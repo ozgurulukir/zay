@@ -55,6 +55,10 @@ _Avoid_: "tool definition" (overloaded with the OpenAI-side `ToolDefinition` JSO
 **Tool registry**:
 A single `pub const registry: []const Tool` slice in `src/tools.zig` that enumerates every tool. The protocol-neutral source of truth — consumed by **ExecutorService** (for dispatch) and by each **LanguageModel** adapter (for building its provider-specific tools schema). Adding a tool is one line in this slice plus the tool's own file exporting `pub const tool: Tool = .{ ... }`.
 
+**search_codebase**:
+The agent-facing search tool for discovering files and matching content inside files from the current codebase.
+_Avoid_: code_search
+
 **Schema**:
 The per-tool argument shape carried inside a **Tool** — `{ properties: []Property }` where each `Property = { name, kind, description, required }`. Generic over the union of property names across all tools (no hard-coded `command` / `path` / `content` / `input` / `query` fields as in the old `JsonSchemaProperties` struct). Each adapter translates `Schema` into its provider's tools-JSON shape inside the adapter, not in `tools.zig`.
 _Avoid_: "JSON schema" (the Schema is provider-neutral; what each adapter emits is the provider's tool-schema JSON).

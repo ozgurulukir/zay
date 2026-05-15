@@ -4,7 +4,4 @@ zig-out/
 *.o
 zig-pkg/
 
-# Py
-__pycache__
-
-examples/
+third_party/

@@ -4,6 +4,7 @@ pub const agent = @import("agent.zig");
 pub const ai = @import("ai.zig");
 pub const bash = @import("bash.zig");
 pub const executor = @import("executor.zig");
+pub const search = @import("search.zig");
 pub const thread = @import("thread.zig");
 pub const tools = @import("tools.zig");
 pub const tui = @import("tui.zig");
@@ -49,6 +50,9 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, config: Config) !void
         .tools = tools.registry,
     });
     defer openai_client.deinit();
+
+    search.start(gpa, cwd);
+    defer search.deinit(gpa);
 
     var agent_instance = agent.Agent.init(gpa, init.io, cwd, .{ .openai = &openai_client });
     defer agent_instance.deinit();
