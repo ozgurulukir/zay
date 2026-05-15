@@ -1,0 +1,3 @@
+# Structured tools instead of bash interception
+
+Nova originally exposed only `bash` and intercepted custom commands such as `read-file` and `edit-file` inside bash command strings. We now expose `read`, `write_file`, `edit_file`, `search_codebase`, and `bash` as separate structured tools, with `bash` acting only as a plain shell executor. This trades a larger tool schema for a more reliable interface: hashline edits no longer depend on shell parsing, heredocs, or custom command emulation. Moreover, the token reduction story started to matter less as we had to add a lot of additional instructions to the system prompt. Also, smaller local models get very confused with editing files via a CLI tool.

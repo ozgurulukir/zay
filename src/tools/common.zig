@@ -1,0 +1,114 @@
+const std = @import("std");
+
+const assert = std.debug.assert;
+
+pub const Output = struct {
+    stdout: []u8,
+    stderr: []u8,
+    code: u8,
+    display: ?[]u8 = null,
+
+    pub fn deinit(self: *Output, gpa: std.mem.Allocator) void {
+        gpa.free(self.stdout);
+        gpa.free(self.stderr);
+        if (self.display) |display| gpa.free(display);
+        self.* = undefined;
+    }
+};
+
+pub const Error = error{
+    OutOfMemory,
+} || std.Io.Cancelable || std.Io.UnexpectedError;
+
+/// A typed record describing one tool. The Tool registry in `tools.zig`
+/// is a slice of these; it is the single source of truth for what tools
+/// exist. Display policy (Expand-by-default, render mode) is NOT carried
+/// here — that lives TUI-side.
+pub const Tool = struct {
+    name: []const u8,
+    /// Raw description template. May contain `{{hsep}}` placeholders that
+    /// each LanguageModel adapter substitutes with `~` before sending.
+    description: []const u8,
+    schema: Schema,
+    run: *const fn (
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        cwd: []const u8,
+        args: []const u8,
+    ) Error!Output,
+    /// Produce the **Display label** shown in the TUI's `$ <label>` line.
+    /// Parses the tool's argument JSON to pick a meaningful summary; falls
+    /// back to the bare tool name on partial / invalid JSON.
+    displayLabel: *const fn (
+        gpa: std.mem.Allocator,
+        args: []const u8,
+    ) std.mem.Allocator.Error![]u8,
+};
+
+pub const Schema = struct {
+    properties: []const Property,
+
+    pub const Property = struct {
+        name: []const u8,
+        kind: Kind,
+        description: []const u8,
+        required: bool,
+    };
+
+    pub const Kind = enum { string, integer };
+};
+
+pub fn ok(gpa: std.mem.Allocator, stdout: []u8) Error!Output {
+    const stderr = try gpa.alloc(u8, 0);
+    return .{ .stdout = stdout, .stderr = stderr, .code = 0, .display = null };
+}
+
+pub fn okWithDisplay(gpa: std.mem.Allocator, stdout: []u8, display: []u8) Error!Output {
+    assert(stdout.len > 0);
+    assert(display.len > 0);
+    const stderr = try gpa.alloc(u8, 0);
+    return .{ .stdout = stdout, .stderr = stderr, .code = 0, .display = display };
+}
+
+pub fn fail(gpa: std.mem.Allocator, message: []const u8, code: u8) Error!Output {
+    assert(code != 0);
+    assert(message.len > 0);
+    const stdout = try gpa.alloc(u8, 0);
+    errdefer gpa.free(stdout);
+    const stderr = try gpa.dupe(u8, message);
+    return .{ .stdout = stdout, .stderr = stderr, .code = code, .display = null };
+}
+
+pub fn failFmt(
+    gpa: std.mem.Allocator,
+    code: u8,
+    comptime fmt: []const u8,
+    args: anytype,
+) Error!Output {
+    assert(code != 0);
+    const stdout = try gpa.alloc(u8, 0);
+    errdefer gpa.free(stdout);
+    const stderr = try std.fmt.allocPrint(gpa, fmt, args);
+    return .{ .stdout = stdout, .stderr = stderr, .code = code, .display = null };
+}
+
+/// Helper for Display label implementations. Parses the argument JSON and
+/// extracts a single string field; returns the bare `fallback` (owned) when
+/// the JSON is partial / invalid / missing the field. This is the function
+/// every tool's `displayLabel` ends up calling for the common case.
+pub fn extractStringField(
+    gpa: std.mem.Allocator,
+    args: []const u8,
+    field: []const u8,
+    fallback: []const u8,
+) std.mem.Allocator.Error![]u8 {
+    if (args.len == 0) return gpa.dupe(u8, fallback);
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, args, .{}) catch {
+        return gpa.dupe(u8, fallback);
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return gpa.dupe(u8, fallback);
+    const value = parsed.value.object.get(field) orelse return gpa.dupe(u8, fallback);
+    if (value != .string) return gpa.dupe(u8, fallback);
+    return gpa.dupe(u8, value.string);
+}

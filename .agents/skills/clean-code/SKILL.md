@@ -79,6 +79,13 @@ description: Use this skill when writing code. It describes how to write beautif
 
 ## Performance
 
+- Be explicit. Minimize dependence on the compiler to do the right thing for you.
+
+  In particular, extract hot loops into stand-alone functions with primitive arguments without
+  `self` (see [an example](https://github.com/tigerbeetle/tigerbeetle/blob/0.16.19/src/lsm/compaction.zig#L1932-L1937)).
+  That way, the compiler doesn't need to prove that it can cache struct's fields in registers, and a
+  human reader can spot redundant computations easier.
+
 - Optimize for the slowest resources first (network, disk, memory, CPU) in that order, after
   compensating for the frequency of usage, because faster resources may be used many times more. For
   example, a memory cache miss may be as expensive as a disk fsync, if it happens many times more.
@@ -177,12 +184,57 @@ description: Use this skill when writing code. It describes how to write beautif
 - Don't duplicate variables or take aliases to them. This will reduce the probability that state
   gets out of sync.
 
-- Shrink the scope to minimize the number of variables at play and reduce the probability that
+- If you don't mean a function argument to be copied when passed by value, and if the argument type
+  is more than 16 bytes, then pass the argument as `*const`. This will catch bugs where the caller
+  makes an accidental copy on the stack before calling the function.
+
+- Construct larger structs _in-place_ by passing an _out pointer_ during initialization.
+
+  In-place initializations can assume **pointer stability** and **immovable types** while
+  eliminating intermediate copy-move allocations, which can lead to undesirable stack growth.
+
+  Keep in mind that in-place initializations are viral — if any field is initialized
+  in-place, the entire container struct should be initialized in-place as well.
+
+  **Prefer:**
+
+  ```zig
+  fn init(target: *LargeStruct) !void {
+    target.* = .{
+      // in-place initialization.
+    };
+  }
+
+  fn main() !void {
+    var target: LargeStruct = undefined;
+    try target.init();
+  }
+  ```
+
+  **Over:**
+
+  ```zig
+  fn init() !LargeStruct {
+    return LargeStruct {
+      // moving the initialized object.
+    }
+  }
+
+  fn main() !void {
+    var target = try LargeStruct.init();
+  }
+  ```
+
+- **Shrink the scope** to minimize the number of variables at play and reduce the probability that
   the wrong variable is used.
 
-- Calculate or check variables close to where/when they are used. Don't introduce variables before
-  they are needed. Don't leave them around where they are not. This will reduce the probability of
-  a POCPOU (place-of-check to place-of-use)
+- Calculate or check variables close to where/when they are used. **Don't introduce variables before
+  they are needed.** Don't leave them around where they are not. This will reduce the probability of
+  a POCPOU (place-of-check to place-of-use), a distant cousin to the infamous
+  [TOCTOU](https://en.wikipedia.org/wiki/Time-of-check_to_time-of-use). Most bugs come down to a
+  semantic gap, caused by a gap in time or space, because it's harder to check code that's not
+  contained along those dimensions.
+
 - Use simpler function signatures and return types to reduce dimensionality at the call site, the
   number of branches that need to be handled at the call site, because this dimensionality can also
   be viral, propagating through the call chain. For example, as a return type, `void` trumps `bool`,
@@ -192,8 +244,13 @@ description: Use this skill when writing code. It describes how to write beautif
   true throughout the lifetime of the function. These assertions are useful documentation without a
   suspend, but may be misleading otherwise.
 
+- Be on your guard for **[buffer bleeds](https://en.wikipedia.org/wiki/Heartbleed)**. This is a
+  buffer underflow, the opposite of a buffer overflow, where a buffer is not fully utilized, with
+  padding not zeroed correctly. This may not only leak sensitive information, but may cause
+  deterministic guarantees as required by TigerBeetle to be violated.
+
 - Use newlines to **group resource allocation and deallocation**, i.e. before the resource
-  allocation and after the corresponding `defer` statement, to make leaks easier to spot. (C++, Go, Zig)
+  allocation and after the corresponding `defer` statement, to make leaks easier to spot.
 
 ### Off-By-One Errors
 

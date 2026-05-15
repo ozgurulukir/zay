@@ -14,6 +14,8 @@ Prefer to use the primitives provided by the framework as much as possible.
 
 Run the following:
 
+- `zig fmt`
+
 - `zig build test`
 
 - `zig build run`
