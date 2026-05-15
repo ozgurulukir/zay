@@ -3,3 +3,5 @@ zig-cache/
 zig-out/
 *.o
 zig-pkg/
+
+third_party/
