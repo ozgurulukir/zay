@@ -45,6 +45,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     mod.addIncludePath(b.path("vendor/fff"));
+    mod.addIncludePath(b.path("vendor/libsql"));
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
