@@ -19,6 +19,10 @@ pub const Error = db.Error || error{
     CorruptPayload,
     OutOfMemory,
     WriteFailed,
+    SystemResources,
+    Unexpected,
+    LockedMemoryLimitExceeded,
+    ThreadQuotaExceeded,
 };
 
 pub const SessionManager = struct {
@@ -157,6 +161,13 @@ pub const Session = struct {
         const payload = try messageToJson(self.manager.gpa, message);
         defer self.manager.gpa.free(payload);
         try self.insertEntry(id_out, "message", message.role, payload);
+    }
+
+    pub fn appendPayload(self: *Session, kind: []const u8, role: ?[]const u8, payload_json: []const u8, id_out: *[entry_id_len]u8) Error!void {
+        assert(kind.len > 0);
+        assert(payload_json.len > 0);
+        fillHex(id_out);
+        try self.insertEntry(id_out, kind, role, payload_json);
     }
 
     pub fn info(self: *Session, title: []const u8, id_out: *[entry_id_len]u8) Error!void {
@@ -303,6 +314,128 @@ pub const Session = struct {
         return readEntry(gpa, &row);
     }
 };
+
+pub const SessionWriter = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    manager: SessionManager,
+    session: Session,
+    mutex: std.atomic.Mutex = .unlocked,
+    queue: []QueuedEntry,
+    head: u32 = 0,
+    count: u32 = 0,
+    stopping: bool = false,
+    thread: ?std.Thread = null,
+
+    pub const queue_capacity_default: u32 = 256;
+
+    pub fn initDefault(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) Error!void {
+        return initDefaultWithCapacity(target, gpa, io, cwd, queue_capacity_default);
+    }
+
+    pub fn initDefaultWithCapacity(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, capacity: u32) Error!void {
+        assert(cwd.len > 0);
+        assert(capacity > 0);
+        var manager = try SessionManager.initDefault(gpa, io, cwd);
+        errdefer manager.deinit();
+        const session = try manager.create(cwd, .{});
+        const queue = try gpa.alloc(QueuedEntry, capacity);
+        errdefer gpa.free(queue);
+        target.* = .{
+            .gpa = gpa,
+            .io = io,
+            .manager = manager,
+            .session = session,
+            .queue = queue,
+        };
+        target.thread = try std.Thread.spawn(.{}, runWriter, .{target});
+    }
+
+    pub fn deinit(self: *SessionWriter) void {
+        lockWriter(self);
+        self.stopping = true;
+        self.mutex.unlock();
+        if (self.thread) |thread| thread.join();
+        var index: u32 = 0;
+        while (index < self.count) : (index += 1) {
+            const queue_index = (self.head + index) % @as(u32, @intCast(self.queue.len));
+            self.queue[queue_index].deinit(self.gpa);
+        }
+        self.gpa.free(self.queue);
+        self.manager.deinit();
+        self.* = undefined;
+    }
+
+    pub fn append(self: *SessionWriter, message: ai.ChatMessage) Error!void {
+        assert(message.role.len > 0);
+        if (std.mem.eql(u8, message.role, "system")) return;
+        const payload = try messageToJson(self.gpa, message);
+        errdefer self.gpa.free(payload);
+        const role = try self.gpa.dupe(u8, message.role);
+        errdefer self.gpa.free(role);
+        try self.enqueue(.{ .kind = "message", .role = role, .payload_json = payload });
+    }
+
+    fn enqueue(self: *SessionWriter, entry: QueuedEntry) Error!void {
+        while (true) {
+            lockWriter(self);
+            if (self.count < self.queue.len) {
+                const tail = (self.head + self.count) % @as(u32, @intCast(self.queue.len));
+                self.queue[tail] = entry;
+                self.count += 1;
+                self.mutex.unlock();
+                return;
+            }
+            self.mutex.unlock();
+            std.Thread.yield() catch {};
+        }
+    }
+};
+
+const QueuedEntry = struct {
+    kind: []const u8,
+    role: ?[]u8,
+    payload_json: []u8,
+
+    fn deinit(self: *QueuedEntry, gpa: std.mem.Allocator) void {
+        if (self.role) |role| gpa.free(role);
+        gpa.free(self.payload_json);
+        self.* = undefined;
+    }
+};
+
+fn runWriter(writer: *SessionWriter) void {
+    while (true) {
+        if (takeQueuedEntry(writer)) |entry| {
+            var owned = entry;
+            defer owned.deinit(writer.gpa);
+            var id: [entry_id_len]u8 = undefined;
+            writer.session.appendPayload(owned.kind, owned.role, owned.payload_json, &id) catch {};
+        } else {
+            lockWriter(writer);
+            const done = writer.stopping and writer.count == 0;
+            writer.mutex.unlock();
+            if (done) return;
+            std.Thread.yield() catch {};
+        }
+    }
+}
+
+fn takeQueuedEntry(writer: *SessionWriter) ?QueuedEntry {
+    lockWriter(writer);
+    defer writer.mutex.unlock();
+    if (writer.count == 0) return null;
+    const entry = writer.queue[writer.head];
+    writer.head = (writer.head + 1) % @as(u32, @intCast(writer.queue.len));
+    writer.count -= 1;
+    return entry;
+}
+
+fn lockWriter(writer: *SessionWriter) void {
+    while (!writer.mutex.tryLock()) {
+        std.Thread.yield() catch {};
+    }
+}
 
 const EntryRecord = struct {
     id: [entry_id_len]u8,

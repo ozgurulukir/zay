@@ -56,8 +56,13 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, config: Config) !void
     search.start(gpa, cwd);
     defer search.deinit(gpa);
 
+    var session_writer: session.SessionWriter = undefined;
+    try session_writer.initDefault(gpa, init.io, cwd);
+    defer session_writer.deinit();
+
     var agent_instance = agent.Agent.init(gpa, init.io, cwd, .{ .openai = &openai_client });
     defer agent_instance.deinit();
+    agent_instance.attachSessionWriter(&session_writer);
 
     const system_prompt = config.system_prompt orelse @embedFile("prompts/system.md");
     try agent_instance.addSystem(system_prompt);
