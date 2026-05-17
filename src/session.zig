@@ -263,6 +263,24 @@ pub const Session = struct {
         try self.updateLeaf(id[0..]);
     }
 
+    pub fn setTitle(self: *Session, title: []const u8) Error!void {
+        assert(title.len > 0);
+        var statement = try self.manager.connection.prepare("update sessions set title = ?, updated_at_ms = ? where id = ?");
+        defer statement.finalize();
+        try statement.bindText(1, title);
+        try statement.bindInt(2, nowMs());
+        try statement.bindText(3, self.id[0..]);
+        try expectDone(&statement);
+    }
+
+    pub fn hasTitle(self: *Session) Error!bool {
+        var statement = try self.manager.connection.prepare("select title from sessions where id = ?");
+        defer statement.finalize();
+        try statement.bindText(1, self.id[0..]);
+        const row = (try statement.step()) orelse return error.MissingSession;
+        return row.columnType(0) != .null and row.text(0).len > 0;
+    }
+
     fn updateLeaf(self: *Session, leaf_id: []const u8) Error!void {
         assert(leaf_id.len == entry_id_len);
         var statement = try self.manager.connection.prepare("update sessions set leaf_entry_id = ?, updated_at_ms = ? where id = ?");
@@ -325,6 +343,7 @@ pub const SessionWriter = struct {
     head: u32 = 0,
     count: u32 = 0,
     stopping: bool = false,
+    title_written: bool = false,
     thread: ?std.Thread = null,
 
     pub const queue_capacity_default: u32 = 256;
@@ -367,6 +386,7 @@ pub const SessionWriter = struct {
             .queue = queue,
         };
         target.session.manager = &target.manager;
+        target.title_written = try target.session.hasTitle();
         target.thread = try std.Thread.spawn(.{}, runWriter, .{target});
     }
 
@@ -392,7 +412,12 @@ pub const SessionWriter = struct {
         errdefer self.gpa.free(payload);
         const role = try self.gpa.dupe(u8, message.role);
         errdefer self.gpa.free(role);
-        try self.enqueue(.{ .kind = "message", .role = role, .payload_json = payload });
+        const title_candidate = if (std.mem.eql(u8, message.role, "user"))
+            try titleFromUserMessage(self.gpa, message.content)
+        else
+            null;
+        errdefer if (title_candidate) |title| self.gpa.free(title);
+        try self.enqueue(.{ .kind = "message", .role = role, .payload_json = payload, .title_candidate = title_candidate });
     }
 
     fn enqueue(self: *SessionWriter, entry: QueuedEntry) Error!void {
@@ -415,10 +440,12 @@ const QueuedEntry = struct {
     kind: []const u8,
     role: ?[]u8,
     payload_json: []u8,
+    title_candidate: ?[]u8 = null,
 
     fn deinit(self: *QueuedEntry, gpa: std.mem.Allocator) void {
         if (self.role) |role| gpa.free(role);
         gpa.free(self.payload_json);
+        if (self.title_candidate) |title| gpa.free(title);
         self.* = undefined;
     }
 };
@@ -429,7 +456,13 @@ fn runWriter(writer: *SessionWriter) void {
             var owned = entry;
             defer owned.deinit(writer.gpa);
             var id: [entry_id_len]u8 = undefined;
-            writer.session.appendPayload(owned.kind, owned.role, owned.payload_json, &id) catch {};
+            writer.session.appendPayload(owned.kind, owned.role, owned.payload_json, &id) catch continue;
+            if (!writer.title_written) {
+                if (owned.title_candidate) |title| {
+                    writer.session.setTitle(title) catch continue;
+                    writer.title_written = true;
+                }
+            }
         } else {
             lockWriter(writer);
             const done = writer.stopping and writer.count == 0;
@@ -615,6 +648,27 @@ fn branchSummaryToJson(gpa: std.mem.Allocator, from_id: []const u8, summary: []c
     try std.json.Stringify.value(summary, .{}, &out.writer);
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
+}
+
+fn titleFromUserMessage(gpa: std.mem.Allocator, content: []const u8) Error!?[]u8 {
+    const trimmed = std.mem.trim(u8, content, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const line_end = std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len;
+    const line = std.mem.trim(u8, trimmed[0..line_end], " \t\r");
+    if (line.len == 0) return null;
+    const title_max: u32 = 80;
+    if (line.len <= title_max) return try gpa.dupe(u8, line);
+    const cut = utf8PrefixLen(line, title_max - 3);
+    return try std.fmt.allocPrint(gpa, "{s}...", .{line[0..cut]});
+}
+
+fn utf8PrefixLen(text: []const u8, limit: u32) u32 {
+    assert(limit < text.len);
+    var end: u32 = limit;
+    while (end > 0) : (end -= 1) {
+        if ((text[end] & 0xc0) != 0x80) return end;
+    }
+    return limit;
 }
 
 fn readSummary(gpa: std.mem.Allocator, row: *const db.Row) Error!SessionSummary {

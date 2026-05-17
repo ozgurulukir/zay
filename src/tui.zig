@@ -1274,8 +1274,8 @@ const MessageWidget = struct {
 
 const Command = enum { new, resume_session };
 const commands = [_]struct { name: []const u8, command: Command }{
-    .{ .name = "new", .command = .new },
-    .{ .name = "resume", .command = .resume_session },
+    .{ .name = "New", .command = .new },
+    .{ .name = "Resume", .command = .resume_session },
 };
 
 fn inputLabel(app: *const App) []const u8 {
@@ -1432,18 +1432,69 @@ const ResumeRowWidget = struct {
         const self: *ResumeRowWidget = @ptrCast(@alignCast(ptr));
         const width = ctx.max.width orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
-        var buffer: [512]u8 = undefined;
-        const modified = modifiedTime(buffer[400..], self.summary.updated_at_ms);
-        const name = self.summary.title orelse "Untitled";
-        const marker = if (self.selected) "‣ " else "  ";
-        const text = if (self.app.resume_global)
-            std.fmt.bufPrint(buffer[0..400], "{s}{s} · {s} · {s}", .{ marker, name, modified, self.summary.cwd }) catch name
-        else
-            std.fmt.bufPrint(buffer[0..400], "{s}{s} · {s}", .{ marker, name, modified }) catch name;
-        try writeCommandLine(&surface, 0, text, ctx, self.selected);
+        var buffer: [128]u8 = undefined;
+        const modified = modifiedTime(buffer[0..], self.summary.updated_at_ms);
+        const left = try self.leftText(ctx, width, modified);
+        try writeCommandLine(&surface, 0, left, ctx, self.selected);
+        try writePanelRight(&surface, 0, modified, ctx, self.selected);
         return surface;
     }
+
+    fn leftText(self: *const ResumeRowWidget, ctx: vxfw.DrawContext, width: u16, modified: []const u8) std.mem.Allocator.Error![]const u8 {
+        const marker = if (self.selected) "‣ " else "  ";
+        const available = resumeLeftWidth(ctx, width, modified);
+        const marker_width = ctx.stringWidth(marker);
+        if (available <= marker_width) return ctx.arena.dupe(u8, marker);
+
+        const name = self.summary.title orelse "Untitled";
+        if (!self.app.resume_global) {
+            const title = try truncateText(ctx, name, available - marker_width);
+            return std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ marker, title });
+        }
+
+        const separator = " · ";
+        const separator_width = ctx.stringWidth(separator);
+        if (available <= marker_width + separator_width + 4) {
+            const title = try truncateText(ctx, name, available - marker_width);
+            return std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ marker, title });
+        }
+
+        const content_width = available - marker_width - separator_width;
+        const title_width = @max(@as(usize, 8), content_width / 2);
+        const path_width = content_width - @min(title_width, content_width);
+        const title = try truncateText(ctx, name, @min(title_width, content_width));
+        const path = try truncateText(ctx, self.summary.cwd, path_width);
+        return std.fmt.allocPrint(ctx.arena, "{s}{s}{s}{s}", .{ marker, title, separator, path });
+    }
 };
+
+fn resumeLeftWidth(ctx: vxfw.DrawContext, row_width: u16, modified: []const u8) usize {
+    const start_col = ConversationLayout.left -| 1;
+    const end_col = row_width -| ConversationLayout.right;
+    const date_width = ctx.stringWidth(modified);
+    if (end_col <= start_col) return 0;
+    if (date_width + 1 >= end_col - start_col) return 0;
+    return end_col - start_col - date_width - 1;
+}
+
+fn truncateText(ctx: vxfw.DrawContext, text: []const u8, width: usize) std.mem.Allocator.Error![]const u8 {
+    if (width == 0) return ctx.arena.dupe(u8, "");
+    if (ctx.stringWidth(text) <= width) return ctx.arena.dupe(u8, text);
+    if (width <= 3) return ctx.arena.dupe(u8, "...");
+
+    var out: std.ArrayList(u8) = .empty;
+    var used: usize = 0;
+    var iter = ctx.graphemeIterator(text);
+    while (iter.next()) |grapheme| {
+        const bytes = grapheme.bytes(text);
+        const grapheme_width = ctx.stringWidth(bytes);
+        if (used + grapheme_width + 3 > width) break;
+        try out.appendSlice(ctx.arena, bytes);
+        used += grapheme_width;
+    }
+    try out.appendSlice(ctx.arena, "...");
+    return out.toOwnedSlice(ctx.arena);
+}
 
 fn writeCommandLine(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool) std.mem.Allocator.Error!void {
     try writePanelLineAt(surface, row, text, ctx, selected, ConversationLayout.left -| 1);
@@ -1451,6 +1502,26 @@ fn writeCommandLine(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxf
 
 fn writePanelLine(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool) std.mem.Allocator.Error!void {
     try writePanelLineAt(surface, row, text, ctx, selected, ConversationLayout.left);
+}
+
+fn writePanelRight(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool) std.mem.Allocator.Error!void {
+    if (row >= surface.size.height) return;
+    const stable_text = try ctx.arena.dupe(u8, text);
+    const style = if (selected) StylePalette.tool else StylePalette.thinking_body;
+    const text_width: u16 = @intCast(@min(ctx.stringWidth(stable_text), std.math.maxInt(u16)));
+    const end_col = surface.size.width -| ConversationLayout.right;
+    if (text_width >= end_col) return;
+    var col = end_col - text_width;
+    var iter = ctx.graphemeIterator(stable_text);
+    while (iter.next()) |grapheme| {
+        if (col >= surface.size.width) return;
+        const bytes = grapheme.bytes(stable_text);
+        const width: u8 = @intCast(ctx.stringWidth(bytes));
+        if (width == 0) continue;
+        if (col + width > surface.size.width) return;
+        surface.writeCell(col, row, .{ .char = .{ .grapheme = bytes, .width = width }, .style = style });
+        col += width;
+    }
 }
 
 fn writePanelLineAt(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool, start_col: u16) std.mem.Allocator.Error!void {
