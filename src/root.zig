@@ -7,6 +7,7 @@ pub const db = @import("db.zig");
 pub const executor = @import("executor.zig");
 pub const search = @import("search.zig");
 pub const session = @import("session.zig");
+pub const runtime = @import("runtime.zig");
 pub const thread = @import("thread.zig");
 pub const tools = @import("tools.zig");
 pub const tui = @import("tui.zig");
@@ -44,8 +45,10 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, config: Config) !void
     const cwd = try std.process.currentPathAlloc(init.io, gpa);
     defer gpa.free(cwd);
 
+    const runtime_gpa = std.heap.smp_allocator;
+
     var openai_client: ai.openai.Client = undefined;
-    try openai_client.init(gpa, init.io, .{
+    try openai_client.init(runtime_gpa, init.io, .{
         .base_url = config.base_url,
         .api_key = config.api_key,
         .model = config.model,
@@ -56,18 +59,11 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, config: Config) !void
     search.start(gpa, cwd);
     defer search.deinit(gpa);
 
-    var session_writer: session.SessionWriter = undefined;
-    try session_writer.initDefault(gpa, init.io, cwd);
-    defer session_writer.deinit();
-
-    var agent_instance = agent.Agent.init(gpa, init.io, cwd, .{ .openai = &openai_client });
-    defer agent_instance.deinit();
-    agent_instance.attachSessionWriter(&session_writer);
-
     const system_prompt = config.system_prompt orelse @embedFile("prompts/system.md");
-    try agent_instance.addSystem(system_prompt);
+    const agent_runtime = try gpa.create(runtime.AgentRuntime);
+    try agent_runtime.initNew(runtime_gpa, init.io, cwd, .{ .openai = &openai_client }, system_prompt);
 
-    try tui.run(init, &agent_instance);
+    try tui.run(init, agent_runtime);
 }
 
 test {

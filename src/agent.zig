@@ -53,6 +53,10 @@ pub const Agent = struct {
         try self.appendMessage("user", content);
     }
 
+    pub fn takeMessage(self: *Agent, message: ai.ChatMessage) !void {
+        try self.messages.append(self.gpa, message);
+    }
+
     /// The tagged union the agent emits to describe what is happening.
     /// Single public seam — the TUI (and any future consumer) subscribes
     /// to this stream of events via `Agent.Listener`.

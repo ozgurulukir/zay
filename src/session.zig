@@ -109,9 +109,9 @@ pub const SessionManager = struct {
 
     pub fn list(self: *SessionManager, gpa: std.mem.Allocator, cwd: ?[]const u8) Error![]SessionSummary {
         const sql = if (cwd == null)
-            "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id from sessions order by updated_at_ms desc"
+            "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id from sessions where leaf_entry_id is not null order by updated_at_ms desc"
         else
-            "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id from sessions where cwd = ? order by updated_at_ms desc";
+            "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id from sessions where cwd = ? and leaf_entry_id is not null order by updated_at_ms desc";
         var statement = try self.connection.prepare(sql);
         defer statement.finalize();
         if (cwd) |path| try statement.bindText(1, path);
@@ -333,12 +333,30 @@ pub const SessionWriter = struct {
         return initDefaultWithCapacity(target, gpa, io, cwd, queue_capacity_default);
     }
 
+    pub fn initResumeDefault(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, session_id: []const u8) Error!void {
+        return initResumeDefaultWithCapacity(target, gpa, io, cwd, session_id, queue_capacity_default);
+    }
+
     pub fn initDefaultWithCapacity(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, capacity: u32) Error!void {
         assert(cwd.len > 0);
         assert(capacity > 0);
         var manager = try SessionManager.initDefault(gpa, io, cwd);
         errdefer manager.deinit();
         const session = try manager.create(cwd, .{});
+        try target.initWithSession(gpa, io, manager, session, capacity);
+    }
+
+    pub fn initResumeDefaultWithCapacity(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, session_id: []const u8, capacity: u32) Error!void {
+        assert(cwd.len > 0);
+        assert(session_id.len > 0);
+        assert(capacity > 0);
+        var manager = try SessionManager.initDefault(gpa, io, cwd);
+        errdefer manager.deinit();
+        const session = try manager.@"resume"(session_id);
+        try target.initWithSession(gpa, io, manager, session, capacity);
+    }
+
+    fn initWithSession(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, manager: SessionManager, session: Session, capacity: u32) Error!void {
         const queue = try gpa.alloc(QueuedEntry, capacity);
         errdefer gpa.free(queue);
         target.* = .{
@@ -348,6 +366,7 @@ pub const SessionWriter = struct {
             .session = session,
             .queue = queue,
         };
+        target.session.manager = &target.manager;
         target.thread = try std.Thread.spawn(.{}, runWriter, .{target});
     }
 

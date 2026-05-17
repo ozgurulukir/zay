@@ -1,10 +1,15 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
+const time_c = @cImport({
+    @cInclude("time.h");
+});
 
 const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
 const openai_mod = @import("ai/openai.zig");
+const runtime_mod = @import("runtime.zig");
+const session_mod = @import("session.zig");
 const thread_mod = @import("thread.zig");
 const tools_mod = @import("tools.zig");
 
@@ -66,10 +71,18 @@ pub const App = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
     agent: *agent_mod.Agent,
+    runtime: ?*runtime_mod.AgentRuntime = null,
     thread: thread_mod.Thread = .{},
     input: vxfw.TextField,
     worker_context: AgentWorkerContext,
     turn_future: ?std.Io.Future(void) = null,
+    owns_runtime: bool = false,
+    mode: Mode = .normal,
+    command_selection: u32 = 0,
+    resume_selection: u32 = 0,
+    resume_global: bool = false,
+    resume_summaries: std.ArrayList(session_mod.SessionSummary) = .empty,
+    retired_threads: std.ArrayList(thread_mod.Thread) = .empty,
     in_flight: bool = false,
     loading_index: ?u32 = null,
     loading_frame: u8 = 0,
@@ -87,6 +100,13 @@ pub const App = struct {
         .draw_cursor = false,
         .wheel_scroll = 4,
     },
+    resume_list: vxfw.ListView = .{
+        .children = .{ .slice = &.{} },
+        .draw_cursor = false,
+        .wheel_scroll = 3,
+    },
+
+    const Mode = enum { normal, command, picker };
 
     pub fn init(io: std.Io, gpa: std.mem.Allocator, agent: *agent_mod.Agent) App {
         return .{
@@ -102,8 +122,29 @@ pub const App = struct {
         };
     }
 
+    pub fn initRuntime(io: std.Io, gpa: std.mem.Allocator, runtime: *runtime_mod.AgentRuntime) App {
+        var app = init(io, gpa, &runtime.agent);
+        app.runtime = runtime;
+        app.owns_runtime = true;
+        return app;
+    }
+
+    pub fn bindInputCallbacks(self: *App) void {
+        self.input.userdata = self;
+        self.input.onChange = inputChanged;
+    }
+
     pub fn deinit(self: *App) void {
         self.awaitTurn();
+        for (self.retired_threads.items) |*thread| thread.deinit(self.gpa);
+        self.retired_threads.deinit(self.gpa);
+        self.resumeClear();
+        if (self.owns_runtime) {
+            if (self.runtime) |runtime| {
+                runtime.deinit();
+                self.gpa.destroy(runtime);
+            }
+        }
         self.worker_context.queue.deinit(self.worker_context.io, self.worker_context.gpa);
         self.tool_indexes.deinit(self.gpa);
         self.thread.deinit(self.gpa);
@@ -121,6 +162,7 @@ pub const App = struct {
     pub fn beginSubmit(self: *App) !?u32 {
         if (self.in_flight) return null;
         const prompt = try self.input.toOwnedSlice();
+        self.resetInputChangeTracking();
         defer self.gpa.free(prompt);
         if (prompt.len == 0) return null;
 
@@ -378,6 +420,36 @@ pub const App = struct {
     }
 
     pub fn handleCommandKey(self: *App, key: vaxis.Key) !bool {
+        if (self.mode == .picker) {
+            if (key.matches('g', .{})) {
+                self.resume_global = !self.resume_global;
+                try self.reloadResumeSessions();
+                return true;
+            }
+            if (key.matches(vaxis.Key.up, .{})) {
+                if (self.resume_selection > 0) self.resume_selection -= 1;
+                self.syncResumeListCursor();
+                return true;
+            }
+            if (key.matches(vaxis.Key.down, .{})) {
+                const count = try self.visibleResumeCount();
+                if (self.resume_selection + 1 < count) self.resume_selection += 1;
+                self.syncResumeListCursor();
+                return true;
+            }
+            return false;
+        }
+        if (self.mode == .command) {
+            if (key.matches(vaxis.Key.up, .{})) {
+                if (self.command_selection > 0) self.command_selection -= 1;
+                return true;
+            }
+            if (key.matches(vaxis.Key.down, .{})) {
+                if (self.command_selection + 1 < commandMatchesCount(self)) self.command_selection += 1;
+                return true;
+            }
+            return false;
+        }
         if (key.matches(vaxis.Key.up, .{})) {
             self.thread.moveSelection(.previous);
             self.thread_auto_scroll = false;
@@ -393,6 +465,224 @@ pub const App = struct {
             return true;
         }
         return false;
+    }
+
+    fn syncModeWithInput(self: *App, value: []const u8) !void {
+        if (self.mode == .picker) {
+            if (self.resume_selection >= try self.visibleResumeCount()) self.resume_selection = 0;
+            return;
+        }
+        if (value.len == 0) {
+            self.mode = .normal;
+            self.command_selection = 0;
+            return;
+        }
+        if (value[0] == ':') {
+            self.mode = .command;
+            const count = commandMatchesCountForFilter(value[1..]);
+            if (self.command_selection >= count) self.command_selection = 0;
+            return;
+        }
+        self.mode = .normal;
+        self.command_selection = 0;
+    }
+
+    fn cancelMode(self: *App) !bool {
+        if (self.mode == .normal) return false;
+        if (self.mode == .picker) {
+            self.mode = .command;
+            self.clearInput();
+            self.resumeClear();
+            return true;
+        }
+        self.mode = .normal;
+        self.clearInput();
+        self.resumeClear();
+        return true;
+    }
+
+    fn submitMode(self: *App) !bool {
+        const input = try self.peekInput();
+        defer self.gpa.free(input);
+        if (self.mode == .picker) {
+            const summary = try self.selectedResumeSummary() orelse return true;
+            self.switchToSession(summary.id) catch |err| {
+                try self.reportSessionSwitchError(err);
+                return true;
+            };
+            return true;
+        }
+        if (input.len == 0) return false;
+        if (input[0] != ':') return false;
+        self.mode = .command;
+        if (resolveCommand(self, input[1..])) |command| {
+            self.clearInput();
+            switch (command) {
+                .new => self.switchToNewSession() catch |err| try self.reportSessionSwitchError(err),
+                .resume_session => try self.openResumePicker(),
+            }
+        }
+        return true;
+    }
+
+    fn openResumePicker(self: *App) !void {
+        self.mode = .picker;
+        self.resume_global = false;
+        self.resume_selection = 0;
+        self.clearInput();
+        try self.reloadResumeSessions();
+    }
+
+    fn reloadResumeSessions(self: *App) !void {
+        self.resumeClear();
+        var manager = try session_mod.SessionManager.initDefault(self.gpa, self.io, self.runtime.?.cwd);
+        defer manager.deinit();
+        const cwd = if (self.resume_global) null else self.runtime.?.cwd;
+        const summaries = try manager.list(self.gpa, cwd);
+        try self.resume_summaries.appendSlice(self.gpa, summaries);
+        if (self.resume_selection >= try self.visibleResumeCount()) self.resume_selection = 0;
+        self.syncResumeListCursor();
+    }
+
+    fn selectedResumeSummary(self: *App) !?*session_mod.SessionSummary {
+        const filter = try self.peekInput();
+        defer self.gpa.free(filter);
+        var visible_index: u32 = 0;
+        for (self.resume_summaries.items) |*summary| {
+            if (!resumeMatches(summary, filter)) continue;
+            if (visible_index == self.resume_selection) return summary;
+            visible_index += 1;
+        }
+        return null;
+    }
+
+    fn visibleResumeCount(self: *App) !u32 {
+        const filter = try self.peekInput();
+        defer self.gpa.free(filter);
+        var count: u32 = 0;
+        for (self.resume_summaries.items) |*summary| {
+            if (resumeMatches(summary, filter)) count += 1;
+        }
+        return count;
+    }
+
+    fn resumeClear(self: *App) void {
+        for (self.resume_summaries.items) |*summary| summary.deinit(self.gpa);
+        self.resume_summaries.clearRetainingCapacity();
+    }
+
+    fn syncResumeListCursor(self: *App) void {
+        self.resume_list.cursor = self.resume_selection;
+        self.resume_list.ensureScroll();
+    }
+
+    fn clearInput(self: *App) void {
+        self.input.clearRetainingCapacity();
+        self.resetInputChangeTracking();
+    }
+
+    fn resetInputChangeTracking(self: *App) void {
+        self.input.buf.allocator.free(self.input.previous_val);
+        self.input.previous_val = "";
+    }
+
+    fn reportSessionSwitchError(self: *App, err: anyerror) !void {
+        self.mode = .normal;
+        self.clearInput();
+        var buffer: [128]u8 = undefined;
+        const message = std.fmt.bufPrint(&buffer, "Could not switch session: {s}", .{@errorName(err)}) catch "Could not switch session.";
+        _ = try self.thread.append(self.gpa, .agent, "agent", message);
+    }
+
+    fn switchToNewSession(self: *App) !void {
+        if (self.in_flight) return error.InFlightTurn;
+        const runtime = try self.createRuntime(null);
+        errdefer {
+            runtime.deinit();
+            self.gpa.destroy(runtime);
+        }
+        try self.installRuntime(runtime);
+        try self.clearConversation();
+    }
+
+    fn switchToSession(self: *App, session_id: []const u8) !void {
+        if (self.in_flight) return error.InFlightTurn;
+        const runtime = try self.createRuntime(session_id);
+        errdefer {
+            runtime.deinit();
+            self.gpa.destroy(runtime);
+        }
+        try self.installRuntime(runtime);
+        try self.rebuildThreadFromAgent();
+    }
+
+    fn createRuntime(self: *App, session_id: ?[]const u8) !*runtime_mod.AgentRuntime {
+        const current = self.runtime.?;
+        const runtime = try self.gpa.create(runtime_mod.AgentRuntime);
+        errdefer self.gpa.destroy(runtime);
+        if (session_id) |id| {
+            try runtime.initResume(current.gpa, self.io, current.cwd, current.client, current.system_prompt, id);
+        } else {
+            try runtime.initNew(current.gpa, self.io, current.cwd, current.client, current.system_prompt);
+        }
+        return runtime;
+    }
+
+    fn installRuntime(self: *App, runtime: *runtime_mod.AgentRuntime) !void {
+        if (self.in_flight) return error.InFlightTurn;
+        self.runtime.?.deinit();
+        self.gpa.destroy(self.runtime.?);
+        self.runtime = runtime;
+        self.agent = &runtime.agent;
+        self.worker_context.agent = &runtime.agent;
+        self.mode = .normal;
+        self.clearInput();
+        self.resetTurnState();
+    }
+
+    fn clearConversation(self: *App) !void {
+        if (self.thread.messages.items.len > 0) {
+            try self.retired_threads.append(self.gpa, self.thread);
+        }
+        self.thread = .{};
+        self.thread_list.scroll = .{};
+    }
+
+    fn rebuildThreadFromAgent(self: *App) !void {
+        try self.clearConversation();
+        for (self.agent.messages.items) |message| {
+            if (std.mem.eql(u8, message.role, "system")) continue;
+            if (std.mem.eql(u8, message.role, "user")) {
+                _ = try self.thread.append(self.gpa, .user, "you", message.content);
+            } else if (std.mem.eql(u8, message.role, "assistant")) {
+                if (message.content.len > 0) _ = try self.thread.append(self.gpa, .agent, "agent", message.content);
+            } else if (std.mem.eql(u8, message.role, "tool")) {
+                const title = try self.resumedToolTitle(message.tool_call_id);
+                defer self.gpa.free(title);
+                _ = try self.thread.append(self.gpa, .tool, title, message.content);
+            }
+        }
+        if (self.thread.messages.items.len > 0) self.thread.selected = @intCast(self.thread.messages.items.len - 1);
+    }
+
+    fn resumedToolTitle(self: *App, tool_call_id: ?[]const u8) ![]u8 {
+        const id = tool_call_id orelse return self.gpa.dupe(u8, "tool");
+        for (self.agent.messages.items) |message| {
+            for (message.tool_calls) |tool_call| {
+                if (!std.mem.eql(u8, tool_call.id, id)) continue;
+                return agent_mod.formatToolTitle(self.gpa, tool_call.name, tool_call.arguments);
+            }
+        }
+        return self.gpa.dupe(u8, id);
+    }
+
+    fn peekInput(self: *App) ![]u8 {
+        const left = self.input.buf.firstHalf();
+        const right = self.input.buf.secondHalf();
+        const out = try self.gpa.alloc(u8, left.len + right.len);
+        @memcpy(out[0..left.len], left);
+        @memcpy(out[left.len..], right);
+        return out;
     }
 
     fn selectionIsLastMessage(self: *const App) bool {
@@ -499,13 +789,14 @@ fn postAgentEvent(context: *anyopaque, event: agent_mod.Agent.Event) anyerror!vo
     try worker_context.queue.push(worker_context.io, worker_context.gpa, event_ptr);
 }
 
-pub fn run(init: std.process.Init, agent: *agent_mod.Agent) !void {
+pub fn run(init: std.process.Init, runtime: *runtime_mod.AgentRuntime) !void {
     const gpa = init.arena.allocator();
     var tty_buffer: [8192]u8 = undefined;
     var fw_app = try vxfw.App.init(init.io, gpa, init.environ_map, &tty_buffer);
     defer fw_app.deinit();
 
-    var app = App.init(init.io, gpa, agent);
+    var app = App.initRuntime(init.io, gpa, runtime);
+    app.bindInputCallbacks();
     defer app.deinit();
 
     const logo = try loadStartupLogo(init.io, gpa);
@@ -546,7 +837,16 @@ const RootWidget = struct {
                 if (mouse.button == .wheel_down) self.app.thread_auto_scroll = !self.app.thread_list.scroll.has_more;
             },
             .key_press => |key| {
-                if (key.matches('c', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                if (key.matches(vaxis.Key.escape, .{})) {
+                    if (try self.app.cancelMode()) {
+                        ctx.consumeAndRedraw();
+                        return;
+                    }
+                    ctx.quit = true;
+                    ctx.consume_event = true;
+                    return;
+                }
+                if (key.matches('c', .{ .ctrl = true })) {
                     ctx.quit = true;
                     ctx.consume_event = true;
                     return;
@@ -610,6 +910,10 @@ const RootWidget = struct {
     }
 
     fn submit(self: *RootWidget, ctx: *vxfw.EventContext) !void {
+        if (try self.app.submitMode()) {
+            ctx.consumeAndRedraw();
+            return;
+        }
         const loading_index = (try self.app.beginSubmit()) orelse return;
         _ = loading_index;
         try self.app.startTurn();
@@ -641,31 +945,51 @@ const RootWidget = struct {
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
         const input_height: u16 = @min(max_height, 3);
-        const thread_height: u16 = max_height - input_height;
+        const panel_height: u16 = if (self.app.mode == .normal) 0 else @min(max_height -| input_height, 7);
+        const thread_height: u16 = max_height - input_height - panel_height;
 
         var thread_view: ThreadWidget = .{ .app = self.app };
+        var panel_view: PanelWidget = .{ .app = self.app };
         var input_view: InputWidget = .{ .app = self.app };
 
         const thread_ctx = ctx.withConstraints(
             .{ .width = max_width, .height = thread_height },
             .{ .width = max_width, .height = thread_height },
         );
+        const panel_ctx = ctx.withConstraints(
+            .{ .width = max_width, .height = panel_height },
+            .{ .width = max_width, .height = panel_height },
+        );
         const input_ctx = ctx.withConstraints(
             .{ .width = max_width, .height = input_height },
             .{ .width = max_width, .height = input_height },
         );
 
-        const children = try ctx.arena.alloc(vxfw.SubSurface, 2);
+        const child_count: usize = if (panel_height == 0) 2 else 3;
+        const children = try ctx.arena.alloc(vxfw.SubSurface, child_count);
         children[0] = .{
             .origin = .{ .row = 0, .col = 0 },
             .surface = try thread_view.widget().draw(thread_ctx),
             .z_index = 0,
         };
-        children[1] = .{
-            .origin = .{ .row = thread_height, .col = 0 },
-            .surface = try input_view.widget().draw(input_ctx),
-            .z_index = 0,
-        };
+        if (panel_height > 0) {
+            children[1] = .{
+                .origin = .{ .row = thread_height, .col = 0 },
+                .surface = try panel_view.widget().draw(panel_ctx),
+                .z_index = 0,
+            };
+            children[2] = .{
+                .origin = .{ .row = thread_height + panel_height, .col = 0 },
+                .surface = try input_view.widget().draw(input_ctx),
+                .z_index = 0,
+            };
+        } else {
+            children[1] = .{
+                .origin = .{ .row = thread_height, .col = 0 },
+                .surface = try input_view.widget().draw(input_ctx),
+                .z_index = 0,
+            };
+        }
 
         return .{
             .size = .{ .width = max_width, .height = max_height },
@@ -948,6 +1272,224 @@ const MessageWidget = struct {
     }
 };
 
+const Command = enum { new, resume_session };
+const commands = [_]struct { name: []const u8, command: Command }{
+    .{ .name = "new", .command = .new },
+    .{ .name = "resume", .command = .resume_session },
+};
+
+fn inputLabel(app: *const App) []const u8 {
+    return switch (app.mode) {
+        .normal => "Build",
+        .command => "Command",
+        .picker => "Search for Sessions",
+    };
+}
+
+fn resolveCommand(app: *App, filter: []const u8) ?Command {
+    var selected: ?Command = null;
+    var index: u32 = 0;
+    for (commands) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, filter)) continue;
+        if (index == app.command_selection) selected = entry.command;
+        index += 1;
+    }
+    if (selected) |command| return command;
+    if (index == 1) {
+        for (commands) |entry| if (std.mem.startsWith(u8, entry.name, filter)) return entry.command;
+    }
+    return null;
+}
+
+fn commandMatchesCount(app: *App) u32 {
+    const input = app.peekInput() catch return 0;
+    defer app.gpa.free(input);
+    if (input.len == 0) return 0;
+    if (input[0] != ':') return 0;
+    return commandMatchesCountForFilter(input[1..]);
+}
+
+fn commandMatchesCountForFilter(filter: []const u8) u32 {
+    var count: u32 = 0;
+    for (commands) |entry| {
+        if (std.mem.startsWith(u8, entry.name, filter)) count += 1;
+    }
+    return count;
+}
+
+fn inputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(userdata.?));
+    try app.syncModeWithInput(value);
+    ctx.consumeAndRedraw();
+}
+
+const PanelWidget = struct {
+    app: *App,
+
+    fn widget(self: *PanelWidget) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = drawPanel };
+    }
+
+    fn drawPanel(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *PanelWidget = @ptrCast(@alignCast(ptr));
+        const width = ctx.max.width orelse 0;
+        const height = ctx.max.height orelse 0;
+        if (self.app.mode == .command) {
+            var content: CommandPanelContent = .{ .app = self.app };
+            var border: vxfw.Border = .{ .child = content.widget(), .style = StylePalette.tool };
+            return border.widget().draw(ctx);
+        }
+        if (self.app.mode == .picker) {
+            var content: ResumePanelContent = .{ .app = self.app };
+            var border: vxfw.Border = .{ .child = content.widget(), .style = StylePalette.tool };
+            return border.widget().draw(ctx);
+        }
+
+        return vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
+    }
+};
+
+const CommandPanelContent = struct {
+    app: *App,
+
+    fn widget(self: *CommandPanelContent) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = drawContent };
+    }
+
+    fn drawContent(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *CommandPanelContent = @ptrCast(@alignCast(ptr));
+        const width = ctx.max.width orelse 0;
+        const height = ctx.max.height orelse 0;
+        var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
+        try drawCommandPanel(self.app, &surface, ctx);
+        return surface;
+    }
+};
+
+fn drawCommandPanel(app: *App, surface: *vxfw.Surface, ctx: vxfw.DrawContext) std.mem.Allocator.Error!void {
+    const input = app.peekInput() catch return;
+    defer app.gpa.free(input);
+    const filter = if (input.len > 0 and input[0] == ':') input[1..] else "";
+    var row: u16 = 0;
+    var index: u32 = 0;
+    for (commands) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, filter)) continue;
+        var buffer: [32]u8 = undefined;
+        const selected = index == app.command_selection;
+        const prefix = if (selected) "‣ " else "  ";
+        const text = std.fmt.bufPrint(&buffer, "{s}{s}", .{ prefix, entry.name }) catch entry.name;
+        try writeCommandLine(surface, row, text, ctx, selected);
+        row += 1;
+        index += 1;
+        if (row >= surface.size.height) return;
+    }
+}
+
+const ResumePanelContent = struct {
+    app: *App,
+
+    fn widget(self: *ResumePanelContent) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = drawContent };
+    }
+
+    fn drawContent(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *ResumePanelContent = @ptrCast(@alignCast(ptr));
+        const widgets = try self.resumeWidgets(ctx);
+        self.app.resume_list.children = .{ .slice = widgets };
+        self.app.resume_list.item_count = @intCast(widgets.len);
+        self.app.resume_list.cursor = self.app.resume_selection;
+        self.app.resume_list.ensureScroll();
+        return self.app.resume_list.widget().draw(ctx);
+    }
+
+    fn resumeWidgets(self: *ResumePanelContent, ctx: vxfw.DrawContext) ![]vxfw.Widget {
+        const filter = self.app.peekInput() catch "";
+        defer if (filter.len > 0) self.app.gpa.free(filter);
+        const count = try self.app.visibleResumeCount();
+        const widgets = try ctx.arena.alloc(vxfw.Widget, count);
+        const rows = try ctx.arena.alloc(ResumeRowWidget, count);
+        var index: u32 = 0;
+        for (self.app.resume_summaries.items) |*summary| {
+            if (!resumeMatches(summary, filter)) continue;
+            rows[index] = .{ .app = self.app, .summary = summary, .selected = index == self.app.resume_selection };
+            widgets[index] = rows[index].widget();
+            index += 1;
+        }
+        return widgets;
+    }
+};
+
+const ResumeRowWidget = struct {
+    app: *App,
+    summary: *const session_mod.SessionSummary,
+    selected: bool,
+
+    fn widget(self: *ResumeRowWidget) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = drawRow };
+    }
+
+    fn drawRow(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *ResumeRowWidget = @ptrCast(@alignCast(ptr));
+        const width = ctx.max.width orelse 0;
+        var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
+        var buffer: [512]u8 = undefined;
+        const modified = modifiedTime(buffer[400..], self.summary.updated_at_ms);
+        const name = self.summary.title orelse "Untitled";
+        const marker = if (self.selected) "‣ " else "  ";
+        const text = if (self.app.resume_global)
+            std.fmt.bufPrint(buffer[0..400], "{s}{s} · {s} · {s}", .{ marker, name, modified, self.summary.cwd }) catch name
+        else
+            std.fmt.bufPrint(buffer[0..400], "{s}{s} · {s}", .{ marker, name, modified }) catch name;
+        try writeCommandLine(&surface, 0, text, ctx, self.selected);
+        return surface;
+    }
+};
+
+fn writeCommandLine(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool) std.mem.Allocator.Error!void {
+    try writePanelLineAt(surface, row, text, ctx, selected, ConversationLayout.left -| 1);
+}
+
+fn writePanelLine(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool) std.mem.Allocator.Error!void {
+    try writePanelLineAt(surface, row, text, ctx, selected, ConversationLayout.left);
+}
+
+fn writePanelLineAt(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool, start_col: u16) std.mem.Allocator.Error!void {
+    if (row >= surface.size.height) return;
+    const stable_text = try ctx.arena.dupe(u8, text);
+    const style = if (selected) StylePalette.tool else StylePalette.thinking_body;
+    var col: u16 = start_col;
+    var iter = ctx.graphemeIterator(stable_text);
+    while (iter.next()) |grapheme| {
+        if (col + 1 >= surface.size.width) return;
+        const bytes = grapheme.bytes(stable_text);
+        const width: u8 = @intCast(ctx.stringWidth(bytes));
+        if (width == 0) continue;
+        surface.writeCell(col, row, .{ .char = .{ .grapheme = bytes, .width = width }, .style = style });
+        col += width;
+    }
+}
+
+fn resumeMatches(summary: *const session_mod.SessionSummary, filter: []const u8) bool {
+    if (filter.len == 0) return true;
+    if (summary.title) |title| {
+        if (std.mem.indexOf(u8, title, filter) != null) return true;
+    }
+    if (std.mem.indexOf(u8, summary.cwd, filter) != null) return true;
+    if (std.mem.indexOf(u8, summary.id, filter) != null) return true;
+    return false;
+}
+
+fn modifiedTime(buffer: []u8, updated_at_ms: i64) []const u8 {
+    if (updated_at_ms < 0) return "unknown time";
+    if (buffer.len == 0) return "unknown time";
+    var seconds: time_c.time_t = @intCast(@divTrunc(updated_at_ms, 1000));
+    var local: time_c.struct_tm = undefined;
+    if (time_c.localtime_r(&seconds, &local) == null) return "unknown time";
+    const written = time_c.strftime(buffer.ptr, buffer.len, "%Y-%m-%d %H:%M:%S", &local);
+    if (written == 0) return "unknown time";
+    return buffer[0..written];
+}
+
 const InputWidget = struct {
     app: *App,
 
@@ -989,7 +1531,7 @@ const InputWidget = struct {
         var border: vxfw.Border = .{
             .child = row_box.widget(),
             .style = StylePalette.thinking_body,
-            .labels = &.{.{ .text = "Paladin", .alignment = .top_left }},
+            .labels = &.{.{ .text = inputLabel(self.app), .alignment = .top_left }},
         };
         var box: vxfw.SizedBox = .{
             .child = border.widget(),
