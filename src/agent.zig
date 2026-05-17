@@ -2,6 +2,7 @@ const std = @import("std");
 
 const ai = @import("ai.zig");
 const executor_mod = @import("executor.zig");
+const session_mod = @import("session.zig");
 const tools = @import("tools.zig");
 
 const assert = std.debug.assert;
@@ -11,6 +12,7 @@ pub const Agent = struct {
     io: std.Io,
     cwd: []const u8,
     client: ai.LanguageModel,
+    session_writer: ?*session_mod.SessionWriter = null,
     messages: std.ArrayList(ai.ChatMessage) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, client: ai.LanguageModel) Agent {
@@ -20,6 +22,10 @@ pub const Agent = struct {
             .cwd = cwd,
             .client = client,
         };
+    }
+
+    pub fn attachSessionWriter(self: *Agent, session_writer: *session_mod.SessionWriter) void {
+        self.session_writer = session_writer;
     }
 
     pub fn addSystem(self: *Agent, content: []const u8) !void {
@@ -45,6 +51,10 @@ pub const Agent = struct {
 
     pub fn addUser(self: *Agent, content: []const u8) !void {
         try self.appendMessage("user", content);
+    }
+
+    pub fn takeMessage(self: *Agent, message: ai.ChatMessage) !void {
+        try self.messages.append(self.gpa, message);
     }
 
     /// The tagged union the agent emits to describe what is happening.
@@ -323,6 +333,7 @@ pub const Agent = struct {
             .role = owned_role,
             .content = owned_content,
         });
+        try self.persistLastMessage();
     }
 
     /// Append an assistant message that emitted at least one tool_call.
@@ -372,6 +383,7 @@ pub const Agent = struct {
             .content = owned_content,
             .tool_calls = stored,
         });
+        try self.persistLastMessage();
     }
 
     /// Move the LLM-channel fields of each ToolResult into a `tool` role
@@ -399,6 +411,7 @@ pub const Agent = struct {
                 .content = r.content,
                 .tool_call_id = r.tool_call_id,
             });
+            try self.persistLastMessage();
             // content and tool_call_id are now owned by `messages`. The
             // human-channel fields were already consumed by `on_finished`.
             self.gpa.free(r.name);
@@ -408,6 +421,13 @@ pub const Agent = struct {
             r.* = undefined;
             moved += 1;
         }
+    }
+
+    fn persistLastMessage(self: *Agent) !void {
+        const session_writer = self.session_writer orelse return;
+        assert(self.messages.items.len > 0);
+        const message = self.messages.items[self.messages.items.len - 1];
+        try session_writer.append(message);
     }
 };
 
