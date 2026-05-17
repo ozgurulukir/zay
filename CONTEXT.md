@@ -63,6 +63,10 @@ _Avoid_: code_search
 The service that creates, resumes, branches, and persists durable agent sessions.
 _Avoid_: ThreadManager
 
+**Command**:
+A TUI-only command entered at the prompt with `:` as the first byte, used for local interaction such as creating or resuming sessions rather than sending a message to the model.
+_Avoid_: Slash command
+
 **Schema**:
 The per-tool argument shape carried inside a **Tool** — `{ properties: []Property }` where each `Property = { name, kind, description, required }`. Generic over the union of property names across all tools (no hard-coded `command` / `path` / `content` / `input` / `query` fields as in the old `JsonSchemaProperties` struct). Each adapter translates `Schema` into its provider's tools-JSON shape inside the adapter, not in `tools.zig`.
 _Avoid_: "JSON schema" (the Schema is provider-neutral; what each adapter emits is the provider's tool-schema JSON).
@@ -109,6 +113,7 @@ _Avoid_: "ToolFinish" (an earlier sketch had a separate type for the human chann
 - The **Tool registry** is consumed by **ExecutorService** (for dispatch) and by each **LanguageModel** variant (for building its provider-specific tools schema from each **Tool**'s **Schema**). The agent never sees it; the TUI never sees it.
 - The agent loops: ask the **LanguageModel** for a turn, hand any **ToolCall**s to the **ExecutorService**, fold the **ToolResult**s into history, repeat — emitting **Agent.Event**s at every transition.
 - A **SessionManager** persists durable sessions; a **Thread** renders transient TUI messages.
+- A **Command** is handled by the TUI and does not become an agent history message.
 
 ## Conventions
 
