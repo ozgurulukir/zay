@@ -214,7 +214,7 @@ fn writeToolOutput(out: *std.Io.Writer, message: ai.ChatMessage) !void {
     try out.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
     try std.json.Stringify.value(message.call_id orelse "", .{}, out);
     try out.writeAll(",\"output\":");
-    try std.json.Stringify.value(messageText(message), .{}, out);
+    try std.json.Stringify.value(message.text(), .{}, out);
     try out.writeByte('}');
 }
 
@@ -246,11 +246,6 @@ fn writeInputContent(out: *std.Io.Writer, blocks: []const ai.ContentBlock) !void
         }
     }
     try out.writeByte(']');
-}
-
-fn messageText(message: ai.ChatMessage) []const u8 {
-    for (message.content) |block| if (block == .text) return block.text.text;
-    return "";
 }
 
 const ToolBuilder = struct {

@@ -411,7 +411,7 @@ pub const SessionWriter = struct {
         const role = try self.gpa.dupe(u8, message.role.label());
         errdefer self.gpa.free(role);
         const title_candidate = if (message.role == .user)
-            try titleFromUserMessage(self.gpa, messageText(message))
+            try titleFromUserMessage(self.gpa, message.text())
         else
             null;
         errdefer if (title_candidate) |title| self.gpa.free(title);
@@ -743,13 +743,6 @@ fn branchSummaryToJson(gpa: std.mem.Allocator, from_id: []const u8, summary: []c
     return out.toOwnedSlice();
 }
 
-fn messageText(message: ai.ChatMessage) []const u8 {
-    for (message.content) |block| {
-        if (block == .text) return block.text.text;
-    }
-    return "";
-}
-
 fn titleFromUserMessage(gpa: std.mem.Allocator, content: []const u8) Error!?[]u8 {
     const trimmed = std.mem.trim(u8, content, " \t\r\n");
     if (trimmed.len == 0) return null;
@@ -856,7 +849,7 @@ test "session persists and loads messages" {
     }
     try std.testing.expectEqual(@as(usize, 1), messages.len);
     try std.testing.expectEqual(.user, messages[0].role);
-    try std.testing.expectEqualStrings("hello", messageText(messages[0]));
+    try std.testing.expectEqualStrings("hello", messages[0].text());
 }
 
 test "session branch with summary changes context" {
@@ -885,6 +878,6 @@ test "session branch with summary changes context" {
         std.testing.allocator.free(messages);
     }
     try std.testing.expectEqual(@as(usize, 2), messages.len);
-    try std.testing.expectEqualStrings("root", messageText(messages[0]));
-    try std.testing.expectEqualStrings("Branch summary: old branch was abandoned", messageText(messages[1]));
+    try std.testing.expectEqualStrings("root", messages[0].text());
+    try std.testing.expectEqualStrings("Branch summary: old branch was abandoned", messages[1].text());
 }

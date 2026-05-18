@@ -132,6 +132,13 @@ pub const ChatMessage = struct {
     content: []ContentBlock,
     call_id: ?[]u8 = null,
 
+    pub fn text(self: ChatMessage) []const u8 {
+        for (self.content) |block| {
+            if (block == .text) return block.text.text;
+        }
+        return "";
+    }
+
     pub fn deinit(self: *ChatMessage, gpa: std.mem.Allocator) void {
         for (self.content) |*block| block.deinit(gpa);
         gpa.free(self.content);
