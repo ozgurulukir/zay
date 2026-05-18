@@ -19,6 +19,8 @@ pub const Config = struct {
     base_url: []const u8 = "https://api.openai.com",
     api_key: []const u8 = "",
     model: []const u8 = "gpt-5.5",
+    use_responses_endpoint: bool = false,
+    reasoning: ?ai.Reasoning = .{},
     /// When null, the embedded `src/prompts/system.md` is used.
     system_prompt: ?[]const u8 = null,
 
@@ -32,11 +34,12 @@ pub const Config = struct {
             .base_url = env.get("OPENAI_BASE_URL") orelse "https://api.openai.com",
             .api_key = env.get("OPENAI_API_KEY") orelse "",
             .model = env.get("OPENAI_MODEL") orelse "gpt-5.5",
+            .use_responses_endpoint = if (env.get("USE_RESPONSES_ENDPOINT")) |value| std.mem.eql(u8, value, "1") else false,
         };
     }
 };
 
-/// The single user-facing entry point. Wires `openai.Client` →
+/// The single user-facing entry point. Wires `openai_compatible.Client` →
 /// `ExecutorService` (via the agent's internal bridge) → `Agent` → TUI,
 /// then blocks until the TUI exits. Embedders that need a different
 /// listener (headless mode, FFI shim, test harness) drop down to
@@ -47,21 +50,38 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, config: Config) !void
 
     const runtime_gpa = std.heap.smp_allocator;
 
-    var openai_client: ai.openai.Client = undefined;
-    try openai_client.init(runtime_gpa, init.io, .{
-        .base_url = config.base_url,
-        .api_key = config.api_key,
-        .model = config.model,
-        .tools = tools.registry,
-    });
-    defer openai_client.deinit();
+    var openai_compatible_client: ai.openai_compatible.Client = undefined;
+    var openai_responses_client: ai.openai_responses.Client = undefined;
+    const client: ai.LanguageModel = if (config.use_responses_endpoint) blk: {
+        try openai_responses_client.init(runtime_gpa, init.io, .{
+            .base_url = config.base_url,
+            .api_key = config.api_key,
+            .model = config.model,
+            .tools = tools.registry,
+            .reasoning = config.reasoning,
+        });
+        break :blk .{ .openai_responses = &openai_responses_client };
+    } else blk: {
+        try openai_compatible_client.init(runtime_gpa, init.io, .{
+            .base_url = config.base_url,
+            .api_key = config.api_key,
+            .model = config.model,
+            .tools = tools.registry,
+            .reasoning = config.reasoning,
+        });
+        break :blk .{ .openai_compatible = &openai_compatible_client };
+    };
+    defer switch (client) {
+        .openai_compatible => openai_compatible_client.deinit(),
+        .openai_responses => openai_responses_client.deinit(),
+    };
 
     search.start(gpa, cwd);
     defer search.deinit(gpa);
 
     const system_prompt = config.system_prompt orelse @embedFile("prompts/system.md");
     const agent_runtime = try gpa.create(runtime.AgentRuntime);
-    try agent_runtime.initNew(runtime_gpa, init.io, cwd, .{ .openai = &openai_client }, system_prompt);
+    try agent_runtime.initNew(runtime_gpa, init.io, cwd, client, system_prompt);
 
     try tui.run(init, agent_runtime);
 }

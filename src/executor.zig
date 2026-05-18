@@ -14,7 +14,7 @@ const assert = std.debug.assert;
 /// record. See CONTEXT.md's `ToolResult`.
 pub const ToolResult = struct {
     /// LLM channel — the id this result is responding to.
-    tool_call_id: []u8,
+    call_id: []u8,
     /// LLM channel — the terse observation that flows into the assistant's
     /// next `tool` role message in history.
     content: []u8,
@@ -33,7 +33,7 @@ pub const ToolResult = struct {
     failed: bool,
 
     pub fn deinit(self: *ToolResult, gpa: std.mem.Allocator) void {
-        gpa.free(self.tool_call_id);
+        gpa.free(self.call_id);
         gpa.free(self.content);
         gpa.free(self.name);
         gpa.free(self.display_label);
@@ -103,8 +103,8 @@ pub const ExecutorService = struct {
         var output = try tools.run(self.gpa, self.io, self.cwd, call.name, call.arguments);
         defer output.deinit(self.gpa);
 
-        const tool_call_id = try self.gpa.dupe(u8, call.id);
-        errdefer self.gpa.free(tool_call_id);
+        const call_id = try self.gpa.dupe(u8, call.call_id);
+        errdefer self.gpa.free(call_id);
         const content = try formatLlmObservation(self.gpa, output);
         errdefer self.gpa.free(content);
         const name = try self.gpa.dupe(u8, call.name);
@@ -116,7 +116,7 @@ pub const ExecutorService = struct {
         const stderr = try makeStderrBody(self.gpa, output.stderr);
         const failed = output.code != 0;
         return .{
-            .tool_call_id = tool_call_id,
+            .call_id = call_id,
             .content = content,
             .name = name,
             .display_label = display_label,
@@ -179,13 +179,13 @@ test "ExecutorService runs bash and returns both channels" {
 
     const calls = [_]ai.ToolCall{
         .{
-            .id = try gpa.dupe(u8, "call_0"),
+            .call_id = try gpa.dupe(u8, "call_0"),
             .name = try gpa.dupe(u8, "bash"),
             .arguments = try gpa.dupe(u8, "{\"command\":\"printf hello\"}"),
         },
     };
     defer for (calls) |c| {
-        gpa.free(c.id);
+        gpa.free(c.call_id);
         gpa.free(c.name);
         gpa.free(c.arguments);
     };
@@ -196,7 +196,7 @@ test "ExecutorService runs bash and returns both channels" {
         gpa.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("call_0", results[0].tool_call_id);
+    try std.testing.expectEqualStrings("call_0", results[0].call_id);
     try std.testing.expectEqualStrings("hello", results[0].content);
     try std.testing.expectEqualStrings("printf hello", results[0].display_label);
     try std.testing.expect(!results[0].failed);

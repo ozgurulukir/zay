@@ -1,11 +1,13 @@
 const std = @import("std");
 const tools_common = @import("tools/common.zig");
 
-pub const openai = @import("ai/openai.zig");
+pub const openai_compatible = @import("ai/openai_compatible.zig");
+pub const openai_responses = @import("ai/openai_responses.zig");
 
 pub const Tool = tools_common.Tool;
 
 pub const ReasoningEffort = enum {
+    minimal,
     low,
     medium,
     high,
@@ -16,76 +18,143 @@ pub const ReasoningEffort = enum {
     }
 };
 
+pub const ReasoningSummary = enum {
+    auto,
+    concise,
+    detailed,
+
+    pub fn label(self: ReasoningSummary) []const u8 {
+        return @tagName(self);
+    }
+};
+
+pub const Reasoning = struct {
+    effort: ?ReasoningEffort = .medium,
+    summary: ?ReasoningSummary = .auto,
+};
+
 pub const Config = struct {
     base_url: []const u8,
     api_key: []const u8,
     model: []const u8,
-    /// Tools the model can call. Each adapter consumes this to build its
-    /// provider-specific tool schema JSON. Protocol-neutral.
     tools: []const Tool = &.{},
-    reasoning_effort: ?ReasoningEffort = .medium,
+    reasoning: ?Reasoning = .{},
 };
 
-/// The canonical, finalised record of one tool call — `{ id, name, arguments }`.
-/// Lives on assistant `ChatMessage`s in history and in `Response.tool_calls`.
-/// Ids are guaranteed non-empty; the LanguageModel adapter mints fallbacks
-/// when the protocol omits them. Distinct from `ToolDelta` (the streaming
-/// chunk shape, carried inside `StreamObserver.on_tool_delta`).
+pub const Role = enum {
+    system,
+    user,
+    assistant,
+    tool,
+
+    pub fn label(self: Role) []const u8 {
+        return @tagName(self);
+    }
+
+    pub fn fromString(role: []const u8) !Role {
+        if (std.mem.eql(u8, role, "system")) return .system;
+        if (std.mem.eql(u8, role, "user")) return .user;
+        if (std.mem.eql(u8, role, "assistant")) return .assistant;
+        if (std.mem.eql(u8, role, "tool")) return .tool;
+        return error.InvalidRole;
+    }
+};
+
+pub const TextBlock = struct {
+    text: []u8,
+    responses_item_id: ?[]u8 = null,
+    responses_phase: ?[]u8 = null,
+
+    pub fn deinit(self: *TextBlock, gpa: std.mem.Allocator) void {
+        gpa.free(self.text);
+        if (self.responses_item_id) |id| gpa.free(id);
+        if (self.responses_phase) |phase| gpa.free(phase);
+        self.* = undefined;
+    }
+};
+
+pub const ImageBlock = struct {
+    mime_type: []u8,
+    data_base64: []u8,
+
+    pub fn deinit(self: *ImageBlock, gpa: std.mem.Allocator) void {
+        gpa.free(self.mime_type);
+        gpa.free(self.data_base64);
+        self.* = undefined;
+    }
+};
+
+pub const ReasoningBlock = struct {
+    text: []u8,
+    responses_item_json: ?[]u8 = null,
+
+    pub fn deinit(self: *ReasoningBlock, gpa: std.mem.Allocator) void {
+        gpa.free(self.text);
+        if (self.responses_item_json) |json| gpa.free(json);
+        self.* = undefined;
+    }
+};
+
 pub const ToolCall = struct {
-    id: []u8,
+    call_id: []u8,
+    responses_item_id: ?[]u8 = null,
     name: []u8,
     arguments: []u8,
 
     pub fn deinit(self: *ToolCall, gpa: std.mem.Allocator) void {
-        gpa.free(self.id);
+        gpa.free(self.call_id);
+        if (self.responses_item_id) |id| gpa.free(id);
         gpa.free(self.name);
         gpa.free(self.arguments);
         self.* = undefined;
     }
 };
 
-/// A streaming chunk of one in-progress tool call, delivered to
-/// `StreamObserver.on_tool_delta`. `name` and `arguments` are *chunks*, not
-/// complete values; the adapter accumulates them internally and assembles
-/// the finalised `ToolCall` for the returned `Response`. Borrowed for the
-/// duration of the callback.
+pub const ContentBlock = union(enum) {
+    text: TextBlock,
+    image: ImageBlock,
+    reasoning: ReasoningBlock,
+    tool_call: ToolCall,
+
+    pub fn deinit(self: *ContentBlock, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .text => |*block| block.deinit(gpa),
+            .image => |*block| block.deinit(gpa),
+            .reasoning => |*block| block.deinit(gpa),
+            .tool_call => |*block| block.deinit(gpa),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const ChatMessage = struct {
+    role: Role,
+    content: []ContentBlock,
+    call_id: ?[]u8 = null,
+
+    pub fn deinit(self: *ChatMessage, gpa: std.mem.Allocator) void {
+        for (self.content) |*block| block.deinit(gpa);
+        gpa.free(self.content);
+        if (self.call_id) |id| gpa.free(id);
+        self.* = undefined;
+    }
+};
+
+pub const Turn = struct {
+    assistant: ChatMessage,
+
+    pub fn deinit(self: *Turn, gpa: std.mem.Allocator) void {
+        self.assistant.deinit(gpa);
+        self.* = undefined;
+    }
+};
+
 pub const ToolDelta = struct {
     index: u32,
     name: []const u8,
     arguments: []const u8,
 };
 
-pub const ChatMessage = struct {
-    role: []const u8,
-    content: []const u8,
-    /// Present only for messages with role="tool". Holds the id of the
-    /// assistant tool_call this result is responding to.
-    tool_call_id: ?[]const u8 = null,
-    /// Present only for messages with role="assistant" that emitted at least
-    /// one tool call. The order matches the response's tool_calls order.
-    tool_calls: []const ToolCall = &.{},
-};
-
-pub const Response = struct {
-    content: []u8,
-    reasoning: []u8,
-    tool_calls: std.ArrayList(ToolCall) = .empty,
-
-    pub fn deinit(self: *Response, gpa: std.mem.Allocator) void {
-        gpa.free(self.content);
-        gpa.free(self.reasoning);
-        for (self.tool_calls.items) |*tool_call| {
-            tool_call.deinit(gpa);
-        }
-        self.tool_calls.deinit(gpa);
-        self.* = undefined;
-    }
-};
-
-/// The narrow private callback interface a `LanguageModel` adapter uses to
-/// report inference progress back to its caller (the agent). Typed
-/// callbacks — no optional fn pointers; consumers that don't want a given
-/// callback supply the matching `StreamObserver.noop_*` fn.
 pub const StreamObserver = struct {
     ptr: *anyopaque,
     on_content: *const fn (*anyopaque, []const u8) anyerror!void,
@@ -93,8 +162,6 @@ pub const StreamObserver = struct {
     on_tool_delta: *const fn (*anyopaque, ToolDelta) anyerror!void,
     on_delta_end: *const fn (*anyopaque) anyerror!void,
 
-    /// A no-op observer for callers that don't care about streaming
-    /// callbacks (most tests). Branch-free at the call site.
     pub const noop: StreamObserver = .{
         .ptr = undefined,
         .on_content = noopBytes,
@@ -108,19 +175,18 @@ pub const StreamObserver = struct {
     pub fn noopVoid(_: *anyopaque) anyerror!void {}
 };
 
-/// The agent's seam to LLM inference. A tagged union over LM adapters —
-/// `openai` today; more planned. Exposes `prompt(messages, observer)` which
-/// dispatches to the active adapter. The agent never sees protocol vocabulary.
 pub const LanguageModel = union(enum) {
-    openai: *openai.Client,
+    openai_compatible: *openai_compatible.Client,
+    openai_responses: *openai_responses.Client,
 
     pub fn prompt(
         self: LanguageModel,
         messages: []const ChatMessage,
         observer: StreamObserver,
-    ) !Response {
+    ) !Turn {
         return switch (self) {
-            .openai => |c| c.prompt(messages, observer),
+            .openai_compatible => |c| c.prompt(messages, observer),
+            .openai_responses => |c| c.prompt(messages, observer),
         };
     }
 };
