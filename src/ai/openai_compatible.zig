@@ -77,7 +77,7 @@ pub const Client = struct {
         self: *Client,
         messages: []const ai.ChatMessage,
         observer: ai.StreamObserver,
-    ) !ai.Response {
+    ) !ai.Turn {
         std.debug.assert(self.url.len > 0);
         std.debug.assert(self.authorization.len > 0);
 
@@ -97,7 +97,7 @@ pub const Client = struct {
             self.config.model,
             messages,
             self.tools_json,
-            self.config.reasoning_effort,
+            self.config.reasoning,
         );
         try body_writer.end();
         try req.connection.?.flush();
@@ -170,27 +170,79 @@ fn writeToolDefinition(
 
 fn writeMessage(out: *std.Io.Writer, message: ai.ChatMessage) !void {
     try out.writeAll("{\"role\":");
-    try std.json.Stringify.value(message.role, .{}, out);
+    try std.json.Stringify.value(message.role.label(), .{}, out);
     try out.writeAll(",\"content\":");
-    try std.json.Stringify.value(message.content, .{}, out);
-    if (message.tool_call_id) |tool_call_id| {
-        try out.writeAll(",\"tool_call_id\":");
-        try std.json.Stringify.value(tool_call_id, .{}, out);
+    if (message.role == .user) {
+        try writeUserContent(out, message.content);
+    } else {
+        try writeTextContent(out, message.content);
     }
-    if (message.tool_calls.len > 0) {
-        try out.writeAll(",\"tool_calls\":[");
-        for (message.tool_calls, 0..) |tool_call, index| {
-            if (index > 0) try out.writeByte(',');
-            try writeToolCall(out, tool_call);
+    if (message.call_id) |call_id| {
+        try out.writeAll(",\"tool_call_id\":");
+        try std.json.Stringify.value(call_id, .{}, out);
+    }
+    if (message.role == .assistant) {
+        var wrote_calls = false;
+        for (message.content) |block| {
+            if (block != .tool_call) continue;
+            if (!wrote_calls) {
+                try out.writeAll(",\"tool_calls\":[");
+                wrote_calls = true;
+            } else {
+                try out.writeByte(',');
+            }
+            try writeToolCall(out, block.tool_call);
         }
-        try out.writeByte(']');
+        if (wrote_calls) try out.writeByte(']');
     }
     try out.writeByte('}');
 }
 
+fn writeTextContent(out: *std.Io.Writer, blocks: []const ai.ContentBlock) !void {
+    var aw: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);
+    defer aw.deinit();
+    for (blocks) |block| {
+        switch (block) {
+            .text => |text| try aw.writer.writeAll(text.text),
+            .reasoning, .image, .tool_call => {},
+        }
+    }
+    try std.json.Stringify.value(aw.written(), .{}, out);
+}
+
+fn writeUserContent(out: *std.Io.Writer, blocks: []const ai.ContentBlock) !void {
+    try out.writeByte('[');
+    var count: u32 = 0;
+    for (blocks) |block| {
+        switch (block) {
+            .text => |text| {
+                if (count > 0) try out.writeByte(',');
+                try out.writeAll("{\"type\":\"text\",\"text\":");
+                try std.json.Stringify.value(text.text, .{}, out);
+                try out.writeByte('}');
+                count += 1;
+            },
+            .image => |image| {
+                if (count > 0) try out.writeByte(',');
+                try out.writeAll("{\"type\":\"image_url\",\"image_url\":{\"url\":");
+                try out.writeByte('"');
+                try out.writeAll("data:");
+                try out.writeAll(image.mime_type);
+                try out.writeAll(";base64,");
+                try out.writeAll(image.data_base64);
+                try out.writeByte('"');
+                try out.writeAll("}}");
+                count += 1;
+            },
+            .reasoning, .tool_call => {},
+        }
+    }
+    try out.writeByte(']');
+}
+
 fn writeToolCall(out: *std.Io.Writer, tool_call: ai.ToolCall) !void {
     try out.writeAll("{\"id\":");
-    try std.json.Stringify.value(tool_call.id, .{}, out);
+    try std.json.Stringify.value(tool_call.call_id, .{}, out);
     try out.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
     try std.json.Stringify.value(tool_call.name, .{}, out);
     try out.writeAll(",\"arguments\":");
@@ -203,7 +255,7 @@ fn writeRequestPayload(
     model: []const u8,
     messages: []const ai.ChatMessage,
     tools_json: []const u8,
-    reasoning_effort: ?ai.ReasoningEffort,
+    reasoning: ?ai.Reasoning,
 ) !void {
     std.debug.assert(model.len > 0);
     std.debug.assert(tools_json.len > 0);
@@ -218,10 +270,12 @@ fn writeRequestPayload(
     try out.writeAll("],\"stream\":true,\"tools\":");
     try out.writeAll(tools_json);
     try out.writeAll(",\"tool_choice\":\"auto\"");
-    if (reasoning_effort) |effort| {
-        try out.writeAll(",\"reasoning_effort\":\"");
-        try out.writeAll(effort.label());
-        try out.writeAll("\"");
+    if (reasoning) |value| {
+        if (value.effort) |effort| {
+            try out.writeAll(",\"reasoning_effort\":\"");
+            try out.writeAll(effort.label());
+            try out.writeAll("\"");
+        }
     }
     try out.writeByte('}');
 }
@@ -250,7 +304,7 @@ const ToolCallBuilder = struct {
             break :id_blk minted;
         };
         return .{
-            .id = id,
+            .call_id = id,
             .name = try self.name.toOwnedSlice(gpa),
             .arguments = try self.arguments.toOwnedSlice(gpa),
         };
@@ -262,7 +316,7 @@ fn readStream(
     reader: *std.Io.Reader,
     observer: ai.StreamObserver,
     tool_call_seq: *u64,
-) !ai.Response {
+) !ai.Turn {
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(gpa);
     var reasoning: std.ArrayList(u8) = .empty;
@@ -290,17 +344,22 @@ fn readStream(
         try processStreamChunk(gpa, data, &content, &reasoning, &builders, observer);
     }
 
-    var result: ai.Response = .{
-        .content = try content.toOwnedSlice(gpa),
-        .reasoning = try reasoning.toOwnedSlice(gpa),
-    };
-    errdefer result.deinit(gpa);
-
+    var blocks: std.ArrayList(ai.ContentBlock) = .empty;
+    errdefer {
+        for (blocks.items) |*block| block.deinit(gpa);
+        blocks.deinit(gpa);
+    }
+    if (reasoning.items.len > 0) {
+        try blocks.append(gpa, .{ .reasoning = .{ .text = try reasoning.toOwnedSlice(gpa) } });
+    }
+    if (content.items.len > 0) {
+        try blocks.append(gpa, .{ .text = .{ .text = try content.toOwnedSlice(gpa) } });
+    }
     for (builders.items) |*builder| {
         if (builder.name.items.len == 0) continue;
-        try result.tool_calls.append(gpa, try builder.toToolCall(gpa, tool_call_seq));
+        try blocks.append(gpa, .{ .tool_call = try builder.toToolCall(gpa, tool_call_seq) });
     }
-    return result;
+    return .{ .assistant = .{ .role = .assistant, .content = try blocks.toOwnedSlice(gpa) } };
 }
 
 fn readStreamLine(gpa: std.mem.Allocator, reader: *std.Io.Reader) !?[]u8 {
@@ -651,7 +710,7 @@ test "readStream accepts an SSE line larger than the transfer buffer" {
     var tool_call_seq: u64 = 0;
     var response = try readStream(gpa, &reader, ai.StreamObserver.noop, &tool_call_seq);
     defer response.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, transfer_buffer_bytes + 512), response.content.len);
+    try std.testing.expectEqual(@as(usize, transfer_buffer_bytes + 512), response.assistant.content[0].text.text.len);
 }
 
 test "parse streaming tool deltas as they arrive" {
