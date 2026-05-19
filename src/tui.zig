@@ -7,6 +7,7 @@ const time_c = @cImport({
 
 const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
+const codex = @import("codex.zig");
 const openai_compatible_mod = @import("ai/openai_compatible.zig");
 const runtime_mod = @import("runtime.zig");
 const session_mod = @import("session.zig");
@@ -82,6 +83,12 @@ pub const App = struct {
     resume_selection: u32 = 0,
     resume_global: bool = false,
     resume_summaries: std.ArrayList(session_mod.SessionSummary) = .empty,
+    codex_models: std.ArrayList(codex.Model) = .empty,
+    model_reasoning: std.ArrayList(u32) = .empty,
+    model_selection: u32 = 0,
+    model_column: ModelColumn = .model,
+    provider_selection: u32 = 0,
+    owned_codex_client: ?*ai.codex_responses.Client = null,
     retired_threads: std.ArrayList(thread_mod.Thread) = .empty,
     in_flight: bool = false,
     loading_index: ?u32 = null,
@@ -105,8 +112,14 @@ pub const App = struct {
         .draw_cursor = false,
         .wheel_scroll = 3,
     },
+    model_list: vxfw.ListView = .{
+        .children = .{ .slice = &.{} },
+        .draw_cursor = false,
+        .wheel_scroll = 3,
+    },
 
-    const Mode = enum { normal, command, picker };
+    const Mode = enum { normal, command, picker, provider_picker, model_picker };
+    const ModelColumn = enum { model, reasoning };
 
     pub fn init(io: std.Io, gpa: std.mem.Allocator, agent: *agent_mod.Agent) App {
         return .{
@@ -139,6 +152,13 @@ pub const App = struct {
         for (self.retired_threads.items) |*thread| thread.deinit(self.gpa);
         self.retired_threads.deinit(self.gpa);
         self.resumeClear();
+        self.codexModelsClear();
+        self.codex_models.deinit(self.gpa);
+        self.model_reasoning.deinit(self.gpa);
+        if (self.owned_codex_client) |client| {
+            client.deinit();
+            self.gpa.destroy(client);
+        }
         if (self.owns_runtime) {
             if (self.runtime) |runtime| {
                 runtime.deinit();
@@ -420,6 +440,36 @@ pub const App = struct {
     }
 
     pub fn handleCommandKey(self: *App, key: vaxis.Key) !bool {
+        if (self.mode == .provider_picker) {
+            if (key.matches(vaxis.Key.up, .{})) return true;
+            if (key.matches(vaxis.Key.down, .{})) return true;
+            return false;
+        }
+        if (self.mode == .model_picker) {
+            if (key.matches(vaxis.Key.left, .{})) {
+                self.model_column = .model;
+                return true;
+            }
+            if (key.matches(vaxis.Key.right, .{})) {
+                if (self.codex_models.items.len > 0) self.model_column = .reasoning;
+                return true;
+            }
+            if (key.matches(vaxis.Key.tab, .{})) {
+                if (self.model_column == .reasoning) try self.cycleSelectedReasoning();
+                return true;
+            }
+            if (key.matches(vaxis.Key.up, .{})) {
+                self.model_selection = previousIndex(self.model_selection, @intCast(self.codex_models.items.len));
+                self.syncModelListCursor();
+                return true;
+            }
+            if (key.matches(vaxis.Key.down, .{})) {
+                self.model_selection = nextIndex(self.model_selection, @intCast(self.codex_models.items.len));
+                self.syncModelListCursor();
+                return true;
+            }
+            return false;
+        }
         if (self.mode == .picker) {
             if (key.matches('g', .{})) {
                 self.resume_global = !self.resume_global;
@@ -427,13 +477,12 @@ pub const App = struct {
                 return true;
             }
             if (key.matches(vaxis.Key.up, .{})) {
-                if (self.resume_selection > 0) self.resume_selection -= 1;
+                self.resume_selection = previousIndex(self.resume_selection, try self.visibleResumeCount());
                 self.syncResumeListCursor();
                 return true;
             }
             if (key.matches(vaxis.Key.down, .{})) {
-                const count = try self.visibleResumeCount();
-                if (self.resume_selection + 1 < count) self.resume_selection += 1;
+                self.resume_selection = nextIndex(self.resume_selection, try self.visibleResumeCount());
                 self.syncResumeListCursor();
                 return true;
             }
@@ -441,11 +490,11 @@ pub const App = struct {
         }
         if (self.mode == .command) {
             if (key.matches(vaxis.Key.up, .{})) {
-                if (self.command_selection > 0) self.command_selection -= 1;
+                self.command_selection = previousIndex(self.command_selection, commandMatchesCount(self));
                 return true;
             }
             if (key.matches(vaxis.Key.down, .{})) {
-                if (self.command_selection + 1 < commandMatchesCount(self)) self.command_selection += 1;
+                self.command_selection = nextIndex(self.command_selection, commandMatchesCount(self));
                 return true;
             }
             return false;
@@ -468,8 +517,17 @@ pub const App = struct {
     }
 
     fn syncModeWithInput(self: *App, value: []const u8) !void {
-        if (self.mode == .picker) {
-            if (self.resume_selection >= try self.visibleResumeCount()) self.resume_selection = 0;
+        if (self.mode == .picker or self.mode == .provider_picker or self.mode == .model_picker) {
+            if (value.len > 0) {
+                if (value[0] == ':') {
+                    self.mode = .command;
+                    self.command_selection = 0;
+                    return;
+                }
+            }
+            if (self.mode == .picker) {
+                if (self.resume_selection >= try self.visibleResumeCount()) self.resume_selection = 0;
+            }
             return;
         }
         if (value.len == 0) {
@@ -489,9 +547,8 @@ pub const App = struct {
 
     fn cancelMode(self: *App) !bool {
         if (self.mode == .normal) return false;
-        if (self.mode == .picker) {
-            self.mode = .command;
-            self.clearInput();
+        if (self.mode == .picker or self.mode == .provider_picker or self.mode == .model_picker) {
+            try self.openCommandMenu();
             self.resumeClear();
             return true;
         }
@@ -504,6 +561,15 @@ pub const App = struct {
     fn submitMode(self: *App) !bool {
         const input = try self.peekInput();
         defer self.gpa.free(input);
+        if (self.mode == .provider_picker) {
+            self.connectCodex() catch |err| try self.reportConnectionError(err);
+            return true;
+        }
+        if (self.mode == .model_picker) {
+            if (self.codex_models.items.len == 0) return true;
+            self.applySelectedModel() catch |err| try self.reportConnectionError(err);
+            return true;
+        }
         if (self.mode == .picker) {
             const summary = try self.selectedResumeSummary() orelse return true;
             self.switchToSession(summary.id) catch |err| {
@@ -520,9 +586,18 @@ pub const App = struct {
             switch (command) {
                 .new => self.switchToNewSession() catch |err| try self.reportSessionSwitchError(err),
                 .resume_session => try self.openResumePicker(),
+                .connect => try self.openProviderPicker(),
+                .model => try self.openModelPicker(),
             }
         }
         return true;
+    }
+
+    fn openCommandMenu(self: *App) !void {
+        self.mode = .command;
+        self.clearInput();
+        try self.input.insertSliceAtCursor(":");
+        self.command_selection = 0;
     }
 
     fn openResumePicker(self: *App) !void {
@@ -531,6 +606,107 @@ pub const App = struct {
         self.resume_selection = 0;
         self.clearInput();
         try self.reloadResumeSessions();
+    }
+
+    fn openProviderPicker(self: *App) !void {
+        self.mode = .provider_picker;
+        self.provider_selection = 0;
+        self.clearInput();
+    }
+
+    fn openModelPicker(self: *App) !void {
+        self.mode = .model_picker;
+        self.model_column = .model;
+        self.clearInput();
+        if (self.codex_models.items.len == 0) {
+            self.reloadCodexModels() catch {};
+        }
+    }
+
+    fn connectCodex(self: *App) !void {
+        if (self.in_flight) return error.InFlightTurn;
+        var credentials = try codex.login(self.gpa, self.io);
+        defer credentials.deinit(self.gpa);
+        try self.reloadCodexModels();
+        const model = self.selectedCodexModel() orelse return error.NoModels;
+        try self.installCodexClient(credentials, model.id, self.selectedReasoningEffort());
+        self.mode = .normal;
+        self.clearInput();
+        _ = try self.thread.append(self.gpa, .agent, "agent", "Connected to OpenAI Codex.");
+    }
+
+    fn applySelectedModel(self: *App) !void {
+        if (self.in_flight) return error.InFlightTurn;
+        const loaded = try codex.load(self.gpa, self.io);
+        var credentials = loaded orelse return error.NotConnected;
+        defer credentials.deinit(self.gpa);
+        if (self.codex_models.items.len == 0) try self.reloadCodexModels();
+        const model = self.selectedCodexModel() orelse return error.NoModels;
+        try self.installCodexClient(credentials, model.id, self.selectedReasoningEffort());
+        self.mode = .normal;
+        self.clearInput();
+    }
+
+    fn reloadCodexModels(self: *App) !void {
+        const models = try codex.loadStaticModels(self.gpa);
+        self.codexModelsClear();
+        try self.codex_models.appendSlice(self.gpa, models);
+        self.gpa.free(models);
+        self.model_reasoning.clearRetainingCapacity();
+        try self.model_reasoning.appendNTimes(self.gpa, 0, self.codex_models.items.len);
+        if (self.model_selection >= self.codex_models.items.len) self.model_selection = 0;
+        self.syncModelListCursor();
+    }
+
+    fn selectedReasoningIndex(self: *App) u32 {
+        if (self.model_selection >= self.model_reasoning.items.len) return 0;
+        return self.model_reasoning.items[self.model_selection];
+    }
+
+    fn selectedReasoningEffort(self: *App) ai.ReasoningEffort {
+        return reasoningOptions()[self.selectedReasoningIndex()].effort;
+    }
+
+    fn cycleSelectedReasoning(self: *App) !void {
+        if (self.model_selection >= self.codex_models.items.len) return;
+        while (self.model_reasoning.items.len < self.codex_models.items.len) {
+            try self.model_reasoning.append(self.gpa, 0);
+        }
+        self.model_reasoning.items[self.model_selection] = nextIndex(self.model_reasoning.items[self.model_selection], @intCast(reasoningOptions().len));
+    }
+
+    fn selectedCodexModel(self: *App) ?codex.Model {
+        if (self.model_selection >= self.codex_models.items.len) return null;
+        return self.codex_models.items[self.model_selection];
+    }
+
+    fn codexModelsClear(self: *App) void {
+        for (self.codex_models.items) |*model| model.deinit(self.gpa);
+        self.codex_models.clearRetainingCapacity();
+        self.model_reasoning.clearRetainingCapacity();
+    }
+
+    fn installCodexClient(self: *App, credentials: codex.Credentials, model: []const u8, effort: ai.ReasoningEffort) !void {
+        const client = try self.gpa.create(ai.codex_responses.Client);
+        errdefer self.gpa.destroy(client);
+        try client.init(self.gpa, self.io, .{
+            .base_url = "https://chatgpt.com/backend-api",
+            .api_key = credentials.access,
+            .model = model,
+            .tools = tools_mod.registry,
+            .reasoning = .{ .effort = effort, .summary = .auto },
+            .provider = .openai_codex,
+            .account_id = credentials.account_id,
+            .session_id = &self.runtime.?.session_writer.session.id,
+            .system_prompt = self.runtime.?.system_prompt,
+        });
+        if (self.owned_codex_client) |old| {
+            old.deinit();
+            self.gpa.destroy(old);
+        }
+        self.owned_codex_client = client;
+        self.runtime.?.client = .{ .codex_responses = client };
+        self.agent.client = .{ .codex_responses = client };
     }
 
     fn reloadResumeSessions(self: *App) !void {
@@ -576,6 +752,11 @@ pub const App = struct {
         self.resume_list.ensureScroll();
     }
 
+    fn syncModelListCursor(self: *App) void {
+        self.model_list.cursor = self.model_selection;
+        self.model_list.ensureScroll();
+    }
+
     fn clearInput(self: *App) void {
         self.input.clearRetainingCapacity();
         self.resetInputChangeTracking();
@@ -591,6 +772,14 @@ pub const App = struct {
         self.clearInput();
         var buffer: [128]u8 = undefined;
         const message = std.fmt.bufPrint(&buffer, "Could not switch session: {s}", .{@errorName(err)}) catch "Could not switch session.";
+        _ = try self.thread.append(self.gpa, .agent, "agent", message);
+    }
+
+    fn reportConnectionError(self: *App, err: anyerror) !void {
+        self.mode = .normal;
+        self.clearInput();
+        var buffer: [128]u8 = undefined;
+        const message = std.fmt.bufPrint(&buffer, "Could not connect provider: {s}", .{@errorName(err)}) catch "Could not connect provider.";
         _ = try self.thread.append(self.gpa, .agent, "agent", message);
     }
 
@@ -693,6 +882,18 @@ pub const App = struct {
         return selected == self.thread.messages.items.len - 1;
     }
 };
+
+fn nextIndex(current: u32, count: u32) u32 {
+    if (count == 0) return 0;
+    if (current + 1 >= count) return 0;
+    return current + 1;
+}
+
+fn previousIndex(current: u32, count: u32) u32 {
+    if (count == 0) return 0;
+    if (current == 0) return count - 1;
+    return current - 1;
+}
 
 fn adjustOptionalIndex(index: *?u32, removed_index: u32) void {
     const current = index.* orelse return;
@@ -1274,8 +1475,10 @@ const MessageWidget = struct {
     }
 };
 
-const Command = enum { new, resume_session };
+const Command = enum { connect, model, new, resume_session };
 const commands = [_]struct { name: []const u8, command: Command }{
+    .{ .name = "Connect", .command = .connect },
+    .{ .name = "Models", .command = .model },
     .{ .name = "New", .command = .new },
     .{ .name = "Resume", .command = .resume_session },
 };
@@ -1285,6 +1488,8 @@ fn inputLabel(app: *const App) []const u8 {
         .normal => "Build",
         .command => "Command",
         .picker => "Search for Sessions",
+        .provider_picker => "Connect Provider",
+        .model_picker => "Select Model",
     };
 }
 
@@ -1292,13 +1497,13 @@ fn resolveCommand(app: *App, filter: []const u8) ?Command {
     var selected: ?Command = null;
     var index: u32 = 0;
     for (commands) |entry| {
-        if (!std.mem.startsWith(u8, entry.name, filter)) continue;
+        if (!startsWithIgnoreCase(entry.name, filter)) continue;
         if (index == app.command_selection) selected = entry.command;
         index += 1;
     }
     if (selected) |command| return command;
     if (index == 1) {
-        for (commands) |entry| if (std.mem.startsWith(u8, entry.name, filter)) return entry.command;
+        for (commands) |entry| if (startsWithIgnoreCase(entry.name, filter)) return entry.command;
     }
     return null;
 }
@@ -1314,9 +1519,14 @@ fn commandMatchesCount(app: *App) u32 {
 fn commandMatchesCountForFilter(filter: []const u8) u32 {
     var count: u32 = 0;
     for (commands) |entry| {
-        if (std.mem.startsWith(u8, entry.name, filter)) count += 1;
+        if (startsWithIgnoreCase(entry.name, filter)) count += 1;
     }
     return count;
+}
+
+fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
+    if (prefix.len > value.len) return false;
+    return std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
 }
 
 fn inputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8) anyerror!void {
@@ -1343,6 +1553,16 @@ const PanelWidget = struct {
         }
         if (self.app.mode == .picker) {
             var content: ResumePanelContent = .{ .app = self.app };
+            var border: vxfw.Border = .{ .child = content.widget(), .style = StylePalette.tool };
+            return border.widget().draw(ctx);
+        }
+        if (self.app.mode == .provider_picker) {
+            var content: ProviderPanelContent = .{ .app = self.app };
+            var border: vxfw.Border = .{ .child = content.widget(), .style = StylePalette.tool };
+            return border.widget().draw(ctx);
+        }
+        if (self.app.mode == .model_picker) {
+            var content: ModelPanelContent = .{ .app = self.app };
             var border: vxfw.Border = .{ .child = content.widget(), .style = StylePalette.tool };
             return border.widget().draw(ctx);
         }
@@ -1375,7 +1595,7 @@ fn drawCommandPanel(app: *App, surface: *vxfw.Surface, ctx: vxfw.DrawContext) st
     var row: u16 = 0;
     var index: u32 = 0;
     for (commands) |entry| {
-        if (!std.mem.startsWith(u8, entry.name, filter)) continue;
+        if (!startsWithIgnoreCase(entry.name, filter)) continue;
         var buffer: [32]u8 = undefined;
         const selected = index == app.command_selection;
         const prefix = if (selected) "‣ " else "  ";
@@ -1386,6 +1606,108 @@ fn drawCommandPanel(app: *App, surface: *vxfw.Surface, ctx: vxfw.DrawContext) st
         if (row >= surface.size.height) return;
     }
 }
+
+const ReasoningOption = struct { label: []const u8, effort: ai.ReasoningEffort };
+
+fn reasoningOptions() []const ReasoningOption {
+    return &.{
+        .{ .label = "medium (Default)", .effort = .medium },
+        .{ .label = "high", .effort = .high },
+        .{ .label = "xhigh", .effort = .xhigh },
+        .{ .label = "low", .effort = .low },
+    };
+}
+
+const ProviderPanelContent = struct {
+    app: *App,
+
+    fn widget(self: *ProviderPanelContent) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = drawContent };
+    }
+
+    fn drawContent(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *ProviderPanelContent = @ptrCast(@alignCast(ptr));
+        const width = ctx.max.width orelse 0;
+        const height = ctx.max.height orelse 0;
+        var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
+        try writeCommandLine(&surface, 0, "‣ OpenAI Codex", ctx, true);
+        try writePanelLine(&surface, 1, "Press Enter to open browser sign-in", ctx, false);
+        return surface;
+    }
+};
+
+const ModelPanelContent = struct {
+    app: *App,
+
+    fn widget(self: *ModelPanelContent) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = drawContent };
+    }
+
+    fn drawContent(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *ModelPanelContent = @ptrCast(@alignCast(ptr));
+        if (self.app.codex_models.items.len == 0) return self.drawEmpty(ctx);
+        const widgets = try self.modelWidgets(ctx);
+        self.app.model_list.children = .{ .slice = widgets };
+        self.app.model_list.item_count = @intCast(widgets.len);
+        self.app.model_list.cursor = self.app.model_selection;
+        self.app.model_list.ensureScroll();
+        return self.app.model_list.widget().draw(ctx);
+    }
+
+    fn drawEmpty(self: *ModelPanelContent, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const width = ctx.max.width orelse 0;
+        const height = ctx.max.height orelse 0;
+        var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
+        try writePanelLineAt(&surface, 0, "No provider models available. Run :connect first.", ctx, false, ConversationLayout.left -| 1);
+        return surface;
+    }
+
+    fn modelWidgets(self: *ModelPanelContent, ctx: vxfw.DrawContext) ![]vxfw.Widget {
+        const widgets = try ctx.arena.alloc(vxfw.Widget, self.app.codex_models.items.len);
+        const rows = try ctx.arena.alloc(ModelRowWidget, self.app.codex_models.items.len);
+        for (self.app.codex_models.items, 0..) |*model, index| {
+            rows[index] = .{
+                .app = self.app,
+                .model = model,
+                .index = @intCast(index),
+                .selected = self.app.model_selection == index,
+            };
+            widgets[index] = rows[index].widget();
+        }
+        return widgets;
+    }
+};
+
+const ModelRowWidget = struct {
+    app: *App,
+    model: *const codex.Model,
+    index: u32,
+    selected: bool,
+
+    fn widget(self: *ModelRowWidget) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = drawRow };
+    }
+
+    fn drawRow(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *ModelRowWidget = @ptrCast(@alignCast(ptr));
+        const width = ctx.max.width orelse 0;
+        var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
+        const model_focused = self.selected and self.app.model_column == .model;
+        const prefix = if (self.selected) "‣ " else "  ";
+        const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.model.label });
+        try writePanelLineAt(&surface, 0, text, ctx, model_focused, ConversationLayout.left -| 1);
+        if (self.selected) try self.drawReasoning(&surface, ctx);
+        return surface;
+    }
+
+    fn drawReasoning(self: *const ModelRowWidget, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
+        const effort_focused = self.app.model_column == .reasoning;
+        const effort = reasoningOptions()[self.app.selectedReasoningIndex()].label;
+        const effort_prefix = if (effort_focused) "‣ " else "  ";
+        const effort_text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ effort_prefix, effort });
+        try writePanelLineAt(surface, 0, effort_text, ctx, effort_focused, surface.size.width / 2);
+    }
+};
 
 const ResumePanelContent = struct {
     app: *App,
@@ -1868,6 +2190,85 @@ test "begin submit clears input and appends loading row before agent turn" {
     try std.testing.expect(isLoadingWord(app.thread.messages.items[loading_index].title));
     try std.testing.expectEqual(@as(u16, 3), messageRows(app.thread.messages.items[loading_index], 80));
     try std.testing.expectEqual(@as(u32, 0), app.thread.selected.?);
+}
+
+test "model picker without models stays on model column" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.mode = .model_picker;
+    app.model_column = .model;
+    try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.right }));
+    try std.testing.expectEqual(App.ModelColumn.model, app.model_column);
+}
+
+test "canceling a picker returns to command menu" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.mode = .model_picker;
+    try std.testing.expect(try app.cancelMode());
+    try std.testing.expectEqual(App.Mode.command, app.mode);
+    const input = try app.peekInput();
+    defer gpa.free(input);
+    try std.testing.expectEqualStrings(":", input);
+}
+
+test "typing colon inside picker opens command menu" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.mode = .picker;
+    try app.syncModeWithInput(":");
+    try std.testing.expectEqual(App.Mode.command, app.mode);
+}
+
+test "menu navigation wraps and model reasoning tab cycles" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.mode = .command;
+    app.command_selection = commandMatchesCountForFilter("") - 1;
+    try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.down }));
+    try std.testing.expectEqual(@as(u32, 0), app.command_selection);
+
+    const models = try codex.loadStaticModels(gpa);
+    defer gpa.free(models);
+    try app.codex_models.appendSlice(gpa, models);
+    try app.model_reasoning.appendNTimes(gpa, 0, app.codex_models.items.len);
+    app.mode = .model_picker;
+    app.model_selection = @intCast(app.codex_models.items.len - 1);
+    try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.down }));
+    try std.testing.expectEqual(@as(u32, 0), app.model_selection);
+
+    app.model_column = .reasoning;
+    try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.tab }));
+    try std.testing.expectEqual(@as(u32, 1), app.model_reasoning.items[0]);
+    try std.testing.expectEqual(@as(u32, 0), app.model_reasoning.items[1]);
 }
 
 fn isLoadingWord(text: []const u8) bool {
