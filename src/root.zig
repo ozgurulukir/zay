@@ -3,20 +3,25 @@ const std = @import("std");
 pub const agent = @import("agent.zig");
 pub const ai = @import("ai.zig");
 pub const bash = @import("bash.zig");
+pub const codex = @import("codex.zig");
 pub const db = @import("db.zig");
 pub const executor = @import("executor.zig");
 pub const search = @import("search.zig");
 pub const session = @import("session.zig");
+pub const logger = @import("logger");
 pub const runtime = @import("runtime.zig");
 pub const thread = @import("thread.zig");
 pub const tools = @import("tools.zig");
 pub const tui = @import("tui.zig");
 
+const default_openai_endpoint = "https://api.openai.com";
+const default_model = "gpt-5.5";
+
 /// The flat, OpenAI-shaped configuration `nova.run` consumes. When a
 /// second LM adapter arrives, this evolves to carry an `LmConfig` union;
 /// today the single-variant shape is the simplest user-facing surface.
 pub const Config = struct {
-    base_url: []const u8 = "https://api.openai.com",
+    base_url: []const u8 = default_openai_endpoint,
     api_key: []const u8 = "",
     model: []const u8 = "gpt-5.5",
     use_responses_endpoint: bool = false,
@@ -31,9 +36,9 @@ pub const Config = struct {
     /// exposes for its environment map across Zig versions.
     pub fn fromEnv(env: anytype) Config {
         return .{
-            .base_url = env.get("OPENAI_BASE_URL") orelse "https://api.openai.com",
+            .base_url = env.get("OPENAI_BASE_URL") orelse default_openai_endpoint,
             .api_key = env.get("OPENAI_API_KEY") orelse "",
-            .model = env.get("OPENAI_MODEL") orelse "gpt-5.5",
+            .model = env.get("OPENAI_MODEL") orelse default_model,
             .use_responses_endpoint = if (env.get("USE_RESPONSES_ENDPOINT")) |value| std.mem.eql(u8, value, "1") else false,
         };
     }
@@ -45,6 +50,7 @@ pub const Config = struct {
 /// listener (headless mode, FFI shim, test harness) drop down to
 /// `Agent.run(listener)` directly with their own `Agent.Listener`.
 pub fn run(init: std.process.Init, gpa: std.mem.Allocator, config: Config) !void {
+    defer logger.deinit();
     const cwd = try std.process.currentPathAlloc(init.io, gpa);
     defer gpa.free(cwd);
 
@@ -59,6 +65,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, config: Config) !void
             .model = config.model,
             .tools = tools.registry,
             .reasoning = config.reasoning,
+            .system_prompt = config.system_prompt orelse @embedFile("prompts/system.md"),
         });
         break :blk .{ .openai_responses = &openai_responses_client };
     } else blk: {
@@ -72,6 +79,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, config: Config) !void
         break :blk .{ .openai_compatible = &openai_compatible_client };
     };
     defer switch (client) {
+        .codex_responses => unreachable,
         .openai_compatible => openai_compatible_client.deinit(),
         .openai_responses => openai_responses_client.deinit(),
     };
