@@ -10,8 +10,11 @@ TODOs and ideas for features to add to Nova coding agent.
 - Subagents
 - Support AGENTS.md
 - Support steering messages (sent as either a subagent call alongisde the conversation so far which then consolidates back into the main thread OR just sent to the model after the tool call response)
-- Wire ability to add images to input
-- Add an OpenAI Codex Responses provider, separate from normal OpenResponses, with Codex-specific auth/headers, optional WebSocket transport, `instructions` system prompt handling, and event normalization.
+- Wire ability to add images to input in the UI
+- improve logger and make it more useful
+- add ability to persist user preferences via `.nova/config.toml` (global and local)
+- add docs on `.nova/auth.json`
+- Move logger outputs to a better location (currently `/tmp/nova-dev.log`)
 
 Handle edge cases where selected content when expanded goes out of bounds. Forcing a mouse scroll. Could somehow initiate a scroll via keyboard.
 
