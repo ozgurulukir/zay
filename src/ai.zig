@@ -1,6 +1,8 @@
 const std = @import("std");
 const tools_common = @import("tools/common.zig");
 
+pub const codex_responses = @import("ai/codex_responses.zig");
+pub const websocket = @import("websocket");
 pub const openai_compatible = @import("ai/openai_compatible.zig");
 pub const openai_responses = @import("ai/openai_responses.zig");
 
@@ -33,12 +35,18 @@ pub const Reasoning = struct {
     summary: ?ReasoningSummary = .auto,
 };
 
+pub const ProviderKind = enum { openai, openai_codex };
+
 pub const Config = struct {
     base_url: []const u8,
     api_key: []const u8,
     model: []const u8,
     tools: []const Tool = &.{},
     reasoning: ?Reasoning = .{},
+    provider: ProviderKind = .openai,
+    account_id: []const u8 = "",
+    session_id: []const u8 = "",
+    system_prompt: []const u8 = "You are a helpful assistant.",
 };
 
 pub const Role = enum {
@@ -183,6 +191,7 @@ pub const StreamObserver = struct {
 };
 
 pub const LanguageModel = union(enum) {
+    codex_responses: *codex_responses.Client,
     openai_compatible: *openai_compatible.Client,
     openai_responses: *openai_responses.Client,
 
@@ -192,6 +201,7 @@ pub const LanguageModel = union(enum) {
         observer: StreamObserver,
     ) !Turn {
         return switch (self) {
+            .codex_responses => |c| c.prompt(messages, observer),
             .openai_compatible => |c| c.prompt(messages, observer),
             .openai_responses => |c| c.prompt(messages, observer),
         };
