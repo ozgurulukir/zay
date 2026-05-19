@@ -15,8 +15,9 @@ TODOs and ideas for features to add to Nova coding agent.
 - add ability to persist user preferences via `.nova/config.toml` (global and local)
 - add docs on `.nova/auth.json`
 - Move logger outputs to a better location (currently `/tmp/nova-dev.log`)
+- Add local models available via llama.cpp and ollama
 
-Handle edge cases where selected content when expanded goes out of bounds. Forcing a mouse scroll. Could somehow initiate a scroll via keyboard.
+- Handle edge cases where selected content when expanded goes out of bounds. Forcing a mouse scroll. Could somehow initiate a scroll via keyboard.
 
 Snap back to bottom shortcut.
 
