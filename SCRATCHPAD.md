@@ -1,16 +1,22 @@
-# Scratchpad 
+# Scratchpad
 
 TODOs and ideas for features to add to Nova coding agent.
 
 ## TODOs
 
 - Support skills in `.agents/`
+- Support referencing files and symbols via `$`
 - MCP (special via some kind of executor)
 - Subagents
 - Support AGENTS.md
 - Support steering messages (sent as either a subagent call alongisde the conversation so far which then consolidates back into the main thread OR just sent to the model after the tool call response)
+- Wire ability to add images to input in the UI
+- improve logger and make it more useful
+- add ability to persist user preferences via `.nova/config.toml` (global and local)
+- add docs on `.nova/auth.json`
+- Move logger outputs to a better location (currently `/tmp/nova-dev.log`)
 
-Handle edge cases where selected content when expanded goes out of bounds. Forcing a mouse scroll. Could somehow initiate a scroll via keyboard. 
+Handle edge cases where selected content when expanded goes out of bounds. Forcing a mouse scroll. Could somehow initiate a scroll via keyboard.
 
 Snap back to bottom shortcut.
 
@@ -29,7 +35,3 @@ Something like:
 - Agent goes to work
 - Human steers as needed (notifiations could be useful here or some kind of observability on where the agent is up to, via the TUI)
 - Hunk style review of code with agent notes
-
-
-## Ideas
-

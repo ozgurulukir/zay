@@ -33,17 +33,8 @@ pub const Agent = struct {
     }
 
     pub fn deinit(self: *Agent) void {
-        for (self.messages.items) |message| {
-            self.gpa.free(message.role);
-            self.gpa.free(message.content);
-            if (message.tool_call_id) |id| self.gpa.free(id);
-            if (message.tool_calls.len > 0) {
-                for (message.tool_calls) |tool_call| {
-                    var owned = tool_call;
-                    owned.deinit(self.gpa);
-                }
-                self.gpa.free(message.tool_calls);
-            }
+        for (self.messages.items) |*message| {
+            message.deinit(self.gpa);
         }
         self.messages.deinit(self.gpa);
         self.* = undefined;
@@ -51,6 +42,16 @@ pub const Agent = struct {
 
     pub fn addUser(self: *Agent, content: []const u8) !void {
         try self.appendMessage("user", content);
+    }
+
+    pub fn addUserBlocks(self: *Agent, blocks: []const ai.ContentBlock) !void {
+        const owned = try self.cloneBlocks(blocks);
+        errdefer {
+            for (owned) |*block| block.deinit(self.gpa);
+            self.gpa.free(owned);
+        }
+        try self.messages.append(self.gpa, .{ .role = .user, .content = owned });
+        try self.persistLastMessage();
     }
 
     pub fn takeMessage(self: *Agent, message: ai.ChatMessage) !void {
@@ -79,7 +80,7 @@ pub const Agent = struct {
 
         pub const ToolCallFinished = struct {
             index: u32,
-            tool_call_id: []const u8 = "",
+            call_id: []const u8 = "",
             name: []const u8,
             display_label: []const u8,
             display_body: []const u8,
@@ -95,7 +96,7 @@ pub const Agent = struct {
                     gpa.free(tool.arguments);
                 },
                 .tool_call_finished => |tool| {
-                    gpa.free(tool.tool_call_id);
+                    gpa.free(tool.call_id);
                     gpa.free(tool.name);
                     gpa.free(tool.display_label);
                     gpa.free(tool.display_body);
@@ -137,23 +138,28 @@ pub const Agent = struct {
                 .listener = listener,
             };
             defer stream_context.deinit();
-            var response = try self.client.prompt(self.messages.items, .{
+            var turn = try self.client.prompt(self.messages.items, .{
                 .ptr = &stream_context,
                 .on_content = onContentDelta,
                 .on_reasoning = onReasoningDelta,
                 .on_tool_delta = onToolDelta,
                 .on_delta_end = onDeltaEnd,
             });
-            defer response.deinit(self.gpa);
+            var turn_owned = true;
+            defer if (turn_owned) turn.deinit(self.gpa);
 
-            if (response.tool_calls.items.len > 0) {
-                try self.appendAssistantTurn(response.content, response.tool_calls.items);
-            } else if (response.content.len > 0) {
-                try self.appendMessage("assistant", response.content);
+            const tool_calls = try self.collectToolCalls(turn.assistant);
+            defer self.gpa.free(tool_calls);
+            if (turn.assistant.content.len > 0) {
+                try self.takeAssistantMessage(&turn.assistant);
+                turn_owned = false;
+            } else {
+                turn.deinit(self.gpa);
+                turn_owned = false;
             }
 
-            if (response.tool_calls.items.len == 0) return;
-            try self.runToolBatch(response.tool_calls.items, &stream_context, listener);
+            if (tool_calls.len == 0) return;
+            try self.runToolBatch(tool_calls, &stream_context, listener);
         }
         return error.ToolCallLimit;
     }
@@ -209,7 +215,7 @@ pub const Agent = struct {
             try self.agent.emitToolCallFinished(
                 self.listener,
                 self.tool_index,
-                result.tool_call_id,
+                result.call_id,
                 result.name,
                 result.display_label,
                 result.display_body,
@@ -291,14 +297,14 @@ pub const Agent = struct {
         self: *Agent,
         listener: Listener,
         tool_index: u32,
-        tool_call_id: []const u8,
+        call_id: []const u8,
         name: []const u8,
         display_label: []const u8,
         display_body: []const u8,
         stderr: ?[]const u8,
         failed: bool,
     ) !void {
-        const owned_id = try self.gpa.dupe(u8, tool_call_id);
+        const owned_id = try self.gpa.dupe(u8, call_id);
         errdefer self.gpa.free(owned_id);
         const owned_name = try self.gpa.dupe(u8, name);
         errdefer self.gpa.free(owned_name);
@@ -314,7 +320,7 @@ pub const Agent = struct {
         try listener.emit(.{
             .tool_call_finished = .{
                 .index = tool_index,
-                .tool_call_id = owned_id,
+                .call_id = owned_id,
                 .name = owned_name,
                 .display_label = owned_label,
                 .display_body = owned_body,
@@ -324,78 +330,77 @@ pub const Agent = struct {
         });
     }
 
-    fn appendMessage(self: *Agent, role: []const u8, content: []const u8) !void {
-        const owned_role = try self.gpa.dupe(u8, role);
-        errdefer self.gpa.free(owned_role);
-        const owned_content = try self.gpa.dupe(u8, content);
-        errdefer self.gpa.free(owned_content);
-        try self.messages.append(self.gpa, .{
-            .role = owned_role,
-            .content = owned_content,
-        });
-        try self.persistLastMessage();
-    }
-
-    /// Append an assistant message that emitted at least one tool_call.
-    /// Per OpenAI's protocol the assistant message must carry the tool_calls
-    /// it produced so the subsequent `tool` messages can reference them by id.
-    /// Ids on the incoming ToolCalls are guaranteed non-empty — the
-    /// LanguageModel adapter mints them when the protocol omits them.
-    fn appendAssistantTurn(
-        self: *Agent,
-        content: []const u8,
-        tool_calls: []const ai.ToolCall,
-    ) !void {
-        assert(tool_calls.len > 0);
-
-        const owned_role = try self.gpa.dupe(u8, "assistant");
-        errdefer self.gpa.free(owned_role);
-        const owned_content = try self.gpa.dupe(u8, content);
-        errdefer self.gpa.free(owned_content);
-
-        const stored = try self.gpa.alloc(ai.ToolCall, tool_calls.len);
+    fn cloneBlocks(self: *Agent, blocks: []const ai.ContentBlock) ![]ai.ContentBlock {
+        const owned = try self.gpa.alloc(ai.ContentBlock, blocks.len);
         var initialized: usize = 0;
         errdefer {
-            for (stored[0..initialized]) |tool_call| {
-                var owned = tool_call;
-                owned.deinit(self.gpa);
-            }
-            self.gpa.free(stored);
+            for (owned[0..initialized]) |*block| block.deinit(self.gpa);
+            self.gpa.free(owned);
         }
-
-        for (tool_calls) |tool_call| {
-            assert(tool_call.id.len > 0);
-            const owned_id = try self.gpa.dupe(u8, tool_call.id);
-            errdefer self.gpa.free(owned_id);
-            const owned_name = try self.gpa.dupe(u8, tool_call.name);
-            errdefer self.gpa.free(owned_name);
-            const owned_args = try self.gpa.dupe(u8, tool_call.arguments);
-            stored[initialized] = .{
-                .id = owned_id,
-                .name = owned_name,
-                .arguments = owned_args,
-            };
+        for (blocks) |block| {
+            owned[initialized] = try self.cloneBlock(block);
             initialized += 1;
         }
+        return owned;
+    }
 
-        try self.messages.append(self.gpa, .{
-            .role = owned_role,
-            .content = owned_content,
-            .tool_calls = stored,
-        });
+    fn cloneBlock(self: *Agent, block: ai.ContentBlock) !ai.ContentBlock {
+        return switch (block) {
+            .text => |text| .{ .text = .{
+                .text = try self.gpa.dupe(u8, text.text),
+                .responses_item_id = if (text.responses_item_id) |id| try self.gpa.dupe(u8, id) else null,
+                .responses_phase = if (text.responses_phase) |phase| try self.gpa.dupe(u8, phase) else null,
+            } },
+            .image => |image| .{ .image = .{
+                .mime_type = try self.gpa.dupe(u8, image.mime_type),
+                .data_base64 = try self.gpa.dupe(u8, image.data_base64),
+            } },
+            .reasoning => |reasoning| .{ .reasoning = .{
+                .text = try self.gpa.dupe(u8, reasoning.text),
+                .responses_item_json = if (reasoning.responses_item_json) |json| try self.gpa.dupe(u8, json) else null,
+            } },
+            .tool_call => |call| .{ .tool_call = .{
+                .call_id = try self.gpa.dupe(u8, call.call_id),
+                .responses_item_id = if (call.responses_item_id) |id| try self.gpa.dupe(u8, id) else null,
+                .name = try self.gpa.dupe(u8, call.name),
+                .arguments = try self.gpa.dupe(u8, call.arguments),
+            } },
+        };
+    }
+
+    fn appendMessage(self: *Agent, role: []const u8, content: []const u8) !void {
+        const parsed_role = try ai.Role.fromString(role);
+        const blocks = try self.gpa.alloc(ai.ContentBlock, 1);
+        errdefer self.gpa.free(blocks);
+        blocks[0] = .{ .text = .{ .text = try self.gpa.dupe(u8, content) } };
+        errdefer blocks[0].deinit(self.gpa);
+        try self.messages.append(self.gpa, .{ .role = parsed_role, .content = blocks });
         try self.persistLastMessage();
     }
 
-    /// Move the LLM-channel fields of each ToolResult into a `tool` role
-    /// ChatMessage in history. Per the `take*` convention: each ToolResult
-    /// is consumed exactly once — `content` and `tool_call_id` are moved
-    /// into the new ChatMessage (no dupe), the human-channel fields are
-    /// freed (the listener already consumed them via the on_finished
-    /// callback), and the source slot is set to `undefined`.
-    ///
-    /// On error partway, results already processed are in history and
-    /// undefined; remaining results are deinit'd here so the caller only
-    /// has to free the outer slice.
+    fn takeAssistantMessage(self: *Agent, assistant: *ai.ChatMessage) !void {
+        assert(assistant.role == .assistant);
+        try self.messages.append(self.gpa, assistant.*);
+        assistant.* = undefined;
+        try self.persistLastMessage();
+    }
+
+    fn collectToolCalls(self: *Agent, assistant: ai.ChatMessage) ![]ai.ToolCall {
+        assert(assistant.role == .assistant);
+        var count: usize = 0;
+        for (assistant.content) |block| {
+            if (block == .tool_call) count += 1;
+        }
+        const calls = try self.gpa.alloc(ai.ToolCall, count);
+        var index: usize = 0;
+        for (assistant.content) |block| {
+            if (block != .tool_call) continue;
+            calls[index] = block.tool_call;
+            index += 1;
+        }
+        return calls;
+    }
+
     fn takeToolResults(self: *Agent, results: []executor_mod.ToolResult) !void {
         assert(results.len > 0);
         var moved: usize = 0;
@@ -403,17 +408,16 @@ pub const Agent = struct {
             for (results[moved..]) |*r| r.deinit(self.gpa);
         }
         for (results) |*r| {
-            assert(r.tool_call_id.len > 0);
-            const owned_role = try self.gpa.dupe(u8, "tool");
-            errdefer self.gpa.free(owned_role);
+            assert(r.call_id.len > 0);
+            const blocks = try self.gpa.alloc(ai.ContentBlock, 1);
+            errdefer self.gpa.free(blocks);
+            blocks[0] = .{ .text = .{ .text = r.content } };
             try self.messages.append(self.gpa, .{
-                .role = owned_role,
-                .content = r.content,
-                .tool_call_id = r.tool_call_id,
+                .role = .tool,
+                .content = blocks,
+                .call_id = r.call_id,
             });
             try self.persistLastMessage();
-            // content and tool_call_id are now owned by `messages`. The
-            // human-channel fields were already consumed by `on_finished`.
             self.gpa.free(r.name);
             self.gpa.free(r.display_label);
             self.gpa.free(r.display_body);
@@ -461,11 +465,11 @@ test "parse bash command arguments" {
 
 test "streaming callbacks emit owned events" {
     const gpa = std.testing.allocator;
-    const openai = @import("ai/openai.zig");
-    var openai_client: openai.Client = undefined;
-    try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
-    defer openai_client.deinit();
-    var agent = Agent.init(gpa, std.testing.io, ".", .{ .openai = &openai_client });
+    const openai_compatible = @import("ai/openai_compatible.zig");
+    var openai_compatible_client: openai_compatible.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
 
     const Seen = struct {

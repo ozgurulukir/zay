@@ -32,14 +32,27 @@ _Avoid_: "title" (overloaded — `thread.zig` uses `title` as the storage field,
 ### Modules and types
 
 **LanguageModel**:
-The tagged union the agent holds to do inference — `union(enum) { openai: *openai.Client, ... }`. Exposes `prompt(messages, tokens: StreamObserver) -> Turn`, which dispatches to the active adapter. Each adapter (currently OpenAI; more planned) owns request-body construction, SSE parsing, tool_call id minting, and calling back into the agent via the **StreamObserver** as inference progresses. The agent never sees protocol vocabulary, and the TUI never sees `LanguageModel`.
+The tagged union the agent holds to do inference — `union(enum) { openai_compatible: *openai_compatible.Client, openai_responses: *openai_responses.Client, ... }`. Exposes `prompt(messages, tokens: StreamObserver) -> Turn`, which dispatches to the active adapter. Each adapter owns request-body construction, SSE parsing, tool_call id minting, and calling back into the agent via the **StreamObserver** as inference progresses. The agent never sees protocol vocabulary, and the TUI never sees `LanguageModel`.
 _Avoid_: "AIClient" (old name for this same union — renamed because it duplicated the LanguageModel concept), "Prompter" (rejected — less precise about what the module is).
 
 **StreamObserver**:
 The narrow private callback interface **LanguageModel** uses to report inference progress back to the agent — `{ on_content, on_reasoning, on_tool_delta }`. Each callback is invoked by the adapter as deltas arrive. The agent is the only consumer; it bridges these callbacks into **Agent.Event**s on its **Agent.Listener**. Implementation detail of the agent/LM seam, not part of the public surface. Continuity name — `ai.StreamObserver` already exists in `src/ai.zig` today; this refactor changes its *shape* (drop optionals, replace indexed `tool_delta` tuple with a typed **ToolDelta** payload) but keeps the name.
 
-**openai.Client**:
-The concrete adapter struct inside `src/ai/openai.zig`. One variant of **LanguageModel**. Owns the HTTP client, the OpenAI-shaped JSON request body, the SSE parser, and the tool_call id minting fallback. Not the seam — the implementation behind it.
+**OpenAI-compatible Chat Completions adapter**:
+The concrete **LanguageModel** adapter for OpenAI-compatible `/v1/chat/completions` APIs, implemented in `src/ai/openai_compatible.zig`. Owns the HTTP client, Chat Completions-shaped JSON request body, SSE parser, and tool_call id minting fallback. Not the seam — the implementation behind it.
+_Avoid_: openai.Client, OpenAI adapter (ambiguous with Responses).
+
+**OpenResponses adapter**:
+The concrete **LanguageModel** adapter for OpenResponses `/v1/responses` APIs, implemented in `src/ai/openai_responses.zig`. Owns the HTTP client, Responses-shaped item translation, semantic SSE parsing, and replay of structured local history.
+_Avoid_: OpenAI Responses adapter (ambiguous with OpenAI's proprietary API rather than the OpenResponses spec).
+
+**OpenResponses replay**:
+The Responses interaction mode where Nova sends the full canonical conversation as Responses input items on each request with `store: false`, relying on provider prompt caching rather than `previous_response_id` for efficiency. Keeps Nova's durable local session history authoritative.
+_Avoid_: OpenResponses continuation (reserved for `previous_response_id`, not used initially).
+
+**Structured message**:
+A canonical history message whose content is represented as semantic blocks rather than one flat text string. Messages preserve text, image, reasoning, and tool-call blocks in order so adapters can replay provider-specific item identity while keeping the agent's history model explicit; normal files are included as text rather than binary file blocks.
+_Avoid_: Replay metadata (rejected as an opaque bolt-on while Nova is still fresh), general file attachment (deferred until provider file semantics are needed).
 
 **ExecutorService**:
 The module that runs a batch of **ToolCall**s. `runAll(calls, tools: ToolCallObserver) -> []ToolResult` dispatches via the **Tool registry**, builds each tool's **Display body** and **Display label**, formats the LLM-facing observation from stdout/stderr, calls back into the agent via the **ToolCallObserver** as each tool starts and finishes, and returns one **ToolResult** per call. Owns the two-channel split from ADR-0002. The TUI never sees `ExecutorService`.
@@ -80,8 +93,8 @@ The typed seam consumers attach to receive **Agent.Event**s — `{ ptr: *anyopaq
 _Avoid_: "StreamPartSink" (old name), "UI listener", "observer" (the **StreamObserver** / **ToolCallObserver** are the narrow internal callbacks; the public seam is the Listener).
 
 **ToolCall**:
-The canonical, finalised record of one tool call — `{ id, name, arguments }`. Lives on assistant **ChatMessage**s in history, in **Turn**s returned by **LanguageModel**, and as input to **ExecutorService**. Ids are always non-empty; **LanguageModel** mints fallbacks when the protocol omits them.
-_Avoid_: "StoredToolCall" (old, redundant — there is one canonical ToolCall now).
+The canonical, finalised record of one tool call — `{ call_id, responses_item_id, name, arguments }`. Lives as an assistant block inside a **Structured message**, in **Turn**s returned by **LanguageModel**, and as input to **ExecutorService**. `call_id` is always non-empty; **LanguageModel** mints fallbacks when the protocol omits it.
+_Avoid_: "StoredToolCall" (old, redundant — there is one canonical ToolCall now), "tool id" (ambiguous between call id and provider item id).
 
 **ToolDelta**:
 The payload type passed through **StreamObserver**'s `on_tool_delta` callback — `{ index, name, arguments }` where `name`/`arguments` are *chunks*, not complete values. A streaming snapshot, distinct from the finalised **ToolCall**. The OpenAI adapter accumulates these internally; outside that adapter no one assembles them back into ToolCalls.
@@ -91,12 +104,12 @@ _Avoid_: "streaming ToolCall" (the older shape that conflated the two).
 The single public entry point — `pub fn run(init: std.process.Init, config: Config) !void`. Wires the OpenAI client, the **ExecutorService**, the agent, the embedded system prompt, and the TUI together, then runs until the TUI exits. `src/main.zig` collapses to ~3 lines (`Config.fromEnv` → `nova.run`). Embedders who want lower-level access bypass `nova.run` and use `Agent.run(listener)` directly with their own listener — the modules stay public.
 
 **Config**:
-The flat record passed to **nova.run** — `{ base_url, api_key, model, system_prompt: ?[]const u8 }`. OpenAI-shaped today (a second LM adapter would evolve this to carry an `LmConfig` union). `Config.fromEnv(env_map)` derives a Config from `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL` with sensible defaults; embedders that don't want env lookups construct a Config literal directly. `system_prompt = null` resolves to the embedded `src/prompts/system.md` at runtime.
+The flat record passed to **nova.run** — `{ base_url, api_key, model, use_responses_endpoint, reasoning, system_prompt: ?[]const u8 }`. `Config.fromEnv(env_map)` derives a Config from `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL` plus `USE_RESPONSES_ENDPOINT`; embedders that don't want env lookups construct a Config literal directly. `reasoning` uses the OpenResponses shape as Nova's canonical reasoning configuration, and adapters strip or translate unsupported fields. `system_prompt = null` resolves to the embedded `src/prompts/system.md` at runtime.
 
 **ToolResult**:
 The output of one **ToolCall**, carrying both channels of ADR-0002 in one record:
 
-- **LLM channel:** `tool_call_id`, `content` (the LLM-facing observation — `stdout` or `stderr` per the fallback rule).
+- **LLM channel:** `call_id`, `content` (the LLM-facing observation — `stdout` or `stderr` per the fallback rule).
 - **Human channel:** `display_label`, `display_body`, `stderr`, `failed`.
 
 Returned in `[]ToolResult` from `ExecutorService.runAll`. Two consumption points share the same value: **ToolCallObserver**'s `on_finished` receives a `*const ToolResult` mid-`runAll` (the agent's bridge reads the human-channel fields and emits an **Agent.Event**), and after `runAll` returns, `Agent.takeToolResults` walks the slice — moves the LLM-channel fields into history and frees the human-channel fields the listener already consumed. Each slot is set to `undefined` after the move per the **take* convention**.
@@ -107,11 +120,11 @@ _Avoid_: "ToolFinish" (an earlier sketch had a separate type for the human chann
 - An **Expand-by-default tool** emits a **Display body**, which becomes the body of its finished thread message.
 - `edit_file`'s display body is a **Diff view**; `write_file`'s is the new file content verbatim.
 - Every tool produces a **Display label** from its argument JSON; the TUI decorates it (e.g. the `$ ` prefix) before placing it in the thread.
-- A **LanguageModel** consumes a slice of `ChatMessage`s, reports progress back to the agent via a **StreamObserver**, and returns a `Turn` carrying **ToolCall**s.
+- A **LanguageModel** consumes a slice of **Structured message**s, reports progress back to the agent via a **StreamObserver**, and returns a `Turn` carrying assistant blocks including **ToolCall**s.
 - An **ExecutorService** consumes a slice of **ToolCall**s, reports progress back to the agent via a **ToolCallObserver**, and returns a slice of **ToolResult**s.
 - The agent translates **StreamObserver** and **ToolCallObserver** callbacks into **Agent.Event**s and emits them through its single public seam, **Agent.Listener**. Sub-modules do not know that a Listener exists.
 - The **Tool registry** is consumed by **ExecutorService** (for dispatch) and by each **LanguageModel** variant (for building its provider-specific tools schema from each **Tool**'s **Schema**). The agent never sees it; the TUI never sees it.
-- The agent loops: ask the **LanguageModel** for a turn, hand any **ToolCall**s to the **ExecutorService**, fold the **ToolResult**s into history, repeat — emitting **Agent.Event**s at every transition.
+- The agent loops: ask the **LanguageModel** for a turn, hand any **ToolCall** blocks to the **ExecutorService**, fold the **ToolResult**s into history as tool-result messages, repeat — emitting **Agent.Event**s at every transition.
 - A **SessionManager** persists durable sessions; a **Thread** renders transient TUI messages.
 - A **Command** is handled by the TUI and does not become an agent history message.
 

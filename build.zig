@@ -20,6 +20,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const websocket_mod = b.createModule(.{
+        .root_source_file = b.path("lib/websocket.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const logger_mod = b.createModule(.{
+        .root_source_file = b.path("lib/logger.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
@@ -42,6 +52,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
+            .{ .name = "websocket", .module = websocket_mod },
+            .{ .name = "logger", .module = logger_mod },
         },
     });
     mod.addIncludePath(b.path("vendor/fff"));
@@ -86,6 +98,8 @@ pub fn build(b: *std.Build) void {
                 // importing modules from different packages).
                 .{ .name = "nova", .module = mod },
                 .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
+                .{ .name = "websocket", .module = websocket_mod },
+                .{ .name = "logger", .module = logger_mod },
             },
         }),
     });

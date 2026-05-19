@@ -1,7 +1,7 @@
 Reads the content at the specified filesystem path.
 
 <instruction>
-Use `read` for inspecting files and directories. Prefer it over `cat`, `head`, `tail`, `less`, `more`, `ls`, `sed -n`, or `awk NR` when the goal is inspection.
+Use `read` for inspecting files and directories. Prefer this over the bash tool for commands like `cat`, `head`, `tail`, `less`, `more`, `ls`, `sed -n`, or `awk NR` when the goal is inspection.
 
 ## Parameters
 
@@ -22,6 +22,7 @@ Use `read` for inspecting files and directories. Prefer it over `cat`, `head`, `
 - Reading a directory path returns a list of directory entries.
 - Reading a file with an omitted or explicit line selector returns lines prefixed with content-hash anchors: `#HL41th|def alpha():`. The `#HL` marker disambiguates anchored lines from arbitrary file content.
 - Use anchors exactly as shown when calling `edit_file` (copy `41th`, not `#HL41th`).
+
 </instruction>
 
 <critical>

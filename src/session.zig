@@ -156,11 +156,10 @@ pub const Session = struct {
     leaf_entry_id: ?[entry_id_len]u8,
 
     pub fn append(self: *Session, message: ai.ChatMessage, id_out: *[entry_id_len]u8) Error!void {
-        assert(message.role.len > 0);
         fillHex(id_out);
         const payload = try messageToJson(self.manager.gpa, message);
         defer self.manager.gpa.free(payload);
-        try self.insertEntry(id_out, "message", message.role, payload);
+        try self.insertEntry(id_out, "message", message.role.label(), payload);
     }
 
     pub fn appendPayload(self: *Session, kind: []const u8, role: ?[]const u8, payload_json: []const u8, id_out: *[entry_id_len]u8) Error!void {
@@ -406,14 +405,13 @@ pub const SessionWriter = struct {
     }
 
     pub fn append(self: *SessionWriter, message: ai.ChatMessage) Error!void {
-        assert(message.role.len > 0);
-        if (std.mem.eql(u8, message.role, "system")) return;
+        if (message.role == .system) return;
         const payload = try messageToJson(self.gpa, message);
         errdefer self.gpa.free(payload);
-        const role = try self.gpa.dupe(u8, message.role);
+        const role = try self.gpa.dupe(u8, message.role.label());
         errdefer self.gpa.free(role);
-        const title_candidate = if (std.mem.eql(u8, message.role, "user"))
-            try titleFromUserMessage(self.gpa, message.content)
+        const title_candidate = if (message.role == .user)
+            try titleFromUserMessage(self.gpa, message.text())
         else
             null;
         errdefer if (title_candidate) |title| self.gpa.free(title);
@@ -540,50 +538,80 @@ fn messageToJson(gpa: std.mem.Allocator, message: ai.ChatMessage) Error![]u8 {
     defer out.deinit();
     const writer = &out.writer;
     try writer.writeAll("{\"role\":");
-    try std.json.Stringify.value(message.role, .{}, writer);
-    try writer.writeAll(",\"content\":");
-    try std.json.Stringify.value(message.content, .{}, writer);
-    if (message.tool_call_id) |id| {
-        try writer.writeAll(",\"tool_call_id\":");
+    try std.json.Stringify.value(message.role.label(), .{}, writer);
+    if (message.call_id) |id| {
+        try writer.writeAll(",\"call_id\":");
         try std.json.Stringify.value(id, .{}, writer);
     }
-    if (message.tool_calls.len > 0) {
-        try writer.writeAll(",\"tool_calls\":[");
-        for (message.tool_calls, 0..) |tool_call, index| {
-            if (index > 0) try writer.writeByte(',');
-            try writer.writeAll("{\"id\":");
-            try std.json.Stringify.value(tool_call.id, .{}, writer);
-            try writer.writeAll(",\"name\":");
-            try std.json.Stringify.value(tool_call.name, .{}, writer);
-            try writer.writeAll(",\"arguments\":");
-            try std.json.Stringify.value(tool_call.arguments, .{}, writer);
-            try writer.writeByte('}');
-        }
-        try writer.writeByte(']');
+    try writer.writeAll(",\"content\":[");
+    for (message.content, 0..) |block, index| {
+        if (index > 0) try writer.writeByte(',');
+        try writeContentBlock(writer, block);
     }
-    try writer.writeByte('}');
+    try writer.writeAll("]}");
     return out.toOwnedSlice();
+}
+
+fn writeContentBlock(writer: *std.Io.Writer, block: ai.ContentBlock) Error!void {
+    switch (block) {
+        .text => |text| {
+            try writer.writeAll("{\"type\":\"text\",\"text\":");
+            try std.json.Stringify.value(text.text, .{}, writer);
+            if (text.responses_item_id) |id| {
+                try writer.writeAll(",\"responses_item_id\":");
+                try std.json.Stringify.value(id, .{}, writer);
+            }
+            if (text.responses_phase) |phase| {
+                try writer.writeAll(",\"responses_phase\":");
+                try std.json.Stringify.value(phase, .{}, writer);
+            }
+            try writer.writeByte('}');
+        },
+        .image => |image| {
+            try writer.writeAll("{\"type\":\"image\",\"mime_type\":");
+            try std.json.Stringify.value(image.mime_type, .{}, writer);
+            try writer.writeAll(",\"data_base64\":");
+            try std.json.Stringify.value(image.data_base64, .{}, writer);
+            try writer.writeByte('}');
+        },
+        .reasoning => |reasoning| {
+            try writer.writeAll("{\"type\":\"reasoning\",\"text\":");
+            try std.json.Stringify.value(reasoning.text, .{}, writer);
+            if (reasoning.responses_item_json) |json| {
+                try writer.writeAll(",\"responses_item_json\":");
+                try std.json.Stringify.value(json, .{}, writer);
+            }
+            try writer.writeByte('}');
+        },
+        .tool_call => |call| {
+            try writer.writeAll("{\"type\":\"tool_call\",\"call_id\":");
+            try std.json.Stringify.value(call.call_id, .{}, writer);
+            if (call.responses_item_id) |id| {
+                try writer.writeAll(",\"responses_item_id\":");
+                try std.json.Stringify.value(id, .{}, writer);
+            }
+            try writer.writeAll(",\"name\":");
+            try std.json.Stringify.value(call.name, .{}, writer);
+            try writer.writeAll(",\"arguments\":");
+            try std.json.Stringify.value(call.arguments, .{}, writer);
+            try writer.writeByte('}');
+        },
+    }
 }
 
 fn jsonToMessage(gpa: std.mem.Allocator, payload_json: []const u8) Error!ai.ChatMessage {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, payload_json, .{}) catch return error.CorruptPayload;
     defer parsed.deinit();
     if (parsed.value != .object) return error.CorruptPayload;
-
     const role_value = parsed.value.object.get("role") orelse return error.CorruptPayload;
     if (role_value != .string) return error.CorruptPayload;
+    const role = ai.Role.fromString(role_value.string) catch return error.CorruptPayload;
+    const call_id = try optionalString(gpa, parsed.value, "call_id");
+    errdefer if (call_id) |id| gpa.free(id);
     const content_value = parsed.value.object.get("content") orelse return error.CorruptPayload;
-    if (content_value != .string) return error.CorruptPayload;
-
-    const role = try gpa.dupe(u8, role_value.string);
-    errdefer gpa.free(role);
-    const content = try gpa.dupe(u8, content_value.string);
-    errdefer gpa.free(content);
-    const tool_call_id = try optionalString(gpa, parsed.value, "tool_call_id");
-    errdefer if (tool_call_id) |id| gpa.free(id);
-    const tool_calls = try parseToolCalls(gpa, parsed.value);
-    errdefer freeToolCalls(gpa, tool_calls);
-    return .{ .role = role, .content = content, .tool_call_id = tool_call_id, .tool_calls = tool_calls };
+    const content = try parseContentBlocks(gpa, content_value);
+    errdefer freeContentBlocks(gpa, content);
+    return .{ .role = role, .content = content, .call_id = call_id };
 }
 
 fn branchSummaryToMessage(gpa: std.mem.Allocator, payload_json: []const u8) Error!ai.ChatMessage {
@@ -593,8 +621,73 @@ fn branchSummaryToMessage(gpa: std.mem.Allocator, payload_json: []const u8) Erro
     if (summary != .string) return error.CorruptPayload;
     const content = try std.fmt.allocPrint(gpa, "Branch summary: {s}", .{summary.string});
     errdefer gpa.free(content);
-    const role = try gpa.dupe(u8, "user");
-    return .{ .role = role, .content = content };
+    const blocks = try gpa.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = content } };
+    return .{ .role = .user, .content = blocks };
+}
+
+fn parseContentBlocks(gpa: std.mem.Allocator, value: std.json.Value) Error![]ai.ContentBlock {
+    if (value == .string) {
+        const blocks = try gpa.alloc(ai.ContentBlock, 1);
+        blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, value.string) } };
+        return blocks;
+    }
+    if (value != .array) return error.CorruptPayload;
+    const blocks = try gpa.alloc(ai.ContentBlock, value.array.items.len);
+    var initialized: usize = 0;
+    errdefer freeContentBlocks(gpa, blocks[0..initialized]);
+    for (value.array.items) |item| {
+        blocks[initialized] = try parseContentBlock(gpa, item);
+        initialized += 1;
+    }
+    return blocks;
+}
+
+fn parseContentBlock(gpa: std.mem.Allocator, value: std.json.Value) Error!ai.ContentBlock {
+    if (value != .object) return error.CorruptPayload;
+    const kind = value.object.get("type") orelse return error.CorruptPayload;
+    if (kind != .string) return error.CorruptPayload;
+    if (std.mem.eql(u8, kind.string, "text")) {
+        const text = value.object.get("text") orelse return error.CorruptPayload;
+        if (text != .string) return error.CorruptPayload;
+        return .{ .text = .{
+            .text = try gpa.dupe(u8, text.string),
+            .responses_item_id = try optionalString(gpa, value, "responses_item_id"),
+            .responses_phase = try optionalString(gpa, value, "responses_phase"),
+        } };
+    }
+    if (std.mem.eql(u8, kind.string, "image")) {
+        const mime = value.object.get("mime_type") orelse return error.CorruptPayload;
+        const data = value.object.get("data_base64") orelse return error.CorruptPayload;
+        if (mime != .string) return error.CorruptPayload;
+        if (data != .string) return error.CorruptPayload;
+        return .{ .image = .{ .mime_type = try gpa.dupe(u8, mime.string), .data_base64 = try gpa.dupe(u8, data.string) } };
+    }
+    if (std.mem.eql(u8, kind.string, "reasoning")) {
+        const text = value.object.get("text") orelse return error.CorruptPayload;
+        if (text != .string) return error.CorruptPayload;
+        return .{ .reasoning = .{ .text = try gpa.dupe(u8, text.string), .responses_item_json = try optionalString(gpa, value, "responses_item_json") } };
+    }
+    if (std.mem.eql(u8, kind.string, "tool_call")) {
+        const call_id = value.object.get("call_id") orelse return error.CorruptPayload;
+        const name = value.object.get("name") orelse return error.CorruptPayload;
+        const arguments = value.object.get("arguments") orelse return error.CorruptPayload;
+        if (call_id != .string) return error.CorruptPayload;
+        if (name != .string) return error.CorruptPayload;
+        if (arguments != .string) return error.CorruptPayload;
+        return .{ .tool_call = .{
+            .call_id = try gpa.dupe(u8, call_id.string),
+            .responses_item_id = try optionalString(gpa, value, "responses_item_id"),
+            .name = try gpa.dupe(u8, name.string),
+            .arguments = try gpa.dupe(u8, arguments.string),
+        } };
+    }
+    return error.CorruptPayload;
+}
+
+fn freeContentBlocks(gpa: std.mem.Allocator, blocks: []ai.ContentBlock) void {
+    for (blocks) |*block| block.deinit(gpa);
+    gpa.free(blocks);
 }
 
 fn parseToolCalls(gpa: std.mem.Allocator, value: std.json.Value) Error![]const ai.ToolCall {
@@ -615,7 +708,7 @@ fn parseToolCalls(gpa: std.mem.Allocator, value: std.json.Value) Error![]const a
         if (name != .string) return error.CorruptPayload;
         if (arguments != .string) return error.CorruptPayload;
         calls[initialized] = .{
-            .id = try gpa.dupe(u8, id.string),
+            .call_id = try gpa.dupe(u8, id.string),
             .name = try gpa.dupe(u8, name.string),
             .arguments = try gpa.dupe(u8, arguments.string),
         };
@@ -726,11 +819,7 @@ fn fillHex(buffer: []u8) void {
 }
 
 fn deinitMessage(gpa: std.mem.Allocator, message: *ai.ChatMessage) void {
-    gpa.free(message.role);
-    gpa.free(message.content);
-    if (message.tool_call_id) |id| gpa.free(id);
-    freeToolCalls(gpa, message.tool_calls);
-    message.* = undefined;
+    message.deinit(gpa);
 }
 
 fn freeToolCalls(gpa: std.mem.Allocator, calls: []const ai.ToolCall) void {
@@ -748,15 +837,19 @@ test "session persists and loads messages" {
     var session = try manager.create("/tmp/nova", .{ .id = "0123456789abcdef0123456789abcdef", .title = "Test" });
 
     var id: [entry_id_len]u8 = undefined;
-    try session.append(.{ .role = "user", .content = "hello" }, &id);
+    const blocks = try std.testing.allocator.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = try std.testing.allocator.dupe(u8, "hello") } };
+    try session.append(.{ .role = .user, .content = blocks }, &id);
+    for (blocks) |*block| block.deinit(std.testing.allocator);
+    std.testing.allocator.free(blocks);
     const messages = try session.messages(std.testing.allocator);
     defer {
         for (messages) |*message| deinitMessage(std.testing.allocator, message);
         std.testing.allocator.free(messages);
     }
     try std.testing.expectEqual(@as(usize, 1), messages.len);
-    try std.testing.expectEqualStrings("user", messages[0].role);
-    try std.testing.expectEqualStrings("hello", messages[0].content);
+    try std.testing.expectEqual(.user, messages[0].role);
+    try std.testing.expectEqualStrings("hello", messages[0].text());
 }
 
 test "session branch with summary changes context" {
@@ -767,8 +860,16 @@ test "session branch with summary changes context" {
     var first: [entry_id_len]u8 = undefined;
     var second: [entry_id_len]u8 = undefined;
     var summary: [entry_id_len]u8 = undefined;
-    try session.append(.{ .role = "user", .content = "root" }, &first);
-    try session.append(.{ .role = "assistant", .content = "old branch" }, &second);
+    const root_blocks = try std.testing.allocator.alloc(ai.ContentBlock, 1);
+    root_blocks[0] = .{ .text = .{ .text = try std.testing.allocator.dupe(u8, "root") } };
+    try session.append(.{ .role = .user, .content = root_blocks }, &first);
+    for (root_blocks) |*block| block.deinit(std.testing.allocator);
+    std.testing.allocator.free(root_blocks);
+    const old_blocks = try std.testing.allocator.alloc(ai.ContentBlock, 1);
+    old_blocks[0] = .{ .text = .{ .text = try std.testing.allocator.dupe(u8, "old branch") } };
+    try session.append(.{ .role = .assistant, .content = old_blocks }, &second);
+    for (old_blocks) |*block| block.deinit(std.testing.allocator);
+    std.testing.allocator.free(old_blocks);
     try session.branch(first[0..], "old branch was abandoned", &summary);
 
     const messages = try session.messages(std.testing.allocator);
@@ -777,6 +878,6 @@ test "session branch with summary changes context" {
         std.testing.allocator.free(messages);
     }
     try std.testing.expectEqual(@as(usize, 2), messages.len);
-    try std.testing.expectEqualStrings("root", messages[0].content);
-    try std.testing.expectEqualStrings("Branch summary: old branch was abandoned", messages[1].content);
+    try std.testing.expectEqualStrings("root", messages[0].text());
+    try std.testing.expectEqualStrings("Branch summary: old branch was abandoned", messages[1].text());
 }
