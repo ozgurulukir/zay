@@ -194,6 +194,18 @@ pub const AgentRuntime = struct {
         self.agent.client = self.client;
     }
 
+    pub fn disconnectCodexClient(self: *AgentRuntime) void {
+        if (self.owned_codex_responses) |client| {
+            client.deinit();
+            self.gpa.destroy(client);
+            self.owned_codex_responses = null;
+        }
+        if (self.client == .codex_responses) {
+            self.client = .none;
+            self.agent.client = .none;
+        }
+    }
+
     pub fn attachOpenAiCompatibleClient(
         self: *AgentRuntime,
         base_url: []const u8,
