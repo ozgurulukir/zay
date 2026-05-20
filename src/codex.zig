@@ -13,6 +13,7 @@ const jwt_claim_path = "https://api.openai.com/auth";
 pub const Model = struct {
     id: []u8,
     label: []u8,
+    codex_only: bool,
 
     pub fn deinit(self: *Model, gpa: std.mem.Allocator) void {
         gpa.free(self.id);
@@ -21,12 +22,12 @@ pub const Model = struct {
     }
 };
 
-const StaticModel = struct { id: []const u8, label: []const u8 };
+const StaticModel = struct { id: []const u8, label: []const u8, codex_only: bool = false };
 
 const static_models = [_]StaticModel{
     .{ .id = "gpt-5.2", .label = "OpenAI Codex · GPT-5.2" },
-    .{ .id = "gpt-5.3-codex", .label = "OpenAI Codex · GPT-5.3 Codex" },
-    .{ .id = "gpt-5.3-codex-spark", .label = "OpenAI Codex · GPT-5.3 Codex Spark" },
+    .{ .id = "gpt-5.3-codex", .label = "OpenAI Codex · GPT-5.3 Codex", .codex_only = true },
+    .{ .id = "gpt-5.3-codex-spark", .label = "OpenAI Codex · GPT-5.3 Codex Spark", .codex_only = true },
     .{ .id = "gpt-5.4", .label = "OpenAI Codex · GPT-5.4" },
     .{ .id = "gpt-5.4-mini", .label = "OpenAI Codex · GPT-5.4 mini" },
     .{ .id = "gpt-5.5", .label = "OpenAI Codex · GPT-5.5" },
@@ -43,6 +44,7 @@ pub fn loadStaticModels(gpa: std.mem.Allocator) ![]Model {
         out[initialized] = .{
             .id = try gpa.dupe(u8, model.id),
             .label = try gpa.dupe(u8, model.label),
+            .codex_only = model.codex_only,
         };
         initialized += 1;
     }
@@ -104,6 +106,15 @@ pub fn refresh(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, refresh
     errdefer credentials.deinit(gpa);
     try save(gpa, io, home_dir, credentials);
     return credentials;
+}
+
+pub fn signOut(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !void {
+    const path = try authPath(gpa, home_dir);
+    defer gpa.free(path);
+    std.Io.Dir.deleteFile(.cwd(), io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 }
 
 fn createAuthorizationFlow(gpa: std.mem.Allocator, io: std.Io) !AuthorizationFlow {
@@ -465,6 +476,10 @@ test "static models match pi openai codex catalog" {
     try std.testing.expectEqualStrings("gpt-5.4", loaded[3].id);
     try std.testing.expectEqualStrings("gpt-5.4-mini", loaded[4].id);
     try std.testing.expectEqualStrings("gpt-5.5", loaded[5].id);
+}
+
+test "sign out removes missing auth file without error" {
+    try signOut(std.testing.allocator, std.testing.io, "/tmp/nova-missing-home-for-signout-test");
 }
 
 test "auth file parser loads openai codex credentials" {
