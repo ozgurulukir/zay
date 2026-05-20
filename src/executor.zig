@@ -1,6 +1,4 @@
-//! The ExecutorService module: runs batches of ToolCalls and produces
-//! ToolResults that carry both channels of ADR-0002's split (LLM-facing
-//! observation + human-facing Display body/label/stderr/failed).
+//! The ExecutorService module: runs batches of ToolCalls and produces ToolResults.
 
 const std = @import("std");
 
