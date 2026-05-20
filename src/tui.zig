@@ -1,13 +1,11 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
-const time_c = @cImport({
-    @cInclude("time.h");
-});
 
 const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
 const codex = @import("codex.zig");
+const config_mod = @import("config.zig");
 const openai_compatible_mod = @import("ai/openai_compatible.zig");
 const runtime_mod = @import("runtime.zig");
 const session_mod = @import("session.zig");
@@ -16,19 +14,11 @@ const tools_mod = @import("tools.zig");
 
 const Render = thread_mod.Render;
 
-/// TUI display policy for a tool — Expand-by-default + Render mode.
-/// Lives here, *not* in the tool layer: the agent and the tools know
-/// nothing about how the TUI draws their results.
 const ToolPolicy = struct {
     expand_by_default: bool,
     render: Render,
 };
 
-/// One entry per tool in the **Tool registry**. The comptime block below
-/// asserts the table covers exactly the registry — no missing tools, no
-/// orphan entries. Adding a tool requires explicitly choosing a display
-/// policy here; forgetting is a build error, not a silent fall-back to
-/// "plain, collapsed."
 const tool_policies = [_]struct { name: []const u8, policy: ToolPolicy }{
     .{ .name = "bash", .policy = .{ .expand_by_default = false, .render = .plain } },
     .{ .name = "read", .policy = .{ .expand_by_default = false, .render = .plain } },
@@ -87,8 +77,11 @@ pub const App = struct {
     model_reasoning: std.ArrayList(u32) = .empty,
     model_selection: u32 = 0,
     model_column: ModelColumn = .model,
+    model_reasoning_snapshot: std.ArrayList(u32) = .empty,
+    model_selection_snapshot: u32 = 0,
     provider_selection: u32 = 0,
-    owned_codex_client: ?*ai.codex_responses.Client = null,
+    cached_config: config_mod.Config = .{},
+    cached_config_owned: bool = false,
     retired_threads: std.ArrayList(thread_mod.Thread) = .empty,
     in_flight: bool = false,
     loading_index: ?u32 = null,
@@ -135,10 +128,17 @@ pub const App = struct {
         };
     }
 
-    pub fn initRuntime(io: std.Io, gpa: std.mem.Allocator, runtime: *runtime_mod.AgentRuntime) App {
+    pub fn initRuntime(
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        runtime: *runtime_mod.AgentRuntime,
+        config: config_mod.Config,
+    ) App {
         var app = init(io, gpa, &runtime.agent);
         app.runtime = runtime;
         app.owns_runtime = true;
+        app.cached_config = config;
+        app.cached_config_owned = true;
         return app;
     }
 
@@ -155,9 +155,10 @@ pub const App = struct {
         self.codexModelsClear();
         self.codex_models.deinit(self.gpa);
         self.model_reasoning.deinit(self.gpa);
-        if (self.owned_codex_client) |client| {
-            client.deinit();
-            self.gpa.destroy(client);
+        self.model_reasoning_snapshot.deinit(self.gpa);
+        if (self.cached_config_owned) {
+            self.cached_config.deinit(self.gpa);
+            self.cached_config_owned = false;
         }
         if (self.owns_runtime) {
             if (self.runtime) |runtime| {
@@ -186,12 +187,55 @@ pub const App = struct {
         defer self.gpa.free(prompt);
         if (prompt.len == 0) return null;
 
+        if (self.runtime != null and self.runtime.?.client == .none) {
+            _ = try self.thread.append(self.gpa, .user, "you", prompt);
+            const message = try self.formatNoProviderMessage();
+            defer self.gpa.free(message);
+            _ = try self.thread.append(self.gpa, .agent, "agent", message);
+            return null;
+        }
+
         self.resetTurnState();
         _ = try self.thread.append(self.gpa, .user, "you", prompt);
         try self.agent.addUser(prompt);
         try self.appendLoading();
         self.in_flight = true;
         return self.loading_index;
+    }
+
+    fn formatNoProviderMessage(self: *App) ![]u8 {
+        if (self.runtime) |rt| {
+            for (rt.diagnostics) |d| {
+                switch (d) {
+                    .config_parse_error => |e| return std.fmt.allocPrint(
+                        self.gpa,
+                        "Failed to load {s}: {s}",
+                        .{ e.path, e.reason },
+                    ),
+                    .bad_env_model => |raw| return std.fmt.allocPrint(
+                        self.gpa,
+                        "Invalid OPENAI_MODEL: expected <provider>/<model>, got '{s}'",
+                        .{raw},
+                    ),
+                }
+            }
+        }
+        if (self.cached_config.provider) |p| {
+            if (p.adapter() == null) {
+                return std.fmt.allocPrint(
+                    self.gpa,
+                    "Provider '{s}' is not yet supported in Nova.",
+                    .{p.label()},
+                );
+            }
+            if (p == .openai) {
+                return self.gpa.dupe(u8, "No OpenAI Codex session — type :connect to sign in.");
+            }
+        }
+        return self.gpa.dupe(
+            u8,
+            "No provider connected. Type :connect to pick one, or set OPENAI_MODEL=<provider>/<model>.",
+        );
     }
 
     fn resetTurnState(self: *App) void {
@@ -547,6 +591,7 @@ pub const App = struct {
 
     fn cancelMode(self: *App) !bool {
         if (self.mode == .normal) return false;
+        if (self.mode == .model_picker) self.revertModelPickerSnapshot();
         if (self.mode == .picker or self.mode == .provider_picker or self.mode == .model_picker) {
             try self.openCommandMenu();
             self.resumeClear();
@@ -556,6 +601,12 @@ pub const App = struct {
         self.clearInput();
         self.resumeClear();
         return true;
+    }
+
+    fn revertModelPickerSnapshot(self: *App) void {
+        self.model_reasoning.clearRetainingCapacity();
+        self.model_reasoning.appendSlice(self.gpa, self.model_reasoning_snapshot.items) catch {};
+        self.model_selection = self.model_selection_snapshot;
     }
 
     fn submitMode(self: *App) !bool {
@@ -621,15 +672,21 @@ pub const App = struct {
         if (self.codex_models.items.len == 0) {
             self.reloadCodexModels() catch {};
         }
+        // Snapshot for Escape revert. See `cancelMode`.
+        self.model_reasoning_snapshot.clearRetainingCapacity();
+        try self.model_reasoning_snapshot.appendSlice(self.gpa, self.model_reasoning.items);
+        self.model_selection_snapshot = self.model_selection;
     }
 
     fn connectCodex(self: *App) !void {
         if (self.in_flight) return error.InFlightTurn;
-        var credentials = try codex.login(self.gpa, self.io);
+        var credentials = try codex.login(self.gpa, self.io, self.runtime.?.home_dir);
         defer credentials.deinit(self.gpa);
         try self.reloadCodexModels();
         const model = self.selectedCodexModel() orelse return error.NoModels;
-        try self.installCodexClient(credentials, model.id, self.selectedReasoningEffort());
+        const effort = self.selectedReasoningEffort();
+        try self.installCodexClient(credentials, model.id, effort);
+        try self.persistCodexSelection(model.id, effort);
         self.mode = .normal;
         self.clearInput();
         _ = try self.thread.append(self.gpa, .agent, "agent", "Connected to OpenAI Codex.");
@@ -637,14 +694,39 @@ pub const App = struct {
 
     fn applySelectedModel(self: *App) !void {
         if (self.in_flight) return error.InFlightTurn;
-        const loaded = try codex.load(self.gpa, self.io);
+        const loaded = try codex.load(self.gpa, self.io, self.runtime.?.home_dir);
         var credentials = loaded orelse return error.NotConnected;
         defer credentials.deinit(self.gpa);
         if (self.codex_models.items.len == 0) try self.reloadCodexModels();
         const model = self.selectedCodexModel() orelse return error.NoModels;
-        try self.installCodexClient(credentials, model.id, self.selectedReasoningEffort());
+        const effort = self.selectedReasoningEffort();
+        try self.installCodexClient(credentials, model.id, effort);
+        try self.persistCodexSelection(model.id, effort);
         self.mode = .normal;
         self.clearInput();
+    }
+
+    fn persistCodexSelection(self: *App, model_id: []const u8, effort: ai.ReasoningEffort) !void {
+        const new_id = try self.gpa.dupe(u8, model_id);
+        errdefer self.gpa.free(new_id);
+        if (self.cached_config_owned) {
+            if (self.cached_config.model) |*old| old.deinit(self.gpa);
+            self.cached_config.provider = .openai;
+            self.cached_config.model = .{ .id = new_id, .reasoning_effort = effort };
+        } else {
+            self.gpa.free(new_id);
+        }
+        var updates: config_mod.Config = .{
+            .provider = .openai,
+            .model = .{
+                .id = try self.gpa.dupe(u8, model_id),
+                .reasoning_effort = effort,
+            },
+        };
+        defer updates.deinit(self.gpa);
+        config_mod.mergeAndWriteGlobal(self.gpa, self.io, self.runtime.?.home_dir, updates) catch |err| {
+            std.log.warn("config.write.failed err={s}", .{@errorName(err)});
+        };
     }
 
     fn reloadCodexModels(self: *App) !void {
@@ -686,27 +768,14 @@ pub const App = struct {
         self.model_reasoning.clearRetainingCapacity();
     }
 
-    fn installCodexClient(self: *App, credentials: codex.Credentials, model: []const u8, effort: ai.ReasoningEffort) !void {
-        const client = try self.gpa.create(ai.codex_responses.Client);
-        errdefer self.gpa.destroy(client);
-        try client.init(self.gpa, self.io, .{
-            .base_url = "https://chatgpt.com/backend-api",
-            .api_key = credentials.access,
-            .model = model,
-            .tools = tools_mod.registry,
-            .reasoning = .{ .effort = effort, .summary = .auto },
-            .provider = .openai_codex,
-            .account_id = credentials.account_id,
-            .session_id = &self.runtime.?.session_writer.session.id,
-            .system_prompt = self.runtime.?.system_prompt,
-        });
-        if (self.owned_codex_client) |old| {
-            old.deinit();
-            self.gpa.destroy(old);
-        }
-        self.owned_codex_client = client;
-        self.runtime.?.client = .{ .codex_responses = client };
-        self.agent.client = .{ .codex_responses = client };
+    fn installCodexClient(
+        self: *App,
+        credentials: codex.Credentials,
+        model: []const u8,
+        effort: ai.ReasoningEffort,
+    ) !void {
+        try self.runtime.?.installCodexClient(credentials, model, effort);
+        self.agent.client = self.runtime.?.client;
     }
 
     fn reloadResumeSessions(self: *App) !void {
@@ -809,10 +878,29 @@ pub const App = struct {
         const current = self.runtime.?;
         const runtime = try self.gpa.create(runtime_mod.AgentRuntime);
         errdefer self.gpa.destroy(runtime);
+        const diagnostics = try self.gpa.alloc(config_mod.Diagnostic, 0);
+        errdefer self.gpa.free(diagnostics);
         if (session_id) |id| {
-            try runtime.initResume(current.gpa, self.io, current.cwd, current.client, current.system_prompt, id);
+            try runtime.initResume(
+                current.gpa,
+                self.io,
+                current.cwd,
+                current.home_dir,
+                current.system_prompt,
+                self.cached_config,
+                diagnostics,
+                id,
+            );
         } else {
-            try runtime.initNew(current.gpa, self.io, current.cwd, current.client, current.system_prompt);
+            try runtime.initNew(
+                current.gpa,
+                self.io,
+                current.cwd,
+                current.home_dir,
+                current.system_prompt,
+                self.cached_config,
+                diagnostics,
+            );
         }
         return runtime;
     }
@@ -992,13 +1080,17 @@ fn postAgentEvent(context: *anyopaque, event: agent_mod.Agent.Event) anyerror!vo
     try worker_context.queue.push(worker_context.io, worker_context.gpa, event_ptr);
 }
 
-pub fn run(init: std.process.Init, runtime: *runtime_mod.AgentRuntime) !void {
+pub fn run(
+    init: std.process.Init,
+    runtime: *runtime_mod.AgentRuntime,
+    config: config_mod.Config,
+) !void {
     const gpa = init.arena.allocator();
     var tty_buffer: [8192]u8 = undefined;
     var fw_app = try vxfw.App.init(init.io, gpa, init.environ_map, &tty_buffer);
     defer fw_app.deinit();
 
-    var app = App.initRuntime(init.io, gpa, runtime);
+    var app = App.initRuntime(init.io, gpa, runtime, config);
     app.bindInputCallbacks();
     defer app.deinit();
 
@@ -1757,7 +1849,7 @@ const ResumeRowWidget = struct {
         const width = ctx.max.width orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
         var buffer: [128]u8 = undefined;
-        const modified = modifiedTime(buffer[0..], self.summary.updated_at_ms);
+        const modified = modifiedTime(self.app.io, buffer[0..], self.summary.updated_at_ms);
         const left = try self.leftText(ctx, width, modified);
         try writeCommandLine(&surface, 0, left, ctx, self.selected);
         try writePanelRight(&surface, 0, modified, ctx, self.selected);
@@ -1874,15 +1966,59 @@ fn resumeMatches(summary: *const session_mod.SessionSummary, filter: []const u8)
     return false;
 }
 
-fn modifiedTime(buffer: []u8, updated_at_ms: i64) []const u8 {
+/// Format a recency label for the resume picker. Buckets:
+///   just now  < 60s
+///   Nm ago    1..59 minutes
+///   Nh ago    1..23 hours
+///   Nd ago    1..6 days
+///   Nw ago    1..3 weeks (7..27 days)
+///   Nmo ago   1..11 months (~28..364 days)
+///   Ny ago    1+ years
+///
+fn modifiedTime(io: std.Io, buffer: []u8, updated_at_ms: i64) []const u8 {
     if (updated_at_ms < 0) return "unknown time";
     if (buffer.len == 0) return "unknown time";
-    var seconds: time_c.time_t = @intCast(@divTrunc(updated_at_ms, 1000));
-    var local: time_c.struct_tm = undefined;
-    if (time_c.localtime_r(&seconds, &local) == null) return "unknown time";
-    const written = time_c.strftime(buffer.ptr, buffer.len, "%Y-%m-%d %H:%M:%S", &local);
-    if (written == 0) return "unknown time";
-    return buffer[0..written];
+    const now_ms = std.Io.Clock.now(.real, io).toMilliseconds();
+    const diff_ms = now_ms - updated_at_ms;
+    if (diff_ms < 0) return "in the future";
+    const seconds: i64 = @divTrunc(diff_ms, 1000);
+    if (seconds < 60) return "just now";
+    const minutes: i64 = @divTrunc(seconds, 60);
+    if (minutes < 60) {
+        return std.fmt.bufPrint(buffer, "{d}m ago", .{minutes}) catch "unknown time";
+    }
+    const hours: i64 = @divTrunc(minutes, 60);
+    if (hours < 24) {
+        return std.fmt.bufPrint(buffer, "{d}h ago", .{hours}) catch "unknown time";
+    }
+    const days: i64 = @divTrunc(hours, 24);
+    if (days < 7) {
+        return std.fmt.bufPrint(buffer, "{d}d ago", .{days}) catch "unknown time";
+    }
+    if (days < 28) {
+        return std.fmt.bufPrint(buffer, "{d}w ago", .{@divTrunc(days, 7)}) catch "unknown time";
+    }
+    if (days < 365) {
+        return std.fmt.bufPrint(buffer, "{d}mo ago", .{@divTrunc(days, 30)}) catch "unknown time";
+    }
+    return std.fmt.bufPrint(buffer, "{d}y ago", .{@divTrunc(days, 365)}) catch "unknown time";
+}
+
+test "modifiedTime buckets" {
+    const io = std.testing.io;
+    var buf: [32]u8 = undefined;
+    const now = std.Io.Clock.now(.real, io).toMilliseconds();
+    const sec_ms: i64 = 1000;
+    const min_ms: i64 = 60 * sec_ms;
+    const hour_ms: i64 = 60 * min_ms;
+    const day_ms: i64 = 24 * hour_ms;
+    try std.testing.expectEqualStrings("just now", modifiedTime(io, &buf, now - 30 * sec_ms));
+    try std.testing.expectEqualStrings("5m ago", modifiedTime(io, &buf, now - 5 * min_ms));
+    try std.testing.expectEqualStrings("3h ago", modifiedTime(io, &buf, now - 3 * hour_ms));
+    try std.testing.expectEqualStrings("3d ago", modifiedTime(io, &buf, now - 3 * day_ms));
+    try std.testing.expectEqualStrings("2w ago", modifiedTime(io, &buf, now - 14 * day_ms));
+    try std.testing.expectEqualStrings("3mo ago", modifiedTime(io, &buf, now - 90 * day_ms));
+    try std.testing.expectEqualStrings("2y ago", modifiedTime(io, &buf, now - 730 * day_ms));
 }
 
 const InputWidget = struct {
