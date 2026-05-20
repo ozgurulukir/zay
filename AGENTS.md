@@ -17,5 +17,3 @@ Run the following:
 - `zig fmt`
 
 - `zig build test`
-
-- `zig build run`
