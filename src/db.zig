@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 
 const c = @cImport({
     @cInclude("sqlite3.h");
@@ -8,8 +7,6 @@ const c = @cImport({
 const assert = std.debug.assert;
 
 pub const Error = error{
-    LibraryNotFound,
-    MissingSymbol,
     Misuse,
     Sqlite,
     OutOfMemory,
@@ -43,28 +40,26 @@ pub const OpenFlags = packed struct(c_int) {
 };
 
 pub const Connection = struct {
-    api: *const Api,
     handle: *c.sqlite3,
 
     pub fn open(path: []const u8, flags: OpenFlags) Error!Connection {
         assert(path.len > 0);
-        const api = try loadApi();
         var path_buffer: [std.fs.max_path_bytes:0]u8 = undefined;
         if (path.len >= path_buffer.len) return error.Misuse;
         @memcpy(path_buffer[0..path.len], path);
         path_buffer[path.len] = 0;
 
         var handle: ?*c.sqlite3 = null;
-        const rc = api.open_v2(path_buffer[0..path.len :0].ptr, &handle, flags.bits(), null);
+        const rc = c.sqlite3_open_v2(path_buffer[0..path.len :0].ptr, &handle, flags.bits(), null);
         if (rc != c.SQLITE_OK) {
-            if (handle) |h| _ = api.close(h);
+            if (handle) |h| _ = c.sqlite3_close(h);
             return error.Sqlite;
         }
-        return .{ .api = api, .handle = handle orelse return error.Sqlite };
+        return .{ .handle = handle orelse return error.Sqlite };
     }
 
     pub fn close(self: *Connection) void {
-        _ = self.api.close(self.handle);
+        _ = c.sqlite3_close(self.handle);
         self.* = undefined;
     }
 
@@ -85,72 +80,71 @@ pub const Connection = struct {
         sql_buffer[sql.len] = 0;
 
         var handle: ?*c.sqlite3_stmt = null;
-        const rc = self.api.prepare_v3(self.handle, sql_buffer[0..sql.len :0].ptr, @intCast(sql.len), 0, &handle, null);
+        const rc = c.sqlite3_prepare_v3(self.handle, sql_buffer[0..sql.len :0].ptr, @intCast(sql.len), 0, &handle, null);
         if (rc != c.SQLITE_OK) return error.Sqlite;
-        return .{ .api = self.api, .connection = self.handle, .handle = handle orelse return error.Sqlite };
+        return .{ .connection = self.handle, .handle = handle orelse return error.Sqlite };
     }
 
     pub fn lastInsertRowid(self: *const Connection) i64 {
-        return self.api.last_insert_rowid(self.handle);
+        return c.sqlite3_last_insert_rowid(self.handle);
     }
 
     pub fn changes(self: *const Connection) i32 {
-        return self.api.changes(self.handle);
+        return c.sqlite3_changes(self.handle);
     }
 
     pub fn errorMessage(self: *const Connection) [:0]const u8 {
-        return std.mem.span(self.api.errmsg(self.handle));
+        return std.mem.span(c.sqlite3_errmsg(self.handle));
     }
 };
 
 pub const Statement = struct {
-    api: *const Api,
     connection: *c.sqlite3,
     handle: *c.sqlite3_stmt,
 
     pub fn finalize(self: *Statement) void {
-        _ = self.api.finalize(self.handle);
+        _ = c.sqlite3_finalize(self.handle);
         self.* = undefined;
     }
 
     pub fn reset(self: *Statement) Error!void {
-        try self.check(self.api.reset(self.handle));
+        try self.check(c.sqlite3_reset(self.handle));
     }
 
     pub fn clearBindings(self: *Statement) Error!void {
-        try self.check(self.api.clear_bindings(self.handle));
+        try self.check(c.sqlite3_clear_bindings(self.handle));
     }
 
     pub fn step(self: *Statement) Error!?Row {
-        const rc = self.api.step(self.handle);
-        if (rc == c.SQLITE_ROW) return Row{ .api = self.api, .handle = self.handle };
+        const rc = c.sqlite3_step(self.handle);
+        if (rc == c.SQLITE_ROW) return Row{ .handle = self.handle };
         if (rc == c.SQLITE_DONE) return null;
         return error.Sqlite;
     }
 
     pub fn bindNull(self: *Statement, index: i32) Error!void {
         assert(index > 0);
-        try self.check(self.api.bind_null(self.handle, index));
+        try self.check(c.sqlite3_bind_null(self.handle, index));
     }
 
     pub fn bindInt(self: *Statement, index: i32, value: i64) Error!void {
         assert(index > 0);
-        try self.check(self.api.bind_int64(self.handle, index, value));
+        try self.check(c.sqlite3_bind_int64(self.handle, index, value));
     }
 
     pub fn bindFloat(self: *Statement, index: i32, value: f64) Error!void {
         assert(index > 0);
-        try self.check(self.api.bind_double(self.handle, index, value));
+        try self.check(c.sqlite3_bind_double(self.handle, index, value));
     }
 
     pub fn bindText(self: *Statement, index: i32, value: []const u8) Error!void {
         assert(index > 0);
-        try self.check(self.api.bind_text(self.handle, index, value.ptr, @intCast(value.len), sqlite_static));
+        try self.check(c.sqlite3_bind_text(self.handle, index, value.ptr, @intCast(value.len), sqlite_static));
     }
 
     pub fn bindBlob(self: *Statement, index: i32, value: []const u8) Error!void {
         assert(index > 0);
-        try self.check(self.api.bind_blob(self.handle, index, value.ptr, @intCast(value.len), sqlite_static));
+        try self.check(c.sqlite3_bind_blob(self.handle, index, value.ptr, @intCast(value.len), sqlite_static));
     }
 
     pub fn bindValue(self: *Statement, index: i32, value: Value) Error!void {
@@ -165,11 +159,11 @@ pub const Statement = struct {
     }
 
     pub fn columnCount(self: *const Statement) i32 {
-        return self.api.column_count(self.handle);
+        return c.sqlite3_column_count(self.handle);
     }
 
     pub fn errorMessage(self: *const Statement) [:0]const u8 {
-        return std.mem.span(self.api.errmsg(self.connection));
+        return std.mem.span(c.sqlite3_errmsg(self.connection));
     }
 
     fn check(self: *Statement, rc: c_int) Error!void {
@@ -180,50 +174,49 @@ pub const Statement = struct {
 };
 
 pub const Row = struct {
-    api: *const Api,
     handle: *c.sqlite3_stmt,
 
     pub fn columnCount(self: *const Row) i32 {
-        return self.api.column_count(self.handle);
+        return c.sqlite3_column_count(self.handle);
     }
 
     pub fn columnName(self: *const Row, index: i32) [:0]const u8 {
         assert(index >= 0);
         assert(index < self.columnCount());
-        return std.mem.span(self.api.column_name(self.handle, index));
+        return std.mem.span(c.sqlite3_column_name(self.handle, index));
     }
 
     pub fn columnType(self: *const Row, index: i32) ColumnType {
         assert(index >= 0);
         assert(index < self.columnCount());
-        return ColumnType.fromSqlite(self.api.column_type(self.handle, index));
+        return ColumnType.fromSqlite(c.sqlite3_column_type(self.handle, index));
     }
 
     pub fn int(self: *const Row, index: i32) i64 {
         assert(index >= 0);
         assert(index < self.columnCount());
-        return self.api.column_int64(self.handle, index);
+        return c.sqlite3_column_int64(self.handle, index);
     }
 
     pub fn float(self: *const Row, index: i32) f64 {
         assert(index >= 0);
         assert(index < self.columnCount());
-        return self.api.column_double(self.handle, index);
+        return c.sqlite3_column_double(self.handle, index);
     }
 
     pub fn text(self: *const Row, index: i32) []const u8 {
         assert(index >= 0);
         assert(index < self.columnCount());
-        const ptr = self.api.column_text(self.handle, index) orelse return "";
-        const len: usize = @intCast(self.api.column_bytes(self.handle, index));
+        const ptr = c.sqlite3_column_text(self.handle, index) orelse return "";
+        const len: usize = @intCast(c.sqlite3_column_bytes(self.handle, index));
         return ptr[0..len];
     }
 
     pub fn blob(self: *const Row, index: i32) []const u8 {
         assert(index >= 0);
         assert(index < self.columnCount());
-        const ptr = self.api.column_blob(self.handle, index) orelse return "";
-        const len: usize = @intCast(self.api.column_bytes(self.handle, index));
+        const ptr = c.sqlite3_column_blob(self.handle, index) orelse return "";
+        const len: usize = @intCast(c.sqlite3_column_bytes(self.handle, index));
         const bytes: [*]const u8 = @ptrCast(ptr);
         return bytes[0..len];
     }
@@ -271,131 +264,6 @@ pub const ColumnType = enum {
 };
 
 const sqlite_static: ?*const fn (?*anyopaque) callconv(.c) void = null;
-
-const Api = struct {
-    lib: std.DynLib,
-    open_v2: OpenV2Fn,
-    close: CloseFn,
-    errmsg: ErrmsgFn,
-    prepare_v3: PrepareV3Fn,
-    step: StepFn,
-    finalize: FinalizeFn,
-    reset: ResetFn,
-    clear_bindings: ClearBindingsFn,
-    bind_null: BindNullFn,
-    bind_int64: BindInt64Fn,
-    bind_double: BindDoubleFn,
-    bind_text: BindTextFn,
-    bind_blob: BindBlobFn,
-    column_count: ColumnCountFn,
-    column_name: ColumnNameFn,
-    column_type: ColumnTypeFn,
-    column_int64: ColumnInt64Fn,
-    column_double: ColumnDoubleFn,
-    column_text: ColumnTextFn,
-    column_blob: ColumnBlobFn,
-    column_bytes: ColumnBytesFn,
-    last_insert_rowid: LastInsertRowidFn,
-    changes: ChangesFn,
-};
-
-const OpenV2Fn = *const fn ([*:0]const u8, *?*c.sqlite3, c_int, ?[*:0]const u8) callconv(.c) c_int;
-const CloseFn = *const fn (*c.sqlite3) callconv(.c) c_int;
-const ErrmsgFn = *const fn (*c.sqlite3) callconv(.c) [*:0]const u8;
-const PrepareV3Fn = *const fn (*c.sqlite3, [*:0]const u8, c_int, c_uint, *?*c.sqlite3_stmt, ?*[*:0]const u8) callconv(.c) c_int;
-const StepFn = *const fn (*c.sqlite3_stmt) callconv(.c) c_int;
-const FinalizeFn = *const fn (*c.sqlite3_stmt) callconv(.c) c_int;
-const ResetFn = *const fn (*c.sqlite3_stmt) callconv(.c) c_int;
-const ClearBindingsFn = *const fn (*c.sqlite3_stmt) callconv(.c) c_int;
-const BindNullFn = *const fn (*c.sqlite3_stmt, c_int) callconv(.c) c_int;
-const BindInt64Fn = *const fn (*c.sqlite3_stmt, c_int, i64) callconv(.c) c_int;
-const BindDoubleFn = *const fn (*c.sqlite3_stmt, c_int, f64) callconv(.c) c_int;
-const BindTextFn = *const fn (*c.sqlite3_stmt, c_int, [*]const u8, c_int, ?*const fn (?*anyopaque) callconv(.c) void) callconv(.c) c_int;
-const BindBlobFn = *const fn (*c.sqlite3_stmt, c_int, [*]const u8, c_int, ?*const fn (?*anyopaque) callconv(.c) void) callconv(.c) c_int;
-const ColumnCountFn = *const fn (*c.sqlite3_stmt) callconv(.c) c_int;
-const ColumnNameFn = *const fn (*c.sqlite3_stmt, c_int) callconv(.c) [*:0]const u8;
-const ColumnTypeFn = *const fn (*c.sqlite3_stmt, c_int) callconv(.c) c_int;
-const ColumnInt64Fn = *const fn (*c.sqlite3_stmt, c_int) callconv(.c) i64;
-const ColumnDoubleFn = *const fn (*c.sqlite3_stmt, c_int) callconv(.c) f64;
-const ColumnTextFn = *const fn (*c.sqlite3_stmt, c_int) callconv(.c) ?[*]const u8;
-const ColumnBlobFn = *const fn (*c.sqlite3_stmt, c_int) callconv(.c) ?*const anyopaque;
-const ColumnBytesFn = *const fn (*c.sqlite3_stmt, c_int) callconv(.c) c_int;
-const LastInsertRowidFn = *const fn (*c.sqlite3) callconv(.c) i64;
-const ChangesFn = *const fn (*c.sqlite3) callconv(.c) c_int;
-
-var api_mutex: std.atomic.Mutex = .unlocked;
-var api_value: ?Api = null;
-
-fn loadApi() Error!*const Api {
-    lockApi();
-    defer api_mutex.unlock();
-    if (api_value) |*api| return api;
-    api_value = try openApi();
-    return &(api_value.?);
-}
-
-fn lockApi() void {
-    while (!api_mutex.tryLock()) {
-        std.Thread.yield() catch {};
-    }
-}
-
-fn openApi() Error!Api {
-    const paths = libraryPaths();
-    for (paths) |path| {
-        var lib = std.DynLib.open(path) catch continue;
-        errdefer lib.close();
-        return .{
-            .lib = lib,
-            .open_v2 = lib.lookup(OpenV2Fn, "sqlite3_open_v2") orelse return error.MissingSymbol,
-            .close = lib.lookup(CloseFn, "sqlite3_close") orelse return error.MissingSymbol,
-            .errmsg = lib.lookup(ErrmsgFn, "sqlite3_errmsg") orelse return error.MissingSymbol,
-            .prepare_v3 = lib.lookup(PrepareV3Fn, "sqlite3_prepare_v3") orelse return error.MissingSymbol,
-            .step = lib.lookup(StepFn, "sqlite3_step") orelse return error.MissingSymbol,
-            .finalize = lib.lookup(FinalizeFn, "sqlite3_finalize") orelse return error.MissingSymbol,
-            .reset = lib.lookup(ResetFn, "sqlite3_reset") orelse return error.MissingSymbol,
-            .clear_bindings = lib.lookup(ClearBindingsFn, "sqlite3_clear_bindings") orelse return error.MissingSymbol,
-            .bind_null = lib.lookup(BindNullFn, "sqlite3_bind_null") orelse return error.MissingSymbol,
-            .bind_int64 = lib.lookup(BindInt64Fn, "sqlite3_bind_int64") orelse return error.MissingSymbol,
-            .bind_double = lib.lookup(BindDoubleFn, "sqlite3_bind_double") orelse return error.MissingSymbol,
-            .bind_text = lib.lookup(BindTextFn, "sqlite3_bind_text") orelse return error.MissingSymbol,
-            .bind_blob = lib.lookup(BindBlobFn, "sqlite3_bind_blob") orelse return error.MissingSymbol,
-            .column_count = lib.lookup(ColumnCountFn, "sqlite3_column_count") orelse return error.MissingSymbol,
-            .column_name = lib.lookup(ColumnNameFn, "sqlite3_column_name") orelse return error.MissingSymbol,
-            .column_type = lib.lookup(ColumnTypeFn, "sqlite3_column_type") orelse return error.MissingSymbol,
-            .column_int64 = lib.lookup(ColumnInt64Fn, "sqlite3_column_int64") orelse return error.MissingSymbol,
-            .column_double = lib.lookup(ColumnDoubleFn, "sqlite3_column_double") orelse return error.MissingSymbol,
-            .column_text = lib.lookup(ColumnTextFn, "sqlite3_column_text") orelse return error.MissingSymbol,
-            .column_blob = lib.lookup(ColumnBlobFn, "sqlite3_column_blob") orelse return error.MissingSymbol,
-            .column_bytes = lib.lookup(ColumnBytesFn, "sqlite3_column_bytes") orelse return error.MissingSymbol,
-            .last_insert_rowid = lib.lookup(LastInsertRowidFn, "sqlite3_last_insert_rowid") orelse return error.MissingSymbol,
-            .changes = lib.lookup(ChangesFn, "sqlite3_changes") orelse return error.MissingSymbol,
-        };
-    }
-    return error.LibraryNotFound;
-}
-
-fn libraryPaths() []const []const u8 {
-    return switch (builtin.os.tag) {
-        .macos => &.{
-            "third_party/libsql/libsql-sqlite3/.libs/libsqlite3.0.dylib",
-            "third_party/libsql/libsql-sqlite3/.libs/liblibsql.0.dylib",
-            "libsqlite3.0.dylib",
-            "liblibsql.0.dylib",
-        },
-        .linux => &.{
-            "third_party/libsql/libsql-sqlite3/.libs/libsqlite3.so",
-            "third_party/libsql/libsql-sqlite3/.libs/liblibsql.so",
-            "libsqlite3.so",
-            "liblibsql.so",
-        },
-        .windows => &.{
-            "third_party\\libsql\\libsql-sqlite3\\.libs\\sqlite3.dll",
-            "sqlite3.dll",
-        },
-        else => &.{"libsqlite3"},
-    };
-}
 
 test "open in-memory database and query row" {
     var connection = try Connection.open(":memory:", .{});
