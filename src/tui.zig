@@ -685,7 +685,7 @@ pub const App = struct {
         try self.reloadCodexModels();
         const model = self.selectedCodexModel() orelse return error.NoModels;
         const effort = self.selectedReasoningEffort();
-        try self.installCodexClient(credentials, model.id, effort);
+        try self.connectCodexClient(credentials, model.id, effort);
         try self.persistCodexSelection(model.id, effort);
         self.mode = .normal;
         self.clearInput();
@@ -700,7 +700,7 @@ pub const App = struct {
         if (self.codex_models.items.len == 0) try self.reloadCodexModels();
         const model = self.selectedCodexModel() orelse return error.NoModels;
         const effort = self.selectedReasoningEffort();
-        try self.installCodexClient(credentials, model.id, effort);
+        try self.connectCodexClient(credentials, model.id, effort);
         try self.persistCodexSelection(model.id, effort);
         self.mode = .normal;
         self.clearInput();
@@ -768,13 +768,13 @@ pub const App = struct {
         self.model_reasoning.clearRetainingCapacity();
     }
 
-    fn installCodexClient(
+    fn connectCodexClient(
         self: *App,
         credentials: codex.Credentials,
         model: []const u8,
         effort: ai.ReasoningEffort,
     ) !void {
-        try self.runtime.?.installCodexClient(credentials, model, effort);
+        try self.runtime.?.connectCodexClient(credentials, model, effort);
         self.agent.client = self.runtime.?.client;
     }
 
