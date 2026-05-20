@@ -485,8 +485,14 @@ pub const App = struct {
 
     pub fn handleCommandKey(self: *App, key: vaxis.Key) !bool {
         if (self.mode == .provider_picker) {
-            if (key.matches(vaxis.Key.up, .{})) return true;
-            if (key.matches(vaxis.Key.down, .{})) return true;
+            if (key.matches(vaxis.Key.up, .{})) {
+                self.provider_selection = previousIndex(self.provider_selection, self.providerOptionCount());
+                return true;
+            }
+            if (key.matches(vaxis.Key.down, .{})) {
+                self.provider_selection = nextIndex(self.provider_selection, self.providerOptionCount());
+                return true;
+            }
             return false;
         }
         if (self.mode == .model_picker) {
@@ -613,7 +619,11 @@ pub const App = struct {
         const input = try self.peekInput();
         defer self.gpa.free(input);
         if (self.mode == .provider_picker) {
-            self.connectCodex() catch |err| try self.reportConnectionError(err);
+            if (self.provider_selection == 0) {
+                self.connectCodex() catch |err| try self.reportConnectionError(err);
+            } else {
+                self.signOutCodex() catch |err| try self.reportConnectionError(err);
+            }
             return true;
         }
         if (self.mode == .model_picker) {
@@ -665,13 +675,15 @@ pub const App = struct {
         self.clearInput();
     }
 
+    fn providerOptionCount(self: *const App) u32 {
+        return if (self.isCodexConnected()) 2 else 1;
+    }
+
     fn openModelPicker(self: *App) !void {
         self.mode = .model_picker;
         self.model_column = .model;
         self.clearInput();
-        if (self.codex_models.items.len == 0) {
-            self.reloadCodexModels() catch {};
-        }
+        self.reloadCodexModels() catch {};
         // Snapshot for Escape revert. See `cancelMode`.
         self.model_reasoning_snapshot.clearRetainingCapacity();
         try self.model_reasoning_snapshot.appendSlice(self.gpa, self.model_reasoning.items);
@@ -690,6 +702,17 @@ pub const App = struct {
         self.mode = .normal;
         self.clearInput();
         _ = try self.thread.append(self.gpa, .agent, "agent", "Connected to OpenAI Codex.");
+    }
+
+    fn signOutCodex(self: *App) !void {
+        if (self.in_flight) return error.InFlightTurn;
+        try codex.signOut(self.gpa, self.io, self.runtime.?.home_dir);
+        self.runtime.?.disconnectCodexClient();
+        self.agent.client = self.runtime.?.client;
+        self.codexModelsClear();
+        self.mode = .normal;
+        self.clearInput();
+        _ = try self.thread.append(self.gpa, .agent, "agent", "Signed out from OpenAI Codex.");
     }
 
     fn applySelectedModel(self: *App) !void {
@@ -731,21 +754,37 @@ pub const App = struct {
 
     fn reloadCodexModels(self: *App) !void {
         const models = try codex.loadStaticModels(self.gpa);
+        defer self.gpa.free(models);
         self.codexModelsClear();
-        try self.codex_models.appendSlice(self.gpa, models);
-        self.gpa.free(models);
+        const show_codex_only = self.isCodexConnected();
+        for (models) |*model| {
+            if (model.codex_only) {
+                if (!show_codex_only) continue;
+            }
+            try self.codex_models.append(self.gpa, model.*);
+            model.* = .{ .id = &.{}, .label = &.{}, .codex_only = false };
+        }
+        for (models) |*model| {
+            if (model.id.len == 0) continue;
+            model.deinit(self.gpa);
+        }
         self.model_reasoning.clearRetainingCapacity();
         try self.model_reasoning.appendNTimes(self.gpa, 0, self.codex_models.items.len);
         if (self.model_selection >= self.codex_models.items.len) self.model_selection = 0;
         self.syncModelListCursor();
     }
 
-    fn selectedReasoningIndex(self: *App) u32 {
+    fn isCodexConnected(self: *const App) bool {
+        const runtime = self.runtime orelse return false;
+        return runtime.client == .codex_responses;
+    }
+
+    fn selectedReasoningIndex(self: *const App) u32 {
         if (self.model_selection >= self.model_reasoning.items.len) return 0;
         return self.model_reasoning.items[self.model_selection];
     }
 
-    fn selectedReasoningEffort(self: *App) ai.ReasoningEffort {
+    fn selectedReasoningEffort(self: *const App) ai.ReasoningEffort {
         return reasoningOptions()[self.selectedReasoningIndex()].effort;
     }
 
@@ -1239,7 +1278,7 @@ const RootWidget = struct {
         const self: *RootWidget = @ptrCast(@alignCast(ptr));
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
-        const input_height: u16 = @min(max_height, 3);
+        const input_height: u16 = @min(max_height, 4);
         const panel_height: u16 = if (self.app.mode == .normal) 0 else @min(max_height -| input_height, 7);
         const thread_height: u16 = max_height - input_height - panel_height;
 
@@ -1585,6 +1624,70 @@ fn inputLabel(app: *const App) []const u8 {
     };
 }
 
+const ModelStatus = struct {
+    provider: []const u8,
+    model: []const u8,
+    thinking: ?[]const u8,
+};
+
+fn modelStatus(app: *const App) ?ModelStatus {
+    if (app.runtime) |runtime| {
+        switch (runtime.client) {
+            .codex_responses => |client| return .{
+                .provider = "openai",
+                .model = client.core_client.config.model,
+                .thinking = reasoningLabel(client.core_client.config.reasoning),
+            },
+            .openai_responses => |client| return .{
+                .provider = providerLabel(app) orelse "openai",
+                .model = client.core_client.config.model,
+                .thinking = reasoningLabel(client.core_client.config.reasoning),
+            },
+            .openai_compatible => |client| return .{
+                .provider = providerLabel(app) orelse "openai_compatible",
+                .model = client.config.model,
+                .thinking = configThinkingLabel(app),
+            },
+            .none => return null,
+        }
+    }
+
+    const model = if (app.cached_config.model) |m| m.id else return null;
+    return .{
+        .provider = providerLabel(app) orelse return null,
+        .model = model,
+        .thinking = configThinkingLabel(app),
+    };
+}
+
+fn providerLabel(app: *const App) ?[]const u8 {
+    const provider = app.cached_config.provider orelse return null;
+    return provider.label();
+}
+
+fn reasoningLabel(reasoning: ?ai.Reasoning) ?[]const u8 {
+    const value = reasoning orelse return null;
+    const effort = value.effort orelse return "Thinking";
+    return effort.label();
+}
+
+fn configThinkingLabel(app: *const App) ?[]const u8 {
+    if (app.cached_config.model) |model| {
+        if (model.reasoning_effort) |effort| return effort.label();
+    }
+    if (app.cached_config.enable_thinking) |enabled| {
+        if (enabled) return "Thinking";
+    }
+    return null;
+}
+
+fn formatModelStatus(gpa: std.mem.Allocator, status: ModelStatus) ![]u8 {
+    if (status.thinking) |thinking| {
+        return std.fmt.allocPrint(gpa, "{s}/{s} • {s}", .{ status.provider, status.model, thinking });
+    }
+    return std.fmt.allocPrint(gpa, "{s}/{s}", .{ status.provider, status.model });
+}
+
 fn resolveCommand(app: *App, filter: []const u8) ?Command {
     var selected: ?Command = null;
     var index: u32 = 0;
@@ -1722,8 +1825,16 @@ const ProviderPanelContent = struct {
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
-        try writeCommandLine(&surface, 0, "‣ OpenAI Codex", ctx, true);
-        try writePanelLine(&surface, 1, "Press Enter to open browser sign-in", ctx, false);
+        const connected = self.app.isCodexConnected();
+        const provider_prefix = if (self.app.provider_selection == 0) "‣ " else "  ";
+        const provider_label = if (connected) "OpenAI Codex [CONNECTED]" else "OpenAI Codex";
+        const provider_text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ provider_prefix, provider_label });
+        try writeCommandLine(&surface, 0, provider_text, ctx, self.app.provider_selection == 0);
+        if (connected) {
+            const signout_prefix = if (self.app.provider_selection == 1) "‣ " else "  ";
+            const signout_text = try std.fmt.allocPrint(ctx.arena, "{s}Sign out", .{signout_prefix});
+            try writeCommandLine(&surface, 1, signout_text, ctx, self.app.provider_selection == 1);
+        }
         return surface;
     }
 };
@@ -2004,6 +2115,20 @@ fn modifiedTime(io: std.Io, buffer: []u8, updated_at_ms: i64) []const u8 {
     return std.fmt.bufPrint(buffer, "{d}y ago", .{@divTrunc(days, 365)}) catch "unknown time";
 }
 
+test "model status includes reasoning effort when present" {
+    const gpa = std.testing.allocator;
+    const text = try formatModelStatus(gpa, .{ .provider = "openai", .model = "gpt-5.5", .thinking = "medium" });
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("openai/gpt-5.5 • medium", text);
+}
+
+test "model status omits separator when thinking is unavailable" {
+    const gpa = std.testing.allocator;
+    const text = try formatModelStatus(gpa, .{ .provider = "ollama", .model = "llama", .thinking = null });
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("ollama/llama", text);
+}
+
 test "modifiedTime buckets" {
     const io = std.testing.io;
     var buf: [32]u8 = undefined;
@@ -2034,7 +2159,7 @@ const InputWidget = struct {
     fn drawInput(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *InputWidget = @ptrCast(@alignCast(ptr));
         const max_width = ctx.max.width orelse 0;
-        const height: u16 = 3;
+        const height: u16 = ctx.max.height orelse 4;
 
         var prompt: vxfw.Text = .{
             .text = ">",
@@ -2064,11 +2189,77 @@ const InputWidget = struct {
             .style = StylePalette.thinking_body,
             .labels = &.{.{ .text = inputLabel(self.app), .alignment = .top_left }},
         };
-        var box: vxfw.SizedBox = .{
+        if (height <= 3) {
+            var box: vxfw.SizedBox = .{
+                .child = border.widget(),
+                .size = .{ .width = max_width, .height = height },
+            };
+            return box.widget().draw(ctx);
+        }
+
+        var border_box: vxfw.SizedBox = .{
             .child = border.widget(),
-            .size = .{ .width = max_width, .height = height },
+            .size = .{ .width = max_width, .height = 3 },
         };
-        return box.widget().draw(ctx);
+
+        const children = try ctx.arena.alloc(vxfw.SubSurface, 3);
+        children[0] = .{
+            .origin = .{ .row = 0, .col = 0 },
+            .surface = try border_box.widget().draw(ctx.withConstraints(
+                .{ .width = max_width, .height = 3 },
+                .{ .width = max_width, .height = 3 },
+            )),
+            .z_index = 0,
+        };
+
+        const cwd = if (self.app.runtime) |runtime| runtime.cwd else self.app.agent.cwd;
+        var cwd_text: vxfw.Text = .{
+            .text = cwd,
+            .style = StylePalette.cwd,
+            .softwrap = false,
+            .overflow = .ellipsis,
+            .width_basis = .parent,
+        };
+        const status_text = if (modelStatus(self.app)) |status|
+            formatModelStatus(ctx.arena, status) catch ""
+        else
+            "";
+        var model_text: vxfw.Text = .{
+            .text = status_text,
+            .style = StylePalette.model_status,
+            .text_align = .right,
+            .softwrap = false,
+            .overflow = .ellipsis,
+            .width_basis = .parent,
+        };
+
+        const status_gap: u16 = if (cwd.len > 0 and status_text.len > 0) 1 else 0;
+        const status_width = @min(ctx.stringWidth(status_text), @as(usize, max_width));
+        const model_width: u16 = @intCast(status_width);
+        const cwd_width: u16 = max_width -| model_width -| status_gap;
+        children[1] = .{
+            .origin = .{ .row = 3, .col = 0 },
+            .surface = try cwd_text.widget().draw(ctx.withConstraints(
+                .{ .width = cwd_width, .height = 1 },
+                .{ .width = cwd_width, .height = 1 },
+            )),
+            .z_index = 0,
+        };
+        children[2] = .{
+            .origin = .{ .row = 3, .col = max_width -| model_width },
+            .surface = try model_text.widget().draw(ctx.withConstraints(
+                .{ .width = model_width, .height = 1 },
+                .{ .width = model_width, .height = 1 },
+            )),
+            .z_index = 0,
+        };
+
+        return .{
+            .size = .{ .width = max_width, .height = height },
+            .widget = self.widget(),
+            .buffer = &.{},
+            .children = children,
+        };
     }
 };
 
@@ -2178,6 +2369,8 @@ const StylePalette = struct {
     const user: vaxis.Style = .{ .fg = .{ .rgb = user_yellow }, .italic = true };
     const tool: vaxis.Style = .{ .fg = .{ .rgb = .{ 34, 197, 94 } } };
     const tool_failed: vaxis.Style = .{ .fg = .{ .rgb = .{ 239, 68, 68 } } };
+    const cwd: vaxis.Style = .{ .fg = .{ .rgb = .{ 34, 197, 94 } } };
+    const model_status: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
     const thinking_label: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
     const thinking_body: vaxis.Style = .{ .fg = .{ .rgb = .{ 138, 138, 138 } } };
     const thinking_bar: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
