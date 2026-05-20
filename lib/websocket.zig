@@ -20,6 +20,8 @@ pub const FrameHeader = struct {
     mask: [4]u8 = .{ 0, 0, 0, 0 },
 };
 
+pub const client_close_frame_bytes: u32 = 6;
+
 pub fn makeKey(io: std.Io) [24]u8 {
     var nonce: [16]u8 = undefined;
     io.random(&nonce);
@@ -41,6 +43,18 @@ pub fn encodeClientTextFrame(gpa: std.mem.Allocator, io: std.Io, payload: []cons
     var mask: [4]u8 = undefined;
     io.random(&mask);
     return try encodeClientFrameWithMask(gpa, .text, payload, mask);
+}
+
+pub fn encodeClientCloseFrame(out: *[client_close_frame_bytes]u8, io: std.Io) void {
+    var mask: [4]u8 = undefined;
+    io.random(&mask);
+    encodeClientCloseFrameWithMask(out, mask);
+}
+
+pub fn encodeClientCloseFrameWithMask(out: *[client_close_frame_bytes]u8, mask: [4]u8) void {
+    out[0] = 0x80 | @as(u8, @intFromEnum(Opcode.close));
+    out[1] = 0x80;
+    @memcpy(out[2..6], &mask);
 }
 
 pub fn encodeClientFrameWithMask(gpa: std.mem.Allocator, opcode: Opcode, payload: []const u8, mask: [4]u8) ![]u8 {
@@ -107,6 +121,14 @@ test "client frames are masked per RFC 6455" {
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, frame[2..6]);
     try std.testing.expectEqual(@as(u8, 'H' ^ 1), frame[6]);
     try std.testing.expectEqual(@as(u8, 'i' ^ 2), frame[7]);
+}
+
+test "client close frame is masked per RFC 6455" {
+    var frame: [client_close_frame_bytes]u8 = undefined;
+    encodeClientCloseFrameWithMask(&frame, .{ 1, 2, 3, 4 });
+    try std.testing.expectEqual(@as(u8, 0x88), frame[0]);
+    try std.testing.expectEqual(@as(u8, 0x80), frame[1]);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, frame[2..6]);
 }
 
 test "parse extended server frame header" {

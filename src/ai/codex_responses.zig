@@ -64,6 +64,7 @@ pub const Client = struct {
         logger.log("codex.websocket.response.head status={d}", .{@intFromEnum(response.head.status)});
         if (response.head.status != .switching_protocols) return error.WebSocketUpgradeFailed;
         if (!acceptMatches(response.head.bytes, &accept_expected)) return error.WebSocketUpgradeFailed;
+        defer finishUpgradedRequest(&req, self.core_client.io);
 
         var body: std.Io.Writer.Allocating = .init(gpa);
         defer body.deinit();
@@ -130,6 +131,16 @@ const ObserverBridge = struct {
         try self.observer.on_delta_end(self.observer.ptr);
     }
 };
+
+fn finishUpgradedRequest(request: *std.http.Client.Request, io: std.Io) void {
+    const connection = request.connection orelse return;
+    var close_frame: [websocket.client_close_frame_bytes]u8 = undefined;
+    websocket.encodeClientCloseFrame(&close_frame, io);
+    connection.writer().writeAll(&close_frame) catch {};
+    connection.flush() catch {};
+    connection.closing = true;
+    request.reader.state = .ready;
+}
 
 fn acceptMatches(head: []const u8, expected: []const u8) bool {
     var lines = std.mem.splitSequence(u8, head, "\r\n");
