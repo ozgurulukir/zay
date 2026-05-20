@@ -1,5 +1,5 @@
 const std = @import("std");
-const builtin = @import("builtin");
+const dynlib = @import("dynlib");
 const bash = @import("bash.zig");
 
 const c = @cImport({
@@ -76,7 +76,7 @@ const SearchDirectoriesFn = *const fn (?*anyopaque, [*:0]const u8, ?[*:0]const u
 const WaitForScanFn = *const fn (?*anyopaque, u64) callconv(.c) *c.FffResult;
 
 const Api = struct {
-    lib: std.DynLib,
+    lib: dynlib,
     create_instance2: CreateInstanceFn,
     destroy: DestroyFn,
     free_result: FreeResultFn,
@@ -210,7 +210,7 @@ fn startThread(gpa: std.mem.Allocator, cwd_owned: []u8) void {
     defer gpa.free(cwd_owned);
     assert(cwd_owned.len > 0);
 
-    var api = loadApi() catch |err| {
+    var api = loadApi(gpa) catch |err| {
         backend.markFailed(gpa, @errorName(err));
         return;
     };
@@ -259,10 +259,14 @@ fn startThread(gpa: std.mem.Allocator, cwd_owned: []u8) void {
     backend.state = .ready;
 }
 
-fn loadApi() !Api {
-    const paths = libraryPaths();
-    for (paths) |path| {
-        var lib = std.DynLib.open(path) catch continue;
+fn loadApi(gpa: std.mem.Allocator) !Api {
+    const search_dirs: []const []const u8 = &.{
+        "vendor/fff",
+        "third_party/fff/target/release",
+        "", // falls back to the OS library search path.
+    };
+    for (search_dirs) |dir| {
+        var lib = dynlib.open(gpa, dir, "fff_c") catch continue;
         errdefer lib.close();
         return .{
             .lib = lib,
@@ -280,27 +284,6 @@ fn loadApi() !Api {
         };
     }
     return error.LibraryNotFound;
-}
-
-fn libraryPaths() []const []const u8 {
-    return switch (builtin.os.tag) {
-        .macos => &.{
-            "vendor/fff/libfff_c.dylib",
-            "third_party/fff/target/release/libfff_c.dylib",
-            "libfff_c.dylib",
-        },
-        .linux => &.{
-            "vendor/fff/libfff_c.so",
-            "third_party/fff/target/release/libfff_c.so",
-            "libfff_c.so",
-        },
-        .windows => &.{
-            "vendor\\fff\\fff_c.dll",
-            "third_party\\fff\\target\\release\\fff_c.dll",
-            "fff_c.dll",
-        },
-        else => &.{"libfff_c"},
-    };
 }
 
 fn runFff(gpa: std.mem.Allocator, request: Request, api: *Api, handle: *anyopaque) !Result {
