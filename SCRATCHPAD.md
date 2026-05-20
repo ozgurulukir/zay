@@ -14,9 +14,10 @@ TODOs and ideas for features to add to Nova coding agent.
 - improve logger and make it more useful
 - add docs on `.nova/auth.json`
 - Save auth tokens and api keys in keyring by default and only auth.json via setting
-- Do not show openai models if not signed in with codex
 - Create OpenAI Compatible provider UI with API key and base URL inputs. Then auto-fetch and cache /models from that endpoint.
 - Handle edge cases where selected content when expanded goes out of bounds. Forcing a mouse scroll. Vim like line-by-line navigation (fall back to select on collapsed blocks)
+- Fix tool call swappign places with loading
+- Support tool streaming
 
 A bit of y spacing to the session list.
 
