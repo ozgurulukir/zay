@@ -30,6 +30,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const dynlib_mod = b.createModule(.{
+        .root_source_file = b.path("lib/dynlib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
@@ -54,10 +59,30 @@ pub fn build(b: *std.Build) void {
             .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
             .{ .name = "websocket", .module = websocket_mod },
             .{ .name = "logger", .module = logger_mod },
+            .{ .name = "dynlib", .module = dynlib_mod },
         },
     });
     mod.addIncludePath(b.path("vendor/fff"));
-    mod.addIncludePath(b.path("vendor/libsql"));
+    mod.addIncludePath(b.path("vendor/sqlite"));
+
+    // SQLite amalgamation, compiled and statically linked
+    mod.link_libc = true;
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/sqlite/sqlite3.c"),
+        .flags = &.{
+            "-DSQLITE_THREADSAFE=2",
+            "-DSQLITE_DEFAULT_FOREIGN_KEYS=1",
+            "-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1",
+            "-DSQLITE_OMIT_DEPRECATED",
+            "-DSQLITE_OMIT_LOAD_EXTENSION",
+            "-DSQLITE_DQS=0",
+            "-DSQLITE_USE_URI=1",
+            "-DSQLITE_ENABLE_JSON1",
+            "-DSQLITE_ENABLE_FTS5",
+            "-Wno-implicit-function-declaration",
+            "-Wno-unused-but-set-variable",
+        },
+    });
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -100,6 +125,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
                 .{ .name = "websocket", .module = websocket_mod },
                 .{ .name = "logger", .module = logger_mod },
+                .{ .name = "dynlib", .module = dynlib_mod },
             },
         }),
     });
