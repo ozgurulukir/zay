@@ -3,7 +3,7 @@
 TODOs and ideas for features to add to Nova coding agent.
 
 ## TODOs
-
+- Keep user model selection / config per session? global? 
 - Support skills in `.agents/`
 - Support referencing files and symbols via `$`
 - MCP (special via some kind of executor)
