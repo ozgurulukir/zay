@@ -13,7 +13,6 @@ const jwt_claim_path = "https://api.openai.com/auth";
 pub const Model = struct {
     id: []u8,
     label: []u8,
-    codex_only: bool,
 
     pub fn deinit(self: *Model, gpa: std.mem.Allocator) void {
         gpa.free(self.id);
@@ -22,12 +21,12 @@ pub const Model = struct {
     }
 };
 
-const StaticModel = struct { id: []const u8, label: []const u8, codex_only: bool = false };
+const StaticModel = struct { id: []const u8, label: []const u8 };
 
 const static_models = [_]StaticModel{
     .{ .id = "gpt-5.2", .label = "OpenAI Codex · GPT-5.2" },
-    .{ .id = "gpt-5.3-codex", .label = "OpenAI Codex · GPT-5.3 Codex", .codex_only = true },
-    .{ .id = "gpt-5.3-codex-spark", .label = "OpenAI Codex · GPT-5.3 Codex Spark", .codex_only = true },
+    .{ .id = "gpt-5.3-codex", .label = "OpenAI Codex · GPT-5.3 Codex" },
+    .{ .id = "gpt-5.3-codex-spark", .label = "OpenAI Codex · GPT-5.3 Codex Spark" },
     .{ .id = "gpt-5.4", .label = "OpenAI Codex · GPT-5.4" },
     .{ .id = "gpt-5.4-mini", .label = "OpenAI Codex · GPT-5.4 mini" },
     .{ .id = "gpt-5.5", .label = "OpenAI Codex · GPT-5.5" },
@@ -44,7 +43,6 @@ pub fn loadStaticModels(gpa: std.mem.Allocator) ![]Model {
         out[initialized] = .{
             .id = try gpa.dupe(u8, model.id),
             .label = try gpa.dupe(u8, model.label),
-            .codex_only = model.codex_only,
         };
         initialized += 1;
     }
