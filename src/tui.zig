@@ -74,6 +74,8 @@ pub const App = struct {
     resume_global: bool = false,
     resume_summaries: std.ArrayList(session_mod.SessionSummary) = .empty,
     codex_models: std.ArrayList(codex.Model) = .empty,
+    compatible_models: std.ArrayList(codex.Model) = .empty,
+    compatible_models_fetched: bool = false,
     model_reasoning: std.ArrayList(u32) = .empty,
     model_selection: u32 = 0,
     model_column: ModelColumn = .model,
@@ -154,6 +156,8 @@ pub const App = struct {
         self.resumeClear();
         self.codexModelsClear();
         self.codex_models.deinit(self.gpa);
+        self.compatibleModelsCacheClear();
+        self.compatible_models.deinit(self.gpa);
         self.model_reasoning.deinit(self.gpa);
         self.model_reasoning_snapshot.deinit(self.gpa);
         if (self.cached_config_owned) {
@@ -698,7 +702,7 @@ pub const App = struct {
         const model = self.selectedCodexModel() orelse return error.NoModels;
         const effort = self.selectedReasoningEffort();
         try self.connectCodexClient(credentials, model.id, effort);
-        try self.persistCodexSelection(model.id, effort);
+        try self.persistModelSelection(.openai, model.id, effort);
         self.mode = .normal;
         self.clearInput();
         _ = try self.thread.append(self.gpa, .agent, "agent", "Connected to OpenAI Codex.");
@@ -717,30 +721,46 @@ pub const App = struct {
 
     fn applySelectedModel(self: *App) !void {
         if (self.in_flight) return error.InFlightTurn;
-        const loaded = try codex.load(self.gpa, self.io, self.runtime.?.home_dir);
-        var credentials = loaded orelse return error.NotConnected;
-        defer credentials.deinit(self.gpa);
         if (self.codex_models.items.len == 0) try self.reloadCodexModels();
         const model = self.selectedCodexModel() orelse return error.NoModels;
         const effort = self.selectedReasoningEffort();
-        try self.connectCodexClient(credentials, model.id, effort);
-        try self.persistCodexSelection(model.id, effort);
+
+        const loaded = try codex.load(self.gpa, self.io, self.runtime.?.home_dir);
+        if (loaded) |codex_creds| {
+            var credentials = codex_creds;
+            defer credentials.deinit(self.gpa);
+            try self.connectCodexClient(credentials, model.id, effort);
+            try self.persistModelSelection(.openai, model.id, effort);
+        } else if (self.hasOpenAICompatibleCredentials()) {
+            const base_url = self.cached_config.base_url.?;
+            const api_key = self.cached_config.api_key.?;
+            try self.attachOpenAiCompatibleClient(base_url, api_key, model.id);
+            const provider = self.cached_config.provider orelse .openai_compatible;
+            try self.persistModelSelection(provider, model.id, effort);
+        } else {
+            return error.NotConnected;
+        }
         self.mode = .normal;
         self.clearInput();
     }
 
-    fn persistCodexSelection(self: *App, model_id: []const u8, effort: ai.ReasoningEffort) !void {
+    fn persistModelSelection(
+        self: *App,
+        provider: config_mod.Provider,
+        model_id: []const u8,
+        effort: ai.ReasoningEffort,
+    ) !void {
         const new_id = try self.gpa.dupe(u8, model_id);
         errdefer self.gpa.free(new_id);
         if (self.cached_config_owned) {
             if (self.cached_config.model) |*old| old.deinit(self.gpa);
-            self.cached_config.provider = .openai;
+            self.cached_config.provider = provider;
             self.cached_config.model = .{ .id = new_id, .reasoning_effort = effort };
         } else {
             self.gpa.free(new_id);
         }
         var updates: config_mod.Config = .{
-            .provider = .openai,
+            .provider = provider,
             .model = .{
                 .id = try self.gpa.dupe(u8, model_id),
                 .reasoning_effort = effort,
@@ -753,20 +773,11 @@ pub const App = struct {
     }
 
     fn reloadCodexModels(self: *App) !void {
-        const models = try codex.loadStaticModels(self.gpa);
-        defer self.gpa.free(models);
         self.codexModelsClear();
-        const show_codex_only = self.isCodexConnected();
-        for (models) |*model| {
-            if (model.codex_only) {
-                if (!show_codex_only) continue;
-            }
-            try self.codex_models.append(self.gpa, model.*);
-            model.* = .{ .id = &.{}, .label = &.{}, .codex_only = false };
-        }
-        for (models) |*model| {
-            if (model.id.len == 0) continue;
-            model.deinit(self.gpa);
+        if (self.isCodexConnected()) {
+            try self.loadCodexStaticCatalog();
+        } else if (self.hasOpenAICompatibleCredentials()) {
+            try self.loadCompatibleCatalog();
         }
         self.model_reasoning.clearRetainingCapacity();
         try self.model_reasoning.appendNTimes(self.gpa, 0, self.codex_models.items.len);
@@ -774,9 +785,67 @@ pub const App = struct {
         self.syncModelListCursor();
     }
 
+    fn loadCodexStaticCatalog(self: *App) !void {
+        const models = try codex.loadStaticModels(self.gpa);
+        defer self.gpa.free(models);
+        for (models) |*model| {
+            try self.codex_models.append(self.gpa, model.*);
+            model.* = .{ .id = &.{}, .label = &.{} };
+        }
+        for (models) |*model| {
+            if (model.id.len == 0) continue;
+            model.deinit(self.gpa);
+        }
+    }
+
+    fn loadCompatibleCatalog(self: *App) !void {
+        if (!self.compatible_models_fetched) try self.fetchCompatibleCatalog();
+        for (self.compatible_models.items) |model| {
+            const id = try self.gpa.dupe(u8, model.id);
+            errdefer self.gpa.free(id);
+            const label = try self.gpa.dupe(u8, model.label);
+            errdefer self.gpa.free(label);
+            try self.codex_models.append(self.gpa, .{ .id = id, .label = label });
+        }
+    }
+
+    fn fetchCompatibleCatalog(self: *App) !void {
+        std.debug.assert(!self.compatible_models_fetched);
+        const base_url = self.cached_config.base_url.?;
+        const api_key = self.cached_config.api_key.?;
+        const fetched = try openai_compatible_mod.listModels(self.gpa, self.io, base_url, api_key);
+        defer {
+            for (fetched) |*entry| entry.deinit(self.gpa);
+            self.gpa.free(fetched);
+        }
+        errdefer self.compatibleModelsCacheClear();
+        for (fetched) |entry| {
+            const id = try self.gpa.dupe(u8, entry.id);
+            errdefer self.gpa.free(id);
+            const label = try self.gpa.dupe(u8, entry.id);
+            errdefer self.gpa.free(label);
+            try self.compatible_models.append(self.gpa, .{ .id = id, .label = label });
+        }
+        self.compatible_models_fetched = true;
+    }
+
+    fn compatibleModelsCacheClear(self: *App) void {
+        for (self.compatible_models.items) |*model| model.deinit(self.gpa);
+        self.compatible_models.clearRetainingCapacity();
+        self.compatible_models_fetched = false;
+    }
+
     fn isCodexConnected(self: *const App) bool {
         const runtime = self.runtime orelse return false;
         return runtime.client == .codex_responses;
+    }
+
+    fn hasOpenAICompatibleCredentials(self: *const App) bool {
+        const base_url = self.cached_config.base_url orelse return false;
+        const api_key = self.cached_config.api_key orelse return false;
+        if (base_url.len == 0) return false;
+        if (api_key.len == 0) return false;
+        return true;
     }
 
     fn selectedReasoningIndex(self: *const App) u32 {
@@ -814,6 +883,16 @@ pub const App = struct {
         effort: ai.ReasoningEffort,
     ) !void {
         try self.runtime.?.connectCodexClient(credentials, model, effort);
+        self.agent.client = self.runtime.?.client;
+    }
+
+    fn attachOpenAiCompatibleClient(
+        self: *App,
+        base_url: []const u8,
+        api_key: []const u8,
+        model_id: []const u8,
+    ) !void {
+        try self.runtime.?.attachOpenAiCompatibleClient(base_url, api_key, model_id);
         self.agent.client = self.runtime.?.client;
     }
 
