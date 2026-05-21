@@ -2023,6 +2023,30 @@ fn truncateText(ctx: vxfw.DrawContext, text: []const u8, width: usize) std.mem.A
     return out.toOwnedSlice(ctx.arena);
 }
 
+fn formatCwdRelative(
+    arena: std.mem.Allocator,
+    cwd: []const u8,
+    home_dir: []const u8,
+) std.mem.Allocator.Error![]const u8 {
+    std.debug.assert(cwd.len > 0);
+    if (home_dir.len == 0) return cwd;
+    if (cwd.len < home_dir.len) return cwd;
+
+    const prefix = cwd[0..home_dir.len];
+    const prefix_matches = switch (@import("builtin").target.os.tag) {
+        .windows => std.ascii.eqlIgnoreCase(prefix, home_dir),
+        else => std.mem.eql(u8, prefix, home_dir),
+    };
+    if (!prefix_matches) return cwd;
+
+    const tail = cwd[home_dir.len..];
+    if (tail.len == 0) return "~";
+    if (tail[0] != '/' and tail[0] != '\\') return cwd;
+
+    std.debug.assert(tail.len >= 1);
+    return std.fmt.allocPrint(arena, "~{s}", .{tail});
+}
+
 fn writeCommandLine(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool) std.mem.Allocator.Error!void {
     try writePanelLineAt(surface, row, text, ctx, selected, ConversationLayout.left -| 1);
 }
@@ -2212,7 +2236,9 @@ const InputWidget = struct {
             .z_index = 0,
         };
 
-        const cwd = if (self.app.runtime) |runtime| runtime.cwd else self.app.agent.cwd;
+        const cwd_raw = if (self.app.runtime) |runtime| runtime.cwd else self.app.agent.cwd;
+        const home_dir = if (self.app.runtime) |runtime| runtime.home_dir else "";
+        const cwd = try formatCwdRelative(ctx.arena, cwd_raw, home_dir);
         var cwd_text: vxfw.Text = .{
             .text = cwd,
             .style = StylePalette.cwd,
