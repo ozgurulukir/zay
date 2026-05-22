@@ -2276,6 +2276,24 @@ test "modifiedTime buckets" {
     try std.testing.expectEqualStrings("2y ago", modifiedTime(io, &buf, now - 730 * day_ms));
 }
 
+const CommandInputText = struct {
+    app: *App,
+
+    fn widget(self: *CommandInputText) vxfw.Widget {
+        return .{
+            .userdata = self,
+            .drawFn = drawInputText,
+        };
+    }
+
+    fn drawInputText(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *CommandInputText = @ptrCast(@alignCast(ptr));
+        var surface = try self.app.input.draw(ctx);
+        try tintCommandInput(&surface, self.app, ctx);
+        return surface;
+    }
+};
+
 const InputWidget = struct {
     app: *App,
 
@@ -2300,8 +2318,9 @@ const InputWidget = struct {
             .child = prompt.widget(),
             .size = .{ .width = 2, .height = 1 },
         };
+        var command_input: CommandInputText = .{ .app = self.app };
         var input_box: vxfw.SizedBox = .{
-            .child = self.app.input.widget(),
+            .child = command_input.widget(),
             .size = .{ .width = max_width -| 2, .height = 1 },
         };
         var row: vxfw.FlexRow = .{
@@ -2491,6 +2510,41 @@ fn diffLineStyle(line: []const u8) vaxis.Style {
         '-' => StylePalette.tool_failed,
         else => StylePalette.thinking_body,
     };
+}
+
+fn tintCommandInput(surface: *vxfw.Surface, app: *App, ctx: vxfw.DrawContext) !void {
+    const input = try app.peekInput();
+    defer app.gpa.free(input);
+    const command_end = commandInputSegmentEnd(input);
+    if (command_end == 0) return;
+
+    var byte_index: usize = 0;
+    var grapheme_index: u16 = 0;
+    var col: u16 = 0;
+    var iter = ctx.graphemeIterator(input);
+    while (iter.next()) |grapheme| {
+        const bytes = grapheme.bytes(input);
+        defer byte_index += bytes.len;
+        defer grapheme_index += 1;
+        if (grapheme_index < app.input.draw_offset) continue;
+        const width: u8 = @intCast(ctx.stringWidth(bytes));
+        if (width == 0) continue;
+        if (col >= surface.size.width) return;
+        if (col + width > surface.size.width) return;
+        if (byte_index >= command_end) return;
+        const cell = surface.readCell(col, 0);
+        surface.writeCell(col, 0, .{ .char = cell.char, .style = StylePalette.tool });
+        col += width;
+    }
+}
+
+fn commandInputSegmentEnd(input: []const u8) usize {
+    if (input.len == 0) return 0;
+    if (input[0] != command_prefix) return 0;
+    for (input, 0..) |byte, index| {
+        if (byte == ' ') return index;
+    }
+    return input.len;
 }
 
 const StylePalette = struct {
@@ -2706,6 +2760,14 @@ test "explicit codex catalog loads before runtime is connected" {
     try std.testing.expect(app.codex_models.items.len > 0);
     try std.testing.expectEqual(app.codex_models.items.len, app.model_reasoning.items.len);
     try std.testing.expect(app.selectedCodexModel() != null);
+}
+
+test "command input segment ends at first space" {
+    try std.testing.expectEqual(@as(usize, 0), commandInputSegmentEnd(""));
+    try std.testing.expectEqual(@as(usize, 0), commandInputSegmentEnd("hello"));
+    try std.testing.expectEqual(@as(usize, 1), commandInputSegmentEnd("/"));
+    try std.testing.expectEqual(@as(usize, 8), commandInputSegmentEnd("/connect"));
+    try std.testing.expectEqual(@as(usize, 8), commandInputSegmentEnd("/connect now"));
 }
 
 test "canceling a picker returns to command menu" {
