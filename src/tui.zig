@@ -81,7 +81,7 @@ pub const App = struct {
     model_column: ModelColumn = .model,
     model_reasoning_snapshot: std.ArrayList(u32) = .empty,
     model_selection_snapshot: u32 = 0,
-    provider_selection: u32 = 0,
+    provider_column: ProviderColumn = .provider,
     cached_config: config_mod.Config = .{},
     cached_config_owned: bool = false,
     retired_threads: std.ArrayList(thread_mod.Thread) = .empty,
@@ -114,7 +114,9 @@ pub const App = struct {
     },
 
     const Mode = enum { normal, command, picker, provider_picker, model_picker };
+    const ModelCatalog = enum { connected_provider, openai_codex };
     const ModelColumn = enum { model, reasoning };
+    const ProviderColumn = enum { provider, sign_out };
 
     pub fn init(io: std.Io, gpa: std.mem.Allocator, agent: *agent_mod.Agent) App {
         return .{
@@ -489,14 +491,20 @@ pub const App = struct {
 
     pub fn handleCommandKey(self: *App, key: vaxis.Key) !bool {
         if (self.mode == .provider_picker) {
-            if (key.matches(vaxis.Key.up, .{})) {
-                self.provider_selection = previousIndex(self.provider_selection, self.providerOptionCount());
+            if (key.matches(vaxis.Key.left, .{})) {
+                self.provider_column = .provider;
                 return true;
             }
-            if (key.matches(vaxis.Key.down, .{})) {
-                self.provider_selection = nextIndex(self.provider_selection, self.providerOptionCount());
+            if (key.matches(vaxis.Key.right, .{})) {
+                if (self.isCodexConnected()) self.provider_column = .sign_out;
                 return true;
             }
+            if (key.matches(vaxis.Key.tab, .{})) {
+                if (self.isCodexConnected()) self.provider_column = nextProviderColumn(self.provider_column);
+                return true;
+            }
+            if (key.matches(vaxis.Key.up, .{})) return true;
+            if (key.matches(vaxis.Key.down, .{})) return true;
             return false;
         }
         if (self.mode == .model_picker) {
@@ -623,10 +631,14 @@ pub const App = struct {
         const input = try self.peekInput();
         defer self.gpa.free(input);
         if (self.mode == .provider_picker) {
-            if (self.provider_selection == 0) {
-                self.connectCodex() catch |err| try self.reportConnectionError(err);
+            if (self.provider_column == .sign_out) {
+                if (self.isCodexConnected()) {
+                    self.signOutCodex() catch |err| try self.reportConnectionError(err);
+                } else {
+                    self.connectCodex() catch |err| try self.reportConnectionError(err);
+                }
             } else {
-                self.signOutCodex() catch |err| try self.reportConnectionError(err);
+                self.connectCodex() catch |err| try self.reportConnectionError(err);
             }
             return true;
         }
@@ -675,19 +687,15 @@ pub const App = struct {
 
     fn openProviderPicker(self: *App) !void {
         self.mode = .provider_picker;
-        self.provider_selection = 0;
+        self.provider_column = .provider;
         self.clearInput();
-    }
-
-    fn providerOptionCount(self: *const App) u32 {
-        return if (self.isCodexConnected()) 2 else 1;
     }
 
     fn openModelPicker(self: *App) !void {
         self.mode = .model_picker;
         self.model_column = .model;
         self.clearInput();
-        self.reloadCodexModels() catch {};
+        self.reloadModelCatalog(.connected_provider) catch {};
         // Snapshot for Escape revert. See `cancelMode`.
         self.model_reasoning_snapshot.clearRetainingCapacity();
         try self.model_reasoning_snapshot.appendSlice(self.gpa, self.model_reasoning.items);
@@ -698,7 +706,7 @@ pub const App = struct {
         if (self.in_flight) return error.InFlightTurn;
         var credentials = try codex.login(self.gpa, self.io, self.runtime.?.home_dir);
         defer credentials.deinit(self.gpa);
-        try self.reloadCodexModels();
+        try self.reloadModelCatalog(.openai_codex);
         const model = self.selectedCodexModel() orelse return error.NoModels;
         const effort = self.selectedReasoningEffort();
         try self.connectCodexClient(credentials, model.id, effort);
@@ -721,7 +729,7 @@ pub const App = struct {
 
     fn applySelectedModel(self: *App) !void {
         if (self.in_flight) return error.InFlightTurn;
-        if (self.codex_models.items.len == 0) try self.reloadCodexModels();
+        if (self.codex_models.items.len == 0) try self.reloadModelCatalog(.connected_provider);
         const model = self.selectedCodexModel() orelse return error.NoModels;
         const effort = self.selectedReasoningEffort();
 
@@ -772,13 +780,22 @@ pub const App = struct {
         };
     }
 
-    fn reloadCodexModels(self: *App) !void {
+    fn reloadModelCatalog(self: *App, catalog: ModelCatalog) !void {
         self.codexModelsClear();
-        if (self.isCodexConnected()) {
-            try self.loadCodexStaticCatalog();
-        } else if (self.hasOpenAICompatibleCredentials()) {
-            try self.loadCompatibleCatalog();
+        switch (catalog) {
+            .connected_provider => {
+                if (self.isCodexConnected()) {
+                    try self.loadCodexStaticCatalog();
+                } else if (self.hasOpenAICompatibleCredentials()) {
+                    try self.loadCompatibleCatalog();
+                }
+            },
+            .openai_codex => try self.loadCodexStaticCatalog(),
         }
+        try self.finishModelCatalogReload();
+    }
+
+    fn finishModelCatalogReload(self: *App) !void {
         self.model_reasoning.clearRetainingCapacity();
         try self.model_reasoning.appendNTimes(self.gpa, 0, self.codex_models.items.len);
         if (self.model_selection >= self.codex_models.items.len) self.model_selection = 0;
@@ -1099,6 +1116,13 @@ fn previousIndex(current: u32, count: u32) u32 {
     if (count == 0) return 0;
     if (current == 0) return count - 1;
     return current - 1;
+}
+
+fn nextProviderColumn(current: App.ProviderColumn) App.ProviderColumn {
+    return switch (current) {
+        .provider => .sign_out,
+        .sign_out => .provider,
+    };
 }
 
 fn adjustOptionalIndex(index: *?u32, removed_index: u32) void {
@@ -1905,14 +1929,16 @@ const ProviderPanelContent = struct {
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
         const connected = self.app.isCodexConnected();
-        const provider_prefix = if (self.app.provider_selection == 0) "‣ " else "  ";
+        const provider_focused = self.app.provider_column == .provider;
+        const provider_prefix = if (provider_focused) "‣ " else "  ";
         const provider_label = if (connected) "OpenAI Codex [CONNECTED]" else "OpenAI Codex";
         const provider_text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ provider_prefix, provider_label });
-        try writeCommandLine(&surface, 0, provider_text, ctx, self.app.provider_selection == 0);
+        try writeCommandLine(&surface, 0, provider_text, ctx, provider_focused);
         if (connected) {
-            const signout_prefix = if (self.app.provider_selection == 1) "‣ " else "  ";
+            const signout_focused = self.app.provider_column == .sign_out;
+            const signout_prefix = if (signout_focused) "‣ " else "  ";
             const signout_text = try std.fmt.allocPrint(ctx.arena, "{s}Sign out", .{signout_prefix});
-            try writeCommandLine(&surface, 1, signout_text, ctx, self.app.provider_selection == 1);
+            try writePanelLineAt(&surface, 0, signout_text, ctx, signout_focused, surface.size.width / 2);
         }
         return surface;
     }
@@ -2640,6 +2666,45 @@ test "model picker without models stays on model column" {
     app.model_column = .model;
     try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.right }));
     try std.testing.expectEqual(App.ModelColumn.model, app.model_column);
+}
+
+test "provider picker selects sign out horizontally" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    var codex_client: ai.codex_responses.Client = undefined;
+    var runtime: runtime_mod.AgentRuntime = undefined;
+    runtime.client = .{ .codex_responses = &codex_client };
+    app.runtime = &runtime;
+
+    app.mode = .provider_picker;
+    app.provider_column = .provider;
+    try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.right }));
+    try std.testing.expectEqual(App.ProviderColumn.sign_out, app.provider_column);
+    try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.tab }));
+    try std.testing.expectEqual(App.ProviderColumn.provider, app.provider_column);
+}
+
+test "explicit codex catalog loads before runtime is connected" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try app.reloadModelCatalog(.openai_codex);
+
+    try std.testing.expect(app.codex_models.items.len > 0);
+    try std.testing.expectEqual(app.codex_models.items.len, app.model_reasoning.items.len);
+    try std.testing.expect(app.selectedCodexModel() != null);
 }
 
 test "canceling a picker returns to command menu" {
