@@ -58,7 +58,7 @@ const loading_spinners = [4][]const u8{ "Firing Neurons", "Multiplying Matrices"
 const loading_frames = [8][]const u8{ "⣼", "⣹", "⢻", "⠿", "⡟", "⣏", "⣧", "⣶" };
 const loading_frame_ms = 40;
 const command_prefix: u8 = '/';
-const picker_secondary_column: u16 = 42;
+const picker_secondary_column: u16 = 52;
 // TODO: Investigate jumpToItem as an alternative to handrolling logic
 pub const App = struct {
     io: std.Io,
@@ -696,6 +696,7 @@ pub const App = struct {
     fn openModelPicker(self: *App) !void {
         self.mode = .model_picker;
         self.model_column = .model;
+        self.model_selection = 0;
         self.clearInput();
         self.reloadModelCatalog(.connected_provider) catch {};
         // Snapshot for Escape revert. See `cancelMode`.
@@ -798,10 +799,21 @@ pub const App = struct {
     }
 
     fn finishModelCatalogReload(self: *App) !void {
+        self.moveActiveModelFirst();
         self.model_reasoning.clearRetainingCapacity();
         try self.model_reasoning.appendNTimes(self.gpa, 0, self.codex_models.items.len);
         if (self.model_selection >= self.codex_models.items.len) self.model_selection = 0;
         self.syncModelListCursor();
+    }
+
+    fn moveActiveModelFirst(self: *App) void {
+        const status = modelStatus(self) orelse return;
+        for (self.codex_models.items, 0..) |model, index| {
+            if (!std.mem.eql(u8, model.id, status.model)) continue;
+            if (index == 0) return;
+            std.mem.swap(codex.Model, &self.codex_models.items[0], &self.codex_models.items[index]);
+            return;
+        }
     }
 
     fn loadCodexStaticCatalog(self: *App) !void {
@@ -1963,7 +1975,7 @@ const ModelPanelContent = struct {
         const widgets = try self.modelWidgets(ctx);
         self.app.model_list.children = .{ .slice = widgets };
         self.app.model_list.item_count = @intCast(widgets.len);
-        self.app.model_list.cursor = self.app.model_selection;
+        self.app.model_list.cursor = self.app.model_selection + 1;
         self.app.model_list.ensureScroll();
         return self.app.model_list.widget().draw(ctx);
     }
@@ -1977,7 +1989,10 @@ const ModelPanelContent = struct {
     }
 
     fn modelWidgets(self: *ModelPanelContent, ctx: vxfw.DrawContext) ![]vxfw.Widget {
-        const widgets = try ctx.arena.alloc(vxfw.Widget, self.app.codex_models.items.len);
+        const widgets = try ctx.arena.alloc(vxfw.Widget, self.app.codex_models.items.len + 1);
+        const header = try ctx.arena.create(ModelHeaderWidget);
+        header.* = .{};
+        widgets[0] = header.widget();
         const rows = try ctx.arena.alloc(ModelRowWidget, self.app.codex_models.items.len);
         for (self.app.codex_models.items, 0..) |*model, index| {
             rows[index] = .{
@@ -1986,9 +2001,24 @@ const ModelPanelContent = struct {
                 .index = @intCast(index),
                 .selected = self.app.model_selection == index,
             };
-            widgets[index] = rows[index].widget();
+            widgets[index + 1] = rows[index].widget();
         }
         return widgets;
+    }
+};
+
+const ModelHeaderWidget = struct {
+    fn widget(self: *ModelHeaderWidget) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = drawHeader };
+    }
+
+    fn drawHeader(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *ModelHeaderWidget = @ptrCast(@alignCast(ptr));
+        const width = ctx.max.width orelse 0;
+        var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
+        try writePanelLineStyledAt(&surface, 0, "NAME", ctx, false, ConversationLayout.left + 1, StylePalette.panel_header);
+        try writePanelLineStyledAt(&surface, 0, "REASONING EFFORT", ctx, false, pickerSecondaryColumn(surface.size.width) + 2, StylePalette.panel_header);
+        return surface;
     }
 };
 
@@ -2007,11 +2037,19 @@ const ModelRowWidget = struct {
         const width = ctx.max.width orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
         const model_focused = self.selected and self.app.model_column == .model;
-        const prefix = if (self.selected) "‣ " else "  ";
-        const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.model.label });
+        const prefix = if (model_focused) "‣ " else "  ";
+        const text = if (self.activeModel())
+            try std.fmt.allocPrint(ctx.arena, "{s}{s} [ACTIVE]", .{ prefix, self.model.label })
+        else
+            try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.model.label });
         try writePanelLineAt(&surface, 0, text, ctx, model_focused, ConversationLayout.left -| 1);
         if (self.selected) try self.drawReasoning(&surface, ctx);
         return surface;
+    }
+
+    fn activeModel(self: *const ModelRowWidget) bool {
+        const status = modelStatus(self.app) orelse return false;
+        return std.mem.eql(u8, status.model, self.model.id);
     }
 
     fn drawReasoning(self: *const ModelRowWidget, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
@@ -2187,9 +2225,22 @@ fn writePanelRight(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw
 }
 
 fn writePanelLineAt(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool, start_col: u16) std.mem.Allocator.Error!void {
-    if (row >= surface.size.height) return;
-    const stable_text = try ctx.arena.dupe(u8, text);
     const style = if (selected) StylePalette.tool else StylePalette.thinking_body;
+    try writePanelLineStyledAt(surface, row, text, ctx, selected, start_col, style);
+}
+
+fn writePanelLineStyledAt(
+    surface: *vxfw.Surface,
+    row: u16,
+    text: []const u8,
+    ctx: vxfw.DrawContext,
+    selected: bool,
+    start_col: u16,
+    style: vaxis.Style,
+) std.mem.Allocator.Error!void {
+    if (row >= surface.size.height) return;
+    _ = selected;
+    const stable_text = try ctx.arena.dupe(u8, text);
     var col: u16 = start_col;
     var iter = ctx.graphemeIterator(stable_text);
     while (iter.next()) |grapheme| {
@@ -2567,6 +2618,7 @@ const StylePalette = struct {
     const thinking_label: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
     const thinking_body: vaxis.Style = .{ .fg = .{ .rgb = .{ 138, 138, 138 } } };
     const thinking_bar: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
+    const panel_header: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } } };
 };
 
 fn mergedSelectedStyle(style: vaxis.Style, selected: bool) vaxis.Style {
@@ -2714,6 +2766,60 @@ test "begin submit clears input and appends loading row before agent turn" {
     try std.testing.expectEqual(@as(u32, 0), app.thread.selected.?);
 }
 
+test "opening model picker starts at top" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.model_selection = 4;
+    try app.openModelPicker();
+
+    try std.testing.expectEqual(@as(u32, 0), app.model_selection);
+}
+
+test "model picker hides model arrow when reasoning column is focused" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.mode = .model_picker;
+    app.model_column = .reasoning;
+    app.model_selection = 0;
+    const models = try codex.loadStaticModels(gpa);
+    defer gpa.free(models);
+    try app.codex_models.appendSlice(gpa, models);
+    try app.model_reasoning.appendNTimes(gpa, 0, app.codex_models.items.len);
+
+    var row: ModelRowWidget = .{
+        .app = &app,
+        .model = &app.codex_models.items[0],
+        .index = 0,
+        .selected = true,
+    };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 1 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try row.widget().draw(ctx);
+
+    try std.testing.expectEqualStrings(" ", surface.readCell(ConversationLayout.left -| 1, 0).char.grapheme);
+    try std.testing.expectEqualStrings("‣", surface.readCell(pickerSecondaryColumn(surface.size.width), 0).char.grapheme);
+}
+
 test "model picker without models stays on model column" {
     const gpa = std.testing.allocator;
     var openai_compatible_client: openai_compatible_mod.Client = undefined;
@@ -2752,6 +2858,25 @@ test "provider picker selects sign out horizontally" {
     try std.testing.expectEqual(App.ProviderColumn.provider, app.provider_column);
 }
 
+test "active model moves to top of model catalog" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    const active_model_id = try gpa.dupe(u8, "gpt-5.4-mini");
+    defer gpa.free(active_model_id);
+    app.cached_config.provider = .openai;
+    app.cached_config.model = .{ .id = active_model_id };
+
+    try app.reloadModelCatalog(.openai_codex);
+
+    try std.testing.expectEqualStrings("gpt-5.4-mini", app.codex_models.items[0].id);
+}
+
 test "explicit codex catalog loads before runtime is connected" {
     const gpa = std.testing.allocator;
     var openai_compatible_client: openai_compatible_mod.Client = undefined;
@@ -2770,7 +2895,7 @@ test "explicit codex catalog loads before runtime is connected" {
 }
 
 test "picker secondary column keeps related options close" {
-    try std.testing.expectEqual(@as(u16, 42), pickerSecondaryColumn(100));
+    try std.testing.expectEqual(@as(u16, 50), pickerSecondaryColumn(100));
     try std.testing.expectEqual(@as(u16, 20), pickerSecondaryColumn(40));
 }
 
