@@ -57,6 +57,7 @@ const logo_bytes_max = 64 * 1024;
 const loading_spinners = [4][]const u8{ "Firing Neurons", "Multiplying Matrices", "brr..brr...", "Warping" };
 const loading_frames = [8][]const u8{ "⣼", "⣹", "⢻", "⠿", "⡟", "⣏", "⣧", "⣶" };
 const loading_frame_ms = 40;
+const command_prefix: u8 = '/';
 // TODO: Investigate jumpToItem as an alternative to handrolling logic
 pub const App = struct {
     io: std.Io,
@@ -235,12 +236,12 @@ pub const App = struct {
                 );
             }
             if (p == .openai) {
-                return self.gpa.dupe(u8, "No OpenAI Codex session — type :connect to sign in.");
+                return self.gpa.dupe(u8, "No OpenAI Codex session — type /connect to sign in.");
             }
         }
         return self.gpa.dupe(
             u8,
-            "No provider connected. Type :connect to pick one, or set OPENAI_MODEL=<provider>/<model>.",
+            "No provider connected. Type /connect to pick one, or set OPENAI_MODEL=<provider>/<model>.",
         );
     }
 
@@ -581,7 +582,7 @@ pub const App = struct {
     fn syncModeWithInput(self: *App, value: []const u8) !void {
         if (self.mode == .picker or self.mode == .provider_picker or self.mode == .model_picker) {
             if (value.len > 0) {
-                if (value[0] == ':') {
+                if (value[0] == command_prefix) {
                     self.mode = .command;
                     self.command_selection = 0;
                     return;
@@ -597,7 +598,7 @@ pub const App = struct {
             self.command_selection = 0;
             return;
         }
-        if (value[0] == ':') {
+        if (value[0] == command_prefix) {
             self.mode = .command;
             const count = commandMatchesCountForFilter(value[1..]);
             if (self.command_selection >= count) self.command_selection = 0;
@@ -656,7 +657,7 @@ pub const App = struct {
             return true;
         }
         if (input.len == 0) return false;
-        if (input[0] != ':') return false;
+        if (input[0] != command_prefix) return false;
         self.mode = .command;
         if (resolveCommand(self, input[1..])) |command| {
             self.clearInput();
@@ -673,7 +674,7 @@ pub const App = struct {
     fn openCommandMenu(self: *App) !void {
         self.mode = .command;
         self.clearInput();
-        try self.input.insertSliceAtCursor(":");
+        try self.input.insertSliceAtCursor(&.{command_prefix});
         self.command_selection = 0;
     }
 
@@ -1810,7 +1811,7 @@ fn commandMatchesCount(app: *App) u32 {
     const input = app.peekInput() catch return 0;
     defer app.gpa.free(input);
     if (input.len == 0) return 0;
-    if (input[0] != ':') return 0;
+    if (input[0] != command_prefix) return 0;
     return commandMatchesCountForFilter(input[1..]);
 }
 
@@ -1889,7 +1890,7 @@ const CommandPanelContent = struct {
 fn drawCommandPanel(app: *App, surface: *vxfw.Surface, ctx: vxfw.DrawContext) std.mem.Allocator.Error!void {
     const input = app.peekInput() catch return;
     defer app.gpa.free(input);
-    const filter = if (input.len > 0 and input[0] == ':') input[1..] else "";
+    const filter = if (input.len > 0 and input[0] == command_prefix) input[1..] else "";
     var row: u16 = 0;
     var index: u32 = 0;
     for (commands) |entry| {
@@ -1966,7 +1967,7 @@ const ModelPanelContent = struct {
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
-        try writePanelLineAt(&surface, 0, "No provider models available. Run :connect first.", ctx, false, ConversationLayout.left -| 1);
+        try writePanelLineAt(&surface, 0, "No provider models available. Run /connect first.", ctx, false, ConversationLayout.left -| 1);
         return surface;
     }
 
@@ -2722,10 +2723,10 @@ test "canceling a picker returns to command menu" {
     try std.testing.expectEqual(App.Mode.command, app.mode);
     const input = try app.peekInput();
     defer gpa.free(input);
-    try std.testing.expectEqualStrings(":", input);
+    try std.testing.expectEqualStrings("/", input);
 }
 
-test "typing colon inside picker opens command menu" {
+test "typing slash inside picker opens command menu" {
     const gpa = std.testing.allocator;
     var openai_compatible_client: openai_compatible_mod.Client = undefined;
     try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
@@ -2736,7 +2737,7 @@ test "typing colon inside picker opens command menu" {
     defer app.deinit();
 
     app.mode = .picker;
-    try app.syncModeWithInput(":");
+    try app.syncModeWithInput("/");
     try std.testing.expectEqual(App.Mode.command, app.mode);
 }
 
