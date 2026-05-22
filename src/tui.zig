@@ -2384,12 +2384,14 @@ const InputWidget = struct {
             .width_basis = .parent,
         };
 
+        const status_padding_x: u16 = @min(@as(u16, 1), max_width);
+        const status_inner_width = max_width -| (status_padding_x * 2);
         const status_gap: u16 = if (cwd.len > 0 and status_text.len > 0) 1 else 0;
-        const status_width = @min(ctx.stringWidth(status_text), @as(usize, max_width));
+        const status_width = @min(ctx.stringWidth(status_text), @as(usize, status_inner_width));
         const model_width: u16 = @intCast(status_width);
-        const cwd_width: u16 = max_width -| model_width -| status_gap;
+        const cwd_width: u16 = status_inner_width -| model_width -| status_gap;
         children[1] = .{
-            .origin = .{ .row = 3, .col = 0 },
+            .origin = .{ .row = 3, .col = status_padding_x },
             .surface = try cwd_text.widget().draw(ctx.withConstraints(
                 .{ .width = cwd_width, .height = 1 },
                 .{ .width = cwd_width, .height = 1 },
@@ -2397,7 +2399,7 @@ const InputWidget = struct {
             .z_index = 0,
         };
         children[2] = .{
-            .origin = .{ .row = 3, .col = max_width -| model_width },
+            .origin = .{ .row = 3, .col = status_padding_x + status_inner_width -| model_width },
             .surface = try model_text.widget().draw(ctx.withConstraints(
                 .{ .width = model_width, .height = 1 },
                 .{ .width = model_width, .height = 1 },
