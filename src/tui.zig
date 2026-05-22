@@ -58,6 +58,7 @@ const loading_spinners = [4][]const u8{ "Firing Neurons", "Multiplying Matrices"
 const loading_frames = [8][]const u8{ "⣼", "⣹", "⢻", "⠿", "⡟", "⣏", "⣧", "⣶" };
 const loading_frame_ms = 40;
 const command_prefix: u8 = '/';
+const picker_secondary_column: u16 = 42;
 // TODO: Investigate jumpToItem as an alternative to handrolling logic
 pub const App = struct {
     io: std.Io,
@@ -1126,6 +1127,10 @@ fn nextProviderColumn(current: App.ProviderColumn) App.ProviderColumn {
     };
 }
 
+fn pickerSecondaryColumn(width: u16) u16 {
+    return @min(picker_secondary_column, width / 2);
+}
+
 fn adjustOptionalIndex(index: *?u32, removed_index: u32) void {
     const current = index.* orelse return;
     if (current == removed_index) {
@@ -1939,7 +1944,7 @@ const ProviderPanelContent = struct {
             const signout_focused = self.app.provider_column == .sign_out;
             const signout_prefix = if (signout_focused) "‣ " else "  ";
             const signout_text = try std.fmt.allocPrint(ctx.arena, "{s}Sign out", .{signout_prefix});
-            try writePanelLineAt(&surface, 0, signout_text, ctx, signout_focused, surface.size.width / 2);
+            try writePanelLineAt(&surface, 0, signout_text, ctx, signout_focused, pickerSecondaryColumn(surface.size.width));
         }
         return surface;
     }
@@ -2014,7 +2019,7 @@ const ModelRowWidget = struct {
         const effort = reasoningOptions()[self.app.selectedReasoningIndex()].label;
         const effort_prefix = if (effort_focused) "‣ " else "  ";
         const effort_text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ effort_prefix, effort });
-        try writePanelLineAt(surface, 0, effort_text, ctx, effort_focused, surface.size.width / 2);
+        try writePanelLineAt(surface, 0, effort_text, ctx, effort_focused, pickerSecondaryColumn(surface.size.width));
     }
 };
 
@@ -2762,6 +2767,11 @@ test "explicit codex catalog loads before runtime is connected" {
     try std.testing.expect(app.codex_models.items.len > 0);
     try std.testing.expectEqual(app.codex_models.items.len, app.model_reasoning.items.len);
     try std.testing.expect(app.selectedCodexModel() != null);
+}
+
+test "picker secondary column keeps related options close" {
+    try std.testing.expectEqual(@as(u16, 42), pickerSecondaryColumn(100));
+    try std.testing.expectEqual(@as(u16, 20), pickerSecondaryColumn(40));
 }
 
 test "command input segment ends at first space" {
