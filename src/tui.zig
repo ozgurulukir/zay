@@ -1613,7 +1613,7 @@ const RootWidget = struct {
         const self: *RootWidget = @ptrCast(@alignCast(ptr));
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
-        const input_height: u16 = @min(max_height, 4);
+        const input_height: u16 = @min(max_height, 5);
         const panel_height: u16 = if (self.app.mode == .normal) 0 else @min(max_height -| input_height, 7);
         const thread_height: u16 = max_height - input_height - panel_height;
 
@@ -2022,7 +2022,7 @@ fn configThinkingLabel(app: *const App) ?[]const u8 {
 
 fn formatModelStatus(gpa: std.mem.Allocator, status: ModelStatus) ![]u8 {
     if (status.thinking) |thinking| {
-        return std.fmt.allocPrint(gpa, "{s}/{s} • {s}", .{ status.provider, status.model, thinking });
+        return std.fmt.allocPrint(gpa, "{s}/{s} · {s}", .{ status.provider, status.model, thinking });
     }
     return std.fmt.allocPrint(gpa, "{s}/{s}", .{ status.provider, status.model });
 }
@@ -2146,6 +2146,36 @@ fn drawCommandPanel(app: *App, surface: *vxfw.Surface, ctx: vxfw.DrawContext) st
     }
 }
 
+fn drawListSurface(
+    ctx: vxfw.DrawContext,
+    owner: vxfw.Widget,
+    list: vxfw.Widget,
+) std.mem.Allocator.Error!vxfw.Surface {
+    const width = ctx.max.width orelse 0;
+    const height = ctx.max.height orelse 0;
+    const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
+    children[0] = .{
+        .origin = .{ .row = 0, .col = 0 },
+        .surface = try list.draw(ctx.withConstraints(
+            .{ .width = width, .height = height },
+            .{ .width = width, .height = height },
+        )),
+        .z_index = 0,
+    };
+    return vxfw.Surface.initWithChildren(ctx.arena, owner, .{ .width = width, .height = height }, children);
+}
+
+fn inputHintText(mode: App.Mode) []const u8 {
+    return switch (mode) {
+        .command => "↑↓ Navigate · [ENTER] Select · [ESC] Back",
+        .session_picker => "↑↓ Navigate · [TAB] Toggle · [ENTER] Select · [ESC] Back",
+        .provider_picker => "↑↓ Navigate · ←→ Actions · [ENTER] Select · [ESC] Back",
+        .custom_connection_form => "↑↓ Navigate · [ENTER] Save · [ESC] Back",
+        .model_picker => "↑↓ Navigate · [TAB] Toggle Effort · ←→ Actions · [ENTER] Select · [ESC] Back",
+        .normal => "↑↓ Navigate · [TAB] Expand",
+    };
+}
+
 const ReasoningOption = struct { label: []const u8, effort: ai.ReasoningEffort };
 
 fn reasoningOptions() []const ReasoningOption {
@@ -2211,7 +2241,7 @@ const CustomConnectionPanelContent = struct {
         const key_text = try std.fmt.allocPrint(ctx.arena, "{s}{s} API Key", .{ key_prefix, key_marker });
         try writeCommandLine(&surface, 0, base_text, ctx, base_focused);
         try writeCommandLine(&surface, 1, key_text, ctx, key_focused);
-        try writePanelLineAt(&surface, 3, "Enter a value below. Press Enter to continue, Tab to switch fields.", ctx, false, ConversationLayout.left -| 1);
+        try writePanelLineAt(&surface, 3, "Enter a value below.", ctx, false, ConversationLayout.left -| 1);
         return surface;
     }
 };
@@ -2231,7 +2261,7 @@ const ModelPanelContent = struct {
         self.app.model_list.item_count = @intCast(widgets.len);
         self.app.model_list.cursor = self.app.model_selection + 1;
         self.app.model_list.ensureScroll();
-        return self.app.model_list.widget().draw(ctx);
+        return drawListSurface(ctx, self.widget(), self.app.model_list.widget());
     }
 
     fn drawEmpty(self: *ModelPanelContent, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
@@ -2329,7 +2359,7 @@ const ResumePanelContent = struct {
         self.app.resume_list.item_count = @intCast(widgets.len);
         self.app.resume_list.cursor = self.app.resume_selection;
         self.app.resume_list.ensureScroll();
-        return self.app.resume_list.widget().draw(ctx);
+        return drawListSurface(ctx, self.widget(), self.app.resume_list.widget());
     }
 
     fn resumeWidgets(self: *ResumePanelContent, ctx: vxfw.DrawContext) ![]vxfw.Widget {
@@ -2559,7 +2589,7 @@ test "model status includes reasoning effort when present" {
     const gpa = std.testing.allocator;
     const text = try formatModelStatus(gpa, .{ .provider = "openai", .model = "gpt-5.5", .thinking = "medium" });
     defer gpa.free(text);
-    try std.testing.expectEqualStrings("openai/gpt-5.5 • medium", text);
+    try std.testing.expectEqualStrings("openai/gpt-5.5 · medium", text);
 }
 
 test "model status omits separator when thinking is unavailable" {
@@ -2661,7 +2691,9 @@ const InputWidget = struct {
             .size = .{ .width = max_width, .height = 3 },
         };
 
-        const children = try ctx.arena.alloc(vxfw.SubSurface, 3);
+        const show_status = height > 3;
+        const show_hint = height > 4;
+        const children = try ctx.arena.alloc(vxfw.SubSurface, if (show_hint) 4 else if (show_status) 3 else 1);
         children[0] = .{
             .origin = .{ .row = 0, .col = 0 },
             .surface = try border_box.widget().draw(ctx.withConstraints(
@@ -2670,6 +2702,14 @@ const InputWidget = struct {
             )),
             .z_index = 0,
         };
+        if (!show_status) {
+            return .{
+                .size = .{ .width = max_width, .height = height },
+                .widget = self.widget(),
+                .buffer = &.{},
+                .children = children,
+            };
+        }
 
         const cwd_raw = if (self.app.runtime) |runtime| runtime.cwd else self.app.agent.cwd;
         const home_dir = if (self.app.runtime) |runtime| runtime.home_dir else "";
@@ -2677,6 +2717,14 @@ const InputWidget = struct {
         var cwd_text: vxfw.Text = .{
             .text = cwd,
             .style = StylePalette.cwd,
+            .softwrap = false,
+            .overflow = .ellipsis,
+            .width_basis = .parent,
+        };
+        var hint_text: vxfw.Text = .{
+            .text = inputHintText(self.app.mode),
+            .style = StylePalette.thinking_body,
+            .text_align = .center,
             .softwrap = false,
             .overflow = .ellipsis,
             .width_basis = .parent,
@@ -2700,8 +2748,9 @@ const InputWidget = struct {
         const status_width = @min(ctx.stringWidth(status_text), @as(usize, status_inner_width));
         const model_width: u16 = @intCast(status_width);
         const cwd_width: u16 = status_inner_width -| model_width -| status_gap;
+        const status_row = @as(u16, 3);
         children[1] = .{
-            .origin = .{ .row = 3, .col = status_padding_x },
+            .origin = .{ .row = status_row, .col = status_padding_x },
             .surface = try cwd_text.widget().draw(ctx.withConstraints(
                 .{ .width = cwd_width, .height = 1 },
                 .{ .width = cwd_width, .height = 1 },
@@ -2709,13 +2758,23 @@ const InputWidget = struct {
             .z_index = 0,
         };
         children[2] = .{
-            .origin = .{ .row = 3, .col = status_padding_x + status_inner_width -| model_width },
+            .origin = .{ .row = status_row, .col = status_padding_x + status_inner_width -| model_width },
             .surface = try model_text.widget().draw(ctx.withConstraints(
                 .{ .width = model_width, .height = 1 },
                 .{ .width = model_width, .height = 1 },
             )),
             .z_index = 0,
         };
+        if (show_hint) {
+            children[3] = .{
+                .origin = .{ .row = status_row + 1, .col = status_padding_x },
+                .surface = try hint_text.widget().draw(ctx.withConstraints(
+                    .{ .width = status_inner_width, .height = 1 },
+                    .{ .width = status_inner_width, .height = 1 },
+                )),
+                .z_index = 0,
+            };
+        }
 
         return .{
             .size = .{ .width = max_width, .height = height },
