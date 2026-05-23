@@ -287,6 +287,7 @@ fn writeToolDefinition(
         const kind_str: []const u8 = switch (prop.kind) {
             .string => "string",
             .integer => "integer",
+            .object => "object",
         };
         try std.json.Stringify.value(kind_str, .{}, writer);
         try writer.writeAll(",\"description\":");

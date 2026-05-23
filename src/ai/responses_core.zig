@@ -162,6 +162,7 @@ fn writeParameters(writer: *std.Io.Writer, tool: tools_common.Tool) !void {
         const kind: []const u8 = switch (prop.kind) {
             .string => "string",
             .integer => "integer",
+            .object => "object",
         };
         try std.json.Stringify.value(kind, .{}, writer);
         try writer.writeAll(",\"description\":");
