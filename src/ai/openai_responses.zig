@@ -7,7 +7,7 @@ pub const Client = struct {
 
     pub fn init(target: *Client, gpa: std.mem.Allocator, io: std.Io, config: ai.Config) !void {
         var openai_config = config;
-        openai_config.provider = .openai_compatible;
+        openai_config.responses_mode = .standard;
         try target.core_client.init(gpa, io, openai_config);
     }
 

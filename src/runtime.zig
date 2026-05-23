@@ -35,13 +35,15 @@ pub const AgentRuntime = struct {
     ) !void {
         assert(cwd.len > 0);
         assert(system_prompt.len > 0);
+        const owned_system_prompt = try gpa.dupe(u8, system_prompt);
+        errdefer gpa.free(owned_system_prompt);
         target.* = .{
             .gpa = gpa,
             .io = io,
             .cwd = cwd,
             .home_dir = home_dir,
             .client = .none,
-            .system_prompt = system_prompt,
+            .system_prompt = owned_system_prompt,
             .session_writer = undefined,
             .agent = undefined,
             .diagnostics = diagnostics,
@@ -52,7 +54,7 @@ pub const AgentRuntime = struct {
         target.agent = agent_mod.Agent.init(gpa, io, cwd, .none);
         errdefer target.agent.deinit();
         target.agent.attachSessionWriter(&target.session_writer);
-        try target.agent.addSystem(system_prompt);
+        try target.agent.addSystem(owned_system_prompt);
 
         try target.applyFromConfig(config);
     }
@@ -70,13 +72,15 @@ pub const AgentRuntime = struct {
     ) !void {
         assert(cwd.len > 0);
         assert(session_id.len > 0);
+        const owned_system_prompt = try gpa.dupe(u8, system_prompt);
+        errdefer gpa.free(owned_system_prompt);
         target.* = .{
             .gpa = gpa,
             .io = io,
             .cwd = cwd,
             .home_dir = home_dir,
             .client = .none,
-            .system_prompt = system_prompt,
+            .system_prompt = owned_system_prompt,
             .session_writer = undefined,
             .agent = undefined,
             .diagnostics = diagnostics,
@@ -87,7 +91,7 @@ pub const AgentRuntime = struct {
         target.agent = agent_mod.Agent.init(gpa, io, cwd, .none);
         errdefer target.agent.deinit();
         target.agent.attachSessionWriter(&target.session_writer);
-        try target.agent.addSystem(system_prompt);
+        try target.agent.addSystem(owned_system_prompt);
         const messages = try target.session_writer.session.messages(gpa);
         defer gpa.free(messages);
         for (messages) |message| try target.agent.takeMessage(message);
@@ -98,6 +102,7 @@ pub const AgentRuntime = struct {
     pub fn deinit(self: *AgentRuntime) void {
         self.agent.deinit();
         self.session_writer.deinit();
+        self.gpa.free(self.system_prompt);
         if (self.owned_codex_responses) |c| {
             c.deinit();
             self.gpa.destroy(c);
@@ -119,12 +124,20 @@ pub const AgentRuntime = struct {
     /// Also handles providers that require sign-in (codex).
     pub fn applyFromConfig(self: *AgentRuntime, config: config_mod.Config) !void {
         const provider = config.provider orelse return;
-        const adapter = provider.adapter() orelse return;
+        const adapter = adapterForConfig(provider, config) orelse return;
         switch (adapter) {
             .codex_responses => try self.tryConnectCodexFromAuth(config),
             .openai_compatible => try self.tryAttachOpenAiCompatibleFromConfig(provider, config),
             .openai_responses => try self.tryAttachOpenAiResponsesFromConfig(provider, config),
         }
+    }
+
+    fn adapterForConfig(provider: config_mod.Provider, config: config_mod.Config) ?config_mod.AdapterKind {
+        const adapter = provider.adapter() orelse return null;
+        if (adapter == .openai_compatible) {
+            if (config.use_responses_endpoint orelse false) return .openai_responses;
+        }
+        return adapter;
     }
 
     fn tryConnectCodexFromAuth(self: *AgentRuntime, config: config_mod.Config) !void {
@@ -179,7 +192,7 @@ pub const AgentRuntime = struct {
             .model = model_id,
             .tools = tools_mod.registry,
             .reasoning = .{ .effort = effort, .summary = .auto },
-            .provider = .openai_codex,
+            .responses_mode = .codex,
             .account_id = credentials.account_id,
             .session_id = &self.session_writer.session.id,
             .system_prompt = self.system_prompt,
@@ -220,7 +233,7 @@ pub const AgentRuntime = struct {
             .model = model_id,
             .tools = tools_mod.registry,
             .reasoning = .{},
-            .provider = .openai_compatible,
+            .responses_mode = .standard,
         });
         errdefer client.deinit();
         if (self.owned_openai_compatible) |old| {
@@ -247,7 +260,7 @@ pub const AgentRuntime = struct {
             .model = model_id,
             .tools = tools_mod.registry,
             .reasoning = reasoning,
-            .provider = .openai_compatible,
+            .responses_mode = .standard,
         });
         errdefer client.deinit();
         if (self.owned_openai_responses) |old| {
@@ -259,3 +272,19 @@ pub const AgentRuntime = struct {
         self.agent.client = self.client;
     }
 };
+
+test "runtime selects responses adapter when requested" {
+    const config: config_mod.Config = .{ .use_responses_endpoint = true };
+    try std.testing.expectEqual(
+        config_mod.AdapterKind.openai_responses,
+        AgentRuntime.adapterForConfig(.openai_compatible, config).?,
+    );
+}
+
+test "runtime keeps codex adapter for openai provider" {
+    const config: config_mod.Config = .{ .use_responses_endpoint = true };
+    try std.testing.expectEqual(
+        config_mod.AdapterKind.codex_responses,
+        AgentRuntime.adapterForConfig(.openai, config).?,
+    );
+}

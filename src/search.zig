@@ -114,6 +114,11 @@ const Backend = struct {
         assert(message.len > 0);
         lockBackend();
         defer self.mutex.unlock();
+        self.markFailedLocked(gpa, message);
+    }
+
+    fn markFailedLocked(self: *Backend, gpa: std.mem.Allocator, message: []const u8) void {
+        assert(message.len > 0);
         if (self.failure_message.len > 0) gpa.free(self.failure_message);
         self.failure_message = gpa.dupe(u8, message) catch &.{};
         self.state = .failed;
@@ -163,40 +168,29 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, request: Request
     assert(cwd.len > 0);
     assert(request.query.len > 0);
 
-    const snapshot = snapshotBackend();
-    defer snapshot.deinit();
+    if (try runReadyBackend(gpa, request)) |result| return result;
 
-    return switch (snapshot.state) {
-        .ready => runFff(gpa, request, snapshot.api.?, snapshot.handle.?) catch |err| switch (err) {
-            error.OutOfMemory, error.InvalidCursor => err,
-            else => fallbackAfterFffFailure(gpa, io, cwd, request, err),
-        },
-        .unstarted, .starting, .failed => runFallback(gpa, io, cwd, request, snapshot.state),
-    };
+    lockBackend();
+    const state = backend.state;
+    backend.mutex.unlock();
+    return runFallback(gpa, io, cwd, request, state);
 }
 
-fn fallbackAfterFffFailure(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, request: Request, err: anyerror) !Result {
-    assert(cwd.len > 0);
+fn runReadyBackend(gpa: std.mem.Allocator, request: Request) !?Result {
     assert(request.query.len > 0);
-    backend.markFailed(gpa, @errorName(err));
-    return runFallback(gpa, io, cwd, request, .failed);
-}
 
-const Snapshot = struct {
-    state: BackendState,
-    api: ?*Api,
-    handle: ?*anyopaque,
-
-    fn deinit(_: Snapshot) void {}
-};
-
-fn snapshotBackend() Snapshot {
     lockBackend();
     defer backend.mutex.unlock();
-    return .{
-        .state = backend.state,
-        .api = if (backend.api) |*api| api else null,
-        .handle = backend.handle,
+    if (backend.state != .ready) return null;
+
+    const api = if (backend.api) |*api| api else return null;
+    const handle = backend.handle orelse return null;
+    return runFff(gpa, request, api, handle) catch |err| switch (err) {
+        error.OutOfMemory, error.InvalidCursor => err,
+        else => {
+            backend.markFailedLocked(gpa, @errorName(err));
+            return null;
+        },
     };
 }
 

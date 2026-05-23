@@ -14,7 +14,7 @@ pub const Client = struct {
         std.debug.assert(config.session_id.len > 0);
         std.debug.assert(config.system_prompt.len > 0);
         var codex_config = config;
-        codex_config.provider = .openai_codex;
+        codex_config.responses_mode = .codex;
         codex_config.base_url = if (config.base_url.len > 0) config.base_url else default_codex_endpoint;
         try target.core_client.init(gpa, io, codex_config);
     }

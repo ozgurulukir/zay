@@ -454,14 +454,7 @@ fn runWriter(writer: *SessionWriter) void {
         if (takeQueuedEntry(writer)) |entry| {
             var owned = entry;
             defer owned.deinit(writer.gpa);
-            var id: [entry_id_len]u8 = undefined;
-            writer.session.appendPayload(owned.kind, owned.role, owned.payload_json, &id) catch continue;
-            if (!writer.title_written) {
-                if (owned.title_candidate) |title| {
-                    writer.session.setTitle(title) catch continue;
-                    writer.title_written = true;
-                }
-            }
+            writeQueuedEntry(writer, &owned) catch continue;
         } else {
             lockWriter(writer);
             const done = writer.stopping and writer.count == 0;
@@ -470,6 +463,26 @@ fn runWriter(writer: *SessionWriter) void {
             std.Thread.yield() catch {};
         }
     }
+}
+
+fn writeQueuedEntry(writer: *SessionWriter, entry: *const QueuedEntry) Error!void {
+    assert(entry.kind.len > 0);
+    assert(entry.payload_json.len > 0);
+
+    const previous_leaf = writer.session.leaf_entry_id;
+    try writer.manager.connection.exec("begin immediate");
+    errdefer {
+        writer.manager.connection.exec("rollback") catch {};
+        writer.session.leaf_entry_id = previous_leaf;
+    }
+
+    var id: [entry_id_len]u8 = undefined;
+    try writer.session.appendPayload(entry.kind, entry.role, entry.payload_json, &id);
+    const should_write_title = !writer.title_written and entry.title_candidate != null;
+    if (should_write_title) try writer.session.setTitle(entry.title_candidate.?);
+
+    try writer.manager.connection.exec("commit");
+    if (should_write_title) writer.title_written = true;
 }
 
 fn takeQueuedEntry(writer: *SessionWriter) ?QueuedEntry {

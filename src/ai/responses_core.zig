@@ -71,7 +71,7 @@ pub const Client = struct {
             .{ .name = "session_id", .value = self.config.session_id },
             .{ .name = "x-client-request-id", .value = self.config.session_id },
         };
-        var req = if (self.config.provider == .openai_codex) blk: {
+        var req = if (self.config.responses_mode == .codex) blk: {
             break :blk try self.http_client.request(.POST, try std.Uri.parse(self.url), .{
                 .headers = .{
                     .authorization = .{ .override = self.authorization },
@@ -89,7 +89,7 @@ pub const Client = struct {
         var payload: std.Io.Writer.Allocating = .init(self.gpa);
         defer payload.deinit();
         try writeRequestPayload(&payload.writer, self.config, messages, self.tools_json);
-        logger.log("responses.request POST {s} provider={s} body={s}", .{ self.url, @tagName(self.config.provider), logBytes(payload.written()) });
+        logger.log("responses.request POST {s} responses_mode={s} body={s}", .{ self.url, @tagName(self.config.responses_mode), logBytes(payload.written()) });
         req.transfer_encoding = .chunked;
         var body_buffer: [body_buffer_bytes]u8 = undefined;
         var body_writer = try req.sendBodyUnflushed(&body_buffer);
@@ -100,7 +100,7 @@ pub const Client = struct {
         var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
         var http_response = try req.receiveHead(&redirect_buffer);
         const status_code: u16 = @intFromEnum(http_response.head.status);
-        logger.log("responses.response.head status={d} provider={s}", .{ status_code, @tagName(self.config.provider) });
+        logger.log("responses.response.head status={d} responses_mode={s}", .{ status_code, @tagName(self.config.responses_mode) });
         if (status_code >= 400) {
             var error_buffer: [transfer_buffer_bytes]u8 = undefined;
             const error_reader = http_response.reader(&error_buffer);
@@ -121,7 +121,7 @@ pub const Client = struct {
 
 fn responsesUrl(gpa: std.mem.Allocator, config: ai.Config) ![]u8 {
     const base = std.mem.trimEnd(u8, config.base_url, "/");
-    if (config.provider == .openai_codex) {
+    if (config.responses_mode == .codex) {
         if (std.mem.endsWith(u8, base, "/codex/responses")) return try gpa.dupe(u8, base);
         if (std.mem.endsWith(u8, base, "/codex")) return try std.fmt.allocPrint(gpa, "{s}/responses", .{base});
         return try std.fmt.allocPrint(gpa, "{s}/codex/responses", .{base});
@@ -186,7 +186,7 @@ pub fn writeRequestPayload(out: *std.Io.Writer, config: ai.Config, messages: []c
     try out.writeAll(",\"input\":[");
     var written: u32 = 0;
     for (messages) |message| {
-        if (config.provider == .openai_codex and message.role == .system) continue;
+        if (config.responses_mode == .codex and message.role == .system) continue;
         if (written > 0) try out.writeByte(',');
         try writeInputMessage(out, message);
         written += 1;
@@ -194,7 +194,7 @@ pub fn writeRequestPayload(out: *std.Io.Writer, config: ai.Config, messages: []c
     try out.writeAll("],\"stream\":true,\"store\":false,\"tools\":");
     try out.writeAll(tools_json);
     try out.writeAll(",\"tool_choice\":\"auto\"");
-    if (config.provider == .openai_codex) {
+    if (config.responses_mode == .codex) {
         try out.writeAll(",\"instructions\":");
         try std.json.Stringify.value(config.system_prompt, .{}, out);
         try out.writeAll(",\"text\":{\"verbosity\":\"low\"},\"parallel_tool_calls\":true");
@@ -318,6 +318,7 @@ fn writeInputContent(out: *std.Io.Writer, blocks: []const ai.ContentBlock) !void
 const ToolBuilder = struct {
     call_id: std.ArrayList(u8) = .empty,
     item_id: std.ArrayList(u8) = .empty,
+    output_index: ?u32 = null,
     name: std.ArrayList(u8) = .empty,
     arguments: std.ArrayList(u8) = .empty,
 
@@ -426,6 +427,7 @@ fn onItemAdded(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.Array
     } else if (std.mem.eql(u8, kind.string, "function_call")) {
         var builder: ToolBuilder = .{};
         errdefer builder.deinit(gpa);
+        builder.output_index = optionalU32(value, "output_index");
         if (try optionalString(gpa, item, "call_id")) |id| {
             defer gpa.free(id);
             try builder.call_id.appendSlice(gpa, id);
@@ -541,22 +543,43 @@ fn onReasoningDelta(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.
 }
 
 fn onArgumentsDelta(gpa: std.mem.Allocator, value: std.json.Value, tools: *std.ArrayList(ToolBuilder), observer: ai.StreamObserver) !void {
-    if (tools.items.len == 0) return;
     const delta = stringField(value, "delta") orelse return;
-    const index: u32 = @intCast(tools.items.len - 1);
+    const index = toolIndexForEvent(value, tools.items) orelse return;
     try tools.items[index].arguments.appendSlice(gpa, delta);
     try observer.on_tool_delta(observer.ptr, .{ .index = index, .name = tools.items[index].name.items, .arguments = tools.items[index].arguments.items });
     try observer.on_delta_end(observer.ptr);
 }
 
 fn onArgumentsDone(gpa: std.mem.Allocator, value: std.json.Value, tools: *std.ArrayList(ToolBuilder), observer: ai.StreamObserver) !void {
-    if (tools.items.len == 0) return;
     const arguments = stringField(value, "arguments") orelse return;
-    const index: u32 = @intCast(tools.items.len - 1);
+    const index = toolIndexForEvent(value, tools.items) orelse return;
     tools.items[index].arguments.clearRetainingCapacity();
     try tools.items[index].arguments.appendSlice(gpa, arguments);
     try observer.on_tool_delta(observer.ptr, .{ .index = index, .name = tools.items[index].name.items, .arguments = tools.items[index].arguments.items });
     try observer.on_delta_end(observer.ptr);
+}
+
+fn toolIndexForEvent(value: std.json.Value, tools: []const ToolBuilder) ?u32 {
+    if (tools.len == 0) return null;
+    if (stringField(value, "item_id")) |item_id| {
+        for (tools, 0..) |tool, index| {
+            if (std.mem.eql(u8, tool.item_id.items, item_id)) return @intCast(index);
+        }
+    }
+    if (stringField(value, "call_id")) |call_id| {
+        for (tools, 0..) |tool, index| {
+            if (std.mem.eql(u8, tool.call_id.items, call_id)) return @intCast(index);
+        }
+    }
+    if (optionalU32(value, "output_index")) |output_index| {
+        for (tools, 0..) |tool, index| {
+            if (tool.output_index) |tool_output_index| {
+                if (tool_output_index == output_index) return @intCast(index);
+            }
+        }
+    }
+    if (tools.len == 1) return 0;
+    return null;
 }
 
 fn appendOwned(gpa: std.mem.Allocator, old: []u8, suffix: []const u8) ![]u8 {
@@ -577,6 +600,14 @@ fn stringField(value: std.json.Value, name: []const u8) ?[]const u8 {
     const field = value.object.get(name) orelse return null;
     if (field != .string) return null;
     return field.string;
+}
+
+fn optionalU32(value: std.json.Value, name: []const u8) ?u32 {
+    const field = value.object.get(name) orelse return null;
+    if (field != .integer) return null;
+    if (field.integer < 0) return null;
+    if (field.integer > std.math.maxInt(u32)) return null;
+    return @intCast(field.integer);
 }
 
 fn readStreamLine(gpa: std.mem.Allocator, reader: *std.Io.Reader) !?[]u8 {
@@ -611,4 +642,25 @@ test "openresponses tools json is an array" {
     defer gpa.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"function\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"strict\":false") != null);
+}
+
+test "openresponses routes parallel argument deltas by output index" {
+    const gpa = std.testing.allocator;
+    var state: StreamState = .{};
+    defer state.deinit(gpa);
+    defer state.deinitBlocks(gpa);
+
+    var call_seq: u64 = 0;
+    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"id\":\"item_a\",\"name\":\"bash\"}}", ai.StreamObserver.noop, &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_b\",\"id\":\"item_b\",\"name\":\"read\"}}", ai.StreamObserver.noop, &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"command\\\":\"}", ai.StreamObserver.noop, &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"path\\\":\"}", ai.StreamObserver.noop, &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"\\\"pwd\\\"}\"}", ai.StreamObserver.noop, &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"\\\"src/main.zig\\\"}\"}", ai.StreamObserver.noop, &call_seq);
+
+    var turn = try state.finish(gpa, &call_seq);
+    defer turn.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), turn.assistant.content.len);
+    try std.testing.expectEqualStrings("{\"command\":\"pwd\"}", turn.assistant.content[0].tool_call.arguments);
+    try std.testing.expectEqualStrings("{\"path\":\"src/main.zig\"}", turn.assistant.content[1].tool_call.arguments);
 }
