@@ -1,5 +1,5 @@
 ---
-name: clean-code
+name: tigerstyle
 description: Use this skill when writing code. It describes how to write beautiful, maintainable and performant code.
 ---
 
