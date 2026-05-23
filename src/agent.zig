@@ -416,10 +416,10 @@ pub const Agent = struct {
                 .role = .tool,
                 .content = blocks,
                 .call_id = r.call_id,
+                .tool_display_label = r.display_label,
             });
             try self.persistLastMessage();
             self.gpa.free(r.name);
-            self.gpa.free(r.display_label);
             self.gpa.free(r.display_body);
             if (r.stderr) |s| self.gpa.free(s);
             r.* = undefined;

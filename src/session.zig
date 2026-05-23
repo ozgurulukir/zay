@@ -557,6 +557,10 @@ fn messageToJson(gpa: std.mem.Allocator, message: ai.ChatMessage) Error![]u8 {
         try writer.writeAll(",\"call_id\":");
         try std.json.Stringify.value(id, .{}, writer);
     }
+    if (message.tool_display_label) |label| {
+        try writer.writeAll(",\"tool_display_label\":");
+        try std.json.Stringify.value(label, .{}, writer);
+    }
     try writer.writeAll(",\"content\":[");
     for (message.content, 0..) |block, index| {
         if (index > 0) try writer.writeByte(',');
@@ -622,10 +626,12 @@ fn jsonToMessage(gpa: std.mem.Allocator, payload_json: []const u8) Error!ai.Chat
     const role = ai.Role.fromString(role_value.string) catch return error.CorruptPayload;
     const call_id = try optionalString(gpa, parsed.value, "call_id");
     errdefer if (call_id) |id| gpa.free(id);
+    const tool_display_label = try optionalString(gpa, parsed.value, "tool_display_label");
+    errdefer if (tool_display_label) |label| gpa.free(label);
     const content_value = parsed.value.object.get("content") orelse return error.CorruptPayload;
     const content = try parseContentBlocks(gpa, content_value);
     errdefer freeContentBlocks(gpa, content);
-    return .{ .role = role, .content = content, .call_id = call_id };
+    return .{ .role = role, .content = content, .call_id = call_id, .tool_display_label = tool_display_label };
 }
 
 fn branchSummaryToMessage(gpa: std.mem.Allocator, payload_json: []const u8) Error!ai.ChatMessage {
@@ -862,6 +868,33 @@ test "session persists and loads messages" {
     try std.testing.expectEqual(@as(usize, 1), messages.len);
     try std.testing.expectEqual(.user, messages[0].role);
     try std.testing.expectEqualStrings("hello", messages[0].text());
+}
+
+test "session persists tool display labels" {
+    var manager = try SessionManager.init(std.testing.allocator, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/nova", .{ .id = "11111111111111111111111111111111", .title = "Tools" });
+
+    var id: [entry_id_len]u8 = undefined;
+    const blocks = try std.testing.allocator.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = try std.testing.allocator.dupe(u8, "contents") } };
+    const call_id = try std.testing.allocator.dupe(u8, "call_1");
+    const label = try std.testing.allocator.dupe(u8, "read AGENTS.md");
+    try session.append(.{ .role = .tool, .content = blocks, .call_id = call_id, .tool_display_label = label }, &id);
+    for (blocks) |*block| block.deinit(std.testing.allocator);
+    std.testing.allocator.free(blocks);
+    std.testing.allocator.free(call_id);
+    std.testing.allocator.free(label);
+
+    const messages = try session.messages(std.testing.allocator);
+    defer {
+        for (messages) |*message| deinitMessage(std.testing.allocator, message);
+        std.testing.allocator.free(messages);
+    }
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqual(.tool, messages[0].role);
+    try std.testing.expectEqualStrings("call_1", messages[0].call_id.?);
+    try std.testing.expectEqualStrings("read AGENTS.md", messages[0].tool_display_label.?);
 }
 
 test "session branch with summary changes context" {

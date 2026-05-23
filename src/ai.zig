@@ -139,6 +139,7 @@ pub const ChatMessage = struct {
     role: Role,
     content: []ContentBlock,
     call_id: ?[]u8 = null,
+    tool_display_label: ?[]u8 = null,
 
     pub fn text(self: ChatMessage) []const u8 {
         for (self.content) |block| {
@@ -151,6 +152,7 @@ pub const ChatMessage = struct {
         for (self.content) |*block| block.deinit(gpa);
         gpa.free(self.content);
         if (self.call_id) |id| gpa.free(id);
+        if (self.tool_display_label) |label| gpa.free(label);
         self.* = undefined;
     }
 };

@@ -1250,7 +1250,7 @@ pub const App = struct {
             } else if (message.role == .assistant) {
                 if (text.len > 0) _ = try self.thread.append(self.gpa, .agent, "agent", text);
             } else if (message.role == .tool) {
-                const title = try self.resumedToolTitle(message.call_id);
+                const title = try self.resumedToolTitle(message);
                 defer self.gpa.free(title);
                 _ = try self.thread.append(self.gpa, .tool, title, text);
             }
@@ -1258,10 +1258,11 @@ pub const App = struct {
         if (self.thread.messages.items.len > 0) self.thread.selected = @intCast(self.thread.messages.items.len - 1);
     }
 
-    fn resumedToolTitle(self: *App, call_id: ?[]const u8) ![]u8 {
-        const id = call_id orelse return self.gpa.dupe(u8, "tool");
-        for (self.agent.messages.items) |message| {
-            for (message.content) |block| {
+    fn resumedToolTitle(self: *App, message: ai.ChatMessage) ![]u8 {
+        if (message.tool_display_label) |label| return self.gpa.dupe(u8, label);
+        const id = message.call_id orelse return self.gpa.dupe(u8, "tool");
+        for (self.agent.messages.items) |candidate| {
+            for (candidate.content) |block| {
                 if (block != .tool_call) continue;
                 if (!std.mem.eql(u8, block.tool_call.call_id, id)) continue;
                 return agent_mod.formatToolTitle(self.gpa, block.tool_call.name, block.tool_call.arguments);
