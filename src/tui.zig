@@ -13,6 +13,7 @@ const thread_mod = @import("thread.zig");
 const agent_worker = @import("tui/agent_worker.zig");
 const tool_policy = @import("tui/tool_policy.zig");
 const tui_metrics = @import("tui/metrics.zig");
+const tui_status = @import("tui/status.zig");
 const tui_style = @import("tui/style.zig");
 
 const StylePalette = tui_style.Palette;
@@ -424,7 +425,8 @@ pub const App = struct {
         const title = try agent_mod.formatToolTitle(self.gpa, tool.name, tool.arguments);
         defer self.gpa.free(title);
 
-        if (std.mem.eql(u8, tool.name, "bash")) self.removeLoading();
+        const loading_removed = self.loading_index != null;
+        self.removeLoading();
 
         var visible_change = false;
         if (self.toolThreadIndex(tool.index)) |index| {
@@ -436,7 +438,7 @@ pub const App = struct {
             visible_change = true;
         }
         self.tool_seen_in_response = true;
-        return visible_change;
+        return loading_removed or visible_change;
     }
 
     fn applyToolFinished(self: *App, tool: agent_mod.Agent.Event.ToolCallFinished) !bool {
@@ -964,7 +966,7 @@ pub const App = struct {
     }
 
     fn moveActiveModelFirst(self: *App) void {
-        const status = modelStatus(self) orelse return;
+        const status = tui_status.modelStatus(self.runtime, self.cached_config) orelse return;
         for (self.codex_models.items, 0..) |model, index| {
             if (!std.mem.eql(u8, model.id, status.model)) continue;
             if (index == 0) return;
@@ -1581,83 +1583,6 @@ const ConversationLayout = struct {
     }
 };
 
-const ThreadWidget = struct {
-    app: *App,
-
-    fn widget(self: *ThreadWidget) vxfw.Widget {
-        return .{
-            .userdata = self,
-            .drawFn = drawThread,
-        };
-    }
-
-    fn drawThread(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *ThreadWidget = @ptrCast(@alignCast(ptr));
-        const widgets = try self.messageWidgets(ctx);
-        self.app.thread_list.children = .{ .slice = widgets };
-        self.app.thread_list.item_count = @intCast(widgets.len);
-        self.syncCursor(ctx);
-
-        var list_padding: vxfw.Padding = .{
-            .child = self.app.thread_list.widget(),
-            .padding = ConversationLayout.verticalPadding(),
-        };
-        return list_padding.widget().draw(ctx);
-    }
-
-    fn messageWidgets(self: *ThreadWidget, ctx: vxfw.DrawContext) ![]vxfw.Widget {
-        const messages = self.app.thread.messages.items;
-        const widgets = try ctx.arena.alloc(vxfw.Widget, messages.len);
-        const bodies = try ctx.arena.alloc(MessageWidget, messages.len);
-        for (messages, 0..) |message, index| {
-            const selected = if (self.app.thread.selected) |selected_index| selected_index == index else false;
-            bodies[index] = .{ .message = message, .selected = selected, .loading_frame = self.app.loading_frame };
-            widgets[index] = bodies[index].widget();
-        }
-        return widgets;
-    }
-
-    fn syncCursor(self: *ThreadWidget, ctx: vxfw.DrawContext) void {
-        // Auto-scroll follows the actual tail of the thread, NOT the user's
-        // selection. The user can wheel-scroll to the bottom (turning auto-
-        // scroll on) while their selection still points at an earlier
-        // message — in that case we must keep them at the tail and leave
-        // the selection untouched. Tying the scroll cursor to `selected`
-        // here used to make every keystroke (which triggers a redraw via
-        // the focused TextField) snap the viewport up to the selection.
-        const messages = self.app.thread.messages.items;
-        if (messages.len == 0) return;
-        if (self.app.thread_auto_scroll) {
-            const tail_index: u32 = @intCast(messages.len - 1);
-            const cursor = self.app.loading_index orelse tail_index;
-            self.app.thread_list.cursor = cursor;
-            self.scrollCursorToTail(ctx, cursor);
-            return;
-        }
-        const cursor = self.app.thread.selected orelse self.app.loading_index orelse 0;
-        const cursor_changed = self.app.thread_list.cursor != cursor;
-        self.app.thread_list.cursor = cursor;
-        if (cursor_changed) self.app.thread_list.ensureScroll();
-    }
-
-    fn scrollCursorToTail(self: *ThreadWidget, ctx: vxfw.DrawContext, cursor: u32) void {
-        if (cursor >= self.app.thread.messages.items.len) return;
-        const max_width = ctx.max.width orelse ctx.min.width;
-        const max_height = ctx.max.height orelse ctx.min.height;
-        const list_height = max_height -| ConversationLayout.top -| ConversationLayout.bottom;
-        const message = self.app.thread.messages.items[cursor];
-        const message_height = messageRows(message, ConversationLayout.contentWidth(max_width));
-        self.app.thread_list.scroll.top = cursor;
-        self.app.thread_list.scroll.pending_lines = 0;
-        self.app.thread_list.scroll.wants_cursor = false;
-        if (message_height > list_height) {
-            self.app.thread_list.scroll.offset = @intCast(message_height - list_height);
-        } else {
-            self.app.thread_list.scroll.offset = 0;
-        }
-    }
-};
-
 const MessageWidget = struct {
     message: thread_mod.Message,
     selected: bool,
@@ -1673,13 +1598,20 @@ const MessageWidget = struct {
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *MessageWidget = @ptrCast(@alignCast(ptr));
         const width = ctx.max.width orelse ctx.min.width;
-        const height = messageRows(self.message, ConversationLayout.contentWidth(width));
+        const requested_height = messageRows(self.message, ConversationLayout.contentWidth(width));
+        const height = clippedSurfaceHeight(width, requested_height);
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{
             .width = width,
             .height = height,
         });
         self.drawBody(&surface, ctx);
         return surface;
+    }
+
+    fn clippedSurfaceHeight(width: u16, requested_height: u16) u16 {
+        if (width == 0) return 0;
+        const max_height = std.math.maxInt(u16) / width;
+        return @min(requested_height, max_height);
     }
 
     fn drawBody(self: *MessageWidget, surface: *vxfw.Surface, ctx: vxfw.DrawContext) void {
@@ -1835,6 +1767,76 @@ const MessageWidget = struct {
     }
 };
 
+const ThreadWidget = struct {
+    app: *App,
+
+    fn widget(self: *ThreadWidget) vxfw.Widget {
+        return .{
+            .userdata = self,
+            .drawFn = drawThread,
+        };
+    }
+
+    fn drawThread(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *ThreadWidget = @ptrCast(@alignCast(ptr));
+        const widgets = try self.messageWidgets(ctx);
+        self.app.thread_list.children = .{ .slice = widgets };
+        self.app.thread_list.item_count = @intCast(widgets.len);
+        self.syncCursor(ctx);
+
+        var list_padding: vxfw.Padding = .{
+            .child = self.app.thread_list.widget(),
+            .padding = ConversationLayout.verticalPadding(),
+        };
+        return list_padding.widget().draw(ctx);
+    }
+
+    fn messageWidgets(self: *ThreadWidget, ctx: vxfw.DrawContext) ![]vxfw.Widget {
+        const messages = self.app.thread.messages.items;
+        const widgets = try ctx.arena.alloc(vxfw.Widget, messages.len);
+        const bodies = try ctx.arena.alloc(MessageWidget, messages.len);
+        for (messages, 0..) |message, index| {
+            const selected = if (self.app.thread.selected) |selected_index| selected_index == index else false;
+            bodies[index] = .{ .message = message, .selected = selected, .loading_frame = self.app.loading_frame };
+            widgets[index] = bodies[index].widget();
+        }
+        return widgets;
+    }
+
+    fn syncCursor(self: *ThreadWidget, ctx: vxfw.DrawContext) void {
+        const messages = self.app.thread.messages.items;
+        if (messages.len == 0) return;
+        if (self.app.thread_auto_scroll) {
+            const tail_index: u32 = @intCast(messages.len - 1);
+            const cursor = self.app.loading_index orelse tail_index;
+            self.app.thread_list.cursor = cursor;
+            self.scrollCursorToTail(ctx, cursor);
+            return;
+        }
+        const cursor = self.app.thread.selected orelse self.app.loading_index orelse 0;
+        const cursor_changed = self.app.thread_list.cursor != cursor;
+        self.app.thread_list.cursor = cursor;
+        if (cursor_changed) self.app.thread_list.ensureScroll();
+    }
+
+    fn scrollCursorToTail(self: *ThreadWidget, ctx: vxfw.DrawContext, cursor: u32) void {
+        if (cursor >= self.app.thread.messages.items.len) return;
+        const max_width = ctx.max.width orelse ctx.min.width;
+        const max_height = ctx.max.height orelse ctx.min.height;
+        const list_height = max_height -| ConversationLayout.top -| ConversationLayout.bottom;
+        const message = self.app.thread.messages.items[cursor];
+        const message_height = messageRows(message, ConversationLayout.contentWidth(max_width));
+        self.app.thread_list.scroll.top = cursor;
+        self.app.thread_list.scroll.pending_lines = 0;
+        self.app.thread_list.scroll.wants_cursor = false;
+        if (message_height > list_height) {
+            self.app.thread_list.scroll.offset = @intCast(message_height - list_height);
+        } else {
+            self.app.thread_list.scroll.offset = 0;
+        }
+    }
+};
+
 const Command = enum { connect, model, new, resume_session };
 const commands = [_]struct { name: []const u8, command: Command }{
     .{ .name = "Connect", .command = .connect },
@@ -1855,70 +1857,6 @@ fn inputLabel(app: *const App) []const u8 {
         },
         .model_picker => "Select Model",
     };
-}
-
-const ModelStatus = struct {
-    provider: []const u8,
-    model: []const u8,
-    thinking: ?[]const u8,
-};
-
-fn modelStatus(app: *const App) ?ModelStatus {
-    if (app.runtime) |runtime| {
-        switch (runtime.client) {
-            .codex_responses => |client| return .{
-                .provider = "openai",
-                .model = client.core_client.config.model,
-                .thinking = reasoningLabel(client.core_client.config.reasoning),
-            },
-            .openai_responses => |client| return .{
-                .provider = providerLabel(app) orelse "openai",
-                .model = client.core_client.config.model,
-                .thinking = reasoningLabel(client.core_client.config.reasoning),
-            },
-            .openai_compatible => |client| return .{
-                .provider = providerLabel(app) orelse "openai_compatible",
-                .model = client.config.model,
-                .thinking = configThinkingLabel(app),
-            },
-            .none => return null,
-        }
-    }
-
-    const model = if (app.cached_config.model) |m| m.id else return null;
-    return .{
-        .provider = providerLabel(app) orelse return null,
-        .model = model,
-        .thinking = configThinkingLabel(app),
-    };
-}
-
-fn providerLabel(app: *const App) ?[]const u8 {
-    const provider = app.cached_config.provider orelse return null;
-    return provider.label();
-}
-
-fn reasoningLabel(reasoning: ?ai.Reasoning) ?[]const u8 {
-    const value = reasoning orelse return null;
-    const effort = value.effort orelse return "Thinking";
-    return effort.label();
-}
-
-fn configThinkingLabel(app: *const App) ?[]const u8 {
-    if (app.cached_config.model) |model| {
-        if (model.reasoning_effort) |effort| return effort.label();
-    }
-    if (app.cached_config.enable_thinking) |enabled| {
-        if (enabled) return "Thinking";
-    }
-    return null;
-}
-
-fn formatModelStatus(gpa: std.mem.Allocator, status: ModelStatus) ![]u8 {
-    if (status.thinking) |thinking| {
-        return std.fmt.allocPrint(gpa, "{s}/{s} · {s}", .{ status.provider, status.model, thinking });
-    }
-    return std.fmt.allocPrint(gpa, "{s}/{s}", .{ status.provider, status.model });
 }
 
 fn resolveCommand(app: *App, filter: []const u8) ?Command {
@@ -2226,7 +2164,7 @@ const ModelRowWidget = struct {
     }
 
     fn activeModel(self: *const ModelRowWidget) bool {
-        const status = modelStatus(self.app) orelse return false;
+        const status = tui_status.modelStatus(self.app.runtime, self.app.cached_config) orelse return false;
         return std.mem.eql(u8, status.model, self.model.id);
     }
 
@@ -2287,7 +2225,7 @@ const ResumeRowWidget = struct {
         const width = ctx.max.width orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
         var buffer: [128]u8 = undefined;
-        const modified = modifiedTime(self.app.io, buffer[0..], self.summary.updated_at_ms);
+        const modified = tui_status.modifiedTime(self.app.io, buffer[0..], self.summary.updated_at_ms);
         const left = try self.leftText(ctx, width, modified);
         try writeCommandLine(&surface, 0, left, ctx, self.selected);
         try writePanelRight(&surface, 0, modified, ctx, self.selected);
@@ -2348,30 +2286,6 @@ fn truncateText(ctx: vxfw.DrawContext, text: []const u8, width: usize) std.mem.A
     }
     try out.appendSlice(ctx.arena, "...");
     return out.toOwnedSlice(ctx.arena);
-}
-
-fn formatCwdRelative(
-    arena: std.mem.Allocator,
-    cwd: []const u8,
-    home_dir: []const u8,
-) std.mem.Allocator.Error![]const u8 {
-    std.debug.assert(cwd.len > 0);
-    if (home_dir.len == 0) return cwd;
-    if (cwd.len < home_dir.len) return cwd;
-
-    const prefix = cwd[0..home_dir.len];
-    const prefix_matches = switch (@import("builtin").target.os.tag) {
-        .windows => std.ascii.eqlIgnoreCase(prefix, home_dir),
-        else => std.mem.eql(u8, prefix, home_dir),
-    };
-    if (!prefix_matches) return cwd;
-
-    const tail = cwd[home_dir.len..];
-    if (tail.len == 0) return "~";
-    if (tail[0] != '/' and tail[0] != '\\') return cwd;
-
-    std.debug.assert(tail.len >= 1);
-    return std.fmt.allocPrint(arena, "~{s}", .{tail});
 }
 
 fn writeCommandLine(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool) std.mem.Allocator.Error!void {
@@ -2439,75 +2353,6 @@ fn resumeMatches(summary: *const session_mod.SessionSummary, filter: []const u8)
     if (std.mem.indexOf(u8, summary.cwd, filter) != null) return true;
     if (std.mem.indexOf(u8, summary.id, filter) != null) return true;
     return false;
-}
-
-/// Format a recency label for the resume picker. Buckets:
-///   just now  < 60s
-///   Nm ago    1..59 minutes
-///   Nh ago    1..23 hours
-///   Nd ago    1..6 days
-///   Nw ago    1..3 weeks (7..27 days)
-///   Nmo ago   1..11 months (~28..364 days)
-///   Ny ago    1+ years
-///
-fn modifiedTime(io: std.Io, buffer: []u8, updated_at_ms: i64) []const u8 {
-    if (updated_at_ms < 0) return "unknown time";
-    if (buffer.len == 0) return "unknown time";
-    const now_ms = std.Io.Clock.now(.real, io).toMilliseconds();
-    const diff_ms = now_ms - updated_at_ms;
-    if (diff_ms < 0) return "in the future";
-    const seconds: i64 = @divTrunc(diff_ms, 1000);
-    if (seconds < 60) return "just now";
-    const minutes: i64 = @divTrunc(seconds, 60);
-    if (minutes < 60) {
-        return std.fmt.bufPrint(buffer, "{d}m ago", .{minutes}) catch "unknown time";
-    }
-    const hours: i64 = @divTrunc(minutes, 60);
-    if (hours < 24) {
-        return std.fmt.bufPrint(buffer, "{d}h ago", .{hours}) catch "unknown time";
-    }
-    const days: i64 = @divTrunc(hours, 24);
-    if (days < 7) {
-        return std.fmt.bufPrint(buffer, "{d}d ago", .{days}) catch "unknown time";
-    }
-    if (days < 28) {
-        return std.fmt.bufPrint(buffer, "{d}w ago", .{@divTrunc(days, 7)}) catch "unknown time";
-    }
-    if (days < 365) {
-        return std.fmt.bufPrint(buffer, "{d}mo ago", .{@divTrunc(days, 30)}) catch "unknown time";
-    }
-    return std.fmt.bufPrint(buffer, "{d}y ago", .{@divTrunc(days, 365)}) catch "unknown time";
-}
-
-test "model status includes reasoning effort when present" {
-    const gpa = std.testing.allocator;
-    const text = try formatModelStatus(gpa, .{ .provider = "openai", .model = "gpt-5.5", .thinking = "medium" });
-    defer gpa.free(text);
-    try std.testing.expectEqualStrings("openai/gpt-5.5 · medium", text);
-}
-
-test "model status omits separator when thinking is unavailable" {
-    const gpa = std.testing.allocator;
-    const text = try formatModelStatus(gpa, .{ .provider = "ollama", .model = "llama", .thinking = null });
-    defer gpa.free(text);
-    try std.testing.expectEqualStrings("ollama/llama", text);
-}
-
-test "modifiedTime buckets" {
-    const io = std.testing.io;
-    var buf: [32]u8 = undefined;
-    const now = std.Io.Clock.now(.real, io).toMilliseconds();
-    const sec_ms: i64 = 1000;
-    const min_ms: i64 = 60 * sec_ms;
-    const hour_ms: i64 = 60 * min_ms;
-    const day_ms: i64 = 24 * hour_ms;
-    try std.testing.expectEqualStrings("just now", modifiedTime(io, &buf, now - 30 * sec_ms));
-    try std.testing.expectEqualStrings("5m ago", modifiedTime(io, &buf, now - 5 * min_ms));
-    try std.testing.expectEqualStrings("3h ago", modifiedTime(io, &buf, now - 3 * hour_ms));
-    try std.testing.expectEqualStrings("3d ago", modifiedTime(io, &buf, now - 3 * day_ms));
-    try std.testing.expectEqualStrings("2w ago", modifiedTime(io, &buf, now - 14 * day_ms));
-    try std.testing.expectEqualStrings("3mo ago", modifiedTime(io, &buf, now - 90 * day_ms));
-    try std.testing.expectEqualStrings("2y ago", modifiedTime(io, &buf, now - 730 * day_ms));
 }
 
 const CommandInputText = struct {
@@ -2607,7 +2452,7 @@ const InputWidget = struct {
 
         const cwd_raw = if (self.app.runtime) |runtime| runtime.cwd else self.app.agent.cwd;
         const home_dir = if (self.app.runtime) |runtime| runtime.home_dir else "";
-        const cwd = try formatCwdRelative(ctx.arena, cwd_raw, home_dir);
+        const cwd = try tui_status.formatCwdRelative(ctx.arena, cwd_raw, home_dir);
         var cwd_text: vxfw.Text = .{
             .text = cwd,
             .style = StylePalette.cwd,
@@ -2623,8 +2468,8 @@ const InputWidget = struct {
             .overflow = .ellipsis,
             .width_basis = .parent,
         };
-        const status_text = if (modelStatus(self.app)) |status|
-            formatModelStatus(ctx.arena, status) catch ""
+        const status_text = if (tui_status.modelStatus(self.app.runtime, self.app.cached_config)) |status|
+            tui_status.formatModelStatus(ctx.arena, status) catch ""
         else
             "";
         var model_text: vxfw.Text = .{
@@ -3351,10 +3196,9 @@ test "structured tool keeps loading status while arguments stream" {
         .name = "write_file",
         .arguments = "{\"path\":\"main.zig\",\"content\":\"const std = @import(\\\"std\\\");",
     } }));
-    try std.testing.expectEqual(@as(usize, 3), app.thread.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
-    try std.testing.expectEqual(.status, app.thread.messages.items[1].kind);
-    try std.testing.expectEqual(.tool, app.thread.messages.items[2].kind);
+    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
 
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
@@ -3513,6 +3357,46 @@ test "new tool response index creates a new thread row" {
     try std.testing.expectEqual(.tool, app.thread.messages.items[2].kind);
     try std.testing.expectEqualStrings("$ ls", app.thread.messages.items[1].title);
     try std.testing.expectEqualStrings("$ pwd", app.thread.messages.items[2].title);
+}
+
+test "structured tool after batch replaces loading status" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try app.input.insertSliceAtCursor("run tools");
+    _ = (try app.beginSubmit()).?;
+
+    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
+        .index = 0,
+        .name = "bash",
+        .arguments = "{\"command\":\"ls\"}",
+    } }));
+    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_call_finished = .{
+        .index = 0,
+        .name = "bash",
+        .display_label = "ls",
+        .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
+    } }));
+    try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
+    try std.testing.expectEqual(.status, app.thread.messages.items[2].kind);
+
+    _ = try app.applyAgentEvent(.{ .tool_delta = .{
+        .index = 0,
+        .name = "write_file",
+        .arguments = "{\"path\":\"main.zig\",\"content\":\"const std = @import(\\\"std\\\");",
+    } });
+
+    try std.testing.expectEqual(@as(usize, 3), app.thread.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
+    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
+    try std.testing.expectEqual(.tool, app.thread.messages.items[2].kind);
 }
 
 test "late tool finish does not move selection upward" {
@@ -3741,6 +3625,38 @@ test "collapsed tool messages render no body text" {
     thread.toggleSelected();
     try std.testing.expect(thread.messages.items[index].expanded);
     try std.testing.expectEqualStrings("hello", thread.messages.items[index].body);
+}
+
+test "expanded tool surface height cannot overflow vxfw buffer size" {
+    const gpa = std.testing.allocator;
+    const body = try gpa.alloc(u8, 80_000);
+    defer gpa.free(body);
+    @memset(body, 'x');
+
+    const message: thread_mod.Message = .{
+        .kind = .tool,
+        .title = try gpa.dupe(u8, "$ yes"),
+        .body = body,
+        .expanded = true,
+    };
+    defer gpa.free(message.title);
+
+    var widget: MessageWidget = .{
+        .message = message,
+        .selected = true,
+        .loading_frame = 0,
+    };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 120, .height = null },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const surface = try widget.widget().draw(ctx);
+    try std.testing.expect(surface.size.width * surface.size.height <= std.math.maxInt(u16));
 }
 
 test "selected collapsed tools stay visible for tight viewport heights" {

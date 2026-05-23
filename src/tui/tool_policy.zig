@@ -38,5 +38,11 @@ pub fn forName(name: []const u8) Policy {
     for (entries) |entry| {
         if (std.mem.eql(u8, entry.name, name)) return entry.policy;
     }
-    unreachable;
+    return .{ .expand_by_default = true, .render = .plain };
+}
+
+test "unknown tools use a safe failure display policy" {
+    const policy = forName("read_file");
+    try std.testing.expect(policy.expand_by_default);
+    try std.testing.expectEqual(thread_mod.Render.plain, policy.render);
 }
