@@ -1,10 +1,12 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const logger = @import("logger");
 const ai = @import("../ai.zig");
 const core = @import("responses_core.zig");
 const websocket = @import("websocket");
 
 const default_codex_endpoint = "https://chatgpt.com/backend-api";
+const websocket_idle_timeout_seconds: u32 = 90;
 
 pub const Client = struct {
     core_client: core.Client,
@@ -64,6 +66,7 @@ pub const Client = struct {
         logger.log("codex.websocket.response.head status={d}", .{@intFromEnum(response.head.status)});
         if (response.head.status != .switching_protocols) return error.WebSocketUpgradeFailed;
         if (!acceptMatches(response.head.bytes, &accept_expected)) return error.WebSocketUpgradeFailed;
+        setWebSocketReadTimeout(req.connection.?);
         defer finishUpgradedRequest(&req, self.core_client.io);
 
         var body: std.Io.Writer.Allocating = .init(gpa);
@@ -84,7 +87,10 @@ pub const Client = struct {
         errdefer state.deinitBlocks(gpa);
         var event_count: u32 = 0;
         while (event_count < 100_000) : (event_count += 1) {
-            const text = try readTextFrame(gpa, req.connection.?.reader());
+            const text = readTextFrame(gpa, req.connection.?.reader()) catch |err| {
+                logWebSocketReadFailure(req.connection.?, err);
+                return err;
+            };
             defer gpa.free(text);
             logger.log("codex.websocket.response.frame {s}", .{logBytes(text)});
             try state.processJson(gpa, text, observer, &self.core_client.call_seq);
@@ -140,6 +146,41 @@ fn finishUpgradedRequest(request: *std.http.Client.Request, io: std.Io) void {
     connection.flush() catch {};
     connection.closing = true;
     request.reader.state = .ready;
+}
+
+fn setWebSocketReadTimeout(connection: *std.http.Client.Connection) void {
+    if (comptime builtin.os.tag == .windows) return;
+    if (comptime builtin.os.tag == .wasi) return;
+    if (comptime builtin.os.tag == .emscripten) return;
+
+    const timeout: std.posix.timeval = .{
+        .sec = websocket_idle_timeout_seconds,
+        .usec = 0,
+    };
+    std.posix.setsockopt(
+        connection.stream_reader.stream.socket.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        std.mem.asBytes(&timeout),
+    ) catch |err| {
+        logger.log("codex.websocket.timeout.setup_failed seconds={d} error={s}", .{
+            websocket_idle_timeout_seconds,
+            @errorName(err),
+        });
+        return;
+    };
+    logger.log("codex.websocket.timeout.read_idle_seconds={d}", .{websocket_idle_timeout_seconds});
+}
+
+fn logWebSocketReadFailure(connection: *std.http.Client.Connection, err: anyerror) void {
+    if (connection.getReadError()) |read_error| {
+        logger.log("codex.websocket.read.failure error={s} transport_error={s}", .{
+            @errorName(err),
+            @errorName(read_error),
+        });
+        return;
+    }
+    logger.log("codex.websocket.read.failure error={s}", .{@errorName(err)});
 }
 
 fn acceptMatches(head: []const u8, expected: []const u8) bool {
