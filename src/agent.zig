@@ -130,7 +130,7 @@ pub const Agent = struct {
 
     pub fn run(self: *Agent, listener: Listener) !void {
         try listener.emit(.turn_started);
-        const tool_call_limit = 8;
+        const tool_call_limit = 100;
         var calls: u32 = 0;
         while (calls < tool_call_limit) : (calls += 1) {
             var stream_context: StreamContext = .{
