@@ -10,48 +10,19 @@ const openai_compatible_mod = @import("ai/openai_compatible.zig");
 const runtime_mod = @import("runtime.zig");
 const session_mod = @import("session.zig");
 const thread_mod = @import("thread.zig");
-const tools_mod = @import("tools.zig");
+const agent_worker = @import("tui/agent_worker.zig");
+const tool_policy = @import("tui/tool_policy.zig");
+const tui_metrics = @import("tui/metrics.zig");
+const tui_style = @import("tui/style.zig");
 
-const Render = thread_mod.Render;
-
-const ToolPolicy = struct {
-    expand_by_default: bool,
-    render: Render,
-};
-
-const tool_policies = [_]struct { name: []const u8, policy: ToolPolicy }{
-    .{ .name = "bash", .policy = .{ .expand_by_default = false, .render = .plain } },
-    .{ .name = "read", .policy = .{ .expand_by_default = false, .render = .plain } },
-    .{ .name = "search_codebase", .policy = .{ .expand_by_default = false, .render = .plain } },
-    .{ .name = "write_file", .policy = .{ .expand_by_default = true, .render = .plain } },
-    .{ .name = "edit_file", .policy = .{ .expand_by_default = true, .render = .diff } },
-};
-
-comptime {
-    // Every tool in the registry has a policy entry.
-    for (tools_mod.registry) |tool| {
-        var found = false;
-        for (tool_policies) |p| if (std.mem.eql(u8, p.name, tool.name)) {
-            found = true;
-        };
-        if (!found) @compileError("missing TUI policy for tool: " ++ tool.name);
-    }
-    // Every policy entry maps to a registry tool — no orphans.
-    for (tool_policies) |p| {
-        var found = false;
-        for (tools_mod.registry) |tool| if (std.mem.eql(u8, p.name, tool.name)) {
-            found = true;
-        };
-        if (!found) @compileError("orphan TUI policy entry: " ++ p.name);
-    }
-}
-
-fn policyFor(name: []const u8) ToolPolicy {
-    for (tool_policies) |p| {
-        if (std.mem.eql(u8, p.name, name)) return p.policy;
-    }
-    unreachable; // guaranteed by the comptime check above
-}
+const StylePalette = tui_style.Palette;
+const gradientStyle = tui_style.gradientStyle;
+const mergedSelectedStyle = tui_style.mergedSelectedStyle;
+const firstVisibleMessage = tui_metrics.firstVisibleMessage;
+const messageRows = tui_metrics.messageRows;
+const messageStartRow = tui_metrics.messageStartRow;
+const threadRows = tui_metrics.threadRows;
+const visibleRows = tui_metrics.visibleRows;
 
 const logo_bytes_max = 64 * 1024;
 const loading_spinners = [4][]const u8{ "Firing Neurons", "Multiplying Matrices", "brr..brr...", "Warping" };
@@ -67,7 +38,7 @@ pub const App = struct {
     runtime: ?*runtime_mod.AgentRuntime = null,
     thread: thread_mod.Thread = .{},
     input: vxfw.TextField,
-    worker_context: AgentWorkerContext,
+    worker_context: agent_worker.Context,
     turn_future: ?std.Io.Future(void) = null,
     owns_runtime: bool = false,
     mode: Mode = .normal,
@@ -138,7 +109,6 @@ pub const App = struct {
             .worker_context = .{
                 .io = io,
                 .gpa = agent.gpa,
-                .agent = agent,
             },
         };
     }
@@ -292,7 +262,7 @@ pub const App = struct {
     }
 
     pub fn startTurn(self: *App) !void {
-        self.turn_future = try self.io.concurrent(runAgentTurn, .{
+        self.turn_future = try self.io.concurrent(agent_worker.runAgentTurn, .{
             self.agent,
             &self.worker_context,
         });
@@ -470,7 +440,7 @@ pub const App = struct {
     }
 
     fn applyToolFinished(self: *App, tool: agent_mod.Agent.Event.ToolCallFinished) !bool {
-        const policy = policyFor(tool.name);
+        const policy = tool_policy.forName(tool.name);
         const existing_index = self.toolThreadIndex(tool.index);
         const index = if (existing_index) |index| index else index: {
             const created = try self.thread.startTool(self.gpa, tool.display_label);
@@ -1222,8 +1192,8 @@ pub const App = struct {
         const current = self.runtime.?;
         const runtime = try self.gpa.create(runtime_mod.AgentRuntime);
         errdefer self.gpa.destroy(runtime);
-        const diagnostics = try self.gpa.alloc(config_mod.Diagnostic, 0);
-        errdefer self.gpa.free(diagnostics);
+        const diagnostics = try current.gpa.alloc(config_mod.Diagnostic, 0);
+        errdefer current.gpa.free(diagnostics);
         if (session_id) |id| {
             try runtime.initResume(
                 current.gpa,
@@ -1255,7 +1225,6 @@ pub const App = struct {
         self.gpa.destroy(self.runtime.?);
         self.runtime = runtime;
         self.agent = &runtime.agent;
-        self.worker_context.agent = &runtime.agent;
         self.mode = .normal;
         self.clearInput();
         self.resetTurnState();
@@ -1377,81 +1346,6 @@ fn chooseLoadingWordIndex(io: std.Io) u8 {
     const timestamp: std.Io.Timestamp = .now(io, .awake);
     const index = @mod(timestamp.nanoseconds, loading_spinners.len);
     return @intCast(index);
-}
-
-const AgentEventQueue = struct {
-    mutex: std.Io.Mutex = .init,
-    items: std.ArrayList(*agent_mod.Agent.Event) = .empty,
-
-    fn push(
-        self: *AgentEventQueue,
-        io: std.Io,
-        gpa: std.mem.Allocator,
-        event: *agent_mod.Agent.Event,
-    ) !void {
-        try self.mutex.lock(io);
-        defer self.mutex.unlock(io);
-        try self.items.append(gpa, event);
-    }
-
-    fn drainInto(
-        self: *AgentEventQueue,
-        io: std.Io,
-        gpa: std.mem.Allocator,
-        sink: *std.ArrayList(*agent_mod.Agent.Event),
-    ) !void {
-        try self.mutex.lock(io);
-        defer self.mutex.unlock(io);
-        try sink.appendSlice(gpa, self.items.items);
-        self.items.clearRetainingCapacity();
-    }
-
-    fn deinit(self: *AgentEventQueue, io: std.Io, gpa: std.mem.Allocator) void {
-        self.mutex.lock(io) catch return;
-        defer self.mutex.unlock(io);
-        for (self.items.items) |event_ptr| {
-            event_ptr.deinit(gpa);
-            gpa.destroy(event_ptr);
-        }
-        self.items.deinit(gpa);
-    }
-};
-
-const AgentWorkerContext = struct {
-    io: std.Io,
-    gpa: std.mem.Allocator,
-    agent: *agent_mod.Agent,
-    queue: AgentEventQueue = .{},
-};
-
-fn runAgentTurn(agent: *agent_mod.Agent, worker_context: *AgentWorkerContext) void {
-    agent.run(.{
-        .ptr = worker_context,
-        .on_event = postAgentEvent,
-    }) catch |err| {
-        const message = std.fmt.allocPrint(
-            worker_context.gpa,
-            "agent turn failed: {s}",
-            .{@errorName(err)},
-        ) catch return;
-        postAgentEvent(worker_context, .{ .turn_failed = message }) catch {
-            worker_context.gpa.free(message);
-            return;
-        };
-    };
-    postAgentEvent(worker_context, .turn_finished) catch {};
-}
-
-fn postAgentEvent(context: *anyopaque, event: agent_mod.Agent.Event) anyerror!void {
-    const worker_context: *AgentWorkerContext = @ptrCast(@alignCast(context));
-    var owned_event = event;
-    errdefer owned_event.deinit(worker_context.gpa);
-    const event_ptr = try worker_context.gpa.create(agent_mod.Agent.Event);
-    errdefer worker_context.gpa.destroy(event_ptr);
-    event_ptr.* = owned_event;
-    owned_event = .delta_end;
-    errdefer event_ptr.deinit(worker_context.gpa);
-    try worker_context.queue.push(worker_context.io, worker_context.gpa, event_ptr);
 }
 
 pub fn run(
@@ -2785,43 +2679,6 @@ const InputWidget = struct {
     }
 };
 
-const RowViewport = struct {
-    first: u32,
-    height: u16,
-};
-
-fn visibleRows(
-    messages: []const thread_mod.Message,
-    selected: ?u32,
-    width: u16,
-    height: u16,
-) RowViewport {
-    const total = threadRows(messages, width);
-    if (total <= height) return .{ .first = 0, .height = height };
-
-    const selected_index = selected orelse return .{
-        .first = total - height,
-        .height = height,
-    };
-    std.debug.assert(selected_index < messages.len);
-
-    const last_index: u32 = @intCast(messages.len - 1);
-    if (selected_index == last_index) {
-        return .{ .first = total - height, .height = height };
-    }
-
-    const selected_start = messageStartRow(messages, selected_index, width);
-    const selected_rows = messageRows(messages[selected_index], width);
-    const selected_end = selected_start + selected_rows;
-    if (selected_rows >= height) {
-        return .{ .first = selected_start, .height = height };
-    }
-    if (selected_end <= height) {
-        return .{ .first = 0, .height = height };
-    }
-    return .{ .first = selected_end - height, .height = height };
-}
-
 fn drawToolBody(
     surface: *vxfw.Surface,
     message: thread_mod.Message,
@@ -2916,144 +2773,6 @@ fn commandInputSegmentEnd(input: []const u8) usize {
         if (byte == ' ') return index;
     }
     return input.len;
-}
-
-const StylePalette = struct {
-    const thinking_blue = .{ 96, 165, 250 };
-    const user_yellow = .{ 212, 175, 55 };
-
-    const selected: vaxis.Style = .{ .bg = .{ .rgb = .{ 38, 38, 38 } } };
-    const user: vaxis.Style = .{ .fg = .{ .rgb = user_yellow }, .italic = true };
-    const tool: vaxis.Style = .{ .fg = .{ .rgb = .{ 34, 197, 94 } } };
-    const tool_failed: vaxis.Style = .{ .fg = .{ .rgb = .{ 239, 68, 68 } } };
-    const cwd: vaxis.Style = .{ .fg = .{ .rgb = .{ 34, 197, 94 } } };
-    const model_status: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
-    const thinking_label: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
-    const thinking_body: vaxis.Style = .{ .fg = .{ .rgb = .{ 138, 138, 138 } } };
-    const thinking_bar: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
-    const panel_header: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } } };
-};
-
-fn mergedSelectedStyle(style: vaxis.Style, selected: bool) vaxis.Style {
-    var merged = style;
-    if (selected) merged.bg = StylePalette.selected.bg;
-    return merged;
-}
-
-fn gradientStyle(col: u16, width: u16, selected: bool) vaxis.Style {
-    std.debug.assert(width > 0);
-    const denominator: u32 = @max(@as(u32, width) - 1, 1);
-    const numerator: u32 = @min(@as(u32, col), denominator);
-    const yellow = .{ 252, 211, 77 };
-    const orange = .{ 249, 115, 22 };
-    return mergedSelectedStyle(.{ .fg = .{ .rgb = .{
-        gradientChannel(yellow[0], orange[0], numerator, denominator),
-        gradientChannel(yellow[1], orange[1], numerator, denominator),
-        gradientChannel(yellow[2], orange[2], numerator, denominator),
-    } } }, selected);
-}
-
-fn gradientChannel(start: u8, end: u8, numerator: u32, denominator: u32) u8 {
-    std.debug.assert(denominator > 0);
-    const start_value: u32 = start;
-    const end_value: u32 = end;
-    if (end_value >= start_value) {
-        return @intCast(start_value + ((end_value - start_value) * numerator) / denominator);
-    }
-    return @intCast(start_value - ((start_value - end_value) * numerator) / denominator);
-}
-
-fn firstVisibleMessage(
-    messages: []const thread_mod.Message,
-    selected: ?u32,
-    width: u16,
-    height: u16,
-) u32 {
-    const first_row = visibleRows(messages, selected, width, height).first;
-    var row: u32 = 0;
-    var index: u32 = 0;
-    while (index < messages.len) : (index += 1) {
-        const next = row + messageRows(messages[index], width);
-        if (next > first_row) return index;
-        row = next;
-    }
-    return 0;
-}
-
-fn threadRows(messages: []const thread_mod.Message, width: u16) u32 {
-    var rows: u32 = 0;
-    for (messages) |message| {
-        rows += messageRows(message, width);
-    }
-    return rows;
-}
-
-fn messageStartRow(messages: []const thread_mod.Message, index: u32, width: u16) u32 {
-    std.debug.assert(index < messages.len);
-    var rows: u32 = 0;
-    var current: u32 = 0;
-    while (current < index) : (current += 1) {
-        rows += messageRows(messages[current], width);
-    }
-    return rows;
-}
-
-fn messageRows(message: thread_mod.Message, width: u16) u16 {
-    return messageContentRows(message, width) + 2;
-}
-
-fn messageContentRows(message: thread_mod.Message, width: u16) u16 {
-    return switch (message.kind) {
-        .user => textRows(message.body, width -| 2),
-        .agent => textRows(message.body, width),
-        .logo => logoRows(message.body),
-        .thinking => if (message.expanded)
-            1 + textRows(message.body, width -| 2)
-        else
-            1,
-        .status => 1,
-        .tool => if (message.expanded)
-            textRows(message.title, width) + toolBodyRows(message, width)
-        else
-            textRows(message.title, width),
-    };
-}
-
-fn toolBodyRows(message: thread_mod.Message, width: u16) u16 {
-    var rows: u16 = 0;
-    if (message.body.len > 0) rows += textRows(message.body, width);
-    if (message.stderr_body) |stderr| rows += textRows(stderr, width);
-    return rows;
-}
-
-fn logoRows(text: []const u8) u16 {
-    if (text.len == 0) return 1;
-    var rows: u16 = 1;
-    for (text) |byte| {
-        if (byte == '\n') rows += 1;
-    }
-    return rows;
-}
-
-fn textRows(text: []const u8, width: u16) u16 {
-    if (text.len == 0) return 1;
-    const row_width = @max(@as(usize, width), 1);
-    var rows: u16 = 1;
-    var col: usize = 0;
-    for (text) |byte| {
-        if (byte == '\n') {
-            rows += 1;
-            col = 0;
-            continue;
-        }
-
-        if (col >= row_width) {
-            rows += 1;
-            col = 0;
-        }
-        col += 1;
-    }
-    return rows;
 }
 
 test "begin submit clears input and appends loading row before agent turn" {
