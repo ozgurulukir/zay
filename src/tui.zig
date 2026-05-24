@@ -35,7 +35,6 @@ const messageStartRow = tui_metrics.messageStartRow;
 const threadRows = tui_metrics.threadRows;
 const visibleRows = tui_metrics.visibleRows;
 
-const logo_bytes_max = 64 * 1024;
 const loading_spinners = tui_thread_projection.loading_spinners;
 const loading_frame_ms = tui_message.loading_frame_ms;
 const command_prefix: u8 = '/';
@@ -1146,7 +1145,7 @@ pub fn run(
     app.bindInputCallbacks();
     defer app.deinit();
 
-    const logo = try loadStartupLogo(init.io, gpa);
+    const logo = try loadStartupLogo(gpa);
     defer gpa.free(logo);
     _ = try app.thread.append(gpa, .logo, "logo", logo);
 
@@ -1154,9 +1153,8 @@ pub fn run(
     try fw_app.run(root.widget(), .{});
 }
 
-fn loadStartupLogo(io: std.Io, gpa: std.mem.Allocator) ![]u8 {
-    var cwd = std.Io.Dir.cwd();
-    return cwd.readFileAllocOptions(io, "src/assets/logo.txt", gpa, .limited(logo_bytes_max), .of(u8), 0);
+fn loadStartupLogo(gpa: std.mem.Allocator) ![]u8 {
+    return gpa.dupe(u8, @embedFile("assets/logo.txt"));
 }
 
 const RootWidget = struct {
