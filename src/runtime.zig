@@ -19,9 +19,38 @@ pub const AgentRuntime = struct {
     session_writer: session_mod.SessionWriter,
     agent: agent_mod.Agent,
     diagnostics: []config_mod.Diagnostic,
-    owned_codex_responses: ?*ai.codex_responses.Client = null,
-    owned_openai_compatible: ?*ai.openai_compatible.Client = null,
-    owned_openai_responses: ?*ai.openai_responses.Client = null,
+    owned_client: ?OwnedClient = null,
+
+    const OwnedClient = union(enum) {
+        codex_responses: *ai.codex_responses.Client,
+        openai_compatible: *ai.openai_compatible.Client,
+        openai_responses: *ai.openai_responses.Client,
+
+        fn deinit(self: OwnedClient, gpa: std.mem.Allocator) void {
+            switch (self) {
+                .codex_responses => |client| {
+                    client.deinit();
+                    gpa.destroy(client);
+                },
+                .openai_compatible => |client| {
+                    client.deinit();
+                    gpa.destroy(client);
+                },
+                .openai_responses => |client| {
+                    client.deinit();
+                    gpa.destroy(client);
+                },
+            }
+        }
+
+        fn languageModel(self: OwnedClient) ai.LanguageModel {
+            return switch (self) {
+                .codex_responses => |client| .{ .codex_responses = client },
+                .openai_compatible => |client| .{ .openai_compatible = client },
+                .openai_responses => |client| .{ .openai_responses = client },
+            };
+        }
+    };
 
     pub fn initNew(
         target: *AgentRuntime,
@@ -103,18 +132,7 @@ pub const AgentRuntime = struct {
         self.agent.deinit();
         self.session_writer.deinit();
         self.gpa.free(self.system_prompt);
-        if (self.owned_codex_responses) |c| {
-            c.deinit();
-            self.gpa.destroy(c);
-        }
-        if (self.owned_openai_compatible) |c| {
-            c.deinit();
-            self.gpa.destroy(c);
-        }
-        if (self.owned_openai_responses) |c| {
-            c.deinit();
-            self.gpa.destroy(c);
-        }
+        if (self.owned_client) |client| client.deinit(self.gpa);
         for (self.diagnostics) |*d| d.deinit(self.gpa);
         self.gpa.free(self.diagnostics);
         self.* = undefined;
@@ -198,25 +216,29 @@ pub const AgentRuntime = struct {
             .system_prompt = self.system_prompt,
         });
         errdefer client.deinit();
-        if (self.owned_codex_responses) |old| {
-            old.deinit();
-            self.gpa.destroy(old);
-        }
-        self.owned_codex_responses = client;
-        self.client = .{ .codex_responses = client };
-        self.agent.client = self.client;
+        self.replaceClient(.{ .codex_responses = client });
     }
 
     pub fn disconnectCodexClient(self: *AgentRuntime) void {
-        if (self.owned_codex_responses) |client| {
-            client.deinit();
-            self.gpa.destroy(client);
-            self.owned_codex_responses = null;
-        }
-        if (self.client == .codex_responses) {
-            self.client = .none;
-            self.agent.client = .none;
-        }
+        const owned_client = self.owned_client orelse return;
+        if (owned_client != .codex_responses) return;
+        owned_client.deinit(self.gpa);
+        self.owned_client = null;
+        self.client = .none;
+        self.agent.client = .none;
+    }
+
+    pub fn hasCodexClient(self: *const AgentRuntime) bool {
+        const owned_client = self.owned_client orelse return false;
+        return owned_client == .codex_responses;
+    }
+
+    pub fn disconnectClient(self: *AgentRuntime) void {
+        const owned_client = self.owned_client orelse return;
+        owned_client.deinit(self.gpa);
+        self.owned_client = null;
+        self.client = .none;
+        self.agent.client = .none;
     }
 
     pub fn attachOpenAiCompatibleClient(
@@ -236,13 +258,7 @@ pub const AgentRuntime = struct {
             .responses_mode = .standard,
         });
         errdefer client.deinit();
-        if (self.owned_openai_compatible) |old| {
-            old.deinit();
-            self.gpa.destroy(old);
-        }
-        self.owned_openai_compatible = client;
-        self.client = .{ .openai_compatible = client };
-        self.agent.client = self.client;
+        self.replaceClient(.{ .openai_compatible = client });
     }
 
     pub fn attachOpenAiResponsesClient(
@@ -263,12 +279,13 @@ pub const AgentRuntime = struct {
             .responses_mode = .standard,
         });
         errdefer client.deinit();
-        if (self.owned_openai_responses) |old| {
-            old.deinit();
-            self.gpa.destroy(old);
-        }
-        self.owned_openai_responses = client;
-        self.client = .{ .openai_responses = client };
+        self.replaceClient(.{ .openai_responses = client });
+    }
+
+    fn replaceClient(self: *AgentRuntime, next: OwnedClient) void {
+        if (self.owned_client) |old| old.deinit(self.gpa);
+        self.owned_client = next;
+        self.client = next.languageModel();
         self.agent.client = self.client;
     }
 };

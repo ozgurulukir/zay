@@ -1,6 +1,8 @@
 const std = @import("std");
 const logger = @import("logger");
 const ai = @import("../ai.zig");
+const model_catalog = @import("openai_compatible_models.zig");
+const openai_endpoint = @import("openai_endpoint.zig");
 const tools_common = @import("../tools/common.zig");
 
 const Scanner = std.json.Scanner;
@@ -11,6 +13,10 @@ const body_buffer_bytes: u32 = 4096;
 const tool_call_count_max: u32 = 16;
 const stream_chunk_count_max: u32 = 100_000;
 const stream_bytes_max: u32 = 8 * 1024 * 1024;
+
+pub const ModelEntry = model_catalog.ModelEntry;
+pub const listModels = model_catalog.listModels;
+pub const openaiV1Root = openai_endpoint.v1Root;
 
 /// OpenAI-compatible AI client using the Completions API.
 pub const Client = struct {
@@ -38,11 +44,9 @@ pub const Client = struct {
         std.debug.assert(config.base_url.len > 0);
         std.debug.assert(config.model.len > 0);
 
-        const url = try std.fmt.allocPrint(
-            gpa,
-            "{s}/v1/chat/completions",
-            .{std.mem.trimEnd(u8, config.base_url, "/")},
-        );
+        const v1_root = try openaiV1Root(gpa, config.base_url);
+        defer gpa.free(v1_root);
+        const url = try std.fmt.allocPrint(gpa, "{s}/chat/completions", .{v1_root});
         errdefer gpa.free(url);
 
         const authorization = try std.fmt.allocPrint(
@@ -141,114 +145,6 @@ fn logBytes(bytes: []const u8) []const u8 {
     const limit = 12 * 1024;
     if (bytes.len <= limit) return bytes;
     return bytes[0..limit];
-}
-
-// TODO: Not convinced this is the best representation
-pub const ModelEntry = struct {
-    id: []u8,
-
-    pub fn deinit(self: *ModelEntry, gpa: std.mem.Allocator) void {
-        gpa.free(self.id);
-        self.* = undefined;
-    }
-};
-
-const models_response_bytes_max: u32 = 1 * 1024 * 1024;
-const models_count_max: u32 = 512;
-
-pub fn listModels(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    base_url: []const u8,
-    api_key: []const u8,
-) ![]ModelEntry {
-    std.debug.assert(base_url.len > 0);
-    std.debug.assert(api_key.len > 0);
-
-    const url = try std.fmt.allocPrint(
-        gpa,
-        "{s}/v1/models",
-        .{std.mem.trimEnd(u8, base_url, "/")},
-    );
-    defer gpa.free(url);
-
-    const authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{api_key});
-    defer gpa.free(authorization);
-
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
-    var req = try http_client.request(.GET, try std.Uri.parse(url), .{
-        .headers = .{ .authorization = .{ .override = authorization } },
-    });
-    defer req.deinit();
-    try req.sendBodiless();
-    logger.log("openai_compatible.models.request GET {s}", .{url});
-
-    var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buffer);
-    const status: u16 = @intFromEnum(response.head.status);
-    logger.log("openai_compatible.models.response.head status={d}", .{status});
-    if (status < 200 or status >= 300) {
-        if (status >= 500) return error.HttpServerError;
-        return error.HttpClientError;
-    }
-
-    const body = try readModelsBody(gpa, &response);
-    defer gpa.free(body);
-    return try parseModelsResponse(gpa, body);
-}
-
-fn readModelsBody(gpa: std.mem.Allocator, response: *std.http.Client.Response) ![]u8 {
-    var empty_decompress_buffer: [0]u8 = .{};
-    var decompress_buffer: []u8 = &empty_decompress_buffer;
-    var decompress_buffer_owned = false;
-    switch (response.head.content_encoding) {
-        .identity => {},
-        .zstd => {
-            decompress_buffer = try gpa.alloc(u8, std.compress.zstd.default_window_len);
-            decompress_buffer_owned = true;
-        },
-        .deflate, .gzip => {
-            decompress_buffer = try gpa.alloc(u8, std.compress.flate.max_window_len);
-            decompress_buffer_owned = true;
-        },
-        .compress => return error.UnsupportedCompressionMethod,
-    }
-    defer if (decompress_buffer_owned) gpa.free(decompress_buffer);
-
-    var transfer_buffer: [8192]u8 = undefined;
-    var decompress: std.http.Decompress = undefined;
-    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    errdefer out.deinit();
-    _ = try reader.streamRemaining(&out.writer);
-    if (out.written().len > models_response_bytes_max) return error.ResponseTooLarge;
-    return try out.toOwnedSlice();
-}
-
-fn parseModelsResponse(gpa: std.mem.Allocator, bytes: []const u8) ![]ModelEntry {
-    std.debug.assert(bytes.len > 0);
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, bytes, .{}) catch return error.InvalidModelsResponse;
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidModelsResponse;
-    const data = parsed.value.object.get("data") orelse return error.InvalidModelsResponse;
-    if (data != .array) return error.InvalidModelsResponse;
-    if (data.array.items.len > models_count_max) return error.TooManyModels;
-
-    var out: std.ArrayList(ModelEntry) = .empty;
-    errdefer {
-        for (out.items) |*entry| entry.deinit(gpa);
-        out.deinit(gpa);
-    }
-    for (data.array.items) |item| {
-        if (item != .object) continue;
-        const id_value = item.object.get("id") orelse continue;
-        if (id_value != .string) continue;
-        if (id_value.string.len == 0) continue;
-        try out.append(gpa, .{ .id = try gpa.dupe(u8, id_value.string) });
-    }
-    return out.toOwnedSlice(gpa);
 }
 
 /// Build the OpenAI `tools` JSON array from the protocol-neutral
