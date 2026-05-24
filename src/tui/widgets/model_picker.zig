@@ -9,9 +9,43 @@ const tui_style = @import("../style.zig");
 
 const StylePalette = tui_style.Palette;
 
-pub const Column = enum { model, reasoning };
+fn scopeColumn(width: u16) u16 {
+    const secondary = panel.secondaryColumn(width);
+    return secondary +| 24;
+}
+
+fn scopeLabel(scope: Scope) []const u8 {
+    return switch (scope) {
+        .global => "Global",
+        .project => "Project",
+        .session => "Session",
+    };
+}
+
+pub const Column = enum {
+    model,
+    reasoning,
+    scope,
+
+    pub fn next(self: Column) Column {
+        return switch (self) {
+            .model => .reasoning,
+            .reasoning => .scope,
+            .scope => .model,
+        };
+    }
+
+    pub fn previous(self: Column) Column {
+        return switch (self) {
+            .model => .scope,
+            .reasoning => .model,
+            .scope => .reasoning,
+        };
+    }
+};
 
 pub const ReasoningOption = struct { label: []const u8 };
+pub const Scope = enum { global, project, session };
 
 pub const Content = struct {
     models: []const codex.Model,
@@ -21,6 +55,7 @@ pub const Content = struct {
     active_model: ?[]const u8,
     reasoning_options: []const ReasoningOption,
     reasoning_indexes: []const u32,
+    scope: Scope,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -58,6 +93,7 @@ pub const Content = struct {
                 .column = self.column,
                 .active_model = self.active_model,
                 .reasoning_label = self.reasoningLabel(@intCast(index)),
+                .scope_label = scopeLabel(self.scope),
             };
             widgets[index + 1] = rows[index].widget();
         }
@@ -83,6 +119,7 @@ const Header = struct {
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
         try panel.lineStyledAt(&surface, 0, "NAME", ctx, message.ConversationLayout.left + 1, StylePalette.panel_header);
         try panel.lineStyledAt(&surface, 0, "REASONING EFFORT", ctx, panel.secondaryColumn(surface.size.width) + 2, StylePalette.panel_header);
+        try panel.lineStyledAt(&surface, 0, "SCOPE", ctx, scopeColumn(surface.size.width), StylePalette.panel_header);
         return surface;
     }
 };
@@ -93,6 +130,7 @@ pub const Row = struct {
     column: Column,
     active_model: ?[]const u8,
     reasoning_label: []const u8,
+    scope_label: []const u8,
 
     pub fn widget(self: *Row) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -109,7 +147,10 @@ pub const Row = struct {
         else
             try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.model.label });
         try panel.lineAt(&surface, 0, text, ctx, model_focused, message.ConversationLayout.left -| 1);
-        if (self.selected) try self.drawReasoning(&surface, ctx);
+        if (self.selected) {
+            try self.drawReasoning(&surface, ctx);
+            try self.drawScope(&surface, ctx);
+        }
         return surface;
     }
 
@@ -123,5 +164,12 @@ pub const Row = struct {
         const prefix = if (focused) "‣ " else "  ";
         const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.reasoning_label });
         try panel.lineAt(surface, 0, text, ctx, focused, panel.secondaryColumn(surface.size.width));
+    }
+
+    fn drawScope(self: *const Row, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
+        const focused = self.column == .scope;
+        const prefix = if (focused) "‣ " else "  ";
+        const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.scope_label });
+        try panel.lineAt(surface, 0, text, ctx, focused, scopeColumn(surface.size.width));
     }
 };

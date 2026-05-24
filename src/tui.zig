@@ -63,6 +63,7 @@ pub const App = struct {
     model_reasoning: std.ArrayList(u32) = .empty,
     model_selection: u32 = 0,
     model_column: model_picker.Column = .model,
+    model_scope: ModelScope = .global,
     model_reasoning_snapshot: std.ArrayList(u32) = .empty,
     model_selection_snapshot: u32 = 0,
     provider_picker: provider_picker.State = .{},
@@ -98,6 +99,7 @@ pub const App = struct {
     const Mode = enum { normal, command, session_picker, provider_picker, custom_connection_form, model_picker };
     const ModelCatalog = enum { connected_provider, openai_codex };
     const ModelSource = enum { openai_codex, openai_compatible };
+    const ModelScope = enum { global, project, session };
 
     pub fn init(io: std.Io, gpa: std.mem.Allocator, agent: *agent_mod.Agent) App {
         return .{
@@ -312,15 +314,19 @@ pub const App = struct {
 
     fn handleModelPickerKey(self: *App, key: vaxis.Key) !bool {
         if (key.matches(vaxis.Key.left, .{})) {
-            self.model_column = .model;
+            self.model_column = self.model_column.previous();
             return true;
         }
         if (key.matches(vaxis.Key.right, .{})) {
-            if (self.codex_models.items.len > 0) self.model_column = .reasoning;
+            if (self.codex_models.items.len > 0) self.model_column = self.model_column.next();
             return true;
         }
         if (key.matches(vaxis.Key.tab, .{})) {
-            if (self.model_column == .reasoning) try self.cycleSelectedReasoning();
+            switch (self.model_column) {
+                .model => self.model_column = self.model_column.next(),
+                .reasoning => try self.cycleSelectedReasoning(),
+                .scope => self.cycleModelScope(),
+            }
             return true;
         }
         if (key.matches(vaxis.Key.up, .{})) {
@@ -517,12 +523,19 @@ pub const App = struct {
         self.mode = .model_picker;
         self.model_column = .model;
         self.model_selection = 0;
+        self.model_scope = self.defaultModelScope();
         self.clearInput();
         try self.reloadModelCatalog(.connected_provider);
         // Snapshot for Escape revert. See `cancelMode`.
         self.model_reasoning_snapshot.clearRetainingCapacity();
         try self.model_reasoning_snapshot.appendSlice(self.gpa, self.model_reasoning.items);
         self.model_selection_snapshot = self.model_selection;
+    }
+
+    fn defaultModelScope(self: *App) ModelScope {
+        const runtime = self.runtime orelse return .global;
+        if (config_mod.projectConfigExists(self.gpa, self.io, runtime.cwd)) return .project;
+        return .global;
     }
 
     fn connectCodex(self: *App) !void {
@@ -534,7 +547,7 @@ pub const App = struct {
         const effort = self.selectedReasoningEffort();
         try self.connectCodexClient(credentials, model.id, effort);
         self.codex_signed_in = true;
-        try self.persistModelSelection(.openai, model.id, effort);
+        try self.persistModelSelection(.openai, model.id, effort, .global);
         self.mode = .normal;
         self.clearInput();
         _ = try self.thread.append(self.gpa, .agent, "agent", "Connected to OpenAI Codex.");
@@ -639,14 +652,6 @@ pub const App = struct {
         try codex.saveCustomProvider(self.gpa, self.io, self.runtime.?.home_dir, .{
             .api_key = self.custom_api_key.items,
         });
-        var updates: config_mod.Config = .{
-            .provider = tui_provider.compatibleProviderFromBaseUrl(self.custom_base_url.items),
-            .base_url = try self.gpa.dupe(u8, self.custom_base_url.items),
-        };
-        defer updates.deinit(self.gpa);
-        config_mod.mergeAndWriteGlobal(self.gpa, self.io, self.runtime.?.home_dir, updates) catch |err| {
-            std.log.warn("config.write.failed err={s}", .{@errorName(err)});
-        };
     }
 
     fn signOutCodex(self: *App) !void {
@@ -676,7 +681,7 @@ pub const App = struct {
                     defer credentials.deinit(self.gpa);
                     try self.connectCodexClient(credentials, model.id, effort);
                     self.codex_signed_in = true;
-                    try self.persistModelSelection(.openai, model.id, effort);
+                    try self.persistModelSelection(.openai, model.id, effort, self.model_scope);
                 } else {
                     return error.NotConnected;
                 }
@@ -687,7 +692,7 @@ pub const App = struct {
                 const api_key = self.cached_config.api_key.?;
                 try self.attachOpenAiCompatibleClient(base_url, api_key, model.id);
                 const provider = tui_provider.compatibleProviderFromBaseUrl(base_url);
-                try self.persistModelSelection(provider, model.id, effort);
+                try self.persistModelSelection(provider, model.id, effort, self.model_scope);
             },
         }
         self.mode = .normal;
@@ -695,6 +700,29 @@ pub const App = struct {
     }
 
     fn persistModelSelection(
+        self: *App,
+        provider: config_mod.Provider,
+        model_id: []const u8,
+        effort: ai.ReasoningEffort,
+        scope: ModelScope,
+    ) !void {
+        try self.updateCachedModelSelection(provider, model_id, effort);
+        if (scope == .session) return;
+
+        var updates = try self.modelSelectionUpdates(provider, model_id, effort);
+        defer updates.deinit(self.gpa);
+        switch (scope) {
+            .global => config_mod.mergeAndWriteGlobal(self.gpa, self.io, self.runtime.?.home_dir, updates) catch |err| {
+                std.log.warn("config.write.failed err={s}", .{@errorName(err)});
+            },
+            .project => config_mod.mergeAndWriteProject(self.gpa, self.io, self.runtime.?.cwd, updates) catch |err| {
+                std.log.warn("project.config.write.failed err={s}", .{@errorName(err)});
+            },
+            .session => unreachable,
+        }
+    }
+
+    fn updateCachedModelSelection(
         self: *App,
         provider: config_mod.Provider,
         model_id: []const u8,
@@ -709,16 +737,39 @@ pub const App = struct {
         } else {
             self.gpa.free(new_id);
         }
-        var updates: config_mod.Config = .{
+    }
+
+    fn modelSelectionUpdates(
+        self: *App,
+        provider: config_mod.Provider,
+        model_id: []const u8,
+        effort: ai.ReasoningEffort,
+    ) !config_mod.Config {
+        const model_id_copy = try self.gpa.dupe(u8, model_id);
+        errdefer self.gpa.free(model_id_copy);
+        var provider_model_id_moved = false;
+        const provider_model_id = try self.gpa.dupe(u8, model_id);
+        errdefer if (!provider_model_id_moved) self.gpa.free(provider_model_id);
+        var models_moved = false;
+        var models = try self.gpa.alloc(config_mod.ProviderModel, 1);
+        errdefer if (!models_moved) self.gpa.free(models);
+        models[0] = .{ .id = provider_model_id, .reasoning_effort = effort };
+        provider_model_id_moved = true;
+        var providers = try self.gpa.alloc(config_mod.ProviderConfig, 1);
+        errdefer {
+            for (providers) |*entry| entry.deinit(self.gpa);
+            self.gpa.free(providers);
+        }
+        providers[0] = .{ .provider = provider, .models = models };
+        models_moved = true;
+        if (provider != .openai) {
+            if (self.cached_config.base_url) |base_url| providers[0].base_url = try self.gpa.dupe(u8, base_url);
+        }
+        return .{
             .provider = provider,
-            .model = .{
-                .id = try self.gpa.dupe(u8, model_id),
-                .reasoning_effort = effort,
-            },
-        };
-        defer updates.deinit(self.gpa);
-        config_mod.mergeAndWriteGlobal(self.gpa, self.io, self.runtime.?.home_dir, updates) catch |err| {
-            std.log.warn("config.write.failed err={s}", .{@errorName(err)});
+            .base_url = if (providers[0].base_url) |base_url| try self.gpa.dupe(u8, base_url) else null,
+            .model = .{ .id = model_id_copy, .reasoning_effort = effort },
+            .providers = providers,
         };
     }
 
@@ -825,6 +876,14 @@ pub const App = struct {
 
     fn selectedReasoningEffort(self: *const App) ai.ReasoningEffort {
         return reasoningOptions()[self.selectedReasoningIndex()].effort;
+    }
+
+    fn cycleModelScope(self: *App) void {
+        self.model_scope = switch (self.model_scope) {
+            .global => .project,
+            .project => .session,
+            .session => .global,
+        };
     }
 
     fn cycleSelectedReasoning(self: *App) !void {
@@ -1497,6 +1556,7 @@ const PanelWidget = struct {
                 .active_model = if (status) |value| value.model else null,
                 .reasoning_options = modelReasoningOptions(),
                 .reasoning_indexes = self.app.model_reasoning.items,
+                .scope = modelPickerScope(self.app.model_scope),
             };
             var shell: panel_widget.Shell = .{ .child = content.widget() };
             return shell.widget().draw(ctx);
@@ -1505,6 +1565,14 @@ const PanelWidget = struct {
         return vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
     }
 };
+
+fn modelPickerScope(scope: App.ModelScope) model_picker.Scope {
+    return switch (scope) {
+        .global => .global,
+        .project => .project,
+        .session => .session,
+    };
+}
 
 fn modelReasoningOptions() []const model_picker.ReasoningOption {
     return &.{
@@ -1532,7 +1600,7 @@ fn inputHintText(mode: App.Mode) []const u8 {
         .session_picker => "↑↓ Navigate · [TAB] Toggle · [ENTER] Select · [ESC] Back",
         .provider_picker => "↑↓ Navigate · ←→ Actions · [ENTER] Select · [ESC] Back",
         .custom_connection_form => "↑↓ Navigate · [ENTER] Save · [ESC] Back",
-        .model_picker => "↑↓ Navigate · [TAB] Toggle Effort · ←→ Actions · [ENTER] Select · [ESC] Back",
+        .model_picker => "↑↓ Navigate · ←→ Column · [TAB] Toggle Effort/Scope · [ENTER] Select · [ESC] Back",
         .normal => "↑↓ Navigate · [TAB] Expand",
     };
 }
@@ -1765,6 +1833,7 @@ test "model picker hides model arrow when reasoning column is focused" {
         .column = app.model_column,
         .active_model = null,
         .reasoning_label = modelReasoningOptions()[app.selectedReasoningIndex()].label,
+        .scope_label = "Global",
     };
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();

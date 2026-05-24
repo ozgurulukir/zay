@@ -6,9 +6,8 @@
 //!   4. env vars: OPENAI_BASE_URL, OPENAI_API_KEY, OPENAI_MODEL,
 //!                NOVA_USE_RESPONSES_ENDPOINT, NOVA_ENABLE_THINKING
 //!
-//! `model` is an indivisible unit: supplying it at any layer replaces
-//! lower layers' `model` whole, because `reasoning_effort` is meaningful
-//! only relative to a specific model id.
+//! `model` is a `<provider>/<model-id>` selection string. Model-specific
+//! fields such as `reasoningEffort` live under `providers.<provider>.models`.
 
 const std = @import("std");
 const ai = @import("ai.zig");
@@ -91,11 +90,51 @@ pub const Model = struct {
     }
 };
 
+pub const ProviderModel = struct {
+    id: []u8,
+    reasoning_effort: ?ai.ReasoningEffort = null,
+
+    pub fn deinit(self: *ProviderModel, gpa: std.mem.Allocator) void {
+        gpa.free(self.id);
+        self.* = undefined;
+    }
+
+    fn clone(self: ProviderModel, gpa: std.mem.Allocator) !ProviderModel {
+        return .{
+            .id = try gpa.dupe(u8, self.id),
+            .reasoning_effort = self.reasoning_effort,
+        };
+    }
+};
+
+pub const ProviderConfig = struct {
+    provider: Provider,
+    base_url: ?[]u8 = null,
+    models: []ProviderModel = &.{},
+
+    pub fn deinit(self: *ProviderConfig, gpa: std.mem.Allocator) void {
+        if (self.base_url) |s| gpa.free(s);
+        for (self.models) |*model| model.deinit(gpa);
+        gpa.free(self.models);
+        self.* = undefined;
+    }
+
+    fn clone(self: ProviderConfig, gpa: std.mem.Allocator) !ProviderConfig {
+        var out: ProviderConfig = .{ .provider = self.provider };
+        errdefer out.deinit(gpa);
+        if (self.base_url) |s| out.base_url = try gpa.dupe(u8, s);
+        out.models = try gpa.alloc(ProviderModel, self.models.len);
+        for (self.models, 0..) |model, index| out.models[index] = try model.clone(gpa);
+        return out;
+    }
+};
+
 pub const Config = struct {
     provider: ?Provider = null,
     base_url: ?[]u8 = null,
     api_key: ?[]u8 = null,
     model: ?Model = null,
+    providers: []ProviderConfig = &.{},
     use_responses_endpoint: ?bool = null,
     enable_thinking: ?bool = null,
     system_prompt: ?[]u8 = null,
@@ -104,6 +143,8 @@ pub const Config = struct {
         if (self.base_url) |s| gpa.free(s);
         if (self.api_key) |s| gpa.free(s);
         if (self.model) |*m| m.deinit(gpa);
+        for (self.providers) |*provider| provider.deinit(gpa);
+        gpa.free(self.providers);
         if (self.system_prompt) |s| gpa.free(s);
         self.* = undefined;
     }
@@ -118,6 +159,8 @@ pub const Config = struct {
         if (self.base_url) |s| out.base_url = try gpa.dupe(u8, s);
         if (self.api_key) |s| out.api_key = try gpa.dupe(u8, s);
         if (self.model) |m| out.model = try m.clone(gpa);
+        out.providers = try gpa.alloc(ProviderConfig, self.providers.len);
+        for (self.providers, 0..) |provider, index| out.providers[index] = try provider.clone(gpa);
         if (self.system_prompt) |s| out.system_prompt = try gpa.dupe(u8, s);
         return out;
     }
@@ -225,9 +268,62 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config, 
         if (updates.api_key) |s| try replaceOptionalSlice(gpa, &target.api_key, s);
     }
     if (updates.system_prompt) |s| try replaceOptionalSlice(gpa, &target.system_prompt, s);
+    for (updates.providers) |provider| try applyProviderOverlay(gpa, target, provider);
     if (updates.model) |m| {
         if (target.model) |*old| old.deinit(gpa);
         target.model = try m.clone(gpa);
+        try hydrateActiveModel(gpa, target);
+    }
+}
+
+fn applyProviderOverlay(gpa: std.mem.Allocator, target: *Config, updates: ProviderConfig) !void {
+    for (target.providers, 0..) |*provider, index| {
+        if (provider.provider != updates.provider) continue;
+        if (updates.base_url) |s| try replaceOptionalSlice(gpa, &provider.base_url, s);
+        try applyProviderModelsOverlay(gpa, provider, updates.models);
+        target.providers[index] = provider.*;
+        return;
+    }
+
+    const next = if (target.providers.len == 0)
+        try gpa.alloc(ProviderConfig, 1)
+    else
+        try gpa.realloc(target.providers, target.providers.len + 1);
+    target.providers = next;
+    target.providers[target.providers.len - 1] = try updates.clone(gpa);
+}
+
+fn applyProviderModelsOverlay(gpa: std.mem.Allocator, target: *ProviderConfig, updates: []const ProviderModel) !void {
+    for (updates) |update| {
+        var replaced = false;
+        for (target.models) |*model| {
+            if (!std.mem.eql(u8, model.id, update.id)) continue;
+            model.reasoning_effort = update.reasoning_effort;
+            replaced = true;
+            break;
+        }
+        if (replaced) continue;
+        const next = if (target.models.len == 0)
+            try gpa.alloc(ProviderModel, 1)
+        else
+            try gpa.realloc(target.models, target.models.len + 1);
+        target.models = next;
+        target.models[target.models.len - 1] = try update.clone(gpa);
+    }
+}
+
+fn hydrateActiveModel(gpa: std.mem.Allocator, config: *Config) !void {
+    const provider = config.provider orelse return;
+    if (config.model == null) return;
+    for (config.providers) |entry| {
+        if (entry.provider != provider) continue;
+        if (entry.base_url) |base_url| try replaceOptionalSlice(gpa, &config.base_url, base_url);
+        for (entry.models) |model| {
+            if (!std.mem.eql(u8, model.id, config.model.?.id)) continue;
+            config.model.?.reasoning_effort = model.reasoning_effort;
+            return;
+        }
+        return;
     }
 }
 
@@ -313,15 +409,19 @@ fn parseObject(
     var out: Config = .{};
     errdefer out.deinit(gpa);
 
-    if (stringField(value, "provider")) |s| {
-        if (providers_by_name.get(s)) |p| {
-            out.provider = p;
-        } else {
+    if (stringField(value, "model")) |s| {
+        if (parseModelSelection(gpa, s)) |selection| {
+            out.provider = selection.provider;
+            out.model = selection.model;
+        } else |err| {
             try diagnostics.append(gpa, .{ .config_parse_error = .{
                 .path = try gpa.dupe(u8, path),
-                .reason = try std.fmt.allocPrint(gpa, "unknown provider '{s}'", .{s}),
+                .reason = try std.fmt.allocPrint(gpa, "invalid model selection: {s}", .{@errorName(err)}),
             } });
         }
+    }
+    if (value.object.get("providers")) |providers_value| {
+        if (providers_value == .object) out.providers = try parseProviders(gpa, providers_value);
     }
     if (stringField(value, "base_url")) |s| {
         out.base_url = try gpa.dupe(u8, s);
@@ -331,18 +431,50 @@ fn parseObject(
     if (stringField(value, "system_prompt")) |s| {
         out.system_prompt = try gpa.dupe(u8, s);
     }
-    if (value.object.get("model")) |model_value| {
-        if (model_value == .object) {
-            if (stringField(model_value, "id")) |id| {
-                var model: Model = .{ .id = try gpa.dupe(u8, id) };
-                if (stringField(model_value, "reasoningEffort")) |effort| {
-                    model.reasoning_effort = reasoning_efforts_by_name.get(effort);
-                }
-                out.model = model;
-            }
-        }
+    try hydrateActiveModel(gpa, &out);
+    return out;
+}
+
+fn parseProviders(gpa: std.mem.Allocator, value: std.json.Value) ![]ProviderConfig {
+    var providers: std.ArrayList(ProviderConfig) = .empty;
+    errdefer {
+        for (providers.items) |*provider| provider.deinit(gpa);
+        providers.deinit(gpa);
+    }
+    var iterator = value.object.iterator();
+    while (iterator.next()) |entry| {
+        const provider = providers_by_name.get(entry.key_ptr.*) orelse continue;
+        if (entry.value_ptr.* != .object) continue;
+        try providers.append(gpa, try parseProviderConfig(gpa, provider, entry.value_ptr.*));
+    }
+    return try providers.toOwnedSlice(gpa);
+}
+
+fn parseProviderConfig(gpa: std.mem.Allocator, provider: Provider, value: std.json.Value) !ProviderConfig {
+    var out: ProviderConfig = .{ .provider = provider };
+    errdefer out.deinit(gpa);
+    if (stringField(value, "base_url")) |s| out.base_url = try gpa.dupe(u8, s);
+    if (value.object.get("models")) |models_value| {
+        if (models_value == .object) out.models = try parseProviderModels(gpa, models_value);
     }
     return out;
+}
+
+fn parseProviderModels(gpa: std.mem.Allocator, value: std.json.Value) ![]ProviderModel {
+    var models: std.ArrayList(ProviderModel) = .empty;
+    errdefer {
+        for (models.items) |*model| model.deinit(gpa);
+        models.deinit(gpa);
+    }
+    var iterator = value.object.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        try models.append(gpa, .{
+            .id = try gpa.dupe(u8, entry.key_ptr.*),
+            .reasoning_effort = if (stringField(entry.value_ptr.*, "reasoningEffort")) |effort| reasoning_efforts_by_name.get(effort) else null,
+        });
+    }
+    return try models.toOwnedSlice(gpa);
 }
 
 fn loadEnv(
@@ -362,7 +494,7 @@ fn loadEnv(
         out.enable_thinking = parseBool(s);
     }
     if (env.get("OPENAI_MODEL")) |raw| {
-        if (parseEnvModel(gpa, raw)) |parsed| {
+        if (parseModelSelection(gpa, raw)) |parsed| {
             out.provider = parsed.provider;
             out.model = parsed.model;
         } else |_| {
@@ -372,17 +504,17 @@ fn loadEnv(
     return out;
 }
 
-const EnvModel = struct {
+const ModelSelection = struct {
     provider: Provider,
     model: Model,
 };
 
-fn parseEnvModel(gpa: std.mem.Allocator, raw: []const u8) !EnvModel {
+fn parseModelSelection(gpa: std.mem.Allocator, raw: []const u8) !ModelSelection {
     const slash = std.mem.indexOfScalar(u8, raw, '/') orelse return error.MissingSeparator;
     const provider_part = raw[0..slash];
     const model_part = raw[slash + 1 ..];
+    if (provider_part.len == 0) return error.MissingProvider;
     if (model_part.len == 0) return error.MissingModel;
-    if (std.mem.indexOfScalar(u8, model_part, '/') != null) return error.TooManySeparators;
     const provider = providers_by_name.get(provider_part) orelse return error.UnknownProvider;
     return .{
         .provider = provider,
@@ -433,7 +565,7 @@ pub fn writeGlobal(
 
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try serialize(&payload.writer, config);
+    try serialize(gpa, &payload.writer, config);
 
     {
         var file = try std.Io.Dir.createFile(.cwd(), io, tmp_path, .{ .truncate = true });
@@ -470,16 +602,73 @@ pub fn mergeAndWriteGlobal(
     try writeGlobal(gpa, io, home_dir, current);
 }
 
-fn serialize(writer: *std.Io.Writer, config: Config) !void {
+pub fn readProject(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) !Config {
+    const path = try projectConfigPath(gpa, cwd);
+    defer gpa.free(path);
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    return loadFile(gpa, io, path, &sink);
+}
+
+pub fn writeProject(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    config: Config,
+) !void {
+    const path = try projectConfigPath(gpa, cwd);
+    defer gpa.free(path);
+
+    const dirname = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    try std.Io.Dir.createDirPath(.cwd(), io, dirname);
+
+    const tmp_path = try std.fmt.allocPrint(gpa, "{s}.tmp", .{path});
+    defer gpa.free(tmp_path);
+
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try serialize(gpa, &payload.writer, config);
+
+    {
+        var file = try std.Io.Dir.createFile(.cwd(), io, tmp_path, .{ .truncate = true });
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try writer.interface.writeAll(payload.written());
+        try writer.interface.flush();
+    }
+
+    try std.Io.Dir.rename(.cwd(), tmp_path, .cwd(), path, io);
+}
+
+pub fn mergeAndWriteProject(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    updates: Config,
+) !void {
+    var current = try readProject(gpa, io, cwd);
+    defer current.deinit(gpa);
+    try applyConfigOverlay(gpa, &current, updates, false);
+    try writeProject(gpa, io, cwd, current);
+}
+
+pub fn projectConfigExists(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) bool {
+    const path = projectConfigPath(gpa, cwd) catch return false;
+    defer gpa.free(path);
+    std.Io.Dir.access(.cwd(), io, path, .{}) catch return false;
+    return true;
+}
+
+fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !void {
     try writer.writeByte('{');
     var wrote_any = false;
     if (config.provider) |p| {
         try writeKey(writer, "provider", &wrote_any);
         try std.json.Stringify.value(p.label(), .{}, writer);
-    }
-    if (config.base_url) |s| {
-        try writeKey(writer, "base_url", &wrote_any);
-        try std.json.Stringify.value(s, .{}, writer);
     }
     if (config.use_responses_endpoint) |b| {
         try writeKey(writer, "use_responses_endpoint", &wrote_any);
@@ -490,20 +679,72 @@ fn serialize(writer: *std.Io.Writer, config: Config) !void {
         try writer.writeAll(if (b) "true" else "false");
     }
     if (config.model) |m| {
-        try writeKey(writer, "model", &wrote_any);
-        try writer.writeAll("{\"id\":");
-        try std.json.Stringify.value(m.id, .{}, writer);
-        if (m.reasoning_effort) |effort| {
-            try writer.writeAll(",\"reasoningEffort\":");
-            try std.json.Stringify.value(effort.label(), .{}, writer);
+        if (config.provider) |provider| {
+            try writeKey(writer, "model", &wrote_any);
+            try writeModelSelection(gpa, writer, provider, m.id);
         }
-        try writer.writeByte('}');
+    }
+    if (config.providers.len > 0) {
+        try writeKey(writer, "providers", &wrote_any);
+        try writeProviders(writer, config.providers);
     }
     if (config.system_prompt) |s| {
         try writeKey(writer, "system_prompt", &wrote_any);
         try std.json.Stringify.value(s, .{}, writer);
     }
     try writer.writeAll("}\n");
+}
+
+fn writeModelSelection(gpa: std.mem.Allocator, writer: *std.Io.Writer, provider: Provider, model_id: []const u8) !void {
+    const selection = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ provider.label(), model_id });
+    defer gpa.free(selection);
+    try std.json.Stringify.value(selection, .{}, writer);
+}
+
+fn writeProviders(writer: *std.Io.Writer, providers: []const ProviderConfig) !void {
+    try writer.writeByte('{');
+    var wrote_provider = false;
+    for (providers) |provider| {
+        if (wrote_provider) try writer.writeByte(',');
+        try std.json.Stringify.value(provider.provider.label(), .{}, writer);
+        try writer.writeByte(':');
+        try writeProvider(writer, provider);
+        wrote_provider = true;
+    }
+    try writer.writeByte('}');
+}
+
+fn writeProvider(writer: *std.Io.Writer, provider: ProviderConfig) !void {
+    try writer.writeByte('{');
+    var wrote_any = false;
+    if (provider.base_url) |base_url| {
+        try writeKey(writer, "base_url", &wrote_any);
+        try std.json.Stringify.value(base_url, .{}, writer);
+    }
+    if (provider.models.len > 0) {
+        try writeKey(writer, "models", &wrote_any);
+        try writeProviderModels(writer, provider.models);
+    }
+    try writer.writeByte('}');
+}
+
+fn writeProviderModels(writer: *std.Io.Writer, models: []const ProviderModel) !void {
+    try writer.writeByte('{');
+    var wrote_model = false;
+    for (models) |model| {
+        if (wrote_model) try writer.writeByte(',');
+        try std.json.Stringify.value(model.id, .{}, writer);
+        try writer.writeByte(':');
+        try writer.writeByte('{');
+        if (model.reasoning_effort) |effort| {
+            try std.json.Stringify.value("reasoningEffort", .{}, writer);
+            try writer.writeByte(':');
+            try std.json.Stringify.value(effort.label(), .{}, writer);
+        }
+        try writer.writeByte('}');
+        wrote_model = true;
+    }
+    try writer.writeByte('}');
 }
 
 fn writeKey(writer: *std.Io.Writer, name: []const u8, wrote_any: *bool) !void {
@@ -516,6 +757,11 @@ fn writeKey(writer: *std.Io.Writer, name: []const u8, wrote_any: *bool) !void {
 fn globalConfigPath(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
     if (home_dir.len == 0) return error.HomeNotSet;
     return std.fs.path.join(gpa, &.{ home_dir, ".nova", "config.json" });
+}
+
+fn projectConfigPath(gpa: std.mem.Allocator, cwd: []const u8) ![]u8 {
+    if (cwd.len == 0) return error.InvalidPath;
+    return std.fs.path.join(gpa, &.{ cwd, ".nova", "config.json" });
 }
 
 const TestEnv = struct {
@@ -547,40 +793,43 @@ test "Provider.adapter returns null for unimplemented anthropic" {
     try std.testing.expectEqual(@as(?AdapterKind, null), Provider.anthropic.adapter());
 }
 
-test "parseEnvModel: valid <provider>/<model>" {
+test "parseModelSelection: valid <provider>/<model>" {
     const gpa = std.testing.allocator;
-    var parsed = try parseEnvModel(gpa, "openai/gpt-5.5");
+    var parsed = try parseModelSelection(gpa, "openai/gpt-5.5");
     defer parsed.model.deinit(gpa);
     try std.testing.expectEqual(Provider.openai, parsed.provider);
     try std.testing.expectEqualStrings("gpt-5.5", parsed.model.id);
 }
 
-test "parseEnvModel: ollama/llama3.1:8b" {
+test "parseModelSelection: ollama/llama3.1:8b" {
     const gpa = std.testing.allocator;
-    var parsed = try parseEnvModel(gpa, "ollama/llama3.1:8b");
+    var parsed = try parseModelSelection(gpa, "ollama/llama3.1:8b");
     defer parsed.model.deinit(gpa);
     try std.testing.expectEqual(Provider.ollama, parsed.provider);
     try std.testing.expectEqualStrings("llama3.1:8b", parsed.model.id);
 }
 
-test "parseEnvModel: missing slash is error" {
+test "parseModelSelection: missing slash is error" {
     const gpa = std.testing.allocator;
-    try std.testing.expectError(error.MissingSeparator, parseEnvModel(gpa, "gpt-5.5"));
+    try std.testing.expectError(error.MissingSeparator, parseModelSelection(gpa, "gpt-5.5"));
 }
 
-test "parseEnvModel: too many slashes is error" {
+test "parseModelSelection: model id may contain slashes" {
     const gpa = std.testing.allocator;
-    try std.testing.expectError(error.TooManySeparators, parseEnvModel(gpa, "openai_compatible/anthropic/claude-3.7-sonnet"));
+    var parsed = try parseModelSelection(gpa, "openrouter/anthropic/claude-3.7-sonnet");
+    defer parsed.model.deinit(gpa);
+    try std.testing.expectEqual(Provider.openrouter, parsed.provider);
+    try std.testing.expectEqualStrings("anthropic/claude-3.7-sonnet", parsed.model.id);
 }
 
-test "parseEnvModel: unknown provider is error" {
+test "parseModelSelection: unknown provider is error" {
     const gpa = std.testing.allocator;
-    try std.testing.expectError(error.UnknownProvider, parseEnvModel(gpa, "mystery/foo"));
+    try std.testing.expectError(error.UnknownProvider, parseModelSelection(gpa, "mystery/foo"));
 }
 
-test "parseEnvModel: anthropic parses (validity checked downstream)" {
+test "parseModelSelection: anthropic parses (validity checked downstream)" {
     const gpa = std.testing.allocator;
-    var parsed = try parseEnvModel(gpa, "anthropic/claude-3.7-sonnet");
+    var parsed = try parseModelSelection(gpa, "anthropic/claude-3.7-sonnet");
     defer parsed.model.deinit(gpa);
     try std.testing.expectEqual(Provider.anthropic, parsed.provider);
 }
@@ -589,7 +838,7 @@ test "parseObject: minimal config" {
     const gpa = std.testing.allocator;
     var sink: std.ArrayList(Diagnostic) = .empty;
     defer sink.deinit(gpa);
-    var cfg = try parseFile(gpa, "<test>", "{\"provider\":\"ollama\",\"model\":{\"id\":\"llama3.1:8b\"}}", &sink);
+    var cfg = try parseFile(gpa, "<test>", "{\"model\":\"ollama/llama3.1:8b\"}", &sink);
     defer cfg.deinit(gpa);
     try std.testing.expectEqual(Provider.ollama, cfg.provider.?);
     try std.testing.expectEqualStrings("llama3.1:8b", cfg.model.?.id);
@@ -600,7 +849,7 @@ test "parseObject: model with reasoningEffort" {
     const gpa = std.testing.allocator;
     var sink: std.ArrayList(Diagnostic) = .empty;
     defer sink.deinit(gpa);
-    var cfg = try parseFile(gpa, "<test>", "{\"provider\":\"openai\",\"model\":{\"id\":\"gpt-5.5\",\"reasoningEffort\":\"high\"}}", &sink);
+    var cfg = try parseFile(gpa, "<test>", "{\"model\":\"openai/gpt-5.5\",\"providers\":{\"openai\":{\"models\":{\"gpt-5.5\":{\"reasoningEffort\":\"high\"}}}}}", &sink);
     defer cfg.deinit(gpa);
     try std.testing.expectEqual(ai.ReasoningEffort.high, cfg.model.?.reasoning_effort.?);
 }
@@ -612,7 +861,7 @@ test "parseObject: unknown provider records diagnostic" {
         for (sink.items) |*d| d.deinit(gpa);
         sink.deinit(gpa);
     }
-    var cfg = try parseFile(gpa, "<test>", "{\"provider\":\"mystery\"}", &sink);
+    var cfg = try parseFile(gpa, "<test>", "{\"model\":\"mystery/foo\"}", &sink);
     defer cfg.deinit(gpa);
     try std.testing.expectEqual(@as(?Provider, null), cfg.provider);
     try std.testing.expectEqual(@as(usize, 1), sink.items.len);
@@ -722,38 +971,52 @@ test "loadEnv: NOVA_USE_RESPONSES_ENDPOINT parses bools" {
 
 test "serialize: skips api_key even if present" {
     const gpa = std.testing.allocator;
+    var provider_models = try gpa.alloc(ProviderModel, 1);
+    provider_models[0] = .{ .id = try gpa.dupe(u8, "gpt-5.5"), .reasoning_effort = .medium };
+    var providers = try gpa.alloc(ProviderConfig, 1);
+    providers[0] = .{ .provider = .openai, .models = provider_models };
     var cfg: Config = .{
         .provider = .openai,
         .api_key = try gpa.dupe(u8, "sk-should-never-appear"),
         .model = .{ .id = try gpa.dupe(u8, "gpt-5.5"), .reasoning_effort = .medium },
+        .providers = providers,
     };
     defer cfg.deinit(gpa);
 
     var buf: std.Io.Writer.Allocating = .init(gpa);
     defer buf.deinit();
-    try serialize(&buf.writer, cfg);
+    try serialize(gpa, &buf.writer, cfg);
 
     try std.testing.expect(std.mem.indexOf(u8, buf.written(), "api_key") == null);
     try std.testing.expect(std.mem.indexOf(u8, buf.written(), "sk-should-never-appear") == null);
-    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"provider\":\"openai\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"id\":\"gpt-5.5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"model\":\"openai/gpt-5.5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"openai\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"reasoningEffort\":\"medium\"") != null);
 }
 
 test "serialize then parse roundtrips" {
     const gpa = std.testing.allocator;
+    var provider_models = try gpa.alloc(ProviderModel, 1);
+    provider_models[0] = .{ .id = try gpa.dupe(u8, "llama3.1:8b") };
+    var providers = try gpa.alloc(ProviderConfig, 1);
+    providers[0] = .{
+        .provider = .ollama,
+        .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
+        .models = provider_models,
+    };
     var original: Config = .{
         .provider = .ollama,
         .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
         .use_responses_endpoint = false,
         .enable_thinking = true,
         .model = .{ .id = try gpa.dupe(u8, "llama3.1:8b") },
+        .providers = providers,
     };
     defer original.deinit(gpa);
 
     var buf: std.Io.Writer.Allocating = .init(gpa);
     defer buf.deinit();
-    try serialize(&buf.writer, original);
+    try serialize(gpa, &buf.writer, original);
 
     var sink: std.ArrayList(Diagnostic) = .empty;
     defer sink.deinit(gpa);
