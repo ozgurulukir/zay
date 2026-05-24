@@ -14,6 +14,7 @@ const agent_worker = @import("tui/agent_worker.zig");
 const tool_policy = @import("tui/tool_policy.zig");
 const tui_metrics = @import("tui/metrics.zig");
 const tui_message = @import("tui/message_widget.zig");
+const tui_provider = @import("tui/provider_controller.zig");
 const tui_status = @import("tui/status.zig");
 const tui_style = @import("tui/style.zig");
 
@@ -124,7 +125,7 @@ pub const App = struct {
         var app = init(io, gpa, &runtime.agent);
         app.runtime = runtime;
         app.owns_runtime = true;
-        app.codex_signed_in = runtime.owned_codex_responses != null or detectCodexSignIn(gpa, io, runtime.home_dir);
+        app.codex_signed_in = runtime.hasCodexClient() or tui_provider.detectCodexSignIn(gpa, io, runtime.home_dir);
         app.cached_config = config;
         app.cached_config_owned = true;
         app.hydrateCustomProviderFromAuth() catch |err| {
@@ -177,7 +178,7 @@ pub const App = struct {
             if (self.cached_config.api_key) |old| self.gpa.free(old);
             self.cached_config.api_key = try self.gpa.dupe(u8, custom.api_key);
             if (self.cached_config.provider == null) {
-                if (self.cached_config.base_url) |base_url| self.cached_config.provider = compatibleProviderFromBaseUrl(base_url);
+                if (self.cached_config.base_url) |base_url| self.cached_config.provider = tui_provider.compatibleProviderFromBaseUrl(base_url);
             }
         }
     }
@@ -374,12 +375,15 @@ pub const App = struct {
 
     fn applyContentDelta(self: *App, delta: []const u8) !void {
         if (delta.len == 0) return;
+        const selected = self.thread.selected;
         if (self.agent_index) |index| {
             try self.thread.appendAgentDelta(self.gpa, index, delta);
         } else {
             self.agent_index = try self.thread.append(self.gpa, .agent, "agent", delta);
         }
-        if (!self.tool_seen_in_response) {
+        if (self.tool_seen_in_response) {
+            if (selected) |index| self.thread.select(index);
+        } else {
             self.selectGeneratedMessage(self.agent_index.?);
         }
     }
@@ -439,6 +443,7 @@ pub const App = struct {
             visible_change = true;
         }
         self.tool_seen_in_response = true;
+        self.agent_index = null;
         return loading_removed or visible_change;
     }
 
@@ -459,6 +464,7 @@ pub const App = struct {
         self.thread.messages.items[index].tool_render = policy.render;
         self.selectGeneratedMessage(index);
         self.tool_seen_in_response = true;
+        self.agent_index = null;
         return existing_index == null or visible_before or policy.expand_by_default != was_expanded;
     }
 
@@ -850,7 +856,7 @@ pub const App = struct {
             self.cached_config_owned = true;
         }
         if (self.cached_config.model) |*old| old.deinit(self.gpa);
-        self.cached_config.provider = compatibleProviderFromBaseUrl(self.custom_base_url.items);
+        self.cached_config.provider = tui_provider.compatibleProviderFromBaseUrl(self.custom_base_url.items);
         self.cached_config.base_url = base_url;
         self.cached_config.api_key = api_key;
         self.cached_config.model = null;
@@ -859,7 +865,7 @@ pub const App = struct {
             .api_key = self.custom_api_key.items,
         });
         var updates: config_mod.Config = .{
-            .provider = compatibleProviderFromBaseUrl(self.custom_base_url.items),
+            .provider = tui_provider.compatibleProviderFromBaseUrl(self.custom_base_url.items),
             .base_url = try self.gpa.dupe(u8, self.custom_base_url.items),
         };
         defer updates.deinit(self.gpa);
@@ -905,7 +911,7 @@ pub const App = struct {
                 const base_url = self.cached_config.base_url.?;
                 const api_key = self.cached_config.api_key.?;
                 try self.attachOpenAiCompatibleClient(base_url, api_key, model.id);
-                const provider = compatibleProviderFromBaseUrl(base_url);
+                const provider = tui_provider.compatibleProviderFromBaseUrl(base_url);
                 try self.persistModelSelection(provider, model.id, effort);
             },
         }
@@ -1034,11 +1040,7 @@ pub const App = struct {
     }
 
     fn hasOpenAICompatibleCredentials(self: *const App) bool {
-        const base_url = self.cached_config.base_url orelse return false;
-        const api_key = self.cached_config.api_key orelse return false;
-        if (base_url.len == 0) return false;
-        if (api_key.len == 0) return false;
-        return true;
+        return tui_provider.hasOpenAICompatibleCredentials(self.cached_config);
     }
 
     fn selectedReasoningIndex(self: *const App) u32 {
@@ -1300,23 +1302,8 @@ fn previousIndex(current: u32, count: u32) u32 {
     return current - 1;
 }
 
-fn detectCodexSignIn(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) bool {
-    if (home_dir.len == 0) return false;
-    var credentials = (codex.load(gpa, io, home_dir) catch null) orelse return false;
-    credentials.deinit(gpa);
-    return true;
-}
-
 fn providerOptionCount() u32 {
     return 2;
-}
-
-fn compatibleProviderFromBaseUrl(base_url: []const u8) config_mod.Provider {
-    if (std.mem.indexOf(u8, base_url, "localhost:11434") != null) return .ollama;
-    if (std.mem.indexOf(u8, base_url, "127.0.0.1:11434") != null) return .ollama;
-    if (std.mem.indexOf(u8, base_url, "localhost:8080") != null) return .llama_cpp;
-    if (std.mem.indexOf(u8, base_url, "127.0.0.1:8080") != null) return .llama_cpp;
-    return .openai_compatible;
 }
 
 fn nextProviderColumn(current: App.ProviderColumn) App.ProviderColumn {
@@ -2548,16 +2535,11 @@ test "codex sign-in survives selecting custom provider" {
     runtime.agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer runtime.agent.deinit();
     runtime.diagnostics = &.{};
-    runtime.owned_codex_responses = null;
-    runtime.owned_openai_compatible = null;
-    runtime.owned_openai_responses = null;
+    runtime.owned_client = null;
     var app = App.init(std.testing.io, gpa, &runtime.agent);
     app.runtime = &runtime;
     defer app.deinit();
-    defer if (runtime.owned_openai_compatible) |client| {
-        client.deinit();
-        gpa.destroy(client);
-    };
+    defer runtime.disconnectClient();
 
     app.codex_signed_in = true;
     try app.codex_models.append(gpa, .{ .id = try gpa.dupe(u8, "llama3"), .label = try gpa.dupe(u8, "llama3") });
@@ -2608,13 +2590,6 @@ test "explicit codex catalog loads before runtime is connected" {
     try std.testing.expect(app.codex_models.items.len > 0);
     try std.testing.expectEqual(app.codex_models.items.len, app.model_reasoning.items.len);
     try std.testing.expect(app.selectedCodexModel() != null);
-}
-
-test "compatible provider is inferred from base url" {
-    try std.testing.expectEqual(config_mod.Provider.ollama, compatibleProviderFromBaseUrl("http://localhost:11434/v1"));
-    try std.testing.expectEqual(config_mod.Provider.ollama, compatibleProviderFromBaseUrl("http://127.0.0.1:11434/v1"));
-    try std.testing.expectEqual(config_mod.Provider.llama_cpp, compatibleProviderFromBaseUrl("http://localhost:8080/v1"));
-    try std.testing.expectEqual(config_mod.Provider.openai_compatible, compatibleProviderFromBaseUrl("https://example.com/v1"));
 }
 
 test "picker secondary column keeps related options close" {
@@ -3293,8 +3268,9 @@ test "content delta after tool preview does not move selection away from tool ro
         .display_body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
     } }));
     try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
-    try std.testing.expectEqualStrings("I will check. Still checking.", app.thread.messages.items[1].body);
+    try std.testing.expectEqualStrings("I will check.", app.thread.messages.items[1].body);
     try std.testing.expectEqualStrings("$ pwd", app.thread.messages.items[2].title);
+    try std.testing.expectEqualStrings(" Still checking.", app.thread.messages.items[3].body);
 }
 
 test "collapsed thinking and tool rows have stable heights" {
