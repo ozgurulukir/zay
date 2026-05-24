@@ -19,7 +19,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     if (loggerEnabledFromEnv(init.environ_map)) {
         if (resolveLogPath(gpa, init.environ_map)) |log_path| {
             defer gpa.free(log_path);
-            logger.init(.{ .io = init.io, .log_path = log_path }) catch {};
+            try logger.init(.{ .io = init.io, .log_path = log_path });
         } else |_| {}
     }
     defer logger.deinit();
