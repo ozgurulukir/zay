@@ -377,6 +377,7 @@ pub const StreamState = struct {
     }
 
     pub fn finish(self: *StreamState, gpa: std.mem.Allocator, call_seq: *u64) !ai.Turn {
+        if (!self.completed) return error.ResponseIncomplete;
         try syncToolBlocks(gpa, &self.blocks, self.tools.items, call_seq);
         const content = try self.blocks.toOwnedSlice(gpa);
         self.blocks = .empty;
@@ -390,24 +391,70 @@ fn processEvent(gpa: std.mem.Allocator, data: []const u8, blocks: *std.ArrayList
     if (parsed.value != .object) return;
     const type_value = parsed.value.object.get("type") orelse return;
     if (type_value != .string) return;
-    const event_type = type_value.string;
-    if (std.mem.eql(u8, event_type, "error")) return error.ProviderError;
-    if (std.mem.eql(u8, event_type, "response.failed")) return error.ProviderError;
-    if (std.mem.eql(u8, event_type, "response.completed")) {
-        completed.* = true;
+    const event_type = responseEventFromString(type_value.string) orelse {
+        logger.log("responses.response.ignored_event type={s}", .{type_value.string});
         return;
+    };
+    switch (event_type) {
+        .provider_error => return error.ProviderError,
+        .completed => {
+            completed.* = true;
+            return;
+        },
+        .output_item_added => return onItemAdded(gpa, parsed.value, blocks, tools, call_seq),
+        .content_part_added => return onContentPartAdded(gpa, parsed.value, blocks),
+        .output_text_delta => return onTextDelta(gpa, parsed.value, blocks, observer),
+        .refusal_delta => return onTextDelta(gpa, parsed.value, blocks, observer),
+        .reasoning_text_delta => return onReasoningDelta(gpa, parsed.value, blocks, observer),
+        .reasoning_summary_text_delta => return onReasoningDelta(gpa, parsed.value, blocks, observer),
+        .reasoning_summary_part_done => return onReasoningSummaryPartDone(gpa, blocks, observer),
+        .function_call_arguments_delta => return onArgumentsDelta(gpa, parsed.value, blocks, tools, observer),
+        .function_call_arguments_done => return onArgumentsDone(gpa, parsed.value, blocks, tools, observer),
+        .output_item_done => return onItemDone(gpa, parsed.value, blocks, tools, observer),
     }
-    if (std.mem.eql(u8, event_type, "response.output_item.added")) return onItemAdded(gpa, parsed.value, blocks, tools, call_seq);
-    if (std.mem.eql(u8, event_type, "response.content_part.added")) return onContentPartAdded(gpa, parsed.value, blocks);
-    if (std.mem.eql(u8, event_type, "response.output_text.delta")) return onTextDelta(gpa, parsed.value, blocks, observer);
-    if (std.mem.eql(u8, event_type, "response.refusal.delta")) return onTextDelta(gpa, parsed.value, blocks, observer);
-    if (std.mem.eql(u8, event_type, "response.reasoning_text.delta")) return onReasoningDelta(gpa, parsed.value, blocks, observer);
-    if (std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta")) return onReasoningDelta(gpa, parsed.value, blocks, observer);
-    if (std.mem.eql(u8, event_type, "response.reasoning_summary_part.done")) return onReasoningSummaryPartDone(gpa, blocks, observer);
-    if (std.mem.eql(u8, event_type, "response.function_call_arguments.delta")) return onArgumentsDelta(gpa, parsed.value, blocks, tools, observer);
-    if (std.mem.eql(u8, event_type, "response.function_call_arguments.done")) return onArgumentsDone(gpa, parsed.value, blocks, tools, observer);
-    if (std.mem.eql(u8, event_type, "response.output_item.done")) return onItemDone(gpa, parsed.value, blocks, tools, observer);
-    logger.log("responses.response.ignored_event type={s}", .{event_type});
+}
+
+const ResponseEvent = enum {
+    provider_error,
+    completed,
+    output_item_added,
+    content_part_added,
+    output_text_delta,
+    refusal_delta,
+    reasoning_text_delta,
+    reasoning_summary_text_delta,
+    reasoning_summary_part_done,
+    function_call_arguments_delta,
+    function_call_arguments_done,
+    output_item_done,
+};
+
+const ResponseEventSpec = struct {
+    name: []const u8,
+    event: ResponseEvent,
+};
+
+const response_event_specs = [_]ResponseEventSpec{
+    .{ .name = "error", .event = .provider_error },
+    .{ .name = "response.failed", .event = .provider_error },
+    .{ .name = "response.completed", .event = .completed },
+    .{ .name = "response.output_item.added", .event = .output_item_added },
+    .{ .name = "response.content_part.added", .event = .content_part_added },
+    .{ .name = "response.output_text.delta", .event = .output_text_delta },
+    .{ .name = "response.refusal.delta", .event = .refusal_delta },
+    .{ .name = "response.reasoning_text.delta", .event = .reasoning_text_delta },
+    .{ .name = "response.reasoning_summary_text.delta", .event = .reasoning_summary_text_delta },
+    .{ .name = "response.reasoning_summary_part.done", .event = .reasoning_summary_part_done },
+    .{ .name = "response.function_call_arguments.delta", .event = .function_call_arguments_delta },
+    .{ .name = "response.function_call_arguments.done", .event = .function_call_arguments_done },
+    .{ .name = "response.output_item.done", .event = .output_item_done },
+};
+
+fn responseEventFromString(name: []const u8) ?ResponseEvent {
+    for (response_event_specs) |spec| {
+        if (std.mem.eql(u8, name, spec.name)) return spec.event;
+    }
+    return null;
 }
 
 fn onItemAdded(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), tools: *std.ArrayList(ToolBuilder), call_seq: *u64) !void {
@@ -773,6 +820,7 @@ test "openresponses emits final item text when no delta arrived" {
     var call_seq: u64 = 0;
     try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}", observer, &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}}", observer, &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.completed\"}", observer, &call_seq);
 
     var turn = try state.finish(gpa, &call_seq);
     defer turn.deinit(gpa);
@@ -793,6 +841,7 @@ test "openresponses preserves text tool text block order" {
     try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.done\",\"output_index\":1,\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}", ai.StreamObserver.noop, &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}", ai.StreamObserver.noop, &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.output_text.delta\",\"delta\":\"after\"}", ai.StreamObserver.noop, &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.completed\"}", ai.StreamObserver.noop, &call_seq);
 
     var turn = try state.finish(gpa, &call_seq);
     defer turn.deinit(gpa);
@@ -815,6 +864,7 @@ test "openresponses routes parallel argument deltas by output index" {
     try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"path\\\":\"}", ai.StreamObserver.noop, &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"\\\"pwd\\\"}\"}", ai.StreamObserver.noop, &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"\\\"src/main.zig\\\"}\"}", ai.StreamObserver.noop, &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.completed\"}", ai.StreamObserver.noop, &call_seq);
 
     var turn = try state.finish(gpa, &call_seq);
     defer turn.deinit(gpa);

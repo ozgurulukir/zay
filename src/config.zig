@@ -21,46 +21,18 @@ pub const Provider = enum {
     openrouter,
     anthropic,
 
-    pub fn fromString(s: []const u8) ?Provider {
-        if (std.mem.eql(u8, s, "openai")) return .openai;
-        if (std.mem.eql(u8, s, "openai_compatible")) return .openai_compatible;
-        if (std.mem.eql(u8, s, "ollama")) return .ollama;
-        if (std.mem.eql(u8, s, "llama.cpp")) return .llama_cpp;
-        if (std.mem.eql(u8, s, "openrouter")) return .openrouter;
-        if (std.mem.eql(u8, s, "anthropic")) return .anthropic;
-        return null;
-    }
-
     pub fn label(self: Provider) []const u8 {
-        return switch (self) {
-            .openai => "openai",
-            .openai_compatible => "openai_compatible",
-            .ollama => "ollama",
-            .llama_cpp => "llama.cpp",
-            .openrouter => "openrouter",
-            .anthropic => "anthropic",
-        };
+        return providerSpec(self).label;
     }
 
     /// Default base_url for this Provider. `null` means the user MUST
     /// supply one (e.g. raw `openai_compatible` and `anthropic`).
     pub fn defaultBaseUrl(self: Provider) ?[]const u8 {
-        return switch (self) {
-            .openai => "https://chatgpt.com/backend-api",
-            .openai_compatible => null,
-            .ollama => "http://localhost:11434",
-            .llama_cpp => "http://localhost:8080",
-            .openrouter => "https://openrouter.ai/api",
-            .anthropic => null,
-        };
+        return providerSpec(self).base_url_default;
     }
 
     pub fn adapter(self: Provider) ?AdapterKind {
-        return switch (self) {
-            .openai => .codex_responses,
-            .openai_compatible, .ollama, .llama_cpp, .openrouter => .openai_compatible,
-            .anthropic => null,
-        };
+        return providerSpec(self).adapter_kind;
     }
 };
 
@@ -69,6 +41,38 @@ pub const AdapterKind = enum {
     openai_responses,
     openai_compatible,
 };
+
+const ProviderSpec = struct {
+    provider: Provider,
+    label: []const u8,
+    base_url_default: ?[]const u8,
+    adapter_kind: ?AdapterKind,
+};
+
+const provider_specs = [_]ProviderSpec{
+    .{ .provider = .openai, .label = "openai", .base_url_default = "https://chatgpt.com/backend-api", .adapter_kind = .codex_responses },
+    .{ .provider = .openai_compatible, .label = "openai_compatible", .base_url_default = null, .adapter_kind = .openai_compatible },
+    .{ .provider = .ollama, .label = "ollama", .base_url_default = "http://localhost:11434", .adapter_kind = .openai_compatible },
+    .{ .provider = .llama_cpp, .label = "llama.cpp", .base_url_default = "http://localhost:8080", .adapter_kind = .openai_compatible },
+    .{ .provider = .openrouter, .label = "openrouter", .base_url_default = "https://openrouter.ai/api", .adapter_kind = .openai_compatible },
+    .{ .provider = .anthropic, .label = "anthropic", .base_url_default = null, .adapter_kind = null },
+};
+
+const providers_by_name = std.StaticStringMap(Provider).initComptime(.{
+    .{ "openai", .openai },
+    .{ "openai_compatible", .openai_compatible },
+    .{ "ollama", .ollama },
+    .{ "llama.cpp", .llama_cpp },
+    .{ "openrouter", .openrouter },
+    .{ "anthropic", .anthropic },
+});
+
+fn providerSpec(provider: Provider) ProviderSpec {
+    const index: usize = @intFromEnum(provider);
+    comptime std.debug.assert(provider_specs.len == @typeInfo(Provider).@"enum".fields.len);
+    std.debug.assert(provider_specs[index].provider == provider);
+    return provider_specs[index];
+}
 
 pub const Model = struct {
     id: []u8,
@@ -208,28 +212,29 @@ pub fn load(
 fn mergeLayers(gpa: std.mem.Allocator, layers: []const Config) !Config {
     var out: Config = .{};
     errdefer out.deinit(gpa);
-    for (layers) |layer| {
-        if (layer.provider) |v| out.provider = v;
-        if (layer.use_responses_endpoint) |v| out.use_responses_endpoint = v;
-        if (layer.enable_thinking) |v| out.enable_thinking = v;
-        if (layer.base_url) |s| {
-            if (out.base_url) |old| gpa.free(old);
-            out.base_url = try gpa.dupe(u8, s);
-        }
-        if (layer.api_key) |s| {
-            if (out.api_key) |old| gpa.free(old);
-            out.api_key = try gpa.dupe(u8, s);
-        }
-        if (layer.system_prompt) |s| {
-            if (out.system_prompt) |old| gpa.free(old);
-            out.system_prompt = try gpa.dupe(u8, s);
-        }
-        if (layer.model) |m| {
-            if (out.model) |*old| old.deinit(gpa);
-            out.model = try m.clone(gpa);
-        }
-    }
+    for (layers) |layer| try applyConfigOverlay(gpa, &out, layer, true);
     return out;
+}
+
+fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config, include_api_key: bool) !void {
+    if (updates.provider) |v| target.provider = v;
+    if (updates.use_responses_endpoint) |v| target.use_responses_endpoint = v;
+    if (updates.enable_thinking) |v| target.enable_thinking = v;
+    if (updates.base_url) |s| try replaceOptionalSlice(gpa, &target.base_url, s);
+    if (include_api_key) {
+        if (updates.api_key) |s| try replaceOptionalSlice(gpa, &target.api_key, s);
+    }
+    if (updates.system_prompt) |s| try replaceOptionalSlice(gpa, &target.system_prompt, s);
+    if (updates.model) |m| {
+        if (target.model) |*old| old.deinit(gpa);
+        target.model = try m.clone(gpa);
+    }
+}
+
+fn replaceOptionalSlice(gpa: std.mem.Allocator, target: *?[]u8, source: []const u8) !void {
+    const next = try gpa.dupe(u8, source);
+    if (target.*) |old| gpa.free(old);
+    target.* = next;
 }
 
 fn loadGlobalFile(
@@ -309,7 +314,7 @@ fn parseObject(
     errdefer out.deinit(gpa);
 
     if (stringField(value, "provider")) |s| {
-        if (Provider.fromString(s)) |p| {
+        if (providers_by_name.get(s)) |p| {
             out.provider = p;
         } else {
             try diagnostics.append(gpa, .{ .config_parse_error = .{
@@ -331,7 +336,7 @@ fn parseObject(
             if (stringField(model_value, "id")) |id| {
                 var model: Model = .{ .id = try gpa.dupe(u8, id) };
                 if (stringField(model_value, "reasoningEffort")) |effort| {
-                    model.reasoning_effort = reasoningEffortFromString(effort);
+                    model.reasoning_effort = reasoning_efforts_by_name.get(effort);
                 }
                 out.model = model;
             }
@@ -378,7 +383,7 @@ fn parseEnvModel(gpa: std.mem.Allocator, raw: []const u8) !EnvModel {
     const model_part = raw[slash + 1 ..];
     if (model_part.len == 0) return error.MissingModel;
     if (std.mem.indexOfScalar(u8, model_part, '/') != null) return error.TooManySeparators;
-    const provider = Provider.fromString(provider_part) orelse return error.UnknownProvider;
+    const provider = providers_by_name.get(provider_part) orelse return error.UnknownProvider;
     return .{
         .provider = provider,
         .model = .{ .id = try gpa.dupe(u8, model_part) },
@@ -391,14 +396,13 @@ fn parseBool(s: []const u8) bool {
     return false;
 }
 
-fn reasoningEffortFromString(s: []const u8) ?ai.ReasoningEffort {
-    if (std.mem.eql(u8, s, "minimal")) return .minimal;
-    if (std.mem.eql(u8, s, "low")) return .low;
-    if (std.mem.eql(u8, s, "medium")) return .medium;
-    if (std.mem.eql(u8, s, "high")) return .high;
-    if (std.mem.eql(u8, s, "xhigh")) return .xhigh;
-    return null;
-}
+const reasoning_efforts_by_name = std.StaticStringMap(ai.ReasoningEffort).initComptime(.{
+    .{ "minimal", .minimal },
+    .{ "low", .low },
+    .{ "medium", .medium },
+    .{ "high", .high },
+    .{ "xhigh", .xhigh },
+});
 
 fn stringField(value: std.json.Value, name: []const u8) ?[]const u8 {
     const field = value.object.get(name) orelse return null;
@@ -462,21 +466,7 @@ pub fn mergeAndWriteGlobal(
 ) !void {
     var current = try readGlobal(gpa, io, home_dir);
     defer current.deinit(gpa);
-    if (updates.provider) |v| current.provider = v;
-    if (updates.use_responses_endpoint) |v| current.use_responses_endpoint = v;
-    if (updates.enable_thinking) |v| current.enable_thinking = v;
-    if (updates.base_url) |s| {
-        if (current.base_url) |old| gpa.free(old);
-        current.base_url = try gpa.dupe(u8, s);
-    }
-    if (updates.model) |m| {
-        if (current.model) |*old| old.deinit(gpa);
-        current.model = try m.clone(gpa);
-    }
-    if (updates.system_prompt) |s| {
-        if (current.system_prompt) |old| gpa.free(old);
-        current.system_prompt = try gpa.dupe(u8, s);
-    }
+    try applyConfigOverlay(gpa, &current, updates, false);
     try writeGlobal(gpa, io, home_dir, current);
 }
 
@@ -541,14 +531,14 @@ const TestEnv = struct {
     }
 };
 
-test "Provider.fromString recognizes known vendor names" {
-    try std.testing.expectEqual(Provider.openai, Provider.fromString("openai").?);
-    try std.testing.expectEqual(Provider.openai_compatible, Provider.fromString("openai_compatible").?);
-    try std.testing.expectEqual(Provider.ollama, Provider.fromString("ollama").?);
-    try std.testing.expectEqual(Provider.llama_cpp, Provider.fromString("llama.cpp").?);
-    try std.testing.expectEqual(Provider.openrouter, Provider.fromString("openrouter").?);
-    try std.testing.expectEqual(Provider.anthropic, Provider.fromString("anthropic").?);
-    try std.testing.expectEqual(@as(?Provider, null), Provider.fromString("mystery"));
+test "providers_by_name recognizes known vendor names" {
+    try std.testing.expectEqual(Provider.openai, providers_by_name.get("openai").?);
+    try std.testing.expectEqual(Provider.openai_compatible, providers_by_name.get("openai_compatible").?);
+    try std.testing.expectEqual(Provider.ollama, providers_by_name.get("ollama").?);
+    try std.testing.expectEqual(Provider.llama_cpp, providers_by_name.get("llama.cpp").?);
+    try std.testing.expectEqual(Provider.openrouter, providers_by_name.get("openrouter").?);
+    try std.testing.expectEqual(Provider.anthropic, providers_by_name.get("anthropic").?);
+    try std.testing.expectEqual(@as(?Provider, null), providers_by_name.get("mystery"));
 }
 
 test "Provider.adapter returns null for unimplemented anthropic" {

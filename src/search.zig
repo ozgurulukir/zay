@@ -17,22 +17,22 @@ pub const Mode = enum {
     file_names,
     directories,
 
-    pub fn parse(raw: []const u8) ?Mode {
-        assert(raw.len > 0);
-        if (std.mem.eql(u8, raw, "file_content")) return .file_content;
-        if (std.mem.eql(u8, raw, "file_names")) return .file_names;
-        if (std.mem.eql(u8, raw, "directories")) return .directories;
-        return null;
-    }
-
     pub fn name(self: Mode) []const u8 {
-        return switch (self) {
-            .file_content => "file_content",
-            .file_names => "file_names",
-            .directories => "directories",
-        };
+        return mode_names[@intFromEnum(self)];
     }
 };
+
+const mode_names = [_][]const u8{
+    "file_content",
+    "file_names",
+    "directories",
+};
+
+pub const modes_by_name = std.StaticStringMap(Mode).initComptime(.{
+    .{ "file_content", .file_content },
+    .{ "file_names", .file_names },
+    .{ "directories", .directories },
+});
 
 pub const Request = struct {
     mode: Mode,
@@ -498,7 +498,7 @@ fn decodeCursor(raw: []const u8) ?Cursor {
     var iter = std.mem.splitScalar(u8, raw, ':');
     const prefix = iter.next() orelse return null;
     if (!std.mem.eql(u8, prefix, "nova-search-v1")) return null;
-    const mode = Mode.parse(iter.next() orelse return null) orelse return null;
+    const mode = modes_by_name.get(iter.next() orelse return null) orelse return null;
     const phase_raw = iter.next() orelse return null;
     if (!std.mem.eql(u8, phase_raw, "primary")) return null;
     const offset = std.fmt.parseInt(u32, iter.next() orelse return null, 10) catch return null;

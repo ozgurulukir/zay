@@ -212,7 +212,7 @@ fn trimTrailingCR(line: []const u8) []const u8 {
 }
 
 fn runSingle(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, path: []const u8, stdin: []const u8) common.Error!common.Output {
-    const absolute = joinPath(gpa, cwd, path) catch |err| return mapAllocError(err);
+    const absolute = common.joinPath(gpa, cwd, path) catch |err| return common.mapAllocError(err);
     defer gpa.free(absolute);
 
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -221,7 +221,7 @@ fn runSingle(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, path: []const 
         return common.failFmt(gpa, 2, "edit_file: invalid patch: {s}\n", .{@errorName(err)});
     };
 
-    const original = readFileBytes(gpa, io, absolute) catch |err| {
+    const original = common.readFileBytes(gpa, io, absolute, max_file_bytes) catch |err| {
         return common.failFmt(gpa, 1, "edit_file: cannot read {s}: {s}\n", .{ path, @errorName(err) });
     };
     defer gpa.free(original);
@@ -269,9 +269,9 @@ fn buildAppliedOutput(
         gpa,
         "Edit applied to {s} (first changed line: {d}).\n",
         .{ path, first },
-    ) catch |err| return mapAllocError(err);
+    ) catch |err| return common.mapAllocError(err);
     errdefer gpa.free(message);
-    const display = render_diff.render(gpa, original, edits) catch |err| return mapAllocError(err);
+    const display = render_diff.render(gpa, original, edits) catch |err| return common.mapAllocError(err);
     return common.okWithDisplay(gpa, message, display);
 }
 
@@ -297,28 +297,6 @@ fn writeBack(io: std.Io, absolute: []const u8, content: []const u8) !void {
     var file = try std.Io.Dir.createFileAbsolute(io, absolute, .{ .truncate = true });
     defer file.close(io);
     try file.writeStreamingAll(io, content);
-}
-
-fn readFileBytes(gpa: std.mem.Allocator, io: std.Io, absolute: []const u8) ![]u8 {
-    var file = try std.Io.Dir.openFileAbsolute(io, absolute, .{});
-    defer file.close(io);
-    var reader = file.reader(io, &.{});
-    return reader.interface.allocRemaining(gpa, .limited(max_file_bytes)) catch |err| switch (err) {
-        error.ReadFailed => return reader.err.?,
-        error.OutOfMemory, error.StreamTooLong => |e| return e,
-    };
-}
-
-fn joinPath(gpa: std.mem.Allocator, cwd: []const u8, path: []const u8) ![]u8 {
-    if (std.fs.path.isAbsolute(path)) return gpa.dupe(u8, path);
-    return std.fs.path.join(gpa, &.{ cwd, path });
-}
-
-fn mapAllocError(err: anyerror) common.Error {
-    return switch (err) {
-        error.OutOfMemory => common.Error.OutOfMemory,
-        else => common.Error.Unexpected,
-    };
 }
 
 test "edit_file requires an input document" {

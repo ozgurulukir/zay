@@ -96,6 +96,28 @@ pub fn failFmt(
 /// extracts a single string field; returns the bare `fallback` (owned) when
 /// the JSON is partial / invalid / missing the field. This is the function
 /// every tool's `displayLabel` ends up calling for the common case.
+pub fn readFileBytes(gpa: std.mem.Allocator, io: std.Io, absolute: []const u8, bytes_max: usize) ![]u8 {
+    var file = try std.Io.Dir.openFileAbsolute(io, absolute, .{});
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    return reader.interface.allocRemaining(gpa, .limited(bytes_max)) catch |err| switch (err) {
+        error.ReadFailed => return reader.err.?,
+        error.OutOfMemory, error.StreamTooLong => |e| return e,
+    };
+}
+
+pub fn joinPath(gpa: std.mem.Allocator, cwd: []const u8, path: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(path)) return gpa.dupe(u8, path);
+    return std.fs.path.join(gpa, &.{ cwd, path });
+}
+
+pub fn mapAllocError(err: anyerror) Error {
+    return switch (err) {
+        error.OutOfMemory => Error.OutOfMemory,
+        else => Error.Unexpected,
+    };
+}
+
 pub fn extractStringField(
     gpa: std.mem.Allocator,
     args: []const u8,

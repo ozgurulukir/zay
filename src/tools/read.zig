@@ -126,7 +126,7 @@ fn parsePositiveAllowZero(text: []const u8) ParseToolError!u32 {
 }
 
 fn read(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, args: Args) common.Error!common.Output {
-    const absolute = joinPath(gpa, cwd, args.path) catch |err| return mapAllocError(err);
+    const absolute = common.joinPath(gpa, cwd, args.path) catch |err| return common.mapAllocError(err);
     defer gpa.free(absolute);
 
     return readDirectory(gpa, io, args.path, absolute) catch |dir_err| switch (dir_err) {
@@ -167,7 +167,7 @@ fn kindName(kind: std.Io.File.Kind) []const u8 {
 }
 
 fn readFile(gpa: std.mem.Allocator, io: std.Io, args: Args, absolute: []const u8) common.Error!common.Output {
-    const bytes = readFileBytes(gpa, io, absolute) catch |err| {
+    const bytes = common.readFileBytes(gpa, io, absolute, max_file_bytes) catch |err| {
         return common.failFmt(gpa, 1, "read: {s}: {s}\n", .{ args.path, @errorName(err) });
     };
     defer gpa.free(bytes);
@@ -176,28 +176,6 @@ fn readFile(gpa: std.mem.Allocator, io: std.Io, args: Args, absolute: []const u8
         .raw => common.ok(gpa, try gpa.dupe(u8, bytes)),
         .conflicts => formatConflicts(gpa, bytes),
         else => formatAnchoredOutput(gpa, args, bytes),
-    };
-}
-
-fn readFileBytes(gpa: std.mem.Allocator, io: std.Io, absolute: []const u8) ![]u8 {
-    var file = try std.Io.Dir.openFileAbsolute(io, absolute, .{});
-    defer file.close(io);
-    var reader = file.reader(io, &.{});
-    return reader.interface.allocRemaining(gpa, .limited(max_file_bytes)) catch |err| switch (err) {
-        error.ReadFailed => return reader.err.?,
-        error.OutOfMemory, error.StreamTooLong => |e| return e,
-    };
-}
-
-fn joinPath(gpa: std.mem.Allocator, cwd: []const u8, path: []const u8) ![]u8 {
-    if (std.fs.path.isAbsolute(path)) return gpa.dupe(u8, path);
-    return std.fs.path.join(gpa, &.{ cwd, path });
-}
-
-fn mapAllocError(err: anyerror) common.Error {
-    return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.Unexpected,
     };
 }
 

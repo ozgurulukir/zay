@@ -65,7 +65,7 @@ fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!search.Re
 
     const mode_value = parsed.value.object.get("mode") orelse return error.MissingMode;
     if (mode_value != .string) return error.BadMode;
-    const mode = search.Mode.parse(mode_value.string) orelse return error.BadMode;
+    const mode = search.modes_by_name.get(mode_value.string) orelse return error.BadMode;
 
     const query_value = parsed.value.object.get("query") orelse return error.MissingQuery;
     if (query_value != .string) return error.BadQuery;

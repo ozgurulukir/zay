@@ -17,6 +17,7 @@ const tui_message = @import("tui/message_widget.zig");
 const tui_provider = @import("tui/provider_controller.zig");
 const tui_status = @import("tui/status.zig");
 const tui_style = @import("tui/style.zig");
+const logger = @import("logger");
 
 const ConversationLayout = tui_message.ConversationLayout;
 const MessageWidget = tui_message.MessageWidget;
@@ -500,96 +501,120 @@ pub const App = struct {
     }
 
     pub fn handleCommandKey(self: *App, key: vaxis.Key) !bool {
-        if (self.mode == .provider_picker) {
-            if (key.matches(vaxis.Key.left, .{})) {
-                self.provider_column = .provider;
-                return true;
-            }
-            if (key.matches(vaxis.Key.right, .{})) {
-                if (self.provider_selection == 0) {
-                    if (self.isCodexSignedIn()) self.provider_column = .sign_out;
-                }
-                return true;
-            }
-            if (key.matches(vaxis.Key.tab, .{})) {
-                if (self.provider_selection == 0) {
-                    if (self.isCodexSignedIn()) self.provider_column = nextProviderColumn(self.provider_column);
-                }
-                return true;
-            }
-            if (key.matches(vaxis.Key.up, .{})) {
-                self.provider_selection = previousIndex(self.provider_selection, providerOptionCount());
-                self.provider_column = .provider;
-                return true;
-            }
-            if (key.matches(vaxis.Key.down, .{})) {
-                self.provider_selection = nextIndex(self.provider_selection, providerOptionCount());
-                self.provider_column = .provider;
-                return true;
-            }
-            return false;
+        return switch (self.mode) {
+            .provider_picker => self.handleProviderPickerKey(key),
+            .custom_connection_form => self.handleCustomConnectionKey(key),
+            .model_picker => self.handleModelPickerKey(key),
+            .session_picker => self.handleSessionPickerKey(key),
+            .command => self.handleCommandMenuKey(key),
+            .normal => self.handleThreadKey(key),
+        };
+    }
+
+    fn handleProviderPickerKey(self: *App, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.left, .{})) {
+            self.provider_column = .provider;
+            return true;
         }
-        if (self.mode == .custom_connection_form) {
-            if (key.matches(vaxis.Key.up, .{}) or key.matches(vaxis.Key.down, .{}) or key.matches(vaxis.Key.tab, .{})) {
-                try self.toggleCustomConnectionField();
-                return true;
+        if (key.matches(vaxis.Key.right, .{})) {
+            if (self.provider_selection == 0) {
+                if (self.isCodexSignedIn()) self.provider_column = .sign_out;
             }
-            return false;
+            return true;
         }
-        if (self.mode == .model_picker) {
-            if (key.matches(vaxis.Key.left, .{})) {
-                self.model_column = .model;
-                return true;
+        if (key.matches(vaxis.Key.tab, .{})) {
+            if (self.provider_selection == 0) {
+                if (self.isCodexSignedIn()) self.provider_column = nextProviderColumn(self.provider_column);
             }
-            if (key.matches(vaxis.Key.right, .{})) {
-                if (self.codex_models.items.len > 0) self.model_column = .reasoning;
-                return true;
-            }
-            if (key.matches(vaxis.Key.tab, .{})) {
-                if (self.model_column == .reasoning) try self.cycleSelectedReasoning();
-                return true;
-            }
-            if (key.matches(vaxis.Key.up, .{})) {
-                self.model_selection = previousIndex(self.model_selection, @intCast(self.codex_models.items.len));
-                self.syncModelListCursor();
-                return true;
-            }
-            if (key.matches(vaxis.Key.down, .{})) {
-                self.model_selection = nextIndex(self.model_selection, @intCast(self.codex_models.items.len));
-                self.syncModelListCursor();
-                return true;
-            }
-            return false;
+            return true;
         }
-        if (self.mode == .session_picker) {
-            if (key.matches('g', .{})) {
-                self.resume_global = !self.resume_global;
-                try self.reloadResumeSessions();
-                return true;
-            }
-            if (key.matches(vaxis.Key.up, .{})) {
-                self.resume_selection = previousIndex(self.resume_selection, try self.visibleResumeCount());
-                self.syncResumeListCursor();
-                return true;
-            }
-            if (key.matches(vaxis.Key.down, .{})) {
-                self.resume_selection = nextIndex(self.resume_selection, try self.visibleResumeCount());
-                self.syncResumeListCursor();
-                return true;
-            }
-            return false;
+        if (key.matches(vaxis.Key.up, .{})) {
+            self.provider_selection = previousIndex(self.provider_selection, providerOptionCount());
+            self.provider_column = .provider;
+            return true;
         }
-        if (self.mode == .command) {
-            if (key.matches(vaxis.Key.up, .{})) {
-                self.command_selection = previousIndex(self.command_selection, commandMatchesCount(self));
-                return true;
-            }
-            if (key.matches(vaxis.Key.down, .{})) {
-                self.command_selection = nextIndex(self.command_selection, commandMatchesCount(self));
-                return true;
-            }
-            return false;
+        if (key.matches(vaxis.Key.down, .{})) {
+            self.provider_selection = nextIndex(self.provider_selection, providerOptionCount());
+            self.provider_column = .provider;
+            return true;
         }
+        return false;
+    }
+
+    fn handleCustomConnectionKey(self: *App, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.up, .{})) {
+            try self.toggleCustomConnectionField();
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{})) {
+            try self.toggleCustomConnectionField();
+            return true;
+        }
+        if (key.matches(vaxis.Key.tab, .{})) {
+            try self.toggleCustomConnectionField();
+            return true;
+        }
+        return false;
+    }
+
+    fn handleModelPickerKey(self: *App, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.left, .{})) {
+            self.model_column = .model;
+            return true;
+        }
+        if (key.matches(vaxis.Key.right, .{})) {
+            if (self.codex_models.items.len > 0) self.model_column = .reasoning;
+            return true;
+        }
+        if (key.matches(vaxis.Key.tab, .{})) {
+            if (self.model_column == .reasoning) try self.cycleSelectedReasoning();
+            return true;
+        }
+        if (key.matches(vaxis.Key.up, .{})) {
+            self.model_selection = previousIndex(self.model_selection, @intCast(self.codex_models.items.len));
+            self.syncModelListCursor();
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{})) {
+            self.model_selection = nextIndex(self.model_selection, @intCast(self.codex_models.items.len));
+            self.syncModelListCursor();
+            return true;
+        }
+        return false;
+    }
+
+    fn handleSessionPickerKey(self: *App, key: vaxis.Key) !bool {
+        if (key.matches('g', .{})) {
+            self.resume_global = !self.resume_global;
+            try self.reloadResumeSessions();
+            return true;
+        }
+        if (key.matches(vaxis.Key.up, .{})) {
+            self.resume_selection = previousIndex(self.resume_selection, try self.visibleResumeCount());
+            self.syncResumeListCursor();
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{})) {
+            self.resume_selection = nextIndex(self.resume_selection, try self.visibleResumeCount());
+            self.syncResumeListCursor();
+            return true;
+        }
+        return false;
+    }
+
+    fn handleCommandMenuKey(self: *App, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.up, .{})) {
+            self.command_selection = previousIndex(self.command_selection, commandMatchesCount(self));
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{})) {
+            self.command_selection = nextIndex(self.command_selection, commandMatchesCount(self));
+            return true;
+        }
+        return false;
+    }
+
+    fn handleThreadKey(self: *App, key: vaxis.Key) !bool {
         if (key.matches(vaxis.Key.up, .{})) {
             self.thread.moveSelection(.previous);
             self.thread_auto_scroll = false;
@@ -639,7 +664,7 @@ pub const App = struct {
 
     fn cancelMode(self: *App) !bool {
         if (self.mode == .normal) return false;
-        if (self.mode == .model_picker) self.revertModelPickerSnapshot();
+        if (self.mode == .model_picker) try self.revertModelPickerSnapshot();
         if (self.mode == .session_picker or self.mode == .provider_picker or self.mode == .custom_connection_form or self.mode == .model_picker) {
             try self.openCommandMenu();
             self.resumeClear();
@@ -651,9 +676,9 @@ pub const App = struct {
         return true;
     }
 
-    fn revertModelPickerSnapshot(self: *App) void {
+    fn revertModelPickerSnapshot(self: *App) !void {
         self.model_reasoning.clearRetainingCapacity();
-        self.model_reasoning.appendSlice(self.gpa, self.model_reasoning_snapshot.items) catch {};
+        try self.model_reasoning.appendSlice(self.gpa, self.model_reasoning_snapshot.items);
         self.model_selection = self.model_selection_snapshot;
     }
 
@@ -743,7 +768,7 @@ pub const App = struct {
         self.model_column = .model;
         self.model_selection = 0;
         self.clearInput();
-        self.reloadModelCatalog(.connected_provider) catch {};
+        try self.reloadModelCatalog(.connected_provider);
         // Snapshot for Escape revert. See `cancelMode`.
         self.model_reasoning_snapshot.clearRetainingCapacity();
         try self.model_reasoning_snapshot.appendSlice(self.gpa, self.model_reasoning.items);
@@ -2175,138 +2200,99 @@ const InputWidget = struct {
         const max_width = ctx.max.width orelse 0;
         const height: u16 = ctx.max.height orelse 4;
 
-        var prompt: vxfw.Text = .{
-            .text = ">",
-            .softwrap = false,
-            .width_basis = .parent,
+        if (height <= 3) return try self.drawInputBorder(ctx, max_width, height);
+
+        const show_hint = height > 4;
+        const children_count: usize = if (show_hint) 4 else 3;
+        const children = try ctx.arena.alloc(vxfw.SubSurface, children_count);
+        children[0] = .{
+            .origin = .{ .row = 0, .col = 0 },
+            .surface = try self.drawInputBorder(ctx, max_width, 3),
+            .z_index = 0,
         };
-        var prompt_box: vxfw.SizedBox = .{
-            .child = prompt.widget(),
-            .size = .{ .width = 2, .height = 1 },
+        try self.drawInputStatus(ctx, children, max_width, show_hint);
+        return .{
+            .size = .{ .width = max_width, .height = height },
+            .widget = self.widget(),
+            .buffer = &.{},
+            .children = children,
         };
+    }
+
+    fn drawInputBorder(self: *InputWidget, ctx: vxfw.DrawContext, max_width: u16, height: u16) std.mem.Allocator.Error!vxfw.Surface {
+        var prompt: vxfw.Text = .{ .text = ">", .softwrap = false, .width_basis = .parent };
+        var prompt_box: vxfw.SizedBox = .{ .child = prompt.widget(), .size = .{ .width = 2, .height = 1 } };
         var command_input: CommandInputText = .{ .app = self.app };
-        var input_box: vxfw.SizedBox = .{
-            .child = command_input.widget(),
-            .size = .{ .width = max_width -| 2, .height = 1 },
-        };
+        var input_box: vxfw.SizedBox = .{ .child = command_input.widget(), .size = .{ .width = max_width -| 2, .height = 1 } };
         var row: vxfw.FlexRow = .{
             .children = &.{
                 .{ .widget = prompt_box.widget(), .flex = 0 },
                 .{ .widget = input_box.widget(), .flex = 1 },
             },
         };
-        var row_box: vxfw.SizedBox = .{
-            .child = row.widget(),
-            .size = .{ .width = max_width -| 2, .height = 1 },
-        };
+        var row_box: vxfw.SizedBox = .{ .child = row.widget(), .size = .{ .width = max_width -| 2, .height = 1 } };
         var border: vxfw.Border = .{
             .child = row_box.widget(),
             .style = StylePalette.thinking_body,
             .labels = &.{.{ .text = inputLabel(self.app), .alignment = .top_left }},
         };
-        if (height <= 3) {
-            var box: vxfw.SizedBox = .{
-                .child = border.widget(),
-                .size = .{ .width = max_width, .height = height },
-            };
-            return box.widget().draw(ctx);
-        }
+        var box: vxfw.SizedBox = .{ .child = border.widget(), .size = .{ .width = max_width, .height = height } };
+        return box.widget().draw(ctx.withConstraints(.{ .width = max_width, .height = height }, .{ .width = max_width, .height = height }));
+    }
 
-        var border_box: vxfw.SizedBox = .{
-            .child = border.widget(),
-            .size = .{ .width = max_width, .height = 3 },
-        };
-
-        const show_status = height > 3;
-        const show_hint = height > 4;
-        const children = try ctx.arena.alloc(vxfw.SubSurface, if (show_hint) 4 else if (show_status) 3 else 1);
-        children[0] = .{
-            .origin = .{ .row = 0, .col = 0 },
-            .surface = try border_box.widget().draw(ctx.withConstraints(
-                .{ .width = max_width, .height = 3 },
-                .{ .width = max_width, .height = 3 },
-            )),
-            .z_index = 0,
-        };
-        if (!show_status) {
-            return .{
-                .size = .{ .width = max_width, .height = height },
-                .widget = self.widget(),
-                .buffer = &.{},
-                .children = children,
-            };
-        }
-
+    fn drawInputStatus(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, max_width: u16, show_hint: bool) std.mem.Allocator.Error!void {
         const cwd_raw = if (self.app.runtime) |runtime| runtime.cwd else self.app.agent.cwd;
         const home_dir = if (self.app.runtime) |runtime| runtime.home_dir else "";
         const cwd = try tui_status.formatCwdRelative(ctx.arena, cwd_raw, home_dir);
-        var cwd_text: vxfw.Text = .{
-            .text = cwd,
-            .style = StylePalette.cwd,
-            .softwrap = false,
-            .overflow = .ellipsis,
-            .width_basis = .parent,
-        };
-        var hint_text: vxfw.Text = .{
-            .text = inputHintText(self.app.mode),
-            .style = StylePalette.thinking_body,
-            .text_align = .center,
-            .softwrap = false,
-            .overflow = .ellipsis,
-            .width_basis = .parent,
-        };
         const status_text = if (tui_status.modelStatus(self.app.runtime, self.app.cached_config)) |status|
             tui_status.formatModelStatus(ctx.arena, status) catch ""
         else
             "";
-        var model_text: vxfw.Text = .{
-            .text = status_text,
-            .style = StylePalette.model_status,
-            .text_align = .right,
-            .softwrap = false,
-            .overflow = .ellipsis,
-            .width_basis = .parent,
-        };
-
         const status_padding_x: u16 = @min(@as(u16, 1), max_width);
         const status_inner_width = max_width -| (status_padding_x * 2);
         const status_gap: u16 = if (cwd.len > 0 and status_text.len > 0) 1 else 0;
-        const status_width = @min(ctx.stringWidth(status_text), @as(usize, status_inner_width));
-        const model_width: u16 = @intCast(status_width);
+        const model_width: u16 = @intCast(@min(ctx.stringWidth(status_text), @as(usize, status_inner_width)));
         const cwd_width: u16 = status_inner_width -| model_width -| status_gap;
+        try self.drawInputStatusRow(ctx, children, cwd, status_text, .{
+            .padding_x = status_padding_x,
+            .inner_width = status_inner_width,
+            .cwd_width = cwd_width,
+            .model_width = model_width,
+            .show_hint = show_hint,
+        });
+    }
+
+    const StatusLayout = struct {
+        padding_x: u16,
+        inner_width: u16,
+        cwd_width: u16,
+        model_width: u16,
+        show_hint: bool,
+    };
+
+    fn drawInputStatusRow(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, cwd: []const u8, status_text: []const u8, layout: StatusLayout) std.mem.Allocator.Error!void {
+        var cwd_text: vxfw.Text = .{ .text = cwd, .style = StylePalette.cwd, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
+        var model_text: vxfw.Text = .{ .text = status_text, .style = StylePalette.model_status, .text_align = .right, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
         const status_row = @as(u16, 3);
         children[1] = .{
-            .origin = .{ .row = status_row, .col = status_padding_x },
-            .surface = try cwd_text.widget().draw(ctx.withConstraints(
-                .{ .width = cwd_width, .height = 1 },
-                .{ .width = cwd_width, .height = 1 },
-            )),
+            .origin = .{ .row = status_row, .col = layout.padding_x },
+            .surface = try cwd_text.widget().draw(ctx.withConstraints(.{ .width = layout.cwd_width, .height = 1 }, .{ .width = layout.cwd_width, .height = 1 })),
             .z_index = 0,
         };
         children[2] = .{
-            .origin = .{ .row = status_row, .col = status_padding_x + status_inner_width -| model_width },
-            .surface = try model_text.widget().draw(ctx.withConstraints(
-                .{ .width = model_width, .height = 1 },
-                .{ .width = model_width, .height = 1 },
-            )),
+            .origin = .{ .row = status_row, .col = layout.padding_x + layout.inner_width -| layout.model_width },
+            .surface = try model_text.widget().draw(ctx.withConstraints(.{ .width = layout.model_width, .height = 1 }, .{ .width = layout.model_width, .height = 1 })),
             .z_index = 0,
         };
-        if (show_hint) {
-            children[3] = .{
-                .origin = .{ .row = status_row + 1, .col = status_padding_x },
-                .surface = try hint_text.widget().draw(ctx.withConstraints(
-                    .{ .width = status_inner_width, .height = 1 },
-                    .{ .width = status_inner_width, .height = 1 },
-                )),
-                .z_index = 0,
-            };
-        }
+        if (layout.show_hint) try self.drawInputHint(ctx, children, status_row + 1, layout.padding_x, layout.inner_width);
+    }
 
-        return .{
-            .size = .{ .width = max_width, .height = height },
-            .widget = self.widget(),
-            .buffer = &.{},
-            .children = children,
+    fn drawInputHint(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, row: u16, col: u16, width: u16) std.mem.Allocator.Error!void {
+        var hint_text: vxfw.Text = .{ .text = inputHintText(self.app.mode), .style = StylePalette.thinking_body, .text_align = .center, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
+        children[3] = .{
+            .origin = .{ .row = row, .col = col },
+            .surface = try hint_text.widget().draw(ctx.withConstraints(.{ .width = width, .height = 1 }, .{ .width = width, .height = 1 })),
+            .z_index = 0,
         };
     }
 };
