@@ -119,7 +119,7 @@ const Header = struct {
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
         try panel.lineStyledAt(&surface, 0, "NAME", ctx, message.ConversationLayout.left + 1, StylePalette.panel_header);
         try panel.lineStyledAt(&surface, 0, "REASONING EFFORT", ctx, panel.secondaryColumn(surface.size.width) + 2, StylePalette.panel_header);
-        try panel.lineStyledAt(&surface, 0, "SCOPE", ctx, scopeColumn(surface.size.width), StylePalette.panel_header);
+        try panel.lineStyledAt(&surface, 0, "SCOPE", ctx, scopeColumn(surface.size.width) + 2, StylePalette.panel_header);
         return surface;
     }
 };

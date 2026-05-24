@@ -63,15 +63,6 @@ pub const Credentials = struct {
     }
 };
 
-pub const CustomProvider = struct {
-    api_key: []u8,
-
-    pub fn deinit(self: *CustomProvider, gpa: std.mem.Allocator) void {
-        gpa.free(self.api_key);
-        self.* = undefined;
-    }
-};
-
 const AuthorizationFlow = struct {
     verifier: []u8,
     state: []u8,
@@ -113,23 +104,6 @@ pub fn refresh(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, refresh
     errdefer credentials.deinit(gpa);
     try save(gpa, io, home_dir, credentials);
     return credentials;
-}
-
-pub fn loadCustomProvider(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !?CustomProvider {
-    const path = try authPath(gpa, home_dir);
-    defer gpa.free(path);
-    const bytes = std.Io.Dir.readFileAllocOptions(.cwd(), io, path, gpa, .limited(32 * 1024), .of(u8), 0) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer gpa.free(bytes);
-    return try parseCustomProviderFile(gpa, bytes);
-}
-
-pub fn saveCustomProvider(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, custom: CustomProvider) !void {
-    var credentials = try load(gpa, io, home_dir);
-    defer if (credentials) |*value| value.deinit(gpa);
-    try writeAuth(gpa, io, home_dir, credentials, custom);
 }
 
 pub fn signOut(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !void {
@@ -328,9 +302,7 @@ fn accountIdFromAccessToken(gpa: std.mem.Allocator, access: []const u8) ![]u8 {
 }
 
 fn save(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, credentials: Credentials) !void {
-    var custom = try loadCustomProvider(gpa, io, home_dir);
-    defer if (custom) |*value| value.deinit(gpa);
-    try writeAuth(gpa, io, home_dir, credentials, custom);
+    try writeAuth(gpa, io, home_dir, credentials);
 }
 
 fn writeAuth(
@@ -338,7 +310,6 @@ fn writeAuth(
     io: std.Io,
     home_dir: []const u8,
     credentials: ?Credentials,
-    custom: ?CustomProvider,
 ) !void {
     const path = try authPath(gpa, home_dir);
     defer gpa.free(path);
@@ -351,10 +322,6 @@ fn writeAuth(
     if (credentials) |value| {
         try writeAuthKey(&payload.writer, "openaiCodex", &wrote_any);
         try writeCredentials(&payload.writer, &value);
-    }
-    if (custom) |value| {
-        try writeAuthKey(&payload.writer, "customProvider", &wrote_any);
-        try writeCustomProvider(&payload.writer, &value);
     }
     try payload.writer.writeAll("}\n");
     var file = try std.Io.Dir.createFile(.cwd(), io, path, .{ .truncate = true });
@@ -385,13 +352,6 @@ fn writeCredentials(writer: *std.Io.Writer, credentials: *const Credentials) !vo
     try writer.writeByte('}');
 }
 
-fn writeCustomProvider(writer: *std.Io.Writer, custom: *const CustomProvider) !void {
-    try writer.writeByte('{');
-    try writer.writeAll("\"apiKey\":");
-    try std.json.Stringify.value(custom.api_key, .{}, writer);
-    try writer.writeByte('}');
-}
-
 fn nowMs(io: std.Io) i64 {
     return std.Io.Clock.now(.real, io).toMilliseconds();
 }
@@ -410,15 +370,6 @@ fn parseAuthFile(gpa: std.mem.Allocator, bytes: []const u8) !?Credentials {
     return try credentialsFromValue(gpa, provider);
 }
 
-fn parseCustomProviderFile(gpa: std.mem.Allocator, bytes: []const u8) !?CustomProvider {
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const provider = parsed.value.object.get("customProvider") orelse return null;
-    if (provider != .object) return null;
-    return try customProviderFromValue(gpa, provider);
-}
-
 fn credentialsFromValue(gpa: std.mem.Allocator, value: std.json.Value) !Credentials {
     const access = stringField(value, "access") orelse return error.InvalidCredentials;
     const refresh_token = stringField(value, "refresh") orelse return error.InvalidCredentials;
@@ -430,11 +381,6 @@ fn credentialsFromValue(gpa: std.mem.Allocator, value: std.json.Value) !Credenti
         .account_id = try gpa.dupe(u8, account_id),
         .expires = expires,
     };
-}
-
-fn customProviderFromValue(gpa: std.mem.Allocator, value: std.json.Value) !CustomProvider {
-    const api_key = stringField(value, "apiKey") orelse return error.InvalidCredentials;
-    return .{ .api_key = try gpa.dupe(u8, api_key) };
 }
 
 fn queryValue(query: []const u8, name: []const u8) ?[]const u8 {
@@ -558,46 +504,6 @@ test "static models match openai codex catalog" {
 
 test "sign out removes missing auth file without error" {
     try signOut(std.testing.allocator, std.testing.io, "/tmp/nova-missing-home-for-signout-test");
-}
-
-test "auth file parser loads custom provider credentials" {
-    const gpa = std.testing.allocator;
-    const loaded = try parseCustomProviderFile(gpa, "{\"customProvider\":{\"apiKey\":\"secret\"}}");
-    var custom = loaded.?;
-    defer custom.deinit(gpa);
-    try std.testing.expectEqualStrings("secret", custom.api_key);
-}
-
-test "auth writer preserves codex and custom provider credentials" {
-    const gpa = std.testing.allocator;
-    var payload: std.Io.Writer.Allocating = .init(gpa);
-    defer payload.deinit();
-    var auth_credentials: Credentials = .{
-        .access = try gpa.dupe(u8, "a"),
-        .refresh = try gpa.dupe(u8, "r"),
-        .expires = 12,
-        .account_id = try gpa.dupe(u8, "acct"),
-    };
-    defer auth_credentials.deinit(gpa);
-    var custom_provider: CustomProvider = .{ .api_key = try gpa.dupe(u8, "secret") };
-    defer custom_provider.deinit(gpa);
-
-    var wrote_any = false;
-    try payload.writer.writeByte('{');
-    try writeAuthKey(&payload.writer, "openaiCodex", &wrote_any);
-    try writeCredentials(&payload.writer, &auth_credentials);
-    try writeAuthKey(&payload.writer, "customProvider", &wrote_any);
-    try writeCustomProvider(&payload.writer, &custom_provider);
-    try payload.writer.writeByte('}');
-
-    const credentials_loaded = try parseAuthFile(gpa, payload.written());
-    var credentials = credentials_loaded.?;
-    defer credentials.deinit(gpa);
-    const custom_loaded = try parseCustomProviderFile(gpa, payload.written());
-    var custom = custom_loaded.?;
-    defer custom.deinit(gpa);
-    try std.testing.expectEqualStrings("a", credentials.access);
-    try std.testing.expectEqualStrings("secret", custom.api_key);
 }
 
 test "auth file parser loads openai codex credentials" {

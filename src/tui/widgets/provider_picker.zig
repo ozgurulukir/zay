@@ -7,7 +7,7 @@ const panel = @import("panel.zig");
 const assert = std.debug.assert;
 
 pub const Column = enum { provider, sign_out };
-pub const Action = enum { connect_codex, sign_out_codex, custom_connection };
+pub const Action = enum { connect_codex, sign_out_codex };
 
 pub const State = struct {
     selection: u32 = 0,
@@ -51,11 +51,8 @@ pub const State = struct {
 
     pub fn selectedAction(self: *const State) Action {
         assert(self.selection < optionCount());
-        if (self.selection == 0) {
-            if (self.column == .sign_out) return .sign_out_codex;
-            return .connect_codex;
-        }
-        return .custom_connection;
+        if (self.column == .sign_out) return .sign_out_codex;
+        return .connect_codex;
     }
 };
 
@@ -73,7 +70,6 @@ pub const Content = struct {
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
         try self.drawCodex(&surface, ctx);
-        try self.drawCustom(&surface, ctx);
         return surface;
     }
 
@@ -92,17 +88,10 @@ pub const Content = struct {
         const text = try std.fmt.allocPrint(ctx.arena, "{s}Sign out", .{prefix});
         try panel.lineAt(surface, 0, text, ctx, focused, panel.secondaryColumn(surface.size.width));
     }
-
-    fn drawCustom(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
-        const focused = self.state.selection == 1;
-        const prefix = if (focused) "‣ " else "  ";
-        const text = try std.fmt.allocPrint(ctx.arena, "{s}Custom", .{prefix});
-        try panel.commandLine(surface, 1, text, ctx, focused);
-    }
 };
 
 pub fn optionCount() u32 {
-    return 2;
+    return 1;
 }
 
 fn nextColumn(current: Column) Column {
@@ -137,6 +126,4 @@ test "provider picker selected action follows selected row and column" {
     try std.testing.expectEqual(Action.connect_codex, state.selectedAction());
     state.column = .sign_out;
     try std.testing.expectEqual(Action.sign_out_codex, state.selectedAction());
-    state.selection = 1;
-    try std.testing.expectEqual(Action.custom_connection, state.selectedAction());
 }

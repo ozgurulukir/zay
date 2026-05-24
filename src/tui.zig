@@ -15,7 +15,6 @@ const tui_thread_projection = @import("tui/thread_projection.zig");
 const tui_metrics = @import("tui/metrics.zig");
 const tui_message = @import("tui/widgets/message.zig");
 const command_panel = @import("tui/widgets/command_panel.zig");
-const custom_connection_form = @import("tui/widgets/custom_connection_form.zig");
 const model_picker = @import("tui/widgets/model_picker.zig");
 const panel_widget = @import("tui/widgets/panel.zig");
 const provider_picker = @import("tui/widgets/provider_picker.zig");
@@ -67,10 +66,6 @@ pub const App = struct {
     model_selection_snapshot: u32 = 0,
     provider_picker: provider_picker.State = .{},
     codex_signed_in: bool = false,
-    custom_connection_field: custom_connection_form.Field = .base_url,
-    custom_connection_show_errors: bool = false,
-    custom_base_url: std.ArrayList(u8) = .empty,
-    custom_api_key: std.ArrayList(u8) = .empty,
     cached_config: config_mod.Config = .{},
     cached_config_owned: bool = false,
     retired_threads: std.ArrayList(thread_mod.Thread) = .empty,
@@ -95,9 +90,9 @@ pub const App = struct {
         .wheel_scroll = 3,
     },
 
-    const Mode = enum { normal, command, session_picker, provider_picker, custom_connection_form, model_picker };
+    const Mode = enum { normal, command, session_picker, provider_picker, model_picker };
     const ModelCatalog = enum { connected_provider, openai_codex };
-    const ModelSource = enum { openai_codex, openai_compatible };
+    const ModelSource = union(enum) { openai_codex, openai_compatible: config_mod.Provider };
     const ModelScope = enum { global, project, session };
 
     pub fn init(io: std.Io, gpa: std.mem.Allocator, agent: *agent_mod.Agent) App {
@@ -125,9 +120,6 @@ pub const App = struct {
         app.codex_signed_in = runtime.hasCodexClient() or tui_provider.detectCodexSignIn(gpa, io, runtime.home_dir);
         app.cached_config = config;
         app.cached_config_owned = true;
-        app.hydrateCustomProviderFromAuth() catch |err| {
-            std.log.warn("custom_provider.auth.load.failed err={s}", .{@errorName(err)});
-        };
         return app;
     }
 
@@ -148,8 +140,6 @@ pub const App = struct {
         self.model_sources.deinit(self.gpa);
         self.model_reasoning.deinit(self.gpa);
         self.model_reasoning_snapshot.deinit(self.gpa);
-        self.custom_base_url.deinit(self.gpa);
-        self.custom_api_key.deinit(self.gpa);
         if (self.cached_config_owned) {
             self.cached_config.deinit(self.gpa);
             self.cached_config_owned = false;
@@ -165,19 +155,6 @@ pub const App = struct {
         self.thread.deinit(self.gpa);
         self.input.deinit();
         self.* = undefined;
-    }
-
-    fn hydrateCustomProviderFromAuth(self: *App) !void {
-        const runtime = self.runtime orelse return;
-        var custom = (try codex.loadCustomProvider(self.gpa, self.io, runtime.home_dir)) orelse return;
-        defer custom.deinit(self.gpa);
-        if (self.cached_config_owned) {
-            if (self.cached_config.api_key) |old| self.gpa.free(old);
-            self.cached_config.api_key = try self.gpa.dupe(u8, custom.api_key);
-            if (self.cached_config.provider == null) {
-                if (self.cached_config.base_url) |base_url| self.cached_config.provider = tui_provider.compatibleProviderFromBaseUrl(base_url);
-            }
-        }
     }
 
     fn awaitTurn(self: *App) void {
@@ -283,7 +260,6 @@ pub const App = struct {
     pub fn handleCommandKey(self: *App, key: vaxis.Key) !bool {
         return switch (self.mode) {
             .provider_picker => self.handleProviderPickerKey(key),
-            .custom_connection_form => self.handleCustomConnectionKey(key),
             .model_picker => self.handleModelPickerKey(key),
             .session_picker => self.handleSessionPickerKey(key),
             .command => self.handleCommandMenuKey(key),
@@ -293,22 +269,6 @@ pub const App = struct {
 
     fn handleProviderPickerKey(self: *App, key: vaxis.Key) !bool {
         return self.provider_picker.handleKey(key, self.isCodexSignedIn());
-    }
-
-    fn handleCustomConnectionKey(self: *App, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.up, .{})) {
-            try self.toggleCustomConnectionField();
-            return true;
-        }
-        if (key.matches(vaxis.Key.down, .{})) {
-            try self.toggleCustomConnectionField();
-            return true;
-        }
-        if (key.matches(vaxis.Key.tab, .{})) {
-            try self.toggleCustomConnectionField();
-            return true;
-        }
-        return false;
     }
 
     fn handleModelPickerKey(self: *App, key: vaxis.Key) !bool {
@@ -391,7 +351,6 @@ pub const App = struct {
     }
 
     fn syncModeWithInput(self: *App, value: []const u8) !void {
-        if (self.mode == .custom_connection_form) return;
         if (self.mode == .session_picker or self.mode == .provider_picker or self.mode == .model_picker) {
             if (value.len > 0) {
                 if (value[0] == command_prefix) {
@@ -423,7 +382,7 @@ pub const App = struct {
     fn cancelMode(self: *App) !bool {
         if (self.mode == .normal) return false;
         if (self.mode == .model_picker) try self.revertModelPickerSnapshot();
-        if (self.mode == .session_picker or self.mode == .provider_picker or self.mode == .custom_connection_form or self.mode == .model_picker) {
+        if (self.mode == .session_picker or self.mode == .provider_picker or self.mode == .model_picker) {
             try self.openCommandMenu();
             self.resumeClear();
             return true;
@@ -453,12 +412,7 @@ pub const App = struct {
                         self.connectCodex() catch |err| try self.reportConnectionError(err);
                     }
                 },
-                .custom_connection => self.openCustomConnectionForm() catch |err| try self.reportConnectionError(err),
             }
-            return true;
-        }
-        if (self.mode == .custom_connection_form) {
-            self.submitCustomConnectionForm() catch |err| try self.reportConnectionError(err);
             return true;
         }
         if (self.mode == .model_picker) {
@@ -510,14 +464,6 @@ pub const App = struct {
         self.clearInput();
     }
 
-    fn openCustomConnectionForm(self: *App) !void {
-        self.mode = .custom_connection_form;
-        self.custom_connection_field = .base_url;
-        self.custom_connection_show_errors = false;
-        try self.customConnectionLoadCachedValues();
-        try self.loadCustomConnectionFieldInput();
-    }
-
     fn openModelPicker(self: *App) !void {
         self.mode = .model_picker;
         self.model_column = .model;
@@ -552,107 +498,6 @@ pub const App = struct {
         _ = try self.thread.append(self.gpa, .agent, "agent", "Connected to OpenAI Codex.");
     }
 
-    fn customConnectionLoadCachedValues(self: *App) !void {
-        self.custom_base_url.clearRetainingCapacity();
-        self.custom_api_key.clearRetainingCapacity();
-        if (self.cached_config.base_url) |base_url| try self.custom_base_url.appendSlice(self.gpa, base_url);
-        if (self.cached_config.api_key) |api_key| try self.custom_api_key.appendSlice(self.gpa, api_key);
-    }
-
-    fn loadCustomConnectionFieldInput(self: *App) !void {
-        self.clearInput();
-        const value = switch (self.custom_connection_field) {
-            .base_url => self.custom_base_url.items,
-            .api_key => self.custom_api_key.items,
-        };
-        try self.input.insertSliceAtCursor(value);
-    }
-
-    fn storeCustomConnectionFieldInput(self: *App) !void {
-        const input = try self.peekInput();
-        defer self.gpa.free(input);
-        const target = switch (self.custom_connection_field) {
-            .base_url => &self.custom_base_url,
-            .api_key => &self.custom_api_key,
-        };
-        target.clearRetainingCapacity();
-        try target.appendSlice(self.gpa, input);
-    }
-
-    fn toggleCustomConnectionField(self: *App) !void {
-        try self.storeCustomConnectionFieldInput();
-        self.custom_connection_field = switch (self.custom_connection_field) {
-            .base_url => .api_key,
-            .api_key => .base_url,
-        };
-        try self.loadCustomConnectionFieldInput();
-    }
-
-    fn customConnectionFieldFilled(self: *App, field: custom_connection_form.Field) !bool {
-        if (self.custom_connection_field == field) {
-            const input = try self.peekInput();
-            defer self.gpa.free(input);
-            return input.len > 0;
-        }
-        return switch (field) {
-            .base_url => self.custom_base_url.items.len > 0,
-            .api_key => self.custom_api_key.items.len > 0,
-        };
-    }
-
-    fn customConnectionFieldMarker(self: *App, field: custom_connection_form.Field) ![]const u8 {
-        if (try self.customConnectionFieldFilled(field)) return "✓";
-        if (self.custom_connection_show_errors) return "✗";
-        return " ";
-    }
-
-    fn submitCustomConnectionForm(self: *App) !void {
-        if (self.in_flight) return error.InFlightTurn;
-        try self.storeCustomConnectionFieldInput();
-        if (self.custom_connection_field == .base_url) {
-            if (self.custom_base_url.items.len == 0) {
-                self.custom_connection_show_errors = true;
-                return;
-            }
-            self.custom_connection_field = .api_key;
-            try self.loadCustomConnectionFieldInput();
-            return;
-        }
-        if (self.custom_base_url.items.len == 0) {
-            self.custom_connection_show_errors = true;
-            return;
-        }
-        if (self.custom_api_key.items.len == 0) {
-            self.custom_connection_show_errors = true;
-            return;
-        }
-        try self.applyCustomConnectionCredentials();
-        try self.openModelPicker();
-    }
-
-    fn applyCustomConnectionCredentials(self: *App) !void {
-        const base_url = try self.gpa.dupe(u8, self.custom_base_url.items);
-        errdefer self.gpa.free(base_url);
-        const api_key = try self.gpa.dupe(u8, self.custom_api_key.items);
-        errdefer self.gpa.free(api_key);
-        if (self.cached_config_owned) {
-            if (self.cached_config.base_url) |old| self.gpa.free(old);
-            if (self.cached_config.api_key) |old| self.gpa.free(old);
-        } else {
-            self.cached_config = .{};
-            self.cached_config_owned = true;
-        }
-        if (self.cached_config.model) |*old| old.deinit(self.gpa);
-        self.cached_config.provider = tui_provider.compatibleProviderFromBaseUrl(self.custom_base_url.items);
-        self.cached_config.base_url = base_url;
-        self.cached_config.api_key = api_key;
-        self.cached_config.model = null;
-        self.compatibleModelsCacheClear();
-        try codex.saveCustomProvider(self.gpa, self.io, self.runtime.?.home_dir, .{
-            .api_key = self.custom_api_key.items,
-        });
-    }
-
     fn signOutCodex(self: *App) !void {
         if (self.in_flight) return error.InFlightTurn;
         try codex.signOut(self.gpa, self.io, self.runtime.?.home_dir);
@@ -685,12 +530,10 @@ pub const App = struct {
                     return error.NotConnected;
                 }
             },
-            .openai_compatible => {
-                if (!self.hasOpenAICompatibleCredentials()) return error.NotConnected;
-                const base_url = self.cached_config.base_url.?;
-                const api_key = self.cached_config.api_key.?;
+            .openai_compatible => |provider| {
+                const base_url = self.compatibleBaseUrl(provider) orelse return error.NotConnected;
+                const api_key = if (self.cached_config.api_key) |key| key else providerLocalApiKey(provider);
                 try self.attachOpenAiCompatibleClient(base_url, api_key, model.id);
-                const provider = tui_provider.compatibleProviderFromBaseUrl(base_url);
                 try self.persistModelSelection(provider, model.id, effort, self.model_scope);
             },
         }
@@ -762,7 +605,7 @@ pub const App = struct {
         providers[0] = .{ .provider = provider, .models = models };
         models_moved = true;
         if (provider != .openai) {
-            if (self.cached_config.base_url) |base_url| providers[0].base_url = try self.gpa.dupe(u8, base_url);
+            if (self.compatibleBaseUrl(provider)) |base_url| providers[0].base_url = try self.gpa.dupe(u8, base_url);
         }
         return .{
             .provider = provider,
@@ -776,12 +619,13 @@ pub const App = struct {
         self.codexModelsClear();
         switch (catalog) {
             .connected_provider => {
-                if (self.hasOpenAICompatibleCredentials()) {
+                if (self.shouldLoadConfiguredCompatibleCatalog()) {
                     self.loadCompatibleCatalog() catch |err| {
                         if (!self.isCodexSignedIn()) return err;
                         std.log.warn("compatible.models.failed err={s}", .{@errorName(err)});
                     };
                 }
+                try self.loadLocalCompatibleCatalogs();
                 if (self.isCodexSignedIn()) try self.loadCodexStaticCatalog();
             },
             .openai_codex => try self.loadCodexStaticCatalog(),
@@ -824,13 +668,38 @@ pub const App = struct {
 
     fn loadCompatibleCatalog(self: *App) !void {
         if (!self.compatible_models_fetched) try self.fetchCompatibleCatalog();
+        const provider = tui_provider.compatibleProviderFromBaseUrl(self.cached_config.base_url.?);
         for (self.compatible_models.items) |model| {
             const id = try self.gpa.dupe(u8, model.id);
             errdefer self.gpa.free(id);
             const label = try self.gpa.dupe(u8, model.label);
             errdefer self.gpa.free(label);
             try self.codex_models.append(self.gpa, .{ .id = id, .label = label });
-            try self.model_sources.append(self.gpa, .openai_compatible);
+            try self.model_sources.append(self.gpa, .{ .openai_compatible = provider });
+        }
+    }
+
+    fn loadLocalCompatibleCatalogs(self: *App) !void {
+        self.loadLocalCompatibleCatalog(.ollama) catch {};
+        self.loadLocalCompatibleCatalog(.llama_cpp) catch {};
+    }
+
+    fn loadLocalCompatibleCatalog(self: *App, provider: config_mod.Provider) !void {
+        const base_url = provider.defaultBaseUrl() orelse return;
+        const api_key = providerLocalApiKey(provider);
+        const fetched = try openai_compatible_mod.listModels(self.gpa, self.io, base_url, api_key);
+        defer {
+            for (fetched) |*entry| entry.deinit(self.gpa);
+            self.gpa.free(fetched);
+        }
+        for (fetched) |entry| {
+            if (!includeLocalModel(provider, entry.id)) continue;
+            const id = try self.gpa.dupe(u8, entry.id);
+            errdefer self.gpa.free(id);
+            const label = try std.fmt.allocPrint(self.gpa, "{s} • {s}", .{ providerModelLabel(provider), entry.id });
+            errdefer self.gpa.free(label);
+            try self.codex_models.append(self.gpa, .{ .id = id, .label = label });
+            try self.model_sources.append(self.gpa, .{ .openai_compatible = provider });
         }
     }
 
@@ -838,6 +707,7 @@ pub const App = struct {
         std.debug.assert(!self.compatible_models_fetched);
         const base_url = self.cached_config.base_url.?;
         const api_key = self.cached_config.api_key.?;
+        const provider = self.cached_config.provider orelse tui_provider.compatibleProviderFromBaseUrl(base_url);
         const fetched = try openai_compatible_mod.listModels(self.gpa, self.io, base_url, api_key);
         defer {
             for (fetched) |*entry| entry.deinit(self.gpa);
@@ -845,6 +715,7 @@ pub const App = struct {
         }
         errdefer self.compatibleModelsCacheClear();
         for (fetched) |entry| {
+            if (!includeLocalModel(provider, entry.id)) continue;
             const id = try self.gpa.dupe(u8, entry.id);
             errdefer self.gpa.free(id);
             const label = try self.gpa.dupe(u8, entry.id);
@@ -866,6 +737,46 @@ pub const App = struct {
 
     fn hasOpenAICompatibleCredentials(self: *const App) bool {
         return tui_provider.hasOpenAICompatibleCredentials(self.cached_config);
+    }
+
+    fn shouldLoadConfiguredCompatibleCatalog(self: *const App) bool {
+        if (!self.hasOpenAICompatibleCredentials()) return false;
+        const base_url = self.cached_config.base_url orelse return false;
+        const provider = self.cached_config.provider orelse tui_provider.compatibleProviderFromBaseUrl(base_url);
+        if (provider == .ollama) return false;
+        if (provider == .llama_cpp) return false;
+        return true;
+    }
+
+    fn compatibleBaseUrl(self: *const App, provider: config_mod.Provider) ?[]const u8 {
+        if (self.cached_config.base_url) |base_url| {
+            const cached_provider = self.cached_config.provider orelse tui_provider.compatibleProviderFromBaseUrl(base_url);
+            if (cached_provider == provider) return base_url;
+        }
+        return provider.defaultBaseUrl();
+    }
+
+    fn providerLocalApiKey(provider: config_mod.Provider) []const u8 {
+        return switch (provider) {
+            .ollama => "ollama",
+            .llama_cpp => "llama.cpp",
+            else => "",
+        };
+    }
+
+    fn providerModelLabel(provider: config_mod.Provider) []const u8 {
+        return switch (provider) {
+            .ollama => "Ollama",
+            .llama_cpp => "llama.cpp",
+            else => provider.label(),
+        };
+    }
+
+    fn includeLocalModel(provider: config_mod.Provider, model_id: []const u8) bool {
+        if (provider == .ollama) {
+            if (std.mem.endsWith(u8, model_id, "-cloud")) return false;
+        }
+        return true;
     }
 
     fn selectedReasoningIndex(self: *const App) u32 {
@@ -1436,10 +1347,6 @@ fn inputLabel(app: *const App) []const u8 {
         .command => "Command",
         .session_picker => "Search for Sessions",
         .provider_picker => "Connect to Provider",
-        .custom_connection_form => switch (app.custom_connection_field) {
-            .base_url => "Custom Base URL",
-            .api_key => "Custom API Key",
-        },
         .model_picker => "Select Model",
     };
 }
@@ -1535,15 +1442,6 @@ const PanelWidget = struct {
             var shell: panel_widget.Shell = .{ .child = content.widget() };
             return shell.widget().draw(ctx);
         }
-        if (self.app.mode == .custom_connection_form) {
-            var content: custom_connection_form.Content = .{
-                .field = self.app.custom_connection_field,
-                .base_marker = try self.app.customConnectionFieldMarker(.base_url),
-                .key_marker = try self.app.customConnectionFieldMarker(.api_key),
-            };
-            var shell: panel_widget.Shell = .{ .child = content.widget() };
-            return shell.widget().draw(ctx);
-        }
         if (self.app.mode == .model_picker) {
             const status = tui_status.modelStatus(self.app.runtime, self.app.cached_config);
             var content: model_picker.Content = .{
@@ -1597,7 +1495,6 @@ fn inputHintText(mode: App.Mode) []const u8 {
         .command => "↑↓ Navigate · [ENTER] Select · [ESC] Back",
         .session_picker => "↑↓ Navigate · [TAB] Toggle · [ENTER] Select · [ESC] Back",
         .provider_picker => "↑↓ Navigate · ←→ Actions · [ENTER] Select · [ESC] Back",
-        .custom_connection_form => "↑↓ Navigate · [ENTER] Save · [ESC] Back",
         .model_picker => "↑↓ Navigate · ←→ Column · [TAB] Toggle Effort/Scope · [ENTER] Select · [ESC] Back",
         .normal => "↑↓ Navigate · [TAB] Expand",
     };
@@ -1863,46 +1760,21 @@ test "model picker without models stays on model column" {
     try std.testing.expectEqual(model_picker.Column.model, app.model_column);
 }
 
-test "provider picker opens custom connection form" {
-    const gpa = std.testing.allocator;
-    var openai_compatible_client: openai_compatible_mod.Client = undefined;
-    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
-    defer openai_compatible_client.deinit();
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
-    defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
-    defer app.deinit();
-
-    try app.openProviderPicker();
-    try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.down }));
-    try std.testing.expectEqual(@as(u32, 1), app.provider_picker.selection);
-    try std.testing.expect(try app.submitMode());
-
-    try std.testing.expectEqual(App.Mode.custom_connection_form, app.mode);
-    try std.testing.expectEqual(custom_connection_form.Field.base_url, app.custom_connection_field);
+test "provider picker has no custom connection row" {
+    var state: provider_picker.State = .{};
+    try std.testing.expect(state.handleKey(.{ .codepoint = vaxis.Key.down }, false));
+    try std.testing.expectEqual(@as(u32, 0), state.selection);
+    try std.testing.expectEqual(provider_picker.Action.connect_codex, state.selectedAction());
 }
 
-test "custom connection form marks empty base url invalid" {
-    const gpa = std.testing.allocator;
-    var openai_compatible_client: openai_compatible_mod.Client = undefined;
-    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
-    defer openai_compatible_client.deinit();
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
-    defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
-    defer app.deinit();
-
-    app.mode = .custom_connection_form;
-    app.custom_connection_field = .base_url;
-    try app.submitCustomConnectionForm();
-
-    try std.testing.expectEqual(App.Mode.custom_connection_form, app.mode);
-    try std.testing.expectEqual(custom_connection_form.Field.base_url, app.custom_connection_field);
-    try std.testing.expect(app.custom_connection_show_errors);
-    try std.testing.expectEqualStrings("✗", try app.customConnectionFieldMarker(.base_url));
+test "ollama cloud models are not listed as local models" {
+    try std.testing.expect(App.includeLocalModel(.ollama, "llama3"));
+    try std.testing.expect(!App.includeLocalModel(.ollama, "gpt-oss-cloud"));
+    try std.testing.expect(!App.includeLocalModel(.ollama, "gpt-oss:120b-cloud"));
+    try std.testing.expect(App.includeLocalModel(.llama_cpp, "gpt-oss-cloud"));
 }
 
-test "custom connection form advances from base url to api key" {
+test "local providers are not loaded twice through configured compatible catalog" {
     const gpa = std.testing.allocator;
     var openai_compatible_client: openai_compatible_mod.Client = undefined;
     try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
@@ -1912,15 +1784,11 @@ test "custom connection form advances from base url to api key" {
     var app = App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    app.mode = .custom_connection_form;
-    app.custom_connection_field = .base_url;
-    try app.input.insertSliceAtCursor("http://localhost:11434/v1");
-    try app.submitCustomConnectionForm();
+    app.cached_config.provider = .ollama;
+    app.cached_config.base_url = @constCast("http://localhost:11434");
+    app.cached_config.api_key = @constCast("ollama");
 
-    try std.testing.expectEqual(App.Mode.custom_connection_form, app.mode);
-    try std.testing.expectEqual(custom_connection_form.Field.api_key, app.custom_connection_field);
-    try std.testing.expectEqualStrings("http://localhost:11434/v1", app.custom_base_url.items);
-    try std.testing.expectEqualStrings("✓", try app.customConnectionFieldMarker(.base_url));
+    try std.testing.expect(!app.shouldLoadConfiguredCompatibleCatalog());
 }
 
 test "provider picker selects sign out horizontally" {
@@ -1946,7 +1814,7 @@ test "provider picker selects sign out horizontally" {
     try std.testing.expectEqual(provider_picker.Column.provider, app.provider_picker.column);
 }
 
-test "codex sign-in survives selecting custom provider" {
+test "codex sign-in survives selecting local compatible provider" {
     const gpa = std.testing.allocator;
     var runtime: runtime_mod.AgentRuntime = undefined;
     runtime.gpa = gpa;
@@ -1967,7 +1835,7 @@ test "codex sign-in survives selecting custom provider" {
 
     app.codex_signed_in = true;
     try app.codex_models.append(gpa, .{ .id = try gpa.dupe(u8, "llama3"), .label = try gpa.dupe(u8, "llama3") });
-    try app.model_sources.append(gpa, .openai_compatible);
+    try app.model_sources.append(gpa, .{ .openai_compatible = .ollama });
     try app.model_reasoning.append(gpa, 0);
     app.model_selection = 0;
     app.cached_config_owned = true;
