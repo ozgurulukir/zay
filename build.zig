@@ -20,10 +20,24 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const websocket_vendor_mod = b.createModule(.{
+        .root_source_file = b.path("vendor/websocket.zig/src/websocket.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    {
+        const options = b.addOptions();
+        options.addOption(bool, "websocket_blocking", false);
+        websocket_vendor_mod.addOptions("build", options);
+    }
     const websocket_mod = b.createModule(.{
         .root_source_file = b.path("lib/websocket.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "websocket_vendor", .module = websocket_vendor_mod },
+        },
     });
     const logger_mod = b.createModule(.{
         .root_source_file = b.path("lib/logger.zig"),
