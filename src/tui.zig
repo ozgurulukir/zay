@@ -11,9 +11,15 @@ const runtime_mod = @import("runtime.zig");
 const session_mod = @import("session.zig");
 const thread_mod = @import("thread.zig");
 const agent_worker = @import("tui/agent_worker.zig");
-const tool_policy = @import("tui/tool_policy.zig");
+const tui_thread_projection = @import("tui/thread_projection.zig");
 const tui_metrics = @import("tui/metrics.zig");
-const tui_message = @import("tui/message_widget.zig");
+const tui_message = @import("tui/widgets/message.zig");
+const command_panel = @import("tui/widgets/command_panel.zig");
+const custom_connection_form = @import("tui/widgets/custom_connection_form.zig");
+const model_picker = @import("tui/widgets/model_picker.zig");
+const panel_widget = @import("tui/widgets/panel.zig");
+const provider_picker = @import("tui/widgets/provider_picker.zig");
+const resume_picker = @import("tui/widgets/resume_picker.zig");
 const tui_provider = @import("tui/provider_controller.zig");
 const tui_status = @import("tui/status.zig");
 const tui_style = @import("tui/style.zig");
@@ -30,7 +36,7 @@ const threadRows = tui_metrics.threadRows;
 const visibleRows = tui_metrics.visibleRows;
 
 const logo_bytes_max = 64 * 1024;
-const loading_spinners = [4][]const u8{ "Firing Neurons", "Multiplying Matrices", "brr..brr...", "Warping" };
+const loading_spinners = tui_thread_projection.loading_spinners;
 const loading_frame_ms = tui_message.loading_frame_ms;
 const command_prefix: u8 = '/';
 const picker_secondary_column: u16 = 52;
@@ -56,13 +62,12 @@ pub const App = struct {
     model_sources: std.ArrayList(ModelSource) = .empty,
     model_reasoning: std.ArrayList(u32) = .empty,
     model_selection: u32 = 0,
-    model_column: ModelColumn = .model,
+    model_column: model_picker.Column = .model,
     model_reasoning_snapshot: std.ArrayList(u32) = .empty,
     model_selection_snapshot: u32 = 0,
-    provider_selection: u32 = 0,
-    provider_column: ProviderColumn = .provider,
+    provider_picker: provider_picker.State = .{},
     codex_signed_in: bool = false,
-    custom_connection_field: CustomConnectionField = .base_url,
+    custom_connection_field: custom_connection_form.Field = .base_url,
     custom_connection_show_errors: bool = false,
     custom_base_url: std.ArrayList(u8) = .empty,
     custom_api_key: std.ArrayList(u8) = .empty,
@@ -70,17 +75,10 @@ pub const App = struct {
     cached_config_owned: bool = false,
     retired_threads: std.ArrayList(thread_mod.Thread) = .empty,
     in_flight: bool = false,
-    loading_index: ?u32 = null,
+    thread_projection: tui_thread_projection.ThreadProjection = .{},
     loading_frame: u8 = 0,
-    loading_word_index: u8 = 0,
     loading_tick_active: bool = false,
-    agent_index: ?u32 = null,
-    thinking_index: ?u32 = null,
-    tool_seen_in_response: bool = false,
-    awaiting_tool_call: bool = false,
-    pending_redraw: bool = false,
     thread_auto_scroll: bool = true,
-    tool_indexes: std.ArrayList(?u32) = .empty,
     thread_list: vxfw.ListView = .{
         .children = .{ .slice = &.{} },
         .draw_cursor = false,
@@ -99,10 +97,7 @@ pub const App = struct {
 
     const Mode = enum { normal, command, session_picker, provider_picker, custom_connection_form, model_picker };
     const ModelCatalog = enum { connected_provider, openai_codex };
-    const ModelColumn = enum { model, reasoning };
     const ModelSource = enum { openai_codex, openai_compatible };
-    const ProviderColumn = enum { provider, sign_out };
-    const CustomConnectionField = enum { base_url, api_key };
 
     pub fn init(io: std.Io, gpa: std.mem.Allocator, agent: *agent_mod.Agent) App {
         return .{
@@ -165,7 +160,7 @@ pub const App = struct {
             }
         }
         self.worker_context.queue.deinit(self.worker_context.io, self.worker_context.gpa);
-        self.tool_indexes.deinit(self.gpa);
+        self.thread_projection.deinit(self.gpa);
         self.thread.deinit(self.gpa);
         self.input.deinit();
         self.* = undefined;
@@ -211,7 +206,7 @@ pub const App = struct {
         try self.agent.addUser(prompt);
         try self.appendLoading();
         self.in_flight = true;
-        return self.loading_index;
+        return self.thread_projection.loading_index;
     }
 
     fn formatNoProviderMessage(self: *App) ![]u8 {
@@ -250,19 +245,12 @@ pub const App = struct {
     }
 
     fn resetTurnState(self: *App) void {
-        self.agent_index = null;
-        self.thinking_index = null;
-        self.loading_index = null;
+        self.thread_projection.resetTurn(self.io);
         self.loading_frame = 0;
-        self.loading_word_index = chooseLoadingWordIndex(self.io);
-        self.tool_seen_in_response = false;
-        self.awaiting_tool_call = true;
-        self.pending_redraw = false;
         // Leave `thread_auto_scroll` alone — if the user has scrolled away
         // from the tail to read older context, submitting another message
         // should not yank them back. They can scroll down (or arrow-down)
         // to opt back into auto-follow.
-        self.tool_indexes.clearRetainingCapacity();
     }
 
     pub fn startTurn(self: *App) !void {
@@ -273,28 +261,7 @@ pub const App = struct {
     }
 
     fn appendLoading(self: *App) !void {
-        std.debug.assert(self.loading_index == null);
-        std.debug.assert(self.loading_word_index < loading_spinners.len);
-        self.loading_index = try self.thread.append(
-            self.gpa,
-            .status,
-            loading_spinners[self.loading_word_index],
-            "",
-        );
-    }
-
-    fn removeLoading(self: *App) void {
-        const index = self.loading_index orelse return;
-        self.loading_index = null;
-        if (index >= self.thread.messages.items.len) return;
-        self.thread.remove(self.gpa, index);
-        self.adjustIndexesAfterRemove(index);
-    }
-
-    fn adjustIndexesAfterRemove(self: *App, removed_index: u32) void {
-        adjustOptionalIndex(&self.agent_index, removed_index);
-        adjustOptionalIndex(&self.thinking_index, removed_index);
-        for (self.tool_indexes.items) |*tool_index| adjustOptionalIndex(tool_index, removed_index);
+        try self.thread_projection.appendLoading(self.gpa, &self.thread);
     }
 
     fn advanceLoadingFrame(self: *App) void {
@@ -304,200 +271,12 @@ pub const App = struct {
     }
 
     pub fn applyAgentEvent(self: *App, event: agent_mod.Agent.Event) !bool {
-        switch (event) {
-            .turn_started => return false,
-            .response_delta => |delta| {
-                self.removeLoading();
-                if (delta.len == 0) return false;
-                _ = try self.finishThinking();
-                try self.applyContentDelta(delta);
-                self.pending_redraw = true;
-                return true;
-            },
-            .thinking_delta => |delta| {
-                self.removeLoading();
-                if (try self.applyReasoningDelta(delta)) {
-                    self.pending_redraw = true;
-                }
-                return false;
-            },
-            .tool_delta => |tool| {
-                const thinking_finished = try self.finishThinking();
-                if (try self.applyToolDelta(tool)) {
-                    self.pending_redraw = true;
-                }
-                if (thinking_finished) {
-                    self.pending_redraw = true;
-                }
-                return false;
-            },
-            .delta_end => {
-                const redraw = self.pending_redraw;
-                self.pending_redraw = false;
-                // Once the model has started streaming (reasoning, content, or
-                // a tool call), we are committed to this turn — no need to put
-                // the spinner back between chunks. The visible streaming text
-                // is its own progress indicator, and any future "waiting" gap
-                // (between tool batches, or before the next turn) is handled
-                // by the explicit appendLoading sites.
-                return redraw;
-            },
-            .tool_call_finished => |tool| {
-                self.removeLoading();
-                const thinking_finished = try self.finishThinking();
-                return thinking_finished or try self.applyToolFinished(tool);
-            },
-            .tool_batch_finished => {
-                self.removeLoading();
-                const thinking_finished = try self.finishThinking();
-                self.agent_index = null;
-                self.thinking_index = null;
-                self.tool_seen_in_response = false;
-                self.awaiting_tool_call = false;
-                self.tool_indexes.clearRetainingCapacity();
-                try self.appendLoading();
-                _ = thinking_finished;
-                return true;
-            },
-            .turn_failed => |message| {
-                self.removeLoading();
-                _ = try self.thread.append(self.gpa, .agent, "agent", message);
-                return true;
-            },
-            .turn_finished => {
-                self.removeLoading();
-                _ = try self.finishThinking();
-                self.in_flight = false;
-                self.awaitTurn();
-                return true;
-            },
-        }
-    }
-
-    fn applyContentDelta(self: *App, delta: []const u8) !void {
-        if (delta.len == 0) return;
-        const selected = self.thread.selected;
-        if (self.agent_index) |index| {
-            try self.thread.appendAgentDelta(self.gpa, index, delta);
-        } else {
-            self.agent_index = try self.thread.append(self.gpa, .agent, "agent", delta);
-        }
-        if (self.tool_seen_in_response) {
-            if (selected) |index| self.thread.select(index);
-        } else {
-            self.selectGeneratedMessage(self.agent_index.?);
-        }
-    }
-
-    fn finishThinking(self: *App) !bool {
-        const index = self.thinking_index orelse return false;
-        if (index >= self.thread.messages.items.len) return false;
-        if (std.mem.eql(u8, self.thread.messages.items[index].title, "Thoughts")) return false;
-        try self.thread.finishThinking(self.gpa, index);
-        return true;
-    }
-
-    fn applyReasoningDelta(self: *App, delta: []const u8) !bool {
-        if (delta.len == 0) return false;
-        var visible_change = false;
-        if (self.thinking_index) |index| {
-            try self.thread.appendThinkingDelta(self.gpa, index, delta);
-        } else if (self.agent_index) |agent_index| {
-            self.thinking_index = try self.thread.insert(
-                self.gpa,
-                agent_index,
-                .thinking,
-                "Thinking...",
-                delta,
-            );
-            self.agent_index = agent_index + 1;
-            self.thread.select(self.thinking_index.?);
-            visible_change = true;
-        } else {
-            self.thinking_index = try self.thread.append(self.gpa, .thinking, "Thinking...", delta);
-            visible_change = true;
-        }
-        if (self.agent_index == null and !self.tool_seen_in_response) {
-            self.selectGeneratedMessage(self.thinking_index.?);
+        const visible_change = try self.thread_projection.apply(self.gpa, &self.thread, event);
+        if (event == .turn_finished) {
+            self.in_flight = false;
+            self.awaitTurn();
         }
         return visible_change;
-    }
-
-    fn applyToolDelta(self: *App, tool: ai.ToolDelta) !bool {
-        if (std.mem.eql(u8, tool.name, "bash")) {
-            const command = agent_mod.parseCommand(self.gpa, tool.arguments) catch return false;
-            self.gpa.free(command);
-        }
-        const title = try agent_mod.formatToolTitle(self.gpa, tool.name, tool.arguments);
-        defer self.gpa.free(title);
-
-        const loading_removed = self.loading_index != null;
-        self.removeLoading();
-
-        var visible_change = false;
-        if (self.toolThreadIndex(tool.index)) |index| {
-            visible_change = !toolTitleMatchesCommand(self.thread.messages.items[index].title, title);
-            try self.thread.updateTool(self.gpa, index, title);
-        } else {
-            const index = try self.thread.startTool(self.gpa, title);
-            try self.putToolThreadIndex(tool.index, index);
-            visible_change = true;
-        }
-        self.tool_seen_in_response = true;
-        self.agent_index = null;
-        return loading_removed or visible_change;
-    }
-
-    fn applyToolFinished(self: *App, tool: agent_mod.Agent.Event.ToolCallFinished) !bool {
-        const policy = tool_policy.forName(tool.name);
-        const existing_index = self.toolThreadIndex(tool.index);
-        const index = if (existing_index) |index| index else index: {
-            const created = try self.thread.startTool(self.gpa, tool.display_label);
-            try self.putToolThreadIndex(tool.index, created);
-            break :index created;
-        };
-
-        const visible_before = self.toolFinishVisibleChange(index, tool.display_label);
-        const was_expanded = self.thread.messages.items[index].expanded;
-        try self.thread.updateTool(self.gpa, index, tool.display_label);
-        try self.thread.finishTool(self.gpa, index, tool.display_body, tool.stderr, tool.failed);
-        self.thread.messages.items[index].expanded = policy.expand_by_default;
-        self.thread.messages.items[index].tool_render = policy.render;
-        self.selectGeneratedMessage(index);
-        self.tool_seen_in_response = true;
-        self.agent_index = null;
-        return existing_index == null or visible_before or policy.expand_by_default != was_expanded;
-    }
-
-    fn selectGeneratedMessage(self: *App, index: u32) void {
-        // Re-assert selection only when the user is already on this exact
-        // message (or has no selection yet). A scrolled-up user, or a user
-        // parked at the tail while an *earlier* message is being finished,
-        // stays put.
-        if (self.thread.selected) |selected| {
-            if (selected != index) return;
-        }
-        self.thread.select(index);
-    }
-
-    fn toolFinishVisibleChange(self: *const App, index: u32, command: []const u8) bool {
-        if (index >= self.thread.messages.items.len) return true;
-        const message = self.thread.messages.items[index];
-        if (message.kind != .tool) return true;
-        if (message.expanded) return true;
-        return !toolTitleMatchesCommand(message.title, command);
-    }
-
-    fn toolThreadIndex(self: *const App, tool_index: u32) ?u32 {
-        if (tool_index >= self.tool_indexes.items.len) return null;
-        return self.tool_indexes.items[tool_index];
-    }
-
-    fn putToolThreadIndex(self: *App, tool_index: u32, thread_index: u32) !void {
-        while (self.tool_indexes.items.len <= tool_index) {
-            try self.tool_indexes.append(self.gpa, null);
-        }
-        self.tool_indexes.items[tool_index] = thread_index;
     }
 
     pub fn handleCommandKey(self: *App, key: vaxis.Key) !bool {
@@ -512,33 +291,7 @@ pub const App = struct {
     }
 
     fn handleProviderPickerKey(self: *App, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.left, .{})) {
-            self.provider_column = .provider;
-            return true;
-        }
-        if (key.matches(vaxis.Key.right, .{})) {
-            if (self.provider_selection == 0) {
-                if (self.isCodexSignedIn()) self.provider_column = .sign_out;
-            }
-            return true;
-        }
-        if (key.matches(vaxis.Key.tab, .{})) {
-            if (self.provider_selection == 0) {
-                if (self.isCodexSignedIn()) self.provider_column = nextProviderColumn(self.provider_column);
-            }
-            return true;
-        }
-        if (key.matches(vaxis.Key.up, .{})) {
-            self.provider_selection = previousIndex(self.provider_selection, providerOptionCount());
-            self.provider_column = .provider;
-            return true;
-        }
-        if (key.matches(vaxis.Key.down, .{})) {
-            self.provider_selection = nextIndex(self.provider_selection, providerOptionCount());
-            self.provider_column = .provider;
-            return true;
-        }
-        return false;
+        return self.provider_picker.handleKey(key, self.isCodexSignedIn());
     }
 
     fn handleCustomConnectionKey(self: *App, key: vaxis.Key) !bool {
@@ -686,18 +439,16 @@ pub const App = struct {
         const input = try self.peekInput();
         defer self.gpa.free(input);
         if (self.mode == .provider_picker) {
-            if (self.provider_selection == 0) {
-                if (self.provider_column == .sign_out) {
+            switch (self.provider_picker.selectedAction()) {
+                .connect_codex => self.connectCodex() catch |err| try self.reportConnectionError(err),
+                .sign_out_codex => {
                     if (self.isCodexSignedIn()) {
                         self.signOutCodex() catch |err| try self.reportConnectionError(err);
                     } else {
                         self.connectCodex() catch |err| try self.reportConnectionError(err);
                     }
-                } else {
-                    self.connectCodex() catch |err| try self.reportConnectionError(err);
-                }
-            } else {
-                self.openCustomConnectionForm() catch |err| try self.reportConnectionError(err);
+                },
+                .custom_connection => self.openCustomConnectionForm() catch |err| try self.reportConnectionError(err),
             }
             return true;
         }
@@ -750,8 +501,7 @@ pub const App = struct {
 
     fn openProviderPicker(self: *App) !void {
         self.mode = .provider_picker;
-        self.provider_selection = 0;
-        self.provider_column = .provider;
+        self.provider_picker.reset();
         self.clearInput();
     }
 
@@ -826,7 +576,7 @@ pub const App = struct {
         try self.loadCustomConnectionFieldInput();
     }
 
-    fn customConnectionFieldFilled(self: *App, field: CustomConnectionField) !bool {
+    fn customConnectionFieldFilled(self: *App, field: custom_connection_form.Field) !bool {
         if (self.custom_connection_field == field) {
             const input = try self.peekInput();
             defer self.gpa.free(input);
@@ -838,7 +588,7 @@ pub const App = struct {
         };
     }
 
-    fn customConnectionFieldMarker(self: *App, field: CustomConnectionField) ![]const u8 {
+    fn customConnectionFieldMarker(self: *App, field: custom_connection_form.Field) ![]const u8 {
         if (try self.customConnectionFieldFilled(field)) return "✓";
         if (self.custom_connection_show_errors) return "✗";
         return " ";
@@ -1138,7 +888,7 @@ pub const App = struct {
         defer self.gpa.free(filter);
         var visible_index: u32 = 0;
         for (self.resume_summaries.items) |*summary| {
-            if (!resumeMatches(summary, filter)) continue;
+            if (!resume_picker.matches(summary, filter)) continue;
             if (visible_index == self.resume_selection) return summary;
             visible_index += 1;
         }
@@ -1148,11 +898,7 @@ pub const App = struct {
     fn visibleResumeCount(self: *App) !u32 {
         const filter = try self.peekInput();
         defer self.gpa.free(filter);
-        var count: u32 = 0;
-        for (self.resume_summaries.items) |*summary| {
-            if (resumeMatches(summary, filter)) count += 1;
-        }
-        return count;
+        return resume_picker.visibleCount(self.resume_summaries.items, filter);
     }
 
     fn resumeClear(self: *App) void {
@@ -1327,43 +1073,6 @@ fn previousIndex(current: u32, count: u32) u32 {
     return current - 1;
 }
 
-fn providerOptionCount() u32 {
-    return 2;
-}
-
-fn nextProviderColumn(current: App.ProviderColumn) App.ProviderColumn {
-    return switch (current) {
-        .provider => .sign_out,
-        .sign_out => .provider,
-    };
-}
-
-fn pickerSecondaryColumn(width: u16) u16 {
-    return @min(picker_secondary_column, width / 2);
-}
-
-fn adjustOptionalIndex(index: *?u32, removed_index: u32) void {
-    const current = index.* orelse return;
-    if (current == removed_index) {
-        index.* = null;
-    } else if (current > removed_index) {
-        index.* = current - 1;
-    }
-}
-
-fn toolTitleMatchesCommand(title: []const u8, command: []const u8) bool {
-    const prefix = "$ ";
-    return std.mem.startsWith(u8, title, prefix) and
-        std.mem.eql(u8, title[prefix.len..], command);
-}
-
-fn chooseLoadingWordIndex(io: std.Io) u8 {
-    std.debug.assert(loading_spinners.len > 0);
-    const timestamp: std.Io.Timestamp = .now(io, .awake);
-    const index = @mod(timestamp.nanoseconds, loading_spinners.len);
-    return @intCast(index);
-}
-
 pub fn run(
     init: std.process.Init,
     runtime: *runtime_mod.AgentRuntime,
@@ -1456,7 +1165,7 @@ const RootWidget = struct {
     fn handleTick(self: *RootWidget, ctx: *vxfw.EventContext) !void {
         var visible_change = try self.drainAgentEvents(ctx);
 
-        if (self.app.loading_index) |_| {
+        if (self.app.thread_projection.loading_index) |_| {
             self.spinner_tick_accum += drain_tick_ms;
             if (self.spinner_tick_accum >= spinner_tick_threshold_ms) {
                 self.spinner_tick_accum = 0;
@@ -1467,7 +1176,7 @@ const RootWidget = struct {
             self.spinner_tick_accum = 0;
         }
 
-        const should_tick = self.app.in_flight or self.app.loading_index != null;
+        const should_tick = self.app.in_flight or self.app.thread_projection.loading_index != null;
         if (should_tick) {
             try ctx.tick(drain_tick_ms, self.widget());
         } else {
@@ -1512,9 +1221,9 @@ const RootWidget = struct {
             defer worker_gpa.destroy(event_ptr);
             defer event_ptr.deinit(worker_gpa);
 
-            if (self.app.loading_index != null) try self.startLoadingTick(ctx);
+            if (self.app.thread_projection.loading_index != null) try self.startLoadingTick(ctx);
             if (try self.app.applyAgentEvent(event_ptr.*)) visible_change = true;
-            if (self.app.loading_index != null) try self.startLoadingTick(ctx);
+            if (self.app.thread_projection.loading_index != null) try self.startLoadingTick(ctx);
         }
         return visible_change;
     }
@@ -1620,12 +1329,12 @@ const ThreadWidget = struct {
         if (messages.len == 0) return;
         if (self.app.thread_auto_scroll) {
             const tail_index: u32 = @intCast(messages.len - 1);
-            const cursor = self.app.loading_index orelse tail_index;
+            const cursor = self.app.thread_projection.loading_index orelse tail_index;
             self.app.thread_list.cursor = cursor;
             self.scrollCursorToTail(ctx, cursor);
             return;
         }
-        const cursor = self.app.thread.selected orelse self.app.loading_index orelse 0;
+        const cursor = self.app.thread.selected orelse self.app.thread_projection.loading_index orelse 0;
         const cursor_changed = self.app.thread_list.cursor != cursor;
         self.app.thread_list.cursor = cursor;
         if (cursor_changed) self.app.thread_list.ensureScroll();
@@ -1650,11 +1359,18 @@ const ThreadWidget = struct {
 };
 
 const Command = enum { connect, model, new, resume_session };
-const commands = [_]struct { name: []const u8, command: Command }{
+const CommandEntry = struct { name: []const u8, command: Command };
+const commands = [_]CommandEntry{
     .{ .name = "Connect", .command = .connect },
     .{ .name = "Models", .command = .model },
     .{ .name = "New", .command = .new },
     .{ .name = "Resume", .command = .resume_session },
+};
+const command_panel_entries = [_]command_panel.Entry{
+    .{ .name = "Connect" },
+    .{ .name = "Models" },
+    .{ .name = "New" },
+    .{ .name = "Resume" },
 };
 
 fn inputLabel(app: *const App) []const u8 {
@@ -1707,6 +1423,10 @@ fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
     return std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
 }
 
+fn pickerSecondaryColumn(width: u16) u16 {
+    return @min(picker_secondary_column, width / 2);
+}
+
 fn inputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8) anyerror!void {
     const app: *App = @ptrCast(@alignCast(userdata.?));
     try app.syncModeWithInput(value);
@@ -1725,98 +1445,73 @@ const PanelWidget = struct {
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         if (self.app.mode == .command) {
-            var content: CommandPanelContent = .{ .app = self.app };
-            var border: vxfw.Border = .{ .child = content.widget(), .style = StylePalette.tool };
-            return border.widget().draw(ctx);
+            const input = try self.app.peekInput();
+            defer self.app.gpa.free(input);
+            const filter = if (input.len > 0 and input[0] == command_prefix) input[1..] else "";
+            var content: command_panel.Content = .{
+                .entries = &command_panel_entries,
+                .filter = filter,
+                .selection = self.app.command_selection,
+            };
+            var shell: panel_widget.Shell = .{ .child = content.widget() };
+            return shell.widget().draw(ctx);
         }
         if (self.app.mode == .session_picker) {
-            var content: ResumePanelContent = .{ .app = self.app };
-            var border: vxfw.Border = .{ .child = content.widget(), .style = StylePalette.tool };
-            return border.widget().draw(ctx);
+            const filter = try self.app.peekInput();
+            defer self.app.gpa.free(filter);
+            var content: resume_picker.Content = .{
+                .io = self.app.io,
+                .list = &self.app.resume_list,
+                .summaries = self.app.resume_summaries.items,
+                .selection = self.app.resume_selection,
+                .global = self.app.resume_global,
+                .filter = filter,
+            };
+            var shell: panel_widget.Shell = .{ .child = content.widget() };
+            return shell.widget().draw(ctx);
         }
         if (self.app.mode == .provider_picker) {
-            var content: ProviderPanelContent = .{ .app = self.app };
-            var border: vxfw.Border = .{ .child = content.widget(), .style = StylePalette.tool };
-            return border.widget().draw(ctx);
+            var content: provider_picker.Content = .{
+                .state = self.app.provider_picker,
+                .codex_signed_in = self.app.isCodexSignedIn(),
+            };
+            var shell: panel_widget.Shell = .{ .child = content.widget() };
+            return shell.widget().draw(ctx);
         }
         if (self.app.mode == .custom_connection_form) {
-            var content: CustomConnectionPanelContent = .{ .app = self.app };
-            var border: vxfw.Border = .{ .child = content.widget(), .style = StylePalette.tool };
-            return border.widget().draw(ctx);
+            var content: custom_connection_form.Content = .{
+                .field = self.app.custom_connection_field,
+                .base_marker = try self.app.customConnectionFieldMarker(.base_url),
+                .key_marker = try self.app.customConnectionFieldMarker(.api_key),
+            };
+            var shell: panel_widget.Shell = .{ .child = content.widget() };
+            return shell.widget().draw(ctx);
         }
         if (self.app.mode == .model_picker) {
-            var content: ModelPanelContent = .{ .app = self.app };
-            var border: vxfw.Border = .{ .child = content.widget(), .style = StylePalette.tool };
-            return border.widget().draw(ctx);
+            const status = tui_status.modelStatus(self.app.runtime, self.app.cached_config);
+            var content: model_picker.Content = .{
+                .models = self.app.codex_models.items,
+                .list = &self.app.model_list,
+                .selection = self.app.model_selection,
+                .column = self.app.model_column,
+                .active_model = if (status) |value| value.model else null,
+                .reasoning_options = modelReasoningOptions(),
+                .reasoning_indexes = self.app.model_reasoning.items,
+            };
+            var shell: panel_widget.Shell = .{ .child = content.widget() };
+            return shell.widget().draw(ctx);
         }
 
         return vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
     }
 };
 
-const CommandPanelContent = struct {
-    app: *App,
-
-    fn widget(self: *CommandPanelContent) vxfw.Widget {
-        return .{ .userdata = self, .drawFn = drawContent };
-    }
-
-    fn drawContent(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *CommandPanelContent = @ptrCast(@alignCast(ptr));
-        const width = ctx.max.width orelse 0;
-        const height = ctx.max.height orelse 0;
-        var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
-        try drawCommandPanel(self.app, &surface, ctx);
-        return surface;
-    }
-};
-
-fn drawCommandPanel(app: *App, surface: *vxfw.Surface, ctx: vxfw.DrawContext) std.mem.Allocator.Error!void {
-    const input = app.peekInput() catch return;
-    defer app.gpa.free(input);
-    const filter = if (input.len > 0 and input[0] == command_prefix) input[1..] else "";
-    var row: u16 = 0;
-    var index: u32 = 0;
-    for (commands) |entry| {
-        if (!startsWithIgnoreCase(entry.name, filter)) continue;
-        var buffer: [32]u8 = undefined;
-        const selected = index == app.command_selection;
-        const prefix = if (selected) "‣ " else "  ";
-        const text = std.fmt.bufPrint(&buffer, "{s}{s}", .{ prefix, entry.name }) catch entry.name;
-        try writeCommandLine(surface, row, text, ctx, selected);
-        row += 1;
-        index += 1;
-        if (row >= surface.size.height) return;
-    }
-}
-
-fn drawListSurface(
-    ctx: vxfw.DrawContext,
-    owner: vxfw.Widget,
-    list: vxfw.Widget,
-) std.mem.Allocator.Error!vxfw.Surface {
-    const width = ctx.max.width orelse 0;
-    const height = ctx.max.height orelse 0;
-    const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
-    children[0] = .{
-        .origin = .{ .row = 0, .col = 0 },
-        .surface = try list.draw(ctx.withConstraints(
-            .{ .width = width, .height = height },
-            .{ .width = width, .height = height },
-        )),
-        .z_index = 0,
-    };
-    return vxfw.Surface.initWithChildren(ctx.arena, owner, .{ .width = width, .height = height }, children);
-}
-
-fn inputHintText(mode: App.Mode) []const u8 {
-    return switch (mode) {
-        .command => "↑↓ Navigate · [ENTER] Select · [ESC] Back",
-        .session_picker => "↑↓ Navigate · [TAB] Toggle · [ENTER] Select · [ESC] Back",
-        .provider_picker => "↑↓ Navigate · ←→ Actions · [ENTER] Select · [ESC] Back",
-        .custom_connection_form => "↑↓ Navigate · [ENTER] Save · [ESC] Back",
-        .model_picker => "↑↓ Navigate · [TAB] Toggle Effort · ←→ Actions · [ENTER] Select · [ESC] Back",
-        .normal => "↑↓ Navigate · [TAB] Expand",
+fn modelReasoningOptions() []const model_picker.ReasoningOption {
+    return &.{
+        .{ .label = "medium (Default)" },
+        .{ .label = "high" },
+        .{ .label = "xhigh" },
+        .{ .label = "low" },
     };
 }
 
@@ -1831,340 +1526,15 @@ fn reasoningOptions() []const ReasoningOption {
     };
 }
 
-const ProviderPanelContent = struct {
-    app: *App,
-
-    fn widget(self: *ProviderPanelContent) vxfw.Widget {
-        return .{ .userdata = self, .drawFn = drawContent };
-    }
-
-    fn drawContent(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *ProviderPanelContent = @ptrCast(@alignCast(ptr));
-        const width = ctx.max.width orelse 0;
-        const height = ctx.max.height orelse 0;
-        var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
-        const connected = self.app.isCodexSignedIn();
-        const codex_focused = self.app.provider_selection == 0 and self.app.provider_column == .provider;
-        const codex_prefix = if (codex_focused) "‣ " else "  ";
-        const codex_label = if (connected) "OpenAI Codex [CONNECTED]" else "OpenAI Codex";
-        const codex_text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ codex_prefix, codex_label });
-        try writeCommandLine(&surface, 0, codex_text, ctx, codex_focused);
-        if (connected) {
-            const signout_focused = self.app.provider_selection == 0 and self.app.provider_column == .sign_out;
-            const signout_prefix = if (signout_focused) "‣ " else "  ";
-            const signout_text = try std.fmt.allocPrint(ctx.arena, "{s}Sign out", .{signout_prefix});
-            try writePanelLineAt(&surface, 0, signout_text, ctx, signout_focused, pickerSecondaryColumn(surface.size.width));
-        }
-        const custom_focused = self.app.provider_selection == 1;
-        const custom_prefix = if (custom_focused) "‣ " else "  ";
-        const custom_text = try std.fmt.allocPrint(ctx.arena, "{s}Custom", .{custom_prefix});
-        try writeCommandLine(&surface, 1, custom_text, ctx, custom_focused);
-        return surface;
-    }
-};
-
-const CustomConnectionPanelContent = struct {
-    app: *App,
-
-    fn widget(self: *CustomConnectionPanelContent) vxfw.Widget {
-        return .{ .userdata = self, .drawFn = drawContent };
-    }
-
-    fn drawContent(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *CustomConnectionPanelContent = @ptrCast(@alignCast(ptr));
-        const width = ctx.max.width orelse 0;
-        const height = ctx.max.height orelse 0;
-        var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
-        const base_focused = self.app.custom_connection_field == .base_url;
-        const key_focused = self.app.custom_connection_field == .api_key;
-        const base_prefix = if (base_focused) "‣ " else "  ";
-        const key_prefix = if (key_focused) "‣ " else "  ";
-        const base_marker = try self.app.customConnectionFieldMarker(.base_url);
-        const key_marker = try self.app.customConnectionFieldMarker(.api_key);
-        const base_text = try std.fmt.allocPrint(ctx.arena, "{s}{s} Base URL", .{ base_prefix, base_marker });
-        const key_text = try std.fmt.allocPrint(ctx.arena, "{s}{s} API Key", .{ key_prefix, key_marker });
-        try writeCommandLine(&surface, 0, base_text, ctx, base_focused);
-        try writeCommandLine(&surface, 1, key_text, ctx, key_focused);
-        try writePanelLineAt(&surface, 3, "Enter a value below.", ctx, false, ConversationLayout.left -| 1);
-        return surface;
-    }
-};
-
-const ModelPanelContent = struct {
-    app: *App,
-
-    fn widget(self: *ModelPanelContent) vxfw.Widget {
-        return .{ .userdata = self, .drawFn = drawContent };
-    }
-
-    fn drawContent(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *ModelPanelContent = @ptrCast(@alignCast(ptr));
-        if (self.app.codex_models.items.len == 0) return self.drawEmpty(ctx);
-        const widgets = try self.modelWidgets(ctx);
-        self.app.model_list.children = .{ .slice = widgets };
-        self.app.model_list.item_count = @intCast(widgets.len);
-        self.app.model_list.cursor = self.app.model_selection + 1;
-        self.app.model_list.ensureScroll();
-        return drawListSurface(ctx, self.widget(), self.app.model_list.widget());
-    }
-
-    fn drawEmpty(self: *ModelPanelContent, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const width = ctx.max.width orelse 0;
-        const height = ctx.max.height orelse 0;
-        var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
-        try writePanelLineAt(&surface, 0, "No provider models available. Run /connect first.", ctx, false, ConversationLayout.left -| 1);
-        return surface;
-    }
-
-    fn modelWidgets(self: *ModelPanelContent, ctx: vxfw.DrawContext) ![]vxfw.Widget {
-        const widgets = try ctx.arena.alloc(vxfw.Widget, self.app.codex_models.items.len + 1);
-        const header = try ctx.arena.create(ModelHeaderWidget);
-        header.* = .{};
-        widgets[0] = header.widget();
-        const rows = try ctx.arena.alloc(ModelRowWidget, self.app.codex_models.items.len);
-        for (self.app.codex_models.items, 0..) |*model, index| {
-            rows[index] = .{
-                .app = self.app,
-                .model = model,
-                .index = @intCast(index),
-                .selected = self.app.model_selection == index,
-            };
-            widgets[index + 1] = rows[index].widget();
-        }
-        return widgets;
-    }
-};
-
-const ModelHeaderWidget = struct {
-    fn widget(self: *ModelHeaderWidget) vxfw.Widget {
-        return .{ .userdata = self, .drawFn = drawHeader };
-    }
-
-    fn drawHeader(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *ModelHeaderWidget = @ptrCast(@alignCast(ptr));
-        const width = ctx.max.width orelse 0;
-        var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
-        try writePanelLineStyledAt(&surface, 0, "NAME", ctx, false, ConversationLayout.left + 1, StylePalette.panel_header);
-        try writePanelLineStyledAt(&surface, 0, "REASONING EFFORT", ctx, false, pickerSecondaryColumn(surface.size.width) + 2, StylePalette.panel_header);
-        return surface;
-    }
-};
-
-const ModelRowWidget = struct {
-    app: *App,
-    model: *const codex.Model,
-    index: u32,
-    selected: bool,
-
-    fn widget(self: *ModelRowWidget) vxfw.Widget {
-        return .{ .userdata = self, .drawFn = drawRow };
-    }
-
-    fn drawRow(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *ModelRowWidget = @ptrCast(@alignCast(ptr));
-        const width = ctx.max.width orelse 0;
-        var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
-        const model_focused = self.selected and self.app.model_column == .model;
-        const prefix = if (model_focused) "‣ " else "  ";
-        const text = if (self.activeModel())
-            try std.fmt.allocPrint(ctx.arena, "{s}{s} [ACTIVE]", .{ prefix, self.model.label })
-        else
-            try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.model.label });
-        try writePanelLineAt(&surface, 0, text, ctx, model_focused, ConversationLayout.left -| 1);
-        if (self.selected) try self.drawReasoning(&surface, ctx);
-        return surface;
-    }
-
-    fn activeModel(self: *const ModelRowWidget) bool {
-        const status = tui_status.modelStatus(self.app.runtime, self.app.cached_config) orelse return false;
-        return std.mem.eql(u8, status.model, self.model.id);
-    }
-
-    fn drawReasoning(self: *const ModelRowWidget, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
-        const effort_focused = self.app.model_column == .reasoning;
-        const effort = reasoningOptions()[self.app.selectedReasoningIndex()].label;
-        const effort_prefix = if (effort_focused) "‣ " else "  ";
-        const effort_text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ effort_prefix, effort });
-        try writePanelLineAt(surface, 0, effort_text, ctx, effort_focused, pickerSecondaryColumn(surface.size.width));
-    }
-};
-
-const ResumePanelContent = struct {
-    app: *App,
-
-    fn widget(self: *ResumePanelContent) vxfw.Widget {
-        return .{ .userdata = self, .drawFn = drawContent };
-    }
-
-    fn drawContent(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *ResumePanelContent = @ptrCast(@alignCast(ptr));
-        const widgets = try self.resumeWidgets(ctx);
-        self.app.resume_list.children = .{ .slice = widgets };
-        self.app.resume_list.item_count = @intCast(widgets.len);
-        self.app.resume_list.cursor = self.app.resume_selection;
-        self.app.resume_list.ensureScroll();
-        return drawListSurface(ctx, self.widget(), self.app.resume_list.widget());
-    }
-
-    fn resumeWidgets(self: *ResumePanelContent, ctx: vxfw.DrawContext) ![]vxfw.Widget {
-        const filter = self.app.peekInput() catch "";
-        defer if (filter.len > 0) self.app.gpa.free(filter);
-        const count = try self.app.visibleResumeCount();
-        const widgets = try ctx.arena.alloc(vxfw.Widget, count);
-        const rows = try ctx.arena.alloc(ResumeRowWidget, count);
-        var index: u32 = 0;
-        for (self.app.resume_summaries.items) |*summary| {
-            if (!resumeMatches(summary, filter)) continue;
-            rows[index] = .{ .app = self.app, .summary = summary, .selected = index == self.app.resume_selection };
-            widgets[index] = rows[index].widget();
-            index += 1;
-        }
-        return widgets;
-    }
-};
-
-const ResumeRowWidget = struct {
-    app: *App,
-    summary: *const session_mod.SessionSummary,
-    selected: bool,
-
-    fn widget(self: *ResumeRowWidget) vxfw.Widget {
-        return .{ .userdata = self, .drawFn = drawRow };
-    }
-
-    fn drawRow(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *ResumeRowWidget = @ptrCast(@alignCast(ptr));
-        const width = ctx.max.width orelse 0;
-        var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
-        var buffer: [128]u8 = undefined;
-        const modified = tui_status.modifiedTime(self.app.io, buffer[0..], self.summary.updated_at_ms);
-        const left = try self.leftText(ctx, width, modified);
-        try writeCommandLine(&surface, 0, left, ctx, self.selected);
-        try writePanelRight(&surface, 0, modified, ctx, self.selected);
-        return surface;
-    }
-
-    fn leftText(self: *const ResumeRowWidget, ctx: vxfw.DrawContext, width: u16, modified: []const u8) std.mem.Allocator.Error![]const u8 {
-        const marker = if (self.selected) "‣ " else "  ";
-        const available = resumeLeftWidth(ctx, width, modified);
-        const marker_width = ctx.stringWidth(marker);
-        if (available <= marker_width) return ctx.arena.dupe(u8, marker);
-
-        const name = self.summary.title orelse "Untitled";
-        if (!self.app.resume_global) {
-            const title = try truncateText(ctx, name, available - marker_width);
-            return std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ marker, title });
-        }
-
-        const separator = " · ";
-        const separator_width = ctx.stringWidth(separator);
-        if (available <= marker_width + separator_width + 4) {
-            const title = try truncateText(ctx, name, available - marker_width);
-            return std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ marker, title });
-        }
-
-        const content_width = available - marker_width - separator_width;
-        const title_width = @max(@as(usize, 8), content_width / 2);
-        const path_width = content_width - @min(title_width, content_width);
-        const title = try truncateText(ctx, name, @min(title_width, content_width));
-        const path = try truncateText(ctx, self.summary.cwd, path_width);
-        return std.fmt.allocPrint(ctx.arena, "{s}{s}{s}{s}", .{ marker, title, separator, path });
-    }
-};
-
-fn resumeLeftWidth(ctx: vxfw.DrawContext, row_width: u16, modified: []const u8) usize {
-    const start_col = ConversationLayout.left -| 1;
-    const end_col = row_width -| ConversationLayout.right;
-    const date_width = ctx.stringWidth(modified);
-    if (end_col <= start_col) return 0;
-    if (date_width + 1 >= end_col - start_col) return 0;
-    return end_col - start_col - date_width - 1;
-}
-
-fn truncateText(ctx: vxfw.DrawContext, text: []const u8, width: usize) std.mem.Allocator.Error![]const u8 {
-    if (width == 0) return ctx.arena.dupe(u8, "");
-    if (ctx.stringWidth(text) <= width) return ctx.arena.dupe(u8, text);
-    if (width <= 3) return ctx.arena.dupe(u8, "...");
-
-    var out: std.ArrayList(u8) = .empty;
-    var used: usize = 0;
-    var iter = ctx.graphemeIterator(text);
-    while (iter.next()) |grapheme| {
-        const bytes = grapheme.bytes(text);
-        const grapheme_width = ctx.stringWidth(bytes);
-        if (used + grapheme_width + 3 > width) break;
-        try out.appendSlice(ctx.arena, bytes);
-        used += grapheme_width;
-    }
-    try out.appendSlice(ctx.arena, "...");
-    return out.toOwnedSlice(ctx.arena);
-}
-
-fn writeCommandLine(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool) std.mem.Allocator.Error!void {
-    try writePanelLineAt(surface, row, text, ctx, selected, ConversationLayout.left -| 1);
-}
-
-fn writePanelLine(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool) std.mem.Allocator.Error!void {
-    try writePanelLineAt(surface, row, text, ctx, selected, ConversationLayout.left);
-}
-
-fn writePanelRight(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool) std.mem.Allocator.Error!void {
-    if (row >= surface.size.height) return;
-    const stable_text = try ctx.arena.dupe(u8, text);
-    const style = if (selected) StylePalette.tool else StylePalette.thinking_body;
-    const text_width: u16 = @intCast(@min(ctx.stringWidth(stable_text), std.math.maxInt(u16)));
-    const end_col = surface.size.width -| ConversationLayout.right;
-    if (text_width >= end_col) return;
-    var col = end_col - text_width;
-    var iter = ctx.graphemeIterator(stable_text);
-    while (iter.next()) |grapheme| {
-        if (col >= surface.size.width) return;
-        const bytes = grapheme.bytes(stable_text);
-        const width: u8 = @intCast(ctx.stringWidth(bytes));
-        if (width == 0) continue;
-        if (col + width > surface.size.width) return;
-        surface.writeCell(col, row, .{ .char = .{ .grapheme = bytes, .width = width }, .style = style });
-        col += width;
-    }
-}
-
-fn writePanelLineAt(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool, start_col: u16) std.mem.Allocator.Error!void {
-    const style = if (selected) StylePalette.tool else StylePalette.thinking_body;
-    try writePanelLineStyledAt(surface, row, text, ctx, selected, start_col, style);
-}
-
-fn writePanelLineStyledAt(
-    surface: *vxfw.Surface,
-    row: u16,
-    text: []const u8,
-    ctx: vxfw.DrawContext,
-    selected: bool,
-    start_col: u16,
-    style: vaxis.Style,
-) std.mem.Allocator.Error!void {
-    if (row >= surface.size.height) return;
-    _ = selected;
-    const stable_text = try ctx.arena.dupe(u8, text);
-    var col: u16 = start_col;
-    var iter = ctx.graphemeIterator(stable_text);
-    while (iter.next()) |grapheme| {
-        if (col + 1 >= surface.size.width) return;
-        const bytes = grapheme.bytes(stable_text);
-        const width: u8 = @intCast(ctx.stringWidth(bytes));
-        if (width == 0) continue;
-        surface.writeCell(col, row, .{ .char = .{ .grapheme = bytes, .width = width }, .style = style });
-        col += width;
-    }
-}
-
-fn resumeMatches(summary: *const session_mod.SessionSummary, filter: []const u8) bool {
-    if (filter.len == 0) return true;
-    if (summary.title) |title| {
-        if (std.mem.indexOf(u8, title, filter) != null) return true;
-    }
-    if (std.mem.indexOf(u8, summary.cwd, filter) != null) return true;
-    if (std.mem.indexOf(u8, summary.id, filter) != null) return true;
-    return false;
+fn inputHintText(mode: App.Mode) []const u8 {
+    return switch (mode) {
+        .command => "↑↓ Navigate · [ENTER] Select · [ESC] Back",
+        .session_picker => "↑↓ Navigate · [TAB] Toggle · [ENTER] Select · [ESC] Back",
+        .provider_picker => "↑↓ Navigate · ←→ Actions · [ENTER] Select · [ESC] Back",
+        .custom_connection_form => "↑↓ Navigate · [ENTER] Save · [ESC] Back",
+        .model_picker => "↑↓ Navigate · [TAB] Toggle Effort · ←→ Actions · [ENTER] Select · [ESC] Back",
+        .normal => "↑↓ Navigate · [TAB] Expand",
+    };
 }
 
 const CommandInputText = struct {
@@ -2389,11 +1759,12 @@ test "model picker hides model arrow when reasoning column is focused" {
     try app.codex_models.appendSlice(gpa, models);
     try app.model_reasoning.appendNTimes(gpa, 0, app.codex_models.items.len);
 
-    var row: ModelRowWidget = .{
-        .app = &app,
+    var row: model_picker.Row = .{
         .model = &app.codex_models.items[0],
-        .index = 0,
         .selected = true,
+        .column = app.model_column,
+        .active_model = null,
+        .reasoning_label = modelReasoningOptions()[app.selectedReasoningIndex()].label,
     };
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -2422,7 +1793,7 @@ test "model picker without models stays on model column" {
     app.mode = .model_picker;
     app.model_column = .model;
     try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.right }));
-    try std.testing.expectEqual(App.ModelColumn.model, app.model_column);
+    try std.testing.expectEqual(model_picker.Column.model, app.model_column);
 }
 
 test "provider picker opens custom connection form" {
@@ -2437,11 +1808,11 @@ test "provider picker opens custom connection form" {
 
     try app.openProviderPicker();
     try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.down }));
-    try std.testing.expectEqual(@as(u32, 1), app.provider_selection);
+    try std.testing.expectEqual(@as(u32, 1), app.provider_picker.selection);
     try std.testing.expect(try app.submitMode());
 
     try std.testing.expectEqual(App.Mode.custom_connection_form, app.mode);
-    try std.testing.expectEqual(App.CustomConnectionField.base_url, app.custom_connection_field);
+    try std.testing.expectEqual(custom_connection_form.Field.base_url, app.custom_connection_field);
 }
 
 test "custom connection form marks empty base url invalid" {
@@ -2459,7 +1830,7 @@ test "custom connection form marks empty base url invalid" {
     try app.submitCustomConnectionForm();
 
     try std.testing.expectEqual(App.Mode.custom_connection_form, app.mode);
-    try std.testing.expectEqual(App.CustomConnectionField.base_url, app.custom_connection_field);
+    try std.testing.expectEqual(custom_connection_form.Field.base_url, app.custom_connection_field);
     try std.testing.expect(app.custom_connection_show_errors);
     try std.testing.expectEqualStrings("✗", try app.customConnectionFieldMarker(.base_url));
 }
@@ -2480,7 +1851,7 @@ test "custom connection form advances from base url to api key" {
     try app.submitCustomConnectionForm();
 
     try std.testing.expectEqual(App.Mode.custom_connection_form, app.mode);
-    try std.testing.expectEqual(App.CustomConnectionField.api_key, app.custom_connection_field);
+    try std.testing.expectEqual(custom_connection_form.Field.api_key, app.custom_connection_field);
     try std.testing.expectEqualStrings("http://localhost:11434/v1", app.custom_base_url.items);
     try std.testing.expectEqualStrings("✓", try app.customConnectionFieldMarker(.base_url));
 }
@@ -2501,11 +1872,11 @@ test "provider picker selects sign out horizontally" {
     app.codex_signed_in = true;
 
     app.mode = .provider_picker;
-    app.provider_column = .provider;
+    app.provider_picker.column = .provider;
     try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.right }));
-    try std.testing.expectEqual(App.ProviderColumn.sign_out, app.provider_column);
+    try std.testing.expectEqual(provider_picker.Column.sign_out, app.provider_picker.column);
     try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.tab }));
-    try std.testing.expectEqual(App.ProviderColumn.provider, app.provider_column);
+    try std.testing.expectEqual(provider_picker.Column.provider, app.provider_picker.column);
 }
 
 test "codex sign-in survives selecting custom provider" {
@@ -2784,7 +2155,7 @@ test "empty content delta does not finalize thinking" {
     _ = (try app.beginSubmit()).?;
 
     _ = try app.applyAgentEvent(.{ .thinking_delta = "thinking" });
-    const thinking_index = app.thinking_index.?;
+    const thinking_index = app.thread_projection.thinking_index.?;
     try std.testing.expectEqualStrings("Thinking...", app.thread.messages.items[thinking_index].title);
 
     _ = try app.applyAgentEvent(.{ .response_delta = "" });

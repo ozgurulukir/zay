@@ -80,6 +80,10 @@ _Avoid_: ThreadManager
 A TUI-only command entered at the prompt with `:` as the first byte, used for local interaction such as creating or resuming sessions rather than sending a message to the model.
 _Avoid_: Slash command
 
+**Thread projection**:
+The TUI-side module that translates **Agent.Event** streams into **Thread** mutations and projection state: streamed assistant text, thinking blocks, tool preview rows, finished **Display body** rows, loading status rows, and selection stability. It owns event-ordering invariants so draw modules and picker modules do not need to know streaming lifecycle details.
+_Avoid_: UI event handler, stream renderer
+
 **Schema**:
 The per-tool argument shape carried inside a **Tool** — `{ properties: []Property }` where each `Property = { name, kind, description, required }`. Generic over the union of property names across all tools (no hard-coded `command` / `path` / `content` / `input` / `query` fields as in the old `JsonSchemaProperties` struct). Each adapter translates `Schema` into its provider's tools-JSON shape inside the adapter, not in `tools.zig`.
 _Avoid_: "JSON schema" (the Schema is provider-neutral; what each adapter emits is the provider's tool-schema JSON).

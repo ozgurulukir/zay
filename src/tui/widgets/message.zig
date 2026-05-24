@@ -2,9 +2,9 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
-const thread_mod = @import("../thread.zig");
-const tui_metrics = @import("metrics.zig");
-const tui_style = @import("style.zig");
+const thread_mod = @import("../../thread.zig");
+const tui_metrics = @import("../metrics.zig");
+const tui_style = @import("../style.zig");
 
 const StylePalette = tui_style.Palette;
 const gradientStyle = tui_style.gradientStyle;
