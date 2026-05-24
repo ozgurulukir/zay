@@ -2,9 +2,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
-const tui_style = @import("../style.zig");
-
-const StylePalette = tui_style.Palette;
+const panel = @import("panel.zig");
 
 pub const Entry = struct { name: []const u8 };
 
@@ -34,7 +32,7 @@ pub const Content = struct {
             const selected = index == self.selection;
             const prefix = if (selected) "‣ " else "  ";
             const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, entry.name });
-            writePanelLine(surface, row, text, ctx, selected);
+            try panel.commandLine(surface, row, text, ctx, selected);
             row += 1;
             index += 1;
             if (row >= surface.size.height) return;
@@ -45,24 +43,6 @@ pub const Content = struct {
 fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
     if (prefix.len > value.len) return false;
     return std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
-}
-
-fn writePanelLine(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool) void {
-    if (row >= surface.size.height) return;
-    var col: u16 = 1;
-    var iter = ctx.graphemeIterator(text);
-    while (iter.next()) |grapheme| {
-        if (col >= surface.size.width) return;
-        const bytes = grapheme.bytes(text);
-        const width: u8 = @intCast(ctx.stringWidth(bytes));
-        if (width == 0) continue;
-        if (col + width > surface.size.width) return;
-        surface.writeCell(col, row, .{
-            .char = .{ .grapheme = bytes, .width = width },
-            .style = if (selected) StylePalette.tool else StylePalette.thinking_body,
-        });
-        col += width;
-    }
 }
 
 test "command panel filters entries case-insensitively" {

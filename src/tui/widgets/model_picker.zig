@@ -4,11 +4,10 @@ const vxfw = vaxis.vxfw;
 
 const codex = @import("../../codex.zig");
 const message = @import("message.zig");
+const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
 
 const StylePalette = tui_style.Palette;
-
-const picker_secondary_column: u16 = 52;
 
 pub const Column = enum { model, reasoning };
 
@@ -35,14 +34,14 @@ pub const Content = struct {
         self.list.item_count = @intCast(widgets.len);
         self.list.cursor = self.selection + 1;
         self.list.ensureScroll();
-        return drawListSurface(ctx, self.widget(), self.list.widget());
+        return panel.listSurface(ctx, self.widget(), self.list.widget());
     }
 
     fn drawEmpty(self: *Content, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
-        try writePanelLineAt(&surface, 0, "No provider models available. Run /connect first.", ctx, false, message.ConversationLayout.left -| 1);
+        try panel.lineAt(&surface, 0, "No provider models available. Run /connect first.", ctx, false, message.ConversationLayout.left -| 1);
         return surface;
     }
 
@@ -82,8 +81,8 @@ const Header = struct {
         const self: *Header = @ptrCast(@alignCast(ptr));
         const width = ctx.max.width orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
-        try writePanelLineStyledAt(&surface, 0, "NAME", ctx, message.ConversationLayout.left + 1, StylePalette.panel_header);
-        try writePanelLineStyledAt(&surface, 0, "REASONING EFFORT", ctx, pickerSecondaryColumn(surface.size.width) + 2, StylePalette.panel_header);
+        try panel.lineStyledAt(&surface, 0, "NAME", ctx, message.ConversationLayout.left + 1, StylePalette.panel_header);
+        try panel.lineStyledAt(&surface, 0, "REASONING EFFORT", ctx, panel.secondaryColumn(surface.size.width) + 2, StylePalette.panel_header);
         return surface;
     }
 };
@@ -109,7 +108,7 @@ pub const Row = struct {
             try std.fmt.allocPrint(ctx.arena, "{s}{s} [ACTIVE]", .{ prefix, self.model.label })
         else
             try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.model.label });
-        try writePanelLineAt(&surface, 0, text, ctx, model_focused, message.ConversationLayout.left -| 1);
+        try panel.lineAt(&surface, 0, text, ctx, model_focused, message.ConversationLayout.left -| 1);
         if (self.selected) try self.drawReasoning(&surface, ctx);
         return surface;
     }
@@ -123,38 +122,6 @@ pub const Row = struct {
         const focused = self.column == .reasoning;
         const prefix = if (focused) "‣ " else "  ";
         const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.reasoning_label });
-        try writePanelLineAt(surface, 0, text, ctx, focused, pickerSecondaryColumn(surface.size.width));
+        try panel.lineAt(surface, 0, text, ctx, focused, panel.secondaryColumn(surface.size.width));
     }
 };
-
-fn drawListSurface(ctx: vxfw.DrawContext, owner: vxfw.Widget, list: vxfw.Widget) !vxfw.Surface {
-    const width = ctx.max.width orelse 0;
-    const height = ctx.max.height orelse 0;
-    const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
-    children[0] = .{ .origin = .{ .row = 0, .col = 0 }, .surface = try list.draw(ctx.withConstraints(.{ .width = width, .height = height }, .{ .width = width, .height = height })), .z_index = 0 };
-    return vxfw.Surface.initWithChildren(ctx.arena, owner, .{ .width = width, .height = height }, children);
-}
-
-fn pickerSecondaryColumn(width: u16) u16 {
-    return @min(picker_secondary_column, width / 2);
-}
-
-fn writePanelLineAt(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool, start_col: u16) !void {
-    const style = if (selected) StylePalette.tool else StylePalette.thinking_body;
-    try writePanelLineStyledAt(surface, row, text, ctx, start_col, style);
-}
-
-fn writePanelLineStyledAt(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, start_col: u16, style: vaxis.Style) !void {
-    if (row >= surface.size.height) return;
-    const stable_text = try ctx.arena.dupe(u8, text);
-    var col: u16 = start_col;
-    var iter = ctx.graphemeIterator(stable_text);
-    while (iter.next()) |grapheme| {
-        if (col + 1 >= surface.size.width) return;
-        const bytes = grapheme.bytes(stable_text);
-        const width: u8 = @intCast(ctx.stringWidth(bytes));
-        if (width == 0) continue;
-        surface.writeCell(col, row, .{ .char = .{ .grapheme = bytes, .width = width }, .style = style });
-        col += width;
-    }
-}

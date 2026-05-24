@@ -4,10 +4,8 @@ const vxfw = vaxis.vxfw;
 
 const session_mod = @import("../../session.zig");
 const message = @import("message.zig");
+const panel = @import("panel.zig");
 const tui_status = @import("../status.zig");
-const tui_style = @import("../style.zig");
-
-const StylePalette = tui_style.Palette;
 
 pub const Content = struct {
     io: std.Io,
@@ -28,7 +26,7 @@ pub const Content = struct {
         self.list.item_count = @intCast(widgets.len);
         self.list.cursor = self.selection;
         self.list.ensureScroll();
-        return drawListSurface(ctx, self.widget(), self.list.widget());
+        return panel.listSurface(ctx, self.widget(), self.list.widget());
     }
 
     fn resumeWidgets(self: *Content, ctx: vxfw.DrawContext) ![]vxfw.Widget {
@@ -68,8 +66,8 @@ const Row = struct {
         var buffer: [128]u8 = undefined;
         const modified = tui_status.modifiedTime(self.io, buffer[0..], self.summary.updated_at_ms);
         const left = try self.leftText(ctx, width, modified);
-        try writeCommandLine(&surface, 0, left, ctx, self.selected);
-        try writePanelRight(&surface, 0, modified, ctx, self.selected);
+        try panel.commandLine(&surface, 0, left, ctx, self.selected);
+        try panel.right(&surface, 0, modified, ctx, self.selected);
         return surface;
     }
 
@@ -119,14 +117,6 @@ pub fn matches(summary: *const session_mod.SessionSummary, filter: []const u8) b
     return false;
 }
 
-fn drawListSurface(ctx: vxfw.DrawContext, owner: vxfw.Widget, list: vxfw.Widget) !vxfw.Surface {
-    const width = ctx.max.width orelse 0;
-    const height = ctx.max.height orelse 0;
-    const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
-    children[0] = .{ .origin = .{ .row = 0, .col = 0 }, .surface = try list.draw(ctx.withConstraints(.{ .width = width, .height = height }, .{ .width = width, .height = height })), .z_index = 0 };
-    return vxfw.Surface.initWithChildren(ctx.arena, owner, .{ .width = width, .height = height }, children);
-}
-
 fn resumeLeftWidth(ctx: vxfw.DrawContext, row_width: u16, modified: []const u8) usize {
     const start_col = message.ConversationLayout.left -| 1;
     const end_col = row_width -| message.ConversationLayout.right;
@@ -153,43 +143,4 @@ fn truncateText(ctx: vxfw.DrawContext, text: []const u8, width: usize) ![]const 
     }
     try out.appendSlice(ctx.arena, "...");
     return out.toOwnedSlice(ctx.arena);
-}
-
-fn writeCommandLine(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool) !void {
-    try writePanelLineAt(surface, row, text, ctx, selected, message.ConversationLayout.left -| 1);
-}
-
-fn writePanelRight(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool) !void {
-    if (row >= surface.size.height) return;
-    const stable_text = try ctx.arena.dupe(u8, text);
-    const style = if (selected) StylePalette.tool else StylePalette.thinking_body;
-    const text_width: u16 = @intCast(@min(ctx.stringWidth(stable_text), std.math.maxInt(u16)));
-    const end_col = surface.size.width -| message.ConversationLayout.right;
-    if (text_width >= end_col) return;
-    var col = end_col - text_width;
-    var iter = ctx.graphemeIterator(stable_text);
-    while (iter.next()) |grapheme| {
-        if (col >= surface.size.width) return;
-        const bytes = grapheme.bytes(stable_text);
-        const width: u8 = @intCast(ctx.stringWidth(bytes));
-        if (width == 0) continue;
-        if (col + width > surface.size.width) return;
-        surface.writeCell(col, row, .{ .char = .{ .grapheme = bytes, .width = width }, .style = style });
-        col += width;
-    }
-}
-
-fn writePanelLineAt(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool, start_col: u16) !void {
-    const style = if (selected) StylePalette.tool else StylePalette.thinking_body;
-    if (row >= surface.size.height) return;
-    var col: u16 = start_col;
-    var iter = ctx.graphemeIterator(text);
-    while (iter.next()) |grapheme| {
-        if (col + 1 >= surface.size.width) return;
-        const bytes = grapheme.bytes(text);
-        const width: u8 = @intCast(ctx.stringWidth(bytes));
-        if (width == 0) continue;
-        surface.writeCell(col, row, .{ .char = .{ .grapheme = bytes, .width = width }, .style = style });
-        col += width;
-    }
 }

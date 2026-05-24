@@ -2,13 +2,9 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
-const tui_style = @import("../style.zig");
+const panel = @import("panel.zig");
 
 const assert = std.debug.assert;
-const picker_secondary_column: u16 = 52;
-
-const StylePalette = tui_style.Palette;
-const mergedSelectedStyle = tui_style.mergedSelectedStyle;
 
 pub const Column = enum { provider, sign_out };
 pub const Action = enum { connect_codex, sign_out_codex, custom_connection };
@@ -86,7 +82,7 @@ pub const Content = struct {
         const prefix = if (focused) "‣ " else "  ";
         const label = if (self.codex_signed_in) "OpenAI Codex [CONNECTED]" else "OpenAI Codex";
         const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, label });
-        writePanelLine(surface, 0, text, ctx, focused);
+        try panel.commandLine(surface, 0, text, ctx, focused);
         if (self.codex_signed_in) try self.drawSignOut(surface, ctx);
     }
 
@@ -94,14 +90,14 @@ pub const Content = struct {
         const focused = self.state.selection == 0 and self.state.column == .sign_out;
         const prefix = if (focused) "‣ " else "  ";
         const text = try std.fmt.allocPrint(ctx.arena, "{s}Sign out", .{prefix});
-        writePanelLineAt(surface, 0, text, ctx, focused, pickerSecondaryColumn(surface.size.width));
+        try panel.lineAt(surface, 0, text, ctx, focused, panel.secondaryColumn(surface.size.width));
     }
 
     fn drawCustom(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
         const focused = self.state.selection == 1;
         const prefix = if (focused) "‣ " else "  ";
         const text = try std.fmt.allocPrint(ctx.arena, "{s}Custom", .{prefix});
-        writePanelLine(surface, 1, text, ctx, focused);
+        try panel.commandLine(surface, 1, text, ctx, focused);
     }
 };
 
@@ -126,39 +122,6 @@ fn previousIndex(current: u32, count: u32) u32 {
     assert(count > 0);
     assert(current < count);
     return if (current == 0) count - 1 else current - 1;
-}
-
-fn pickerSecondaryColumn(width: u16) u16 {
-    return @min(picker_secondary_column, width / 2);
-}
-
-fn writePanelLine(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool) void {
-    writePanelLineAt(surface, row, text, ctx, selected, 1);
-}
-
-fn writePanelLineAt(
-    surface: *vxfw.Surface,
-    row: u16,
-    text: []const u8,
-    ctx: vxfw.DrawContext,
-    selected: bool,
-    start_col: u16,
-) void {
-    if (row >= surface.size.height) return;
-    var col = start_col;
-    var iter = ctx.graphemeIterator(text);
-    while (iter.next()) |grapheme| {
-        if (col >= surface.size.width) return;
-        const bytes = grapheme.bytes(text);
-        const width: u8 = @intCast(ctx.stringWidth(bytes));
-        if (width == 0) continue;
-        if (col + width > surface.size.width) return;
-        surface.writeCell(col, row, .{
-            .char = .{ .grapheme = bytes, .width = width },
-            .style = mergedSelectedStyle(StylePalette.tool, selected),
-        });
-        col += width;
-    }
 }
 
 test "provider picker navigation reaches sign out only when signed in" {
