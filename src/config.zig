@@ -48,9 +48,9 @@ pub const Provider = enum {
         return switch (self) {
             .openai => "https://chatgpt.com/backend-api",
             .openai_compatible => null,
-            .ollama => "http://localhost:11434/v1",
-            .llama_cpp => "http://localhost:8080/v1",
-            .openrouter => "https://openrouter.ai/api/v1",
+            .ollama => "http://localhost:11434",
+            .llama_cpp => "http://localhost:8080",
+            .openrouter => "https://openrouter.ai/api",
             .anthropic => null,
         };
     }
