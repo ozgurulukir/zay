@@ -33,10 +33,6 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     var load_result = try config.load(gpa, init.io, cwd, home_dir, init.environ_map);
     const tui_gpa = init.arena.allocator();
     const tui_config = try load_result.config.cloneForTui(tui_gpa);
-    errdefer {
-        var owned = tui_config;
-        owned.deinit(tui_gpa);
-    }
 
     const runtime_gpa = std.heap.smp_allocator;
 

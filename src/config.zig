@@ -115,7 +115,7 @@ pub const ProviderConfig = struct {
     pub fn deinit(self: *ProviderConfig, gpa: std.mem.Allocator) void {
         if (self.base_url) |s| gpa.free(s);
         for (self.models) |*model| model.deinit(gpa);
-        gpa.free(self.models);
+        if (self.models.len > 0) gpa.free(self.models);
         self.* = undefined;
     }
 
@@ -144,7 +144,7 @@ pub const Config = struct {
         if (self.api_key) |s| gpa.free(s);
         if (self.model) |*m| m.deinit(gpa);
         for (self.providers) |*provider| provider.deinit(gpa);
-        gpa.free(self.providers);
+        if (self.providers.len > 0) gpa.free(self.providers);
         if (self.system_prompt) |s| gpa.free(s);
         self.* = undefined;
     }
