@@ -10,7 +10,7 @@ const Entry = struct {
 
 const State = struct {
     mutex: std.atomic.Mutex = .unlocked,
-    initialized: bool = false,
+    io: std.Io = undefined,
     enabled: bool = false,
     stopping: bool = false,
     dropped: u64 = 0,
@@ -24,8 +24,25 @@ const State = struct {
 
 var state: State = .{};
 
+pub const Options = struct {
+    io: std.Io,
+    log_path: []const u8,
+};
+
+pub fn init(options: Options) error{PathTooLong}!void {
+    lock();
+    defer state.mutex.unlock();
+    if (state.enabled) return;
+    if (options.log_path.len >= state.path.len) return error.PathTooLong;
+    @memcpy(state.path[0..options.log_path.len], options.log_path);
+    state.path_len = @intCast(options.log_path.len);
+    state.io = options.io;
+    state.enabled = true;
+    state.thread = std.Thread.spawn(.{}, writerThread, .{}) catch null;
+    if (state.thread == null) state.enabled = false;
+}
+
 pub fn log(comptime fmt: []const u8, args: anytype) void {
-    ensureInit();
     lock();
     defer state.mutex.unlock();
     if (!state.enabled) return;
@@ -48,55 +65,37 @@ pub fn log(comptime fmt: []const u8, args: anytype) void {
 }
 
 pub fn deinit() void {
-    ensureInit();
     lock();
+    if (!state.enabled) {
+        state.mutex.unlock();
+        return;
+    }
     state.stopping = true;
     const thread = state.thread;
     state.mutex.unlock();
     if (thread) |t| t.join();
 }
 
-fn ensureInit() void {
-    lock();
-    if (state.initialized) {
-        state.mutex.unlock();
-        return;
-    }
-    state.initialized = true;
-    state.enabled = enabledFromEnv();
-    if (state.enabled) {
-        setPathFromEnv();
-        state.thread = std.Thread.spawn(.{}, writerThread, .{}) catch null;
-        if (state.thread == null) state.enabled = false;
-    }
-    state.mutex.unlock();
-}
-
 fn lock() void {
     while (!state.mutex.tryLock()) std.Thread.yield() catch {};
 }
 
-fn enabledFromEnv() bool {
-    const value_ptr = std.c.getenv("NOVA_DEV_LOG") orelse return false;
-    const value = std.mem.span(value_ptr);
-    if (std.mem.eql(u8, value, "1")) return true;
-    if (std.ascii.eqlIgnoreCase(value, "true")) return true;
-    if (std.ascii.eqlIgnoreCase(value, "yes")) return true;
-    return false;
-}
-
-fn setPathFromEnv() void {
-    const default_path = "/tmp/nova-dev.log";
-    const value = if (std.c.getenv("NOVA_LOG_FILE")) |ptr| std.mem.span(ptr) else default_path;
-    const len = @min(value.len, state.path.len - 1);
-    @memcpy(state.path[0..len], value[0..len]);
-    state.path[len] = 0;
-    state.path_len = @intCast(len);
-}
-
 fn writerThread() void {
-    const file = std.c.fopen(@ptrCast(state.path[0..state.path_len :0].ptr), "ab") orelse return;
-    defer _ = std.c.fclose(file);
+    const path = state.path[0..state.path_len];
+
+    if (std.fs.path.dirname(path)) |dir| {
+        std.Io.Dir.createDirPath(.cwd(), state.io, dir) catch return;
+    }
+
+    var file = std.Io.Dir.createFile(.cwd(), state.io, path, .{ .truncate = false }) catch return;
+    defer file.close(state.io);
+
+    const existing_size: u64 = if (file.stat(state.io)) |s| s.size else |_| 0;
+
+    var buffer: [4096]u8 = undefined;
+    var writer = file.writer(state.io, &buffer);
+    writer.seekTo(existing_size) catch {};
+
     var local: Entry = .{};
     while (true) {
         var should_stop = false;
@@ -116,25 +115,29 @@ fn writerThread() void {
         state.mutex.unlock();
 
         if (has_entry) {
-            writeLine(file, local.bytes[0..local.len]);
+            writeLine(&writer, local.bytes[0..local.len]);
             continue;
         }
         if (dropped > 0) {
-            var buffer: [128]u8 = undefined;
-            const text = std.fmt.bufPrint(&buffer, "logger dropped {d} entries", .{dropped}) catch "logger dropped entries";
-            writeLine(file, text);
+            var dropped_buf: [128]u8 = undefined;
+            const text = std.fmt.bufPrint(&dropped_buf, "logger dropped {d} entries", .{dropped}) catch "logger dropped entries";
+            writeLine(&writer, text);
             continue;
         }
-        if (should_stop) break;
+        if (should_stop) {
+            writer.interface.flush() catch {};
+            break;
+        }
         std.Thread.yield() catch {};
     }
 }
 
-fn writeLine(file: *std.c.FILE, bytes: []const u8) void {
-    _ = std.c.fwrite(bytes.ptr, 1, bytes.len, file);
-    _ = std.c.fwrite("\n", 1, 1, file);
+fn writeLine(writer: *std.Io.File.Writer, bytes: []const u8) void {
+    writer.interface.writeAll(bytes) catch {};
+    writer.interface.writeAll("\n") catch {};
+    writer.interface.flush() catch {};
 }
 
-test "logger stays disabled without env" {
+test "logger stays disabled without init" {
     log("test {d}", .{1});
 }

@@ -1,5 +1,5 @@
 const std = @import("std");
-const builtin = @import("builtin");
+const dynlib = @import("dynlib");
 const bash = @import("bash.zig");
 
 const c = @cImport({
@@ -17,22 +17,22 @@ pub const Mode = enum {
     file_names,
     directories,
 
-    pub fn parse(raw: []const u8) ?Mode {
-        assert(raw.len > 0);
-        if (std.mem.eql(u8, raw, "file_content")) return .file_content;
-        if (std.mem.eql(u8, raw, "file_names")) return .file_names;
-        if (std.mem.eql(u8, raw, "directories")) return .directories;
-        return null;
-    }
-
     pub fn name(self: Mode) []const u8 {
-        return switch (self) {
-            .file_content => "file_content",
-            .file_names => "file_names",
-            .directories => "directories",
-        };
+        return mode_names[@intFromEnum(self)];
     }
 };
+
+const mode_names = [_][]const u8{
+    "file_content",
+    "file_names",
+    "directories",
+};
+
+pub const modes_by_name = std.StaticStringMap(Mode).initComptime(.{
+    .{ "file_content", .file_content },
+    .{ "file_names", .file_names },
+    .{ "directories", .directories },
+});
 
 pub const Request = struct {
     mode: Mode,
@@ -76,7 +76,7 @@ const SearchDirectoriesFn = *const fn (?*anyopaque, [*:0]const u8, ?[*:0]const u
 const WaitForScanFn = *const fn (?*anyopaque, u64) callconv(.c) *c.FffResult;
 
 const Api = struct {
-    lib: std.DynLib,
+    lib: dynlib,
     create_instance2: CreateInstanceFn,
     destroy: DestroyFn,
     free_result: FreeResultFn,
@@ -114,6 +114,11 @@ const Backend = struct {
         assert(message.len > 0);
         lockBackend();
         defer self.mutex.unlock();
+        self.markFailedLocked(gpa, message);
+    }
+
+    fn markFailedLocked(self: *Backend, gpa: std.mem.Allocator, message: []const u8) void {
+        assert(message.len > 0);
         if (self.failure_message.len > 0) gpa.free(self.failure_message);
         self.failure_message = gpa.dupe(u8, message) catch &.{};
         self.state = .failed;
@@ -163,40 +168,29 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, request: Request
     assert(cwd.len > 0);
     assert(request.query.len > 0);
 
-    const snapshot = snapshotBackend();
-    defer snapshot.deinit();
+    if (try runReadyBackend(gpa, request)) |result| return result;
 
-    return switch (snapshot.state) {
-        .ready => runFff(gpa, request, snapshot.api.?, snapshot.handle.?) catch |err| switch (err) {
-            error.OutOfMemory, error.InvalidCursor => err,
-            else => fallbackAfterFffFailure(gpa, io, cwd, request, err),
-        },
-        .unstarted, .starting, .failed => runFallback(gpa, io, cwd, request, snapshot.state),
-    };
+    lockBackend();
+    const state = backend.state;
+    backend.mutex.unlock();
+    return runFallback(gpa, io, cwd, request, state);
 }
 
-fn fallbackAfterFffFailure(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, request: Request, err: anyerror) !Result {
-    assert(cwd.len > 0);
+fn runReadyBackend(gpa: std.mem.Allocator, request: Request) !?Result {
     assert(request.query.len > 0);
-    backend.markFailed(gpa, @errorName(err));
-    return runFallback(gpa, io, cwd, request, .failed);
-}
 
-const Snapshot = struct {
-    state: BackendState,
-    api: ?*Api,
-    handle: ?*anyopaque,
-
-    fn deinit(_: Snapshot) void {}
-};
-
-fn snapshotBackend() Snapshot {
     lockBackend();
     defer backend.mutex.unlock();
-    return .{
-        .state = backend.state,
-        .api = if (backend.api) |*api| api else null,
-        .handle = backend.handle,
+    if (backend.state != .ready) return null;
+
+    const api = if (backend.api) |*api| api else return null;
+    const handle = backend.handle orelse return null;
+    return runFff(gpa, request, api, handle) catch |err| switch (err) {
+        error.OutOfMemory, error.InvalidCursor => err,
+        else => {
+            backend.markFailedLocked(gpa, @errorName(err));
+            return null;
+        },
     };
 }
 
@@ -210,7 +204,7 @@ fn startThread(gpa: std.mem.Allocator, cwd_owned: []u8) void {
     defer gpa.free(cwd_owned);
     assert(cwd_owned.len > 0);
 
-    var api = loadApi() catch |err| {
+    var api = loadApi(gpa) catch |err| {
         backend.markFailed(gpa, @errorName(err));
         return;
     };
@@ -259,10 +253,14 @@ fn startThread(gpa: std.mem.Allocator, cwd_owned: []u8) void {
     backend.state = .ready;
 }
 
-fn loadApi() !Api {
-    const paths = libraryPaths();
-    for (paths) |path| {
-        var lib = std.DynLib.open(path) catch continue;
+fn loadApi(gpa: std.mem.Allocator) !Api {
+    const search_dirs: []const []const u8 = &.{
+        "vendor/fff",
+        "third_party/fff/target/release",
+        "", // falls back to the OS library search path.
+    };
+    for (search_dirs) |dir| {
+        var lib = dynlib.open(gpa, dir, "fff_c") catch continue;
         errdefer lib.close();
         return .{
             .lib = lib,
@@ -280,27 +278,6 @@ fn loadApi() !Api {
         };
     }
     return error.LibraryNotFound;
-}
-
-fn libraryPaths() []const []const u8 {
-    return switch (builtin.os.tag) {
-        .macos => &.{
-            "vendor/fff/libfff_c.dylib",
-            "third_party/fff/target/release/libfff_c.dylib",
-            "libfff_c.dylib",
-        },
-        .linux => &.{
-            "vendor/fff/libfff_c.so",
-            "third_party/fff/target/release/libfff_c.so",
-            "libfff_c.so",
-        },
-        .windows => &.{
-            "vendor\\fff\\fff_c.dll",
-            "third_party\\fff\\target\\release\\fff_c.dll",
-            "fff_c.dll",
-        },
-        else => &.{"libfff_c"},
-    };
 }
 
 fn runFff(gpa: std.mem.Allocator, request: Request, api: *Api, handle: *anyopaque) !Result {
@@ -521,7 +498,7 @@ fn decodeCursor(raw: []const u8) ?Cursor {
     var iter = std.mem.splitScalar(u8, raw, ':');
     const prefix = iter.next() orelse return null;
     if (!std.mem.eql(u8, prefix, "nova-search-v1")) return null;
-    const mode = Mode.parse(iter.next() orelse return null) orelse return null;
+    const mode = modes_by_name.get(iter.next() orelse return null) orelse return null;
     const phase_raw = iter.next() orelse return null;
     if (!std.mem.eql(u8, phase_raw, "primary")) return null;
     const offset = std.fmt.parseInt(u32, iter.next() orelse return null, 10) catch return null;

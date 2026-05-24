@@ -4,6 +4,7 @@ TODOs and ideas for features to add to Nova coding agent.
 
 ## TODOs
 
+- Keep user model selection / config per session? global?
 - Support skills in `.agents/`
 - Support referencing files and symbols via `$`
 - MCP (special via some kind of executor)
@@ -12,11 +13,11 @@ TODOs and ideas for features to add to Nova coding agent.
 - Support steering messages (sent as either a subagent call alongisde the conversation so far which then consolidates back into the main thread OR just sent to the model after the tool call response)
 - Wire ability to add images to input in the UI
 - improve logger and make it more useful
-- add ability to persist user preferences via `.nova/config.toml` (global and local)
 - add docs on `.nova/auth.json`
-- Move logger outputs to a better location (currently `/tmp/nova-dev.log`)
-
-Handle edge cases where selected content when expanded goes out of bounds. Forcing a mouse scroll. Could somehow initiate a scroll via keyboard.
+- Save auth tokens and api keys in keyring by default and only auth.json via setting
+- Handle edge cases where selected content when expanded goes out of bounds. Forcing a mouse scroll. Vim like line-by-line navigation (fall back to select on collapsed blocks)
+- Fix tool call swappign places with loading
+- Support tool streaming
 
 Snap back to bottom shortcut.
 

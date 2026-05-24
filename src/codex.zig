@@ -76,7 +76,7 @@ const AuthorizationFlow = struct {
     }
 };
 
-pub fn login(gpa: std.mem.Allocator, io: std.Io) !Credentials {
+pub fn login(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !Credentials {
     var flow = try createAuthorizationFlow(gpa, io);
     defer flow.deinit(gpa);
     try openBrowser(gpa, io, flow.url);
@@ -84,12 +84,12 @@ pub fn login(gpa: std.mem.Allocator, io: std.Io) !Credentials {
     defer gpa.free(code);
     var credentials = try exchangeAuthorizationCode(gpa, io, code, flow.verifier);
     errdefer credentials.deinit(gpa);
-    try save(gpa, io, credentials);
+    try save(gpa, io, home_dir, credentials);
     return credentials;
 }
 
-pub fn load(gpa: std.mem.Allocator, io: std.Io) !?Credentials {
-    const path = try authPath(gpa);
+pub fn load(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !?Credentials {
+    const path = try authPath(gpa, home_dir);
     defer gpa.free(path);
     const bytes = std.Io.Dir.readFileAllocOptions(.cwd(), io, path, gpa, .limited(32 * 1024), .of(u8), 0) catch |err| switch (err) {
         error.FileNotFound => return null,
@@ -99,11 +99,20 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io) !?Credentials {
     return try parseAuthFile(gpa, bytes);
 }
 
-pub fn refresh(gpa: std.mem.Allocator, io: std.Io, refresh_token: []const u8) !Credentials {
+pub fn refresh(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, refresh_token: []const u8) !Credentials {
     var credentials = try refreshAccessToken(gpa, io, refresh_token);
     errdefer credentials.deinit(gpa);
-    try save(gpa, io, credentials);
+    try save(gpa, io, home_dir, credentials);
     return credentials;
+}
+
+pub fn signOut(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !void {
+    const path = try authPath(gpa, home_dir);
+    defer gpa.free(path);
+    std.Io.Dir.deleteFile(.cwd(), io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 }
 
 fn createAuthorizationFlow(gpa: std.mem.Allocator, io: std.Io) !AuthorizationFlow {
@@ -228,7 +237,7 @@ fn tokenRequest(gpa: std.mem.Allocator, io: std.Io, body: []const u8) !Credentia
     defer gpa.free(bytes);
     logger.log("codex.token.response status={d} body={s}", .{ status, logBytes(bytes) });
     if (status < 200 or status >= 300) return error.TokenRequestFailed;
-    return try parseTokenResponse(gpa, bytes);
+    return try parseTokenResponse(gpa, io, bytes);
 }
 
 fn readResponseBody(gpa: std.mem.Allocator, response: *std.http.Client.Response) ![]u8 {
@@ -257,7 +266,7 @@ fn readResponseBody(gpa: std.mem.Allocator, response: *std.http.Client.Response)
     return try out.toOwnedSlice();
 }
 
-fn parseTokenResponse(gpa: std.mem.Allocator, bytes: []const u8) !Credentials {
+fn parseTokenResponse(gpa: std.mem.Allocator, io: std.Io, bytes: []const u8) !Credentials {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, bytes, .{}) catch return error.InvalidCredentials;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidCredentials;
@@ -270,7 +279,7 @@ fn parseTokenResponse(gpa: std.mem.Allocator, bytes: []const u8) !Credentials {
         .access = try gpa.dupe(u8, access),
         .refresh = try gpa.dupe(u8, refresh_token),
         .account_id = account_id,
-        .expires = nowMs() + expires_in * 1000,
+        .expires = nowMs(io) + expires_in * 1000,
     };
 }
 
@@ -292,23 +301,29 @@ fn accountIdFromAccessToken(gpa: std.mem.Allocator, access: []const u8) ![]u8 {
     return try gpa.dupe(u8, account_id);
 }
 
-fn save(gpa: std.mem.Allocator, io: std.Io, credentials: Credentials) !void {
-    const path = try authPath(gpa);
+fn save(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, credentials: Credentials) !void {
+    try writeAuth(gpa, io, home_dir, credentials);
+}
+
+fn writeAuth(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    home_dir: []const u8,
+    credentials: ?Credentials,
+) !void {
+    const path = try authPath(gpa, home_dir);
     defer gpa.free(path);
     const dirname = std.fs.path.dirname(path) orelse return error.InvalidPath;
     try std.Io.Dir.createDirPath(.cwd(), io, dirname);
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try payload.writer.writeAll("{\"openai-codex\":{");
-    try payload.writer.writeAll("\"access\":");
-    try std.json.Stringify.value(credentials.access, .{}, &payload.writer);
-    try payload.writer.writeAll(",\"refresh\":");
-    try std.json.Stringify.value(credentials.refresh, .{}, &payload.writer);
-    try payload.writer.writeAll(",\"expires\":");
-    try std.json.Stringify.value(credentials.expires, .{}, &payload.writer);
-    try payload.writer.writeAll(",\"accountId\":");
-    try std.json.Stringify.value(credentials.account_id, .{}, &payload.writer);
-    try payload.writer.writeAll("}}\n");
+    try payload.writer.writeByte('{');
+    var wrote_any = false;
+    if (credentials) |value| {
+        try writeAuthKey(&payload.writer, "openaiCodex", &wrote_any);
+        try writeCredentials(&payload.writer, &value);
+    }
+    try payload.writer.writeAll("}\n");
     var file = try std.Io.Dir.createFile(.cwd(), io, path, .{ .truncate = true });
     defer file.close(io);
     var buffer: [4096]u8 = undefined;
@@ -317,23 +332,40 @@ fn save(gpa: std.mem.Allocator, io: std.Io, credentials: Credentials) !void {
     try writer.interface.flush();
 }
 
-fn nowMs() i64 {
-    var tv: std.c.timeval = undefined;
-    if (std.c.gettimeofday(&tv, null) != 0) return 0;
-    return @as(i64, @intCast(tv.sec)) * 1000 + @divTrunc(@as(i64, @intCast(tv.usec)), 1000);
+fn writeAuthKey(writer: *std.Io.Writer, name: []const u8, wrote_any: *bool) !void {
+    if (wrote_any.*) try writer.writeByte(',');
+    try std.json.Stringify.value(name, .{}, writer);
+    try writer.writeByte(':');
+    wrote_any.* = true;
 }
 
-fn authPath(gpa: std.mem.Allocator) ![]u8 {
-    const home_ptr = std.c.getenv("HOME") orelse return error.HomeNotSet;
-    const home = std.mem.span(home_ptr);
-    return std.fs.path.join(gpa, &.{ home, ".nova", "auth.json" });
+fn writeCredentials(writer: *std.Io.Writer, credentials: *const Credentials) !void {
+    try writer.writeByte('{');
+    try writer.writeAll("\"access\":");
+    try std.json.Stringify.value(credentials.access, .{}, writer);
+    try writer.writeAll(",\"refresh\":");
+    try std.json.Stringify.value(credentials.refresh, .{}, writer);
+    try writer.writeAll(",\"expires\":");
+    try std.json.Stringify.value(credentials.expires, .{}, writer);
+    try writer.writeAll(",\"accountId\":");
+    try std.json.Stringify.value(credentials.account_id, .{}, writer);
+    try writer.writeByte('}');
+}
+
+fn nowMs(io: std.Io) i64 {
+    return std.Io.Clock.now(.real, io).toMilliseconds();
+}
+
+fn authPath(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
+    if (home_dir.len == 0) return error.HomeNotSet;
+    return std.fs.path.join(gpa, &.{ home_dir, ".nova", "auth.json" });
 }
 
 fn parseAuthFile(gpa: std.mem.Allocator, bytes: []const u8) !?Credentials {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-    const provider = parsed.value.object.get("openai-codex") orelse return null;
+    const provider = parsed.value.object.get("openaiCodex") orelse return null;
     if (provider != .object) return null;
     return try credentialsFromValue(gpa, provider);
 }
@@ -451,10 +483,10 @@ test "callback parser validates state and decodes code" {
 
 test "invalid token json maps to domain error" {
     const gpa = std.testing.allocator;
-    try std.testing.expectError(error.InvalidCredentials, parseTokenResponse(gpa, "not json"));
+    try std.testing.expectError(error.InvalidCredentials, parseTokenResponse(gpa, std.testing.io, "not json"));
 }
 
-test "static models match pi openai codex catalog" {
+test "static models match openai codex catalog" {
     const gpa = std.testing.allocator;
     const loaded = try loadStaticModels(gpa);
     defer {
@@ -470,9 +502,13 @@ test "static models match pi openai codex catalog" {
     try std.testing.expectEqualStrings("gpt-5.5", loaded[5].id);
 }
 
+test "sign out removes missing auth file without error" {
+    try signOut(std.testing.allocator, std.testing.io, "/tmp/nova-missing-home-for-signout-test");
+}
+
 test "auth file parser loads openai codex credentials" {
     const gpa = std.testing.allocator;
-    const loaded = try parseAuthFile(gpa, "{\"openai-codex\":{\"access\":\"a\",\"refresh\":\"r\",\"expires\":12,\"accountId\":\"acct\"}}");
+    const loaded = try parseAuthFile(gpa, "{\"openaiCodex\":{\"access\":\"a\",\"refresh\":\"r\",\"expires\":12,\"accountId\":\"acct\"}}");
     var credentials = loaded.?;
     defer credentials.deinit(gpa);
     try std.testing.expectEqualStrings("a", credentials.access);

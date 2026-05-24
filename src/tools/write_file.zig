@@ -54,7 +54,7 @@ pub fn runTool(
 }
 
 fn write(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, path: []const u8, content: []const u8) common.Error!common.Output {
-    const absolute = joinPath(gpa, cwd, path) catch |err| return mapAllocError(err);
+    const absolute = common.joinPath(gpa, cwd, path) catch |err| return common.mapAllocError(err);
     defer gpa.free(absolute);
 
     if (std.fs.path.dirname(absolute)) |parent| {
@@ -80,10 +80,10 @@ fn buildOutput(gpa: std.mem.Allocator, path: []const u8, content: []const u8) co
         gpa,
         "Successfully wrote {s}",
         .{path},
-    ) catch |err| return mapAllocError(err);
+    ) catch |err| return common.mapAllocError(err);
     errdefer gpa.free(message);
     if (content.len == 0) return common.ok(gpa, message);
-    const display = normaliseContent(gpa, content) catch |err| return mapAllocError(err);
+    const display = normaliseContent(gpa, content) catch |err| return common.mapAllocError(err);
     return common.okWithDisplay(gpa, message, display);
 }
 
@@ -99,18 +99,6 @@ fn normaliseContent(gpa: std.mem.Allocator, content: []const u8) ![]u8 {
         }
     }
     return buffer.toOwnedSlice(gpa);
-}
-
-fn joinPath(gpa: std.mem.Allocator, cwd: []const u8, path: []const u8) ![]u8 {
-    if (std.fs.path.isAbsolute(path)) return gpa.dupe(u8, path);
-    return std.fs.path.join(gpa, &.{ cwd, path });
-}
-
-fn mapAllocError(err: anyerror) common.Error {
-    return switch (err) {
-        error.OutOfMemory => common.Error.OutOfMemory,
-        else => common.Error.Unexpected,
-    };
 }
 
 test "write_file requires a path" {

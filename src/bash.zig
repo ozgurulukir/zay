@@ -19,15 +19,34 @@ pub const Result = struct {
 
 const stdout_bytes_limit: usize = 512 * 1024;
 const stderr_bytes_limit: usize = 512 * 1024;
+pub const timeout_seconds_default: u32 = 10;
+
+pub const RunOptions = struct {
+    cwd: []const u8,
+    command: []const u8,
+    env_map: ?*const std.process.Environ.Map = null,
+    timeout: std.Io.Timeout = timeoutFromSeconds(timeout_seconds_default),
+};
+
+pub fn timeoutFromSeconds(seconds: u32) std.Io.Timeout {
+    assert(seconds > 0);
+    return .{ .duration = .{ .raw = .fromSeconds(seconds), .clock = .awake } };
+}
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, command: []const u8) !Result {
-    assert(cwd.len > 0);
-    assert(command.len > 0);
+    return runWithOptions(gpa, io, .{ .cwd = cwd, .command = command });
+}
+
+pub fn runWithOptions(gpa: std.mem.Allocator, io: std.Io, options: RunOptions) !Result {
+    assert(options.cwd.len > 0);
+    assert(options.command.len > 0);
     const child_result = try std.process.run(gpa, io, .{
-        .argv = &.{ bashPath(io), "-lc", command },
-        .cwd = .{ .path = cwd },
+        .argv = &.{ bashPath(io), "-lc", options.command },
+        .cwd = .{ .path = options.cwd },
+        .environ_map = options.env_map,
         .stdout_limit = .limited(stdout_bytes_limit),
         .stderr_limit = .limited(stderr_bytes_limit),
+        .timeout = options.timeout,
     });
     errdefer gpa.free(child_result.stdout);
     errdefer gpa.free(child_result.stderr);

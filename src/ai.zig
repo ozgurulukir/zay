@@ -35,7 +35,7 @@ pub const Reasoning = struct {
     summary: ?ReasoningSummary = .auto,
 };
 
-pub const ProviderKind = enum { openai, openai_codex };
+pub const ResponsesMode = enum { standard, codex };
 
 pub const Config = struct {
     base_url: []const u8,
@@ -43,7 +43,7 @@ pub const Config = struct {
     model: []const u8,
     tools: []const Tool = &.{},
     reasoning: ?Reasoning = .{},
-    provider: ProviderKind = .openai,
+    responses_mode: ResponsesMode = .standard,
     account_id: []const u8 = "",
     session_id: []const u8 = "",
     system_prompt: []const u8 = "You are a helpful assistant.",
@@ -139,6 +139,7 @@ pub const ChatMessage = struct {
     role: Role,
     content: []ContentBlock,
     call_id: ?[]u8 = null,
+    tool_display_label: ?[]u8 = null,
 
     pub fn text(self: ChatMessage) []const u8 {
         for (self.content) |block| {
@@ -151,6 +152,7 @@ pub const ChatMessage = struct {
         for (self.content) |*block| block.deinit(gpa);
         gpa.free(self.content);
         if (self.call_id) |id| gpa.free(id);
+        if (self.tool_display_label) |label| gpa.free(label);
         self.* = undefined;
     }
 };
@@ -191,6 +193,7 @@ pub const StreamObserver = struct {
 };
 
 pub const LanguageModel = union(enum) {
+    none,
     codex_responses: *codex_responses.Client,
     openai_compatible: *openai_compatible.Client,
     openai_responses: *openai_responses.Client,
@@ -201,6 +204,7 @@ pub const LanguageModel = union(enum) {
         observer: StreamObserver,
     ) !Turn {
         return switch (self) {
+            .none => error.NoProviderConnected,
             .codex_responses => |c| c.prompt(messages, observer),
             .openai_compatible => |c| c.prompt(messages, observer),
             .openai_responses => |c| c.prompt(messages, observer),

@@ -1,5 +1,8 @@
 const std = @import("std");
+const logger = @import("logger");
 const ai = @import("../ai.zig");
+const model_catalog = @import("openai_compatible_models.zig");
+const openai_endpoint = @import("openai_endpoint.zig");
 const tools_common = @import("../tools/common.zig");
 
 const Scanner = std.json.Scanner;
@@ -10,6 +13,10 @@ const body_buffer_bytes: u32 = 4096;
 const tool_call_count_max: u32 = 16;
 const stream_chunk_count_max: u32 = 100_000;
 const stream_bytes_max: u32 = 8 * 1024 * 1024;
+
+pub const ModelEntry = model_catalog.ModelEntry;
+pub const listModels = model_catalog.listModels;
+pub const openaiV1Root = openai_endpoint.v1Root;
 
 /// OpenAI-compatible AI client using the Completions API.
 pub const Client = struct {
@@ -37,11 +44,9 @@ pub const Client = struct {
         std.debug.assert(config.base_url.len > 0);
         std.debug.assert(config.model.len > 0);
 
-        const url = try std.fmt.allocPrint(
-            gpa,
-            "{s}/v1/chat/completions",
-            .{std.mem.trimEnd(u8, config.base_url, "/")},
-        );
+        const v1_root = try openaiV1Root(gpa, config.base_url);
+        defer gpa.free(v1_root);
+        const url = try std.fmt.allocPrint(gpa, "{s}/chat/completions", .{v1_root});
         errdefer gpa.free(url);
 
         const authorization = try std.fmt.allocPrint(
@@ -51,13 +56,19 @@ pub const Client = struct {
         );
         errdefer gpa.free(authorization);
 
+        var owned_config = config;
+        owned_config.base_url = "";
+        owned_config.api_key = "";
+        owned_config.model = try gpa.dupe(u8, config.model);
+        errdefer gpa.free(owned_config.model);
+
         const tools_json = try buildToolsJson(gpa, config.tools);
         errdefer gpa.free(tools_json);
 
         target.* = .{
             .gpa = gpa,
             .io = io,
-            .config = config,
+            .config = owned_config,
             .url = url,
             .authorization = authorization,
             .tools_json = tools_json,
@@ -67,6 +78,7 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         self.http_client.deinit();
+        self.gpa.free(self.config.model);
         self.gpa.free(self.tools_json);
         self.gpa.free(self.authorization);
         self.gpa.free(self.url);
@@ -89,24 +101,38 @@ pub const Client = struct {
         });
         defer req.deinit();
 
-        req.transfer_encoding = .chunked;
-        var body_buffer: [body_buffer_bytes]u8 = undefined;
-        var body_writer = try req.sendBodyUnflushed(&body_buffer);
+        var payload: std.Io.Writer.Allocating = .init(self.gpa);
+        defer payload.deinit();
         try writeRequestPayload(
-            &body_writer.writer,
+            &payload.writer,
             self.config.model,
             messages,
             self.tools_json,
             self.config.reasoning,
         );
+        logger.log("openai_compatible.request POST {s} body={s}", .{ self.url, logBytes(payload.written()) });
+
+        req.transfer_encoding = .chunked;
+        var body_buffer: [body_buffer_bytes]u8 = undefined;
+        var body_writer = try req.sendBodyUnflushed(&body_buffer);
+        try body_writer.writer.writeAll(payload.written());
         try body_writer.end();
         try req.connection.?.flush();
 
         var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
         var http_response = try req.receiveHead(&redirect_buffer);
         const status_code: u16 = @intFromEnum(http_response.head.status);
-        if (status_code >= 500) return error.HttpServerError;
-        if (status_code >= 400) return error.HttpClientError;
+        logger.log("openai_compatible.response.head status={d}", .{status_code});
+        if (status_code >= 400) {
+            var error_buffer: [transfer_buffer_bytes]u8 = undefined;
+            const error_reader = http_response.reader(&error_buffer);
+            var error_body: std.Io.Writer.Allocating = .init(self.gpa);
+            defer error_body.deinit();
+            _ = error_reader.streamRemaining(&error_body.writer) catch 0;
+            logger.log("openai_compatible.response.error status={d} body={s}", .{ status_code, logBytes(error_body.written()) });
+            if (status_code >= 500) return error.HttpServerError;
+            return error.HttpClientError;
+        }
         if (status_code < 200 or status_code >= 300) return error.HttpUnexpectedStatus;
 
         var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
@@ -114,6 +140,12 @@ pub const Client = struct {
         return try readStream(self.gpa, reader, observer, &self.tool_call_seq);
     }
 };
+
+fn logBytes(bytes: []const u8) []const u8 {
+    const limit = 12 * 1024;
+    if (bytes.len <= limit) return bytes;
+    return bytes[0..limit];
+}
 
 /// Build the OpenAI `tools` JSON array from the protocol-neutral
 /// **Tool registry**. Each adapter owns its own translation; this is the
@@ -151,6 +183,7 @@ fn writeToolDefinition(
         const kind_str: []const u8 = switch (prop.kind) {
             .string => "string",
             .integer => "integer",
+            .object => "object",
         };
         try std.json.Stringify.value(kind_str, .{}, writer);
         try writer.writeAll(",\"description\":");

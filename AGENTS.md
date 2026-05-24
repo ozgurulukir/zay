@@ -2,7 +2,7 @@
 
 This project uses Zig version 0.16
 
-Always consult the clean-code skill when writing code.
+Always consult the tigerstyle skill when writing code.
 
 ## Building the TUI
 
@@ -17,5 +17,3 @@ Run the following:
 - `zig fmt`
 
 - `zig build test`
-
-- `zig build run`

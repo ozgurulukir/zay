@@ -27,21 +27,22 @@ pub const Error = db.Error || error{
 
 pub const SessionManager = struct {
     gpa: std.mem.Allocator,
+    io: std.Io,
     connection: db.Connection,
 
-    pub fn init(gpa: std.mem.Allocator, path: []const u8) Error!SessionManager {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, path: []const u8) Error!SessionManager {
         assert(path.len > 0);
         var connection = try db.Connection.open(path, .{});
         errdefer connection.close();
-        try migrate(&connection);
-        return .{ .gpa = gpa, .connection = connection };
+        try migrate(&connection, io);
+        return .{ .gpa = gpa, .io = io, .connection = connection };
     }
 
     pub fn initDefault(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) Error!SessionManager {
         assert(cwd.len > 0);
         const db_path = try defaultPath(gpa, io, cwd);
         defer gpa.free(db_path);
-        return init(gpa, db_path);
+        return init(gpa, io, db_path);
     }
 
     pub fn deinit(self: *SessionManager) void {
@@ -57,11 +58,11 @@ pub const SessionManager = struct {
             @memcpy(id_buffer[0..], id);
             break :blk id_buffer[0..];
         } else blk: {
-            fillHex(&id_buffer);
+            fillHex(self.io, &id_buffer);
             break :blk id_buffer[0..];
         };
 
-        const timestamp_ms = nowMs();
+        const timestamp_ms = nowMs(self.io);
         var statement = try self.connection.prepare("insert into sessions(id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id) values (?, ?, ?, ?, ?, null)");
         defer statement.finalize();
         try statement.bindText(1, session_id);
@@ -156,7 +157,7 @@ pub const Session = struct {
     leaf_entry_id: ?[entry_id_len]u8,
 
     pub fn append(self: *Session, message: ai.ChatMessage, id_out: *[entry_id_len]u8) Error!void {
-        fillHex(id_out);
+        fillHex(self.manager.io, id_out);
         const payload = try messageToJson(self.manager.gpa, message);
         defer self.manager.gpa.free(payload);
         try self.insertEntry(id_out, "message", message.role.label(), payload);
@@ -165,13 +166,13 @@ pub const Session = struct {
     pub fn appendPayload(self: *Session, kind: []const u8, role: ?[]const u8, payload_json: []const u8, id_out: *[entry_id_len]u8) Error!void {
         assert(kind.len > 0);
         assert(payload_json.len > 0);
-        fillHex(id_out);
+        fillHex(self.manager.io, id_out);
         try self.insertEntry(id_out, kind, role, payload_json);
     }
 
     pub fn info(self: *Session, title: []const u8, id_out: *[entry_id_len]u8) Error!void {
         assert(title.len > 0);
-        fillHex(id_out);
+        fillHex(self.manager.io, id_out);
         const payload = try titleToJson(self.manager.gpa, title);
         defer self.manager.gpa.free(payload);
         try self.insertEntry(id_out, "session_info", null, payload);
@@ -179,7 +180,7 @@ pub const Session = struct {
         var statement = try self.manager.connection.prepare("update sessions set title = ?, updated_at_ms = ? where id = ?");
         defer statement.finalize();
         try statement.bindText(1, title);
-        try statement.bindInt(2, nowMs());
+        try statement.bindInt(2, nowMs(self.manager.io));
         try statement.bindText(3, self.id[0..]);
         try expectDone(&statement);
     }
@@ -190,7 +191,7 @@ pub const Session = struct {
         try self.requireEntry(entry_id);
         if (summary) |text| {
             const out = id_out orelse return error.BadEntryId;
-            fillHex(out);
+            fillHex(self.manager.io, out);
             const payload = try branchSummaryToJson(self.manager.gpa, entry_id, text);
             defer self.manager.gpa.free(payload);
             try self.insertEntryWithParent(out, entry_id, "branch_summary", null, payload);
@@ -239,7 +240,7 @@ pub const Session = struct {
     fn insertEntryWithParent(self: *Session, id: *const [entry_id_len]u8, parent_id: ?[]const u8, kind: []const u8, role: ?[]const u8, payload_json: []const u8) Error!void {
         assert(kind.len > 0);
         assert(payload_json.len > 0);
-        const timestamp_ms = nowMs();
+        const timestamp_ms = nowMs(self.manager.io);
         var statement = try self.manager.connection.prepare("insert into session_entries(id, session_id, parent_id, kind, role, payload_json, created_at_ms) values (?, ?, ?, ?, ?, ?, ?)");
         defer statement.finalize();
         try statement.bindText(1, id[0..]);
@@ -267,7 +268,7 @@ pub const Session = struct {
         var statement = try self.manager.connection.prepare("update sessions set title = ?, updated_at_ms = ? where id = ?");
         defer statement.finalize();
         try statement.bindText(1, title);
-        try statement.bindInt(2, nowMs());
+        try statement.bindInt(2, nowMs(self.manager.io));
         try statement.bindText(3, self.id[0..]);
         try expectDone(&statement);
     }
@@ -285,7 +286,7 @@ pub const Session = struct {
         var statement = try self.manager.connection.prepare("update sessions set leaf_entry_id = ?, updated_at_ms = ? where id = ?");
         defer statement.finalize();
         try statement.bindText(1, leaf_id);
-        try statement.bindInt(2, nowMs());
+        try statement.bindInt(2, nowMs(self.manager.io));
         try statement.bindText(3, self.id[0..]);
         try expectDone(&statement);
     }
@@ -453,14 +454,7 @@ fn runWriter(writer: *SessionWriter) void {
         if (takeQueuedEntry(writer)) |entry| {
             var owned = entry;
             defer owned.deinit(writer.gpa);
-            var id: [entry_id_len]u8 = undefined;
-            writer.session.appendPayload(owned.kind, owned.role, owned.payload_json, &id) catch continue;
-            if (!writer.title_written) {
-                if (owned.title_candidate) |title| {
-                    writer.session.setTitle(title) catch continue;
-                    writer.title_written = true;
-                }
-            }
+            writeQueuedEntry(writer, &owned) catch continue;
         } else {
             lockWriter(writer);
             const done = writer.stopping and writer.count == 0;
@@ -469,6 +463,26 @@ fn runWriter(writer: *SessionWriter) void {
             std.Thread.yield() catch {};
         }
     }
+}
+
+fn writeQueuedEntry(writer: *SessionWriter, entry: *const QueuedEntry) Error!void {
+    assert(entry.kind.len > 0);
+    assert(entry.payload_json.len > 0);
+
+    const previous_leaf = writer.session.leaf_entry_id;
+    try writer.manager.connection.exec("begin immediate");
+    errdefer {
+        writer.manager.connection.exec("rollback") catch {};
+        writer.session.leaf_entry_id = previous_leaf;
+    }
+
+    var id: [entry_id_len]u8 = undefined;
+    try writer.session.appendPayload(entry.kind, entry.role, entry.payload_json, &id);
+    const should_write_title = !writer.title_written and entry.title_candidate != null;
+    if (should_write_title) try writer.session.setTitle(entry.title_candidate.?);
+
+    try writer.manager.connection.exec("commit");
+    if (should_write_title) writer.title_written = true;
 }
 
 fn takeQueuedEntry(writer: *SessionWriter) ?QueuedEntry {
@@ -503,7 +517,7 @@ const EntryRecord = struct {
     }
 };
 
-fn migrate(connection: *db.Connection) Error!void {
+fn migrate(connection: *db.Connection, io: std.Io) Error!void {
     try connection.exec("pragma foreign_keys = on");
     try connection.exec("pragma journal_mode = wal");
     try connection.exec("create table if not exists schema_migrations(version integer primary key, applied_at_ms integer not null)");
@@ -517,7 +531,7 @@ fn migrate(connection: *db.Connection) Error!void {
     var statement = try connection.prepare("insert or ignore into schema_migrations(version, applied_at_ms) values (?, ?)");
     defer statement.finalize();
     try statement.bindInt(1, schema_version);
-    try statement.bindInt(2, nowMs());
+    try statement.bindInt(2, nowMs(io));
     try expectDone(&statement);
 }
 
@@ -542,6 +556,10 @@ fn messageToJson(gpa: std.mem.Allocator, message: ai.ChatMessage) Error![]u8 {
     if (message.call_id) |id| {
         try writer.writeAll(",\"call_id\":");
         try std.json.Stringify.value(id, .{}, writer);
+    }
+    if (message.tool_display_label) |label| {
+        try writer.writeAll(",\"tool_display_label\":");
+        try std.json.Stringify.value(label, .{}, writer);
     }
     try writer.writeAll(",\"content\":[");
     for (message.content, 0..) |block, index| {
@@ -608,10 +626,12 @@ fn jsonToMessage(gpa: std.mem.Allocator, payload_json: []const u8) Error!ai.Chat
     const role = ai.Role.fromString(role_value.string) catch return error.CorruptPayload;
     const call_id = try optionalString(gpa, parsed.value, "call_id");
     errdefer if (call_id) |id| gpa.free(id);
+    const tool_display_label = try optionalString(gpa, parsed.value, "tool_display_label");
+    errdefer if (tool_display_label) |label| gpa.free(label);
     const content_value = parsed.value.object.get("content") orelse return error.CorruptPayload;
     const content = try parseContentBlocks(gpa, content_value);
     errdefer freeContentBlocks(gpa, content);
-    return .{ .role = role, .content = content, .call_id = call_id };
+    return .{ .role = role, .content = content, .call_id = call_id, .tool_display_label = tool_display_label };
 }
 
 fn branchSummaryToMessage(gpa: std.mem.Allocator, payload_json: []const u8) Error!ai.ChatMessage {
@@ -800,16 +820,14 @@ fn readEntry(gpa: std.mem.Allocator, row: *const db.Row) Error!EntryRecord {
     };
 }
 
-fn nowMs() i64 {
-    var tv: std.c.timeval = undefined;
-    if (std.c.gettimeofday(&tv, null) != 0) return 0;
-    return @as(i64, @intCast(tv.sec)) * 1000 + @divTrunc(@as(i64, @intCast(tv.usec)), 1000);
+fn nowMs(io: std.Io) i64 {
+    return std.Io.Clock.now(.real, io).toMilliseconds();
 }
 
-fn fillHex(buffer: []u8) void {
+fn fillHex(io: std.Io, buffer: []u8) void {
     assert(buffer.len > 0);
     var bytes: [16]u8 = undefined;
-    std.c.arc4random_buf(&bytes, bytes.len);
+    io.random(&bytes);
     const alphabet = "0123456789abcdef";
     for (buffer, 0..) |*byte, index| {
         const value = bytes[index / 2];
@@ -832,7 +850,7 @@ fn freeToolCalls(gpa: std.mem.Allocator, calls: []const ai.ToolCall) void {
 }
 
 test "session persists and loads messages" {
-    var manager = try SessionManager.init(std.testing.allocator, ":memory:");
+    var manager = try SessionManager.init(std.testing.allocator, std.testing.io, ":memory:");
     defer manager.deinit();
     var session = try manager.create("/tmp/nova", .{ .id = "0123456789abcdef0123456789abcdef", .title = "Test" });
 
@@ -852,8 +870,35 @@ test "session persists and loads messages" {
     try std.testing.expectEqualStrings("hello", messages[0].text());
 }
 
+test "session persists tool display labels" {
+    var manager = try SessionManager.init(std.testing.allocator, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/nova", .{ .id = "11111111111111111111111111111111", .title = "Tools" });
+
+    var id: [entry_id_len]u8 = undefined;
+    const blocks = try std.testing.allocator.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = try std.testing.allocator.dupe(u8, "contents") } };
+    const call_id = try std.testing.allocator.dupe(u8, "call_1");
+    const label = try std.testing.allocator.dupe(u8, "read AGENTS.md");
+    try session.append(.{ .role = .tool, .content = blocks, .call_id = call_id, .tool_display_label = label }, &id);
+    for (blocks) |*block| block.deinit(std.testing.allocator);
+    std.testing.allocator.free(blocks);
+    std.testing.allocator.free(call_id);
+    std.testing.allocator.free(label);
+
+    const messages = try session.messages(std.testing.allocator);
+    defer {
+        for (messages) |*message| deinitMessage(std.testing.allocator, message);
+        std.testing.allocator.free(messages);
+    }
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqual(.tool, messages[0].role);
+    try std.testing.expectEqualStrings("call_1", messages[0].call_id.?);
+    try std.testing.expectEqualStrings("read AGENTS.md", messages[0].tool_display_label.?);
+}
+
 test "session branch with summary changes context" {
-    var manager = try SessionManager.init(std.testing.allocator, ":memory:");
+    var manager = try SessionManager.init(std.testing.allocator, std.testing.io, ":memory:");
     defer manager.deinit();
     var session = try manager.create("/tmp/nova", .{ .id = "fedcba9876543210fedcba9876543210" });
 
