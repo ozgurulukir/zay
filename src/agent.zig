@@ -29,7 +29,7 @@ pub const Agent = struct {
     }
 
     pub fn addSystem(self: *Agent, content: []const u8) !void {
-        try self.appendMessage("system", content);
+        try self.appendMessage(.system, content);
     }
 
     pub fn deinit(self: *Agent) void {
@@ -41,7 +41,7 @@ pub const Agent = struct {
     }
 
     pub fn addUser(self: *Agent, content: []const u8) !void {
-        try self.appendMessage("user", content);
+        try self.appendMessage(.user, content);
     }
 
     pub fn addUserBlocks(self: *Agent, blocks: []const ai.ContentBlock) !void {
@@ -368,13 +368,12 @@ pub const Agent = struct {
         };
     }
 
-    fn appendMessage(self: *Agent, role: []const u8, content: []const u8) !void {
-        const parsed_role = try ai.Role.fromString(role);
+    fn appendMessage(self: *Agent, role: ai.Role, content: []const u8) !void {
         const blocks = try self.gpa.alloc(ai.ContentBlock, 1);
         errdefer self.gpa.free(blocks);
         blocks[0] = .{ .text = .{ .text = try self.gpa.dupe(u8, content) } };
         errdefer blocks[0].deinit(self.gpa);
-        try self.messages.append(self.gpa, .{ .role = parsed_role, .content = blocks });
+        try self.messages.append(self.gpa, .{ .role = role, .content = blocks });
         try self.persistLastMessage();
     }
 
