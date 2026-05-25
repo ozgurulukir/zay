@@ -11,7 +11,8 @@ pub const Policy = struct {
 const entries = [_]struct { name: []const u8, policy: Policy }{
     .{ .name = "bash", .policy = .{ .expand_by_default = false, .render = .plain } },
     .{ .name = "read", .policy = .{ .expand_by_default = false, .render = .plain } },
-    .{ .name = "search_codebase", .policy = .{ .expand_by_default = false, .render = .plain } },
+    .{ .name = "find", .policy = .{ .expand_by_default = false, .render = .plain } },
+    .{ .name = "grep", .policy = .{ .expand_by_default = false, .render = .plain } },
     .{ .name = "write_file", .policy = .{ .expand_by_default = true, .render = .plain } },
     .{ .name = "edit_file", .policy = .{ .expand_by_default = true, .render = .diff } },
 };
