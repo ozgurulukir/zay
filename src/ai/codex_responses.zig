@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const logger = @import("logger");
 const ai = @import("../ai.zig");
 const core = @import("responses_core.zig");
@@ -294,6 +295,14 @@ fn logBytes(bytes: []const u8) []const u8 {
 }
 
 fn monotonicNowNs() i64 {
+    if (builtin.os.tag == .windows) {
+        var freq: std.os.windows.LARGE_INTEGER = undefined;
+        _ = std.os.windows.ntdll.RtlQueryPerformanceFrequency(&freq);
+        var counter: std.os.windows.LARGE_INTEGER = undefined;
+        _ = std.os.windows.ntdll.RtlQueryPerformanceCounter(&counter);
+        const ns: i128 = @divFloor(@as(i128, counter) * std.time.ns_per_s, @as(i128, freq));
+        return @intCast(ns);
+    }
     var now: std.c.timespec = undefined;
     const rc = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &now);
     std.debug.assert(rc == 0);
@@ -302,6 +311,12 @@ fn monotonicNowNs() i64 {
 
 fn sleepMs(milliseconds: u32) void {
     std.debug.assert(milliseconds > 0);
+    if (builtin.os.tag == .windows) {
+        // NtDelayExecution interval is in 100ns units; negative = relative.
+        const interval: std.os.windows.LARGE_INTEGER = -@as(std.os.windows.LARGE_INTEGER, milliseconds) * 10_000;
+        _ = std.os.windows.ntdll.NtDelayExecution(.FALSE, &interval);
+        return;
+    }
     var remaining: std.c.timespec = .{
         .sec = milliseconds / std.time.ms_per_s,
         .nsec = @as(c_long, @intCast(milliseconds % std.time.ms_per_s)) * std.time.ns_per_ms,
