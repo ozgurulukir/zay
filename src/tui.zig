@@ -696,7 +696,7 @@ pub const App = struct {
             if (!includeLocalModel(provider, entry.id)) continue;
             const id = try self.gpa.dupe(u8, entry.id);
             errdefer self.gpa.free(id);
-            const label = try std.fmt.allocPrint(self.gpa, "{s} • {s}", .{ providerModelLabel(provider), entry.id });
+            const label = try localModelLabel(self.gpa, provider, entry.id);
             errdefer self.gpa.free(label);
             try self.codex_models.append(self.gpa, .{ .id = id, .label = label });
             try self.model_sources.append(self.gpa, .{ .openai_compatible = provider });
@@ -770,6 +770,10 @@ pub const App = struct {
             .llama_cpp => "llama.cpp",
             else => provider.label(),
         };
+    }
+
+    fn localModelLabel(gpa: std.mem.Allocator, provider: config_mod.Provider, model_id: []const u8) ![]u8 {
+        return std.fmt.allocPrint(gpa, "{s} · {s}", .{ providerModelLabel(provider), model_id });
     }
 
     fn includeLocalModel(provider: config_mod.Provider, model_id: []const u8) bool {
@@ -1765,6 +1769,13 @@ test "provider picker has no custom connection row" {
     try std.testing.expect(state.handleKey(.{ .codepoint = vaxis.Key.down }, false));
     try std.testing.expectEqual(@as(u32, 0), state.selection);
     try std.testing.expectEqual(provider_picker.Action.connect_codex, state.selectedAction());
+}
+
+test "local provider model labels use correct separator" {
+    const label = try App.localModelLabel(std.testing.allocator, .ollama, "llama3");
+    defer std.testing.allocator.free(label);
+
+    try std.testing.expectEqualStrings("Ollama · llama3", label);
 }
 
 test "ollama cloud models are not listed as local models" {
