@@ -36,8 +36,8 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
 
     const runtime_gpa = std.heap.smp_allocator;
 
-    search.start(gpa, cwd);
-    defer search.deinit(gpa);
+    search.start(gpa, init.io, cwd);
+    defer search.deinit(gpa, init.io);
 
     const system_prompt = if (load_result.config.system_prompt) |s| s else @embedFile("prompts/system.md");
     const agent_runtime = try gpa.create(runtime.AgentRuntime);

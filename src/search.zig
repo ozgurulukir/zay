@@ -77,147 +77,144 @@ const Api = struct {
     }
 };
 
-const BackendState = enum {
-    unstarted,
-    starting,
-    ready,
-    failed,
+const InitOutcome = union(enum) {
+    ready: struct { api: Api, handle: *anyopaque },
+    failed: []u8, // gpa-owned
+
+    fn deinit(self: *InitOutcome, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .ready => |*r| {
+                r.api.destroy(r.handle);
+                r.api.close();
+            },
+            .failed => |msg| if (msg.len > 0) gpa.free(msg),
+        }
+        self.* = undefined;
+    }
 };
 
 const Backend = struct {
-    mutex: std.atomic.Mutex = .unlocked,
-    state: BackendState = .unstarted,
+    mutex: std.Io.Mutex = .init,
+    future: ?std.Io.Future(InitOutcome) = null,
+    /// Set by the init task immediately before it returns, so callers can
+    /// non-blockingly check whether `await` will be instant.
+    done: std.atomic.Value(bool) = .init(false),
     api: ?Api = null,
     handle: ?*anyopaque = null,
-    thread: ?std.Thread = null,
+    failed: bool = false,
     failure_message: []u8 = &.{},
-
-    fn markFailed(self: *Backend, gpa: std.mem.Allocator, message: []const u8) void {
-        assert(message.len > 0);
-        lockBackend();
-        defer self.mutex.unlock();
-        self.markFailedLocked(gpa, message);
-    }
-
-    fn markFailedLocked(self: *Backend, gpa: std.mem.Allocator, message: []const u8) void {
-        assert(message.len > 0);
-        if (self.failure_message.len > 0) gpa.free(self.failure_message);
-        self.failure_message = gpa.dupe(u8, message) catch &.{};
-        self.state = .failed;
-    }
 };
 
 var backend: Backend = .{};
 
-pub fn start(gpa: std.mem.Allocator, cwd: []const u8) void {
+fn initBackend(gpa: std.mem.Allocator, cwd: []u8, done: *std.atomic.Value(bool)) InitOutcome {
+    defer {
+        gpa.free(cwd);
+        done.store(true, .release);
+    }
+
+    var api = loadApi(gpa) catch |err| {
+        return .{ .failed = gpa.dupe(u8, @errorName(err)) catch &.{} };
+    };
+    errdefer api.close();
+
+    const cwd_c = toCString(gpa, cwd) catch {
+        return .{ .failed = gpa.dupe(u8, "out of memory") catch &.{} };
+    };
+    defer gpa.free(cwd_c);
+
+    const create_result = api.create_instance2(cwd_c.ptr, null, null, false, true, true, true, true, null, null, 0, 0, 0);
+    if (!create_result.success) {
+        const message: []u8 = gpa.dupe(u8, resultErrorMessage(create_result)) catch &.{};
+        api.free_result(create_result);
+        return .{ .failed = message };
+    }
+    const handle = create_result.handle orelse {
+        api.free_result(create_result);
+        return .{ .failed = gpa.dupe(u8, "fff returned no handle") catch &.{} };
+    };
+    api.free_result(create_result);
+
+    return .{ .ready = .{ .api = api, .handle = handle } };
+}
+
+pub fn start(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) void {
     assert(cwd.len > 0);
-    lockBackend();
-    defer backend.mutex.unlock();
-    if (backend.state != .unstarted) return;
+    if (backend.future != null or backend.api != null or backend.failed) return;
 
     const cwd_owned = gpa.dupe(u8, cwd) catch {
-        backend.state = .failed;
+        backend.failed = true;
         return;
     };
-    backend.state = .starting;
-    backend.thread = std.Thread.spawn(.{}, startThread, .{ gpa, cwd_owned }) catch {
+
+    backend.done.store(false, .release);
+    backend.future = io.concurrent(initBackend, .{ gpa, cwd_owned, &backend.done }) catch |err| {
         gpa.free(cwd_owned);
-        backend.state = .failed;
+        backend.failed = true;
+        backend.failure_message = gpa.dupe(u8, @errorName(err)) catch &.{};
         return;
     };
 }
 
-pub fn deinit(gpa: std.mem.Allocator) void {
-    if (backend.thread) |thread| {
-        thread.join();
-        backend.thread = null;
+pub fn deinit(gpa: std.mem.Allocator, io: std.Io) void {
+    if (backend.future) |*future| {
+        var outcome = future.cancel(io);
+        outcome.deinit(gpa);
+        backend.future = null;
     }
-
-    lockBackend();
-    defer backend.mutex.unlock();
+    backend.done.store(false, .release);
     if (backend.api) |*api| {
         if (backend.handle) |handle| api.destroy(handle);
         api.close();
     }
     if (backend.failure_message.len > 0) gpa.free(backend.failure_message);
-    backend.state = .unstarted;
-    backend.api = null;
-    backend.handle = null;
-    backend.failure_message = &.{};
+    backend = .{};
 }
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, request: Request) !Result {
     assert(cwd.len > 0);
     assert(request.query.len > 0);
 
-    if (try runReadyBackend(gpa, request)) |result| return result;
-
-    lockBackend();
-    const state = backend.state;
-    backend.mutex.unlock();
-    return runFallback(gpa, io, cwd, request, state);
+    if (try runReadyBackend(gpa, io, request)) |result| return result;
+    return runFallback(gpa, io, cwd, request);
 }
 
-fn runReadyBackend(gpa: std.mem.Allocator, request: Request) !?Result {
+fn runReadyBackend(gpa: std.mem.Allocator, io: std.Io, request: Request) !?Result {
     assert(request.query.len > 0);
 
-    lockBackend();
-    defer backend.mutex.unlock();
-    if (backend.state != .ready) return null;
+    try backend.mutex.lock(io);
+    defer backend.mutex.unlock(io);
 
-    const api = if (backend.api) |*api| api else return null;
+    if (backend.future != null and backend.done.load(.acquire)) {
+        const outcome = backend.future.?.await(io);
+        backend.future = null;
+        switch (outcome) {
+            .ready => |r| {
+                backend.api = r.api;
+                backend.handle = r.handle;
+            },
+            .failed => |msg| {
+                backend.failed = true;
+                backend.failure_message = msg;
+            },
+        }
+    }
+
+    if (backend.failed) return null;
+    if (backend.api == null) return null;
+
+    const api = &backend.api.?;
     const handle = backend.handle orelse return null;
     if (api.is_scanning(handle)) return null;
     return runFff(gpa, request, api, handle) catch |err| switch (err) {
         error.OutOfMemory, error.InvalidCursor => err,
         else => {
-            backend.markFailedLocked(gpa, @errorName(err));
+            if (backend.failure_message.len > 0) gpa.free(backend.failure_message);
+            backend.failure_message = gpa.dupe(u8, @errorName(err)) catch &.{};
+            backend.failed = true;
             return null;
         },
     };
-}
-
-fn lockBackend() void {
-    while (!backend.mutex.tryLock()) {
-        std.Thread.yield() catch {};
-    }
-}
-
-fn startThread(gpa: std.mem.Allocator, cwd_owned: []u8) void {
-    defer gpa.free(cwd_owned);
-    assert(cwd_owned.len > 0);
-
-    var api = loadApi(gpa) catch |err| {
-        backend.markFailed(gpa, @errorName(err));
-        return;
-    };
-    errdefer api.close();
-
-    const cwd_c = toCString(gpa, cwd_owned) catch {
-        backend.markFailed(gpa, "out of memory");
-        return;
-    };
-    defer gpa.free(cwd_c);
-
-    const create_result = api.create_instance2(cwd_c.ptr, null, null, false, true, true, true, true, null, null, 0, 0, 0);
-    if (!create_result.success) {
-        const message = resultErrorMessage(create_result);
-        backend.markFailed(gpa, message);
-        api.free_result(create_result);
-        return;
-    }
-    const handle = create_result.handle orelse {
-        api.free_result(create_result);
-        backend.markFailed(gpa, "fff returned no handle");
-        return;
-    };
-    api.free_result(create_result);
-
-    lockBackend();
-    defer backend.mutex.unlock();
-    backend.api = api;
-    backend.handle = handle;
-    backend.state = .ready;
 }
 
 fn loadApi(gpa: std.mem.Allocator) !Api {
@@ -324,10 +321,9 @@ fn formatFind(gpa: std.mem.Allocator, request: Request, result: *c.FffMixedSearc
     return okOwned(gpa, try out.toOwnedSlice());
 }
 
-fn runFallback(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, request: Request, state: BackendState) !Result {
+fn runFallback(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, request: Request) !Result {
     assert(cwd.len > 0);
     assert(request.query.len > 0);
-    _ = state;
     const command = try fallbackCommand(gpa, request.op, request.query);
     defer gpa.free(command);
 
