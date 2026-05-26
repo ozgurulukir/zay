@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const logger = @import("logger");
 const ai = @import("../ai.zig");
 const core = @import("responses_core.zig");
@@ -55,7 +54,7 @@ pub const Client = struct {
         defer client.close(.{}) catch {};
 
         var watchdog: WebSocketWatchdog = undefined;
-        try watchdog.start(client.stream.stream.socket.handle);
+        try watchdog.start(self.core_client.io, client.stream.stream.socket.handle);
         defer watchdog.stop();
 
         const headers = try buildHandshakeHeaders(gpa, endpoint.host_header, self.core_client.authorization, self.core_client.config);
@@ -106,38 +105,45 @@ pub const Client = struct {
 
 const WebSocketWatchdog = struct {
     fd: std.posix.socket_t,
+    io: std.Io,
     deadline_ns: std.atomic.Value(i64),
-    stopped: std.atomic.Value(bool),
     timed_out: std.atomic.Value(bool),
-    thread: std.Thread,
+    future: ?std.Io.Future(void),
 
-    fn start(self: *WebSocketWatchdog, fd: std.posix.socket_t) !void {
+    fn start(self: *WebSocketWatchdog, io: std.Io, fd: std.posix.socket_t) !void {
         self.* = .{
             .fd = fd,
+            .io = io,
             .deadline_ns = .init(0),
-            .stopped = .init(false),
             .timed_out = .init(false),
-            .thread = undefined,
+            .future = null,
         };
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        self.future = try io.concurrent(run, .{self});
     }
 
     fn stop(self: *WebSocketWatchdog) void {
-        self.stopped.store(true, .release);
-        self.thread.join();
+        if (self.future) |*future| {
+            _ = future.cancel(self.io);
+            self.future = null;
+        }
+    }
+
+    fn nowNs(self: *WebSocketWatchdog) i64 {
+        const ts = std.Io.Clock.Timestamp.now(self.io, .awake);
+        return @intCast(ts.raw.nanoseconds);
     }
 
     fn armMs(self: *WebSocketWatchdog, timeout_ms: u32) void {
         std.debug.assert(timeout_ms > 0);
         const timeout_ns: i64 = @as(i64, timeout_ms) * std.time.ns_per_ms;
-        self.deadline_ns.store(monotonicNowNs() + timeout_ns, .release);
+        self.deadline_ns.store(self.nowNs() + timeout_ns, .release);
         self.timed_out.store(false, .release);
     }
 
     fn armSeconds(self: *WebSocketWatchdog, timeout_seconds: u32) void {
         std.debug.assert(timeout_seconds > 0);
         const timeout_ns: i64 = @as(i64, timeout_seconds) * std.time.ns_per_s;
-        self.deadline_ns.store(monotonicNowNs() + timeout_ns, .release);
+        self.deadline_ns.store(self.nowNs() + timeout_ns, .release);
         self.timed_out.store(false, .release);
     }
 
@@ -147,16 +153,19 @@ const WebSocketWatchdog = struct {
     }
 
     fn run(self: *WebSocketWatchdog) void {
-        while (!self.stopped.load(.acquire)) {
+        while (true) {
             const deadline_ns = self.deadline_ns.load(.acquire);
-            if (deadline_ns > 0) {
-                if (monotonicNowNs() >= deadline_ns) {
+            const remaining_ns: i64 = blk: {
+                if (deadline_ns == 0) break :blk websocket_watchdog_poll_ms * std.time.ns_per_ms;
+                const now_ns = self.nowNs();
+                if (now_ns >= deadline_ns) {
                     self.timed_out.store(true, .release);
                     self.shutdown();
                     return;
                 }
-            }
-            sleepMs(websocket_watchdog_poll_ms);
+                break :blk deadline_ns - now_ns;
+            };
+            self.io.sleep(std.Io.Duration.fromNanoseconds(remaining_ns), .awake) catch return;
         }
     }
 
@@ -292,36 +301,6 @@ fn logBytes(bytes: []const u8) []const u8 {
     const limit = 12 * 1024;
     if (bytes.len <= limit) return bytes;
     return bytes[0..limit];
-}
-
-fn monotonicNowNs() i64 {
-    if (builtin.os.tag == .windows) {
-        var freq: std.os.windows.LARGE_INTEGER = undefined;
-        _ = std.os.windows.ntdll.RtlQueryPerformanceFrequency(&freq);
-        var counter: std.os.windows.LARGE_INTEGER = undefined;
-        _ = std.os.windows.ntdll.RtlQueryPerformanceCounter(&counter);
-        const ns: i128 = @divFloor(@as(i128, counter) * std.time.ns_per_s, @as(i128, freq));
-        return @intCast(ns);
-    }
-    var now: std.c.timespec = undefined;
-    const rc = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &now);
-    std.debug.assert(rc == 0);
-    return @as(i64, @intCast(now.sec)) * std.time.ns_per_s + now.nsec;
-}
-
-fn sleepMs(milliseconds: u32) void {
-    std.debug.assert(milliseconds > 0);
-    if (builtin.os.tag == .windows) {
-        // NtDelayExecution interval is in 100ns units; negative = relative.
-        const interval: std.os.windows.LARGE_INTEGER = -@as(std.os.windows.LARGE_INTEGER, milliseconds) * 10_000;
-        _ = std.os.windows.ntdll.NtDelayExecution(.FALSE, &interval);
-        return;
-    }
-    var remaining: std.c.timespec = .{
-        .sec = milliseconds / std.time.ms_per_s,
-        .nsec = @as(c_long, @intCast(milliseconds % std.time.ms_per_s)) * std.time.ns_per_ms,
-    };
-    while (std.c.nanosleep(&remaining, &remaining) != 0) {}
 }
 
 test "codex websocket endpoint parses https url" {
