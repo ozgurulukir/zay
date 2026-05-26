@@ -9,6 +9,7 @@ pub const db = @import("db.zig");
 pub const executor = @import("executor.zig");
 pub const search = @import("search.zig");
 pub const session = @import("session.zig");
+pub const symbols = @import("symbols.zig");
 pub const logger = @import("logger");
 pub const runtime = @import("runtime.zig");
 pub const thread = @import("thread.zig");

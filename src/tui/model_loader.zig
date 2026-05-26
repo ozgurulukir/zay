@@ -3,6 +3,7 @@ const std = @import("std");
 const codex = @import("../codex.zig");
 const config_mod = @import("../config.zig");
 const openai_compatible_mod = @import("../ai/openai_compatible.zig");
+const symbols = @import("../symbols.zig");
 
 pub const ModelSource = union(enum) { openai_codex, openai_compatible: config_mod.Provider };
 
@@ -130,7 +131,7 @@ fn loadLocal(job: *Job, provider: config_mod.Provider, result: *Result) !void {
         if (!includeLocalModel(provider, entry.id)) continue;
         const id = try job.gpa.dupe(u8, entry.id);
         errdefer job.gpa.free(id);
-        const label = try std.fmt.allocPrint(job.gpa, "{s} • {s}", .{ providerModelLabel(provider), entry.id });
+        const label = try std.fmt.allocPrint(job.gpa, "{s}{s}{s}", .{ providerModelLabel(provider), symbols.separator_dot_padded, entry.id });
         errdefer job.gpa.free(label);
         try result.models.append(job.gpa, .{ .id = id, .label = label });
         try result.sources.append(job.gpa, .{ .openai_compatible = provider });

@@ -9,6 +9,7 @@ const config_mod = @import("config.zig");
 const openai_compatible_mod = @import("ai/openai_compatible.zig");
 const runtime_mod = @import("runtime.zig");
 const session_mod = @import("session.zig");
+const symbols = @import("symbols.zig");
 const thread_mod = @import("thread.zig");
 const agent_worker = @import("tui/agent_worker.zig");
 const tui_thread_projection = @import("tui/thread_projection.zig");
@@ -802,7 +803,7 @@ pub const App = struct {
             if (!includeLocalModel(provider, entry.id)) continue;
             const id = try self.gpa.dupe(u8, entry.id);
             errdefer self.gpa.free(id);
-            const label = try std.fmt.allocPrint(self.gpa, "{s} • {s}", .{ providerModelLabel(provider), entry.id });
+            const label = try std.fmt.allocPrint(self.gpa, "{s}{s}{s}", .{ providerModelLabel(provider), symbols.separator_dot_padded, entry.id });
             errdefer self.gpa.free(label);
             try self.codex_models.append(self.gpa, .{ .id = id, .label = label });
             try self.model_sources.append(self.gpa, .{ .openai_compatible = provider });
@@ -1603,11 +1604,11 @@ fn reasoningOptions() []const ReasoningOption {
 
 fn inputHintText(mode: App.Mode) []const u8 {
     return switch (mode) {
-        .command => "↑↓ Navigate · [ENTER] Select · [ESC] Back",
-        .session_picker => "↑↓ Navigate · [TAB] Toggle · [ENTER] Select · [ESC] Back",
-        .provider_picker => "↑↓ Navigate · ←→ Actions · [ENTER] Select · [ESC] Back",
-        .model_picker => "↑↓ Navigate · ←→ Column · [TAB] Toggle Effort/Scope · [ENTER] Select · [ESC] Back",
-        .normal => "↑↓ Navigate · [TAB] Expand",
+        .command => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
+        .session_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[TAB] Toggle" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
+        .provider_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Actions" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
+        .model_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Column" ++ symbols.separator_dot_padded ++ "[TAB] Toggle Effort/Scope" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
+        .normal => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[TAB] Expand",
     };
 }
 

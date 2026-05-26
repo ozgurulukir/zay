@@ -3,6 +3,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const session_mod = @import("../../session.zig");
+const symbols = @import("../../symbols.zig");
 const message = @import("message.zig");
 const panel = @import("panel.zig");
 const tui_status = @import("../status.zig");
@@ -83,7 +84,7 @@ const Row = struct {
             return std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ marker, title });
         }
 
-        const separator = " · ";
+        const separator = symbols.separator_dot_padded;
         const separator_width = ctx.stringWidth(separator);
         if (available <= marker_width + separator_width + 4) {
             const title = try truncateText(ctx, name, available - marker_width);

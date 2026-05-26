@@ -3,6 +3,7 @@ const std = @import("std");
 const ai = @import("../ai.zig");
 const config_mod = @import("../config.zig");
 const runtime_mod = @import("../runtime.zig");
+const symbols = @import("../symbols.zig");
 
 pub const ModelStatus = struct {
     provider: []const u8,
@@ -42,7 +43,7 @@ pub fn modelStatus(runtime: ?*const runtime_mod.AgentRuntime, config: config_mod
 
 pub fn formatModelStatus(gpa: std.mem.Allocator, status: ModelStatus) ![]u8 {
     if (status.thinking) |thinking| {
-        return std.fmt.allocPrint(gpa, "{s}/{s} · {s}", .{ status.provider, status.model, thinking });
+        return std.fmt.allocPrint(gpa, "{s}/{s}{s}{s}", .{ status.provider, status.model, symbols.separator_dot_padded, thinking });
     }
     return std.fmt.allocPrint(gpa, "{s}/{s}", .{ status.provider, status.model });
 }
@@ -125,7 +126,7 @@ test "model status includes reasoning effort when present" {
     const gpa = std.testing.allocator;
     const text = try formatModelStatus(gpa, .{ .provider = "openai", .model = "gpt-5.5", .thinking = "medium" });
     defer gpa.free(text);
-    try std.testing.expectEqualStrings("openai/gpt-5.5 · medium", text);
+    try std.testing.expectEqualStrings("openai/gpt-5.5" ++ symbols.separator_dot_padded ++ "medium", text);
 }
 
 test "model status omits separator when thinking is unavailable" {
