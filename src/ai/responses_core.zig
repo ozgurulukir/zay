@@ -189,7 +189,7 @@ pub fn writeRequestPayload(out: *std.Io.Writer, config: ai.Config, messages: []c
     try out.writeAll(",\"input\":[");
     var written: u32 = 0;
     for (messages) |message| {
-        if (config.responses_mode == .codex and message.role == .system) continue;
+        if (config.system_prompt.len > 0 and message.role == .system) continue;
         if (written > 0) try out.writeByte(',');
         try writeInputMessage(out, message);
         written += 1;
@@ -197,14 +197,16 @@ pub fn writeRequestPayload(out: *std.Io.Writer, config: ai.Config, messages: []c
     try out.writeAll("],\"stream\":true,\"store\":false,\"tools\":");
     try out.writeAll(tools_json);
     try out.writeAll(",\"tool_choice\":\"auto\"");
-    if (config.responses_mode == .codex) {
+    if (config.system_prompt.len > 0) {
         try out.writeAll(",\"instructions\":");
         try std.json.Stringify.value(config.system_prompt, .{}, out);
+    }
+    if (config.session_id.len > 0) {
+        try out.writeAll(",\"prompt_cache_key\":");
+        try std.json.Stringify.value(config.session_id, .{}, out);
+    }
+    if (config.responses_mode == .codex) {
         try out.writeAll(",\"text\":{\"verbosity\":\"low\"},\"parallel_tool_calls\":true");
-        if (config.session_id.len > 0) {
-            try out.writeAll(",\"prompt_cache_key\":");
-            try std.json.Stringify.value(config.session_id, .{}, out);
-        }
     }
     if (config.reasoning) |value| {
         try out.writeAll(",\"reasoning\":{");
@@ -782,6 +784,71 @@ fn logBytes(bytes: []const u8) []const u8 {
     const limit = 12 * 1024;
     if (bytes.len <= limit) return bytes;
     return bytes[0..limit];
+}
+
+test "writeRequestPayload puts system prompt in instructions for standard mode" {
+    const gpa = std.testing.allocator;
+    const empty_content = try gpa.alloc(ai.ContentBlock, 0);
+    defer gpa.free(empty_content);
+    const system_message: ai.ChatMessage = .{ .role = .system, .content = empty_content };
+    const config: ai.Config = .{
+        .base_url = "",
+        .api_key = "",
+        .model = "gpt-test",
+        .responses_mode = .standard,
+        .session_id = "session-abc",
+        .system_prompt = "You are Nova.",
+        .reasoning = null,
+    };
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(&payload.writer, config, &.{system_message}, "[]");
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"You are Nova.\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"session-abc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"input\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "verbosity") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "parallel_tool_calls") == null);
+}
+
+test "writeRequestPayload keeps codex-only verbosity hint in codex mode" {
+    const gpa = std.testing.allocator;
+    const config: ai.Config = .{
+        .base_url = "",
+        .api_key = "",
+        .model = "gpt-5.5",
+        .responses_mode = .codex,
+        .session_id = "session-xyz",
+        .system_prompt = "You are Nova.",
+        .reasoning = null,
+    };
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(&payload.writer, config, &.{}, "[]");
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"You are Nova.\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"session-xyz\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"verbosity\":\"low\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"parallel_tool_calls\":true") != null);
+}
+
+test "writeRequestPayload omits prompt_cache_key when no session id is set" {
+    const gpa = std.testing.allocator;
+    const config: ai.Config = .{
+        .base_url = "",
+        .api_key = "",
+        .model = "gpt-test",
+        .responses_mode = .standard,
+        .session_id = "",
+        .system_prompt = "You are Nova.",
+        .reasoning = null,
+    };
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(&payload.writer, config, &.{}, "[]");
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_key") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"You are Nova.\"") != null);
 }
 
 test "openresponses tools json is an array" {
