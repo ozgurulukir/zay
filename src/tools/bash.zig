@@ -136,7 +136,7 @@ fn parseError(gpa: std.mem.Allocator, err: ParseError) common.Error!common.Outpu
     };
 }
 
-fn currentEnvMap(gpa: std.mem.Allocator) std.mem.Allocator.Error!std.process.Environ.Map {
+fn currentEnvMap(gpa: std.mem.Allocator) (std.mem.Allocator.Error || std.Io.UnexpectedError)!std.process.Environ.Map {
     if (builtin.os.tag == .windows) {
         return std.process.Environ.createMap(.{ .block = .global }, gpa);
     }

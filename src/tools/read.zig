@@ -129,20 +129,19 @@ fn read(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, args: Args) common.
     const absolute = common.joinPath(gpa, cwd, args.path) catch |err| return common.mapAllocError(err);
     defer gpa.free(absolute);
 
-    return readDirectory(gpa, io, args.path, absolute) catch |dir_err| switch (dir_err) {
+    return readDirectory(gpa, io, absolute) catch |dir_err| switch (dir_err) {
         error.NotDir => readFile(gpa, io, args, absolute),
         else => common.failFmt(gpa, 1, "read: {s}: {s}\n", .{ args.path, @errorName(dir_err) }),
     };
 }
 
 // TODO: Investigate io_uring here
-fn readDirectory(gpa: std.mem.Allocator, io: std.Io, display_path: []const u8, absolute: []const u8) !common.Output {
+fn readDirectory(gpa: std.mem.Allocator, io: std.Io, absolute: []const u8) !common.Output {
     var dir = try std.Io.Dir.openDirAbsolute(io, absolute, .{ .iterate = true });
     defer dir.close(io);
 
     var buffer: std.ArrayList(u8) = .empty;
     errdefer buffer.deinit(gpa);
-    try buffer.print(gpa, "{s}/\n", .{display_path});
 
     var iter = dir.iterate();
     var count: u32 = 0;
@@ -151,19 +150,11 @@ fn readDirectory(gpa: std.mem.Allocator, io: std.Io, display_path: []const u8, a
             try buffer.print(gpa, "\n[Showing first {d} entries.]", .{max_directory_entries});
             break;
         }
-        try buffer.print(gpa, "{s}\t{s}\n", .{ kindName(entry.kind), entry.name });
+        const suffix: []const u8 = if (entry.kind == .directory) "/" else "";
+        try buffer.print(gpa, "{s}{s}\n", .{ entry.name, suffix });
         count += 1;
     }
     return common.ok(gpa, try buffer.toOwnedSlice(gpa));
-}
-
-fn kindName(kind: std.Io.File.Kind) []const u8 {
-    return switch (kind) {
-        .directory => "dir",
-        .file => "file",
-        .sym_link => "link",
-        else => "other",
-    };
 }
 
 fn readFile(gpa: std.mem.Allocator, io: std.Io, args: Args, absolute: []const u8) common.Error!common.Output {

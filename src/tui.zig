@@ -9,12 +9,14 @@ const config_mod = @import("config.zig");
 const openai_compatible_mod = @import("ai/openai_compatible.zig");
 const runtime_mod = @import("runtime.zig");
 const session_mod = @import("session.zig");
+const symbols = @import("symbols.zig");
 const thread_mod = @import("thread.zig");
 const agent_worker = @import("tui/agent_worker.zig");
 const tui_thread_projection = @import("tui/thread_projection.zig");
 const tui_metrics = @import("tui/metrics.zig");
 const tui_message = @import("tui/widgets/message.zig");
 const command_panel = @import("tui/widgets/command_panel.zig");
+const model_loader = @import("tui/model_loader.zig");
 const model_picker = @import("tui/widgets/model_picker.zig");
 const panel_widget = @import("tui/widgets/panel.zig");
 const provider_picker = @import("tui/widgets/provider_picker.zig");
@@ -89,10 +91,17 @@ pub const App = struct {
         .draw_cursor = false,
         .wheel_scroll = 3,
     },
+    model_load_future: ?std.Io.Future(model_loader.Outcome) = null,
+    model_load_done: std.atomic.Value(bool) = .init(false),
+    model_load_error: ?[]u8 = null,
+    /// True once a successful catalog fetch has populated `codex_models`.
+    /// Subsequent picker opens skip the network round-trip and just re-sort
+    /// for the current active model. Reset on sign-in/sign-out.
+    models_cached: bool = false,
 
     const Mode = enum { normal, command, session_picker, provider_picker, model_picker };
     const ModelCatalog = enum { connected_provider, openai_codex };
-    const ModelSource = union(enum) { openai_codex, openai_compatible: config_mod.Provider };
+    const ModelSource = model_loader.ModelSource;
     const ModelScope = enum { global, project, session };
 
     pub fn init(io: std.Io, gpa: std.mem.Allocator, agent: *agent_mod.Agent) App {
@@ -130,6 +139,11 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         self.awaitTurn();
+        self.cancelModelLoad();
+        if (self.model_load_error) |message| {
+            self.gpa.free(message);
+            self.model_load_error = null;
+        }
         for (self.retired_threads.items) |*thread| thread.deinit(self.gpa);
         self.retired_threads.deinit(self.gpa);
         self.resumeClear();
@@ -290,12 +304,10 @@ pub const App = struct {
         }
         if (key.matches(vaxis.Key.up, .{})) {
             self.model_selection = previousIndex(self.model_selection, @intCast(self.codex_models.items.len));
-            self.syncModelListCursor();
             return true;
         }
         if (key.matches(vaxis.Key.down, .{})) {
             self.model_selection = nextIndex(self.model_selection, @intCast(self.codex_models.items.len));
-            self.syncModelListCursor();
             return true;
         }
         return false;
@@ -381,7 +393,10 @@ pub const App = struct {
 
     fn cancelMode(self: *App) !bool {
         if (self.mode == .normal) return false;
-        if (self.mode == .model_picker) try self.revertModelPickerSnapshot();
+        if (self.mode == .model_picker) {
+            self.cancelModelLoad();
+            try self.revertModelPickerSnapshot();
+        }
         if (self.mode == .session_picker or self.mode == .provider_picker or self.mode == .model_picker) {
             try self.openCommandMenu();
             self.resumeClear();
@@ -437,7 +452,7 @@ pub const App = struct {
                 .new => self.switchToNewSession() catch |err| try self.reportSessionSwitchError(err),
                 .resume_session => try self.openResumePicker(),
                 .connect => try self.openProviderPicker(),
-                .model => try self.openModelPicker(),
+                .model => self.openModelPicker() catch |err| try self.reportConnectionError(err),
             }
         }
         return true;
@@ -470,11 +485,110 @@ pub const App = struct {
         self.model_selection = 0;
         self.model_scope = self.defaultModelScope();
         self.clearInput();
-        try self.reloadModelCatalog(.connected_provider);
-        // Snapshot for Escape revert. See `cancelMode`.
+
+        if (self.models_cached and self.codex_models.items.len > 0) {
+            try self.finishModelCatalogReload();
+            try self.snapshotModelPickerState();
+            return;
+        }
+
+        // Cold path — clear stale state, kick off the async load.
+        self.codexModelsClear();
+        self.model_reasoning.clearRetainingCapacity();
+        self.model_reasoning_snapshot.clearRetainingCapacity();
+        self.model_selection_snapshot = 0;
+        try self.startModelLoad(.connected_provider);
+    }
+
+    fn snapshotModelPickerState(self: *App) !void {
         self.model_reasoning_snapshot.clearRetainingCapacity();
         try self.model_reasoning_snapshot.appendSlice(self.gpa, self.model_reasoning.items);
         self.model_selection_snapshot = self.model_selection;
+    }
+
+    fn startModelLoad(self: *App, catalog: ModelCatalog) !void {
+        self.cancelModelLoad();
+        if (self.model_load_error) |message| {
+            self.gpa.free(message);
+            self.model_load_error = null;
+        }
+
+        const job = try self.gpa.create(model_loader.Job);
+        errdefer self.gpa.destroy(job);
+
+        var configured: ?model_loader.Configured = null;
+        errdefer if (configured) |c| {
+            self.gpa.free(c.base_url);
+            self.gpa.free(c.api_key);
+        };
+        if (catalog == .connected_provider and self.shouldLoadConfiguredCompatibleCatalog()) {
+            const base_url = try self.gpa.dupe(u8, self.cached_config.base_url.?);
+            errdefer self.gpa.free(base_url);
+            const api_key = try self.gpa.dupe(u8, self.cached_config.api_key.?);
+            const provider = self.cached_config.provider orelse tui_provider.compatibleProviderFromBaseUrl(base_url);
+            configured = .{ .provider = provider, .base_url = base_url, .api_key = api_key };
+        }
+
+        job.* = .{
+            .gpa = self.gpa,
+            .io = self.io,
+            .catalog = switch (catalog) {
+                .connected_provider => .connected_provider,
+                .openai_codex => .openai_codex,
+            },
+            .configured = configured,
+            .codex_signed_in = self.isCodexSignedIn(),
+            .done = &self.model_load_done,
+        };
+
+        self.model_load_done.store(false, .release);
+        self.model_load_future = try self.io.concurrent(model_loader.run, .{job});
+    }
+
+    fn cancelModelLoad(self: *App) void {
+        if (self.model_load_future) |*future| {
+            var outcome = future.cancel(self.io);
+            outcome.deinit(self.gpa);
+            self.model_load_future = null;
+        }
+        self.model_load_done.store(false, .release);
+    }
+
+    /// Called from the tick handler. Polls the non-blocking `done` flag, and
+    /// only `await`s once the worker has signalled completion. Returns true
+    /// if a redraw is needed.
+    fn drainModelLoad(self: *App) !bool {
+        if (self.model_load_future == null) return false;
+        if (!self.model_load_done.load(.acquire)) return false;
+
+        var outcome = self.model_load_future.?.await(self.io);
+        self.model_load_future = null;
+        self.model_load_done.store(false, .release);
+        defer outcome.deinit(self.gpa);
+
+        switch (outcome) {
+            .ready => |*result| try self.installModelLoadResult(result),
+            .failed => |message| {
+                if (self.model_load_error) |old| self.gpa.free(old);
+                self.model_load_error = try self.gpa.dupe(u8, message);
+            },
+        }
+        return true;
+    }
+
+    fn installModelLoadResult(self: *App, result: *model_loader.Result) !void {
+        self.codexModelsClear();
+        for (result.models.items) |*model| {
+            try self.codex_models.append(self.gpa, model.*);
+        }
+        result.models.clearRetainingCapacity();
+        for (result.sources.items) |source| {
+            try self.model_sources.append(self.gpa, source);
+        }
+        result.sources.clearRetainingCapacity();
+        try self.finishModelCatalogReload();
+        try self.snapshotModelPickerState();
+        self.models_cached = true;
     }
 
     fn defaultModelScope(self: *App) ModelScope {
@@ -487,6 +601,7 @@ pub const App = struct {
         if (self.in_flight) return error.InFlightTurn;
         var credentials = try codex.login(self.gpa, self.io, self.runtime.?.home_dir);
         defer credentials.deinit(self.gpa);
+        self.models_cached = false;
         try self.reloadModelCatalog(.openai_codex);
         const model = self.selectedCodexModel() orelse return error.NoModels;
         const effort = self.selectedReasoningEffort();
@@ -505,6 +620,7 @@ pub const App = struct {
         self.codex_signed_in = false;
         self.agent.client = self.runtime.?.client;
         self.codexModelsClear();
+        self.models_cached = false;
         self.mode = .normal;
         self.clearInput();
         _ = try self.thread.append(self.gpa, .agent, "agent", "Signed out from OpenAI Codex.");
@@ -512,7 +628,6 @@ pub const App = struct {
 
     fn applySelectedModel(self: *App) !void {
         if (self.in_flight) return error.InFlightTurn;
-        if (self.codex_models.items.len == 0) try self.reloadModelCatalog(.connected_provider);
         const model = self.selectedCodexModel() orelse return error.NoModels;
         const effort = self.selectedReasoningEffort();
 
@@ -634,22 +749,14 @@ pub const App = struct {
     }
 
     fn finishModelCatalogReload(self: *App) !void {
-        self.moveActiveModelFirst();
         self.model_reasoning.clearRetainingCapacity();
         try self.model_reasoning.appendNTimes(self.gpa, 0, self.codex_models.items.len);
         if (self.model_selection >= self.codex_models.items.len) self.model_selection = 0;
-        self.syncModelListCursor();
     }
 
-    fn moveActiveModelFirst(self: *App) void {
-        const status = tui_status.modelStatus(self.runtime, self.cached_config) orelse return;
-        for (self.codex_models.items, 0..) |model, index| {
-            if (!std.mem.eql(u8, model.id, status.model)) continue;
-            if (index == 0) return;
-            std.mem.swap(codex.Model, &self.codex_models.items[0], &self.codex_models.items[index]);
-            std.mem.swap(ModelSource, &self.model_sources.items[0], &self.model_sources.items[index]);
-            return;
-        }
+    fn activeModelId(self: *const App) ?[]const u8 {
+        const status = tui_status.modelStatus(self.runtime, self.cached_config) orelse return null;
+        return status.model;
     }
 
     fn loadCodexStaticCatalog(self: *App) !void {
@@ -810,12 +917,17 @@ pub const App = struct {
 
     fn selectedCodexModel(self: *App) ?codex.Model {
         if (self.model_selection >= self.codex_models.items.len) return null;
-        return self.codex_models.items[self.model_selection];
+        const active_storage_idx = model_picker.findActiveStorageIdx(self.codex_models.items, self.activeModelId());
+        const idx = model_picker.displayToStorage(active_storage_idx, self.model_selection);
+        return self.codex_models.items[idx];
     }
 
     fn selectedModelSource(self: *const App) ?ModelSource {
         if (self.model_selection >= self.model_sources.items.len) return null;
-        return self.model_sources.items[self.model_selection];
+        const active_storage_idx = model_picker.findActiveStorageIdx(self.codex_models.items, self.activeModelId());
+        const idx = model_picker.displayToStorage(active_storage_idx, self.model_selection);
+        if (idx >= self.model_sources.items.len) return null;
+        return self.model_sources.items[idx];
     }
 
     fn codexModelsClear(self: *App) void {
@@ -882,11 +994,6 @@ pub const App = struct {
     fn syncResumeListCursor(self: *App) void {
         self.resume_list.cursor = self.resume_selection;
         self.resume_list.ensureScroll();
-    }
-
-    fn syncModelListCursor(self: *App) void {
-        self.model_list.cursor = self.model_selection;
-        self.model_list.ensureScroll();
     }
 
     fn clearInput(self: *App) void {
@@ -1136,6 +1243,7 @@ const RootWidget = struct {
 
     fn handleTick(self: *RootWidget, ctx: *vxfw.EventContext) !void {
         var visible_change = try self.drainAgentEvents(ctx);
+        if (try self.app.drainModelLoad()) visible_change = true;
 
         if (self.app.thread_projection.loading_index) |_| {
             self.spinner_tick_accum += drain_tick_ms;
@@ -1148,7 +1256,8 @@ const RootWidget = struct {
             self.spinner_tick_accum = 0;
         }
 
-        const should_tick = self.app.in_flight or self.app.thread_projection.loading_index != null;
+        const model_loading = self.app.model_load_future != null;
+        const should_tick = self.app.in_flight or self.app.thread_projection.loading_index != null or model_loading;
         if (should_tick) {
             try ctx.tick(drain_tick_ms, self.widget());
         } else {
@@ -1171,6 +1280,7 @@ const RootWidget = struct {
 
     fn submit(self: *RootWidget, ctx: *vxfw.EventContext) !void {
         if (try self.app.submitMode()) {
+            if (self.app.model_load_future != null) try self.startLoadingTick(ctx);
             ctx.consumeAndRedraw();
             return;
         }
@@ -1457,6 +1567,8 @@ const PanelWidget = struct {
                 .reasoning_options = modelReasoningOptions(),
                 .reasoning_indexes = self.app.model_reasoning.items,
                 .scope = modelPickerScope(self.app.model_scope),
+                .loading = self.app.model_load_future != null,
+                .error_message = self.app.model_load_error,
             };
             var shell: panel_widget.Shell = .{ .child = content.widget() };
             return shell.widget().draw(ctx);
@@ -1496,11 +1608,11 @@ fn reasoningOptions() []const ReasoningOption {
 
 fn inputHintText(mode: App.Mode) []const u8 {
     return switch (mode) {
-        .command => "↑↓ Navigate · [ENTER] Select · [ESC] Back",
-        .session_picker => "↑↓ Navigate · [TAB] Toggle · [ENTER] Select · [ESC] Back",
-        .provider_picker => "↑↓ Navigate · ←→ Actions · [ENTER] Select · [ESC] Back",
-        .model_picker => "↑↓ Navigate · ←→ Column · [TAB] Toggle Effort/Scope · [ENTER] Select · [ESC] Back",
-        .normal => "↑↓ Navigate · [TAB] Expand",
+        .command => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
+        .session_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[TAB] Toggle" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
+        .provider_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Actions" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
+        .model_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Column" ++ symbols.separator_dot_padded ++ "[TAB] Toggle Effort/Scope" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
+        .normal => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[TAB] Expand",
     };
 }
 
@@ -1859,7 +1971,7 @@ test "codex sign-in survives selecting local compatible provider" {
     try std.testing.expectEqual(config_mod.Provider.ollama, app.cached_config.provider.?);
 }
 
-test "active model moves to top of model catalog" {
+test "active model appears at display position 0 without mutating storage" {
     const gpa = std.testing.allocator;
     var openai_compatible_client: openai_compatible_mod.Client = undefined;
     try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
@@ -1875,7 +1987,9 @@ test "active model moves to top of model catalog" {
 
     try app.reloadModelCatalog(.openai_codex);
 
-    try std.testing.expectEqualStrings("gpt-5.4-mini", app.codex_models.items[0].id);
+    const active_storage_idx = model_picker.findActiveStorageIdx(app.codex_models.items, "gpt-5.4-mini");
+    const storage_idx = model_picker.displayToStorage(active_storage_idx, 0);
+    try std.testing.expectEqualStrings("gpt-5.4-mini", app.codex_models.items[storage_idx].id);
 }
 
 test "explicit codex catalog loads before runtime is connected" {

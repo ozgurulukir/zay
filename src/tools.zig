@@ -3,8 +3,9 @@ const std = @import("std");
 const bash_tool = @import("tools/bash.zig");
 const common = @import("tools/common.zig");
 const edit_file = @import("tools/edit_file.zig");
+const find_tool = @import("tools/find.zig");
+const grep_tool = @import("tools/grep.zig");
 const read = @import("tools/read.zig");
-const search_codebase = @import("tools/search_codebase.zig");
 const write_file = @import("tools/write_file.zig");
 
 const assert = std.debug.assert;
@@ -22,7 +23,8 @@ pub const registry: []const Tool = &.{
     read.tool,
     write_file.tool,
     edit_file.tool,
-    search_codebase.tool,
+    find_tool.tool,
+    grep_tool.tool,
 };
 
 pub fn run(
@@ -58,7 +60,7 @@ test "registry contains every tool exactly once" {
         const gop = try seen.getOrPut(tool.name);
         try std.testing.expect(!gop.found_existing);
     }
-    try std.testing.expectEqual(@as(usize, 5), registry.len);
+    try std.testing.expectEqual(@as(usize, 6), registry.len);
 }
 
 test "lookup finds a registered tool" {
@@ -74,8 +76,9 @@ test {
     _ = bash_tool;
     _ = common;
     _ = edit_file;
+    _ = find_tool;
+    _ = grep_tool;
     _ = read;
-    _ = search_codebase;
     _ = write_file;
     _ = @import("tools/hashline/hash.zig");
     _ = @import("tools/hashline/parse.zig");
