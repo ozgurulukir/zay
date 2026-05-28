@@ -1206,6 +1206,7 @@ pub const App = struct {
     }
 
     fn setSelectedMessageOffset(self: *App, selected: u32, offset: u16) void {
+        self.thread_list.cursor = selected;
         self.thread_list.scroll.top = selected;
         self.thread_list.scroll.offset = @intCast(offset);
         self.thread_list.scroll.pending_lines = 0;
@@ -1972,6 +1973,19 @@ test "up enters selected long message at bottom" {
 
     try std.testing.expect(!scrolled);
     try std.testing.expectEqual(@as(?u32, 0), app.thread.selected);
+    try std.testing.expect(app.thread_list.scroll.offset > 0);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var thread_widget: ThreadWidget = .{ .app = &app };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 6 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    _ = try thread_widget.widget().draw(ctx);
+
     try std.testing.expect(app.thread_list.scroll.offset > 0);
 }
 
