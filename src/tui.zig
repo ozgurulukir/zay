@@ -4,6 +4,7 @@ const vxfw = vaxis.vxfw;
 
 const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
+const bash_mod = @import("bash.zig");
 const codex = @import("codex.zig");
 const config_mod = @import("config.zig");
 const openai_compatible_mod = @import("ai/openai_compatible.zig");
@@ -78,6 +79,7 @@ pub const App = struct {
     loading_frame: u8 = 0,
     loading_tick_active: bool = false,
     thread_auto_scroll: bool = true,
+    git_branch: []const u8 = "",
     thread_view_width: u16 = 80,
     thread_view_height: u16 = 1,
     thread_list: vxfw.ListView = .{
@@ -1251,7 +1253,7 @@ const RootLayout = struct {
 };
 
 fn rootLayout(max_height: u16, panel_visible: bool) RootLayout {
-    const input_height: u16 = @min(max_height, 5);
+    const input_height: u16 = @min(max_height, 6);
     const thread_height: u16 = max_height - input_height;
     const panel_height: u16 = if (panel_visible) @min(thread_height, 7) else 0;
     return .{
@@ -1281,12 +1283,28 @@ pub fn run(
     defer gpa.free(logo);
     _ = try app.thread.append(gpa, .logo, "logo", logo);
 
+    app.git_branch = loadGitBranch(gpa, init.io, runtime.cwd) catch "";
+
     var root: RootWidget = .{ .app = &app };
     try fw_app.run(root.widget(), .{});
 }
 
 fn loadStartupLogo(gpa: std.mem.Allocator) ![]u8 {
     return gpa.dupe(u8, @embedFile("assets/logo.txt"));
+}
+
+fn loadGitBranch(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) ![]const u8 {
+    const command = "branch=$(git branch --show-current 2>/dev/null); if [ -n \"$branch\" ]; then printf %s \"$branch\"; else git rev-parse --short HEAD 2>/dev/null; fi";
+    var result = try bash_mod.runWithOptions(gpa, io, .{
+        .cwd = cwd,
+        .command = command,
+        .timeout = bash_mod.timeoutFromSeconds(2),
+    });
+    defer result.deinit(gpa);
+    if (result.code != 0) return "";
+    const branch = std.mem.trim(u8, result.stdout, " \t\r\n");
+    if (branch.len == 0) return "";
+    return try std.fmt.allocPrint(gpa, "⌥ {s}", .{branch});
 }
 
 const RootWidget = struct {
@@ -1764,15 +1782,16 @@ const InputWidget = struct {
 
         if (height <= 3) return try self.drawInputBorder(ctx, max_width, height);
 
-        const show_hint = height > 4;
-        const children_count: usize = if (show_hint) 4 else 3;
+        const show_branch = height > 4;
+        const show_hint = height > 5;
+        const children_count: usize = 3 + @as(usize, if (show_branch) 1 else 0) + @as(usize, if (show_hint) 1 else 0);
         const children = try ctx.arena.alloc(vxfw.SubSurface, children_count);
         children[0] = .{
             .origin = .{ .row = 0, .col = 0 },
             .surface = try self.drawInputBorder(ctx, max_width, 3),
             .z_index = 0,
         };
-        try self.drawInputStatus(ctx, children, max_width, show_hint);
+        try self.drawInputStatus(ctx, children, max_width, .{ .branch = show_branch, .hint = show_hint });
         return .{
             .size = .{ .width = max_width, .height = height },
             .widget = self.widget(),
@@ -1802,7 +1821,9 @@ const InputWidget = struct {
         return box.widget().draw(ctx.withConstraints(.{ .width = max_width, .height = height }, .{ .width = max_width, .height = height }));
     }
 
-    fn drawInputStatus(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, max_width: u16, show_hint: bool) std.mem.Allocator.Error!void {
+    const StatusRows = struct { branch: bool, hint: bool };
+
+    fn drawInputStatus(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, max_width: u16, rows: StatusRows) std.mem.Allocator.Error!void {
         const cwd_raw = if (self.app.runtime) |runtime| runtime.cwd else self.app.agent.cwd;
         const home_dir = if (self.app.runtime) |runtime| runtime.home_dir else "";
         const cwd = try tui_status.formatCwdRelative(ctx.arena, cwd_raw, home_dir);
@@ -1820,7 +1841,8 @@ const InputWidget = struct {
             .inner_width = status_inner_width,
             .cwd_width = cwd_width,
             .model_width = model_width,
-            .show_hint = show_hint,
+            .show_branch = rows.branch,
+            .show_hint = rows.hint,
         });
     }
 
@@ -1829,6 +1851,7 @@ const InputWidget = struct {
         inner_width: u16,
         cwd_width: u16,
         model_width: u16,
+        show_branch: bool,
         show_hint: bool,
     };
 
@@ -1836,22 +1859,38 @@ const InputWidget = struct {
         var cwd_text: vxfw.Text = .{ .text = cwd, .style = StylePalette.cwd, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
         var model_text: vxfw.Text = .{ .text = status_text, .style = StylePalette.model_status, .text_align = .right, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
         const status_row = @as(u16, 3);
-        children[1] = .{
+        var child_index: usize = 1;
+        children[child_index] = .{
             .origin = .{ .row = status_row, .col = layout.padding_x },
             .surface = try cwd_text.widget().draw(ctx.withConstraints(.{ .width = layout.cwd_width, .height = 1 }, .{ .width = layout.cwd_width, .height = 1 })),
             .z_index = 0,
         };
-        children[2] = .{
+        child_index += 1;
+        children[child_index] = .{
             .origin = .{ .row = status_row, .col = layout.padding_x + layout.inner_width -| layout.model_width },
             .surface = try model_text.widget().draw(ctx.withConstraints(.{ .width = layout.model_width, .height = 1 }, .{ .width = layout.model_width, .height = 1 })),
             .z_index = 0,
         };
-        if (layout.show_hint) try self.drawInputHint(ctx, children, status_row + 1, layout.padding_x, layout.inner_width);
+        child_index += 1;
+        if (layout.show_branch) {
+            try self.drawInputGitBranch(ctx, children, child_index, status_row + 1, layout.padding_x, layout.inner_width);
+            child_index += 1;
+        }
+        if (layout.show_hint) try self.drawInputHint(ctx, children, child_index, status_row + 2, layout.padding_x, layout.inner_width);
     }
 
-    fn drawInputHint(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, row: u16, col: u16, width: u16) std.mem.Allocator.Error!void {
+    fn drawInputGitBranch(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, child_index: usize, row: u16, col: u16, width: u16) std.mem.Allocator.Error!void {
+        var branch_text: vxfw.Text = .{ .text = self.app.git_branch, .style = StylePalette.git_branch, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
+        children[child_index] = .{
+            .origin = .{ .row = row, .col = col },
+            .surface = try branch_text.widget().draw(ctx.withConstraints(.{ .width = width, .height = 1 }, .{ .width = width, .height = 1 })),
+            .z_index = 0,
+        };
+    }
+
+    fn drawInputHint(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, child_index: usize, row: u16, col: u16, width: u16) std.mem.Allocator.Error!void {
         var hint_text: vxfw.Text = .{ .text = inputHintText(self.app.mode), .style = StylePalette.thinking_body, .text_align = .center, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
-        children[3] = .{
+        children[child_index] = .{
             .origin = .{ .row = row, .col = col },
             .surface = try hint_text.widget().draw(ctx.withConstraints(.{ .width = width, .height = 1 }, .{ .width = width, .height = 1 })),
             .z_index = 0,
@@ -1900,18 +1939,18 @@ test "root layout keeps input fixed when panel opens" {
 
     try std.testing.expectEqual(normal.input_row, picker.input_row);
     try std.testing.expectEqual(normal.thread_height, picker.thread_height);
-    try std.testing.expectEqual(@as(u16, 18), picker.panel_row);
+    try std.testing.expectEqual(@as(u16, 17), picker.panel_row);
     try std.testing.expectEqual(@as(u16, 7), picker.panel_height);
 }
 
 test "root layout clamps panel above input on short screens" {
     const layout = rootLayout(8, true);
 
-    try std.testing.expectEqual(@as(u16, 5), layout.input_height);
-    try std.testing.expectEqual(@as(u16, 3), layout.thread_height);
-    try std.testing.expectEqual(@as(u16, 3), layout.panel_height);
+    try std.testing.expectEqual(@as(u16, 6), layout.input_height);
+    try std.testing.expectEqual(@as(u16, 2), layout.thread_height);
+    try std.testing.expectEqual(@as(u16, 2), layout.panel_height);
     try std.testing.expectEqual(@as(u16, 0), layout.panel_row);
-    try std.testing.expectEqual(@as(u16, 3), layout.input_row);
+    try std.testing.expectEqual(@as(u16, 2), layout.input_row);
 }
 
 test "shift down jumps to conversation bottom" {

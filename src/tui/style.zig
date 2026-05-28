@@ -10,6 +10,7 @@ pub const Palette = struct {
     pub const tool: vaxis.Style = .{ .fg = .{ .rgb = .{ 34, 197, 94 } } };
     pub const tool_failed: vaxis.Style = .{ .fg = .{ .rgb = .{ 239, 68, 68 } } };
     pub const cwd: vaxis.Style = .{ .fg = .{ .rgb = .{ 34, 197, 94 } } };
+    pub const git_branch: vaxis.Style = .{ .fg = .{ .rgb = .{ 249, 115, 22 } } };
     pub const model_status: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
     pub const thinking_label: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
     pub const thinking_body: vaxis.Style = .{ .fg = .{ .rgb = .{ 138, 138, 138 } } };
