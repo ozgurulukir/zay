@@ -1,5 +1,6 @@
 const std = @import("std");
 const logger = @import("logger");
+const symbols = @import("symbols.zig");
 
 const auth_port: u16 = 1455;
 const auth_host = "127.0.0.1";
@@ -24,12 +25,12 @@ pub const Model = struct {
 const StaticModel = struct { id: []const u8, label: []const u8 };
 
 const static_models = [_]StaticModel{
-    .{ .id = "gpt-5.2", .label = "OpenAI Codex · GPT-5.2" },
-    .{ .id = "gpt-5.3-codex", .label = "OpenAI Codex · GPT-5.3 Codex" },
-    .{ .id = "gpt-5.3-codex-spark", .label = "OpenAI Codex · GPT-5.3 Codex Spark" },
-    .{ .id = "gpt-5.4", .label = "OpenAI Codex · GPT-5.4" },
-    .{ .id = "gpt-5.4-mini", .label = "OpenAI Codex · GPT-5.4 mini" },
-    .{ .id = "gpt-5.5", .label = "OpenAI Codex · GPT-5.5" },
+    .{ .id = "gpt-5.2", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.2" },
+    .{ .id = "gpt-5.3-codex", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.3 Codex" },
+    .{ .id = "gpt-5.3-codex-spark", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.3 Codex Spark" },
+    .{ .id = "gpt-5.4", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.4" },
+    .{ .id = "gpt-5.4-mini", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.4 mini" },
+    .{ .id = "gpt-5.5", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.5" },
 };
 
 pub fn loadStaticModels(gpa: std.mem.Allocator) ![]Model {

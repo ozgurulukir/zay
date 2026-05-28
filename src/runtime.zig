@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
@@ -64,7 +65,7 @@ pub const AgentRuntime = struct {
     ) !void {
         assert(cwd.len > 0);
         assert(system_prompt.len > 0);
-        const owned_system_prompt = try gpa.dupe(u8, system_prompt);
+        const owned_system_prompt = try createSystemPrompt(gpa, system_prompt, cwd);
         errdefer gpa.free(owned_system_prompt);
         target.* = .{
             .gpa = gpa,
@@ -101,7 +102,7 @@ pub const AgentRuntime = struct {
     ) !void {
         assert(cwd.len > 0);
         assert(session_id.len > 0);
-        const owned_system_prompt = try gpa.dupe(u8, system_prompt);
+        const owned_system_prompt = try createSystemPrompt(gpa, system_prompt, cwd);
         errdefer gpa.free(owned_system_prompt);
         target.* = .{
             .gpa = gpa,
@@ -277,6 +278,8 @@ pub const AgentRuntime = struct {
             .tools = tools_mod.registry,
             .reasoning = reasoning,
             .responses_mode = .standard,
+            .session_id = &self.session_writer.session.id,
+            .system_prompt = self.system_prompt,
         });
         errdefer client.deinit();
         self.replaceClient(.{ .openai_responses = client });
@@ -288,6 +291,28 @@ pub const AgentRuntime = struct {
         self.client = next.languageModel();
         self.agent.client = self.client;
     }
+};
+
+/// Substitute the `${CWD}` and `${OS}` placeholders in a system-prompt template
+/// with the working directory and host operating system. The template may come
+/// from the embedded `src/prompts/system.md` or from a user-supplied override in
+/// `config.json`
+fn createSystemPrompt(gpa: std.mem.Allocator, template: []const u8, cwd: []const u8) ![]u8 {
+    assert(template.len > 0);
+    assert(cwd.len > 0);
+    const cwd_resolved = try std.mem.replaceOwned(u8, gpa, template, "${CWD}", cwd);
+    defer gpa.free(cwd_resolved);
+    return try std.mem.replaceOwned(u8, gpa, cwd_resolved, "${OS}", os_label);
+}
+
+const os_label: []const u8 = switch (builtin.os.tag) {
+    .windows => "Windows",
+    .linux => "Linux",
+    .macos => "macOS",
+    .freebsd => "FreeBSD",
+    .netbsd => "NetBSD",
+    .openbsd => "OpenBSD",
+    else => @tagName(builtin.os.tag),
 };
 
 test "runtime selects responses adapter when requested" {
@@ -304,4 +329,27 @@ test "runtime keeps codex adapter for openai provider" {
         config_mod.AdapterKind.codex_responses,
         AgentRuntime.adapterForConfig(.openai, config).?,
     );
+}
+
+test "createSystemPrompt substitutes ${CWD} with the working directory" {
+    const gpa = std.testing.allocator;
+    const rendered = try createSystemPrompt(gpa, "header\nYou are in ${CWD}.\n", "C:\\repos\\nova");
+    defer gpa.free(rendered);
+    try std.testing.expectEqualStrings("header\nYou are in C:\\repos\\nova.\n", rendered);
+}
+
+test "createSystemPrompt leaves a template without the placeholder untouched" {
+    const gpa = std.testing.allocator;
+    const rendered = try createSystemPrompt(gpa, "no placeholder here", "/tmp/nova");
+    defer gpa.free(rendered);
+    try std.testing.expectEqualStrings("no placeholder here", rendered);
+}
+
+test "createSystemPrompt substitutes ${OS} with the host operating system" {
+    const gpa = std.testing.allocator;
+    const rendered = try createSystemPrompt(gpa, "OS: ${OS}", "/tmp/nova");
+    defer gpa.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "${OS}") == null);
+    try std.testing.expect(std.mem.startsWith(u8, rendered, "OS: "));
+    try std.testing.expect(rendered.len > "OS: ".len);
 }

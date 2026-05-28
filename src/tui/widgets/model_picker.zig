@@ -47,6 +47,21 @@ pub const Column = enum {
 pub const ReasoningOption = struct { label: []const u8 };
 pub const Scope = enum { global, project, session };
 
+pub fn findActiveStorageIdx(models: []const codex.Model, active_id: ?[]const u8) ?u32 {
+    const id = active_id orelse return null;
+    for (models, 0..) |m, i| {
+        if (std.mem.eql(u8, m.id, id)) return @intCast(i);
+    }
+    return null;
+}
+
+pub fn displayToStorage(active_storage_idx: ?u32, display_pos: u32) u32 {
+    const aidx = active_storage_idx orelse return display_pos;
+    if (display_pos == 0) return aidx;
+    const offset = display_pos - 1;
+    return if (offset < aidx) offset else offset + 1;
+}
+
 pub const Content = struct {
     models: []const codex.Model,
     list: *vxfw.ListView,
@@ -56,6 +71,8 @@ pub const Content = struct {
     reasoning_options: []const ReasoningOption,
     reasoning_indexes: []const u32,
     scope: Scope,
+    loading: bool = false,
+    error_message: ?[]const u8 = null,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -63,6 +80,8 @@ pub const Content = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Content = @ptrCast(@alignCast(ptr));
+        if (self.loading) return self.drawStatus(ctx, "Loading models…", StylePalette.tool);
+        if (self.error_message) |msg| return self.drawStatus(ctx, msg, StylePalette.tool_failed);
         if (self.models.len == 0) return self.drawEmpty(ctx);
         const widgets = try self.modelWidgets(ctx);
         self.list.children = .{ .slice = widgets };
@@ -70,6 +89,14 @@ pub const Content = struct {
         self.list.cursor = self.selection + 1;
         self.list.ensureScroll();
         return panel.listSurface(ctx, self.widget(), self.list.widget());
+    }
+
+    fn drawStatus(self: *Content, ctx: vxfw.DrawContext, text: []const u8, style: vaxis.Style) std.mem.Allocator.Error!vxfw.Surface {
+        const width = ctx.max.width orelse 0;
+        const height = ctx.max.height orelse 0;
+        var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
+        try panel.lineStyledAt(&surface, 0, text, ctx, message.ConversationLayout.left -| 1, style);
+        return surface;
     }
 
     fn drawEmpty(self: *Content, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
@@ -86,16 +113,19 @@ pub const Content = struct {
         header.* = .{};
         widgets[0] = header.widget();
         const rows = try ctx.arena.alloc(Row, self.models.len);
-        for (self.models, 0..) |*model, index| {
-            rows[index] = .{
-                .model = model,
-                .selected = self.selection == index,
+        const active_storage_idx = findActiveStorageIdx(self.models, self.active_model);
+        var display_pos: u32 = 0;
+        while (display_pos < self.models.len) : (display_pos += 1) {
+            const storage_idx = displayToStorage(active_storage_idx, display_pos);
+            rows[display_pos] = .{
+                .model = &self.models[storage_idx],
+                .selected = self.selection == display_pos,
                 .column = self.column,
                 .active_model = self.active_model,
-                .reasoning_label = self.reasoningLabel(@intCast(index)),
+                .reasoning_label = self.reasoningLabel(display_pos),
                 .scope_label = scopeLabel(self.scope),
             };
-            widgets[index + 1] = rows[index].widget();
+            widgets[display_pos + 1] = rows[display_pos].widget();
         }
         return widgets;
     }
