@@ -648,7 +648,7 @@ pub const App = struct {
             .openai_compatible => |provider| {
                 const base_url = self.compatibleBaseUrl(provider) orelse return error.NotConnected;
                 const api_key = if (self.cached_config.api_key) |key| key else providerLocalApiKey(provider);
-                try self.attachOpenAiCompatibleClient(base_url, api_key, model.id);
+                try self.attachOpenAiCompatibleClient(base_url, api_key, model.id, effort);
                 try self.persistModelSelection(provider, model.id, effort, self.model_scope);
             },
         }
@@ -952,8 +952,9 @@ pub const App = struct {
         base_url: []const u8,
         api_key: []const u8,
         model_id: []const u8,
+        effort: ai.ReasoningEffort,
     ) !void {
-        try self.runtime.?.attachOpenAiCompatibleClient(base_url, api_key, model_id);
+        try self.runtime.?.attachOpenAiCompatibleClient(base_url, api_key, model_id, effort);
         self.agent.client = self.runtime.?.client;
     }
 
@@ -1592,6 +1593,7 @@ fn modelReasoningOptions() []const model_picker.ReasoningOption {
         .{ .label = "high" },
         .{ .label = "xhigh" },
         .{ .label = "low" },
+        .{ .label = "none" },
     };
 }
 
@@ -1603,6 +1605,7 @@ fn reasoningOptions() []const ReasoningOption {
         .{ .label = "high", .effort = .high },
         .{ .label = "xhigh", .effort = .xhigh },
         .{ .label = "low", .effort = .low },
+        .{ .label = "none", .effort = .none },
     };
 }
 

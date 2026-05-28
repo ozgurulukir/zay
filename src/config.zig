@@ -531,6 +531,7 @@ fn parseBool(s: []const u8) bool {
 const reasoning_efforts_by_name = std.StaticStringMap(ai.ReasoningEffort).initComptime(.{
     .{ "minimal", .minimal },
     .{ "low", .low },
+    .{ "none", .none },
     .{ "medium", .medium },
     .{ "high", .high },
     .{ "xhigh", .xhigh },
