@@ -175,8 +175,9 @@ pub const AgentRuntime = struct {
     ) !void {
         const base_url = config.base_url orelse provider.defaultBaseUrl() orelse return;
         const api_key = config.api_key orelse "";
-        const model_id = if (config.model) |m| m.id else return;
-        try self.attachOpenAiCompatibleClient(base_url, api_key, model_id);
+        const model = config.model orelse return;
+        const effort = model.reasoning_effort orelse .medium;
+        try self.attachOpenAiCompatibleClient(base_url, api_key, model.id, effort);
     }
 
     fn tryAttachOpenAiResponsesFromConfig(
@@ -247,6 +248,7 @@ pub const AgentRuntime = struct {
         base_url: []const u8,
         api_key: []const u8,
         model_id: []const u8,
+        effort: ai.ReasoningEffort,
     ) !void {
         const client = try self.gpa.create(ai.openai_compatible.Client);
         errdefer self.gpa.destroy(client);
@@ -255,7 +257,7 @@ pub const AgentRuntime = struct {
             .api_key = api_key,
             .model = model_id,
             .tools = tools_mod.registry,
-            .reasoning = .{},
+            .reasoning = .{ .effort = effort },
             .responses_mode = .standard,
         });
         errdefer client.deinit();

@@ -2,6 +2,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
+const terminal_markdown = @import("terminal_markdown");
 const thread_mod = @import("../../thread.zig");
 const tui_metrics = @import("../metrics.zig");
 const tui_style = @import("../style.zig");
@@ -69,7 +70,7 @@ pub const MessageWidget = struct {
         row += 1;
         switch (self.message.kind) {
             .user => drawWrapped(surface, self.message.body, StylePalette.user, self.selected, &row, ctx, 2, StylePalette.user),
-            .agent => drawWrapped(surface, self.message.body, .{}, self.selected, &row, ctx, 0, null),
+            .agent => drawMarkdown(surface, self.message.body, self.selected, &row, ctx),
             .logo => drawLogo(surface, self.message.body, &row, ctx),
             .tool => {
                 drawWrapped(surface, self.message.title, StylePalette.tool, self.selected, &row, ctx, 0, null);
@@ -121,7 +122,7 @@ pub const MessageWidget = struct {
         bar_style: ?vaxis.Style,
     ) void {
         const content_width = ConversationLayout.contentWidth(surface.size.width);
-        const width = @max(@as(usize, content_width -| indent), 1);
+        const width = @max(content_width -| indent, 1);
         if (text.len == 0) {
             drawLine(surface, "", style, selected, row, ctx, indent, bar_style);
             return;
@@ -130,18 +131,32 @@ pub const MessageWidget = struct {
         var line_start: usize = 0;
         while (line_start <= text.len) {
             const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
-            if (line_start == line_end) {
-                drawLine(surface, "", style, selected, row, ctx, indent, bar_style);
-            } else {
-                var chunk_start = line_start;
-                while (chunk_start < line_end) {
-                    const chunk_end = @min(chunk_start + width, line_end);
-                    drawLine(surface, text[chunk_start..chunk_end], style, selected, row, ctx, indent, bar_style);
-                    chunk_start = chunk_end;
-                }
-            }
+            drawWrappedHardLine(surface, text[line_start..line_end], style, selected, row, ctx, indent, bar_style, width);
             if (line_end == text.len) break;
             line_start = line_end + 1;
+        }
+    }
+
+    fn drawWrappedHardLine(
+        surface: *vxfw.Surface,
+        line: []const u8,
+        style: vaxis.Style,
+        selected: bool,
+        row: *u16,
+        ctx: vxfw.DrawContext,
+        indent: u16,
+        bar_style: ?vaxis.Style,
+        width: u16,
+    ) void {
+        if (line.len == 0) {
+            drawLine(surface, "", style, selected, row, ctx, indent, bar_style);
+            return;
+        }
+        var start: usize = 0;
+        while (start < line.len) {
+            const end = wrappedLineEnd(line, start, width, ctx);
+            drawLine(surface, line[start..end], style, selected, row, ctx, indent, bar_style);
+            start = skipLinearWhitespace(line, end);
         }
     }
 
@@ -216,6 +231,45 @@ pub const MessageWidget = struct {
     }
 };
 
+fn drawMarkdown(
+    surface: *vxfw.Surface,
+    text: []const u8,
+    selected: bool,
+    row: *u16,
+    ctx: vxfw.DrawContext,
+) void {
+    const content_width = @max(ConversationLayout.contentWidth(surface.size.width), 1);
+    var rendered = terminal_markdown.render(ctx.arena, text, content_width) catch {
+        MessageWidget.drawWrapped(surface, text, .{}, selected, row, ctx, 0, null);
+        return;
+    };
+    defer rendered.deinit(ctx.arena);
+
+    for (rendered.rows) |markdown_row| {
+        if (row.* >= surface.size.height) return;
+        MessageWidget.fillRow(surface, row.*, selected);
+        var start_col = markdown_row.indent;
+        for (markdown_row.spans) |span| {
+            MessageWidget.writeText(surface, span.text, markdownStyle(span.style), selected, row.*, ctx, start_col);
+            start_col += @intCast(@min(ctx.stringWidth(span.text), std.math.maxInt(u16)));
+        }
+        row.* += 1;
+    }
+}
+
+fn markdownStyle(style: terminal_markdown.Style) vaxis.Style {
+    return switch (style) {
+        .normal => .{},
+        .heading => .{ .bold = true, .fg = .{ .rgb = .{ 252, 211, 77 } } },
+        .quote => StylePalette.thinking_body,
+        .list_marker => .{},
+        .table_border => StylePalette.thinking_body,
+        .code => .{ .fg = .{ .rgb = .{ 147, 197, 253 } } },
+        .strong => .{ .bold = true },
+        .emphasis => .{ .italic = true },
+    };
+}
+
 fn drawToolBody(
     surface: *vxfw.Surface,
     message: thread_mod.Message,
@@ -242,7 +296,7 @@ fn drawWrappedDiff(
     ctx: vxfw.DrawContext,
 ) void {
     const content_width = ConversationLayout.contentWidth(surface.size.width);
-    const width = @max(@as(usize, content_width), 1);
+    const width = @max(content_width, 1);
     if (text.len == 0) {
         MessageWidget.drawLine(surface, "", StylePalette.thinking_body, selected, row, ctx, 0, null);
         return;
@@ -253,16 +307,7 @@ fn drawWrappedDiff(
         const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
         const line = text[line_start..line_end];
         const style = diffLineStyle(line);
-        if (line.len == 0) {
-            MessageWidget.drawLine(surface, "", style, selected, row, ctx, 0, null);
-        } else {
-            var chunk_start: usize = 0;
-            while (chunk_start < line.len) {
-                const chunk_end = @min(chunk_start + width, line.len);
-                MessageWidget.drawLine(surface, line[chunk_start..chunk_end], style, selected, row, ctx, 0, null);
-                chunk_start = chunk_end;
-            }
-        }
+        MessageWidget.drawWrappedHardLine(surface, line, style, selected, row, ctx, 0, null, width);
         if (line_end == text.len) break;
         line_start = line_end + 1;
     }
@@ -275,4 +320,54 @@ fn diffLineStyle(line: []const u8) vaxis.Style {
         '-' => StylePalette.tool_failed,
         else => StylePalette.thinking_body,
     };
+}
+
+fn wrappedLineEnd(line: []const u8, start: usize, width: u16, ctx: vxfw.DrawContext) usize {
+    std.debug.assert(start < line.len);
+    std.debug.assert(width > 0);
+    var iter = ctx.graphemeIterator(line[start..]);
+    var col: u16 = 0;
+    var index = start;
+    var last_break: ?usize = null;
+    while (iter.next()) |grapheme| {
+        const bytes = grapheme.bytes(line[start..]);
+        const grapheme_start = index;
+        const grapheme_width = @min(ctx.stringWidth(bytes), std.math.maxInt(u16));
+        if (col + grapheme_width > width) {
+            return last_break orelse if (grapheme_start > start) grapheme_start else grapheme_start + bytes.len;
+        }
+        index += bytes.len;
+        if (isLinearWhitespace(bytes)) last_break = grapheme_start;
+        col += @intCast(grapheme_width);
+    }
+    return line.len;
+}
+
+fn skipLinearWhitespace(line: []const u8, start: usize) usize {
+    var index = start;
+    while (index < line.len) {
+        const len = std.unicode.utf8ByteSequenceLength(line[index]) catch return index;
+        if (!isLinearWhitespace(line[index .. index + len])) return index;
+        index += len;
+    }
+    return index;
+}
+
+fn isLinearWhitespace(bytes: []const u8) bool {
+    return std.mem.eql(u8, bytes, " ") or std.mem.eql(u8, bytes, "\t");
+}
+
+test "wrappedLineEnd wraps before overflowing word" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 8, .height = 3 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const text = "hello world";
+    try std.testing.expectEqual(@as(usize, 5), wrappedLineEnd(text, 0, 8, ctx));
+    try std.testing.expectEqual(@as(usize, 6), skipLinearWhitespace(text, 5));
 }

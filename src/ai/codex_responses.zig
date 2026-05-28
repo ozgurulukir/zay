@@ -11,6 +11,7 @@ const websocket_message_bytes_max: usize = 8 * 1024 * 1024;
 const websocket_buffer_bytes: usize = 16 * 1024;
 const websocket_watchdog_poll_ms: u32 = 250;
 
+// TODO: This module shouldn't have knowledge of codex
 pub const Client = struct {
     core_client: core.Client,
 

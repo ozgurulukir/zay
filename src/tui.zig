@@ -4,6 +4,7 @@ const vxfw = vaxis.vxfw;
 
 const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
+const bash_mod = @import("bash.zig");
 const codex = @import("codex.zig");
 const config_mod = @import("config.zig");
 const openai_compatible_mod = @import("ai/openai_compatible.zig");
@@ -23,6 +24,7 @@ const provider_picker = @import("tui/widgets/provider_picker.zig");
 const resume_picker = @import("tui/widgets/resume_picker.zig");
 const tui_provider = @import("tui/provider_controller.zig");
 const tui_status = @import("tui/status.zig");
+const tui_app = @import("tui/app.zig");
 const tui_style = @import("tui/style.zig");
 const logger = @import("logger");
 
@@ -40,6 +42,8 @@ const loading_spinners = tui_thread_projection.loading_spinners;
 const loading_frame_ms = tui_message.loading_frame_ms;
 const command_prefix: u8 = '/';
 const picker_secondary_column: u16 = 52;
+const long_message_scroll_step_rows: u16 = 3;
+const ThreadNavigation = enum { previous, next };
 // TODO: Investigate jumpToItem as an alternative to handrolling logic
 pub const App = struct {
     io: std.Io,
@@ -76,6 +80,9 @@ pub const App = struct {
     loading_frame: u8 = 0,
     loading_tick_active: bool = false,
     thread_auto_scroll: bool = true,
+    git_branch: []const u8 = "",
+    thread_view_width: u16 = 80,
+    thread_view_height: u16 = 1,
     thread_list: vxfw.ListView = .{
         .children = .{ .slice = &.{} },
         .draw_cursor = false,
@@ -345,14 +352,17 @@ pub const App = struct {
     }
 
     fn handleThreadKey(self: *App, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.down, .{ .shift = true })) {
+            self.jumpThreadToBottom();
+            return true;
+        }
         if (key.matches(vaxis.Key.up, .{})) {
-            self.thread.moveSelection(.previous);
-            self.thread_auto_scroll = false;
+            _ = self.navigateThread(.previous);
             return true;
         }
         if (key.matches(vaxis.Key.down, .{})) {
-            self.thread.moveSelection(.next);
-            self.thread_auto_scroll = self.selectionIsLastMessage();
+            const scrolled = self.navigateThread(.next);
+            self.thread_auto_scroll = !scrolled and self.selectionIsLastMessage() and !self.selectedMessageIsLong();
             return true;
         }
         if (key.matches(vaxis.Key.tab, .{})) {
@@ -648,7 +658,7 @@ pub const App = struct {
             .openai_compatible => |provider| {
                 const base_url = self.compatibleBaseUrl(provider) orelse return error.NotConnected;
                 const api_key = if (self.cached_config.api_key) |key| key else providerLocalApiKey(provider);
-                try self.attachOpenAiCompatibleClient(base_url, api_key, model.id);
+                try self.attachOpenAiCompatibleClient(base_url, api_key, model.id, effort);
                 try self.persistModelSelection(provider, model.id, effort, self.model_scope);
             },
         }
@@ -803,7 +813,7 @@ pub const App = struct {
             if (!includeLocalModel(provider, entry.id)) continue;
             const id = try self.gpa.dupe(u8, entry.id);
             errdefer self.gpa.free(id);
-            const label = try std.fmt.allocPrint(self.gpa, "{s}{s}{s}", .{ providerModelLabel(provider), symbols.separator_dot_padded, entry.id });
+            const label = try localModelLabel(self.gpa, provider, entry.id);
             errdefer self.gpa.free(label);
             try self.codex_models.append(self.gpa, .{ .id = id, .label = label });
             try self.model_sources.append(self.gpa, .{ .openai_compatible = provider });
@@ -879,6 +889,10 @@ pub const App = struct {
         };
     }
 
+    fn localModelLabel(gpa: std.mem.Allocator, provider: config_mod.Provider, model_id: []const u8) ![]u8 {
+        return std.fmt.allocPrint(gpa, "{s} · {s}", .{ providerModelLabel(provider), model_id });
+    }
+
     fn includeLocalModel(provider: config_mod.Provider, model_id: []const u8) bool {
         if (provider == .ollama) {
             if (std.mem.endsWith(u8, model_id, "-cloud")) return false;
@@ -948,8 +962,9 @@ pub const App = struct {
         base_url: []const u8,
         api_key: []const u8,
         model_id: []const u8,
+        effort: ai.ReasoningEffort,
     ) !void {
-        try self.runtime.?.attachOpenAiCompatibleClient(base_url, api_key, model_id);
+        try self.runtime.?.attachOpenAiCompatibleClient(base_url, api_key, model_id, effort);
         self.agent.client = self.runtime.?.client;
     }
 
@@ -1135,7 +1150,88 @@ pub const App = struct {
         if (self.thread.messages.items.len == 0) return false;
         return selected == self.thread.messages.items.len - 1;
     }
+
+    fn jumpThreadToBottom(self: *App) void {
+        self.thread.selectLast();
+        self.thread_auto_scroll = true;
+        self.thread_list.scroll.pending_lines = 0;
+        self.thread_list.scroll.wants_cursor = false;
+    }
+
+    fn navigateThread(self: *App, direction: ThreadNavigation) bool {
+        self.thread_auto_scroll = false;
+        if (self.scrollSelectedLongMessage(direction)) return true;
+        switch (direction) {
+            .previous => self.thread.moveSelection(.previous),
+            .next => self.thread.moveSelection(.next),
+        }
+        self.anchorSelectedLongMessage(direction);
+        return false;
+    }
+
+    fn scrollSelectedLongMessage(self: *App, direction: ThreadNavigation) bool {
+        const selected = self.thread.selected orelse return false;
+        if (selected >= self.thread.messages.items.len) return false;
+        const rows = messageRows(self.thread.messages.items[selected], ConversationLayout.contentWidth(self.thread_view_width));
+        const height = self.thread_view_height;
+        if (rows <= height) return false;
+        const rows_hidden = rows - height;
+        const step = scrollStepRows(height);
+
+        switch (direction) {
+            .next => {
+                const offset = self.selectedMessageOffset(selected);
+                if (offset >= rows_hidden) return false;
+                self.setSelectedMessageOffset(selected, @min(rows_hidden, offset + step));
+                return true;
+            },
+            .previous => {
+                const offset = self.selectedMessageOffset(selected);
+                if (offset == 0) return false;
+                self.setSelectedMessageOffset(selected, offset - @min(offset, step));
+                return true;
+            },
+        }
+    }
+
+    fn selectedMessageIsLong(self: *const App) bool {
+        const selected = self.thread.selected orelse return false;
+        if (selected >= self.thread.messages.items.len) return false;
+        const rows = messageRows(self.thread.messages.items[selected], ConversationLayout.contentWidth(self.thread_view_width));
+        return rows > self.thread_view_height;
+    }
+
+    fn anchorSelectedLongMessage(self: *App, direction: ThreadNavigation) void {
+        const selected = self.thread.selected orelse return;
+        if (selected >= self.thread.messages.items.len) return;
+        const rows = messageRows(self.thread.messages.items[selected], ConversationLayout.contentWidth(self.thread_view_width));
+        const height = self.thread_view_height;
+        if (rows <= height) return;
+        const offset = switch (direction) {
+            .next => 0,
+            .previous => rows - height,
+        };
+        self.setSelectedMessageOffset(selected, offset);
+    }
+
+    fn selectedMessageOffset(self: *const App, selected: u32) u16 {
+        if (self.thread_list.scroll.top == selected) return @intCast(@max(self.thread_list.scroll.offset, 0));
+        return 0;
+    }
+
+    fn setSelectedMessageOffset(self: *App, selected: u32, offset: u16) void {
+        self.thread_list.cursor = selected;
+        self.thread_list.scroll.top = selected;
+        self.thread_list.scroll.offset = @intCast(offset);
+        self.thread_list.scroll.pending_lines = 0;
+        self.thread_list.scroll.wants_cursor = false;
+    }
 };
+
+fn scrollStepRows(height: u16) u16 {
+    if (height == 0) return 1;
+    return @min(height, long_message_scroll_step_rows);
+}
 
 fn nextIndex(current: u32, count: u32) u32 {
     if (count == 0) return 0;
@@ -1149,6 +1245,27 @@ fn previousIndex(current: u32, count: u32) u32 {
     return current - 1;
 }
 
+const RootLayout = struct {
+    input_height: u16,
+    panel_height: u16,
+    thread_height: u16,
+    panel_row: u16,
+    input_row: u16,
+};
+
+fn rootLayout(max_height: u16, panel_visible: bool) RootLayout {
+    const input_height: u16 = @min(max_height, 6);
+    const thread_height: u16 = max_height - input_height;
+    const panel_height: u16 = if (panel_visible) @min(thread_height, 7) else 0;
+    return .{
+        .input_height = input_height,
+        .panel_height = panel_height,
+        .thread_height = thread_height,
+        .panel_row = thread_height - panel_height,
+        .input_row = thread_height,
+    };
+}
+
 pub fn run(
     init: std.process.Init,
     runtime: *runtime_mod.AgentRuntime,
@@ -1156,7 +1273,7 @@ pub fn run(
 ) !void {
     const gpa = init.arena.allocator();
     var tty_buffer: [8192]u8 = undefined;
-    var fw_app = try vxfw.App.init(init.io, gpa, init.environ_map, &tty_buffer);
+    var fw_app = try tui_app.init(init.io, gpa, init.environ_map, &tty_buffer);
     defer fw_app.deinit();
 
     var app = App.initRuntime(init.io, gpa, runtime, config);
@@ -1167,12 +1284,28 @@ pub fn run(
     defer gpa.free(logo);
     _ = try app.thread.append(gpa, .logo, "logo", logo);
 
+    app.git_branch = loadGitBranch(gpa, init.io, runtime.cwd) catch "";
+
     var root: RootWidget = .{ .app = &app };
     try fw_app.run(root.widget(), .{});
 }
 
 fn loadStartupLogo(gpa: std.mem.Allocator) ![]u8 {
     return gpa.dupe(u8, @embedFile("assets/logo.txt"));
+}
+
+fn loadGitBranch(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) ![]const u8 {
+    const command = "branch=$(git branch --show-current 2>/dev/null); if [ -n \"$branch\" ]; then printf %s \"$branch\"; else git rev-parse --short HEAD 2>/dev/null; fi";
+    var result = try bash_mod.runWithOptions(gpa, io, .{
+        .cwd = cwd,
+        .command = command,
+        .timeout = bash_mod.timeoutFromSeconds(2),
+    });
+    defer result.deinit(gpa);
+    if (result.code != 0) return "";
+    const branch = std.mem.trim(u8, result.stdout, " \t\r\n");
+    if (branch.len == 0) return "";
+    return try std.fmt.allocPrint(gpa, "⌥ {s}", .{branch});
 }
 
 const RootWidget = struct {
@@ -1310,48 +1443,46 @@ const RootWidget = struct {
         const self: *RootWidget = @ptrCast(@alignCast(ptr));
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
-        const input_height: u16 = @min(max_height, 5);
-        const panel_height: u16 = if (self.app.mode == .normal) 0 else @min(max_height -| input_height, 7);
-        const thread_height: u16 = max_height - input_height - panel_height;
+        const layout = rootLayout(max_height, self.app.mode != .normal);
 
         var thread_view: ThreadWidget = .{ .app = self.app };
         var panel_view: PanelWidget = .{ .app = self.app };
         var input_view: InputWidget = .{ .app = self.app };
 
         const thread_ctx = ctx.withConstraints(
-            .{ .width = max_width, .height = thread_height },
-            .{ .width = max_width, .height = thread_height },
+            .{ .width = max_width, .height = layout.thread_height },
+            .{ .width = max_width, .height = layout.thread_height },
         );
         const panel_ctx = ctx.withConstraints(
-            .{ .width = max_width, .height = panel_height },
-            .{ .width = max_width, .height = panel_height },
+            .{ .width = max_width, .height = layout.panel_height },
+            .{ .width = max_width, .height = layout.panel_height },
         );
         const input_ctx = ctx.withConstraints(
-            .{ .width = max_width, .height = input_height },
-            .{ .width = max_width, .height = input_height },
+            .{ .width = max_width, .height = layout.input_height },
+            .{ .width = max_width, .height = layout.input_height },
         );
 
-        const child_count: usize = if (panel_height == 0) 2 else 3;
+        const child_count: usize = if (layout.panel_height == 0) 2 else 3;
         const children = try ctx.arena.alloc(vxfw.SubSurface, child_count);
         children[0] = .{
             .origin = .{ .row = 0, .col = 0 },
             .surface = try thread_view.widget().draw(thread_ctx),
             .z_index = 0,
         };
-        if (panel_height > 0) {
+        if (layout.panel_height > 0) {
             children[1] = .{
-                .origin = .{ .row = thread_height, .col = 0 },
+                .origin = .{ .row = layout.panel_row, .col = 0 },
                 .surface = try panel_view.widget().draw(panel_ctx),
-                .z_index = 0,
+                .z_index = 1,
             };
             children[2] = .{
-                .origin = .{ .row = thread_height + panel_height, .col = 0 },
+                .origin = .{ .row = layout.input_row, .col = 0 },
                 .surface = try input_view.widget().draw(input_ctx),
                 .z_index = 0,
             };
         } else {
             children[1] = .{
-                .origin = .{ .row = thread_height, .col = 0 },
+                .origin = .{ .row = layout.input_row, .col = 0 },
                 .surface = try input_view.widget().draw(input_ctx),
                 .z_index = 0,
             };
@@ -1378,6 +1509,7 @@ const ThreadWidget = struct {
 
     fn drawThread(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *ThreadWidget = @ptrCast(@alignCast(ptr));
+        self.syncViewport(ctx);
         const widgets = try self.messageWidgets(ctx);
         self.app.thread_list.children = .{ .slice = widgets };
         self.app.thread_list.item_count = @intCast(widgets.len);
@@ -1388,6 +1520,14 @@ const ThreadWidget = struct {
             .padding = ConversationLayout.verticalPadding(),
         };
         return list_padding.widget().draw(ctx);
+    }
+
+    fn syncViewport(self: *ThreadWidget, ctx: vxfw.DrawContext) void {
+        const max_width = ctx.max.width orelse ctx.min.width;
+        const max_height = ctx.max.height orelse ctx.min.height;
+        self.app.thread_view_width = max_width;
+        self.app.thread_view_height = max_height -| ConversationLayout.top -| ConversationLayout.bottom;
+        if (self.app.thread_view_height == 0) self.app.thread_view_height = 1;
     }
 
     fn messageWidgets(self: *ThreadWidget, ctx: vxfw.DrawContext) ![]vxfw.Widget {
@@ -1582,33 +1722,29 @@ fn modelPickerScope(scope: App.ModelScope) model_picker.Scope {
     };
 }
 
+const reasoning_options = [_]model_picker.ReasoningOption{
+    .{ .label = "medium (Default)", .effort = .medium },
+    .{ .label = "high", .effort = .high },
+    .{ .label = "xhigh", .effort = .xhigh },
+    .{ .label = "low", .effort = .low },
+    .{ .label = "nothink", .effort = .none },
+};
+
 fn modelReasoningOptions() []const model_picker.ReasoningOption {
-    return &.{
-        .{ .label = "medium (Default)" },
-        .{ .label = "high" },
-        .{ .label = "xhigh" },
-        .{ .label = "low" },
-    };
+    return &reasoning_options;
 }
 
-const ReasoningOption = struct { label: []const u8, effort: ai.ReasoningEffort };
-
-fn reasoningOptions() []const ReasoningOption {
-    return &.{
-        .{ .label = "medium (Default)", .effort = .medium },
-        .{ .label = "high", .effort = .high },
-        .{ .label = "xhigh", .effort = .xhigh },
-        .{ .label = "low", .effort = .low },
-    };
+fn reasoningOptions() []const model_picker.ReasoningOption {
+    return &reasoning_options;
 }
 
 fn inputHintText(mode: App.Mode) []const u8 {
     return switch (mode) {
         .command => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
-        .session_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[TAB] Toggle" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
+        .session_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[TAB] Toggle" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[g] All sessions" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .provider_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Actions" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .model_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Column" ++ symbols.separator_dot_padded ++ "[TAB] Toggle Effort/Scope" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
-        .normal => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[TAB] Expand",
+        .normal => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[SHIFT] ↓ Jump to Bottom" ++ symbols.separator_dot_padded ++ "[TAB] Expand",
     };
 }
 
@@ -1647,15 +1783,16 @@ const InputWidget = struct {
 
         if (height <= 3) return try self.drawInputBorder(ctx, max_width, height);
 
-        const show_hint = height > 4;
-        const children_count: usize = if (show_hint) 4 else 3;
+        const show_branch = height > 4;
+        const show_hint = height > 5;
+        const children_count: usize = 3 + @as(usize, if (show_branch) 1 else 0) + @as(usize, if (show_hint) 1 else 0);
         const children = try ctx.arena.alloc(vxfw.SubSurface, children_count);
         children[0] = .{
             .origin = .{ .row = 0, .col = 0 },
             .surface = try self.drawInputBorder(ctx, max_width, 3),
             .z_index = 0,
         };
-        try self.drawInputStatus(ctx, children, max_width, show_hint);
+        try self.drawInputStatus(ctx, children, max_width, .{ .branch = show_branch, .hint = show_hint });
         return .{
             .size = .{ .width = max_width, .height = height },
             .widget = self.widget(),
@@ -1685,7 +1822,9 @@ const InputWidget = struct {
         return box.widget().draw(ctx.withConstraints(.{ .width = max_width, .height = height }, .{ .width = max_width, .height = height }));
     }
 
-    fn drawInputStatus(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, max_width: u16, show_hint: bool) std.mem.Allocator.Error!void {
+    const StatusRows = struct { branch: bool, hint: bool };
+
+    fn drawInputStatus(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, max_width: u16, rows: StatusRows) std.mem.Allocator.Error!void {
         const cwd_raw = if (self.app.runtime) |runtime| runtime.cwd else self.app.agent.cwd;
         const home_dir = if (self.app.runtime) |runtime| runtime.home_dir else "";
         const cwd = try tui_status.formatCwdRelative(ctx.arena, cwd_raw, home_dir);
@@ -1703,7 +1842,8 @@ const InputWidget = struct {
             .inner_width = status_inner_width,
             .cwd_width = cwd_width,
             .model_width = model_width,
-            .show_hint = show_hint,
+            .show_branch = rows.branch,
+            .show_hint = rows.hint,
         });
     }
 
@@ -1712,6 +1852,7 @@ const InputWidget = struct {
         inner_width: u16,
         cwd_width: u16,
         model_width: u16,
+        show_branch: bool,
         show_hint: bool,
     };
 
@@ -1719,22 +1860,38 @@ const InputWidget = struct {
         var cwd_text: vxfw.Text = .{ .text = cwd, .style = StylePalette.cwd, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
         var model_text: vxfw.Text = .{ .text = status_text, .style = StylePalette.model_status, .text_align = .right, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
         const status_row = @as(u16, 3);
-        children[1] = .{
+        var child_index: usize = 1;
+        children[child_index] = .{
             .origin = .{ .row = status_row, .col = layout.padding_x },
             .surface = try cwd_text.widget().draw(ctx.withConstraints(.{ .width = layout.cwd_width, .height = 1 }, .{ .width = layout.cwd_width, .height = 1 })),
             .z_index = 0,
         };
-        children[2] = .{
+        child_index += 1;
+        children[child_index] = .{
             .origin = .{ .row = status_row, .col = layout.padding_x + layout.inner_width -| layout.model_width },
             .surface = try model_text.widget().draw(ctx.withConstraints(.{ .width = layout.model_width, .height = 1 }, .{ .width = layout.model_width, .height = 1 })),
             .z_index = 0,
         };
-        if (layout.show_hint) try self.drawInputHint(ctx, children, status_row + 1, layout.padding_x, layout.inner_width);
+        child_index += 1;
+        if (layout.show_branch) {
+            try self.drawInputGitBranch(ctx, children, child_index, status_row + 1, layout.padding_x, layout.inner_width);
+            child_index += 1;
+        }
+        if (layout.show_hint) try self.drawInputHint(ctx, children, child_index, status_row + 2, layout.padding_x, layout.inner_width);
     }
 
-    fn drawInputHint(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, row: u16, col: u16, width: u16) std.mem.Allocator.Error!void {
+    fn drawInputGitBranch(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, child_index: usize, row: u16, col: u16, width: u16) std.mem.Allocator.Error!void {
+        var branch_text: vxfw.Text = .{ .text = self.app.git_branch, .style = StylePalette.git_branch, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
+        children[child_index] = .{
+            .origin = .{ .row = row, .col = col },
+            .surface = try branch_text.widget().draw(ctx.withConstraints(.{ .width = width, .height = 1 }, .{ .width = width, .height = 1 })),
+            .z_index = 0,
+        };
+    }
+
+    fn drawInputHint(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, child_index: usize, row: u16, col: u16, width: u16) std.mem.Allocator.Error!void {
         var hint_text: vxfw.Text = .{ .text = inputHintText(self.app.mode), .style = StylePalette.thinking_body, .text_align = .center, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
-        children[3] = .{
+        children[child_index] = .{
             .origin = .{ .row = row, .col = col },
             .surface = try hint_text.widget().draw(ctx.withConstraints(.{ .width = width, .height = 1 }, .{ .width = width, .height = 1 })),
             .z_index = 0,
@@ -1775,6 +1932,125 @@ fn commandInputSegmentEnd(input: []const u8) usize {
         if (byte == ' ') return index;
     }
     return input.len;
+}
+
+test "root layout keeps input fixed when panel opens" {
+    const normal = rootLayout(30, false);
+    const picker = rootLayout(30, true);
+
+    try std.testing.expectEqual(normal.input_row, picker.input_row);
+    try std.testing.expectEqual(normal.thread_height, picker.thread_height);
+    try std.testing.expectEqual(@as(u16, 17), picker.panel_row);
+    try std.testing.expectEqual(@as(u16, 7), picker.panel_height);
+}
+
+test "root layout clamps panel above input on short screens" {
+    const layout = rootLayout(8, true);
+
+    try std.testing.expectEqual(@as(u16, 6), layout.input_height);
+    try std.testing.expectEqual(@as(u16, 2), layout.thread_height);
+    try std.testing.expectEqual(@as(u16, 2), layout.panel_height);
+    try std.testing.expectEqual(@as(u16, 0), layout.panel_row);
+    try std.testing.expectEqual(@as(u16, 2), layout.input_row);
+}
+
+test "shift down jumps to conversation bottom" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    _ = try app.thread.append(gpa, .agent, "agent", "one");
+    _ = try app.thread.append(gpa, .agent, "agent", "two");
+    _ = try app.thread.append(gpa, .status, "status", "loading");
+    app.thread.selected = 0;
+    app.thread_auto_scroll = false;
+
+    try std.testing.expect(try app.handleThreadKey(.{ .codepoint = vaxis.Key.down, .mods = .{ .shift = true } }));
+
+    try std.testing.expectEqual(@as(?u32, 1), app.thread.selected);
+    try std.testing.expect(app.thread_auto_scroll);
+}
+
+test "down scrolls through selected long message before moving selection" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    _ = try app.thread.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+    _ = try app.thread.append(gpa, .agent, "agent", "next");
+    app.thread.selected = 0;
+    app.thread_view_width = 80;
+    app.thread_view_height = 4;
+
+    const scrolled = app.navigateThread(.next);
+
+    try std.testing.expect(scrolled);
+    try std.testing.expectEqual(@as(?u32, 0), app.thread.selected);
+    try std.testing.expectEqual(@as(u32, 0), app.thread_list.scroll.top);
+    try std.testing.expect(app.thread_list.scroll.offset > 0);
+}
+
+test "long message scroll uses a small fixed step" {
+    try std.testing.expectEqual(@as(u16, 1), scrollStepRows(1));
+    try std.testing.expectEqual(@as(u16, 2), scrollStepRows(2));
+    try std.testing.expectEqual(@as(u16, 3), scrollStepRows(20));
+}
+
+test "down moves after selected long message bottom is visible" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    _ = try app.thread.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+    _ = try app.thread.append(gpa, .agent, "agent", "next");
+    app.thread.selected = 0;
+    app.thread_view_width = 80;
+    app.thread_view_height = 4;
+    app.setSelectedMessageOffset(0, messageRows(app.thread.messages.items[0], ConversationLayout.contentWidth(app.thread_view_width)) - app.thread_view_height);
+
+    const scrolled = app.navigateThread(.next);
+
+    try std.testing.expect(!scrolled);
+    try std.testing.expectEqual(@as(?u32, 1), app.thread.selected);
+}
+
+test "up enters selected long message at bottom" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    _ = try app.thread.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+    _ = try app.thread.append(gpa, .agent, "agent", "next");
+    app.thread.selected = 1;
+    app.thread_view_width = 80;
+    app.thread_view_height = 4;
+
+    const scrolled = app.navigateThread(.previous);
+
+    try std.testing.expect(!scrolled);
+    try std.testing.expectEqual(@as(?u32, 0), app.thread.selected);
+    try std.testing.expect(app.thread_list.scroll.offset > 0);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var thread_widget: ThreadWidget = .{ .app = &app };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 6 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    _ = try thread_widget.widget().draw(ctx);
+
+    try std.testing.expect(app.thread_list.scroll.offset > 0);
 }
 
 test "begin submit clears input and appends loading row before agent turn" {
@@ -1877,6 +2153,13 @@ test "provider picker has no custom connection row" {
     try std.testing.expect(state.handleKey(.{ .codepoint = vaxis.Key.down }, false));
     try std.testing.expectEqual(@as(u32, 0), state.selection);
     try std.testing.expectEqual(provider_picker.Action.connect_codex, state.selectedAction());
+}
+
+test "local provider model labels use correct separator" {
+    const label = try App.localModelLabel(std.testing.allocator, .ollama, "llama3");
+    defer std.testing.allocator.free(label);
+
+    try std.testing.expectEqualStrings("Ollama · llama3", label);
 }
 
 test "ollama cloud models are not listed as local models" {

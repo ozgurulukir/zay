@@ -154,6 +154,22 @@ pub const Thread = struct {
         self.selected = index;
     }
 
+    pub fn selectLast(self: *Thread) void {
+        if (self.messages.items.len == 0) {
+            self.selected = null;
+            return;
+        }
+        var index: u32 = @intCast(self.messages.items.len);
+        while (index > 0) {
+            index -= 1;
+            if (self.messages.items[index].kind.selectable()) {
+                self.selected = index;
+                return;
+            }
+        }
+        self.selected = null;
+    }
+
     pub fn remove(self: *Thread, gpa: std.mem.Allocator, index: u32) void {
         assert(index < self.messages.items.len);
         self.messages.items[index].deinit(gpa);
@@ -298,6 +314,20 @@ test "thinking and tool messages are compact until toggled" {
     try std.testing.expect(!thread.messages.items[0].expanded);
     thread.toggleSelected();
     try std.testing.expect(thread.messages.items[0].expanded);
+}
+
+test "selectLast selects last selectable before status tail" {
+    const gpa = std.testing.allocator;
+    var thread: Thread = .{};
+    defer thread.deinit(gpa);
+
+    _ = try thread.append(gpa, .agent, "agent", "one");
+    _ = try thread.append(gpa, .status, "status", "loading");
+    thread.selected = null;
+
+    thread.selectLast();
+
+    try std.testing.expectEqual(@as(?u32, 0), thread.selected);
 }
 
 test "consecutive tools remain separate messages" {

@@ -303,14 +303,20 @@ fn writeRequestPayload(
     try out.writeAll("],\"stream\":true,\"tools\":");
     try out.writeAll(tools_json);
     try out.writeAll(",\"tool_choice\":\"auto\"");
-    if (reasoning) |value| {
-        if (value.effort) |effort| {
+    const effort = if (reasoning) |value| value.effort else null;
+    const value = effort orelse {
+        try out.writeByte('}');
+        return;
+    };
+
+    switch (value) {
+        .none => try out.writeAll(",\"enable_thinking\":false}"),
+        else => {
             try out.writeAll(",\"reasoning_effort\":\"");
-            try out.writeAll(effort.label());
-            try out.writeAll("\"");
-        }
+            try out.writeAll(value.label());
+            try out.writeAll("\"}");
+        },
     }
-    try out.writeByte('}');
 }
 
 const ToolCallBuilder = struct {
@@ -726,6 +732,16 @@ test "buildToolsJson substitutes {{hsep}} placeholders with ~" {
     defer gpa.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "uses ~ marker") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "{{hsep}}") == null);
+}
+
+test "writeRequestPayload disables thinking for reasoning effort none" {
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(&payload.writer, "qwen-test", &.{}, "[]", .{ .effort = .none });
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_effort") == null);
 }
 
 test "readStream accepts an SSE line larger than the transfer buffer" {

@@ -832,6 +832,24 @@ test "writeRequestPayload keeps codex-only verbosity hint in codex mode" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"parallel_tool_calls\":true") != null);
 }
 
+test "writeRequestPayload emits reasoning effort none" {
+    const gpa = std.testing.allocator;
+    const config: ai.Config = .{
+        .base_url = "",
+        .api_key = "",
+        .model = "gpt-test",
+        .responses_mode = .standard,
+        .session_id = "",
+        .system_prompt = "",
+        .reasoning = .{ .effort = .none, .summary = null },
+    };
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(&payload.writer, config, &.{}, "[]");
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"none\"}") != null);
+}
+
 test "writeRequestPayload omits prompt_cache_key when no session id is set" {
     const gpa = std.testing.allocator;
     const config: ai.Config = .{

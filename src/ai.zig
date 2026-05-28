@@ -11,6 +11,7 @@ pub const Tool = tools_common.Tool;
 pub const ReasoningEffort = enum {
     minimal,
     low,
+    none,
     medium,
     high,
     xhigh,
