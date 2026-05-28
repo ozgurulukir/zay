@@ -40,6 +40,8 @@ const loading_spinners = tui_thread_projection.loading_spinners;
 const loading_frame_ms = tui_message.loading_frame_ms;
 const command_prefix: u8 = '/';
 const picker_secondary_column: u16 = 52;
+const long_message_scroll_step_rows: u16 = 3;
+const ThreadNavigation = enum { previous, next };
 // TODO: Investigate jumpToItem as an alternative to handrolling logic
 pub const App = struct {
     io: std.Io,
@@ -76,6 +78,8 @@ pub const App = struct {
     loading_frame: u8 = 0,
     loading_tick_active: bool = false,
     thread_auto_scroll: bool = true,
+    thread_view_width: u16 = 80,
+    thread_view_height: u16 = 1,
     thread_list: vxfw.ListView = .{
         .children = .{ .slice = &.{} },
         .draw_cursor = false,
@@ -346,13 +350,12 @@ pub const App = struct {
 
     fn handleThreadKey(self: *App, key: vaxis.Key) !bool {
         if (key.matches(vaxis.Key.up, .{})) {
-            self.thread.moveSelection(.previous);
-            self.thread_auto_scroll = false;
+            _ = self.navigateThread(.previous);
             return true;
         }
         if (key.matches(vaxis.Key.down, .{})) {
-            self.thread.moveSelection(.next);
-            self.thread_auto_scroll = self.selectionIsLastMessage();
+            const scrolled = self.navigateThread(.next);
+            self.thread_auto_scroll = !scrolled and self.selectionIsLastMessage() and !self.selectedMessageIsLong();
             return true;
         }
         if (key.matches(vaxis.Key.tab, .{})) {
@@ -1140,7 +1143,80 @@ pub const App = struct {
         if (self.thread.messages.items.len == 0) return false;
         return selected == self.thread.messages.items.len - 1;
     }
+
+    fn navigateThread(self: *App, direction: ThreadNavigation) bool {
+        self.thread_auto_scroll = false;
+        if (self.scrollSelectedLongMessage(direction)) return true;
+        switch (direction) {
+            .previous => self.thread.moveSelection(.previous),
+            .next => self.thread.moveSelection(.next),
+        }
+        self.anchorSelectedLongMessage(direction);
+        return false;
+    }
+
+    fn scrollSelectedLongMessage(self: *App, direction: ThreadNavigation) bool {
+        const selected = self.thread.selected orelse return false;
+        if (selected >= self.thread.messages.items.len) return false;
+        const rows = messageRows(self.thread.messages.items[selected], ConversationLayout.contentWidth(self.thread_view_width));
+        const height = self.thread_view_height;
+        if (rows <= height) return false;
+        const rows_hidden = rows - height;
+        const step = scrollStepRows(height);
+
+        switch (direction) {
+            .next => {
+                const offset = self.selectedMessageOffset(selected);
+                if (offset >= rows_hidden) return false;
+                self.setSelectedMessageOffset(selected, @min(rows_hidden, offset + step));
+                return true;
+            },
+            .previous => {
+                const offset = self.selectedMessageOffset(selected);
+                if (offset == 0) return false;
+                self.setSelectedMessageOffset(selected, offset - @min(offset, step));
+                return true;
+            },
+        }
+    }
+
+    fn selectedMessageIsLong(self: *const App) bool {
+        const selected = self.thread.selected orelse return false;
+        if (selected >= self.thread.messages.items.len) return false;
+        const rows = messageRows(self.thread.messages.items[selected], ConversationLayout.contentWidth(self.thread_view_width));
+        return rows > self.thread_view_height;
+    }
+
+    fn anchorSelectedLongMessage(self: *App, direction: ThreadNavigation) void {
+        const selected = self.thread.selected orelse return;
+        if (selected >= self.thread.messages.items.len) return;
+        const rows = messageRows(self.thread.messages.items[selected], ConversationLayout.contentWidth(self.thread_view_width));
+        const height = self.thread_view_height;
+        if (rows <= height) return;
+        const offset = switch (direction) {
+            .next => 0,
+            .previous => rows - height,
+        };
+        self.setSelectedMessageOffset(selected, offset);
+    }
+
+    fn selectedMessageOffset(self: *const App, selected: u32) u16 {
+        if (self.thread_list.scroll.top == selected) return @intCast(@max(self.thread_list.scroll.offset, 0));
+        return 0;
+    }
+
+    fn setSelectedMessageOffset(self: *App, selected: u32, offset: u16) void {
+        self.thread_list.scroll.top = selected;
+        self.thread_list.scroll.offset = @intCast(offset);
+        self.thread_list.scroll.pending_lines = 0;
+        self.thread_list.scroll.wants_cursor = false;
+    }
 };
+
+fn scrollStepRows(height: u16) u16 {
+    if (height == 0) return 1;
+    return @min(height, long_message_scroll_step_rows);
+}
 
 fn nextIndex(current: u32, count: u32) u32 {
     if (count == 0) return 0;
@@ -1402,6 +1478,7 @@ const ThreadWidget = struct {
 
     fn drawThread(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *ThreadWidget = @ptrCast(@alignCast(ptr));
+        self.syncViewport(ctx);
         const widgets = try self.messageWidgets(ctx);
         self.app.thread_list.children = .{ .slice = widgets };
         self.app.thread_list.item_count = @intCast(widgets.len);
@@ -1412,6 +1489,14 @@ const ThreadWidget = struct {
             .padding = ConversationLayout.verticalPadding(),
         };
         return list_padding.widget().draw(ctx);
+    }
+
+    fn syncViewport(self: *ThreadWidget, ctx: vxfw.DrawContext) void {
+        const max_width = ctx.max.width orelse ctx.min.width;
+        const max_height = ctx.max.height orelse ctx.min.height;
+        self.app.thread_view_width = max_width;
+        self.app.thread_view_height = max_height -| ConversationLayout.top -| ConversationLayout.bottom;
+        if (self.app.thread_view_height == 0) self.app.thread_view_height = 1;
     }
 
     fn messageWidgets(self: *ThreadWidget, ctx: vxfw.DrawContext) ![]vxfw.Widget {
@@ -1821,6 +1906,73 @@ test "root layout clamps panel above input on short screens" {
     try std.testing.expectEqual(@as(u16, 3), layout.panel_height);
     try std.testing.expectEqual(@as(u16, 0), layout.panel_row);
     try std.testing.expectEqual(@as(u16, 3), layout.input_row);
+}
+
+test "down scrolls through selected long message before moving selection" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    _ = try app.thread.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+    _ = try app.thread.append(gpa, .agent, "agent", "next");
+    app.thread.selected = 0;
+    app.thread_view_width = 80;
+    app.thread_view_height = 4;
+
+    const scrolled = app.navigateThread(.next);
+
+    try std.testing.expect(scrolled);
+    try std.testing.expectEqual(@as(?u32, 0), app.thread.selected);
+    try std.testing.expectEqual(@as(u32, 0), app.thread_list.scroll.top);
+    try std.testing.expect(app.thread_list.scroll.offset > 0);
+}
+
+test "long message scroll uses a small fixed step" {
+    try std.testing.expectEqual(@as(u16, 1), scrollStepRows(1));
+    try std.testing.expectEqual(@as(u16, 2), scrollStepRows(2));
+    try std.testing.expectEqual(@as(u16, 3), scrollStepRows(20));
+}
+
+test "down moves after selected long message bottom is visible" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    _ = try app.thread.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+    _ = try app.thread.append(gpa, .agent, "agent", "next");
+    app.thread.selected = 0;
+    app.thread_view_width = 80;
+    app.thread_view_height = 4;
+    app.setSelectedMessageOffset(0, messageRows(app.thread.messages.items[0], ConversationLayout.contentWidth(app.thread_view_width)) - app.thread_view_height);
+
+    const scrolled = app.navigateThread(.next);
+
+    try std.testing.expect(!scrolled);
+    try std.testing.expectEqual(@as(?u32, 1), app.thread.selected);
+}
+
+test "up enters selected long message at bottom" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    _ = try app.thread.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+    _ = try app.thread.append(gpa, .agent, "agent", "next");
+    app.thread.selected = 1;
+    app.thread_view_width = 80;
+    app.thread_view_height = 4;
+
+    const scrolled = app.navigateThread(.previous);
+
+    try std.testing.expect(!scrolled);
+    try std.testing.expectEqual(@as(?u32, 0), app.thread.selected);
+    try std.testing.expect(app.thread_list.scroll.offset > 0);
 }
 
 test "begin submit clears input and appends loading row before agent turn" {
