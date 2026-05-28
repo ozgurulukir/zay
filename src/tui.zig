@@ -1154,6 +1154,27 @@ fn previousIndex(current: u32, count: u32) u32 {
     return current - 1;
 }
 
+const RootLayout = struct {
+    input_height: u16,
+    panel_height: u16,
+    thread_height: u16,
+    panel_row: u16,
+    input_row: u16,
+};
+
+fn rootLayout(max_height: u16, panel_visible: bool) RootLayout {
+    const input_height: u16 = @min(max_height, 5);
+    const thread_height: u16 = max_height - input_height;
+    const panel_height: u16 = if (panel_visible) @min(thread_height, 7) else 0;
+    return .{
+        .input_height = input_height,
+        .panel_height = panel_height,
+        .thread_height = thread_height,
+        .panel_row = thread_height - panel_height,
+        .input_row = thread_height,
+    };
+}
+
 pub fn run(
     init: std.process.Init,
     runtime: *runtime_mod.AgentRuntime,
@@ -1315,48 +1336,46 @@ const RootWidget = struct {
         const self: *RootWidget = @ptrCast(@alignCast(ptr));
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
-        const input_height: u16 = @min(max_height, 5);
-        const panel_height: u16 = if (self.app.mode == .normal) 0 else @min(max_height -| input_height, 7);
-        const thread_height: u16 = max_height - input_height - panel_height;
+        const layout = rootLayout(max_height, self.app.mode != .normal);
 
         var thread_view: ThreadWidget = .{ .app = self.app };
         var panel_view: PanelWidget = .{ .app = self.app };
         var input_view: InputWidget = .{ .app = self.app };
 
         const thread_ctx = ctx.withConstraints(
-            .{ .width = max_width, .height = thread_height },
-            .{ .width = max_width, .height = thread_height },
+            .{ .width = max_width, .height = layout.thread_height },
+            .{ .width = max_width, .height = layout.thread_height },
         );
         const panel_ctx = ctx.withConstraints(
-            .{ .width = max_width, .height = panel_height },
-            .{ .width = max_width, .height = panel_height },
+            .{ .width = max_width, .height = layout.panel_height },
+            .{ .width = max_width, .height = layout.panel_height },
         );
         const input_ctx = ctx.withConstraints(
-            .{ .width = max_width, .height = input_height },
-            .{ .width = max_width, .height = input_height },
+            .{ .width = max_width, .height = layout.input_height },
+            .{ .width = max_width, .height = layout.input_height },
         );
 
-        const child_count: usize = if (panel_height == 0) 2 else 3;
+        const child_count: usize = if (layout.panel_height == 0) 2 else 3;
         const children = try ctx.arena.alloc(vxfw.SubSurface, child_count);
         children[0] = .{
             .origin = .{ .row = 0, .col = 0 },
             .surface = try thread_view.widget().draw(thread_ctx),
             .z_index = 0,
         };
-        if (panel_height > 0) {
+        if (layout.panel_height > 0) {
             children[1] = .{
-                .origin = .{ .row = thread_height, .col = 0 },
+                .origin = .{ .row = layout.panel_row, .col = 0 },
                 .surface = try panel_view.widget().draw(panel_ctx),
-                .z_index = 0,
+                .z_index = 1,
             };
             children[2] = .{
-                .origin = .{ .row = thread_height + panel_height, .col = 0 },
+                .origin = .{ .row = layout.input_row, .col = 0 },
                 .surface = try input_view.widget().draw(input_ctx),
                 .z_index = 0,
             };
         } else {
             children[1] = .{
-                .origin = .{ .row = thread_height, .col = 0 },
+                .origin = .{ .row = layout.input_row, .col = 0 },
                 .surface = try input_view.widget().draw(input_ctx),
                 .z_index = 0,
             };
@@ -1782,6 +1801,26 @@ fn commandInputSegmentEnd(input: []const u8) usize {
         if (byte == ' ') return index;
     }
     return input.len;
+}
+
+test "root layout keeps input fixed when panel opens" {
+    const normal = rootLayout(30, false);
+    const picker = rootLayout(30, true);
+
+    try std.testing.expectEqual(normal.input_row, picker.input_row);
+    try std.testing.expectEqual(normal.thread_height, picker.thread_height);
+    try std.testing.expectEqual(@as(u16, 18), picker.panel_row);
+    try std.testing.expectEqual(@as(u16, 7), picker.panel_height);
+}
+
+test "root layout clamps panel above input on short screens" {
+    const layout = rootLayout(8, true);
+
+    try std.testing.expectEqual(@as(u16, 5), layout.input_height);
+    try std.testing.expectEqual(@as(u16, 3), layout.thread_height);
+    try std.testing.expectEqual(@as(u16, 3), layout.panel_height);
+    try std.testing.expectEqual(@as(u16, 0), layout.panel_row);
+    try std.testing.expectEqual(@as(u16, 3), layout.input_row);
 }
 
 test "begin submit clears input and appends loading row before agent turn" {
