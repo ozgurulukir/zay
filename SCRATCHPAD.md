@@ -18,15 +18,4 @@ TODOs and ideas for features to add to Nova coding agent.
 - /tree from pi
 - progressive disclosure of tool guides
 - API for model capability detection
-
-Generally should explore libvaxis more and use more of its capabilities.
-
-Tightening the human-agent loop.
-
-Something like:
-
-- Human initiates new feature/bugfix
-- Back and forth occurs (how to make this smooth? grill-me)
-- Agent goes to work
-- Human steers as needed (notifiations could be useful here or some kind of observability on where the agent is up to, via the TUI)
-- Hunk style review of code with agent notes
+- Better json interface
