@@ -1721,7 +1721,7 @@ fn reasoningOptions() []const ReasoningOption {
         .{ .label = "high", .effort = .high },
         .{ .label = "xhigh", .effort = .xhigh },
         .{ .label = "low", .effort = .low },
-        .{ .label = "none", .effort = .none },
+        .{ .label = "nothink", .effort = .none },
     };
 }
 
