@@ -4,7 +4,6 @@ TODOs and ideas for features to add to Nova coding agent.
 
 ## TODOs
 
-- Keep user model selection / config per session? global?
 - Support skills in `.agents/`
 - Support referencing files and symbols via `$`
 - MCP (special via some kind of executor)
@@ -15,15 +14,10 @@ TODOs and ideas for features to add to Nova coding agent.
 - improve logger and make it more useful
 - add docs on `.nova/auth.json`
 - Save auth tokens and api keys in keyring by default and only auth.json via setting
-- Handle edge cases where selected content when expanded goes out of bounds. Forcing a mouse scroll. Vim like line-by-line navigation (fall back to select on collapsed blocks)
-- Fix tool call swappign places with loading
-- Support tool streaming
-
-Snap back to bottom shortcut.
-
-Fix wrapping of text leading to dangling characters (Just need to word-break).
-
-Markdown formatting.
+- Vim-ish movements like jump 3 message up
+- /tree from pi
+- progressive disclosure of tool guides
+- API for model capability detection
 
 Generally should explore libvaxis more and use more of its capabilities.
 
