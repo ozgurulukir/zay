@@ -349,6 +349,10 @@ pub const App = struct {
     }
 
     fn handleThreadKey(self: *App, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.down, .{ .shift = true })) {
+            self.jumpThreadToBottom();
+            return true;
+        }
         if (key.matches(vaxis.Key.up, .{})) {
             _ = self.navigateThread(.previous);
             return true;
@@ -1144,6 +1148,13 @@ pub const App = struct {
         return selected == self.thread.messages.items.len - 1;
     }
 
+    fn jumpThreadToBottom(self: *App) void {
+        self.thread.selectLast();
+        self.thread_auto_scroll = true;
+        self.thread_list.scroll.pending_lines = 0;
+        self.thread_list.scroll.wants_cursor = false;
+    }
+
     fn navigateThread(self: *App, direction: ThreadNavigation) bool {
         self.thread_auto_scroll = false;
         if (self.scrollSelectedLongMessage(direction)) return true;
@@ -1720,7 +1731,7 @@ fn inputHintText(mode: App.Mode) []const u8 {
         .session_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[TAB] Toggle" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[g] All sessions" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .provider_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Actions" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .model_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Column" ++ symbols.separator_dot_padded ++ "[TAB] Toggle Effort/Scope" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
-        .normal => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[TAB] Expand",
+        .normal => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[SHIFT] ↓ Jump to Bottom" ++ symbols.separator_dot_padded ++ "[TAB] Expand",
     };
 }
 
@@ -1907,6 +1918,25 @@ test "root layout clamps panel above input on short screens" {
     try std.testing.expectEqual(@as(u16, 3), layout.panel_height);
     try std.testing.expectEqual(@as(u16, 0), layout.panel_row);
     try std.testing.expectEqual(@as(u16, 3), layout.input_row);
+}
+
+test "shift down jumps to conversation bottom" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    _ = try app.thread.append(gpa, .agent, "agent", "one");
+    _ = try app.thread.append(gpa, .agent, "agent", "two");
+    _ = try app.thread.append(gpa, .status, "status", "loading");
+    app.thread.selected = 0;
+    app.thread_auto_scroll = false;
+
+    try std.testing.expect(try app.handleThreadKey(.{ .codepoint = vaxis.Key.down, .mods = .{ .shift = true } }));
+
+    try std.testing.expectEqual(@as(?u32, 1), app.thread.selected);
+    try std.testing.expect(app.thread_auto_scroll);
 }
 
 test "down scrolls through selected long message before moving selection" {
