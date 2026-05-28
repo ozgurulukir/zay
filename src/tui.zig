@@ -24,6 +24,7 @@ const provider_picker = @import("tui/widgets/provider_picker.zig");
 const resume_picker = @import("tui/widgets/resume_picker.zig");
 const tui_provider = @import("tui/provider_controller.zig");
 const tui_status = @import("tui/status.zig");
+const tui_app = @import("tui/app.zig");
 const tui_style = @import("tui/style.zig");
 const logger = @import("logger");
 
@@ -1272,7 +1273,7 @@ pub fn run(
 ) !void {
     const gpa = init.arena.allocator();
     var tty_buffer: [8192]u8 = undefined;
-    var fw_app = try vxfw.App.init(init.io, gpa, init.environ_map, &tty_buffer);
+    var fw_app = try tui_app.init(init.io, gpa, init.environ_map, &tty_buffer);
     defer fw_app.deinit();
 
     var app = App.initRuntime(init.io, gpa, runtime, config);
