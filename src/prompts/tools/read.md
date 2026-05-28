@@ -19,7 +19,7 @@ Use `read` for inspecting files and directories. Prefer this over the bash tool 
 
 # Filesystem
 
-- Reading a directory path returns a list of directory entries.
+- Reading a directory path returns its entries, one per line; directories are suffixed with `/`.
 - Reading a file with an omitted or explicit line selector returns lines prefixed with content-hash anchors: `#HL41th|def alpha():`. The `#HL` marker disambiguates anchored lines from arbitrary file content.
 - Use anchors exactly as shown when calling `edit_file` (copy `41th`, not `#HL41th`).
 
