@@ -6,9 +6,7 @@ pub const Client = struct {
     core_client: core.Client,
 
     pub fn init(target: *Client, gpa: std.mem.Allocator, io: std.Io, config: ai.Config) !void {
-        var openai_config = config;
-        openai_config.responses_mode = .standard;
-        try target.core_client.init(gpa, io, openai_config);
+        try target.core_client.init(gpa, io, config, .{});
     }
 
     pub fn deinit(self: *Client) void {

@@ -36,15 +36,12 @@ pub const Reasoning = struct {
     summary: ?ReasoningSummary = .auto,
 };
 
-pub const ResponsesMode = enum { standard, codex };
-
 pub const Config = struct {
     base_url: []const u8,
     api_key: []const u8,
     model: []const u8,
     tools: []const Tool = &.{},
     reasoning: ?Reasoning = .{},
-    responses_mode: ResponsesMode = .standard,
     account_id: []const u8 = "",
     session_id: []const u8 = "",
     system_prompt: []const u8 = "You are a helpful assistant.",

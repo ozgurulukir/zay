@@ -11,7 +11,31 @@ const websocket_message_bytes_max: usize = 8 * 1024 * 1024;
 const websocket_buffer_bytes: usize = 16 * 1024;
 const websocket_watchdog_poll_ms: u32 = 250;
 
-// TODO: This module shouldn't have knowledge of codex
+const codex_responses_config: core.ResponsesConfig = .{
+    .base_url_mode = .raw,
+    .endpoint_path = "/codex/responses",
+    .headers = &.{
+        .{ .name = "accept", .value = .{ .literal = "text/event-stream" } },
+        .{ .name = "chatgpt-account-id", .value = .account_id },
+        .{ .name = "originator", .value = .{ .literal = "nova" } },
+        .{ .name = "OpenAI-Beta", .value = .{ .literal = "responses=experimental" } },
+        .{ .name = "session_id", .value = .session_id },
+        .{ .name = "x-client-request-id", .value = .session_id },
+    },
+    .user_agent = "nova",
+    .text_verbosity = "low",
+    .parallel_tool_calls = true,
+    .log_name = "codex",
+};
+
+fn codexBaseUrl(base_url: []const u8) []const u8 {
+    if (base_url.len == 0) return default_codex_endpoint;
+    const trimmed = std.mem.trimEnd(u8, base_url, "/");
+    if (std.mem.endsWith(u8, trimmed, "/codex/responses")) return trimmed[0 .. trimmed.len - "/codex/responses".len];
+    if (std.mem.endsWith(u8, trimmed, "/codex")) return trimmed[0 .. trimmed.len - "/codex".len];
+    return trimmed;
+}
+
 pub const Client = struct {
     core_client: core.Client,
 
@@ -20,9 +44,8 @@ pub const Client = struct {
         std.debug.assert(config.session_id.len > 0);
         std.debug.assert(config.system_prompt.len > 0);
         var codex_config = config;
-        codex_config.responses_mode = .codex;
-        codex_config.base_url = if (config.base_url.len > 0) config.base_url else default_codex_endpoint;
-        try target.core_client.init(gpa, io, codex_config);
+        codex_config.base_url = codexBaseUrl(config.base_url);
+        try target.core_client.init(gpa, io, codex_config, codex_responses_config);
     }
 
     pub fn deinit(self: *Client) void {
@@ -75,7 +98,7 @@ pub const Client = struct {
         try body.writer.writeAll("{\"type\":\"response.create\",");
         var payload: std.Io.Writer.Allocating = .init(gpa);
         defer payload.deinit();
-        try core.writeRequestPayload(&payload.writer, self.core_client.config, messages, self.core_client.tools_json);
+        try core.writeRequestPayload(&payload.writer, self.core_client.config, self.core_client.responses_config, messages, self.core_client.tools_json);
         try body.writer.writeAll(payload.written()[1..]);
         logger.log("codex.websocket.request.body {s}", .{logBytes(body.written())});
         try client.writeText(body.written());

@@ -10,6 +10,29 @@ const body_buffer_bytes: u32 = 4096;
 const stream_chunk_count_max: u32 = 100_000;
 const stream_bytes_max: u32 = 8 * 1024 * 1024;
 
+pub const ResponsesConfig = struct {
+    pub const HeaderValue = union(enum) {
+        literal: []const u8,
+        account_id,
+        session_id,
+    };
+
+    pub const Header = struct {
+        name: []const u8,
+        value: HeaderValue,
+    };
+
+    pub const BaseUrlMode = enum { openai_v1, raw };
+
+    base_url_mode: BaseUrlMode = .openai_v1,
+    endpoint_path: []const u8 = "/responses",
+    headers: []const Header = &.{},
+    user_agent: ?[]const u8 = null,
+    text_verbosity: ?[]const u8 = null,
+    parallel_tool_calls: ?bool = null,
+    log_name: []const u8 = "standard",
+};
+
 pub const Client = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -17,13 +40,14 @@ pub const Client = struct {
     url: []u8,
     authorization: []u8,
     tools_json: []u8,
+    responses_config: ResponsesConfig,
     http_client: std.http.Client,
     call_seq: u64 = 0,
 
-    pub fn init(target: *Client, gpa: std.mem.Allocator, io: std.Io, config: ai.Config) !void {
+    pub fn init(target: *Client, gpa: std.mem.Allocator, io: std.Io, config: ai.Config, responses_config: ResponsesConfig) !void {
         std.debug.assert(config.base_url.len > 0);
         std.debug.assert(config.model.len > 0);
-        const url = try responsesUrl(gpa, config);
+        const url = try responsesUrl(gpa, config.base_url, responses_config);
         errdefer gpa.free(url);
         const authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{config.api_key});
         errdefer gpa.free(authorization);
@@ -47,6 +71,7 @@ pub const Client = struct {
             .url = url,
             .authorization = authorization,
             .tools_json = tools_json,
+            .responses_config = responses_config,
             .http_client = .{ .allocator = gpa, .io = io },
         };
     }
@@ -64,33 +89,22 @@ pub const Client = struct {
     }
 
     pub fn prompt(self: *Client, messages: []const ai.ChatMessage, observer: ai.StreamObserver) !ai.Turn {
-        const extra_headers = [_]std.http.Header{
-            .{ .name = "accept", .value = "text/event-stream" },
-            .{ .name = "chatgpt-account-id", .value = self.config.account_id },
-            .{ .name = "originator", .value = "nova" },
-            .{ .name = "OpenAI-Beta", .value = "responses=experimental" },
-            .{ .name = "session_id", .value = self.config.session_id },
-            .{ .name = "x-client-request-id", .value = self.config.session_id },
-        };
-        var req = if (self.config.responses_mode == .codex) blk: {
-            break :blk try self.http_client.request(.POST, try std.Uri.parse(self.url), .{
-                .headers = .{
-                    .authorization = .{ .override = self.authorization },
-                    .content_type = .{ .override = "application/json" },
-                    .user_agent = .{ .override = "nova" },
-                },
-                .extra_headers = &extra_headers,
-            });
-        } else try self.http_client.request(.POST, try std.Uri.parse(self.url), .{ .headers = .{
-            .authorization = .{ .override = self.authorization },
-            .content_type = .{ .override = "application/json" },
-        } });
+        var extra_headers_buffer: [8]std.http.Header = undefined;
+        const extra_headers = self.extraHeaders(&extra_headers_buffer);
+        var req = try self.http_client.request(.POST, try std.Uri.parse(self.url), .{
+            .headers = .{
+                .authorization = .{ .override = self.authorization },
+                .content_type = .{ .override = "application/json" },
+                .user_agent = if (self.responses_config.user_agent) |value| .{ .override = value } else .default,
+            },
+            .extra_headers = extra_headers,
+        });
         defer req.deinit();
 
         var payload: std.Io.Writer.Allocating = .init(self.gpa);
         defer payload.deinit();
-        try writeRequestPayload(&payload.writer, self.config, messages, self.tools_json);
-        logger.log("responses.request POST {s} responses_mode={s} body={s}", .{ self.url, @tagName(self.config.responses_mode), logBytes(payload.written()) });
+        try writeRequestPayload(&payload.writer, self.config, self.responses_config, messages, self.tools_json);
+        logger.log("responses.request POST {s} profile={s} body={s}", .{ self.url, self.responses_config.log_name, logBytes(payload.written()) });
         req.transfer_encoding = .chunked;
         var body_buffer: [body_buffer_bytes]u8 = undefined;
         var body_writer = try req.sendBodyUnflushed(&body_buffer);
@@ -101,7 +115,7 @@ pub const Client = struct {
         var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
         var http_response = try req.receiveHead(&redirect_buffer);
         const status_code: u16 = @intFromEnum(http_response.head.status);
-        logger.log("responses.response.head status={d} responses_mode={s}", .{ status_code, @tagName(self.config.responses_mode) });
+        logger.log("responses.response.head status={d} profile={s}", .{ status_code, self.responses_config.log_name });
         if (status_code >= 400) {
             var error_buffer: [transfer_buffer_bytes]u8 = undefined;
             const error_reader = http_response.reader(&error_buffer);
@@ -118,18 +132,31 @@ pub const Client = struct {
         const reader = http_response.reader(&transfer_buffer);
         return try readStream(self.gpa, reader, observer, &self.call_seq);
     }
+
+    fn extraHeaders(self: *const Client, buffer: *[8]std.http.Header) []const std.http.Header {
+        std.debug.assert(self.responses_config.headers.len <= buffer.len);
+        for (self.responses_config.headers, 0..) |header, index| {
+            buffer[index] = .{
+                .name = header.name,
+                .value = switch (header.value) {
+                    .literal => |value| value,
+                    .account_id => self.config.account_id,
+                    .session_id => self.config.session_id,
+                },
+            };
+        }
+        return buffer[0..self.responses_config.headers.len];
+    }
 };
 
-fn responsesUrl(gpa: std.mem.Allocator, config: ai.Config) ![]u8 {
-    const base = std.mem.trimEnd(u8, config.base_url, "/");
-    if (config.responses_mode == .codex) {
-        if (std.mem.endsWith(u8, base, "/codex/responses")) return try gpa.dupe(u8, base);
-        if (std.mem.endsWith(u8, base, "/codex")) return try std.fmt.allocPrint(gpa, "{s}/responses", .{base});
-        return try std.fmt.allocPrint(gpa, "{s}/codex/responses", .{base});
-    }
-    const v1_root = try openai_endpoint.v1Root(gpa, base);
-    defer gpa.free(v1_root);
-    return try std.fmt.allocPrint(gpa, "{s}/responses", .{v1_root});
+fn responsesUrl(gpa: std.mem.Allocator, base_url: []const u8, responses_config: ResponsesConfig) ![]u8 {
+    const base = std.mem.trimEnd(u8, base_url, "/");
+    const root = switch (responses_config.base_url_mode) {
+        .raw => try gpa.dupe(u8, base),
+        .openai_v1 => try openai_endpoint.v1Root(gpa, base),
+    };
+    defer gpa.free(root);
+    return try std.fmt.allocPrint(gpa, "{s}{s}", .{ root, responses_config.endpoint_path });
 }
 
 fn buildToolsJson(gpa: std.mem.Allocator, tools: []const tools_common.Tool) ![]u8 {
@@ -183,7 +210,7 @@ fn writeParameters(writer: *std.Io.Writer, tool: tools_common.Tool) !void {
     try writer.writeAll("]}");
 }
 
-pub fn writeRequestPayload(out: *std.Io.Writer, config: ai.Config, messages: []const ai.ChatMessage, tools_json: []const u8) !void {
+pub fn writeRequestPayload(out: *std.Io.Writer, config: ai.Config, responses_config: ResponsesConfig, messages: []const ai.ChatMessage, tools_json: []const u8) !void {
     try out.writeAll("{\"model\":");
     try std.json.Stringify.value(config.model, .{}, out);
     try out.writeAll(",\"input\":[");
@@ -205,8 +232,14 @@ pub fn writeRequestPayload(out: *std.Io.Writer, config: ai.Config, messages: []c
         try out.writeAll(",\"prompt_cache_key\":");
         try std.json.Stringify.value(config.session_id, .{}, out);
     }
-    if (config.responses_mode == .codex) {
-        try out.writeAll(",\"text\":{\"verbosity\":\"low\"},\"parallel_tool_calls\":true");
+    if (responses_config.text_verbosity) |verbosity| {
+        try out.writeAll(",\"text\":{\"verbosity\":");
+        try std.json.Stringify.value(verbosity, .{}, out);
+        try out.writeByte('}');
+    }
+    if (responses_config.parallel_tool_calls) |enabled| {
+        try out.writeAll(",\"parallel_tool_calls\":");
+        try std.json.Stringify.value(enabled, .{}, out);
     }
     if (config.reasoning) |value| {
         try out.writeAll(",\"reasoning\":{");
@@ -795,14 +828,13 @@ test "writeRequestPayload puts system prompt in instructions for standard mode" 
         .base_url = "",
         .api_key = "",
         .model = "gpt-test",
-        .responses_mode = .standard,
         .session_id = "session-abc",
         .system_prompt = "You are Nova.",
         .reasoning = null,
     };
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(&payload.writer, config, &.{system_message}, "[]");
+    try writeRequestPayload(&payload.writer, config, .{}, &.{system_message}, "[]");
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"You are Nova.\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"session-abc\"") != null);
@@ -811,20 +843,19 @@ test "writeRequestPayload puts system prompt in instructions for standard mode" 
     try std.testing.expect(std.mem.indexOf(u8, body, "parallel_tool_calls") == null);
 }
 
-test "writeRequestPayload keeps codex-only verbosity hint in codex mode" {
+test "writeRequestPayload keeps configured verbosity hint" {
     const gpa = std.testing.allocator;
     const config: ai.Config = .{
         .base_url = "",
         .api_key = "",
         .model = "gpt-5.5",
-        .responses_mode = .codex,
         .session_id = "session-xyz",
         .system_prompt = "You are Nova.",
         .reasoning = null,
     };
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(&payload.writer, config, &.{}, "[]");
+    try writeRequestPayload(&payload.writer, config, .{ .text_verbosity = "low", .parallel_tool_calls = true }, &.{}, "[]");
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"You are Nova.\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"session-xyz\"") != null);
@@ -838,14 +869,13 @@ test "writeRequestPayload emits reasoning effort none" {
         .base_url = "",
         .api_key = "",
         .model = "gpt-test",
-        .responses_mode = .standard,
         .session_id = "",
         .system_prompt = "",
         .reasoning = .{ .effort = .none, .summary = null },
     };
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(&payload.writer, config, &.{}, "[]");
+    try writeRequestPayload(&payload.writer, config, .{}, &.{}, "[]");
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"none\"}") != null);
 }
@@ -856,14 +886,13 @@ test "writeRequestPayload omits prompt_cache_key when no session id is set" {
         .base_url = "",
         .api_key = "",
         .model = "gpt-test",
-        .responses_mode = .standard,
         .session_id = "",
         .system_prompt = "You are Nova.",
         .reasoning = null,
     };
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(&payload.writer, config, &.{}, "[]");
+    try writeRequestPayload(&payload.writer, config, .{}, &.{}, "[]");
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_key") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"You are Nova.\"") != null);

@@ -212,7 +212,6 @@ pub const AgentRuntime = struct {
             .model = model_id,
             .tools = tools_mod.registry,
             .reasoning = .{ .effort = effort, .summary = .auto },
-            .responses_mode = .codex,
             .account_id = credentials.account_id,
             .session_id = &self.session_writer.session.id,
             .system_prompt = self.system_prompt,
@@ -258,7 +257,6 @@ pub const AgentRuntime = struct {
             .model = model_id,
             .tools = tools_mod.registry,
             .reasoning = .{ .effort = effort },
-            .responses_mode = .standard,
         });
         errdefer client.deinit();
         self.replaceClient(.{ .openai_compatible = client });
@@ -279,7 +277,6 @@ pub const AgentRuntime = struct {
             .model = model_id,
             .tools = tools_mod.registry,
             .reasoning = reasoning,
-            .responses_mode = .standard,
             .session_id = &self.session_writer.session.id,
             .system_prompt = self.system_prompt,
         });
