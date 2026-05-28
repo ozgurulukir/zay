@@ -1158,6 +1158,12 @@ pub const App = struct {
         self.thread_list.scroll.wants_cursor = false;
     }
 
+    fn updateMouseAutoScroll(self: *App) void {
+        self.thread_auto_scroll = !self.thread_list.scroll.has_more and
+            self.selectionIsLastMessage() and
+            !self.selectedMessageIsLong();
+    }
+
     fn navigateThread(self: *App, direction: ThreadNavigation) bool {
         self.thread_auto_scroll = false;
         if (self.scrollSelectedLongMessage(direction)) return true;
@@ -1330,7 +1336,7 @@ const RootWidget = struct {
             },
             .mouse => |mouse| {
                 if (mouse.button == .wheel_up) self.app.thread_auto_scroll = false;
-                if (mouse.button == .wheel_down) self.app.thread_auto_scroll = !self.app.thread_list.scroll.has_more;
+                if (mouse.button == .wheel_down) self.app.updateMouseAutoScroll();
             },
             .key_press => |key| {
                 if (key.matches(vaxis.Key.escape, .{})) {
@@ -1952,6 +1958,24 @@ test "root layout clamps panel above input on short screens" {
     try std.testing.expectEqual(@as(u16, 2), layout.panel_height);
     try std.testing.expectEqual(@as(u16, 0), layout.panel_row);
     try std.testing.expectEqual(@as(u16, 2), layout.input_row);
+}
+
+test "mouse bottom does not enable auto-scroll when older message is selected" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    _ = try app.thread.append(gpa, .agent, "agent", "one");
+    _ = try app.thread.append(gpa, .agent, "agent", "two");
+    app.thread.selected = 0;
+    app.thread_auto_scroll = false;
+    app.thread_list.scroll.has_more = false;
+
+    app.updateMouseAutoScroll();
+
+    try std.testing.expect(!app.thread_auto_scroll);
 }
 
 test "shift down jumps to conversation bottom" {
