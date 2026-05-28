@@ -1703,26 +1703,20 @@ fn modelPickerScope(scope: App.ModelScope) model_picker.Scope {
     };
 }
 
+const reasoning_options = [_]model_picker.ReasoningOption{
+    .{ .label = "medium (Default)", .effort = .medium },
+    .{ .label = "high", .effort = .high },
+    .{ .label = "xhigh", .effort = .xhigh },
+    .{ .label = "low", .effort = .low },
+    .{ .label = "nothink", .effort = .none },
+};
+
 fn modelReasoningOptions() []const model_picker.ReasoningOption {
-    return &.{
-        .{ .label = "medium (Default)" },
-        .{ .label = "high" },
-        .{ .label = "xhigh" },
-        .{ .label = "low" },
-        .{ .label = "none" },
-    };
+    return &reasoning_options;
 }
 
-const ReasoningOption = struct { label: []const u8, effort: ai.ReasoningEffort };
-
-fn reasoningOptions() []const ReasoningOption {
-    return &.{
-        .{ .label = "medium (Default)", .effort = .medium },
-        .{ .label = "high", .effort = .high },
-        .{ .label = "xhigh", .effort = .xhigh },
-        .{ .label = "low", .effort = .low },
-        .{ .label = "nothink", .effort = .none },
-    };
+fn reasoningOptions() []const model_picker.ReasoningOption {
+    return &reasoning_options;
 }
 
 fn inputHintText(mode: App.Mode) []const u8 {

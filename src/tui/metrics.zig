@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const terminal_markdown = @import("terminal_markdown");
 const thread_mod = @import("../thread.zig");
 
 pub const RowViewport = struct {
@@ -81,7 +82,7 @@ pub fn messageRows(message: thread_mod.Message, width: u16) u16 {
 pub fn messageContentRows(message: thread_mod.Message, width: u16) u16 {
     return switch (message.kind) {
         .user => textRows(message.body, width -| 2),
-        .agent => textRows(message.body, width),
+        .agent => terminal_markdown.countRows(message.body, @max(width, 1)),
         .logo => logoRows(message.body),
         .thinking => if (message.expanded)
             1 + textRows(message.body, width -| 2)

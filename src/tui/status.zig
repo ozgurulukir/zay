@@ -109,12 +109,12 @@ fn providerLabel(config: config_mod.Config) ?[]const u8 {
 fn reasoningLabel(reasoning: ?ai.Reasoning) ?[]const u8 {
     const value = reasoning orelse return null;
     const effort = value.effort orelse return "Thinking";
-    return effort.label();
+    return reasoningEffortLabel(effort);
 }
 
 fn configThinkingLabel(config: config_mod.Config) ?[]const u8 {
     if (config.model) |model| {
-        if (model.reasoning_effort) |effort| return effort.label();
+        if (model.reasoning_effort) |effort| return reasoningEffortLabel(effort);
     }
     if (config.enable_thinking) |enabled| {
         if (enabled) return "Thinking";
@@ -127,6 +127,20 @@ test "model status includes reasoning effort when present" {
     const text = try formatModelStatus(gpa, .{ .provider = "openai", .model = "gpt-5.5", .thinking = "medium" });
     defer gpa.free(text);
     try std.testing.expectEqualStrings("openai/gpt-5.5" ++ symbols.separator_dot_padded ++ "medium", text);
+}
+
+fn reasoningEffortLabel(effort: ai.ReasoningEffort) []const u8 {
+    return switch (effort) {
+        .none => "nothink",
+        else => effort.label(),
+    };
+}
+
+test "model status labels none reasoning as nothink" {
+    const gpa = std.testing.allocator;
+    const text = try formatModelStatus(gpa, .{ .provider = "openai", .model = "gpt-5.5", .thinking = reasoningEffortLabel(.none) });
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("openai/gpt-5.5" ++ symbols.separator_dot_padded ++ "nothink", text);
 }
 
 test "model status omits separator when thinking is unavailable" {

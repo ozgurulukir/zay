@@ -2,6 +2,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
+const ai = @import("../../ai.zig");
 const codex = @import("../../codex.zig");
 const message = @import("message.zig");
 const panel = @import("panel.zig");
@@ -44,7 +45,7 @@ pub const Column = enum {
     }
 };
 
-pub const ReasoningOption = struct { label: []const u8 };
+pub const ReasoningOption = struct { label: []const u8, effort: ai.ReasoningEffort };
 pub const Scope = enum { global, project, session };
 
 pub fn findActiveStorageIdx(models: []const codex.Model, active_id: ?[]const u8) ?u32 {
@@ -182,7 +183,7 @@ test "selection wrap to first row restores header" {
         .{ .id = @constCast("m9"), .label = @constCast("m9") },
     };
     const reasoning = [_]u32{0} ** models.len;
-    const options = [_]ReasoningOption{.{ .label = "medium (Default)" }};
+    const options = [_]ReasoningOption{.{ .label = "medium (Default)", .effort = .medium }};
     var list: vxfw.ListView = .{ .children = .{ .slice = &.{} }, .draw_cursor = false };
     var content: Content = .{
         .models = &models,

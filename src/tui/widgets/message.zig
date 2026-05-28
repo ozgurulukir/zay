@@ -2,6 +2,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
+const terminal_markdown = @import("terminal_markdown");
 const thread_mod = @import("../../thread.zig");
 const tui_metrics = @import("../metrics.zig");
 const tui_style = @import("../style.zig");
@@ -69,7 +70,7 @@ pub const MessageWidget = struct {
         row += 1;
         switch (self.message.kind) {
             .user => drawWrapped(surface, self.message.body, StylePalette.user, self.selected, &row, ctx, 2, StylePalette.user),
-            .agent => drawWrapped(surface, self.message.body, .{}, self.selected, &row, ctx, 0, null),
+            .agent => drawMarkdown(surface, self.message.body, self.selected, &row, ctx),
             .logo => drawLogo(surface, self.message.body, &row, ctx),
             .tool => {
                 drawWrapped(surface, self.message.title, StylePalette.tool, self.selected, &row, ctx, 0, null);
@@ -229,6 +230,45 @@ pub const MessageWidget = struct {
         }
     }
 };
+
+fn drawMarkdown(
+    surface: *vxfw.Surface,
+    text: []const u8,
+    selected: bool,
+    row: *u16,
+    ctx: vxfw.DrawContext,
+) void {
+    const content_width = @max(ConversationLayout.contentWidth(surface.size.width), 1);
+    var rendered = terminal_markdown.render(ctx.arena, text, content_width) catch {
+        MessageWidget.drawWrapped(surface, text, .{}, selected, row, ctx, 0, null);
+        return;
+    };
+    defer rendered.deinit(ctx.arena);
+
+    for (rendered.rows) |markdown_row| {
+        if (row.* >= surface.size.height) return;
+        MessageWidget.fillRow(surface, row.*, selected);
+        var start_col = markdown_row.indent;
+        for (markdown_row.spans) |span| {
+            MessageWidget.writeText(surface, span.text, markdownStyle(span.style), selected, row.*, ctx, start_col);
+            start_col += @intCast(@min(ctx.stringWidth(span.text), std.math.maxInt(u16)));
+        }
+        row.* += 1;
+    }
+}
+
+fn markdownStyle(style: terminal_markdown.Style) vaxis.Style {
+    return switch (style) {
+        .normal => .{},
+        .heading => .{ .bold = true, .fg = .{ .rgb = .{ 252, 211, 77 } } },
+        .quote => StylePalette.thinking_body,
+        .list_marker => .{},
+        .table_border => StylePalette.thinking_body,
+        .code => .{ .fg = .{ .rgb = .{ 147, 197, 253 } } },
+        .strong => .{ .bold = true },
+        .emphasis => .{ .italic = true },
+    };
+}
 
 fn drawToolBody(
     surface: *vxfw.Surface,

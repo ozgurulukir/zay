@@ -49,6 +49,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const terminal_markdown_mod = b.createModule(.{
+        .root_source_file = b.path("lib/terminal_markdown.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
@@ -74,6 +79,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "websocket", .module = websocket_mod },
             .{ .name = "logger", .module = logger_mod },
             .{ .name = "dynlib", .module = dynlib_mod },
+            .{ .name = "terminal_markdown", .module = terminal_markdown_mod },
         },
     });
     mod.addIncludePath(b.path("vendor/fff"));
@@ -140,6 +146,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "websocket", .module = websocket_mod },
                 .{ .name = "logger", .module = logger_mod },
                 .{ .name = "dynlib", .module = dynlib_mod },
+                .{ .name = "terminal_markdown", .module = terminal_markdown_mod },
             },
         }),
     });
