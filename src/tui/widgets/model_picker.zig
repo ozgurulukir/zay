@@ -87,7 +87,7 @@ pub const Content = struct {
         self.list.children = .{ .slice = widgets };
         self.list.item_count = @intCast(widgets.len);
         self.list.cursor = self.selection + 1;
-        self.list.ensureScroll();
+        self.syncListScroll();
         return panel.listSurface(ctx, self.widget(), self.list.widget());
     }
 
@@ -136,6 +136,17 @@ pub const Content = struct {
         if (reasoning_index >= self.reasoning_options.len) return "medium (Default)";
         return self.reasoning_options[reasoning_index].label;
     }
+
+    fn syncListScroll(self: *Content) void {
+        if (self.selection == 0) {
+            self.list.scroll.top = 0;
+            self.list.scroll.offset = 0;
+            self.list.scroll.pending_lines = 0;
+            self.list.scroll.wants_cursor = false;
+            return;
+        }
+        self.list.ensureScroll();
+    }
 };
 
 const Header = struct {
@@ -153,6 +164,52 @@ const Header = struct {
         return surface;
     }
 };
+
+test "selection wrap to first row restores header" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const models = [_]codex.Model{
+        .{ .id = @constCast("m0"), .label = @constCast("m0") },
+        .{ .id = @constCast("m1"), .label = @constCast("m1") },
+        .{ .id = @constCast("m2"), .label = @constCast("m2") },
+        .{ .id = @constCast("m3"), .label = @constCast("m3") },
+        .{ .id = @constCast("m4"), .label = @constCast("m4") },
+        .{ .id = @constCast("m5"), .label = @constCast("m5") },
+        .{ .id = @constCast("m6"), .label = @constCast("m6") },
+        .{ .id = @constCast("m7"), .label = @constCast("m7") },
+        .{ .id = @constCast("m8"), .label = @constCast("m8") },
+        .{ .id = @constCast("m9"), .label = @constCast("m9") },
+    };
+    const reasoning = [_]u32{0} ** models.len;
+    const options = [_]ReasoningOption{.{ .label = "medium (Default)" }};
+    var list: vxfw.ListView = .{ .children = .{ .slice = &.{} }, .draw_cursor = false };
+    var content: Content = .{
+        .models = &models,
+        .list = &list,
+        .selection = @intCast(models.len - 1),
+        .column = .model,
+        .active_model = null,
+        .reasoning_options = &options,
+        .reasoning_indexes = &reasoning,
+        .scope = .global,
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 7 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    _ = try content.widget().draw(ctx);
+    try std.testing.expect(list.scroll.top > 0);
+
+    content.selection = 0;
+    _ = try content.widget().draw(ctx);
+
+    try std.testing.expectEqual(@as(u32, 0), list.scroll.top);
+    try std.testing.expectEqual(@as(i17, 0), list.scroll.offset);
+}
 
 pub const Row = struct {
     model: *const codex.Model,
