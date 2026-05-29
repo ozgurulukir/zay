@@ -139,7 +139,7 @@ pub const ThreadProjection = struct {
         message: []const u8,
     ) !bool {
         self.removeLoading(gpa, thread);
-        _ = try thread.append(gpa, .agent, "agent", message);
+        _ = try thread.append(gpa, .notice, "notice", message);
         return true;
     }
 
