@@ -10,19 +10,19 @@ pub const tool: common.Tool = .{
         .properties = &.{ .{
             .name = "command",
             .kind = .string,
-            .description = "Required. Shell command to execute.",
+            .description = "Shell command to run.",
             .required = true,
         }, .{
             .name = "cwd",
             .kind = .string,
-            .description = "Optional. Working directory for the command, relative to the current project unless absolute.",
+            .description = "Working directory. Relative to the project unless absolute.",
             .required = false,
         }, .{
             .name = "env",
             .kind = .object,
-            .description = "Optional. Environment variables to add or override. Values must be strings.",
+            .description = "Extra environment variables, merged over the inherited env. String values only.",
             .required = false,
-        }, .{ .name = "timeout", .kind = .integer, .description = "Optional. Timeout for this command in seconds. Defaults to 10.", .required = false } },
+        }, .{ .name = "timeout", .kind = .integer, .description = "Timeout in seconds (default 10).", .required = false } },
     },
     .run = runTool,
     .displayLabel = displayLabel,

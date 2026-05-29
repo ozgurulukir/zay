@@ -10,13 +10,13 @@ pub const tool: common.Tool = .{
             .{
                 .name = "query",
                 .kind = .string,
-                .description = "Required. Fuzzy text matched against file and directory paths.",
+                .description = "Fuzzy text matched against paths. Not a regex.",
                 .required = true,
             },
             .{
                 .name = "cursor",
                 .kind = .string,
-                .description = "Optional. Continuation token returned by a previous find result. Reuse only with the same query.",
+                .description = "Page token from a previous find result. Reuse only with the same query.",
                 .required = false,
             },
         },

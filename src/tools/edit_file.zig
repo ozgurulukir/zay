@@ -16,7 +16,7 @@ pub const tool: common.Tool = .{
             .{
                 .name = "input",
                 .kind = .string,
-                .description = "Hashline patch document only, not an explanation. Must contain at least one @@ PATH header, followed by hashline operations using anchors from read.",
+                .description = "The patch document only, no prose. At least one `@@ PATH` header followed by ops using anchors from read.",
                 .required = true,
             },
         },

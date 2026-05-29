@@ -13,13 +13,13 @@ pub const tool: common.Tool = .{
             .{
                 .name = "path",
                 .kind = .string,
-                .description = "Required. File path to create or overwrite, relative to the current working directory unless absolute.",
+                .description = "Path to create or overwrite. Relative to the working directory unless absolute.",
                 .required = true,
             },
             .{
                 .name = "content",
                 .kind = .string,
-                .description = "Required. Complete file content to write. Do not put the path here.",
+                .description = "Full file body. Not a patch or diff; do not include the path.",
                 .required = true,
             },
         },
