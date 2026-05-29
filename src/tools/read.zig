@@ -15,7 +15,7 @@ pub const tool: common.Tool = .{
             .{
                 .name = "path",
                 .kind = .string,
-                .description = "Required. File or directory path to read. Append selectors like :50, :50-200, :50+150, :raw, or :conflicts.",
+                .description = "File or directory to read. Append a selector for ranges or modes: :50, :50-200, :50+150, :raw, :conflicts.",
                 .required = true,
             },
         },

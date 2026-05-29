@@ -19,7 +19,6 @@ const tui_message = @import("tui/widgets/message.zig");
 const command_panel = @import("tui/widgets/command_panel.zig");
 const model_loader = @import("tui/model_loader.zig");
 const model_picker = @import("tui/widgets/model_picker.zig");
-const panel_widget = @import("tui/widgets/panel.zig");
 const provider_picker = @import("tui/widgets/provider_picker.zig");
 const resume_picker = @import("tui/widgets/resume_picker.zig");
 const tui_provider = @import("tui/provider_controller.zig");
@@ -52,6 +51,7 @@ pub const App = struct {
     runtime: ?*runtime_mod.AgentRuntime = null,
     thread: thread_mod.Thread = .{},
     input: vxfw.TextField,
+    palette_input: vxfw.TextField,
     worker_context: agent_worker.Context,
     turn_future: ?std.Io.Future(void) = null,
     owns_runtime: bool = false,
@@ -105,6 +105,10 @@ pub const App = struct {
     /// Subsequent picker opens skip the network round-trip and just re-sort
     /// for the current active model. Reset on sign-in/sign-out.
     models_cached: bool = false,
+    pending_quit_at: ?std.Io.Timestamp = null,
+    turn_discarded: bool = false,
+
+    pub const ctrl_c_double_press_ms: u32 = 1500;
 
     const Mode = enum { normal, command, session_picker, provider_picker, model_picker };
     const ModelCatalog = enum { connected_provider, openai_codex };
@@ -117,6 +121,7 @@ pub const App = struct {
             .gpa = gpa,
             .agent = agent,
             .input = .init(gpa),
+            .palette_input = .init(gpa),
             .worker_context = .{
                 .io = io,
                 .gpa = agent.gpa,
@@ -142,10 +147,16 @@ pub const App = struct {
     pub fn bindInputCallbacks(self: *App) void {
         self.input.userdata = self;
         self.input.onChange = inputChanged;
+        self.palette_input.userdata = self;
+        self.palette_input.onChange = paletteInputChanged;
     }
 
     pub fn deinit(self: *App) void {
-        self.awaitTurn();
+        if (self.turn_discarded) {
+            self.discardAbandonedTurn();
+        } else {
+            self.awaitTurn();
+        }
         self.cancelModelLoad();
         if (self.model_load_error) |message| {
             self.gpa.free(message);
@@ -175,6 +186,7 @@ pub const App = struct {
         self.thread_projection.deinit(self.gpa);
         self.thread.deinit(self.gpa);
         self.input.deinit();
+        self.palette_input.deinit();
         self.* = undefined;
     }
 
@@ -185,8 +197,47 @@ pub const App = struct {
         }
     }
 
+    pub fn handleInterrupt(self: *App) !void {
+        if (!self.in_flight) return;
+        self.worker_context.requestCancel();
+        const message = try self.gpa.dupe(u8, agent_worker.cancel_message);
+        var event: agent_mod.Agent.Event = .{ .turn_failed = message };
+        defer event.deinit(self.gpa);
+        _ = try self.thread_projection.apply(self.gpa, &self.thread, event);
+        self.in_flight = false;
+        self.turn_discarded = true;
+    }
+
+    fn discardAbandonedTurn(self: *App) void {
+        if (!self.turn_discarded and self.turn_future == null) return;
+        if (self.turn_future) |*future| {
+            // `cancel` blocks until the task hits its next cancellation point
+            // (typically the network read) and unwinds. On a healthy stream
+            // this is near-instant; on a hung connection it forces the OS
+            // read to abort.
+            _ = future.cancel(self.io);
+            self.turn_future = null;
+        }
+        var batch: std.ArrayList(*agent_mod.Agent.Event) = .empty;
+        defer batch.deinit(self.worker_context.gpa);
+        self.worker_context.queue.drainInto(
+            self.worker_context.io,
+            self.worker_context.gpa,
+            &batch,
+        ) catch {};
+        for (batch.items) |event_ptr| {
+            event_ptr.deinit(self.worker_context.gpa);
+            self.worker_context.gpa.destroy(event_ptr);
+        }
+        self.turn_discarded = false;
+    }
+
     pub fn beginSubmit(self: *App) !?u32 {
         if (self.in_flight) return null;
+        // If a previous turn was Esc-interrupted, force-cancel its worker
+        // before starting a new one. Two concurrent workers would race on
+        // the shared agent message history.
+        if (self.turn_discarded) self.discardAbandonedTurn();
         const prompt = try self.input.toOwnedSlice();
         self.resetInputChangeTracking();
         defer self.gpa.free(prompt);
@@ -201,6 +252,7 @@ pub const App = struct {
         }
 
         self.resetTurnState();
+        self.worker_context.resetCancel();
         _ = try self.thread.append(self.gpa, .user, "you", prompt);
         try self.agent.addUser(prompt);
         try self.appendLoading();
@@ -321,7 +373,7 @@ pub const App = struct {
     }
 
     fn handleSessionPickerKey(self: *App, key: vaxis.Key) !bool {
-        if (key.matches('g', .{})) {
+        if (key.matches(vaxis.Key.tab, .{})) {
             self.resume_global = !self.resume_global;
             try self.reloadResumeSessions();
             return true;
@@ -374,27 +426,19 @@ pub const App = struct {
 
     fn syncModeWithInput(self: *App, value: []const u8) !void {
         if (self.mode == .session_picker or self.mode == .provider_picker or self.mode == .model_picker) {
-            if (value.len > 0) {
-                if (value[0] == command_prefix) {
-                    self.mode = .command;
-                    self.command_selection = 0;
-                    return;
-                }
+            if (value.len > 0 and value[0] == command_prefix) {
+                self.mode = .command;
+                self.command_selection = 0;
+                return;
             }
             if (self.mode == .session_picker) {
                 if (self.resume_selection >= try self.visibleResumeCount()) self.resume_selection = 0;
             }
             return;
         }
-        if (value.len == 0) {
-            self.mode = .normal;
-            self.command_selection = 0;
-            return;
-        }
-        if (value[0] == command_prefix) {
+        if (value.len > 0 and value[0] == command_prefix) {
             self.mode = .command;
-            const count = commandMatchesCountForFilter(value[1..]);
-            if (self.command_selection >= count) self.command_selection = 0;
+            self.command_selection = 0;
             return;
         }
         self.mode = .normal;
@@ -414,6 +458,7 @@ pub const App = struct {
         }
         self.mode = .normal;
         self.clearInput();
+        self.clearPaletteInput();
         self.resumeClear();
         return true;
     }
@@ -425,8 +470,6 @@ pub const App = struct {
     }
 
     fn submitMode(self: *App) !bool {
-        const input = try self.peekInput();
-        defer self.gpa.free(input);
         if (self.mode == .provider_picker) {
             switch (self.provider_picker.selectedAction()) {
                 .connect_codex => self.connectCodex() catch |err| try self.reportConnectionError(err),
@@ -453,25 +496,28 @@ pub const App = struct {
             };
             return true;
         }
-        if (input.len == 0) return false;
-        if (input[0] != command_prefix) return false;
-        self.mode = .command;
-        if (resolveCommand(self, input[1..])) |command| {
-            self.clearInput();
-            switch (command) {
-                .new => self.switchToNewSession() catch |err| try self.reportSessionSwitchError(err),
-                .resume_session => try self.openResumePicker(),
-                .connect => try self.openProviderPicker(),
-                .model => self.openModelPicker() catch |err| try self.reportConnectionError(err),
+        if (self.mode == .command) {
+            const filter = try self.peekPaletteInput();
+            defer self.gpa.free(filter);
+            if (resolveCommand(self, filter)) |command| {
+                self.clearPaletteInput();
+                self.clearInput();
+                switch (command) {
+                    .new => self.switchToNewSession() catch |err| try self.reportSessionSwitchError(err),
+                    .resume_session => try self.openResumePicker(),
+                    .connect => try self.openProviderPicker(),
+                    .model => self.openModelPicker() catch |err| try self.reportConnectionError(err),
+                }
             }
+            return true;
         }
-        return true;
+        return false;
     }
 
     fn openCommandMenu(self: *App) !void {
         self.mode = .command;
         self.clearInput();
-        try self.input.insertSliceAtCursor(&.{command_prefix});
+        self.clearPaletteInput();
         self.command_selection = 0;
     }
 
@@ -980,7 +1026,7 @@ pub const App = struct {
     }
 
     fn selectedResumeSummary(self: *App) !?*session_mod.SessionSummary {
-        const filter = try self.peekInput();
+        const filter = try self.peekPaletteInput();
         defer self.gpa.free(filter);
         var visible_index: u32 = 0;
         for (self.resume_summaries.items) |*summary| {
@@ -992,7 +1038,7 @@ pub const App = struct {
     }
 
     fn visibleResumeCount(self: *App) !u32 {
-        const filter = try self.peekInput();
+        const filter = try self.peekPaletteInput();
         defer self.gpa.free(filter);
         return resume_picker.visibleCount(self.resume_summaries.items, filter);
     }
@@ -1015,6 +1061,21 @@ pub const App = struct {
     fn resetInputChangeTracking(self: *App) void {
         self.input.buf.allocator.free(self.input.previous_val);
         self.input.previous_val = "";
+    }
+
+    fn clearPaletteInput(self: *App) void {
+        self.palette_input.clearRetainingCapacity();
+        self.palette_input.buf.allocator.free(self.palette_input.previous_val);
+        self.palette_input.previous_val = "";
+    }
+
+    fn peekPaletteInput(self: *App) ![]u8 {
+        const left = self.palette_input.buf.firstHalf();
+        const right = self.palette_input.buf.secondHalf();
+        const out = try self.gpa.alloc(u8, left.len + right.len);
+        @memcpy(out[0..left.len], left);
+        @memcpy(out[left.len..], right);
+        return out;
     }
 
     fn reportSessionSwitchError(self: *App, err: anyerror) !void {
@@ -1340,19 +1401,39 @@ const RootWidget = struct {
             },
             .key_press => |key| {
                 if (key.matches(vaxis.Key.escape, .{})) {
-                    if (try self.app.cancelMode()) {
+                    if (self.app.in_flight) {
+                        try self.app.handleInterrupt();
                         ctx.consumeAndRedraw();
                         return;
                     }
-                    ctx.quit = true;
+                    if (try self.app.cancelMode()) {
+                        try self.syncFocus(ctx);
+                        ctx.consumeAndRedraw();
+                        return;
+                    }
+                    // No in-flight turn and no overlay to close — swallow the
+                    // key so the user doesn't accidentally exit the TUI.
+                    self.app.pending_quit_at = null;
                     ctx.consume_event = true;
                     return;
                 }
                 if (key.matches('c', .{ .ctrl = true })) {
-                    ctx.quit = true;
+                    const now = std.Io.Timestamp.now(self.app.io, .awake);
+                    if (self.app.pending_quit_at) |first_press| {
+                        const elapsed_ns = first_press.durationTo(now).nanoseconds;
+                        const threshold_ns: i128 = @as(i128, App.ctrl_c_double_press_ms) * std.time.ns_per_ms;
+                        if (elapsed_ns >= 0 and elapsed_ns <= threshold_ns) {
+                            ctx.quit = true;
+                            ctx.consume_event = true;
+                            return;
+                        }
+                    }
+                    self.app.pending_quit_at = now;
                     ctx.consume_event = true;
                     return;
                 }
+                // Any other key cancels the pending-quit prompt.
+                self.app.pending_quit_at = null;
                 if (key.matches(vaxis.Key.enter, .{})) {
                     try self.submit(ctx);
                     return;
@@ -1415,6 +1496,7 @@ const RootWidget = struct {
 
     fn submit(self: *RootWidget, ctx: *vxfw.EventContext) !void {
         if (try self.app.submitMode()) {
+            try self.syncFocus(ctx);
             if (self.app.model_load_future != null) try self.startLoadingTick(ctx);
             ctx.consumeAndRedraw();
             return;
@@ -1424,6 +1506,14 @@ const RootWidget = struct {
         try self.app.startTurn();
         try self.startLoadingTick(ctx);
         ctx.consumeAndRedraw();
+    }
+
+    fn syncFocus(self: *RootWidget, ctx: *vxfw.EventContext) !void {
+        const target = switch (self.app.mode) {
+            .command, .session_picker, .provider_picker, .model_picker => self.app.palette_input.widget(),
+            .normal => self.app.input.widget(),
+        };
+        try ctx.requestFocus(target);
     }
 
     fn drainAgentEvents(self: *RootWidget, ctx: *vxfw.EventContext) !bool {
@@ -1438,6 +1528,13 @@ const RootWidget = struct {
             defer worker_gpa.destroy(event_ptr);
             defer event_ptr.deinit(worker_gpa);
 
+            if (self.app.turn_discarded) {
+                if (event_ptr.* == .turn_finished) {
+                    self.app.awaitTurn();
+                    self.app.turn_discarded = false;
+                }
+                continue;
+            }
             if (self.app.thread_projection.loading_index != null) try self.startLoadingTick(ctx);
             if (try self.app.applyAgentEvent(event_ptr.*)) visible_change = true;
             if (self.app.thread_projection.loading_index != null) try self.startLoadingTick(ctx);
@@ -1449,49 +1546,71 @@ const RootWidget = struct {
         const self: *RootWidget = @ptrCast(@alignCast(ptr));
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
-        const layout = rootLayout(max_height, self.app.mode != .normal);
+        const layout = rootLayout(max_height, false);
 
         var thread_view: ThreadWidget = .{ .app = self.app };
-        var panel_view: PanelWidget = .{ .app = self.app };
         var input_view: InputWidget = .{ .app = self.app };
+        var overlay_view: OverlayWidget = .{ .app = self.app };
 
         const thread_ctx = ctx.withConstraints(
             .{ .width = max_width, .height = layout.thread_height },
             .{ .width = max_width, .height = layout.thread_height },
-        );
-        const panel_ctx = ctx.withConstraints(
-            .{ .width = max_width, .height = layout.panel_height },
-            .{ .width = max_width, .height = layout.panel_height },
         );
         const input_ctx = ctx.withConstraints(
             .{ .width = max_width, .height = layout.input_height },
             .{ .width = max_width, .height = layout.input_height },
         );
 
-        const child_count: usize = if (layout.panel_height == 0) 2 else 3;
+        const overlay_visible = self.app.mode != .normal;
+
+        var child_count: usize = 2;
+        if (overlay_visible) child_count += 1;
         const children = try ctx.arena.alloc(vxfw.SubSurface, child_count);
-        children[0] = .{
+        var idx: usize = 0;
+        children[idx] = .{
             .origin = .{ .row = 0, .col = 0 },
             .surface = try thread_view.widget().draw(thread_ctx),
             .z_index = 0,
         };
-        if (layout.panel_height > 0) {
-            children[1] = .{
-                .origin = .{ .row = layout.panel_row, .col = 0 },
-                .surface = try panel_view.widget().draw(panel_ctx),
-                .z_index = 1,
-            };
-            children[2] = .{
-                .origin = .{ .row = layout.input_row, .col = 0 },
-                .surface = try input_view.widget().draw(input_ctx),
+        idx += 1;
+        children[idx] = .{
+            .origin = .{ .row = layout.input_row, .col = 0 },
+            .surface = try input_view.widget().draw(input_ctx),
+            .z_index = 0,
+        };
+        idx += 1;
+        if (overlay_visible) {
+            const pad_x: u16 = 2;
+            const pad_y: u16 = 1;
+            const inner_max_w: u16 = max_width -| (pad_x * 2);
+            const inner_max_h: u16 = layout.thread_height -| (pad_y * 2);
+            const popup_surface = try overlay_view.widget().draw(ctx.withConstraints(
+                .{ .width = 0, .height = 0 },
+                .{ .width = inner_max_w, .height = inner_max_h },
+            ));
+            const padded_w: u16 = popup_surface.size.width + pad_x * 2;
+            const padded_h: u16 = popup_surface.size.height + pad_y * 2;
+            var padded_surface = try vxfw.Surface.init(
+                ctx.arena,
+                self.widget(),
+                .{ .width = padded_w, .height = padded_h },
+            );
+            const padded_children = try ctx.arena.alloc(vxfw.SubSurface, 1);
+            padded_children[0] = .{
+                .origin = .{ .row = pad_y, .col = pad_x },
                 .z_index = 0,
+                .surface = popup_surface,
             };
-        } else {
-            children[1] = .{
-                .origin = .{ .row = layout.input_row, .col = 0 },
-                .surface = try input_view.widget().draw(input_ctx),
-                .z_index = 0,
+            padded_surface.children = padded_children;
+
+            const x: u16 = (max_width -| padded_w) / 2;
+            const y: u16 = (layout.thread_height -| padded_h) / 2;
+            children[idx] = .{
+                .origin = .{ .row = y, .col = x },
+                .surface = padded_surface,
+                .z_index = 2,
             };
+            idx += 1;
         }
 
         return .{
@@ -1598,8 +1717,13 @@ const command_panel_entries = [_]command_panel.Entry{
 };
 
 fn inputLabel(app: *const App) []const u8 {
-    return switch (app.mode) {
-        .normal => "Build",
+    _ = app;
+    return "Build";
+}
+
+fn overlayLabel(mode: App.Mode) []const u8 {
+    return switch (mode) {
+        .normal => "",
         .command => "Command",
         .session_picker => "Search for Sessions",
         .provider_picker => "Connect to Provider",
@@ -1623,11 +1747,9 @@ fn resolveCommand(app: *App, filter: []const u8) ?Command {
 }
 
 fn commandMatchesCount(app: *App) u32 {
-    const input = app.peekInput() catch return 0;
-    defer app.gpa.free(input);
-    if (input.len == 0) return 0;
-    if (input[0] != command_prefix) return 0;
-    return commandMatchesCountForFilter(input[1..]);
+    const filter = app.peekPaletteInput() catch return 0;
+    defer app.gpa.free(filter);
+    return commandMatchesCountForFilter(filter);
 }
 
 fn commandMatchesCountForFilter(filter: []const u8) u32 {
@@ -1649,74 +1771,185 @@ fn pickerSecondaryColumn(width: u16) u16 {
 
 fn inputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8) anyerror!void {
     const app: *App = @ptrCast(@alignCast(userdata.?));
+    const was_command = app.mode == .command;
     try app.syncModeWithInput(value);
+    if (!was_command and app.mode == .command) {
+        app.clearInput();
+        app.clearPaletteInput();
+        try ctx.requestFocus(app.palette_input.widget());
+    }
     ctx.consumeAndRedraw();
 }
 
-const PanelWidget = struct {
+fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(userdata.?));
+    switch (app.mode) {
+        .command => {
+            const count = commandMatchesCountForFilter(value);
+            if (app.command_selection >= count) app.command_selection = 0;
+        },
+        .session_picker => {
+            const count = resume_picker.visibleCount(app.resume_summaries.items, value);
+            if (app.resume_selection >= count) app.resume_selection = 0;
+            app.syncResumeListCursor();
+        },
+        .provider_picker, .model_picker, .normal => {},
+    }
+    ctx.consumeAndRedraw();
+}
+
+const OverlaySize = struct { width: u16, height: u16 };
+
+fn overlaySize(mode: App.Mode) OverlaySize {
+    return switch (mode) {
+        .normal => .{ .width = 0, .height = 0 },
+        .command, .provider_picker, .session_picker, .model_picker => .{ .width = 90, .height = 16 },
+    };
+}
+
+const OverlayWidget = struct {
     app: *App,
 
-    fn widget(self: *PanelWidget) vxfw.Widget {
-        return .{ .userdata = self, .drawFn = drawPanel };
+    fn widget(self: *OverlayWidget) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = drawOverlay };
     }
 
-    fn drawPanel(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *PanelWidget = @ptrCast(@alignCast(ptr));
-        const width = ctx.max.width orelse 0;
-        const height = ctx.max.height orelse 0;
-        if (self.app.mode == .command) {
-            const input = try self.app.peekInput();
-            defer self.app.gpa.free(input);
-            const filter = if (input.len > 0 and input[0] == command_prefix) input[1..] else "";
-            var content: command_panel.Content = .{
-                .entries = &command_panel_entries,
-                .filter = filter,
-                .selection = self.app.command_selection,
-            };
-            var shell: panel_widget.Shell = .{ .child = content.widget() };
-            return shell.widget().draw(ctx);
-        }
-        if (self.app.mode == .session_picker) {
-            const filter = try self.app.peekInput();
-            defer self.app.gpa.free(filter);
-            var content: resume_picker.Content = .{
-                .io = self.app.io,
-                .list = &self.app.resume_list,
-                .summaries = self.app.resume_summaries.items,
-                .selection = self.app.resume_selection,
-                .global = self.app.resume_global,
-                .filter = filter,
-            };
-            var shell: panel_widget.Shell = .{ .child = content.widget() };
-            return shell.widget().draw(ctx);
-        }
-        if (self.app.mode == .provider_picker) {
-            var content: provider_picker.Content = .{
-                .state = self.app.provider_picker,
-                .codex_signed_in = self.app.isCodexSignedIn(),
-            };
-            var shell: panel_widget.Shell = .{ .child = content.widget() };
-            return shell.widget().draw(ctx);
-        }
-        if (self.app.mode == .model_picker) {
-            const status = tui_status.modelStatus(self.app.runtime, self.app.cached_config);
-            var content: model_picker.Content = .{
-                .models = self.app.codex_models.items,
-                .list = &self.app.model_list,
-                .selection = self.app.model_selection,
-                .column = self.app.model_column,
-                .active_model = if (status) |value| value.model else null,
-                .reasoning_options = modelReasoningOptions(),
-                .reasoning_indexes = self.app.model_reasoning.items,
-                .scope = modelPickerScope(self.app.model_scope),
-                .loading = self.app.model_load_future != null,
-                .error_message = self.app.model_load_error,
-            };
-            var shell: panel_widget.Shell = .{ .child = content.widget() };
-            return shell.widget().draw(ctx);
+    fn drawOverlay(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *OverlayWidget = @ptrCast(@alignCast(ptr));
+        const size = overlaySize(self.app.mode);
+        const max_w: u16 = ctx.max.width orelse size.width;
+        const max_h: u16 = ctx.max.height orelse size.height;
+        const total_w: u16 = @min(size.width, max_w);
+        const total_h: u16 = @min(size.height, max_h);
+        var inner: OverlayInner = .{ .app = self.app };
+        var border: vxfw.Border = .{
+            .child = inner.widget(),
+            .style = StylePalette.thinking_body,
+            .labels = &.{.{ .text = overlayLabel(self.app.mode), .alignment = .top_left }},
+        };
+        return border.widget().draw(ctx.withConstraints(
+            .{ .width = total_w, .height = total_h },
+            .{ .width = total_w, .height = total_h },
+        ));
+    }
+};
+
+const OverlayInner = struct {
+    app: *App,
+
+    fn widget(self: *OverlayInner) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = drawInner };
+    }
+
+    fn drawInner(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *OverlayInner = @ptrCast(@alignCast(ptr));
+        const iw: u16 = ctx.max.width orelse 0;
+        const ih: u16 = ctx.max.height orelse 0;
+
+        var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = iw, .height = ih });
+
+        // Horizontal separator under the search row.
+        var sep_col: u16 = 0;
+        while (sep_col < iw) : (sep_col += 1) {
+            surface.writeCell(sep_col, 1, .{
+                .char = .{ .grapheme = "─", .width = 1 },
+                .style = StylePalette.thinking_body,
+            });
         }
 
-        return vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
+        const children = try ctx.arena.alloc(vxfw.SubSurface, 2);
+
+        // Row 0: prompt + shared overlay search input.
+        var prompt_text: vxfw.Text = .{ .text = ">", .softwrap = false, .width_basis = .parent };
+        var prompt_box: vxfw.SizedBox = .{ .child = prompt_text.widget(), .size = .{ .width = 2, .height = 1 } };
+        var input_box: vxfw.SizedBox = .{ .child = self.app.palette_input.widget(), .size = .{ .width = iw -| 2, .height = 1 } };
+        var search_row: vxfw.FlexRow = .{ .children = &.{
+            .{ .widget = prompt_box.widget(), .flex = 0 },
+            .{ .widget = input_box.widget(), .flex = 1 },
+        } };
+        children[0] = .{
+            .origin = .{ .row = 0, .col = 0 },
+            .z_index = 0,
+            .surface = try search_row.widget().draw(ctx.withConstraints(
+                .{ .width = iw, .height = 1 },
+                .{ .width = iw, .height = 1 },
+            )),
+        };
+
+        // Rows 2..: mode-specific content area.
+        const content_h: u16 = ih -| 2;
+        const content_ctx = ctx.withConstraints(
+            .{ .width = iw, .height = content_h },
+            .{ .width = iw, .height = content_h },
+        );
+        children[1] = .{
+            .origin = .{ .row = 2, .col = 0 },
+            .z_index = 0,
+            .surface = try drawContent(self.app, content_ctx),
+        };
+
+        surface.children = children;
+        return surface;
+    }
+
+    fn drawContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        return switch (app.mode) {
+            .command => drawCommandContent(app, ctx),
+            .session_picker => drawSessionContent(app, ctx),
+            .provider_picker => drawProviderContent(app, ctx),
+            .model_picker => drawModelContent(app, ctx),
+            .normal => unreachable,
+        };
+    }
+
+    fn drawCommandContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const filter = try app.peekPaletteInput();
+        defer app.gpa.free(filter);
+        var content: command_panel.Content = .{
+            .entries = &command_panel_entries,
+            .filter = filter,
+            .selection = app.command_selection,
+        };
+        return content.widget().draw(ctx);
+    }
+
+    fn drawSessionContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const filter = try app.peekPaletteInput();
+        defer app.gpa.free(filter);
+        var content: resume_picker.Content = .{
+            .io = app.io,
+            .list = &app.resume_list,
+            .summaries = app.resume_summaries.items,
+            .selection = app.resume_selection,
+            .global = app.resume_global,
+            .filter = filter,
+        };
+        return content.widget().draw(ctx);
+    }
+
+    fn drawProviderContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        var content: provider_picker.Content = .{
+            .state = app.provider_picker,
+            .codex_signed_in = app.isCodexSignedIn(),
+        };
+        return content.widget().draw(ctx);
+    }
+
+    fn drawModelContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const status = tui_status.modelStatus(app.runtime, app.cached_config);
+        var content: model_picker.Content = .{
+            .models = app.codex_models.items,
+            .list = &app.model_list,
+            .selection = app.model_selection,
+            .column = app.model_column,
+            .active_model = if (status) |value| value.model else null,
+            .reasoning_options = modelReasoningOptions(),
+            .reasoning_indexes = app.model_reasoning.items,
+            .scope = modelPickerScope(app.model_scope),
+            .loading = app.model_load_future != null,
+            .error_message = app.model_load_error,
+        };
+        return content.widget().draw(ctx);
     }
 };
 
@@ -1747,7 +1980,7 @@ fn reasoningOptions() []const model_picker.ReasoningOption {
 fn inputHintText(mode: App.Mode) []const u8 {
     return switch (mode) {
         .command => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
-        .session_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[TAB] Toggle" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[g] All sessions" ++ symbols.separator_dot_padded ++ "[ESC] Back",
+        .session_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[TAB] All sessions" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .provider_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Actions" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .model_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Column" ++ symbols.separator_dot_padded ++ "[TAB] Toggle Effort/Scope" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .normal => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[SHIFT] ↓ Jump to Bottom" ++ symbols.separator_dot_padded ++ "[TAB] Expand",
@@ -2096,7 +2329,7 @@ test "begin submit clears input and appends loading row before agent turn" {
     try std.testing.expectEqualStrings("hello", app.thread.messages.items[0].body);
     try std.testing.expectEqual(.status, app.thread.messages.items[loading_index].kind);
     try std.testing.expect(isLoadingWord(app.thread.messages.items[loading_index].title));
-    try std.testing.expectEqual(@as(u16, 3), messageRows(app.thread.messages.items[loading_index], 80));
+    try std.testing.expectEqual(@as(u16, 2), messageRows(app.thread.messages.items[loading_index], 80));
     try std.testing.expectEqual(@as(u32, 0), app.thread.selected.?);
 }
 
@@ -2331,9 +2564,12 @@ test "canceling a picker returns to command menu" {
     app.mode = .model_picker;
     try std.testing.expect(try app.cancelMode());
     try std.testing.expectEqual(App.Mode.command, app.mode);
-    const input = try app.peekInput();
-    defer gpa.free(input);
-    try std.testing.expectEqualStrings("/", input);
+    const main_input = try app.peekInput();
+    defer gpa.free(main_input);
+    try std.testing.expectEqualStrings("", main_input);
+    const palette_filter = try app.peekPaletteInput();
+    defer gpa.free(palette_filter);
+    try std.testing.expectEqualStrings("", palette_filter);
 }
 
 test "typing slash inside picker opens command menu" {
@@ -2992,14 +3228,14 @@ test "collapsed thinking and tool rows have stable heights" {
     defer thread.deinit(gpa);
 
     const thinking_index = try thread.append(gpa, .thinking, "Thinking...", "short");
-    try std.testing.expectEqual(@as(u16, 3), messageRows(thread.messages.items[thinking_index], 80));
+    try std.testing.expectEqual(@as(u16, 2), messageRows(thread.messages.items[thinking_index], 80));
 
     try thread.appendThinkingDelta(gpa, thinking_index, " ");
     try thread.appendThinkingDelta(gpa, thinking_index, "this is a much longer thinking body that should not change the collapsed row height");
-    try std.testing.expectEqual(@as(u16, 3), messageRows(thread.messages.items[thinking_index], 80));
+    try std.testing.expectEqual(@as(u16, 2), messageRows(thread.messages.items[thinking_index], 80));
 
     const tool_index = try thread.startTool(gpa, "pwd");
-    try std.testing.expectEqual(@as(u16, 3), messageRows(thread.messages.items[tool_index], 80));
+    try std.testing.expectEqual(@as(u16, 2), messageRows(thread.messages.items[tool_index], 80));
 }
 
 test "first visible message tracks bottom viewport row" {
@@ -3012,7 +3248,7 @@ test "first visible message tracks bottom viewport row" {
     _ = try thread.append(gpa, .agent, "agent", "three");
 
     try std.testing.expectEqual(
-        @as(u32, 1),
+        @as(u32, 0),
         firstVisibleMessage(thread.messages.items, thread.selected, 80, 6),
     );
 }
@@ -3026,8 +3262,8 @@ test "latest tall message scrolls by rows instead of message boundaries" {
     _ = try thread.append(gpa, .agent, "agent", "line1\nline2\nline3\nline4\nline5\nline6");
 
     const viewport = visibleRows(thread.messages.items, thread.selected, 80, 4);
-    try std.testing.expectEqual(@as(u32, 7), viewport.first);
-    try std.testing.expectEqual(@as(u32, 11), threadRows(thread.messages.items, 80));
+    try std.testing.expectEqual(@as(u32, 5), viewport.first);
+    try std.testing.expectEqual(@as(u32, 9), threadRows(thread.messages.items, 80));
 }
 
 test "collapsed tool title wraps to visible rows" {
@@ -3049,7 +3285,7 @@ test "collapsed tool messages render no body text" {
     try thread.finishTool(gpa, index, "hello", null, false);
 
     try std.testing.expect(!thread.messages.items[index].expanded);
-    try std.testing.expectEqual(@as(u16, 3), messageRows(thread.messages.items[index], 80));
+    try std.testing.expectEqual(@as(u16, 2), messageRows(thread.messages.items[index], 80));
     thread.toggleSelected();
     try std.testing.expect(thread.messages.items[index].expanded);
     try std.testing.expectEqualStrings("hello", thread.messages.items[index].body);

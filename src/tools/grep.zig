@@ -10,13 +10,13 @@ pub const tool: common.Tool = .{
             .{
                 .name = "query",
                 .kind = .string,
-                .description = "Required. Regex pattern matched against file contents.",
+                .description = "Regex matched against file contents.",
                 .required = true,
             },
             .{
                 .name = "cursor",
                 .kind = .string,
-                .description = "Optional. Continuation token returned by a previous grep result. Reuse only with the same query.",
+                .description = "Page token from a previous grep result. Reuse only with the same query.",
                 .required = false,
             },
         },

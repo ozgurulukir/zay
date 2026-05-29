@@ -76,12 +76,12 @@ pub fn messageStartRow(messages: []const thread_mod.Message, index: u32, width: 
 }
 
 pub fn messageRows(message: thread_mod.Message, width: u16) u16 {
-    return messageContentRows(message, width) + 2;
+    return messageContentRows(message, width) + 1;
 }
 
 pub fn messageContentRows(message: thread_mod.Message, width: u16) u16 {
     return switch (message.kind) {
-        .user => textRows(message.body, width -| 2),
+        .user, .notice => textRows(message.body, width -| 2),
         .agent => terminal_markdown.countRows(message.body, @max(width, 1)),
         .logo => logoRows(message.body),
         .thinking => if (message.expanded)

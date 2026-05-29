@@ -16,9 +16,17 @@ pub const MessageKind = enum {
     thinking,
     tool,
     status,
+    notice,
 
     fn selectable(self: MessageKind) bool {
         return self != .logo and self != .status;
+    }
+
+    pub fn dimmable(self: MessageKind) bool {
+        return switch (self) {
+            .user, .agent, .thinking, .tool, .notice => true,
+            .logo, .status => false,
+        };
     }
 };
 
@@ -259,7 +267,7 @@ pub const Thread = struct {
         const message = &self.messages.items[selected];
         switch (message.kind) {
             .thinking, .tool => message.expanded = !message.expanded,
-            .user, .agent, .logo, .status => {},
+            .user, .agent, .logo, .status, .notice => {},
         }
     }
 

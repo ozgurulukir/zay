@@ -20,7 +20,7 @@ pub const Palette = struct {
 
 pub fn mergedSelectedStyle(style: vaxis.Style, selected: bool) vaxis.Style {
     var merged = style;
-    if (selected) merged.bg = Palette.selected.bg;
+    if (!selected) merged.dim = true;
     return merged;
 }
 

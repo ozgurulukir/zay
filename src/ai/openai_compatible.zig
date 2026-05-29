@@ -713,7 +713,7 @@ test "buildToolsJson produces a valid JSON array for the registry" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"read_file\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"write_file\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"path\",\"content\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "Always include BOTH `path` and `content`.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "`content` is the entire file body") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, ":50-200") != null);
 }
 

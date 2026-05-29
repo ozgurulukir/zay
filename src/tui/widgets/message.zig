@@ -65,24 +65,23 @@ pub const MessageWidget = struct {
     }
 
     fn drawBody(self: *MessageWidget, surface: *vxfw.Surface, ctx: vxfw.DrawContext) void {
-        var row: u16 = 0;
-        fillRow(surface, row, self.selected);
-        row += 1;
+        const styled_as_selected = self.selected or !self.message.kind.dimmable();
+        var row: u16 = 1;
         switch (self.message.kind) {
-            .user => drawWrapped(surface, self.message.body, StylePalette.user, self.selected, &row, ctx, 2, StylePalette.user),
-            .agent => drawMarkdown(surface, self.message.body, self.selected, &row, ctx),
+            .user => drawWrapped(surface, self.message.body, StylePalette.user, styled_as_selected, &row, ctx, 2, StylePalette.user),
+            .agent => drawMarkdown(surface, self.message.body, styled_as_selected, &row, ctx),
+            .notice => drawWrapped(surface, self.message.body, StylePalette.tool_failed, styled_as_selected, &row, ctx, 2, StylePalette.tool_failed),
             .logo => drawLogo(surface, self.message.body, &row, ctx),
             .tool => {
-                drawWrapped(surface, self.message.title, StylePalette.tool, self.selected, &row, ctx, 0, null);
-                if (self.message.expanded) drawToolBody(surface, self.message, self.selected, &row, ctx);
+                drawWrapped(surface, self.message.title, StylePalette.tool, styled_as_selected, &row, ctx, 0, null);
+                if (self.message.expanded) drawToolBody(surface, self.message, styled_as_selected, &row, ctx);
             },
             .thinking => {
-                drawLine(surface, self.message.title, StylePalette.thinking_label, self.selected, &row, ctx, 2, StylePalette.thinking_bar);
-                if (self.message.expanded) drawWrapped(surface, self.message.body, StylePalette.thinking_body, self.selected, &row, ctx, 2, StylePalette.thinking_bar);
+                drawLine(surface, self.message.title, StylePalette.thinking_label, styled_as_selected, &row, ctx, 2, StylePalette.thinking_bar);
+                if (self.message.expanded) drawWrapped(surface, self.message.body, StylePalette.thinking_body, styled_as_selected, &row, ctx, 2, StylePalette.thinking_bar);
             },
             .status => drawLoading(surface, self.message.title, self.loading_frame, &row, ctx),
         }
-        fillRow(surface, row, self.selected);
     }
 
     fn drawLoading(
@@ -94,9 +93,8 @@ pub const MessageWidget = struct {
     ) void {
         std.debug.assert(loading_frame < loading_frames.len);
         if (row.* >= surface.size.height) return;
-        fillRow(surface, row.*, false);
-        writeText(surface, loading_frames[loading_frame], StylePalette.thinking_label, false, row.*, ctx, 0);
-        writeText(surface, text, StylePalette.thinking_body, false, row.*, ctx, 2);
+        writeText(surface, loading_frames[loading_frame], StylePalette.thinking_label, true, row.*, ctx, 0);
+        writeText(surface, text, StylePalette.thinking_body, true, row.*, ctx, 2);
         row.* += 1;
     }
 
@@ -171,18 +169,9 @@ pub const MessageWidget = struct {
         bar_style: ?vaxis.Style,
     ) void {
         if (row.* >= surface.size.height) return;
-        fillRow(surface, row.*, selected);
         if (bar_style) |active_bar_style| writeText(surface, "┃", active_bar_style, selected, row.*, ctx, 0);
         writeText(surface, text, style, selected, row.*, ctx, indent);
         row.* += 1;
-    }
-
-    fn fillRow(surface: *vxfw.Surface, row: u16, selected: bool) void {
-        if (!selected) return;
-        var col: u16 = 0;
-        while (col < surface.size.width) : (col += 1) {
-            surface.writeCell(col, row, .{ .style = StylePalette.selected });
-        }
     }
 
     fn writeText(
@@ -224,7 +213,7 @@ pub const MessageWidget = struct {
             if (col + width > col_limit) return;
             surface.writeCell(col, row, .{
                 .char = .{ .grapheme = bytes, .width = width },
-                .style = gradientStyle(col - ConversationLayout.left, gradient_width, false),
+                .style = gradientStyle(col - ConversationLayout.left, gradient_width, true),
             });
             col += width;
         }
@@ -247,7 +236,6 @@ fn drawMarkdown(
 
     for (rendered.rows) |markdown_row| {
         if (row.* >= surface.size.height) return;
-        MessageWidget.fillRow(surface, row.*, selected);
         var start_col = markdown_row.indent;
         for (markdown_row.spans) |span| {
             MessageWidget.writeText(surface, span.text, markdownStyle(span.style), selected, row.*, ctx, start_col);
