@@ -44,12 +44,6 @@ pub const Context = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
     queue: EventQueue = .{},
-    /// Set by the TUI when the user asks to interrupt the in-flight turn.
-    /// `postAgentEvent` observes this and returns `error.TurnCancelled` exactly
-    /// once, which propagates up through the agent and into `runAgentTurn`'s
-    /// catch block. From there, the terminal `turn_failed` / `turn_finished`
-    /// events still need to reach the TUI so it can clean up, so we use a
-    /// separate `cancel_signaled` latch to make sure cancel only fires once.
     cancel_requested: std.atomic.Value(bool) = .init(false),
     cancel_signaled: std.atomic.Value(bool) = .init(false),
 
