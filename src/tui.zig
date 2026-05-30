@@ -1290,11 +1290,13 @@ pub const App = struct {
     fn navigateThread(self: *App, direction: ThreadNavigation) bool {
         self.thread_auto_scroll = false;
         if (self.scrollSelectedLongMessage(direction)) return true;
+
+        const selected_before = self.thread.selected;
         switch (direction) {
             .previous => self.thread.moveSelection(.previous),
             .next => self.thread.moveSelection(.next),
         }
-        self.anchorSelectedLongMessage(direction);
+        if (self.thread.selected != selected_before) self.anchorSelectedLongMessage(direction);
         return false;
     }
 
@@ -2348,6 +2350,27 @@ test "long message scroll uses a small fixed step" {
     try std.testing.expectEqual(@as(u16, 1), scrollStepRows(1));
     try std.testing.expectEqual(@as(u16, 2), scrollStepRows(2));
     try std.testing.expectEqual(@as(u16, 3), scrollStepRows(20));
+}
+
+test "down at latest long message bottom does not loop to top" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    _ = try app.thread.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+    app.thread.selected = 0;
+    app.thread_view_width = 80;
+    app.thread_view_height = 4;
+    const offset = messageRows(app.thread.messages.items[0], ConversationLayout.contentWidth(app.thread_view_width)) - app.thread_view_height;
+    app.setSelectedMessageOffset(0, offset);
+
+    const scrolled = app.navigateThread(.next);
+
+    try std.testing.expect(!scrolled);
+    try std.testing.expectEqual(@as(?u32, 0), app.thread.selected);
+    try std.testing.expectEqual(@as(i17, @intCast(offset)), app.thread_list.scroll.offset);
 }
 
 test "down moves after selected long message bottom is visible" {
