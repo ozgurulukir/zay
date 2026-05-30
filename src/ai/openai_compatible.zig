@@ -563,13 +563,13 @@ fn parseDeltaObject(
     while (try nextObjectKey(scanner)) |key| {
         if (std.mem.eql(u8, key, "content")) {
             const before: u32 = @intCast(content.items.len);
-            const appended = try appendStringValueOrNull(scanner, gpa, content);
+            const appended = try appendStringValue(scanner, gpa, content, .allow_null);
             if (appended) {
                 if (content.items.len > before) change.content_start = before;
             }
         } else if (std.mem.eql(u8, key, "reasoning") or std.mem.eql(u8, key, "reasoning_content")) {
             const before: u32 = @intCast(reasoning.items.len);
-            const appended = try appendStringValueOrNull(scanner, gpa, reasoning);
+            const appended = try appendStringValue(scanner, gpa, reasoning, .allow_null);
             if (appended) {
                 if (reasoning.items.len > before) change.reasoning_start = before;
             }
@@ -619,7 +619,7 @@ fn parseToolCallObject(
             if (index >= tool_call_count_max) return error.TooManyToolCalls;
             resolved_index = @intCast(index);
         } else if (std.mem.eql(u8, key, "id")) {
-            try appendStringValue(scanner, gpa, &pending.id);
+            _ = try appendStringValue(scanner, gpa, &pending.id, .reject_null);
             has_pending_id = true;
         } else if (std.mem.eql(u8, key, "function")) {
             try parseToolCallFunction(gpa, scanner, &pending, &has_pending_name, &has_pending_arguments);
@@ -648,10 +648,10 @@ fn parseToolCallFunction(
     try expectObjectBegin(scanner);
     while (try nextObjectKey(scanner)) |key| {
         if (std.mem.eql(u8, key, "name")) {
-            try appendStringValue(scanner, gpa, &pending.name);
+            _ = try appendStringValue(scanner, gpa, &pending.name, .reject_null);
             has_pending_name.* = true;
         } else if (std.mem.eql(u8, key, "arguments")) {
-            try appendStringValue(scanner, gpa, &pending.arguments);
+            _ = try appendStringValue(scanner, gpa, &pending.arguments, .reject_null);
             has_pending_arguments.* = true;
         } else {
             try scanner.skipValue();
@@ -687,16 +687,21 @@ fn nextInteger(scanner: *Scanner) !i64 {
     return try std.fmt.parseInt(i64, text, 10);
 }
 
-fn appendStringValue(scanner: *Scanner, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) !void {
-    const appended = try appendStringValueOrNull(scanner, gpa, list);
-    if (!appended) return error.UnexpectedToken;
-}
+const NullStringPolicy = enum { allow_null, reject_null };
 
-fn appendStringValueOrNull(scanner: *Scanner, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) !bool {
+fn appendStringValue(
+    scanner: *Scanner,
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    null_policy: NullStringPolicy,
+) !bool {
     while (true) {
         const token = try scanner.next();
         switch (token) {
-            .null => return false,
+            .null => switch (null_policy) {
+                .allow_null => return false,
+                .reject_null => return error.UnexpectedToken,
+            },
             .string => |s| {
                 try list.appendSlice(gpa, s);
                 return true;
