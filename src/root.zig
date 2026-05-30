@@ -42,8 +42,8 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     defer search.deinit(gpa, init.io);
 
     const system_prompt = if (load_result.config.system_prompt) |s| s else @embedFile("prompts/system.md");
-    const agent_runtime = try gpa.create(runtime.AgentRuntime);
-    errdefer gpa.destroy(agent_runtime);
+    const agent_runtime = try tui_gpa.create(runtime.AgentRuntime);
+    errdefer tui_gpa.destroy(agent_runtime);
     try agent_runtime.initNew(
         runtime_gpa,
         init.io,
