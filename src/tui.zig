@@ -1580,34 +1580,13 @@ const RootWidget = struct {
         };
         idx += 1;
         if (overlay_visible) {
-            const pad_x: u16 = 2;
-            const pad_y: u16 = 1;
-            const inner_max_w: u16 = max_width -| (pad_x * 2);
-            const inner_max_h: u16 = layout.thread_height -| (pad_y * 2);
-            const popup_surface = try overlay_view.widget().draw(ctx.withConstraints(
-                .{ .width = 0, .height = 0 },
-                .{ .width = inner_max_w, .height = inner_max_h },
-            ));
-            const padded_w: u16 = popup_surface.size.width + pad_x * 2;
-            const padded_h: u16 = popup_surface.size.height + pad_y * 2;
-            var padded_surface = try vxfw.Surface.init(
-                ctx.arena,
-                self.widget(),
-                .{ .width = padded_w, .height = padded_h },
-            );
-            const padded_children = try ctx.arena.alloc(vxfw.SubSurface, 1);
-            padded_children[0] = .{
-                .origin = .{ .row = pad_y, .col = pad_x },
-                .z_index = 0,
-                .surface = popup_surface,
-            };
-            padded_surface.children = padded_children;
-
-            const x: u16 = (max_width -| padded_w) / 2;
-            const y: u16 = (layout.thread_height -| padded_h) / 2;
+            var centered_overlay: vxfw.Center = .{ .child = overlay_view.widget() };
             children[idx] = .{
-                .origin = .{ .row = y, .col = x },
-                .surface = padded_surface,
+                .origin = .{ .row = 0, .col = 0 },
+                .surface = try centered_overlay.widget().draw(ctx.withConstraints(
+                    .{ .width = max_width, .height = layout.thread_height },
+                    .{ .width = max_width, .height = layout.thread_height },
+                )),
                 .z_index = 2,
             };
             idx += 1;
@@ -2191,6 +2170,37 @@ test "root layout clamps panel above input on short screens" {
     try std.testing.expectEqual(@as(u16, 2), layout.panel_height);
     try std.testing.expectEqual(@as(u16, 0), layout.panel_row);
     try std.testing.expectEqual(@as(u16, 2), layout.input_row);
+}
+
+test "root overlay host does not paint outside panel" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.mode = .command;
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 100, .height = 30 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const surface = try root.widget().draw(ctx);
+    try std.testing.expectEqual(@as(usize, 3), surface.children.len);
+
+    const overlay_host = surface.children[2].surface;
+    try std.testing.expectEqual(@as(usize, 0), overlay_host.buffer.len);
+    try std.testing.expectEqual(@as(usize, 1), overlay_host.children.len);
+
+    const panel_surface = overlay_host.children[0].surface;
+    try std.testing.expectEqual(@as(u16, 90), panel_surface.size.width);
+    try std.testing.expectEqual(@as(u16, 16), panel_surface.size.height);
 }
 
 test "mouse bottom does not enable auto-scroll when older message is selected" {
