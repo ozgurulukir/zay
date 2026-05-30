@@ -26,6 +26,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    const bounded_queue_mod = b.createModule(.{
+        .root_source_file = b.path("lib/bounded_queue.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     {
         const options = b.addOptions();
         options.addOption(bool, "websocket_blocking", false);
@@ -43,6 +48,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("lib/logger.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "bounded_queue", .module = bounded_queue_mod },
+        },
     });
     const dynlib_mod = b.createModule(.{
         .root_source_file = b.path("lib/dynlib.zig"),
@@ -75,6 +83,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "bounded_queue", .module = bounded_queue_mod },
             .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
             .{ .name = "websocket", .module = websocket_mod },
             .{ .name = "logger", .module = logger_mod },
