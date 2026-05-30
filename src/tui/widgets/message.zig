@@ -101,7 +101,7 @@ pub const MessageWidget = struct {
     fn drawLogo(surface: *vxfw.Surface, text: []const u8, row: *u16, ctx: vxfw.DrawContext) void {
         var line_start: usize = 0;
         while (line_start <= text.len) {
-            const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
+            const line_end = std.mem.findScalarPos(u8, text, line_start, '\n') orelse text.len;
             writeGradient(surface, text[line_start..line_end], row.*, ctx);
             row.* += 1;
             if (line_end == text.len) break;
@@ -128,7 +128,7 @@ pub const MessageWidget = struct {
 
         var line_start: usize = 0;
         while (line_start <= text.len) {
-            const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
+            const line_end = std.mem.findScalarPos(u8, text, line_start, '\n') orelse text.len;
             drawWrappedHardLine(surface, text[line_start..line_end], style, selected, row, ctx, indent, bar_style, width);
             if (line_end == text.len) break;
             line_start = line_end + 1;
@@ -292,7 +292,7 @@ fn drawWrappedDiff(
 
     var line_start: usize = 0;
     while (line_start <= text.len) {
-        const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
+        const line_end = std.mem.findScalarPos(u8, text, line_start, '\n') orelse text.len;
         const line = text[line_start..line_end];
         const style = diffLineStyle(line);
         MessageWidget.drawWrappedHardLine(surface, line, style, selected, row, ctx, 0, null, width);

@@ -118,7 +118,7 @@ pub fn textRows(text: []const u8, width: u16) u16 {
     var rows: u16 = 0;
     var line_start: usize = 0;
     while (line_start <= text.len) {
-        const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
+        const line_end = std.mem.findScalarPos(u8, text, line_start, '\n') orelse text.len;
         rows += wrappedLineRows(text[line_start..line_end], row_width);
         if (line_end == text.len) break;
         line_start = line_end + 1;

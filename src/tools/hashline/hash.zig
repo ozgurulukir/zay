@@ -161,7 +161,7 @@ test "formatHashLines prefixes every line" {
     var index: u32 = 1;
     while (iter.next()) |line| : (index += 1) {
         try std.testing.expect(std.mem.startsWith(u8, line, line_prefix));
-        try std.testing.expect(std.mem.indexOfScalar(u8, line, body_sep) != null);
+        try std.testing.expect(std.mem.findScalar(u8, line, body_sep) != null);
     }
     try std.testing.expectEqual(@as(u32, 4), index);
 }

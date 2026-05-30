@@ -79,33 +79,35 @@ fn readBody(gpa: std.mem.Allocator, response: *std.http.Client.Response) ![]u8 {
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    errdefer out.deinit();
-    _ = try reader.streamRemaining(&out.writer);
-    if (out.written().len > response_bytes_max) return error.ResponseTooLarge;
-    return try out.toOwnedSlice();
+    return reader.allocRemaining(gpa, .limited(response_bytes_max)) catch |err| switch (err) {
+        error.StreamTooLong => error.ResponseTooLarge,
+        else => |e| e,
+    };
 }
+
+const ModelsResponse = struct {
+    data: []const ModelJson,
+};
+
+const ModelJson = struct {
+    id: ?[]const u8 = null,
+};
 
 fn parseResponse(gpa: std.mem.Allocator, bytes: []const u8) ![]ModelEntry {
     std.debug.assert(bytes.len > 0);
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, bytes, .{}) catch return error.InvalidModelsResponse;
+    const parsed = std.json.parseFromSlice(ModelsResponse, gpa, bytes, .{ .ignore_unknown_fields = true }) catch return error.InvalidModelsResponse;
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidModelsResponse;
-    const data = parsed.value.object.get("data") orelse return error.InvalidModelsResponse;
-    if (data != .array) return error.InvalidModelsResponse;
-    if (data.array.items.len > model_count_max) return error.TooManyModels;
+    if (parsed.value.data.len > model_count_max) return error.TooManyModels;
 
     var out: std.ArrayList(ModelEntry) = .empty;
     errdefer {
         for (out.items) |*entry| entry.deinit(gpa);
         out.deinit(gpa);
     }
-    for (data.array.items) |item| {
-        if (item != .object) continue;
-        const id_value = item.object.get("id") orelse continue;
-        if (id_value != .string) continue;
-        if (id_value.string.len == 0) continue;
-        try out.append(gpa, .{ .id = try gpa.dupe(u8, id_value.string) });
+    for (parsed.value.data) |item| {
+        const id = item.id orelse continue;
+        if (id.len == 0) continue;
+        try out.append(gpa, .{ .id = try gpa.dupe(u8, id) });
     }
     return out.toOwnedSlice(gpa);
 }

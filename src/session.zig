@@ -759,7 +759,7 @@ fn branchSummaryToJson(gpa: std.mem.Allocator, from_id: []const u8, summary: []c
 fn titleFromUserMessage(gpa: std.mem.Allocator, content: []const u8) Error!?[]u8 {
     const trimmed = std.mem.trim(u8, content, " \t\r\n");
     if (trimmed.len == 0) return null;
-    const line_end = std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len;
+    const line_end = std.mem.findScalar(u8, trimmed, '\n') orelse trimmed.len;
     const line = std.mem.trim(u8, trimmed[0..line_end], " \t\r");
     if (line.len == 0) return null;
     const title_max: u32 = 80;

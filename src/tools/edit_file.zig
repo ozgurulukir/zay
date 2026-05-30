@@ -61,15 +61,18 @@ pub fn runTool(
     cwd: []const u8,
     arguments: []const u8,
 ) common.Error!common.Output {
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, arguments, .{}) catch {
+    const parsed = std.json.parseFromSlice(JsonArgs, gpa, arguments, .{ .ignore_unknown_fields = true }) catch {
         return common.fail(gpa, "edit_file: invalid JSON arguments\n", 2);
     };
     defer parsed.deinit();
 
-    const input = parsed.value.object.get("input") orelse return common.fail(gpa, "edit_file: missing input\n", 2);
-    if (input != .string) return common.fail(gpa, "edit_file: input must be a string\n", 2);
-    return runPatchDocument(gpa, io, cwd, input.string);
+    const input = parsed.value.input orelse return common.fail(gpa, "edit_file: missing input\n", 2);
+    return runPatchDocument(gpa, io, cwd, input);
 }
+
+const JsonArgs = struct {
+    input: ?[]const u8 = null,
+};
 
 const Section = struct {
     path: []const u8,

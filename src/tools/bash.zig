@@ -34,12 +34,8 @@ pub fn runTool(
     cwd: []const u8,
     arguments: []const u8,
 ) common.Error!common.Output {
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, arguments, .{}) catch {
-        return common.fail(gpa, "bash: invalid JSON arguments\n", 2);
-    };
-    defer parsed.deinit();
-
-    const args = parseArgs(parsed.value) catch |err| return parseError(gpa, err);
+    var args = parseArgs(gpa, arguments) catch |err| return parseError(gpa, err);
+    defer args.deinit();
     var command_cwd: ?[]u8 = null;
     defer if (command_cwd) |path| gpa.free(path);
     const resolved_cwd = if (args.cwd) |path| value: {
@@ -73,7 +69,20 @@ const Args = struct {
     command: []const u8,
     cwd: ?[]const u8 = null,
     env: ?std.json.Value = null,
+    parsed: std.json.Parsed(JsonArgs),
     timeout_seconds: u32 = bash.timeout_seconds_default,
+
+    fn deinit(self: *Args) void {
+        self.parsed.deinit();
+        self.* = undefined;
+    }
+};
+
+const JsonArgs = struct {
+    command: ?[]const u8 = null,
+    cwd: ?[]const u8 = null,
+    env: ?std.json.Value = null,
+    timeout: ?u32 = null,
 };
 
 const ParseError = error{
@@ -87,32 +96,32 @@ const ParseError = error{
     BadTimeout,
 };
 
-fn parseArgs(value: std.json.Value) ParseError!Args {
-    if (value != .object) return error.InvalidJson;
+fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args {
+    const parsed = std.json.parseFromSlice(JsonArgs, gpa, arguments, .{ .ignore_unknown_fields = true }) catch return error.InvalidJson;
+    errdefer parsed.deinit();
 
-    const command = value.object.get("command") orelse return error.MissingCommand;
-    if (command != .string) return error.BadCommand;
-    if (command.string.len == 0) return error.MissingCommand;
+    const command = parsed.value.command orelse return error.MissingCommand;
+    if (command.len == 0) return error.MissingCommand;
 
-    const cwd = if (value.object.get("cwd")) |cwd_value| cwd: {
-        if (cwd_value != .string) return error.BadCwd;
-        if (cwd_value.string.len == 0) return error.BadCwd;
-        break :cwd cwd_value.string;
-    } else null;
+    if (parsed.value.cwd) |cwd| {
+        if (cwd.len == 0) return error.BadCwd;
+    }
 
-    const env = if (value.object.get("env")) |env_value| env: {
-        if (env_value != .object) return error.BadEnv;
-        try validateEnv(env_value);
-        break :env env_value;
-    } else null;
+    if (parsed.value.env) |env| {
+        if (env != .object) return error.BadEnv;
+        try validateEnv(env);
+    }
 
-    const timeout_seconds = if (value.object.get("timeout")) |timeout_value| timeout: {
-        if (timeout_value != .integer) return error.BadTimeout;
-        if (timeout_value.integer <= 0) return error.BadTimeout;
-        break :timeout std.math.cast(u32, timeout_value.integer) orelse return error.BadTimeout;
-    } else bash.timeout_seconds_default;
+    const timeout_seconds = parsed.value.timeout orelse bash.timeout_seconds_default;
+    if (timeout_seconds == 0) return error.BadTimeout;
 
-    return .{ .command = command.string, .cwd = cwd, .env = env, .timeout_seconds = timeout_seconds };
+    return .{
+        .command = command,
+        .cwd = parsed.value.cwd,
+        .env = parsed.value.env,
+        .parsed = parsed,
+        .timeout_seconds = timeout_seconds,
+    };
 }
 
 fn validateEnv(env: std.json.Value) ParseError!void {
@@ -146,7 +155,7 @@ fn currentEnvMap(gpa: std.mem.Allocator) (std.mem.Allocator.Error || std.Io.Unex
     var index: usize = 0;
     while (std.c.environ[index]) |entry| : (index += 1) {
         const line = std.mem.span(entry);
-        const separator = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const separator = std.mem.findScalar(u8, line, '=') orelse continue;
         if (separator == 0) continue;
         try map.put(line[0..separator], line[separator + 1 ..]);
     }
@@ -217,10 +226,8 @@ test "bash tool applies relative cwd" {
 }
 
 test "bash tool parses timeout" {
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"command\":\"printf ok\",\"timeout\":42}", .{});
-    defer parsed.deinit();
-
-    const args = try parseArgs(parsed.value);
+    var args = try parseArgs(std.testing.allocator, "{\"command\":\"printf ok\",\"timeout\":42}");
+    defer args.deinit();
 
     try std.testing.expectEqual(@as(u32, 42), args.timeout_seconds);
 }

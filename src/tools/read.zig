@@ -61,7 +61,7 @@ pub fn runTool(
     cwd: []const u8,
     arguments: []const u8,
 ) common.Error!common.Output {
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, arguments, .{}) catch {
+    const parsed = std.json.parseFromSlice(JsonArgs, gpa, arguments, .{ .ignore_unknown_fields = true }) catch {
         return common.fail(gpa, "read: invalid JSON arguments\n", 2);
     };
     defer parsed.deinit();
@@ -70,13 +70,16 @@ pub fn runTool(
     return read(gpa, io, cwd, args);
 }
 
+const JsonArgs = struct {
+    path: ?[]const u8 = null,
+};
+
 const ParseToolError = error{ MissingPath, BadPath, BadSelector };
 
-fn parseToolArgs(value: std.json.Value) ParseToolError!Args {
-    const path = value.object.get("path") orelse return ParseToolError.MissingPath;
-    if (path != .string) return ParseToolError.BadPath;
-    if (path.string.len == 0) return ParseToolError.MissingPath;
-    return parsePathSelector(path.string) catch return ParseToolError.BadSelector;
+fn parseToolArgs(value: JsonArgs) ParseToolError!Args {
+    const path = value.path orelse return ParseToolError.MissingPath;
+    if (path.len == 0) return ParseToolError.MissingPath;
+    return parsePathSelector(path) catch return ParseToolError.BadSelector;
 }
 
 fn parseToolError(gpa: std.mem.Allocator, err: ParseToolError) common.Error!common.Output {
@@ -89,7 +92,7 @@ fn parseToolError(gpa: std.mem.Allocator, err: ParseToolError) common.Error!comm
 }
 
 fn parsePathSelector(path: []const u8) ParseToolError!Args {
-    const colon = std.mem.lastIndexOfScalar(u8, path, ':') orelse return .{ .path = path };
+    const colon = std.mem.findScalarLast(u8, path, ':') orelse return .{ .path = path };
     const suffix = path[colon + 1 ..];
     if (suffix.len == 0) return .{ .path = path };
     if (std.mem.eql(u8, suffix, "raw")) return .{ .path = path[0..colon], .selector = .raw };
@@ -97,13 +100,13 @@ fn parsePathSelector(path: []const u8) ParseToolError!Args {
     if (!std.ascii.isDigit(suffix[0])) return .{ .path = path };
     if (path[0..colon].len == 0) return ParseToolError.BadSelector;
 
-    if (std.mem.indexOfScalar(u8, suffix, '-')) |dash| {
+    if (std.mem.findScalar(u8, suffix, '-')) |dash| {
         const start = try parsePositive(suffix[0..dash]);
         const end = try parsePositive(suffix[dash + 1 ..]);
         if (end < start) return ParseToolError.BadSelector;
         return .{ .path = path[0..colon], .selector = .{ .range_between = .{ .start = start, .end = end } } };
     }
-    if (std.mem.indexOfScalar(u8, suffix, '+')) |plus| {
+    if (std.mem.findScalar(u8, suffix, '+')) |plus| {
         const start = try parsePositive(suffix[0..plus]);
         const count = try parsePositiveAllowZero(suffix[plus + 1 ..]);
         return .{ .path = path[0..colon], .selector = .{ .range_count = .{ .start = start, .count = count } } };

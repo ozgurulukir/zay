@@ -510,7 +510,7 @@ const ModelSelection = struct {
 };
 
 fn parseModelSelection(gpa: std.mem.Allocator, raw: []const u8) !ModelSelection {
-    const slash = std.mem.indexOfScalar(u8, raw, '/') orelse return error.MissingSeparator;
+    const slash = std.mem.findScalar(u8, raw, '/') orelse return error.MissingSeparator;
     const provider_part = raw[0..slash];
     const model_part = raw[slash + 1 ..];
     if (provider_part.len == 0) return error.MissingProvider;

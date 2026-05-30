@@ -50,23 +50,25 @@ const ParseError = error{
     BadCursor,
 };
 
+const JsonArgs = struct {
+    query: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+};
+
 fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!search.Request {
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, arguments, .{}) catch return error.InvalidJson;
+    const parsed = std.json.parseFromSlice(JsonArgs, gpa, arguments, .{ .ignore_unknown_fields = true }) catch return error.InvalidJson;
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidJson;
 
-    const query_value = parsed.value.object.get("query") orelse return error.MissingQuery;
-    if (query_value != .string) return error.BadQuery;
-    if (query_value.string.len == 0) return error.MissingQuery;
+    const raw_query = parsed.value.query orelse return error.MissingQuery;
+    if (raw_query.len == 0) return error.MissingQuery;
 
-    const cursor = if (parsed.value.object.get("cursor")) |cursor_value| value: {
-        if (cursor_value != .string) return error.BadCursor;
-        if (cursor_value.string.len == 0) return error.BadCursor;
-        break :value gpa.dupe(u8, cursor_value.string) catch return error.InvalidJson;
+    const cursor = if (parsed.value.cursor) |raw_cursor| value: {
+        if (raw_cursor.len == 0) return error.BadCursor;
+        break :value gpa.dupe(u8, raw_cursor) catch return error.InvalidJson;
     } else null;
     errdefer if (cursor) |owned| gpa.free(owned);
 
-    const query = gpa.dupe(u8, query_value.string) catch return error.InvalidJson;
+    const query = gpa.dupe(u8, raw_query) catch return error.InvalidJson;
     return .{ .op = .find, .query = query, .cursor = cursor };
 }
 

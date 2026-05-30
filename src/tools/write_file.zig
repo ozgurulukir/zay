@@ -41,17 +41,20 @@ pub fn runTool(
     cwd: []const u8,
     arguments: []const u8,
 ) common.Error!common.Output {
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, arguments, .{}) catch {
+    const parsed = std.json.parseFromSlice(JsonArgs, gpa, arguments, .{ .ignore_unknown_fields = true }) catch {
         return common.fail(gpa, "write_file: invalid JSON arguments\n", 2);
     };
     defer parsed.deinit();
 
-    const path = parsed.value.object.get("path") orelse return common.fail(gpa, "write_file: missing required field `path`; call write_file with both `path` and `content`\n", 2);
-    const content = parsed.value.object.get("content") orelse return common.fail(gpa, "write_file: missing required field `content`; call write_file with both `path` and `content`\n", 2);
-    if (path != .string) return common.fail(gpa, "write_file: path must be a string\n", 2);
-    if (content != .string) return common.fail(gpa, "write_file: content must be a string\n", 2);
-    return write(gpa, io, cwd, path.string, content.string);
+    const path = parsed.value.path orelse return common.fail(gpa, "write_file: missing required field `path`; call write_file with both `path` and `content`\n", 2);
+    const content = parsed.value.content orelse return common.fail(gpa, "write_file: missing required field `content`; call write_file with both `path` and `content`\n", 2);
+    return write(gpa, io, cwd, path, content);
 }
+
+const JsonArgs = struct {
+    path: ?[]const u8 = null,
+    content: ?[]const u8 = null,
+};
 
 fn write(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, path: []const u8, content: []const u8) common.Error!common.Output {
     const absolute = common.joinPath(gpa, cwd, path) catch |err| return common.mapAllocError(err);

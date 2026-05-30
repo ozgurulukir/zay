@@ -33,7 +33,7 @@ const Record = union(enum) {
 /// have any number of new lines inserted before it; plus separate buckets
 /// for inserts at BOF and EOF.
 const Routing = struct {
-    by_line: std.AutoHashMap(u32, Bucket),
+    by_line: std.AutoHashMapUnmanaged(u32, Bucket),
     bof: std.ArrayList([]const u8),
     eof: std.ArrayList([]const u8),
 
@@ -45,7 +45,7 @@ const Routing = struct {
     fn deinit(self: *Routing, gpa: std.mem.Allocator) void {
         var it = self.by_line.valueIterator();
         while (it.next()) |bucket| bucket.inserts_before.deinit(gpa);
-        self.by_line.deinit();
+        self.by_line.deinit(gpa);
         self.bof.deinit(gpa);
         self.eof.deinit(gpa);
         self.* = undefined;
@@ -103,7 +103,7 @@ fn buildRouting(
     line_count: u32,
 ) !Routing {
     var routing: Routing = .{
-        .by_line = std.AutoHashMap(u32, Routing.Bucket).init(gpa),
+        .by_line = .empty,
         .bof = .empty,
         .eof = .empty,
     };
@@ -111,16 +111,16 @@ fn buildRouting(
 
     for (edits) |edit| {
         switch (edit) {
-            .delete => |d| try markDelete(&routing, d.anchor.line),
+            .delete => |d| try markDelete(gpa, &routing, d.anchor.line),
             .insert => |ins| try routeInsert(gpa, &routing, ins, line_count),
         }
     }
     return routing;
 }
 
-fn markDelete(routing: *Routing, line: u32) !void {
+fn markDelete(gpa: std.mem.Allocator, routing: *Routing, line: u32) !void {
     assert(line > 0);
-    const entry = try routing.by_line.getOrPut(line);
+    const entry = try routing.by_line.getOrPut(gpa, line);
     if (!entry.found_existing) entry.value_ptr.* = .{};
     entry.value_ptr.delete = true;
 }
@@ -158,7 +158,7 @@ fn appendInsertBefore(
     text: []const u8,
 ) !void {
     assert(line > 0);
-    const entry = try routing.by_line.getOrPut(line);
+    const entry = try routing.by_line.getOrPut(gpa, line);
     if (!entry.found_existing) entry.value_ptr.* = .{};
     try entry.value_ptr.inserts_before.append(gpa, text);
 }

@@ -54,10 +54,10 @@ fn failFmt(gpa: std.mem.Allocator, code: u8, comptime fmt: []const u8, args: any
 }
 
 test "registry contains every tool exactly once" {
-    var seen = std.StringHashMap(void).init(std.testing.allocator);
-    defer seen.deinit();
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(std.testing.allocator);
     for (registry) |tool| {
-        const gop = try seen.getOrPut(tool.name);
+        const gop = try seen.getOrPut(std.testing.allocator, tool.name);
         try std.testing.expect(!gop.found_existing);
     }
     try std.testing.expectEqual(@as(usize, 6), registry.len);

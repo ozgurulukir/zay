@@ -186,7 +186,7 @@ fn waitForAuthorizationCode(gpa: std.mem.Allocator, io: std.Io, state: []const u
 }
 
 fn parseCallbackTarget(gpa: std.mem.Allocator, target: []const u8, expected_state: []const u8) ![]u8 {
-    const question = std.mem.indexOfScalar(u8, target, '?') orelse return error.InvalidCallback;
+    const question = std.mem.findScalar(u8, target, '?') orelse return error.InvalidCallback;
     if (!std.mem.eql(u8, target[0..question], "/auth/callback")) return error.InvalidCallback;
     const query = target[question + 1 ..];
     const code = queryValue(query, "code") orelse return error.InvalidCallback;
@@ -267,22 +267,32 @@ fn readResponseBody(gpa: std.mem.Allocator, response: *std.http.Client.Response)
     return try out.toOwnedSlice();
 }
 
+const TokenResponse = struct {
+    access_token: []const u8,
+    refresh_token: []const u8,
+    expires_in: i64,
+};
+
 fn parseTokenResponse(gpa: std.mem.Allocator, io: std.Io, bytes: []const u8) !Credentials {
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, bytes, .{}) catch return error.InvalidCredentials;
+    const parsed = std.json.parseFromSlice(TokenResponse, gpa, bytes, .{ .ignore_unknown_fields = true }) catch return error.InvalidCredentials;
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidCredentials;
-    const access = stringField(parsed.value, "access_token") orelse return error.InvalidCredentials;
-    const refresh_token = stringField(parsed.value, "refresh_token") orelse return error.InvalidCredentials;
-    const expires_in = numberField(parsed.value, "expires_in") orelse return error.InvalidCredentials;
-    const account_id = try accountIdFromAccessToken(gpa, access);
+    const account_id = try accountIdFromAccessToken(gpa, parsed.value.access_token);
     errdefer gpa.free(account_id);
     return .{
-        .access = try gpa.dupe(u8, access),
-        .refresh = try gpa.dupe(u8, refresh_token),
+        .access = try gpa.dupe(u8, parsed.value.access_token),
+        .refresh = try gpa.dupe(u8, parsed.value.refresh_token),
         .account_id = account_id,
-        .expires = nowMs(io) + expires_in * 1000,
+        .expires = nowMs(io) + parsed.value.expires_in * 1000,
     };
 }
+
+const AccessTokenClaims = struct {
+    @"https://api.openai.com/auth": AccountClaim,
+};
+
+const AccountClaim = struct {
+    chatgpt_account_id: []const u8,
+};
 
 fn accountIdFromAccessToken(gpa: std.mem.Allocator, access: []const u8) ![]u8 {
     var parts = std.mem.splitScalar(u8, access, '.');
@@ -293,13 +303,9 @@ fn accountIdFromAccessToken(gpa: std.mem.Allocator, access: []const u8) ![]u8 {
     const decoded = try gpa.alloc(u8, size);
     defer gpa.free(decoded);
     try std.base64.url_safe_no_pad.Decoder.decode(decoded, payload);
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, decoded, .{}) catch return error.InvalidCredentials;
+    const parsed = std.json.parseFromSlice(AccessTokenClaims, gpa, decoded, .{ .ignore_unknown_fields = true }) catch return error.InvalidCredentials;
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidCredentials;
-    const claim = parsed.value.object.get(jwt_claim_path) orelse return error.InvalidCredentials;
-    if (claim != .object) return error.InvalidCredentials;
-    const account_id = stringField(claim, "chatgpt_account_id") orelse return error.InvalidCredentials;
-    return try gpa.dupe(u8, account_id);
+    return try gpa.dupe(u8, @field(parsed.value, jwt_claim_path).chatgpt_account_id);
 }
 
 fn save(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, credentials: Credentials) !void {
@@ -362,50 +368,36 @@ fn authPath(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
     return std.fs.path.join(gpa, &.{ home_dir, ".nova", "auth.json" });
 }
 
-fn parseAuthFile(gpa: std.mem.Allocator, bytes: []const u8) !?Credentials {
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const provider = parsed.value.object.get("openaiCodex") orelse return null;
-    if (provider != .object) return null;
-    return try credentialsFromValue(gpa, provider);
-}
+const AuthFile = struct {
+    openaiCodex: ?CredentialsJson = null,
+};
 
-fn credentialsFromValue(gpa: std.mem.Allocator, value: std.json.Value) !Credentials {
-    const access = stringField(value, "access") orelse return error.InvalidCredentials;
-    const refresh_token = stringField(value, "refresh") orelse return error.InvalidCredentials;
-    const account_id = stringField(value, "accountId") orelse return error.InvalidCredentials;
-    const expires = numberField(value, "expires") orelse return error.InvalidCredentials;
+const CredentialsJson = struct {
+    access: []const u8,
+    refresh: []const u8,
+    accountId: []const u8,
+    expires: i64,
+};
+
+fn parseAuthFile(gpa: std.mem.Allocator, bytes: []const u8) !?Credentials {
+    const parsed = std.json.parseFromSlice(AuthFile, gpa, bytes, .{ .ignore_unknown_fields = true }) catch return error.InvalidCredentials;
+    defer parsed.deinit();
+    const provider = parsed.value.openaiCodex orelse return null;
     return .{
-        .access = try gpa.dupe(u8, access),
-        .refresh = try gpa.dupe(u8, refresh_token),
-        .account_id = try gpa.dupe(u8, account_id),
-        .expires = expires,
+        .access = try gpa.dupe(u8, provider.access),
+        .refresh = try gpa.dupe(u8, provider.refresh),
+        .account_id = try gpa.dupe(u8, provider.accountId),
+        .expires = provider.expires,
     };
 }
 
 fn queryValue(query: []const u8, name: []const u8) ?[]const u8 {
     var parts = std.mem.splitScalar(u8, query, '&');
     while (parts.next()) |part| {
-        const equals = std.mem.indexOfScalar(u8, part, '=') orelse continue;
+        const equals = std.mem.findScalar(u8, part, '=') orelse continue;
         if (std.mem.eql(u8, part[0..equals], name)) return part[equals + 1 ..];
     }
     return null;
-}
-
-fn stringField(value: std.json.Value, name: []const u8) ?[]const u8 {
-    const field = value.object.get(name) orelse return null;
-    if (field != .string) return null;
-    return field.string;
-}
-
-fn numberField(value: std.json.Value, name: []const u8) ?i64 {
-    const field = value.object.get(name) orelse return null;
-    return switch (field) {
-        .integer => |integer| @intCast(integer),
-        .float => |float| @intFromFloat(float),
-        else => null,
-    };
 }
 
 fn base64Url(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {

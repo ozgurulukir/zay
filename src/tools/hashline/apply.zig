@@ -128,7 +128,7 @@ fn applyValidated(
     defer bof_inserts.deinit(gpa);
     var eof_inserts: std.ArrayList([]const u8) = .empty;
     defer eof_inserts.deinit(gpa);
-    var by_line: std.AutoHashMap(u32, Bucket) = .init(gpa);
+    var by_line: std.AutoHashMapUnmanaged(u32, Bucket) = .empty;
     defer freeBuckets(gpa, &by_line);
 
     for (edits) |edit| try routeEdit(gpa, edit, &bof_inserts, &eof_inserts, &by_line, lines.items.len);
@@ -149,12 +149,12 @@ fn routeEdit(
     edit: parse.Edit,
     bof: *std.ArrayList([]const u8),
     eof: *std.ArrayList([]const u8),
-    by_line: *std.AutoHashMap(u32, Bucket),
+    by_line: *std.AutoHashMapUnmanaged(u32, Bucket),
     file_line_count: usize,
 ) Error!void {
     switch (edit) {
         .delete => |d| {
-            const entry = try by_line.getOrPut(d.anchor.line);
+            const entry = try by_line.getOrPut(gpa, d.anchor.line);
             if (!entry.found_existing) entry.value_ptr.* = .{};
             entry.value_ptr.delete = true;
         },
@@ -181,25 +181,25 @@ fn routeEdit(
 
 fn appendToBucket(
     gpa: std.mem.Allocator,
-    by_line: *std.AutoHashMap(u32, Bucket),
+    by_line: *std.AutoHashMapUnmanaged(u32, Bucket),
     line: u32,
     text: []const u8,
 ) Error!void {
-    const entry = try by_line.getOrPut(line);
+    const entry = try by_line.getOrPut(gpa, line);
     if (!entry.found_existing) entry.value_ptr.* = .{};
     try entry.value_ptr.inserts_before.append(gpa, text);
 }
 
-fn freeBuckets(gpa: std.mem.Allocator, by_line: *std.AutoHashMap(u32, Bucket)) void {
+fn freeBuckets(gpa: std.mem.Allocator, by_line: *std.AutoHashMapUnmanaged(u32, Bucket)) void {
     var it = by_line.iterator();
     while (it.next()) |entry| entry.value_ptr.inserts_before.deinit(gpa);
-    by_line.deinit();
+    by_line.deinit(gpa);
 }
 
 fn applyAnchorBuckets(
     gpa: std.mem.Allocator,
     lines: *std.ArrayList([]const u8),
-    by_line: *std.AutoHashMap(u32, Bucket),
+    by_line: *std.AutoHashMapUnmanaged(u32, Bucket),
     first_changed: *?u32,
 ) Error!void {
     var sorted: std.ArrayList(u32) = .empty;

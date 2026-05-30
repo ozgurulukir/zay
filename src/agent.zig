@@ -502,12 +502,14 @@ pub const Agent = struct {
 /// this to detect whether the streaming bash JSON is complete enough to
 /// surface a meaningful title — for partial JSON we hold the title back.
 pub fn parseCommand(gpa: std.mem.Allocator, arguments: []const u8) ![]u8 {
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, arguments, .{});
+    const JsonArgs = struct {
+        command: ?[]const u8 = null,
+    };
+    const parsed = std.json.parseFromSlice(JsonArgs, gpa, arguments, .{ .ignore_unknown_fields = true }) catch return error.InvalidToolArguments;
     defer parsed.deinit();
 
-    const command = parsed.value.object.get("command") orelse return error.InvalidToolArguments;
-    if (command != .string) return error.InvalidToolArguments;
-    return try gpa.dupe(u8, command.string);
+    const command = parsed.value.command orelse return error.InvalidToolArguments;
+    return try gpa.dupe(u8, command);
 }
 
 /// Render a friendly title for a tool call by delegating to the registered
