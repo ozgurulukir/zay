@@ -563,12 +563,16 @@ fn parseDeltaObject(
     while (try nextObjectKey(scanner)) |key| {
         if (std.mem.eql(u8, key, "content")) {
             const before: u32 = @intCast(content.items.len);
-            try appendStringValue(scanner, gpa, content);
-            if (content.items.len > before) change.content_start = before;
+            const appended = try appendStringValueOrNull(scanner, gpa, content);
+            if (appended) {
+                if (content.items.len > before) change.content_start = before;
+            }
         } else if (std.mem.eql(u8, key, "reasoning") or std.mem.eql(u8, key, "reasoning_content")) {
             const before: u32 = @intCast(reasoning.items.len);
-            try appendStringValue(scanner, gpa, reasoning);
-            if (reasoning.items.len > before) change.reasoning_start = before;
+            const appended = try appendStringValueOrNull(scanner, gpa, reasoning);
+            if (appended) {
+                if (reasoning.items.len > before) change.reasoning_start = before;
+            }
         } else if (std.mem.eql(u8, key, "tool_calls")) {
             try parseToolCallsArray(gpa, scanner, builders, change);
         } else {
@@ -684,12 +688,18 @@ fn nextInteger(scanner: *Scanner) !i64 {
 }
 
 fn appendStringValue(scanner: *Scanner, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) !void {
+    const appended = try appendStringValueOrNull(scanner, gpa, list);
+    if (!appended) return error.UnexpectedToken;
+}
+
+fn appendStringValueOrNull(scanner: *Scanner, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) !bool {
     while (true) {
         const token = try scanner.next();
         switch (token) {
+            .null => return false,
             .string => |s| {
                 try list.appendSlice(gpa, s);
-                return;
+                return true;
             },
             .partial_string => |s| try list.appendSlice(gpa, s),
             .partial_string_escaped_1 => |bytes| try list.appendSlice(gpa, &bytes),
@@ -760,6 +770,29 @@ test "readStream accepts an SSE line larger than the transfer buffer" {
     var response = try readStream(gpa, &reader, ai.StreamObserver.noop, &tool_call_seq);
     defer response.deinit(gpa);
     try std.testing.expectEqual(@as(usize, transfer_buffer_bytes + 512), response.assistant.content[0].text.text.len);
+}
+
+test "parse streaming content tolerates null prelude" {
+    const gpa = std.testing.allocator;
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
+    var builders: std.ArrayList(ToolCallBuilder) = .empty;
+    defer {
+        for (builders.items) |*builder| {
+            builder.deinit(gpa);
+        }
+        builders.deinit(gpa);
+    }
+
+    const change = try parseStreamChunk(gpa,
+        \\{"choices":[{"finish_reason":null,"index":0,"delta":{"role":"assistant","content":null}}]}
+    , &content, &reasoning, &builders);
+
+    try std.testing.expect(change.empty());
+    try std.testing.expectEqual(@as(usize, 0), content.items.len);
+    try std.testing.expectEqual(@as(usize, 0), reasoning.items.len);
 }
 
 test "parse streaming tool deltas as they arrive" {

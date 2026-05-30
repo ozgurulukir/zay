@@ -931,8 +931,8 @@ pub const App = struct {
 
     fn compatibleBaseUrl(self: *const App, provider: config_mod.Provider) ?[]const u8 {
         if (self.cached_config.base_url) |base_url| {
-            const cached_provider = self.cached_config.provider orelse tui_provider.compatibleProviderFromBaseUrl(base_url);
-            if (cached_provider == provider) return base_url;
+            const url_provider = tui_provider.compatibleProviderFromBaseUrl(base_url);
+            if (url_provider == provider) return base_url;
         }
         return provider.defaultBaseUrl();
     }
@@ -2608,6 +2608,23 @@ test "provider picker selects sign out horizontally" {
     try std.testing.expectEqual(provider_picker.Column.sign_out, app.provider_picker.column);
     try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.tab }));
     try std.testing.expectEqual(provider_picker.Column.provider, app.provider_picker.column);
+}
+
+test "compatible base url falls back when cached local provider differs" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.cached_config.provider = .llama_cpp;
+    app.cached_config.base_url = @constCast("http://localhost:11434");
+
+    try std.testing.expectEqualStrings("http://localhost:8080", app.compatibleBaseUrl(.llama_cpp).?);
+    try std.testing.expectEqualStrings("http://localhost:11434", app.compatibleBaseUrl(.ollama).?);
 }
 
 test "codex sign-in survives selecting local compatible provider" {
