@@ -9,7 +9,6 @@ TODOs and ideas for features to add to Nova coding agent.
 - MCP (special via some kind of executor)
 - Subagents
 - Support AGENTS.md
-- Support steering messages (sent as either a subagent call alongisde the conversation so far which then consolidates back into the main thread OR just sent to the model after the tool call response)
 - Wire ability to add images to input in the UI
 - improve logger and make it more useful
 - add docs on `.nova/auth.json`
