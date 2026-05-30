@@ -49,6 +49,7 @@ pub const ThreadProjection = struct {
             .delta_end => return self.takePendingRedraw(),
             .tool_call_finished => |tool| return try self.applyToolFinished(gpa, thread, tool),
             .tool_batch_finished => return try self.applyToolBatchFinished(gpa, thread),
+            .queued_messages_flushed => return false,
             .turn_failed => |message| return try self.applyTurnFailed(gpa, thread, message),
             .turn_finished => return try self.applyTurnFinished(gpa, thread),
         }

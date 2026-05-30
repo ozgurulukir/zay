@@ -1,10 +1,15 @@
 const std = @import("std");
 
+const bounded_queue = @import("bounded_queue");
 const agent_mod = @import("../agent.zig");
+
+const event_queue_capacity: u32 = 4096;
+const EventQueueStorage = bounded_queue.BoundedQueue(*agent_mod.Agent.Event);
 
 pub const EventQueue = struct {
     mutex: std.Io.Mutex = .init,
-    items: std.ArrayList(*agent_mod.Agent.Event) = .empty,
+    event_queue: EventQueueStorage = .{},
+    storage: [event_queue_capacity]*agent_mod.Agent.Event = undefined,
 
     pub fn push(
         self: *EventQueue,
@@ -12,9 +17,10 @@ pub const EventQueue = struct {
         gpa: std.mem.Allocator,
         event: *agent_mod.Agent.Event,
     ) !void {
+        _ = gpa;
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
-        try self.items.append(gpa, event);
+        if (!self.event_queue.push(&self.storage, event)) return error.QueueFull;
     }
 
     pub fn drainInto(
@@ -25,18 +31,18 @@ pub const EventQueue = struct {
     ) !void {
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
-        try sink.appendSlice(gpa, self.items.items);
-        self.items.clearRetainingCapacity();
+        while (self.event_queue.pop(&self.storage)) |event| {
+            try sink.append(gpa, event);
+        }
     }
 
     pub fn deinit(self: *EventQueue, io: std.Io, gpa: std.mem.Allocator) void {
         self.mutex.lock(io) catch return;
         defer self.mutex.unlock(io);
-        for (self.items.items) |event_ptr| {
+        while (self.event_queue.pop(&self.storage)) |event_ptr| {
             event_ptr.deinit(gpa);
             gpa.destroy(event_ptr);
         }
-        self.items.deinit(gpa);
     }
 };
 

@@ -1,11 +1,19 @@
 const std = @import("std");
 
 const ai = @import("ai.zig");
+const bounded_queue = @import("bounded_queue");
 const executor_mod = @import("executor.zig");
 const session_mod = @import("session.zig");
 const tools = @import("tools.zig");
 
 const assert = std.debug.assert;
+const message_queue_capacity: u32 = 64;
+
+const QueuedUserMessage = struct {
+    message: ai.ChatMessage,
+};
+
+const MessageQueue = bounded_queue.BoundedQueue(QueuedUserMessage);
 
 pub const Agent = struct {
     gpa: std.mem.Allocator,
@@ -14,6 +22,9 @@ pub const Agent = struct {
     client: ai.LanguageModel,
     session_writer: ?*session_mod.SessionWriter = null,
     messages: std.ArrayList(ai.ChatMessage) = .empty,
+    message_queue: MessageQueue = .{},
+    message_queue_storage: [message_queue_capacity]QueuedUserMessage = undefined,
+    message_queue_mutex: std.atomic.Mutex = .unlocked,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, client: ai.LanguageModel) Agent {
         return .{
@@ -37,11 +48,26 @@ pub const Agent = struct {
             message.deinit(self.gpa);
         }
         self.messages.deinit(self.gpa);
+        self.lockMessageQueue();
+        while (self.message_queue.pop(&self.message_queue_storage)) |queued| {
+            var owned = queued;
+            owned.message.deinit(self.gpa);
+        }
+        self.message_queue_mutex.unlock();
         self.* = undefined;
     }
 
     pub fn addUser(self: *Agent, content: []const u8) !void {
         try self.appendMessage(.user, content);
+    }
+
+    pub fn enqueueUser(self: *Agent, content: []const u8) !void {
+        assert(content.len > 0);
+        var message = try self.makeTextMessage(.user, content);
+        errdefer message.deinit(self.gpa);
+        self.lockMessageQueue();
+        defer self.message_queue_mutex.unlock();
+        if (!self.message_queue.push(&self.message_queue_storage, .{ .message = message })) return error.QueueFull;
     }
 
     pub fn addUserBlocks(self: *Agent, blocks: []const ai.ContentBlock) !void {
@@ -75,6 +101,7 @@ pub const Agent = struct {
         delta_end,
         tool_call_finished: ToolCallFinished,
         tool_batch_finished,
+        queued_messages_flushed: u32,
         turn_finished,
         turn_failed: []const u8,
 
@@ -102,7 +129,7 @@ pub const Agent = struct {
                     gpa.free(tool.display_body);
                     if (tool.stderr) |stderr| gpa.free(stderr);
                 },
-                .turn_started, .delta_end, .tool_batch_finished, .turn_finished => {},
+                .turn_started, .delta_end, .tool_batch_finished, .queued_messages_flushed, .turn_finished => {},
             }
             self.* = undefined;
         }
@@ -158,8 +185,17 @@ pub const Agent = struct {
                 turn_owned = false;
             }
 
-            if (tool_calls.len == 0) return;
+            if (tool_calls.len == 0) {
+                const drained_count = try self.drainQueuedUserMessage();
+                if (drained_count > 0) {
+                    try listener.emit(.{ .queued_messages_flushed = drained_count });
+                    continue;
+                }
+                return;
+            }
             try self.runToolBatch(tool_calls, &stream_context, listener);
+            const drained_count = try self.drainQueuedUserMessage();
+            if (drained_count > 0) try listener.emit(.{ .queued_messages_flushed = drained_count });
         }
         return error.ToolCallLimit;
     }
@@ -369,12 +405,40 @@ pub const Agent = struct {
     }
 
     fn appendMessage(self: *Agent, role: ai.Role, content: []const u8) !void {
+        var message = try self.makeTextMessage(role, content);
+        errdefer message.deinit(self.gpa);
+        try self.messages.append(self.gpa, message);
+        try self.persistLastMessage();
+    }
+
+    fn makeTextMessage(self: *Agent, role: ai.Role, content: []const u8) !ai.ChatMessage {
+        assert(content.len > 0);
         const blocks = try self.gpa.alloc(ai.ContentBlock, 1);
         errdefer self.gpa.free(blocks);
         blocks[0] = .{ .text = .{ .text = try self.gpa.dupe(u8, content) } };
         errdefer blocks[0].deinit(self.gpa);
-        try self.messages.append(self.gpa, .{ .role = role, .content = blocks });
+        return .{ .role = role, .content = blocks };
+    }
+
+    fn drainQueuedUserMessage(self: *Agent) !u32 {
+        var message = self.takeQueuedUserMessage() orelse return 0;
+        errdefer message.deinit(self.gpa);
+        try self.messages.append(self.gpa, message);
         try self.persistLastMessage();
+        return 1;
+    }
+
+    fn takeQueuedUserMessage(self: *Agent) ?ai.ChatMessage {
+        self.lockMessageQueue();
+        defer self.message_queue_mutex.unlock();
+        const queued = self.message_queue.pop(&self.message_queue_storage) orelse return null;
+        return queued.message;
+    }
+
+    fn lockMessageQueue(self: *Agent) void {
+        while (!self.message_queue_mutex.tryLock()) {
+            std.Thread.yield() catch {};
+        }
     }
 
     fn takeAssistantMessage(self: *Agent, assistant: *ai.ChatMessage) !void {
@@ -515,4 +579,31 @@ test "streaming callbacks emit owned events" {
     try std.testing.expectEqual(.delta_end, seen.events.items[3]);
     try std.testing.expect(context.toolDeltaSeen(1));
     try std.testing.expect(!context.toolDeltaSeen(0));
+}
+
+test "queued user messages wait for completed assistant turn" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    try agent.addUser("first");
+    try agent.enqueueUser("queued");
+
+    try std.testing.expectEqual(@as(u32, 1), try agent.drainQueuedUserMessage());
+    try std.testing.expectEqual(@as(usize, 2), agent.messages.items.len);
+    try std.testing.expectEqualStrings("queued", agent.messages.items[1].text());
+}
+
+test "queued user messages drain one at a time" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    try agent.enqueueUser("first");
+    try agent.enqueueUser("second");
+
+    try std.testing.expectEqual(@as(u32, 1), try agent.drainQueuedUserMessage());
+    try std.testing.expectEqual(@as(usize, 1), agent.messages.items.len);
+    try std.testing.expectEqual(@as(u32, 1), agent.message_queue.len());
+    try std.testing.expectEqualStrings("first", agent.messages.items[0].text());
 }

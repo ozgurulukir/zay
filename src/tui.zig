@@ -106,6 +106,7 @@ pub const App = struct {
     /// for the current active model. Reset on sign-in/sign-out.
     models_cached: bool = false,
     pending_quit_at: ?std.Io.Timestamp = null,
+    queued_user_messages: std.ArrayList([]const u8) = .empty,
     turn_discarded: bool = false,
 
     pub const ctrl_c_double_press_ms: u32 = 1500;
@@ -183,6 +184,8 @@ pub const App = struct {
             }
         }
         self.worker_context.queue.deinit(self.worker_context.io, self.worker_context.gpa);
+        self.clearQueuedUserMessages();
+        self.queued_user_messages.deinit(self.gpa);
         self.thread_projection.deinit(self.gpa);
         self.thread.deinit(self.gpa);
         self.input.deinit();
@@ -233,7 +236,7 @@ pub const App = struct {
     }
 
     pub fn beginSubmit(self: *App) !?u32 {
-        if (self.in_flight) return null;
+        if (self.in_flight) return try self.enqueueSubmit();
         // If a previous turn was Esc-interrupted, force-cancel its worker
         // before starting a new one. Two concurrent workers would race on
         // the shared agent message history.
@@ -322,10 +325,25 @@ pub const App = struct {
     }
 
     pub fn applyAgentEvent(self: *App, event: agent_mod.Agent.Event) !bool {
-        const visible_change = try self.thread_projection.apply(self.gpa, &self.thread, event);
-        if (event == .turn_finished) {
-            self.in_flight = false;
-            self.awaitTurn();
+        var visible_change = try self.thread_projection.apply(self.gpa, &self.thread, event);
+        switch (event) {
+            .queued_messages_flushed => |count| {
+                if (count > 0) {
+                    if (self.queued_user_messages.items.len > 0) {
+                        try self.flushQueuedUserMessagesToThread(count);
+                        visible_change = true;
+                    }
+                }
+            },
+            .turn_finished => {
+                self.in_flight = false;
+                self.awaitTurn();
+                if (self.queued_user_messages.items.len > 0) {
+                    self.clearQueuedUserMessages();
+                    visible_change = true;
+                }
+            },
+            else => {},
         }
         return visible_change;
     }
@@ -1056,6 +1074,50 @@ pub const App = struct {
     fn clearInput(self: *App) void {
         self.input.clearRetainingCapacity();
         self.resetInputChangeTracking();
+    }
+
+    fn enqueueSubmit(self: *App) !?u32 {
+        const prompt = try self.input.buf.dupe();
+        errdefer self.gpa.free(prompt);
+        if (prompt.len == 0) {
+            self.gpa.free(prompt);
+            return null;
+        }
+        self.agent.enqueueUser(prompt) catch |err| switch (err) {
+            error.QueueFull => {
+                self.gpa.free(prompt);
+                try self.appendMessageQueueFullNotice();
+                return null;
+            },
+            else => return err,
+        };
+        try self.queued_user_messages.append(self.gpa, prompt);
+        self.clearInput();
+        return null;
+    }
+
+    fn appendMessageQueueFullNotice(self: *App) !void {
+        const had_loading = self.thread_projection.loading_index != null;
+        self.thread_projection.removeLoading(self.gpa, &self.thread);
+        _ = try self.thread.append(self.gpa, .notice, "notice", "MessageQueueFull");
+        if (had_loading) try self.appendLoading();
+    }
+
+    fn flushQueuedUserMessagesToThread(self: *App, count: u32) !void {
+        self.thread_projection.removeLoading(self.gpa, &self.thread);
+        const flush_count: usize = @min(count, self.queued_user_messages.items.len);
+        for (self.queued_user_messages.items[0..flush_count]) |message| {
+            _ = try self.thread.append(self.gpa, .user, "you", message);
+            self.gpa.free(message);
+        }
+        std.mem.copyForwards([]const u8, self.queued_user_messages.items[0 .. self.queued_user_messages.items.len - flush_count], self.queued_user_messages.items[flush_count..]);
+        self.queued_user_messages.shrinkRetainingCapacity(self.queued_user_messages.items.len - flush_count);
+        try self.appendLoading();
+    }
+
+    fn clearQueuedUserMessages(self: *App) void {
+        for (self.queued_user_messages.items) |message| self.gpa.free(message);
+        self.queued_user_messages.clearRetainingCapacity();
     }
 
     fn resetInputChangeTracking(self: *App) void {
@@ -2001,16 +2063,27 @@ const InputWidget = struct {
 
         if (height <= 3) return try self.drawInputBorder(ctx, max_width, height);
 
-        const show_branch = height > 4;
-        const show_hint = height > 5;
-        const children_count: usize = 3 + @as(usize, if (show_branch) 1 else 0) + @as(usize, if (show_hint) 1 else 0);
+        const queued_visible = self.app.queued_user_messages.items.len > 0;
+        const input_row: u16 = if (queued_visible) 1 else 0;
+        const show_branch = if (queued_visible) height > 5 else height > 4;
+        const show_hint = if (queued_visible) height > 6 else height > 5;
+        const children_count: usize = 3 + @as(usize, if (show_branch) 1 else 0) + @as(usize, if (show_hint) 1 else 0) + @as(usize, if (queued_visible) 1 else 0);
         const children = try ctx.arena.alloc(vxfw.SubSurface, children_count);
-        children[0] = .{
-            .origin = .{ .row = 0, .col = 0 },
+        var child_index: usize = 0;
+        if (queued_visible) {
+            children[child_index] = .{
+                .origin = .{ .row = 0, .col = 1 },
+                .surface = try self.drawQueuedMessage(ctx, max_width -| 2),
+                .z_index = 0,
+            };
+            child_index += 1;
+        }
+        children[child_index] = .{
+            .origin = .{ .row = input_row, .col = 0 },
             .surface = try self.drawInputBorder(ctx, max_width, 3),
             .z_index = 0,
         };
-        try self.drawInputStatus(ctx, children, max_width, .{ .branch = show_branch, .hint = show_hint });
+        try self.drawInputStatus(ctx, children[child_index + 1 ..], max_width, input_row, .{ .branch = show_branch, .hint = show_hint });
         return .{
             .size = .{ .width = max_width, .height = height },
             .widget = self.widget(),
@@ -2042,7 +2115,15 @@ const InputWidget = struct {
 
     const StatusRows = struct { branch: bool, hint: bool };
 
-    fn drawInputStatus(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, max_width: u16, rows: StatusRows) std.mem.Allocator.Error!void {
+    fn drawQueuedMessage(self: *InputWidget, ctx: vxfw.DrawContext, width: u16) std.mem.Allocator.Error!vxfw.Surface {
+        const last = self.app.queued_user_messages.items[self.app.queued_user_messages.items.len - 1];
+        const prefix = if (self.app.queued_user_messages.items.len == 1) "[...] " else "[...] + ";
+        const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, last });
+        var queued_text: vxfw.Text = .{ .text = text, .style = .{ .fg = StylePalette.thinking_body.fg, .dim = true }, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
+        return queued_text.widget().draw(ctx.withConstraints(.{ .width = width, .height = 1 }, .{ .width = width, .height = 1 }));
+    }
+
+    fn drawInputStatus(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, max_width: u16, row_offset: u16, rows: StatusRows) std.mem.Allocator.Error!void {
         const cwd_raw = if (self.app.runtime) |runtime| runtime.cwd else self.app.agent.cwd;
         const home_dir = if (self.app.runtime) |runtime| runtime.home_dir else "";
         const cwd = try tui_status.formatCwdRelative(ctx.arena, cwd_raw, home_dir);
@@ -2060,6 +2141,7 @@ const InputWidget = struct {
             .inner_width = status_inner_width,
             .cwd_width = cwd_width,
             .model_width = model_width,
+            .row_offset = row_offset,
             .show_branch = rows.branch,
             .show_hint = rows.hint,
         });
@@ -2070,6 +2152,7 @@ const InputWidget = struct {
         inner_width: u16,
         cwd_width: u16,
         model_width: u16,
+        row_offset: u16,
         show_branch: bool,
         show_hint: bool,
     };
@@ -2077,8 +2160,8 @@ const InputWidget = struct {
     fn drawInputStatusRow(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, cwd: []const u8, status_text: []const u8, layout: StatusLayout) std.mem.Allocator.Error!void {
         var cwd_text: vxfw.Text = .{ .text = cwd, .style = StylePalette.cwd, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
         var model_text: vxfw.Text = .{ .text = status_text, .style = StylePalette.model_status, .text_align = .right, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
-        const status_row = @as(u16, 3);
-        var child_index: usize = 1;
+        const status_row = @as(u16, 3) + layout.row_offset;
+        var child_index: usize = 0;
         children[child_index] = .{
             .origin = .{ .row = status_row, .col = layout.padding_x },
             .surface = try cwd_text.widget().draw(ctx.withConstraints(.{ .width = layout.cwd_width, .height = 1 }, .{ .width = layout.cwd_width, .height = 1 })),
@@ -2341,6 +2424,57 @@ test "begin submit clears input and appends loading row before agent turn" {
     try std.testing.expect(isLoadingWord(app.thread.messages.items[loading_index].title));
     try std.testing.expectEqual(@as(u16, 2), messageRows(app.thread.messages.items[loading_index], 80));
     try std.testing.expectEqual(@as(u32, 0), app.thread.selected.?);
+}
+
+test "begin submit queues while turn is in flight" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.in_flight = true;
+
+    try app.input.insertSliceAtCursor("later");
+    try std.testing.expectEqual(@as(?u32, null), try app.beginSubmit());
+
+    try std.testing.expectEqual(@as(usize, 1), app.queued_user_messages.items.len);
+    try std.testing.expectEqualStrings("later", app.queued_user_messages.items[0]);
+    try std.testing.expectEqual(@as(u32, 1), agent.message_queue.len());
+    try std.testing.expectEqual(@as(usize, 0), app.input.buf.firstHalf().len);
+    try std.testing.expect(try app.applyAgentEvent(.{ .queued_messages_flushed = 1 }));
+    try std.testing.expectEqual(@as(usize, 0), app.queued_user_messages.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
+    try std.testing.expectEqualStrings("later", app.thread.messages.items[0].body);
+    try std.testing.expectEqual(.status, app.thread.messages.items[1].kind);
+}
+
+test "begin submit shows notice when queued message queue is full" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.in_flight = true;
+    try app.appendLoading();
+
+    var queued_count: usize = 0;
+    while (queued_count < agent.message_queue_storage.len) : (queued_count += 1) {
+        try agent.enqueueUser("queued");
+    }
+
+    try app.input.insertSliceAtCursor("later");
+    try std.testing.expectEqual(@as(?u32, null), try app.beginSubmit());
+
+    try std.testing.expectEqual(@as(usize, 0), app.queued_user_messages.items.len);
+    try std.testing.expectEqual(@as(u32, @intCast(agent.message_queue_storage.len)), agent.message_queue.len());
+    try std.testing.expectEqualStrings("later", app.input.buf.firstHalf());
+    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
+    try std.testing.expectEqual(.notice, app.thread.messages.items[0].kind);
+    try std.testing.expectEqualStrings("MessageQueueFull", app.thread.messages.items[0].body);
+    try std.testing.expectEqual(.status, app.thread.messages.items[1].kind);
 }
 
 test "opening model picker starts at top" {
