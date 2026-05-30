@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const bounded_queue = @import("bounded_queue");
 const ai = @import("ai.zig");
 const db = @import("db.zig");
 
@@ -9,6 +10,7 @@ const schema_version: u32 = 1;
 const entry_id_len: u32 = 8;
 const session_id_len: u32 = 32;
 const default_db_relative_path = ".nova/sessions.sqlite";
+const EntryQueue = bounded_queue.BoundedQueue(QueuedEntry);
 
 pub const Error = db.Error || error{
     BadSessionId,
@@ -340,8 +342,7 @@ pub const SessionWriter = struct {
     session: Session,
     mutex: std.atomic.Mutex = .unlocked,
     queue: []QueuedEntry,
-    head: u32 = 0,
-    count: u32 = 0,
+    entry_queue: EntryQueue = .{},
     stopping: bool = false,
     title_written: bool = false,
     thread: ?std.Thread = null,
@@ -395,10 +396,9 @@ pub const SessionWriter = struct {
         self.stopping = true;
         self.mutex.unlock();
         if (self.thread) |thread| thread.join();
-        var index: u32 = 0;
-        while (index < self.count) : (index += 1) {
-            const queue_index = (self.head + index) % @as(u32, @intCast(self.queue.len));
-            self.queue[queue_index].deinit(self.gpa);
+        while (self.entry_queue.pop(self.queue)) |entry| {
+            var owned = entry;
+            owned.deinit(self.gpa);
         }
         self.gpa.free(self.queue);
         self.manager.deinit();
@@ -422,10 +422,7 @@ pub const SessionWriter = struct {
     fn enqueue(self: *SessionWriter, entry: QueuedEntry) Error!void {
         while (true) {
             lockWriter(self);
-            if (self.count < self.queue.len) {
-                const tail = (self.head + self.count) % @as(u32, @intCast(self.queue.len));
-                self.queue[tail] = entry;
-                self.count += 1;
+            if (self.entry_queue.push(self.queue, entry)) {
                 self.mutex.unlock();
                 return;
             }
@@ -457,7 +454,7 @@ fn runWriter(writer: *SessionWriter) void {
             writeQueuedEntry(writer, &owned) catch continue;
         } else {
             lockWriter(writer);
-            const done = writer.stopping and writer.count == 0;
+            const done = writer.stopping and writer.entry_queue.empty();
             writer.mutex.unlock();
             if (done) return;
             std.Thread.yield() catch {};
@@ -488,11 +485,7 @@ fn writeQueuedEntry(writer: *SessionWriter, entry: *const QueuedEntry) Error!voi
 fn takeQueuedEntry(writer: *SessionWriter) ?QueuedEntry {
     lockWriter(writer);
     defer writer.mutex.unlock();
-    if (writer.count == 0) return null;
-    const entry = writer.queue[writer.head];
-    writer.head = (writer.head + 1) % @as(u32, @intCast(writer.queue.len));
-    writer.count -= 1;
-    return entry;
+    return writer.entry_queue.pop(writer.queue);
 }
 
 fn lockWriter(writer: *SessionWriter) void {

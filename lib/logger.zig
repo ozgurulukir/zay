@@ -1,5 +1,7 @@
 const std = @import("std");
+const bounded_queue = @import("bounded_queue");
 
+const assert = std.debug.assert;
 const entry_count_max: u32 = 256;
 const entry_bytes_max: u32 = 16 * 1024;
 
@@ -8,15 +10,16 @@ const Entry = struct {
     len: u32 = 0,
 };
 
+const EntryQueue = bounded_queue.BoundedQueue(Entry);
+
 const State = struct {
     mutex: std.atomic.Mutex = .unlocked,
     io: std.Io = undefined,
     enabled: bool = false,
     stopping: bool = false,
     dropped: u64 = 0,
-    head: u32 = 0,
-    count: u32 = 0,
     entries: [entry_count_max]Entry = undefined,
+    entry_queue: EntryQueue = .{},
     thread: ?std.Thread = null,
     path: [1024]u8 = undefined,
     path_len: u32 = 0,
@@ -46,12 +49,11 @@ pub fn log(comptime fmt: []const u8, args: anytype) void {
     lock();
     defer state.mutex.unlock();
     if (!state.enabled) return;
-    if (state.count >= entry_count_max) {
+    if (state.entry_queue.full(&state.entries)) {
         state.dropped += 1;
         return;
     }
-    const index = (state.head + state.count) % entry_count_max;
-    var entry = &state.entries[index];
+    var entry: Entry = .{};
     const message = std.fmt.bufPrint(&entry.bytes, fmt, args) catch |err| blk: {
         if (err == error.NoSpaceLeft) {
             const fallback = std.fmt.bufPrint(&entry.bytes, "logger entry too large: {s}", .{fmt}) catch "logger entry too large";
@@ -61,7 +63,8 @@ pub fn log(comptime fmt: []const u8, args: anytype) void {
         break :blk fallback;
     };
     entry.len = @intCast(message.len);
-    state.count += 1;
+    const pushed = state.entry_queue.push(&state.entries, entry);
+    assert(pushed);
 }
 
 pub fn deinit() void {
@@ -102,10 +105,8 @@ fn writerThread() void {
         var has_entry = false;
         var dropped: u64 = 0;
         lock();
-        if (state.count > 0) {
-            local = state.entries[state.head];
-            state.head = (state.head + 1) % entry_count_max;
-            state.count -= 1;
+        if (state.entry_queue.pop(&state.entries)) |entry| {
+            local = entry;
             has_entry = true;
         } else {
             should_stop = state.stopping;
