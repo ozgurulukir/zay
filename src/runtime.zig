@@ -16,6 +16,7 @@ pub const AgentRuntime = struct {
     cwd: []const u8,
     home_dir: []const u8,
     client: ai.LanguageModel,
+    base_system_prompt: []const u8,
     system_prompt: []const u8,
     session_writer: session_mod.SessionWriter,
     agent: agent_mod.Agent,
@@ -59,34 +60,11 @@ pub const AgentRuntime = struct {
         io: std.Io,
         cwd: []const u8,
         home_dir: []const u8,
-        system_prompt: []const u8,
+        base_system_prompt: []const u8,
         config: config_mod.Config,
         diagnostics: []config_mod.Diagnostic,
     ) !void {
-        assert(cwd.len > 0);
-        assert(system_prompt.len > 0);
-        const owned_system_prompt = try createSystemPrompt(gpa, system_prompt, cwd);
-        errdefer gpa.free(owned_system_prompt);
-        target.* = .{
-            .gpa = gpa,
-            .io = io,
-            .cwd = cwd,
-            .home_dir = home_dir,
-            .client = .none,
-            .system_prompt = owned_system_prompt,
-            .session_writer = undefined,
-            .agent = undefined,
-            .diagnostics = diagnostics,
-        };
-        try target.session_writer.initDefault(gpa, io, cwd);
-        errdefer target.session_writer.deinit();
-
-        target.agent = agent_mod.Agent.init(gpa, io, cwd, .none);
-        errdefer target.agent.deinit();
-        target.agent.attachSessionWriter(&target.session_writer);
-        try target.agent.addSystem(owned_system_prompt);
-
-        try target.applyFromConfig(config);
+        try target.initSession(gpa, io, cwd, home_dir, base_system_prompt, config, diagnostics, null);
     }
 
     pub fn initResume(
@@ -95,36 +73,65 @@ pub const AgentRuntime = struct {
         io: std.Io,
         cwd: []const u8,
         home_dir: []const u8,
-        system_prompt: []const u8,
+        base_system_prompt: []const u8,
         config: config_mod.Config,
         diagnostics: []config_mod.Diagnostic,
         session_id: []const u8,
     ) !void {
-        assert(cwd.len > 0);
         assert(session_id.len > 0);
-        const owned_system_prompt = try createSystemPrompt(gpa, system_prompt, cwd);
+        try target.initSession(gpa, io, cwd, home_dir, base_system_prompt, config, diagnostics, session_id);
+    }
+
+    fn initSession(
+        target: *AgentRuntime,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        cwd: []const u8,
+        home_dir: []const u8,
+        base_system_prompt: []const u8,
+        config: config_mod.Config,
+        diagnostics: []config_mod.Diagnostic,
+        session_id: ?[]const u8,
+    ) !void {
+        assert(cwd.len > 0);
+        assert(base_system_prompt.len > 0);
+        if (session_id) |id| assert(id.len > 0);
+
+        const owned_base_system_prompt = try gpa.dupe(u8, base_system_prompt);
+        errdefer gpa.free(owned_base_system_prompt);
+        const owned_system_prompt = try createSystemPromptWithContext(gpa, io, owned_base_system_prompt, cwd);
         errdefer gpa.free(owned_system_prompt);
+
         target.* = .{
             .gpa = gpa,
             .io = io,
             .cwd = cwd,
             .home_dir = home_dir,
             .client = .none,
+            .base_system_prompt = owned_base_system_prompt,
             .system_prompt = owned_system_prompt,
             .session_writer = undefined,
             .agent = undefined,
             .diagnostics = diagnostics,
         };
-        try target.session_writer.initResumeDefault(gpa, io, cwd, session_id);
+
+        if (session_id) |id| {
+            try target.session_writer.initResumeDefault(gpa, io, cwd, id);
+        } else {
+            try target.session_writer.initDefault(gpa, io, cwd);
+        }
         errdefer target.session_writer.deinit();
 
         target.agent = agent_mod.Agent.init(gpa, io, cwd, .none);
         errdefer target.agent.deinit();
         target.agent.attachSessionWriter(&target.session_writer);
         try target.agent.addSystem(owned_system_prompt);
-        const messages = try target.session_writer.session.messages(gpa);
-        defer gpa.free(messages);
-        for (messages) |message| try target.agent.takeMessage(message);
+
+        if (session_id != null) {
+            const messages = try target.session_writer.session.messages(gpa);
+            defer gpa.free(messages);
+            for (messages) |message| try target.agent.takeMessage(message);
+        }
 
         try target.applyFromConfig(config);
     }
@@ -132,6 +139,7 @@ pub const AgentRuntime = struct {
     pub fn deinit(self: *AgentRuntime) void {
         self.agent.deinit();
         self.session_writer.deinit();
+        self.gpa.free(self.base_system_prompt);
         self.gpa.free(self.system_prompt);
         if (self.owned_client) |client| client.deinit(self.gpa);
         for (self.diagnostics) |*d| d.deinit(self.gpa);
@@ -304,6 +312,50 @@ fn createSystemPrompt(gpa: std.mem.Allocator, template: []const u8, cwd: []const
     return try std.mem.replaceOwned(u8, gpa, cwd_resolved, "${OS}", os_label);
 }
 
+/// Reads AGENTS.md in the root directory if it exists. Returns null otherwise.
+fn readContextFile(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) !?[]u8 {
+    assert(cwd.len > 0);
+    const context_file_path = try std.fs.path.join(gpa, &.{ cwd, "AGENTS.md" });
+    defer gpa.free(context_file_path);
+    return std.Io.Dir.readFileAllocOptions(
+        .cwd(),
+        io,
+        context_file_path,
+        gpa,
+        .limited(64 * 1024),
+        .of(u8),
+        null,
+    ) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+}
+
+fn createSystemPromptWithContext(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    base_system_prompt: []const u8,
+    cwd: []const u8,
+) ![]u8 {
+    const system_prompt = try createSystemPrompt(gpa, base_system_prompt, cwd);
+    errdefer gpa.free(system_prompt);
+
+    const maybe_context = try readContextFile(gpa, io, cwd);
+    defer if (maybe_context) |context| gpa.free(context);
+
+    if (maybe_context) |context| {
+        const combined = try std.fmt.allocPrint(
+            gpa,
+            "{s}\n\n<project_instructions path=\"AGENTS.md\">\n{s}\n</project_instructions>\n",
+            .{ system_prompt, context },
+        );
+        gpa.free(system_prompt);
+        return combined;
+    }
+
+    return system_prompt;
+}
+
 const os_label: []const u8 = switch (builtin.os.tag) {
     .windows => "Windows",
     .linux => "Linux",
@@ -351,4 +403,28 @@ test "createSystemPrompt substitutes ${OS} with the host operating system" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "${OS}") == null);
     try std.testing.expect(std.mem.startsWith(u8, rendered, "OS: "));
     try std.testing.expect(rendered.len > "OS: ".len);
+}
+
+test "readContextFile reads AGENTS.md when it exists" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var file = try tmp.dir.createFile(io, "AGENTS.md", .{ .truncate = true });
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try writer.interface.writeAll("# Guidelines\nThis is a test.");
+        try writer.interface.flush();
+    }
+
+    const cwd = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(cwd);
+
+    const agents_md = (try readContextFile(gpa, io, cwd)) orelse return error.MissingContextFile;
+    defer gpa.free(agents_md);
+    try std.testing.expectEqualStrings("# Guidelines\nThis is a test.", agents_md);
 }

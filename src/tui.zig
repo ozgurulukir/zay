@@ -1190,7 +1190,7 @@ pub const App = struct {
                 self.io,
                 current.cwd,
                 current.home_dir,
-                current.system_prompt,
+                current.base_system_prompt,
                 self.cached_config,
                 diagnostics,
                 id,
@@ -1201,7 +1201,7 @@ pub const App = struct {
                 self.io,
                 current.cwd,
                 current.home_dir,
-                current.system_prompt,
+                current.base_system_prompt,
                 self.cached_config,
                 diagnostics,
             );
@@ -2658,6 +2658,7 @@ test "codex sign-in survives selecting local compatible provider" {
     runtime.cwd = ".";
     runtime.home_dir = ".";
     runtime.client = .none;
+    runtime.base_system_prompt = "test";
     runtime.system_prompt = "test";
     runtime.session_writer = undefined;
     runtime.agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
