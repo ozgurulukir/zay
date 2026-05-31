@@ -111,7 +111,7 @@ pub const ExecutorService = struct {
         errdefer self.gpa.free(display_label);
         const display_body = try makeDisplayBody(self.gpa, output);
         errdefer self.gpa.free(display_body);
-        const stderr = try makeStderrBody(self.gpa, output.stderr);
+        const stderr = if (output.stderr.len > 0) try self.gpa.dupe(u8, output.stderr) else null;
         const failed = output.code != 0;
         return .{
             .call_id = call_id,
@@ -162,11 +162,6 @@ fn makeDisplayBody(gpa: std.mem.Allocator, result: tools.Output) ![]u8 {
     errdefer buffer.deinit(gpa);
     try hashline.appendStripped(gpa, &buffer, result.stdout);
     return buffer.toOwnedSlice(gpa);
-}
-
-fn makeStderrBody(gpa: std.mem.Allocator, stderr: []const u8) !?[]u8 {
-    if (stderr.len == 0) return null;
-    return try gpa.dupe(u8, stderr);
 }
 
 test "ExecutorService runs bash and returns both channels" {
