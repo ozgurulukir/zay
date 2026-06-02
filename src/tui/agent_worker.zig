@@ -65,7 +65,25 @@ pub const Context = struct {
 
 pub const cancel_message = "Interrupted.";
 
-pub fn runAgentTurn(agent: *agent_mod.Agent, worker_context: *Context) void {
+/// `pending_prompt`, when present, is raw user text owned by `worker_context.gpa`.
+/// It is expanded (file embedding / image attachment) and appended to history
+/// here, on the worker thread, so the UI thread never blocks on that I/O.
+pub fn runAgentTurn(agent: *agent_mod.Agent, worker_context: *Context, pending_prompt: ?[]u8) void {
+    if (pending_prompt) |prompt| {
+        defer worker_context.gpa.free(prompt);
+        agent.addUserPrompt(prompt) catch |err| {
+            const message_text = std.fmt.allocPrint(
+                worker_context.gpa,
+                "agent turn failed: {s}",
+                .{@errorName(err)},
+            ) catch return;
+            postAgentEvent(worker_context, .{ .turn_failed = message_text }) catch {
+                worker_context.gpa.free(message_text);
+            };
+            postAgentEvent(worker_context, .turn_finished) catch {};
+            return;
+        };
+    }
     agent.run(.{
         .ptr = worker_context,
         .on_event = postAgentEvent,

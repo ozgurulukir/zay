@@ -4,7 +4,9 @@ const vxfw = vaxis.vxfw;
 
 const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
+const at_mention = @import("at_mention.zig");
 const bash_mod = @import("bash.zig");
+const search_mod = @import("search.zig");
 const codex = @import("codex.zig");
 const config_mod = @import("config.zig");
 const openai_compatible_mod = @import("ai/openai_compatible.zig");
@@ -16,6 +18,7 @@ const agent_worker = @import("tui/agent_worker.zig");
 const tui_thread_projection = @import("tui/thread_projection.zig");
 const tui_metrics = @import("tui/metrics.zig");
 const tui_message = @import("tui/widgets/message.zig");
+const at_search = @import("tui/widgets/at_search.zig");
 const command_panel = @import("tui/widgets/command_panel.zig");
 const model_loader = @import("tui/model_loader.zig");
 const model_picker = @import("tui/widgets/model_picker.zig");
@@ -107,7 +110,16 @@ pub const App = struct {
     models_cached: bool = false,
     pending_quit_at: ?std.Io.Timestamp = null,
     queued_user_messages: std.ArrayList([]const u8) = .empty,
+    /// Raw prompt for a turn that `beginSubmit` accepted but `startTurn` has
+    /// not yet handed to the worker. Owned by `gpa`; the worker frees it once
+    /// the turn starts.
+    pending_prompt: ?[]u8 = null,
     turn_discarded: bool = false,
+    at_active: bool = false,
+    at_query: []u8 = "",
+    at_results: std.ArrayList([]const u8) = .empty,
+    at_selection: u32 = 0,
+    at_indexing: bool = false,
 
     pub const ctrl_c_double_press_ms: u32 = 1500;
 
@@ -186,6 +198,9 @@ pub const App = struct {
         self.worker_context.queue.deinit(self.worker_context.io, self.worker_context.gpa);
         self.clearQueuedUserMessages();
         self.queued_user_messages.deinit(self.gpa);
+        if (self.pending_prompt) |prompt| self.gpa.free(prompt);
+        self.closeAtSearch();
+        self.at_results.deinit(self.gpa);
         self.thread_projection.deinit(self.gpa);
         self.thread.deinit(self.gpa);
         self.input.deinit();
@@ -236,6 +251,7 @@ pub const App = struct {
     }
 
     pub fn beginSubmit(self: *App) !?u32 {
+        self.closeAtSearch();
         if (self.in_flight) return try self.enqueueSubmit();
         // If a previous turn was Esc-interrupted, force-cancel its worker
         // before starting a new one. Two concurrent workers would race on
@@ -257,8 +273,10 @@ pub const App = struct {
         self.resetTurnState();
         self.worker_context.resetCancel();
         _ = try self.thread.append(self.gpa, .user, "you", prompt);
-        try self.agent.addUser(prompt);
         try self.appendLoading();
+        // The worker expands `@`-mentions (reading files / images) off the UI
+        // thread; stash the raw text for `startTurn` to hand over.
+        self.pending_prompt = try self.gpa.dupe(u8, prompt);
         self.in_flight = true;
         return self.thread_projection.loading_index;
     }
@@ -308,9 +326,13 @@ pub const App = struct {
     }
 
     pub fn startTurn(self: *App) !void {
+        const prompt = self.pending_prompt;
+        self.pending_prompt = null;
+        errdefer if (prompt) |p| self.gpa.free(p);
         self.turn_future = try self.io.concurrent(agent_worker.runAgentTurn, .{
             self.agent,
             &self.worker_context,
+            prompt,
         });
     }
 
@@ -422,6 +444,16 @@ pub const App = struct {
     }
 
     fn handleThreadKey(self: *App, key: vaxis.Key) !bool {
+        if (self.at_active and self.at_results.items.len > 0) {
+            if (key.matches(vaxis.Key.up, .{})) {
+                self.at_selection = previousIndex(self.at_selection, @intCast(self.at_results.items.len));
+                return true;
+            }
+            if (key.matches(vaxis.Key.down, .{})) {
+                self.at_selection = nextIndex(self.at_selection, @intCast(self.at_results.items.len));
+                return true;
+            }
+        }
         if (key.matches(vaxis.Key.down, .{ .shift = true })) {
             self.jumpThreadToBottom();
             return true;
@@ -1076,6 +1108,86 @@ pub const App = struct {
         self.resetInputChangeTracking();
     }
 
+    /// Recompute the `@`-mention popup from the text before the cursor. Called
+    /// on every edit while in normal mode.
+    fn updateAtSearch(self: *App) !void {
+        const active = at_mention.activeQuery(self.input.buf.firstHalf()) orelse {
+            self.closeAtSearch();
+            return;
+        };
+        self.at_active = true;
+        if (!std.mem.eql(u8, active.query, self.at_query)) {
+            // Dupe before freeing so a failed alloc leaves the old query intact.
+            // An empty query keeps the "" sentinel rather than a heap-owned
+            // zero-length slice, so `closeAtSearch`'s `len > 0` free is correct.
+            const owned: []u8 = if (active.query.len > 0) try self.gpa.dupe(u8, active.query) else "";
+            if (self.at_query.len > 0) self.gpa.free(self.at_query);
+            self.at_query = owned;
+            self.at_selection = 0;
+            try self.refreshAtResults();
+        }
+    }
+
+    fn refreshAtResults(self: *App) !void {
+        self.clearAtResults();
+        self.at_indexing = false;
+        if (self.at_query.len == 0) return;
+        var result = (try search_mod.runIfReady(self.gpa, self.io, .{
+            .op = .find,
+            .query = self.at_query,
+        })) orelse {
+            self.at_indexing = true;
+            return;
+        };
+        defer result.deinit(self.gpa);
+        try self.parseAtResults(result.stdout);
+    }
+
+    fn parseAtResults(self: *App, stdout: []const u8) !void {
+        const max_results = 50;
+        var iter = std.mem.splitScalar(u8, stdout, '\n');
+        while (iter.next()) |line| {
+            if (self.at_results.items.len >= max_results) break;
+            if (line.len == 0) continue;
+            if (isSearchFooter(line)) continue;
+            if (line[line.len - 1] == '/') continue; // directory: `@` loads files
+            const owned = try self.gpa.dupe(u8, line);
+            errdefer self.gpa.free(owned);
+            try self.at_results.append(self.gpa, owned);
+        }
+        if (self.at_selection >= self.at_results.items.len) self.at_selection = 0;
+    }
+
+    /// Replace the active `@<query>` token with `@<selected-path> `.
+    fn acceptAtSelection(self: *App) !void {
+        if (self.at_selection >= self.at_results.items.len) return;
+        const before = self.input.buf.firstHalf();
+        const active = at_mention.activeQuery(before) orelse return;
+        const path = self.at_results.items[self.at_selection];
+        const insert = try std.fmt.allocPrint(self.gpa, "@{s} ", .{path});
+        defer self.gpa.free(insert);
+        self.input.buf.growGapLeft(before.len - active.start);
+        try self.input.insertSliceAtCursor(insert);
+        self.resetInputChangeTracking();
+        self.closeAtSearch();
+    }
+
+    fn clearAtResults(self: *App) void {
+        for (self.at_results.items) |path| self.gpa.free(path);
+        self.at_results.clearRetainingCapacity();
+    }
+
+    fn closeAtSearch(self: *App) void {
+        self.at_active = false;
+        self.at_indexing = false;
+        self.at_selection = 0;
+        self.clearAtResults();
+        if (self.at_query.len > 0) {
+            self.gpa.free(self.at_query);
+            self.at_query = "";
+        }
+    }
+
     fn enqueueSubmit(self: *App) !?u32 {
         const prompt = try self.input.buf.dupe();
         errdefer self.gpa.free(prompt);
@@ -1083,6 +1195,8 @@ pub const App = struct {
             self.gpa.free(prompt);
             return null;
         }
+        // Enqueue the raw text; the worker expands `@`-mentions when it drains
+        // the queue, keeping file I/O off the UI thread.
         self.agent.enqueueUser(prompt) catch |err| switch (err) {
             error.QueueFull => {
                 self.gpa.free(prompt);
@@ -1465,6 +1579,11 @@ const RootWidget = struct {
             },
             .key_press => |key| {
                 if (key.matches(vaxis.Key.escape, .{})) {
+                    if (self.app.at_active) {
+                        self.app.closeAtSearch();
+                        ctx.consumeAndRedraw();
+                        return;
+                    }
                     if (self.app.in_flight) {
                         try self.app.handleInterrupt();
                         ctx.consumeAndRedraw();
@@ -1499,6 +1618,11 @@ const RootWidget = struct {
                 // Any other key cancels the pending-quit prompt.
                 self.app.pending_quit_at = null;
                 if (key.matches(vaxis.Key.enter, .{})) {
+                    if (self.app.at_active and self.app.at_results.items.len > 0) {
+                        try self.app.acceptAtSelection();
+                        ctx.consumeAndRedraw();
+                        return;
+                    }
                     try self.submit(ctx);
                     return;
                 }
@@ -1626,9 +1750,11 @@ const RootWidget = struct {
         );
 
         const overlay_visible = self.app.mode != .normal;
+        const at_visible = self.app.at_active and !overlay_visible;
 
         var child_count: usize = 2;
         if (overlay_visible) child_count += 1;
+        if (at_visible) child_count += 1;
         const children = try ctx.arena.alloc(vxfw.SubSurface, child_count);
         var idx: usize = 0;
         children[idx] = .{
@@ -1652,6 +1778,20 @@ const RootWidget = struct {
                     .{ .width = max_width, .height = layout.thread_height },
                 )),
                 .z_index = 2,
+            };
+            idx += 1;
+        }
+        if (at_visible) {
+            var at_view: AtSearchWidget = .{ .app = self.app };
+            const panel_height = at_search.panelHeight(self.app.at_results.items.len);
+            const panel_width = @min(@as(u16, 72), max_width);
+            children[idx] = .{
+                .origin = .{ .row = layout.input_row -| panel_height, .col = 0 },
+                .surface = try at_view.widget().draw(ctx.withConstraints(
+                    .{ .width = panel_width, .height = panel_height },
+                    .{ .width = panel_width, .height = panel_height },
+                )),
+                .z_index = 1,
             };
             idx += 1;
         }
@@ -1808,6 +1948,14 @@ fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
     return std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
 }
 
+/// Non-path trailer lines in `search_mod` find output: the `+N more results`
+/// pagination footer and the empty-result marker. (The "ready" backend never
+/// emits the grep footer or the shell-fallback banner on this path.)
+fn isSearchFooter(line: []const u8) bool {
+    return std.mem.startsWith(u8, line, "+") or
+        std.mem.eql(u8, line, "0 results.");
+}
+
 fn pickerSecondaryColumn(width: u16) u16 {
     return @min(picker_secondary_column, width / 2);
 }
@@ -1820,6 +1968,11 @@ fn inputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u
         app.clearInput();
         app.clearPaletteInput();
         try ctx.requestFocus(app.palette_input.widget());
+    }
+    if (app.mode == .normal) {
+        try app.updateAtSearch();
+    } else {
+        app.closeAtSearch();
     }
     ctx.consumeAndRedraw();
 }
@@ -1849,6 +2002,27 @@ fn overlaySize(mode: App.Mode) OverlaySize {
         .command, .provider_picker, .session_picker, .model_picker => .{ .width = 90, .height = 16 },
     };
 }
+
+/// Builds the floating `@`-results panel from app state. Presentational only;
+/// the main input keeps focus.
+const AtSearchWidget = struct {
+    app: *App,
+
+    fn widget(self: *AtSearchWidget) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = drawAtSearch };
+    }
+
+    fn drawAtSearch(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *AtSearchWidget = @ptrCast(@alignCast(ptr));
+        var content: at_search.Content = .{
+            .results = self.app.at_results.items,
+            .selection = self.app.at_selection,
+            .query = self.app.at_query,
+            .indexing = self.app.at_indexing,
+        };
+        return content.widget().draw(ctx);
+    }
+};
 
 const OverlayWidget = struct {
     app: *App,

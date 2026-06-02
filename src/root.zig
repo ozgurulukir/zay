@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const agent = @import("agent.zig");
 pub const ai = @import("ai.zig");
+pub const at_mention = @import("at_mention.zig");
 pub const bash = @import("bash.zig");
 pub const codex = @import("codex.zig");
 pub const config = @import("config.zig");

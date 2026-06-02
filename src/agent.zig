@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const ai = @import("ai.zig");
+const at_mention = @import("at_mention.zig");
 const bounded_queue = @import("bounded_queue");
 const executor_mod = @import("executor.zig");
 const session_mod = @import("session.zig");
@@ -10,7 +11,10 @@ const assert = std.debug.assert;
 const message_queue_capacity: u32 = 64;
 
 const QueuedUserMessage = struct {
-    message: ai.ChatMessage,
+    /// Raw prompt text as typed. `@`-mentions are expanded (files embedded,
+    /// images attached) lazily at drain time so the file I/O lands on the
+    /// agent worker thread rather than the UI thread.
+    prompt: []u8,
 };
 
 const MessageQueue = bounded_queue.BoundedQueue(QueuedUserMessage);
@@ -50,8 +54,7 @@ pub const Agent = struct {
         self.messages.deinit(self.gpa);
         self.lockMessageQueue();
         while (self.message_queue.pop(&self.message_queue_storage)) |queued| {
-            var owned = queued;
-            owned.message.deinit(self.gpa);
+            self.gpa.free(queued.prompt);
         }
         self.message_queue_mutex.unlock();
         self.* = undefined;
@@ -63,20 +66,23 @@ pub const Agent = struct {
 
     pub fn enqueueUser(self: *Agent, content: []const u8) !void {
         assert(content.len > 0);
-        var message = try self.makeTextMessage(.user, content);
-        errdefer message.deinit(self.gpa);
+        const owned = try self.gpa.dupe(u8, content);
+        errdefer self.gpa.free(owned);
         self.lockMessageQueue();
         defer self.message_queue_mutex.unlock();
-        if (!self.message_queue.push(&self.message_queue_storage, .{ .message = message })) return error.QueueFull;
+        if (!self.message_queue.push(&self.message_queue_storage, .{ .prompt = owned })) return error.QueueFull;
     }
 
-    pub fn addUserBlocks(self: *Agent, blocks: []const ai.ContentBlock) !void {
-        const owned = try self.cloneBlocks(blocks);
+    /// Expand `@`-mentions in `prompt` (embedding text files inline, attaching
+    /// images as real content blocks) and append the result as a user message.
+    /// Reads files, so this is meant to run on the agent worker thread.
+    pub fn addUserPrompt(self: *Agent, prompt: []const u8) !void {
+        const blocks = try at_mention.buildUserMessage(self.gpa, self.io, self.cwd, prompt);
         errdefer {
-            for (owned) |*block| block.deinit(self.gpa);
-            self.gpa.free(owned);
+            for (blocks) |*block| block.deinit(self.gpa);
+            self.gpa.free(blocks);
         }
-        try self.messages.append(self.gpa, .{ .role = .user, .content = owned });
+        try self.messages.append(self.gpa, .{ .role = .user, .content = blocks });
         try self.persistLastMessage();
     }
 
@@ -366,44 +372,6 @@ pub const Agent = struct {
         });
     }
 
-    fn cloneBlocks(self: *Agent, blocks: []const ai.ContentBlock) ![]ai.ContentBlock {
-        const owned = try self.gpa.alloc(ai.ContentBlock, blocks.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (owned[0..initialized]) |*block| block.deinit(self.gpa);
-            self.gpa.free(owned);
-        }
-        for (blocks) |block| {
-            owned[initialized] = try self.cloneBlock(block);
-            initialized += 1;
-        }
-        return owned;
-    }
-
-    fn cloneBlock(self: *Agent, block: ai.ContentBlock) !ai.ContentBlock {
-        return switch (block) {
-            .text => |text| .{ .text = .{
-                .text = try self.gpa.dupe(u8, text.text),
-                .responses_item_id = if (text.responses_item_id) |id| try self.gpa.dupe(u8, id) else null,
-                .responses_phase = if (text.responses_phase) |phase| try self.gpa.dupe(u8, phase) else null,
-            } },
-            .image => |image| .{ .image = .{
-                .mime_type = try self.gpa.dupe(u8, image.mime_type),
-                .data_base64 = try self.gpa.dupe(u8, image.data_base64),
-            } },
-            .reasoning => |reasoning| .{ .reasoning = .{
-                .text = try self.gpa.dupe(u8, reasoning.text),
-                .responses_item_json = if (reasoning.responses_item_json) |json| try self.gpa.dupe(u8, json) else null,
-            } },
-            .tool_call => |call| .{ .tool_call = .{
-                .call_id = try self.gpa.dupe(u8, call.call_id),
-                .responses_item_id = if (call.responses_item_id) |id| try self.gpa.dupe(u8, id) else null,
-                .name = try self.gpa.dupe(u8, call.name),
-                .arguments = try self.gpa.dupe(u8, call.arguments),
-            } },
-        };
-    }
-
     fn appendMessage(self: *Agent, role: ai.Role, content: []const u8) !void {
         var message = try self.makeTextMessage(role, content);
         errdefer message.deinit(self.gpa);
@@ -421,18 +389,17 @@ pub const Agent = struct {
     }
 
     fn drainQueuedUserMessage(self: *Agent) !u32 {
-        var message = self.takeQueuedUserMessage() orelse return 0;
-        errdefer message.deinit(self.gpa);
-        try self.messages.append(self.gpa, message);
-        try self.persistLastMessage();
+        const prompt = self.takeQueuedUserPrompt() orelse return 0;
+        defer self.gpa.free(prompt);
+        try self.addUserPrompt(prompt);
         return 1;
     }
 
-    fn takeQueuedUserMessage(self: *Agent) ?ai.ChatMessage {
+    fn takeQueuedUserPrompt(self: *Agent) ?[]u8 {
         self.lockMessageQueue();
         defer self.message_queue_mutex.unlock();
         const queued = self.message_queue.pop(&self.message_queue_storage) orelse return null;
-        return queued.message;
+        return queued.prompt;
     }
 
     fn lockMessageQueue(self: *Agent) void {

@@ -179,6 +179,15 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, request: Request
     return runFallback(gpa, io, cwd, request);
 }
 
+/// Non-blocking variant for interactive callers (e.g. the `@` file-search
+/// autocomplete). Queries the in-memory `fff` index only and returns `null`
+/// when it is still scanning or hasn't finished initializing — never falls
+/// back to the shell, so it won't stutter the render loop.
+pub fn runIfReady(gpa: std.mem.Allocator, io: std.Io, request: Request) !?Result {
+    assert(request.query.len > 0);
+    return runReadyBackend(gpa, io, request);
+}
+
 fn runReadyBackend(gpa: std.mem.Allocator, io: std.Io, request: Request) !?Result {
     assert(request.query.len > 0);
 
