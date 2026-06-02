@@ -7,7 +7,7 @@ const db = @import("db.zig");
 const assert = std.debug.assert;
 
 const schema_version: u32 = 1;
-const entry_id_len: u32 = 8;
+pub const entry_id_len: u32 = 8;
 const session_id_len: u32 = 32;
 const default_db_relative_path = ".nova/sessions.sqlite";
 const EntryQueue = bounded_queue.BoundedQueue(QueuedEntry);
@@ -206,10 +206,10 @@ pub const Session = struct {
     }
 
     pub fn messages(self: *Session, gpa: std.mem.Allocator) Error![]ai.ChatMessage {
-        const entries = try self.loadBranch(gpa);
+        const path = try self.loadBranch(gpa);
         defer {
-            for (entries) |*entry| entry.deinit(gpa);
-            gpa.free(entries);
+            for (path) |*entry| entry.deinit(gpa);
+            gpa.free(path);
         }
 
         var messages_list: std.ArrayList(ai.ChatMessage) = .empty;
@@ -217,7 +217,7 @@ pub const Session = struct {
             for (messages_list.items) |*message| deinitMessage(gpa, message);
             messages_list.deinit(gpa);
         }
-        for (entries) |entry| {
+        for (path) |entry| {
             if (std.mem.eql(u8, entry.kind, "message")) {
                 try messages_list.append(gpa, try jsonToMessage(gpa, entry.payload_json));
             } else {
@@ -300,6 +300,26 @@ pub const Session = struct {
         try statement.bindText(2, entry_id);
         if (try statement.step()) |_| return;
         return error.MissingEntry;
+    }
+
+    /// Load every entry in the session (the whole tree, not just the active
+    /// path). Callers build the parent→children structure themselves. Entries
+    /// are returned oldest-first by creation time so siblings keep a stable
+    /// order. Caller owns the slice and each record.
+    pub fn entries(self: *Session, gpa: std.mem.Allocator) Error![]EntryRecord {
+        var statement = try self.manager.connection.prepare("select id, parent_id, kind, role, payload_json, created_at_ms from session_entries where session_id = ? order by created_at_ms");
+        defer statement.finalize();
+        try statement.bindText(1, self.id[0..]);
+
+        var records: std.ArrayList(EntryRecord) = .empty;
+        errdefer {
+            for (records.items) |*record| record.deinit(gpa);
+            records.deinit(gpa);
+        }
+        while (try statement.step()) |row| {
+            try records.append(gpa, try readEntry(gpa, &row));
+        }
+        return records.toOwnedSlice(gpa);
     }
 
     fn loadBranch(self: *Session, gpa: std.mem.Allocator) Error![]EntryRecord {
@@ -419,6 +439,60 @@ pub const SessionWriter = struct {
         try self.enqueue(.{ .kind = "message", .role = role, .payload_json = payload, .title_candidate = title_candidate });
     }
 
+    /// Load the whole session tree, race-free. Stops the background writer so
+    /// the read has exclusive access to the connection, then restarts it.
+    pub fn entries(self: *SessionWriter, gpa: std.mem.Allocator) Error![]EntryRecord {
+        self.quiesce();
+        defer self.restart() catch {};
+        return self.session.entries(gpa);
+    }
+
+    /// Reconstruct the active-path messages (leaf→root), race-free. Used after
+    /// `navigate` to rehydrate the agent's conversation from the new branch.
+    pub fn messages(self: *SessionWriter, gpa: std.mem.Allocator) Error![]ai.ChatMessage {
+        self.quiesce();
+        defer self.restart() catch {};
+        return self.session.messages(gpa);
+    }
+
+    /// Move the session leaf to `entry_id` (branch switch, no summary),
+    /// race-free with the background writer. The next appended message becomes
+    /// a child of `entry_id`, forming a new branch.
+    pub fn navigate(self: *SessionWriter, entry_id: []const u8) Error!void {
+        self.quiesce();
+        defer self.restart() catch {};
+        try self.session.branch(entry_id, null, null);
+    }
+
+    pub fn leaf(self: *const SessionWriter) ?[]const u8 {
+        return self.session.leaf();
+    }
+
+    /// Stop the writer thread and flush any queued entries synchronously,
+    /// leaving the calling thread sole owner of the sqlite connection. Pair
+    /// with `restart`. Queued entries are written (not dropped) so an
+    /// in-flight assistant turn isn't lost.
+    fn quiesce(self: *SessionWriter) void {
+        lockWriter(self);
+        self.stopping = true;
+        self.mutex.unlock();
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+        while (self.entry_queue.pop(self.queue)) |entry| {
+            var owned = entry;
+            defer owned.deinit(self.gpa);
+            writeQueuedEntry(self, &owned) catch {};
+        }
+    }
+
+    fn restart(self: *SessionWriter) Error!void {
+        assert(self.thread == null);
+        self.stopping = false;
+        self.thread = try std.Thread.spawn(.{}, runWriter, .{self});
+    }
+
     fn enqueue(self: *SessionWriter, entry: QueuedEntry) Error!void {
         while (true) {
             lockWriter(self);
@@ -494,7 +568,7 @@ fn lockWriter(writer: *SessionWriter) void {
     }
 }
 
-const EntryRecord = struct {
+pub const EntryRecord = struct {
     id: [entry_id_len]u8,
     parent_id: ?[entry_id_len]u8,
     kind: []u8,
@@ -502,7 +576,7 @@ const EntryRecord = struct {
     payload_json: []u8,
     created_at_ms: i64,
 
-    fn deinit(self: *EntryRecord, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: *EntryRecord, gpa: std.mem.Allocator) void {
         gpa.free(self.kind);
         if (self.role) |role| gpa.free(role);
         gpa.free(self.payload_json);
@@ -754,6 +828,125 @@ fn branchSummaryToJson(gpa: std.mem.Allocator, from_id: []const u8, summary: []c
     try std.json.Stringify.value(summary, .{}, &out.writer);
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
+}
+
+/// Classification of a session entry, used by the `/tree` view to drive filter
+/// modes and to hide tool-call-only assistant turns by default.
+pub const EntryKind = enum {
+    user,
+    assistant,
+    /// Assistant turn that carried only tool calls (no visible text).
+    assistant_empty,
+    tool,
+    branch_summary,
+    session_info,
+    other,
+};
+
+pub const EntrySummary = struct {
+    kind: EntryKind,
+    /// One-line display text, owned by the caller.
+    text: []u8,
+};
+
+/// Classify an entry and produce its one-line `/tree` summary in a single
+/// parse. Whitespace is collapsed and the text truncated to one row. Caller
+/// owns `text`.
+pub fn entrySummary(gpa: std.mem.Allocator, record: EntryRecord) Error!EntrySummary {
+    const display_max: u32 = 120;
+    if (std.mem.eql(u8, record.kind, "branch_summary")) {
+        return .{ .kind = .branch_summary, .text = try gpa.dupe(u8, "branch summary") };
+    }
+    if (std.mem.eql(u8, record.kind, "session_info")) {
+        const parsed = std.json.parseFromSlice(std.json.Value, gpa, record.payload_json, .{}) catch
+            return .{ .kind = .session_info, .text = try gpa.dupe(u8, "title") };
+        defer parsed.deinit();
+        if (parsed.value == .object) {
+            if (parsed.value.object.get("title")) |title| {
+                if (title == .string) {
+                    const collapsed = try collapseWhitespace(gpa, title.string, display_max);
+                    defer gpa.free(collapsed);
+                    return .{ .kind = .session_info, .text = try std.fmt.allocPrint(gpa, "title: {s}", .{collapsed}) };
+                }
+            }
+        }
+        return .{ .kind = .session_info, .text = try gpa.dupe(u8, "title") };
+    }
+    if (!std.mem.eql(u8, record.kind, "message")) {
+        return .{ .kind = .other, .text = try gpa.dupe(u8, record.kind) };
+    }
+
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, record.payload_json, .{}) catch
+        return .{ .kind = .other, .text = try gpa.dupe(u8, "message") };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .kind = .other, .text = try gpa.dupe(u8, "message") };
+    const object = parsed.value.object;
+
+    const role = if (object.get("role")) |value| (if (value == .string) value.string else "") else "";
+    if (std.mem.eql(u8, role, "tool")) {
+        if (object.get("tool_display_label")) |label| {
+            if (label == .string and label.string.len > 0) {
+                return .{ .kind = .tool, .text = try collapseWhitespace(gpa, label.string, display_max) };
+            }
+        }
+        return .{ .kind = .tool, .text = try gpa.dupe(u8, "tool result") };
+    }
+
+    const is_user = std.mem.eql(u8, role, "user");
+    const prefix = if (is_user) "you: " else "agent: ";
+    const text = firstTextBlock(object);
+    if (text.len == 0) {
+        const kind: EntryKind = if (is_user) .user else .assistant_empty;
+        return .{ .kind = kind, .text = try gpa.dupe(u8, std.mem.trimEnd(u8, prefix, " :")) };
+    }
+    const collapsed = try collapseWhitespace(gpa, text, display_max);
+    defer gpa.free(collapsed);
+    return .{
+        .kind = if (is_user) .user else .assistant,
+        .text = try std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, collapsed }),
+    };
+}
+
+/// First `text` block of a message's content array, or "" if none.
+fn firstTextBlock(object: std.json.ObjectMap) []const u8 {
+    const content = object.get("content") orelse return "";
+    if (content == .string) return content.string;
+    if (content != .array) return "";
+    for (content.array.items) |block| {
+        if (block != .object) continue;
+        const kind = block.object.get("type") orelse continue;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "text")) continue;
+        const value = block.object.get("text") orelse continue;
+        if (value == .string and value.string.len > 0) return value.string;
+    }
+    return "";
+}
+
+/// Collapse runs of whitespace to single spaces and truncate to `max` columns
+/// (byte-approximate; trailing "..." added when cut). Caller owns the result.
+fn collapseWhitespace(gpa: std.mem.Allocator, text: []const u8, max: u32) Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var pending_space = false;
+    var started = false;
+    for (text) |byte| {
+        const is_space = byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
+        if (is_space) {
+            pending_space = started;
+            continue;
+        }
+        if (pending_space) {
+            try out.append(gpa, ' ');
+            pending_space = false;
+        }
+        try out.append(gpa, byte);
+        started = true;
+        if (out.items.len >= max) {
+            try out.appendSlice(gpa, "...");
+            break;
+        }
+    }
+    return out.toOwnedSlice(gpa);
 }
 
 fn titleFromUserMessage(gpa: std.mem.Allocator, content: []const u8) Error!?[]u8 {

@@ -25,6 +25,7 @@ const model_loader = @import("tui/model_loader.zig");
 const model_picker = @import("tui/widgets/model_picker.zig");
 const provider_picker = @import("tui/widgets/provider_picker.zig");
 const resume_picker = @import("tui/widgets/resume_picker.zig");
+const tree_selector = @import("tui/widgets/tree_selector.zig");
 const tui_provider = @import("tui/provider_controller.zig");
 const tui_status = @import("tui/status.zig");
 const tui_app = @import("tui/app.zig");
@@ -64,6 +65,7 @@ pub const App = struct {
     resume_selection: u32 = 0,
     resume_global: bool = false,
     resume_summaries: std.ArrayList(session_mod.SessionSummary) = .empty,
+    tree_state: tree_selector.TreeState,
     codex_models: std.ArrayList(codex.Model) = .empty,
     compatible_models: std.ArrayList(codex.Model) = .empty,
     compatible_models_fetched: bool = false,
@@ -103,6 +105,11 @@ pub const App = struct {
         .draw_cursor = false,
         .wheel_scroll = 3,
     },
+    tree_list: vxfw.ListView = .{
+        .children = .{ .slice = &.{} },
+        .draw_cursor = false,
+        .wheel_scroll = 3,
+    },
     model_list: vxfw.ListView = .{
         .children = .{ .slice = &.{} },
         .draw_cursor = false,
@@ -135,7 +142,7 @@ pub const App = struct {
 
     pub const ctrl_c_double_press_ms: u32 = 1500;
 
-    const Mode = enum { normal, command, session_picker, provider_picker, model_picker };
+    const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker };
     const ModelCatalog = enum { connected_provider, openai_codex };
     const ModelSource = model_loader.ModelSource;
     const ModelScope = enum { global, project, session };
@@ -147,6 +154,7 @@ pub const App = struct {
             .agent = agent,
             .input = .init(gpa),
             .palette_input = .init(gpa),
+            .tree_state = .init(gpa),
             .worker_context = .{
                 .io = io,
                 .gpa = agent.gpa,
@@ -190,6 +198,7 @@ pub const App = struct {
         for (self.retired_threads.items) |*thread| thread.deinit(self.gpa);
         self.retired_threads.deinit(self.gpa);
         self.resumeClear();
+        self.tree_state.deinit();
         self.codexModelsClear();
         self.codex_models.deinit(self.gpa);
         self.compatibleModelsCacheClear();
@@ -393,9 +402,40 @@ pub const App = struct {
             .provider_picker => self.handleProviderPickerKey(key),
             .model_picker => self.handleModelPickerKey(key),
             .session_picker => self.handleSessionPickerKey(key),
+            .tree_picker => self.handleTreePickerKey(key),
             .command => self.handleCommandMenuKey(key),
             .normal => self.handleThreadKey(key),
         };
+    }
+
+    fn handleTreePickerKey(self: *App, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.up, .{})) {
+            self.tree_state.moveUp();
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{})) {
+            self.tree_state.moveDown();
+            return true;
+        }
+        if (key.matches(vaxis.Key.left, .{})) {
+            const filter = try self.peekPaletteInput();
+            defer self.gpa.free(filter);
+            try self.tree_state.cycleFilter(filter, false);
+            return true;
+        }
+        if (key.matches(vaxis.Key.right, .{})) {
+            const filter = try self.peekPaletteInput();
+            defer self.gpa.free(filter);
+            try self.tree_state.cycleFilter(filter, true);
+            return true;
+        }
+        if (key.matches(vaxis.Key.tab, .{})) {
+            const filter = try self.peekPaletteInput();
+            defer self.gpa.free(filter);
+            try self.tree_state.toggleFoldSelected(filter);
+            return true;
+        }
+        return false;
     }
 
     fn handleProviderPickerKey(self: *App, key: vaxis.Key) !bool {
@@ -500,7 +540,7 @@ pub const App = struct {
     }
 
     fn syncModeWithInput(self: *App, value: []const u8) !void {
-        if (self.mode == .session_picker or self.mode == .provider_picker or self.mode == .model_picker) {
+        if (self.mode == .session_picker or self.mode == .provider_picker or self.mode == .model_picker or self.mode == .tree_picker) {
             if (value.len > 0 and value[0] == command_prefix) {
                 self.mode = .command;
                 self.command_selection = 0;
@@ -526,7 +566,7 @@ pub const App = struct {
             self.cancelModelLoad();
             try self.revertModelPickerSnapshot();
         }
-        if (self.mode == .session_picker or self.mode == .provider_picker or self.mode == .model_picker) {
+        if (self.mode == .session_picker or self.mode == .provider_picker or self.mode == .model_picker or self.mode == .tree_picker) {
             try self.openCommandMenu();
             self.resumeClear();
             return true;
@@ -571,6 +611,23 @@ pub const App = struct {
             };
             return true;
         }
+        if (self.mode == .tree_picker) {
+            if (self.tree_state.selectedId()) |id| {
+                // Switching to the current leaf is a no-op; just close.
+                if (!self.tree_state.selectedIsLeaf()) {
+                    var buffer: [session_mod.entry_id_len]u8 = undefined;
+                    @memcpy(buffer[0..], id);
+                    self.navigateToEntry(buffer[0..]) catch |err| {
+                        try self.reportSessionSwitchError(err);
+                        return true;
+                    };
+                }
+            }
+            self.mode = .normal;
+            self.clearInput();
+            self.clearPaletteInput();
+            return true;
+        }
         if (self.mode == .command) {
             const filter = try self.peekPaletteInput();
             defer self.gpa.free(filter);
@@ -580,6 +637,7 @@ pub const App = struct {
                 switch (command) {
                     .new => self.switchToNewSession() catch |err| try self.reportSessionSwitchError(err),
                     .resume_session => try self.openResumePicker(),
+                    .tree => self.openTreeSelector() catch |err| try self.reportSessionSwitchError(err),
                     .connect => try self.openProviderPicker(),
                     .model => self.openModelPicker() catch |err| try self.reportConnectionError(err),
                 }
@@ -608,6 +666,13 @@ pub const App = struct {
         self.mode = .provider_picker;
         self.provider_picker.reset();
         self.clearInput();
+    }
+
+    fn openTreeSelector(self: *App) !void {
+        if (self.in_flight) return error.InFlightTurn;
+        self.mode = .tree_picker;
+        self.clearInput();
+        try self.reloadTreeNodes();
     }
 
     fn openModelPicker(self: *App) !void {
@@ -1160,6 +1225,25 @@ pub const App = struct {
     fn syncResumeListCursor(self: *App) void {
         self.resume_list.cursor = self.resume_selection;
         self.resume_list.ensureScroll();
+    }
+
+    fn reloadTreeNodes(self: *App) !void {
+        const writer = &self.runtime.?.session_writer;
+        const records = try writer.entries(self.gpa);
+        defer {
+            for (records) |*record| record.deinit(self.gpa);
+            self.gpa.free(records);
+        }
+        try self.tree_state.load(records, writer.leaf());
+    }
+
+    /// Switch the session leaf to `entry_id`, then rehydrate the agent's
+    /// conversation and the display thread from the new branch. Refused mid-turn.
+    fn navigateToEntry(self: *App, entry_id: []const u8) !void {
+        if (self.in_flight) return error.InFlightTurn;
+        try self.runtime.?.session_writer.navigate(entry_id);
+        try self.runtime.?.reloadMessages();
+        try self.rebuildThreadFromAgent();
     }
 
     fn clearInput(self: *App) void {
@@ -1890,7 +1974,7 @@ const RootWidget = struct {
 
     fn syncFocus(self: *RootWidget, ctx: *vxfw.EventContext) !void {
         const target = switch (self.app.mode) {
-            .command, .session_picker, .provider_picker, .model_picker => self.app.palette_input.widget(),
+            .command, .session_picker, .provider_picker, .model_picker, .tree_picker => self.app.palette_input.widget(),
             .normal => self.app.input.widget(),
         };
         try ctx.requestFocus(target);
@@ -2088,19 +2172,21 @@ const ThreadWidget = struct {
     }
 };
 
-const Command = enum { connect, model, new, resume_session };
+const Command = enum { connect, model, new, resume_session, tree };
 const CommandEntry = struct { name: []const u8, command: Command };
 const commands = [_]CommandEntry{
     .{ .name = "Connect", .command = .connect },
     .{ .name = "Models", .command = .model },
     .{ .name = "New", .command = .new },
     .{ .name = "Resume", .command = .resume_session },
+    .{ .name = "Tree", .command = .tree },
 };
 const command_panel_entries = [_]command_panel.Entry{
     .{ .name = "Connect" },
     .{ .name = "Models" },
     .{ .name = "New" },
     .{ .name = "Resume" },
+    .{ .name = "Tree" },
 };
 
 fn overlayLabel(mode: App.Mode) []const u8 {
@@ -2110,6 +2196,7 @@ fn overlayLabel(mode: App.Mode) []const u8 {
         .session_picker => "Search for Sessions",
         .provider_picker => "Connect to Provider",
         .model_picker => "Select Model",
+        .tree_picker => "Session Tree",
     };
 }
 
@@ -2189,6 +2276,9 @@ fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []
             if (app.resume_selection >= count) app.resume_selection = 0;
             app.syncResumeListCursor();
         },
+        .tree_picker => {
+            try app.tree_state.reflattenKeepingSelection(value);
+        },
         .model_picker => {
             if (!app.modelDisplayMatches(app.model_selection, value)) {
                 app.model_selection = app.firstMatchingModelDisplay(value) orelse 0;
@@ -2208,6 +2298,7 @@ fn overlaySize(mode: App.Mode) OverlaySize {
         .provider_picker => .{ .width = 64, .height = 16 },
         .session_picker => .{ .width = 80, .height = 16 },
         .model_picker => .{ .width = 90, .height = 16 },
+        .tree_picker => .{ .width = 90, .height = 20 },
     };
 }
 
@@ -2369,8 +2460,17 @@ const OverlayInner = struct {
             .session_picker => drawSessionContent(app, ctx),
             .provider_picker => drawProviderContent(app, ctx),
             .model_picker => drawModelContent(app, ctx),
+            .tree_picker => drawTreeContent(app, ctx),
             .normal => unreachable,
         };
+    }
+
+    fn drawTreeContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        var content: tree_selector.Content = .{
+            .state = &app.tree_state,
+            .list = &app.tree_list,
+        };
+        return content.widget().draw(ctx);
     }
 
     fn drawCommandContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
@@ -2457,6 +2557,7 @@ fn inputHintText(mode: App.Mode) []const u8 {
         .session_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[TAB] All sessions" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .provider_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Actions" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .model_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Column" ++ symbols.separator_dot_padded ++ "[TAB] Toggle Effort/Scope" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
+        .tree_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Filter" ++ symbols.separator_dot_padded ++ "[TAB] Fold" ++ symbols.separator_dot_padded ++ "[ENTER] Switch" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .normal => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[SHIFT] ↓ Jump to Bottom" ++ symbols.separator_dot_padded ++ "[TAB] Expand",
     };
 }

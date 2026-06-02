@@ -90,6 +90,22 @@ pub const Agent = struct {
         try self.messages.append(self.gpa, message);
     }
 
+    /// Drop every non-system message, freeing it. Keeps the system prompt(s) in
+    /// place so the conversation can be rehydrated from a different branch (see
+    /// `AgentRuntime.reloadMessages`). Must not be called mid-turn.
+    pub fn clearNonSystemMessages(self: *Agent) void {
+        var kept: usize = 0;
+        for (self.messages.items) |*message| {
+            if (message.role == .system) {
+                self.messages.items[kept] = message.*;
+                kept += 1;
+            } else {
+                message.deinit(self.gpa);
+            }
+        }
+        self.messages.shrinkRetainingCapacity(kept);
+    }
+
     /// The tagged union the agent emits to describe what is happening.
     /// Single public seam — the TUI (and any future consumer) subscribes
     /// to this stream of events via `Agent.Listener`.

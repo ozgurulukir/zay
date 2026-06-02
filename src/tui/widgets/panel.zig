@@ -79,9 +79,13 @@ pub fn lineStyledAt(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxf
 }
 
 pub fn right(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool) !void {
+    const active_style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;
+    try rightStyled(surface, row, text, ctx, active_style);
+}
+
+pub fn rightStyled(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, active_style: vaxis.Style) !void {
     if (row >= surface.size.height) return;
     const stable_text = try ctx.arena.dupe(u8, text);
-    const active_style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;
     const text_width: u16 = @intCast(@min(ctx.stringWidth(stable_text), std.math.maxInt(u16)));
     const end_col = surface.size.width -| message.ConversationLayout.right;
     if (text_width >= end_col) return;

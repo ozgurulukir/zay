@@ -136,6 +136,17 @@ pub const AgentRuntime = struct {
         try target.applyFromConfig(config);
     }
 
+    /// Rehydrate the agent's conversation from the session's current leaf.
+    /// Call after `session_writer.navigate(...)` switches branches: clears the
+    /// in-memory messages (keeping the system prompt) and reloads the new
+    /// active path. Must not be called mid-turn.
+    pub fn reloadMessages(self: *AgentRuntime) !void {
+        self.agent.clearNonSystemMessages();
+        const messages = try self.session_writer.messages(self.gpa);
+        defer self.gpa.free(messages);
+        for (messages) |message| try self.agent.takeMessage(message);
+    }
+
     pub fn deinit(self: *AgentRuntime) void {
         self.agent.deinit();
         self.session_writer.deinit();
