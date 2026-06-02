@@ -15,6 +15,11 @@ fn scopeColumn(width: u16) u16 {
     return secondary +| 24;
 }
 
+fn columnStyle(focused: bool, selected: bool) vaxis.Style {
+    if (focused) return StylePalette.selected_item;
+    return tui_style.onSelectionBg(StylePalette.thinking_body, selected);
+}
+
 fn scopeLabel(scope: Scope) []const u8 {
     return switch (scope) {
         .global => "Global",
@@ -48,6 +53,21 @@ pub const Column = enum {
 pub const ReasoningOption = struct { label: []const u8, effort: ai.ReasoningEffort };
 pub const Scope = enum { global, project, session };
 
+pub fn matches(model: codex.Model, filter: []const u8) bool {
+    if (filter.len == 0) return true;
+    return containsIgnoreCase(model.label, filter) or containsIgnoreCase(model.id, filter);
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
 pub fn findActiveStorageIdx(models: []const codex.Model, active_id: ?[]const u8) ?u32 {
     const id = active_id orelse return null;
     for (models, 0..) |m, i| {
@@ -72,6 +92,7 @@ pub const Content = struct {
     reasoning_options: []const ReasoningOption,
     reasoning_indexes: []const u32,
     scope: Scope,
+    filter: []const u8 = "",
     loading: bool = false,
     error_message: ?[]const u8 = null,
 
@@ -81,13 +102,14 @@ pub const Content = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Content = @ptrCast(@alignCast(ptr));
-        if (self.loading) return self.drawStatus(ctx, "Loading models…", StylePalette.tool);
+        if (self.loading) return self.drawStatus(ctx, "Loading models…", StylePalette.panel_header);
         if (self.error_message) |msg| return self.drawStatus(ctx, msg, StylePalette.tool_failed);
         if (self.models.len == 0) return self.drawEmpty(ctx);
-        const widgets = try self.modelWidgets(ctx);
-        self.list.children = .{ .slice = widgets };
-        self.list.item_count = @intCast(widgets.len);
-        self.list.cursor = self.selection + 1;
+        const built = try self.modelWidgets(ctx);
+        if (built.widgets.len <= 1) return self.drawStatus(ctx, "No matching models", StylePalette.thinking_body);
+        self.list.children = .{ .slice = built.widgets };
+        self.list.item_count = @intCast(built.widgets.len);
+        self.list.cursor = built.cursor;
         self.syncListScroll();
         return panel.listSurface(ctx, self.widget(), self.list.widget());
     }
@@ -108,27 +130,42 @@ pub const Content = struct {
         return surface;
     }
 
-    fn modelWidgets(self: *Content, ctx: vxfw.DrawContext) ![]vxfw.Widget {
-        const widgets = try ctx.arena.alloc(vxfw.Widget, self.models.len + 1);
+    const Built = struct { widgets: []vxfw.Widget, cursor: u32 };
+
+    fn modelWidgets(self: *Content, ctx: vxfw.DrawContext) !Built {
+        const active_storage_idx = findActiveStorageIdx(self.models, self.active_model);
+
+        var match_count: usize = 0;
+        var d: u32 = 0;
+        while (d < self.models.len) : (d += 1) {
+            if (matches(self.models[displayToStorage(active_storage_idx, d)], self.filter)) match_count += 1;
+        }
+
+        const widgets = try ctx.arena.alloc(vxfw.Widget, match_count + 1);
         const header = try ctx.arena.create(Header);
         header.* = .{};
         widgets[0] = header.widget();
-        const rows = try ctx.arena.alloc(Row, self.models.len);
-        const active_storage_idx = findActiveStorageIdx(self.models, self.active_model);
-        var display_pos: u32 = 0;
-        while (display_pos < self.models.len) : (display_pos += 1) {
-            const storage_idx = displayToStorage(active_storage_idx, display_pos);
-            rows[display_pos] = .{
+        const rows = try ctx.arena.alloc(Row, match_count);
+
+        var cursor: u32 = 1;
+        var vis: usize = 0;
+        d = 0;
+        while (d < self.models.len) : (d += 1) {
+            const storage_idx = displayToStorage(active_storage_idx, d);
+            if (!matches(self.models[storage_idx], self.filter)) continue;
+            rows[vis] = .{
                 .model = &self.models[storage_idx],
-                .selected = self.selection == display_pos,
+                .selected = self.selection == d,
                 .column = self.column,
                 .active_model = self.active_model,
-                .reasoning_label = self.reasoningLabel(display_pos),
+                .reasoning_label = self.reasoningLabel(d),
                 .scope_label = scopeLabel(self.scope),
             };
-            widgets[display_pos + 1] = rows[display_pos].widget();
+            widgets[vis + 1] = rows[vis].widget();
+            if (self.selection == d) cursor = @intCast(vis + 1);
+            vis += 1;
         }
-        return widgets;
+        return .{ .widgets = widgets, .cursor = cursor };
     }
 
     fn reasoningLabel(self: *const Content, index: u32) []const u8 {
@@ -212,6 +249,50 @@ test "selection wrap to first row restores header" {
     try std.testing.expectEqual(@as(i17, 0), list.scroll.offset);
 }
 
+test "matches is a case-insensitive substring over label and id" {
+    const m: codex.Model = .{ .id = @constCast("gpt-5-codex"), .label = @constCast("GPT-5 Codex") };
+    try std.testing.expect(matches(m, ""));
+    try std.testing.expect(matches(m, "codex"));
+    try std.testing.expect(matches(m, "GPT"));
+    try std.testing.expect(matches(m, "5-CO"));
+    try std.testing.expect(!matches(m, "claude"));
+}
+
+test "filter limits the visible model rows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const models = [_]codex.Model{
+        .{ .id = @constCast("gpt-5"), .label = @constCast("GPT-5") },
+        .{ .id = @constCast("o3-mini"), .label = @constCast("o3-mini") },
+        .{ .id = @constCast("gpt-5-codex"), .label = @constCast("GPT-5 Codex") },
+    };
+    const reasoning = [_]u32{0} ** models.len;
+    const options = [_]ReasoningOption{.{ .label = "medium (Default)", .effort = .medium }};
+    var list: vxfw.ListView = .{ .children = .{ .slice = &.{} }, .draw_cursor = false };
+    var content: Content = .{
+        .models = &models,
+        .list = &list,
+        .selection = 0,
+        .column = .model,
+        .active_model = null,
+        .reasoning_options = &options,
+        .reasoning_indexes = &reasoning,
+        .scope = .global,
+        .filter = "gpt",
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 7 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    _ = try content.widget().draw(ctx);
+    // Two models match "gpt", plus the header row.
+    try std.testing.expectEqual(@as(?u32, 3), list.item_count);
+}
+
 pub const Row = struct {
     model: *const codex.Model,
     selected: bool,
@@ -228,13 +309,18 @@ pub const Row = struct {
         const self: *Row = @ptrCast(@alignCast(ptr));
         const width = ctx.max.width orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
+        if (self.selected) panel.fillRow(&surface, 0, StylePalette.selected);
+
         const model_focused = self.selected and self.column == .model;
         const prefix = if (model_focused) "‣ " else "  ";
-        const text = if (self.activeModel())
-            try std.fmt.allocPrint(ctx.arena, "{s}{s} [ACTIVE]", .{ prefix, self.model.label })
-        else
-            try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.model.label });
-        try panel.lineAt(&surface, 0, text, ctx, model_focused, message.ConversationLayout.left -| 1);
+        const start_col = message.ConversationLayout.left -| 1;
+        const base = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.model.label });
+        try panel.lineStyledAt(&surface, 0, base, ctx, start_col, columnStyle(model_focused, self.selected));
+        if (self.activeModel()) {
+            const badge_col: u16 = start_col +
+                @as(u16, @intCast(@min(ctx.stringWidth(base), @as(usize, std.math.maxInt(u16)))));
+            try panel.lineStyledAt(&surface, 0, " [ACTIVE]", ctx, badge_col, tui_style.onSelectionBg(StylePalette.success, self.selected));
+        }
         if (self.selected) {
             try self.drawReasoning(&surface, ctx);
             try self.drawScope(&surface, ctx);
@@ -251,13 +337,13 @@ pub const Row = struct {
         const focused = self.column == .reasoning;
         const prefix = if (focused) "‣ " else "  ";
         const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.reasoning_label });
-        try panel.lineAt(surface, 0, text, ctx, focused, panel.secondaryColumn(surface.size.width));
+        try panel.lineStyledAt(surface, 0, text, ctx, panel.secondaryColumn(surface.size.width), columnStyle(focused, self.selected));
     }
 
     fn drawScope(self: *const Row, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
         const focused = self.column == .scope;
         const prefix = if (focused) "‣ " else "  ";
         const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.scope_label });
-        try panel.lineAt(surface, 0, text, ctx, focused, scopeColumn(surface.size.width));
+        try panel.lineStyledAt(surface, 0, text, ctx, scopeColumn(surface.size.width), columnStyle(focused, self.selected));
     }
 };
