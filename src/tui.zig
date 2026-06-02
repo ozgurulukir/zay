@@ -115,6 +115,11 @@ pub const App = struct {
     /// the turn starts.
     pending_prompt: ?[]u8 = null,
     turn_discarded: bool = false,
+    /// When true, arrow keys navigate conversation blocks; when false they move
+    /// the cursor within the (multiline) input. Set when the cursor leaves the
+    /// top of the input, cleared when it re-enters from the last block or on any
+    /// edit/submit. See `RootWidget.captureEvent`.
+    block_nav: bool = false,
     at_active: bool = false,
     at_query: []u8 = "",
     at_results: std.ArrayList([]const u8) = .empty,
@@ -252,6 +257,7 @@ pub const App = struct {
 
     pub fn beginSubmit(self: *App) !?u32 {
         self.closeAtSearch();
+        self.block_nav = false;
         if (self.in_flight) return try self.enqueueSubmit();
         // If a previous turn was Esc-interrupted, force-cancel its worker
         // before starting a new one. Two concurrent workers would race on
@@ -463,6 +469,13 @@ pub const App = struct {
             return true;
         }
         if (key.matches(vaxis.Key.down, .{})) {
+            // Stepping down past the last block (when it can't scroll further)
+            // re-enters the input and traps the cursor there again.
+            if (self.block_nav and self.selectionIsLastMessage() and !self.selectedMessageCanScrollDown()) {
+                self.block_nav = false;
+                self.thread_auto_scroll = true;
+                return true;
+            }
             const scrolled = self.navigateThread(.next);
             self.thread_auto_scroll = !scrolled and self.selectionIsLastMessage() and !self.selectedMessageIsLong();
             return true;
@@ -1382,6 +1395,56 @@ pub const App = struct {
         return out;
     }
 
+    fn inputVisualLines(self: *const App) u16 {
+        var lines: u16 = 1;
+        for (self.input.buf.firstHalf()) |byte| if (byte == '\n') {
+            lines += 1;
+        };
+        for (self.input.buf.secondHalf()) |byte| if (byte == '\n') {
+            lines += 1;
+        };
+        return lines;
+    }
+
+    fn inputTextRows(self: *const App) u16 {
+        return self.inputVisualLines();
+    }
+
+    fn insertInputNewline(self: *App) !void {
+        try self.input.insertSliceAtCursor("\n");
+        self.resetInputChangeTracking();
+        try self.updateAtSearch();
+    }
+
+    fn moveInputCursorVertical(self: *App, move: VerticalMove) !bool {
+        const text = try self.peekInput();
+        defer self.gpa.free(text);
+        const cur = self.input.buf.firstHalf().len;
+        const cur_line_start = lineStartBefore(text, cur);
+        const col = graphemeColumn(text[cur_line_start..cur]);
+
+        const target = switch (move) {
+            .up => blk: {
+                if (cur_line_start == 0) return false;
+                const prev_start = lineStartBefore(text, cur_line_start - 1);
+                break :blk byteAtColumn(text, prev_start, cur_line_start - 1, col);
+            },
+            .down => blk: {
+                const nl = std.mem.indexOfScalarPos(u8, text, cur, '\n') orelse return false;
+                const next_start = nl + 1;
+                const next_end = std.mem.indexOfScalarPos(u8, text, next_start, '\n') orelse text.len;
+                break :blk byteAtColumn(text, next_start, next_end, col);
+            },
+        };
+
+        if (target < cur) {
+            self.input.buf.moveGapLeft(cur - target);
+        } else if (target > cur) {
+            self.input.buf.moveGapRight(target - cur);
+        }
+        return true;
+    }
+
     fn selectionIsLastMessage(self: *const App) bool {
         const selected = self.thread.selected orelse return false;
         if (self.thread.messages.items.len == 0) return false;
@@ -1389,6 +1452,7 @@ pub const App = struct {
     }
 
     fn jumpThreadToBottom(self: *App) void {
+        self.block_nav = false;
         self.thread.selectLast();
         self.thread_auto_scroll = true;
         self.thread_list.scroll.pending_lines = 0;
@@ -1446,6 +1510,18 @@ pub const App = struct {
         return rows > self.thread_view_height;
     }
 
+    /// True when the selected message is taller than the viewport and still has
+    /// rows hidden below the current scroll offset (mirrors the `.next` branch of
+    /// `scrollSelectedLongMessage`).
+    fn selectedMessageCanScrollDown(self: *const App) bool {
+        const selected = self.thread.selected orelse return false;
+        if (selected >= self.thread.messages.items.len) return false;
+        const rows = messageRows(self.thread.messages.items[selected], ConversationLayout.contentWidth(self.thread_view_width));
+        const height = self.thread_view_height;
+        if (rows <= height) return false;
+        return self.selectedMessageOffset(selected) < rows - height;
+    }
+
     fn anchorSelectedLongMessage(self: *App, direction: ThreadNavigation) void {
         const selected = self.thread.selected orelse return;
         if (selected >= self.thread.messages.items.len) return;
@@ -1498,8 +1574,10 @@ const RootLayout = struct {
     input_row: u16,
 };
 
-fn rootLayout(max_height: u16, panel_visible: bool) RootLayout {
-    const input_height: u16 = @min(max_height, 6);
+fn rootLayout(max_height: u16, panel_visible: bool, input_text_rows: u16) RootLayout {
+    const desired: u16 = 5 + input_text_rows;
+    const max_allowed: u16 = @max(@as(u16, 6), max_height -| 3);
+    const input_height: u16 = @min(max_height, @min(desired, max_allowed));
     const thread_height: u16 = max_height - input_height;
     const panel_height: u16 = if (panel_visible) @min(thread_height, 7) else 0;
     return .{
@@ -1601,6 +1679,14 @@ const RootWidget = struct {
                     return;
                 }
                 if (key.matches('c', .{ .ctrl = true })) {
+                    if (self.app.mode == .normal and self.app.input.buf.realLength() > 0) {
+                        self.app.clearInput();
+                        self.app.closeAtSearch();
+                        self.app.block_nav = false;
+                        self.app.pending_quit_at = null;
+                        ctx.consumeAndRedraw();
+                        return;
+                    }
                     const now = std.Io.Timestamp.now(self.app.io, .awake);
                     if (self.app.pending_quit_at) |first_press| {
                         const elapsed_ns = first_press.durationTo(now).nanoseconds;
@@ -1617,6 +1703,11 @@ const RootWidget = struct {
                 }
                 // Any other key cancels the pending-quit prompt.
                 self.app.pending_quit_at = null;
+                if (self.app.mode == .normal and key.matches(vaxis.Key.enter, .{ .shift = true })) {
+                    try self.app.insertInputNewline();
+                    ctx.consumeAndRedraw();
+                    return;
+                }
                 if (key.matches(vaxis.Key.enter, .{})) {
                     if (self.app.at_active and self.app.at_results.items.len > 0) {
                         try self.app.acceptAtSelection();
@@ -1625,6 +1716,32 @@ const RootWidget = struct {
                     }
                     try self.submit(ctx);
                     return;
+                }
+                // Arrow keys are owned by the input until the cursor leaves the
+                // top of it. While the input owns them (`!block_nav`) up/down
+                // move the cursor between lines; going up past the first line
+                // hands control to block navigation, and down stays trapped in
+                // the input. Once in block navigation the arrows fall through to
+                // `handleThreadKey`, which walks blocks and re-enters the input
+                // when you press down past the last block. The @-mention popup
+                // keeps the arrows for itself.
+                if (self.app.mode == .normal and !self.app.at_active) {
+                    if (key.matches(vaxis.Key.up, .{})) {
+                        if (!self.app.block_nav) {
+                            if (try self.app.moveInputCursorVertical(.up)) {
+                                ctx.consumeAndRedraw();
+                                return;
+                            }
+                            // Top line: leave the input and start walking blocks.
+                            self.app.block_nav = true;
+                        }
+                    } else if (key.matches(vaxis.Key.down, .{})) {
+                        if (!self.app.block_nav) {
+                            _ = try self.app.moveInputCursorVertical(.down);
+                            ctx.consumeAndRedraw();
+                            return;
+                        }
+                    }
                 }
                 if (try self.app.handleCommandKey(key)) {
                     ctx.consumeAndRedraw();
@@ -1734,7 +1851,7 @@ const RootWidget = struct {
         const self: *RootWidget = @ptrCast(@alignCast(ptr));
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
-        const layout = rootLayout(max_height, false);
+        const layout = rootLayout(max_height, false, self.app.inputTextRows());
 
         var thread_view: ThreadWidget = .{ .app = self.app };
         var input_view: InputWidget = .{ .app = self.app };
@@ -1899,11 +2016,6 @@ const command_panel_entries = [_]command_panel.Entry{
     .{ .name = "Resume" },
 };
 
-fn inputLabel(app: *const App) []const u8 {
-    _ = app;
-    return "Build";
-}
-
 fn overlayLabel(mode: App.Mode) []const u8 {
     return switch (mode) {
         .normal => "",
@@ -1962,6 +2074,7 @@ fn pickerSecondaryColumn(width: u16) u16 {
 
 fn inputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8) anyerror!void {
     const app: *App = @ptrCast(@alignCast(userdata.?));
+    app.block_nav = false;
     const was_command = app.mode == .command;
     try app.syncModeWithInput(value);
     if (!was_command and app.mode == .command) {
@@ -1999,7 +2112,10 @@ const OverlaySize = struct { width: u16, height: u16 };
 fn overlaySize(mode: App.Mode) OverlaySize {
     return switch (mode) {
         .normal => .{ .width = 0, .height = 0 },
-        .command, .provider_picker, .session_picker, .model_picker => .{ .width = 90, .height = 16 },
+        .command => .{ .width = 40, .height = 16 },
+        .provider_picker => .{ .width = 64, .height = 16 },
+        .session_picker => .{ .width = 80, .height = 16 },
+        .model_picker => .{ .width = 90, .height = 16 },
     };
 }
 
@@ -2042,14 +2158,32 @@ const OverlayWidget = struct {
         var border: vxfw.Border = .{
             .child = inner.widget(),
             .style = StylePalette.thinking_body,
-            .labels = &.{.{ .text = overlayLabel(self.app.mode), .alignment = .top_left }},
         };
-        return border.widget().draw(ctx.withConstraints(
+        var surface = try border.widget().draw(ctx.withConstraints(
             .{ .width = total_w, .height = total_h },
             .{ .width = total_w, .height = total_h },
         ));
+        writeBorderLabel(&surface, ctx, overlayLabel(self.app.mode));
+        return surface;
     }
 };
+
+fn writeBorderLabel(surface: *vxfw.Surface, ctx: vxfw.DrawContext, text: []const u8) void {
+    if (text.len == 0) return;
+    var col: u16 = 1;
+    var iter = ctx.graphemeIterator(text);
+    while (iter.next()) |grapheme| {
+        const bytes = grapheme.bytes(text);
+        const width: u16 = @intCast(ctx.stringWidth(bytes));
+        if (width == 0) continue;
+        if (col + width >= surface.size.width) break;
+        surface.writeCell(col, 0, .{
+            .char = .{ .grapheme = bytes, .width = @intCast(width) },
+            .style = StylePalette.border_label,
+        });
+        col += width;
+    }
+}
 
 const OverlayInner = struct {
     app: *App,
@@ -2216,11 +2350,102 @@ const CommandInputText = struct {
 
     fn drawInputText(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *CommandInputText = @ptrCast(@alignCast(ptr));
-        var surface = try self.app.input.draw(ctx);
-        try tintCommandInput(&surface, self.app, ctx);
+        if (self.app.inputVisualLines() <= 1) {
+            var surface = try self.app.input.draw(ctx);
+            try tintCommandInput(&surface, self.app, ctx);
+            return surface;
+        }
+        return self.drawMultiline(ctx);
+    }
+
+    fn drawMultiline(self: *CommandInputText, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const width = ctx.max.width orelse 0;
+        const height: u16 = @max(ctx.max.height orelse 1, 1);
+        var surface = try vxfw.Surface.init(ctx.arena, self.app.input.widget(), .{ .width = width, .height = height });
+        if (width == 0) return surface;
+
+        const first = self.app.input.buf.firstHalf();
+        const second = self.app.input.buf.secondHalf();
+
+        var cursor_line: u16 = 0;
+        for (first) |byte| if (byte == '\n') {
+            cursor_line += 1;
+        };
+        const last_nl = std.mem.lastIndexOfScalar(u8, first, '\n');
+        const cursor_prefix = if (last_nl) |idx| first[idx + 1 ..] else first;
+        const cursor_col: u16 = @intCast(@min(ctx.stringWidth(cursor_prefix), @as(usize, width -| 1)));
+
+        var total_lines: u16 = 1;
+        for (first) |byte| if (byte == '\n') {
+            total_lines += 1;
+        };
+        for (second) |byte| if (byte == '\n') {
+            total_lines += 1;
+        };
+
+        const first_visible = firstVisibleLine(cursor_line, total_lines, height);
+
+        const combined = try ctx.arena.alloc(u8, first.len + second.len);
+        @memcpy(combined[0..first.len], first);
+        @memcpy(combined[first.len..], second);
+
+        var line_index: u16 = 0;
+        var iter = std.mem.splitScalar(u8, combined, '\n');
+        while (iter.next()) |line| : (line_index += 1) {
+            if (line_index < first_visible) continue;
+            const row = line_index - first_visible;
+            if (row >= height) break;
+            drawInputLineClipped(&surface, ctx, row, line, width);
+        }
+
+        surface.cursor = .{ .row = cursor_line -| first_visible, .col = cursor_col };
         return surface;
     }
 };
+
+const VerticalMove = enum { up, down };
+
+fn lineStartBefore(text: []const u8, pos: usize) usize {
+    if (std.mem.lastIndexOfScalar(u8, text[0..pos], '\n')) |idx| return idx + 1;
+    return 0;
+}
+
+fn graphemeColumn(slice: []const u8) usize {
+    var iter = vaxis.unicode.graphemeIterator(slice);
+    var n: usize = 0;
+    while (iter.next()) |_| n += 1;
+    return n;
+}
+
+fn byteAtColumn(text: []const u8, line_start: usize, line_end: usize, col: usize) usize {
+    var iter = vaxis.unicode.graphemeIterator(text[line_start..line_end]);
+    var off: usize = line_start;
+    var n: usize = 0;
+    while (n < col) : (n += 1) {
+        const grapheme = iter.next() orelse break;
+        off += grapheme.len;
+    }
+    return off;
+}
+
+fn firstVisibleLine(cursor_line: u16, total: u16, visible: u16) u16 {
+    if (visible == 0 or total <= visible) return 0;
+    if (cursor_line < visible) return 0;
+    return @min(cursor_line - visible + 1, total - visible);
+}
+
+fn drawInputLineClipped(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, text: []const u8, width: u16) void {
+    var col: u16 = 0;
+    var iter = ctx.graphemeIterator(text);
+    while (iter.next()) |grapheme| {
+        const bytes = grapheme.bytes(text);
+        const w: u16 = @intCast(ctx.stringWidth(bytes));
+        if (w == 0) continue;
+        if (col + w > width) break;
+        surface.writeCell(col, row, .{ .char = .{ .grapheme = bytes, .width = @intCast(w) } });
+        col += w;
+    }
+}
 
 const InputWidget = struct {
     app: *App,
@@ -2237,12 +2462,19 @@ const InputWidget = struct {
         const max_width = ctx.max.width orelse 0;
         const height: u16 = ctx.max.height orelse 4;
 
-        if (height <= 3) return try self.drawInputBorder(ctx, max_width, height);
-
         const queued_visible = self.app.queued_user_messages.items.len > 0;
         const input_row: u16 = if (queued_visible) 1 else 0;
-        const show_branch = if (queued_visible) height > 5 else height > 4;
-        const show_hint = if (queued_visible) height > 6 else height > 5;
+        const avail: u16 = height -| input_row;
+        const text_rows: u16 = @min(self.app.inputTextRows(), @max(@as(u16, 1), avail -| 2));
+        const border_height: u16 = text_rows + 2;
+
+        if (height <= input_row + border_height) {
+            return try self.drawInputBorder(ctx, max_width, @min(height, border_height), text_rows);
+        }
+
+        const base_row: u16 = input_row + border_height; // first status row
+        const show_branch = height >= base_row + 2;
+        const show_hint = height >= base_row + 3;
         const children_count: usize = 3 + @as(usize, if (show_branch) 1 else 0) + @as(usize, if (show_hint) 1 else 0) + @as(usize, if (queued_visible) 1 else 0);
         const children = try ctx.arena.alloc(vxfw.SubSurface, children_count);
         var child_index: usize = 0;
@@ -2256,10 +2488,10 @@ const InputWidget = struct {
         }
         children[child_index] = .{
             .origin = .{ .row = input_row, .col = 0 },
-            .surface = try self.drawInputBorder(ctx, max_width, 3),
+            .surface = try self.drawInputBorder(ctx, max_width, border_height, text_rows),
             .z_index = 0,
         };
-        try self.drawInputStatus(ctx, children[child_index + 1 ..], max_width, input_row, .{ .branch = show_branch, .hint = show_hint });
+        try self.drawInputStatus(ctx, children[child_index + 1 ..], max_width, base_row, .{ .branch = show_branch, .hint = show_hint });
         return .{
             .size = .{ .width = max_width, .height = height },
             .widget = self.widget(),
@@ -2268,25 +2500,25 @@ const InputWidget = struct {
         };
     }
 
-    fn drawInputBorder(self: *InputWidget, ctx: vxfw.DrawContext, max_width: u16, height: u16) std.mem.Allocator.Error!vxfw.Surface {
-        var prompt: vxfw.Text = .{ .text = ">", .softwrap = false, .width_basis = .parent };
+    fn drawInputBorder(self: *InputWidget, ctx: vxfw.DrawContext, max_width: u16, border_height: u16, text_rows: u16) std.mem.Allocator.Error!vxfw.Surface {
+        const prompt_text: []const u8 = if (self.app.mode == .normal) ">" else " ";
+        var prompt: vxfw.Text = .{ .text = prompt_text, .softwrap = false, .width_basis = .parent };
         var prompt_box: vxfw.SizedBox = .{ .child = prompt.widget(), .size = .{ .width = 2, .height = 1 } };
         var command_input: CommandInputText = .{ .app = self.app };
-        var input_box: vxfw.SizedBox = .{ .child = command_input.widget(), .size = .{ .width = max_width -| 2, .height = 1 } };
+        var input_box: vxfw.SizedBox = .{ .child = command_input.widget(), .size = .{ .width = max_width -| 2, .height = text_rows } };
         var row: vxfw.FlexRow = .{
             .children = &.{
                 .{ .widget = prompt_box.widget(), .flex = 0 },
                 .{ .widget = input_box.widget(), .flex = 1 },
             },
         };
-        var row_box: vxfw.SizedBox = .{ .child = row.widget(), .size = .{ .width = max_width -| 2, .height = 1 } };
+        var row_box: vxfw.SizedBox = .{ .child = row.widget(), .size = .{ .width = max_width -| 2, .height = text_rows } };
         var border: vxfw.Border = .{
             .child = row_box.widget(),
             .style = StylePalette.thinking_body,
-            .labels = &.{.{ .text = inputLabel(self.app), .alignment = .top_left }},
         };
-        var box: vxfw.SizedBox = .{ .child = border.widget(), .size = .{ .width = max_width, .height = height } };
-        return box.widget().draw(ctx.withConstraints(.{ .width = max_width, .height = height }, .{ .width = max_width, .height = height }));
+        var box: vxfw.SizedBox = .{ .child = border.widget(), .size = .{ .width = max_width, .height = border_height } };
+        return box.widget().draw(ctx.withConstraints(.{ .width = max_width, .height = border_height }, .{ .width = max_width, .height = border_height }));
     }
 
     const StatusRows = struct { branch: bool, hint: bool };
@@ -2299,7 +2531,7 @@ const InputWidget = struct {
         return queued_text.widget().draw(ctx.withConstraints(.{ .width = width, .height = 1 }, .{ .width = width, .height = 1 }));
     }
 
-    fn drawInputStatus(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, max_width: u16, row_offset: u16, rows: StatusRows) std.mem.Allocator.Error!void {
+    fn drawInputStatus(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, max_width: u16, base_row: u16, rows: StatusRows) std.mem.Allocator.Error!void {
         const cwd_raw = if (self.app.runtime) |runtime| runtime.cwd else self.app.agent.cwd;
         const home_dir = if (self.app.runtime) |runtime| runtime.home_dir else "";
         const cwd = try tui_status.formatCwdRelative(ctx.arena, cwd_raw, home_dir);
@@ -2317,7 +2549,7 @@ const InputWidget = struct {
             .inner_width = status_inner_width,
             .cwd_width = cwd_width,
             .model_width = model_width,
-            .row_offset = row_offset,
+            .base_row = base_row,
             .show_branch = rows.branch,
             .show_hint = rows.hint,
         });
@@ -2328,7 +2560,7 @@ const InputWidget = struct {
         inner_width: u16,
         cwd_width: u16,
         model_width: u16,
-        row_offset: u16,
+        base_row: u16,
         show_branch: bool,
         show_hint: bool,
     };
@@ -2336,7 +2568,7 @@ const InputWidget = struct {
     fn drawInputStatusRow(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, cwd: []const u8, status_text: []const u8, layout: StatusLayout) std.mem.Allocator.Error!void {
         var cwd_text: vxfw.Text = .{ .text = cwd, .style = StylePalette.cwd, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
         var model_text: vxfw.Text = .{ .text = status_text, .style = StylePalette.model_status, .text_align = .right, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
-        const status_row = @as(u16, 3) + layout.row_offset;
+        const status_row = layout.base_row;
         var child_index: usize = 0;
         children[child_index] = .{
             .origin = .{ .row = status_row, .col = layout.padding_x },
@@ -2412,8 +2644,8 @@ fn commandInputSegmentEnd(input: []const u8) usize {
 }
 
 test "root layout keeps input fixed when panel opens" {
-    const normal = rootLayout(30, false);
-    const picker = rootLayout(30, true);
+    const normal = rootLayout(30, false, 1);
+    const picker = rootLayout(30, true, 1);
 
     try std.testing.expectEqual(normal.input_row, picker.input_row);
     try std.testing.expectEqual(normal.thread_height, picker.thread_height);
@@ -2422,13 +2654,163 @@ test "root layout keeps input fixed when panel opens" {
 }
 
 test "root layout clamps panel above input on short screens" {
-    const layout = rootLayout(8, true);
+    const layout = rootLayout(8, true, 1);
 
     try std.testing.expectEqual(@as(u16, 6), layout.input_height);
     try std.testing.expectEqual(@as(u16, 2), layout.thread_height);
     try std.testing.expectEqual(@as(u16, 2), layout.panel_height);
     try std.testing.expectEqual(@as(u16, 0), layout.panel_row);
     try std.testing.expectEqual(@as(u16, 2), layout.input_row);
+}
+
+test "root layout grows the input as text rows increase" {
+    // Single line keeps the 6-row baseline; each extra row adds one to the
+    // input and removes one from the thread.
+    const one = rootLayout(30, false, 1);
+    try std.testing.expectEqual(@as(u16, 6), one.input_height);
+    try std.testing.expectEqual(@as(u16, 24), one.thread_height);
+
+    const three = rootLayout(30, false, 3);
+    try std.testing.expectEqual(@as(u16, 8), three.input_height);
+    try std.testing.expectEqual(@as(u16, 22), three.thread_height);
+
+    // A short screen still leaves the thread some room.
+    const tight = rootLayout(10, false, 6);
+    try std.testing.expectEqual(@as(u16, 7), tight.input_height);
+    try std.testing.expectEqual(@as(u16, 3), tight.thread_height);
+}
+
+test "input text rows track the line count" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try std.testing.expectEqual(@as(u16, 1), app.inputVisualLines());
+    try std.testing.expectEqual(@as(u16, 1), app.inputTextRows());
+
+    try app.input.insertSliceAtCursor("a\nb\nc");
+    try std.testing.expectEqual(@as(u16, 3), app.inputVisualLines());
+    try std.testing.expectEqual(@as(u16, 3), app.inputTextRows());
+
+    // The input keeps growing with the line count (no fixed cap).
+    try app.input.insertSliceAtCursor("\n\n\n\n\n\n\n\n");
+    try std.testing.expectEqual(@as(u16, 11), app.inputTextRows());
+}
+
+test "arrow up and down move the input cursor between lines" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // Cursor ends on the third line at column 2 ("ca|t").
+    try app.input.insertSliceAtCursor("fox\nox\ncat");
+    app.input.cursorLeft(); // between "ca" and "t"
+
+    // Up keeps the column, clamped to the shorter middle line ("ox" -> end).
+    try std.testing.expect(try app.moveInputCursorVertical(.up));
+    try std.testing.expectEqualStrings("fox\nox", app.input.buf.firstHalf());
+
+    // Up again lands at column 2 of the first line ("fo|x").
+    try std.testing.expect(try app.moveInputCursorVertical(.up));
+    try std.testing.expectEqualStrings("fo", app.input.buf.firstHalf());
+
+    // Already on the first line: no move, caller falls back to thread nav.
+    try std.testing.expect(!(try app.moveInputCursorVertical(.up)));
+
+    // Down returns to the middle line at the same column ("ox" -> end).
+    try std.testing.expect(try app.moveInputCursorVertical(.down));
+    try std.testing.expectEqualStrings("fox\nox", app.input.buf.firstHalf());
+
+    // Down to the last line, then no further move.
+    try std.testing.expect(try app.moveInputCursorVertical(.down));
+    try std.testing.expectEqualStrings("fox\nox\nca", app.input.buf.firstHalf());
+    try std.testing.expect(!(try app.moveInputCursorVertical(.down)));
+}
+
+test "ctrl-c clears a non-empty input instead of arming quit" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    try app.input.insertSliceAtCursor("draft message");
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    const ctrl_c: vxfw.Event = .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } };
+    try RootWidget.captureEvent(&root, &ctx, ctrl_c);
+
+    // The input is cleared and the quit sequence is not armed.
+    try std.testing.expectEqual(@as(usize, 0), app.input.buf.realLength());
+    try std.testing.expect(app.pending_quit_at == null);
+    try std.testing.expect(!ctx.quit);
+}
+
+test "down past the last block re-enters the input" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    // Tall viewport so the short messages never count as scrollable.
+    app.thread_view_width = 80;
+    app.thread_view_height = 100;
+
+    _ = try app.thread.append(gpa, .agent, "agent", "one");
+    _ = try app.thread.append(gpa, .agent, "agent", "two");
+    _ = try app.thread.append(gpa, .agent, "agent", "three");
+    // Following the tail, the last block is selected.
+    try std.testing.expectEqual(@as(?u32, 2), app.thread.selected);
+
+    // In block navigation, up walks to an earlier block.
+    app.block_nav = true;
+    _ = try app.handleThreadKey(.{ .codepoint = vaxis.Key.up });
+    try std.testing.expectEqual(@as(?u32, 1), app.thread.selected);
+
+    // Down walks back toward the last block, still navigating blocks.
+    _ = try app.handleThreadKey(.{ .codepoint = vaxis.Key.down });
+    try std.testing.expectEqual(@as(?u32, 2), app.thread.selected);
+    try std.testing.expect(app.block_nav);
+
+    // Down again on the last block hands control back to the input.
+    _ = try app.handleThreadKey(.{ .codepoint = vaxis.Key.down });
+    try std.testing.expect(!app.block_nav);
+    try std.testing.expectEqual(@as(?u32, 2), app.thread.selected);
+}
+
+test "shift enter inserts a newline instead of submitting" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    try app.input.insertSliceAtCursor("line one");
+    try app.insertInputNewline();
+    try app.input.insertSliceAtCursor("line two");
+
+    const value = try app.peekInput();
+    defer gpa.free(value);
+    try std.testing.expectEqualStrings("line one\nline two", value);
+    try std.testing.expectEqual(@as(u16, 2), app.inputVisualLines());
+}
+
+test "firstVisibleLine keeps the cursor line within the window" {
+    try std.testing.expectEqual(@as(u16, 0), firstVisibleLine(0, 3, 4));
+    try std.testing.expectEqual(@as(u16, 0), firstVisibleLine(3, 4, 4));
+    // Cursor past the fold pins to the bottom edge.
+    try std.testing.expectEqual(@as(u16, 1), firstVisibleLine(4, 10, 4));
+    try std.testing.expectEqual(@as(u16, 6), firstVisibleLine(9, 10, 4));
 }
 
 test "root overlay host does not paint outside panel" {
@@ -2458,7 +2840,7 @@ test "root overlay host does not paint outside panel" {
     try std.testing.expectEqual(@as(usize, 1), overlay_host.children.len);
 
     const panel_surface = overlay_host.children[0].surface;
-    try std.testing.expectEqual(@as(u16, 90), panel_surface.size.width);
+    try std.testing.expectEqual(@as(u16, 40), panel_surface.size.width);
     try std.testing.expectEqual(@as(u16, 16), panel_surface.size.height);
 }
 
