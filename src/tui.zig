@@ -18,6 +18,7 @@ const agent_worker = @import("tui/agent_worker.zig");
 const tui_thread_projection = @import("tui/thread_projection.zig");
 const tui_metrics = @import("tui/metrics.zig");
 const tui_message = @import("tui/widgets/message.zig");
+const blackhole = @import("tui/blackhole.zig");
 const at_search = @import("tui/widgets/at_search.zig");
 const command_panel = @import("tui/widgets/command_panel.zig");
 const model_loader = @import("tui/model_loader.zig");
@@ -82,6 +83,12 @@ pub const App = struct {
     thread_projection: tui_thread_projection.ThreadProjection = .{},
     loading_frame: u8 = 0,
     loading_tick_active: bool = false,
+    // Black-hole intro animation. `blackhole_visible` is recomputed each draw
+    // (true only while the startup logo sits at the top of the viewport) and
+    // gates the animation tick so it stops costing anything once the logo
+    // scrolls away.
+    blackhole_frame: u16 = 0,
+    blackhole_visible: bool = true,
     thread_auto_scroll: bool = true,
     git_label: []const u8 = "",
     thread_view_width: u16 = 80,
@@ -350,6 +357,11 @@ pub const App = struct {
         std.debug.assert(tui_message.loading_frames.len > 0);
         self.loading_frame +%= 1;
         if (self.loading_frame >= tui_message.loading_frames.len) self.loading_frame = 0;
+    }
+
+    fn advanceBlackholeFrame(self: *App) void {
+        self.blackhole_frame += 1;
+        if (self.blackhole_frame >= blackhole.frame_count) self.blackhole_frame = 0;
     }
 
     pub fn applyAgentEvent(self: *App, event: agent_mod.Agent.Event) !bool {
@@ -1637,18 +1649,14 @@ pub fn run(
     app.bindInputCallbacks();
     defer app.deinit();
 
-    const logo = try loadStartupLogo(gpa);
-    defer gpa.free(logo);
-    _ = try app.thread.append(gpa, .logo, "logo", logo);
+    // The logo message is a marker: the black-hole animation renders its frames
+    // directly (see tui/blackhole.zig), so the body is intentionally empty.
+    _ = try app.thread.append(gpa, .logo, "logo", "");
 
     app.git_label = loadGitLabel(gpa, init.io, runtime.cwd) catch "";
 
     var root: RootWidget = .{ .app = &app };
     try fw_app.run(root.widget(), .{});
-}
-
-fn loadStartupLogo(gpa: std.mem.Allocator) ![]u8 {
-    return gpa.dupe(u8, @embedFile("assets/logo.txt"));
 }
 
 fn loadGitLabel(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) ![]const u8 {
@@ -1677,6 +1685,7 @@ fn loadGitLabel(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) ![]const u8
 const RootWidget = struct {
     app: *App,
     spinner_tick_accum: u32 = 0,
+    blackhole_tick_accum: u32 = 0,
 
     fn widget(self: *RootWidget) vxfw.Widget {
         return .{
@@ -1692,13 +1701,18 @@ const RootWidget = struct {
         switch (event) {
             .init => {
                 try ctx.requestFocus(self.app.input.widget());
+                try self.ensureTick(ctx);
                 ctx.consumeAndRedraw();
             },
             .mouse => |mouse| {
+                // Scrolling may bring the logo back into view; the tick stops
+                // itself again on the next frame if it didn't.
+                try self.ensureTick(ctx);
                 if (mouse.button == .wheel_up) self.app.thread_auto_scroll = false;
                 if (mouse.button == .wheel_down) self.app.updateMouseAutoScroll();
             },
             .key_press => |key| {
+                try self.ensureTick(ctx);
                 if (key.matches(vaxis.Key.escape, .{})) {
                     if (self.app.at_active) {
                         self.app.closeAtSearch();
@@ -1820,8 +1834,24 @@ const RootWidget = struct {
             self.spinner_tick_accum = 0;
         }
 
+        if (self.app.blackhole_visible) {
+            // Carry the remainder so the average interval tracks ~24 fps even
+            // though the host tick (30 ms) is coarser than the frame interval.
+            self.blackhole_tick_accum += drain_tick_ms;
+            while (self.blackhole_tick_accum >= blackhole.frame_interval_ms) {
+                self.blackhole_tick_accum -= blackhole.frame_interval_ms;
+                self.app.advanceBlackholeFrame();
+                visible_change = true;
+            }
+        } else {
+            self.blackhole_tick_accum = 0;
+        }
+
         const model_loading = self.app.model_load_future != null;
-        const should_tick = self.app.in_flight or self.app.thread_projection.loading_index != null or model_loading;
+        const should_tick = self.app.in_flight or
+            self.app.thread_projection.loading_index != null or
+            model_loading or
+            self.app.blackhole_visible;
         if (should_tick) {
             try ctx.tick(drain_tick_ms, self.widget());
         } else {
@@ -1835,7 +1865,9 @@ const RootWidget = struct {
         }
     }
 
-    fn startLoadingTick(self: *RootWidget, ctx: *vxfw.EventContext) !void {
+    // Schedule the shared animation/drain tick if one isn't already pending.
+    // Drives the spinner, agent-event draining, and the black-hole intro.
+    fn ensureTick(self: *RootWidget, ctx: *vxfw.EventContext) !void {
         if (self.app.loading_tick_active) return;
         self.app.loading_tick_active = true;
         self.spinner_tick_accum = 0;
@@ -1845,14 +1877,14 @@ const RootWidget = struct {
     fn submit(self: *RootWidget, ctx: *vxfw.EventContext) !void {
         if (try self.app.submitMode()) {
             try self.syncFocus(ctx);
-            if (self.app.model_load_future != null) try self.startLoadingTick(ctx);
+            if (self.app.model_load_future != null) try self.ensureTick(ctx);
             ctx.consumeAndRedraw();
             return;
         }
         const loading_index = (try self.app.beginSubmit()) orelse return;
         _ = loading_index;
         try self.app.startTurn();
-        try self.startLoadingTick(ctx);
+        try self.ensureTick(ctx);
         ctx.consumeAndRedraw();
     }
 
@@ -1883,9 +1915,9 @@ const RootWidget = struct {
                 }
                 continue;
             }
-            if (self.app.thread_projection.loading_index != null) try self.startLoadingTick(ctx);
+            if (self.app.thread_projection.loading_index != null) try self.ensureTick(ctx);
             if (try self.app.applyAgentEvent(event_ptr.*)) visible_change = true;
-            if (self.app.thread_projection.loading_index != null) try self.startLoadingTick(ctx);
+            if (self.app.thread_projection.loading_index != null) try self.ensureTick(ctx);
         }
         return visible_change;
     }
@@ -1987,7 +2019,19 @@ const ThreadWidget = struct {
             .child = self.app.thread_list.widget(),
             .padding = ConversationLayout.verticalPadding(),
         };
-        return list_padding.widget().draw(ctx);
+        const surface = try list_padding.widget().draw(ctx);
+        self.updateBlackholeVisibility();
+        return surface;
+    }
+
+    // The intro animation only runs while the startup logo (message 0) is the
+    // first item the list view is rendering. Once a turn pushes it off the top,
+    // `scroll.top` advances and the animation tick is allowed to stop.
+    fn updateBlackholeVisibility(self: *ThreadWidget) void {
+        const messages = self.app.thread.messages.items;
+        self.app.blackhole_visible = messages.len > 0 and
+            messages[0].kind == .logo and
+            self.app.thread_list.scroll.top == 0;
     }
 
     fn syncViewport(self: *ThreadWidget, ctx: vxfw.DrawContext) void {
@@ -2004,7 +2048,7 @@ const ThreadWidget = struct {
         const bodies = try ctx.arena.alloc(MessageWidget, messages.len);
         for (messages, 0..) |message, index| {
             const selected = if (self.app.thread.selected) |selected_index| selected_index == index else false;
-            bodies[index] = .{ .message = message, .selected = selected, .loading_frame = self.app.loading_frame };
+            bodies[index] = .{ .message = message, .selected = selected, .loading_frame = self.app.loading_frame, .blackhole_frame = self.app.blackhole_frame };
             widgets[index] = bodies[index].widget();
         }
         return widgets;
@@ -4070,6 +4114,7 @@ test "expanded tool surface height cannot overflow vxfw buffer size" {
         .message = message,
         .selected = true,
         .loading_frame = 0,
+        .blackhole_frame = 0,
     };
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();

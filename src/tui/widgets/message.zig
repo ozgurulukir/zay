@@ -6,9 +6,9 @@ const terminal_markdown = @import("terminal_markdown");
 const thread_mod = @import("../../thread.zig");
 const tui_metrics = @import("../metrics.zig");
 const tui_style = @import("../style.zig");
+const blackhole = @import("../blackhole.zig");
 
 const StylePalette = tui_style.Palette;
-const gradientStyle = tui_style.gradientStyle;
 const mergedSelectedStyle = tui_style.mergedSelectedStyle;
 const messageRows = tui_metrics.messageRows;
 
@@ -37,6 +37,7 @@ pub const MessageWidget = struct {
     message: thread_mod.Message,
     selected: bool,
     loading_frame: u8,
+    blackhole_frame: u16,
 
     pub fn widget(self: *MessageWidget) vxfw.Widget {
         return .{
@@ -71,7 +72,7 @@ pub const MessageWidget = struct {
             .user => drawWrapped(surface, self.message.body, StylePalette.user, styled_as_selected, &row, ctx, 2, StylePalette.user),
             .agent => drawMarkdown(surface, self.message.body, styled_as_selected, &row, ctx),
             .notice => drawWrapped(surface, self.message.body, StylePalette.tool_failed, styled_as_selected, &row, ctx, 2, StylePalette.tool_failed),
-            .logo => drawLogo(surface, self.message.body, &row, ctx),
+            .logo => drawBlackhole(surface, self.blackhole_frame, &row, ctx),
             .tool => {
                 const title_style = if (self.message.failed) StylePalette.tool_failed else StylePalette.tool;
                 drawWrapped(surface, self.message.title, title_style, styled_as_selected, &row, ctx, 0, null);
@@ -99,14 +100,36 @@ pub const MessageWidget = struct {
         row.* += 1;
     }
 
-    fn drawLogo(surface: *vxfw.Surface, text: []const u8, row: *u16, ctx: vxfw.DrawContext) void {
+    fn drawBlackhole(surface: *vxfw.Surface, frame_index: u16, row: *u16, ctx: vxfw.DrawContext) void {
+        _ = ctx;
+        const data = blackhole.frame(frame_index);
         var line_start: usize = 0;
-        while (line_start <= text.len) {
-            const line_end = std.mem.findScalarPos(u8, text, line_start, '\n') orelse text.len;
-            writeGradient(surface, text[line_start..line_end], row.*, ctx);
+        while (line_start <= data.len) {
+            const line_end = std.mem.findScalarPos(u8, data, line_start, '\n') orelse data.len;
+            writeBlackholeLine(surface, data[line_start..line_end], row.*);
             row.* += 1;
-            if (line_end == text.len) break;
+            if (line_end == data.len) break;
             line_start = line_end + 1;
+        }
+    }
+
+    // Frames are single-width ASCII, so we walk bytes directly (no grapheme
+    // segmentation) and slice glyph bytes out of the static frame data — those
+    // slices outlive the render, so the cells need no allocation. Void bytes
+    // are skipped entirely, leaving the terminal background as empty space.
+    fn writeBlackholeLine(surface: *vxfw.Surface, line: []const u8, row: u16) void {
+        if (row >= surface.size.height) return;
+        var col = ConversationLayout.left;
+        const col_limit = surface.size.width -| ConversationLayout.right;
+        for (line, 0..) |byte, i| {
+            if (col >= col_limit) return;
+            if (blackhole.colorAt(byte)) |rgb| {
+                surface.writeCell(col, row, .{
+                    .char = .{ .grapheme = line[i .. i + 1], .width = 1 },
+                    .style = .{ .fg = .{ .rgb = rgb } },
+                });
+            }
+            col += 1;
         }
     }
 
@@ -201,24 +224,6 @@ pub const MessageWidget = struct {
         }
     }
 
-    fn writeGradient(surface: *vxfw.Surface, text: []const u8, row: u16, ctx: vxfw.DrawContext) void {
-        const gradient_width: u16 = @max(@min(ctx.stringWidth(text), std.math.maxInt(u16)), 1);
-        var col: u16 = ConversationLayout.left;
-        const col_limit = surface.size.width -| ConversationLayout.right;
-        var iter = ctx.graphemeIterator(text);
-        while (iter.next()) |grapheme| {
-            if (col >= col_limit) return;
-            const bytes = grapheme.bytes(text);
-            const width: u8 = @intCast(ctx.stringWidth(bytes));
-            if (width == 0) continue;
-            if (col + width > col_limit) return;
-            surface.writeCell(col, row, .{
-                .char = .{ .grapheme = bytes, .width = width },
-                .style = gradientStyle(col - ConversationLayout.left, gradient_width, true),
-            });
-            col += width;
-        }
-    }
 };
 
 fn drawMarkdown(

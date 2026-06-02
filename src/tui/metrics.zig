@@ -2,6 +2,7 @@ const std = @import("std");
 
 const terminal_markdown = @import("terminal_markdown");
 const thread_mod = @import("../thread.zig");
+const blackhole = @import("blackhole.zig");
 
 pub const RowViewport = struct {
     first: u32,
@@ -83,7 +84,7 @@ pub fn messageContentRows(message: thread_mod.Message, width: u16) u16 {
     return switch (message.kind) {
         .user, .notice => textRows(message.body, width -| 2),
         .agent => terminal_markdown.countRows(message.body, @max(width, 1)),
-        .logo => logoRows(message.body),
+        .logo => blackhole.rows,
         .thinking => if (message.expanded)
             1 + textRows(message.body, width -| 2)
         else
@@ -100,15 +101,6 @@ pub fn toolBodyRows(message: thread_mod.Message, width: u16) u16 {
     var rows: u16 = 0;
     if (message.body.len > 0) rows += textRows(message.body, width);
     if (message.stderr_body) |stderr| rows += textRows(stderr, width);
-    return rows;
-}
-
-pub fn logoRows(text: []const u8) u16 {
-    if (text.len == 0) return 1;
-    var rows: u16 = 1;
-    for (text) |byte| {
-        if (byte == '\n') rows += 1;
-    }
     return rows;
 }
 
