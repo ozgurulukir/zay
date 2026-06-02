@@ -73,7 +73,8 @@ pub const MessageWidget = struct {
             .notice => drawWrapped(surface, self.message.body, StylePalette.tool_failed, styled_as_selected, &row, ctx, 2, StylePalette.tool_failed),
             .logo => drawLogo(surface, self.message.body, &row, ctx),
             .tool => {
-                drawWrapped(surface, self.message.title, StylePalette.tool, styled_as_selected, &row, ctx, 0, null);
+                const title_style = if (self.message.failed) StylePalette.tool_failed else StylePalette.tool;
+                drawWrapped(surface, self.message.title, title_style, styled_as_selected, &row, ctx, 0, null);
                 if (self.message.expanded) drawToolBody(surface, self.message, styled_as_selected, &row, ctx);
             },
             .thinking => {

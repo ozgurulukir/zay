@@ -3,6 +3,10 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const panel = @import("panel.zig");
+const message = @import("message.zig");
+const tui_style = @import("../style.zig");
+
+const StylePalette = tui_style.Palette;
 
 const assert = std.debug.assert;
 
@@ -76,10 +80,14 @@ pub const Content = struct {
     fn drawCodex(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
         const focused = self.state.selection == 0 and self.state.column == .provider;
         const prefix = if (focused) "‣ " else "  ";
-        const label = if (self.codex_signed_in) "OpenAI Codex [CONNECTED]" else "OpenAI Codex";
-        const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, label });
-        try panel.commandLine(surface, 0, text, ctx, focused);
-        if (self.codex_signed_in) try self.drawSignOut(surface, ctx);
+        const base = try std.fmt.allocPrint(ctx.arena, "{s}OpenAI Codex", .{prefix});
+        try panel.commandLine(surface, 0, base, ctx, focused);
+        if (self.codex_signed_in) {
+            const badge_col: u16 = (message.ConversationLayout.left -| 1) +
+                @as(u16, @intCast(@min(ctx.stringWidth(base), @as(usize, std.math.maxInt(u16)))));
+            try panel.lineStyledAt(surface, 0, " [CONNECTED]", ctx, badge_col, tui_style.onSelectionBg(StylePalette.success, focused));
+            try self.drawSignOut(surface, ctx);
+        }
     }
 
     fn drawSignOut(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {

@@ -46,8 +46,17 @@ pub fn commandLine(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw
     try lineAt(surface, row, text, ctx, selected, message.ConversationLayout.left -| 1);
 }
 
+pub fn fillRow(surface: *vxfw.Surface, row: u16, style: vaxis.Style) void {
+    if (row >= surface.size.height) return;
+    var col: u16 = 0;
+    while (col < surface.size.width) : (col += 1) {
+        surface.writeCell(col, row, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
+    }
+}
+
 pub fn lineAt(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool, start_col: u16) !void {
-    const active_style = if (selected) StylePalette.tool else StylePalette.thinking_body;
+    if (selected) fillRow(surface, row, StylePalette.selected);
+    const active_style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;
     try lineStyledAt(surface, row, text, ctx, start_col, active_style);
 }
 
@@ -72,7 +81,7 @@ pub fn lineStyledAt(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxf
 pub fn right(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool) !void {
     if (row >= surface.size.height) return;
     const stable_text = try ctx.arena.dupe(u8, text);
-    const active_style = if (selected) StylePalette.tool else StylePalette.thinking_body;
+    const active_style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;
     const text_width: u16 = @intCast(@min(ctx.stringWidth(stable_text), std.math.maxInt(u16)));
     const end_col = surface.size.width -| message.ConversationLayout.right;
     if (text_width >= end_col) return;

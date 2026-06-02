@@ -83,7 +83,7 @@ pub const App = struct {
     loading_frame: u8 = 0,
     loading_tick_active: bool = false,
     thread_auto_scroll: bool = true,
-    git_branch: []const u8 = "",
+    git_label: []const u8 = "",
     thread_view_width: u16 = 80,
     thread_view_height: u16 = 1,
     thread_list: vxfw.ListView = .{
@@ -408,11 +408,11 @@ pub const App = struct {
             return true;
         }
         if (key.matches(vaxis.Key.up, .{})) {
-            self.model_selection = previousIndex(self.model_selection, @intCast(self.codex_models.items.len));
+            try self.stepModelSelection(false);
             return true;
         }
         if (key.matches(vaxis.Key.down, .{})) {
-            self.model_selection = nextIndex(self.model_selection, @intCast(self.codex_models.items.len));
+            try self.stepModelSelection(true);
             return true;
         }
         return false;
@@ -1041,6 +1041,40 @@ pub const App = struct {
         return self.codex_models.items[idx];
     }
 
+    fn modelDisplayMatches(self: *const App, display_pos: u32, filter: []const u8) bool {
+        const count: u32 = @intCast(self.codex_models.items.len);
+        if (display_pos >= count) return false;
+        const active = model_picker.findActiveStorageIdx(self.codex_models.items, self.activeModelId());
+        const storage = model_picker.displayToStorage(active, display_pos);
+        if (storage >= count) return false;
+        return model_picker.matches(self.codex_models.items[storage], filter);
+    }
+
+    fn firstMatchingModelDisplay(self: *const App, filter: []const u8) ?u32 {
+        const count: u32 = @intCast(self.codex_models.items.len);
+        var d: u32 = 0;
+        while (d < count) : (d += 1) {
+            if (self.modelDisplayMatches(d, filter)) return d;
+        }
+        return null;
+    }
+
+    fn stepModelSelection(self: *App, forward: bool) !void {
+        const count: u32 = @intCast(self.codex_models.items.len);
+        if (count == 0) return;
+        const filter = try self.peekPaletteInput();
+        defer self.gpa.free(filter);
+        var next = self.model_selection;
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            next = if (forward) nextIndex(next, count) else previousIndex(next, count);
+            if (self.modelDisplayMatches(next, filter)) {
+                self.model_selection = next;
+                return;
+            }
+        }
+    }
+
     fn selectedModelSource(self: *const App) ?ModelSource {
         if (self.model_selection >= self.model_sources.items.len) return null;
         const active_storage_idx = model_picker.findActiveStorageIdx(self.codex_models.items, self.activeModelId());
@@ -1575,7 +1609,7 @@ const RootLayout = struct {
 };
 
 fn rootLayout(max_height: u16, panel_visible: bool, input_text_rows: u16) RootLayout {
-    const desired: u16 = 5 + input_text_rows;
+    const desired: u16 = 3 + input_text_rows;
     const max_allowed: u16 = @max(@as(u16, 6), max_height -| 3);
     const input_height: u16 = @min(max_height, @min(desired, max_allowed));
     const thread_height: u16 = max_height - input_height;
@@ -1607,7 +1641,7 @@ pub fn run(
     defer gpa.free(logo);
     _ = try app.thread.append(gpa, .logo, "logo", logo);
 
-    app.git_branch = loadGitBranch(gpa, init.io, runtime.cwd) catch "";
+    app.git_label = loadGitLabel(gpa, init.io, runtime.cwd) catch "";
 
     var root: RootWidget = .{ .app = &app };
     try fw_app.run(root.widget(), .{});
@@ -1617,8 +1651,14 @@ fn loadStartupLogo(gpa: std.mem.Allocator) ![]u8 {
     return gpa.dupe(u8, @embedFile("assets/logo.txt"));
 }
 
-fn loadGitBranch(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) ![]const u8 {
-    const command = "branch=$(git branch --show-current 2>/dev/null); if [ -n \"$branch\" ]; then printf %s \"$branch\"; else git rev-parse --short HEAD 2>/dev/null; fi";
+fn loadGitLabel(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) ![]const u8 {
+    const command =
+        \\root=$(git rev-parse --show-toplevel 2>/dev/null)
+        \\if [ -n "$root" ]; then repo=$(basename "$root"); else repo=$(basename "$PWD"); fi
+        \\branch=$(git branch --show-current 2>/dev/null)
+        \\if [ -z "$branch" ]; then branch=$(git rev-parse --short HEAD 2>/dev/null); fi
+        \\if [ -n "$branch" ]; then printf '%s\t%s' "$repo" "$branch"; else printf '%s' "$repo"; fi
+    ;
     var result = try bash_mod.runWithOptions(gpa, io, .{
         .cwd = cwd,
         .command = command,
@@ -1626,9 +1666,12 @@ fn loadGitBranch(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) ![]const u
     });
     defer result.deinit(gpa);
     if (result.code != 0) return "";
-    const branch = std.mem.trim(u8, result.stdout, " \t\r\n");
-    if (branch.len == 0) return "";
-    return try std.fmt.allocPrint(gpa, "⌥ {s}", .{branch});
+    const out = std.mem.trim(u8, result.stdout, " \t\r\n");
+    if (out.len == 0) return "";
+    if (std.mem.indexOfScalar(u8, out, '\t')) |tab| {
+        return std.fmt.allocPrint(gpa, "{s} ⌥ {s}", .{ out[0..tab], out[tab + 1 ..] });
+    }
+    return gpa.dupe(u8, out);
 }
 
 const RootWidget = struct {
@@ -2102,7 +2145,12 @@ fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []
             if (app.resume_selection >= count) app.resume_selection = 0;
             app.syncResumeListCursor();
         },
-        .provider_picker, .model_picker, .normal => {},
+        .model_picker => {
+            if (!app.modelDisplayMatches(app.model_selection, value)) {
+                app.model_selection = app.firstMatchingModelDisplay(value) orelse 0;
+            }
+        },
+        .provider_picker, .normal => {},
     }
     ctx.consumeAndRedraw();
 }
@@ -2169,7 +2217,11 @@ const OverlayWidget = struct {
 };
 
 fn writeBorderLabel(surface: *vxfw.Surface, ctx: vxfw.DrawContext, text: []const u8) void {
-    if (text.len == 0) return;
+    writeBorderLabelLeft(surface, ctx, 0, text, StylePalette.border_label);
+}
+
+fn writeBorderLabelLeft(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, text: []const u8, style: vaxis.Style) void {
+    if (text.len == 0 or row >= surface.size.height) return;
     var col: u16 = 1;
     var iter = ctx.graphemeIterator(text);
     while (iter.next()) |grapheme| {
@@ -2177,11 +2229,35 @@ fn writeBorderLabel(surface: *vxfw.Surface, ctx: vxfw.DrawContext, text: []const
         const width: u16 = @intCast(ctx.stringWidth(bytes));
         if (width == 0) continue;
         if (col + width >= surface.size.width) break;
-        surface.writeCell(col, 0, .{
+        surface.writeCell(col, row, .{
             .char = .{ .grapheme = bytes, .width = @intCast(width) },
-            .style = StylePalette.border_label,
+            .style = style,
         });
         col += width;
+    }
+}
+
+fn writeBorderLabelRight(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, text: []const u8, style: vaxis.Style) void {
+    if (text.len == 0 or row >= surface.size.height) return;
+    const w = surface.size.width;
+    if (w < 4) return;
+    const max_w: u16 = w -| 3;
+    const text_w: u16 = @intCast(@min(ctx.stringWidth(text), @as(usize, max_w)));
+    if (text_w == 0) return;
+    var col: u16 = w -| 2 -| text_w;
+    var used: u16 = 0;
+    var iter = ctx.graphemeIterator(text);
+    while (iter.next()) |grapheme| {
+        const bytes = grapheme.bytes(text);
+        const width: u16 = @intCast(ctx.stringWidth(bytes));
+        if (width == 0) continue;
+        if (used + width > text_w) break;
+        surface.writeCell(col, row, .{
+            .char = .{ .grapheme = bytes, .width = @intCast(width) },
+            .style = style,
+        });
+        col += width;
+        used += width;
     }
 }
 
@@ -2287,6 +2363,8 @@ const OverlayInner = struct {
     }
 
     fn drawModelContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const filter = try app.peekPaletteInput();
+        defer app.gpa.free(filter);
         const status = tui_status.modelStatus(app.runtime, app.cached_config);
         var content: model_picker.Content = .{
             .models = app.codex_models.items,
@@ -2297,6 +2375,7 @@ const OverlayInner = struct {
             .reasoning_options = modelReasoningOptions(),
             .reasoning_indexes = app.model_reasoning.items,
             .scope = modelPickerScope(app.model_scope),
+            .filter = filter,
             .loading = app.model_load_future != null,
             .error_message = app.model_load_error,
         };
@@ -2472,10 +2551,9 @@ const InputWidget = struct {
             return try self.drawInputBorder(ctx, max_width, @min(height, border_height), text_rows);
         }
 
-        const base_row: u16 = input_row + border_height; // first status row
-        const show_branch = height >= base_row + 2;
-        const show_hint = height >= base_row + 3;
-        const children_count: usize = 3 + @as(usize, if (show_branch) 1 else 0) + @as(usize, if (show_hint) 1 else 0) + @as(usize, if (queued_visible) 1 else 0);
+        const base_row: u16 = input_row + border_height;
+        const show_hint = height >= base_row + 1;
+        const children_count: usize = 1 + @as(usize, if (show_hint) 1 else 0) + @as(usize, if (queued_visible) 1 else 0);
         const children = try ctx.arena.alloc(vxfw.SubSurface, children_count);
         var child_index: usize = 0;
         if (queued_visible) {
@@ -2491,7 +2569,12 @@ const InputWidget = struct {
             .surface = try self.drawInputBorder(ctx, max_width, border_height, text_rows),
             .z_index = 0,
         };
-        try self.drawInputStatus(ctx, children[child_index + 1 ..], max_width, base_row, .{ .branch = show_branch, .hint = show_hint });
+        child_index += 1;
+        if (show_hint) {
+            const padding_x: u16 = @min(@as(u16, 1), max_width);
+            const inner_width = max_width -| (padding_x * 2);
+            try self.drawInputHint(ctx, children, child_index, base_row, padding_x, inner_width);
+        }
         return .{
             .size = .{ .width = max_width, .height = height },
             .widget = self.widget(),
@@ -2518,10 +2601,16 @@ const InputWidget = struct {
             .style = StylePalette.thinking_body,
         };
         var box: vxfw.SizedBox = .{ .child = border.widget(), .size = .{ .width = max_width, .height = border_height } };
-        return box.widget().draw(ctx.withConstraints(.{ .width = max_width, .height = border_height }, .{ .width = max_width, .height = border_height }));
-    }
+        var surface = try box.widget().draw(ctx.withConstraints(.{ .width = max_width, .height = border_height }, .{ .width = max_width, .height = border_height }));
 
-    const StatusRows = struct { branch: bool, hint: bool };
+        const status_text = if (tui_status.modelStatus(self.app.runtime, self.app.cached_config)) |status|
+            tui_status.formatModelStatus(ctx.arena, status) catch ""
+        else
+            "";
+        writeBorderLabelRight(&surface, ctx, 0, status_text, StylePalette.model_status);
+        writeBorderLabelRight(&surface, ctx, border_height -| 1, self.app.git_label, StylePalette.thinking_body);
+        return surface;
+    }
 
     fn drawQueuedMessage(self: *InputWidget, ctx: vxfw.DrawContext, width: u16) std.mem.Allocator.Error!vxfw.Surface {
         const last = self.app.queued_user_messages.items[self.app.queued_user_messages.items.len - 1];
@@ -2529,73 +2618,6 @@ const InputWidget = struct {
         const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, last });
         var queued_text: vxfw.Text = .{ .text = text, .style = .{ .fg = StylePalette.thinking_body.fg, .dim = true }, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
         return queued_text.widget().draw(ctx.withConstraints(.{ .width = width, .height = 1 }, .{ .width = width, .height = 1 }));
-    }
-
-    fn drawInputStatus(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, max_width: u16, base_row: u16, rows: StatusRows) std.mem.Allocator.Error!void {
-        const cwd_raw = if (self.app.runtime) |runtime| runtime.cwd else self.app.agent.cwd;
-        const home_dir = if (self.app.runtime) |runtime| runtime.home_dir else "";
-        const cwd = try tui_status.formatCwdRelative(ctx.arena, cwd_raw, home_dir);
-        const status_text = if (tui_status.modelStatus(self.app.runtime, self.app.cached_config)) |status|
-            tui_status.formatModelStatus(ctx.arena, status) catch ""
-        else
-            "";
-        const status_padding_x: u16 = @min(@as(u16, 1), max_width);
-        const status_inner_width = max_width -| (status_padding_x * 2);
-        const status_gap: u16 = if (cwd.len > 0 and status_text.len > 0) 1 else 0;
-        const model_width: u16 = @intCast(@min(ctx.stringWidth(status_text), @as(usize, status_inner_width)));
-        const cwd_width: u16 = status_inner_width -| model_width -| status_gap;
-        try self.drawInputStatusRow(ctx, children, cwd, status_text, .{
-            .padding_x = status_padding_x,
-            .inner_width = status_inner_width,
-            .cwd_width = cwd_width,
-            .model_width = model_width,
-            .base_row = base_row,
-            .show_branch = rows.branch,
-            .show_hint = rows.hint,
-        });
-    }
-
-    const StatusLayout = struct {
-        padding_x: u16,
-        inner_width: u16,
-        cwd_width: u16,
-        model_width: u16,
-        base_row: u16,
-        show_branch: bool,
-        show_hint: bool,
-    };
-
-    fn drawInputStatusRow(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, cwd: []const u8, status_text: []const u8, layout: StatusLayout) std.mem.Allocator.Error!void {
-        var cwd_text: vxfw.Text = .{ .text = cwd, .style = StylePalette.cwd, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
-        var model_text: vxfw.Text = .{ .text = status_text, .style = StylePalette.model_status, .text_align = .right, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
-        const status_row = layout.base_row;
-        var child_index: usize = 0;
-        children[child_index] = .{
-            .origin = .{ .row = status_row, .col = layout.padding_x },
-            .surface = try cwd_text.widget().draw(ctx.withConstraints(.{ .width = layout.cwd_width, .height = 1 }, .{ .width = layout.cwd_width, .height = 1 })),
-            .z_index = 0,
-        };
-        child_index += 1;
-        children[child_index] = .{
-            .origin = .{ .row = status_row, .col = layout.padding_x + layout.inner_width -| layout.model_width },
-            .surface = try model_text.widget().draw(ctx.withConstraints(.{ .width = layout.model_width, .height = 1 }, .{ .width = layout.model_width, .height = 1 })),
-            .z_index = 0,
-        };
-        child_index += 1;
-        if (layout.show_branch) {
-            try self.drawInputGitBranch(ctx, children, child_index, status_row + 1, layout.padding_x, layout.inner_width);
-            child_index += 1;
-        }
-        if (layout.show_hint) try self.drawInputHint(ctx, children, child_index, status_row + 2, layout.padding_x, layout.inner_width);
-    }
-
-    fn drawInputGitBranch(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, child_index: usize, row: u16, col: u16, width: u16) std.mem.Allocator.Error!void {
-        var branch_text: vxfw.Text = .{ .text = self.app.git_branch, .style = StylePalette.git_branch, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
-        children[child_index] = .{
-            .origin = .{ .row = row, .col = col },
-            .surface = try branch_text.widget().draw(ctx.withConstraints(.{ .width = width, .height = 1 }, .{ .width = width, .height = 1 })),
-            .z_index = 0,
-        };
     }
 
     fn drawInputHint(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, child_index: usize, row: u16, col: u16, width: u16) std.mem.Allocator.Error!void {
@@ -2649,30 +2671,28 @@ test "root layout keeps input fixed when panel opens" {
 
     try std.testing.expectEqual(normal.input_row, picker.input_row);
     try std.testing.expectEqual(normal.thread_height, picker.thread_height);
-    try std.testing.expectEqual(@as(u16, 17), picker.panel_row);
+    try std.testing.expectEqual(@as(u16, 19), picker.panel_row);
     try std.testing.expectEqual(@as(u16, 7), picker.panel_height);
 }
 
 test "root layout clamps panel above input on short screens" {
     const layout = rootLayout(8, true, 1);
 
-    try std.testing.expectEqual(@as(u16, 6), layout.input_height);
-    try std.testing.expectEqual(@as(u16, 2), layout.thread_height);
-    try std.testing.expectEqual(@as(u16, 2), layout.panel_height);
+    try std.testing.expectEqual(@as(u16, 4), layout.input_height);
+    try std.testing.expectEqual(@as(u16, 4), layout.thread_height);
+    try std.testing.expectEqual(@as(u16, 4), layout.panel_height);
     try std.testing.expectEqual(@as(u16, 0), layout.panel_row);
-    try std.testing.expectEqual(@as(u16, 2), layout.input_row);
+    try std.testing.expectEqual(@as(u16, 4), layout.input_row);
 }
 
 test "root layout grows the input as text rows increase" {
-    // Single line keeps the 6-row baseline; each extra row adds one to the
-    // input and removes one from the thread.
     const one = rootLayout(30, false, 1);
-    try std.testing.expectEqual(@as(u16, 6), one.input_height);
-    try std.testing.expectEqual(@as(u16, 24), one.thread_height);
+    try std.testing.expectEqual(@as(u16, 4), one.input_height);
+    try std.testing.expectEqual(@as(u16, 26), one.thread_height);
 
     const three = rootLayout(30, false, 3);
-    try std.testing.expectEqual(@as(u16, 8), three.input_height);
-    try std.testing.expectEqual(@as(u16, 22), three.thread_height);
+    try std.testing.expectEqual(@as(u16, 6), three.input_height);
+    try std.testing.expectEqual(@as(u16, 24), three.thread_height);
 
     // A short screen still leaves the thread some room.
     const tight = rootLayout(10, false, 6);

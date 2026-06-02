@@ -1,14 +1,11 @@
 const std = @import("std");
 
-const ai = @import("../ai.zig");
 const config_mod = @import("../config.zig");
 const runtime_mod = @import("../runtime.zig");
-const symbols = @import("../symbols.zig");
 
 pub const ModelStatus = struct {
     provider: []const u8,
     model: []const u8,
-    thinking: ?[]const u8,
 };
 
 pub fn modelStatus(runtime: ?*const runtime_mod.AgentRuntime, config: config_mod.Config) ?ModelStatus {
@@ -17,17 +14,14 @@ pub fn modelStatus(runtime: ?*const runtime_mod.AgentRuntime, config: config_mod
             .codex_responses => |client| return .{
                 .provider = "openai",
                 .model = client.core_client.config.model,
-                .thinking = reasoningLabel(client.core_client.config.reasoning),
             },
             .openai_responses => |client| return .{
                 .provider = providerLabel(config) orelse "openai",
                 .model = client.core_client.config.model,
-                .thinking = reasoningLabel(client.core_client.config.reasoning),
             },
             .openai_compatible => |client| return .{
                 .provider = providerLabel(config) orelse "openai_compatible",
                 .model = client.config.model,
-                .thinking = configThinkingLabel(config),
             },
             .none => return null,
         }
@@ -37,14 +31,10 @@ pub fn modelStatus(runtime: ?*const runtime_mod.AgentRuntime, config: config_mod
     return .{
         .provider = providerLabel(config) orelse return null,
         .model = model,
-        .thinking = configThinkingLabel(config),
     };
 }
 
 pub fn formatModelStatus(gpa: std.mem.Allocator, status: ModelStatus) ![]u8 {
-    if (status.thinking) |thinking| {
-        return std.fmt.allocPrint(gpa, "{s}/{s}{s}{s}", .{ status.provider, status.model, symbols.separator_dot_padded, thinking });
-    }
     return std.fmt.allocPrint(gpa, "{s}/{s}", .{ status.provider, status.model });
 }
 
@@ -106,46 +96,9 @@ fn providerLabel(config: config_mod.Config) ?[]const u8 {
     return provider.label();
 }
 
-fn reasoningLabel(reasoning: ?ai.Reasoning) ?[]const u8 {
-    const value = reasoning orelse return null;
-    const effort = value.effort orelse return "Thinking";
-    return reasoningEffortLabel(effort);
-}
-
-fn configThinkingLabel(config: config_mod.Config) ?[]const u8 {
-    if (config.model) |model| {
-        if (model.reasoning_effort) |effort| return reasoningEffortLabel(effort);
-    }
-    if (config.enable_thinking) |enabled| {
-        if (enabled) return "Thinking";
-    }
-    return null;
-}
-
-test "model status includes reasoning effort when present" {
+test "model status formats as provider/model" {
     const gpa = std.testing.allocator;
-    const text = try formatModelStatus(gpa, .{ .provider = "openai", .model = "gpt-5.5", .thinking = "medium" });
-    defer gpa.free(text);
-    try std.testing.expectEqualStrings("openai/gpt-5.5" ++ symbols.separator_dot_padded ++ "medium", text);
-}
-
-fn reasoningEffortLabel(effort: ai.ReasoningEffort) []const u8 {
-    return switch (effort) {
-        .none => "nothink",
-        else => effort.label(),
-    };
-}
-
-test "model status labels none reasoning as nothink" {
-    const gpa = std.testing.allocator;
-    const text = try formatModelStatus(gpa, .{ .provider = "openai", .model = "gpt-5.5", .thinking = reasoningEffortLabel(.none) });
-    defer gpa.free(text);
-    try std.testing.expectEqualStrings("openai/gpt-5.5" ++ symbols.separator_dot_padded ++ "nothink", text);
-}
-
-test "model status omits separator when thinking is unavailable" {
-    const gpa = std.testing.allocator;
-    const text = try formatModelStatus(gpa, .{ .provider = "ollama", .model = "llama", .thinking = null });
+    const text = try formatModelStatus(gpa, .{ .provider = "ollama", .model = "llama" });
     defer gpa.free(text);
     try std.testing.expectEqualStrings("ollama/llama", text);
 }
