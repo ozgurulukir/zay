@@ -34,13 +34,17 @@ pub const Rendered = struct {
 };
 
 pub fn render(gpa: std.mem.Allocator, text: []const u8, width: u16) !Rendered {
+    return renderLimited(gpa, text, width, std.math.maxInt(usize));
+}
+
+pub fn renderLimited(gpa: std.mem.Allocator, text: []const u8, width: u16, max_rows: usize) !Rendered {
     assert(width > 0);
     var rows: std.ArrayList(Row) = .empty;
     errdefer freeRows(gpa, rows.items);
 
     var state: BlockState = .{};
     var line_start: usize = 0;
-    while (line_start <= text.len) {
+    while (line_start <= text.len and rows.items.len < max_rows) {
         const line = lineAt(text, line_start);
         if (!state.in_code) {
             if (try renderTable(gpa, &rows, text, line_start, width)) |next_start| {

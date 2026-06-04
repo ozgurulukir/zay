@@ -90,6 +90,8 @@ pub fn runAgentTurn(agent: *agent_mod.Agent, worker_context: *Context, pending_p
     }) catch |err| {
         const message_text = if (err == error.TurnCancelled)
             worker_context.gpa.dupe(u8, cancel_message) catch return
+        else if (agent.client.lastErrorDetail()) |detail|
+            worker_context.gpa.dupe(u8, detail) catch return
         else
             std.fmt.allocPrint(
                 worker_context.gpa,
@@ -103,6 +105,8 @@ pub fn runAgentTurn(agent: *agent_mod.Agent, worker_context: *Context, pending_p
     };
     postAgentEvent(worker_context, .turn_finished) catch {};
 }
+
+const queue_full_backoff_ms: u64 = 2;
 
 fn postAgentEvent(context: *anyopaque, event: agent_mod.Agent.Event) anyerror!void {
     const worker_context: *Context = @ptrCast(@alignCast(context));
@@ -120,5 +124,25 @@ fn postAgentEvent(context: *anyopaque, event: agent_mod.Agent.Event) anyerror!vo
     event_ptr.* = owned_event;
     owned_event = .delta_end;
     errdefer event_ptr.deinit(worker_context.gpa);
-    try worker_context.queue.push(worker_context.io, worker_context.gpa, event_ptr);
+
+    // Block until the event lands. Dropping it would corrupt the rendered turn,
+    // and dropping the terminal `turn_finished` would leave the UI stuck
+    // `in_flight` forever (spinner never stops, no further submits). The worker
+    // is inside the network read loop here, so waiting just applies normal
+    // backpressure to the stream.
+    //
+    // We don't bail on cancel here: the top-of-function check already aborts the
+    // turn, and `turn_finished` is posted *during* that unwind (with
+    // `cancel_requested` already set) — it must still be delivered. The UI keeps
+    // draining every ~30 ms while `in_flight`, so a full queue always clears.
+    while (true) {
+        worker_context.queue.push(worker_context.io, worker_context.gpa, event_ptr) catch |err| switch (err) {
+            error.QueueFull => {
+                worker_context.io.sleep(.fromMilliseconds(queue_full_backoff_ms), .awake) catch {};
+                continue;
+            },
+            else => return err,
+        };
+        return;
+    }
 }

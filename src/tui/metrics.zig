@@ -4,80 +4,13 @@ const terminal_markdown = @import("terminal_markdown");
 const thread_mod = @import("../thread.zig");
 const blackhole = @import("blackhole.zig");
 
-pub const RowViewport = struct {
-    first: u32,
-    height: u16,
-};
-
-pub fn visibleRows(
-    messages: []const thread_mod.Message,
-    selected: ?u32,
-    width: u16,
-    height: u16,
-) RowViewport {
-    const total = threadRows(messages, width);
-    if (total <= height) return .{ .first = 0, .height = height };
-
-    const selected_index = selected orelse return .{
-        .first = total - height,
-        .height = height,
-    };
-    std.debug.assert(selected_index < messages.len);
-
-    const last_index: u32 = @intCast(messages.len - 1);
-    if (selected_index == last_index) {
-        return .{ .first = total - height, .height = height };
+pub fn messageRowsCached(message: *thread_mod.Message, width: u16) u16 {
+    if (message.row_cache.valid and message.row_cache.width == width) {
+        return message.row_cache.rows;
     }
-
-    const selected_start = messageStartRow(messages, selected_index, width);
-    const selected_rows = messageRows(messages[selected_index], width);
-    const selected_end = selected_start + selected_rows;
-    if (selected_rows >= height) {
-        return .{ .first = selected_start, .height = height };
-    }
-    if (selected_end <= height) {
-        return .{ .first = 0, .height = height };
-    }
-    return .{ .first = selected_end - height, .height = height };
-}
-
-pub fn firstVisibleMessage(
-    messages: []const thread_mod.Message,
-    selected: ?u32,
-    width: u16,
-    height: u16,
-) u32 {
-    const first_row = visibleRows(messages, selected, width, height).first;
-    var row: u32 = 0;
-    var index: u32 = 0;
-    while (index < messages.len) : (index += 1) {
-        const next = row + messageRows(messages[index], width);
-        if (next > first_row) return index;
-        row = next;
-    }
-    return 0;
-}
-
-pub fn threadRows(messages: []const thread_mod.Message, width: u16) u32 {
-    var rows: u32 = 0;
-    for (messages) |message| {
-        rows += messageRows(message, width);
-    }
+    const rows = messageContentRows(message.*, width) + 1;
+    message.row_cache = .{ .valid = true, .width = width, .rows = rows };
     return rows;
-}
-
-pub fn messageStartRow(messages: []const thread_mod.Message, index: u32, width: u16) u32 {
-    std.debug.assert(index < messages.len);
-    var rows: u32 = 0;
-    var current: u32 = 0;
-    while (current < index) : (current += 1) {
-        rows += messageRows(messages[current], width);
-    }
-    return rows;
-}
-
-pub fn messageRows(message: thread_mod.Message, width: u16) u16 {
-    return messageContentRows(message, width) + 1;
 }
 
 pub fn messageContentRows(message: thread_mod.Message, width: u16) u16 {

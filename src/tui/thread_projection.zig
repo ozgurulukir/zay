@@ -259,7 +259,7 @@ pub const ThreadProjection = struct {
         const was_expanded = thread.messages.items[index].expanded;
         try thread.updateTool(gpa, index, tool.display_label);
         try thread.finishTool(gpa, index, tool.display_body, tool.stderr, tool.failed);
-        thread.messages.items[index].expanded = policy.expand_by_default;
+        thread.setExpanded(index, policy.expand_by_default);
         thread.messages.items[index].tool_render = policy.render;
         selectGeneratedMessage(thread, index);
         self.tool_seen_in_response = true;

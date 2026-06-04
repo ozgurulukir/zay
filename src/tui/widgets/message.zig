@@ -10,10 +10,16 @@ const blackhole = @import("../blackhole.zig");
 
 const StylePalette = tui_style.Palette;
 const mergedSelectedStyle = tui_style.mergedSelectedStyle;
-const messageRows = tui_metrics.messageRows;
+const messageRowsCached = tui_metrics.messageRowsCached;
 
 pub const loading_frames = [8][]const u8{ "⣼", "⣹", "⢻", "⠿", "⡟", "⣏", "⣧", "⣶" };
 pub const loading_frame_ms = 40;
+
+/// Agent bodies at or below this size keep their fully rendered markdown cached
+/// across frames (see `thread_mod.RenderCache`). Larger bodies fall back to a
+/// per-frame, viewport-bounded render so a giant message never materializes its
+/// whole row list into a long-lived cache — preserving the draw-time OOM guard.
+const render_cache_max_bytes: usize = 64 * 1024;
 
 pub const ConversationLayout = struct {
     pub const left: u16 = 2;
@@ -34,10 +40,14 @@ pub const ConversationLayout = struct {
 };
 
 pub const MessageWidget = struct {
-    message: thread_mod.Message,
+    message: *thread_mod.Message,
     selected: bool,
     loading_frame: u8,
     blackhole_frame: u16,
+    /// Long-lived allocator for the per-message rendered-markdown cache. The
+    /// frame arena (`ctx.arena`) is reset every draw, so the cache that must
+    /// survive between frames is allocated from here instead.
+    gpa: std.mem.Allocator,
 
     pub fn widget(self: *MessageWidget) vxfw.Widget {
         return .{
@@ -49,7 +59,7 @@ pub const MessageWidget = struct {
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *MessageWidget = @ptrCast(@alignCast(ptr));
         const width = ctx.max.width orelse ctx.min.width;
-        const requested_height = messageRows(self.message, ConversationLayout.contentWidth(width));
+        const requested_height = messageRowsCached(self.message, ConversationLayout.contentWidth(width));
         const height = clippedSurfaceHeight(width, requested_height);
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{
             .width = width,
@@ -70,13 +80,13 @@ pub const MessageWidget = struct {
         var row: u16 = 1;
         switch (self.message.kind) {
             .user => drawWrapped(surface, self.message.body, StylePalette.user, styled_as_selected, &row, ctx, 2, StylePalette.user),
-            .agent => drawMarkdown(surface, self.message.body, styled_as_selected, &row, ctx),
+            .agent => drawMarkdown(self, surface, styled_as_selected, &row, ctx),
             .notice => drawWrapped(surface, self.message.body, StylePalette.tool_failed, styled_as_selected, &row, ctx, 2, StylePalette.tool_failed),
             .logo => drawBlackhole(surface, self.blackhole_frame, &row, ctx),
             .tool => {
                 const title_style = if (self.message.failed) StylePalette.tool_failed else StylePalette.tool;
                 drawWrapped(surface, self.message.title, title_style, styled_as_selected, &row, ctx, 0, null);
-                if (self.message.expanded) drawToolBody(surface, self.message, styled_as_selected, &row, ctx);
+                if (self.message.expanded) drawToolBody(surface, self.message.*, styled_as_selected, &row, ctx);
             },
             .thinking => {
                 drawLine(surface, self.message.title, StylePalette.thinking_label, styled_as_selected, &row, ctx, 2, StylePalette.thinking_bar);
@@ -227,20 +237,53 @@ pub const MessageWidget = struct {
 };
 
 fn drawMarkdown(
+    self: *MessageWidget,
     surface: *vxfw.Surface,
-    text: []const u8,
     selected: bool,
     row: *u16,
     ctx: vxfw.DrawContext,
 ) void {
+    const text = self.message.body;
     const content_width = @max(ConversationLayout.contentWidth(surface.size.width), 1);
-    var rendered = terminal_markdown.render(ctx.arena, text, content_width) catch {
-        MessageWidget.drawWrapped(surface, text, .{}, selected, row, ctx, 0, null);
-        return;
-    };
-    defer rendered.deinit(ctx.arena);
 
-    for (rendered.rows) |markdown_row| {
+    // Markdown rendering is the dominant per-frame cost, and a visible message
+    // is otherwise re-parsed on every animation tick even when nothing about it
+    // changed. Cache the rendered rows on the message (keyed by width, dropped
+    // by `Thread` mutators) so only the message whose body actually changed is
+    // re-rendered.
+    const rows: []const terminal_markdown.Row = rows: {
+        // Very large bodies stay uncached: holding (and re-rendering) their whole
+        // row list is the unbounded-allocation case the draw guard exists for.
+        // Render only the rows that land inside the surface, into the frame arena
+        // (reset next frame), and drop any cache left over from when the body was
+        // smaller. The loop below stops at `surface.size.height`, which is itself
+        // capped (see `clippedSurfaceHeight`), so this stays bounded.
+        if (text.len > render_cache_max_bytes) {
+            if (self.message.render_cache.rendered) |*stale| {
+                stale.deinit(self.gpa);
+                self.message.render_cache = .{};
+            }
+            break :rows (terminal_markdown.renderLimited(ctx.arena, text, content_width, surface.size.height) catch {
+                MessageWidget.drawWrapped(surface, text, .{}, selected, row, ctx, 0, null);
+                return;
+            }).rows;
+        }
+
+        const cache = &self.message.render_cache;
+        if (!cache.valid or cache.width != content_width) {
+            if (cache.rendered) |*stale| stale.deinit(self.gpa);
+            cache.rendered = terminal_markdown.render(self.gpa, text, content_width) catch {
+                cache.* = .{};
+                MessageWidget.drawWrapped(surface, text, .{}, selected, row, ctx, 0, null);
+                return;
+            };
+            cache.valid = true;
+            cache.width = content_width;
+        }
+        break :rows cache.rendered.?.rows;
+    };
+
+    for (rows) |markdown_row| {
         if (row.* >= surface.size.height) return;
         var start_col = markdown_row.indent;
         for (markdown_row.spans) |span| {

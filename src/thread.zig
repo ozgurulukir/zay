@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const terminal_markdown = @import("terminal_markdown");
+
 const assert = std.debug.assert;
 
 /// How a tool's display body should be drawn in the TUI.
@@ -30,6 +32,35 @@ pub const MessageKind = enum {
     }
 };
 
+/// Memoized row count for a message at a given width. Computing it scans the
+/// whole (possibly multi-KB, streaming) body, and the draw loop asks for it
+/// several times per frame, so we cache the last result. Width is part of the
+/// key (resize changes wrapping); content changes invalidate via
+/// `Message.invalidateRowCache`, called by every `Thread` mutator. Because the
+/// only layout-affecting writes go through those mutators, width is the only
+/// thing the lookup itself has to re-check.
+pub const RowCache = struct {
+    valid: bool = false,
+    width: u16 = 0,
+    rows: u16 = 0,
+};
+
+/// Memoized rendered markdown for an `.agent` body at a given width. Where
+/// `RowCache` stores only a row *count*, this keeps the fully rendered
+/// `Row`/`Span` list so a visible message isn't re-parsed on every animation
+/// frame (the dominant per-frame cost in the draw loop). The spans borrow
+/// slices of `Message.body`, so the cache is valid only while the body is
+/// unchanged: every mutator that touches the body invalidates it via
+/// `invalidateRowCache`, and `deinit` frees the owned row/span arrays. The draw
+/// layer leaves very large bodies uncached (see `message.zig`) so a giant
+/// message never materializes its whole row list — preserving the draw-time
+/// out-of-memory guard.
+pub const RenderCache = struct {
+    valid: bool = false,
+    width: u16 = 0,
+    rendered: ?terminal_markdown.Rendered = null,
+};
+
 pub const Message = struct {
     kind: MessageKind,
     title: []u8,
@@ -43,12 +74,29 @@ pub const Message = struct {
     /// rendered in red below the gray body. Null when the tool produced no
     /// stderr output.
     stderr_body: ?[]u8 = null,
+    /// Cached row count; see `RowCache`. Not owned, needs no cleanup.
+    row_cache: RowCache = .{},
+    /// Cached rendered markdown; see `RenderCache`. Owned — freed in `deinit`.
+    render_cache: RenderCache = .{},
 
     pub fn deinit(self: *Message, gpa: std.mem.Allocator) void {
         gpa.free(self.title);
         gpa.free(self.body);
         if (self.stderr_body) |stderr| gpa.free(stderr);
+        if (self.render_cache.rendered) |*rendered| rendered.deinit(gpa);
         self.* = undefined;
+    }
+
+    /// Drop the memoized row count and rendered markdown after a layout-affecting
+    /// change. The rendered markdown's spans borrow `body`, which the caller is
+    /// about to mutate (and may move via `realloc`), so the stale render must
+    /// never be drawn again. The owned allocation is freed lazily — on the next
+    /// render or in `deinit` — because this runs on hot mutators with no
+    /// allocator at hand; freeing only releases the gpa-owned row/span arrays and
+    /// never dereferences the borrowed (now-dangling) span text.
+    pub fn invalidateRowCache(self: *Message) void {
+        self.row_cache.valid = false;
+        self.render_cache.valid = false;
     }
 };
 
@@ -115,6 +163,7 @@ pub const Thread = struct {
         const message = &self.messages.items[index];
         assert(message.kind == .agent);
         try appendOwned(gpa, &message.body, delta);
+        message.invalidateRowCache();
     }
 
     pub fn appendThinkingDelta(
@@ -127,6 +176,7 @@ pub const Thread = struct {
         const message = &self.messages.items[index];
         assert(message.kind == .thinking);
         try appendOwned(gpa, &message.body, delta);
+        message.invalidateRowCache();
     }
 
     pub fn insert(
@@ -214,6 +264,7 @@ pub const Thread = struct {
         const title = try toolTitle(gpa, command);
         gpa.free(message.title);
         message.title = title;
+        message.invalidateRowCache();
     }
 
     pub fn finishThinking(self: *Thread, gpa: std.mem.Allocator, index: u32) !void {
@@ -246,6 +297,17 @@ pub const Thread = struct {
             message.stderr_body = owned;
         }
         message.failed = failed;
+        message.invalidateRowCache();
+    }
+
+    /// Set a message's expanded state, invalidating its cached row count. The
+    /// projection mutates `expanded` directly when a tool finishes; route it
+    /// through here so the cache stays correct.
+    pub fn setExpanded(self: *Thread, index: u32, value: bool) void {
+        assert(index < self.messages.items.len);
+        const message = &self.messages.items[index];
+        message.expanded = value;
+        message.invalidateRowCache();
     }
 
     pub fn moveSelection(self: *Thread, direction: enum { previous, next }) void {
@@ -266,7 +328,10 @@ pub const Thread = struct {
         assert(selected < self.messages.items.len);
         const message = &self.messages.items[selected];
         switch (message.kind) {
-            .thinking, .tool => message.expanded = !message.expanded,
+            .thinking, .tool => {
+                message.expanded = !message.expanded;
+                message.invalidateRowCache();
+            },
             .user, .agent, .logo, .status, .notice => {},
         }
     }
@@ -301,11 +366,13 @@ pub const Thread = struct {
 
 fn appendOwned(gpa: std.mem.Allocator, target: *[]u8, suffix: []const u8) !void {
     if (suffix.len == 0) return;
-    const old = target.*;
-    const joined = try gpa.alloc(u8, old.len + suffix.len);
-    @memcpy(joined[0..old.len], old);
-    @memcpy(joined[old.len..], suffix);
-    gpa.free(old);
+    // `realloc` grows the buffer in place when the allocator's size class has
+    // room, so streaming deltas don't recopy the whole (ever-growing) body on
+    // every append. A fresh alloc + memcpy here is O(N) per delta — O(N²) over
+    // a long response, the main driver of mid-stream slowdown.
+    const old_len = target.len;
+    const joined = try gpa.realloc(target.*, old_len + suffix.len);
+    @memcpy(joined[old_len..], suffix);
     target.* = joined;
 }
 

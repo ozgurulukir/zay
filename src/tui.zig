@@ -36,11 +36,7 @@ const ConversationLayout = tui_message.ConversationLayout;
 const MessageWidget = tui_message.MessageWidget;
 const StylePalette = tui_style.Palette;
 const mergedSelectedStyle = tui_style.mergedSelectedStyle;
-const firstVisibleMessage = tui_metrics.firstVisibleMessage;
-const messageRows = tui_metrics.messageRows;
-const messageStartRow = tui_metrics.messageStartRow;
-const threadRows = tui_metrics.threadRows;
-const visibleRows = tui_metrics.visibleRows;
+const messageRowsCached = tui_metrics.messageRowsCached;
 
 const loading_spinners = tui_thread_projection.loading_spinners;
 const loading_frame_ms = tui_message.loading_frame_ms;
@@ -78,6 +74,13 @@ pub const App = struct {
     model_selection_snapshot: u32 = 0,
     provider_picker: provider_picker.State = .{},
     codex_signed_in: bool = false,
+    /// Stored API keys for catalogue providers (label -> key), mirrored from
+    /// `~/.nova/auth.json`. Drives the picker's [CONNECTED] badges and supplies
+    /// keys when (re)building the model catalogue. Owned; freed in `deinit`.
+    provider_api_keys: codex.ApiKeyMap = .empty,
+    /// Inline edit buffer for the provider setup form's API-key field. Owned;
+    /// freed in `deinit`.
+    provider_key_input: std.ArrayList(u8) = .empty,
     cached_config: config_mod.Config = .{},
     cached_config_owned: bool = false,
     retired_threads: std.ArrayList(thread_mod.Thread) = .empty,
@@ -118,6 +121,9 @@ pub const App = struct {
     model_load_future: ?std.Io.Future(model_loader.Outcome) = null,
     model_load_done: std.atomic.Value(bool) = .init(false),
     model_load_error: ?[]u8 = null,
+    /// When true, the in-flight model load merges into the existing catalogue
+    /// (incremental, after connecting a new provider) instead of replacing it.
+    model_load_merge: bool = false,
     /// True once a successful catalog fetch has populated `codex_models`.
     /// Subsequent picker opens skip the network round-trip and just re-sort
     /// for the current active model. Reset on sign-in/sign-out.
@@ -206,6 +212,8 @@ pub const App = struct {
         self.model_sources.deinit(self.gpa);
         self.model_reasoning.deinit(self.gpa);
         self.model_reasoning_snapshot.deinit(self.gpa);
+        codex.freeApiKeyMap(self.gpa, &self.provider_api_keys);
+        self.provider_key_input.deinit(self.gpa);
         if (self.cached_config_owned) {
             self.cached_config.deinit(self.gpa);
             self.cached_config_owned = false;
@@ -219,7 +227,7 @@ pub const App = struct {
         self.worker_context.queue.deinit(self.worker_context.io, self.worker_context.gpa);
         self.clearQueuedUserMessages();
         self.queued_user_messages.deinit(self.gpa);
-        if (self.pending_prompt) |prompt| self.gpa.free(prompt);
+        if (self.pending_prompt) |prompt| self.worker_context.gpa.free(prompt);
         self.closeAtSearch();
         self.at_results.deinit(self.gpa);
         self.thread_projection.deinit(self.gpa);
@@ -297,8 +305,11 @@ pub const App = struct {
         _ = try self.thread.append(self.gpa, .user, "you", prompt);
         try self.appendLoading();
         // The worker expands `@`-mentions (reading files / images) off the UI
-        // thread; stash the raw text for `startTurn` to hand over.
-        self.pending_prompt = try self.gpa.dupe(u8, prompt);
+        // thread; stash the raw text for `startTurn` to hand over. Owned by
+        // `worker_context.gpa` — the worker frees it with that allocator, which
+        // differs from `self.gpa` (an arena), so allocating it here with the
+        // wrong allocator would crash on free.
+        self.pending_prompt = try self.worker_context.gpa.dupe(u8, prompt);
         self.in_flight = true;
         return self.thread_projection.loading_index;
     }
@@ -350,7 +361,7 @@ pub const App = struct {
     pub fn startTurn(self: *App) !void {
         const prompt = self.pending_prompt;
         self.pending_prompt = null;
-        errdefer if (prompt) |p| self.gpa.free(p);
+        errdefer if (prompt) |p| self.worker_context.gpa.free(p);
         self.turn_future = try self.io.concurrent(agent_worker.runAgentTurn, .{
             self.agent,
             &self.worker_context,
@@ -439,7 +450,30 @@ pub const App = struct {
     }
 
     fn handleProviderPickerKey(self: *App, key: vaxis.Key) !bool {
+        // The setup form hosts its own inline API-key editor: capture typed text
+        // and backspace here so nothing leaks to the (unused) overlay search row.
+        if (self.provider_picker.stage == .form) {
+            if (key.matches(vaxis.Key.backspace, .{})) {
+                self.popProviderKeyInput();
+                return true;
+            }
+            if (key.text) |text| {
+                try self.provider_key_input.appendSlice(self.gpa, text);
+                return true;
+            }
+            // Swallow everything else (arrows, tab) — Enter/Esc are handled upstream.
+            return true;
+        }
         return self.provider_picker.handleKey(key, self.isCodexSignedIn());
+    }
+
+    /// Remove the last UTF-8 scalar from the inline API-key buffer.
+    fn popProviderKeyInput(self: *App) void {
+        const items = self.provider_key_input.items;
+        if (items.len == 0) return;
+        var cut = items.len - 1;
+        while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
+        self.provider_key_input.shrinkRetainingCapacity(cut);
     }
 
     fn handleModelPickerKey(self: *App, key: vaxis.Key) !bool {
@@ -540,6 +574,9 @@ pub const App = struct {
     }
 
     fn syncModeWithInput(self: *App, value: []const u8) !void {
+        // While typing an API key in the provider form, the input is the key —
+        // never reinterpret a leading '/' as a command.
+        if (self.mode == .provider_picker and self.provider_picker.stage == .form) return;
         if (self.mode == .session_picker or self.mode == .provider_picker or self.mode == .model_picker or self.mode == .tree_picker) {
             if (value.len > 0 and value[0] == command_prefix) {
                 self.mode = .command;
@@ -562,6 +599,13 @@ pub const App = struct {
 
     fn cancelMode(self: *App) !bool {
         if (self.mode == .normal) return false;
+        // Esc inside the provider setup form returns to the provider list.
+        if (self.mode == .provider_picker and self.provider_picker.stage == .form) {
+            self.provider_picker.stage = .list;
+            self.provider_picker.form_provider = null;
+            self.provider_key_input.clearRetainingCapacity();
+            return true;
+        }
         if (self.mode == .model_picker) {
             self.cancelModelLoad();
             try self.revertModelPickerSnapshot();
@@ -586,6 +630,11 @@ pub const App = struct {
 
     fn submitMode(self: *App) !bool {
         if (self.mode == .provider_picker) {
+            if (self.provider_picker.stage == .form) {
+                const provider = self.provider_picker.form_provider orelse return true;
+                self.submitProviderSetup(provider) catch |err| try self.reportConnectionError(err);
+                return true;
+            }
             switch (self.provider_picker.selectedAction()) {
                 .connect_codex => self.connectCodex() catch |err| try self.reportConnectionError(err),
                 .sign_out_codex => {
@@ -595,6 +644,7 @@ pub const App = struct {
                         self.connectCodex() catch |err| try self.reportConnectionError(err);
                     }
                 },
+                .open_form => |provider| self.openProviderForm(provider),
             }
             return true;
         }
@@ -666,6 +716,25 @@ pub const App = struct {
         self.mode = .provider_picker;
         self.provider_picker.reset();
         self.clearInput();
+        self.clearPaletteInput();
+        try self.refreshProviderApiKeys();
+    }
+
+    /// Reload the cached provider API keys from `~/.nova/auth.json`. Drives the
+    /// picker badges and the multi-provider model catalogue.
+    fn refreshProviderApiKeys(self: *App) !void {
+        const home = self.runtime.?.home_dir;
+        if (home.len == 0) return;
+        var fresh = try codex.loadAllProviderApiKeys(self.gpa, self.io, home);
+        codex.freeApiKeyMap(self.gpa, &self.provider_api_keys);
+        self.provider_api_keys = fresh;
+        fresh = .empty;
+    }
+
+    fn openProviderForm(self: *App, provider: config_mod.Provider) void {
+        self.provider_picker.stage = .form;
+        self.provider_picker.form_provider = provider;
+        self.provider_key_input.clearRetainingCapacity();
     }
 
     fn openTreeSelector(self: *App) !void {
@@ -712,17 +781,13 @@ pub const App = struct {
         const job = try self.gpa.create(model_loader.Job);
         errdefer self.gpa.destroy(job);
 
-        var configured: ?model_loader.Configured = null;
-        errdefer if (configured) |c| {
-            self.gpa.free(c.base_url);
-            self.gpa.free(c.api_key);
-        };
-        if (catalog == .connected_provider and self.shouldLoadConfiguredCompatibleCatalog()) {
-            const base_url = try self.gpa.dupe(u8, self.cached_config.base_url.?);
-            errdefer self.gpa.free(base_url);
-            const api_key = try self.gpa.dupe(u8, self.cached_config.api_key.?);
-            const provider = self.cached_config.provider orelse tui_provider.compatibleProviderFromBaseUrl(base_url);
-            configured = .{ .provider = provider, .base_url = base_url, .api_key = api_key };
+        const configured = try self.collectConfiguredProviders(catalog);
+        errdefer {
+            for (configured) |c| {
+                self.gpa.free(c.base_url);
+                self.gpa.free(c.api_key);
+            }
+            if (configured.len > 0) self.gpa.free(configured);
         }
 
         job.* = .{
@@ -733,12 +798,62 @@ pub const App = struct {
                 .openai_codex => .openai_codex,
             },
             .configured = configured,
+            .include_locals = catalog == .connected_provider,
             .codex_signed_in = self.isCodexSignedIn(),
             .done = &self.model_load_done,
         };
 
+        self.model_load_merge = false;
         self.model_load_done.store(false, .release);
         self.model_load_future = try self.io.concurrent(model_loader.run, .{job});
+    }
+
+    /// Every OpenAI-compatible provider to fetch for a full catalogue reload:
+    /// each catalogue provider with a stored key (or an anonymous tier), plus a
+    /// non-catalogue env/config provider when one is configured. Caller owns the slice.
+    fn collectConfiguredProviders(self: *App, catalog: ModelCatalog) ![]model_loader.Configured {
+        var list: std.ArrayList(model_loader.Configured) = .empty;
+        errdefer {
+            for (list.items) |c| {
+                self.gpa.free(c.base_url);
+                self.gpa.free(c.api_key);
+            }
+            list.deinit(self.gpa);
+        }
+        if (catalog == .connected_provider) {
+            for (config_mod.catalogueProviders()) |provider| {
+                const base_url = provider.defaultBaseUrl() orelse continue;
+                // Stored key wins; otherwise an anonymous-tier provider (OpenCode
+                // Zen) still loads via its `public` sentinel (free models only).
+                const key = self.provider_api_keys.get(provider.label()) orelse anon: {
+                    break :anon provider.anonymousApiKey() orelse continue;
+                };
+                try self.appendConfigured(&list, provider, base_url, key);
+            }
+            if (self.shouldLoadConfiguredCompatibleCatalog()) {
+                const base_url = self.cached_config.base_url.?;
+                const provider = self.cached_config.provider orelse tui_provider.compatibleProviderFromBaseUrl(base_url);
+                // Catalogue providers are already covered by the auth.json keys above.
+                if (!provider.isCatalogue()) {
+                    try self.appendConfigured(&list, provider, base_url, self.cached_config.api_key.?);
+                }
+            }
+        }
+        return list.toOwnedSlice(self.gpa);
+    }
+
+    fn appendConfigured(
+        self: *App,
+        list: *std.ArrayList(model_loader.Configured),
+        provider: config_mod.Provider,
+        base_url: []const u8,
+        api_key: []const u8,
+    ) !void {
+        const url = try self.gpa.dupe(u8, base_url);
+        errdefer self.gpa.free(url);
+        const key = try self.gpa.dupe(u8, api_key);
+        errdefer self.gpa.free(key);
+        try list.append(self.gpa, .{ .provider = provider, .base_url = url, .api_key = key });
     }
 
     fn cancelModelLoad(self: *App) void {
@@ -773,18 +888,51 @@ pub const App = struct {
     }
 
     fn installModelLoadResult(self: *App, result: *model_loader.Result) !void {
-        self.codexModelsClear();
-        for (result.models.items) |*model| {
-            try self.codex_models.append(self.gpa, model.*);
+        if (self.model_load_merge) {
+            // Incremental load: replace only the freshly-fetched providers'
+            // models, leaving previously-cached providers untouched.
+            var refreshed = std.EnumSet(config_mod.Provider).initEmpty();
+            for (result.sources.items) |source| switch (source) {
+                .openai_compatible => |provider| {
+                    if (!refreshed.contains(provider)) {
+                        self.dropModelsForProvider(provider);
+                        refreshed.insert(provider);
+                    }
+                },
+                .openai_codex => {},
+            };
+        } else {
+            self.codexModelsClear();
         }
+        // Move models in (the struct copies own their id/label); clearing the
+        // result without freeing avoids a double-free.
+        for (result.models.items) |*model| try self.codex_models.append(self.gpa, model.*);
         result.models.clearRetainingCapacity();
-        for (result.sources.items) |source| {
-            try self.model_sources.append(self.gpa, source);
-        }
+        for (result.sources.items) |source| try self.model_sources.append(self.gpa, source);
         result.sources.clearRetainingCapacity();
+        self.model_load_merge = false;
         try self.finishModelCatalogReload();
         try self.snapshotModelPickerState();
         self.models_cached = true;
+    }
+
+    /// Remove every cached model that came from `provider`, keeping the parallel
+    /// `codex_models` / `model_sources` arrays aligned.
+    fn dropModelsForProvider(self: *App, provider: config_mod.Provider) void {
+        var i: usize = 0;
+        while (i < self.model_sources.items.len) {
+            const matches = switch (self.model_sources.items[i]) {
+                .openai_compatible => |p| p == provider,
+                .openai_codex => false,
+            };
+            if (matches) {
+                var model = self.codex_models.orderedRemove(i);
+                model.deinit(self.gpa);
+                _ = self.model_sources.orderedRemove(i);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     fn defaultModelScope(self: *App) ModelScope {
@@ -822,6 +970,82 @@ pub const App = struct {
         _ = try self.thread.append(self.gpa, .agent, "agent", "Signed out from OpenAI Codex.");
     }
 
+    /// Save the entered API key for a catalogue provider, then fetch just that
+    /// provider's models and merge them into the catalogue before handing off to
+    /// the model picker. A blank key is allowed only for providers that don't
+    /// require one (`requiresApiKey() == false`); all current ones do.
+    fn submitProviderSetup(self: *App, provider: config_mod.Provider) !void {
+        if (self.in_flight) return error.InFlightTurn;
+        const key = std.mem.trim(u8, self.provider_key_input.items, " \t\r\n");
+
+        // A required key cannot be blank — keep the form open so the user can type.
+        if (key.len == 0 and provider.requiresApiKey()) return;
+
+        const home = self.runtime.?.home_dir;
+        if (key.len > 0) {
+            try codex.saveProviderApiKey(self.gpa, self.io, home, provider.label(), key);
+        } else {
+            // Anonymous free tier: drop any stale key so we connect without one.
+            codex.removeProviderApiKey(self.gpa, self.io, home, provider.label()) catch {};
+        }
+        try self.refreshProviderApiKeys();
+
+        // With no key, connect via the provider's anonymous sentinel (e.g.
+        // OpenCode Zen's `public`, which the gateway limits to free models).
+        const connect_key = if (key.len > 0) key else (provider.anonymousApiKey() orelse key);
+        // `connect_key` may alias the input buffer — fetch (which dupes it) first.
+        try self.startProviderModelLoad(provider, connect_key);
+
+        self.provider_picker.stage = .list;
+        self.provider_picker.form_provider = null;
+        self.provider_key_input.clearRetainingCapacity();
+
+        self.mode = .model_picker;
+        self.model_column = .model;
+        self.model_selection = 0;
+        self.model_scope = self.defaultModelScope();
+        self.model_reasoning_snapshot.clearRetainingCapacity();
+        self.model_selection_snapshot = 0;
+        self.clearInput();
+        self.clearPaletteInput();
+    }
+
+    /// Incremental, merge-on-arrival load of a single provider's `/models`.
+    fn startProviderModelLoad(self: *App, provider: config_mod.Provider, key: []const u8) !void {
+        self.cancelModelLoad();
+        if (self.model_load_error) |message| {
+            self.gpa.free(message);
+            self.model_load_error = null;
+        }
+
+        const base_url_default = provider.defaultBaseUrl() orelse return error.NotConnected;
+
+        const job = try self.gpa.create(model_loader.Job);
+        errdefer self.gpa.destroy(job);
+
+        const configured = try self.gpa.alloc(model_loader.Configured, 1);
+        errdefer self.gpa.free(configured);
+        const base_url = try self.gpa.dupe(u8, base_url_default);
+        errdefer self.gpa.free(base_url);
+        const api_key = try self.gpa.dupe(u8, key);
+        errdefer self.gpa.free(api_key);
+        configured[0] = .{ .provider = provider, .base_url = base_url, .api_key = api_key };
+
+        job.* = .{
+            .gpa = self.gpa,
+            .io = self.io,
+            .catalog = .single_provider,
+            .configured = configured,
+            .include_locals = false,
+            .codex_signed_in = self.isCodexSignedIn(),
+            .done = &self.model_load_done,
+        };
+
+        self.model_load_merge = true;
+        self.model_load_done.store(false, .release);
+        self.model_load_future = try self.io.concurrent(model_loader.run, .{job});
+    }
+
     fn applySelectedModel(self: *App) !void {
         if (self.in_flight) return error.InFlightTurn;
         const model = self.selectedCodexModel() orelse return error.NoModels;
@@ -843,7 +1067,8 @@ pub const App = struct {
             },
             .openai_compatible => |provider| {
                 const base_url = self.compatibleBaseUrl(provider) orelse return error.NotConnected;
-                const api_key = if (self.cached_config.api_key) |key| key else providerLocalApiKey(provider);
+                const api_key = self.compatibleApiKey(provider);
+                if (api_key.len == 0 and provider.requiresApiKey()) return error.NotConnected;
                 try self.attachOpenAiCompatibleClient(base_url, api_key, model.id, effort);
                 try self.persistModelSelection(provider, model.id, effort, self.model_scope);
             },
@@ -1057,6 +1282,16 @@ pub const App = struct {
             if (url_provider == provider) return base_url;
         }
         return provider.defaultBaseUrl();
+    }
+
+    /// Resolve the API key for an OpenAI-compatible provider: a key stored in
+    /// auth.json wins, then the env/config key, then the provider's anonymous
+    /// sentinel (e.g. OpenCode Zen's `public`), then the local-daemon sentinel.
+    fn compatibleApiKey(self: *const App, provider: config_mod.Provider) []const u8 {
+        if (self.provider_api_keys.get(provider.label())) |key| return key;
+        if (self.cached_config.api_key) |key| return key;
+        if (provider.anonymousApiKey()) |anon| return anon;
+        return providerLocalApiKey(provider);
     }
 
     fn providerLocalApiKey(provider: config_mod.Provider) []const u8 {
@@ -1611,7 +1846,7 @@ pub const App = struct {
     fn scrollSelectedLongMessage(self: *App, direction: ThreadNavigation) bool {
         const selected = self.thread.selected orelse return false;
         if (selected >= self.thread.messages.items.len) return false;
-        const rows = messageRows(self.thread.messages.items[selected], ConversationLayout.contentWidth(self.thread_view_width));
+        const rows = messageRowsCached(&self.thread.messages.items[selected], ConversationLayout.contentWidth(self.thread_view_width));
         const height = self.thread_view_height;
         if (rows <= height) return false;
         const rows_hidden = rows - height;
@@ -1636,7 +1871,7 @@ pub const App = struct {
     fn selectedMessageIsLong(self: *const App) bool {
         const selected = self.thread.selected orelse return false;
         if (selected >= self.thread.messages.items.len) return false;
-        const rows = messageRows(self.thread.messages.items[selected], ConversationLayout.contentWidth(self.thread_view_width));
+        const rows = messageRowsCached(&self.thread.messages.items[selected], ConversationLayout.contentWidth(self.thread_view_width));
         return rows > self.thread_view_height;
     }
 
@@ -1646,7 +1881,7 @@ pub const App = struct {
     fn selectedMessageCanScrollDown(self: *const App) bool {
         const selected = self.thread.selected orelse return false;
         if (selected >= self.thread.messages.items.len) return false;
-        const rows = messageRows(self.thread.messages.items[selected], ConversationLayout.contentWidth(self.thread_view_width));
+        const rows = messageRowsCached(&self.thread.messages.items[selected], ConversationLayout.contentWidth(self.thread_view_width));
         const height = self.thread_view_height;
         if (rows <= height) return false;
         return self.selectedMessageOffset(selected) < rows - height;
@@ -1655,7 +1890,7 @@ pub const App = struct {
     fn anchorSelectedLongMessage(self: *App, direction: ThreadNavigation) void {
         const selected = self.thread.selected orelse return;
         if (selected >= self.thread.messages.items.len) return;
-        const rows = messageRows(self.thread.messages.items[selected], ConversationLayout.contentWidth(self.thread_view_width));
+        const rows = messageRowsCached(&self.thread.messages.items[selected], ConversationLayout.contentWidth(self.thread_view_width));
         const height = self.thread_view_height;
         if (rows <= height) return;
         const offset = switch (direction) {
@@ -1732,6 +1967,12 @@ pub fn run(
     var app = App.initRuntime(init.io, gpa, runtime, config);
     app.bindInputCallbacks();
     defer app.deinit();
+
+    // Load stored catalogue-provider keys from auth.json up front so the first
+    // model-catalogue build includes every connected provider. Without this the
+    // keys only loaded when the provider picker was opened, so a cold model
+    // picker silently skipped (and then cached) every keyed provider.
+    app.refreshProviderApiKeys() catch {};
 
     // The logo message is a marker: the black-hole animation renders its frames
     // directly (see tui/blackhole.zig), so the body is intentionally empty.
@@ -1973,6 +2214,14 @@ const RootWidget = struct {
     }
 
     fn syncFocus(self: *RootWidget, ctx: *vxfw.EventContext) !void {
+        // The provider setup form draws its own inline editor and intentionally
+        // omits the overlay search field. Focusing the (undrawn) palette input
+        // would leave the focus path empty and panic on the next event, so keep
+        // focus on the root widget — it owns key handling via captureEvent anyway.
+        if (self.app.mode == .provider_picker and self.app.provider_picker.stage == .form) {
+            try ctx.requestFocus(self.widget());
+            return;
+        }
         const target = switch (self.app.mode) {
             .command, .session_picker, .provider_picker, .model_picker, .tree_picker => self.app.palette_input.widget(),
             .normal => self.app.input.widget(),
@@ -2130,9 +2379,9 @@ const ThreadWidget = struct {
         const messages = self.app.thread.messages.items;
         const widgets = try ctx.arena.alloc(vxfw.Widget, messages.len);
         const bodies = try ctx.arena.alloc(MessageWidget, messages.len);
-        for (messages, 0..) |message, index| {
+        for (messages, 0..) |*message, index| {
             const selected = if (self.app.thread.selected) |selected_index| selected_index == index else false;
-            bodies[index] = .{ .message = message, .selected = selected, .loading_frame = self.app.loading_frame, .blackhole_frame = self.app.blackhole_frame };
+            bodies[index] = .{ .message = message, .selected = selected, .loading_frame = self.app.loading_frame, .blackhole_frame = self.app.blackhole_frame, .gpa = self.app.gpa };
             widgets[index] = bodies[index].widget();
         }
         return widgets;
@@ -2159,8 +2408,7 @@ const ThreadWidget = struct {
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
         const list_height = max_height -| ConversationLayout.top -| ConversationLayout.bottom;
-        const message = self.app.thread.messages.items[cursor];
-        const message_height = messageRows(message, ConversationLayout.contentWidth(max_width));
+        const message_height = messageRowsCached(&self.app.thread.messages.items[cursor], ConversationLayout.contentWidth(max_width));
         self.app.thread_list.scroll.top = cursor;
         self.app.thread_list.scroll.pending_lines = 0;
         self.app.thread_list.scroll.wants_cursor = false;
@@ -2295,7 +2543,7 @@ fn overlaySize(mode: App.Mode) OverlaySize {
     return switch (mode) {
         .normal => .{ .width = 0, .height = 0 },
         .command => .{ .width = 40, .height = 16 },
-        .provider_picker => .{ .width = 64, .height = 16 },
+        .provider_picker => .{ .width = 72, .height = 16 },
         .session_picker => .{ .width = 80, .height = 16 },
         .model_picker => .{ .width = 90, .height = 16 },
         .tree_picker => .{ .width = 90, .height = 20 },
@@ -2332,7 +2580,10 @@ const OverlayWidget = struct {
 
     fn drawOverlay(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *OverlayWidget = @ptrCast(@alignCast(ptr));
-        const size = overlaySize(self.app.mode);
+        const size = if (self.app.mode == .provider_picker and self.app.provider_picker.stage == .form)
+            OverlaySize{ .width = 64, .height = 6 }
+        else
+            overlaySize(self.app.mode);
         const max_w: u16 = ctx.max.width orelse size.width;
         const max_h: u16 = ctx.max.height orelse size.height;
         const total_w: u16 = @min(size.width, max_w);
@@ -2409,6 +2660,22 @@ const OverlayInner = struct {
         const ih: u16 = ctx.max.height orelse 0;
 
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = iw, .height = ih });
+
+        // The provider setup form hosts its own inline editor, so it skips the
+        // shared search row entirely and fills the panel from the top.
+        if (self.app.mode == .provider_picker and self.app.provider_picker.stage == .form) {
+            const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
+            children[0] = .{
+                .origin = .{ .row = 0, .col = 0 },
+                .z_index = 0,
+                .surface = try drawContent(self.app, ctx.withConstraints(
+                    .{ .width = iw, .height = ih },
+                    .{ .width = iw, .height = ih },
+                )),
+            };
+            surface.children = children;
+            return surface;
+        }
 
         // Horizontal separator under the search row.
         var sep_col: u16 = 0;
@@ -2499,9 +2766,16 @@ const OverlayInner = struct {
     }
 
     fn drawProviderContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const providers = config_mod.catalogueProviders();
+        const connected = try ctx.arena.alloc(bool, providers.len);
+        for (providers, 0..) |provider, i| {
+            connected[i] = app.provider_api_keys.get(provider.label()) != null;
+        }
         var content: provider_picker.Content = .{
             .state = app.provider_picker,
             .codex_signed_in = app.isCodexSignedIn(),
+            .connected = connected,
+            .key_input = app.provider_key_input.items,
         };
         return content.widget().draw(ctx);
     }
@@ -3009,6 +3283,31 @@ test "root overlay host does not paint outside panel" {
     try std.testing.expectEqual(@as(u16, 16), panel_surface.size.height);
 }
 
+test "provider setup form renders for opencode zen without crashing" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.mode = .provider_picker;
+    app.provider_picker.stage = .form;
+    app.provider_picker.form_provider = .opencode_zen;
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 100, .height = 30 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const surface = try root.widget().draw(ctx);
+    try std.testing.expect(surface.children.len >= 1);
+}
+
 test "mouse bottom does not enable auto-scroll when older message is selected" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
@@ -3084,7 +3383,7 @@ test "down at latest long message bottom does not loop to top" {
     app.thread.selected = 0;
     app.thread_view_width = 80;
     app.thread_view_height = 4;
-    const offset = messageRows(app.thread.messages.items[0], ConversationLayout.contentWidth(app.thread_view_width)) - app.thread_view_height;
+    const offset = messageRowsCached(&app.thread.messages.items[0], ConversationLayout.contentWidth(app.thread_view_width)) - app.thread_view_height;
     app.setSelectedMessageOffset(0, offset);
 
     const scrolled = app.navigateThread(.next);
@@ -3106,7 +3405,7 @@ test "down moves after selected long message bottom is visible" {
     app.thread.selected = 0;
     app.thread_view_width = 80;
     app.thread_view_height = 4;
-    app.setSelectedMessageOffset(0, messageRows(app.thread.messages.items[0], ConversationLayout.contentWidth(app.thread_view_width)) - app.thread_view_height);
+    app.setSelectedMessageOffset(0, messageRowsCached(&app.thread.messages.items[0], ConversationLayout.contentWidth(app.thread_view_width)) - app.thread_view_height);
 
     const scrolled = app.navigateThread(.next);
 
@@ -3166,7 +3465,7 @@ test "begin submit clears input and appends loading row before agent turn" {
     try std.testing.expectEqualStrings("hello", app.thread.messages.items[0].body);
     try std.testing.expectEqual(.status, app.thread.messages.items[loading_index].kind);
     try std.testing.expect(isLoadingWord(app.thread.messages.items[loading_index].title));
-    try std.testing.expectEqual(@as(u16, 2), messageRows(app.thread.messages.items[loading_index], 80));
+    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&app.thread.messages.items[loading_index], 80));
     try std.testing.expectEqual(@as(u32, 0), app.thread.selected.?);
 }
 
@@ -3293,11 +3592,14 @@ test "model picker without models stays on model column" {
     try std.testing.expectEqual(model_picker.Column.model, app.model_column);
 }
 
-test "provider picker has no custom connection row" {
+test "provider picker navigates from codex to catalogue providers" {
     var state: provider_picker.State = .{};
-    try std.testing.expect(state.handleKey(.{ .codepoint = vaxis.Key.down }, false));
     try std.testing.expectEqual(@as(u32, 0), state.selection);
     try std.testing.expectEqual(provider_picker.Action.connect_codex, state.selectedAction());
+    // Below the Codex row sit the catalogue providers; selecting one opens its form.
+    try std.testing.expect(state.handleKey(.{ .codepoint = vaxis.Key.down }, false));
+    try std.testing.expectEqual(@as(u32, 1), state.selection);
+    try std.testing.expect(state.selectedAction() == .open_form);
 }
 
 test "local provider model labels use correct separator" {
@@ -4134,42 +4436,14 @@ test "collapsed thinking and tool rows have stable heights" {
     defer thread.deinit(gpa);
 
     const thinking_index = try thread.append(gpa, .thinking, "Thinking...", "short");
-    try std.testing.expectEqual(@as(u16, 2), messageRows(thread.messages.items[thinking_index], 80));
+    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&thread.messages.items[thinking_index], 80));
 
     try thread.appendThinkingDelta(gpa, thinking_index, " ");
     try thread.appendThinkingDelta(gpa, thinking_index, "this is a much longer thinking body that should not change the collapsed row height");
-    try std.testing.expectEqual(@as(u16, 2), messageRows(thread.messages.items[thinking_index], 80));
+    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&thread.messages.items[thinking_index], 80));
 
     const tool_index = try thread.startTool(gpa, "pwd");
-    try std.testing.expectEqual(@as(u16, 2), messageRows(thread.messages.items[tool_index], 80));
-}
-
-test "first visible message tracks bottom viewport row" {
-    const gpa = std.testing.allocator;
-    var thread: thread_mod.Thread = .{};
-    defer thread.deinit(gpa);
-
-    _ = try thread.append(gpa, .user, "you", "one");
-    _ = try thread.append(gpa, .agent, "agent", "two");
-    _ = try thread.append(gpa, .agent, "agent", "three");
-
-    try std.testing.expectEqual(
-        @as(u32, 0),
-        firstVisibleMessage(thread.messages.items, thread.selected, 80, 6),
-    );
-}
-
-test "latest tall message scrolls by rows instead of message boundaries" {
-    const gpa = std.testing.allocator;
-    var thread: thread_mod.Thread = .{};
-    defer thread.deinit(gpa);
-
-    _ = try thread.append(gpa, .agent, "agent", "one");
-    _ = try thread.append(gpa, .agent, "agent", "line1\nline2\nline3\nline4\nline5\nline6");
-
-    const viewport = visibleRows(thread.messages.items, thread.selected, 80, 4);
-    try std.testing.expectEqual(@as(u32, 5), viewport.first);
-    try std.testing.expectEqual(@as(u32, 9), threadRows(thread.messages.items, 80));
+    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&thread.messages.items[tool_index], 80));
 }
 
 test "collapsed tool title wraps to visible rows" {
@@ -4179,7 +4453,7 @@ test "collapsed tool title wraps to visible rows" {
 
     const index = try thread.startTool(gpa, "edit_file {\"input\":\"a very long patch document\"}");
     try std.testing.expect(!thread.messages.items[index].expanded);
-    try std.testing.expect(messageRows(thread.messages.items[index], 12) > 3);
+    try std.testing.expect(messageRowsCached(&thread.messages.items[index], 12) > 3);
 }
 
 test "collapsed tool messages render no body text" {
@@ -4191,7 +4465,7 @@ test "collapsed tool messages render no body text" {
     try thread.finishTool(gpa, index, "hello", null, false);
 
     try std.testing.expect(!thread.messages.items[index].expanded);
-    try std.testing.expectEqual(@as(u16, 2), messageRows(thread.messages.items[index], 80));
+    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&thread.messages.items[index], 80));
     thread.toggleSelected();
     try std.testing.expect(thread.messages.items[index].expanded);
     try std.testing.expectEqualStrings("hello", thread.messages.items[index].body);
@@ -4203,7 +4477,7 @@ test "expanded tool surface height cannot overflow vxfw buffer size" {
     defer gpa.free(body);
     @memset(body, 'x');
 
-    const message: thread_mod.Message = .{
+    var message: thread_mod.Message = .{
         .kind = .tool,
         .title = try gpa.dupe(u8, "$ yes"),
         .body = body,
@@ -4212,10 +4486,11 @@ test "expanded tool surface height cannot overflow vxfw buffer size" {
     defer gpa.free(message.title);
 
     var widget: MessageWidget = .{
-        .message = message,
+        .message = &message,
         .selected = true,
         .loading_frame = 0,
         .blackhole_frame = 0,
+        .gpa = gpa,
     };
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -4230,33 +4505,3 @@ test "expanded tool surface height cannot overflow vxfw buffer size" {
     try std.testing.expect(surface.size.width * surface.size.height <= std.math.maxInt(u16));
 }
 
-test "selected collapsed tools stay visible for tight viewport heights" {
-    const gpa = std.testing.allocator;
-    var thread: thread_mod.Thread = .{};
-    defer thread.deinit(gpa);
-
-    _ = try thread.append(gpa, .agent, "agent", "one two three four five six seven eight nine ten");
-    const tool_index = try thread.startTool(gpa, "zig build test");
-    _ = try thread.append(gpa, .agent, "agent", "done");
-
-    thread.selected = tool_index;
-    var height: u16 = 1;
-    while (height <= 8) : (height += 1) {
-        const first = firstVisibleMessage(thread.messages.items, thread.selected, 12, height);
-        try std.testing.expect(first <= tool_index);
-        try std.testing.expect(selectedRowFits(thread.messages.items, thread.selected.?, 12, height));
-    }
-}
-
-fn selectedRowFits(
-    messages: []const thread_mod.Message,
-    selected: u32,
-    width: u16,
-    height: u16,
-) bool {
-    const viewport = visibleRows(messages, selected, width, height);
-    const selected_start = messageStartRow(messages, selected, width);
-    const selected_end = selected_start + messageRows(messages[selected], width);
-    const viewport_end = viewport.first + viewport.height;
-    return selected_start < viewport_end and selected_end > viewport.first;
-}
