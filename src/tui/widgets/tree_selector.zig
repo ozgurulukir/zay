@@ -307,12 +307,13 @@ pub const TreeState = struct {
             }
         }
 
-        // 3a. DFS over the visible tree, assigning each node a display indent.
-        // The root is a bare dot. A single-child chain stays at the same indent
-        // (it reads as one connected thread, not a staircase). The only step is
-        // after a branch: each arm's own continuation indents once more so the
-        // `│` joining the arms has a free column.
-        const Layout = struct { full_index: usize, indent: u16, foldable: bool, is_folded: bool };
+        // 3a. DFS over the visible tree assigning each node a display indent.
+        // The root and any single-child (linear) chain stay flush at indent 0 —
+        // they read as one connected thread, not a staircase of siblings. The
+        // indent steps in by one only at a branch: each arm, and that arm's
+        // first continuation, moves one level deeper so sibling arms keep a free
+        // `│` gutter column.
+        const Layout = struct { full_index: usize, indent: u16, foldable: bool, is_folded: bool, branch_point: bool };
         var layout: std.ArrayList(Layout) = .empty;
         const Frame = struct { index: usize, indent: u16, just_branched: bool };
         var stack: std.ArrayList(Frame) = .empty;
@@ -328,18 +329,18 @@ pub const TreeState = struct {
             // Fold only at branches: a node is foldable when it is one arm of a
             // branch (its visible parent has >1 children) and has children of
             // its own. Folding hides that arm's descendants — its children, not
-            // its siblings.
+            // its siblings. Such a node always sits at indent ≥ 1, so its fold
+            // marker rides in the connector's middle slot.
             const foldable = kids.len > 0 and parent != null and child_lists[parent.?].items.len > 1;
             try layout.append(arena, .{
                 .full_index = frame.index,
                 .indent = frame.indent,
                 .foldable = foldable,
                 .is_folded = self.folded.contains(self.nodes[frame.index].id),
+                .branch_point = multiple,
             });
 
-            const child_indent: u16 = if (frame.indent == 0)
-                1
-            else if (multiple or frame.just_branched)
+            const child_indent: u16 = if (multiple or (frame.just_branched and frame.indent > 0))
                 frame.indent + 1
             else
                 frame.indent;
@@ -351,9 +352,10 @@ pub const TreeState = struct {
             }
         }
 
-        // 3b. Second pass: derive connectors from the *displayed* layout, so a
-        // run of siblings connects with `├─`/`│` and only the genuine last node
-        // at a level gets `└─`. `last_at_indent[k]` tracks whether the current
+        // 3b. Second pass: derive connectors from the *displayed* layout. Within
+        // a branch (indent ≥ 1) a run of nodes at the same indent connects as a
+        // thread (`├─`…`╰─`); only the genuine last node at a level gets the
+        // rounded corner. `last_at_indent[k]` tracks whether the current
         // ancestor at indent k is the last at its level (drives the `│`
         // gutters); pre-order + ≤+1 indent steps keep it pointing at ancestors.
         var out: std.ArrayList(VisibleNode) = try .initCapacity(arena, layout.items.len);
@@ -370,7 +372,7 @@ pub const TreeState = struct {
                 }
                 if (layout.items[j].indent < item.indent) break;
             }
-            const prefix = try buildPrefix(arena, item.indent, is_last, last_at_indent[0..], item.is_folded, item.foldable);
+            const prefix = try buildPrefix(arena, item.indent, is_last, last_at_indent[0..], item.is_folded, item.foldable, item.branch_point);
             if (item.indent <= max_levels) last_at_indent[item.indent] = is_last;
             out.appendAssumeCapacity(.{
                 .full_index = item.full_index,
@@ -419,11 +421,18 @@ pub const TreeState = struct {
 
 };
 
-/// Build the tree-art prefix for a row. The root (indent 0) is a bare dot.
-/// Every other node draws ancestor gutters (`│ `/blank) followed by its own
-/// connector (`├─`/`└─`); the connector's middle slot carries the fold marker
-/// (`▼` expandable, `▲` folded, `─` otherwise). `last_at_indent[k]` tells
-/// whether the ancestor at indent `k` is the last at its level (no `│` below).
+/// Build the tree-art prefix for a row. The root and linear chains (indent 0)
+/// render flush as plain text. Every other node draws ancestor gutters
+/// (`│  `/blank) followed by its own connector — a tee (`├─`) when more nodes
+/// follow at its level, a rounded corner (`╰─`) when it is the last. The
+/// connector's middle slot carries the fold marker (`▼` expanded, `▶`
+/// collapsed, `─` otherwise). `last_at_indent[k]` tells whether the ancestor at
+/// indent `k` is the last at its level (no `│` below it).
+///
+/// A branch point (a node with >1 visible children) ends its prefix with a
+/// downward tee `┬`, sitting exactly above its children's connector column.
+/// That gives the branch a node to grow from, so the `├─`/`╰─` arms join a
+/// connector instead of sprouting out of the parent's message text.
 fn buildPrefix(
     arena: std.mem.Allocator,
     indent: u16,
@@ -431,32 +440,38 @@ fn buildPrefix(
     last_at_indent: []const bool,
     is_folded: bool,
     is_foldable: bool,
+    is_branch_point: bool,
 ) ![]const u8 {
-    if (indent == 0) return arena.dupe(u8, "● ");
-
     var out: std.ArrayList(u8) = .empty;
-    const levels = @min(indent, max_levels);
-    // Cells 0..levels-2 are ancestor gutters; cell `levels-1` is this node's
-    // connector. The gutter at cell c continues the ancestor whose connector
-    // sits there — the ancestor at indent c+1 — when it is not the last node
-    // at its level.
-    var cell: u16 = 0;
-    while (cell + 1 < levels) : (cell += 1) {
-        const ancestor_indent = cell + 1;
-        const draw_bar = ancestor_indent < last_at_indent.len and !last_at_indent[ancestor_indent];
-        try out.appendSlice(arena, if (draw_bar) "│  " else "   ");
+    if (indent > 0) {
+        const levels = @min(indent, max_levels);
+        // Cells 0..levels-2 are ancestor gutters; cell `levels-1` is this node's
+        // connector. The gutter at cell c continues the ancestor whose connector
+        // sits there — the ancestor at indent c+1 — when it is not the last node
+        // at its level.
+        var cell: u16 = 0;
+        while (cell + 1 < levels) : (cell += 1) {
+            const ancestor_indent = cell + 1;
+            const draw_bar = ancestor_indent < last_at_indent.len and !last_at_indent[ancestor_indent];
+            try out.appendSlice(arena, if (draw_bar) "│  " else "   ");
+        }
+        // Connector cell: a rounded corner for the last node at this level, a
+        // tee otherwise. The middle slot doubles as the fold marker, kept to the
+        // same 3-column width as a gutter so columns line up.
+        try out.appendSlice(arena, if (is_last) "╰" else "├");
+        if (is_folded) {
+            try out.appendSlice(arena, "▶");
+        } else if (is_foldable) {
+            try out.appendSlice(arena, "▼");
+        } else {
+            try out.appendSlice(arena, "─");
+        }
+        try out.append(arena, ' ');
     }
-    // Connector cell: corner + a middle slot that doubles as the fold marker,
-    // kept to the same 3-column width as a gutter so columns line up.
-    try out.appendSlice(arena, if (is_last) "└" else "├");
-    if (is_folded) {
-        try out.appendSlice(arena, "▲");
-    } else if (is_foldable) {
-        try out.appendSlice(arena, "▼");
-    } else {
-        try out.appendSlice(arena, "─");
-    }
-    try out.append(arena, ' ');
+    // The branch point's own node glyph: its children's connectors align under
+    // this `┬`, so the fork reads as one continuous line rather than separate
+    // lines starting beneath the text.
+    if (is_branch_point) try out.appendSlice(arena, "┬ ");
     return out.toOwnedSlice(arena);
 }
 
@@ -552,7 +567,7 @@ const Row = struct {
     }
 };
 
-test "root is a dot; every other node gets a connector" {
+test "linear chains stay flush; only branch children get connectors" {
     const gpa = std.testing.allocator;
     var state = TreeState.init(gpa);
     defer state.deinit();
@@ -567,13 +582,14 @@ test "root is a dot; every other node gets a connector" {
     try state.load(&records, "cccccccc");
 
     try std.testing.expectEqual(@as(usize, 4), state.visible.len);
-    // root is a bare dot.
-    try std.testing.expectEqualStrings("● ", state.visible[0].prefix);
-    // the single linear child still gets a connector (last child -> └).
-    try std.testing.expect(std.mem.indexOf(u8, state.visible[1].prefix, "└") != null);
-    // the two children of bbbbbbbb are a branch: one tee, one last.
+    // The root linear node renders flush, with no tree art.
+    try std.testing.expectEqualStrings("", state.visible[0].prefix);
+    // bbbbbbbb is a branch point: it grows a `┬` tee for its children to join.
+    try std.testing.expectEqualStrings("┬ ", state.visible[1].prefix);
+    // Its two children are the branch arms: one tee, one rounded last corner,
+    // both aligned under the parent's `┬`.
     try std.testing.expect(std.mem.indexOf(u8, state.visible[2].prefix, "├") != null);
-    try std.testing.expect(std.mem.indexOf(u8, state.visible[3].prefix, "└") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.visible[3].prefix, "╰") != null);
 }
 
 test "fold hides a subtree and unfold restores it" {
