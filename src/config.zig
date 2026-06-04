@@ -18,10 +18,19 @@ pub const Provider = enum {
     ollama,
     llama_cpp,
     openrouter,
+    cerebras,
+    ollama_cloud,
+    huggingface,
+    nvidia_nim,
+    opencode_zen,
     anthropic,
 
     pub fn label(self: Provider) []const u8 {
         return providerSpec(self).label;
+    }
+
+    pub fn displayName(self: Provider) []const u8 {
+        return providerSpec(self).display_name;
     }
 
     /// Default base_url for this Provider. `null` means the user MUST
@@ -33,7 +42,38 @@ pub const Provider = enum {
     pub fn adapter(self: Provider) ?AdapterKind {
         return providerSpec(self).adapter_kind;
     }
+
+    pub fn isCatalogue(self: Provider) bool {
+        return providerSpec(self).catalogue;
+    }
+
+    pub fn requiresApiKey(self: Provider) bool {
+        return providerSpec(self).requires_api_key;
+    }
+
+    pub fn anonymousApiKey(self: Provider) ?[]const u8 {
+        return switch (self) {
+            .opencode_zen => "public",
+            else => null,
+        };
+    }
 };
+
+pub fn catalogueProviders() []const Provider {
+    const list = comptime blk: {
+        var buf: [provider_specs.len]Provider = undefined;
+        var n: usize = 0;
+        for (provider_specs) |spec| {
+            if (spec.catalogue) {
+                buf[n] = spec.provider;
+                n += 1;
+            }
+        }
+        const final = buf[0..n].*;
+        break :blk final;
+    };
+    return &list;
+}
 
 pub const AdapterKind = enum {
     codex_responses,
@@ -44,17 +84,25 @@ pub const AdapterKind = enum {
 const ProviderSpec = struct {
     provider: Provider,
     label: []const u8,
+    display_name: []const u8,
     base_url_default: ?[]const u8,
     adapter_kind: ?AdapterKind,
+    catalogue: bool = false,
+    requires_api_key: bool = true,
 };
 
 const provider_specs = [_]ProviderSpec{
-    .{ .provider = .openai, .label = "openai", .base_url_default = "https://chatgpt.com/backend-api", .adapter_kind = .codex_responses },
-    .{ .provider = .openai_compatible, .label = "openai_compatible", .base_url_default = null, .adapter_kind = .openai_compatible },
-    .{ .provider = .ollama, .label = "ollama", .base_url_default = "http://localhost:11434", .adapter_kind = .openai_compatible },
-    .{ .provider = .llama_cpp, .label = "llama.cpp", .base_url_default = "http://localhost:8080", .adapter_kind = .openai_compatible },
-    .{ .provider = .openrouter, .label = "openrouter", .base_url_default = "https://openrouter.ai/api", .adapter_kind = .openai_compatible },
-    .{ .provider = .anthropic, .label = "anthropic", .base_url_default = null, .adapter_kind = null },
+    .{ .provider = .openai, .label = "openai", .display_name = "OpenAI Codex", .base_url_default = "https://chatgpt.com/backend-api", .adapter_kind = .codex_responses },
+    .{ .provider = .openai_compatible, .label = "openai_compatible", .display_name = "OpenAI Compatible", .base_url_default = null, .adapter_kind = .openai_compatible },
+    .{ .provider = .ollama, .label = "ollama", .display_name = "Ollama", .base_url_default = "http://localhost:11434", .adapter_kind = .openai_compatible },
+    .{ .provider = .llama_cpp, .label = "llama.cpp", .display_name = "llama.cpp", .base_url_default = "http://localhost:8080", .adapter_kind = .openai_compatible },
+    .{ .provider = .openrouter, .label = "openrouter", .display_name = "OpenRouter", .base_url_default = "https://openrouter.ai/api", .adapter_kind = .openai_compatible, .catalogue = true },
+    .{ .provider = .cerebras, .label = "cerebras", .display_name = "Cerebras", .base_url_default = "https://api.cerebras.ai/v1", .adapter_kind = .openai_compatible, .catalogue = true },
+    .{ .provider = .ollama_cloud, .label = "ollama_cloud", .display_name = "Ollama Cloud", .base_url_default = "https://ollama.com/v1", .adapter_kind = .openai_compatible, .catalogue = true },
+    .{ .provider = .huggingface, .label = "huggingface", .display_name = "HuggingFace", .base_url_default = "https://router.huggingface.co/v1", .adapter_kind = .openai_compatible, .catalogue = true },
+    .{ .provider = .nvidia_nim, .label = "nvidia_nim", .display_name = "Nvidia Nim", .base_url_default = "https://integrate.api.nvidia.com/v1", .adapter_kind = .openai_compatible, .catalogue = true },
+    .{ .provider = .opencode_zen, .label = "opencode_zen", .display_name = "OpenCode Zen", .base_url_default = "https://opencode.ai/zen/v1", .adapter_kind = .openai_compatible, .catalogue = true, .requires_api_key = false },
+    .{ .provider = .anthropic, .label = "anthropic", .display_name = "Anthropic", .base_url_default = null, .adapter_kind = null },
 };
 
 const providers_by_name = std.StaticStringMap(Provider).initComptime(.{
@@ -63,6 +111,11 @@ const providers_by_name = std.StaticStringMap(Provider).initComptime(.{
     .{ "ollama", .ollama },
     .{ "llama.cpp", .llama_cpp },
     .{ "openrouter", .openrouter },
+    .{ "cerebras", .cerebras },
+    .{ "ollama_cloud", .ollama_cloud },
+    .{ "huggingface", .huggingface },
+    .{ "nvidia_nim", .nvidia_nim },
+    .{ "opencode_zen", .opencode_zen },
     .{ "anthropic", .anthropic },
 });
 
@@ -784,8 +837,26 @@ test "providers_by_name recognizes known vendor names" {
     try std.testing.expectEqual(Provider.ollama, providers_by_name.get("ollama").?);
     try std.testing.expectEqual(Provider.llama_cpp, providers_by_name.get("llama.cpp").?);
     try std.testing.expectEqual(Provider.openrouter, providers_by_name.get("openrouter").?);
+    try std.testing.expectEqual(Provider.cerebras, providers_by_name.get("cerebras").?);
+    try std.testing.expectEqual(Provider.ollama_cloud, providers_by_name.get("ollama_cloud").?);
+    try std.testing.expectEqual(Provider.huggingface, providers_by_name.get("huggingface").?);
+    try std.testing.expectEqual(Provider.nvidia_nim, providers_by_name.get("nvidia_nim").?);
+    try std.testing.expectEqual(Provider.opencode_zen, providers_by_name.get("opencode_zen").?);
     try std.testing.expectEqual(Provider.anthropic, providers_by_name.get("anthropic").?);
     try std.testing.expectEqual(@as(?Provider, null), providers_by_name.get("mystery"));
+}
+
+test "every catalogue provider round-trips through providers_by_name and has a base url" {
+    for (catalogueProviders()) |provider| {
+        try std.testing.expectEqual(provider, providers_by_name.get(provider.label()).?);
+        try std.testing.expect(provider.defaultBaseUrl() != null);
+        try std.testing.expectEqual(AdapterKind.openai_compatible, provider.adapter().?);
+    }
+    // OpenCode Zen is the one catalogue provider with an anonymous (free) tier.
+    try std.testing.expect(!Provider.opencode_zen.requiresApiKey());
+    try std.testing.expectEqualStrings("public", Provider.opencode_zen.anonymousApiKey().?);
+    try std.testing.expect(Provider.cerebras.requiresApiKey());
+    try std.testing.expectEqual(@as(?[]const u8, null), Provider.cerebras.anonymousApiKey());
 }
 
 test "Provider.adapter returns null for unimplemented anthropic" {

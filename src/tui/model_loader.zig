@@ -7,7 +7,11 @@ const symbols = @import("../symbols.zig");
 
 pub const ModelSource = union(enum) { openai_codex, openai_compatible: config_mod.Provider };
 
-pub const Catalog = enum { connected_provider, openai_codex };
+pub const Catalog = enum {
+    connected_provider,
+    openai_codex,
+    single_provider,
+};
 
 pub const Result = struct {
     models: std.ArrayList(codex.Model) = .empty,
@@ -50,17 +54,19 @@ pub const Job = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     catalog: Catalog,
-    configured: ?Configured,
+    configured: []Configured,
+    include_locals: bool,
     codex_signed_in: bool,
     /// Set to `true` immediately before the worker returns, so the main
     /// thread can non-blockingly poll for completion without awaiting.
     done: *std.atomic.Value(bool),
 
     fn deinit(self: *Job) void {
-        if (self.configured) |c| {
+        for (self.configured) |c| {
             self.gpa.free(c.base_url);
             self.gpa.free(c.api_key);
         }
+        if (self.configured.len > 0) self.gpa.free(self.configured);
         self.* = undefined;
     }
 };
@@ -89,14 +95,15 @@ pub fn run(job: *Job) Outcome {
 fn buildCatalog(job: *Job, result: *Result) !void {
     switch (job.catalog) {
         .connected_provider => {
-            if (job.configured) |configured| {
-                loadConfigured(job, configured, result) catch |err| {
-                    if (!job.codex_signed_in) return err;
-                };
+            for (job.configured) |configured| loadConfigured(job, configured, result) catch {};
+            if (job.include_locals) {
+                loadLocal(job, .ollama, result) catch {};
+                loadLocal(job, .llama_cpp, result) catch {};
             }
-            loadLocal(job, .ollama, result) catch {};
-            loadLocal(job, .llama_cpp, result) catch {};
             if (job.codex_signed_in) try loadStatic(job, result);
+        },
+        .single_provider => {
+            for (job.configured) |configured| try loadConfigured(job, configured, result);
         },
         .openai_codex => try loadStatic(job, result),
     }
@@ -110,9 +117,10 @@ fn loadConfigured(job: *Job, configured: Configured, result: *Result) !void {
     }
     for (fetched) |entry| {
         if (!includeLocalModel(configured.provider, entry.id)) continue;
+        if (!includeAnonymousModel(configured.provider, configured.api_key, entry.id)) continue;
         const id = try job.gpa.dupe(u8, entry.id);
         errdefer job.gpa.free(id);
-        const label = try job.gpa.dupe(u8, entry.id);
+        const label = try std.fmt.allocPrint(job.gpa, "{s}{s}{s}", .{ providerModelLabel(configured.provider), symbols.separator_dot_padded, entry.id });
         errdefer job.gpa.free(label);
         try result.models.append(job.gpa, .{ .id = id, .label = label });
         try result.sources.append(job.gpa, .{ .openai_compatible = configured.provider });
@@ -151,8 +159,17 @@ fn loadStatic(job: *Job, result: *Result) !void {
     }
 }
 
+pub fn includeAnonymousModel(provider: config_mod.Provider, api_key: []const u8, id: []const u8) bool {
+    const anon = provider.anonymousApiKey() orelse return true;
+    if (!std.mem.eql(u8, api_key, anon)) return true;
+    return std.mem.endsWith(u8, id, "-free");
+}
+
 pub fn includeLocalModel(provider: config_mod.Provider, id: []const u8) bool {
-    if (provider == .ollama and std.mem.endsWith(u8, id, "-cloud")) return false;
+    if (provider == .ollama) {
+        if (std.mem.endsWith(u8, id, "-cloud")) return false;
+        if (std.mem.endsWith(u8, id, ":cloud")) return false;
+    }
     return true;
 }
 
@@ -165,9 +182,26 @@ fn providerLocalApiKey(provider: config_mod.Provider) []const u8 {
 }
 
 fn providerModelLabel(provider: config_mod.Provider) []const u8 {
-    return switch (provider) {
-        .ollama => "Ollama",
-        .llama_cpp => "llama.cpp",
-        else => provider.label(),
-    };
+    return provider.displayName();
+}
+
+test "includeAnonymousModel keeps only -free models when anonymous on opencode zen" {
+    // Anonymous (the "public" sentinel): only `-free` models pass.
+    try std.testing.expect(includeAnonymousModel(.opencode_zen, "public", "deepseek-v4-flash-free"));
+    try std.testing.expect(!includeAnonymousModel(.opencode_zen, "public", "claude-opus-4-8"));
+    try std.testing.expect(!includeAnonymousModel(.opencode_zen, "public", "deepseek-v4-flash"));
+    // A real key (not the sentinel) shows everything.
+    try std.testing.expect(includeAnonymousModel(.opencode_zen, "sk-real", "claude-opus-4-8"));
+    // Providers without an anonymous tier are never filtered.
+    try std.testing.expect(includeAnonymousModel(.cerebras, "public", "anything"));
+}
+
+test "includeLocalModel drops cloud-suffixed models for local ollama only" {
+    try std.testing.expect(!includeLocalModel(.ollama, "gpt-oss:120b-cloud"));
+    try std.testing.expect(!includeLocalModel(.ollama, "qwen3-coder:480b-cloud"));
+    try std.testing.expect(!includeLocalModel(.ollama, "deepseek-v3.1:671b:cloud"));
+    try std.testing.expect(includeLocalModel(.ollama, "llama3.1:8b"));
+    // Ollama Cloud and other providers keep every model the endpoint returns.
+    try std.testing.expect(includeLocalModel(.ollama_cloud, "gpt-oss:120b-cloud"));
+    try std.testing.expect(includeLocalModel(.cerebras, "anything:cloud"));
 }

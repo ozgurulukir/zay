@@ -108,6 +108,12 @@ pub fn refresh(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, refresh
 }
 
 pub fn signOut(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !void {
+    var keys = try loadAllProviderApiKeys(gpa, io, home_dir);
+    defer freeApiKeyMap(gpa, &keys);
+    if (apiKeysCount(&keys) > 0) {
+        try writeAuthFile(gpa, io, home_dir, null, &keys);
+        return;
+    }
     const path = try authPath(gpa, home_dir);
     defer gpa.free(path);
     std.Io.Dir.deleteFile(.cwd(), io, path) catch |err| switch (err) {
@@ -309,14 +315,20 @@ fn accountIdFromAccessToken(gpa: std.mem.Allocator, access: []const u8) ![]u8 {
 }
 
 fn save(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, credentials: Credentials) !void {
-    try writeAuth(gpa, io, home_dir, credentials);
+    // Preserve any stored provider API keys when (re)writing Codex credentials.
+    var keys = try loadAllProviderApiKeys(gpa, io, home_dir);
+    defer freeApiKeyMap(gpa, &keys);
+    try writeAuthFile(gpa, io, home_dir, credentials, &keys);
 }
 
-fn writeAuth(
+/// Single owner of `auth.json`: serializes the optional Codex credentials and
+/// the provider API-key map together, so neither write clobbers the other.
+fn writeAuthFile(
     gpa: std.mem.Allocator,
     io: std.Io,
     home_dir: []const u8,
     credentials: ?Credentials,
+    api_keys: *const ApiKeyMap,
 ) !void {
     const path = try authPath(gpa, home_dir);
     defer gpa.free(path);
@@ -330,6 +342,10 @@ fn writeAuth(
         try writeAuthKey(&payload.writer, "openaiCodex", &wrote_any);
         try writeCredentials(&payload.writer, &value);
     }
+    if (apiKeysCount(api_keys) > 0) {
+        try writeAuthKey(&payload.writer, "apiKeys", &wrote_any);
+        try writeApiKeys(&payload.writer, api_keys);
+    }
     try payload.writer.writeAll("}\n");
     var file = try std.Io.Dir.createFile(.cwd(), io, path, .{ .truncate = true });
     defer file.close(io);
@@ -337,6 +353,30 @@ fn writeAuth(
     var writer = file.writer(io, &buffer);
     try writer.interface.writeAll(payload.written());
     try writer.interface.flush();
+}
+
+fn apiKeysCount(api_keys: *const ApiKeyMap) usize {
+    var count: usize = 0;
+    var it = api_keys.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.*.len > 0) count += 1;
+    }
+    return count;
+}
+
+fn writeApiKeys(writer: *std.Io.Writer, api_keys: *const ApiKeyMap) !void {
+    try writer.writeByte('{');
+    var wrote_any = false;
+    var it = api_keys.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.*.len == 0) continue;
+        if (wrote_any) try writer.writeByte(',');
+        try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
+        try writer.writeByte(':');
+        try std.json.Stringify.value(entry.value_ptr.*, .{}, writer);
+        wrote_any = true;
+    }
+    try writer.writeByte('}');
 }
 
 fn writeAuthKey(writer: *std.Io.Writer, name: []const u8, wrote_any: *bool) !void {
@@ -370,7 +410,94 @@ fn authPath(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
 
 const AuthFile = struct {
     openaiCodex: ?CredentialsJson = null,
+    /// Map of `provider.label()` -> API key. Parsed as a raw object because
+    /// the keys are provider labels, not known field names.
+    apiKeys: ?std.json.Value = null,
 };
+
+pub const ApiKeyMap = std.StringArrayHashMapUnmanaged([]u8);
+
+pub fn freeApiKeyMap(gpa: std.mem.Allocator, map: *ApiKeyMap) void {
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        gpa.free(entry.key_ptr.*);
+        gpa.free(entry.value_ptr.*);
+    }
+    map.deinit(gpa);
+}
+
+/// Read every stored provider API key. Returns an empty map when the auth
+/// file is absent or carries no `apiKeys` section.
+pub fn loadAllProviderApiKeys(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !ApiKeyMap {
+    const path = try authPath(gpa, home_dir);
+    defer gpa.free(path);
+    const bytes = std.Io.Dir.readFileAllocOptions(.cwd(), io, path, gpa, .limited(32 * 1024), .of(u8), 0) catch |err| switch (err) {
+        error.FileNotFound => return .empty,
+        else => return err,
+    };
+    defer gpa.free(bytes);
+    return parseApiKeys(gpa, bytes);
+}
+
+/// Read a single provider's stored API key, or null if none is stored.
+pub fn loadProviderApiKey(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, label: []const u8) !?[]u8 {
+    var map = try loadAllProviderApiKeys(gpa, io, home_dir);
+    defer freeApiKeyMap(gpa, &map);
+    const value = map.get(label) orelse return null;
+    return try gpa.dupe(u8, value);
+}
+
+/// Upsert a provider API key, preserving any Codex credentials and other keys.
+pub fn saveProviderApiKey(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, label: []const u8, key: []const u8) !void {
+    var keys = try loadAllProviderApiKeys(gpa, io, home_dir);
+    defer freeApiKeyMap(gpa, &keys);
+    if (keys.fetchOrderedRemove(label)) |old| {
+        gpa.free(old.key);
+        gpa.free(old.value);
+    }
+    const owned_label = try gpa.dupe(u8, label);
+    errdefer gpa.free(owned_label);
+    const owned_key = try gpa.dupe(u8, key);
+    errdefer gpa.free(owned_key);
+    try keys.put(gpa, owned_label, owned_key);
+
+    var creds = try load(gpa, io, home_dir);
+    defer if (creds) |*c| c.deinit(gpa);
+    try writeAuthFile(gpa, io, home_dir, creds, &keys);
+}
+
+/// Remove a provider API key, preserving Codex credentials and other keys.
+pub fn removeProviderApiKey(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, label: []const u8) !void {
+    var keys = try loadAllProviderApiKeys(gpa, io, home_dir);
+    defer freeApiKeyMap(gpa, &keys);
+    if (keys.fetchOrderedRemove(label)) |old| {
+        gpa.free(old.key);
+        gpa.free(old.value);
+    }
+    var creds = try load(gpa, io, home_dir);
+    defer if (creds) |*c| c.deinit(gpa);
+    try writeAuthFile(gpa, io, home_dir, creds, &keys);
+}
+
+fn parseApiKeys(gpa: std.mem.Allocator, bytes: []const u8) !ApiKeyMap {
+    const parsed = std.json.parseFromSlice(AuthFile, gpa, bytes, .{ .ignore_unknown_fields = true }) catch return error.InvalidCredentials;
+    defer parsed.deinit();
+    var map: ApiKeyMap = .empty;
+    errdefer freeApiKeyMap(gpa, &map);
+    const keys_value = parsed.value.apiKeys orelse return map;
+    if (keys_value != .object) return map;
+    var it = keys_value.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .string) continue;
+        if (entry.value_ptr.*.string.len == 0) continue;
+        const owned_label = try gpa.dupe(u8, entry.key_ptr.*);
+        errdefer gpa.free(owned_label);
+        const owned_key = try gpa.dupe(u8, entry.value_ptr.*.string);
+        errdefer gpa.free(owned_key);
+        try map.put(gpa, owned_label, owned_key);
+    }
+    return map;
+}
 
 const CredentialsJson = struct {
     access: []const u8,
@@ -508,4 +635,40 @@ test "auth file parser loads openai codex credentials" {
     try std.testing.expectEqualStrings("r", credentials.refresh);
     try std.testing.expectEqualStrings("acct", credentials.account_id);
     try std.testing.expectEqual(@as(i64, 12), credentials.expires);
+}
+
+test "auth file parser still reads codex creds alongside apiKeys" {
+    const gpa = std.testing.allocator;
+    const loaded = try parseAuthFile(gpa, "{\"openaiCodex\":{\"access\":\"a\",\"refresh\":\"r\",\"expires\":12,\"accountId\":\"acct\"},\"apiKeys\":{\"cerebras\":\"csk\"}}");
+    var credentials = loaded.?;
+    defer credentials.deinit(gpa);
+    try std.testing.expectEqualStrings("a", credentials.access);
+}
+
+test "parseApiKeys reads keys and skips empty/non-string entries" {
+    const gpa = std.testing.allocator;
+    var map = try parseApiKeys(gpa, "{\"apiKeys\":{\"cerebras\":\"csk\",\"openrouter\":\"\",\"nvidia_nim\":42,\"huggingface\":\"hf\"}}");
+    defer freeApiKeyMap(gpa, &map);
+    try std.testing.expectEqual(@as(usize, 2), map.count());
+    try std.testing.expectEqualStrings("csk", map.get("cerebras").?);
+    try std.testing.expectEqualStrings("hf", map.get("huggingface").?);
+    try std.testing.expectEqual(@as(?[]u8, null), map.get("openrouter"));
+}
+
+test "parseApiKeys returns empty map when section absent" {
+    const gpa = std.testing.allocator;
+    var map = try parseApiKeys(gpa, "{\"openaiCodex\":{\"access\":\"a\",\"refresh\":\"r\",\"expires\":1,\"accountId\":\"x\"}}");
+    defer freeApiKeyMap(gpa, &map);
+    try std.testing.expectEqual(@as(usize, 0), map.count());
+}
+
+test "writeApiKeys serializes non-empty entries as a json object" {
+    const gpa = std.testing.allocator;
+    var map: ApiKeyMap = .empty;
+    defer freeApiKeyMap(gpa, &map);
+    try map.put(gpa, try gpa.dupe(u8, "cerebras"), try gpa.dupe(u8, "csk"));
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try writeApiKeys(&out.writer, &map);
+    try std.testing.expectEqualStrings("{\"cerebras\":\"csk\"}", out.written());
 }

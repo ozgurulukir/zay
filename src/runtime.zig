@@ -193,9 +193,19 @@ pub const AgentRuntime = struct {
         config: config_mod.Config,
     ) !void {
         const base_url = config.base_url orelse provider.defaultBaseUrl() orelse return;
-        const api_key = config.api_key orelse "";
         const model = config.model orelse return;
         const effort = model.reasoning_effort orelse .medium;
+        var loaded_key: ?[]u8 = null;
+        defer if (loaded_key) |k| self.gpa.free(k);
+        const api_key = config.api_key orelse blk: {
+            if (provider.isCatalogue() and self.home_dir.len > 0) {
+                loaded_key = codex_mod.loadProviderApiKey(self.gpa, self.io, self.home_dir, provider.label()) catch null;
+                if (loaded_key) |k| break :blk k;
+            }
+            // No stored key — use the anonymous sentinel (e.g. OpenCode Zen's
+            // `public`) when the provider supports it, else send no key.
+            break :blk provider.anonymousApiKey() orelse "";
+        };
         try self.attachOpenAiCompatibleClient(base_url, api_key, model.id, effort);
     }
 

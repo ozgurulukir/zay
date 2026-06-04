@@ -24,9 +24,7 @@ pub const Client = struct {
     io: std.Io,
     config: ai.Config,
     url: []u8,
-    authorization: []u8,
-    /// Pre-built JSON for the OpenAI `tools` request field — derived from
-    /// `config.tools` (the protocol-neutral **Tool registry**) once at init.
+    authorization: ?[]u8,
     tools_json: []u8,
     http_client: std.http.Client,
     /// Monotonic counter for synthesised tool_call ids when the inference
@@ -34,6 +32,7 @@ pub const Client = struct {
     /// assistant tool_calls to their `tool` result messages, so we mint
     /// one here rather than letting the agent see an empty id.
     tool_call_seq: u64 = 0,
+    last_error_detail: ?[]u8 = null,
 
     pub fn init(
         target: *Client,
@@ -49,12 +48,13 @@ pub const Client = struct {
         const url = try std.fmt.allocPrint(gpa, "{s}/chat/completions", .{v1_root});
         errdefer gpa.free(url);
 
-        const authorization = try std.fmt.allocPrint(
-            gpa,
-            "Bearer {s}",
-            .{config.api_key},
-        );
-        errdefer gpa.free(authorization);
+        // Empty key => anonymous request. Keep `authorization` null so `prompt`
+        // omits the header entirely.
+        const authorization: ?[]u8 = if (config.api_key.len > 0)
+            try std.fmt.allocPrint(gpa, "Bearer {s}", .{config.api_key})
+        else
+            null;
+        errdefer if (authorization) |a| gpa.free(a);
 
         var owned_config = config;
         owned_config.base_url = "";
@@ -80,9 +80,25 @@ pub const Client = struct {
         self.http_client.deinit();
         self.gpa.free(self.config.model);
         self.gpa.free(self.tools_json);
-        self.gpa.free(self.authorization);
+        if (self.authorization) |a| self.gpa.free(a);
         self.gpa.free(self.url);
+        if (self.last_error_detail) |d| self.gpa.free(d);
         self.* = undefined;
+    }
+
+    fn clearErrorDetail(self: *Client) void {
+        if (self.last_error_detail) |d| self.gpa.free(d);
+        self.last_error_detail = null;
+    }
+
+    /// Record `HTTP <status>: <message>` from a failed response body for the UI.
+    /// Best-effort: a failure to build the string just leaves the detail unset.
+    fn recordErrorDetail(self: *Client, status_code: u16, body: []const u8) void {
+        const message = extractErrorMessage(self.gpa, body) catch return;
+        defer self.gpa.free(message);
+        const detail = std.fmt.allocPrint(self.gpa, "HTTP {d}: {s}", .{ status_code, message }) catch return;
+        self.clearErrorDetail();
+        self.last_error_detail = detail;
     }
 
     pub fn prompt(
@@ -91,11 +107,11 @@ pub const Client = struct {
         observer: ai.StreamObserver,
     ) !ai.Turn {
         std.debug.assert(self.url.len > 0);
-        std.debug.assert(self.authorization.len > 0);
+        self.clearErrorDetail();
 
         var req = try self.http_client.request(.POST, try std.Uri.parse(self.url), .{
             .headers = .{
-                .authorization = .{ .override = self.authorization },
+                .authorization = if (self.authorization) |a| .{ .override = a } else .omit,
                 .content_type = .{ .override = "application/json" },
             },
         });
@@ -130,6 +146,7 @@ pub const Client = struct {
             defer error_body.deinit();
             _ = error_reader.streamRemaining(&error_body.writer) catch 0;
             logger.log("openai_compatible.response.error status={d} body={s}", .{ status_code, logBytes(error_body.written()) });
+            self.recordErrorDetail(status_code, error_body.written());
             if (status_code >= 500) return error.HttpServerError;
             return error.HttpClientError;
         }
@@ -145,6 +162,58 @@ fn logBytes(bytes: []const u8) []const u8 {
     const limit = 12 * 1024;
     if (bytes.len <= limit) return bytes;
     return bytes[0..limit];
+}
+
+/// Pull a human-readable message out of an error response body. Handles the
+/// common OpenAI-ish shapes — `{"error":{"message":...}}`, `{"error":"..."}`,
+/// `{"message":...}` — and falls back to the raw body (capped) when the body
+/// isn't JSON or has none of those. Returned slice is owned by `gpa`.
+fn extractErrorMessage(gpa: std.mem.Allocator, body: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, body, " \t\r\n");
+    const cap = 600;
+    const fallback = trimmed[0..@min(trimmed.len, cap)];
+
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, trimmed, .{}) catch
+        return gpa.dupe(u8, if (fallback.len > 0) fallback else "(empty response body)");
+    defer parsed.deinit();
+
+    if (parsed.value == .object) {
+        const obj = parsed.value.object;
+        if (obj.get("error")) |err_val| switch (err_val) {
+            .string => |s| return gpa.dupe(u8, s),
+            .object => |eo| if (eo.get("message")) |m| {
+                if (m == .string) return gpa.dupe(u8, m.string);
+            },
+            else => {},
+        };
+        if (obj.get("message")) |m| {
+            if (m == .string) return gpa.dupe(u8, m.string);
+        }
+    }
+    return gpa.dupe(u8, if (fallback.len > 0) fallback else "(empty response body)");
+}
+
+test "extractErrorMessage pulls the nested message, plain error, or raw fallback" {
+    const gpa = std.testing.allocator;
+
+    // OpenCode Zen's shape: {"type":"error","error":{"type":...,"message":...}}
+    const zen = try extractErrorMessage(gpa,
+        \\{"type":"error","error":{"type":"ModelError","message":"Free promotion has ended."}}
+    );
+    defer gpa.free(zen);
+    try std.testing.expectEqualStrings("Free promotion has ended.", zen);
+
+    // `error` as a bare string.
+    const plain = try extractErrorMessage(gpa,
+        \\{"error":"invalid api key"}
+    );
+    defer gpa.free(plain);
+    try std.testing.expectEqualStrings("invalid api key", plain);
+
+    // Non-JSON body falls back to the raw text.
+    const raw = try extractErrorMessage(gpa, "  upstream timeout  ");
+    defer gpa.free(raw);
+    try std.testing.expectEqualStrings("upstream timeout", raw);
 }
 
 /// Build the OpenAI `tools` JSON array from the protocol-neutral
@@ -380,6 +449,9 @@ fn readStream(
         if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
         const data = std.mem.trim(u8, trimmed["data:".len..], " ");
         if (std.mem.eql(u8, data, "[DONE]")) break;
+        // Keep-alive / empty SSE data lines carry no chunk — skip them so the
+        // parser's non-empty-payload assertion never fires.
+        if (data.len == 0) continue;
         try processStreamChunk(gpa, data, &content, &reasoning, &builders, observer);
     }
 
@@ -491,7 +563,9 @@ fn parseStreamChunk(
     reasoning: *std.ArrayList(u8),
     builders: *std.ArrayList(ToolCallBuilder),
 ) !ChunkChange {
-    std.debug.assert(data.len > 0);
+    // Empty payloads carry no chunk (keep-alive lines). Return early rather than
+    // feeding the scanner an empty document.
+    if (data.len == 0) return .{};
 
     var scanner = Scanner.initCompleteInput(gpa, data);
     defer scanner.deinit();
@@ -775,6 +849,22 @@ test "readStream accepts an SSE line larger than the transfer buffer" {
     var response = try readStream(gpa, &reader, ai.StreamObserver.noop, &tool_call_seq);
     defer response.deinit(gpa);
     try std.testing.expectEqual(@as(usize, transfer_buffer_bytes + 512), response.assistant.content[0].text.text.len);
+}
+
+test "readStream skips empty data lines without crashing" {
+    const gpa = std.testing.allocator;
+    // An empty `data:` keep-alive used to hit `parseStreamChunk`'s non-empty
+    // assertion and panic the TUI mid-turn.
+    const stream =
+        "data:\n" ++
+        "data: \n" ++
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n" ++
+        "data: [DONE]\n";
+    var reader: std.Io.Reader = .fixed(stream);
+    var tool_call_seq: u64 = 0;
+    var response = try readStream(gpa, &reader, ai.StreamObserver.noop, &tool_call_seq);
+    defer response.deinit(gpa);
+    try std.testing.expectEqualStrings("hi", response.assistant.content[0].text.text);
 }
 
 test "parse streaming content tolerates null prelude" {

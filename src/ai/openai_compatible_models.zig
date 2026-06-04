@@ -23,21 +23,23 @@ pub fn listModels(
     api_key: []const u8,
 ) ![]ModelEntry {
     std.debug.assert(base_url.len > 0);
-    std.debug.assert(api_key.len > 0);
 
     const v1_root = try openai_endpoint.v1Root(gpa, base_url);
     defer gpa.free(v1_root);
     const url = try std.fmt.allocPrint(gpa, "{s}/models", .{v1_root});
     defer gpa.free(url);
 
-    const authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{api_key});
-    defer gpa.free(authorization);
+    const authorization: ?[]u8 = if (api_key.len > 0)
+        try std.fmt.allocPrint(gpa, "Bearer {s}", .{api_key})
+    else
+        null;
+    defer if (authorization) |a| gpa.free(a);
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
     var request = try http_client.request(.GET, try std.Uri.parse(url), .{
-        .headers = .{ .authorization = .{ .override = authorization } },
+        .headers = .{ .authorization = if (authorization) |a| .{ .override = a } else .omit },
     });
     defer request.deinit();
     try request.sendBodiless();
