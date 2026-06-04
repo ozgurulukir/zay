@@ -208,4 +208,11 @@ pub const LanguageModel = union(enum) {
             .openai_responses => |c| c.prompt(messages, observer),
         };
     }
+
+    pub fn lastErrorDetail(self: LanguageModel) ?[]const u8 {
+        return switch (self) {
+            .openai_compatible => |c| c.last_error_detail,
+            else => null,
+        };
+    }
 };
