@@ -198,7 +198,18 @@ fn formatAnchoredOutput(gpa: std.mem.Allocator, args: Args, bytes: []const u8) c
         if (emitted >= max_output_lines) break;
     }
     try appendFooter(gpa, &buffer, window, total_lines, line_number, emitted);
-    return common.ok(gpa, try buffer.toOwnedSlice(gpa));
+
+    // The LLM channel keeps the `#HL…|` anchors (edit_file references them);
+    // the human display strips them. read owns that stripping — the anchor
+    // format is its concern, so no downstream client needs to know about it.
+    const anchored = try buffer.toOwnedSlice(gpa);
+    errdefer gpa.free(anchored);
+    var display: std.ArrayList(u8) = .empty;
+    errdefer display.deinit(gpa);
+    try hashline.appendStripped(gpa, &display, anchored);
+    const stderr = try gpa.alloc(u8, 0);
+    errdefer gpa.free(stderr);
+    return .{ .stdout = anchored, .stderr = stderr, .code = 0, .display = try display.toOwnedSlice(gpa) };
 }
 
 const Window = struct {

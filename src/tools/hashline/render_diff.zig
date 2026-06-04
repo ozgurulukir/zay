@@ -60,8 +60,7 @@ const Hunk = struct {
 };
 
 /// Render a diff view of the edits applied to `original`. Returns an
-/// allocated string containing the rendered body. See CONTEXT.md
-/// "Diff view" and docs/adr/0002.
+/// allocated string containing the rendered body.
 pub fn render(
     gpa: std.mem.Allocator,
     original: []const u8,

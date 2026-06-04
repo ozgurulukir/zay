@@ -3,13 +3,13 @@
 const std = @import("std");
 
 const ai = @import("ai.zig");
-const hashline = @import("tools/hashline/hash.zig");
 const tools = @import("tools.zig");
 
 const assert = std.debug.assert;
 
-/// The output of one ToolCall, carrying both channels of ADR-0002 in one
-/// record. See CONTEXT.md's `ToolResult`.
+/// The output of one ToolCall, carrying both the LLM channel (the terse
+/// observation that flows into history) and the human channel (display
+/// label/body for the TUI) in one record.
 pub const ToolResult = struct {
     /// LLM channel — the id this result is responding to.
     call_id: []u8,
@@ -146,22 +146,17 @@ fn makeDisplayLabel(gpa: std.mem.Allocator, name: []const u8, args: []const u8) 
     return tool.displayLabel(gpa, args);
 }
 
-/// The human-facing body: the tool's Display body when present, otherwise
-/// the stripped stdout text (hashline anchors removed), otherwise the
-/// sentinel "no output" or an empty slice when stderr will be shown below.
+/// The human-facing body. Each tool owns its own display: when it sets a
+/// `display`, that IS the body (read strips its own anchors, edit_file renders
+/// a diff). Otherwise the body is the raw stdout, or a sentinel when there is
+/// none. The executor passes through — it knows nothing tool-specific.
 fn makeDisplayBody(gpa: std.mem.Allocator, result: tools.Output) ![]u8 {
-    if (result.display) |display| {
-        assert(display.len > 0);
-        return gpa.dupe(u8, display);
-    }
+    if (result.display) |display| return gpa.dupe(u8, display);
     if (result.stdout.len == 0) {
         if (result.stderr.len > 0) return gpa.alloc(u8, 0);
         return gpa.dupe(u8, "no output");
     }
-    var buffer: std.ArrayList(u8) = .empty;
-    errdefer buffer.deinit(gpa);
-    try hashline.appendStripped(gpa, &buffer, result.stdout);
-    return buffer.toOwnedSlice(gpa);
+    return gpa.dupe(u8, result.stdout);
 }
 
 test "ExecutorService runs bash and returns both channels" {

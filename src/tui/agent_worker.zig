@@ -126,15 +126,15 @@ fn postAgentEvent(context: *anyopaque, event: agent_mod.Agent.Event) anyerror!vo
     errdefer event_ptr.deinit(worker_context.gpa);
 
     // Block until the event lands. Dropping it would corrupt the rendered turn,
-    // and dropping the terminal `turn_finished` would leave the UI stuck
-    // `in_flight` forever (spinner never stops, no further submits). The worker
-    // is inside the network read loop here, so waiting just applies normal
-    // backpressure to the stream.
+    // and dropping the terminal `turn_finished` would strand the UI's Turn in
+    // the active state forever (spinner never stops, no further submits). The
+    // worker is inside the network read loop here, so waiting just applies
+    // normal backpressure to the stream.
     //
     // We don't bail on cancel here: the top-of-function check already aborts the
     // turn, and `turn_finished` is posted *during* that unwind (with
     // `cancel_requested` already set) — it must still be delivered. The UI keeps
-    // draining every ~30 ms while `in_flight`, so a full queue always clears.
+    // draining every ~30 ms while the turn is active, so a full queue clears.
     while (true) {
         worker_context.queue.push(worker_context.io, worker_context.gpa, event_ptr) catch |err| switch (err) {
             error.QueueFull => {

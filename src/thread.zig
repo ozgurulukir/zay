@@ -7,8 +7,7 @@ const assert = std.debug.assert;
 /// How a tool's display body should be drawn in the TUI.
 ///   - `.plain`: single muted-gray body (bash output, file reads, etc.).
 ///   - `.diff`: per-line — `+` green, `-` red, others gray (edit_file only).
-/// Failure overrides everything to red at draw time. See CONTEXT.md's
-/// **Color rule** and **Render** definitions.
+/// Failure overrides everything to red at draw time.
 pub const Render = enum { plain, diff };
 
 pub const MessageKind = enum {

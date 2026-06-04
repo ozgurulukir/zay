@@ -3,6 +3,7 @@ const logger = @import("logger");
 const ai = @import("../ai.zig");
 const model_catalog = @import("openai_compatible_models.zig");
 const openai_endpoint = @import("openai_endpoint.zig");
+const stream_part = @import("stream_part.zig");
 const tools_common = @import("../tools/common.zig");
 
 const Scanner = std.json.Scanner;
@@ -11,8 +12,6 @@ const redirect_buffer_bytes: u32 = 8192;
 const transfer_buffer_bytes: u32 = 4096;
 const body_buffer_bytes: u32 = 4096;
 const tool_call_count_max: u32 = 16;
-const stream_chunk_count_max: u32 = 100_000;
-const stream_bytes_max: u32 = 8 * 1024 * 1024;
 
 pub const ModelEntry = model_catalog.ModelEntry;
 pub const listModels = model_catalog.listModels;
@@ -437,21 +436,9 @@ fn readStream(
         builders.deinit(gpa);
     }
 
-    var chunk_count: u32 = 0;
-    var bytes_read: usize = 0;
-    while (try readStreamLine(gpa, reader)) |line| {
-        defer gpa.free(line);
-        chunk_count += 1;
-        bytes_read += line.len;
-        if (chunk_count > stream_chunk_count_max) return error.StreamTooManyChunks;
-        if (bytes_read > stream_bytes_max) return error.StreamTooLarge;
-        const trimmed = std.mem.trim(u8, line, " \r");
-        if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
-        const data = std.mem.trim(u8, trimmed["data:".len..], " ");
-        if (std.mem.eql(u8, data, "[DONE]")) break;
-        // Keep-alive / empty SSE data lines carry no chunk — skip them so the
-        // parser's non-empty-payload assertion never fires.
-        if (data.len == 0) continue;
+    var source: stream_part.Source = .{ .reader = reader };
+    while (try source.next(gpa)) |data| {
+        defer gpa.free(data);
         try processStreamChunk(gpa, data, &content, &reasoning, &builders, observer);
     }
 
@@ -471,29 +458,6 @@ fn readStream(
         try blocks.append(gpa, .{ .tool_call = try builder.toToolCall(gpa, tool_call_seq) });
     }
     return .{ .assistant = .{ .role = .assistant, .content = try blocks.toOwnedSlice(gpa) } };
-}
-
-fn readStreamLine(gpa: std.mem.Allocator, reader: *std.Io.Reader) !?[]u8 {
-    var line_writer: std.Io.Writer.Allocating = .init(gpa);
-    errdefer line_writer.deinit();
-
-    _ = reader.streamDelimiterEnding(&line_writer.writer, '\n') catch |err| switch (err) {
-        error.ReadFailed => return error.ReadFailed,
-        error.WriteFailed => return error.OutOfMemory,
-    };
-
-    const delimiter = reader.take(1) catch |err| switch (err) {
-        error.EndOfStream => {
-            if (line_writer.written().len == 0) return null;
-            const line = try line_writer.toOwnedSlice();
-            return line;
-        },
-        else => |e| return e,
-    };
-    std.debug.assert(delimiter.len == 1);
-    std.debug.assert(delimiter[0] == '\n');
-    const line = try line_writer.toOwnedSlice();
-    return line;
 }
 
 const ChunkChange = struct {

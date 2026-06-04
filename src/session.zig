@@ -631,57 +631,10 @@ fn messageToJson(gpa: std.mem.Allocator, message: ai.ChatMessage) Error![]u8 {
     try writer.writeAll(",\"content\":[");
     for (message.content, 0..) |block, index| {
         if (index > 0) try writer.writeByte(',');
-        try writeContentBlock(writer, block);
+        try block.writeJson(writer);
     }
     try writer.writeAll("]}");
     return out.toOwnedSlice();
-}
-
-fn writeContentBlock(writer: *std.Io.Writer, block: ai.ContentBlock) Error!void {
-    switch (block) {
-        .text => |text| {
-            try writer.writeAll("{\"type\":\"text\",\"text\":");
-            try std.json.Stringify.value(text.text, .{}, writer);
-            if (text.responses_item_id) |id| {
-                try writer.writeAll(",\"responses_item_id\":");
-                try std.json.Stringify.value(id, .{}, writer);
-            }
-            if (text.responses_phase) |phase| {
-                try writer.writeAll(",\"responses_phase\":");
-                try std.json.Stringify.value(phase, .{}, writer);
-            }
-            try writer.writeByte('}');
-        },
-        .image => |image| {
-            try writer.writeAll("{\"type\":\"image\",\"mime_type\":");
-            try std.json.Stringify.value(image.mime_type, .{}, writer);
-            try writer.writeAll(",\"data_base64\":");
-            try std.json.Stringify.value(image.data_base64, .{}, writer);
-            try writer.writeByte('}');
-        },
-        .reasoning => |reasoning| {
-            try writer.writeAll("{\"type\":\"reasoning\",\"text\":");
-            try std.json.Stringify.value(reasoning.text, .{}, writer);
-            if (reasoning.responses_item_json) |json| {
-                try writer.writeAll(",\"responses_item_json\":");
-                try std.json.Stringify.value(json, .{}, writer);
-            }
-            try writer.writeByte('}');
-        },
-        .tool_call => |call| {
-            try writer.writeAll("{\"type\":\"tool_call\",\"call_id\":");
-            try std.json.Stringify.value(call.call_id, .{}, writer);
-            if (call.responses_item_id) |id| {
-                try writer.writeAll(",\"responses_item_id\":");
-                try std.json.Stringify.value(id, .{}, writer);
-            }
-            try writer.writeAll(",\"name\":");
-            try std.json.Stringify.value(call.name, .{}, writer);
-            try writer.writeAll(",\"arguments\":");
-            try std.json.Stringify.value(call.arguments, .{}, writer);
-            try writer.writeByte('}');
-        },
-    }
 }
 
 fn jsonToMessage(gpa: std.mem.Allocator, payload_json: []const u8) Error!ai.ChatMessage {
@@ -724,52 +677,10 @@ fn parseContentBlocks(gpa: std.mem.Allocator, value: std.json.Value) Error![]ai.
     var initialized: usize = 0;
     errdefer freeContentBlocks(gpa, blocks[0..initialized]);
     for (value.array.items) |item| {
-        blocks[initialized] = try parseContentBlock(gpa, item);
+        blocks[initialized] = try ai.ContentBlock.fromJson(gpa, item);
         initialized += 1;
     }
     return blocks;
-}
-
-fn parseContentBlock(gpa: std.mem.Allocator, value: std.json.Value) Error!ai.ContentBlock {
-    if (value != .object) return error.CorruptPayload;
-    const kind = value.object.get("type") orelse return error.CorruptPayload;
-    if (kind != .string) return error.CorruptPayload;
-    if (std.mem.eql(u8, kind.string, "text")) {
-        const text = value.object.get("text") orelse return error.CorruptPayload;
-        if (text != .string) return error.CorruptPayload;
-        return .{ .text = .{
-            .text = try gpa.dupe(u8, text.string),
-            .responses_item_id = try optionalString(gpa, value, "responses_item_id"),
-            .responses_phase = try optionalString(gpa, value, "responses_phase"),
-        } };
-    }
-    if (std.mem.eql(u8, kind.string, "image")) {
-        const mime = value.object.get("mime_type") orelse return error.CorruptPayload;
-        const data = value.object.get("data_base64") orelse return error.CorruptPayload;
-        if (mime != .string) return error.CorruptPayload;
-        if (data != .string) return error.CorruptPayload;
-        return .{ .image = .{ .mime_type = try gpa.dupe(u8, mime.string), .data_base64 = try gpa.dupe(u8, data.string) } };
-    }
-    if (std.mem.eql(u8, kind.string, "reasoning")) {
-        const text = value.object.get("text") orelse return error.CorruptPayload;
-        if (text != .string) return error.CorruptPayload;
-        return .{ .reasoning = .{ .text = try gpa.dupe(u8, text.string), .responses_item_json = try optionalString(gpa, value, "responses_item_json") } };
-    }
-    if (std.mem.eql(u8, kind.string, "tool_call")) {
-        const call_id = value.object.get("call_id") orelse return error.CorruptPayload;
-        const name = value.object.get("name") orelse return error.CorruptPayload;
-        const arguments = value.object.get("arguments") orelse return error.CorruptPayload;
-        if (call_id != .string) return error.CorruptPayload;
-        if (name != .string) return error.CorruptPayload;
-        if (arguments != .string) return error.CorruptPayload;
-        return .{ .tool_call = .{
-            .call_id = try gpa.dupe(u8, call_id.string),
-            .responses_item_id = try optionalString(gpa, value, "responses_item_id"),
-            .name = try gpa.dupe(u8, name.string),
-            .arguments = try gpa.dupe(u8, arguments.string),
-        } };
-    }
-    return error.CorruptPayload;
 }
 
 fn freeContentBlocks(gpa: std.mem.Allocator, blocks: []ai.ContentBlock) void {

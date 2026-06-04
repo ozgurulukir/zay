@@ -305,27 +305,35 @@ pub fn load(
     };
 }
 
+/// The pure layering algebra: fold each layer onto the result in
+/// least-to-most-specific order (global, then project, then env), then hydrate
+/// the chosen model against the fully merged provider list. No file IO — every
+/// input is an already-parsed Config, so the precedence rules and hydration are
+/// unit-testable without touching disk (see the "mergeLayers …" tests).
 fn mergeLayers(gpa: std.mem.Allocator, layers: []const Config) !Config {
     var out: Config = .{};
     errdefer out.deinit(gpa);
-    for (layers) |layer| try applyConfigOverlay(gpa, &out, layer, true);
+    for (layers) |layer| try applyConfigOverlay(gpa, &out, layer);
+    try hydrateActiveModel(gpa, &out);
     return out;
 }
 
-fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config, include_api_key: bool) !void {
+/// Merge `updates` onto `target`. `api_key` is merged like any other field —
+/// it is needed in the in-memory runtime config. Persistence is a separate
+/// concern: `serialize` is the single seam that decides what reaches disk, and
+/// it never writes `api_key` (keys live only in auth.json). So this overlay
+/// needs no "should I keep the key?" flag — the write path strips it anyway.
+fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) !void {
     if (updates.provider) |v| target.provider = v;
     if (updates.use_responses_endpoint) |v| target.use_responses_endpoint = v;
     if (updates.enable_thinking) |v| target.enable_thinking = v;
     if (updates.base_url) |s| try replaceOptionalSlice(gpa, &target.base_url, s);
-    if (include_api_key) {
-        if (updates.api_key) |s| try replaceOptionalSlice(gpa, &target.api_key, s);
-    }
+    if (updates.api_key) |s| try replaceOptionalSlice(gpa, &target.api_key, s);
     if (updates.system_prompt) |s| try replaceOptionalSlice(gpa, &target.system_prompt, s);
     for (updates.providers) |provider| try applyProviderOverlay(gpa, target, provider);
     if (updates.model) |m| {
         if (target.model) |*old| old.deinit(gpa);
         target.model = try m.clone(gpa);
-        try hydrateActiveModel(gpa, target);
     }
 }
 
@@ -484,7 +492,9 @@ fn parseObject(
     if (stringField(value, "system_prompt")) |s| {
         out.system_prompt = try gpa.dupe(u8, s);
     }
-    try hydrateActiveModel(gpa, &out);
+    // Parsing is pure: producing a single layer's Config never reaches into the
+    // provider catalogue. Hydration runs once after all layers merge, against
+    // the fully merged provider list (see `mergeLayers`).
     return out;
 }
 
@@ -652,7 +662,7 @@ pub fn mergeAndWriteGlobal(
 ) !void {
     var current = try readGlobal(gpa, io, home_dir);
     defer current.deinit(gpa);
-    try applyConfigOverlay(gpa, &current, updates, false);
+    try applyConfigOverlay(gpa, &current, updates);
     try writeGlobal(gpa, io, home_dir, current);
 }
 
@@ -706,7 +716,7 @@ pub fn mergeAndWriteProject(
 ) !void {
     var current = try readProject(gpa, io, cwd);
     defer current.deinit(gpa);
-    try applyConfigOverlay(gpa, &current, updates, false);
+    try applyConfigOverlay(gpa, &current, updates);
     try writeProject(gpa, io, cwd, current);
 }
 
@@ -717,6 +727,11 @@ pub fn projectConfigExists(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) 
     return true;
 }
 
+/// The single seam between an in-memory Config and config.json on disk.
+/// Invariant: `api_key` is NEVER written here — API keys live only in
+/// auth.json (see codex.ApiKeyMap). This is the one place that enforces it, so
+/// callers never have to thread a "should I persist the key?" flag through the
+/// merge path. The "serialize: skips api_key even if present" test guards it.
 fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !void {
     try writer.writeByte('{');
     var wrote_any = false;
@@ -917,13 +932,18 @@ test "parseObject: minimal config" {
     try std.testing.expectEqual(@as(usize, 0), sink.items.len);
 }
 
-test "parseObject: model with reasoningEffort" {
+test "parseFile is pure; merge hydrates model reasoningEffort from providers" {
     const gpa = std.testing.allocator;
     var sink: std.ArrayList(Diagnostic) = .empty;
     defer sink.deinit(gpa);
     var cfg = try parseFile(gpa, "<test>", "{\"model\":\"openai/gpt-5.5\",\"providers\":{\"openai\":{\"models\":{\"gpt-5.5\":{\"reasoningEffort\":\"high\"}}}}}", &sink);
     defer cfg.deinit(gpa);
-    try std.testing.expectEqual(ai.ReasoningEffort.high, cfg.model.?.reasoning_effort.?);
+    // Parsing one layer never reaches into the provider catalogue.
+    try std.testing.expectEqual(@as(?ai.ReasoningEffort, null), cfg.model.?.reasoning_effort);
+    // Merging hydrates the active model against the parsed providers.
+    var merged = try mergeLayers(gpa, &.{cfg});
+    defer merged.deinit(gpa);
+    try std.testing.expectEqual(ai.ReasoningEffort.high, merged.model.?.reasoning_effort.?);
 }
 
 test "parseObject: unknown provider records diagnostic" {
@@ -1066,6 +1086,46 @@ test "serialize: skips api_key even if present" {
     try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"reasoningEffort\":\"medium\"") != null);
 }
 
+test "mergeLayers: later layers win for scalar fields" {
+    const gpa = std.testing.allocator;
+    var global: Config = .{ .provider = .openai, .base_url = try gpa.dupe(u8, "https://global") };
+    defer global.deinit(gpa);
+    var project: Config = .{ .base_url = try gpa.dupe(u8, "https://project") };
+    defer project.deinit(gpa);
+    var env: Config = .{ .base_url = try gpa.dupe(u8, "https://env") };
+    defer env.deinit(gpa);
+
+    // Least-to-most-specific: env is applied last and wins; provider survives
+    // from the only layer that set it.
+    var merged = try mergeLayers(gpa, &.{ global, project, env });
+    defer merged.deinit(gpa);
+
+    try std.testing.expectEqual(Provider.openai, merged.provider.?);
+    try std.testing.expectEqualStrings("https://env", merged.base_url.?);
+}
+
+test "mergeLayers: active model is hydrated from the merged provider list" {
+    const gpa = std.testing.allocator;
+    // The provider catalogue entry (reasoning + base_url) comes from one layer...
+    const models = try gpa.alloc(ProviderModel, 1);
+    models[0] = .{ .id = try gpa.dupe(u8, "gpt-5.5"), .reasoning_effort = .medium };
+    const providers = try gpa.alloc(ProviderConfig, 1);
+    providers[0] = .{ .provider = .openai, .base_url = try gpa.dupe(u8, "https://from-provider"), .models = models };
+    var global: Config = .{ .providers = providers };
+    defer global.deinit(gpa);
+    // ...the active model selection comes from another, carrying no reasoning.
+    var project: Config = .{ .provider = .openai, .model = .{ .id = try gpa.dupe(u8, "gpt-5.5") } };
+    defer project.deinit(gpa);
+
+    var merged = try mergeLayers(gpa, &.{ global, project });
+    defer merged.deinit(gpa);
+
+    // Hydration runs once over the merged providers, so the cross-layer match
+    // copies reasoning effort and base_url onto the chosen model.
+    try std.testing.expectEqual(ai.ReasoningEffort.medium, merged.model.?.reasoning_effort.?);
+    try std.testing.expectEqualStrings("https://from-provider", merged.base_url.?);
+}
+
 test "serialize then parse roundtrips" {
     const gpa = std.testing.allocator;
     var provider_models = try gpa.alloc(ProviderModel, 1);
@@ -1092,7 +1152,11 @@ test "serialize then parse roundtrips" {
 
     var sink: std.ArrayList(Diagnostic) = .empty;
     defer sink.deinit(gpa);
-    var roundtrip = try parseFile(gpa, "<test>", buf.written(), &sink);
+    var parsed = try parseFile(gpa, "<test>", buf.written(), &sink);
+    defer parsed.deinit(gpa);
+    // base_url is not serialized; it is rehydrated from the provider entry when
+    // the parsed layer is merged.
+    var roundtrip = try mergeLayers(gpa, &.{parsed});
     defer roundtrip.deinit(gpa);
 
     try std.testing.expectEqual(Provider.ollama, roundtrip.provider.?);

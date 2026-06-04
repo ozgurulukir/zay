@@ -12,7 +12,13 @@ pub const loading_spinners = [4][]const u8{ "Firing Neurons", "Multiplying Matri
 pub const ThreadProjection = struct {
     agent_index: ?u32 = null,
     thinking_index: ?u32 = null,
-    loading_index: ?u32 = null,
+    /// True while the turn is waiting for the next chunk of model output: at
+    /// turn start, and again after each tool batch until the next delta lands.
+    /// The TUI derives the loading spinner from this flag and draws it as a
+    /// synthetic tail row — the spinner is never a real thread message. Kept
+    /// here rather than in `Turn` because only the per-event projection logic
+    /// knows whether a chunk actually rendered (partial tool arguments do not).
+    awaiting_output: bool = false,
     loading_word_index: u8 = 0,
     tool_seen_in_response: bool = false,
     awaiting_tool_call: bool = false,
@@ -27,7 +33,7 @@ pub const ThreadProjection = struct {
     pub fn resetTurn(self: *ThreadProjection, io: std.Io) void {
         self.agent_index = null;
         self.thinking_index = null;
-        self.loading_index = null;
+        self.awaiting_output = false;
         self.loading_word_index = chooseLoadingWordIndex(io);
         self.tool_seen_in_response = false;
         self.awaiting_tool_call = true;
@@ -55,18 +61,11 @@ pub const ThreadProjection = struct {
         }
     }
 
-    pub fn appendLoading(self: *ThreadProjection, gpa: std.mem.Allocator, thread: *thread_mod.Thread) !void {
-        assert(self.loading_index == null);
+    /// Begin waiting for the next chunk of model output. The spinner the TUI
+    /// derives from `awaiting_output` is drawn at the tail; no thread mutation.
+    pub fn beginAwaiting(self: *ThreadProjection) void {
         assert(self.loading_word_index < loading_spinners.len);
-        self.loading_index = try thread.append(gpa, .status, loading_spinners[self.loading_word_index], "");
-    }
-
-    pub fn removeLoading(self: *ThreadProjection, gpa: std.mem.Allocator, thread: *thread_mod.Thread) void {
-        const index = self.loading_index orelse return;
-        self.loading_index = null;
-        if (index >= thread.messages.items.len) return;
-        thread.remove(gpa, index);
-        self.adjustIndexesAfterRemove(index);
+        self.awaiting_output = true;
     }
 
     fn applyResponseDelta(
@@ -75,7 +74,7 @@ pub const ThreadProjection = struct {
         thread: *thread_mod.Thread,
         delta: []const u8,
     ) !bool {
-        self.removeLoading(gpa, thread);
+        self.awaiting_output = false;
         if (delta.len == 0) return false;
         _ = try self.finishThinking(gpa, thread);
         try self.applyContentDelta(gpa, thread, delta);
@@ -89,7 +88,7 @@ pub const ThreadProjection = struct {
         thread: *thread_mod.Thread,
         delta: []const u8,
     ) !bool {
-        self.removeLoading(gpa, thread);
+        self.awaiting_output = false;
         if (try self.applyReasoningDelta(gpa, thread, delta)) self.pending_redraw = true;
         return false;
     }
@@ -112,7 +111,7 @@ pub const ThreadProjection = struct {
         thread: *thread_mod.Thread,
         tool: agent_mod.Agent.Event.ToolCallFinished,
     ) !bool {
-        self.removeLoading(gpa, thread);
+        self.awaiting_output = false;
         const thinking_finished = try self.finishThinking(gpa, thread);
         return thinking_finished or try self.finishTool(gpa, thread, tool);
     }
@@ -122,14 +121,14 @@ pub const ThreadProjection = struct {
         gpa: std.mem.Allocator,
         thread: *thread_mod.Thread,
     ) !bool {
-        self.removeLoading(gpa, thread);
         _ = try self.finishThinking(gpa, thread);
         self.agent_index = null;
         self.thinking_index = null;
         self.tool_seen_in_response = false;
         self.awaiting_tool_call = false;
         self.tool_indexes.clearRetainingCapacity();
-        try self.appendLoading(gpa, thread);
+        // The batch is done; wait for the next response segment.
+        self.awaiting_output = true;
         return true;
     }
 
@@ -139,7 +138,7 @@ pub const ThreadProjection = struct {
         thread: *thread_mod.Thread,
         message: []const u8,
     ) !bool {
-        self.removeLoading(gpa, thread);
+        self.awaiting_output = false;
         _ = try thread.append(gpa, .notice, "notice", message);
         return true;
     }
@@ -149,7 +148,7 @@ pub const ThreadProjection = struct {
         gpa: std.mem.Allocator,
         thread: *thread_mod.Thread,
     ) !bool {
-        self.removeLoading(gpa, thread);
+        self.awaiting_output = false;
         _ = try self.finishThinking(gpa, thread);
         return true;
     }
@@ -224,8 +223,10 @@ pub const ThreadProjection = struct {
         const title = try agent_mod.formatToolTitle(gpa, tool.name, tool.arguments);
         defer gpa.free(title);
 
-        const loading_removed = self.loading_index != null;
-        self.removeLoading(gpa, thread);
+        // Reached only once arguments parse — partial tool args return above,
+        // keeping the spinner up. Clearing it here counts as a visible change.
+        const was_awaiting = self.awaiting_output;
+        self.awaiting_output = false;
 
         var visible_change = false;
         if (self.toolThreadIndex(tool.index)) |index| {
@@ -238,7 +239,7 @@ pub const ThreadProjection = struct {
         }
         self.tool_seen_in_response = true;
         self.agent_index = null;
-        return loading_removed or visible_change;
+        return was_awaiting or visible_change;
     }
 
     fn finishTool(
@@ -299,22 +300,7 @@ pub const ThreadProjection = struct {
         }
         self.tool_indexes.items[tool_index] = thread_index;
     }
-
-    fn adjustIndexesAfterRemove(self: *ThreadProjection, removed_index: u32) void {
-        adjustOptionalIndex(&self.agent_index, removed_index);
-        adjustOptionalIndex(&self.thinking_index, removed_index);
-        for (self.tool_indexes.items) |*tool_index| adjustOptionalIndex(tool_index, removed_index);
-    }
 };
-
-fn adjustOptionalIndex(index: *?u32, removed_index: u32) void {
-    const current = index.* orelse return;
-    if (current == removed_index) {
-        index.* = null;
-    } else if (current > removed_index) {
-        index.* = current - 1;
-    }
-}
 
 fn toolTitleMatchesCommand(title: []const u8, command: []const u8) bool {
     const prefix = "$ ";

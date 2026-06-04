@@ -2,13 +2,12 @@ const std = @import("std");
 const logger = @import("logger");
 const ai = @import("../ai.zig");
 const openai_endpoint = @import("openai_endpoint.zig");
+const stream_part = @import("stream_part.zig");
 const tools_common = @import("../tools/common.zig");
 
 const redirect_buffer_bytes: u32 = 8192;
 const transfer_buffer_bytes: u32 = 4096;
 const body_buffer_bytes: u32 = 4096;
-const stream_chunk_count_max: u32 = 100_000;
-const stream_bytes_max: u32 = 8 * 1024 * 1024;
 
 pub const ResponsesConfig = struct {
     pub const HeaderValue = union(enum) {
@@ -374,19 +373,10 @@ fn readStream(gpa: std.mem.Allocator, reader: *std.Io.Reader, observer: ai.Strea
     var state: StreamState = .{};
     defer state.deinit(gpa);
     errdefer state.deinitBlocks(gpa);
-    var chunk_count: u32 = 0;
-    var bytes_read: usize = 0;
-    while (try readStreamLine(gpa, reader)) |line| {
-        defer gpa.free(line);
-        chunk_count += 1;
-        bytes_read += line.len;
-        if (chunk_count > stream_chunk_count_max) return error.StreamTooManyChunks;
-        if (bytes_read > stream_bytes_max) return error.StreamTooLarge;
-        const trimmed = std.mem.trim(u8, line, " \r");
-        if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
-        const data = std.mem.trim(u8, trimmed["data:".len..], " ");
+    var source: stream_part.Source = .{ .reader = reader };
+    while (try source.next(gpa)) |data| {
+        defer gpa.free(data);
         logger.log("responses.response.sse data={s}", .{logBytes(data)});
-        if (std.mem.eql(u8, data, "[DONE]")) break;
         try state.processJson(gpa, data, observer, call_seq);
     }
     return try state.finish(gpa, call_seq);
@@ -792,25 +782,6 @@ fn optionalU32(value: std.json.Value, name: []const u8) ?u32 {
     if (field.integer < 0) return null;
     if (field.integer > std.math.maxInt(u32)) return null;
     return @intCast(field.integer);
-}
-
-fn readStreamLine(gpa: std.mem.Allocator, reader: *std.Io.Reader) !?[]u8 {
-    var line_writer: std.Io.Writer.Allocating = .init(gpa);
-    errdefer line_writer.deinit();
-    _ = reader.streamDelimiterEnding(&line_writer.writer, '\n') catch |err| switch (err) {
-        error.ReadFailed => return error.ReadFailed,
-        error.WriteFailed => return error.OutOfMemory,
-    };
-    const delimiter = reader.take(1) catch |err| switch (err) {
-        error.EndOfStream => {
-            if (line_writer.written().len == 0) return null;
-            return try line_writer.toOwnedSlice();
-        },
-        else => |e| return e,
-    };
-    std.debug.assert(delimiter.len == 1);
-    std.debug.assert(delimiter[0] == '\n');
-    return try line_writer.toOwnedSlice();
 }
 
 fn logBytes(bytes: []const u8) []const u8 {

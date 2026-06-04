@@ -15,6 +15,8 @@ const session_mod = @import("session.zig");
 const symbols = @import("symbols.zig");
 const thread_mod = @import("thread.zig");
 const agent_worker = @import("tui/agent_worker.zig");
+const Turn = @import("tui/turn.zig");
+const model_catalogue = @import("tui/model_catalogue.zig");
 const tui_thread_projection = @import("tui/thread_projection.zig");
 const tui_metrics = @import("tui/metrics.zig");
 const tui_message = @import("tui/widgets/message.zig");
@@ -62,16 +64,9 @@ pub const App = struct {
     resume_global: bool = false,
     resume_summaries: std.ArrayList(session_mod.SessionSummary) = .empty,
     tree_state: tree_selector.TreeState,
-    codex_models: std.ArrayList(codex.Model) = .empty,
-    compatible_models: std.ArrayList(codex.Model) = .empty,
-    compatible_models_fetched: bool = false,
-    model_sources: std.ArrayList(ModelSource) = .empty,
-    model_reasoning: std.ArrayList(u32) = .empty,
-    model_selection: u32 = 0,
-    model_column: model_picker.Column = .model,
-    model_scope: ModelScope = .global,
-    model_reasoning_snapshot: std.ArrayList(u32) = .empty,
-    model_selection_snapshot: u32 = 0,
+    /// All model/provider/selection state for the model picker — fetched
+    /// lists, selection cursor/column/scope, and the async-load handle.
+    models: model_catalogue.ModelCatalogue = .{},
     provider_picker: provider_picker.State = .{},
     codex_signed_in: bool = false,
     /// Stored API keys for catalogue providers (label -> key), mirrored from
@@ -84,7 +79,10 @@ pub const App = struct {
     cached_config: config_mod.Config = .{},
     cached_config_owned: bool = false,
     retired_threads: std.ArrayList(thread_mod.Thread) = .empty,
-    in_flight: bool = false,
+    /// Lifecycle state for the in-progress agent turn (idle / active /
+    /// interrupting). Collapses what used to be the `in_flight` and
+    /// `turn_discarded` booleans plus the scattered discard logic.
+    turn: Turn = .{},
     thread_projection: tui_thread_projection.ThreadProjection = .{},
     loading_frame: u8 = 0,
     loading_tick_active: bool = false,
@@ -118,23 +116,12 @@ pub const App = struct {
         .draw_cursor = false,
         .wheel_scroll = 3,
     },
-    model_load_future: ?std.Io.Future(model_loader.Outcome) = null,
-    model_load_done: std.atomic.Value(bool) = .init(false),
-    model_load_error: ?[]u8 = null,
-    /// When true, the in-flight model load merges into the existing catalogue
-    /// (incremental, after connecting a new provider) instead of replacing it.
-    model_load_merge: bool = false,
-    /// True once a successful catalog fetch has populated `codex_models`.
-    /// Subsequent picker opens skip the network round-trip and just re-sort
-    /// for the current active model. Reset on sign-in/sign-out.
-    models_cached: bool = false,
     pending_quit_at: ?std.Io.Timestamp = null,
     queued_user_messages: std.ArrayList([]const u8) = .empty,
     /// Raw prompt for a turn that `beginSubmit` accepted but `startTurn` has
     /// not yet handed to the worker. Owned by `gpa`; the worker frees it once
     /// the turn starts.
     pending_prompt: ?[]u8 = null,
-    turn_discarded: bool = false,
     /// When true, arrow keys navigate conversation blocks; when false they move
     /// the cursor within the (multiline) input. Set when the cursor leaves the
     /// top of the input, cleared when it re-enters from the last block or on any
@@ -151,7 +138,7 @@ pub const App = struct {
     const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker };
     const ModelCatalog = enum { connected_provider, openai_codex };
     const ModelSource = model_loader.ModelSource;
-    const ModelScope = enum { global, project, session };
+    const ModelScope = model_catalogue.ModelScope;
 
     pub fn init(io: std.Io, gpa: std.mem.Allocator, agent: *agent_mod.Agent) App {
         return .{
@@ -191,27 +178,19 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
-        if (self.turn_discarded) {
+        if (self.turn.state == .interrupting) {
             self.discardAbandonedTurn();
         } else {
             self.awaitTurn();
         }
+        // Cancel the in-flight load first (it needs `io`), then free the
+        // catalogue's owned lists + error in one pass.
         self.cancelModelLoad();
-        if (self.model_load_error) |message| {
-            self.gpa.free(message);
-            self.model_load_error = null;
-        }
         for (self.retired_threads.items) |*thread| thread.deinit(self.gpa);
         self.retired_threads.deinit(self.gpa);
         self.resumeClear();
         self.tree_state.deinit();
-        self.codexModelsClear();
-        self.codex_models.deinit(self.gpa);
-        self.compatibleModelsCacheClear();
-        self.compatible_models.deinit(self.gpa);
-        self.model_sources.deinit(self.gpa);
-        self.model_reasoning.deinit(self.gpa);
-        self.model_reasoning_snapshot.deinit(self.gpa);
+        self.models.deinit(self.gpa);
         codex.freeApiKeyMap(self.gpa, &self.provider_api_keys);
         self.provider_key_input.deinit(self.gpa);
         if (self.cached_config_owned) {
@@ -245,18 +224,19 @@ pub const App = struct {
     }
 
     pub fn handleInterrupt(self: *App) !void {
-        if (!self.in_flight) return;
+        if (self.turn.state != .active) return;
         self.worker_context.requestCancel();
+        // Show the cancellation notice immediately; the worker's own
+        // `turn_failed`/`turn_finished` are then swallowed while interrupting.
         const message = try self.gpa.dupe(u8, agent_worker.cancel_message);
         var event: agent_mod.Agent.Event = .{ .turn_failed = message };
         defer event.deinit(self.gpa);
         _ = try self.thread_projection.apply(self.gpa, &self.thread, event);
-        self.in_flight = false;
-        self.turn_discarded = true;
+        self.turn.interrupt();
     }
 
     fn discardAbandonedTurn(self: *App) void {
-        if (!self.turn_discarded and self.turn_future == null) return;
+        if (self.turn.state != .interrupting and self.turn_future == null) return;
         if (self.turn_future) |*future| {
             // `cancel` blocks until the task hits its next cancellation point
             // (typically the network read) and unwinds. On a healthy stream
@@ -276,42 +256,45 @@ pub const App = struct {
             event_ptr.deinit(self.worker_context.gpa);
             self.worker_context.gpa.destroy(event_ptr);
         }
-        self.turn_discarded = false;
+        if (self.turn.state == .interrupting) self.turn.reset();
     }
 
-    pub fn beginSubmit(self: *App) !?u32 {
+    /// Start a turn from the current input. Returns true when a turn was
+    /// started (the caller should then call `startTurn`); false when the
+    /// prompt was empty, had no provider, or was queued behind a running turn.
+    pub fn beginSubmit(self: *App) !bool {
         self.closeAtSearch();
         self.block_nav = false;
-        if (self.in_flight) return try self.enqueueSubmit();
+        if (self.turn.isActive()) return try self.enqueueSubmit();
         // If a previous turn was Esc-interrupted, force-cancel its worker
         // before starting a new one. Two concurrent workers would race on
         // the shared agent message history.
-        if (self.turn_discarded) self.discardAbandonedTurn();
+        if (self.turn.state == .interrupting) self.discardAbandonedTurn();
         const prompt = try self.input.toOwnedSlice();
         self.resetInputChangeTracking();
         defer self.gpa.free(prompt);
-        if (prompt.len == 0) return null;
+        if (prompt.len == 0) return false;
 
         if (self.runtime != null and self.runtime.?.client == .none) {
             _ = try self.thread.append(self.gpa, .user, "you", prompt);
             const message = try self.formatNoProviderMessage();
             defer self.gpa.free(message);
             _ = try self.thread.append(self.gpa, .agent, "agent", message);
-            return null;
+            return false;
         }
 
         self.resetTurnState();
         self.worker_context.resetCancel();
         _ = try self.thread.append(self.gpa, .user, "you", prompt);
-        try self.appendLoading();
+        self.thread_projection.beginAwaiting();
         // The worker expands `@`-mentions (reading files / images) off the UI
         // thread; stash the raw text for `startTurn` to hand over. Owned by
         // `worker_context.gpa` — the worker frees it with that allocator, which
         // differs from `self.gpa` (an arena), so allocating it here with the
         // wrong allocator would crash on free.
         self.pending_prompt = try self.worker_context.gpa.dupe(u8, prompt);
-        self.in_flight = true;
-        return self.thread_projection.loading_index;
+        self.turn.submit();
+        return true;
     }
 
     fn formatNoProviderMessage(self: *App) ![]u8 {
@@ -369,10 +352,6 @@ pub const App = struct {
         });
     }
 
-    fn appendLoading(self: *App) !void {
-        try self.thread_projection.appendLoading(self.gpa, &self.thread);
-    }
-
     fn advanceLoadingFrame(self: *App) void {
         std.debug.assert(tui_message.loading_frames.len > 0);
         self.loading_frame +%= 1;
@@ -385,25 +364,29 @@ pub const App = struct {
     }
 
     pub fn applyAgentEvent(self: *App, event: agent_mod.Agent.Event) !bool {
+        const outcome = self.turn.apply(event);
+        if (!outcome.project) {
+            // Interrupting: a discarded turn's output must not mutate the
+            // thread. Join the worker once it posts its terminal event.
+            if (outcome.finished) self.awaitTurn();
+            return false;
+        }
         var visible_change = try self.thread_projection.apply(self.gpa, &self.thread, event);
         switch (event) {
             .queued_messages_flushed => |count| {
-                if (count > 0) {
-                    if (self.queued_user_messages.items.len > 0) {
-                        try self.flushQueuedUserMessagesToThread(count);
-                        visible_change = true;
-                    }
-                }
-            },
-            .turn_finished => {
-                self.in_flight = false;
-                self.awaitTurn();
-                if (self.queued_user_messages.items.len > 0) {
-                    self.clearQueuedUserMessages();
+                if (count > 0 and self.queued_user_messages.items.len > 0) {
+                    try self.flushQueuedUserMessagesToThread(count);
                     visible_change = true;
                 }
             },
             else => {},
+        }
+        if (outcome.finished) {
+            self.awaitTurn();
+            if (self.queued_user_messages.items.len > 0) {
+                self.clearQueuedUserMessages();
+                visible_change = true;
+            }
         }
         return visible_change;
     }
@@ -478,16 +461,16 @@ pub const App = struct {
 
     fn handleModelPickerKey(self: *App, key: vaxis.Key) !bool {
         if (key.matches(vaxis.Key.left, .{})) {
-            self.model_column = self.model_column.previous();
+            self.models.model_column = self.models.model_column.previous();
             return true;
         }
         if (key.matches(vaxis.Key.right, .{})) {
-            if (self.codex_models.items.len > 0) self.model_column = self.model_column.next();
+            if (self.models.len() > 0) self.models.model_column = self.models.model_column.next();
             return true;
         }
         if (key.matches(vaxis.Key.tab, .{})) {
-            switch (self.model_column) {
-                .model => self.model_column = self.model_column.next(),
+            switch (self.models.model_column) {
+                .model => self.models.model_column = self.models.model_column.next(),
                 .reasoning => try self.cycleSelectedReasoning(),
                 .scope => self.cycleModelScope(),
             }
@@ -623,9 +606,7 @@ pub const App = struct {
     }
 
     fn revertModelPickerSnapshot(self: *App) !void {
-        self.model_reasoning.clearRetainingCapacity();
-        try self.model_reasoning.appendSlice(self.gpa, self.model_reasoning_snapshot.items);
-        self.model_selection = self.model_selection_snapshot;
+        self.models.restore();
     }
 
     fn submitMode(self: *App) !bool {
@@ -649,7 +630,7 @@ pub const App = struct {
             return true;
         }
         if (self.mode == .model_picker) {
-            if (self.codex_models.items.len == 0) return true;
+            if (self.models.len() == 0) return true;
             self.applySelectedModel() catch |err| try self.reportConnectionError(err);
             return true;
         }
@@ -738,7 +719,7 @@ pub const App = struct {
     }
 
     fn openTreeSelector(self: *App) !void {
-        if (self.in_flight) return error.InFlightTurn;
+        if (self.turn.isActive()) return error.InFlightTurn;
         self.mode = .tree_picker;
         self.clearInput();
         try self.reloadTreeNodes();
@@ -746,12 +727,12 @@ pub const App = struct {
 
     fn openModelPicker(self: *App) !void {
         self.mode = .model_picker;
-        self.model_column = .model;
-        self.model_selection = 0;
-        self.model_scope = self.defaultModelScope();
+        self.models.model_column = .model;
+        self.models.model_selection = 0;
+        self.models.model_scope = self.defaultModelScope();
         self.clearInput();
 
-        if (self.models_cached and self.codex_models.items.len > 0) {
+        if (self.models.models_cached and self.models.len() > 0) {
             try self.finishModelCatalogReload();
             try self.snapshotModelPickerState();
             return;
@@ -759,23 +740,20 @@ pub const App = struct {
 
         // Cold path — clear stale state, kick off the async load.
         self.codexModelsClear();
-        self.model_reasoning.clearRetainingCapacity();
-        self.model_reasoning_snapshot.clearRetainingCapacity();
-        self.model_selection_snapshot = 0;
+        self.models.reasoning_snapshot.clearRetainingCapacity();
+        self.models.model_selection_snapshot = 0;
         try self.startModelLoad(.connected_provider);
     }
 
     fn snapshotModelPickerState(self: *App) !void {
-        self.model_reasoning_snapshot.clearRetainingCapacity();
-        try self.model_reasoning_snapshot.appendSlice(self.gpa, self.model_reasoning.items);
-        self.model_selection_snapshot = self.model_selection;
+        try self.models.snapshot(self.gpa);
     }
 
     fn startModelLoad(self: *App, catalog: ModelCatalog) !void {
         self.cancelModelLoad();
-        if (self.model_load_error) |message| {
+        if (self.models.model_load_error) |message| {
             self.gpa.free(message);
-            self.model_load_error = null;
+            self.models.model_load_error = null;
         }
 
         const job = try self.gpa.create(model_loader.Job);
@@ -800,12 +778,12 @@ pub const App = struct {
             .configured = configured,
             .include_locals = catalog == .connected_provider,
             .codex_signed_in = self.isCodexSignedIn(),
-            .done = &self.model_load_done,
+            .done = &self.models.model_load_done,
         };
 
-        self.model_load_merge = false;
-        self.model_load_done.store(false, .release);
-        self.model_load_future = try self.io.concurrent(model_loader.run, .{job});
+        self.models.model_load_merge = false;
+        self.models.model_load_done.store(false, .release);
+        self.models.model_load_future = try self.io.concurrent(model_loader.run, .{job});
     }
 
     /// Every OpenAI-compatible provider to fetch for a full catalogue reload:
@@ -857,38 +835,38 @@ pub const App = struct {
     }
 
     fn cancelModelLoad(self: *App) void {
-        if (self.model_load_future) |*future| {
+        if (self.models.model_load_future) |*future| {
             var outcome = future.cancel(self.io);
             outcome.deinit(self.gpa);
-            self.model_load_future = null;
+            self.models.model_load_future = null;
         }
-        self.model_load_done.store(false, .release);
+        self.models.model_load_done.store(false, .release);
     }
 
     /// Called from the tick handler. Polls the non-blocking `done` flag, and
     /// only `await`s once the worker has signalled completion. Returns true
     /// if a redraw is needed.
     fn drainModelLoad(self: *App) !bool {
-        if (self.model_load_future == null) return false;
-        if (!self.model_load_done.load(.acquire)) return false;
+        if (self.models.model_load_future == null) return false;
+        if (!self.models.model_load_done.load(.acquire)) return false;
 
-        var outcome = self.model_load_future.?.await(self.io);
-        self.model_load_future = null;
-        self.model_load_done.store(false, .release);
+        var outcome = self.models.model_load_future.?.await(self.io);
+        self.models.model_load_future = null;
+        self.models.model_load_done.store(false, .release);
         defer outcome.deinit(self.gpa);
 
         switch (outcome) {
             .ready => |*result| try self.installModelLoadResult(result),
             .failed => |message| {
-                if (self.model_load_error) |old| self.gpa.free(old);
-                self.model_load_error = try self.gpa.dupe(u8, message);
+                if (self.models.model_load_error) |old| self.gpa.free(old);
+                self.models.model_load_error = try self.gpa.dupe(u8, message);
             },
         }
         return true;
     }
 
     fn installModelLoadResult(self: *App, result: *model_loader.Result) !void {
-        if (self.model_load_merge) {
+        if (self.models.model_load_merge) {
             // Incremental load: replace only the freshly-fetched providers'
             // models, leaving previously-cached providers untouched.
             var refreshed = std.EnumSet(config_mod.Provider).initEmpty();
@@ -905,34 +883,23 @@ pub const App = struct {
             self.codexModelsClear();
         }
         // Move models in (the struct copies own their id/label); clearing the
-        // result without freeing avoids a double-free.
-        for (result.models.items) |*model| try self.codex_models.append(self.gpa, model.*);
+        // result without freeing avoids a double-free. `models` and `sources`
+        // are built in lockstep, so they zip into one entry each.
+        std.debug.assert(result.models.items.len == result.sources.items.len);
+        for (result.models.items, result.sources.items) |*model, source| {
+            try self.models.append(self.gpa, model.*, source);
+        }
         result.models.clearRetainingCapacity();
-        for (result.sources.items) |source| try self.model_sources.append(self.gpa, source);
         result.sources.clearRetainingCapacity();
-        self.model_load_merge = false;
+        self.models.model_load_merge = false;
         try self.finishModelCatalogReload();
         try self.snapshotModelPickerState();
-        self.models_cached = true;
+        self.models.models_cached = true;
     }
 
-    /// Remove every cached model that came from `provider`, keeping the parallel
-    /// `codex_models` / `model_sources` arrays aligned.
+    /// Remove every cached model that came from `provider`.
     fn dropModelsForProvider(self: *App, provider: config_mod.Provider) void {
-        var i: usize = 0;
-        while (i < self.model_sources.items.len) {
-            const matches = switch (self.model_sources.items[i]) {
-                .openai_compatible => |p| p == provider,
-                .openai_codex => false,
-            };
-            if (matches) {
-                var model = self.codex_models.orderedRemove(i);
-                model.deinit(self.gpa);
-                _ = self.model_sources.orderedRemove(i);
-            } else {
-                i += 1;
-            }
-        }
+        self.models.dropProvider(self.gpa, provider);
     }
 
     fn defaultModelScope(self: *App) ModelScope {
@@ -942,10 +909,10 @@ pub const App = struct {
     }
 
     fn connectCodex(self: *App) !void {
-        if (self.in_flight) return error.InFlightTurn;
+        if (self.turn.isActive()) return error.InFlightTurn;
         var credentials = try codex.login(self.gpa, self.io, self.runtime.?.home_dir);
         defer credentials.deinit(self.gpa);
-        self.models_cached = false;
+        self.models.models_cached = false;
         try self.reloadModelCatalog(.openai_codex);
         const model = self.selectedCodexModel() orelse return error.NoModels;
         const effort = self.selectedReasoningEffort();
@@ -958,13 +925,13 @@ pub const App = struct {
     }
 
     fn signOutCodex(self: *App) !void {
-        if (self.in_flight) return error.InFlightTurn;
+        if (self.turn.isActive()) return error.InFlightTurn;
         try codex.signOut(self.gpa, self.io, self.runtime.?.home_dir);
         self.runtime.?.disconnectCodexClient();
         self.codex_signed_in = false;
         self.agent.client = self.runtime.?.client;
         self.codexModelsClear();
-        self.models_cached = false;
+        self.models.models_cached = false;
         self.mode = .normal;
         self.clearInput();
         _ = try self.thread.append(self.gpa, .agent, "agent", "Signed out from OpenAI Codex.");
@@ -975,7 +942,7 @@ pub const App = struct {
     /// the model picker. A blank key is allowed only for providers that don't
     /// require one (`requiresApiKey() == false`); all current ones do.
     fn submitProviderSetup(self: *App, provider: config_mod.Provider) !void {
-        if (self.in_flight) return error.InFlightTurn;
+        if (self.turn.isActive()) return error.InFlightTurn;
         const key = std.mem.trim(u8, self.provider_key_input.items, " \t\r\n");
 
         // A required key cannot be blank — keep the form open so the user can type.
@@ -1001,11 +968,11 @@ pub const App = struct {
         self.provider_key_input.clearRetainingCapacity();
 
         self.mode = .model_picker;
-        self.model_column = .model;
-        self.model_selection = 0;
-        self.model_scope = self.defaultModelScope();
-        self.model_reasoning_snapshot.clearRetainingCapacity();
-        self.model_selection_snapshot = 0;
+        self.models.model_column = .model;
+        self.models.model_selection = 0;
+        self.models.model_scope = self.defaultModelScope();
+        self.models.reasoning_snapshot.clearRetainingCapacity();
+        self.models.model_selection_snapshot = 0;
         self.clearInput();
         self.clearPaletteInput();
     }
@@ -1013,9 +980,9 @@ pub const App = struct {
     /// Incremental, merge-on-arrival load of a single provider's `/models`.
     fn startProviderModelLoad(self: *App, provider: config_mod.Provider, key: []const u8) !void {
         self.cancelModelLoad();
-        if (self.model_load_error) |message| {
+        if (self.models.model_load_error) |message| {
             self.gpa.free(message);
-            self.model_load_error = null;
+            self.models.model_load_error = null;
         }
 
         const base_url_default = provider.defaultBaseUrl() orelse return error.NotConnected;
@@ -1038,16 +1005,16 @@ pub const App = struct {
             .configured = configured,
             .include_locals = false,
             .codex_signed_in = self.isCodexSignedIn(),
-            .done = &self.model_load_done,
+            .done = &self.models.model_load_done,
         };
 
-        self.model_load_merge = true;
-        self.model_load_done.store(false, .release);
-        self.model_load_future = try self.io.concurrent(model_loader.run, .{job});
+        self.models.model_load_merge = true;
+        self.models.model_load_done.store(false, .release);
+        self.models.model_load_future = try self.io.concurrent(model_loader.run, .{job});
     }
 
     fn applySelectedModel(self: *App) !void {
-        if (self.in_flight) return error.InFlightTurn;
+        if (self.turn.isActive()) return error.InFlightTurn;
         const model = self.selectedCodexModel() orelse return error.NoModels;
         const effort = self.selectedReasoningEffort();
 
@@ -1060,7 +1027,7 @@ pub const App = struct {
                     defer credentials.deinit(self.gpa);
                     try self.connectCodexClient(credentials, model.id, effort);
                     self.codex_signed_in = true;
-                    try self.persistModelSelection(.openai, model.id, effort, self.model_scope);
+                    try self.persistModelSelection(.openai, model.id, effort, self.models.model_scope);
                 } else {
                     return error.NotConnected;
                 }
@@ -1070,7 +1037,7 @@ pub const App = struct {
                 const api_key = self.compatibleApiKey(provider);
                 if (api_key.len == 0 and provider.requiresApiKey()) return error.NotConnected;
                 try self.attachOpenAiCompatibleClient(base_url, api_key, model.id, effort);
-                try self.persistModelSelection(provider, model.id, effort, self.model_scope);
+                try self.persistModelSelection(provider, model.id, effort, self.models.model_scope);
             },
         }
         self.mode = .normal;
@@ -1170,9 +1137,7 @@ pub const App = struct {
     }
 
     fn finishModelCatalogReload(self: *App) !void {
-        self.model_reasoning.clearRetainingCapacity();
-        try self.model_reasoning.appendNTimes(self.gpa, 0, self.codex_models.items.len);
-        if (self.model_selection >= self.codex_models.items.len) self.model_selection = 0;
+        self.models.resetReasoning();
     }
 
     fn activeModelId(self: *const App) ?[]const u8 {
@@ -1184,8 +1149,7 @@ pub const App = struct {
         const models = try codex.loadStaticModels(self.gpa);
         defer self.gpa.free(models);
         for (models) |*model| {
-            try self.codex_models.append(self.gpa, model.*);
-            try self.model_sources.append(self.gpa, .openai_codex);
+            try self.models.append(self.gpa, model.*, .openai_codex);
             model.* = .{ .id = &.{}, .label = &.{} };
         }
         for (models) |*model| {
@@ -1195,15 +1159,14 @@ pub const App = struct {
     }
 
     fn loadCompatibleCatalog(self: *App) !void {
-        if (!self.compatible_models_fetched) try self.fetchCompatibleCatalog();
+        if (!self.models.compatible_models_fetched) try self.fetchCompatibleCatalog();
         const provider = tui_provider.compatibleProviderFromBaseUrl(self.cached_config.base_url.?);
-        for (self.compatible_models.items) |model| {
+        for (self.models.compatible_models.items) |model| {
             const id = try self.gpa.dupe(u8, model.id);
             errdefer self.gpa.free(id);
             const label = try self.gpa.dupe(u8, model.label);
             errdefer self.gpa.free(label);
-            try self.codex_models.append(self.gpa, .{ .id = id, .label = label });
-            try self.model_sources.append(self.gpa, .{ .openai_compatible = provider });
+            try self.models.append(self.gpa, .{ .id = id, .label = label }, .{ .openai_compatible = provider });
         }
     }
 
@@ -1226,13 +1189,12 @@ pub const App = struct {
             errdefer self.gpa.free(id);
             const label = try localModelLabel(self.gpa, provider, entry.id);
             errdefer self.gpa.free(label);
-            try self.codex_models.append(self.gpa, .{ .id = id, .label = label });
-            try self.model_sources.append(self.gpa, .{ .openai_compatible = provider });
+            try self.models.append(self.gpa, .{ .id = id, .label = label }, .{ .openai_compatible = provider });
         }
     }
 
     fn fetchCompatibleCatalog(self: *App) !void {
-        std.debug.assert(!self.compatible_models_fetched);
+        std.debug.assert(!self.models.compatible_models_fetched);
         const base_url = self.cached_config.base_url.?;
         const api_key = self.cached_config.api_key.?;
         const provider = self.cached_config.provider orelse tui_provider.compatibleProviderFromBaseUrl(base_url);
@@ -1248,15 +1210,15 @@ pub const App = struct {
             errdefer self.gpa.free(id);
             const label = try self.gpa.dupe(u8, entry.id);
             errdefer self.gpa.free(label);
-            try self.compatible_models.append(self.gpa, .{ .id = id, .label = label });
+            try self.models.compatible_models.append(self.gpa, .{ .id = id, .label = label });
         }
-        self.compatible_models_fetched = true;
+        self.models.compatible_models_fetched = true;
     }
 
     fn compatibleModelsCacheClear(self: *App) void {
-        for (self.compatible_models.items) |*model| model.deinit(self.gpa);
-        self.compatible_models.clearRetainingCapacity();
-        self.compatible_models_fetched = false;
+        for (self.models.compatible_models.items) |*model| model.deinit(self.gpa);
+        self.models.compatible_models.clearRetainingCapacity();
+        self.models.compatible_models_fetched = false;
     }
 
     fn isCodexSignedIn(self: *const App) bool {
@@ -1322,8 +1284,8 @@ pub const App = struct {
     }
 
     fn selectedReasoningIndex(self: *const App) u32 {
-        if (self.model_selection >= self.model_reasoning.items.len) return 0;
-        return self.model_reasoning.items[self.model_selection];
+        if (self.models.model_selection >= self.models.len()) return 0;
+        return self.models.entries.items[self.models.model_selection].reasoning_index;
     }
 
     fn selectedReasoningEffort(self: *const App) ai.ReasoningEffort {
@@ -1331,7 +1293,7 @@ pub const App = struct {
     }
 
     fn cycleModelScope(self: *App) void {
-        self.model_scope = switch (self.model_scope) {
+        self.models.model_scope = switch (self.models.model_scope) {
             .global => .project,
             .project => .session,
             .session => .global,
@@ -1339,31 +1301,29 @@ pub const App = struct {
     }
 
     fn cycleSelectedReasoning(self: *App) !void {
-        if (self.model_selection >= self.codex_models.items.len) return;
-        while (self.model_reasoning.items.len < self.codex_models.items.len) {
-            try self.model_reasoning.append(self.gpa, 0);
-        }
-        self.model_reasoning.items[self.model_selection] = nextIndex(self.model_reasoning.items[self.model_selection], @intCast(reasoningOptions().len));
+        if (self.models.model_selection >= self.models.len()) return;
+        const entry = &self.models.entries.items[self.models.model_selection];
+        entry.reasoning_index = nextIndex(entry.reasoning_index, @intCast(reasoningOptions().len));
     }
 
     fn selectedCodexModel(self: *App) ?codex.Model {
-        if (self.model_selection >= self.codex_models.items.len) return null;
-        const active_storage_idx = model_picker.findActiveStorageIdx(self.codex_models.items, self.activeModelId());
-        const idx = model_picker.displayToStorage(active_storage_idx, self.model_selection);
-        return self.codex_models.items[idx];
+        if (self.models.model_selection >= self.models.len()) return null;
+        const active_storage_idx = self.models.activeStorageIdx(self.activeModelId());
+        const idx = model_picker.displayToStorage(active_storage_idx, self.models.model_selection);
+        return self.models.entries.items[idx].model;
     }
 
     fn modelDisplayMatches(self: *const App, display_pos: u32, filter: []const u8) bool {
-        const count: u32 = @intCast(self.codex_models.items.len);
+        const count: u32 = self.models.len();
         if (display_pos >= count) return false;
-        const active = model_picker.findActiveStorageIdx(self.codex_models.items, self.activeModelId());
+        const active = self.models.activeStorageIdx(self.activeModelId());
         const storage = model_picker.displayToStorage(active, display_pos);
         if (storage >= count) return false;
-        return model_picker.matches(self.codex_models.items[storage], filter);
+        return model_picker.matches(self.models.entries.items[storage].model, filter);
     }
 
     fn firstMatchingModelDisplay(self: *const App, filter: []const u8) ?u32 {
-        const count: u32 = @intCast(self.codex_models.items.len);
+        const count: u32 = self.models.len();
         var d: u32 = 0;
         while (d < count) : (d += 1) {
             if (self.modelDisplayMatches(d, filter)) return d;
@@ -1372,34 +1332,31 @@ pub const App = struct {
     }
 
     fn stepModelSelection(self: *App, forward: bool) !void {
-        const count: u32 = @intCast(self.codex_models.items.len);
+        const count: u32 = self.models.len();
         if (count == 0) return;
         const filter = try self.peekPaletteInput();
         defer self.gpa.free(filter);
-        var next = self.model_selection;
+        var next = self.models.model_selection;
         var i: u32 = 0;
         while (i < count) : (i += 1) {
             next = if (forward) nextIndex(next, count) else previousIndex(next, count);
             if (self.modelDisplayMatches(next, filter)) {
-                self.model_selection = next;
+                self.models.model_selection = next;
                 return;
             }
         }
     }
 
     fn selectedModelSource(self: *const App) ?ModelSource {
-        if (self.model_selection >= self.model_sources.items.len) return null;
-        const active_storage_idx = model_picker.findActiveStorageIdx(self.codex_models.items, self.activeModelId());
-        const idx = model_picker.displayToStorage(active_storage_idx, self.model_selection);
-        if (idx >= self.model_sources.items.len) return null;
-        return self.model_sources.items[idx];
+        if (self.models.model_selection >= self.models.len()) return null;
+        const active_storage_idx = self.models.activeStorageIdx(self.activeModelId());
+        const idx = model_picker.displayToStorage(active_storage_idx, self.models.model_selection);
+        if (idx >= self.models.len()) return null;
+        return self.models.entries.items[idx].source;
     }
 
     fn codexModelsClear(self: *App) void {
-        for (self.codex_models.items) |*model| model.deinit(self.gpa);
-        self.codex_models.clearRetainingCapacity();
-        self.model_sources.clearRetainingCapacity();
-        self.model_reasoning.clearRetainingCapacity();
+        self.models.clearEntries(self.gpa);
     }
 
     fn connectCodexClient(
@@ -1475,7 +1432,7 @@ pub const App = struct {
     /// Switch the session leaf to `entry_id`, then rehydrate the agent's
     /// conversation and the display thread from the new branch. Refused mid-turn.
     fn navigateToEntry(self: *App, entry_id: []const u8) !void {
-        if (self.in_flight) return error.InFlightTurn;
+        if (self.turn.isActive()) return error.InFlightTurn;
         try self.runtime.?.session_writer.navigate(entry_id);
         try self.runtime.?.reloadMessages();
         try self.rebuildThreadFromAgent();
@@ -1566,12 +1523,14 @@ pub const App = struct {
         }
     }
 
-    fn enqueueSubmit(self: *App) !?u32 {
+    /// Stash a prompt submitted while a turn is already running. Returns false
+    /// — no new turn starts; the message rides the steering queue instead.
+    fn enqueueSubmit(self: *App) !bool {
         const prompt = try self.input.buf.dupe();
         errdefer self.gpa.free(prompt);
         if (prompt.len == 0) {
             self.gpa.free(prompt);
-            return null;
+            return false;
         }
         // Enqueue the raw text; the worker expands `@`-mentions when it drains
         // the queue, keeping file I/O off the UI thread.
@@ -1579,24 +1538,22 @@ pub const App = struct {
             error.QueueFull => {
                 self.gpa.free(prompt);
                 try self.appendMessageQueueFullNotice();
-                return null;
+                return false;
             },
             else => return err,
         };
         try self.queued_user_messages.append(self.gpa, prompt);
         self.clearInput();
-        return null;
+        return false;
     }
 
     fn appendMessageQueueFullNotice(self: *App) !void {
-        const had_loading = self.thread_projection.loading_index != null;
-        self.thread_projection.removeLoading(self.gpa, &self.thread);
+        // The spinner is derived from `awaiting_output` and drawn at the tail,
+        // so appending below it needs no remove/re-append dance.
         _ = try self.thread.append(self.gpa, .notice, "notice", "MessageQueueFull");
-        if (had_loading) try self.appendLoading();
     }
 
     fn flushQueuedUserMessagesToThread(self: *App, count: u32) !void {
-        self.thread_projection.removeLoading(self.gpa, &self.thread);
         const flush_count: usize = @min(count, self.queued_user_messages.items.len);
         for (self.queued_user_messages.items[0..flush_count]) |message| {
             _ = try self.thread.append(self.gpa, .user, "you", message);
@@ -1604,7 +1561,6 @@ pub const App = struct {
         }
         std.mem.copyForwards([]const u8, self.queued_user_messages.items[0 .. self.queued_user_messages.items.len - flush_count], self.queued_user_messages.items[flush_count..]);
         self.queued_user_messages.shrinkRetainingCapacity(self.queued_user_messages.items.len - flush_count);
-        try self.appendLoading();
     }
 
     fn clearQueuedUserMessages(self: *App) void {
@@ -1649,7 +1605,7 @@ pub const App = struct {
     }
 
     fn switchToNewSession(self: *App) !void {
-        if (self.in_flight) return error.InFlightTurn;
+        if (self.turn.isActive()) return error.InFlightTurn;
         const runtime = try self.createRuntime(null);
         errdefer {
             runtime.deinit();
@@ -1660,7 +1616,7 @@ pub const App = struct {
     }
 
     fn switchToSession(self: *App, session_id: []const u8) !void {
-        if (self.in_flight) return error.InFlightTurn;
+        if (self.turn.isActive()) return error.InFlightTurn;
         const runtime = try self.createRuntime(session_id);
         errdefer {
             runtime.deinit();
@@ -1702,7 +1658,7 @@ pub const App = struct {
     }
 
     fn installRuntime(self: *App, runtime: *runtime_mod.AgentRuntime) !void {
-        if (self.in_flight) return error.InFlightTurn;
+        if (self.turn.isActive()) return error.InFlightTurn;
         self.runtime.?.deinit();
         self.gpa.destroy(self.runtime.?);
         self.runtime = runtime;
@@ -2044,7 +2000,7 @@ const RootWidget = struct {
                         ctx.consumeAndRedraw();
                         return;
                     }
-                    if (self.app.in_flight) {
+                    if (self.app.turn.state == .active) {
                         try self.app.handleInterrupt();
                         ctx.consumeAndRedraw();
                         return;
@@ -2148,7 +2104,7 @@ const RootWidget = struct {
         var visible_change = try self.drainAgentEvents(ctx);
         if (try self.app.drainModelLoad()) visible_change = true;
 
-        if (self.app.thread_projection.loading_index) |_| {
+        if (self.app.thread_projection.awaiting_output) {
             self.spinner_tick_accum += drain_tick_ms;
             if (self.spinner_tick_accum >= spinner_tick_threshold_ms) {
                 self.spinner_tick_accum = 0;
@@ -2172,9 +2128,10 @@ const RootWidget = struct {
             self.blackhole_tick_accum = 0;
         }
 
-        const model_loading = self.app.model_load_future != null;
-        const should_tick = self.app.in_flight or
-            self.app.thread_projection.loading_index != null or
+        const model_loading = self.app.models.model_load_future != null;
+        // Keep ticking while a turn is active OR interrupting, so the worker's
+        // remaining events (and its terminal `turn_finished`) get drained.
+        const should_tick = self.app.turn.state != .idle or
             model_loading or
             self.app.blackhole_visible;
         if (should_tick) {
@@ -2202,12 +2159,11 @@ const RootWidget = struct {
     fn submit(self: *RootWidget, ctx: *vxfw.EventContext) !void {
         if (try self.app.submitMode()) {
             try self.syncFocus(ctx);
-            if (self.app.model_load_future != null) try self.ensureTick(ctx);
+            if (self.app.models.model_load_future != null) try self.ensureTick(ctx);
             ctx.consumeAndRedraw();
             return;
         }
-        const loading_index = (try self.app.beginSubmit()) orelse return;
-        _ = loading_index;
+        if (!try self.app.beginSubmit()) return;
         try self.app.startTurn();
         try self.ensureTick(ctx);
         ctx.consumeAndRedraw();
@@ -2241,16 +2197,12 @@ const RootWidget = struct {
             defer worker_gpa.destroy(event_ptr);
             defer event_ptr.deinit(worker_gpa);
 
-            if (self.app.turn_discarded) {
-                if (event_ptr.* == .turn_finished) {
-                    self.app.awaitTurn();
-                    self.app.turn_discarded = false;
-                }
-                continue;
-            }
-            if (self.app.thread_projection.loading_index != null) try self.ensureTick(ctx);
+            // A discarded (interrupted) turn's events are swallowed inside
+            // applyAgentEvent — the Turn machine refuses to project them — so
+            // draining stays a single uniform path.
+            if (self.app.thread_projection.awaiting_output) try self.ensureTick(ctx);
             if (try self.app.applyAgentEvent(event_ptr.*)) visible_change = true;
-            if (self.app.thread_projection.loading_index != null) try self.ensureTick(ctx);
+            if (self.app.thread_projection.awaiting_output) try self.ensureTick(ctx);
         }
         return visible_change;
     }
@@ -2375,40 +2327,66 @@ const ThreadWidget = struct {
         if (self.app.thread_view_height == 0) self.app.thread_view_height = 1;
     }
 
+    // Status-row height (content row + the one-row separator metrics adds);
+    // see `messageContentRows` for `.status` in tui/metrics.zig.
+    const spinner_rows: u16 = 2;
+
     fn messageWidgets(self: *ThreadWidget, ctx: vxfw.DrawContext) ![]vxfw.Widget {
         const messages = self.app.thread.messages.items;
-        const widgets = try ctx.arena.alloc(vxfw.Widget, messages.len);
-        const bodies = try ctx.arena.alloc(MessageWidget, messages.len);
+        const awaiting = self.app.thread_projection.awaiting_output;
+        const total = messages.len + @intFromBool(awaiting);
+        const widgets = try ctx.arena.alloc(vxfw.Widget, total);
+        const bodies = try ctx.arena.alloc(MessageWidget, total);
         for (messages, 0..) |*message, index| {
             const selected = if (self.app.thread.selected) |selected_index| selected_index == index else false;
             bodies[index] = .{ .message = message, .selected = selected, .loading_frame = self.app.loading_frame, .blackhole_frame = self.app.blackhole_frame, .gpa = self.app.gpa };
             widgets[index] = bodies[index].widget();
+        }
+        if (awaiting) {
+            // The loading spinner is derived UI, not a thread message: a
+            // synthetic status row drawn at the tail while the turn waits for
+            // the next chunk of model output.
+            const word = loading_spinners[self.app.thread_projection.loading_word_index];
+            const spinner = try ctx.arena.create(thread_mod.Message);
+            spinner.* = .{ .kind = .status, .title = try ctx.arena.dupe(u8, word), .body = try ctx.arena.dupe(u8, "") };
+            bodies[messages.len] = .{ .message = spinner, .selected = false, .loading_frame = self.app.loading_frame, .blackhole_frame = self.app.blackhole_frame, .gpa = self.app.gpa };
+            widgets[messages.len] = bodies[messages.len].widget();
         }
         return widgets;
     }
 
     fn syncCursor(self: *ThreadWidget, ctx: vxfw.DrawContext) void {
         const messages = self.app.thread.messages.items;
-        if (messages.len == 0) return;
+        const awaiting = self.app.thread_projection.awaiting_output;
+        const total: u32 = @intCast(messages.len + @intFromBool(awaiting));
+        if (total == 0) return;
         if (self.app.thread_auto_scroll) {
-            const tail_index: u32 = @intCast(messages.len - 1);
-            const cursor = self.app.thread_projection.loading_index orelse tail_index;
+            // The tail is the synthetic spinner row when awaiting, else the
+            // last real message.
+            const cursor = total - 1;
             self.app.thread_list.cursor = cursor;
             self.scrollCursorToTail(ctx, cursor);
             return;
         }
-        const cursor = self.app.thread.selected orelse self.app.thread_projection.loading_index orelse 0;
+        const fallback: u32 = if (awaiting) total - 1 else 0;
+        const cursor = self.app.thread.selected orelse fallback;
         const cursor_changed = self.app.thread_list.cursor != cursor;
         self.app.thread_list.cursor = cursor;
         if (cursor_changed) self.app.thread_list.ensureScroll();
     }
 
     fn scrollCursorToTail(self: *ThreadWidget, ctx: vxfw.DrawContext, cursor: u32) void {
-        if (cursor >= self.app.thread.messages.items.len) return;
+        const message_count: u32 = @intCast(self.app.thread.messages.items.len);
+        if (cursor > message_count) return;
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
         const list_height = max_height -| ConversationLayout.top -| ConversationLayout.bottom;
-        const message_height = messageRowsCached(&self.app.thread.messages.items[cursor], ConversationLayout.contentWidth(max_width));
+        // `cursor == message_count` targets the synthetic spinner row, which is
+        // not in `thread.messages`; use its fixed status-row height.
+        const message_height = if (cursor == message_count)
+            spinner_rows
+        else
+            messageRowsCached(&self.app.thread.messages.items[cursor], ConversationLayout.contentWidth(max_width));
         self.app.thread_list.scroll.top = cursor;
         self.app.thread_list.scroll.pending_lines = 0;
         self.app.thread_list.scroll.wants_cursor = false;
@@ -2528,8 +2506,8 @@ fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []
             try app.tree_state.reflattenKeepingSelection(value);
         },
         .model_picker => {
-            if (!app.modelDisplayMatches(app.model_selection, value)) {
-                app.model_selection = app.firstMatchingModelDisplay(value) orelse 0;
+            if (!app.modelDisplayMatches(app.models.model_selection, value)) {
+                app.models.model_selection = app.firstMatchingModelDisplay(value) orelse 0;
             }
         },
         .provider_picker, .normal => {},
@@ -2784,18 +2762,28 @@ const OverlayInner = struct {
         const filter = try app.peekPaletteInput();
         defer app.gpa.free(filter);
         const status = tui_status.modelStatus(app.runtime, app.cached_config);
+        // Project the consolidated entries into the parallel slices the picker
+        // widget consumes. Arena-allocated, rebuilt each draw — cheap, and it
+        // keeps the picker decoupled from the catalogue's internal layout.
+        const entries = app.models.entries.items;
+        const picker_models = try ctx.arena.alloc(codex.Model, entries.len);
+        const picker_reasoning = try ctx.arena.alloc(u32, entries.len);
+        for (entries, 0..) |entry, i| {
+            picker_models[i] = entry.model;
+            picker_reasoning[i] = entry.reasoning_index;
+        }
         var content: model_picker.Content = .{
-            .models = app.codex_models.items,
+            .models = picker_models,
             .list = &app.model_list,
-            .selection = app.model_selection,
-            .column = app.model_column,
+            .selection = app.models.model_selection,
+            .column = app.models.model_column,
             .active_model = if (status) |value| value.model else null,
             .reasoning_options = modelReasoningOptions(),
-            .reasoning_indexes = app.model_reasoning.items,
-            .scope = modelPickerScope(app.model_scope),
+            .reasoning_indexes = picker_reasoning,
+            .scope = modelPickerScope(app.models.model_scope),
             .filter = filter,
-            .loading = app.model_load_future != null,
-            .error_message = app.model_load_error,
+            .loading = app.models.model_load_future != null,
+            .error_message = app.models.model_load_error,
         };
         return content.widget().draw(ctx);
     }
@@ -3446,7 +3434,7 @@ test "up enters selected long message at bottom" {
     try std.testing.expect(app.thread_list.scroll.offset > 0);
 }
 
-test "begin submit clears input and appends loading row before agent turn" {
+test "begin submit clears input and starts a turn awaiting output" {
     const gpa = std.testing.allocator;
     var openai_compatible_client: openai_compatible_mod.Client = undefined;
     try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
@@ -3458,15 +3446,44 @@ test "begin submit clears input and appends loading row before agent turn" {
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("hello");
-    const loading_index = (try app.beginSubmit()).?;
+    try std.testing.expect(try app.beginSubmit());
 
     try std.testing.expectEqual(@as(usize, 0), app.input.buf.firstHalf().len);
     try std.testing.expectEqual(@as(usize, 0), app.input.buf.secondHalf().len);
+    // The user message is the only thread entry; the spinner is derived from
+    // `awaiting_output` and drawn at the tail, never stored as a message.
+    try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
     try std.testing.expectEqualStrings("hello", app.thread.messages.items[0].body);
-    try std.testing.expectEqual(.status, app.thread.messages.items[loading_index].kind);
-    try std.testing.expect(isLoadingWord(app.thread.messages.items[loading_index].title));
-    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&app.thread.messages.items[loading_index], 80));
+    try std.testing.expect(app.thread_projection.awaiting_output);
+    try std.testing.expectEqual(Turn.State.active, app.turn.state);
     try std.testing.expectEqual(@as(u32, 0), app.thread.selected.?);
+}
+
+test "awaiting turn draws a synthetic spinner row at the tail" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    _ = try app.thread.append(gpa, .user, "you", "hello");
+    app.thread_projection.awaiting_output = true;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var thread_widget: ThreadWidget = .{ .app = &app };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 6 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    _ = try thread_widget.widget().draw(ctx);
+
+    // One real message plus the derived spinner row, with auto-scroll parked on
+    // the synthetic tail — exercises the synthetic-row index and scroll math.
+    try std.testing.expectEqual(2, app.thread_list.item_count);
+    try std.testing.expectEqual(1, app.thread_list.cursor);
 }
 
 test "begin submit queues while turn is in flight" {
@@ -3476,10 +3493,12 @@ test "begin submit queues while turn is in flight" {
 
     var app = App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    app.in_flight = true;
+    // Simulate a turn already streaming and waiting on the next chunk.
+    app.turn.submit();
+    app.thread_projection.awaiting_output = true;
 
     try app.input.insertSliceAtCursor("later");
-    try std.testing.expectEqual(@as(?u32, null), try app.beginSubmit());
+    try std.testing.expect(!try app.beginSubmit());
 
     try std.testing.expectEqual(@as(usize, 1), app.queued_user_messages.items.len);
     try std.testing.expectEqualStrings("later", app.queued_user_messages.items[0]);
@@ -3487,10 +3506,11 @@ test "begin submit queues while turn is in flight" {
     try std.testing.expectEqual(@as(usize, 0), app.input.buf.firstHalf().len);
     try std.testing.expect(try app.applyAgentEvent(.{ .queued_messages_flushed = 1 }));
     try std.testing.expectEqual(@as(usize, 0), app.queued_user_messages.items.len);
-    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
+    // Just the flushed user message; the spinner stays derived at the tail.
+    try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
     try std.testing.expectEqualStrings("later", app.thread.messages.items[0].body);
-    try std.testing.expectEqual(.status, app.thread.messages.items[1].kind);
+    try std.testing.expect(app.thread_projection.awaiting_output);
 }
 
 test "begin submit shows notice when queued message queue is full" {
@@ -3500,8 +3520,8 @@ test "begin submit shows notice when queued message queue is full" {
 
     var app = App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    app.in_flight = true;
-    try app.appendLoading();
+    app.turn.submit();
+    app.thread_projection.awaiting_output = true;
 
     var queued_count: usize = 0;
     while (queued_count < agent.message_queue_storage.len) : (queued_count += 1) {
@@ -3509,15 +3529,16 @@ test "begin submit shows notice when queued message queue is full" {
     }
 
     try app.input.insertSliceAtCursor("later");
-    try std.testing.expectEqual(@as(?u32, null), try app.beginSubmit());
+    try std.testing.expect(!try app.beginSubmit());
 
     try std.testing.expectEqual(@as(usize, 0), app.queued_user_messages.items.len);
     try std.testing.expectEqual(@as(u32, @intCast(agent.message_queue_storage.len)), agent.message_queue.len());
     try std.testing.expectEqualStrings("later", app.input.buf.firstHalf());
-    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
+    // The notice is appended below the derived spinner; no status message.
+    try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
     try std.testing.expectEqual(.notice, app.thread.messages.items[0].kind);
     try std.testing.expectEqualStrings("MessageQueueFull", app.thread.messages.items[0].body);
-    try std.testing.expectEqual(.status, app.thread.messages.items[1].kind);
+    try std.testing.expect(app.thread_projection.awaiting_output);
 }
 
 test "opening model picker starts at top" {
@@ -3530,10 +3551,10 @@ test "opening model picker starts at top" {
     var app = App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    app.model_selection = 4;
+    app.models.model_selection = 4;
     try app.openModelPicker();
 
-    try std.testing.expectEqual(@as(u32, 0), app.model_selection);
+    try std.testing.expectEqual(@as(u32, 0), app.models.model_selection);
 }
 
 test "model picker hides model arrow when reasoning column is focused" {
@@ -3547,17 +3568,16 @@ test "model picker hides model arrow when reasoning column is focused" {
     defer app.deinit();
 
     app.mode = .model_picker;
-    app.model_column = .reasoning;
-    app.model_selection = 0;
+    app.models.model_column = .reasoning;
+    app.models.model_selection = 0;
     const models = try codex.loadStaticModels(gpa);
     defer gpa.free(models);
-    try app.codex_models.appendSlice(gpa, models);
-    try app.model_reasoning.appendNTimes(gpa, 0, app.codex_models.items.len);
+    for (models) |model| try app.models.append(gpa, model, .openai_codex);
 
     var row: model_picker.Row = .{
-        .model = &app.codex_models.items[0],
+        .model = &app.models.entries.items[0].model,
         .selected = true,
-        .column = app.model_column,
+        .column = app.models.model_column,
         .active_model = null,
         .reasoning_label = modelReasoningOptions()[app.selectedReasoningIndex()].label,
         .scope_label = "Global",
@@ -3587,9 +3607,9 @@ test "model picker without models stays on model column" {
     defer app.deinit();
 
     app.mode = .model_picker;
-    app.model_column = .model;
+    app.models.model_column = .model;
     try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.right }));
-    try std.testing.expectEqual(model_picker.Column.model, app.model_column);
+    try std.testing.expectEqual(model_picker.Column.model, app.models.model_column);
 }
 
 test "provider picker navigates from codex to catalogue providers" {
@@ -3694,10 +3714,8 @@ test "codex sign-in survives selecting local compatible provider" {
     defer runtime.disconnectClient();
 
     app.codex_signed_in = true;
-    try app.codex_models.append(gpa, .{ .id = try gpa.dupe(u8, "llama3"), .label = try gpa.dupe(u8, "llama3") });
-    try app.model_sources.append(gpa, .{ .openai_compatible = .ollama });
-    try app.model_reasoning.append(gpa, 0);
-    app.model_selection = 0;
+    try app.models.append(gpa, .{ .id = try gpa.dupe(u8, "llama3"), .label = try gpa.dupe(u8, "llama3") }, .{ .openai_compatible = .ollama });
+    app.models.model_selection = 0;
     app.cached_config_owned = true;
     app.cached_config.base_url = try gpa.dupe(u8, "http://localhost:11434/v1");
     app.cached_config.api_key = try gpa.dupe(u8, "ollama");
@@ -3724,9 +3742,9 @@ test "active model appears at display position 0 without mutating storage" {
 
     try app.reloadModelCatalog(.openai_codex);
 
-    const active_storage_idx = model_picker.findActiveStorageIdx(app.codex_models.items, "gpt-5.4-mini");
+    const active_storage_idx = app.models.activeStorageIdx("gpt-5.4-mini");
     const storage_idx = model_picker.displayToStorage(active_storage_idx, 0);
-    try std.testing.expectEqualStrings("gpt-5.4-mini", app.codex_models.items[storage_idx].id);
+    try std.testing.expectEqualStrings("gpt-5.4-mini", app.models.entries.items[storage_idx].model.id);
 }
 
 test "explicit codex catalog loads before runtime is connected" {
@@ -3741,8 +3759,7 @@ test "explicit codex catalog loads before runtime is connected" {
 
     try app.reloadModelCatalog(.openai_codex);
 
-    try std.testing.expect(app.codex_models.items.len > 0);
-    try std.testing.expectEqual(app.codex_models.items.len, app.model_reasoning.items.len);
+    try std.testing.expect(app.models.len() > 0);
     try std.testing.expect(app.selectedCodexModel() != null);
 }
 
@@ -3812,24 +3829,16 @@ test "menu navigation wraps and model reasoning tab cycles" {
 
     const models = try codex.loadStaticModels(gpa);
     defer gpa.free(models);
-    try app.codex_models.appendSlice(gpa, models);
-    try app.model_reasoning.appendNTimes(gpa, 0, app.codex_models.items.len);
+    for (models) |model| try app.models.append(gpa, model, .openai_codex);
     app.mode = .model_picker;
-    app.model_selection = @intCast(app.codex_models.items.len - 1);
+    app.models.model_selection = @intCast(app.models.len() - 1);
     try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.down }));
-    try std.testing.expectEqual(@as(u32, 0), app.model_selection);
+    try std.testing.expectEqual(@as(u32, 0), app.models.model_selection);
 
-    app.model_column = .reasoning;
+    app.models.model_column = .reasoning;
     try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.tab }));
-    try std.testing.expectEqual(@as(u32, 1), app.model_reasoning.items[0]);
-    try std.testing.expectEqual(@as(u32, 0), app.model_reasoning.items[1]);
-}
-
-fn isLoadingWord(text: []const u8) bool {
-    for (loading_spinners) |loading_spinner| {
-        if (std.mem.eql(u8, text, loading_spinner)) return true;
-    }
-    return false;
+    try std.testing.expectEqual(@as(u32, 1), app.models.entries.items[0].reasoning_index);
+    try std.testing.expectEqual(@as(u32, 0), app.models.entries.items[1].reasoning_index);
 }
 
 test "empty text deltas do not create selectable messages" {
@@ -3844,7 +3853,7 @@ test "empty text deltas do not create selectable messages" {
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("hello");
-    _ = (try app.beginSubmit()).?;
+    _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .response_delta = "" }));
     try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
@@ -3867,7 +3876,7 @@ test "agent app events update thread on the ui side" {
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("hello");
-    _ = (try app.beginSubmit()).?;
+    _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .thinking_delta = "checking" }));
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
@@ -3904,7 +3913,7 @@ test "user can navigate away from a streaming thinking block" {
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("hello");
-    _ = (try app.beginSubmit()).?;
+    _ = try app.beginSubmit();
 
     _ = try app.applyAgentEvent(.{ .thinking_delta = "first chunk" });
     try std.testing.expectEqual(.thinking, app.thread.messages.items[app.thread.selected.?].kind);
@@ -3928,7 +3937,7 @@ test "user can navigate away from a streaming agent message" {
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("hello");
-    _ = (try app.beginSubmit()).?;
+    _ = try app.beginSubmit();
 
     _ = try app.applyAgentEvent(.{ .response_delta = "first chunk" });
     try std.testing.expectEqual(.agent, app.thread.messages.items[app.thread.selected.?].kind);
@@ -3952,7 +3961,7 @@ test "empty content delta does not finalize thinking" {
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("hello");
-    _ = (try app.beginSubmit()).?;
+    _ = try app.beginSubmit();
 
     _ = try app.applyAgentEvent(.{ .thinking_delta = "thinking" });
     const thinking_index = app.thread_projection.thinking_index.?;
@@ -3980,7 +3989,7 @@ test "content deltas do not override user scroll state" {
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("hello");
-    _ = (try app.beginSubmit()).?;
+    _ = try app.beginSubmit();
 
     _ = try app.applyAgentEvent(.{ .response_delta = "first" });
     try std.testing.expect(app.thread_auto_scroll);
@@ -4002,7 +4011,7 @@ test "loading does not appear during final answer after tool batch" {
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("inspect");
-    _ = (try app.beginSubmit()).?;
+    _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
@@ -4016,7 +4025,10 @@ test "loading does not appear during final answer after tool batch" {
         .display_body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
-    try std.testing.expectEqual(.status, app.thread.messages.items[2].kind);
+    // No status message — the spinner is derived; the batch leaves us awaiting
+    // the next response over the user + tool rows.
+    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
+    try std.testing.expect(app.thread_projection.awaiting_output);
 
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "Final answer" }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
@@ -4036,7 +4048,7 @@ test "loading does not reappear between content chunks" {
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("implement dijkstra");
-    _ = (try app.beginSubmit()).?;
+    _ = try app.beginSubmit();
 
     // Once a content delta has arrived we are committed to streaming. The gap
     // between chunks must NOT bring the spinner back — the streaming text is
@@ -4060,7 +4072,7 @@ test "structured tool keeps loading status while arguments stream" {
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("write file");
-    _ = (try app.beginSubmit()).?;
+    _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
@@ -4094,7 +4106,7 @@ test "tool row persists through finish and turn completion" {
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("run ls");
-    _ = (try app.beginSubmit()).?;
+    _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
@@ -4138,16 +4150,18 @@ test "partial tool arguments do not create visible tool rows" {
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("run ls");
-    _ = (try app.beginSubmit()).?;
+    _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
         .arguments = "{\"command\":\"",
     } }));
-    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
+    // Partial arguments render nothing, so no tool row appears and the spinner
+    // stays up (awaiting) over the lone user message.
+    try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
-    try std.testing.expectEqual(.status, app.thread.messages.items[1].kind);
+    try std.testing.expect(app.thread_projection.awaiting_output);
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
@@ -4171,7 +4185,7 @@ test "tool finish creates row if no complete streamed arguments appeared" {
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("run ls");
-    _ = (try app.beginSubmit()).?;
+    _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
@@ -4202,7 +4216,7 @@ test "new tool response index creates a new thread row" {
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("run tools");
-    _ = (try app.beginSubmit()).?;
+    _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
@@ -4242,7 +4256,7 @@ test "structured tool after batch replaces loading status" {
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("run tools");
-    _ = (try app.beginSubmit()).?;
+    _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
@@ -4256,7 +4270,9 @@ test "structured tool after batch replaces loading status" {
         .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
-    try std.testing.expectEqual(.status, app.thread.messages.items[2].kind);
+    // Awaiting the next segment over the user + tool rows; spinner is derived.
+    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
+    try std.testing.expect(app.thread_projection.awaiting_output);
 
     _ = try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
@@ -4282,7 +4298,7 @@ test "late tool finish does not move selection upward" {
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("run tools");
-    _ = (try app.beginSubmit()).?;
+    _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
@@ -4323,7 +4339,7 @@ test "loading does not resume after post-tool thinking delta" {
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("inspect");
-    _ = (try app.beginSubmit()).?;
+    _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
@@ -4360,7 +4376,7 @@ test "agent response after tool batch appears below tool rows" {
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("inspect");
-    _ = (try app.beginSubmit()).?;
+    _ = try app.beginSubmit();
 
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "I will check." }));
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
@@ -4400,7 +4416,7 @@ test "content delta after tool preview does not move selection away from tool ro
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("inspect");
-    _ = (try app.beginSubmit()).?;
+    _ = try app.beginSubmit();
 
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "I will check." }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
@@ -4504,4 +4520,3 @@ test "expanded tool surface height cannot overflow vxfw buffer size" {
     const surface = try widget.widget().draw(ctx);
     try std.testing.expect(surface.size.width * surface.size.height <= std.math.maxInt(u16));
 }
-

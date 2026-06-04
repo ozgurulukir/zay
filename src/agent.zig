@@ -112,9 +112,7 @@ pub const Agent = struct {
     ///
     /// Variant payloads are C-flattenable (flat fields, strings as
     /// `[]const u8`, integers, enums, single-level structs) so an FFI shim
-    /// can wrap them later without redesigning the type. See CONTEXT.md's
-    /// **Agent.Event** and the **C-flattenable Agent.Event payloads**
-    /// convention.
+    /// can wrap them later without redesigning the type.
     pub const Event = union(enum) {
         turn_started,
         thinking_delta: []const u8,
