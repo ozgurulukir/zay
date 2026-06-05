@@ -6,12 +6,10 @@ const session_mod = @import("../../session.zig");
 const message = @import("message.zig");
 const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
+const tree_art = @import("tree_art.zig");
 
 const entry_id_len = session_mod.entry_id_len;
 const Id = [entry_id_len]u8;
-/// Hard cap on indentation levels so a pathologically deep branch can't push
-/// text off-screen. Each level is 3 columns.
-const max_levels: u16 = 16;
 
 pub const FilterMode = enum {
     default,
@@ -359,7 +357,7 @@ pub const TreeState = struct {
         // ancestor at indent k is the last at its level (drives the `│`
         // gutters); pre-order + ≤+1 indent steps keep it pointing at ancestors.
         var out: std.ArrayList(VisibleNode) = try .initCapacity(arena, layout.items.len);
-        var last_at_indent = [_]bool{false} ** (max_levels + 2);
+        var last_at_indent = [_]bool{false} ** (tree_art.max_levels + 2);
         for (layout.items, 0..) |item, i| {
             // Last at its level when the next node at indent <= this one steps
             // back out (indent <), or there is none.
@@ -372,8 +370,8 @@ pub const TreeState = struct {
                 }
                 if (layout.items[j].indent < item.indent) break;
             }
-            const prefix = try buildPrefix(arena, item.indent, is_last, last_at_indent[0..], item.is_folded, item.foldable, item.branch_point);
-            if (item.indent <= max_levels) last_at_indent[item.indent] = is_last;
+            const prefix = try tree_art.buildPrefix(arena, item.indent, is_last, last_at_indent[0..], item.is_folded, item.foldable, item.branch_point);
+            if (item.indent <= tree_art.max_levels) last_at_indent[item.indent] = is_last;
             out.appendAssumeCapacity(.{
                 .full_index = item.full_index,
                 .prefix = prefix,
@@ -418,62 +416,7 @@ pub const TreeState = struct {
         }
         return null;
     }
-
 };
-
-/// Build the tree-art prefix for a row. The root and linear chains (indent 0)
-/// render flush as plain text. Every other node draws ancestor gutters
-/// (`│  `/blank) followed by its own connector — a tee (`├─`) when more nodes
-/// follow at its level, a rounded corner (`╰─`) when it is the last. The
-/// connector's middle slot carries the fold marker (`▼` expanded, `▶`
-/// collapsed, `─` otherwise). `last_at_indent[k]` tells whether the ancestor at
-/// indent `k` is the last at its level (no `│` below it).
-///
-/// A branch point (a node with >1 visible children) ends its prefix with a
-/// downward tee `┬`, sitting exactly above its children's connector column.
-/// That gives the branch a node to grow from, so the `├─`/`╰─` arms join a
-/// connector instead of sprouting out of the parent's message text.
-fn buildPrefix(
-    arena: std.mem.Allocator,
-    indent: u16,
-    is_last: bool,
-    last_at_indent: []const bool,
-    is_folded: bool,
-    is_foldable: bool,
-    is_branch_point: bool,
-) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    if (indent > 0) {
-        const levels = @min(indent, max_levels);
-        // Cells 0..levels-2 are ancestor gutters; cell `levels-1` is this node's
-        // connector. The gutter at cell c continues the ancestor whose connector
-        // sits there — the ancestor at indent c+1 — when it is not the last node
-        // at its level.
-        var cell: u16 = 0;
-        while (cell + 1 < levels) : (cell += 1) {
-            const ancestor_indent = cell + 1;
-            const draw_bar = ancestor_indent < last_at_indent.len and !last_at_indent[ancestor_indent];
-            try out.appendSlice(arena, if (draw_bar) "│  " else "   ");
-        }
-        // Connector cell: a rounded corner for the last node at this level, a
-        // tee otherwise. The middle slot doubles as the fold marker, kept to the
-        // same 3-column width as a gutter so columns line up.
-        try out.appendSlice(arena, if (is_last) "╰" else "├");
-        if (is_folded) {
-            try out.appendSlice(arena, "▶");
-        } else if (is_foldable) {
-            try out.appendSlice(arena, "▼");
-        } else {
-            try out.appendSlice(arena, "─");
-        }
-        try out.append(arena, ' ');
-    }
-    // The branch point's own node glyph: its children's connectors align under
-    // this `┬`, so the fork reads as one continuous line rather than separate
-    // lines starting beneath the text.
-    if (is_branch_point) try out.appendSlice(arena, "┬ ");
-    return out.toOwnedSlice(arena);
-}
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;

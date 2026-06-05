@@ -46,6 +46,12 @@ const command_prefix: u8 = '/';
 const picker_secondary_column: u16 = 52;
 const long_message_scroll_step_rows: u16 = 3;
 const ThreadNavigation = enum { previous, next };
+
+const DiffCounts = struct {
+    additions: u32 = 0,
+    deletions: u32 = 0,
+};
+
 // TODO: Investigate jumpToItem as an alternative to handrolling logic
 pub const App = struct {
     io: std.Io,
@@ -63,6 +69,7 @@ pub const App = struct {
     resume_selection: u32 = 0,
     resume_global: bool = false,
     resume_summaries: std.ArrayList(session_mod.SessionSummary) = .empty,
+    resume_folded_projects: std.ArrayList([]u8) = .empty,
     tree_state: tree_selector.TreeState,
     /// All model/provider/selection state for the model picker — fetched
     /// lists, selection cursor/column/scope, and the async-load handle.
@@ -94,6 +101,7 @@ pub const App = struct {
     blackhole_visible: bool = true,
     thread_auto_scroll: bool = true,
     git_label: []const u8 = "",
+    diff_counts: DiffCounts = .{},
     thread_view_width: u16 = 80,
     thread_view_height: u16 = 1,
     thread_list: vxfw.ListView = .{
@@ -189,6 +197,8 @@ pub const App = struct {
         for (self.retired_threads.items) |*thread| thread.deinit(self.gpa);
         self.retired_threads.deinit(self.gpa);
         self.resumeClear();
+        self.resumeClearFolds();
+        self.resume_folded_projects.deinit(self.gpa);
         self.tree_state.deinit();
         self.models.deinit(self.gpa);
         codex.freeApiKeyMap(self.gpa, &self.provider_api_keys);
@@ -487,9 +497,15 @@ pub const App = struct {
     }
 
     fn handleSessionPickerKey(self: *App, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.tab, .{})) {
+        if (key.matches('a', .{ .ctrl = true })) {
             self.resume_global = !self.resume_global;
+            self.resume_selection = 0;
+            self.resumeClearFolds();
             try self.reloadResumeSessions();
+            return true;
+        }
+        if (key.matches(vaxis.Key.tab, .{})) {
+            if (self.resume_global) try self.toggleSelectedResumeProject();
             return true;
         }
         if (key.matches(vaxis.Key.up, .{})) {
@@ -688,6 +704,7 @@ pub const App = struct {
         self.mode = .session_picker;
         self.resume_global = false;
         self.resume_selection = 0;
+        self.resumeClearFolds();
         self.clearInput();
         try self.reloadResumeSessions();
     }
@@ -1387,6 +1404,7 @@ pub const App = struct {
         const cwd = if (self.resume_global) null else self.runtime.?.cwd;
         const summaries = try manager.list(self.gpa, cwd);
         try self.resume_summaries.appendSlice(self.gpa, summaries);
+        if (self.resume_global) std.mem.sort(session_mod.SessionSummary, self.resume_summaries.items, {}, resumeSummaryLessThan);
         if (self.resume_selection >= try self.visibleResumeCount()) self.resume_selection = 0;
         self.syncResumeListCursor();
     }
@@ -1394,19 +1412,39 @@ pub const App = struct {
     fn selectedResumeSummary(self: *App) !?*session_mod.SessionSummary {
         const filter = try self.peekPaletteInput();
         defer self.gpa.free(filter);
-        var visible_index: u32 = 0;
-        for (self.resume_summaries.items) |*summary| {
-            if (!resume_picker.matches(summary, filter)) continue;
-            if (visible_index == self.resume_selection) return summary;
-            visible_index += 1;
-        }
-        return null;
+        return @constCast(resume_picker.selectedSummary(self.resume_summaries.items, filter, self.resume_folded_projects.items, self.resume_selection, self.resume_global));
     }
 
     fn visibleResumeCount(self: *App) !u32 {
         const filter = try self.peekPaletteInput();
         defer self.gpa.free(filter);
-        return resume_picker.visibleCount(self.resume_summaries.items, filter);
+        return resume_picker.visibleCount(self.resume_summaries.items, filter, self.resume_folded_projects.items, self.resume_global);
+    }
+
+    fn toggleSelectedResumeProject(self: *App) !void {
+        const filter = try self.peekPaletteInput();
+        defer self.gpa.free(filter);
+        const cwd = resume_picker.selectedProject(self.resume_summaries.items, filter, self.resume_folded_projects.items, self.resume_selection) orelse return;
+        if (self.resumeFoldIndex(cwd)) |index| {
+            self.gpa.free(self.resume_folded_projects.items[index]);
+            _ = self.resume_folded_projects.orderedRemove(index);
+        } else {
+            try self.resume_folded_projects.append(self.gpa, try self.gpa.dupe(u8, cwd));
+        }
+        if (self.resume_selection >= try self.visibleResumeCount()) self.resume_selection = 0;
+        self.syncResumeListCursor();
+    }
+
+    fn resumeFoldIndex(self: *const App, cwd: []const u8) ?usize {
+        for (self.resume_folded_projects.items, 0..) |folded, index| {
+            if (std.mem.eql(u8, folded, cwd)) return index;
+        }
+        return null;
+    }
+
+    fn resumeClearFolds(self: *App) void {
+        for (self.resume_folded_projects.items) |folded| self.gpa.free(folded);
+        self.resume_folded_projects.clearRetainingCapacity();
     }
 
     fn resumeClear(self: *App) void {
@@ -1770,6 +1808,29 @@ pub const App = struct {
         return selected == self.thread.messages.items.len - 1;
     }
 
+    fn diffCountsVisible(self: *const App) bool {
+        if (self.diff_counts.additions > 0) return true;
+        return self.diff_counts.deletions > 0;
+    }
+
+    fn refreshDiffCounts(self: *App) !bool {
+        const cwd = if (self.runtime) |runtime| runtime.cwd else ".";
+        var result = try bash_mod.runWithOptions(self.gpa, self.io, .{
+            .cwd = cwd,
+            .command = diffCountCommand,
+            .timeout = bash_mod.timeoutFromSeconds(1),
+        });
+        defer result.deinit(self.gpa);
+        if (result.code != 0) return false;
+
+        const next = parseDiffCounts(result.stdout);
+        if (next.additions == self.diff_counts.additions) {
+            if (next.deletions == self.diff_counts.deletions) return false;
+        }
+        self.diff_counts = next;
+        return true;
+    }
+
     fn jumpThreadToBottom(self: *App) void {
         self.block_nav = false;
         self.thread.selectLast();
@@ -1879,6 +1940,13 @@ fn nextIndex(current: u32, count: u32) u32 {
     return current + 1;
 }
 
+fn resumeSummaryLessThan(_: void, left: session_mod.SessionSummary, right: session_mod.SessionSummary) bool {
+    const cwd_order = std.mem.order(u8, left.cwd, right.cwd);
+    if (cwd_order == .lt) return true;
+    if (cwd_order == .gt) return false;
+    return left.updated_at_ms > right.updated_at_ms;
+}
+
 fn previousIndex(current: u32, count: u32) u32 {
     if (count == 0) return 0;
     if (current == 0) return count - 1;
@@ -1938,6 +2006,49 @@ pub fn run(
     try fw_app.run(root.widget(), .{});
 }
 
+const diffCountCommand =
+    \\if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    \\  git diff --numstat HEAD -- 2>/dev/null
+    \\  git ls-files --others --exclude-standard -z 2>/dev/null | while IFS= read -r -d '' file; do
+    \\    lines=$(wc -l < "$file" 2>/dev/null | tr -d ' ')
+    \\    if [ -n "$lines" ]; then printf '%s\t0\t%s\n' "$lines" "$file"; fi
+    \\  done
+    \\fi
+;
+
+fn parseDiffCounts(output: []const u8) DiffCounts {
+    var counts: DiffCounts = .{};
+    var line_start: usize = 0;
+    while (line_start <= output.len) {
+        const line_end = std.mem.findScalarPos(u8, output, line_start, '\n') orelse output.len;
+        parseDiffCountLine(&counts, output[line_start..line_end]);
+        if (line_end == output.len) break;
+        line_start = line_end + 1;
+    }
+    return counts;
+}
+
+fn parseDiffCountLine(counts: *DiffCounts, line: []const u8) void {
+    if (line.len == 0) return;
+    const first_tab = std.mem.indexOfScalar(u8, line, '\t') orelse return;
+    const rest = line[first_tab + 1 ..];
+    const second_tab = std.mem.indexOfScalar(u8, rest, '\t') orelse return;
+    counts.additions = saturatingAdd(counts.additions, parseNumstatField(line[0..first_tab]));
+    counts.deletions = saturatingAdd(counts.deletions, parseNumstatField(rest[0..second_tab]));
+}
+
+fn parseNumstatField(field: []const u8) u32 {
+    if (field.len == 0) return 0;
+    if (std.mem.eql(u8, field, "-")) return 0;
+    const value = std.fmt.parseUnsigned(u64, field, 10) catch return 0;
+    return @intCast(@min(value, std.math.maxInt(u32)));
+}
+
+fn saturatingAdd(a: u32, b: u32) u32 {
+    const sum: u64 = @as(u64, a) + @as(u64, b);
+    return @intCast(@min(sum, std.math.maxInt(u32)));
+}
+
 fn loadGitLabel(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) ![]const u8 {
     const command =
         \\root=$(git rev-parse --show-toplevel 2>/dev/null)
@@ -1965,6 +2076,8 @@ const RootWidget = struct {
     app: *App,
     spinner_tick_accum: u32 = 0,
     blackhole_tick_accum: u32 = 0,
+    diff_tick_accum: u32 = 0,
+    diff_refresh_pending: bool = false,
 
     fn widget(self: *RootWidget) vxfw.Widget {
         return .{
@@ -2097,6 +2210,7 @@ const RootWidget = struct {
 
     const drain_tick_ms: u32 = 30;
     const spinner_tick_threshold_ms: u32 = loading_frame_ms;
+    const diff_tick_threshold_ms: u32 = 300;
 
     fn handleTick(self: *RootWidget, ctx: *vxfw.EventContext) !void {
         var visible_change = try self.drainAgentEvents(ctx);
@@ -2111,6 +2225,17 @@ const RootWidget = struct {
             }
         } else {
             self.spinner_tick_accum = 0;
+        }
+
+        if (self.diff_refresh_pending) {
+            self.diff_tick_accum += drain_tick_ms;
+            if (self.diff_tick_accum >= diff_tick_threshold_ms) {
+                self.diff_tick_accum = 0;
+                self.diff_refresh_pending = false;
+                if (try self.app.refreshDiffCounts()) visible_change = true;
+            }
+        } else {
+            self.diff_tick_accum = 0;
         }
 
         if (self.app.blackhole_visible) {
@@ -2131,7 +2256,8 @@ const RootWidget = struct {
         // remaining events (and its terminal `turn_finished`) get drained.
         const should_tick = self.app.turn.state != .idle or
             model_loading or
-            self.app.blackhole_visible;
+            self.app.blackhole_visible or
+            self.diff_refresh_pending;
         if (should_tick) {
             try ctx.tick(drain_tick_ms, self.widget());
         } else {
@@ -2199,6 +2325,13 @@ const RootWidget = struct {
             // applyAgentEvent — the Turn machine refuses to project them — so
             // draining stays a single uniform path.
             if (self.app.thread_projection.awaiting_output) try self.ensureTick(ctx);
+            switch (event_ptr.*) {
+                .tool_call_finished => {
+                    self.diff_refresh_pending = true;
+                    self.diff_tick_accum = 0;
+                },
+                else => {},
+            }
             if (try self.app.applyAgentEvent(event_ptr.*)) visible_change = true;
             if (self.app.thread_projection.awaiting_output) try self.ensureTick(ctx);
         }
@@ -2496,7 +2629,7 @@ fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []
             if (app.command_selection >= count) app.command_selection = 0;
         },
         .session_picker => {
-            const count = resume_picker.visibleCount(app.resume_summaries.items, value);
+            const count = resume_picker.visibleCount(app.resume_summaries.items, value, app.resume_folded_projects.items, app.resume_global);
             if (app.resume_selection >= count) app.resume_selection = 0;
             app.syncResumeListCursor();
         },
@@ -2577,6 +2710,28 @@ const OverlayWidget = struct {
         return surface;
     }
 };
+
+fn writeDiffCounts(surface: *vxfw.Surface, ctx: vxfw.DrawContext, counts: DiffCounts) void {
+    _ = ctx;
+    var additions_buf: [8]u8 = undefined;
+    var deletions_buf: [8]u8 = undefined;
+    const additions = std.fmt.bufPrint(&additions_buf, "+{d: >5}", .{@min(counts.additions, 99999)}) catch return;
+    const deletions = std.fmt.bufPrint(&deletions_buf, "-{d: >5}", .{@min(counts.deletions, 99999)}) catch return;
+    writeAscii(surface, additions, StylePalette.tool, 0);
+    writeAscii(surface, deletions, StylePalette.tool_failed, @intCast(additions.len + 1));
+}
+
+fn writeAscii(surface: *vxfw.Surface, text: []const u8, style: vaxis.Style, col_start: u16) void {
+    var col = col_start;
+    for (text, 0..) |_, index| {
+        if (col >= surface.size.width) return;
+        surface.writeCell(col, 0, .{
+            .char = .{ .grapheme = text[index .. index + 1], .width = 1 },
+            .style = style,
+        });
+        col += 1;
+    }
+}
 
 fn writeBorderLabel(surface: *vxfw.Surface, ctx: vxfw.DrawContext, text: []const u8) void {
     writeBorderLabelLeft(surface, ctx, 0, text, StylePalette.border_label);
@@ -2735,8 +2890,9 @@ const OverlayInner = struct {
             .list = &app.resume_list,
             .summaries = app.resume_summaries.items,
             .selection = app.resume_selection,
-            .global = app.resume_global,
+            .folded_projects = app.resume_folded_projects.items,
             .filter = filter,
+            .tree_mode = app.resume_global,
         };
         return content.widget().draw(ctx);
     }
@@ -2811,10 +2967,13 @@ fn reasoningOptions() []const model_picker.ReasoningOption {
     return &reasoning_options;
 }
 
-fn inputHintText(mode: App.Mode) []const u8 {
-    return switch (mode) {
+fn inputHintText(app: *const App) []const u8 {
+    return switch (app.mode) {
         .command => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
-        .session_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[TAB] All sessions" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
+        .session_picker => if (app.resume_global)
+            "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[CTRL+A] Current project" ++ symbols.separator_dot_padded ++ "[TAB] Fold" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back"
+        else
+            "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[CTRL+A] All projects" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .provider_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Actions" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .model_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Column" ++ symbols.separator_dot_padded ++ "[TAB] Toggle Effort/Scope" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .tree_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Filter" ++ symbols.separator_dot_padded ++ "[TAB] Fold" ++ symbols.separator_dot_padded ++ "[ENTER] Switch" ++ symbols.separator_dot_padded ++ "[ESC] Back",
@@ -3075,7 +3234,8 @@ const InputWidget = struct {
 
         const base_row: u16 = input_row + border_height;
         const show_hint = height >= base_row + 1;
-        const children_count: usize = 1 + @as(usize, if (show_hint) 1 else 0) + @as(usize, if (queued_visible) 1 else 0);
+        const show_diff = show_hint and self.app.diffCountsVisible();
+        const children_count: usize = 1 + @as(usize, if (show_hint) 1 else 0) + @as(usize, if (show_diff) 1 else 0) + @as(usize, if (queued_visible) 1 else 0);
         const children = try ctx.arena.alloc(vxfw.SubSurface, children_count);
         var child_index: usize = 0;
         if (queued_visible) {
@@ -3096,6 +3256,10 @@ const InputWidget = struct {
             const padding_x: u16 = @min(@as(u16, 1), max_width);
             const inner_width = max_width -| (padding_x * 2);
             try self.drawInputHint(ctx, children, child_index, base_row, padding_x, inner_width);
+            child_index += 1;
+        }
+        if (show_diff) {
+            try self.drawDiffCounts(ctx, children, child_index, base_row, max_width);
         }
         return .{
             .size = .{ .width = max_width, .height = height },
@@ -3143,11 +3307,23 @@ const InputWidget = struct {
     }
 
     fn drawInputHint(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, child_index: usize, row: u16, col: u16, width: u16) std.mem.Allocator.Error!void {
-        var hint_text: vxfw.Text = .{ .text = inputHintText(self.app.mode), .style = StylePalette.thinking_body, .text_align = .center, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
+        var hint_text: vxfw.Text = .{ .text = inputHintText(self.app), .style = StylePalette.thinking_body, .text_align = .center, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
         children[child_index] = .{
             .origin = .{ .row = row, .col = col },
             .surface = try hint_text.widget().draw(ctx.withConstraints(.{ .width = width, .height = 1 }, .{ .width = width, .height = 1 })),
             .z_index = 0,
+        };
+    }
+
+    fn drawDiffCounts(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, child_index: usize, row: u16, width: u16) std.mem.Allocator.Error!void {
+        const diff_width: u16 = 13;
+        const surface_width = @min(diff_width, width);
+        var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = surface_width, .height = 1 });
+        if (surface_width > 0) writeDiffCounts(&surface, ctx, self.app.diff_counts);
+        children[child_index] = .{
+            .origin = .{ .row = row, .col = width -| 2 -| surface_width },
+            .surface = surface,
+            .z_index = 1,
         };
     }
 };
@@ -3185,6 +3361,34 @@ fn commandInputSegmentEnd(input: []const u8) usize {
         if (byte == ' ') return index;
     }
     return input.len;
+}
+
+test "parse diff counts sums numstat and skips binary" {
+    const counts = parseDiffCounts(
+        "3\t1\tsrc/a.zig\n" ++
+            "-\t-\timage.png\n" ++
+            "8\t0\tsrc/new.zig\n",
+    );
+
+    try std.testing.expectEqual(@as(u32, 11), counts.additions);
+    try std.testing.expectEqual(@as(u32, 1), counts.deletions);
+}
+
+test "diff count label keeps a fixed width" {
+    var small_add: [8]u8 = undefined;
+    var small_del: [8]u8 = undefined;
+    const small = DiffCounts{ .additions = 1, .deletions = 12 };
+    const small_additions = try std.fmt.bufPrint(&small_add, "+{d: >5}", .{@min(small.additions, 99999)});
+    const small_deletions = try std.fmt.bufPrint(&small_del, "-{d: >5}", .{@min(small.deletions, 99999)});
+
+    var large_add: [8]u8 = undefined;
+    var large_del: [8]u8 = undefined;
+    const large = DiffCounts{ .additions = 12345, .deletions = 999999 };
+    const large_additions = try std.fmt.bufPrint(&large_add, "+{d: >5}", .{@min(large.additions, 99999)});
+    const large_deletions = try std.fmt.bufPrint(&large_del, "-{d: >5}", .{@min(large.deletions, 99999)});
+
+    try std.testing.expectEqual(small_additions.len, large_additions.len);
+    try std.testing.expectEqual(small_deletions.len, large_deletions.len);
 }
 
 test "root layout keeps input fixed when panel opens" {

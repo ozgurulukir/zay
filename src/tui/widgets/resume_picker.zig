@@ -3,18 +3,19 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const session_mod = @import("../../session.zig");
-const symbols = @import("../../symbols.zig");
 const message = @import("message.zig");
 const panel = @import("panel.zig");
 const tui_status = @import("../status.zig");
+const tree_art = @import("tree_art.zig");
 
 pub const Content = struct {
     io: std.Io,
     list: *vxfw.ListView,
     summaries: []const session_mod.SessionSummary,
     selection: u32,
-    global: bool,
+    folded_projects: []const []const u8,
     filter: []const u8,
+    tree_mode: bool,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -31,30 +32,117 @@ pub const Content = struct {
     }
 
     fn resumeWidgets(self: *Content, ctx: vxfw.DrawContext) ![]vxfw.Widget {
-        const count = visibleCount(self.summaries, self.filter);
+        const count = visibleCount(self.summaries, self.filter, self.folded_projects, self.tree_mode);
         const widgets = try ctx.arena.alloc(vxfw.Widget, count);
         const rows = try ctx.arena.alloc(Row, count);
-        var index: u32 = 0;
+        var builder: RowBuilder = .{
+            .io = self.io,
+            .ctx = ctx,
+            .summaries = self.summaries,
+            .filter = self.filter,
+            .folded_projects = self.folded_projects,
+            .tree_mode = self.tree_mode,
+            .rows = rows,
+            .widgets = widgets,
+            .selection = self.selection,
+        };
+        try builder.build();
+        return widgets;
+    }
+};
+
+const RowBuilder = struct {
+    io: std.Io,
+    ctx: vxfw.DrawContext,
+    summaries: []const session_mod.SessionSummary,
+    filter: []const u8,
+    folded_projects: []const []const u8,
+    tree_mode: bool,
+    rows: []Row,
+    widgets: []vxfw.Widget,
+    selection: u32,
+    index: u32 = 0,
+
+    fn build(self: *RowBuilder) !void {
+        if (!self.tree_mode) return self.buildFlat();
+
+        var summary_index: usize = 0;
+        while (summary_index < self.summaries.len) {
+            const cwd = self.summaries[summary_index].cwd;
+            const end = projectEnd(self.summaries, summary_index);
+            if (projectMatches(self.summaries[summary_index..end], self.filter)) {
+                const folded = projectFolded(self.folded_projects, cwd);
+                const has_children = matchingChildCount(self.summaries[summary_index..end], self.filter) > 0;
+                try self.appendProject(cwd, end - summary_index, folded, has_children);
+                if (!folded) {
+                    const last_child = lastMatchingChild(self.summaries[summary_index..end], self.filter) orelse summary_index;
+                    var child_index = summary_index;
+                    while (child_index < end) : (child_index += 1) {
+                        const summary = &self.summaries[child_index];
+                        if (!matches(summary, self.filter)) continue;
+                        try self.appendSession(summary, child_index - summary_index == last_child, true);
+                    }
+                }
+            }
+            summary_index = end;
+        }
+    }
+
+    fn buildFlat(self: *RowBuilder) !void {
         for (self.summaries) |*summary| {
             if (!matches(summary, self.filter)) continue;
-            rows[index] = .{
-                .io = self.io,
-                .summary = summary,
-                .selected = index == self.selection,
-                .global = self.global,
-            };
-            widgets[index] = rows[index].widget();
-            index += 1;
+            try self.appendSession(summary, false, false);
         }
-        return widgets;
+    }
+
+    fn appendProject(self: *RowBuilder, cwd: []const u8, count: usize, folded: bool, has_children: bool) !void {
+        const prefix = try tree_art.buildPrefix(self.ctx.arena, 0, false, &.{}, false, false, has_children);
+        self.rows[self.index] = .{
+            .io = self.io,
+            .kind = .{ .project = .{ .cwd = cwd, .session_count = @intCast(@min(count, std.math.maxInt(u32))), .folded = folded, .prefix = prefix } },
+            .selected = self.index == self.selection,
+        };
+        self.widgets[self.index] = self.rows[self.index].widget();
+        self.index += 1;
+    }
+
+    fn appendSession(self: *RowBuilder, summary: *const session_mod.SessionSummary, last: bool, tree: bool) !void {
+        var last_at_indent = [_]bool{false} ** (tree_art.max_levels + 2);
+        const prefix = if (tree)
+            try tree_art.buildPrefix(self.ctx.arena, 1, last, last_at_indent[0..], false, false, false)
+        else
+            "";
+        self.rows[self.index] = .{
+            .io = self.io,
+            .kind = .{ .session = .{ .summary = summary, .prefix = prefix } },
+            .selected = self.index == self.selection,
+        };
+        self.widgets[self.index] = self.rows[self.index].widget();
+        self.index += 1;
     }
 };
 
 const Row = struct {
     io: std.Io,
-    summary: *const session_mod.SessionSummary,
+    kind: Kind,
     selected: bool,
-    global: bool,
+
+    const Kind = union(enum) {
+        project: Project,
+        session: Session,
+    };
+
+    const Session = struct {
+        summary: *const session_mod.SessionSummary,
+        prefix: []const u8,
+    };
+
+    const Project = struct {
+        cwd: []const u8,
+        session_count: u32,
+        folded: bool,
+        prefix: []const u8,
+    };
 
     fn widget(self: *Row) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -64,48 +152,126 @@ const Row = struct {
         const self: *Row = @ptrCast(@alignCast(ptr));
         const width = ctx.max.width orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
-        var buffer: [128]u8 = undefined;
-        const modified = tui_status.modifiedTime(self.io, buffer[0..], self.summary.updated_at_ms);
-        const left = try self.leftText(ctx, width, modified);
-        try panel.commandLine(&surface, 0, left, ctx, self.selected);
-        try panel.right(&surface, 0, modified, ctx, self.selected);
+        switch (self.kind) {
+            .project => |project| try self.drawProject(&surface, ctx, project),
+            .session => |session| try self.drawSession(&surface, ctx, session),
+        }
         return surface;
     }
 
-    fn leftText(self: *const Row, ctx: vxfw.DrawContext, width: u16, modified: []const u8) ![]const u8 {
+    fn drawProject(self: *Row, surface: *vxfw.Surface, ctx: vxfw.DrawContext, project: Project) !void {
+        const marker = if (self.selected) "‣ " else "  ";
+        _ = project.folded;
+        const name = baseName(project.cwd);
+        const left = try std.fmt.allocPrint(ctx.arena, "{s}{s}{s} ({d})", .{ marker, project.prefix, name, project.session_count });
+        try panel.commandLine(surface, 0, left, ctx, self.selected);
+    }
+
+    fn drawSession(self: *Row, surface: *vxfw.Surface, ctx: vxfw.DrawContext, session: Session) !void {
+        var buffer: [128]u8 = undefined;
+        const modified = tui_status.modifiedTime(self.io, buffer[0..], session.summary.updated_at_ms);
+        const left = try self.sessionLeftText(ctx, surface.size.width, modified, session);
+        try panel.commandLine(surface, 0, left, ctx, self.selected);
+        try panel.right(surface, 0, modified, ctx, self.selected);
+    }
+
+    fn sessionLeftText(self: *const Row, ctx: vxfw.DrawContext, width: u16, modified: []const u8, session: Session) ![]const u8 {
         const marker = if (self.selected) "‣ " else "  ";
         const available = resumeLeftWidth(ctx, width, modified);
-        const marker_width = ctx.stringWidth(marker);
-        if (available <= marker_width) return ctx.arena.dupe(u8, marker);
+        const prefix_width = ctx.stringWidth(marker) + ctx.stringWidth(session.prefix);
+        if (available <= prefix_width) return ctx.arena.dupe(u8, marker);
 
-        const name = self.summary.title orelse "Untitled";
-        if (!self.global) {
-            const title = try truncateText(ctx, name, available - marker_width);
-            return std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ marker, title });
-        }
-
-        const separator = symbols.separator_dot_padded;
-        const separator_width = ctx.stringWidth(separator);
-        if (available <= marker_width + separator_width + 4) {
-            const title = try truncateText(ctx, name, available - marker_width);
-            return std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ marker, title });
-        }
-
-        const content_width = available - marker_width - separator_width;
-        const title_width = @max(@as(usize, 8), content_width / 2);
-        const path_width = content_width - @min(title_width, content_width);
-        const title = try truncateText(ctx, name, @min(title_width, content_width));
-        const path = try truncateText(ctx, self.summary.cwd, path_width);
-        return std.fmt.allocPrint(ctx.arena, "{s}{s}{s}{s}", .{ marker, title, separator, path });
+        const name = session.summary.title orelse "Untitled";
+        const title = try truncateText(ctx, name, available - prefix_width);
+        return std.fmt.allocPrint(ctx.arena, "{s}{s}{s}", .{ marker, session.prefix, title });
     }
 };
 
-pub fn visibleCount(summaries: []const session_mod.SessionSummary, filter: []const u8) u32 {
+pub fn visibleCount(summaries: []const session_mod.SessionSummary, filter: []const u8, folded_projects: []const []const u8, tree_mode: bool) u32 {
+    if (!tree_mode) return flatVisibleCount(summaries, filter);
+
+    var count: u32 = 0;
+    var index: usize = 0;
+    while (index < summaries.len) {
+        const cwd = summaries[index].cwd;
+        const end = projectEnd(summaries, index);
+        if (projectMatches(summaries[index..end], filter)) {
+            count += 1;
+            if (!projectFolded(folded_projects, cwd)) {
+                var child_index = index;
+                while (child_index < end) : (child_index += 1) {
+                    if (matches(&summaries[child_index], filter)) count += 1;
+                }
+            }
+        }
+        index = end;
+    }
+    return count;
+}
+
+fn flatVisibleCount(summaries: []const session_mod.SessionSummary, filter: []const u8) u32 {
     var count: u32 = 0;
     for (summaries) |*summary| {
         if (matches(summary, filter)) count += 1;
     }
     return count;
+}
+
+pub fn selectedSummary(summaries: []const session_mod.SessionSummary, filter: []const u8, folded_projects: []const []const u8, selection: u32, tree_mode: bool) ?*const session_mod.SessionSummary {
+    if (!tree_mode) return selectedFlatSummary(summaries, filter, selection);
+
+    var row: u32 = 0;
+    var index: usize = 0;
+    while (index < summaries.len) {
+        const cwd = summaries[index].cwd;
+        const end = projectEnd(summaries, index);
+        if (projectMatches(summaries[index..end], filter)) {
+            if (row == selection) return null;
+            row += 1;
+            if (!projectFolded(folded_projects, cwd)) {
+                var child_index = index;
+                while (child_index < end) : (child_index += 1) {
+                    const summary = &summaries[child_index];
+                    if (!matches(summary, filter)) continue;
+                    if (row == selection) return summary;
+                    row += 1;
+                }
+            }
+        }
+        index = end;
+    }
+    return null;
+}
+
+fn selectedFlatSummary(summaries: []const session_mod.SessionSummary, filter: []const u8, selection: u32) ?*const session_mod.SessionSummary {
+    var row: u32 = 0;
+    for (summaries) |*summary| {
+        if (!matches(summary, filter)) continue;
+        if (row == selection) return summary;
+        row += 1;
+    }
+    return null;
+}
+
+pub fn selectedProject(summaries: []const session_mod.SessionSummary, filter: []const u8, folded_projects: []const []const u8, selection: u32) ?[]const u8 {
+    var row: u32 = 0;
+    var index: usize = 0;
+    while (index < summaries.len) {
+        const cwd = summaries[index].cwd;
+        const end = projectEnd(summaries, index);
+        if (projectMatches(summaries[index..end], filter)) {
+            if (row == selection) return cwd;
+            row += 1;
+            if (!projectFolded(folded_projects, cwd)) {
+                var child_index = index;
+                while (child_index < end) : (child_index += 1) {
+                    if (matches(&summaries[child_index], filter)) row += 1;
+                }
+            }
+        }
+        index = end;
+    }
+    return null;
 }
 
 pub fn matches(summary: *const session_mod.SessionSummary, filter: []const u8) bool {
@@ -118,6 +284,54 @@ pub fn matches(summary: *const session_mod.SessionSummary, filter: []const u8) b
     return false;
 }
 
+fn projectMatches(summaries: []const session_mod.SessionSummary, filter: []const u8) bool {
+    if (filter.len == 0) return true;
+    for (summaries) |*summary| {
+        if (matches(summary, filter)) return true;
+    }
+    return false;
+}
+
+fn lastMatchingChild(summaries: []const session_mod.SessionSummary, filter: []const u8) ?usize {
+    var last: ?usize = null;
+    for (summaries, 0..) |*summary, index| {
+        if (matches(summary, filter)) last = index;
+    }
+    return last;
+}
+
+fn matchingChildCount(summaries: []const session_mod.SessionSummary, filter: []const u8) u32 {
+    var count: u32 = 0;
+    for (summaries) |*summary| {
+        if (matches(summary, filter)) count += 1;
+    }
+    return count;
+}
+
+fn projectEnd(summaries: []const session_mod.SessionSummary, start: usize) usize {
+    const cwd = summaries[start].cwd;
+    var index = start + 1;
+    while (index < summaries.len) : (index += 1) {
+        if (!std.mem.eql(u8, summaries[index].cwd, cwd)) break;
+    }
+    return index;
+}
+
+pub fn projectFolded(folded_projects: []const []const u8, cwd: []const u8) bool {
+    for (folded_projects) |folded| {
+        if (std.mem.eql(u8, folded, cwd)) return true;
+    }
+    return false;
+}
+
+fn baseName(path: []const u8) []const u8 {
+    if (path.len == 0) return path;
+    var end = path.len;
+    while (end > 1 and path[end - 1] == '/') end -= 1;
+    if (std.mem.lastIndexOfScalar(u8, path[0..end], '/')) |index| return path[index + 1 .. end];
+    return path[0..end];
+}
+
 fn resumeLeftWidth(ctx: vxfw.DrawContext, row_width: u16, modified: []const u8) usize {
     const start_col = message.ConversationLayout.left -| 1;
     const end_col = row_width -| message.ConversationLayout.right;
@@ -125,6 +339,20 @@ fn resumeLeftWidth(ctx: vxfw.DrawContext, row_width: u16, modified: []const u8) 
     if (end_col <= start_col) return 0;
     if (date_width + 1 >= end_col - start_col) return 0;
     return end_col - start_col - date_width - 1;
+}
+
+test "session tree counts project rows and folds children" {
+    var summaries = [_]session_mod.SessionSummary{
+        .{ .id = @constCast("1"), .title = @constCast("one"), .cwd = @constCast("/repo/a"), .created_at_ms = 0, .updated_at_ms = 2, .leaf_entry_id = null },
+        .{ .id = @constCast("2"), .title = @constCast("two"), .cwd = @constCast("/repo/a"), .created_at_ms = 0, .updated_at_ms = 1, .leaf_entry_id = null },
+        .{ .id = @constCast("3"), .title = @constCast("three"), .cwd = @constCast("/repo/b"), .created_at_ms = 0, .updated_at_ms = 3, .leaf_entry_id = null },
+    };
+
+    try std.testing.expectEqual(@as(u32, 3), visibleCount(&summaries, "", &.{}, false));
+    try std.testing.expectEqual(@as(u32, 5), visibleCount(&summaries, "", &.{}, true));
+    try std.testing.expectEqual(@as(u32, 3), visibleCount(&summaries, "", &.{"/repo/a"}, true));
+    try std.testing.expect(selectedProject(&summaries, "", &.{}, 0) != null);
+    try std.testing.expect(selectedSummary(&summaries, "", &.{}, 1, true) != null);
 }
 
 fn truncateText(ctx: vxfw.DrawContext, text: []const u8, width: usize) ![]const u8 {
