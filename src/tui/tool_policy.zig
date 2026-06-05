@@ -10,11 +10,6 @@ pub const Policy = struct {
 
 const entries = [_]struct { name: []const u8, policy: Policy }{
     .{ .name = "bash", .policy = .{ .expand_by_default = false, .render = .plain } },
-    .{ .name = "read", .policy = .{ .expand_by_default = false, .render = .plain } },
-    .{ .name = "find", .policy = .{ .expand_by_default = false, .render = .plain } },
-    .{ .name = "grep", .policy = .{ .expand_by_default = false, .render = .plain } },
-    .{ .name = "write_file", .policy = .{ .expand_by_default = true, .render = .plain } },
-    .{ .name = "edit_file", .policy = .{ .expand_by_default = true, .render = .diff } },
 };
 
 comptime {
@@ -43,7 +38,7 @@ pub fn forName(name: []const u8) Policy {
 }
 
 test "unknown tools use a safe failure display policy" {
-    const policy = forName("read_file");
+    const policy = forName("unknown_tool");
     try std.testing.expect(policy.expand_by_default);
     try std.testing.expectEqual(thread_mod.Render.plain, policy.render);
 }
