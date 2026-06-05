@@ -17,7 +17,8 @@ TODOs and ideas for features to add to Nova coding agent.
 - Voice
 - Branch summarization
 - Model config profiles (e.g. rush)
-
-Current Tree bugs:
-- Agent text empty
-- Selection behaviour weird
+- large read outputs need to be written to temp file
+- Make rg available
+- Diffs
+- Worktrees
+- Tmux
