@@ -1724,8 +1724,10 @@ pub const App = struct {
         return lines;
     }
 
-    fn inputTextRows(self: *const App) u16 {
-        return self.inputVisualLines();
+    fn inputTextRows(self: *App, ctx: vxfw.DrawContext, width: u16) !u16 {
+        const text = try self.peekInput();
+        defer self.gpa.free(text);
+        return wrappedTextRows(ctx, text, width);
     }
 
     fn insertInputNewline(self: *App) !void {
@@ -2207,7 +2209,7 @@ const RootWidget = struct {
         const self: *RootWidget = @ptrCast(@alignCast(ptr));
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
-        const layout = rootLayout(max_height, false, self.app.inputTextRows());
+        const layout = rootLayout(max_height, false, try self.app.inputTextRows(ctx, max_width -| 4));
 
         var thread_view: ThreadWidget = .{ .app = self.app };
         var input_view: InputWidget = .{ .app = self.app };
@@ -2832,7 +2834,9 @@ const CommandInputText = struct {
 
     fn drawInputText(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *CommandInputText = @ptrCast(@alignCast(ptr));
-        if (self.app.inputVisualLines() <= 1) {
+        const width = ctx.max.width orelse 0;
+        const rows = try self.app.inputTextRows(ctx, width);
+        if (rows <= 1) {
             var surface = try self.app.input.draw(ctx);
             try tintCommandInput(&surface, self.app, ctx);
             return surface;
@@ -2849,38 +2853,21 @@ const CommandInputText = struct {
         const first = self.app.input.buf.firstHalf();
         const second = self.app.input.buf.secondHalf();
 
-        var cursor_line: u16 = 0;
-        for (first) |byte| if (byte == '\n') {
-            cursor_line += 1;
-        };
-        const last_nl = std.mem.lastIndexOfScalar(u8, first, '\n');
-        const cursor_prefix = if (last_nl) |idx| first[idx + 1 ..] else first;
-        const cursor_col: u16 = @intCast(@min(ctx.stringWidth(cursor_prefix), @as(usize, width -| 1)));
-
-        var total_lines: u16 = 1;
-        for (first) |byte| if (byte == '\n') {
-            total_lines += 1;
-        };
-        for (second) |byte| if (byte == '\n') {
-            total_lines += 1;
-        };
-
-        const first_visible = firstVisibleLine(cursor_line, total_lines, height);
-
         const combined = try ctx.arena.alloc(u8, first.len + second.len);
         @memcpy(combined[0..first.len], first);
         @memcpy(combined[first.len..], second);
 
-        var line_index: u16 = 0;
-        var iter = std.mem.splitScalar(u8, combined, '\n');
-        while (iter.next()) |line| : (line_index += 1) {
-            if (line_index < first_visible) continue;
-            const row = line_index - first_visible;
-            if (row >= height) break;
-            drawInputLineClipped(&surface, ctx, row, line, width);
-        }
+        const cursor_pos = wrappedTextPositionAt(ctx, combined, first.len, width);
+        const total_lines = wrappedTextRows(ctx, combined, width);
+        const first_visible = firstVisibleLine(cursor_pos.row, total_lines, height);
 
-        surface.cursor = .{ .row = cursor_line -| first_visible, .col = cursor_col };
+        drawInputWrapped(&surface, ctx, combined, .{
+            .first_visible = first_visible,
+            .height = height,
+            .width = width,
+        });
+
+        surface.cursor = .{ .row = cursor_pos.row -| first_visible, .col = cursor_pos.col };
         return surface;
     }
 };
@@ -2916,17 +2903,148 @@ fn firstVisibleLine(cursor_line: u16, total: u16, visible: u16) u16 {
     return @min(cursor_line - visible + 1, total - visible);
 }
 
-fn drawInputLineClipped(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, text: []const u8, width: u16) void {
+const WrappedTextPosition = struct {
+    row: u16,
+    col: u16,
+};
+
+const WrappedInputDraw = struct {
+    first_visible: u16,
+    height: u16,
+    width: u16,
+};
+
+fn wrappedTextRows(ctx: vxfw.DrawContext, text: []const u8, width: u16) u16 {
+    return wrappedTextPositionAt(ctx, text, text.len, width).row + 1;
+}
+
+fn wrappedTextPositionAt(ctx: vxfw.DrawContext, text: []const u8, cursor: usize, width: u16) WrappedTextPosition {
+    if (width == 0) return .{ .row = 0, .col = 0 };
+
+    var row: u16 = 0;
     var col: u16 = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        if (cursor <= index) return .{ .row = row, .col = col };
+        if (text[index] == '\n') {
+            row += 1;
+            col = 0;
+            index += 1;
+            continue;
+        }
+
+        const spaces_start = index;
+        while (index < text.len and wrapSpace(text[index])) index += 1;
+        if (cursor <= index) return advancePosition(ctx, text[spaces_start..cursor], row, col, width);
+
+        const spaces = text[spaces_start..index];
+        const word_start = index;
+        while (index < text.len and text[index] != '\n' and !wrapSpace(text[index])) index += 1;
+        const word = text[word_start..index];
+        if (word.len == 0) {
+            const pos = advancePosition(ctx, spaces, row, col, width);
+            row = pos.row;
+            col = pos.col;
+            continue;
+        }
+
+        const spaces_width: u16 = @intCast(ctx.stringWidth(spaces));
+        const word_width: u16 = @intCast(ctx.stringWidth(word));
+        if (col > 0) {
+            if (col + spaces_width + word_width > width) {
+                row += 1;
+                col = 0;
+            } else {
+                col = @min(width, col + spaces_width);
+            }
+        }
+        if (cursor <= index) return advancePosition(ctx, text[word_start..cursor], row, col, width);
+
+        const pos = advancePosition(ctx, word, row, col, width);
+        row = pos.row;
+        col = pos.col;
+    }
+    return .{ .row = row, .col = col };
+}
+
+fn advancePosition(ctx: vxfw.DrawContext, text: []const u8, row_start: u16, col_start: u16, width: u16) WrappedTextPosition {
+    var row = row_start;
+    var col = col_start;
     var iter = ctx.graphemeIterator(text);
     while (iter.next()) |grapheme| {
         const bytes = grapheme.bytes(text);
-        const w: u16 = @intCast(ctx.stringWidth(bytes));
-        if (w == 0) continue;
-        if (col + w > width) break;
-        surface.writeCell(col, row, .{ .char = .{ .grapheme = bytes, .width = @intCast(w) } });
-        col += w;
+        const cell_width: u16 = @intCast(ctx.stringWidth(bytes));
+        if (cell_width == 0) continue;
+        if (col + cell_width > width) {
+            row += 1;
+            col = 0;
+        }
+        col = @min(width, col + cell_width);
     }
+    return .{ .row = row, .col = col };
+}
+
+fn drawInputWrapped(surface: *vxfw.Surface, ctx: vxfw.DrawContext, text: []const u8, draw: WrappedInputDraw) void {
+    if (draw.width == 0) return;
+
+    var row: u16 = 0;
+    var col: u16 = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == '\n') {
+            row += 1;
+            col = 0;
+            index += 1;
+            continue;
+        }
+
+        const spaces_start = index;
+        while (index < text.len and wrapSpace(text[index])) index += 1;
+        const spaces = text[spaces_start..index];
+
+        const word_start = index;
+        while (index < text.len and text[index] != '\n' and !wrapSpace(text[index])) index += 1;
+        const word = text[word_start..index];
+        if (word.len == 0) {
+            drawRunWrapped(surface, ctx, spaces, draw, &row, &col);
+            continue;
+        }
+
+        const spaces_width: u16 = @intCast(ctx.stringWidth(spaces));
+        const word_width: u16 = @intCast(ctx.stringWidth(word));
+        if (col > 0) {
+            if (col + spaces_width + word_width > draw.width) {
+                row += 1;
+                col = 0;
+            } else {
+                drawRunWrapped(surface, ctx, spaces, draw, &row, &col);
+            }
+        }
+        drawRunWrapped(surface, ctx, word, draw, &row, &col);
+    }
+}
+
+fn drawRunWrapped(surface: *vxfw.Surface, ctx: vxfw.DrawContext, text: []const u8, draw: WrappedInputDraw, row: *u16, col: *u16) void {
+    var iter = ctx.graphemeIterator(text);
+    while (iter.next()) |grapheme| {
+        const bytes = grapheme.bytes(text);
+        const cell_width: u16 = @intCast(ctx.stringWidth(bytes));
+        if (cell_width == 0) continue;
+        if (col.* + cell_width > draw.width) {
+            row.* += 1;
+            col.* = 0;
+        }
+        if (row.* >= draw.first_visible) {
+            const visible_row = row.* - draw.first_visible;
+            if (visible_row >= draw.height) break;
+            surface.writeCell(col.*, visible_row, .{ .char = .{ .grapheme = bytes, .width = @intCast(cell_width) } });
+        }
+        col.* = @min(draw.width, col.* + cell_width);
+    }
+}
+
+fn wrapSpace(byte: u8) bool {
+    return byte == ' ' or byte == '\t';
 }
 
 const InputWidget = struct {
@@ -2947,7 +3065,8 @@ const InputWidget = struct {
         const queued_visible = self.app.queued_user_messages.items.len > 0;
         const input_row: u16 = if (queued_visible) 1 else 0;
         const avail: u16 = height -| input_row;
-        const text_rows: u16 = @min(self.app.inputTextRows(), @max(@as(u16, 1), avail -| 2));
+        const input_width = max_width -| 4;
+        const text_rows: u16 = @min(try self.app.inputTextRows(ctx, input_width), @max(@as(u16, 1), avail -| 2));
         const border_height: u16 = text_rows + 2;
 
         if (height <= input_row + border_height) {
@@ -3110,16 +3229,47 @@ test "input text rows track the line count" {
     var app = App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 100, .height = 30 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
     try std.testing.expectEqual(@as(u16, 1), app.inputVisualLines());
-    try std.testing.expectEqual(@as(u16, 1), app.inputTextRows());
+    try std.testing.expectEqual(@as(u16, 1), try app.inputTextRows(ctx, 80));
 
     try app.input.insertSliceAtCursor("a\nb\nc");
     try std.testing.expectEqual(@as(u16, 3), app.inputVisualLines());
-    try std.testing.expectEqual(@as(u16, 3), app.inputTextRows());
+    try std.testing.expectEqual(@as(u16, 3), try app.inputTextRows(ctx, 80));
+
+    try app.input.insertSliceAtCursor("defgh");
+    try std.testing.expectEqual(@as(u16, 4), try app.inputTextRows(ctx, 4));
 
     // The input keeps growing with the line count (no fixed cap).
     try app.input.insertSliceAtCursor("\n\n\n\n\n\n\n\n");
-    try std.testing.expectEqual(@as(u16, 11), app.inputTextRows());
+    try std.testing.expectEqual(@as(u16, 12), try app.inputTextRows(ctx, 4));
+}
+
+test "input wrapping uses word breaks" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 100, .height = 30 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const text = "hello world";
+    try std.testing.expectEqual(@as(u16, 2), wrappedTextRows(ctx, text, 10));
+
+    const cursor = wrappedTextPositionAt(ctx, text, "hello wo".len, 10);
+    try std.testing.expectEqual(@as(u16, 1), cursor.row);
+    try std.testing.expectEqual(@as(u16, 2), cursor.col);
 }
 
 test "arrow up and down move the input cursor between lines" {
