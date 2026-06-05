@@ -4,7 +4,7 @@ Seamless-loop ASCII black-hole frame generator for Nova's startup animation.
 
 Regenerate the frames consumed by `src/tui/blackhole.zig` with:
 
-    uv run python tools/gen_blackhole.py --outdir src/assets/blackhole
+    uv run python utils/gen_blackhole.py --outdir src/assets/blackhole
 
 Writes numbered plain-ASCII frames (frame_000.txt ...). Frame N wraps cleanly to
 frame 0: all time-varying terms are integer harmonics of a single
