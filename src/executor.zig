@@ -22,8 +22,7 @@ pub const ToolResult = struct {
     name: []u8,
     /// Human channel — the Display label.
     display_label: []u8,
-    /// Human channel — the Display body (Diff view for edit_file, file
-    /// content for write_file, stripped stdout otherwise).
+    /// Human channel — the display body shown in the thread.
     display_body: []u8,
     /// Human channel — stderr text rendered in red below the body, or null.
     stderr: ?[]u8,
@@ -147,9 +146,9 @@ fn makeDisplayLabel(gpa: std.mem.Allocator, name: []const u8, args: []const u8) 
 }
 
 /// The human-facing body. Each tool owns its own display: when it sets a
-/// `display`, that IS the body (read strips its own anchors, edit_file renders
-/// a diff). Otherwise the body is the raw stdout, or a sentinel when there is
-/// none. The executor passes through — it knows nothing tool-specific.
+/// `display`, that is the body. Otherwise the body is the raw stdout, or a
+/// sentinel when there is none. The executor passes through; it knows nothing
+/// tool-specific.
 fn makeDisplayBody(gpa: std.mem.Allocator, result: tools.Output) ![]u8 {
     if (result.display) |display| return gpa.dupe(u8, display);
     if (result.stdout.len == 0) {

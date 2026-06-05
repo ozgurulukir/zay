@@ -944,7 +944,7 @@ test "openresponses routes parallel argument deltas by output index" {
 
     var call_seq: u64 = 0;
     try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"id\":\"item_a\",\"name\":\"bash\"}}", ai.StreamObserver.noop, &call_seq);
-    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_b\",\"id\":\"item_b\",\"name\":\"read\"}}", ai.StreamObserver.noop, &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_b\",\"id\":\"item_b\",\"name\":\"bash\"}}", ai.StreamObserver.noop, &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"command\\\":\"}", ai.StreamObserver.noop, &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"path\\\":\"}", ai.StreamObserver.noop, &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"\\\"pwd\\\"}\"}", ai.StreamObserver.noop, &call_seq);
@@ -956,4 +956,5 @@ test "openresponses routes parallel argument deltas by output index" {
     try std.testing.expectEqual(@as(usize, 2), turn.assistant.content.len);
     try std.testing.expectEqualStrings("{\"command\":\"pwd\"}", turn.assistant.content[0].tool_call.arguments);
     try std.testing.expectEqualStrings("{\"path\":\"src/main.zig\"}", turn.assistant.content[1].tool_call.arguments);
+    try std.testing.expectEqualStrings("bash", turn.assistant.content[1].tool_call.name);
 }

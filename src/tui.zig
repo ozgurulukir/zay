@@ -2460,9 +2460,9 @@ fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
     return std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
 }
 
-/// Non-path trailer lines in `search_mod` find output: the `+N more results`
-/// pagination footer and the empty-result marker. (The "ready" backend never
-/// emits the grep footer or the shell-fallback banner on this path.)
+/// Non-path trailer lines in `search_mod` path output: the `+N more results`
+/// pagination footer and the empty-result marker. The ready backend never emits
+/// content-search footers or shell-fallback banners on this path.
 fn isSearchFooter(line: []const u8) bool {
     return std.mem.startsWith(u8, line, "+") or
         std.mem.eql(u8, line, "0 results.");
@@ -4060,7 +4060,7 @@ test "loading does not reappear between content chunks" {
     try std.testing.expectEqual(.agent, app.thread.messages.items[1].kind);
 }
 
-test "structured tool keeps loading status while arguments stream" {
+test "bash tool waits for complete arguments while streaming" {
     const gpa = std.testing.allocator;
     var openai_compatible_client: openai_compatible_mod.Client = undefined;
     try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
@@ -4071,23 +4071,22 @@ test "structured tool keeps loading status while arguments stream" {
     var app = App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("write file");
+    try app.input.insertSliceAtCursor("list files");
     _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
-        .name = "write_file",
-        .arguments = "{\"path\":\"main.zig\",\"content\":\"const std = @import(\\\"std\\\");",
+        .name = "bash",
+        .arguments = "{\"command\":\"printf hello",
     } }));
-    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
-    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
 
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .name = "write_file",
-        .display_label = "write_file {\"path\":\"main.zig\",\"content\":\"const std = @import(\\\"std\\\");\"}",
-        .display_body = "Successfully wrote 27 bytes to main.zig\n",
+        .name = "bash",
+        .display_label = "printf hello",
+        .display_body = "hello",
     } }));
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
@@ -4244,7 +4243,7 @@ test "new tool response index creates a new thread row" {
     try std.testing.expectEqualStrings("$ pwd", app.thread.messages.items[2].title);
 }
 
-test "structured tool after batch replaces loading status" {
+test "bash tool after batch creates a new tool row" {
     const gpa = std.testing.allocator;
     var openai_compatible_client: openai_compatible_mod.Client = undefined;
     try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
@@ -4276,8 +4275,8 @@ test "structured tool after batch replaces loading status" {
 
     _ = try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
-        .name = "write_file",
-        .arguments = "{\"path\":\"main.zig\",\"content\":\"const std = @import(\\\"std\\\");",
+        .name = "bash",
+        .arguments = "{\"command\":\"printf done\"}",
     } });
 
     try std.testing.expectEqual(@as(usize, 3), app.thread.messages.items.len);
@@ -4467,7 +4466,7 @@ test "collapsed tool title wraps to visible rows" {
     var thread: thread_mod.Thread = .{};
     defer thread.deinit(gpa);
 
-    const index = try thread.startTool(gpa, "edit_file {\"input\":\"a very long patch document\"}");
+    const index = try thread.startTool(gpa, "python3 - <<'PY'\nprint('a very long patch document')\nPY");
     try std.testing.expect(!thread.messages.items[index].expanded);
     try std.testing.expect(messageRowsCached(&thread.messages.items[index], 12) > 3);
 }

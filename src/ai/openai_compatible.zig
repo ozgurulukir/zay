@@ -762,12 +762,9 @@ test "buildToolsJson produces a valid JSON array for the registry" {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value == .array);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"read\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"read_file\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"write_file\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"path\",\"content\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "`content` is the entire file body") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, ":50-200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"bash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"command\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "Shell command to run.") != null);
 }
 
 test "buildToolsJson substitutes {{hsep}} placeholders with ~" {

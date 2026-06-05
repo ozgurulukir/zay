@@ -5,8 +5,8 @@ const terminal_markdown = @import("terminal_markdown");
 const assert = std.debug.assert;
 
 /// How a tool's display body should be drawn in the TUI.
-///   - `.plain`: single muted-gray body (bash output, file reads, etc.).
-///   - `.diff`: per-line — `+` green, `-` red, others gray (edit_file only).
+///   - `.plain`: single muted-gray body.
+///   - `.diff`: per-line diff styling with `+` green, `-` red, others gray.
 /// Failure overrides everything to red at draw time.
 pub const Render = enum { plain, diff };
 
