@@ -116,23 +116,28 @@ pub const Content = struct {
     }
 
     fn drawCodex(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
-        const focused = self.state.selection == 0 and self.state.column == .provider;
-        const prefix = if (focused) "‣ " else "  ";
+        const row_selected = self.state.selection == 0;
+        const provider_focused = row_selected and self.state.column == .provider;
+        if (row_selected) panel.fillRow(surface, 0, StylePalette.selected);
+
+        const prefix = if (provider_focused) "‣ " else "  ";
         const base = try std.fmt.allocPrint(ctx.arena, "{s}OpenAI Codex", .{prefix});
-        try panel.commandLine(surface, 0, base, ctx, focused);
+        const base_style = if (provider_focused) StylePalette.selected_item else tui_style.onSelectionBg(StylePalette.thinking_body, row_selected);
+        try panel.lineStyledAt(surface, 0, base, ctx, message.ConversationLayout.left -| 1, base_style);
         if (self.codex_signed_in) {
             const badge_col: u16 = (message.ConversationLayout.left -| 1) +
                 @as(u16, @intCast(@min(ctx.stringWidth(base), @as(usize, std.math.maxInt(u16)))));
-            try panel.lineStyledAt(surface, 0, " [CONNECTED]", ctx, badge_col, tui_style.onSelectionBg(StylePalette.success, focused));
-            try self.drawSignOut(surface, ctx);
+            try panel.lineStyledAt(surface, 0, " [CONNECTED]", ctx, badge_col, tui_style.onSelectionBg(StylePalette.success, row_selected));
+            try self.drawSignOut(surface, ctx, row_selected);
         }
     }
 
-    fn drawSignOut(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
-        const focused = self.state.selection == 0 and self.state.column == .sign_out;
+    fn drawSignOut(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext, row_selected: bool) !void {
+        const focused = row_selected and self.state.column == .sign_out;
         const prefix = if (focused) "‣ " else "  ";
-        const text = try std.fmt.allocPrint(ctx.arena, "{s}Sign out", .{prefix});
-        try panel.lineAt(surface, 0, text, ctx, focused, panel.secondaryColumn(surface.size.width));
+        const text = try std.fmt.allocPrint(ctx.arena, "{s}Sign Out", .{prefix});
+        const style = if (focused) StylePalette.selected_item else tui_style.onSelectionBg(StylePalette.thinking_body, row_selected);
+        try panel.lineStyledAt(surface, 0, text, ctx, panel.secondaryColumn(surface.size.width), style);
     }
 
     fn drawForm(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
@@ -177,6 +182,47 @@ test "provider picker navigation reaches sign out only when signed in" {
     try std.testing.expectEqual(Column.provider, state.column);
     try std.testing.expect(state.handleKey(.{ .codepoint = vaxis.Key.right }, true));
     try std.testing.expectEqual(Column.sign_out, state.column);
+}
+
+test "provider picker keeps codex text visible when sign out is focused" {
+    var content: Content = .{
+        .state = .{ .selection = 0, .column = .sign_out },
+        .codex_signed_in = true,
+        .connected = &.{},
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 4 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try content.widget().draw(ctx);
+
+    try std.testing.expectEqualStrings("O", surface.readCell(message.ConversationLayout.left + 1, 0).char.grapheme);
+    try std.testing.expectEqualStrings("‣", surface.readCell(panel.secondaryColumn(surface.size.width), 0).char.grapheme);
+    try std.testing.expectEqual(StylePalette.selected.bg, surface.readCell(panel.secondaryColumn(surface.size.width) + 2, 0).style.bg);
+}
+
+test "provider picker keeps sign out on the selected row background" {
+    var content: Content = .{
+        .state = .{ .selection = 0, .column = .provider },
+        .codex_signed_in = true,
+        .connected = &.{},
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 4 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try content.widget().draw(ctx);
+
+    try std.testing.expectEqualStrings("S", surface.readCell(panel.secondaryColumn(surface.size.width) + 2, 0).char.grapheme);
+    try std.testing.expectEqual(StylePalette.selected.bg, surface.readCell(panel.secondaryColumn(surface.size.width) + 2, 0).style.bg);
 }
 
 test "provider picker selecting a catalogue row opens its form" {
