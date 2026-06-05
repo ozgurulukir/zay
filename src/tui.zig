@@ -1449,6 +1449,7 @@ pub const App = struct {
             self.closeAtSearch();
             return;
         };
+        self.startAtSearchBackend();
         self.at_active = true;
         if (!std.mem.eql(u8, active.query, self.at_query)) {
             // Dupe before freeing so a failed alloc leaves the old query intact.
@@ -1460,6 +1461,11 @@ pub const App = struct {
             self.at_selection = 0;
             try self.refreshAtResults();
         }
+    }
+
+    fn startAtSearchBackend(self: *App) void {
+        const cwd = if (self.runtime) |runtime| runtime.cwd else ".";
+        search_mod.start(std.heap.smp_allocator, self.io, cwd);
     }
 
     fn refreshAtResults(self: *App) !void {
