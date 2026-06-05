@@ -33,7 +33,9 @@ pub fn frame(index: usize) []const u8 {
     return frames[index % frame_count];
 }
 
-const Rgb = [3]u8;
+pub const Rgb = [3]u8;
+
+pub const orange: Rgb = .{ 255, 106, 61 };
 
 // Brightness ramp -> warm accretion-disk gradient. Dim outer fringe in deep
 // red, hot inner core in near-white, with the glow (255,90,40) and accent
@@ -47,7 +49,7 @@ const color_table = blk: {
     table['x'] = .{ 140, 28, 14 };
     table['+'] = .{ 224, 67, 26 }; // #e0431a
     table['='] = .{ 255, 90, 40 }; // glow
-    table['*'] = .{ 255, 106, 61 }; // accent #ff6a3d
+    table['*'] = orange; // accent #ff6a3d
     table['%'] = .{ 255, 138, 61 }; // #ff8a3d
     table['$'] = .{ 255, 138, 61 };
     table['@'] = .{ 255, 226, 194 }; // #ffe2c2 hot core

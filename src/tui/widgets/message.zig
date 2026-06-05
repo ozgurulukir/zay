@@ -8,6 +8,11 @@ const tui_metrics = @import("../metrics.zig");
 const tui_style = @import("../style.zig");
 const blackhole = @import("../blackhole.zig");
 
+const logo_text = @embedFile("../../assets/logo/logo.txt");
+const logo_connect_text = "/connect to begin building";
+const logo_gap: u16 = 8;
+const logo_row_offset: u16 = 7;
+
 const StylePalette = tui_style.Palette;
 const mergedSelectedStyle = tui_style.mergedSelectedStyle;
 const messageRowsCached = tui_metrics.messageRowsCached;
@@ -82,7 +87,7 @@ pub const MessageWidget = struct {
             .user => drawWrapped(surface, self.message.body, StylePalette.user, styled_as_selected, &row, ctx, 2, StylePalette.user),
             .agent => drawMarkdown(self, surface, styled_as_selected, &row, ctx),
             .notice => drawWrapped(surface, self.message.body, StylePalette.tool_failed, styled_as_selected, &row, ctx, 2, StylePalette.tool_failed),
-            .logo => drawBlackhole(surface, self.blackhole_frame, &row, ctx),
+            .logo => drawIntro(surface, self.blackhole_frame, &row, ctx),
             .tool => {
                 const title_style = if (self.message.failed) StylePalette.tool_failed else StylePalette.tool;
                 drawWrapped(surface, self.message.title, title_style, styled_as_selected, &row, ctx, 0, null);
@@ -110,17 +115,41 @@ pub const MessageWidget = struct {
         row.* += 1;
     }
 
-    fn drawBlackhole(surface: *vxfw.Surface, frame_index: u16, row: *u16, ctx: vxfw.DrawContext) void {
-        _ = ctx;
+    fn drawIntro(surface: *vxfw.Surface, frame_index: u16, row: *u16, ctx: vxfw.DrawContext) void {
+        const row_start = row.*;
+        drawBlackhole(surface, frame_index, row_start);
+        drawLogo(surface, row_start + logo_row_offset, ctx);
+        row.* = row_start + blackhole.rows;
+    }
+
+    fn drawBlackhole(surface: *vxfw.Surface, frame_index: u16, row_start: u16) void {
         const data = blackhole.frame(frame_index);
+        var row = row_start;
         var line_start: usize = 0;
         while (line_start <= data.len) {
             const line_end = std.mem.findScalarPos(u8, data, line_start, '\n') orelse data.len;
-            writeBlackholeLine(surface, data[line_start..line_end], row.*);
-            row.* += 1;
+            writeBlackholeLine(surface, data[line_start..line_end], row);
+            row += 1;
             if (line_end == data.len) break;
             line_start = line_end + 1;
         }
+    }
+
+    fn drawLogo(surface: *vxfw.Surface, row_start: u16, ctx: vxfw.DrawContext) void {
+        const col_start = ConversationLayout.left + blackhole.cols + logo_gap;
+        if (col_start >= surface.size.width -| ConversationLayout.right) return;
+
+        var row = row_start;
+        var line_start: usize = 0;
+        while (line_start <= logo_text.len) {
+            const line_end = std.mem.findScalarPos(u8, logo_text, line_start, '\n') orelse logo_text.len;
+            writeLogoLine(surface, logo_text[line_start..line_end], row, col_start, ctx);
+            row += 1;
+            if (line_end == logo_text.len) break;
+            line_start = line_end + 1;
+        }
+
+        writeLogoLine(surface, logo_connect_text, row + 1, col_start, ctx);
     }
 
     // Frames are single-width ASCII, so we walk bytes directly (no grapheme
@@ -140,6 +169,25 @@ pub const MessageWidget = struct {
                 });
             }
             col += 1;
+        }
+    }
+
+    fn writeLogoLine(surface: *vxfw.Surface, line: []const u8, row: u16, col_start: u16, ctx: vxfw.DrawContext) void {
+        if (row >= surface.size.height) return;
+        var col = col_start;
+        const col_limit = surface.size.width -| ConversationLayout.right;
+        var iter = ctx.graphemeIterator(line);
+        while (iter.next()) |grapheme| {
+            if (col >= col_limit) return;
+            const bytes = grapheme.bytes(line);
+            const width: u16 = @intCast(ctx.stringWidth(bytes));
+            if (width == 0) continue;
+            if (col + width > col_limit) return;
+            surface.writeCell(col, row, .{
+                .char = .{ .grapheme = bytes, .width = @intCast(width) },
+                .style = .{ .fg = .{ .rgb = blackhole.orange } },
+            });
+            col += width;
         }
     }
 
@@ -233,7 +281,6 @@ pub const MessageWidget = struct {
             col += width;
         }
     }
-
 };
 
 fn drawMarkdown(
