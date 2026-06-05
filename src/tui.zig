@@ -265,13 +265,12 @@ pub const App = struct {
     pub fn beginSubmit(self: *App) !bool {
         self.closeAtSearch();
         self.block_nav = false;
-        if (self.turn.isActive()) return try self.enqueueSubmit();
         // If a previous turn was Esc-interrupted, force-cancel its worker
         // before starting a new one. Two concurrent workers would race on
         // the shared agent message history.
         if (self.turn.state == .interrupting) self.discardAbandonedTurn();
+        if (self.turn.isActive()) return try self.enqueueSubmit();
         const prompt = try self.input.toOwnedSlice();
-        self.resetInputChangeTracking();
         defer self.gpa.free(prompt);
         if (prompt.len == 0) return false;
 
@@ -1014,6 +1013,7 @@ pub const App = struct {
     }
 
     fn applySelectedModel(self: *App) !void {
+        if (self.turn.state == .interrupting) self.discardAbandonedTurn();
         if (self.turn.isActive()) return error.InFlightTurn;
         const model = self.selectedCodexModel() orelse return error.NoModels;
         const effort = self.selectedReasoningEffort();
@@ -1440,7 +1440,6 @@ pub const App = struct {
 
     fn clearInput(self: *App) void {
         self.input.clearRetainingCapacity();
-        self.resetInputChangeTracking();
     }
 
     /// Recompute the `@`-mention popup from the text before the cursor. Called
@@ -1503,7 +1502,6 @@ pub const App = struct {
         defer self.gpa.free(insert);
         self.input.buf.growGapLeft(before.len - active.start);
         try self.input.insertSliceAtCursor(insert);
-        self.resetInputChangeTracking();
         self.closeAtSearch();
     }
 
@@ -1568,15 +1566,8 @@ pub const App = struct {
         self.queued_user_messages.clearRetainingCapacity();
     }
 
-    fn resetInputChangeTracking(self: *App) void {
-        self.input.buf.allocator.free(self.input.previous_val);
-        self.input.previous_val = "";
-    }
-
     fn clearPaletteInput(self: *App) void {
         self.palette_input.clearRetainingCapacity();
-        self.palette_input.buf.allocator.free(self.palette_input.previous_val);
-        self.palette_input.previous_val = "";
     }
 
     fn peekPaletteInput(self: *App) ![]u8 {
@@ -1733,7 +1724,6 @@ pub const App = struct {
 
     fn insertInputNewline(self: *App) !void {
         try self.input.insertSliceAtCursor("\n");
-        self.resetInputChangeTracking();
         try self.updateAtSearch();
     }
 
@@ -3766,6 +3756,96 @@ test "explicit codex catalog loads before runtime is connected" {
 test "picker secondary column keeps related options close" {
     try std.testing.expectEqual(@as(u16, 50), pickerSecondaryColumn(100));
     try std.testing.expectEqual(@as(u16, 20), pickerSecondaryColumn(40));
+}
+
+test "typing slash can open command menu after input changed before" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{
+        .io = std.testing.io,
+        .alloc = arena.allocator(),
+        .cmds = .empty,
+    };
+
+    try app.input.widget().handleEvent(&ctx, .{ .key_press = .{ .codepoint = 'x', .text = "x" } });
+    app.input.clearRetainingCapacity();
+    app.turn.submit();
+    defer app.turn.reset();
+    try app.input.widget().handleEvent(&ctx, .{ .key_press = .{ .codepoint = '/', .text = "/" } });
+
+    try std.testing.expectEqual(App.Mode.command, app.mode);
+}
+
+test "reprompt after interrupt starts a fresh turn" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try app.input.insertSliceAtCursor("first");
+    try std.testing.expect(try app.beginSubmit());
+    if (app.pending_prompt) |prompt| app.worker_context.gpa.free(prompt);
+    app.pending_prompt = null;
+    try app.handleInterrupt();
+
+    try app.input.insertSliceAtCursor("second");
+    try std.testing.expect(try app.beginSubmit());
+    defer app.turn.reset();
+    defer {
+        if (app.pending_prompt) |prompt| app.worker_context.gpa.free(prompt);
+        app.pending_prompt = null;
+    }
+
+    try std.testing.expectEqual(Turn.State.active, app.turn.state);
+    try std.testing.expectEqual(@as(usize, 0), app.queued_user_messages.items.len);
+}
+
+test "model selection is allowed after interrupt" {
+    const gpa = std.testing.allocator;
+    var runtime: runtime_mod.AgentRuntime = undefined;
+    runtime.gpa = gpa;
+    runtime.io = std.testing.io;
+    runtime.cwd = ".";
+    runtime.home_dir = ".";
+    runtime.client = .none;
+    runtime.base_system_prompt = "test";
+    runtime.system_prompt = "test";
+    runtime.session_writer = undefined;
+    runtime.agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer runtime.agent.deinit();
+    runtime.diagnostics = &.{};
+    runtime.owned_client = null;
+    var app = App.init(std.testing.io, gpa, &runtime.agent);
+    app.runtime = &runtime;
+    defer app.deinit();
+    defer runtime.disconnectClient();
+
+    try app.models.append(gpa, .{ .id = try gpa.dupe(u8, "llama3"), .label = try gpa.dupe(u8, "llama3") }, .{ .openai_compatible = .ollama });
+    app.models.model_selection = 0;
+    app.cached_config_owned = true;
+    app.cached_config.base_url = try gpa.dupe(u8, "http://localhost:11434/v1");
+    app.cached_config.api_key = try gpa.dupe(u8, "ollama");
+    app.turn.submit();
+    app.turn.interrupt();
+
+    try app.applySelectedModel();
+
+    try std.testing.expectEqual(Turn.State.idle, app.turn.state);
+    try std.testing.expectEqual(config_mod.Provider.ollama, app.cached_config.provider.?);
 }
 
 test "command input segment ends at first space" {
