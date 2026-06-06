@@ -10,6 +10,10 @@ const tools_mod = @import("tools.zig");
 
 const assert = std.debug.assert;
 
+const codex_refresh_margin_ms: i64 = 5 * std.time.ms_per_min;
+
+pub const codex_connection_expired_message = "Codex connection expired. Run /connect to reconnect.";
+
 pub const AgentRuntime = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -21,6 +25,7 @@ pub const AgentRuntime = struct {
     session_writer: session_mod.SessionWriter,
     agent: agent_mod.Agent,
     diagnostics: []config_mod.Diagnostic,
+    codex_connection_expired: bool = false,
     owned_client: ?OwnedClient = null,
 
     const OwnedClient = union(enum) {
@@ -113,6 +118,7 @@ pub const AgentRuntime = struct {
             .session_writer = undefined,
             .agent = undefined,
             .diagnostics = diagnostics,
+            .codex_connection_expired = false,
         };
 
         if (session_id) |id| {
@@ -182,9 +188,30 @@ pub const AgentRuntime = struct {
         if (self.home_dir.len == 0) return;
         var creds = (codex_mod.load(self.gpa, self.io, self.home_dir) catch null) orelse return;
         defer creds.deinit(self.gpa);
+        try self.refreshCodexCredentialsIfNeeded(&creds);
+        if (self.codex_connection_expired) return;
         const model_id = if (config.model) |m| m.id else "gpt-5.5";
         const effort = if (config.model) |m| (m.reasoning_effort orelse .medium) else .medium;
         try self.connectCodexClient(creds, model_id, effort);
+    }
+
+    fn refreshCodexCredentialsIfNeeded(self: *AgentRuntime, creds: *codex_mod.Credentials) !void {
+        const now_ms = std.Io.Clock.now(.real, self.io).toMilliseconds();
+        if (!codexRefreshNeeded(creds.expires, now_ms)) {
+            self.codex_connection_expired = false;
+            return;
+        }
+        const refresh_token = try self.gpa.dupe(u8, creds.refresh);
+        defer self.gpa.free(refresh_token);
+        var refreshed = codex_mod.refresh(self.gpa, self.io, self.home_dir, refresh_token) catch |err| {
+            std.log.warn("codex.refresh.failed err={s}", .{@errorName(err)});
+            self.codex_connection_expired = true;
+            return;
+        };
+        creds.deinit(self.gpa);
+        creds.* = refreshed;
+        refreshed = undefined;
+        self.codex_connection_expired = false;
     }
 
     fn tryAttachOpenAiCompatibleFromConfig(
@@ -247,6 +274,7 @@ pub const AgentRuntime = struct {
         });
         errdefer client.deinit();
         self.replaceClient(.{ .codex_responses = client });
+        self.codex_connection_expired = false;
     }
 
     pub fn disconnectCodexClient(self: *AgentRuntime) void {
@@ -314,6 +342,7 @@ pub const AgentRuntime = struct {
     }
 
     fn replaceClient(self: *AgentRuntime, next: OwnedClient) void {
+        self.codex_connection_expired = false;
         if (self.owned_client) |old| old.deinit(self.gpa);
         self.owned_client = next;
         self.client = next.languageModel();
@@ -377,6 +406,10 @@ fn createSystemPromptWithContext(
     return system_prompt;
 }
 
+fn codexRefreshNeeded(expires_ms: i64, now_ms: i64) bool {
+    return expires_ms <= now_ms + codex_refresh_margin_ms;
+}
+
 const os_label: []const u8 = switch (builtin.os.tag) {
     .windows => "Windows",
     .linux => "Linux",
@@ -386,6 +419,13 @@ const os_label: []const u8 = switch (builtin.os.tag) {
     .openbsd => "OpenBSD",
     else => @tagName(builtin.os.tag),
 };
+
+test "codex refresh starts before token expiry" {
+    const now_ms: i64 = 10_000;
+    try std.testing.expect(codexRefreshNeeded(now_ms - 1, now_ms));
+    try std.testing.expect(codexRefreshNeeded(now_ms + codex_refresh_margin_ms, now_ms));
+    try std.testing.expect(!codexRefreshNeeded(now_ms + codex_refresh_margin_ms + 1, now_ms));
+}
 
 test "runtime selects responses adapter when requested" {
     const config: config_mod.Config = .{ .use_responses_endpoint = true };

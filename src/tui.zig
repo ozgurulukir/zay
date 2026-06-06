@@ -172,7 +172,8 @@ pub const App = struct {
         var app = init(io, gpa, &runtime.agent);
         app.runtime = runtime;
         app.owns_runtime = true;
-        app.codex_signed_in = runtime.hasCodexClient() or tui_provider.detectCodexSignIn(gpa, io, runtime.home_dir);
+        app.codex_signed_in = !runtime.codex_connection_expired and
+            (runtime.hasCodexClient() or tui_provider.detectCodexSignIn(gpa, io, runtime.home_dir));
         app.cached_config = config;
         app.cached_config_owned = true;
         return app;
@@ -332,6 +333,9 @@ pub const App = struct {
                 );
             }
             if (p == .openai) {
+                if (self.runtime) |rt| {
+                    if (rt.codex_connection_expired) return self.gpa.dupe(u8, runtime_mod.codex_connection_expired_message);
+                }
                 return self.gpa.dupe(u8, "No OpenAI Codex session — type /connect to sign in.");
             }
         }
@@ -934,6 +938,7 @@ pub const App = struct {
         const effort = self.selectedReasoningEffort();
         try self.connectCodexClient(credentials, model.id, effort);
         self.codex_signed_in = true;
+        self.runtime.?.codex_connection_expired = false;
         try self.persistModelSelection(.openai, model.id, effort, .global);
         self.mode = .normal;
         self.clearInput();
@@ -945,6 +950,7 @@ pub const App = struct {
         try codex.signOut(self.gpa, self.io, self.runtime.?.home_dir);
         self.runtime.?.disconnectCodexClient();
         self.codex_signed_in = false;
+        self.runtime.?.codex_connection_expired = false;
         self.agent.client = self.runtime.?.client;
         self.codexModelsClear();
         self.models.models_cached = false;
@@ -4147,6 +4153,24 @@ test "slash opens command menu when text field previous value is stale" {
 
     try std.testing.expectEqual(App.Mode.command, app.mode);
     try std.testing.expectEqual(@as(usize, 0), app.input.buf.realLength());
+}
+
+test "expired codex connection reports reconnect message" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var runtime: runtime_mod.AgentRuntime = undefined;
+    runtime.codex_connection_expired = true;
+    runtime.diagnostics = &.{};
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.runtime = &runtime;
+    app.cached_config = .{ .provider = .openai };
+
+    const message = try app.formatNoProviderMessage();
+    defer gpa.free(message);
+
+    try std.testing.expectEqualStrings(runtime_mod.codex_connection_expired_message, message);
 }
 
 test "typing slash can open command menu after input changed before" {
