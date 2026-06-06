@@ -5,6 +5,7 @@ const vxfw = vaxis.vxfw;
 const session_mod = @import("../../session.zig");
 const message = @import("message.zig");
 const panel = @import("panel.zig");
+const tui_style = @import("../style.zig");
 const tui_status = @import("../status.zig");
 const tree_art = @import("tree_art.zig");
 
@@ -96,7 +97,10 @@ const RowBuilder = struct {
     }
 
     fn appendProject(self: *RowBuilder, cwd: []const u8, count: usize, folded: bool, has_children: bool) !void {
-        const prefix = try tree_art.buildPrefix(self.ctx.arena, 0, false, &.{}, false, false, has_children);
+        const prefix = if (folded)
+            ""
+        else
+            try tree_art.buildPrefix(self.ctx.arena, 0, false, &.{}, false, false, has_children);
         self.rows[self.index] = .{
             .io = self.io,
             .kind = .{ .project = .{ .cwd = cwd, .session_count = @intCast(@min(count, std.math.maxInt(u32))), .folded = folded, .prefix = prefix } },
@@ -160,11 +164,27 @@ const Row = struct {
     }
 
     fn drawProject(self: *Row, surface: *vxfw.Surface, ctx: vxfw.DrawContext, project: Project) !void {
+        if (self.selected) panel.fillRow(surface, 0, tui_style.Palette.selected);
+
         const marker = if (self.selected) "‣ " else "  ";
-        _ = project.folded;
+        const start_col = message.ConversationLayout.left -| 1;
+        const marker_style = if (self.selected)
+            tui_style.Palette.selected_item
+        else
+            tui_style.Palette.thinking_body;
+        try panel.lineStyledAt(surface, 0, marker, ctx, start_col, marker_style);
+
+        var col: u16 = start_col + @as(u16, @intCast(ctx.stringWidth(marker)));
+        const prefix_style = tui_style.onSelectionBg(tui_style.Palette.thinking_body, self.selected);
+        try panel.lineStyledAt(surface, 0, project.prefix, ctx, col, prefix_style);
+        col += @intCast(ctx.stringWidth(project.prefix));
+
         const name = baseName(project.cwd);
-        const left = try std.fmt.allocPrint(ctx.arena, "{s}{s}{s} ({d})", .{ marker, project.prefix, name, project.session_count });
-        try panel.commandLine(surface, 0, left, ctx, self.selected);
+        try panel.lineStyledAt(surface, 0, name, ctx, col, tui_style.onSelectionBg(tui_style.Palette.markdown_code, self.selected));
+        col += @intCast(ctx.stringWidth(name));
+
+        const count = try std.fmt.allocPrint(ctx.arena, " ({d})", .{project.session_count});
+        try panel.lineStyledAt(surface, 0, count, ctx, col, prefix_style);
     }
 
     fn drawSession(self: *Row, surface: *vxfw.Surface, ctx: vxfw.DrawContext, session: Session) !void {
