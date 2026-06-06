@@ -2026,6 +2026,7 @@ pub fn run(
     _ = try app.thread.append(gpa, .logo, "logo", "");
 
     app.git_label = loadGitLabel(gpa, init.io, runtime.cwd) catch "";
+    _ = app.refreshDiffCounts() catch false;
 
     var root: RootWidget = .{ .app = &app };
     try fw_app.run(root.widget(), .{});
@@ -2348,6 +2349,7 @@ const RootWidget = struct {
         try self.app.worker_context.queue.drainInto(worker_io, worker_gpa, &batch);
 
         var visible_change = false;
+        var refresh_diff = false;
         for (batch.items) |event_ptr| {
             defer worker_gpa.destroy(event_ptr);
             defer event_ptr.deinit(worker_gpa);
@@ -2357,14 +2359,16 @@ const RootWidget = struct {
             // draining stays a single uniform path.
             if (self.app.thread_projection.awaiting_output) try self.ensureTick(ctx);
             switch (event_ptr.*) {
-                .tool_call_finished => {
-                    self.diff_refresh_pending = true;
-                    self.diff_tick_accum = 0;
-                },
+                .tool_call_finished => refresh_diff = true,
                 else => {},
             }
             if (try self.app.applyAgentEvent(event_ptr.*)) visible_change = true;
             if (self.app.thread_projection.awaiting_output) try self.ensureTick(ctx);
+        }
+        if (refresh_diff) {
+            self.diff_refresh_pending = false;
+            self.diff_tick_accum = 0;
+            if (try self.app.refreshDiffCounts()) visible_change = true;
         }
         return visible_change;
     }
@@ -2753,13 +2757,15 @@ const OverlayWidget = struct {
 };
 
 fn writeDiffCounts(surface: *vxfw.Surface, ctx: vxfw.DrawContext, counts: DiffCounts) void {
-    _ = ctx;
-    var additions_buf: [8]u8 = undefined;
-    var deletions_buf: [8]u8 = undefined;
-    const additions = std.fmt.bufPrint(&additions_buf, "+{d: >5}", .{@min(counts.additions, 99999)}) catch return;
-    const deletions = std.fmt.bufPrint(&deletions_buf, "-{d: >5}", .{@min(counts.deletions, 99999)}) catch return;
-    writeAscii(surface, additions, StylePalette.tool, 0);
-    writeAscii(surface, deletions, StylePalette.tool_failed, @intCast(additions.len + 1));
+    const additions = std.fmt.allocPrint(ctx.arena, "+{d}", .{@min(counts.additions, 99999)}) catch return;
+    const deletions = std.fmt.allocPrint(ctx.arena, "-{d}", .{@min(counts.deletions, 99999)}) catch return;
+    const total_width = additions.len + 1 + deletions.len;
+    const start_col: u16 = if (total_width >= surface.size.width)
+        0
+    else
+        @intCast(surface.size.width - total_width);
+    writeAscii(surface, additions, StylePalette.tool, start_col);
+    writeAscii(surface, deletions, StylePalette.tool_failed, start_col + @as(u16, @intCast(additions.len + 1)));
 }
 
 fn writeAscii(surface: *vxfw.Surface, text: []const u8, style: vaxis.Style, col_start: u16) void {
@@ -3376,21 +3382,45 @@ test "parse diff counts sums numstat and skips binary" {
     try std.testing.expectEqual(@as(u32, 1), counts.deletions);
 }
 
-test "diff count label keeps a fixed width" {
+test "diff count label is right aligned" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 13, .height = 1 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    var surface = try vxfw.Surface.init(ctx.arena, .{ .userdata = undefined, .drawFn = undefined }, .{ .width = 13, .height = 1 });
+
+    writeDiffCounts(&surface, ctx, .{ .additions = 1, .deletions = 12 });
+
+    try std.testing.expectEqualStrings(" ", surface.readCell(6, 0).char.grapheme);
+    try std.testing.expectEqualStrings("+", surface.readCell(7, 0).char.grapheme);
+    try std.testing.expectEqualStrings("1", surface.readCell(8, 0).char.grapheme);
+    try std.testing.expectEqualStrings(" ", surface.readCell(9, 0).char.grapheme);
+    try std.testing.expectEqualStrings("-", surface.readCell(10, 0).char.grapheme);
+    try std.testing.expectEqualStrings("1", surface.readCell(11, 0).char.grapheme);
+    try std.testing.expectEqualStrings("2", surface.readCell(12, 0).char.grapheme);
+}
+
+test "diff count labels keep signs next to numbers" {
     var small_add: [8]u8 = undefined;
     var small_del: [8]u8 = undefined;
     const small = DiffCounts{ .additions = 1, .deletions = 12 };
-    const small_additions = try std.fmt.bufPrint(&small_add, "+{d: >5}", .{@min(small.additions, 99999)});
-    const small_deletions = try std.fmt.bufPrint(&small_del, "-{d: >5}", .{@min(small.deletions, 99999)});
+    const small_additions = try std.fmt.bufPrint(&small_add, "+{d}", .{@min(small.additions, 99999)});
+    const small_deletions = try std.fmt.bufPrint(&small_del, "-{d}", .{@min(small.deletions, 99999)});
 
     var large_add: [8]u8 = undefined;
     var large_del: [8]u8 = undefined;
     const large = DiffCounts{ .additions = 12345, .deletions = 999999 };
-    const large_additions = try std.fmt.bufPrint(&large_add, "+{d: >5}", .{@min(large.additions, 99999)});
-    const large_deletions = try std.fmt.bufPrint(&large_del, "-{d: >5}", .{@min(large.deletions, 99999)});
+    const large_additions = try std.fmt.bufPrint(&large_add, "+{d}", .{@min(large.additions, 99999)});
+    const large_deletions = try std.fmt.bufPrint(&large_del, "-{d}", .{@min(large.deletions, 99999)});
 
-    try std.testing.expectEqual(small_additions.len, large_additions.len);
-    try std.testing.expectEqual(small_deletions.len, large_deletions.len);
+    try std.testing.expectEqualStrings("+1", small_additions);
+    try std.testing.expectEqualStrings("-12", small_deletions);
+    try std.testing.expectEqualStrings("+12345", large_additions);
+    try std.testing.expectEqualStrings("-99999", large_deletions);
 }
 
 test "root layout keeps input fixed when panel opens" {
