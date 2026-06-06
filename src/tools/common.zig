@@ -7,12 +7,50 @@ pub const Output = struct {
     stderr: []u8,
     code: u8,
     display: ?[]u8 = null,
+    observation: ?Observation = null,
 
     pub fn deinit(self: *Output, gpa: std.mem.Allocator) void {
         gpa.free(self.stdout);
         gpa.free(self.stderr);
         if (self.display) |display| gpa.free(display);
+        if (self.observation) |*observation| observation.deinit(gpa);
         self.* = undefined;
+    }
+};
+
+pub const Observation = union(enum) {
+    complete: []u8,
+    truncated_tail: TruncatedTail,
+
+    pub const TruncatedTail = struct {
+        text: []u8,
+        total_lines: u32,
+        shown_lines: u32,
+        total_bytes: u64,
+        shown_bytes: u32,
+        full_output_path: []u8,
+    };
+
+    pub fn deinit(self: *Observation, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .complete => |text| gpa.free(text),
+            .truncated_tail => |tail| {
+                gpa.free(tail.text);
+                gpa.free(tail.full_output_path);
+            },
+        }
+        self.* = undefined;
+    }
+
+    pub fn render(self: Observation, gpa: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+        return switch (self) {
+            .complete => |text| gpa.dupe(u8, text),
+            .truncated_tail => |tail| std.fmt.allocPrint(
+                gpa,
+                "{s}\n\n[Showing last {d} of {d} lines ({d} of {d} bytes). Full output: {s}]",
+                .{ tail.text, tail.shown_lines, tail.total_lines, tail.shown_bytes, tail.total_bytes, tail.full_output_path },
+            ),
+        };
     }
 };
 

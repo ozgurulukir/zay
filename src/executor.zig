@@ -128,6 +128,7 @@ pub const ExecutorService = struct {
 /// non-empty, else the literal "empty". When both are non-empty (typical
 /// for bash commands writing to both) concatenate so we don't drop signal.
 fn formatLlmObservation(gpa: std.mem.Allocator, result: tools.Output) ![]u8 {
+    if (result.observation) |observation| return observation.render(gpa);
     if (result.stdout.len > 0 and result.stderr.len > 0) {
         return std.fmt.allocPrint(gpa, "{s}\n{s}", .{ result.stdout, result.stderr });
     }

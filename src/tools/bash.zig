@@ -44,25 +44,33 @@ pub fn runTool(
         break :value command_cwd.?;
     } else cwd;
 
-    var env_map = if (args.env) |_| try currentEnvMap(gpa) else null;
-    defer if (env_map) |*map| map.deinit();
-    if (args.env) |env| try applyEnv(&env_map.?, env);
+    const output_path = tempOutputPath(gpa, io) catch return error.OutOfMemory;
+    var keep_output_file = false;
+    defer {
+        if (!keep_output_file) std.Io.Dir.deleteFile(.cwd(), io, output_path) catch {};
+        gpa.free(output_path);
+    }
 
-    const result = bash.runWithOptions(gpa, io, .{
+    var env_map = try currentEnvMap(gpa);
+    defer env_map.deinit();
+    if (args.env) |env| try applyEnv(&env_map, env);
+    try env_map.put("NOVA_BASH_OUTPUT", output_path);
+
+    const wrapped_command = wrapCommandForOutputFile(gpa, args.command) catch return error.OutOfMemory;
+    defer gpa.free(wrapped_command);
+
+    var run_result = bash.runWithOptions(gpa, io, .{
         .cwd = resolved_cwd,
-        .command = args.command,
-        .env_map = if (env_map) |*map| map else null,
+        .command = wrapped_command,
+        .env_map = &env_map,
         .timeout = bash.timeoutFromSeconds(args.timeout_seconds),
     }) catch |err| switch (err) {
-        error.Timeout => return common.failFmt(gpa, 124, "bash: command timed out after {d} seconds\n", .{args.timeout_seconds}),
+        error.Timeout => return finishBashOutput(gpa, io, output_path, 124, .{ .timeout_seconds = args.timeout_seconds }, &keep_output_file),
         else => return mapBashError(err),
     };
-    return .{
-        .stdout = result.stdout,
-        .stderr = result.stderr,
-        .code = result.code,
-        .display = result.display,
-    };
+    defer run_result.deinit(gpa);
+
+    return finishBashOutput(gpa, io, output_path, run_result.code, .{}, &keep_output_file);
 }
 
 const Args = struct {
@@ -169,6 +177,197 @@ fn applyEnv(map: *std.process.Environ.Map, env: std.json.Value) std.mem.Allocato
     }
 }
 
+const observation_lines_max: u32 = 2000;
+const observation_bytes_max: usize = 50 * 1024;
+const rolling_bytes_max: usize = observation_bytes_max * 2;
+
+const FinishStatus = struct {
+    timeout_seconds: ?u32 = null,
+};
+
+const TailSnapshot = struct {
+    text: []u8,
+    total_lines: u32,
+    shown_lines: u32,
+    total_bytes: u64,
+    shown_bytes: u32,
+    truncated: bool,
+    last_line_partial: bool,
+};
+
+fn finishBashOutput(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    output_path: []const u8,
+    code: u8,
+    status: FinishStatus,
+    keep_output_file: *bool,
+) common.Error!common.Output {
+    var snapshot = readTailSnapshot(gpa, io, output_path) catch |err| return mapBashError(err);
+    defer snapshotDeinit(gpa, &snapshot);
+
+    const observation_text = formatBashText(gpa, snapshot.text, code, status) catch return error.OutOfMemory;
+    var observation_text_moved = false;
+    errdefer if (!observation_text_moved) gpa.free(observation_text);
+
+    var observation: common.Observation = if (snapshot.truncated) truncated: {
+        const path = try gpa.dupe(u8, output_path);
+        errdefer gpa.free(path);
+        keep_output_file.* = true;
+        break :truncated .{ .truncated_tail = .{
+            .text = observation_text,
+            .total_lines = snapshot.total_lines,
+            .shown_lines = snapshot.shown_lines,
+            .total_bytes = snapshot.total_bytes,
+            .shown_bytes = snapshot.shown_bytes,
+            .full_output_path = path,
+        } };
+    } else .{ .complete = observation_text };
+    observation_text_moved = true;
+    errdefer observation.deinit(gpa);
+    const display_text = observation.render(gpa) catch return error.OutOfMemory;
+    errdefer gpa.free(display_text);
+
+    const stderr = try gpa.alloc(u8, 0);
+    errdefer gpa.free(stderr);
+    return .{
+        .stdout = display_text,
+        .stderr = stderr,
+        .code = code,
+        .display = null,
+        .observation = observation,
+    };
+}
+
+fn snapshotDeinit(gpa: std.mem.Allocator, snapshot: *TailSnapshot) void {
+    gpa.free(snapshot.text);
+    snapshot.* = undefined;
+}
+
+fn wrapCommandForOutputFile(gpa: std.mem.Allocator, command: []const u8) std.mem.Allocator.Error![]u8 {
+    return std.fmt.allocPrint(gpa, "exec >\"$NOVA_BASH_OUTPUT\" 2>&1\n{s}", .{command});
+}
+
+fn tempOutputPath(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
+    var random: [16]u8 = undefined;
+    io.random(&random);
+    const hex = std.fmt.bytesToHex(random, .lower);
+    const name = try std.fmt.allocPrint(gpa, "nova-bash-{s}.log", .{hex[0..]});
+    defer gpa.free(name);
+    return std.fs.path.join(gpa, &.{ "/tmp", name });
+}
+
+fn formatBashText(gpa: std.mem.Allocator, text: []const u8, code: u8, status: FinishStatus) std.mem.Allocator.Error![]u8 {
+    if (status.timeout_seconds) |seconds| {
+        if (text.len == 0) return std.fmt.allocPrint(gpa, "Command timed out after {d} seconds", .{seconds});
+        return std.fmt.allocPrint(gpa, "{s}\n\nCommand timed out after {d} seconds", .{ text, seconds });
+    }
+    if (code != 0) {
+        if (text.len == 0) return std.fmt.allocPrint(gpa, "Command exited with code {d}", .{code});
+        return std.fmt.allocPrint(gpa, "{s}\n\nCommand exited with code {d}", .{ text, code });
+    }
+    if (text.len == 0) return gpa.dupe(u8, "(no output)");
+    return gpa.dupe(u8, text);
+}
+
+fn readTailSnapshot(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !TailSnapshot {
+    var file = try std.Io.Dir.openFile(.cwd(), io, path, .{});
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    var tail: std.ArrayList(u8) = .empty;
+    errdefer tail.deinit(gpa);
+    var total_bytes: u64 = 0;
+    var newline_count: u32 = 0;
+    var ended_with_newline = false;
+    var buffer: [8192]u8 = undefined;
+    while (true) {
+        const read_count = reader.interface.readSliceShort(&buffer) catch |err| switch (err) {
+            error.ReadFailed => return reader.err.?,
+        };
+        if (read_count == 0) break;
+        const chunk = buffer[0..read_count];
+        total_bytes += read_count;
+        for (chunk) |byte| {
+            if (byte == '\n') newline_count += 1;
+        }
+        ended_with_newline = chunk[chunk.len - 1] == '\n';
+        try tail.appendSlice(gpa, chunk);
+        trimRollingTail(&tail);
+    }
+    const total_lines: u32 = if (total_bytes == 0) 0 else newline_count + @intFromBool(!ended_with_newline);
+    const text = try truncateTailBuffer(gpa, tail.items, total_lines, total_bytes);
+    tail.deinit(gpa);
+    return text;
+}
+
+fn trimRollingTail(tail: *std.ArrayList(u8)) void {
+    if (tail.items.len <= rolling_bytes_max * 2) return;
+    var start = tail.items.len - rolling_bytes_max;
+    while (start < tail.items.len and (tail.items[start] & 0xC0) == 0x80) start += 1;
+    std.mem.copyForwards(u8, tail.items[0 .. tail.items.len - start], tail.items[start..]);
+    tail.shrinkRetainingCapacity(tail.items.len - start);
+}
+
+fn truncateTailBuffer(gpa: std.mem.Allocator, tail: []const u8, total_lines: u32, total_bytes: u64) !TailSnapshot {
+    const truncated = total_lines > observation_lines_max or total_bytes > observation_bytes_max;
+    if (!truncated) {
+        return .{
+            .text = try gpa.dupe(u8, tail),
+            .total_lines = total_lines,
+            .shown_lines = total_lines,
+            .total_bytes = total_bytes,
+            .shown_bytes = @intCast(@min(total_bytes, std.math.maxInt(u32))),
+            .truncated = false,
+            .last_line_partial = false,
+        };
+    }
+
+    var start = tail.len;
+    var lines_seen: u32 = 0;
+    var bytes_seen: usize = 0;
+    while (start > 0) {
+        const next = previousUtf8Start(tail, start);
+        const byte_count = start - next;
+        if (bytes_seen + byte_count > observation_bytes_max) break;
+        bytes_seen += byte_count;
+        start = next;
+        if (tail[start] == '\n') {
+            if (lines_seen >= observation_lines_max) {
+                start += 1;
+                break;
+            }
+            lines_seen += 1;
+        }
+    }
+    while (start < tail.len and (tail[start] & 0xC0) == 0x80) start += 1;
+    const out = try gpa.dupe(u8, tail[start..]);
+    return .{
+        .text = out,
+        .total_lines = total_lines,
+        .shown_lines = countLines(out),
+        .total_bytes = total_bytes,
+        .shown_bytes = @intCast(@min(out.len, std.math.maxInt(u32))),
+        .truncated = true,
+        .last_line_partial = start > 0 and start < tail.len and tail[start - 1] != '\n',
+    };
+}
+
+fn previousUtf8Start(text: []const u8, end: usize) usize {
+    var index = end - 1;
+    while (index > 0 and (text[index] & 0xC0) == 0x80) index -= 1;
+    return index;
+}
+
+fn countLines(text: []const u8) u32 {
+    if (text.len == 0) return 0;
+    var count: u32 = 1;
+    for (text) |byte| {
+        if (byte == '\n') count += 1;
+    }
+    if (text[text.len - 1] == '\n') count -= 1;
+    return count;
+}
+
 fn mapBashError(err: anyerror) common.Error {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -230,4 +429,46 @@ test "bash tool parses timeout" {
     defer args.deinit();
 
     try std.testing.expectEqual(@as(u32, 42), args.timeout_seconds);
+}
+
+fn testObservationText(gpa: std.mem.Allocator, output: common.Output) ![]u8 {
+    const observation = output.observation orelse return error.MissingObservation;
+    return observation.render(gpa);
+}
+
+test "bash tool reports exit code in observation" {
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+
+    var output = try runTool(gpa, std.testing.io, cwd, "{\"command\":\"printf nope; exit 7\"}");
+    defer output.deinit(gpa);
+    const observation = try testObservationText(gpa, output);
+    defer gpa.free(observation);
+
+    try std.testing.expectEqual(@as(u8, 7), output.code);
+    try std.testing.expect(std.mem.indexOf(u8, observation, "nope") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observation, "Command exited with code 7") != null);
+}
+
+test "bash tool truncates observation tail and keeps full output path" {
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+
+    var output = try runTool(gpa, std.testing.io, cwd, "{\"command\":\"python3 - <<'PY'\\nfor i in range(2105): print(f'line-{i}')\\nPY\"}");
+    defer {
+        if (output.observation) |observation| switch (observation) {
+            .complete => {},
+            .truncated_tail => |tail| std.Io.Dir.deleteFile(.cwd(), std.testing.io, tail.full_output_path) catch {},
+        };
+        output.deinit(gpa);
+    }
+    const observation = try testObservationText(gpa, output);
+    defer gpa.free(observation);
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    try std.testing.expect(std.mem.indexOf(u8, observation, "line-2104") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observation, "line-0\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, observation, "Full output:") != null);
 }
