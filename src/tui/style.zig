@@ -6,6 +6,7 @@ pub const Palette = struct {
     const success_green = .{ 34, 197, 94 };
     const failure_red = .{ 239, 68, 68 };
     const accent_orange = .{ 249, 115, 22 };
+    const skill_purple = .{ 168, 85, 247 };
     const muted_gray = .{ 138, 138, 138 };
     const selection_bg = .{ 38, 38, 38 };
 
@@ -13,6 +14,7 @@ pub const Palette = struct {
     pub const selected_item: vaxis.Style = .{ .fg = .{ .rgb = accent_orange }, .bg = .{ .rgb = selection_bg } };
 
     pub const user: vaxis.Style = .{ .fg = .{ .rgb = user_yellow }, .italic = true };
+    pub const skill: vaxis.Style = .{ .fg = .{ .rgb = skill_purple }, .bold = true };
     pub const tool: vaxis.Style = .{ .fg = .{ .rgb = success_green } };
     pub const tool_failed: vaxis.Style = .{ .fg = .{ .rgb = failure_red } };
     pub const success: vaxis.Style = .{ .fg = .{ .rgb = success_green } };

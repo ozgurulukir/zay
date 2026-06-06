@@ -36,6 +36,8 @@ pub const Content = struct {
     selection: u32,
     query: []const u8,
     indexing: bool = false,
+    sigil: u8 = '@',
+    title: []const u8 = "Files",
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -43,7 +45,10 @@ pub const Content = struct {
 
     fn emptyMessage(self: *const Content) []const u8 {
         if (self.indexing) return "Indexing…";
-        if (self.query.len == 0) return "Type a path after @";
+        if (self.query.len == 0) {
+            if (self.sigil == '$') return "Type a skill after $";
+            return "Type a path after @";
+        }
         return "No matches";
     }
 
@@ -53,7 +58,7 @@ pub const Content = struct {
         var border: vxfw.Border = .{
             .child = body.widget(),
             .style = StylePalette.thinking_body,
-            .labels = &.{.{ .text = "Files", .alignment = .top_left }},
+            .labels = &.{.{ .text = self.title, .alignment = .top_left }},
         };
         return border.widget().draw(ctx);
     }

@@ -12,6 +12,7 @@ const config_mod = @import("config.zig");
 const openai_compatible_mod = @import("ai/openai_compatible.zig");
 const runtime_mod = @import("runtime.zig");
 const session_mod = @import("session.zig");
+const skill_mod = @import("skill.zig");
 const symbols = @import("symbols.zig");
 const thread_mod = @import("thread.zig");
 const agent_worker = @import("tui/agent_worker.zig");
@@ -46,6 +47,7 @@ const command_prefix: u8 = '/';
 const picker_secondary_column: u16 = 52;
 const long_message_scroll_step_rows: u16 = 3;
 const ThreadNavigation = enum { previous, next };
+const MentionSearchKind = enum { file, skill };
 
 const DiffCounts = struct {
     additions: u32 = 0,
@@ -140,6 +142,7 @@ pub const App = struct {
     at_results: std.ArrayList([]const u8) = .empty,
     at_selection: u32 = 0,
     at_indexing: bool = false,
+    at_kind: MentionSearchKind = .file,
 
     pub const ctrl_c_double_press_ms: u32 = 1500;
 
@@ -296,6 +299,7 @@ pub const App = struct {
         self.resetTurnState();
         self.worker_context.resetCancel();
         _ = try self.thread.append(self.gpa, .user, "you", prompt);
+        try self.appendSkillInvocationsToThread(prompt);
         self.thread_projection.beginAwaiting();
         // The worker expands `@`-mentions (reading files / images) off the UI
         // thread; stash the raw text for `startTurn` to hand over. Owned by
@@ -1505,21 +1509,28 @@ pub const App = struct {
         self.input.clearRetainingCapacity();
     }
 
-    /// Recompute the `@`-mention popup from the text before the cursor. Called
-    /// on every edit while in normal mode.
+    /// Recompute the mention popup from the text before the cursor. Called on
+    /// every edit while in normal mode. `@` searches files; `$` searches skills.
     fn updateAtSearch(self: *App) !void {
-        const active = at_mention.activeQuery(self.input.buf.firstHalf()) orelse {
-            self.closeAtSearch();
+        const before = self.input.buf.firstHalf();
+        if (at_mention.activeQuery(before)) |active| {
+            try self.setMentionSearch(.file, active.query);
             return;
-        };
-        self.startAtSearchBackend();
+        }
+        if (skill_mod.activeQuery(before)) |active| {
+            try self.setMentionSearch(.skill, active.query);
+            return;
+        }
+        self.closeAtSearch();
+    }
+
+    fn setMentionSearch(self: *App, kind: MentionSearchKind, query: []const u8) !void {
+        if (kind == .file) self.startAtSearchBackend();
         self.at_active = true;
-        if (!std.mem.eql(u8, active.query, self.at_query)) {
-            // Dupe before freeing so a failed alloc leaves the old query intact.
-            // An empty query keeps the "" sentinel rather than a heap-owned
-            // zero-length slice, so `closeAtSearch`'s `len > 0` free is correct.
-            const owned: []u8 = if (active.query.len > 0) try self.gpa.dupe(u8, active.query) else "";
+        if (kind != self.at_kind or !std.mem.eql(u8, query, self.at_query)) {
+            const owned: []u8 = if (query.len > 0) try self.gpa.dupe(u8, query) else "";
             if (self.at_query.len > 0) self.gpa.free(self.at_query);
+            self.at_kind = kind;
             self.at_query = owned;
             self.at_selection = 0;
             try self.refreshAtResults();
@@ -1534,6 +1545,13 @@ pub const App = struct {
     fn refreshAtResults(self: *App) !void {
         self.clearAtResults();
         self.at_indexing = false;
+        switch (self.at_kind) {
+            .file => try self.refreshFileResults(),
+            .skill => try self.refreshSkillResults(),
+        }
+    }
+
+    fn refreshFileResults(self: *App) !void {
         if (self.at_query.len == 0) return;
         var result = (try search_mod.runIfReady(self.gpa, self.io, .{
             .op = .find,
@@ -1544,6 +1562,18 @@ pub const App = struct {
         };
         defer result.deinit(self.gpa);
         try self.parseAtResults(result.stdout);
+    }
+
+    fn refreshSkillResults(self: *App) !void {
+        const runtime = self.runtime orelse return;
+        const names = try skill_mod.filterNames(self.gpa, runtime.skills, self.at_query);
+        errdefer {
+            for (names) |name| self.gpa.free(name);
+            self.gpa.free(names);
+        }
+        for (names) |name| try self.at_results.append(self.gpa, name);
+        self.gpa.free(names);
+        if (self.at_selection >= self.at_results.items.len) self.at_selection = 0;
     }
 
     fn parseAtResults(self: *App, stdout: []const u8) !void {
@@ -1561,15 +1591,19 @@ pub const App = struct {
         if (self.at_selection >= self.at_results.items.len) self.at_selection = 0;
     }
 
-    /// Replace the active `@<query>` token with `@<selected-path> `.
+    /// Replace the active mention token with the selected path or skill name.
     fn acceptAtSelection(self: *App) !void {
         if (self.at_selection >= self.at_results.items.len) return;
         const before = self.input.buf.firstHalf();
-        const active = at_mention.activeQuery(before) orelse return;
-        const path = self.at_results.items[self.at_selection];
-        const insert = try std.fmt.allocPrint(self.gpa, "@{s} ", .{path});
+        const active_start = switch (self.at_kind) {
+            .file => if (at_mention.activeQuery(before)) |active| active.start else return,
+            .skill => if (skill_mod.activeQuery(before)) |active| active.start else return,
+        };
+        const value = self.at_results.items[self.at_selection];
+        const sigil: u8 = if (self.at_kind == .file) '@' else '$';
+        const insert = try std.fmt.allocPrint(self.gpa, "{c}{s} ", .{ sigil, value });
         defer self.gpa.free(insert);
-        self.input.buf.growGapLeft(before.len - active.start);
+        self.input.buf.growGapLeft(before.len - active_start);
         try self.input.insertSliceAtCursor(insert);
         self.closeAtSearch();
     }
@@ -1583,6 +1617,7 @@ pub const App = struct {
         self.at_active = false;
         self.at_indexing = false;
         self.at_selection = 0;
+        self.at_kind = .file;
         self.clearAtResults();
         if (self.at_query.len > 0) {
             self.gpa.free(self.at_query);
@@ -1620,10 +1655,22 @@ pub const App = struct {
         _ = try self.thread.append(self.gpa, .notice, "notice", "MessageQueueFull");
     }
 
+    fn appendSkillInvocationsToThread(self: *App, prompt: []const u8) !void {
+        const runtime = self.runtime orelse return;
+        const names = try skill_mod.collectInvocations(self.gpa, runtime.skills, prompt);
+        defer self.gpa.free(names);
+        for (names) |name| {
+            const title = try std.fmt.allocPrint(self.gpa, "[SKILL] {s}", .{name});
+            defer self.gpa.free(title);
+            _ = try self.thread.append(self.gpa, .skill, title, "");
+        }
+    }
+
     fn flushQueuedUserMessagesToThread(self: *App, count: u32) !void {
         const flush_count: usize = @min(count, self.queued_user_messages.items.len);
         for (self.queued_user_messages.items[0..flush_count]) |message| {
             _ = try self.thread.append(self.gpa, .user, "you", message);
+            try self.appendSkillInvocationsToThread(message);
             self.gpa.free(message);
         }
         std.mem.copyForwards([]const u8, self.queued_user_messages.items[0 .. self.queued_user_messages.items.len - flush_count], self.queued_user_messages.items[flush_count..]);
@@ -2720,6 +2767,8 @@ const AtSearchWidget = struct {
             .selection = self.app.at_selection,
             .query = self.app.at_query,
             .indexing = self.app.at_indexing,
+            .sigil = if (self.app.at_kind == .file) '@' else '$',
+            .title = if (self.app.at_kind == .file) "Files" else "Skills",
         };
         return content.widget().draw(ctx);
     }

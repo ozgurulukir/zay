@@ -6,6 +6,7 @@ const ai = @import("ai.zig");
 const codex_mod = @import("codex.zig");
 const config_mod = @import("config.zig");
 const session_mod = @import("session.zig");
+const skill_mod = @import("skill.zig");
 const tools_mod = @import("tools.zig");
 
 const assert = std.debug.assert;
@@ -22,6 +23,7 @@ pub const AgentRuntime = struct {
     client: ai.LanguageModel,
     base_system_prompt: []const u8,
     system_prompt: []const u8,
+    skills: []skill_mod.Skill,
     session_writer: session_mod.SessionWriter,
     agent: agent_mod.Agent,
     diagnostics: []config_mod.Diagnostic,
@@ -104,7 +106,9 @@ pub const AgentRuntime = struct {
 
         const owned_base_system_prompt = try gpa.dupe(u8, base_system_prompt);
         errdefer gpa.free(owned_base_system_prompt);
-        const owned_system_prompt = try createSystemPromptWithContext(gpa, io, owned_base_system_prompt, cwd);
+        const skills = try skill_mod.loadProject(gpa, io, cwd);
+        errdefer skill_mod.deinitAll(gpa, skills);
+        const owned_system_prompt = try createSystemPromptWithContext(gpa, io, owned_base_system_prompt, cwd, skills);
         errdefer gpa.free(owned_system_prompt);
 
         target.* = .{
@@ -115,6 +119,7 @@ pub const AgentRuntime = struct {
             .client = .none,
             .base_system_prompt = owned_base_system_prompt,
             .system_prompt = owned_system_prompt,
+            .skills = skills,
             .session_writer = undefined,
             .agent = undefined,
             .diagnostics = diagnostics,
@@ -130,6 +135,7 @@ pub const AgentRuntime = struct {
 
         target.agent = agent_mod.Agent.init(gpa, io, cwd, .none);
         errdefer target.agent.deinit();
+        target.agent.skills = target.skills;
         target.agent.attachSessionWriter(&target.session_writer);
         try target.agent.addSystem(owned_system_prompt);
 
@@ -158,6 +164,7 @@ pub const AgentRuntime = struct {
         self.session_writer.deinit();
         self.gpa.free(self.base_system_prompt);
         self.gpa.free(self.system_prompt);
+        skill_mod.deinitAll(self.gpa, self.skills);
         if (self.owned_client) |client| client.deinit(self.gpa);
         for (self.diagnostics) |*d| d.deinit(self.gpa);
         self.gpa.free(self.diagnostics);
@@ -386,19 +393,28 @@ fn createSystemPromptWithContext(
     io: std.Io,
     base_system_prompt: []const u8,
     cwd: []const u8,
+    skills: []const skill_mod.Skill,
 ) ![]u8 {
     const system_prompt = try createSystemPrompt(gpa, base_system_prompt, cwd);
     errdefer gpa.free(system_prompt);
 
     const maybe_context = try readContextFile(gpa, io, cwd);
     defer if (maybe_context) |context| gpa.free(context);
+    const skill_prompt = try skill_mod.formatForPrompt(gpa, skills);
+    defer gpa.free(skill_prompt);
 
     if (maybe_context) |context| {
         const combined = try std.fmt.allocPrint(
             gpa,
-            "{s}\n\n<project_instructions path=\"AGENTS.md\">\n{s}\n</project_instructions>\n",
-            .{ system_prompt, context },
+            "{s}\n\n<project_instructions path=\"AGENTS.md\">\n{s}\n</project_instructions>\n{s}",
+            .{ system_prompt, context, skill_prompt },
         );
+        gpa.free(system_prompt);
+        return combined;
+    }
+
+    if (skill_prompt.len > 0) {
+        const combined = try std.fmt.allocPrint(gpa, "{s}{s}", .{ system_prompt, skill_prompt });
         gpa.free(system_prompt);
         return combined;
     }

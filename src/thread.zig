@@ -13,6 +13,7 @@ pub const Render = enum { plain, diff };
 pub const MessageKind = enum {
     user,
     agent,
+    skill,
     logo,
     thinking,
     tool,
@@ -25,7 +26,7 @@ pub const MessageKind = enum {
 
     pub fn dimmable(self: MessageKind) bool {
         return switch (self) {
-            .user, .agent, .thinking, .tool, .notice => true,
+            .user, .agent, .skill, .thinking, .tool, .notice => true,
             .logo, .status => false,
         };
     }
@@ -331,7 +332,7 @@ pub const Thread = struct {
                 message.expanded = !message.expanded;
                 message.invalidateRowCache();
             },
-            .user, .agent, .logo, .status, .notice => {},
+            .user, .agent, .skill, .logo, .status, .notice => {},
         }
     }
 

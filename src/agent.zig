@@ -5,6 +5,7 @@ const at_mention = @import("at_mention.zig");
 const bounded_queue = @import("bounded_queue");
 const executor_mod = @import("executor.zig");
 const session_mod = @import("session.zig");
+const skill_mod = @import("skill.zig");
 const tools = @import("tools.zig");
 
 const assert = std.debug.assert;
@@ -25,6 +26,7 @@ pub const Agent = struct {
     cwd: []const u8,
     client: ai.LanguageModel,
     session_writer: ?*session_mod.SessionWriter = null,
+    skills: []const skill_mod.Skill = &.{},
     messages: std.ArrayList(ai.ChatMessage) = .empty,
     message_queue: MessageQueue = .{},
     message_queue_storage: [message_queue_capacity]QueuedUserMessage = undefined,
@@ -82,8 +84,22 @@ pub const Agent = struct {
             for (blocks) |*block| block.deinit(self.gpa);
             self.gpa.free(blocks);
         }
+        try self.prependSkillBlocks(prompt, blocks);
         try self.messages.append(self.gpa, .{ .role = .user, .content = blocks });
         try self.persistLastMessage();
+    }
+
+    fn prependSkillBlocks(self: *Agent, prompt: []const u8, blocks: []ai.ContentBlock) !void {
+        assert(blocks.len > 0);
+        assert(blocks[0] == .text);
+        const prefix = try skill_mod.promptPrefix(self.gpa, self.io, self.skills, prompt);
+        defer self.gpa.free(prefix);
+        if (prefix.len == 0) return;
+
+        const old_text = blocks[0].text.text;
+        const new_text = try std.fmt.allocPrint(self.gpa, "{s}{s}", .{ prefix, old_text });
+        self.gpa.free(old_text);
+        blocks[0].text.text = new_text;
     }
 
     pub fn takeMessage(self: *Agent, message: ai.ChatMessage) !void {

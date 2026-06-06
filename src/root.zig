@@ -10,6 +10,7 @@ pub const db = @import("db.zig");
 pub const executor = @import("executor.zig");
 pub const search = @import("search.zig");
 pub const session = @import("session.zig");
+pub const skill = @import("skill.zig");
 pub const symbols = @import("symbols.zig");
 pub const terminal_markdown = @import("terminal_markdown");
 pub const logger = @import("logger");

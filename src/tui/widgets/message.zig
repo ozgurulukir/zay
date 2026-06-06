@@ -87,6 +87,7 @@ pub const MessageWidget = struct {
         switch (self.message.kind) {
             .user => drawWrapped(surface, self.message.body, StylePalette.user, styled_as_selected, &row, ctx, 2, StylePalette.user),
             .agent => drawMarkdown(self, surface, styled_as_selected, &row, ctx),
+            .skill => drawWrapped(surface, self.message.title, StylePalette.skill, styled_as_selected, &row, ctx, 2, StylePalette.skill),
             .notice => drawWrapped(surface, self.message.body, StylePalette.tool_failed, styled_as_selected, &row, ctx, 2, StylePalette.tool_failed),
             .logo => drawIntro(surface, self.blackhole_frame, &row, ctx),
             .tool => {
