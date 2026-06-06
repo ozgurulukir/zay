@@ -10,6 +10,7 @@ const blackhole = @import("../blackhole.zig");
 
 const logo_text = @embedFile("../../assets/logo/logo.txt");
 const logo_connect_text = "/connect to begin building";
+const intro_x_padding: u16 = 7;
 const logo_gap: u16 = 8;
 const logo_row_offset: u16 = 7;
 
@@ -136,7 +137,7 @@ pub const MessageWidget = struct {
     }
 
     fn drawLogo(surface: *vxfw.Surface, row_start: u16, ctx: vxfw.DrawContext) void {
-        const col_start = ConversationLayout.left + blackhole.cols + logo_gap;
+        const col_start = ConversationLayout.left + intro_x_padding + blackhole.cols + logo_gap;
         if (col_start >= surface.size.width -| ConversationLayout.right) return;
 
         var row = row_start;
@@ -158,7 +159,7 @@ pub const MessageWidget = struct {
     // are skipped entirely, leaving the terminal background as empty space.
     fn writeBlackholeLine(surface: *vxfw.Surface, line: []const u8, row: u16) void {
         if (row >= surface.size.height) return;
-        var col = ConversationLayout.left;
+        var col = ConversationLayout.left + intro_x_padding;
         const col_limit = surface.size.width -| ConversationLayout.right;
         for (line, 0..) |byte, i| {
             if (col >= col_limit) return;
@@ -348,7 +349,7 @@ fn markdownStyle(style: terminal_markdown.Style) vaxis.Style {
         .quote => StylePalette.thinking_body,
         .list_marker => .{},
         .table_border => StylePalette.thinking_body,
-        .code => .{ .fg = .{ .rgb = .{ 147, 197, 253 } } },
+        .code => StylePalette.markdown_code,
         .strong => .{ .bold = true },
         .emphasis => .{ .italic = true },
     };
