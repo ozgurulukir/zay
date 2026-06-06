@@ -2152,6 +2152,12 @@ const RootWidget = struct {
                 }
                 // Any other key cancels the pending-quit prompt.
                 self.app.pending_quit_at = null;
+                if (shouldOpenCommandMenuForSlash(self.app, key)) {
+                    try self.app.openCommandMenu();
+                    try self.syncFocus(ctx);
+                    ctx.consumeAndRedraw();
+                    return;
+                }
                 if (self.app.mode == .normal and key.matches(vaxis.Key.enter, .{ .shift = true })) {
                     try self.app.insertInputNewline();
                     ctx.consumeAndRedraw();
@@ -2412,6 +2418,16 @@ const RootWidget = struct {
         };
     }
 };
+
+fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
+    if (!key.matches('/', .{})) return false;
+    return switch (app.mode) {
+        .normal => app.input.buf.realLength() == 0,
+        .session_picker, .model_picker, .tree_picker => app.palette_input.buf.realLength() == 0,
+        .provider_picker => app.provider_picker.stage == .list and app.palette_input.buf.realLength() == 0,
+        .command => false,
+    };
+}
 
 const ThreadWidget = struct {
     app: *App,
@@ -2995,11 +3011,7 @@ const CommandInputText = struct {
         const self: *CommandInputText = @ptrCast(@alignCast(ptr));
         const width = ctx.max.width orelse 0;
         const rows = try self.app.inputTextRows(ctx, width);
-        if (rows <= 1) {
-            var surface = try self.app.input.draw(ctx);
-            try tintCommandInput(&surface, self.app, ctx);
-            return surface;
-        }
+        if (rows <= 1) return self.app.input.draw(ctx);
         return self.drawMultiline(ctx);
     }
 
@@ -3327,41 +3339,6 @@ const InputWidget = struct {
         };
     }
 };
-
-fn tintCommandInput(surface: *vxfw.Surface, app: *App, ctx: vxfw.DrawContext) !void {
-    const input = try app.peekInput();
-    defer app.gpa.free(input);
-    const command_end = commandInputSegmentEnd(input);
-    if (command_end == 0) return;
-
-    var byte_index: usize = 0;
-    var grapheme_index: u16 = 0;
-    var col: u16 = 0;
-    var iter = ctx.graphemeIterator(input);
-    while (iter.next()) |grapheme| {
-        const bytes = grapheme.bytes(input);
-        defer byte_index += bytes.len;
-        defer grapheme_index += 1;
-        if (grapheme_index < app.input.draw_offset) continue;
-        const width: u8 = @intCast(ctx.stringWidth(bytes));
-        if (width == 0) continue;
-        if (col >= surface.size.width) return;
-        if (col + width > surface.size.width) return;
-        if (byte_index >= command_end) return;
-        const cell = surface.readCell(col, 0);
-        surface.writeCell(col, 0, .{ .char = cell.char, .style = StylePalette.tool });
-        col += width;
-    }
-}
-
-fn commandInputSegmentEnd(input: []const u8) usize {
-    if (input.len == 0) return 0;
-    if (input[0] != command_prefix) return 0;
-    for (input, 0..) |byte, index| {
-        if (byte == ' ') return index;
-    }
-    return input.len;
-}
 
 test "parse diff counts sums numstat and skips binary" {
     const counts = parseDiffCounts(
@@ -4118,6 +4095,60 @@ test "picker secondary column keeps related options close" {
     try std.testing.expectEqual(@as(u16, 20), pickerSecondaryColumn(40));
 }
 
+test "slash opens command menu before focused input handles it" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{
+        .io = std.testing.io,
+        .alloc = arena.allocator(),
+        .cmds = .empty,
+    };
+
+    var root: RootWidget = .{ .app = &app };
+    try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = '/', .text = "/" } });
+
+    try std.testing.expectEqual(App.Mode.command, app.mode);
+    try std.testing.expectEqual(@as(usize, 0), app.input.buf.realLength());
+}
+
+test "slash opens command menu when text field previous value is stale" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    app.input.previous_val = try gpa.dupe(u8, "/");
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{
+        .io = std.testing.io,
+        .alloc = arena.allocator(),
+        .cmds = .empty,
+    };
+
+    var root: RootWidget = .{ .app = &app };
+    try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = '/', .text = "/" } });
+
+    try std.testing.expectEqual(App.Mode.command, app.mode);
+    try std.testing.expectEqual(@as(usize, 0), app.input.buf.realLength());
+}
+
 test "typing slash can open command menu after input changed before" {
     const gpa = std.testing.allocator;
     var openai_compatible_client: openai_compatible_mod.Client = undefined;
@@ -4206,14 +4237,6 @@ test "model selection is allowed after interrupt" {
 
     try std.testing.expectEqual(Turn.State.idle, app.turn.state);
     try std.testing.expectEqual(config_mod.Provider.ollama, app.cached_config.provider.?);
-}
-
-test "command input segment ends at first space" {
-    try std.testing.expectEqual(@as(usize, 0), commandInputSegmentEnd(""));
-    try std.testing.expectEqual(@as(usize, 0), commandInputSegmentEnd("hello"));
-    try std.testing.expectEqual(@as(usize, 1), commandInputSegmentEnd("/"));
-    try std.testing.expectEqual(@as(usize, 8), commandInputSegmentEnd("/connect"));
-    try std.testing.expectEqual(@as(usize, 8), commandInputSegmentEnd("/connect now"));
 }
 
 test "canceling a picker returns to command menu" {
