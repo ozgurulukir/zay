@@ -7,8 +7,8 @@ pub const max_levels: u16 = 16;
 /// Build the tree-art prefix for a row. The root and linear chains (indent 0)
 /// render flush unless `is_branch_point` is set. Every other node draws
 /// ancestor gutters (`│  `/blank) followed by its own connector. The middle
-/// slot carries the fold marker, kept to the same 3-column width as a gutter so
-/// columns line up.
+/// slot carries either a horizontal segment or a branch tee, kept to the same
+/// 3-column width as a gutter so columns line up.
 pub fn buildPrefix(
     arena: std.mem.Allocator,
     indent: u16,
@@ -32,8 +32,9 @@ pub fn buildPrefix(
         _ = is_foldable;
         try out.appendSlice(arena, "─");
         try out.append(arena, ' ');
+    } else if (is_branch_point) {
+        try out.appendSlice(arena, "┬ ");
     }
-    if (is_branch_point) try out.appendSlice(arena, "┬ ");
     return out.toOwnedSlice(arena);
 }
 
@@ -46,4 +47,12 @@ test "root branch and children share connector column" {
 
     try std.testing.expectEqualStrings("┬ ", root);
     try std.testing.expectEqualStrings("├─ ", child);
+}
+
+test "nested branch points keep the normal connector" {
+    var last = [_]bool{false} ** (max_levels + 2);
+    const nested = try buildPrefix(std.testing.allocator, 1, false, last[0..], false, false, true);
+    defer std.testing.allocator.free(nested);
+
+    try std.testing.expectEqualStrings("├─ ", nested);
 }
