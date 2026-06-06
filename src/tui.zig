@@ -1102,9 +1102,28 @@ pub const App = struct {
             if (self.cached_config.model) |*old| old.deinit(self.gpa);
             self.cached_config.provider = provider;
             self.cached_config.model = .{ .id = new_id, .reasoning_effort = effort };
+            try self.updateCachedProviderConnection(provider);
         } else {
             self.gpa.free(new_id);
         }
+    }
+
+    fn updateCachedProviderConnection(self: *App, provider: config_mod.Provider) !void {
+        if (provider == .openai_compatible) return;
+        if (provider.defaultBaseUrl()) |base_url| try self.replaceCachedBaseUrl(base_url);
+        self.clearCachedApiKey();
+    }
+
+    fn replaceCachedBaseUrl(self: *App, base_url: []const u8) !void {
+        const owned = try self.gpa.dupe(u8, base_url);
+        errdefer self.gpa.free(owned);
+        if (self.cached_config.base_url) |old| self.gpa.free(old);
+        self.cached_config.base_url = owned;
+    }
+
+    fn clearCachedApiKey(self: *App) void {
+        if (self.cached_config.api_key) |old| self.gpa.free(old);
+        self.cached_config.api_key = null;
     }
 
     fn modelSelectionUpdates(
@@ -4057,6 +4076,44 @@ test "codex sign-in survives selecting local compatible provider" {
 
     try std.testing.expect(app.isCodexSignedIn());
     try std.testing.expectEqual(config_mod.Provider.ollama, app.cached_config.provider.?);
+}
+
+test "switching from codex to catalogue provider resets cached connection" {
+    const gpa = std.testing.allocator;
+    var runtime: runtime_mod.AgentRuntime = undefined;
+    runtime.gpa = gpa;
+    runtime.io = std.testing.io;
+    runtime.cwd = ".";
+    runtime.home_dir = ".";
+    runtime.client = .none;
+    runtime.base_system_prompt = "test";
+    runtime.system_prompt = "test";
+    runtime.session_writer = undefined;
+    runtime.agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer runtime.agent.deinit();
+    runtime.diagnostics = &.{};
+    runtime.codex_connection_expired = false;
+    runtime.owned_client = null;
+    defer runtime.disconnectClient();
+
+    var app = App.init(std.testing.io, gpa, &runtime.agent);
+    app.runtime = &runtime;
+    defer app.deinit();
+
+    app.models.model_scope = .session;
+    try app.models.append(gpa, .{ .id = try gpa.dupe(u8, "zen"), .label = try gpa.dupe(u8, "zen") }, .{ .openai_compatible = .opencode_zen });
+    app.models.model_selection = 0;
+    app.cached_config_owned = true;
+    app.cached_config.provider = .openai;
+    app.cached_config.base_url = try gpa.dupe(u8, "https://chatgpt.com/backend-api");
+    app.cached_config.api_key = try gpa.dupe(u8, "stale-codex-key");
+
+    try app.applySelectedModel();
+
+    try std.testing.expectEqual(config_mod.Provider.opencode_zen, app.cached_config.provider.?);
+    try std.testing.expectEqualStrings("https://opencode.ai/zen/v1", app.cached_config.base_url.?);
+    try std.testing.expectEqual(@as(?[]u8, null), app.cached_config.api_key);
+    try std.testing.expectEqualStrings("https://opencode.ai/zen/v1/chat/completions", runtime.client.openai_compatible.url);
 }
 
 test "active model appears at display position 0 without mutating storage" {
