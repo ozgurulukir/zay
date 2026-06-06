@@ -7,7 +7,7 @@ const tool_policy = @import("tool_policy.zig");
 
 const assert = std.debug.assert;
 
-pub const loading_spinners = [4][]const u8{ "Firing Neurons", "Multiplying Matrices", "brr..brr...", "Warping" };
+pub const loading_spinners = [12][]const u8{ "Firing Neurons", "Multiplying Matrices", "brr..brr...", "Warping", "Hailing the machine god", "Tokenmaxxing", "Uploading consciousness", "Brain dancing", "Resisting psychosis", "Wait a minute...", "beep... boop...", "Uhhh" };
 
 pub const ThreadProjection = struct {
     agent_index: ?u32 = null,
