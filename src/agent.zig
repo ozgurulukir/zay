@@ -486,6 +486,7 @@ pub const Agent = struct {
                 .content = blocks,
                 .call_id = r.call_id,
                 .tool_display_label = r.display_label,
+                .tool_failed = r.failed,
             });
             try self.persistLastMessage();
             self.gpa.free(r.name);

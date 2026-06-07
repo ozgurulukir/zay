@@ -97,10 +97,7 @@ const RowBuilder = struct {
     }
 
     fn appendProject(self: *RowBuilder, cwd: []const u8, count: usize, folded: bool, has_children: bool) !void {
-        const prefix = if (folded)
-            ""
-        else
-            try tree_art.buildPrefix(self.ctx.arena, 0, false, &.{}, false, false, has_children);
+        const prefix = try tree_art.buildPrefix(self.ctx.arena, 0, false, &.{}, folded, has_children, has_children);
         self.rows[self.index] = .{
             .io = self.io,
             .kind = .{ .project = .{ .cwd = cwd, .session_count = @intCast(@min(count, std.math.maxInt(u32))), .folded = folded, .prefix = prefix } },

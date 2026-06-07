@@ -657,6 +657,7 @@ fn messageToJson(gpa: std.mem.Allocator, message: ai.ChatMessage) Error![]u8 {
         try writer.writeAll(",\"tool_display_label\":");
         try std.json.Stringify.value(label, .{}, writer);
     }
+    if (message.tool_failed) try writer.writeAll(",\"tool_failed\":true");
     try writer.writeAll(",\"content\":[");
     for (message.content, 0..) |block, index| {
         if (index > 0) try writer.writeByte(',');
@@ -677,10 +678,11 @@ fn jsonToMessage(gpa: std.mem.Allocator, payload_json: []const u8) Error!ai.Chat
     errdefer if (call_id) |id| gpa.free(id);
     const tool_display_label = try optionalString(gpa, parsed.value, "tool_display_label");
     errdefer if (tool_display_label) |label| gpa.free(label);
+    const tool_failed = try optionalBool(parsed.value, "tool_failed");
     const content_value = parsed.value.object.get("content") orelse return error.CorruptPayload;
     const content = try parseContentBlocks(gpa, content_value);
     errdefer freeContentBlocks(gpa, content);
-    return .{ .role = role, .content = content, .call_id = call_id, .tool_display_label = tool_display_label };
+    return .{ .role = role, .content = content, .call_id = call_id, .tool_display_label = tool_display_label, .tool_failed = tool_failed };
 }
 
 fn branchSummaryToMessage(gpa: std.mem.Allocator, payload_json: []const u8) Error!ai.ChatMessage {
@@ -750,6 +752,12 @@ fn optionalString(gpa: std.mem.Allocator, value: std.json.Value, name: []const u
     return try gpa.dupe(u8, field.string);
 }
 
+fn optionalBool(value: std.json.Value, name: []const u8) Error!bool {
+    const field = value.object.get(name) orelse return false;
+    if (field != .bool) return error.CorruptPayload;
+    return field.bool;
+}
+
 fn titleToJson(gpa: std.mem.Allocator, title: []const u8) Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -785,6 +793,7 @@ pub const EntryKind = enum {
 
 pub const EntrySummary = struct {
     kind: EntryKind,
+    tool_failed: bool = false,
     /// One-line display text, owned by the caller.
     text: []u8,
 };
@@ -824,12 +833,13 @@ pub fn entrySummary(gpa: std.mem.Allocator, record: EntryRecord) Error!EntrySumm
 
     const role = if (object.get("role")) |value| (if (value == .string) value.string else "") else "";
     if (std.mem.eql(u8, role, "tool")) {
+        const tool_failed = if (object.get("tool_failed")) |field| field == .bool and field.bool else false;
         if (object.get("tool_display_label")) |label| {
             if (label == .string and label.string.len > 0) {
-                return .{ .kind = .tool, .text = try collapseWhitespace(gpa, label.string, display_max) };
+                return .{ .kind = .tool, .tool_failed = tool_failed, .text = try collapseWhitespace(gpa, label.string, display_max) };
             }
         }
-        return .{ .kind = .tool, .text = try gpa.dupe(u8, "tool result") };
+        return .{ .kind = .tool, .tool_failed = tool_failed, .text = try gpa.dupe(u8, "tool result") };
     }
 
     const is_user = std.mem.eql(u8, role, "user");
@@ -996,7 +1006,7 @@ test "session persists and loads messages" {
     try std.testing.expectEqualStrings("hello", messages[0].text());
 }
 
-test "session persists tool display labels" {
+test "session persists tool display labels and failures" {
     var manager = try SessionManager.init(std.testing.allocator, std.testing.io, ":memory:");
     defer manager.deinit();
     var session = try manager.create("/tmp/nova", .{ .id = "11111111111111111111111111111111", .title = "Tools" });
@@ -1006,7 +1016,7 @@ test "session persists tool display labels" {
     blocks[0] = .{ .text = .{ .text = try std.testing.allocator.dupe(u8, "contents") } };
     const call_id = try std.testing.allocator.dupe(u8, "call_1");
     const label = try std.testing.allocator.dupe(u8, "read AGENTS.md");
-    try session.append(.{ .role = .tool, .content = blocks, .call_id = call_id, .tool_display_label = label }, &id);
+    try session.append(.{ .role = .tool, .content = blocks, .call_id = call_id, .tool_display_label = label, .tool_failed = true }, &id);
     for (blocks) |*block| block.deinit(std.testing.allocator);
     std.testing.allocator.free(blocks);
     std.testing.allocator.free(call_id);
@@ -1021,6 +1031,7 @@ test "session persists tool display labels" {
     try std.testing.expectEqual(.tool, messages[0].role);
     try std.testing.expectEqualStrings("call_1", messages[0].call_id.?);
     try std.testing.expectEqualStrings("read AGENTS.md", messages[0].tool_display_label.?);
+    try std.testing.expect(messages[0].tool_failed);
 }
 
 test "session branch with summary changes context" {

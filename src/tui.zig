@@ -1793,23 +1793,26 @@ pub const App = struct {
             } else if (message.role == .tool) {
                 const title = try self.resumedToolTitle(message);
                 defer self.gpa.free(title);
-                _ = try self.thread.append(self.gpa, .tool, title, text);
+                const index = try self.thread.append(self.gpa, .tool, title, text);
+                self.thread.messages.items[index].failed = message.tool_failed;
             }
         }
         if (self.thread.messages.items.len > 0) self.thread.selected = @intCast(self.thread.messages.items.len - 1);
     }
 
     fn resumedToolTitle(self: *App, message: ai.ChatMessage) ![]u8 {
-        if (message.tool_display_label) |label| return self.gpa.dupe(u8, label);
-        const id = message.call_id orelse return self.gpa.dupe(u8, "tool");
+        if (message.tool_display_label) |label| return thread_mod.toolTitle(self.gpa, label);
+        const id = message.call_id orelse return thread_mod.toolTitle(self.gpa, "tool");
         for (self.agent.messages.items) |candidate| {
             for (candidate.content) |block| {
                 if (block != .tool_call) continue;
                 if (!std.mem.eql(u8, block.tool_call.call_id, id)) continue;
-                return agent_mod.formatToolTitle(self.gpa, block.tool_call.name, block.tool_call.arguments);
+                const label = try agent_mod.formatToolTitle(self.gpa, block.tool_call.name, block.tool_call.arguments);
+                defer self.gpa.free(label);
+                return thread_mod.toolTitle(self.gpa, label);
             }
         }
-        return self.gpa.dupe(u8, id);
+        return thread_mod.toolTitle(self.gpa, id);
     }
 
     fn peekInput(self: *App) ![]u8 {
@@ -4514,7 +4517,7 @@ test "agent app events update thread on the ui side" {
     try std.testing.expectEqual(.tool, app.thread.messages.items[2].kind);
     try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
     try std.testing.expectEqualStrings("checking files", app.thread.messages.items[1].body);
-    try std.testing.expectEqualStrings("$ ls", app.thread.messages.items[2].title);
+    try std.testing.expectEqualStrings("🛠  ls", app.thread.messages.items[2].title);
 }
 
 test "user can navigate away from a streaming thinking block" {
@@ -4730,12 +4733,12 @@ test "tool row persists through finish and turn completion" {
     } }));
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
     try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
-    try std.testing.expectEqualStrings("$ ls", app.thread.messages.items[1].title);
+    try std.testing.expectEqualStrings("🛠  ls", app.thread.messages.items[1].title);
 
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
     try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
-    try std.testing.expectEqualStrings("$ ls", app.thread.messages.items[1].title);
+    try std.testing.expectEqualStrings("🛠  ls", app.thread.messages.items[1].title);
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
@@ -4745,12 +4748,12 @@ test "tool row persists through finish and turn completion" {
     } }));
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
     try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
-    try std.testing.expectEqualStrings("$ ls", app.thread.messages.items[1].title);
+    try std.testing.expectEqualStrings("🛠  ls", app.thread.messages.items[1].title);
 
     try std.testing.expect(try app.applyAgentEvent(.turn_finished));
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
     try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
-    try std.testing.expectEqualStrings("$ ls", app.thread.messages.items[1].title);
+    try std.testing.expectEqualStrings("🛠  ls", app.thread.messages.items[1].title);
 }
 
 test "partial tool arguments do not create visible tool rows" {
@@ -4785,7 +4788,7 @@ test "partial tool arguments do not create visible tool rows" {
     } }));
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
     try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
-    try std.testing.expectEqualStrings("$ ls", app.thread.messages.items[1].title);
+    try std.testing.expectEqualStrings("🛠  ls", app.thread.messages.items[1].title);
 }
 
 test "tool finish creates row if no complete streamed arguments appeared" {
@@ -4816,7 +4819,7 @@ test "tool finish creates row if no complete streamed arguments appeared" {
 
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
     try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
-    try std.testing.expectEqualStrings("$ ls", app.thread.messages.items[1].title);
+    try std.testing.expectEqualStrings("🛠  ls", app.thread.messages.items[1].title);
 }
 
 test "new tool response index creates a new thread row" {
@@ -4855,8 +4858,8 @@ test "new tool response index creates a new thread row" {
     try std.testing.expectEqual(@as(usize, 3), app.thread.messages.items.len);
     try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
     try std.testing.expectEqual(.tool, app.thread.messages.items[2].kind);
-    try std.testing.expectEqualStrings("$ ls", app.thread.messages.items[1].title);
-    try std.testing.expectEqualStrings("$ pwd", app.thread.messages.items[2].title);
+    try std.testing.expectEqualStrings("🛠  ls", app.thread.messages.items[1].title);
+    try std.testing.expectEqualStrings("🛠  pwd", app.thread.messages.items[2].title);
 }
 
 test "bash tool after batch creates a new tool row" {
@@ -5014,7 +5017,7 @@ test "agent response after tool batch appears below tool rows" {
     try std.testing.expectEqual(.tool, app.thread.messages.items[2].kind);
     try std.testing.expectEqual(.agent, app.thread.messages.items[3].kind);
     try std.testing.expectEqualStrings("I will check.", app.thread.messages.items[1].body);
-    try std.testing.expectEqualStrings("$ pwd", app.thread.messages.items[2].title);
+    try std.testing.expectEqualStrings("🛠  pwd", app.thread.messages.items[2].title);
     try std.testing.expectEqualStrings("The repo is in /tmp.", app.thread.messages.items[3].body);
     try std.testing.expectEqual(@as(u32, 3), app.thread.selected.?);
 }
@@ -5057,7 +5060,7 @@ test "content delta after tool preview does not move selection away from tool ro
     } }));
     try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
     try std.testing.expectEqualStrings("I will check.", app.thread.messages.items[1].body);
-    try std.testing.expectEqualStrings("$ pwd", app.thread.messages.items[2].title);
+    try std.testing.expectEqualStrings("🛠  pwd", app.thread.messages.items[2].title);
     try std.testing.expectEqualStrings(" Still checking.", app.thread.messages.items[3].body);
 }
 
@@ -5085,6 +5088,27 @@ test "collapsed tool title wraps to visible rows" {
     const index = try thread.startTool(gpa, "python3 - <<'PY'\nprint('a very long patch document')\nPY");
     try std.testing.expect(!thread.messages.items[index].expanded);
     try std.testing.expect(messageRowsCached(&thread.messages.items[index], 12) > 3);
+}
+
+test "resumed tool messages keep the tool icon" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    const blocks = try gpa.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "done") } };
+    try agent.takeMessage(.{
+        .role = .tool,
+        .content = blocks,
+        .tool_display_label = try gpa.dupe(u8, "zig build test"),
+    });
+
+    try app.rebuildThreadFromAgent();
+
+    try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
+    try std.testing.expectEqualStrings("🛠  zig build test", app.thread.messages.items[0].title);
 }
 
 test "collapsed tool messages render no body text" {

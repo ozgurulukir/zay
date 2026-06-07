@@ -293,6 +293,7 @@ pub const ChatMessage = struct {
     content: []ContentBlock,
     call_id: ?[]u8 = null,
     tool_display_label: ?[]u8 = null,
+    tool_failed: bool = false,
 
     pub fn text(self: ChatMessage) []const u8 {
         for (self.content) |block| {

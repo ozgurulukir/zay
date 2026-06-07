@@ -316,7 +316,7 @@ pub const TurnView = struct {
 };
 
 fn toolTitleMatchesCommand(title: []const u8, command: []const u8) bool {
-    const prefix = "$ ";
+    const prefix = "🛠  ";
     return std.mem.startsWith(u8, title, prefix) and std.mem.eql(u8, title[prefix.len..], command);
 }
 

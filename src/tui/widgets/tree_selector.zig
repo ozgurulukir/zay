@@ -8,6 +8,7 @@ const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
 const tree_art = @import("tree_art.zig");
 
+const assert = std.debug.assert;
 const entry_id_len = session_mod.entry_id_len;
 const Id = [entry_id_len]u8;
 
@@ -51,6 +52,7 @@ const FullNode = struct {
     id: Id,
     parent_id: ?Id,
     kind: session_mod.EntryKind,
+    tool_failed: bool,
     on_active_path: bool,
     is_leaf: bool,
     text: []u8,
@@ -63,11 +65,12 @@ const VisibleNode = struct {
     /// Tree-art prefix (gutters + connector + fold marker), arena-owned.
     prefix: []const u8,
     text: []const u8,
+    kind: session_mod.EntryKind,
+    tool_failed: bool,
     is_leaf: bool,
     on_active_path: bool,
     is_folded: bool,
     is_foldable: bool,
-    branch_color: ?[3]u8,
 };
 
 /// Owns the full tree plus the fold/filter UI state for the `/tree` overlay.
@@ -174,6 +177,7 @@ pub const TreeState = struct {
                 .id = record.id,
                 .parent_id = record.parent_id,
                 .kind = summary.kind,
+                .tool_failed = summary.tool_failed,
                 .on_active_path = active.contains(record.id),
                 .is_leaf = is_leaf,
                 .text = summary.text,
@@ -312,34 +316,27 @@ pub const TreeState = struct {
         // indent steps in by one only at a branch: each arm, and that arm's
         // first continuation, moves one level deeper so sibling arms keep a free
         // `│` gutter column.
-        const Layout = struct { full_index: usize, indent: u16, foldable: bool, is_folded: bool, branch_point: bool, branch_color: ?[3]u8 };
+        const Layout = struct { full_index: usize, indent: u16, foldable: bool, is_folded: bool, branch_point: bool };
         var layout: std.ArrayList(Layout) = .empty;
-        const Frame = struct { index: usize, indent: u16, just_branched: bool, branch_color: ?[3]u8 };
-        var next_branch_color: usize = 0;
+        const Frame = struct { index: usize, indent: u16, just_branched: bool };
         var stack: std.ArrayList(Frame) = .empty;
         var root_index = roots.items.len;
         while (root_index > 0) {
             root_index -= 1;
-            try stack.append(arena, .{ .index = roots.items[root_index], .indent = 0, .just_branched = false, .branch_color = null });
+            try stack.append(arena, .{ .index = roots.items[root_index], .indent = 0, .just_branched = false });
         }
         while (stack.pop()) |frame| {
             const kids = child_lists[frame.index].items;
             const multiple = kids.len > 1;
-            const parent = visible_parent[frame.index];
-            // Fold only at branches: a node is foldable when it is one arm of a
-            // branch (its visible parent has >1 children) and has children of
-            // its own. Folding hides that arm's descendants — its children, not
-            // its siblings. Such a node always sits at indent ≥ 1, so its fold
-            // marker rides in the connector's middle slot.
-            const foldable = kids.len > 0 and parent != null and child_lists[parent.?].items.len > 1;
-            const node_color: ?[3]u8 = if (multiple) null else frame.branch_color;
+            // Fold controls appear on branch points and on the first node of
+            // each branch arm when that arm has descendants.
+            const foldable = self.isFoldable(frame.index);
             try layout.append(arena, .{
                 .full_index = frame.index,
                 .indent = frame.indent,
                 .foldable = foldable,
                 .is_folded = self.folded.contains(self.nodes[frame.index].id),
                 .branch_point = multiple,
-                .branch_color = node_color,
             });
 
             const child_indent: u16 = if (multiple or (frame.just_branched and frame.indent > 0))
@@ -347,13 +344,10 @@ pub const TreeState = struct {
             else
                 frame.indent;
 
-            const first_child_color = next_branch_color;
-            if (multiple) next_branch_color += kids.len;
             var kid_index = kids.len;
             while (kid_index > 0) {
                 kid_index -= 1;
-                const child_color = if (multiple) branchColor(first_child_color + kid_index) else node_color;
-                try stack.append(arena, .{ .index = kids[kid_index], .indent = child_indent, .just_branched = multiple, .branch_color = child_color });
+                try stack.append(arena, .{ .index = kids[kid_index], .indent = child_indent, .just_branched = multiple });
             }
         }
 
@@ -383,15 +377,38 @@ pub const TreeState = struct {
                 .full_index = item.full_index,
                 .prefix = prefix,
                 .text = self.nodes[item.full_index].text,
+                .kind = self.nodes[item.full_index].kind,
+                .tool_failed = self.nodes[item.full_index].tool_failed,
                 .is_leaf = self.nodes[item.full_index].is_leaf,
                 .on_active_path = self.nodes[item.full_index].on_active_path,
                 .is_folded = item.is_folded,
                 .is_foldable = item.foldable,
-                .branch_color = item.branch_color,
             });
         }
 
         self.visible = try out.toOwnedSlice(arena);
+    }
+
+    fn isFoldable(self: *const TreeState, index: usize) bool {
+        assert(index < self.nodes.len);
+        const own_children = self.childCount(index);
+        if (own_children == 0) return false;
+        if (own_children > 1) return true;
+        const parent_id = self.nodes[index].parent_id orelse return false;
+        const parent_index = self.index_by_id.get(parent_id) orelse return false;
+        return self.childCount(parent_index) > 1;
+    }
+
+    fn childCount(self: *const TreeState, index: usize) u32 {
+        assert(index < self.nodes.len);
+        const id = self.nodes[index].id;
+        var count: u32 = 0;
+        for (self.nodes) |node| {
+            if (node.parent_id) |parent_id| {
+                if (std.mem.eql(u8, parent_id[0..], id[0..])) count += 1;
+            }
+        }
+        return count;
     }
 
     fn kindPasses(self: *const TreeState, kind: session_mod.EntryKind) bool {
@@ -511,62 +528,41 @@ const Row = struct {
         const self: *Row = @ptrCast(@alignCast(ptr));
         const width = ctx.max.width orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
+        if (self.selected) panel.fillRow(&surface, 0, tui_style.Palette.selected);
+
+        var col = message.ConversationLayout.left -| 1;
         const marker = if (self.selected) "‣ " else "  ";
-        const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}{s}", .{ marker, self.node.prefix, self.node.text });
-        if (self.node.branch_color) |color| {
-            if (self.selected) panel.fillRow(&surface, 0, tui_style.Palette.selected);
-            try panel.lineStyledAt(&surface, 0, text, ctx, message.ConversationLayout.left -| 1, branchStyle(color, self.selected));
-        } else {
-            try panel.commandLine(&surface, 0, text, ctx, self.selected);
-        }
+        const marker_style = if (self.selected)
+            tui_style.Palette.selected_item
+        else
+            tui_style.Palette.thinking_body;
+        try panel.lineStyledAt(&surface, 0, marker, ctx, col, marker_style);
+        col += @intCast(ctx.stringWidth(marker));
+
+        try panel.lineStyledAt(&surface, 0, self.node.prefix, ctx, col, tui_style.onSelectionBg(tui_style.Palette.thinking_body, self.selected));
+        col += @intCast(ctx.stringWidth(self.node.prefix));
+
+        const text = try self.displayText(ctx);
+        try panel.lineStyledAt(&surface, 0, text, ctx, col, rowStyle(self.node.kind, self.node.tool_failed, self.selected));
         return surface;
+    }
+
+    fn displayText(self: *const Row, ctx: vxfw.DrawContext) ![]const u8 {
+        if (self.node.kind != .tool) return self.node.text;
+        if (std.mem.startsWith(u8, self.node.text, "🛠  ")) return self.node.text;
+        return std.fmt.allocPrint(ctx.arena, "🛠  {s}", .{self.node.text});
     }
 };
 
-fn branchStyle(color: [3]u8, selected: bool) vaxis.Style {
-    return tui_style.onSelectionBg(.{ .fg = .{ .rgb = color } }, selected);
-}
-
-fn branchColor(index: usize) [3]u8 {
-    const hue = branchColorHue(index);
-    return hsvToRgb(hue, 80, 255);
-}
-
-fn branchColorHue(index: usize) u16 {
-    const excluded_min: u16 = 10;
-    const excluded_max: u16 = 40;
-    const excluded_count: u16 = excluded_max - excluded_min + 1;
-    const allowed_count: u16 = 360 - excluded_count;
-    const hue: u16 = @intCast((index *% 137 +% 17) % allowed_count);
-    std.debug.assert(excluded_min <= excluded_max);
-    std.debug.assert(hue < allowed_count);
-    if (hue < excluded_min) return hue;
-    return hue + excluded_count;
-}
-
-fn hsvToRgb(hue_degrees: u16, saturation_percent: u8, value: u8) [3]u8 {
-    std.debug.assert(hue_degrees < 360);
-    std.debug.assert(saturation_percent <= 100);
-
-    const sector: u16 = hue_degrees / 60;
-    const fraction: u16 = hue_degrees % 60;
-    const chroma: u16 = @as(u16, value) * saturation_percent / 100;
-    const minimum: u16 = @as(u16, value) - chroma;
-    const rising: u16 = minimum + chroma * fraction / 60;
-    const falling: u16 = minimum + chroma * (60 - fraction) / 60;
-
-    const rgb: [3]u16 = switch (sector) {
-        0 => .{ value, rising, minimum },
-        1 => .{ falling, value, minimum },
-        2 => .{ minimum, value, rising },
-        3 => .{ minimum, falling, value },
-        4 => .{ rising, minimum, value },
-        else => .{ value, minimum, falling },
+fn rowStyle(kind: session_mod.EntryKind, tool_failed: bool, selected: bool) vaxis.Style {
+    _ = tool_failed;
+    const style = switch (kind) {
+        .user => tui_style.Palette.user,
+        .assistant, .assistant_empty => tui_style.Palette.thinking_label,
+        .tool => tui_style.Palette.thinking_body,
+        .branch_summary, .session_info, .other => tui_style.Palette.thinking_body,
     };
-    std.debug.assert(rgb[0] <= 255);
-    std.debug.assert(rgb[1] <= 255);
-    std.debug.assert(rgb[2] <= 255);
-    return .{ @intCast(rgb[0]), @intCast(rgb[1]), @intCast(rgb[2]) };
+    return tui_style.onSelectionBg(style, selected);
 }
 
 test "linear chains stay flush; only branch children get connectors" {
@@ -584,48 +580,28 @@ test "linear chains stay flush; only branch children get connectors" {
     try state.load(&records, "cccccccc");
 
     try std.testing.expectEqual(@as(usize, 4), state.visible.len);
-    // The root linear node renders flush, with no tree art.
+    // Linear roots stay flush; branch points get Pi's expand/collapse marker.
     try std.testing.expectEqualStrings("", state.visible[0].prefix);
-    // bbbbbbbb is a branch point: it grows a `┬` tee for its children to join.
-    try std.testing.expectEqualStrings("┬ ", state.visible[1].prefix);
-    // Its two children are the branch arms: one tee, one rounded last corner,
-    // both aligned under the parent's `┬`.
+    try std.testing.expect(std.mem.indexOf(u8, state.visible[1].prefix, "⊟") != null);
+    // Its two children are the branch arms: one tee, one corner.
     try std.testing.expect(std.mem.indexOf(u8, state.visible[2].prefix, "├") != null);
     try std.testing.expect(std.mem.indexOf(u8, state.visible[3].prefix, "╰") != null);
 }
 
-test "branch arms have unique colors and branch points stay neutral" {
+test "tool rows carry icon gray state" {
     const gpa = std.testing.allocator;
     var state = TreeState.init(gpa);
     defer state.deinit();
-
-    // root -> branch -> {left, right}; each arm should get its own color, but
-    // the branch point itself should not be color coded.
     var records = [_]session_mod.EntryRecord{
-        makeRecord("aaaaaaaa", null),
-        makeRecord("bbbbbbbb", "aaaaaaaa"),
-        makeRecord("cccccccc", "bbbbbbbb"),
-        makeRecord("dddddddd", "bbbbbbbb"),
+        makeTool("aaaaaaaa", null, "bash pwd", false),
+        makeTool("bbbbbbbb", "aaaaaaaa", "bash false", true),
     };
-    try state.load(&records, "cccccccc");
+    try state.load(&records, "bbbbbbbb");
 
-    try std.testing.expectEqual(@as(?[3]u8, null), state.visible[1].branch_color);
-    try std.testing.expect(state.visible[2].branch_color != null);
-    try std.testing.expect(state.visible[3].branch_color != null);
-    try std.testing.expect(!std.meta.eql(state.visible[2].branch_color.?, state.visible[3].branch_color.?));
-}
-
-test "branch colors stay vivid and avoid highlight orange" {
-    var index: usize = 0;
-    while (index < 128) : (index += 1) {
-        const hue = branchColorHue(index);
-        const color = branchColor(index);
-        const channel_min = @min(color[0], @min(color[1], color[2]));
-        const channel_max = @max(color[0], @max(color[1], color[2]));
-        try std.testing.expect(hue < 10 or hue > 40);
-        try std.testing.expect(channel_min <= 80);
-        try std.testing.expect(channel_max >= 240);
-    }
+    try std.testing.expectEqual(session_mod.EntryKind.tool, state.visible[0].kind);
+    try std.testing.expect(!state.visible[0].tool_failed);
+    try std.testing.expectEqualStrings("bash pwd", state.visible[0].text);
+    try std.testing.expect(state.visible[1].tool_failed);
 }
 
 test "fold hides a subtree and unfold restores it" {
@@ -641,10 +617,19 @@ test "fold hides a subtree and unfold restores it" {
     try state.load(&records, "dddddddd");
     try std.testing.expectEqual(@as(usize, 4), state.visible.len);
 
-    // Select bbbbbbbb (non-root with a child) and fold it; dddddddd hides.
+    // Branch-arm starts with descendants fold independently.
     state.selection = 1;
     try state.toggleFoldSelected("");
     try std.testing.expectEqual(@as(usize, 3), state.visible.len);
+    try std.testing.expect(std.mem.indexOf(u8, state.visible[1].prefix, "⊞") != null);
+    try state.toggleFoldSelected("");
+    try std.testing.expectEqual(@as(usize, 4), state.visible.len);
+
+    // Branch points also fold their whole subtree and show the folded marker.
+    state.selection = 0;
+    try state.toggleFoldSelected("");
+    try std.testing.expectEqual(@as(usize, 1), state.visible.len);
+    try std.testing.expect(std.mem.indexOf(u8, state.visible[0].prefix, "⊞") != null);
     try state.toggleFoldSelected("");
     try std.testing.expectEqual(@as(usize, 4), state.visible.len);
 }
@@ -668,6 +653,15 @@ test "user-only filter keeps only user turns" {
 
 fn makeRecord(id: *const [8]u8, parent: ?*const [8]u8) session_mod.EntryRecord {
     return makeMessage(id, parent, "user", "x");
+}
+
+fn makeTool(id: *const [8]u8, parent: ?*const [8]u8, comptime label: []const u8, failed: bool) session_mod.EntryRecord {
+    var record = makeMessage(id, parent, "tool", "output");
+    record.payload_json = if (failed)
+        @constCast("{\"role\":\"tool\",\"tool_display_label\":\"" ++ label ++ "\",\"tool_failed\":true,\"content\":[{\"type\":\"text\",\"text\":\"output\"}]}")
+    else
+        @constCast("{\"role\":\"tool\",\"tool_display_label\":\"" ++ label ++ "\",\"content\":[{\"type\":\"text\",\"text\":\"output\"}]}");
+    return record;
 }
 
 fn makeMessage(id: *const [8]u8, parent: ?*const [8]u8, comptime role: []const u8, comptime text: []const u8) session_mod.EntryRecord {

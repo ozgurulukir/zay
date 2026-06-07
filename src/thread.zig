@@ -376,8 +376,8 @@ fn appendOwned(gpa: std.mem.Allocator, target: *[]u8, suffix: []const u8) !void 
     target.* = joined;
 }
 
-fn toolTitle(gpa: std.mem.Allocator, command: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(gpa, "$ {s}", .{command});
+pub fn toolTitle(gpa: std.mem.Allocator, command: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(gpa, "🛠  {s}", .{command});
 }
 
 test "thinking and tool messages are compact until toggled" {
@@ -415,8 +415,8 @@ test "consecutive tools remain separate messages" {
     const second = try thread.startTool(gpa, "pwd");
     try std.testing.expect(first != second);
     try std.testing.expectEqual(@as(usize, 2), thread.messages.items.len);
-    try std.testing.expectEqualStrings("$ ls", thread.messages.items[0].title);
-    try std.testing.expectEqualStrings("$ pwd", thread.messages.items[1].title);
+    try std.testing.expectEqualStrings("🛠  ls", thread.messages.items[0].title);
+    try std.testing.expectEqualStrings("🛠  pwd", thread.messages.items[1].title);
     try std.testing.expect(!thread.messages.items[0].expanded);
     try std.testing.expect(!thread.messages.items[1].expanded);
 }
