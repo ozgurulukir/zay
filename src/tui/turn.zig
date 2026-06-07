@@ -5,7 +5,7 @@
 //! event last, even on cancellation (see `agent_worker.runAgentTurn`), so it
 //! is the single terminal signal the machine waits for.
 //!
-//! The machine is pure: it owns no thread, projection, worker, or allocator.
+//! The machine is pure: it owns no thread, turn view, worker, or allocator.
 //! The App drives it by calling `submit`/`interrupt` and feeding every
 //! `Agent.Event` through `apply`, which advances the state and returns an
 //! `Outcome` describing what the App must do next. Keeping it pure makes the
@@ -15,7 +15,7 @@
 //! The loading spinner the TUI shows while waiting for output is NOT part of
 //! this machine. Whether a given chunk actually rendered (partial tool
 //! arguments render nothing, for example) is known only to the thread
-//! projection, which owns that finer-grained `awaiting_output` state.
+//! turn view, which owns that finer-grained display activity.
 
 const std = @import("std");
 
@@ -40,7 +40,7 @@ pub const State = enum {
 /// What the App must do after `apply` handles an event. Flags rather than a
 /// single enum because a terminal event is several things at once.
 pub const Outcome = struct {
-    /// Forward this event to the thread projection. False while interrupting:
+    /// Forward this event to the turn view. False while interrupting:
     /// a discarded turn's output must not mutate the thread.
     project: bool = false,
     /// The turn reached its terminal event; the App should join the worker
@@ -124,7 +124,7 @@ test "interrupt swallows output until the terminal event" {
     try std.testing.expectEqual(State.interrupting, turn.state);
 
     // The worker keeps streaming (including its own turn_failed) — none of it
-    // should reach the projection.
+    // should reach the turn view.
     const swallowed = turn.apply(.{ .response_delta = "late" });
     try std.testing.expect(!swallowed.project);
     try std.testing.expect(!swallowed.finished);
