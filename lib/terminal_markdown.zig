@@ -1,4 +1,5 @@
 const std = @import("std");
+const vaxis = @import("vaxis");
 
 const assert = std.debug.assert;
 
@@ -569,10 +570,11 @@ fn appendHardWrappedWord(
             current_width.* = try startRow(gpa, current, &.{}, continuation_indent);
             continue;
         }
-        const take = @min(capacity, @as(u16, @intCast(@min(word.len - index, std.math.maxInt(u16)))));
-        try current.append(gpa, .{ .text = word[index .. index + take], .style = style });
-        current_width.* += take;
-        index += take;
+        const end = graphemeSliceEnd(word, index, capacity);
+        const slice = word[index..end];
+        try current.append(gpa, .{ .text = slice, .style = style });
+        current_width.* += textWidth(slice);
+        index = end;
         if (index < word.len) {
             try commitRow(gpa, rows, current, current_indent);
             current_width.* = try startRow(gpa, current, &.{}, continuation_indent);
@@ -657,7 +659,26 @@ fn isSpace(byte: u8) bool {
 }
 
 fn textWidth(text: []const u8) u16 {
-    return @intCast(@min(text.len, std.math.maxInt(u16)));
+    return vaxis.gwidth.gwidth(text, .unicode);
+}
+
+fn graphemeSliceEnd(text: []const u8, start: usize, width: u16) usize {
+    assert(start < text.len);
+    assert(width > 0);
+    var iter = vaxis.unicode.graphemeIterator(text[start..]);
+    var used: u16 = 0;
+    var end = start;
+    while (iter.next()) |grapheme| {
+        const bytes = grapheme.bytes(text[start..]);
+        const grapheme_width = textWidth(bytes);
+        if (used > 0) {
+            if (used + grapheme_width > width) break;
+        }
+        end += grapheme.len;
+        used += grapheme_width;
+        if (used >= width) break;
+    }
+    return end;
 }
 
 fn freeRows(gpa: std.mem.Allocator, rows: []Row) void {

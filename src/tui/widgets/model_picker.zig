@@ -319,7 +319,7 @@ pub const Row = struct {
         if (self.activeModel()) {
             const badge_col: u16 = start_col +
                 @as(u16, @intCast(@min(ctx.stringWidth(base), @as(usize, std.math.maxInt(u16)))));
-            try panel.lineStyledAt(&surface, 0, " [ACTIVE]", ctx, badge_col, tui_style.onSelectionBg(StylePalette.success, self.selected));
+            try panel.lineStyledAt(&surface, 0, " ✓", ctx, badge_col, tui_style.onSelectionBg(StylePalette.success, self.selected));
         }
         if (self.selected) {
             try self.drawReasoning(&surface, ctx);

@@ -139,7 +139,6 @@ const windows_bash_candidates = [_][]const u8{
     "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
 };
 
-// TODO: Persist this
 var bash_path_value: ?[]const u8 = null;
 
 fn bashPath(io: std.Io) []const u8 {

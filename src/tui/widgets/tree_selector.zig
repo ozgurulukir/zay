@@ -529,11 +529,7 @@ fn branchStyle(color: [3]u8, selected: bool) vaxis.Style {
 
 fn branchColor(index: usize) [3]u8 {
     const hue = branchColorHue(index);
-    const color = hsvToRgb(hue, 80, 255);
-    std.debug.assert(color[0] <= 255);
-    std.debug.assert(color[1] <= 255);
-    std.debug.assert(color[2] <= 255);
-    return color;
+    return hsvToRgb(hue, 80, 255);
 }
 
 fn branchColorHue(index: usize) u16 {

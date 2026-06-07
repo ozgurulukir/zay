@@ -1,8 +1,5 @@
 const std = @import("std");
-
-const c = @cImport({
-    @cInclude("sqlite3.h");
-});
+const c = @import("c");
 
 const assert = std.debug.assert;
 

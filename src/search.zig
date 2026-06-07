@@ -1,10 +1,7 @@
 const std = @import("std");
+const c = @import("c");
 const dynlib = @import("dynlib");
 const bash = @import("bash.zig");
-
-const c = @cImport({
-    @cInclude("fff.h");
-});
 
 const assert = std.debug.assert;
 

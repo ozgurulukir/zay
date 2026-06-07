@@ -29,9 +29,9 @@ const model_picker = @import("tui/widgets/model_picker.zig");
 const provider_picker = @import("tui/widgets/provider_picker.zig");
 const resume_picker = @import("tui/widgets/resume_picker.zig");
 const tree_selector = @import("tui/widgets/tree_selector.zig");
+const panel = @import("tui/widgets/panel.zig");
 const tui_provider = @import("tui/provider_controller.zig");
 const tui_status = @import("tui/status.zig");
-const tui_app = @import("tui/app.zig");
 const tui_style = @import("tui/style.zig");
 const logger = @import("logger");
 
@@ -44,7 +44,6 @@ const messageRowsCached = tui_metrics.messageRowsCached;
 const loading_spinners = tui_thread_projection.loading_spinners;
 const loading_frame_ms = tui_message.loading_frame_ms;
 const command_prefix: u8 = '/';
-const picker_secondary_column: u16 = 52;
 const long_message_scroll_step_rows: u16 = 3;
 const ThreadNavigation = enum { previous, next };
 const MentionSearchKind = enum { file, skill };
@@ -54,7 +53,6 @@ const DiffCounts = struct {
     deletions: u32 = 0,
 };
 
-// TODO: Investigate jumpToItem as an alternative to handrolling logic
 pub const App = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -1823,17 +1821,6 @@ pub const App = struct {
         return out;
     }
 
-    fn inputVisualLines(self: *const App) u16 {
-        var lines: u16 = 1;
-        for (self.input.buf.firstHalf()) |byte| if (byte == '\n') {
-            lines += 1;
-        };
-        for (self.input.buf.secondHalf()) |byte| if (byte == '\n') {
-            lines += 1;
-        };
-        return lines;
-    }
-
     fn inputTextRows(self: *App, ctx: vxfw.DrawContext, width: u16) !u16 {
         const text = try self.peekInput();
         defer self.gpa.free(text);
@@ -1850,7 +1837,7 @@ pub const App = struct {
         defer self.gpa.free(text);
         const cur = self.input.buf.firstHalf().len;
         const cur_line_start = lineStartBefore(text, cur);
-        const col = graphemeColumn(text[cur_line_start..cur]);
+        const col = cellColumn(text[cur_line_start..cur]);
 
         const target = switch (move) {
             .up => blk: {
@@ -2055,7 +2042,7 @@ pub fn run(
 ) !void {
     const gpa = init.arena.allocator();
     var tty_buffer: [8192]u8 = undefined;
-    var fw_app = try tui_app.init(init.io, gpa, init.environ_map, &tty_buffer);
+    var fw_app = try vxfw.App.init(init.io, gpa, init.environ_map, &tty_buffer);
     defer fw_app.deinit();
 
     var app = App.initRuntime(init.io, gpa, runtime, config);
@@ -2691,10 +2678,6 @@ fn isSearchFooter(line: []const u8) bool {
         std.mem.eql(u8, line, "0 results.");
 }
 
-fn pickerSecondaryColumn(width: u16) u16 {
-    return @min(picker_secondary_column, width / 2);
-}
-
 fn inputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8) anyerror!void {
     const app: *App = @ptrCast(@alignCast(userdata.?));
     app.block_nav = false;
@@ -3028,7 +3011,7 @@ const OverlayInner = struct {
             .selection = app.models.model_selection,
             .column = app.models.model_column,
             .active_model = if (status) |value| value.model else null,
-            .reasoning_options = modelReasoningOptions(),
+            .reasoning_options = reasoningOptions(),
             .reasoning_indexes = picker_reasoning,
             .scope = modelPickerScope(app.models.model_scope),
             .filter = filter,
@@ -3054,10 +3037,6 @@ const reasoning_options = [_]model_picker.ReasoningOption{
     .{ .label = "low", .effort = .low },
     .{ .label = "nothink", .effort = .none },
 };
-
-fn modelReasoningOptions() []const model_picker.ReasoningOption {
-    return &reasoning_options;
-}
 
 fn reasoningOptions() []const model_picker.ReasoningOption {
     return &reasoning_options;
@@ -3130,22 +3109,23 @@ fn lineStartBefore(text: []const u8, pos: usize) usize {
     return 0;
 }
 
-fn graphemeColumn(slice: []const u8) usize {
-    var iter = vaxis.unicode.graphemeIterator(slice);
-    var n: usize = 0;
-    while (iter.next()) |_| n += 1;
-    return n;
+fn cellColumn(slice: []const u8) usize {
+    return vaxis.gwidth.gwidth(slice, .unicode);
 }
 
 fn byteAtColumn(text: []const u8, line_start: usize, line_end: usize, col: usize) usize {
     var iter = vaxis.unicode.graphemeIterator(text[line_start..line_end]);
-    var off: usize = line_start;
-    var n: usize = 0;
-    while (n < col) : (n += 1) {
+    var offset: usize = line_start;
+    var cells: usize = 0;
+    while (cells < col) {
         const grapheme = iter.next() orelse break;
-        off += grapheme.len;
+        const bytes = grapheme.bytes(text[line_start..line_end]);
+        const width = vaxis.gwidth.gwidth(bytes, .unicode);
+        if (cells + width > col) break;
+        cells += width;
+        offset += grapheme.len;
     }
-    return off;
+    return offset;
 }
 
 fn firstVisibleLine(cursor_line: u16, total: u16, visible: u16) u16 {
@@ -3523,11 +3503,9 @@ test "input text rows track the line count" {
         .cell_size = .{ .width = 10, .height = 20 },
     };
 
-    try std.testing.expectEqual(@as(u16, 1), app.inputVisualLines());
     try std.testing.expectEqual(@as(u16, 1), try app.inputTextRows(ctx, 80));
 
     try app.input.insertSliceAtCursor("a\nb\nc");
-    try std.testing.expectEqual(@as(u16, 3), app.inputVisualLines());
     try std.testing.expectEqual(@as(u16, 3), try app.inputTextRows(ctx, 80));
 
     try app.input.insertSliceAtCursor("defgh");
@@ -3660,7 +3638,6 @@ test "shift enter inserts a newline instead of submitting" {
     const value = try app.peekInput();
     defer gpa.free(value);
     try std.testing.expectEqualStrings("line one\nline two", value);
-    try std.testing.expectEqual(@as(u16, 2), app.inputVisualLines());
 }
 
 test "firstVisibleLine keeps the cursor line within the window" {
@@ -4010,7 +3987,7 @@ test "model picker hides model arrow when reasoning column is focused" {
         .selected = true,
         .column = app.models.model_column,
         .active_model = null,
-        .reasoning_label = modelReasoningOptions()[app.selectedReasoningIndex()].label,
+        .reasoning_label = reasoningOptions()[app.selectedReasoningIndex()].label,
         .scope_label = "Global",
     };
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -4024,7 +4001,7 @@ test "model picker hides model arrow when reasoning column is focused" {
     const surface = try row.widget().draw(ctx);
 
     try std.testing.expectEqualStrings(" ", surface.readCell(ConversationLayout.left -| 1, 0).char.grapheme);
-    try std.testing.expectEqualStrings("‣", surface.readCell(pickerSecondaryColumn(surface.size.width), 0).char.grapheme);
+    try std.testing.expectEqualStrings("‣", surface.readCell(panel.secondaryColumn(surface.size.width), 0).char.grapheme);
 }
 
 test "model picker without models stays on model column" {
@@ -4230,11 +4207,6 @@ test "explicit codex catalog loads before runtime is connected" {
 
     try std.testing.expect(app.models.len() > 0);
     try std.testing.expect(app.selectedCodexModel() != null);
-}
-
-test "picker secondary column keeps related options close" {
-    try std.testing.expectEqual(@as(u16, 50), pickerSecondaryColumn(100));
-    try std.testing.expectEqual(@as(u16, 20), pickerSecondaryColumn(40));
 }
 
 test "slash opens command menu before focused input handles it" {
