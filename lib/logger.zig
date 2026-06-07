@@ -1,7 +1,10 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const bounded_queue = @import("bounded_queue");
 
 const assert = std.debug.assert;
+
+pub const enabled = builtin.mode == .Debug;
 const entry_count_max: u32 = 256;
 const entry_bytes_max: u32 = 16 * 1024;
 
@@ -32,7 +35,11 @@ pub const Options = struct {
     log_path: []const u8,
 };
 
-pub fn init(options: Options) error{PathTooLong}!void {
+pub const init = if (enabled) initEnabled else initDisabled;
+pub const log = if (enabled) logEnabled else logDisabled;
+pub const deinit = if (enabled) deinitEnabled else deinitDisabled;
+
+fn initEnabled(options: Options) error{PathTooLong}!void {
     lock();
     defer state.mutex.unlock();
     if (state.enabled) return;
@@ -45,7 +52,9 @@ pub fn init(options: Options) error{PathTooLong}!void {
     if (state.thread == null) state.enabled = false;
 }
 
-pub fn log(comptime fmt: []const u8, args: anytype) void {
+fn initDisabled(_: Options) error{PathTooLong}!void {}
+
+fn logEnabled(comptime fmt: []const u8, args: anytype) void {
     lock();
     defer state.mutex.unlock();
     if (!state.enabled) return;
@@ -67,7 +76,9 @@ pub fn log(comptime fmt: []const u8, args: anytype) void {
     assert(pushed);
 }
 
-pub fn deinit() void {
+fn logDisabled(comptime _: []const u8, _: anytype) void {}
+
+fn deinitEnabled() void {
     lock();
     if (!state.enabled) {
         state.mutex.unlock();
@@ -78,6 +89,8 @@ pub fn deinit() void {
     state.mutex.unlock();
     if (thread) |t| t.join();
 }
+
+fn deinitDisabled() void {}
 
 fn lock() void {
     while (!state.mutex.tryLock()) std.Thread.yield() catch {};
