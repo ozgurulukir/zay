@@ -25,10 +25,15 @@ pub fn messageContentRows(message: thread_mod.Message, width: u16) u16 {
             1,
         .status => 1,
         .tool => if (message.expanded)
-            textRows(message.title, width) + toolBodyRows(message, width)
+            toolTitleRows(message.title, width) + toolBodyRows(message, width)
         else
-            textRows(message.title, width),
+            toolTitleRows(message.title, width),
     };
+}
+
+pub fn toolTitleRows(title: []const u8, width: u16) u16 {
+    const indent: u16 = 3;
+    return textRows(toolCommandTitle(title), width -| indent);
 }
 
 pub fn toolBodyRows(message: thread_mod.Message, width: u16) u16 {
@@ -50,6 +55,12 @@ pub fn textRows(text: []const u8, width: u16) u16 {
         line_start = line_end + 1;
     }
     return rows;
+}
+
+fn toolCommandTitle(title: []const u8) []const u8 {
+    const prefix = "🛠  ";
+    if (std.mem.startsWith(u8, title, prefix)) return title[prefix.len..];
+    return title;
 }
 
 fn wrappedLineRows(line: []const u8, row_width: usize) u16 {

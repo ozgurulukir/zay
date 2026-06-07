@@ -92,7 +92,7 @@ pub const MessageWidget = struct {
             .logo => drawIntro(surface, self.blackhole_frame, &row, ctx),
             .tool => {
                 const title_style = if (self.message.failed) StylePalette.tool_failed else StylePalette.tool;
-                drawWrapped(surface, self.message.title, title_style, styled_as_selected, &row, ctx, 0, null);
+                drawToolTitle(surface, self.message.*, title_style, styled_as_selected, self.loading_frame, &row, ctx);
                 if (self.message.expanded) drawToolBody(surface, self.message.*, styled_as_selected, &row, ctx);
             },
             .thinking => {
@@ -115,6 +115,70 @@ pub const MessageWidget = struct {
         writeText(surface, loading_frames[loading_frame], StylePalette.thinking_label, true, row.*, ctx, 0);
         writeText(surface, text, StylePalette.thinking_body, true, row.*, ctx, 2);
         row.* += 1;
+    }
+
+    fn drawToolTitle(
+        surface: *vxfw.Surface,
+        message: thread_mod.Message,
+        style: vaxis.Style,
+        selected: bool,
+        loading_frame: u8,
+        row: *u16,
+        ctx: vxfw.DrawContext,
+    ) void {
+        std.debug.assert(message.kind == .tool);
+        std.debug.assert(loading_frame < loading_frames.len);
+        const prefix = if (message.tool_running) loading_frames[loading_frame] else "🛠";
+        const command = toolCommandTitle(message.title);
+        drawToolTitleWrapped(surface, prefix, command, style, selected, row, ctx);
+    }
+
+    fn drawToolTitleWrapped(
+        surface: *vxfw.Surface,
+        prefix: []const u8,
+        command: []const u8,
+        style: vaxis.Style,
+        selected: bool,
+        row: *u16,
+        ctx: vxfw.DrawContext,
+    ) void {
+        std.debug.assert(prefix.len > 0);
+        const indent: u16 = 3;
+        const content_width = ConversationLayout.contentWidth(surface.size.width);
+        const width = @max(content_width -| indent, 1);
+        if (command.len == 0) {
+            drawToolTitleLine(surface, prefix, "", style, selected, row, ctx);
+            return;
+        }
+
+        var start: usize = 0;
+        while (start < command.len) {
+            const end = wrappedLineEnd(command, start, width, ctx);
+            const line_prefix = if (start == 0) prefix else "";
+            drawToolTitleLine(surface, line_prefix, command[start..end], style, selected, row, ctx);
+            start = skipLinearWhitespace(command, end);
+        }
+    }
+
+    fn drawToolTitleLine(
+        surface: *vxfw.Surface,
+        prefix: []const u8,
+        command: []const u8,
+        style: vaxis.Style,
+        selected: bool,
+        row: *u16,
+        ctx: vxfw.DrawContext,
+    ) void {
+        if (row.* >= surface.size.height) return;
+        if (prefix.len > 0) writeText(surface, prefix, StylePalette.thinking_label, selected, row.*, ctx, 0);
+        writeText(surface, command, style, selected, row.*, ctx, 3);
+        row.* += 1;
+    }
+
+    fn toolCommandTitle(title: []const u8) []const u8 {
+        const prefix = "🛠  ";
+        if (std.mem.startsWith(u8, title, prefix)) return title[prefix.len..];
+        return title;
     }
 
     fn drawIntro(surface: *vxfw.Surface, frame_index: u16, row: *u16, ctx: vxfw.DrawContext) void {

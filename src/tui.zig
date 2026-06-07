@@ -53,6 +53,47 @@ const DiffCounts = struct {
     deletions: u32 = 0,
 };
 
+const DiffRefreshJob = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []u8,
+    done: *std.atomic.Value(bool),
+
+    fn deinit(self: *DiffRefreshJob) void {
+        self.gpa.free(self.cwd);
+        self.* = undefined;
+    }
+};
+
+const DiffRefreshOutcome = union(enum) {
+    ready: DiffCounts,
+    failed,
+
+    pub fn deinit(self: *DiffRefreshOutcome) void {
+        self.* = undefined;
+    }
+};
+
+fn runDiffRefresh(job: *DiffRefreshJob) DiffRefreshOutcome {
+    const gpa = job.gpa;
+    const done = job.done;
+    defer {
+        job.deinit();
+        gpa.destroy(job);
+        done.store(true, .release);
+    }
+
+    var result = bash_mod.runWithOptions(gpa, job.io, .{
+        .cwd = job.cwd,
+        .command = diffCountCommand,
+        .timeout = bash_mod.timeoutFromSeconds(1),
+    }) catch return .failed;
+    defer result.deinit(gpa);
+
+    if (result.code != 0) return .failed;
+    return .{ .ready = parseDiffCounts(result.stdout) };
+}
+
 pub const App = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -102,6 +143,9 @@ pub const App = struct {
     thread_auto_scroll: bool = true,
     git_label: []const u8 = "",
     diff_counts: DiffCounts = .{},
+    diff_refresh_future: ?std.Io.Future(DiffRefreshOutcome) = null,
+    diff_refresh_done: std.atomic.Value(bool) = .init(false),
+    diff_refresh_again: bool = false,
     thread_view_width: u16 = 80,
     thread_view_height: u16 = 1,
     thread_list: vxfw.ListView = .{
@@ -202,6 +246,7 @@ pub const App = struct {
         self.resumeClearFolds();
         self.resume_folded_projects.deinit(self.gpa);
         self.tree_state.deinit();
+        self.cancelDiffRefresh();
         self.models.deinit(self.gpa);
         codex.freeApiKeyMap(self.gpa, &self.provider_api_keys);
         self.provider_key_input.deinit(self.gpa);
@@ -1431,7 +1476,12 @@ pub const App = struct {
         const cwd = if (self.resume_global) null else self.runtime.?.cwd;
         const summaries = try manager.list(self.gpa, cwd);
         try self.resume_summaries.appendSlice(self.gpa, summaries);
-        if (self.resume_global) std.mem.sort(session_mod.SessionSummary, self.resume_summaries.items, {}, resumeSummaryLessThan);
+        if (self.resume_global) std.mem.sort(
+            session_mod.SessionSummary,
+            self.resume_summaries.items,
+            self.resume_summaries.items,
+            resumeSummaryLessThan,
+        );
         if (self.resume_selection >= try self.visibleResumeCount()) self.resume_selection = 0;
         self.syncResumeListCursor();
     }
@@ -1885,12 +1935,68 @@ pub const App = struct {
         defer result.deinit(self.gpa);
         if (result.code != 0) return false;
 
-        const next = parseDiffCounts(result.stdout);
+        return self.installDiffCounts(parseDiffCounts(result.stdout));
+    }
+
+    fn installDiffCounts(self: *App, next: DiffCounts) bool {
         if (next.additions == self.diff_counts.additions) {
             if (next.deletions == self.diff_counts.deletions) return false;
         }
         self.diff_counts = next;
         return true;
+    }
+
+    fn scheduleDiffRefresh(self: *App) !void {
+        if (self.diff_refresh_future != null) {
+            self.diff_refresh_again = true;
+            return;
+        }
+
+        const cwd_source = if (self.runtime) |runtime| runtime.cwd else ".";
+        const cwd = try self.gpa.dupe(u8, cwd_source);
+        errdefer self.gpa.free(cwd);
+
+        const job = try self.gpa.create(DiffRefreshJob);
+        errdefer self.gpa.destroy(job);
+        job.* = .{
+            .gpa = self.gpa,
+            .io = self.io,
+            .cwd = cwd,
+            .done = &self.diff_refresh_done,
+        };
+        errdefer job.deinit();
+
+        self.diff_refresh_again = false;
+        self.diff_refresh_done.store(false, .release);
+        self.diff_refresh_future = try self.io.concurrent(runDiffRefresh, .{job});
+    }
+
+    fn cancelDiffRefresh(self: *App) void {
+        if (self.diff_refresh_future) |*future| {
+            var outcome = future.cancel(self.io);
+            outcome.deinit();
+            self.diff_refresh_future = null;
+        }
+        self.diff_refresh_again = false;
+        self.diff_refresh_done.store(false, .release);
+    }
+
+    fn drainDiffRefresh(self: *App) !bool {
+        if (self.diff_refresh_future == null) return false;
+        if (!self.diff_refresh_done.load(.acquire)) return false;
+
+        var outcome = self.diff_refresh_future.?.await(self.io);
+        self.diff_refresh_future = null;
+        self.diff_refresh_done.store(false, .release);
+        defer outcome.deinit();
+
+        var visible_change = false;
+        switch (outcome) {
+            .ready => |counts| visible_change = self.installDiffCounts(counts),
+            .failed => {},
+        }
+        if (self.diff_refresh_again) try self.scheduleDiffRefresh();
+        return visible_change;
     }
 
     fn jumpThreadToBottom(self: *App) void {
@@ -2002,11 +2108,25 @@ fn nextIndex(current: u32, count: u32) u32 {
     return current + 1;
 }
 
-fn resumeSummaryLessThan(_: void, left: session_mod.SessionSummary, right: session_mod.SessionSummary) bool {
-    const cwd_order = std.mem.order(u8, left.cwd, right.cwd);
-    if (cwd_order == .lt) return true;
-    if (cwd_order == .gt) return false;
-    return left.updated_at_ms > right.updated_at_ms;
+fn resumeSummaryLessThan(summaries: []const session_mod.SessionSummary, left: session_mod.SessionSummary, right: session_mod.SessionSummary) bool {
+    if (std.mem.eql(u8, left.cwd, right.cwd)) return left.updated_at_ms > right.updated_at_ms;
+
+    const left_project_updated_at_ms = resumeProjectUpdatedAtMax(summaries, left.cwd);
+    const right_project_updated_at_ms = resumeProjectUpdatedAtMax(summaries, right.cwd);
+    if (left_project_updated_at_ms != right_project_updated_at_ms) {
+        return left_project_updated_at_ms > right_project_updated_at_ms;
+    }
+
+    return std.mem.lessThan(u8, left.cwd, right.cwd);
+}
+
+fn resumeProjectUpdatedAtMax(summaries: []const session_mod.SessionSummary, cwd: []const u8) i64 {
+    var updated_at_ms: i64 = std.math.minInt(i64);
+    for (summaries) |summary| {
+        if (!std.mem.eql(u8, summary.cwd, cwd)) continue;
+        updated_at_ms = @max(updated_at_ms, summary.updated_at_ms);
+    }
+    return updated_at_ms;
 }
 
 fn previousIndex(current: u32, count: u32) u32 {
@@ -2284,8 +2404,9 @@ const RootWidget = struct {
     fn handleTick(self: *RootWidget, ctx: *vxfw.EventContext) !void {
         var visible_change = try self.drainAgentEvents(ctx);
         if (try self.app.drainModelLoad()) visible_change = true;
+        if (try self.app.drainDiffRefresh()) visible_change = true;
 
-        if (self.app.turn_view.awaitingOutput()) {
+        if (self.app.turn_view.awaitingOutput() or self.app.thread.hasRunningTool()) {
             self.spinner_tick_accum += drain_tick_ms;
             if (self.spinner_tick_accum >= spinner_tick_threshold_ms) {
                 self.spinner_tick_accum = 0;
@@ -2301,7 +2422,7 @@ const RootWidget = struct {
             if (self.diff_tick_accum >= diff_tick_threshold_ms) {
                 self.diff_tick_accum = 0;
                 self.diff_refresh_pending = false;
-                if (try self.app.refreshDiffCounts()) visible_change = true;
+                try self.app.scheduleDiffRefresh();
             }
         } else {
             self.diff_tick_accum = 0;
@@ -2321,10 +2442,12 @@ const RootWidget = struct {
         }
 
         const model_loading = self.app.models.model_load_future != null;
+        const diff_loading = self.app.diff_refresh_future != null;
         // Keep ticking while a turn is active OR interrupting, so the worker's
         // remaining events (and its terminal `turn_finished`) get drained.
         const should_tick = self.app.turn.state != .idle or
             model_loading or
+            diff_loading or
             self.app.blackhole_visible or
             self.diff_refresh_pending;
         if (should_tick) {
@@ -2403,9 +2526,9 @@ const RootWidget = struct {
             if (self.app.turn_view.awaitingOutput()) try self.ensureTick(ctx);
         }
         if (refresh_diff) {
-            self.diff_refresh_pending = false;
+            self.diff_refresh_pending = true;
             self.diff_tick_accum = 0;
-            if (try self.app.refreshDiffCounts()) visible_change = true;
+            try self.ensureTick(ctx);
         }
         return visible_change;
     }
@@ -3570,6 +3693,27 @@ test "arrow up and down move the input cursor between lines" {
     try std.testing.expect(!(try app.moveInputCursorVertical(.down)));
 }
 
+test "global resume sorting groups projects by latest session" {
+    var summaries = [_]session_mod.SessionSummary{
+        .{ .id = @constCast("old-b"), .title = null, .cwd = @constCast("/repo/b"), .created_at_ms = 0, .updated_at_ms = 10, .leaf_entry_id = null },
+        .{ .id = @constCast("new-a"), .title = null, .cwd = @constCast("/repo/a"), .created_at_ms = 0, .updated_at_ms = 30, .leaf_entry_id = null },
+        .{ .id = @constCast("new-b"), .title = null, .cwd = @constCast("/repo/b"), .created_at_ms = 0, .updated_at_ms = 40, .leaf_entry_id = null },
+        .{ .id = @constCast("old-a"), .title = null, .cwd = @constCast("/repo/a"), .created_at_ms = 0, .updated_at_ms = 20, .leaf_entry_id = null },
+    };
+
+    const context: []const session_mod.SessionSummary = summaries[0..];
+    std.mem.sort(session_mod.SessionSummary, summaries[0..], context, resumeSummaryLessThan);
+
+    try std.testing.expectEqualStrings("/repo/b", summaries[0].cwd);
+    try std.testing.expectEqualStrings("new-b", summaries[0].id);
+    try std.testing.expectEqualStrings("/repo/b", summaries[1].cwd);
+    try std.testing.expectEqualStrings("old-b", summaries[1].id);
+    try std.testing.expectEqualStrings("/repo/a", summaries[2].cwd);
+    try std.testing.expectEqualStrings("new-a", summaries[2].id);
+    try std.testing.expectEqualStrings("/repo/a", summaries[3].cwd);
+    try std.testing.expectEqualStrings("old-a", summaries[3].id);
+}
+
 test "esc backs out of command panels before interrupting active turn" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
@@ -4504,7 +4648,7 @@ test "agent app events update thread on the ui side" {
         .arguments = "{\"command\":\"ls\"}",
     } }));
     try std.testing.expect(!try app.applyAgentEvent(.{ .thinking_delta = " files" }));
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_call_finished = .{
+    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
         .name = "bash",
         .display_label = "ls",
@@ -4637,7 +4781,7 @@ test "loading does not appear during final answer after tool batch" {
         .name = "bash",
         .arguments = "{\"command\":\"pwd\"}",
     } }));
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_call_finished = .{
+    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
         .name = "bash",
         .display_label = "pwd",
@@ -4734,19 +4878,23 @@ test "tool row persists through finish and turn completion" {
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
     try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
     try std.testing.expectEqualStrings("🛠  ls", app.thread.messages.items[1].title);
+    try std.testing.expect(app.thread.messages.items[1].tool_running);
+    try std.testing.expect(app.thread.hasRunningTool());
 
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
     try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
     try std.testing.expectEqualStrings("🛠  ls", app.thread.messages.items[1].title);
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_call_finished = .{
+    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
         .name = "bash",
         .display_label = "ls",
         .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
+    try std.testing.expect(!app.thread.messages.items[1].tool_running);
+    try std.testing.expect(!app.thread.hasRunningTool());
     try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
     try std.testing.expectEqualStrings("🛠  ls", app.thread.messages.items[1].title);
 
@@ -4841,7 +4989,7 @@ test "new tool response index creates a new thread row" {
         .name = "bash",
         .arguments = "{\"command\":\"ls\"}",
     } }));
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_call_finished = .{
+    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
         .name = "bash",
         .display_label = "ls",
@@ -4881,7 +5029,7 @@ test "bash tool after batch creates a new tool row" {
         .name = "bash",
         .arguments = "{\"command\":\"ls\"}",
     } }));
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_call_finished = .{
+    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
         .name = "bash",
         .display_label = "ls",
@@ -4932,7 +5080,7 @@ test "late tool finish does not move selection upward" {
     } }));
     try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_call_finished = .{
+    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
         .name = "bash",
         .display_label = "ls",
@@ -4964,7 +5112,7 @@ test "loading does not resume after post-tool thinking delta" {
         .name = "bash",
         .arguments = "{\"command\":\"pwd\"}",
     } }));
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_call_finished = .{
+    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
         .name = "bash",
         .display_label = "pwd",
@@ -5002,7 +5150,7 @@ test "agent response after tool batch appears below tool rows" {
         .name = "bash",
         .arguments = "{\"command\":\"pwd\"}",
     } }));
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_call_finished = .{
+    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
         .name = "bash",
         .display_label = "pwd",
@@ -5052,7 +5200,7 @@ test "content delta after tool preview does not move selection away from tool ro
     _ = try app.applyAgentEvent(.delta_end);
     try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_call_finished = .{
+    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
         .name = "bash",
         .display_label = "pwd",

@@ -67,6 +67,9 @@ pub const Message = struct {
     body: []u8,
     expanded: bool = true,
     failed: bool = false,
+    /// Only meaningful when `kind == .tool`. True while the executor owns the
+    /// call and the TUI should animate the title prefix.
+    tool_running: bool = false,
     /// Only meaningful when `kind == .tool`. Drives per-line styling of the
     /// body in the TUI; see `Render`.
     tool_render: Render = .plain,
@@ -253,6 +256,7 @@ pub const Thread = struct {
         defer gpa.free(title);
         const index = try self.append(gpa, .tool, title, "");
         self.messages.items[index].expanded = false;
+        self.messages.items[index].tool_running = true;
         return index;
     }
 
@@ -289,6 +293,7 @@ pub const Thread = struct {
         assert(index < self.messages.items.len);
         const message = &self.messages.items[index];
         assert(message.kind == .tool);
+        message.tool_running = false;
         try appendOwned(gpa, &message.body, body);
         if (stderr_body) |stderr| {
             assert(stderr.len > 0);
@@ -321,6 +326,25 @@ pub const Thread = struct {
             .previous => self.previousSelectable(selected) orelse selected,
             .next => self.nextSelectable(selected) orelse selected,
         };
+    }
+
+    pub fn hasRunningTool(self: *const Thread) bool {
+        for (self.messages.items) |message| {
+            if (message.kind != .tool) continue;
+            if (message.tool_running) return true;
+        }
+        return false;
+    }
+
+    pub fn stopRunningTools(self: *Thread) bool {
+        var stopped = false;
+        for (self.messages.items) |*message| {
+            if (message.kind != .tool) continue;
+            if (!message.tool_running) continue;
+            message.tool_running = false;
+            stopped = true;
+        }
+        return stopped;
     }
 
     pub fn toggleSelected(self: *Thread) void {

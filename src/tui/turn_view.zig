@@ -153,6 +153,7 @@ pub const TurnView = struct {
         message: []const u8,
     ) !bool {
         self.activity = .idle;
+        _ = thread.stopRunningTools();
         _ = try thread.append(gpa, .notice, "notice", message);
         return true;
     }
@@ -164,6 +165,7 @@ pub const TurnView = struct {
     ) !bool {
         self.activity = .idle;
         _ = try self.finishThinking(gpa, thread);
+        _ = thread.stopRunningTools();
         return true;
     }
 
@@ -271,6 +273,7 @@ pub const TurnView = struct {
 
         const visible_before = toolFinishVisibleChange(thread, index, tool.display_label);
         const was_expanded = thread.messages.items[index].expanded;
+        const was_running = thread.messages.items[index].tool_running;
         try thread.updateTool(gpa, index, tool.display_label);
         try thread.finishTool(gpa, index, tool.display_body, tool.stderr, tool.failed);
         thread.setExpanded(index, policy.expand_by_default);
@@ -278,7 +281,7 @@ pub const TurnView = struct {
         selectGeneratedMessage(thread, index);
         self.tool_seen_in_response = true;
         self.agent_index = null;
-        return existing_index == null or visible_before or policy.expand_by_default != was_expanded;
+        return existing_index == null or was_running or visible_before or policy.expand_by_default != was_expanded;
     }
 
     fn selectGeneratedMessage(thread: *thread_mod.Thread, index: u32) void {
