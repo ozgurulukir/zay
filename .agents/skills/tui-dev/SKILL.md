@@ -1,6 +1,6 @@
 ---
 name: tui-dev
-description: Use this skill when writing code for the TUI component. It explains the libvaxis usage guidelines.
+description: Use when writing TUI-related code. It explains libvaxis usage guidelines.
 ---
 
 # Using libvaxis
