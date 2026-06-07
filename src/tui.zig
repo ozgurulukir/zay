@@ -2171,13 +2171,13 @@ const RootWidget = struct {
                         ctx.consumeAndRedraw();
                         return;
                     }
-                    if (self.app.turn.state == .active) {
-                        try self.app.handleInterrupt();
+                    if (try self.app.cancelMode()) {
+                        try self.syncFocus(ctx);
                         ctx.consumeAndRedraw();
                         return;
                     }
-                    if (try self.app.cancelMode()) {
-                        try self.syncFocus(ctx);
+                    if (self.app.turn.state == .active) {
+                        try self.app.handleInterrupt();
                         ctx.consumeAndRedraw();
                         return;
                     }
@@ -3565,6 +3565,27 @@ test "arrow up and down move the input cursor between lines" {
     try std.testing.expect(try app.moveInputCursorVertical(.down));
     try std.testing.expectEqualStrings("fox\nox\nca", app.input.buf.firstHalf());
     try std.testing.expect(!(try app.moveInputCursorVertical(.down)));
+}
+
+test "esc backs out of command panels before interrupting active turn" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.turn.submit();
+    app.mode = .provider_picker;
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.escape } });
+
+    try std.testing.expectEqual(App.Mode.command, app.mode);
+    try std.testing.expectEqual(Turn.State.active, app.turn.state);
 }
 
 test "ctrl-c clears a non-empty input instead of arming quit" {
