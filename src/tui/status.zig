@@ -10,20 +10,23 @@ pub const ModelStatus = struct {
 
 pub fn modelStatus(runtime: ?*const runtime_mod.AgentRuntime, config: config_mod.Config) ?ModelStatus {
     if (runtime) |rt| {
-        switch (rt.client) {
-            .codex_responses => |client| return .{
-                .provider = "openai",
-                .model = client.core_client.config.model,
+        switch (rt.clientState()) {
+            .disconnected => return null,
+            .connected => |language_model| switch (language_model) {
+                .codex_responses => |client| return .{
+                    .provider = "openai",
+                    .model = client.core_client.config.model,
+                },
+                .openai_responses => |client| return .{
+                    .provider = providerLabel(config) orelse "openai",
+                    .model = client.core_client.config.model,
+                },
+                .openai_compatible => |client| return .{
+                    .provider = providerLabel(config) orelse "openai_compatible",
+                    .model = client.config.model,
+                },
+                .none => unreachable,
             },
-            .openai_responses => |client| return .{
-                .provider = providerLabel(config) orelse "openai",
-                .model = client.core_client.config.model,
-            },
-            .openai_compatible => |client| return .{
-                .provider = providerLabel(config) orelse "openai_compatible",
-                .model = client.config.model,
-            },
-            .none => return null,
         }
     }
 

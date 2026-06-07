@@ -301,7 +301,7 @@ pub const Thread = struct {
     }
 
     /// Set a message's expanded state, invalidating its cached row count. The
-    /// projection mutates `expanded` directly when a tool finishes; route it
+    /// The turn view mutates `expanded` when a tool finishes; route it
     /// through here so the cache stays correct.
     pub fn setExpanded(self: *Thread, index: u32, value: bool) void {
         assert(index < self.messages.items.len);

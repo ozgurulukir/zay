@@ -12,6 +12,8 @@
 const std = @import("std");
 const ai = @import("ai.zig");
 
+const assert = std.debug.assert;
+
 pub const Provider = enum {
     openai,
     openai_compatible,
@@ -182,6 +184,21 @@ pub const ProviderConfig = struct {
     }
 };
 
+pub const ModelSelectionRef = struct {
+    provider: Provider,
+    model: *const Model,
+};
+
+pub const ModelSelection = struct {
+    provider: Provider,
+    model: Model,
+
+    pub fn deinit(self: *ModelSelection, gpa: std.mem.Allocator) void {
+        self.model.deinit(gpa);
+        self.* = undefined;
+    }
+};
+
 pub const Config = struct {
     provider: ?Provider = null,
     base_url: ?[]u8 = null,
@@ -223,7 +240,21 @@ pub const Config = struct {
     pub fn cloneForTui(self: Config, gpa: std.mem.Allocator) !Config {
         return self.clone(gpa);
     }
+
+    pub fn activeModelSelection(self: *const Config) ?ModelSelectionRef {
+        const provider = self.provider orelse return null;
+        const model = if (self.model) |*model| model else return null;
+        return .{ .provider = provider, .model = model };
+    }
 };
+
+pub fn assertModelSelection(config: *const Config) void {
+    if (config.provider) |_| {
+        assert(config.model != null);
+    } else {
+        assert(config.model == null);
+    }
+}
 
 pub const Diagnostic = union(enum) {
     config_parse_error: ParseError,
@@ -567,12 +598,12 @@ fn loadEnv(
     return out;
 }
 
-const ModelSelection = struct {
+const ParsedModelSelection = struct {
     provider: Provider,
     model: Model,
 };
 
-fn parseModelSelection(gpa: std.mem.Allocator, raw: []const u8) !ModelSelection {
+fn parseModelSelection(gpa: std.mem.Allocator, raw: []const u8) !ParsedModelSelection {
     const slash = std.mem.findScalar(u8, raw, '/') orelse return error.MissingSeparator;
     const provider_part = raw[0..slash];
     const model_part = raw[slash + 1 ..];

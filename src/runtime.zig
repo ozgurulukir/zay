@@ -30,6 +30,11 @@ pub const AgentRuntime = struct {
     codex_connection_expired: bool = false,
     owned_client: ?OwnedClient = null,
 
+    pub const ClientState = union(enum) {
+        disconnected,
+        connected: ai.LanguageModel,
+    };
+
     const OwnedClient = union(enum) {
         codex_responses: *ai.codex_responses.Client,
         openai_compatible: *ai.openai_compatible.Client,
@@ -159,7 +164,25 @@ pub const AgentRuntime = struct {
         for (messages) |message| try self.agent.takeMessage(message);
     }
 
+    pub fn clientState(self: *const AgentRuntime) ClientState {
+        if (self.client == .none) return .disconnected;
+        return .{ .connected = self.client };
+    }
+
+    pub fn assertClientInvariant(self: *const AgentRuntime) void {
+        if (self.owned_client) |owned| {
+            assert(self.client != .none);
+            assert(self.agent.client != .none);
+            assert(languageModelMatchesOwned(self.client, owned));
+            assert(languageModelMatches(self.agent.client, self.client));
+        } else {
+            assert(self.client == .none);
+            assert(self.agent.client == .none);
+        }
+    }
+
     pub fn deinit(self: *AgentRuntime) void {
+        self.assertClientInvariant();
         self.agent.deinit();
         self.session_writer.deinit();
         self.gpa.free(self.base_system_prompt);
@@ -174,12 +197,12 @@ pub const AgentRuntime = struct {
     /// Pick and wire the LanguageModel adapter specified in `config`.
     /// Also handles providers that require sign-in (codex).
     pub fn applyFromConfig(self: *AgentRuntime, config: config_mod.Config) !void {
-        const provider = config.provider orelse return;
-        const adapter = adapterForConfig(provider, config) orelse return;
+        const selection = config.activeModelSelection() orelse return;
+        const adapter = adapterForConfig(selection.provider, config) orelse return;
         switch (adapter) {
             .codex_responses => try self.tryConnectCodexFromAuth(config),
-            .openai_compatible => try self.tryAttachOpenAiCompatibleFromConfig(provider, config),
-            .openai_responses => try self.tryAttachOpenAiResponsesFromConfig(provider, config),
+            .openai_compatible => try self.tryAttachOpenAiCompatibleFromConfig(selection.provider, config),
+            .openai_responses => try self.tryAttachOpenAiResponsesFromConfig(selection.provider, config),
         }
     }
 
@@ -276,7 +299,7 @@ pub const AgentRuntime = struct {
             .tools = tools_mod.registry,
             .reasoning = .{ .effort = effort, .summary = .auto },
             .account_id = credentials.account_id,
-            .session_id = &self.session_writer.session.id,
+            .session_id = self.session_writer.session.id.slice(),
             .system_prompt = self.system_prompt,
         });
         errdefer client.deinit();
@@ -291,6 +314,7 @@ pub const AgentRuntime = struct {
         self.owned_client = null;
         self.client = .none;
         self.agent.client = .none;
+        self.assertClientInvariant();
     }
 
     pub fn hasCodexClient(self: *const AgentRuntime) bool {
@@ -304,6 +328,7 @@ pub const AgentRuntime = struct {
         self.owned_client = null;
         self.client = .none;
         self.agent.client = .none;
+        self.assertClientInvariant();
     }
 
     pub fn attachOpenAiCompatibleClient(
@@ -341,11 +366,28 @@ pub const AgentRuntime = struct {
             .model = model_id,
             .tools = tools_mod.registry,
             .reasoning = reasoning,
-            .session_id = &self.session_writer.session.id,
+            .session_id = self.session_writer.session.id.slice(),
             .system_prompt = self.system_prompt,
         });
         errdefer client.deinit();
         self.replaceClient(.{ .openai_responses = client });
+    }
+
+    fn languageModelMatches(a: ai.LanguageModel, b: ai.LanguageModel) bool {
+        return switch (a) {
+            .none => b == .none,
+            .codex_responses => |client| b == .codex_responses and b.codex_responses == client,
+            .openai_compatible => |client| b == .openai_compatible and b.openai_compatible == client,
+            .openai_responses => |client| b == .openai_responses and b.openai_responses == client,
+        };
+    }
+
+    fn languageModelMatchesOwned(model: ai.LanguageModel, owned: OwnedClient) bool {
+        return switch (owned) {
+            .codex_responses => |client| model == .codex_responses and model.codex_responses == client,
+            .openai_compatible => |client| model == .openai_compatible and model.openai_compatible == client,
+            .openai_responses => |client| model == .openai_responses and model.openai_responses == client,
+        };
     }
 
     fn replaceClient(self: *AgentRuntime, next: OwnedClient) void {
@@ -354,6 +396,7 @@ pub const AgentRuntime = struct {
         self.owned_client = next;
         self.client = next.languageModel();
         self.agent.client = self.client;
+        self.assertClientInvariant();
     }
 };
 

@@ -18,7 +18,7 @@ const thread_mod = @import("thread.zig");
 const agent_worker = @import("tui/agent_worker.zig");
 const Turn = @import("tui/turn.zig");
 const model_catalogue = @import("tui/model_catalogue.zig");
-const tui_thread_projection = @import("tui/thread_projection.zig");
+const tui_turn_view = @import("tui/turn_view.zig");
 const tui_metrics = @import("tui/metrics.zig");
 const tui_message = @import("tui/widgets/message.zig");
 const blackhole = @import("tui/blackhole.zig");
@@ -41,7 +41,7 @@ const StylePalette = tui_style.Palette;
 const mergedSelectedStyle = tui_style.mergedSelectedStyle;
 const messageRowsCached = tui_metrics.messageRowsCached;
 
-const loading_spinners = tui_thread_projection.loading_spinners;
+const loading_spinners = tui_turn_view.loading_spinners;
 const loading_frame_ms = tui_message.loading_frame_ms;
 const command_prefix: u8 = '/';
 const long_message_scroll_step_rows: u16 = 3;
@@ -90,7 +90,7 @@ pub const App = struct {
     /// interrupting). Collapses what used to be the `in_flight` and
     /// `turn_discarded` booleans plus the scattered discard logic.
     turn: Turn = .{},
-    thread_projection: tui_thread_projection.ThreadProjection = .{},
+    turn_view: tui_turn_view.TurnView = .{},
     loading_frame: u8 = 0,
     loading_tick_active: bool = false,
     // Black-hole intro animation. `blackhole_visible` is recomputed each draw
@@ -221,7 +221,7 @@ pub const App = struct {
         if (self.pending_prompt) |prompt| self.worker_context.gpa.free(prompt);
         self.closeAtSearch();
         self.at_results.deinit(self.gpa);
-        self.thread_projection.deinit(self.gpa);
+        self.turn_view.deinit(self.gpa);
         self.thread.deinit(self.gpa);
         self.input.deinit();
         self.palette_input.deinit();
@@ -243,7 +243,7 @@ pub const App = struct {
         const message = try self.gpa.dupe(u8, agent_worker.cancel_message);
         var event: agent_mod.Agent.Event = .{ .turn_failed = message };
         defer event.deinit(self.gpa);
-        _ = try self.thread_projection.apply(self.gpa, &self.thread, event);
+        _ = try self.turn_view.apply(self.gpa, &self.thread, event);
         self.turn.interrupt();
     }
 
@@ -298,7 +298,7 @@ pub const App = struct {
         self.worker_context.resetCancel();
         _ = try self.thread.append(self.gpa, .user, "you", prompt);
         try self.appendSkillInvocationsToThread(prompt);
-        self.thread_projection.beginAwaiting();
+        self.turn_view.awaitModel();
         // The worker expands `@`-mentions (reading files / images) off the UI
         // thread; stash the raw text for `startTurn` to hand over. Owned by
         // `worker_context.gpa` — the worker frees it with that allocator, which
@@ -348,7 +348,7 @@ pub const App = struct {
     }
 
     fn resetTurnState(self: *App) void {
-        self.thread_projection.resetTurn(self.io);
+        self.turn_view.reset(self.io);
         self.loading_frame = 0;
         // Leave `thread_auto_scroll` alone — if the user has scrolled away
         // from the tail to read older context, submitting another message
@@ -386,7 +386,7 @@ pub const App = struct {
             if (outcome.finished) self.awaitTurn();
             return false;
         }
-        var visible_change = try self.thread_projection.apply(self.gpa, &self.thread, event);
+        var visible_change = try self.turn_view.apply(self.gpa, &self.thread, event);
         switch (event) {
             .queued_messages_flushed => |count| {
                 if (count > 0 and self.queued_user_messages.items.len > 0) {
@@ -1648,7 +1648,7 @@ pub const App = struct {
     }
 
     fn appendMessageQueueFullNotice(self: *App) !void {
-        // The spinner is derived from `awaiting_output` and drawn at the tail,
+        // The spinner is derived from the turn view and drawn at the tail,
         // so appending below it needs no remove/re-append dance.
         _ = try self.thread.append(self.gpa, .notice, "notice", "MessageQueueFull");
     }
@@ -2282,7 +2282,7 @@ const RootWidget = struct {
         var visible_change = try self.drainAgentEvents(ctx);
         if (try self.app.drainModelLoad()) visible_change = true;
 
-        if (self.app.thread_projection.awaiting_output) {
+        if (self.app.turn_view.awaitingOutput()) {
             self.spinner_tick_accum += drain_tick_ms;
             if (self.spinner_tick_accum >= spinner_tick_threshold_ms) {
                 self.spinner_tick_accum = 0;
@@ -2391,13 +2391,13 @@ const RootWidget = struct {
             // A discarded (interrupted) turn's events are swallowed inside
             // applyAgentEvent — the Turn machine refuses to project them — so
             // draining stays a single uniform path.
-            if (self.app.thread_projection.awaiting_output) try self.ensureTick(ctx);
+            if (self.app.turn_view.awaitingOutput()) try self.ensureTick(ctx);
             switch (event_ptr.*) {
                 .tool_call_finished => refresh_diff = true,
                 else => {},
             }
             if (try self.app.applyAgentEvent(event_ptr.*)) visible_change = true;
-            if (self.app.thread_projection.awaiting_output) try self.ensureTick(ctx);
+            if (self.app.turn_view.awaitingOutput()) try self.ensureTick(ctx);
         }
         if (refresh_diff) {
             self.diff_refresh_pending = false;
@@ -2543,7 +2543,7 @@ const ThreadWidget = struct {
 
     fn messageWidgets(self: *ThreadWidget, ctx: vxfw.DrawContext) ![]vxfw.Widget {
         const messages = self.app.thread.messages.items;
-        const awaiting = self.app.thread_projection.awaiting_output;
+        const awaiting = self.app.turn_view.awaitingOutput();
         const total = messages.len + @intFromBool(awaiting);
         const widgets = try ctx.arena.alloc(vxfw.Widget, total);
         const bodies = try ctx.arena.alloc(MessageWidget, total);
@@ -2556,7 +2556,7 @@ const ThreadWidget = struct {
             // The loading spinner is derived UI, not a thread message: a
             // synthetic status row drawn at the tail while the turn waits for
             // the next chunk of model output.
-            const word = loading_spinners[self.app.thread_projection.loading_word_index];
+            const word = loading_spinners[self.app.turn_view.loading_word_index];
             const spinner = try ctx.arena.create(thread_mod.Message);
             spinner.* = .{ .kind = .status, .title = try ctx.arena.dupe(u8, word), .body = try ctx.arena.dupe(u8, "") };
             bodies[messages.len] = .{ .message = spinner, .selected = false, .loading_frame = self.app.loading_frame, .blackhole_frame = self.app.blackhole_frame, .gpa = self.app.gpa };
@@ -2567,7 +2567,7 @@ const ThreadWidget = struct {
 
     fn syncCursor(self: *ThreadWidget, ctx: vxfw.DrawContext) void {
         const messages = self.app.thread.messages.items;
-        const awaiting = self.app.thread_projection.awaiting_output;
+        const awaiting = self.app.turn_view.awaitingOutput();
         const total: u32 = @intCast(messages.len + @intFromBool(awaiting));
         if (total == 0) return;
         if (self.app.thread_auto_scroll) {
@@ -3859,10 +3859,10 @@ test "begin submit clears input and starts a turn awaiting output" {
     try std.testing.expectEqual(@as(usize, 0), app.input.buf.firstHalf().len);
     try std.testing.expectEqual(@as(usize, 0), app.input.buf.secondHalf().len);
     // The user message is the only thread entry; the spinner is derived from
-    // `awaiting_output` and drawn at the tail, never stored as a message.
+    // The loading spinner is drawn at the tail, never stored as a message.
     try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
     try std.testing.expectEqualStrings("hello", app.thread.messages.items[0].body);
-    try std.testing.expect(app.thread_projection.awaiting_output);
+    try std.testing.expect(app.turn_view.awaitingOutput());
     try std.testing.expectEqual(Turn.State.active, app.turn.state);
     try std.testing.expectEqual(@as(u32, 0), app.thread.selected.?);
 }
@@ -3875,7 +3875,7 @@ test "awaiting turn draws a synthetic spinner row at the tail" {
     defer app.deinit();
 
     _ = try app.thread.append(gpa, .user, "you", "hello");
-    app.thread_projection.awaiting_output = true;
+    app.turn_view.awaitModel();
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -3903,7 +3903,7 @@ test "begin submit queues while turn is in flight" {
     defer app.deinit();
     // Simulate a turn already streaming and waiting on the next chunk.
     app.turn.submit();
-    app.thread_projection.awaiting_output = true;
+    app.turn_view.awaitModel();
 
     try app.input.insertSliceAtCursor("later");
     try std.testing.expect(!try app.beginSubmit());
@@ -3918,7 +3918,7 @@ test "begin submit queues while turn is in flight" {
     try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
     try std.testing.expectEqualStrings("later", app.thread.messages.items[0].body);
-    try std.testing.expect(app.thread_projection.awaiting_output);
+    try std.testing.expect(app.turn_view.awaitingOutput());
 }
 
 test "begin submit shows notice when queued message queue is full" {
@@ -3929,7 +3929,7 @@ test "begin submit shows notice when queued message queue is full" {
     var app = App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
     app.turn.submit();
-    app.thread_projection.awaiting_output = true;
+    app.turn_view.awaitModel();
 
     var queued_count: usize = 0;
     while (queued_count < agent.message_queue_storage.len) : (queued_count += 1) {
@@ -3946,7 +3946,7 @@ test "begin submit shows notice when queued message queue is full" {
     try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
     try std.testing.expectEqual(.notice, app.thread.messages.items[0].kind);
     try std.testing.expectEqualStrings("MessageQueueFull", app.thread.messages.items[0].body);
-    try std.testing.expect(app.thread_projection.awaiting_output);
+    try std.testing.expect(app.turn_view.awaitingOutput());
 }
 
 test "opening model picker starts at top" {
@@ -4559,7 +4559,7 @@ test "empty content delta does not finalize thinking" {
     _ = try app.beginSubmit();
 
     _ = try app.applyAgentEvent(.{ .thinking_delta = "thinking" });
-    const thinking_index = app.thread_projection.thinking_index.?;
+    const thinking_index = app.turn_view.thinking_index.?;
     try std.testing.expectEqualStrings("Thinking...", app.thread.messages.items[thinking_index].title);
 
     _ = try app.applyAgentEvent(.{ .response_delta = "" });
@@ -4623,7 +4623,7 @@ test "loading does not appear during final answer after tool batch" {
     // No status message — the spinner is derived; the batch leaves us awaiting
     // the next response over the user + tool rows.
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
-    try std.testing.expect(app.thread_projection.awaiting_output);
+    try std.testing.expect(app.turn_view.awaitingOutput());
 
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "Final answer" }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
@@ -4755,7 +4755,7 @@ test "partial tool arguments do not create visible tool rows" {
     // stays up (awaiting) over the lone user message.
     try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
-    try std.testing.expect(app.thread_projection.awaiting_output);
+    try std.testing.expect(app.turn_view.awaitingOutput());
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
@@ -4866,7 +4866,7 @@ test "bash tool after batch creates a new tool row" {
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
     // Awaiting the next segment over the user + tool rows; spinner is derived.
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
-    try std.testing.expect(app.thread_projection.awaiting_output);
+    try std.testing.expect(app.turn_view.awaitingOutput());
 
     _ = try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,

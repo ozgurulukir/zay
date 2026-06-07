@@ -20,6 +20,15 @@ const QueuedUserMessage = struct {
 
 const MessageQueue = bounded_queue.BoundedQueue(QueuedUserMessage);
 
+const ToolBatch = struct {
+    calls: []const ai.ToolCall,
+
+    fn init(calls: []const ai.ToolCall) ToolBatch {
+        assert(calls.len > 0);
+        return .{ .calls = calls };
+    }
+};
+
 pub const Agent = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -229,7 +238,7 @@ pub const Agent = struct {
                 }
                 return;
             }
-            try self.runToolBatch(tool_calls, &stream_context, listener);
+            try self.runToolBatch(ToolBatch.init(tool_calls), &stream_context, listener);
             const drained_count = try self.drainQueuedUserMessage();
             if (drained_count > 0) try listener.emit(.{ .queued_messages_flushed = drained_count });
         }
@@ -241,7 +250,7 @@ pub const Agent = struct {
     /// the LLM-channel of each ToolResult into history.
     fn runToolBatch(
         self: *Agent,
-        tool_calls: []const ai.ToolCall,
+        tool_batch: ToolBatch,
         stream_context: *const StreamContext,
         listener: Listener,
     ) !void {
@@ -251,7 +260,7 @@ pub const Agent = struct {
             .stream_context = stream_context,
         };
         var executor = executor_mod.ExecutorService.init(self.gpa, self.io, self.cwd);
-        const results = try executor.runAll(tool_calls, .{
+        const results = try executor.runAll(tool_batch.calls, .{
             .ptr = &bridge,
             .on_started = ExecutorBridge.onStarted,
             .on_finished = ExecutorBridge.onFinished,

@@ -9,6 +9,36 @@ const assert = std.debug.assert;
 const schema_version: u32 = 1;
 pub const entry_id_len: u32 = 8;
 const session_id_len: u32 = 32;
+
+pub const EntryId = struct {
+    bytes: [entry_id_len]u8,
+
+    pub fn fromSlice(value: []const u8) Error!EntryId {
+        if (value.len != entry_id_len) return error.BadEntryId;
+        var bytes: [entry_id_len]u8 = undefined;
+        @memcpy(bytes[0..], value);
+        return .{ .bytes = bytes };
+    }
+
+    pub fn slice(self: *const EntryId) []const u8 {
+        return self.bytes[0..];
+    }
+};
+
+pub const SessionId = struct {
+    bytes: [session_id_len]u8,
+
+    pub fn fromSlice(value: []const u8) Error!SessionId {
+        if (value.len != session_id_len) return error.BadSessionId;
+        var bytes: [session_id_len]u8 = undefined;
+        @memcpy(bytes[0..], value);
+        return .{ .bytes = bytes };
+    }
+
+    pub fn slice(self: *const SessionId) []const u8 {
+        return self.bytes[0..];
+    }
+};
 const default_db_relative_path = ".nova/sessions.sqlite";
 const EntryQueue = bounded_queue.BoundedQueue(QueuedEntry);
 
@@ -80,7 +110,7 @@ pub const SessionManager = struct {
 
         return .{
             .manager = self,
-            .id = id_buffer,
+            .id = .{ .bytes = id_buffer },
             .leaf_entry_id = null,
         };
     }
@@ -94,8 +124,7 @@ pub const SessionManager = struct {
         try statement.bindText(1, session_id);
         const row = (try statement.step()) orelse return error.MissingSession;
 
-        var id_buffer: [session_id_len]u8 = undefined;
-        @memcpy(id_buffer[0..], session_id);
+        const id = try SessionId.fromSlice(session_id);
         var leaf_buffer: [entry_id_len]u8 = undefined;
         const leaf = switch (row.columnType(0)) {
             .null => null,
@@ -103,11 +132,11 @@ pub const SessionManager = struct {
                 const value = row.text(0);
                 if (value.len != entry_id_len) return error.BadEntryId;
                 @memcpy(leaf_buffer[0..], value);
-                break :blk leaf_buffer;
+                break :blk EntryId{ .bytes = leaf_buffer };
             },
             else => return error.BadEntryId,
         };
-        return .{ .manager = self, .id = id_buffer, .leaf_entry_id = leaf };
+        return .{ .manager = self, .id = id, .leaf_entry_id = leaf };
     }
 
     pub fn list(self: *SessionManager, gpa: std.mem.Allocator, cwd: ?[]const u8) Error![]SessionSummary {
@@ -155,8 +184,8 @@ pub const SessionSummary = struct {
 
 pub const Session = struct {
     manager: *SessionManager,
-    id: [session_id_len]u8,
-    leaf_entry_id: ?[entry_id_len]u8,
+    id: SessionId,
+    leaf_entry_id: ?EntryId,
 
     pub fn append(self: *Session, message: ai.ChatMessage, id_out: *[entry_id_len]u8) Error!void {
         fillHex(self.manager.io, id_out);
@@ -183,7 +212,7 @@ pub const Session = struct {
         defer statement.finalize();
         try statement.bindText(1, title);
         try statement.bindInt(2, nowMs(self.manager.io));
-        try statement.bindText(3, self.id[0..]);
+        try statement.bindText(3, self.id.slice());
         try expectDone(&statement);
     }
 
@@ -200,7 +229,7 @@ pub const Session = struct {
         } else {
             var buffer: [entry_id_len]u8 = undefined;
             @memcpy(buffer[0..], entry_id);
-            self.leaf_entry_id = buffer;
+            self.leaf_entry_id = .{ .bytes = buffer };
             try self.updateLeaf(entry_id);
         }
     }
@@ -230,12 +259,12 @@ pub const Session = struct {
     }
 
     pub fn leaf(self: *const Session) ?[]const u8 {
-        if (self.leaf_entry_id) |*id| return id[0..];
+        if (self.leaf_entry_id) |*id| return id.slice();
         return null;
     }
 
     fn insertEntry(self: *Session, id: *const [entry_id_len]u8, kind: []const u8, role: ?[]const u8, payload_json: []const u8) Error!void {
-        const parent: ?[]const u8 = if (self.leaf_entry_id) |*leaf_id| leaf_id[0..] else null;
+        const parent: ?[]const u8 = if (self.leaf_entry_id) |*leaf_id| leaf_id.slice() else null;
         try self.insertEntryWithParent(id, parent, kind, role, payload_json);
     }
 
@@ -246,7 +275,7 @@ pub const Session = struct {
         var statement = try self.manager.connection.prepare("insert into session_entries(id, session_id, parent_id, kind, role, payload_json, created_at_ms) values (?, ?, ?, ?, ?, ?, ?)");
         defer statement.finalize();
         try statement.bindText(1, id[0..]);
-        try statement.bindText(2, self.id[0..]);
+        try statement.bindText(2, self.id.slice());
         if (parent_id) |parent| {
             try statement.bindText(3, parent);
         } else {
@@ -261,7 +290,7 @@ pub const Session = struct {
         try statement.bindText(6, payload_json);
         try statement.bindInt(7, timestamp_ms);
         try expectDone(&statement);
-        self.leaf_entry_id = id.*;
+        self.leaf_entry_id = .{ .bytes = id.* };
         try self.updateLeaf(id[0..]);
     }
 
@@ -271,14 +300,14 @@ pub const Session = struct {
         defer statement.finalize();
         try statement.bindText(1, title);
         try statement.bindInt(2, nowMs(self.manager.io));
-        try statement.bindText(3, self.id[0..]);
+        try statement.bindText(3, self.id.slice());
         try expectDone(&statement);
     }
 
     pub fn hasTitle(self: *Session) Error!bool {
         var statement = try self.manager.connection.prepare("select title from sessions where id = ?");
         defer statement.finalize();
-        try statement.bindText(1, self.id[0..]);
+        try statement.bindText(1, self.id.slice());
         const row = (try statement.step()) orelse return error.MissingSession;
         return row.columnType(0) != .null and row.text(0).len > 0;
     }
@@ -289,14 +318,14 @@ pub const Session = struct {
         defer statement.finalize();
         try statement.bindText(1, leaf_id);
         try statement.bindInt(2, nowMs(self.manager.io));
-        try statement.bindText(3, self.id[0..]);
+        try statement.bindText(3, self.id.slice());
         try expectDone(&statement);
     }
 
     fn requireEntry(self: *Session, entry_id: []const u8) Error!void {
         var statement = try self.manager.connection.prepare("select 1 from session_entries where session_id = ? and id = ?");
         defer statement.finalize();
-        try statement.bindText(1, self.id[0..]);
+        try statement.bindText(1, self.id.slice());
         try statement.bindText(2, entry_id);
         if (try statement.step()) |_| return;
         return error.MissingEntry;
@@ -309,7 +338,7 @@ pub const Session = struct {
     pub fn entries(self: *Session, gpa: std.mem.Allocator) Error![]EntryRecord {
         var statement = try self.manager.connection.prepare("select id, parent_id, kind, role, payload_json, created_at_ms from session_entries where session_id = ? order by created_at_ms");
         defer statement.finalize();
-        try statement.bindText(1, self.id[0..]);
+        try statement.bindText(1, self.id.slice());
 
         var records: std.ArrayList(EntryRecord) = .empty;
         errdefer {
@@ -332,11 +361,11 @@ pub const Session = struct {
 
         var current = leaf_id;
         while (true) {
-            const record = try self.loadEntry(gpa, current[0..]);
+            const record = try self.loadEntry(gpa, current.slice());
             const parent = record.parent_id;
             try records.append(gpa, record);
             if (parent) |value| {
-                current = value;
+                current = .{ .bytes = value };
             } else {
                 break;
             }
@@ -348,7 +377,7 @@ pub const Session = struct {
     fn loadEntry(self: *Session, gpa: std.mem.Allocator, entry_id: []const u8) Error!EntryRecord {
         var statement = try self.manager.connection.prepare("select id, parent_id, kind, role, payload_json, created_at_ms from session_entries where session_id = ? and id = ?");
         defer statement.finalize();
-        try statement.bindText(1, self.id[0..]);
+        try statement.bindText(1, self.id.slice());
         try statement.bindText(2, entry_id);
         const row = (try statement.step()) orelse return error.MissingEntry;
         return readEntry(gpa, &row);
