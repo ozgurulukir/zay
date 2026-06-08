@@ -609,6 +609,7 @@ pub const App = struct {
             if (self.block_nav and self.selectionIsLastMessage() and !self.selectedMessageCanScrollDown()) {
                 self.block_nav = false;
                 self.thread_auto_scroll = true;
+                _ = try self.moveInputCursorVertical(.down);
                 return true;
             }
             const scrolled = self.navigateThread(.next);
@@ -734,7 +735,7 @@ pub const App = struct {
                 switch (command) {
                     .new => self.switchToNewSession() catch |err| try self.reportSessionSwitchError(err),
                     .resume_session => try self.openResumePicker(),
-                    .tree => self.openTreeSelector() catch |err| try self.reportSessionSwitchError(err),
+                    .timeline => self.openTimelineSelector() catch |err| try self.reportSessionSwitchError(err),
                     .connect => try self.openProviderPicker(),
                     .model => self.openModelPicker() catch |err| try self.reportConnectionError(err),
                 }
@@ -785,7 +786,7 @@ pub const App = struct {
         self.provider_key_input.clearRetainingCapacity();
     }
 
-    fn openTreeSelector(self: *App) !void {
+    fn openTimelineSelector(self: *App) !void {
         if (self.turn.isActive()) return error.InFlightTurn;
         self.mode = .tree_picker;
         self.clearInput();
@@ -2374,7 +2375,15 @@ const RootWidget = struct {
                             self.app.block_nav = true;
                         }
                     } else if (key.matches(vaxis.Key.down, .{})) {
-                        if (!self.app.block_nav) {
+                        if (self.app.block_nav) {
+                            if (self.app.thread.selected == null) {
+                                if (try self.app.moveInputCursorVertical(.down)) {
+                                    self.app.block_nav = false;
+                                    ctx.consumeAndRedraw();
+                                    return;
+                                }
+                            }
+                        } else {
                             _ = try self.app.moveInputCursorVertical(.down);
                             ctx.consumeAndRedraw();
                             return;
@@ -2734,21 +2743,21 @@ const ThreadWidget = struct {
     }
 };
 
-const Command = enum { connect, model, new, resume_session, tree };
+const Command = enum { connect, model, new, resume_session, timeline };
 const CommandEntry = struct { name: []const u8, command: Command };
 const commands = [_]CommandEntry{
     .{ .name = "Connect", .command = .connect },
     .{ .name = "Models", .command = .model },
     .{ .name = "New", .command = .new },
     .{ .name = "Resume", .command = .resume_session },
-    .{ .name = "Tree", .command = .tree },
+    .{ .name = "Timeline", .command = .timeline },
 };
 const command_panel_entries = [_]command_panel.Entry{
     .{ .name = "Connect" },
     .{ .name = "Models" },
     .{ .name = "New" },
     .{ .name = "Resume" },
-    .{ .name = "Tree" },
+    .{ .name = "Timeline" },
 };
 
 fn overlayLabel(mode: App.Mode) []const u8 {
@@ -2758,7 +2767,7 @@ fn overlayLabel(mode: App.Mode) []const u8 {
         .session_picker => "Search for Sessions",
         .provider_picker => "Connect to Provider",
         .model_picker => "Select Model",
-        .tree_picker => "Session Tree",
+        .tree_picker => "Session Timeline",
     };
 }
 
@@ -3661,6 +3670,38 @@ test "input wrapping uses word breaks" {
     try std.testing.expectEqual(@as(u16, 2), cursor.col);
 }
 
+test "down returns to multiline input after overshooting above top line" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    try app.input.insertSliceAtCursor("top\nmiddle\nbottom");
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.up } });
+    try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.up } });
+    try std.testing.expectEqualStrings("top", app.input.buf.firstHalf());
+
+    // One more Up leaves the input for block navigation.
+    try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.up } });
+    try std.testing.expect(app.block_nav);
+
+    // With no thread block selected, Down must return to the multiline input.
+    try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.down } });
+    try std.testing.expect(!app.block_nav);
+    try std.testing.expectEqualStrings("top\nmid", app.input.buf.firstHalf());
+
+    try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.down } });
+    try std.testing.expectEqualStrings("top\nmiddle\nbot", app.input.buf.firstHalf());
+}
+
 test "arrow up and down move the input cursor between lines" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
@@ -3789,6 +3830,27 @@ test "down past the last block re-enters the input" {
     _ = try app.handleThreadKey(.{ .codepoint = vaxis.Key.down });
     try std.testing.expect(!app.block_nav);
     try std.testing.expectEqual(@as(?u32, 2), app.thread.selected);
+}
+
+test "down past the last block moves into multiline input" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.thread_view_width = 80;
+    app.thread_view_height = 100;
+
+    _ = try app.thread.append(gpa, .agent, "agent", "one");
+    try app.input.insertSliceAtCursor("top\nmiddle");
+    // Put the cursor on the top line, just before the newline. Re-entering
+    // from block navigation should step down into the input line below.
+    app.input.buf.moveGapLeft("\nmiddle".len);
+    app.block_nav = true;
+
+    try std.testing.expect(try app.handleThreadKey(.{ .codepoint = vaxis.Key.down }));
+    try std.testing.expect(!app.block_nav);
+    try std.testing.expectEqualStrings("top\nmid", app.input.buf.firstHalf());
 }
 
 test "shift enter inserts a newline instead of submitting" {

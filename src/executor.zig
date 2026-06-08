@@ -169,7 +169,7 @@ test "ExecutorService runs bash and returns both channels" {
         .{
             .call_id = try gpa.dupe(u8, "call_0"),
             .name = try gpa.dupe(u8, "bash"),
-            .arguments = try gpa.dupe(u8, "{\"command\":\"printf hello\"}"),
+            .arguments = try gpa.dupe(u8, "{\"command\":\"printf hello\",\"reason\":\"read\"}"),
         },
     };
     defer for (calls) |c| {

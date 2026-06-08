@@ -73,7 +73,7 @@ const VisibleNode = struct {
     is_foldable: bool,
 };
 
-/// Owns the full tree plus the fold/filter UI state for the `/tree` overlay.
+/// Owns the full tree plus the fold/filter UI state for the `/timeline` overlay.
 /// The App holds one of these; the `Content` widget is a thin per-draw view.
 pub const TreeState = struct {
     gpa: std.mem.Allocator,

@@ -778,7 +778,7 @@ fn branchSummaryToJson(gpa: std.mem.Allocator, from_id: []const u8, summary: []c
     return out.toOwnedSlice();
 }
 
-/// Classification of a session entry, used by the `/tree` view to drive filter
+/// Classification of a session entry, used by the `/timeline` view to drive filter
 /// modes and to hide tool-call-only assistant turns by default.
 pub const EntryKind = enum {
     user,
@@ -798,7 +798,7 @@ pub const EntrySummary = struct {
     text: []u8,
 };
 
-/// Classify an entry and produce its one-line `/tree` summary in a single
+/// Classify an entry and produce its one-line `/timeline` summary in a single
 /// parse. Whitespace is collapsed and the text truncated to one row. Caller
 /// owns `text`.
 pub fn entrySummary(gpa: std.mem.Allocator, record: EntryRecord) Error!EntrySummary {

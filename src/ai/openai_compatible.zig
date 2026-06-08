@@ -763,7 +763,7 @@ test "buildToolsJson produces a valid JSON array for the registry" {
     defer parsed.deinit();
     try std.testing.expect(parsed.value == .array);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"bash\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"command\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"command\",\"reason\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "Shell command to run.") != null);
 }
 

@@ -13,6 +13,11 @@ pub const tool: common.Tool = .{
             .description = "Shell command to run.",
             .required = true,
         }, .{
+            .name = "reason",
+            .kind = .string,
+            .description = "Why this command is being run: read, edit, write, search, or other.",
+            .required = true,
+        }, .{
             .name = "cwd",
             .kind = .string,
             .description = "Working directory. Relative to the project unless absolute.",
@@ -75,6 +80,7 @@ pub fn runTool(
 
 const Args = struct {
     command: []const u8,
+    reason: Reason,
     cwd: ?[]const u8 = null,
     env: ?std.json.Value = null,
     parsed: std.json.Parsed(JsonArgs),
@@ -88,15 +94,20 @@ const Args = struct {
 
 const JsonArgs = struct {
     command: ?[]const u8 = null,
+    reason: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
     env: ?std.json.Value = null,
     timeout: ?u32 = null,
 };
 
+const Reason = enum { read, edit, write, search, other };
+
 const ParseError = error{
     InvalidJson,
     MissingCommand,
+    MissingReason,
     BadCommand,
+    BadReason,
     BadCwd,
     BadEnv,
     BadEnvKey,
@@ -110,6 +121,9 @@ fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args {
 
     const command = parsed.value.command orelse return error.MissingCommand;
     if (command.len == 0) return error.MissingCommand;
+
+    const reason_text = parsed.value.reason orelse return error.MissingReason;
+    const reason = std.meta.stringToEnum(Reason, reason_text) orelse return error.BadReason;
 
     if (parsed.value.cwd) |cwd| {
         if (cwd.len == 0) return error.BadCwd;
@@ -125,6 +139,7 @@ fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args {
 
     return .{
         .command = command,
+        .reason = reason,
         .cwd = parsed.value.cwd,
         .env = parsed.value.env,
         .parsed = parsed,
@@ -144,7 +159,9 @@ fn parseError(gpa: std.mem.Allocator, err: ParseError) common.Error!common.Outpu
     return switch (err) {
         error.InvalidJson => common.fail(gpa, "bash: invalid JSON arguments\n", 2),
         error.MissingCommand => common.fail(gpa, "bash: missing command\n", 2),
+        error.MissingReason => common.fail(gpa, "bash: missing reason\n", 2),
         error.BadCommand => common.fail(gpa, "bash: command must be a string\n", 2),
+        error.BadReason => common.fail(gpa, "bash: reason must be read, edit, write, search, or other\n", 2),
         error.BadCwd => common.fail(gpa, "bash: cwd must be a non-empty string\n", 2),
         error.BadEnv => common.fail(gpa, "bash: env must be an object\n", 2),
         error.BadEnvKey => common.fail(gpa, "bash: env keys must be valid environment variable names\n", 2),
@@ -401,7 +418,7 @@ test "bash tool applies env object" {
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
 
-    var output = try runTool(gpa, std.testing.io, cwd, "{\"command\":\"printf \\\"$BASH_TOOL_TEST\\\"\",\"env\":{\"BASH_TOOL_TEST\":\"hello-env\"}}");
+    var output = try runTool(gpa, std.testing.io, cwd, "{\"command\":\"printf \\\"$BASH_TOOL_TEST\\\"\",\"reason\":\"read\",\"env\":{\"BASH_TOOL_TEST\":\"hello-env\"}}");
     defer output.deinit(gpa);
 
     try std.testing.expectEqual(@as(u8, 0), output.code);
@@ -417,7 +434,7 @@ test "bash tool applies relative cwd" {
     const expected = try std.fs.path.join(gpa, &.{ cwd, ".zig-cache/bash-tool-test" });
     defer gpa.free(expected);
 
-    var output = try runTool(gpa, std.testing.io, cwd, "{\"command\":\"printf \\\"$PWD\\\"\",\"cwd\":\".zig-cache/bash-tool-test\"}");
+    var output = try runTool(gpa, std.testing.io, cwd, "{\"command\":\"printf \\\"$PWD\\\"\",\"reason\":\"read\",\"cwd\":\".zig-cache/bash-tool-test\"}");
     defer output.deinit(gpa);
 
     try std.testing.expectEqual(@as(u8, 0), output.code);
@@ -425,10 +442,17 @@ test "bash tool applies relative cwd" {
 }
 
 test "bash tool parses timeout" {
-    var args = try parseArgs(std.testing.allocator, "{\"command\":\"printf ok\",\"timeout\":42}");
+    var args = try parseArgs(std.testing.allocator, "{\"command\":\"printf ok\",\"reason\":\"read\",\"timeout\":42}");
     defer args.deinit();
 
     try std.testing.expectEqual(@as(u32, 42), args.timeout_seconds);
+}
+
+test "bash tool accepts other reason" {
+    var args = try parseArgs(std.testing.allocator, "{\"command\":\"printf ok\",\"reason\":\"other\"}");
+    defer args.deinit();
+
+    try std.testing.expectEqual(Reason.other, args.reason);
 }
 
 fn testObservationText(gpa: std.mem.Allocator, output: common.Output) ![]u8 {
@@ -441,7 +465,7 @@ test "bash tool reports exit code in observation" {
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
 
-    var output = try runTool(gpa, std.testing.io, cwd, "{\"command\":\"printf nope; exit 7\"}");
+    var output = try runTool(gpa, std.testing.io, cwd, "{\"command\":\"printf nope; exit 7\",\"reason\":\"read\"}");
     defer output.deinit(gpa);
     const observation = try testObservationText(gpa, output);
     defer gpa.free(observation);
@@ -456,7 +480,7 @@ test "bash tool truncates observation tail and keeps full output path" {
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
 
-    var output = try runTool(gpa, std.testing.io, cwd, "{\"command\":\"python3 - <<'PY'\\nfor i in range(2105): print(f'line-{i}')\\nPY\"}");
+    var output = try runTool(gpa, std.testing.io, cwd, "{\"command\":\"python3 - <<'PY'\\nfor i in range(2105): print(f'line-{i}')\\nPY\",\"reason\":\"read\"}");
     defer {
         if (output.observation) |observation| switch (observation) {
             .complete => {},
