@@ -20,8 +20,10 @@ pub const ToolResult = struct {
     /// up its display policy. Not strictly a channel — it's the same name
     /// the LM emitted.
     name: []u8,
-    /// Human channel — the Display label.
+    /// Human channel — the collapsed Display label.
     display_label: []u8,
+    /// Human channel — label shown in place of `display_label` when expanded.
+    display_expanded_label: ?[]u8,
     /// Human channel — the display body shown in the thread.
     display_body: []u8,
     /// Human channel — stderr text rendered in red below the body, or null.
@@ -34,6 +36,7 @@ pub const ToolResult = struct {
         gpa.free(self.content);
         gpa.free(self.name);
         gpa.free(self.display_label);
+        if (self.display_expanded_label) |label| gpa.free(label);
         gpa.free(self.display_body);
         if (self.stderr) |s| gpa.free(s);
         self.* = undefined;
@@ -106,8 +109,8 @@ pub const ExecutorService = struct {
         errdefer self.gpa.free(content);
         const name = try self.gpa.dupe(u8, call.name);
         errdefer self.gpa.free(name);
-        const display_label = try makeDisplayLabel(self.gpa, call.name, call.arguments);
-        errdefer self.gpa.free(display_label);
+        var display = try makeDisplay(self.gpa, call.name, call.arguments);
+        errdefer display.deinit(self.gpa);
         const display_body = try makeDisplayBody(self.gpa, output);
         errdefer self.gpa.free(display_body);
         const stderr = if (output.stderr.len > 0) try self.gpa.dupe(u8, output.stderr) else null;
@@ -116,7 +119,8 @@ pub const ExecutorService = struct {
             .call_id = call_id,
             .content = content,
             .name = name,
-            .display_label = display_label,
+            .display_label = display.label,
+            .display_expanded_label = display.expanded_label,
             .display_body = display_body,
             .stderr = stderr,
             .failed = failed,
@@ -137,13 +141,13 @@ fn formatLlmObservation(gpa: std.mem.Allocator, result: tools.Output) ![]u8 {
     return gpa.dupe(u8, "empty");
 }
 
-/// Look up the tool in the registry and delegate to its `displayLabel`.
+/// Look up the tool in the registry and delegate to its display formatter.
 /// Falls back to the tool name itself when unknown — shouldn't happen
 /// outside test code, since callers source the name from a `ToolCall`
 /// that the LM emitted.
-fn makeDisplayLabel(gpa: std.mem.Allocator, name: []const u8, args: []const u8) ![]u8 {
-    const tool = tools.lookup(name) orelse return gpa.dupe(u8, name);
-    return tool.displayLabel(gpa, args);
+fn makeDisplay(gpa: std.mem.Allocator, name: []const u8, args: []const u8) !tools.ToolDisplay {
+    const tool = tools.lookup(name) orelse return .{ .label = try gpa.dupe(u8, name) };
+    return tool.display(gpa, args);
 }
 
 /// The human-facing body. Each tool owns its own display: when it sets a
@@ -169,7 +173,7 @@ test "ExecutorService runs bash and returns both channels" {
         .{
             .call_id = try gpa.dupe(u8, "call_0"),
             .name = try gpa.dupe(u8, "bash"),
-            .arguments = try gpa.dupe(u8, "{\"command\":\"printf hello\",\"reason\":\"read\"}"),
+            .arguments = try gpa.dupe(u8, "{\"command\":\"printf hello\",\"reason\":\"Print hello\"}"),
         },
     };
     defer for (calls) |c| {
@@ -186,6 +190,7 @@ test "ExecutorService runs bash and returns both channels" {
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqualStrings("call_0", results[0].call_id);
     try std.testing.expectEqualStrings("hello", results[0].content);
-    try std.testing.expectEqualStrings("printf hello", results[0].display_label);
+    try std.testing.expectEqualStrings("Print hello", results[0].display_label);
+    try std.testing.expectEqualStrings("printf hello", results[0].display_expanded_label.?);
     try std.testing.expect(!results[0].failed);
 }

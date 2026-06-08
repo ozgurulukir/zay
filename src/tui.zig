@@ -1858,9 +1858,9 @@ pub const App = struct {
             for (candidate.content) |block| {
                 if (block != .tool_call) continue;
                 if (!std.mem.eql(u8, block.tool_call.call_id, id)) continue;
-                const label = try agent_mod.formatToolTitle(self.gpa, block.tool_call.name, block.tool_call.arguments);
-                defer self.gpa.free(label);
-                return thread_mod.toolTitle(self.gpa, label);
+                var display = try agent_mod.formatToolDisplay(self.gpa, block.tool_call.name, block.tool_call.arguments);
+                defer display.deinit(self.gpa);
+                return thread_mod.toolTitle(self.gpa, display.label);
             }
         }
         return thread_mod.toolTitle(self.gpa, id);
@@ -4737,13 +4737,14 @@ test "agent app events update thread on the ui side" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"ls\"}",
+        .arguments = "{\"command\":\"ls\",\"reason\":\"List files\"}",
     } }));
     try std.testing.expect(!try app.applyAgentEvent(.{ .thinking_delta = " files" }));
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
         .name = "bash",
-        .display_label = "ls",
+        .display_label = "List files",
+        .display_expanded_label = "ls",
         .display_body = "$ ls\nexit 0\nstdout:\n\nstderr:\n",
     } }));
 
@@ -4753,7 +4754,7 @@ test "agent app events update thread on the ui side" {
     try std.testing.expectEqual(.tool, app.thread.messages.items[2].kind);
     try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
     try std.testing.expectEqualStrings("checking files", app.thread.messages.items[1].body);
-    try std.testing.expectEqualStrings("🛠  ls", app.thread.messages.items[2].title);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.messages.items[2].title);
 }
 
 test "user can navigate away from a streaming thinking block" {
@@ -4871,12 +4872,13 @@ test "loading does not appear during final answer after tool batch" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"pwd\"}",
+        .arguments = "{\"command\":\"pwd\",\"reason\":\"Print working directory\"}",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
         .name = "bash",
-        .display_label = "pwd",
+        .display_label = "Print working directory",
+        .display_expanded_label = "pwd",
         .display_body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
@@ -4940,7 +4942,8 @@ test "bash tool waits for complete arguments while streaming" {
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
         .name = "bash",
-        .display_label = "printf hello",
+        .display_label = "Print hello",
+        .display_expanded_label = "printf hello",
         .display_body = "hello",
     } }));
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
@@ -4965,35 +4968,37 @@ test "tool row persists through finish and turn completion" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"ls\"}",
+        .arguments = "{\"command\":\"ls\",\"reason\":\"List files\"}",
     } }));
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
     try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  ls", app.thread.messages.items[1].title);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.messages.items[1].title);
+    try std.testing.expectEqualStrings("🛠  ls", app.thread.messages.items[1].tool_expanded_title.?);
     try std.testing.expect(app.thread.messages.items[1].tool_running);
     try std.testing.expect(app.thread.hasRunningTool());
 
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
     try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  ls", app.thread.messages.items[1].title);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.messages.items[1].title);
 
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
         .name = "bash",
-        .display_label = "ls",
+        .display_label = "List files",
+        .display_expanded_label = "ls",
         .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
     try std.testing.expect(!app.thread.messages.items[1].tool_running);
     try std.testing.expect(!app.thread.hasRunningTool());
     try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  ls", app.thread.messages.items[1].title);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.messages.items[1].title);
 
     try std.testing.expect(try app.applyAgentEvent(.turn_finished));
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
     try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  ls", app.thread.messages.items[1].title);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.messages.items[1].title);
 }
 
 test "partial tool arguments do not create visible tool rows" {
@@ -5024,11 +5029,11 @@ test "partial tool arguments do not create visible tool rows" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"ls\"}",
+        .arguments = "{\"command\":\"ls\",\"reason\":\"List files\"}",
     } }));
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
     try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  ls", app.thread.messages.items[1].title);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.messages.items[1].title);
 }
 
 test "tool finish creates row if no complete streamed arguments appeared" {
@@ -5053,13 +5058,14 @@ test "tool finish creates row if no complete streamed arguments appeared" {
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
         .name = "bash",
-        .display_label = "ls",
+        .display_label = "List files",
+        .display_expanded_label = "ls",
         .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
 
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
     try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  ls", app.thread.messages.items[1].title);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.messages.items[1].title);
 }
 
 test "new tool response index creates a new thread row" {
@@ -5079,12 +5085,13 @@ test "new tool response index creates a new thread row" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"ls\"}",
+        .arguments = "{\"command\":\"ls\",\"reason\":\"List files\"}",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
         .name = "bash",
-        .display_label = "ls",
+        .display_label = "List files",
+        .display_expanded_label = "ls",
         .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
@@ -5092,14 +5099,14 @@ test "new tool response index creates a new thread row" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"pwd\"}",
+        .arguments = "{\"command\":\"pwd\",\"reason\":\"Print working directory\"}",
     } }));
 
     try std.testing.expectEqual(@as(usize, 3), app.thread.messages.items.len);
     try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
     try std.testing.expectEqual(.tool, app.thread.messages.items[2].kind);
-    try std.testing.expectEqualStrings("🛠  ls", app.thread.messages.items[1].title);
-    try std.testing.expectEqualStrings("🛠  pwd", app.thread.messages.items[2].title);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.messages.items[1].title);
+    try std.testing.expectEqualStrings("🛠  Print working directory", app.thread.messages.items[2].title);
 }
 
 test "bash tool after batch creates a new tool row" {
@@ -5119,12 +5126,13 @@ test "bash tool after batch creates a new tool row" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"ls\"}",
+        .arguments = "{\"command\":\"ls\",\"reason\":\"List files\"}",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
         .name = "bash",
-        .display_label = "ls",
+        .display_label = "List files",
+        .display_expanded_label = "ls",
         .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
@@ -5135,7 +5143,7 @@ test "bash tool after batch creates a new tool row" {
     _ = try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"printf done\"}",
+        .arguments = "{\"command\":\"printf done\",\"reason\":\"Print done\"}",
     } });
 
     try std.testing.expectEqual(@as(usize, 3), app.thread.messages.items.len);
@@ -5161,21 +5169,22 @@ test "late tool finish does not move selection upward" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"ls\"}",
+        .arguments = "{\"command\":\"ls\",\"reason\":\"List files\"}",
     } }));
     try std.testing.expectEqual(@as(u32, 1), app.thread.selected.?);
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 1,
         .name = "bash",
-        .arguments = "{\"command\":\"pwd\"}",
+        .arguments = "{\"command\":\"pwd\",\"reason\":\"Print working directory\"}",
     } }));
     try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
 
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
         .name = "bash",
-        .display_label = "ls",
+        .display_label = "List files",
+        .display_expanded_label = "ls",
         .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
     try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
@@ -5202,12 +5211,13 @@ test "loading does not resume after post-tool thinking delta" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"pwd\"}",
+        .arguments = "{\"command\":\"pwd\",\"reason\":\"Print working directory\"}",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
         .name = "bash",
-        .display_label = "pwd",
+        .display_label = "Print working directory",
+        .display_expanded_label = "pwd",
         .display_body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
@@ -5240,12 +5250,13 @@ test "agent response after tool batch appears below tool rows" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"pwd\"}",
+        .arguments = "{\"command\":\"pwd\",\"reason\":\"Print working directory\"}",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
         .name = "bash",
-        .display_label = "pwd",
+        .display_label = "Print working directory",
+        .display_expanded_label = "pwd",
         .display_body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
@@ -5257,7 +5268,7 @@ test "agent response after tool batch appears below tool rows" {
     try std.testing.expectEqual(.tool, app.thread.messages.items[2].kind);
     try std.testing.expectEqual(.agent, app.thread.messages.items[3].kind);
     try std.testing.expectEqualStrings("I will check.", app.thread.messages.items[1].body);
-    try std.testing.expectEqualStrings("🛠  pwd", app.thread.messages.items[2].title);
+    try std.testing.expectEqualStrings("🛠  Print working directory", app.thread.messages.items[2].title);
     try std.testing.expectEqualStrings("The repo is in /tmp.", app.thread.messages.items[3].body);
     try std.testing.expectEqual(@as(u32, 3), app.thread.selected.?);
 }
@@ -5283,7 +5294,7 @@ test "content delta after tool preview does not move selection away from tool ro
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"pwd\"}",
+        .arguments = "{\"command\":\"pwd\",\"reason\":\"Print working directory\"}",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
     try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
@@ -5295,12 +5306,13 @@ test "content delta after tool preview does not move selection away from tool ro
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
         .name = "bash",
-        .display_label = "pwd",
+        .display_label = "Print working directory",
+        .display_expanded_label = "pwd",
         .display_body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
     } }));
     try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
     try std.testing.expectEqualStrings("I will check.", app.thread.messages.items[1].body);
-    try std.testing.expectEqualStrings("🛠  pwd", app.thread.messages.items[2].title);
+    try std.testing.expectEqualStrings("🛠  Print working directory", app.thread.messages.items[2].title);
     try std.testing.expectEqualStrings(" Still checking.", app.thread.messages.items[3].body);
 }
 

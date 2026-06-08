@@ -25,15 +25,20 @@ pub fn messageContentRows(message: thread_mod.Message, width: u16) u16 {
             1,
         .status => 1,
         .tool => if (message.expanded)
-            toolTitleRows(message.title, width) + toolBodyRows(message, width)
+            toolTitleRows(toolMessageTitle(message), width) + toolBodyRows(message, width)
         else
-            toolTitleRows(message.title, width),
+            toolTitleRows(toolMessageTitle(message), width),
     };
 }
 
 pub fn toolTitleRows(title: []const u8, width: u16) u16 {
     const indent: u16 = 3;
     return textRows(toolCommandTitle(title), width -| indent);
+}
+
+fn toolMessageTitle(message: thread_mod.Message) []const u8 {
+    if (message.expanded) return message.tool_expanded_title orelse message.title;
+    return message.title;
 }
 
 pub fn toolBodyRows(message: thread_mod.Message, width: u16) u16 {

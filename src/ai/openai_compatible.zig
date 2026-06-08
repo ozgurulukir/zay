@@ -775,7 +775,7 @@ test "buildToolsJson substitutes {{hsep}} placeholders with ~" {
             .description = "uses {{hsep}} marker",
             .schema = .{ .properties = &.{} },
             .run = undefined,
-            .displayLabel = undefined,
+            .display = undefined,
         },
     };
     const json = try buildToolsJson(gpa, &tools);

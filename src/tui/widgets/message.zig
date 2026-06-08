@@ -134,7 +134,8 @@ pub const MessageWidget = struct {
         std.debug.assert(message.kind == .tool);
         std.debug.assert(loading_frame < loading_frames.len);
         const prefix = if (message.tool_running) loading_frames[loading_frame] else "🛠";
-        const command = toolCommandTitle(message.title);
+        const title = if (message.expanded) message.tool_expanded_title orelse message.title else message.title;
+        const command = toolCommandTitle(title);
         drawToolTitleWrapped(surface, prefix, command, style, selected, row, ctx);
     }
 
@@ -510,6 +511,35 @@ fn skipLinearWhitespace(line: []const u8, start: usize) usize {
 
 fn isLinearWhitespace(bytes: []const u8) bool {
     return std.mem.eql(u8, bytes, " ") or std.mem.eql(u8, bytes, "\t");
+}
+
+test "expanded tool title uses expanded command" {
+    const gpa = std.testing.allocator;
+    var thread: thread_mod.Thread = .{};
+    defer thread.deinit(gpa);
+
+    const index = try thread.startTool(gpa, "List files");
+    try thread.updateToolExpanded(gpa, index, "List files", "pwd");
+    thread.messages.items[index].expanded = true;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var message_widget: MessageWidget = .{
+        .message = &thread.messages.items[index],
+        .selected = true,
+        .loading_frame = 0,
+        .blackhole_frame = 0,
+        .gpa = gpa,
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 40, .height = 4 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try message_widget.widget().draw(ctx);
+
+    try std.testing.expectEqualStrings("p", surface.readCell(ConversationLayout.left + 3, 1).char.grapheme);
 }
 
 test "wrappedLineEnd wraps before overflowing word" {

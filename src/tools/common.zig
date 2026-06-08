@@ -58,6 +58,19 @@ pub const Error = error{
     OutOfMemory,
 } || std.Io.Cancelable || std.Io.UnexpectedError;
 
+pub const ToolDisplay = struct {
+    /// Human-facing summary shown while the tool is collapsed.
+    label: []u8,
+    /// Machine-facing detail shown in place of `label` when expanded.
+    expanded_label: ?[]u8 = null,
+
+    pub fn deinit(self: *ToolDisplay, gpa: std.mem.Allocator) void {
+        gpa.free(self.label);
+        if (self.expanded_label) |label| gpa.free(label);
+        self.* = undefined;
+    }
+};
+
 /// A typed record describing one tool. The Tool registry in `tools.zig`
 /// is a slice of these; it is the single source of truth for what tools
 /// exist. Display policy (Expand-by-default, render mode) is NOT carried
@@ -74,13 +87,13 @@ pub const Tool = struct {
         cwd: []const u8,
         args: []const u8,
     ) Error!Output,
-    /// Produce the **Display label** shown in the TUI's `$ <label>` line.
-    /// Parses the tool's argument JSON to pick a meaningful summary; falls
-    /// back to the bare tool name on partial / invalid JSON.
-    displayLabel: *const fn (
+    /// Produce the human display metadata shown in the TUI's tool row.
+    /// `label` is the collapsed summary; `expanded_label`, when present,
+    /// replaces it while the row is expanded.
+    display: *const fn (
         gpa: std.mem.Allocator,
         args: []const u8,
-    ) std.mem.Allocator.Error![]u8,
+    ) std.mem.Allocator.Error!ToolDisplay,
 };
 
 pub const Schema = struct {
@@ -130,10 +143,9 @@ pub fn failFmt(
     return .{ .stdout = stdout, .stderr = stderr, .code = code, .display = null };
 }
 
-/// Helper for Display label implementations. Parses the argument JSON and
-/// extracts a single string field; returns the bare `fallback` (owned) when
-/// the JSON is partial / invalid / missing the field. This is the function
-/// every tool's `displayLabel` ends up calling for the common case.
+/// Helper for display implementations. Parses the argument JSON and extracts
+/// a single string field; returns the bare `fallback` (owned) when the JSON is
+/// partial / invalid / missing the field.
 pub fn readFileBytes(gpa: std.mem.Allocator, io: std.Io, absolute: []const u8, bytes_max: usize) ![]u8 {
     var file = try std.Io.Dir.openFileAbsolute(io, absolute, .{});
     defer file.close(io);

@@ -155,6 +155,7 @@ pub const Agent = struct {
             call_id: []const u8 = "",
             name: []const u8,
             display_label: []const u8,
+            display_expanded_label: ?[]const u8 = null,
             display_body: []const u8,
             stderr: ?[]const u8 = null,
             failed: bool = false,
@@ -171,6 +172,7 @@ pub const Agent = struct {
                     gpa.free(tool.call_id);
                     gpa.free(tool.name);
                     gpa.free(tool.display_label);
+                    if (tool.display_expanded_label) |label| gpa.free(label);
                     gpa.free(tool.display_body);
                     if (tool.stderr) |stderr| gpa.free(stderr);
                 },
@@ -299,6 +301,7 @@ pub const Agent = struct {
                 result.call_id,
                 result.name,
                 result.display_label,
+                result.display_expanded_label,
                 result.display_body,
                 result.stderr,
                 result.failed,
@@ -381,6 +384,7 @@ pub const Agent = struct {
         call_id: []const u8,
         name: []const u8,
         display_label: []const u8,
+        display_expanded_label: ?[]const u8,
         display_body: []const u8,
         stderr: ?[]const u8,
         failed: bool,
@@ -391,6 +395,11 @@ pub const Agent = struct {
         errdefer self.gpa.free(owned_name);
         const owned_label = try self.gpa.dupe(u8, display_label);
         errdefer self.gpa.free(owned_label);
+        const owned_expanded_label: ?[]u8 = if (display_expanded_label) |label|
+            try self.gpa.dupe(u8, label)
+        else
+            null;
+        errdefer if (owned_expanded_label) |label| self.gpa.free(label);
         const owned_body = try self.gpa.dupe(u8, display_body);
         errdefer self.gpa.free(owned_body);
         const owned_stderr: ?[]u8 = if (stderr) |s|
@@ -404,6 +413,7 @@ pub const Agent = struct {
                 .call_id = owned_id,
                 .name = owned_name,
                 .display_label = owned_label,
+                .display_expanded_label = owned_expanded_label,
                 .display_body = owned_body,
                 .stderr = owned_stderr,
                 .failed = failed,
@@ -490,6 +500,7 @@ pub const Agent = struct {
             });
             try self.persistLastMessage();
             self.gpa.free(r.name);
+            if (r.display_expanded_label) |label| self.gpa.free(label);
             self.gpa.free(r.display_body);
             if (r.stderr) |s| self.gpa.free(s);
             r.* = undefined;
@@ -519,13 +530,13 @@ pub fn parseCommand(gpa: std.mem.Allocator, arguments: []const u8) ![]u8 {
     return try gpa.dupe(u8, command);
 }
 
-/// Render a friendly title for a tool call by delegating to the registered
-/// tool's `displayLabel`. Falls back to `<name> <arguments>` for tools that
-/// aren't in the registry (shouldn't happen outside test paths).
-pub fn formatToolTitle(gpa: std.mem.Allocator, name: []const u8, arguments: []const u8) ![]u8 {
+/// Render friendly display metadata for a tool call by delegating to the
+/// registered tool. Falls back to `<name> <arguments>` for tools that aren't
+/// in the registry (shouldn't happen outside test paths).
+pub fn formatToolDisplay(gpa: std.mem.Allocator, name: []const u8, arguments: []const u8) !tools.ToolDisplay {
     const tool = tools.lookup(name) orelse
-        return std.fmt.allocPrint(gpa, "{s} {s}", .{ name, arguments });
-    return tool.displayLabel(gpa, arguments);
+        return .{ .label = try std.fmt.allocPrint(gpa, "{s} {s}", .{ name, arguments }) };
+    return tool.display(gpa, arguments);
 }
 
 test "parse bash command arguments" {

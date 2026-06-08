@@ -9,6 +9,7 @@ const std = @import("std");
 const agent_mod = @import("../agent.zig");
 const ai = @import("../ai.zig");
 const thread_mod = @import("../thread.zig");
+const tools_mod = @import("../tools.zig");
 const tool_policy = @import("tool_policy.zig");
 
 const assert = std.debug.assert;
@@ -240,8 +241,9 @@ pub const TurnView = struct {
                 return try self.applySkillPreview(gpa, thread, tool.index, skill_name);
             }
         }
-        const title = try agent_mod.formatToolTitle(gpa, tool.name, tool.arguments);
-        defer gpa.free(title);
+        var display = try agent_mod.formatToolDisplay(gpa, tool.name, tool.arguments);
+        defer display.deinit(gpa);
+        if (std.mem.eql(u8, tool.name, "bash") and display.expanded_label == null) return false;
 
         // Reached only once arguments parse — partial tool args return above,
         // keeping the spinner up. Clearing it here counts as a visible change.
@@ -249,10 +251,11 @@ pub const TurnView = struct {
 
         var visible_change = false;
         if (self.toolThreadIndex(tool.index)) |index| {
-            visible_change = !toolTitleMatchesCommand(thread.messages.items[index].title, title);
-            try thread.updateTool(gpa, index, title);
+            visible_change = !toolDisplayMatches(thread.messages.items[index], display);
+            try thread.updateToolExpanded(gpa, index, display.label, display.expanded_label);
         } else {
-            const index = try thread.startTool(gpa, title);
+            const index = try thread.startTool(gpa, display.label);
+            try thread.updateToolExpanded(gpa, index, display.label, display.expanded_label);
             try self.putToolThreadIndex(gpa, tool.index, index);
             visible_change = true;
         }
@@ -271,6 +274,7 @@ pub const TurnView = struct {
         gpa.free(message.title);
         gpa.free(message.body);
         if (message.stderr_body) |stderr| gpa.free(stderr);
+        if (message.tool_expanded_title) |expanded_title| gpa.free(expanded_title);
         message.* = .{
             .kind = .skill,
             .title = owned_title,
@@ -322,6 +326,7 @@ pub const TurnView = struct {
         }
         const index = if (existing_index) |index| index else index: {
             const created = try thread.startTool(gpa, tool.display_label);
+            try thread.updateToolExpanded(gpa, created, tool.display_label, tool.display_expanded_label);
             try self.putToolThreadIndex(gpa, tool.index, created);
             break :index created;
         };
@@ -329,7 +334,7 @@ pub const TurnView = struct {
         const visible_before = toolFinishVisibleChange(thread, index, tool.display_label);
         const was_expanded = thread.messages.items[index].expanded;
         const was_running = thread.messages.items[index].tool_running;
-        try thread.updateTool(gpa, index, tool.display_label);
+        try thread.updateToolExpanded(gpa, index, tool.display_label, tool.display_expanded_label);
         try thread.finishTool(gpa, index, tool.display_body, tool.stderr, tool.failed);
         thread.setExpanded(index, policy.expand_by_default);
         thread.messages.items[index].tool_render = policy.render;
@@ -363,13 +368,10 @@ pub const TurnView = struct {
     fn skillNameFromBashRead(gpa: std.mem.Allocator, arguments: []const u8) !?[]u8 {
         const JsonArgs = struct {
             command: ?[]const u8 = null,
-            reason: ?[]const u8 = null,
         };
         const parsed = std.json.parseFromSlice(JsonArgs, gpa, arguments, .{ .ignore_unknown_fields = true }) catch return null;
         defer parsed.deinit();
         const command = parsed.value.command orelse return null;
-        const reason = parsed.value.reason orelse return null;
-        if (!std.mem.eql(u8, reason, "read")) return null;
         if (!commandReadsSkill(command)) return null;
         const name = skillNameFromCommand(command) orelse return null;
         return try gpa.dupe(u8, name);
@@ -409,9 +411,22 @@ pub const TurnView = struct {
     }
 };
 
+fn toolDisplayMatches(message: thread_mod.Message, display: tools_mod.ToolDisplay) bool {
+    if (!toolTitleMatchesText(message.title, display.label)) return false;
+    if (display.expanded_label) |label| {
+        const title = message.tool_expanded_title orelse return false;
+        return toolTitleMatchesText(title, label);
+    }
+    return message.tool_expanded_title == null;
+}
+
 fn toolTitleMatchesCommand(title: []const u8, command: []const u8) bool {
+    return toolTitleMatchesText(title, command);
+}
+
+fn toolTitleMatchesText(title: []const u8, text: []const u8) bool {
     const prefix = "🛠  ";
-    return std.mem.startsWith(u8, title, prefix) and std.mem.eql(u8, title[prefix.len..], command);
+    return std.mem.startsWith(u8, title, prefix) and std.mem.eql(u8, title[prefix.len..], text);
 }
 
 fn chooseLoadingWordIndex(io: std.Io) u8 {
@@ -431,7 +446,7 @@ test "bash read of skill renders skill row" {
     const changed = try view.applyToolPreview(gpa, &thread, .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"cat .agents/skills/tigerstyle/SKILL.md\",\"reason\":\"read\"}",
+        .arguments = "{\"command\":\"cat .agents/skills/tigerstyle/SKILL.md\",\"reason\":\"Read the tigerstyle skill instructions\"}",
     });
 
     try std.testing.expect(changed);
@@ -442,7 +457,8 @@ test "bash read of skill renders skill row" {
     const finished = try view.applyToolFinished(gpa, &thread, .{
         .index = 0,
         .name = "bash",
-        .display_label = "cat .agents/skills/tigerstyle/SKILL.md",
+        .display_label = "Read the tigerstyle skill instructions",
+        .display_expanded_label = "cat .agents/skills/tigerstyle/SKILL.md",
         .display_body = "skill file contents",
     });
     try std.testing.expect(finished);
@@ -452,10 +468,11 @@ test "bash read of skill renders skill row" {
     try std.testing.expect(thread.messages.items[0].expanded);
 }
 
-test "bash read of skill ignores non-read reason" {
+test "bash skill detection uses command, not reason" {
     const gpa = std.testing.allocator;
-    const skill_name = try TurnView.skillNameFromBashRead(gpa, "{\"command\":\"cat .agents/skills/tigerstyle/SKILL.md\",\"reason\":\"other\"}");
-    try std.testing.expect(skill_name == null);
+    const skill_name = try TurnView.skillNameFromBashRead(gpa, "{\"command\":\"cat .agents/skills/tigerstyle/SKILL.md\",\"reason\":\"Read the skill file\"}");
+    defer if (skill_name) |name| gpa.free(name);
+    try std.testing.expectEqualStrings("tigerstyle", skill_name.?);
 }
 
 test "turn view streams content into thread" {

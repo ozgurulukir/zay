@@ -15,7 +15,7 @@ pub const tool: common.Tool = .{
         }, .{
             .name = "reason",
             .kind = .string,
-            .description = "Why this command is being run: read, edit, write, search, or other.",
+            .description = "Human-readable single-sentence explanation of what this command does.",
             .required = true,
         }, .{
             .name = "cwd",
@@ -30,7 +30,7 @@ pub const tool: common.Tool = .{
         }, .{ .name = "timeout", .kind = .integer, .description = "Timeout in seconds (default 10).", .required = false } },
     },
     .run = runTool,
-    .displayLabel = displayLabel,
+    .display = display,
 };
 
 pub fn runTool(
@@ -80,7 +80,7 @@ pub fn runTool(
 
 const Args = struct {
     command: []const u8,
-    reason: Reason,
+    reason: []const u8,
     cwd: ?[]const u8 = null,
     env: ?std.json.Value = null,
     parsed: std.json.Parsed(JsonArgs),
@@ -100,14 +100,11 @@ const JsonArgs = struct {
     timeout: ?u32 = null,
 };
 
-const Reason = enum { read, edit, write, search, other };
-
 const ParseError = error{
     InvalidJson,
     MissingCommand,
     MissingReason,
     BadCommand,
-    BadReason,
     BadCwd,
     BadEnv,
     BadEnvKey,
@@ -122,8 +119,8 @@ fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args {
     const command = parsed.value.command orelse return error.MissingCommand;
     if (command.len == 0) return error.MissingCommand;
 
-    const reason_text = parsed.value.reason orelse return error.MissingReason;
-    const reason = std.meta.stringToEnum(Reason, reason_text) orelse return error.BadReason;
+    const reason = parsed.value.reason orelse return error.MissingReason;
+    if (reason.len == 0) return error.MissingReason;
 
     if (parsed.value.cwd) |cwd| {
         if (cwd.len == 0) return error.BadCwd;
@@ -161,7 +158,6 @@ fn parseError(gpa: std.mem.Allocator, err: ParseError) common.Error!common.Outpu
         error.MissingCommand => common.fail(gpa, "bash: missing command\n", 2),
         error.MissingReason => common.fail(gpa, "bash: missing reason\n", 2),
         error.BadCommand => common.fail(gpa, "bash: command must be a string\n", 2),
-        error.BadReason => common.fail(gpa, "bash: reason must be read, edit, write, search, or other\n", 2),
         error.BadCwd => common.fail(gpa, "bash: cwd must be a non-empty string\n", 2),
         error.BadEnv => common.fail(gpa, "bash: env must be an object\n", 2),
         error.BadEnvKey => common.fail(gpa, "bash: env keys must be valid environment variable names\n", 2),
@@ -393,24 +389,38 @@ fn mapBashError(err: anyerror) common.Error {
     };
 }
 
-/// The bash Display label is the command itself, not "bash <command>" —
-/// the `$ ` prefix added by `thread.zig` already reads as a shell prompt.
-fn displayLabel(gpa: std.mem.Allocator, args: []const u8) std.mem.Allocator.Error![]u8 {
-    return common.extractStringField(gpa, args, "command", "bash");
+/// The bash display summary is the model-provided reason; the expanded title
+/// is the executable command, so users can inspect exactly what ran.
+fn display(gpa: std.mem.Allocator, args: []const u8) std.mem.Allocator.Error!common.ToolDisplay {
+    const parsed = std.json.parseFromSlice(JsonArgs, gpa, args, .{ .ignore_unknown_fields = true }) catch {
+        return .{ .label = try gpa.dupe(u8, "bash") };
+    };
+    defer parsed.deinit();
+    const reason = parsed.value.reason orelse return .{ .label = try gpa.dupe(u8, "bash") };
+    if (reason.len == 0) return .{ .label = try gpa.dupe(u8, "bash") };
+    const command = parsed.value.command orelse return .{ .label = try gpa.dupe(u8, "bash") };
+    if (command.len == 0) return .{ .label = try gpa.dupe(u8, "bash") };
+
+    const label = try gpa.dupe(u8, reason);
+    errdefer gpa.free(label);
+    const expanded_label = try gpa.dupe(u8, command);
+    return .{ .label = label, .expanded_label = expanded_label };
 }
 
-test "bash displayLabel extracts command" {
+test "bash display uses reason with command as expanded label" {
     const gpa = std.testing.allocator;
-    const label = try displayLabel(gpa, "{\"command\":\"pwd\"}");
-    defer gpa.free(label);
-    try std.testing.expectEqualStrings("pwd", label);
+    var label = try display(gpa, "{\"command\":\"pwd\",\"reason\":\"Inspect the current directory\"}");
+    defer label.deinit(gpa);
+    try std.testing.expectEqualStrings("Inspect the current directory", label.label);
+    try std.testing.expectEqualStrings("pwd", label.expanded_label.?);
 }
 
-test "bash displayLabel falls back on partial JSON" {
+test "bash display falls back on partial JSON" {
     const gpa = std.testing.allocator;
-    const label = try displayLabel(gpa, "{\"command");
-    defer gpa.free(label);
-    try std.testing.expectEqualStrings("bash", label);
+    var label = try display(gpa, "{\"command");
+    defer label.deinit(gpa);
+    try std.testing.expectEqualStrings("bash", label.label);
+    try std.testing.expect(label.expanded_label == null);
 }
 
 test "bash tool applies env object" {
@@ -448,11 +458,11 @@ test "bash tool parses timeout" {
     try std.testing.expectEqual(@as(u32, 42), args.timeout_seconds);
 }
 
-test "bash tool accepts other reason" {
-    var args = try parseArgs(std.testing.allocator, "{\"command\":\"printf ok\",\"reason\":\"other\"}");
+test "bash tool accepts freeform reason" {
+    var args = try parseArgs(std.testing.allocator, "{\"command\":\"printf ok\",\"reason\":\"Print ok\"}");
     defer args.deinit();
 
-    try std.testing.expectEqual(Reason.other, args.reason);
+    try std.testing.expectEqualStrings("Print ok", args.reason);
 }
 
 fn testObservationText(gpa: std.mem.Allocator, output: common.Output) ![]u8 {

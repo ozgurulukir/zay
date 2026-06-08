@@ -77,6 +77,9 @@ pub const Message = struct {
     /// rendered in red below the gray body. Null when the tool produced no
     /// stderr output.
     stderr_body: ?[]u8 = null,
+    /// Only meaningful when `kind == .tool`. Title shown when the row is
+    /// expanded; used for bash to reveal the exact command behind a summary.
+    tool_expanded_title: ?[]u8 = null,
     /// Cached row count; see `RowCache`. Not owned, needs no cleanup.
     row_cache: RowCache = .{},
     /// Cached rendered markdown; see `RenderCache`. Owned — freed in `deinit`.
@@ -86,6 +89,7 @@ pub const Message = struct {
         gpa.free(self.title);
         gpa.free(self.body);
         if (self.stderr_body) |stderr| gpa.free(stderr);
+        if (self.tool_expanded_title) |title| gpa.free(title);
         if (self.render_cache.rendered) |*rendered| rendered.deinit(gpa);
         self.* = undefined;
     }
@@ -261,13 +265,28 @@ pub const Thread = struct {
     }
 
     pub fn updateTool(self: *Thread, gpa: std.mem.Allocator, index: u32, command: []const u8) !void {
+        try self.updateToolExpanded(gpa, index, command, null);
+    }
+
+    pub fn updateToolExpanded(
+        self: *Thread,
+        gpa: std.mem.Allocator,
+        index: u32,
+        command: []const u8,
+        expanded_command: ?[]const u8,
+    ) !void {
         assert(index < self.messages.items.len);
         const message = &self.messages.items[index];
         assert(message.kind == .tool);
 
         const title = try toolTitle(gpa, command);
+        errdefer gpa.free(title);
+        const expanded_title = if (expanded_command) |value| try toolTitle(gpa, value) else null;
+        errdefer if (expanded_title) |value| gpa.free(value);
         gpa.free(message.title);
+        if (message.tool_expanded_title) |value| gpa.free(value);
         message.title = title;
+        message.tool_expanded_title = expanded_title;
         message.invalidateRowCache();
     }
 

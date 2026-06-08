@@ -9,6 +9,7 @@ pub const Output = common.Output;
 pub const Error = common.Error;
 pub const Tool = common.Tool;
 pub const Schema = common.Schema;
+pub const ToolDisplay = common.ToolDisplay;
 
 /// The Tool registry — single source of truth for what tools exist.
 /// Consumed by `ExecutorService` (for dispatch) and by each `LanguageModel`

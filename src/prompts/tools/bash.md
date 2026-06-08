@@ -1,6 +1,6 @@
 Run a shell command.
 
-- Always set `reason` to one of: `read`, `edit`, `write`, `search`, or `other`.
+- Always set `reason` to a human-readable single-sentence explanation of what the command does.
 - Set the working directory with the `cwd` param, not `cd dir && ...` because each call starts a fresh shell.
 - Pass values via `env: { NAME: "..." }` for multiline or complex values. Reference them as `"$NAME"`.
 - Quote every expansion: `"$var"`, `"$(cmd)"`, `"${arr[@]}"`.
