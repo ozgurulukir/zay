@@ -3435,7 +3435,7 @@ const InputWidget = struct {
         const text_rows: u16 = @min(try self.app.inputTextRows(ctx, input_width), @max(@as(u16, 1), avail -| 2));
         const border_height: u16 = text_rows + 2;
 
-        if (height <= input_row + border_height) {
+        if (height < input_row + border_height) {
             return try self.drawInputBorder(ctx, max_width, @min(height, border_height), text_rows);
         }
 
@@ -4149,6 +4149,36 @@ test "begin submit queues while turn is in flight" {
     try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
     try std.testing.expectEqualStrings("later", app.thread.messages.items[0].body);
     try std.testing.expect(app.turn_view.awaitingOutput());
+}
+
+test "queued prompt draws above input at minimum input height" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.turn.submit();
+    app.turn_view.awaitModel();
+
+    try app.input.insertSliceAtCursor("later");
+    try std.testing.expect(!try app.beginSubmit());
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var input_widget: InputWidget = .{ .app = &app };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 40, .height = 4 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try input_widget.widget().draw(ctx);
+
+    try std.testing.expectEqual(@as(usize, 2), surface.children.len);
+    try std.testing.expectEqual(@as(u16, 0), surface.children[0].origin.row);
+    try std.testing.expectEqual(@as(u16, 1), surface.children[1].origin.row);
+    try std.testing.expectEqualStrings("[", surface.children[0].surface.readCell(0, 0).char.grapheme);
 }
 
 test "begin submit shows notice when queued message queue is full" {
