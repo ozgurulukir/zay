@@ -305,6 +305,21 @@ pub const Thread = struct {
         message.invalidateRowCache();
     }
 
+    pub fn finishSkill(
+        self: *Thread,
+        gpa: std.mem.Allocator,
+        index: u32,
+        body: []const u8,
+        failed: bool,
+    ) !void {
+        assert(index < self.messages.items.len);
+        const message = &self.messages.items[index];
+        assert(message.kind == .skill);
+        try appendOwned(gpa, &message.body, body);
+        message.failed = failed;
+        message.invalidateRowCache();
+    }
+
     /// Set a message's expanded state, invalidating its cached row count. The
     /// The turn view mutates `expanded` when a tool finishes; route it
     /// through here so the cache stays correct.
@@ -356,7 +371,11 @@ pub const Thread = struct {
                 message.expanded = !message.expanded;
                 message.invalidateRowCache();
             },
-            .user, .agent, .skill, .logo, .status, .notice => {},
+            .skill => if (message.body.len > 0) {
+                message.expanded = !message.expanded;
+                message.invalidateRowCache();
+            },
+            .user, .agent, .logo, .status, .notice => {},
         }
     }
 

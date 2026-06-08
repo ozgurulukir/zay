@@ -17,7 +17,7 @@ pub fn messageContentRows(message: thread_mod.Message, width: u16) u16 {
     return switch (message.kind) {
         .user, .notice => textRows(message.body, width -| 2),
         .agent => terminal_markdown.countRows(message.body, @max(width, 1)),
-        .skill => textRows(message.title, width -| 2),
+        .skill => textRows(message.title, width -| 2) + if (message.expanded and message.body.len > 0) textRows(message.body, width) else 0,
         .logo => blackhole.rows,
         .thinking => if (message.expanded)
             1 + textRows(message.body, width -| 2)

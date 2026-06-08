@@ -235,6 +235,10 @@ pub const TurnView = struct {
         if (std.mem.eql(u8, tool.name, "bash")) {
             const command = agent_mod.parseCommand(gpa, tool.arguments) catch return false;
             gpa.free(command);
+            if (try skillNameFromBashRead(gpa, tool.arguments)) |skill_name| {
+                defer gpa.free(skill_name);
+                return try self.applySkillPreview(gpa, thread, tool.index, skill_name);
+            }
         }
         const title = try agent_mod.formatToolTitle(gpa, tool.name, tool.arguments);
         defer gpa.free(title);
@@ -257,6 +261,49 @@ pub const TurnView = struct {
         return was_awaiting or visible_change;
     }
 
+    fn setSkillMessage(gpa: std.mem.Allocator, thread: *thread_mod.Thread, index: u32, title: []const u8) !void {
+        assert(index < thread.messages.items.len);
+        const message = &thread.messages.items[index];
+        const owned_title = try gpa.dupe(u8, title);
+        errdefer gpa.free(owned_title);
+        const owned_body = try gpa.dupe(u8, "");
+        errdefer gpa.free(owned_body);
+        gpa.free(message.title);
+        gpa.free(message.body);
+        if (message.stderr_body) |stderr| gpa.free(stderr);
+        message.* = .{
+            .kind = .skill,
+            .title = owned_title,
+            .body = owned_body,
+            .expanded = false,
+        };
+    }
+
+    fn applySkillPreview(
+        self: *TurnView,
+        gpa: std.mem.Allocator,
+        thread: *thread_mod.Thread,
+        tool_index: u32,
+        skill_name: []const u8,
+    ) !bool {
+        const title = try std.fmt.allocPrint(gpa, "[SKILL] {s}", .{skill_name});
+        defer gpa.free(title);
+
+        const was_awaiting = self.awaitingOutput();
+        var visible_change = false;
+        if (self.toolThreadIndex(tool_index)) |index| {
+            visible_change = thread.messages.items[index].kind != .skill or !std.mem.eql(u8, thread.messages.items[index].title, title);
+            if (visible_change) try setSkillMessage(gpa, thread, index, title);
+        } else {
+            const index = try thread.append(gpa, .skill, title, "");
+            try self.putToolThreadIndex(gpa, tool_index, index);
+            visible_change = true;
+        }
+        self.tool_seen_in_response = true;
+        self.agent_index = null;
+        return was_awaiting or visible_change;
+    }
+
     fn finishTool(
         self: *TurnView,
         gpa: std.mem.Allocator,
@@ -265,6 +312,14 @@ pub const TurnView = struct {
     ) !bool {
         const policy = tool_policy.forName(tool.name);
         const existing_index = self.toolThreadIndex(tool.index);
+        if (existing_index) |index| {
+            if (index < thread.messages.items.len and thread.messages.items[index].kind == .skill) {
+                try thread.finishSkill(gpa, index, tool.display_body, tool.failed);
+                self.tool_seen_in_response = true;
+                self.agent_index = null;
+                return true;
+            }
+        }
         const index = if (existing_index) |index| index else index: {
             const created = try thread.startTool(gpa, tool.display_label);
             try self.putToolThreadIndex(gpa, tool.index, created);
@@ -305,6 +360,42 @@ pub const TurnView = struct {
         return self.tool_indexes.items[tool_index];
     }
 
+    fn skillNameFromBashRead(gpa: std.mem.Allocator, arguments: []const u8) !?[]u8 {
+        const JsonArgs = struct {
+            command: ?[]const u8 = null,
+            reason: ?[]const u8 = null,
+        };
+        const parsed = std.json.parseFromSlice(JsonArgs, gpa, arguments, .{ .ignore_unknown_fields = true }) catch return null;
+        defer parsed.deinit();
+        const command = parsed.value.command orelse return null;
+        const reason = parsed.value.reason orelse return null;
+        if (!std.mem.eql(u8, reason, "read")) return null;
+        if (!commandReadsSkill(command)) return null;
+        const name = skillNameFromCommand(command) orelse return null;
+        return try gpa.dupe(u8, name);
+    }
+
+    fn commandReadsSkill(command: []const u8) bool {
+        if (std.mem.indexOf(u8, command, "cat") == null) return false;
+        if (std.mem.indexOf(u8, command, ".agents/") == null) return false;
+        return std.mem.indexOf(u8, command, "/SKILL.md") != null;
+    }
+
+    fn skillNameFromCommand(command: []const u8) ?[]const u8 {
+        const skill_suffix = "/SKILL.md";
+        const suffix_start = std.mem.indexOf(u8, command, skill_suffix) orelse return null;
+        var name_start = suffix_start;
+        while (name_start > 0) {
+            const byte = command[name_start - 1];
+            if (byte == '/' or byte == '\'' or byte == '"' or std.ascii.isWhitespace(byte)) break;
+            name_start -= 1;
+        }
+        const name = command[name_start..suffix_start];
+        if (name.len == 0) return null;
+        if (std.mem.indexOfScalar(u8, name, '/') != null) return null;
+        return name;
+    }
+
     fn putToolThreadIndex(
         self: *TurnView,
         gpa: std.mem.Allocator,
@@ -328,6 +419,43 @@ fn chooseLoadingWordIndex(io: std.Io) u8 {
     const timestamp: std.Io.Timestamp = .now(io, .awake);
     const index = @mod(timestamp.nanoseconds, loading_spinners.len);
     return @intCast(index);
+}
+
+test "bash read of skill renders skill row" {
+    const gpa = std.testing.allocator;
+    var view: TurnView = .{};
+    defer view.deinit(gpa);
+    var thread: thread_mod.Thread = .{};
+    defer thread.deinit(gpa);
+
+    const changed = try view.applyToolPreview(gpa, &thread, .{
+        .index = 0,
+        .name = "bash",
+        .arguments = "{\"command\":\"cat .agents/skills/tigerstyle/SKILL.md\",\"reason\":\"read\"}",
+    });
+
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(@as(usize, 1), thread.messages.items.len);
+    try std.testing.expectEqual(thread_mod.MessageKind.skill, thread.messages.items[0].kind);
+    try std.testing.expectEqualStrings("[SKILL] tigerstyle", thread.messages.items[0].title);
+
+    const finished = try view.applyToolFinished(gpa, &thread, .{
+        .index = 0,
+        .name = "bash",
+        .display_label = "cat .agents/skills/tigerstyle/SKILL.md",
+        .display_body = "skill file contents",
+    });
+    try std.testing.expect(finished);
+    try std.testing.expectEqualStrings("skill file contents", thread.messages.items[0].body);
+    try std.testing.expect(!thread.messages.items[0].expanded);
+    thread.toggleSelected();
+    try std.testing.expect(thread.messages.items[0].expanded);
+}
+
+test "bash read of skill ignores non-read reason" {
+    const gpa = std.testing.allocator;
+    const skill_name = try TurnView.skillNameFromBashRead(gpa, "{\"command\":\"cat .agents/skills/tigerstyle/SKILL.md\",\"reason\":\"other\"}");
+    try std.testing.expect(skill_name == null);
 }
 
 test "turn view streams content into thread" {
