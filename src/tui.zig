@@ -25,6 +25,7 @@ const blackhole = @import("tui/blackhole.zig");
 const at_search = @import("tui/widgets/at_search.zig");
 const command_panel = @import("tui/widgets/command_panel.zig");
 const model_loader = @import("tui/model_loader.zig");
+const model_cache = @import("tui/model_cache.zig");
 const model_picker = @import("tui/widgets/model_picker.zig");
 const provider_picker = @import("tui/widgets/provider_picker.zig");
 const resume_picker = @import("tui/widgets/resume_picker.zig");
@@ -806,6 +807,8 @@ pub const App = struct {
             return;
         }
 
+        if (try self.restoreModelCache()) return;
+
         // Cold path — clear stale state, kick off the async load.
         self.codexModelsClear();
         self.models.reasoning_snapshot.clearRetainingCapacity();
@@ -963,11 +966,84 @@ pub const App = struct {
         try self.finishModelCatalogReload();
         try self.snapshotModelPickerState();
         self.models.models_cached = true;
+        self.saveModelCache() catch |err| std.log.warn("models.cache.save.failed err={s}", .{@errorName(err)});
     }
 
     /// Remove every cached model that came from `provider`.
     fn dropModelsForProvider(self: *App, provider: config_mod.Provider) void {
         self.models.dropProvider(self.gpa, provider);
+    }
+
+    fn restoreModelCache(self: *App) !bool {
+        const runtime = self.runtime orelse return false;
+        if (runtime.home_dir.len == 0) return false;
+
+        var configured = try self.collectModelCacheConfigured();
+        defer configured.deinit(self.gpa);
+
+        var cached = model_cache.load(self.gpa, self.io, runtime.home_dir, configured.items) catch return false;
+        defer cached.deinit(self.gpa);
+
+        self.codexModelsClear();
+        for (cached.items.items) |*record| {
+            try self.models.append(self.gpa, record.model, record.source);
+            record.model = .{ .id = &.{}, .label = &.{} };
+        }
+        if (self.isCodexSignedIn()) try self.loadCodexStaticCatalog();
+        if (self.models.len() == 0) return false;
+
+        try self.finishModelCatalogReload();
+        try self.snapshotModelPickerState();
+        self.models.models_cached = true;
+        return true;
+    }
+
+    fn saveModelCache(self: *App) !void {
+        const runtime = self.runtime orelse return;
+        if (runtime.home_dir.len == 0) return;
+
+        var configured = try self.collectModelCacheConfigured();
+        defer configured.deinit(self.gpa);
+        if (configured.items.len == 0) return;
+
+        const records = try self.gpa.alloc(model_cache.Record, self.models.entries.items.len);
+        defer self.gpa.free(records);
+        for (self.models.entries.items, 0..) |entry, index| {
+            records[index] = .{ .model = entry.model, .source = entry.source };
+        }
+        try model_cache.save(self.gpa, self.io, runtime.home_dir, records, configured.items);
+    }
+
+    fn collectModelCacheConfigured(self: *App) !std.ArrayList(model_cache.Configured) {
+        var list: std.ArrayList(model_cache.Configured) = .empty;
+        errdefer list.deinit(self.gpa);
+
+        for (config_mod.catalogueProviders()) |provider| {
+            const base_url = provider.defaultBaseUrl() orelse continue;
+            const auth_mode: model_cache.AuthMode = if (self.provider_api_keys.get(provider.label())) |_|
+                .keyed
+            else if (provider.anonymousApiKey() != null)
+                .anonymous
+            else
+                continue;
+            try list.append(self.gpa, .{ .provider = provider, .base_url = base_url, .auth_mode = auth_mode });
+        }
+
+        if (self.shouldLoadConfiguredCompatibleCatalog()) {
+            const base_url = self.cached_config.base_url.?;
+            const provider = self.cached_config.provider orelse tui_provider.compatibleProviderFromBaseUrl(base_url);
+            if (!provider.isCatalogue()) {
+                try list.append(self.gpa, .{ .provider = provider, .base_url = base_url, .auth_mode = .keyed });
+            }
+        }
+
+        if (config_mod.Provider.ollama.defaultBaseUrl()) |base_url| {
+            try list.append(self.gpa, .{ .provider = .ollama, .base_url = base_url, .auth_mode = .local });
+        }
+        if (config_mod.Provider.llama_cpp.defaultBaseUrl()) |base_url| {
+            try list.append(self.gpa, .{ .provider = .llama_cpp, .base_url = base_url, .auth_mode = .local });
+        }
+        return list;
     }
 
     fn defaultModelScope(self: *App) ModelScope {
