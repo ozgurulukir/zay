@@ -20,7 +20,7 @@ pub const TurnView = struct {
     agent_index: ?u32 = null,
     thinking_index: ?u32 = null,
     /// Chosen when the turn starts. The spinner itself is synthetic and is
-    /// drawn only while `activity == .awaiting_model`.
+    /// drawn outside the transcript while `activity == .awaiting_model`.
     loading_word_index: u8 = 0,
     activity: Activity = .idle,
     tool_seen_in_response: bool = false,
@@ -75,7 +75,7 @@ pub const TurnView = struct {
     }
 
     /// Begin waiting for the next chunk of model output. The spinner is drawn
-    /// at the tail; no thread mutation.
+    /// outside the transcript; no thread mutation.
     pub fn awaitModel(self: *TurnView) void {
         assert(self.loading_word_index < loading_spinners.len);
         self.activity = .awaiting_model;

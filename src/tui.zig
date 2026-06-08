@@ -1775,8 +1775,8 @@ pub const App = struct {
     }
 
     fn appendMessageQueueFullNotice(self: *App) !void {
-        // The spinner is derived from the turn view and drawn at the tail,
-        // so appending below it needs no remove/re-append dance.
+        // The spinner is derived from the turn view and drawn outside the
+        // transcript, so appending needs no remove/re-append dance.
         _ = try self.thread.append(self.gpa, .notice, "notice", "MessageQueueFull");
     }
 
@@ -2212,26 +2212,34 @@ fn previousIndex(current: u32, count: u32) u32 {
     return current - 1;
 }
 
+const loading_status_rows: u16 = 2;
+
 const RootLayout = struct {
     input_height: u16,
+    loading_height: u16,
     panel_height: u16,
     thread_height: u16,
+    loading_row: u16,
     panel_row: u16,
     input_row: u16,
 };
 
-fn rootLayout(max_height: u16, panel_visible: bool, input_text_rows: u16) RootLayout {
+fn rootLayout(max_height: u16, panel_visible: bool, input_text_rows: u16, loading_visible: bool) RootLayout {
     const desired: u16 = 3 + input_text_rows;
     const max_allowed: u16 = @max(@as(u16, 6), max_height -| 3);
     const input_height: u16 = @min(max_height, @min(desired, max_allowed));
-    const thread_height: u16 = max_height - input_height;
+    const above_input_height: u16 = max_height - input_height;
+    const loading_height: u16 = if (loading_visible) @min(loading_status_rows, above_input_height) else 0;
+    const thread_height: u16 = above_input_height - loading_height;
     const panel_height: u16 = if (panel_visible) @min(thread_height, 7) else 0;
     return .{
         .input_height = input_height,
+        .loading_height = loading_height,
         .panel_height = panel_height,
         .thread_height = thread_height,
+        .loading_row = thread_height,
         .panel_row = thread_height - panel_height,
-        .input_row = thread_height,
+        .input_row = thread_height + loading_height,
     };
 }
 
@@ -2622,9 +2630,11 @@ const RootWidget = struct {
         const self: *RootWidget = @ptrCast(@alignCast(ptr));
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
-        const layout = rootLayout(max_height, false, try self.app.inputTextRows(ctx, max_width -| 4));
+        const loading_visible = self.app.turn_view.awaitingOutput();
+        const layout = rootLayout(max_height, false, try self.app.inputTextRows(ctx, max_width -| 4), loading_visible);
 
         var thread_view: ThreadWidget = .{ .app = self.app };
+        var loading_view: LoadingWidget = .{ .app = self.app };
         var input_view: InputWidget = .{ .app = self.app };
         var overlay_view: OverlayWidget = .{ .app = self.app };
 
@@ -2641,6 +2651,7 @@ const RootWidget = struct {
         const at_visible = self.app.at_active and !overlay_visible;
 
         var child_count: usize = 2;
+        if (layout.loading_height > 0) child_count += 1;
         if (overlay_visible) child_count += 1;
         if (at_visible) child_count += 1;
         const children = try ctx.arena.alloc(vxfw.SubSurface, child_count);
@@ -2651,6 +2662,18 @@ const RootWidget = struct {
             .z_index = 0,
         };
         idx += 1;
+        if (layout.loading_height > 0) {
+            const loading_ctx = ctx.withConstraints(
+                .{ .width = max_width, .height = layout.loading_height },
+                .{ .width = max_width, .height = layout.loading_height },
+            );
+            children[idx] = .{
+                .origin = .{ .row = layout.loading_row, .col = 0 },
+                .surface = try loading_view.widget().draw(loading_ctx),
+                .z_index = 0,
+            };
+            idx += 1;
+        }
         children[idx] = .{
             .origin = .{ .row = layout.input_row, .col = 0 },
             .surface = try input_view.widget().draw(input_ctx),
@@ -2703,6 +2726,33 @@ fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
     };
 }
 
+const LoadingWidget = struct {
+    app: *App,
+
+    fn widget(self: *LoadingWidget) vxfw.Widget {
+        return .{
+            .userdata = self,
+            .drawFn = drawLoading,
+        };
+    }
+
+    fn drawLoading(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *LoadingWidget = @ptrCast(@alignCast(ptr));
+        const width = ctx.max.width orelse ctx.min.width;
+        const height = ctx.max.height orelse ctx.min.height;
+        var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{
+            .width = width,
+            .height = height,
+        });
+        if (height > 0) {
+            var row: u16 = if (height > 1) 1 else 0;
+            const word = loading_spinners[self.app.turn_view.loading_word_index];
+            tui_message.MessageWidget.drawLoading(&surface, word, self.app.loading_frame, &row, ctx);
+        }
+        return surface;
+    }
+};
+
 const ThreadWidget = struct {
     app: *App,
 
@@ -2748,49 +2798,28 @@ const ThreadWidget = struct {
         if (self.app.thread_view_height == 0) self.app.thread_view_height = 1;
     }
 
-    // Status-row height (content row + the one-row separator metrics adds);
-    // see `messageContentRows` for `.status` in tui/metrics.zig.
-    const spinner_rows: u16 = 2;
-
     fn messageWidgets(self: *ThreadWidget, ctx: vxfw.DrawContext) ![]vxfw.Widget {
         const messages = self.app.thread.messages.items;
-        const awaiting = self.app.turn_view.awaitingOutput();
-        const total = messages.len + @intFromBool(awaiting);
-        const widgets = try ctx.arena.alloc(vxfw.Widget, total);
-        const bodies = try ctx.arena.alloc(MessageWidget, total);
+        const widgets = try ctx.arena.alloc(vxfw.Widget, messages.len);
+        const bodies = try ctx.arena.alloc(MessageWidget, messages.len);
         for (messages, 0..) |*message, index| {
             const selected = if (self.app.thread.selected) |selected_index| selected_index == index else false;
             bodies[index] = .{ .message = message, .selected = selected, .loading_frame = self.app.loading_frame, .blackhole_frame = self.app.blackhole_frame, .gpa = self.app.gpa };
             widgets[index] = bodies[index].widget();
-        }
-        if (awaiting) {
-            // The loading spinner is derived UI, not a thread message: a
-            // synthetic status row drawn at the tail while the turn waits for
-            // the next chunk of model output.
-            const word = loading_spinners[self.app.turn_view.loading_word_index];
-            const spinner = try ctx.arena.create(thread_mod.Message);
-            spinner.* = .{ .kind = .status, .title = try ctx.arena.dupe(u8, word), .body = try ctx.arena.dupe(u8, "") };
-            bodies[messages.len] = .{ .message = spinner, .selected = false, .loading_frame = self.app.loading_frame, .blackhole_frame = self.app.blackhole_frame, .gpa = self.app.gpa };
-            widgets[messages.len] = bodies[messages.len].widget();
         }
         return widgets;
     }
 
     fn syncCursor(self: *ThreadWidget, ctx: vxfw.DrawContext) void {
         const messages = self.app.thread.messages.items;
-        const awaiting = self.app.turn_view.awaitingOutput();
-        const total: u32 = @intCast(messages.len + @intFromBool(awaiting));
-        if (total == 0) return;
+        if (messages.len == 0) return;
         if (self.app.thread_auto_scroll) {
-            // The tail is the synthetic spinner row when awaiting, else the
-            // last real message.
-            const cursor = total - 1;
+            const cursor: u32 = @intCast(messages.len - 1);
             self.app.thread_list.cursor = cursor;
             self.scrollCursorToTail(ctx, cursor);
             return;
         }
-        const fallback: u32 = if (awaiting) total - 1 else 0;
-        const cursor = self.app.thread.selected orelse fallback;
+        const cursor = self.app.thread.selected orelse 0;
         const cursor_changed = self.app.thread_list.cursor != cursor;
         self.app.thread_list.cursor = cursor;
         if (cursor_changed) self.app.thread_list.ensureScroll();
@@ -2798,16 +2827,11 @@ const ThreadWidget = struct {
 
     fn scrollCursorToTail(self: *ThreadWidget, ctx: vxfw.DrawContext, cursor: u32) void {
         const message_count: u32 = @intCast(self.app.thread.messages.items.len);
-        if (cursor > message_count) return;
+        if (cursor >= message_count) return;
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
         const list_height = max_height -| ConversationLayout.top -| ConversationLayout.bottom;
-        // `cursor == message_count` targets the synthetic spinner row, which is
-        // not in `thread.messages`; use its fixed status-row height.
-        const message_height = if (cursor == message_count)
-            spinner_rows
-        else
-            messageRowsCached(&self.app.thread.messages.items[cursor], ConversationLayout.contentWidth(max_width));
+        const message_height = messageRowsCached(&self.app.thread.messages.items[cursor], ConversationLayout.contentWidth(max_width));
         self.app.thread_list.scroll.top = cursor;
         self.app.thread_list.scroll.pending_lines = 0;
         self.app.thread_list.scroll.wants_cursor = false;
@@ -3664,8 +3688,8 @@ test "diff count labels keep signs next to numbers" {
 }
 
 test "root layout keeps input fixed when panel opens" {
-    const normal = rootLayout(30, false, 1);
-    const picker = rootLayout(30, true, 1);
+    const normal = rootLayout(30, false, 1, false);
+    const picker = rootLayout(30, true, 1, false);
 
     try std.testing.expectEqual(normal.input_row, picker.input_row);
     try std.testing.expectEqual(normal.thread_height, picker.thread_height);
@@ -3674,7 +3698,7 @@ test "root layout keeps input fixed when panel opens" {
 }
 
 test "root layout clamps panel above input on short screens" {
-    const layout = rootLayout(8, true, 1);
+    const layout = rootLayout(8, true, 1, false);
 
     try std.testing.expectEqual(@as(u16, 4), layout.input_height);
     try std.testing.expectEqual(@as(u16, 4), layout.thread_height);
@@ -3684,16 +3708,16 @@ test "root layout clamps panel above input on short screens" {
 }
 
 test "root layout grows the input as text rows increase" {
-    const one = rootLayout(30, false, 1);
+    const one = rootLayout(30, false, 1, false);
     try std.testing.expectEqual(@as(u16, 4), one.input_height);
     try std.testing.expectEqual(@as(u16, 26), one.thread_height);
 
-    const three = rootLayout(30, false, 3);
+    const three = rootLayout(30, false, 3, false);
     try std.testing.expectEqual(@as(u16, 6), three.input_height);
     try std.testing.expectEqual(@as(u16, 24), three.thread_height);
 
     // A short screen still leaves the thread some room.
-    const tight = rootLayout(10, false, 6);
+    const tight = rootLayout(10, false, 6, false);
     try std.testing.expectEqual(@as(u16, 7), tight.input_height);
     try std.testing.expectEqual(@as(u16, 3), tight.thread_height);
 }
@@ -4164,8 +4188,8 @@ test "begin submit clears input and starts a turn awaiting output" {
 
     try std.testing.expectEqual(@as(usize, 0), app.input.buf.firstHalf().len);
     try std.testing.expectEqual(@as(usize, 0), app.input.buf.secondHalf().len);
-    // The user message is the only thread entry; the spinner is derived from
-    // The loading spinner is drawn at the tail, never stored as a message.
+    // The user message is the only thread entry; the loading spinner is never
+    // stored as a message.
     try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
     try std.testing.expectEqualStrings("hello", app.thread.messages.items[0].body);
     try std.testing.expect(app.turn_view.awaitingOutput());
@@ -4173,7 +4197,7 @@ test "begin submit clears input and starts a turn awaiting output" {
     try std.testing.expectEqual(@as(u32, 0), app.thread.selected.?);
 }
 
-test "awaiting turn draws a synthetic spinner row at the tail" {
+test "awaiting turn draws loading outside the thread list" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
@@ -4185,19 +4209,48 @@ test "awaiting turn draws a synthetic spinner row at the tail" {
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    var thread_widget: ThreadWidget = .{ .app = &app };
+    var root_widget: RootWidget = .{ .app = &app };
     const ctx: vxfw.DrawContext = .{
         .arena = arena.allocator(),
         .min = .{},
-        .max = .{ .width = 80, .height = 6 },
+        .max = .{ .width = 80, .height = 10 },
         .cell_size = .{ .width = 10, .height = 20 },
     };
-    _ = try thread_widget.widget().draw(ctx);
+    const surface = try root_widget.widget().draw(ctx);
 
-    // One real message plus the derived spinner row, with auto-scroll parked on
-    // the synthetic tail — exercises the synthetic-row index and scroll math.
-    try std.testing.expectEqual(2, app.thread_list.item_count);
-    try std.testing.expectEqual(1, app.thread_list.cursor);
+    try std.testing.expectEqual(@as(usize, 3), surface.children.len);
+    try std.testing.expectEqual(@as(?u32, 1), app.thread_list.item_count);
+    try std.testing.expectEqual(@as(u32, 0), app.thread_list.cursor);
+    try std.testing.expectEqual(rootLayout(10, false, 1, true).loading_row, surface.children[1].origin.row);
+}
+
+test "awaiting turn preserves selected long message inner scroll" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    _ = try app.thread.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+    app.thread.selected = 0;
+    app.thread_auto_scroll = false;
+    app.turn_view.awaitModel();
+    app.setSelectedMessageOffset(0, 3);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root_widget: RootWidget = .{ .app = &app };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 10 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    _ = try root_widget.widget().draw(ctx);
+
+    try std.testing.expectEqual(@as(u32, 0), app.thread_list.cursor);
+    try std.testing.expectEqual(@as(u32, 0), app.thread_list.scroll.top);
+    try std.testing.expectEqual(@as(i17, 3), app.thread_list.scroll.offset);
 }
 
 test "begin submit queues while turn is in flight" {
@@ -4220,7 +4273,7 @@ test "begin submit queues while turn is in flight" {
     try std.testing.expectEqual(@as(usize, 0), app.input.buf.firstHalf().len);
     try std.testing.expect(try app.applyAgentEvent(.{ .queued_messages_flushed = 1 }));
     try std.testing.expectEqual(@as(usize, 0), app.queued_user_messages.items.len);
-    // Just the flushed user message; the spinner stays derived at the tail.
+    // Just the flushed user message; the spinner stays derived UI.
     try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
     try std.testing.expectEqualStrings("later", app.thread.messages.items[0].body);
@@ -4278,7 +4331,7 @@ test "begin submit shows notice when queued message queue is full" {
     try std.testing.expectEqual(@as(usize, 0), app.queued_user_messages.items.len);
     try std.testing.expectEqual(@as(u32, @intCast(agent.message_queue_storage.len)), agent.message_queue.len());
     try std.testing.expectEqualStrings("later", app.input.buf.firstHalf());
-    // The notice is appended below the derived spinner; no status message.
+    // The notice is the only transcript row; the spinner is not a status message.
     try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
     try std.testing.expectEqual(.notice, app.thread.messages.items[0].kind);
     try std.testing.expectEqualStrings("MessageQueueFull", app.thread.messages.items[0].body);

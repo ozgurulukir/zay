@@ -108,7 +108,7 @@ pub const MessageWidget = struct {
         }
     }
 
-    fn drawLoading(
+    pub fn drawLoading(
         surface: *vxfw.Surface,
         text: []const u8,
         loading_frame: u8,
