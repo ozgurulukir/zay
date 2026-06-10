@@ -68,19 +68,24 @@ pub const cancel_message = "Interrupted.";
 /// `pending_prompt`, when present, is raw user text owned by `worker_context.gpa`.
 /// It is expanded (file embedding / image attachment) and appended to history
 /// here, on the worker thread, so the UI thread never blocks on that I/O.
-pub fn runAgentTurn(agent: *agent_mod.Agent, worker_context: *Context, pending_prompt: ?[]u8) void {
+///
+/// `drain_queue_first` empties the agent's message queue into history before the
+/// turn's first prompt — used to deliver a queue stranded by a user interrupt as
+/// a fresh turn. The @-mention expansion lands here, off the UI thread.
+pub fn runAgentTurn(agent: *agent_mod.Agent, worker_context: *Context, pending_prompt: ?[]u8, drain_queue_first: bool) void {
+    if (drain_queue_first) {
+        const flushed = agent.drainAllQueuedToHistory() catch |err| {
+            postTurnFailed(worker_context, err);
+            return;
+        };
+        if (flushed > 0) {
+            postAgentEvent(worker_context, .{ .queued_messages_flushed = flushed }) catch {};
+        }
+    }
     if (pending_prompt) |prompt| {
         defer worker_context.gpa.free(prompt);
         agent.addUserPrompt(prompt) catch |err| {
-            const message_text = std.fmt.allocPrint(
-                worker_context.gpa,
-                "agent turn failed: {s}",
-                .{@errorName(err)},
-            ) catch return;
-            postAgentEvent(worker_context, .{ .turn_failed = message_text }) catch {
-                worker_context.gpa.free(message_text);
-            };
-            postAgentEvent(worker_context, .turn_finished) catch {};
+            postTurnFailed(worker_context, err);
             return;
         };
     }
@@ -102,6 +107,20 @@ pub fn runAgentTurn(agent: *agent_mod.Agent, worker_context: *Context, pending_p
             worker_context.gpa.free(message_text);
             return;
         };
+    };
+    postAgentEvent(worker_context, .turn_finished) catch {};
+}
+
+/// Post a `turn_failed` notice followed by the terminal `turn_finished`, so the
+/// UI's Turn machine always sees its terminal event even when setup fails.
+fn postTurnFailed(worker_context: *Context, err: anyerror) void {
+    const message_text = std.fmt.allocPrint(
+        worker_context.gpa,
+        "agent turn failed: {s}",
+        .{@errorName(err)},
+    ) catch return;
+    postAgentEvent(worker_context, .{ .turn_failed = message_text }) catch {
+        worker_context.gpa.free(message_text);
     };
     postAgentEvent(worker_context, .turn_finished) catch {};
 }

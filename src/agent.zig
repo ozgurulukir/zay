@@ -18,6 +18,10 @@ const QueuedUserMessage = struct {
     /// images attached) lazily at drain time so the file I/O lands on the
     /// agent worker thread rather than the UI thread.
     prompt: []u8,
+    /// When set, this message is injected after the next tool batch ("steer")
+    /// rather than waiting for the turn to go idle. The UI flips it via
+    /// `setQueuedSteer` when the user steers a queued message.
+    steer: bool = false,
 };
 
 const MessageQueue = bounded_queue.BoundedQueue(QueuedUserMessage);
@@ -315,7 +319,10 @@ pub const Agent = struct {
             self.recordUsage(usage);
 
             if (tool_calls.len == 0) {
-                const drained_count = try self.drainQueuedUserMessage();
+                // Turn would otherwise go idle: drain the front queued message
+                // (steer or not) and continue, so anything still waiting is
+                // handled at the natural turn end.
+                const drained_count = try self.drainQueuedUserMessage(false);
                 if (drained_count > 0) {
                     try listener.emit(.{ .queued_messages_flushed = drained_count });
                     continue;
@@ -323,8 +330,12 @@ pub const Agent = struct {
                 return;
             }
             try self.runToolBatch(ToolBatch.init(tool_calls), &stream_context, listener);
-            const drained_count = try self.drainQueuedUserMessage();
-            if (drained_count > 0) try listener.emit(.{ .queued_messages_flushed = drained_count });
+            // Mid-turn we only inject messages explicitly marked to steer, and
+            // only from the front so FIFO order holds — a default-queued
+            // message ahead of a steer one keeps it waiting for turn end.
+            var steered: u32 = 0;
+            while ((try self.drainQueuedUserMessage(true)) > 0) steered += 1;
+            if (steered > 0) try listener.emit(.{ .queued_messages_flushed = steered });
         }
         return error.ToolCallLimit;
     }
@@ -518,18 +529,54 @@ pub const Agent = struct {
         return .{ .role = role, .content = blocks };
     }
 
-    fn drainQueuedUserMessage(self: *Agent) !u32 {
-        const prompt = self.takeQueuedUserPrompt() orelse return 0;
+    fn drainQueuedUserMessage(self: *Agent, steer_only: bool) !u32 {
+        const prompt = self.takeQueuedUserPrompt(steer_only) orelse return 0;
         defer self.gpa.free(prompt);
         try self.addUserPrompt(prompt);
         return 1;
     }
 
-    fn takeQueuedUserPrompt(self: *Agent) ?[]u8 {
+    /// Move every queued message into history in FIFO order, returning how many
+    /// were drained. Used to deliver a stranded queue as a fresh turn (e.g.
+    /// after a user interrupt): the leading messages become context and the
+    /// last one is the latest user message the next prompt answers.
+    pub fn drainAllQueuedToHistory(self: *Agent) !u32 {
+        var count: u32 = 0;
+        while ((try self.drainQueuedUserMessage(false)) > 0) count += 1;
+        return count;
+    }
+
+    /// Drop every queued message without delivering it. Thread-safe; the worker
+    /// drains under the same mutex.
+    pub fn clearQueue(self: *Agent) void {
         self.lockMessageQueue();
         defer self.message_queue_mutex.unlock();
+        while (self.message_queue.pop(&self.message_queue_storage)) |queued| {
+            self.gpa.free(queued.prompt);
+        }
+    }
+
+    /// Pop and return the front queued prompt. When `steer_only` is set, only
+    /// pops if the front message is marked to steer (otherwise returns null,
+    /// leaving the queue untouched).
+    fn takeQueuedUserPrompt(self: *Agent, steer_only: bool) ?[]u8 {
+        self.lockMessageQueue();
+        defer self.message_queue_mutex.unlock();
+        if (steer_only) {
+            const front = self.message_queue.peek(&self.message_queue_storage) orelse return null;
+            if (!front.steer) return null;
+        }
         const queued = self.message_queue.pop(&self.message_queue_storage) orelse return null;
         return queued.prompt;
+    }
+
+    /// Mark the queued message at logical `index` to steer (inject after the
+    /// next tool batch). Called from the UI thread; guarded by the queue mutex
+    /// the worker also holds while draining.
+    pub fn setQueuedSteer(self: *Agent, index: u32) void {
+        self.lockMessageQueue();
+        defer self.message_queue_mutex.unlock();
+        if (self.message_queue.at(&self.message_queue_storage, index)) |entry| entry.steer = true;
     }
 
     fn lockMessageQueue(self: *Agent) void {
@@ -837,7 +884,7 @@ test "queued user messages wait for completed assistant turn" {
     try agent.addUser("first");
     try agent.enqueueUser("queued");
 
-    try std.testing.expectEqual(@as(u32, 1), try agent.drainQueuedUserMessage());
+    try std.testing.expectEqual(@as(u32, 1), try agent.drainQueuedUserMessage(false));
     try std.testing.expectEqual(@as(usize, 2), agent.messages().len);
     try std.testing.expectEqualStrings("queued", agent.messages()[1].text());
 }
@@ -865,8 +912,57 @@ test "queued user messages drain one at a time" {
     try agent.enqueueUser("first");
     try agent.enqueueUser("second");
 
-    try std.testing.expectEqual(@as(u32, 1), try agent.drainQueuedUserMessage());
+    try std.testing.expectEqual(@as(u32, 1), try agent.drainQueuedUserMessage(false));
     try std.testing.expectEqual(@as(usize, 1), agent.messages().len);
     try std.testing.expectEqual(@as(u32, 1), agent.message_queue.len());
     try std.testing.expectEqualStrings("first", agent.messages()[0].text());
+}
+
+test "steer-only drain pops a steered front but leaves default-queued messages" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    try agent.enqueueUser("steer me");
+    try agent.enqueueUser("later");
+    agent.setQueuedSteer(0);
+
+    // The steered front injects mid-turn...
+    try std.testing.expectEqual(@as(u32, 1), try agent.drainQueuedUserMessage(true));
+    try std.testing.expectEqualStrings("steer me", agent.messages()[0].text());
+    // ...but the default-queued one behind it waits for turn end.
+    try std.testing.expectEqual(@as(u32, 0), try agent.drainQueuedUserMessage(true));
+    try std.testing.expectEqual(@as(u32, 1), agent.message_queue.len());
+    // The turn-end drain (steer_only = false) takes it.
+    try std.testing.expectEqual(@as(u32, 1), try agent.drainQueuedUserMessage(false));
+    try std.testing.expectEqualStrings("later", agent.messages()[1].text());
+}
+
+test "drain all queued moves the whole queue to history in FIFO order" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    try agent.enqueueUser("a");
+    try agent.enqueueUser("b");
+    try agent.enqueueUser("c");
+
+    try std.testing.expectEqual(@as(u32, 3), try agent.drainAllQueuedToHistory());
+    try std.testing.expectEqual(@as(usize, 3), agent.messages().len);
+    try std.testing.expectEqualStrings("a", agent.messages()[0].text());
+    try std.testing.expectEqualStrings("c", agent.messages()[2].text());
+    try std.testing.expectEqual(@as(u32, 0), agent.message_queue.len());
+}
+
+test "clear queue drops messages without delivering them" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    try agent.enqueueUser("x");
+    try agent.enqueueUser("y");
+    agent.clearQueue();
+
+    try std.testing.expectEqual(@as(u32, 0), agent.message_queue.len());
+    try std.testing.expectEqual(@as(usize, 0), agent.messages().len);
 }

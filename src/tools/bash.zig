@@ -267,7 +267,29 @@ fn tempOutputPath(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
     const hex = std.fmt.bytesToHex(random, .lower);
     const name = try std.fmt.allocPrint(gpa, "nova-bash-{s}.log", .{hex[0..]});
     defer gpa.free(name);
-    return std.fs.path.join(gpa, &.{ "/tmp", name });
+    const dir = try tempDir(gpa);
+    defer gpa.free(dir);
+    return std.fs.path.join(gpa, &.{ dir, name });
+}
+
+/// Resolve a temp directory that both the shell and Nova agree on.
+///
+/// On Windows the bash tool runs under git bash, which maps `/tmp` to `%TEMP%`,
+/// but Nova reads the captured output back through the Windows file API — there
+/// a literal `/tmp/...` resolves against the current drive root (`C:\tmp\...`),
+/// not where the shell actually wrote. Using the real `%TEMP%` keeps the write
+/// and the read pointing at the same file. POSIX shares one `/tmp` already.
+fn tempDir(gpa: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+    if (builtin.os.tag != .windows) return gpa.dupe(u8, "/tmp");
+    for ([_][]const u8{ "TEMP", "TMP" }) |key| {
+        const value = std.process.Environ.getAlloc(.{ .block = .global }, gpa, key) catch continue;
+        if (value.len == 0) {
+            gpa.free(value);
+            continue;
+        }
+        return value;
+    }
+    return gpa.dupe(u8, ".");
 }
 
 fn formatBashText(gpa: std.mem.Allocator, text: []const u8, code: u8, status: FinishStatus) std.mem.Allocator.Error![]u8 {

@@ -95,6 +95,14 @@ fn runDiffRefresh(job: *DiffRefreshJob) DiffRefreshOutcome {
     return .{ .ready = parseDiffCounts(result.stdout) };
 }
 
+/// A user message queued behind a running turn, mirrored from the agent queue
+/// for display and navigation. `steer` means inject after the next tool batch;
+/// the default (false) waits for the turn to go idle.
+pub const QueuedMessage = struct {
+    text: []const u8,
+    steer: bool = false,
+};
+
 pub const App = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -170,7 +178,8 @@ pub const App = struct {
         .wheel_scroll = 3,
     },
     pending_quit_at: ?std.Io.Timestamp = null,
-    queued_user_messages: std.ArrayList([]const u8) = .empty,
+    queued_user_messages: std.ArrayList(QueuedMessage) = .empty,
+    queued_selection: usize = 0,
     /// Raw prompt for a turn that `beginSubmit` accepted but `startTurn` has
     /// not yet handed to the worker. Owned by `gpa`; the worker frees it once
     /// the turn starts.
@@ -411,7 +420,35 @@ pub const App = struct {
             self.agent,
             &self.worker_context,
             prompt,
+            false,
         });
+    }
+
+    /// After a user interrupt has fully unwound (worker joined, queue stranded),
+    /// deliver any queued messages as a fresh turn: the worker drains the whole
+    /// queue into history (leading messages as context, the last as the latest
+    /// user message the model answers). Returns true if a turn was started.
+    fn restartTurnForQueuedMessages(self: *App) !bool {
+        if (self.queued_user_messages.items.len == 0) return false;
+        // No connected provider to run a turn: surface the queued text in the
+        // transcript and drop the queue rather than spin up a doomed worker.
+        if (self.runtime != null and self.runtime.?.client == .none) {
+            try self.flushQueuedUserMessagesToThread(@intCast(self.queued_user_messages.items.len));
+            self.agent.clearQueue();
+            return true;
+        }
+        self.resetTurnState();
+        self.worker_context.resetCancel();
+        self.turn_view.awaitModel();
+        self.pending_prompt = null;
+        self.turn.submit();
+        self.turn_future = try self.io.concurrent(agent_worker.runAgentTurn, .{
+            self.agent,
+            &self.worker_context,
+            self.pending_prompt,
+            true,
+        });
+        return true;
     }
 
     fn advanceLoadingFrame(self: *App) void {
@@ -429,8 +466,13 @@ pub const App = struct {
         const outcome = self.turn.apply(event);
         if (!outcome.project) {
             // Interrupting: a discarded turn's output must not mutate the
-            // thread. Join the worker once it posts its terminal event.
-            if (outcome.finished) self.awaitTurn();
+            // thread. Join the worker once it posts its terminal event, then
+            // deliver any messages the user queued behind the cancelled turn as
+            // a fresh turn.
+            if (outcome.finished) {
+                self.awaitTurn();
+                return try self.restartTurnForQueuedMessages();
+            }
             return false;
         }
         var visible_change = try self.turn_view.apply(self.gpa, &self.thread, event);
@@ -1770,9 +1812,36 @@ pub const App = struct {
             },
             else => return err,
         };
-        try self.queued_user_messages.append(self.gpa, prompt);
+        try self.queued_user_messages.append(self.gpa, .{ .text = prompt });
+        // Select the newest message so the line above the input shows what was
+        // just queued; ALT+← walks back to older ones.
+        self.queued_selection = self.queued_user_messages.items.len - 1;
         self.clearInput();
         return false;
+    }
+
+    /// Move the queued-message selection one older (ALT+←).
+    fn selectPrevQueued(self: *App) void {
+        if (self.queued_user_messages.items.len == 0) return;
+        if (self.queued_selection > 0) self.queued_selection -= 1;
+    }
+
+    /// Move the queued-message selection one newer (ALT+→).
+    fn selectNextQueued(self: *App) void {
+        const len = self.queued_user_messages.items.len;
+        if (len == 0) return;
+        if (self.queued_selection + 1 < len) self.queued_selection += 1;
+    }
+
+    /// Mark the selected queued message to steer (CTRL+→). One-way: it will be
+    /// injected after the next tool batch. Updates both the UI mirror and the
+    /// agent queue so the worker's drain decision matches what's on screen.
+    fn steerSelectedQueued(self: *App) void {
+        const items = self.queued_user_messages.items;
+        if (items.len == 0) return;
+        const index = @min(self.queued_selection, items.len - 1);
+        items[index].steer = true;
+        self.agent.setQueuedSteer(@intCast(index));
     }
 
     fn appendMessageQueueFullNotice(self: *App) !void {
@@ -1795,17 +1864,21 @@ pub const App = struct {
     fn flushQueuedUserMessagesToThread(self: *App, count: u32) !void {
         const flush_count: usize = @min(count, self.queued_user_messages.items.len);
         for (self.queued_user_messages.items[0..flush_count]) |message| {
-            _ = try self.thread.append(self.gpa, .user, "you", message);
-            try self.appendSkillInvocationsToThread(message);
-            self.gpa.free(message);
+            _ = try self.thread.append(self.gpa, .user, "you", message.text);
+            try self.appendSkillInvocationsToThread(message.text);
+            self.gpa.free(message.text);
         }
-        std.mem.copyForwards([]const u8, self.queued_user_messages.items[0 .. self.queued_user_messages.items.len - flush_count], self.queued_user_messages.items[flush_count..]);
+        std.mem.copyForwards(QueuedMessage, self.queued_user_messages.items[0 .. self.queued_user_messages.items.len - flush_count], self.queued_user_messages.items[flush_count..]);
         self.queued_user_messages.shrinkRetainingCapacity(self.queued_user_messages.items.len - flush_count);
+        // Messages drain from the front, so shift the selection left to keep it
+        // pointing at the same logical message (clamped into range).
+        self.queued_selection -|= flush_count;
     }
 
     fn clearQueuedUserMessages(self: *App) void {
-        for (self.queued_user_messages.items) |message| self.gpa.free(message);
+        for (self.queued_user_messages.items) |message| self.gpa.free(message.text);
         self.queued_user_messages.clearRetainingCapacity();
+        self.queued_selection = 0;
     }
 
     fn clearPaletteInput(self: *App) void {
@@ -2458,6 +2531,24 @@ const RootWidget = struct {
                 // `handleThreadKey`, which walks blocks and re-enters the input
                 // when you press down past the last block. The @-mention popup
                 // keeps the arrows for itself.
+                if (self.app.mode == .normal and !self.app.at_active and self.app.queued_user_messages.items.len > 0) {
+                    // ALT+←/→ navigate queued messages; CTRL+→ steers the
+                    // selected one. Gated on a non-empty queue so the keys fall
+                    // through to normal cursor/word movement otherwise.
+                    if (key.matches(vaxis.Key.left, .{ .alt = true })) {
+                        self.app.selectPrevQueued();
+                        ctx.consumeAndRedraw();
+                        return;
+                    } else if (key.matches(vaxis.Key.right, .{ .alt = true })) {
+                        self.app.selectNextQueued();
+                        ctx.consumeAndRedraw();
+                        return;
+                    } else if (key.matches(vaxis.Key.right, .{ .ctrl = true })) {
+                        self.app.steerSelectedQueued();
+                        ctx.consumeAndRedraw();
+                        return;
+                    }
+                }
                 if (self.app.mode == .normal and !self.app.at_active) {
                     if (key.matches(vaxis.Key.up, .{})) {
                         if (!self.app.block_nav) {
@@ -3690,9 +3781,18 @@ const InputWidget = struct {
     }
 
     fn drawQueuedMessage(self: *InputWidget, ctx: vxfw.DrawContext, width: u16) std.mem.Allocator.Error!vxfw.Surface {
-        const last = self.app.queued_user_messages.items[self.app.queued_user_messages.items.len - 1];
-        const prefix = if (self.app.queued_user_messages.items.len == 1) "[...] " else "[...] + ";
-        const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, last });
+        const items = self.app.queued_user_messages.items;
+        const sel = @min(self.app.queued_selection, items.len - 1);
+        const message = items[sel];
+        // Position suffix only when there's more than one to navigate.
+        const position = if (items.len > 1)
+            try std.fmt.allocPrint(ctx.arena, " {d}/{d}", .{ sel + 1, items.len })
+        else
+            "";
+        const text = if (message.steer)
+            try std.fmt.allocPrint(ctx.arena, "↩ {s}{s}", .{ message.text, position })
+        else
+            try std.fmt.allocPrint(ctx.arena, "[...] {s} (CTRL → to steer){s}", .{ message.text, position });
         var queued_text: vxfw.Text = .{ .text = text, .style = .{ .fg = StylePalette.thinking_body.fg, .dim = true }, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
         return queued_text.widget().draw(ctx.withConstraints(.{ .width = width, .height = 1 }, .{ .width = width, .height = 1 }));
     }
@@ -4378,7 +4478,7 @@ test "begin submit queues while turn is in flight" {
     try std.testing.expect(!try app.beginSubmit());
 
     try std.testing.expectEqual(@as(usize, 1), app.queued_user_messages.items.len);
-    try std.testing.expectEqualStrings("later", app.queued_user_messages.items[0]);
+    try std.testing.expectEqualStrings("later", app.queued_user_messages.items[0].text);
     try std.testing.expectEqual(@as(u32, 1), agent.message_queue.len());
     try std.testing.expectEqual(@as(usize, 0), app.input.buf.firstHalf().len);
     try std.testing.expect(try app.applyAgentEvent(.{ .queued_messages_flushed = 1 }));
@@ -4418,6 +4518,55 @@ test "queued prompt draws above input at minimum input height" {
     try std.testing.expectEqual(@as(u16, 0), surface.children[0].origin.row);
     try std.testing.expectEqual(@as(u16, 1), surface.children[1].origin.row);
     try std.testing.expectEqualStrings("[", surface.children[0].surface.readCell(0, 0).char.grapheme);
+}
+
+test "alt navigation and ctrl-steer drive the queued message line" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.turn.submit();
+    app.turn_view.awaitModel();
+
+    try app.input.insertSliceAtCursor("first");
+    try std.testing.expect(!try app.beginSubmit());
+    try app.input.insertSliceAtCursor("second");
+    try std.testing.expect(!try app.beginSubmit());
+
+    // Newest is selected after queueing.
+    try std.testing.expectEqual(@as(usize, 1), app.queued_selection);
+
+    // ALT+← walks back to the older message; clamps at the front.
+    app.selectPrevQueued();
+    try std.testing.expectEqual(@as(usize, 0), app.queued_selection);
+    app.selectPrevQueued();
+    try std.testing.expectEqual(@as(usize, 0), app.queued_selection);
+
+    // CTRL+→ steers the selected message in both the mirror and agent queue.
+    app.steerSelectedQueued();
+    try std.testing.expect(app.queued_user_messages.items[0].steer);
+    try std.testing.expect(agent.message_queue.at(&agent.message_queue_storage, 0).?.steer);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var input_widget: InputWidget = .{ .app = &app };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 60, .height = 6 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try input_widget.widget().draw(ctx);
+    // Steered selection renders the ↩ form, not the "[...]" form.
+    try std.testing.expectEqualStrings("↩", surface.children[0].surface.readCell(0, 0).char.grapheme);
+
+    // ALT+→ moves to the newer, still-queued message: back to "[...]".
+    app.selectNextQueued();
+    try std.testing.expectEqual(@as(usize, 1), app.queued_selection);
+    const surface2 = try input_widget.widget().draw(ctx);
+    try std.testing.expectEqualStrings("[", surface2.children[0].surface.readCell(0, 0).char.grapheme);
 }
 
 test "begin submit shows notice when queued message queue is full" {
@@ -4871,6 +5020,45 @@ test "model selection is allowed after interrupt" {
 
     try std.testing.expectEqual(Turn.State.idle, app.turn.state);
     try std.testing.expectEqual(config_mod.Provider.ollama, app.cached_config.provider.?);
+}
+
+test "interrupt restart flushes queued messages to the transcript when no provider" {
+    const gpa = std.testing.allocator;
+    var runtime: runtime_mod.AgentRuntime = undefined;
+    runtime.gpa = gpa;
+    runtime.io = std.testing.io;
+    runtime.cwd = ".";
+    runtime.home_dir = ".";
+    runtime.client = .none;
+    runtime.base_system_prompt = "test";
+    runtime.system_prompt = "test";
+    runtime.session_writer = undefined;
+    runtime.agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer runtime.agent.deinit();
+    runtime.diagnostics = &.{};
+    runtime.owned_client = null;
+    runtime.owned_compaction_client = null;
+    var app = App.init(std.testing.io, gpa, &runtime.agent);
+    app.runtime = &runtime;
+    defer app.deinit();
+    defer app.turn.reset();
+
+    // Queue two messages behind a running turn.
+    app.turn.submit();
+    try app.input.insertSliceAtCursor("one");
+    try std.testing.expect(!try app.beginSubmit());
+    try app.input.insertSliceAtCursor("two");
+    try std.testing.expect(!try app.beginSubmit());
+    try std.testing.expectEqual(@as(usize, 2), app.queued_user_messages.items.len);
+
+    // With no provider, the restart surfaces the queued text and drops the queue
+    // rather than spinning up a doomed worker.
+    try std.testing.expect(try app.restartTurnForQueuedMessages());
+    try std.testing.expectEqual(@as(usize, 0), app.queued_user_messages.items.len);
+    try std.testing.expectEqual(@as(u32, 0), runtime.agent.message_queue.len());
+    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
+    try std.testing.expectEqualStrings("one", app.thread.messages.items[0].body);
+    try std.testing.expectEqualStrings("two", app.thread.messages.items[1].body);
 }
 
 test "canceling a picker returns to command menu" {
