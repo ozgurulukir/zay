@@ -180,6 +180,7 @@ pub const App = struct {
     /// top of the input, cleared when it re-enters from the last block or on any
     /// edit/submit. See `RootWidget.captureEvent`.
     block_nav: bool = false,
+    input_wrap_width: u16 = 0,
     at_active: bool = false,
     at_query: []u8 = "",
     at_results: std.ArrayList([]const u8) = .empty,
@@ -1962,26 +1963,35 @@ pub const App = struct {
         try self.updateAtSearch();
     }
 
+    /// Moves the input cursor up or down by one *visual* row, so navigation
+    /// follows the wrapped layout the user actually sees — a long line with no
+    /// manual breaks behaves like a multi-row text area, not a single logical
+    /// line. Returns false when there is no row to move to (top/bottom), so the
+    /// caller can hand control to block navigation.
     fn moveInputCursorVertical(self: *App, move: VerticalMove) !bool {
         const text = try self.peekInput();
         defer self.gpa.free(text);
         const cur = self.input.buf.firstHalf().len;
-        const cur_line_start = lineStartBefore(text, cur);
-        const col = cellColumn(text[cur_line_start..cur]);
+        // Before the first draw (only in tests) the width is unknown; a wide
+        // sentinel keeps every logical line on one visual row.
+        const width: u16 = if (self.input_wrap_width == 0) 4096 else self.input_wrap_width;
 
-        const target = switch (move) {
-            .up => blk: {
-                if (cur_line_start == 0) return false;
-                const prev_start = lineStartBefore(text, cur_line_start - 1);
-                break :blk byteAtColumn(text, prev_start, cur_line_start - 1, col);
-            },
+        const pos = wrappedPosition(text, cur, width);
+        const target_row: u16 = switch (move) {
+            .up => if (pos.row == 0) return false else pos.row - 1,
             .down => blk: {
-                const nl = std.mem.indexOfScalarPos(u8, text, cur, '\n') orelse return false;
-                const next_start = nl + 1;
-                const next_end = std.mem.indexOfScalarPos(u8, text, next_start, '\n') orelse text.len;
-                break :blk byteAtColumn(text, next_start, next_end, col);
+                const last_row = wrappedPosition(text, text.len, width).row;
+                if (pos.row >= last_row) return false;
+                break :blk pos.row + 1;
             },
         };
+
+        const row_start = visualRowStart(text, target_row, width);
+        var row_end = visualRowStart(text, target_row + 1, width);
+        // A row that ends at a hard break owns the text up to, but not
+        // including, the newline.
+        if (row_end > row_start and text[row_end - 1] == '\n') row_end -= 1;
+        const target = byteAtVisualColumn(text, row_start, row_end, pos.col);
 
         if (target < cur) {
             self.input.buf.moveGapLeft(cur - target);
@@ -3304,6 +3314,7 @@ const CommandInputText = struct {
     fn drawInputText(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *CommandInputText = @ptrCast(@alignCast(ptr));
         const width = ctx.max.width orelse 0;
+        self.app.input_wrap_width = width;
         const rows = try self.app.inputTextRows(ctx, width);
         if (rows <= 1) return self.app.input.draw(ctx);
         return self.drawMultiline(ctx);
@@ -3339,25 +3350,85 @@ const CommandInputText = struct {
 
 const VerticalMove = enum { up, down };
 
-fn lineStartBefore(text: []const u8, pos: usize) usize {
-    if (std.mem.lastIndexOfScalar(u8, text[0..pos], '\n')) |idx| return idx + 1;
-    return 0;
+/// Byte offset where the given visual (wrapped) row begins. Mirrors the
+/// wrapping rules in `wrappedPosition`/`drawInputWrapped` so navigation lands
+/// the cursor exactly where the text is drawn. Returns `text.len` when the row
+/// is past the end.
+fn visualRowStart(text: []const u8, target_row: u16, width: u16) usize {
+    if (target_row == 0 or width == 0) return 0;
+    var row: u16 = 0;
+    var col: u16 = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == '\n') {
+            row += 1;
+            index += 1;
+            if (row == target_row) return index;
+            col = 0;
+            continue;
+        }
+
+        const spaces_start = index;
+        while (index < text.len and wrapSpace(text[index])) index += 1;
+        const spaces = text[spaces_start..index];
+        const word_start = index;
+        while (index < text.len and text[index] != '\n' and !wrapSpace(text[index])) index += 1;
+        const word = text[word_start..index];
+        if (word.len == 0) {
+            if (advanceRowStart(spaces, spaces_start, &row, &col, width, target_row)) |off| return off;
+            continue;
+        }
+
+        const spaces_width = gw(spaces);
+        const word_width = gw(word);
+        if (col > 0) {
+            if (col + spaces_width + word_width > width) {
+                row += 1;
+                col = 0;
+                if (row == target_row) return word_start;
+            } else {
+                col = @min(width, col + spaces_width);
+            }
+        }
+        if (advanceRowStart(word, word_start, &row, &col, width, target_row)) |off| return off;
+    }
+    return text.len;
 }
 
-fn cellColumn(slice: []const u8) usize {
-    return vaxis.gwidth.gwidth(slice, .unicode);
+/// Walks a run grapheme-by-grapheme, soft-wrapping like the renderer. Returns
+/// the absolute byte offset of the grapheme that opens `target_row`, or null if
+/// the run does not reach it. `base` is the run's offset within the full text.
+fn advanceRowStart(text: []const u8, base: usize, row: *u16, col: *u16, width: u16, target_row: u16) ?usize {
+    var iter = vaxis.unicode.graphemeIterator(text);
+    var local: usize = 0;
+    while (iter.next()) |grapheme| {
+        const cell_width = gw(grapheme.bytes(text));
+        if (cell_width == 0) {
+            local += grapheme.len;
+            continue;
+        }
+        if (col.* + cell_width > width) {
+            row.* += 1;
+            col.* = 0;
+            if (row.* == target_row) return base + local;
+        }
+        col.* = @min(width, col.* + cell_width);
+        local += grapheme.len;
+    }
+    return null;
 }
 
-fn byteAtColumn(text: []const u8, line_start: usize, line_end: usize, col: usize) usize {
-    var iter = vaxis.unicode.graphemeIterator(text[line_start..line_end]);
-    var offset: usize = line_start;
-    var cells: usize = 0;
-    while (cells < col) {
-        const grapheme = iter.next() orelse break;
-        const bytes = grapheme.bytes(text[line_start..line_end]);
-        const width = vaxis.gwidth.gwidth(bytes, .unicode);
-        if (cells + width > col) break;
-        cells += width;
+/// Byte offset within a single visual row `[row_start, row_end)` whose column is
+/// the largest not exceeding `desired_col` — i.e. where a vertical move lands.
+fn byteAtVisualColumn(text: []const u8, row_start: usize, row_end: usize, desired_col: u16) usize {
+    const slice = text[row_start..row_end];
+    var iter = vaxis.unicode.graphemeIterator(slice);
+    var offset: usize = row_start;
+    var col: u16 = 0;
+    while (iter.next()) |grapheme| {
+        const cell_width = gw(grapheme.bytes(slice));
+        if (col + cell_width > desired_col) break;
+        col += cell_width;
         offset += grapheme.len;
     }
     return offset;
@@ -3380,11 +3451,25 @@ const WrappedInputDraw = struct {
     width: u16,
 };
 
+/// Cell width of a string under the unicode width method — the same metric the
+/// renderer uses (`DrawContext.stringWidth` is a static wrapper over this).
+fn gw(s: []const u8) u16 {
+    return @intCast(vaxis.gwidth.gwidth(s, .unicode));
+}
+
 fn wrappedTextRows(ctx: vxfw.DrawContext, text: []const u8, width: u16) u16 {
-    return wrappedTextPositionAt(ctx, text, text.len, width).row + 1;
+    _ = ctx;
+    return wrappedPosition(text, text.len, width).row + 1;
 }
 
 fn wrappedTextPositionAt(ctx: vxfw.DrawContext, text: []const u8, cursor: usize, width: u16) WrappedTextPosition {
+    _ = ctx;
+    return wrappedPosition(text, cursor, width);
+}
+
+/// Maps a byte offset to its visual (row, col) under word-wrapping at `width`.
+/// Context-free so cursor navigation can reuse the renderer's exact layout.
+fn wrappedPosition(text: []const u8, cursor: usize, width: u16) WrappedTextPosition {
     if (width == 0) return .{ .row = 0, .col = 0 };
 
     var row: u16 = 0;
@@ -3401,21 +3486,21 @@ fn wrappedTextPositionAt(ctx: vxfw.DrawContext, text: []const u8, cursor: usize,
 
         const spaces_start = index;
         while (index < text.len and wrapSpace(text[index])) index += 1;
-        if (cursor <= index) return advancePosition(ctx, text[spaces_start..cursor], row, col, width);
+        if (cursor <= index) return advancePosition(text[spaces_start..cursor], row, col, width);
 
         const spaces = text[spaces_start..index];
         const word_start = index;
         while (index < text.len and text[index] != '\n' and !wrapSpace(text[index])) index += 1;
         const word = text[word_start..index];
         if (word.len == 0) {
-            const pos = advancePosition(ctx, spaces, row, col, width);
+            const pos = advancePosition(spaces, row, col, width);
             row = pos.row;
             col = pos.col;
             continue;
         }
 
-        const spaces_width: u16 = @intCast(ctx.stringWidth(spaces));
-        const word_width: u16 = @intCast(ctx.stringWidth(word));
+        const spaces_width = gw(spaces);
+        const word_width = gw(word);
         if (col > 0) {
             if (col + spaces_width + word_width > width) {
                 row += 1;
@@ -3424,22 +3509,21 @@ fn wrappedTextPositionAt(ctx: vxfw.DrawContext, text: []const u8, cursor: usize,
                 col = @min(width, col + spaces_width);
             }
         }
-        if (cursor <= index) return advancePosition(ctx, text[word_start..cursor], row, col, width);
+        if (cursor <= index) return advancePosition(text[word_start..cursor], row, col, width);
 
-        const pos = advancePosition(ctx, word, row, col, width);
+        const pos = advancePosition(word, row, col, width);
         row = pos.row;
         col = pos.col;
     }
     return .{ .row = row, .col = col };
 }
 
-fn advancePosition(ctx: vxfw.DrawContext, text: []const u8, row_start: u16, col_start: u16, width: u16) WrappedTextPosition {
+fn advancePosition(text: []const u8, row_start: u16, col_start: u16, width: u16) WrappedTextPosition {
     var row = row_start;
     var col = col_start;
-    var iter = ctx.graphemeIterator(text);
+    var iter = vaxis.unicode.graphemeIterator(text);
     while (iter.next()) |grapheme| {
-        const bytes = grapheme.bytes(text);
-        const cell_width: u16 = @intCast(ctx.stringWidth(bytes));
+        const cell_width = gw(grapheme.bytes(text));
         if (cell_width == 0) continue;
         if (col + cell_width > width) {
             row += 1;
@@ -3831,6 +3915,32 @@ test "arrow up and down move the input cursor between lines" {
     // Down to the last line, then no further move.
     try std.testing.expect(try app.moveInputCursorVertical(.down));
     try std.testing.expectEqualStrings("fox\nox\nca", app.input.buf.firstHalf());
+    try std.testing.expect(!(try app.moveInputCursorVertical(.down)));
+}
+
+test "vertical navigation follows soft-wrapped visual rows" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // A single long line with no manual breaks. Wrapped at width 10 it spans
+    // two visual rows ("abcdefghij" / "klmnopqrst"), so the cursor must move by
+    // visual row — the old '\n'-only logic was stuck on one logical line.
+    try app.input.insertSliceAtCursor("abcdefghijklmnopqrst");
+    app.input_wrap_width = 10;
+
+    // Cursor sits at the end (second visual row). Up moves to the first row.
+    try std.testing.expect(try app.moveInputCursorVertical(.up));
+    try std.testing.expectEqualStrings("abcdefghij", app.input.buf.firstHalf());
+
+    // Already on the first visual row: no move, hand off to block nav.
+    try std.testing.expect(!(try app.moveInputCursorVertical(.up)));
+
+    // Down returns to the second visual row at the same column.
+    try std.testing.expect(try app.moveInputCursorVertical(.down));
+    try std.testing.expectEqualStrings("abcdefghijklmnopqrst", app.input.buf.firstHalf());
     try std.testing.expect(!(try app.moveInputCursorVertical(.down)));
 }
 
