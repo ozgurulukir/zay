@@ -377,6 +377,7 @@ pub const AgentRuntime = struct {
             .model = model_id,
             .tools = tools_mod.registry,
             .reasoning = .{ .effort = effort },
+            .session_id = self.session_writer.session.id.slice(),
         });
         errdefer client.deinit();
         self.replaceClient(.{ .openai_compatible = client });
