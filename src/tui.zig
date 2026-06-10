@@ -1910,7 +1910,7 @@ pub const App = struct {
 
     fn rebuildThreadFromAgent(self: *App) !void {
         try self.clearConversation();
-        for (self.agent.messages.items) |message| {
+        for (self.agent.messages()) |message| {
             if (message.role == .system) continue;
             const text = message.text();
             if (message.role == .user) {
@@ -1930,7 +1930,7 @@ pub const App = struct {
     fn resumedToolTitle(self: *App, message: ai.ChatMessage) ![]u8 {
         if (message.tool_display_label) |label| return thread_mod.toolTitle(self.gpa, label);
         const id = message.call_id orelse return thread_mod.toolTitle(self.gpa, "tool");
-        for (self.agent.messages.items) |candidate| {
+        for (self.agent.messages()) |candidate| {
             for (candidate.content) |block| {
                 if (block != .tool_call) continue;
                 if (!std.mem.eql(u8, block.tool_call.call_id, id)) continue;
@@ -4505,6 +4505,7 @@ test "codex sign-in survives selecting local compatible provider" {
     defer runtime.agent.deinit();
     runtime.diagnostics = &.{};
     runtime.owned_client = null;
+    runtime.owned_compaction_client = null;
     var app = App.init(std.testing.io, gpa, &runtime.agent);
     app.runtime = &runtime;
     defer app.deinit();
@@ -4539,6 +4540,7 @@ test "switching from codex to catalogue provider resets cached connection" {
     runtime.diagnostics = &.{};
     runtime.codex_connection_expired = false;
     runtime.owned_client = null;
+    runtime.owned_compaction_client = null;
     defer runtime.disconnectClient();
 
     var app = App.init(std.testing.io, gpa, &runtime.agent);
@@ -4741,6 +4743,7 @@ test "model selection is allowed after interrupt" {
     defer runtime.agent.deinit();
     runtime.diagnostics = &.{};
     runtime.owned_client = null;
+    runtime.owned_compaction_client = null;
     var app = App.init(std.testing.io, gpa, &runtime.agent);
     app.runtime = &runtime;
     defer app.deinit();

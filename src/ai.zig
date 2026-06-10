@@ -311,8 +311,39 @@ pub const ChatMessage = struct {
     }
 };
 
+/// Token accounting for one model response, normalized across provider
+/// dialects. Chat Completions reports `prompt_tokens`/`completion_tokens`;
+/// the Responses API reports `input_tokens`/`output_tokens`. We store the
+/// neutral `input`/`output` naming and parse each dialect at its adapter
+/// boundary (see `boundary-discipline`).
+///
+/// `cached_input_tokens` is a *subset* of `input_tokens` (already counted in
+/// it) and is informational only: a cached prompt is still re-sent in full,
+/// so it never reduces the size used for context-overflow math.
+pub const Usage = struct {
+    input_tokens: u32,
+    output_tokens: u32,
+    total_tokens: u32,
+    cached_input_tokens: u32 = 0,
+    reasoning_tokens: u32 = 0,
+};
+
+/// Clamp a provider-reported token count (an arbitrary JSON integer parsed at
+/// an adapter boundary) into the `u32` domain `Usage` uses. Negative or absurd
+/// values collapse to the nearest representable bound rather than wrapping.
+pub fn clampTokenCount(value: i64) u32 {
+    if (value < 0) return 0;
+    if (value > std.math.maxInt(u32)) return std.math.maxInt(u32);
+    return @intCast(value);
+}
+
 pub const Turn = struct {
     assistant: ChatMessage,
+    /// Token usage for this turn, when the provider reported it. `null` means
+    /// the provider omitted usage (e.g. a streaming OpenAI-compatible endpoint
+    /// without `stream_options.include_usage`); the budget falls back to a
+    /// size estimate in that case.
+    usage: ?Usage = null,
 
     pub fn deinit(self: *Turn, gpa: std.mem.Allocator) void {
         self.assistant.deinit(gpa);

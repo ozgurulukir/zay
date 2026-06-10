@@ -368,7 +368,11 @@ fn writeRequestPayload(
         if (index > 0) try out.writeByte(',');
         try writeMessage(out, message);
     }
-    try out.writeAll("],\"stream\":true,\"tools\":");
+    // `stream_options.include_usage` makes the server emit a final usage-only
+    // chunk (empty `choices`) before `[DONE]`. Without it, streaming responses
+    // carry no token counts. Some OpenAI-compatible servers ignore it, so the
+    // parser treats usage as optional.
+    try out.writeAll("],\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tools\":");
     try out.writeAll(tools_json);
     try out.writeAll(",\"tool_choice\":\"auto\"");
     const effort = if (reasoning) |value| value.effort else null;
@@ -436,10 +440,16 @@ fn readStream(
         builders.deinit(gpa);
     }
 
+    // Parse and apply each chunk inline (rather than via `processStreamChunk`)
+    // so the final usage-only chunk's `change.usage` reaches the Turn. The
+    // server emits at most one usage chunk; the last one observed wins.
+    var usage: ?ai.Usage = null;
     var source: stream_part.Source = .{ .reader = reader };
     while (try source.next(gpa)) |data| {
         defer gpa.free(data);
-        try processStreamChunk(gpa, data, &content, &reasoning, &builders, observer);
+        const change = try parseStreamChunk(gpa, data, &content, &reasoning, &builders);
+        if (change.usage) |chunk_usage| usage = chunk_usage;
+        try applyChunkCallbacks(change, content.items, reasoning.items, builders.items, observer);
     }
 
     var blocks: std.ArrayList(ai.ContentBlock) = .empty;
@@ -457,7 +467,7 @@ fn readStream(
         if (builder.name.items.len == 0) continue;
         try blocks.append(gpa, .{ .tool_call = try builder.toToolCall(gpa, tool_call_seq) });
     }
-    return .{ .assistant = .{ .role = .assistant, .content = try blocks.toOwnedSlice(gpa) } };
+    return .{ .assistant = .{ .role = .assistant, .content = try blocks.toOwnedSlice(gpa) }, .usage = usage };
 }
 
 const ChunkChange = struct {
@@ -465,6 +475,9 @@ const ChunkChange = struct {
     reasoning_start: ?u32 = null,
     tool_call_indexes: [tool_call_count_max]u32 = @splat(0),
     tool_call_count: u32 = 0,
+    /// Token usage when this chunk was the final usage-only chunk; otherwise
+    /// null. Does not affect `empty()` — a usage chunk emits no callbacks.
+    usage: ?ai.Usage = null,
 
     fn empty(self: *const ChunkChange) bool {
         if (self.content_start != null) return false;
@@ -539,11 +552,50 @@ fn parseStreamChunk(
     while (try nextObjectKey(&scanner)) |key| {
         if (std.mem.eql(u8, key, "choices")) {
             try parseChoicesArray(gpa, &scanner, content, reasoning, builders, &change);
+        } else if (std.mem.eql(u8, key, "usage")) {
+            try parseUsageValue(&scanner, &change.usage);
         } else {
             try scanner.skipValue();
         }
     }
     return change;
+}
+
+/// Parse the chat-completions `usage` value. Content chunks carry `usage:null`
+/// (consumed and ignored); the final usage-only chunk carries the object.
+fn parseUsageValue(scanner: *Scanner, usage: *?ai.Usage) !void {
+    const peeked = try scanner.peekNextTokenType();
+    if (peeked == .null) {
+        _ = try scanner.next();
+        return;
+    }
+    usage.* = try parseUsageObject(scanner);
+}
+
+/// Parse the chat-completions usage object. Only the top-level totals are
+/// captured; the optional `*_tokens_details` sub-objects are skipped (their
+/// cached/reasoning breakdown is informational and not needed for budgeting).
+fn parseUsageObject(scanner: *Scanner) !ai.Usage {
+    try expectObjectBegin(scanner);
+    var input_tokens: i64 = 0;
+    var output_tokens: i64 = 0;
+    var total_tokens: i64 = 0;
+    while (try nextObjectKey(scanner)) |key| {
+        if (std.mem.eql(u8, key, "prompt_tokens")) {
+            input_tokens = try nextInteger(scanner);
+        } else if (std.mem.eql(u8, key, "completion_tokens")) {
+            output_tokens = try nextInteger(scanner);
+        } else if (std.mem.eql(u8, key, "total_tokens")) {
+            total_tokens = try nextInteger(scanner);
+        } else {
+            try scanner.skipValue();
+        }
+    }
+    return .{
+        .input_tokens = ai.clampTokenCount(input_tokens),
+        .output_tokens = ai.clampTokenCount(output_tokens),
+        .total_tokens = ai.clampTokenCount(total_tokens),
+    };
 }
 
 fn parseChoicesArray(
@@ -1043,4 +1095,39 @@ test "parse streaming content deltas as they arrive" {
 
     try std.testing.expectEqualStrings("hello", seen.content.items);
     try std.testing.expectEqualStrings("hello", content.items);
+}
+
+test "parse streaming usage chunk" {
+    const gpa = std.testing.allocator;
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
+    var builders: std.ArrayList(ToolCallBuilder) = .empty;
+    defer builders.deinit(gpa);
+
+    const change = try parseStreamChunk(gpa,
+        \\{"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":340,"total_tokens":1540}}
+    , &content, &reasoning, &builders);
+
+    try std.testing.expect(change.usage != null);
+    try std.testing.expectEqual(@as(u32, 1200), change.usage.?.input_tokens);
+    try std.testing.expectEqual(@as(u32, 340), change.usage.?.output_tokens);
+    try std.testing.expectEqual(@as(u32, 1540), change.usage.?.total_tokens);
+}
+
+test "content chunk carries null usage" {
+    const gpa = std.testing.allocator;
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
+    var builders: std.ArrayList(ToolCallBuilder) = .empty;
+    defer builders.deinit(gpa);
+
+    const change = try parseStreamChunk(gpa,
+        \\{"choices":[{"delta":{"content":"hi"}}],"usage":null}
+    , &content, &reasoning, &builders);
+
+    try std.testing.expect(change.usage == null);
 }

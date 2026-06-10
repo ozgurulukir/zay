@@ -386,6 +386,7 @@ pub const StreamState = struct {
     blocks: std.ArrayList(ai.ContentBlock) = .empty,
     tools: std.ArrayList(ToolBuilder) = .empty,
     completed: bool = false,
+    usage: ?ai.Usage = null,
 
     pub fn deinit(self: *StreamState, gpa: std.mem.Allocator) void {
         for (self.tools.items) |*tool| tool.deinit(gpa);
@@ -398,7 +399,7 @@ pub const StreamState = struct {
     }
 
     pub fn processJson(self: *StreamState, gpa: std.mem.Allocator, data: []const u8, observer: ai.StreamObserver, call_seq: *u64) !void {
-        try processEvent(gpa, data, &self.blocks, &self.tools, observer, call_seq, &self.completed);
+        try processEvent(gpa, data, &self.blocks, &self.tools, observer, call_seq, &self.completed, &self.usage);
     }
 
     pub fn finish(self: *StreamState, gpa: std.mem.Allocator, call_seq: *u64) !ai.Turn {
@@ -406,11 +407,11 @@ pub const StreamState = struct {
         try syncToolBlocks(gpa, &self.blocks, self.tools.items, call_seq);
         const content = try self.blocks.toOwnedSlice(gpa);
         self.blocks = .empty;
-        return .{ .assistant = .{ .role = .assistant, .content = content } };
+        return .{ .assistant = .{ .role = .assistant, .content = content }, .usage = self.usage };
     }
 };
 
-fn processEvent(gpa: std.mem.Allocator, data: []const u8, blocks: *std.ArrayList(ai.ContentBlock), tools: *std.ArrayList(ToolBuilder), observer: ai.StreamObserver, call_seq: *u64, completed: *bool) !void {
+fn processEvent(gpa: std.mem.Allocator, data: []const u8, blocks: *std.ArrayList(ai.ContentBlock), tools: *std.ArrayList(ToolBuilder), observer: ai.StreamObserver, call_seq: *u64, completed: *bool, usage: *?ai.Usage) !void {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, data, .{}) catch return;
     defer parsed.deinit();
     if (parsed.value != .object) return;
@@ -424,6 +425,7 @@ fn processEvent(gpa: std.mem.Allocator, data: []const u8, blocks: *std.ArrayList
         .provider_error => return error.ProviderError,
         .completed => {
             completed.* = true;
+            usage.* = parseResponseUsage(parsed.value);
             return;
         },
         .output_item_added => return onItemAdded(gpa, parsed.value, blocks, tools, call_seq),
@@ -437,6 +439,38 @@ fn processEvent(gpa: std.mem.Allocator, data: []const u8, blocks: *std.ArrayList
         .function_call_arguments_done => return onArgumentsDone(gpa, parsed.value, blocks, tools, observer),
         .output_item_done => return onItemDone(gpa, parsed.value, blocks, tools, observer),
     }
+}
+
+/// Extract `response.usage` from a `response.completed` event. Returns null
+/// when the event carries no usage (e.g. the synthetic completed events in
+/// tests). The Responses API names tokens `input_tokens`/`output_tokens`,
+/// unlike Chat Completions — see `ai.Usage`.
+fn parseResponseUsage(event: std.json.Value) ?ai.Usage {
+    const response = event.object.get("response") orelse return null;
+    if (response != .object) return null;
+    const usage = response.object.get("usage") orelse return null;
+    if (usage != .object) return null;
+    return .{
+        .input_tokens = usageInteger(usage, "input_tokens"),
+        .output_tokens = usageInteger(usage, "output_tokens"),
+        .total_tokens = usageInteger(usage, "total_tokens"),
+        .cached_input_tokens = usageNestedInteger(usage, "input_tokens_details", "cached_tokens"),
+        .reasoning_tokens = usageNestedInteger(usage, "output_tokens_details", "reasoning_tokens"),
+    };
+}
+
+fn usageInteger(usage: std.json.Value, name: []const u8) u32 {
+    const field = usage.object.get(name) orelse return 0;
+    if (field != .integer) return 0;
+    return ai.clampTokenCount(field.integer);
+}
+
+fn usageNestedInteger(usage: std.json.Value, object_name: []const u8, field_name: []const u8) u32 {
+    const nested = usage.object.get(object_name) orelse return 0;
+    if (nested != .object) return 0;
+    const field = nested.object.get(field_name) orelse return 0;
+    if (field != .integer) return 0;
+    return ai.clampTokenCount(field.integer);
 }
 
 const ResponseEvent = enum {
@@ -934,6 +968,39 @@ test "openresponses preserves text tool text block order" {
     try std.testing.expectEqualStrings("before", turn.assistant.content[0].text.text);
     try std.testing.expectEqualStrings("bash", turn.assistant.content[1].tool_call.name);
     try std.testing.expectEqualStrings("after", turn.assistant.content[2].text.text);
+}
+
+test "openresponses parses usage from completed event" {
+    const gpa = std.testing.allocator;
+    var state: StreamState = .{};
+    defer state.deinit(gpa);
+    defer state.deinitBlocks(gpa);
+
+    var call_seq: u64 = 0;
+    try state.processJson(gpa, "{\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":2000,\"input_tokens_details\":{\"cached_tokens\":1500},\"output_tokens\":420,\"output_tokens_details\":{\"reasoning_tokens\":256},\"total_tokens\":2420}}}", ai.StreamObserver.noop, &call_seq);
+
+    var turn = try state.finish(gpa, &call_seq);
+    defer turn.deinit(gpa);
+    try std.testing.expect(turn.usage != null);
+    try std.testing.expectEqual(@as(u32, 2000), turn.usage.?.input_tokens);
+    try std.testing.expectEqual(@as(u32, 1500), turn.usage.?.cached_input_tokens);
+    try std.testing.expectEqual(@as(u32, 420), turn.usage.?.output_tokens);
+    try std.testing.expectEqual(@as(u32, 256), turn.usage.?.reasoning_tokens);
+    try std.testing.expectEqual(@as(u32, 2420), turn.usage.?.total_tokens);
+}
+
+test "openresponses completed event without usage leaves null" {
+    const gpa = std.testing.allocator;
+    var state: StreamState = .{};
+    defer state.deinit(gpa);
+    defer state.deinitBlocks(gpa);
+
+    var call_seq: u64 = 0;
+    try state.processJson(gpa, "{\"type\":\"response.completed\"}", ai.StreamObserver.noop, &call_seq);
+
+    var turn = try state.finish(gpa, &call_seq);
+    defer turn.deinit(gpa);
+    try std.testing.expect(turn.usage == null);
 }
 
 test "openresponses routes parallel argument deltas by output index" {
