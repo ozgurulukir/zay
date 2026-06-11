@@ -1,11 +1,11 @@
 const std = @import("std");
-const builtin = @import("builtin");
 
 const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
 const codex_mod = @import("codex.zig");
 const compaction = @import("compaction.zig");
 const config_mod = @import("config.zig");
+const os = @import("os.zig");
 const session_mod = @import("session.zig");
 const skill_mod = @import("skill.zig");
 const tools_mod = @import("tools.zig");
@@ -494,7 +494,7 @@ fn createSystemPrompt(gpa: std.mem.Allocator, template: []const u8, cwd: []const
     assert(cwd.len > 0);
     const cwd_resolved = try std.mem.replaceOwned(u8, gpa, template, "${CWD}", cwd);
     defer gpa.free(cwd_resolved);
-    return try std.mem.replaceOwned(u8, gpa, cwd_resolved, "${OS}", os_label);
+    return try std.mem.replaceOwned(u8, gpa, cwd_resolved, "${OS}", os.label);
 }
 
 /// Reads AGENTS.md in the root directory if it exists. Returns null otherwise.
@@ -553,16 +553,6 @@ fn createSystemPromptWithContext(
 fn codexRefreshNeeded(expires_ms: i64, now_ms: i64) bool {
     return expires_ms <= now_ms + codex_refresh_margin_ms;
 }
-
-const os_label: []const u8 = switch (builtin.os.tag) {
-    .windows => "Windows",
-    .linux => "Linux",
-    .macos => "macOS",
-    .freebsd => "FreeBSD",
-    .netbsd => "NetBSD",
-    .openbsd => "OpenBSD",
-    else => @tagName(builtin.os.tag),
-};
 
 test "codex refresh starts before token expiry" {
     const now_ms: i64 = 10_000;

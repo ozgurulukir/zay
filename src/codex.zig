@@ -1,5 +1,6 @@
 const std = @import("std");
 const logger = @import("logger");
+const os = @import("os.zig");
 const symbols = @import("symbols.zig");
 
 const auth_port: u16 = 1455;
@@ -155,7 +156,7 @@ fn createAuthorizationFlow(gpa: std.mem.Allocator, io: std.Io) !AuthorizationFlo
 }
 
 fn openBrowser(gpa: std.mem.Allocator, io: std.Io, url: []const u8) !void {
-    const argv = switch (@import("builtin").target.os.tag) {
+    const argv = switch (os.tag) {
         .macos => &[_][]const u8{ "open", url },
         .windows => &[_][]const u8{ "cmd", "/c", "start", "", url },
         else => &[_][]const u8{ "xdg-open", url },
