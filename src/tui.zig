@@ -68,10 +68,16 @@ const DiffRefreshJob = struct {
 };
 
 const DiffRefreshOutcome = union(enum) {
-    ready: DiffCounts,
+    /// The full combined diff text (owned). Counts are derived from it on the UI
+    /// thread, and it's cached so `/diff` opens instantly.
+    ready: []u8,
     failed,
 
-    pub fn deinit(self: *DiffRefreshOutcome) void {
+    pub fn deinit(self: *DiffRefreshOutcome, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .ready => |raw| gpa.free(raw),
+            .failed => {},
+        }
         self.* = undefined;
     }
 };
@@ -85,15 +91,18 @@ fn runDiffRefresh(job: *DiffRefreshJob) DiffRefreshOutcome {
         done.store(true, .release);
     }
 
+    // Grab the full diff (not just numstat): one git pass gives both the cached
+    // text and the +/- counts. `--no-index` exits non-zero when untracked files
+    // differ, so the exit code is ignored — empty stdout simply means no changes.
     var result = bash_mod.runWithOptions(gpa, job.io, .{
         .cwd = job.cwd,
-        .command = diffCountCommand,
-        .timeout = bash_mod.timeoutFromSeconds(1),
+        .command = diff_viewer.diff_command,
+        .timeout = bash_mod.timeoutFromSeconds(5),
     }) catch return .failed;
     defer result.deinit(gpa);
 
-    if (result.code != 0) return .failed;
-    return .{ .ready = parseDiffCounts(result.stdout) };
+    const raw = gpa.dupe(u8, result.stdout) catch return .failed;
+    return .{ .ready = raw };
 }
 
 /// A user message queued behind a running turn, mirrored from the agent queue
@@ -162,6 +171,12 @@ pub const App = struct {
     diff_refresh_future: ?std.Io.Future(DiffRefreshOutcome) = null,
     diff_refresh_done: std.atomic.Value(bool) = .init(false),
     diff_refresh_again: bool = false,
+    /// Most recent full diff text (owned), refreshed in the background alongside
+    /// the counts so `/diff` opens instantly. Null until the first refresh lands.
+    diff_cache: ?[]u8 = null,
+    /// True while the viewer is open on a cold cache, showing "Loading diff…"
+    /// until the background refresh populates it.
+    diff_loading: bool = false,
     thread_view_width: u16 = 80,
     thread_view_height: u16 = 1,
     thread_list: vxfw.ListView = .{
@@ -266,6 +281,7 @@ pub const App = struct {
         self.resume_folded_projects.deinit(self.gpa);
         self.tree_state.deinit();
         self.cancelDiffRefresh();
+        if (self.diff_cache) |raw| self.gpa.free(raw);
         self.models.deinit(self.gpa);
         codex.freeApiKeyMap(self.gpa, &self.provider_api_keys);
         self.provider_key_input.deinit(self.gpa);
@@ -851,21 +867,35 @@ pub const App = struct {
         try self.reloadTreeNodes();
     }
 
-    /// Load the working-tree diff and enter the full-screen viewer. An empty
-    /// diff surfaces a notice and stays in normal mode.
+    /// Enter the full-screen diff viewer. Warm path: parse the cached diff
+    /// instantly. Cold path: navigate immediately and show "Loading diff…" while
+    /// a background refresh fetches it (never blocks on git).
     fn openDiffViewer(self: *App) !void {
-        const runtime = self.runtime orelse return error.NoWorkingDirectory;
-        var state = try diff_viewer.load(self.gpa, self.io, runtime.cwd);
-        if (state.isEmpty()) {
-            state.deinit(self.gpa);
-            _ = try self.thread.append(self.gpa, .agent, "agent", "No changes to review.");
-            self.mode = .normal;
-            self.clearInput();
-            self.clearPaletteInput();
+        if (self.runtime == null) return error.NoWorkingDirectory;
+        self.enterDiffMode();
+
+        if (self.diff_cache) |raw| {
+            self.diff_loading = false;
+            var state = try diff_viewer.fromRaw(self.gpa, raw);
+            if (state.isEmpty()) {
+                state.deinit(self.gpa);
+                self.mode = .normal;
+                _ = try self.thread.append(self.gpa, .agent, "agent", "No changes to review.");
+                return;
+            }
+            self.diff.deinit(self.gpa);
+            self.diff = state;
             return;
         }
+
+        // Cold start: show the loading state and kick (or ride) a refresh.
         self.diff.deinit(self.gpa);
-        self.diff = state;
+        self.diff = .{};
+        self.diff_loading = true;
+        if (self.diff_refresh_future == null) try self.scheduleDiffRefresh();
+    }
+
+    fn enterDiffMode(self: *App) void {
         self.mode = .diff_viewer;
         // The diff viewer never draws the thread, so the black-hole visibility
         // (recomputed only there) would stay stuck true and drive a pointless
@@ -892,6 +922,7 @@ pub const App = struct {
     fn closeDiffViewer(self: *App, send: bool) !bool {
         const composed = if (send) try self.diff.composeMessage(self.gpa) else null;
         self.diff.deinit(self.gpa);
+        self.diff_loading = false;
         self.mode = .normal;
         self.clearInput();
         self.clearPaletteInput();
@@ -2210,7 +2241,7 @@ pub const App = struct {
     fn cancelDiffRefresh(self: *App) void {
         if (self.diff_refresh_future) |*future| {
             var outcome = future.cancel(self.io);
-            outcome.deinit();
+            outcome.deinit(self.gpa);
             self.diff_refresh_future = null;
         }
         self.diff_refresh_again = false;
@@ -2224,15 +2255,51 @@ pub const App = struct {
         var outcome = self.diff_refresh_future.?.await(self.io);
         self.diff_refresh_future = null;
         self.diff_refresh_done.store(false, .release);
-        defer outcome.deinit();
+        defer outcome.deinit(self.gpa);
 
         var visible_change = false;
         switch (outcome) {
-            .ready => |counts| visible_change = self.installDiffCounts(counts),
-            .failed => {},
+            .ready => |raw| {
+                // Take ownership of the diff text into the cache; blank the local
+                // copy so the deferred deinit doesn't free what we kept.
+                if (self.diff_cache) |old| self.gpa.free(old);
+                self.diff_cache = raw;
+                outcome = .failed;
+                if (self.installDiffCounts(countDiff(self.diff_cache.?))) visible_change = true;
+                // A viewer opened on a cold cache is waiting on exactly this.
+                if (self.diff_loading) {
+                    try self.populateDiffFromCache();
+                    visible_change = true;
+                }
+            },
+            .failed => {
+                if (self.diff_loading) {
+                    self.diff_loading = false;
+                    self.mode = .normal;
+                    _ = try self.thread.append(self.gpa, .agent, "agent", "Couldn't load diff.");
+                    visible_change = true;
+                }
+            },
         }
         if (self.diff_refresh_again) try self.scheduleDiffRefresh();
         return visible_change;
+    }
+
+    /// Build the viewer's state from the cached diff (parse only — no git). Drops
+    /// back to normal mode with a notice when the diff turned out empty.
+    fn populateDiffFromCache(self: *App) !void {
+        self.diff_loading = false;
+        const raw = self.diff_cache orelse return;
+        var state = try diff_viewer.fromRaw(self.gpa, raw);
+        if (state.isEmpty()) {
+            state.deinit(self.gpa);
+            self.mode = .normal;
+            self.clearInput();
+            _ = try self.thread.append(self.gpa, .agent, "agent", "No changes to review.");
+            return;
+        }
+        self.diff.deinit(self.gpa);
+        self.diff = state;
     }
 
     fn jumpThreadToBottom(self: *App) void {
@@ -2455,6 +2522,28 @@ fn parseDiffCounts(output: []const u8) DiffCounts {
     return counts;
 }
 
+/// Count additions/deletions straight from a unified diff by tallying `+`/`-`
+/// body lines (excluding the `+++`/`---` file headers). A cheap, allocation-free
+/// scan used on the cached full diff.
+fn countDiff(raw: []const u8) DiffCounts {
+    var counts: DiffCounts = .{};
+    var line_start: usize = 0;
+    while (line_start <= raw.len) {
+        const line_end = std.mem.findScalarPos(u8, raw, line_start, '\n') orelse raw.len;
+        const line = raw[line_start..line_end];
+        if (line.len > 0) {
+            if (line[0] == '+' and !std.mem.startsWith(u8, line, "+++")) {
+                counts.additions = saturatingAdd(counts.additions, 1);
+            } else if (line[0] == '-' and !std.mem.startsWith(u8, line, "---")) {
+                counts.deletions = saturatingAdd(counts.deletions, 1);
+            }
+        }
+        if (line_end == raw.len) break;
+        line_start = line_end + 1;
+    }
+    return counts;
+}
+
 fn parseDiffCountLine(counts: *DiffCounts, line: []const u8) void {
     if (line.len == 0) return;
     const first_tab = std.mem.indexOfScalar(u8, line, '\t') orelse return;
@@ -2521,6 +2610,9 @@ const RootWidget = struct {
             .init => {
                 try ctx.requestFocus(self.app.input.widget());
                 try self.ensureTick(ctx);
+                // Warm the diff cache in the background so the first `/diff`
+                // opens instantly instead of cold-loading.
+                self.app.scheduleDiffRefresh() catch {};
                 ctx.consumeAndRedraw();
             },
             .mouse => |mouse| {
@@ -2751,7 +2843,9 @@ const RootWidget = struct {
     fn submit(self: *RootWidget, ctx: *vxfw.EventContext) !void {
         if (try self.app.submitMode()) {
             try self.syncFocus(ctx);
-            if (self.app.models.model_load_future != null) try self.ensureTick(ctx);
+            // Keep the tick alive to drain an async model load or diff refresh
+            // (e.g. the cold-start "Loading diff…" the /diff command kicked off).
+            if (self.app.models.model_load_future != null or self.app.diff_refresh_future != null) try self.ensureTick(ctx);
             ctx.consumeAndRedraw();
             return;
         }
@@ -2930,6 +3024,12 @@ const RootWidget = struct {
             try self.closeDiff(ctx, true);
             return;
         }
+        // Nothing to navigate or comment on while the diff is still loading (or
+        // genuinely empty) — swallow everything except the exit keys above.
+        if (app.diff.lines.items.len == 0) {
+            ctx.consumeEvent();
+            return;
+        }
         if (key.matches('w', .{ .ctrl = true })) {
             // Edit the comment on the exact selected range if one exists, else new.
             const prefill = app.diff.beginComment();
@@ -3103,16 +3203,21 @@ const RootWidget = struct {
         var subs: [3]vxfw.SubSurface = undefined;
         var n: usize = 0;
 
-        var body: DiffBodyWidget = .{ .app = app };
-        subs[n] = .{
-            .origin = .{ .row = body_top, .col = 0 },
-            .z_index = 0,
-            .surface = try body.widget().draw(ctx.withConstraints(
-                .{ .width = w, .height = body_h },
-                .{ .width = w, .height = body_h },
-            )),
-        };
-        n += 1;
+        if (app.diff_loading) {
+            // Cold start: navigated in, diff still fetching in the background.
+            panel.lineStyledAt(&surface, body_top + body_h / 2, "Loading diff…", ctx, 2, StylePalette.model_status) catch {};
+        } else {
+            var body: DiffBodyWidget = .{ .app = app };
+            subs[n] = .{
+                .origin = .{ .row = body_top, .col = 0 },
+                .z_index = 0,
+                .surface = try body.widget().draw(ctx.withConstraints(
+                    .{ .width = w, .height = body_h },
+                    .{ .width = w, .height = body_h },
+                )),
+            };
+            n += 1;
+        }
 
         if (editing) {
             var editor: DiffCommentEditor = .{ .app = app };

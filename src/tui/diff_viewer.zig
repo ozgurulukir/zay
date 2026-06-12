@@ -11,7 +11,7 @@ const assert = std.debug.assert;
 /// Working tree vs HEAD, plus untracked files rendered as all-additions. Mirrors
 /// the status-bar counter's scope. The `--no-index` per-file pass exits non-zero
 /// when a file differs, which is expected; we only read stdout.
-const diff_command =
+pub const diff_command =
     \\git diff --no-color HEAD
     \\git ls-files --others --exclude-standard -z 2>/dev/null | while IFS= read -r -d '' f; do
     \\  git diff --no-color --no-index -- /dev/null "$f"
@@ -371,7 +371,13 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) !State {
     }) catch return .{};
     defer result.deinit(gpa);
 
-    var state: State = .{ .raw = try gpa.dupe(u8, result.stdout) };
+    return fromRaw(gpa, result.stdout);
+}
+
+/// Parse an already-captured combined diff (e.g. the cached one) into a fresh
+/// `State`. Dupes `raw`, so the caller keeps ownership of its copy.
+pub fn fromRaw(gpa: std.mem.Allocator, raw: []const u8) !State {
+    var state: State = .{ .raw = try gpa.dupe(u8, raw) };
     errdefer state.deinit(gpa);
     try parse(&state, gpa);
     return state;
