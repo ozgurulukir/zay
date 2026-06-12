@@ -8,7 +8,7 @@ const tui_metrics = @import("../metrics.zig");
 const tui_style = @import("../style.zig");
 const blackhole = @import("../blackhole.zig");
 
-const logo_text = @embedFile("../../assets/logo/logo.txt");
+const logo_text = "N.O.V.A";
 const logo_connect_text = "/connect to begin building";
 const intro_x_padding: u16 = 7;
 const logo_gap: u16 = 8;
