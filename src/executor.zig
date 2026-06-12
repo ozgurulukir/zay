@@ -100,7 +100,11 @@ pub const ExecutorService = struct {
     }
 
     fn runOne(self: *ExecutorService, call: ai.ToolCall) !ToolResult {
-        var output = try tools.run(self.gpa, self.io, self.cwd, call.name, call.arguments);
+        var output = tools.run(self.gpa, self.io, self.cwd, call.name, call.arguments) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return error.Canceled,
+            else => return self.runFailure(call, err),
+        };
         defer output.deinit(self.gpa);
 
         const call_id = try self.gpa.dupe(u8, call.call_id);
@@ -124,6 +128,28 @@ pub const ExecutorService = struct {
             .display_body = display_body,
             .stderr = stderr,
             .failed = failed,
+        };
+    }
+
+    fn runFailure(self: *ExecutorService, call: ai.ToolCall, err: anyerror) !ToolResult {
+        const call_id = try self.gpa.dupe(u8, call.call_id);
+        errdefer self.gpa.free(call_id);
+        const name = try self.gpa.dupe(u8, call.name);
+        errdefer self.gpa.free(name);
+        var display = try makeDisplay(self.gpa, call.name, call.arguments);
+        errdefer display.deinit(self.gpa);
+        const content = try std.fmt.allocPrint(self.gpa, "tool '{s}' failed to execute: {s}", .{ call.name, @errorName(err) });
+        errdefer self.gpa.free(content);
+        const display_body = try self.gpa.dupe(u8, content);
+        return .{
+            .call_id = call_id,
+            .content = content,
+            .name = name,
+            .display_label = display.label,
+            .display_expanded_label = display.expanded_label,
+            .display_body = display_body,
+            .stderr = null,
+            .failed = true,
         };
     }
 };
@@ -193,4 +219,27 @@ test "ExecutorService runs bash and returns both channels" {
     try std.testing.expectEqualStrings("Print hello", results[0].display_label);
     try std.testing.expectEqualStrings("printf hello", results[0].display_expanded_label.?);
     try std.testing.expect(!results[0].failed);
+}
+
+test "executor converts a tool execution error into a failed result" {
+    const gpa = std.testing.allocator;
+    var executor = ExecutorService.init(gpa, std.testing.io, "/tmp");
+    const call: ai.ToolCall = .{
+        .call_id = try gpa.dupe(u8, "call_x"),
+        .name = try gpa.dupe(u8, "bash"),
+        .arguments = try gpa.dupe(u8, "{\"command\":\"rg foo\",\"reason\":\"search\"}"),
+    };
+    defer {
+        gpa.free(call.call_id);
+        gpa.free(call.name);
+        gpa.free(call.arguments);
+    }
+
+    var result = try executor.runFailure(call, error.Unexpected);
+    defer result.deinit(gpa);
+    try std.testing.expect(result.failed);
+    try std.testing.expectEqualStrings("call_x", result.call_id);
+    try std.testing.expectEqualStrings("search", result.display_label);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "failed to execute") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "Unexpected") != null);
 }

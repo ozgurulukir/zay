@@ -67,6 +67,7 @@ pub const TurnView = struct {
             .queued_messages_flushed => return false,
             .turn_failed => |message| return try self.applyTurnFailed(gpa, thread, message),
             .turn_finished => return try self.applyTurnFinished(gpa, thread),
+            .history_compacted => |info| return try self.applyHistoryCompacted(gpa, thread, info),
         }
     }
 
@@ -167,6 +168,23 @@ pub const TurnView = struct {
         self.activity = .idle;
         _ = try self.finishThinking(gpa, thread);
         _ = thread.stopRunningTools();
+        return true;
+    }
+
+    fn applyHistoryCompacted(
+        self: *TurnView,
+        gpa: std.mem.Allocator,
+        thread: *thread_mod.Thread,
+        info: agent_mod.Agent.Event.HistoryCompacted,
+    ) !bool {
+        _ = self;
+        var buffer: [128]u8 = undefined;
+        const text = std.fmt.bufPrint(
+            &buffer,
+            "compacted context ~{d} -> ~{d} tokens",
+            .{ info.tokens_before, info.tokens_after },
+        ) catch "compacted context";
+        _ = try thread.append(gpa, .notice, "notice", text);
         return true;
     }
 

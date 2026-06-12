@@ -95,6 +95,14 @@ fn runDiffRefresh(job: *DiffRefreshJob) DiffRefreshOutcome {
     return .{ .ready = parseDiffCounts(result.stdout) };
 }
 
+/// A user message queued behind a running turn, mirrored from the agent queue
+/// for display and navigation. `steer` means inject after the next tool batch;
+/// the default (false) waits for the turn to go idle.
+pub const QueuedMessage = struct {
+    text: []const u8,
+    steer: bool = false,
+};
+
 pub const App = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -170,7 +178,8 @@ pub const App = struct {
         .wheel_scroll = 3,
     },
     pending_quit_at: ?std.Io.Timestamp = null,
-    queued_user_messages: std.ArrayList([]const u8) = .empty,
+    queued_user_messages: std.ArrayList(QueuedMessage) = .empty,
+    queued_selection: usize = 0,
     /// Raw prompt for a turn that `beginSubmit` accepted but `startTurn` has
     /// not yet handed to the worker. Owned by `gpa`; the worker frees it once
     /// the turn starts.
@@ -180,6 +189,7 @@ pub const App = struct {
     /// top of the input, cleared when it re-enters from the last block or on any
     /// edit/submit. See `RootWidget.captureEvent`.
     block_nav: bool = false,
+    input_wrap_width: u16 = 0,
     at_active: bool = false,
     at_query: []u8 = "",
     at_results: std.ArrayList([]const u8) = .empty,
@@ -410,7 +420,35 @@ pub const App = struct {
             self.agent,
             &self.worker_context,
             prompt,
+            false,
         });
+    }
+
+    /// After a user interrupt has fully unwound (worker joined, queue stranded),
+    /// deliver any queued messages as a fresh turn: the worker drains the whole
+    /// queue into history (leading messages as context, the last as the latest
+    /// user message the model answers). Returns true if a turn was started.
+    fn restartTurnForQueuedMessages(self: *App) !bool {
+        if (self.queued_user_messages.items.len == 0) return false;
+        // No connected provider to run a turn: surface the queued text in the
+        // transcript and drop the queue rather than spin up a doomed worker.
+        if (self.runtime != null and self.runtime.?.client == .none) {
+            try self.flushQueuedUserMessagesToThread(@intCast(self.queued_user_messages.items.len));
+            self.agent.clearQueue();
+            return true;
+        }
+        self.resetTurnState();
+        self.worker_context.resetCancel();
+        self.turn_view.awaitModel();
+        self.pending_prompt = null;
+        self.turn.submit();
+        self.turn_future = try self.io.concurrent(agent_worker.runAgentTurn, .{
+            self.agent,
+            &self.worker_context,
+            self.pending_prompt,
+            true,
+        });
+        return true;
     }
 
     fn advanceLoadingFrame(self: *App) void {
@@ -428,8 +466,13 @@ pub const App = struct {
         const outcome = self.turn.apply(event);
         if (!outcome.project) {
             // Interrupting: a discarded turn's output must not mutate the
-            // thread. Join the worker once it posts its terminal event.
-            if (outcome.finished) self.awaitTurn();
+            // thread. Join the worker once it posts its terminal event, then
+            // deliver any messages the user queued behind the cancelled turn as
+            // a fresh turn.
+            if (outcome.finished) {
+                self.awaitTurn();
+                return try self.restartTurnForQueuedMessages();
+            }
             return false;
         }
         var visible_change = try self.turn_view.apply(self.gpa, &self.thread, event);
@@ -1769,9 +1812,36 @@ pub const App = struct {
             },
             else => return err,
         };
-        try self.queued_user_messages.append(self.gpa, prompt);
+        try self.queued_user_messages.append(self.gpa, .{ .text = prompt });
+        // Select the newest message so the line above the input shows what was
+        // just queued; ALT+← walks back to older ones.
+        self.queued_selection = self.queued_user_messages.items.len - 1;
         self.clearInput();
         return false;
+    }
+
+    /// Move the queued-message selection one older (ALT+←).
+    fn selectPrevQueued(self: *App) void {
+        if (self.queued_user_messages.items.len == 0) return;
+        if (self.queued_selection > 0) self.queued_selection -= 1;
+    }
+
+    /// Move the queued-message selection one newer (ALT+→).
+    fn selectNextQueued(self: *App) void {
+        const len = self.queued_user_messages.items.len;
+        if (len == 0) return;
+        if (self.queued_selection + 1 < len) self.queued_selection += 1;
+    }
+
+    /// Mark the selected queued message to steer (CTRL+→). One-way: it will be
+    /// injected after the next tool batch. Updates both the UI mirror and the
+    /// agent queue so the worker's drain decision matches what's on screen.
+    fn steerSelectedQueued(self: *App) void {
+        const items = self.queued_user_messages.items;
+        if (items.len == 0) return;
+        const index = @min(self.queued_selection, items.len - 1);
+        items[index].steer = true;
+        self.agent.setQueuedSteer(@intCast(index));
     }
 
     fn appendMessageQueueFullNotice(self: *App) !void {
@@ -1794,17 +1864,21 @@ pub const App = struct {
     fn flushQueuedUserMessagesToThread(self: *App, count: u32) !void {
         const flush_count: usize = @min(count, self.queued_user_messages.items.len);
         for (self.queued_user_messages.items[0..flush_count]) |message| {
-            _ = try self.thread.append(self.gpa, .user, "you", message);
-            try self.appendSkillInvocationsToThread(message);
-            self.gpa.free(message);
+            _ = try self.thread.append(self.gpa, .user, "you", message.text);
+            try self.appendSkillInvocationsToThread(message.text);
+            self.gpa.free(message.text);
         }
-        std.mem.copyForwards([]const u8, self.queued_user_messages.items[0 .. self.queued_user_messages.items.len - flush_count], self.queued_user_messages.items[flush_count..]);
+        std.mem.copyForwards(QueuedMessage, self.queued_user_messages.items[0 .. self.queued_user_messages.items.len - flush_count], self.queued_user_messages.items[flush_count..]);
         self.queued_user_messages.shrinkRetainingCapacity(self.queued_user_messages.items.len - flush_count);
+        // Messages drain from the front, so shift the selection left to keep it
+        // pointing at the same logical message (clamped into range).
+        self.queued_selection -|= flush_count;
     }
 
     fn clearQueuedUserMessages(self: *App) void {
-        for (self.queued_user_messages.items) |message| self.gpa.free(message);
+        for (self.queued_user_messages.items) |message| self.gpa.free(message.text);
         self.queued_user_messages.clearRetainingCapacity();
+        self.queued_selection = 0;
     }
 
     fn clearPaletteInput(self: *App) void {
@@ -1910,7 +1984,7 @@ pub const App = struct {
 
     fn rebuildThreadFromAgent(self: *App) !void {
         try self.clearConversation();
-        for (self.agent.messages.items) |message| {
+        for (self.agent.messages()) |message| {
             if (message.role == .system) continue;
             const text = message.text();
             if (message.role == .user) {
@@ -1930,7 +2004,7 @@ pub const App = struct {
     fn resumedToolTitle(self: *App, message: ai.ChatMessage) ![]u8 {
         if (message.tool_display_label) |label| return thread_mod.toolTitle(self.gpa, label);
         const id = message.call_id orelse return thread_mod.toolTitle(self.gpa, "tool");
-        for (self.agent.messages.items) |candidate| {
+        for (self.agent.messages()) |candidate| {
             for (candidate.content) |block| {
                 if (block != .tool_call) continue;
                 if (!std.mem.eql(u8, block.tool_call.call_id, id)) continue;
@@ -1962,26 +2036,35 @@ pub const App = struct {
         try self.updateAtSearch();
     }
 
+    /// Moves the input cursor up or down by one *visual* row, so navigation
+    /// follows the wrapped layout the user actually sees — a long line with no
+    /// manual breaks behaves like a multi-row text area, not a single logical
+    /// line. Returns false when there is no row to move to (top/bottom), so the
+    /// caller can hand control to block navigation.
     fn moveInputCursorVertical(self: *App, move: VerticalMove) !bool {
         const text = try self.peekInput();
         defer self.gpa.free(text);
         const cur = self.input.buf.firstHalf().len;
-        const cur_line_start = lineStartBefore(text, cur);
-        const col = cellColumn(text[cur_line_start..cur]);
+        // Before the first draw (only in tests) the width is unknown; a wide
+        // sentinel keeps every logical line on one visual row.
+        const width: u16 = if (self.input_wrap_width == 0) 4096 else self.input_wrap_width;
 
-        const target = switch (move) {
-            .up => blk: {
-                if (cur_line_start == 0) return false;
-                const prev_start = lineStartBefore(text, cur_line_start - 1);
-                break :blk byteAtColumn(text, prev_start, cur_line_start - 1, col);
-            },
+        const pos = wrappedPosition(text, cur, width);
+        const target_row: u16 = switch (move) {
+            .up => if (pos.row == 0) return false else pos.row - 1,
             .down => blk: {
-                const nl = std.mem.indexOfScalarPos(u8, text, cur, '\n') orelse return false;
-                const next_start = nl + 1;
-                const next_end = std.mem.indexOfScalarPos(u8, text, next_start, '\n') orelse text.len;
-                break :blk byteAtColumn(text, next_start, next_end, col);
+                const last_row = wrappedPosition(text, text.len, width).row;
+                if (pos.row >= last_row) return false;
+                break :blk pos.row + 1;
             },
         };
+
+        const row_start = visualRowStart(text, target_row, width);
+        var row_end = visualRowStart(text, target_row + 1, width);
+        // A row that ends at a hard break owns the text up to, but not
+        // including, the newline.
+        if (row_end > row_start and text[row_end - 1] == '\n') row_end -= 1;
+        const target = byteAtVisualColumn(text, row_start, row_end, pos.col);
 
         if (target < cur) {
             self.input.buf.moveGapLeft(cur - target);
@@ -2448,6 +2531,24 @@ const RootWidget = struct {
                 // `handleThreadKey`, which walks blocks and re-enters the input
                 // when you press down past the last block. The @-mention popup
                 // keeps the arrows for itself.
+                if (self.app.mode == .normal and !self.app.at_active and self.app.queued_user_messages.items.len > 0) {
+                    // ALT+←/→ navigate queued messages; CTRL+→ steers the
+                    // selected one. Gated on a non-empty queue so the keys fall
+                    // through to normal cursor/word movement otherwise.
+                    if (key.matches(vaxis.Key.left, .{ .alt = true })) {
+                        self.app.selectPrevQueued();
+                        ctx.consumeAndRedraw();
+                        return;
+                    } else if (key.matches(vaxis.Key.right, .{ .alt = true })) {
+                        self.app.selectNextQueued();
+                        ctx.consumeAndRedraw();
+                        return;
+                    } else if (key.matches(vaxis.Key.right, .{ .ctrl = true })) {
+                        self.app.steerSelectedQueued();
+                        ctx.consumeAndRedraw();
+                        return;
+                    }
+                }
                 if (self.app.mode == .normal and !self.app.at_active) {
                     if (key.matches(vaxis.Key.up, .{})) {
                         if (!self.app.block_nav) {
@@ -3304,6 +3405,7 @@ const CommandInputText = struct {
     fn drawInputText(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *CommandInputText = @ptrCast(@alignCast(ptr));
         const width = ctx.max.width orelse 0;
+        self.app.input_wrap_width = width;
         const rows = try self.app.inputTextRows(ctx, width);
         if (rows <= 1) return self.app.input.draw(ctx);
         return self.drawMultiline(ctx);
@@ -3339,25 +3441,85 @@ const CommandInputText = struct {
 
 const VerticalMove = enum { up, down };
 
-fn lineStartBefore(text: []const u8, pos: usize) usize {
-    if (std.mem.lastIndexOfScalar(u8, text[0..pos], '\n')) |idx| return idx + 1;
-    return 0;
+/// Byte offset where the given visual (wrapped) row begins. Mirrors the
+/// wrapping rules in `wrappedPosition`/`drawInputWrapped` so navigation lands
+/// the cursor exactly where the text is drawn. Returns `text.len` when the row
+/// is past the end.
+fn visualRowStart(text: []const u8, target_row: u16, width: u16) usize {
+    if (target_row == 0 or width == 0) return 0;
+    var row: u16 = 0;
+    var col: u16 = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == '\n') {
+            row += 1;
+            index += 1;
+            if (row == target_row) return index;
+            col = 0;
+            continue;
+        }
+
+        const spaces_start = index;
+        while (index < text.len and wrapSpace(text[index])) index += 1;
+        const spaces = text[spaces_start..index];
+        const word_start = index;
+        while (index < text.len and text[index] != '\n' and !wrapSpace(text[index])) index += 1;
+        const word = text[word_start..index];
+        if (word.len == 0) {
+            if (advanceRowStart(spaces, spaces_start, &row, &col, width, target_row)) |off| return off;
+            continue;
+        }
+
+        const spaces_width = gw(spaces);
+        const word_width = gw(word);
+        if (col > 0) {
+            if (col + spaces_width + word_width > width) {
+                row += 1;
+                col = 0;
+                if (row == target_row) return word_start;
+            } else {
+                col = @min(width, col + spaces_width);
+            }
+        }
+        if (advanceRowStart(word, word_start, &row, &col, width, target_row)) |off| return off;
+    }
+    return text.len;
 }
 
-fn cellColumn(slice: []const u8) usize {
-    return vaxis.gwidth.gwidth(slice, .unicode);
+/// Walks a run grapheme-by-grapheme, soft-wrapping like the renderer. Returns
+/// the absolute byte offset of the grapheme that opens `target_row`, or null if
+/// the run does not reach it. `base` is the run's offset within the full text.
+fn advanceRowStart(text: []const u8, base: usize, row: *u16, col: *u16, width: u16, target_row: u16) ?usize {
+    var iter = vaxis.unicode.graphemeIterator(text);
+    var local: usize = 0;
+    while (iter.next()) |grapheme| {
+        const cell_width = gw(grapheme.bytes(text));
+        if (cell_width == 0) {
+            local += grapheme.len;
+            continue;
+        }
+        if (col.* + cell_width > width) {
+            row.* += 1;
+            col.* = 0;
+            if (row.* == target_row) return base + local;
+        }
+        col.* = @min(width, col.* + cell_width);
+        local += grapheme.len;
+    }
+    return null;
 }
 
-fn byteAtColumn(text: []const u8, line_start: usize, line_end: usize, col: usize) usize {
-    var iter = vaxis.unicode.graphemeIterator(text[line_start..line_end]);
-    var offset: usize = line_start;
-    var cells: usize = 0;
-    while (cells < col) {
-        const grapheme = iter.next() orelse break;
-        const bytes = grapheme.bytes(text[line_start..line_end]);
-        const width = vaxis.gwidth.gwidth(bytes, .unicode);
-        if (cells + width > col) break;
-        cells += width;
+/// Byte offset within a single visual row `[row_start, row_end)` whose column is
+/// the largest not exceeding `desired_col` — i.e. where a vertical move lands.
+fn byteAtVisualColumn(text: []const u8, row_start: usize, row_end: usize, desired_col: u16) usize {
+    const slice = text[row_start..row_end];
+    var iter = vaxis.unicode.graphemeIterator(slice);
+    var offset: usize = row_start;
+    var col: u16 = 0;
+    while (iter.next()) |grapheme| {
+        const cell_width = gw(grapheme.bytes(slice));
+        if (col + cell_width > desired_col) break;
+        col += cell_width;
         offset += grapheme.len;
     }
     return offset;
@@ -3380,11 +3542,25 @@ const WrappedInputDraw = struct {
     width: u16,
 };
 
+/// Cell width of a string under the unicode width method — the same metric the
+/// renderer uses (`DrawContext.stringWidth` is a static wrapper over this).
+fn gw(s: []const u8) u16 {
+    return @intCast(vaxis.gwidth.gwidth(s, .unicode));
+}
+
 fn wrappedTextRows(ctx: vxfw.DrawContext, text: []const u8, width: u16) u16 {
-    return wrappedTextPositionAt(ctx, text, text.len, width).row + 1;
+    _ = ctx;
+    return wrappedPosition(text, text.len, width).row + 1;
 }
 
 fn wrappedTextPositionAt(ctx: vxfw.DrawContext, text: []const u8, cursor: usize, width: u16) WrappedTextPosition {
+    _ = ctx;
+    return wrappedPosition(text, cursor, width);
+}
+
+/// Maps a byte offset to its visual (row, col) under word-wrapping at `width`.
+/// Context-free so cursor navigation can reuse the renderer's exact layout.
+fn wrappedPosition(text: []const u8, cursor: usize, width: u16) WrappedTextPosition {
     if (width == 0) return .{ .row = 0, .col = 0 };
 
     var row: u16 = 0;
@@ -3401,21 +3577,21 @@ fn wrappedTextPositionAt(ctx: vxfw.DrawContext, text: []const u8, cursor: usize,
 
         const spaces_start = index;
         while (index < text.len and wrapSpace(text[index])) index += 1;
-        if (cursor <= index) return advancePosition(ctx, text[spaces_start..cursor], row, col, width);
+        if (cursor <= index) return advancePosition(text[spaces_start..cursor], row, col, width);
 
         const spaces = text[spaces_start..index];
         const word_start = index;
         while (index < text.len and text[index] != '\n' and !wrapSpace(text[index])) index += 1;
         const word = text[word_start..index];
         if (word.len == 0) {
-            const pos = advancePosition(ctx, spaces, row, col, width);
+            const pos = advancePosition(spaces, row, col, width);
             row = pos.row;
             col = pos.col;
             continue;
         }
 
-        const spaces_width: u16 = @intCast(ctx.stringWidth(spaces));
-        const word_width: u16 = @intCast(ctx.stringWidth(word));
+        const spaces_width = gw(spaces);
+        const word_width = gw(word);
         if (col > 0) {
             if (col + spaces_width + word_width > width) {
                 row += 1;
@@ -3424,22 +3600,21 @@ fn wrappedTextPositionAt(ctx: vxfw.DrawContext, text: []const u8, cursor: usize,
                 col = @min(width, col + spaces_width);
             }
         }
-        if (cursor <= index) return advancePosition(ctx, text[word_start..cursor], row, col, width);
+        if (cursor <= index) return advancePosition(text[word_start..cursor], row, col, width);
 
-        const pos = advancePosition(ctx, word, row, col, width);
+        const pos = advancePosition(word, row, col, width);
         row = pos.row;
         col = pos.col;
     }
     return .{ .row = row, .col = col };
 }
 
-fn advancePosition(ctx: vxfw.DrawContext, text: []const u8, row_start: u16, col_start: u16, width: u16) WrappedTextPosition {
+fn advancePosition(text: []const u8, row_start: u16, col_start: u16, width: u16) WrappedTextPosition {
     var row = row_start;
     var col = col_start;
-    var iter = ctx.graphemeIterator(text);
+    var iter = vaxis.unicode.graphemeIterator(text);
     while (iter.next()) |grapheme| {
-        const bytes = grapheme.bytes(text);
-        const cell_width: u16 = @intCast(ctx.stringWidth(bytes));
+        const cell_width = gw(grapheme.bytes(text));
         if (cell_width == 0) continue;
         if (col + cell_width > width) {
             row += 1;
@@ -3606,9 +3781,18 @@ const InputWidget = struct {
     }
 
     fn drawQueuedMessage(self: *InputWidget, ctx: vxfw.DrawContext, width: u16) std.mem.Allocator.Error!vxfw.Surface {
-        const last = self.app.queued_user_messages.items[self.app.queued_user_messages.items.len - 1];
-        const prefix = if (self.app.queued_user_messages.items.len == 1) "[...] " else "[...] + ";
-        const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, last });
+        const items = self.app.queued_user_messages.items;
+        const sel = @min(self.app.queued_selection, items.len - 1);
+        const message = items[sel];
+        // Position suffix only when there's more than one to navigate.
+        const position = if (items.len > 1)
+            try std.fmt.allocPrint(ctx.arena, " {d}/{d}", .{ sel + 1, items.len })
+        else
+            "";
+        const text = if (message.steer)
+            try std.fmt.allocPrint(ctx.arena, "↩ {s}{s}", .{ message.text, position })
+        else
+            try std.fmt.allocPrint(ctx.arena, "[...] {s} (CTRL → to steer){s}", .{ message.text, position });
         var queued_text: vxfw.Text = .{ .text = text, .style = .{ .fg = StylePalette.thinking_body.fg, .dim = true }, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
         return queued_text.widget().draw(ctx.withConstraints(.{ .width = width, .height = 1 }, .{ .width = width, .height = 1 }));
     }
@@ -3831,6 +4015,32 @@ test "arrow up and down move the input cursor between lines" {
     // Down to the last line, then no further move.
     try std.testing.expect(try app.moveInputCursorVertical(.down));
     try std.testing.expectEqualStrings("fox\nox\nca", app.input.buf.firstHalf());
+    try std.testing.expect(!(try app.moveInputCursorVertical(.down)));
+}
+
+test "vertical navigation follows soft-wrapped visual rows" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // A single long line with no manual breaks. Wrapped at width 10 it spans
+    // two visual rows ("abcdefghij" / "klmnopqrst"), so the cursor must move by
+    // visual row — the old '\n'-only logic was stuck on one logical line.
+    try app.input.insertSliceAtCursor("abcdefghijklmnopqrst");
+    app.input_wrap_width = 10;
+
+    // Cursor sits at the end (second visual row). Up moves to the first row.
+    try std.testing.expect(try app.moveInputCursorVertical(.up));
+    try std.testing.expectEqualStrings("abcdefghij", app.input.buf.firstHalf());
+
+    // Already on the first visual row: no move, hand off to block nav.
+    try std.testing.expect(!(try app.moveInputCursorVertical(.up)));
+
+    // Down returns to the second visual row at the same column.
+    try std.testing.expect(try app.moveInputCursorVertical(.down));
+    try std.testing.expectEqualStrings("abcdefghijklmnopqrst", app.input.buf.firstHalf());
     try std.testing.expect(!(try app.moveInputCursorVertical(.down)));
 }
 
@@ -4268,7 +4478,7 @@ test "begin submit queues while turn is in flight" {
     try std.testing.expect(!try app.beginSubmit());
 
     try std.testing.expectEqual(@as(usize, 1), app.queued_user_messages.items.len);
-    try std.testing.expectEqualStrings("later", app.queued_user_messages.items[0]);
+    try std.testing.expectEqualStrings("later", app.queued_user_messages.items[0].text);
     try std.testing.expectEqual(@as(u32, 1), agent.message_queue.len());
     try std.testing.expectEqual(@as(usize, 0), app.input.buf.firstHalf().len);
     try std.testing.expect(try app.applyAgentEvent(.{ .queued_messages_flushed = 1 }));
@@ -4308,6 +4518,55 @@ test "queued prompt draws above input at minimum input height" {
     try std.testing.expectEqual(@as(u16, 0), surface.children[0].origin.row);
     try std.testing.expectEqual(@as(u16, 1), surface.children[1].origin.row);
     try std.testing.expectEqualStrings("[", surface.children[0].surface.readCell(0, 0).char.grapheme);
+}
+
+test "alt navigation and ctrl-steer drive the queued message line" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.turn.submit();
+    app.turn_view.awaitModel();
+
+    try app.input.insertSliceAtCursor("first");
+    try std.testing.expect(!try app.beginSubmit());
+    try app.input.insertSliceAtCursor("second");
+    try std.testing.expect(!try app.beginSubmit());
+
+    // Newest is selected after queueing.
+    try std.testing.expectEqual(@as(usize, 1), app.queued_selection);
+
+    // ALT+← walks back to the older message; clamps at the front.
+    app.selectPrevQueued();
+    try std.testing.expectEqual(@as(usize, 0), app.queued_selection);
+    app.selectPrevQueued();
+    try std.testing.expectEqual(@as(usize, 0), app.queued_selection);
+
+    // CTRL+→ steers the selected message in both the mirror and agent queue.
+    app.steerSelectedQueued();
+    try std.testing.expect(app.queued_user_messages.items[0].steer);
+    try std.testing.expect(agent.message_queue.at(&agent.message_queue_storage, 0).?.steer);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var input_widget: InputWidget = .{ .app = &app };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 60, .height = 6 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try input_widget.widget().draw(ctx);
+    // Steered selection renders the ↩ form, not the "[...]" form.
+    try std.testing.expectEqualStrings("↩", surface.children[0].surface.readCell(0, 0).char.grapheme);
+
+    // ALT+→ moves to the newer, still-queued message: back to "[...]".
+    app.selectNextQueued();
+    try std.testing.expectEqual(@as(usize, 1), app.queued_selection);
+    const surface2 = try input_widget.widget().draw(ctx);
+    try std.testing.expectEqualStrings("[", surface2.children[0].surface.readCell(0, 0).char.grapheme);
 }
 
 test "begin submit shows notice when queued message queue is full" {
@@ -4505,6 +4764,7 @@ test "codex sign-in survives selecting local compatible provider" {
     defer runtime.agent.deinit();
     runtime.diagnostics = &.{};
     runtime.owned_client = null;
+    runtime.owned_compaction_client = null;
     var app = App.init(std.testing.io, gpa, &runtime.agent);
     app.runtime = &runtime;
     defer app.deinit();
@@ -4539,6 +4799,7 @@ test "switching from codex to catalogue provider resets cached connection" {
     runtime.diagnostics = &.{};
     runtime.codex_connection_expired = false;
     runtime.owned_client = null;
+    runtime.owned_compaction_client = null;
     defer runtime.disconnectClient();
 
     var app = App.init(std.testing.io, gpa, &runtime.agent);
@@ -4741,6 +5002,7 @@ test "model selection is allowed after interrupt" {
     defer runtime.agent.deinit();
     runtime.diagnostics = &.{};
     runtime.owned_client = null;
+    runtime.owned_compaction_client = null;
     var app = App.init(std.testing.io, gpa, &runtime.agent);
     app.runtime = &runtime;
     defer app.deinit();
@@ -4758,6 +5020,45 @@ test "model selection is allowed after interrupt" {
 
     try std.testing.expectEqual(Turn.State.idle, app.turn.state);
     try std.testing.expectEqual(config_mod.Provider.ollama, app.cached_config.provider.?);
+}
+
+test "interrupt restart flushes queued messages to the transcript when no provider" {
+    const gpa = std.testing.allocator;
+    var runtime: runtime_mod.AgentRuntime = undefined;
+    runtime.gpa = gpa;
+    runtime.io = std.testing.io;
+    runtime.cwd = ".";
+    runtime.home_dir = ".";
+    runtime.client = .none;
+    runtime.base_system_prompt = "test";
+    runtime.system_prompt = "test";
+    runtime.session_writer = undefined;
+    runtime.agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer runtime.agent.deinit();
+    runtime.diagnostics = &.{};
+    runtime.owned_client = null;
+    runtime.owned_compaction_client = null;
+    var app = App.init(std.testing.io, gpa, &runtime.agent);
+    app.runtime = &runtime;
+    defer app.deinit();
+    defer app.turn.reset();
+
+    // Queue two messages behind a running turn.
+    app.turn.submit();
+    try app.input.insertSliceAtCursor("one");
+    try std.testing.expect(!try app.beginSubmit());
+    try app.input.insertSliceAtCursor("two");
+    try std.testing.expect(!try app.beginSubmit());
+    try std.testing.expectEqual(@as(usize, 2), app.queued_user_messages.items.len);
+
+    // With no provider, the restart surfaces the queued text and drops the queue
+    // rather than spinning up a doomed worker.
+    try std.testing.expect(try app.restartTurnForQueuedMessages());
+    try std.testing.expectEqual(@as(usize, 0), app.queued_user_messages.items.len);
+    try std.testing.expectEqual(@as(u32, 0), runtime.agent.message_queue.len());
+    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
+    try std.testing.expectEqualStrings("one", app.thread.messages.items[0].body);
+    try std.testing.expectEqualStrings("two", app.thread.messages.items[1].body);
 }
 
 test "canceling a picker returns to command menu" {

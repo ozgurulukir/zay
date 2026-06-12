@@ -1,10 +1,11 @@
 const std = @import("std");
-const builtin = @import("builtin");
 
 const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
 const codex_mod = @import("codex.zig");
+const compaction = @import("compaction.zig");
 const config_mod = @import("config.zig");
+const os = @import("os.zig");
 const session_mod = @import("session.zig");
 const skill_mod = @import("skill.zig");
 const tools_mod = @import("tools.zig");
@@ -29,6 +30,9 @@ pub const AgentRuntime = struct {
     diagnostics: []config_mod.Diagnostic,
     codex_connection_expired: bool = false,
     owned_client: ?OwnedClient = null,
+    /// Second client, same config as `owned_client`, used only by the agent's
+    /// background summarizer so the two never share a connection.
+    owned_compaction_client: ?OwnedClient = null,
 
     pub const ClientState = union(enum) {
         disconnected,
@@ -162,6 +166,9 @@ pub const AgentRuntime = struct {
         const messages = try self.session_writer.messages(self.gpa);
         defer self.gpa.free(messages);
         for (messages) |message| try self.agent.takeMessage(message);
+        // The conversation is now a different branch; the usage anchor no
+        // longer refers to these messages.
+        self.agent.resetContextUsage();
     }
 
     pub fn clientState(self: *const AgentRuntime) ClientState {
@@ -188,6 +195,9 @@ pub const AgentRuntime = struct {
         self.gpa.free(self.base_system_prompt);
         self.gpa.free(self.system_prompt);
         skill_mod.deinitAll(self.gpa, self.skills);
+        // `agent.deinit` above joined the summarizer thread, so its client is
+        // no longer in use and is safe to free.
+        if (self.owned_compaction_client) |client| client.deinit(self.gpa);
         if (self.owned_client) |client| client.deinit(self.gpa);
         for (self.diagnostics) |*d| d.deinit(self.gpa);
         self.gpa.free(self.diagnostics);
@@ -304,12 +314,32 @@ pub const AgentRuntime = struct {
         });
         errdefer client.deinit();
         self.replaceClient(.{ .codex_responses = client });
+        self.agent.context_window_tokens = compaction.contextWindowTokens(model_id);
+
+        attach_compaction: {
+            const compaction_client = self.gpa.create(ai.codex_responses.Client) catch break :attach_compaction;
+            compaction_client.init(self.gpa, self.io, .{
+                .base_url = "https://chatgpt.com/backend-api",
+                .api_key = credentials.access,
+                .model = model_id,
+                .tools = tools_mod.registry,
+                .reasoning = .{ .effort = effort, .summary = .auto },
+                .account_id = credentials.account_id,
+                .session_id = self.session_writer.session.id.slice(),
+                .system_prompt = self.system_prompt,
+            }) catch {
+                self.gpa.destroy(compaction_client);
+                break :attach_compaction;
+            };
+            self.setCompactionClient(.{ .codex_responses = compaction_client });
+        }
         self.codex_connection_expired = false;
     }
 
     pub fn disconnectCodexClient(self: *AgentRuntime) void {
         const owned_client = self.owned_client orelse return;
         if (owned_client != .codex_responses) return;
+        self.clearCompactionClient();
         owned_client.deinit(self.gpa);
         self.owned_client = null;
         self.client = .none;
@@ -324,6 +354,7 @@ pub const AgentRuntime = struct {
 
     pub fn disconnectClient(self: *AgentRuntime) void {
         const owned_client = self.owned_client orelse return;
+        self.clearCompactionClient();
         owned_client.deinit(self.gpa);
         self.owned_client = null;
         self.client = .none;
@@ -346,9 +377,26 @@ pub const AgentRuntime = struct {
             .model = model_id,
             .tools = tools_mod.registry,
             .reasoning = .{ .effort = effort },
+            .session_id = self.session_writer.session.id.slice(),
         });
         errdefer client.deinit();
         self.replaceClient(.{ .openai_compatible = client });
+        self.agent.context_window_tokens = compaction.contextWindowTokens(model_id);
+
+        attach_compaction: {
+            const compaction_client = self.gpa.create(ai.openai_compatible.Client) catch break :attach_compaction;
+            compaction_client.init(self.gpa, self.io, .{
+                .base_url = base_url,
+                .api_key = api_key,
+                .model = model_id,
+                .tools = tools_mod.registry,
+                .reasoning = .{ .effort = effort },
+            }) catch {
+                self.gpa.destroy(compaction_client);
+                break :attach_compaction;
+            };
+            self.setCompactionClient(.{ .openai_compatible = compaction_client });
+        }
     }
 
     pub fn attachOpenAiResponsesClient(
@@ -371,6 +419,24 @@ pub const AgentRuntime = struct {
         });
         errdefer client.deinit();
         self.replaceClient(.{ .openai_responses = client });
+        self.agent.context_window_tokens = compaction.contextWindowTokens(model_id);
+
+        attach_compaction: {
+            const compaction_client = self.gpa.create(ai.openai_responses.Client) catch break :attach_compaction;
+            compaction_client.init(self.gpa, self.io, .{
+                .base_url = base_url,
+                .api_key = api_key,
+                .model = model_id,
+                .tools = tools_mod.registry,
+                .reasoning = reasoning,
+                .session_id = self.session_writer.session.id.slice(),
+                .system_prompt = self.system_prompt,
+            }) catch {
+                self.gpa.destroy(compaction_client);
+                break :attach_compaction;
+            };
+            self.setCompactionClient(.{ .openai_responses = compaction_client });
+        }
     }
 
     fn languageModelMatches(a: ai.LanguageModel, b: ai.LanguageModel) bool {
@@ -398,6 +464,25 @@ pub const AgentRuntime = struct {
         self.agent.client = self.client;
         self.assertClientInvariant();
     }
+
+    /// Install the dedicated background-summarizer client, replacing any
+    /// previous one. Connecting happens between turns, so no summarizer is in
+    /// flight against the old client when it is freed.
+    fn setCompactionClient(self: *AgentRuntime, next: OwnedClient) void {
+        self.agent.drainBackgroundCompaction();
+        if (self.owned_compaction_client) |old| old.deinit(self.gpa);
+        self.owned_compaction_client = next;
+        self.agent.compaction_client = next.languageModel();
+    }
+
+    /// Tear down the background-summarizer client (after draining any in-flight
+    /// summary), disabling compaction until the next connect.
+    fn clearCompactionClient(self: *AgentRuntime) void {
+        self.agent.drainBackgroundCompaction();
+        if (self.owned_compaction_client) |old| old.deinit(self.gpa);
+        self.owned_compaction_client = null;
+        self.agent.compaction_client = .none;
+    }
 };
 
 /// Substitute the `${CWD}` and `${OS}` placeholders in a system-prompt template
@@ -409,7 +494,7 @@ fn createSystemPrompt(gpa: std.mem.Allocator, template: []const u8, cwd: []const
     assert(cwd.len > 0);
     const cwd_resolved = try std.mem.replaceOwned(u8, gpa, template, "${CWD}", cwd);
     defer gpa.free(cwd_resolved);
-    return try std.mem.replaceOwned(u8, gpa, cwd_resolved, "${OS}", os_label);
+    return try std.mem.replaceOwned(u8, gpa, cwd_resolved, "${OS}", os.label);
 }
 
 /// Reads AGENTS.md in the root directory if it exists. Returns null otherwise.
@@ -468,16 +553,6 @@ fn createSystemPromptWithContext(
 fn codexRefreshNeeded(expires_ms: i64, now_ms: i64) bool {
     return expires_ms <= now_ms + codex_refresh_margin_ms;
 }
-
-const os_label: []const u8 = switch (builtin.os.tag) {
-    .windows => "Windows",
-    .linux => "Linux",
-    .macos => "macOS",
-    .freebsd => "FreeBSD",
-    .netbsd => "NetBSD",
-    .openbsd => "OpenBSD",
-    else => @tagName(builtin.os.tag),
-};
 
 test "codex refresh starts before token expiry" {
     const now_ms: i64 = 10_000;

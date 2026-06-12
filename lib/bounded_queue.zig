@@ -58,6 +58,15 @@ pub fn BoundedQueue(comptime T: type) type {
             if (self.count == 0) return null;
             return &buffer[self.head];
         }
+
+        pub fn at(self: *Self, buffer: []T, index: u32) ?*T {
+            assert(buffer.len > 0);
+            assert(buffer.len <= std.math.maxInt(u32));
+            assert(self.count <= buffer.len);
+            if (index >= self.count) return null;
+            const capacity: u32 = @intCast(buffer.len);
+            return &buffer[(self.head + index) % capacity];
+        }
     };
 }
 
@@ -76,4 +85,27 @@ test "bounded queue preserves order across wrap" {
     try std.testing.expectEqual(@as(?u8, 3), queue.pop(&buffer));
     try std.testing.expectEqual(@as(?u8, 4), queue.pop(&buffer));
     try std.testing.expectEqual(@as(?u8, null), queue.pop(&buffer));
+}
+
+test "bounded queue at indexes logical order across wrap" {
+    var buffer: [3]u8 = undefined;
+    var queue: BoundedQueue(u8) = .{};
+
+    // Advance head so the live range wraps the backing buffer.
+    try std.testing.expect(queue.push(&buffer, 1));
+    try std.testing.expect(queue.push(&buffer, 2));
+    try std.testing.expectEqual(@as(?u8, 1), queue.pop(&buffer));
+    try std.testing.expect(queue.push(&buffer, 3));
+    try std.testing.expect(queue.push(&buffer, 4));
+
+    // Logical order is now 2, 3, 4 even though they straddle the wrap.
+    try std.testing.expectEqual(@as(u8, 2), queue.at(&buffer, 0).?.*);
+    try std.testing.expectEqual(@as(u8, 3), queue.at(&buffer, 1).?.*);
+    try std.testing.expectEqual(@as(u8, 4), queue.at(&buffer, 2).?.*);
+    try std.testing.expectEqual(@as(?*u8, null), queue.at(&buffer, 3));
+
+    // Mutating through the pointer is visible to a later pop.
+    queue.at(&buffer, 1).?.* = 30;
+    try std.testing.expectEqual(@as(?u8, 2), queue.pop(&buffer));
+    try std.testing.expectEqual(@as(?u8, 30), queue.pop(&buffer));
 }

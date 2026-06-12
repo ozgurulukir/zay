@@ -2,11 +2,15 @@ const std = @import("std");
 
 const bounded_queue = @import("bounded_queue");
 const ai = @import("ai.zig");
+const compaction = @import("compaction.zig");
 const db = @import("db.zig");
 
 const assert = std.debug.assert;
 
 const schema_version: u32 = 1;
+/// Upper bound on entries in a single branch path. Far above any real
+/// session; exists so projection loops are bounded (tigerstyle).
+const path_entries_max: u32 = 1 << 20;
 pub const entry_id_len: u32 = 8;
 const session_id_len: u32 = 32;
 
@@ -234,28 +238,94 @@ pub const Session = struct {
         }
     }
 
+    /// Append a compaction boundary as a child of the current leaf. `summary`
+    /// (with any handover framing already applied by the caller) stands in for
+    /// every entry before `first_kept_id` in the projected context. Validates
+    /// that `first_kept_id` exists in this session before writing — the
+    /// write-time half of the branch-safety guarantee whose read-time half is
+    /// `findCompactionBoundary`.
+    pub fn appendCompaction(self: *Session, first_kept_id: []const u8, summary: []const u8, id_out: *[entry_id_len]u8) Error!void {
+        assert(first_kept_id.len == entry_id_len);
+        assert(summary.len > 0);
+        try self.requireEntry(first_kept_id);
+        fillHex(self.manager.io, id_out);
+        const payload = try compactionToJson(self.manager.gpa, first_kept_id, summary);
+        defer self.manager.gpa.free(payload);
+        try self.insertEntry(id_out, "compaction", null, payload);
+    }
+
+    /// Project the active branch into the message list the model sees. The
+    /// durable tree is the source of truth; this is the derived view. When the
+    /// branch carries a compaction boundary, the summarized prefix is replaced
+    /// by the summary message and everything from the first kept entry onward
+    /// is emitted verbatim (see `findCompactionBoundary`). Without a boundary
+    /// the whole branch is emitted, preserving the pre-compaction behavior.
     pub fn messages(self: *Session, gpa: std.mem.Allocator) Error![]ai.ChatMessage {
         const path = try self.loadBranch(gpa);
         defer {
             for (path) |*entry| entry.deinit(gpa);
             gpa.free(path);
         }
+        assert(path.len <= path_entries_max);
+
+        const boundary = try findCompactionBoundary(gpa, path);
+        const emit_start: u32 = if (boundary) |b| b.first_kept_index else 0;
 
         var messages_list: std.ArrayList(ai.ChatMessage) = .empty;
         errdefer {
             for (messages_list.items) |*message| deinitMessage(gpa, message);
             messages_list.deinit(gpa);
         }
-        for (path) |entry| {
-            if (std.mem.eql(u8, entry.kind, "message")) {
-                try messages_list.append(gpa, try jsonToMessage(gpa, entry.payload_json));
-            } else {
-                if (std.mem.eql(u8, entry.kind, "branch_summary")) {
-                    try messages_list.append(gpa, try branchSummaryToMessage(gpa, entry.payload_json));
-                }
-            }
+        if (boundary) |b| {
+            try messages_list.append(gpa, try compactionSummaryToMessage(gpa, path[b.summary_index].payload_json));
+        }
+        for (path[emit_start..]) |entry| {
+            try appendProjectedEntry(gpa, &messages_list, entry);
         }
         return messages_list.toOwnedSlice(gpa);
+    }
+
+    /// Compute where to cut the active branch for compaction: the entry that
+    /// becomes the first kept message, plus the rendered text of everything
+    /// before it (including any prior summary, folded in). Works in tree-space
+    /// so the boundary references a real entry id — the cache never needs to
+    /// track ids. Returns null when the kept-recent budget already covers the
+    /// branch (nothing worth summarizing). Caller owns `prefix_text`.
+    pub fn compactionCut(self: *Session, gpa: std.mem.Allocator, keep_recent_tokens: u32) Error!?CompactionCut {
+        const path = try self.loadBranch(gpa);
+        defer {
+            for (path) |*entry| entry.deinit(gpa);
+            gpa.free(path);
+        }
+        assert(path.len <= path_entries_max);
+
+        const boundary = try findCompactionBoundary(gpa, path);
+        const emit_start: u32 = if (boundary) |b| b.first_kept_index else 0;
+
+        var msgs: std.ArrayList(ai.ChatMessage) = .empty;
+        defer {
+            for (msgs.items) |*message| deinitMessage(gpa, message);
+            msgs.deinit(gpa);
+        }
+        var ids: std.ArrayList([entry_id_len]u8) = .empty;
+        defer ids.deinit(gpa);
+        for (path[emit_start..]) |entry| {
+            if (std.mem.eql(u8, entry.kind, "message")) {
+                try msgs.append(gpa, try jsonToMessage(gpa, entry.payload_json));
+                try ids.append(gpa, entry.id);
+            } else if (std.mem.eql(u8, entry.kind, "branch_summary")) {
+                try msgs.append(gpa, try branchSummaryToMessage(gpa, entry.payload_json));
+                try ids.append(gpa, entry.id);
+            }
+        }
+        if (msgs.items.len == 0) return null;
+
+        const cut = compaction.findCutIndex(msgs.items, keep_recent_tokens);
+        if (cut == 0) return null;
+        assert(cut < msgs.items.len);
+
+        const prefix_text = try renderCompactionPrefix(gpa, path, boundary, msgs.items[0..cut]);
+        return .{ .first_kept_id = ids.items[cut], .prefix_text = prefix_text };
     }
 
     pub fn leaf(self: *const Session) ?[]const u8 {
@@ -468,6 +538,19 @@ pub const SessionWriter = struct {
         try self.enqueue(.{ .kind = "message", .role = role, .payload_json = payload, .title_candidate = title_candidate });
     }
 
+    /// Enqueue a compaction boundary for the background writer. Mirrors
+    /// `append`: builds the payload and hands it to the writer thread. The
+    /// branch on which it lands is whatever leaf is current when the writer
+    /// drains it; a stale boundary is ignored at projection time, so no
+    /// quiesce is needed here.
+    pub fn appendCompaction(self: *SessionWriter, first_kept_id: []const u8, summary: []const u8) Error!void {
+        assert(first_kept_id.len == entry_id_len);
+        assert(summary.len > 0);
+        const payload = try compactionToJson(self.gpa, first_kept_id, summary);
+        errdefer self.gpa.free(payload);
+        try self.enqueue(.{ .kind = "compaction", .role = null, .payload_json = payload });
+    }
+
     /// Load the whole session tree, race-free. Stops the background writer so
     /// the read has exclusive access to the connection, then restarts it.
     pub fn entries(self: *SessionWriter, gpa: std.mem.Allocator) Error![]EntryRecord {
@@ -482,6 +565,14 @@ pub const SessionWriter = struct {
         self.quiesce();
         defer self.restart() catch {};
         return self.session.messages(gpa);
+    }
+
+    /// Race-free `Session.compactionCut`: flushes queued writes so the cut is
+    /// computed against the persisted tree, then restarts the writer.
+    pub fn compactionCut(self: *SessionWriter, gpa: std.mem.Allocator, keep_recent_tokens: u32) Error!?CompactionCut {
+        self.quiesce();
+        defer self.restart() catch {};
+        return self.session.compactionCut(gpa, keep_recent_tokens);
     }
 
     /// Move the session leaf to `entry_id` (branch switch, no summary),
@@ -778,6 +869,135 @@ fn branchSummaryToJson(gpa: std.mem.Allocator, from_id: []const u8, summary: []c
     return out.toOwnedSlice();
 }
 
+/// Emit one branch entry into the projected message list, dispatching on its
+/// kind. Compaction entries are skipped: they are represented by the summary
+/// message emitted in `messages`, not by a message of their own.
+fn appendProjectedEntry(gpa: std.mem.Allocator, list: *std.ArrayList(ai.ChatMessage), entry: EntryRecord) Error!void {
+    assert(entry.kind.len > 0);
+    assert(entry.payload_json.len > 0);
+    if (std.mem.eql(u8, entry.kind, "message")) {
+        try list.append(gpa, try jsonToMessage(gpa, entry.payload_json));
+        return;
+    }
+    if (std.mem.eql(u8, entry.kind, "branch_summary")) {
+        try list.append(gpa, try branchSummaryToMessage(gpa, entry.payload_json));
+        return;
+    }
+}
+
+/// The active compaction boundary on a branch: the index of the summary entry
+/// and the index of the first entry kept verbatim after it.
+const CompactionBoundary = struct {
+    summary_index: u32,
+    first_kept_index: u32,
+};
+
+/// Locate the active compaction boundary in a root→leaf `path`: the newest
+/// `compaction` entry whose `first_kept_id` still resolves to an entry on the
+/// path. Returns null when there is no compaction entry, or when the named
+/// boundary is not on this branch (a stale boundary left by a branch switch —
+/// ignored so the full history projects instead).
+fn findCompactionBoundary(gpa: std.mem.Allocator, path: []const EntryRecord) Error!?CompactionBoundary {
+    assert(path.len <= path_entries_max);
+    var summary_index: u32 = 0;
+    var found = false;
+    var scan: u32 = @intCast(path.len);
+    while (scan > 0) {
+        scan -= 1;
+        if (std.mem.eql(u8, path[scan].kind, "compaction")) {
+            summary_index = scan;
+            found = true;
+            break;
+        }
+    }
+    if (!found) return null;
+
+    const first_kept_id = try compactionFirstKeptId(gpa, path[summary_index].payload_json);
+    const first_kept_index = indexOfEntry(path, first_kept_id[0..]) orelse return null;
+    if (first_kept_index > summary_index) return null;
+    assert(first_kept_index <= summary_index);
+    return .{ .summary_index = summary_index, .first_kept_index = first_kept_index };
+}
+
+/// Index of the entry whose id equals `id` in `path`, or null if absent.
+fn indexOfEntry(path: []const EntryRecord, id: []const u8) ?u32 {
+    assert(id.len == entry_id_len);
+    assert(path.len <= path_entries_max);
+    for (path, 0..) |entry, index| {
+        if (std.mem.eql(u8, entry.id[0..], id)) return @intCast(index);
+    }
+    return null;
+}
+
+fn compactionToJson(gpa: std.mem.Allocator, first_kept_id: []const u8, summary: []const u8) Error![]u8 {
+    assert(first_kept_id.len == entry_id_len);
+    assert(summary.len > 0);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try out.writer.writeAll("{\"first_kept_id\":");
+    try std.json.Stringify.value(first_kept_id, .{}, &out.writer);
+    try out.writer.writeAll(",\"summary\":");
+    try std.json.Stringify.value(summary, .{}, &out.writer);
+    try out.writer.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+fn compactionFirstKeptId(gpa: std.mem.Allocator, payload_json: []const u8) Error![entry_id_len]u8 {
+    assert(payload_json.len > 0);
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, payload_json, .{}) catch return error.CorruptPayload;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.CorruptPayload;
+    const field = parsed.value.object.get("first_kept_id") orelse return error.CorruptPayload;
+    if (field != .string) return error.CorruptPayload;
+    if (field.string.len != entry_id_len) return error.BadEntryId;
+    var bytes: [entry_id_len]u8 = undefined;
+    @memcpy(bytes[0..], field.string);
+    return bytes;
+}
+
+fn compactionSummaryToMessage(gpa: std.mem.Allocator, payload_json: []const u8) Error!ai.ChatMessage {
+    const summary = try compactionSummaryText(gpa, payload_json);
+    errdefer gpa.free(summary);
+    const blocks = try gpa.alloc(ai.ContentBlock, 1);
+    errdefer gpa.free(blocks);
+    blocks[0] = .{ .text = .{ .text = summary } };
+    return .{ .role = .user, .content = blocks };
+}
+
+fn compactionSummaryText(gpa: std.mem.Allocator, payload_json: []const u8) Error![]u8 {
+    assert(payload_json.len > 0);
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, payload_json, .{}) catch return error.CorruptPayload;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.CorruptPayload;
+    const summary = parsed.value.object.get("summary") orelse return error.CorruptPayload;
+    if (summary != .string) return error.CorruptPayload;
+    return gpa.dupe(u8, summary.string);
+}
+
+/// Result of `compactionCut`: which entry stays as the first kept message, and
+/// the rendered prefix text to summarize. Caller owns `prefix_text`.
+pub const CompactionCut = struct {
+    first_kept_id: [entry_id_len]u8,
+    prefix_text: []u8,
+};
+
+/// Render the text handed to the summarizer: any prior summary (folded in so
+/// repeated compactions stay cumulative) followed by the rendered prefix
+/// messages. Caller owns the result.
+fn renderCompactionPrefix(gpa: std.mem.Allocator, path: []const EntryRecord, boundary: ?CompactionBoundary, prefix_msgs: []const ai.ChatMessage) Error![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    if (boundary) |b| {
+        const prev_summary = try compactionSummaryText(gpa, path[b.summary_index].payload_json);
+        defer gpa.free(prev_summary);
+        try out.writer.print("{s}\n", .{prev_summary});
+    }
+    const rendered = try compaction.serializePrefix(gpa, prefix_msgs);
+    defer gpa.free(rendered);
+    try out.writer.writeAll(rendered);
+    return out.toOwnedSlice();
+}
+
 /// Classification of a session entry, used by the `/timeline` view to drive filter
 /// modes and to hide tool-call-only assistant turns by default.
 pub const EntryKind = enum {
@@ -1062,4 +1282,100 @@ test "session branch with summary changes context" {
     try std.testing.expectEqual(@as(usize, 2), messages.len);
     try std.testing.expectEqualStrings("root", messages[0].text());
     try std.testing.expectEqualStrings("Branch summary: old branch was abandoned", messages[1].text());
+}
+
+fn appendTextEntry(session: *Session, gpa: std.mem.Allocator, role: ai.Role, text: []const u8, id_out: *[entry_id_len]u8) !void {
+    const blocks = try gpa.alloc(ai.ContentBlock, 1);
+    defer {
+        for (blocks) |*block| block.deinit(gpa);
+        gpa.free(blocks);
+    }
+    blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, text) } };
+    try session.append(.{ .role = role, .content = blocks }, id_out);
+}
+
+test "session compaction boundary replaces summarized prefix" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/nova", .{ .id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
+
+    var id_old_user: [entry_id_len]u8 = undefined;
+    var id_old_agent: [entry_id_len]u8 = undefined;
+    var id_kept: [entry_id_len]u8 = undefined;
+    var id_compaction: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "old one", &id_old_user);
+    try appendTextEntry(&session, gpa, .assistant, "old two", &id_old_agent);
+    try appendTextEntry(&session, gpa, .user, "keep me", &id_kept);
+    try session.appendCompaction(id_kept[0..], "SUMMARY TEXT", &id_compaction);
+
+    const messages = try session.messages(gpa);
+    defer {
+        for (messages) |*message| deinitMessage(gpa, message);
+        gpa.free(messages);
+    }
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expectEqual(.user, messages[0].role);
+    try std.testing.expectEqualStrings("SUMMARY TEXT", messages[0].text());
+    try std.testing.expectEqualStrings("keep me", messages[1].text());
+}
+
+test "session compaction boundary keeps entries appended after it" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/nova", .{ .id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" });
+
+    var id_old: [entry_id_len]u8 = undefined;
+    var id_kept: [entry_id_len]u8 = undefined;
+    var id_compaction: [entry_id_len]u8 = undefined;
+    var id_after: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "old one", &id_old);
+    try appendTextEntry(&session, gpa, .user, "keep me", &id_kept);
+    try session.appendCompaction(id_kept[0..], "SUMMARY", &id_compaction);
+    try appendTextEntry(&session, gpa, .assistant, "after compaction", &id_after);
+
+    const messages = try session.messages(gpa);
+    defer {
+        for (messages) |*message| deinitMessage(gpa, message);
+        gpa.free(messages);
+    }
+    try std.testing.expectEqual(@as(usize, 3), messages.len);
+    try std.testing.expectEqualStrings("SUMMARY", messages[0].text());
+    try std.testing.expectEqualStrings("keep me", messages[1].text());
+    try std.testing.expectEqualStrings("after compaction", messages[2].text());
+}
+
+test "compaction cut splits the branch at the keep-recent budget" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/nova", .{ .id = "cccccccccccccccccccccccccccccccc" });
+
+    var id_first: [entry_id_len]u8 = undefined;
+    var id_second: [entry_id_len]u8 = undefined;
+    var id_third: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "a" ** 40, &id_first);
+    try appendTextEntry(&session, gpa, .assistant, "b" ** 40, &id_second);
+    try appendTextEntry(&session, gpa, .user, "c" ** 40, &id_third);
+
+    // keep_recent of 15 tokens keeps the last two (~10 tokens each); the cut
+    // lands on the second entry and the first is summarized.
+    const cut = (try session.compactionCut(gpa, 15)) orelse return error.TestFailed;
+    defer gpa.free(cut.prefix_text);
+    try std.testing.expectEqualSlices(u8, id_second[0..], cut.first_kept_id[0..]);
+    try std.testing.expect(std.mem.indexOf(u8, cut.prefix_text, "aaaa") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cut.prefix_text, "bbbb") == null);
+}
+
+test "compaction cut returns null when the budget covers the branch" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/nova", .{ .id = "dddddddddddddddddddddddddddddddd" });
+
+    var id_only: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "small", &id_only);
+    const result = try session.compactionCut(gpa, 100_000);
+    try std.testing.expect(result == null);
 }

@@ -1,7 +1,7 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const bash = @import("../bash.zig");
 const common = @import("common.zig");
+const os = @import("../os.zig");
 
 pub const tool: common.Tool = .{
     .name = "bash",
@@ -49,33 +49,21 @@ pub fn runTool(
         break :value command_cwd.?;
     } else cwd;
 
-    const output_path = tempOutputPath(gpa, io) catch return error.OutOfMemory;
-    var keep_output_file = false;
-    defer {
-        if (!keep_output_file) std.Io.Dir.deleteFile(.cwd(), io, output_path) catch {};
-        gpa.free(output_path);
-    }
-
-    var env_map = try currentEnvMap(gpa);
+    var env_map = try currentEnvMap(gpa, io);
     defer env_map.deinit();
     if (args.env) |env| try applyEnv(&env_map, env);
-    try env_map.put("NOVA_BASH_OUTPUT", output_path);
 
-    const wrapped_command = wrapCommandForOutputFile(gpa, args.command) catch return error.OutOfMemory;
-    defer gpa.free(wrapped_command);
-
-    var run_result = bash.runWithOptions(gpa, io, .{
+    var captured = bash.capture(gpa, io, .{
         .cwd = resolved_cwd,
-        .command = wrapped_command,
+        .command = args.command,
         .env_map = &env_map,
         .timeout = bash.timeoutFromSeconds(args.timeout_seconds),
-    }) catch |err| switch (err) {
-        error.Timeout => return finishBashOutput(gpa, io, output_path, 124, .{ .timeout_seconds = args.timeout_seconds }, &keep_output_file),
-        else => return mapBashError(err),
-    };
-    defer run_result.deinit(gpa);
+        .limits = capture_limits,
+    }) catch |err| return mapBashError(err);
+    defer captured.deinit(gpa);
 
-    return finishBashOutput(gpa, io, output_path, run_result.code, .{}, &keep_output_file);
+    const status: FinishStatus = if (captured.timed_out) .{ .timeout_seconds = args.timeout_seconds } else .{};
+    return finishBashOutput(gpa, &captured, status);
 }
 
 const Args = struct {
@@ -166,8 +154,8 @@ fn parseError(gpa: std.mem.Allocator, err: ParseError) common.Error!common.Outpu
     };
 }
 
-fn currentEnvMap(gpa: std.mem.Allocator) (std.mem.Allocator.Error || std.Io.UnexpectedError)!std.process.Environ.Map {
-    if (builtin.os.tag == .windows) {
+fn currentEnvMap(gpa: std.mem.Allocator, io: std.Io) (std.mem.Allocator.Error || std.Io.UnexpectedError)!std.process.Environ.Map {
+    if (os.is_windows) {
         return std.process.Environ.createMap(.{ .block = .global }, gpa);
     }
 
@@ -179,6 +167,21 @@ fn currentEnvMap(gpa: std.mem.Allocator) (std.mem.Allocator.Error || std.Io.Unex
         const separator = std.mem.findScalar(u8, line, '=') orelse continue;
         if (separator == 0) continue;
         try map.put(line[0..separator], line[separator + 1 ..]);
+    }
+
+    // Overlay the login shell's environment (PATH etc.) over the inherited
+    // process env, so non-login command shells see what a login shell would —
+    // captured once, not re-sourced per command. The per-command `env` arg is
+    // applied after this and still wins. Null (Windows / capture failure) leaves
+    // the process env untouched.
+    if (bash.loginEnvBlock(io)) |block| {
+        var entries = std.mem.splitScalar(u8, block, 0);
+        while (entries.next()) |entry| {
+            if (entry.len == 0) continue;
+            const separator = std.mem.findScalar(u8, entry, '=') orelse continue;
+            if (separator == 0) continue;
+            try map.put(entry[0..separator], entry[separator + 1 ..]);
+        }
     }
     return map;
 }
@@ -194,6 +197,15 @@ const observation_lines_max: u32 = 2000;
 const observation_bytes_max: usize = 50 * 1024;
 const rolling_bytes_max: usize = observation_bytes_max * 2;
 
+/// Capture thresholds for `bash.capture`. The spill-to-disk trigger is the same
+/// budget the observation truncates at, so a spill file exists exactly when the
+/// tail is shown truncated.
+const capture_limits: bash.CaptureLimits = .{
+    .bytes_max = observation_bytes_max,
+    .lines_max = observation_lines_max,
+    .tail_bytes_max = rolling_bytes_max,
+};
+
 const FinishStatus = struct {
     timeout_seconds: ?u32 = null,
 };
@@ -208,25 +220,24 @@ const TailSnapshot = struct {
     last_line_partial: bool,
 };
 
+/// Turn a `bash.Capture` into the tool's observation: trim the rolling tail to
+/// the display budget, and — when the output was spilled to disk — surface the
+/// spill path so the model can read the full output.
 fn finishBashOutput(
     gpa: std.mem.Allocator,
-    io: std.Io,
-    output_path: []const u8,
-    code: u8,
+    captured: *const bash.Capture,
     status: FinishStatus,
-    keep_output_file: *bool,
 ) common.Error!common.Output {
-    var snapshot = readTailSnapshot(gpa, io, output_path) catch |err| return mapBashError(err);
+    var snapshot = truncateTailBuffer(gpa, captured.tail, captured.total_lines, captured.total_bytes) catch return error.OutOfMemory;
     defer snapshotDeinit(gpa, &snapshot);
 
-    const observation_text = formatBashText(gpa, snapshot.text, code, status) catch return error.OutOfMemory;
+    const observation_text = formatBashText(gpa, snapshot.text, captured.code, status) catch return error.OutOfMemory;
     var observation_text_moved = false;
     errdefer if (!observation_text_moved) gpa.free(observation_text);
 
-    var observation: common.Observation = if (snapshot.truncated) truncated: {
-        const path = try gpa.dupe(u8, output_path);
+    var observation: common.Observation = if (captured.spill_path) |spill_path| truncated: {
+        const path = try gpa.dupe(u8, spill_path);
         errdefer gpa.free(path);
-        keep_output_file.* = true;
         break :truncated .{ .truncated_tail = .{
             .text = observation_text,
             .total_lines = snapshot.total_lines,
@@ -246,7 +257,7 @@ fn finishBashOutput(
     return .{
         .stdout = display_text,
         .stderr = stderr,
-        .code = code,
+        .code = captured.code,
         .display = null,
         .observation = observation,
     };
@@ -255,19 +266,6 @@ fn finishBashOutput(
 fn snapshotDeinit(gpa: std.mem.Allocator, snapshot: *TailSnapshot) void {
     gpa.free(snapshot.text);
     snapshot.* = undefined;
-}
-
-fn wrapCommandForOutputFile(gpa: std.mem.Allocator, command: []const u8) std.mem.Allocator.Error![]u8 {
-    return std.fmt.allocPrint(gpa, "exec >\"$NOVA_BASH_OUTPUT\" 2>&1\n{s}", .{command});
-}
-
-fn tempOutputPath(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
-    var random: [16]u8 = undefined;
-    io.random(&random);
-    const hex = std.fmt.bytesToHex(random, .lower);
-    const name = try std.fmt.allocPrint(gpa, "nova-bash-{s}.log", .{hex[0..]});
-    defer gpa.free(name);
-    return std.fs.path.join(gpa, &.{ "/tmp", name });
 }
 
 fn formatBashText(gpa: std.mem.Allocator, text: []const u8, code: u8, status: FinishStatus) std.mem.Allocator.Error![]u8 {
@@ -281,44 +279,6 @@ fn formatBashText(gpa: std.mem.Allocator, text: []const u8, code: u8, status: Fi
     }
     if (text.len == 0) return gpa.dupe(u8, "(no output)");
     return gpa.dupe(u8, text);
-}
-
-fn readTailSnapshot(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !TailSnapshot {
-    var file = try std.Io.Dir.openFile(.cwd(), io, path, .{});
-    defer file.close(io);
-    var reader = file.reader(io, &.{});
-    var tail: std.ArrayList(u8) = .empty;
-    errdefer tail.deinit(gpa);
-    var total_bytes: u64 = 0;
-    var newline_count: u32 = 0;
-    var ended_with_newline = false;
-    var buffer: [8192]u8 = undefined;
-    while (true) {
-        const read_count = reader.interface.readSliceShort(&buffer) catch |err| switch (err) {
-            error.ReadFailed => return reader.err.?,
-        };
-        if (read_count == 0) break;
-        const chunk = buffer[0..read_count];
-        total_bytes += read_count;
-        for (chunk) |byte| {
-            if (byte == '\n') newline_count += 1;
-        }
-        ended_with_newline = chunk[chunk.len - 1] == '\n';
-        try tail.appendSlice(gpa, chunk);
-        trimRollingTail(&tail);
-    }
-    const total_lines: u32 = if (total_bytes == 0) 0 else newline_count + @intFromBool(!ended_with_newline);
-    const text = try truncateTailBuffer(gpa, tail.items, total_lines, total_bytes);
-    tail.deinit(gpa);
-    return text;
-}
-
-fn trimRollingTail(tail: *std.ArrayList(u8)) void {
-    if (tail.items.len <= rolling_bytes_max * 2) return;
-    var start = tail.items.len - rolling_bytes_max;
-    while (start < tail.items.len and (tail.items[start] & 0xC0) == 0x80) start += 1;
-    std.mem.copyForwards(u8, tail.items[0 .. tail.items.len - start], tail.items[start..]);
-    tail.shrinkRetainingCapacity(tail.items.len - start);
 }
 
 fn truncateTailBuffer(gpa: std.mem.Allocator, tail: []const u8, total_lines: u32, total_bytes: u64) !TailSnapshot {
@@ -441,14 +401,15 @@ test "bash tool applies relative cwd" {
     defer gpa.free(cwd);
 
     try std.Io.Dir.cwd().createDirPath(std.testing.io, ".zig-cache/bash-tool-test");
-    const expected = try std.fs.path.join(gpa, &.{ cwd, ".zig-cache/bash-tool-test" });
-    defer gpa.free(expected);
 
     var output = try runTool(gpa, std.testing.io, cwd, "{\"command\":\"printf \\\"$PWD\\\"\",\"reason\":\"read\",\"cwd\":\".zig-cache/bash-tool-test\"}");
     defer output.deinit(gpa);
 
+    // `$PWD` is reported in the shell's native notation (MSYS forward-slash form
+    // under git bash), so assert the relative segment was applied rather than
+    // exact-matching a host-style absolute path.
     try std.testing.expectEqual(@as(u8, 0), output.code);
-    try std.testing.expectEqualStrings(expected, output.stdout);
+    try std.testing.expect(std.mem.endsWith(u8, output.stdout, ".zig-cache/bash-tool-test"));
 }
 
 test "bash tool parses timeout" {
@@ -490,7 +451,7 @@ test "bash tool truncates observation tail and keeps full output path" {
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
 
-    var output = try runTool(gpa, std.testing.io, cwd, "{\"command\":\"python3 - <<'PY'\\nfor i in range(2105): print(f'line-{i}')\\nPY\",\"reason\":\"read\"}");
+    var output = try runTool(gpa, std.testing.io, cwd, "{\"command\":\"i=0; while [ $i -lt 2105 ]; do echo line-$i; i=$((i+1)); done\",\"reason\":\"read\"}");
     defer {
         if (output.observation) |observation| switch (observation) {
             .complete => {},

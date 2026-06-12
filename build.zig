@@ -61,6 +61,28 @@ pub fn build(b: *std.Build) void {
     translate_c.addIncludePath(b.path("vendor/sqlite"));
     const c_mod = translate_c.createModule();
 
+    // Generate the models.dev context-window catalogue at build time. A small
+    // host tool reads the vendored snapshot and emits a static Zig table that
+    // `compaction.zig` imports as `model_catalog`. Keeps accurate per-model
+    // context windows in the binary without a runtime JSON parse; refresh by
+    // re-curling vendor/models.dev/models.json and rebuilding.
+    const model_catalog_gen = b.addExecutable(.{
+        .name = "gen-model-catalog",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_model_catalog.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const model_catalog_run = b.addRunArtifact(model_catalog_gen);
+    model_catalog_run.addFileArg(b.path("vendor/models.dev/models.json"));
+    const model_catalog_zig = model_catalog_run.addOutputFileArg("model_catalog.zig");
+    const model_catalog_mod = b.createModule(.{
+        .root_source_file = model_catalog_zig,
+        .target = target,
+        .optimize = optimize,
+    });
+
     const mod = b.addModule("nova", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -73,6 +95,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "dynlib", .module = dynlib_mod },
             .{ .name = "terminal_markdown", .module = terminal_markdown_mod },
             .{ .name = "c", .module = c_mod },
+            .{ .name = "model_catalog", .module = model_catalog_mod },
         },
     });
 

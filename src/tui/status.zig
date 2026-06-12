@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const config_mod = @import("../config.zig");
+const os = @import("../os.zig");
 const runtime_mod = @import("../runtime.zig");
 
 pub const ModelStatus = struct {
@@ -51,7 +52,7 @@ pub fn formatCwdRelative(
     if (cwd.len < home_dir.len) return cwd;
 
     const prefix = cwd[0..home_dir.len];
-    const prefix_matches = switch (@import("builtin").target.os.tag) {
+    const prefix_matches = switch (os.tag) {
         .windows => std.ascii.eqlIgnoreCase(prefix, home_dir),
         else => std.mem.eql(u8, prefix, home_dir),
     };

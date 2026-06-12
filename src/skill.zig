@@ -203,9 +203,20 @@ fn loadOne(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Skill {
     };
 }
 
+/// Byte length of the opening `---` fence line, tolerating both LF and CRLF
+/// line endings (SKILL.md authored on Windows ships as CRLF), or null when the
+/// input does not open with a frontmatter fence.
+fn frontmatterOpenLen(raw: []const u8) ?u32 {
+    if (std.mem.startsWith(u8, raw, "---\r\n")) return 5;
+    if (std.mem.startsWith(u8, raw, "---\n")) return 4;
+    return null;
+}
+
 fn parseFrontmatter(raw: []const u8) []const u8 {
-    if (!std.mem.startsWith(u8, raw, "---\n")) return "";
-    const rest = raw[4..];
+    const open_len = frontmatterOpenLen(raw) orelse return "";
+    const rest = raw[open_len..];
+    // `\n---` matches the closing fence under both LF and CRLF; any trailing
+    // `\r` on a value line is stripped by `frontmatterValue`.
     const end = std.mem.indexOf(u8, rest, "\n---") orelse return "";
     return rest[0..end];
 }
@@ -243,12 +254,30 @@ fn appendSkillBlock(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, 
 }
 
 fn stripFrontmatter(raw: []const u8) []const u8 {
-    if (!std.mem.startsWith(u8, raw, "---\n")) return raw;
-    const rest = raw[4..];
+    const open_len = frontmatterOpenLen(raw) orelse return raw;
+    const rest = raw[open_len..];
     const end = std.mem.indexOf(u8, rest, "\n---") orelse return raw;
-    var body = rest[end + 4 ..];
-    if (std.mem.startsWith(u8, body, "\n")) body = body[1..];
-    return body;
+    const after_fence = rest[end + 4 ..];
+    // Drop the remainder of the closing fence line (LF or CRLF) so the body
+    // starts on its own line.
+    const newline = std.mem.indexOfScalar(u8, after_fence, '\n') orelse return "";
+    return after_fence[newline + 1 ..];
+}
+
+test "frontmatter parses CRLF line endings" {
+    const raw = "---\r\nname: demo\r\ndescription: \"a demo skill\"\r\n---\r\nbody line\r\n";
+    const frontmatter = parseFrontmatter(raw);
+    try std.testing.expectEqualStrings("demo", frontmatterValue(frontmatter, "name").?);
+    try std.testing.expectEqualStrings("a demo skill", frontmatterValue(frontmatter, "description").?);
+    try std.testing.expectEqualStrings("body line\r\n", stripFrontmatter(raw));
+}
+
+test "frontmatter parses LF line endings" {
+    const raw = "---\nname: demo\ndescription: d\n---\nbody\n";
+    const frontmatter = parseFrontmatter(raw);
+    try std.testing.expectEqualStrings("demo", frontmatterValue(frontmatter, "name").?);
+    try std.testing.expectEqualStrings("d", frontmatterValue(frontmatter, "description").?);
+    try std.testing.expectEqualStrings("body\n", stripFrontmatter(raw));
 }
 
 fn writeXmlTag(writer: *std.Io.Writer, tag: []const u8, value: []const u8, spaces: u8) !void {
