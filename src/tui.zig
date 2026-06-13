@@ -24,6 +24,7 @@ const tui_message = @import("tui/widgets/message.zig");
 const blackhole = @import("tui/blackhole.zig");
 const at_search = @import("tui/widgets/at_search.zig");
 const command_panel = @import("tui/widgets/command_panel.zig");
+const diff_viewer = @import("tui/diff_viewer.zig");
 const model_loader = @import("tui/model_loader.zig");
 const model_cache = @import("tui/model_cache.zig");
 const model_picker = @import("tui/widgets/model_picker.zig");
@@ -67,10 +68,16 @@ const DiffRefreshJob = struct {
 };
 
 const DiffRefreshOutcome = union(enum) {
-    ready: DiffCounts,
+    /// The full combined diff text (owned). Counts are derived from it on the UI
+    /// thread, and it's cached so `/diff` opens instantly.
+    ready: []u8,
     failed,
 
-    pub fn deinit(self: *DiffRefreshOutcome) void {
+    pub fn deinit(self: *DiffRefreshOutcome, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .ready => |raw| gpa.free(raw),
+            .failed => {},
+        }
         self.* = undefined;
     }
 };
@@ -84,15 +91,18 @@ fn runDiffRefresh(job: *DiffRefreshJob) DiffRefreshOutcome {
         done.store(true, .release);
     }
 
+    // Grab the full diff (not just numstat): one git pass gives both the cached
+    // text and the +/- counts. `--no-index` exits non-zero when untracked files
+    // differ, so the exit code is ignored — empty stdout simply means no changes.
     var result = bash_mod.runWithOptions(gpa, job.io, .{
         .cwd = job.cwd,
-        .command = diffCountCommand,
-        .timeout = bash_mod.timeoutFromSeconds(1),
+        .command = diff_viewer.diff_command,
+        .timeout = bash_mod.timeoutFromSeconds(5),
     }) catch return .failed;
     defer result.deinit(gpa);
 
-    if (result.code != 0) return .failed;
-    return .{ .ready = parseDiffCounts(result.stdout) };
+    const raw = gpa.dupe(u8, result.stdout) catch return .failed;
+    return .{ .ready = raw };
 }
 
 /// A user message queued behind a running turn, mirrored from the agent queue
@@ -111,6 +121,12 @@ pub const App = struct {
     thread: thread_mod.Thread = .{},
     input: vxfw.TextField,
     palette_input: vxfw.TextField,
+    /// Inline comment editor for the diff viewer. Single-line; cleared between
+    /// comments. The diff-viewer file-search field reuses `palette_input`.
+    comment_input: vxfw.TextField,
+    /// Parsed state for the `/diff` viewer. Populated by `openDiffViewer`, reset
+    /// to `.{}` on exit. Only meaningful while `mode == .diff_viewer`.
+    diff: diff_viewer.State = .{},
     worker_context: agent_worker.Context,
     turn_future: ?std.Io.Future(void) = null,
     owns_runtime: bool = false,
@@ -155,6 +171,12 @@ pub const App = struct {
     diff_refresh_future: ?std.Io.Future(DiffRefreshOutcome) = null,
     diff_refresh_done: std.atomic.Value(bool) = .init(false),
     diff_refresh_again: bool = false,
+    /// Most recent full diff text (owned), refreshed in the background alongside
+    /// the counts so `/diff` opens instantly. Null until the first refresh lands.
+    diff_cache: ?[]u8 = null,
+    /// True while the viewer is open on a cold cache, showing "Loading diff…"
+    /// until the background refresh populates it.
+    diff_loading: bool = false,
     thread_view_width: u16 = 80,
     thread_view_height: u16 = 1,
     thread_list: vxfw.ListView = .{
@@ -199,7 +221,7 @@ pub const App = struct {
 
     pub const ctrl_c_double_press_ms: u32 = 1500;
 
-    const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker };
+    const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer };
     const ModelCatalog = enum { connected_provider, openai_codex };
     const ModelSource = model_loader.ModelSource;
     const ModelScope = model_catalogue.ModelScope;
@@ -211,6 +233,7 @@ pub const App = struct {
             .agent = agent,
             .input = .init(gpa),
             .palette_input = .init(gpa),
+            .comment_input = .init(gpa),
             .tree_state = .init(gpa),
             .worker_context = .{
                 .io = io,
@@ -258,6 +281,7 @@ pub const App = struct {
         self.resume_folded_projects.deinit(self.gpa);
         self.tree_state.deinit();
         self.cancelDiffRefresh();
+        if (self.diff_cache) |raw| self.gpa.free(raw);
         self.models.deinit(self.gpa);
         codex.freeApiKeyMap(self.gpa, &self.provider_api_keys);
         self.provider_key_input.deinit(self.gpa);
@@ -279,8 +303,10 @@ pub const App = struct {
         self.at_results.deinit(self.gpa);
         self.turn_view.deinit(self.gpa);
         self.thread.deinit(self.gpa);
+        self.diff.deinit(self.gpa);
         self.input.deinit();
         self.palette_input.deinit();
+        self.comment_input.deinit();
         self.* = undefined;
     }
 
@@ -502,6 +528,9 @@ pub const App = struct {
             .session_picker => self.handleSessionPickerKey(key),
             .tree_picker => self.handleTreePickerKey(key),
             .command => self.handleCommandMenuKey(key),
+            // The diff viewer owns its keys directly in `captureEvent`; nothing
+            // reaches the generic dispatch.
+            .diff_viewer => false,
             .normal => self.handleThreadKey(key),
         };
     }
@@ -782,6 +811,7 @@ pub const App = struct {
                     .timeline => self.openTimelineSelector() catch |err| try self.reportSessionSwitchError(err),
                     .connect => try self.openProviderPicker(),
                     .model => self.openModelPicker() catch |err| try self.reportConnectionError(err),
+                    .diff => self.openDiffViewer() catch |err| try self.reportDiffError(err),
                 }
             }
             return true;
@@ -835,6 +865,74 @@ pub const App = struct {
         self.mode = .tree_picker;
         self.clearInput();
         try self.reloadTreeNodes();
+    }
+
+    /// Enter the full-screen diff viewer. Warm path: parse the cached diff
+    /// instantly. Cold path: navigate immediately and show "Loading diff…" while
+    /// a background refresh fetches it (never blocks on git).
+    fn openDiffViewer(self: *App) !void {
+        if (self.runtime == null) return error.NoWorkingDirectory;
+        self.enterDiffMode();
+
+        if (self.diff_cache) |raw| {
+            self.diff_loading = false;
+            var state = try diff_viewer.fromRaw(self.gpa, raw);
+            if (state.isEmpty()) {
+                state.deinit(self.gpa);
+                self.mode = .normal;
+                _ = try self.thread.append(self.gpa, .agent, "agent", "No changes to review.");
+                return;
+            }
+            self.diff.deinit(self.gpa);
+            self.diff = state;
+            return;
+        }
+
+        // Cold start: show the loading state and kick (or ride) a refresh.
+        self.diff.deinit(self.gpa);
+        self.diff = .{};
+        self.diff_loading = true;
+        if (self.diff_refresh_future == null) try self.scheduleDiffRefresh();
+    }
+
+    fn enterDiffMode(self: *App) void {
+        self.mode = .diff_viewer;
+        // The diff viewer never draws the thread, so the black-hole visibility
+        // (recomputed only there) would stay stuck true and drive a pointless
+        // continuous redraw/tick loop. Park it off while in the viewer.
+        self.blackhole_visible = false;
+        self.clearInput();
+        self.clearPaletteInput();
+        self.comment_input.clearRetainingCapacity();
+    }
+
+    fn reportDiffError(self: *App, err: anyerror) !void {
+        const message = try std.fmt.allocPrint(self.gpa, "Couldn't open diff: {s}", .{@errorName(err)});
+        defer self.gpa.free(message);
+        _ = try self.thread.append(self.gpa, .agent, "agent", message);
+        self.mode = .normal;
+        self.clearInput();
+        self.clearPaletteInput();
+    }
+
+    /// Leave the diff viewer. When `send` is set, composed review comments (if
+    /// any) are stuffed into the main input so the caller can run them through
+    /// the normal submit path; an Esc-style exit discards them. Returns true when
+    /// there is text queued to submit.
+    fn closeDiffViewer(self: *App, send: bool) !bool {
+        const composed = if (send) try self.diff.composeMessage(self.gpa) else null;
+        self.diff.deinit(self.gpa);
+        self.diff_loading = false;
+        self.mode = .normal;
+        self.clearInput();
+        self.clearPaletteInput();
+        self.comment_input.clearRetainingCapacity();
+        if (composed) |message| {
+            defer self.gpa.free(message);
+            try self.input.insertSliceAtCursor(message);
+            return true;
+        }
+        return false;
     }
 
     fn openModelPicker(self: *App) !void {
@@ -1894,6 +1992,15 @@ pub const App = struct {
         return out;
     }
 
+    fn peekCommentInput(self: *App) ![]u8 {
+        const left = self.comment_input.buf.firstHalf();
+        const right = self.comment_input.buf.secondHalf();
+        const out = try self.gpa.alloc(u8, left.len + right.len);
+        @memcpy(out[0..left.len], left);
+        @memcpy(out[left.len..], right);
+        return out;
+    }
+
     fn reportSessionSwitchError(self: *App, err: anyerror) !void {
         self.mode = .normal;
         self.clearInput();
@@ -2134,7 +2241,7 @@ pub const App = struct {
     fn cancelDiffRefresh(self: *App) void {
         if (self.diff_refresh_future) |*future| {
             var outcome = future.cancel(self.io);
-            outcome.deinit();
+            outcome.deinit(self.gpa);
             self.diff_refresh_future = null;
         }
         self.diff_refresh_again = false;
@@ -2148,15 +2255,51 @@ pub const App = struct {
         var outcome = self.diff_refresh_future.?.await(self.io);
         self.diff_refresh_future = null;
         self.diff_refresh_done.store(false, .release);
-        defer outcome.deinit();
+        defer outcome.deinit(self.gpa);
 
         var visible_change = false;
         switch (outcome) {
-            .ready => |counts| visible_change = self.installDiffCounts(counts),
-            .failed => {},
+            .ready => |raw| {
+                // Take ownership of the diff text into the cache; blank the local
+                // copy so the deferred deinit doesn't free what we kept.
+                if (self.diff_cache) |old| self.gpa.free(old);
+                self.diff_cache = raw;
+                outcome = .failed;
+                if (self.installDiffCounts(countDiff(self.diff_cache.?))) visible_change = true;
+                // A viewer opened on a cold cache is waiting on exactly this.
+                if (self.diff_loading) {
+                    try self.populateDiffFromCache();
+                    visible_change = true;
+                }
+            },
+            .failed => {
+                if (self.diff_loading) {
+                    self.diff_loading = false;
+                    self.mode = .normal;
+                    _ = try self.thread.append(self.gpa, .agent, "agent", "Couldn't load diff.");
+                    visible_change = true;
+                }
+            },
         }
         if (self.diff_refresh_again) try self.scheduleDiffRefresh();
         return visible_change;
+    }
+
+    /// Build the viewer's state from the cached diff (parse only — no git). Drops
+    /// back to normal mode with a notice when the diff turned out empty.
+    fn populateDiffFromCache(self: *App) !void {
+        self.diff_loading = false;
+        const raw = self.diff_cache orelse return;
+        var state = try diff_viewer.fromRaw(self.gpa, raw);
+        if (state.isEmpty()) {
+            state.deinit(self.gpa);
+            self.mode = .normal;
+            self.clearInput();
+            _ = try self.thread.append(self.gpa, .agent, "agent", "No changes to review.");
+            return;
+        }
+        self.diff.deinit(self.gpa);
+        self.diff = state;
     }
 
     fn jumpThreadToBottom(self: *App) void {
@@ -2379,6 +2522,28 @@ fn parseDiffCounts(output: []const u8) DiffCounts {
     return counts;
 }
 
+/// Count additions/deletions straight from a unified diff by tallying `+`/`-`
+/// body lines (excluding the `+++`/`---` file headers). A cheap, allocation-free
+/// scan used on the cached full diff.
+fn countDiff(raw: []const u8) DiffCounts {
+    var counts: DiffCounts = .{};
+    var line_start: usize = 0;
+    while (line_start <= raw.len) {
+        const line_end = std.mem.findScalarPos(u8, raw, line_start, '\n') orelse raw.len;
+        const line = raw[line_start..line_end];
+        if (line.len > 0) {
+            if (line[0] == '+' and !std.mem.startsWith(u8, line, "+++")) {
+                counts.additions = saturatingAdd(counts.additions, 1);
+            } else if (line[0] == '-' and !std.mem.startsWith(u8, line, "---")) {
+                counts.deletions = saturatingAdd(counts.deletions, 1);
+            }
+        }
+        if (line_end == raw.len) break;
+        line_start = line_end + 1;
+    }
+    return counts;
+}
+
 fn parseDiffCountLine(counts: *DiffCounts, line: []const u8) void {
     if (line.len == 0) return;
     const first_tab = std.mem.indexOfScalar(u8, line, '\t') orelse return;
@@ -2445,6 +2610,9 @@ const RootWidget = struct {
             .init => {
                 try ctx.requestFocus(self.app.input.widget());
                 try self.ensureTick(ctx);
+                // Warm the diff cache in the background so the first `/diff`
+                // opens instantly instead of cold-loading.
+                self.app.scheduleDiffRefresh() catch {};
                 ctx.consumeAndRedraw();
             },
             .mouse => |mouse| {
@@ -2456,6 +2624,12 @@ const RootWidget = struct {
             },
             .key_press => |key| {
                 try self.ensureTick(ctx);
+                // The diff viewer is a self-contained full-screen mode: it owns
+                // every key (including Esc) so it can manage its own sub-states.
+                if (self.app.mode == .diff_viewer) {
+                    try self.handleDiffViewerEvent(ctx, key);
+                    return;
+                }
                 if (key.matches(vaxis.Key.escape, .{})) {
                     if (self.app.at_active) {
                         self.app.closeAtSearch();
@@ -2669,7 +2843,9 @@ const RootWidget = struct {
     fn submit(self: *RootWidget, ctx: *vxfw.EventContext) !void {
         if (try self.app.submitMode()) {
             try self.syncFocus(ctx);
-            if (self.app.models.model_load_future != null) try self.ensureTick(ctx);
+            // Keep the tick alive to drain an async model load or diff refresh
+            // (e.g. the cold-start "Loading diff…" the /diff command kicked off).
+            if (self.app.models.model_load_future != null or self.app.diff_refresh_future != null) try self.ensureTick(ctx);
             ctx.consumeAndRedraw();
             return;
         }
@@ -2690,6 +2866,14 @@ const RootWidget = struct {
         }
         const target = switch (self.app.mode) {
             .command, .session_picker, .provider_picker, .model_picker, .tree_picker => self.app.palette_input.widget(),
+            // The diff viewer routes focus by sub-state: the comment editor and
+            // the file-search field each host a drawn TextField; while browsing
+            // the root widget owns every key.
+            .diff_viewer => switch (self.app.diff.sub) {
+                .commenting => self.app.comment_input.widget(),
+                .file_search => self.app.palette_input.widget(),
+                .browse => self.widget(),
+            },
             .normal => self.app.input.widget(),
         };
         try ctx.requestFocus(target);
@@ -2729,6 +2913,9 @@ const RootWidget = struct {
 
     fn drawRoot(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *RootWidget = @ptrCast(@alignCast(ptr));
+        // The diff viewer replaces the whole screen (thread + input + overlay),
+        // so it short-circuits the normal layout entirely.
+        if (self.app.mode == .diff_viewer) return self.drawDiffViewer(ctx);
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
         const loading_visible = self.app.turn_view.awaitingOutput();
@@ -2815,7 +3002,610 @@ const RootWidget = struct {
             .children = children,
         };
     }
+
+    // --- Diff viewer ------------------------------------------------------
+
+    fn handleDiffViewerEvent(self: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+        switch (self.app.diff.sub) {
+            .browse => try self.handleDiffBrowseKey(ctx, key),
+            .file_search => try self.handleDiffSearchKey(ctx, key),
+            .commenting => try self.handleDiffCommentKey(ctx, key),
+        }
+    }
+
+    fn handleDiffBrowseKey(self: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+        const app = self.app;
+        // Esc / Ctrl+C exit cleanly (comments discarded); Ctrl+S exits and sends.
+        if (key.matches(vaxis.Key.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
+            try self.closeDiff(ctx, false);
+            return;
+        }
+        if (key.matches('s', .{ .ctrl = true })) {
+            try self.closeDiff(ctx, true);
+            return;
+        }
+        // Nothing to navigate or comment on while the diff is still loading (or
+        // genuinely empty) — swallow everything except the exit keys above.
+        if (app.diff.lines.items.len == 0) {
+            ctx.consumeEvent();
+            return;
+        }
+        if (key.matches('w', .{ .ctrl = true })) {
+            // Edit the comment on the exact selected range if one exists, else new.
+            const prefill = app.diff.beginComment();
+            app.comment_input.clearRetainingCapacity();
+            if (prefill.len > 0) try app.comment_input.insertSliceAtCursor(prefill);
+            try self.syncFocus(ctx);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (key.matches('e', .{ .ctrl = true })) {
+            if (app.diff.editActiveComment()) |prefill| {
+                app.comment_input.clearRetainingCapacity();
+                if (prefill.len > 0) try app.comment_input.insertSliceAtCursor(prefill);
+                try self.syncFocus(ctx);
+                ctx.consumeAndRedraw();
+                return;
+            }
+            ctx.consumeEvent();
+            return;
+        }
+        if (key.matches('d', .{ .ctrl = true })) {
+            if (app.diff.deleteActiveComment(app.gpa)) ctx.consumeAndRedraw() else ctx.consumeEvent();
+            return;
+        }
+        if (key.matches('p', .{ .ctrl = true })) {
+            app.diff.sub = .file_search;
+            app.diff.search_sel = 0;
+            app.clearPaletteInput();
+            try app.diff.filterFiles(app.gpa, "");
+            try self.syncFocus(ctx);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        // File jumps via Ctrl+↑/↓ (Ctrl+Shift+arrows aren't reported reliably).
+        if (key.matches(vaxis.Key.up, .{ .ctrl = true })) {
+            app.diff.jumpFile(-1);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (key.matches(vaxis.Key.down, .{ .ctrl = true })) {
+            app.diff.jumpFile(1);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (key.matches(vaxis.Key.up, .{ .shift = true })) {
+            app.diff.extendSelection(-1);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (key.matches(vaxis.Key.down, .{ .shift = true })) {
+            app.diff.extendSelection(1);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (key.matches(vaxis.Key.up, .{})) {
+            app.diff.moveCursor(-1);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (key.matches(vaxis.Key.down, .{})) {
+            app.diff.moveCursor(1);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        const page: i32 = @intCast(@max(@as(u16, 1), app.diff.viewport_rows));
+        if (key.matches(vaxis.Key.page_up, .{})) {
+            app.diff.moveCursor(-page);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (key.matches(vaxis.Key.page_down, .{})) {
+            app.diff.moveCursor(page);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        // Swallow anything else so stray keys don't leak to a focused widget.
+        ctx.consumeEvent();
+    }
+
+    fn handleDiffSearchKey(self: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+        const app = self.app;
+        if (key.matches(vaxis.Key.escape, .{})) {
+            app.diff.sub = .browse;
+            try self.syncFocus(ctx);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (key.matches(vaxis.Key.enter, .{})) {
+            const matches = app.diff.search_matches.items;
+            if (matches.len > 0) app.diff.jumpToFile(matches[@min(app.diff.search_sel, matches.len - 1)]);
+            app.diff.sub = .browse;
+            try self.syncFocus(ctx);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (key.matches(vaxis.Key.up, .{})) {
+            app.diff.search_sel = previousIndex(app.diff.search_sel, @intCast(app.diff.search_matches.items.len));
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (key.matches(vaxis.Key.down, .{})) {
+            app.diff.search_sel = nextIndex(app.diff.search_sel, @intCast(app.diff.search_matches.items.len));
+            ctx.consumeAndRedraw();
+            return;
+        }
+        // Typed text / backspace bubbles to the focused palette input; its
+        // onChange (paletteInputChanged) refilters the match list.
+    }
+
+    fn handleDiffCommentKey(self: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+        const app = self.app;
+        if (key.matches(vaxis.Key.escape, .{})) {
+            app.diff.sub = .browse;
+            app.diff.sel_anchor = null;
+            app.comment_input.clearRetainingCapacity();
+            try self.syncFocus(ctx);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (key.matches('s', .{ .ctrl = true }) or key.matches(vaxis.Key.enter, .{})) {
+            const draft = try app.peekCommentInput();
+            defer app.gpa.free(draft);
+            _ = try app.diff.saveComment(app.gpa, draft);
+            app.comment_input.clearRetainingCapacity();
+            try self.syncFocus(ctx);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        // Typed text / backspace handled by the focused comment input.
+    }
+
+    fn closeDiff(self: *RootWidget, ctx: *vxfw.EventContext, send: bool) !void {
+        const has_comments = try self.app.closeDiffViewer(send);
+        try self.syncFocus(ctx);
+        if (has_comments) {
+            if (try self.app.beginSubmit()) try self.app.startTurn();
+            try self.ensureTick(ctx);
+        }
+        ctx.consumeAndRedraw();
+    }
+
+    fn drawDiffViewer(self: *RootWidget, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const app = self.app;
+        const w = ctx.max.width orelse ctx.min.width;
+        const h = ctx.max.height orelse ctx.min.height;
+        var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = w, .height = h });
+        if (w == 0 or h == 0) return surface;
+
+        var adds: u32 = 0;
+        var dels: u32 = 0;
+        for (app.diff.files.items) |file| {
+            adds += file.adds;
+            dels += file.dels;
+        }
+        // Title: "Diff · N files  +A −D" — counts colored green/red, no shortcuts.
+        const prefix = std.fmt.allocPrint(ctx.arena, "Diff · {d} files  ", .{app.diff.files.items.len}) catch "Diff  ";
+        const add_str = std.fmt.allocPrint(ctx.arena, "+{d}", .{adds}) catch "+0";
+        const del_str = std.fmt.allocPrint(ctx.arena, "−{d}", .{dels}) catch "−0";
+        panel.lineStyledAt(&surface, 0, prefix, ctx, 1, StylePalette.thinking_body) catch {};
+        const add_col = 1 + @as(u16, @intCast(ctx.stringWidth(prefix)));
+        panel.lineStyledAt(&surface, 0, add_str, ctx, add_col, StylePalette.tool) catch {};
+        const del_col = add_col + @as(u16, @intCast(ctx.stringWidth(add_str))) + 1;
+        panel.lineStyledAt(&surface, 0, del_str, ctx, del_col, StylePalette.tool_failed) catch {};
+
+        const editing = app.diff.sub == .commenting;
+        const footer_h: u16 = if (editing) @min(h -| 1, @as(u16, 3)) else @min(h -| 1, @as(u16, 2));
+        const body_top: u16 = 1;
+        const body_h: u16 = h -| body_top -| footer_h;
+        app.diff.viewport_rows = body_h;
+
+        var subs: [3]vxfw.SubSurface = undefined;
+        var n: usize = 0;
+
+        if (app.diff_loading) {
+            // Cold start: navigated in, diff still fetching in the background.
+            panel.lineStyledAt(&surface, body_top + body_h / 2, "Loading diff…", ctx, 2, StylePalette.model_status) catch {};
+        } else {
+            var body: DiffBodyWidget = .{ .app = app };
+            subs[n] = .{
+                .origin = .{ .row = body_top, .col = 0 },
+                .z_index = 0,
+                .surface = try body.widget().draw(ctx.withConstraints(
+                    .{ .width = w, .height = body_h },
+                    .{ .width = w, .height = body_h },
+                )),
+            };
+            n += 1;
+        }
+
+        if (editing) {
+            var editor: DiffCommentEditor = .{ .app = app };
+            subs[n] = .{
+                .origin = .{ .row = h -| footer_h, .col = 0 },
+                .z_index = 1,
+                .surface = try editor.widget().draw(ctx.withConstraints(
+                    .{ .width = w, .height = footer_h },
+                    .{ .width = w, .height = footer_h },
+                )),
+            };
+            n += 1;
+        } else {
+            panel.lineStyledAt(&surface, h -| 2, diff_hint_line1, ctx, 1, StylePalette.thinking_body) catch {};
+            panel.lineStyledAt(&surface, h -| 1, diff_hint_line2, ctx, 1, StylePalette.thinking_body) catch {};
+        }
+
+        if (app.diff.sub == .file_search) {
+            const pw: u16 = @min(@as(u16, 72), w);
+            // Border (2) + search row (1) + separator (1) + up to 10 result rows.
+            const result_rows: u16 = @intCast(@max(@as(usize, 1), @min(app.diff.search_matches.items.len, 10)));
+            const ph: u16 = @min(h, result_rows + 4);
+            // Center the search popup on screen.
+            var search: DiffSearchWidget = .{ .app = app };
+            subs[n] = .{
+                .origin = .{ .row = (h -| ph) / 2, .col = (w -| pw) / 2 },
+                .z_index = 2,
+                .surface = try search.widget().draw(ctx.withConstraints(
+                    .{ .width = pw, .height = ph },
+                    .{ .width = pw, .height = ph },
+                )),
+            };
+            n += 1;
+        }
+
+        surface.children = try ctx.arena.dupe(vxfw.SubSurface, subs[0..n]);
+        return surface;
+    }
 };
+
+const diff_hint_line1 = "↑↓ Move" ++ symbols.separator_dot_padded ++ "⇧↑↓ Select lines" ++ symbols.separator_dot_padded ++ "^↑↓ Jump file" ++ symbols.separator_dot_padded ++ "^P Find file";
+const diff_hint_line2 = "^W Comment" ++ symbols.separator_dot_padded ++ "^E Edit" ++ symbols.separator_dot_padded ++ "^D Delete" ++ symbols.separator_dot_padded ++ "^S Save & send" ++ symbols.separator_dot_padded ++ "Esc Exit";
+
+// Left-margin columns: [0..3] line number, [4] diff sign, [5] comment bracket,
+// [6..] content.
+const diff_content_col: u16 = 6;
+const diff_bracket_col: u16 = 5;
+
+const DiffBodyWidget = struct {
+    app: *App,
+
+    fn widget(self: *DiffBodyWidget) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = draw };
+    }
+
+    fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *DiffBodyWidget = @ptrCast(@alignCast(ptr));
+        const app = self.app;
+        const w = ctx.max.width orelse 0;
+        const h = ctx.max.height orelse 0;
+        var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = w, .height = h });
+        if (w == 0 or h == 0) return surface;
+
+        const lines = app.diff.lines.items;
+        const comments = app.diff.comments.items;
+
+        // Display rows = diff lines interleaved with one preview row per comment
+        // (inserted after the comment's last line). We never materialize the full
+        // list: only on-screen rows allocate, so a huge diff stays bounded.
+        const total = lines.len + comments.len;
+        var cursor_display = app.diff.cursor;
+        for (comments) |comment| {
+            if (comment.row_end < app.diff.cursor) cursor_display += 1;
+        }
+
+        var scroll = app.diff.scroll;
+        if (cursor_display < scroll) scroll = cursor_display;
+        if (cursor_display >= scroll + h) scroll = cursor_display + 1 - h;
+        if (total > h) {
+            if (scroll > total - h) scroll = total - h;
+        } else {
+            scroll = 0;
+        }
+        app.diff.scroll = scroll;
+
+        const sel = app.diff.selection();
+        const active = app.diff.activeComment();
+
+        // Walk display rows, drawing only those inside [scroll, scroll + h).
+        var display: usize = 0;
+        var li: usize = 0;
+        while (li < lines.len and display < scroll + h) : (li += 1) {
+            if (display >= scroll) {
+                drawDiffRow(&surface, ctx, app, li, @intCast(display - scroll), li >= sel.start and li <= sel.end, active);
+            }
+            display += 1;
+            for (comments, 0..) |comment, ci| {
+                if (comment.row_end != li) continue;
+                if (display >= scroll and display < scroll + h) {
+                    drawCommentPreview(&surface, ctx, app, ci, @intCast(display - scroll), ci == active);
+                }
+                display += 1;
+            }
+        }
+        return surface;
+    }
+};
+
+fn drawDiffRow(surface: *vxfw.Surface, ctx: vxfw.DrawContext, app: *App, idx: usize, row: u16, highlighted: bool, active: ?usize) void {
+    const line = app.diff.lines.items[idx];
+    switch (line.kind) {
+        .file_header => {
+            if (highlighted) panel.fillRow(surface, row, StylePalette.selected);
+            panel.lineStyledAt(surface, row, line.text, ctx, 0, mergedDiffStyle(StylePalette.diff_file_header, highlighted)) catch {};
+            return;
+        },
+        .hunk_header => {
+            if (highlighted) panel.fillRow(surface, row, StylePalette.selected);
+            drawHunkHeader(surface, ctx, line.text, row, highlighted);
+            return;
+        },
+        .meta => {
+            if (highlighted) panel.fillRow(surface, row, StylePalette.selected);
+            panel.lineStyledAt(surface, row, line.text, ctx, diff_content_col, mergedDiffStyle(StylePalette.diff_hunk, highlighted)) catch {};
+            return;
+        },
+        .added, .removed, .context, .modified => {},
+    }
+
+    // Faint green/red wash for whole added/removed lines; selection gray wins
+    // while the line is in a comment selection.
+    const row_bg: ?vaxis.Style = if (highlighted)
+        StylePalette.selected
+    else switch (line.kind) {
+        .added => StylePalette.diff_added_row,
+        .removed => StylePalette.diff_removed_row,
+        else => null,
+    };
+    if (row_bg) |bg| panel.fillRow(surface, row, bg);
+
+    const fg = switch (line.kind) {
+        .added => StylePalette.tool,
+        .removed => StylePalette.tool_failed,
+        else => StylePalette.thinking_body,
+    };
+    const style = bgMerged(fg, row_bg);
+
+    const number = if (line.kind == .removed) line.old_no else line.new_no;
+    if (number) |value| {
+        const num = std.fmt.allocPrint(ctx.arena, "{d: >4}", .{value}) catch "    ";
+        panel.lineStyledAt(surface, row, num, ctx, 0, bgMerged(StylePalette.diff_gutter, row_bg)) catch {};
+    }
+
+    const sign: []const u8 = switch (line.kind) {
+        .added => "+",
+        .removed => "-",
+        .modified => "~",
+        else => " ",
+    };
+    panel.lineStyledAt(surface, row, sign, ctx, 4, style) catch {};
+
+    if (app.diff.bracketChar(idx)) |glyph| {
+        // Yellow when the active (cursor-selected) comment covers this line, so
+        // the user can see what Ctrl+E / Ctrl+D will act on; orange otherwise.
+        const base_bracket = if (activeCovers(app, active, idx)) StylePalette.diff_bracket_active else StylePalette.diff_bracket;
+        panel.lineStyledAt(surface, row, glyph, ctx, diff_bracket_col, bgMerged(base_bracket, row_bg)) catch {};
+    }
+
+    // A modification renders both sides on one line: common text neutral, the
+    // deleted middle red and the inserted middle green (each with its own faint
+    // wash) — computed lazily for visible rows only, so it stays cheap.
+    if (line.kind == .modified) {
+        const d = diff_viewer.inlineDiff(line.old_text, line.new_text);
+        const neutral = bgMerged(StylePalette.thinking_body, row_bg);
+        var col = diff_content_col;
+        col = writeDiffSegment(surface, ctx, row, col, d.prefix, neutral);
+        col = writeDiffSegment(surface, ctx, row, col, d.old_mid, StylePalette.diff_inline_del);
+        col = writeDiffSegment(surface, ctx, row, col, d.new_mid, StylePalette.diff_inline_add);
+        _ = writeDiffSegment(surface, ctx, row, col, d.suffix, neutral);
+        return;
+    }
+
+    const content = expandTabs(ctx.arena, line.text) catch line.text;
+    panel.lineStyledAt(surface, row, content, ctx, diff_content_col, style) catch {};
+}
+
+/// Render a hunk header (`@@ -a,b +c,d @@`) with the `-` (deletion) range in red
+/// and the `+` (addition) range in green; the `@@` markers stay dim. An empty
+/// side (`-0,0` on a new file, `+0,0` on a deleted one) is dropped — a red
+/// `-0,0` reads like a bug.
+fn drawHunkHeader(surface: *vxfw.Surface, ctx: vxfw.DrawContext, text: []const u8, row: u16, highlighted: bool) void {
+    const bg: ?vaxis.Style = if (highlighted) StylePalette.selected else null;
+    var col: u16 = 1;
+    var wrote = false;
+    var it = std.mem.splitScalar(u8, text, ' ');
+    while (it.next()) |token| {
+        if (token.len == 0) continue;
+        if (std.mem.eql(u8, token, "-0,0") or std.mem.eql(u8, token, "+0,0")) continue;
+        if (wrote) col = writeDiffSegment(surface, ctx, row, col, " ", bgMerged(StylePalette.diff_hunk, bg));
+        wrote = true;
+        const seg_style = switch (token[0]) {
+            '-' => StylePalette.tool_failed,
+            '+' => StylePalette.tool,
+            else => StylePalette.diff_hunk,
+        };
+        col = writeDiffSegment(surface, ctx, row, col, token, bgMerged(seg_style, bg));
+    }
+}
+
+/// Copy `style` with `source`'s background merged in (when present).
+fn bgMerged(style: vaxis.Style, source: ?vaxis.Style) vaxis.Style {
+    var merged = style;
+    if (source) |s| merged.bg = s.bg;
+    return merged;
+}
+
+/// Write one styled segment of an inline-diff line starting at `col`, expanding
+/// tabs, and return the next free column. Stops at the surface edge.
+fn writeDiffSegment(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, col: u16, text: []const u8, style: vaxis.Style) u16 {
+    if (text.len == 0) return col;
+    const expanded = expandTabs(ctx.arena, text) catch text;
+    var c = col;
+    var iter = ctx.graphemeIterator(expanded);
+    while (iter.next()) |grapheme| {
+        if (c + 1 >= surface.size.width) return c;
+        const bytes = grapheme.bytes(expanded);
+        const width: u8 = @intCast(ctx.stringWidth(bytes));
+        if (width == 0) continue;
+        surface.writeCell(c, row, .{ .char = .{ .grapheme = bytes, .width = width }, .style = style });
+        c += width;
+    }
+    return c;
+}
+
+/// True when the active comment exists and covers `idx`.
+fn activeCovers(app: *App, active: ?usize, idx: usize) bool {
+    const active_index = active orelse return false;
+    const comment = app.diff.comments.items[active_index];
+    return idx >= comment.row_start and idx <= comment.row_end;
+}
+
+/// Inline preview row beneath a commented range: the bracket's `└` foot plus a
+/// 💬 and the comment text. The active comment renders yellow with a ▸ marker.
+fn drawCommentPreview(surface: *vxfw.Surface, ctx: vxfw.DrawContext, app: *App, comment_index: usize, row: u16, active: bool) void {
+    const comment = app.diff.comments.items[comment_index];
+    const bracket_style = if (active) StylePalette.diff_bracket_active else StylePalette.diff_bracket;
+    panel.lineStyledAt(surface, row, "└", ctx, diff_bracket_col, bracket_style) catch {};
+    const marker: []const u8 = if (active) "▸ 💬 " else "💬 ";
+    const text = std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ marker, comment.text }) catch comment.text;
+    const text_style = if (active) StylePalette.diff_comment_active else StylePalette.diff_comment;
+    panel.lineStyledAt(surface, row, text, ctx, diff_content_col, text_style) catch {};
+}
+
+fn mergedDiffStyle(style: vaxis.Style, highlighted: bool) vaxis.Style {
+    return tui_style.onSelectionBg(style, highlighted);
+}
+
+/// Expand tabs to four spaces so diff content lines up in the fixed-width body.
+/// Returns the input unchanged when it has no tabs.
+fn expandTabs(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, text, '\t') == null) return text;
+    var list: std.ArrayList(u8) = .empty;
+    for (text) |c| {
+        if (c == '\t') {
+            try list.appendSlice(arena, "    ");
+        } else {
+            try list.append(arena, c);
+        }
+    }
+    return list.items;
+}
+
+const DiffCommentEditor = struct {
+    app: *App,
+
+    fn widget(self: *DiffCommentEditor) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = draw };
+    }
+
+    fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *DiffCommentEditor = @ptrCast(@alignCast(ptr));
+        const app = self.app;
+        const label = app.diff.rangeLabel(ctx.arena, app.diff.comment_anchor) catch "comment";
+        const inner_w: u16 = (ctx.max.width orelse 2) -| 2;
+        var input_box: vxfw.SizedBox = .{ .child = app.comment_input.widget(), .size = .{ .width = inner_w, .height = 1 } };
+        var border: vxfw.Border = .{
+            .child = input_box.widget(),
+            .style = StylePalette.border_label,
+            .labels = &.{.{ .text = label, .alignment = .top_left }},
+        };
+        var surface = try border.widget().draw(ctx);
+        writeBorderLabelRight(&surface, ctx, 0, "^S save · Esc cancel", StylePalette.thinking_body);
+        return surface;
+    }
+};
+
+/// Centered file-search popup: a bordered box with a real search text field
+/// (`palette_input`) on top and the filtered file list below — same shape as the
+/// resume/command pickers, rather than stuffing the query into the border label.
+const DiffSearchWidget = struct {
+    app: *App,
+
+    fn widget(self: *DiffSearchWidget) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = draw };
+    }
+
+    fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *DiffSearchWidget = @ptrCast(@alignCast(ptr));
+        var inner: DiffSearchInner = .{ .app = self.app };
+        var border: vxfw.Border = .{
+            .child = inner.widget(),
+            .style = StylePalette.thinking_body,
+            .labels = &.{.{ .text = "Jump to file", .alignment = .top_left }},
+        };
+        return border.widget().draw(ctx);
+    }
+};
+
+const DiffSearchInner = struct {
+    app: *App,
+
+    fn widget(self: *DiffSearchInner) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = draw };
+    }
+
+    fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *DiffSearchInner = @ptrCast(@alignCast(ptr));
+        const app = self.app;
+        const iw: u16 = ctx.max.width orelse 0;
+        const ih: u16 = ctx.max.height orelse 0;
+        var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = iw, .height = ih });
+        if (iw == 0 or ih == 0) return surface;
+
+        // Separator under the search row.
+        var sep_col: u16 = 0;
+        while (sep_col < iw) : (sep_col += 1) {
+            surface.writeCell(sep_col, 1, .{ .char = .{ .grapheme = "─", .width = 1 }, .style = StylePalette.thinking_body });
+        }
+
+        // Row 0: prompt + the search text field.
+        const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
+        var prompt_text: vxfw.Text = .{ .text = ">", .softwrap = false, .width_basis = .parent };
+        var prompt_box: vxfw.SizedBox = .{ .child = prompt_text.widget(), .size = .{ .width = 2, .height = 1 } };
+        var input_box: vxfw.SizedBox = .{ .child = app.palette_input.widget(), .size = .{ .width = iw -| 2, .height = 1 } };
+        var search_row: vxfw.FlexRow = .{ .children = &.{
+            .{ .widget = prompt_box.widget(), .flex = 0 },
+            .{ .widget = input_box.widget(), .flex = 1 },
+        } };
+        children[0] = .{
+            .origin = .{ .row = 0, .col = 0 },
+            .z_index = 0,
+            .surface = try search_row.widget().draw(ctx.withConstraints(
+                .{ .width = iw, .height = 1 },
+                .{ .width = iw, .height = 1 },
+            )),
+        };
+        surface.children = children;
+
+        // Rows 2..: filtered file list (drawn straight onto the base buffer).
+        const matches = app.diff.search_matches.items;
+        const files = app.diff.files.items;
+        const visible: u16 = ih -| 2;
+        if (matches.len == 0) {
+            panel.lineAt(&surface, 2, "No matching files", ctx, false, 0) catch {};
+            return surface;
+        }
+        const count: u32 = @intCast(matches.len);
+        const first = firstVisibleWindow(app.diff.search_sel, count, visible);
+        var r: u16 = 0;
+        while (r < visible and first + r < count) : (r += 1) {
+            const index = first + r;
+            const selected = index == app.diff.search_sel;
+            const prefix = if (selected) "‣ " else "  ";
+            const text = std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, files[matches[index]].path }) catch files[matches[index]].path;
+            panel.lineAt(&surface, 2 + r, text, ctx, selected, 0) catch {};
+        }
+        return surface;
+    }
+};
+
+/// First visible index so `selection` stays on screen, pinned to the bottom edge
+/// once it scrolls past the fold.
+fn firstVisibleWindow(selection: u32, count: u32, visible: u16) u32 {
+    const v: u32 = visible;
+    if (v == 0 or count <= v) return 0;
+    if (selection < v) return 0;
+    return @min(selection - v + 1, count - v);
+}
 
 fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
     if (!key.matches('/', .{})) return false;
@@ -2823,7 +3613,7 @@ fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
         .normal => app.input.buf.realLength() == 0,
         .session_picker, .model_picker, .tree_picker => app.palette_input.buf.realLength() == 0,
         .provider_picker => app.provider_picker.stage == .list and app.palette_input.buf.realLength() == 0,
-        .command => false,
+        .command, .diff_viewer => false,
     };
 }
 
@@ -2944,7 +3734,7 @@ const ThreadWidget = struct {
     }
 };
 
-const Command = enum { connect, model, new, resume_session, timeline };
+const Command = enum { connect, model, new, resume_session, timeline, diff };
 const CommandEntry = struct { name: []const u8, command: Command };
 const commands = [_]CommandEntry{
     .{ .name = "Connect", .command = .connect },
@@ -2952,6 +3742,7 @@ const commands = [_]CommandEntry{
     .{ .name = "New", .command = .new },
     .{ .name = "Resume", .command = .resume_session },
     .{ .name = "Timeline", .command = .timeline },
+    .{ .name = "Diff", .command = .diff },
 };
 const command_panel_entries = [_]command_panel.Entry{
     .{ .name = "Connect" },
@@ -2959,6 +3750,7 @@ const command_panel_entries = [_]command_panel.Entry{
     .{ .name = "New" },
     .{ .name = "Resume" },
     .{ .name = "Timeline" },
+    .{ .name = "Diff" },
 };
 
 fn overlayLabel(mode: App.Mode) []const u8 {
@@ -2969,6 +3761,7 @@ fn overlayLabel(mode: App.Mode) []const u8 {
         .provider_picker => "Connect to Provider",
         .model_picker => "Select Model",
         .tree_picker => "Session Timeline",
+        .diff_viewer => "",
     };
 }
 
@@ -3052,6 +3845,9 @@ fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []
                 app.models.model_selection = app.firstMatchingModelDisplay(value) orelse 0;
             }
         },
+        .diff_viewer => {
+            if (app.diff.sub == .file_search) try app.diff.filterFiles(app.gpa, value);
+        },
         .provider_picker, .normal => {},
     }
     ctx.consumeAndRedraw();
@@ -3067,6 +3863,7 @@ fn overlaySize(mode: App.Mode) OverlaySize {
         .session_picker => .{ .width = 80, .height = 16 },
         .model_picker => .{ .width = 90, .height = 16 },
         .tree_picker => .{ .width = 90, .height = 20 },
+        .diff_viewer => .{ .width = 0, .height = 0 },
     };
 }
 
@@ -3274,7 +4071,9 @@ const OverlayInner = struct {
             .provider_picker => drawProviderContent(app, ctx),
             .model_picker => drawModelContent(app, ctx),
             .tree_picker => drawTreeContent(app, ctx),
-            .normal => unreachable,
+            // The diff viewer is full-screen — `drawRoot` returns before the
+            // overlay path, so this is never reached.
+            .normal, .diff_viewer => unreachable,
         };
     }
 
@@ -3388,6 +4187,7 @@ fn inputHintText(app: *const App) []const u8 {
         .provider_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Actions" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .model_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Column" ++ symbols.separator_dot_padded ++ "[TAB] Toggle Effort/Scope" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .tree_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Filter" ++ symbols.separator_dot_padded ++ "[TAB] Fold" ++ symbols.separator_dot_padded ++ "[ENTER] Switch" ++ symbols.separator_dot_padded ++ "[ESC] Back",
+        .diff_viewer => "",
         .normal => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[SHIFT] ↓ Jump to Bottom" ++ symbols.separator_dot_padded ++ "[TAB] Expand",
     };
 }
