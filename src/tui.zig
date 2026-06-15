@@ -281,6 +281,9 @@ pub const App = struct {
         self.resume_folded_projects.deinit(self.gpa);
         self.tree_state.deinit();
         self.cancelDiffRefresh();
+        // Non-empty labels are always heap-allocated by `loadGitLabel`; the
+        // empty default is a literal, so guard on length before freeing.
+        if (self.git_label.len > 0) self.gpa.free(self.git_label);
         if (self.diff_cache) |raw| self.gpa.free(raw);
         self.models.deinit(self.gpa);
         codex.freeApiKeyMap(self.gpa, &self.provider_api_keys);
@@ -382,10 +385,9 @@ pub const App = struct {
         try self.appendSkillInvocationsToThread(prompt);
         self.turn_view.awaitModel();
         // The worker expands `@`-mentions (reading files / images) off the UI
-        // thread; stash the raw text for `startTurn` to hand over. Owned by
-        // `worker_context.gpa` — the worker frees it with that allocator, which
-        // differs from `self.gpa` (an arena), so allocating it here with the
-        // wrong allocator would crash on free.
+        // thread; stash the raw text for `startTurn` to hand over. The worker
+        // owns and frees it, so it must be allocated with the worker's
+        // allocator (`worker_context.gpa`), not `self.gpa`.
         self.pending_prompt = try self.worker_context.gpa.dupe(u8, prompt);
         self.turn.submit();
         return true;
@@ -2474,7 +2476,11 @@ pub fn run(
     runtime: *runtime_mod.AgentRuntime,
     config: config_mod.Config,
 ) !void {
-    const gpa = init.arena.allocator();
+    // A real freeing allocator, not `init.arena` — the TUI runs for the whole
+    // session and streams unbounded content, so arena-backed allocations (which
+    // are never reclaimed) OOM over time. Must match `tui_gpa` in root.zig since
+    // `runtime`/`cached_config` cross the seam and are freed in `App.deinit`.
+    const gpa = std.heap.smp_allocator;
     var tty_buffer: [8192]u8 = undefined;
     var fw_app = try vxfw.App.init(init.io, gpa, init.environ_map, &tty_buffer);
     defer fw_app.deinit();

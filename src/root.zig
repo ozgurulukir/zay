@@ -38,7 +38,13 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     defer gpa.free(home_dir);
 
     var load_result = try config.load(gpa, init.io, cwd, home_dir, init.environ_map);
-    const tui_gpa = init.arena.allocator();
+    // The TUI is long-running and streams unbounded content, so it must use a
+    // real freeing allocator — an arena never reclaims, and `Thread`'s
+    // streaming-body `realloc` degrades to O(N²) abandoned buffers on one (see
+    // `appendOwned` in thread.zig). `smp_allocator` is a thread-safe global
+    // singleton, so this matches `App.gpa` (tui.zig) exactly — required because
+    // `agent_runtime`/`tui_config` are allocated here and freed in `App.deinit`.
+    const tui_gpa = std.heap.smp_allocator;
     const tui_config = try load_result.config.cloneForTui(tui_gpa);
 
     const runtime_gpa = std.heap.smp_allocator;
