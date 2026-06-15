@@ -3184,25 +3184,9 @@ const RootWidget = struct {
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = w, .height = h });
         if (w == 0 or h == 0) return surface;
 
-        var adds: u32 = 0;
-        var dels: u32 = 0;
-        for (app.diff.files.items) |file| {
-            adds += file.adds;
-            dels += file.dels;
-        }
-        // Title: "Diff · N files  +A −D" — counts colored green/red, no shortcuts.
-        const prefix = std.fmt.allocPrint(ctx.arena, "Diff · {d} files  ", .{app.diff.files.items.len}) catch "Diff  ";
-        const add_str = std.fmt.allocPrint(ctx.arena, "+{d}", .{adds}) catch "+0";
-        const del_str = std.fmt.allocPrint(ctx.arena, "−{d}", .{dels}) catch "−0";
-        panel.lineStyledAt(&surface, 0, prefix, ctx, 1, StylePalette.thinking_body) catch {};
-        const add_col = 1 + @as(u16, @intCast(ctx.stringWidth(prefix)));
-        panel.lineStyledAt(&surface, 0, add_str, ctx, add_col, StylePalette.tool) catch {};
-        const del_col = add_col + @as(u16, @intCast(ctx.stringWidth(add_str))) + 1;
-        panel.lineStyledAt(&surface, 0, del_str, ctx, del_col, StylePalette.tool_failed) catch {};
-
         const editing = app.diff.sub == .commenting;
         const footer_h: u16 = if (editing) @min(h -| 1, @as(u16, 3)) else @min(h -| 1, @as(u16, 2));
-        const body_top: u16 = 1;
+        const body_top: u16 = 0;
         const body_h: u16 = h -| body_top -| footer_h;
         app.diff.viewport_rows = body_h;
 
