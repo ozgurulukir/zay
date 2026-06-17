@@ -290,6 +290,24 @@ pub const Session = struct {
         return null;
     }
 
+    /// The change-id of the earliest checkpoint anywhere in the session (across
+    /// branches). Its parent is the session's baseline code state — used to
+    /// restore the working copy when navigating to a node that precedes every
+    /// checkpoint. Caller owns the returned string.
+    pub fn firstCheckpointChange(self: *Session, gpa: std.mem.Allocator) Error!?[]u8 {
+        const records = try self.entries(gpa); // oldest-first by creation time
+        defer {
+            for (records) |*record| record.deinit(gpa);
+            gpa.free(records);
+        }
+        for (records) |record| {
+            if (std.mem.eql(u8, record.kind, "checkpoint")) {
+                return try checkpointChangeId(gpa, record.payload_json);
+            }
+        }
+        return null;
+    }
+
     /// Project the active branch into the message list the model sees. The
     /// durable tree is the source of truth; this is the derived view. When the
     /// branch carries a compaction boundary, the summarized prefix is replaced
@@ -604,6 +622,13 @@ pub const SessionWriter = struct {
         self.quiesce();
         defer self.restart() catch {};
         return self.session.checkpointHead(gpa);
+    }
+
+    /// Race-free `Session.firstCheckpointChange`.
+    pub fn firstCheckpointChange(self: *SessionWriter, gpa: std.mem.Allocator) Error!?[]u8 {
+        self.quiesce();
+        defer self.restart() catch {};
+        return self.session.firstCheckpointChange(gpa);
     }
 
     /// Load the whole session tree, race-free. Stops the background writer so

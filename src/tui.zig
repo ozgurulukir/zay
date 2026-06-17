@@ -1827,12 +1827,37 @@ pub const App = struct {
     }
 
     /// Switch the session leaf to `entry_id`, then rehydrate the agent's
-    /// conversation and the display transcript from the new branch. Refused mid-turn.
+    /// conversation, the display transcript, AND the working copy from the new
+    /// branch. Refused mid-turn.
     fn navigateToEntry(self: *App, entry_id: []const u8) !void {
         if (self.thread.turn.isActive()) return error.InFlightTurn;
-        try self.liveRuntime().?.session_writer.navigate(entry_id);
-        try self.liveRuntime().?.reloadMessages();
+        const rt = self.liveRuntime() orelse return error.NoActiveRuntime;
+        try rt.session_writer.navigate(entry_id);
+        try rt.reloadMessages();
         try self.rebuildTranscriptFromAgent();
+        try self.restoreCheckpointForBranch(rt);
+    }
+
+    /// Restore the working copy to the code state of the now-active timeline
+    /// branch: the nearest checkpoint at/above the new leaf, or — when the node
+    /// precedes every checkpoint — the baseline (the first checkpoint's parent).
+    /// Best-effort: jj absent, no checkpoints, or a jj failure leaves files as-is.
+    fn restoreCheckpointForBranch(self: *App, rt: *runtime_mod.AgentRuntime) !void {
+        if (!jj.isAvailable(self.gpa, self.io)) return;
+        if (try rt.session_writer.checkpointHead(self.gpa)) |head| {
+            defer self.gpa.free(head);
+            const change = jj.ChangeId.parse(head) catch return;
+            jj.newOnTop(self.gpa, self.io, rt.cwd, change) catch {};
+            return;
+        }
+        if (try rt.session_writer.firstCheckpointChange(self.gpa)) |first| {
+            defer self.gpa.free(first);
+            // `<change>-` is the change's parent in jj revset syntax: the state
+            // before the first file-changing turn.
+            const revset = try std.fmt.allocPrint(self.gpa, "{s}-", .{first});
+            defer self.gpa.free(revset);
+            jj.newOnRevset(self.gpa, self.io, rt.cwd, revset) catch {};
+        }
     }
 
     fn clearInput(self: *App) void {

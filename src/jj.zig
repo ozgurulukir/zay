@@ -351,12 +351,19 @@ pub fn rangeHasConflicts(gpa: std.mem.Allocator, io: std.Io, repo_dir: []const u
     return std.mem.indexOfScalar(u8, out.stdout, 'x') != null;
 }
 
-/// Put a fresh working-copy commit on top of `rev` in `dir` — advances the
-/// primary lane onto freshly-landed work so its tree reflects the merge.
-pub fn newOnTop(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, rev: ChangeId) CmdError!void {
-    var out = try run(gpa, io, dir, &.{ "new", rev.slice() });
+/// Put a fresh working-copy commit on top of the revision named by `revset`,
+/// updating the on-disk files to that revision's tree. Used to advance the
+/// primary onto landed work, and to restore a lane's working copy when timeline
+/// navigation jumps to another branch's code state.
+pub fn newOnRevset(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, revset: []const u8) CmdError!void {
+    var out = try run(gpa, io, dir, &.{ "new", revset });
     defer out.deinit(gpa);
     if (out.code != 0) return error.JjCommandFailed;
+}
+
+/// `newOnRevset` for a concrete change-id.
+pub fn newOnTop(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, rev: ChangeId) CmdError!void {
+    return newOnRevset(gpa, io, dir, rev.slice());
 }
 
 /// Undo the last jj operation — reverts a rebase that produced conflicts so a
