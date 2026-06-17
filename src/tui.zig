@@ -379,6 +379,7 @@ pub const App = struct {
         self.resetTurnState();
         self.thread.worker_context.?.resetCancel();
         _ = try self.thread.transcript.append(self.gpa, .user, "you", prompt);
+        try self.setLaneTitleIfUnset(prompt);
         try self.appendSkillInvocationsToTranscript(prompt);
         self.thread.turn_view.awaitModel();
         // The worker expands `@`-mentions (reading files / images) off the UI
@@ -388,6 +389,25 @@ pub const App = struct {
         self.thread.pending_prompt = try self.thread.worker_context.?.gpa.dupe(u8, prompt);
         self.thread.turn.submit();
         return true;
+    }
+
+    /// Label the lane by its first user prompt (one line, truncated) so split
+    /// tiles read as the session, not a generic "lane". Owned; freed in deinit.
+    fn setLaneTitleIfUnset(self: *App, prompt: []const u8) !void {
+        if (self.thread.title != null) return;
+        const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
+        if (trimmed.len == 0) return;
+        const line_end = std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len;
+        const line = std.mem.trim(u8, trimmed[0..line_end], " \t\r");
+        if (line.len == 0) return;
+        const max: usize = 40;
+        if (line.len <= max) {
+            self.thread.title = try self.gpa.dupe(u8, line);
+            return;
+        }
+        var cut: usize = max;
+        while (cut > 0 and (line[cut] & 0xC0) == 0x80) cut -= 1;
+        self.thread.title = try std.fmt.allocPrint(self.gpa, "{s}…", .{line[0..cut]});
     }
 
     fn formatNoProviderMessage(self: *App) ![]u8 {
@@ -725,7 +745,7 @@ pub const App = struct {
             self.thread.auto_scroll = !scrolled and self.selectionIsLastMessage() and !self.selectedMessageIsLong();
             return true;
         }
-        if (key.matches(vaxis.Key.tab, .{ .ctrl = true })) {
+        if (key.matches(vaxis.Key.tab, .{ .shift = true })) {
             self.switchToNextLane();
             return true;
         }
@@ -854,7 +874,7 @@ pub const App = struct {
                     .diff => self.openDiffViewer() catch |err| try self.reportDiffError(err),
                     .parallel => self.createParallelLane() catch |err| try self.reportLaneError(err),
                     .close => self.closeActiveLane() catch |err| try self.reportLaneError(err),
-                    .split => self.toggleSplit(),
+                    .split => self.toggleSplit() catch |err| try self.reportLaneError(err),
                     .merge => self.mergeActiveLane() catch |err| try self.reportLaneError(err),
                 }
             }
@@ -2177,6 +2197,7 @@ pub const App = struct {
 
         // Committed: `threads` owns `lane`, which owns `runtime`/`dest`.
         self.thread = lane;
+        self.split = true; // a new lane implies tiling so both are visible
         self.mode = .normal;
         self.clearInput();
         self.resetTurnState();
@@ -2283,10 +2304,19 @@ pub const App = struct {
     /// Cycle to the next lane (wrapping). No-op with a single lane or mid-turn:
     /// lanes share one worker until per-lane event routing lands, so switching
     /// during a turn would misroute its events.
-    /// Toggle split view (tile all lanes as columns vs. show only the active).
-    fn toggleSplit(self: *App) void {
-        self.split = !self.split;
+    /// Toggle split view. Turning it on with only one lane spawns a second
+    /// (independent) lane first, so there's something to tile.
+    fn toggleSplit(self: *App) !void {
         self.mode = .normal;
+        if (self.split) {
+            self.split = false;
+            return;
+        }
+        if (self.threads.items.len < 2) {
+            try self.createParallelLane(); // sets `split` and switches to the new lane
+            return;
+        }
+        self.split = true;
     }
 
     fn switchToNextLane(self: *App) void {
@@ -3202,7 +3232,10 @@ const RootWidget = struct {
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
         const loading_visible = self.app.thread.turn_view.awaitingOutput();
-        const layout = rootLayout(max_height, false, try self.app.inputTextRows(ctx, max_width -| 4), loading_visible);
+        const split = self.app.split and self.app.threads.items.len > 1;
+        // In split view always reserve the loading row so each column keeps a
+        // fixed height across turns — the spinner appearing must not reflow.
+        const layout = rootLayout(max_height, false, try self.app.inputTextRows(ctx, max_width -| 4), loading_visible or split);
 
         var transcript_view: TranscriptWidget = .{ .app = self.app, .thread = self.app.thread };
         var loading_view: LoadingWidget = .{ .app = self.app };
@@ -3221,9 +3254,8 @@ const RootWidget = struct {
         const overlay_visible = self.app.mode != .normal;
         const at_visible = self.app.at_active and !overlay_visible;
 
-        const split = self.app.split and self.app.threads.items.len > 1;
         var child_count: usize = (if (split) self.app.threads.items.len else 1) + 1;
-        if (layout.loading_height > 0) child_count += 1;
+        if (loading_visible) child_count += 1;
         if (overlay_visible) child_count += 1;
         if (at_visible) child_count += 1;
         const children = try ctx.arena.alloc(vxfw.SubSurface, child_count);
@@ -3251,7 +3283,7 @@ const RootWidget = struct {
             };
             idx += 1;
         }
-        if (layout.loading_height > 0) {
+        if (loading_visible) {
             const loading_ctx = ctx.withConstraints(
                 .{ .width = max_width, .height = layout.loading_height },
                 .{ .width = max_width, .height = layout.loading_height },
@@ -3309,7 +3341,7 @@ const RootWidget = struct {
     /// column's border is undimmed.
     fn drawLaneColumn(self: *RootWidget, ctx: vxfw.DrawContext, lane: *Thread, width: u16, height: u16, active: bool) std.mem.Allocator.Error!vxfw.Surface {
         var transcript_view: TranscriptWidget = .{ .app = self.app, .thread = lane };
-        const title = if (lane.title) |t| t else "lane";
+        const title = if (lane.title) |t| t else "untitled";
         const label_text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ if (active) "● " else "○ ", title });
         var border: vxfw.Border = .{
             .child = transcript_view.widget(),

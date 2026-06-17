@@ -560,6 +560,7 @@ fn rowStyle(kind: session_mod.EntryKind, tool_failed: bool, selected: bool) vaxi
         .user => tui_style.Palette.user,
         .assistant, .assistant_empty => tui_style.Palette.thinking_label,
         .tool => tui_style.Palette.thinking_body,
+        .checkpoint => tui_style.Palette.checkpoint,
         .branch_summary, .session_info, .other => tui_style.Palette.thinking_body,
     };
     return tui_style.onSelectionBg(style, selected);

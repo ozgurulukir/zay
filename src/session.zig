@@ -1083,6 +1083,9 @@ pub const EntryKind = enum {
     tool,
     branch_summary,
     session_info,
+    /// Per-turn code-state checkpoint — internal metadata, hidden from the
+    /// timeline view.
+    checkpoint,
     other,
 };
 
@@ -1115,6 +1118,9 @@ pub fn entrySummary(gpa: std.mem.Allocator, record: EntryRecord) Error!EntrySumm
             }
         }
         return .{ .kind = .session_info, .text = try gpa.dupe(u8, "title") };
+    }
+    if (std.mem.eql(u8, record.kind, "checkpoint")) {
+        return .{ .kind = .checkpoint, .text = try gpa.dupe(u8, "checkpoint") };
     }
     if (!std.mem.eql(u8, record.kind, "message")) {
         return .{ .kind = .other, .text = try gpa.dupe(u8, record.kind) };
