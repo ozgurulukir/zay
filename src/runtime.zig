@@ -80,8 +80,9 @@ pub const AgentRuntime = struct {
         base_system_prompt: []const u8,
         config: config_mod.Config,
         diagnostics: []config_mod.Diagnostic,
+        template: ?*const AgentRuntime,
     ) !void {
-        try target.initSession(gpa, io, cwd, session_dir, home_dir, base_system_prompt, config, diagnostics, null);
+        try target.initSession(gpa, io, cwd, session_dir, home_dir, base_system_prompt, config, diagnostics, null, template);
     }
 
     pub fn initResume(
@@ -95,9 +96,10 @@ pub const AgentRuntime = struct {
         config: config_mod.Config,
         diagnostics: []config_mod.Diagnostic,
         session_id: []const u8,
+        template: ?*const AgentRuntime,
     ) !void {
         assert(session_id.len > 0);
-        try target.initSession(gpa, io, cwd, session_dir, home_dir, base_system_prompt, config, diagnostics, session_id);
+        try target.initSession(gpa, io, cwd, session_dir, home_dir, base_system_prompt, config, diagnostics, session_id, template);
     }
 
     /// `cwd` is where the agent runs tools and loads skills (a lane's workspace);
@@ -114,6 +116,7 @@ pub const AgentRuntime = struct {
         config: config_mod.Config,
         diagnostics: []config_mod.Diagnostic,
         session_id: ?[]const u8,
+        template: ?*const AgentRuntime,
     ) !void {
         assert(cwd.len > 0);
         assert(base_system_prompt.len > 0);
@@ -121,9 +124,12 @@ pub const AgentRuntime = struct {
 
         const owned_base_system_prompt = try gpa.dupe(u8, base_system_prompt);
         errdefer gpa.free(owned_base_system_prompt);
-        const skills = try skill_mod.loadProject(gpa, io, cwd);
+        // A `template` (the primary lane) shares the same project, so clone its
+        // already-loaded skills + assembled system prompt instead of re-scanning
+        // the workspace (which is a checkout of the same repo).
+        const skills = if (template) |t| try skill_mod.cloneAll(gpa, t.skills) else try skill_mod.loadProject(gpa, io, cwd);
         errdefer skill_mod.deinitAll(gpa, skills);
-        const owned_system_prompt = try createSystemPromptWithContext(gpa, io, owned_base_system_prompt, cwd, skills);
+        const owned_system_prompt = if (template) |t| try gpa.dupe(u8, t.system_prompt) else try createSystemPromptWithContext(gpa, io, owned_base_system_prompt, cwd, skills);
         errdefer gpa.free(owned_system_prompt);
 
         target.* = .{

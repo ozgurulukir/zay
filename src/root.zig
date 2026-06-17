@@ -65,6 +65,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
         system_prompt,
         load_result.config,
         load_result.takeDiagnostics(),
+        null, // template: the primary builds its prompt + skills from scratch
     );
     load_result.config.deinit(gpa);
 

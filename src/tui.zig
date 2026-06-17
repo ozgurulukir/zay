@@ -569,7 +569,9 @@ pub const App = struct {
             self.checkpoint_state = .unavailable;
             return false;
         };
-        const ok = jj.isAvailable(self.gpa, self.io) and blk: {
+        // jj ships with Nova (the install script ensures it on PATH), so assume
+        // it's present — just make sure the repo is colocated.
+        const ok = blk: {
             jj.ensureColocated(self.gpa, self.io, repo) catch break :blk false;
             break :blk true;
         };
@@ -1843,7 +1845,6 @@ pub const App = struct {
     /// precedes every checkpoint — the baseline (the first checkpoint's parent).
     /// Best-effort: jj absent, no checkpoints, or a jj failure leaves files as-is.
     fn restoreCheckpointForBranch(self: *App, rt: *runtime_mod.AgentRuntime) !void {
-        if (!jj.isAvailable(self.gpa, self.io)) return;
         if (try rt.session_writer.checkpointHead(self.gpa)) |head| {
             defer self.gpa.free(head);
             const change = jj.ChangeId.parse(head) catch return;
@@ -2145,6 +2146,7 @@ pub const App = struct {
                 self.cached_config,
                 diagnostics,
                 id,
+                current, // template: reuse the live lane's project prompt + skills
             );
         } else {
             try runtime.initNew(
@@ -2156,6 +2158,7 @@ pub const App = struct {
                 current.base_system_prompt,
                 self.cached_config,
                 diagnostics,
+                current, // template: reuse the live lane's project prompt + skills
             );
         }
         return runtime;
@@ -2179,7 +2182,6 @@ pub const App = struct {
         if (self.threads.items.len >= 4) return error.TooManyLanes; // the split grid is 2×2
         const current = self.liveRuntime() orelse return error.NoActiveRuntime;
         const repo = self.repoRoot() orelse return error.NoActiveRuntime;
-        if (!jj.isAvailable(self.gpa, self.io)) return error.JjUnavailable;
         try jj.ensureColocated(self.gpa, self.io, repo);
 
         var raw: [6]u8 = undefined;
@@ -2252,7 +2254,6 @@ pub const App = struct {
         if (self.thread.turn.isActive()) return error.InFlightTurn;
         const index = self.activeIndex();
         if (index == 0) return error.CannotMergePrimaryLane;
-        if (!jj.isAvailable(self.gpa, self.io)) return error.JjUnavailable;
         const repo = self.repoRoot() orelse return error.NoActiveRuntime;
 
         const lane = self.thread;
