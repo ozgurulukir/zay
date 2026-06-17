@@ -874,7 +874,7 @@ pub const App = struct {
                     .diff => self.openDiffViewer() catch |err| try self.reportDiffError(err),
                     .parallel => self.createParallelLane() catch |err| try self.reportLaneError(err),
                     .close => self.closeActiveLane() catch |err| try self.reportLaneError(err),
-                    .split => self.toggleSplit() catch |err| try self.reportLaneError(err),
+                    .split => self.splitLane() catch |err| try self.reportLaneError(err),
                     .merge => self.mergeActiveLane() catch |err| try self.reportLaneError(err),
                 }
             }
@@ -2151,6 +2151,7 @@ pub const App = struct {
     /// at a time (per-lane event routing is a later step), so creation is
     /// refused mid-turn.
     fn createParallelLane(self: *App) !void {
+        if (self.threads.items.len >= 4) return error.TooManyLanes; // the split grid is 2×2
         const current = self.liveRuntime() orelse return error.NoActiveRuntime;
         const repo = self.repoRoot() orelse return error.NoActiveRuntime;
         if (!jj.isAvailable(self.gpa, self.io)) return error.JjUnavailable;
@@ -2303,24 +2304,14 @@ pub const App = struct {
         return false;
     }
 
-    /// Cycle to the next lane (wrapping). No-op with a single lane or mid-turn:
-    /// lanes share one worker until per-lane event routing lands, so switching
-    /// during a turn would misroute its events.
-    /// Toggle split view. Turning it on with only one lane spawns a second
-    /// (independent) lane first, so there's something to tile.
-    fn toggleSplit(self: *App) !void {
+    /// Add one more tiled lane (up to the grid's four). Each `/split` spawns
+    /// another independent lane and tiles; closing lanes back down untiles.
+    fn splitLane(self: *App) !void {
         self.mode = .normal;
-        if (self.split) {
-            self.split = false;
-            return;
-        }
-        if (self.threads.items.len < 2) {
-            try self.createParallelLane(); // sets `split` and switches to the new lane
-            return;
-        }
-        self.split = true;
+        try self.createParallelLane(); // creates the lane, sets `split`, switches to it
     }
 
+    /// Cycle to the next lane (wrapping). No-op with a single lane.
     fn switchToNextLane(self: *App) void {
         if (self.threads.items.len < 2) return;
         const next = (self.activeIndex() + 1) % self.threads.items.len;
@@ -3263,16 +3254,23 @@ const RootWidget = struct {
         const children = try ctx.arena.alloc(vxfw.SubSurface, child_count);
         var idx: usize = 0;
         if (split) {
-            // Tile the transcript area into one bordered column per lane; the
-            // active lane is marked in its label. Input + spinner stay shared
-            // below and route to the focused (active) lane.
-            const cols: u16 = @intCast(self.app.threads.items.len);
-            const col_width: u16 = max_width / cols;
+            // Tile the transcript area as a 2-wide grid: rows of two lanes, a
+            // trailing odd lane spanning its row. The active lane is marked in
+            // its border label; input + spinner stay shared below, routing to it.
+            const n = self.app.threads.items.len;
+            const rows: u16 = @intCast((n + 1) / 2);
+            const cell_h: u16 = layout.transcript_height / rows;
             for (self.app.threads.items, 0..) |lane, i| {
-                const width: u16 = if (i + 1 == self.app.threads.items.len) max_width - col_width * (cols - 1) else col_width;
+                const row: u16 = @intCast(i / 2);
+                const col: u16 = @intCast(i % 2);
+                const last_row = row == rows - 1;
+                const per_row: u16 = if (last_row and n % 2 == 1) 1 else 2;
+                const cell_w: u16 = max_width / per_row;
+                const w: u16 = if (col == per_row - 1) max_width - cell_w * (per_row - 1) else cell_w;
+                const h: u16 = if (last_row) layout.transcript_height - cell_h * (rows - 1) else cell_h;
                 children[idx] = .{
-                    .origin = .{ .row = 0, .col = @intCast(@as(usize, i) * col_width) },
-                    .surface = try self.drawLaneColumn(ctx, lane, width, layout.transcript_height, lane == self.app.thread),
+                    .origin = .{ .row = row * cell_h, .col = col * cell_w },
+                    .surface = try self.drawLaneColumn(ctx, lane, w, h, lane == self.app.thread),
                     .z_index = 0,
                 };
                 idx += 1;
