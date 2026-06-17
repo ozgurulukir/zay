@@ -60,6 +60,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
         runtime_gpa,
         init.io,
         cwd,
+        cwd, // session_dir: the primary's sessions live in the repo root's .nova
         home_dir,
         system_prompt,
         load_result.config,

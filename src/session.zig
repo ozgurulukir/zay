@@ -760,6 +760,10 @@ pub const EntryRecord = struct {
 };
 
 fn migrate(connection: *db.Connection, io: std.Io) Error!void {
+    // Lanes share one repo-level DB; each lane's background writer holds its own
+    // connection, so a busy timeout makes concurrent writes wait (WAL serializes
+    // writers) instead of failing with SQLITE_BUSY and dropping a session entry.
+    try connection.exec("pragma busy_timeout = 5000");
     try connection.exec("pragma foreign_keys = on");
     try connection.exec("pragma journal_mode = wal");
     try connection.exec("create table if not exists schema_migrations(version integer primary key, applied_at_ms integer not null)");

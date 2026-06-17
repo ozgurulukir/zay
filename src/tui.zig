@@ -1753,7 +1753,7 @@ pub const App = struct {
 
     fn reloadResumeSessions(self: *App) !void {
         self.resumeClear();
-        var manager = try session_mod.SessionManager.initDefault(self.gpa, self.io, self.liveRuntime().?.cwd);
+        var manager = try session_mod.SessionManager.initDefault(self.gpa, self.io, self.repoRoot() orelse self.liveRuntime().?.cwd);
         defer manager.deinit();
         const cwd = if (self.resume_global) null else self.liveRuntime().?.cwd;
         const summaries = try manager.list(self.gpa, cwd);
@@ -2083,7 +2083,7 @@ pub const App = struct {
 
     fn switchToNewSession(self: *App) !void {
         if (self.thread.turn.isActive()) return error.InFlightTurn;
-        const runtime = try self.createRuntime(self.liveRuntime().?.cwd, null);
+        const runtime = try self.createRuntime(self.liveRuntime().?.cwd, self.repoRoot() orelse self.liveRuntime().?.cwd, null);
         errdefer {
             runtime.deinit();
             self.gpa.destroy(runtime);
@@ -2094,7 +2094,7 @@ pub const App = struct {
 
     fn switchToSession(self: *App, session_id: []const u8) !void {
         if (self.thread.turn.isActive()) return error.InFlightTurn;
-        const runtime = try self.createRuntime(self.liveRuntime().?.cwd, session_id);
+        const runtime = try self.createRuntime(self.liveRuntime().?.cwd, self.repoRoot() orelse self.liveRuntime().?.cwd, session_id);
         errdefer {
             runtime.deinit();
             self.gpa.destroy(runtime);
@@ -2103,7 +2103,7 @@ pub const App = struct {
         try self.rebuildTranscriptFromAgent();
     }
 
-    fn createRuntime(self: *App, cwd: []const u8, session_id: ?[]const u8) !*runtime_mod.AgentRuntime {
+    fn createRuntime(self: *App, cwd: []const u8, session_dir: []const u8, session_id: ?[]const u8) !*runtime_mod.AgentRuntime {
         const current = self.liveRuntime().?;
         const runtime = try self.gpa.create(runtime_mod.AgentRuntime);
         errdefer self.gpa.destroy(runtime);
@@ -2114,6 +2114,7 @@ pub const App = struct {
                 current.gpa,
                 self.io,
                 cwd,
+                session_dir,
                 current.home_dir,
                 current.base_system_prompt,
                 self.cached_config,
@@ -2125,6 +2126,7 @@ pub const App = struct {
                 current.gpa,
                 self.io,
                 cwd,
+                session_dir,
                 current.home_dir,
                 current.base_system_prompt,
                 self.cached_config,
@@ -2175,7 +2177,7 @@ pub const App = struct {
         try jj.workspaceAdd(self.gpa, self.io, repo, workspace, dest, base);
         errdefer jj.workspaceForget(self.gpa, self.io, repo, workspace) catch {};
 
-        const runtime = try self.createRuntime(dest, null);
+        const runtime = try self.createRuntime(dest, repo, null);
         errdefer {
             runtime.deinit();
             self.gpa.destroy(runtime);

@@ -75,12 +75,13 @@ pub const AgentRuntime = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         cwd: []const u8,
+        session_dir: []const u8,
         home_dir: []const u8,
         base_system_prompt: []const u8,
         config: config_mod.Config,
         diagnostics: []config_mod.Diagnostic,
     ) !void {
-        try target.initSession(gpa, io, cwd, home_dir, base_system_prompt, config, diagnostics, null);
+        try target.initSession(gpa, io, cwd, session_dir, home_dir, base_system_prompt, config, diagnostics, null);
     }
 
     pub fn initResume(
@@ -88,6 +89,7 @@ pub const AgentRuntime = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         cwd: []const u8,
+        session_dir: []const u8,
         home_dir: []const u8,
         base_system_prompt: []const u8,
         config: config_mod.Config,
@@ -95,14 +97,18 @@ pub const AgentRuntime = struct {
         session_id: []const u8,
     ) !void {
         assert(session_id.len > 0);
-        try target.initSession(gpa, io, cwd, home_dir, base_system_prompt, config, diagnostics, session_id);
+        try target.initSession(gpa, io, cwd, session_dir, home_dir, base_system_prompt, config, diagnostics, session_id);
     }
 
+    /// `cwd` is where the agent runs tools and loads skills (a lane's workspace);
+    /// `session_dir` is where the session DB lives and what the session records
+    /// as its cwd — the repo root, so all lanes share one DB and group together.
     fn initSession(
         target: *AgentRuntime,
         gpa: std.mem.Allocator,
         io: std.Io,
         cwd: []const u8,
+        session_dir: []const u8,
         home_dir: []const u8,
         base_system_prompt: []const u8,
         config: config_mod.Config,
@@ -136,9 +142,9 @@ pub const AgentRuntime = struct {
         };
 
         if (session_id) |id| {
-            try target.session_writer.initResumeDefault(gpa, io, cwd, id);
+            try target.session_writer.initResumeDefault(gpa, io, session_dir, id);
         } else {
-            try target.session_writer.initDefault(gpa, io, cwd);
+            try target.session_writer.initDefault(gpa, io, session_dir);
         }
         errdefer target.session_writer.deinit();
 
