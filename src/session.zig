@@ -254,6 +254,42 @@ pub const Session = struct {
         try self.insertEntry(id_out, "compaction", null, payload);
     }
 
+    /// Append a code-state checkpoint as a child of the current leaf: the jj
+    /// `change_id` whose workspace state corresponds to the conversation at this
+    /// point. Written once per turn that changed files. The change-id is stored
+    /// opaquely (validated as a `jj.ChangeId` by the caller before it gets
+    /// here); `messages` never projects this entry, so the model is unaware of
+    /// it, but branch walks see it — that's how branching at an older node
+    /// recovers the code state to spawn a workspace from.
+    pub fn appendCheckpoint(self: *Session, change_id: []const u8, id_out: *[entry_id_len]u8) Error!void {
+        assert(change_id.len > 0);
+        fillHex(self.manager.io, id_out);
+        const payload = try checkpointToJson(self.manager.gpa, change_id);
+        defer self.manager.gpa.free(payload);
+        try self.insertEntry(id_out, "checkpoint", null, payload);
+    }
+
+    /// The change-id of the nearest `checkpoint` entry on the active branch
+    /// (scanning leaf→root), or null when the branch carries none. This is the
+    /// code state bound to the current conversation position. Caller owns the
+    /// returned string.
+    pub fn checkpointHead(self: *Session, gpa: std.mem.Allocator) Error!?[]u8 {
+        const path = try self.loadBranch(gpa);
+        defer {
+            for (path) |*entry| entry.deinit(gpa);
+            gpa.free(path);
+        }
+        assert(path.len <= path_entries_max);
+        var scan: u32 = @intCast(path.len);
+        while (scan > 0) {
+            scan -= 1;
+            if (std.mem.eql(u8, path[scan].kind, "checkpoint")) {
+                return try checkpointChangeId(gpa, path[scan].payload_json);
+            }
+        }
+        return null;
+    }
+
     /// Project the active branch into the message list the model sees. The
     /// durable tree is the source of truth; this is the derived view. When the
     /// branch carries a compaction boundary, the summarized prefix is replaced
@@ -549,6 +585,25 @@ pub const SessionWriter = struct {
         const payload = try compactionToJson(self.gpa, first_kept_id, summary);
         errdefer self.gpa.free(payload);
         try self.enqueue(.{ .kind = "compaction", .role = null, .payload_json = payload });
+    }
+
+    /// Enqueue a per-turn code-state checkpoint for the background writer.
+    /// Mirrors `appendCompaction`: it lands on whatever leaf is current when the
+    /// writer drains it, which is the branch the turn ran on.
+    pub fn appendCheckpoint(self: *SessionWriter, change_id: []const u8) Error!void {
+        assert(change_id.len > 0);
+        const payload = try checkpointToJson(self.gpa, change_id);
+        errdefer self.gpa.free(payload);
+        try self.enqueue(.{ .kind = "checkpoint", .role = null, .payload_json = payload });
+    }
+
+    /// Race-free `Session.checkpointHead`: flushes queued writes so the lookup
+    /// sees any checkpoint the current turn just enqueued, then restarts the
+    /// writer. Caller owns the returned string.
+    pub fn checkpointHead(self: *SessionWriter, gpa: std.mem.Allocator) Error!?[]u8 {
+        self.quiesce();
+        defer self.restart() catch {};
+        return self.session.checkpointHead(gpa);
     }
 
     /// Load the whole session tree, race-free. Stops the background writer so
@@ -940,6 +995,26 @@ fn compactionToJson(gpa: std.mem.Allocator, first_kept_id: []const u8, summary: 
     try std.json.Stringify.value(summary, .{}, &out.writer);
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
+}
+
+fn checkpointToJson(gpa: std.mem.Allocator, change_id: []const u8) Error![]u8 {
+    assert(change_id.len > 0);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try out.writer.writeAll("{\"change_id\":");
+    try std.json.Stringify.value(change_id, .{}, &out.writer);
+    try out.writer.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+fn checkpointChangeId(gpa: std.mem.Allocator, payload_json: []const u8) Error![]u8 {
+    assert(payload_json.len > 0);
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, payload_json, .{}) catch return error.CorruptPayload;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.CorruptPayload;
+    const field = parsed.value.object.get("change_id") orelse return error.CorruptPayload;
+    if (field != .string or field.string.len == 0) return error.CorruptPayload;
+    return gpa.dupe(u8, field.string);
 }
 
 fn compactionFirstKeptId(gpa: std.mem.Allocator, payload_json: []const u8) Error![entry_id_len]u8 {
@@ -1378,4 +1453,57 @@ test "compaction cut returns null when the budget covers the branch" {
     try appendTextEntry(&session, gpa, .user, "small", &id_only);
     const result = try session.compactionCut(gpa, 100_000);
     try std.testing.expect(result == null);
+}
+
+test "checkpoint records a change-id without entering the projected messages" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/nova", .{ .id = "1" ** session_id_len });
+
+    var id_user: [entry_id_len]u8 = undefined;
+    var id_checkpoint: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "do the thing", &id_user);
+    try session.appendCheckpoint("kxryzmorlvtnpqsw", &id_checkpoint);
+
+    const head = (try session.checkpointHead(gpa)) orelse return error.TestFailed;
+    defer gpa.free(head);
+    try std.testing.expectEqualStrings("kxryzmorlvtnpqsw", head);
+
+    // The checkpoint is metadata: the model still sees only the user message.
+    const messages = try session.messages(gpa);
+    defer {
+        for (messages) |*message| deinitMessage(gpa, message);
+        gpa.free(messages);
+    }
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqualStrings("do the thing", messages[0].text());
+}
+
+test "checkpointHead returns the nearest checkpoint on the branch" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/nova", .{ .id = "2" ** session_id_len });
+
+    var scratch: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "first", &scratch);
+    try session.appendCheckpoint("kkkkkkkk", &scratch);
+    try appendTextEntry(&session, gpa, .assistant, "second", &scratch);
+    try session.appendCheckpoint("llllllll", &scratch);
+
+    const head = (try session.checkpointHead(gpa)) orelse return error.TestFailed;
+    defer gpa.free(head);
+    try std.testing.expectEqualStrings("llllllll", head);
+}
+
+test "checkpointHead is null on a branch with no checkpoint" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/nova", .{ .id = "3" ** session_id_len });
+
+    var scratch: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "only a message", &scratch);
+    try std.testing.expect((try session.checkpointHead(gpa)) == null);
 }

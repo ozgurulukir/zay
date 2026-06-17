@@ -3,7 +3,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const terminal_markdown = @import("terminal_markdown");
-const thread_mod = @import("../../thread.zig");
+const transcript_mod = @import("../../transcript.zig");
 const tui_metrics = @import("../metrics.zig");
 const tui_style = @import("../style.zig");
 const blackhole = @import("../blackhole.zig");
@@ -22,7 +22,7 @@ pub const loading_frames = [8][]const u8{ "⣼", "⣹", "⢻", "⠿", "⡟", "�
 pub const loading_frame_ms = 40;
 
 /// Agent bodies at or below this size keep their fully rendered markdown cached
-/// across frames (see `thread_mod.RenderCache`). Larger bodies fall back to a
+/// across frames (see `transcript_mod.RenderCache`). Larger bodies fall back to a
 /// per-frame, viewport-bounded render so a giant message never materializes its
 /// whole row list into a long-lived cache — preserving the draw-time OOM guard.
 const render_cache_max_bytes: usize = 64 * 1024;
@@ -46,7 +46,7 @@ pub const ConversationLayout = struct {
 };
 
 pub const MessageWidget = struct {
-    message: *thread_mod.Message,
+    message: *transcript_mod.Message,
     selected: bool,
     loading_frame: u8,
     blackhole_frame: u16,
@@ -124,7 +124,7 @@ pub const MessageWidget = struct {
 
     fn drawToolTitle(
         surface: *vxfw.Surface,
-        message: thread_mod.Message,
+        message: transcript_mod.Message,
         style: vaxis.Style,
         selected: bool,
         loading_frame: u8,
@@ -368,7 +368,7 @@ fn drawMarkdown(
     // Markdown rendering is the dominant per-frame cost, and a visible message
     // is otherwise re-parsed on every animation tick even when nothing about it
     // changed. Cache the rendered rows on the message (keyed by width, dropped
-    // by `Thread` mutators) so only the message whose body actually changed is
+    // by `Transcript` mutators) so only the message whose body actually changed is
     // re-rendered.
     const rows: []const terminal_markdown.Row = rows: {
         // Very large bodies stay uncached: holding (and re-rendering) their whole
@@ -428,7 +428,7 @@ fn markdownStyle(style: terminal_markdown.Style) vaxis.Style {
 
 fn drawToolBody(
     surface: *vxfw.Surface,
-    message: thread_mod.Message,
+    message: transcript_mod.Message,
     selected: bool,
     row: *u16,
     ctx: vxfw.DrawContext,
@@ -515,17 +515,17 @@ fn isLinearWhitespace(bytes: []const u8) bool {
 
 test "expanded tool title uses expanded command" {
     const gpa = std.testing.allocator;
-    var thread: thread_mod.Thread = .{};
-    defer thread.deinit(gpa);
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
 
-    const index = try thread.startTool(gpa, "List files");
-    try thread.updateToolExpanded(gpa, index, "List files", "pwd");
-    thread.messages.items[index].expanded = true;
+    const index = try transcript.startTool(gpa, "List files");
+    try transcript.updateToolExpanded(gpa, index, "List files", "pwd");
+    transcript.messages.items[index].expanded = true;
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var message_widget: MessageWidget = .{
-        .message = &thread.messages.items[index],
+        .message = &transcript.messages.items[index],
         .selected = true,
         .loading_frame = 0,
         .blackhole_frame = 0,

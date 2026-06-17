@@ -1,11 +1,11 @@
 const std = @import("std");
 
-const thread_mod = @import("../thread.zig");
+const transcript_mod = @import("../transcript.zig");
 const tools_mod = @import("../tools.zig");
 
 pub const Policy = struct {
     expand_by_default: bool,
-    render: thread_mod.Render,
+    render: transcript_mod.Render,
 };
 
 const entries = [_]struct { name: []const u8, policy: Policy }{
@@ -40,5 +40,5 @@ pub fn forName(name: []const u8) Policy {
 test "unknown tools use a safe failure display policy" {
     const policy = forName("unknown_tool");
     try std.testing.expect(policy.expand_by_default);
-    try std.testing.expectEqual(thread_mod.Render.plain, policy.render);
+    try std.testing.expectEqual(transcript_mod.Render.plain, policy.render);
 }

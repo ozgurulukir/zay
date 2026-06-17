@@ -12,13 +12,15 @@ const config_mod = @import("config.zig");
 const openai_compatible_mod = @import("ai/openai_compatible.zig");
 const runtime_mod = @import("runtime.zig");
 const session_mod = @import("session.zig");
+const jj = @import("jj.zig");
 const skill_mod = @import("skill.zig");
 const symbols = @import("symbols.zig");
-const thread_mod = @import("thread.zig");
+const transcript_mod = @import("transcript.zig");
 const agent_worker = @import("tui/agent_worker.zig");
 const Turn = @import("tui/turn.zig");
 const model_catalogue = @import("tui/model_catalogue.zig");
 const tui_turn_view = @import("tui/turn_view.zig");
+const Thread = @import("tui/thread.zig");
 const tui_metrics = @import("tui/metrics.zig");
 const tui_message = @import("tui/widgets/message.zig");
 const blackhole = @import("tui/blackhole.zig");
@@ -47,7 +49,7 @@ const loading_spinners = tui_turn_view.loading_spinners;
 const loading_frame_ms = tui_message.loading_frame_ms;
 const command_prefix: u8 = '/';
 const long_message_scroll_step_rows: u16 = 3;
-const ThreadNavigation = enum { previous, next };
+const TranscriptNavigation = enum { previous, next };
 const MentionSearchKind = enum { file, skill };
 
 const DiffCounts = struct {
@@ -105,20 +107,21 @@ fn runDiffRefresh(job: *DiffRefreshJob) DiffRefreshOutcome {
     return .{ .ready = raw };
 }
 
-/// A user message queued behind a running turn, mirrored from the agent queue
-/// for display and navigation. `steer` means inject after the next tool batch;
-/// the default (false) waits for the turn to go idle.
-pub const QueuedMessage = struct {
-    text: []const u8,
-    steer: bool = false,
-};
-
 pub const App = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
-    agent: *agent_mod.Agent,
-    runtime: ?*runtime_mod.AgentRuntime = null,
-    thread: thread_mod.Thread = .{},
+    /// All lanes the developer has open, heap-allocated so their addresses stay
+    /// stable while live runtimes and (later) worker threads hold references.
+    /// Owns the `Thread`s; freed in `deinit`.
+    threads: std.ArrayList(*Thread) = .empty,
+    /// The lane currently on screen — always one of `threads`. A pointer (not an
+    /// index) so every `self.thread.X` site reads/mutates the active lane through
+    /// auto-deref, even from a `*const App`.
+    thread: *Thread,
+    /// When true and there's more than one lane, the transcript area tiles all
+    /// lanes as columns (toggled by `/split`); otherwise only the active lane
+    /// shows full-width.
+    split: bool = false,
     input: vxfw.TextField,
     palette_input: vxfw.TextField,
     /// Inline comment editor for the diff viewer. Single-line; cleared between
@@ -127,9 +130,10 @@ pub const App = struct {
     /// Parsed state for the `/diff` viewer. Populated by `openDiffViewer`, reset
     /// to `.{}` on exit. Only meaningful while `mode == .diff_viewer`.
     diff: diff_viewer.State = .{},
-    worker_context: agent_worker.Context,
-    turn_future: ?std.Io.Future(void) = null,
-    owns_runtime: bool = false,
+    /// Lazily-resolved readiness of jj-backed per-turn checkpointing: `.unknown`
+    /// until the first finished turn probes jj and colocates the repo, then
+    /// cached. `.unavailable` keeps the feature inert when jj isn't installed.
+    checkpoint_state: CheckpointState = .unknown,
     mode: Mode = .normal,
     command_selection: u32 = 0,
     resume_selection: u32 = 0,
@@ -151,12 +155,7 @@ pub const App = struct {
     provider_key_input: std.ArrayList(u8) = .empty,
     cached_config: config_mod.Config = .{},
     cached_config_owned: bool = false,
-    retired_threads: std.ArrayList(thread_mod.Thread) = .empty,
-    /// Lifecycle state for the in-progress agent turn (idle / active /
-    /// interrupting). Collapses what used to be the `in_flight` and
-    /// `turn_discarded` booleans plus the scattered discard logic.
-    turn: Turn = .{},
-    turn_view: tui_turn_view.TurnView = .{},
+    retired_transcripts: std.ArrayList(transcript_mod.Transcript) = .empty,
     loading_frame: u8 = 0,
     loading_tick_active: bool = false,
     // Black-hole intro animation. `blackhole_visible` is recomputed each draw
@@ -165,7 +164,6 @@ pub const App = struct {
     // scrolls away.
     blackhole_frame: u16 = 0,
     blackhole_visible: bool = true,
-    thread_auto_scroll: bool = true,
     git_label: []const u8 = "",
     diff_counts: DiffCounts = .{},
     diff_refresh_future: ?std.Io.Future(DiffRefreshOutcome) = null,
@@ -177,13 +175,6 @@ pub const App = struct {
     /// True while the viewer is open on a cold cache, showing "Loading diff…"
     /// until the background refresh populates it.
     diff_loading: bool = false,
-    thread_view_width: u16 = 80,
-    thread_view_height: u16 = 1,
-    thread_list: vxfw.ListView = .{
-        .children = .{ .slice = &.{} },
-        .draw_cursor = false,
-        .wheel_scroll = 4,
-    },
     resume_list: vxfw.ListView = .{
         .children = .{ .slice = &.{} },
         .draw_cursor = false,
@@ -200,12 +191,7 @@ pub const App = struct {
         .wheel_scroll = 3,
     },
     pending_quit_at: ?std.Io.Timestamp = null,
-    queued_user_messages: std.ArrayList(QueuedMessage) = .empty,
     queued_selection: usize = 0,
-    /// Raw prompt for a turn that `beginSubmit` accepted but `startTurn` has
-    /// not yet handed to the worker. Owned by `gpa`; the worker frees it once
-    /// the turn starts.
-    pending_prompt: ?[]u8 = null,
     /// When true, arrow keys navigate conversation blocks; when false they move
     /// the cursor within the (multiline) input. Set when the cursor leaves the
     /// top of the input, cleared when it re-enters from the last block or on any
@@ -223,22 +209,26 @@ pub const App = struct {
 
     const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer };
     const ModelCatalog = enum { connected_provider, openai_codex };
+    const CheckpointState = enum { unknown, ready, unavailable };
     const ModelSource = model_loader.ModelSource;
     const ModelScope = model_catalogue.ModelScope;
 
-    pub fn init(io: std.Io, gpa: std.mem.Allocator, agent: *agent_mod.Agent) App {
+    pub fn init(io: std.Io, gpa: std.mem.Allocator, agent: *agent_mod.Agent) !App {
+        const primary = try gpa.create(Thread);
+        errdefer gpa.destroy(primary);
+        primary.* = .{ .agent = agent, .worker_context = .{ .io = io, .gpa = agent.gpa } };
+        var threads: std.ArrayList(*Thread) = .empty;
+        errdefer threads.deinit(gpa);
+        try threads.append(gpa, primary);
         return .{
             .io = io,
             .gpa = gpa,
-            .agent = agent,
+            .threads = threads,
+            .thread = primary,
             .input = .init(gpa),
             .palette_input = .init(gpa),
             .comment_input = .init(gpa),
             .tree_state = .init(gpa),
-            .worker_context = .{
-                .io = io,
-                .gpa = agent.gpa,
-            },
         };
     }
 
@@ -247,15 +237,25 @@ pub const App = struct {
         gpa: std.mem.Allocator,
         runtime: *runtime_mod.AgentRuntime,
         config: config_mod.Config,
-    ) App {
-        var app = init(io, gpa, &runtime.agent);
-        app.runtime = runtime;
-        app.owns_runtime = true;
+    ) !App {
+        var app = try init(io, gpa, &runtime.agent);
+        app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = true } };
+        app.thread.id = runtime.session_writer.session.id;
         app.codex_signed_in = !runtime.codex_connection_expired and
             (runtime.hasCodexClient() or tui_provider.detectCodexSignIn(gpa, io, runtime.home_dir));
         app.cached_config = config;
         app.cached_config_owned = true;
         return app;
+    }
+
+    /// The live lane's runtime, or null when no engine is attached (idle/test).
+    /// Engine ownership lives in `thread.engine`; this read accessor replaced the
+    /// former `App.runtime` field.
+    fn liveRuntime(self: *const App) ?*runtime_mod.AgentRuntime {
+        return switch (self.thread.engine) {
+            .live => |live| live.runtime,
+            .idle, .archived => null,
+        };
     }
 
     pub fn bindInputCallbacks(self: *App) void {
@@ -266,16 +266,20 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
-        if (self.turn.state == .interrupting) {
-            self.discardAbandonedTurn();
-        } else {
-            self.awaitTurn();
+        // Cancel every lane's in-flight turn (background lanes may still be
+        // running) so no worker thread outlives the App.
+        for (self.threads.items) |lane| {
+            if (lane.turn_future) |*future| {
+                if (lane.worker_context) |*worker| worker.requestCancel();
+                _ = future.cancel(self.io);
+                lane.turn_future = null;
+            }
         }
         // Cancel the in-flight load first (it needs `io`), then free the
         // catalogue's owned lists + error in one pass.
         self.cancelModelLoad();
-        for (self.retired_threads.items) |*thread| thread.deinit(self.gpa);
-        self.retired_threads.deinit(self.gpa);
+        for (self.retired_transcripts.items) |*transcript| transcript.deinit(self.gpa);
+        self.retired_transcripts.deinit(self.gpa);
         self.resumeClear();
         self.resumeClearFolds();
         self.resume_folded_projects.deinit(self.gpa);
@@ -292,20 +296,13 @@ pub const App = struct {
             self.cached_config.deinit(self.gpa);
             self.cached_config_owned = false;
         }
-        if (self.owns_runtime) {
-            if (self.runtime) |runtime| {
-                runtime.deinit();
-                self.gpa.destroy(runtime);
-            }
-        }
-        self.worker_context.queue.deinit(self.worker_context.io, self.worker_context.gpa);
-        self.clearQueuedUserMessages();
-        self.queued_user_messages.deinit(self.gpa);
-        if (self.pending_prompt) |prompt| self.worker_context.gpa.free(prompt);
         self.closeAtSearch();
         self.at_results.deinit(self.gpa);
-        self.turn_view.deinit(self.gpa);
-        self.thread.deinit(self.gpa);
+        for (self.threads.items) |lane| {
+            lane.deinit(self.gpa);
+            self.gpa.destroy(lane);
+        }
+        self.threads.deinit(self.gpa);
         self.diff.deinit(self.gpa);
         self.input.deinit();
         self.palette_input.deinit();
@@ -314,46 +311,46 @@ pub const App = struct {
     }
 
     fn awaitTurn(self: *App) void {
-        if (self.turn_future) |*future| {
+        if (self.thread.turn_future) |*future| {
             future.await(self.io);
-            self.turn_future = null;
+            self.thread.turn_future = null;
         }
     }
 
     pub fn handleInterrupt(self: *App) !void {
-        if (self.turn.state != .active) return;
-        self.worker_context.requestCancel();
+        if (self.thread.turn.state != .active) return;
+        self.thread.worker_context.?.requestCancel();
         // Show the cancellation notice immediately; the worker's own
         // `turn_failed`/`turn_finished` are then swallowed while interrupting.
         const message = try self.gpa.dupe(u8, agent_worker.cancel_message);
         var event: agent_mod.Agent.Event = .{ .turn_failed = message };
         defer event.deinit(self.gpa);
-        _ = try self.turn_view.apply(self.gpa, &self.thread, event);
-        self.turn.interrupt();
+        _ = try self.thread.turn_view.apply(self.gpa, &self.thread.transcript, event);
+        self.thread.turn.interrupt();
     }
 
     fn discardAbandonedTurn(self: *App) void {
-        if (self.turn.state != .interrupting and self.turn_future == null) return;
-        if (self.turn_future) |*future| {
+        if (self.thread.turn.state != .interrupting and self.thread.turn_future == null) return;
+        if (self.thread.turn_future) |*future| {
             // `cancel` blocks until the task hits its next cancellation point
             // (typically the network read) and unwinds. On a healthy stream
             // this is near-instant; on a hung connection it forces the OS
             // read to abort.
             _ = future.cancel(self.io);
-            self.turn_future = null;
+            self.thread.turn_future = null;
         }
         var batch: std.ArrayList(*agent_mod.Agent.Event) = .empty;
-        defer batch.deinit(self.worker_context.gpa);
-        self.worker_context.queue.drainInto(
-            self.worker_context.io,
-            self.worker_context.gpa,
+        defer batch.deinit(self.thread.worker_context.?.gpa);
+        self.thread.worker_context.?.queue.drainInto(
+            self.thread.worker_context.?.io,
+            self.thread.worker_context.?.gpa,
             &batch,
         ) catch {};
         for (batch.items) |event_ptr| {
-            event_ptr.deinit(self.worker_context.gpa);
-            self.worker_context.gpa.destroy(event_ptr);
+            event_ptr.deinit(self.thread.worker_context.?.gpa);
+            self.thread.worker_context.?.gpa.destroy(event_ptr);
         }
-        if (self.turn.state == .interrupting) self.turn.reset();
+        if (self.thread.turn.state == .interrupting) self.thread.turn.reset();
     }
 
     /// Start a turn from the current input. Returns true when a turn was
@@ -365,36 +362,36 @@ pub const App = struct {
         // If a previous turn was Esc-interrupted, force-cancel its worker
         // before starting a new one. Two concurrent workers would race on
         // the shared agent message history.
-        if (self.turn.state == .interrupting) self.discardAbandonedTurn();
-        if (self.turn.isActive()) return try self.enqueueSubmit();
+        if (self.thread.turn.state == .interrupting) self.discardAbandonedTurn();
+        if (self.thread.turn.isActive()) return try self.enqueueSubmit();
         const prompt = try self.input.toOwnedSlice();
         defer self.gpa.free(prompt);
         if (prompt.len == 0) return false;
 
-        if (self.runtime != null and self.runtime.?.client == .none) {
-            _ = try self.thread.append(self.gpa, .user, "you", prompt);
+        if (self.liveRuntime() != null and self.liveRuntime().?.client == .none) {
+            _ = try self.thread.transcript.append(self.gpa, .user, "you", prompt);
             const message = try self.formatNoProviderMessage();
             defer self.gpa.free(message);
-            _ = try self.thread.append(self.gpa, .agent, "agent", message);
+            _ = try self.thread.transcript.append(self.gpa, .agent, "agent", message);
             return false;
         }
 
         self.resetTurnState();
-        self.worker_context.resetCancel();
-        _ = try self.thread.append(self.gpa, .user, "you", prompt);
-        try self.appendSkillInvocationsToThread(prompt);
-        self.turn_view.awaitModel();
+        self.thread.worker_context.?.resetCancel();
+        _ = try self.thread.transcript.append(self.gpa, .user, "you", prompt);
+        try self.appendSkillInvocationsToTranscript(prompt);
+        self.thread.turn_view.awaitModel();
         // The worker expands `@`-mentions (reading files / images) off the UI
         // thread; stash the raw text for `startTurn` to hand over. The worker
         // owns and frees it, so it must be allocated with the worker's
         // allocator (`worker_context.gpa`), not `self.gpa`.
-        self.pending_prompt = try self.worker_context.gpa.dupe(u8, prompt);
-        self.turn.submit();
+        self.thread.pending_prompt = try self.thread.worker_context.?.gpa.dupe(u8, prompt);
+        self.thread.turn.submit();
         return true;
     }
 
     fn formatNoProviderMessage(self: *App) ![]u8 {
-        if (self.runtime) |rt| {
+        if (self.liveRuntime()) |rt| {
             for (rt.diagnostics) |d| {
                 switch (d) {
                     .config_parse_error => |e| return std.fmt.allocPrint(
@@ -419,7 +416,7 @@ pub const App = struct {
                 );
             }
             if (p == .openai) {
-                if (self.runtime) |rt| {
+                if (self.liveRuntime()) |rt| {
                     if (rt.codex_connection_expired) return self.gpa.dupe(u8, runtime_mod.codex_connection_expired_message);
                 }
                 return self.gpa.dupe(u8, "No OpenAI Codex session — type /connect to sign in.");
@@ -432,21 +429,21 @@ pub const App = struct {
     }
 
     fn resetTurnState(self: *App) void {
-        self.turn_view.reset(self.io);
+        self.thread.turn_view.reset(self.io);
         self.loading_frame = 0;
-        // Leave `thread_auto_scroll` alone — if the user has scrolled away
+        // Leave `transcript_auto_scroll` alone — if the user has scrolled away
         // from the tail to read older context, submitting another message
         // should not yank them back. They can scroll down (or arrow-down)
         // to opt back into auto-follow.
     }
 
     pub fn startTurn(self: *App) !void {
-        const prompt = self.pending_prompt;
-        self.pending_prompt = null;
-        errdefer if (prompt) |p| self.worker_context.gpa.free(p);
-        self.turn_future = try self.io.concurrent(agent_worker.runAgentTurn, .{
-            self.agent,
-            &self.worker_context,
+        const prompt = self.thread.pending_prompt;
+        self.thread.pending_prompt = null;
+        errdefer if (prompt) |p| self.thread.worker_context.?.gpa.free(p);
+        self.thread.turn_future = try self.io.concurrent(agent_worker.runAgentTurn, .{
+            self.thread.agent.?,
+            &self.thread.worker_context.?,
             prompt,
             false,
         });
@@ -457,23 +454,23 @@ pub const App = struct {
     /// queue into history (leading messages as context, the last as the latest
     /// user message the model answers). Returns true if a turn was started.
     fn restartTurnForQueuedMessages(self: *App) !bool {
-        if (self.queued_user_messages.items.len == 0) return false;
+        if (self.thread.queued.items.len == 0) return false;
         // No connected provider to run a turn: surface the queued text in the
         // transcript and drop the queue rather than spin up a doomed worker.
-        if (self.runtime != null and self.runtime.?.client == .none) {
-            try self.flushQueuedUserMessagesToThread(@intCast(self.queued_user_messages.items.len));
-            self.agent.clearQueue();
+        if (self.liveRuntime() != null and self.liveRuntime().?.client == .none) {
+            try self.flushQueuedUserMessagesToTranscript(@intCast(self.thread.queued.items.len));
+            self.thread.agent.?.clearQueue();
             return true;
         }
         self.resetTurnState();
-        self.worker_context.resetCancel();
-        self.turn_view.awaitModel();
-        self.pending_prompt = null;
-        self.turn.submit();
-        self.turn_future = try self.io.concurrent(agent_worker.runAgentTurn, .{
-            self.agent,
-            &self.worker_context,
-            self.pending_prompt,
+        self.thread.worker_context.?.resetCancel();
+        self.thread.turn_view.awaitModel();
+        self.thread.pending_prompt = null;
+        self.thread.turn.submit();
+        self.thread.turn_future = try self.io.concurrent(agent_worker.runAgentTurn, .{
+            self.thread.agent.?,
+            &self.thread.worker_context.?,
+            self.thread.pending_prompt,
             true,
         });
         return true;
@@ -491,10 +488,10 @@ pub const App = struct {
     }
 
     pub fn applyAgentEvent(self: *App, event: agent_mod.Agent.Event) !bool {
-        const outcome = self.turn.apply(event);
+        const outcome = self.thread.turn.apply(event);
         if (!outcome.project) {
             // Interrupting: a discarded turn's output must not mutate the
-            // thread. Join the worker once it posts its terminal event, then
+            // transcript. Join the worker once it posts its terminal event, then
             // deliver any messages the user queued behind the cancelled turn as
             // a fresh turn.
             if (outcome.finished) {
@@ -503,11 +500,11 @@ pub const App = struct {
             }
             return false;
         }
-        var visible_change = try self.turn_view.apply(self.gpa, &self.thread, event);
+        var visible_change = try self.thread.turn_view.apply(self.gpa, &self.thread.transcript, event);
         switch (event) {
             .queued_messages_flushed => |count| {
-                if (count > 0 and self.queued_user_messages.items.len > 0) {
-                    try self.flushQueuedUserMessagesToThread(count);
+                if (count > 0 and self.thread.queued.items.len > 0) {
+                    try self.flushQueuedUserMessagesToTranscript(count);
                     visible_change = true;
                 }
             },
@@ -515,12 +512,49 @@ pub const App = struct {
         }
         if (outcome.finished) {
             self.awaitTurn();
-            if (self.queued_user_messages.items.len > 0) {
+            self.checkpointFinishedTurn();
+            if (self.thread.queued.items.len > 0) {
                 self.clearQueuedUserMessages();
                 visible_change = true;
             }
         }
         return visible_change;
+    }
+
+    /// After a turn finishes cleanly, seal the working-copy changes into a jj
+    /// checkpoint and record its change-id on the conversation branch, binding
+    /// this conversation node to the code state the turn produced. Best-effort:
+    /// any jj or persistence failure is swallowed so a turn never fails over a
+    /// checkpoint, and the whole feature stays inert when jj isn't available.
+    /// Interrupted turns are skipped — their file changes fold into the next
+    /// clean turn's checkpoint.
+    fn checkpointFinishedTurn(self: *App) void {
+        const rt = self.liveRuntime() orelse return;
+        if (!self.ensureCheckpointReady()) return;
+        const sealed = jj.sealTurn(self.gpa, self.io, rt.cwd, "nova: turn checkpoint") catch return;
+        if (sealed) |id| rt.session_writer.appendCheckpoint(id.slice()) catch {};
+    }
+
+    /// Resolve once whether per-turn checkpointing can run: jj installed and the
+    /// repo colocated. Colocation is checked against the repo root (the shared
+    /// `.jj` store) — not a lane's workspace cwd, which has no `.jj` of its own.
+    /// Cached, so the probe and `jj git init --colocate` happen once per session.
+    fn ensureCheckpointReady(self: *App) bool {
+        switch (self.checkpoint_state) {
+            .ready => return true,
+            .unavailable => return false,
+            .unknown => {},
+        }
+        const repo = self.repoRoot() orelse {
+            self.checkpoint_state = .unavailable;
+            return false;
+        };
+        const ok = jj.isAvailable(self.gpa, self.io) and blk: {
+            jj.ensureColocated(self.gpa, self.io, repo) catch break :blk false;
+            break :blk true;
+        };
+        self.checkpoint_state = if (ok) .ready else .unavailable;
+        return ok;
     }
 
     pub fn handleCommandKey(self: *App, key: vaxis.Key) !bool {
@@ -533,7 +567,7 @@ pub const App = struct {
             // The diff viewer owns its keys directly in `captureEvent`; nothing
             // reaches the generic dispatch.
             .diff_viewer => false,
-            .normal => self.handleThreadKey(key),
+            .normal => self.handleTranscriptKey(key),
         };
     }
 
@@ -659,7 +693,7 @@ pub const App = struct {
         return false;
     }
 
-    fn handleThreadKey(self: *App, key: vaxis.Key) !bool {
+    fn handleTranscriptKey(self: *App, key: vaxis.Key) !bool {
         if (self.at_active and self.at_results.items.len > 0) {
             if (key.matches(vaxis.Key.up, .{})) {
                 self.at_selection = previousIndex(self.at_selection, @intCast(self.at_results.items.len));
@@ -671,11 +705,11 @@ pub const App = struct {
             }
         }
         if (key.matches(vaxis.Key.down, .{ .shift = true })) {
-            self.jumpThreadToBottom();
+            self.jumpTranscriptToBottom();
             return true;
         }
         if (key.matches(vaxis.Key.up, .{})) {
-            _ = self.navigateThread(.previous);
+            _ = self.navigateTranscript(.previous);
             return true;
         }
         if (key.matches(vaxis.Key.down, .{})) {
@@ -683,16 +717,20 @@ pub const App = struct {
             // re-enters the input and traps the cursor there again.
             if (self.block_nav and self.selectionIsLastMessage() and !self.selectedMessageCanScrollDown()) {
                 self.block_nav = false;
-                self.thread_auto_scroll = true;
+                self.thread.auto_scroll = true;
                 _ = try self.moveInputCursorVertical(.down);
                 return true;
             }
-            const scrolled = self.navigateThread(.next);
-            self.thread_auto_scroll = !scrolled and self.selectionIsLastMessage() and !self.selectedMessageIsLong();
+            const scrolled = self.navigateTranscript(.next);
+            self.thread.auto_scroll = !scrolled and self.selectionIsLastMessage() and !self.selectedMessageIsLong();
+            return true;
+        }
+        if (key.matches(vaxis.Key.tab, .{ .ctrl = true })) {
+            self.switchToNextLane();
             return true;
         }
         if (key.matches(vaxis.Key.tab, .{})) {
-            self.thread.toggleSelected();
+            self.thread.transcript.toggleSelected();
             return true;
         }
         return false;
@@ -814,6 +852,10 @@ pub const App = struct {
                     .connect => try self.openProviderPicker(),
                     .model => self.openModelPicker() catch |err| try self.reportConnectionError(err),
                     .diff => self.openDiffViewer() catch |err| try self.reportDiffError(err),
+                    .parallel => self.createParallelLane() catch |err| try self.reportLaneError(err),
+                    .close => self.closeActiveLane() catch |err| try self.reportLaneError(err),
+                    .split => self.toggleSplit(),
+                    .merge => self.mergeActiveLane() catch |err| try self.reportLaneError(err),
                 }
             }
             return true;
@@ -848,7 +890,7 @@ pub const App = struct {
     /// Reload the cached provider API keys from `~/.nova/auth.json`. Drives the
     /// picker badges and the multi-provider model catalogue.
     fn refreshProviderApiKeys(self: *App) !void {
-        const home = self.runtime.?.home_dir;
+        const home = self.liveRuntime().?.home_dir;
         if (home.len == 0) return;
         var fresh = try codex.loadAllProviderApiKeys(self.gpa, self.io, home);
         codex.freeApiKeyMap(self.gpa, &self.provider_api_keys);
@@ -863,7 +905,7 @@ pub const App = struct {
     }
 
     fn openTimelineSelector(self: *App) !void {
-        if (self.turn.isActive()) return error.InFlightTurn;
+        if (self.thread.turn.isActive()) return error.InFlightTurn;
         self.mode = .tree_picker;
         self.clearInput();
         try self.reloadTreeNodes();
@@ -873,7 +915,7 @@ pub const App = struct {
     /// instantly. Cold path: navigate immediately and show "Loading diff…" while
     /// a background refresh fetches it (never blocks on git).
     fn openDiffViewer(self: *App) !void {
-        if (self.runtime == null) return error.NoWorkingDirectory;
+        if (self.liveRuntime() == null) return error.NoWorkingDirectory;
         self.enterDiffMode();
 
         if (self.diff_cache) |raw| {
@@ -882,7 +924,7 @@ pub const App = struct {
             if (state.isEmpty()) {
                 state.deinit(self.gpa);
                 self.mode = .normal;
-                _ = try self.thread.append(self.gpa, .agent, "agent", "No changes to review.");
+                _ = try self.thread.transcript.append(self.gpa, .agent, "agent", "No changes to review.");
                 return;
             }
             self.diff.deinit(self.gpa);
@@ -899,7 +941,7 @@ pub const App = struct {
 
     fn enterDiffMode(self: *App) void {
         self.mode = .diff_viewer;
-        // The diff viewer never draws the thread, so the black-hole visibility
+        // The diff viewer never draws the transcript, so the black-hole visibility
         // (recomputed only there) would stay stuck true and drive a pointless
         // continuous redraw/tick loop. Park it off while in the viewer.
         self.blackhole_visible = false;
@@ -911,7 +953,7 @@ pub const App = struct {
     fn reportDiffError(self: *App, err: anyerror) !void {
         const message = try std.fmt.allocPrint(self.gpa, "Couldn't open diff: {s}", .{@errorName(err)});
         defer self.gpa.free(message);
-        _ = try self.thread.append(self.gpa, .agent, "agent", message);
+        _ = try self.thread.transcript.append(self.gpa, .agent, "agent", message);
         self.mode = .normal;
         self.clearInput();
         self.clearPaletteInput();
@@ -1118,7 +1160,7 @@ pub const App = struct {
     }
 
     fn restoreModelCache(self: *App) !bool {
-        const runtime = self.runtime orelse return false;
+        const runtime = self.liveRuntime() orelse return false;
         if (runtime.home_dir.len == 0) return false;
 
         var configured = try self.collectModelCacheConfigured();
@@ -1142,7 +1184,7 @@ pub const App = struct {
     }
 
     fn saveModelCache(self: *App) !void {
-        const runtime = self.runtime orelse return;
+        const runtime = self.liveRuntime() orelse return;
         if (runtime.home_dir.len == 0) return;
 
         var configured = try self.collectModelCacheConfigured();
@@ -1190,14 +1232,14 @@ pub const App = struct {
     }
 
     fn defaultModelScope(self: *App) ModelScope {
-        const runtime = self.runtime orelse return .global;
+        const runtime = self.liveRuntime() orelse return .global;
         if (config_mod.projectConfigExists(self.gpa, self.io, runtime.cwd)) return .project;
         return .global;
     }
 
     fn connectCodex(self: *App) !void {
-        if (self.turn.isActive()) return error.InFlightTurn;
-        var credentials = try codex.login(self.gpa, self.io, self.runtime.?.home_dir);
+        if (self.thread.turn.isActive()) return error.InFlightTurn;
+        var credentials = try codex.login(self.gpa, self.io, self.liveRuntime().?.home_dir);
         defer credentials.deinit(self.gpa);
         self.models.models_cached = false;
         try self.reloadModelCatalog(.openai_codex);
@@ -1205,25 +1247,25 @@ pub const App = struct {
         const effort = self.selectedReasoningEffort();
         try self.connectCodexClient(credentials, model.id, effort);
         self.codex_signed_in = true;
-        self.runtime.?.codex_connection_expired = false;
+        self.liveRuntime().?.codex_connection_expired = false;
         try self.persistModelSelection(.openai, model.id, effort, .global);
         self.mode = .normal;
         self.clearInput();
-        _ = try self.thread.append(self.gpa, .agent, "agent", "Connected to OpenAI Codex.");
+        _ = try self.thread.transcript.append(self.gpa, .agent, "agent", "Connected to OpenAI Codex.");
     }
 
     fn signOutCodex(self: *App) !void {
-        if (self.turn.isActive()) return error.InFlightTurn;
-        try codex.signOut(self.gpa, self.io, self.runtime.?.home_dir);
-        self.runtime.?.disconnectCodexClient();
+        if (self.thread.turn.isActive()) return error.InFlightTurn;
+        try codex.signOut(self.gpa, self.io, self.liveRuntime().?.home_dir);
+        self.liveRuntime().?.disconnectCodexClient();
         self.codex_signed_in = false;
-        self.runtime.?.codex_connection_expired = false;
-        self.agent.client = self.runtime.?.client;
+        self.liveRuntime().?.codex_connection_expired = false;
+        self.thread.agent.?.client = self.liveRuntime().?.client;
         self.codexModelsClear();
         self.models.models_cached = false;
         self.mode = .normal;
         self.clearInput();
-        _ = try self.thread.append(self.gpa, .agent, "agent", "Signed out from OpenAI Codex.");
+        _ = try self.thread.transcript.append(self.gpa, .agent, "agent", "Signed out from OpenAI Codex.");
     }
 
     /// Save the entered API key for a catalogue provider, then fetch just that
@@ -1231,13 +1273,13 @@ pub const App = struct {
     /// the model picker. A blank key is allowed only for providers that don't
     /// require one (`requiresApiKey() == false`); all current ones do.
     fn submitProviderSetup(self: *App, provider: config_mod.Provider) !void {
-        if (self.turn.isActive()) return error.InFlightTurn;
+        if (self.thread.turn.isActive()) return error.InFlightTurn;
         const key = std.mem.trim(u8, self.provider_key_input.items, " \t\r\n");
 
         // A required key cannot be blank — keep the form open so the user can type.
         if (key.len == 0 and provider.requiresApiKey()) return;
 
-        const home = self.runtime.?.home_dir;
+        const home = self.liveRuntime().?.home_dir;
         if (key.len > 0) {
             try codex.saveProviderApiKey(self.gpa, self.io, home, provider.label(), key);
         } else {
@@ -1303,15 +1345,15 @@ pub const App = struct {
     }
 
     fn applySelectedModel(self: *App) !void {
-        if (self.turn.state == .interrupting) self.discardAbandonedTurn();
-        if (self.turn.isActive()) return error.InFlightTurn;
+        if (self.thread.turn.state == .interrupting) self.discardAbandonedTurn();
+        if (self.thread.turn.isActive()) return error.InFlightTurn;
         const model = self.selectedCodexModel() orelse return error.NoModels;
         const effort = self.selectedReasoningEffort();
 
         const source = self.selectedModelSource() orelse return error.NoModels;
         switch (source) {
             .openai_codex => {
-                const loaded = try codex.load(self.gpa, self.io, self.runtime.?.home_dir);
+                const loaded = try codex.load(self.gpa, self.io, self.liveRuntime().?.home_dir);
                 if (loaded) |codex_creds| {
                     var credentials = codex_creds;
                     defer credentials.deinit(self.gpa);
@@ -1347,10 +1389,10 @@ pub const App = struct {
         var updates = try self.modelSelectionUpdates(provider, model_id, effort);
         defer updates.deinit(self.gpa);
         switch (scope) {
-            .global => config_mod.mergeAndWriteGlobal(self.gpa, self.io, self.runtime.?.home_dir, updates) catch |err| {
+            .global => config_mod.mergeAndWriteGlobal(self.gpa, self.io, self.liveRuntime().?.home_dir, updates) catch |err| {
                 std.log.warn("config.write.failed err={s}", .{@errorName(err)});
             },
-            .project => config_mod.mergeAndWriteProject(self.gpa, self.io, self.runtime.?.cwd, updates) catch |err| {
+            .project => config_mod.mergeAndWriteProject(self.gpa, self.io, self.liveRuntime().?.cwd, updates) catch |err| {
                 std.log.warn("project.config.write.failed err={s}", .{@errorName(err)});
             },
             .session => unreachable,
@@ -1450,7 +1492,7 @@ pub const App = struct {
     }
 
     fn activeModelId(self: *const App) ?[]const u8 {
-        const status = tui_status.modelStatus(self.runtime, self.cached_config) orelse return null;
+        const status = tui_status.modelStatus(self.liveRuntime(), self.cached_config) orelse return null;
         return status.model;
     }
 
@@ -1674,8 +1716,8 @@ pub const App = struct {
         model: []const u8,
         effort: ai.ReasoningEffort,
     ) !void {
-        try self.runtime.?.connectCodexClient(credentials, model, effort);
-        self.agent.client = self.runtime.?.client;
+        try self.liveRuntime().?.connectCodexClient(credentials, model, effort);
+        self.thread.agent.?.client = self.liveRuntime().?.client;
     }
 
     fn attachOpenAiCompatibleClient(
@@ -1685,15 +1727,15 @@ pub const App = struct {
         model_id: []const u8,
         effort: ai.ReasoningEffort,
     ) !void {
-        try self.runtime.?.attachOpenAiCompatibleClient(base_url, api_key, model_id, effort);
-        self.agent.client = self.runtime.?.client;
+        try self.liveRuntime().?.attachOpenAiCompatibleClient(base_url, api_key, model_id, effort);
+        self.thread.agent.?.client = self.liveRuntime().?.client;
     }
 
     fn reloadResumeSessions(self: *App) !void {
         self.resumeClear();
-        var manager = try session_mod.SessionManager.initDefault(self.gpa, self.io, self.runtime.?.cwd);
+        var manager = try session_mod.SessionManager.initDefault(self.gpa, self.io, self.liveRuntime().?.cwd);
         defer manager.deinit();
-        const cwd = if (self.resume_global) null else self.runtime.?.cwd;
+        const cwd = if (self.resume_global) null else self.liveRuntime().?.cwd;
         const summaries = try manager.list(self.gpa, cwd);
         try self.resume_summaries.appendSlice(self.gpa, summaries);
         if (self.resume_global) std.mem.sort(
@@ -1755,7 +1797,7 @@ pub const App = struct {
     }
 
     fn reloadTreeNodes(self: *App) !void {
-        const writer = &self.runtime.?.session_writer;
+        const writer = &self.liveRuntime().?.session_writer;
         const records = try writer.entries(self.gpa);
         defer {
             for (records) |*record| record.deinit(self.gpa);
@@ -1765,12 +1807,12 @@ pub const App = struct {
     }
 
     /// Switch the session leaf to `entry_id`, then rehydrate the agent's
-    /// conversation and the display thread from the new branch. Refused mid-turn.
+    /// conversation and the display transcript from the new branch. Refused mid-turn.
     fn navigateToEntry(self: *App, entry_id: []const u8) !void {
-        if (self.turn.isActive()) return error.InFlightTurn;
-        try self.runtime.?.session_writer.navigate(entry_id);
-        try self.runtime.?.reloadMessages();
-        try self.rebuildThreadFromAgent();
+        if (self.thread.turn.isActive()) return error.InFlightTurn;
+        try self.liveRuntime().?.session_writer.navigate(entry_id);
+        try self.liveRuntime().?.reloadMessages();
+        try self.rebuildTranscriptFromAgent();
     }
 
     fn clearInput(self: *App) void {
@@ -1806,7 +1848,7 @@ pub const App = struct {
     }
 
     fn startAtSearchBackend(self: *App) void {
-        const cwd = if (self.runtime) |runtime| runtime.cwd else ".";
+        const cwd = if (self.liveRuntime()) |runtime| runtime.cwd else ".";
         search_mod.start(std.heap.smp_allocator, self.io, cwd);
     }
 
@@ -1833,7 +1875,7 @@ pub const App = struct {
     }
 
     fn refreshSkillResults(self: *App) !void {
-        const runtime = self.runtime orelse return;
+        const runtime = self.liveRuntime() orelse return;
         const names = try skill_mod.filterNames(self.gpa, runtime.skills, self.at_query);
         errdefer {
             for (names) |name| self.gpa.free(name);
@@ -1904,7 +1946,7 @@ pub const App = struct {
         }
         // Enqueue the raw text; the worker expands `@`-mentions when it drains
         // the queue, keeping file I/O off the UI thread.
-        self.agent.enqueueUser(prompt) catch |err| switch (err) {
+        self.thread.agent.?.enqueueUser(prompt) catch |err| switch (err) {
             error.QueueFull => {
                 self.gpa.free(prompt);
                 try self.appendMessageQueueFullNotice();
@@ -1912,23 +1954,23 @@ pub const App = struct {
             },
             else => return err,
         };
-        try self.queued_user_messages.append(self.gpa, .{ .text = prompt });
+        try self.thread.queued.append(self.gpa, .{ .text = prompt });
         // Select the newest message so the line above the input shows what was
         // just queued; ALT+← walks back to older ones.
-        self.queued_selection = self.queued_user_messages.items.len - 1;
+        self.queued_selection = self.thread.queued.items.len - 1;
         self.clearInput();
         return false;
     }
 
     /// Move the queued-message selection one older (ALT+←).
     fn selectPrevQueued(self: *App) void {
-        if (self.queued_user_messages.items.len == 0) return;
+        if (self.thread.queued.items.len == 0) return;
         if (self.queued_selection > 0) self.queued_selection -= 1;
     }
 
     /// Move the queued-message selection one newer (ALT+→).
     fn selectNextQueued(self: *App) void {
-        const len = self.queued_user_messages.items.len;
+        const len = self.thread.queued.items.len;
         if (len == 0) return;
         if (self.queued_selection + 1 < len) self.queued_selection += 1;
     }
@@ -1937,47 +1979,47 @@ pub const App = struct {
     /// injected after the next tool batch. Updates both the UI mirror and the
     /// agent queue so the worker's drain decision matches what's on screen.
     fn steerSelectedQueued(self: *App) void {
-        const items = self.queued_user_messages.items;
+        const items = self.thread.queued.items;
         if (items.len == 0) return;
         const index = @min(self.queued_selection, items.len - 1);
         items[index].steer = true;
-        self.agent.setQueuedSteer(@intCast(index));
+        self.thread.agent.?.setQueuedSteer(@intCast(index));
     }
 
     fn appendMessageQueueFullNotice(self: *App) !void {
         // The spinner is derived from the turn view and drawn outside the
         // transcript, so appending needs no remove/re-append dance.
-        _ = try self.thread.append(self.gpa, .notice, "notice", "MessageQueueFull");
+        _ = try self.thread.transcript.append(self.gpa, .notice, "notice", "MessageQueueFull");
     }
 
-    fn appendSkillInvocationsToThread(self: *App, prompt: []const u8) !void {
-        const runtime = self.runtime orelse return;
+    fn appendSkillInvocationsToTranscript(self: *App, prompt: []const u8) !void {
+        const runtime = self.liveRuntime() orelse return;
         const names = try skill_mod.collectInvocations(self.gpa, runtime.skills, prompt);
         defer self.gpa.free(names);
         for (names) |name| {
             const title = try std.fmt.allocPrint(self.gpa, "[SKILL] {s}", .{name});
             defer self.gpa.free(title);
-            _ = try self.thread.append(self.gpa, .skill, title, "");
+            _ = try self.thread.transcript.append(self.gpa, .skill, title, "");
         }
     }
 
-    fn flushQueuedUserMessagesToThread(self: *App, count: u32) !void {
-        const flush_count: usize = @min(count, self.queued_user_messages.items.len);
-        for (self.queued_user_messages.items[0..flush_count]) |message| {
-            _ = try self.thread.append(self.gpa, .user, "you", message.text);
-            try self.appendSkillInvocationsToThread(message.text);
+    fn flushQueuedUserMessagesToTranscript(self: *App, count: u32) !void {
+        const flush_count: usize = @min(count, self.thread.queued.items.len);
+        for (self.thread.queued.items[0..flush_count]) |message| {
+            _ = try self.thread.transcript.append(self.gpa, .user, "you", message.text);
+            try self.appendSkillInvocationsToTranscript(message.text);
             self.gpa.free(message.text);
         }
-        std.mem.copyForwards(QueuedMessage, self.queued_user_messages.items[0 .. self.queued_user_messages.items.len - flush_count], self.queued_user_messages.items[flush_count..]);
-        self.queued_user_messages.shrinkRetainingCapacity(self.queued_user_messages.items.len - flush_count);
+        std.mem.copyForwards(Thread.QueuedMessage, self.thread.queued.items[0 .. self.thread.queued.items.len - flush_count], self.thread.queued.items[flush_count..]);
+        self.thread.queued.shrinkRetainingCapacity(self.thread.queued.items.len - flush_count);
         // Messages drain from the front, so shift the selection left to keep it
         // pointing at the same logical message (clamped into range).
         self.queued_selection -|= flush_count;
     }
 
     fn clearQueuedUserMessages(self: *App) void {
-        for (self.queued_user_messages.items) |message| self.gpa.free(message.text);
-        self.queued_user_messages.clearRetainingCapacity();
+        for (self.thread.queued.items) |message| self.gpa.free(message.text);
+        self.thread.queued.clearRetainingCapacity();
         self.queued_selection = 0;
     }
 
@@ -2008,7 +2050,7 @@ pub const App = struct {
         self.clearInput();
         var buffer: [128]u8 = undefined;
         const message = std.fmt.bufPrint(&buffer, "Could not switch session: {s}", .{@errorName(err)}) catch "Could not switch session.";
-        _ = try self.thread.append(self.gpa, .agent, "agent", message);
+        _ = try self.thread.transcript.append(self.gpa, .agent, "agent", message);
     }
 
     fn reportConnectionError(self: *App, err: anyerror) !void {
@@ -2016,12 +2058,12 @@ pub const App = struct {
         self.clearInput();
         var buffer: [128]u8 = undefined;
         const message = std.fmt.bufPrint(&buffer, "Could not connect to provider: {s}", .{@errorName(err)}) catch "Could not connect to provider.";
-        _ = try self.thread.append(self.gpa, .agent, "agent", message);
+        _ = try self.thread.transcript.append(self.gpa, .agent, "agent", message);
     }
 
     fn switchToNewSession(self: *App) !void {
-        if (self.turn.isActive()) return error.InFlightTurn;
-        const runtime = try self.createRuntime(null);
+        if (self.thread.turn.isActive()) return error.InFlightTurn;
+        const runtime = try self.createRuntime(self.liveRuntime().?.cwd, null);
         errdefer {
             runtime.deinit();
             self.gpa.destroy(runtime);
@@ -2031,18 +2073,18 @@ pub const App = struct {
     }
 
     fn switchToSession(self: *App, session_id: []const u8) !void {
-        if (self.turn.isActive()) return error.InFlightTurn;
-        const runtime = try self.createRuntime(session_id);
+        if (self.thread.turn.isActive()) return error.InFlightTurn;
+        const runtime = try self.createRuntime(self.liveRuntime().?.cwd, session_id);
         errdefer {
             runtime.deinit();
             self.gpa.destroy(runtime);
         }
         try self.installRuntime(runtime);
-        try self.rebuildThreadFromAgent();
+        try self.rebuildTranscriptFromAgent();
     }
 
-    fn createRuntime(self: *App, session_id: ?[]const u8) !*runtime_mod.AgentRuntime {
-        const current = self.runtime.?;
+    fn createRuntime(self: *App, cwd: []const u8, session_id: ?[]const u8) !*runtime_mod.AgentRuntime {
+        const current = self.liveRuntime().?;
         const runtime = try self.gpa.create(runtime_mod.AgentRuntime);
         errdefer self.gpa.destroy(runtime);
         const diagnostics = try current.gpa.alloc(config_mod.Diagnostic, 0);
@@ -2051,7 +2093,7 @@ pub const App = struct {
             try runtime.initResume(
                 current.gpa,
                 self.io,
-                current.cwd,
+                cwd,
                 current.home_dir,
                 current.base_system_prompt,
                 self.cached_config,
@@ -2062,7 +2104,7 @@ pub const App = struct {
             try runtime.initNew(
                 current.gpa,
                 self.io,
-                current.cwd,
+                cwd,
                 current.home_dir,
                 current.base_system_prompt,
                 self.cached_config,
@@ -2072,57 +2114,283 @@ pub const App = struct {
         return runtime;
     }
 
+    /// Repo root = the primary lane's working directory (it was launched there).
+    /// Null only if the primary somehow has no runtime (headless/test).
+    fn repoRoot(self: *const App) ?[]const u8 {
+        return switch (self.threads.items[0].engine) {
+            .live => |live| live.runtime.cwd,
+            .idle, .archived => null,
+        };
+    }
+
+    /// Spawn a parallel lane: a fresh jj workspace branched from the active
+    /// lane's current code state, with its own session + agent, then switch to
+    /// it. The new lane runs the same project in isolation. Lanes still run one
+    /// at a time (per-lane event routing is a later step), so creation is
+    /// refused mid-turn.
+    fn createParallelLane(self: *App) !void {
+        const current = self.liveRuntime() orelse return error.NoActiveRuntime;
+        const repo = self.repoRoot() orelse return error.NoActiveRuntime;
+        if (!jj.isAvailable(self.gpa, self.io)) return error.JjUnavailable;
+        try jj.ensureColocated(self.gpa, self.io, repo);
+
+        var raw: [6]u8 = undefined;
+        self.io.random(&raw);
+        const id = std.fmt.bytesToHex(raw, .lower);
+
+        const ws_str = try std.fmt.allocPrint(self.gpa, "nova-{s}", .{id[0..]});
+        defer self.gpa.free(ws_str);
+        const workspace = try jj.WorkspaceName.parse(ws_str);
+        const bm_str = try std.fmt.allocPrint(self.gpa, "nova/{s}", .{id[0..]});
+        defer self.gpa.free(bm_str);
+        const bookmark = try jj.BookmarkName.parse(bm_str);
+
+        const parent = try std.fs.path.join(self.gpa, &.{ repo, ".nova", "workspaces" });
+        defer self.gpa.free(parent);
+        std.Io.Dir.cwd().createDirPath(self.io, parent) catch {};
+        const dest = try std.fs.path.join(self.gpa, &.{ parent, id[0..] });
+        errdefer self.gpa.free(dest);
+
+        const base = try jj.workingCopyChangeId(self.gpa, self.io, current.cwd);
+        try jj.workspaceAdd(self.gpa, self.io, repo, workspace, dest, base);
+        errdefer jj.workspaceForget(self.gpa, self.io, repo, workspace) catch {};
+
+        const runtime = try self.createRuntime(dest, null);
+        errdefer {
+            runtime.deinit();
+            self.gpa.destroy(runtime);
+        }
+
+        const lane = try self.gpa.create(Thread);
+        errdefer self.gpa.destroy(lane);
+        lane.* = .{
+            .id = runtime.session_writer.session.id,
+            .agent = &runtime.agent,
+            .worker_context = .{ .io = self.io, .gpa = runtime.gpa },
+            .engine = .{ .live = .{
+                .lane = .{ .working = .{ .workspace = workspace, .bookmark = bookmark, .base = base, .path = dest } },
+                .runtime = runtime,
+                .owns = true,
+            } },
+        };
+        try self.threads.append(self.gpa, lane);
+
+        // Committed: `threads` owns `lane`, which owns `runtime`/`dest`.
+        self.thread = lane;
+        self.mode = .normal;
+        self.clearInput();
+        self.resetTurnState();
+    }
+
+    fn reportLaneError(self: *App, err: anyerror) !void {
+        self.mode = .normal;
+        self.clearInput();
+        const message = try std.fmt.allocPrint(self.gpa, "Lane operation failed: {s}", .{@errorName(err)});
+        defer self.gpa.free(message);
+        _ = try self.thread.transcript.append(self.gpa, .agent, "agent", message);
+    }
+
+    /// Merge the active (working) lane onto main: seal both sides, rebase the
+    /// lane's checkpoint chain onto the primary's head, and — only if the rebase
+    /// is conflict-free — advance the primary onto the result and retire the
+    /// lane. Conflicts abort and `jj undo` the rebase, leaving main untouched
+    /// (the guided per-conflict resolution loop is a follow-on). The primary
+    /// (index 0) can't be merged; refused mid-turn.
+    ///
+    /// NOTE: the jj rebase/conflict revsets are unverified against a live jj —
+    /// confirm with a throwaway repo before relying on this. `jj undo` is the net.
+    fn mergeActiveLane(self: *App) !void {
+        if (self.thread.turn.isActive()) return error.InFlightTurn;
+        const index = self.activeIndex();
+        if (index == 0) return error.CannotMergePrimaryLane;
+        if (!jj.isAvailable(self.gpa, self.io)) return error.JjUnavailable;
+        const repo = self.repoRoot() orelse return error.NoActiveRuntime;
+
+        const lane = self.thread;
+        const live = switch (lane.engine) {
+            .live => |l| l,
+            .idle, .archived => return error.NotAWorkingLane,
+        };
+        const working = switch (live.lane) {
+            .working => |w| w,
+            .primary => return error.NotAWorkingLane,
+        };
+        const lane_rt = live.runtime;
+        const primary = self.threads.items[0];
+        const primary_rt = switch (primary.engine) {
+            .live => |l| l.runtime,
+            .idle, .archived => return error.NoActiveRuntime,
+        };
+
+        // Seal pending work on both sides so the heads are well-defined.
+        _ = jj.sealTurn(self.gpa, self.io, lane_rt.cwd, "nova: pre-merge seal") catch null;
+        _ = jj.sealTurn(self.gpa, self.io, primary_rt.cwd, "nova: pre-merge seal") catch null;
+
+        const lane_head_raw = (try lane_rt.session_writer.checkpointHead(self.gpa)) orelse return error.NothingToMerge;
+        defer self.gpa.free(lane_head_raw);
+        const main_head_raw = (try primary_rt.session_writer.checkpointHead(self.gpa)) orelse return error.NothingToMerge;
+        defer self.gpa.free(main_head_raw);
+        const lane_head = try jj.ChangeId.parse(lane_head_raw);
+        const main_head = try jj.ChangeId.parse(main_head_raw);
+
+        // Rebase the lane's chain onto main. jj records conflicts as data; if any
+        // survive, undo the rebase so main is untouched and bail (resolution loop
+        // is a follow-on).
+        try jj.rebaseChainOnto(self.gpa, self.io, repo, working.base, lane_head, main_head);
+        if (try jj.rangeHasConflicts(self.gpa, self.io, repo, working.base, lane_head)) {
+            jj.undoLast(self.gpa, self.io, repo) catch {};
+            return error.MergeConflicts;
+        }
+
+        // Clean: advance the primary's working copy onto the landed work.
+        try jj.newOnTop(self.gpa, self.io, primary_rt.cwd, lane_head);
+
+        // Retire the lane — its work is now on main. Capture the workspace name +
+        // path (freed by `lane.deinit`) before teardown.
+        const ws = working.workspace;
+        const dir = try self.gpa.dupe(u8, working.path);
+        defer self.gpa.free(dir);
+        self.thread = primary;
+        _ = self.threads.orderedRemove(index);
+        lane.deinit(self.gpa);
+        self.gpa.destroy(lane);
+        jj.workspaceForget(self.gpa, self.io, repo, ws) catch {};
+        std.Io.Dir.cwd().deleteTree(self.io, dir) catch {};
+        self.split = false;
+        self.block_nav = false;
+        self.clearInput();
+
+        _ = try self.thread.transcript.append(self.gpa, .notice, "notice", "Lane merged onto main.");
+    }
+
+    fn activeIndex(self: *const App) usize {
+        for (self.threads.items, 0..) |lane, index| {
+            if (lane == self.thread) return index;
+        }
+        return 0;
+    }
+
+    /// True while any lane has a turn in flight — keeps the drain/animation tick
+    /// alive so background lanes' events (and their terminal `turn_finished`)
+    /// keep draining even when the visible lane is idle.
+    fn anyTurnActive(self: *const App) bool {
+        for (self.threads.items) |lane| {
+            if (lane.turn.state != .idle) return true;
+        }
+        return false;
+    }
+
+    /// Cycle to the next lane (wrapping). No-op with a single lane or mid-turn:
+    /// lanes share one worker until per-lane event routing lands, so switching
+    /// during a turn would misroute its events.
+    /// Toggle split view (tile all lanes as columns vs. show only the active).
+    fn toggleSplit(self: *App) void {
+        self.split = !self.split;
+        self.mode = .normal;
+    }
+
+    fn switchToNextLane(self: *App) void {
+        if (self.threads.items.len < 2) return;
+        const next = (self.activeIndex() + 1) % self.threads.items.len;
+        self.thread = self.threads.items[next];
+        self.block_nav = false;
+        self.clearInput();
+    }
+
+    /// Close (abandon) the active lane: tear it down, forget its jj workspace,
+    /// and delete the workspace directory, then fall back to the previous lane.
+    /// The primary lane (index 0) can't be closed. Refused mid-turn.
+    fn closeActiveLane(self: *App) !void {
+        if (self.thread.turn.isActive()) return error.InFlightTurn;
+        const index = self.activeIndex();
+        if (index == 0) return error.CannotClosePrimaryLane;
+
+        const lane = self.threads.items[index];
+        var workspace: ?jj.WorkspaceName = null;
+        var dir: ?[]u8 = null;
+        switch (lane.engine) {
+            .live => |live| switch (live.lane) {
+                .working => |w| {
+                    workspace = w.workspace;
+                    dir = try self.gpa.dupe(u8, w.path);
+                },
+                .primary => {},
+            },
+            .idle, .archived => {},
+        }
+        defer if (dir) |d| self.gpa.free(d);
+
+        // Switch away and drop the lane from the list before teardown so nothing
+        // dereferences it afterward. `lane.deinit` closes its session DB (inside
+        // `dir`), so the directory is safe to delete only after it returns.
+        self.thread = self.threads.items[index - 1];
+        _ = self.threads.orderedRemove(index);
+        lane.deinit(self.gpa);
+        self.gpa.destroy(lane);
+
+        if (workspace) |w| {
+            if (self.repoRoot()) |repo| jj.workspaceForget(self.gpa, self.io, repo, w) catch {};
+        }
+        if (dir) |d| std.Io.Dir.cwd().deleteTree(self.io, d) catch {};
+
+        self.block_nav = false;
+        self.clearInput();
+    }
+
     fn installRuntime(self: *App, runtime: *runtime_mod.AgentRuntime) !void {
-        if (self.turn.isActive()) return error.InFlightTurn;
-        self.runtime.?.deinit();
-        self.gpa.destroy(self.runtime.?);
-        self.runtime = runtime;
-        self.agent = &runtime.agent;
+        if (self.thread.turn.isActive()) return error.InFlightTurn;
+        if (self.liveRuntime()) |old| {
+            old.deinit();
+            self.gpa.destroy(old);
+        }
+        self.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = true } };
+        self.thread.agent = &runtime.agent;
+        self.thread.id = runtime.session_writer.session.id;
         self.mode = .normal;
         self.clearInput();
         self.resetTurnState();
     }
 
     fn clearConversation(self: *App) !void {
-        if (self.thread.messages.items.len > 0) {
-            try self.retired_threads.append(self.gpa, self.thread);
+        if (self.thread.transcript.messages.items.len > 0) {
+            try self.retired_transcripts.append(self.gpa, self.thread.transcript);
         }
-        self.thread = .{};
-        self.thread_list.scroll = .{};
+        self.thread.transcript = .{};
+        self.thread.transcript_list.scroll = .{};
     }
 
-    fn rebuildThreadFromAgent(self: *App) !void {
+    fn rebuildTranscriptFromAgent(self: *App) !void {
         try self.clearConversation();
-        for (self.agent.messages()) |message| {
+        for (self.thread.agent.?.messages()) |message| {
             if (message.role == .system) continue;
             const text = message.text();
             if (message.role == .user) {
-                _ = try self.thread.append(self.gpa, .user, "you", text);
+                _ = try self.thread.transcript.append(self.gpa, .user, "you", text);
             } else if (message.role == .assistant) {
-                if (text.len > 0) _ = try self.thread.append(self.gpa, .agent, "agent", text);
+                if (text.len > 0) _ = try self.thread.transcript.append(self.gpa, .agent, "agent", text);
             } else if (message.role == .tool) {
                 const title = try self.resumedToolTitle(message);
                 defer self.gpa.free(title);
-                const index = try self.thread.append(self.gpa, .tool, title, text);
-                self.thread.messages.items[index].failed = message.tool_failed;
+                const index = try self.thread.transcript.append(self.gpa, .tool, title, text);
+                self.thread.transcript.messages.items[index].failed = message.tool_failed;
             }
         }
-        if (self.thread.messages.items.len > 0) self.thread.selected = @intCast(self.thread.messages.items.len - 1);
+        if (self.thread.transcript.messages.items.len > 0) self.thread.transcript.selected = @intCast(self.thread.transcript.messages.items.len - 1);
     }
 
     fn resumedToolTitle(self: *App, message: ai.ChatMessage) ![]u8 {
-        if (message.tool_display_label) |label| return thread_mod.toolTitle(self.gpa, label);
-        const id = message.call_id orelse return thread_mod.toolTitle(self.gpa, "tool");
-        for (self.agent.messages()) |candidate| {
+        if (message.tool_display_label) |label| return transcript_mod.toolTitle(self.gpa, label);
+        const id = message.call_id orelse return transcript_mod.toolTitle(self.gpa, "tool");
+        for (self.thread.agent.?.messages()) |candidate| {
             for (candidate.content) |block| {
                 if (block != .tool_call) continue;
                 if (!std.mem.eql(u8, block.tool_call.call_id, id)) continue;
                 var display = try agent_mod.formatToolDisplay(self.gpa, block.tool_call.name, block.tool_call.arguments);
                 defer display.deinit(self.gpa);
-                return thread_mod.toolTitle(self.gpa, display.label);
+                return transcript_mod.toolTitle(self.gpa, display.label);
             }
         }
-        return thread_mod.toolTitle(self.gpa, id);
+        return transcript_mod.toolTitle(self.gpa, id);
     }
 
     fn peekInput(self: *App) ![]u8 {
@@ -2184,9 +2452,9 @@ pub const App = struct {
     }
 
     fn selectionIsLastMessage(self: *const App) bool {
-        const selected = self.thread.selected orelse return false;
-        if (self.thread.messages.items.len == 0) return false;
-        return selected == self.thread.messages.items.len - 1;
+        const selected = self.thread.transcript.selected orelse return false;
+        if (self.thread.transcript.messages.items.len == 0) return false;
+        return selected == self.thread.transcript.messages.items.len - 1;
     }
 
     fn diffCountsVisible(self: *const App) bool {
@@ -2195,7 +2463,7 @@ pub const App = struct {
     }
 
     fn refreshDiffCounts(self: *App) !bool {
-        const cwd = if (self.runtime) |runtime| runtime.cwd else ".";
+        const cwd = if (self.liveRuntime()) |runtime| runtime.cwd else ".";
         var result = try bash_mod.runWithOptions(self.gpa, self.io, .{
             .cwd = cwd,
             .command = diffCountCommand,
@@ -2221,7 +2489,7 @@ pub const App = struct {
             return;
         }
 
-        const cwd_source = if (self.runtime) |runtime| runtime.cwd else ".";
+        const cwd_source = if (self.liveRuntime()) |runtime| runtime.cwd else ".";
         const cwd = try self.gpa.dupe(u8, cwd_source);
         errdefer self.gpa.free(cwd);
 
@@ -2278,7 +2546,7 @@ pub const App = struct {
                 if (self.diff_loading) {
                     self.diff_loading = false;
                     self.mode = .normal;
-                    _ = try self.thread.append(self.gpa, .agent, "agent", "Couldn't load diff.");
+                    _ = try self.thread.transcript.append(self.gpa, .agent, "agent", "Couldn't load diff.");
                     visible_change = true;
                 }
             },
@@ -2297,45 +2565,45 @@ pub const App = struct {
             state.deinit(self.gpa);
             self.mode = .normal;
             self.clearInput();
-            _ = try self.thread.append(self.gpa, .agent, "agent", "No changes to review.");
+            _ = try self.thread.transcript.append(self.gpa, .agent, "agent", "No changes to review.");
             return;
         }
         self.diff.deinit(self.gpa);
         self.diff = state;
     }
 
-    fn jumpThreadToBottom(self: *App) void {
+    fn jumpTranscriptToBottom(self: *App) void {
         self.block_nav = false;
-        self.thread.selectLast();
-        self.thread_auto_scroll = true;
-        self.thread_list.scroll.pending_lines = 0;
-        self.thread_list.scroll.wants_cursor = false;
+        self.thread.transcript.selectLast();
+        self.thread.auto_scroll = true;
+        self.thread.transcript_list.scroll.pending_lines = 0;
+        self.thread.transcript_list.scroll.wants_cursor = false;
     }
 
     fn updateMouseAutoScroll(self: *App) void {
-        self.thread_auto_scroll = !self.thread_list.scroll.has_more and
+        self.thread.auto_scroll = !self.thread.transcript_list.scroll.has_more and
             self.selectionIsLastMessage() and
             !self.selectedMessageIsLong();
     }
 
-    fn navigateThread(self: *App, direction: ThreadNavigation) bool {
-        self.thread_auto_scroll = false;
+    fn navigateTranscript(self: *App, direction: TranscriptNavigation) bool {
+        self.thread.auto_scroll = false;
         if (self.scrollSelectedLongMessage(direction)) return true;
 
-        const selected_before = self.thread.selected;
+        const selected_before = self.thread.transcript.selected;
         switch (direction) {
-            .previous => self.thread.moveSelection(.previous),
-            .next => self.thread.moveSelection(.next),
+            .previous => self.thread.transcript.moveSelection(.previous),
+            .next => self.thread.transcript.moveSelection(.next),
         }
-        if (self.thread.selected != selected_before) self.anchorSelectedLongMessage(direction);
+        if (self.thread.transcript.selected != selected_before) self.anchorSelectedLongMessage(direction);
         return false;
     }
 
-    fn scrollSelectedLongMessage(self: *App, direction: ThreadNavigation) bool {
-        const selected = self.thread.selected orelse return false;
-        if (selected >= self.thread.messages.items.len) return false;
-        const rows = messageRowsCached(&self.thread.messages.items[selected], ConversationLayout.contentWidth(self.thread_view_width));
-        const height = self.thread_view_height;
+    fn scrollSelectedLongMessage(self: *App, direction: TranscriptNavigation) bool {
+        const selected = self.thread.transcript.selected orelse return false;
+        if (selected >= self.thread.transcript.messages.items.len) return false;
+        const rows = messageRowsCached(&self.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(self.thread.transcript_view_width));
+        const height = self.thread.transcript_view_height;
         if (rows <= height) return false;
         const rows_hidden = rows - height;
         const step = scrollStepRows(height);
@@ -2357,29 +2625,29 @@ pub const App = struct {
     }
 
     fn selectedMessageIsLong(self: *const App) bool {
-        const selected = self.thread.selected orelse return false;
-        if (selected >= self.thread.messages.items.len) return false;
-        const rows = messageRowsCached(&self.thread.messages.items[selected], ConversationLayout.contentWidth(self.thread_view_width));
-        return rows > self.thread_view_height;
+        const selected = self.thread.transcript.selected orelse return false;
+        if (selected >= self.thread.transcript.messages.items.len) return false;
+        const rows = messageRowsCached(&self.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(self.thread.transcript_view_width));
+        return rows > self.thread.transcript_view_height;
     }
 
     /// True when the selected message is taller than the viewport and still has
     /// rows hidden below the current scroll offset (mirrors the `.next` branch of
     /// `scrollSelectedLongMessage`).
     fn selectedMessageCanScrollDown(self: *const App) bool {
-        const selected = self.thread.selected orelse return false;
-        if (selected >= self.thread.messages.items.len) return false;
-        const rows = messageRowsCached(&self.thread.messages.items[selected], ConversationLayout.contentWidth(self.thread_view_width));
-        const height = self.thread_view_height;
+        const selected = self.thread.transcript.selected orelse return false;
+        if (selected >= self.thread.transcript.messages.items.len) return false;
+        const rows = messageRowsCached(&self.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(self.thread.transcript_view_width));
+        const height = self.thread.transcript_view_height;
         if (rows <= height) return false;
         return self.selectedMessageOffset(selected) < rows - height;
     }
 
-    fn anchorSelectedLongMessage(self: *App, direction: ThreadNavigation) void {
-        const selected = self.thread.selected orelse return;
-        if (selected >= self.thread.messages.items.len) return;
-        const rows = messageRowsCached(&self.thread.messages.items[selected], ConversationLayout.contentWidth(self.thread_view_width));
-        const height = self.thread_view_height;
+    fn anchorSelectedLongMessage(self: *App, direction: TranscriptNavigation) void {
+        const selected = self.thread.transcript.selected orelse return;
+        if (selected >= self.thread.transcript.messages.items.len) return;
+        const rows = messageRowsCached(&self.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(self.thread.transcript_view_width));
+        const height = self.thread.transcript_view_height;
         if (rows <= height) return;
         const offset = switch (direction) {
             .next => 0,
@@ -2389,16 +2657,16 @@ pub const App = struct {
     }
 
     fn selectedMessageOffset(self: *const App, selected: u32) u16 {
-        if (self.thread_list.scroll.top == selected) return @intCast(@max(self.thread_list.scroll.offset, 0));
+        if (self.thread.transcript_list.scroll.top == selected) return @intCast(@max(self.thread.transcript_list.scroll.offset, 0));
         return 0;
     }
 
     fn setSelectedMessageOffset(self: *App, selected: u32, offset: u16) void {
-        self.thread_list.cursor = selected;
-        self.thread_list.scroll.top = selected;
-        self.thread_list.scroll.offset = @intCast(offset);
-        self.thread_list.scroll.pending_lines = 0;
-        self.thread_list.scroll.wants_cursor = false;
+        self.thread.transcript_list.cursor = selected;
+        self.thread.transcript_list.scroll.top = selected;
+        self.thread.transcript_list.scroll.offset = @intCast(offset);
+        self.thread.transcript_list.scroll.pending_lines = 0;
+        self.thread.transcript_list.scroll.wants_cursor = false;
     }
 };
 
@@ -2446,7 +2714,7 @@ const RootLayout = struct {
     input_height: u16,
     loading_height: u16,
     panel_height: u16,
-    thread_height: u16,
+    transcript_height: u16,
     loading_row: u16,
     panel_row: u16,
     input_row: u16,
@@ -2458,16 +2726,16 @@ fn rootLayout(max_height: u16, panel_visible: bool, input_text_rows: u16, loadin
     const input_height: u16 = @min(max_height, @min(desired, max_allowed));
     const above_input_height: u16 = max_height - input_height;
     const loading_height: u16 = if (loading_visible) @min(loading_status_rows, above_input_height) else 0;
-    const thread_height: u16 = above_input_height - loading_height;
-    const panel_height: u16 = if (panel_visible) @min(thread_height, 7) else 0;
+    const transcript_height: u16 = above_input_height - loading_height;
+    const panel_height: u16 = if (panel_visible) @min(transcript_height, 7) else 0;
     return .{
         .input_height = input_height,
         .loading_height = loading_height,
         .panel_height = panel_height,
-        .thread_height = thread_height,
-        .loading_row = thread_height,
-        .panel_row = thread_height - panel_height,
-        .input_row = thread_height + loading_height,
+        .transcript_height = transcript_height,
+        .loading_row = transcript_height,
+        .panel_row = transcript_height - panel_height,
+        .input_row = transcript_height + loading_height,
     };
 }
 
@@ -2485,7 +2753,7 @@ pub fn run(
     var fw_app = try vxfw.App.init(init.io, gpa, init.environ_map, &tty_buffer);
     defer fw_app.deinit();
 
-    var app = App.initRuntime(init.io, gpa, runtime, config);
+    var app = try App.initRuntime(init.io, gpa, runtime, config);
     app.bindInputCallbacks();
     defer app.deinit();
 
@@ -2497,7 +2765,7 @@ pub fn run(
 
     // The logo message is a marker: the black-hole animation renders its frames
     // directly (see tui/blackhole.zig), so the body is intentionally empty.
-    _ = try app.thread.append(gpa, .logo, "logo", "");
+    _ = try app.thread.transcript.append(gpa, .logo, "logo", "");
 
     app.git_label = loadGitLabel(gpa, init.io, runtime.cwd) catch "";
     _ = app.refreshDiffCounts() catch false;
@@ -2625,7 +2893,7 @@ const RootWidget = struct {
                 // Scrolling may bring the logo back into view; the tick stops
                 // itself again on the next frame if it didn't.
                 try self.ensureTick(ctx);
-                if (mouse.button == .wheel_up) self.app.thread_auto_scroll = false;
+                if (mouse.button == .wheel_up) self.app.thread.auto_scroll = false;
                 if (mouse.button == .wheel_down) self.app.updateMouseAutoScroll();
             },
             .key_press => |key| {
@@ -2647,7 +2915,7 @@ const RootWidget = struct {
                         ctx.consumeAndRedraw();
                         return;
                     }
-                    if (self.app.turn.state == .active) {
+                    if (self.app.thread.turn.state == .active) {
                         try self.app.handleInterrupt();
                         ctx.consumeAndRedraw();
                         return;
@@ -2708,10 +2976,10 @@ const RootWidget = struct {
                 // move the cursor between lines; going up past the first line
                 // hands control to block navigation, and down stays trapped in
                 // the input. Once in block navigation the arrows fall through to
-                // `handleThreadKey`, which walks blocks and re-enters the input
+                // `handleTranscriptKey`, which walks blocks and re-enters the input
                 // when you press down past the last block. The @-mention popup
                 // keeps the arrows for itself.
-                if (self.app.mode == .normal and !self.app.at_active and self.app.queued_user_messages.items.len > 0) {
+                if (self.app.mode == .normal and !self.app.at_active and self.app.thread.queued.items.len > 0) {
                     // ALT+←/→ navigate queued messages; CTRL+→ steers the
                     // selected one. Gated on a non-empty queue so the keys fall
                     // through to normal cursor/word movement otherwise.
@@ -2741,7 +3009,7 @@ const RootWidget = struct {
                         }
                     } else if (key.matches(vaxis.Key.down, .{})) {
                         if (self.app.block_nav) {
-                            if (self.app.thread.selected == null) {
+                            if (self.app.thread.transcript.selected == null) {
                                 if (try self.app.moveInputCursorVertical(.down)) {
                                     self.app.block_nav = false;
                                     ctx.consumeAndRedraw();
@@ -2780,7 +3048,7 @@ const RootWidget = struct {
         if (try self.app.drainModelLoad()) visible_change = true;
         if (try self.app.drainDiffRefresh()) visible_change = true;
 
-        if (self.app.turn_view.awaitingOutput() or self.app.thread.hasRunningTool()) {
+        if (self.app.thread.turn_view.awaitingOutput() or self.app.thread.transcript.hasRunningTool()) {
             self.spinner_tick_accum += drain_tick_ms;
             if (self.spinner_tick_accum >= spinner_tick_threshold_ms) {
                 self.spinner_tick_accum = 0;
@@ -2819,7 +3087,7 @@ const RootWidget = struct {
         const diff_loading = self.app.diff_refresh_future != null;
         // Keep ticking while a turn is active OR interrupting, so the worker's
         // remaining events (and its terminal `turn_finished`) get drained.
-        const should_tick = self.app.turn.state != .idle or
+        const should_tick = self.app.anyTurnActive() or
             model_loading or
             diff_loading or
             self.app.blackhole_visible or
@@ -2886,28 +3154,37 @@ const RootWidget = struct {
     }
 
     fn drainAgentEvents(self: *RootWidget, ctx: *vxfw.EventContext) !bool {
-        const worker_io = self.app.worker_context.io;
-        const worker_gpa = self.app.worker_context.gpa;
-        var batch: std.ArrayList(*agent_mod.Agent.Event) = .empty;
-        defer batch.deinit(worker_gpa);
-        try self.app.worker_context.queue.drainInto(worker_io, worker_gpa, &batch);
-
         var visible_change = false;
         var refresh_diff = false;
-        for (batch.items) |event_ptr| {
-            defer worker_gpa.destroy(event_ptr);
-            defer event_ptr.deinit(worker_gpa);
+        const active = self.app.thread;
+        // Each lane runs its own turn, so drain every lane's queue and apply its
+        // events to *that* lane. The Turn machine operates on `self.thread`, so
+        // scope-swap it to the lane being processed (UI-thread only) and restore
+        // the visible lane afterward.
+        for (self.app.threads.items) |lane| {
+            const worker = if (lane.worker_context) |*wc| wc else continue;
+            var batch: std.ArrayList(*agent_mod.Agent.Event) = .empty;
+            defer batch.deinit(worker.gpa);
+            try worker.queue.drainInto(worker.io, worker.gpa, &batch);
+            if (batch.items.len == 0) continue;
 
-            // A discarded (interrupted) turn's events are swallowed inside
-            // applyAgentEvent — the Turn machine refuses to project them — so
-            // draining stays a single uniform path.
-            if (self.app.turn_view.awaitingOutput()) try self.ensureTick(ctx);
-            switch (event_ptr.*) {
-                .tool_call_finished => refresh_diff = true,
-                else => {},
+            self.app.thread = lane;
+            defer self.app.thread = active;
+            for (batch.items) |event_ptr| {
+                defer worker.gpa.destroy(event_ptr);
+                defer event_ptr.deinit(worker.gpa);
+
+                // A discarded (interrupted) turn's events are swallowed inside
+                // applyAgentEvent — the Turn machine refuses to project them.
+                const changed = try self.app.applyAgentEvent(event_ptr.*);
+                if (lane != active) continue; // a background lane never touches the view
+                if (changed) visible_change = true;
+                switch (event_ptr.*) {
+                    .tool_call_finished => refresh_diff = true,
+                    else => {},
+                }
+                if (lane.turn_view.awaitingOutput()) try self.ensureTick(ctx);
             }
-            if (try self.app.applyAgentEvent(event_ptr.*)) visible_change = true;
-            if (self.app.turn_view.awaitingOutput()) try self.ensureTick(ctx);
         }
         if (refresh_diff) {
             self.diff_refresh_pending = true;
@@ -2919,22 +3196,22 @@ const RootWidget = struct {
 
     fn drawRoot(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *RootWidget = @ptrCast(@alignCast(ptr));
-        // The diff viewer replaces the whole screen (thread + input + overlay),
+        // The diff viewer replaces the whole screen (transcript + input + overlay),
         // so it short-circuits the normal layout entirely.
         if (self.app.mode == .diff_viewer) return self.drawDiffViewer(ctx);
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
-        const loading_visible = self.app.turn_view.awaitingOutput();
+        const loading_visible = self.app.thread.turn_view.awaitingOutput();
         const layout = rootLayout(max_height, false, try self.app.inputTextRows(ctx, max_width -| 4), loading_visible);
 
-        var thread_view: ThreadWidget = .{ .app = self.app };
+        var transcript_view: TranscriptWidget = .{ .app = self.app, .thread = self.app.thread };
         var loading_view: LoadingWidget = .{ .app = self.app };
         var input_view: InputWidget = .{ .app = self.app };
         var overlay_view: OverlayWidget = .{ .app = self.app };
 
-        const thread_ctx = ctx.withConstraints(
-            .{ .width = max_width, .height = layout.thread_height },
-            .{ .width = max_width, .height = layout.thread_height },
+        const transcript_ctx = ctx.withConstraints(
+            .{ .width = max_width, .height = layout.transcript_height },
+            .{ .width = max_width, .height = layout.transcript_height },
         );
         const input_ctx = ctx.withConstraints(
             .{ .width = max_width, .height = layout.input_height },
@@ -2944,18 +3221,36 @@ const RootWidget = struct {
         const overlay_visible = self.app.mode != .normal;
         const at_visible = self.app.at_active and !overlay_visible;
 
-        var child_count: usize = 2;
+        const split = self.app.split and self.app.threads.items.len > 1;
+        var child_count: usize = (if (split) self.app.threads.items.len else 1) + 1;
         if (layout.loading_height > 0) child_count += 1;
         if (overlay_visible) child_count += 1;
         if (at_visible) child_count += 1;
         const children = try ctx.arena.alloc(vxfw.SubSurface, child_count);
         var idx: usize = 0;
-        children[idx] = .{
-            .origin = .{ .row = 0, .col = 0 },
-            .surface = try thread_view.widget().draw(thread_ctx),
-            .z_index = 0,
-        };
-        idx += 1;
+        if (split) {
+            // Tile the transcript area into one bordered column per lane; the
+            // active lane is marked in its label. Input + spinner stay shared
+            // below and route to the focused (active) lane.
+            const cols: u16 = @intCast(self.app.threads.items.len);
+            const col_width: u16 = max_width / cols;
+            for (self.app.threads.items, 0..) |lane, i| {
+                const width: u16 = if (i + 1 == self.app.threads.items.len) max_width - col_width * (cols - 1) else col_width;
+                children[idx] = .{
+                    .origin = .{ .row = 0, .col = @intCast(@as(usize, i) * col_width) },
+                    .surface = try self.drawLaneColumn(ctx, lane, width, layout.transcript_height, lane == self.app.thread),
+                    .z_index = 0,
+                };
+                idx += 1;
+            }
+        } else {
+            children[idx] = .{
+                .origin = .{ .row = 0, .col = 0 },
+                .surface = try transcript_view.widget().draw(transcript_ctx),
+                .z_index = 0,
+            };
+            idx += 1;
+        }
         if (layout.loading_height > 0) {
             const loading_ctx = ctx.withConstraints(
                 .{ .width = max_width, .height = layout.loading_height },
@@ -2979,8 +3274,8 @@ const RootWidget = struct {
             children[idx] = .{
                 .origin = .{ .row = 0, .col = 0 },
                 .surface = try centered_overlay.widget().draw(ctx.withConstraints(
-                    .{ .width = max_width, .height = layout.thread_height },
-                    .{ .width = max_width, .height = layout.thread_height },
+                    .{ .width = max_width, .height = layout.transcript_height },
+                    .{ .width = max_width, .height = layout.transcript_height },
                 )),
                 .z_index = 2,
             };
@@ -3007,6 +3302,24 @@ const RootWidget = struct {
             .buffer = &.{},
             .children = children,
         };
+    }
+
+    /// Draw one lane's transcript as a bordered column for split view. The
+    /// border label marks the lane (● active / ○ background) and the active
+    /// column's border is undimmed.
+    fn drawLaneColumn(self: *RootWidget, ctx: vxfw.DrawContext, lane: *Thread, width: u16, height: u16, active: bool) std.mem.Allocator.Error!vxfw.Surface {
+        var transcript_view: TranscriptWidget = .{ .app = self.app, .thread = lane };
+        const title = if (lane.title) |t| t else "lane";
+        const label_text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ if (active) "● " else "○ ", title });
+        var border: vxfw.Border = .{
+            .child = transcript_view.widget(),
+            .labels = &.{.{ .text = label_text, .alignment = .top_left }},
+            .style = if (active) .{} else .{ .dim = true },
+        };
+        return border.widget().draw(ctx.withConstraints(
+            .{ .width = width, .height = height },
+            .{ .width = width, .height = height },
+        ));
     }
 
     // --- Diff viewer ------------------------------------------------------
@@ -3627,33 +3940,35 @@ const LoadingWidget = struct {
         });
         if (height > 0) {
             var row: u16 = if (height > 1) 1 else 0;
-            const word = loading_spinners[self.app.turn_view.loading_word_index];
+            const word = loading_spinners[self.app.thread.turn_view.loading_word_index];
             tui_message.MessageWidget.drawLoading(&surface, word, self.app.loading_frame, &row, ctx);
         }
         return surface;
     }
 };
 
-const ThreadWidget = struct {
+const TranscriptWidget = struct {
     app: *App,
+    /// The lane this pane renders — the active lane today; any lane once tiled.
+    thread: *Thread,
 
-    fn widget(self: *ThreadWidget) vxfw.Widget {
+    fn widget(self: *TranscriptWidget) vxfw.Widget {
         return .{
             .userdata = self,
-            .drawFn = drawThread,
+            .drawFn = drawTranscript,
         };
     }
 
-    fn drawThread(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *ThreadWidget = @ptrCast(@alignCast(ptr));
+    fn drawTranscript(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *TranscriptWidget = @ptrCast(@alignCast(ptr));
         self.syncViewport(ctx);
         const widgets = try self.messageWidgets(ctx);
-        self.app.thread_list.children = .{ .slice = widgets };
-        self.app.thread_list.item_count = @intCast(widgets.len);
+        self.thread.transcript_list.children = .{ .slice = widgets };
+        self.thread.transcript_list.item_count = @intCast(widgets.len);
         self.syncCursor(ctx);
 
         var list_padding: vxfw.Padding = .{
-            .child = self.app.thread_list.widget(),
+            .child = self.thread.transcript_list.widget(),
             .padding = ConversationLayout.verticalPadding(),
         };
         const surface = try list_padding.widget().draw(ctx);
@@ -3664,67 +3979,67 @@ const ThreadWidget = struct {
     // The intro animation only runs while the startup logo (message 0) is the
     // first item the list view is rendering. Once a turn pushes it off the top,
     // `scroll.top` advances and the animation tick is allowed to stop.
-    fn updateBlackholeVisibility(self: *ThreadWidget) void {
-        const messages = self.app.thread.messages.items;
+    fn updateBlackholeVisibility(self: *TranscriptWidget) void {
+        const messages = self.thread.transcript.messages.items;
         self.app.blackhole_visible = messages.len > 0 and
             messages[0].kind == .logo and
-            self.app.thread_list.scroll.top == 0;
+            self.thread.transcript_list.scroll.top == 0;
     }
 
-    fn syncViewport(self: *ThreadWidget, ctx: vxfw.DrawContext) void {
+    fn syncViewport(self: *TranscriptWidget, ctx: vxfw.DrawContext) void {
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
-        self.app.thread_view_width = max_width;
-        self.app.thread_view_height = max_height -| ConversationLayout.top -| ConversationLayout.bottom;
-        if (self.app.thread_view_height == 0) self.app.thread_view_height = 1;
+        self.thread.transcript_view_width = max_width;
+        self.thread.transcript_view_height = max_height -| ConversationLayout.top -| ConversationLayout.bottom;
+        if (self.thread.transcript_view_height == 0) self.thread.transcript_view_height = 1;
     }
 
-    fn messageWidgets(self: *ThreadWidget, ctx: vxfw.DrawContext) ![]vxfw.Widget {
-        const messages = self.app.thread.messages.items;
+    fn messageWidgets(self: *TranscriptWidget, ctx: vxfw.DrawContext) ![]vxfw.Widget {
+        const messages = self.thread.transcript.messages.items;
         const widgets = try ctx.arena.alloc(vxfw.Widget, messages.len);
         const bodies = try ctx.arena.alloc(MessageWidget, messages.len);
         for (messages, 0..) |*message, index| {
-            const selected = if (self.app.thread.selected) |selected_index| selected_index == index else false;
+            const selected = if (self.thread.transcript.selected) |selected_index| selected_index == index else false;
             bodies[index] = .{ .message = message, .selected = selected, .loading_frame = self.app.loading_frame, .blackhole_frame = self.app.blackhole_frame, .gpa = self.app.gpa };
             widgets[index] = bodies[index].widget();
         }
         return widgets;
     }
 
-    fn syncCursor(self: *ThreadWidget, ctx: vxfw.DrawContext) void {
-        const messages = self.app.thread.messages.items;
+    fn syncCursor(self: *TranscriptWidget, ctx: vxfw.DrawContext) void {
+        const messages = self.thread.transcript.messages.items;
         if (messages.len == 0) return;
-        if (self.app.thread_auto_scroll) {
+        if (self.thread.auto_scroll) {
             const cursor: u32 = @intCast(messages.len - 1);
-            self.app.thread_list.cursor = cursor;
+            self.thread.transcript_list.cursor = cursor;
             self.scrollCursorToTail(ctx, cursor);
             return;
         }
-        const cursor = self.app.thread.selected orelse 0;
-        const cursor_changed = self.app.thread_list.cursor != cursor;
-        self.app.thread_list.cursor = cursor;
-        if (cursor_changed) self.app.thread_list.ensureScroll();
+        const cursor = self.thread.transcript.selected orelse 0;
+        const cursor_changed = self.thread.transcript_list.cursor != cursor;
+        self.thread.transcript_list.cursor = cursor;
+        if (cursor_changed) self.thread.transcript_list.ensureScroll();
     }
 
-    fn scrollCursorToTail(self: *ThreadWidget, ctx: vxfw.DrawContext, cursor: u32) void {
-        const message_count: u32 = @intCast(self.app.thread.messages.items.len);
+    fn scrollCursorToTail(self: *TranscriptWidget, ctx: vxfw.DrawContext, cursor: u32) void {
+        const message_count: u32 = @intCast(self.thread.transcript.messages.items.len);
         if (cursor >= message_count) return;
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
         const list_height = max_height -| ConversationLayout.top -| ConversationLayout.bottom;
-        const message_height = messageRowsCached(&self.app.thread.messages.items[cursor], ConversationLayout.contentWidth(max_width));
-        self.app.thread_list.scroll.top = cursor;
-        self.app.thread_list.scroll.pending_lines = 0;
-        self.app.thread_list.scroll.wants_cursor = false;
+        const message_height = messageRowsCached(&self.thread.transcript.messages.items[cursor], ConversationLayout.contentWidth(max_width));
+        self.thread.transcript_list.scroll.top = cursor;
+        self.thread.transcript_list.scroll.pending_lines = 0;
+        self.thread.transcript_list.scroll.wants_cursor = false;
         if (message_height > list_height) {
-            self.app.thread_list.scroll.offset = @intCast(message_height - list_height);
+            self.thread.transcript_list.scroll.offset = @intCast(message_height - list_height);
         } else {
-            self.app.thread_list.scroll.offset = 0;
+            self.thread.transcript_list.scroll.offset = 0;
         }
     }
 };
 
-const Command = enum { connect, model, new, resume_session, timeline, diff };
+const Command = enum { connect, model, new, resume_session, timeline, diff, parallel, close, split, merge };
 const CommandEntry = struct { name: []const u8, command: Command };
 const commands = [_]CommandEntry{
     .{ .name = "Connect", .command = .connect },
@@ -3733,6 +4048,10 @@ const commands = [_]CommandEntry{
     .{ .name = "Resume", .command = .resume_session },
     .{ .name = "Timeline", .command = .timeline },
     .{ .name = "Diff", .command = .diff },
+    .{ .name = "Parallel", .command = .parallel },
+    .{ .name = "Close", .command = .close },
+    .{ .name = "Split", .command = .split },
+    .{ .name = "Merge", .command = .merge },
 };
 const command_panel_entries = [_]command_panel.Entry{
     .{ .name = "Connect" },
@@ -3741,6 +4060,10 @@ const command_panel_entries = [_]command_panel.Entry{
     .{ .name = "Resume" },
     .{ .name = "Timeline" },
     .{ .name = "Diff" },
+    .{ .name = "Parallel" },
+    .{ .name = "Close" },
+    .{ .name = "Split" },
+    .{ .name = "Merge" },
 };
 
 fn overlayLabel(mode: App.Mode) []const u8 {
@@ -4119,7 +4442,7 @@ const OverlayInner = struct {
     fn drawModelContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const filter = try app.peekPaletteInput();
         defer app.gpa.free(filter);
-        const status = tui_status.modelStatus(app.runtime, app.cached_config);
+        const status = tui_status.modelStatus(app.liveRuntime(), app.cached_config);
         // Project the consolidated entries into the parallel slices the picker
         // widget consumes. Arena-allocated, rebuilt each draw — cheap, and it
         // keeps the picker decoupled from the catalogue's internal layout.
@@ -4493,7 +4816,7 @@ const InputWidget = struct {
         const max_width = ctx.max.width orelse 0;
         const height: u16 = ctx.max.height orelse 4;
 
-        const queued_visible = self.app.queued_user_messages.items.len > 0;
+        const queued_visible = self.app.thread.queued.items.len > 0;
         const input_row: u16 = if (queued_visible) 1 else 0;
         const avail: u16 = height -| input_row;
         const input_width = max_width -| 4;
@@ -4561,7 +4884,7 @@ const InputWidget = struct {
         var box: vxfw.SizedBox = .{ .child = border.widget(), .size = .{ .width = max_width, .height = border_height } };
         var surface = try box.widget().draw(ctx.withConstraints(.{ .width = max_width, .height = border_height }, .{ .width = max_width, .height = border_height }));
 
-        const status_text = if (tui_status.modelStatus(self.app.runtime, self.app.cached_config)) |status|
+        const status_text = if (tui_status.modelStatus(self.app.liveRuntime(), self.app.cached_config)) |status|
             tui_status.formatModelStatus(ctx.arena, status) catch ""
         else
             "";
@@ -4571,7 +4894,7 @@ const InputWidget = struct {
     }
 
     fn drawQueuedMessage(self: *InputWidget, ctx: vxfw.DrawContext, width: u16) std.mem.Allocator.Error!vxfw.Surface {
-        const items = self.app.queued_user_messages.items;
+        const items = self.app.thread.queued.items;
         const sel = @min(self.app.queued_selection, items.len - 1);
         const message = items[sel];
         // Position suffix only when there's more than one to navigate.
@@ -4666,7 +4989,7 @@ test "root layout keeps input fixed when panel opens" {
     const picker = rootLayout(30, true, 1, false);
 
     try std.testing.expectEqual(normal.input_row, picker.input_row);
-    try std.testing.expectEqual(normal.thread_height, picker.thread_height);
+    try std.testing.expectEqual(normal.transcript_height, picker.transcript_height);
     try std.testing.expectEqual(@as(u16, 19), picker.panel_row);
     try std.testing.expectEqual(@as(u16, 7), picker.panel_height);
 }
@@ -4675,7 +4998,7 @@ test "root layout clamps panel above input on short screens" {
     const layout = rootLayout(8, true, 1, false);
 
     try std.testing.expectEqual(@as(u16, 4), layout.input_height);
-    try std.testing.expectEqual(@as(u16, 4), layout.thread_height);
+    try std.testing.expectEqual(@as(u16, 4), layout.transcript_height);
     try std.testing.expectEqual(@as(u16, 4), layout.panel_height);
     try std.testing.expectEqual(@as(u16, 0), layout.panel_row);
     try std.testing.expectEqual(@as(u16, 4), layout.input_row);
@@ -4684,23 +5007,23 @@ test "root layout clamps panel above input on short screens" {
 test "root layout grows the input as text rows increase" {
     const one = rootLayout(30, false, 1, false);
     try std.testing.expectEqual(@as(u16, 4), one.input_height);
-    try std.testing.expectEqual(@as(u16, 26), one.thread_height);
+    try std.testing.expectEqual(@as(u16, 26), one.transcript_height);
 
     const three = rootLayout(30, false, 3, false);
     try std.testing.expectEqual(@as(u16, 6), three.input_height);
-    try std.testing.expectEqual(@as(u16, 24), three.thread_height);
+    try std.testing.expectEqual(@as(u16, 24), three.transcript_height);
 
-    // A short screen still leaves the thread some room.
+    // A short screen still leaves the transcript some room.
     const tight = rootLayout(10, false, 6, false);
     try std.testing.expectEqual(@as(u16, 7), tight.input_height);
-    try std.testing.expectEqual(@as(u16, 3), tight.thread_height);
+    try std.testing.expectEqual(@as(u16, 3), tight.transcript_height);
 }
 
 test "input text rows track the line count" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -4748,7 +5071,7 @@ test "down returns to multiline input after overshooting above top line" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
     app.bindInputCallbacks();
 
@@ -4767,7 +5090,7 @@ test "down returns to multiline input after overshooting above top line" {
     try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.up } });
     try std.testing.expect(app.block_nav);
 
-    // With no thread block selected, Down must return to the multiline input.
+    // With no transcript block selected, Down must return to the multiline input.
     try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.down } });
     try std.testing.expect(!app.block_nav);
     try std.testing.expectEqualStrings("top\nmid", app.input.buf.firstHalf());
@@ -4780,7 +5103,7 @@ test "arrow up and down move the input cursor between lines" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     // Cursor ends on the third line at column 2 ("ca|t").
@@ -4795,7 +5118,7 @@ test "arrow up and down move the input cursor between lines" {
     try std.testing.expect(try app.moveInputCursorVertical(.up));
     try std.testing.expectEqualStrings("fo", app.input.buf.firstHalf());
 
-    // Already on the first line: no move, caller falls back to thread nav.
+    // Already on the first line: no move, caller falls back to transcript nav.
     try std.testing.expect(!(try app.moveInputCursorVertical(.up)));
 
     // Down returns to the middle line at the same column ("ox" -> end).
@@ -4812,7 +5135,7 @@ test "vertical navigation follows soft-wrapped visual rows" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     // A single long line with no manual breaks. Wrapped at width 10 it spans
@@ -4859,10 +5182,10 @@ test "esc backs out of command panels before interrupting active turn" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    app.turn.submit();
+    app.thread.turn.submit();
     app.mode = .provider_picker;
 
     var root: RootWidget = .{ .app = &app };
@@ -4873,14 +5196,14 @@ test "esc backs out of command panels before interrupting active turn" {
     try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.escape } });
 
     try std.testing.expectEqual(App.Mode.command, app.mode);
-    try std.testing.expectEqual(Turn.State.active, app.turn.state);
+    try std.testing.expectEqual(Turn.State.active, app.thread.turn.state);
 }
 
 test "ctrl-c clears a non-empty input instead of arming quit" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
     app.bindInputCallbacks();
 
@@ -4904,51 +5227,51 @@ test "down past the last block re-enters the input" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
     // Tall viewport so the short messages never count as scrollable.
-    app.thread_view_width = 80;
-    app.thread_view_height = 100;
+    app.thread.transcript_view_width = 80;
+    app.thread.transcript_view_height = 100;
 
-    _ = try app.thread.append(gpa, .agent, "agent", "one");
-    _ = try app.thread.append(gpa, .agent, "agent", "two");
-    _ = try app.thread.append(gpa, .agent, "agent", "three");
+    _ = try app.thread.transcript.append(gpa, .agent, "agent", "one");
+    _ = try app.thread.transcript.append(gpa, .agent, "agent", "two");
+    _ = try app.thread.transcript.append(gpa, .agent, "agent", "three");
     // Following the tail, the last block is selected.
-    try std.testing.expectEqual(@as(?u32, 2), app.thread.selected);
+    try std.testing.expectEqual(@as(?u32, 2), app.thread.transcript.selected);
 
     // In block navigation, up walks to an earlier block.
     app.block_nav = true;
-    _ = try app.handleThreadKey(.{ .codepoint = vaxis.Key.up });
-    try std.testing.expectEqual(@as(?u32, 1), app.thread.selected);
+    _ = try app.handleTranscriptKey(.{ .codepoint = vaxis.Key.up });
+    try std.testing.expectEqual(@as(?u32, 1), app.thread.transcript.selected);
 
     // Down walks back toward the last block, still navigating blocks.
-    _ = try app.handleThreadKey(.{ .codepoint = vaxis.Key.down });
-    try std.testing.expectEqual(@as(?u32, 2), app.thread.selected);
+    _ = try app.handleTranscriptKey(.{ .codepoint = vaxis.Key.down });
+    try std.testing.expectEqual(@as(?u32, 2), app.thread.transcript.selected);
     try std.testing.expect(app.block_nav);
 
     // Down again on the last block hands control back to the input.
-    _ = try app.handleThreadKey(.{ .codepoint = vaxis.Key.down });
+    _ = try app.handleTranscriptKey(.{ .codepoint = vaxis.Key.down });
     try std.testing.expect(!app.block_nav);
-    try std.testing.expectEqual(@as(?u32, 2), app.thread.selected);
+    try std.testing.expectEqual(@as(?u32, 2), app.thread.transcript.selected);
 }
 
 test "down past the last block moves into multiline input" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    app.thread_view_width = 80;
-    app.thread_view_height = 100;
+    app.thread.transcript_view_width = 80;
+    app.thread.transcript_view_height = 100;
 
-    _ = try app.thread.append(gpa, .agent, "agent", "one");
+    _ = try app.thread.transcript.append(gpa, .agent, "agent", "one");
     try app.input.insertSliceAtCursor("top\nmiddle");
     // Put the cursor on the top line, just before the newline. Re-entering
     // from block navigation should step down into the input line below.
     app.input.buf.moveGapLeft("\nmiddle".len);
     app.block_nav = true;
 
-    try std.testing.expect(try app.handleThreadKey(.{ .codepoint = vaxis.Key.down }));
+    try std.testing.expect(try app.handleTranscriptKey(.{ .codepoint = vaxis.Key.down }));
     try std.testing.expect(!app.block_nav);
     try std.testing.expectEqualStrings("top\nmid", app.input.buf.firstHalf());
 }
@@ -4957,7 +5280,7 @@ test "shift enter inserts a newline instead of submitting" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
     app.bindInputCallbacks();
 
@@ -4982,7 +5305,7 @@ test "root overlay host does not paint outside panel" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     app.mode = .command;
@@ -5013,7 +5336,7 @@ test "provider setup form renders for opencode zen without crashing" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     app.mode = .provider_picker;
@@ -5038,58 +5361,58 @@ test "mouse bottom does not enable auto-scroll when older message is selected" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    _ = try app.thread.append(gpa, .agent, "agent", "one");
-    _ = try app.thread.append(gpa, .agent, "agent", "two");
-    app.thread.selected = 0;
-    app.thread_auto_scroll = false;
-    app.thread_list.scroll.has_more = false;
+    _ = try app.thread.transcript.append(gpa, .agent, "agent", "one");
+    _ = try app.thread.transcript.append(gpa, .agent, "agent", "two");
+    app.thread.transcript.selected = 0;
+    app.thread.auto_scroll = false;
+    app.thread.transcript_list.scroll.has_more = false;
 
     app.updateMouseAutoScroll();
 
-    try std.testing.expect(!app.thread_auto_scroll);
+    try std.testing.expect(!app.thread.auto_scroll);
 }
 
 test "shift down jumps to conversation bottom" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    _ = try app.thread.append(gpa, .agent, "agent", "one");
-    _ = try app.thread.append(gpa, .agent, "agent", "two");
-    _ = try app.thread.append(gpa, .status, "status", "loading");
-    app.thread.selected = 0;
-    app.thread_auto_scroll = false;
+    _ = try app.thread.transcript.append(gpa, .agent, "agent", "one");
+    _ = try app.thread.transcript.append(gpa, .agent, "agent", "two");
+    _ = try app.thread.transcript.append(gpa, .status, "status", "loading");
+    app.thread.transcript.selected = 0;
+    app.thread.auto_scroll = false;
 
-    try std.testing.expect(try app.handleThreadKey(.{ .codepoint = vaxis.Key.down, .mods = .{ .shift = true } }));
+    try std.testing.expect(try app.handleTranscriptKey(.{ .codepoint = vaxis.Key.down, .mods = .{ .shift = true } }));
 
-    try std.testing.expectEqual(@as(?u32, 1), app.thread.selected);
-    try std.testing.expect(app.thread_auto_scroll);
+    try std.testing.expectEqual(@as(?u32, 1), app.thread.transcript.selected);
+    try std.testing.expect(app.thread.auto_scroll);
 }
 
 test "down scrolls through selected long message before moving selection" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    _ = try app.thread.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
-    _ = try app.thread.append(gpa, .agent, "agent", "next");
-    app.thread.selected = 0;
-    app.thread_view_width = 80;
-    app.thread_view_height = 4;
+    _ = try app.thread.transcript.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+    _ = try app.thread.transcript.append(gpa, .agent, "agent", "next");
+    app.thread.transcript.selected = 0;
+    app.thread.transcript_view_width = 80;
+    app.thread.transcript_view_height = 4;
 
-    const scrolled = app.navigateThread(.next);
+    const scrolled = app.navigateTranscript(.next);
 
     try std.testing.expect(scrolled);
-    try std.testing.expectEqual(@as(?u32, 0), app.thread.selected);
-    try std.testing.expectEqual(@as(u32, 0), app.thread_list.scroll.top);
-    try std.testing.expect(app.thread_list.scroll.offset > 0);
+    try std.testing.expectEqual(@as(?u32, 0), app.thread.transcript.selected);
+    try std.testing.expectEqual(@as(u32, 0), app.thread.transcript_list.scroll.top);
+    try std.testing.expect(app.thread.transcript_list.scroll.offset > 0);
 }
 
 test "long message scroll uses a small fixed step" {
@@ -5102,74 +5425,74 @@ test "down at latest long message bottom does not loop to top" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    _ = try app.thread.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
-    app.thread.selected = 0;
-    app.thread_view_width = 80;
-    app.thread_view_height = 4;
-    const offset = messageRowsCached(&app.thread.messages.items[0], ConversationLayout.contentWidth(app.thread_view_width)) - app.thread_view_height;
+    _ = try app.thread.transcript.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+    app.thread.transcript.selected = 0;
+    app.thread.transcript_view_width = 80;
+    app.thread.transcript_view_height = 4;
+    const offset = messageRowsCached(&app.thread.transcript.messages.items[0], ConversationLayout.contentWidth(app.thread.transcript_view_width)) - app.thread.transcript_view_height;
     app.setSelectedMessageOffset(0, offset);
 
-    const scrolled = app.navigateThread(.next);
+    const scrolled = app.navigateTranscript(.next);
 
     try std.testing.expect(!scrolled);
-    try std.testing.expectEqual(@as(?u32, 0), app.thread.selected);
-    try std.testing.expectEqual(@as(i17, @intCast(offset)), app.thread_list.scroll.offset);
+    try std.testing.expectEqual(@as(?u32, 0), app.thread.transcript.selected);
+    try std.testing.expectEqual(@as(i17, @intCast(offset)), app.thread.transcript_list.scroll.offset);
 }
 
 test "down moves after selected long message bottom is visible" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    _ = try app.thread.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
-    _ = try app.thread.append(gpa, .agent, "agent", "next");
-    app.thread.selected = 0;
-    app.thread_view_width = 80;
-    app.thread_view_height = 4;
-    app.setSelectedMessageOffset(0, messageRowsCached(&app.thread.messages.items[0], ConversationLayout.contentWidth(app.thread_view_width)) - app.thread_view_height);
+    _ = try app.thread.transcript.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+    _ = try app.thread.transcript.append(gpa, .agent, "agent", "next");
+    app.thread.transcript.selected = 0;
+    app.thread.transcript_view_width = 80;
+    app.thread.transcript_view_height = 4;
+    app.setSelectedMessageOffset(0, messageRowsCached(&app.thread.transcript.messages.items[0], ConversationLayout.contentWidth(app.thread.transcript_view_width)) - app.thread.transcript_view_height);
 
-    const scrolled = app.navigateThread(.next);
+    const scrolled = app.navigateTranscript(.next);
 
     try std.testing.expect(!scrolled);
-    try std.testing.expectEqual(@as(?u32, 1), app.thread.selected);
+    try std.testing.expectEqual(@as(?u32, 1), app.thread.transcript.selected);
 }
 
 test "up enters selected long message at bottom" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    _ = try app.thread.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
-    _ = try app.thread.append(gpa, .agent, "agent", "next");
-    app.thread.selected = 1;
-    app.thread_view_width = 80;
-    app.thread_view_height = 4;
+    _ = try app.thread.transcript.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+    _ = try app.thread.transcript.append(gpa, .agent, "agent", "next");
+    app.thread.transcript.selected = 1;
+    app.thread.transcript_view_width = 80;
+    app.thread.transcript_view_height = 4;
 
-    const scrolled = app.navigateThread(.previous);
+    const scrolled = app.navigateTranscript(.previous);
 
     try std.testing.expect(!scrolled);
-    try std.testing.expectEqual(@as(?u32, 0), app.thread.selected);
-    try std.testing.expect(app.thread_list.scroll.offset > 0);
+    try std.testing.expectEqual(@as(?u32, 0), app.thread.transcript.selected);
+    try std.testing.expect(app.thread.transcript_list.scroll.offset > 0);
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    var thread_widget: ThreadWidget = .{ .app = &app };
+    var transcript_widget: TranscriptWidget = .{ .app = &app, .thread = app.thread };
     const ctx: vxfw.DrawContext = .{
         .arena = arena.allocator(),
         .min = .{},
         .max = .{ .width = 80, .height = 6 },
         .cell_size = .{ .width = 10, .height = 20 },
     };
-    _ = try thread_widget.widget().draw(ctx);
+    _ = try transcript_widget.widget().draw(ctx);
 
-    try std.testing.expect(app.thread_list.scroll.offset > 0);
+    try std.testing.expect(app.thread.transcript_list.scroll.offset > 0);
 }
 
 test "begin submit clears input and starts a turn awaiting output" {
@@ -5180,7 +5503,7 @@ test "begin submit clears input and starts a turn awaiting output" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("hello");
@@ -5188,24 +5511,24 @@ test "begin submit clears input and starts a turn awaiting output" {
 
     try std.testing.expectEqual(@as(usize, 0), app.input.buf.firstHalf().len);
     try std.testing.expectEqual(@as(usize, 0), app.input.buf.secondHalf().len);
-    // The user message is the only thread entry; the loading spinner is never
+    // The user message is the only transcript entry; the loading spinner is never
     // stored as a message.
-    try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
-    try std.testing.expectEqualStrings("hello", app.thread.messages.items[0].body);
-    try std.testing.expect(app.turn_view.awaitingOutput());
-    try std.testing.expectEqual(Turn.State.active, app.turn.state);
-    try std.testing.expectEqual(@as(u32, 0), app.thread.selected.?);
+    try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqualStrings("hello", app.thread.transcript.messages.items[0].body);
+    try std.testing.expect(app.thread.turn_view.awaitingOutput());
+    try std.testing.expectEqual(Turn.State.active, app.thread.turn.state);
+    try std.testing.expectEqual(@as(u32, 0), app.thread.transcript.selected.?);
 }
 
-test "awaiting turn draws loading outside the thread list" {
+test "awaiting turn draws loading outside the transcript list" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    _ = try app.thread.append(gpa, .user, "you", "hello");
-    app.turn_view.awaitModel();
+    _ = try app.thread.transcript.append(gpa, .user, "you", "hello");
+    app.thread.turn_view.awaitModel();
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -5219,8 +5542,8 @@ test "awaiting turn draws loading outside the thread list" {
     const surface = try root_widget.widget().draw(ctx);
 
     try std.testing.expectEqual(@as(usize, 3), surface.children.len);
-    try std.testing.expectEqual(@as(?u32, 1), app.thread_list.item_count);
-    try std.testing.expectEqual(@as(u32, 0), app.thread_list.cursor);
+    try std.testing.expectEqual(@as(?u32, 1), app.thread.transcript_list.item_count);
+    try std.testing.expectEqual(@as(u32, 0), app.thread.transcript_list.cursor);
     try std.testing.expectEqual(rootLayout(10, false, 1, true).loading_row, surface.children[1].origin.row);
 }
 
@@ -5228,13 +5551,13 @@ test "awaiting turn preserves selected long message inner scroll" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    _ = try app.thread.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
-    app.thread.selected = 0;
-    app.thread_auto_scroll = false;
-    app.turn_view.awaitModel();
+    _ = try app.thread.transcript.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+    app.thread.transcript.selected = 0;
+    app.thread.auto_scroll = false;
+    app.thread.turn_view.awaitModel();
     app.setSelectedMessageOffset(0, 3);
 
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -5248,9 +5571,9 @@ test "awaiting turn preserves selected long message inner scroll" {
     };
     _ = try root_widget.widget().draw(ctx);
 
-    try std.testing.expectEqual(@as(u32, 0), app.thread_list.cursor);
-    try std.testing.expectEqual(@as(u32, 0), app.thread_list.scroll.top);
-    try std.testing.expectEqual(@as(i17, 3), app.thread_list.scroll.offset);
+    try std.testing.expectEqual(@as(u32, 0), app.thread.transcript_list.cursor);
+    try std.testing.expectEqual(@as(u32, 0), app.thread.transcript_list.scroll.top);
+    try std.testing.expectEqual(@as(i17, 3), app.thread.transcript_list.scroll.offset);
 }
 
 test "begin submit queues while turn is in flight" {
@@ -5258,26 +5581,26 @@ test "begin submit queues while turn is in flight" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
     // Simulate a turn already streaming and waiting on the next chunk.
-    app.turn.submit();
-    app.turn_view.awaitModel();
+    app.thread.turn.submit();
+    app.thread.turn_view.awaitModel();
 
     try app.input.insertSliceAtCursor("later");
     try std.testing.expect(!try app.beginSubmit());
 
-    try std.testing.expectEqual(@as(usize, 1), app.queued_user_messages.items.len);
-    try std.testing.expectEqualStrings("later", app.queued_user_messages.items[0].text);
+    try std.testing.expectEqual(@as(usize, 1), app.thread.queued.items.len);
+    try std.testing.expectEqualStrings("later", app.thread.queued.items[0].text);
     try std.testing.expectEqual(@as(u32, 1), agent.message_queue.len());
     try std.testing.expectEqual(@as(usize, 0), app.input.buf.firstHalf().len);
     try std.testing.expect(try app.applyAgentEvent(.{ .queued_messages_flushed = 1 }));
-    try std.testing.expectEqual(@as(usize, 0), app.queued_user_messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
     // Just the flushed user message; the spinner stays derived UI.
-    try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
-    try std.testing.expectEqualStrings("later", app.thread.messages.items[0].body);
-    try std.testing.expect(app.turn_view.awaitingOutput());
+    try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
+    try std.testing.expectEqualStrings("later", app.thread.transcript.messages.items[0].body);
+    try std.testing.expect(app.thread.turn_view.awaitingOutput());
 }
 
 test "queued prompt draws above input at minimum input height" {
@@ -5285,10 +5608,10 @@ test "queued prompt draws above input at minimum input height" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    app.turn.submit();
-    app.turn_view.awaitModel();
+    app.thread.turn.submit();
+    app.thread.turn_view.awaitModel();
 
     try app.input.insertSliceAtCursor("later");
     try std.testing.expect(!try app.beginSubmit());
@@ -5315,10 +5638,10 @@ test "alt navigation and ctrl-steer drive the queued message line" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    app.turn.submit();
-    app.turn_view.awaitModel();
+    app.thread.turn.submit();
+    app.thread.turn_view.awaitModel();
 
     try app.input.insertSliceAtCursor("first");
     try std.testing.expect(!try app.beginSubmit());
@@ -5336,7 +5659,7 @@ test "alt navigation and ctrl-steer drive the queued message line" {
 
     // CTRL+→ steers the selected message in both the mirror and agent queue.
     app.steerSelectedQueued();
-    try std.testing.expect(app.queued_user_messages.items[0].steer);
+    try std.testing.expect(app.thread.queued.items[0].steer);
     try std.testing.expect(agent.message_queue.at(&agent.message_queue_storage, 0).?.steer);
 
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -5364,10 +5687,10 @@ test "begin submit shows notice when queued message queue is full" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    app.turn.submit();
-    app.turn_view.awaitModel();
+    app.thread.turn.submit();
+    app.thread.turn_view.awaitModel();
 
     var queued_count: usize = 0;
     while (queued_count < agent.message_queue_storage.len) : (queued_count += 1) {
@@ -5377,14 +5700,14 @@ test "begin submit shows notice when queued message queue is full" {
     try app.input.insertSliceAtCursor("later");
     try std.testing.expect(!try app.beginSubmit());
 
-    try std.testing.expectEqual(@as(usize, 0), app.queued_user_messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
     try std.testing.expectEqual(@as(u32, @intCast(agent.message_queue_storage.len)), agent.message_queue.len());
     try std.testing.expectEqualStrings("later", app.input.buf.firstHalf());
     // The notice is the only transcript row; the spinner is not a status message.
-    try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
-    try std.testing.expectEqual(.notice, app.thread.messages.items[0].kind);
-    try std.testing.expectEqualStrings("MessageQueueFull", app.thread.messages.items[0].body);
-    try std.testing.expect(app.turn_view.awaitingOutput());
+    try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqual(.notice, app.thread.transcript.messages.items[0].kind);
+    try std.testing.expectEqualStrings("MessageQueueFull", app.thread.transcript.messages.items[0].body);
+    try std.testing.expect(app.thread.turn_view.awaitingOutput());
 }
 
 test "opening model picker starts at top" {
@@ -5394,7 +5717,7 @@ test "opening model picker starts at top" {
     defer openai_compatible_client.deinit();
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     app.models.model_selection = 4;
@@ -5410,7 +5733,7 @@ test "model picker hides model arrow when reasoning column is focused" {
     defer openai_compatible_client.deinit();
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     app.mode = .model_picker;
@@ -5449,7 +5772,7 @@ test "model picker without models stays on model column" {
     defer openai_compatible_client.deinit();
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     app.mode = .model_picker;
@@ -5489,7 +5812,7 @@ test "local providers are not loaded twice through configured compatible catalog
     defer openai_compatible_client.deinit();
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     app.cached_config.provider = .ollama;
@@ -5506,12 +5829,12 @@ test "provider picker selects sign out horizontally" {
     defer openai_compatible_client.deinit();
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
     var codex_client: ai.codex_responses.Client = undefined;
     var runtime: runtime_mod.AgentRuntime = undefined;
     runtime.client = .{ .codex_responses = &codex_client };
-    app.runtime = &runtime;
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
     app.codex_signed_in = true;
 
     app.mode = .provider_picker;
@@ -5529,7 +5852,7 @@ test "compatible base url falls back when cached local provider differs" {
     defer openai_compatible_client.deinit();
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     app.cached_config.provider = .llama_cpp;
@@ -5555,8 +5878,8 @@ test "codex sign-in survives selecting local compatible provider" {
     runtime.diagnostics = &.{};
     runtime.owned_client = null;
     runtime.owned_compaction_client = null;
-    var app = App.init(std.testing.io, gpa, &runtime.agent);
-    app.runtime = &runtime;
+    var app = try App.init(std.testing.io, gpa, &runtime.agent);
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
     defer app.deinit();
     defer runtime.disconnectClient();
 
@@ -5592,8 +5915,8 @@ test "switching from codex to catalogue provider resets cached connection" {
     runtime.owned_compaction_client = null;
     defer runtime.disconnectClient();
 
-    var app = App.init(std.testing.io, gpa, &runtime.agent);
-    app.runtime = &runtime;
+    var app = try App.init(std.testing.io, gpa, &runtime.agent);
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
     defer app.deinit();
 
     app.models.model_scope = .session;
@@ -5619,7 +5942,7 @@ test "active model appears at display position 0 without mutating storage" {
     defer openai_compatible_client.deinit();
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
     const active_model_id = try gpa.dupe(u8, "gpt-5.4-mini");
     defer gpa.free(active_model_id);
@@ -5640,7 +5963,7 @@ test "explicit codex catalog loads before runtime is connected" {
     defer openai_compatible_client.deinit();
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.reloadModelCatalog(.openai_codex);
@@ -5656,7 +5979,7 @@ test "slash opens command menu before focused input handles it" {
     defer openai_compatible_client.deinit();
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
     app.bindInputCallbacks();
 
@@ -5682,7 +6005,7 @@ test "slash opens command menu when text field previous value is stale" {
     defer openai_compatible_client.deinit();
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
     app.bindInputCallbacks();
 
@@ -5710,9 +6033,9 @@ test "expired codex connection reports reconnect message" {
     var runtime: runtime_mod.AgentRuntime = undefined;
     runtime.codex_connection_expired = true;
     runtime.diagnostics = &.{};
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    app.runtime = &runtime;
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
     app.cached_config = .{ .provider = .openai };
 
     const message = try app.formatNoProviderMessage();
@@ -5728,7 +6051,7 @@ test "typing slash can open command menu after input changed before" {
     defer openai_compatible_client.deinit();
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
     app.bindInputCallbacks();
 
@@ -5742,8 +6065,8 @@ test "typing slash can open command menu after input changed before" {
 
     try app.input.widget().handleEvent(&ctx, .{ .key_press = .{ .codepoint = 'x', .text = "x" } });
     app.input.clearRetainingCapacity();
-    app.turn.submit();
-    defer app.turn.reset();
+    app.thread.turn.submit();
+    defer app.thread.turn.reset();
     try app.input.widget().handleEvent(&ctx, .{ .key_press = .{ .codepoint = '/', .text = "/" } });
 
     try std.testing.expectEqual(App.Mode.command, app.mode);
@@ -5756,25 +6079,25 @@ test "reprompt after interrupt starts a fresh turn" {
     defer openai_compatible_client.deinit();
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("first");
     try std.testing.expect(try app.beginSubmit());
-    if (app.pending_prompt) |prompt| app.worker_context.gpa.free(prompt);
-    app.pending_prompt = null;
+    if (app.thread.pending_prompt) |prompt| app.thread.worker_context.?.gpa.free(prompt);
+    app.thread.pending_prompt = null;
     try app.handleInterrupt();
 
     try app.input.insertSliceAtCursor("second");
     try std.testing.expect(try app.beginSubmit());
-    defer app.turn.reset();
+    defer app.thread.turn.reset();
     defer {
-        if (app.pending_prompt) |prompt| app.worker_context.gpa.free(prompt);
-        app.pending_prompt = null;
+        if (app.thread.pending_prompt) |prompt| app.thread.worker_context.?.gpa.free(prompt);
+        app.thread.pending_prompt = null;
     }
 
-    try std.testing.expectEqual(Turn.State.active, app.turn.state);
-    try std.testing.expectEqual(@as(usize, 0), app.queued_user_messages.items.len);
+    try std.testing.expectEqual(Turn.State.active, app.thread.turn.state);
+    try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
 }
 
 test "model selection is allowed after interrupt" {
@@ -5793,8 +6116,8 @@ test "model selection is allowed after interrupt" {
     runtime.diagnostics = &.{};
     runtime.owned_client = null;
     runtime.owned_compaction_client = null;
-    var app = App.init(std.testing.io, gpa, &runtime.agent);
-    app.runtime = &runtime;
+    var app = try App.init(std.testing.io, gpa, &runtime.agent);
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
     defer app.deinit();
     defer runtime.disconnectClient();
 
@@ -5803,12 +6126,12 @@ test "model selection is allowed after interrupt" {
     app.cached_config_owned = true;
     app.cached_config.base_url = try gpa.dupe(u8, "http://localhost:11434/v1");
     app.cached_config.api_key = try gpa.dupe(u8, "ollama");
-    app.turn.submit();
-    app.turn.interrupt();
+    app.thread.turn.submit();
+    app.thread.turn.interrupt();
 
     try app.applySelectedModel();
 
-    try std.testing.expectEqual(Turn.State.idle, app.turn.state);
+    try std.testing.expectEqual(Turn.State.idle, app.thread.turn.state);
     try std.testing.expectEqual(config_mod.Provider.ollama, app.cached_config.provider.?);
 }
 
@@ -5828,27 +6151,27 @@ test "interrupt restart flushes queued messages to the transcript when no provid
     runtime.diagnostics = &.{};
     runtime.owned_client = null;
     runtime.owned_compaction_client = null;
-    var app = App.init(std.testing.io, gpa, &runtime.agent);
-    app.runtime = &runtime;
+    var app = try App.init(std.testing.io, gpa, &runtime.agent);
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
     defer app.deinit();
-    defer app.turn.reset();
+    defer app.thread.turn.reset();
 
     // Queue two messages behind a running turn.
-    app.turn.submit();
+    app.thread.turn.submit();
     try app.input.insertSliceAtCursor("one");
     try std.testing.expect(!try app.beginSubmit());
     try app.input.insertSliceAtCursor("two");
     try std.testing.expect(!try app.beginSubmit());
-    try std.testing.expectEqual(@as(usize, 2), app.queued_user_messages.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.thread.queued.items.len);
 
     // With no provider, the restart surfaces the queued text and drops the queue
     // rather than spinning up a doomed worker.
     try std.testing.expect(try app.restartTurnForQueuedMessages());
-    try std.testing.expectEqual(@as(usize, 0), app.queued_user_messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
     try std.testing.expectEqual(@as(u32, 0), runtime.agent.message_queue.len());
-    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
-    try std.testing.expectEqualStrings("one", app.thread.messages.items[0].body);
-    try std.testing.expectEqualStrings("two", app.thread.messages.items[1].body);
+    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqualStrings("one", app.thread.transcript.messages.items[0].body);
+    try std.testing.expectEqualStrings("two", app.thread.transcript.messages.items[1].body);
 }
 
 test "canceling a picker returns to command menu" {
@@ -5858,7 +6181,7 @@ test "canceling a picker returns to command menu" {
     defer openai_compatible_client.deinit();
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     app.mode = .model_picker;
@@ -5879,7 +6202,7 @@ test "typing slash inside picker opens command menu" {
     defer openai_compatible_client.deinit();
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     app.mode = .session_picker;
@@ -5894,7 +6217,7 @@ test "menu navigation wraps and model reasoning tab cycles" {
     defer openai_compatible_client.deinit();
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     app.mode = .command;
@@ -5924,22 +6247,22 @@ test "empty text deltas do not create selectable messages" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("hello");
     _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .response_delta = "" }));
-    try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .thinking_delta = "" }));
-    try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
 }
 
-test "agent app events update thread on the ui side" {
+test "agent app events update transcript on the ui side" {
     const gpa = std.testing.allocator;
     var openai_compatible_client: openai_compatible_mod.Client = undefined;
     try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
@@ -5947,7 +6270,7 @@ test "agent app events update thread on the ui side" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("hello");
@@ -5968,13 +6291,13 @@ test "agent app events update thread on the ui side" {
         .display_body = "$ ls\nexit 0\nstdout:\n\nstderr:\n",
     } }));
 
-    try std.testing.expectEqual(@as(usize, 3), app.thread.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
-    try std.testing.expectEqual(.thinking, app.thread.messages.items[1].kind);
-    try std.testing.expectEqual(.tool, app.thread.messages.items[2].kind);
-    try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
-    try std.testing.expectEqualStrings("checking files", app.thread.messages.items[1].body);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.messages.items[2].title);
+    try std.testing.expectEqual(@as(usize, 3), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
+    try std.testing.expectEqual(.thinking, app.thread.transcript.messages.items[1].kind);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[2].kind);
+    try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);
+    try std.testing.expectEqualStrings("checking files", app.thread.transcript.messages.items[1].body);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[2].title);
 }
 
 test "user can navigate away from a streaming thinking block" {
@@ -5985,20 +6308,20 @@ test "user can navigate away from a streaming thinking block" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("hello");
     _ = try app.beginSubmit();
 
     _ = try app.applyAgentEvent(.{ .thinking_delta = "first chunk" });
-    try std.testing.expectEqual(.thinking, app.thread.messages.items[app.thread.selected.?].kind);
+    try std.testing.expectEqual(.thinking, app.thread.transcript.messages.items[app.thread.transcript.selected.?].kind);
 
-    app.thread.moveSelection(.previous);
-    try std.testing.expectEqual(.user, app.thread.messages.items[app.thread.selected.?].kind);
+    app.thread.transcript.moveSelection(.previous);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[app.thread.transcript.selected.?].kind);
 
     _ = try app.applyAgentEvent(.{ .thinking_delta = " more" });
-    try std.testing.expectEqual(.user, app.thread.messages.items[app.thread.selected.?].kind);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[app.thread.transcript.selected.?].kind);
 }
 
 test "user can navigate away from a streaming agent message" {
@@ -6009,20 +6332,20 @@ test "user can navigate away from a streaming agent message" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("hello");
     _ = try app.beginSubmit();
 
     _ = try app.applyAgentEvent(.{ .response_delta = "first chunk" });
-    try std.testing.expectEqual(.agent, app.thread.messages.items[app.thread.selected.?].kind);
+    try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[app.thread.transcript.selected.?].kind);
 
-    app.thread.moveSelection(.previous);
-    try std.testing.expectEqual(.user, app.thread.messages.items[app.thread.selected.?].kind);
+    app.thread.transcript.moveSelection(.previous);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[app.thread.transcript.selected.?].kind);
 
     _ = try app.applyAgentEvent(.{ .response_delta = " more" });
-    try std.testing.expectEqual(.user, app.thread.messages.items[app.thread.selected.?].kind);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[app.thread.transcript.selected.?].kind);
 }
 
 test "empty content delta does not finalize thinking" {
@@ -6033,24 +6356,24 @@ test "empty content delta does not finalize thinking" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("hello");
     _ = try app.beginSubmit();
 
     _ = try app.applyAgentEvent(.{ .thinking_delta = "thinking" });
-    const thinking_index = app.turn_view.thinking_index.?;
-    try std.testing.expectEqualStrings("Thinking...", app.thread.messages.items[thinking_index].title);
+    const thinking_index = app.thread.turn_view.thinking_index.?;
+    try std.testing.expectEqualStrings("Thinking...", app.thread.transcript.messages.items[thinking_index].title);
 
     _ = try app.applyAgentEvent(.{ .response_delta = "" });
-    try std.testing.expectEqualStrings("Thinking...", app.thread.messages.items[thinking_index].title);
+    try std.testing.expectEqualStrings("Thinking...", app.thread.transcript.messages.items[thinking_index].title);
 
     _ = try app.applyAgentEvent(.{ .thinking_delta = " more" });
-    try std.testing.expectEqualStrings("Thinking...", app.thread.messages.items[thinking_index].title);
+    try std.testing.expectEqualStrings("Thinking...", app.thread.transcript.messages.items[thinking_index].title);
 
     _ = try app.applyAgentEvent(.{ .response_delta = "answer" });
-    try std.testing.expectEqualStrings("Thoughts", app.thread.messages.items[thinking_index].title);
+    try std.testing.expectEqualStrings("Thoughts", app.thread.transcript.messages.items[thinking_index].title);
 }
 
 test "content deltas do not override user scroll state" {
@@ -6061,18 +6384,18 @@ test "content deltas do not override user scroll state" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("hello");
     _ = try app.beginSubmit();
 
     _ = try app.applyAgentEvent(.{ .response_delta = "first" });
-    try std.testing.expect(app.thread_auto_scroll);
+    try std.testing.expect(app.thread.auto_scroll);
 
-    app.thread_auto_scroll = false;
+    app.thread.auto_scroll = false;
     _ = try app.applyAgentEvent(.{ .response_delta = " second" });
-    try std.testing.expect(!app.thread_auto_scroll);
+    try std.testing.expect(!app.thread.auto_scroll);
 }
 
 test "loading does not appear during final answer after tool batch" {
@@ -6083,7 +6406,7 @@ test "loading does not appear during final answer after tool batch" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("inspect");
@@ -6104,13 +6427,13 @@ test "loading does not appear during final answer after tool batch" {
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
     // No status message — the spinner is derived; the batch leaves us awaiting
     // the next response over the user + tool rows.
-    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
-    try std.testing.expect(app.turn_view.awaitingOutput());
+    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
+    try std.testing.expect(app.thread.turn_view.awaitingOutput());
 
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "Final answer" }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
-    try std.testing.expectEqual(@as(usize, 3), app.thread.messages.items.len);
-    try std.testing.expectEqual(.agent, app.thread.messages.items[2].kind);
+    try std.testing.expectEqual(@as(usize, 3), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[2].kind);
 }
 
 test "loading does not reappear between content chunks" {
@@ -6121,7 +6444,7 @@ test "loading does not reappear between content chunks" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("implement dijkstra");
@@ -6132,9 +6455,9 @@ test "loading does not reappear between content chunks" {
     // its own progress indicator.
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "Here's the implementation plan:" }));
     _ = try app.applyAgentEvent(.delta_end);
-    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
-    try std.testing.expectEqual(.agent, app.thread.messages.items[1].kind);
+    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
+    try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[1].kind);
 }
 
 test "bash tool waits for complete arguments while streaming" {
@@ -6145,7 +6468,7 @@ test "bash tool waits for complete arguments while streaming" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("list files");
@@ -6156,8 +6479,8 @@ test "bash tool waits for complete arguments while streaming" {
         .name = "bash",
         .arguments = "{\"command\":\"printf hello",
     } }));
-    try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
 
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
@@ -6166,9 +6489,9 @@ test "bash tool waits for complete arguments while streaming" {
         .display_expanded_label = "printf hello",
         .display_body = "hello",
     } }));
-    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
-    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
+    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
 }
 
 test "tool row persists through finish and turn completion" {
@@ -6179,7 +6502,7 @@ test "tool row persists through finish and turn completion" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("run ls");
@@ -6190,17 +6513,17 @@ test "tool row persists through finish and turn completion" {
         .name = "bash",
         .arguments = "{\"command\":\"ls\",\"reason\":\"List files\"}",
     } }));
-    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
-    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.messages.items[1].title);
-    try std.testing.expectEqualStrings("🛠  ls", app.thread.messages.items[1].tool_expanded_title.?);
-    try std.testing.expect(app.thread.messages.items[1].tool_running);
-    try std.testing.expect(app.thread.hasRunningTool());
+    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].title);
+    try std.testing.expectEqualStrings("🛠  ls", app.thread.transcript.messages.items[1].tool_expanded_title.?);
+    try std.testing.expect(app.thread.transcript.messages.items[1].tool_running);
+    try std.testing.expect(app.thread.transcript.hasRunningTool());
 
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
-    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
-    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.messages.items[1].title);
+    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].title);
 
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
@@ -6209,16 +6532,16 @@ test "tool row persists through finish and turn completion" {
         .display_expanded_label = "ls",
         .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
-    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
-    try std.testing.expect(!app.thread.messages.items[1].tool_running);
-    try std.testing.expect(!app.thread.hasRunningTool());
-    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.messages.items[1].title);
+    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
+    try std.testing.expect(!app.thread.transcript.messages.items[1].tool_running);
+    try std.testing.expect(!app.thread.transcript.hasRunningTool());
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].title);
 
     try std.testing.expect(try app.applyAgentEvent(.turn_finished));
-    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
-    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.messages.items[1].title);
+    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].title);
 }
 
 test "partial tool arguments do not create visible tool rows" {
@@ -6229,7 +6552,7 @@ test "partial tool arguments do not create visible tool rows" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("run ls");
@@ -6242,18 +6565,18 @@ test "partial tool arguments do not create visible tool rows" {
     } }));
     // Partial arguments render nothing, so no tool row appears and the spinner
     // stays up (awaiting) over the lone user message.
-    try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
-    try std.testing.expect(app.turn_view.awaitingOutput());
+    try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
+    try std.testing.expect(app.thread.turn_view.awaitingOutput());
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
         .arguments = "{\"command\":\"ls\",\"reason\":\"List files\"}",
     } }));
-    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
-    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.messages.items[1].title);
+    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].title);
 }
 
 test "tool finish creates row if no complete streamed arguments appeared" {
@@ -6264,7 +6587,7 @@ test "tool finish creates row if no complete streamed arguments appeared" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("run ls");
@@ -6283,12 +6606,12 @@ test "tool finish creates row if no complete streamed arguments appeared" {
         .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
 
-    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
-    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.messages.items[1].title);
+    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].title);
 }
 
-test "new tool response index creates a new thread row" {
+test "new tool response index creates a new transcript row" {
     const gpa = std.testing.allocator;
     var openai_compatible_client: openai_compatible_mod.Client = undefined;
     try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
@@ -6296,7 +6619,7 @@ test "new tool response index creates a new thread row" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("run tools");
@@ -6322,11 +6645,11 @@ test "new tool response index creates a new thread row" {
         .arguments = "{\"command\":\"pwd\",\"reason\":\"Print working directory\"}",
     } }));
 
-    try std.testing.expectEqual(@as(usize, 3), app.thread.messages.items.len);
-    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
-    try std.testing.expectEqual(.tool, app.thread.messages.items[2].kind);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.messages.items[1].title);
-    try std.testing.expectEqualStrings("🛠  Print working directory", app.thread.messages.items[2].title);
+    try std.testing.expectEqual(@as(usize, 3), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[2].kind);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].title);
+    try std.testing.expectEqualStrings("🛠  Print working directory", app.thread.transcript.messages.items[2].title);
 }
 
 test "bash tool after batch creates a new tool row" {
@@ -6337,7 +6660,7 @@ test "bash tool after batch creates a new tool row" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("run tools");
@@ -6357,8 +6680,8 @@ test "bash tool after batch creates a new tool row" {
     } }));
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
     // Awaiting the next segment over the user + tool rows; spinner is derived.
-    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
-    try std.testing.expect(app.turn_view.awaitingOutput());
+    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
+    try std.testing.expect(app.thread.turn_view.awaitingOutput());
 
     _ = try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
@@ -6366,10 +6689,10 @@ test "bash tool after batch creates a new tool row" {
         .arguments = "{\"command\":\"printf done\",\"reason\":\"Print done\"}",
     } });
 
-    try std.testing.expectEqual(@as(usize, 3), app.thread.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
-    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
-    try std.testing.expectEqual(.tool, app.thread.messages.items[2].kind);
+    try std.testing.expectEqual(@as(usize, 3), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[2].kind);
 }
 
 test "late tool finish does not move selection upward" {
@@ -6380,7 +6703,7 @@ test "late tool finish does not move selection upward" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("run tools");
@@ -6391,14 +6714,14 @@ test "late tool finish does not move selection upward" {
         .name = "bash",
         .arguments = "{\"command\":\"ls\",\"reason\":\"List files\"}",
     } }));
-    try std.testing.expectEqual(@as(u32, 1), app.thread.selected.?);
+    try std.testing.expectEqual(@as(u32, 1), app.thread.transcript.selected.?);
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 1,
         .name = "bash",
         .arguments = "{\"command\":\"pwd\",\"reason\":\"Print working directory\"}",
     } }));
-    try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
+    try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);
 
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
@@ -6407,11 +6730,11 @@ test "late tool finish does not move selection upward" {
         .display_expanded_label = "ls",
         .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
-    try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
+    try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);
 
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "done" }));
-    try std.testing.expectEqual(@as(u32, 3), app.thread.selected.?);
+    try std.testing.expectEqual(@as(u32, 3), app.thread.transcript.selected.?);
 }
 
 test "loading does not resume after post-tool thinking delta" {
@@ -6422,7 +6745,7 @@ test "loading does not resume after post-tool thinking delta" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("inspect");
@@ -6445,11 +6768,11 @@ test "loading does not resume after post-tool thinking delta" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .thinking_delta = "checking output" }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
 
-    try std.testing.expectEqual(@as(usize, 3), app.thread.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
-    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
-    try std.testing.expectEqual(.thinking, app.thread.messages.items[2].kind);
-    try std.testing.expectEqualStrings("Thinking...", app.thread.messages.items[2].title);
+    try std.testing.expectEqual(@as(usize, 3), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
+    try std.testing.expectEqual(.thinking, app.thread.transcript.messages.items[2].kind);
+    try std.testing.expectEqualStrings("Thinking...", app.thread.transcript.messages.items[2].title);
 }
 
 test "agent response after tool batch appears below tool rows" {
@@ -6460,7 +6783,7 @@ test "agent response after tool batch appears below tool rows" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("inspect");
@@ -6482,15 +6805,15 @@ test "agent response after tool batch appears below tool rows" {
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "The repo is in /tmp." }));
 
-    try std.testing.expectEqual(@as(usize, 4), app.thread.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
-    try std.testing.expectEqual(.agent, app.thread.messages.items[1].kind);
-    try std.testing.expectEqual(.tool, app.thread.messages.items[2].kind);
-    try std.testing.expectEqual(.agent, app.thread.messages.items[3].kind);
-    try std.testing.expectEqualStrings("I will check.", app.thread.messages.items[1].body);
-    try std.testing.expectEqualStrings("🛠  Print working directory", app.thread.messages.items[2].title);
-    try std.testing.expectEqualStrings("The repo is in /tmp.", app.thread.messages.items[3].body);
-    try std.testing.expectEqual(@as(u32, 3), app.thread.selected.?);
+    try std.testing.expectEqual(@as(usize, 4), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
+    try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[1].kind);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[2].kind);
+    try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[3].kind);
+    try std.testing.expectEqualStrings("I will check.", app.thread.transcript.messages.items[1].body);
+    try std.testing.expectEqualStrings("🛠  Print working directory", app.thread.transcript.messages.items[2].title);
+    try std.testing.expectEqualStrings("The repo is in /tmp.", app.thread.transcript.messages.items[3].body);
+    try std.testing.expectEqual(@as(u32, 3), app.thread.transcript.selected.?);
 }
 
 test "content delta after tool preview does not move selection away from tool row" {
@@ -6501,7 +6824,7 @@ test "content delta after tool preview does not move selection away from tool ro
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("inspect");
@@ -6509,7 +6832,7 @@ test "content delta after tool preview does not move selection away from tool ro
 
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "I will check." }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
-    try std.testing.expectEqual(@as(u32, 1), app.thread.selected.?);
+    try std.testing.expectEqual(@as(u32, 1), app.thread.transcript.selected.?);
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
@@ -6517,11 +6840,11 @@ test "content delta after tool preview does not move selection away from tool ro
         .arguments = "{\"command\":\"pwd\",\"reason\":\"Print working directory\"}",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
-    try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
+    try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);
 
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = " Still checking." }));
     _ = try app.applyAgentEvent(.delta_end);
-    try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
+    try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);
 
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
@@ -6530,43 +6853,43 @@ test "content delta after tool preview does not move selection away from tool ro
         .display_expanded_label = "pwd",
         .display_body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
     } }));
-    try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
-    try std.testing.expectEqualStrings("I will check.", app.thread.messages.items[1].body);
-    try std.testing.expectEqualStrings("🛠  Print working directory", app.thread.messages.items[2].title);
-    try std.testing.expectEqualStrings(" Still checking.", app.thread.messages.items[3].body);
+    try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);
+    try std.testing.expectEqualStrings("I will check.", app.thread.transcript.messages.items[1].body);
+    try std.testing.expectEqualStrings("🛠  Print working directory", app.thread.transcript.messages.items[2].title);
+    try std.testing.expectEqualStrings(" Still checking.", app.thread.transcript.messages.items[3].body);
 }
 
 test "collapsed thinking and tool rows have stable heights" {
     const gpa = std.testing.allocator;
-    var thread: thread_mod.Thread = .{};
-    defer thread.deinit(gpa);
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
 
-    const thinking_index = try thread.append(gpa, .thinking, "Thinking...", "short");
-    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&thread.messages.items[thinking_index], 80));
+    const thinking_index = try transcript.append(gpa, .thinking, "Thinking...", "short");
+    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&transcript.messages.items[thinking_index], 80));
 
-    try thread.appendThinkingDelta(gpa, thinking_index, " ");
-    try thread.appendThinkingDelta(gpa, thinking_index, "this is a much longer thinking body that should not change the collapsed row height");
-    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&thread.messages.items[thinking_index], 80));
+    try transcript.appendThinkingDelta(gpa, thinking_index, " ");
+    try transcript.appendThinkingDelta(gpa, thinking_index, "this is a much longer thinking body that should not change the collapsed row height");
+    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&transcript.messages.items[thinking_index], 80));
 
-    const tool_index = try thread.startTool(gpa, "pwd");
-    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&thread.messages.items[tool_index], 80));
+    const tool_index = try transcript.startTool(gpa, "pwd");
+    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&transcript.messages.items[tool_index], 80));
 }
 
 test "collapsed tool title wraps to visible rows" {
     const gpa = std.testing.allocator;
-    var thread: thread_mod.Thread = .{};
-    defer thread.deinit(gpa);
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
 
-    const index = try thread.startTool(gpa, "python3 - <<'PY'\nprint('a very long patch document')\nPY");
-    try std.testing.expect(!thread.messages.items[index].expanded);
-    try std.testing.expect(messageRowsCached(&thread.messages.items[index], 12) > 3);
+    const index = try transcript.startTool(gpa, "python3 - <<'PY'\nprint('a very long patch document')\nPY");
+    try std.testing.expect(!transcript.messages.items[index].expanded);
+    try std.testing.expect(messageRowsCached(&transcript.messages.items[index], 12) > 3);
 }
 
 test "resumed tool messages keep the tool icon" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    var app = App.init(std.testing.io, gpa, &agent);
+    var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     const blocks = try gpa.alloc(ai.ContentBlock, 1);
@@ -6577,25 +6900,25 @@ test "resumed tool messages keep the tool icon" {
         .tool_display_label = try gpa.dupe(u8, "zig build test"),
     });
 
-    try app.rebuildThreadFromAgent();
+    try app.rebuildTranscriptFromAgent();
 
-    try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
-    try std.testing.expectEqualStrings("🛠  zig build test", app.thread.messages.items[0].title);
+    try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqualStrings("🛠  zig build test", app.thread.transcript.messages.items[0].title);
 }
 
 test "collapsed tool messages render no body text" {
     const gpa = std.testing.allocator;
-    var thread: thread_mod.Thread = .{};
-    defer thread.deinit(gpa);
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
 
-    const index = try thread.startTool(gpa, "printf hello");
-    try thread.finishTool(gpa, index, "hello", null, false);
+    const index = try transcript.startTool(gpa, "printf hello");
+    try transcript.finishTool(gpa, index, "hello", null, false);
 
-    try std.testing.expect(!thread.messages.items[index].expanded);
-    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&thread.messages.items[index], 80));
-    thread.toggleSelected();
-    try std.testing.expect(thread.messages.items[index].expanded);
-    try std.testing.expectEqualStrings("hello", thread.messages.items[index].body);
+    try std.testing.expect(!transcript.messages.items[index].expanded);
+    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&transcript.messages.items[index], 80));
+    transcript.toggleSelected();
+    try std.testing.expect(transcript.messages.items[index].expanded);
+    try std.testing.expectEqualStrings("hello", transcript.messages.items[index].body);
 }
 
 test "expanded tool surface height cannot overflow vxfw buffer size" {
@@ -6604,7 +6927,7 @@ test "expanded tool surface height cannot overflow vxfw buffer size" {
     defer gpa.free(body);
     @memset(body, 'x');
 
-    var message: thread_mod.Message = .{
+    var message: transcript_mod.Message = .{
         .kind = .tool,
         .title = try gpa.dupe(u8, "$ yes"),
         .body = body,
@@ -6630,4 +6953,20 @@ test "expanded tool surface height cannot overflow vxfw buffer size" {
 
     const surface = try widget.widget().draw(ctx);
     try std.testing.expect(surface.size.width * surface.size.height <= std.math.maxInt(u16));
+}
+
+test "switching lanes is a no-op with a single lane" {
+    const gpa = std.testing.allocator;
+    var client: openai_compatible_mod.Client = undefined;
+    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &client });
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), app.threads.items.len);
+    const before = app.thread;
+    app.switchToNextLane();
+    try std.testing.expectEqual(before, app.thread);
 }
