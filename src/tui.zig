@@ -480,6 +480,21 @@ pub const App = struct {
         });
     }
 
+    /// Start a turn whose prompt Nova supplies (not typed by the user): show
+    /// `notice` in the transcript for context, then run `prompt` through the
+    /// normal worker path. The prompt reaches the model (it's the turn's user
+    /// message) but isn't echoed as a "you" bubble. Used to kick off sync
+    /// conflict resolution.
+    fn startInjectedTurn(self: *App, prompt: []const u8, notice: []const u8) !void {
+        self.resetTurnState();
+        self.thread.worker_context.?.resetCancel();
+        _ = try self.thread.transcript.append(self.gpa, .notice, "notice", notice);
+        self.thread.turn_view.awaitModel();
+        self.thread.pending_prompt = try self.thread.worker_context.?.gpa.dupe(u8, prompt);
+        self.thread.turn.submit();
+        try self.startTurn();
+    }
+
     /// After a user interrupt has fully unwound (worker joined, queue stranded),
     /// deliver any queued messages as a fresh turn: the worker drains the whole
     /// queue into history (leading messages as context, the last as the latest
@@ -871,6 +886,14 @@ pub const App = struct {
             self.mode = .normal;
             self.clearInput();
             self.clearPaletteInput();
+            return true;
+        }
+        if (self.mode == .lane_picker) {
+            const source = self.nthCandidateIndex(self.lane_pick_selection);
+            self.mode = .normal;
+            self.clearInput();
+            self.clearPaletteInput();
+            if (source) |s| self.syncActiveLane(s) catch |err| try self.reportLaneError(err);
             return true;
         }
         if (self.mode == .command) {
@@ -2303,13 +2326,8 @@ pub const App = struct {
             self.lane_pick_selection = nextIndex(self.lane_pick_selection, count);
             return true;
         }
-        if (key.matches(vaxis.Key.enter, .{})) {
-            const source = self.nthCandidateIndex(self.lane_pick_selection);
-            self.mode = .normal;
-            self.clearInput();
-            if (source) |s| self.syncActiveLane(s) catch |err| try self.reportLaneError(err);
-            return true;
-        }
+        // Enter is handled by `submitMode` (the shared submit path intercepts it
+        // before generic key dispatch), so the picker only owns up/down here.
         return false;
     }
 
@@ -2354,15 +2372,14 @@ pub const App = struct {
         const dest_head_raw = try dest_rt.session_writer.checkpointHead(self.gpa);
         defer if (dest_head_raw) |h| self.gpa.free(h);
 
+        var has_conflicts = false;
         if (dest_head_raw) |dh_raw| {
             // Rebase the destination's own chain (base..head) onto the source's
-            // head. jj records conflicts as data; if any survive, undo and bail.
+            // head. jj records conflicts as data — the rebase always lands; any
+            // conflicts go to the agent (below) rather than unwinding.
             const dest_head = try jj.ChangeId.parse(dh_raw);
             try jj.rebaseChainOnto(self.gpa, self.io, repo, working.base, dest_head, source_head);
-            if (try jj.rangeHasConflicts(self.gpa, self.io, repo, working.base, dest_head)) {
-                jj.undoLast(self.gpa, self.io, repo) catch {};
-                return error.SyncConflicts;
-            }
+            has_conflicts = try jj.rangeHasConflicts(self.gpa, self.io, repo, working.base, dest_head);
             try jj.newOnTop(self.gpa, self.io, dest_rt.cwd, dest_head);
         } else {
             // No work of our own yet — just re-root the empty working copy onto
@@ -2370,12 +2387,25 @@ pub const App = struct {
             try jj.newOnTop(self.gpa, self.io, dest_rt.cwd, source_head);
         }
 
-        // The fork point is now the source's head, so a later sync rebases only
-        // the work we add from here.
+        // The rebase landed regardless of conflicts, so the fork point is now the
+        // source's head — a later sync rebases only the work we add from here.
         dest.engine.live.lane.working.base = source_head;
 
         const label = source.title orelse "the other lane";
-        const msg = try std.fmt.allocPrint(self.gpa, "Synced {s} into this lane.", .{label});
+        if (has_conflicts) {
+            // Don't unwind: the conflicted working copy carries jj's markers.
+            // Kick off a single turn that has the agent walk the user through the
+            // conflicts one at a time — from there it's an ordinary conversation
+            // (per-turn checkpoints capture progress, Esc interrupts as usual).
+            const notice = try std.fmt.allocPrint(self.gpa, "Sync from \"{s}\" hit conflicts — resolving them with the agent.", .{label});
+            defer self.gpa.free(notice);
+            const prompt = try buildSyncConflictPrompt(self.gpa, label);
+            defer self.gpa.free(prompt);
+            try self.startInjectedTurn(prompt, notice);
+            return;
+        }
+
+        const msg = try std.fmt.allocPrint(self.gpa, "Synced \"{s}\" into this lane.", .{label});
         defer self.gpa.free(msg);
         _ = try dest.transcript.append(self.gpa, .notice, "notice", msg);
     }
@@ -3227,8 +3257,10 @@ const RootWidget = struct {
         if (try self.app.submitMode()) {
             try self.syncFocus(ctx);
             // Keep the tick alive to drain an async model load or diff refresh
-            // (e.g. the cold-start "Loading diff…" the /diff command kicked off).
-            if (self.app.models.model_load_future != null or self.app.diff_refresh_future != null) try self.ensureTick(ctx);
+            // (e.g. the cold-start "Loading diff…" the /diff command kicked off),
+            // or a turn a command started directly (e.g. /sync conflict
+            // resolution injects one).
+            if (self.app.thread.turn.isActive() or self.app.models.model_load_future != null or self.app.diff_refresh_future != null) try self.ensureTick(ctx);
             ctx.consumeAndRedraw();
             return;
         }
@@ -4180,6 +4212,37 @@ const commands = [_]CommandEntry{
 fn commandVisible(app: *const App, entry: CommandEntry) bool {
     if (entry.multi_lane and app.threads.items.len < 2) return false;
     return true;
+}
+
+/// The kickoff prompt for agent-guided sync-conflict resolution. Injected once
+/// (see `startInjectedTurn`); the agent then self-paces one conflict per message
+/// across the ensuing conversation — Nova never re-prompts.
+fn buildSyncConflictPrompt(gpa: std.mem.Allocator, source_title: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa,
+        \\You just pulled the latest work from the lane "{s}" into this lane with
+        \\`jj rebase`, and it produced merge conflicts. Resolve them *with me*, one
+        \\conflict at a time — do not resolve anything on your own.
+        \\
+        \\How to work:
+        \\- Run `jj resolve --list` (and read the conflicted files) to see what
+        \\  conflicts. Work through them one at a time, in order.
+        \\- For each conflict: show me the conflicted region and explain, in plain
+        \\  language, what each side changed and why they collide. Then propose a
+        \\  specific resolution and your reasoning.
+        \\- STOP there and wait for my answer (yes / no / do it differently). Do
+        \\  NOT edit the file until I reply. Handle exactly one conflict per
+        \\  message — never batch, never jump ahead.
+        \\- Once I approve, edit the file so the conflict markers are gone and the
+        \\  code reflects what we agreed, then move to the next conflict (propose,
+        \\  wait again).
+        \\- jj stores conflicts as data: a file is resolved once its conflict
+        \\  markers are removed and saved. Re-run `jj resolve --list` to confirm
+        \\  each one drops off.
+        \\- When no conflicts remain, build/test if there's an obvious way,
+        \\  summarize what changed across the sync, and tell me it's complete.
+        \\
+        \\Start by listing the conflicts and walking me through the first one.
+    , .{source_title});
 }
 
 fn overlayLabel(mode: App.Mode) []const u8 {
@@ -6294,6 +6357,16 @@ test "lane commands stay hidden until a second lane exists" {
     try std.testing.expect(resolveCommand(&app, "Close") == null);
     try std.testing.expect(resolveCommand(&app, "Sync") == null);
     try std.testing.expect(resolveCommand(&app, "Parallel") == .parallel);
+}
+
+test "sync conflict prompt embeds the source lane and the one-at-a-time rule" {
+    const gpa = std.testing.allocator;
+    const prompt = try buildSyncConflictPrompt(gpa, "feature A");
+    defer gpa.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "feature A") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "jj resolve --list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "wait for my answer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "one conflict per") != null);
 }
 
 test "model selection is allowed after interrupt" {
