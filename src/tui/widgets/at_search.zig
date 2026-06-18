@@ -91,7 +91,7 @@ const Body = struct {
         while (row < surface.size.height and first + row < count) : (row += 1) {
             const index = first + row;
             const selected = index == content.selection;
-            const prefix = if (selected) "‣ " else "  ";
+            const prefix = "  ";
             const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, content.results[index] });
             try panel.lineAt(&surface, row, text, ctx, selected, 0);
         }

@@ -531,7 +531,7 @@ const Row = struct {
         if (self.selected) panel.fillRow(&surface, 0, tui_style.Palette.selected);
 
         var col = message.ConversationLayout.left -| 1;
-        const marker = if (self.selected) "‣ " else "  ";
+        const marker = "  ";
         const marker_style = if (self.selected)
             tui_style.Palette.selected_item
         else
