@@ -157,7 +157,16 @@ fn postAgentEvent(context: *anyopaque, event: agent_mod.Agent.Event) anyerror!vo
     while (true) {
         worker_context.queue.push(worker_context.io, worker_context.gpa, event_ptr) catch |err| switch (err) {
             error.QueueFull => {
-                worker_context.io.sleep(.fromMilliseconds(queue_full_backoff_ms), .awake) catch {};
+                // Back off and retry — but a cancelled sleep means the task is
+                // being torn down (`future.cancel` from interrupt/quit). The UI
+                // thread is then blocked *in* that cancel and isn't draining, so
+                // retrying forever would deadlock the teardown. Drop the event
+                // and bail; the canceller discards the queue anyway.
+                worker_context.io.sleep(.fromMilliseconds(queue_full_backoff_ms), .awake) catch {
+                    event_ptr.deinit(worker_context.gpa);
+                    worker_context.gpa.destroy(event_ptr);
+                    return error.TurnCancelled;
+                };
                 continue;
             },
             else => return err,
