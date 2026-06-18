@@ -136,6 +136,8 @@ pub const App = struct {
     checkpoint_state: CheckpointState = .unknown,
     mode: Mode = .normal,
     command_selection: u32 = 0,
+    /// Selection within the `/sync` lane picker (indexes the non-active lanes).
+    lane_pick_selection: u32 = 0,
     resume_selection: u32 = 0,
     resume_global: bool = false,
     resume_summaries: std.ArrayList(session_mod.SessionSummary) = .empty,
@@ -207,7 +209,7 @@ pub const App = struct {
 
     pub const ctrl_c_double_press_ms: u32 = 1500;
 
-    const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer };
+    const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, lane_picker, diff_viewer };
     const ModelCatalog = enum { connected_provider, openai_codex };
     const CheckpointState = enum { unknown, ready, unavailable };
     const ModelSource = model_loader.ModelSource;
@@ -594,6 +596,7 @@ pub const App = struct {
             .model_picker => self.handleModelPickerKey(key),
             .session_picker => self.handleSessionPickerKey(key),
             .tree_picker => self.handleTreePickerKey(key),
+            .lane_picker => self.handleLanePickerKey(key),
             .command => self.handleCommandMenuKey(key),
             // The diff viewer owns its keys directly in `captureEvent`; nothing
             // reaches the generic dispatch.
@@ -885,8 +888,7 @@ pub const App = struct {
                     .diff => self.openDiffViewer() catch |err| try self.reportDiffError(err),
                     .parallel => self.createParallelLane() catch |err| try self.reportLaneError(err),
                     .close => self.closeActiveLane() catch |err| try self.reportLaneError(err),
-                    .split => self.splitLane() catch |err| try self.reportLaneError(err),
-                    .merge => self.mergeActiveLane() catch |err| try self.reportLaneError(err),
+                    .sync => self.beginSync() catch |err| try self.reportLaneError(err),
                 }
             }
             return true;
@@ -2250,76 +2252,132 @@ pub const App = struct {
         _ = try self.thread.transcript.append(self.gpa, .agent, "agent", message);
     }
 
-    /// Merge the active (working) lane onto main: seal both sides, rebase the
-    /// lane's checkpoint chain onto the primary's head, and — only if the rebase
-    /// is conflict-free — advance the primary onto the result and retire the
-    /// lane. Conflicts abort and `jj undo` the rebase, leaving main untouched
-    /// (the guided per-conflict resolution loop is a follow-on). The primary
-    /// (index 0) can't be merged; refused mid-turn.
+    /// Number of lanes eligible as a sync source (every lane but the active one).
+    fn syncCandidateCount(self: *const App) u32 {
+        return @intCast(self.threads.items.len -| 1);
+    }
+
+    /// The real `threads` index of the n-th sync candidate (skipping the active
+    /// lane), or null when `n` is out of range.
+    fn nthCandidateIndex(self: *const App, n: u32) ?usize {
+        const active = self.activeIndex();
+        var k: u32 = 0;
+        for (self.threads.items, 0..) |_, i| {
+            if (i == active) continue;
+            if (k == n) return i;
+            k += 1;
+        }
+        return null;
+    }
+
+    /// Entry point for `/sync`: catch the active lane up to another lane's work.
+    /// The active lane is the destination (it must be a working lane — it needs a
+    /// fork base to rebase from). With exactly two lanes the source is implied;
+    /// otherwise open the lane picker to choose it.
+    fn beginSync(self: *App) !void {
+        self.mode = .normal;
+        self.clearInput();
+        self.clearPaletteInput();
+        if (self.threads.items.len < 2) return error.NoLaneToSync;
+        switch (self.thread.engine) {
+            .live => |l| switch (l.lane) {
+                .working => {},
+                .primary => return error.SyncDestMustBeWorkingLane,
+            },
+            .idle, .archived => return error.NotAWorkingLane,
+        }
+        if (self.threads.items.len == 2) {
+            return self.syncActiveLane(self.nthCandidateIndex(0).?);
+        }
+        self.lane_pick_selection = 0;
+        self.mode = .lane_picker;
+    }
+
+    fn handleLanePickerKey(self: *App, key: vaxis.Key) !bool {
+        const count = self.syncCandidateCount();
+        if (key.matches(vaxis.Key.up, .{})) {
+            self.lane_pick_selection = previousIndex(self.lane_pick_selection, count);
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{})) {
+            self.lane_pick_selection = nextIndex(self.lane_pick_selection, count);
+            return true;
+        }
+        if (key.matches(vaxis.Key.enter, .{})) {
+            const source = self.nthCandidateIndex(self.lane_pick_selection);
+            self.mode = .normal;
+            self.clearInput();
+            if (source) |s| self.syncActiveLane(s) catch |err| try self.reportLaneError(err);
+            return true;
+        }
+        return false;
+    }
+
+    /// Catch the active (destination) lane up to `source_index`'s latest work:
+    /// seal both sides, rebase the destination's own checkpoint chain onto the
+    /// source's head, and — only if conflict-free — re-materialise the
+    /// destination's working copy on top. Both lanes survive (retiring is always
+    /// an explicit `/close`). Conflicts `jj undo` the rebase and bail; the guided
+    /// per-conflict resolution loop is the follow-on.
     ///
     /// NOTE: the jj rebase/conflict revsets are unverified against a live jj —
     /// confirm with a throwaway repo before relying on this. `jj undo` is the net.
-    fn mergeActiveLane(self: *App) !void {
+    fn syncActiveLane(self: *App, source_index: usize) !void {
         if (self.thread.turn.isActive()) return error.InFlightTurn;
-        const index = self.activeIndex();
-        if (index == 0) return error.CannotMergePrimaryLane;
         const repo = self.repoRoot() orelse return error.NoActiveRuntime;
 
-        const lane = self.thread;
-        const live = switch (lane.engine) {
+        const dest = self.thread;
+        const dest_live = switch (dest.engine) {
             .live => |l| l,
             .idle, .archived => return error.NotAWorkingLane,
         };
-        const working = switch (live.lane) {
+        const working = switch (dest_live.lane) {
             .working => |w| w,
-            .primary => return error.NotAWorkingLane,
+            .primary => return error.SyncDestMustBeWorkingLane,
         };
-        const lane_rt = live.runtime;
-        const primary = self.threads.items[0];
-        const primary_rt = switch (primary.engine) {
+        const dest_rt = dest_live.runtime;
+
+        const source = self.threads.items[source_index];
+        const source_rt = switch (source.engine) {
             .live => |l| l.runtime,
             .idle, .archived => return error.NoActiveRuntime,
         };
 
         // Seal pending work on both sides so the heads are well-defined.
-        _ = jj.sealTurn(self.gpa, self.io, lane_rt.cwd, "nova: pre-merge seal") catch null;
-        _ = jj.sealTurn(self.gpa, self.io, primary_rt.cwd, "nova: pre-merge seal") catch null;
+        _ = jj.sealTurn(self.gpa, self.io, dest_rt.cwd, "nova: pre-sync seal") catch null;
+        _ = jj.sealTurn(self.gpa, self.io, source_rt.cwd, "nova: pre-sync seal") catch null;
 
-        const lane_head_raw = (try lane_rt.session_writer.checkpointHead(self.gpa)) orelse return error.NothingToMerge;
-        defer self.gpa.free(lane_head_raw);
-        const main_head_raw = (try primary_rt.session_writer.checkpointHead(self.gpa)) orelse return error.NothingToMerge;
-        defer self.gpa.free(main_head_raw);
-        const lane_head = try jj.ChangeId.parse(lane_head_raw);
-        const main_head = try jj.ChangeId.parse(main_head_raw);
+        const source_head_raw = (try source_rt.session_writer.checkpointHead(self.gpa)) orelse return error.NothingToSync;
+        defer self.gpa.free(source_head_raw);
+        const source_head = try jj.ChangeId.parse(source_head_raw);
 
-        // Rebase the lane's chain onto main. jj records conflicts as data; if any
-        // survive, undo the rebase so main is untouched and bail (resolution loop
-        // is a follow-on).
-        try jj.rebaseChainOnto(self.gpa, self.io, repo, working.base, lane_head, main_head);
-        if (try jj.rangeHasConflicts(self.gpa, self.io, repo, working.base, lane_head)) {
-            jj.undoLast(self.gpa, self.io, repo) catch {};
-            return error.MergeConflicts;
+        const dest_head_raw = try dest_rt.session_writer.checkpointHead(self.gpa);
+        defer if (dest_head_raw) |h| self.gpa.free(h);
+
+        if (dest_head_raw) |dh_raw| {
+            // Rebase the destination's own chain (base..head) onto the source's
+            // head. jj records conflicts as data; if any survive, undo and bail.
+            const dest_head = try jj.ChangeId.parse(dh_raw);
+            try jj.rebaseChainOnto(self.gpa, self.io, repo, working.base, dest_head, source_head);
+            if (try jj.rangeHasConflicts(self.gpa, self.io, repo, working.base, dest_head)) {
+                jj.undoLast(self.gpa, self.io, repo) catch {};
+                return error.SyncConflicts;
+            }
+            try jj.newOnTop(self.gpa, self.io, dest_rt.cwd, dest_head);
+        } else {
+            // No work of our own yet — just re-root the empty working copy onto
+            // the source's head.
+            try jj.newOnTop(self.gpa, self.io, dest_rt.cwd, source_head);
         }
 
-        // Clean: advance the primary's working copy onto the landed work.
-        try jj.newOnTop(self.gpa, self.io, primary_rt.cwd, lane_head);
+        // The fork point is now the source's head, so a later sync rebases only
+        // the work we add from here.
+        dest.engine.live.lane.working.base = source_head;
 
-        // Retire the lane — its work is now on main. Capture the workspace name +
-        // path (freed by `lane.deinit`) before teardown.
-        const ws = working.workspace;
-        const dir = try self.gpa.dupe(u8, working.path);
-        defer self.gpa.free(dir);
-        self.thread = primary;
-        _ = self.threads.orderedRemove(index);
-        lane.deinit(self.gpa);
-        self.gpa.destroy(lane);
-        jj.workspaceForget(self.gpa, self.io, repo, ws) catch {};
-        std.Io.Dir.cwd().deleteTree(self.io, dir) catch {};
-        self.split = false;
-        self.block_nav = false;
-        self.clearInput();
-
-        _ = try self.thread.transcript.append(self.gpa, .notice, "notice", "Lane merged onto main.");
+        const label = source.title orelse "the other lane";
+        const msg = try std.fmt.allocPrint(self.gpa, "Synced {s} into this lane.", .{label});
+        defer self.gpa.free(msg);
+        _ = try dest.transcript.append(self.gpa, .notice, "notice", msg);
     }
 
     fn activeIndex(self: *const App) usize {
@@ -2337,13 +2395,6 @@ pub const App = struct {
             if (lane.turn.state != .idle) return true;
         }
         return false;
-    }
-
-    /// Add one more tiled lane (up to the grid's four). Each `/split` spawns
-    /// another independent lane and tiles; closing lanes back down untiles.
-    fn splitLane(self: *App) !void {
-        self.mode = .normal;
-        try self.createParallelLane(); // creates the lane, sets `split`, switches to it
     }
 
     /// Cycle to the next lane (wrapping). No-op with a single lane.
@@ -3197,6 +3248,9 @@ const RootWidget = struct {
             return;
         }
         const target = switch (self.app.mode) {
+            // The lane picker draws no search field, so keep key handling on the
+            // root widget (via captureEvent) — there's no input to focus.
+            .lane_picker => self.widget(),
             .command, .session_picker, .provider_picker, .model_picker, .tree_picker => self.app.palette_input.widget(),
             // The diff viewer routes focus by sub-state: the comment editor and
             // the file-search field each host a drawn TextField; while browsing
@@ -3983,7 +4037,7 @@ fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
         .normal => app.input.buf.realLength() == 0,
         .session_picker, .model_picker, .tree_picker => app.palette_input.buf.realLength() == 0,
         .provider_picker => app.provider_picker.stage == .list and app.palette_input.buf.realLength() == 0,
-        .command, .diff_viewer => false,
+        .command, .lane_picker, .diff_viewer => false,
     };
 }
 
@@ -4106,8 +4160,10 @@ const TranscriptWidget = struct {
     }
 };
 
-const Command = enum { connect, model, new, resume_session, timeline, diff, parallel, close, split, merge };
-const CommandEntry = struct { name: []const u8, command: Command };
+const Command = enum { connect, model, new, resume_session, timeline, diff, parallel, close, sync };
+/// `multi_lane` commands act on another lane, so they're hidden from the palette
+/// (and unresolvable) until more than one lane exists.
+const CommandEntry = struct { name: []const u8, command: Command, multi_lane: bool = false };
 const commands = [_]CommandEntry{
     .{ .name = "Connect", .command = .connect },
     .{ .name = "Models", .command = .model },
@@ -4116,22 +4172,15 @@ const commands = [_]CommandEntry{
     .{ .name = "Timeline", .command = .timeline },
     .{ .name = "Diff", .command = .diff },
     .{ .name = "Parallel", .command = .parallel },
-    .{ .name = "Close", .command = .close },
-    .{ .name = "Split", .command = .split },
-    .{ .name = "Merge", .command = .merge },
+    .{ .name = "Close", .command = .close, .multi_lane = true },
+    .{ .name = "Sync", .command = .sync, .multi_lane = true },
 };
-const command_panel_entries = [_]command_panel.Entry{
-    .{ .name = "Connect" },
-    .{ .name = "Models" },
-    .{ .name = "New" },
-    .{ .name = "Resume" },
-    .{ .name = "Timeline" },
-    .{ .name = "Diff" },
-    .{ .name = "Parallel" },
-    .{ .name = "Close" },
-    .{ .name = "Split" },
-    .{ .name = "Merge" },
-};
+
+/// Whether `entry` should appear in the palette given the current lane count.
+fn commandVisible(app: *const App, entry: CommandEntry) bool {
+    if (entry.multi_lane and app.threads.items.len < 2) return false;
+    return true;
+}
 
 fn overlayLabel(mode: App.Mode) []const u8 {
     return switch (mode) {
@@ -4141,6 +4190,7 @@ fn overlayLabel(mode: App.Mode) []const u8 {
         .provider_picker => "Connect to Provider",
         .model_picker => "Select Model",
         .tree_picker => "Session Timeline",
+        .lane_picker => "Sync — pick a lane to pull from",
         .diff_viewer => "",
     };
 }
@@ -4149,13 +4199,17 @@ fn resolveCommand(app: *App, filter: []const u8) ?Command {
     var selected: ?Command = null;
     var index: u32 = 0;
     for (commands) |entry| {
+        if (!commandVisible(app, entry)) continue;
         if (!startsWithIgnoreCase(entry.name, filter)) continue;
         if (index == app.command_selection) selected = entry.command;
         index += 1;
     }
     if (selected) |command| return command;
     if (index == 1) {
-        for (commands) |entry| if (startsWithIgnoreCase(entry.name, filter)) return entry.command;
+        for (commands) |entry| {
+            if (!commandVisible(app, entry)) continue;
+            if (startsWithIgnoreCase(entry.name, filter)) return entry.command;
+        }
     }
     return null;
 }
@@ -4163,12 +4217,13 @@ fn resolveCommand(app: *App, filter: []const u8) ?Command {
 fn commandMatchesCount(app: *App) u32 {
     const filter = app.peekPaletteInput() catch return 0;
     defer app.gpa.free(filter);
-    return commandMatchesCountForFilter(filter);
+    return commandMatchesCountForFilter(app, filter);
 }
 
-fn commandMatchesCountForFilter(filter: []const u8) u32 {
+fn commandMatchesCountForFilter(app: *const App, filter: []const u8) u32 {
     var count: u32 = 0;
     for (commands) |entry| {
+        if (!commandVisible(app, entry)) continue;
         if (startsWithIgnoreCase(entry.name, filter)) count += 1;
     }
     return count;
@@ -4209,7 +4264,7 @@ fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []
     const app: *App = @ptrCast(@alignCast(userdata.?));
     switch (app.mode) {
         .command => {
-            const count = commandMatchesCountForFilter(value);
+            const count = commandMatchesCountForFilter(app, value);
             if (app.command_selection >= count) app.command_selection = 0;
         },
         .session_picker => {
@@ -4228,7 +4283,7 @@ fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []
         .diff_viewer => {
             if (app.diff.sub == .file_search) try app.diff.filterFiles(app.gpa, value);
         },
-        .provider_picker, .normal => {},
+        .provider_picker, .lane_picker, .normal => {},
     }
     ctx.consumeAndRedraw();
 }
@@ -4243,6 +4298,7 @@ fn overlaySize(mode: App.Mode) OverlaySize {
         .session_picker => .{ .width = 80, .height = 16 },
         .model_picker => .{ .width = 90, .height = 16 },
         .tree_picker => .{ .width = 90, .height = 20 },
+        .lane_picker => .{ .width = 50, .height = 12 },
         .diff_viewer => .{ .width = 0, .height = 0 },
     };
 }
@@ -4386,7 +4442,9 @@ const OverlayInner = struct {
 
         // The provider setup form hosts its own inline editor, so it skips the
         // shared search row entirely and fills the panel from the top.
-        if (self.app.mode == .provider_picker and self.app.provider_picker.stage == .form) {
+        if ((self.app.mode == .provider_picker and self.app.provider_picker.stage == .form) or
+            self.app.mode == .lane_picker)
+        {
             const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
             children[0] = .{
                 .origin = .{ .row = 0, .col = 0 },
@@ -4451,6 +4509,7 @@ const OverlayInner = struct {
             .provider_picker => drawProviderContent(app, ctx),
             .model_picker => drawModelContent(app, ctx),
             .tree_picker => drawTreeContent(app, ctx),
+            .lane_picker => drawLaneContent(app, ctx),
             // The diff viewer is full-screen — `drawRoot` returns before the
             // overlay path, so this is never reached.
             .normal, .diff_viewer => unreachable,
@@ -4468,10 +4527,37 @@ const OverlayInner = struct {
     fn drawCommandContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const filter = try app.peekPaletteInput();
         defer app.gpa.free(filter);
+        // Build the visible entry list (lane commands appear only with >1 lane);
+        // resolveCommand applies the same visibility + filter, so indices align.
+        var buf: [commands.len]command_panel.Entry = undefined;
+        var n: usize = 0;
+        for (commands) |entry| {
+            if (!commandVisible(app, entry)) continue;
+            buf[n] = .{ .name = entry.name };
+            n += 1;
+        }
         var content: command_panel.Content = .{
-            .entries = &command_panel_entries,
+            .entries = buf[0..n],
             .filter = filter,
             .selection = app.command_selection,
+        };
+        return content.widget().draw(ctx);
+    }
+
+    /// The `/sync` lane picker: list every lane but the active one, by title.
+    fn drawLaneContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        var buf: [4]command_panel.Entry = undefined; // grid caps lanes at four
+        var n: usize = 0;
+        const active = app.activeIndex();
+        for (app.threads.items, 0..) |lane, i| {
+            if (i == active) continue;
+            buf[n] = .{ .name = lane.title orelse try std.fmt.allocPrint(ctx.arena, "lane {d}", .{i + 1}) };
+            n += 1;
+        }
+        var content: command_panel.Content = .{
+            .entries = buf[0..n],
+            .filter = "",
+            .selection = app.lane_pick_selection,
         };
         return content.widget().draw(ctx);
     }
@@ -4567,6 +4653,7 @@ fn inputHintText(app: *const App) []const u8 {
         .provider_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Actions" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .model_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Column" ++ symbols.separator_dot_padded ++ "[TAB] Toggle Effort/Scope" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .tree_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Filter" ++ symbols.separator_dot_padded ++ "[TAB] Fold" ++ symbols.separator_dot_padded ++ "[ENTER] Switch" ++ symbols.separator_dot_padded ++ "[ESC] Back",
+        .lane_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Sync" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .diff_viewer => "",
         .normal => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[SHIFT] ↓ Jump to Bottom" ++ symbols.separator_dot_padded ++ "[TAB] Expand",
     };
@@ -6191,6 +6278,24 @@ test "interrupt drops the turn straight back to idle" {
     try std.testing.expect(!app.thread.turn.isActive());
 }
 
+test "lane commands stay hidden until a second lane exists" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // Single lane: the lane-only commands (/close, /sync) are filtered out of the
+    // palette and can't be resolved; the seven always-on commands remain.
+    try std.testing.expectEqual(@as(u32, 7), commandMatchesCountForFilter(&app, ""));
+    try std.testing.expect(resolveCommand(&app, "Close") == null);
+    try std.testing.expect(resolveCommand(&app, "Sync") == null);
+    try std.testing.expect(resolveCommand(&app, "Parallel") == .parallel);
+}
+
 test "model selection is allowed after interrupt" {
     const gpa = std.testing.allocator;
     var runtime: runtime_mod.AgentRuntime = undefined;
@@ -6312,7 +6417,7 @@ test "menu navigation wraps and model reasoning tab cycles" {
     defer app.deinit();
 
     app.mode = .command;
-    app.command_selection = commandMatchesCountForFilter("") - 1;
+    app.command_selection = commandMatchesCountForFilter(&app, "") - 1;
     try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.down }));
     try std.testing.expectEqual(@as(u32, 0), app.command_selection);
 
