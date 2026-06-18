@@ -3884,12 +3884,12 @@ fn activeCovers(app: *App, active: ?usize, idx: usize) bool {
 }
 
 /// Inline preview row beneath a commented range: the bracket's `└` foot plus a
-/// 💬 and the comment text. The active comment renders yellow with a ▸ marker.
+/// 💬 and the comment text. The active comment renders yellow with a 💬 marker.
 fn drawCommentPreview(surface: *vxfw.Surface, ctx: vxfw.DrawContext, app: *App, comment_index: usize, row: u16, active: bool) void {
     const comment = app.diff.comments.items[comment_index];
     const bracket_style = if (active) StylePalette.diff_bracket_active else StylePalette.diff_bracket;
     panel.lineStyledAt(surface, row, "└", ctx, diff_bracket_col, bracket_style) catch {};
-    const marker: []const u8 = if (active) "▸ 💬 " else "💬 ";
+    const marker: []const u8 = if (active) "  💬 " else "💬 ";
     const text = std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ marker, comment.text }) catch comment.text;
     const text_style = if (active) StylePalette.diff_comment_active else StylePalette.diff_comment;
     panel.lineStyledAt(surface, row, text, ctx, diff_content_col, text_style) catch {};
@@ -4014,7 +4014,7 @@ const DiffSearchInner = struct {
         while (r < visible and first + r < count) : (r += 1) {
             const index = first + r;
             const selected = index == app.diff.search_sel;
-            const prefix = if (selected) "‣ " else "  ";
+            const prefix = if (selected) "  " else "  ";
             const text = std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, files[matches[index]].path }) catch files[matches[index]].path;
             panel.lineAt(&surface, 2 + r, text, ctx, selected, 0) catch {};
         }
@@ -5916,7 +5916,7 @@ test "model picker hides model arrow when reasoning column is focused" {
     const surface = try row.widget().draw(ctx);
 
     try std.testing.expectEqualStrings(" ", surface.readCell(ConversationLayout.left -| 1, 0).char.grapheme);
-    try std.testing.expectEqualStrings("‣", surface.readCell(panel.secondaryColumn(surface.size.width), 0).char.grapheme);
+    try std.testing.expectEqualStrings(" ", surface.readCell(panel.secondaryColumn(surface.size.width), 0).char.grapheme);
 }
 
 test "model picker without models stays on model column" {
