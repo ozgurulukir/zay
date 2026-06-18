@@ -320,13 +320,22 @@ pub const App = struct {
     pub fn handleInterrupt(self: *App) !void {
         if (self.thread.turn.state != .active) return;
         self.thread.worker_context.?.requestCancel();
-        // Show the cancellation notice immediately; the worker's own
-        // `turn_failed`/`turn_finished` are then swallowed while interrupting.
+        // Show the cancellation notice immediately.
         const message = try self.gpa.dupe(u8, agent_worker.cancel_message);
         var event: agent_mod.Agent.Event = .{ .turn_failed = message };
         defer event.deinit(self.gpa);
         _ = try self.thread.turn_view.apply(self.gpa, &self.thread.transcript, event);
         self.thread.turn.interrupt();
+        // Tear the worker down now rather than waiting for it to reach its next
+        // cooperative cancellation point. `requestCancel` only takes effect on
+        // the worker's next `emit`, but between stream chunks (and for the whole
+        // duration of a running tool) the worker is blocked in a read and emits
+        // nothing — so a purely cooperative cancel would leave the lane stuck
+        // `interrupting`, i.e. reading as still in-flight long after Esc.
+        // `cancel` aborts that read and joins the worker; we then drop back to
+        // idle and deliver anything the user queued behind the cancelled turn.
+        self.discardAbandonedTurn();
+        _ = try self.restartTurnForQueuedMessages();
     }
 
     fn discardAbandonedTurn(self: *App) void {
@@ -6156,6 +6165,30 @@ test "reprompt after interrupt starts a fresh turn" {
 
     try std.testing.expectEqual(Turn.State.active, app.thread.turn.state);
     try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
+}
+
+test "interrupt drops the turn straight back to idle" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try app.input.insertSliceAtCursor("first");
+    try std.testing.expect(try app.beginSubmit());
+    if (app.thread.pending_prompt) |prompt| app.thread.worker_context.?.gpa.free(prompt);
+    app.thread.pending_prompt = null;
+    try std.testing.expectEqual(Turn.State.active, app.thread.turn.state);
+
+    // Interrupt must not leave the lane lingering in `interrupting` waiting for
+    // a (possibly blocked) worker to reach its next cancellation point — the UI
+    // would read as in-flight. The worker is torn down and the turn is idle.
+    try app.handleInterrupt();
+    try std.testing.expectEqual(Turn.State.idle, app.thread.turn.state);
+    try std.testing.expect(!app.thread.turn.isActive());
 }
 
 test "model selection is allowed after interrupt" {
