@@ -387,6 +387,12 @@ pub const App = struct {
             return false;
         }
 
+        // The "before" anchor: capture anything the user changed outside a turn —
+        // hand edits, or a working copy left behind by timeline navigation — as
+        // its own checkpoint, so it isn't silently folded into the agent's turn.
+        // A no-op when nothing changed since the last checkpoint.
+        self.sealCheckpoint("nova: checkpoint");
+
         self.resetTurnState();
         self.thread.worker_context.?.resetCancel();
         _ = try self.thread.transcript.append(self.gpa, .user, "you", prompt);
@@ -567,18 +573,23 @@ pub const App = struct {
         return visible_change;
     }
 
-    /// After a turn finishes cleanly, seal the working-copy changes into a jj
-    /// checkpoint and record its change-id on the conversation branch, binding
-    /// this conversation node to the code state the turn produced. Best-effort:
-    /// any jj or persistence failure is swallowed so a turn never fails over a
-    /// checkpoint, and the whole feature stays inert when jj isn't available.
-    /// Interrupted turns are skipped — their file changes fold into the next
-    /// clean turn's checkpoint.
-    fn checkpointFinishedTurn(self: *App) void {
+    /// Seal the working copy into a jj checkpoint and record its change-id on the
+    /// conversation branch, binding this conversation node to its code state.
+    /// No-op when the working copy is unchanged (`sealTurn` returns null), so it's
+    /// safe to call at every turn boundary. Best-effort: any jj or persistence
+    /// failure is swallowed so a turn never fails over a checkpoint, and the whole
+    /// feature stays inert when jj isn't available.
+    fn sealCheckpoint(self: *App, message: []const u8) void {
         const rt = self.liveRuntime() orelse return;
         if (!self.ensureCheckpointReady()) return;
-        const sealed = jj.sealTurn(self.gpa, self.io, rt.cwd, "nova: turn checkpoint") catch return;
+        const sealed = jj.sealTurn(self.gpa, self.io, rt.cwd, message) catch return;
         if (sealed) |id| rt.session_writer.appendCheckpoint(id.slice()) catch {};
+    }
+
+    /// The "after" anchor: seal at the end of a clean turn. Interrupted turns are
+    /// skipped (they return before this), folding into the next clean checkpoint.
+    fn checkpointFinishedTurn(self: *App) void {
+        self.sealCheckpoint("nova: turn checkpoint");
     }
 
     /// Resolve once whether per-turn checkpointing can run: jj installed and the
