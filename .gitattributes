@@ -1,0 +1,6 @@
+# Normalize all text files to LF in the repo and working tree. jj snapshots
+# (and Nova's edit tool) always write LF, so storing LF keeps git, jj, and the
+# working tree in agreement — otherwise every edit churns the whole file's line
+# endings and jj/git fight on checkout. Binary files are auto-detected and left
+# untouched.
+* text=auto eol=lf
