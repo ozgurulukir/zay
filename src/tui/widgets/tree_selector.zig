@@ -71,6 +71,9 @@ const VisibleNode = struct {
     on_active_path: bool,
     is_folded: bool,
     is_foldable: bool,
+    /// A checkpoint was sealed at this message (its checkpoint entries are hidden
+    /// from the tree and shown as a ✦ marker on this row instead).
+    has_checkpoint: bool,
 };
 
 /// Owns the full tree plus the fold/filter UI state for the `/timeline` overlay.
@@ -140,6 +143,9 @@ pub const TreeState = struct {
 
         var active = std.AutoHashMap(Id, void).init(self.gpa);
         defer active.deinit();
+        // The conversation leaf is usually a (hidden) checkpoint; resolve it to
+        // the nearest real message so that row — not nothing — is selected on open.
+        var effective_leaf: ?Id = null;
         if (leaf_id) |id| {
             if (id.len == entry_id_len) {
                 var current: Id = undefined;
@@ -147,6 +153,7 @@ pub const TreeState = struct {
                 while (true) {
                     try active.put(current, {});
                     const index = record_index.get(current) orelse break;
+                    if (effective_leaf == null and !isCheckpointRecord(records[index])) effective_leaf = current;
                     const parent = records[index].parent_id orelse break;
                     current = parent;
                 }
@@ -172,7 +179,7 @@ pub const TreeState = struct {
             const record = records[frame.index];
             const summary = try session_mod.entrySummary(self.gpa, record);
             errdefer self.gpa.free(summary.text);
-            const is_leaf = leaf_id != null and std.mem.eql(u8, record.id[0..], leaf_id.?);
+            const is_leaf = effective_leaf != null and std.mem.eql(u8, record.id[0..], effective_leaf.?[0..]);
             try nodes.append(self.gpa, .{
                 .id = record.id,
                 .parent_id = record.parent_id,
@@ -284,21 +291,30 @@ pub const TreeState = struct {
         }
 
         // 1. Visibility mask: filter + search, minus fold-hidden subtrees.
+        // Checkpoints never appear as their own rows — they're folded into a ✦
+        // marker on the message they were sealed at (computed in step 2).
         const visible_mask = try arena.alloc(bool, self.nodes.len);
         for (self.nodes, 0..) |node, i| {
-            const kind_ok = node.is_leaf or self.kindPasses(node.kind);
+            const kind_ok = node.kind != .checkpoint and (node.is_leaf or self.kindPasses(node.kind));
             const search_ok = search.len == 0 or containsIgnoreCase(node.text, search);
             visible_mask[i] = kind_ok and search_ok and !self.foldHidden(i);
         }
 
         // 2. Visible tree structure: nearest-visible parent + ordered children.
+        // A hidden checkpoint tags its nearest visible ancestor (the message it
+        // was sealed at) so that row can show the ✦ marker.
         const visible_parent = try arena.alloc(?usize, self.nodes.len);
+        const has_cp = try arena.alloc(bool, self.nodes.len);
+        @memset(has_cp, false);
         const child_lists = try arena.alloc(std.ArrayList(usize), self.nodes.len);
         for (child_lists) |*list| list.* = .empty;
         var roots: std.ArrayList(usize) = .empty;
-        for (self.nodes, 0..) |_, i| {
+        for (self.nodes, 0..) |node, i| {
             if (!visible_mask[i]) {
                 visible_parent[i] = null;
+                if (node.kind == .checkpoint) {
+                    if (self.nearestVisibleAncestor(i, visible_mask)) |anc| has_cp[anc] = true;
+                }
                 continue;
             }
             const ancestor = self.nearestVisibleAncestor(i, visible_mask);
@@ -383,6 +399,7 @@ pub const TreeState = struct {
                 .on_active_path = self.nodes[item.full_index].on_active_path,
                 .is_folded = item.is_folded,
                 .is_foldable = item.foldable,
+                .has_checkpoint = has_cp[item.full_index],
             });
         }
 
@@ -442,6 +459,10 @@ pub const TreeState = struct {
         return null;
     }
 };
+
+fn isCheckpointRecord(record: session_mod.EntryRecord) bool {
+    return std.mem.eql(u8, record.kind, "checkpoint");
+}
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
@@ -544,6 +565,10 @@ const Row = struct {
 
         const text = try self.displayText(ctx);
         try panel.lineStyledAt(&surface, 0, text, ctx, col, rowStyle(self.node.kind, self.node.tool_failed, self.selected));
+        if (self.node.has_checkpoint) {
+            col += @intCast(ctx.stringWidth(text));
+            try panel.lineStyledAt(&surface, 0, " ✦", ctx, col, tui_style.onSelectionBg(tui_style.Palette.checkpoint_mark, self.selected));
+        }
         return surface;
     }
 
@@ -652,8 +677,35 @@ test "user-only filter keeps only user turns" {
     try std.testing.expectEqual(@as(usize, 2), state.visible.len);
 }
 
+test "checkpoints fold into a marker on their parent, not their own row" {
+    const gpa = std.testing.allocator;
+    var state = TreeState.init(gpa);
+    defer state.deinit();
+    // user -> agent -> checkpoint(leaf): the checkpoint is hidden; the agent
+    // message it was sealed at carries ✦ and becomes the resolved leaf selection.
+    var records = [_]session_mod.EntryRecord{
+        makeMessage("aaaaaaaa", null, "user", "do it"),
+        makeMessage("bbbbbbbb", "aaaaaaaa", "assistant", "done"),
+        makeCheckpoint("cccccccc", "bbbbbbbb"),
+    };
+    try state.load(&records, "cccccccc");
+
+    try std.testing.expectEqual(@as(usize, 2), state.visible.len);
+    try std.testing.expect(!state.visible[0].has_checkpoint);
+    try std.testing.expect(state.visible[1].has_checkpoint);
+    try std.testing.expect(state.visible[1].is_leaf);
+}
+
 fn makeRecord(id: *const [8]u8, parent: ?*const [8]u8) session_mod.EntryRecord {
     return makeMessage(id, parent, "user", "x");
+}
+
+fn makeCheckpoint(id: *const [8]u8, parent: ?*const [8]u8) session_mod.EntryRecord {
+    var record = makeMessage(id, parent, "assistant", "x");
+    record.kind = @constCast("checkpoint");
+    record.role = null;
+    record.payload_json = @constCast("{\"change_id\":\"kkkkkkkk\"}");
+    return record;
 }
 
 fn makeTool(id: *const [8]u8, parent: ?*const [8]u8, comptime label: []const u8, failed: bool) session_mod.EntryRecord {
