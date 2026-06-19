@@ -134,6 +134,9 @@ pub const App = struct {
     /// until the first finished turn probes jj and colocates the repo, then
     /// cached. `.unavailable` keeps the feature inert when jj isn't installed.
     checkpoint_state: CheckpointState = .unknown,
+    /// The git branch the primary lane saves onto — captured once at the first
+    /// checkpoint, before jj detaches HEAD. Null if launched on a detached HEAD.
+    primary_branch: ?jj.BookmarkName = null,
     mode: Mode = .normal,
     command_selection: u32 = 0,
     /// Selection within the `/sync` lane picker (indexes the non-active lanes).
@@ -583,13 +586,68 @@ pub const App = struct {
         const rt = self.liveRuntime() orelse return;
         if (!self.ensureCheckpointReady()) return;
         const sealed = jj.sealTurn(self.gpa, self.io, rt.cwd, message) catch return;
-        if (sealed) |id| rt.session_writer.appendCheckpoint(id.slice()) catch {};
+        if (sealed) |id| {
+            rt.session_writer.appendCheckpoint(id.slice()) catch {};
+            // Label the new leaf so the in-session detached HEAD reads as a live
+            // position (`nova/live`) instead of an anonymous commit.
+            if (jj.BookmarkName.parse("nova/live")) |live| {
+                jj.setBookmark(self.gpa, self.io, rt.cwd, live, id) catch {};
+            } else |_| {}
+        }
     }
 
     /// The "after" anchor: seal at the end of a clean turn. Interrupted turns are
     /// skipped (they return before this), folding into the next clean checkpoint.
     fn checkpointFinishedTurn(self: *App) void {
         self.sealCheckpoint("nova: turn checkpoint");
+    }
+
+    /// The git branch the active lane saves onto: the primary's launch branch
+    /// (e.g. `worktrees`) for the primary, the lane's own `nova/<id>` otherwise.
+    fn activeLaneBranch(self: *const App) ?jj.BookmarkName {
+        return switch (self.thread.engine) {
+            .live => |l| switch (l.lane) {
+                .working => |w| w.bookmark,
+                .primary => self.primary_branch,
+            },
+            .idle, .archived => null,
+        };
+    }
+
+    /// `/save`: land the active lane's timeline onto its own git branch as a
+    /// single squash-all commit — seal pending work, build one commit on the
+    /// branch holding the leaf's full tree, and repoint the branch onto it. The
+    /// per-turn checkpoint chain never reaches the branch; only this commit does.
+    fn saveActiveLane(self: *App) !void {
+        if (self.thread.turn.isActive()) return error.InFlightTurn;
+        const rt = self.liveRuntime() orelse return error.NoActiveRuntime;
+        const branch = self.activeLaneBranch() orelse return error.NoBranchToSaveTo;
+
+        // Seal anything pending so the leaf is well-defined, then read it.
+        self.sealCheckpoint("nova: checkpoint");
+        const leaf_raw = (try rt.session_writer.checkpointHead(self.gpa)) orelse return error.NothingToSave;
+        defer self.gpa.free(leaf_raw);
+        const leaf = try jj.ChangeId.parse(leaf_raw);
+
+        const message = self.thread.title orelse "nova: saved session";
+        try jj.newOnRevset(self.gpa, self.io, rt.cwd, branch.slice());
+        try jj.restoreFrom(self.gpa, self.io, rt.cwd, leaf);
+        const saved = (try jj.sealTurn(self.gpa, self.io, rt.cwd, message)) orelse return error.NothingToSave;
+        try jj.setBookmark(self.gpa, self.io, rt.cwd, branch, saved);
+
+        // A working lane's fork point is now the saved commit, so a later save or
+        // sync only carries work added from here.
+        switch (self.thread.engine) {
+            .live => |l| switch (l.lane) {
+                .working => self.thread.engine.live.lane.working.base = saved,
+                .primary => {},
+            },
+            .idle, .archived => {},
+        }
+
+        const note = try std.fmt.allocPrint(self.gpa, "Saved to \"{s}\".", .{branch.slice()});
+        defer self.gpa.free(note);
+        _ = try self.thread.transcript.append(self.gpa, .notice, "notice", note);
     }
 
     /// Resolve once whether per-turn checkpointing can run: jj installed and the
@@ -613,7 +671,24 @@ pub const App = struct {
             break :blk true;
         };
         self.checkpoint_state = if (ok) .ready else .unavailable;
+        // Capture the launch branch now, while HEAD is still attached — the first
+        // checkpoint (next) detaches it, and `/save` needs the primary's branch.
+        if (ok and self.primary_branch == null) self.primary_branch = readGitBranch(self.gpa, self.io, repo);
         return ok;
+    }
+
+    /// The current git branch in `repo`, or null on a detached HEAD / failure.
+    fn readGitBranch(gpa: std.mem.Allocator, io: std.Io, repo: []const u8) ?jj.BookmarkName {
+        var result = bash_mod.runWithOptions(gpa, io, .{
+            .cwd = repo,
+            .command = "git branch --show-current 2>/dev/null",
+            .timeout = bash_mod.timeoutFromSeconds(2),
+        }) catch return null;
+        defer result.deinit(gpa);
+        if (result.code != 0) return null;
+        const name = std.mem.trim(u8, result.stdout, " \t\r\n");
+        if (name.len == 0) return null;
+        return jj.BookmarkName.parse(name) catch null;
     }
 
     pub fn handleCommandKey(self: *App, key: vaxis.Key) !bool {
@@ -921,6 +996,7 @@ pub const App = struct {
                     .model => self.openModelPicker() catch |err| try self.reportConnectionError(err),
                     .diff => self.openDiffViewer() catch |err| try self.reportDiffError(err),
                     .parallel => self.createParallelLane() catch |err| try self.reportLaneError(err),
+                    .save => self.saveActiveLane() catch |err| try self.reportLaneError(err),
                     .close => self.closeActiveLane() catch |err| try self.reportLaneError(err),
                     .sync => self.beginSync() catch |err| try self.reportLaneError(err),
                 }
@@ -4215,7 +4291,7 @@ const TranscriptWidget = struct {
     }
 };
 
-const Command = enum { connect, model, new, resume_session, timeline, diff, parallel, close, sync };
+const Command = enum { connect, model, new, resume_session, timeline, diff, parallel, save, close, sync };
 /// `multi_lane` commands act on another lane, so they're hidden from the palette
 /// (and unresolvable) until more than one lane exists.
 const CommandEntry = struct { name: []const u8, command: Command, multi_lane: bool = false };
@@ -4227,6 +4303,7 @@ const commands = [_]CommandEntry{
     .{ .name = "Timeline", .command = .timeline },
     .{ .name = "Diff", .command = .diff },
     .{ .name = "Parallel", .command = .parallel },
+    .{ .name = "Save", .command = .save },
     .{ .name = "Close", .command = .close, .multi_lane = true },
     .{ .name = "Sync", .command = .sync, .multi_lane = true },
 };
@@ -6375,8 +6452,8 @@ test "lane commands stay hidden until a second lane exists" {
     defer app.deinit();
 
     // Single lane: the lane-only commands (/close, /sync) are filtered out of the
-    // palette and can't be resolved; the seven always-on commands remain.
-    try std.testing.expectEqual(@as(u32, 7), commandMatchesCountForFilter(&app, ""));
+    // palette and can't be resolved; the eight always-on commands remain.
+    try std.testing.expectEqual(@as(u32, 8), commandMatchesCountForFilter(&app, ""));
     try std.testing.expect(resolveCommand(&app, "Close") == null);
     try std.testing.expect(resolveCommand(&app, "Sync") == null);
     try std.testing.expect(resolveCommand(&app, "Parallel") == .parallel);

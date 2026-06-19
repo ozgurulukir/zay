@@ -396,6 +396,15 @@ pub fn newOnTop(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, rev: Change
     return newOnRevset(gpa, io, dir, rev.slice());
 }
 
+/// Restore every path in the working copy from revision `rev` (no path args ⇒
+/// the whole tree). `/save` uses this to pull a checkpoint leaf's full tree into
+/// a fresh commit on the lane's branch, collapsing the chain into one diff.
+pub fn restoreFrom(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, rev: ChangeId) CmdError!void {
+    var out = try run(gpa, io, dir, &.{ "restore", "--from", rev.slice() });
+    defer out.deinit(gpa);
+    if (out.code != 0) return error.JjCommandFailed;
+}
+
 /// Undo the last jj operation — reverts a rebase that produced conflicts so a
 /// merge attempt leaves main untouched.
 pub fn undoLast(gpa: std.mem.Allocator, io: std.Io, repo_dir: []const u8) CmdError!void {
