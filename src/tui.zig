@@ -2250,6 +2250,13 @@ pub const App = struct {
         try jj.workspaceAdd(self.gpa, self.io, repo, workspace, dest, base);
         errdefer jj.workspaceForget(self.gpa, self.io, repo, workspace) catch {};
 
+        // Give the lane its own git branch alongside the worktree (the bookmark
+        // exports to `refs/heads/nova/<id>` in colocated mode), so `git branch`
+        // shows each lane and `/save` has a per-lane target. Starts at `base`;
+        // `/save` later advances it onto the lane's squashed work.
+        try jj.createBookmark(self.gpa, self.io, repo, bookmark, base);
+        errdefer jj.deleteBookmark(self.gpa, self.io, repo, bookmark) catch {};
+
         const runtime = try self.createRuntime(dest, repo, null);
         errdefer {
             runtime.deinit();
@@ -2457,11 +2464,13 @@ pub const App = struct {
 
         const lane = self.threads.items[index];
         var workspace: ?jj.WorkspaceName = null;
+        var book: ?jj.BookmarkName = null;
         var dir: ?[]u8 = null;
         switch (lane.engine) {
             .live => |live| switch (live.lane) {
                 .working => |w| {
                     workspace = w.workspace;
+                    book = w.bookmark;
                     dir = try self.gpa.dupe(u8, w.path);
                 },
                 .primary => {},
@@ -2478,8 +2487,11 @@ pub const App = struct {
         lane.deinit(self.gpa);
         self.gpa.destroy(lane);
 
-        if (workspace) |w| {
-            if (self.repoRoot()) |repo| jj.workspaceForget(self.gpa, self.io, repo, w) catch {};
+        if (self.repoRoot()) |repo| {
+            if (workspace) |w| jj.workspaceForget(self.gpa, self.io, repo, w) catch {};
+            // Drop the lane's git branch too, so closed lanes don't leave stray
+            // `nova/<id>` branches behind.
+            if (book) |b| jj.deleteBookmark(self.gpa, self.io, repo, b) catch {};
         }
         if (dir) |d| std.Io.Dir.cwd().deleteTree(self.io, d) catch {};
 

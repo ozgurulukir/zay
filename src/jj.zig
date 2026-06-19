@@ -321,6 +321,36 @@ pub fn workspaceForget(gpa: std.mem.Allocator, io: std.Io, repo_dir: []const u8,
     if (out.code != 0) return error.JjCommandFailed;
 }
 
+// === Bookmark ops =========================================================
+//
+// In a colocated repo a bookmark exports to a git branch (`refs/heads/<name>`),
+// so these give each lane a real git branch alongside its workspace.
+
+/// Create a new bookmark `name` at `rev`. Used when a lane is born, so it has a
+/// branch from the start; the branch advances onto the lane's work only on save.
+pub fn createBookmark(gpa: std.mem.Allocator, io: std.Io, repo_dir: []const u8, name: BookmarkName, rev: ChangeId) CmdError!void {
+    var out = try run(gpa, io, repo_dir, &.{ "bookmark", "create", name.slice(), "-r", rev.slice() });
+    defer out.deinit(gpa);
+    if (out.code != 0) return error.JjCommandFailed;
+}
+
+/// Move an existing bookmark to `rev` (`--allow-backwards` so a save that
+/// rewrites history can still repoint it). This is how `/save` advances a lane's
+/// branch onto the squashed commit.
+pub fn setBookmark(gpa: std.mem.Allocator, io: std.Io, repo_dir: []const u8, name: BookmarkName, rev: ChangeId) CmdError!void {
+    var out = try run(gpa, io, repo_dir, &.{ "bookmark", "set", name.slice(), "-r", rev.slice(), "--allow-backwards" });
+    defer out.deinit(gpa);
+    if (out.code != 0) return error.JjCommandFailed;
+}
+
+/// Delete bookmark `name` (drops the git branch). Used to unwind a half-created
+/// lane and when retiring one.
+pub fn deleteBookmark(gpa: std.mem.Allocator, io: std.Io, repo_dir: []const u8, name: BookmarkName) CmdError!void {
+    var out = try run(gpa, io, repo_dir, &.{ "bookmark", "delete", name.slice() });
+    defer out.deinit(gpa);
+    if (out.code != 0) return error.JjCommandFailed;
+}
+
 // === Merge ops ============================================================
 //
 // These land a lane's work back onto main. jj records conflicts as data in the
