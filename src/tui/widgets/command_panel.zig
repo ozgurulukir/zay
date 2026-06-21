@@ -30,7 +30,8 @@ pub const Content = struct {
         for (self.entries) |entry| {
             if (!startsWithIgnoreCase(entry.name, self.filter)) continue;
             const selected = index == self.selection;
-            const prefix = if (selected) "‣ " else "  ";
+            // Two-space indent; selection is shown by the row's background fill.
+            const prefix = "  ";
             const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, entry.name });
             try panel.commandLine(surface, row, text, ctx, selected);
             row += 1;

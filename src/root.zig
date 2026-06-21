@@ -18,9 +18,11 @@ pub const symbols = @import("symbols.zig");
 pub const terminal_markdown = @import("terminal_markdown");
 pub const logger = @import("logger");
 pub const runtime = @import("runtime.zig");
-pub const thread = @import("thread.zig");
+pub const jj = @import("jj.zig");
+pub const transcript = @import("transcript.zig");
 pub const tools = @import("tools.zig");
 pub const tui = @import("tui.zig");
+pub const thread = @import("tui/thread.zig");
 
 pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     if (logger.enabled) {
@@ -39,9 +41,9 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
 
     var load_result = try config.load(gpa, init.io, cwd, home_dir, init.environ_map);
     // The TUI is long-running and streams unbounded content, so it must use a
-    // real freeing allocator — an arena never reclaims, and `Thread`'s
+    // real freeing allocator — an arena never reclaims, and `Transcript`'s
     // streaming-body `realloc` degrades to O(N²) abandoned buffers on one (see
-    // `appendOwned` in thread.zig). `smp_allocator` is a thread-safe global
+    // `appendOwned` in transcript.zig). `smp_allocator` is a thread-safe global
     // singleton, so this matches `App.gpa` (tui.zig) exactly — required because
     // `agent_runtime`/`tui_config` are allocated here and freed in `App.deinit`.
     const tui_gpa = std.heap.smp_allocator;
@@ -58,10 +60,12 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
         runtime_gpa,
         init.io,
         cwd,
+        cwd, // session_dir: the primary's sessions live in the repo root's .nova
         home_dir,
         system_prompt,
         load_result.config,
         load_result.takeDiagnostics(),
+        null, // template: the primary builds its prompt + skills from scratch
     );
     load_result.config.deinit(gpa);
 

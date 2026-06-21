@@ -312,7 +312,7 @@ pub const Row = struct {
         if (self.selected) panel.fillRow(&surface, 0, StylePalette.selected);
 
         const model_focused = self.selected and self.column == .model;
-        const prefix = if (model_focused) "‣ " else "  ";
+        const prefix = "  ";
         const start_col = message.ConversationLayout.left -| 1;
         const base = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.model.label });
         try panel.lineStyledAt(&surface, 0, base, ctx, start_col, columnStyle(model_focused, self.selected));
@@ -335,14 +335,14 @@ pub const Row = struct {
 
     fn drawReasoning(self: *const Row, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
         const focused = self.column == .reasoning;
-        const prefix = if (focused) "‣ " else "  ";
+        const prefix = "  ";
         const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.reasoning_label });
         try panel.lineStyledAt(surface, 0, text, ctx, panel.secondaryColumn(surface.size.width), columnStyle(focused, self.selected));
     }
 
     fn drawScope(self: *const Row, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
         const focused = self.column == .scope;
-        const prefix = if (focused) "‣ " else "  ";
+        const prefix = "  ";
         const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.scope_label });
         try panel.lineStyledAt(surface, 0, text, ctx, scopeColumn(surface.size.width), columnStyle(focused, self.selected));
     }

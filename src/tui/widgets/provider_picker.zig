@@ -104,7 +104,7 @@ pub const Content = struct {
         for (providers, 0..) |provider, index| {
             const row: u16 = @intCast(index + 1);
             const focused = self.state.selection == row and self.state.column == .provider;
-            const prefix = if (focused) "‣ " else "  ";
+            const prefix = "  ";
             const base = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, provider.displayName() });
             try panel.commandLine(surface, row, base, ctx, focused);
             if (index < self.connected.len and self.connected[index]) {
@@ -120,7 +120,7 @@ pub const Content = struct {
         const provider_focused = row_selected and self.state.column == .provider;
         if (row_selected) panel.fillRow(surface, 0, StylePalette.selected);
 
-        const prefix = if (provider_focused) "‣ " else "  ";
+        const prefix = "  ";
         const base = try std.fmt.allocPrint(ctx.arena, "{s}OpenAI Codex", .{prefix});
         const base_style = if (provider_focused) StylePalette.selected_item else tui_style.onSelectionBg(StylePalette.thinking_body, row_selected);
         try panel.lineStyledAt(surface, 0, base, ctx, message.ConversationLayout.left -| 1, base_style);
@@ -134,7 +134,7 @@ pub const Content = struct {
 
     fn drawSignOut(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext, row_selected: bool) !void {
         const focused = row_selected and self.state.column == .sign_out;
-        const prefix = if (focused) "‣ " else "  ";
+        const prefix = "  ";
         const text = try std.fmt.allocPrint(ctx.arena, "{s}Sign Out", .{prefix});
         const style = if (focused) StylePalette.selected_item else tui_style.onSelectionBg(StylePalette.thinking_body, row_selected);
         try panel.lineStyledAt(surface, 0, text, ctx, panel.secondaryColumn(surface.size.width), style);
@@ -201,7 +201,7 @@ test "provider picker keeps codex text visible when sign out is focused" {
     const surface = try content.widget().draw(ctx);
 
     try std.testing.expectEqualStrings("O", surface.readCell(message.ConversationLayout.left + 1, 0).char.grapheme);
-    try std.testing.expectEqualStrings("‣", surface.readCell(panel.secondaryColumn(surface.size.width), 0).char.grapheme);
+    try std.testing.expectEqualStrings("S", surface.readCell(panel.secondaryColumn(surface.size.width) + 2, 0).char.grapheme);
     try std.testing.expectEqual(StylePalette.selected.bg, surface.readCell(panel.secondaryColumn(surface.size.width) + 2, 0).style.bg);
 }
 

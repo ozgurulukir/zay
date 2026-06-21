@@ -22,6 +22,11 @@ pub const Palette = struct {
     pub const model_status: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
     pub const thinking_label: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
     pub const thinking_body: vaxis.Style = .{ .fg = .{ .rgb = muted_gray } };
+    /// Timeline code-state checkpoints — the light blue, marking branch points.
+    pub const checkpoint: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
+    /// The ✦ marker on a timeline message that has a checkpoint — the same blue
+    /// as diff-view file names (`code_blue`).
+    pub const checkpoint_mark: vaxis.Style = .{ .fg = .{ .rgb = code_blue } };
     pub const thinking_bar: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
     pub const markdown_code: vaxis.Style = .{ .fg = .{ .rgb = .{ 147, 197, 253 } } };
     pub const panel_header: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } } };

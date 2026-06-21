@@ -1,10 +1,10 @@
 const std = @import("std");
 
 const terminal_markdown = @import("terminal_markdown");
-const thread_mod = @import("../thread.zig");
+const transcript_mod = @import("../transcript.zig");
 const blackhole = @import("blackhole.zig");
 
-pub fn messageRowsCached(message: *thread_mod.Message, width: u16) u16 {
+pub fn messageRowsCached(message: *transcript_mod.Message, width: u16) u16 {
     if (message.row_cache.valid and message.row_cache.width == width) {
         return message.row_cache.rows;
     }
@@ -13,7 +13,7 @@ pub fn messageRowsCached(message: *thread_mod.Message, width: u16) u16 {
     return rows;
 }
 
-pub fn messageContentRows(message: thread_mod.Message, width: u16) u16 {
+pub fn messageContentRows(message: transcript_mod.Message, width: u16) u16 {
     return switch (message.kind) {
         .user, .notice => textRows(message.body, width -| 2),
         .agent => terminal_markdown.countRows(message.body, @max(width, 1)),
@@ -36,12 +36,12 @@ pub fn toolTitleRows(title: []const u8, width: u16) u16 {
     return textRows(toolCommandTitle(title), width -| indent);
 }
 
-fn toolMessageTitle(message: thread_mod.Message) []const u8 {
+fn toolMessageTitle(message: transcript_mod.Message) []const u8 {
     if (message.expanded) return message.tool_expanded_title orelse message.title;
     return message.title;
 }
 
-pub fn toolBodyRows(message: thread_mod.Message, width: u16) u16 {
+pub fn toolBodyRows(message: transcript_mod.Message, width: u16) u16 {
     var rows: u16 = 0;
     if (message.body.len > 0) rows += textRows(message.body, width);
     if (message.stderr_body) |stderr| rows += textRows(stderr, width);

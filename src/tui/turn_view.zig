@@ -1,6 +1,6 @@
 //! TurnView owns the visible state of the current agent turn.
 //!
-//! The durable transcript lives in `thread.zig`. This type only remembers the
+//! The durable transcript lives in `transcript.zig`. This type only remembers the
 //! streaming positions needed to turn `Agent.Event`s into transcript mutations
 //! and synthetic UI state such as the loading spinner.
 
@@ -8,7 +8,7 @@ const std = @import("std");
 
 const agent_mod = @import("../agent.zig");
 const ai = @import("../ai.zig");
-const thread_mod = @import("../thread.zig");
+const transcript_mod = @import("../transcript.zig");
 const tools_mod = @import("../tools.zig");
 const tool_policy = @import("tool_policy.zig");
 
@@ -53,21 +53,21 @@ pub const TurnView = struct {
     pub fn apply(
         self: *TurnView,
         gpa: std.mem.Allocator,
-        thread: *thread_mod.Thread,
+        transcript: *transcript_mod.Transcript,
         event: agent_mod.Agent.Event,
     ) !bool {
         switch (event) {
             .turn_started => return false,
-            .response_delta => |delta| return try self.applyResponseDelta(gpa, thread, delta),
-            .thinking_delta => |delta| return try self.applyThinkingDelta(gpa, thread, delta),
-            .tool_delta => |tool| return try self.applyToolDelta(gpa, thread, tool),
+            .response_delta => |delta| return try self.applyResponseDelta(gpa, transcript, delta),
+            .thinking_delta => |delta| return try self.applyThinkingDelta(gpa, transcript, delta),
+            .tool_delta => |tool| return try self.applyToolDelta(gpa, transcript, tool),
             .delta_end => return self.takePendingRedraw(),
-            .tool_call_finished => |tool| return try self.applyToolFinished(gpa, thread, tool),
-            .tool_batch_finished => return try self.applyToolBatchFinished(gpa, thread),
+            .tool_call_finished => |tool| return try self.applyToolFinished(gpa, transcript, tool),
+            .tool_batch_finished => return try self.applyToolBatchFinished(gpa, transcript),
             .queued_messages_flushed => return false,
-            .turn_failed => |message| return try self.applyTurnFailed(gpa, thread, message),
-            .turn_finished => return try self.applyTurnFinished(gpa, thread),
-            .history_compacted => |info| return try self.applyHistoryCompacted(gpa, thread, info),
+            .turn_failed => |message| return try self.applyTurnFailed(gpa, transcript, message),
+            .turn_finished => return try self.applyTurnFinished(gpa, transcript),
+            .history_compacted => |info| return try self.applyHistoryCompacted(gpa, transcript, info),
         }
     }
 
@@ -76,7 +76,7 @@ pub const TurnView = struct {
     }
 
     /// Begin waiting for the next chunk of model output. The spinner is drawn
-    /// outside the transcript; no thread mutation.
+    /// outside the transcript; no transcript mutation.
     pub fn awaitModel(self: *TurnView) void {
         assert(self.loading_word_index < loading_spinners.len);
         self.activity = .awaiting_model;
@@ -85,12 +85,12 @@ pub const TurnView = struct {
     fn applyResponseDelta(
         self: *TurnView,
         gpa: std.mem.Allocator,
-        thread: *thread_mod.Thread,
+        transcript: *transcript_mod.Transcript,
         delta: []const u8,
     ) !bool {
         if (delta.len == 0) return false;
-        _ = try self.finishThinking(gpa, thread);
-        try self.applyContentDelta(gpa, thread, delta);
+        _ = try self.finishThinking(gpa, transcript);
+        try self.applyContentDelta(gpa, transcript, delta);
         self.activity = .{ .writing_response = self.agent_index.? };
         self.pending_redraw = true;
         return true;
@@ -99,10 +99,10 @@ pub const TurnView = struct {
     fn applyThinkingDelta(
         self: *TurnView,
         gpa: std.mem.Allocator,
-        thread: *thread_mod.Thread,
+        transcript: *transcript_mod.Transcript,
         delta: []const u8,
     ) !bool {
-        if (try self.applyReasoningDelta(gpa, thread, delta)) self.pending_redraw = true;
+        if (try self.applyReasoningDelta(gpa, transcript, delta)) self.pending_redraw = true;
         if (self.thinking_index) |index| self.activity = .{ .thinking = index };
         return false;
     }
@@ -110,11 +110,11 @@ pub const TurnView = struct {
     fn applyToolDelta(
         self: *TurnView,
         gpa: std.mem.Allocator,
-        thread: *thread_mod.Thread,
+        transcript: *transcript_mod.Transcript,
         tool: ai.ToolDelta,
     ) !bool {
-        const thinking_finished = try self.finishThinking(gpa, thread);
-        if (try self.applyToolPreview(gpa, thread, tool)) {
+        const thinking_finished = try self.finishThinking(gpa, transcript);
+        if (try self.applyToolPreview(gpa, transcript, tool)) {
             self.activity = .calling_tools;
             self.pending_redraw = true;
         }
@@ -125,20 +125,20 @@ pub const TurnView = struct {
     fn applyToolFinished(
         self: *TurnView,
         gpa: std.mem.Allocator,
-        thread: *thread_mod.Thread,
+        transcript: *transcript_mod.Transcript,
         tool: agent_mod.Agent.Event.ToolCallFinished,
     ) !bool {
-        const thinking_finished = try self.finishThinking(gpa, thread);
+        const thinking_finished = try self.finishThinking(gpa, transcript);
         self.activity = .calling_tools;
-        return thinking_finished or try self.finishTool(gpa, thread, tool);
+        return thinking_finished or try self.finishTool(gpa, transcript, tool);
     }
 
     fn applyToolBatchFinished(
         self: *TurnView,
         gpa: std.mem.Allocator,
-        thread: *thread_mod.Thread,
+        transcript: *transcript_mod.Transcript,
     ) !bool {
-        _ = try self.finishThinking(gpa, thread);
+        _ = try self.finishThinking(gpa, transcript);
         self.agent_index = null;
         self.thinking_index = null;
         self.tool_seen_in_response = false;
@@ -151,30 +151,30 @@ pub const TurnView = struct {
     fn applyTurnFailed(
         self: *TurnView,
         gpa: std.mem.Allocator,
-        thread: *thread_mod.Thread,
+        transcript: *transcript_mod.Transcript,
         message: []const u8,
     ) !bool {
         self.activity = .idle;
-        _ = thread.stopRunningTools();
-        _ = try thread.append(gpa, .notice, "notice", message);
+        _ = transcript.stopRunningTools();
+        _ = try transcript.append(gpa, .notice, "notice", message);
         return true;
     }
 
     fn applyTurnFinished(
         self: *TurnView,
         gpa: std.mem.Allocator,
-        thread: *thread_mod.Thread,
+        transcript: *transcript_mod.Transcript,
     ) !bool {
         self.activity = .idle;
-        _ = try self.finishThinking(gpa, thread);
-        _ = thread.stopRunningTools();
+        _ = try self.finishThinking(gpa, transcript);
+        _ = transcript.stopRunningTools();
         return true;
     }
 
     fn applyHistoryCompacted(
         self: *TurnView,
         gpa: std.mem.Allocator,
-        thread: *thread_mod.Thread,
+        transcript: *transcript_mod.Transcript,
         info: agent_mod.Agent.Event.HistoryCompacted,
     ) !bool {
         _ = self;
@@ -184,7 +184,7 @@ pub const TurnView = struct {
             "compacted context ~{d} -> ~{d} tokens",
             .{ info.tokens_before, info.tokens_after },
         ) catch "compacted context";
-        _ = try thread.append(gpa, .notice, "notice", text);
+        _ = try transcript.append(gpa, .notice, "notice", text);
         return true;
     }
 
@@ -197,58 +197,58 @@ pub const TurnView = struct {
     fn applyContentDelta(
         self: *TurnView,
         gpa: std.mem.Allocator,
-        thread: *thread_mod.Thread,
+        transcript: *transcript_mod.Transcript,
         delta: []const u8,
     ) !void {
         assert(delta.len > 0);
-        const selected = thread.selected;
+        const selected = transcript.selected;
         if (self.agent_index) |index| {
-            try thread.appendAgentDelta(gpa, index, delta);
+            try transcript.appendAgentDelta(gpa, index, delta);
         } else {
-            self.agent_index = try thread.append(gpa, .agent, "agent", delta);
+            self.agent_index = try transcript.append(gpa, .agent, "agent", delta);
         }
         if (self.tool_seen_in_response) {
-            if (selected) |index| thread.select(index);
+            if (selected) |index| transcript.select(index);
         } else {
-            selectGeneratedMessage(thread, self.agent_index.?);
+            selectGeneratedMessage(transcript, self.agent_index.?);
         }
     }
 
-    fn finishThinking(self: *TurnView, gpa: std.mem.Allocator, thread: *thread_mod.Thread) !bool {
+    fn finishThinking(self: *TurnView, gpa: std.mem.Allocator, transcript: *transcript_mod.Transcript) !bool {
         const index = self.thinking_index orelse return false;
-        if (index >= thread.messages.items.len) return false;
-        if (std.mem.eql(u8, thread.messages.items[index].title, "Thoughts")) return false;
-        try thread.finishThinking(gpa, index);
+        if (index >= transcript.messages.items.len) return false;
+        if (std.mem.eql(u8, transcript.messages.items[index].title, "Thoughts")) return false;
+        try transcript.finishThinking(gpa, index);
         return true;
     }
 
     fn applyReasoningDelta(
         self: *TurnView,
         gpa: std.mem.Allocator,
-        thread: *thread_mod.Thread,
+        transcript: *transcript_mod.Transcript,
         delta: []const u8,
     ) !bool {
         if (delta.len == 0) return false;
         var visible_change = false;
         if (self.thinking_index) |index| {
-            try thread.appendThinkingDelta(gpa, index, delta);
+            try transcript.appendThinkingDelta(gpa, index, delta);
         } else if (self.agent_index) |agent_index| {
-            self.thinking_index = try thread.insert(gpa, agent_index, .thinking, "Thinking...", delta);
+            self.thinking_index = try transcript.insert(gpa, agent_index, .thinking, "Thinking...", delta);
             self.agent_index = agent_index + 1;
-            thread.select(self.thinking_index.?);
+            transcript.select(self.thinking_index.?);
             visible_change = true;
         } else {
-            self.thinking_index = try thread.append(gpa, .thinking, "Thinking...", delta);
+            self.thinking_index = try transcript.append(gpa, .thinking, "Thinking...", delta);
             visible_change = true;
         }
-        if (self.agent_index == null and !self.tool_seen_in_response) selectGeneratedMessage(thread, self.thinking_index.?);
+        if (self.agent_index == null and !self.tool_seen_in_response) selectGeneratedMessage(transcript, self.thinking_index.?);
         return visible_change;
     }
 
     fn applyToolPreview(
         self: *TurnView,
         gpa: std.mem.Allocator,
-        thread: *thread_mod.Thread,
+        transcript: *transcript_mod.Transcript,
         tool: ai.ToolDelta,
     ) !bool {
         if (std.mem.eql(u8, tool.name, "bash")) {
@@ -256,7 +256,7 @@ pub const TurnView = struct {
             gpa.free(command);
             if (try skillNameFromBashRead(gpa, tool.arguments)) |skill_name| {
                 defer gpa.free(skill_name);
-                return try self.applySkillPreview(gpa, thread, tool.index, skill_name);
+                return try self.applySkillPreview(gpa, transcript, tool.index, skill_name);
             }
         }
         var display = try agent_mod.formatToolDisplay(gpa, tool.name, tool.arguments);
@@ -268,13 +268,13 @@ pub const TurnView = struct {
         const was_awaiting = self.awaitingOutput();
 
         var visible_change = false;
-        if (self.toolThreadIndex(tool.index)) |index| {
-            visible_change = !toolDisplayMatches(thread.messages.items[index], display);
-            try thread.updateToolExpanded(gpa, index, display.label, display.expanded_label);
+        if (self.toolTranscriptIndex(tool.index)) |index| {
+            visible_change = !toolDisplayMatches(transcript.messages.items[index], display);
+            try transcript.updateToolExpanded(gpa, index, display.label, display.expanded_label);
         } else {
-            const index = try thread.startTool(gpa, display.label);
-            try thread.updateToolExpanded(gpa, index, display.label, display.expanded_label);
-            try self.putToolThreadIndex(gpa, tool.index, index);
+            const index = try transcript.startTool(gpa, display.label);
+            try transcript.updateToolExpanded(gpa, index, display.label, display.expanded_label);
+            try self.putToolTranscriptIndex(gpa, tool.index, index);
             visible_change = true;
         }
         self.tool_seen_in_response = true;
@@ -282,9 +282,9 @@ pub const TurnView = struct {
         return was_awaiting or visible_change;
     }
 
-    fn setSkillMessage(gpa: std.mem.Allocator, thread: *thread_mod.Thread, index: u32, title: []const u8) !void {
-        assert(index < thread.messages.items.len);
-        const message = &thread.messages.items[index];
+    fn setSkillMessage(gpa: std.mem.Allocator, transcript: *transcript_mod.Transcript, index: u32, title: []const u8) !void {
+        assert(index < transcript.messages.items.len);
+        const message = &transcript.messages.items[index];
         const owned_title = try gpa.dupe(u8, title);
         errdefer gpa.free(owned_title);
         const owned_body = try gpa.dupe(u8, "");
@@ -304,7 +304,7 @@ pub const TurnView = struct {
     fn applySkillPreview(
         self: *TurnView,
         gpa: std.mem.Allocator,
-        thread: *thread_mod.Thread,
+        transcript: *transcript_mod.Transcript,
         tool_index: u32,
         skill_name: []const u8,
     ) !bool {
@@ -313,12 +313,12 @@ pub const TurnView = struct {
 
         const was_awaiting = self.awaitingOutput();
         var visible_change = false;
-        if (self.toolThreadIndex(tool_index)) |index| {
-            visible_change = thread.messages.items[index].kind != .skill or !std.mem.eql(u8, thread.messages.items[index].title, title);
-            if (visible_change) try setSkillMessage(gpa, thread, index, title);
+        if (self.toolTranscriptIndex(tool_index)) |index| {
+            visible_change = transcript.messages.items[index].kind != .skill or !std.mem.eql(u8, transcript.messages.items[index].title, title);
+            if (visible_change) try setSkillMessage(gpa, transcript, index, title);
         } else {
-            const index = try thread.append(gpa, .skill, title, "");
-            try self.putToolThreadIndex(gpa, tool_index, index);
+            const index = try transcript.append(gpa, .skill, title, "");
+            try self.putToolTranscriptIndex(gpa, tool_index, index);
             visible_change = true;
         }
         self.tool_seen_in_response = true;
@@ -329,56 +329,56 @@ pub const TurnView = struct {
     fn finishTool(
         self: *TurnView,
         gpa: std.mem.Allocator,
-        thread: *thread_mod.Thread,
+        transcript: *transcript_mod.Transcript,
         tool: agent_mod.Agent.Event.ToolCallFinished,
     ) !bool {
         const policy = tool_policy.forName(tool.name);
-        const existing_index = self.toolThreadIndex(tool.index);
+        const existing_index = self.toolTranscriptIndex(tool.index);
         if (existing_index) |index| {
-            if (index < thread.messages.items.len and thread.messages.items[index].kind == .skill) {
-                try thread.finishSkill(gpa, index, tool.display_body, tool.failed);
+            if (index < transcript.messages.items.len and transcript.messages.items[index].kind == .skill) {
+                try transcript.finishSkill(gpa, index, tool.display_body, tool.failed);
                 self.tool_seen_in_response = true;
                 self.agent_index = null;
                 return true;
             }
         }
         const index = if (existing_index) |index| index else index: {
-            const created = try thread.startTool(gpa, tool.display_label);
-            try thread.updateToolExpanded(gpa, created, tool.display_label, tool.display_expanded_label);
-            try self.putToolThreadIndex(gpa, tool.index, created);
+            const created = try transcript.startTool(gpa, tool.display_label);
+            try transcript.updateToolExpanded(gpa, created, tool.display_label, tool.display_expanded_label);
+            try self.putToolTranscriptIndex(gpa, tool.index, created);
             break :index created;
         };
 
-        const visible_before = toolFinishVisibleChange(thread, index, tool.display_label);
-        const was_expanded = thread.messages.items[index].expanded;
-        const was_running = thread.messages.items[index].tool_running;
-        try thread.updateToolExpanded(gpa, index, tool.display_label, tool.display_expanded_label);
-        try thread.finishTool(gpa, index, tool.display_body, tool.stderr, tool.failed);
-        thread.setExpanded(index, policy.expand_by_default);
-        thread.messages.items[index].tool_render = policy.render;
-        selectGeneratedMessage(thread, index);
+        const visible_before = toolFinishVisibleChange(transcript, index, tool.display_label);
+        const was_expanded = transcript.messages.items[index].expanded;
+        const was_running = transcript.messages.items[index].tool_running;
+        try transcript.updateToolExpanded(gpa, index, tool.display_label, tool.display_expanded_label);
+        try transcript.finishTool(gpa, index, tool.display_body, tool.stderr, tool.failed);
+        transcript.setExpanded(index, policy.expand_by_default);
+        transcript.messages.items[index].tool_render = policy.render;
+        selectGeneratedMessage(transcript, index);
         self.tool_seen_in_response = true;
         self.agent_index = null;
         return existing_index == null or was_running or visible_before or policy.expand_by_default != was_expanded;
     }
 
-    fn selectGeneratedMessage(thread: *thread_mod.Thread, index: u32) void {
-        assert(index < thread.messages.items.len);
-        if (thread.selected) |selected| {
+    fn selectGeneratedMessage(transcript: *transcript_mod.Transcript, index: u32) void {
+        assert(index < transcript.messages.items.len);
+        if (transcript.selected) |selected| {
             if (selected != index) return;
         }
-        thread.select(index);
+        transcript.select(index);
     }
 
-    fn toolFinishVisibleChange(thread: *const thread_mod.Thread, index: u32, command: []const u8) bool {
-        if (index >= thread.messages.items.len) return true;
-        const message = thread.messages.items[index];
+    fn toolFinishVisibleChange(transcript: *const transcript_mod.Transcript, index: u32, command: []const u8) bool {
+        if (index >= transcript.messages.items.len) return true;
+        const message = transcript.messages.items[index];
         if (message.kind != .tool) return true;
         if (message.expanded) return true;
         return !toolTitleMatchesCommand(message.title, command);
     }
 
-    fn toolThreadIndex(self: *const TurnView, tool_index: u32) ?u32 {
+    fn toolTranscriptIndex(self: *const TurnView, tool_index: u32) ?u32 {
         if (tool_index >= self.tool_indexes.items.len) return null;
         return self.tool_indexes.items[tool_index];
     }
@@ -416,20 +416,20 @@ pub const TurnView = struct {
         return name;
     }
 
-    fn putToolThreadIndex(
+    fn putToolTranscriptIndex(
         self: *TurnView,
         gpa: std.mem.Allocator,
         tool_index: u32,
-        thread_index: u32,
+        transcript_index: u32,
     ) !void {
         while (self.tool_indexes.items.len <= tool_index) {
             try self.tool_indexes.append(gpa, null);
         }
-        self.tool_indexes.items[tool_index] = thread_index;
+        self.tool_indexes.items[tool_index] = transcript_index;
     }
 };
 
-fn toolDisplayMatches(message: thread_mod.Message, display: tools_mod.ToolDisplay) bool {
+fn toolDisplayMatches(message: transcript_mod.Message, display: tools_mod.ToolDisplay) bool {
     if (!toolTitleMatchesText(message.title, display.label)) return false;
     if (display.expanded_label) |label| {
         const title = message.tool_expanded_title orelse return false;
@@ -458,21 +458,21 @@ test "bash read of skill renders skill row" {
     const gpa = std.testing.allocator;
     var view: TurnView = .{};
     defer view.deinit(gpa);
-    var thread: thread_mod.Thread = .{};
-    defer thread.deinit(gpa);
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
 
-    const changed = try view.applyToolPreview(gpa, &thread, .{
+    const changed = try view.applyToolPreview(gpa, &transcript, .{
         .index = 0,
         .name = "bash",
         .arguments = "{\"command\":\"cat .agents/skills/tigerstyle/SKILL.md\",\"reason\":\"Read the tigerstyle skill instructions\"}",
     });
 
     try std.testing.expect(changed);
-    try std.testing.expectEqual(@as(usize, 1), thread.messages.items.len);
-    try std.testing.expectEqual(thread_mod.MessageKind.skill, thread.messages.items[0].kind);
-    try std.testing.expectEqualStrings("[SKILL] tigerstyle", thread.messages.items[0].title);
+    try std.testing.expectEqual(@as(usize, 1), transcript.messages.items.len);
+    try std.testing.expectEqual(transcript_mod.MessageKind.skill, transcript.messages.items[0].kind);
+    try std.testing.expectEqualStrings("[SKILL] tigerstyle", transcript.messages.items[0].title);
 
-    const finished = try view.applyToolFinished(gpa, &thread, .{
+    const finished = try view.applyToolFinished(gpa, &transcript, .{
         .index = 0,
         .name = "bash",
         .display_label = "Read the tigerstyle skill instructions",
@@ -480,10 +480,10 @@ test "bash read of skill renders skill row" {
         .display_body = "skill file contents",
     });
     try std.testing.expect(finished);
-    try std.testing.expectEqualStrings("skill file contents", thread.messages.items[0].body);
-    try std.testing.expect(!thread.messages.items[0].expanded);
-    thread.toggleSelected();
-    try std.testing.expect(thread.messages.items[0].expanded);
+    try std.testing.expectEqualStrings("skill file contents", transcript.messages.items[0].body);
+    try std.testing.expect(!transcript.messages.items[0].expanded);
+    transcript.toggleSelected();
+    try std.testing.expect(transcript.messages.items[0].expanded);
 }
 
 test "bash skill detection uses command, not reason" {
@@ -493,19 +493,19 @@ test "bash skill detection uses command, not reason" {
     try std.testing.expectEqualStrings("tigerstyle", skill_name.?);
 }
 
-test "turn view streams content into thread" {
+test "turn view streams content into transcript" {
     const gpa = std.testing.allocator;
-    var thread: thread_mod.Thread = .{};
-    defer thread.deinit(gpa);
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
     var turn_view: TurnView = .{};
     defer turn_view.deinit(gpa);
 
     turn_view.awaitModel();
     try std.testing.expect(turn_view.activity == .awaiting_model);
 
-    try std.testing.expect(try turn_view.apply(gpa, &thread, .{ .response_delta = "hello" }));
-    try std.testing.expectEqual(@as(usize, 1), thread.messages.items.len);
-    try std.testing.expectEqualStrings("hello", thread.messages.items[0].body);
+    try std.testing.expect(try turn_view.apply(gpa, &transcript, .{ .response_delta = "hello" }));
+    try std.testing.expectEqual(@as(usize, 1), transcript.messages.items.len);
+    try std.testing.expectEqualStrings("hello", transcript.messages.items[0].body);
     try std.testing.expect(turn_view.activity == .writing_response);
     try std.testing.expectEqual(@as(u32, 0), turn_view.activity.writing_response);
 }

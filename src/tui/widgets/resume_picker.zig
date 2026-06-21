@@ -163,7 +163,7 @@ const Row = struct {
     fn drawProject(self: *Row, surface: *vxfw.Surface, ctx: vxfw.DrawContext, project: Project) !void {
         if (self.selected) panel.fillRow(surface, 0, tui_style.Palette.selected);
 
-        const marker = if (self.selected) "‣ " else "  ";
+        const marker = "  ";
         const start_col = message.ConversationLayout.left -| 1;
         const marker_style = if (self.selected)
             tui_style.Palette.selected_item
@@ -187,13 +187,13 @@ const Row = struct {
     fn drawSession(self: *Row, surface: *vxfw.Surface, ctx: vxfw.DrawContext, session: Session) !void {
         var buffer: [128]u8 = undefined;
         const modified = tui_status.modifiedTime(self.io, buffer[0..], session.summary.updated_at_ms);
-        const left = try self.sessionLeftText(ctx, surface.size.width, modified, session);
+        const left = try sessionLeftText(ctx, surface.size.width, modified, session);
         try panel.commandLine(surface, 0, left, ctx, self.selected);
         try panel.right(surface, 0, modified, ctx, self.selected);
     }
 
-    fn sessionLeftText(self: *const Row, ctx: vxfw.DrawContext, width: u16, modified: []const u8, session: Session) ![]const u8 {
-        const marker = if (self.selected) "‣ " else "  ";
+    fn sessionLeftText(ctx: vxfw.DrawContext, width: u16, modified: []const u8, session: Session) ![]const u8 {
+        const marker = "  ";
         const available = resumeLeftWidth(ctx, width, modified);
         const prefix_width = ctx.stringWidth(marker) + ctx.stringWidth(session.prefix);
         if (available <= prefix_width) return ctx.arena.dupe(u8, marker);

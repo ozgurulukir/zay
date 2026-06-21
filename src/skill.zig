@@ -38,6 +38,35 @@ pub fn deinitAll(gpa: std.mem.Allocator, skills: []Skill) void {
     gpa.free(skills);
 }
 
+/// Deep-copy a loaded skill list. Lanes reuse the primary's skills (same
+/// project) rather than re-scanning the filesystem; each runtime owns its copy.
+pub fn cloneAll(gpa: std.mem.Allocator, skills: []const Skill) ![]Skill {
+    const out = try gpa.alloc(Skill, skills.len);
+    var done: usize = 0;
+    errdefer {
+        for (out[0..done]) |*skill| skill.deinit(gpa);
+        gpa.free(out);
+    }
+    for (skills, 0..) |skill, i| {
+        const name = try gpa.dupe(u8, skill.name);
+        errdefer gpa.free(name);
+        const description = try gpa.dupe(u8, skill.description);
+        errdefer gpa.free(description);
+        const path = try gpa.dupe(u8, skill.path);
+        errdefer gpa.free(path);
+        const base_dir = try gpa.dupe(u8, skill.base_dir);
+        out[i] = .{
+            .name = name,
+            .description = description,
+            .path = path,
+            .base_dir = base_dir,
+            .disable_model_invocation = skill.disable_model_invocation,
+        };
+        done = i + 1;
+    }
+    return out;
+}
+
 pub fn formatForPrompt(gpa: std.mem.Allocator, skills: []const Skill) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
