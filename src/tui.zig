@@ -598,7 +598,8 @@ pub const App = struct {
     /// position unlabeled.
     fn setLiveBookmark(self: *App, rt: *runtime_mod.AgentRuntime, change: jj.ChangeId) void {
         const live = jj.BookmarkName.parse("nova/live") catch return;
-        jj.setBookmark(self.gpa, self.io, rt.cwd, live, change) catch {};
+        jj.setBookmark(self.gpa, self.io, rt.cwd, live, change) catch return;
+        self.thread.live_active = true;
     }
 
     /// The "after" anchor: seal at the end of a clean turn. Interrupted turns are
@@ -4580,6 +4581,29 @@ fn writeBorderLabelLeft(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16,
     }
 }
 
+/// Draw `text` on `row` so its last cell ends at `end_col` (inclusive), filling
+/// leftward. Returns the first column the text occupies — or `end_col + 1` when
+/// nothing was drawn — so a caller can place another label further left.
+fn writeBorderTextEndingAt(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, end_col: u16, text: []const u8, style: vaxis.Style) u16 {
+    if (text.len == 0 or row >= surface.size.height) return end_col + 1;
+    const text_w: u16 = @intCast(ctx.stringWidth(text));
+    if (text_w == 0 or text_w > end_col + 1) return end_col + 1;
+    const start: u16 = end_col + 1 - text_w;
+    var col = start;
+    var iter = ctx.graphemeIterator(text);
+    while (iter.next()) |grapheme| {
+        const bytes = grapheme.bytes(text);
+        const width: u16 = @intCast(ctx.stringWidth(bytes));
+        if (width == 0) continue;
+        surface.writeCell(col, row, .{
+            .char = .{ .grapheme = bytes, .width = @intCast(width) },
+            .style = style,
+        });
+        col += width;
+    }
+    return start;
+}
+
 fn writeBorderLabelRight(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, text: []const u8, style: vaxis.Style) void {
     if (text.len == 0 or row >= surface.size.height) return;
     const w = surface.size.width;
@@ -5221,7 +5245,14 @@ const InputWidget = struct {
         else
             "";
         writeBorderLabelRight(&surface, ctx, 0, status_text, StylePalette.model_status);
-        writeBorderLabelRight(&surface, ctx, border_height -| 1, self.app.git_label, StylePalette.thinking_body);
+        // Bottom-right: git branch info at the edge, with the `nova/live` working
+        // position just to its left (one-space gap) once the lane has checkpointed.
+        const bottom = border_height -| 1;
+        const right_edge = max_width -| 3; // last interior cell before the corner margin
+        const git_start = writeBorderTextEndingAt(&surface, ctx, bottom, right_edge, self.app.git_label, StylePalette.thinking_body);
+        if (self.app.thread.live_active) {
+            _ = writeBorderTextEndingAt(&surface, ctx, bottom, git_start -| 2, "nova/live", StylePalette.checkpoint_mark);
+        }
         return surface;
     }
 
