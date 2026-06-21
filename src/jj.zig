@@ -261,7 +261,17 @@ pub fn ensureColocated(gpa: std.mem.Allocator, io: std.Io, repo_dir: []const u8)
 /// The change-id of the working-copy commit (`@`) in `dir`. Reading triggers
 /// jj's snapshot, so the result reflects the current on-disk state.
 pub fn workingCopyChangeId(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) CmdError!ChangeId {
-    var out = try run(gpa, io, dir, &.{ "log", "--no-graph", "-r", "@", "-T", "change_id" });
+    return changeIdAt(gpa, io, dir, "@");
+}
+
+/// The change-id of the working copy's parent (`@-`) in `dir`. After a `jj new
+/// <rev>` this is `<rev>` — the revision the working copy was placed on top of.
+pub fn parentChangeId(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) CmdError!ChangeId {
+    return changeIdAt(gpa, io, dir, "@-");
+}
+
+fn changeIdAt(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, revset: []const u8) CmdError!ChangeId {
+    var out = try run(gpa, io, dir, &.{ "log", "--no-graph", "-r", revset, "-T", "change_id" });
     defer out.deinit(gpa);
     if (out.code != 0) return error.JjCommandFailed;
     return ChangeId.parse(out.stdout);
@@ -510,6 +520,11 @@ test "jj: colocate, read @, empty flag, seal a checkpoint" {
     const sealed = (try sealTurn(gpa, io, repo, "nova: checkpoint")) orelse return error.TestFailed;
     try std.testing.expect(sealed.eql(id0));
     try std.testing.expect(try workingCopyEmpty(gpa, io, repo));
+
+    // The fresh `@` sits on top of the sealed change, so `@-` resolves to it —
+    // this is what timeline navigation reads to re-anchor `nova/live`.
+    const parent = try parentChangeId(gpa, io, repo);
+    try std.testing.expect(parent.eql(sealed));
 
     // Sealing again with nothing changed is a no-op.
     try std.testing.expect((try sealTurn(gpa, io, repo, "nova: checkpoint")) == null);

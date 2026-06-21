@@ -588,12 +588,17 @@ pub const App = struct {
         const sealed = jj.sealTurn(self.gpa, self.io, rt.cwd, message) catch return;
         if (sealed) |id| {
             rt.session_writer.appendCheckpoint(id.slice()) catch {};
-            // Label the new leaf so the in-session detached HEAD reads as a live
-            // position (`nova/live`) instead of an anonymous commit.
-            if (jj.BookmarkName.parse("nova/live")) |live| {
-                jj.setBookmark(self.gpa, self.io, rt.cwd, live, id) catch {};
-            } else |_| {}
+            self.setLiveBookmark(rt, id);
         }
+    }
+
+    /// Point the lane's `nova/live` bookmark at `change`, so the in-session
+    /// detached HEAD reads as a live position instead of an anonymous commit.
+    /// Best-effort: a jj failure or an unavailable bookmark just leaves the
+    /// position unlabeled.
+    fn setLiveBookmark(self: *App, rt: *runtime_mod.AgentRuntime, change: jj.ChangeId) void {
+        const live = jj.BookmarkName.parse("nova/live") catch return;
+        jj.setBookmark(self.gpa, self.io, rt.cwd, live, change) catch {};
     }
 
     /// The "after" anchor: seal at the end of a clean turn. Interrupted turns are
@@ -1964,12 +1969,18 @@ pub const App = struct {
     /// Restore the working copy to the code state of the now-active timeline
     /// branch: the nearest checkpoint at/above the new leaf, or — when the node
     /// precedes every checkpoint — the baseline (the first checkpoint's parent).
-    /// Best-effort: jj absent, no checkpoints, or a jj failure leaves files as-is.
+    /// `jj new` detaches git HEAD onto a fresh working commit, so afterwards we
+    /// re-anchor `nova/live` onto the restored point (`@-`): navigation moves the
+    /// live label with you instead of stranding an anonymous detached HEAD with a
+    /// stale bookmark. Best-effort: jj absent, no checkpoints, or a jj failure
+    /// leaves files as-is.
     fn restoreCheckpointForBranch(self: *App, rt: *runtime_mod.AgentRuntime) !void {
         if (try rt.session_writer.checkpointHead(self.gpa)) |head| {
             defer self.gpa.free(head);
             const change = jj.ChangeId.parse(head) catch return;
-            jj.newOnTop(self.gpa, self.io, rt.cwd, change) catch {};
+            jj.newOnTop(self.gpa, self.io, rt.cwd, change) catch return;
+            // `@-` is now the checkpoint we restored onto.
+            self.setLiveBookmark(rt, change);
             return;
         }
         if (try rt.session_writer.firstCheckpointChange(self.gpa)) |first| {
@@ -1978,7 +1989,11 @@ pub const App = struct {
             // before the first file-changing turn.
             const revset = try std.fmt.allocPrint(self.gpa, "{s}-", .{first});
             defer self.gpa.free(revset);
-            jj.newOnRevset(self.gpa, self.io, rt.cwd, revset) catch {};
+            jj.newOnRevset(self.gpa, self.io, rt.cwd, revset) catch return;
+            // Anchor the live label on the baseline (now `@-`).
+            if (jj.parentChangeId(self.gpa, self.io, rt.cwd)) |base| {
+                self.setLiveBookmark(rt, base);
+            } else |_| {}
         }
     }
 
