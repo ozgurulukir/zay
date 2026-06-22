@@ -366,8 +366,8 @@ pub fn deleteBookmark(gpa: std.mem.Allocator, io: std.Io, repo_dir: []const u8, 
 // These land a lane's work back onto main. jj records conflicts as data in the
 // rebased commits (it never aborts), so `rebaseChainOnto` always "succeeds"
 // mechanically and `rangeHasConflicts` is the gate. The revsets below are
-// best-effort for jj 0.42 and MUST be confirmed with a live `/merge` on a
-// throwaway repo before being relied on — `undoLast` is the reversibility net.
+// verified against jj 0.42 on a colocated repo (see the sync integration test
+// at the bottom of this file); `undoLast` is the reversibility net.
 
 /// Rebase the lane's checkpoint chain — the commits in `base..head` — onto
 /// `dest` (the current main tip), in the shared repo. Change-ids are stable
@@ -522,10 +522,67 @@ test "jj: colocate, read @, empty flag, seal a checkpoint" {
     try std.testing.expect(try workingCopyEmpty(gpa, io, repo));
 
     // The fresh `@` sits on top of the sealed change, so `@-` resolves to it —
-    // this is what timeline navigation reads to re-anchor `nova/live`.
+    // this is what timeline navigation reads to re-anchor the working copy.
     const parent = try parentChangeId(gpa, io, repo);
     try std.testing.expect(parent.eql(sealed));
 
     // Sealing again with nothing changed is a no-op.
     try std.testing.expect((try sealTurn(gpa, io, repo, "nova: checkpoint")) == null);
+}
+
+/// Overwrite a working-copy file (truncating) — test helper for building commit
+/// chains. `rel_path` is relative to the process cwd.
+fn writeWorkingFile(io: std.Io, rel_path: []const u8, content: []const u8) !void {
+    var f = try std.Io.Dir.createFile(.cwd(), io, rel_path, .{});
+    defer f.close(io);
+    try f.writeStreamingAll(io, content);
+}
+
+test "jj: sync rebase lands a chain, flags conflicts, and undo reverts" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!isAvailable(gpa, io)) return error.SkipZigTest;
+
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+
+    var rand: [8]u8 = undefined;
+    io.random(&rand);
+    const hex = std.fmt.bytesToHex(rand, .lower);
+    const name = try std.fmt.allocPrint(gpa, "nova-jjsync-{s}", .{hex[0..]});
+    defer gpa.free(name);
+
+    try std.Io.Dir.cwd().createDirPath(io, name);
+    defer std.Io.Dir.cwd().deleteTree(io, name) catch {};
+
+    const repo = try std.fs.path.join(gpa, &.{ cwd, name });
+    defer gpa.free(repo);
+    try ensureColocated(gpa, io, repo);
+
+    const file_rel = try std.fs.path.join(gpa, &.{ name, "f.txt" });
+    defer gpa.free(file_rel);
+
+    // Baseline B0, then a dest chain D1 that rewrites line 1.
+    try writeWorkingFile(io, file_rel, "base\n");
+    const b0 = (try sealTurn(gpa, io, repo, "B0")) orelse return error.TestFailed;
+    try writeWorkingFile(io, file_rel, "dest\n");
+    const d1 = (try sealTurn(gpa, io, repo, "D1")) orelse return error.TestFailed;
+
+    // A source head S1 branched off B0 with a conflicting edit to the same line.
+    try newOnTop(gpa, io, repo, b0);
+    try writeWorkingFile(io, file_rel, "source\n");
+    const s1 = (try sealTurn(gpa, io, repo, "S1")) orelse return error.TestFailed;
+
+    // Before the rebase the dest chain is conflict-free.
+    try std.testing.expect(!(try rangeHasConflicts(gpa, io, repo, b0, d1)));
+
+    // Rebasing the chain onto the source head lands it (jj records the conflict
+    // as data rather than aborting), and the conflict is now detectable.
+    try rebaseChainOnto(gpa, io, repo, b0, d1, s1);
+    try std.testing.expect(try rangeHasConflicts(gpa, io, repo, b0, d1));
+
+    // `undo` is the reversibility net: it restores the pre-rebase, conflict-free
+    // state so a conflicting sync can bail without touching the lanes.
+    try undoLast(gpa, io, repo);
+    try std.testing.expect(!(try rangeHasConflicts(gpa, io, repo, b0, d1)));
 }

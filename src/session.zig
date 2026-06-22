@@ -290,10 +290,13 @@ pub const Session = struct {
         return null;
     }
 
-    /// The change-id of the earliest checkpoint anywhere in the session (across
-    /// branches). Its parent is the session's baseline code state — used to
-    /// restore the working copy when navigating to a node that precedes every
-    /// checkpoint. Caller owns the returned string.
+    /// The change-id of the earliest checkpoint anywhere in the session — the
+    /// first file-changing turn's seal. Scanning across branches (not just the
+    /// active one) is intentional and correct: every branch forks from the same
+    /// pre-Nova root, so this checkpoint's jj parent (`<change>-`) is the baseline
+    /// code state shared by all of them. Used to restore the working copy when
+    /// navigating to a node that precedes every checkpoint on the active branch
+    /// (where `checkpointHead` returns null). Caller owns the returned string.
     pub fn firstCheckpointChange(self: *Session, gpa: std.mem.Allocator) Error!?[]u8 {
         const records = try self.entries(gpa); // oldest-first by creation time
         defer {
@@ -460,7 +463,11 @@ pub const Session = struct {
     /// are returned oldest-first by creation time so siblings keep a stable
     /// order. Caller owns the slice and each record.
     pub fn entries(self: *Session, gpa: std.mem.Allocator) Error![]EntryRecord {
-        var statement = try self.manager.connection.prepare("select id, parent_id, kind, role, payload_json, created_at_ms from session_entries where session_id = ? order by created_at_ms");
+        // `rowid` breaks created_at_ms ties so "oldest-first" is strictly
+        // insertion order — entries written in the same millisecond (tests, fast
+        // turns) keep a deterministic sequence, which `firstCheckpointChange`
+        // and the tree pre-order both rely on.
+        var statement = try self.manager.connection.prepare("select id, parent_id, kind, role, payload_json, created_at_ms from session_entries where session_id = ? order by created_at_ms, rowid");
         defer statement.finalize();
         try statement.bindText(1, self.id.slice());
 
@@ -1541,4 +1548,33 @@ test "checkpointHead is null on a branch with no checkpoint" {
     var scratch: [entry_id_len]u8 = undefined;
     try appendTextEntry(&session, gpa, .user, "only a message", &scratch);
     try std.testing.expect((try session.checkpointHead(gpa)) == null);
+}
+
+test "firstCheckpointChange returns the session baseline across branches" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/nova", .{ .id = "4" ** session_id_len });
+
+    var first_user: [entry_id_len]u8 = undefined;
+    var scratch: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "first", &first_user);
+    try session.appendCheckpoint("kkkkkkkk", &scratch); // earliest seal anywhere
+    try appendTextEntry(&session, gpa, .assistant, "second", &scratch);
+    try session.appendCheckpoint("llllllll", &scratch);
+
+    // Fork a second branch off the first user message; its checkpoint is newer.
+    try session.branch(first_user[0..], null, null);
+    try appendTextEntry(&session, gpa, .user, "alt", &scratch);
+    try session.appendCheckpoint("mmmmmmmm", &scratch);
+
+    // Active leaf now sits on the alt branch, whose nearest checkpoint is the
+    // newest one — but the *baseline* is still the first turn's seal.
+    const head = (try session.checkpointHead(gpa)) orelse return error.TestFailed;
+    defer gpa.free(head);
+    try std.testing.expectEqualStrings("mmmmmmmm", head);
+
+    const base = (try session.firstCheckpointChange(gpa)) orelse return error.TestFailed;
+    defer gpa.free(base);
+    try std.testing.expectEqualStrings("kkkkkkkk", base);
 }

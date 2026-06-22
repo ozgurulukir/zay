@@ -74,6 +74,11 @@ const VisibleNode = struct {
     /// A checkpoint was sealed at this message (its checkpoint entries are hidden
     /// from the tree and shown as a ✦ marker on this row instead).
     has_checkpoint: bool,
+    /// The id of the checkpoint sealed at this message (the after-turn seal — the
+    /// shallowest hidden checkpoint tagging this row), or null when the row has no
+    /// checkpoint. Navigation targets this so restoring the code state lands on
+    /// the commit the ✦ represents, not the previous turn's checkpoint.
+    checkpoint_id: ?Id,
 };
 
 /// Owns the full tree plus the fold/filter UI state for the `/timeline` overlay.
@@ -223,6 +228,18 @@ pub const TreeState = struct {
         return self.visible[self.selection].is_leaf;
     }
 
+    /// The entry to navigate to for the selected row: the checkpoint sealed at
+    /// this message when it has one (so restoring its code state lands on the
+    /// commit the ✦ marks), otherwise the message itself — a row with no
+    /// checkpoint of its own inherits the nearest ancestor checkpoint at restore
+    /// time. Slice is stable until the next `reflatten`/`load`.
+    pub fn selectedNavigationId(self: *const TreeState) ?[]const u8 {
+        if (self.selection >= self.visible.len) return null;
+        const node = &self.visible[self.selection];
+        if (node.checkpoint_id) |*id| return id[0..];
+        return self.nodes[node.full_index].id[0..];
+    }
+
     pub fn moveUp(self: *TreeState) void {
         if (self.visible.len == 0) return;
         self.selection = if (self.selection == 0) @intCast(self.visible.len - 1) else self.selection - 1;
@@ -306,6 +323,8 @@ pub const TreeState = struct {
         const visible_parent = try arena.alloc(?usize, self.nodes.len);
         const has_cp = try arena.alloc(bool, self.nodes.len);
         @memset(has_cp, false);
+        const cp_id = try arena.alloc(?Id, self.nodes.len);
+        @memset(cp_id, null);
         const child_lists = try arena.alloc(std.ArrayList(usize), self.nodes.len);
         for (child_lists) |*list| list.* = .empty;
         var roots: std.ArrayList(usize) = .empty;
@@ -313,7 +332,13 @@ pub const TreeState = struct {
             if (!visible_mask[i]) {
                 visible_parent[i] = null;
                 if (node.kind == .checkpoint) {
-                    if (self.nearestVisibleAncestor(i, visible_mask)) |anc| has_cp[anc] = true;
+                    if (self.nearestVisibleAncestor(i, visible_mask)) |anc| {
+                        has_cp[anc] = true;
+                        // Pre-order visits the after-turn seal (shallowest child)
+                        // before any later before-seal under the same message, so
+                        // first-write-wins binds the row to its own turn's state.
+                        if (cp_id[anc] == null) cp_id[anc] = self.nodes[i].id;
+                    }
                 }
                 continue;
             }
@@ -400,6 +425,7 @@ pub const TreeState = struct {
                 .is_folded = item.is_folded,
                 .is_foldable = item.foldable,
                 .has_checkpoint = has_cp[item.full_index],
+                .checkpoint_id = cp_id[item.full_index],
             });
         }
 

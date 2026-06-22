@@ -134,6 +134,9 @@ pub const App = struct {
     /// until the first finished turn probes jj and colocates the repo, then
     /// cached. `.unavailable` keeps the feature inert when jj isn't installed.
     checkpoint_state: CheckpointState = .unknown,
+    /// True once a checkpoint seal has failed and we've told the user. Stops the
+    /// per-turn failure notice from repeating every turn while jj is wedged.
+    checkpoint_warned: bool = false,
     /// The git branch the primary lane saves onto — captured once at the first
     /// checkpoint, before jj detaches HEAD. Null if launched on a detached HEAD.
     primary_branch: ?jj.BookmarkName = null,
@@ -394,7 +397,7 @@ pub const App = struct {
         // hand edits, or a working copy left behind by timeline navigation — as
         // its own checkpoint, so it isn't silently folded into the agent's turn.
         // A no-op when nothing changed since the last checkpoint.
-        self.sealCheckpoint("nova: checkpoint");
+        self.checkpointBoundary("nova: checkpoint");
 
         self.resetTurnState();
         self.thread.worker_context.?.resetCancel();
@@ -551,6 +554,10 @@ pub const App = struct {
             // a fresh turn.
             if (outcome.finished) {
                 self.awaitTurn();
+                // The worker is joined, so any files the cut-short turn wrote are
+                // settled on disk. Seal them now — otherwise they sit untracked
+                // and a later timeline `jj new` can't reset them away.
+                self.checkpointFinishedTurn();
                 return try self.restartTurnForQueuedMessages();
             }
             return false;
@@ -576,36 +583,63 @@ pub const App = struct {
         return visible_change;
     }
 
+    /// What a `sealCheckpoint` attempt did — so callers can tell a genuine
+    /// failure (jj/persist error) apart from the benign "nothing to seal" and
+    /// "jj not available" cases and surface only the former.
+    const SealOutcome = enum { sealed, nothing, unavailable, failed };
+
     /// Seal the working copy into a jj checkpoint and record its change-id on the
     /// conversation branch, binding this conversation node to its code state.
-    /// No-op when the working copy is unchanged (`sealTurn` returns null), so it's
-    /// safe to call at every turn boundary. Best-effort: any jj or persistence
-    /// failure is swallowed so a turn never fails over a checkpoint, and the whole
-    /// feature stays inert when jj isn't available.
-    fn sealCheckpoint(self: *App, message: []const u8) void {
-        const rt = self.liveRuntime() orelse return;
-        if (!self.ensureCheckpointReady()) return;
-        const sealed = jj.sealTurn(self.gpa, self.io, rt.cwd, message) catch return;
-        if (sealed) |id| {
-            rt.session_writer.appendCheckpoint(id.slice()) catch {};
-            self.setLiveBookmark(rt, id);
+    /// Returns `.nothing` when the working copy is unchanged, so it's safe to call
+    /// at every turn boundary. A jj or persistence error returns `.failed` (no
+    /// longer swallowed silently — the binding the timeline depends on is too
+    /// important to lose without a trace); the caller decides how to surface it.
+    fn sealCheckpoint(self: *App, message: []const u8) SealOutcome {
+        const rt = self.liveRuntime() orelse return .unavailable;
+        if (!self.ensureCheckpointReady()) return .unavailable;
+        const sealed = jj.sealTurn(self.gpa, self.io, rt.cwd, message) catch return .failed;
+        const id = sealed orelse return .nothing;
+        // Record the change-id on the conversation branch. If this fails the jj
+        // commit exists but the node→code binding doesn't, which is exactly the
+        // silent gap that broke timeline navigation — report it.
+        rt.session_writer.appendCheckpoint(id.slice()) catch return .failed;
+        // Mark the lane as having a live working position (drives the status-line
+        // marker). No git bookmark is created: jj's detached HEAD during a session
+        // is expected, and a shared `nova/live` ref only clutters `git branch` and
+        // collides across parallel lanes.
+        self.thread.live_active = true;
+        return .sealed;
+    }
+
+    /// Tell the user a checkpoint couldn't be sealed — once. A persistently
+    /// wedged jj would otherwise append this on every turn; the flag clears the
+    /// next time a seal succeeds (see `noteCheckpointSucceeded`).
+    fn noteCheckpointFailure(self: *App) void {
+        if (self.checkpoint_warned) return;
+        self.checkpoint_warned = true;
+        _ = self.thread.transcript.append(self.gpa, .notice, "notice", "Couldn't checkpoint the working copy — timeline navigation may not restore this point's files. Check that `jj` works in this repo.") catch {};
+    }
+
+    fn noteCheckpointSucceeded(self: *App) void {
+        self.checkpoint_warned = false;
+    }
+
+    /// Seal at a turn/navigation boundary and surface a genuine failure to the
+    /// user (deduped). Every place that must bind the current code state to the
+    /// conversation goes through here, so a broken seal is never silent.
+    fn checkpointBoundary(self: *App, message: []const u8) void {
+        switch (self.sealCheckpoint(message)) {
+            .sealed => self.noteCheckpointSucceeded(),
+            .failed => self.noteCheckpointFailure(),
+            .nothing, .unavailable => {},
         }
     }
 
-    /// Point the lane's `nova/live` bookmark at `change`, so the in-session
-    /// detached HEAD reads as a live position instead of an anonymous commit.
-    /// Best-effort: a jj failure or an unavailable bookmark just leaves the
-    /// position unlabeled.
-    fn setLiveBookmark(self: *App, rt: *runtime_mod.AgentRuntime, change: jj.ChangeId) void {
-        const live = jj.BookmarkName.parse("nova/live") catch return;
-        jj.setBookmark(self.gpa, self.io, rt.cwd, live, change) catch return;
-        self.thread.live_active = true;
-    }
-
-    /// The "after" anchor: seal at the end of a clean turn. Interrupted turns are
-    /// skipped (they return before this), folding into the next clean checkpoint.
+    /// The "after" anchor: seal at the end of a turn (clean or interrupted, so a
+    /// turn that wrote files before being cut still binds them to a checkpoint
+    /// instead of leaving them untracked on disk).
     fn checkpointFinishedTurn(self: *App) void {
-        self.sealCheckpoint("nova: turn checkpoint");
+        self.checkpointBoundary("nova: turn checkpoint");
     }
 
     /// The git branch the active lane saves onto: the primary's launch branch
@@ -630,7 +664,7 @@ pub const App = struct {
         const branch = self.activeLaneBranch() orelse return error.NoBranchToSaveTo;
 
         // Seal anything pending so the leaf is well-defined, then read it.
-        self.sealCheckpoint("nova: checkpoint");
+        self.checkpointBoundary("nova: checkpoint");
         const leaf_raw = (try rt.session_writer.checkpointHead(self.gpa)) orelse return error.NothingToSave;
         defer self.gpa.free(leaf_raw);
         const leaf = try jj.ChangeId.parse(leaf_raw);
@@ -964,7 +998,7 @@ pub const App = struct {
             return true;
         }
         if (self.mode == .tree_picker) {
-            if (self.tree_state.selectedId()) |id| {
+            if (self.tree_state.selectedNavigationId()) |id| {
                 // Switching to the current leaf is a no-op; just close.
                 if (!self.tree_state.selectedIsLeaf()) {
                     var buffer: [session_mod.entry_id_len]u8 = undefined;
@@ -1961,6 +1995,10 @@ pub const App = struct {
     fn navigateToEntry(self: *App, entry_id: []const u8) !void {
         if (self.thread.turn.isActive()) return error.InFlightTurn;
         const rt = self.liveRuntime() orelse return error.NoActiveRuntime;
+        // Capture any hand edits in the current working copy as a checkpoint on
+        // the branch we're leaving, so navigating away doesn't strand them
+        // off-timeline. No-op when the working copy is clean.
+        self.checkpointBoundary("nova: checkpoint");
         try rt.session_writer.navigate(entry_id);
         try rt.reloadMessages();
         try self.rebuildTranscriptFromAgent();
@@ -1970,18 +2008,18 @@ pub const App = struct {
     /// Restore the working copy to the code state of the now-active timeline
     /// branch: the nearest checkpoint at/above the new leaf, or — when the node
     /// precedes every checkpoint — the baseline (the first checkpoint's parent).
-    /// `jj new` detaches git HEAD onto a fresh working commit, so afterwards we
-    /// re-anchor `nova/live` onto the restored point (`@-`): navigation moves the
-    /// live label with you instead of stranding an anonymous detached HEAD with a
-    /// stale bookmark. Best-effort: jj absent, no checkpoints, or a jj failure
-    /// leaves files as-is.
+    /// Navigation targets a row's own checkpoint (see `selectedNavigationId`), so
+    /// the leaf usually *is* the checkpoint and this restores exactly that state.
+    /// `jj new` detaches git HEAD onto a fresh working commit; we mark the lane
+    /// live for the status-line marker. A jj failure or a node with no checkpoint
+    /// binding leaves files as-is — but says so (a silent no-op here is exactly
+    /// what hid stale files after navigation).
     fn restoreCheckpointForBranch(self: *App, rt: *runtime_mod.AgentRuntime) !void {
         if (try rt.session_writer.checkpointHead(self.gpa)) |head| {
             defer self.gpa.free(head);
-            const change = jj.ChangeId.parse(head) catch return;
-            jj.newOnTop(self.gpa, self.io, rt.cwd, change) catch return;
-            // `@-` is now the checkpoint we restored onto.
-            self.setLiveBookmark(rt, change);
+            const change = jj.ChangeId.parse(head) catch return self.noteWorkingCopyUnchanged();
+            self.restoreWorkingCopyOnto(rt, change) catch return self.noteWorkingCopyUnchanged();
+            self.thread.live_active = true;
             return;
         }
         if (try rt.session_writer.firstCheckpointChange(self.gpa)) |first| {
@@ -1990,12 +2028,30 @@ pub const App = struct {
             // before the first file-changing turn.
             const revset = try std.fmt.allocPrint(self.gpa, "{s}-", .{first});
             defer self.gpa.free(revset);
-            jj.newOnRevset(self.gpa, self.io, rt.cwd, revset) catch return;
-            // Anchor the live label on the baseline (now `@-`).
-            if (jj.parentChangeId(self.gpa, self.io, rt.cwd)) |base| {
-                self.setLiveBookmark(rt, base);
-            } else |_| {}
+            jj.newOnRevset(self.gpa, self.io, rt.cwd, revset) catch return self.noteWorkingCopyUnchanged();
+            self.thread.live_active = true;
+            return;
         }
+        // No checkpoint anywhere on the way to this node — there's no code state
+        // to restore. Tell the user (only when checkpointing is actually on, so
+        // the message isn't noise when jj is simply unavailable).
+        if (self.checkpoint_state == .ready) self.noteWorkingCopyUnchanged();
+    }
+
+    /// One-line notice that a timeline jump moved the conversation but not the
+    /// files — so a stale working copy is never silently mistaken for a restore.
+    fn noteWorkingCopyUnchanged(self: *App) void {
+        _ = self.thread.transcript.append(self.gpa, .notice, "notice", "Moved the conversation here, but couldn't restore this point's code — your working copy is unchanged.") catch {};
+    }
+
+    /// Re-materialise the working copy on top of `change` via a fresh `jj new`,
+    /// unless it already sits empty on top of `change` — re-running `jj new` on
+    /// every navigation would pile up abandoned empty working commits.
+    fn restoreWorkingCopyOnto(self: *App, rt: *runtime_mod.AgentRuntime, change: jj.ChangeId) jj.CmdError!void {
+        if (jj.parentChangeId(self.gpa, self.io, rt.cwd)) |parent| {
+            if (parent.eql(change) and (jj.workingCopyEmpty(self.gpa, self.io, rt.cwd) catch false)) return;
+        } else |_| {}
+        try jj.newOnTop(self.gpa, self.io, rt.cwd, change);
     }
 
     fn clearInput(self: *App) void {
@@ -2310,6 +2366,17 @@ pub const App = struct {
         };
     }
 
+    /// The change a new lane forks from: the source lane's latest checkpoint
+    /// (after the caller has sealed pending work), or its working-copy commit
+    /// when the lane has no checkpoint yet.
+    fn laneForkBase(self: *App, rt: *runtime_mod.AgentRuntime) !jj.ChangeId {
+        if (try rt.session_writer.checkpointHead(self.gpa)) |head| {
+            defer self.gpa.free(head);
+            if (jj.ChangeId.parse(head)) |change| return change else |_| {}
+        }
+        return jj.workingCopyChangeId(self.gpa, self.io, rt.cwd);
+    }
+
     /// Spawn a parallel lane: a fresh jj workspace branched from the active
     /// lane's current code state, with its own session + agent, then switch to
     /// it. The new lane runs the same project in isolation. Lanes still run one
@@ -2338,7 +2405,10 @@ pub const App = struct {
         const dest = try std.fs.path.join(self.gpa, &.{ parent, id[0..] });
         errdefer self.gpa.free(dest);
 
-        const base = try jj.workingCopyChangeId(self.gpa, self.io, current.cwd);
+        // Seal any uncommitted work on the source lane first, so the fork starts
+        // from a stable checkpoint commit rather than a mutable working copy.
+        self.checkpointBoundary("nova: checkpoint");
+        const base = try self.laneForkBase(current);
         try jj.workspaceAdd(self.gpa, self.io, repo, workspace, dest, base);
         errdefer jj.workspaceForget(self.gpa, self.io, repo, workspace) catch {};
 
@@ -2448,8 +2518,10 @@ pub const App = struct {
     /// an explicit `/close`). Conflicts `jj undo` the rebase and bail; the guided
     /// per-conflict resolution loop is the follow-on.
     ///
-    /// NOTE: the jj rebase/conflict revsets are unverified against a live jj —
-    /// confirm with a throwaway repo before relying on this. `jj undo` is the net.
+    /// The jj rebase/conflict revsets are verified against jj 0.42 (see the sync
+    /// integration test in `jj.zig`). `jj undo` is the reversibility net on a
+    /// conflicting rebase. The guided per-conflict resolution loop is the
+    /// follow-on; today conflicts hand off to a single agent turn.
     fn syncActiveLane(self: *App, source_index: usize) !void {
         if (self.thread.turn.isActive()) return error.InFlightTurn;
         const repo = self.repoRoot() orelse return error.NoActiveRuntime;
@@ -5245,13 +5317,13 @@ const InputWidget = struct {
         else
             "";
         writeBorderLabelRight(&surface, ctx, 0, status_text, StylePalette.model_status);
-        // Bottom-right: git branch info at the edge, with the `nova/live` working
-        // position just to its left (one-space gap) once the lane has checkpointed.
+        // Bottom-right: git branch info at the edge, with a "live" working-position
+        // marker just to its left (one-space gap) once the lane has checkpointed.
         const bottom = border_height -| 1;
         const right_edge = max_width -| 3; // last interior cell before the corner margin
         const git_start = writeBorderTextEndingAt(&surface, ctx, bottom, right_edge, self.app.git_label, StylePalette.thinking_body);
         if (self.app.thread.live_active) {
-            _ = writeBorderTextEndingAt(&surface, ctx, bottom, git_start -| 2, "nova/live", StylePalette.checkpoint_mark);
+            _ = writeBorderTextEndingAt(&surface, ctx, bottom, git_start -| 2, "✦ live", StylePalette.checkpoint_mark);
         }
         return surface;
     }
