@@ -9,6 +9,7 @@ const executor_mod = @import("executor.zig");
 const session_mod = @import("session.zig");
 const skill_mod = @import("skill.zig");
 const tools = @import("tools.zig");
+const vcs = @import("vcs.zig");
 
 const assert = std.debug.assert;
 const message_queue_capacity: u32 = 64;
@@ -115,6 +116,12 @@ pub const Agent = struct {
     message_queue: MessageQueue = .{},
     message_queue_storage: [message_queue_capacity]QueuedUserMessage = undefined,
     message_queue_mutex: std.atomic.Mutex = .unlocked,
+    /// git-shadow snapshot state (see `snapshotAfterBatch`). The dedicated index
+    /// path is resolved once and cached; `last_snapshot_tree` dedups unchanged
+    /// batches; `snapshots_disabled` latches off when git/the repo is absent.
+    snapshot_index: ?[]u8 = null,
+    last_snapshot_tree: ?vcs.ObjectId = null,
+    snapshots_disabled: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, client: ai.LanguageModel) Agent {
         return .{
@@ -150,6 +157,7 @@ pub const Agent = struct {
             self.gpa.free(queued.prompt);
         }
         self.message_queue_mutex.unlock();
+        if (self.snapshot_index) |path| self.gpa.free(path);
         self.* = undefined;
     }
 
@@ -363,7 +371,44 @@ pub const Agent = struct {
         defer self.gpa.free(results);
         errdefer for (results) |*r| r.deinit(self.gpa);
         try self.takeToolResults(results);
+        self.snapshotAfterBatch();
         try listener.emit(.tool_batch_finished);
+    }
+
+    /// After a tool batch, snapshot the working tree (git-shadow) and bind it to
+    /// the batch's last conversation entry, giving per-tool-batch timeline
+    /// granularity. Runs on the worker thread — the only thread that writes
+    /// session entries during a turn — so binding via `setLeafSnapshot` (which
+    /// flushes the writer) can't race a concurrent append.
+    ///
+    /// Authoritative change-detection without trusting tool output: the
+    /// content-addressed tree id is compared to the last snapshot's; an unchanged
+    /// tree (a read-only batch, or a build that only touched gitignored files) is
+    /// skipped, creating no object and no binding. Best-effort — any failure
+    /// latches snapshots off for the session rather than failing the turn.
+    fn snapshotAfterBatch(self: *Agent) void {
+        if (self.snapshots_disabled) return;
+        const session_writer = self.context_manager.session_writer orelse return;
+        const index = self.snapshot_index orelse blk: {
+            if (!vcs.isAvailable(self.gpa, self.io) or !vcs.isRepo(self.gpa, self.io, self.cwd)) {
+                self.snapshots_disabled = true;
+                return;
+            }
+            const path = vcs.indexPath(self.gpa, self.io, self.cwd) catch {
+                self.snapshots_disabled = true;
+                return;
+            };
+            self.snapshot_index = path;
+            break :blk path;
+        };
+        const tree = vcs.workingTreeId(self.gpa, self.io, self.cwd, index) catch return;
+        if (self.last_snapshot_tree) |last| {
+            if (tree.eql(last)) return; // batch changed nothing tracked — no node
+        }
+        const commit = vcs.commitTree(self.gpa, self.io, self.cwd, tree) catch return;
+        session_writer.setLeafSnapshot(commit.slice()) catch return;
+        if (session_writer.leaf()) |leaf_id| vcs.keepRef(self.gpa, self.io, self.cwd, leaf_id, commit) catch {};
+        self.last_snapshot_tree = tree;
     }
 
     /// Bridges ExecutorService's `ToolCallObserver` callbacks into the

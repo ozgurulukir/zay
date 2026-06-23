@@ -55,6 +55,9 @@ const FullNode = struct {
     tool_failed: bool,
     on_active_path: bool,
     is_leaf: bool,
+    /// This entry carries a git snapshot (its `snapshot` column is set) — the
+    /// code state at this conversation node. Drives the ✦ marker + navigation.
+    has_snapshot: bool,
     text: []u8,
 };
 
@@ -71,14 +74,13 @@ const VisibleNode = struct {
     on_active_path: bool,
     is_folded: bool,
     is_foldable: bool,
-    /// A checkpoint was sealed at this message (its checkpoint entries are hidden
-    /// from the tree and shown as a ✦ marker on this row instead).
-    has_checkpoint: bool,
-    /// The id of the checkpoint sealed at this message (the after-turn seal — the
-    /// shallowest hidden checkpoint tagging this row), or null when the row has no
-    /// checkpoint. Navigation targets this so restoring the code state lands on
-    /// the commit the ✦ represents, not the previous turn's checkpoint.
-    checkpoint_id: ?Id,
+    /// A git snapshot is bound at or within this row's collapsed segment (its own
+    /// entry, or a hidden descendant like a tool result) — shown as a ✦ marker.
+    has_snapshot: bool,
+    /// The id of the snapshot-bearing entry this row maps to (the deepest one in
+    /// its segment), or null when the row has none. Navigation targets it so
+    /// `snapshotAt` resolves exactly that code state.
+    snapshot_entry: ?Id,
 };
 
 /// Owns the full tree plus the fold/filter UI state for the `/timeline` overlay.
@@ -192,6 +194,7 @@ pub const TreeState = struct {
                 .tool_failed = summary.tool_failed,
                 .on_active_path = active.contains(record.id),
                 .is_leaf = is_leaf,
+                .has_snapshot = record.snapshot != null,
                 .text = summary.text,
             });
             const kids = children[frame.index].items;
@@ -228,15 +231,15 @@ pub const TreeState = struct {
         return self.visible[self.selection].is_leaf;
     }
 
-    /// The entry to navigate to for the selected row: the checkpoint sealed at
-    /// this message when it has one (so restoring its code state lands on the
-    /// commit the ✦ marks), otherwise the message itself — a row with no
-    /// checkpoint of its own inherits the nearest ancestor checkpoint at restore
-    /// time. Slice is stable until the next `reflatten`/`load`.
+    /// The entry to navigate to for the selected row: the snapshot-bearing entry
+    /// the row maps to (so restoring its code state lands on exactly the commit
+    /// the ✦ marks), otherwise the row's own entry — which inherits the nearest
+    /// ancestor snapshot at restore time. Slice is stable until the next
+    /// `reflatten`/`load`.
     pub fn selectedNavigationId(self: *const TreeState) ?[]const u8 {
         if (self.selection >= self.visible.len) return null;
         const node = &self.visible[self.selection];
-        if (node.checkpoint_id) |*id| return id[0..];
+        if (node.snapshot_entry) |*id| return id[0..];
         return self.nodes[node.full_index].id[0..];
     }
 
@@ -308,8 +311,8 @@ pub const TreeState = struct {
         }
 
         // 1. Visibility mask: filter + search, minus fold-hidden subtrees.
-        // Checkpoints never appear as their own rows — they're folded into a ✦
-        // marker on the message they were sealed at (computed in step 2).
+        // Legacy `checkpoint`-kind entries (from old jj-era sessions) never appear
+        // as their own rows.
         const visible_mask = try arena.alloc(bool, self.nodes.len);
         for (self.nodes, 0..) |node, i| {
             const kind_ok = node.kind != .checkpoint and (node.is_leaf or self.kindPasses(node.kind));
@@ -318,36 +321,40 @@ pub const TreeState = struct {
         }
 
         // 2. Visible tree structure: nearest-visible parent + ordered children.
-        // A hidden checkpoint tags its nearest visible ancestor (the message it
-        // was sealed at) so that row can show the ✦ marker.
+        // A snapshot-bearing entry (often a hidden tool result) tags the nearest
+        // visible row at or above it with a ✦; pre-order means the deepest
+        // snapshot in a row's collapsed segment wins (last-write), so the row maps
+        // to the latest code state produced under it — which is what navigation
+        // restores.
         const visible_parent = try arena.alloc(?usize, self.nodes.len);
-        const has_cp = try arena.alloc(bool, self.nodes.len);
-        @memset(has_cp, false);
-        const cp_id = try arena.alloc(?Id, self.nodes.len);
-        @memset(cp_id, null);
+        const has_snap = try arena.alloc(bool, self.nodes.len);
+        @memset(has_snap, false);
+        const snap_id = try arena.alloc(?Id, self.nodes.len);
+        @memset(snap_id, null);
         const child_lists = try arena.alloc(std.ArrayList(usize), self.nodes.len);
         for (child_lists) |*list| list.* = .empty;
         var roots: std.ArrayList(usize) = .empty;
         for (self.nodes, 0..) |node, i| {
-            if (!visible_mask[i]) {
+            if (visible_mask[i]) {
+                const ancestor = self.nearestVisibleAncestor(i, visible_mask);
+                visible_parent[i] = ancestor;
+                if (ancestor) |parent| {
+                    try child_lists[parent].append(arena, i);
+                } else {
+                    try roots.append(arena, i);
+                }
+                if (node.has_snapshot) {
+                    has_snap[i] = true;
+                    snap_id[i] = node.id;
+                }
+            } else {
                 visible_parent[i] = null;
-                if (node.kind == .checkpoint) {
+                if (node.has_snapshot) {
                     if (self.nearestVisibleAncestor(i, visible_mask)) |anc| {
-                        has_cp[anc] = true;
-                        // Pre-order visits the after-turn seal (shallowest child)
-                        // before any later before-seal under the same message, so
-                        // first-write-wins binds the row to its own turn's state.
-                        if (cp_id[anc] == null) cp_id[anc] = self.nodes[i].id;
+                        has_snap[anc] = true;
+                        snap_id[anc] = node.id; // last-wins: deepest in the segment
                     }
                 }
-                continue;
-            }
-            const ancestor = self.nearestVisibleAncestor(i, visible_mask);
-            visible_parent[i] = ancestor;
-            if (ancestor) |parent| {
-                try child_lists[parent].append(arena, i);
-            } else {
-                try roots.append(arena, i);
             }
         }
 
@@ -424,8 +431,8 @@ pub const TreeState = struct {
                 .on_active_path = self.nodes[item.full_index].on_active_path,
                 .is_folded = item.is_folded,
                 .is_foldable = item.foldable,
-                .has_checkpoint = has_cp[item.full_index],
-                .checkpoint_id = cp_id[item.full_index],
+                .has_snapshot = has_snap[item.full_index],
+                .snapshot_entry = snap_id[item.full_index],
             });
         }
 
@@ -591,7 +598,7 @@ const Row = struct {
 
         const text = try self.displayText(ctx);
         try panel.lineStyledAt(&surface, 0, text, ctx, col, rowStyle(self.node.kind, self.node.tool_failed, self.selected));
-        if (self.node.has_checkpoint) {
+        if (self.node.has_snapshot) {
             col += @intCast(ctx.stringWidth(text));
             try panel.lineStyledAt(&surface, 0, " ✦", ctx, col, tui_style.onSelectionBg(tui_style.Palette.checkpoint_mark, self.selected));
         }
@@ -703,34 +710,39 @@ test "user-only filter keeps only user turns" {
     try std.testing.expectEqual(@as(usize, 2), state.visible.len);
 }
 
-test "checkpoints fold into a marker on their parent, not their own row" {
+test "a hidden snapshot-bearing entry marks ✦ on its nearest visible row" {
     const gpa = std.testing.allocator;
     var state = TreeState.init(gpa);
     defer state.deinit();
-    // user -> agent -> checkpoint(leaf): the checkpoint is hidden; the agent
-    // message it was sealed at carries ✦ and becomes the resolved leaf selection.
+    // user -> assistant -> tool(snapshot) -> assistant2(leaf). In the default
+    // filter the tool is hidden; its snapshot tags the *assistant* row with ✦,
+    // and navigating that row targets the tool entry (where the snapshot lives).
     var records = [_]session_mod.EntryRecord{
         makeMessage("aaaaaaaa", null, "user", "do it"),
-        makeMessage("bbbbbbbb", "aaaaaaaa", "assistant", "done"),
-        makeCheckpoint("cccccccc", "bbbbbbbb"),
+        makeMessage("bbbbbbbb", "aaaaaaaa", "assistant", "running"),
+        makeSnapshotTool("cccccccc", "bbbbbbbb"),
+        makeMessage("dddddddd", "cccccccc", "assistant", "done"),
     };
-    try state.load(&records, "cccccccc");
+    try state.load(&records, "dddddddd");
 
-    try std.testing.expectEqual(@as(usize, 2), state.visible.len);
-    try std.testing.expect(!state.visible[0].has_checkpoint);
-    try std.testing.expect(state.visible[1].has_checkpoint);
-    try std.testing.expect(state.visible[1].is_leaf);
+    // Rows: user, assistant, assistant2 (the tool is hidden).
+    try std.testing.expectEqual(@as(usize, 3), state.visible.len);
+    try std.testing.expect(!state.visible[0].has_snapshot);
+    try std.testing.expect(state.visible[1].has_snapshot); // tagged by the tool
+    try std.testing.expect(!state.visible[2].has_snapshot);
+
+    // Selecting the assistant row navigates to the snapshot-bearing tool entry.
+    state.selection = 1;
+    try std.testing.expectEqualStrings("cccccccc", state.selectedNavigationId().?);
 }
 
 fn makeRecord(id: *const [8]u8, parent: ?*const [8]u8) session_mod.EntryRecord {
     return makeMessage(id, parent, "user", "x");
 }
 
-fn makeCheckpoint(id: *const [8]u8, parent: ?*const [8]u8) session_mod.EntryRecord {
-    var record = makeMessage(id, parent, "assistant", "x");
-    record.kind = @constCast("checkpoint");
-    record.role = null;
-    record.payload_json = @constCast("{\"change_id\":\"kkkkkkkk\"}");
+fn makeSnapshotTool(id: *const [8]u8, parent: ?*const [8]u8) session_mod.EntryRecord {
+    var record = makeTool(id, parent, "build", false);
+    record.snapshot = @constCast("0123456789abcdef0123456789abcdef01234567");
     return record;
 }
 

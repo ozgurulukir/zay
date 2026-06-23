@@ -26,7 +26,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 
 const agent_mod = @import("../agent.zig");
-const jj = @import("../jj.zig");
+const vcs = @import("../vcs.zig");
 const runtime = @import("../runtime.zig");
 const session = @import("../session.zig");
 const transcript_mod = @import("../transcript.zig");
@@ -84,9 +84,9 @@ pub const QueuedMessage = struct {
     steer: bool = false,
 };
 
-/// A live lane: its jj workspace identity plus the owned runtime driving it.
+/// A live lane: its git worktree identity plus the owned runtime driving it.
 pub const Live = struct {
-    lane: jj.Lane,
+    lane: vcs.Lane,
     runtime: *runtime.AgentRuntime,
     /// Whether this lane owns `runtime` and frees it on deinit. False for a
     /// borrowed runtime — e.g. a test that attaches a stack-allocated stub it
@@ -94,13 +94,13 @@ pub const Live = struct {
     owns: bool = true,
 };
 
-/// Whether — and how — this lane is attached to an execution engine. See the
-/// module doc; `lane` rides inside `idle`/`live` so `archived` can't hold a
-/// popped workspace path.
+/// Whether — and how — this lane is attached to an execution engine. A lane is
+/// either parked (`idle`, no runtime) or running (`live`). Closing a lane tears
+/// it down and removes it from the list — there is no archived state (lanes
+/// don't merge; they land on `main` via a PR).
 pub const Engine = union(enum) {
-    idle: jj.Lane,
+    idle: vcs.Lane,
     live: Live,
-    archived: jj.MergeRecord,
 };
 
 /// Free everything this thread owns. For `.live`, that includes tearing down and
@@ -124,7 +124,6 @@ pub fn deinit(self: *Thread, gpa: std.mem.Allocator) void {
             }
             live.lane.deinit(gpa);
         },
-        .archived => {},
     }
     self.* = undefined;
 }
@@ -136,23 +135,11 @@ test "idle thread frees its owned title, transcript, and queue" {
     thread.deinit(gpa);
 }
 
-test "idle working lane frees its workspace path" {
+test "idle working lane frees its worktree branch and path" {
     const gpa = std.testing.allocator;
     var thread: Thread = .{ .engine = .{ .idle = .{ .working = .{
-        .workspace = try jj.WorkspaceName.parse("nova-x"),
-        .bookmark = try jj.BookmarkName.parse("nova/x"),
-        .base = try jj.ChangeId.parse("kkk"),
-        .path = try gpa.dupe(u8, "/repo/.nova/workspaces/x"),
+        .branch = try gpa.dupe(u8, "nova/x"),
+        .path = try gpa.dupe(u8, "/repo/.nova/worktrees/x"),
     } } } };
-    thread.deinit(gpa);
-}
-
-test "archived thread holds only a merge record" {
-    const gpa = std.testing.allocator;
-    var thread: Thread = .{ .engine = .{ .archived = .{
-        .bookmark = try jj.BookmarkName.parse("nova/x"),
-        .target_bookmark = try jj.BookmarkName.parse("main"),
-        .into = try jj.ChangeId.parse("kkkk"),
-    } } };
     thread.deinit(gpa);
 }
