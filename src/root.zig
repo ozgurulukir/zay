@@ -25,6 +25,8 @@ pub const tui = @import("tui.zig");
 pub const thread = @import("tui/thread.zig");
 
 pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
+    @import("bash.zig").disablePseudoConsole();
+
     if (logger.enabled) {
         if (resolveLogPath(gpa, init.environ_map)) |log_path| {
             defer gpa.free(log_path);

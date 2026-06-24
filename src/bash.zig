@@ -411,6 +411,21 @@ const windows_bash_candidates = [_][]const u8{
     "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
 };
 
+extern "kernel32" fn SetEnvironmentVariableW(
+    lpName: [*:0]const u16,
+    lpValue: [*:0]const u16,
+) callconv(.winapi) std.os.windows.BOOL;
+
+/// Disable MSYS2/Cygwin's pseudo-console (ConPTY) integration for every child
+/// shell, by setting `MSYS`/`CYGWIN=disable_pcon` in our own process
+/// environment so spawned bash processes inherit it.
+pub fn disablePseudoConsole() void {
+    if (!os.is_windows) return;
+    const value = std.unicode.utf8ToUtf16LeStringLiteral("disable_pcon");
+    _ = SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("MSYS"), value);
+    _ = SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("CYGWIN"), value);
+}
+
 var bash_path_value: ?[]const u8 = null;
 
 fn bashPath(io: std.Io) []const u8 {
