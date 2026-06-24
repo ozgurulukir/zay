@@ -584,15 +584,8 @@ const Row = struct {
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
         if (self.selected) panel.fillRow(&surface, 0, tui_style.Palette.selected);
 
+        // Tree rows anchor at the same left column as the "Filter:" header.
         var col = message.ConversationLayout.left -| 1;
-        const marker = "  ";
-        const marker_style = if (self.selected)
-            tui_style.Palette.selected_item
-        else
-            tui_style.Palette.thinking_body;
-        try panel.lineStyledAt(&surface, 0, marker, ctx, col, marker_style);
-        col += @intCast(ctx.stringWidth(marker));
-
         try panel.lineStyledAt(&surface, 0, self.node.prefix, ctx, col, tui_style.onSelectionBg(tui_style.Palette.thinking_body, self.selected));
         col += @intCast(ctx.stringWidth(self.node.prefix));
 
