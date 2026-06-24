@@ -74,9 +74,9 @@ pub const SessionManager = struct {
         return .{ .gpa = gpa, .io = io, .connection = connection };
     }
 
-    pub fn initDefault(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) Error!SessionManager {
-        assert(cwd.len > 0);
-        const db_path = try defaultPath(gpa, io, cwd);
+    pub fn initDefault(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) Error!SessionManager {
+        assert(home_dir.len > 0);
+        const db_path = try defaultPath(gpa, io, home_dir);
         defer gpa.free(db_path);
         return init(gpa, io, db_path);
     }
@@ -516,28 +516,29 @@ pub const SessionWriter = struct {
 
     pub const queue_capacity_default: u32 = 256;
 
-    pub fn initDefault(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) Error!void {
-        return initDefaultWithCapacity(target, gpa, io, cwd, queue_capacity_default);
+    pub fn initDefault(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, cwd: []const u8) Error!void {
+        return initDefaultWithCapacity(target, gpa, io, home_dir, cwd, queue_capacity_default);
     }
 
-    pub fn initResumeDefault(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, session_id: []const u8) Error!void {
-        return initResumeDefaultWithCapacity(target, gpa, io, cwd, session_id, queue_capacity_default);
+    pub fn initResumeDefault(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, session_id: []const u8) Error!void {
+        return initResumeDefaultWithCapacity(target, gpa, io, home_dir, session_id, queue_capacity_default);
     }
 
-    pub fn initDefaultWithCapacity(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, capacity: u32) Error!void {
+    pub fn initDefaultWithCapacity(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, cwd: []const u8, capacity: u32) Error!void {
+        assert(home_dir.len > 0);
         assert(cwd.len > 0);
         assert(capacity > 0);
-        var manager = try SessionManager.initDefault(gpa, io, cwd);
+        var manager = try SessionManager.initDefault(gpa, io, home_dir);
         errdefer manager.deinit();
         const session = try manager.create(cwd, .{});
         try target.initWithSession(gpa, io, manager, session, capacity);
     }
 
-    pub fn initResumeDefaultWithCapacity(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, session_id: []const u8, capacity: u32) Error!void {
-        assert(cwd.len > 0);
+    pub fn initResumeDefaultWithCapacity(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, session_id: []const u8, capacity: u32) Error!void {
+        assert(home_dir.len > 0);
         assert(session_id.len > 0);
         assert(capacity > 0);
-        var manager = try SessionManager.initDefault(gpa, io, cwd);
+        var manager = try SessionManager.initDefault(gpa, io, home_dir);
         errdefer manager.deinit();
         const session = try manager.@"resume"(session_id);
         try target.initWithSession(gpa, io, manager, session, capacity);
@@ -800,12 +801,12 @@ fn migrate(connection: *db.Connection, io: std.Io) Error!void {
     try expectDone(&statement);
 }
 
-fn defaultPath(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) Error![]u8 {
-    assert(cwd.len > 0);
-    const dir = try std.fs.path.join(gpa, &.{ cwd, ".nova" });
+fn defaultPath(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) Error![]u8 {
+    assert(home_dir.len > 0);
+    const dir = try std.fs.path.join(gpa, &.{ home_dir, ".nova" });
     defer gpa.free(dir);
     std.Io.Dir.cwd().createDirPath(io, dir) catch return error.Sqlite;
-    return std.fs.path.join(gpa, &.{ cwd, default_db_relative_path });
+    return std.fs.path.join(gpa, &.{ home_dir, default_db_relative_path });
 }
 
 fn expectDone(statement: *db.Statement) Error!void {

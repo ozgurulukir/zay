@@ -1856,9 +1856,9 @@ pub const App = struct {
 
     fn reloadResumeSessions(self: *App) !void {
         self.resumeClear();
-        var manager = try session_mod.SessionManager.initDefault(self.gpa, self.io, self.repoRoot() orelse self.liveRuntime().?.cwd);
+        var manager = try session_mod.SessionManager.initDefault(self.gpa, self.io, self.liveRuntime().?.home_dir);
         defer manager.deinit();
-        const cwd = if (self.resume_global) null else self.liveRuntime().?.cwd;
+        const cwd = if (self.resume_global) null else (self.repoRoot() orelse self.liveRuntime().?.cwd);
         const summaries = try manager.list(self.gpa, cwd);
         try self.resume_summaries.appendSlice(self.gpa, summaries);
         if (self.resume_global) std.mem.sort(
@@ -2276,6 +2276,7 @@ pub const App = struct {
     fn createParallelLane(self: *App) !void {
         if (self.threads.items.len >= 4) return error.TooManyLanes; // the split grid is 2×2
         const repo = self.repoRoot() orelse return error.NoActiveRuntime;
+        const home = (self.liveRuntime() orelse return error.NoActiveRuntime).home_dir;
         if (!vcs.isRepo(self.gpa, self.io, repo)) return error.NotAGitRepo;
 
         var raw: [6]u8 = undefined;
@@ -2285,7 +2286,9 @@ pub const App = struct {
         const branch = try std.fmt.allocPrint(self.gpa, "nova/{s}", .{id[0..]});
         errdefer self.gpa.free(branch);
 
-        const parent = try std.fs.path.join(self.gpa, &.{ repo, ".nova", "worktrees" });
+        // Worktrees live under the global `<home>/.nova/worktrees`, OUTSIDE the
+        // repo, so `git add -A`/snapshots/`/save` never see them.
+        const parent = try std.fs.path.join(self.gpa, &.{ home, ".nova", "worktrees" });
         defer self.gpa.free(parent);
         std.Io.Dir.cwd().createDirPath(self.io, parent) catch {};
         const dest = try std.fs.path.join(self.gpa, &.{ parent, id[0..] });
