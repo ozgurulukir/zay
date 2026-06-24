@@ -52,11 +52,6 @@ turn_view: turn_view_mod.TurnView = .{},
 queued: std.ArrayList(QueuedMessage) = .empty,
 /// Per-lane viewport state that outlives any single turn.
 auto_scroll: bool = true,
-/// True once this lane has sealed (or navigated to) a checkpoint, so it has a
-/// live working position on the timeline. Drives the status-line working-position
-/// marker; false on a fresh lane before its first checkpoint, when HEAD is still
-/// attached to the real branch. UI-only — no git bookmark backs it.
-live_active: bool = false,
 /// Per-lane scroll/viewport state for rendering this lane's transcript in its
 /// own pane, so split columns scroll independently.
 transcript_list: vaxis.vxfw.ListView = .{ .children = .{ .slice = &.{} }, .draw_cursor = false, .wheel_scroll = 4 },

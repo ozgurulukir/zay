@@ -581,7 +581,6 @@ pub const App = struct {
         // Keep the snapshot reachable against `git gc`, named by the entry it
         // binds so it can be pruned with that entry.
         vcs.keepRef(self.gpa, self.io, rt.cwd, leaf_id, sha) catch {};
-        self.thread.live_active = true;
         return .sealed;
     }
 
@@ -644,7 +643,7 @@ pub const App = struct {
         if (self.thread.turn.isActive()) return error.InFlightTurn;
         const rt = self.liveRuntime() orelse return error.NoActiveRuntime;
         try vcs.commitAll(self.gpa, self.io, rt.cwd, message);
-        _ = try self.thread.transcript.append(self.gpa, .notice, "notice", "Saved — committed the working tree to the current branch.");
+        _ = try self.thread.transcript.append(self.gpa, .success, "notice", "Saved — committed the working tree to the current branch.");
     }
 
     /// Resolve once whether the git-shadow snapshot feature can run: git
@@ -1945,26 +1944,17 @@ pub const App = struct {
     /// Restore the working tree to the snapshot bound to the now-active timeline
     /// node — its own, or the nearest ancestor that has one (`snapshotAt`). HEAD
     /// stays attached to the branch; `vcs.restore` rewrites tracked files to that
-    /// tree (adds/modifies/deletes). A git failure or a node with no snapshot
-    /// leaves files as-is, but says so — a silent no-op here is exactly what hid
-    /// stale files after navigation before.
+    /// tree (adds/modifies/deletes). Best-effort: a node with no bound snapshot
+    /// (an early point, before any file change) or a git failure simply leaves
+    /// the working tree as-is — no error, since the binding is reliable and the
+    /// "no snapshot here" case is normal, not a problem.
     fn restoreCheckpointForBranch(self: *App, rt: *runtime_mod.AgentRuntime) !void {
-        const sha_raw = (try rt.session_writer.snapshotAt(self.gpa)) orelse {
-            if (self.checkpoint_state == .ready) self.noteWorkingCopyUnchanged();
-            return;
-        };
+        const sha_raw = (try rt.session_writer.snapshotAt(self.gpa)) orelse return;
         defer self.gpa.free(sha_raw);
-        const sha = vcs.ObjectId.parse(sha_raw) catch return self.noteWorkingCopyUnchanged();
-        const index = vcs.indexPath(self.gpa, self.io, rt.cwd) catch return self.noteWorkingCopyUnchanged();
+        const sha = vcs.ObjectId.parse(sha_raw) catch return;
+        const index = vcs.indexPath(self.gpa, self.io, rt.cwd) catch return;
         defer self.gpa.free(index);
-        vcs.restore(self.gpa, self.io, rt.cwd, index, sha) catch return self.noteWorkingCopyUnchanged();
-        self.thread.live_active = true;
-    }
-
-    /// One-line notice that a timeline jump moved the conversation but not the
-    /// files — so a stale working copy is never silently mistaken for a restore.
-    fn noteWorkingCopyUnchanged(self: *App) void {
-        _ = self.thread.transcript.append(self.gpa, .notice, "notice", "Moved the conversation here, but couldn't restore this point's code — your working copy is unchanged.") catch {};
+        vcs.restore(self.gpa, self.io, rt.cwd, index, sha) catch return;
     }
 
     fn clearInput(self: *App) void {
@@ -4154,7 +4144,7 @@ fn overlayLabel(mode: App.Mode) []const u8 {
         .provider_picker => "Connect to Provider",
         .model_picker => "Select Model",
         .tree_picker => "Session Timeline",
-        .save_message => "Save — commit message",
+        .save_message => "Commit Message",
         .diff_viewer => "",
     };
 }
@@ -4263,7 +4253,7 @@ fn overlaySize(mode: App.Mode) OverlaySize {
         .session_picker => .{ .width = 80, .height = 16 },
         .model_picker => .{ .width = 90, .height = 16 },
         .tree_picker => .{ .width = 90, .height = 20 },
-        .save_message => .{ .width = 60, .height = 5 },
+        .save_message => .{ .width = 60, .height = 3 },
         .diff_viewer => .{ .width = 0, .height = 0 },
     };
 }
@@ -4504,7 +4494,8 @@ const OverlayInner = struct {
 
     fn drawSaveMessageContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         _ = app;
-        var text: vxfw.Text = .{ .text = "Commit the working tree to the current branch.", .style = StylePalette.thinking_body };
+        // No body — the border label ("Commit Message") and the input row say it all.
+        var text: vxfw.Text = .{ .text = "" };
         return text.widget().draw(ctx);
     }
 
@@ -5017,14 +5008,10 @@ const InputWidget = struct {
         else
             "";
         writeBorderLabelRight(&surface, ctx, 0, status_text, StylePalette.model_status);
-        // Bottom-right: git branch info at the edge, with a "live" working-position
-        // marker just to its left (one-space gap) once the lane has checkpointed.
+        // Bottom-right: git branch info at the edge.
         const bottom = border_height -| 1;
         const right_edge = max_width -| 3; // last interior cell before the corner margin
-        const git_start = writeBorderTextEndingAt(&surface, ctx, bottom, right_edge, self.app.git_label, StylePalette.thinking_body);
-        if (self.app.thread.live_active) {
-            _ = writeBorderTextEndingAt(&surface, ctx, bottom, git_start -| 2, "✦ live", StylePalette.checkpoint_mark);
-        }
+        _ = writeBorderTextEndingAt(&surface, ctx, bottom, right_edge, self.app.git_label, StylePalette.thinking_body);
         return surface;
     }
 

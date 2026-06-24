@@ -598,10 +598,6 @@ const Row = struct {
 
         const text = try self.displayText(ctx);
         try panel.lineStyledAt(&surface, 0, text, ctx, col, rowStyle(self.node.kind, self.node.tool_failed, self.selected));
-        if (self.node.has_snapshot) {
-            col += @intCast(ctx.stringWidth(text));
-            try panel.lineStyledAt(&surface, 0, " ✦", ctx, col, tui_style.onSelectionBg(tui_style.Palette.checkpoint_mark, self.selected));
-        }
         return surface;
     }
 
@@ -710,13 +706,13 @@ test "user-only filter keeps only user turns" {
     try std.testing.expectEqual(@as(usize, 2), state.visible.len);
 }
 
-test "a hidden snapshot-bearing entry marks ✦ on its nearest visible row" {
+test "a snapshot-bearing row maps navigation to that entry" {
     const gpa = std.testing.allocator;
     var state = TreeState.init(gpa);
     defer state.deinit();
-    // user -> assistant -> tool(snapshot) -> assistant2(leaf). In the default
-    // filter the tool is hidden; its snapshot tags the *assistant* row with ✦,
-    // and navigating that row targets the tool entry (where the snapshot lives).
+    // user -> assistant -> tool(snapshot) -> assistant2(leaf). The default filter
+    // shows tool rows, so the tool carries its snapshot directly; navigating it
+    // targets that entry, restoring exactly its code state.
     var records = [_]session_mod.EntryRecord{
         makeMessage("aaaaaaaa", null, "user", "do it"),
         makeMessage("bbbbbbbb", "aaaaaaaa", "assistant", "running"),
@@ -725,14 +721,12 @@ test "a hidden snapshot-bearing entry marks ✦ on its nearest visible row" {
     };
     try state.load(&records, "dddddddd");
 
-    // Rows: user, assistant, assistant2 (the tool is hidden).
-    try std.testing.expectEqual(@as(usize, 3), state.visible.len);
-    try std.testing.expect(!state.visible[0].has_snapshot);
-    try std.testing.expect(state.visible[1].has_snapshot); // tagged by the tool
-    try std.testing.expect(!state.visible[2].has_snapshot);
+    // Rows: user, assistant, tool, assistant2.
+    try std.testing.expectEqual(@as(usize, 4), state.visible.len);
+    try std.testing.expect(state.visible[2].has_snapshot); // the tool row
+    try std.testing.expect(!state.visible[1].has_snapshot);
 
-    // Selecting the assistant row navigates to the snapshot-bearing tool entry.
-    state.selection = 1;
+    state.selection = 2;
     try std.testing.expectEqualStrings("cccccccc", state.selectedNavigationId().?);
 }
 
@@ -769,5 +763,6 @@ fn makeMessage(id: *const [8]u8, parent: ?*const [8]u8, comptime role: []const u
     record.role = @constCast(role);
     record.payload_json = @constCast("{\"role\":\"" ++ role ++ "\",\"content\":[{\"type\":\"text\",\"text\":\"" ++ text ++ "\"}]}");
     record.created_at_ms = 0;
+    record.snapshot = null;
     return record;
 }
