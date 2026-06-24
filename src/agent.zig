@@ -9,6 +9,7 @@ const executor_mod = @import("executor.zig");
 const session_mod = @import("session.zig");
 const skill_mod = @import("skill.zig");
 const tools = @import("tools.zig");
+const vcs = @import("vcs.zig");
 
 const assert = std.debug.assert;
 const message_queue_capacity: u32 = 64;
@@ -115,6 +116,12 @@ pub const Agent = struct {
     message_queue: MessageQueue = .{},
     message_queue_storage: [message_queue_capacity]QueuedUserMessage = undefined,
     message_queue_mutex: std.atomic.Mutex = .unlocked,
+    /// git-shadow snapshot state (see `snapshotAfterBatch`). The dedicated index
+    /// path is resolved once and cached; `last_snapshot_tree` dedups unchanged
+    /// batches; `snapshots_disabled` latches off when git/the repo is absent.
+    snapshot_index: ?[]u8 = null,
+    last_snapshot_tree: ?vcs.ObjectId = null,
+    snapshots_disabled: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, client: ai.LanguageModel) Agent {
         return .{
@@ -150,6 +157,7 @@ pub const Agent = struct {
             self.gpa.free(queued.prompt);
         }
         self.message_queue_mutex.unlock();
+        if (self.snapshot_index) |path| self.gpa.free(path);
         self.* = undefined;
     }
 
@@ -170,6 +178,13 @@ pub const Agent = struct {
     /// images as real content blocks) and append the result as a user message.
     /// Reads files, so this is meant to run on the agent worker thread.
     pub fn addUserPrompt(self: *Agent, prompt: []const u8) !void {
+        // A turn interrupted mid-tool-batch leaves the assistant's `tool_call`s
+        // with no matching tool result. Providers reject a turn whose history has
+        // a tool_use without a corresponding tool_result, so fill them in before
+        // this user message lands — keeping the synthetic results right after the
+        // assistant call, ahead of the new user turn.
+        try self.reconcileInterruptedToolCalls();
+
         const blocks = try at_mention.buildUserMessage(self.gpa, self.io, self.cwd, prompt);
         errdefer {
             for (blocks) |*block| block.deinit(self.gpa);
@@ -177,6 +192,55 @@ pub const Agent = struct {
         }
         try self.prependSkillBlocks(prompt, blocks);
         try self.context_manager.appendPersisted(.{ .role = .user, .content = blocks });
+    }
+
+    /// Result text recorded for a tool call the user interrupted before it
+    /// finished — surfaced to the model so it knows the call was cancelled.
+    const interrupted_tool_result = "The user interrupted the turn before this tool call completed; it produced no result.";
+
+    /// Append a synthetic, failed tool result for every `tool_call` on the active
+    /// branch that has no matching result yet. Runs before a new user message so
+    /// the dangling calls (from a mid-batch interrupt) don't break the next turn.
+    /// A no-op when every call already has a result.
+    fn reconcileInterruptedToolCalls(self: *Agent) !void {
+        const history = self.context_manager.items();
+
+        var resolved = std.StringHashMap(void).init(self.gpa);
+        defer resolved.deinit();
+        for (history) |message| {
+            if (message.role == .tool) {
+                if (message.call_id) |id| try resolved.put(id, {});
+            }
+        }
+
+        // Copy the unmatched ids out before appending — `appendPersisted` may
+        // realloc the message array, invalidating slices into it.
+        var missing: std.ArrayList([]u8) = .empty;
+        defer {
+            for (missing.items) |id| self.gpa.free(id);
+            missing.deinit(self.gpa);
+        }
+        for (history) |message| {
+            if (message.role != .assistant) continue;
+            for (message.content) |block| {
+                if (block != .tool_call) continue;
+                if (resolved.contains(block.tool_call.call_id)) continue;
+                try missing.append(self.gpa, try self.gpa.dupe(u8, block.tool_call.call_id));
+            }
+        }
+
+        for (missing.items) |id| {
+            const blocks = try self.gpa.alloc(ai.ContentBlock, 1);
+            errdefer self.gpa.free(blocks);
+            blocks[0] = .{ .text = .{ .text = try self.gpa.dupe(u8, interrupted_tool_result) } };
+            try self.context_manager.appendPersisted(.{
+                .role = .tool,
+                .content = blocks,
+                .call_id = try self.gpa.dupe(u8, id),
+                .tool_display_label = try self.gpa.dupe(u8, "cancelled"),
+                .tool_failed = true,
+            });
+        }
     }
 
     fn prependSkillBlocks(self: *Agent, prompt: []const u8, blocks: []ai.ContentBlock) !void {
@@ -363,7 +427,44 @@ pub const Agent = struct {
         defer self.gpa.free(results);
         errdefer for (results) |*r| r.deinit(self.gpa);
         try self.takeToolResults(results);
+        self.snapshotAfterBatch();
         try listener.emit(.tool_batch_finished);
+    }
+
+    /// After a tool batch, snapshot the working tree (git-shadow) and bind it to
+    /// the batch's last conversation entry, giving per-tool-batch timeline
+    /// granularity. Runs on the worker thread — the only thread that writes
+    /// session entries during a turn — so binding via `setLeafSnapshot` (which
+    /// flushes the writer) can't race a concurrent append.
+    ///
+    /// Authoritative change-detection without trusting tool output: the
+    /// content-addressed tree id is compared to the last snapshot's; an unchanged
+    /// tree (a read-only batch, or a build that only touched gitignored files) is
+    /// skipped, creating no object and no binding. Best-effort — any failure
+    /// latches snapshots off for the session rather than failing the turn.
+    fn snapshotAfterBatch(self: *Agent) void {
+        if (self.snapshots_disabled) return;
+        const session_writer = self.context_manager.session_writer orelse return;
+        const index = self.snapshot_index orelse blk: {
+            if (!vcs.isAvailable(self.gpa, self.io) or !vcs.isRepo(self.gpa, self.io, self.cwd)) {
+                self.snapshots_disabled = true;
+                return;
+            }
+            const path = vcs.indexPath(self.gpa, self.io, self.cwd) catch {
+                self.snapshots_disabled = true;
+                return;
+            };
+            self.snapshot_index = path;
+            break :blk path;
+        };
+        const tree = vcs.workingTreeId(self.gpa, self.io, self.cwd, index) catch return;
+        if (self.last_snapshot_tree) |last| {
+            if (tree.eql(last)) return; // batch changed nothing tracked — no node
+        }
+        const commit = vcs.commitTree(self.gpa, self.io, self.cwd, tree) catch return;
+        session_writer.setLeafSnapshot(commit.slice()) catch return;
+        if (session_writer.leaf()) |leaf_id| vcs.keepRef(self.gpa, self.io, self.cwd, leaf_id, commit) catch {};
+        self.last_snapshot_tree = tree;
     }
 
     /// Bridges ExecutorService's `ToolCallObserver` callbacks into the
@@ -887,6 +988,38 @@ test "queued user messages wait for completed assistant turn" {
     try std.testing.expectEqual(@as(u32, 1), try agent.drainQueuedUserMessage(false));
     try std.testing.expectEqual(@as(usize, 2), agent.messages().len);
     try std.testing.expectEqualStrings("queued", agent.messages()[1].text());
+}
+
+test "interrupted tool calls get synthetic cancelled results" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    // Assistant issues two tool calls; only the first got a result before the
+    // user interrupted — leaving call_b dangling.
+    const calls = try gpa.alloc(ai.ContentBlock, 2);
+    calls[0] = .{ .tool_call = .{ .call_id = try gpa.dupe(u8, "call_a"), .name = try gpa.dupe(u8, "read"), .arguments = try gpa.dupe(u8, "{}") } };
+    calls[1] = .{ .tool_call = .{ .call_id = try gpa.dupe(u8, "call_b"), .name = try gpa.dupe(u8, "bash"), .arguments = try gpa.dupe(u8, "{}") } };
+    try agent.context_manager.appendUnpersisted(.{ .role = .assistant, .content = calls });
+
+    const result = try gpa.alloc(ai.ContentBlock, 1);
+    result[0] = .{ .text = .{ .text = try gpa.dupe(u8, "ok") } };
+    try agent.context_manager.appendUnpersisted(.{ .role = .tool, .content = result, .call_id = try gpa.dupe(u8, "call_a") });
+
+    try agent.reconcileInterruptedToolCalls();
+
+    // A synthetic failed result for call_b is appended right after; call_a is left
+    // alone.
+    const items = agent.messages();
+    try std.testing.expectEqual(@as(usize, 3), items.len);
+    const synthetic = items[2];
+    try std.testing.expectEqual(ai.Role.tool, synthetic.role);
+    try std.testing.expectEqualStrings("call_b", synthetic.call_id.?);
+    try std.testing.expect(synthetic.tool_failed);
+
+    // Idempotent: every call now has a result, so a second pass adds nothing.
+    try agent.reconcileInterruptedToolCalls();
+    try std.testing.expectEqual(@as(usize, 3), agent.messages().len);
 }
 
 test "context token estimate anchors on usage plus trailing messages" {

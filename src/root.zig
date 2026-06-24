@@ -18,13 +18,15 @@ pub const symbols = @import("symbols.zig");
 pub const terminal_markdown = @import("terminal_markdown");
 pub const logger = @import("logger");
 pub const runtime = @import("runtime.zig");
-pub const jj = @import("jj.zig");
+pub const vcs = @import("vcs.zig");
 pub const transcript = @import("transcript.zig");
 pub const tools = @import("tools.zig");
 pub const tui = @import("tui.zig");
 pub const thread = @import("tui/thread.zig");
 
 pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
+    @import("bash.zig").disablePseudoConsole();
+
     if (logger.enabled) {
         if (resolveLogPath(gpa, init.environ_map)) |log_path| {
             defer gpa.free(log_path);

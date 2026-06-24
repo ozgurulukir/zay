@@ -12,7 +12,7 @@ const config_mod = @import("config.zig");
 const openai_compatible_mod = @import("ai/openai_compatible.zig");
 const runtime_mod = @import("runtime.zig");
 const session_mod = @import("session.zig");
-const jj = @import("jj.zig");
+const vcs = @import("vcs.zig");
 const skill_mod = @import("skill.zig");
 const symbols = @import("symbols.zig");
 const transcript_mod = @import("transcript.zig");
@@ -130,20 +130,15 @@ pub const App = struct {
     /// Parsed state for the `/diff` viewer. Populated by `openDiffViewer`, reset
     /// to `.{}` on exit. Only meaningful while `mode == .diff_viewer`.
     diff: diff_viewer.State = .{},
-    /// Lazily-resolved readiness of jj-backed per-turn checkpointing: `.unknown`
-    /// until the first finished turn probes jj and colocates the repo, then
-    /// cached. `.unavailable` keeps the feature inert when jj isn't installed.
+    /// Lazily-resolved readiness of git-shadow snapshotting: `.unknown` until the
+    /// first boundary probes git + that the cwd is a repo, then cached.
+    /// `.unavailable` keeps the feature inert when git isn't available.
     checkpoint_state: CheckpointState = .unknown,
-    /// True once a checkpoint seal has failed and we've told the user. Stops the
-    /// per-turn failure notice from repeating every turn while jj is wedged.
+    /// True once a snapshot has failed and we've told the user. Stops the
+    /// per-turn failure notice from repeating every turn while git is wedged.
     checkpoint_warned: bool = false,
-    /// The git branch the primary lane saves onto — captured once at the first
-    /// checkpoint, before jj detaches HEAD. Null if launched on a detached HEAD.
-    primary_branch: ?jj.BookmarkName = null,
     mode: Mode = .normal,
     command_selection: u32 = 0,
-    /// Selection within the `/sync` lane picker (indexes the non-active lanes).
-    lane_pick_selection: u32 = 0,
     resume_selection: u32 = 0,
     resume_global: bool = false,
     resume_summaries: std.ArrayList(session_mod.SessionSummary) = .empty,
@@ -215,7 +210,7 @@ pub const App = struct {
 
     pub const ctrl_c_double_press_ms: u32 = 1500;
 
-    const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, lane_picker, diff_viewer };
+    const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message };
     const ModelCatalog = enum { connected_provider, openai_codex };
     const CheckpointState = enum { unknown, ready, unavailable };
     const ModelSource = model_loader.ModelSource;
@@ -262,7 +257,7 @@ pub const App = struct {
     fn liveRuntime(self: *const App) ?*runtime_mod.AgentRuntime {
         return switch (self.thread.engine) {
             .live => |live| live.runtime,
-            .idle, .archived => null,
+            .idle => null,
         };
     }
 
@@ -393,12 +388,6 @@ pub const App = struct {
             return false;
         }
 
-        // The "before" anchor: capture anything the user changed outside a turn —
-        // hand edits, or a working copy left behind by timeline navigation — as
-        // its own checkpoint, so it isn't silently folded into the agent's turn.
-        // A no-op when nothing changed since the last checkpoint.
-        self.checkpointBoundary("nova: checkpoint");
-
         self.resetTurnState();
         self.thread.worker_context.?.resetCancel();
         _ = try self.thread.transcript.append(self.gpa, .user, "you", prompt);
@@ -492,21 +481,6 @@ pub const App = struct {
         });
     }
 
-    /// Start a turn whose prompt Nova supplies (not typed by the user): show
-    /// `notice` in the transcript for context, then run `prompt` through the
-    /// normal worker path. The prompt reaches the model (it's the turn's user
-    /// message) but isn't echoed as a "you" bubble. Used to kick off sync
-    /// conflict resolution.
-    fn startInjectedTurn(self: *App, prompt: []const u8, notice: []const u8) !void {
-        self.resetTurnState();
-        self.thread.worker_context.?.resetCancel();
-        _ = try self.thread.transcript.append(self.gpa, .notice, "notice", notice);
-        self.thread.turn_view.awaitModel();
-        self.thread.pending_prompt = try self.thread.worker_context.?.gpa.dupe(u8, prompt);
-        self.thread.turn.submit();
-        try self.startTurn();
-    }
-
     /// After a user interrupt has fully unwound (worker joined, queue stranded),
     /// deliver any queued messages as a fresh turn: the worker drains the whole
     /// queue into history (leading messages as context, the last as the latest
@@ -555,8 +529,8 @@ pub const App = struct {
             if (outcome.finished) {
                 self.awaitTurn();
                 // The worker is joined, so any files the cut-short turn wrote are
-                // settled on disk. Seal them now — otherwise they sit untracked
-                // and a later timeline `jj new` can't reset them away.
+                // settled on disk. Snapshot them now — otherwise they sit
+                // unbound and a later timeline restore can't bring them back.
                 self.checkpointFinishedTurn();
                 return try self.restartTurnForQueuedMessages();
             }
@@ -584,116 +558,96 @@ pub const App = struct {
     }
 
     /// What a `sealCheckpoint` attempt did — so callers can tell a genuine
-    /// failure (jj/persist error) apart from the benign "nothing to seal" and
-    /// "jj not available" cases and surface only the former.
+    /// failure apart from the benign "nothing to bind" and "git unavailable"
+    /// cases and surface only the former.
     const SealOutcome = enum { sealed, nothing, unavailable, failed };
 
-    /// Seal the working copy into a jj checkpoint and record its change-id on the
-    /// conversation branch, binding this conversation node to its code state.
-    /// Returns `.nothing` when the working copy is unchanged, so it's safe to call
-    /// at every turn boundary. A jj or persistence error returns `.failed` (no
-    /// longer swallowed silently — the binding the timeline depends on is too
-    /// important to lose without a trace); the caller decides how to surface it.
-    fn sealCheckpoint(self: *App, message: []const u8) SealOutcome {
+    /// Snapshot the working tree (git-shadow) and bind the resulting commit id to
+    /// the active conversation leaf, so navigating back here restores this code
+    /// state. HEAD stays attached to the branch; the snapshot is an off-branch
+    /// commit kept alive by a `refs/nova/*` ref. A git or persistence error
+    /// returns `.failed` — never swallowed silently, since a missing binding is
+    /// exactly what broke timeline navigation before.
+    fn sealCheckpoint(self: *App) SealOutcome {
         const rt = self.liveRuntime() orelse return .unavailable;
         if (!self.ensureCheckpointReady()) return .unavailable;
-        const sealed = jj.sealTurn(self.gpa, self.io, rt.cwd, message) catch return .failed;
-        const id = sealed orelse return .nothing;
-        // Record the change-id on the conversation branch. If this fails the jj
-        // commit exists but the node→code binding doesn't, which is exactly the
-        // silent gap that broke timeline navigation — report it.
-        rt.session_writer.appendCheckpoint(id.slice()) catch return .failed;
-        // Mark the lane as having a live working position (drives the status-line
-        // marker). No git bookmark is created: jj's detached HEAD during a session
-        // is expected, and a shared `nova/live` ref only clutters `git branch` and
-        // collides across parallel lanes.
-        self.thread.live_active = true;
+        const index = vcs.indexPath(self.gpa, self.io, rt.cwd) catch return .failed;
+        defer self.gpa.free(index);
+        const sha = vcs.snapshot(self.gpa, self.io, rt.cwd, index) catch return .failed;
+        rt.session_writer.setLeafSnapshot(sha.slice()) catch return .failed;
+        // Bind only makes sense if there is a leaf entry to bind to; otherwise the
+        // snapshot is an orphan (gc'd later) — report nothing happened.
+        const leaf_id = rt.session_writer.leaf() orelse return .nothing;
+        // Keep the snapshot reachable against `git gc`, named by the entry it
+        // binds so it can be pruned with that entry.
+        vcs.keepRef(self.gpa, self.io, rt.cwd, leaf_id, sha) catch {};
         return .sealed;
     }
 
-    /// Tell the user a checkpoint couldn't be sealed — once. A persistently
-    /// wedged jj would otherwise append this on every turn; the flag clears the
-    /// next time a seal succeeds (see `noteCheckpointSucceeded`).
+    /// Tell the user a snapshot couldn't be taken — once. A persistently broken
+    /// git would otherwise append this every turn; the flag clears the next time
+    /// a snapshot succeeds (see `noteCheckpointSucceeded`).
     fn noteCheckpointFailure(self: *App) void {
         if (self.checkpoint_warned) return;
         self.checkpoint_warned = true;
-        _ = self.thread.transcript.append(self.gpa, .notice, "notice", "Couldn't checkpoint the working copy — timeline navigation may not restore this point's files. Check that `jj` works in this repo.") catch {};
+        _ = self.thread.transcript.append(self.gpa, .notice, "notice", "Couldn't snapshot the working tree — timeline navigation may not restore this point's files. Check that `git` works in this repo.") catch {};
     }
 
     fn noteCheckpointSucceeded(self: *App) void {
         self.checkpoint_warned = false;
     }
 
-    /// Seal at a turn/navigation boundary and surface a genuine failure to the
-    /// user (deduped). Every place that must bind the current code state to the
-    /// conversation goes through here, so a broken seal is never silent.
-    fn checkpointBoundary(self: *App, message: []const u8) void {
-        switch (self.sealCheckpoint(message)) {
+    /// Snapshot at a turn boundary and surface a genuine failure to the user
+    /// (deduped). Every place that must bind the current code state to the
+    /// conversation goes through here, so a broken snapshot is never silent.
+    fn checkpointBoundary(self: *App) void {
+        switch (self.sealCheckpoint()) {
             .sealed => self.noteCheckpointSucceeded(),
             .failed => self.noteCheckpointFailure(),
             .nothing, .unavailable => {},
         }
     }
 
-    /// The "after" anchor: seal at the end of a turn (clean or interrupted, so a
-    /// turn that wrote files before being cut still binds them to a checkpoint
-    /// instead of leaving them untracked on disk).
+    /// Seal at the end of a turn (clean or interrupted, so a turn that wrote
+    /// files before being cut still binds them to a snapshot).
     fn checkpointFinishedTurn(self: *App) void {
-        self.checkpointBoundary("nova: turn checkpoint");
+        self.checkpointBoundary();
     }
 
-    /// The git branch the active lane saves onto: the primary's launch branch
-    /// (e.g. `worktrees`) for the primary, the lane's own `nova/<id>` otherwise.
-    fn activeLaneBranch(self: *const App) ?jj.BookmarkName {
-        return switch (self.thread.engine) {
-            .live => |l| switch (l.lane) {
-                .working => |w| w.bookmark,
-                .primary => self.primary_branch,
-            },
-            .idle, .archived => null,
-        };
-    }
-
-    /// `/save`: land the active lane's timeline onto its own git branch as a
-    /// single squash-all commit — seal pending work, build one commit on the
-    /// branch holding the leaf's full tree, and repoint the branch onto it. The
-    /// per-turn checkpoint chain never reaches the branch; only this commit does.
-    fn saveActiveLane(self: *App) !void {
+    /// `/save` entry point: reject when the working tree has nothing to commit,
+    /// otherwise open the commit-message prompt. `saveActiveLane` commits on
+    /// confirm.
+    fn beginSave(self: *App) !void {
         if (self.thread.turn.isActive()) return error.InFlightTurn;
         const rt = self.liveRuntime() orelse return error.NoActiveRuntime;
-        const branch = self.activeLaneBranch() orelse return error.NoBranchToSaveTo;
 
-        // Seal anything pending so the leaf is well-defined, then read it.
-        self.checkpointBoundary("nova: checkpoint");
-        const leaf_raw = (try rt.session_writer.checkpointHead(self.gpa)) orelse return error.NothingToSave;
-        defer self.gpa.free(leaf_raw);
-        const leaf = try jj.ChangeId.parse(leaf_raw);
-
-        const message = self.thread.title orelse "nova: saved session";
-        try jj.newOnRevset(self.gpa, self.io, rt.cwd, branch.slice());
-        try jj.restoreFrom(self.gpa, self.io, rt.cwd, leaf);
-        const saved = (try jj.sealTurn(self.gpa, self.io, rt.cwd, message)) orelse return error.NothingToSave;
-        try jj.setBookmark(self.gpa, self.io, rt.cwd, branch, saved);
-
-        // A working lane's fork point is now the saved commit, so a later save or
-        // sync only carries work added from here.
-        switch (self.thread.engine) {
-            .live => |l| switch (l.lane) {
-                .working => self.thread.engine.live.lane.working.base = saved,
-                .primary => {},
-            },
-            .idle, .archived => {},
+        if (!(vcs.workingTreeDirty(self.gpa, self.io, rt.cwd) catch true)) {
+            _ = try self.thread.transcript.append(self.gpa, .notice, "notice", "Nothing to save — the working tree matches the last commit.");
+            return;
         }
 
-        const note = try std.fmt.allocPrint(self.gpa, "Saved to \"{s}\".", .{branch.slice()});
-        defer self.gpa.free(note);
-        _ = try self.thread.transcript.append(self.gpa, .notice, "notice", note);
+        // Prompt for a commit message; `submitMode` calls `saveActiveLane` on
+        // confirm. Prefill the lane title as an editable suggestion.
+        self.mode = .save_message;
+        self.clearInput();
+        self.clearPaletteInput();
+        if (self.thread.title) |title| self.palette_input.insertSliceAtCursor(title) catch {};
     }
 
-    /// Resolve once whether per-turn checkpointing can run: jj installed and the
-    /// repo colocated. Colocation is checked against the repo root (the shared
-    /// `.jj` store) — not a lane's workspace cwd, which has no `.jj` of its own.
-    /// Cached, so the probe and `jj git init --colocate` happen once per session.
+    /// `/save`: commit the current working tree onto the lane's branch with the
+    /// user's message. In the git-shadow model HEAD stays attached, so this is
+    /// just `git add -A && git commit` — the working tree *is* the state to keep;
+    /// the off-branch snapshot chain never reaches the branch. `message` is the
+    /// user-supplied commit message (see `beginSave`).
+    fn saveActiveLane(self: *App, message: []const u8) !void {
+        if (self.thread.turn.isActive()) return error.InFlightTurn;
+        const rt = self.liveRuntime() orelse return error.NoActiveRuntime;
+        try vcs.commitAll(self.gpa, self.io, rt.cwd, message);
+        _ = try self.thread.transcript.append(self.gpa, .success, "notice", "Saved — committed the working tree to the current branch.");
+    }
+
+    /// Resolve once whether the git-shadow snapshot feature can run: git
+    /// installed and the working copy inside a git repo. Cached per session.
     fn ensureCheckpointReady(self: *App) bool {
         switch (self.checkpoint_state) {
             .ready => return true,
@@ -704,31 +658,9 @@ pub const App = struct {
             self.checkpoint_state = .unavailable;
             return false;
         };
-        // jj ships with Nova (the install script ensures it on PATH), so assume
-        // it's present — just make sure the repo is colocated.
-        const ok = blk: {
-            jj.ensureColocated(self.gpa, self.io, repo) catch break :blk false;
-            break :blk true;
-        };
+        const ok = vcs.isAvailable(self.gpa, self.io) and vcs.isRepo(self.gpa, self.io, repo);
         self.checkpoint_state = if (ok) .ready else .unavailable;
-        // Capture the launch branch now, while HEAD is still attached — the first
-        // checkpoint (next) detaches it, and `/save` needs the primary's branch.
-        if (ok and self.primary_branch == null) self.primary_branch = readGitBranch(self.gpa, self.io, repo);
         return ok;
-    }
-
-    /// The current git branch in `repo`, or null on a detached HEAD / failure.
-    fn readGitBranch(gpa: std.mem.Allocator, io: std.Io, repo: []const u8) ?jj.BookmarkName {
-        var result = bash_mod.runWithOptions(gpa, io, .{
-            .cwd = repo,
-            .command = "git branch --show-current 2>/dev/null",
-            .timeout = bash_mod.timeoutFromSeconds(2),
-        }) catch return null;
-        defer result.deinit(gpa);
-        if (result.code != 0) return null;
-        const name = std.mem.trim(u8, result.stdout, " \t\r\n");
-        if (name.len == 0) return null;
-        return jj.BookmarkName.parse(name) catch null;
     }
 
     pub fn handleCommandKey(self: *App, key: vaxis.Key) !bool {
@@ -737,11 +669,13 @@ pub const App = struct {
             .model_picker => self.handleModelPickerKey(key),
             .session_picker => self.handleSessionPickerKey(key),
             .tree_picker => self.handleTreePickerKey(key),
-            .lane_picker => self.handleLanePickerKey(key),
             .command => self.handleCommandMenuKey(key),
             // The diff viewer owns its keys directly in `captureEvent`; nothing
             // reaches the generic dispatch.
             .diff_viewer => false,
+            // The save prompt is a plain text field: Enter/Esc are handled in
+            // submit/cancel; every other key falls through to the focused input.
+            .save_message => false,
             .normal => self.handleTranscriptKey(key),
         };
     }
@@ -1014,12 +948,19 @@ pub const App = struct {
             self.clearPaletteInput();
             return true;
         }
-        if (self.mode == .lane_picker) {
-            const source = self.nthCandidateIndex(self.lane_pick_selection);
+        if (self.mode == .save_message) {
+            const raw = try self.peekPaletteInput();
+            defer self.gpa.free(raw);
+            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+            // Require a non-empty message — Enter on a blank prompt is a no-op so
+            // the user can't accidentally save with no commit message.
+            if (trimmed.len == 0) return true;
+            const message = try self.gpa.dupe(u8, trimmed);
+            defer self.gpa.free(message);
             self.mode = .normal;
             self.clearInput();
             self.clearPaletteInput();
-            if (source) |s| self.syncActiveLane(s) catch |err| try self.reportLaneError(err);
+            self.saveActiveLane(message) catch |err| try self.reportLaneError(err);
             return true;
         }
         if (self.mode == .command) {
@@ -1036,9 +977,8 @@ pub const App = struct {
                     .model => self.openModelPicker() catch |err| try self.reportConnectionError(err),
                     .diff => self.openDiffViewer() catch |err| try self.reportDiffError(err),
                     .parallel => self.createParallelLane() catch |err| try self.reportLaneError(err),
-                    .save => self.saveActiveLane() catch |err| try self.reportLaneError(err),
+                    .save => self.beginSave() catch |err| try self.reportLaneError(err),
                     .close => self.closeActiveLane() catch |err| try self.reportLaneError(err),
-                    .sync => self.beginSync() catch |err| try self.reportLaneError(err),
                 }
             }
             return true;
@@ -1916,9 +1856,9 @@ pub const App = struct {
 
     fn reloadResumeSessions(self: *App) !void {
         self.resumeClear();
-        var manager = try session_mod.SessionManager.initDefault(self.gpa, self.io, self.repoRoot() orelse self.liveRuntime().?.cwd);
+        var manager = try session_mod.SessionManager.initDefault(self.gpa, self.io, self.liveRuntime().?.home_dir);
         defer manager.deinit();
-        const cwd = if (self.resume_global) null else self.liveRuntime().?.cwd;
+        const cwd = if (self.resume_global) null else (self.repoRoot() orelse self.liveRuntime().?.cwd);
         const summaries = try manager.list(self.gpa, cwd);
         try self.resume_summaries.appendSlice(self.gpa, summaries);
         if (self.resume_global) std.mem.sort(
@@ -1995,63 +1935,26 @@ pub const App = struct {
     fn navigateToEntry(self: *App, entry_id: []const u8) !void {
         if (self.thread.turn.isActive()) return error.InFlightTurn;
         const rt = self.liveRuntime() orelse return error.NoActiveRuntime;
-        // Capture any hand edits in the current working copy as a checkpoint on
-        // the branch we're leaving, so navigating away doesn't strand them
-        // off-timeline. No-op when the working copy is clean.
-        self.checkpointBoundary("nova: checkpoint");
         try rt.session_writer.navigate(entry_id);
         try rt.reloadMessages();
         try self.rebuildTranscriptFromAgent();
         try self.restoreCheckpointForBranch(rt);
     }
 
-    /// Restore the working copy to the code state of the now-active timeline
-    /// branch: the nearest checkpoint at/above the new leaf, or — when the node
-    /// precedes every checkpoint — the baseline (the first checkpoint's parent).
-    /// Navigation targets a row's own checkpoint (see `selectedNavigationId`), so
-    /// the leaf usually *is* the checkpoint and this restores exactly that state.
-    /// `jj new` detaches git HEAD onto a fresh working commit; we mark the lane
-    /// live for the status-line marker. A jj failure or a node with no checkpoint
-    /// binding leaves files as-is — but says so (a silent no-op here is exactly
-    /// what hid stale files after navigation).
+    /// Restore the working tree to the snapshot bound to the now-active timeline
+    /// node — its own, or the nearest ancestor that has one (`snapshotAt`). HEAD
+    /// stays attached to the branch; `vcs.restore` rewrites tracked files to that
+    /// tree (adds/modifies/deletes). Best-effort: a node with no bound snapshot
+    /// (an early point, before any file change) or a git failure simply leaves
+    /// the working tree as-is — no error, since the binding is reliable and the
+    /// "no snapshot here" case is normal, not a problem.
     fn restoreCheckpointForBranch(self: *App, rt: *runtime_mod.AgentRuntime) !void {
-        if (try rt.session_writer.checkpointHead(self.gpa)) |head| {
-            defer self.gpa.free(head);
-            const change = jj.ChangeId.parse(head) catch return self.noteWorkingCopyUnchanged();
-            self.restoreWorkingCopyOnto(rt, change) catch return self.noteWorkingCopyUnchanged();
-            self.thread.live_active = true;
-            return;
-        }
-        if (try rt.session_writer.firstCheckpointChange(self.gpa)) |first| {
-            defer self.gpa.free(first);
-            // `<change>-` is the change's parent in jj revset syntax: the state
-            // before the first file-changing turn.
-            const revset = try std.fmt.allocPrint(self.gpa, "{s}-", .{first});
-            defer self.gpa.free(revset);
-            jj.newOnRevset(self.gpa, self.io, rt.cwd, revset) catch return self.noteWorkingCopyUnchanged();
-            self.thread.live_active = true;
-            return;
-        }
-        // No checkpoint anywhere on the way to this node — there's no code state
-        // to restore. Tell the user (only when checkpointing is actually on, so
-        // the message isn't noise when jj is simply unavailable).
-        if (self.checkpoint_state == .ready) self.noteWorkingCopyUnchanged();
-    }
-
-    /// One-line notice that a timeline jump moved the conversation but not the
-    /// files — so a stale working copy is never silently mistaken for a restore.
-    fn noteWorkingCopyUnchanged(self: *App) void {
-        _ = self.thread.transcript.append(self.gpa, .notice, "notice", "Moved the conversation here, but couldn't restore this point's code — your working copy is unchanged.") catch {};
-    }
-
-    /// Re-materialise the working copy on top of `change` via a fresh `jj new`,
-    /// unless it already sits empty on top of `change` — re-running `jj new` on
-    /// every navigation would pile up abandoned empty working commits.
-    fn restoreWorkingCopyOnto(self: *App, rt: *runtime_mod.AgentRuntime, change: jj.ChangeId) jj.CmdError!void {
-        if (jj.parentChangeId(self.gpa, self.io, rt.cwd)) |parent| {
-            if (parent.eql(change) and (jj.workingCopyEmpty(self.gpa, self.io, rt.cwd) catch false)) return;
-        } else |_| {}
-        try jj.newOnTop(self.gpa, self.io, rt.cwd, change);
+        const sha_raw = (try rt.session_writer.snapshotAt(self.gpa)) orelse return;
+        defer self.gpa.free(sha_raw);
+        const sha = vcs.ObjectId.parse(sha_raw) catch return;
+        const index = vcs.indexPath(self.gpa, self.io, rt.cwd) catch return;
+        defer self.gpa.free(index);
+        vcs.restore(self.gpa, self.io, rt.cwd, index, sha) catch return;
     }
 
     fn clearInput(self: *App) void {
@@ -2362,62 +2265,37 @@ pub const App = struct {
     fn repoRoot(self: *const App) ?[]const u8 {
         return switch (self.threads.items[0].engine) {
             .live => |live| live.runtime.cwd,
-            .idle, .archived => null,
+            .idle => null,
         };
     }
 
-    /// The change a new lane forks from: the source lane's latest checkpoint
-    /// (after the caller has sealed pending work), or its working-copy commit
-    /// when the lane has no checkpoint yet.
-    fn laneForkBase(self: *App, rt: *runtime_mod.AgentRuntime) !jj.ChangeId {
-        if (try rt.session_writer.checkpointHead(self.gpa)) |head| {
-            defer self.gpa.free(head);
-            if (jj.ChangeId.parse(head)) |change| return change else |_| {}
-        }
-        return jj.workingCopyChangeId(self.gpa, self.io, rt.cwd);
-    }
-
-    /// Spawn a parallel lane: a fresh jj workspace branched from the active
-    /// lane's current code state, with its own session + agent, then switch to
-    /// it. The new lane runs the same project in isolation. Lanes still run one
-    /// at a time (per-lane event routing is a later step), so creation is
-    /// refused mid-turn.
+    /// Spawn a parallel lane: a fresh `git worktree` on its own `nova/<id>`
+    /// branch forked from the current HEAD, with its own session + agent, then
+    /// switch to it. Fully isolated — its own working copy, branch, and snapshot
+    /// index; lanes never interact (land on `main` via a PR). Refused mid-turn.
     fn createParallelLane(self: *App) !void {
         if (self.threads.items.len >= 4) return error.TooManyLanes; // the split grid is 2×2
-        const current = self.liveRuntime() orelse return error.NoActiveRuntime;
         const repo = self.repoRoot() orelse return error.NoActiveRuntime;
-        try jj.ensureColocated(self.gpa, self.io, repo);
+        const home = (self.liveRuntime() orelse return error.NoActiveRuntime).home_dir;
+        if (!vcs.isRepo(self.gpa, self.io, repo)) return error.NotAGitRepo;
 
         var raw: [6]u8 = undefined;
         self.io.random(&raw);
         const id = std.fmt.bytesToHex(raw, .lower);
 
-        const ws_str = try std.fmt.allocPrint(self.gpa, "nova-{s}", .{id[0..]});
-        defer self.gpa.free(ws_str);
-        const workspace = try jj.WorkspaceName.parse(ws_str);
-        const bm_str = try std.fmt.allocPrint(self.gpa, "nova/{s}", .{id[0..]});
-        defer self.gpa.free(bm_str);
-        const bookmark = try jj.BookmarkName.parse(bm_str);
+        const branch = try std.fmt.allocPrint(self.gpa, "nova/{s}", .{id[0..]});
+        errdefer self.gpa.free(branch);
 
-        const parent = try std.fs.path.join(self.gpa, &.{ repo, ".nova", "workspaces" });
+        // Worktrees live under the global `<home>/.nova/worktrees`, OUTSIDE the
+        // repo, so `git add -A`/snapshots/`/save` never see them.
+        const parent = try std.fs.path.join(self.gpa, &.{ home, ".nova", "worktrees" });
         defer self.gpa.free(parent);
         std.Io.Dir.cwd().createDirPath(self.io, parent) catch {};
         const dest = try std.fs.path.join(self.gpa, &.{ parent, id[0..] });
         errdefer self.gpa.free(dest);
 
-        // Seal any uncommitted work on the source lane first, so the fork starts
-        // from a stable checkpoint commit rather than a mutable working copy.
-        self.checkpointBoundary("nova: checkpoint");
-        const base = try self.laneForkBase(current);
-        try jj.workspaceAdd(self.gpa, self.io, repo, workspace, dest, base);
-        errdefer jj.workspaceForget(self.gpa, self.io, repo, workspace) catch {};
-
-        // Give the lane its own git branch alongside the worktree (the bookmark
-        // exports to `refs/heads/nova/<id>` in colocated mode), so `git branch`
-        // shows each lane and `/save` has a per-lane target. Starts at `base`;
-        // `/save` later advances it onto the lane's squashed work.
-        try jj.createBookmark(self.gpa, self.io, repo, bookmark, base);
-        errdefer jj.deleteBookmark(self.gpa, self.io, repo, bookmark) catch {};
+        try vcs.worktreeAdd(self.gpa, self.io, repo, dest, branch);
+        errdefer vcs.worktreeRemove(self.gpa, self.io, repo, dest) catch {};
 
         const runtime = try self.createRuntime(dest, repo, null);
         errdefer {
@@ -2432,14 +2310,14 @@ pub const App = struct {
             .agent = &runtime.agent,
             .worker_context = .{ .io = self.io, .gpa = runtime.gpa },
             .engine = .{ .live = .{
-                .lane = .{ .working = .{ .workspace = workspace, .bookmark = bookmark, .base = base, .path = dest } },
+                .lane = .{ .working = .{ .branch = branch, .path = dest } },
                 .runtime = runtime,
                 .owns = true,
             } },
         };
         try self.threads.append(self.gpa, lane);
 
-        // Committed: `threads` owns `lane`, which owns `runtime`/`dest`.
+        // Committed: `threads` owns `lane`, which owns `runtime`/`branch`/`dest`.
         self.thread = lane;
         self.split = true; // a new lane implies tiling so both are visible
         self.mode = .normal;
@@ -2453,143 +2331,6 @@ pub const App = struct {
         const message = try std.fmt.allocPrint(self.gpa, "Lane operation failed: {s}", .{@errorName(err)});
         defer self.gpa.free(message);
         _ = try self.thread.transcript.append(self.gpa, .agent, "agent", message);
-    }
-
-    /// Number of lanes eligible as a sync source (every lane but the active one).
-    fn syncCandidateCount(self: *const App) u32 {
-        return @intCast(self.threads.items.len -| 1);
-    }
-
-    /// The real `threads` index of the n-th sync candidate (skipping the active
-    /// lane), or null when `n` is out of range.
-    fn nthCandidateIndex(self: *const App, n: u32) ?usize {
-        const active = self.activeIndex();
-        var k: u32 = 0;
-        for (self.threads.items, 0..) |_, i| {
-            if (i == active) continue;
-            if (k == n) return i;
-            k += 1;
-        }
-        return null;
-    }
-
-    /// Entry point for `/sync`: catch the active lane up to another lane's work.
-    /// The active lane is the destination (it must be a working lane — it needs a
-    /// fork base to rebase from). With exactly two lanes the source is implied;
-    /// otherwise open the lane picker to choose it.
-    fn beginSync(self: *App) !void {
-        self.mode = .normal;
-        self.clearInput();
-        self.clearPaletteInput();
-        if (self.threads.items.len < 2) return error.NoLaneToSync;
-        switch (self.thread.engine) {
-            .live => |l| switch (l.lane) {
-                .working => {},
-                .primary => return error.SyncDestMustBeWorkingLane,
-            },
-            .idle, .archived => return error.NotAWorkingLane,
-        }
-        if (self.threads.items.len == 2) {
-            return self.syncActiveLane(self.nthCandidateIndex(0).?);
-        }
-        self.lane_pick_selection = 0;
-        self.mode = .lane_picker;
-    }
-
-    fn handleLanePickerKey(self: *App, key: vaxis.Key) !bool {
-        const count = self.syncCandidateCount();
-        if (key.matches(vaxis.Key.up, .{})) {
-            self.lane_pick_selection = previousIndex(self.lane_pick_selection, count);
-            return true;
-        }
-        if (key.matches(vaxis.Key.down, .{})) {
-            self.lane_pick_selection = nextIndex(self.lane_pick_selection, count);
-            return true;
-        }
-        // Enter is handled by `submitMode` (the shared submit path intercepts it
-        // before generic key dispatch), so the picker only owns up/down here.
-        return false;
-    }
-
-    /// Catch the active (destination) lane up to `source_index`'s latest work:
-    /// seal both sides, rebase the destination's own checkpoint chain onto the
-    /// source's head, and — only if conflict-free — re-materialise the
-    /// destination's working copy on top. Both lanes survive (retiring is always
-    /// an explicit `/close`). Conflicts `jj undo` the rebase and bail; the guided
-    /// per-conflict resolution loop is the follow-on.
-    ///
-    /// The jj rebase/conflict revsets are verified against jj 0.42 (see the sync
-    /// integration test in `jj.zig`). `jj undo` is the reversibility net on a
-    /// conflicting rebase. The guided per-conflict resolution loop is the
-    /// follow-on; today conflicts hand off to a single agent turn.
-    fn syncActiveLane(self: *App, source_index: usize) !void {
-        if (self.thread.turn.isActive()) return error.InFlightTurn;
-        const repo = self.repoRoot() orelse return error.NoActiveRuntime;
-
-        const dest = self.thread;
-        const dest_live = switch (dest.engine) {
-            .live => |l| l,
-            .idle, .archived => return error.NotAWorkingLane,
-        };
-        const working = switch (dest_live.lane) {
-            .working => |w| w,
-            .primary => return error.SyncDestMustBeWorkingLane,
-        };
-        const dest_rt = dest_live.runtime;
-
-        const source = self.threads.items[source_index];
-        const source_rt = switch (source.engine) {
-            .live => |l| l.runtime,
-            .idle, .archived => return error.NoActiveRuntime,
-        };
-
-        // Seal pending work on both sides so the heads are well-defined.
-        _ = jj.sealTurn(self.gpa, self.io, dest_rt.cwd, "nova: pre-sync seal") catch null;
-        _ = jj.sealTurn(self.gpa, self.io, source_rt.cwd, "nova: pre-sync seal") catch null;
-
-        const source_head_raw = (try source_rt.session_writer.checkpointHead(self.gpa)) orelse return error.NothingToSync;
-        defer self.gpa.free(source_head_raw);
-        const source_head = try jj.ChangeId.parse(source_head_raw);
-
-        const dest_head_raw = try dest_rt.session_writer.checkpointHead(self.gpa);
-        defer if (dest_head_raw) |h| self.gpa.free(h);
-
-        var has_conflicts = false;
-        if (dest_head_raw) |dh_raw| {
-            // Rebase the destination's own chain (base..head) onto the source's
-            // head. jj records conflicts as data — the rebase always lands; any
-            // conflicts go to the agent (below) rather than unwinding.
-            const dest_head = try jj.ChangeId.parse(dh_raw);
-            try jj.rebaseChainOnto(self.gpa, self.io, repo, working.base, dest_head, source_head);
-            has_conflicts = try jj.rangeHasConflicts(self.gpa, self.io, repo, working.base, dest_head);
-            try jj.newOnTop(self.gpa, self.io, dest_rt.cwd, dest_head);
-        } else {
-            // No work of our own yet — just re-root the empty working copy onto
-            // the source's head.
-            try jj.newOnTop(self.gpa, self.io, dest_rt.cwd, source_head);
-        }
-
-        // The rebase landed regardless of conflicts, so the fork point is now the
-        // source's head — a later sync rebases only the work we add from here.
-        dest.engine.live.lane.working.base = source_head;
-
-        const label = source.title orelse "the other lane";
-        if (has_conflicts) {
-            // Don't unwind: the conflicted working copy carries jj's markers.
-            // Kick off a single turn that has the agent walk the user through the
-            // conflicts one at a time — from there it's an ordinary conversation
-            // (per-turn checkpoints capture progress, Esc interrupts as usual).
-            const notice = try std.fmt.allocPrint(self.gpa, "Sync from \"{s}\" hit conflicts — resolving them with the agent.", .{label});
-            defer self.gpa.free(notice);
-            const prompt = try buildSyncConflictPrompt(self.gpa, label);
-            defer self.gpa.free(prompt);
-            try self.startInjectedTurn(prompt, notice);
-            return;
-        }
-
-        const msg = try std.fmt.allocPrint(self.gpa, "Synced \"{s}\" into this lane.", .{label});
-        defer self.gpa.free(msg);
-        _ = try dest.transcript.append(self.gpa, .notice, "notice", msg);
     }
 
     fn activeIndex(self: *const App) usize {
@@ -2618,46 +2359,46 @@ pub const App = struct {
         self.clearInput();
     }
 
-    /// Close (abandon) the active lane: tear it down, forget its jj workspace,
-    /// and delete the workspace directory, then fall back to the previous lane.
-    /// The primary lane (index 0) can't be closed. Refused mid-turn.
+    /// Close (abandon) the active lane: tear it down, remove its git worktree and
+    /// delete its branch, then fall back to the previous lane. The primary lane
+    /// (index 0) can't be closed. Refused mid-turn.
     fn closeActiveLane(self: *App) !void {
         if (self.thread.turn.isActive()) return error.InFlightTurn;
         const index = self.activeIndex();
         if (index == 0) return error.CannotClosePrimaryLane;
 
         const lane = self.threads.items[index];
-        var workspace: ?jj.WorkspaceName = null;
-        var book: ?jj.BookmarkName = null;
+        const lane_ref: *const vcs.Lane = switch (lane.engine) {
+            .live => |*live| &live.lane,
+            .idle => |*l| l,
+        };
+        var branch: ?[]u8 = null;
         var dir: ?[]u8 = null;
-        switch (lane.engine) {
-            .live => |live| switch (live.lane) {
-                .working => |w| {
-                    workspace = w.workspace;
-                    book = w.bookmark;
-                    dir = try self.gpa.dupe(u8, w.path);
-                },
-                .primary => {},
+        switch (lane_ref.*) {
+            .working => |w| {
+                branch = try self.gpa.dupe(u8, w.branch);
+                dir = try self.gpa.dupe(u8, w.path);
             },
-            .idle, .archived => {},
+            .primary => {},
         }
+        defer if (branch) |b| self.gpa.free(b);
         defer if (dir) |d| self.gpa.free(d);
 
         // Switch away and drop the lane from the list before teardown so nothing
-        // dereferences it afterward. `lane.deinit` closes its session DB (inside
-        // `dir`), so the directory is safe to delete only after it returns.
+        // dereferences it afterward. `lane.deinit` closes its (shared-repo)
+        // session connection; the worktree dir holds no DB, so it's safe to
+        // remove after.
         self.thread = self.threads.items[index - 1];
         _ = self.threads.orderedRemove(index);
         lane.deinit(self.gpa);
         self.gpa.destroy(lane);
 
         if (self.repoRoot()) |repo| {
-            if (workspace) |w| jj.workspaceForget(self.gpa, self.io, repo, w) catch {};
-            // Drop the lane's git branch too, so closed lanes don't leave stray
-            // `nova/<id>` branches behind.
-            if (book) |b| jj.deleteBookmark(self.gpa, self.io, repo, b) catch {};
+            // `git worktree remove` deletes the working directory; then drop the
+            // lane's branch so closed lanes leave no stray `nova/<id>` behind.
+            if (dir) |d| vcs.worktreeRemove(self.gpa, self.io, repo, d) catch {};
+            if (branch) |b| vcs.deleteBranch(self.gpa, self.io, repo, b) catch {};
         }
-        if (dir) |d| std.Io.Dir.cwd().deleteTree(self.io, d) catch {};
 
         self.block_nav = false;
         self.clearInput();
@@ -3467,10 +3208,7 @@ const RootWidget = struct {
             return;
         }
         const target = switch (self.app.mode) {
-            // The lane picker draws no search field, so keep key handling on the
-            // root widget (via captureEvent) — there's no input to focus.
-            .lane_picker => self.widget(),
-            .command, .session_picker, .provider_picker, .model_picker, .tree_picker => self.app.palette_input.widget(),
+            .command, .session_picker, .provider_picker, .model_picker, .tree_picker, .save_message => self.app.palette_input.widget(),
             // The diff viewer routes focus by sub-state: the comment editor and
             // the file-search field each host a drawn TextField; while browsing
             // the root widget owns every key.
@@ -4256,7 +3994,7 @@ fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
         .normal => app.input.buf.realLength() == 0,
         .session_picker, .model_picker, .tree_picker => app.palette_input.buf.realLength() == 0,
         .provider_picker => app.provider_picker.stage == .list and app.palette_input.buf.realLength() == 0,
-        .command, .lane_picker, .diff_viewer => false,
+        .command, .diff_viewer, .save_message => false,
     };
 }
 
@@ -4379,7 +4117,7 @@ const TranscriptWidget = struct {
     }
 };
 
-const Command = enum { connect, model, new, resume_session, timeline, diff, parallel, save, close, sync };
+const Command = enum { connect, model, new, resume_session, timeline, diff, parallel, save, close };
 /// `multi_lane` commands act on another lane, so they're hidden from the palette
 /// (and unresolvable) until more than one lane exists.
 const CommandEntry = struct { name: []const u8, command: Command, multi_lane: bool = false };
@@ -4393,44 +4131,12 @@ const commands = [_]CommandEntry{
     .{ .name = "Parallel", .command = .parallel },
     .{ .name = "Save", .command = .save },
     .{ .name = "Close", .command = .close, .multi_lane = true },
-    .{ .name = "Sync", .command = .sync, .multi_lane = true },
 };
 
 /// Whether `entry` should appear in the palette given the current lane count.
 fn commandVisible(app: *const App, entry: CommandEntry) bool {
     if (entry.multi_lane and app.threads.items.len < 2) return false;
     return true;
-}
-
-/// The kickoff prompt for agent-guided sync-conflict resolution. Injected once
-/// (see `startInjectedTurn`); the agent then self-paces one conflict per message
-/// across the ensuing conversation — Nova never re-prompts.
-fn buildSyncConflictPrompt(gpa: std.mem.Allocator, source_title: []const u8) ![]u8 {
-    return std.fmt.allocPrint(gpa,
-        \\You just pulled the latest work from the lane "{s}" into this lane with
-        \\`jj rebase`, and it produced merge conflicts. Resolve them *with me*, one
-        \\conflict at a time — do not resolve anything on your own.
-        \\
-        \\How to work:
-        \\- Run `jj resolve --list` (and read the conflicted files) to see what
-        \\  conflicts. Work through them one at a time, in order.
-        \\- For each conflict: show me the conflicted region and explain, in plain
-        \\  language, what each side changed and why they collide. Then propose a
-        \\  specific resolution and your reasoning.
-        \\- STOP there and wait for my answer (yes / no / do it differently). Do
-        \\  NOT edit the file until I reply. Handle exactly one conflict per
-        \\  message — never batch, never jump ahead.
-        \\- Once I approve, edit the file so the conflict markers are gone and the
-        \\  code reflects what we agreed, then move to the next conflict (propose,
-        \\  wait again).
-        \\- jj stores conflicts as data: a file is resolved once its conflict
-        \\  markers are removed and saved. Re-run `jj resolve --list` to confirm
-        \\  each one drops off.
-        \\- When no conflicts remain, build/test if there's an obvious way,
-        \\  summarize what changed across the sync, and tell me it's complete.
-        \\
-        \\Start by listing the conflicts and walking me through the first one.
-    , .{source_title});
 }
 
 fn overlayLabel(mode: App.Mode) []const u8 {
@@ -4441,7 +4147,7 @@ fn overlayLabel(mode: App.Mode) []const u8 {
         .provider_picker => "Connect to Provider",
         .model_picker => "Select Model",
         .tree_picker => "Session Timeline",
-        .lane_picker => "Sync — pick a lane to pull from",
+        .save_message => "Commit Message",
         .diff_viewer => "",
     };
 }
@@ -4534,7 +4240,8 @@ fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []
         .diff_viewer => {
             if (app.diff.sub == .file_search) try app.diff.filterFiles(app.gpa, value);
         },
-        .provider_picker, .lane_picker, .normal => {},
+        // The save-message prompt is free text — nothing to filter live.
+        .provider_picker, .normal, .save_message => {},
     }
     ctx.consumeAndRedraw();
 }
@@ -4549,7 +4256,7 @@ fn overlaySize(mode: App.Mode) OverlaySize {
         .session_picker => .{ .width = 80, .height = 16 },
         .model_picker => .{ .width = 90, .height = 16 },
         .tree_picker => .{ .width = 90, .height = 20 },
-        .lane_picker => .{ .width = 50, .height = 12 },
+        .save_message => .{ .width = 60, .height = 3 },
         .diff_viewer => .{ .width = 0, .height = 0 },
     };
 }
@@ -4716,9 +4423,7 @@ const OverlayInner = struct {
 
         // The provider setup form hosts its own inline editor, so it skips the
         // shared search row entirely and fills the panel from the top.
-        if ((self.app.mode == .provider_picker and self.app.provider_picker.stage == .form) or
-            self.app.mode == .lane_picker)
-        {
+        if (self.app.mode == .provider_picker and self.app.provider_picker.stage == .form) {
             const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
             children[0] = .{
                 .origin = .{ .row = 0, .col = 0 },
@@ -4783,11 +4488,18 @@ const OverlayInner = struct {
             .provider_picker => drawProviderContent(app, ctx),
             .model_picker => drawModelContent(app, ctx),
             .tree_picker => drawTreeContent(app, ctx),
-            .lane_picker => drawLaneContent(app, ctx),
+            .save_message => drawSaveMessageContent(app, ctx),
             // The diff viewer is full-screen — `drawRoot` returns before the
             // overlay path, so this is never reached.
             .normal, .diff_viewer => unreachable,
         };
+    }
+
+    fn drawSaveMessageContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        _ = app;
+        // No body — the border label ("Commit Message") and the input row say it all.
+        var text: vxfw.Text = .{ .text = "" };
+        return text.widget().draw(ctx);
     }
 
     fn drawTreeContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
@@ -4814,24 +4526,6 @@ const OverlayInner = struct {
             .entries = buf[0..n],
             .filter = filter,
             .selection = app.command_selection,
-        };
-        return content.widget().draw(ctx);
-    }
-
-    /// The `/sync` lane picker: list every lane but the active one, by title.
-    fn drawLaneContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        var buf: [4]command_panel.Entry = undefined; // grid caps lanes at four
-        var n: usize = 0;
-        const active = app.activeIndex();
-        for (app.threads.items, 0..) |lane, i| {
-            if (i == active) continue;
-            buf[n] = .{ .name = lane.title orelse try std.fmt.allocPrint(ctx.arena, "lane {d}", .{i + 1}) };
-            n += 1;
-        }
-        var content: command_panel.Content = .{
-            .entries = buf[0..n],
-            .filter = "",
-            .selection = app.lane_pick_selection,
         };
         return content.widget().draw(ctx);
     }
@@ -4927,7 +4621,7 @@ fn inputHintText(app: *const App) []const u8 {
         .provider_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Actions" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .model_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Column" ++ symbols.separator_dot_padded ++ "[TAB] Toggle Effort/Scope" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .tree_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Filter" ++ symbols.separator_dot_padded ++ "[TAB] Fold" ++ symbols.separator_dot_padded ++ "✦ Checkpoint" ++ symbols.separator_dot_padded ++ "[ENTER] Switch" ++ symbols.separator_dot_padded ++ "[ESC] Back",
-        .lane_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Sync" ++ symbols.separator_dot_padded ++ "[ESC] Back",
+        .save_message => "[ENTER] Save" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
         .diff_viewer => "",
         .normal => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[SHIFT] ↓ Jump to Bottom" ++ symbols.separator_dot_padded ++ "[TAB] Expand",
     };
@@ -5317,14 +5011,10 @@ const InputWidget = struct {
         else
             "";
         writeBorderLabelRight(&surface, ctx, 0, status_text, StylePalette.model_status);
-        // Bottom-right: git branch info at the edge, with a "live" working-position
-        // marker just to its left (one-space gap) once the lane has checkpointed.
+        // Bottom-right: git branch info at the edge.
         const bottom = border_height -| 1;
         const right_edge = max_width -| 3; // last interior cell before the corner margin
-        const git_start = writeBorderTextEndingAt(&surface, ctx, bottom, right_edge, self.app.git_label, StylePalette.thinking_body);
-        if (self.app.thread.live_active) {
-            _ = writeBorderTextEndingAt(&surface, ctx, bottom, git_start -| 2, "✦ live", StylePalette.checkpoint_mark);
-        }
+        _ = writeBorderTextEndingAt(&surface, ctx, bottom, right_edge, self.app.git_label, StylePalette.thinking_body);
         return surface;
     }
 
@@ -6575,16 +6265,6 @@ test "lane commands stay hidden until a second lane exists" {
     try std.testing.expect(resolveCommand(&app, "Close") == null);
     try std.testing.expect(resolveCommand(&app, "Sync") == null);
     try std.testing.expect(resolveCommand(&app, "Parallel") == .parallel);
-}
-
-test "sync conflict prompt embeds the source lane and the one-at-a-time rule" {
-    const gpa = std.testing.allocator;
-    const prompt = try buildSyncConflictPrompt(gpa, "feature A");
-    defer gpa.free(prompt);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "feature A") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "jj resolve --list") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "wait for my answer") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "one conflict per") != null);
 }
 
 test "model selection is allowed after interrupt" {

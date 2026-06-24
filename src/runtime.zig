@@ -148,9 +148,9 @@ pub const AgentRuntime = struct {
         };
 
         if (session_id) |id| {
-            try target.session_writer.initResumeDefault(gpa, io, session_dir, id);
+            try target.session_writer.initResumeDefault(gpa, io, home_dir, id);
         } else {
-            try target.session_writer.initDefault(gpa, io, session_dir);
+            try target.session_writer.initDefault(gpa, io, home_dir, session_dir);
         }
         errdefer target.session_writer.deinit();
 

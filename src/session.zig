@@ -7,7 +7,7 @@ const db = @import("db.zig");
 
 const assert = std.debug.assert;
 
-const schema_version: u32 = 1;
+const schema_version: u32 = 2;
 /// Upper bound on entries in a single branch path. Far above any real
 /// session; exists so projection loops are bounded (tigerstyle).
 const path_entries_max: u32 = 1 << 20;
@@ -74,9 +74,9 @@ pub const SessionManager = struct {
         return .{ .gpa = gpa, .io = io, .connection = connection };
     }
 
-    pub fn initDefault(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) Error!SessionManager {
-        assert(cwd.len > 0);
-        const db_path = try defaultPath(gpa, io, cwd);
+    pub fn initDefault(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) Error!SessionManager {
+        assert(home_dir.len > 0);
+        const db_path = try defaultPath(gpa, io, home_dir);
         defer gpa.free(db_path);
         return init(gpa, io, db_path);
     }
@@ -254,61 +254,49 @@ pub const Session = struct {
         try self.insertEntry(id_out, "compaction", null, payload);
     }
 
-    /// Append a code-state checkpoint as a child of the current leaf: the jj
-    /// `change_id` whose workspace state corresponds to the conversation at this
-    /// point. Written once per turn that changed files. The change-id is stored
-    /// opaquely (validated as a `jj.ChangeId` by the caller before it gets
-    /// here); `messages` never projects this entry, so the model is unaware of
-    /// it, but branch walks see it — that's how branching at an older node
-    /// recovers the code state to spawn a workspace from.
-    pub fn appendCheckpoint(self: *Session, change_id: []const u8, id_out: *[entry_id_len]u8) Error!void {
-        assert(change_id.len > 0);
-        fillHex(self.manager.io, id_out);
-        const payload = try checkpointToJson(self.manager.gpa, change_id);
-        defer self.manager.gpa.free(payload);
-        try self.insertEntry(id_out, "checkpoint", null, payload);
+    // === git-shadow snapshots ==============================================
+    //
+    // Each entry can carry a git commit id (`snapshot`) binding it to the code
+    // state *at* that conversation node. Unlike the old `checkpoint` child
+    // entries, the id lives ON the entry, so navigating to a node reads its own
+    // (or its nearest ancestor's) snapshot directly — no descendant scan, no
+    // off-by-one. Written by the harness after a file-changing step.
+
+    /// Record `sha` (a git commit id) as the code state at `entry_id`.
+    pub fn setSnapshot(self: *Session, entry_id: []const u8, sha: []const u8) Error!void {
+        assert(entry_id.len == entry_id_len);
+        assert(sha.len > 0);
+        var statement = try self.manager.connection.prepare("update session_entries set snapshot = ? where session_id = ? and id = ?");
+        defer statement.finalize();
+        try statement.bindText(1, sha);
+        try statement.bindText(2, self.id.slice());
+        try statement.bindText(3, entry_id);
+        try expectDone(&statement);
     }
 
-    /// The change-id of the nearest `checkpoint` entry on the active branch
-    /// (scanning leaf→root), or null when the branch carries none. This is the
-    /// code state bound to the current conversation position. Caller owns the
-    /// returned string.
-    pub fn checkpointHead(self: *Session, gpa: std.mem.Allocator) Error!?[]u8 {
-        const path = try self.loadBranch(gpa);
-        defer {
-            for (path) |*entry| entry.deinit(gpa);
-            gpa.free(path);
-        }
-        assert(path.len <= path_entries_max);
-        var scan: u32 = @intCast(path.len);
-        while (scan > 0) {
-            scan -= 1;
-            if (std.mem.eql(u8, path[scan].kind, "checkpoint")) {
-                return try checkpointChangeId(gpa, path[scan].payload_json);
-            }
-        }
-        return null;
-    }
-
-    /// The change-id of the earliest checkpoint anywhere in the session — the
-    /// first file-changing turn's seal. Scanning across branches (not just the
-    /// active one) is intentional and correct: every branch forks from the same
-    /// pre-Nova root, so this checkpoint's jj parent (`<change>-`) is the baseline
-    /// code state shared by all of them. Used to restore the working copy when
-    /// navigating to a node that precedes every checkpoint on the active branch
-    /// (where `checkpointHead` returns null). Caller owns the returned string.
-    pub fn firstCheckpointChange(self: *Session, gpa: std.mem.Allocator) Error!?[]u8 {
-        const records = try self.entries(gpa); // oldest-first by creation time
-        defer {
-            for (records) |*record| record.deinit(gpa);
-            gpa.free(records);
-        }
-        for (records) |record| {
-            if (std.mem.eql(u8, record.kind, "checkpoint")) {
-                return try checkpointChangeId(gpa, record.payload_json);
-            }
-        }
-        return null;
+    /// The git commit id of the nearest entry at or above the current leaf that
+    /// carries a snapshot (walking leaf→root) — the code state bound to the
+    /// active conversation position. Null when no ancestor has one (a brand-new
+    /// session before any file change). Caller owns the returned string.
+    pub fn snapshotAt(self: *Session, gpa: std.mem.Allocator) Error!?[]u8 {
+        const leaf_id = self.leaf_entry_id orelse return null;
+        var statement = try self.manager.connection.prepare(
+            \\with recursive anc(id, parent_id, snapshot, depth) as (
+            \\  select id, parent_id, snapshot, 0 from session_entries
+            \\    where session_id = ?1 and id = ?2
+            \\  union all
+            \\  select e.id, e.parent_id, e.snapshot, anc.depth + 1
+            \\    from session_entries e join anc on e.id = anc.parent_id
+            \\    where e.session_id = ?1
+            \\)
+            \\select snapshot from anc where snapshot is not null order by depth limit 1
+        );
+        defer statement.finalize();
+        try statement.bindText(1, self.id.slice());
+        try statement.bindText(2, leaf_id.slice());
+        const row = (try statement.step()) orelse return null;
+        if (row.columnType(0) == .null) return null;
+        return try gpa.dupe(u8, row.text(0));
     }
 
     /// Project the active branch into the message list the model sees. The
@@ -465,9 +453,8 @@ pub const Session = struct {
     pub fn entries(self: *Session, gpa: std.mem.Allocator) Error![]EntryRecord {
         // `rowid` breaks created_at_ms ties so "oldest-first" is strictly
         // insertion order — entries written in the same millisecond (tests, fast
-        // turns) keep a deterministic sequence, which `firstCheckpointChange`
-        // and the tree pre-order both rely on.
-        var statement = try self.manager.connection.prepare("select id, parent_id, kind, role, payload_json, created_at_ms from session_entries where session_id = ? order by created_at_ms, rowid");
+        // turns) keep a deterministic sequence, which the tree pre-order relies on.
+        var statement = try self.manager.connection.prepare("select id, parent_id, kind, role, payload_json, created_at_ms, snapshot from session_entries where session_id = ? order by created_at_ms, rowid");
         defer statement.finalize();
         try statement.bindText(1, self.id.slice());
 
@@ -506,7 +493,7 @@ pub const Session = struct {
     }
 
     fn loadEntry(self: *Session, gpa: std.mem.Allocator, entry_id: []const u8) Error!EntryRecord {
-        var statement = try self.manager.connection.prepare("select id, parent_id, kind, role, payload_json, created_at_ms from session_entries where session_id = ? and id = ?");
+        var statement = try self.manager.connection.prepare("select id, parent_id, kind, role, payload_json, created_at_ms, snapshot from session_entries where session_id = ? and id = ?");
         defer statement.finalize();
         try statement.bindText(1, self.id.slice());
         try statement.bindText(2, entry_id);
@@ -529,28 +516,29 @@ pub const SessionWriter = struct {
 
     pub const queue_capacity_default: u32 = 256;
 
-    pub fn initDefault(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) Error!void {
-        return initDefaultWithCapacity(target, gpa, io, cwd, queue_capacity_default);
+    pub fn initDefault(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, cwd: []const u8) Error!void {
+        return initDefaultWithCapacity(target, gpa, io, home_dir, cwd, queue_capacity_default);
     }
 
-    pub fn initResumeDefault(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, session_id: []const u8) Error!void {
-        return initResumeDefaultWithCapacity(target, gpa, io, cwd, session_id, queue_capacity_default);
+    pub fn initResumeDefault(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, session_id: []const u8) Error!void {
+        return initResumeDefaultWithCapacity(target, gpa, io, home_dir, session_id, queue_capacity_default);
     }
 
-    pub fn initDefaultWithCapacity(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, capacity: u32) Error!void {
+    pub fn initDefaultWithCapacity(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, cwd: []const u8, capacity: u32) Error!void {
+        assert(home_dir.len > 0);
         assert(cwd.len > 0);
         assert(capacity > 0);
-        var manager = try SessionManager.initDefault(gpa, io, cwd);
+        var manager = try SessionManager.initDefault(gpa, io, home_dir);
         errdefer manager.deinit();
         const session = try manager.create(cwd, .{});
         try target.initWithSession(gpa, io, manager, session, capacity);
     }
 
-    pub fn initResumeDefaultWithCapacity(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, session_id: []const u8, capacity: u32) Error!void {
-        assert(cwd.len > 0);
+    pub fn initResumeDefaultWithCapacity(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, session_id: []const u8, capacity: u32) Error!void {
+        assert(home_dir.len > 0);
         assert(session_id.len > 0);
         assert(capacity > 0);
-        var manager = try SessionManager.initDefault(gpa, io, cwd);
+        var manager = try SessionManager.initDefault(gpa, io, home_dir);
         errdefer manager.deinit();
         const session = try manager.@"resume"(session_id);
         try target.initWithSession(gpa, io, manager, session, capacity);
@@ -612,30 +600,22 @@ pub const SessionWriter = struct {
         try self.enqueue(.{ .kind = "compaction", .role = null, .payload_json = payload });
     }
 
-    /// Enqueue a per-turn code-state checkpoint for the background writer.
-    /// Mirrors `appendCompaction`: it lands on whatever leaf is current when the
-    /// writer drains it, which is the branch the turn ran on.
-    pub fn appendCheckpoint(self: *SessionWriter, change_id: []const u8) Error!void {
-        assert(change_id.len > 0);
-        const payload = try checkpointToJson(self.gpa, change_id);
-        errdefer self.gpa.free(payload);
-        try self.enqueue(.{ .kind = "checkpoint", .role = null, .payload_json = payload });
-    }
-
-    /// Race-free `Session.checkpointHead`: flushes queued writes so the lookup
-    /// sees any checkpoint the current turn just enqueued, then restarts the
-    /// writer. Caller owns the returned string.
-    pub fn checkpointHead(self: *SessionWriter, gpa: std.mem.Allocator) Error!?[]u8 {
+    /// Bind a git snapshot id to the current leaf entry, race-free. Flushes
+    /// queued writes first so the leaf reflects the entries the turn just wrote,
+    /// then annotates that entry. No-op if the session has no leaf yet.
+    pub fn setLeafSnapshot(self: *SessionWriter, sha: []const u8) Error!void {
         self.quiesce();
         defer self.restart() catch {};
-        return self.session.checkpointHead(gpa);
+        const leaf_id = self.session.leaf() orelse return;
+        return self.session.setSnapshot(leaf_id, sha);
     }
 
-    /// Race-free `Session.firstCheckpointChange`.
-    pub fn firstCheckpointChange(self: *SessionWriter, gpa: std.mem.Allocator) Error!?[]u8 {
+    /// Race-free `Session.snapshotAt`: the git snapshot bound to the active
+    /// conversation position (nearest entry at/above the leaf). Caller owns it.
+    pub fn snapshotAt(self: *SessionWriter, gpa: std.mem.Allocator) Error!?[]u8 {
         self.quiesce();
         defer self.restart() catch {};
-        return self.session.firstCheckpointChange(gpa);
+        return self.session.snapshotAt(gpa);
     }
 
     /// Load the whole session tree, race-free. Stops the background writer so
@@ -782,11 +762,15 @@ pub const EntryRecord = struct {
     role: ?[]u8,
     payload_json: []u8,
     created_at_ms: i64,
+    /// The git snapshot commit bound to this entry (null if none). Drives the
+    /// timeline ✦ marker and code-state restore.
+    snapshot: ?[]u8 = null,
 
     pub fn deinit(self: *EntryRecord, gpa: std.mem.Allocator) void {
         gpa.free(self.kind);
         if (self.role) |role| gpa.free(role);
         gpa.free(self.payload_json);
+        if (self.snapshot) |s| gpa.free(s);
         self.* = undefined;
     }
 };
@@ -800,7 +784,11 @@ fn migrate(connection: *db.Connection, io: std.Io) Error!void {
     try connection.exec("pragma journal_mode = wal");
     try connection.exec("create table if not exists schema_migrations(version integer primary key, applied_at_ms integer not null)");
     try connection.exec("create table if not exists sessions(id text primary key, title text, cwd text not null, created_at_ms integer not null, updated_at_ms integer not null, leaf_entry_id text, foreign key(id, leaf_entry_id) references session_entries(session_id, id))");
-    try connection.exec("create table if not exists session_entries(id text not null, session_id text not null, parent_id text, kind text not null, role text, payload_json text not null, created_at_ms integer not null, primary key(session_id, id), foreign key(session_id) references sessions(id) on delete cascade, foreign key(session_id, parent_id) references session_entries(session_id, id))");
+    try connection.exec("create table if not exists session_entries(id text not null, session_id text not null, parent_id text, kind text not null, role text, payload_json text not null, created_at_ms integer not null, snapshot text, primary key(session_id, id), foreign key(session_id) references sessions(id) on delete cascade, foreign key(session_id, parent_id) references session_entries(session_id, id))");
+    // Upgrade DBs created before the git-shadow model: add the `snapshot` column
+    // (a git commit id binding the entry to its code state). On a fresh DB the
+    // column already exists, so the ALTER fails with "duplicate column" — ignore.
+    connection.exec("alter table session_entries add column snapshot text") catch {};
     try connection.exec("create index if not exists session_entries_parent on session_entries(session_id, parent_id)");
     try connection.exec("create index if not exists session_entries_kind on session_entries(session_id, kind)");
     try connection.exec("create index if not exists session_entries_role on session_entries(session_id, role)");
@@ -813,12 +801,12 @@ fn migrate(connection: *db.Connection, io: std.Io) Error!void {
     try expectDone(&statement);
 }
 
-fn defaultPath(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) Error![]u8 {
-    assert(cwd.len > 0);
-    const dir = try std.fs.path.join(gpa, &.{ cwd, ".nova" });
+fn defaultPath(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) Error![]u8 {
+    assert(home_dir.len > 0);
+    const dir = try std.fs.path.join(gpa, &.{ home_dir, ".nova" });
     defer gpa.free(dir);
     std.Io.Dir.cwd().createDirPath(io, dir) catch return error.Sqlite;
-    return std.fs.path.join(gpa, &.{ cwd, default_db_relative_path });
+    return std.fs.path.join(gpa, &.{ home_dir, default_db_relative_path });
 }
 
 fn expectDone(statement: *db.Statement) Error!void {
@@ -1031,26 +1019,6 @@ fn compactionToJson(gpa: std.mem.Allocator, first_kept_id: []const u8, summary: 
     try std.json.Stringify.value(summary, .{}, &out.writer);
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
-}
-
-fn checkpointToJson(gpa: std.mem.Allocator, change_id: []const u8) Error![]u8 {
-    assert(change_id.len > 0);
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try out.writer.writeAll("{\"change_id\":");
-    try std.json.Stringify.value(change_id, .{}, &out.writer);
-    try out.writer.writeByte('}');
-    return out.toOwnedSlice();
-}
-
-fn checkpointChangeId(gpa: std.mem.Allocator, payload_json: []const u8) Error![]u8 {
-    assert(payload_json.len > 0);
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, payload_json, .{}) catch return error.CorruptPayload;
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.CorruptPayload;
-    const field = parsed.value.object.get("change_id") orelse return error.CorruptPayload;
-    if (field != .string or field.string.len == 0) return error.CorruptPayload;
-    return gpa.dupe(u8, field.string);
 }
 
 fn compactionFirstKeptId(gpa: std.mem.Allocator, payload_json: []const u8) Error![entry_id_len]u8 {
@@ -1290,6 +1258,7 @@ fn readEntry(gpa: std.mem.Allocator, row: *const db.Row) Error!EntryRecord {
         .role = if (row.columnType(3) == .null) null else try gpa.dupe(u8, row.text(3)),
         .payload_json = try gpa.dupe(u8, row.text(4)),
         .created_at_ms = row.int(5),
+        .snapshot = if (row.columnType(6) == .null) null else try gpa.dupe(u8, row.text(6)),
     };
 }
 
@@ -1497,84 +1466,46 @@ test "compaction cut returns null when the budget covers the branch" {
     try std.testing.expect(result == null);
 }
 
-test "checkpoint records a change-id without entering the projected messages" {
+test "snapshotAt reads the nearest ancestor-or-self snapshot, branch-aware" {
     const gpa = std.testing.allocator;
     var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
     defer manager.deinit();
-    var session = try manager.create("/tmp/nova", .{ .id = "1" ** session_id_len });
+    var session = try manager.create("/tmp/nova", .{ .id = "5" ** session_id_len });
 
-    var id_user: [entry_id_len]u8 = undefined;
-    var id_checkpoint: [entry_id_len]u8 = undefined;
-    try appendTextEntry(&session, gpa, .user, "do the thing", &id_user);
-    try session.appendCheckpoint("kxryzmorlvtnpqsw", &id_checkpoint);
+    const sha_a = "a" ** 40;
+    const sha_b = "b" ** 40;
+    var user_id: [entry_id_len]u8 = undefined;
+    var asst_id: [entry_id_len]u8 = undefined;
+    var scratch: [entry_id_len]u8 = undefined;
 
-    const head = (try session.checkpointHead(gpa)) orelse return error.TestFailed;
-    defer gpa.free(head);
-    try std.testing.expectEqualStrings("kxryzmorlvtnpqsw", head);
+    // No entries yet → no snapshot.
+    try std.testing.expect((try session.snapshotAt(gpa)) == null);
 
-    // The checkpoint is metadata: the model still sees only the user message.
-    const messages = try session.messages(gpa);
-    defer {
-        for (messages) |*message| deinitMessage(gpa, message);
-        gpa.free(messages);
+    try appendTextEntry(&session, gpa, .user, "first", &user_id);
+    try session.setSnapshot(user_id[0..], sha_a);
+    try appendTextEntry(&session, gpa, .assistant, "second", &asst_id);
+
+    // a1 carries no snapshot → nearest ancestor (u1) wins.
+    {
+        const got = (try session.snapshotAt(gpa)) orelse return error.TestFailed;
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(sha_a, got);
     }
-    try std.testing.expectEqual(@as(usize, 1), messages.len);
-    try std.testing.expectEqualStrings("do the thing", messages[0].text());
-}
-
-test "checkpointHead returns the nearest checkpoint on the branch" {
-    const gpa = std.testing.allocator;
-    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
-    defer manager.deinit();
-    var session = try manager.create("/tmp/nova", .{ .id = "2" ** session_id_len });
-
-    var scratch: [entry_id_len]u8 = undefined;
-    try appendTextEntry(&session, gpa, .user, "first", &scratch);
-    try session.appendCheckpoint("kkkkkkkk", &scratch);
-    try appendTextEntry(&session, gpa, .assistant, "second", &scratch);
-    try session.appendCheckpoint("llllllll", &scratch);
-
-    const head = (try session.checkpointHead(gpa)) orelse return error.TestFailed;
-    defer gpa.free(head);
-    try std.testing.expectEqualStrings("llllllll", head);
-}
-
-test "checkpointHead is null on a branch with no checkpoint" {
-    const gpa = std.testing.allocator;
-    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
-    defer manager.deinit();
-    var session = try manager.create("/tmp/nova", .{ .id = "3" ** session_id_len });
-
-    var scratch: [entry_id_len]u8 = undefined;
-    try appendTextEntry(&session, gpa, .user, "only a message", &scratch);
-    try std.testing.expect((try session.checkpointHead(gpa)) == null);
-}
-
-test "firstCheckpointChange returns the session baseline across branches" {
-    const gpa = std.testing.allocator;
-    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
-    defer manager.deinit();
-    var session = try manager.create("/tmp/nova", .{ .id = "4" ** session_id_len });
-
-    var first_user: [entry_id_len]u8 = undefined;
-    var scratch: [entry_id_len]u8 = undefined;
-    try appendTextEntry(&session, gpa, .user, "first", &first_user);
-    try session.appendCheckpoint("kkkkkkkk", &scratch); // earliest seal anywhere
-    try appendTextEntry(&session, gpa, .assistant, "second", &scratch);
-    try session.appendCheckpoint("llllllll", &scratch);
-
-    // Fork a second branch off the first user message; its checkpoint is newer.
-    try session.branch(first_user[0..], null, null);
+    // Annotate the assistant entry → self wins.
+    try session.setSnapshot(asst_id[0..], sha_b);
+    {
+        const got = (try session.snapshotAt(gpa)) orelse return error.TestFailed;
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(sha_b, got);
+    }
+    // Fork off u1: the new branch's leaf has no snapshot, so it inherits u1's —
+    // never a1's (which is on the other branch). This is the binding that the
+    // old descendant-checkpoint model got wrong.
+    try session.branch(user_id[0..], null, null);
     try appendTextEntry(&session, gpa, .user, "alt", &scratch);
-    try session.appendCheckpoint("mmmmmmmm", &scratch);
-
-    // Active leaf now sits on the alt branch, whose nearest checkpoint is the
-    // newest one — but the *baseline* is still the first turn's seal.
-    const head = (try session.checkpointHead(gpa)) orelse return error.TestFailed;
-    defer gpa.free(head);
-    try std.testing.expectEqualStrings("mmmmmmmm", head);
-
-    const base = (try session.firstCheckpointChange(gpa)) orelse return error.TestFailed;
-    defer gpa.free(base);
-    try std.testing.expectEqualStrings("kkkkkkkk", base);
+    {
+        const got = (try session.snapshotAt(gpa)) orelse return error.TestFailed;
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(sha_a, got);
+    }
 }

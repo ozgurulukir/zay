@@ -19,6 +19,7 @@ pub const MessageKind = enum {
     tool,
     status,
     notice,
+    success,
 
     fn selectable(self: MessageKind) bool {
         return self != .logo and self != .status;
@@ -26,7 +27,7 @@ pub const MessageKind = enum {
 
     pub fn dimmable(self: MessageKind) bool {
         return switch (self) {
-            .user, .agent, .skill, .thinking, .tool, .notice => true,
+            .user, .agent, .skill, .thinking, .tool, .notice, .success => true,
             .logo, .status => false,
         };
     }
@@ -394,7 +395,7 @@ pub const Transcript = struct {
                 message.expanded = !message.expanded;
                 message.invalidateRowCache();
             },
-            .user, .agent, .logo, .status, .notice => {},
+            .user, .agent, .logo, .status, .notice, .success => {},
         }
     }
 
