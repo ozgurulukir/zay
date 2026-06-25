@@ -64,6 +64,8 @@ transcript_view_height: u16 = 1,
 worker_context: ?agent_worker.Context = null,
 turn_future: ?std.Io.Future(void) = null,
 pending_prompt: ?[]u8 = null,
+permission_selection: agent_worker.ApprovalDecision = .approve,
+permission_scroll: u32 = 0,
 /// The turn-driving handle: enqueue user input, start turns, read messages.
 /// Orthogonal to `engine` — in production it points into the live runtime's
 /// agent, but it's a borrowed handle (never freed here), and it can be present
@@ -107,7 +109,10 @@ pub fn deinit(self: *Thread, gpa: std.mem.Allocator) void {
     for (self.queued.items) |*message| gpa.free(message.text);
     self.queued.deinit(gpa);
     if (self.pending_prompt) |prompt| gpa.free(prompt);
-    if (self.worker_context) |*worker| worker.queue.deinit(worker.io, gpa);
+    if (self.worker_context) |*worker| {
+        worker.approval.deinit(worker.io, gpa);
+        worker.queue.deinit(worker.io, gpa);
+    }
     switch (self.engine) {
         .idle => |*lane| lane.deinit(gpa),
         .live => |*live| {

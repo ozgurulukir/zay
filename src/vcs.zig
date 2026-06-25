@@ -297,10 +297,10 @@ pub fn workingTreeId(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, index_
 /// Nova's, not the user's — unlike `/save`'s real commit).
 pub fn commitTree(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, tree: ObjectId) CmdError!ObjectId {
     const commit_raw = try runOut(gpa, io, dir, &.{
-        "-c", "user.name=nova",
-        "-c", "user.email=nova@local",
+        "-c",          "user.name=nova",
+        "-c",          "user.email=nova@local",
         "commit-tree", tree.slice(),
-        "-m", "nova snapshot",
+        "-m",          "nova snapshot",
     }, null);
     defer gpa.free(commit_raw);
     return ObjectId.parse(commit_raw);

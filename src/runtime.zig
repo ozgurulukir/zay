@@ -157,6 +157,9 @@ pub const AgentRuntime = struct {
         target.agent = agent_mod.Agent.init(gpa, io, cwd, .none);
         errdefer target.agent.deinit();
         target.agent.skills = target.skills;
+        if (config.bash_classifier_url) |url| {
+            target.agent.bash_classifier_url = try gpa.dupe(u8, url);
+        }
         target.agent.attachSessionWriter(&target.session_writer);
         try target.agent.addSystem(owned_system_prompt);
 

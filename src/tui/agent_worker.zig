@@ -50,6 +50,7 @@ pub const Context = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
     queue: EventQueue = .{},
+    approval: ApprovalGate = .{},
     cancel_requested: std.atomic.Value(bool) = .init(false),
     cancel_signaled: std.atomic.Value(bool) = .init(false),
 
@@ -63,6 +64,80 @@ pub const Context = struct {
     }
 };
 
+pub const ApprovalSnapshot = struct {
+    command: []u8,
+    selected: ApprovalDecision,
+};
+
+pub const ApprovalDecision = enum {
+    approve,
+    reject,
+};
+
+const ApprovalGate = struct {
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
+    command: ?[]u8 = null,
+    decision: ?ApprovalDecision = null,
+
+    fn request(self: *ApprovalGate, io: std.Io, gpa: std.mem.Allocator, command: []const u8) !bool {
+        const owned = try gpa.dupe(u8, command);
+        errdefer gpa.free(owned);
+
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        std.debug.assert(self.command == null);
+        self.command = owned;
+        self.decision = null;
+
+        while (self.decision == null) {
+            self.condition.wait(io, &self.mutex) catch |err| {
+                if (self.command) |command_pending| gpa.free(command_pending);
+                self.command = null;
+                self.decision = null;
+                return err;
+            };
+        }
+        const decision = self.decision.?;
+        if (self.command) |command_pending| gpa.free(command_pending);
+        self.command = null;
+        self.decision = null;
+        return decision == .approve;
+    }
+
+    pub fn resolve(self: *ApprovalGate, io: std.Io, decision: ApprovalDecision) !void {
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        if (self.command == null) return;
+        self.decision = decision;
+        self.condition.signal(io);
+    }
+
+    pub fn snapshot(self: *ApprovalGate, io: std.Io, gpa: std.mem.Allocator, selected: ApprovalDecision) std.mem.Allocator.Error!?ApprovalSnapshot {
+        self.mutex.lock(io) catch return null;
+        defer self.mutex.unlock(io);
+        const command = self.command orelse return null;
+        return .{
+            .command = try gpa.dupe(u8, command),
+            .selected = selected,
+        };
+    }
+
+    pub fn pending(self: *ApprovalGate, io: std.Io) bool {
+        self.mutex.lock(io) catch return false;
+        defer self.mutex.unlock(io);
+        return self.command != null;
+    }
+
+    pub fn deinit(self: *ApprovalGate, io: std.Io, gpa: std.mem.Allocator) void {
+        self.mutex.lock(io) catch return;
+        defer self.mutex.unlock(io);
+        if (self.command) |command| gpa.free(command);
+        self.command = null;
+        self.decision = null;
+    }
+};
+
 pub const cancel_message = "Interrupted.";
 
 /// `pending_prompt`, when present, is raw user text owned by `worker_context.gpa`.
@@ -73,6 +148,12 @@ pub const cancel_message = "Interrupted.";
 /// turn's first prompt — used to deliver a queue stranded by a user interrupt as
 /// a fresh turn. The @-mention expansion lands here, off the UI thread.
 pub fn runAgentTurn(agent: *agent_mod.Agent, worker_context: *Context, pending_prompt: ?[]u8, drain_queue_first: bool) void {
+    agent.bash_approval = .{
+        .ptr = worker_context,
+        .request = requestBashApproval,
+    };
+    defer agent.bash_approval = null;
+
     if (drain_queue_first) {
         const flushed = agent.drainAllQueuedToHistory() catch |err| {
             postTurnFailed(worker_context, err);
@@ -109,6 +190,11 @@ pub fn runAgentTurn(agent: *agent_mod.Agent, worker_context: *Context, pending_p
         };
     };
     postAgentEvent(worker_context, .turn_finished) catch {};
+}
+
+fn requestBashApproval(context: *anyopaque, command: []const u8) anyerror!bool {
+    const worker_context: *Context = @ptrCast(@alignCast(context));
+    return worker_context.approval.request(worker_context.io, worker_context.gpa, command);
 }
 
 /// Post a `turn_failed` notice followed by the terminal `turn_finished`, so the

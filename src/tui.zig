@@ -531,6 +531,50 @@ pub const App = struct {
         if (self.blackhole_frame >= blackhole.frame_count) self.blackhole_frame = 0;
     }
 
+    fn permissionPending(self: *App) bool {
+        const worker = if (self.thread.worker_context) |*context| context else return false;
+        return worker.approval.pending(worker.io);
+    }
+
+    fn handlePermissionKey(self: *App, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.left, .{})) {
+            self.thread.permission_selection = .approve;
+            return true;
+        }
+        if (key.matches(vaxis.Key.right, .{})) {
+            self.thread.permission_selection = .reject;
+            return true;
+        }
+        if (key.matches(vaxis.Key.up, .{})) {
+            if (self.thread.permission_scroll > 0) self.thread.permission_scroll -= 1;
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{})) {
+            self.thread.permission_scroll += 1;
+            return true;
+        }
+        if (key.matches(vaxis.Key.enter, .{})) {
+            try self.resolvePermission(self.thread.permission_selection);
+            return true;
+        }
+        if (key.matches('y', .{}) or key.matches('a', .{})) {
+            try self.resolvePermission(.approve);
+            return true;
+        }
+        if (key.matches('n', .{}) or key.matches('r', .{})) {
+            try self.resolvePermission(.reject);
+            return true;
+        }
+        return false;
+    }
+
+    fn resolvePermission(self: *App, decision: agent_worker.ApprovalDecision) !void {
+        const worker = if (self.thread.worker_context) |*context| context else return;
+        try worker.approval.resolve(worker.io, decision);
+        self.thread.permission_scroll = 0;
+        self.thread.permission_selection = .approve;
+    }
+
     pub fn applyAgentEvent(self: *App, event: agent_mod.Agent.Event) !bool {
         const outcome = self.thread.turn.apply(event);
         if (!outcome.project) {
@@ -3039,6 +3083,11 @@ const RootWidget = struct {
                     return;
                 }
                 if (key.matches(vaxis.Key.escape, .{})) {
+                    if (self.app.permissionPending()) {
+                        try self.app.resolvePermission(.reject);
+                        ctx.consumeAndRedraw();
+                        return;
+                    }
                     if (self.app.at_active) {
                         self.app.closeAtSearch();
                         ctx.consumeAndRedraw();
@@ -3085,6 +3134,14 @@ const RootWidget = struct {
                 }
                 // Any other key cancels the pending-quit prompt.
                 self.app.pending_quit_at = null;
+                if (self.app.permissionPending()) {
+                    if (try self.app.handlePermissionKey(key)) {
+                        ctx.consumeAndRedraw();
+                    } else {
+                        ctx.consumeEvent();
+                    }
+                    return;
+                }
                 if (shouldOpenCommandMenuForSlash(self.app, key)) {
                     try self.app.openCommandMenu();
                     try self.syncFocus(ctx);
@@ -3358,11 +3415,13 @@ const RootWidget = struct {
         );
 
         const overlay_visible = self.app.mode != .normal;
-        const at_visible = self.app.at_active and !overlay_visible;
+        const permission_visible = self.app.permissionPending() and !overlay_visible;
+        const at_visible = self.app.at_active and !overlay_visible and !permission_visible;
 
         var child_count: usize = (if (split) self.app.threads.items.len else 1) + 1;
         if (loading_visible) child_count += 1;
         if (overlay_visible) child_count += 1;
+        if (permission_visible) child_count += 1;
         if (at_visible) child_count += 1;
         const children = try ctx.arena.alloc(vxfw.SubSurface, child_count);
         var idx: usize = 0;
@@ -3423,6 +3482,19 @@ const RootWidget = struct {
                     .{ .width = max_width, .height = layout.transcript_height },
                 )),
                 .z_index = 2,
+            };
+            idx += 1;
+        }
+        if (permission_visible) {
+            var permission_view: PermissionWidget = .{ .app = self.app };
+            const panel_height: u16 = @min(@as(u16, 12), @max(@as(u16, 5), layout.input_row));
+            children[idx] = .{
+                .origin = .{ .row = layout.input_row -| panel_height, .col = 0 },
+                .surface = try permission_view.widget().draw(ctx.withConstraints(
+                    .{ .width = max_width, .height = panel_height },
+                    .{ .width = max_width, .height = panel_height },
+                )),
+                .z_index = 3,
             };
             idx += 1;
         }
@@ -3708,6 +3780,103 @@ const RootWidget = struct {
 
 const diff_hint_line1 = "↑↓ Move" ++ symbols.separator_dot_padded ++ "⇧↑↓ Select lines" ++ symbols.separator_dot_padded ++ "^↑↓ Jump file" ++ symbols.separator_dot_padded ++ "^P Find file";
 const diff_hint_line2 = "^W Comment" ++ symbols.separator_dot_padded ++ "^E Edit" ++ symbols.separator_dot_padded ++ "^D Delete" ++ symbols.separator_dot_padded ++ "^S Save & send" ++ symbols.separator_dot_padded ++ "Esc Exit";
+
+const PermissionWidget = struct {
+    app: *App,
+
+    fn widget(self: *PermissionWidget) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = draw };
+    }
+
+    fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *PermissionWidget = @ptrCast(@alignCast(ptr));
+        const app = self.app;
+        const worker = if (app.thread.worker_context) |*context| context else {
+            return vxfw.Surface.init(ctx.arena, self.widget(), .{
+                .width = ctx.max.width orelse 0,
+                .height = ctx.max.height orelse 0,
+            });
+        };
+        const snapshot = try worker.approval.snapshot(worker.io, ctx.arena, app.thread.permission_selection) orelse {
+            return vxfw.Surface.init(ctx.arena, self.widget(), .{
+                .width = ctx.max.width orelse 0,
+                .height = ctx.max.height orelse 0,
+            });
+        };
+
+        const width = ctx.max.width orelse 0;
+        const height = ctx.max.height orelse 0;
+        const surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = width, .height = height });
+        if (width == 0 or height == 0) return surface;
+
+        const inner = try ctx.arena.create(PermissionInner);
+        inner.* = .{ .snapshot = snapshot, .scroll = app.thread.permission_scroll };
+        var border: vxfw.Border = .{
+            .child = inner.widget(),
+            .labels = &.{.{ .text = "Unsafe bash command", .alignment = .top_left }},
+            .style = StylePalette.border_label,
+        };
+        return border.widget().draw(ctx);
+    }
+};
+
+const PermissionInner = struct {
+    snapshot: agent_worker.ApprovalSnapshot,
+    scroll: u32,
+
+    fn widget(self: *PermissionInner) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = draw };
+    }
+
+    fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *PermissionInner = @ptrCast(@alignCast(ptr));
+        const width = ctx.max.width orelse 0;
+        const height = ctx.max.height orelse 0;
+        var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = width, .height = height });
+        if (width == 0 or height == 0) return surface;
+
+        panel.lineStyledAt(&surface, 0, "Review before running", ctx, 1, StylePalette.panel_header) catch {};
+        const body_rows = height -| 3;
+        drawPermissionCommand(&surface, ctx, self.snapshot.command, self.scroll, body_rows);
+        drawPermissionActions(&surface, ctx, height -| 1, self.snapshot.selected);
+        return surface;
+    }
+};
+
+fn drawPermissionCommand(surface: *vxfw.Surface, ctx: vxfw.DrawContext, command: []const u8, scroll: u32, rows: u16) void {
+    if (rows == 0) return;
+    var line_index: u32 = 0;
+    var drawn: u16 = 0;
+    var iterator = std.mem.splitScalar(u8, command, '\n');
+    while (iterator.next()) |line| {
+        if (line_index < scroll) {
+            line_index += 1;
+            continue;
+        }
+        if (drawn >= rows) return;
+        panel.lineStyledAt(surface, 1 + drawn, line, ctx, 1, StylePalette.thinking_body) catch {};
+        drawn += 1;
+        line_index += 1;
+    }
+}
+
+fn drawPermissionActions(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, selected: agent_worker.ApprovalDecision) void {
+    if (row >= surface.size.height) return;
+    const approve_selected = selected == .approve;
+    const reject_selected = selected == .reject;
+    panel.lineStyledAt(surface, row, actionLabel(ctx, "Approve", approve_selected), ctx, 1, permissionActionStyle(approve_selected)) catch {};
+    panel.lineStyledAt(surface, row, actionLabel(ctx, "Reject", reject_selected), ctx, 13, permissionActionStyle(reject_selected)) catch {};
+}
+
+fn actionLabel(ctx: vxfw.DrawContext, text: []const u8, selected: bool) []const u8 {
+    if (selected) return std.fmt.allocPrint(ctx.arena, "[ {s} ]", .{text}) catch text;
+    return std.fmt.allocPrint(ctx.arena, "  {s}  ", .{text}) catch text;
+}
+
+fn permissionActionStyle(selected: bool) vaxis.Style {
+    if (selected) return StylePalette.selected_item;
+    return StylePalette.thinking_body;
+}
 
 // Left-margin columns: [0..3] line number, [4] diff sign, [5] comment bracket,
 // [6..] content.

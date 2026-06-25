@@ -4,7 +4,8 @@
 //!   2. global  `<home>/.nova/config.json`
 //!   3. project `<cwd>/.nova/config.json`
 //!   4. env vars: OPENAI_BASE_URL, OPENAI_API_KEY, OPENAI_MODEL,
-//!                NOVA_USE_RESPONSES_ENDPOINT, NOVA_ENABLE_THINKING
+//!                NOVA_USE_RESPONSES_ENDPOINT, NOVA_ENABLE_THINKING,
+//!                NOVA_BASH_CLASSIFIER_URL
 //!
 //! `model` is a `<provider>/<model-id>` selection string. Model-specific
 //! fields such as `reasoningEffort` live under `providers.<provider>.models`.
@@ -203,6 +204,7 @@ pub const Config = struct {
     provider: ?Provider = null,
     base_url: ?[]u8 = null,
     api_key: ?[]u8 = null,
+    bash_classifier_url: ?[]u8 = null,
     model: ?Model = null,
     providers: []ProviderConfig = &.{},
     use_responses_endpoint: ?bool = null,
@@ -212,6 +214,7 @@ pub const Config = struct {
     pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
         if (self.base_url) |s| gpa.free(s);
         if (self.api_key) |s| gpa.free(s);
+        if (self.bash_classifier_url) |s| gpa.free(s);
         if (self.model) |*m| m.deinit(gpa);
         for (self.providers) |*provider| provider.deinit(gpa);
         if (self.providers.len > 0) gpa.free(self.providers);
@@ -228,6 +231,7 @@ pub const Config = struct {
         errdefer out.deinit(gpa);
         if (self.base_url) |s| out.base_url = try gpa.dupe(u8, s);
         if (self.api_key) |s| out.api_key = try gpa.dupe(u8, s);
+        if (self.bash_classifier_url) |s| out.bash_classifier_url = try gpa.dupe(u8, s);
         if (self.model) |m| out.model = try m.clone(gpa);
         out.providers = try gpa.alloc(ProviderConfig, self.providers.len);
         for (self.providers, 0..) |provider, index| out.providers[index] = try provider.clone(gpa);
@@ -360,6 +364,7 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
     if (updates.enable_thinking) |v| target.enable_thinking = v;
     if (updates.base_url) |s| try replaceOptionalSlice(gpa, &target.base_url, s);
     if (updates.api_key) |s| try replaceOptionalSlice(gpa, &target.api_key, s);
+    if (updates.bash_classifier_url) |s| try replaceOptionalSlice(gpa, &target.bash_classifier_url, s);
     if (updates.system_prompt) |s| try replaceOptionalSlice(gpa, &target.system_prompt, s);
     for (updates.providers) |provider| try applyProviderOverlay(gpa, target, provider);
     if (updates.model) |m| {
@@ -581,6 +586,9 @@ fn loadEnv(
 
     if (env.get("OPENAI_BASE_URL")) |s| out.base_url = try gpa.dupe(u8, s);
     if (env.get("OPENAI_API_KEY")) |s| out.api_key = try gpa.dupe(u8, s);
+    if (env.get("NOVA_BASH_CLASSIFIER_URL")) |s| {
+        if (s.len > 0) out.bash_classifier_url = try gpa.dupe(u8, s);
+    }
     if (env.get("NOVA_USE_RESPONSES_ENDPOINT")) |s| {
         out.use_responses_endpoint = parseBool(s);
     }

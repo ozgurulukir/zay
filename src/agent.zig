@@ -116,6 +116,10 @@ pub const Agent = struct {
     /// Dedicated client for background summarization, distinct from `client` so
     /// the two never share a connection. `.none` disables compaction.
     compaction_client: ai.LanguageModel = .none,
+    /// Optional local classifier endpoint for bash approval gating.
+    bash_classifier_url: ?[]const u8 = null,
+    /// Optional synchronous approval hook used by the TUI worker.
+    bash_approval: ?BashApproval = null,
     /// Background summarizer state machine.
     compactor: Compactor = .{},
     message_queue: MessageQueue = .{},
@@ -163,6 +167,7 @@ pub const Agent = struct {
         }
         self.message_queue_mutex.unlock();
         if (self.snapshot_index) |path| self.gpa.free(path);
+        if (self.bash_classifier_url) |url| self.gpa.free(url);
         self.* = undefined;
     }
 
@@ -423,11 +428,17 @@ pub const Agent = struct {
             .listener = listener,
             .stream_context = stream_context,
         };
-        var executor = executor_mod.ExecutorService.init(self.gpa, self.io, self.cwd);
+        var executor = executor_mod.ExecutorService.init(.{
+            .gpa = self.gpa,
+            .io = self.io,
+            .cwd = self.cwd,
+            .bash_classifier_url = self.bash_classifier_url,
+        });
         const results = try executor.runAll(tool_batch.calls, .{
             .ptr = &bridge,
             .on_started = ExecutorBridge.onStarted,
             .on_finished = ExecutorBridge.onFinished,
+            .approve_unsafe_bash = ExecutorBridge.approveUnsafeBash,
         });
         defer self.gpa.free(results);
         errdefer for (results) |*r| r.deinit(self.gpa);
@@ -506,6 +517,13 @@ pub const Agent = struct {
                 result.failed,
             );
             self.tool_index += 1;
+        }
+
+        fn approveUnsafeBash(ptr: *anyopaque, call: ai.ToolCall, command: []const u8) anyerror!bool {
+            _ = call;
+            const self: *ExecutorBridge = @ptrCast(@alignCast(ptr));
+            const approval = self.agent.bash_approval orelse return true;
+            return approval.request(approval.ptr, command);
         }
     };
 
@@ -895,6 +913,11 @@ pub const Agent = struct {
         }
         return total;
     }
+};
+
+pub const BashApproval = struct {
+    ptr: *anyopaque,
+    request: *const fn (*anyopaque, []const u8) anyerror!bool,
 };
 
 /// Parse just the `command` field of bash's argument JSON. The TUI uses

@@ -3,6 +3,7 @@
 const std = @import("std");
 
 const ai = @import("ai.zig");
+const bash_safety = @import("bash_safety.zig");
 const tools = @import("tools.zig");
 
 const assert = std.debug.assert;
@@ -51,25 +52,44 @@ pub const ToolCallObserver = struct {
     ptr: *anyopaque,
     on_started: *const fn (*anyopaque, ai.ToolCall) anyerror!void,
     on_finished: *const fn (*anyopaque, *const ToolResult) anyerror!void,
+    approve_unsafe_bash: *const fn (*anyopaque, ai.ToolCall, []const u8) anyerror!bool,
 
     pub const noop: ToolCallObserver = .{
         .ptr = undefined,
         .on_started = noopStarted,
         .on_finished = noopFinished,
+        .approve_unsafe_bash = noopApproveUnsafeBash,
     };
 
     pub fn noopStarted(_: *anyopaque, _: ai.ToolCall) anyerror!void {}
     pub fn noopFinished(_: *anyopaque, _: *const ToolResult) anyerror!void {}
+    pub fn noopApproveUnsafeBash(_: *anyopaque, _: ai.ToolCall, _: []const u8) anyerror!bool {
+        return true;
+    }
 };
 
 pub const ExecutorService = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
+    bash_classifier_url: ?[]const u8 = null,
 
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) ExecutorService {
-        assert(cwd.len > 0);
-        return .{ .gpa = gpa, .io = io, .cwd = cwd };
+    pub const InitOptions = struct {
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        cwd: []const u8,
+        bash_classifier_url: ?[]const u8 = null,
+    };
+
+    pub fn init(options: InitOptions) ExecutorService {
+        assert(options.cwd.len > 0);
+        if (options.bash_classifier_url) |url| assert(url.len > 0);
+        return .{
+            .gpa = options.gpa,
+            .io = options.io,
+            .cwd = options.cwd,
+            .bash_classifier_url = options.bash_classifier_url,
+        };
     }
 
     /// Run a batch of ToolCalls. For each call:
@@ -92,11 +112,26 @@ pub const ExecutorService = struct {
         }
         for (calls, 0..) |call, i| {
             try observer.on_started(observer.ptr, call);
-            results[i] = try self.runOne(call);
+            if (try self.shouldRejectUnsafeBash(call, observer)) {
+                results[i] = try self.runRejected(call);
+            } else {
+                results[i] = try self.runOne(call);
+            }
             initialized = i + 1;
             try observer.on_finished(observer.ptr, &results[i]);
         }
         return results;
+    }
+
+    fn shouldRejectUnsafeBash(self: *ExecutorService, call: ai.ToolCall, observer: ToolCallObserver) !bool {
+        const url = self.bash_classifier_url orelse return false;
+        if (!std.mem.eql(u8, call.name, "bash")) return false;
+        const command = bash_safety.commandFromArguments(self.gpa, call.arguments) catch return false;
+        defer self.gpa.free(command);
+        const verdict = bash_safety.classify(self.gpa, self.io, url, self.cwd, command);
+        if (verdict != .unsafe) return false;
+        const approved = try observer.approve_unsafe_bash(observer.ptr, call, command);
+        return !approved;
     }
 
     fn runOne(self: *ExecutorService, call: ai.ToolCall) !ToolResult {
@@ -152,6 +187,29 @@ pub const ExecutorService = struct {
             .failed = true,
         };
     }
+
+    fn runRejected(self: *ExecutorService, call: ai.ToolCall) !ToolResult {
+        const message = "The tool call was rejected by the user for being unsafe. Try something else.";
+        const call_id = try self.gpa.dupe(u8, call.call_id);
+        errdefer self.gpa.free(call_id);
+        const name = try self.gpa.dupe(u8, call.name);
+        errdefer self.gpa.free(name);
+        var display = try makeDisplay(self.gpa, call.name, call.arguments);
+        errdefer display.deinit(self.gpa);
+        const content = try self.gpa.dupe(u8, message);
+        errdefer self.gpa.free(content);
+        const display_body = try self.gpa.dupe(u8, message);
+        return .{
+            .call_id = call_id,
+            .content = content,
+            .name = name,
+            .display_label = display.label,
+            .display_expanded_label = display.expanded_label,
+            .display_body = display_body,
+            .stderr = null,
+            .failed = true,
+        };
+    }
 };
 
 /// The LLM-facing observation: stdout if non-empty, else stderr if
@@ -193,7 +251,7 @@ test "ExecutorService runs bash and returns both channels" {
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
-    var executor = ExecutorService.init(gpa, std.testing.io, cwd);
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = cwd });
 
     const calls = [_]ai.ToolCall{
         .{
@@ -223,7 +281,7 @@ test "ExecutorService runs bash and returns both channels" {
 
 test "executor converts a tool execution error into a failed result" {
     const gpa = std.testing.allocator;
-    var executor = ExecutorService.init(gpa, std.testing.io, "/tmp");
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp" });
     const call: ai.ToolCall = .{
         .call_id = try gpa.dupe(u8, "call_x"),
         .name = try gpa.dupe(u8, "bash"),
@@ -242,4 +300,25 @@ test "executor converts a tool execution error into a failed result" {
     try std.testing.expectEqualStrings("search", result.display_label);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "failed to execute") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "Unexpected") != null);
+}
+
+test "executor rejected bash result is failed and model-facing" {
+    const gpa = std.testing.allocator;
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp" });
+    const call: ai.ToolCall = .{
+        .call_id = try gpa.dupe(u8, "call_reject"),
+        .name = try gpa.dupe(u8, "bash"),
+        .arguments = try gpa.dupe(u8, "{\"command\":\"rm -rf /\",\"reason\":\"clean\"}"),
+    };
+    defer {
+        gpa.free(call.call_id);
+        gpa.free(call.name);
+        gpa.free(call.arguments);
+    }
+
+    var result = try executor.runRejected(call);
+    defer result.deinit(gpa);
+    try std.testing.expect(result.failed);
+    try std.testing.expectEqualStrings("The tool call was rejected by the user for being unsafe. Try something else.", result.content);
+    try std.testing.expectEqualStrings(result.content, result.display_body);
 }
