@@ -4,7 +4,7 @@ import argparse
 import os
 import time
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypedDict
 
 import numpy as np
 import onnxruntime as ort
@@ -12,6 +12,21 @@ import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from transformers import AutoTokenizer
+
+
+type ProviderName = Literal[
+    "CUDAExecutionProvider",
+    "CPUExecutionProvider",
+]
+
+
+class CoreMLProviderOptions(TypedDict):
+    MLComputeUnits: Literal["CPUAndGPU"]
+    ModelCacheDirectory: str
+
+
+type CoreMLProvider = tuple[Literal["CoreMLExecutionProvider"], CoreMLProviderOptions]
+type Provider = ProviderName | CoreMLProvider
 
 
 class ClassifyRequest(BaseModel):
@@ -30,15 +45,8 @@ class Classifier:
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
         self.max_length = max_length
 
-        options = ort.SessionOptions()
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        options.intra_op_num_threads = min(4, max(1, os.cpu_count() or 1))
-        options.inter_op_num_threads = 1
-        self.session = ort.InferenceSession(
-            onnx_path,
-            sess_options=options,
-            providers=["CPUExecutionProvider"],
-        )
+        self.session = create_session(onnx_path)
+        self.provider = self.session.get_providers()[0]
         self.input_names = {item.name for item in self.session.get_inputs()}
         self.warm()
 
@@ -75,6 +83,54 @@ def softmax(values: np.ndarray) -> np.ndarray:
     return exp / np.sum(exp)
 
 
+def create_session(onnx_path: Path) -> ort.InferenceSession:
+    providers = preferred_providers(ort.get_available_providers(), onnx_path)
+    try:
+        return create_session_with_providers(onnx_path, providers)
+    except Exception:
+        if providers == ["CPUExecutionProvider"]:
+            raise
+        return create_session_with_providers(onnx_path, ["CPUExecutionProvider"])
+
+
+def create_session_with_providers(
+    onnx_path: Path,
+    providers: list[Provider],
+) -> ort.InferenceSession:
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    options.intra_op_num_threads = min(4, max(1, os.cpu_count() or 1))
+    options.inter_op_num_threads = 1
+    return ort.InferenceSession(
+        onnx_path,
+        sess_options=options,
+        providers=providers,
+    )
+
+
+def preferred_providers(available: list[str], onnx_path: Path) -> list[Provider]:
+    providers: list[Provider] = []
+    if "CUDAExecutionProvider" in available:
+        providers.append("CUDAExecutionProvider")
+    if "CoreMLExecutionProvider" in available:
+        providers.append(coreml_provider(onnx_path))
+    if "CPUExecutionProvider" not in providers:
+        providers.append("CPUExecutionProvider")
+    return providers
+
+
+def coreml_provider(onnx_path: Path) -> CoreMLProvider:
+    cache_dir = onnx_path.parent / ".onnxruntime-coreml-cache"
+    cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return (
+        "CoreMLExecutionProvider",
+        {
+            "MLComputeUnits": "CPUAndGPU",
+            "ModelCacheDirectory": str(cache_dir),
+        },
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve the bash classifier locally.")
     parser.add_argument("--model-dir", default="ModernBERT-bash-classifier")
@@ -90,7 +146,7 @@ def build_app(classifier: Classifier) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {"status": "ok"}
+        return {"status": "ok", "provider": classifier.provider}
 
     @app.post("/classify")
     def classify(request: ClassifyRequest) -> ClassifyResponse:
