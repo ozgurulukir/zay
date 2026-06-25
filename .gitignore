@@ -6,3 +6,9 @@ zig-pkg/
 
 third_party/
 .nova/
+
+.venv
+__pycache__
+
+## Models
+ModernBERT-bash-classifier/
