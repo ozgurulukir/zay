@@ -28,6 +28,7 @@ const at_search = @import("tui/widgets/at_search.zig");
 const command_panel = @import("tui/widgets/command_panel.zig");
 const diff_viewer = @import("tui/diff_viewer.zig");
 const model_loader = @import("tui/model_loader.zig");
+const connectivity = @import("tui/connectivity.zig");
 const model_cache = @import("tui/model_cache.zig");
 const model_picker = @import("tui/widgets/model_picker.zig");
 const provider_picker = @import("tui/widgets/provider_picker.zig");
@@ -156,6 +157,15 @@ pub const App = struct {
     /// Inline edit buffer for the provider setup form's API-key field. Owned;
     /// freed in `deinit`.
     provider_key_input: std.ArrayList(u8) = .empty,
+    /// Live connectivity per catalogue provider, indexed by `catalogueProviders()`
+    /// order. A stored key proves only that a key was entered, not that it still
+    /// works, so these are refreshed by background `/models` probes (on startup
+    /// and whenever the picker opens). Drives the picker badge: only `.connected`
+    /// shows [CONNECTED]. `conn_done`/`conn_future` are the per-slot non-blocking
+    /// handles, mirroring the model-load/diff-refresh job pattern.
+    conn_status: [catalogue_provider_count]connectivity.Status = @splat(.unknown),
+    conn_future: [catalogue_provider_count]?std.Io.Future(connectivity.Outcome) = @splat(null),
+    conn_done: [catalogue_provider_count]std.atomic.Value(bool) = @splat(.init(false)),
     cached_config: config_mod.Config = .{},
     cached_config_owned: bool = false,
     retired_transcripts: std.ArrayList(transcript_mod.Transcript) = .empty,
@@ -215,6 +225,7 @@ pub const App = struct {
     const CheckpointState = enum { unknown, ready, unavailable };
     const ModelSource = model_loader.ModelSource;
     const ModelScope = model_catalogue.ModelScope;
+    const catalogue_provider_count = config_mod.catalogueProviders().len;
 
     pub fn init(io: std.Io, gpa: std.mem.Allocator, agent: *agent_mod.Agent) !App {
         const primary = try gpa.create(Thread);
@@ -281,6 +292,7 @@ pub const App = struct {
         // Cancel the in-flight load first (it needs `io`), then free the
         // catalogue's owned lists + error in one pass.
         self.cancelModelLoad();
+        self.cancelConnectivityChecks();
         for (self.retired_transcripts.items) |*transcript| transcript.deinit(self.gpa);
         self.retired_transcripts.deinit(self.gpa);
         self.resumeClear();
@@ -1008,6 +1020,9 @@ pub const App = struct {
         self.clearInput();
         self.clearPaletteInput();
         try self.refreshProviderApiKeys();
+        // Re-probe so the badges reflect connectivity as of now, not whatever the
+        // startup check found (a key may have expired or come back since).
+        self.startConnectivityChecks();
     }
 
     /// Reload the cached provider API keys from `~/.nova/auth.json`. Drives the
@@ -1019,6 +1034,93 @@ pub const App = struct {
         codex.freeApiKeyMap(self.gpa, &self.provider_api_keys);
         self.provider_api_keys = fresh;
         fresh = .empty;
+    }
+
+    /// Kick off a background `/models` probe for every catalogue provider so the
+    /// picker badges reflect live connectivity rather than mere key presence.
+    /// Non-blocking: each probe runs on its own worker and lands via the tick
+    /// loop's `drainConnectivityChecks`. Safe to call repeatedly — each slot's
+    /// in-flight probe is cancelled and restarted. Relies on `provider_api_keys`
+    /// already being loaded.
+    fn startConnectivityChecks(self: *App) void {
+        for (config_mod.catalogueProviders(), 0..) |provider, index| {
+            self.startConnectivityCheck(provider, index) catch {};
+        }
+    }
+
+    fn startConnectivityCheck(self: *App, provider: config_mod.Provider, index: usize) !void {
+        self.cancelConnectivityCheck(index);
+
+        const base_url = provider.defaultBaseUrl() orelse {
+            self.conn_status[index] = .unknown;
+            return;
+        };
+        // Stored key wins; otherwise an anonymous-tier provider (OpenCode Zen)
+        // is probed via its sentinel. No credentials at all => nothing to check.
+        const key = self.provider_api_keys.get(provider.label()) orelse anon: {
+            break :anon provider.anonymousApiKey() orelse {
+                self.conn_status[index] = .unknown;
+                return;
+            };
+        };
+
+        const job = try self.gpa.create(connectivity.Job);
+        errdefer self.gpa.destroy(job);
+        const base_url_owned = try self.gpa.dupe(u8, base_url);
+        errdefer self.gpa.free(base_url_owned);
+        const api_key_owned = try self.gpa.dupe(u8, key);
+        errdefer self.gpa.free(api_key_owned);
+        job.* = .{
+            .gpa = self.gpa,
+            .io = self.io,
+            .base_url = base_url_owned,
+            .api_key = api_key_owned,
+            .done = &self.conn_done[index],
+        };
+
+        self.conn_done[index].store(false, .release);
+        self.conn_status[index] = .checking;
+        self.conn_future[index] = try self.io.concurrent(connectivity.run, .{job});
+    }
+
+    fn cancelConnectivityCheck(self: *App, index: usize) void {
+        if (self.conn_future[index]) |*future| {
+            _ = future.cancel(self.io);
+            self.conn_future[index] = null;
+        }
+        self.conn_done[index].store(false, .release);
+    }
+
+    fn cancelConnectivityChecks(self: *App) void {
+        for (0..catalogue_provider_count) |index| self.cancelConnectivityCheck(index);
+    }
+
+    fn connectivityChecksInFlight(self: *const App) bool {
+        for (self.conn_future) |slot| {
+            if (slot != null) return true;
+        }
+        return false;
+    }
+
+    /// Called from the tick handler. Polls each slot's non-blocking `done` flag
+    /// and only `await`s the ones that have finished, folding the outcome into
+    /// `conn_status`. Returns true when a badge changed (redraw needed).
+    fn drainConnectivityChecks(self: *App) bool {
+        var changed = false;
+        for (&self.conn_future, 0..) |*slot, index| {
+            if (slot.* == null) continue;
+            if (!self.conn_done[index].load(.acquire)) continue;
+
+            const outcome = slot.*.?.await(self.io);
+            slot.* = null;
+            self.conn_done[index].store(false, .release);
+            self.conn_status[index] = switch (outcome) {
+                .connected => .connected,
+                .failed => .failed,
+            };
+            changed = true;
+        }
+        return changed;
     }
 
     fn openProviderForm(self: *App, provider: config_mod.Provider) void {
@@ -1410,6 +1512,14 @@ pub const App = struct {
             codex.removeProviderApiKey(self.gpa, self.io, home, provider.label()) catch {};
         }
         try self.refreshProviderApiKeys();
+        // Re-probe this provider so its picker badge reflects the key just saved
+        // (or cleared) instead of the pre-edit connectivity.
+        for (config_mod.catalogueProviders(), 0..) |catalogue_provider, index| {
+            if (catalogue_provider == provider) {
+                self.startConnectivityCheck(provider, index) catch {};
+                break;
+            }
+        }
 
         // With no key, connect via the provider's anonymous sentinel (e.g.
         // OpenCode Zen's `public`, which the gateway limits to free models).
@@ -2954,6 +3064,7 @@ const RootWidget = struct {
                 // Warm the diff cache in the background so the first `/diff`
                 // opens instantly instead of cold-loading.
                 self.app.scheduleDiffRefresh() catch {};
+                self.app.startConnectivityChecks();
                 ctx.consumeAndRedraw();
             },
             .mouse => |mouse| {
@@ -3114,6 +3225,7 @@ const RootWidget = struct {
         var visible_change = try self.drainAgentEvents(ctx);
         if (try self.app.drainModelLoad()) visible_change = true;
         if (try self.app.drainDiffRefresh()) visible_change = true;
+        if (self.app.drainConnectivityChecks()) visible_change = true;
 
         if (self.app.thread.turn_view.awaitingOutput() or self.app.thread.transcript.hasRunningTool()) {
             self.spinner_tick_accum += drain_tick_ms;
@@ -3157,6 +3269,7 @@ const RootWidget = struct {
         const should_tick = self.app.anyTurnActive() or
             model_loading or
             diff_loading or
+            self.app.connectivityChecksInFlight() or
             self.app.blackhole_visible or
             self.diff_refresh_pending;
         if (should_tick) {
@@ -4546,15 +4659,12 @@ const OverlayInner = struct {
     }
 
     fn drawProviderContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const providers = config_mod.catalogueProviders();
-        const connected = try ctx.arena.alloc(bool, providers.len);
-        for (providers, 0..) |provider, i| {
-            connected[i] = app.provider_api_keys.get(provider.label()) != null;
-        }
         var content: provider_picker.Content = .{
             .state = app.provider_picker,
             .codex_signed_in = app.isCodexSignedIn(),
-            .connected = connected,
+            // `conn_status` is indexed by `catalogueProviders()` order, exactly
+            // how the picker iterates its rows.
+            .statuses = &app.conn_status,
             .key_input = app.provider_key_input.items,
         };
         return content.widget().draw(ctx);

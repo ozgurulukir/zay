@@ -6,6 +6,7 @@ const panel = @import("panel.zig");
 const message = @import("message.zig");
 const tui_style = @import("../style.zig");
 const config_mod = @import("../../config.zig");
+const connectivity = @import("../connectivity.zig");
 
 const StylePalette = tui_style.Palette;
 
@@ -78,7 +79,7 @@ pub const State = struct {
 pub const Content = struct {
     state: State,
     codex_signed_in: bool,
-    connected: []const bool,
+    statuses: []const connectivity.Status,
     key_input: []const u8 = "",
 
     pub fn widget(self: *Content) vxfw.Widget {
@@ -107,12 +108,34 @@ pub const Content = struct {
             const prefix = "  ";
             const base = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, provider.displayName() });
             try panel.commandLine(surface, row, base, ctx, focused);
-            if (index < self.connected.len and self.connected[index]) {
-                const badge_col: u16 = (message.ConversationLayout.left -| 1) +
-                    @as(u16, @intCast(@min(ctx.stringWidth(base), @as(usize, std.math.maxInt(u16)))));
-                try panel.lineStyledAt(surface, row, " [CONNECTED]", ctx, badge_col, tui_style.onSelectionBg(StylePalette.success, focused));
-            }
+            const status = if (index < self.statuses.len) self.statuses[index] else .unknown;
+            try drawBadge(surface, ctx, row, base, status, focused);
         }
+    }
+
+    fn drawBadge(
+        surface: *vxfw.Surface,
+        ctx: vxfw.DrawContext,
+        row: u16,
+        base: []const u8,
+        status: connectivity.Status,
+        focused: bool,
+    ) !void {
+        const text: []const u8 = switch (status) {
+            .connected => " [CONNECTED]",
+            .checking => " [CHECKING]",
+            .failed => " [DISCONNECTED]",
+            .unknown => return,
+        };
+        const style: vaxis.Style = switch (status) {
+            .connected => StylePalette.success,
+            .checking => StylePalette.thinking_body,
+            .failed => StylePalette.tool_failed,
+            .unknown => unreachable,
+        };
+        const badge_col: u16 = (message.ConversationLayout.left -| 1) +
+            @as(u16, @intCast(@min(ctx.stringWidth(base), @as(usize, std.math.maxInt(u16)))));
+        try panel.lineStyledAt(surface, row, text, ctx, badge_col, tui_style.onSelectionBg(style, focused));
     }
 
     fn drawCodex(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
@@ -188,7 +211,7 @@ test "provider picker keeps codex text visible when sign out is focused" {
     var content: Content = .{
         .state = .{ .selection = 0, .column = .sign_out },
         .codex_signed_in = true,
-        .connected = &.{},
+        .statuses = &.{},
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -209,7 +232,7 @@ test "provider picker keeps sign out on the selected row background" {
     var content: Content = .{
         .state = .{ .selection = 0, .column = .provider },
         .codex_signed_in = true,
-        .connected = &.{},
+        .statuses = &.{},
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -233,6 +256,52 @@ test "provider picker selecting a catalogue row opens its form" {
     try std.testing.expect(action == .open_form);
     try std.testing.expectEqual(config_mod.catalogueProviders()[0], action.open_form);
     try std.testing.expectEqual(config_mod.catalogueProviders()[0], state.selectedProvider().?);
+}
+
+fn rowText(arena: std.mem.Allocator, surface: vxfw.Surface, row: u16) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var col: u16 = 0;
+    while (col < surface.size.width) : (col += 1) {
+        try out.appendSlice(arena, surface.readCell(col, row).char.grapheme);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+test "provider picker badge reflects connectivity status, not key presence" {
+    const count = comptime config_mod.catalogueProviders().len;
+    var statuses: [count]connectivity.Status = @splat(.unknown);
+    statuses[0] = .connected;
+    statuses[1] = .failed;
+    statuses[2] = .checking;
+
+    var content: Content = .{
+        .state = .{},
+        .codex_signed_in = false,
+        .statuses = &statuses,
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = @intCast(rowCount() + 1) },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try content.widget().draw(ctx);
+
+    // Rows are 1-based: row 1 is the first catalogue provider.
+    const connected_row = try rowText(arena.allocator(), surface, 1);
+    try std.testing.expect(std.mem.indexOf(u8, connected_row, "[CONNECTED]") != null);
+
+    const failed_row = try rowText(arena.allocator(), surface, 2);
+    try std.testing.expect(std.mem.indexOf(u8, failed_row, "[DISCONNECTED]") != null);
+
+    const checking_row = try rowText(arena.allocator(), surface, 3);
+    try std.testing.expect(std.mem.indexOf(u8, checking_row, "[CHECKING]") != null);
+
+    // An unprobed provider (no credentials) shows no badge at all.
+    const unknown_row = try rowText(arena.allocator(), surface, 4);
+    try std.testing.expect(std.mem.indexOf(u8, unknown_row, "[") == null);
 }
 
 test "provider picker form stage defers keys to the input field" {
