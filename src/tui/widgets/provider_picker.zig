@@ -6,11 +6,16 @@ const panel = @import("panel.zig");
 const message = @import("message.zig");
 const tui_style = @import("../style.zig");
 const config_mod = @import("../../config.zig");
-const connectivity = @import("../connectivity.zig");
 
 const StylePalette = tui_style.Palette;
 
 const assert = std.debug.assert;
+
+/// Per-provider connection state shown as the row badge. Derived from the model
+/// load's per-provider outcome (see `model_loader.ProviderOutcome`): `connected`
+/// when the provider returned at least one usable model, `failed` when it was
+/// configured but returned none / errored, `unknown` when not configured.
+pub const Status = enum { unknown, connected, failed };
 
 pub const Stage = enum { list, form };
 pub const Column = enum { provider, sign_out };
@@ -79,7 +84,7 @@ pub const State = struct {
 pub const Content = struct {
     state: State,
     codex_signed_in: bool,
-    statuses: []const connectivity.Status,
+    statuses: []const Status,
     key_input: []const u8 = "",
 
     pub fn widget(self: *Content) vxfw.Widget {
@@ -118,18 +123,16 @@ pub const Content = struct {
         ctx: vxfw.DrawContext,
         row: u16,
         base: []const u8,
-        status: connectivity.Status,
+        status: Status,
         focused: bool,
     ) !void {
         const text: []const u8 = switch (status) {
             .connected => " [CONNECTED]",
-            .checking => " [CHECKING]",
             .failed => " [DISCONNECTED]",
             .unknown => return,
         };
         const style: vaxis.Style = switch (status) {
             .connected => StylePalette.success,
-            .checking => StylePalette.thinking_body,
             .failed => StylePalette.tool_failed,
             .unknown => unreachable,
         };
@@ -269,10 +272,9 @@ fn rowText(arena: std.mem.Allocator, surface: vxfw.Surface, row: u16) ![]u8 {
 
 test "provider picker badge reflects connectivity status, not key presence" {
     const count = comptime config_mod.catalogueProviders().len;
-    var statuses: [count]connectivity.Status = @splat(.unknown);
+    var statuses: [count]Status = @splat(.unknown);
     statuses[0] = .connected;
     statuses[1] = .failed;
-    statuses[2] = .checking;
 
     var content: Content = .{
         .state = .{},
@@ -296,11 +298,8 @@ test "provider picker badge reflects connectivity status, not key presence" {
     const failed_row = try rowText(arena.allocator(), surface, 2);
     try std.testing.expect(std.mem.indexOf(u8, failed_row, "[DISCONNECTED]") != null);
 
-    const checking_row = try rowText(arena.allocator(), surface, 3);
-    try std.testing.expect(std.mem.indexOf(u8, checking_row, "[CHECKING]") != null);
-
-    // An unprobed provider (no credentials) shows no badge at all.
-    const unknown_row = try rowText(arena.allocator(), surface, 4);
+    // An unconfigured provider (no credentials) shows no badge at all.
+    const unknown_row = try rowText(arena.allocator(), surface, 3);
     try std.testing.expect(std.mem.indexOf(u8, unknown_row, "[") == null);
 }
 

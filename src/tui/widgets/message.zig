@@ -95,6 +95,7 @@ pub const MessageWidget = struct {
             },
             .notice => drawWrapped(surface, self.message.body, StylePalette.tool_failed, styled_as_selected, &row, ctx, 2, StylePalette.tool_failed),
             .success => drawWrapped(surface, self.message.body, StylePalette.tool, styled_as_selected, &row, ctx, 2, StylePalette.tool),
+            .info => drawWrapped(surface, self.message.body, StylePalette.info, styled_as_selected, &row, ctx, 2, StylePalette.info),
             .logo => drawIntro(surface, self.blackhole_frame, &row, ctx),
             .tool => {
                 const title_style = if (self.message.failed) StylePalette.tool_failed else StylePalette.tool;

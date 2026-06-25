@@ -15,7 +15,7 @@ pub fn messageRowsCached(message: *transcript_mod.Message, width: u16) u16 {
 
 pub fn messageContentRows(message: transcript_mod.Message, width: u16) u16 {
     return switch (message.kind) {
-        .user, .notice, .success => textRows(message.body, width -| 2),
+        .user, .notice, .success, .info => textRows(message.body, width -| 2),
         .agent => terminal_markdown.countRows(message.body, @max(width, 1)),
         .skill => textRows(message.title, width -| 2) + if (message.expanded and message.body.len > 0) textRows(message.body, width) else 0,
         .logo => blackhole.rows,

@@ -184,7 +184,7 @@ pub const TurnView = struct {
             "compacted context ~{d} -> ~{d} tokens",
             .{ info.tokens_before, info.tokens_after },
         ) catch "compacted context";
-        _ = try transcript.append(gpa, .notice, "notice", text);
+        _ = try transcript.append(gpa, .info, "notice", text);
         return true;
     }
 
@@ -508,4 +508,20 @@ test "turn view streams content into transcript" {
     try std.testing.expectEqualStrings("hello", transcript.messages.items[0].body);
     try std.testing.expect(turn_view.activity == .writing_response);
     try std.testing.expectEqual(@as(u32, 0), turn_view.activity.writing_response);
+}
+
+test "history compacted appends a white info notice, not a red error" {
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+    var turn_view: TurnView = .{};
+    defer turn_view.deinit(gpa);
+
+    try std.testing.expect(try turn_view.apply(gpa, &transcript, .{
+        .history_compacted = .{ .tokens_before = 90_000, .tokens_after = 20_000 },
+    }));
+    try std.testing.expectEqual(@as(usize, 1), transcript.messages.items.len);
+    // Neutral `.info` (white), distinct from `.notice` (red error).
+    try std.testing.expectEqual(transcript_mod.MessageKind.info, transcript.messages.items[0].kind);
+    try std.testing.expectEqualStrings("compacted context ~90000 -> ~20000 tokens", transcript.messages.items[0].body);
 }

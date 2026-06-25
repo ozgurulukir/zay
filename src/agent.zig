@@ -1,4 +1,5 @@
 const std = @import("std");
+const logger = @import("logger");
 
 const ai = @import("ai.zig");
 const at_mention = @import("at_mention.zig");
@@ -74,7 +75,11 @@ const Compactor = struct {
 fn runCompactionThread(compactor: *Compactor) void {
     const job = compactor.job.?;
     defer job.gpa.free(job.prefix_text);
-    const stored = produceStoredSummary(job) catch {
+    const stored = produceStoredSummary(job) catch |err| {
+        // Surface the real reason (file logger only — never stderr/the TUI).
+        // `EmptySummary` here means the summarizer answered with no text, e.g. a
+        // tool call — which is why the summarizer client carries no tools.
+        logger.log("compaction summarize failed: {s}", .{@errorName(err)});
         compactor.state.store(.failed, .release);
         return;
     };

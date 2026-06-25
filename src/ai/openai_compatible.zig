@@ -377,9 +377,12 @@ fn writeRequestPayload(
     // chunk (empty `choices`) before `[DONE]`. Without it, streaming responses
     // carry no token counts. Some OpenAI-compatible servers ignore it, so the
     // parser treats usage as optional.
-    try out.writeAll("],\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tools\":");
-    try out.writeAll(tools_json);
-    try out.writeAll(",\"tool_choice\":\"auto\"");
+    try out.writeAll("],\"stream\":true,\"stream_options\":{\"include_usage\":true}");
+    if (!std.mem.eql(u8, tools_json, "[]")) {
+        try out.writeAll(",\"tools\":");
+        try out.writeAll(tools_json);
+        try out.writeAll(",\"tool_choice\":\"auto\"");
+    }
     // Standard OpenAI cache-routing hint: steers requests sharing this session's
     // prefix to the same backend, raising prefix-cache hit rates (used by
     // gateways like OpenCode Zen; servers that don't support it, e.g. Ollama,
@@ -875,6 +878,28 @@ test "writeRequestPayload omits prompt_cache_key when no session id is set" {
     try writeRequestPayload(&payload.writer, "qwen-test", "", &.{}, "[]", null);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_key") == null);
+}
+
+test "writeRequestPayload omits tools and tool_choice when there are none" {
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    // The background summarizer sends no tools ("[]"); the request must not carry
+    // a `tool_choice` (rejected by strict providers) or invite a tool-call reply.
+    try writeRequestPayload(&payload.writer, "summarizer", "", &.{}, "[]", null);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "tool_choice") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") == null);
+}
+
+test "writeRequestPayload keeps tools and tool_choice when tools are present" {
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(&payload.writer, "agent", "", &.{}, "[{\"type\":\"function\"}]", null);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"auto\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":[{\"type\":\"function\"}]") != null);
 }
 
 test "readStream accepts an SSE line larger than the transfer buffer" {

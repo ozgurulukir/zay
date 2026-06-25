@@ -334,7 +334,7 @@ pub const AgentRuntime = struct {
                 .base_url = "https://chatgpt.com/backend-api",
                 .api_key = credentials.access,
                 .model = model_id,
-                .tools = tools_mod.registry,
+                .tools = &.{},
                 .reasoning = .{ .effort = effort, .summary = .auto },
                 .account_id = credentials.account_id,
                 .session_id = self.session_writer.session.id.slice(),
@@ -401,7 +401,7 @@ pub const AgentRuntime = struct {
                 .base_url = base_url,
                 .api_key = api_key,
                 .model = model_id,
-                .tools = tools_mod.registry,
+                .tools = &.{},
                 .reasoning = .{ .effort = effort },
             }) catch {
                 self.gpa.destroy(compaction_client);
@@ -439,7 +439,7 @@ pub const AgentRuntime = struct {
                 .base_url = base_url,
                 .api_key = api_key,
                 .model = model_id,
-                .tools = tools_mod.registry,
+                .tools = &.{},
                 .reasoning = reasoning,
                 .session_id = self.session_writer.session.id.slice(),
                 .system_prompt = self.system_prompt,

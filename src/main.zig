@@ -1,9 +1,21 @@
 const std = @import("std");
 const nova = @import("nova");
+const logger = @import("logger");
 
 pub const std_options: std.Options = .{
     .unexpected_error_tracing = false,
+    .logFn = novaLog,
 };
+
+fn novaLog(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const prefix = "[" ++ comptime level.asText() ++ "] (" ++ @tagName(scope) ++ ") ";
+    logger.log(prefix ++ format, args);
+}
 
 pub const panic = std.debug.FullPanic(novaPanic);
 

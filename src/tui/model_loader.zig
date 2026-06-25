@@ -1,4 +1,5 @@
 const std = @import("std");
+const logger = @import("logger");
 
 const codex = @import("../codex.zig");
 const config_mod = @import("../config.zig");
@@ -13,14 +14,25 @@ pub const Catalog = enum {
     single_provider,
 };
 
+/// Per-provider connectivity verdict, derived from the same fetch that builds
+/// the catalogue: `ok` is true when the provider's `/models` returned at least
+/// one usable model. Lets the picker's [CONNECTED] badge read off the model
+/// load instead of a separate probe, so the two can never disagree.
+pub const ProviderOutcome = struct {
+    provider: config_mod.Provider,
+    ok: bool,
+};
+
 pub const Result = struct {
     models: std.ArrayList(codex.Model) = .empty,
     sources: std.ArrayList(ModelSource) = .empty,
+    outcomes: std.ArrayList(ProviderOutcome) = .empty,
 
     pub fn deinit(self: *Result, gpa: std.mem.Allocator) void {
         for (self.models.items) |*model| model.deinit(gpa);
         self.models.deinit(gpa);
         self.sources.deinit(gpa);
+        self.outcomes.deinit(gpa);
         self.* = undefined;
     }
 };
@@ -95,7 +107,12 @@ pub fn run(job: *Job) Outcome {
 fn buildCatalog(job: *Job, result: *Result) !void {
     switch (job.catalog) {
         .connected_provider => {
-            for (job.configured) |configured| loadConfigured(job, configured, result) catch {};
+            // One provider failing (expired key, unreachable host) must not abort
+            // the others — but don't swallow the reason silently: log it, and
+            // record a per-provider outcome so the picker's [CONNECTED] badge can
+            // tell a provider that contributes no models (e.g. Ollama Cloud) from
+            // one that does.
+            for (job.configured) |configured| try loadAndRecord(job, configured, result);
             if (job.include_locals) {
                 loadLocal(job, .ollama, result) catch {};
                 loadLocal(job, .llama_cpp, result) catch {};
@@ -103,9 +120,24 @@ fn buildCatalog(job: *Job, result: *Result) !void {
             if (job.codex_signed_in) try loadStatic(job, result);
         },
         .single_provider => {
-            for (job.configured) |configured| try loadConfigured(job, configured, result);
+            for (job.configured) |configured| try loadAndRecord(job, configured, result);
         },
         .openai_codex => try loadStatic(job, result),
+    }
+}
+
+/// Load one provider and record its connectivity outcome. A fetch failure is
+/// logged and recorded as `ok = false` (not propagated), so one dead provider
+/// neither aborts the others nor vanishes without explanation. Only an
+/// allocation failure recording the outcome propagates.
+fn loadAndRecord(job: *Job, configured: Configured, result: *Result) !void {
+    const before = result.models.items.len;
+    if (loadConfigured(job, configured, result)) |_| {
+        const added = result.models.items.len - before;
+        try result.outcomes.append(job.gpa, .{ .provider = configured.provider, .ok = added > 0 });
+    } else |err| {
+        logger.log("model load {s}: failed: {s}", .{ configured.provider.label(), @errorName(err) });
+        try result.outcomes.append(job.gpa, .{ .provider = configured.provider, .ok = false });
     }
 }
 

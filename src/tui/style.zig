@@ -18,6 +18,9 @@ pub const Palette = struct {
     pub const tool: vaxis.Style = .{ .fg = .{ .rgb = success_green } };
     pub const tool_failed: vaxis.Style = .{ .fg = .{ .rgb = failure_red } };
     pub const success: vaxis.Style = .{ .fg = .{ .rgb = success_green } };
+    /// Neutral informational notice (e.g. context compaction) — plain white, so
+    /// it reads as status rather than an error (red) or a win (green).
+    pub const info: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } } };
     pub const border_label: vaxis.Style = .{ .fg = .{ .rgb = accent_orange } };
     pub const model_status: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
     pub const thinking_label: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };

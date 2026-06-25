@@ -2,6 +2,9 @@ const std = @import("std");
 const logger = @import("logger");
 const os = @import("os.zig");
 const symbols = @import("symbols.zig");
+const keyring = @import("keyring.zig");
+
+const keyring_service = "Nova";
 
 const auth_port: u16 = 1455;
 const auth_host = "127.0.0.1";
@@ -91,12 +94,7 @@ pub fn login(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !Credenti
 }
 
 pub fn load(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !?Credentials {
-    const path = try authPath(gpa, home_dir);
-    defer gpa.free(path);
-    const bytes = std.Io.Dir.readFileAllocOptions(.cwd(), io, path, gpa, .limited(32 * 1024), .of(u8), 0) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
+    const bytes = (try readBlob(gpa, io, home_dir)) orelse return null;
     defer gpa.free(bytes);
     return try parseAuthFile(gpa, bytes);
 }
@@ -115,12 +113,7 @@ pub fn signOut(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !void {
         try writeAuthFile(gpa, io, home_dir, null, &keys);
         return;
     }
-    const path = try authPath(gpa, home_dir);
-    defer gpa.free(path);
-    std.Io.Dir.deleteFile(.cwd(), io, path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
+    try deleteBlob(gpa, io, home_dir);
 }
 
 fn createAuthorizationFlow(gpa: std.mem.Allocator, io: std.Io) !AuthorizationFlow {
@@ -322,8 +315,6 @@ fn save(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, credentials: C
     try writeAuthFile(gpa, io, home_dir, credentials, &keys);
 }
 
-/// Single owner of `auth.json`: serializes the optional Codex credentials and
-/// the provider API-key map together, so neither write clobbers the other.
 fn writeAuthFile(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -331,10 +322,6 @@ fn writeAuthFile(
     credentials: ?Credentials,
     api_keys: *const ApiKeyMap,
 ) !void {
-    const path = try authPath(gpa, home_dir);
-    defer gpa.free(path);
-    const dirname = std.fs.path.dirname(path) orelse return error.InvalidPath;
-    try std.Io.Dir.createDirPath(.cwd(), io, dirname);
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
     try payload.writer.writeByte('{');
@@ -348,12 +335,90 @@ fn writeAuthFile(
         try writeApiKeys(&payload.writer, api_keys);
     }
     try payload.writer.writeAll("}\n");
+    try writeBlob(gpa, io, home_dir, payload.written());
+}
+
+fn keyringAccount(home_dir: []const u8, buf: *[20]u8) []const u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(home_dir, &digest, .{});
+    const hex = "0123456789abcdef";
+    @memcpy(buf[0..4], "cli|");
+    for (digest[0..8], 0..) |byte, i| {
+        buf[4 + i * 2] = hex[byte >> 4];
+        buf[4 + i * 2 + 1] = hex[byte & 0x0f];
+    }
+    return buf[0..20];
+}
+
+/// Read the serialized auth blob, preferring the keychain and falling back to
+/// `auth.json`. Returns gpa-owned bytes, or null when neither has an entry.
+/// A keychain miss must still try the file: it's where the blob lives on hosts
+/// with no keychain (Linux), and where a blob too large for the OS keychain
+/// (Windows caps credentials at 2560 bytes, so a Codex JWT bundle spills here)
+/// was written by `writeBlob`'s fallback. Not just a migration read.
+fn readBlob(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !?[]u8 {
+    var account_buf: [20]u8 = undefined;
+    const account = keyringAccount(home_dir, &account_buf);
+    if (keyring.load(gpa, keyring_service, account)) |maybe| {
+        if (maybe) |bytes| return bytes;
+    } else |err| {
+        if (err != error.Unsupported) logger.log("keyring load failed ({s}); using auth.json", .{@errorName(err)});
+    }
+    return readBlobFile(gpa, io, home_dir);
+}
+
+/// Persist the blob: try the keychain, and on success drop the plaintext file so
+/// the secret isn't left on disk. If the keychain is unavailable or rejects it
+/// (e.g. blob too large for Windows), write `auth.json` instead.
+fn writeBlob(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, bytes: []const u8) !void {
+    var account_buf: [20]u8 = undefined;
+    const account = keyringAccount(home_dir, &account_buf);
+    keyring.save(gpa, keyring_service, account, bytes) catch |err| {
+        if (err != error.Unsupported) logger.log("keyring save failed ({s}); writing auth.json", .{@errorName(err)});
+        return writeBlobFile(gpa, io, home_dir, bytes);
+    };
+    deleteBlobFile(gpa, io, home_dir) catch {};
+}
+
+/// Remove the blob from both the keychain and the plaintext file.
+fn deleteBlob(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !void {
+    var account_buf: [20]u8 = undefined;
+    const account = keyringAccount(home_dir, &account_buf);
+    _ = keyring.delete(gpa, keyring_service, account) catch |err| {
+        if (err != error.Unsupported) logger.log("keyring delete failed ({s})", .{@errorName(err)});
+    };
+    try deleteBlobFile(gpa, io, home_dir);
+}
+
+fn readBlobFile(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !?[]u8 {
+    const path = try authPath(gpa, home_dir);
+    defer gpa.free(path);
+    return std.Io.Dir.readFileAllocOptions(.cwd(), io, path, gpa, .limited(32 * 1024), .of(u8), 0) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => err,
+    };
+}
+
+fn writeBlobFile(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, bytes: []const u8) !void {
+    const path = try authPath(gpa, home_dir);
+    defer gpa.free(path);
+    const dirname = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    try std.Io.Dir.createDirPath(.cwd(), io, dirname);
     var file = try std.Io.Dir.createFile(.cwd(), io, path, .{ .truncate = true });
     defer file.close(io);
     var buffer: [4096]u8 = undefined;
     var writer = file.writer(io, &buffer);
-    try writer.interface.writeAll(payload.written());
+    try writer.interface.writeAll(bytes);
     try writer.interface.flush();
+}
+
+fn deleteBlobFile(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !void {
+    const path = try authPath(gpa, home_dir);
+    defer gpa.free(path);
+    std.Io.Dir.deleteFile(.cwd(), io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 }
 
 fn apiKeysCount(api_keys: *const ApiKeyMap) usize {
@@ -430,12 +495,7 @@ pub fn freeApiKeyMap(gpa: std.mem.Allocator, map: *ApiKeyMap) void {
 /// Read every stored provider API key. Returns an empty map when the auth
 /// file is absent or carries no `apiKeys` section.
 pub fn loadAllProviderApiKeys(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !ApiKeyMap {
-    const path = try authPath(gpa, home_dir);
-    defer gpa.free(path);
-    const bytes = std.Io.Dir.readFileAllocOptions(.cwd(), io, path, gpa, .limited(32 * 1024), .of(u8), 0) catch |err| switch (err) {
-        error.FileNotFound => return .empty,
-        else => return err,
-    };
+    const bytes = (try readBlob(gpa, io, home_dir)) orelse return .empty;
     defer gpa.free(bytes);
     return parseApiKeys(gpa, bytes);
 }

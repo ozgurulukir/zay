@@ -28,7 +28,6 @@ const at_search = @import("tui/widgets/at_search.zig");
 const command_panel = @import("tui/widgets/command_panel.zig");
 const diff_viewer = @import("tui/diff_viewer.zig");
 const model_loader = @import("tui/model_loader.zig");
-const connectivity = @import("tui/connectivity.zig");
 const model_cache = @import("tui/model_cache.zig");
 const model_picker = @import("tui/widgets/model_picker.zig");
 const provider_picker = @import("tui/widgets/provider_picker.zig");
@@ -158,14 +157,16 @@ pub const App = struct {
     /// freed in `deinit`.
     provider_key_input: std.ArrayList(u8) = .empty,
     /// Live connectivity per catalogue provider, indexed by `catalogueProviders()`
-    /// order. A stored key proves only that a key was entered, not that it still
-    /// works, so these are refreshed by background `/models` probes (on startup
-    /// and whenever the picker opens). Drives the picker badge: only `.connected`
-    /// shows [CONNECTED]. `conn_done`/`conn_future` are the per-slot non-blocking
-    /// handles, mirroring the model-load/diff-refresh job pattern.
-    conn_status: [catalogue_provider_count]connectivity.Status = @splat(.unknown),
-    conn_future: [catalogue_provider_count]?std.Io.Future(connectivity.Outcome) = @splat(null),
-    conn_done: [catalogue_provider_count]std.atomic.Value(bool) = @splat(.init(false)),
+    /// order. Derived from the model load's per-provider outcome (a key existing
+    /// only proves it was entered, not that it works), so the picker badge and
+    /// the model picker read the same source and can't disagree. Only
+    /// `.connected` shows [CONNECTED]; `.failed` shows [DISCONNECTED].
+    conn_status: [catalogue_provider_count]provider_picker.Status = @splat(.unknown),
+    /// True while the in-flight model load is a full connected-provider sweep,
+    /// so its result recomputes every badge (providers absent from the result
+    /// reset to `.unknown`). False for single-provider loads, which touch only
+    /// the provider they fetched.
+    conn_recompute: bool = false,
     cached_config: config_mod.Config = .{},
     cached_config_owned: bool = false,
     retired_transcripts: std.ArrayList(transcript_mod.Transcript) = .empty,
@@ -292,7 +293,6 @@ pub const App = struct {
         // Cancel the in-flight load first (it needs `io`), then free the
         // catalogue's owned lists + error in one pass.
         self.cancelModelLoad();
-        self.cancelConnectivityChecks();
         for (self.retired_transcripts.items) |*transcript| transcript.deinit(self.gpa);
         self.retired_transcripts.deinit(self.gpa);
         self.resumeClear();
@@ -1020,9 +1020,10 @@ pub const App = struct {
         self.clearInput();
         self.clearPaletteInput();
         try self.refreshProviderApiKeys();
-        // Re-probe so the badges reflect connectivity as of now, not whatever the
-        // startup check found (a key may have expired or come back since).
-        self.startConnectivityChecks();
+        // Refresh the badges from a live model load (merge, so the catalogue isn't
+        // cleared). The load's per-provider outcome drives `conn_status`, so the
+        // badge reads the same source as the model picker and can't disagree.
+        self.startModelLoad(.connected_provider, true) catch {};
     }
 
     /// Reload the cached provider API keys from `~/.nova/auth.json`. Drives the
@@ -1036,91 +1037,26 @@ pub const App = struct {
         fresh = .empty;
     }
 
-    /// Kick off a background `/models` probe for every catalogue provider so the
-    /// picker badges reflect live connectivity rather than mere key presence.
-    /// Non-blocking: each probe runs on its own worker and lands via the tick
-    /// loop's `drainConnectivityChecks`. Safe to call repeatedly — each slot's
-    /// in-flight probe is cancelled and restarted. Relies on `provider_api_keys`
-    /// already being loaded.
-    fn startConnectivityChecks(self: *App) void {
-        for (config_mod.catalogueProviders(), 0..) |provider, index| {
-            self.startConnectivityCheck(provider, index) catch {};
+    /// Index of `provider` within `catalogueProviders()` — the order `conn_status`
+    /// is keyed by. Null when it isn't a catalogue provider (no badge row).
+    fn catalogueIndex(provider: config_mod.Provider) ?usize {
+        for (config_mod.catalogueProviders(), 0..) |candidate, index| {
+            if (candidate == provider) return index;
         }
+        return null;
     }
 
-    fn startConnectivityCheck(self: *App, provider: config_mod.Provider, index: usize) !void {
-        self.cancelConnectivityCheck(index);
-
-        const base_url = provider.defaultBaseUrl() orelse {
-            self.conn_status[index] = .unknown;
-            return;
-        };
-        // Stored key wins; otherwise an anonymous-tier provider (OpenCode Zen)
-        // is probed via its sentinel. No credentials at all => nothing to check.
-        const key = self.provider_api_keys.get(provider.label()) orelse anon: {
-            break :anon provider.anonymousApiKey() orelse {
-                self.conn_status[index] = .unknown;
-                return;
-            };
-        };
-
-        const job = try self.gpa.create(connectivity.Job);
-        errdefer self.gpa.destroy(job);
-        const base_url_owned = try self.gpa.dupe(u8, base_url);
-        errdefer self.gpa.free(base_url_owned);
-        const api_key_owned = try self.gpa.dupe(u8, key);
-        errdefer self.gpa.free(api_key_owned);
-        job.* = .{
-            .gpa = self.gpa,
-            .io = self.io,
-            .base_url = base_url_owned,
-            .api_key = api_key_owned,
-            .done = &self.conn_done[index],
-        };
-
-        self.conn_done[index].store(false, .release);
-        self.conn_status[index] = .checking;
-        self.conn_future[index] = try self.io.concurrent(connectivity.run, .{job});
-    }
-
-    fn cancelConnectivityCheck(self: *App, index: usize) void {
-        if (self.conn_future[index]) |*future| {
-            _ = future.cancel(self.io);
-            self.conn_future[index] = null;
+    /// Fold a finished model load's per-provider outcomes into the picker badges.
+    /// A full connected-provider sweep (`conn_recompute`) first clears every badge
+    /// to `.unknown`, so a provider dropped from the configured set (key removed)
+    /// stops reading connected; a single-provider load updates only what it
+    /// fetched.
+    fn applyProviderOutcomes(self: *App, outcomes: []const model_loader.ProviderOutcome) void {
+        if (self.conn_recompute) self.conn_status = @splat(.unknown);
+        for (outcomes) |outcome| {
+            const index = catalogueIndex(outcome.provider) orelse continue;
+            self.conn_status[index] = if (outcome.ok) .connected else .failed;
         }
-        self.conn_done[index].store(false, .release);
-    }
-
-    fn cancelConnectivityChecks(self: *App) void {
-        for (0..catalogue_provider_count) |index| self.cancelConnectivityCheck(index);
-    }
-
-    fn connectivityChecksInFlight(self: *const App) bool {
-        for (self.conn_future) |slot| {
-            if (slot != null) return true;
-        }
-        return false;
-    }
-
-    /// Called from the tick handler. Polls each slot's non-blocking `done` flag
-    /// and only `await`s the ones that have finished, folding the outcome into
-    /// `conn_status`. Returns true when a badge changed (redraw needed).
-    fn drainConnectivityChecks(self: *App) bool {
-        var changed = false;
-        for (&self.conn_future, 0..) |*slot, index| {
-            if (slot.* == null) continue;
-            if (!self.conn_done[index].load(.acquire)) continue;
-
-            const outcome = slot.*.?.await(self.io);
-            slot.* = null;
-            self.conn_done[index].store(false, .release);
-            self.conn_status[index] = switch (outcome) {
-                .connected => .connected,
-                .failed => .failed,
-            };
-            changed = true;
-        }
-        return changed;
     }
 
     fn openProviderForm(self: *App, provider: config_mod.Provider) void {
@@ -1217,21 +1153,35 @@ pub const App = struct {
             return;
         }
 
-        if (try self.restoreModelCache()) return;
+        if (try self.restoreModelCache()) {
+            // Stale-while-revalidate (same pattern as the diff cache): the disk
+            // cache shows instantly, but it can predate a provider connected
+            // since it was written — e.g. an Ollama Cloud key added or renewed
+            // later, so the cache holds only the providers that were live then.
+            // Refresh connected providers in the background and MERGE: present
+            // providers update in place, newly-reachable ones appear, and any
+            // that fail keep their cached entries.
+            self.startModelLoad(.connected_provider, true) catch {};
+            return;
+        }
 
         // Cold path — clear stale state, kick off the async load.
         self.codexModelsClear();
         self.models.reasoning_snapshot.clearRetainingCapacity();
         self.models.model_selection_snapshot = 0;
-        try self.startModelLoad(.connected_provider);
+        try self.startModelLoad(.connected_provider, false);
     }
 
     fn snapshotModelPickerState(self: *App) !void {
         try self.models.snapshot(self.gpa);
     }
 
-    fn startModelLoad(self: *App, catalog: ModelCatalog) !void {
+    fn startModelLoad(self: *App, catalog: ModelCatalog, merge: bool) !void {
         self.cancelModelLoad();
+        // A connected-provider sweep fetches every configured provider, so its
+        // result is authoritative for all badges; an openai_codex load touches no
+        // catalogue providers and must not reset them.
+        self.conn_recompute = catalog == .connected_provider;
         if (self.models.model_load_error) |message| {
             self.gpa.free(message);
             self.models.model_load_error = null;
@@ -1262,7 +1212,7 @@ pub const App = struct {
             .done = &self.models.model_load_done,
         };
 
-        self.models.model_load_merge = false;
+        self.models.model_load_merge = merge;
         self.models.model_load_done.store(false, .release);
         self.models.model_load_future = try self.io.concurrent(model_loader.run, .{job});
     }
@@ -1373,6 +1323,9 @@ pub const App = struct {
         result.models.clearRetainingCapacity();
         result.sources.clearRetainingCapacity();
         self.models.model_load_merge = false;
+        // Same fetch that built the catalogue also tells us which providers are
+        // reachable — drive the picker badges from it.
+        self.applyProviderOutcomes(result.outcomes.items);
         try self.finishModelCatalogReload();
         try self.snapshotModelPickerState();
         self.models.models_cached = true;
@@ -1512,14 +1465,6 @@ pub const App = struct {
             codex.removeProviderApiKey(self.gpa, self.io, home, provider.label()) catch {};
         }
         try self.refreshProviderApiKeys();
-        // Re-probe this provider so its picker badge reflects the key just saved
-        // (or cleared) instead of the pre-edit connectivity.
-        for (config_mod.catalogueProviders(), 0..) |catalogue_provider, index| {
-            if (catalogue_provider == provider) {
-                self.startConnectivityCheck(provider, index) catch {};
-                break;
-            }
-        }
 
         // With no key, connect via the provider's anonymous sentinel (e.g.
         // OpenCode Zen's `public`, which the gateway limits to free models).
@@ -1544,6 +1489,9 @@ pub const App = struct {
     /// Incremental, merge-on-arrival load of a single provider's `/models`.
     fn startProviderModelLoad(self: *App, provider: config_mod.Provider, key: []const u8) !void {
         self.cancelModelLoad();
+        // Single provider: its outcome updates only this provider's badge, never
+        // a full recompute that would wipe the others.
+        self.conn_recompute = false;
         if (self.models.model_load_error) |message| {
             self.gpa.free(message);
             self.models.model_load_error = null;
@@ -2897,8 +2845,12 @@ const RootLayout = struct {
     input_row: u16,
 };
 
-fn rootLayout(max_height: u16, panel_visible: bool, input_text_rows: u16, loading_visible: bool) RootLayout {
-    const desired: u16 = 3 + input_text_rows;
+fn rootLayout(max_height: u16, panel_visible: bool, input_text_rows: u16, loading_visible: bool, queued_visible: bool) RootLayout {
+    // Reserve: top border + bottom border + one hint/diff-counts row (the `3`),
+    // the wrapped input text, and — when a steered message is queued — the extra
+    // line the InputWidget draws above the border for it. Omitting the queued row
+    // here starves the InputWidget so it silently drops the hint + diff counts.
+    const desired: u16 = 3 + input_text_rows + @intFromBool(queued_visible);
     const max_allowed: u16 = @max(@as(u16, 6), max_height -| 3);
     const input_height: u16 = @min(max_height, @min(desired, max_allowed));
     const above_input_height: u16 = max_height - input_height;
@@ -3064,7 +3016,11 @@ const RootWidget = struct {
                 // Warm the diff cache in the background so the first `/diff`
                 // opens instantly instead of cold-loading.
                 self.app.scheduleDiffRefresh() catch {};
-                self.app.startConnectivityChecks();
+                // Warm the model catalogue in the background: this one fetch both
+                // populates the model picker and drives the provider [CONNECTED]
+                // badges (via per-provider outcomes), so an expired key shows
+                // DISCONNECTED without a separate probe.
+                self.app.startModelLoad(.connected_provider, false) catch {};
                 ctx.consumeAndRedraw();
             },
             .mouse => |mouse| {
@@ -3225,7 +3181,6 @@ const RootWidget = struct {
         var visible_change = try self.drainAgentEvents(ctx);
         if (try self.app.drainModelLoad()) visible_change = true;
         if (try self.app.drainDiffRefresh()) visible_change = true;
-        if (self.app.drainConnectivityChecks()) visible_change = true;
 
         if (self.app.thread.turn_view.awaitingOutput() or self.app.thread.transcript.hasRunningTool()) {
             self.spinner_tick_accum += drain_tick_ms;
@@ -3269,7 +3224,6 @@ const RootWidget = struct {
         const should_tick = self.app.anyTurnActive() or
             model_loading or
             diff_loading or
-            self.app.connectivityChecksInFlight() or
             self.app.blackhole_visible or
             self.diff_refresh_pending;
         if (should_tick) {
@@ -3387,7 +3341,7 @@ const RootWidget = struct {
         const split = self.app.split and self.app.threads.items.len > 1;
         // In split view always reserve the loading row so each column keeps a
         // fixed height across turns — the spinner appearing must not reflow.
-        const layout = rootLayout(max_height, false, try self.app.inputTextRows(ctx, max_width -| 4), loading_visible or split);
+        const layout = rootLayout(max_height, false, try self.app.inputTextRows(ctx, max_width -| 4), loading_visible or split, self.app.thread.queued.items.len > 0);
 
         var transcript_view: TranscriptWidget = .{ .app = self.app, .thread = self.app.thread };
         var loading_view: LoadingWidget = .{ .app = self.app };
@@ -5220,8 +5174,8 @@ test "diff count labels keep signs next to numbers" {
 }
 
 test "root layout keeps input fixed when panel opens" {
-    const normal = rootLayout(30, false, 1, false);
-    const picker = rootLayout(30, true, 1, false);
+    const normal = rootLayout(30, false, 1, false, false);
+    const picker = rootLayout(30, true, 1, false, false);
 
     try std.testing.expectEqual(normal.input_row, picker.input_row);
     try std.testing.expectEqual(normal.transcript_height, picker.transcript_height);
@@ -5230,7 +5184,7 @@ test "root layout keeps input fixed when panel opens" {
 }
 
 test "root layout clamps panel above input on short screens" {
-    const layout = rootLayout(8, true, 1, false);
+    const layout = rootLayout(8, true, 1, false, false);
 
     try std.testing.expectEqual(@as(u16, 4), layout.input_height);
     try std.testing.expectEqual(@as(u16, 4), layout.transcript_height);
@@ -5240,18 +5194,27 @@ test "root layout clamps panel above input on short screens" {
 }
 
 test "root layout grows the input as text rows increase" {
-    const one = rootLayout(30, false, 1, false);
+    const one = rootLayout(30, false, 1, false, false);
     try std.testing.expectEqual(@as(u16, 4), one.input_height);
     try std.testing.expectEqual(@as(u16, 26), one.transcript_height);
 
-    const three = rootLayout(30, false, 3, false);
+    const three = rootLayout(30, false, 3, false, false);
     try std.testing.expectEqual(@as(u16, 6), three.input_height);
     try std.testing.expectEqual(@as(u16, 24), three.transcript_height);
 
     // A short screen still leaves the transcript some room.
-    const tight = rootLayout(10, false, 6, false);
+    const tight = rootLayout(10, false, 6, false, false);
     try std.testing.expectEqual(@as(u16, 7), tight.input_height);
     try std.testing.expectEqual(@as(u16, 3), tight.transcript_height);
+}
+
+test "root layout reserves a row for the queued-message line" {
+    // A queued (steered) message draws an extra line above the input border, so
+    // the input region must grow by one row — otherwise the hint + diff counts
+    // get squeezed out (regression: they vanished after sending mid-generation).
+    const plain = rootLayout(30, false, 1, false, false);
+    const queued = rootLayout(30, false, 1, false, true);
+    try std.testing.expectEqual(plain.input_height + 1, queued.input_height);
 }
 
 test "input text rows track the line count" {
@@ -5779,7 +5742,7 @@ test "awaiting turn draws loading outside the transcript list" {
     try std.testing.expectEqual(@as(usize, 3), surface.children.len);
     try std.testing.expectEqual(@as(?u32, 1), app.thread.transcript_list.item_count);
     try std.testing.expectEqual(@as(u32, 0), app.thread.transcript_list.cursor);
-    try std.testing.expectEqual(rootLayout(10, false, 1, true).loading_row, surface.children[1].origin.row);
+    try std.testing.expectEqual(rootLayout(10, false, 1, true, false).loading_row, surface.children[1].origin.row);
 }
 
 test "awaiting turn preserves selected long message inner scroll" {
