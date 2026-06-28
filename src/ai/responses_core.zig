@@ -192,6 +192,7 @@ fn writeParameters(writer: *std.Io.Writer, tool: tools_common.Tool) !void {
             .string => "string",
             .integer => "integer",
             .object => "object",
+            .boolean => "boolean",
         };
         try std.json.Stringify.value(kind, .{}, writer);
         try writer.writeAll(",\"description\":");

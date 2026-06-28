@@ -7,6 +7,13 @@ Run a shell command.
 - Prefer targeted commands (`rg`, `find`, `git diff --stat`, `head`, `tail`) over dumping large files or full build logs.
 - Bash output may be truncated. If output is truncated, use the reported full-output path to read the rest or rerun with a narrower command.
 
+## Long-running commands
+
+- For commands that take a long time or never return on their own — builds, dev servers, watchers, `tail -f` — set `run_in_background: true`. The call returns immediately with a job id, pid, and a log file path instead of blocking.
+- The command keeps running after the call returns. Its eventual exit is delivered to you as a message; do not poll in a busy loop waiting for it.
+- To check on a background job meanwhile, read its log file (e.g. `tail -n 50 <path>`) or use `ps`/`taskkill` with the reported pid. The log path stays valid for the life of the job.
+- `timeout` is ignored for background commands. Use a normal (foreground) call for anything you need the output of right away.
+
 ## Error handling
 
 - A non-zero exit code is returned in the result. For multi-step commands, chain with `&&` or start scripts with `set -euo pipefail`.

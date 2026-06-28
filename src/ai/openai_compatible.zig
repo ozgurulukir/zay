@@ -256,6 +256,7 @@ fn writeToolDefinition(
             .string => "string",
             .integer => "integer",
             .object => "object",
+            .boolean => "boolean",
         };
         try std.json.Stringify.value(kind_str, .{}, writer);
         try writer.writeAll(",\"description\":");

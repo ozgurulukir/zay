@@ -22,6 +22,9 @@ pub const Palette = struct {
     /// it reads as status rather than an error (red) or a win (green).
     pub const info: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } } };
     pub const border_label: vaxis.Style = .{ .fg = .{ .rgb = accent_orange } };
+    /// Bottom-left background-jobs badge: black text on the thinking-blue fill,
+    /// so the live-job count reads as a status pill, not body text.
+    pub const background_badge: vaxis.Style = .{ .fg = .{ .rgb = .{ 0, 0, 0 } }, .bg = .{ .rgb = thinking_blue } };
     pub const model_status: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
     pub const thinking_label: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
     pub const thinking_body: vaxis.Style = .{ .fg = .{ .rgb = muted_gray } };

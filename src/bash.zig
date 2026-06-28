@@ -426,6 +426,21 @@ pub fn disablePseudoConsole() void {
     _ = SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("CYGWIN"), value);
 }
 
+/// The resolved bash executable path (git bash on Windows, `bash` elsewhere).
+/// Exposed so the `BackgroundManager` spawns the same shell as foreground runs.
+pub fn shellPath(io: std.Io) []const u8 {
+    return bashPath(io);
+}
+
+/// Join `name` under the temp directory both the shell and Nova agree on (see
+/// `tempDir`). Used for background-job log files so the model can `tail` a stable
+/// path. Caller owns the result.
+pub fn namedTempPath(gpa: std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]u8 {
+    const dir = try tempDir(gpa);
+    defer gpa.free(dir);
+    return std.fs.path.join(gpa, &.{ dir, name });
+}
+
 var bash_path_value: ?[]const u8 = null;
 
 fn bashPath(io: std.Io) []const u8 {

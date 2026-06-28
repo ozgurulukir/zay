@@ -1,4 +1,5 @@
 const std = @import("std");
+const background = @import("../background.zig");
 const bash = @import("../bash.zig");
 const common = @import("common.zig");
 const os = @import("../os.zig");
@@ -27,7 +28,12 @@ pub const tool: common.Tool = .{
             .kind = .object,
             .description = "Extra environment variables, merged over the inherited env. String values only.",
             .required = false,
-        }, .{ .name = "timeout", .kind = .integer, .description = "Timeout in seconds (default 10).", .required = false } },
+        }, .{ .name = "timeout", .kind = .integer, .description = "Timeout in seconds (default 10).", .required = false }, .{
+            .name = "run_in_background",
+            .kind = .boolean,
+            .description = "Run the command in the background and return immediately. Use for long-running commands (builds, dev servers, watchers) so you are not blocked. The command's exit will be delivered to you as a message; meanwhile read its log file or use ps to check on it. The `timeout` field is ignored for background commands.",
+            .required = false,
+        } },
     },
     .run = runTool,
     .display = display,
@@ -64,6 +70,67 @@ pub fn runTool(
 
     const status: FinishStatus = if (captured.timed_out) .{ .timeout_seconds = args.timeout_seconds } else .{};
     return finishBashOutput(gpa, &captured, status);
+}
+
+/// Whether the bash arguments request a background launch. Cheap parse used by
+/// the executor to decide whether to route the call to the `BackgroundManager`
+/// before falling back to a normal blocking run. False on any parse failure.
+pub fn wantsBackground(gpa: std.mem.Allocator, arguments: []const u8) bool {
+    const Probe = struct { run_in_background: ?bool = null };
+    const parsed = std.json.parseFromSlice(Probe, gpa, arguments, .{ .ignore_unknown_fields = true }) catch return false;
+    defer parsed.deinit();
+    return parsed.value.run_in_background orelse false;
+}
+
+/// Launch the command in the background via `manager` and return immediately
+/// with an observation telling the model the job id, pid, and log path. The
+/// job's eventual exit is delivered to the agent as a message by the manager.
+pub fn runBackground(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    arguments: []const u8,
+    manager: *background.BackgroundManager,
+    owner: *anyopaque,
+) common.Error!common.Output {
+    var args = parseArgs(gpa, arguments) catch |err| return parseError(gpa, err);
+    defer args.deinit();
+    var command_cwd: ?[]u8 = null;
+    defer if (command_cwd) |path| gpa.free(path);
+    const resolved_cwd = if (args.cwd) |path| value: {
+        if (std.fs.path.isAbsolute(path)) break :value path;
+        command_cwd = std.fs.path.join(gpa, &.{ cwd, path }) catch return error.OutOfMemory;
+        break :value command_cwd.?;
+    } else cwd;
+
+    var env_map = try currentEnvMap(gpa, io);
+    defer env_map.deinit();
+    if (args.env) |env| try applyEnv(&env_map, env);
+
+    var started = manager.start(.{
+        .command = args.command,
+        .cwd = resolved_cwd,
+        .env_map = &env_map,
+        .owner = owner,
+    }) catch |err| return mapBackgroundError(gpa, err);
+    defer started.deinit(gpa);
+
+    const text = try std.fmt.allocPrint(
+        gpa,
+        "Started in the background as {s} (pid {d}).\n" ++
+            "Output is streaming to {s} — read that file (e.g. tail) or use ps to check on it.\n" ++
+            "Do not wait on it: its exit will be delivered to you as a message when it finishes.",
+        .{ started.label, started.pid, started.log_path },
+    );
+    return common.ok(gpa, text);
+}
+
+fn mapBackgroundError(gpa: std.mem.Allocator, err: anyerror) common.Error!common.Output {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Canceled => error.Canceled,
+        else => common.failFmt(gpa, 1, "bash: failed to launch background command: {s}\n", .{@errorName(err)}),
+    };
 }
 
 const Args = struct {

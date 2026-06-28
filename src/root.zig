@@ -3,6 +3,7 @@ const std = @import("std");
 pub const agent = @import("agent.zig");
 pub const ai = @import("ai.zig");
 pub const at_mention = @import("at_mention.zig");
+pub const background = @import("background.zig");
 pub const bash = @import("bash.zig");
 pub const bash_classifier_server = @import("bash_classifier_server.zig");
 pub const bash_safety = @import("bash_safety.zig");

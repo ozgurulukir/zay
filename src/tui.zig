@@ -5,6 +5,7 @@ const vxfw = vaxis.vxfw;
 const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
 const at_mention = @import("at_mention.zig");
+const background_mod = @import("background.zig");
 const bash_mod = @import("bash.zig");
 const search_mod = @import("search.zig");
 const codex = @import("codex.zig");
@@ -218,8 +219,32 @@ pub const App = struct {
     at_selection: u32 = 0,
     at_indexing: bool = false,
     at_kind: MentionSearchKind = .file,
+    /// Shared manager for `run_in_background` bash commands. Heap-allocated (so
+    /// its address is stable for the agents that borrow it) and owned here; null
+    /// on the headless/test path. See `background.zig`.
+    background: ?*background_mod.BackgroundManager = null,
+    /// `Ctrl+O` background-jobs modal: open flag, selected row, and whether the
+    /// `[CANCEL]` button column has focus (right-arrow). Mirrors the permission
+    /// overlay's lightweight, mode-less state.
+    background_modal: bool = false,
+    background_selection: usize = 0,
+    background_cancel_focus: bool = false,
+    /// Completed background jobs awaiting delivery. Held here (not pushed into a
+    /// busy transcript) so the notice + model message land only when the owning
+    /// lane is idle — "auto-start if idle, queue if in-flight". Owned; freed in
+    /// `deinit`.
+    background_pending: std.ArrayList(BackgroundDelivery) = .empty,
 
     pub const ctrl_c_double_press_ms: u32 = 1500;
+
+    /// A finished background job buffered for delivery to its owning lane.
+    /// `owner` is the opaque `*Agent` token from the manager; `message` is the
+    /// model-facing completion text (null when the job was killed — notice only).
+    const BackgroundDelivery = struct {
+        owner: *anyopaque,
+        notice: []u8,
+        message: ?[]u8,
+    };
 
     const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message };
     const ModelCatalog = enum { connected_provider, openai_codex };
@@ -254,6 +279,13 @@ pub const App = struct {
         config: config_mod.Config,
     ) !App {
         var app = try init(io, gpa, &runtime.agent);
+        // One shared background manager for the whole session. Heap-allocated so
+        // its address stays put as agents (primary + lanes) borrow it.
+        const manager = try gpa.create(background_mod.BackgroundManager);
+        errdefer gpa.destroy(manager);
+        manager.* = .init(io, gpa);
+        app.background = manager;
+        runtime.agent.background_manager = manager;
         app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = true } };
         app.thread.id = runtime.session_writer.session.id;
         app.codex_signed_in = !runtime.codex_connection_expired and
@@ -290,6 +322,17 @@ pub const App = struct {
                 lane.turn_future = null;
             }
         }
+        // Now that no worker can still be inside `manager.start`, terminate and
+        // join every background job (kills the whole process tree on Windows via
+        // the per-job Job Object). Jobs hold an opaque owner token that is never
+        // dereferenced, so this is independent of lane/agent teardown order.
+        if (self.background) |manager| {
+            manager.deinit();
+            self.gpa.destroy(manager);
+            self.background = null;
+        }
+        for (self.background_pending.items) |*delivery| self.freeDelivery(delivery);
+        self.background_pending.deinit(self.gpa);
         // Cancel the in-flight load first (it needs `io`), then free the
         // catalogue's owned lists + error in one pass.
         self.cancelModelLoad();
@@ -518,6 +561,185 @@ pub const App = struct {
             true,
         });
         return true;
+    }
+
+    /// The lane whose agent is `agent_ptr`, or null if it has been closed. Used
+    /// to route a background-job completion back to the lane that started it.
+    fn laneForAgent(self: *App, agent_ptr: *agent_mod.Agent) ?*Thread {
+        for (self.threads.items) |lane| {
+            if (lane.agent) |a| {
+                if (a == agent_ptr) return lane;
+            }
+        }
+        return null;
+    }
+
+    fn freeDelivery(self: *App, delivery: *BackgroundDelivery) void {
+        self.gpa.free(delivery.notice);
+        if (delivery.message) |message| self.gpa.free(message);
+        delivery.* = undefined;
+    }
+
+    /// Whether the drain/animation tick must stay alive for background work:
+    /// jobs still running, or completions waiting to be delivered.
+    fn backgroundActive(self: *App) bool {
+        if (self.background_pending.items.len > 0) return true;
+        const manager = self.background orelse return false;
+        return manager.activeCount() > 0;
+    }
+
+    /// Drain finished jobs from the manager into `background_pending`. Called each
+    /// tick; the actual delivery (notice + turn) happens in
+    /// `deliverPendingBackground` once the owning lane is idle.
+    fn pollBackgroundJobs(self: *App) !bool {
+        const manager = self.background orelse return false;
+        const finished = manager.takeFinished(self.gpa) catch return false;
+        defer self.gpa.free(finished);
+        for (finished) |*job| {
+            const notice = self.formatBackgroundNotice(job) catch {
+                job.deinit(self.gpa);
+                continue;
+            };
+            // Take the model-facing message out of the job so its deinit only
+            // frees the metadata.
+            const message = job.completion_message;
+            job.completion_message = null;
+            self.background_pending.append(self.gpa, .{
+                .owner = job.owner,
+                .notice = notice,
+                .message = message,
+            }) catch {
+                self.gpa.free(notice);
+                if (message) |m| self.gpa.free(m);
+            };
+            job.deinit(self.gpa);
+        }
+        return finished.len > 0;
+    }
+
+    fn formatBackgroundNotice(self: *App, job: *const background_mod.BackgroundManager.Finished) ![]u8 {
+        if (job.killed) {
+            return std.fmt.allocPrint(self.gpa, "{s} ({s}) was cancelled", .{ job.label, job.command });
+        }
+        return std.fmt.allocPrint(self.gpa, "{s} ({s}) finished — exit {d}", .{ job.label, job.command, job.exit_code });
+    }
+
+    /// Deliver buffered background completions to idle lanes: append the notice
+    /// to the lane's transcript and, for non-killed jobs, enqueue the model
+    /// message and start a turn to answer it. A lane mid-turn is left alone (the
+    /// completion waits); the visible lane is also left alone while the user is
+    /// typing, so a finishing job never yanks them mid-compose.
+    fn deliverPendingBackground(self: *App) !bool {
+        var changed = false;
+        const active = self.thread;
+        defer self.thread = active;
+        var i: usize = 0;
+        while (i < self.background_pending.items.len) {
+            const delivery = &self.background_pending.items[i];
+            const lane = self.laneForAgent(@ptrCast(@alignCast(delivery.owner))) orelse {
+                self.freeDelivery(delivery);
+                _ = self.background_pending.orderedRemove(i);
+                continue;
+            };
+            const composing = lane == active and self.input.buf.realLength() > 0;
+            if (lane.turn.state != .idle or composing) {
+                i += 1;
+                continue;
+            }
+            _ = lane.transcript.append(self.gpa, .notice, "background", delivery.notice) catch {};
+            if (lane == active) changed = true;
+            const start_turn = delivery.message != null;
+            if (delivery.message) |message| lane.agent.?.enqueueRaw(message) catch {};
+            self.freeDelivery(delivery);
+            _ = self.background_pending.orderedRemove(i);
+            if (start_turn) {
+                self.thread = lane;
+                self.startDeliveryTurnOnCurrentThread() catch {};
+                return true;
+            }
+            changed = true;
+            // Removed in place — re-check the same index next iteration.
+        }
+        return changed;
+    }
+
+    /// Start a turn on `self.thread` that drains its agent's queued (background)
+    /// messages into history and answers them. Mirrors
+    /// `restartTurnForQueuedMessages` but is gated on the agent queue, not the
+    /// UI's display queue. Caller must have set `self.thread` to the target lane.
+    fn startDeliveryTurnOnCurrentThread(self: *App) !void {
+        if (self.liveRuntime() != null and self.liveRuntime().?.client == .none) {
+            // No provider to run a turn — drop the queued notice rather than spin
+            // up a doomed worker.
+            self.thread.agent.?.clearQueue();
+            return;
+        }
+        self.resetTurnState();
+        self.thread.worker_context.?.resetCancel();
+        self.thread.turn_view.awaitModel();
+        self.thread.pending_prompt = null;
+        self.thread.turn.submit();
+        self.thread.turn_future = try self.io.concurrent(agent_worker.runAgentTurn, .{
+            self.thread.agent.?,
+            &self.thread.worker_context.?,
+            self.thread.pending_prompt,
+            true,
+        });
+    }
+
+    fn runningBackgroundCount(self: *App) usize {
+        const manager = self.background orelse return 0;
+        return manager.runningCount();
+    }
+
+    /// Toggle the `Ctrl+O` modal. Opening is a no-op when nothing is running, so
+    /// the key only ever surfaces a modal with content.
+    fn toggleBackgroundModal(self: *App) void {
+        if (!self.background_modal and self.runningBackgroundCount() == 0) return;
+        self.background_modal = !self.background_modal;
+        self.background_selection = 0;
+        self.background_cancel_focus = false;
+    }
+
+    /// Route a key to the open background-jobs modal. Returns true when the key
+    /// changed visible state (caller redraws), false when it was swallowed.
+    fn handleBackgroundModalKey(self: *App, key: vaxis.Key) bool {
+        const count = self.runningBackgroundCount();
+        if (count == 0) return false;
+        if (self.background_selection >= count) self.background_selection = count - 1;
+        if (key.matches(vaxis.Key.up, .{})) {
+            if (self.background_selection > 0) self.background_selection -= 1;
+            self.background_cancel_focus = false;
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{})) {
+            if (self.background_selection + 1 < count) self.background_selection += 1;
+            self.background_cancel_focus = false;
+            return true;
+        }
+        if (key.matches(vaxis.Key.left, .{})) {
+            self.background_cancel_focus = false;
+            return true;
+        }
+        if (key.matches(vaxis.Key.right, .{})) {
+            self.background_cancel_focus = true;
+            return true;
+        }
+        if (self.background_cancel_focus and key.matches(vaxis.Key.enter, .{})) {
+            self.cancelSelectedBackgroundJob();
+            return true;
+        }
+        return false;
+    }
+
+    fn cancelSelectedBackgroundJob(self: *App) void {
+        const manager = self.background orelse return;
+        const views = manager.snapshot(self.gpa) catch return;
+        defer background_mod.BackgroundManager.freeViews(self.gpa, views);
+        if (views.len == 0) return;
+        const sel = @min(self.background_selection, views.len - 1);
+        _ = manager.cancel(views[sel].id);
+        self.background_cancel_focus = false;
     }
 
     fn advanceLoadingFrame(self: *App) void {
@@ -2359,6 +2581,9 @@ pub const App = struct {
                 current, // template: reuse the live lane's project prompt + skills
             );
         }
+        // Every lane shares the one background manager so jobs survive lane
+        // switches and are all torn down together at exit.
+        runtime.agent.background_manager = self.background;
         return runtime;
     }
 
@@ -3083,6 +3308,11 @@ const RootWidget = struct {
                     return;
                 }
                 if (key.matches(vaxis.Key.escape, .{})) {
+                    if (self.app.background_modal) {
+                        self.app.background_modal = false;
+                        ctx.consumeAndRedraw();
+                        return;
+                    }
                     if (self.app.permissionPending()) {
                         try self.app.resolvePermission(.reject);
                         ctx.consumeAndRedraw();
@@ -3107,6 +3337,18 @@ const RootWidget = struct {
                     // key so the user doesn't accidentally exit the TUI.
                     self.app.pending_quit_at = null;
                     ctx.consume_event = true;
+                    return;
+                }
+                if (key.matches('o', .{ .ctrl = true })) {
+                    self.app.pending_quit_at = null;
+                    self.app.toggleBackgroundModal();
+                    ctx.consumeAndRedraw();
+                    return;
+                }
+                // While the jobs modal is open it owns navigation/cancel keys.
+                if (self.app.background_modal and self.app.mode == .normal) {
+                    self.app.pending_quit_at = null;
+                    if (self.app.handleBackgroundModalKey(key)) ctx.consumeAndRedraw() else ctx.consumeEvent();
                     return;
                 }
                 if (key.matches('c', .{ .ctrl = true })) {
@@ -3238,6 +3480,10 @@ const RootWidget = struct {
         var visible_change = try self.drainAgentEvents(ctx);
         if (try self.app.drainModelLoad()) visible_change = true;
         if (try self.app.drainDiffRefresh()) visible_change = true;
+        // Collect any finished background jobs, then deliver buffered completions
+        // to idle lanes (notice + a turn to answer them).
+        if (try self.app.pollBackgroundJobs()) visible_change = true;
+        if (try self.app.deliverPendingBackground()) visible_change = true;
 
         if (self.app.thread.turn_view.awaitingOutput() or self.app.thread.transcript.hasRunningTool()) {
             self.spinner_tick_accum += drain_tick_ms;
@@ -3282,7 +3528,8 @@ const RootWidget = struct {
             model_loading or
             diff_loading or
             self.app.blackhole_visible or
-            self.diff_refresh_pending;
+            self.diff_refresh_pending or
+            self.app.backgroundActive();
         if (should_tick) {
             try ctx.tick(drain_tick_ms, self.widget());
         } else {
@@ -3416,12 +3663,14 @@ const RootWidget = struct {
 
         const overlay_visible = self.app.mode != .normal;
         const permission_visible = self.app.permissionPending() and !overlay_visible;
-        const at_visible = self.app.at_active and !overlay_visible and !permission_visible;
+        const background_visible = self.app.background_modal and !overlay_visible and !permission_visible;
+        const at_visible = self.app.at_active and !overlay_visible and !permission_visible and !background_visible;
 
         var child_count: usize = (if (split) self.app.threads.items.len else 1) + 1;
         if (loading_visible) child_count += 1;
         if (overlay_visible) child_count += 1;
         if (permission_visible) child_count += 1;
+        if (background_visible) child_count += 1;
         if (at_visible) child_count += 1;
         const children = try ctx.arena.alloc(vxfw.SubSurface, child_count);
         var idx: usize = 0;
@@ -3491,6 +3740,20 @@ const RootWidget = struct {
             children[idx] = .{
                 .origin = .{ .row = layout.input_row -| panel_height, .col = 0 },
                 .surface = try permission_view.widget().draw(ctx.withConstraints(
+                    .{ .width = max_width, .height = panel_height },
+                    .{ .width = max_width, .height = panel_height },
+                )),
+                .z_index = 3,
+            };
+            idx += 1;
+        }
+        if (background_visible) {
+            var jobs_view: BackgroundJobsWidget = .{ .app = self.app };
+            const rows: u16 = @intCast(@min(@as(usize, 8), self.app.runningBackgroundCount()));
+            const panel_height: u16 = @min(layout.input_row, rows + 4);
+            children[idx] = .{
+                .origin = .{ .row = layout.input_row -| panel_height, .col = 0 },
+                .surface = try jobs_view.widget().draw(ctx.withConstraints(
                     .{ .width = max_width, .height = panel_height },
                     .{ .width = max_width, .height = panel_height },
                 )),
@@ -3780,6 +4043,90 @@ const RootWidget = struct {
 
 const diff_hint_line1 = "↑↓ Move" ++ symbols.separator_dot_padded ++ "⇧↑↓ Select lines" ++ symbols.separator_dot_padded ++ "^↑↓ Jump file" ++ symbols.separator_dot_padded ++ "^P Find file";
 const diff_hint_line2 = "^W Comment" ++ symbols.separator_dot_padded ++ "^E Edit" ++ symbols.separator_dot_padded ++ "^D Delete" ++ symbols.separator_dot_padded ++ "^S Save & send" ++ symbols.separator_dot_padded ++ "Esc Exit";
+
+const BackgroundJobsWidget = struct {
+    app: *App,
+
+    fn widget(self: *BackgroundJobsWidget) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = draw };
+    }
+
+    fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *BackgroundJobsWidget = @ptrCast(@alignCast(ptr));
+        const app = self.app;
+        const empty = vxfw.Surface.init(ctx.arena, self.widget(), .{
+            .width = ctx.max.width orelse 0,
+            .height = ctx.max.height orelse 0,
+        });
+        const manager = app.background orelse return empty;
+        const views = manager.snapshot(ctx.arena) catch return empty;
+        const inner = try ctx.arena.create(BackgroundJobsInner);
+        inner.* = .{
+            .views = views,
+            .selection = if (views.len == 0) 0 else @min(app.background_selection, views.len - 1),
+            .cancel_focus = app.background_cancel_focus,
+        };
+        var border: vxfw.Border = .{
+            .child = inner.widget(),
+            .labels = &.{.{ .text = "Background jobs", .alignment = .top_left }},
+            .style = StylePalette.border_label,
+        };
+        return border.widget().draw(ctx);
+    }
+};
+
+const BackgroundJobsInner = struct {
+    views: []background_mod.BackgroundManager.JobView,
+    selection: usize,
+    cancel_focus: bool,
+
+    fn widget(self: *BackgroundJobsInner) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = draw };
+    }
+
+    fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *BackgroundJobsInner = @ptrCast(@alignCast(ptr));
+        const width = ctx.max.width orelse 0;
+        const height = ctx.max.height orelse 0;
+        var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = width, .height = height });
+        if (width == 0 or height == 0) return surface;
+
+        if (self.views.len == 0) {
+            panel.lineStyledAt(&surface, 0, "No background jobs running.", ctx, 1, StylePalette.thinking_body) catch {};
+            return surface;
+        }
+
+        panel.lineStyledAt(&surface, 0, "↑↓ select · → cancel · Esc close", ctx, 1, StylePalette.panel_header) catch {};
+        const body_rows = height -| 1;
+        var row: u16 = 0;
+        while (row < self.views.len and row < body_rows) : (row += 1) {
+            const view = self.views[row];
+            const selected = row == self.selection;
+            var elapsed_buf: [32]u8 = undefined;
+            const line = std.fmt.allocPrint(ctx.arena, "{s}  {s}  {s}", .{
+                view.label,
+                formatJobElapsed(&elapsed_buf, view.elapsed_seconds),
+                view.command,
+            }) catch view.command;
+            panel.lineAt(&surface, 1 + row, line, ctx, selected, 1) catch {};
+            // The cancel button sits at the right; highlighted only when the
+            // selected row has cancel focus (right-arrow).
+            const focused = selected and self.cancel_focus;
+            const button = if (focused) "[CANCEL]" else "CANCEL";
+            const style = if (focused) StylePalette.tool_failed else StylePalette.thinking_body;
+            panel.rightStyled(&surface, 1 + row, button, ctx, style) catch {};
+        }
+        return surface;
+    }
+};
+
+/// Compact elapsed render for a modal row, e.g. `45s`, `12m03s`, `2h05m`.
+fn formatJobElapsed(buf: []u8, total_seconds: u64) []const u8 {
+    if (total_seconds < 60) return std.fmt.bufPrint(buf, "{d}s", .{total_seconds}) catch "?";
+    const minutes = total_seconds / 60;
+    if (minutes < 60) return std.fmt.bufPrint(buf, "{d}m{d:0>2}s", .{ minutes, total_seconds % 60 }) catch "?";
+    return std.fmt.bufPrint(buf, "{d}h{d:0>2}m", .{ minutes / 60, minutes % 60 }) catch "?";
+}
 
 const PermissionWidget = struct {
     app: *App,
@@ -5185,7 +5532,12 @@ const InputWidget = struct {
         const base_row: u16 = input_row + border_height;
         const show_hint = height >= base_row + 1;
         const show_diff = show_hint and self.app.diffCountsVisible();
-        const children_count: usize = 1 + @as(usize, if (show_hint) 1 else 0) + @as(usize, if (show_diff) 1 else 0) + @as(usize, if (queued_visible) 1 else 0);
+        const show_badge = show_hint and self.app.runningBackgroundCount() > 0;
+        const children_count: usize = 1 +
+            @as(usize, if (show_hint) 1 else 0) +
+            @as(usize, if (show_diff) 1 else 0) +
+            @as(usize, if (show_badge) 1 else 0) +
+            @as(usize, if (queued_visible) 1 else 0);
         const children = try ctx.arena.alloc(vxfw.SubSurface, children_count);
         var child_index: usize = 0;
         if (queued_visible) {
@@ -5210,6 +5562,15 @@ const InputWidget = struct {
         }
         if (show_diff) {
             try self.drawDiffCounts(ctx, children, child_index, base_row, max_width);
+            child_index += 1;
+        }
+        if (show_badge) {
+            children[child_index] = .{
+                .origin = .{ .row = base_row, .col = 1 },
+                .surface = try self.drawBackgroundBadge(ctx, max_width -| 2),
+                .z_index = 2,
+            };
+            child_index += 1;
         }
         return .{
             .size = .{ .width = max_width, .height = height },
@@ -5275,6 +5636,19 @@ const InputWidget = struct {
             .surface = try hint_text.widget().draw(ctx.withConstraints(.{ .width = width, .height = 1 }, .{ .width = width, .height = 1 })),
             .z_index = 0,
         };
+    }
+
+    /// Bottom-left status pill: live background-job count + the Ctrl+O hint, in
+    /// black-on-blue so it reads as a control affordance.
+    fn drawBackgroundBadge(self: *InputWidget, ctx: vxfw.DrawContext, max_width: u16) std.mem.Allocator.Error!vxfw.Surface {
+        const count = self.app.runningBackgroundCount();
+        const text = try std.fmt.allocPrint(ctx.arena, " {d} background job{s} · Ctrl+O ", .{ count, if (count == 1) "" else "s" });
+        const text_width: u16 = @intCast(@min(ctx.stringWidth(text), max_width));
+        var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = text_width, .height = 1 });
+        if (text_width == 0) return surface;
+        panel.fillRow(&surface, 0, StylePalette.background_badge);
+        panel.lineStyledAt(&surface, 0, text, ctx, 0, StylePalette.background_badge) catch {};
+        return surface;
     }
 
     fn drawDiffCounts(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, child_index: usize, row: u16, width: u16) std.mem.Allocator.Error!void {

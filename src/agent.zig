@@ -3,6 +3,7 @@ const logger = @import("logger");
 
 const ai = @import("ai.zig");
 const at_mention = @import("at_mention.zig");
+const background_mod = @import("background.zig");
 const bounded_queue = @import("bounded_queue");
 const compaction = @import("compaction.zig");
 const context_mod = @import("context.zig");
@@ -24,6 +25,11 @@ const QueuedUserMessage = struct {
     /// rather than waiting for the turn to go idle. The UI flips it via
     /// `setQueuedSteer` when the user steers a queued message.
     steer: bool = false,
+    /// When set, the text is delivered verbatim as a user message — no
+    /// `@`-mention expansion or skill-prefix handling. Used for machine-
+    /// generated content (e.g. background-job completion notices) whose body
+    /// must not be reinterpreted as file references.
+    raw: bool = false,
 };
 
 const MessageQueue = bounded_queue.BoundedQueue(QueuedUserMessage);
@@ -120,6 +126,10 @@ pub const Agent = struct {
     bash_classifier_url: ?[]const u8 = null,
     /// Optional synchronous approval hook used by the TUI worker.
     bash_approval: ?BashApproval = null,
+    /// Optional shared manager for long-running bash commands launched with
+    /// `run_in_background`. Borrowed (owned by the App); null disables the
+    /// background path so such calls fall back to a normal blocking run.
+    background_manager: ?*background_mod.BackgroundManager = null,
     /// Background summarizer state machine.
     compactor: Compactor = .{},
     message_queue: MessageQueue = .{},
@@ -182,6 +192,28 @@ pub const Agent = struct {
         self.lockMessageQueue();
         defer self.message_queue_mutex.unlock();
         if (!self.message_queue.push(&self.message_queue_storage, .{ .prompt = owned })) return error.QueueFull;
+    }
+
+    /// Queue a machine-generated user message delivered verbatim (no `@`-mention
+    /// expansion or skill prefixing) at the next turn boundary. Thread-safe — the
+    /// `BackgroundManager` callers reach it from the UI thread while the worker
+    /// may be draining the same queue. See `QueuedUserMessage.raw`.
+    pub fn enqueueRaw(self: *Agent, content: []const u8) !void {
+        assert(content.len > 0);
+        const owned = try self.gpa.dupe(u8, content);
+        errdefer self.gpa.free(owned);
+        self.lockMessageQueue();
+        defer self.message_queue_mutex.unlock();
+        if (!self.message_queue.push(&self.message_queue_storage, .{ .prompt = owned, .raw = true })) return error.QueueFull;
+    }
+
+    /// Whether any user message is waiting in the queue. The UI uses this to
+    /// decide whether an idle lane should start a turn to deliver a background
+    /// completion that was enqueued while no turn was running.
+    pub fn hasQueuedMessages(self: *Agent) bool {
+        self.lockMessageQueue();
+        defer self.message_queue_mutex.unlock();
+        return self.message_queue.len() > 0;
     }
 
     /// Expand `@`-mentions in `prompt` (embedding text files inline, attaching
@@ -433,6 +465,10 @@ pub const Agent = struct {
             .io = self.io,
             .cwd = self.cwd,
             .bash_classifier_url = self.bash_classifier_url,
+            .background = if (self.background_manager) |manager|
+                .{ .manager = manager, .owner = self }
+            else
+                null,
         });
         const results = try executor.runAll(tool_batch.calls, .{
             .ptr = &bridge,
@@ -654,9 +690,12 @@ pub const Agent = struct {
     }
 
     fn drainQueuedUserMessage(self: *Agent, steer_only: bool) !u32 {
-        const prompt = self.takeQueuedUserPrompt(steer_only) orelse return 0;
-        defer self.gpa.free(prompt);
-        try self.addUserPrompt(prompt);
+        const queued = self.takeQueuedUserMessage(steer_only) orelse return 0;
+        defer self.gpa.free(queued.prompt);
+        // Raw (machine-generated) messages bypass `@`-mention expansion and skill
+        // prefixing so their body is never reinterpreted; user-typed prompts go
+        // through the full expansion path.
+        if (queued.raw) try self.addUser(queued.prompt) else try self.addUserPrompt(queued.prompt);
         return 1;
     }
 
@@ -680,18 +719,17 @@ pub const Agent = struct {
         }
     }
 
-    /// Pop and return the front queued prompt. When `steer_only` is set, only
+    /// Pop and return the front queued message. When `steer_only` is set, only
     /// pops if the front message is marked to steer (otherwise returns null,
-    /// leaving the queue untouched).
-    fn takeQueuedUserPrompt(self: *Agent, steer_only: bool) ?[]u8 {
+    /// leaving the queue untouched). Caller owns `queued.prompt`.
+    fn takeQueuedUserMessage(self: *Agent, steer_only: bool) ?QueuedUserMessage {
         self.lockMessageQueue();
         defer self.message_queue_mutex.unlock();
         if (steer_only) {
             const front = self.message_queue.peek(&self.message_queue_storage) orelse return null;
             if (!front.steer) return null;
         }
-        const queued = self.message_queue.pop(&self.message_queue_storage) orelse return null;
-        return queued.prompt;
+        return self.message_queue.pop(&self.message_queue_storage);
     }
 
     /// Mark the queued message at logical `index` to steer (inject after the
@@ -1113,6 +1151,26 @@ test "drain all queued moves the whole queue to history in FIFO order" {
     try std.testing.expectEqualStrings("a", agent.messages()[0].text());
     try std.testing.expectEqualStrings("c", agent.messages()[2].text());
     try std.testing.expectEqual(@as(u32, 0), agent.message_queue.len());
+}
+
+test "raw enqueued messages are delivered verbatim without @-mention expansion" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    try std.testing.expect(!agent.hasQueuedMessages());
+    // A background completion notice may contain an `@` that must not be treated
+    // as a file mention.
+    try agent.enqueueRaw("Background command bg_1 (`echo @no/such/file`) finished — exit 0");
+    try std.testing.expect(agent.hasQueuedMessages());
+
+    try std.testing.expectEqual(@as(u32, 1), try agent.drainQueuedUserMessage(false));
+    try std.testing.expectEqual(@as(usize, 1), agent.messages().len);
+    try std.testing.expectEqualStrings(
+        "Background command bg_1 (`echo @no/such/file`) finished — exit 0",
+        agent.messages()[0].text(),
+    );
+    try std.testing.expect(!agent.hasQueuedMessages());
 }
 
 test "clear queue drops messages without delivering them" {

@@ -106,7 +106,7 @@ pub const Schema = struct {
         required: bool,
     };
 
-    pub const Kind = enum { string, integer, object };
+    pub const Kind = enum { string, integer, object, boolean };
 };
 
 pub fn ok(gpa: std.mem.Allocator, stdout: []u8) Error!Output {

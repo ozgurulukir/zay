@@ -3,10 +3,21 @@
 const std = @import("std");
 
 const ai = @import("ai.zig");
+const background = @import("background.zig");
 const bash_safety = @import("bash_safety.zig");
+const bash_tool = @import("tools/bash.zig");
 const tools = @import("tools.zig");
 
 const assert = std.debug.assert;
+
+/// Wiring for the background-bash path: the shared manager plus an opaque token
+/// identifying the agent the job belongs to (the manager hands it back at
+/// completion so the UI can route the delivery to the right lane). Threaded in
+/// by the agent only when a `BackgroundManager` is attached.
+pub const BackgroundStart = struct {
+    manager: *background.BackgroundManager,
+    owner: *anyopaque,
+};
 
 /// The output of one ToolCall, carrying both the LLM channel (the terse
 /// observation that flows into history) and the human channel (display
@@ -73,12 +84,14 @@ pub const ExecutorService = struct {
     io: std.Io,
     cwd: []const u8,
     bash_classifier_url: ?[]const u8 = null,
+    background: ?BackgroundStart = null,
 
     pub const InitOptions = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         cwd: []const u8,
         bash_classifier_url: ?[]const u8 = null,
+        background: ?BackgroundStart = null,
     };
 
     pub fn init(options: InitOptions) ExecutorService {
@@ -89,6 +102,7 @@ pub const ExecutorService = struct {
             .io = options.io,
             .cwd = options.cwd,
             .bash_classifier_url = options.bash_classifier_url,
+            .background = options.background,
         };
     }
 
@@ -135,7 +149,7 @@ pub const ExecutorService = struct {
     }
 
     fn runOne(self: *ExecutorService, call: ai.ToolCall) !ToolResult {
-        var output = tools.run(self.gpa, self.io, self.cwd, call.name, call.arguments) catch |err| switch (err) {
+        var output = self.produceOutput(call) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled => return error.Canceled,
             else => return self.runFailure(call, err),
@@ -164,6 +178,18 @@ pub const ExecutorService = struct {
             .stderr = stderr,
             .failed = failed,
         };
+    }
+
+    /// Source the tool's `Output`, routing a `run_in_background` bash call to the
+    /// `BackgroundManager` (which spawns the job and returns immediately) and
+    /// everything else through the normal blocking tool registry.
+    fn produceOutput(self: *ExecutorService, call: ai.ToolCall) tools.Error!tools.Output {
+        if (self.background) |bg| {
+            if (std.mem.eql(u8, call.name, "bash") and bash_tool.wantsBackground(self.gpa, call.arguments)) {
+                return bash_tool.runBackground(self.gpa, self.io, self.cwd, call.arguments, bg.manager, bg.owner);
+            }
+        }
+        return tools.run(self.gpa, self.io, self.cwd, call.name, call.arguments);
     }
 
     fn runFailure(self: *ExecutorService, call: ai.ToolCall, err: anyerror) !ToolResult {
