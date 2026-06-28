@@ -12,10 +12,9 @@
 //! jobs each tick (see `takeFinished`) and enqueues the notice itself, keeping
 //! all agent/history mutation on the UI/worker threads.
 //!
-//! Lifecycle: a clean exit calls `shutdownAll` (terminate + join). On Windows the
-//! per-job Job Object additionally carries KILL_ON_JOB_CLOSE, so an unexpected
-//! Nova exit (panic/kill) still tears down the whole process tree when our last
-//! handle closes.
+//! Lifecycle: a clean exit (and the modal's cancel) calls `terminateTree`, which
+//! kills the whole process tree — `taskkill /T` on Windows, `kill` on POSIX.
+//! TODO: Address orphaned processes when an unexpected exit happens.
 
 const std = @import("std");
 
@@ -107,7 +106,6 @@ pub const BackgroundManager = struct {
         started: std.Io.Timestamp,
         child: std.process.Child,
         log_file: std.Io.File,
-        kill_handle: KillHandle,
         tail: std.ArrayList(u8) = .empty,
         thread: ?std.Thread = null,
         state: std.atomic.Value(State) = .init(.running),
@@ -164,7 +162,6 @@ pub const BackgroundManager = struct {
         // From here a failure must also tear down the spawned child.
         errdefer child.kill(io);
 
-        const kill_handle = KillHandle.make(child);
         const pid = processId(child);
 
         const command_owned = try gpa.dupe(u8, opts.command);
@@ -186,7 +183,6 @@ pub const BackgroundManager = struct {
             .started = std.Io.Timestamp.now(io, .awake),
             .child = child,
             .log_file = log_file,
-            .kill_handle = kill_handle,
         };
 
         const result: StartResult = .{
@@ -337,17 +333,23 @@ pub const BackgroundManager = struct {
         return count;
     }
 
-    /// Request termination of job `id`. The process (and on Windows its whole
-    /// tree) is killed; the reader then reaps it and marks it finished+killed.
-    /// Returns true if a running job matched.
+    /// Request termination of job `id`, killing the whole process tree. The
+    /// reader then reaps it and marks it finished+killed. Returns true if a
+    /// running job matched. The actual kill runs outside the lock so it never stalls the UI's draw/poll path.
     pub fn cancel(self: *BackgroundManager, id: u32) bool {
         self.lockMutex();
-        defer self.mutex.unlock();
+        var pid: ?i64 = null;
         for (self.jobs.items) |job| {
             if (job.id != id) continue;
-            if (job.state.load(.acquire) != .running) return false;
-            job.killed.store(true, .release);
-            job.kill_handle.terminate();
+            if (job.state.load(.acquire) == .running) {
+                job.killed.store(true, .release);
+                pid = job.pid;
+            }
+            break;
+        }
+        self.mutex.unlock();
+        if (pid) |p| {
+            terminateTree(self.io, self.gpa, p);
             return true;
         }
         return false;
@@ -422,7 +424,7 @@ pub const BackgroundManager = struct {
         for (list.items) |job| {
             if (job.state.load(.acquire) == .running) {
                 job.killed.store(true, .release);
-                job.kill_handle.terminate();
+                terminateTree(self.io, self.gpa, job.pid);
             }
             if (job.thread) |thread| {
                 thread.join();
@@ -440,7 +442,6 @@ pub const BackgroundManager = struct {
 
     fn destroyJob(gpa: std.mem.Allocator, io: std.Io, job: *Job) void {
         _ = io;
-        job.kill_handle.deinit();
         gpa.free(job.label);
         gpa.free(job.command);
         gpa.free(job.cwd);
@@ -479,153 +480,37 @@ fn termCode(term: std.process.Child.Term) u8 {
     };
 }
 
+/// Kill a job's whole process tree by pid. Best-effort and side-effect free on
+/// the caller's data — runs outside the manager lock.
+fn terminateTree(io: std.Io, gpa: std.mem.Allocator, pid: i64) void {
+    if (os.is_windows) {
+        const pid_arg = std.fmt.allocPrint(gpa, "{d}", .{pid}) catch return;
+        defer gpa.free(pid_arg);
+        const result = std.process.run(gpa, io, .{
+            .argv = &.{ "taskkill", "/F", "/T", "/PID", pid_arg },
+            .stdout_limit = .limited(64 * 1024),
+            .stderr_limit = .limited(64 * 1024),
+            .timeout = bash.timeoutFromSeconds(5),
+        }) catch return;
+        gpa.free(result.stdout);
+        gpa.free(result.stderr);
+        return;
+    }
+    std.posix.kill(@intCast(pid), std.posix.SIG.KILL) catch {};
+}
+
 fn processId(child: std.process.Child) i64 {
     if (os.is_windows) return @intCast(windows.GetProcessId(child.id.?));
     return @intCast(child.id.?);
 }
 
-/// Platform handle used to terminate a job's whole process tree.
-const KillHandle = if (os.is_windows) WindowsKill else PosixKill;
-
-const PosixKill = struct {
-    pid: std.posix.pid_t,
-
-    fn make(child: std.process.Child) PosixKill {
-        return .{ .pid = child.id.? };
-    }
-
-    /// Best-effort: signals the direct shell child. Grandchildren in the same
-    /// group are not reliably reached without a process-group setup the spawn
-    /// API does not expose — see the module header.
-    fn terminate(self: *PosixKill) void {
-        std.posix.kill(self.pid, std.posix.SIG.KILL) catch {};
-    }
-
-    fn deinit(self: *PosixKill) void {
-        self.* = undefined;
-    }
-};
-
-const WindowsKill = struct {
-    /// Job Object owning the process tree; null if creation/assignment failed,
-    /// in which case `proc` is used for a single-process terminate.
-    job: ?windows.HANDLE,
-    /// Independent duplicate of the process handle, valid until `deinit` — so
-    /// terminating never races the reader thread closing the child's own handle.
-    proc: ?windows.HANDLE,
-
-    fn make(child: std.process.Child) WindowsKill {
-        const hproc = child.id.?;
-        var dup: windows.HANDLE = undefined;
-        const proc: ?windows.HANDLE = if (windows.DuplicateHandle(
-            windows.GetCurrentProcess(),
-            hproc,
-            windows.GetCurrentProcess(),
-            &dup,
-            0,
-            0,
-            windows.DUPLICATE_SAME_ACCESS,
-        ) != 0) dup else null;
-
-        var job: ?windows.HANDLE = windows.CreateJobObjectW(null, null);
-        if (job) |handle| {
-            var info: windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std.mem.zeroes(windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
-            info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            _ = windows.SetInformationJobObject(
-                handle,
-                windows.JobObjectExtendedLimitInformation,
-                &info,
-                @sizeOf(windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION),
-            );
-            if (windows.AssignProcessToJobObject(handle, hproc) == 0) {
-                std.os.windows.CloseHandle(handle);
-                job = null;
-            }
-        }
-        return .{ .job = job, .proc = proc };
-    }
-
-    fn terminate(self: *WindowsKill) void {
-        if (self.job) |handle| {
-            _ = windows.TerminateJobObject(handle, 1);
-        } else if (self.proc) |handle| {
-            _ = windows.TerminateProcess(handle, 1);
-        }
-    }
-
-    fn deinit(self: *WindowsKill) void {
-        // Closing the job's last handle also kills any survivors
-        // (KILL_ON_JOB_CLOSE), the backstop for an unexpected Nova exit.
-        if (self.job) |handle| std.os.windows.CloseHandle(handle);
-        if (self.proc) |handle| std.os.windows.CloseHandle(handle);
-        self.* = undefined;
-    }
-};
-
-/// Win32 surface for process-tree termination, kept local so the rest of the
-/// codebase stays platform-agnostic.
+/// Minimal Win32 surface — just the pid query, so the displayed/taskkill pid
+/// matches the real OS process. No Job Object or handle duplication: those
+/// disturb cygwin (see `terminateTree`).
 const windows = struct {
     const HANDLE = std.os.windows.HANDLE;
-    // Plain C int rather than std's `Bool(c_int)` enum so the `!= 0` / `== 0`
-    // ABI checks below read naturally; the Win32 BOOL is a 32-bit int.
-    const BOOL = c_int;
     const DWORD = std.os.windows.DWORD;
-
-    const DUPLICATE_SAME_ACCESS: DWORD = 0x00000002;
-    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: DWORD = 0x00002000;
-    const JobObjectExtendedLimitInformation: c_int = 9;
-
-    const IO_COUNTERS = extern struct {
-        ReadOperationCount: u64,
-        WriteOperationCount: u64,
-        OtherOperationCount: u64,
-        ReadTransferCount: u64,
-        WriteTransferCount: u64,
-        OtherTransferCount: u64,
-    };
-
-    const JOBOBJECT_BASIC_LIMIT_INFORMATION = extern struct {
-        PerProcessUserTimeLimit: i64,
-        PerJobUserTimeLimit: i64,
-        LimitFlags: DWORD,
-        MinimumWorkingSetSize: usize,
-        MaximumWorkingSetSize: usize,
-        ActiveProcessLimit: DWORD,
-        Affinity: usize,
-        PriorityClass: DWORD,
-        SchedulingClass: DWORD,
-    };
-
-    const JOBOBJECT_EXTENDED_LIMIT_INFORMATION = extern struct {
-        BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION,
-        IoInfo: IO_COUNTERS,
-        ProcessMemoryLimit: usize,
-        JobMemoryLimit: usize,
-        PeakProcessMemoryUsed: usize,
-        PeakJobMemoryUsed: usize,
-    };
-
-    extern "kernel32" fn GetCurrentProcess() callconv(.winapi) HANDLE;
     extern "kernel32" fn GetProcessId(Process: HANDLE) callconv(.winapi) DWORD;
-    extern "kernel32" fn TerminateProcess(hProcess: HANDLE, uExitCode: c_uint) callconv(.winapi) BOOL;
-    extern "kernel32" fn CreateJobObjectW(lpJobAttributes: ?*anyopaque, lpName: ?[*:0]const u16) callconv(.winapi) ?HANDLE;
-    extern "kernel32" fn AssignProcessToJobObject(hJob: HANDLE, hProcess: HANDLE) callconv(.winapi) BOOL;
-    extern "kernel32" fn TerminateJobObject(hJob: HANDLE, uExitCode: c_uint) callconv(.winapi) BOOL;
-    extern "kernel32" fn SetInformationJobObject(
-        hJob: HANDLE,
-        JobObjectInformationClass: c_int,
-        lpJobObjectInformation: *anyopaque,
-        cbJobObjectInformationLength: DWORD,
-    ) callconv(.winapi) BOOL;
-    extern "kernel32" fn DuplicateHandle(
-        hSourceProcessHandle: HANDLE,
-        hSourceHandle: HANDLE,
-        hTargetProcessHandle: HANDLE,
-        lpTargetHandle: *HANDLE,
-        dwDesiredAccess: DWORD,
-        bInheritHandle: BOOL,
-        dwOptions: DWORD,
-    ) callconv(.winapi) BOOL;
 };
 
 test "manager runs a command, streams a log, and reports completion" {
@@ -667,6 +552,47 @@ test "manager runs a command, streams a log, and reports completion" {
     try std.testing.expect(std.mem.indexOf(u8, finished[0].completion_message.?, "hello-bg") != null);
     try std.testing.expect(@as(*anyopaque, &owner) == finished[0].owner);
     // Reported job is removed from the manager.
+    try std.testing.expectEqual(@as(usize, 0), manager.activeCount());
+}
+
+test "cancel terminates a running job and reports it killed" {
+    const gpa = std.testing.allocator;
+    var manager = BackgroundManager.init(std.testing.io, gpa);
+    defer manager.deinit();
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var owner: u8 = 0;
+
+    var started = try manager.start(.{
+        .command = "sleep 30",
+        .cwd = ".",
+        .env_map = &env,
+        .owner = &owner,
+    });
+    defer started.deinit(gpa);
+
+    // Give the shell a moment to come up, then cancel by id.
+    std.testing.io.sleep(.fromMilliseconds(100), .awake) catch {};
+    try std.testing.expect(manager.cancel(1));
+
+    var finished: []BackgroundManager.Finished = &.{};
+    var tries: usize = 0;
+    while (tries < 500) : (tries += 1) {
+        finished = try manager.takeFinished(gpa);
+        if (finished.len > 0) break;
+        gpa.free(finished);
+        std.testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    defer {
+        for (finished) |*job| job.deinit(gpa);
+        gpa.free(finished);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), finished.len);
+    try std.testing.expect(finished[0].killed);
+    // A user-cancelled job is surfaced in the UI only — no model message.
+    try std.testing.expect(finished[0].completion_message == null);
     try std.testing.expectEqual(@as(usize, 0), manager.activeCount());
 }
 
