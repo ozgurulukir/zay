@@ -52,6 +52,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
         },
     });
+    const counting_allocator_mod = b.createModule(.{
+        .root_source_file = b.path("lib/counting_allocator.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const translate_c = b.addTranslateC(.{
         .root_source_file = b.path("src/c.h"),
         .target = target,
@@ -94,6 +99,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "logger", .module = logger_mod },
             .{ .name = "dynlib", .module = dynlib_mod },
             .{ .name = "terminal_markdown", .module = terminal_markdown_mod },
+            .{ .name = "counting_allocator", .module = counting_allocator_mod },
             .{ .name = "c", .module = c_mod },
             .{ .name = "model_catalog", .module = model_catalog_mod },
         },
@@ -226,6 +232,39 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    for ([_]*std.Build.Module{
+        terminal_markdown_mod,
+        bounded_queue_mod,
+        logger_mod,
+        websocket_mod,
+    }) |lib_mod| {
+        const lib_tests = b.addTest(.{ .root_module = lib_mod, .filters = test_filters });
+        test_step.dependOn(&b.addRunArtifact(lib_tests).step);
+    }
+
+    // Benchmarks are standalone executables under bench/, always built
+    // ReleaseFast so the numbers are meaningful, and wired only to
+    // `zig build bench` — never to the default install or `zig build test`.
+    const bench_step = b.step("bench", "Run benchmarks (ReleaseFast)");
+    for ([_][]const u8{
+        "bench/markdown_render.zig",
+        "bench/markdown_incremental.zig",
+    }) |bench_src| {
+        const bench_exe = b.addExecutable(.{
+            .name = b.fmt("bench-{s}", .{std.fs.path.stem(bench_src)}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(bench_src),
+                .target = target,
+                .optimize = .ReleaseFast,
+                .imports = &.{
+                    .{ .name = "terminal_markdown", .module = terminal_markdown_mod },
+                    .{ .name = "counting_allocator", .module = counting_allocator_mod },
+                },
+            }),
+        });
+        bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
+    }
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
