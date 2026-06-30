@@ -17,6 +17,7 @@ const vcs = @import("vcs.zig");
 const skill_mod = @import("skill.zig");
 const symbols = @import("symbols.zig");
 const transcript_mod = @import("transcript.zig");
+const CountingAllocator = @import("counting_allocator").CountingAllocator;
 const agent_worker = @import("tui/agent_worker.zig");
 const Turn = @import("tui/turn.zig");
 const model_catalogue = @import("tui/model_catalogue.zig");
@@ -4608,6 +4609,30 @@ const LoadingWidget = struct {
     }
 };
 
+const MessageListBuilder = struct {
+    arena: std.mem.Allocator,
+    messages: []transcript_mod.Message,
+    selected: ?u32,
+    loading_frame: u8,
+    blackhole_frame: u16,
+    gpa: std.mem.Allocator,
+
+    fn build(ptr: *const anyopaque, idx: usize, cursor: usize) ?vxfw.Widget {
+        _ = cursor;
+        const self: *const MessageListBuilder = @ptrCast(@alignCast(ptr));
+        if (idx >= self.messages.len) return null;
+        const body = self.arena.create(MessageWidget) catch return null;
+        body.* = .{
+            .message = &self.messages[idx],
+            .selected = if (self.selected) |selected| selected == idx else false,
+            .loading_frame = self.loading_frame,
+            .blackhole_frame = self.blackhole_frame,
+            .gpa = self.gpa,
+        };
+        return body.widget();
+    }
+};
+
 const TranscriptWidget = struct {
     app: *App,
     /// The lane this pane renders — the active lane today; any lane once tiled.
@@ -4623,9 +4648,17 @@ const TranscriptWidget = struct {
     fn drawTranscript(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *TranscriptWidget = @ptrCast(@alignCast(ptr));
         self.syncViewport(ctx);
-        const widgets = try self.messageWidgets(ctx);
-        self.thread.transcript_list.children = .{ .slice = widgets };
-        self.thread.transcript_list.item_count = @intCast(widgets.len);
+
+        var builder: MessageListBuilder = .{
+            .arena = ctx.arena,
+            .messages = self.thread.transcript.messages.items,
+            .selected = self.thread.transcript.selected,
+            .loading_frame = self.app.loading_frame,
+            .blackhole_frame = self.app.blackhole_frame,
+            .gpa = self.app.gpa,
+        };
+        self.thread.transcript_list.children = .{ .builder = .{ .userdata = &builder, .buildFn = MessageListBuilder.build } };
+        self.thread.transcript_list.item_count = @intCast(self.thread.transcript.messages.items.len);
         self.syncCursor(ctx);
 
         var list_padding: vxfw.Padding = .{
@@ -4653,18 +4686,6 @@ const TranscriptWidget = struct {
         self.thread.transcript_view_width = max_width;
         self.thread.transcript_view_height = max_height -| ConversationLayout.top -| ConversationLayout.bottom;
         if (self.thread.transcript_view_height == 0) self.thread.transcript_view_height = 1;
-    }
-
-    fn messageWidgets(self: *TranscriptWidget, ctx: vxfw.DrawContext) ![]vxfw.Widget {
-        const messages = self.thread.transcript.messages.items;
-        const widgets = try ctx.arena.alloc(vxfw.Widget, messages.len);
-        const bodies = try ctx.arena.alloc(MessageWidget, messages.len);
-        for (messages, 0..) |*message, index| {
-            const selected = if (self.thread.transcript.selected) |selected_index| selected_index == index else false;
-            bodies[index] = .{ .message = message, .selected = selected, .loading_frame = self.app.loading_frame, .blackhole_frame = self.app.blackhole_frame, .gpa = self.app.gpa };
-            widgets[index] = bodies[index].widget();
-        }
-        return widgets;
     }
 
     fn syncCursor(self: *TranscriptWidget, ctx: vxfw.DrawContext) void {
@@ -7752,4 +7773,53 @@ test "switching lanes is a no-op with a single lane" {
     const before = app.thread;
     app.switchToNextLane();
     try std.testing.expectEqual(before, app.thread);
+}
+
+const BenchResult = struct { allocs: usize, bytes: usize };
+
+fn benchTranscriptDraw(gpa: std.mem.Allocator, n: usize) !BenchResult {
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    const body = "This is a paragraph of agent markdown that wraps across the\nterminal a few times so the row counting and render caches do real work.\n";
+    var i: usize = 0;
+    while (i < n) : (i += 1) _ = try app.thread.transcript.append(gpa, .agent, "agent", body);
+    app.thread.transcript_view_width = 100;
+    app.thread.transcript_view_height = 40;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var counting: CountingAllocator = .{ .child = arena.allocator() };
+    var transcript_widget: TranscriptWidget = .{ .app = &app, .thread = app.thread };
+
+    const draw = struct {
+        fn f(tw: *TranscriptWidget, ar: *std.heap.ArenaAllocator, c: *CountingAllocator) !void {
+            _ = ar.reset(.retain_capacity);
+            const ctx: vxfw.DrawContext = .{
+                .arena = c.allocator(),
+                .min = .{},
+                .max = .{ .width = 100, .height = 40 },
+                .cell_size = .{ .width = 10, .height = 20 },
+            };
+            _ = try tw.widget().draw(ctx);
+        }
+    }.f;
+
+    // Warm frame: renders + caches markdown for the visible messages.
+    try draw(&transcript_widget, &arena, &counting);
+
+    // One measured warm frame for allocation accounting.
+    counting.count = 0;
+    counting.bytes = 0;
+    try draw(&transcript_widget, &arena, &counting);
+    return .{ .allocs = counting.count, .bytes = counting.bytes };
+}
+
+test "transcript draw allocation does not scale with history length" {
+    const gpa = std.testing.allocator;
+    const small = try benchTranscriptDraw(gpa, 50);
+    const large = try benchTranscriptDraw(gpa, 800);
+    try std.testing.expect(large.bytes <= small.bytes + 4096);
 }

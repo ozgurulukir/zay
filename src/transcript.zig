@@ -47,22 +47,6 @@ pub const RowCache = struct {
     rows: u16 = 0,
 };
 
-/// Memoized rendered markdown for an `.agent` body at a given width. Where
-/// `RowCache` stores only a row *count*, this keeps the fully rendered
-/// `Row`/`Span` list so a visible message isn't re-parsed on every animation
-/// frame (the dominant per-frame cost in the draw loop). The spans borrow
-/// slices of `Message.body`, so the cache is valid only while the body is
-/// unchanged: every mutator that touches the body invalidates it via
-/// `invalidateRowCache`, and `deinit` frees the owned row/span arrays. The draw
-/// layer leaves very large bodies uncached (see `message.zig`) so a giant
-/// message never materializes its whole row list — preserving the draw-time
-/// out-of-memory guard.
-pub const RenderCache = struct {
-    valid: bool = false,
-    width: u16 = 0,
-    rendered: ?terminal_markdown.Rendered = null,
-};
-
 pub const Message = struct {
     kind: MessageKind,
     title: []u8,
@@ -84,28 +68,19 @@ pub const Message = struct {
     tool_expanded_title: ?[]u8 = null,
     /// Cached row count; see `RowCache`. Not owned, needs no cleanup.
     row_cache: RowCache = .{},
-    /// Cached rendered markdown; see `RenderCache`. Owned — freed in `deinit`.
-    render_cache: RenderCache = .{},
+    render_inc: terminal_markdown.Incremental = .{},
 
     pub fn deinit(self: *Message, gpa: std.mem.Allocator) void {
         gpa.free(self.title);
         gpa.free(self.body);
         if (self.stderr_body) |stderr| gpa.free(stderr);
         if (self.tool_expanded_title) |title| gpa.free(title);
-        if (self.render_cache.rendered) |*rendered| rendered.deinit(gpa);
+        self.render_inc.deinit(gpa);
         self.* = undefined;
     }
 
-    /// Drop the memoized row count and rendered markdown after a layout-affecting
-    /// change. The rendered markdown's spans borrow `body`, which the caller is
-    /// about to mutate (and may move via `realloc`), so the stale render must
-    /// never be drawn again. The owned allocation is freed lazily — on the next
-    /// render or in `deinit` — because this runs on hot mutators with no
-    /// allocator at hand; freeing only releases the gpa-owned row/span arrays and
-    /// never dereferences the borrowed (now-dangling) span text.
     pub fn invalidateRowCache(self: *Message) void {
         self.row_cache.valid = false;
-        self.render_cache.valid = false;
     }
 };
 

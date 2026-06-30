@@ -367,41 +367,20 @@ fn drawMarkdown(
     const text = self.message.body;
     const content_width = @max(ConversationLayout.contentWidth(surface.size.width), 1);
 
-    // Markdown rendering is the dominant per-frame cost, and a visible message
-    // is otherwise re-parsed on every animation tick even when nothing about it
-    // changed. Cache the rendered rows on the message (keyed by width, dropped
-    // by `Transcript` mutators) so only the message whose body actually changed is
-    // re-rendered.
     const rows: []const terminal_markdown.Row = rows: {
-        // Very large bodies stay uncached: holding (and re-rendering) their whole
-        // row list is the unbounded-allocation case the draw guard exists for.
-        // Render only the rows that land inside the surface, into the frame arena
-        // (reset next frame), and drop any cache left over from when the body was
-        // smaller. The loop below stops at `surface.size.height`, which is itself
-        // capped (see `clippedSurfaceHeight`), so this stays bounded.
         if (text.len > render_cache_max_bytes) {
-            if (self.message.render_cache.rendered) |*stale| {
-                stale.deinit(self.gpa);
-                self.message.render_cache = .{};
-            }
+            self.message.render_inc.deinit(self.gpa);
+            self.message.render_inc = .{};
             break :rows (terminal_markdown.renderLimited(ctx.arena, text, content_width, surface.size.height) catch {
                 MessageWidget.drawWrapped(surface, text, .{}, selected, row, ctx, 0, null);
                 return;
             }).rows;
         }
 
-        const cache = &self.message.render_cache;
-        if (!cache.valid or cache.width != content_width) {
-            if (cache.rendered) |*stale| stale.deinit(self.gpa);
-            cache.rendered = terminal_markdown.render(self.gpa, text, content_width) catch {
-                cache.* = .{};
-                MessageWidget.drawWrapped(surface, text, .{}, selected, row, ctx, 0, null);
-                return;
-            };
-            cache.valid = true;
-            cache.width = content_width;
-        }
-        break :rows cache.rendered.?.rows;
+        break :rows self.message.render_inc.rows(self.gpa, ctx.arena, text, content_width) catch {
+            MessageWidget.drawWrapped(surface, text, .{}, selected, row, ctx, 0, null);
+            return;
+        };
     };
 
     for (rows) |markdown_row| {
