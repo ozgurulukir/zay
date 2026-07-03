@@ -11,6 +11,7 @@ pub const codex = @import("codex.zig");
 pub const compaction = @import("compaction.zig");
 pub const config = @import("config.zig");
 pub const context = @import("context.zig");
+pub const distiller = @import("distiller.zig");
 pub const db = @import("db.zig");
 pub const executor = @import("executor.zig");
 pub const os = @import("os.zig");
@@ -24,6 +25,7 @@ pub const runtime = @import("runtime.zig");
 pub const vcs = @import("vcs.zig");
 pub const transcript = @import("transcript.zig");
 pub const tools = @import("tools.zig");
+pub const toolbox = @import("toolbox.zig");
 pub const tui = @import("tui.zig");
 pub const thread = @import("tui/thread.zig");
 

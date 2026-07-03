@@ -6,6 +6,7 @@ const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
 const at_mention = @import("at_mention.zig");
 const background_mod = @import("background.zig");
+const toolbox_mod = @import("toolbox.zig");
 const bash_mod = @import("bash.zig");
 const search_mod = @import("search.zig");
 const codex = @import("codex.zig");
@@ -224,6 +225,11 @@ pub const App = struct {
     /// its address is stable for the agents that borrow it) and owned here; null
     /// on the headless/test path. See `background.zig`.
     background: ?*background_mod.BackgroundManager = null,
+    /// Procedurally-generated tool box reached via `execute_tool`/`search_tools`.
+    /// Heap-allocated (stable address for borrowing agents) and owned here; null
+    /// on the headless/test path. Project-scoped, persists across sessions. See
+    /// `toolbox.zig`.
+    toolbox: ?*toolbox_mod.Toolbox = null,
     /// `Ctrl+O` background-jobs modal: open flag, selected row, and whether the
     /// `[CANCEL]` button column has focus (right-arrow). Mirrors the permission
     /// overlay's lightweight, mode-less state.
@@ -287,6 +293,11 @@ pub const App = struct {
         manager.* = .init(io, gpa);
         app.background = manager;
         runtime.agent.background_manager = manager;
+        // One shared, project-scoped tool box for the session. A load failure
+        // (missing/corrupt file) is non-fatal — `create` returns an empty box;
+        // only OOM is fatal, so keep the feature off rather than abort startup.
+        app.toolbox = toolbox_mod.Toolbox.create(gpa, io, runtime.agent.cwd) catch null;
+        runtime.agent.toolbox = app.toolbox;
         app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = true } };
         app.thread.id = runtime.session_writer.session.id;
         app.codex_signed_in = !runtime.codex_connection_expired and
@@ -331,6 +342,10 @@ pub const App = struct {
             manager.deinit();
             self.gpa.destroy(manager);
             self.background = null;
+        }
+        if (self.toolbox) |box| {
+            box.destroy();
+            self.toolbox = null;
         }
         for (self.background_pending.items) |*delivery| self.freeDelivery(delivery);
         self.background_pending.deinit(self.gpa);
@@ -2585,6 +2600,8 @@ pub const App = struct {
         // Every lane shares the one background manager so jobs survive lane
         // switches and are all torn down together at exit.
         runtime.agent.background_manager = self.background;
+        // Likewise the tool box is shared across lanes (it is project-scoped).
+        runtime.agent.toolbox = self.toolbox;
         return runtime;
     }
 

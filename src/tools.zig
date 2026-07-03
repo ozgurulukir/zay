@@ -2,6 +2,7 @@ const std = @import("std");
 
 const bash_tool = @import("tools/bash.zig");
 const common = @import("tools/common.zig");
+const meta_tool = @import("tools/meta.zig");
 
 const assert = std.debug.assert;
 
@@ -11,11 +12,15 @@ pub const Tool = common.Tool;
 pub const Schema = common.Schema;
 pub const ToolDisplay = common.ToolDisplay;
 
-/// The Tool registry — single source of truth for what tools exist.
+/// The Tool registry — single source of truth for the native tools that exist.
 /// Consumed by `ExecutorService` (for dispatch) and by each `LanguageModel`
-/// adapter (for building its provider-specific tools schema).
+/// adapter (for building its provider-specific tools schema). Generated tools
+/// are NOT here — they live in the runtime `Toolbox` and are reached through
+/// `execute_tool`.
 pub const registry: []const Tool = &.{
     bash_tool.tool,
+    meta_tool.search_tools,
+    meta_tool.execute_tool,
 };
 
 pub fn run(
@@ -51,7 +56,7 @@ test "registry contains every tool exactly once" {
         const gop = try seen.getOrPut(std.testing.allocator, tool.name);
         try std.testing.expect(!gop.found_existing);
     }
-    try std.testing.expectEqual(@as(usize, 1), registry.len);
+    try std.testing.expectEqual(@as(usize, 3), registry.len);
 }
 
 test "lookup finds a registered tool" {
@@ -66,4 +71,5 @@ test "lookup returns null for unknown tool" {
 test {
     _ = bash_tool;
     _ = common;
+    _ = meta_tool;
 }

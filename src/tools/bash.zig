@@ -7,6 +7,7 @@ const os = @import("../os.zig");
 pub const tool: common.Tool = .{
     .name = "bash",
     .description = @embedFile("../prompts/tools/bash.md"),
+    .keywords = &.{ "shell", "command", "terminal", "run", "exec", "script", "cli" },
     .schema = .{
         .properties = &.{ .{
             .name = "command",
@@ -59,16 +60,32 @@ pub fn runTool(
     defer env_map.deinit();
     if (args.env) |env| try applyEnv(&env_map, env);
 
+    return runCaptured(gpa, io, resolved_cwd, args.command, &env_map, args.timeout_seconds);
+}
+
+/// Run `command` under bash with the tool's standard capture limits and shape
+/// the result into a tool `Output` (merged-output observation, exit-code
+/// framing, spill-to-disk on overflow). Shared by the bash tool and the
+/// generated-tool interpreter (`toolbox.zig`) so both produce identical
+/// observations. `cwd` must already be resolved to an absolute path.
+pub fn runCaptured(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    command: []const u8,
+    env_map: *const std.process.Environ.Map,
+    timeout_seconds: u32,
+) common.Error!common.Output {
     var captured = bash.capture(gpa, io, .{
-        .cwd = resolved_cwd,
-        .command = args.command,
-        .env_map = &env_map,
-        .timeout = bash.timeoutFromSeconds(args.timeout_seconds),
+        .cwd = cwd,
+        .command = command,
+        .env_map = env_map,
+        .timeout = bash.timeoutFromSeconds(timeout_seconds),
         .limits = capture_limits,
     }) catch |err| return mapBashError(err);
     defer captured.deinit(gpa);
 
-    const status: FinishStatus = if (captured.timed_out) .{ .timeout_seconds = args.timeout_seconds } else .{};
+    const status: FinishStatus = if (captured.timed_out) .{ .timeout_seconds = timeout_seconds } else .{};
     return finishBashOutput(gpa, &captured, status);
 }
 
@@ -221,7 +238,7 @@ fn parseError(gpa: std.mem.Allocator, err: ParseError) common.Error!common.Outpu
     };
 }
 
-fn currentEnvMap(gpa: std.mem.Allocator, io: std.Io) (std.mem.Allocator.Error || std.Io.UnexpectedError)!std.process.Environ.Map {
+pub fn currentEnvMap(gpa: std.mem.Allocator, io: std.Io) (std.mem.Allocator.Error || std.Io.UnexpectedError)!std.process.Environ.Map {
     if (os.is_windows) {
         return std.process.Environ.createMap(.{ .block = .global }, gpa);
     }

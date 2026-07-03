@@ -485,6 +485,7 @@ pub const AgentRuntime = struct {
     /// flight against the old client when it is freed.
     fn setCompactionClient(self: *AgentRuntime, next: OwnedClient) void {
         self.agent.drainBackgroundCompaction();
+        self.agent.drainDistillation(); // the distiller borrows this client too
         if (self.owned_compaction_client) |old| old.deinit(self.gpa);
         self.owned_compaction_client = next;
         self.agent.compaction_client = next.languageModel();
@@ -494,6 +495,7 @@ pub const AgentRuntime = struct {
     /// summary), disabling compaction until the next connect.
     fn clearCompactionClient(self: *AgentRuntime) void {
         self.agent.drainBackgroundCompaction();
+        self.agent.drainDistillation(); // the distiller borrows this client too
         if (self.owned_compaction_client) |old| old.deinit(self.gpa);
         self.owned_compaction_client = null;
         self.agent.compaction_client = .none;
