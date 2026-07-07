@@ -7,7 +7,6 @@ const os = @import("../os.zig");
 pub const tool: common.Tool = .{
     .name = "bash",
     .description = @embedFile("../prompts/tools/bash.md"),
-    .keywords = &.{ "shell", "command", "terminal", "run", "exec", "script", "cli" },
     .schema = .{
         .properties = &.{ .{
             .name = "command",
@@ -65,9 +64,8 @@ pub fn runTool(
 
 /// Run `command` under bash with the tool's standard capture limits and shape
 /// the result into a tool `Output` (merged-output observation, exit-code
-/// framing, spill-to-disk on overflow). Shared by the bash tool and the
-/// generated-tool interpreter (`toolbox.zig`) so both produce identical
-/// observations. `cwd` must already be resolved to an absolute path.
+/// framing, spill-to-disk on overflow). `cwd` must already be resolved to an
+/// absolute path.
 pub fn runCaptured(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -304,15 +302,27 @@ const TailSnapshot = struct {
     last_line_partial: bool,
 };
 
-/// Turn a `bash.Capture` into the tool's observation: trim the rolling tail to
-/// the display budget, and — when the output was spilled to disk — surface the
-/// spill path so the model can read the full output.
+/// Sentinel lines the `nova` Python helpers (`.nova/nova/`) wrap display
+/// content in. Anything between a begin/end pair is routed to the human
+/// display channel (`Output.display`, rendered as a diff) and stripped from
+/// the model-facing observation. `\x1e` (ASCII record separator) makes an
+/// accidental collision with real command output practically impossible.
+pub const display_diff_begin = "\x1enova:diff";
+pub const display_diff_end = "\x1enova:end";
+
+/// Turn a `bash.Capture` into the tool's observation: split out any
+/// display-block sentinel content, trim the rolling tail to the display
+/// budget, and — when the output was spilled to disk — surface the spill path
+/// so the model can read the full output.
 fn finishBashOutput(
     gpa: std.mem.Allocator,
     captured: *const bash.Capture,
     status: FinishStatus,
 ) common.Error!common.Output {
-    var snapshot = truncateTailBuffer(gpa, captured.tail, captured.total_lines, captured.total_bytes) catch return error.OutOfMemory;
+    var extraction = extractDisplayBlocks(gpa, captured.tail) catch return error.OutOfMemory;
+    defer extraction.deinit(gpa);
+
+    var snapshot = truncateTailBuffer(gpa, extraction.remainder, captured.total_lines, captured.total_bytes) catch return error.OutOfMemory;
     defer snapshotDeinit(gpa, &snapshot);
 
     const observation_text = formatBashText(gpa, snapshot.text, captured.code, status) catch return error.OutOfMemory;
@@ -338,13 +348,108 @@ fn finishBashOutput(
 
     const stderr = try gpa.alloc(u8, 0);
     errdefer gpa.free(stderr);
+    const display_block = extraction.takeDisplay();
     return .{
         .stdout = display_text,
         .stderr = stderr,
         .code = captured.code,
-        .display = null,
+        .display = display_block,
+        .display_kind = if (display_block != null) .diff else .text,
         .observation = observation,
     };
+}
+
+const DisplayExtraction = struct {
+    /// The captured tail with every display block (markers included) removed.
+    remainder: []u8,
+    /// Concatenated inner text of all blocks, or null when none were found.
+    display: ?[]u8,
+
+    /// Move the display text out; the caller owns it. See `take*` convention.
+    fn takeDisplay(self: *DisplayExtraction) ?[]u8 {
+        const text = self.display;
+        self.display = null;
+        return text;
+    }
+
+    fn deinit(self: *DisplayExtraction, gpa: std.mem.Allocator) void {
+        gpa.free(self.remainder);
+        if (self.display) |text| gpa.free(text);
+        self.* = undefined;
+    }
+};
+
+/// Split sentinel-delimited display blocks out of a captured tail. Markers
+/// must each sit on their own line. A begin marker with no matching end
+/// (crash mid-print, or the rolling tail clipped the pair apart) is left in
+/// place untouched — plain rendering is the safe failure mode. A begin whose
+/// leading bytes were clipped leaves a dangling end marker; that line alone is
+/// dropped so half a diff never leaks into the observation as gibberish.
+fn extractDisplayBlocks(gpa: std.mem.Allocator, tail: []const u8) std.mem.Allocator.Error!DisplayExtraction {
+    if (std.mem.indexOf(u8, tail, display_diff_begin) == null and
+        std.mem.indexOf(u8, tail, display_diff_end) == null)
+    {
+        return .{ .remainder = try gpa.dupe(u8, tail), .display = null };
+    }
+
+    var remainder: std.ArrayList(u8) = .empty;
+    errdefer remainder.deinit(gpa);
+    var blocks: std.ArrayList(u8) = .empty;
+    errdefer blocks.deinit(gpa);
+    var found_block = false;
+
+    var cursor: usize = 0;
+    while (cursor < tail.len) {
+        const line_end = std.mem.findScalarPos(u8, tail, cursor, '\n') orelse tail.len;
+        const line_span_end = @min(line_end + 1, tail.len);
+        const line = std.mem.trimEnd(u8, tail[cursor..line_end], "\r");
+        if (std.mem.eql(u8, line, display_diff_begin)) {
+            if (findBlockEnd(tail, line_span_end)) |block| {
+                if (found_block) try blocks.append(gpa, '\n');
+                try blocks.appendSlice(gpa, tail[line_span_end..block.text_end]);
+                found_block = true;
+                cursor = block.next;
+                continue;
+            }
+            // Unterminated block: keep everything as-is from here on.
+            try remainder.appendSlice(gpa, tail[cursor..]);
+            break;
+        }
+        if (!std.mem.eql(u8, line, display_diff_end)) {
+            try remainder.appendSlice(gpa, tail[cursor..line_span_end]);
+        }
+        cursor = line_span_end;
+    }
+
+    return .{
+        .remainder = try remainder.toOwnedSlice(gpa),
+        .display = if (found_block) try blocks.toOwnedSlice(gpa) else blk: {
+            blocks.deinit(gpa);
+            break :blk null;
+        },
+    };
+}
+
+const BlockEnd = struct {
+    /// End of the block's inner text (trailing newline before the end marker excluded).
+    text_end: usize,
+    /// First byte after the end-marker line.
+    next: usize,
+};
+
+fn findBlockEnd(tail: []const u8, from: usize) ?BlockEnd {
+    var cursor = from;
+    while (cursor < tail.len) {
+        const line_end = std.mem.findScalarPos(u8, tail, cursor, '\n') orelse tail.len;
+        const line = std.mem.trimEnd(u8, tail[cursor..line_end], "\r");
+        if (std.mem.eql(u8, line, display_diff_end)) {
+            const text_end = if (cursor > from) cursor - 1 else from;
+            return .{ .text_end = text_end, .next = @min(line_end + 1, tail.len) };
+        }
+        cursor = @min(line_end + 1, tail.len);
+        if (line_end == tail.len) break;
+    }
+    return null;
 }
 
 fn snapshotDeinit(gpa: std.mem.Allocator, snapshot: *TailSnapshot) void {
@@ -528,6 +633,71 @@ test "bash tool reports exit code in observation" {
     try std.testing.expectEqual(@as(u8, 7), output.code);
     try std.testing.expect(std.mem.indexOf(u8, observation, "nope") != null);
     try std.testing.expect(std.mem.indexOf(u8, observation, "Command exited with code 7") != null);
+}
+
+test "extractDisplayBlocks routes sentinel content to the display channel" {
+    const gpa = std.testing.allocator;
+    const tail = "before\n" ++ display_diff_begin ++ "\n-old\n+new\n" ++ display_diff_end ++ "\nafter\n";
+    var extraction = try extractDisplayBlocks(gpa, tail);
+    defer extraction.deinit(gpa);
+    try std.testing.expectEqualStrings("before\nafter\n", extraction.remainder);
+    try std.testing.expectEqualStrings("-old\n+new", extraction.display.?);
+}
+
+test "extractDisplayBlocks concatenates multiple blocks" {
+    const gpa = std.testing.allocator;
+    const tail = display_diff_begin ++ "\n+a\n" ++ display_diff_end ++ "\nmid\n" ++
+        display_diff_begin ++ "\n+b\n" ++ display_diff_end ++ "\n";
+    var extraction = try extractDisplayBlocks(gpa, tail);
+    defer extraction.deinit(gpa);
+    try std.testing.expectEqualStrings("mid\n", extraction.remainder);
+    try std.testing.expectEqualStrings("+a\n+b", extraction.display.?);
+}
+
+test "extractDisplayBlocks passes through text without markers" {
+    const gpa = std.testing.allocator;
+    var extraction = try extractDisplayBlocks(gpa, "plain output\n");
+    defer extraction.deinit(gpa);
+    try std.testing.expectEqualStrings("plain output\n", extraction.remainder);
+    try std.testing.expect(extraction.display == null);
+}
+
+test "extractDisplayBlocks leaves an unterminated block in place" {
+    const gpa = std.testing.allocator;
+    const tail = "before\n" ++ display_diff_begin ++ "\n+clipped\n";
+    var extraction = try extractDisplayBlocks(gpa, tail);
+    defer extraction.deinit(gpa);
+    try std.testing.expectEqualStrings(tail, extraction.remainder);
+    try std.testing.expect(extraction.display == null);
+}
+
+test "extractDisplayBlocks drops a dangling end marker line" {
+    const gpa = std.testing.allocator;
+    const tail = "+half a diff clipped by the rolling tail\n" ++ display_diff_end ++ "\nafter\n";
+    var extraction = try extractDisplayBlocks(gpa, tail);
+    defer extraction.deinit(gpa);
+    try std.testing.expectEqualStrings("+half a diff clipped by the rolling tail\nafter\n", extraction.remainder);
+    try std.testing.expect(extraction.display == null);
+}
+
+test "bash tool surfaces a display block as a diff-kind display" {
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+
+    // The JSON-escaped RS byte (backslash-u-001e) is the sentinel; the shell
+    // receives it literally and printf echoes it back out.
+    const args = "{\"command\":\"printf 'edited ok\\n\\u001enova:diff\\n-old\\n+new\\n\\u001enova:end\\n'\",\"reason\":\"edit\"}";
+    var output = try runTool(gpa, std.testing.io, cwd, args);
+    defer output.deinit(gpa);
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    try std.testing.expectEqualStrings("-old\n+new", output.display.?);
+    try std.testing.expectEqual(common.DisplayKind.diff, output.display_kind);
+    const observation = try testObservationText(gpa, output);
+    defer gpa.free(observation);
+    try std.testing.expect(std.mem.indexOf(u8, observation, "edited ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observation, "\x1e") == null);
 }
 
 test "bash tool truncates observation tail and keeps full output path" {

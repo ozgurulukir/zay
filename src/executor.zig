@@ -7,8 +7,6 @@ const background = @import("background.zig");
 const bash_safety = @import("bash_safety.zig");
 const bash_tool = @import("tools/bash.zig");
 const tools = @import("tools.zig");
-const tools_common = @import("tools/common.zig");
-const toolbox_mod = @import("toolbox.zig");
 
 const assert = std.debug.assert;
 
@@ -40,6 +38,9 @@ pub const ToolResult = struct {
     display_expanded_label: ?[]u8,
     /// Human channel — the display body shown in the thread.
     display_body: []u8,
+    /// Human channel — what `display_body` is (plain text or a diff). The TUI
+    /// maps this to a draw style, overriding the per-tool-name policy.
+    display_kind: tools.DisplayKind = .text,
     /// Human channel — stderr text rendered in red below the body, or null.
     stderr: ?[]u8,
     /// Human channel — overrides body styling to red at draw time.
@@ -87,7 +88,6 @@ pub const ExecutorService = struct {
     cwd: []const u8,
     bash_classifier_url: ?[]const u8 = null,
     background: ?BackgroundStart = null,
-    toolbox: ?*toolbox_mod.Toolbox = null,
 
     pub const InitOptions = struct {
         gpa: std.mem.Allocator,
@@ -95,7 +95,6 @@ pub const ExecutorService = struct {
         cwd: []const u8,
         bash_classifier_url: ?[]const u8 = null,
         background: ?BackgroundStart = null,
-        toolbox: ?*toolbox_mod.Toolbox = null,
     };
 
     pub fn init(options: InitOptions) ExecutorService {
@@ -107,7 +106,6 @@ pub const ExecutorService = struct {
             .cwd = options.cwd,
             .bash_classifier_url = options.bash_classifier_url,
             .background = options.background,
-            .toolbox = options.toolbox,
         };
     }
 
@@ -131,72 +129,15 @@ pub const ExecutorService = struct {
         }
         for (calls, 0..) |call, i| {
             try observer.on_started(observer.ptr, call);
-            var effective = try self.resolveCall(call);
-            defer effective.deinit();
-            const eff_call = effective.toolCall(call.call_id);
-            if (try self.shouldRejectUnsafeBash(eff_call, observer)) {
-                results[i] = try self.runRejected(eff_call);
+            if (try self.shouldRejectUnsafeBash(call, observer)) {
+                results[i] = try self.runRejected(call);
             } else {
-                results[i] = try self.runOne(eff_call);
+                results[i] = try self.runOne(call);
             }
             initialized = i + 1;
             try observer.on_finished(observer.ptr, &results[i]);
         }
         return results;
-    }
-
-    const EffectiveCall = struct {
-        gpa: std.mem.Allocator,
-        name: []const u8,
-        arguments: []const u8,
-        parsed: ?std.json.Parsed(std.json.Value) = null,
-        args_owned: ?[]u8 = null,
-
-        fn toolCall(self: EffectiveCall, call_id: []const u8) ai.ToolCall {
-            return .{
-                .call_id = @constCast(call_id),
-                .name = @constCast(self.name),
-                .arguments = @constCast(self.arguments),
-            };
-        }
-
-        fn deinit(self: *EffectiveCall) void {
-            if (self.args_owned) |a| self.gpa.free(a);
-            if (self.parsed) |p| p.deinit();
-            self.* = undefined;
-        }
-    };
-
-    fn resolveCall(self: *ExecutorService, call: ai.ToolCall) !EffectiveCall {
-        if (self.toolbox == null or !std.mem.eql(u8, call.name, "execute_tool")) {
-            return .{ .gpa = self.gpa, .name = call.name, .arguments = call.arguments };
-        }
-        const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, call.arguments, .{}) catch {
-            return .{ .gpa = self.gpa, .name = "", .arguments = "{}" };
-        };
-        if (parsed.value != .object) {
-            parsed.deinit();
-            return .{ .gpa = self.gpa, .name = "", .arguments = "{}" };
-        }
-        const name: []const u8 = if (parsed.value.object.get("name")) |v|
-            (if (v == .string) v.string else "")
-        else
-            "";
-        var args_owned: ?[]u8 = null;
-        if (parsed.value.object.get("args")) |args_value| {
-            var aw: std.Io.Writer.Allocating = .init(self.gpa);
-            defer aw.deinit();
-            if (std.json.Stringify.value(args_value, .{}, &aw.writer)) |_| {
-                args_owned = aw.toOwnedSlice() catch null;
-            } else |_| {}
-        }
-        return .{
-            .gpa = self.gpa,
-            .name = name,
-            .arguments = args_owned orelse "{}",
-            .parsed = parsed,
-            .args_owned = args_owned,
-        };
     }
 
     fn shouldRejectUnsafeBash(self: *ExecutorService, call: ai.ToolCall, observer: ToolCallObserver) !bool {
@@ -237,6 +178,7 @@ pub const ExecutorService = struct {
             .display_label = display.label,
             .display_expanded_label = display.expanded_label,
             .display_body = display_body,
+            .display_kind = output.display_kind,
             .stderr = stderr,
             .failed = failed,
         };
@@ -246,32 +188,12 @@ pub const ExecutorService = struct {
     /// `BackgroundManager` (which spawns the job and returns immediately) and
     /// everything else through the normal blocking tool registry.
     fn produceOutput(self: *ExecutorService, call: ai.ToolCall) tools.Error!tools.Output {
-        if (self.toolbox) |tb| {
-            if (std.mem.eql(u8, call.name, "search_tools")) {
-                return self.searchToolsOutput(tb, call.arguments);
-            }
-        }
         if (self.background) |bg| {
             if (std.mem.eql(u8, call.name, "bash") and bash_tool.wantsBackground(self.gpa, call.arguments)) {
                 return bash_tool.runBackground(self.gpa, self.io, self.cwd, call.arguments, bg.manager, bg.owner);
             }
         }
-        if (self.toolbox) |tb| {
-            if (try tb.run(self.gpa, self.io, self.cwd, call.name, call.arguments)) |output| return output;
-        }
         return tools.run(self.gpa, self.io, self.cwd, call.name, call.arguments);
-    }
-
-    fn searchToolsOutput(self: *ExecutorService, tb: *toolbox_mod.Toolbox, arguments: []const u8) tools.Error!tools.Output {
-        const Args = struct { query: ?[]const u8 = null };
-        const query = query: {
-            const parsed = std.json.parseFromSlice(Args, self.gpa, arguments, .{ .ignore_unknown_fields = true }) catch break :query "";
-            defer parsed.deinit();
-            break :query if (parsed.value.query) |q| self.gpa.dupe(u8, q) catch "" else "";
-        };
-        defer if (query.len > 0) self.gpa.free(query);
-        const text = try tb.searchText(self.gpa, query, tools.registry);
-        return tools_common.ok(self.gpa, text);
     }
 
     fn runFailure(self: *ExecutorService, call: ai.ToolCall, err: anyerror) !ToolResult {

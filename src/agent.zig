@@ -4,8 +4,6 @@ const logger = @import("logger");
 const ai = @import("ai.zig");
 const at_mention = @import("at_mention.zig");
 const background_mod = @import("background.zig");
-const toolbox_mod = @import("toolbox.zig");
-const distiller_mod = @import("distiller.zig");
 const bounded_queue = @import("bounded_queue");
 const compaction = @import("compaction.zig");
 const context_mod = @import("context.zig");
@@ -44,72 +42,6 @@ const ToolBatch = struct {
         return .{ .calls = calls };
     }
 };
-
-/// One recorded tool call the distiller may mine into a new tool. Bounded ring
-/// on the agent; strings are `gpa`-owned.
-const ToolCallRecord = struct {
-    name: []u8,
-    arguments: []u8,
-};
-
-/// Rolling window of recent tool calls kept for distillation.
-const distill_log_cap: usize = 40;
-/// Per-call argument cap when rendering the log for the distiller model.
-const distill_arg_cap: usize = 600;
-/// Minimum new tool calls accumulated before a distillation run is worthwhile.
-const min_calls_to_distill: u32 = 4;
-/// A generated tool unused for more than this many turns is evicted.
-const max_idle_turns: u32 = 10;
-
-/// Background tool-distiller state. Mirrors `Compactor`: at most one analysis is
-/// ever in flight, so a single atomic state plus a result slot is all the
-/// synchronization needed between the worker thread (start/install) and the
-/// distiller thread (produce). The distiller thread touches only the dedicated
-/// client, its own allocations, and the `Toolbox` (which is itself locked) —
-/// never live history or the session.
-const Distiller = struct {
-    state: std.atomic.Value(State) = .init(.idle),
-    thread: ?std.Thread = null,
-    job: ?Job = null,
-    /// Raw model text produced by the finished run (null on failure/no output),
-    /// parsed into tools by the worker once it sees `.ready`. Worker-owned.
-    response: ?[]u8 = null,
-
-    const State = enum(u8) { idle, running, ready };
-
-    /// Self-contained input for the distiller thread. `log_text` and `existing`
-    /// are owned by the job and freed by the thread when it finishes. The thread
-    /// touches only the client and its own allocations — never the box or
-    /// history, so it cannot race a teardown that frees them.
-    const Job = struct {
-        gpa: std.mem.Allocator,
-        client: ai.LanguageModel,
-        log_text: []u8,
-        existing: [][]const u8,
-    };
-
-    fn stateIs(self: *const Distiller, expected: State) bool {
-        return self.state.load(.acquire) == expected;
-    }
-};
-
-/// Body of the distiller thread: run the model call, publish its text, and flip
-/// to `.ready`. Parsing and box mutation happen on the worker at install time,
-/// so this thread never touches shared state beyond the borrowed client.
-fn runDistillThread(distiller: *Distiller) void {
-    const job = distiller.job.?;
-    defer {
-        job.gpa.free(job.log_text);
-        for (job.existing) |name| job.gpa.free(name);
-        job.gpa.free(job.existing);
-    }
-    distiller.response = distiller_mod.requestProposals(job.gpa, job.client, job.log_text, job.existing) catch |err| {
-        logger.log("distiller: model call failed: {s}", .{@errorName(err)});
-        distiller.state.store(.ready, .release); // ready with a null response = nothing to install
-        return;
-    };
-    distiller.state.store(.ready, .release);
-}
 
 /// Background summarizer state. At most one summary is ever in flight, so a
 /// single result slot plus an atomic state is all the synchronization needed
@@ -198,17 +130,6 @@ pub const Agent = struct {
     /// `run_in_background`. Borrowed (owned by the App); null disables the
     /// background path so such calls fall back to a normal blocking run.
     background_manager: ?*background_mod.BackgroundManager = null,
-    /// Shared runtime tool box reached via the `execute_tool` / `search_tools`
-    /// meta-tools. Borrowed (owned by the App); null disables the meta-tools.
-    toolbox: ?*toolbox_mod.Toolbox = null,
-    /// Background tool-distiller state machine. Reuses `compaction_client` (also
-    /// tool-less) and is mutually exclusive with compaction so the shared
-    /// background connection is never used by two threads at once.
-    distiller: Distiller = .{},
-    /// Rolling window of recent tool calls the distiller mines, and how many have
-    /// accrued since the last run (the cadence gate).
-    distill_log: std.ArrayList(ToolCallRecord) = .empty,
-    distill_pending_calls: u32 = 0,
     /// Background summarizer state machine.
     compactor: Compactor = .{},
     message_queue: MessageQueue = .{},
@@ -246,11 +167,9 @@ pub const Agent = struct {
     }
 
     pub fn deinit(self: *Agent) void {
-        // Wait for any background summarizer/distiller before tearing down the
-        // state they read (the client, the box), then release their results.
+        // Wait for any background summarizer before tearing down the state it
+        // reads (the client), then release its result.
         self.drainBackgroundCompaction();
-        self.drainDistillation();
-        self.clearDistillLog();
         self.context_manager.deinit();
         self.lockMessageQueue();
         while (self.message_queue.pop(&self.message_queue_storage)) |queued| {
@@ -425,6 +344,7 @@ pub const Agent = struct {
             display_label: []const u8,
             display_expanded_label: ?[]const u8 = null,
             display_body: []const u8,
+            display_kind: tools.DisplayKind = .text,
             stderr: ?[]const u8 = null,
             failed: bool = false,
         };
@@ -472,8 +392,6 @@ pub const Agent = struct {
 
     pub fn run(self: *Agent, listener: Listener) !void {
         try listener.emit(.turn_started);
-        self.onTurnStart();
-        defer self.maybeStartDistillation();
         const tool_call_limit = 100;
         var calls: u32 = 0;
         while (calls < tool_call_limit) : (calls += 1) {
@@ -538,7 +456,6 @@ pub const Agent = struct {
         stream_context: *const StreamContext,
         listener: Listener,
     ) !void {
-        self.recordToolCallsForDistill(tool_batch.calls);
         var bridge: ExecutorBridge = .{
             .agent = self,
             .listener = listener,
@@ -553,7 +470,6 @@ pub const Agent = struct {
                 .{ .manager = manager, .owner = self }
             else
                 null,
-            .toolbox = self.toolbox,
         });
         const results = try executor.runAll(tool_batch.calls, .{
             .ptr = &bridge,
@@ -634,6 +550,7 @@ pub const Agent = struct {
                 result.display_label,
                 result.display_expanded_label,
                 result.display_body,
+                result.display_kind,
                 result.stderr,
                 result.failed,
             );
@@ -724,6 +641,7 @@ pub const Agent = struct {
         display_label: []const u8,
         display_expanded_label: ?[]const u8,
         display_body: []const u8,
+        display_kind: tools.DisplayKind,
         stderr: ?[]const u8,
         failed: bool,
     ) !void {
@@ -753,6 +671,7 @@ pub const Agent = struct {
                 .display_label = owned_label,
                 .display_expanded_label = owned_expanded_label,
                 .display_body = owned_body,
+                .display_kind = display_kind,
                 .stderr = owned_stderr,
                 .failed = failed,
             },
@@ -904,7 +823,7 @@ pub const Agent = struct {
         // Past the start watermark: kick off the summary so it is ready by the
         // time the footprint reaches the swap watermark.
         if (compaction.shouldStartSummary(used, self.context_window_tokens) and
-            self.compactor.stateIs(.idle) and self.distiller.stateIs(.idle))
+            self.compactor.stateIs(.idle))
         {
             self.startCompaction() catch |err| std.log.warn("compaction start failed: {s}", .{@errorName(err)});
         }
@@ -979,155 +898,6 @@ pub const Agent = struct {
     pub fn drainBackgroundCompaction(self: *Agent) void {
         self.joinCompactor();
         self.finishCompactor();
-    }
-
-    /// Turn-boundary maintenance: age generated tools (evicting the long-idle)
-    /// and install any tools produced by the previous turn's distillation.
-    fn onTurnStart(self: *Agent) void {
-        if (self.toolbox) |box| _ = box.tickTurnAndEvict(max_idle_turns);
-        self.installReadyDistillation();
-    }
-
-    /// Record a batch's calls into the rolling distill log so a later run can
-    /// mine them. `search_tools` is skipped — pure discovery, no work to distill.
-    fn recordToolCallsForDistill(self: *Agent, calls: []const ai.ToolCall) void {
-        if (self.toolbox == null) return;
-        for (calls) |call| {
-            if (std.mem.eql(u8, call.name, "search_tools")) continue;
-            self.appendDistillRecord(call.name, call.arguments) catch continue;
-            self.distill_pending_calls +|= 1;
-        }
-    }
-
-    fn appendDistillRecord(self: *Agent, name: []const u8, arguments: []const u8) !void {
-        const name_owned = try self.gpa.dupe(u8, name);
-        errdefer self.gpa.free(name_owned);
-        const args_owned = try self.gpa.dupe(u8, arguments);
-        errdefer self.gpa.free(args_owned);
-        if (self.distill_log.items.len >= distill_log_cap) {
-            const oldest = self.distill_log.orderedRemove(0);
-            self.gpa.free(oldest.name);
-            self.gpa.free(oldest.arguments);
-        }
-        try self.distill_log.append(self.gpa, .{ .name = name_owned, .arguments = args_owned });
-    }
-
-    /// Kick off a background distillation if enough new calls have accrued and
-    /// nothing else is using the shared background client. Best-effort.
-    fn maybeStartDistillation(self: *Agent) void {
-        if (self.toolbox == null) return;
-        if (self.compaction_client == .none) return;
-        if (!self.distiller.stateIs(.idle)) return; // one distillation at a time
-        if (!self.compactor.stateIs(.idle)) return; // share the client with compaction
-        if (self.distill_pending_calls < min_calls_to_distill) return;
-        self.startDistillation() catch |err| {
-            logger.log("distiller start failed: {s}", .{@errorName(err)});
-            return;
-        };
-        self.distill_pending_calls = 0;
-    }
-
-    /// Snapshot the log + existing names and hand them to the distiller thread.
-    fn startDistillation(self: *Agent) !void {
-        const box = self.toolbox orelse return;
-        const log_text = try self.serializeDistillLog();
-        errdefer self.gpa.free(log_text);
-        const existing = try box.snapshotNames(self.gpa);
-        errdefer {
-            for (existing) |name| self.gpa.free(name);
-            self.gpa.free(existing);
-        }
-        self.distiller.response = null;
-        self.distiller.job = .{
-            .gpa = self.gpa,
-            .client = self.compaction_client,
-            .log_text = log_text,
-            .existing = existing,
-        };
-        self.distiller.state.store(.running, .release);
-        self.distiller.thread = std.Thread.spawn(.{}, runDistillThread, .{&self.distiller}) catch |err| {
-            self.gpa.free(log_text);
-            for (existing) |name| self.gpa.free(name);
-            self.gpa.free(existing);
-            self.distiller.job = null;
-            self.distiller.state.store(.idle, .release);
-            return err;
-        };
-    }
-
-    /// Install a finished distillation: parse the model's proposals, add the
-    /// accepted ones to the box (worker-thread-only box mutation), and — if any
-    /// landed — drop a hidden reminder into this turn's context. No-op unless ready.
-    fn installReadyDistillation(self: *Agent) void {
-        if (!self.distiller.stateIs(.ready)) return;
-        self.joinDistiller();
-        const response = self.distiller.response;
-        self.distiller.response = null;
-        self.finishDistiller();
-
-        const text = response orelse return;
-        defer self.gpa.free(text);
-        const box = self.toolbox orelse return;
-        const existing = box.snapshotNames(self.gpa) catch return;
-        defer {
-            for (existing) |name| self.gpa.free(name);
-            self.gpa.free(existing);
-        }
-        const added = distiller_mod.parseAndAdd(self.gpa, box, text, existing) catch 0;
-        if (added > 0) self.appendToolboxReminder() catch |err| {
-            logger.log("distiller reminder failed: {s}", .{@errorName(err)});
-        };
-    }
-
-    /// A hidden, unpersisted user message nudging the model to consult the box.
-    /// Unpersisted so it never pollutes the saved session; delivered via the
-    /// context list (not the transcript), so it stays invisible in the TUI.
-    fn appendToolboxReminder(self: *Agent) !void {
-        const text = "<system_reminder>New tools were added to your tool box based on your recent work. Use search_tools to see whether any of them fit the task at hand.</system_reminder>";
-        var msg = try self.makeTextMessage(.user, text);
-        errdefer msg.deinit(self.gpa);
-        try self.context_manager.appendUnpersisted(msg);
-    }
-
-    fn joinDistiller(self: *Agent) void {
-        if (self.distiller.thread) |thread| {
-            thread.join();
-            self.distiller.thread = null;
-        }
-    }
-
-    /// Return the distiller to idle. The thread already freed the job's owned
-    /// input; free any response the worker didn't take (drain path).
-    fn finishDistiller(self: *Agent) void {
-        if (self.distiller.response) |r| self.gpa.free(r);
-        self.distiller.response = null;
-        self.distiller.job = null;
-        self.distiller.state.store(.idle, .release);
-    }
-
-    /// Wait for any in-flight distillation and reset. Call before freeing the
-    /// client it borrows or the box it writes to.
-    pub fn drainDistillation(self: *Agent) void {
-        self.joinDistiller();
-        self.finishDistiller();
-    }
-
-    fn serializeDistillLog(self: *Agent) ![]u8 {
-        var aw: std.Io.Writer.Allocating = .init(self.gpa);
-        defer aw.deinit();
-        for (self.distill_log.items) |record| {
-            const args = if (record.arguments.len > distill_arg_cap) record.arguments[0..distill_arg_cap] else record.arguments;
-            aw.writer.print("{s} {s}\n", .{ record.name, args }) catch return error.OutOfMemory;
-        }
-        return aw.toOwnedSlice() catch error.OutOfMemory;
-    }
-
-    fn clearDistillLog(self: *Agent) void {
-        for (self.distill_log.items) |record| {
-            self.gpa.free(record.name);
-            self.gpa.free(record.arguments);
-        }
-        self.distill_log.deinit(self.gpa);
     }
 
     /// Rehydrate the cached message list from the session projection after a

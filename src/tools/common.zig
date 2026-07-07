@@ -2,11 +2,14 @@ const std = @import("std");
 
 const assert = std.debug.assert;
 
+pub const DisplayKind = enum(u8) { text, diff };
+
 pub const Output = struct {
     stdout: []u8,
     stderr: []u8,
     code: u8,
     display: ?[]u8 = null,
+    display_kind: DisplayKind = .text,
     observation: ?Observation = null,
 
     pub fn deinit(self: *Output, gpa: std.mem.Allocator) void {
@@ -80,10 +83,6 @@ pub const Tool = struct {
     /// Raw description template. May contain `{{hsep}}` placeholders that
     /// each LanguageModel adapter substitutes with `~` before sending.
     description: []const u8,
-    /// Hidden search metadata: extra terms `search_tools` matches against, on
-    /// top of the name. Never sent to the model and never shown in the TUI —
-    /// it only steers discovery through the tool box (see `toolbox.zig`).
-    keywords: []const []const u8 = &.{},
     schema: Schema,
     run: *const fn (
         gpa: std.mem.Allocator,
