@@ -43,12 +43,10 @@ const users = getUsers();
 console.log(users);
 EOF
 
-# Patch a small section of a file.
-python3 - <<'PY'
-from pathlib import Path
-path = Path('src/main.ts')
-text = path.read_text()
-path.write_text(text.replace('old', 'new', 1))
+# Edit a file or run any Python — always through uv, always a quoted heredoc.
+uv run --project .nova python - <<'PY'
+from nova import edit
+edit("src/main.ts", "const users = getUsers();", "const users = await getUsers();")
 PY
 ```
 

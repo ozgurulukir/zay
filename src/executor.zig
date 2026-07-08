@@ -38,6 +38,9 @@ pub const ToolResult = struct {
     display_expanded_label: ?[]u8,
     /// Human channel — the display body shown in the thread.
     display_body: []u8,
+    /// Human channel — what `display_body` is (plain text or a diff). The TUI
+    /// maps this to a draw style, overriding the per-tool-name policy.
+    display_kind: tools.DisplayKind = .text,
     /// Human channel — stderr text rendered in red below the body, or null.
     stderr: ?[]u8,
     /// Human channel — overrides body styling to red at draw time.
@@ -175,6 +178,7 @@ pub const ExecutorService = struct {
             .display_label = display.label,
             .display_expanded_label = display.expanded_label,
             .display_body = display_body,
+            .display_kind = output.display_kind,
             .stderr = stderr,
             .failed = failed,
         };

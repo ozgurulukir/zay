@@ -6,14 +6,17 @@ const common = @import("tools/common.zig");
 const assert = std.debug.assert;
 
 pub const Output = common.Output;
+pub const DisplayKind = common.DisplayKind;
 pub const Error = common.Error;
 pub const Tool = common.Tool;
 pub const Schema = common.Schema;
 pub const ToolDisplay = common.ToolDisplay;
 
-/// The Tool registry — single source of truth for what tools exist.
+/// The Tool registry — single source of truth for the native tools that exist.
 /// Consumed by `ExecutorService` (for dispatch) and by each `LanguageModel`
-/// adapter (for building its provider-specific tools schema).
+/// adapter (for building its provider-specific tools schema). Bash is the only
+/// tool: everything richer (edits, search, reusable helpers) is Python run
+/// through it — see `src/py/` and the system prompt.
 pub const registry: []const Tool = &.{
     bash_tool.tool,
 };

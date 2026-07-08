@@ -354,12 +354,14 @@ pub const TurnView = struct {
         const was_running = transcript.messages.items[index].tool_running;
         try transcript.updateToolExpanded(gpa, index, tool.display_label, tool.display_expanded_label);
         try transcript.finishTool(gpa, index, tool.display_body, tool.stderr, tool.failed);
-        transcript.setExpanded(index, policy.expand_by_default);
-        transcript.messages.items[index].tool_render = policy.render;
+        const is_diff = tool.display_kind == .diff;
+        const expand = policy.expand_by_default or is_diff;
+        transcript.setExpanded(index, expand);
+        transcript.messages.items[index].tool_render = if (is_diff) .diff else policy.render;
         selectGeneratedMessage(transcript, index);
         self.tool_seen_in_response = true;
         self.agent_index = null;
-        return existing_index == null or was_running or visible_before or policy.expand_by_default != was_expanded;
+        return existing_index == null or was_running or visible_before or expand != was_expanded;
     }
 
     fn selectGeneratedMessage(transcript: *transcript_mod.Transcript, index: u32) void {

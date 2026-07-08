@@ -2,11 +2,14 @@ const std = @import("std");
 
 const assert = std.debug.assert;
 
+pub const DisplayKind = enum(u8) { text, diff };
+
 pub const Output = struct {
     stdout: []u8,
     stderr: []u8,
     code: u8,
     display: ?[]u8 = null,
+    display_kind: DisplayKind = .text,
     observation: ?Observation = null,
 
     pub fn deinit(self: *Output, gpa: std.mem.Allocator) void {

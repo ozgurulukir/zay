@@ -6,6 +6,7 @@ const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
 const at_mention = @import("at_mention.zig");
 const background_mod = @import("background.zig");
+const pytools = @import("pytools.zig");
 const bash_mod = @import("bash.zig");
 const search_mod = @import("search.zig");
 const codex = @import("codex.zig");
@@ -287,6 +288,10 @@ pub const App = struct {
         manager.* = .init(io, gpa);
         app.background = manager;
         runtime.agent.background_manager = manager;
+        // Materialize the project-scoped Python helper package (`.nova/`) so the
+        // model's `uv run --project .nova` invocations find it. Best-effort —
+        // a failure only degrades the python workflow, never blocks startup.
+        pytools.ensureInstalled(gpa, io, runtime.agent.cwd) catch {};
         app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = true } };
         app.thread.id = runtime.session_writer.session.id;
         app.codex_signed_in = !runtime.codex_connection_expired and

@@ -168,7 +168,7 @@ pub const Agent = struct {
 
     pub fn deinit(self: *Agent) void {
         // Wait for any background summarizer before tearing down the state it
-        // reads, then release its result.
+        // reads (the client), then release its result.
         self.drainBackgroundCompaction();
         self.context_manager.deinit();
         self.lockMessageQueue();
@@ -344,6 +344,7 @@ pub const Agent = struct {
             display_label: []const u8,
             display_expanded_label: ?[]const u8 = null,
             display_body: []const u8,
+            display_kind: tools.DisplayKind = .text,
             stderr: ?[]const u8 = null,
             failed: bool = false,
         };
@@ -549,6 +550,7 @@ pub const Agent = struct {
                 result.display_label,
                 result.display_expanded_label,
                 result.display_body,
+                result.display_kind,
                 result.stderr,
                 result.failed,
             );
@@ -639,6 +641,7 @@ pub const Agent = struct {
         display_label: []const u8,
         display_expanded_label: ?[]const u8,
         display_body: []const u8,
+        display_kind: tools.DisplayKind,
         stderr: ?[]const u8,
         failed: bool,
     ) !void {
@@ -668,6 +671,7 @@ pub const Agent = struct {
                 .display_label = owned_label,
                 .display_expanded_label = owned_expanded_label,
                 .display_body = owned_body,
+                .display_kind = display_kind,
                 .stderr = owned_stderr,
                 .failed = failed,
             },
@@ -818,7 +822,9 @@ pub const Agent = struct {
 
         // Past the start watermark: kick off the summary so it is ready by the
         // time the footprint reaches the swap watermark.
-        if (compaction.shouldStartSummary(used, self.context_window_tokens) and self.compactor.stateIs(.idle)) {
+        if (compaction.shouldStartSummary(used, self.context_window_tokens) and
+            self.compactor.stateIs(.idle))
+        {
             self.startCompaction() catch |err| std.log.warn("compaction start failed: {s}", .{@errorName(err)});
         }
     }
