@@ -56,8 +56,10 @@ pub const ObjectId = struct {
 
 /// A lane's relationship to the working tree. `.primary` is the repo's own
 /// working copy (the branch Nova launched on); `.working` is a parallel lane in
-/// its own `git worktree` on a dedicated branch. Lanes are fully isolated — they
-/// never interact (no cross-lane sync); a lane reaches `main` via a normal PR.
+/// its own `git worktree` on a dedicated branch. Lanes run in isolation, but a
+/// `.working` lane can be folded back into another lane with `merge` (`/merge`
+/// and `/lanes`): the source's branch is merged into the destination's worktree
+/// and the source worktree is then removed.
 pub const Lane = union(enum) {
     primary,
     working: Working,
@@ -364,6 +366,80 @@ pub fn deleteBranch(gpa: std.mem.Allocator, io: std.Io, repo_dir: []const u8, br
     // A missing branch is fine — this is cleanup.
 }
 
+/// Outcome of a lane merge. `.conflict` covers both content conflicts and a
+/// dirty destination that git refuses to overwrite — in either case the merge
+/// was rolled back (`git merge --abort`) so the destination is left untouched.
+pub const MergeOutcome = enum { ok, conflict };
+
+/// Merge `branch` into the working tree of `dir` (the destination lane's
+/// worktree, on its own branch). A clean merge returns `.ok`; anything git
+/// refuses — content conflicts or a dirty tree it would clobber — is rolled
+/// back with `git merge --abort` and returns `.conflict`, so a denied merge
+/// never leaves the destination half-merged.
+pub fn merge(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, branch: []const u8) CmdError!MergeOutcome {
+    var out = try run(gpa, io, dir, &.{ "merge", "--no-edit", branch }, null);
+    defer out.deinit(gpa);
+    if (out.code == 0) return .ok;
+    // Roll back so the destination worktree is exactly as it was pre-merge.
+    var abort = try run(gpa, io, dir, &.{ "merge", "--abort" }, null);
+    abort.deinit(gpa);
+    return .conflict;
+}
+
+/// One entry from `git worktree list` — an absolute worktree `path` and the
+/// `branch` checked out there (short name, e.g. `nova/<id>`). Both owned.
+pub const WorktreeEntry = struct {
+    path: []u8,
+    branch: []u8,
+
+    pub fn deinit(self: *WorktreeEntry, gpa: std.mem.Allocator) void {
+        gpa.free(self.path);
+        gpa.free(self.branch);
+        self.* = undefined;
+    }
+};
+
+/// List every linked worktree of `repo_dir` and the branch each has checked out.
+/// Parses `git worktree list --porcelain` (records separated by blank lines,
+/// `worktree <path>` + `branch refs/heads/<name>` lines). Detached or
+/// branchless worktrees are skipped. Backs `/lanes`, which filters to parked
+/// `nova/*` lanes. Caller owns the slice — free with `freeWorktreeList`.
+pub fn worktreeList(gpa: std.mem.Allocator, io: std.Io, repo_dir: []const u8) CmdError![]WorktreeEntry {
+    const raw = try runOut(gpa, io, repo_dir, &.{ "worktree", "list", "--porcelain" }, null);
+    defer gpa.free(raw);
+
+    var entries: std.ArrayList(WorktreeEntry) = .empty;
+    errdefer {
+        for (entries.items) |*entry| entry.deinit(gpa);
+        entries.deinit(gpa);
+    }
+
+    var path: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, "worktree ")) {
+            path = std.mem.trim(u8, trimmed["worktree ".len..], " \t\r");
+        } else if (std.mem.startsWith(u8, trimmed, "branch ")) {
+            const ref = std.mem.trim(u8, trimmed["branch ".len..], " \t\r");
+            const name = if (std.mem.startsWith(u8, ref, "refs/heads/")) ref["refs/heads/".len..] else ref;
+            const p = path orelse continue;
+            const path_dup = try gpa.dupe(u8, p);
+            errdefer gpa.free(path_dup);
+            const branch_dup = try gpa.dupe(u8, name);
+            errdefer gpa.free(branch_dup);
+            try entries.append(gpa, .{ .path = path_dup, .branch = branch_dup });
+        }
+    }
+    return entries.toOwnedSlice(gpa);
+}
+
+/// Free a slice returned by `worktreeList`.
+pub fn freeWorktreeList(gpa: std.mem.Allocator, entries: []WorktreeEntry) void {
+    for (entries) |*entry| entry.deinit(gpa);
+    gpa.free(entries);
+}
+
 /// Point a `refs/nova/<name>` ref at `sha` so the snapshot survives `git gc`.
 /// `name` must be a ref-safe path segment (the caller passes a session/entry id).
 pub fn keepRef(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8, sha: ObjectId) CmdError!void {
@@ -490,6 +566,82 @@ test "git shadow: snapshot ignores artifacts, restore adds/deletes, HEAD stays c
     const count = try runOut(gpa, io, repo, &.{ "rev-list", "--count", "HEAD" }, null);
     defer gpa.free(count);
     try std.testing.expectEqualStrings("1", std.mem.trim(u8, count, " \t\r\n"));
+}
+
+test "worktree lanes: list finds lane branches, merge folds one in, conflict rolls back" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!isAvailable(gpa, io)) return error.SkipZigTest;
+
+    var rand: [8]u8 = undefined;
+    io.random(&rand);
+    const hex = std.fmt.bytesToHex(rand, .lower);
+    const name = try std.fmt.allocPrint(gpa, "nova-mergetest-{s}", .{hex[0..]});
+    defer gpa.free(name);
+
+    try std.Io.Dir.cwd().createDirPath(io, name);
+    defer std.Io.Dir.cwd().deleteTree(io, name) catch {};
+
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const repo = try std.fs.path.join(gpa, &.{ cwd, name });
+    defer gpa.free(repo);
+
+    // Baseline commit with a git identity so worktree commits inherit it.
+    try expectOk(gpa, io, repo, &.{ "init", "-q" });
+    try expectOk(gpa, io, repo, &.{ "config", "core.autocrlf", "false" });
+    try expectOk(gpa, io, repo, &.{ "config", "user.name", "t" });
+    try expectOk(gpa, io, repo, &.{ "config", "user.email", "t@t" });
+    try writeFileRel(io, name, "base.txt", "base\n");
+    try expectOk(gpa, io, repo, &.{ "add", "-A" });
+    try expectOk(gpa, io, repo, &.{ "commit", "-qm", "baseline" });
+
+    // Two lanes forked from HEAD (nested under the repo; git tracks them as
+    // linked worktrees, not files).
+    const dest = try std.fs.path.join(gpa, &.{ repo, "wt-dest" });
+    defer gpa.free(dest);
+    const src = try std.fs.path.join(gpa, &.{ repo, "wt-src" });
+    defer gpa.free(src);
+    try worktreeAdd(gpa, io, repo, dest, "nova/dest");
+    try worktreeAdd(gpa, io, repo, src, "nova/src");
+
+    // worktreeList reports both lane branches.
+    {
+        const list = try worktreeList(gpa, io, repo);
+        defer freeWorktreeList(gpa, list);
+        var saw_src = false;
+        var saw_dest = false;
+        for (list) |entry| {
+            if (std.mem.eql(u8, entry.branch, "nova/src")) saw_src = true;
+            if (std.mem.eql(u8, entry.branch, "nova/dest")) saw_dest = true;
+        }
+        try std.testing.expect(saw_src and saw_dest);
+    }
+
+    // Non-conflicting work on the source lane; commit it onto nova/src.
+    try writeFileRel(io, name, "wt-src/feature.txt", "feature\n");
+    try expectOk(gpa, io, src, &.{ "add", "-A" });
+    try expectOk(gpa, io, src, &.{ "commit", "-qm", "feat" });
+
+    // Merge folds the source lane's file into the destination worktree.
+    try std.testing.expectEqual(MergeOutcome.ok, try merge(gpa, io, dest, "nova/src"));
+    {
+        const merged = try showFile(gpa, io, dest, "HEAD", "feature.txt");
+        defer gpa.free(merged);
+        try std.testing.expectEqualStrings("feature\n", merged);
+    }
+
+    // Divergent edits to the same file on each lane → conflict, rolled back.
+    try writeFileRel(io, name, "wt-src/base.txt", "src-change\n");
+    try expectOk(gpa, io, src, &.{ "commit", "-aqm", "src edit" });
+    try writeFileRel(io, name, "wt-dest/base.txt", "dest-change\n");
+    try expectOk(gpa, io, dest, &.{ "commit", "-aqm", "dest edit" });
+    try std.testing.expectEqual(MergeOutcome.conflict, try merge(gpa, io, dest, "nova/src"));
+
+    // The abort left the destination exactly as it was — no half-merge.
+    const restored = try showFile(gpa, io, dest, "HEAD", "base.txt");
+    defer gpa.free(restored);
+    try std.testing.expectEqualStrings("dest-change\n", restored);
 }
 
 fn expectOk(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, args: []const []const u8) !void {

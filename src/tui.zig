@@ -36,6 +36,7 @@ const model_picker = @import("tui/widgets/model_picker.zig");
 const provider_picker = @import("tui/widgets/provider_picker.zig");
 const resume_picker = @import("tui/widgets/resume_picker.zig");
 const tree_selector = @import("tui/widgets/tree_selector.zig");
+const lanes_picker = @import("tui/widgets/lanes_picker.zig");
 const panel = @import("tui/widgets/panel.zig");
 const tui_provider = @import("tui/provider_controller.zig");
 const tui_status = @import("tui/status.zig");
@@ -207,6 +208,24 @@ pub const App = struct {
         .draw_cursor = false,
         .wheel_scroll = 3,
     },
+    /// Scroll state for the `/lanes` overlay (shared by the `/merge` destination
+    /// picker — both use `Mode.lanes`).
+    lanes_list: vxfw.ListView = .{
+        .children = .{ .slice = &.{} },
+        .draw_cursor = false,
+        .wheel_scroll = 3,
+    },
+    /// What the `Mode.lanes` overlay is doing: managing parked worktrees
+    /// (`/lanes`, M/X) or choosing a merge destination (`/merge`, Enter).
+    lanes_purpose: LanesPurpose = .manage,
+    lanes_selection: u32 = 0,
+    /// `.manage`: on-disk `nova/*` worktrees not currently open as lanes. Owned;
+    /// freed by `clearLanesState`.
+    parked_lanes: []vcs.WorktreeEntry = &.{},
+    /// `.merge_dest`: the source lane (current) whose work is being merged, and
+    /// the candidate destination lane indices into `threads`. Owned.
+    merge_source_index: usize = 0,
+    merge_dest_indices: []usize = &.{},
     pending_quit_at: ?std.Io.Timestamp = null,
     queued_selection: usize = 0,
     /// When true, arrow keys navigate conversation blocks; when false they move
@@ -248,7 +267,8 @@ pub const App = struct {
         message: ?[]u8,
     };
 
-    const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message };
+    const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message, lanes };
+    const LanesPurpose = enum { manage, merge_dest };
     const ModelCatalog = enum { connected_provider, openai_codex };
     const CheckpointState = enum { unknown, ready, unavailable };
     const ModelSource = model_loader.ModelSource;
@@ -362,6 +382,7 @@ pub const App = struct {
         }
         self.closeAtSearch();
         self.at_results.deinit(self.gpa);
+        self.clearLanesState();
         for (self.threads.items) |lane| {
             lane.deinit(self.gpa);
             self.gpa.destroy(lane);
@@ -953,6 +974,7 @@ pub const App = struct {
             .model_picker => self.handleModelPickerKey(key),
             .session_picker => self.handleSessionPickerKey(key),
             .tree_picker => self.handleTreePickerKey(key),
+            .lanes => self.handleLanesKey(key),
             .command => self.handleCommandMenuKey(key),
             // The diff viewer owns its keys directly in `captureEvent`; nothing
             // reaches the generic dispatch.
@@ -1171,6 +1193,13 @@ pub const App = struct {
             self.resumeClear();
             return true;
         }
+        if (self.mode == .lanes) {
+            self.clearLanesState();
+            self.mode = .normal;
+            self.clearInput();
+            self.clearPaletteInput();
+            return true;
+        }
         self.mode = .normal;
         self.clearInput();
         self.clearPaletteInput();
@@ -1247,6 +1276,12 @@ pub const App = struct {
             self.saveActiveLane(message) catch |err| try self.reportLaneError(err);
             return true;
         }
+        if (self.mode == .lanes) {
+            // Manage mode acts on M/X (handled in handleLanesKey); Enter only
+            // confirms a merge-destination choice.
+            if (self.lanes_purpose == .merge_dest) try self.confirmMergeDest();
+            return true;
+        }
         if (self.mode == .command) {
             const filter = try self.peekPaletteInput();
             defer self.gpa.free(filter);
@@ -1263,6 +1298,8 @@ pub const App = struct {
                     .parallel => self.createParallelLane() catch |err| try self.reportLaneError(err),
                     .save => self.beginSave() catch |err| try self.reportLaneError(err),
                     .close => self.closeActiveLane() catch |err| try self.reportLaneError(err),
+                    .merge => self.createMergePicker() catch |err| try self.reportLaneError(err),
+                    .lanes => self.openLanesPicker() catch |err| try self.reportLaneError(err),
                 }
             }
             return true;
@@ -2604,8 +2641,9 @@ pub const App = struct {
 
     /// Spawn a parallel lane: a fresh `git worktree` on its own `nova/<id>`
     /// branch forked from the current HEAD, with its own session + agent, then
-    /// switch to it. Fully isolated — its own working copy, branch, and snapshot
-    /// index; lanes never interact (land on `main` via a PR). Refused mid-turn.
+    /// switch to it. Isolated while it runs — its own working copy, branch, and
+    /// snapshot index — but can later be folded into another lane via `/merge`
+    /// (or `/lanes` once parked). Refused mid-turn.
     fn createParallelLane(self: *App) !void {
         if (self.threads.items.len >= 4) return error.TooManyLanes; // the split grid is 2×2
         const repo = self.repoRoot() orelse return error.NoActiveRuntime;
@@ -2661,7 +2699,8 @@ pub const App = struct {
     fn reportLaneError(self: *App, err: anyerror) !void {
         self.mode = .normal;
         self.clearInput();
-        const message = try std.fmt.allocPrint(self.gpa, "Lane operation failed: {s}", .{@errorName(err)});
+        self.clearLanesState();
+        const message = try std.fmt.allocPrint(self.gpa, "Lane operation failed: {s}", .{laneErrorText(err)});
         defer self.gpa.free(message);
         _ = try self.thread.transcript.append(self.gpa, .agent, "agent", message);
     }
@@ -2692,14 +2731,35 @@ pub const App = struct {
         self.clearInput();
     }
 
-    /// Close (abandon) the active lane: tear it down, remove its git worktree and
-    /// delete its branch, then fall back to the previous lane. The primary lane
-    /// (index 0) can't be closed. Refused mid-turn.
+    /// Close the active lane by *parking* it: tear down its runtime and drop it
+    /// from the split grid, but PRESERVE its git worktree and branch on disk so it
+    /// can be merged or deleted later from `/lanes`. Its conversation stays
+    /// resumable via `/resume`. The primary lane (index 0) can't be closed.
+    /// Refused mid-turn.
     fn closeActiveLane(self: *App) !void {
         if (self.thread.turn.isActive()) return error.InFlightTurn;
         const index = self.activeIndex();
         if (index == 0) return error.CannotClosePrimaryLane;
 
+        const lane = self.threads.items[index];
+        // Switch away and drop the lane before teardown so nothing dereferences
+        // it afterward. Unlike `abandonLane`, the worktree + branch are left on
+        // disk — a parked lane, surfaced by `/lanes`.
+        self.thread = self.threads.items[index - 1];
+        _ = self.threads.orderedRemove(index);
+        lane.deinit(self.gpa);
+        self.gpa.destroy(lane);
+
+        self.block_nav = false;
+        self.clearInput();
+    }
+
+    /// Tear down the working lane at `index` and DELETE its git worktree +
+    /// branch. Used for a merged source (its work now lives in the destination) —
+    /// unlike `/close`, which parks. Caller must ensure `index != 0` (never the
+    /// primary) and, if `index` is the active lane, point `self.thread` at a
+    /// survivor first.
+    fn abandonLane(self: *App, index: usize) !void {
         const lane = self.threads.items[index];
         const lane_ref: *const vcs.Lane = switch (lane.engine) {
             .live => |*live| &live.lane,
@@ -2717,24 +2777,287 @@ pub const App = struct {
         defer if (branch) |b| self.gpa.free(b);
         defer if (dir) |d| self.gpa.free(d);
 
-        // Switch away and drop the lane from the list before teardown so nothing
-        // dereferences it afterward. `lane.deinit` closes its (shared-repo)
-        // session connection; the worktree dir holds no DB, so it's safe to
-        // remove after.
-        self.thread = self.threads.items[index - 1];
+        // `lane.deinit` closes its (shared-repo) session connection; the worktree
+        // dir holds no DB, so it's safe to remove after.
         _ = self.threads.orderedRemove(index);
         lane.deinit(self.gpa);
         self.gpa.destroy(lane);
 
         if (self.repoRoot()) |repo| {
-            // `git worktree remove` deletes the working directory; then drop the
-            // lane's branch so closed lanes leave no stray `nova/<id>` behind.
+            // Remove the worktree before deleting the branch — git won't delete a
+            // branch that's still checked out in a linked worktree.
             if (dir) |d| vcs.worktreeRemove(self.gpa, self.io, repo, d) catch {};
             if (branch) |b| vcs.deleteBranch(self.gpa, self.io, repo, b) catch {};
         }
+    }
 
+    /// The directory to run a merge in for `lane` as the destination: its
+    /// worktree path, or the repo root for the primary lane.
+    fn laneMergeDir(self: *App, lane: *Thread) ?[]const u8 {
+        const lane_ref: *const vcs.Lane = switch (lane.engine) {
+            .live => |*live| &live.lane,
+            .idle => |*l| l,
+        };
+        return switch (lane_ref.*) {
+            .working => |w| w.path,
+            .primary => self.repoRoot(),
+        };
+    }
+
+    /// Merge `source` into `dest`, then remove the source lane (its work now
+    /// lives in the destination). Refused if either lane has a turn in flight, or
+    /// if the merge conflicts (rolled back — the destination is untouched). On
+    /// success `dest` becomes the active lane. Leaves `mode`/picker state to the
+    /// caller so `/lanes` can stay open while `/merge` closes.
+    fn mergeLane(self: *App, source: MergeSource, dest: *Thread) !void {
+        if (dest.turn.isActive()) return error.InFlightTurn;
+        if (source.active_index) |si| {
+            if (self.threads.items[si].turn.isActive()) return error.InFlightTurn;
+        }
+        const dest_dir = self.laneMergeDir(dest) orelse return error.NoActiveRuntime;
+
+        // Seal the source so uncommitted lane work is included. The source is
+        // always a `nova/<id>` working lane (never the user's primary branch), so
+        // auto-committing here is safe and expected.
+        if (try vcs.workingTreeDirty(self.gpa, self.io, source.path)) {
+            try vcs.commitAll(self.gpa, self.io, source.path, "nova: merge lane");
+        }
+
+        switch (try vcs.merge(self.gpa, self.io, dest_dir, source.branch)) {
+            .conflict => return error.MergeConflict,
+            .ok => {},
+        }
+
+        // Fold complete: land on the surviving destination, then remove the source.
+        self.thread = dest;
+        if (source.active_index) |si| {
+            try self.abandonLane(si);
+        } else if (self.repoRoot()) |repo| {
+            vcs.worktreeRemove(self.gpa, self.io, repo, source.path) catch {};
+            vcs.deleteBranch(self.gpa, self.io, repo, source.branch) catch {};
+        }
+
+        if (self.threads.items.len < 2) self.split = false;
         self.block_nav = false;
+    }
+
+    /// `/merge`: fold the current (working) lane into another. Refused mid-turn or
+    /// from the primary lane. With exactly one other lane, merge immediately;
+    /// otherwise open the destination picker (`Mode.lanes`, `.merge_dest`).
+    fn createMergePicker(self: *App) !void {
+        if (self.thread.turn.isActive()) return error.InFlightTurn;
+        const src_index = self.activeIndex();
+        if (src_index == 0) return error.CannotMergePrimaryLane;
+        const src = workingLaneOf(self.thread) orelse return error.CannotMergePrimaryLane;
+        if (self.threads.items.len < 2) return error.NoMergeDestination;
+
+        const source: MergeSource = .{ .branch = src.branch, .path = src.path, .active_index = src_index };
+
+        if (self.threads.items.len == 2) {
+            const dest = self.threads.items[if (src_index == 0) 1 else 0];
+            defer {
+                self.clearPaletteInput();
+                self.clearLanesState();
+            }
+            try self.mergeLane(source, dest);
+            self.mode = .normal;
+            self.clearInput();
+            return;
+        }
+
+        var dests: std.ArrayList(usize) = .empty;
+        errdefer dests.deinit(self.gpa);
+        for (self.threads.items, 0..) |_, i| {
+            if (i != src_index) try dests.append(self.gpa, i);
+        }
+        self.clearLanesState();
+        self.merge_dest_indices = try dests.toOwnedSlice(self.gpa);
+        self.merge_source_index = src_index;
+        self.lanes_purpose = .merge_dest;
+        self.lanes_selection = 0;
+        self.mode = .lanes;
         self.clearInput();
+        self.clearPaletteInput();
+    }
+
+    /// Enter in the `/merge` destination picker: merge the source lane into the
+    /// selected destination and close the picker.
+    fn confirmMergeDest(self: *App) !void {
+        defer {
+            self.clearPaletteInput();
+            self.clearLanesState();
+        }
+        if (self.merge_dest_indices.len == 0 or self.lanes_selection >= self.merge_dest_indices.len) {
+            self.mode = .normal;
+            self.clearInput();
+            return;
+        }
+        const dest = self.threads.items[self.merge_dest_indices[self.lanes_selection]];
+        const src = workingLaneOf(self.threads.items[self.merge_source_index]) orelse {
+            self.mode = .normal;
+            self.clearInput();
+            return;
+        };
+        const source: MergeSource = .{ .branch = src.branch, .path = src.path, .active_index = self.merge_source_index };
+        self.mergeLane(source, dest) catch |err| {
+            // reportLaneError resets mode to normal and records the message.
+            try self.reportLaneError(err);
+            return;
+        };
+        self.mode = .normal;
+        self.clearInput();
+    }
+
+    /// `/lanes`: list parked `nova/*` worktrees (closed lanes still on disk) for
+    /// merge (M) or deletion (X).
+    fn openLanesPicker(self: *App) !void {
+        const repo = self.repoRoot() orelse return error.NoActiveRuntime;
+        self.clearLanesState();
+        self.parked_lanes = try self.collectParkedLanes(repo);
+        self.lanes_purpose = .manage;
+        self.lanes_selection = 0;
+        self.mode = .lanes;
+        self.clearInput();
+        self.clearPaletteInput();
+    }
+
+    /// On-disk `nova/*` worktrees that are NOT currently open as lanes — the
+    /// parked lanes. Caller owns the result (free via `vcs.freeWorktreeList`).
+    fn collectParkedLanes(self: *App, repo: []const u8) ![]vcs.WorktreeEntry {
+        const all = try vcs.worktreeList(self.gpa, self.io, repo);
+        defer vcs.freeWorktreeList(self.gpa, all);
+
+        var out: std.ArrayList(vcs.WorktreeEntry) = .empty;
+        errdefer {
+            for (out.items) |*entry| entry.deinit(self.gpa);
+            out.deinit(self.gpa);
+        }
+        for (all) |entry| {
+            if (!std.mem.startsWith(u8, entry.branch, "nova/")) continue;
+            if (self.laneOpenAtPath(entry.path)) continue;
+            const path_dup = try self.gpa.dupe(u8, entry.path);
+            errdefer self.gpa.free(path_dup);
+            const branch_dup = try self.gpa.dupe(u8, entry.branch);
+            errdefer self.gpa.free(branch_dup);
+            try out.append(self.gpa, .{ .path = path_dup, .branch = branch_dup });
+        }
+        return out.toOwnedSlice(self.gpa);
+    }
+
+    /// Whether an open lane's worktree lives at `path`. Compares the final path
+    /// segment (the unique lane id) so it survives git reporting forward slashes
+    /// where the stored path uses the platform separator.
+    fn laneOpenAtPath(self: *App, path: []const u8) bool {
+        for (self.threads.items) |lane| {
+            if (workingLaneOf(lane)) |w| {
+                if (std.mem.eql(u8, lastPathSegment(w.path), lastPathSegment(path))) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Reload the parked-lane list in place (after a merge/delete) and clamp the
+    /// selection. Keeps the `/lanes` window open.
+    fn reloadParkedLanes(self: *App) !void {
+        const repo = self.repoRoot() orelse return;
+        if (self.parked_lanes.len > 0) {
+            vcs.freeWorktreeList(self.gpa, self.parked_lanes);
+            self.parked_lanes = &.{};
+        }
+        self.parked_lanes = try self.collectParkedLanes(repo);
+        if (self.lanes_selection >= self.parked_lanes.len) {
+            self.lanes_selection = if (self.parked_lanes.len == 0) 0 else @intCast(self.parked_lanes.len - 1);
+        }
+    }
+
+    /// `/lanes` → M: merge the selected parked worktree into the current lane,
+    /// remove it, and keep the window open on the reloaded list.
+    fn mergeSelectedParked(self: *App) !void {
+        if (self.lanes_selection >= self.parked_lanes.len) return;
+        const entry = self.parked_lanes[self.lanes_selection];
+        const source: MergeSource = .{ .branch = entry.branch, .path = entry.path, .active_index = null };
+        try self.mergeLane(source, self.thread);
+        try self.reloadParkedLanes();
+    }
+
+    /// `/lanes` → X: delete the selected parked worktree and its branch.
+    fn deleteSelectedParked(self: *App) !void {
+        if (self.lanes_selection >= self.parked_lanes.len) return;
+        const entry = self.parked_lanes[self.lanes_selection];
+        if (self.repoRoot()) |repo| {
+            vcs.worktreeRemove(self.gpa, self.io, repo, entry.path) catch {};
+            vcs.deleteBranch(self.gpa, self.io, repo, entry.branch) catch {};
+        }
+        try self.reloadParkedLanes();
+    }
+
+    /// Number of rows in the lanes overlay for the current purpose.
+    fn laneEntryCount(self: *const App) u32 {
+        return switch (self.lanes_purpose) {
+            .manage => @intCast(self.parked_lanes.len),
+            .merge_dest => @intCast(self.merge_dest_indices.len),
+        };
+    }
+
+    /// Free the lanes-overlay working state (parked list + destination indices).
+    fn clearLanesState(self: *App) void {
+        if (self.parked_lanes.len > 0) {
+            vcs.freeWorktreeList(self.gpa, self.parked_lanes);
+            self.parked_lanes = &.{};
+        }
+        if (self.merge_dest_indices.len > 0) {
+            self.gpa.free(self.merge_dest_indices);
+            self.merge_dest_indices = &.{};
+        }
+        self.lanes_selection = 0;
+    }
+
+    /// Rows for the lanes overlay, arena-allocated each draw (strings borrowed
+    /// from `parked_lanes` / `threads`).
+    fn buildLaneEntries(self: *App, arena: std.mem.Allocator) ![]lanes_picker.Entry {
+        switch (self.lanes_purpose) {
+            .manage => {
+                const out = try arena.alloc(lanes_picker.Entry, self.parked_lanes.len);
+                for (self.parked_lanes, 0..) |entry, i| {
+                    out[i] = .{ .title = entry.branch, .subtitle = entry.path };
+                }
+                return out;
+            },
+            .merge_dest => {
+                const out = try arena.alloc(lanes_picker.Entry, self.merge_dest_indices.len);
+                for (self.merge_dest_indices, 0..) |ti, i| {
+                    const lane = self.threads.items[ti];
+                    out[i] = .{
+                        .title = lane.title orelse (if (ti == 0) "primary" else "lane"),
+                        .subtitle = if (workingLaneOf(lane)) |w| w.branch else "(primary working copy)",
+                    };
+                }
+                return out;
+            },
+        }
+    }
+
+    fn handleLanesKey(self: *App, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.up, .{})) {
+            if (self.lanes_selection > 0) self.lanes_selection -= 1;
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{})) {
+            const count = self.laneEntryCount();
+            if (count > 0 and self.lanes_selection + 1 < count) self.lanes_selection += 1;
+            return true;
+        }
+        if (self.lanes_purpose == .manage) {
+            if (key.matches('m', .{}) or key.matches('m', .{ .shift = true })) {
+                self.mergeSelectedParked() catch |err| try self.reportLaneError(err);
+                return true;
+            }
+            if (key.matches('x', .{}) or key.matches('x', .{ .shift = true })) {
+                self.deleteSelectedParked() catch |err| try self.reportLaneError(err);
+                return true;
+            }
+        }
+        return false;
     }
 
     fn installRuntime(self: *App, runtime: *runtime_mod.AgentRuntime) !void {
@@ -3594,6 +3917,9 @@ const RootWidget = struct {
                 .file_search => self.app.palette_input.widget(),
                 .browse => self.widget(),
             },
+            // The lanes overlay owns its keys via captureEvent; the palette input
+            // is unused, so keep focus on the root (typed keys are ignored).
+            .lanes => self.widget(),
             .normal => self.app.input.widget(),
         };
         try ctx.requestFocus(target);
@@ -4583,7 +4909,7 @@ fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
         .normal => app.input.buf.realLength() == 0,
         .session_picker, .model_picker, .tree_picker => app.palette_input.buf.realLength() == 0,
         .provider_picker => app.provider_picker.stage == .list and app.palette_input.buf.realLength() == 0,
-        .command, .diff_viewer, .save_message => false,
+        .command, .diff_viewer, .save_message, .lanes => false,
     };
 }
 
@@ -4726,7 +5052,54 @@ const TranscriptWidget = struct {
     }
 };
 
-const Command = enum { connect, model, new, resume_session, timeline, diff, parallel, save, close };
+/// A lane being merged away. `branch`/`path` identify its `nova/<id>` worktree;
+/// `active_index` is its `threads` slot when it's an open lane (torn down via
+/// `abandonLane` after a successful merge), or null for a parked worktree
+/// (removed directly). Strings are borrowed for the duration of the merge.
+const MergeSource = struct {
+    branch: []const u8,
+    path: []const u8,
+    active_index: ?usize,
+};
+
+/// The `nova/<id>` worktree of `lane` if it's a working lane, else null (the
+/// primary lane carries no dedicated branch/worktree).
+fn workingLaneOf(lane: *Thread) ?vcs.Lane.Working {
+    const lane_ref: *const vcs.Lane = switch (lane.engine) {
+        .live => |*live| &live.lane,
+        .idle => |*l| l,
+    };
+    return switch (lane_ref.*) {
+        .working => |w| w,
+        .primary => null,
+    };
+}
+
+/// Final path segment, tolerant of both `/` and `\` separators and trailing
+/// slashes. Used to match worktree paths across git's forward-slash reporting
+/// and the platform-native paths Nova stores.
+fn lastPathSegment(path: []const u8) []const u8 {
+    var end = path.len;
+    while (end > 0 and (path[end - 1] == '/' or path[end - 1] == '\\')) end -= 1;
+    var start = end;
+    while (start > 0 and path[start - 1] != '/' and path[start - 1] != '\\') start -= 1;
+    return path[start..end];
+}
+
+/// Friendly text for the lane-operation errors surfaced by `reportLaneError`.
+fn laneErrorText(err: anyerror) []const u8 {
+    return switch (err) {
+        error.InFlightTurn => "a turn is still running — wait for it to finish",
+        error.MergeConflict => "merge conflict — the lanes changed the same lines (rolled back, nothing lost)",
+        error.CannotMergePrimaryLane => "can't merge the primary lane; switch to a working lane first",
+        error.CannotClosePrimaryLane => "can't close the primary lane",
+        error.NoMergeDestination => "no other lane to merge into",
+        error.TooManyLanes => "too many lanes (max 4)",
+        else => @errorName(err),
+    };
+}
+
+const Command = enum { connect, model, new, resume_session, timeline, diff, parallel, save, close, merge, lanes };
 /// `multi_lane` commands act on another lane, so they're hidden from the palette
 /// (and unresolvable) until more than one lane exists.
 const CommandEntry = struct { name: []const u8, command: Command, multi_lane: bool = false };
@@ -4739,7 +5112,9 @@ const commands = [_]CommandEntry{
     .{ .name = "Diff", .command = .diff },
     .{ .name = "Parallel", .command = .parallel },
     .{ .name = "Save", .command = .save },
+    .{ .name = "Merge", .command = .merge, .multi_lane = true },
     .{ .name = "Close", .command = .close, .multi_lane = true },
+    .{ .name = "Lanes", .command = .lanes },
 };
 
 /// Whether `entry` should appear in the palette given the current lane count.
@@ -4748,8 +5123,8 @@ fn commandVisible(app: *const App, entry: CommandEntry) bool {
     return true;
 }
 
-fn overlayLabel(mode: App.Mode) []const u8 {
-    return switch (mode) {
+fn overlayLabel(app: *const App) []const u8 {
+    return switch (app.mode) {
         .normal => "",
         .command => "Command",
         .session_picker => "Search for Sessions",
@@ -4757,6 +5132,10 @@ fn overlayLabel(mode: App.Mode) []const u8 {
         .model_picker => "Select Model",
         .tree_picker => "Session Timeline",
         .save_message => "Commit Message",
+        .lanes => switch (app.lanes_purpose) {
+            .manage => "Parallel Lanes",
+            .merge_dest => "Merge Into",
+        },
         .diff_viewer => "",
     };
 }
@@ -4849,8 +5228,9 @@ fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []
         .diff_viewer => {
             if (app.diff.sub == .file_search) try app.diff.filterFiles(app.gpa, value);
         },
-        // The save-message prompt is free text — nothing to filter live.
-        .provider_picker, .normal, .save_message => {},
+        // The save-message prompt is free text — nothing to filter live. The
+        // lanes overlay has no palette input.
+        .provider_picker, .normal, .save_message, .lanes => {},
     }
     ctx.consumeAndRedraw();
 }
@@ -4866,6 +5246,7 @@ fn overlaySize(mode: App.Mode) OverlaySize {
         .model_picker => .{ .width = 90, .height = 16 },
         .tree_picker => .{ .width = 90, .height = 20 },
         .save_message => .{ .width = 60, .height = 3 },
+        .lanes => .{ .width = 80, .height = 16 },
         .diff_viewer => .{ .width = 0, .height = 0 },
     };
 }
@@ -4919,7 +5300,7 @@ const OverlayWidget = struct {
             .{ .width = total_w, .height = total_h },
             .{ .width = total_w, .height = total_h },
         ));
-        writeBorderLabel(&surface, ctx, overlayLabel(self.app.mode));
+        writeBorderLabel(&surface, ctx, overlayLabel(self.app));
         return surface;
     }
 };
@@ -5098,6 +5479,7 @@ const OverlayInner = struct {
             .model_picker => drawModelContent(app, ctx),
             .tree_picker => drawTreeContent(app, ctx),
             .save_message => drawSaveMessageContent(app, ctx),
+            .lanes => drawLanesContent(app, ctx),
             // The diff viewer is full-screen — `drawRoot` returns before the
             // overlay path, so this is never reached.
             .normal, .diff_viewer => unreachable,
@@ -5115,6 +5497,20 @@ const OverlayInner = struct {
         var content: tree_selector.Content = .{
             .state = &app.tree_state,
             .list = &app.tree_list,
+        };
+        return content.widget().draw(ctx);
+    }
+
+    fn drawLanesContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const entries = try app.buildLaneEntries(ctx.arena);
+        var content: lanes_picker.Content = .{
+            .list = &app.lanes_list,
+            .entries = entries,
+            .selection = app.lanes_selection,
+            .empty_message = switch (app.lanes_purpose) {
+                .manage => "  No parked lanes.",
+                .merge_dest => "  No lanes to merge into.",
+            },
         };
         return content.widget().draw(ctx);
     }
@@ -5228,6 +5624,10 @@ fn inputHintText(app: *const App) []const u8 {
         .model_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Column" ++ symbols.separator_dot_padded ++ "[TAB] Toggle Effort/Scope" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .tree_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Filter" ++ symbols.separator_dot_padded ++ "[TAB] Fold" ++ symbols.separator_dot_padded ++ "✦ Checkpoint" ++ symbols.separator_dot_padded ++ "[ENTER] Switch" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .save_message => "[ENTER] Save" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
+        .lanes => switch (app.lanes_purpose) {
+            .manage => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[M] Merge into current" ++ symbols.separator_dot_padded ++ "[X] Delete" ++ symbols.separator_dot_padded ++ "[ESC] Back",
+            .merge_dest => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Merge into" ++ symbols.separator_dot_padded ++ "[ESC] Back",
+        },
         .diff_viewer => "",
         .normal => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[SHIFT] ↓ Jump to Bottom" ++ symbols.separator_dot_padded ++ "[TAB] Expand",
     };
@@ -6901,12 +7301,23 @@ test "lane commands stay hidden until a second lane exists" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    // Single lane: the lane-only commands (/close, /sync) are filtered out of the
-    // palette and can't be resolved; the eight always-on commands remain.
-    try std.testing.expectEqual(@as(u32, 8), commandMatchesCountForFilter(&app, ""));
+    // Single lane: the multi-lane commands (/merge, /close) are filtered out of
+    // the palette and can't be resolved; the nine always-on commands remain
+    // (Connect, Models, New, Resume, Timeline, Diff, Parallel, Save, Lanes).
+    try std.testing.expectEqual(@as(u32, 9), commandMatchesCountForFilter(&app, ""));
     try std.testing.expect(resolveCommand(&app, "Close") == null);
+    try std.testing.expect(resolveCommand(&app, "Merge") == null);
+    // `/sync` was removed with the git-shadow pivot and never came back.
     try std.testing.expect(resolveCommand(&app, "Sync") == null);
     try std.testing.expect(resolveCommand(&app, "Parallel") == .parallel);
+    try std.testing.expect(resolveCommand(&app, "Lanes") == .lanes);
+
+    // A second lane unhides the multi-lane commands.
+    const lane2 = try gpa.create(Thread);
+    lane2.* = .{};
+    try app.threads.append(gpa, lane2);
+    try std.testing.expect(resolveCommand(&app, "Merge") == .merge);
+    try std.testing.expect(resolveCommand(&app, "Close") == .close);
 }
 
 test "model selection is allowed after interrupt" {
