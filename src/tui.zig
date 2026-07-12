@@ -111,6 +111,21 @@ fn runDiffRefresh(job: *DiffRefreshJob) DiffRefreshOutcome {
     return .{ .ready = raw };
 }
 
+/// A single-row clickable region on screen (absolute coordinates). Used to
+/// hit-test mouse clicks against the pink lanes chip.
+const ChipRect = struct {
+    row: u16,
+    col: u16,
+    width: u16,
+
+    fn contains(self: ChipRect, row: i16, col: i16) bool {
+        if (row < 0 or col < 0) return false;
+        const r: u16 = @intCast(row);
+        const c: u16 = @intCast(col);
+        return r == self.row and c >= self.col and c < self.col + self.width;
+    }
+};
+
 pub const App = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -123,9 +138,15 @@ pub const App = struct {
     /// auto-deref, even from a `*const App`.
     thread: *Thread,
     /// When true and there's more than one lane, the transcript area tiles all
-    /// lanes as columns (toggled by `/split`); otherwise only the active lane
-    /// shows full-width.
+    /// lanes as columns; otherwise only the active lane shows full-width
+    /// ("fullscreen"). Set true on opening a parallel lane and toggled by
+    /// `toggleLaneFullscreen` (Ctrl+L) / clicking the pink lanes chip.
     split: bool = false,
+    lanes_chip_rect: ?ChipRect = null,
+    /// Root-relative row where the input surface is drawn this frame; lets the
+    /// input widget translate its local chip position into absolute coordinates
+    /// for `lanes_chip_rect`.
+    input_surface_row: u16 = 0,
     input: vxfw.TextField,
     palette_input: vxfw.TextField,
     /// Inline comment editor for the diff viewer. Single-line; cleared between
@@ -1140,9 +1161,15 @@ pub const App = struct {
             self.thread.auto_scroll = !scrolled and self.selectionIsLastMessage() and !self.selectedMessageIsLong();
             return true;
         }
-        if (key.matches(vaxis.Key.tab, .{ .shift = true })) {
-            self.switchToNextLane();
-            return true;
+        if (self.threads.items.len > 1) {
+            if (key.matches(vaxis.Key.tab, .{ .shift = true }) or key.matches(vaxis.Key.right, .{ .shift = true })) {
+                self.cycleLane(1);
+                return true;
+            }
+            if (key.matches(vaxis.Key.left, .{ .shift = true })) {
+                self.cycleLane(-1);
+                return true;
+            }
         }
         if (key.matches(vaxis.Key.tab, .{})) {
             self.thread.transcript.toggleSelected();
@@ -2722,13 +2749,32 @@ pub const App = struct {
         return false;
     }
 
-    /// Cycle to the next lane (wrapping). No-op with a single lane.
-    fn switchToNextLane(self: *App) void {
-        if (self.threads.items.len < 2) return;
-        const next = (self.activeIndex() + 1) % self.threads.items.len;
+    /// Cycle the active lane by `delta` (+1 next, -1 previous), wrapping at both
+    /// ends. No-op with a single lane. Switching the active lane matters in both
+    /// layouts: it moves the ● marker in split view and swaps the visible column
+    /// when fullscreened.
+    fn cycleLane(self: *App, delta: i32) void {
+        const n = self.threads.items.len;
+        if (n < 2) return;
+        const cur: i32 = @intCast(self.activeIndex());
+        const next: usize = @intCast(@mod(cur + delta, @as(i32, @intCast(n))));
         self.thread = self.threads.items[next];
         self.block_nav = false;
         self.clearInput();
+    }
+
+    /// Cycle to the next lane (wrapping). No-op with a single lane.
+    fn switchToNextLane(self: *App) void {
+        self.cycleLane(1);
+    }
+
+    /// Toggle between the tiled split view and fullscreening the active lane.
+    /// No-op with a single lane — there's nothing to tile, so the state would be
+    /// invisible. When fullscreened while other lanes remain, the pink "N Lanes"
+    /// chip surfaces the hidden lanes and offers a click-back to split.
+    fn toggleLaneFullscreen(self: *App) void {
+        if (self.threads.items.len < 2) return;
+        self.split = !self.split;
     }
 
     /// Close the active lane by *parking* it: tear down its runtime and drop it
@@ -3627,6 +3673,15 @@ const RootWidget = struct {
                 try self.ensureTick(ctx);
                 if (mouse.button == .wheel_up) self.app.thread.auto_scroll = false;
                 if (mouse.button == .wheel_down) self.app.updateMouseAutoScroll();
+                if (mouse.type == .press and mouse.button == .left) {
+                    if (self.app.lanes_chip_rect) |rect| {
+                        if (rect.contains(mouse.row, mouse.col)) {
+                            self.app.split = true;
+                            ctx.consumeAndRedraw();
+                            return;
+                        }
+                    }
+                }
             },
             .key_press => |key| {
                 try self.ensureTick(ctx);
@@ -3671,6 +3726,12 @@ const RootWidget = struct {
                 if (key.matches('o', .{ .ctrl = true })) {
                     self.app.pending_quit_at = null;
                     self.app.toggleBackgroundModal();
+                    ctx.consumeAndRedraw();
+                    return;
+                }
+                if (key.matches('l', .{ .ctrl = true }) or key.matches('l', .{ .super = true })) {
+                    self.app.pending_quit_at = null;
+                    self.app.toggleLaneFullscreen();
                     ctx.consumeAndRedraw();
                     return;
                 }
@@ -3978,6 +4039,8 @@ const RootWidget = struct {
         // In split view always reserve the loading row so each column keeps a
         // fixed height across turns — the spinner appearing must not reflow.
         const layout = rootLayout(max_height, false, try self.app.inputTextRows(ctx, max_width -| 4), loading_visible or split, self.app.thread.queued.items.len > 0);
+        self.app.input_surface_row = layout.input_row;
+        self.app.lanes_chip_rect = null;
 
         var transcript_view: TranscriptWidget = .{ .app = self.app, .thread = self.app.thread };
         var loading_view: LoadingWidget = .{ .app = self.app };
@@ -5959,10 +6022,14 @@ const InputWidget = struct {
         const show_hint = height >= base_row + 1;
         const show_diff = show_hint and self.app.diffCountsVisible();
         const show_badge = show_hint and self.app.runningBackgroundCount() > 0;
+        // The pink lanes chip only makes sense while fullscreened (not tiled)
+        // with other lanes hidden behind the active one.
+        const show_lanes = show_hint and !self.app.split and self.app.threads.items.len > 1;
         const children_count: usize = 1 +
             @as(usize, if (show_hint) 1 else 0) +
             @as(usize, if (show_diff) 1 else 0) +
             @as(usize, if (show_badge) 1 else 0) +
+            @as(usize, if (show_lanes) 1 else 0) +
             @as(usize, if (queued_visible) 1 else 0);
         const children = try ctx.arena.alloc(vxfw.SubSurface, children_count);
         var child_index: usize = 0;
@@ -5990,10 +6057,29 @@ const InputWidget = struct {
             try self.drawDiffCounts(ctx, children, child_index, base_row, max_width);
             child_index += 1;
         }
-        if (show_badge) {
+        // Lay the two bottom-left pills out left-to-right: pink lanes chip first,
+        // then the blue background-jobs badge shifted past it when both show.
+        var lanes_width: u16 = 0;
+        if (show_lanes) {
+            const lanes_surface = try self.drawLanesBadge(ctx, max_width -| 2);
+            lanes_width = lanes_surface.size.width;
             children[child_index] = .{
                 .origin = .{ .row = base_row, .col = 1 },
-                .surface = try self.drawBackgroundBadge(ctx, max_width -| 2),
+                .surface = lanes_surface,
+                .z_index = 2,
+            };
+            child_index += 1;
+            self.app.lanes_chip_rect = .{
+                .row = self.app.input_surface_row + base_row,
+                .col = 1,
+                .width = lanes_width,
+            };
+        }
+        if (show_badge) {
+            const badge_col: u16 = if (show_lanes) 1 + lanes_width + 1 else 1;
+            children[child_index] = .{
+                .origin = .{ .row = base_row, .col = badge_col },
+                .surface = try self.drawBackgroundBadge(ctx, max_width -| badge_col -| 1),
                 .z_index = 2,
             };
             child_index += 1;
@@ -6062,6 +6148,19 @@ const InputWidget = struct {
             .surface = try hint_text.widget().draw(ctx.withConstraints(.{ .width = width, .height = 1 }, .{ .width = width, .height = 1 })),
             .z_index = 0,
         };
+    }
+
+    /// Bottom-left pink pill: the count of open lanes, shown while the active
+    /// lane is fullscreened. Black-on-pink so it reads as a control affordance;
+    /// clicking it (mouse) or pressing Ctrl+L restores the split view.
+    fn drawLanesBadge(self: *InputWidget, ctx: vxfw.DrawContext, max_width: u16) std.mem.Allocator.Error!vxfw.Surface {
+        const text = try std.fmt.allocPrint(ctx.arena, " {d} Lanes ", .{self.app.threads.items.len});
+        const text_width: u16 = @intCast(@min(ctx.stringWidth(text), max_width));
+        var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = text_width, .height = 1 });
+        if (text_width == 0) return surface;
+        panel.fillRow(&surface, 0, StylePalette.lanes_badge);
+        panel.lineStyledAt(&surface, 0, text, ctx, 0, StylePalette.lanes_badge) catch {};
+        return surface;
     }
 
     /// Bottom-left status pill: live background-job count + the Ctrl+O hint, in
@@ -7318,6 +7417,75 @@ test "lane commands stay hidden until a second lane exists" {
     try app.threads.append(gpa, lane2);
     try std.testing.expect(resolveCommand(&app, "Merge") == .merge);
     try std.testing.expect(resolveCommand(&app, "Close") == .close);
+}
+
+test "cycleLane wraps the active lane in both directions" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // With a single lane, cycling is a no-op.
+    app.cycleLane(1);
+    try std.testing.expectEqual(@as(usize, 0), app.activeIndex());
+
+    const lane2 = try gpa.create(Thread);
+    lane2.* = .{};
+    try app.threads.append(gpa, lane2);
+    const lane3 = try gpa.create(Thread);
+    lane3.* = .{};
+    try app.threads.append(gpa, lane3);
+
+    try std.testing.expectEqual(@as(usize, 0), app.activeIndex());
+    app.cycleLane(1);
+    try std.testing.expectEqual(@as(usize, 1), app.activeIndex());
+    app.cycleLane(1);
+    try std.testing.expectEqual(@as(usize, 2), app.activeIndex());
+    // Forward past the last lane wraps to the first.
+    app.cycleLane(1);
+    try std.testing.expectEqual(@as(usize, 0), app.activeIndex());
+    // Backward past the first lane wraps to the last.
+    app.cycleLane(-1);
+    try std.testing.expectEqual(@as(usize, 2), app.activeIndex());
+}
+
+test "toggleLaneFullscreen flips split only when multiple lanes exist" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // Single lane: nothing to tile, so the toggle leaves split untouched.
+    try std.testing.expect(!app.split);
+    app.toggleLaneFullscreen();
+    try std.testing.expect(!app.split);
+
+    const lane2 = try gpa.create(Thread);
+    lane2.* = .{};
+    try app.threads.append(gpa, lane2);
+    app.split = true; // parallel lanes open tiled
+    app.toggleLaneFullscreen();
+    try std.testing.expect(!app.split); // now fullscreened
+    app.toggleLaneFullscreen();
+    try std.testing.expect(app.split); // back to split
+}
+
+test "lanes chip rect hit test covers its row span only" {
+    const rect: ChipRect = .{ .row = 5, .col = 2, .width = 9 };
+    try std.testing.expect(rect.contains(5, 2)); // left edge
+    try std.testing.expect(rect.contains(5, 10)); // right edge (col + width - 1)
+    try std.testing.expect(!rect.contains(5, 11)); // one past the right edge
+    try std.testing.expect(!rect.contains(5, 1)); // one before the left edge
+    try std.testing.expect(!rect.contains(4, 5)); // wrong row
+    try std.testing.expect(!rect.contains(-1, -1)); // off-screen negatives
 }
 
 test "model selection is allowed after interrupt" {

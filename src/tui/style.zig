@@ -7,6 +7,7 @@ pub const Palette = struct {
     const failure_red = .{ 239, 68, 68 };
     const accent_orange = .{ 249, 115, 22 };
     const skill_purple = .{ 168, 85, 247 };
+    const lane_pink = .{ 244, 114, 182 };
     const muted_gray = .{ 138, 138, 138 };
     const selection_bg = .{ 38, 38, 38 };
 
@@ -25,6 +26,7 @@ pub const Palette = struct {
     /// Bottom-left background-jobs badge: black text on the thinking-blue fill,
     /// so the live-job count reads as a status pill, not body text.
     pub const background_badge: vaxis.Style = .{ .fg = .{ .rgb = .{ 0, 0, 0 } }, .bg = .{ .rgb = thinking_blue } };
+    pub const lanes_badge: vaxis.Style = .{ .fg = .{ .rgb = .{ 0, 0, 0 } }, .bg = .{ .rgb = lane_pink } };
     pub const model_status: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
     pub const thinking_label: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
     pub const thinking_body: vaxis.Style = .{ .fg = .{ .rgb = muted_gray } };
