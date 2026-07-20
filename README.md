@@ -18,7 +18,7 @@ hf download P0u4a/ModernBERT-bash-classifier
 And export the model to ONNX
 
 ```bash
-cd vendor/bert-bash-classifier
+cd vendor/local-models
 uv run python export_onnx.py --model-dir /path/to/model
 ```
 

@@ -20,6 +20,7 @@ const symbols = @import("symbols.zig");
 const transcript_mod = @import("transcript.zig");
 const CountingAllocator = @import("counting_allocator").CountingAllocator;
 const agent_worker = @import("tui/agent_worker.zig");
+const naming_mod = @import("tui/naming.zig");
 const Turn = @import("tui/turn.zig");
 const model_catalogue = @import("tui/model_catalogue.zig");
 const tui_turn_view = @import("tui/turn_view.zig");
@@ -53,6 +54,9 @@ const loading_spinners = tui_turn_view.loading_spinners;
 const loading_frame_ms = tui_message.loading_frame_ms;
 const command_prefix: u8 = '/';
 const long_message_scroll_step_rows: u16 = 3;
+/// How many recent parent-lane messages ride along as branch-naming context
+/// when a lane is forked with `/parallel`.
+const lane_naming_context_max: usize = 3;
 const TranscriptNavigation = enum { previous, next };
 const MentionSearchKind = enum { file, skill };
 
@@ -352,6 +356,19 @@ pub const App = struct {
         };
     }
 
+    /// The runtime whose allocator, home dir, and prompt/skills template seed
+    /// new lanes: the first live lane (the primary, in practice). Null only in
+    /// headless/test setups.
+    fn templateRuntime(self: *const App) ?*runtime_mod.AgentRuntime {
+        for (self.threads.items) |lane| {
+            switch (lane.engine) {
+                .live => |live| return live.runtime,
+                else => {},
+            }
+        }
+        return null;
+    }
+
     pub fn bindInputCallbacks(self: *App) void {
         self.input.userdata = self;
         self.input.onChange = inputChanged;
@@ -368,6 +385,7 @@ pub const App = struct {
                 _ = future.cancel(self.io);
                 lane.turn_future = null;
             }
+            self.cancelLaneNaming(lane);
         }
         // Now that no worker can still be inside `manager.start`, terminate and
         // join every background job (kills the whole process tree on Windows via
@@ -494,6 +512,11 @@ pub const App = struct {
         self.resetTurnState();
         self.thread.worker_context.?.resetCancel();
         _ = try self.thread.transcript.append(self.gpa, .user, "you", prompt);
+        // A worktree lane's first prompt also names its branch: ask the model
+        // in parallel, and rename the hex branch when the answer lands.
+        if (self.thread.title == null and workingLaneOf(self.thread) != null) {
+            self.scheduleLaneNaming(self.thread, prompt) catch {};
+        }
         try self.setLaneTitleIfUnset(prompt);
         try self.appendSkillInvocationsToTranscript(prompt);
         self.thread.turn_view.awaitModel();
@@ -1770,6 +1793,8 @@ pub const App = struct {
 
     fn signOutCodex(self: *App) !void {
         if (self.thread.turn.isActive()) return error.InFlightTurn;
+        // The naming client is about to be freed; no job may still borrow it.
+        self.cancelLaneNaming(self.thread);
         try codex.signOut(self.gpa, self.io, self.liveRuntime().?.home_dir);
         self.liveRuntime().?.disconnectCodexClient();
         self.codex_signed_in = false;
@@ -2233,6 +2258,8 @@ pub const App = struct {
         model: []const u8,
         effort: ai.ReasoningEffort,
     ) !void {
+        // The naming client is about to be replaced; no job may still borrow it.
+        self.cancelLaneNaming(self.thread);
         try self.liveRuntime().?.connectCodexClient(credentials, model, effort);
         self.thread.agent.?.client = self.liveRuntime().?.client;
     }
@@ -2244,6 +2271,8 @@ pub const App = struct {
         model_id: []const u8,
         effort: ai.ReasoningEffort,
     ) !void {
+        // The naming client is about to be replaced; no job may still borrow it.
+        self.cancelLaneNaming(self.thread);
         try self.liveRuntime().?.attachOpenAiCompatibleClient(base_url, api_key, model_id, effort);
         self.thread.agent.?.client = self.liveRuntime().?.client;
     }
@@ -2620,7 +2649,7 @@ pub const App = struct {
     }
 
     fn createRuntime(self: *App, cwd: []const u8, session_dir: []const u8, session_id: ?[]const u8) !*runtime_mod.AgentRuntime {
-        const current = self.liveRuntime().?;
+        const current = self.templateRuntime() orelse return error.NoActiveRuntime;
         const runtime = try self.gpa.create(runtime_mod.AgentRuntime);
         errdefer self.gpa.destroy(runtime);
         const diagnostics = try current.gpa.alloc(config_mod.Diagnostic, 0);
@@ -2670,12 +2699,22 @@ pub const App = struct {
     /// branch forked from the current HEAD, with its own session + agent, then
     /// switch to it. Isolated while it runs — its own working copy, branch, and
     /// snapshot index — but can later be folded into another lane via `/merge`
-    /// (or `/lanes` once parked). Refused mid-turn.
+    /// (or `/lanes` once parked). The hex branch is renamed to a descriptive
+    /// `nova/<name>` once the model names it on the lane's first submit (see
+    /// `scheduleLaneNaming` / `drainLaneNaming`). Refused mid-turn.
     fn createParallelLane(self: *App) !void {
         if (self.threads.items.len >= 4) return error.TooManyLanes; // the split grid is 2×2
         const repo = self.repoRoot() orelse return error.NoActiveRuntime;
         const home = (self.liveRuntime() orelse return error.NoActiveRuntime).home_dir;
         if (!vcs.isRepo(self.gpa, self.io, repo)) return error.NotAGitRepo;
+
+        // Recent parent-lane messages give the branch-naming request context
+        // for vague first prompts ("try the other approach").
+        const context = try self.captureLaneContext(lane_naming_context_max);
+        errdefer {
+            for (context) |message| self.gpa.free(message);
+            if (context.len > 0) self.gpa.free(context);
+        }
 
         var raw: [6]u8 = undefined;
         self.io.random(&raw);
@@ -2707,6 +2746,7 @@ pub const App = struct {
             .id = runtime.session_writer.session.id,
             .agent = &runtime.agent,
             .worker_context = .{ .io = self.io, .gpa = runtime.gpa },
+            .parent_context = context,
             .engine = .{ .live = .{
                 .lane = .{ .working = .{ .branch = branch, .path = dest } },
                 .runtime = runtime,
@@ -2721,6 +2761,129 @@ pub const App = struct {
         self.mode = .normal;
         self.clearInput();
         self.resetTurnState();
+    }
+
+    /// Copy the tail of the current lane's conversation (user + agent text,
+    /// oldest first) as naming context for a lane forked from it.
+    fn captureLaneContext(self: *App, max: usize) ![][]u8 {
+        var out: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (out.items) |message| self.gpa.free(message);
+            out.deinit(self.gpa);
+        }
+        const messages = self.thread.transcript.messages.items;
+        var index = messages.len;
+        while (index > 0 and out.items.len < max) {
+            index -= 1;
+            const message = messages[index];
+            if (message.kind != .user and message.kind != .agent) continue;
+            if (message.body.len == 0) continue;
+            try out.append(self.gpa, try self.gpa.dupe(u8, message.body));
+        }
+        std.mem.reverse([]u8, out.items);
+        return out.toOwnedSlice(self.gpa);
+    }
+
+    /// Ask the session's model (via the lane runtime's dedicated naming
+    /// client) to name the lane's branch from its first prompt + the captured
+    /// parent context. Fire-and-forget: the turn runs regardless, and
+    /// `drainLaneNaming` renames the hex branch when the result lands.
+    fn scheduleLaneNaming(self: *App, lane: *Thread, first_message: []const u8) !void {
+        if (lane.naming_future != null) return;
+        const runtime = switch (lane.engine) {
+            .live => |live| live.runtime,
+            .idle => return,
+        };
+        if (runtime.naming_client == .none) return;
+
+        const first = try self.gpa.dupe(u8, first_message);
+        errdefer self.gpa.free(first);
+        const job = try self.gpa.create(naming_mod.BranchJob);
+        job.* = .{
+            .gpa = self.gpa,
+            .client = runtime.naming_client,
+            .context = lane.parent_context,
+            .first_message = first,
+            .done = &lane.naming_done,
+        };
+        // The job owns the captured context now.
+        lane.parent_context = &.{};
+        lane.naming_done.store(false, .release);
+        lane.naming_future = self.io.concurrent(naming_mod.runBranchJob, .{job}) catch |err| {
+            job.deinit();
+            self.gpa.destroy(job);
+            return err;
+        };
+    }
+
+    /// Called from the tick handler: rename any lane whose branch name landed —
+    /// `nova/<hex>` becomes `nova/<slug>` in place (worktree HEADs follow), and
+    /// the branch becomes the lane's label. A rejected or colliding name simply
+    /// leaves the hex branch.
+    fn drainLaneNaming(self: *App) !bool {
+        var changed = false;
+        for (self.threads.items) |lane| {
+            if (lane.naming_future == null) continue;
+            if (!lane.naming_done.load(.acquire)) continue;
+            var outcome = lane.naming_future.?.await(self.io);
+            lane.naming_future = null;
+            lane.naming_done.store(false, .release);
+            defer outcome.deinit(self.gpa);
+            const slug = outcome.slug orelse continue;
+            if (self.renameLaneBranch(lane, slug) catch false) changed = true;
+        }
+        return changed;
+    }
+
+    /// Point `lane`'s working branch at `nova/<slug>` — the git rename plus the
+    /// lane's own records (branch string, label). False when the lane has no
+    /// working branch or the new name is taken.
+    fn renameLaneBranch(self: *App, lane: *Thread, slug: []const u8) !bool {
+        const live = switch (lane.engine) {
+            .live => |*live| live,
+            .idle => return false,
+        };
+        const working = switch (live.lane) {
+            .working => |*w| w,
+            .primary => return false,
+        };
+
+        const branch = try std.fmt.allocPrint(self.gpa, "nova/{s}", .{slug});
+        errdefer self.gpa.free(branch);
+        const title = try self.gpa.dupe(u8, branch);
+        errdefer self.gpa.free(title);
+
+        vcs.renameBranch(self.gpa, self.io, live.runtime.cwd, working.branch, branch) catch {
+            // Taken (or git refused) — the hex branch stays; not an error.
+            self.gpa.free(branch);
+            self.gpa.free(title);
+            return false;
+        };
+
+        self.gpa.free(working.branch);
+        working.branch = branch;
+        // The lane's label is its branch from here on.
+        if (lane.title) |old| self.gpa.free(old);
+        lane.title = title;
+        return true;
+    }
+
+    fn cancelLaneNaming(self: *App, lane: *Thread) void {
+        if (lane.naming_future) |*future| {
+            var outcome = future.cancel(self.io);
+            outcome.deinit(self.gpa);
+            lane.naming_future = null;
+        }
+        lane.naming_done.store(false, .release);
+    }
+
+    /// Whether any lane has an async branch-naming job in flight — the tick
+    /// must stay alive for the result to be drained.
+    fn namingActive(self: *const App) bool {
+        for (self.threads.items) |lane| {
+            if (lane.naming_future != null) return true;
+        }
+        return false;
     }
 
     fn reportLaneError(self: *App, err: anyerror) !void {
@@ -2791,6 +2954,7 @@ pub const App = struct {
         // Switch away and drop the lane before teardown so nothing dereferences
         // it afterward. Unlike `abandonLane`, the worktree + branch are left on
         // disk — a parked lane, surfaced by `/lanes`.
+        self.cancelLaneNaming(lane);
         self.thread = self.threads.items[index - 1];
         _ = self.threads.orderedRemove(index);
         lane.deinit(self.gpa);
@@ -2807,24 +2971,18 @@ pub const App = struct {
     /// survivor first.
     fn abandonLane(self: *App, index: usize) !void {
         const lane = self.threads.items[index];
-        const lane_ref: *const vcs.Lane = switch (lane.engine) {
-            .live => |*live| &live.lane,
-            .idle => |*l| l,
-        };
         var branch: ?[]u8 = null;
         var dir: ?[]u8 = null;
-        switch (lane_ref.*) {
-            .working => |w| {
-                branch = try self.gpa.dupe(u8, w.branch);
-                dir = try self.gpa.dupe(u8, w.path);
-            },
-            .primary => {},
+        if (workingLaneOf(lane)) |w| {
+            branch = try self.gpa.dupe(u8, w.branch);
+            dir = try self.gpa.dupe(u8, w.path);
         }
         defer if (branch) |b| self.gpa.free(b);
         defer if (dir) |d| self.gpa.free(d);
 
         // `lane.deinit` closes its (shared-repo) session connection; the worktree
         // dir holds no DB, so it's safe to remove after.
+        self.cancelLaneNaming(lane);
         _ = self.threads.orderedRemove(index);
         lane.deinit(self.gpa);
         self.gpa.destroy(lane);
@@ -2840,14 +2998,8 @@ pub const App = struct {
     /// The directory to run a merge in for `lane` as the destination: its
     /// worktree path, or the repo root for the primary lane.
     fn laneMergeDir(self: *App, lane: *Thread) ?[]const u8 {
-        const lane_ref: *const vcs.Lane = switch (lane.engine) {
-            .live => |*live| &live.lane,
-            .idle => |*l| l,
-        };
-        return switch (lane_ref.*) {
-            .working => |w| w.path,
-            .primary => self.repoRoot(),
-        };
+        if (workingLaneOf(lane)) |w| return w.path;
+        return self.repoRoot();
     }
 
     /// Merge `source` into `dest`, then remove the source lane (its work now
@@ -3108,6 +3260,7 @@ pub const App = struct {
 
     fn installRuntime(self: *App, runtime: *runtime_mod.AgentRuntime) !void {
         if (self.thread.turn.isActive()) return error.InFlightTurn;
+        self.cancelLaneNaming(self.thread);
         if (self.liveRuntime()) |old| {
             old.deinit();
             self.gpa.destroy(old);
@@ -3115,6 +3268,10 @@ pub const App = struct {
         self.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = true } };
         self.thread.agent = &runtime.agent;
         self.thread.id = runtime.session_writer.session.id;
+        // The label belongs to the departed session; the next first prompt
+        // re-derives it.
+        if (self.thread.title) |title| self.gpa.free(title);
+        self.thread.title = null;
         self.mode = .normal;
         self.clearInput();
         self.resetTurnState();
@@ -3145,6 +3302,15 @@ pub const App = struct {
             }
         }
         if (self.thread.transcript.messages.items.len > 0) self.thread.transcript.selected = @intCast(self.thread.transcript.messages.items.len - 1);
+        // A freshly installed (resumed) session left the label unset; re-derive
+        // it from the conversation's first user message.
+        if (self.thread.title == null) {
+            for (self.thread.agent.?.messages()) |message| {
+                if (message.role != .user) continue;
+                try self.setLaneTitleIfUnset(message.text());
+                break;
+            }
+        }
     }
 
     fn resumedToolTitle(self: *App, message: ai.ChatMessage) ![]u8 {
@@ -3870,6 +4036,8 @@ const RootWidget = struct {
         var visible_change = try self.drainAgentEvents(ctx);
         if (try self.app.drainModelLoad()) visible_change = true;
         if (try self.app.drainDiffRefresh()) visible_change = true;
+        // Lanes whose branch name landed get renamed in place.
+        if (try self.app.drainLaneNaming()) visible_change = true;
         // Collect any finished background jobs, then deliver buffered completions
         // to idle lanes (notice + a turn to answer them).
         if (try self.app.pollBackgroundJobs()) visible_change = true;
@@ -3919,7 +4087,8 @@ const RootWidget = struct {
             diff_loading or
             self.app.blackhole_visible or
             self.diff_refresh_pending or
-            self.app.backgroundActive();
+            self.app.backgroundActive() or
+            self.app.namingActive();
         if (should_tick) {
             try ctx.tick(drain_tick_ms, self.widget());
         } else {
@@ -7144,6 +7313,8 @@ test "codex sign-in survives selecting local compatible provider" {
     runtime.diagnostics = &.{};
     runtime.owned_client = null;
     runtime.owned_compaction_client = null;
+    runtime.owned_naming_client = null;
+    runtime.naming_client = .none;
     var app = try App.init(std.testing.io, gpa, &runtime.agent);
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
     defer app.deinit();
@@ -7179,6 +7350,8 @@ test "switching from codex to catalogue provider resets cached connection" {
     runtime.codex_connection_expired = false;
     runtime.owned_client = null;
     runtime.owned_compaction_client = null;
+    runtime.owned_naming_client = null;
+    runtime.naming_client = .none;
     defer runtime.disconnectClient();
 
     var app = try App.init(std.testing.io, gpa, &runtime.agent);
@@ -7504,6 +7677,8 @@ test "model selection is allowed after interrupt" {
     runtime.diagnostics = &.{};
     runtime.owned_client = null;
     runtime.owned_compaction_client = null;
+    runtime.owned_naming_client = null;
+    runtime.naming_client = .none;
     var app = try App.init(std.testing.io, gpa, &runtime.agent);
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
     defer app.deinit();
@@ -7539,6 +7714,8 @@ test "interrupt restart flushes queued messages to the transcript when no provid
     runtime.diagnostics = &.{};
     runtime.owned_client = null;
     runtime.owned_compaction_client = null;
+    runtime.owned_naming_client = null;
+    runtime.naming_client = .none;
     var app = try App.init(std.testing.io, gpa, &runtime.agent);
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
     defer app.deinit();

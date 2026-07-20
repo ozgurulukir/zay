@@ -1,4 +1,5 @@
-//! Lifecycle for Nova's vendored local bash classifier server.
+//! Lifecycle for Nova's vendored local model server (the ModernBERT bash
+//! classifier).
 
 const std = @import("std");
 
@@ -9,7 +10,10 @@ const assert = std.debug.assert;
 const host = "127.0.0.1";
 const port_first: u16 = 8765;
 const port_count: u16 = 10;
-const startup_attempts: u32 = 100;
+// The server binds before its models load (they finish in a background
+// thread), but a cold Python start still takes several seconds — poll for up
+// to 30s, returning as soon as /health answers.
+const startup_attempts: u32 = 300;
 const startup_sleep_ms: i64 = 100;
 
 pub const Server = struct {
@@ -26,7 +30,7 @@ pub const Server = struct {
 pub fn ensure(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) !?Server {
     assert(cwd.len > 0);
 
-    const classifier_dir = try std.fs.path.join(gpa, &.{ cwd, "vendor", "bert-bash-classifier" });
+    const classifier_dir = try std.fs.path.join(gpa, &.{ cwd, "vendor", "local-models" });
     defer gpa.free(classifier_dir);
     if (!accessible(io, classifier_dir)) return null;
 

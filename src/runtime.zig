@@ -33,6 +33,12 @@ pub const AgentRuntime = struct {
     /// Second client, same config as `owned_client`, used only by the agent's
     /// background summarizer so the two never share a connection.
     owned_compaction_client: ?OwnedClient = null,
+    /// Third client, same config as `owned_client` (no tools), used only by
+    /// the TUI's background branch-naming request so it never shares a
+    /// connection with the live turn or the summarizer. The App cancels any
+    /// in-flight naming job before this runtime is torn down or reconnected.
+    owned_naming_client: ?OwnedClient = null,
+    naming_client: ai.LanguageModel = .none,
 
     pub const ClientState = union(enum) {
         disconnected,
@@ -211,7 +217,9 @@ pub const AgentRuntime = struct {
         self.gpa.free(self.system_prompt);
         skill_mod.deinitAll(self.gpa, self.skills);
         // `agent.deinit` above joined the summarizer thread, so its client is
-        // no longer in use and is safe to free.
+        // no longer in use and is safe to free. The naming client's borrower
+        // (the App's branch-naming job) is cancelled before runtime teardown.
+        if (self.owned_naming_client) |client| client.deinit(self.gpa);
         if (self.owned_compaction_client) |client| client.deinit(self.gpa);
         if (self.owned_client) |client| client.deinit(self.gpa);
         for (self.diagnostics) |*d| d.deinit(self.gpa);
@@ -348,6 +356,23 @@ pub const AgentRuntime = struct {
             };
             self.setCompactionClient(.{ .codex_responses = compaction_client });
         }
+        attach_naming: {
+            const naming_client = self.gpa.create(ai.codex_responses.Client) catch break :attach_naming;
+            naming_client.init(self.gpa, self.io, .{
+                .base_url = "https://chatgpt.com/backend-api",
+                .api_key = credentials.access,
+                .model = model_id,
+                .tools = &.{},
+                .reasoning = .{ .effort = effort, .summary = .auto },
+                .account_id = credentials.account_id,
+                .session_id = self.session_writer.session.id.slice(),
+                .system_prompt = self.system_prompt,
+            }) catch {
+                self.gpa.destroy(naming_client);
+                break :attach_naming;
+            };
+            self.setNamingClient(.{ .codex_responses = naming_client });
+        }
         self.codex_connection_expired = false;
     }
 
@@ -355,6 +380,7 @@ pub const AgentRuntime = struct {
         const owned_client = self.owned_client orelse return;
         if (owned_client != .codex_responses) return;
         self.clearCompactionClient();
+        self.clearNamingClient();
         owned_client.deinit(self.gpa);
         self.owned_client = null;
         self.client = .none;
@@ -370,6 +396,7 @@ pub const AgentRuntime = struct {
     pub fn disconnectClient(self: *AgentRuntime) void {
         const owned_client = self.owned_client orelse return;
         self.clearCompactionClient();
+        self.clearNamingClient();
         owned_client.deinit(self.gpa);
         self.owned_client = null;
         self.client = .none;
@@ -412,6 +439,20 @@ pub const AgentRuntime = struct {
             };
             self.setCompactionClient(.{ .openai_compatible = compaction_client });
         }
+        attach_naming: {
+            const naming_client = self.gpa.create(ai.openai_compatible.Client) catch break :attach_naming;
+            naming_client.init(self.gpa, self.io, .{
+                .base_url = base_url,
+                .api_key = api_key,
+                .model = model_id,
+                .tools = &.{},
+                .reasoning = .{ .effort = effort },
+            }) catch {
+                self.gpa.destroy(naming_client);
+                break :attach_naming;
+            };
+            self.setNamingClient(.{ .openai_compatible = naming_client });
+        }
     }
 
     pub fn attachOpenAiResponsesClient(
@@ -451,6 +492,22 @@ pub const AgentRuntime = struct {
                 break :attach_compaction;
             };
             self.setCompactionClient(.{ .openai_responses = compaction_client });
+        }
+        attach_naming: {
+            const naming_client = self.gpa.create(ai.openai_responses.Client) catch break :attach_naming;
+            naming_client.init(self.gpa, self.io, .{
+                .base_url = base_url,
+                .api_key = api_key,
+                .model = model_id,
+                .tools = &.{},
+                .reasoning = reasoning,
+                .session_id = self.session_writer.session.id.slice(),
+                .system_prompt = self.system_prompt,
+            }) catch {
+                self.gpa.destroy(naming_client);
+                break :attach_naming;
+            };
+            self.setNamingClient(.{ .openai_responses = naming_client });
         }
     }
 
@@ -497,6 +554,23 @@ pub const AgentRuntime = struct {
         if (self.owned_compaction_client) |old| old.deinit(self.gpa);
         self.owned_compaction_client = null;
         self.agent.compaction_client = .none;
+    }
+
+    /// Install the dedicated branch-naming client, replacing any previous one.
+    /// The caller (App) guarantees no naming job is in flight against the old
+    /// client — it cancels naming before connecting/reconnecting.
+    fn setNamingClient(self: *AgentRuntime, next: OwnedClient) void {
+        if (self.owned_naming_client) |old| old.deinit(self.gpa);
+        self.owned_naming_client = next;
+        self.naming_client = next.languageModel();
+    }
+
+    /// Tear down the branch-naming client, disabling naming until the next
+    /// connect. Same caller contract as `setNamingClient`.
+    fn clearNamingClient(self: *AgentRuntime) void {
+        if (self.owned_naming_client) |old| old.deinit(self.gpa);
+        self.owned_naming_client = null;
+        self.naming_client = .none;
     }
 };
 

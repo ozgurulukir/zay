@@ -1,5 +1,5 @@
 [project]
-name = "bert-bash-classifier"
+name = "local-models"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"

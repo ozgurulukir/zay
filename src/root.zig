@@ -5,7 +5,7 @@ pub const ai = @import("ai.zig");
 pub const at_mention = @import("at_mention.zig");
 pub const background = @import("background.zig");
 pub const bash = @import("bash.zig");
-pub const bash_classifier_server = @import("bash_classifier_server.zig");
+pub const local_models = @import("local_models.zig");
 pub const bash_safety = @import("bash_safety.zig");
 pub const codex = @import("codex.zig");
 pub const compaction = @import("compaction.zig");
@@ -46,15 +46,15 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     defer gpa.free(home_dir);
 
     var load_result = try config.load(gpa, init.io, cwd, home_dir, init.environ_map);
-    var bash_classifier_server_handle: ?bash_classifier_server.Server = null;
+    var local_models_handle: ?local_models.Server = null;
     if (load_result.config.bash_classifier_url == null) {
-        bash_classifier_server_handle = try bash_classifier_server.ensure(gpa, init.io, cwd);
-        errdefer if (bash_classifier_server_handle) |*server| server.deinit(gpa, init.io);
-        if (bash_classifier_server_handle) |server| {
+        local_models_handle = try local_models.ensure(gpa, init.io, cwd);
+        errdefer if (local_models_handle) |*server| server.deinit(gpa, init.io);
+        if (local_models_handle) |server| {
             load_result.config.bash_classifier_url = try gpa.dupe(u8, server.url);
         }
     }
-    defer if (bash_classifier_server_handle) |*server| server.deinit(gpa, init.io);
+    defer if (local_models_handle) |*server| server.deinit(gpa, init.io);
 
     // The TUI is long-running and streams unbounded content, so it must use a
     // real freeing allocator — an arena never reclaims, and `Transcript`'s

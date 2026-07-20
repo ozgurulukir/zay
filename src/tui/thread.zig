@@ -33,6 +33,7 @@ const transcript_mod = @import("../transcript.zig");
 const Turn = @import("turn.zig");
 const turn_view_mod = @import("turn_view.zig");
 const agent_worker = @import("agent_worker.zig");
+const naming = @import("naming.zig");
 
 const Thread = @This();
 
@@ -73,6 +74,15 @@ permission_scroll: u32 = 0,
 /// Null until an agent is attached.
 agent: ?*agent_mod.Agent = null,
 engine: Engine = .{ .idle = .primary },
+/// Recent parent-lane messages captured when this lane was forked with
+/// `/parallel` (oldest first) — context for the branch-naming request fired
+/// on the lane's first submit. Owned; consumed by the naming job.
+parent_context: [][]u8 = &.{},
+/// The async branch-naming request (the lane starts on a `nova/<hex>` branch
+/// and is renamed in place when the model's name lands). The future needs
+/// `io` to cancel, so the App (not `deinit` here) is responsible for it.
+naming_future: ?std.Io.Future(naming.BranchOutcome) = null,
+naming_done: std.atomic.Value(bool) = .init(false),
 
 /// A user message queued behind a running turn. `steer` injects it after the
 /// next tool batch instead of waiting for the turn to go idle. Text is owned.
@@ -104,6 +114,8 @@ pub const Engine = union(enum) {
 /// destroying the owned `AgentRuntime` — the lane is the runtime's owner.
 pub fn deinit(self: *Thread, gpa: std.mem.Allocator) void {
     if (self.title) |title| gpa.free(title);
+    for (self.parent_context) |message| gpa.free(message);
+    if (self.parent_context.len > 0) gpa.free(self.parent_context);
     self.transcript.deinit(gpa);
     self.turn_view.deinit(gpa);
     for (self.queued.items) |*message| gpa.free(message.text);
@@ -132,6 +144,15 @@ test "idle thread frees its owned title, transcript, and queue" {
     const gpa = std.testing.allocator;
     var thread: Thread = .{ .title = try gpa.dupe(u8, "feature x") };
     try thread.queued.append(gpa, .{ .text = try gpa.dupe(u8, "queued prompt") });
+    thread.deinit(gpa);
+}
+
+test "lane frees its captured parent context" {
+    const gpa = std.testing.allocator;
+    const context = try gpa.alloc([]u8, 2);
+    context[0] = try gpa.dupe(u8, "fix the login race");
+    context[1] = try gpa.dupe(u8, "I found the mutex issue");
+    var thread: Thread = .{ .parent_context = context };
     thread.deinit(gpa);
 }
 

@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import argparse
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Literal, TypedDict
 
+# transformers is imported lazily inside the model loader thread: it takes
+# several seconds to import, and the HTTP server must bind immediately (Nova's
+# startup health probe only waits so long).
 import numpy as np
 import onnxruntime as ort
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from transformers import AutoTokenizer
 
 
 type ProviderName = Literal[
@@ -42,6 +45,8 @@ class ClassifyResponse(BaseModel):
 
 class Classifier:
     def __init__(self, model_dir: Path, onnx_path: Path, max_length: int) -> None:
+        from transformers import AutoTokenizer
+
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
         self.max_length = max_length
 
@@ -74,6 +79,22 @@ class Classifier:
             label=label,
             score=unsafe_score,
             latency_ms=(time.perf_counter() - started) * 1000,
+        )
+
+
+class ModelHost:
+    """Holds the classifier while it loads in the background. The HTTP server
+    binds immediately (Nova's health probe only waits so long), and endpoints
+    return 503 until the model is ready."""
+
+    def __init__(self) -> None:
+        self.classifier: Classifier | None = None
+
+    def load(self, args: argparse.Namespace) -> None:
+        self.classifier = Classifier(
+            model_dir=Path(args.model_dir),
+            onnx_path=Path(args.onnx),
+            max_length=args.max_length,
         )
 
 
@@ -132,7 +153,7 @@ def coreml_provider(onnx_path: Path) -> CoreMLProvider:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Serve the bash classifier locally.")
+    parser = argparse.ArgumentParser(description="Serve Nova's local models.")
     parser.add_argument("--model-dir", default="ModernBERT-bash-classifier")
     parser.add_argument("--onnx", default="ModernBERT-bash-classifier/model.onnx")
     parser.add_argument("--host", default="127.0.0.1")
@@ -141,29 +162,31 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_app(classifier: Classifier) -> FastAPI:
+def build_app(host: ModelHost) -> FastAPI:
     app = FastAPI()
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {"status": "ok", "provider": classifier.provider}
+        return {
+            "status": "ok",
+            "classifier": "ok" if host.classifier is not None else "loading",
+        }
 
     @app.post("/classify")
     def classify(request: ClassifyRequest) -> ClassifyResponse:
-        return classifier.classify(request.command, request.cwd)
+        if host.classifier is None:
+            raise HTTPException(status_code=503, detail="classifier still loading")
+        return host.classifier.classify(request.command, request.cwd)
 
     return app
 
 
 def main() -> None:
     args = parse_args()
-    classifier = Classifier(
-        model_dir=Path(args.model_dir),
-        onnx_path=Path(args.onnx),
-        max_length=args.max_length,
-    )
+    host = ModelHost()
+    threading.Thread(target=host.load, args=(args,), daemon=True).start()
     uvicorn.run(
-        build_app(classifier),
+        build_app(host),
         host=args.host,
         port=args.port,
         log_level="warning",

@@ -366,6 +366,15 @@ pub fn deleteBranch(gpa: std.mem.Allocator, io: std.Io, repo_dir: []const u8, br
     // A missing branch is fine — this is cleanup.
 }
 
+/// Rename `old` to `new` (e.g. when the model names a lane's hex branch).
+/// Fails if `new` already exists; worktree HEADs checked out on `old` follow
+/// the rename, so this is safe while an agent works in the lane's worktree.
+pub fn renameBranch(gpa: std.mem.Allocator, io: std.Io, repo_dir: []const u8, old: []const u8, new: []const u8) CmdError!void {
+    var out = try run(gpa, io, repo_dir, &.{ "branch", "-m", old, new }, null);
+    defer out.deinit(gpa);
+    if (out.code != 0) return error.GitCommandFailed;
+}
+
 /// Outcome of a lane merge. `.conflict` covers both content conflicts and a
 /// dirty destination that git refuses to overwrite — in either case the merge
 /// was rolled back (`git merge --abort`) so the destination is left untouched.
