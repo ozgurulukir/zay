@@ -7,6 +7,10 @@ import time
 from pathlib import Path
 from typing import Literal, TypedDict
 
+# Make ONNX Runtime thread pool sleep instead of busy-wait when idle
+# (default is spinning, which wastes ~10% CPU even when no classify is running).
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+
 # transformers is imported lazily inside the model loader thread: it takes
 # several seconds to import, and the HTTP server must bind immediately (Nova's
 # startup health probe only waits so long).

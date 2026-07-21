@@ -58,7 +58,7 @@ pub fn ensure(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) !?Server {
             return .{ .child = null, .url = url };
         }
 
-        var child = spawn(io, classifier_dir, python_path, port) catch {
+        var child = spawn(gpa, io, classifier_dir, python_path, port) catch {
             gpa.free(url);
             continue;
         };
@@ -73,9 +73,26 @@ pub fn ensure(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) !?Server {
     return null;
 }
 
-fn spawn(io: std.Io, classifier_dir: []const u8, python_path: []const u8, port: u16) !std.process.Child {
+fn spawn(gpa: std.mem.Allocator, io: std.Io, classifier_dir: []const u8, python_path: []const u8, port: u16) !std.process.Child {
     var port_buffer: [16]u8 = undefined;
     const port_text = try std.fmt.bufPrint(&port_buffer, "{d}", .{port});
+
+    // Inherit parent process environment, then force ONNX Runtime to sleep
+    // threads when idle instead of spinning (default busy-wait wastes ~10%
+    // CPU per core).
+    var env_map = std.process.Environ.Map.init(gpa);
+    defer env_map.deinit();
+    {
+        var index: usize = 0;
+        while (std.c.environ[index]) |entry| : (index += 1) {
+            const line = std.mem.span(entry);
+            const separator = std.mem.findScalar(u8, line, '=') orelse continue;
+            if (separator == 0) continue;
+            try env_map.put(line[0..separator], line[separator + 1 ..]);
+        }
+    }
+    try env_map.put("OMP_WAIT_POLICY", "PASSIVE");
+
     return std.process.spawn(io, .{
         .argv = &.{
             python_path,
@@ -86,6 +103,7 @@ fn spawn(io: std.Io, classifier_dir: []const u8, python_path: []const u8, port: 
             port_text,
         },
         .cwd = .{ .path = classifier_dir },
+        .environ_map = &env_map,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
