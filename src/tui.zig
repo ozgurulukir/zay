@@ -418,6 +418,10 @@ pub const App = struct {
         return &self.provider_key_input;
     }
 
+    pub fn getModels(self: *App) *model_catalogue.ModelCatalogue {
+        return &self.models;
+    }
+
     pub fn popProviderKeyInput(self: *App) void {
         const items = self.provider_key_input.items;
         if (items.len == 0) return;
@@ -1144,31 +1148,7 @@ pub const App = struct {
     }
 
     pub fn handleModelPickerKey(self: *App, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.left, .{})) {
-            self.models.model_column = self.models.model_column.previous();
-            return true;
-        }
-        if (key.matches(vaxis.Key.right, .{})) {
-            if (self.models.len() > 0) self.models.model_column = self.models.model_column.next();
-            return true;
-        }
-        if (key.matches(vaxis.Key.tab, .{})) {
-            switch (self.models.model_column) {
-                .model => self.models.model_column = self.models.model_column.next(),
-                .reasoning => try self.cycleSelectedReasoning(),
-                .scope => self.cycleModelScope(),
-            }
-            return true;
-        }
-        if (key.matches(vaxis.Key.up, .{})) {
-            try self.stepModelSelection(false);
-            return true;
-        }
-        if (key.matches(vaxis.Key.down, .{})) {
-            try self.stepModelSelection(true);
-            return true;
-        }
-        return false;
+        return command_router.ModelPicker.handle(self, key);
     }
 
     pub fn handleSessionPickerKey(self: *App, key: vaxis.Key) !bool {
@@ -2237,7 +2217,7 @@ pub const App = struct {
         return reasoningOptions()[self.selectedReasoningIndex()].effort;
     }
 
-    fn cycleModelScope(self: *App) void {
+    pub fn cycleModelScope(self: *App) void {
         self.models.model_scope = switch (self.models.model_scope) {
             .global => .project,
             .project => .session,
@@ -2245,7 +2225,7 @@ pub const App = struct {
         };
     }
 
-    fn cycleSelectedReasoning(self: *App) !void {
+    pub fn cycleSelectedReasoning(self: *App) !void {
         if (self.models.model_selection >= self.models.len()) return;
         const entry = &self.models.entries.items[self.models.model_selection];
         entry.reasoning_index = nextIndex(entry.reasoning_index, @intCast(reasoningOptions().len));
@@ -2276,7 +2256,7 @@ pub const App = struct {
         return null;
     }
 
-    fn stepModelSelection(self: *App, forward: bool) !void {
+    pub fn stepModelSelection(self: *App, forward: bool) !void {
         const count: u32 = self.models.len();
         if (count == 0) return;
         const filter = try self.peekPaletteInput();

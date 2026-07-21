@@ -112,11 +112,37 @@ const ProviderPicker = struct {
 
 /// Model picker mode (column switcher + row navigation + reasoning/scope).
 ///
-/// R2.1 stub: forwards to `App.handleModelPickerKey`. Real implementation
-/// lands in R2.4.
+/// Left/right move between model columns; tab cycles the active column's
+/// value (column -> reasoning -> scope -> column); up/down step the
+/// selection through filtered entries.
 const ModelPicker = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
-        return app.handleModelPickerKey(key);
+        const models = app.getModels();
+        if (key.matches(vaxis.Key.left, .{})) {
+            models.model_column = models.model_column.previous();
+            return true;
+        }
+        if (key.matches(vaxis.Key.right, .{})) {
+            if (models.len() > 0) models.model_column = models.model_column.next();
+            return true;
+        }
+        if (key.matches(vaxis.Key.tab, .{})) {
+            switch (models.model_column) {
+                .model => models.model_column = models.model_column.next(),
+                .reasoning => try app.cycleSelectedReasoning(),
+                .scope => app.cycleModelScope(),
+            }
+            return true;
+        }
+        if (key.matches(vaxis.Key.up, .{})) {
+            try app.stepModelSelection(false);
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{})) {
+            try app.stepModelSelection(true);
+            return true;
+        }
+        return false;
     }
 };
 
