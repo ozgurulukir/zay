@@ -27,3 +27,14 @@ pub const AtSearchState = struct {
     kind: MentionSearchKind = .file,
     query: []const u8 = "",
 };
+
+/// The three text-input widgets: the main prompt, the slash-palette
+/// search, and the commit-message editor. Owns the vxfw.TextField
+/// structs and their backing buffers.
+pub const InputState = struct {
+    input: vxfw.TextField,
+    palette: vxfw.TextField,
+    comment: vxfw.TextField,
+};
+
+const vxfw = @import("vaxis").vxfw;

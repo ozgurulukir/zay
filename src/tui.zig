@@ -154,11 +154,7 @@ pub const App = struct {
     /// input widget translate its local chip position into absolute coordinates
     /// for `lanes_chip_rect`.
     input_surface_row: u16 = 0,
-    input: vxfw.TextField,
-    palette_input: vxfw.TextField,
-    /// Inline comment editor for the diff viewer. Single-line; cleared between
-    /// comments. The diff-viewer file-search field reuses `palette_input`.
-    comment_input: vxfw.TextField,
+    inputs: app_state.InputState,
     /// Parsed state for the `/diff` viewer. Populated by `openDiffViewer`, reset
     /// to `.{}` on exit. Only meaningful while `mode == .diff_viewer`.
     diff: diff_viewer.State = .{},
@@ -310,9 +306,7 @@ pub const App = struct {
             .gpa = gpa,
             .threads = threads,
             .thread = primary,
-            .input = .init(gpa),
-            .palette_input = .init(gpa),
-            .comment_input = .init(gpa),
+            .inputs = .{ .input = .init(gpa), .palette = .init(gpa), .comment = .init(gpa) },
             .tree_state = .init(gpa),
         };
     }
@@ -368,10 +362,10 @@ pub const App = struct {
     }
 
     pub fn bindInputCallbacks(self: *App) void {
-        self.input.userdata = self;
-        self.input.onChange = inputChanged;
-        self.palette_input.userdata = self;
-        self.palette_input.onChange = paletteInputChanged;
+        self.inputs.input.userdata = self;
+        self.inputs.input.onChange = inputChanged;
+        self.inputs.palette.userdata = self;
+        self.inputs.palette.onChange = paletteInputChanged;
     }
 
     // --- Accessors for cross-module access (R1: event_router needs these
@@ -383,11 +377,11 @@ pub const App = struct {
     }
 
     pub fn inputWidget(self: *App) vxfw.Widget {
-        return self.input.widget();
+        return self.inputs.input.widget();
     }
 
     pub fn inputRealLength(self: *const App) usize {
-        return self.input.buf.realLength();
+        return self.inputs.input.buf.realLength();
     }
 
     pub fn isNormalMode(self: *const App) bool {
@@ -467,8 +461,8 @@ pub const App = struct {
     }
 
     pub fn peekPaletteInput(self: *App) ![]u8 {
-        const left = self.palette_input.buf.firstHalf();
-        const right = self.palette_input.buf.secondHalf();
+        const left = self.inputs.palette.buf.firstHalf();
+        const right = self.inputs.palette.buf.secondHalf();
         const out = try self.gpa.alloc(u8, left.len + right.len);
         @memcpy(out[0..left.len], left);
         @memcpy(out[left.len..], right);
@@ -611,9 +605,9 @@ pub const App = struct {
         }
         self.threads.deinit(self.gpa);
         self.diff.deinit(self.gpa);
-        self.input.deinit();
-        self.palette_input.deinit();
-        self.comment_input.deinit();
+        self.inputs.input.deinit();
+        self.inputs.palette.deinit();
+        self.inputs.comment.deinit();
         self.* = undefined;
     }
 
@@ -680,7 +674,7 @@ pub const App = struct {
         // the shared agent message history.
         if (self.thread.turn.state == .interrupting) self.discardAbandonedTurn();
         if (self.thread.turn.isActive()) return try self.enqueueSubmit();
-        const prompt = try self.input.toOwnedSlice();
+        const prompt = try self.inputs.input.toOwnedSlice();
         defer self.gpa.free(prompt);
         if (prompt.len == 0) return false;
 
@@ -895,7 +889,7 @@ pub const App = struct {
                 _ = self.background_pending.orderedRemove(i);
                 continue;
             };
-            const composing = lane == active and self.input.buf.realLength() > 0;
+            const composing = lane == active and self.inputs.input.buf.realLength() > 0;
             if (lane.turn.state != .idle or composing) {
                 i += 1;
                 continue;
@@ -1163,7 +1157,7 @@ pub const App = struct {
         self.mode = .save_message;
         self.clearInput();
         self.clearPaletteInput();
-        if (self.thread.title) |title| self.palette_input.insertSliceAtCursor(title) catch {};
+        if (self.thread.title) |title| self.inputs.palette.insertSliceAtCursor(title) catch {};
     }
 
     /// `/save`: commit the current working tree onto the lane's branch with the
@@ -1481,7 +1475,7 @@ pub const App = struct {
         self.blackhole_visible = false;
         self.clearInput();
         self.clearPaletteInput();
-        self.comment_input.clearRetainingCapacity();
+        self.inputs.comment.clearRetainingCapacity();
     }
 
     fn reportDiffError(self: *App, err: anyerror) !void {
@@ -1504,10 +1498,10 @@ pub const App = struct {
         self.mode = .normal;
         self.clearInput();
         self.clearPaletteInput();
-        self.comment_input.clearRetainingCapacity();
+        self.inputs.comment.clearRetainingCapacity();
         if (composed) |message| {
             defer self.gpa.free(message);
-            try self.input.insertSliceAtCursor(message);
+            try self.inputs.input.insertSliceAtCursor(message);
             return true;
         }
         return false;
@@ -2391,13 +2385,13 @@ pub const App = struct {
     }
 
     pub fn clearInput(self: *App) void {
-        self.input.clearRetainingCapacity();
+        self.inputs.input.clearRetainingCapacity();
     }
 
     /// Recompute the mention popup from the text before the cursor. Called on
     /// every edit while in normal mode. `@` searches files; `$` searches skills.
     fn updateAtSearch(self: *App) !void {
-        const before = self.input.buf.firstHalf();
+        const before = self.inputs.input.buf.firstHalf();
         if (at_mention.activeQuery(before)) |active| {
             try self.setMentionSearch(.file, active.query);
             return;
@@ -2479,7 +2473,7 @@ pub const App = struct {
     /// Replace the active mention token with the selected path or skill name.
     pub fn acceptAtSelection(self: *App) !void {
         if (self.at_search.selection >= self.at_search.results.items.len) return;
-        const before = self.input.buf.firstHalf();
+        const before = self.inputs.input.buf.firstHalf();
         const active_start = switch (self.at_search.kind) {
             .file => if (at_mention.activeQuery(before)) |active| active.start else return,
             .skill => if (skill_mod.activeQuery(before)) |active| active.start else return,
@@ -2488,8 +2482,8 @@ pub const App = struct {
         const sigil: u8 = if (self.at_search.kind == .file) '@' else '$';
         const insert = try std.fmt.allocPrint(self.gpa, "{c}{s} ", .{ sigil, value });
         defer self.gpa.free(insert);
-        self.input.buf.growGapLeft(before.len - active_start);
-        try self.input.insertSliceAtCursor(insert);
+        self.inputs.input.buf.growGapLeft(before.len - active_start);
+        try self.inputs.input.insertSliceAtCursor(insert);
         self.closeAtSearch();
     }
 
@@ -2513,7 +2507,7 @@ pub const App = struct {
     /// Stash a prompt submitted while a turn is already running. Returns false
     /// — no new turn starts; the message rides the steering queue instead.
     fn enqueueSubmit(self: *App) !bool {
-        const prompt = try self.input.buf.dupe();
+        const prompt = try self.inputs.input.buf.dupe();
         errdefer self.gpa.free(prompt);
         if (prompt.len == 0) {
             self.gpa.free(prompt);
@@ -2599,12 +2593,12 @@ pub const App = struct {
     }
 
     fn clearPaletteInput(self: *App) void {
-        self.palette_input.clearRetainingCapacity();
+        self.inputs.palette.clearRetainingCapacity();
     }
 
     fn peekCommentInput(self: *App) ![]u8 {
-        const left = self.comment_input.buf.firstHalf();
-        const right = self.comment_input.buf.secondHalf();
+        const left = self.inputs.comment.buf.firstHalf();
+        const right = self.inputs.comment.buf.secondHalf();
         const out = try self.gpa.alloc(u8, left.len + right.len);
         @memcpy(out[0..left.len], left);
         @memcpy(out[left.len..], right);
@@ -3311,8 +3305,8 @@ pub const App = struct {
     }
 
     fn peekInput(self: *App) ![]u8 {
-        const left = self.input.buf.firstHalf();
-        const right = self.input.buf.secondHalf();
+        const left = self.inputs.input.buf.firstHalf();
+        const right = self.inputs.input.buf.secondHalf();
         const out = try self.gpa.alloc(u8, left.len + right.len);
         @memcpy(out[0..left.len], left);
         @memcpy(out[left.len..], right);
@@ -3326,7 +3320,7 @@ pub const App = struct {
     }
 
     pub fn insertInputNewline(self: *App) !void {
-        try self.input.insertSliceAtCursor("\n");
+        try self.inputs.input.insertSliceAtCursor("\n");
         try self.updateAtSearch();
     }
 
@@ -3338,7 +3332,7 @@ pub const App = struct {
     pub fn moveInputCursorVertical(self: *App, move: VerticalMove) !bool {
         const text = try self.peekInput();
         defer self.gpa.free(text);
-        const cur = self.input.buf.firstHalf().len;
+        const cur = self.inputs.input.buf.firstHalf().len;
         // Before the first draw (only in tests) the width is unknown; a wide
         // sentinel keeps every logical line on one visual row.
         const width: u16 = if (self.input_wrap_width == 0) 4096 else self.input_wrap_width;
@@ -3361,9 +3355,9 @@ pub const App = struct {
         const target = byteAtVisualColumn(text, row_start, row_end, pos.col);
 
         if (target < cur) {
-            self.input.buf.moveGapLeft(cur - target);
+            self.inputs.input.buf.moveGapLeft(cur - target);
         } else if (target > cur) {
-            self.input.buf.moveGapRight(target - cur);
+            self.inputs.input.buf.moveGapRight(target - cur);
         }
         return true;
     }
@@ -3922,19 +3916,19 @@ pub const RootWidget = struct {
             return;
         }
         const target = switch (self.app.mode) {
-            .command, .session_picker, .provider_picker, .model_picker, .tree_picker, .save_message => self.app.palette_input.widget(),
+            .command, .session_picker, .provider_picker, .model_picker, .tree_picker, .save_message => self.app.inputs.palette.widget(),
             // The diff viewer routes focus by sub-state: the comment editor and
             // the file-search field each host a drawn TextField; while browsing
             // the root widget owns every key.
             .diff_viewer => switch (self.app.diff.sub) {
-                .commenting => self.app.comment_input.widget(),
-                .file_search => self.app.palette_input.widget(),
+                .commenting => self.app.inputs.comment.widget(),
+                .file_search => self.app.inputs.palette.widget(),
                 .browse => self.widget(),
             },
             // The lanes overlay owns its keys via captureEvent; the palette input
             // is unused, so keep focus on the root (typed keys are ignored).
             .lanes => self.widget(),
-            .normal => self.app.input.widget(),
+            .normal => self.app.inputs.input.widget(),
         };
         try ctx.requestFocus(target);
     }
@@ -4180,16 +4174,16 @@ pub const RootWidget = struct {
         if (key.matches('w', .{ .ctrl = true })) {
             // Edit the comment on the exact selected range if one exists, else new.
             const prefill = app.diff.beginComment();
-            app.comment_input.clearRetainingCapacity();
-            if (prefill.len > 0) try app.comment_input.insertSliceAtCursor(prefill);
+            app.inputs.comment.clearRetainingCapacity();
+            if (prefill.len > 0) try app.inputs.comment.insertSliceAtCursor(prefill);
             try self.syncFocus(ctx);
             ctx.consumeAndRedraw();
             return;
         }
         if (key.matches('e', .{ .ctrl = true })) {
             if (app.diff.editActiveComment()) |prefill| {
-                app.comment_input.clearRetainingCapacity();
-                if (prefill.len > 0) try app.comment_input.insertSliceAtCursor(prefill);
+                app.inputs.comment.clearRetainingCapacity();
+                if (prefill.len > 0) try app.inputs.comment.insertSliceAtCursor(prefill);
                 try self.syncFocus(ctx);
                 ctx.consumeAndRedraw();
                 return;
@@ -4291,7 +4285,7 @@ pub const RootWidget = struct {
         if (key.matches(vaxis.Key.escape, .{})) {
             app.diff.sub = .browse;
             app.diff.sel_anchor = null;
-            app.comment_input.clearRetainingCapacity();
+            app.inputs.comment.clearRetainingCapacity();
             try self.syncFocus(ctx);
             ctx.consumeAndRedraw();
             return;
@@ -4300,7 +4294,7 @@ pub const RootWidget = struct {
             const draft = try app.peekCommentInput();
             defer app.gpa.free(draft);
             _ = try app.diff.saveComment(app.gpa, draft);
-            app.comment_input.clearRetainingCapacity();
+            app.inputs.comment.clearRetainingCapacity();
             try self.syncFocus(ctx);
             ctx.consumeAndRedraw();
             return;
@@ -4814,7 +4808,7 @@ const DiffCommentEditor = struct {
         const app = self.app;
         const label = app.diff.rangeLabel(ctx.arena, app.diff.comment_anchor) catch "comment";
         const inner_w: u16 = (ctx.max.width orelse 2) -| 2;
-        var input_box: vxfw.SizedBox = .{ .child = app.comment_input.widget(), .size = .{ .width = inner_w, .height = 1 } };
+        var input_box: vxfw.SizedBox = .{ .child = app.inputs.comment.widget(), .size = .{ .width = inner_w, .height = 1 } };
         var border: vxfw.Border = .{
             .child = input_box.widget(),
             .style = StylePalette.border_label,
@@ -4873,7 +4867,7 @@ const DiffSearchInner = struct {
         const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
         var prompt_text: vxfw.Text = .{ .text = ">", .softwrap = false, .width_basis = .parent };
         var prompt_box: vxfw.SizedBox = .{ .child = prompt_text.widget(), .size = .{ .width = 2, .height = 1 } };
-        var input_box: vxfw.SizedBox = .{ .child = app.palette_input.widget(), .size = .{ .width = iw -| 2, .height = 1 } };
+        var input_box: vxfw.SizedBox = .{ .child = app.inputs.palette.widget(), .size = .{ .width = iw -| 2, .height = 1 } };
         var search_row: vxfw.FlexRow = .{ .children = &.{
             .{ .widget = prompt_box.widget(), .flex = 0 },
             .{ .widget = input_box.widget(), .flex = 1 },
@@ -4922,9 +4916,9 @@ fn firstVisibleWindow(selection: u32, count: u32, visible: u16) u32 {
 pub fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
     if (!key.matches('/', .{})) return false;
     return switch (app.mode) {
-        .normal => app.input.buf.realLength() == 0,
-        .session_picker, .model_picker, .tree_picker => app.palette_input.buf.realLength() == 0,
-        .provider_picker => app.provider_picker.stage == .list and app.palette_input.buf.realLength() == 0,
+        .normal => app.inputs.input.buf.realLength() == 0,
+        .session_picker, .model_picker, .tree_picker => app.inputs.palette.buf.realLength() == 0,
+        .provider_picker => app.provider_picker.stage == .list and app.inputs.palette.buf.realLength() == 0,
         .command, .diff_viewer, .save_message, .lanes => false,
     };
 }
@@ -5211,7 +5205,7 @@ fn inputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u
     if (!was_command and app.mode == .command) {
         app.clearInput();
         app.clearPaletteInput();
-        try ctx.requestFocus(app.palette_input.widget());
+        try ctx.requestFocus(app.inputs.palette.widget());
     }
     if (app.mode == .normal) {
         try app.updateAtSearch();
@@ -5457,7 +5451,7 @@ const OverlayInner = struct {
         // Row 0: prompt + shared overlay search input.
         var prompt_text: vxfw.Text = .{ .text = ">", .softwrap = false, .width_basis = .parent };
         var prompt_box: vxfw.SizedBox = .{ .child = prompt_text.widget(), .size = .{ .width = 2, .height = 1 } };
-        var input_box: vxfw.SizedBox = .{ .child = self.app.palette_input.widget(), .size = .{ .width = iw -| 2, .height = 1 } };
+        var input_box: vxfw.SizedBox = .{ .child = self.app.inputs.palette.widget(), .size = .{ .width = iw -| 2, .height = 1 } };
         var search_row: vxfw.FlexRow = .{ .children = &.{
             .{ .widget = prompt_box.widget(), .flex = 0 },
             .{ .widget = input_box.widget(), .flex = 1 },
@@ -5664,18 +5658,18 @@ const CommandInputText = struct {
         const width = ctx.max.width orelse 0;
         self.app.input_wrap_width = width;
         const rows = try self.app.inputTextRows(ctx, width);
-        if (rows <= 1) return self.app.input.draw(ctx);
+        if (rows <= 1) return self.app.inputs.input.draw(ctx);
         return self.drawMultiline(ctx);
     }
 
     fn drawMultiline(self: *CommandInputText, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const width = ctx.max.width orelse 0;
         const height: u16 = @max(ctx.max.height orelse 1, 1);
-        var surface = try vxfw.Surface.init(ctx.arena, self.app.input.widget(), .{ .width = width, .height = height });
+        var surface = try vxfw.Surface.init(ctx.arena, self.app.inputs.input.widget(), .{ .width = width, .height = height });
         if (width == 0) return surface;
 
-        const first = self.app.input.buf.firstHalf();
-        const second = self.app.input.buf.secondHalf();
+        const first = self.app.inputs.input.buf.firstHalf();
+        const second = self.app.inputs.input.buf.secondHalf();
 
         const combined = try ctx.arena.alloc(u8, first.len + second.len);
         @memcpy(combined[0..first.len], first);
@@ -6256,14 +6250,14 @@ test "input text rows track the line count" {
 
     try std.testing.expectEqual(@as(u16, 1), try app.inputTextRows(ctx, 80));
 
-    try app.input.insertSliceAtCursor("a\nb\nc");
+    try app.inputs.input.insertSliceAtCursor("a\nb\nc");
     try std.testing.expectEqual(@as(u16, 3), try app.inputTextRows(ctx, 80));
 
-    try app.input.insertSliceAtCursor("defgh");
+    try app.inputs.input.insertSliceAtCursor("defgh");
     try std.testing.expectEqual(@as(u16, 4), try app.inputTextRows(ctx, 4));
 
     // The input keeps growing with the line count (no fixed cap).
-    try app.input.insertSliceAtCursor("\n\n\n\n\n\n\n\n");
+    try app.inputs.input.insertSliceAtCursor("\n\n\n\n\n\n\n\n");
     try std.testing.expectEqual(@as(u16, 12), try app.inputTextRows(ctx, 4));
 }
 
@@ -6294,7 +6288,7 @@ test "down returns to multiline input after overshooting above top line" {
     defer app.deinit();
     app.bindInputCallbacks();
 
-    try app.input.insertSliceAtCursor("top\nmiddle\nbottom");
+    try app.inputs.input.insertSliceAtCursor("top\nmiddle\nbottom");
 
     var root: RootWidget = .{ .app = &app };
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -6303,7 +6297,7 @@ test "down returns to multiline input after overshooting above top line" {
 
     try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.up } });
     try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.up } });
-    try std.testing.expectEqualStrings("top", app.input.buf.firstHalf());
+    try std.testing.expectEqualStrings("top", app.inputs.input.buf.firstHalf());
 
     // One more Up leaves the input for block navigation.
     try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.up } });
@@ -6312,10 +6306,10 @@ test "down returns to multiline input after overshooting above top line" {
     // With no transcript block selected, Down must return to the multiline input.
     try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.down } });
     try std.testing.expect(!app.block_nav);
-    try std.testing.expectEqualStrings("top\nmid", app.input.buf.firstHalf());
+    try std.testing.expectEqualStrings("top\nmid", app.inputs.input.buf.firstHalf());
 
     try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.down } });
-    try std.testing.expectEqualStrings("top\nmiddle\nbot", app.input.buf.firstHalf());
+    try std.testing.expectEqualStrings("top\nmiddle\nbot", app.inputs.input.buf.firstHalf());
 }
 
 test "arrow up and down move the input cursor between lines" {
@@ -6326,27 +6320,27 @@ test "arrow up and down move the input cursor between lines" {
     defer app.deinit();
 
     // Cursor ends on the third line at column 2 ("ca|t").
-    try app.input.insertSliceAtCursor("fox\nox\ncat");
-    app.input.cursorLeft(); // between "ca" and "t"
+    try app.inputs.input.insertSliceAtCursor("fox\nox\ncat");
+    app.inputs.input.cursorLeft(); // between "ca" and "t"
 
     // Up keeps the column, clamped to the shorter middle line ("ox" -> end).
     try std.testing.expect(try app.moveInputCursorVertical(.up));
-    try std.testing.expectEqualStrings("fox\nox", app.input.buf.firstHalf());
+    try std.testing.expectEqualStrings("fox\nox", app.inputs.input.buf.firstHalf());
 
     // Up again lands at column 2 of the first line ("fo|x").
     try std.testing.expect(try app.moveInputCursorVertical(.up));
-    try std.testing.expectEqualStrings("fo", app.input.buf.firstHalf());
+    try std.testing.expectEqualStrings("fo", app.inputs.input.buf.firstHalf());
 
     // Already on the first line: no move, caller falls back to transcript nav.
     try std.testing.expect(!(try app.moveInputCursorVertical(.up)));
 
     // Down returns to the middle line at the same column ("ox" -> end).
     try std.testing.expect(try app.moveInputCursorVertical(.down));
-    try std.testing.expectEqualStrings("fox\nox", app.input.buf.firstHalf());
+    try std.testing.expectEqualStrings("fox\nox", app.inputs.input.buf.firstHalf());
 
     // Down to the last line, then no further move.
     try std.testing.expect(try app.moveInputCursorVertical(.down));
-    try std.testing.expectEqualStrings("fox\nox\nca", app.input.buf.firstHalf());
+    try std.testing.expectEqualStrings("fox\nox\nca", app.inputs.input.buf.firstHalf());
     try std.testing.expect(!(try app.moveInputCursorVertical(.down)));
 }
 
@@ -6360,19 +6354,19 @@ test "vertical navigation follows soft-wrapped visual rows" {
     // A single long line with no manual breaks. Wrapped at width 10 it spans
     // two visual rows ("abcdefghij" / "klmnopqrst"), so the cursor must move by
     // visual row — the old '\n'-only logic was stuck on one logical line.
-    try app.input.insertSliceAtCursor("abcdefghijklmnopqrst");
+    try app.inputs.input.insertSliceAtCursor("abcdefghijklmnopqrst");
     app.input_wrap_width = 10;
 
     // Cursor sits at the end (second visual row). Up moves to the first row.
     try std.testing.expect(try app.moveInputCursorVertical(.up));
-    try std.testing.expectEqualStrings("abcdefghij", app.input.buf.firstHalf());
+    try std.testing.expectEqualStrings("abcdefghij", app.inputs.input.buf.firstHalf());
 
     // Already on the first visual row: no move, hand off to block nav.
     try std.testing.expect(!(try app.moveInputCursorVertical(.up)));
 
     // Down returns to the second visual row at the same column.
     try std.testing.expect(try app.moveInputCursorVertical(.down));
-    try std.testing.expectEqualStrings("abcdefghijklmnopqrst", app.input.buf.firstHalf());
+    try std.testing.expectEqualStrings("abcdefghijklmnopqrst", app.inputs.input.buf.firstHalf());
     try std.testing.expect(!(try app.moveInputCursorVertical(.down)));
 }
 
@@ -6426,7 +6420,7 @@ test "ctrl-c clears a non-empty input instead of arming quit" {
     defer app.deinit();
     app.bindInputCallbacks();
 
-    try app.input.insertSliceAtCursor("draft message");
+    try app.inputs.input.insertSliceAtCursor("draft message");
 
     var root: RootWidget = .{ .app = &app };
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -6437,7 +6431,7 @@ test "ctrl-c clears a non-empty input instead of arming quit" {
     try RootWidget.captureEvent(&root, &ctx, ctrl_c);
 
     // The input is cleared and the quit sequence is not armed.
-    try std.testing.expectEqual(@as(usize, 0), app.input.buf.realLength());
+    try std.testing.expectEqual(@as(usize, 0), app.inputs.input.buf.realLength());
     try std.testing.expect(app.pending_quit_at == null);
     try std.testing.expect(!ctx.quit);
 }
@@ -6484,15 +6478,15 @@ test "down past the last block moves into multiline input" {
     app.thread.transcript_view_height = 100;
 
     _ = try app.thread.transcript.append(gpa, .agent, "agent", "one");
-    try app.input.insertSliceAtCursor("top\nmiddle");
+    try app.inputs.input.insertSliceAtCursor("top\nmiddle");
     // Put the cursor on the top line, just before the newline. Re-entering
     // from block navigation should step down into the input line below.
-    app.input.buf.moveGapLeft("\nmiddle".len);
+    app.inputs.input.buf.moveGapLeft("\nmiddle".len);
     app.block_nav = true;
 
     try std.testing.expect(try app.handleTranscriptKey(.{ .codepoint = vaxis.Key.down }));
     try std.testing.expect(!app.block_nav);
-    try std.testing.expectEqualStrings("top\nmid", app.input.buf.firstHalf());
+    try std.testing.expectEqualStrings("top\nmid", app.inputs.input.buf.firstHalf());
 }
 
 test "shift enter inserts a newline instead of submitting" {
@@ -6503,9 +6497,9 @@ test "shift enter inserts a newline instead of submitting" {
     defer app.deinit();
     app.bindInputCallbacks();
 
-    try app.input.insertSliceAtCursor("line one");
+    try app.inputs.input.insertSliceAtCursor("line one");
     try app.insertInputNewline();
-    try app.input.insertSliceAtCursor("line two");
+    try app.inputs.input.insertSliceAtCursor("line two");
 
     const value = try app.peekInput();
     defer gpa.free(value);
@@ -6725,11 +6719,11 @@ test "begin submit clears input and starts a turn awaiting output" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("hello");
+    try app.inputs.input.insertSliceAtCursor("hello");
     try std.testing.expect(try app.beginSubmit());
 
-    try std.testing.expectEqual(@as(usize, 0), app.input.buf.firstHalf().len);
-    try std.testing.expectEqual(@as(usize, 0), app.input.buf.secondHalf().len);
+    try std.testing.expectEqual(@as(usize, 0), app.inputs.input.buf.firstHalf().len);
+    try std.testing.expectEqual(@as(usize, 0), app.inputs.input.buf.secondHalf().len);
     // The user message is the only transcript entry; the loading spinner is never
     // stored as a message.
     try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
@@ -6806,13 +6800,13 @@ test "begin submit queues while turn is in flight" {
     app.thread.turn.submit();
     app.thread.turn_view.awaitModel();
 
-    try app.input.insertSliceAtCursor("later");
+    try app.inputs.input.insertSliceAtCursor("later");
     try std.testing.expect(!try app.beginSubmit());
 
     try std.testing.expectEqual(@as(usize, 1), app.thread.queued.items.len);
     try std.testing.expectEqualStrings("later", app.thread.queued.items[0].text);
     try std.testing.expectEqual(@as(u32, 1), agent.message_queue.len());
-    try std.testing.expectEqual(@as(usize, 0), app.input.buf.firstHalf().len);
+    try std.testing.expectEqual(@as(usize, 0), app.inputs.input.buf.firstHalf().len);
     try std.testing.expect(try app.applyAgentEvent(.{ .queued_messages_flushed = 1 }));
     try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
     // Just the flushed user message; the spinner stays derived UI.
@@ -6832,7 +6826,7 @@ test "queued prompt draws above input at minimum input height" {
     app.thread.turn.submit();
     app.thread.turn_view.awaitModel();
 
-    try app.input.insertSliceAtCursor("later");
+    try app.inputs.input.insertSliceAtCursor("later");
     try std.testing.expect(!try app.beginSubmit());
 
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -6862,9 +6856,9 @@ test "alt navigation and ctrl-steer drive the queued message line" {
     app.thread.turn.submit();
     app.thread.turn_view.awaitModel();
 
-    try app.input.insertSliceAtCursor("first");
+    try app.inputs.input.insertSliceAtCursor("first");
     try std.testing.expect(!try app.beginSubmit());
-    try app.input.insertSliceAtCursor("second");
+    try app.inputs.input.insertSliceAtCursor("second");
     try std.testing.expect(!try app.beginSubmit());
 
     // Newest is selected after queueing.
@@ -6916,12 +6910,12 @@ test "begin submit shows notice when queued message queue is full" {
         try agent.enqueueUser("queued");
     }
 
-    try app.input.insertSliceAtCursor("later");
+    try app.inputs.input.insertSliceAtCursor("later");
     try std.testing.expect(!try app.beginSubmit());
 
     try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
     try std.testing.expectEqual(@as(u32, @intCast(agent.message_queue_storage.len)), agent.message_queue.len());
-    try std.testing.expectEqualStrings("later", app.input.buf.firstHalf());
+    try std.testing.expectEqualStrings("later", app.inputs.input.buf.firstHalf());
     // The notice is the only transcript row; the spinner is not a status message.
     try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
     try std.testing.expectEqual(.notice, app.thread.transcript.messages.items[0].kind);
@@ -7218,7 +7212,7 @@ test "slash opens command menu before focused input handles it" {
     try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = '/', .text = "/" } });
 
     try std.testing.expectEqual(App.Mode.command, app.mode);
-    try std.testing.expectEqual(@as(usize, 0), app.input.buf.realLength());
+    try std.testing.expectEqual(@as(usize, 0), app.inputs.input.buf.realLength());
 }
 
 test "slash opens command menu when text field previous value is stale" {
@@ -7232,7 +7226,7 @@ test "slash opens command menu when text field previous value is stale" {
     defer app.deinit();
     app.bindInputCallbacks();
 
-    app.input.previous_val = try gpa.dupe(u8, "/");
+    app.inputs.input.previous_val = try gpa.dupe(u8, "/");
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -7246,7 +7240,7 @@ test "slash opens command menu when text field previous value is stale" {
     try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = '/', .text = "/" } });
 
     try std.testing.expectEqual(App.Mode.command, app.mode);
-    try std.testing.expectEqual(@as(usize, 0), app.input.buf.realLength());
+    try std.testing.expectEqual(@as(usize, 0), app.inputs.input.buf.realLength());
 }
 
 test "expired codex connection reports reconnect message" {
@@ -7286,11 +7280,11 @@ test "typing slash can open command menu after input changed before" {
         .cmds = .empty,
     };
 
-    try app.input.widget().handleEvent(&ctx, .{ .key_press = .{ .codepoint = 'x', .text = "x" } });
-    app.input.clearRetainingCapacity();
+    try app.inputs.input.widget().handleEvent(&ctx, .{ .key_press = .{ .codepoint = 'x', .text = "x" } });
+    app.inputs.input.clearRetainingCapacity();
     app.thread.turn.submit();
     defer app.thread.turn.reset();
-    try app.input.widget().handleEvent(&ctx, .{ .key_press = .{ .codepoint = '/', .text = "/" } });
+    try app.inputs.input.widget().handleEvent(&ctx, .{ .key_press = .{ .codepoint = '/', .text = "/" } });
 
     try std.testing.expectEqual(App.Mode.command, app.mode);
 }
@@ -7305,13 +7299,13 @@ test "reprompt after interrupt starts a fresh turn" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("first");
+    try app.inputs.input.insertSliceAtCursor("first");
     try std.testing.expect(try app.beginSubmit());
     if (app.thread.pending_prompt) |prompt| app.thread.worker_context.?.gpa.free(prompt);
     app.thread.pending_prompt = null;
     try app.handleInterrupt();
 
-    try app.input.insertSliceAtCursor("second");
+    try app.inputs.input.insertSliceAtCursor("second");
     try std.testing.expect(try app.beginSubmit());
     defer app.thread.turn.reset();
     defer {
@@ -7333,7 +7327,7 @@ test "interrupt drops the turn straight back to idle" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("first");
+    try app.inputs.input.insertSliceAtCursor("first");
     try std.testing.expect(try app.beginSubmit());
     if (app.thread.pending_prompt) |prompt| app.thread.worker_context.?.gpa.free(prompt);
     app.thread.pending_prompt = null;
@@ -7507,9 +7501,9 @@ test "interrupt restart flushes queued messages to the transcript when no provid
 
     // Queue two messages behind a running turn.
     app.thread.turn.submit();
-    try app.input.insertSliceAtCursor("one");
+    try app.inputs.input.insertSliceAtCursor("one");
     try std.testing.expect(!try app.beginSubmit());
-    try app.input.insertSliceAtCursor("two");
+    try app.inputs.input.insertSliceAtCursor("two");
     try std.testing.expect(!try app.beginSubmit());
     try std.testing.expectEqual(@as(usize, 2), app.thread.queued.items.len);
 
@@ -7599,7 +7593,7 @@ test "empty text deltas do not create selectable messages" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("hello");
+    try app.inputs.input.insertSliceAtCursor("hello");
     _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .response_delta = "" }));
@@ -7622,7 +7616,7 @@ test "agent app events update transcript on the ui side" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("hello");
+    try app.inputs.input.insertSliceAtCursor("hello");
     _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .thinking_delta = "checking" }));
@@ -7660,7 +7654,7 @@ test "user can navigate away from a streaming thinking block" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("hello");
+    try app.inputs.input.insertSliceAtCursor("hello");
     _ = try app.beginSubmit();
 
     _ = try app.applyAgentEvent(.{ .thinking_delta = "first chunk" });
@@ -7684,7 +7678,7 @@ test "user can navigate away from a streaming agent message" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("hello");
+    try app.inputs.input.insertSliceAtCursor("hello");
     _ = try app.beginSubmit();
 
     _ = try app.applyAgentEvent(.{ .response_delta = "first chunk" });
@@ -7708,7 +7702,7 @@ test "empty content delta does not finalize thinking" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("hello");
+    try app.inputs.input.insertSliceAtCursor("hello");
     _ = try app.beginSubmit();
 
     _ = try app.applyAgentEvent(.{ .thinking_delta = "thinking" });
@@ -7736,7 +7730,7 @@ test "content deltas do not override user scroll state" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("hello");
+    try app.inputs.input.insertSliceAtCursor("hello");
     _ = try app.beginSubmit();
 
     _ = try app.applyAgentEvent(.{ .response_delta = "first" });
@@ -7758,7 +7752,7 @@ test "loading does not appear during final answer after tool batch" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("inspect");
+    try app.inputs.input.insertSliceAtCursor("inspect");
     _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
@@ -7796,7 +7790,7 @@ test "loading does not reappear between content chunks" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("implement dijkstra");
+    try app.inputs.input.insertSliceAtCursor("implement dijkstra");
     _ = try app.beginSubmit();
 
     // Once a content delta has arrived we are committed to streaming. The gap
@@ -7820,7 +7814,7 @@ test "bash tool waits for complete arguments while streaming" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("list files");
+    try app.inputs.input.insertSliceAtCursor("list files");
     _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
@@ -7854,7 +7848,7 @@ test "tool row persists through finish and turn completion" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("run ls");
+    try app.inputs.input.insertSliceAtCursor("run ls");
     _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
@@ -7904,7 +7898,7 @@ test "partial tool arguments do not create visible tool rows" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("run ls");
+    try app.inputs.input.insertSliceAtCursor("run ls");
     _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
@@ -7939,7 +7933,7 @@ test "tool finish creates row if no complete streamed arguments appeared" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("run ls");
+    try app.inputs.input.insertSliceAtCursor("run ls");
     _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
@@ -7971,7 +7965,7 @@ test "new tool response index creates a new transcript row" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("run tools");
+    try app.inputs.input.insertSliceAtCursor("run tools");
     _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
@@ -8012,7 +8006,7 @@ test "bash tool after batch creates a new tool row" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("run tools");
+    try app.inputs.input.insertSliceAtCursor("run tools");
     _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
@@ -8055,7 +8049,7 @@ test "late tool finish does not move selection upward" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("run tools");
+    try app.inputs.input.insertSliceAtCursor("run tools");
     _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
@@ -8097,7 +8091,7 @@ test "loading does not resume after post-tool thinking delta" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("inspect");
+    try app.inputs.input.insertSliceAtCursor("inspect");
     _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
@@ -8135,7 +8129,7 @@ test "agent response after tool batch appears below tool rows" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("inspect");
+    try app.inputs.input.insertSliceAtCursor("inspect");
     _ = try app.beginSubmit();
 
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "I will check." }));
@@ -8176,7 +8170,7 @@ test "content delta after tool preview does not move selection away from tool ro
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try app.input.insertSliceAtCursor("inspect");
+    try app.inputs.input.insertSliceAtCursor("inspect");
     _ = try app.beginSubmit();
 
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "I will check." }));
