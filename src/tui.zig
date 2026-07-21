@@ -33,6 +33,7 @@ pub const Thread = @import("tui/thread.zig");
 const tui_metrics = @import("tui/metrics.zig");
 const lane_column = @import("tui/lane_column.zig");
 const diff_viewer_overlay = @import("tui/diff_viewer_overlay.zig");
+const lifecycle = @import("tui/lifecycle.zig");
 const root_layout = @import("tui/layout.zig");
 const root_layout_widget = @import("tui/root_layout.zig");
 const input_mod = @import("tui/widgets/input.zig");
@@ -520,61 +521,7 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
-        // Cancel every lane's in-flight turn (background lanes may still be
-        // running) so no worker thread outlives the App.
-        for (self.threads.items) |lane| {
-            if (lane.turn_future) |*future| {
-                if (lane.worker_context) |*worker| worker.requestCancel();
-                _ = future.cancel(self.io);
-                lane.turn_future = null;
-            }
-            self.cancelLaneNaming(lane);
-        }
-        // Now that no worker can still be inside `manager.start`, terminate and
-        // join every background job (kills the whole process tree on Windows via
-        // the per-job Job Object). Jobs hold an opaque owner token that is never
-        // dereferenced, so this is independent of lane/agent teardown order.
-        if (self.background) |manager| {
-            manager.deinit();
-            self.gpa.destroy(manager);
-            self.background = null;
-        }
-        for (self.background_modal_state.pending.items) |*delivery| self.freeDelivery(delivery);
-        self.background_modal_state.pending.deinit(self.gpa);
-        // Cancel the in-flight load first (it needs `io`), then free the
-        // catalogue's owned lists + error in one pass.
-        self.cancelModelLoad();
-        for (self.retired_transcripts.items) |*transcript| transcript.deinit(self.gpa);
-        self.retired_transcripts.deinit(self.gpa);
-        self.resumeClear();
-        self.resumeClearFolds();
-        self.resume_folded_projects.deinit(self.gpa);
-        self.pickers.tree.deinit();
-        self.cancelDiffRefresh();
-        // Non-empty labels are always heap-allocated by `loadGitLabel`; the
-        // empty default is a literal, so guard on length before freeing.
-        if (self.metrics.git_label.len > 0) self.gpa.free(self.metrics.git_label);
-        if (self.metrics.diff_cache) |raw| self.gpa.free(raw);
-        self.pickers.models.deinit(self.gpa);
-        codex.freeApiKeyMap(self.gpa, &self.provider_api_keys);
-        self.provider_key_input.deinit(self.gpa);
-        if (self.cached_config_owned) {
-            self.cached_config.deinit(self.gpa);
-            self.cached_config_owned = false;
-        }
-        self.closeAtSearch();
-        self.at_search.results.deinit(self.gpa);
-        self.clearLanesState();
-        for (self.threads.items) |lane| {
-            lane.deinit(self.gpa);
-            self.gpa.destroy(lane);
-        }
-        self.threads.deinit(self.gpa);
-        self.diff.deinit(self.gpa);
-        self.inputs.input.deinit();
-        self.inputs.palette.deinit();
-        self.inputs.comment.deinit();
-        self.* = undefined;
+        lifecycle.deinitApp(self);
     }
 
     fn awaitTurn(self: *App) void {
