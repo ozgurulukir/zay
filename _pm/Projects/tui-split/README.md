@@ -25,7 +25,7 @@ Strangler Fig (Rule 15):
 
 No "compatibility shim" left behind (Rule 9 outcome-oriented).
 
-## Modules shipped (R1–R5)
+## Modules shipped (R1–R7)
 
 | File | Phase | Pulled from `tui.zig` |
 | --- | --- | --- |
@@ -33,16 +33,16 @@ No "compatibility shim" left behind (Rule 9 outcome-oriented).
 | `tui/command_router.zig` | R2 | `handleCommandKey` mode switch (struct-per-mode) |
 | `tui/app_state.zig` | R3 | `App` state grouped into 6 sub-structs |
 | `tui/background_delivery.zig` | R4 | background-job poll/format/deliver |
+| `tui/lane_column.zig` | R5.2a | `drawLaneColumn` |
+| `tui/diff_viewer_overlay.zig` | R5.2b | `drawDiffViewer` |
+| `tui/layout.zig` | R5.2c | `rootLayout` math |
+| `tui/root_layout.zig` | R6.2 | `drawRoot` layout |
+| `tui/lifecycle.zig` | R6.3–R7.3 | deinit, handleTick, createParallelLane, handleDiffBrowseKey/Search/Comment, closeDiff, syncFocus, submit, ensureTick, handleDiffViewerEvent |
 | `tui/widgets/background_jobs.zig` | R5.1a | `BackgroundJobsWidget` |
 | `tui/widgets/permission.zig` | R5.1a | `PermissionWidget` |
 | `tui/widgets/diff.zig` | R5.1b | `DiffBodyWidget` + `DiffCommentEditor` + `DiffSearchWidget` |
 | `tui/widgets/loading.zig` | R5.1c | `LoadingWidget` |
 | `tui/widgets/transcript.zig` | R5.1d | `TranscriptWidget` + `MessageListBuilder` |
-| `tui/lane_column.zig` | R5.2a | `drawLaneColumn` |
-| `tui/diff_viewer_overlay.zig` | R5.2b | `drawDiffViewer` |
-| `tui/layout.zig` | R5.2c | `rootLayout` math |
-| `tui/root_layout.zig` | R6.2 | `drawRoot` |
-| `tui/lifecycle.zig` | R6.3 | `deinit`, `handleTick`, `createParallelLane`, `handleDiffBrowseKey` |
 | `tui/widgets/input.zig` | R6.1 | `InputWidget` + 13 wrapping helpers |
 | `tui/widgets/overlay.zig` | R7.1 | `OverlayWidget` + `OverlayInner` |
 

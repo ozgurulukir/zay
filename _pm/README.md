@@ -5,10 +5,11 @@ Cross-linked index for project management artifacts.
 ## Projects (active)
 
 - [tui-split](Projects/tui-split/) — Split `src/tui.zig` into focused modules
-  - State: R1–R6 done & pushed; R7.1 (OverlayWidget) local, 1 unpushed commit. 35 atomic commits total. `tui.zig` target ≤ 2500 lines — **30.8% there**.
+  - State: R1–R7.3 pushed (37 commits). `tui.zig` 8586 → **6143 (-28.5%)**.
   - Created: 2026-07-21
   - Source: BFG analysis (cycles, coupling, 30x file size over limit)
-  - Result: `tui.zig` 8586 → ~5943 (-2643, -30.8%); 17 new modules. `zig build test` 2.3s, 310 tests pass.
+  - Result: 17 new modules, all tests pass (2.3s, 310/310). Remaining ~5800 lines
+    are App methods, inline tests, and `submitMode` (stays per R6.0 audit).
 
 ## Areas (ongoing)
 
