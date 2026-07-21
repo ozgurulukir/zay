@@ -29,6 +29,7 @@ const tui = @import("../tui.zig");
 
 const App = tui.App;
 const Mode = App.Mode;
+const provider_model = @import("provider_model.zig");
 const previousIndex = tui.previousIndex;
 const nextIndex = tui.nextIndex;
 
@@ -131,17 +132,17 @@ const ModelPicker = struct {
         if (key.matches(vaxis.Key.tab, .{})) {
             switch (models.model_column) {
                 .model => models.model_column = models.model_column.next(),
-                .reasoning => try app.cycleSelectedReasoning(),
-                .scope => app.cycleModelScope(),
+                .reasoning => try provider_model.cycleSelectedReasoning(app),
+                .scope => provider_model.cycleModelScope(app),
             }
             return true;
         }
         if (key.matches(vaxis.Key.up, .{})) {
-            try app.stepModelSelection(false);
+            try provider_model.stepModelSelection(app, false);
             return true;
         }
         if (key.matches(vaxis.Key.down, .{})) {
-            try app.stepModelSelection(true);
+            try provider_model.stepModelSelection(app, true);
             return true;
         }
         return false;

@@ -13,6 +13,7 @@ const tui = @import("../tui.zig");
 const agent_mod = @import("../agent.zig");
 const blackhole = @import("../tui/blackhole.zig");
 const codex = @import("../codex.zig");
+const provider_model = @import("provider_model.zig");
 const runtime_mod = @import("../runtime.zig");
 const vcs = @import("../vcs.zig");
 
@@ -46,7 +47,7 @@ pub fn deinitApp(self: *App) void {
     self.background_modal_state.pending.deinit(self.gpa);
     // Cancel the in-flight load first (it needs `io`), then free the
     // catalogue's owned lists + error in one pass.
-    self.cancelModelLoad();
+    provider_model.cancelModelLoad(self);
     for (self.retired_transcripts.items) |*transcript| transcript.deinit(self.gpa);
     self.retired_transcripts.deinit(self.gpa);
     self.resumeClear();
@@ -85,7 +86,7 @@ pub fn deinitApp(self: *App) void {
 /// intro. Re-schedules itself when work is still pending.
 pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     var visible_change = try drainAgentEvents(root, ctx);
-    if (try root.app.drainModelLoad()) visible_change = true;
+    if (try provider_model.drainModelLoad(root.app)) visible_change = true;
     if (try root.app.drainDiffRefresh()) visible_change = true;
     // Lanes whose branch name landed get renamed in place.
     if (try root.app.drainLaneNaming()) visible_change = true;
@@ -360,7 +361,7 @@ pub fn handleDiffBrowseKey(root: *RootWidget, ctx: *vxfw.EventContext, key: vaxi
 /// Close the `/diff` viewer, optionally saving any pending comments.
 /// When saved comments exist, begins a turn so the agent sees them.
 pub fn closeDiff(root: *RootWidget, ctx: *vxfw.EventContext, send: bool) !void {
-    const has_comments = try root.app.closeDiffViewer(send);
+    const has_comments = try provider_model.closeDiffViewer(root.app, send);
     try syncFocus(root, ctx);
     if (has_comments) {
         if (try root.app.beginSubmit()) try root.app.startTurn();

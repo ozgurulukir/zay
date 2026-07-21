@@ -21,6 +21,7 @@ const tui = @import("../tui.zig");
 
 const App = tui.App;
 const RootWidget = tui.RootWidget;
+const provider_model = @import("provider_model.zig");
 
 /// Top-level event entry, called by vxfw for every event the root receives.
 ///
@@ -49,7 +50,7 @@ fn routeInit(app: *App, root: *RootWidget, ctx: *vxfw.EventContext) !void {
     // populates the model picker and drives the provider [CONNECTED] badges
     // (via per-provider outcomes), so an expired key shows DISCONNECTED
     // without a separate probe.
-    app.startModelLoad(.connected_provider, false) catch {};
+    provider_model.startModelLoad(app, .connected_provider, false) catch {};
     ctx.consumeAndRedraw();
 }
 
