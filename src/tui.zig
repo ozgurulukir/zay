@@ -36,6 +36,7 @@ const blackhole = @import("tui/blackhole.zig");
 const at_search = @import("tui/widgets/at_search.zig");
 const background_jobs = @import("tui/widgets/background_jobs.zig");
 const command_panel = @import("tui/widgets/command_panel.zig");
+const loading = @import("tui/widgets/loading.zig");
 const permission = @import("tui/widgets/permission.zig");
 const diff_viewer = @import("tui/diff_viewer.zig");
 const model_loader = @import("tui/model_loader.zig");
@@ -3889,7 +3890,7 @@ pub const RootWidget = struct {
         self.app.nav.lanes_chip_rect = null;
 
         var transcript_view: TranscriptWidget = .{ .app = self.app, .thread = self.app.thread };
-        var loading_view: LoadingWidget = .{ .app = self.app };
+        var loading_view: loading.LoadingWidget = .{ .app = self.app };
         var input_view: InputWidget = .{ .app = self.app };
         var overlay_view: OverlayWidget = .{ .app = self.app };
 
@@ -4640,33 +4641,6 @@ pub fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
         .command, .diff_viewer, .save_message, .lanes => false,
     };
 }
-
-const LoadingWidget = struct {
-    app: *App,
-
-    fn widget(self: *LoadingWidget) vxfw.Widget {
-        return .{
-            .userdata = self,
-            .drawFn = drawLoading,
-        };
-    }
-
-    fn drawLoading(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *LoadingWidget = @ptrCast(@alignCast(ptr));
-        const width = ctx.max.width orelse ctx.min.width;
-        const height = ctx.max.height orelse ctx.min.height;
-        var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{
-            .width = width,
-            .height = height,
-        });
-        if (height > 0) {
-            var row: u16 = if (height > 1) 1 else 0;
-            const word = loading_spinners[self.app.thread.turn_view.loading_word_index];
-            tui_message.MessageWidget.drawLoading(&surface, word, self.app.metrics.loading_frame, &row, ctx);
-        }
-        return surface;
-    }
-};
 
 const MessageListBuilder = struct {
     arena: std.mem.Allocator,
