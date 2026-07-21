@@ -438,6 +438,18 @@ pub const App = struct {
         self.resume_selection = v;
     }
 
+    pub fn getLanesSelection(self: *App) u32 {
+        return self.lanes_selection;
+    }
+
+    pub fn setLanesSelection(self: *App, v: u32) void {
+        self.lanes_selection = v;
+    }
+
+    pub fn getLanesPurpose(self: *const App) LanesPurpose {
+        return self.lanes_purpose;
+    }
+
     pub fn popProviderKeyInput(self: *App) void {
         const items = self.provider_key_input.items;
         if (items.len == 0) return;
@@ -2904,7 +2916,7 @@ pub const App = struct {
         return false;
     }
 
-    fn reportLaneError(self: *App, err: anyerror) !void {
+    pub fn reportLaneError(self: *App, err: anyerror) !void {
         self.mode = .normal;
         self.clearInput();
         self.clearLanesState();
@@ -3188,7 +3200,7 @@ pub const App = struct {
 
     /// `/lanes` → M: merge the selected parked worktree into the current lane,
     /// remove it, and keep the window open on the reloaded list.
-    fn mergeSelectedParked(self: *App) !void {
+    pub fn mergeSelectedParked(self: *App) !void {
         if (self.lanes_selection >= self.parked_lanes.len) return;
         const entry = self.parked_lanes[self.lanes_selection];
         const source: MergeSource = .{ .branch = entry.branch, .path = entry.path, .active_index = null };
@@ -3197,7 +3209,7 @@ pub const App = struct {
     }
 
     /// `/lanes` → X: delete the selected parked worktree and its branch.
-    fn deleteSelectedParked(self: *App) !void {
+    pub fn deleteSelectedParked(self: *App) !void {
         if (self.lanes_selection >= self.parked_lanes.len) return;
         const entry = self.parked_lanes[self.lanes_selection];
         if (self.repoRoot()) |repo| {
@@ -3208,7 +3220,7 @@ pub const App = struct {
     }
 
     /// Number of rows in the lanes overlay for the current purpose.
-    fn laneEntryCount(self: *const App) u32 {
+    pub fn laneEntryCount(self: *const App) u32 {
         return switch (self.lanes_purpose) {
             .manage => @intCast(self.parked_lanes.len),
             .merge_dest => @intCast(self.merge_dest_indices.len),
@@ -3254,26 +3266,7 @@ pub const App = struct {
     }
 
     pub fn handleLanesKey(self: *App, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.up, .{})) {
-            if (self.lanes_selection > 0) self.lanes_selection -= 1;
-            return true;
-        }
-        if (key.matches(vaxis.Key.down, .{})) {
-            const count = self.laneEntryCount();
-            if (count > 0 and self.lanes_selection + 1 < count) self.lanes_selection += 1;
-            return true;
-        }
-        if (self.lanes_purpose == .manage) {
-            if (key.matches('m', .{}) or key.matches('m', .{ .shift = true })) {
-                self.mergeSelectedParked() catch |err| try self.reportLaneError(err);
-                return true;
-            }
-            if (key.matches('x', .{}) or key.matches('x', .{ .shift = true })) {
-                self.deleteSelectedParked() catch |err| try self.reportLaneError(err);
-                return true;
-            }
-        }
-        return false;
+        return command_router.Lanes.handle(self, key);
     }
 
     fn installRuntime(self: *App, runtime: *runtime_mod.AgentRuntime) !void {

@@ -187,11 +187,35 @@ const SessionPicker = struct {
 
 /// Lanes manager mode (parallel-lane picker + parked-lane management).
 ///
-/// R2.1 stub: forwards to `App.handleLanesKey`. Real implementation lands
-/// in R2.6.
+/// Up/down move the selection; in manage-purpose (parked lanes view)
+/// 'm' merges the selected parked lane back into the active lane, and
+/// 'x' deletes it. Lane errors are routed through the existing reporter.
 const Lanes = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
-        return app.handleLanesKey(key);
+        if (key.matches(vaxis.Key.up, .{})) {
+            if (app.getLanesSelection() > 0) {
+                app.setLanesSelection(app.getLanesSelection() - 1);
+            }
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{})) {
+            const count = app.laneEntryCount();
+            if (count > 0 and app.getLanesSelection() + 1 < count) {
+                app.setLanesSelection(app.getLanesSelection() + 1);
+            }
+            return true;
+        }
+        if (app.getLanesPurpose() == .manage) {
+            if (key.matches('m', .{}) or key.matches('m', .{ .shift = true })) {
+                app.mergeSelectedParked() catch |err| try app.reportLaneError(err);
+                return true;
+            }
+            if (key.matches('x', .{}) or key.matches('x', .{ .shift = true })) {
+                app.deleteSelectedParked() catch |err| try app.reportLaneError(err);
+                return true;
+            }
+        }
+        return false;
     }
 };
 
