@@ -20,7 +20,7 @@ const skill_mod = @import("skill.zig");
 const symbols = @import("symbols.zig");
 const transcript_mod = @import("transcript.zig");
 const CountingAllocator = @import("counting_allocator").CountingAllocator;
-const agent_worker = @import("tui/agent_worker.zig");
+pub const agent_worker = @import("tui/agent_worker.zig");
 const naming_mod = @import("tui/naming.zig");
 const Turn = @import("tui/turn.zig");
 const model_catalogue = @import("tui/model_catalogue.zig");
@@ -34,7 +34,9 @@ const tui_metrics = @import("tui/metrics.zig");
 const tui_message = @import("tui/widgets/message.zig");
 const blackhole = @import("tui/blackhole.zig");
 const at_search = @import("tui/widgets/at_search.zig");
+const background_jobs = @import("tui/widgets/background_jobs.zig");
 const command_panel = @import("tui/widgets/command_panel.zig");
+const permission = @import("tui/widgets/permission.zig");
 const diff_viewer = @import("tui/diff_viewer.zig");
 const model_loader = @import("tui/model_loader.zig");
 const model_cache = @import("tui/model_cache.zig");
@@ -3974,7 +3976,7 @@ pub const RootWidget = struct {
             idx += 1;
         }
         if (permission_visible) {
-            var permission_view: PermissionWidget = .{ .app = self.app };
+            var permission_view: permission.PermissionWidget = .{ .app = self.app };
             const panel_height: u16 = @min(@as(u16, 12), @max(@as(u16, 5), layout.input_row));
             children[idx] = .{
                 .origin = .{ .row = layout.input_row -| panel_height, .col = 0 },
@@ -3987,7 +3989,7 @@ pub const RootWidget = struct {
             idx += 1;
         }
         if (background_visible) {
-            var jobs_view: BackgroundJobsWidget = .{ .app = self.app };
+            var jobs_view: background_jobs.BackgroundJobsWidget = .{ .app = self.app };
             const rows: u16 = @intCast(@min(@as(usize, 8), self.app.runningBackgroundCount()));
             const panel_height: u16 = @min(layout.input_row, rows + 4);
             children[idx] = .{
@@ -4282,187 +4284,6 @@ pub const RootWidget = struct {
 
 const diff_hint_line1 = "↑↓ Move" ++ symbols.separator_dot_padded ++ "⇧↑↓ Select lines" ++ symbols.separator_dot_padded ++ "^↑↓ Jump file" ++ symbols.separator_dot_padded ++ "^P Find file";
 const diff_hint_line2 = "^W Comment" ++ symbols.separator_dot_padded ++ "^E Edit" ++ symbols.separator_dot_padded ++ "^D Delete" ++ symbols.separator_dot_padded ++ "^S Save & send" ++ symbols.separator_dot_padded ++ "Esc Exit";
-
-const BackgroundJobsWidget = struct {
-    app: *App,
-
-    fn widget(self: *BackgroundJobsWidget) vxfw.Widget {
-        return .{ .userdata = self, .drawFn = draw };
-    }
-
-    fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *BackgroundJobsWidget = @ptrCast(@alignCast(ptr));
-        const app = self.app;
-        const empty = vxfw.Surface.init(ctx.arena, self.widget(), .{
-            .width = ctx.max.width orelse 0,
-            .height = ctx.max.height orelse 0,
-        });
-        const manager = app.background orelse return empty;
-        const views = manager.snapshot(ctx.arena) catch return empty;
-        const inner = try ctx.arena.create(BackgroundJobsInner);
-        inner.* = .{
-            .views = views,
-            .selection = if (views.len == 0) 0 else @min(app.background_modal_state.selection, views.len - 1),
-            .cancel_focus = app.background_modal_state.cancel_focus,
-        };
-        var border: vxfw.Border = .{
-            .child = inner.widget(),
-            .labels = &.{.{ .text = "Background jobs", .alignment = .top_left }},
-            .style = StylePalette.border_label,
-        };
-        return border.widget().draw(ctx);
-    }
-};
-
-const BackgroundJobsInner = struct {
-    views: []background_mod.BackgroundManager.JobView,
-    selection: usize,
-    cancel_focus: bool,
-
-    fn widget(self: *BackgroundJobsInner) vxfw.Widget {
-        return .{ .userdata = self, .drawFn = draw };
-    }
-
-    fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *BackgroundJobsInner = @ptrCast(@alignCast(ptr));
-        const width = ctx.max.width orelse 0;
-        const height = ctx.max.height orelse 0;
-        var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = width, .height = height });
-        if (width == 0 or height == 0) return surface;
-
-        if (self.views.len == 0) {
-            panel.lineStyledAt(&surface, 0, "No background jobs running.", ctx, 1, StylePalette.thinking_body) catch {};
-            return surface;
-        }
-
-        panel.lineStyledAt(&surface, 0, "↑↓ select · → cancel · Esc close", ctx, 1, StylePalette.panel_header) catch {};
-        const body_rows = height -| 1;
-        var row: u16 = 0;
-        while (row < self.views.len and row < body_rows) : (row += 1) {
-            const view = self.views[row];
-            const selected = row == self.selection;
-            var elapsed_buf: [32]u8 = undefined;
-            const line = std.fmt.allocPrint(ctx.arena, "{s}  {s}  {s}", .{
-                view.label,
-                formatJobElapsed(&elapsed_buf, view.elapsed_seconds),
-                view.command,
-            }) catch view.command;
-            panel.lineAt(&surface, 1 + row, line, ctx, selected, 1) catch {};
-            // The cancel button sits at the right; highlighted only when the
-            // selected row has cancel focus (right-arrow).
-            const focused = selected and self.cancel_focus;
-            const button = if (focused) "[CANCEL]" else "CANCEL";
-            const style = if (focused) StylePalette.tool_failed else StylePalette.thinking_body;
-            panel.rightStyled(&surface, 1 + row, button, ctx, style) catch {};
-        }
-        return surface;
-    }
-};
-
-/// Compact elapsed render for a modal row, e.g. `45s`, `12m03s`, `2h05m`.
-fn formatJobElapsed(buf: []u8, total_seconds: u64) []const u8 {
-    if (total_seconds < 60) return std.fmt.bufPrint(buf, "{d}s", .{total_seconds}) catch "?";
-    const minutes = total_seconds / 60;
-    if (minutes < 60) return std.fmt.bufPrint(buf, "{d}m{d:0>2}s", .{ minutes, total_seconds % 60 }) catch "?";
-    return std.fmt.bufPrint(buf, "{d}h{d:0>2}m", .{ minutes / 60, minutes % 60 }) catch "?";
-}
-
-const PermissionWidget = struct {
-    app: *App,
-
-    fn widget(self: *PermissionWidget) vxfw.Widget {
-        return .{ .userdata = self, .drawFn = draw };
-    }
-
-    fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *PermissionWidget = @ptrCast(@alignCast(ptr));
-        const app = self.app;
-        const worker = if (app.thread.worker_context) |*context| context else {
-            return vxfw.Surface.init(ctx.arena, self.widget(), .{
-                .width = ctx.max.width orelse 0,
-                .height = ctx.max.height orelse 0,
-            });
-        };
-        const snapshot = try worker.approval.snapshot(worker.io, ctx.arena, app.thread.permission_selection) orelse {
-            return vxfw.Surface.init(ctx.arena, self.widget(), .{
-                .width = ctx.max.width orelse 0,
-                .height = ctx.max.height orelse 0,
-            });
-        };
-
-        const width = ctx.max.width orelse 0;
-        const height = ctx.max.height orelse 0;
-        const surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = width, .height = height });
-        if (width == 0 or height == 0) return surface;
-
-        const inner = try ctx.arena.create(PermissionInner);
-        inner.* = .{ .snapshot = snapshot, .scroll = app.thread.permission_scroll };
-        var border: vxfw.Border = .{
-            .child = inner.widget(),
-            .labels = &.{.{ .text = "Unsafe bash command", .alignment = .top_left }},
-            .style = StylePalette.border_label,
-        };
-        return border.widget().draw(ctx);
-    }
-};
-
-const PermissionInner = struct {
-    snapshot: agent_worker.ApprovalSnapshot,
-    scroll: u32,
-
-    fn widget(self: *PermissionInner) vxfw.Widget {
-        return .{ .userdata = self, .drawFn = draw };
-    }
-
-    fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *PermissionInner = @ptrCast(@alignCast(ptr));
-        const width = ctx.max.width orelse 0;
-        const height = ctx.max.height orelse 0;
-        var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = width, .height = height });
-        if (width == 0 or height == 0) return surface;
-
-        panel.lineStyledAt(&surface, 0, "Review before running", ctx, 1, StylePalette.panel_header) catch {};
-        const body_rows = height -| 3;
-        drawPermissionCommand(&surface, ctx, self.snapshot.command, self.scroll, body_rows);
-        drawPermissionActions(&surface, ctx, height -| 1, self.snapshot.selected);
-        return surface;
-    }
-};
-
-fn drawPermissionCommand(surface: *vxfw.Surface, ctx: vxfw.DrawContext, command: []const u8, scroll: u32, rows: u16) void {
-    if (rows == 0) return;
-    var line_index: u32 = 0;
-    var drawn: u16 = 0;
-    var iterator = std.mem.splitScalar(u8, command, '\n');
-    while (iterator.next()) |line| {
-        if (line_index < scroll) {
-            line_index += 1;
-            continue;
-        }
-        if (drawn >= rows) return;
-        panel.lineStyledAt(surface, 1 + drawn, line, ctx, 1, StylePalette.thinking_body) catch {};
-        drawn += 1;
-        line_index += 1;
-    }
-}
-
-fn drawPermissionActions(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, selected: agent_worker.ApprovalDecision) void {
-    if (row >= surface.size.height) return;
-    const approve_selected = selected == .approve;
-    const reject_selected = selected == .reject;
-    panel.lineStyledAt(surface, row, actionLabel(ctx, "Approve", approve_selected), ctx, 1, permissionActionStyle(approve_selected)) catch {};
-    panel.lineStyledAt(surface, row, actionLabel(ctx, "Reject", reject_selected), ctx, 13, permissionActionStyle(reject_selected)) catch {};
-}
-
-fn actionLabel(ctx: vxfw.DrawContext, text: []const u8, selected: bool) []const u8 {
-    if (selected) return std.fmt.allocPrint(ctx.arena, "[ {s} ]", .{text}) catch text;
-    return std.fmt.allocPrint(ctx.arena, "  {s}  ", .{text}) catch text;
-}
-
-fn permissionActionStyle(selected: bool) vaxis.Style {
-    if (selected) return StylePalette.selected_item;
-    return StylePalette.thinking_body;
-}
 
 // Left-margin columns: [0..3] line number, [4] diff sign, [5] comment bracket,
 // [6..] content.
