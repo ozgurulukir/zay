@@ -26,6 +26,7 @@ const input_mod = @import("widgets/input.zig");
 const permission = @import("widgets/permission.zig");
 const background_jobs = @import("widgets/background_jobs.zig");
 const at_search = @import("widgets/at_search.zig");
+const overlay = @import("widgets/overlay.zig");
 
 const App = tui.App;
 
@@ -46,7 +47,7 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
     var transcript_view: tx_widget.TranscriptWidget = .{ .app = app, .thread = app.thread };
     var loading_view: loading.LoadingWidget = .{ .app = app };
     var input_view: input_mod.InputWidget = .{ .app = app };
-    var overlay_view: tui.OverlayWidget = .{ .app = app };
+    var overlay_view: overlay.OverlayWidget = .{ .app = app };
 
     const transcript_ctx = ctx.withConstraints(
         .{ .width = max_width, .height = layout.transcript_height },

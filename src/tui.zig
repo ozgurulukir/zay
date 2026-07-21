@@ -34,6 +34,7 @@ const tui_metrics = @import("tui/metrics.zig");
 const lane_column = @import("tui/lane_column.zig");
 const diff_viewer_overlay = @import("tui/diff_viewer_overlay.zig");
 const lifecycle = @import("tui/lifecycle.zig");
+const overlay = @import("tui/widgets/overlay.zig");
 const root_layout = @import("tui/layout.zig");
 const root_layout_widget = @import("tui/root_layout.zig");
 const input_mod = @import("tui/widgets/input.zig");
@@ -253,7 +254,7 @@ pub const App = struct {
     /// `deinit`.
     pub const ctrl_c_double_press_ms: u32 = 1500;
 
-    const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message, lanes };
+    pub const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message, lanes };
     pub const LanesPurpose = app_state.NavState.LanesPurpose;
     const ModelCatalog = enum { connected_provider, openai_codex };
     const CheckpointState = enum { unknown, ready, unavailable };
@@ -3004,7 +3005,7 @@ pub const App = struct {
 
     /// Rows for the lanes overlay, arena-allocated each draw (strings borrowed
     /// from `parked_lanes` / `threads`).
-    fn buildLaneEntries(self: *App, arena: std.mem.Allocator) ![]lanes_picker.Entry {
+    pub fn buildLaneEntries(self: *App, arena: std.mem.Allocator) ![]lanes_picker.Entry {
         switch (self.nav.lanes_purpose) {
             .manage => {
                 const out = try arena.alloc(lanes_picker.Entry, self.parked_lanes.len);
@@ -3793,11 +3794,11 @@ fn laneErrorText(err: anyerror) []const u8 {
     };
 }
 
-const Command = enum { connect, model, new, resume_session, timeline, diff, parallel, save, close, merge, lanes };
+pub const Command = enum { connect, model, new, resume_session, timeline, diff, parallel, save, close, merge, lanes };
 /// `multi_lane` commands act on another lane, so they're hidden from the palette
 /// (and unresolvable) until more than one lane exists.
-const CommandEntry = struct { name: []const u8, command: Command, multi_lane: bool = false };
-const commands = [_]CommandEntry{
+pub const CommandEntry = struct { name: []const u8, command: Command, multi_lane: bool = false };
+pub const commands = [_]CommandEntry{
     .{ .name = "Connect", .command = .connect },
     .{ .name = "Models", .command = .model },
     .{ .name = "New", .command = .new },
@@ -3812,26 +3813,9 @@ const commands = [_]CommandEntry{
 };
 
 /// Whether `entry` should appear in the palette given the current lane count.
-fn commandVisible(app: *const App, entry: CommandEntry) bool {
+pub fn commandVisible(app: *const App, entry: CommandEntry) bool {
     if (entry.multi_lane and app.threads.items.len < 2) return false;
     return true;
-}
-
-fn overlayLabel(app: *const App) []const u8 {
-    return switch (app.mode) {
-        .normal => "",
-        .command => "Command",
-        .session_picker => "Search for Sessions",
-        .provider_picker => "Connect to Provider",
-        .model_picker => "Select Model",
-        .tree_picker => "Session Timeline",
-        .save_message => "Commit Message",
-        .lanes => switch (app.nav.lanes_purpose) {
-            .manage => "Parallel Lanes",
-            .merge_dest => "Merge Into",
-        },
-        .diff_viewer => "",
-    };
 }
 
 fn resolveCommand(app: *App, filter: []const u8) ?Command {
@@ -3929,22 +3913,6 @@ fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []
     ctx.consumeAndRedraw();
 }
 
-const OverlaySize = struct { width: u16, height: u16 };
-
-fn overlaySize(mode: App.Mode) OverlaySize {
-    return switch (mode) {
-        .normal => .{ .width = 0, .height = 0 },
-        .command => .{ .width = 40, .height = 16 },
-        .provider_picker => .{ .width = 72, .height = 16 },
-        .session_picker => .{ .width = 80, .height = 16 },
-        .model_picker => .{ .width = 90, .height = 16 },
-        .tree_picker => .{ .width = 90, .height = 20 },
-        .save_message => .{ .width = 60, .height = 3 },
-        .lanes => .{ .width = 80, .height = 16 },
-        .diff_viewer => .{ .width = 0, .height = 0 },
-    };
-}
-
 /// Builds the floating `@`-results panel from app state. Presentational only;
 /// the main input keeps focus.
 pub const AtSearchWidget = struct {
@@ -3967,58 +3935,6 @@ pub const AtSearchWidget = struct {
         return content.widget().draw(ctx);
     }
 };
-
-pub const OverlayWidget = struct {
-    app: *App,
-
-    pub fn widget(self: *OverlayWidget) vxfw.Widget {
-        return .{ .userdata = self, .drawFn = drawOverlay };
-    }
-
-    fn drawOverlay(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *OverlayWidget = @ptrCast(@alignCast(ptr));
-        const size = if (self.app.mode == .provider_picker and self.app.pickers.provider.stage == .form)
-            OverlaySize{ .width = 64, .height = 6 }
-        else
-            overlaySize(self.app.mode);
-        const max_w: u16 = ctx.max.width orelse size.width;
-        const max_h: u16 = ctx.max.height orelse size.height;
-        const total_w: u16 = @min(size.width, max_w);
-        const total_h: u16 = @min(size.height, max_h);
-        var inner: OverlayInner = .{ .app = self.app };
-        var border: vxfw.Border = .{
-            .child = inner.widget(),
-            .style = StylePalette.thinking_body,
-        };
-        var surface = try border.widget().draw(ctx.withConstraints(
-            .{ .width = total_w, .height = total_h },
-            .{ .width = total_w, .height = total_h },
-        ));
-        writeBorderLabel(&surface, ctx, overlayLabel(self.app));
-        return surface;
-    }
-};
-
-fn writeBorderLabel(surface: *vxfw.Surface, ctx: vxfw.DrawContext, text: []const u8) void {
-    writeBorderLabelLeft(surface, ctx, 0, text, StylePalette.border_label);
-}
-
-fn writeBorderLabelLeft(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, text: []const u8, style: vaxis.Style) void {
-    if (text.len == 0 or row >= surface.size.height) return;
-    var col: u16 = 1;
-    var iter = ctx.graphemeIterator(text);
-    while (iter.next()) |grapheme| {
-        const bytes = grapheme.bytes(text);
-        const width: u16 = @intCast(ctx.stringWidth(bytes));
-        if (width == 0) continue;
-        if (col + width >= surface.size.width) break;
-        surface.writeCell(col, row, .{
-            .char = .{ .grapheme = bytes, .width = @intCast(width) },
-            .style = style,
-        });
-        col += width;
-    }
-}
 
 /// Draw `text` on `row` so its last cell ends at `end_col` (inclusive), filling
 /// leftward. Returns the first column the text occupies — or `end_col + 1` when
@@ -4067,203 +3983,7 @@ pub fn writeBorderLabelRight(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row:
     }
 }
 
-const OverlayInner = struct {
-    app: *App,
-
-    fn widget(self: *OverlayInner) vxfw.Widget {
-        return .{ .userdata = self, .drawFn = drawInner };
-    }
-
-    fn drawInner(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *OverlayInner = @ptrCast(@alignCast(ptr));
-        const iw: u16 = ctx.max.width orelse 0;
-        const ih: u16 = ctx.max.height orelse 0;
-
-        var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = iw, .height = ih });
-
-        // The provider setup form hosts its own inline editor, so it skips the
-        // shared search row entirely and fills the panel from the top.
-        if (self.app.mode == .provider_picker and self.app.pickers.provider.stage == .form) {
-            const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
-            children[0] = .{
-                .origin = .{ .row = 0, .col = 0 },
-                .z_index = 0,
-                .surface = try drawContent(self.app, ctx.withConstraints(
-                    .{ .width = iw, .height = ih },
-                    .{ .width = iw, .height = ih },
-                )),
-            };
-            surface.children = children;
-            return surface;
-        }
-
-        // Horizontal separator under the search row.
-        var sep_col: u16 = 0;
-        while (sep_col < iw) : (sep_col += 1) {
-            surface.writeCell(sep_col, 1, .{
-                .char = .{ .grapheme = "─", .width = 1 },
-                .style = StylePalette.thinking_body,
-            });
-        }
-
-        const children = try ctx.arena.alloc(vxfw.SubSurface, 2);
-
-        // Row 0: prompt + shared overlay search input.
-        var prompt_text: vxfw.Text = .{ .text = ">", .softwrap = false, .width_basis = .parent };
-        var prompt_box: vxfw.SizedBox = .{ .child = prompt_text.widget(), .size = .{ .width = 2, .height = 1 } };
-        var input_box: vxfw.SizedBox = .{ .child = self.app.inputs.palette.widget(), .size = .{ .width = iw -| 2, .height = 1 } };
-        var search_row: vxfw.FlexRow = .{ .children = &.{
-            .{ .widget = prompt_box.widget(), .flex = 0 },
-            .{ .widget = input_box.widget(), .flex = 1 },
-        } };
-        children[0] = .{
-            .origin = .{ .row = 0, .col = 0 },
-            .z_index = 0,
-            .surface = try search_row.widget().draw(ctx.withConstraints(
-                .{ .width = iw, .height = 1 },
-                .{ .width = iw, .height = 1 },
-            )),
-        };
-
-        // Rows 2..: mode-specific content area.
-        const content_h: u16 = ih -| 2;
-        const content_ctx = ctx.withConstraints(
-            .{ .width = iw, .height = content_h },
-            .{ .width = iw, .height = content_h },
-        );
-        children[1] = .{
-            .origin = .{ .row = 2, .col = 0 },
-            .z_index = 0,
-            .surface = try drawContent(self.app, content_ctx),
-        };
-
-        surface.children = children;
-        return surface;
-    }
-
-    fn drawContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        return switch (app.mode) {
-            .command => drawCommandContent(app, ctx),
-            .session_picker => drawSessionContent(app, ctx),
-            .provider_picker => drawProviderContent(app, ctx),
-            .model_picker => drawModelContent(app, ctx),
-            .tree_picker => drawTreeContent(app, ctx),
-            .save_message => drawSaveMessageContent(app, ctx),
-            .lanes => drawLanesContent(app, ctx),
-            // The diff viewer is full-screen — `drawRoot` returns before the
-            // overlay path, so this is never reached.
-            .normal, .diff_viewer => unreachable,
-        };
-    }
-
-    fn drawSaveMessageContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        _ = app;
-        // No body — the border label ("Commit Message") and the input row say it all.
-        var text: vxfw.Text = .{ .text = "" };
-        return text.widget().draw(ctx);
-    }
-
-    fn drawTreeContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        var content: tree_selector.Content = .{
-            .state = &app.pickers.tree,
-            .list = &app.tree_list,
-        };
-        return content.widget().draw(ctx);
-    }
-
-    fn drawLanesContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const entries = try app.buildLaneEntries(ctx.arena);
-        var content: lanes_picker.Content = .{
-            .list = &app.lanes_list,
-            .entries = entries,
-            .selection = app.nav.lanes_selection,
-            .empty_message = switch (app.nav.lanes_purpose) {
-                .manage => "  No parked lanes.",
-                .merge_dest => "  No lanes to merge into.",
-            },
-        };
-        return content.widget().draw(ctx);
-    }
-
-    fn drawCommandContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const filter = try app.peekPaletteInput();
-        defer app.gpa.free(filter);
-        // Build the visible entry list (lane commands appear only with >1 lane);
-        // resolveCommand applies the same visibility + filter, so indices align.
-        var buf: [commands.len]command_panel.Entry = undefined;
-        var n: usize = 0;
-        for (commands) |entry| {
-            if (!commandVisible(app, entry)) continue;
-            buf[n] = .{ .name = entry.name };
-            n += 1;
-        }
-        var content: command_panel.Content = .{
-            .entries = buf[0..n],
-            .filter = filter,
-            .selection = app.nav.command_selection,
-        };
-        return content.widget().draw(ctx);
-    }
-
-    fn drawSessionContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const filter = try app.peekPaletteInput();
-        defer app.gpa.free(filter);
-        var content: resume_picker.Content = .{
-            .io = app.io,
-            .list = &app.resume_list,
-            .summaries = app.resume_summaries.items,
-            .selection = app.nav.resume_selection,
-            .folded_projects = app.resume_folded_projects.items,
-            .filter = filter,
-            .tree_mode = app.nav.resume_global,
-        };
-        return content.widget().draw(ctx);
-    }
-
-    fn drawProviderContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        var content: provider_picker.Content = .{
-            .state = app.pickers.provider,
-            .codex_signed_in = app.isCodexSignedIn(),
-            // `conn_status` is indexed by `catalogueProviders()` order, exactly
-            // how the picker iterates its rows.
-            .statuses = &app.conn_status,
-            .key_input = app.provider_key_input.items,
-        };
-        return content.widget().draw(ctx);
-    }
-
-    fn drawModelContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const filter = try app.peekPaletteInput();
-        defer app.gpa.free(filter);
-        const status = tui_status.modelStatus(app.liveRuntime(), app.cached_config);
-        // Project the consolidated entries into the parallel slices the picker
-        // widget consumes. Arena-allocated, rebuilt each draw — cheap, and it
-        // keeps the picker decoupled from the catalogue's internal layout.
-        const entries = app.pickers.models.entries.items;
-        const picker_models = try ctx.arena.alloc(codex.Model, entries.len);
-        const picker_reasoning = try ctx.arena.alloc(u32, entries.len);
-        for (entries, 0..) |entry, i| {
-            picker_models[i] = entry.model;
-            picker_reasoning[i] = entry.reasoning_index;
-        }
-        var content: model_picker.Content = .{
-            .models = picker_models,
-            .list = &app.model_list,
-            .selection = app.pickers.models.model_selection,
-            .column = app.pickers.models.model_column,
-            .active_model = if (status) |value| value.model else null,
-            .reasoning_options = reasoningOptions(),
-            .reasoning_indexes = picker_reasoning,
-            .scope = modelPickerScope(app.pickers.models.model_scope),
-            .filter = filter,
-            .loading = app.pickers.models.model_load_future != null,
-            .error_message = app.pickers.models.model_load_error,
-        };
-        return content.widget().draw(ctx);
-    }
-};
-
-fn modelPickerScope(scope: App.ModelScope) model_picker.Scope {
+pub fn modelPickerScope(scope: App.ModelScope) model_picker.Scope {
     return switch (scope) {
         .global => .global,
         .project => .project,
@@ -4279,7 +3999,7 @@ const reasoning_options = [_]model_picker.ReasoningOption{
     .{ .label = "nothink", .effort = .none },
 };
 
-fn reasoningOptions() []const model_picker.ReasoningOption {
+pub fn reasoningOptions() []const model_picker.ReasoningOption {
     return &reasoning_options;
 }
 
