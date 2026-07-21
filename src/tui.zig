@@ -5,7 +5,8 @@ const vxfw = vaxis.vxfw;
 const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
 const at_mention = @import("at_mention.zig");
-const background_mod = @import("background.zig");
+pub const background_mod = @import("background.zig");
+pub const BackgroundDelivery = app_state.BackgroundModalState.BackgroundDelivery;
 const pytools = @import("pytools.zig");
 const bash_mod = @import("bash.zig");
 const search_mod = @import("search.zig");
@@ -27,6 +28,7 @@ const tui_turn_view = @import("tui/turn_view.zig");
 const event_router = @import("tui/event_router.zig");
 const command_router = @import("tui/command_router.zig");
 const app_state = @import("tui/app_state.zig");
+const background_delivery = @import("tui/background_delivery.zig");
 const Thread = @import("tui/thread.zig");
 const tui_metrics = @import("tui/metrics.zig");
 const tui_message = @import("tui/widgets/message.zig");
@@ -239,11 +241,6 @@ pub const App = struct {
     /// lane is idle — "auto-start if idle, queue if in-flight". Owned; freed in
     /// `deinit`.
     pub const ctrl_c_double_press_ms: u32 = 1500;
-
-    /// A finished background job buffered for delivery to its owning lane.
-    /// `owner` is the opaque `*Agent` token from the manager; `message` is the
-    /// model-facing completion text (null when the job was killed — notice only).
-    pub const BackgroundDelivery = app_state.BackgroundModalState.BackgroundDelivery;
 
     const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message, lanes };
     pub const LanesPurpose = app_state.NavState.LanesPurpose;
@@ -772,7 +769,7 @@ pub const App = struct {
 
     /// The lane whose agent is `agent_ptr`, or null if it has been closed. Used
     /// to route a background-job completion back to the lane that started it.
-    fn laneForAgent(self: *App, agent_ptr: *agent_mod.Agent) ?*Thread {
+    pub fn laneForAgent(self: *App, agent_ptr: *agent_mod.Agent) ?*Thread {
         for (self.threads.items) |lane| {
             if (lane.agent) |a| {
                 if (a == agent_ptr) return lane;
@@ -781,54 +778,25 @@ pub const App = struct {
         return null;
     }
 
-    fn freeDelivery(self: *App, delivery: *BackgroundDelivery) void {
-        self.gpa.free(delivery.notice);
-        if (delivery.message) |message| self.gpa.free(message);
-        delivery.* = undefined;
+    pub fn freeDelivery(self: *App, delivery: *BackgroundDelivery) void {
+        return background_delivery.freeDelivery(self, delivery);
     }
 
     /// Whether the drain/animation tick must stay alive for background work:
     /// jobs still running, or completions waiting to be delivered.
-    fn backgroundActive(self: *App) bool {
-        if (self.background_modal_state.pending.items.len > 0) return true;
-        const manager = self.background orelse return false;
-        return manager.activeCount() > 0;
+    pub fn backgroundActive(self: *App) bool {
+        return background_delivery.backgroundActive(self);
     }
 
     /// Drain finished jobs from the manager into `background_pending`. Called each
     /// tick; the actual delivery (notice + turn) happens in
     /// `deliverPendingBackground` once the owning lane is idle.
-    fn pollBackgroundJobs(self: *App) !bool {
-        const manager = self.background orelse return false;
-        const finished = manager.takeFinished(self.gpa) catch return false;
-        defer self.gpa.free(finished);
-        for (finished) |*job| {
-            const notice = self.formatBackgroundNotice(job) catch {
-                job.deinit(self.gpa);
-                continue;
-            };
-            // Take the model-facing message out of the job so its deinit only
-            // frees the metadata.
-            const message = job.completion_message;
-            job.completion_message = null;
-            self.background_modal_state.pending.append(self.gpa, .{
-                .owner = job.owner,
-                .notice = notice,
-                .message = message,
-            }) catch {
-                self.gpa.free(notice);
-                if (message) |m| self.gpa.free(m);
-            };
-            job.deinit(self.gpa);
-        }
-        return finished.len > 0;
+    pub fn pollBackgroundJobs(self: *App) !bool {
+        return background_delivery.pollBackgroundJobs(self);
     }
 
-    fn formatBackgroundNotice(self: *App, job: *const background_mod.BackgroundManager.Finished) ![]u8 {
-        if (job.killed) {
-            return std.fmt.allocPrint(self.gpa, "{s} ({s}) was cancelled", .{ job.label, job.command });
-        }
-        return std.fmt.allocPrint(self.gpa, "{s} ({s}) finished — exit {d}", .{ job.label, job.command, job.exit_code });
+    pub fn formatBackgroundNotice(self: *App, job: *const background_mod.BackgroundManager.Finished) ![]u8 {
+        return background_delivery.formatBackgroundNotice(self, job);
     }
 
     /// Deliver buffered background completions to idle lanes: append the notice
@@ -836,45 +804,15 @@ pub const App = struct {
     /// message and start a turn to answer it. A lane mid-turn is left alone (the
     /// completion waits); the visible lane is also left alone while the user is
     /// typing, so a finishing job never yanks them mid-compose.
-    fn deliverPendingBackground(self: *App) !bool {
-        var changed = false;
-        const active = self.thread;
-        defer self.thread = active;
-        var i: usize = 0;
-        while (i < self.background_modal_state.pending.items.len) {
-            const delivery = &self.background_modal_state.pending.items[i];
-            const lane = self.laneForAgent(@ptrCast(@alignCast(delivery.owner))) orelse {
-                self.freeDelivery(delivery);
-                _ = self.background_modal_state.pending.orderedRemove(i);
-                continue;
-            };
-            const composing = lane == active and self.inputs.input.buf.realLength() > 0;
-            if (lane.turn.state != .idle or composing) {
-                i += 1;
-                continue;
-            }
-            _ = lane.transcript.append(self.gpa, .notice, "background", delivery.notice) catch {};
-            if (lane == active) changed = true;
-            const start_turn = delivery.message != null;
-            if (delivery.message) |message| lane.agent.?.enqueueRaw(message) catch {};
-            self.freeDelivery(delivery);
-            _ = self.background_modal_state.pending.orderedRemove(i);
-            if (start_turn) {
-                self.thread = lane;
-                self.startDeliveryTurnOnCurrentThread() catch {};
-                return true;
-            }
-            changed = true;
-            // Removed in place — re-check the same index next iteration.
-        }
-        return changed;
+    pub fn deliverPendingBackground(self: *App) !bool {
+        return background_delivery.deliverPendingBackground(self);
     }
 
     /// Start a turn on `self.thread` that drains its agent's queued (background)
     /// messages into history and answers them. Mirrors
     /// `restartTurnForQueuedMessages` but is gated on the agent queue, not the
     /// UI's display queue. Caller must have set `self.thread` to the target lane.
-    fn startDeliveryTurnOnCurrentThread(self: *App) !void {
+    pub fn startDeliveryTurnOnCurrentThread(self: *App) !void {
         if (self.liveRuntime() != null and self.liveRuntime().?.client == .none) {
             // No provider to run a turn — drop the queued notice rather than spin
             // up a doomed worker.
