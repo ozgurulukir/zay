@@ -31,6 +31,7 @@ const app_state = @import("tui/app_state.zig");
 const background_delivery = @import("tui/background_delivery.zig");
 pub const Thread = @import("tui/thread.zig");
 const tui_metrics = @import("tui/metrics.zig");
+const lane_column = @import("tui/lane_column.zig");
 const tui_message = @import("tui/widgets/message.zig");
 const blackhole = @import("tui/blackhole.zig");
 const at_search = @import("tui/widgets/at_search.zig");
@@ -3935,7 +3936,7 @@ pub const RootWidget = struct {
                 const h: u16 = if (last_row) layout.transcript_height - cell_h * (rows - 1) else cell_h;
                 children[idx] = .{
                     .origin = .{ .row = row * cell_h, .col = col * cell_w },
-                    .surface = try self.drawLaneColumn(ctx, lane, w, h, lane == self.app.thread),
+                    .surface = try lane_column.drawLaneColumn(self.app, ctx, lane, w, h, lane == self.app.thread),
                     .z_index = 0,
                 };
                 idx += 1;
@@ -4031,21 +4032,6 @@ pub const RootWidget = struct {
     /// Draw one lane's transcript as a bordered column for split view. The
     /// border label marks the lane (● active / ○ background) and the active
     /// column's border is undimmed.
-    fn drawLaneColumn(self: *RootWidget, ctx: vxfw.DrawContext, lane: *Thread, width: u16, height: u16, active: bool) std.mem.Allocator.Error!vxfw.Surface {
-        var transcript_view: tx_widget.TranscriptWidget = .{ .app = self.app, .thread = lane };
-        const title = if (lane.title) |t| t else "untitled";
-        const label_text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ if (active) "● " else "○ ", title });
-        var border: vxfw.Border = .{
-            .child = transcript_view.widget(),
-            .labels = &.{.{ .text = label_text, .alignment = .top_left }},
-            .style = if (active) .{} else .{ .dim = true },
-        };
-        return border.widget().draw(ctx.withConstraints(
-            .{ .width = width, .height = height },
-            .{ .width = width, .height = height },
-        ));
-    }
-
     // --- Diff viewer ------------------------------------------------------
 
     pub fn handleDiffViewerEvent(self: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
