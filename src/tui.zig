@@ -840,7 +840,7 @@ pub const App = struct {
         });
     }
 
-    fn runningBackgroundCount(self: *App) usize {
+    pub fn runningBackgroundCount(self: *App) usize {
         const manager = self.background orelse return 0;
         return manager.runningCount();
     }
@@ -3218,7 +3218,7 @@ pub const App = struct {
         return out;
     }
 
-    fn inputTextRows(self: *App, ctx: vxfw.DrawContext, width: u16) !u16 {
+    pub fn inputTextRows(self: *App, ctx: vxfw.DrawContext, width: u16) !u16 {
         const text = try self.peekInput();
         defer self.gpa.free(text);
         return wrappedTextRows(ctx, text, width);
@@ -3273,7 +3273,7 @@ pub const App = struct {
         return selected == self.thread.transcript.messages.items.len - 1;
     }
 
-    fn diffCountsVisible(self: *const App) bool {
+    pub fn diffCountsVisible(self: *const App) bool {
         if (self.metrics.diff_counts.additions > 0) return true;
         return self.metrics.diff_counts.deletions > 0;
     }
@@ -4503,7 +4503,7 @@ fn writeBorderLabelLeft(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16,
 /// Draw `text` on `row` so its last cell ends at `end_col` (inclusive), filling
 /// leftward. Returns the first column the text occupies — or `end_col + 1` when
 /// nothing was drawn — so a caller can place another label further left.
-fn writeBorderTextEndingAt(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, end_col: u16, text: []const u8, style: vaxis.Style) u16 {
+pub fn writeBorderTextEndingAt(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, end_col: u16, text: []const u8, style: vaxis.Style) u16 {
     if (text.len == 0 or row >= surface.size.height) return end_col + 1;
     const text_w: u16 = @intCast(ctx.stringWidth(text));
     if (text_w == 0 or text_w > end_col + 1) return end_col + 1;
