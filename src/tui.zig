@@ -33,6 +33,8 @@ pub const Thread = @import("tui/thread.zig");
 const tui_metrics = @import("tui/metrics.zig");
 const lane_column = @import("tui/lane_column.zig");
 const diff_viewer_overlay = @import("tui/diff_viewer_overlay.zig");
+const diff_utils = @import("tui/diff_utils.zig");
+const lanes_util = @import("tui/lanes.zig");
 const lifecycle = @import("tui/lifecycle.zig");
 const overlay = @import("tui/widgets/overlay.zig");
 const root_layout = @import("tui/layout.zig");
@@ -605,7 +607,7 @@ pub const App = struct {
         _ = try self.thread.transcript.append(self.gpa, .user, "you", prompt);
         // A worktree lane's first prompt also names its branch: ask the model
         // in parallel, and rename the hex branch when the answer lands.
-        if (self.thread.title == null and workingLaneOf(self.thread) != null) {
+        if (self.thread.title == null and lanes_util.workingLaneOf(self.thread) != null) {
             self.scheduleLaneNaming(self.thread, prompt) catch {};
         }
         try self.setLaneTitleIfUnset(prompt);
@@ -2683,7 +2685,7 @@ pub const App = struct {
         self.mode = .normal;
         self.clearInput();
         self.clearLanesState();
-        const message = try std.fmt.allocPrint(self.gpa, "Lane operation failed: {s}", .{laneErrorText(err)});
+        const message = try std.fmt.allocPrint(self.gpa, "Lane operation failed: {s}", .{lanes_util.laneErrorText(err)});
         defer self.gpa.free(message);
         _ = try self.thread.transcript.append(self.gpa, .agent, "agent", message);
     }
@@ -2766,7 +2768,7 @@ pub const App = struct {
         const lane = self.threads.items[index];
         var branch: ?[]u8 = null;
         var dir: ?[]u8 = null;
-        if (workingLaneOf(lane)) |w| {
+        if (lanes_util.workingLaneOf(lane)) |w| {
             branch = try self.gpa.dupe(u8, w.branch);
             dir = try self.gpa.dupe(u8, w.path);
         }
@@ -2791,7 +2793,7 @@ pub const App = struct {
     /// The directory to run a merge in for `lane` as the destination: its
     /// worktree path, or the repo root for the primary lane.
     fn laneMergeDir(self: *App, lane: *Thread) ?[]const u8 {
-        if (workingLaneOf(lane)) |w| return w.path;
+        if (lanes_util.workingLaneOf(lane)) |w| return w.path;
         return self.repoRoot();
     }
 
@@ -2800,7 +2802,7 @@ pub const App = struct {
     /// if the merge conflicts (rolled back — the destination is untouched). On
     /// success `dest` becomes the active lane. Leaves `mode`/picker state to the
     /// caller so `/lanes` can stay open while `/merge` closes.
-    fn mergeLane(self: *App, source: MergeSource, dest: *Thread) !void {
+    fn mergeLane(self: *App, source: lanes_util.MergeSource, dest: *Thread) !void {
         if (dest.turn.isActive()) return error.InFlightTurn;
         if (source.active_index) |si| {
             if (self.threads.items[si].turn.isActive()) return error.InFlightTurn;
@@ -2839,10 +2841,10 @@ pub const App = struct {
         if (self.thread.turn.isActive()) return error.InFlightTurn;
         const src_index = self.activeIndex();
         if (src_index == 0) return error.CannotMergePrimaryLane;
-        const src = workingLaneOf(self.thread) orelse return error.CannotMergePrimaryLane;
+        const src = lanes_util.workingLaneOf(self.thread) orelse return error.CannotMergePrimaryLane;
         if (self.threads.items.len < 2) return error.NoMergeDestination;
 
-        const source: MergeSource = .{ .branch = src.branch, .path = src.path, .active_index = src_index };
+        const source: lanes_util.MergeSource = .{ .branch = src.branch, .path = src.path, .active_index = src_index };
 
         if (self.threads.items.len == 2) {
             const dest = self.threads.items[if (src_index == 0) 1 else 0];
@@ -2884,12 +2886,12 @@ pub const App = struct {
             return;
         }
         const dest = self.threads.items[self.merge_dest_indices[self.nav.lanes_selection]];
-        const src = workingLaneOf(self.threads.items[self.merge_source_index]) orelse {
+        const src = lanes_util.workingLaneOf(self.threads.items[self.merge_source_index]) orelse {
             self.mode = .normal;
             self.clearInput();
             return;
         };
-        const source: MergeSource = .{ .branch = src.branch, .path = src.path, .active_index = self.merge_source_index };
+        const source: lanes_util.MergeSource = .{ .branch = src.branch, .path = src.path, .active_index = self.merge_source_index };
         self.mergeLane(source, dest) catch |err| {
             // reportLaneError resets mode to normal and records the message.
             try self.reportLaneError(err);
@@ -2940,8 +2942,8 @@ pub const App = struct {
     /// where the stored path uses the platform separator.
     fn laneOpenAtPath(self: *App, path: []const u8) bool {
         for (self.threads.items) |lane| {
-            if (workingLaneOf(lane)) |w| {
-                if (std.mem.eql(u8, lastPathSegment(w.path), lastPathSegment(path))) return true;
+            if (lanes_util.workingLaneOf(lane)) |w| {
+                if (std.mem.eql(u8, lanes_util.lastPathSegment(w.path), lanes_util.lastPathSegment(path))) return true;
             }
         }
         return false;
@@ -2966,7 +2968,7 @@ pub const App = struct {
     pub fn mergeSelectedParked(self: *App) !void {
         if (self.nav.lanes_selection >= self.parked_lanes.len) return;
         const entry = self.parked_lanes[self.nav.lanes_selection];
-        const source: MergeSource = .{ .branch = entry.branch, .path = entry.path, .active_index = null };
+        const source: lanes_util.MergeSource = .{ .branch = entry.branch, .path = entry.path, .active_index = null };
         try self.mergeLane(source, self.thread);
         try self.reloadParkedLanes();
     }
@@ -3020,7 +3022,7 @@ pub const App = struct {
                     const lane = self.threads.items[ti];
                     out[i] = .{
                         .title = lane.title orelse (if (ti == 0) "primary" else "lane"),
-                        .subtitle = if (workingLaneOf(lane)) |w| w.branch else "(primary working copy)",
+                        .subtitle = if (lanes_util.workingLaneOf(lane)) |w| w.branch else "(primary working copy)",
                     };
                 }
                 return out;
@@ -3181,7 +3183,7 @@ pub const App = struct {
         defer result.deinit(self.gpa);
         if (result.code != 0) return false;
 
-        return self.installDiffCounts(parseDiffCounts(result.stdout));
+        return self.installDiffCounts(diff_utils.parseDiffCounts(result.stdout));
     }
 
     fn installDiffCounts(self: *App, next: DiffCounts) bool {
@@ -3244,7 +3246,7 @@ pub const App = struct {
                 if (self.metrics.diff_cache) |old| self.gpa.free(old);
                 self.metrics.diff_cache = raw;
                 outcome = .failed;
-                if (self.installDiffCounts(countDiff(self.metrics.diff_cache.?))) visible_change = true;
+                if (self.installDiffCounts(diff_utils.countDiff(self.metrics.diff_cache.?))) visible_change = true;
                 // A viewer opened on a cold cache is waiting on exactly this.
                 if (self.metrics.diff_loading) {
                     try self.populateDiffFromCache();
@@ -3445,7 +3447,7 @@ pub fn run(
     // directly (see tui/blackhole.zig), so the body is intentionally empty.
     _ = try app.thread.transcript.append(gpa, .logo, "logo", "");
 
-    app.metrics.git_label = loadGitLabel(gpa, init.io, runtime.cwd) catch "";
+    app.metrics.git_label = diff_utils.loadGitLabel(gpa, init.io, runtime.cwd) catch "";
     _ = app.refreshDiffCounts() catch false;
 
     var root: RootWidget = .{ .app = &app };
@@ -3461,84 +3463,6 @@ const diffCountCommand =
     \\  done
     \\fi
 ;
-
-fn parseDiffCounts(output: []const u8) DiffCounts {
-    var counts: DiffCounts = .{};
-    var line_start: usize = 0;
-    while (line_start <= output.len) {
-        const line_end = std.mem.findScalarPos(u8, output, line_start, '\n') orelse output.len;
-        parseDiffCountLine(&counts, output[line_start..line_end]);
-        if (line_end == output.len) break;
-        line_start = line_end + 1;
-    }
-    return counts;
-}
-
-/// Count additions/deletions straight from a unified diff by tallying `+`/`-`
-/// body lines (excluding the `+++`/`---` file headers). A cheap, allocation-free
-/// scan used on the cached full diff.
-fn countDiff(raw: []const u8) DiffCounts {
-    var counts: DiffCounts = .{};
-    var line_start: usize = 0;
-    while (line_start <= raw.len) {
-        const line_end = std.mem.findScalarPos(u8, raw, line_start, '\n') orelse raw.len;
-        const line = raw[line_start..line_end];
-        if (line.len > 0) {
-            if (line[0] == '+' and !std.mem.startsWith(u8, line, "+++")) {
-                counts.additions = saturatingAdd(counts.additions, 1);
-            } else if (line[0] == '-' and !std.mem.startsWith(u8, line, "---")) {
-                counts.deletions = saturatingAdd(counts.deletions, 1);
-            }
-        }
-        if (line_end == raw.len) break;
-        line_start = line_end + 1;
-    }
-    return counts;
-}
-
-fn parseDiffCountLine(counts: *DiffCounts, line: []const u8) void {
-    if (line.len == 0) return;
-    const first_tab = std.mem.indexOfScalar(u8, line, '\t') orelse return;
-    const rest = line[first_tab + 1 ..];
-    const second_tab = std.mem.indexOfScalar(u8, rest, '\t') orelse return;
-    counts.additions = saturatingAdd(counts.additions, parseNumstatField(line[0..first_tab]));
-    counts.deletions = saturatingAdd(counts.deletions, parseNumstatField(rest[0..second_tab]));
-}
-
-fn parseNumstatField(field: []const u8) u32 {
-    if (field.len == 0) return 0;
-    if (std.mem.eql(u8, field, "-")) return 0;
-    const value = std.fmt.parseUnsigned(u64, field, 10) catch return 0;
-    return @intCast(@min(value, std.math.maxInt(u32)));
-}
-
-fn saturatingAdd(a: u32, b: u32) u32 {
-    const sum: u64 = @as(u64, a) + @as(u64, b);
-    return @intCast(@min(sum, std.math.maxInt(u32)));
-}
-
-fn loadGitLabel(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) ![]const u8 {
-    const command =
-        \\root=$(git rev-parse --show-toplevel 2>/dev/null)
-        \\if [ -n "$root" ]; then repo=$(basename "$root"); else repo=$(basename "$PWD"); fi
-        \\branch=$(git branch --show-current 2>/dev/null)
-        \\if [ -z "$branch" ]; then branch=$(git rev-parse --short HEAD 2>/dev/null); fi
-        \\if [ -n "$branch" ]; then printf '%s\t%s' "$repo" "$branch"; else printf '%s' "$repo"; fi
-    ;
-    var result = try bash_mod.runWithOptions(gpa, io, .{
-        .cwd = cwd,
-        .command = command,
-        .timeout = bash_mod.timeoutFromSeconds(2),
-    });
-    defer result.deinit(gpa);
-    if (result.code != 0) return "";
-    const out = std.mem.trim(u8, result.stdout, " \t\r\n");
-    if (out.len == 0) return "";
-    if (std.mem.indexOfScalar(u8, out, '\t')) |tab| {
-        return std.fmt.allocPrint(gpa, "{s} ⌥ {s}", .{ out[0..tab], out[tab + 1 ..] });
-    }
-    return gpa.dupe(u8, out);
-}
 
 pub const RootWidget = struct {
     app: *App,
@@ -3631,77 +3555,6 @@ pub fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
         .session_picker, .model_picker, .tree_picker => app.inputs.palette.buf.realLength() == 0,
         .provider_picker => app.pickers.provider.stage == .list and app.inputs.palette.buf.realLength() == 0,
         .command, .diff_viewer, .save_message, .lanes => false,
-    };
-}
-
-const MessageListBuilder = struct {
-    arena: std.mem.Allocator,
-    messages: []transcript_mod.Message,
-    selected: ?u32,
-    loading_frame: u8,
-    blackhole_frame: u16,
-    gpa: std.mem.Allocator,
-
-    fn build(ptr: *const anyopaque, idx: usize, cursor: usize) ?vxfw.Widget {
-        _ = cursor;
-        const self: *const MessageListBuilder = @ptrCast(@alignCast(ptr));
-        if (idx >= self.messages.len) return null;
-        const body = self.arena.create(MessageWidget) catch return null;
-        body.* = .{
-            .message = &self.messages[idx],
-            .selected = if (self.selected) |selected| selected == idx else false,
-            .loading_frame = self.loading_frame,
-            .blackhole_frame = self.blackhole_frame,
-            .gpa = self.gpa,
-        };
-        return body.widget();
-    }
-};
-
-/// A lane being merged away. `branch`/`path` identify its `nova/<id>` worktree;
-/// `active_index` is its `threads` slot when it's an open lane (torn down via
-/// `abandonLane` after a successful merge), or null for a parked worktree
-/// (removed directly). Strings are borrowed for the duration of the merge.
-const MergeSource = struct {
-    branch: []const u8,
-    path: []const u8,
-    active_index: ?usize,
-};
-
-/// The `nova/<id>` worktree of `lane` if it's a working lane, else null (the
-/// primary lane carries no dedicated branch/worktree).
-fn workingLaneOf(lane: *Thread) ?vcs.Lane.Working {
-    const lane_ref: *const vcs.Lane = switch (lane.engine) {
-        .live => |*live| &live.lane,
-        .idle => |*l| l,
-    };
-    return switch (lane_ref.*) {
-        .working => |w| w,
-        .primary => null,
-    };
-}
-
-/// Final path segment, tolerant of both `/` and `\` separators and trailing
-/// slashes. Used to match worktree paths across git's forward-slash reporting
-/// and the platform-native paths Nova stores.
-fn lastPathSegment(path: []const u8) []const u8 {
-    var end = path.len;
-    while (end > 0 and (path[end - 1] == '/' or path[end - 1] == '\\')) end -= 1;
-    var start = end;
-    while (start > 0 and path[start - 1] != '/' and path[start - 1] != '\\') start -= 1;
-    return path[start..end];
-}
-
-/// Friendly text for the lane-operation errors surfaced by `reportLaneError`.
-fn laneErrorText(err: anyerror) []const u8 {
-    return switch (err) {
-        error.InFlightTurn => "a turn is still running — wait for it to finish",
-        error.MergeConflict => "merge conflict — the lanes changed the same lines (rolled back, nothing lost)",
-        error.CannotMergePrimaryLane => "can't merge the primary lane; switch to a working lane first",
-        error.CannotClosePrimaryLane => "can't close the primary lane",
-        error.NoMergeDestination => "no other lane to merge into",
-        error.TooManyLanes => "too many lanes (max 4)",
-        else => @errorName(err),
     };
 }
 
@@ -3916,7 +3769,7 @@ pub fn reasoningOptions() []const model_picker.ReasoningOption {
 
 
 test "parse diff counts sums numstat and skips binary" {
-    const counts = parseDiffCounts(
+    const counts = diff_utils.parseDiffCounts(
         "3\t1\tsrc/a.zig\n" ++
             "-\t-\timage.png\n" ++
             "8\t0\tsrc/new.zig\n",
