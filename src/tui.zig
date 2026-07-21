@@ -26,6 +26,7 @@ const model_catalogue = @import("tui/model_catalogue.zig");
 const tui_turn_view = @import("tui/turn_view.zig");
 const event_router = @import("tui/event_router.zig");
 const command_router = @import("tui/command_router.zig");
+const app_state = @import("tui/app_state.zig");
 const Thread = @import("tui/thread.zig");
 const tui_metrics = @import("tui/metrics.zig");
 const tui_message = @import("tui/widgets/message.zig");
@@ -60,7 +61,7 @@ const long_message_scroll_step_rows: u16 = 3;
 /// when a lane is forked with `/parallel`.
 const lane_naming_context_max: usize = 3;
 pub const TranscriptNavigation = enum { previous, next };
-const MentionSearchKind = enum { file, skill };
+pub const MentionSearchKind = enum { file, skill };
 
 const DiffCounts = struct {
     additions: u32 = 0,
@@ -261,12 +262,7 @@ pub const App = struct {
     /// edit/submit. See `RootWidget.captureEvent`.
     block_nav: bool = false,
     input_wrap_width: u16 = 0,
-    at_active: bool = false,
-    at_query: []u8 = "",
-    at_results: std.ArrayList([]const u8) = .empty,
-    at_selection: u32 = 0,
-    at_indexing: bool = false,
-    at_kind: MentionSearchKind = .file,
+    at_search: app_state.AtSearchState = .{},
     /// Shared manager for `run_in_background` bash commands. Heap-allocated (so
     /// its address is stable for the agents that borrow it) and owned here; null
     /// on the headless/test path. See `background.zig`.
@@ -488,23 +484,23 @@ pub const App = struct {
     }
 
     pub fn isAtSearchActive(self: *const App) bool {
-        return self.at_active;
+        return self.at_search.active;
     }
 
     pub fn atSearchHasResults(self: *const App) bool {
-        return self.at_results.items.len > 0;
+        return self.at_search.results.items.len > 0;
     }
 
     pub fn getAtSelection(self: *const App) u32 {
-        return self.at_selection;
+        return self.at_search.selection;
     }
 
     pub fn setAtSelection(self: *App, v: u32) void {
-        self.at_selection = v;
+        self.at_search.selection = v;
     }
 
     pub fn atResultsLen(self: *const App) usize {
-        return self.at_results.items.len;
+        return self.at_search.results.items.len;
     }
 
     pub fn threadsCount(self: *const App) usize {
@@ -607,7 +603,7 @@ pub const App = struct {
             self.cached_config_owned = false;
         }
         self.closeAtSearch();
-        self.at_results.deinit(self.gpa);
+        self.at_search.results.deinit(self.gpa);
         self.clearLanesState();
         for (self.threads.items) |lane| {
             lane.deinit(self.gpa);
@@ -2415,13 +2411,13 @@ pub const App = struct {
 
     fn setMentionSearch(self: *App, kind: MentionSearchKind, query: []const u8) !void {
         if (kind == .file) self.startAtSearchBackend();
-        self.at_active = true;
-        if (kind != self.at_kind or !std.mem.eql(u8, query, self.at_query)) {
+        self.at_search.active = true;
+        if (kind != self.at_search.kind or !std.mem.eql(u8, query, self.at_search.query)) {
             const owned: []u8 = if (query.len > 0) try self.gpa.dupe(u8, query) else "";
-            if (self.at_query.len > 0) self.gpa.free(self.at_query);
-            self.at_kind = kind;
-            self.at_query = owned;
-            self.at_selection = 0;
+            if (self.at_search.query.len > 0) self.gpa.free(self.at_search.query);
+            self.at_search.kind = kind;
+            self.at_search.query = owned;
+            self.at_search.selection = 0;
             try self.refreshAtResults();
         }
     }
@@ -2433,20 +2429,20 @@ pub const App = struct {
 
     fn refreshAtResults(self: *App) !void {
         self.clearAtResults();
-        self.at_indexing = false;
-        switch (self.at_kind) {
+        self.at_search.indexing = false;
+        switch (self.at_search.kind) {
             .file => try self.refreshFileResults(),
             .skill => try self.refreshSkillResults(),
         }
     }
 
     fn refreshFileResults(self: *App) !void {
-        if (self.at_query.len == 0) return;
+        if (self.at_search.query.len == 0) return;
         var result = (try search_mod.runIfReady(self.gpa, self.io, .{
             .op = .find,
-            .query = self.at_query,
+            .query = self.at_search.query,
         })) orelse {
-            self.at_indexing = true;
+            self.at_search.indexing = true;
             return;
         };
         defer result.deinit(self.gpa);
@@ -2455,41 +2451,41 @@ pub const App = struct {
 
     fn refreshSkillResults(self: *App) !void {
         const runtime = self.liveRuntime() orelse return;
-        const names = try skill_mod.filterNames(self.gpa, runtime.skills, self.at_query);
+        const names = try skill_mod.filterNames(self.gpa, runtime.skills, self.at_search.query);
         errdefer {
             for (names) |name| self.gpa.free(name);
             self.gpa.free(names);
         }
-        for (names) |name| try self.at_results.append(self.gpa, name);
+        for (names) |name| try self.at_search.results.append(self.gpa, name);
         self.gpa.free(names);
-        if (self.at_selection >= self.at_results.items.len) self.at_selection = 0;
+        if (self.at_search.selection >= self.at_search.results.items.len) self.at_search.selection = 0;
     }
 
     fn parseAtResults(self: *App, stdout: []const u8) !void {
         const max_results = 50;
         var iter = std.mem.splitScalar(u8, stdout, '\n');
         while (iter.next()) |line| {
-            if (self.at_results.items.len >= max_results) break;
+            if (self.at_search.results.items.len >= max_results) break;
             if (line.len == 0) continue;
             if (isSearchFooter(line)) continue;
             if (line[line.len - 1] == '/') continue; // directory: `@` loads files
             const owned = try self.gpa.dupe(u8, line);
             errdefer self.gpa.free(owned);
-            try self.at_results.append(self.gpa, owned);
+            try self.at_search.results.append(self.gpa, owned);
         }
-        if (self.at_selection >= self.at_results.items.len) self.at_selection = 0;
+        if (self.at_search.selection >= self.at_search.results.items.len) self.at_search.selection = 0;
     }
 
     /// Replace the active mention token with the selected path or skill name.
     pub fn acceptAtSelection(self: *App) !void {
-        if (self.at_selection >= self.at_results.items.len) return;
+        if (self.at_search.selection >= self.at_search.results.items.len) return;
         const before = self.input.buf.firstHalf();
-        const active_start = switch (self.at_kind) {
+        const active_start = switch (self.at_search.kind) {
             .file => if (at_mention.activeQuery(before)) |active| active.start else return,
             .skill => if (skill_mod.activeQuery(before)) |active| active.start else return,
         };
-        const value = self.at_results.items[self.at_selection];
-        const sigil: u8 = if (self.at_kind == .file) '@' else '$';
+        const value = self.at_search.results.items[self.at_search.selection];
+        const sigil: u8 = if (self.at_search.kind == .file) '@' else '$';
         const insert = try std.fmt.allocPrint(self.gpa, "{c}{s} ", .{ sigil, value });
         defer self.gpa.free(insert);
         self.input.buf.growGapLeft(before.len - active_start);
@@ -2498,19 +2494,19 @@ pub const App = struct {
     }
 
     fn clearAtResults(self: *App) void {
-        for (self.at_results.items) |path| self.gpa.free(path);
-        self.at_results.clearRetainingCapacity();
+        for (self.at_search.results.items) |path| self.gpa.free(path);
+        self.at_search.results.clearRetainingCapacity();
     }
 
     pub fn closeAtSearch(self: *App) void {
-        self.at_active = false;
-        self.at_indexing = false;
-        self.at_selection = 0;
-        self.at_kind = .file;
+        self.at_search.active = false;
+        self.at_search.indexing = false;
+        self.at_search.selection = 0;
+        self.at_search.kind = .file;
         self.clearAtResults();
-        if (self.at_query.len > 0) {
-            self.gpa.free(self.at_query);
-            self.at_query = "";
+        if (self.at_search.query.len > 0) {
+            self.gpa.free(self.at_search.query);
+            self.at_search.query = "";
         }
     }
 
@@ -4016,7 +4012,7 @@ pub const RootWidget = struct {
         const overlay_visible = self.app.mode != .normal;
         const permission_visible = self.app.permissionPending() and !overlay_visible;
         const background_visible = self.app.background_modal and !overlay_visible and !permission_visible;
-        const at_visible = self.app.at_active and !overlay_visible and !permission_visible and !background_visible;
+        const at_visible = self.app.at_search.active and !overlay_visible and !permission_visible and !background_visible;
 
         var child_count: usize = (if (split) self.app.threads.items.len else 1) + 1;
         if (loading_visible) child_count += 1;
@@ -4115,7 +4111,7 @@ pub const RootWidget = struct {
         }
         if (at_visible) {
             var at_view: AtSearchWidget = .{ .app = self.app };
-            const panel_height = at_search.panelHeight(self.app.at_results.items.len);
+            const panel_height = at_search.panelHeight(self.app.at_search.results.items.len);
             const panel_width = @min(@as(u16, 72), max_width);
             children[idx] = .{
                 .origin = .{ .row = layout.input_row -| panel_height, .col = 0 },
@@ -5283,12 +5279,12 @@ const AtSearchWidget = struct {
     fn drawAtSearch(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *AtSearchWidget = @ptrCast(@alignCast(ptr));
         var content: at_search.Content = .{
-            .results = self.app.at_results.items,
-            .selection = self.app.at_selection,
-            .query = self.app.at_query,
-            .indexing = self.app.at_indexing,
-            .sigil = if (self.app.at_kind == .file) '@' else '$',
-            .title = if (self.app.at_kind == .file) "Files" else "Skills",
+            .results = self.app.at_search.results.items,
+            .selection = self.app.at_search.selection,
+            .query = self.app.at_search.query,
+            .indexing = self.app.at_search.indexing,
+            .sigil = if (self.app.at_search.kind == .file) '@' else '$',
+            .title = if (self.app.at_search.kind == .file) "Files" else "Skills",
         };
         return content.widget().draw(ctx);
     }
