@@ -368,3 +368,60 @@ pub fn closeDiff(root: *RootWidget, ctx: *vxfw.EventContext, send: bool) !void {
     }
     ctx.consumeAndRedraw();
 }
+
+/// Route keys while the `/diff` file-search popup is open. Esc/Enter exit
+/// the search (Enter jumps to the selected file); ↑↓ scroll the match list.
+/// Typed text / backspace bubble to the focused palette input.
+pub fn handleDiffSearchKey(root: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+    const app = root.app;
+    if (key.matches(vaxis.Key.escape, .{})) {
+        app.diff.sub = .browse;
+        try RootWidget.syncFocus(root, ctx);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (key.matches(vaxis.Key.enter, .{})) {
+        const matches = app.diff.search_matches.items;
+        if (matches.len > 0) app.diff.jumpToFile(matches[@min(app.diff.search_sel, matches.len - 1)]);
+        app.diff.sub = .browse;
+        try RootWidget.syncFocus(root, ctx);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (key.matches(vaxis.Key.up, .{})) {
+        app.diff.search_sel = tui.previousIndex(app.diff.search_sel, @intCast(app.diff.search_matches.items.len));
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (key.matches(vaxis.Key.down, .{})) {
+        app.diff.search_sel = tui.nextIndex(app.diff.search_sel, @intCast(app.diff.search_matches.items.len));
+        ctx.consumeAndRedraw();
+        return;
+    }
+    // Typed text / backspace bubbles to the focused palette input; its
+    // onChange (paletteInputChanged) refilters the match list.
+}
+
+/// Route keys while the `/diff` comment editor is focused. Esc discards the
+/// draft and returns to browse mode; Ctrl+S / Enter saves the comment.
+pub fn handleDiffCommentKey(root: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+    const app = root.app;
+    if (key.matches(vaxis.Key.escape, .{})) {
+        app.diff.sub = .browse;
+        app.diff.sel_anchor = null;
+        app.inputs.comment.clearRetainingCapacity();
+        try RootWidget.syncFocus(root, ctx);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (key.matches('s', .{ .ctrl = true }) or key.matches(vaxis.Key.enter, .{})) {
+        const draft = try app.peekCommentInput();
+        defer app.gpa.free(draft);
+        _ = try app.diff.saveComment(app.gpa, draft);
+        app.inputs.comment.clearRetainingCapacity();
+        try RootWidget.syncFocus(root, ctx);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    // Typed text / backspace handled by the focused comment input.
+}

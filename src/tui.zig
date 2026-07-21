@@ -2451,7 +2451,7 @@ pub const App = struct {
         self.inputs.palette.clearRetainingCapacity();
     }
 
-    fn peekCommentInput(self: *App) ![]u8 {
+    pub fn peekCommentInput(self: *App) ![]u8 {
         const left = self.inputs.comment.buf.firstHalf();
         const right = self.inputs.comment.buf.secondHalf();
         const out = try self.gpa.alloc(u8, left.len + right.len);
@@ -3657,55 +3657,11 @@ pub const RootWidget = struct {
     }
 
     fn handleDiffSearchKey(self: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
-        const app = self.app;
-        if (key.matches(vaxis.Key.escape, .{})) {
-            app.diff.sub = .browse;
-            try self.syncFocus(ctx);
-            ctx.consumeAndRedraw();
-            return;
-        }
-        if (key.matches(vaxis.Key.enter, .{})) {
-            const matches = app.diff.search_matches.items;
-            if (matches.len > 0) app.diff.jumpToFile(matches[@min(app.diff.search_sel, matches.len - 1)]);
-            app.diff.sub = .browse;
-            try self.syncFocus(ctx);
-            ctx.consumeAndRedraw();
-            return;
-        }
-        if (key.matches(vaxis.Key.up, .{})) {
-            app.diff.search_sel = previousIndex(app.diff.search_sel, @intCast(app.diff.search_matches.items.len));
-            ctx.consumeAndRedraw();
-            return;
-        }
-        if (key.matches(vaxis.Key.down, .{})) {
-            app.diff.search_sel = nextIndex(app.diff.search_sel, @intCast(app.diff.search_matches.items.len));
-            ctx.consumeAndRedraw();
-            return;
-        }
-        // Typed text / backspace bubbles to the focused palette input; its
-        // onChange (paletteInputChanged) refilters the match list.
+        try lifecycle.handleDiffSearchKey(self, ctx, key);
     }
 
     fn handleDiffCommentKey(self: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
-        const app = self.app;
-        if (key.matches(vaxis.Key.escape, .{})) {
-            app.diff.sub = .browse;
-            app.diff.sel_anchor = null;
-            app.inputs.comment.clearRetainingCapacity();
-            try self.syncFocus(ctx);
-            ctx.consumeAndRedraw();
-            return;
-        }
-        if (key.matches('s', .{ .ctrl = true }) or key.matches(vaxis.Key.enter, .{})) {
-            const draft = try app.peekCommentInput();
-            defer app.gpa.free(draft);
-            _ = try app.diff.saveComment(app.gpa, draft);
-            app.inputs.comment.clearRetainingCapacity();
-            try self.syncFocus(ctx);
-            ctx.consumeAndRedraw();
-            return;
-        }
-        // Typed text / backspace handled by the focused comment input.
+        try lifecycle.handleDiffCommentKey(self, ctx, key);
     }
 
     fn closeDiff(self: *RootWidget, ctx: *vxfw.EventContext, send: bool) !void {
