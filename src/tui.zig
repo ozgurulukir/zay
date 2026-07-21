@@ -171,11 +171,7 @@ pub const App = struct {
     resume_global: bool = false,
     resume_summaries: std.ArrayList(session_mod.SessionSummary) = .empty,
     resume_folded_projects: std.ArrayList([]u8) = .empty,
-    tree_state: tree_selector.TreeState,
-    /// All model/provider/selection state for the model picker — fetched
-    /// lists, selection cursor/column/scope, and the async-load handle.
-    models: model_catalogue.ModelCatalogue = .{},
-    provider_picker: provider_picker.State = .{},
+    pickers: app_state.PickerStates,
     codex_signed_in: bool = false,
     /// Stored API keys for catalogue providers (label -> key), mirrored from
     /// `~/.nova/auth.json`. Drives the picker's [CONNECTED] badges and supplies
@@ -307,7 +303,7 @@ pub const App = struct {
             .threads = threads,
             .thread = primary,
             .inputs = .{ .input = .init(gpa), .palette = .init(gpa), .comment = .init(gpa) },
-            .tree_state = .init(gpa),
+            .pickers = .{ .tree = .init(gpa) },
         };
     }
 
@@ -397,11 +393,11 @@ pub const App = struct {
     }
 
     pub fn getTreeState(self: *App) *tree_selector.TreeState {
-        return &self.tree_state;
+        return &self.pickers.tree;
     }
 
     pub fn getProviderPicker(self: *App) *provider_picker.State {
-        return &self.provider_picker;
+        return &self.pickers.provider;
     }
 
     pub fn getProviderKeyInput(self: *App) *std.ArrayList(u8) {
@@ -409,7 +405,7 @@ pub const App = struct {
     }
 
     pub fn getModels(self: *App) *model_catalogue.ModelCatalogue {
-        return &self.models;
+        return &self.pickers.models;
     }
 
     pub fn toggleResumeGlobal(self: *App) void {
@@ -583,13 +579,13 @@ pub const App = struct {
         self.resumeClear();
         self.resumeClearFolds();
         self.resume_folded_projects.deinit(self.gpa);
-        self.tree_state.deinit();
+        self.pickers.tree.deinit();
         self.cancelDiffRefresh();
         // Non-empty labels are always heap-allocated by `loadGitLabel`; the
         // empty default is a literal, so guard on length before freeing.
         if (self.git_label.len > 0) self.gpa.free(self.git_label);
         if (self.diff_cache) |raw| self.gpa.free(raw);
-        self.models.deinit(self.gpa);
+        self.pickers.models.deinit(self.gpa);
         codex.freeApiKeyMap(self.gpa, &self.provider_api_keys);
         self.provider_key_input.deinit(self.gpa);
         if (self.cached_config_owned) {
@@ -1212,7 +1208,7 @@ pub const App = struct {
     fn syncModeWithInput(self: *App, value: []const u8) !void {
         // While typing an API key in the provider form, the input is the key —
         // never reinterpret a leading '/' as a command.
-        if (self.mode == .provider_picker and self.provider_picker.stage == .form) return;
+        if (self.mode == .provider_picker and self.pickers.provider.stage == .form) return;
         if (self.mode == .session_picker or self.mode == .provider_picker or self.mode == .model_picker or self.mode == .tree_picker) {
             if (value.len > 0 and value[0] == command_prefix) {
                 self.mode = .command;
@@ -1236,9 +1232,9 @@ pub const App = struct {
     pub fn cancelMode(self: *App) !bool {
         if (self.mode == .normal) return false;
         // Esc inside the provider setup form returns to the provider list.
-        if (self.mode == .provider_picker and self.provider_picker.stage == .form) {
-            self.provider_picker.stage = .list;
-            self.provider_picker.form_provider = null;
+        if (self.mode == .provider_picker and self.pickers.provider.stage == .form) {
+            self.pickers.provider.stage = .list;
+            self.pickers.provider.form_provider = null;
             self.provider_key_input.clearRetainingCapacity();
             return true;
         }
@@ -1266,17 +1262,17 @@ pub const App = struct {
     }
 
     fn revertModelPickerSnapshot(self: *App) !void {
-        self.models.restore();
+        self.pickers.models.restore();
     }
 
     fn submitMode(self: *App) !bool {
         if (self.mode == .provider_picker) {
-            if (self.provider_picker.stage == .form) {
-                const provider = self.provider_picker.form_provider orelse return true;
+            if (self.pickers.provider.stage == .form) {
+                const provider = self.pickers.provider.form_provider orelse return true;
                 self.submitProviderSetup(provider) catch |err| try self.reportConnectionError(err);
                 return true;
             }
-            switch (self.provider_picker.selectedAction()) {
+            switch (self.pickers.provider.selectedAction()) {
                 .connect_codex => self.connectCodex() catch |err| try self.reportConnectionError(err),
                 .sign_out_codex => {
                     if (self.isCodexSignedIn()) {
@@ -1290,7 +1286,7 @@ pub const App = struct {
             return true;
         }
         if (self.mode == .model_picker) {
-            if (self.models.len() == 0) return true;
+            if (self.pickers.models.len() == 0) return true;
             self.applySelectedModel() catch |err| try self.reportConnectionError(err);
             return true;
         }
@@ -1303,9 +1299,9 @@ pub const App = struct {
             return true;
         }
         if (self.mode == .tree_picker) {
-            if (self.tree_state.selectedNavigationId()) |id| {
+            if (self.pickers.tree.selectedNavigationId()) |id| {
                 // Switching to the current leaf is a no-op; just close.
-                if (!self.tree_state.selectedIsLeaf()) {
+                if (!self.pickers.tree.selectedIsLeaf()) {
                     var buffer: [session_mod.entry_id_len]u8 = undefined;
                     @memcpy(buffer[0..], id);
                     self.navigateToEntry(buffer[0..]) catch |err| {
@@ -1383,7 +1379,7 @@ pub const App = struct {
 
     fn openProviderPicker(self: *App) !void {
         self.mode = .provider_picker;
-        self.provider_picker.reset();
+        self.pickers.provider.reset();
         self.clearInput();
         self.clearPaletteInput();
         try self.refreshProviderApiKeys();
@@ -1427,8 +1423,8 @@ pub const App = struct {
     }
 
     fn openProviderForm(self: *App, provider: config_mod.Provider) void {
-        self.provider_picker.stage = .form;
-        self.provider_picker.form_provider = provider;
+        self.pickers.provider.stage = .form;
+        self.pickers.provider.form_provider = provider;
         self.provider_key_input.clearRetainingCapacity();
     }
 
@@ -1509,12 +1505,12 @@ pub const App = struct {
 
     fn openModelPicker(self: *App) !void {
         self.mode = .model_picker;
-        self.models.model_column = .model;
-        self.models.model_selection = 0;
-        self.models.model_scope = self.defaultModelScope();
+        self.pickers.models.model_column = .model;
+        self.pickers.models.model_selection = 0;
+        self.pickers.models.model_scope = self.defaultModelScope();
         self.clearInput();
 
-        if (self.models.models_cached and self.models.len() > 0) {
+        if (self.pickers.models.models_cached and self.pickers.models.len() > 0) {
             try self.finishModelCatalogReload();
             try self.snapshotModelPickerState();
             return;
@@ -1534,13 +1530,13 @@ pub const App = struct {
 
         // Cold path — clear stale state, kick off the async load.
         self.codexModelsClear();
-        self.models.reasoning_snapshot.clearRetainingCapacity();
-        self.models.model_selection_snapshot = 0;
+        self.pickers.models.reasoning_snapshot.clearRetainingCapacity();
+        self.pickers.models.model_selection_snapshot = 0;
         try self.startModelLoad(.connected_provider, false);
     }
 
     fn snapshotModelPickerState(self: *App) !void {
-        try self.models.snapshot(self.gpa);
+        try self.pickers.models.snapshot(self.gpa);
     }
 
     pub fn startModelLoad(self: *App, catalog: ModelCatalog, merge: bool) !void {
@@ -1549,9 +1545,9 @@ pub const App = struct {
         // result is authoritative for all badges; an openai_codex load touches no
         // catalogue providers and must not reset them.
         self.conn_recompute = catalog == .connected_provider;
-        if (self.models.model_load_error) |message| {
+        if (self.pickers.models.model_load_error) |message| {
             self.gpa.free(message);
-            self.models.model_load_error = null;
+            self.pickers.models.model_load_error = null;
         }
 
         const job = try self.gpa.create(model_loader.Job);
@@ -1576,12 +1572,12 @@ pub const App = struct {
             .configured = configured,
             .include_locals = catalog == .connected_provider,
             .codex_signed_in = self.isCodexSignedIn(),
-            .done = &self.models.model_load_done,
+            .done = &self.pickers.models.model_load_done,
         };
 
-        self.models.model_load_merge = merge;
-        self.models.model_load_done.store(false, .release);
-        self.models.model_load_future = try self.io.concurrent(model_loader.run, .{job});
+        self.pickers.models.model_load_merge = merge;
+        self.pickers.models.model_load_done.store(false, .release);
+        self.pickers.models.model_load_future = try self.io.concurrent(model_loader.run, .{job});
     }
 
     /// Every OpenAI-compatible provider to fetch for a full catalogue reload:
@@ -1633,38 +1629,38 @@ pub const App = struct {
     }
 
     fn cancelModelLoad(self: *App) void {
-        if (self.models.model_load_future) |*future| {
+        if (self.pickers.models.model_load_future) |*future| {
             var outcome = future.cancel(self.io);
             outcome.deinit(self.gpa);
-            self.models.model_load_future = null;
+            self.pickers.models.model_load_future = null;
         }
-        self.models.model_load_done.store(false, .release);
+        self.pickers.models.model_load_done.store(false, .release);
     }
 
     /// Called from the tick handler. Polls the non-blocking `done` flag, and
     /// only `await`s once the worker has signalled completion. Returns true
     /// if a redraw is needed.
     fn drainModelLoad(self: *App) !bool {
-        if (self.models.model_load_future == null) return false;
-        if (!self.models.model_load_done.load(.acquire)) return false;
+        if (self.pickers.models.model_load_future == null) return false;
+        if (!self.pickers.models.model_load_done.load(.acquire)) return false;
 
-        var outcome = self.models.model_load_future.?.await(self.io);
-        self.models.model_load_future = null;
-        self.models.model_load_done.store(false, .release);
+        var outcome = self.pickers.models.model_load_future.?.await(self.io);
+        self.pickers.models.model_load_future = null;
+        self.pickers.models.model_load_done.store(false, .release);
         defer outcome.deinit(self.gpa);
 
         switch (outcome) {
             .ready => |*result| try self.installModelLoadResult(result),
             .failed => |message| {
-                if (self.models.model_load_error) |old| self.gpa.free(old);
-                self.models.model_load_error = try self.gpa.dupe(u8, message);
+                if (self.pickers.models.model_load_error) |old| self.gpa.free(old);
+                self.pickers.models.model_load_error = try self.gpa.dupe(u8, message);
             },
         }
         return true;
     }
 
     fn installModelLoadResult(self: *App, result: *model_loader.Result) !void {
-        if (self.models.model_load_merge) {
+        if (self.pickers.models.model_load_merge) {
             // Incremental load: replace only the freshly-fetched providers'
             // models, leaving previously-cached providers untouched.
             var refreshed = std.EnumSet(config_mod.Provider).initEmpty();
@@ -1685,23 +1681,23 @@ pub const App = struct {
         // are built in lockstep, so they zip into one entry each.
         std.debug.assert(result.models.items.len == result.sources.items.len);
         for (result.models.items, result.sources.items) |*model, source| {
-            try self.models.append(self.gpa, model.*, source);
+            try self.pickers.models.append(self.gpa, model.*, source);
         }
         result.models.clearRetainingCapacity();
         result.sources.clearRetainingCapacity();
-        self.models.model_load_merge = false;
+        self.pickers.models.model_load_merge = false;
         // Same fetch that built the catalogue also tells us which providers are
         // reachable — drive the picker badges from it.
         self.applyProviderOutcomes(result.outcomes.items);
         try self.finishModelCatalogReload();
         try self.snapshotModelPickerState();
-        self.models.models_cached = true;
+        self.pickers.models.models_cached = true;
         self.saveModelCache() catch |err| std.log.warn("models.cache.save.failed err={s}", .{@errorName(err)});
     }
 
     /// Remove every cached model that came from `provider`.
     fn dropModelsForProvider(self: *App, provider: config_mod.Provider) void {
-        self.models.dropProvider(self.gpa, provider);
+        self.pickers.models.dropProvider(self.gpa, provider);
     }
 
     fn restoreModelCache(self: *App) !bool {
@@ -1716,15 +1712,15 @@ pub const App = struct {
 
         self.codexModelsClear();
         for (cached.items.items) |*record| {
-            try self.models.append(self.gpa, record.model, record.source);
+            try self.pickers.models.append(self.gpa, record.model, record.source);
             record.model = .{ .id = &.{}, .label = &.{} };
         }
         if (self.isCodexSignedIn()) try self.loadCodexStaticCatalog();
-        if (self.models.len() == 0) return false;
+        if (self.pickers.models.len() == 0) return false;
 
         try self.finishModelCatalogReload();
         try self.snapshotModelPickerState();
-        self.models.models_cached = true;
+        self.pickers.models.models_cached = true;
         return true;
     }
 
@@ -1736,9 +1732,9 @@ pub const App = struct {
         defer configured.deinit(self.gpa);
         if (configured.items.len == 0) return;
 
-        const records = try self.gpa.alloc(model_cache.Record, self.models.entries.items.len);
+        const records = try self.gpa.alloc(model_cache.Record, self.pickers.models.entries.items.len);
         defer self.gpa.free(records);
-        for (self.models.entries.items, 0..) |entry, index| {
+        for (self.pickers.models.entries.items, 0..) |entry, index| {
             records[index] = .{ .model = entry.model, .source = entry.source };
         }
         try model_cache.save(self.gpa, self.io, runtime.home_dir, records, configured.items);
@@ -1786,7 +1782,7 @@ pub const App = struct {
         if (self.thread.turn.isActive()) return error.InFlightTurn;
         var credentials = try codex.login(self.gpa, self.io, self.liveRuntime().?.home_dir);
         defer credentials.deinit(self.gpa);
-        self.models.models_cached = false;
+        self.pickers.models.models_cached = false;
         try self.reloadModelCatalog(.openai_codex);
         const model = self.selectedCodexModel() orelse return error.NoModels;
         const effort = self.selectedReasoningEffort();
@@ -1809,7 +1805,7 @@ pub const App = struct {
         self.liveRuntime().?.codex_connection_expired = false;
         self.thread.agent.?.client = self.liveRuntime().?.client;
         self.codexModelsClear();
-        self.models.models_cached = false;
+        self.pickers.models.models_cached = false;
         self.mode = .normal;
         self.clearInput();
         _ = try self.thread.transcript.append(self.gpa, .agent, "agent", "Signed out from OpenAI Codex.");
@@ -1841,16 +1837,16 @@ pub const App = struct {
         // `connect_key` may alias the input buffer — fetch (which dupes it) first.
         try self.startProviderModelLoad(provider, connect_key);
 
-        self.provider_picker.stage = .list;
-        self.provider_picker.form_provider = null;
+        self.pickers.provider.stage = .list;
+        self.pickers.provider.form_provider = null;
         self.provider_key_input.clearRetainingCapacity();
 
         self.mode = .model_picker;
-        self.models.model_column = .model;
-        self.models.model_selection = 0;
-        self.models.model_scope = self.defaultModelScope();
-        self.models.reasoning_snapshot.clearRetainingCapacity();
-        self.models.model_selection_snapshot = 0;
+        self.pickers.models.model_column = .model;
+        self.pickers.models.model_selection = 0;
+        self.pickers.models.model_scope = self.defaultModelScope();
+        self.pickers.models.reasoning_snapshot.clearRetainingCapacity();
+        self.pickers.models.model_selection_snapshot = 0;
         self.clearInput();
         self.clearPaletteInput();
     }
@@ -1861,9 +1857,9 @@ pub const App = struct {
         // Single provider: its outcome updates only this provider's badge, never
         // a full recompute that would wipe the others.
         self.conn_recompute = false;
-        if (self.models.model_load_error) |message| {
+        if (self.pickers.models.model_load_error) |message| {
             self.gpa.free(message);
-            self.models.model_load_error = null;
+            self.pickers.models.model_load_error = null;
         }
 
         const base_url_default = provider.defaultBaseUrl() orelse return error.NotConnected;
@@ -1886,12 +1882,12 @@ pub const App = struct {
             .configured = configured,
             .include_locals = false,
             .codex_signed_in = self.isCodexSignedIn(),
-            .done = &self.models.model_load_done,
+            .done = &self.pickers.models.model_load_done,
         };
 
-        self.models.model_load_merge = true;
-        self.models.model_load_done.store(false, .release);
-        self.models.model_load_future = try self.io.concurrent(model_loader.run, .{job});
+        self.pickers.models.model_load_merge = true;
+        self.pickers.models.model_load_done.store(false, .release);
+        self.pickers.models.model_load_future = try self.io.concurrent(model_loader.run, .{job});
     }
 
     fn applySelectedModel(self: *App) !void {
@@ -1909,7 +1905,7 @@ pub const App = struct {
                     defer credentials.deinit(self.gpa);
                     try self.connectCodexClient(credentials, model.id, effort);
                     self.codex_signed_in = true;
-                    try self.persistModelSelection(.openai, model.id, effort, self.models.model_scope);
+                    try self.persistModelSelection(.openai, model.id, effort, self.pickers.models.model_scope);
                 } else {
                     return error.NotConnected;
                 }
@@ -1919,7 +1915,7 @@ pub const App = struct {
                 const api_key = self.compatibleApiKey(provider);
                 if (api_key.len == 0 and provider.requiresApiKey()) return error.NotConnected;
                 try self.attachOpenAiCompatibleClient(base_url, api_key, model.id, effort);
-                try self.persistModelSelection(provider, model.id, effort, self.models.model_scope);
+                try self.persistModelSelection(provider, model.id, effort, self.pickers.models.model_scope);
             },
         }
         self.mode = .normal;
@@ -2038,7 +2034,7 @@ pub const App = struct {
     }
 
     fn finishModelCatalogReload(self: *App) !void {
-        self.models.resetReasoning();
+        self.pickers.models.resetReasoning();
     }
 
     fn activeModelId(self: *const App) ?[]const u8 {
@@ -2050,7 +2046,7 @@ pub const App = struct {
         const models = try codex.loadStaticModels(self.gpa);
         defer self.gpa.free(models);
         for (models) |*model| {
-            try self.models.append(self.gpa, model.*, .openai_codex);
+            try self.pickers.models.append(self.gpa, model.*, .openai_codex);
             model.* = .{ .id = &.{}, .label = &.{} };
         }
         for (models) |*model| {
@@ -2060,14 +2056,14 @@ pub const App = struct {
     }
 
     fn loadCompatibleCatalog(self: *App) !void {
-        if (!self.models.compatible_models_fetched) try self.fetchCompatibleCatalog();
+        if (!self.pickers.models.compatible_models_fetched) try self.fetchCompatibleCatalog();
         const provider = tui_provider.compatibleProviderFromBaseUrl(self.cached_config.base_url.?);
-        for (self.models.compatible_models.items) |model| {
+        for (self.pickers.models.compatible_models.items) |model| {
             const id = try self.gpa.dupe(u8, model.id);
             errdefer self.gpa.free(id);
             const label = try self.gpa.dupe(u8, model.label);
             errdefer self.gpa.free(label);
-            try self.models.append(self.gpa, .{ .id = id, .label = label }, .{ .openai_compatible = provider });
+            try self.pickers.models.append(self.gpa, .{ .id = id, .label = label }, .{ .openai_compatible = provider });
         }
     }
 
@@ -2090,12 +2086,12 @@ pub const App = struct {
             errdefer self.gpa.free(id);
             const label = try localModelLabel(self.gpa, provider, entry.id);
             errdefer self.gpa.free(label);
-            try self.models.append(self.gpa, .{ .id = id, .label = label }, .{ .openai_compatible = provider });
+            try self.pickers.models.append(self.gpa, .{ .id = id, .label = label }, .{ .openai_compatible = provider });
         }
     }
 
     fn fetchCompatibleCatalog(self: *App) !void {
-        std.debug.assert(!self.models.compatible_models_fetched);
+        std.debug.assert(!self.pickers.models.compatible_models_fetched);
         const base_url = self.cached_config.base_url.?;
         const api_key = self.cached_config.api_key.?;
         const provider = self.cached_config.provider orelse tui_provider.compatibleProviderFromBaseUrl(base_url);
@@ -2111,15 +2107,15 @@ pub const App = struct {
             errdefer self.gpa.free(id);
             const label = try self.gpa.dupe(u8, entry.id);
             errdefer self.gpa.free(label);
-            try self.models.compatible_models.append(self.gpa, .{ .id = id, .label = label });
+            try self.pickers.models.compatible_models.append(self.gpa, .{ .id = id, .label = label });
         }
-        self.models.compatible_models_fetched = true;
+        self.pickers.models.compatible_models_fetched = true;
     }
 
     fn compatibleModelsCacheClear(self: *App) void {
-        for (self.models.compatible_models.items) |*model| model.deinit(self.gpa);
-        self.models.compatible_models.clearRetainingCapacity();
-        self.models.compatible_models_fetched = false;
+        for (self.pickers.models.compatible_models.items) |*model| model.deinit(self.gpa);
+        self.pickers.models.compatible_models.clearRetainingCapacity();
+        self.pickers.models.compatible_models_fetched = false;
     }
 
     fn hasOpenAICompatibleCredentials(self: *const App) bool {
@@ -2181,8 +2177,8 @@ pub const App = struct {
     }
 
     fn selectedReasoningIndex(self: *const App) u32 {
-        if (self.models.model_selection >= self.models.len()) return 0;
-        return self.models.entries.items[self.models.model_selection].reasoning_index;
+        if (self.pickers.models.model_selection >= self.pickers.models.len()) return 0;
+        return self.pickers.models.entries.items[self.pickers.models.model_selection].reasoning_index;
     }
 
     fn selectedReasoningEffort(self: *const App) ai.ReasoningEffort {
@@ -2190,7 +2186,7 @@ pub const App = struct {
     }
 
     pub fn cycleModelScope(self: *App) void {
-        self.models.model_scope = switch (self.models.model_scope) {
+        self.pickers.models.model_scope = switch (self.pickers.models.model_scope) {
             .global => .project,
             .project => .session,
             .session => .global,
@@ -2198,29 +2194,29 @@ pub const App = struct {
     }
 
     pub fn cycleSelectedReasoning(self: *App) !void {
-        if (self.models.model_selection >= self.models.len()) return;
-        const entry = &self.models.entries.items[self.models.model_selection];
+        if (self.pickers.models.model_selection >= self.pickers.models.len()) return;
+        const entry = &self.pickers.models.entries.items[self.pickers.models.model_selection];
         entry.reasoning_index = nextIndex(entry.reasoning_index, @intCast(reasoningOptions().len));
     }
 
     fn selectedCodexModel(self: *App) ?codex.Model {
-        if (self.models.model_selection >= self.models.len()) return null;
-        const active_storage_idx = self.models.activeStorageIdx(self.activeModelId());
-        const idx = model_picker.displayToStorage(active_storage_idx, self.models.model_selection);
-        return self.models.entries.items[idx].model;
+        if (self.pickers.models.model_selection >= self.pickers.models.len()) return null;
+        const active_storage_idx = self.pickers.models.activeStorageIdx(self.activeModelId());
+        const idx = model_picker.displayToStorage(active_storage_idx, self.pickers.models.model_selection);
+        return self.pickers.models.entries.items[idx].model;
     }
 
     fn modelDisplayMatches(self: *const App, display_pos: u32, filter: []const u8) bool {
-        const count: u32 = self.models.len();
+        const count: u32 = self.pickers.models.len();
         if (display_pos >= count) return false;
-        const active = self.models.activeStorageIdx(self.activeModelId());
+        const active = self.pickers.models.activeStorageIdx(self.activeModelId());
         const storage = model_picker.displayToStorage(active, display_pos);
         if (storage >= count) return false;
-        return model_picker.matches(self.models.entries.items[storage].model, filter);
+        return model_picker.matches(self.pickers.models.entries.items[storage].model, filter);
     }
 
     fn firstMatchingModelDisplay(self: *const App, filter: []const u8) ?u32 {
-        const count: u32 = self.models.len();
+        const count: u32 = self.pickers.models.len();
         var d: u32 = 0;
         while (d < count) : (d += 1) {
             if (self.modelDisplayMatches(d, filter)) return d;
@@ -2229,31 +2225,31 @@ pub const App = struct {
     }
 
     pub fn stepModelSelection(self: *App, forward: bool) !void {
-        const count: u32 = self.models.len();
+        const count: u32 = self.pickers.models.len();
         if (count == 0) return;
         const filter = try self.peekPaletteInput();
         defer self.gpa.free(filter);
-        var next = self.models.model_selection;
+        var next = self.pickers.models.model_selection;
         var i: u32 = 0;
         while (i < count) : (i += 1) {
             next = if (forward) nextIndex(next, count) else previousIndex(next, count);
             if (self.modelDisplayMatches(next, filter)) {
-                self.models.model_selection = next;
+                self.pickers.models.model_selection = next;
                 return;
             }
         }
     }
 
     fn selectedModelSource(self: *const App) ?ModelSource {
-        if (self.models.model_selection >= self.models.len()) return null;
-        const active_storage_idx = self.models.activeStorageIdx(self.activeModelId());
-        const idx = model_picker.displayToStorage(active_storage_idx, self.models.model_selection);
-        if (idx >= self.models.len()) return null;
-        return self.models.entries.items[idx].source;
+        if (self.pickers.models.model_selection >= self.pickers.models.len()) return null;
+        const active_storage_idx = self.pickers.models.activeStorageIdx(self.activeModelId());
+        const idx = model_picker.displayToStorage(active_storage_idx, self.pickers.models.model_selection);
+        if (idx >= self.pickers.models.len()) return null;
+        return self.pickers.models.entries.items[idx].source;
     }
 
     fn codexModelsClear(self: *App) void {
-        self.models.clearEntries(self.gpa);
+        self.pickers.models.clearEntries(self.gpa);
     }
 
     fn connectCodexClient(
@@ -2353,7 +2349,7 @@ pub const App = struct {
             for (records) |*record| record.deinit(self.gpa);
             self.gpa.free(records);
         }
-        try self.tree_state.load(records, writer.leaf());
+        try self.pickers.tree.load(records, writer.leaf());
     }
 
     /// Switch the session leaf to `entry_id`, then rehydrate the agent's
@@ -3856,7 +3852,7 @@ pub const RootWidget = struct {
             self.blackhole_tick_accum = 0;
         }
 
-        const model_loading = self.app.models.model_load_future != null;
+        const model_loading = self.app.pickers.models.model_load_future != null;
         const diff_loading = self.app.diff_refresh_future != null;
         // Keep ticking while a turn is active OR interrupting, so the worker's
         // remaining events (and its terminal `turn_finished`) get drained.
@@ -3896,7 +3892,7 @@ pub const RootWidget = struct {
             // (e.g. the cold-start "Loading diff…" the /diff command kicked off),
             // or a turn a command started directly (e.g. /sync conflict
             // resolution injects one).
-            if (self.app.thread.turn.isActive() or self.app.models.model_load_future != null or self.app.diff_refresh_future != null) try self.ensureTick(ctx);
+            if (self.app.thread.turn.isActive() or self.app.pickers.models.model_load_future != null or self.app.diff_refresh_future != null) try self.ensureTick(ctx);
             ctx.consumeAndRedraw();
             return;
         }
@@ -3911,7 +3907,7 @@ pub const RootWidget = struct {
         // omits the overlay search field. Focusing the (undrawn) palette input
         // would leave the focus path empty and panic on the next event, so keep
         // focus on the root widget — it owns key handling via captureEvent anyway.
-        if (self.app.mode == .provider_picker and self.app.provider_picker.stage == .form) {
+        if (self.app.mode == .provider_picker and self.app.pickers.provider.stage == .form) {
             try ctx.requestFocus(self.widget());
             return;
         }
@@ -4918,7 +4914,7 @@ pub fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
     return switch (app.mode) {
         .normal => app.inputs.input.buf.realLength() == 0,
         .session_picker, .model_picker, .tree_picker => app.inputs.palette.buf.realLength() == 0,
-        .provider_picker => app.provider_picker.stage == .list and app.inputs.palette.buf.realLength() == 0,
+        .provider_picker => app.pickers.provider.stage == .list and app.inputs.palette.buf.realLength() == 0,
         .command, .diff_viewer, .save_message, .lanes => false,
     };
 }
@@ -5228,11 +5224,11 @@ fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []
             app.syncResumeListCursor();
         },
         .tree_picker => {
-            try app.tree_state.reflattenKeepingSelection(value);
+            try app.pickers.tree.reflattenKeepingSelection(value);
         },
         .model_picker => {
-            if (!app.modelDisplayMatches(app.models.model_selection, value)) {
-                app.models.model_selection = app.firstMatchingModelDisplay(value) orelse 0;
+            if (!app.modelDisplayMatches(app.pickers.models.model_selection, value)) {
+                app.pickers.models.model_selection = app.firstMatchingModelDisplay(value) orelse 0;
             }
         },
         .diff_viewer => {
@@ -5293,7 +5289,7 @@ const OverlayWidget = struct {
 
     fn drawOverlay(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *OverlayWidget = @ptrCast(@alignCast(ptr));
-        const size = if (self.app.mode == .provider_picker and self.app.provider_picker.stage == .form)
+        const size = if (self.app.mode == .provider_picker and self.app.pickers.provider.stage == .form)
             OverlaySize{ .width = 64, .height = 6 }
         else
             overlaySize(self.app.mode);
@@ -5423,7 +5419,7 @@ const OverlayInner = struct {
 
         // The provider setup form hosts its own inline editor, so it skips the
         // shared search row entirely and fills the panel from the top.
-        if (self.app.mode == .provider_picker and self.app.provider_picker.stage == .form) {
+        if (self.app.mode == .provider_picker and self.app.pickers.provider.stage == .form) {
             const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
             children[0] = .{
                 .origin = .{ .row = 0, .col = 0 },
@@ -5505,7 +5501,7 @@ const OverlayInner = struct {
 
     fn drawTreeContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         var content: tree_selector.Content = .{
-            .state = &app.tree_state,
+            .state = &app.pickers.tree,
             .list = &app.tree_list,
         };
         return content.widget().draw(ctx);
@@ -5562,7 +5558,7 @@ const OverlayInner = struct {
 
     fn drawProviderContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         var content: provider_picker.Content = .{
-            .state = app.provider_picker,
+            .state = app.pickers.provider,
             .codex_signed_in = app.isCodexSignedIn(),
             // `conn_status` is indexed by `catalogueProviders()` order, exactly
             // how the picker iterates its rows.
@@ -5579,7 +5575,7 @@ const OverlayInner = struct {
         // Project the consolidated entries into the parallel slices the picker
         // widget consumes. Arena-allocated, rebuilt each draw — cheap, and it
         // keeps the picker decoupled from the catalogue's internal layout.
-        const entries = app.models.entries.items;
+        const entries = app.pickers.models.entries.items;
         const picker_models = try ctx.arena.alloc(codex.Model, entries.len);
         const picker_reasoning = try ctx.arena.alloc(u32, entries.len);
         for (entries, 0..) |entry, i| {
@@ -5589,15 +5585,15 @@ const OverlayInner = struct {
         var content: model_picker.Content = .{
             .models = picker_models,
             .list = &app.model_list,
-            .selection = app.models.model_selection,
-            .column = app.models.model_column,
+            .selection = app.pickers.models.model_selection,
+            .column = app.pickers.models.model_column,
             .active_model = if (status) |value| value.model else null,
             .reasoning_options = reasoningOptions(),
             .reasoning_indexes = picker_reasoning,
-            .scope = modelPickerScope(app.models.model_scope),
+            .scope = modelPickerScope(app.pickers.models.model_scope),
             .filter = filter,
-            .loading = app.models.model_load_future != null,
-            .error_message = app.models.model_load_error,
+            .loading = app.pickers.models.model_load_future != null,
+            .error_message = app.pickers.models.model_load_error,
         };
         return content.widget().draw(ctx);
     }
@@ -6553,8 +6549,8 @@ test "provider setup form renders for opencode zen without crashing" {
     defer app.deinit();
 
     app.mode = .provider_picker;
-    app.provider_picker.stage = .form;
-    app.provider_picker.form_provider = .opencode_zen;
+    app.pickers.provider.stage = .form;
+    app.pickers.provider.form_provider = .opencode_zen;
 
     var root: RootWidget = .{ .app = &app };
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -6933,10 +6929,10 @@ test "opening model picker starts at top" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    app.models.model_selection = 4;
+    app.pickers.models.model_selection = 4;
     try app.openModelPicker();
 
-    try std.testing.expectEqual(@as(u32, 0), app.models.model_selection);
+    try std.testing.expectEqual(@as(u32, 0), app.pickers.models.model_selection);
 }
 
 test "model picker hides model arrow when reasoning column is focused" {
@@ -6950,16 +6946,16 @@ test "model picker hides model arrow when reasoning column is focused" {
     defer app.deinit();
 
     app.mode = .model_picker;
-    app.models.model_column = .reasoning;
-    app.models.model_selection = 0;
+    app.pickers.models.model_column = .reasoning;
+    app.pickers.models.model_selection = 0;
     const models = try codex.loadStaticModels(gpa);
     defer gpa.free(models);
-    for (models) |model| try app.models.append(gpa, model, .openai_codex);
+    for (models) |model| try app.pickers.models.append(gpa, model, .openai_codex);
 
     var row: model_picker.Row = .{
-        .model = &app.models.entries.items[0].model,
+        .model = &app.pickers.models.entries.items[0].model,
         .selected = true,
-        .column = app.models.model_column,
+        .column = app.pickers.models.model_column,
         .active_model = null,
         .reasoning_label = reasoningOptions()[app.selectedReasoningIndex()].label,
         .scope_label = "Global",
@@ -6989,9 +6985,9 @@ test "model picker without models stays on model column" {
     defer app.deinit();
 
     app.mode = .model_picker;
-    app.models.model_column = .model;
+    app.pickers.models.model_column = .model;
     try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.right }));
-    try std.testing.expectEqual(model_picker.Column.model, app.models.model_column);
+    try std.testing.expectEqual(model_picker.Column.model, app.pickers.models.model_column);
 }
 
 test "provider picker navigates from codex to catalogue providers" {
@@ -7051,11 +7047,11 @@ test "provider picker selects sign out horizontally" {
     app.codex_signed_in = true;
 
     app.mode = .provider_picker;
-    app.provider_picker.column = .provider;
+    app.pickers.provider.column = .provider;
     try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.right }));
-    try std.testing.expectEqual(provider_picker.Column.sign_out, app.provider_picker.column);
+    try std.testing.expectEqual(provider_picker.Column.sign_out, app.pickers.provider.column);
     try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.tab }));
-    try std.testing.expectEqual(provider_picker.Column.provider, app.provider_picker.column);
+    try std.testing.expectEqual(provider_picker.Column.provider, app.pickers.provider.column);
 }
 
 test "compatible base url falls back when cached local provider differs" {
@@ -7099,8 +7095,8 @@ test "codex sign-in survives selecting local compatible provider" {
     defer runtime.disconnectClient();
 
     app.codex_signed_in = true;
-    try app.models.append(gpa, .{ .id = try gpa.dupe(u8, "llama3"), .label = try gpa.dupe(u8, "llama3") }, .{ .openai_compatible = .ollama });
-    app.models.model_selection = 0;
+    try app.pickers.models.append(gpa, .{ .id = try gpa.dupe(u8, "llama3"), .label = try gpa.dupe(u8, "llama3") }, .{ .openai_compatible = .ollama });
+    app.pickers.models.model_selection = 0;
     app.cached_config_owned = true;
     app.cached_config.base_url = try gpa.dupe(u8, "http://localhost:11434/v1");
     app.cached_config.api_key = try gpa.dupe(u8, "ollama");
@@ -7136,9 +7132,9 @@ test "switching from codex to catalogue provider resets cached connection" {
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
     defer app.deinit();
 
-    app.models.model_scope = .session;
-    try app.models.append(gpa, .{ .id = try gpa.dupe(u8, "zen"), .label = try gpa.dupe(u8, "zen") }, .{ .openai_compatible = .opencode_zen });
-    app.models.model_selection = 0;
+    app.pickers.models.model_scope = .session;
+    try app.pickers.models.append(gpa, .{ .id = try gpa.dupe(u8, "zen"), .label = try gpa.dupe(u8, "zen") }, .{ .openai_compatible = .opencode_zen });
+    app.pickers.models.model_selection = 0;
     app.cached_config_owned = true;
     app.cached_config.provider = .openai;
     app.cached_config.base_url = try gpa.dupe(u8, "https://chatgpt.com/backend-api");
@@ -7168,9 +7164,9 @@ test "active model appears at display position 0 without mutating storage" {
 
     try app.reloadModelCatalog(.openai_codex);
 
-    const active_storage_idx = app.models.activeStorageIdx("gpt-5.4-mini");
+    const active_storage_idx = app.pickers.models.activeStorageIdx("gpt-5.4-mini");
     const storage_idx = model_picker.displayToStorage(active_storage_idx, 0);
-    try std.testing.expectEqualStrings("gpt-5.4-mini", app.models.entries.items[storage_idx].model.id);
+    try std.testing.expectEqualStrings("gpt-5.4-mini", app.pickers.models.entries.items[storage_idx].model.id);
 }
 
 test "explicit codex catalog loads before runtime is connected" {
@@ -7185,7 +7181,7 @@ test "explicit codex catalog loads before runtime is connected" {
 
     try app.reloadModelCatalog(.openai_codex);
 
-    try std.testing.expect(app.models.len() > 0);
+    try std.testing.expect(app.pickers.models.len() > 0);
     try std.testing.expect(app.selectedCodexModel() != null);
 }
 
@@ -7462,8 +7458,8 @@ test "model selection is allowed after interrupt" {
     defer app.deinit();
     defer runtime.disconnectClient();
 
-    try app.models.append(gpa, .{ .id = try gpa.dupe(u8, "llama3"), .label = try gpa.dupe(u8, "llama3") }, .{ .openai_compatible = .ollama });
-    app.models.model_selection = 0;
+    try app.pickers.models.append(gpa, .{ .id = try gpa.dupe(u8, "llama3"), .label = try gpa.dupe(u8, "llama3") }, .{ .openai_compatible = .ollama });
+    app.pickers.models.model_selection = 0;
     app.cached_config_owned = true;
     app.cached_config.base_url = try gpa.dupe(u8, "http://localhost:11434/v1");
     app.cached_config.api_key = try gpa.dupe(u8, "ollama");
@@ -7570,16 +7566,16 @@ test "menu navigation wraps and model reasoning tab cycles" {
 
     const models = try codex.loadStaticModels(gpa);
     defer gpa.free(models);
-    for (models) |model| try app.models.append(gpa, model, .openai_codex);
+    for (models) |model| try app.pickers.models.append(gpa, model, .openai_codex);
     app.mode = .model_picker;
-    app.models.model_selection = @intCast(app.models.len() - 1);
+    app.pickers.models.model_selection = @intCast(app.pickers.models.len() - 1);
     try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.down }));
-    try std.testing.expectEqual(@as(u32, 0), app.models.model_selection);
+    try std.testing.expectEqual(@as(u32, 0), app.pickers.models.model_selection);
 
-    app.models.model_column = .reasoning;
+    app.pickers.models.model_column = .reasoning;
     try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.tab }));
-    try std.testing.expectEqual(@as(u32, 1), app.models.entries.items[0].reasoning_index);
-    try std.testing.expectEqual(@as(u32, 0), app.models.entries.items[1].reasoning_index);
+    try std.testing.expectEqual(@as(u32, 1), app.pickers.models.entries.items[0].reasoning_index);
+    try std.testing.expectEqual(@as(u32, 0), app.pickers.models.entries.items[1].reasoning_index);
 }
 
 test "empty text deltas do not create selectable messages" {

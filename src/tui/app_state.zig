@@ -12,7 +12,12 @@
 //! every operation mutates the same memory, just one struct level deeper.
 
 const std = @import("std");
+const vaxis = @import("vaxis");
 const tui = @import("../tui.zig");
+const tree_selector = @import("widgets/tree_selector.zig");
+const model_catalogue = @import("model_catalogue.zig");
+const provider_picker = @import("widgets/provider_picker.zig");
+const vxfw = vaxis.vxfw;
 
 const MentionSearchKind = tui.MentionSearchKind;
 
@@ -37,4 +42,10 @@ pub const InputState = struct {
     comment: vxfw.TextField,
 };
 
-const vxfw = @import("vaxis").vxfw;
+/// The three picker widgets: file tree (overlay), model catalogue, and
+/// provider list with API-key form. Owns the per-picker state structs.
+pub const PickerStates = struct {
+    tree: tree_selector.TreeState,
+    models: model_catalogue.ModelCatalogue = .{},
+    provider: provider_picker.State = .{},
+};
