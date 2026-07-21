@@ -844,13 +844,13 @@ pub const App = struct {
         self.background_modal_state.cancel_focus = false;
     }
 
-    fn advanceLoadingFrame(self: *App) void {
+    pub fn advanceLoadingFrame(self: *App) void {
         std.debug.assert(tui_message.loading_frames.len > 0);
         self.metrics.loading_frame +%= 1;
         if (self.metrics.loading_frame >= tui_message.loading_frames.len) self.metrics.loading_frame = 0;
     }
 
-    fn advanceBlackholeFrame(self: *App) void {
+    pub fn advanceBlackholeFrame(self: *App) void {
         self.metrics.blackhole_frame += 1;
         if (self.metrics.blackhole_frame >= blackhole.frame_count) self.metrics.blackhole_frame = 0;
     }
@@ -1498,7 +1498,7 @@ pub const App = struct {
     /// Called from the tick handler. Polls the non-blocking `done` flag, and
     /// only `await`s once the worker has signalled completion. Returns true
     /// if a redraw is needed.
-    fn drainModelLoad(self: *App) !bool {
+    pub fn drainModelLoad(self: *App) !bool {
         if (self.pickers.models.model_load_future == null) return false;
         if (!self.pickers.models.model_load_done.load(.acquire)) return false;
 
@@ -2669,7 +2669,7 @@ pub const App = struct {
     /// `nova/<hex>` becomes `nova/<slug>` in place (worktree HEADs follow), and
     /// the branch becomes the lane's label. A rejected or colliding name simply
     /// leaves the hex branch.
-    fn drainLaneNaming(self: *App) !bool {
+    pub fn drainLaneNaming(self: *App) !bool {
         var changed = false;
         for (self.threads.items) |lane| {
             if (lane.naming_future == null) continue;
@@ -2728,7 +2728,7 @@ pub const App = struct {
 
     /// Whether any lane has an async branch-naming job in flight — the tick
     /// must stay alive for the result to be drained.
-    fn namingActive(self: *const App) bool {
+    pub fn namingActive(self: *const App) bool {
         for (self.threads.items) |lane| {
             if (lane.naming_future != null) return true;
         }
@@ -2754,7 +2754,7 @@ pub const App = struct {
     /// True while any lane has a turn in flight — keeps the drain/animation tick
     /// alive so background lanes' events (and their terminal `turn_finished`)
     /// keep draining even when the visible lane is idle.
-    fn anyTurnActive(self: *const App) bool {
+    pub fn anyTurnActive(self: *const App) bool {
         for (self.threads.items) |lane| {
             if (lane.turn.state != .idle) return true;
         }
@@ -3283,7 +3283,7 @@ pub const App = struct {
         self.metrics.diff_refresh_done.store(false, .release);
     }
 
-    fn drainDiffRefresh(self: *App) !bool {
+    pub fn drainDiffRefresh(self: *App) !bool {
         if (self.metrics.diff_refresh_future == null) return false;
         if (!self.metrics.diff_refresh_done.load(.acquire)) return false;
 
@@ -3603,7 +3603,7 @@ pub const RootWidget = struct {
     diff_tick_accum: u32 = 0,
     diff_refresh_pending: bool = false,
 
-    fn widget(self: *RootWidget) vxfw.Widget {
+    pub fn widget(self: *RootWidget) vxfw.Widget {
         return .{
             .userdata = self,
             .captureHandler = captureEvent,
@@ -3625,78 +3625,12 @@ pub const RootWidget = struct {
         }
     }
 
-    const drain_tick_ms: u32 = 30;
-    const spinner_tick_threshold_ms: u32 = loading_frame_ms;
-    const diff_tick_threshold_ms: u32 = 300;
+    pub const drain_tick_ms: u32 = 30;
+    pub const spinner_tick_threshold_ms: u32 = loading_frame_ms;
+    pub const diff_tick_threshold_ms: u32 = 300;
 
     fn handleTick(self: *RootWidget, ctx: *vxfw.EventContext) !void {
-        var visible_change = try self.drainAgentEvents(ctx);
-        if (try self.app.drainModelLoad()) visible_change = true;
-        if (try self.app.drainDiffRefresh()) visible_change = true;
-        // Lanes whose branch name landed get renamed in place.
-        if (try self.app.drainLaneNaming()) visible_change = true;
-        // Collect any finished background jobs, then deliver buffered completions
-        // to idle lanes (notice + a turn to answer them).
-        if (try self.app.pollBackgroundJobs()) visible_change = true;
-        if (try self.app.deliverPendingBackground()) visible_change = true;
-
-        if (self.app.thread.turn_view.awaitingOutput() or self.app.thread.transcript.hasRunningTool()) {
-            self.spinner_tick_accum += drain_tick_ms;
-            if (self.spinner_tick_accum >= spinner_tick_threshold_ms) {
-                self.spinner_tick_accum = 0;
-                self.app.advanceLoadingFrame();
-                visible_change = true;
-            }
-        } else {
-            self.spinner_tick_accum = 0;
-        }
-
-        if (self.diff_refresh_pending) {
-            self.diff_tick_accum += drain_tick_ms;
-            if (self.diff_tick_accum >= diff_tick_threshold_ms) {
-                self.diff_tick_accum = 0;
-                self.diff_refresh_pending = false;
-                try self.app.scheduleDiffRefresh();
-            }
-        } else {
-            self.diff_tick_accum = 0;
-        }
-
-        if (self.app.metrics.blackhole_visible) {
-            // Carry the remainder so the average interval tracks ~24 fps even
-            // though the host tick (30 ms) is coarser than the frame interval.
-            self.blackhole_tick_accum += drain_tick_ms;
-            while (self.blackhole_tick_accum >= blackhole.frame_interval_ms) {
-                self.blackhole_tick_accum -= blackhole.frame_interval_ms;
-                self.app.advanceBlackholeFrame();
-                visible_change = true;
-            }
-        } else {
-            self.blackhole_tick_accum = 0;
-        }
-
-        const model_loading = self.app.pickers.models.model_load_future != null;
-        const diff_loading = self.app.metrics.diff_refresh_future != null;
-        // Keep ticking while a turn is active OR interrupting, so the worker's
-        // remaining events (and its terminal `turn_finished`) get drained.
-        const should_tick = self.app.anyTurnActive() or
-            model_loading or
-            diff_loading or
-            self.app.metrics.blackhole_visible or
-            self.diff_refresh_pending or
-            self.app.backgroundActive() or
-            self.app.namingActive();
-        if (should_tick) {
-            try ctx.tick(drain_tick_ms, self.widget());
-        } else {
-            self.app.metrics.loading_tick_active = false;
-        }
-
-        if (visible_change) {
-            ctx.consumeAndRedraw();
-        } else {
-            ctx.consumeEvent();
-        }
+        try lifecycle.handleTick(self, ctx);
     }
 
     // Schedule the shared animation/drain tick if one isn't already pending.
@@ -3753,44 +3687,7 @@ pub const RootWidget = struct {
     }
 
     fn drainAgentEvents(self: *RootWidget, ctx: *vxfw.EventContext) !bool {
-        var visible_change = false;
-        var refresh_diff = false;
-        const active = self.app.thread;
-        // Each lane runs its own turn, so drain every lane's queue and apply its
-        // events to *that* lane. The Turn machine operates on `self.thread`, so
-        // scope-swap it to the lane being processed (UI-thread only) and restore
-        // the visible lane afterward.
-        for (self.app.threads.items) |lane| {
-            const worker = if (lane.worker_context) |*wc| wc else continue;
-            var batch: std.ArrayList(*agent_mod.Agent.Event) = .empty;
-            defer batch.deinit(worker.gpa);
-            try worker.queue.drainInto(worker.io, worker.gpa, &batch);
-            if (batch.items.len == 0) continue;
-
-            self.app.thread = lane;
-            defer self.app.thread = active;
-            for (batch.items) |event_ptr| {
-                defer worker.gpa.destroy(event_ptr);
-                defer event_ptr.deinit(worker.gpa);
-
-                // A discarded (interrupted) turn's events are swallowed inside
-                // applyAgentEvent — the Turn machine refuses to project them.
-                const changed = try self.app.applyAgentEvent(event_ptr.*);
-                if (lane != active) continue; // a background lane never touches the view
-                if (changed) visible_change = true;
-                switch (event_ptr.*) {
-                    .tool_call_finished => refresh_diff = true,
-                    else => {},
-                }
-                if (lane.turn_view.awaitingOutput()) try self.ensureTick(ctx);
-            }
-        }
-        if (refresh_diff) {
-            self.diff_refresh_pending = true;
-            self.diff_tick_accum = 0;
-            try self.ensureTick(ctx);
-        }
-        return visible_change;
+        return lifecycle.drainAgentEvents(self, ctx);
     }
 
     fn drawRoot(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
