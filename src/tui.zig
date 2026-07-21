@@ -1539,7 +1539,7 @@ pub const App = struct {
         try list.append(self.gpa, .{ .provider = provider, .base_url = url, .api_key = key });
     }
 
-    fn cancelModelLoad(self: *App) void {
+    pub fn cancelModelLoad(self: *App) void {
         if (self.pickers.models.model_load_future) |*future| {
             var outcome = future.cancel(self.io);
             outcome.deinit(self.gpa);
@@ -2243,7 +2243,7 @@ pub const App = struct {
         self.resume_folded_projects.clearRetainingCapacity();
     }
 
-    fn resumeClear(self: *App) void {
+    pub fn resumeClear(self: *App) void {
         for (self.resume_summaries.items) |*summary| summary.deinit(self.gpa);
         self.resume_summaries.clearRetainingCapacity();
     }
@@ -2770,7 +2770,7 @@ pub const App = struct {
         return true;
     }
 
-    fn cancelLaneNaming(self: *App, lane: *Thread) void {
+    pub fn cancelLaneNaming(self: *App, lane: *Thread) void {
         if (lane.naming_future) |*future| {
             var outcome = future.cancel(self.io);
             outcome.deinit(self.gpa);
@@ -3100,7 +3100,7 @@ pub const App = struct {
     }
 
     /// Free the lanes-overlay working state (parked list + destination indices).
-    fn clearLanesState(self: *App) void {
+    pub fn clearLanesState(self: *App) void {
         if (self.parked_lanes.len > 0) {
             vcs.freeWorktreeList(self.gpa, self.parked_lanes);
             self.parked_lanes = &.{};
@@ -3326,7 +3326,7 @@ pub const App = struct {
         self.metrics.diff_refresh_future = try self.io.concurrent(runDiffRefresh, .{job});
     }
 
-    fn cancelDiffRefresh(self: *App) void {
+    pub fn cancelDiffRefresh(self: *App) void {
         if (self.metrics.diff_refresh_future) |*future| {
             var outcome = future.cancel(self.io);
             outcome.deinit(self.gpa);
