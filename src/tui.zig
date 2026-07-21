@@ -120,7 +120,7 @@ fn runDiffRefresh(job: *DiffRefreshJob) DiffRefreshOutcome {
 
 /// A single-row clickable region on screen (absolute coordinates). Used to
 /// hit-test mouse clicks against the pink lanes chip.
-const ChipRect = struct {
+pub const ChipRect = struct {
     row: u16,
     col: u16,
     width: u16,
@@ -149,12 +149,13 @@ pub const App = struct {
     /// ("fullscreen"). Set true on opening a parallel lane and toggled by
     /// `toggleLaneFullscreen` (Ctrl+L) / clicking the pink lanes chip.
     split: bool = false,
-    lanes_chip_rect: ?ChipRect = null,
     /// Root-relative row where the input surface is drawn this frame; lets the
     /// input widget translate its local chip position into absolute coordinates
     /// for `lanes_chip_rect`.
     input_surface_row: u16 = 0,
     inputs: app_state.InputState,
+    /// Cross-pane navigation cursors and the lane-chip hit-test rect.
+    nav: app_state.NavState = .{},
     /// Parsed state for the `/diff` viewer. Populated by `openDiffViewer`, reset
     /// to `.{}` on exit. Only meaningful while `mode == .diff_viewer`.
     diff: diff_viewer.State = .{},
@@ -166,9 +167,6 @@ pub const App = struct {
     /// per-turn failure notice from repeating every turn while git is wedged.
     checkpoint_warned: bool = false,
     mode: Mode = .normal,
-    command_selection: u32 = 0,
-    resume_selection: u32 = 0,
-    resume_global: bool = false,
     resume_summaries: std.ArrayList(session_mod.SessionSummary) = .empty,
     resume_folded_projects: std.ArrayList([]u8) = .empty,
     pickers: app_state.PickerStates,
@@ -237,22 +235,11 @@ pub const App = struct {
     },
     /// What the `Mode.lanes` overlay is doing: managing parked worktrees
     /// (`/lanes`, M/X) or choosing a merge destination (`/merge`, Enter).
-    lanes_purpose: LanesPurpose = .manage,
-    lanes_selection: u32 = 0,
-    /// `.manage`: on-disk `nova/*` worktrees not currently open as lanes. Owned;
-    /// freed by `clearLanesState`.
     parked_lanes: []vcs.WorktreeEntry = &.{},
     /// `.merge_dest`: the source lane (current) whose work is being merged, and
     /// the candidate destination lane indices into `threads`. Owned.
     merge_source_index: usize = 0,
     merge_dest_indices: []usize = &.{},
-    pending_quit_at: ?std.Io.Timestamp = null,
-    queued_selection: usize = 0,
-    /// When true, arrow keys navigate conversation blocks; when false they move
-    /// the cursor within the (multiline) input. Set when the cursor leaves the
-    /// top of the input, cleared when it re-enters from the last block or on any
-    /// edit/submit. See `RootWidget.captureEvent`.
-    block_nav: bool = false,
     input_wrap_width: u16 = 0,
     at_search: app_state.AtSearchState = .{},
     /// Shared manager for `run_in_background` bash commands. Heap-allocated (so
@@ -283,7 +270,7 @@ pub const App = struct {
     };
 
     const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message, lanes };
-    const LanesPurpose = enum { manage, merge_dest };
+pub const LanesPurpose = app_state.NavState.LanesPurpose;
     const ModelCatalog = enum { connected_provider, openai_codex };
     const CheckpointState = enum { unknown, ready, unavailable };
     const ModelSource = model_loader.ModelSource;
@@ -409,39 +396,39 @@ pub const App = struct {
     }
 
     pub fn toggleResumeGlobal(self: *App) void {
-        self.resume_global = !self.resume_global;
+        self.nav.resume_global = !self.nav.resume_global;
     }
 
     pub fn getResumeGlobal(self: *const App) bool {
-        return self.resume_global;
+        return self.nav.resume_global;
     }
 
     pub fn getResumeSelection(self: *const App) u32 {
-        return self.resume_selection;
+        return self.nav.resume_selection;
     }
 
     pub fn setResumeSelection(self: *App, v: u32) void {
-        self.resume_selection = v;
+        self.nav.resume_selection = v;
     }
 
     pub fn getLanesSelection(self: *App) u32 {
-        return self.lanes_selection;
+        return self.nav.lanes_selection;
     }
 
     pub fn setLanesSelection(self: *App, v: u32) void {
-        self.lanes_selection = v;
+        self.nav.lanes_selection = v;
     }
 
     pub fn getLanesPurpose(self: *const App) LanesPurpose {
-        return self.lanes_purpose;
+        return self.nav.lanes_purpose;
     }
 
     pub fn getCommandSelection(self: *App) u32 {
-        return self.command_selection;
+        return self.nav.command_selection;
     }
 
     pub fn setCommandSelection(self: *App, v: u32) void {
-        self.command_selection = v;
+        self.nav.command_selection = v;
     }
 
     pub fn popProviderKeyInput(self: *App) void {
@@ -502,23 +489,23 @@ pub const App = struct {
     }
 
     pub fn getBlockNav(self: *const App) bool {
-        return self.block_nav;
+        return self.nav.block_nav;
     }
 
     pub fn setBlockNav(self: *App, v: bool) void {
-        self.block_nav = v;
+        self.nav.block_nav = v;
     }
 
     pub fn getPendingQuitAt(self: *const App) ?std.Io.Timestamp {
-        return self.pending_quit_at;
+        return self.nav.pending_quit_at;
     }
 
     pub fn setPendingQuitAt(self: *App, v: ?std.Io.Timestamp) void {
-        self.pending_quit_at = v;
+        self.nav.pending_quit_at = v;
     }
 
     pub fn clearPendingQuitAt(self: *App) void {
-        self.pending_quit_at = null;
+        self.nav.pending_quit_at = null;
     }
 
     pub fn getSplit(self: *const App) bool {
@@ -530,7 +517,7 @@ pub const App = struct {
     }
 
     pub fn getLanesChipRect(self: *const App) ?ChipRect {
-        return self.lanes_chip_rect;
+        return self.nav.lanes_chip_rect;
     }
 
     pub fn turnStateIsActive(self: *const App) bool {
@@ -664,7 +651,7 @@ pub const App = struct {
     /// prompt was empty, had no provider, or was queued behind a running turn.
     pub fn beginSubmit(self: *App) !bool {
         self.closeAtSearch();
-        self.block_nav = false;
+        self.nav.block_nav = false;
         // If a previous turn was Esc-interrupted, force-cancel its worker
         // before starting a new one. Two concurrent workers would race on
         // the shared agent message history.
@@ -1212,21 +1199,21 @@ pub const App = struct {
         if (self.mode == .session_picker or self.mode == .provider_picker or self.mode == .model_picker or self.mode == .tree_picker) {
             if (value.len > 0 and value[0] == command_prefix) {
                 self.mode = .command;
-                self.command_selection = 0;
+                self.nav.command_selection = 0;
                 return;
             }
             if (self.mode == .session_picker) {
-                if (self.resume_selection >= try self.visibleResumeCount()) self.resume_selection = 0;
+                if (self.nav.resume_selection >= try self.visibleResumeCount()) self.nav.resume_selection = 0;
             }
             return;
         }
         if (value.len > 0 and value[0] == command_prefix) {
             self.mode = .command;
-            self.command_selection = 0;
+            self.nav.command_selection = 0;
             return;
         }
         self.mode = .normal;
-        self.command_selection = 0;
+        self.nav.command_selection = 0;
     }
 
     pub fn cancelMode(self: *App) !bool {
@@ -1333,7 +1320,7 @@ pub const App = struct {
         if (self.mode == .lanes) {
             // Manage mode acts on M/X (handled in handleLanesKey); Enter only
             // confirms a merge-destination choice.
-            if (self.lanes_purpose == .merge_dest) try self.confirmMergeDest();
+            if (self.nav.lanes_purpose == .merge_dest) try self.confirmMergeDest();
             return true;
         }
         if (self.mode == .command) {
@@ -1365,13 +1352,13 @@ pub const App = struct {
         self.mode = .command;
         self.clearInput();
         self.clearPaletteInput();
-        self.command_selection = 0;
+        self.nav.command_selection = 0;
     }
 
     fn openResumePicker(self: *App) !void {
         self.mode = .session_picker;
-        self.resume_global = false;
-        self.resume_selection = 0;
+        self.nav.resume_global = false;
+        self.nav.resume_selection = 0;
         self.resumeClearFolds();
         self.clearInput();
         try self.reloadResumeSessions();
@@ -2281,42 +2268,42 @@ pub const App = struct {
         self.resumeClear();
         var manager = try session_mod.SessionManager.initDefault(self.gpa, self.io, self.liveRuntime().?.home_dir);
         defer manager.deinit();
-        const cwd = if (self.resume_global) null else (self.repoRoot() orelse self.liveRuntime().?.cwd);
+        const cwd = if (self.nav.resume_global) null else (self.repoRoot() orelse self.liveRuntime().?.cwd);
         const summaries = try manager.list(self.gpa, cwd);
         try self.resume_summaries.appendSlice(self.gpa, summaries);
-        if (self.resume_global) std.mem.sort(
+        if (self.nav.resume_global) std.mem.sort(
             session_mod.SessionSummary,
             self.resume_summaries.items,
             self.resume_summaries.items,
             resumeSummaryLessThan,
         );
-        if (self.resume_selection >= try self.visibleResumeCount()) self.resume_selection = 0;
+        if (self.nav.resume_selection >= try self.visibleResumeCount()) self.nav.resume_selection = 0;
         self.syncResumeListCursor();
     }
 
     fn selectedResumeSummary(self: *App) !?*session_mod.SessionSummary {
         const filter = try self.peekPaletteInput();
         defer self.gpa.free(filter);
-        return @constCast(resume_picker.selectedSummary(self.resume_summaries.items, filter, self.resume_folded_projects.items, self.resume_selection, self.resume_global));
+        return @constCast(resume_picker.selectedSummary(self.resume_summaries.items, filter, self.resume_folded_projects.items, self.nav.resume_selection, self.nav.resume_global));
     }
 
     pub fn visibleResumeCount(self: *App) !u32 {
         const filter = try self.peekPaletteInput();
         defer self.gpa.free(filter);
-        return resume_picker.visibleCount(self.resume_summaries.items, filter, self.resume_folded_projects.items, self.resume_global);
+        return resume_picker.visibleCount(self.resume_summaries.items, filter, self.resume_folded_projects.items, self.nav.resume_global);
     }
 
     pub fn toggleSelectedResumeProject(self: *App) !void {
         const filter = try self.peekPaletteInput();
         defer self.gpa.free(filter);
-        const cwd = resume_picker.selectedProject(self.resume_summaries.items, filter, self.resume_folded_projects.items, self.resume_selection) orelse return;
+        const cwd = resume_picker.selectedProject(self.resume_summaries.items, filter, self.resume_folded_projects.items, self.nav.resume_selection) orelse return;
         if (self.resumeFoldIndex(cwd)) |index| {
             self.gpa.free(self.resume_folded_projects.items[index]);
             _ = self.resume_folded_projects.orderedRemove(index);
         } else {
             try self.resume_folded_projects.append(self.gpa, try self.gpa.dupe(u8, cwd));
         }
-        if (self.resume_selection >= try self.visibleResumeCount()) self.resume_selection = 0;
+        if (self.nav.resume_selection >= try self.visibleResumeCount()) self.nav.resume_selection = 0;
         self.syncResumeListCursor();
     }
 
@@ -2338,7 +2325,7 @@ pub const App = struct {
     }
 
     pub fn syncResumeListCursor(self: *App) void {
-        self.resume_list.cursor = self.resume_selection;
+        self.resume_list.cursor = self.nav.resume_selection;
         self.resume_list.ensureScroll();
     }
 
@@ -2522,7 +2509,7 @@ pub const App = struct {
         try self.thread.queued.append(self.gpa, .{ .text = prompt });
         // Select the newest message so the line above the input shows what was
         // just queued; ALT+← walks back to older ones.
-        self.queued_selection = self.thread.queued.items.len - 1;
+        self.nav.queued_selection = self.thread.queued.items.len - 1;
         self.clearInput();
         return false;
     }
@@ -2530,14 +2517,14 @@ pub const App = struct {
     /// Move the queued-message selection one older (ALT+←).
     pub fn selectPrevQueued(self: *App) void {
         if (self.thread.queued.items.len == 0) return;
-        if (self.queued_selection > 0) self.queued_selection -= 1;
+        if (self.nav.queued_selection > 0) self.nav.queued_selection -= 1;
     }
 
     /// Move the queued-message selection one newer (ALT+→).
     pub fn selectNextQueued(self: *App) void {
         const len = self.thread.queued.items.len;
         if (len == 0) return;
-        if (self.queued_selection + 1 < len) self.queued_selection += 1;
+        if (self.nav.queued_selection + 1 < len) self.nav.queued_selection += 1;
     }
 
     /// Mark the selected queued message to steer (CTRL+→). One-way: it will be
@@ -2546,7 +2533,7 @@ pub const App = struct {
     pub fn steerSelectedQueued(self: *App) void {
         const items = self.thread.queued.items;
         if (items.len == 0) return;
-        const index = @min(self.queued_selection, items.len - 1);
+        const index = @min(self.nav.queued_selection, items.len - 1);
         items[index].steer = true;
         self.thread.agent.?.setQueuedSteer(@intCast(index));
     }
@@ -2579,13 +2566,13 @@ pub const App = struct {
         self.thread.queued.shrinkRetainingCapacity(self.thread.queued.items.len - flush_count);
         // Messages drain from the front, so shift the selection left to keep it
         // pointing at the same logical message (clamped into range).
-        self.queued_selection -|= flush_count;
+        self.nav.queued_selection -|= flush_count;
     }
 
     fn clearQueuedUserMessages(self: *App) void {
         for (self.thread.queued.items) |message| self.gpa.free(message.text);
         self.thread.queued.clearRetainingCapacity();
-        self.queued_selection = 0;
+        self.nav.queued_selection = 0;
     }
 
     fn clearPaletteInput(self: *App) void {
@@ -2913,7 +2900,7 @@ pub const App = struct {
         const cur: i32 = @intCast(self.activeIndex());
         const next: usize = @intCast(@mod(cur + delta, @as(i32, @intCast(n))));
         self.thread = self.threads.items[next];
-        self.block_nav = false;
+        self.nav.block_nav = false;
         self.clearInput();
     }
 
@@ -2951,7 +2938,7 @@ pub const App = struct {
         lane.deinit(self.gpa);
         self.gpa.destroy(lane);
 
-        self.block_nav = false;
+        self.nav.block_nav = false;
         self.clearInput();
     }
 
@@ -3027,7 +3014,7 @@ pub const App = struct {
         }
 
         if (self.threads.items.len < 2) self.split = false;
-        self.block_nav = false;
+        self.nav.block_nav = false;
     }
 
     /// `/merge`: fold the current (working) lane into another. Refused mid-turn or
@@ -3062,8 +3049,8 @@ pub const App = struct {
         self.clearLanesState();
         self.merge_dest_indices = try dests.toOwnedSlice(self.gpa);
         self.merge_source_index = src_index;
-        self.lanes_purpose = .merge_dest;
-        self.lanes_selection = 0;
+        self.nav.lanes_purpose = .merge_dest;
+        self.nav.lanes_selection = 0;
         self.mode = .lanes;
         self.clearInput();
         self.clearPaletteInput();
@@ -3076,12 +3063,12 @@ pub const App = struct {
             self.clearPaletteInput();
             self.clearLanesState();
         }
-        if (self.merge_dest_indices.len == 0 or self.lanes_selection >= self.merge_dest_indices.len) {
+        if (self.merge_dest_indices.len == 0 or self.nav.lanes_selection >= self.merge_dest_indices.len) {
             self.mode = .normal;
             self.clearInput();
             return;
         }
-        const dest = self.threads.items[self.merge_dest_indices[self.lanes_selection]];
+        const dest = self.threads.items[self.merge_dest_indices[self.nav.lanes_selection]];
         const src = workingLaneOf(self.threads.items[self.merge_source_index]) orelse {
             self.mode = .normal;
             self.clearInput();
@@ -3103,8 +3090,8 @@ pub const App = struct {
         const repo = self.repoRoot() orelse return error.NoActiveRuntime;
         self.clearLanesState();
         self.parked_lanes = try self.collectParkedLanes(repo);
-        self.lanes_purpose = .manage;
-        self.lanes_selection = 0;
+        self.nav.lanes_purpose = .manage;
+        self.nav.lanes_selection = 0;
         self.mode = .lanes;
         self.clearInput();
         self.clearPaletteInput();
@@ -3154,16 +3141,16 @@ pub const App = struct {
             self.parked_lanes = &.{};
         }
         self.parked_lanes = try self.collectParkedLanes(repo);
-        if (self.lanes_selection >= self.parked_lanes.len) {
-            self.lanes_selection = if (self.parked_lanes.len == 0) 0 else @intCast(self.parked_lanes.len - 1);
+        if (self.nav.lanes_selection >= self.parked_lanes.len) {
+            self.nav.lanes_selection = if (self.parked_lanes.len == 0) 0 else @intCast(self.parked_lanes.len - 1);
         }
     }
 
     /// `/lanes` → M: merge the selected parked worktree into the current lane,
     /// remove it, and keep the window open on the reloaded list.
     pub fn mergeSelectedParked(self: *App) !void {
-        if (self.lanes_selection >= self.parked_lanes.len) return;
-        const entry = self.parked_lanes[self.lanes_selection];
+        if (self.nav.lanes_selection >= self.parked_lanes.len) return;
+        const entry = self.parked_lanes[self.nav.lanes_selection];
         const source: MergeSource = .{ .branch = entry.branch, .path = entry.path, .active_index = null };
         try self.mergeLane(source, self.thread);
         try self.reloadParkedLanes();
@@ -3171,8 +3158,8 @@ pub const App = struct {
 
     /// `/lanes` → X: delete the selected parked worktree and its branch.
     pub fn deleteSelectedParked(self: *App) !void {
-        if (self.lanes_selection >= self.parked_lanes.len) return;
-        const entry = self.parked_lanes[self.lanes_selection];
+        if (self.nav.lanes_selection >= self.parked_lanes.len) return;
+        const entry = self.parked_lanes[self.nav.lanes_selection];
         if (self.repoRoot()) |repo| {
             vcs.worktreeRemove(self.gpa, self.io, repo, entry.path) catch {};
             vcs.deleteBranch(self.gpa, self.io, repo, entry.branch) catch {};
@@ -3182,7 +3169,7 @@ pub const App = struct {
 
     /// Number of rows in the lanes overlay for the current purpose.
     pub fn laneEntryCount(self: *const App) u32 {
-        return switch (self.lanes_purpose) {
+        return switch (self.nav.lanes_purpose) {
             .manage => @intCast(self.parked_lanes.len),
             .merge_dest => @intCast(self.merge_dest_indices.len),
         };
@@ -3198,13 +3185,13 @@ pub const App = struct {
             self.gpa.free(self.merge_dest_indices);
             self.merge_dest_indices = &.{};
         }
-        self.lanes_selection = 0;
+        self.nav.lanes_selection = 0;
     }
 
     /// Rows for the lanes overlay, arena-allocated each draw (strings borrowed
     /// from `parked_lanes` / `threads`).
     fn buildLaneEntries(self: *App, arena: std.mem.Allocator) ![]lanes_picker.Entry {
-        switch (self.lanes_purpose) {
+        switch (self.nav.lanes_purpose) {
             .manage => {
                 const out = try arena.alloc(lanes_picker.Entry, self.parked_lanes.len);
                 for (self.parked_lanes, 0..) |entry, i| {
@@ -3480,7 +3467,7 @@ pub const App = struct {
     }
 
     pub fn jumpTranscriptToBottom(self: *App) void {
-        self.block_nav = false;
+        self.nav.block_nav = false;
         self.thread.transcript.selectLast();
         self.thread.auto_scroll = true;
         self.thread.transcript_list.scroll.pending_lines = 0;
@@ -3983,7 +3970,7 @@ pub const RootWidget = struct {
         // fixed height across turns — the spinner appearing must not reflow.
         const layout = rootLayout(max_height, false, try self.app.inputTextRows(ctx, max_width -| 4), loading_visible or split, self.app.thread.queued.items.len > 0);
         self.app.input_surface_row = layout.input_row;
-        self.app.lanes_chip_rect = null;
+        self.app.nav.lanes_chip_rect = null;
 
         var transcript_view: TranscriptWidget = .{ .app = self.app, .thread = self.app.thread };
         var loading_view: LoadingWidget = .{ .app = self.app };
@@ -5138,7 +5125,7 @@ fn overlayLabel(app: *const App) []const u8 {
         .model_picker => "Select Model",
         .tree_picker => "Session Timeline",
         .save_message => "Commit Message",
-        .lanes => switch (app.lanes_purpose) {
+        .lanes => switch (app.nav.lanes_purpose) {
             .manage => "Parallel Lanes",
             .merge_dest => "Merge Into",
         },
@@ -5152,7 +5139,7 @@ fn resolveCommand(app: *App, filter: []const u8) ?Command {
     for (commands) |entry| {
         if (!commandVisible(app, entry)) continue;
         if (!startsWithIgnoreCase(entry.name, filter)) continue;
-        if (index == app.command_selection) selected = entry.command;
+        if (index == app.nav.command_selection) selected = entry.command;
         index += 1;
     }
     if (selected) |command| return command;
@@ -5195,7 +5182,7 @@ fn isSearchFooter(line: []const u8) bool {
 
 fn inputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8) anyerror!void {
     const app: *App = @ptrCast(@alignCast(userdata.?));
-    app.block_nav = false;
+    app.nav.block_nav = false;
     const was_command = app.mode == .command;
     try app.syncModeWithInput(value);
     if (!was_command and app.mode == .command) {
@@ -5216,11 +5203,11 @@ fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []
     switch (app.mode) {
         .command => {
             const count = commandMatchesCountForFilter(app, value);
-            if (app.command_selection >= count) app.command_selection = 0;
+            if (app.nav.command_selection >= count) app.nav.command_selection = 0;
         },
         .session_picker => {
-            const count = resume_picker.visibleCount(app.resume_summaries.items, value, app.resume_folded_projects.items, app.resume_global);
-            if (app.resume_selection >= count) app.resume_selection = 0;
+            const count = resume_picker.visibleCount(app.resume_summaries.items, value, app.resume_folded_projects.items, app.nav.resume_global);
+            if (app.nav.resume_selection >= count) app.nav.resume_selection = 0;
             app.syncResumeListCursor();
         },
         .tree_picker => {
@@ -5512,8 +5499,8 @@ const OverlayInner = struct {
         var content: lanes_picker.Content = .{
             .list = &app.lanes_list,
             .entries = entries,
-            .selection = app.lanes_selection,
-            .empty_message = switch (app.lanes_purpose) {
+            .selection = app.nav.lanes_selection,
+            .empty_message = switch (app.nav.lanes_purpose) {
                 .manage => "  No parked lanes.",
                 .merge_dest => "  No lanes to merge into.",
             },
@@ -5536,7 +5523,7 @@ const OverlayInner = struct {
         var content: command_panel.Content = .{
             .entries = buf[0..n],
             .filter = filter,
-            .selection = app.command_selection,
+            .selection = app.nav.command_selection,
         };
         return content.widget().draw(ctx);
     }
@@ -5548,10 +5535,10 @@ const OverlayInner = struct {
             .io = app.io,
             .list = &app.resume_list,
             .summaries = app.resume_summaries.items,
-            .selection = app.resume_selection,
+            .selection = app.nav.resume_selection,
             .folded_projects = app.resume_folded_projects.items,
             .filter = filter,
-            .tree_mode = app.resume_global,
+            .tree_mode = app.nav.resume_global,
         };
         return content.widget().draw(ctx);
     }
@@ -5622,7 +5609,7 @@ fn reasoningOptions() []const model_picker.ReasoningOption {
 fn inputHintText(app: *const App) []const u8 {
     return switch (app.mode) {
         .command => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
-        .session_picker => if (app.resume_global)
+        .session_picker => if (app.nav.resume_global)
             "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[CTRL+A] Current project" ++ symbols.separator_dot_padded ++ "[TAB] Fold" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back"
         else
             "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[CTRL+A] All projects" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
@@ -5630,7 +5617,7 @@ fn inputHintText(app: *const App) []const u8 {
         .model_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Column" ++ symbols.separator_dot_padded ++ "[TAB] Toggle Effort/Scope" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .tree_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Filter" ++ symbols.separator_dot_padded ++ "[TAB] Fold" ++ symbols.separator_dot_padded ++ "✦ Checkpoint" ++ symbols.separator_dot_padded ++ "[ENTER] Switch" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         .save_message => "[ENTER] Save" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
-        .lanes => switch (app.lanes_purpose) {
+        .lanes => switch (app.nav.lanes_purpose) {
             .manage => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[M] Merge into current" ++ symbols.separator_dot_padded ++ "[X] Delete" ++ symbols.separator_dot_padded ++ "[ESC] Back",
             .merge_dest => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Merge into" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         },
@@ -6012,7 +5999,7 @@ const InputWidget = struct {
                 .z_index = 2,
             };
             child_index += 1;
-            self.app.lanes_chip_rect = .{
+            self.app.nav.lanes_chip_rect = .{
                 .row = self.app.input_surface_row + base_row,
                 .col = 1,
                 .width = lanes_width,
@@ -6069,7 +6056,7 @@ const InputWidget = struct {
 
     fn drawQueuedMessage(self: *InputWidget, ctx: vxfw.DrawContext, width: u16) std.mem.Allocator.Error!vxfw.Surface {
         const items = self.app.thread.queued.items;
-        const sel = @min(self.app.queued_selection, items.len - 1);
+        const sel = @min(self.app.nav.queued_selection, items.len - 1);
         const message = items[sel];
         // Position suffix only when there's more than one to navigate.
         const position = if (items.len > 1)
@@ -6297,11 +6284,11 @@ test "down returns to multiline input after overshooting above top line" {
 
     // One more Up leaves the input for block navigation.
     try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.up } });
-    try std.testing.expect(app.block_nav);
+    try std.testing.expect(app.nav.block_nav);
 
     // With no transcript block selected, Down must return to the multiline input.
     try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.down } });
-    try std.testing.expect(!app.block_nav);
+    try std.testing.expect(!app.nav.block_nav);
     try std.testing.expectEqualStrings("top\nmid", app.inputs.input.buf.firstHalf());
 
     try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.down } });
@@ -6428,7 +6415,7 @@ test "ctrl-c clears a non-empty input instead of arming quit" {
 
     // The input is cleared and the quit sequence is not armed.
     try std.testing.expectEqual(@as(usize, 0), app.inputs.input.buf.realLength());
-    try std.testing.expect(app.pending_quit_at == null);
+    try std.testing.expect(app.nav.pending_quit_at == null);
     try std.testing.expect(!ctx.quit);
 }
 
@@ -6449,18 +6436,18 @@ test "down past the last block re-enters the input" {
     try std.testing.expectEqual(@as(?u32, 2), app.thread.transcript.selected);
 
     // In block navigation, up walks to an earlier block.
-    app.block_nav = true;
+    app.nav.block_nav = true;
     _ = try app.handleTranscriptKey(.{ .codepoint = vaxis.Key.up });
     try std.testing.expectEqual(@as(?u32, 1), app.thread.transcript.selected);
 
     // Down walks back toward the last block, still navigating blocks.
     _ = try app.handleTranscriptKey(.{ .codepoint = vaxis.Key.down });
     try std.testing.expectEqual(@as(?u32, 2), app.thread.transcript.selected);
-    try std.testing.expect(app.block_nav);
+    try std.testing.expect(app.nav.block_nav);
 
     // Down again on the last block hands control back to the input.
     _ = try app.handleTranscriptKey(.{ .codepoint = vaxis.Key.down });
-    try std.testing.expect(!app.block_nav);
+    try std.testing.expect(!app.nav.block_nav);
     try std.testing.expectEqual(@as(?u32, 2), app.thread.transcript.selected);
 }
 
@@ -6478,10 +6465,10 @@ test "down past the last block moves into multiline input" {
     // Put the cursor on the top line, just before the newline. Re-entering
     // from block navigation should step down into the input line below.
     app.inputs.input.buf.moveGapLeft("\nmiddle".len);
-    app.block_nav = true;
+    app.nav.block_nav = true;
 
     try std.testing.expect(try app.handleTranscriptKey(.{ .codepoint = vaxis.Key.down }));
-    try std.testing.expect(!app.block_nav);
+    try std.testing.expect(!app.nav.block_nav);
     try std.testing.expectEqualStrings("top\nmid", app.inputs.input.buf.firstHalf());
 }
 
@@ -6858,13 +6845,13 @@ test "alt navigation and ctrl-steer drive the queued message line" {
     try std.testing.expect(!try app.beginSubmit());
 
     // Newest is selected after queueing.
-    try std.testing.expectEqual(@as(usize, 1), app.queued_selection);
+    try std.testing.expectEqual(@as(usize, 1), app.nav.queued_selection);
 
     // ALT+← walks back to the older message; clamps at the front.
     app.selectPrevQueued();
-    try std.testing.expectEqual(@as(usize, 0), app.queued_selection);
+    try std.testing.expectEqual(@as(usize, 0), app.nav.queued_selection);
     app.selectPrevQueued();
-    try std.testing.expectEqual(@as(usize, 0), app.queued_selection);
+    try std.testing.expectEqual(@as(usize, 0), app.nav.queued_selection);
 
     // CTRL+→ steers the selected message in both the mirror and agent queue.
     app.steerSelectedQueued();
@@ -6886,7 +6873,7 @@ test "alt navigation and ctrl-steer drive the queued message line" {
 
     // ALT+→ moves to the newer, still-queued message: back to "[...]".
     app.selectNextQueued();
-    try std.testing.expectEqual(@as(usize, 1), app.queued_selection);
+    try std.testing.expectEqual(@as(usize, 1), app.nav.queued_selection);
     const surface2 = try input_widget.widget().draw(ctx);
     try std.testing.expectEqualStrings("[", surface2.children[0].surface.readCell(0, 0).char.grapheme);
 }
@@ -7560,9 +7547,9 @@ test "menu navigation wraps and model reasoning tab cycles" {
     defer app.deinit();
 
     app.mode = .command;
-    app.command_selection = commandMatchesCountForFilter(&app, "") - 1;
+    app.nav.command_selection = commandMatchesCountForFilter(&app, "") - 1;
     try std.testing.expect(try app.handleCommandKey(.{ .codepoint = vaxis.Key.down }));
-    try std.testing.expectEqual(@as(u32, 0), app.command_selection);
+    try std.testing.expectEqual(@as(u32, 0), app.nav.command_selection);
 
     const models = try codex.loadStaticModels(gpa);
     defer gpa.free(models);

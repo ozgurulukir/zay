@@ -49,3 +49,21 @@ pub const PickerStates = struct {
     models: model_catalogue.ModelCatalogue = .{},
     provider: provider_picker.State = .{},
 };
+
+/// Navigation cursors and the cross-pane selection state. Owns the
+/// current position in each picker/menu (command, resume, lanes,
+/// transcript) plus the quit-double-tap timestamp and the lane-chip
+/// hit-test rect.
+pub const NavState = struct {
+    pub const LanesPurpose = enum { manage, merge_dest };
+
+    block_nav: bool = false,
+    command_selection: u32 = 0,
+    resume_selection: u32 = 0,
+    resume_global: bool = false,
+    lanes_selection: u32 = 0,
+    lanes_purpose: LanesPurpose = .manage,
+    queued_selection: usize = 0,
+    pending_quit_at: ?std.Io.Timestamp = null,
+    lanes_chip_rect: ?tui.ChipRect = null,
+};
