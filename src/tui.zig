@@ -450,6 +450,14 @@ pub const App = struct {
         return self.lanes_purpose;
     }
 
+    pub fn getCommandSelection(self: *App) u32 {
+        return self.command_selection;
+    }
+
+    pub fn setCommandSelection(self: *App, v: u32) void {
+        self.command_selection = v;
+    }
+
     pub fn popProviderKeyInput(self: *App) void {
         const items = self.provider_key_input.items;
         if (items.len == 0) return;
@@ -1184,15 +1192,7 @@ pub const App = struct {
     }
 
     pub fn handleCommandMenuKey(self: *App, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.up, .{})) {
-            self.command_selection = previousIndex(self.command_selection, commandMatchesCount(self));
-            return true;
-        }
-        if (key.matches(vaxis.Key.down, .{})) {
-            self.command_selection = nextIndex(self.command_selection, commandMatchesCount(self));
-            return true;
-        }
-        return false;
+        return command_router.CommandMenu.handle(self, key);
     }
 
     pub fn handleTranscriptKey(self: *App, key: vaxis.Key) !bool {
@@ -5204,13 +5204,13 @@ fn resolveCommand(app: *App, filter: []const u8) ?Command {
     return null;
 }
 
-fn commandMatchesCount(app: *App) u32 {
+pub fn commandMatchesCount(app: *App) u32 {
     const filter = app.peekPaletteInput() catch return 0;
     defer app.gpa.free(filter);
     return commandMatchesCountForFilter(app, filter);
 }
 
-fn commandMatchesCountForFilter(app: *const App, filter: []const u8) u32 {
+pub fn commandMatchesCountForFilter(app: *const App, filter: []const u8) u32 {
     var count: u32 = 0;
     for (commands) |entry| {
         if (!commandVisible(app, entry)) continue;

@@ -221,11 +221,22 @@ const Lanes = struct {
 
 /// Slash-command menu mode.
 ///
-/// R2.1 stub: forwards to `App.handleCommandMenuKey`. Real implementation
-/// lands in R2.7.
+/// Up/down move the cursor through the filtered command list. The
+/// filter itself is owned by the input widget; this struct only owns
+/// the selection.
 const CommandMenu = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
-        return app.handleCommandMenuKey(key);
+        if (key.matches(vaxis.Key.up, .{})) {
+            const next = previousIndex(app.getCommandSelection(), tui.commandMatchesCount(app));
+            app.setCommandSelection(next);
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{})) {
+            const next = nextIndex(app.getCommandSelection(), tui.commandMatchesCount(app));
+            app.setCommandSelection(next);
+            return true;
+        }
+        return false;
     }
 };
 
