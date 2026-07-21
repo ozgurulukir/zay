@@ -244,14 +244,17 @@ const CommandMenu = struct {
 ///
 /// The largest arm — split into three sub-handlers (R2.8a/b/c) that each
 /// own one concern: mention popup selection, block navigation, and
-/// multi-lane switching. The full arm body still lives in
-/// `App.handleTranscriptKey` for now; R2.8a/b/c incrementally move each
-/// concern out.
+/// multi-lane switching. Each sub-handler returns true if it consumed
+/// the key; Transcript.handle short-circuits and returns. The full arm
+/// body still lives in `App.handleTranscriptKey` for the bits not yet
+/// extracted.
 const Transcript = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
         // R2.8a: @-mention popup owns up/down while active.
         if (try MentionPopup.handle(app, key)) return true;
-        // R2.8b + R2.8c: still on App.handleTranscriptKey.
+        // R2.8b: block navigation owns shift+down and plain up/down.
+        if (try BlockNav.handle(app, key)) return true;
+        // R2.8c: lane switching and transcript toggle (lands later).
         return app.handleTranscriptKey(key);
     }
 };
@@ -274,5 +277,45 @@ const MentionPopup = struct {
             return true;
         }
         return false;
+    }
+};
+
+/// R2.8b: Block navigation through the transcript.
+///
+/// Shift+Down jumps to the bottom (re-entering the input when needed).
+/// Plain Up/Down walks blocks: stepping down past the last block (when
+/// it can't scroll further) re-enters the input and traps the cursor
+/// there. Auto-scroll follows the navigation state.
+const BlockNav = struct {
+    pub fn handle(app: *App, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.down, .{ .shift = true })) {
+            app.jumpTranscriptToBottom();
+            return true;
+        }
+        if (key.matches(vaxis.Key.up, .{})) {
+            _ = app.navigateTranscript(.previous);
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{})) {
+            // Stepping down past the last block (when it can't scroll further)
+            // re-enters the input and traps the cursor there again.
+            if (app.getBlockNav() and app.selectionIsLastMessage() and !app.selectedMessageCanScrollDown()) {
+                app.setBlockNav(false);
+                app.setThreadAutoScroll(true);
+                _ = try app.moveInputCursorVertical(.down);
+                return true;
+            }
+            const scrolled = app.navigateTranscript(.next);
+            app.setThreadAutoScroll(!scrolled and app.selectionIsLastMessage() and !app.selectedMessageIsLong());
+            return true;
+        }
+        return false;
+    }
+};
+
+/// R2.8c stub: still in App.handleTranscriptKey. Lands in R2.8c.
+const LaneSwitch = struct {
+    pub fn handle(_: *App, _: vaxis.Key) !bool {
+        @panic("LaneSwitch.handle: R2.8b stub — implementation lands in R2.8c");
     }
 };

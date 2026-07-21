@@ -59,7 +59,7 @@ const long_message_scroll_step_rows: u16 = 3;
 /// How many recent parent-lane messages ride along as branch-naming context
 /// when a lane is forked with `/parallel`.
 const lane_naming_context_max: usize = 3;
-const TranscriptNavigation = enum { previous, next };
+pub const TranscriptNavigation = enum { previous, next };
 const MentionSearchKind = enum { file, skill };
 
 const DiffCounts = struct {
@@ -1208,29 +1208,8 @@ pub const App = struct {
     }
 
     pub fn handleTranscriptKey(self: *App, key: vaxis.Key) !bool {
-        // The @-mention popup is handled by command_router.MentionPopup
-        // before this method is called.
-        if (key.matches(vaxis.Key.down, .{ .shift = true })) {
-            self.jumpTranscriptToBottom();
-            return true;
-        }
-        if (key.matches(vaxis.Key.up, .{})) {
-            _ = self.navigateTranscript(.previous);
-            return true;
-        }
-        if (key.matches(vaxis.Key.down, .{})) {
-            // Stepping down past the last block (when it can't scroll further)
-            // re-enters the input and traps the cursor there again.
-            if (self.block_nav and self.selectionIsLastMessage() and !self.selectedMessageCanScrollDown()) {
-                self.block_nav = false;
-                self.thread.auto_scroll = true;
-                _ = try self.moveInputCursorVertical(.down);
-                return true;
-            }
-            const scrolled = self.navigateTranscript(.next);
-            self.thread.auto_scroll = !scrolled and self.selectionIsLastMessage() and !self.selectedMessageIsLong();
-            return true;
-        }
+        // The @-mention popup and block nav are handled by
+        // command_router.{MentionPopup,BlockNav} before this method.
         if (self.threads.items.len > 1) {
             if (key.matches(vaxis.Key.tab, .{ .shift = true }) or key.matches(vaxis.Key.right, .{ .shift = true })) {
                 self.cycleLane(1);
@@ -2950,7 +2929,7 @@ pub const App = struct {
     /// ends. No-op with a single lane. Switching the active lane matters in both
     /// layouts: it moves the ● marker in split view and swaps the visible column
     /// when fullscreened.
-    fn cycleLane(self: *App, delta: i32) void {
+    pub fn cycleLane(self: *App, delta: i32) void {
         const n = self.threads.items.len;
         if (n < 2) return;
         const cur: i32 = @intCast(self.activeIndex());
@@ -3401,7 +3380,7 @@ pub const App = struct {
         return true;
     }
 
-    fn selectionIsLastMessage(self: *const App) bool {
+    pub fn selectionIsLastMessage(self: *const App) bool {
         const selected = self.thread.transcript.selected orelse return false;
         if (self.thread.transcript.messages.items.len == 0) return false;
         return selected == self.thread.transcript.messages.items.len - 1;
@@ -3522,7 +3501,7 @@ pub const App = struct {
         self.diff = state;
     }
 
-    fn jumpTranscriptToBottom(self: *App) void {
+    pub fn jumpTranscriptToBottom(self: *App) void {
         self.block_nav = false;
         self.thread.transcript.selectLast();
         self.thread.auto_scroll = true;
@@ -3536,7 +3515,7 @@ pub const App = struct {
             !self.selectedMessageIsLong();
     }
 
-    fn navigateTranscript(self: *App, direction: TranscriptNavigation) bool {
+    pub fn navigateTranscript(self: *App, direction: TranscriptNavigation) bool {
         self.thread.auto_scroll = false;
         if (self.scrollSelectedLongMessage(direction)) return true;
 
@@ -3574,7 +3553,7 @@ pub const App = struct {
         }
     }
 
-    fn selectedMessageIsLong(self: *const App) bool {
+    pub fn selectedMessageIsLong(self: *const App) bool {
         const selected = self.thread.transcript.selected orelse return false;
         if (selected >= self.thread.transcript.messages.items.len) return false;
         const rows = messageRowsCached(&self.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(self.thread.transcript_view_width));
@@ -3584,7 +3563,7 @@ pub const App = struct {
     /// True when the selected message is taller than the viewport and still has
     /// rows hidden below the current scroll offset (mirrors the `.next` branch of
     /// `scrollSelectedLongMessage`).
-    fn selectedMessageCanScrollDown(self: *const App) bool {
+    pub fn selectedMessageCanScrollDown(self: *const App) bool {
         const selected = self.thread.transcript.selected orelse return false;
         if (selected >= self.thread.transcript.messages.items.len) return false;
         const rows = messageRowsCached(&self.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(self.thread.transcript_view_width));
