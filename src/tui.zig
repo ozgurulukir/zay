@@ -24,6 +24,7 @@ const naming_mod = @import("tui/naming.zig");
 const Turn = @import("tui/turn.zig");
 const model_catalogue = @import("tui/model_catalogue.zig");
 const tui_turn_view = @import("tui/turn_view.zig");
+const event_router = @import("tui/event_router.zig");
 const Thread = @import("tui/thread.zig");
 const tui_metrics = @import("tui/metrics.zig");
 const tui_message = @import("tui/widgets/message.zig");
@@ -122,7 +123,7 @@ const ChipRect = struct {
     col: u16,
     width: u16,
 
-    fn contains(self: ChipRect, row: i16, col: i16) bool {
+    pub fn contains(self: ChipRect, row: i16, col: i16) bool {
         if (row < 0 or col < 0) return false;
         const r: u16 = @intCast(row);
         const c: u16 = @intCast(col);
@@ -374,6 +375,94 @@ pub const App = struct {
         self.input.onChange = inputChanged;
         self.palette_input.userdata = self;
         self.palette_input.onChange = paletteInputChanged;
+    }
+
+    // --- Accessors for cross-module access (R1: event_router needs these
+    // because Zig 0.16 forbids `pub` on struct fields). Pure read/write
+    // forwarding — prefer existing semantic methods when one fits. ----------
+
+    pub fn getIo(self: *const App) std.Io {
+        return self.io;
+    }
+
+    pub fn inputWidget(self: *App) vxfw.Widget {
+        return self.input.widget();
+    }
+
+    pub fn inputRealLength(self: *const App) usize {
+        return self.input.buf.realLength();
+    }
+
+    pub fn isNormalMode(self: *const App) bool {
+        return self.mode == .normal;
+    }
+
+    pub fn isDiffViewerMode(self: *const App) bool {
+        return self.mode == .diff_viewer;
+    }
+
+    pub fn getBackgroundModal(self: *const App) bool {
+        return self.background_modal;
+    }
+
+    pub fn setBackgroundModal(self: *App, v: bool) void {
+        self.background_modal = v;
+    }
+
+    pub fn isAtSearchActive(self: *const App) bool {
+        return self.at_active;
+    }
+
+    pub fn atSearchHasResults(self: *const App) bool {
+        return self.at_results.items.len > 0;
+    }
+
+    pub fn getBlockNav(self: *const App) bool {
+        return self.block_nav;
+    }
+
+    pub fn setBlockNav(self: *App, v: bool) void {
+        self.block_nav = v;
+    }
+
+    pub fn getPendingQuitAt(self: *const App) ?std.Io.Timestamp {
+        return self.pending_quit_at;
+    }
+
+    pub fn setPendingQuitAt(self: *App, v: ?std.Io.Timestamp) void {
+        self.pending_quit_at = v;
+    }
+
+    pub fn clearPendingQuitAt(self: *App) void {
+        self.pending_quit_at = null;
+    }
+
+    pub fn getSplit(self: *const App) bool {
+        return self.split;
+    }
+
+    pub fn setSplit(self: *App, v: bool) void {
+        self.split = v;
+    }
+
+    pub fn getLanesChipRect(self: *const App) ?ChipRect {
+        return self.lanes_chip_rect;
+    }
+
+    pub fn turnStateIsActive(self: *const App) bool {
+        return self.thread.turn.state == .active;
+    }
+
+    pub fn queuedCount(self: *const App) usize {
+        return self.thread.queued.items.len;
+    }
+
+    pub fn transcriptHasSelection(self: *const App) bool {
+        return self.thread.transcript.selected != null;
+    }
+
+    pub fn setThreadAutoScroll(self: *App, v: bool) void {
+        self.thread.auto_scroll = v;
     }
 
     pub fn deinit(self: *App) void {
@@ -765,7 +854,7 @@ pub const App = struct {
 
     /// Toggle the `Ctrl+O` modal. Opening is a no-op when nothing is running, so
     /// the key only ever surfaces a modal with content.
-    fn toggleBackgroundModal(self: *App) void {
+    pub fn toggleBackgroundModal(self: *App) void {
         if (!self.background_modal and self.runningBackgroundCount() == 0) return;
         self.background_modal = !self.background_modal;
         self.background_selection = 0;
@@ -774,7 +863,7 @@ pub const App = struct {
 
     /// Route a key to the open background-jobs modal. Returns true when the key
     /// changed visible state (caller redraws), false when it was swallowed.
-    fn handleBackgroundModalKey(self: *App, key: vaxis.Key) bool {
+    pub fn handleBackgroundModalKey(self: *App, key: vaxis.Key) bool {
         const count = self.runningBackgroundCount();
         if (count == 0) return false;
         if (self.background_selection >= count) self.background_selection = count - 1;
@@ -824,12 +913,12 @@ pub const App = struct {
         if (self.blackhole_frame >= blackhole.frame_count) self.blackhole_frame = 0;
     }
 
-    fn permissionPending(self: *App) bool {
+    pub fn permissionPending(self: *App) bool {
         const worker = if (self.thread.worker_context) |*context| context else return false;
         return worker.approval.pending(worker.io);
     }
 
-    fn handlePermissionKey(self: *App, key: vaxis.Key) !bool {
+    pub fn handlePermissionKey(self: *App, key: vaxis.Key) !bool {
         if (key.matches(vaxis.Key.left, .{})) {
             self.thread.permission_selection = .approve;
             return true;
@@ -861,7 +950,7 @@ pub const App = struct {
         return false;
     }
 
-    fn resolvePermission(self: *App, decision: agent_worker.ApprovalDecision) !void {
+    pub fn resolvePermission(self: *App, decision: agent_worker.ApprovalDecision) !void {
         const worker = if (self.thread.worker_context) |*context| context else return;
         try worker.approval.resolve(worker.io, decision);
         self.thread.permission_scroll = 0;
@@ -1225,7 +1314,7 @@ pub const App = struct {
         self.command_selection = 0;
     }
 
-    fn cancelMode(self: *App) !bool {
+    pub fn cancelMode(self: *App) !bool {
         if (self.mode == .normal) return false;
         // Esc inside the provider setup form returns to the provider list.
         if (self.mode == .provider_picker and self.provider_picker.stage == .form) {
@@ -1357,7 +1446,7 @@ pub const App = struct {
         return false;
     }
 
-    fn openCommandMenu(self: *App) !void {
+    pub fn openCommandMenu(self: *App) !void {
         self.mode = .command;
         self.clearInput();
         self.clearPaletteInput();
@@ -1535,7 +1624,7 @@ pub const App = struct {
         try self.models.snapshot(self.gpa);
     }
 
-    fn startModelLoad(self: *App, catalog: ModelCatalog, merge: bool) !void {
+    pub fn startModelLoad(self: *App, catalog: ModelCatalog, merge: bool) !void {
         self.cancelModelLoad();
         // A connected-provider sweep fetches every configured provider, so its
         // result is authoritative for all badges; an openai_codex load touches no
@@ -2380,7 +2469,7 @@ pub const App = struct {
         vcs.restore(self.gpa, self.io, rt.cwd, index, sha) catch return;
     }
 
-    fn clearInput(self: *App) void {
+    pub fn clearInput(self: *App) void {
         self.input.clearRetainingCapacity();
     }
 
@@ -2467,7 +2556,7 @@ pub const App = struct {
     }
 
     /// Replace the active mention token with the selected path or skill name.
-    fn acceptAtSelection(self: *App) !void {
+    pub fn acceptAtSelection(self: *App) !void {
         if (self.at_selection >= self.at_results.items.len) return;
         const before = self.input.buf.firstHalf();
         const active_start = switch (self.at_kind) {
@@ -2488,7 +2577,7 @@ pub const App = struct {
         self.at_results.clearRetainingCapacity();
     }
 
-    fn closeAtSearch(self: *App) void {
+    pub fn closeAtSearch(self: *App) void {
         self.at_active = false;
         self.at_indexing = false;
         self.at_selection = 0;
@@ -2528,13 +2617,13 @@ pub const App = struct {
     }
 
     /// Move the queued-message selection one older (ALT+←).
-    fn selectPrevQueued(self: *App) void {
+    pub fn selectPrevQueued(self: *App) void {
         if (self.thread.queued.items.len == 0) return;
         if (self.queued_selection > 0) self.queued_selection -= 1;
     }
 
     /// Move the queued-message selection one newer (ALT+→).
-    fn selectNextQueued(self: *App) void {
+    pub fn selectNextQueued(self: *App) void {
         const len = self.thread.queued.items.len;
         if (len == 0) return;
         if (self.queued_selection + 1 < len) self.queued_selection += 1;
@@ -2543,7 +2632,7 @@ pub const App = struct {
     /// Mark the selected queued message to steer (CTRL+→). One-way: it will be
     /// injected after the next tool batch. Updates both the UI mirror and the
     /// agent queue so the worker's drain decision matches what's on screen.
-    fn steerSelectedQueued(self: *App) void {
+    pub fn steerSelectedQueued(self: *App) void {
         const items = self.thread.queued.items;
         if (items.len == 0) return;
         const index = @min(self.queued_selection, items.len - 1);
@@ -2935,7 +3024,7 @@ pub const App = struct {
     /// No-op with a single lane — there's nothing to tile, so the state would be
     /// invisible. When fullscreened while other lanes remain, the pink "N Lanes"
     /// chip surfaces the hidden lanes and offers a click-back to split.
-    fn toggleLaneFullscreen(self: *App) void {
+    pub fn toggleLaneFullscreen(self: *App) void {
         if (self.threads.items.len < 2) return;
         self.split = !self.split;
     }
@@ -3343,7 +3432,7 @@ pub const App = struct {
         return wrappedTextRows(ctx, text, width);
     }
 
-    fn insertInputNewline(self: *App) !void {
+    pub fn insertInputNewline(self: *App) !void {
         try self.input.insertSliceAtCursor("\n");
         try self.updateAtSearch();
     }
@@ -3353,7 +3442,7 @@ pub const App = struct {
     /// manual breaks behaves like a multi-row text area, not a single logical
     /// line. Returns false when there is no row to move to (top/bottom), so the
     /// caller can hand control to block navigation.
-    fn moveInputCursorVertical(self: *App, move: VerticalMove) !bool {
+    pub fn moveInputCursorVertical(self: *App, move: VerticalMove) !bool {
         const text = try self.peekInput();
         defer self.gpa.free(text);
         const cur = self.input.buf.firstHalf().len;
@@ -3418,7 +3507,7 @@ pub const App = struct {
         return true;
     }
 
-    fn scheduleDiffRefresh(self: *App) !void {
+    pub fn scheduleDiffRefresh(self: *App) !void {
         if (self.diff_refresh_future != null) {
             self.diff_refresh_again = true;
             return;
@@ -3515,7 +3604,7 @@ pub const App = struct {
         self.thread.transcript_list.scroll.wants_cursor = false;
     }
 
-    fn updateMouseAutoScroll(self: *App) void {
+    pub fn updateMouseAutoScroll(self: *App) void {
         self.thread.auto_scroll = !self.thread.transcript_list.scroll.has_more and
             self.selectionIsLastMessage() and
             !self.selectedMessageIsLong();
@@ -3801,7 +3890,7 @@ fn loadGitLabel(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) ![]const u8
     return gpa.dupe(u8, out);
 }
 
-const RootWidget = struct {
+pub const RootWidget = struct {
     app: *App,
     spinner_tick_accum: u32 = 0,
     blackhole_tick_accum: u32 = 0,
@@ -3819,205 +3908,7 @@ const RootWidget = struct {
 
     fn captureEvent(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
         const self: *RootWidget = @ptrCast(@alignCast(ptr));
-        switch (event) {
-            .init => {
-                try ctx.requestFocus(self.app.input.widget());
-                try self.ensureTick(ctx);
-                // Warm the diff cache in the background so the first `/diff`
-                // opens instantly instead of cold-loading.
-                self.app.scheduleDiffRefresh() catch {};
-                // Warm the model catalogue in the background: this one fetch both
-                // populates the model picker and drives the provider [CONNECTED]
-                // badges (via per-provider outcomes), so an expired key shows
-                // DISCONNECTED without a separate probe.
-                self.app.startModelLoad(.connected_provider, false) catch {};
-                ctx.consumeAndRedraw();
-            },
-            .mouse => |mouse| {
-                // Scrolling may bring the logo back into view; the tick stops
-                // itself again on the next frame if it didn't.
-                try self.ensureTick(ctx);
-                if (mouse.button == .wheel_up) self.app.thread.auto_scroll = false;
-                if (mouse.button == .wheel_down) self.app.updateMouseAutoScroll();
-                if (mouse.type == .press and mouse.button == .left) {
-                    if (self.app.lanes_chip_rect) |rect| {
-                        if (rect.contains(mouse.row, mouse.col)) {
-                            self.app.split = true;
-                            ctx.consumeAndRedraw();
-                            return;
-                        }
-                    }
-                }
-            },
-            .key_press => |key| {
-                try self.ensureTick(ctx);
-                // The diff viewer is a self-contained full-screen mode: it owns
-                // every key (including Esc) so it can manage its own sub-states.
-                if (self.app.mode == .diff_viewer) {
-                    try self.handleDiffViewerEvent(ctx, key);
-                    return;
-                }
-                if (key.matches(vaxis.Key.escape, .{})) {
-                    if (self.app.background_modal) {
-                        self.app.background_modal = false;
-                        ctx.consumeAndRedraw();
-                        return;
-                    }
-                    if (self.app.permissionPending()) {
-                        try self.app.resolvePermission(.reject);
-                        ctx.consumeAndRedraw();
-                        return;
-                    }
-                    if (self.app.at_active) {
-                        self.app.closeAtSearch();
-                        ctx.consumeAndRedraw();
-                        return;
-                    }
-                    if (try self.app.cancelMode()) {
-                        try self.syncFocus(ctx);
-                        ctx.consumeAndRedraw();
-                        return;
-                    }
-                    if (self.app.thread.turn.state == .active) {
-                        try self.app.handleInterrupt();
-                        ctx.consumeAndRedraw();
-                        return;
-                    }
-                    // No in-flight turn and no overlay to close — swallow the
-                    // key so the user doesn't accidentally exit the TUI.
-                    self.app.pending_quit_at = null;
-                    ctx.consume_event = true;
-                    return;
-                }
-                if (key.matches('o', .{ .ctrl = true })) {
-                    self.app.pending_quit_at = null;
-                    self.app.toggleBackgroundModal();
-                    ctx.consumeAndRedraw();
-                    return;
-                }
-                if (key.matches('l', .{ .ctrl = true }) or key.matches('l', .{ .super = true })) {
-                    self.app.pending_quit_at = null;
-                    self.app.toggleLaneFullscreen();
-                    ctx.consumeAndRedraw();
-                    return;
-                }
-                // While the jobs modal is open it owns navigation/cancel keys.
-                if (self.app.background_modal and self.app.mode == .normal) {
-                    self.app.pending_quit_at = null;
-                    if (self.app.handleBackgroundModalKey(key)) ctx.consumeAndRedraw() else ctx.consumeEvent();
-                    return;
-                }
-                if (key.matches('c', .{ .ctrl = true })) {
-                    if (self.app.mode == .normal and self.app.input.buf.realLength() > 0) {
-                        self.app.clearInput();
-                        self.app.closeAtSearch();
-                        self.app.block_nav = false;
-                        self.app.pending_quit_at = null;
-                        ctx.consumeAndRedraw();
-                        return;
-                    }
-                    const now = std.Io.Timestamp.now(self.app.io, .awake);
-                    if (self.app.pending_quit_at) |first_press| {
-                        const elapsed_ns = first_press.durationTo(now).nanoseconds;
-                        const threshold_ns: i128 = @as(i128, App.ctrl_c_double_press_ms) * std.time.ns_per_ms;
-                        if (elapsed_ns >= 0 and elapsed_ns <= threshold_ns) {
-                            ctx.quit = true;
-                            ctx.consume_event = true;
-                            return;
-                        }
-                    }
-                    self.app.pending_quit_at = now;
-                    ctx.consume_event = true;
-                    return;
-                }
-                // Any other key cancels the pending-quit prompt.
-                self.app.pending_quit_at = null;
-                if (self.app.permissionPending()) {
-                    if (try self.app.handlePermissionKey(key)) {
-                        ctx.consumeAndRedraw();
-                    } else {
-                        ctx.consumeEvent();
-                    }
-                    return;
-                }
-                if (shouldOpenCommandMenuForSlash(self.app, key)) {
-                    try self.app.openCommandMenu();
-                    try self.syncFocus(ctx);
-                    ctx.consumeAndRedraw();
-                    return;
-                }
-                if (self.app.mode == .normal and key.matches(vaxis.Key.enter, .{ .shift = true })) {
-                    try self.app.insertInputNewline();
-                    ctx.consumeAndRedraw();
-                    return;
-                }
-                if (key.matches(vaxis.Key.enter, .{})) {
-                    if (self.app.at_active and self.app.at_results.items.len > 0) {
-                        try self.app.acceptAtSelection();
-                        ctx.consumeAndRedraw();
-                        return;
-                    }
-                    try self.submit(ctx);
-                    return;
-                }
-                // Arrow keys are owned by the input until the cursor leaves the
-                // top of it. While the input owns them (`!block_nav`) up/down
-                // move the cursor between lines; going up past the first line
-                // hands control to block navigation, and down stays trapped in
-                // the input. Once in block navigation the arrows fall through to
-                // `handleTranscriptKey`, which walks blocks and re-enters the input
-                // when you press down past the last block. The @-mention popup
-                // keeps the arrows for itself.
-                if (self.app.mode == .normal and !self.app.at_active and self.app.thread.queued.items.len > 0) {
-                    // ALT+←/→ navigate queued messages; CTRL+→ steers the
-                    // selected one. Gated on a non-empty queue so the keys fall
-                    // through to normal cursor/word movement otherwise.
-                    if (key.matches(vaxis.Key.left, .{ .alt = true })) {
-                        self.app.selectPrevQueued();
-                        ctx.consumeAndRedraw();
-                        return;
-                    } else if (key.matches(vaxis.Key.right, .{ .alt = true })) {
-                        self.app.selectNextQueued();
-                        ctx.consumeAndRedraw();
-                        return;
-                    } else if (key.matches(vaxis.Key.right, .{ .ctrl = true })) {
-                        self.app.steerSelectedQueued();
-                        ctx.consumeAndRedraw();
-                        return;
-                    }
-                }
-                if (self.app.mode == .normal and !self.app.at_active) {
-                    if (key.matches(vaxis.Key.up, .{})) {
-                        if (!self.app.block_nav) {
-                            if (try self.app.moveInputCursorVertical(.up)) {
-                                ctx.consumeAndRedraw();
-                                return;
-                            }
-                            // Top line: leave the input and start walking blocks.
-                            self.app.block_nav = true;
-                        }
-                    } else if (key.matches(vaxis.Key.down, .{})) {
-                        if (self.app.block_nav) {
-                            if (self.app.thread.transcript.selected == null) {
-                                if (try self.app.moveInputCursorVertical(.down)) {
-                                    self.app.block_nav = false;
-                                    ctx.consumeAndRedraw();
-                                    return;
-                                }
-                            }
-                        } else {
-                            _ = try self.app.moveInputCursorVertical(.down);
-                            ctx.consumeAndRedraw();
-                            return;
-                        }
-                    }
-                }
-                if (try self.app.handleCommandKey(key)) {
-                    ctx.consumeAndRedraw();
-                }
-            },
-            else => {},
-        }
+        try event_router.captureEvent(self.app, self, ctx, event);
     }
 
     fn handleEvent(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
@@ -4104,14 +3995,14 @@ const RootWidget = struct {
 
     // Schedule the shared animation/drain tick if one isn't already pending.
     // Drives the spinner, agent-event draining, and the black-hole intro.
-    fn ensureTick(self: *RootWidget, ctx: *vxfw.EventContext) !void {
+    pub fn ensureTick(self: *RootWidget, ctx: *vxfw.EventContext) !void {
         if (self.app.loading_tick_active) return;
         self.app.loading_tick_active = true;
         self.spinner_tick_accum = 0;
         try ctx.tick(drain_tick_ms, self.widget());
     }
 
-    fn submit(self: *RootWidget, ctx: *vxfw.EventContext) !void {
+    pub fn submit(self: *RootWidget, ctx: *vxfw.EventContext) !void {
         if (try self.app.submitMode()) {
             try self.syncFocus(ctx);
             // Keep the tick alive to drain an async model load or diff refresh
@@ -4128,7 +4019,7 @@ const RootWidget = struct {
         ctx.consumeAndRedraw();
     }
 
-    fn syncFocus(self: *RootWidget, ctx: *vxfw.EventContext) !void {
+    pub fn syncFocus(self: *RootWidget, ctx: *vxfw.EventContext) !void {
         // The provider setup form draws its own inline editor and intentionally
         // omits the overlay search field. Focusing the (undrawn) palette input
         // would leave the focus path empty and panic on the next event, so keep
@@ -4368,7 +4259,7 @@ const RootWidget = struct {
 
     // --- Diff viewer ------------------------------------------------------
 
-    fn handleDiffViewerEvent(self: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+    pub fn handleDiffViewerEvent(self: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
         switch (self.app.diff.sub) {
             .browse => try self.handleDiffBrowseKey(ctx, key),
             .file_search => try self.handleDiffSearchKey(ctx, key),
@@ -5135,7 +5026,7 @@ fn firstVisibleWindow(selection: u32, count: u32, visible: u16) u32 {
     return @min(selection - v + 1, count - v);
 }
 
-fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
+pub fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
     if (!key.matches('/', .{})) return false;
     return switch (app.mode) {
         .normal => app.input.buf.realLength() == 0,
