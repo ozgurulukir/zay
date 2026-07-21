@@ -1345,7 +1345,7 @@ pub const App = struct {
     /// any) are stuffed into the main input so the caller can run them through
     /// the normal submit path; an Esc-style exit discards them. Returns true when
     /// there is text queued to submit.
-    fn closeDiffViewer(self: *App, send: bool) !bool {
+    pub fn closeDiffViewer(self: *App, send: bool) !bool {
         const composed = if (send) try self.diff.composeMessage(self.gpa) else null;
         self.diff.deinit(self.gpa);
         self.metrics.diff_loading = false;
@@ -2446,7 +2446,7 @@ pub const App = struct {
         self.nav.queued_selection = 0;
     }
 
-    fn clearPaletteInput(self: *App) void {
+    pub fn clearPaletteInput(self: *App) void {
         self.inputs.palette.clearRetainingCapacity();
     }
 
@@ -3652,99 +3652,7 @@ pub const RootWidget = struct {
     }
 
     fn handleDiffBrowseKey(self: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
-        const app = self.app;
-        // Esc / Ctrl+C exit cleanly (comments discarded); Ctrl+S exits and sends.
-        if (key.matches(vaxis.Key.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
-            try self.closeDiff(ctx, false);
-            return;
-        }
-        if (key.matches('s', .{ .ctrl = true })) {
-            try self.closeDiff(ctx, true);
-            return;
-        }
-        // Nothing to navigate or comment on while the diff is still loading (or
-        // genuinely empty) — swallow everything except the exit keys above.
-        if (app.diff.lines.items.len == 0) {
-            ctx.consumeEvent();
-            return;
-        }
-        if (key.matches('w', .{ .ctrl = true })) {
-            // Edit the comment on the exact selected range if one exists, else new.
-            const prefill = app.diff.beginComment();
-            app.inputs.comment.clearRetainingCapacity();
-            if (prefill.len > 0) try app.inputs.comment.insertSliceAtCursor(prefill);
-            try self.syncFocus(ctx);
-            ctx.consumeAndRedraw();
-            return;
-        }
-        if (key.matches('e', .{ .ctrl = true })) {
-            if (app.diff.editActiveComment()) |prefill| {
-                app.inputs.comment.clearRetainingCapacity();
-                if (prefill.len > 0) try app.inputs.comment.insertSliceAtCursor(prefill);
-                try self.syncFocus(ctx);
-                ctx.consumeAndRedraw();
-                return;
-            }
-            ctx.consumeEvent();
-            return;
-        }
-        if (key.matches('d', .{ .ctrl = true })) {
-            if (app.diff.deleteActiveComment(app.gpa)) ctx.consumeAndRedraw() else ctx.consumeEvent();
-            return;
-        }
-        if (key.matches('p', .{ .ctrl = true })) {
-            app.diff.sub = .file_search;
-            app.diff.search_sel = 0;
-            app.clearPaletteInput();
-            try app.diff.filterFiles(app.gpa, "");
-            try self.syncFocus(ctx);
-            ctx.consumeAndRedraw();
-            return;
-        }
-        // File jumps via Ctrl+↑/↓ (Ctrl+Shift+arrows aren't reported reliably).
-        if (key.matches(vaxis.Key.up, .{ .ctrl = true })) {
-            app.diff.jumpFile(-1);
-            ctx.consumeAndRedraw();
-            return;
-        }
-        if (key.matches(vaxis.Key.down, .{ .ctrl = true })) {
-            app.diff.jumpFile(1);
-            ctx.consumeAndRedraw();
-            return;
-        }
-        if (key.matches(vaxis.Key.up, .{ .shift = true })) {
-            app.diff.extendSelection(-1);
-            ctx.consumeAndRedraw();
-            return;
-        }
-        if (key.matches(vaxis.Key.down, .{ .shift = true })) {
-            app.diff.extendSelection(1);
-            ctx.consumeAndRedraw();
-            return;
-        }
-        if (key.matches(vaxis.Key.up, .{})) {
-            app.diff.moveCursor(-1);
-            ctx.consumeAndRedraw();
-            return;
-        }
-        if (key.matches(vaxis.Key.down, .{})) {
-            app.diff.moveCursor(1);
-            ctx.consumeAndRedraw();
-            return;
-        }
-        const page: i32 = @intCast(@max(@as(u16, 1), app.diff.viewport_rows));
-        if (key.matches(vaxis.Key.page_up, .{})) {
-            app.diff.moveCursor(-page);
-            ctx.consumeAndRedraw();
-            return;
-        }
-        if (key.matches(vaxis.Key.page_down, .{})) {
-            app.diff.moveCursor(page);
-            ctx.consumeAndRedraw();
-            return;
-        }
-        // Swallow anything else so stray keys don't leak to a focused widget.
-        ctx.consumeEvent();
+        try lifecycle.handleDiffBrowseKey(self, ctx, key);
     }
 
     fn handleDiffSearchKey(self: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
@@ -3800,13 +3708,7 @@ pub const RootWidget = struct {
     }
 
     fn closeDiff(self: *RootWidget, ctx: *vxfw.EventContext, send: bool) !void {
-        const has_comments = try self.app.closeDiffViewer(send);
-        try self.syncFocus(ctx);
-        if (has_comments) {
-            if (try self.app.beginSubmit()) try self.app.startTurn();
-            try self.ensureTick(ctx);
-        }
-        ctx.consumeAndRedraw();
+        try lifecycle.closeDiff(self, ctx, send);
     }
 };
 

@@ -257,3 +257,114 @@ pub fn createParallelLane(self: *App) !void {
     self.clearInput();
     self.resetTurnState();
 }
+
+/// Route keys while the user is browsing the `/diff` viewer body. Returns
+/// without consuming when a key targets the search popup or the comment editor
+/// (their own routers handle those).
+pub fn handleDiffBrowseKey(root: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+    const app = root.app;
+    // Esc / Ctrl+C exit cleanly (comments discarded); Ctrl+S exits and sends.
+    if (key.matches(vaxis.Key.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
+        try closeDiff(root, ctx, false);
+        return;
+    }
+    if (key.matches('s', .{ .ctrl = true })) {
+        try closeDiff(root, ctx, true);
+        return;
+    }
+    // Nothing to navigate or comment on while the diff is still loading (or
+    // genuinely empty) — swallow everything except the exit keys above.
+    if (app.diff.lines.items.len == 0) {
+        ctx.consumeEvent();
+        return;
+    }
+    if (key.matches('w', .{ .ctrl = true })) {
+        // Edit the comment on the exact selected range if one exists, else new.
+        const prefill = app.diff.beginComment();
+        app.inputs.comment.clearRetainingCapacity();
+        if (prefill.len > 0) try app.inputs.comment.insertSliceAtCursor(prefill);
+        try RootWidget.syncFocus(root, ctx);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (key.matches('e', .{ .ctrl = true })) {
+        if (app.diff.editActiveComment()) |prefill| {
+            app.inputs.comment.clearRetainingCapacity();
+            if (prefill.len > 0) try app.inputs.comment.insertSliceAtCursor(prefill);
+            try RootWidget.syncFocus(root, ctx);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        ctx.consumeEvent();
+        return;
+    }
+    if (key.matches('d', .{ .ctrl = true })) {
+        if (app.diff.deleteActiveComment(app.gpa)) ctx.consumeAndRedraw() else ctx.consumeEvent();
+        return;
+    }
+    if (key.matches('p', .{ .ctrl = true })) {
+        app.diff.sub = .file_search;
+        app.diff.search_sel = 0;
+        app.clearPaletteInput();
+        try app.diff.filterFiles(app.gpa, "");
+        try RootWidget.syncFocus(root, ctx);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    // File jumps via Ctrl+↑/↓ (Ctrl+Shift+arrows aren't reported reliably).
+    if (key.matches(vaxis.Key.up, .{ .ctrl = true })) {
+        app.diff.jumpFile(-1);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (key.matches(vaxis.Key.down, .{ .ctrl = true })) {
+        app.diff.jumpFile(1);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (key.matches(vaxis.Key.up, .{ .shift = true })) {
+        app.diff.extendSelection(-1);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (key.matches(vaxis.Key.down, .{ .shift = true })) {
+        app.diff.extendSelection(1);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (key.matches(vaxis.Key.up, .{})) {
+        app.diff.moveCursor(-1);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (key.matches(vaxis.Key.down, .{})) {
+        app.diff.moveCursor(1);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    const page: i32 = @intCast(@max(@as(u16, 1), app.diff.viewport_rows));
+    if (key.matches(vaxis.Key.page_up, .{})) {
+        app.diff.moveCursor(-page);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (key.matches(vaxis.Key.page_down, .{})) {
+        app.diff.moveCursor(page);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    // Swallow anything else so stray keys don't leak to a focused widget.
+    ctx.consumeEvent();
+}
+
+/// Close the `/diff` viewer, optionally saving any pending comments.
+/// When saved comments exist, begins a turn so the agent sees them.
+pub fn closeDiff(root: *RootWidget, ctx: *vxfw.EventContext, send: bool) !void {
+    const has_comments = try root.app.closeDiffViewer(send);
+    try RootWidget.syncFocus(root, ctx);
+    if (has_comments) {
+        if (try root.app.beginSubmit()) try root.app.startTurn();
+        try RootWidget.ensureTick(root, ctx);
+    }
+    ctx.consumeAndRedraw();
+}
