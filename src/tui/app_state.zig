@@ -83,3 +83,21 @@ pub const BackgroundModalState = struct {
     cancel_focus: bool = false,
     pending: std.ArrayList(BackgroundDelivery) = .empty,
 };
+
+/// Visual feedback state: the loading spinner frame, the black-hole
+/// intro animation frame, the cached git label, and the diff-cache
+/// fields (counts, refresh future, cache buffer, loading flag). The
+/// rendering code reads from here; the loader thread writes here.
+pub const MetricsState = struct {
+    loading_frame: u8 = 0,
+    loading_tick_active: bool = false,
+    blackhole_frame: u16 = 0,
+    blackhole_visible: bool = true,
+    git_label: []const u8 = "",
+    diff_counts: tui.DiffCounts = .{},
+    diff_refresh_future: ?std.Io.Future(tui.DiffRefreshOutcome) = null,
+    diff_refresh_done: std.atomic.Value(bool) = .init(false),
+    diff_refresh_again: bool = false,
+    diff_cache: ?[]u8 = null,
+    diff_loading: bool = false,
+};

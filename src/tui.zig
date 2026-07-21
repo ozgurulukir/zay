@@ -63,7 +63,7 @@ const lane_naming_context_max: usize = 3;
 pub const TranscriptNavigation = enum { previous, next };
 pub const MentionSearchKind = enum { file, skill };
 
-const DiffCounts = struct {
+pub const DiffCounts = struct {
     additions: u32 = 0,
     deletions: u32 = 0,
 };
@@ -80,7 +80,7 @@ const DiffRefreshJob = struct {
     }
 };
 
-const DiffRefreshOutcome = union(enum) {
+pub const DiffRefreshOutcome = union(enum) {
     /// The full combined diff text (owned). Counts are derived from it on the UI
     /// thread, and it's cached so `/diff` opens instantly.
     ready: []u8,
@@ -192,25 +192,9 @@ pub const App = struct {
     cached_config: config_mod.Config = .{},
     cached_config_owned: bool = false,
     retired_transcripts: std.ArrayList(transcript_mod.Transcript) = .empty,
-    loading_frame: u8 = 0,
-    loading_tick_active: bool = false,
-    // Black-hole intro animation. `blackhole_visible` is recomputed each draw
-    // (true only while the startup logo sits at the top of the viewport) and
-    // gates the animation tick so it stops costing anything once the logo
-    // scrolls away.
-    blackhole_frame: u16 = 0,
-    blackhole_visible: bool = true,
-    git_label: []const u8 = "",
-    diff_counts: DiffCounts = .{},
-    diff_refresh_future: ?std.Io.Future(DiffRefreshOutcome) = null,
-    diff_refresh_done: std.atomic.Value(bool) = .init(false),
-    diff_refresh_again: bool = false,
-    /// Most recent full diff text (owned), refreshed in the background alongside
-    /// the counts so `/diff` opens instantly. Null until the first refresh lands.
-    diff_cache: ?[]u8 = null,
-    /// True while the viewer is open on a cold cache, showing "Loading diff…"
-    /// until the background refresh populates it.
-    diff_loading: bool = false,
+    /// Visual feedback state (loading spinner, black-hole intro, diff
+    /// cache, git label) lives in MetricsState.
+    metrics: app_state.MetricsState = .{},
     resume_list: vxfw.ListView = .{
         .children = .{ .slice = &.{} },
         .draw_cursor = false,
@@ -259,7 +243,7 @@ pub const App = struct {
     /// A finished background job buffered for delivery to its owning lane.
     /// `owner` is the opaque `*Agent` token from the manager; `message` is the
     /// model-facing completion text (null when the job was killed — notice only).
-pub const BackgroundDelivery = app_state.BackgroundModalState.BackgroundDelivery;
+    pub const BackgroundDelivery = app_state.BackgroundModalState.BackgroundDelivery;
 
     const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message, lanes };
     pub const LanesPurpose = app_state.NavState.LanesPurpose;
@@ -562,8 +546,8 @@ pub const BackgroundDelivery = app_state.BackgroundModalState.BackgroundDelivery
         self.cancelDiffRefresh();
         // Non-empty labels are always heap-allocated by `loadGitLabel`; the
         // empty default is a literal, so guard on length before freeing.
-        if (self.git_label.len > 0) self.gpa.free(self.git_label);
-        if (self.diff_cache) |raw| self.gpa.free(raw);
+        if (self.metrics.git_label.len > 0) self.gpa.free(self.metrics.git_label);
+        if (self.metrics.diff_cache) |raw| self.gpa.free(raw);
         self.pickers.models.deinit(self.gpa);
         codex.freeApiKeyMap(self.gpa, &self.provider_api_keys);
         self.provider_key_input.deinit(self.gpa);
@@ -740,7 +724,7 @@ pub const BackgroundDelivery = app_state.BackgroundModalState.BackgroundDelivery
 
     fn resetTurnState(self: *App) void {
         self.thread.turn_view.reset(self.io);
-        self.loading_frame = 0;
+        self.metrics.loading_frame = 0;
         // Leave `transcript_auto_scroll` alone — if the user has scrolled away
         // from the tail to read older context, submitting another message
         // should not yank them back. They can scroll down (or arrow-down)
@@ -967,13 +951,13 @@ pub const BackgroundDelivery = app_state.BackgroundModalState.BackgroundDelivery
 
     fn advanceLoadingFrame(self: *App) void {
         std.debug.assert(tui_message.loading_frames.len > 0);
-        self.loading_frame +%= 1;
-        if (self.loading_frame >= tui_message.loading_frames.len) self.loading_frame = 0;
+        self.metrics.loading_frame +%= 1;
+        if (self.metrics.loading_frame >= tui_message.loading_frames.len) self.metrics.loading_frame = 0;
     }
 
     fn advanceBlackholeFrame(self: *App) void {
-        self.blackhole_frame += 1;
-        if (self.blackhole_frame >= blackhole.frame_count) self.blackhole_frame = 0;
+        self.metrics.blackhole_frame += 1;
+        if (self.metrics.blackhole_frame >= blackhole.frame_count) self.metrics.blackhole_frame = 0;
     }
 
     pub fn permissionPending(self: *App) bool {
@@ -1421,8 +1405,8 @@ pub const BackgroundDelivery = app_state.BackgroundModalState.BackgroundDelivery
         if (self.liveRuntime() == null) return error.NoWorkingDirectory;
         self.enterDiffMode();
 
-        if (self.diff_cache) |raw| {
-            self.diff_loading = false;
+        if (self.metrics.diff_cache) |raw| {
+            self.metrics.diff_loading = false;
             var state = try diff_viewer.fromRaw(self.gpa, raw);
             if (state.isEmpty()) {
                 state.deinit(self.gpa);
@@ -1438,8 +1422,8 @@ pub const BackgroundDelivery = app_state.BackgroundModalState.BackgroundDelivery
         // Cold start: show the loading state and kick (or ride) a refresh.
         self.diff.deinit(self.gpa);
         self.diff = .{};
-        self.diff_loading = true;
-        if (self.diff_refresh_future == null) try self.scheduleDiffRefresh();
+        self.metrics.diff_loading = true;
+        if (self.metrics.diff_refresh_future == null) try self.scheduleDiffRefresh();
     }
 
     fn enterDiffMode(self: *App) void {
@@ -1447,7 +1431,7 @@ pub const BackgroundDelivery = app_state.BackgroundModalState.BackgroundDelivery
         // The diff viewer never draws the transcript, so the black-hole visibility
         // (recomputed only there) would stay stuck true and drive a pointless
         // continuous redraw/tick loop. Park it off while in the viewer.
-        self.blackhole_visible = false;
+        self.metrics.blackhole_visible = false;
         self.clearInput();
         self.clearPaletteInput();
         self.inputs.comment.clearRetainingCapacity();
@@ -1469,7 +1453,7 @@ pub const BackgroundDelivery = app_state.BackgroundModalState.BackgroundDelivery
     fn closeDiffViewer(self: *App, send: bool) !bool {
         const composed = if (send) try self.diff.composeMessage(self.gpa) else null;
         self.diff.deinit(self.gpa);
-        self.diff_loading = false;
+        self.metrics.diff_loading = false;
         self.mode = .normal;
         self.clearInput();
         self.clearPaletteInput();
@@ -3344,8 +3328,8 @@ pub const BackgroundDelivery = app_state.BackgroundModalState.BackgroundDelivery
     }
 
     fn diffCountsVisible(self: *const App) bool {
-        if (self.diff_counts.additions > 0) return true;
-        return self.diff_counts.deletions > 0;
+        if (self.metrics.diff_counts.additions > 0) return true;
+        return self.metrics.diff_counts.deletions > 0;
     }
 
     fn refreshDiffCounts(self: *App) !bool {
@@ -3362,16 +3346,16 @@ pub const BackgroundDelivery = app_state.BackgroundModalState.BackgroundDelivery
     }
 
     fn installDiffCounts(self: *App, next: DiffCounts) bool {
-        if (next.additions == self.diff_counts.additions) {
-            if (next.deletions == self.diff_counts.deletions) return false;
+        if (next.additions == self.metrics.diff_counts.additions) {
+            if (next.deletions == self.metrics.diff_counts.deletions) return false;
         }
-        self.diff_counts = next;
+        self.metrics.diff_counts = next;
         return true;
     }
 
     pub fn scheduleDiffRefresh(self: *App) !void {
-        if (self.diff_refresh_future != null) {
-            self.diff_refresh_again = true;
+        if (self.metrics.diff_refresh_future != null) {
+            self.metrics.diff_refresh_again = true;
             return;
         }
 
@@ -3385,32 +3369,32 @@ pub const BackgroundDelivery = app_state.BackgroundModalState.BackgroundDelivery
             .gpa = self.gpa,
             .io = self.io,
             .cwd = cwd,
-            .done = &self.diff_refresh_done,
+            .done = &self.metrics.diff_refresh_done,
         };
         errdefer job.deinit();
 
-        self.diff_refresh_again = false;
-        self.diff_refresh_done.store(false, .release);
-        self.diff_refresh_future = try self.io.concurrent(runDiffRefresh, .{job});
+        self.metrics.diff_refresh_again = false;
+        self.metrics.diff_refresh_done.store(false, .release);
+        self.metrics.diff_refresh_future = try self.io.concurrent(runDiffRefresh, .{job});
     }
 
     fn cancelDiffRefresh(self: *App) void {
-        if (self.diff_refresh_future) |*future| {
+        if (self.metrics.diff_refresh_future) |*future| {
             var outcome = future.cancel(self.io);
             outcome.deinit(self.gpa);
-            self.diff_refresh_future = null;
+            self.metrics.diff_refresh_future = null;
         }
-        self.diff_refresh_again = false;
-        self.diff_refresh_done.store(false, .release);
+        self.metrics.diff_refresh_again = false;
+        self.metrics.diff_refresh_done.store(false, .release);
     }
 
     fn drainDiffRefresh(self: *App) !bool {
-        if (self.diff_refresh_future == null) return false;
-        if (!self.diff_refresh_done.load(.acquire)) return false;
+        if (self.metrics.diff_refresh_future == null) return false;
+        if (!self.metrics.diff_refresh_done.load(.acquire)) return false;
 
-        var outcome = self.diff_refresh_future.?.await(self.io);
-        self.diff_refresh_future = null;
-        self.diff_refresh_done.store(false, .release);
+        var outcome = self.metrics.diff_refresh_future.?.await(self.io);
+        self.metrics.diff_refresh_future = null;
+        self.metrics.diff_refresh_done.store(false, .release);
         defer outcome.deinit(self.gpa);
 
         var visible_change = false;
@@ -3418,34 +3402,34 @@ pub const BackgroundDelivery = app_state.BackgroundModalState.BackgroundDelivery
             .ready => |raw| {
                 // Take ownership of the diff text into the cache; blank the local
                 // copy so the deferred deinit doesn't free what we kept.
-                if (self.diff_cache) |old| self.gpa.free(old);
-                self.diff_cache = raw;
+                if (self.metrics.diff_cache) |old| self.gpa.free(old);
+                self.metrics.diff_cache = raw;
                 outcome = .failed;
-                if (self.installDiffCounts(countDiff(self.diff_cache.?))) visible_change = true;
+                if (self.installDiffCounts(countDiff(self.metrics.diff_cache.?))) visible_change = true;
                 // A viewer opened on a cold cache is waiting on exactly this.
-                if (self.diff_loading) {
+                if (self.metrics.diff_loading) {
                     try self.populateDiffFromCache();
                     visible_change = true;
                 }
             },
             .failed => {
-                if (self.diff_loading) {
-                    self.diff_loading = false;
+                if (self.metrics.diff_loading) {
+                    self.metrics.diff_loading = false;
                     self.mode = .normal;
                     _ = try self.thread.transcript.append(self.gpa, .agent, "agent", "Couldn't load diff.");
                     visible_change = true;
                 }
             },
         }
-        if (self.diff_refresh_again) try self.scheduleDiffRefresh();
+        if (self.metrics.diff_refresh_again) try self.scheduleDiffRefresh();
         return visible_change;
     }
 
     /// Build the viewer's state from the cached diff (parse only — no git). Drops
     /// back to normal mode with a notice when the diff turned out empty.
     fn populateDiffFromCache(self: *App) !void {
-        self.diff_loading = false;
-        const raw = self.diff_cache orelse return;
+        self.metrics.diff_loading = false;
+        const raw = self.metrics.diff_cache orelse return;
         var state = try diff_viewer.fromRaw(self.gpa, raw);
         if (state.isEmpty()) {
             state.deinit(self.gpa);
@@ -3657,7 +3641,7 @@ pub fn run(
     // directly (see tui/blackhole.zig), so the body is intentionally empty.
     _ = try app.thread.transcript.append(gpa, .logo, "logo", "");
 
-    app.git_label = loadGitLabel(gpa, init.io, runtime.cwd) catch "";
+    app.metrics.git_label = loadGitLabel(gpa, init.io, runtime.cwd) catch "";
     _ = app.refreshDiffCounts() catch false;
 
     var root: RootWidget = .{ .app = &app };
@@ -3818,7 +3802,7 @@ pub const RootWidget = struct {
             self.diff_tick_accum = 0;
         }
 
-        if (self.app.blackhole_visible) {
+        if (self.app.metrics.blackhole_visible) {
             // Carry the remainder so the average interval tracks ~24 fps even
             // though the host tick (30 ms) is coarser than the frame interval.
             self.blackhole_tick_accum += drain_tick_ms;
@@ -3832,20 +3816,20 @@ pub const RootWidget = struct {
         }
 
         const model_loading = self.app.pickers.models.model_load_future != null;
-        const diff_loading = self.app.diff_refresh_future != null;
+        const diff_loading = self.app.metrics.diff_refresh_future != null;
         // Keep ticking while a turn is active OR interrupting, so the worker's
         // remaining events (and its terminal `turn_finished`) get drained.
         const should_tick = self.app.anyTurnActive() or
             model_loading or
             diff_loading or
-            self.app.blackhole_visible or
+            self.app.metrics.blackhole_visible or
             self.diff_refresh_pending or
             self.app.backgroundActive() or
             self.app.namingActive();
         if (should_tick) {
             try ctx.tick(drain_tick_ms, self.widget());
         } else {
-            self.app.loading_tick_active = false;
+            self.app.metrics.loading_tick_active = false;
         }
 
         if (visible_change) {
@@ -3858,8 +3842,8 @@ pub const RootWidget = struct {
     // Schedule the shared animation/drain tick if one isn't already pending.
     // Drives the spinner, agent-event draining, and the black-hole intro.
     pub fn ensureTick(self: *RootWidget, ctx: *vxfw.EventContext) !void {
-        if (self.app.loading_tick_active) return;
-        self.app.loading_tick_active = true;
+        if (self.app.metrics.loading_tick_active) return;
+        self.app.metrics.loading_tick_active = true;
         self.spinner_tick_accum = 0;
         try ctx.tick(drain_tick_ms, self.widget());
     }
@@ -3871,7 +3855,7 @@ pub const RootWidget = struct {
             // (e.g. the cold-start "Loading diff…" the /diff command kicked off),
             // or a turn a command started directly (e.g. /sync conflict
             // resolution injects one).
-            if (self.app.thread.turn.isActive() or self.app.pickers.models.model_load_future != null or self.app.diff_refresh_future != null) try self.ensureTick(ctx);
+            if (self.app.thread.turn.isActive() or self.app.pickers.models.model_load_future != null or self.app.metrics.diff_refresh_future != null) try self.ensureTick(ctx);
             ctx.consumeAndRedraw();
             return;
         }
@@ -4303,7 +4287,7 @@ pub const RootWidget = struct {
         var subs: [3]vxfw.SubSurface = undefined;
         var n: usize = 0;
 
-        if (app.diff_loading) {
+        if (app.metrics.diff_loading) {
             // Cold start: navigated in, diff still fetching in the background.
             panel.lineStyledAt(&surface, body_top + body_h / 2, "Loading diff…", ctx, 2, StylePalette.model_status) catch {};
         } else {
@@ -4919,7 +4903,7 @@ const LoadingWidget = struct {
         if (height > 0) {
             var row: u16 = if (height > 1) 1 else 0;
             const word = loading_spinners[self.app.thread.turn_view.loading_word_index];
-            tui_message.MessageWidget.drawLoading(&surface, word, self.app.loading_frame, &row, ctx);
+            tui_message.MessageWidget.drawLoading(&surface, word, self.app.metrics.loading_frame, &row, ctx);
         }
         return surface;
     }
@@ -4969,8 +4953,8 @@ const TranscriptWidget = struct {
             .arena = ctx.arena,
             .messages = self.thread.transcript.messages.items,
             .selected = self.thread.transcript.selected,
-            .loading_frame = self.app.loading_frame,
-            .blackhole_frame = self.app.blackhole_frame,
+            .loading_frame = self.app.metrics.loading_frame,
+            .blackhole_frame = self.app.metrics.blackhole_frame,
             .gpa = self.app.gpa,
         };
         self.thread.transcript_list.children = .{ .builder = .{ .userdata = &builder, .buildFn = MessageListBuilder.build } };
@@ -4991,7 +4975,7 @@ const TranscriptWidget = struct {
     // `scroll.top` advances and the animation tick is allowed to stop.
     fn updateBlackholeVisibility(self: *TranscriptWidget) void {
         const messages = self.thread.transcript.messages.items;
-        self.app.blackhole_visible = messages.len > 0 and
+        self.app.metrics.blackhole_visible = messages.len > 0 and
             messages[0].kind == .logo and
             self.thread.transcript_list.scroll.top == 0;
     }
@@ -6042,7 +6026,7 @@ const InputWidget = struct {
         // Bottom-right: git branch info at the edge.
         const bottom = border_height -| 1;
         const right_edge = max_width -| 3; // last interior cell before the corner margin
-        _ = writeBorderTextEndingAt(&surface, ctx, bottom, right_edge, self.app.git_label, StylePalette.thinking_body);
+        _ = writeBorderTextEndingAt(&surface, ctx, bottom, right_edge, self.app.metrics.git_label, StylePalette.thinking_body);
         return surface;
     }
 
@@ -6102,7 +6086,7 @@ const InputWidget = struct {
         const diff_width: u16 = 13;
         const surface_width = @min(diff_width, width);
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = surface_width, .height = 1 });
-        if (surface_width > 0) writeDiffCounts(&surface, ctx, self.app.diff_counts);
+        if (surface_width > 0) writeDiffCounts(&surface, ctx, self.app.metrics.diff_counts);
         children[child_index] = .{
             .origin = .{ .row = row, .col = width -| 2 -| surface_width },
             .surface = surface,
