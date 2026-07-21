@@ -6,10 +6,9 @@ Always consult the tigerstyle skill when writing code.
 
 ## Setup
 
-- `code-tandem` lives at `/home/aristo/.local/bin/code-tandem`; server stays active for code search/coupling analysis.
-- The project is indexed with ~1404 symbols; use `index_workspace` then `semantic_search` for conceptual queries, `grep` for exact patterns.
-- After cloning, vendor `fff` (build into `vendor/fff/libfff_c.so`) and the ModernBERT ONNX model. Both are gitignored.
+- After cloning, vendor `fff` (build into `vendor/fff/libfff_c.so`) and the ModernBERT ONNX model (`vendor/local-models/ModernBERT-bash-classifier`). Both are gitignored.
 - Use `OMP_WAIT_POLICY=passive` at runtime to avoid MKL/CPU spin in the embedding worker.
+- `zig build install -Doptimize=ReleaseFast --prefix $HOME/.local` produces an installable binary under `~/.local/bin/`.
 
 ## Building the TUI
 
@@ -20,6 +19,28 @@ Prefer to use the primitives provided by the framework as much as possible.
 **vxfw gotcha:** widget methods like `TextField.widget()` are *mutating* — they take `*Self`, not `*const Self`. Accessors that return `*TextField` from a struct must be declared on `*App`, not `*const App`, or the call site fails to type-check.
 
 **Zig 0.16 field rule:** `pub` cannot precede a field declaration — only functions/variables. Cross-module field access goes through `pub fn` accessors (`getX()` form, never `X()`, because of the field-vs-method name collision).
+
+**TUI module split.** `src/tui.zig` holds the `App` lifecycle and the top-level
+`RootWidget`; the rest of `src/tui/` is split by concern. See `README.md`
+Architecture for the current module list (kept in sync as `tui.zig` shrinks).
+The split is tracked as the `tui-split` sub-project under
+`_pm/Projects/tui-split/` with phases R1–R5 (R1–R4 done).
+
+**Widget extraction pattern.** Isolated widgets live under `src/tui/widgets/`.
+A new widget file declares the outer border widget as
+`pub const NameWidget = struct { app: *App, pub fn widget(...) vxfw.Widget { ... } }`
+and a private `Inner` struct built inside `draw()` from a `vxfw.DrawContext`.
+The file imports `const tui = @import("../../tui.zig");`,
+`const tui_style = @import("../style.zig");`, `const panel = @import("panel.zig");`
+and re-aliases `const App = tui.App;`. Nested types from other modules
+(e.g. `BackgroundManager.JobView`, `ApprovalSnapshot`) are re-exported through
+`pub const` in `tui.zig` so widget files can reach them as `tui.<module>.<Type>`.
+
+**Per-mode command routing.** `src/tui/command_router.zig` holds one struct per
+`App.Mode` variant. Each struct owns a `handle` method that used to be a private
+method on `App`; the dispatcher is a free function delegating to the right
+struct. This is the place to add new per-mode logic — don't reintroduce
+private methods on `App` for key handling.
 
 ## Zig Development
 
