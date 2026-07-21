@@ -13,9 +13,12 @@ const tui = @import("../tui.zig");
 const agent_mod = @import("../agent.zig");
 const blackhole = @import("../tui/blackhole.zig");
 const codex = @import("../codex.zig");
+const runtime_mod = @import("../runtime.zig");
+const vcs = @import("../vcs.zig");
 
 const App = tui.App;
 const RootWidget = tui.RootWidget;
+const Thread = tui.Thread;
 
 /// Tear down every lane, background job, picker, cache, and input buffer.
 /// Called once at clean exit (or when switching to a new `initRuntime` session).
@@ -189,4 +192,68 @@ fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
         root.diff_refresh_pending = true;
     }
     return visible_change;
+}
+
+/// Fork a parallel lane: create a git worktree, new runtime, and a fresh
+/// Thread. Up to 4 lanes (2×2 grid). Called from the command palette (/parallel)
+/// and from `App.submitMode` (command palette dispatch).
+pub fn createParallelLane(self: *App) !void {
+    if (self.threads.items.len >= 4) return error.TooManyLanes; // the split grid is 2×2
+    const repo = self.repoRoot() orelse return error.NoActiveRuntime;
+    const home = (self.liveRuntime() orelse return error.NoActiveRuntime).home_dir;
+    if (!vcs.isRepo(self.gpa, self.io, repo)) return error.NotAGitRepo;
+
+    // Recent parent-lane messages give the branch-naming request context
+    // for vague first prompts ("try the other approach").
+    const context = try self.captureLaneContext(tui.lane_naming_context_max);
+    errdefer {
+        for (context) |message| self.gpa.free(message);
+        if (context.len > 0) self.gpa.free(context);
+    }
+
+    var raw: [6]u8 = undefined;
+    self.io.random(&raw);
+    const id = std.fmt.bytesToHex(raw, .lower);
+
+    const branch = try std.fmt.allocPrint(self.gpa, "nova/{s}", .{id[0..]});
+    errdefer self.gpa.free(branch);
+
+    // Worktrees live under the global `<home>/.nova/worktrees`, OUTSIDE the
+    // repo, so `git add -A`/snapshots/`/save` never see them.
+    const parent = try std.fs.path.join(self.gpa, &.{ home, ".nova", "worktrees" });
+    defer self.gpa.free(parent);
+    std.Io.Dir.cwd().createDirPath(self.io, parent) catch {};
+    const dest = try std.fs.path.join(self.gpa, &.{ parent, id[0..] });
+    errdefer self.gpa.free(dest);
+
+    try vcs.worktreeAdd(self.gpa, self.io, repo, dest, branch);
+    errdefer vcs.worktreeRemove(self.gpa, self.io, repo, dest) catch {};
+
+    const runtime = try self.createRuntime(dest, repo, null);
+    errdefer {
+        runtime.deinit();
+        self.gpa.destroy(runtime);
+    }
+
+    const lane = try self.gpa.create(Thread);
+    errdefer self.gpa.destroy(lane);
+    lane.* = .{
+        .id = runtime.session_writer.session.id,
+        .agent = &runtime.agent,
+        .worker_context = .{ .io = self.io, .gpa = runtime.gpa },
+        .parent_context = context,
+        .engine = .{ .live = .{
+            .lane = .{ .working = .{ .branch = branch, .path = dest } },
+            .runtime = runtime,
+            .owns = true,
+        } },
+    };
+    try self.threads.append(self.gpa, lane);
+
+    // Committed: `threads` owns `lane`, which owns `runtime`/`branch`/`dest`.
+    self.thread = lane;
+    self.split = true; // a new lane implies tiling so both are visible
+    self.mode = .normal;
+    self.clearInput();
+    self.resetTurnState();
 }

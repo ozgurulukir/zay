@@ -72,7 +72,7 @@ const command_prefix: u8 = '/';
 const long_message_scroll_step_rows: u16 = 3;
 /// How many recent parent-lane messages ride along as branch-naming context
 /// when a lane is forked with `/parallel`.
-const lane_naming_context_max: usize = 3;
+pub const lane_naming_context_max: usize = 3;
 pub const TranscriptNavigation = enum { previous, next };
 pub const MentionSearchKind = enum { file, skill };
 
@@ -676,7 +676,7 @@ pub const App = struct {
         );
     }
 
-    fn resetTurnState(self: *App) void {
+    pub fn resetTurnState(self: *App) void {
         self.thread.turn_view.reset(self.io);
         self.metrics.loading_frame = 0;
         // Leave `transcript_auto_scroll` alone — if the user has scrolled away
@@ -2497,7 +2497,7 @@ pub const App = struct {
         try self.rebuildTranscriptFromAgent();
     }
 
-    fn createRuntime(self: *App, cwd: []const u8, session_dir: []const u8, session_id: ?[]const u8) !*runtime_mod.AgentRuntime {
+    pub fn createRuntime(self: *App, cwd: []const u8, session_dir: []const u8, session_id: ?[]const u8) !*runtime_mod.AgentRuntime {
         const current = self.templateRuntime() orelse return error.NoActiveRuntime;
         const runtime = try self.gpa.create(runtime_mod.AgentRuntime);
         errdefer self.gpa.destroy(runtime);
@@ -2537,7 +2537,7 @@ pub const App = struct {
 
     /// Repo root = the primary lane's working directory (it was launched there).
     /// Null only if the primary somehow has no runtime (headless/test).
-    fn repoRoot(self: *const App) ?[]const u8 {
+    pub fn repoRoot(self: *const App) ?[]const u8 {
         return switch (self.threads.items[0].engine) {
             .live => |live| live.runtime.cwd,
             .idle => null,
@@ -2552,69 +2552,12 @@ pub const App = struct {
     /// `nova/<name>` once the model names it on the lane's first submit (see
     /// `scheduleLaneNaming` / `drainLaneNaming`). Refused mid-turn.
     fn createParallelLane(self: *App) !void {
-        if (self.threads.items.len >= 4) return error.TooManyLanes; // the split grid is 2×2
-        const repo = self.repoRoot() orelse return error.NoActiveRuntime;
-        const home = (self.liveRuntime() orelse return error.NoActiveRuntime).home_dir;
-        if (!vcs.isRepo(self.gpa, self.io, repo)) return error.NotAGitRepo;
-
-        // Recent parent-lane messages give the branch-naming request context
-        // for vague first prompts ("try the other approach").
-        const context = try self.captureLaneContext(lane_naming_context_max);
-        errdefer {
-            for (context) |message| self.gpa.free(message);
-            if (context.len > 0) self.gpa.free(context);
-        }
-
-        var raw: [6]u8 = undefined;
-        self.io.random(&raw);
-        const id = std.fmt.bytesToHex(raw, .lower);
-
-        const branch = try std.fmt.allocPrint(self.gpa, "nova/{s}", .{id[0..]});
-        errdefer self.gpa.free(branch);
-
-        // Worktrees live under the global `<home>/.nova/worktrees`, OUTSIDE the
-        // repo, so `git add -A`/snapshots/`/save` never see them.
-        const parent = try std.fs.path.join(self.gpa, &.{ home, ".nova", "worktrees" });
-        defer self.gpa.free(parent);
-        std.Io.Dir.cwd().createDirPath(self.io, parent) catch {};
-        const dest = try std.fs.path.join(self.gpa, &.{ parent, id[0..] });
-        errdefer self.gpa.free(dest);
-
-        try vcs.worktreeAdd(self.gpa, self.io, repo, dest, branch);
-        errdefer vcs.worktreeRemove(self.gpa, self.io, repo, dest) catch {};
-
-        const runtime = try self.createRuntime(dest, repo, null);
-        errdefer {
-            runtime.deinit();
-            self.gpa.destroy(runtime);
-        }
-
-        const lane = try self.gpa.create(Thread);
-        errdefer self.gpa.destroy(lane);
-        lane.* = .{
-            .id = runtime.session_writer.session.id,
-            .agent = &runtime.agent,
-            .worker_context = .{ .io = self.io, .gpa = runtime.gpa },
-            .parent_context = context,
-            .engine = .{ .live = .{
-                .lane = .{ .working = .{ .branch = branch, .path = dest } },
-                .runtime = runtime,
-                .owns = true,
-            } },
-        };
-        try self.threads.append(self.gpa, lane);
-
-        // Committed: `threads` owns `lane`, which owns `runtime`/`branch`/`dest`.
-        self.thread = lane;
-        self.split = true; // a new lane implies tiling so both are visible
-        self.mode = .normal;
-        self.clearInput();
-        self.resetTurnState();
+        try lifecycle.createParallelLane(self);
     }
 
     /// Copy the tail of the current lane's conversation (user + agent text,
     /// oldest first) as naming context for a lane forked from it.
-    fn captureLaneContext(self: *App, max: usize) ![][]u8 {
+    pub fn captureLaneContext(self: *App, max: usize) ![][]u8 {
         var out: std.ArrayList([]u8) = .empty;
         errdefer {
             for (out.items) |message| self.gpa.free(message);
