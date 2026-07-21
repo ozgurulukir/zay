@@ -25,6 +25,7 @@ const Turn = @import("tui/turn.zig");
 const model_catalogue = @import("tui/model_catalogue.zig");
 const tui_turn_view = @import("tui/turn_view.zig");
 const event_router = @import("tui/event_router.zig");
+const command_router = @import("tui/command_router.zig");
 const Thread = @import("tui/thread.zig");
 const tui_metrics = @import("tui/metrics.zig");
 const tui_message = @import("tui/widgets/message.zig");
@@ -399,6 +400,10 @@ pub const App = struct {
 
     pub fn isDiffViewerMode(self: *const App) bool {
         return self.mode == .diff_viewer;
+    }
+
+    pub fn getMode(self: *const App) Mode {
+        return self.mode;
     }
 
     pub fn getBackgroundModal(self: *const App) bool {
@@ -1102,24 +1107,10 @@ pub const App = struct {
     }
 
     pub fn handleCommandKey(self: *App, key: vaxis.Key) !bool {
-        return switch (self.mode) {
-            .provider_picker => self.handleProviderPickerKey(key),
-            .model_picker => self.handleModelPickerKey(key),
-            .session_picker => self.handleSessionPickerKey(key),
-            .tree_picker => self.handleTreePickerKey(key),
-            .lanes => self.handleLanesKey(key),
-            .command => self.handleCommandMenuKey(key),
-            // The diff viewer owns its keys directly in `captureEvent`; nothing
-            // reaches the generic dispatch.
-            .diff_viewer => false,
-            // The save prompt is a plain text field: Enter/Esc are handled in
-            // submit/cancel; every other key falls through to the focused input.
-            .save_message => false,
-            .normal => self.handleTranscriptKey(key),
-        };
+        return command_router.handleCommandKey(self, key);
     }
 
-    fn handleTreePickerKey(self: *App, key: vaxis.Key) !bool {
+    pub fn handleTreePickerKey(self: *App, key: vaxis.Key) !bool {
         if (key.matches(vaxis.Key.up, .{})) {
             self.tree_state.moveUp();
             return true;
@@ -1149,7 +1140,7 @@ pub const App = struct {
         return false;
     }
 
-    fn handleProviderPickerKey(self: *App, key: vaxis.Key) !bool {
+    pub fn handleProviderPickerKey(self: *App, key: vaxis.Key) !bool {
         // The setup form hosts its own inline API-key editor: capture typed text
         // and backspace here so nothing leaks to the (unused) overlay search row.
         if (self.provider_picker.stage == .form) {
@@ -1176,7 +1167,7 @@ pub const App = struct {
         self.provider_key_input.shrinkRetainingCapacity(cut);
     }
 
-    fn handleModelPickerKey(self: *App, key: vaxis.Key) !bool {
+    pub fn handleModelPickerKey(self: *App, key: vaxis.Key) !bool {
         if (key.matches(vaxis.Key.left, .{})) {
             self.models.model_column = self.models.model_column.previous();
             return true;
@@ -1204,7 +1195,7 @@ pub const App = struct {
         return false;
     }
 
-    fn handleSessionPickerKey(self: *App, key: vaxis.Key) !bool {
+    pub fn handleSessionPickerKey(self: *App, key: vaxis.Key) !bool {
         if (key.matches('a', .{ .ctrl = true })) {
             self.resume_global = !self.resume_global;
             self.resume_selection = 0;
@@ -1229,7 +1220,7 @@ pub const App = struct {
         return false;
     }
 
-    fn handleCommandMenuKey(self: *App, key: vaxis.Key) !bool {
+    pub fn handleCommandMenuKey(self: *App, key: vaxis.Key) !bool {
         if (key.matches(vaxis.Key.up, .{})) {
             self.command_selection = previousIndex(self.command_selection, commandMatchesCount(self));
             return true;
@@ -1241,7 +1232,7 @@ pub const App = struct {
         return false;
     }
 
-    fn handleTranscriptKey(self: *App, key: vaxis.Key) !bool {
+    pub fn handleTranscriptKey(self: *App, key: vaxis.Key) !bool {
         if (self.at_active and self.at_results.items.len > 0) {
             if (key.matches(vaxis.Key.up, .{})) {
                 self.at_selection = previousIndex(self.at_selection, @intCast(self.at_results.items.len));
@@ -3324,7 +3315,7 @@ pub const App = struct {
         }
     }
 
-    fn handleLanesKey(self: *App, key: vaxis.Key) !bool {
+    pub fn handleLanesKey(self: *App, key: vaxis.Key) !bool {
         if (key.matches(vaxis.Key.up, .{})) {
             if (self.lanes_selection > 0) self.lanes_selection -= 1;
             return true;
