@@ -410,6 +410,26 @@ pub const App = struct {
         return &self.tree_state;
     }
 
+    pub fn getProviderPicker(self: *App) *provider_picker.State {
+        return &self.provider_picker;
+    }
+
+    pub fn getProviderKeyInput(self: *App) *std.ArrayList(u8) {
+        return &self.provider_key_input;
+    }
+
+    pub fn popProviderKeyInput(self: *App) void {
+        const items = self.provider_key_input.items;
+        if (items.len == 0) return;
+        var cut = items.len - 1;
+        while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
+        self.provider_key_input.shrinkRetainingCapacity(cut);
+    }
+
+    pub fn isCodexSignedIn(self: *const App) bool {
+        return self.codex_signed_in;
+    }
+
     pub fn peekPaletteInput(self: *App) ![]u8 {
         const left = self.palette_input.buf.firstHalf();
         const right = self.palette_input.buf.secondHalf();
@@ -1121,33 +1141,6 @@ pub const App = struct {
 
     pub fn handleCommandKey(self: *App, key: vaxis.Key) !bool {
         return command_router.handleCommandKey(self, key);
-    }
-
-    pub fn handleProviderPickerKey(self: *App, key: vaxis.Key) !bool {
-        // The setup form hosts its own inline API-key editor: capture typed text
-        // and backspace here so nothing leaks to the (unused) overlay search row.
-        if (self.provider_picker.stage == .form) {
-            if (key.matches(vaxis.Key.backspace, .{})) {
-                self.popProviderKeyInput();
-                return true;
-            }
-            if (key.text) |text| {
-                try self.provider_key_input.appendSlice(self.gpa, text);
-                return true;
-            }
-            // Swallow everything else (arrows, tab) — Enter/Esc are handled upstream.
-            return true;
-        }
-        return self.provider_picker.handleKey(key, self.isCodexSignedIn());
-    }
-
-    /// Remove the last UTF-8 scalar from the inline API-key buffer.
-    fn popProviderKeyInput(self: *App) void {
-        const items = self.provider_key_input.items;
-        if (items.len == 0) return;
-        var cut = items.len - 1;
-        while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
-        self.provider_key_input.shrinkRetainingCapacity(cut);
     }
 
     pub fn handleModelPickerKey(self: *App, key: vaxis.Key) !bool {
@@ -2175,10 +2168,6 @@ pub const App = struct {
         for (self.models.compatible_models.items) |*model| model.deinit(self.gpa);
         self.models.compatible_models.clearRetainingCapacity();
         self.models.compatible_models_fetched = false;
-    }
-
-    fn isCodexSignedIn(self: *const App) bool {
-        return self.codex_signed_in;
     }
 
     fn hasOpenAICompatibleCredentials(self: *const App) bool {

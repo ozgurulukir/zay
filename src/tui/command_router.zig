@@ -89,11 +89,24 @@ const TreePicker = struct {
 
 /// Provider picker mode (provider list + API-key setup form).
 ///
-/// R2.1 stub: forwards to `App.handleProviderPickerKey`. Real
-/// implementation lands in R2.3.
+/// The setup form hosts its own inline API-key editor: capture typed text
+/// and backspace here so nothing leaks to the (unused) overlay search row.
+/// In list stage, delegate to the picker widget's own handleKey.
 const ProviderPicker = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
-        return app.handleProviderPickerKey(key);
+        if (app.getProviderPicker().stage == .form) {
+            if (key.matches(vaxis.Key.backspace, .{})) {
+                app.popProviderKeyInput();
+                return true;
+            }
+            if (key.text) |text| {
+                try app.getProviderKeyInput().appendSlice(app.gpa, text);
+                return true;
+            }
+            // Swallow everything else (arrows, tab) — Enter/Esc are handled upstream.
+            return true;
+        }
+        return app.getProviderPicker().handleKey(key, app.isCodexSignedIn());
     }
 };
 
