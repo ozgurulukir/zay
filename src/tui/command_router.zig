@@ -248,14 +248,15 @@ const CommandMenu = struct {
 /// the key; Transcript.handle short-circuits and returns. The full arm
 /// body still lives in `App.handleTranscriptKey` for the bits not yet
 /// extracted.
-const Transcript = struct {
+pub const Transcript = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
         // R2.8a: @-mention popup owns up/down while active.
         if (try MentionPopup.handle(app, key)) return true;
         // R2.8b: block navigation owns shift+down and plain up/down.
         if (try BlockNav.handle(app, key)) return true;
-        // R2.8c: lane switching and transcript toggle (lands later).
-        return app.handleTranscriptKey(key);
+        // R2.8c: lane switching and transcript toggle.
+        if (try LaneSwitch.handle(app, key)) return true;
+        return false;
     }
 };
 
@@ -263,7 +264,7 @@ const Transcript = struct {
 ///
 /// When the @-mention popup is open with results, up/down move the
 /// selection through the result list. Other keys fall through.
-const MentionPopup = struct {
+pub const MentionPopup = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
         if (!app.isAtSearchActive() or !app.atSearchHasResults()) return false;
         if (key.matches(vaxis.Key.up, .{})) {
@@ -286,7 +287,7 @@ const MentionPopup = struct {
 /// Plain Up/Down walks blocks: stepping down past the last block (when
 /// it can't scroll further) re-enters the input and traps the cursor
 /// there. Auto-scroll follows the navigation state.
-const BlockNav = struct {
+pub const BlockNav = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
         if (key.matches(vaxis.Key.down, .{ .shift = true })) {
             app.jumpTranscriptToBottom();
@@ -313,9 +314,27 @@ const BlockNav = struct {
     }
 };
 
-/// R2.8c stub: still in App.handleTranscriptKey. Lands in R2.8c.
-const LaneSwitch = struct {
-    pub fn handle(_: *App, _: vaxis.Key) !bool {
-        @panic("LaneSwitch.handle: R2.8b stub — implementation lands in R2.8c");
+/// R2.8c: Lane switching and transcript toggle.
+///
+/// With multiple lanes, Shift+Tab/Shift+Right cycle forward, Shift+Left
+/// cycles back. Plain Tab toggles the currently selected transcript
+/// block (used to copy from the transcript).
+pub const LaneSwitch = struct {
+    pub fn handle(app: *App, key: vaxis.Key) !bool {
+        if (app.threadsCount() > 1) {
+            if (key.matches(vaxis.Key.tab, .{ .shift = true }) or key.matches(vaxis.Key.right, .{ .shift = true })) {
+                app.cycleLane(1);
+                return true;
+            }
+            if (key.matches(vaxis.Key.left, .{ .shift = true })) {
+                app.cycleLane(-1);
+                return true;
+            }
+        }
+        if (key.matches(vaxis.Key.tab, .{})) {
+            app.toggleSelectedTranscriptBlock();
+            return true;
+        }
+        return false;
     }
 };

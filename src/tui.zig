@@ -507,6 +507,14 @@ pub const App = struct {
         return self.at_results.items.len;
     }
 
+    pub fn threadsCount(self: *const App) usize {
+        return self.threads.items.len;
+    }
+
+    pub fn toggleSelectedTranscriptBlock(self: *App) void {
+        self.thread.transcript.toggleSelected();
+    }
+
     pub fn getBlockNav(self: *const App) bool {
         return self.block_nav;
     }
@@ -1208,23 +1216,7 @@ pub const App = struct {
     }
 
     pub fn handleTranscriptKey(self: *App, key: vaxis.Key) !bool {
-        // The @-mention popup and block nav are handled by
-        // command_router.{MentionPopup,BlockNav} before this method.
-        if (self.threads.items.len > 1) {
-            if (key.matches(vaxis.Key.tab, .{ .shift = true }) or key.matches(vaxis.Key.right, .{ .shift = true })) {
-                self.cycleLane(1);
-                return true;
-            }
-            if (key.matches(vaxis.Key.left, .{ .shift = true })) {
-                self.cycleLane(-1);
-                return true;
-            }
-        }
-        if (key.matches(vaxis.Key.tab, .{})) {
-            self.thread.transcript.toggleSelected();
-            return true;
-        }
-        return false;
+        return command_router.Transcript.handle(self, key);
     }
 
     fn syncModeWithInput(self: *App, value: []const u8) !void {
