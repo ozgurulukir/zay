@@ -246,31 +246,23 @@ pub const App = struct {
     /// its address is stable for the agents that borrow it) and owned here; null
     /// on the headless/test path. See `background.zig`.
     background: ?*background_mod.BackgroundManager = null,
-    /// `Ctrl+O` background-jobs modal: open flag, selected row, and whether the
-    /// `[CANCEL]` button column has focus (right-arrow). Mirrors the permission
-    /// overlay's lightweight, mode-less state.
-    background_modal: bool = false,
-    background_selection: usize = 0,
-    background_cancel_focus: bool = false,
+    /// `Ctrl+O` background-jobs modal: open flag, selected row, the
+    /// `[CANCEL]` button focus hint, and the pending-delivery queue.
+    /// Mirrors the permission overlay's lightweight, mode-less state.
+    background_modal_state: app_state.BackgroundModalState = .{},
     /// Completed background jobs awaiting delivery. Held here (not pushed into a
     /// busy transcript) so the notice + model message land only when the owning
     /// lane is idle — "auto-start if idle, queue if in-flight". Owned; freed in
     /// `deinit`.
-    background_pending: std.ArrayList(BackgroundDelivery) = .empty,
-
     pub const ctrl_c_double_press_ms: u32 = 1500;
 
     /// A finished background job buffered for delivery to its owning lane.
     /// `owner` is the opaque `*Agent` token from the manager; `message` is the
     /// model-facing completion text (null when the job was killed — notice only).
-    const BackgroundDelivery = struct {
-        owner: *anyopaque,
-        notice: []u8,
-        message: ?[]u8,
-    };
+pub const BackgroundDelivery = app_state.BackgroundModalState.BackgroundDelivery;
 
     const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message, lanes };
-pub const LanesPurpose = app_state.NavState.LanesPurpose;
+    pub const LanesPurpose = app_state.NavState.LanesPurpose;
     const ModelCatalog = enum { connected_provider, openai_codex };
     const CheckpointState = enum { unknown, ready, unavailable };
     const ModelSource = model_loader.ModelSource;
@@ -453,11 +445,11 @@ pub const LanesPurpose = app_state.NavState.LanesPurpose;
     }
 
     pub fn getBackgroundModal(self: *const App) bool {
-        return self.background_modal;
+        return self.background_modal_state.modal;
     }
 
     pub fn setBackgroundModal(self: *App, v: bool) void {
-        self.background_modal = v;
+        self.background_modal_state.modal = v;
     }
 
     pub fn isAtSearchActive(self: *const App) bool {
@@ -556,8 +548,8 @@ pub const LanesPurpose = app_state.NavState.LanesPurpose;
             self.gpa.destroy(manager);
             self.background = null;
         }
-        for (self.background_pending.items) |*delivery| self.freeDelivery(delivery);
-        self.background_pending.deinit(self.gpa);
+        for (self.background_modal_state.pending.items) |*delivery| self.freeDelivery(delivery);
+        self.background_modal_state.pending.deinit(self.gpa);
         // Cancel the in-flight load first (it needs `io`), then free the
         // catalogue's owned lists + error in one pass.
         self.cancelModelLoad();
@@ -814,7 +806,7 @@ pub const LanesPurpose = app_state.NavState.LanesPurpose;
     /// Whether the drain/animation tick must stay alive for background work:
     /// jobs still running, or completions waiting to be delivered.
     fn backgroundActive(self: *App) bool {
-        if (self.background_pending.items.len > 0) return true;
+        if (self.background_modal_state.pending.items.len > 0) return true;
         const manager = self.background orelse return false;
         return manager.activeCount() > 0;
     }
@@ -835,7 +827,7 @@ pub const LanesPurpose = app_state.NavState.LanesPurpose;
             // frees the metadata.
             const message = job.completion_message;
             job.completion_message = null;
-            self.background_pending.append(self.gpa, .{
+            self.background_modal_state.pending.append(self.gpa, .{
                 .owner = job.owner,
                 .notice = notice,
                 .message = message,
@@ -865,11 +857,11 @@ pub const LanesPurpose = app_state.NavState.LanesPurpose;
         const active = self.thread;
         defer self.thread = active;
         var i: usize = 0;
-        while (i < self.background_pending.items.len) {
-            const delivery = &self.background_pending.items[i];
+        while (i < self.background_modal_state.pending.items.len) {
+            const delivery = &self.background_modal_state.pending.items[i];
             const lane = self.laneForAgent(@ptrCast(@alignCast(delivery.owner))) orelse {
                 self.freeDelivery(delivery);
-                _ = self.background_pending.orderedRemove(i);
+                _ = self.background_modal_state.pending.orderedRemove(i);
                 continue;
             };
             const composing = lane == active and self.inputs.input.buf.realLength() > 0;
@@ -882,7 +874,7 @@ pub const LanesPurpose = app_state.NavState.LanesPurpose;
             const start_turn = delivery.message != null;
             if (delivery.message) |message| lane.agent.?.enqueueRaw(message) catch {};
             self.freeDelivery(delivery);
-            _ = self.background_pending.orderedRemove(i);
+            _ = self.background_modal_state.pending.orderedRemove(i);
             if (start_turn) {
                 self.thread = lane;
                 self.startDeliveryTurnOnCurrentThread() catch {};
@@ -926,10 +918,10 @@ pub const LanesPurpose = app_state.NavState.LanesPurpose;
     /// Toggle the `Ctrl+O` modal. Opening is a no-op when nothing is running, so
     /// the key only ever surfaces a modal with content.
     pub fn toggleBackgroundModal(self: *App) void {
-        if (!self.background_modal and self.runningBackgroundCount() == 0) return;
-        self.background_modal = !self.background_modal;
-        self.background_selection = 0;
-        self.background_cancel_focus = false;
+        if (!self.background_modal_state.modal and self.runningBackgroundCount() == 0) return;
+        self.background_modal_state.modal = !self.background_modal_state.modal;
+        self.background_modal_state.selection = 0;
+        self.background_modal_state.cancel_focus = false;
     }
 
     /// Route a key to the open background-jobs modal. Returns true when the key
@@ -937,26 +929,26 @@ pub const LanesPurpose = app_state.NavState.LanesPurpose;
     pub fn handleBackgroundModalKey(self: *App, key: vaxis.Key) bool {
         const count = self.runningBackgroundCount();
         if (count == 0) return false;
-        if (self.background_selection >= count) self.background_selection = count - 1;
+        if (self.background_modal_state.selection >= count) self.background_modal_state.selection = count - 1;
         if (key.matches(vaxis.Key.up, .{})) {
-            if (self.background_selection > 0) self.background_selection -= 1;
-            self.background_cancel_focus = false;
+            if (self.background_modal_state.selection > 0) self.background_modal_state.selection -= 1;
+            self.background_modal_state.cancel_focus = false;
             return true;
         }
         if (key.matches(vaxis.Key.down, .{})) {
-            if (self.background_selection + 1 < count) self.background_selection += 1;
-            self.background_cancel_focus = false;
+            if (self.background_modal_state.selection + 1 < count) self.background_modal_state.selection += 1;
+            self.background_modal_state.cancel_focus = false;
             return true;
         }
         if (key.matches(vaxis.Key.left, .{})) {
-            self.background_cancel_focus = false;
+            self.background_modal_state.cancel_focus = false;
             return true;
         }
         if (key.matches(vaxis.Key.right, .{})) {
-            self.background_cancel_focus = true;
+            self.background_modal_state.cancel_focus = true;
             return true;
         }
-        if (self.background_cancel_focus and key.matches(vaxis.Key.enter, .{})) {
+        if (self.background_modal_state.cancel_focus and key.matches(vaxis.Key.enter, .{})) {
             self.cancelSelectedBackgroundJob();
             return true;
         }
@@ -968,9 +960,9 @@ pub const LanesPurpose = app_state.NavState.LanesPurpose;
         const views = manager.snapshot(self.gpa) catch return;
         defer background_mod.BackgroundManager.freeViews(self.gpa, views);
         if (views.len == 0) return;
-        const sel = @min(self.background_selection, views.len - 1);
+        const sel = @min(self.background_modal_state.selection, views.len - 1);
         _ = manager.cancel(views[sel].id);
-        self.background_cancel_focus = false;
+        self.background_modal_state.cancel_focus = false;
     }
 
     fn advanceLoadingFrame(self: *App) void {
@@ -3988,7 +3980,7 @@ pub const RootWidget = struct {
 
         const overlay_visible = self.app.mode != .normal;
         const permission_visible = self.app.permissionPending() and !overlay_visible;
-        const background_visible = self.app.background_modal and !overlay_visible and !permission_visible;
+        const background_visible = self.app.background_modal_state.modal and !overlay_visible and !permission_visible;
         const at_visible = self.app.at_search.active and !overlay_visible and !permission_visible and !background_visible;
 
         var child_count: usize = (if (split) self.app.threads.items.len else 1) + 1;
@@ -4388,8 +4380,8 @@ const BackgroundJobsWidget = struct {
         const inner = try ctx.arena.create(BackgroundJobsInner);
         inner.* = .{
             .views = views,
-            .selection = if (views.len == 0) 0 else @min(app.background_selection, views.len - 1),
-            .cancel_focus = app.background_cancel_focus,
+            .selection = if (views.len == 0) 0 else @min(app.background_modal_state.selection, views.len - 1),
+            .cancel_focus = app.background_modal_state.cancel_focus,
         };
         var border: vxfw.Border = .{
             .child = inner.widget(),

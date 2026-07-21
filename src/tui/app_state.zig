@@ -67,3 +67,19 @@ pub const NavState = struct {
     pending_quit_at: ?std.Io.Timestamp = null,
     lanes_chip_rect: ?tui.ChipRect = null,
 };
+
+/// State for the Ctrl+O background-jobs modal: the open flag, the
+/// selected row, the cancel-button focus hint, and the pending-delivery
+/// queue of background results to surface.
+pub const BackgroundModalState = struct {
+    pub const BackgroundDelivery = struct {
+        owner: *anyopaque,
+        notice: []u8,
+        message: ?[]u8,
+    };
+
+    modal: bool = false,
+    selection: usize = 0,
+    cancel_focus: bool = false,
+    pending: std.ArrayList(BackgroundDelivery) = .empty,
+};
