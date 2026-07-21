@@ -40,9 +40,12 @@ concern:
 - `command_router.zig` — per-mode key dispatch (one struct per `App.Mode`).
 - `app_state.zig` — `App` state grouped into sub-structs.
 - `background_delivery.zig` — background-job poll/format/deliver.
+- `layout.zig` — `rootLayout` math for `drawRoot` (transcript / loading / input row split).
+- `lane_column.zig` — per-lane bordered transcript column (split view).
+- `diff_viewer_overlay.zig` — full-screen `/diff` overlay.
 - `thread.zig` — `Thread` (lane) state, multi-lane state machine.
 - `turn.zig` / `turn_view.zig` — turn lifecycle + render.
-- `diff_viewer.zig` — `/diff` viewer widget.
+- `diff_viewer.zig` — `/diff` inline-diff helpers (used by `widgets/diff.zig`).
 - `model_catalogue.zig` / `model_loader.zig` / `model_cache.zig` — model
   catalogue, async loader, cached model handles.
 - `provider_controller.zig` — provider API controller.
@@ -53,5 +56,6 @@ concern:
   shared helpers and policies.
 
 `src/tui/widgets/` holds the per-widget draw code (message, command
-panel, at_search, lanes picker, model picker, provider picker, resume
-picker, tree selector, panel layout, tree art).
+panel, at_search, background_jobs, permission, diff, loading, transcript,
+lanes picker, model picker, provider picker, resume picker, tree selector,
+panel layout, tree art).
