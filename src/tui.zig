@@ -1124,7 +1124,7 @@ pub const App = struct {
         self.pickers.models.restore();
     }
 
-    fn submitMode(self: *App) !bool {
+    pub fn submitMode(self: *App) !bool {
         if (self.mode == .provider_picker) {
             if (self.pickers.provider.stage == .form) {
                 const provider = self.pickers.provider.form_provider orelse return true;
@@ -3564,7 +3564,7 @@ pub const RootWidget = struct {
     fn handleEvent(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
         const self: *RootWidget = @ptrCast(@alignCast(ptr));
         switch (event) {
-            .tick => try self.handleTick(ctx),
+            .tick => try lifecycle.handleTick(self, ctx),
             else => {},
         }
     }
@@ -3577,57 +3577,16 @@ pub const RootWidget = struct {
         try lifecycle.handleTick(self, ctx);
     }
 
-    // Schedule the shared animation/drain tick if one isn't already pending.
-    // Drives the spinner, agent-event draining, and the black-hole intro.
     pub fn ensureTick(self: *RootWidget, ctx: *vxfw.EventContext) !void {
-        if (self.app.metrics.loading_tick_active) return;
-        self.app.metrics.loading_tick_active = true;
-        self.spinner_tick_accum = 0;
-        try ctx.tick(drain_tick_ms, self.widget());
+        try lifecycle.ensureTick(self, ctx);
     }
 
     pub fn submit(self: *RootWidget, ctx: *vxfw.EventContext) !void {
-        if (try self.app.submitMode()) {
-            try self.syncFocus(ctx);
-            // Keep the tick alive to drain an async model load or diff refresh
-            // (e.g. the cold-start "Loading diff…" the /diff command kicked off),
-            // or a turn a command started directly (e.g. /sync conflict
-            // resolution injects one).
-            if (self.app.thread.turn.isActive() or self.app.pickers.models.model_load_future != null or self.app.metrics.diff_refresh_future != null) try self.ensureTick(ctx);
-            ctx.consumeAndRedraw();
-            return;
-        }
-        if (!try self.app.beginSubmit()) return;
-        try self.app.startTurn();
-        try self.ensureTick(ctx);
-        ctx.consumeAndRedraw();
+        try lifecycle.submit(self, ctx);
     }
 
     pub fn syncFocus(self: *RootWidget, ctx: *vxfw.EventContext) !void {
-        // The provider setup form draws its own inline editor and intentionally
-        // omits the overlay search field. Focusing the (undrawn) palette input
-        // would leave the focus path empty and panic on the next event, so keep
-        // focus on the root widget — it owns key handling via captureEvent anyway.
-        if (self.app.mode == .provider_picker and self.app.pickers.provider.stage == .form) {
-            try ctx.requestFocus(self.widget());
-            return;
-        }
-        const target = switch (self.app.mode) {
-            .command, .session_picker, .provider_picker, .model_picker, .tree_picker, .save_message => self.app.inputs.palette.widget(),
-            // The diff viewer routes focus by sub-state: the comment editor and
-            // the file-search field each host a drawn TextField; while browsing
-            // the root widget owns every key.
-            .diff_viewer => switch (self.app.diff.sub) {
-                .commenting => self.app.inputs.comment.widget(),
-                .file_search => self.app.inputs.palette.widget(),
-                .browse => self.widget(),
-            },
-            // The lanes overlay owns its keys via captureEvent; the palette input
-            // is unused, so keep focus on the root (typed keys are ignored).
-            .lanes => self.widget(),
-            .normal => self.app.inputs.input.widget(),
-        };
-        try ctx.requestFocus(target);
+        try lifecycle.syncFocus(self, ctx);
     }
 
     fn drainAgentEvents(self: *RootWidget, ctx: *vxfw.EventContext) !bool {
@@ -3645,11 +3604,7 @@ pub const RootWidget = struct {
     // --- Diff viewer ------------------------------------------------------
 
     pub fn handleDiffViewerEvent(self: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
-        switch (self.app.diff.sub) {
-            .browse => try self.handleDiffBrowseKey(ctx, key),
-            .file_search => try self.handleDiffSearchKey(ctx, key),
-            .commenting => try self.handleDiffCommentKey(ctx, key),
-        }
+        try lifecycle.handleDiffViewerEvent(self, ctx, key);
     }
 
     fn handleDiffBrowseKey(self: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {

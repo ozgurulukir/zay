@@ -185,7 +185,7 @@ fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
                 .tool_call_finished => refresh_diff = true,
                 else => {},
             }
-            if (lane.turn_view.awaitingOutput()) try tui.RootWidget.ensureTick(root, ctx);
+            if (lane.turn_view.awaitingOutput()) try ensureTick(root, ctx);
         }
     }
     if (refresh_diff) {
@@ -283,7 +283,7 @@ pub fn handleDiffBrowseKey(root: *RootWidget, ctx: *vxfw.EventContext, key: vaxi
         const prefill = app.diff.beginComment();
         app.inputs.comment.clearRetainingCapacity();
         if (prefill.len > 0) try app.inputs.comment.insertSliceAtCursor(prefill);
-        try RootWidget.syncFocus(root, ctx);
+        try syncFocus(root, ctx);
         ctx.consumeAndRedraw();
         return;
     }
@@ -291,7 +291,7 @@ pub fn handleDiffBrowseKey(root: *RootWidget, ctx: *vxfw.EventContext, key: vaxi
         if (app.diff.editActiveComment()) |prefill| {
             app.inputs.comment.clearRetainingCapacity();
             if (prefill.len > 0) try app.inputs.comment.insertSliceAtCursor(prefill);
-            try RootWidget.syncFocus(root, ctx);
+            try syncFocus(root, ctx);
             ctx.consumeAndRedraw();
             return;
         }
@@ -307,7 +307,7 @@ pub fn handleDiffBrowseKey(root: *RootWidget, ctx: *vxfw.EventContext, key: vaxi
         app.diff.search_sel = 0;
         app.clearPaletteInput();
         try app.diff.filterFiles(app.gpa, "");
-        try RootWidget.syncFocus(root, ctx);
+        try syncFocus(root, ctx);
         ctx.consumeAndRedraw();
         return;
     }
@@ -361,10 +361,10 @@ pub fn handleDiffBrowseKey(root: *RootWidget, ctx: *vxfw.EventContext, key: vaxi
 /// When saved comments exist, begins a turn so the agent sees them.
 pub fn closeDiff(root: *RootWidget, ctx: *vxfw.EventContext, send: bool) !void {
     const has_comments = try root.app.closeDiffViewer(send);
-    try RootWidget.syncFocus(root, ctx);
+    try syncFocus(root, ctx);
     if (has_comments) {
         if (try root.app.beginSubmit()) try root.app.startTurn();
-        try RootWidget.ensureTick(root, ctx);
+        try ensureTick(root, ctx);
     }
     ctx.consumeAndRedraw();
 }
@@ -376,7 +376,7 @@ pub fn handleDiffSearchKey(root: *RootWidget, ctx: *vxfw.EventContext, key: vaxi
     const app = root.app;
     if (key.matches(vaxis.Key.escape, .{})) {
         app.diff.sub = .browse;
-        try RootWidget.syncFocus(root, ctx);
+        try syncFocus(root, ctx);
         ctx.consumeAndRedraw();
         return;
     }
@@ -384,7 +384,7 @@ pub fn handleDiffSearchKey(root: *RootWidget, ctx: *vxfw.EventContext, key: vaxi
         const matches = app.diff.search_matches.items;
         if (matches.len > 0) app.diff.jumpToFile(matches[@min(app.diff.search_sel, matches.len - 1)]);
         app.diff.sub = .browse;
-        try RootWidget.syncFocus(root, ctx);
+        try syncFocus(root, ctx);
         ctx.consumeAndRedraw();
         return;
     }
@@ -410,7 +410,7 @@ pub fn handleDiffCommentKey(root: *RootWidget, ctx: *vxfw.EventContext, key: vax
         app.diff.sub = .browse;
         app.diff.sel_anchor = null;
         app.inputs.comment.clearRetainingCapacity();
-        try RootWidget.syncFocus(root, ctx);
+        try syncFocus(root, ctx);
         ctx.consumeAndRedraw();
         return;
     }
@@ -419,9 +419,77 @@ pub fn handleDiffCommentKey(root: *RootWidget, ctx: *vxfw.EventContext, key: vax
         defer app.gpa.free(draft);
         _ = try app.diff.saveComment(app.gpa, draft);
         app.inputs.comment.clearRetainingCapacity();
-        try RootWidget.syncFocus(root, ctx);
+        try syncFocus(root, ctx);
         ctx.consumeAndRedraw();
         return;
     }
     // Typed text / backspace handled by the focused comment input.
+}
+
+/// Route focus to the correct widget for the current mode. The provider
+/// setup form keeps focus on root (it draws its own editor); the diff
+/// viewer routes by sub-state (comment editor / file search / browse).
+pub fn syncFocus(root: *RootWidget, ctx: *vxfw.EventContext) !void {
+    const app = root.app;
+    // The provider setup form draws its own inline editor and intentionally
+    // omits the overlay search field. Focusing the (undrawn) palette input
+    // would leave the focus path empty and panic on the next event, so keep
+    // focus on the root widget — it owns key handling via captureEvent anyway.
+    if (app.mode == .provider_picker and app.pickers.provider.stage == .form) {
+        try ctx.requestFocus(root.widget());
+        return;
+    }
+    const target = switch (app.mode) {
+        .command, .session_picker, .provider_picker, .model_picker, .tree_picker, .save_message => app.inputs.palette.widget(),
+        // The diff viewer routes focus by sub-state: the comment editor and
+        // the file-search field each host a drawn TextField; while browsing
+        // the root widget owns every key.
+        .diff_viewer => switch (app.diff.sub) {
+            .commenting => app.inputs.comment.widget(),
+            .file_search => app.inputs.palette.widget(),
+            .browse => root.widget(),
+        },
+        // The lanes overlay owns its keys via captureEvent; the palette input
+        // is unused, so keep focus on the root (typed keys are ignored).
+        .lanes => root.widget(),
+        .normal => app.inputs.input.widget(),
+    };
+    try ctx.requestFocus(target);
+}
+
+/// Schedule the shared animation/drain tick if one isn't already pending.
+/// Drives the spinner, agent-event draining, and the black-hole intro.
+pub fn ensureTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
+    if (root.app.metrics.loading_tick_active) return;
+    root.app.metrics.loading_tick_active = true;
+    root.spinner_tick_accum = 0;
+    try ctx.tick(RootWidget.drain_tick_ms, root.widget());
+}
+
+/// Submit the current input: enter closes a picker, command runs the
+/// selected action, and normal mode starts a turn with the input text.
+pub fn submit(root: *RootWidget, ctx: *vxfw.EventContext) !void {
+    if (try root.app.submitMode()) {
+        try syncFocus(root, ctx);
+        // Keep the tick alive to drain an async model load or diff refresh
+        // (e.g. the cold-start "Loading diff…" the /diff command kicked off),
+        // or a turn a command started directly (e.g. /sync conflict
+        // resolution injects one).
+        if (root.app.thread.turn.isActive() or root.app.pickers.models.model_load_future != null or root.app.metrics.diff_refresh_future != null) try ensureTick(root, ctx);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (!try root.app.beginSubmit()) return;
+    try root.app.startTurn();
+    try ensureTick(root, ctx);
+    ctx.consumeAndRedraw();
+}
+
+/// Dispatch key events to the per-sub-mode diff viewer handlers.
+pub fn handleDiffViewerEvent(root: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+    switch (root.app.diff.sub) {
+        .browse => try handleDiffBrowseKey(root, ctx, key),
+        .file_search => try handleDiffSearchKey(root, ctx, key),
+        .commenting => try handleDiffCommentKey(root, ctx, key),
+    }
 }
