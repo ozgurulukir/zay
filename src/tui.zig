@@ -495,6 +495,18 @@ pub const App = struct {
         return self.at_results.items.len > 0;
     }
 
+    pub fn getAtSelection(self: *const App) u32 {
+        return self.at_selection;
+    }
+
+    pub fn setAtSelection(self: *App, v: u32) void {
+        self.at_selection = v;
+    }
+
+    pub fn atResultsLen(self: *const App) usize {
+        return self.at_results.items.len;
+    }
+
     pub fn getBlockNav(self: *const App) bool {
         return self.block_nav;
     }
@@ -1196,16 +1208,8 @@ pub const App = struct {
     }
 
     pub fn handleTranscriptKey(self: *App, key: vaxis.Key) !bool {
-        if (self.at_active and self.at_results.items.len > 0) {
-            if (key.matches(vaxis.Key.up, .{})) {
-                self.at_selection = previousIndex(self.at_selection, @intCast(self.at_results.items.len));
-                return true;
-            }
-            if (key.matches(vaxis.Key.down, .{})) {
-                self.at_selection = nextIndex(self.at_selection, @intCast(self.at_results.items.len));
-                return true;
-            }
-        }
+        // The @-mention popup is handled by command_router.MentionPopup
+        // before this method is called.
         if (key.matches(vaxis.Key.down, .{ .shift = true })) {
             self.jumpTranscriptToBottom();
             return true;

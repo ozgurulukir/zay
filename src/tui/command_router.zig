@@ -242,11 +242,37 @@ const CommandMenu = struct {
 
 /// Normal-mode transcript navigation (block nav, @-mention popup, lane switch).
 ///
-/// R2.1 stub: forwards to `App.handleTranscriptKey`. Real implementation
-/// lands in R2.8. The largest arm — handles the most keys and the most
-/// state transitions.
+/// The largest arm — split into three sub-handlers (R2.8a/b/c) that each
+/// own one concern: mention popup selection, block navigation, and
+/// multi-lane switching. The full arm body still lives in
+/// `App.handleTranscriptKey` for now; R2.8a/b/c incrementally move each
+/// concern out.
 const Transcript = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
+        // R2.8a: @-mention popup owns up/down while active.
+        if (try MentionPopup.handle(app, key)) return true;
+        // R2.8b + R2.8c: still on App.handleTranscriptKey.
         return app.handleTranscriptKey(key);
+    }
+};
+
+/// R2.8a: @-mention popup selection.
+///
+/// When the @-mention popup is open with results, up/down move the
+/// selection through the result list. Other keys fall through.
+const MentionPopup = struct {
+    pub fn handle(app: *App, key: vaxis.Key) !bool {
+        if (!app.isAtSearchActive() or !app.atSearchHasResults()) return false;
+        if (key.matches(vaxis.Key.up, .{})) {
+            const next = previousIndex(app.getAtSelection(), @intCast(app.atResultsLen()));
+            app.setAtSelection(next);
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{})) {
+            const next = nextIndex(app.getAtSelection(), @intCast(app.atResultsLen()));
+            app.setAtSelection(next);
+            return true;
+        }
+        return false;
     }
 };
