@@ -18,7 +18,7 @@ const session_mod = @import("session.zig");
 const vcs = @import("vcs.zig");
 const skill_mod = @import("skill.zig");
 const symbols = @import("symbols.zig");
-const transcript_mod = @import("transcript.zig");
+pub const transcript_mod = @import("transcript.zig");
 const CountingAllocator = @import("counting_allocator").CountingAllocator;
 pub const agent_worker = @import("tui/agent_worker.zig");
 const naming_mod = @import("tui/naming.zig");
@@ -29,7 +29,7 @@ const event_router = @import("tui/event_router.zig");
 const command_router = @import("tui/command_router.zig");
 const app_state = @import("tui/app_state.zig");
 const background_delivery = @import("tui/background_delivery.zig");
-const Thread = @import("tui/thread.zig");
+pub const Thread = @import("tui/thread.zig");
 const tui_metrics = @import("tui/metrics.zig");
 const tui_message = @import("tui/widgets/message.zig");
 const blackhole = @import("tui/blackhole.zig");
@@ -39,6 +39,7 @@ const command_panel = @import("tui/widgets/command_panel.zig");
 const diff = @import("tui/widgets/diff.zig");
 const loading = @import("tui/widgets/loading.zig");
 const permission = @import("tui/widgets/permission.zig");
+const tx_widget = @import("tui/widgets/transcript.zig");
 const diff_viewer = @import("tui/diff_viewer.zig");
 const model_loader = @import("tui/model_loader.zig");
 const model_cache = @import("tui/model_cache.zig");
@@ -3890,7 +3891,7 @@ pub const RootWidget = struct {
         self.app.input_surface_row = layout.input_row;
         self.app.nav.lanes_chip_rect = null;
 
-        var transcript_view: TranscriptWidget = .{ .app = self.app, .thread = self.app.thread };
+        var transcript_view: tx_widget.TranscriptWidget = .{ .app = self.app, .thread = self.app.thread };
         var loading_view: loading.LoadingWidget = .{ .app = self.app };
         var input_view: InputWidget = .{ .app = self.app };
         var overlay_view: OverlayWidget = .{ .app = self.app };
@@ -4031,7 +4032,7 @@ pub const RootWidget = struct {
     /// border label marks the lane (● active / ○ background) and the active
     /// column's border is undimmed.
     fn drawLaneColumn(self: *RootWidget, ctx: vxfw.DrawContext, lane: *Thread, width: u16, height: u16, active: bool) std.mem.Allocator.Error!vxfw.Surface {
-        var transcript_view: TranscriptWidget = .{ .app = self.app, .thread = lane };
+        var transcript_view: tx_widget.TranscriptWidget = .{ .app = self.app, .thread = lane };
         const title = if (lane.title) |t| t else "untitled";
         const label_text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ if (active) "● " else "○ ", title });
         var border: vxfw.Border = .{
@@ -4318,94 +4319,6 @@ const MessageListBuilder = struct {
             .gpa = self.gpa,
         };
         return body.widget();
-    }
-};
-
-const TranscriptWidget = struct {
-    app: *App,
-    /// The lane this pane renders — the active lane today; any lane once tiled.
-    thread: *Thread,
-
-    fn widget(self: *TranscriptWidget) vxfw.Widget {
-        return .{
-            .userdata = self,
-            .drawFn = drawTranscript,
-        };
-    }
-
-    fn drawTranscript(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *TranscriptWidget = @ptrCast(@alignCast(ptr));
-        self.syncViewport(ctx);
-
-        var builder: MessageListBuilder = .{
-            .arena = ctx.arena,
-            .messages = self.thread.transcript.messages.items,
-            .selected = self.thread.transcript.selected,
-            .loading_frame = self.app.metrics.loading_frame,
-            .blackhole_frame = self.app.metrics.blackhole_frame,
-            .gpa = self.app.gpa,
-        };
-        self.thread.transcript_list.children = .{ .builder = .{ .userdata = &builder, .buildFn = MessageListBuilder.build } };
-        self.thread.transcript_list.item_count = @intCast(self.thread.transcript.messages.items.len);
-        self.syncCursor(ctx);
-
-        var list_padding: vxfw.Padding = .{
-            .child = self.thread.transcript_list.widget(),
-            .padding = ConversationLayout.verticalPadding(),
-        };
-        const surface = try list_padding.widget().draw(ctx);
-        self.updateBlackholeVisibility();
-        return surface;
-    }
-
-    // The intro animation only runs while the startup logo (message 0) is the
-    // first item the list view is rendering. Once a turn pushes it off the top,
-    // `scroll.top` advances and the animation tick is allowed to stop.
-    fn updateBlackholeVisibility(self: *TranscriptWidget) void {
-        const messages = self.thread.transcript.messages.items;
-        self.app.metrics.blackhole_visible = messages.len > 0 and
-            messages[0].kind == .logo and
-            self.thread.transcript_list.scroll.top == 0;
-    }
-
-    fn syncViewport(self: *TranscriptWidget, ctx: vxfw.DrawContext) void {
-        const max_width = ctx.max.width orelse ctx.min.width;
-        const max_height = ctx.max.height orelse ctx.min.height;
-        self.thread.transcript_view_width = max_width;
-        self.thread.transcript_view_height = max_height -| ConversationLayout.top -| ConversationLayout.bottom;
-        if (self.thread.transcript_view_height == 0) self.thread.transcript_view_height = 1;
-    }
-
-    fn syncCursor(self: *TranscriptWidget, ctx: vxfw.DrawContext) void {
-        const messages = self.thread.transcript.messages.items;
-        if (messages.len == 0) return;
-        if (self.thread.auto_scroll) {
-            const cursor: u32 = @intCast(messages.len - 1);
-            self.thread.transcript_list.cursor = cursor;
-            self.scrollCursorToTail(ctx, cursor);
-            return;
-        }
-        const cursor = self.thread.transcript.selected orelse 0;
-        const cursor_changed = self.thread.transcript_list.cursor != cursor;
-        self.thread.transcript_list.cursor = cursor;
-        if (cursor_changed) self.thread.transcript_list.ensureScroll();
-    }
-
-    fn scrollCursorToTail(self: *TranscriptWidget, ctx: vxfw.DrawContext, cursor: u32) void {
-        const message_count: u32 = @intCast(self.thread.transcript.messages.items.len);
-        if (cursor >= message_count) return;
-        const max_width = ctx.max.width orelse ctx.min.width;
-        const max_height = ctx.max.height orelse ctx.min.height;
-        const list_height = max_height -| ConversationLayout.top -| ConversationLayout.bottom;
-        const message_height = messageRowsCached(&self.thread.transcript.messages.items[cursor], ConversationLayout.contentWidth(max_width));
-        self.thread.transcript_list.scroll.top = cursor;
-        self.thread.transcript_list.scroll.pending_lines = 0;
-        self.thread.transcript_list.scroll.wants_cursor = false;
-        if (message_height > list_height) {
-            self.thread.transcript_list.scroll.offset = @intCast(message_height - list_height);
-        } else {
-            self.thread.transcript_list.scroll.offset = 0;
-        }
     }
 };
 
@@ -6043,7 +5956,7 @@ test "up enters selected long message at bottom" {
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    var transcript_widget: TranscriptWidget = .{ .app = &app, .thread = app.thread };
+    var transcript_widget: tx_widget.TranscriptWidget = .{ .app = &app, .thread = app.thread };
     const ctx: vxfw.DrawContext = .{
         .arena = arena.allocator(),
         .min = .{},
@@ -7678,10 +7591,10 @@ fn benchTranscriptDraw(gpa: std.mem.Allocator, n: usize) !BenchResult {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var counting: CountingAllocator = .{ .child = arena.allocator() };
-    var transcript_widget: TranscriptWidget = .{ .app = &app, .thread = app.thread };
+    var transcript_widget: tx_widget.TranscriptWidget = .{ .app = &app, .thread = app.thread };
 
     const draw = struct {
-        fn f(tw: *TranscriptWidget, ar: *std.heap.ArenaAllocator, c: *CountingAllocator) !void {
+        fn f(tw: *tx_widget.TranscriptWidget, ar: *std.heap.ArenaAllocator, c: *CountingAllocator) !void {
             _ = ar.reset(.retain_capacity);
             const ctx: vxfw.DrawContext = .{
                 .arena = c.allocator(),
