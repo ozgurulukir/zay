@@ -29,6 +29,8 @@ const tui = @import("../tui.zig");
 
 const App = tui.App;
 const Mode = App.Mode;
+const previousIndex = tui.previousIndex;
+const nextIndex = tui.nextIndex;
 
 /// Top-level dispatch: routes a key to the per-mode handler for the current
 /// `App.mode`. Returns true when visible state changed (caller redraws).
@@ -148,11 +150,38 @@ const ModelPicker = struct {
 
 /// Resume-session picker mode (project grouping + selection navigation).
 ///
-/// R2.1 stub: forwards to `App.handleSessionPickerKey`. Real implementation
-/// lands in R2.5.
+/// Ctrl+A toggles global vs project-scoped resume list (and reloads from
+/// disk); tab toggles fold of the selected project when in global mode;
+/// up/down step the selection through the visible (filtered) entries.
 const SessionPicker = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
-        return app.handleSessionPickerKey(key);
+        if (key.matches('a', .{ .ctrl = true })) {
+            app.toggleResumeGlobal();
+            app.setResumeSelection(0);
+            app.resumeClearFolds();
+            try app.reloadResumeSessions();
+            return true;
+        }
+        if (key.matches(vaxis.Key.tab, .{})) {
+            // global mode means: the resume list is grouped by project, so
+            // tab folds/unfolds the selected project. Otherwise tab is a
+            // no-op (the picker has no other column to switch to).
+            if (app.getResumeGlobal()) try app.toggleSelectedResumeProject();
+            return true;
+        }
+        if (key.matches(vaxis.Key.up, .{})) {
+            const next = previousIndex(app.getResumeSelection(), try app.visibleResumeCount());
+            app.setResumeSelection(next);
+            app.syncResumeListCursor();
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{})) {
+            const next = nextIndex(app.getResumeSelection(), try app.visibleResumeCount());
+            app.setResumeSelection(next);
+            app.syncResumeListCursor();
+            return true;
+        }
+        return false;
     }
 };
 

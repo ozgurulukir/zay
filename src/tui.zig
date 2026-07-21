@@ -422,6 +422,22 @@ pub const App = struct {
         return &self.models;
     }
 
+    pub fn toggleResumeGlobal(self: *App) void {
+        self.resume_global = !self.resume_global;
+    }
+
+    pub fn getResumeGlobal(self: *const App) bool {
+        return self.resume_global;
+    }
+
+    pub fn getResumeSelection(self: *const App) u32 {
+        return self.resume_selection;
+    }
+
+    pub fn setResumeSelection(self: *App, v: u32) void {
+        self.resume_selection = v;
+    }
+
     pub fn popProviderKeyInput(self: *App) void {
         const items = self.provider_key_input.items;
         if (items.len == 0) return;
@@ -1152,28 +1168,7 @@ pub const App = struct {
     }
 
     pub fn handleSessionPickerKey(self: *App, key: vaxis.Key) !bool {
-        if (key.matches('a', .{ .ctrl = true })) {
-            self.resume_global = !self.resume_global;
-            self.resume_selection = 0;
-            self.resumeClearFolds();
-            try self.reloadResumeSessions();
-            return true;
-        }
-        if (key.matches(vaxis.Key.tab, .{})) {
-            if (self.resume_global) try self.toggleSelectedResumeProject();
-            return true;
-        }
-        if (key.matches(vaxis.Key.up, .{})) {
-            self.resume_selection = previousIndex(self.resume_selection, try self.visibleResumeCount());
-            self.syncResumeListCursor();
-            return true;
-        }
-        if (key.matches(vaxis.Key.down, .{})) {
-            self.resume_selection = nextIndex(self.resume_selection, try self.visibleResumeCount());
-            self.syncResumeListCursor();
-            return true;
-        }
-        return false;
+        return command_router.SessionPicker.handle(self, key);
     }
 
     pub fn handleCommandMenuKey(self: *App, key: vaxis.Key) !bool {
@@ -2309,7 +2304,7 @@ pub const App = struct {
         self.thread.agent.?.client = self.liveRuntime().?.client;
     }
 
-    fn reloadResumeSessions(self: *App) !void {
+    pub fn reloadResumeSessions(self: *App) !void {
         self.resumeClear();
         var manager = try session_mod.SessionManager.initDefault(self.gpa, self.io, self.liveRuntime().?.home_dir);
         defer manager.deinit();
@@ -2332,13 +2327,13 @@ pub const App = struct {
         return @constCast(resume_picker.selectedSummary(self.resume_summaries.items, filter, self.resume_folded_projects.items, self.resume_selection, self.resume_global));
     }
 
-    fn visibleResumeCount(self: *App) !u32 {
+    pub fn visibleResumeCount(self: *App) !u32 {
         const filter = try self.peekPaletteInput();
         defer self.gpa.free(filter);
         return resume_picker.visibleCount(self.resume_summaries.items, filter, self.resume_folded_projects.items, self.resume_global);
     }
 
-    fn toggleSelectedResumeProject(self: *App) !void {
+    pub fn toggleSelectedResumeProject(self: *App) !void {
         const filter = try self.peekPaletteInput();
         defer self.gpa.free(filter);
         const cwd = resume_picker.selectedProject(self.resume_summaries.items, filter, self.resume_folded_projects.items, self.resume_selection) orelse return;
@@ -2359,7 +2354,7 @@ pub const App = struct {
         return null;
     }
 
-    fn resumeClearFolds(self: *App) void {
+    pub fn resumeClearFolds(self: *App) void {
         for (self.resume_folded_projects.items) |folded| self.gpa.free(folded);
         self.resume_folded_projects.clearRetainingCapacity();
     }
@@ -2369,7 +2364,7 @@ pub const App = struct {
         self.resume_summaries.clearRetainingCapacity();
     }
 
-    fn syncResumeListCursor(self: *App) void {
+    pub fn syncResumeListCursor(self: *App) void {
         self.resume_list.cursor = self.resume_selection;
         self.resume_list.ensureScroll();
     }
@@ -3633,7 +3628,7 @@ fn scrollStepRows(height: u16) u16 {
     return @min(height, long_message_scroll_step_rows);
 }
 
-fn nextIndex(current: u32, count: u32) u32 {
+pub fn nextIndex(current: u32, count: u32) u32 {
     if (count == 0) return 0;
     if (current + 1 >= count) return 0;
     return current + 1;
@@ -3660,7 +3655,7 @@ fn resumeProjectUpdatedAtMax(summaries: []const session_mod.SessionSummary, cwd:
     return updated_at_ms;
 }
 
-fn previousIndex(current: u32, count: u32) u32 {
+pub fn previousIndex(current: u32, count: u32) u32 {
     if (count == 0) return 0;
     if (current == 0) return count - 1;
     return current - 1;
