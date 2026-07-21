@@ -33,6 +33,7 @@ pub const Thread = @import("tui/thread.zig");
 const tui_metrics = @import("tui/metrics.zig");
 const lane_column = @import("tui/lane_column.zig");
 const diff_viewer_overlay = @import("tui/diff_viewer_overlay.zig");
+const root_layout = @import("tui/layout.zig");
 const tui_message = @import("tui/widgets/message.zig");
 const blackhole = @import("tui/blackhole.zig");
 const at_search = @import("tui/widgets/at_search.zig");
@@ -3523,41 +3524,6 @@ pub fn previousIndex(current: u32, count: u32) u32 {
     return current - 1;
 }
 
-const loading_status_rows: u16 = 2;
-
-const RootLayout = struct {
-    input_height: u16,
-    loading_height: u16,
-    panel_height: u16,
-    transcript_height: u16,
-    loading_row: u16,
-    panel_row: u16,
-    input_row: u16,
-};
-
-fn rootLayout(max_height: u16, panel_visible: bool, input_text_rows: u16, loading_visible: bool, queued_visible: bool) RootLayout {
-    // Reserve: top border + bottom border + one hint/diff-counts row (the `3`),
-    // the wrapped input text, and — when a steered message is queued — the extra
-    // line the InputWidget draws above the border for it. Omitting the queued row
-    // here starves the InputWidget so it silently drops the hint + diff counts.
-    const desired: u16 = 3 + input_text_rows + @intFromBool(queued_visible);
-    const max_allowed: u16 = @max(@as(u16, 6), max_height -| 3);
-    const input_height: u16 = @min(max_height, @min(desired, max_allowed));
-    const above_input_height: u16 = max_height - input_height;
-    const loading_height: u16 = if (loading_visible) @min(loading_status_rows, above_input_height) else 0;
-    const transcript_height: u16 = above_input_height - loading_height;
-    const panel_height: u16 = if (panel_visible) @min(transcript_height, 7) else 0;
-    return .{
-        .input_height = input_height,
-        .loading_height = loading_height,
-        .panel_height = panel_height,
-        .transcript_height = transcript_height,
-        .loading_row = transcript_height,
-        .panel_row = transcript_height - panel_height,
-        .input_row = transcript_height + loading_height,
-    };
-}
-
 pub fn run(
     init: std.process.Init,
     runtime: *runtime_mod.AgentRuntime,
@@ -3889,7 +3855,7 @@ pub const RootWidget = struct {
         const split = self.app.split and self.app.threads.items.len > 1;
         // In split view always reserve the loading row so each column keeps a
         // fixed height across turns — the spinner appearing must not reflow.
-        const layout = rootLayout(max_height, false, try self.app.inputTextRows(ctx, max_width -| 4), loading_visible or split, self.app.thread.queued.items.len > 0);
+        const layout = root_layout.rootLayout(max_height, false, try self.app.inputTextRows(ctx, max_width -| 4), loading_visible or split, self.app.thread.queued.items.len > 0);
         self.app.input_surface_row = layout.input_row;
         self.app.nav.lanes_chip_rect = null;
 
@@ -5363,8 +5329,8 @@ test "diff count labels keep signs next to numbers" {
 }
 
 test "root layout keeps input fixed when panel opens" {
-    const normal = rootLayout(30, false, 1, false, false);
-    const picker = rootLayout(30, true, 1, false, false);
+    const normal = root_layout.rootLayout(30, false, 1, false, false);
+    const picker = root_layout.rootLayout(30, true, 1, false, false);
 
     try std.testing.expectEqual(normal.input_row, picker.input_row);
     try std.testing.expectEqual(normal.transcript_height, picker.transcript_height);
@@ -5373,7 +5339,7 @@ test "root layout keeps input fixed when panel opens" {
 }
 
 test "root layout clamps panel above input on short screens" {
-    const layout = rootLayout(8, true, 1, false, false);
+    const layout = root_layout.rootLayout(8, true, 1, false, false);
 
     try std.testing.expectEqual(@as(u16, 4), layout.input_height);
     try std.testing.expectEqual(@as(u16, 4), layout.transcript_height);
@@ -5383,16 +5349,16 @@ test "root layout clamps panel above input on short screens" {
 }
 
 test "root layout grows the input as text rows increase" {
-    const one = rootLayout(30, false, 1, false, false);
+    const one = root_layout.rootLayout(30, false, 1, false, false);
     try std.testing.expectEqual(@as(u16, 4), one.input_height);
     try std.testing.expectEqual(@as(u16, 26), one.transcript_height);
 
-    const three = rootLayout(30, false, 3, false, false);
+    const three = root_layout.rootLayout(30, false, 3, false, false);
     try std.testing.expectEqual(@as(u16, 6), three.input_height);
     try std.testing.expectEqual(@as(u16, 24), three.transcript_height);
 
     // A short screen still leaves the transcript some room.
-    const tight = rootLayout(10, false, 6, false, false);
+    const tight = root_layout.rootLayout(10, false, 6, false, false);
     try std.testing.expectEqual(@as(u16, 7), tight.input_height);
     try std.testing.expectEqual(@as(u16, 3), tight.transcript_height);
 }
@@ -5401,8 +5367,8 @@ test "root layout reserves a row for the queued-message line" {
     // A queued (steered) message draws an extra line above the input border, so
     // the input region must grow by one row — otherwise the hint + diff counts
     // get squeezed out (regression: they vanished after sending mid-generation).
-    const plain = rootLayout(30, false, 1, false, false);
-    const queued = rootLayout(30, false, 1, false, true);
+    const plain = root_layout.rootLayout(30, false, 1, false, false);
+    const queued = root_layout.rootLayout(30, false, 1, false, true);
     try std.testing.expectEqual(plain.input_height + 1, queued.input_height);
 }
 
@@ -5931,7 +5897,7 @@ test "awaiting turn draws loading outside the transcript list" {
     try std.testing.expectEqual(@as(usize, 3), surface.children.len);
     try std.testing.expectEqual(@as(?u32, 1), app.thread.transcript_list.item_count);
     try std.testing.expectEqual(@as(u32, 0), app.thread.transcript_list.cursor);
-    try std.testing.expectEqual(rootLayout(10, false, 1, true, false).loading_row, surface.children[1].origin.row);
+    try std.testing.expectEqual(root_layout.rootLayout(10, false, 1, true, false).loading_row, surface.children[1].origin.row);
 }
 
 test "awaiting turn preserves selected long message inner scroll" {
