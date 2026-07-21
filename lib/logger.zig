@@ -16,7 +16,8 @@ const Entry = struct {
 const EntryQueue = bounded_queue.BoundedQueue(Entry);
 
 const State = struct {
-    mutex: std.atomic.Mutex = .unlocked,
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
     io: std.Io = undefined,
     enabled: bool = false,
     stopping: bool = false,
@@ -40,61 +41,70 @@ pub const log = if (enabled) logEnabled else logDisabled;
 pub const deinit = if (enabled) deinitEnabled else deinitDisabled;
 
 fn initEnabled(options: Options) error{PathTooLong}!void {
-    lock();
-    defer state.mutex.unlock();
-    if (state.enabled) return;
-    if (options.log_path.len >= state.path.len) return error.PathTooLong;
-    @memcpy(state.path[0..options.log_path.len], options.log_path);
-    state.path_len = @intCast(options.log_path.len);
-    state.io = options.io;
-    state.enabled = true;
-    state.thread = std.Thread.spawn(.{}, writerThread, .{}) catch null;
-    if (state.thread == null) state.enabled = false;
+    if (state.mutex.lock(state.io)) |_| {
+        defer state.mutex.unlock(state.io);
+        if (state.enabled) return;
+        if (options.log_path.len >= state.path.len) return error.PathTooLong;
+        @memcpy(state.path[0..options.log_path.len], options.log_path);
+        state.path_len = @intCast(options.log_path.len);
+        state.io = options.io;
+        state.enabled = true;
+        state.thread = std.Thread.spawn(.{}, writerThread, .{}) catch null;
+        if (state.thread == null) state.enabled = false;
+    } else |_| {
+        // Lock failed (canceled) — init is best-effort during teardown anyway.
+    }
 }
 
 fn initDisabled(_: Options) error{PathTooLong}!void {}
 
 fn logEnabled(comptime fmt: []const u8, args: anytype) void {
-    lock();
-    defer state.mutex.unlock();
-    if (!state.enabled) return;
-    if (state.entry_queue.full(&state.entries)) {
-        state.dropped += 1;
-        return;
-    }
-    var entry: Entry = .{};
-    const message = std.fmt.bufPrint(&entry.bytes, fmt, args) catch |err| blk: {
-        if (err == error.NoSpaceLeft) {
-            const fallback = std.fmt.bufPrint(&entry.bytes, "logger entry too large: {s}", .{fmt}) catch "logger entry too large";
-            break :blk fallback;
+    if (state.mutex.lock(state.io)) |_| {
+        defer state.mutex.unlock(state.io);
+        if (!state.enabled) return;
+        if (state.entry_queue.full(&state.entries)) {
+            state.dropped += 1;
+            return;
         }
-        const fallback = std.fmt.bufPrint(&entry.bytes, "logger format failed: {s}", .{@errorName(err)}) catch "logger format failed";
-        break :blk fallback;
-    };
-    entry.len = @intCast(message.len);
-    const pushed = state.entry_queue.push(&state.entries, entry);
-    assert(pushed);
+        var entry: Entry = .{};
+        const message = std.fmt.bufPrint(&entry.bytes, fmt, args) catch |err| blk: {
+            if (err == error.NoSpaceLeft) {
+                const fallback = std.fmt.bufPrint(&entry.bytes, "logger entry too large: {s}", .{fmt}) catch "logger entry too large";
+                break :blk fallback;
+            }
+            const fallback = std.fmt.bufPrint(&entry.bytes, "logger format failed: {s}", .{@errorName(err)}) catch "logger format failed";
+            break :blk fallback;
+        };
+        entry.len = @intCast(message.len);
+        const pushed = state.entry_queue.push(&state.entries, entry);
+        assert(pushed);
+        // Wake the writer thread if it was idle on the condition.
+        state.condition.signal(state.io);
+    } else |_| {
+        // Lock failed (canceled) — drop the log entry silently.
+    }
 }
 
 fn logDisabled(comptime _: []const u8, _: anytype) void {}
 
 fn deinitEnabled() void {
-    lock();
-    if (!state.enabled) {
-        state.mutex.unlock();
-        return;
+    if (state.mutex.lock(state.io)) |_| {
+        if (!state.enabled) {
+            state.mutex.unlock(state.io);
+            return;
+        }
+        state.stopping = true;
+        const thread = state.thread;
+        state.condition.signal(state.io);
+        state.mutex.unlock(state.io);
+        if (thread) |t| t.join();
+    } else |_| {
+        // Lock failed (canceled) — best-effort join.
+        if (state.thread) |t| t.join();
     }
-    state.stopping = true;
-    const thread = state.thread;
-    state.mutex.unlock();
-    if (thread) |t| t.join();
 }
 
 fn deinitDisabled() void {}
-
-fn lock() void {
-    while (!state.mutex.tryLock()) std.Thread.yield() catch {};
-}
 
 fn writerThread() void {
     const path = state.path[0..state.path_len];
@@ -117,16 +127,21 @@ fn writerThread() void {
         var should_stop = false;
         var has_entry = false;
         var dropped: u64 = 0;
-        lock();
-        if (state.entry_queue.pop(&state.entries)) |entry| {
-            local = entry;
-            has_entry = true;
-        } else {
-            should_stop = state.stopping;
-            dropped = state.dropped;
-            state.dropped = 0;
-        }
-        state.mutex.unlock();
+        if (state.mutex.lock(state.io)) |_| {
+            // Wait for an entry or the stop signal — no busy-yield.
+            while (state.entry_queue.empty() and !state.stopping) {
+                state.condition.waitUncancelable(state.io, &state.mutex);
+            }
+            if (state.entry_queue.pop(&state.entries)) |entry| {
+                local = entry;
+                has_entry = true;
+            } else {
+                should_stop = state.stopping;
+                dropped = state.dropped;
+                state.dropped = 0;
+            }
+            state.mutex.unlock(state.io);
+        } else |_| return;
 
         if (has_entry) {
             writeLine(&writer, local.bytes[0..local.len]);
@@ -142,7 +157,6 @@ fn writerThread() void {
             writer.interface.flush() catch {};
             break;
         }
-        std.Thread.yield() catch {};
     }
 }
 

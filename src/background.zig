@@ -31,11 +31,10 @@ const read_reserve: usize = 64 * 1024;
 pub const BackgroundManager = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
-    /// Guards the job list and the per-job display fields. A spinlock (matching
-    /// the agent's queue mutex) — every critical section is short and takes no
-    /// I/O, and the reader threads never acquire it, so a `join` under the lock
-    /// can't deadlock.
-    mutex: std.atomic.Mutex = .unlocked,
+    /// Guards the job list and the per-job display fields. Blocking mutex;
+    /// critical sections are short and take no I/O, and the reader threads
+    /// never acquire it, so a `join` under the lock can't deadlock.
+    mutex: std.Io.Mutex = .init,
     next_id: u32 = 1,
     jobs: std.ArrayList(*Job) = .empty,
 
@@ -119,22 +118,16 @@ pub const BackgroundManager = struct {
         return .{ .io = io, .gpa = gpa };
     }
 
-    fn lockMutex(self: *BackgroundManager) void {
-        while (!self.mutex.tryLock()) {
-            std.Thread.yield() catch {};
-        }
-    }
-
     /// Spawn `opts.command` under bash with stderr merged into stdout, streaming
     /// to a fresh log file, and start its reader thread. Returns immediately.
     pub fn start(self: *BackgroundManager, opts: StartOptions) !StartResult {
         const gpa = self.gpa;
         const io = self.io;
 
-        self.lockMutex();
+        try self.mutex.lock(io);
         const id = self.next_id;
         self.next_id += 1;
-        self.mutex.unlock();
+        defer self.mutex.unlock(self.io);
 
         const label = try std.fmt.allocPrint(gpa, "bg_{d}", .{id});
         errdefer gpa.free(label);
@@ -195,13 +188,16 @@ pub const BackgroundManager = struct {
             r.deinit(gpa);
         }
 
-        self.lockMutex();
+        try self.mutex.lock(io);
         try self.jobs.append(gpa, job);
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
         errdefer {
-            self.lockMutex();
-            _ = removeJobPtr(&self.jobs, job);
-            self.mutex.unlock();
+            if (self.mutex.lock(io)) |_| {
+                _ = removeJobPtr(&self.jobs, job);
+                self.mutex.unlock(self.io);
+            } else |_| {
+                // Lock failed (canceled) — best-effort cleanup skipped.
+            }
         }
 
         // Spawn the reader last: once it owns the child/log it must run to
@@ -210,9 +206,9 @@ pub const BackgroundManager = struct {
         // under the same lock) never races this write; until it lands the job
         // reads as running, and a job that finishes first is deferred a poll.
         const thread = try std.Thread.spawn(.{}, runReader, .{job});
-        self.lockMutex();
+        try self.mutex.lock(io);
         job.thread = thread;
-        self.mutex.unlock();
+        defer self.mutex.unlock(self.io);
         return result;
     }
 
@@ -280,8 +276,8 @@ pub const BackgroundManager = struct {
     /// Snapshot the running jobs for the TUI modal (oldest first). Free with
     /// `freeViews`.
     pub fn snapshot(self: *BackgroundManager, gpa: std.mem.Allocator) ![]JobView {
-        self.lockMutex();
-        defer self.mutex.unlock();
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
         const now = std.Io.Timestamp.now(self.io, .awake);
         var out: std.ArrayList(JobView) = .empty;
         errdefer freeViewsList(&out, gpa);
@@ -317,50 +313,59 @@ pub const BackgroundManager = struct {
     /// How many jobs the manager is tracking (running plus finished-but-not-yet-
     /// reported). The UI keeps its drain tick alive while this is non-zero.
     pub fn activeCount(self: *BackgroundManager) usize {
-        self.lockMutex();
-        defer self.mutex.unlock();
-        return self.jobs.items.len;
+        if (self.mutex.lock(self.io)) |_| {
+            defer self.mutex.unlock(self.io);
+            return self.jobs.items.len;
+        } else |_| {
+            return 0;
+        }
     }
 
     /// How many jobs are still running — the count shown in the footer.
     pub fn runningCount(self: *BackgroundManager) usize {
-        self.lockMutex();
-        defer self.mutex.unlock();
-        var count: usize = 0;
-        for (self.jobs.items) |job| {
-            if (job.state.load(.acquire) == .running) count += 1;
+        if (self.mutex.lock(self.io)) |_| {
+            defer self.mutex.unlock(self.io);
+            var count: usize = 0;
+            for (self.jobs.items) |job| {
+                if (job.state.load(.acquire) == .running) count += 1;
+            }
+            return count;
+        } else |_| {
+            return 0;
         }
-        return count;
     }
 
     /// Request termination of job `id`, killing the whole process tree. The
     /// reader then reaps it and marks it finished+killed. Returns true if a
     /// running job matched. The actual kill runs outside the lock so it never stalls the UI's draw/poll path.
     pub fn cancel(self: *BackgroundManager, id: u32) bool {
-        self.lockMutex();
-        var pid: ?i64 = null;
-        for (self.jobs.items) |job| {
-            if (job.id != id) continue;
-            if (job.state.load(.acquire) == .running) {
-                job.killed.store(true, .release);
-                pid = job.pid;
+        if (self.mutex.lock(self.io)) |_| {
+            var pid: ?i64 = null;
+            for (self.jobs.items) |job| {
+                if (job.id != id) continue;
+                if (job.state.load(.acquire) == .running) {
+                    job.killed.store(true, .release);
+                    pid = job.pid;
+                }
+                break;
             }
-            break;
+            defer self.mutex.unlock(self.io);
+            if (pid) |p| {
+                terminateTree(self.io, self.gpa, p);
+                return true;
+            }
+            return false;
+        } else |_| {
+            return false;
         }
-        self.mutex.unlock();
-        if (pid) |p| {
-            terminateTree(self.io, self.gpa, p);
-            return true;
-        }
-        return false;
     }
 
     /// Take every finished-but-unreported job, transferring ownership to the
     /// caller (the UI), which shows the notice and — for non-killed jobs —
     /// delivers `completion_message` to the owning agent. Free each with `deinit`.
     pub fn takeFinished(self: *BackgroundManager, gpa: std.mem.Allocator) ![]Finished {
-        self.lockMutex();
-        defer self.mutex.unlock();
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
         var out: std.ArrayList(Finished) = .empty;
         errdefer {
             for (out.items) |*f| f.deinit(gpa);
@@ -416,11 +421,10 @@ pub const BackgroundManager = struct {
 
     /// Terminate and reap every job, then free everything. Called at clean exit.
     pub fn shutdownAll(self: *BackgroundManager) void {
-        self.lockMutex();
+        self.mutex.lock(self.io) catch return;
         var list = self.jobs;
         self.jobs = .empty;
-        self.mutex.unlock();
-
+        self.mutex.unlock(self.io);
         for (list.items) |job| {
             if (job.state.load(.acquire) == .running) {
                 job.killed.store(true, .release);

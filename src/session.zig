@@ -59,6 +59,8 @@ pub const Error = db.Error || error{
     Unexpected,
     LockedMemoryLimitExceeded,
     ThreadQuotaExceeded,
+    QueueFull,
+    Canceled,
 };
 
 pub const SessionManager = struct {
@@ -507,7 +509,8 @@ pub const SessionWriter = struct {
     io: std.Io,
     manager: SessionManager,
     session: Session,
-    mutex: std.atomic.Mutex = .unlocked,
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
     queue: []QueuedEntry,
     entry_queue: EntryQueue = .{},
     stopping: bool = false,
@@ -560,9 +563,13 @@ pub const SessionWriter = struct {
     }
 
     pub fn deinit(self: *SessionWriter) void {
-        lockWriter(self);
-        self.stopping = true;
-        self.mutex.unlock();
+        if (self.mutex.lock(self.io)) |_| {
+            self.stopping = true;
+            self.condition.signal(self.io);
+            self.mutex.unlock(self.io);
+        } else |_| {
+            // Lock failed (canceled) — signal/cleanup will happen via thread join.
+        }
         if (self.thread) |thread| thread.join();
         while (self.entry_queue.pop(self.queue)) |entry| {
             var owned = entry;
@@ -660,9 +667,13 @@ pub const SessionWriter = struct {
     /// with `restart`. Queued entries are written (not dropped) so an
     /// in-flight assistant turn isn't lost.
     fn quiesce(self: *SessionWriter) void {
-        lockWriter(self);
-        self.stopping = true;
-        self.mutex.unlock();
+        if (self.mutex.lock(self.io)) |_| {
+            self.stopping = true;
+            self.condition.signal(self.io);
+            self.mutex.unlock(self.io);
+        } else |_| {
+            // Lock failed (canceled) — stop flag will be observed on next poll.
+        }
         if (self.thread) |thread| {
             thread.join();
             self.thread = null;
@@ -681,15 +692,13 @@ pub const SessionWriter = struct {
     }
 
     fn enqueue(self: *SessionWriter, entry: QueuedEntry) Error!void {
-        while (true) {
-            lockWriter(self);
-            if (self.entry_queue.push(self.queue, entry)) {
-                self.mutex.unlock();
-                return;
-            }
-            self.mutex.unlock();
-            std.Thread.yield() catch {};
+        try self.mutex.lock(self.io);
+        if (!self.entry_queue.push(self.queue, entry)) {
+            self.mutex.unlock(self.io);
+            return error.QueueFull;
         }
+        self.condition.signal(self.io);
+        self.mutex.unlock(self.io);
     }
 };
 
@@ -714,11 +723,16 @@ fn runWriter(writer: *SessionWriter) void {
             defer owned.deinit(writer.gpa);
             writeQueuedEntry(writer, &owned) catch continue;
         } else {
-            lockWriter(writer);
+            // Queue is empty: wait for a signal rather than busy-yielding.
+            // We hold the lock around the check+wait so we can't miss a
+            // signal that lands between the check and the wait.
+            writer.mutex.lock(writer.io) catch return;
+            while (writer.entry_queue.empty() and !writer.stopping) {
+                writer.condition.waitUncancelable(writer.io, &writer.mutex);
+            }
             const done = writer.stopping and writer.entry_queue.empty();
-            writer.mutex.unlock();
+            writer.mutex.unlock(writer.io);
             if (done) return;
-            std.Thread.yield() catch {};
         }
     }
 }
@@ -744,15 +758,9 @@ fn writeQueuedEntry(writer: *SessionWriter, entry: *const QueuedEntry) Error!voi
 }
 
 fn takeQueuedEntry(writer: *SessionWriter) ?QueuedEntry {
-    lockWriter(writer);
-    defer writer.mutex.unlock();
+    writer.mutex.lock(writer.io) catch return null;
+    defer writer.mutex.unlock(writer.io);
     return writer.entry_queue.pop(writer.queue);
-}
-
-fn lockWriter(writer: *SessionWriter) void {
-    while (!writer.mutex.tryLock()) {
-        std.Thread.yield() catch {};
-    }
 }
 
 pub const EntryRecord = struct {

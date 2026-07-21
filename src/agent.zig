@@ -134,7 +134,7 @@ pub const Agent = struct {
     compactor: Compactor = .{},
     message_queue: MessageQueue = .{},
     message_queue_storage: [message_queue_capacity]QueuedUserMessage = undefined,
-    message_queue_mutex: std.atomic.Mutex = .unlocked,
+    message_queue_mutex: std.Io.Mutex = .init,
     /// git-shadow snapshot state (see `snapshotAfterBatch`). The dedicated index
     /// path is resolved once and cached; `last_snapshot_tree` dedups unchanged
     /// batches; `snapshots_disabled` latches off when git/the repo is absent.
@@ -171,11 +171,14 @@ pub const Agent = struct {
         // reads (the client), then release its result.
         self.drainBackgroundCompaction();
         self.context_manager.deinit();
-        self.lockMessageQueue();
-        while (self.message_queue.pop(&self.message_queue_storage)) |queued| {
-            self.gpa.free(queued.prompt);
+        if (self.message_queue_mutex.lock(self.io)) |_| {
+            defer self.message_queue_mutex.unlock(self.io);
+            while (self.message_queue.pop(&self.message_queue_storage)) |queued| {
+                self.gpa.free(queued.prompt);
+            }
+        } else |_| {
+            // Lock failed (canceled) — skip critical section, continue cleanup.
         }
-        self.message_queue_mutex.unlock();
         if (self.snapshot_index) |path| self.gpa.free(path);
         if (self.bash_classifier_url) |url| self.gpa.free(url);
         self.* = undefined;
@@ -189,8 +192,8 @@ pub const Agent = struct {
         assert(content.len > 0);
         const owned = try self.gpa.dupe(u8, content);
         errdefer self.gpa.free(owned);
-        self.lockMessageQueue();
-        defer self.message_queue_mutex.unlock();
+        try self.message_queue_mutex.lock(self.io);
+        defer self.message_queue_mutex.unlock(self.io);
         if (!self.message_queue.push(&self.message_queue_storage, .{ .prompt = owned })) return error.QueueFull;
     }
 
@@ -202,8 +205,8 @@ pub const Agent = struct {
         assert(content.len > 0);
         const owned = try self.gpa.dupe(u8, content);
         errdefer self.gpa.free(owned);
-        self.lockMessageQueue();
-        defer self.message_queue_mutex.unlock();
+        try self.message_queue_mutex.lock(self.io);
+        defer self.message_queue_mutex.unlock(self.io);
         if (!self.message_queue.push(&self.message_queue_storage, .{ .prompt = owned, .raw = true })) return error.QueueFull;
     }
 
@@ -211,8 +214,8 @@ pub const Agent = struct {
     /// decide whether an idle lane should start a turn to deliver a background
     /// completion that was enqueued while no turn was running.
     pub fn hasQueuedMessages(self: *Agent) bool {
-        self.lockMessageQueue();
-        defer self.message_queue_mutex.unlock();
+        self.message_queue_mutex.lock(self.io) catch return false;
+        defer self.message_queue_mutex.unlock(self.io);
         return self.message_queue.len() > 0;
     }
 
@@ -716,10 +719,11 @@ pub const Agent = struct {
     /// Drop every queued message without delivering it. Thread-safe; the worker
     /// drains under the same mutex.
     pub fn clearQueue(self: *Agent) void {
-        self.lockMessageQueue();
-        defer self.message_queue_mutex.unlock();
-        while (self.message_queue.pop(&self.message_queue_storage)) |queued| {
-            self.gpa.free(queued.prompt);
+        if (self.message_queue_mutex.lock(self.io) catch null) |_| {
+            defer self.message_queue_mutex.unlock(self.io);
+            while (self.message_queue.pop(&self.message_queue_storage)) |queued| {
+                self.gpa.free(queued.prompt);
+            }
         }
     }
 
@@ -727,27 +731,25 @@ pub const Agent = struct {
     /// pops if the front message is marked to steer (otherwise returns null,
     /// leaving the queue untouched). Caller owns `queued.prompt`.
     fn takeQueuedUserMessage(self: *Agent, steer_only: bool) ?QueuedUserMessage {
-        self.lockMessageQueue();
-        defer self.message_queue_mutex.unlock();
-        if (steer_only) {
-            const front = self.message_queue.peek(&self.message_queue_storage) orelse return null;
-            if (!front.steer) return null;
+        if (self.message_queue_mutex.lock(self.io)) |_| {
+            defer self.message_queue_mutex.unlock(self.io);
+            if (steer_only) {
+                const front = self.message_queue.peek(&self.message_queue_storage) orelse return null;
+                if (!front.steer) return null;
+            }
+            return self.message_queue.pop(&self.message_queue_storage);
+        } else |_| {
+            return null;
         }
-        return self.message_queue.pop(&self.message_queue_storage);
     }
 
     /// Mark the queued message at logical `index` to steer (inject after the
     /// next tool batch). Called from the UI thread; guarded by the queue mutex
     /// the worker also holds while draining.
     pub fn setQueuedSteer(self: *Agent, index: u32) void {
-        self.lockMessageQueue();
-        defer self.message_queue_mutex.unlock();
-        if (self.message_queue.at(&self.message_queue_storage, index)) |entry| entry.steer = true;
-    }
-
-    fn lockMessageQueue(self: *Agent) void {
-        while (!self.message_queue_mutex.tryLock()) {
-            std.Thread.yield() catch {};
+        if (self.message_queue_mutex.lock(self.io) catch null) |_| {
+            defer self.message_queue_mutex.unlock(self.io);
+            if (self.message_queue.at(&self.message_queue_storage, index)) |entry| entry.steer = true;
         }
     }
 
