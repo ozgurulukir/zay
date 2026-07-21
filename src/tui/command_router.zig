@@ -52,11 +52,38 @@ pub fn handleCommandKey(app: *App, key: vaxis.Key) !bool {
 
 /// File-tree picker mode (overlay search + tree state).
 ///
-/// R2.1 stub: forwards to `App.handleTreePickerKey`. Real implementation
-/// lands in R2.2.
+/// Keys: up/down move the cursor; left/right cycle the filter; tab toggles
+/// the fold state of the currently selected node. Every other key falls
+/// through to the input.
 const TreePicker = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
-        return app.handleTreePickerKey(key);
+        if (key.matches(vaxis.Key.up, .{})) {
+            app.getTreeState().moveUp();
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{})) {
+            app.getTreeState().moveDown();
+            return true;
+        }
+        if (key.matches(vaxis.Key.left, .{})) {
+            const filter = try app.peekPaletteInput();
+            defer app.gpa.free(filter);
+            try app.getTreeState().cycleFilter(filter, false);
+            return true;
+        }
+        if (key.matches(vaxis.Key.right, .{})) {
+            const filter = try app.peekPaletteInput();
+            defer app.gpa.free(filter);
+            try app.getTreeState().cycleFilter(filter, true);
+            return true;
+        }
+        if (key.matches(vaxis.Key.tab, .{})) {
+            const filter = try app.peekPaletteInput();
+            defer app.gpa.free(filter);
+            try app.getTreeState().toggleFoldSelected(filter);
+            return true;
+        }
+        return false;
     }
 };
 

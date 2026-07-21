@@ -406,6 +406,19 @@ pub const App = struct {
         return self.mode;
     }
 
+    pub fn getTreeState(self: *App) *tree_selector.TreeState {
+        return &self.tree_state;
+    }
+
+    pub fn peekPaletteInput(self: *App) ![]u8 {
+        const left = self.palette_input.buf.firstHalf();
+        const right = self.palette_input.buf.secondHalf();
+        const out = try self.gpa.alloc(u8, left.len + right.len);
+        @memcpy(out[0..left.len], left);
+        @memcpy(out[left.len..], right);
+        return out;
+    }
+
     pub fn getBackgroundModal(self: *const App) bool {
         return self.background_modal;
     }
@@ -1108,36 +1121,6 @@ pub const App = struct {
 
     pub fn handleCommandKey(self: *App, key: vaxis.Key) !bool {
         return command_router.handleCommandKey(self, key);
-    }
-
-    pub fn handleTreePickerKey(self: *App, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.up, .{})) {
-            self.tree_state.moveUp();
-            return true;
-        }
-        if (key.matches(vaxis.Key.down, .{})) {
-            self.tree_state.moveDown();
-            return true;
-        }
-        if (key.matches(vaxis.Key.left, .{})) {
-            const filter = try self.peekPaletteInput();
-            defer self.gpa.free(filter);
-            try self.tree_state.cycleFilter(filter, false);
-            return true;
-        }
-        if (key.matches(vaxis.Key.right, .{})) {
-            const filter = try self.peekPaletteInput();
-            defer self.gpa.free(filter);
-            try self.tree_state.cycleFilter(filter, true);
-            return true;
-        }
-        if (key.matches(vaxis.Key.tab, .{})) {
-            const filter = try self.peekPaletteInput();
-            defer self.gpa.free(filter);
-            try self.tree_state.toggleFoldSelected(filter);
-            return true;
-        }
-        return false;
     }
 
     pub fn handleProviderPickerKey(self: *App, key: vaxis.Key) !bool {
@@ -2670,15 +2653,6 @@ pub const App = struct {
 
     fn clearPaletteInput(self: *App) void {
         self.palette_input.clearRetainingCapacity();
-    }
-
-    fn peekPaletteInput(self: *App) ![]u8 {
-        const left = self.palette_input.buf.firstHalf();
-        const right = self.palette_input.buf.secondHalf();
-        const out = try self.gpa.alloc(u8, left.len + right.len);
-        @memcpy(out[0..left.len], left);
-        @memcpy(out[left.len..], right);
-        return out;
     }
 
     fn peekCommentInput(self: *App) ![]u8 {
