@@ -34,6 +34,7 @@ const tui_metrics = @import("tui/metrics.zig");
 const lane_column = @import("tui/lane_column.zig");
 const diff_viewer_overlay = @import("tui/diff_viewer_overlay.zig");
 const root_layout = @import("tui/layout.zig");
+const root_layout_widget = @import("tui/root_layout.zig");
 const input_mod = @import("tui/widgets/input.zig");
 const tui_message = @import("tui/widgets/message.zig");
 const blackhole = @import("tui/blackhole.zig");
@@ -3847,154 +3848,7 @@ pub const RootWidget = struct {
 
     fn drawRoot(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *RootWidget = @ptrCast(@alignCast(ptr));
-        // The diff viewer replaces the whole screen (transcript + input + overlay),
-        // so it short-circuits the normal layout entirely.
-        if (self.app.mode == .diff_viewer) return diff_viewer_overlay.drawDiffViewer(self.app, self.widget(), ctx);
-        const max_width = ctx.max.width orelse ctx.min.width;
-        const max_height = ctx.max.height orelse ctx.min.height;
-        const loading_visible = self.app.thread.turn_view.awaitingOutput();
-        const split = self.app.split and self.app.threads.items.len > 1;
-        // In split view always reserve the loading row so each column keeps a
-        // fixed height across turns — the spinner appearing must not reflow.
-        const layout = root_layout.rootLayout(max_height, false, try self.app.inputTextRows(ctx, max_width -| 4), loading_visible or split, self.app.thread.queued.items.len > 0);
-        self.app.input_surface_row = layout.input_row;
-        self.app.nav.lanes_chip_rect = null;
-
-        var transcript_view: tx_widget.TranscriptWidget = .{ .app = self.app, .thread = self.app.thread };
-        var loading_view: loading.LoadingWidget = .{ .app = self.app };
-        var input_view: input_mod.InputWidget = .{ .app = self.app };
-        var overlay_view: OverlayWidget = .{ .app = self.app };
-
-        const transcript_ctx = ctx.withConstraints(
-            .{ .width = max_width, .height = layout.transcript_height },
-            .{ .width = max_width, .height = layout.transcript_height },
-        );
-        const input_ctx = ctx.withConstraints(
-            .{ .width = max_width, .height = layout.input_height },
-            .{ .width = max_width, .height = layout.input_height },
-        );
-
-        const overlay_visible = self.app.mode != .normal;
-        const permission_visible = self.app.permissionPending() and !overlay_visible;
-        const background_visible = self.app.background_modal_state.modal and !overlay_visible and !permission_visible;
-        const at_visible = self.app.at_search.active and !overlay_visible and !permission_visible and !background_visible;
-
-        var child_count: usize = (if (split) self.app.threads.items.len else 1) + 1;
-        if (loading_visible) child_count += 1;
-        if (overlay_visible) child_count += 1;
-        if (permission_visible) child_count += 1;
-        if (background_visible) child_count += 1;
-        if (at_visible) child_count += 1;
-        const children = try ctx.arena.alloc(vxfw.SubSurface, child_count);
-        var idx: usize = 0;
-        if (split) {
-            // Tile the transcript area as a 2-wide grid: rows of two lanes, a
-            // trailing odd lane spanning its row. The active lane is marked in
-            // its border label; input + spinner stay shared below, routing to it.
-            const n = self.app.threads.items.len;
-            const rows: u16 = @intCast((n + 1) / 2);
-            const cell_h: u16 = layout.transcript_height / rows;
-            for (self.app.threads.items, 0..) |lane, i| {
-                const row: u16 = @intCast(i / 2);
-                const col: u16 = @intCast(i % 2);
-                const last_row = row == rows - 1;
-                const per_row: u16 = if (last_row and n % 2 == 1) 1 else 2;
-                const cell_w: u16 = max_width / per_row;
-                const w: u16 = if (col == per_row - 1) max_width - cell_w * (per_row - 1) else cell_w;
-                const h: u16 = if (last_row) layout.transcript_height - cell_h * (rows - 1) else cell_h;
-                children[idx] = .{
-                    .origin = .{ .row = row * cell_h, .col = col * cell_w },
-                    .surface = try lane_column.drawLaneColumn(self.app, ctx, lane, w, h, lane == self.app.thread),
-                    .z_index = 0,
-                };
-                idx += 1;
-            }
-        } else {
-            children[idx] = .{
-                .origin = .{ .row = 0, .col = 0 },
-                .surface = try transcript_view.widget().draw(transcript_ctx),
-                .z_index = 0,
-            };
-            idx += 1;
-        }
-        if (loading_visible) {
-            const loading_ctx = ctx.withConstraints(
-                .{ .width = max_width, .height = layout.loading_height },
-                .{ .width = max_width, .height = layout.loading_height },
-            );
-            children[idx] = .{
-                .origin = .{ .row = layout.loading_row, .col = 0 },
-                .surface = try loading_view.widget().draw(loading_ctx),
-                .z_index = 0,
-            };
-            idx += 1;
-        }
-        children[idx] = .{
-            .origin = .{ .row = layout.input_row, .col = 0 },
-            .surface = try input_view.widget().draw(input_ctx),
-            .z_index = 0,
-        };
-        idx += 1;
-        if (overlay_visible) {
-            var centered_overlay: vxfw.Center = .{ .child = overlay_view.widget() };
-            children[idx] = .{
-                .origin = .{ .row = 0, .col = 0 },
-                .surface = try centered_overlay.widget().draw(ctx.withConstraints(
-                    .{ .width = max_width, .height = layout.transcript_height },
-                    .{ .width = max_width, .height = layout.transcript_height },
-                )),
-                .z_index = 2,
-            };
-            idx += 1;
-        }
-        if (permission_visible) {
-            var permission_view: permission.PermissionWidget = .{ .app = self.app };
-            const panel_height: u16 = @min(@as(u16, 12), @max(@as(u16, 5), layout.input_row));
-            children[idx] = .{
-                .origin = .{ .row = layout.input_row -| panel_height, .col = 0 },
-                .surface = try permission_view.widget().draw(ctx.withConstraints(
-                    .{ .width = max_width, .height = panel_height },
-                    .{ .width = max_width, .height = panel_height },
-                )),
-                .z_index = 3,
-            };
-            idx += 1;
-        }
-        if (background_visible) {
-            var jobs_view: background_jobs.BackgroundJobsWidget = .{ .app = self.app };
-            const rows: u16 = @intCast(@min(@as(usize, 8), self.app.runningBackgroundCount()));
-            const panel_height: u16 = @min(layout.input_row, rows + 4);
-            children[idx] = .{
-                .origin = .{ .row = layout.input_row -| panel_height, .col = 0 },
-                .surface = try jobs_view.widget().draw(ctx.withConstraints(
-                    .{ .width = max_width, .height = panel_height },
-                    .{ .width = max_width, .height = panel_height },
-                )),
-                .z_index = 3,
-            };
-            idx += 1;
-        }
-        if (at_visible) {
-            var at_view: AtSearchWidget = .{ .app = self.app };
-            const panel_height = at_search.panelHeight(self.app.at_search.results.items.len);
-            const panel_width = @min(@as(u16, 72), max_width);
-            children[idx] = .{
-                .origin = .{ .row = layout.input_row -| panel_height, .col = 0 },
-                .surface = try at_view.widget().draw(ctx.withConstraints(
-                    .{ .width = panel_width, .height = panel_height },
-                    .{ .width = panel_width, .height = panel_height },
-                )),
-                .z_index = 1,
-            };
-            idx += 1;
-        }
-
-        return .{
-            .size = .{ .width = max_width, .height = max_height },
-            .widget = self.widget(),
-            .buffer = &.{},
-            .children = children,
-        };
+        return root_layout_widget.drawRoot(self.app, self.widget(), ctx);
     }
 
     /// Draw one lane's transcript as a bordered column for split view. The
@@ -4404,10 +4258,10 @@ fn overlaySize(mode: App.Mode) OverlaySize {
 
 /// Builds the floating `@`-results panel from app state. Presentational only;
 /// the main input keeps focus.
-const AtSearchWidget = struct {
+pub const AtSearchWidget = struct {
     app: *App,
 
-    fn widget(self: *AtSearchWidget) vxfw.Widget {
+    pub fn widget(self: *AtSearchWidget) vxfw.Widget {
         return .{ .userdata = self, .drawFn = drawAtSearch };
     }
 
@@ -4425,10 +4279,10 @@ const AtSearchWidget = struct {
     }
 };
 
-const OverlayWidget = struct {
+pub const OverlayWidget = struct {
     app: *App,
 
-    fn widget(self: *OverlayWidget) vxfw.Widget {
+    pub fn widget(self: *OverlayWidget) vxfw.Widget {
         return .{ .userdata = self, .drawFn = drawOverlay };
     }
 
