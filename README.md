@@ -44,7 +44,10 @@ concern:
 - `lane_column.zig` — per-lane bordered transcript column (split view).
 - `diff_viewer_overlay.zig` — full-screen `/diff` overlay.
 - `root_layout.zig` — top-level `drawRoot` layout (tile grid, loading, input, overlay stack).
-- `lifecycle.zig` — `deinit`, `handleTick`, `createParallelLane`, `handleDiffBrowseKey`.
+- `lifecycle.zig` — `deinit`, `handleTick`, `createParallelLane`, diff key handlers, `syncFocus`, `submit`, `ensureTick`.
+- `diff_utils.zig` — pure diff-count stat/numstat parsers, git label loader.
+- `lanes.zig` — `MergeSource` type + lane merge helpers (`workingLaneOf`, `laneErrorText`).
+- `provider_model.zig` — provider connection, model catalogue loading, model selection (~50 functions).
 - `thread.zig` — `Thread` (lane) state, multi-lane state machine.
 - `turn.zig` / `turn_view.zig` — turn lifecycle + render.
 - `diff_viewer.zig` — `/diff` inline-diff helpers (used by `widgets/diff.zig`).
@@ -59,5 +62,5 @@ concern:
 
 `src/tui/widgets/` holds the per-widget draw code (message, command
 panel, at_search, background_jobs, permission, diff, loading, transcript,
-input, lanes picker, model picker, provider picker, resume picker, tree
-selector, panel layout, tree art).
+input, overlay, lanes picker, model picker, provider picker, resume
+picker, tree selector, panel layout, tree art).
