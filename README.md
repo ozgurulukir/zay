@@ -40,6 +40,9 @@ concern:
 - `command_router.zig` — per-mode key dispatch (one struct per `App.Mode`).
 - `app_state.zig` — `App` state grouped into sub-structs.
 - `background_delivery.zig` — background-job poll/format/deliver.
+- `lane_lifecycle.zig` — lane naming, cycling, closing, merging, `/lanes` overlay.
+- `diff_lifecycle.zig` — async diff refresh pipeline (DiffCounts, schedule/cancel/drain).
+- `session_switcher.zig` — resume picker, session creation, timeline navigation.
 - `layout.zig` — `rootLayout` math for `drawRoot` (transcript / loading / input row split).
 - `lane_column.zig` — per-lane bordered transcript column (split view).
 - `diff_viewer_overlay.zig` — full-screen `/diff` overlay.

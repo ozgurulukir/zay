@@ -24,6 +24,14 @@ Prefer to use the primitives provided by the framework as much as possible.
 `RootWidget`; the rest of `src/tui/` is split by concern. See `README.md`
 Architecture for the current module list (kept in sync as `tui.zig` shrinks).
 
+**Domain extraction pattern.** Isolated domain clusters (lane lifecycle, diff
+lifecycle, session switching) live under `src/tui/` as free-function modules.
+Each module imports `const tui = @import("../tui.zig")` and defines `pub fn`
+taking `*App` as the first parameter. The original App method stays as a
+1-line delegate (Strangler Fig) so inline tests in `tui.zig` resolve via the
+struct. When a private App method is needed from the new module, promote it to
+`pub` — not `pub const` (that is for module-level re-exports of nested types).
+
 **Widget extraction pattern.** Isolated widgets live under `src/tui/widgets/`.
 A new widget file declares the outer border widget as
 `pub const NameWidget = struct { app: *App, pub fn widget(...) vxfw.Widget { ... } }`
