@@ -27,6 +27,7 @@ const model_catalogue = @import("tui/model_catalogue.zig");
 const tui_turn_view = @import("tui/turn_view.zig");
 const event_router = @import("tui/event_router.zig");
 const command_router = @import("tui/command_router.zig");
+const session_switcher = @import("tui/session_switcher.zig");
 const app_state = @import("tui/app_state.zig");
 const background_delivery = @import("tui/background_delivery.zig");
 pub const Thread = @import("tui/thread.zig");
@@ -271,7 +272,7 @@ pub const App = struct {
     /// The runtime whose allocator, home dir, and prompt/skills template seed
     /// new lanes: the first live lane (the primary, in practice). Null only in
     /// headless/test setups.
-    fn templateRuntime(self: *const App) ?*runtime_mod.AgentRuntime {
+    pub fn templateRuntime(self: *const App) ?*runtime_mod.AgentRuntime {
         for (self.threads.items) |lane| {
             switch (lane.engine) {
                 .live => |live| return live.runtime,
@@ -1179,127 +1180,88 @@ pub const App = struct {
     }
 
     fn openResumePicker(self: *App) !void {
-        self.closeAtSearch();
-        const summaries = self.resume_summaries.items;
-        const filter = self.peekPaletteInput() catch "";
-        _ = resume_picker.visibleCount(summaries, filter, self.resume_folded_projects.items, self.nav.resume_global);
-        self.nav.resume_selection = 0;
-        self.nav.block_nav = false;
-        self.mode = .session_picker;
-        self.inputs.palette.clearRetainingCapacity();
-        if (filter.len > 0) try self.inputs.palette.insertSliceAtCursor(filter);
-        self.syncResumeListCursor();
+        return session_switcher.openResumePicker(self);
     }
 
     pub fn reloadResumeSessions(self: *App) !void {
-        self.resumeClear();
-        var manager = try session_mod.SessionManager.initDefault(self.gpa, self.io, self.liveRuntime().?.home_dir);
-        defer manager.deinit();
-        const cwd = if (self.nav.resume_global) null else (self.repoRoot() orelse self.liveRuntime().?.cwd);
-        const summaries = try manager.list(self.gpa, cwd);
-        try self.resume_summaries.appendSlice(self.gpa, summaries);
-        if (self.nav.resume_global) std.mem.sort(
-            session_mod.SessionSummary,
-            self.resume_summaries.items,
-            self.resume_summaries.items,
-            resumeSummaryLessThan,
-        );
-        if (self.nav.resume_selection >= try self.visibleResumeCount()) self.nav.resume_selection = 0;
-        self.syncResumeListCursor();
+        return session_switcher.reloadResumeSessions(self);
     }
 
     fn selectedResumeSummary(self: *App) !?*session_mod.SessionSummary {
-        const filter = try self.peekPaletteInput();
-        defer self.gpa.free(filter);
-        return @constCast(resume_picker.selectedSummary(self.resume_summaries.items, filter, self.resume_folded_projects.items, self.nav.resume_selection, self.nav.resume_global));
+        return session_switcher.selectedResumeSummary(self);
     }
 
     pub fn visibleResumeCount(self: *App) !u32 {
-        const filter = try self.peekPaletteInput();
-        defer self.gpa.free(filter);
-        return resume_picker.visibleCount(self.resume_summaries.items, filter, self.resume_folded_projects.items, self.nav.resume_global);
+        return session_switcher.visibleResumeCount(self);
     }
 
     pub fn toggleSelectedResumeProject(self: *App) !void {
-        const filter = try self.peekPaletteInput();
-        defer self.gpa.free(filter);
-        const cwd = resume_picker.selectedProject(self.resume_summaries.items, filter, self.resume_folded_projects.items, self.nav.resume_selection) orelse return;
-        if (self.resumeFoldIndex(cwd)) |index| {
-            self.gpa.free(self.resume_folded_projects.items[index]);
-            _ = self.resume_folded_projects.orderedRemove(index);
-        } else {
-            try self.resume_folded_projects.append(self.gpa, try self.gpa.dupe(u8, cwd));
-        }
-        if (self.nav.resume_selection >= try self.visibleResumeCount()) self.nav.resume_selection = 0;
-        self.syncResumeListCursor();
-    }
-
-    fn resumeFoldIndex(self: *const App, cwd: []const u8) ?usize {
-        for (self.resume_folded_projects.items, 0..) |folded, index| {
-            if (std.mem.eql(u8, folded, cwd)) return index;
-        }
-        return null;
+        return session_switcher.toggleSelectedResumeProject(self);
     }
 
     pub fn resumeClearFolds(self: *App) void {
-        for (self.resume_folded_projects.items) |folded| self.gpa.free(folded);
-        self.resume_folded_projects.clearRetainingCapacity();
+        session_switcher.resumeClearFolds(self);
     }
 
     pub fn resumeClear(self: *App) void {
-        for (self.resume_summaries.items) |*summary| summary.deinit(self.gpa);
-        self.resume_summaries.clearRetainingCapacity();
+        session_switcher.resumeClear(self);
     }
 
     pub fn syncResumeListCursor(self: *App) void {
-        self.resume_list.cursor = self.nav.resume_selection;
-        self.resume_list.ensureScroll();
+        session_switcher.syncResumeListCursor(self);
     }
 
     pub fn reloadTreeNodes(self: *App) !void {
-        const writer = &self.liveRuntime().?.session_writer;
-        const records = try writer.entries(self.gpa);
-        defer {
-            for (records) |*record| record.deinit(self.gpa);
-            self.gpa.free(records);
-        }
-        try self.pickers.tree.load(records, writer.leaf());
+        return session_switcher.reloadTreeNodes(self);
     }
 
-    /// Switch the session leaf to `entry_id`, then rehydrate the agent's
-    /// conversation, the display transcript, AND the working copy from the new
-    /// branch. Refused mid-turn.
     fn navigateToEntry(self: *App, entry_id: []const u8) !void {
-        if (self.thread.turn.isActive()) return error.InFlightTurn;
-        const rt = self.liveRuntime() orelse return error.NoActiveRuntime;
-        try rt.session_writer.navigate(entry_id);
-        try rt.reloadMessages();
-        try self.rebuildTranscriptFromAgent();
-        try self.restoreCheckpointForBranch(rt);
+        return session_switcher.navigateToEntry(self, entry_id);
     }
 
-    /// Restore the working tree to the snapshot bound to the now-active timeline
-    /// node — its own, or the nearest ancestor that has one (`snapshotAt`). HEAD
-    /// stays attached to the branch; `vcs.restore` rewrites tracked files to that
-    /// tree (adds/modifies/deletes). Best-effort: a node with no bound snapshot
-    /// (an early point, before any file change) or a git failure simply leaves
-    /// the working tree as-is — no error, since the binding is reliable and the
-    /// "no snapshot here" case is normal, not a problem.
-    fn restoreCheckpointForBranch(self: *App, rt: *runtime_mod.AgentRuntime) !void {
-        const sha_raw = (try rt.session_writer.snapshotAt(self.gpa)) orelse return;
-        defer self.gpa.free(sha_raw);
-        const sha = vcs.ObjectId.parse(sha_raw) catch return;
-        const index = vcs.indexPath(self.gpa, self.io, rt.cwd) catch return;
-        defer self.gpa.free(index);
-        vcs.restore(self.gpa, self.io, rt.cwd, index, sha) catch return;
+    fn reportSessionSwitchError(self: *App, err: anyerror) !void {
+        return session_switcher.reportSessionSwitchError(self, err);
+    }
+
+    fn reportConnectionError(self: *App, err: anyerror) !void {
+        self.mode = .normal;
+        self.clearInput();
+        var buffer: [128]u8 = undefined;
+        const message = std.fmt.bufPrint(&buffer, "Could not connect to provider: {s}", .{@errorName(err)}) catch "Could not connect to provider.";
+        _ = try self.thread.transcript.append(self.gpa, .agent, "agent", message);
+    }
+
+    fn switchToNewSession(self: *App) !void {
+        return session_switcher.switchToNewSession(self);
+    }
+
+    fn switchToSession(self: *App, session_id: []const u8) !void {
+        return session_switcher.switchToSession(self, session_id);
+    }
+
+    pub fn createRuntime(self: *App, cwd: []const u8, session_dir: []const u8, session_id: ?[]const u8) !*runtime_mod.AgentRuntime {
+        return session_switcher.createRuntime(self, cwd, session_dir, session_id);
     }
 
     pub fn clearInput(self: *App) void {
         self.inputs.input.clearRetainingCapacity();
     }
 
-    /// Recompute the mention popup from the text before the cursor. Called on
-    /// every edit while in normal mode. `@` searches files; `$` searches skills.
+    pub fn clearPaletteInput(self: *App) void {
+        self.inputs.palette.clearRetainingCapacity();
+    }
+
+    pub fn peekCommentInput(self: *App) ![]u8 {
+        const left = self.inputs.comment.buf.firstHalf();
+        const right = self.inputs.comment.buf.secondHalf();
+        const out = try self.gpa.alloc(u8, left.len + right.len);
+        @memcpy(out[0..left.len], left);
+        @memcpy(out[left.len..], right);
+        return out;
+    }
+
+    // --- At-search (mention popup) ---------------------------------------
+
     fn updateAtSearch(self: *App) !void {
         const before = self.inputs.input.buf.firstHalf();
         if (at_mention.activeQuery(before)) |active| {
@@ -1372,7 +1334,7 @@ pub const App = struct {
             if (self.at_search.results.items.len >= max_results) break;
             if (line.len == 0) continue;
             if (isSearchFooter(line)) continue;
-            if (line[line.len - 1] == '/') continue; // directory: `@` loads files
+            if (line[line.len - 1] == '/') continue;
             const owned = try self.gpa.dupe(u8, line);
             errdefer self.gpa.free(owned);
             try self.at_search.results.append(self.gpa, owned);
@@ -1380,7 +1342,6 @@ pub const App = struct {
         if (self.at_search.selection >= self.at_search.results.items.len) self.at_search.selection = 0;
     }
 
-    /// Replace the active mention token with the selected path or skill name.
     pub fn acceptAtSelection(self: *App) !void {
         if (self.at_search.selection >= self.at_search.results.items.len) return;
         const before = self.inputs.input.buf.firstHalf();
@@ -1414,8 +1375,17 @@ pub const App = struct {
         }
     }
 
-    /// Stash a prompt submitted while a turn is already running. Returns false
-    /// — no new turn starts; the message rides the steering queue instead.
+    /// Repo root = the primary lane's working directory (it was launched there).
+    /// Null only if the primary somehow has no runtime (headless/test).
+    pub fn repoRoot(self: *const App) ?[]const u8 {
+        return switch (self.threads.items[0].engine) {
+            .live => |live| live.runtime.cwd,
+            .idle => null,
+        };
+    }
+
+    // --- Queue management ------------------------------------------------
+
     fn enqueueSubmit(self: *App) !bool {
         const prompt = try self.inputs.input.buf.dupe();
         errdefer self.gpa.free(prompt);
@@ -1423,8 +1393,6 @@ pub const App = struct {
             self.gpa.free(prompt);
             return false;
         }
-        // Enqueue the raw text; the worker expands `@`-mentions when it drains
-        // the queue, keeping file I/O off the UI thread.
         self.thread.agent.?.enqueueUser(prompt) catch |err| switch (err) {
             error.QueueFull => {
                 self.gpa.free(prompt);
@@ -1434,29 +1402,22 @@ pub const App = struct {
             else => return err,
         };
         try self.thread.queued.append(self.gpa, .{ .text = prompt });
-        // Select the newest message so the line above the input shows what was
-        // just queued; ALT+← walks back to older ones.
         self.nav.queued_selection = self.thread.queued.items.len - 1;
         self.clearInput();
         return false;
     }
 
-    /// Move the queued-message selection one older (ALT+←).
     pub fn selectPrevQueued(self: *App) void {
         if (self.thread.queued.items.len == 0) return;
         if (self.nav.queued_selection > 0) self.nav.queued_selection -= 1;
     }
 
-    /// Move the queued-message selection one newer (ALT+→).
     pub fn selectNextQueued(self: *App) void {
         const len = self.thread.queued.items.len;
         if (len == 0) return;
         if (self.nav.queued_selection + 1 < len) self.nav.queued_selection += 1;
     }
 
-    /// Mark the selected queued message to steer (CTRL+→). One-way: it will be
-    /// injected after the next tool batch. Updates both the UI mirror and the
-    /// agent queue so the worker's drain decision matches what's on screen.
     pub fn steerSelectedQueued(self: *App) void {
         const items = self.thread.queued.items;
         if (items.len == 0) return;
@@ -1466,8 +1427,6 @@ pub const App = struct {
     }
 
     fn appendMessageQueueFullNotice(self: *App) !void {
-        // The spinner is derived from the turn view and drawn outside the
-        // transcript, so appending needs no remove/re-append dance.
         _ = try self.thread.transcript.append(self.gpa, .notice, "notice", "MessageQueueFull");
     }
 
@@ -1491,8 +1450,6 @@ pub const App = struct {
         }
         std.mem.copyForwards(Thread.QueuedMessage, self.thread.queued.items[0 .. self.thread.queued.items.len - flush_count], self.thread.queued.items[flush_count..]);
         self.thread.queued.shrinkRetainingCapacity(self.thread.queued.items.len - flush_count);
-        // Messages drain from the front, so shift the selection left to keep it
-        // pointing at the same logical message (clamped into range).
         self.nav.queued_selection -|= flush_count;
     }
 
@@ -1500,104 +1457,6 @@ pub const App = struct {
         for (self.thread.queued.items) |message| self.gpa.free(message.text);
         self.thread.queued.clearRetainingCapacity();
         self.nav.queued_selection = 0;
-    }
-
-    pub fn clearPaletteInput(self: *App) void {
-        self.inputs.palette.clearRetainingCapacity();
-    }
-
-    pub fn peekCommentInput(self: *App) ![]u8 {
-        const left = self.inputs.comment.buf.firstHalf();
-        const right = self.inputs.comment.buf.secondHalf();
-        const out = try self.gpa.alloc(u8, left.len + right.len);
-        @memcpy(out[0..left.len], left);
-        @memcpy(out[left.len..], right);
-        return out;
-    }
-
-    fn reportSessionSwitchError(self: *App, err: anyerror) !void {
-        self.mode = .normal;
-        self.clearInput();
-        var buffer: [128]u8 = undefined;
-        const message = std.fmt.bufPrint(&buffer, "Could not switch session: {s}", .{@errorName(err)}) catch "Could not switch session.";
-        _ = try self.thread.transcript.append(self.gpa, .agent, "agent", message);
-    }
-
-    fn reportConnectionError(self: *App, err: anyerror) !void {
-        self.mode = .normal;
-        self.clearInput();
-        var buffer: [128]u8 = undefined;
-        const message = std.fmt.bufPrint(&buffer, "Could not connect to provider: {s}", .{@errorName(err)}) catch "Could not connect to provider.";
-        _ = try self.thread.transcript.append(self.gpa, .agent, "agent", message);
-    }
-
-    fn switchToNewSession(self: *App) !void {
-        if (self.thread.turn.isActive()) return error.InFlightTurn;
-        const runtime = try self.createRuntime(self.liveRuntime().?.cwd, self.repoRoot() orelse self.liveRuntime().?.cwd, null);
-        errdefer {
-            runtime.deinit();
-            self.gpa.destroy(runtime);
-        }
-        try self.installRuntime(runtime);
-        try self.clearConversation();
-    }
-
-    fn switchToSession(self: *App, session_id: []const u8) !void {
-        if (self.thread.turn.isActive()) return error.InFlightTurn;
-        const runtime = try self.createRuntime(self.liveRuntime().?.cwd, self.repoRoot() orelse self.liveRuntime().?.cwd, session_id);
-        errdefer {
-            runtime.deinit();
-            self.gpa.destroy(runtime);
-        }
-        try self.installRuntime(runtime);
-        try self.rebuildTranscriptFromAgent();
-    }
-
-    pub fn createRuntime(self: *App, cwd: []const u8, session_dir: []const u8, session_id: ?[]const u8) !*runtime_mod.AgentRuntime {
-        const current = self.templateRuntime() orelse return error.NoActiveRuntime;
-        const runtime = try self.gpa.create(runtime_mod.AgentRuntime);
-        errdefer self.gpa.destroy(runtime);
-        const diagnostics = try current.gpa.alloc(config_mod.Diagnostic, 0);
-        errdefer current.gpa.free(diagnostics);
-        if (session_id) |id| {
-            try runtime.initResume(
-                current.gpa,
-                self.io,
-                cwd,
-                session_dir,
-                current.home_dir,
-                current.base_system_prompt,
-                self.cached_config,
-                diagnostics,
-                id,
-                current, // template: reuse the live lane's project prompt + skills
-            );
-        } else {
-            try runtime.initNew(
-                current.gpa,
-                self.io,
-                cwd,
-                session_dir,
-                current.home_dir,
-                current.base_system_prompt,
-                self.cached_config,
-                diagnostics,
-                current, // template: reuse the live lane's project prompt + skills
-            );
-        }
-        // Every lane shares the one background manager so jobs survive lane
-        // switches and are all torn down together at exit.
-        runtime.agent.background_manager = self.background;
-        return runtime;
-    }
-
-    /// Repo root = the primary lane's working directory (it was launched there).
-    /// Null only if the primary somehow has no runtime (headless/test).
-    pub fn repoRoot(self: *const App) ?[]const u8 {
-        return switch (self.threads.items[0].engine) {
-            .live => |live| live.runtime.cwd,
-            .idle => null,
-        };
     }
 
     /// Spawn a parallel lane: a fresh `git worktree` on its own `nova/<id>`
@@ -1714,7 +1573,7 @@ pub const App = struct {
         return lane_lifecycle.handleLanesKey(self, key);
     }
 
-    fn installRuntime(self: *App, runtime: *runtime_mod.AgentRuntime) !void {
+    pub fn installRuntime(self: *App, runtime: *runtime_mod.AgentRuntime) !void {
         if (self.thread.turn.isActive()) return error.InFlightTurn;
         self.cancelLaneNaming(self.thread);
         if (self.liveRuntime()) |old| {
@@ -1733,7 +1592,7 @@ pub const App = struct {
         self.resetTurnState();
     }
 
-    fn clearConversation(self: *App) !void {
+    pub fn clearConversation(self: *App) !void {
         if (self.thread.transcript.messages.items.len > 0) {
             try self.retired_transcripts.append(self.gpa, self.thread.transcript);
         }
@@ -1741,7 +1600,7 @@ pub const App = struct {
         self.thread.transcript_list.scroll = .{};
     }
 
-    fn rebuildTranscriptFromAgent(self: *App) !void {
+    pub fn rebuildTranscriptFromAgent(self: *App) !void {
         try self.clearConversation();
         for (self.thread.agent.?.messages()) |message| {
             if (message.role == .system) continue;
@@ -1975,27 +1834,6 @@ pub fn nextIndex(current: u32, count: u32) u32 {
     if (count == 0) return 0;
     if (current + 1 >= count) return 0;
     return current + 1;
-}
-
-fn resumeSummaryLessThan(summaries: []const session_mod.SessionSummary, left: session_mod.SessionSummary, right: session_mod.SessionSummary) bool {
-    if (std.mem.eql(u8, left.cwd, right.cwd)) return left.updated_at_ms > right.updated_at_ms;
-
-    const left_project_updated_at_ms = resumeProjectUpdatedAtMax(summaries, left.cwd);
-    const right_project_updated_at_ms = resumeProjectUpdatedAtMax(summaries, right.cwd);
-    if (left_project_updated_at_ms != right_project_updated_at_ms) {
-        return left_project_updated_at_ms > right_project_updated_at_ms;
-    }
-
-    return std.mem.lessThan(u8, left.cwd, right.cwd);
-}
-
-fn resumeProjectUpdatedAtMax(summaries: []const session_mod.SessionSummary, cwd: []const u8) i64 {
-    var updated_at_ms: i64 = std.math.minInt(i64);
-    for (summaries) |summary| {
-        if (!std.mem.eql(u8, summary.cwd, cwd)) continue;
-        updated_at_ms = @max(updated_at_ms, summary.updated_at_ms);
-    }
-    return updated_at_ms;
 }
 
 pub fn previousIndex(current: u32, count: u32) u32 {
@@ -2586,7 +2424,7 @@ test "global resume sorting groups projects by latest session" {
     };
 
     const context: []const session_mod.SessionSummary = summaries[0..];
-    std.mem.sort(session_mod.SessionSummary, summaries[0..], context, resumeSummaryLessThan);
+    std.mem.sort(session_mod.SessionSummary, summaries[0..], context, session_switcher.resumeSummaryLessThan);
 
     try std.testing.expectEqualStrings("/repo/b", summaries[0].cwd);
     try std.testing.expectEqualStrings("new-b", summaries[0].id);
