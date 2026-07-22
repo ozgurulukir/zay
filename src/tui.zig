@@ -86,6 +86,7 @@ const transcript_nav = @import("tui/transcript_nav.zig");
 pub const TranscriptNavigation = transcript_nav.TranscriptNavigation;
 const at_search_mod = @import("tui/at_search.zig");
 const permission_mod = @import("tui/permission.zig");
+const event_callbacks = @import("tui/event_callbacks.zig");
 pub const MentionSearchKind = at_search_mod.MentionSearchKind;
 
 /// A single-row clickable region on screen (absolute coordinates). Used to
@@ -287,9 +288,9 @@ pub const App = struct {
 
     pub fn bindInputCallbacks(self: *App) void {
         self.inputs.input.userdata = self;
-        self.inputs.input.onChange = inputChanged;
+        self.inputs.input.onChange = event_callbacks.inputChanged;
         self.inputs.palette.userdata = self;
-        self.inputs.palette.onChange = paletteInputChanged;
+        self.inputs.palette.onChange = event_callbacks.paletteInputChanged;
     }
 
     // --- Accessors for cross-module access (R1: event_router needs these
@@ -988,7 +989,7 @@ pub const App = struct {
         return command_router.Transcript.handle(self, key);
     }
 
-    fn syncModeWithInput(self: *App, value: []const u8) !void {
+    pub fn syncModeWithInput(self: *App, value: []const u8) !void {
         // While typing an API key in the provider form, the input is the key —
         // never reinterpret a leading '/' as a command.
         if (self.mode == .provider_picker and self.pickers.provider.stage == .form) return;
@@ -1233,7 +1234,7 @@ pub const App = struct {
 
     // --- At-search (mention popup) ---------------------------------------
 
-    fn updateAtSearch(self: *App) !void {
+    pub fn updateAtSearch(self: *App) !void {
         return at_search_mod.updateAtSearch(self);
     }
 
@@ -1820,54 +1821,6 @@ fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
     return std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
 }
 
-
-fn inputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8) anyerror!void {
-    const app: *App = @ptrCast(@alignCast(userdata.?));
-    app.nav.block_nav = false;
-    const was_command = app.mode == .command;
-    try app.syncModeWithInput(value);
-    if (!was_command and app.mode == .command) {
-        app.clearInput();
-        app.clearPaletteInput();
-        try ctx.requestFocus(app.inputs.palette.widget());
-    }
-    if (app.mode == .normal) {
-        try app.updateAtSearch();
-    } else {
-        app.closeAtSearch();
-    }
-    ctx.consumeAndRedraw();
-}
-
-fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8) anyerror!void {
-    const app: *App = @ptrCast(@alignCast(userdata.?));
-    switch (app.mode) {
-        .command => {
-            const count = commandMatchesCountForFilter(app, value);
-            if (app.nav.command_selection >= count) app.nav.command_selection = 0;
-        },
-        .session_picker => {
-            const count = resume_picker.visibleCount(app.resume_summaries.items, value, app.resume_folded_projects.items, app.nav.resume_global);
-            if (app.nav.resume_selection >= count) app.nav.resume_selection = 0;
-            app.syncResumeListCursor();
-        },
-        .tree_picker => {
-            try app.pickers.tree.reflattenKeepingSelection(value);
-        },
-        .model_picker => {
-            if (!provider_model.modelDisplayMatches(app, app.pickers.models.model_selection, value)) {
-                app.pickers.models.model_selection = provider_model.firstMatchingModelDisplay(app, value) orelse 0;
-            }
-        },
-        .diff_viewer => {
-            if (app.diff.sub == .file_search) try app.diff.filterFiles(app.gpa, value);
-        },
-        // The save-message prompt is free text — nothing to filter live. The
-        // lanes overlay has no palette input.
-        .provider_picker, .normal, .save_message, .lanes => {},
-    }
-    ctx.consumeAndRedraw();
-}
 
 /// Builds the floating `@`-results panel from app state. Presentational only;
 /// the main input keeps focus.
