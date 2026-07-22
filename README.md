@@ -76,4 +76,4 @@ concern:
 `src/tui/widgets/` holds the per-widget draw code (message, command
 panel, at_search, background_jobs, permission, diff, loading, transcript,
 input, overlay, lanes picker, model picker, provider picker, resume
-picker, tree selector, panel layout, tree art).
+picker, help picker, tree selector, panel layout, tree art).

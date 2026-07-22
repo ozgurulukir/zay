@@ -12,11 +12,9 @@ Always consult the tigerstyle skill when writing code.
 
 ## Building the TUI
 
-We use libvaxis vxfw for building the TUI. The source code for this library is inside zig-pkg.
+TUI built with libvaxis vxfw (source in zig-pkg). Prefer framework primitives.
 
-Prefer to use the primitives provided by the framework as much as possible.
-
-**vxfw gotcha:** widget methods like `TextField.widget()` are *mutating* — they take `*Self`, not `*const Self`. Accessors that return `*TextField` from a struct must be declared on `*App`, not `*const App`, or the call site fails to type-check.
+**vxfw gotcha:** widget methods like `TextField.widget()` are *mutating* — they take `*Self`, not `*const Self`. Accessors returning `*TextField` must be declared on `*App`, not `*const App`, or the call site fails to type-check.
 
 **Zig 0.16 field rule:** `pub` cannot precede a field declaration — only functions/variables. Cross-module field access goes through `pub fn` accessors (`getX()` form, never `X()`, because of the field-vs-method name collision).
 
@@ -26,7 +24,7 @@ Architecture for the current module list (kept in sync as `tui.zig` shrinks).
 
 **Domain extraction pattern.** Isolated domain clusters (lane lifecycle, diff
 lifecycle, session switching, at-search, transcript navigation, permission,
-event callbacks) live under `src/tui/` as free-function modules.
+event callbacks, queue) live under `src/tui/` as free-function modules.
 Each module imports `const tui = @import("../tui.zig")` and defines `pub fn`
 taking `*App` as the first parameter. The original App method stays as a
 1-line delegate (Strangler Fig) so inline tests in `tui.zig` resolve via the
@@ -51,9 +49,7 @@ private methods on `App` for key handling.
 
 ## Zig Development
 
-Use `zigdoc` to discover current APIs for the Zig standard library and any third-party dependencies before coding.
-
-Examples:
+Use `zigdoc` to discover APIs before coding.
 
 ```bash
 zigdoc std.fs
@@ -137,15 +133,14 @@ const output = try writer.toOwnedSlice();
 ## Safety
 
 - Add assertions at API boundaries and state transitions; avoid trivial assertions.
-- Keep functions small and push pure computation into helpers.
+- Keep functions small; push pure computation into helpers.
 - Comments should explain why, not what.
 
 ## Verifying
 
-Run the following:
+Run:
 
 - `zig fmt`
-
 - `zig build test`
 
 ## Known Issues
