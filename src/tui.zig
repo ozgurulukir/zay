@@ -85,6 +85,7 @@ pub const lane_naming_context_max: usize = 3;
 const transcript_nav = @import("tui/transcript_nav.zig");
 pub const TranscriptNavigation = transcript_nav.TranscriptNavigation;
 const at_search_mod = @import("tui/at_search.zig");
+const permission_mod = @import("tui/permission.zig");
 pub const MentionSearchKind = at_search_mod.MentionSearchKind;
 
 /// A single-row clickable region on screen (absolute coordinates). Used to
@@ -812,47 +813,15 @@ pub const App = struct {
     }
 
     pub fn permissionPending(self: *App) bool {
-        const worker = if (self.thread.worker_context) |*context| context else return false;
-        return worker.approval.pending(worker.io);
+        return permission_mod.permissionPending(self);
     }
 
     pub fn handlePermissionKey(self: *App, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.left, .{})) {
-            self.thread.permission_selection = .approve;
-            return true;
-        }
-        if (key.matches(vaxis.Key.right, .{})) {
-            self.thread.permission_selection = .reject;
-            return true;
-        }
-        if (key.matches(vaxis.Key.up, .{})) {
-            if (self.thread.permission_scroll > 0) self.thread.permission_scroll -= 1;
-            return true;
-        }
-        if (key.matches(vaxis.Key.down, .{})) {
-            self.thread.permission_scroll += 1;
-            return true;
-        }
-        if (key.matches(vaxis.Key.enter, .{})) {
-            try self.resolvePermission(self.thread.permission_selection);
-            return true;
-        }
-        if (key.matches('y', .{}) or key.matches('a', .{})) {
-            try self.resolvePermission(.approve);
-            return true;
-        }
-        if (key.matches('n', .{}) or key.matches('r', .{})) {
-            try self.resolvePermission(.reject);
-            return true;
-        }
-        return false;
+        return permission_mod.handlePermissionKey(self, key);
     }
 
     pub fn resolvePermission(self: *App, decision: agent_worker.ApprovalDecision) !void {
-        const worker = if (self.thread.worker_context) |*context| context else return;
-        try worker.approval.resolve(worker.io, decision);
-        self.thread.permission_scroll = 0;
-        self.thread.permission_selection = .approve;
+        return permission_mod.resolvePermission(self, decision);
     }
 
     pub fn applyAgentEvent(self: *App, event: agent_mod.Agent.Event) !bool {
