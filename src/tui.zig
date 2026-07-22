@@ -34,6 +34,9 @@ const tui_metrics = @import("tui/metrics.zig");
 const lane_column = @import("tui/lane_column.zig");
 const provider_model = @import("tui/provider_model.zig");
 const diff_viewer_overlay = @import("tui/diff_viewer_overlay.zig");
+const diff_lifecycle = @import("tui/diff_lifecycle.zig");
+pub const DiffCounts = diff_lifecycle.DiffCounts;
+pub const DiffRefreshOutcome = diff_lifecycle.DiffRefreshOutcome;
 const diff_utils = @import("tui/diff_utils.zig");
 const lane_lifecycle = @import("tui/lane_lifecycle.zig");
 const lanes_util = @import("tui/lanes.zig");
@@ -80,61 +83,6 @@ const long_message_scroll_step_rows: u16 = 3;
 pub const lane_naming_context_max: usize = 3;
 pub const TranscriptNavigation = enum { previous, next };
 pub const MentionSearchKind = enum { file, skill };
-
-pub const DiffCounts = struct {
-    additions: u32 = 0,
-    deletions: u32 = 0,
-};
-
-const DiffRefreshJob = struct {
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    cwd: []u8,
-    done: *std.atomic.Value(bool),
-
-    fn deinit(self: *DiffRefreshJob) void {
-        self.gpa.free(self.cwd);
-        self.* = undefined;
-    }
-};
-
-pub const DiffRefreshOutcome = union(enum) {
-    /// The full combined diff text (owned). Counts are derived from it on the UI
-    /// thread, and it's cached so `/diff` opens instantly.
-    ready: []u8,
-    failed,
-
-    pub fn deinit(self: *DiffRefreshOutcome, gpa: std.mem.Allocator) void {
-        switch (self.*) {
-            .ready => |raw| gpa.free(raw),
-            .failed => {},
-        }
-        self.* = undefined;
-    }
-};
-
-fn runDiffRefresh(job: *DiffRefreshJob) DiffRefreshOutcome {
-    const gpa = job.gpa;
-    const done = job.done;
-    defer {
-        job.deinit();
-        gpa.destroy(job);
-        done.store(true, .release);
-    }
-
-    // Grab the full diff (not just numstat): one git pass gives both the cached
-    // text and the +/- counts. `--no-index` exits non-zero when untracked files
-    // differ, so the exit code is ignored — empty stdout simply means no changes.
-    var result = bash_mod.runWithOptions(gpa, job.io, .{
-        .cwd = job.cwd,
-        .command = diff_viewer.diff_command,
-        .timeout = bash_mod.timeoutFromSeconds(5),
-    }) catch return .failed;
-    defer result.deinit(gpa);
-
-    const raw = gpa.dupe(u8, result.stdout) catch return .failed;
-    return .{ .ready = raw };
-}
 
 /// A single-row clickable region on screen (absolute coordinates). Used to
 /// hit-test mouse clicks against the pink lanes chip.
@@ -1901,118 +1849,23 @@ pub const App = struct {
     }
 
     pub fn diffCountsVisible(self: *const App) bool {
-        if (self.metrics.diff_counts.additions > 0) return true;
-        return self.metrics.diff_counts.deletions > 0;
+        return diff_lifecycle.diffCountsVisible(self);
     }
 
-    fn refreshDiffCounts(self: *App) !bool {
-        const cwd = if (self.liveRuntime()) |runtime| runtime.cwd else ".";
-        var result = try bash_mod.runWithOptions(self.gpa, self.io, .{
-            .cwd = cwd,
-            .command = diffCountCommand,
-            .timeout = bash_mod.timeoutFromSeconds(1),
-        });
-        defer result.deinit(self.gpa);
-        if (result.code != 0) return false;
-
-        return self.installDiffCounts(diff_utils.parseDiffCounts(result.stdout));
-    }
-
-    fn installDiffCounts(self: *App, next: DiffCounts) bool {
-        if (next.additions == self.metrics.diff_counts.additions) {
-            if (next.deletions == self.metrics.diff_counts.deletions) return false;
-        }
-        self.metrics.diff_counts = next;
-        return true;
+    pub fn refreshDiffCounts(self: *App) !bool {
+        return diff_lifecycle.refreshDiffCounts(self);
     }
 
     pub fn scheduleDiffRefresh(self: *App) !void {
-        if (self.metrics.diff_refresh_future != null) {
-            self.metrics.diff_refresh_again = true;
-            return;
-        }
-
-        const cwd_source = if (self.liveRuntime()) |runtime| runtime.cwd else ".";
-        const cwd = try self.gpa.dupe(u8, cwd_source);
-        errdefer self.gpa.free(cwd);
-
-        const job = try self.gpa.create(DiffRefreshJob);
-        errdefer self.gpa.destroy(job);
-        job.* = .{
-            .gpa = self.gpa,
-            .io = self.io,
-            .cwd = cwd,
-            .done = &self.metrics.diff_refresh_done,
-        };
-        errdefer job.deinit();
-
-        self.metrics.diff_refresh_again = false;
-        self.metrics.diff_refresh_done.store(false, .release);
-        self.metrics.diff_refresh_future = try self.io.concurrent(runDiffRefresh, .{job});
+        return diff_lifecycle.scheduleDiffRefresh(self);
     }
 
     pub fn cancelDiffRefresh(self: *App) void {
-        if (self.metrics.diff_refresh_future) |*future| {
-            var outcome = future.cancel(self.io);
-            outcome.deinit(self.gpa);
-            self.metrics.diff_refresh_future = null;
-        }
-        self.metrics.diff_refresh_again = false;
-        self.metrics.diff_refresh_done.store(false, .release);
+        diff_lifecycle.cancelDiffRefresh(self);
     }
 
     pub fn drainDiffRefresh(self: *App) !bool {
-        if (self.metrics.diff_refresh_future == null) return false;
-        if (!self.metrics.diff_refresh_done.load(.acquire)) return false;
-
-        var outcome = self.metrics.diff_refresh_future.?.await(self.io);
-        self.metrics.diff_refresh_future = null;
-        self.metrics.diff_refresh_done.store(false, .release);
-        defer outcome.deinit(self.gpa);
-
-        var visible_change = false;
-        switch (outcome) {
-            .ready => |raw| {
-                // Take ownership of the diff text into the cache; blank the local
-                // copy so the deferred deinit doesn't free what we kept.
-                if (self.metrics.diff_cache) |old| self.gpa.free(old);
-                self.metrics.diff_cache = raw;
-                outcome = .failed;
-                if (self.installDiffCounts(diff_utils.countDiff(self.metrics.diff_cache.?))) visible_change = true;
-                // A viewer opened on a cold cache is waiting on exactly this.
-                if (self.metrics.diff_loading) {
-                    try self.populateDiffFromCache();
-                    visible_change = true;
-                }
-            },
-            .failed => {
-                if (self.metrics.diff_loading) {
-                    self.metrics.diff_loading = false;
-                    self.mode = .normal;
-                    _ = try self.thread.transcript.append(self.gpa, .agent, "agent", "Couldn't load diff.");
-                    visible_change = true;
-                }
-            },
-        }
-        if (self.metrics.diff_refresh_again) try self.scheduleDiffRefresh();
-        return visible_change;
-    }
-
-    /// Build the viewer's state from the cached diff (parse only — no git). Drops
-    /// back to normal mode with a notice when the diff turned out empty.
-    fn populateDiffFromCache(self: *App) !void {
-        self.metrics.diff_loading = false;
-        const raw = self.metrics.diff_cache orelse return;
-        var state = try diff_viewer.fromRaw(self.gpa, raw);
-        if (state.isEmpty()) {
-            state.deinit(self.gpa);
-            self.mode = .normal;
-            self.clearInput();
-            _ = try self.thread.transcript.append(self.gpa, .agent, "agent", "No changes to review.");
-            return;
-        }
-        self.diff.deinit(self.gpa);
-        self.diff = state;
+        return diff_lifecycle.drainDiffRefresh(self);
     }
 
     pub fn jumpTranscriptToBottom(self: *App) void {
@@ -2185,16 +2038,6 @@ pub fn run(
     var root: RootWidget = .{ .app = &app };
     try fw_app.run(root.widget(), .{});
 }
-
-const diffCountCommand =
-    \\if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    \\  git diff --numstat HEAD -- 2>/dev/null
-    \\  git ls-files --others --exclude-standard -z 2>/dev/null | while IFS= read -r -d '' file; do
-    \\    lines=$(wc -l < "$file" 2>/dev/null | tr -d ' ')
-    \\    if [ -n "$lines" ]; then printf '%s\t0\t%s\n' "$lines" "$file"; fi
-    \\  done
-    \\fi
-;
 
 pub const RootWidget = struct {
     app: *App,
