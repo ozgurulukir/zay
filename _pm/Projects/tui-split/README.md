@@ -25,7 +25,7 @@ Strangler Fig (Rule 15):
 
 No "compatibility shim" left behind (Rule 9 outcome-oriented).
 
-## Modules shipped (R1–R7)
+## Modules shipped (R1–R7.5)
 
 | File | Phase | Pulled from `tui.zig` |
 | --- | --- | --- |
@@ -37,7 +37,10 @@ No "compatibility shim" left behind (Rule 9 outcome-oriented).
 | `tui/diff_viewer_overlay.zig` | R5.2b | `drawDiffViewer` |
 | `tui/layout.zig` | R5.2c | `rootLayout` math |
 | `tui/root_layout.zig` | R6.2 | `drawRoot` layout |
-| `tui/lifecycle.zig` | R6.3–R7.3 | deinit, handleTick, createParallelLane, handleDiffBrowseKey/Search/Comment, closeDiff, syncFocus, submit, ensureTick, handleDiffViewerEvent |
+| `tui/lifecycle.zig` | R6.3–R7.3 | deinit, handleTick, createParallelLane, diff handlers, syncFocus, submit, ensureTick |
+| `tui/diff_utils.zig` | R7.4 | pure diff-count parsers |
+| `tui/lanes.zig` | R7.4 | MergeSource + lane helpers |
+| `tui/provider_model.zig` | R7.5 | provider + model catalogue setup (~50 fns) |
 | `tui/widgets/background_jobs.zig` | R5.1a | `BackgroundJobsWidget` |
 | `tui/widgets/permission.zig` | R5.1a | `PermissionWidget` |
 | `tui/widgets/diff.zig` | R5.1b | `DiffBodyWidget` + `DiffCommentEditor` + `DiffSearchWidget` |
@@ -46,14 +49,16 @@ No "compatibility shim" left behind (Rule 9 outcome-oriented).
 | `tui/widgets/input.zig` | R6.1 | `InputWidget` + 13 wrapping helpers |
 | `tui/widgets/overlay.zig` | R7.1 | `OverlayWidget` + `OverlayInner` |
 
-## Remaining candidates
+## Remaining
 
-| File | Source | Blocker |
-| --- | --- | --- |
-| — | RootWidget handlers (`handleEvent`, `handleDiffSearchKey`, `handleDiffCommentKey`, `submit`, `syncFocus`, `ensureTick`) | Small methods, low ROI per commit |
-| — | `submitMode` (~95 lines) | stays in `tui.zig` (25+ private-method promotions not worth it) |
+`tui.zig` ~5100 lines. No further extraction planned — each remaining
+block requires 5–15 pub promotions for diminishing ROI. Key stays:
+- `submitMode` (95 lines, ~25 private helpers — stays per R6.0 audit)
+- App business logic (provider, session, lane, diff lifecycle)
+- Event callbacks (`inputChanged`, `paletteInputChanged`)
+- Inline test blocks (~200 lines)
 
-Target: ≤ 2500 lines. Remaining: `tui.zig` ~5943 → -3500 to go. Likely several more R7.x commits.
+Target: ≤ 2500 lines. 50.8% there.
 
 ## What stays in `tui.zig`
 

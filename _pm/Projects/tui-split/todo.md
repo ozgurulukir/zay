@@ -2,62 +2,33 @@
 
 Items committed to, not yet started.
 
-## R6 — finish shrinking `tui.zig`
+## Status
 
-R1–R5 shipped 26 atomic commits bringing `tui.zig` from 8586 → 7504 lines
-(-1082, -12.6%). R6 picks up the three extractions R5 deferred because they
-were blocked on the App/private-method boundary. R6's first job is to
-rethink that boundary, then extract.
+R1–R7.5 completed and pushed (42 atomic commits). `tui.zig` 8586 → 5100 lines (-40.6%).
+`zig build test` 2.3s, all 310 tests pass. 18 new modules shipped.
 
-### R6.0 — App/private-method boundary audit (prerequisite)
+The remaining ~5100 lines are App business logic with high internal coupling
+(provider setup, session management, lane lifecycle, etc.). Each extraction
+requires 5–15 pub promotions per move — ROI has diminished significantly.
 
-✅ **Done** — see `audit-R6.md` for the full table.
+## Candidates for future work (all deferred)
 
-Result: 22 promotions, ~10 moves across 12 atomic commits. `submitMode`
-stays in `tui.zig` (~25 promotions not worth it; it is the natural
-mode-dispatch companion to `handleCommandKey` from R2).
+- **RootWidget delegate stubs** (~50 lines) — 1-line pass-throughs, can fold into lifecycle.zig
+- **`submitMode`** — stays (R6.0 audit: ~25 private promotions not worth it)
+- **`inputChanged` / `paletteInputChanged`** — vxfw callback adapters, tightly coupled to App
+- **Test blocks** (~200 lines) — belong with tested code
 
-### R6.1 — InputWidget family → `tui/widgets/input.zig`
-
-- [ ] **R6.1 prep**: promote `writeBorderTextEndingAt`,
-  `App.inputTextRows`, `App.diffCountsVisible`, `App.runningBackgroundCount`.
-- [ ] **R6.1**: move `InputWidget`, `CommandInputText`, `WrappedInputDraw`,
-  `inputHintText`, `writeDiffCounts`, and the 8 draw helpers
-  (`drawInput`, `drawInputText`, `drawInputWrapped`, `drawInputBorder`,
-  `drawQueuedMessage`, `drawInputHint`, `drawLanesBadge`, `drawBackgroundBadge`,
-  `drawDiffCounts`).
-
-### R6.2 — `drawRoot` → `tui/root_layout.zig`
-
-- [ ] **R6.2 prep**: pub `AtSearchWidget` (or add a `newAtSearchWidget`
-  accessor).
-- [ ] **R6.2**: move `OverlayWidget` + `drawRoot` as a free function taking
-  `*App` + the outer widget handle (R5.2b pattern).
-
-### R6.3 — Lifecycle → `tui/lifecycle.zig`
-
-- [ ] **R6.3 prep (deinit)**: promote `cancelLaneNaming`, `cancelModelLoad`,
-  `resumeClear`, `cancelDiffRefresh`, `clearLanesState`.
-- [ ] **R6.3a**: move `App.deinit`.
-- [ ] **R6.3 prep (handleTick)**: promote `drainModelLoad`, `drainDiffRefresh`,
-  `drainLaneNaming`, `advanceLoadingFrame`, `advanceBlackholeFrame`,
-  `anyTurnActive`, `namingActive`.
-- [ ] **R6.3b**: move `RootWidget.handleTick` + `drainAgentEvents`.
-- [ ] **R6.3 prep (createParallelLane)**: promote `repoRoot`,
-  `captureLaneContext`, `createRuntime`, `resetTurnState`.
-- [ ] **R6.3c**: move `App.createParallelLane`.
-- [ ] **R6.3 prep (handleDiffBrowseKey)**: promote `clearPaletteInput`.
-- [ ] **R6.3d**: move `RootWidget.handleDiffBrowseKey` + `closeDiff`.
-
-### Out of scope for R6
-
-- **`App.submitMode`** — would need ~25 private-method promotions to move; bad
-  trade. Stays in `tui.zig` as the natural mode-dispatch companion to
-  `handleCommandKey` (R2).
-
-### Done
+## Done
 
 - [x] R1 → R4 — see `done.md`
-- [x] R5.1a–d (4 commits) — see `done.md`
-- [x] R5.2a–c (3 commits) — see `done.md`
+- [x] R5.1a–d — see `done.md`
+- [x] R5.2a–c — see `done.md`
 - [x] R6.0 boundary audit — see `audit-R6.md`
+- [x] R6.1 InputWidget → `widgets/input.zig`
+- [x] R6.2 drawRoot → `tui/root_layout.zig`
+- [x] R6.3a–d lifecycle methods → `tui/lifecycle.zig`
+- [x] R7.1 OverlayWidget → `widgets/overlay.zig`
+- [x] R7.2 diff key handlers → `lifecycle.zig`
+- [x] R7.3 RootWidget handlers → `lifecycle.zig`
+- [x] R7.4 diff_utils, lanes, MessageListBuilder cleanup
+- [x] R7.5 provider_model → `tui/provider_model.zig`

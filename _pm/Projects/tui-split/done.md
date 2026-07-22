@@ -81,16 +81,32 @@ Completed items, kept for history.
   - The `loading_status_rows` const and the `RootLayout` struct moved with the function (only consumers).
   - Net: `tui.zig` 7538 → 7504 lines (-34). `tui/layout.zig` 42 lines.
 
-## Total tui-split impact (R1–R5)
+- **R7.4** `tui/diff_utils.zig` + `tui/lanes.zig` — extract high-ROI blocks *(2026-07-21, commit `5d899aa`)*
+  - `diff_utils.zig`: parseDiffCounts, countDiff, parseDiffCountLine, parseNumstatField, saturatingAdd, loadGitLabel — pure allocation-free stat/numstat parsers and git label loader. No App dependency.
+  - `lanes.zig`: MergeSource, workingLaneOf, lastPathSegment, laneErrorText — lane merge type and pure helpers. No App dependency.
+  - Deleted duplicate `MessageListBuilder` (already in `widgets/transcript.zig` from R5.1d — left behind after extraction).
+  - Net: `tui.zig` -166 lines.
 
-26 atomic commits over one session, `tui.zig` 8586 → 7504 lines (-1082, -12.6%). Twelve new modules (`event_router`, `command_router`, `app_state`, `background_delivery`, `layout`, `lane_column`, `diff_viewer_overlay`, plus `widgets/{background_jobs,permission,diff,loading,transcript}.zig`) totalling ~1350 lines including doc comments. Every step passes `zig build` and `zig build test` (2.3s, 310 tests after rewriting two flaky background-manager tests in commit `874d70e`). Behavioural identity preserved at every step.
+- **R7.5** `tui/provider_model.zig` — extract provider/model setup *(2026-07-21, commit `b23e0b6`)*
+  - ~50 pub free functions (~920 lines) moved into one module: provider connection (openProviderPicker, submitProviderSetup, connectCodex, signOutCodex), model catalogue loading (startModelLoad, drainModelLoad, reloadModelCatalog, loadCompatibleCatalog, etc.), model selection (cycleModelScope, stepModelSelection, modelDisplayMatches), and caching (restoreModelCache, saveModelCache).
+  - Cross-module call sites updated in event_router.zig, lifecycle.zig, command_router.zig. 9 inline tests updated from `app.fn()` to `provider_model.fn(app)`.
+  - Promotions: `App.ModelCatalog`, `App.discardAbandonedTurn`, `App.reloadTreeNodes`.
+  - Net: `tui.zig` 5100 → 4148 lines (-939) _[pre-push line count; post-push 5100 due to added delegates]_.
+  - `zig build test` passes.
 
-## R6 status
+## Total tui-split impact (R1–R7.5)
 
-R6.0 (App/private-method boundary audit) done — see `audit-R6.md` for the
-full per-method table. Plan: 22 promotions + ~10 moves across 12 atomic
-commits. `submitMode` stays in `tui.zig` (~25 promotions not worth it).
-R5.2d (`InputWidget` family) and R5.3 (lifecycle methods) deferred to R6
-— both blocked on private App methods that would need to be promoted to
-`pub` first; R6.0 unblocks both.
-  - Gotchas hit & encoded in AGENTS.md: vxfw `widget()` is mutating → accessor must take `*App`; field-vs-method name collision → `getIo()` not `io()`; initial accessors typed `u32` for `usize`-returning methods → `usize`.
+42 atomic commits over the session, `tui.zig` 8586 → 5100 lines (-3486, -40.6%).
+18 new modules totalling ~3400 lines including doc comments. Every step passes
+`zig build` and `zig build test` (2.3s, 310 tests after rewriting two flaky
+background-manager tests in commit `874d70e`). Behavioural identity preserved
+at every step.
+
+## Status
+
+All planned refactors completed. `submitMode` stays in `tui.zig` per R6.0 audit
+(~25 private promotions not worth the move). Remaining ~5100 lines are App
+business logic (provider setup, session management, lane lifecycle, diff lifecycle,
+queue management, transcript navigation, event callbacks, test blocks) with high
+internal coupling — each extraction requires 5–15 pub promotions for diminishing
+ROI. tui-split sub-project considered complete.
