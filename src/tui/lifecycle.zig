@@ -61,6 +61,14 @@ pub fn deinitApp(self: *App) void {
     if (self.metrics.diff_cache) |raw| self.gpa.free(raw);
     self.pickers.models.deinit(self.gpa);
     codex.freeApiKeyMap(self.gpa, &self.provider_api_keys);
+    if (self.modelsdev_registry) |*r| {
+        r.deinit(self.gpa);
+        self.modelsdev_registry = null;
+    }
+    if (self.dynamics_slice) |slice| {
+        self.gpa.free(slice);
+        self.dynamics_slice = null;
+    }
     self.provider_key_input.deinit(self.gpa);
     if (self.cached_config_owned) {
         self.cached_config.deinit(self.gpa);

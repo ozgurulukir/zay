@@ -146,7 +146,7 @@ pub const ContentBlock = union(enum) {
         switch (self) {
             .text => |text| {
                 try writer.writeAll("{\"type\":\"text\",\"text\":");
-                try std.json.Stringify.value(text.text, .{}, writer);
+                try std.json.Stringify.value(@as([]const u8, text.text), .{}, writer);
                 if (text.responses_item_id) |id| {
                     try writer.writeAll(",\"responses_item_id\":");
                     try std.json.Stringify.value(id, .{}, writer);
@@ -166,7 +166,7 @@ pub const ContentBlock = union(enum) {
             },
             .reasoning => |reasoning| {
                 try writer.writeAll("{\"type\":\"reasoning\",\"text\":");
-                try std.json.Stringify.value(reasoning.text, .{}, writer);
+                try std.json.Stringify.value(@as([]const u8, reasoning.text), .{}, writer);
                 if (reasoning.responses_item_json) |json| {
                     try writer.writeAll(",\"responses_item_json\":");
                     try std.json.Stringify.value(json, .{}, writer);
@@ -195,9 +195,15 @@ pub const ContentBlock = union(enum) {
         if (kind != .string) return error.CorruptPayload;
         if (std.mem.eql(u8, kind.string, "text")) {
             const text = value.object.get("text") orelse return error.CorruptPayload;
-            if (text != .string) return error.CorruptPayload;
+            const text_str = if (text == .string)
+                try gpa.dupe(u8, text.string)
+            else if (text == .array)
+                try jsonByteArrayToString(gpa, text.array.items)
+            else
+                return error.CorruptPayload;
+
             return .{ .text = .{
-                .text = try gpa.dupe(u8, text.string),
+                .text = text_str,
                 .responses_item_id = try jsonOptionalString(gpa, value, "responses_item_id"),
                 .responses_phase = try jsonOptionalString(gpa, value, "responses_phase"),
             } };
@@ -211,8 +217,14 @@ pub const ContentBlock = union(enum) {
         }
         if (std.mem.eql(u8, kind.string, "reasoning")) {
             const text = value.object.get("text") orelse return error.CorruptPayload;
-            if (text != .string) return error.CorruptPayload;
-            return .{ .reasoning = .{ .text = try gpa.dupe(u8, text.string), .responses_item_json = try jsonOptionalString(gpa, value, "responses_item_json") } };
+            const text_str = if (text == .string)
+                try gpa.dupe(u8, text.string)
+            else if (text == .array)
+                try jsonByteArrayToString(gpa, text.array.items)
+            else
+                return error.CorruptPayload;
+
+            return .{ .reasoning = .{ .text = text_str, .responses_item_json = try jsonOptionalString(gpa, value, "responses_item_json") } };
         }
         if (std.mem.eql(u8, kind.string, "tool_call")) {
             const call_id = value.object.get("call_id") orelse return error.CorruptPayload;
@@ -238,6 +250,16 @@ fn jsonOptionalString(gpa: std.mem.Allocator, value: std.json.Value, name: []con
     const field = value.object.get(name) orelse return null;
     if (field != .string) return error.CorruptPayload;
     return try gpa.dupe(u8, field.string);
+}
+
+fn jsonByteArrayToString(gpa: std.mem.Allocator, items: []const std.json.Value) ContentBlock.DecodeError![]u8 {
+    var buf = try gpa.alloc(u8, items.len);
+    errdefer gpa.free(buf);
+    for (items, 0..) |item, i| {
+        if (item != .integer or item.integer < 0 or item.integer > 255) return error.CorruptPayload;
+        buf[i] = @intCast(item.integer);
+    }
+    return buf;
 }
 
 fn reencode(gpa: std.mem.Allocator, block: ContentBlock) ![]u8 {

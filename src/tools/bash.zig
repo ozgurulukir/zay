@@ -240,16 +240,9 @@ pub fn currentEnvMap(gpa: std.mem.Allocator, io: std.Io) (std.mem.Allocator.Erro
     if (os.is_windows) {
         return std.process.Environ.createMap(.{ .block = .global }, gpa);
     }
-
-    var map = std.process.Environ.Map.init(gpa);
+    const env_slice = std.mem.span(std.c.environ);
+    var map = try std.process.Environ.createMap(.{ .block = .{ .slice = env_slice } }, gpa);
     errdefer map.deinit();
-    var index: usize = 0;
-    while (std.c.environ[index]) |entry| : (index += 1) {
-        const line = std.mem.span(entry);
-        const separator = std.mem.findScalar(u8, line, '=') orelse continue;
-        if (separator == 0) continue;
-        try map.put(line[0..separator], line[separator + 1 ..]);
-    }
 
     // Overlay the login shell's environment (PATH etc.) over the inherited
     // process env, so non-login command shells see what a login shell would —

@@ -4,7 +4,6 @@ const logger = @import("logger");
 const ai = @import("ai.zig");
 const at_mention = @import("at_mention.zig");
 const background_mod = @import("background.zig");
-const bounded_queue = @import("bounded_queue");
 const compaction = @import("compaction.zig");
 const context_mod = @import("context.zig");
 const executor_mod = @import("executor.zig");
@@ -14,91 +13,15 @@ const tools = @import("tools.zig");
 const vcs = @import("vcs.zig");
 
 const assert = std.debug.assert;
-const message_queue_capacity: u32 = 64;
+const agent_queue = @import("agent/queue.zig");
+const tool_batch_mod = @import("agent/tool_batch.zig");
 
-const QueuedUserMessage = struct {
-    /// Raw prompt text as typed. `@`-mentions are expanded (files embedded,
-    /// images attached) lazily at drain time so the file I/O lands on the
-    /// agent worker thread rather than the UI thread.
-    prompt: []u8,
-    /// When set, this message is injected after the next tool batch ("steer")
-    /// rather than waiting for the turn to go idle. The UI flips it via
-    /// `setQueuedSteer` when the user steers a queued message.
-    steer: bool = false,
-    /// When set, the text is delivered verbatim as a user message — no
-    /// `@`-mention expansion or skill-prefix handling. Used for machine-
-    /// generated content (e.g. background-job completion notices) whose body
-    /// must not be reinterpreted as file references.
-    raw: bool = false,
-};
+const QueuedUserMessage = agent_queue.QueuedUserMessage;
+const MessageQueue = agent_queue.MessageQueue;
+const ToolBatch = tool_batch_mod.ToolBatch;
 
-const MessageQueue = bounded_queue.BoundedQueue(QueuedUserMessage);
-
-const ToolBatch = struct {
-    calls: []const ai.ToolCall,
-
-    fn init(calls: []const ai.ToolCall) ToolBatch {
-        assert(calls.len > 0);
-        return .{ .calls = calls };
-    }
-};
-
-/// Background summarizer state. At most one summary is ever in flight, so a
-/// single result slot plus an atomic state is all the synchronization needed
-/// between the worker thread (start/apply) and the summarizer thread (produce).
-/// The summarizer never touches live history or the session — only the
-/// dedicated client and its own allocations — so the boundary is clean.
-const Compactor = struct {
-    state: std.atomic.Value(State) = .init(.idle),
-    thread: ?std.Thread = null,
-    job: ?Job = null,
-    result: ?Result = null,
-
-    const State = enum(u8) { idle, running, ready, failed };
-
-    /// Self-contained input handed to the summarizer thread: the rendered
-    /// prefix to summarize and the entry the kept history resumes from.
-    const Job = struct {
-        gpa: std.mem.Allocator,
-        client: ai.LanguageModel,
-        first_kept_id: [session_mod.entry_id_len]u8,
-        prefix_text: []u8,
-    };
-
-    const Result = struct {
-        first_kept_id: [session_mod.entry_id_len]u8,
-        stored_summary: []u8,
-    };
-
-    fn stateIs(self: *const Compactor, expected: State) bool {
-        return self.state.load(.acquire) == expected;
-    }
-};
-
-/// Body of the summarizer thread: produce the stored summary from the job's
-/// frozen prefix, publish it, and flip the state. Acquire/release on `state`
-/// makes the result visible to the worker once it observes `.ready`.
-fn runCompactionThread(compactor: *Compactor) void {
-    const job = compactor.job.?;
-    defer job.gpa.free(job.prefix_text);
-    const stored = produceStoredSummary(job) catch |err| {
-        // Surface the real reason (file logger only — never stderr/the TUI).
-        // `EmptySummary` here means the summarizer answered with no text, e.g. a
-        // tool call — which is why the summarizer client carries no tools.
-        logger.log("compaction summarize failed: {s}", .{@errorName(err)});
-        compactor.state.store(.failed, .release);
-        return;
-    };
-    compactor.result = .{ .first_kept_id = job.first_kept_id, .stored_summary = stored };
-    compactor.state.store(.ready, .release);
-}
-
-fn produceStoredSummary(job: Compactor.Job) ![]u8 {
-    const summary = try compaction.summarize(job.gpa, job.client, job.prefix_text);
-    defer job.gpa.free(summary);
-    if (summary.len == 0) return error.EmptySummary;
-    return compaction.buildStoredSummary(job.gpa, summary);
-}
+const agent_compactor = @import("agent/compactor.zig");
+const Compactor = agent_compactor.Compactor;
 
 pub const Agent = struct {
     gpa: std.mem.Allocator,
@@ -133,7 +56,7 @@ pub const Agent = struct {
     /// Background summarizer state machine.
     compactor: Compactor = .{},
     message_queue: MessageQueue = .{},
-    message_queue_storage: [message_queue_capacity]QueuedUserMessage = undefined,
+    message_queue_storage: [agent_queue.capacity]QueuedUserMessage = undefined,
     message_queue_mutex: std.Io.Mutex = .init,
     /// git-shadow snapshot state (see `snapshotAfterBatch`). The dedicated index
     /// path is resolved once and cached; `last_snapshot_tree` dedups unchanged
@@ -829,6 +752,15 @@ pub const Agent = struct {
         {
             self.startCompaction() catch |err| std.log.warn("compaction start failed: {s}", .{@errorName(err)});
         }
+
+        // If used tokens still exceed the swap watermark and compaction is running,
+        // wait synchronously so prompt sent to LLM fits within window.
+        if (compaction.shouldSwap(self.currentContextTokens(), self.context_window_tokens) and
+            self.compactor.stateIs(.running))
+        {
+            self.joinCompactor();
+            self.applyReadyCompaction(listener) catch |err| std.log.warn("compaction apply failed: {s}", .{@errorName(err)});
+        }
     }
 
     /// Snapshot the frozen prefix and hand it to the summarizer thread. The
@@ -836,7 +768,8 @@ pub const Agent = struct {
     /// thread never touches live history.
     fn startCompaction(self: *Agent) !void {
         const session_writer = self.context_manager.session_writer orelse return;
-        const cut = (try session_writer.compactionCut(self.gpa, compaction.keep_recent_tokens_default)) orelse return;
+        const recent_tokens = compaction.keepRecentTokens(self.context_window_tokens);
+        const cut = (try session_writer.compactionCut(self.gpa, recent_tokens)) orelse return;
         self.compactor.result = null;
         self.compactor.job = .{
             .gpa = self.gpa,
@@ -845,7 +778,7 @@ pub const Agent = struct {
             .prefix_text = cut.prefix_text,
         };
         self.compactor.state.store(.running, .release);
-        self.compactor.thread = std.Thread.spawn(.{}, runCompactionThread, .{&self.compactor}) catch |err| {
+        self.compactor.thread = std.Thread.spawn(.{}, agent_compactor.Compactor.runThread, .{&self.compactor}) catch |err| {
             self.gpa.free(cut.prefix_text);
             self.compactor.job = null;
             self.compactor.state.store(.idle, .release);

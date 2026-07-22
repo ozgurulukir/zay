@@ -68,6 +68,7 @@ fn restoreCheckpointForBranch(app: *App, rt: *runtime_mod.AgentRuntime) !void {
 
 pub fn openResumePicker(app: *App) !void {
     app.closeAtSearch();
+    try app.reloadResumeSessions();
     const summaries = app.resume_summaries.items;
     const filter = app.peekPaletteInput() catch "";
     _ = resume_picker.visibleCount(summaries, filter, app.resume_folded_projects.items, app.nav.resume_global);
@@ -85,6 +86,7 @@ pub fn reloadResumeSessions(app: *App) !void {
     defer manager.deinit();
     const cwd = if (app.nav.resume_global) null else (app.repoRoot() orelse app.liveRuntime().?.cwd);
     const summaries = try manager.list(app.gpa, cwd);
+    defer app.gpa.free(summaries);
     try app.resume_summaries.appendSlice(app.gpa, summaries);
     if (app.nav.resume_global) std.mem.sort(
         session_mod.SessionSummary,

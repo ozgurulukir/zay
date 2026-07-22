@@ -338,6 +338,7 @@ pub const AgentRuntime = struct {
         errdefer client.deinit();
         self.replaceClient(.{ .codex_responses = client });
         self.agent.context_window_tokens = compaction.contextWindowTokens(model_id);
+        self.agent.resetContextUsage();
 
         attach_compaction: {
             const compaction_client = self.gpa.create(ai.codex_responses.Client) catch break :attach_compaction;
@@ -424,6 +425,7 @@ pub const AgentRuntime = struct {
         errdefer client.deinit();
         self.replaceClient(.{ .openai_compatible = client });
         self.agent.context_window_tokens = compaction.contextWindowTokens(model_id);
+        self.agent.resetContextUsage();
 
         attach_compaction: {
             const compaction_client = self.gpa.create(ai.openai_compatible.Client) catch break :attach_compaction;
@@ -476,6 +478,7 @@ pub const AgentRuntime = struct {
         errdefer client.deinit();
         self.replaceClient(.{ .openai_responses = client });
         self.agent.context_window_tokens = compaction.contextWindowTokens(model_id);
+        self.agent.resetContextUsage();
 
         attach_compaction: {
             const compaction_client = self.gpa.create(ai.openai_responses.Client) catch break :attach_compaction;

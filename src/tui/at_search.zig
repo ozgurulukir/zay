@@ -45,7 +45,7 @@ fn setMentionSearch(app: *App, kind: MentionSearchKind, query: []const u8) !void
 
 fn startAtSearchBackend(app: *App) void {
     const cwd = if (app.liveRuntime()) |runtime| runtime.cwd else ".";
-    search_mod.start(std.heap.smp_allocator, app.io, cwd);
+    search_mod.start(app.gpa, app.io, cwd);
 }
 
 fn refreshAtResults(app: *App) !void {

@@ -24,6 +24,19 @@ pub fn installRuntime(app: *App, runtime: *runtime_mod.AgentRuntime) !void {
     // re-derives it.
     if (app.thread.title) |title| app.gpa.free(title);
     app.thread.title = null;
+    // Load prompt history from the session DB.
+    app.thread.prompt_history_index = null;
+    app.thread.prompt_history.deinit(app.gpa);
+    app.thread.prompt_history = .empty;
+    if (runtime.session_writer.loadPromptHistory(app.gpa)) |prompts| {
+        // loadPromptHistory returns newest-first; reverse to oldest-first.
+        var i: usize = prompts.len;
+        while (i > 0) {
+            i -= 1;
+            app.thread.prompt_history.append(app.gpa, prompts[i]) catch {};
+        }
+        app.gpa.free(prompts);
+    } else |_| {}
     app.mode = .normal;
     app.clearInput();
     app.resetTurnState();

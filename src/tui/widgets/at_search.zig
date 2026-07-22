@@ -22,6 +22,31 @@ pub fn panelHeight(result_count: usize) u16 {
     return rows + border_rows;
 }
 
+const tui = @import("../../tui.zig");
+const App = tui.App;
+
+/// AtSearchWidget — thin wrapper that creates a `Content` from App state and draws it.
+pub const AtSearchWidget = struct {
+    app: *App,
+
+    pub fn widget(self: *AtSearchWidget) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = draw };
+    }
+
+    fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *AtSearchWidget = @ptrCast(@alignCast(ptr));
+        var content: Content = .{
+            .results = self.app.at_search.results.items,
+            .selection = self.app.at_search.selection,
+            .query = self.app.at_search.query,
+            .indexing = self.app.at_search.indexing,
+            .sigil = if (self.app.at_search.kind == .file) '@' else '$',
+            .title = if (self.app.at_search.kind == .file) "Files" else "Skills",
+        };
+        return content.widget().draw(ctx);
+    }
+};
+
 /// Index of the first result to render so `selection` is within the `visible`
 /// rows. Keeps the selection pinned to the bottom edge once it scrolls past
 /// the fold; snaps back to the top while it still fits without scrolling.

@@ -38,6 +38,37 @@ pub fn listSurface(ctx: vxfw.DrawContext, owner: vxfw.Widget, list: vxfw.Widget)
     return vxfw.Surface.initWithChildren(ctx.arena, owner, .{ .width = width, .height = height }, children);
 }
 
+pub const ViewportWindow = struct {
+    scroll_top: u32,
+    start_index: u32,
+    end_index: u32,
+    visible_height: u32,
+
+    pub fn compute(selection: u32, total_count: u32, height: u16) ViewportWindow {
+        const visible_height: u32 = height;
+        if (visible_height == 0 or total_count == 0) {
+            return .{ .scroll_top = 0, .start_index = 0, .end_index = 0, .visible_height = 0 };
+        }
+
+        var scroll_top: u32 = 0;
+        if (selection >= visible_height) {
+            scroll_top = selection - visible_height + 1;
+        }
+
+        const end_index = @min(total_count, scroll_top + visible_height);
+        return .{
+            .scroll_top = scroll_top,
+            .start_index = scroll_top,
+            .end_index = end_index,
+            .visible_height = visible_height,
+        };
+    }
+
+    pub fn screenRow(self: ViewportWindow, index: u32) u16 {
+        return @intCast(index - self.scroll_top);
+    }
+};
+
 pub fn secondaryColumn(width: u16) u16 {
     return @min(secondary_column, width / 2);
 }

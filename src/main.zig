@@ -25,6 +25,7 @@ fn novaPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
 }
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = std.heap.smp_allocator;
+    var page_allocator = std.heap.PageAllocator{};
+    const gpa = std.mem.Allocator{ .ptr = &page_allocator, .vtable = &std.heap.PageAllocator.vtable };
     try nova.run(init, gpa);
 }

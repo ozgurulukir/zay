@@ -185,7 +185,9 @@ pub fn runAgentTurn(agent: *agent_mod.Agent, worker_context: *Context, pending_p
                 .{@errorName(err)},
             ) catch return;
         postAgentEvent(worker_context, .{ .turn_failed = message_text }) catch {
-            worker_context.gpa.free(message_text);
+            // postAgentEvent already freed message_text on error (via
+            // owned.deinit in the cancel path or event_ptr.deinit in the
+            // QueueFull path); do NOT free it here — that would be a double-free.
             return;
         };
     };
@@ -206,7 +208,8 @@ fn postTurnFailed(worker_context: *Context, err: anyerror) void {
         .{@errorName(err)},
     ) catch return;
     postAgentEvent(worker_context, .{ .turn_failed = message_text }) catch {
-        worker_context.gpa.free(message_text);
+        // postAgentEvent already freed message_text on error.
+        return;
     };
     postAgentEvent(worker_context, .turn_finished) catch {};
 }
@@ -249,8 +252,7 @@ fn postAgentEvent(context: *anyopaque, event: agent_mod.Agent.Event) anyerror!vo
                 // retrying forever would deadlock the teardown. Drop the event
                 // and bail; the canceller discards the queue anyway.
                 worker_context.io.sleep(.fromMilliseconds(queue_full_backoff_ms), .awake) catch {
-                    event_ptr.deinit(worker_context.gpa);
-                    worker_context.gpa.destroy(event_ptr);
+                    // errdefers handle event_ptr deinit and destroy automatically.
                     return error.TurnCancelled;
                 };
                 continue;

@@ -57,6 +57,7 @@ pub const Configured = struct {
     provider: config_mod.Provider,
     base_url: []u8, // gpa-owned
     api_key: []u8, // gpa-owned
+    display_name: ?[]u8 = null, // gpa-owned
 };
 
 /// Snapshot of everything the worker needs. Owned by the job and freed when
@@ -77,6 +78,7 @@ pub const Job = struct {
         for (self.configured) |c| {
             self.gpa.free(c.base_url);
             self.gpa.free(c.api_key);
+            if (c.display_name) |d| self.gpa.free(d);
         }
         if (self.configured.len > 0) self.gpa.free(self.configured);
         self.* = undefined;
@@ -152,7 +154,8 @@ fn loadConfigured(job: *Job, configured: Configured, result: *Result) !void {
         if (!includeAnonymousModel(configured.provider, configured.api_key, entry.id)) continue;
         const id = try job.gpa.dupe(u8, entry.id);
         errdefer job.gpa.free(id);
-        const label = try std.fmt.allocPrint(job.gpa, "{s}{s}{s}", .{ providerModelLabel(configured.provider), symbols.separator_dot_padded, entry.id });
+        const prefix_name = if (configured.display_name) |d| d else providerModelLabel(configured.provider);
+        const label = try std.fmt.allocPrint(job.gpa, "{s}{s}{s}", .{ prefix_name, symbols.separator_dot_padded, entry.id });
         errdefer job.gpa.free(label);
         try result.models.append(job.gpa, .{ .id = id, .label = label });
         try result.sources.append(job.gpa, .{ .openai_compatible = configured.provider });

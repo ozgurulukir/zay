@@ -1,67 +1,38 @@
 const std = @import("std");
 
-const bounded_queue = @import("bounded_queue");
 const ai = @import("ai.zig");
 const compaction = @import("compaction.zig");
 const db = @import("db.zig");
 
 const assert = std.debug.assert;
 
-const schema_version: u32 = 2;
-/// Upper bound on entries in a single branch path. Far above any real
-/// session; exists so projection loops are bounded (tigerstyle).
-const path_entries_max: u32 = 1 << 20;
-pub const entry_id_len: u32 = 8;
-const session_id_len: u32 = 32;
+const session_type = @import("session/types.zig");
+const session_migration = @import("session/migration.zig");
 
-pub const EntryId = struct {
-    bytes: [entry_id_len]u8,
+pub const entry_id_len = session_type.entry_id_len;
+const session_id_len = session_type.session_id_len;
+pub const path_entries_max = session_type.path_entries_max;
+pub const EntryId = session_type.EntryId;
+pub const SessionId = session_type.SessionId;
+pub const Error = session_type.Error;
+const EntryQueue = session_type.EntryQueue;
+pub const QueuedEntry = session_type.QueuedEntry;
+pub const CreateOptions = session_type.CreateOptions;
+pub const SessionSummary = session_type.SessionSummary;
+pub const EntryRecord = session_type.EntryRecord;
+pub const CompactionBoundary = session_type.CompactionBoundary;
+pub const CompactionCut = session_type.CompactionCut;
+pub const EntryKind = session_type.EntryKind;
+pub const EntrySummary = session_type.EntrySummary;
 
-    pub fn fromSlice(value: []const u8) Error!EntryId {
-        if (value.len != entry_id_len) return error.BadEntryId;
-        var bytes: [entry_id_len]u8 = undefined;
-        @memcpy(bytes[0..], value);
-        return .{ .bytes = bytes };
-    }
-
-    pub fn slice(self: *const EntryId) []const u8 {
-        return self.bytes[0..];
-    }
-};
-
-pub const SessionId = struct {
-    bytes: [session_id_len]u8,
-
-    pub fn fromSlice(value: []const u8) Error!SessionId {
-        if (value.len != session_id_len) return error.BadSessionId;
-        var bytes: [session_id_len]u8 = undefined;
-        @memcpy(bytes[0..], value);
-        return .{ .bytes = bytes };
-    }
-
-    pub fn slice(self: *const SessionId) []const u8 {
-        return self.bytes[0..];
-    }
-};
-const default_db_relative_path = ".nova/sessions.sqlite";
-const EntryQueue = bounded_queue.BoundedQueue(QueuedEntry);
-
-pub const Error = db.Error || error{
-    BadSessionId,
-    BadEntryId,
-    MissingSession,
-    MissingEntry,
-    UnsupportedEntryKind,
-    CorruptPayload,
-    OutOfMemory,
-    WriteFailed,
-    SystemResources,
-    Unexpected,
-    LockedMemoryLimitExceeded,
-    ThreadQuotaExceeded,
-    QueueFull,
-    Canceled,
-};
+const schema_version = session_migration.schema_version;
+const default_db_relative_path = session_migration.default_db_relative_path;
+fn defaultPath(gpa: std.mem.Allocator, home_dir: []const u8) session_migration.Error![]u8 {
+    return session_migration.defaultPath(gpa, home_dir);
+}
+fn migrate(connection: *db.Connection, io: std.Io) !void {
+    try session_migration.migrate(connection, io);
+}
 
 pub const SessionManager = struct {
     gpa: std.mem.Allocator,
@@ -78,7 +49,7 @@ pub const SessionManager = struct {
 
     pub fn initDefault(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) Error!SessionManager {
         assert(home_dir.len > 0);
-        const db_path = try defaultPath(gpa, io, home_dir);
+        const db_path = try defaultPath(gpa, home_dir);
         defer gpa.free(db_path);
         return init(gpa, io, db_path);
     }
@@ -114,11 +85,14 @@ pub const SessionManager = struct {
         try statement.bindInt(5, timestamp_ms);
         try expectDone(&statement);
 
-        return .{
+        const session = Session{
             .manager = self,
             .id = .{ .bytes = id_buffer },
             .leaf_entry_id = null,
         };
+        // Two-way assertion: created session round-trips through resume.
+        assert(session.id.bytes.len == session_id_len);
+        return session;
     }
 
     pub fn @"resume"(self: *SessionManager, session_id: []const u8) Error!Session {
@@ -164,30 +138,17 @@ pub const SessionManager = struct {
         }
         return summaries.toOwnedSlice(gpa);
     }
-};
 
-pub const CreateOptions = struct {
-    id: ?[]const u8 = null,
-    title: ?[]const u8 = null,
-};
-
-pub const SessionSummary = struct {
-    id: []u8,
-    title: ?[]u8,
-    cwd: []u8,
-    created_at_ms: i64,
-    updated_at_ms: i64,
-    leaf_entry_id: ?[]u8,
-
-    pub fn deinit(self: *SessionSummary, gpa: std.mem.Allocator) void {
-        gpa.free(self.id);
-        if (self.title) |title| gpa.free(title);
-        gpa.free(self.cwd);
-        if (self.leaf_entry_id) |id| gpa.free(id);
-        self.* = undefined;
+    /// Find the most recently updated session for the given cwd. Returns null
+    /// when no session exists for this directory. Caller owns the returned id.
+    pub fn findLatest(self: *SessionManager, gpa: std.mem.Allocator, cwd: []const u8) Error!?[]u8 {
+        var statement = try self.connection.prepare("select id from sessions where cwd = ? and leaf_entry_id is not null order by updated_at_ms desc limit 1");
+        defer statement.finalize();
+        try statement.bindText(1, cwd);
+        const row = (try statement.step()) orelse return null;
+        return try gpa.dupe(u8, row.text(0));
     }
 };
-
 pub const Session = struct {
     manager: *SessionManager,
     id: SessionId,
@@ -274,6 +235,37 @@ pub const Session = struct {
         try statement.bindText(2, self.id.slice());
         try statement.bindText(3, entry_id);
         try expectDone(&statement);
+    }
+
+    /// Save a prompt to the session's prompt history. Deduplicates against the
+    /// most recent entry so consecutive identical prompts aren't stored twice.
+    pub fn savePromptHistory(self: *Session, prompt: []const u8) Error!void {
+        assert(prompt.len > 0);
+        const timestamp_ms = nowMs(self.manager.io);
+        var statement = try self.manager.connection.prepare("insert into prompt_history(session_id, prompt_text, created_at_ms) values (?, ?, ?)");
+        defer statement.finalize();
+        try statement.bindText(1, self.id.slice());
+        try statement.bindText(2, prompt);
+        try statement.bindInt(3, timestamp_ms);
+        try expectDone(&statement);
+    }
+
+    /// Load the prompt history for this session, newest first. Caller owns the
+    /// slice and each string.
+    pub fn loadPromptHistory(self: *Session, gpa: std.mem.Allocator) Error![][]u8 {
+        var statement = try self.manager.connection.prepare("select prompt_text from prompt_history where session_id = ? order by created_at_ms desc");
+        defer statement.finalize();
+        try statement.bindText(1, self.id.slice());
+
+        var prompts: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (prompts.items) |p| gpa.free(p);
+            prompts.deinit(gpa);
+        }
+        while (try statement.step()) |row| {
+            try prompts.append(gpa, try gpa.dupe(u8, row.text(0)));
+        }
+        return prompts.toOwnedSlice(gpa);
     }
 
     /// The git commit id of the nearest entry at or above the current leaf that
@@ -625,6 +617,23 @@ pub const SessionWriter = struct {
         return self.session.snapshotAt(gpa);
     }
 
+    /// Save a prompt to the session's prompt history, race-free. Deduplicates
+    /// against the most recent entry so consecutive identical prompts aren't
+    /// stored twice.
+    pub fn savePromptHistory(self: *SessionWriter, prompt: []const u8) Error!void {
+        self.quiesce();
+        defer self.restart() catch {};
+        try self.session.savePromptHistory(prompt);
+    }
+
+    /// Load the prompt history for this session, race-free. Caller owns the
+    /// slice and each string.
+    pub fn loadPromptHistory(self: *SessionWriter, gpa: std.mem.Allocator) Error![][]u8 {
+        self.quiesce();
+        defer self.restart() catch {};
+        return self.session.loadPromptHistory(gpa);
+    }
+
     /// Load the whole session tree, race-free. Stops the background writer so
     /// the read has exclusive access to the connection, then restarts it.
     pub fn entries(self: *SessionWriter, gpa: std.mem.Allocator) Error![]EntryRecord {
@@ -702,20 +711,6 @@ pub const SessionWriter = struct {
     }
 };
 
-const QueuedEntry = struct {
-    kind: []const u8,
-    role: ?[]u8,
-    payload_json: []u8,
-    title_candidate: ?[]u8 = null,
-
-    fn deinit(self: *QueuedEntry, gpa: std.mem.Allocator) void {
-        if (self.role) |role| gpa.free(role);
-        gpa.free(self.payload_json);
-        if (self.title_candidate) |title| gpa.free(title);
-        self.* = undefined;
-    }
-};
-
 fn runWriter(writer: *SessionWriter) void {
     while (true) {
         if (takeQueuedEntry(writer)) |entry| {
@@ -761,60 +756,6 @@ fn takeQueuedEntry(writer: *SessionWriter) ?QueuedEntry {
     writer.mutex.lock(writer.io) catch return null;
     defer writer.mutex.unlock(writer.io);
     return writer.entry_queue.pop(writer.queue);
-}
-
-pub const EntryRecord = struct {
-    id: [entry_id_len]u8,
-    parent_id: ?[entry_id_len]u8,
-    kind: []u8,
-    role: ?[]u8,
-    payload_json: []u8,
-    created_at_ms: i64,
-    /// The git snapshot commit bound to this entry (null if none). Drives the
-    /// timeline ✦ marker and code-state restore.
-    snapshot: ?[]u8 = null,
-
-    pub fn deinit(self: *EntryRecord, gpa: std.mem.Allocator) void {
-        gpa.free(self.kind);
-        if (self.role) |role| gpa.free(role);
-        gpa.free(self.payload_json);
-        if (self.snapshot) |s| gpa.free(s);
-        self.* = undefined;
-    }
-};
-
-fn migrate(connection: *db.Connection, io: std.Io) Error!void {
-    // Lanes share one repo-level DB; each lane's background writer holds its own
-    // connection, so a busy timeout makes concurrent writes wait (WAL serializes
-    // writers) instead of failing with SQLITE_BUSY and dropping a session entry.
-    try connection.exec("pragma busy_timeout = 5000");
-    try connection.exec("pragma foreign_keys = on");
-    try connection.exec("pragma journal_mode = wal");
-    try connection.exec("create table if not exists schema_migrations(version integer primary key, applied_at_ms integer not null)");
-    try connection.exec("create table if not exists sessions(id text primary key, title text, cwd text not null, created_at_ms integer not null, updated_at_ms integer not null, leaf_entry_id text, foreign key(id, leaf_entry_id) references session_entries(session_id, id))");
-    try connection.exec("create table if not exists session_entries(id text not null, session_id text not null, parent_id text, kind text not null, role text, payload_json text not null, created_at_ms integer not null, snapshot text, primary key(session_id, id), foreign key(session_id) references sessions(id) on delete cascade, foreign key(session_id, parent_id) references session_entries(session_id, id))");
-    // Upgrade DBs created before the git-shadow model: add the `snapshot` column
-    // (a git commit id binding the entry to its code state). On a fresh DB the
-    // column already exists, so the ALTER fails with "duplicate column" — ignore.
-    connection.exec("alter table session_entries add column snapshot text") catch {};
-    try connection.exec("create index if not exists session_entries_parent on session_entries(session_id, parent_id)");
-    try connection.exec("create index if not exists session_entries_kind on session_entries(session_id, kind)");
-    try connection.exec("create index if not exists session_entries_role on session_entries(session_id, role)");
-    try connection.exec("create index if not exists sessions_cwd_updated on sessions(cwd, updated_at_ms)");
-
-    var statement = try connection.prepare("insert or ignore into schema_migrations(version, applied_at_ms) values (?, ?)");
-    defer statement.finalize();
-    try statement.bindInt(1, schema_version);
-    try statement.bindInt(2, nowMs(io));
-    try expectDone(&statement);
-}
-
-fn defaultPath(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) Error![]u8 {
-    assert(home_dir.len > 0);
-    const dir = try std.fs.path.join(gpa, &.{ home_dir, ".nova" });
-    defer gpa.free(dir);
-    std.Io.Dir.cwd().createDirPath(io, dir) catch return error.Sqlite;
-    return std.fs.path.join(gpa, &.{ home_dir, default_db_relative_path });
 }
 
 fn expectDone(statement: *db.Statement) Error!void {
@@ -972,13 +913,6 @@ fn appendProjectedEntry(gpa: std.mem.Allocator, list: *std.ArrayList(ai.ChatMess
     }
 }
 
-/// The active compaction boundary on a branch: the index of the summary entry
-/// and the index of the first entry kept verbatim after it.
-const CompactionBoundary = struct {
-    summary_index: u32,
-    first_kept_index: u32,
-};
-
 /// Locate the active compaction boundary in a root→leaf `path`: the newest
 /// `compaction` entry whose `first_kept_id` still resolves to an entry on the
 /// path. Returns null when there is no compaction entry, or when the named
@@ -1061,13 +995,6 @@ fn compactionSummaryText(gpa: std.mem.Allocator, payload_json: []const u8) Error
     return gpa.dupe(u8, summary.string);
 }
 
-/// Result of `compactionCut`: which entry stays as the first kept message, and
-/// the rendered prefix text to summarize. Caller owns `prefix_text`.
-pub const CompactionCut = struct {
-    first_kept_id: [entry_id_len]u8,
-    prefix_text: []u8,
-};
-
 /// Render the text handed to the summarizer: any prior summary (folded in so
 /// repeated compactions stay cumulative) followed by the rendered prefix
 /// messages. Caller owns the result.
@@ -1084,29 +1011,6 @@ fn renderCompactionPrefix(gpa: std.mem.Allocator, path: []const EntryRecord, bou
     try out.writer.writeAll(rendered);
     return out.toOwnedSlice();
 }
-
-/// Classification of a session entry, used by the `/timeline` view to drive filter
-/// modes and to hide tool-call-only assistant turns by default.
-pub const EntryKind = enum {
-    user,
-    assistant,
-    /// Assistant turn that carried only tool calls (no visible text).
-    assistant_empty,
-    tool,
-    branch_summary,
-    session_info,
-    /// Per-turn code-state checkpoint — internal metadata, hidden from the
-    /// timeline view.
-    checkpoint,
-    other,
-};
-
-pub const EntrySummary = struct {
-    kind: EntryKind,
-    tool_failed: bool = false,
-    /// One-line display text, owned by the caller.
-    text: []u8,
-};
 
 /// Classify an entry and produce its one-line `/timeline` summary in a single
 /// parse. Whitespace is collapsed and the text truncated to one row. Caller

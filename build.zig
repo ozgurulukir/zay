@@ -81,9 +81,16 @@ pub fn build(b: *std.Build) void {
     });
     const model_catalog_run = b.addRunArtifact(model_catalog_gen);
     model_catalog_run.addFileArg(b.path("vendor/models.dev/models.json"));
+    model_catalog_run.addFileArg(b.path("vendor/models.dev/api.json"));
     const model_catalog_zig = model_catalog_run.addOutputFileArg("model_catalog.zig");
+    const provider_registry_zig = model_catalog_run.addOutputFileArg("provider_registry.zig");
     const model_catalog_mod = b.createModule(.{
         .root_source_file = model_catalog_zig,
+        .target = target,
+        .optimize = optimize,
+    });
+    const provider_registry_mod = b.createModule(.{
+        .root_source_file = provider_registry_zig,
         .target = target,
         .optimize = optimize,
     });
@@ -102,6 +109,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "counting_allocator", .module = counting_allocator_mod },
             .{ .name = "c", .module = c_mod },
             .{ .name = "model_catalog", .module = model_catalog_mod },
+            .{ .name = "provider_registry", .module = provider_registry_mod },
         },
     });
 

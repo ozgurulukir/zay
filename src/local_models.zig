@@ -80,17 +80,9 @@ fn spawn(gpa: std.mem.Allocator, io: std.Io, classifier_dir: []const u8, python_
     // Inherit parent process environment, then force ONNX Runtime to sleep
     // threads when idle instead of spinning (default busy-wait wastes ~10%
     // CPU per core).
-    var env_map = std.process.Environ.Map.init(gpa);
+    const env_slice = std.mem.span(std.c.environ);
+    var env_map = try std.process.Environ.createMap(.{ .block = .{ .slice = env_slice } }, gpa);
     defer env_map.deinit();
-    {
-        var index: usize = 0;
-        while (std.c.environ[index]) |entry| : (index += 1) {
-            const line = std.mem.span(entry);
-            const separator = std.mem.findScalar(u8, line, '=') orelse continue;
-            if (separator == 0) continue;
-            try env_map.put(line[0..separator], line[separator + 1 ..]);
-        }
-    }
     try env_map.put("OMP_WAIT_POLICY", "PASSIVE");
 
     return std.process.spawn(io, .{

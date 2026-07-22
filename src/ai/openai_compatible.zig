@@ -122,6 +122,7 @@ pub const Client = struct {
         var payload: std.Io.Writer.Allocating = .init(self.gpa);
         defer payload.deinit();
         try writeRequestPayload(
+            self.gpa,
             &payload.writer,
             self.config.model,
             self.config.session_id,
@@ -274,14 +275,14 @@ fn writeToolDefinition(
     try writer.writeAll("]}}}");
 }
 
-fn writeMessage(out: *std.Io.Writer, message: ai.ChatMessage) !void {
+fn writeMessage(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMessage) !void {
     try out.writeAll("{\"role\":");
     try std.json.Stringify.value(message.role.label(), .{}, out);
     try out.writeAll(",\"content\":");
     if (message.role == .user) {
         try writeUserContent(out, message.content);
     } else {
-        try writeTextContent(out, message.content);
+        try writeTextContent(out, gpa, message.content);
     }
     if (message.call_id) |call_id| {
         try out.writeAll(",\"tool_call_id\":");
@@ -304,8 +305,8 @@ fn writeMessage(out: *std.Io.Writer, message: ai.ChatMessage) !void {
     try out.writeByte('}');
 }
 
-fn writeTextContent(out: *std.Io.Writer, blocks: []const ai.ContentBlock) !void {
-    var aw: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);
+fn writeTextContent(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []const ai.ContentBlock) !void {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     for (blocks) |block| {
         switch (block) {
@@ -357,6 +358,7 @@ fn writeToolCall(out: *std.Io.Writer, tool_call: ai.ToolCall) !void {
 }
 
 fn writeRequestPayload(
+    gpa: std.mem.Allocator,
     out: *std.Io.Writer,
     model: []const u8,
     session_id: []const u8,
@@ -372,7 +374,7 @@ fn writeRequestPayload(
     try out.writeAll(",\"messages\":[");
     for (messages, 0..) |message, index| {
         if (index > 0) try out.writeByte(',');
-        try writeMessage(out, message);
+        try writeMessage(out, gpa, message);
     }
     // `stream_options.include_usage` makes the server emit a final usage-only
     // chunk (empty `choices`) before `[DONE]`. Without it, streaming responses
@@ -857,7 +859,7 @@ test "writeRequestPayload disables thinking for reasoning effort none" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(&payload.writer, "qwen-test", "", &.{}, "[]", .{ .effort = .none });
+    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "", &.{}, "[]", .{ .effort = .none });
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_effort") == null);
@@ -867,7 +869,7 @@ test "writeRequestPayload emits prompt_cache_key from the session id" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(&payload.writer, "qwen-test", "session-abc", &.{}, "[]", null);
+    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "session-abc", &.{}, "[]", null);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"session-abc\"") != null);
 }
@@ -876,7 +878,7 @@ test "writeRequestPayload omits prompt_cache_key when no session id is set" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(&payload.writer, "qwen-test", "", &.{}, "[]", null);
+    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "", &.{}, "[]", null);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_key") == null);
 }
@@ -887,7 +889,7 @@ test "writeRequestPayload omits tools and tool_choice when there are none" {
     defer payload.deinit();
     // The background summarizer sends no tools ("[]"); the request must not carry
     // a `tool_choice` (rejected by strict providers) or invite a tool-call reply.
-    try writeRequestPayload(&payload.writer, "summarizer", "", &.{}, "[]", null);
+    try writeRequestPayload(gpa, &payload.writer, "summarizer", "", &.{}, "[]", null);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "tool_choice") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") == null);
@@ -897,7 +899,7 @@ test "writeRequestPayload keeps tools and tool_choice when tools are present" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(&payload.writer, "agent", "", &.{}, "[{\"type\":\"function\"}]", null);
+    try writeRequestPayload(gpa, &payload.writer, "agent", "", &.{}, "[{\"type\":\"function\"}]", null);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"auto\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":[{\"type\":\"function\"}]") != null);

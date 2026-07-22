@@ -56,36 +56,70 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     }
     defer if (local_models_handle) |*server| server.deinit(gpa, init.io);
 
-    // The TUI is long-running and streams unbounded content, so it must use a
-    // real freeing allocator — an arena never reclaims, and `Transcript`'s
-    // streaming-body `realloc` degrades to O(N²) abandoned buffers on one (see
-    // `appendOwned` in transcript.zig). `smp_allocator` is a thread-safe global
-    // singleton, so this matches `App.gpa` (tui.zig) exactly — required because
-    // `agent_runtime`/`tui_config` are allocated here and freed in `App.deinit`.
-    const tui_gpa = std.heap.smp_allocator;
+    // The TUI is long-running and streams unbounded content. `SmpAllocator`
+    // (Zig 0.16) has a known multi-threaded free-list corruption bug that
+    // panics with "incorrect alignment"; `PageAllocator` is the safe fallback:
+    // thread-safe, actually frees memory, but each allocation maps a whole page.
+    const tui_gpa = gpa;
     const tui_config = try load_result.config.cloneForTui(tui_gpa);
-
-    const runtime_gpa = std.heap.smp_allocator;
+    const runtime_gpa = gpa;
 
     defer search.deinit(runtime_gpa, init.io);
 
     const system_prompt = if (load_result.config.system_prompt) |s| s else @embedFile("prompts/system.md");
     const agent_runtime = try tui_gpa.create(runtime.AgentRuntime);
     errdefer tui_gpa.destroy(agent_runtime);
-    try agent_runtime.initNew(
-        runtime_gpa,
-        init.io,
-        cwd,
-        cwd, // session_dir: the primary's sessions live in the repo root's .nova
-        home_dir,
-        system_prompt,
-        load_result.config,
-        load_result.takeDiagnostics(),
-        null, // template: the primary builds its prompt + skills from scratch
-    );
+
+    // Auto-resume: find the most recently updated session for this cwd.
+    const resume_session_id = blk: {
+        var manager = session.SessionManager.initDefault(runtime_gpa, init.io, home_dir) catch break :blk null;
+        defer manager.deinit();
+        const id = manager.findLatest(runtime_gpa, cwd) catch null;
+        break :blk id;
+    };
+    if (resume_session_id) |id| {
+        defer runtime_gpa.free(id);
+        agent_runtime.initResume(
+            runtime_gpa,
+            init.io,
+            cwd,
+            cwd,
+            home_dir,
+            system_prompt,
+            load_result.config,
+            load_result.takeDiagnostics(),
+            id,
+            null,
+        ) catch |err| {
+            std.log.warn("session.resume.failed err={s}, starting new session", .{@errorName(err)});
+            try agent_runtime.initNew(
+                runtime_gpa,
+                init.io,
+                cwd,
+                cwd,
+                home_dir,
+                system_prompt,
+                load_result.config,
+                load_result.takeDiagnostics(),
+                null,
+            );
+        };
+    } else {
+        try agent_runtime.initNew(
+            runtime_gpa,
+            init.io,
+            cwd,
+            cwd,
+            home_dir,
+            system_prompt,
+            load_result.config,
+            load_result.takeDiagnostics(),
+            null,
+        );
+    }
     load_result.config.deinit(gpa);
 
-    try tui.run(init, agent_runtime, tui_config);
+    try tui.run(init, agent_runtime, tui_config, tui_gpa);
 }
 
 fn resolveLogPath(gpa: std.mem.Allocator, env: anytype) ![]u8 {

@@ -73,6 +73,7 @@ pub fn beginSubmit(app: *App) !bool {
     defer app.gpa.free(prompt);
     if (prompt.len == 0) return false;
     try app.thread.pushPromptHistory(app.gpa, prompt);
+    if (app.liveRuntime()) |rt| rt.session_writer.savePromptHistory(prompt) catch {};
 
     if (app.liveRuntime() != null and app.liveRuntime().?.client == .none) {
         _ = try app.thread.transcript.append(app.gpa, .user, "you", prompt);

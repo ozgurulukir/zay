@@ -73,6 +73,7 @@ const tui_provider = @import("tui/provider_controller.zig");
 const tui_status = @import("tui/status.zig");
 const tui_style = @import("tui/style.zig");
 const logger = @import("logger");
+pub const modelsdev = @import("modelsdev.zig");
 
 const ConversationLayout = tui_message.ConversationLayout;
 const MessageWidget = tui_message.MessageWidget;
@@ -152,6 +153,10 @@ pub const App = struct {
     /// `~/.nova/auth.json`. Drives the picker's [CONNECTED] badges and supplies
     /// keys when (re)building the model catalogue. Owned; freed in `deinit`.
     provider_api_keys: codex.ApiKeyMap = .empty,
+    /// Merged models.dev provider registry (builtins + cached/fetched). Owned; freed in `deinit`.
+    modelsdev_registry: ?modelsdev.Registry = null,
+    /// Backing slice for provider picker's dynamic provider list. Owned; freed in `deinit`.
+    dynamics_slice: ?[]const modelsdev.Provider = null,
     /// Inline edit buffer for the provider setup form's API-key field. Owned;
     /// freed in `deinit`.
     provider_key_input: std.ArrayList(u8) = .empty,
@@ -988,12 +993,13 @@ pub fn run(
     init: std.process.Init,
     runtime: *runtime_mod.AgentRuntime,
     config: config_mod.Config,
+    gpa: std.mem.Allocator,
 ) !void {
-    // A real freeing allocator, not `init.arena` — the TUI runs for the whole
-    // session and streams unbounded content, so arena-backed allocations (which
-    // are never reclaimed) OOM over time. Must match `tui_gpa` in root.zig since
-    // `runtime`/`cached_config` cross the seam and are freed in `App.deinit`.
-    const gpa = std.heap.smp_allocator;
+    // Allocator is provided by root.zig as `PageAllocator`. Thread-safe and
+    // correct, but each allocation maps a whole page — traded off to avoid
+    // `SmpAllocator`'s multi-threaded free-list corruption panic in Zig 0.16.
+    // Must match `tui_gpa` in root.zig since `runtime`/`cached_config` cross
+    // the seam and are freed in `App.deinit`.
     var tty_buffer: [8192]u8 = undefined;
     var fw_app = try vxfw.App.init(init.io, gpa, init.environ_map, &tty_buffer);
     defer fw_app.deinit();
@@ -1619,7 +1625,7 @@ test "provider setup form renders for opencode zen without crashing" {
 
     app.mode = .provider_picker;
     app.pickers.provider.stage = .form;
-    app.pickers.provider.form_provider = .opencode_zen;
+    app.pickers.provider.form_handle = .{ .builtin = .opencode_zen };
 
     var root: RootWidget = .{ .app = &app };
     var arena = std.heap.ArenaAllocator.init(gpa);

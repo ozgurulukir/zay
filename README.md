@@ -60,7 +60,8 @@ concern:
 - `lifecycle.zig` — `deinit`, `handleTick`, `createParallelLane`, diff key handlers, `syncFocus`, `submit`, `ensureTick`.
 - `diff_utils.zig` — pure diff-count stat/numstat parsers, git label loader.
 - `lanes.zig` — `MergeSource` type + lane merge helpers (`workingLaneOf`, `laneErrorText`).
-- `provider_model.zig` — provider connection, model catalogue loading, model selection (~50 functions).
+- `provider_model.zig` — provider connection, model catalogue loading, dynamic models.dev integration, provider setup forms, and ProviderHandle dispatch.
+- `model_loader_job.zig` — async model loading background jobs, outcome installation, and disk cache persistence.
 - `thread.zig` — `Thread` (lane) state, multi-lane state machine.
 - `turn.zig` / `turn_view.zig` — turn lifecycle + render.
 - `diff_viewer.zig` — `/diff` inline-diff helpers (used by `widgets/diff.zig`).
@@ -75,5 +76,13 @@ concern:
 
 `src/tui/widgets/` holds the per-widget draw code (message, command
 panel, at_search, background_jobs, permission, diff, loading, transcript,
-input, overlay, lanes picker, model picker, provider picker, resume
+input, overlay, lanes picker, model picker, provider picker with ViewportWindow scrolling, resume
 picker, help picker, tree selector, panel layout, tree art).
+
+## Core Systems & Engine
+
+- **`modelsdev.zig`**: Provider registry integration combining built-in static providers with dynamic data from `https://models.dev/api.json`. Supports local disk caching in `~/.nova/modelsdev_cache.json` and safe string arena management (`StringRef` / `UnresolvedProvider`).
+- **`compaction.zig`**: Pure decisions for automatic context window compaction. Calculates dynamic retention budgets (`keepRecentTokens`) scaled to the model's context window (%35 max 20,000) so small-context models (e.g. 8K/16K/32K) can always compact cleanly below their swap watermarks.
+- **`agent.zig`**: Autonomous loop orchestrating LLM tool execution, background/synchronous context compaction, and VCS git-shadow checkpointing (`snapshotAfterBatch`).
+- **`runtime.zig`**: Dual client lifecycle (primary turn client + compaction/naming secondary clients), context usage tracking reset on model switch, and robust session initialization/resume error recovery.
+- **`session.zig`**: SQLite-backed session persistence (`sessions.sqlite`). Tolerant payload decoding handles both standard text strings and byte array JSON encodings.

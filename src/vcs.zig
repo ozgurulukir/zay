@@ -238,20 +238,12 @@ fn indexEnv(gpa: std.mem.Allocator, io: std.Io, index_path: []const u8) CmdError
 }
 
 fn currentEnv(gpa: std.mem.Allocator, io: std.Io) CmdError!std.process.Environ.Map {
+    _ = io;
     if (builtin.os.tag == .windows) {
         return std.process.Environ.createMap(.{ .block = .global }, gpa) catch error.OutOfMemory;
     }
-    _ = io;
-    var map = std.process.Environ.Map.init(gpa);
-    errdefer map.deinit();
-    var index: usize = 0;
-    while (std.c.environ[index]) |entry| : (index += 1) {
-        const line = std.mem.span(entry);
-        const separator = std.mem.findScalar(u8, line, '=') orelse continue;
-        if (separator == 0) continue;
-        try map.put(line[0..separator], line[separator + 1 ..]);
-    }
-    return map;
+    const env_slice = std.mem.span(std.c.environ);
+    return std.process.Environ.createMap(.{ .block = .{ .slice = env_slice } }, gpa) catch error.OutOfMemory;
 }
 
 /// Resolve the path of Nova's dedicated snapshot index for `dir`. Uses

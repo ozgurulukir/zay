@@ -72,14 +72,30 @@ const tool_output_render_cap_bytes: u32 = 2048;
 /// catalogue carries only the providers Nova integrates with; anything else
 /// lands on the conservative default, which only compacts early — the safe
 /// direction.
-pub fn contextWindowTokens(model_id: []const u8) u32 {
+pub fn contextWindowTokens(raw_model_id: []const u8) u32 {
+    var model_id = raw_model_id;
+    while (std.mem.indexOfScalar(u8, model_id, '/')) |slash| {
+        model_id = model_id[slash + 1 ..];
+    }
+
     var best: ?model_catalog.Entry = null;
     for (model_catalog.entries) |entry| {
-        if (!std.mem.startsWith(u8, model_id, entry.id)) continue;
-        if (best == null or entry.id.len > best.?.id.len) best = entry;
+        if (std.mem.startsWith(u8, model_id, entry.id) or std.mem.startsWith(u8, entry.id, model_id)) {
+            if (best == null or entry.id.len > best.?.id.len) best = entry;
+        }
     }
     if (best) |entry| return entry.context;
     return context_window_default_tokens;
+}
+
+/// Target tokens of recent conversation to keep verbatim during compaction.
+/// Scaled dynamically based on `context_window` so small-context models keep
+/// a proportionate window and can always compact cleanly below their swap
+/// watermark.
+pub fn keepRecentTokens(context_window: u32) u32 {
+    if (context_window == 0) return keep_recent_tokens_default;
+    const target: u32 = @intCast(@as(u64, context_window) * 35 / 100);
+    return @max(1000, @min(keep_recent_tokens_default, target));
 }
 
 /// True once `used_tokens` crosses the start watermark: begin producing the
@@ -381,6 +397,19 @@ test "serialize prefix drops reasoning and tags roles" {
     const text = try serializePrefix(gpa, &.{ user, tool });
     defer gpa.free(text);
     try std.testing.expectEqualStrings("[user]: hello\n[tool result]: output\n", text);
+}
+
+test "keepRecentTokens scales with context window" {
+    try std.testing.expectEqual(@as(u32, 20_000), keepRecentTokens(200_000));
+    try std.testing.expectEqual(@as(u32, 11_200), keepRecentTokens(32_000));
+    try std.testing.expectEqual(@as(u32, 5_600), keepRecentTokens(16_000));
+    try std.testing.expectEqual(@as(u32, 2_800), keepRecentTokens(8_000));
+}
+
+test "contextWindowTokens strips provider prefix" {
+    const tokens1 = contextWindowTokens("gpt-4o");
+    const tokens2 = contextWindowTokens("openai/gpt-4o");
+    try std.testing.expectEqual(tokens1, tokens2);
 }
 
 fn textMessage(gpa: std.mem.Allocator, role: ai.Role, text: []const u8) !ai.ChatMessage {

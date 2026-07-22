@@ -45,7 +45,7 @@ pub fn cancelMode(app: *App) !bool {
     // Esc inside the provider setup form returns to the provider list.
     if (app.mode == .provider_picker and app.pickers.provider.stage == .form) {
         app.pickers.provider.stage = .list;
-        app.pickers.provider.form_provider = null;
+        app.pickers.provider.form_handle = null;
         app.provider_key_input.clearRetainingCapacity();
         return true;
     }
@@ -75,8 +75,13 @@ pub fn cancelMode(app: *App) !bool {
 pub fn submitMode(app: *App) !bool {
     if (app.mode == .provider_picker) {
         if (app.pickers.provider.stage == .form) {
-            const provider = app.pickers.provider.form_provider orelse return true;
-            provider_model.submitProviderSetup(app, provider) catch |err| try app.reportConnectionError(err);
+            if (app.pickers.provider.form_handle) |handle| {
+                switch (handle) {
+                    .builtin => |provider| provider_model.submitProviderSetup(app, provider) catch |err| try app.reportConnectionError(err),
+                    .dynamic => |provider| provider_model.submitDynamicProviderSetup(app, provider) catch |err| try app.reportConnectionError(err),
+                }
+                return true;
+            }
             return true;
         }
         switch (app.pickers.provider.selectedAction()) {
@@ -89,6 +94,7 @@ pub fn submitMode(app: *App) !bool {
                 }
             },
             .open_form => |provider| provider_model.openProviderForm(app, provider),
+            .open_dynamic => |provider| provider_model.openDynamicProviderForm(app, provider),
         }
         return true;
     }

@@ -47,6 +47,10 @@ method on `App`; the dispatcher is a free function delegating to the right
 struct. This is the place to add new per-mode logic — don't reintroduce
 private methods on `App` for key handling.
 
+**Viewport scrolling pattern.** Standardize overlay list viewports using `panel.ViewportWindow.compute(selection, total_count, surface.size.height)` in `src/tui/widgets/panel.zig`. Use `viewport.screenRow(i)` for row rendering calculations.
+
+**Provider polymorphism pattern.** Unify static builtin `config_mod.Provider` and dynamic `modelsdev.Provider` handles using `ProviderHandle = union(enum) { builtin: config_mod.Provider, dynamic: modelsdev.Provider }` in `src/tui/widgets/provider_picker.zig`.
+
 ## Zig Development
 
 Use `zigdoc` to discover APIs before coding.
@@ -135,6 +139,9 @@ const output = try writer.toOwnedSlice();
 - Add assertions at API boundaries and state transitions; avoid trivial assertions.
 - Keep functions small; push pure computation into helpers.
 - Comments should explain why, not what.
+- **POSIX Environment Access:** Never index `std.c.environ` directly in loops (`while (std.c.environ[i]) |e|`). In Zig 0.16 on POSIX, `std.c.environ` is `[*:null]?[*:0]u8`. Use `const env_slice = std.mem.span(std.c.environ);` and pass to `std.process.Environ.createMap(.{ .block = .{ .slice = env_slice } }, gpa)` to prevent null-pointer segfaults in multi-threaded contexts.
+- **Models.dev Registry Allocations:** `modelsdev.Registry` string storage uses an `ArrayList(u8)`. To prevent dangling slice pointers when building or merging providers, accumulate string offsets via `StringRef` (`start`, `len`) and resolve slice pointers only after all string appends complete.
+- **Dynamic Context Compaction:** Never hardcode fixed context retention budgets (e.g. 20,000 tokens) when compacting history. Use `compaction.keepRecentTokens(context_window)` so small-context models (8K/16K/32K) keep a scaled history window (%35 max 20,000) and can always compact below their swap watermark.
 
 ## Verifying
 
@@ -146,3 +153,5 @@ Run:
 ## Known Issues
 
 - **High CPU usage from spinlocks.** `std.atomic.Mutex` busy-waits and pegs the CPU on multi-core. Use `std.Io.Mutex` and `std.Io.Condition` instead (paired via `static_thread_pool` or similar). Symptom: 80% CPU at idle, drops to ~2% after the fix. Files affected: `lib/logger.zig`, `src/agent.zig`, `src/background.zig`, `src/session.zig`.
+
+- **Double-free in `postAgentEvent` / `postTurnFailed` / `runAgentTurn` (fixed).** `postAgentEvent` takes ownership of the event — on error it frees the event's data internally. The callers' catch blocks were freeing `message_text` again (double-free), and the QueueFull handler in `postAgentEvent` was manually cleaning up `event_ptr` before `return error.TurnCancelled`, which triggered errdefer to repeat the same cleanup. Pattern: caller allocates `message_text`, passes it into `.{ .turn_failed = message_text }`, `postAgentEvent` frees it on error, caller's catch block frees it again. Fix: remove `worker_context.gpa.free(message_text)` from catch blocks in `runAgentTurn` and `postTurnFailed`; remove manual `event_ptr.deinit`+`destroy` before `return error.TurnCancelled` in `postAgentEvent`.
