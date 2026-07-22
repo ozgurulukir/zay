@@ -1,9 +1,7 @@
 //! The Ctrl+O background-jobs modal widget and its inner row layout.
 //!
-//! Pulled out of `tui.zig` (R5.1a of `_pm/Projects/tui-split`) — the
-//! widget was a self-contained 75-line struct that only read
-//! `App.background`, `App.background_modal_state`, and the panel/style
-//! helpers, so it earns its own file under `widgets/`.
+//! Renders background job snapshots with vxfw.Border labels, elapsed timers,
+//! and focused cancel action buttons.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
@@ -41,7 +39,7 @@ pub const BackgroundJobsWidget = struct {
         };
         var border: vxfw.Border = .{
             .child = inner.widget(),
-            .labels = &.{.{ .text = "Background jobs", .alignment = .top_left }},
+            .labels = &.{.{ .text = "Background Jobs", .alignment = .top_left }},
             .style = StylePalette.border_label,
         };
         return border.widget().draw(ctx);
@@ -72,14 +70,14 @@ const BackgroundJobsInner = struct {
             return surface;
         }
 
-        panel.lineStyledAt(&surface, 0, "↑↓ select · → cancel · Esc close", ctx, 1, StylePalette.panel_header) catch {};
+        panel.lineStyledAt(&surface, 0, " ↑/↓ Navigate · → Cancel Job · Esc Close ", ctx, 1, StylePalette.panel_header) catch {};
         const body_rows = height -| 1;
         var row: u16 = 0;
         while (row < self.views.len and row < body_rows) : (row += 1) {
             const view = self.views[row];
             const selected = row == self.selection;
             var elapsed_buf: [32]u8 = undefined;
-            const line = std.fmt.allocPrint(ctx.arena, "{s}  {s}  {s}", .{
+            const line = std.fmt.allocPrint(ctx.arena, "  {s}  [{s}]  {s}", .{
                 view.label,
                 formatJobElapsed(&elapsed_buf, view.elapsed_seconds),
                 view.command,
@@ -88,7 +86,7 @@ const BackgroundJobsInner = struct {
             // The cancel button sits at the right; highlighted only when the
             // selected row has cancel focus (right-arrow).
             const focused = selected and self.cancel_focus;
-            const button = if (focused) "[CANCEL]" else "CANCEL";
+            const button = if (focused) " [CANCEL] " else " CANCEL ";
             const style = if (focused) StylePalette.tool_failed else StylePalette.thinking_body;
             panel.rightStyled(&surface, 1 + row, button, ctx, style) catch {};
         }
@@ -98,8 +96,11 @@ const BackgroundJobsInner = struct {
 
 /// Compact elapsed render for a modal row, e.g. `45s`, `12m03s`, `2h05m`.
 fn formatJobElapsed(buf: []u8, total_seconds: u64) []const u8 {
-    if (total_seconds < 60) return std.fmt.bufPrint(buf, "{d}s", .{total_seconds}) catch "?";
+    if (total_seconds < 60) return std.fmt.bufPrint(buf, "{d}s", .{total_seconds}) catch "0s";
     const minutes = total_seconds / 60;
-    if (minutes < 60) return std.fmt.bufPrint(buf, "{d}m{d:0>2}s", .{ minutes, total_seconds % 60 }) catch "?";
-    return std.fmt.bufPrint(buf, "{d}h{d:0>2}m", .{ minutes / 60, minutes % 60 }) catch "?";
+    const seconds = total_seconds % 60;
+    if (minutes < 60) return std.fmt.bufPrint(buf, "{d}m{d:0>2}s", .{ minutes, seconds }) catch "0m";
+    const hours = minutes / 60;
+    const rem_minutes = minutes % 60;
+    return std.fmt.bufPrint(buf, "{d}h{d:0>2}m", .{ hours, rem_minutes }) catch "0h";
 }

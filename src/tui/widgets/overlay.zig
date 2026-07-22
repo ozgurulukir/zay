@@ -25,6 +25,7 @@ const resume_picker = @import("resume_picker.zig");
 const tree_selector = @import("tree_selector.zig");
 const tui_status = @import("../status.zig");
 const codex = @import("../../codex.zig");
+const settings_widget = @import("settings.zig");
 
 const App = tui.App;
 const StylePalette = tui_style.Palette;
@@ -41,7 +42,8 @@ fn overlaySize(mode: App.Mode) OverlaySize {
         .tree_picker => .{ .width = 90, .height = 20 },
         .save_message => .{ .width = 60, .height = 3 },
         .lanes => .{ .width = 80, .height = 16 },
-        .help => .{ .width = 80, .height = 18 },
+        .help => .{ .width = 90, .height = 22 },
+        .settings => .{ .width = 90, .height = 22 },
         .diff_viewer => .{ .width = 0, .height = 0 },
     };
 }
@@ -56,6 +58,7 @@ fn overlayLabel(app: *const App) []const u8 {
         .tree_picker => "Session Timeline",
         .save_message => "Commit Message",
         .help => "Help & Keyboard Shortcuts",
+        .settings => "Settings",
         .lanes => switch (app.nav.lanes_purpose) {
             .manage => "Parallel Lanes",
             .merge_dest => "Merge Into",
@@ -103,16 +106,20 @@ pub const OverlayWidget = struct {
         const total_w: u16 = @min(size.width, max_w);
         const total_h: u16 = @min(size.height, max_h);
         var inner: OverlayInner = .{ .app = self.app };
+        const label_text = overlayLabel(self.app);
+        const border_labels: []const vxfw.Border.BorderLabel = if (label_text.len > 0)
+            &.{.{ .text = label_text, .alignment = .top_left }}
+        else
+            &.{};
         var border: vxfw.Border = .{
             .child = inner.widget(),
+            .labels = border_labels,
             .style = StylePalette.thinking_body,
         };
-        var surface = try border.widget().draw(ctx.withConstraints(
+        return border.widget().draw(ctx.withConstraints(
             .{ .width = total_w, .height = total_h },
             .{ .width = total_w, .height = total_h },
         ));
-        writeBorderLabel(&surface, ctx, overlayLabel(self.app));
-        return surface;
     }
 };
 
@@ -130,9 +137,12 @@ const OverlayInner = struct {
 
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = iw, .height = ih });
 
-        // The provider setup form hosts its own inline editor, so it skips the
-        // shared search row entirely and fills the panel from the top.
-        if (self.app.mode == .provider_picker and self.app.pickers.provider.stage == .form) {
+        // The provider setup form, the settings panel, and the help modal host
+        // their own headers/navigation, so they skip the shared search row
+        // entirely and fill the panel from the top.
+        const is_full_panel = (self.app.mode == .provider_picker and self.app.pickers.provider.stage == .form) or
+            self.app.mode == .settings or self.app.mode == .help;
+        if (is_full_panel) {
             const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
             children[0] = .{
                 .origin = .{ .row = 0, .col = 0 },
@@ -202,6 +212,7 @@ const OverlayInner = struct {
             .save_message => drawSaveMessageContent(app, ctx),
             .lanes => drawLanesContent(app, ctx),
             .help => drawHelpContent(app, ctx),
+            .settings => drawSettingsContent(app, ctx),
             // The diff viewer is full-screen — `drawRoot` returns before the
             // overlay path, so this is never reached.
             .normal, .diff_viewer => unreachable,
@@ -209,8 +220,20 @@ const OverlayInner = struct {
     }
 
     fn drawHelpContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        _ = app;
-        var content: help_picker.Content = .{};
+        var content: help_picker.Content = .{ .state = &app.pickers.help };
+        return content.widget().draw(ctx);
+    }
+
+    fn drawSettingsContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const runtime = app.liveRuntime();
+        var content: settings_widget.Content = .{
+            .state = &app.pickers.settings,
+            .config = &app.cached_config,
+            .home_dir = if (runtime) |r| r.home_dir else "",
+            .cwd = if (runtime) |r| r.cwd else ".",
+            .system_prompt_input = app.settings_text_input.items,
+            .bash_classifier_input = app.settings_text_input.items,
+        };
         return content.widget().draw(ctx);
     }
 

@@ -17,6 +17,8 @@ const tui = @import("../tui.zig");
 const tree_selector = @import("widgets/tree_selector.zig");
 const model_catalogue = @import("model_catalogue.zig");
 const provider_picker = @import("widgets/provider_picker.zig");
+const settings_widget = @import("widgets/settings.zig");
+const help_picker = @import("widgets/help_picker.zig");
 const vxfw = vaxis.vxfw;
 
 const MentionSearchKind = tui.MentionSearchKind;
@@ -42,12 +44,15 @@ pub const InputState = struct {
     comment: vxfw.TextField,
 };
 
-/// The three picker widgets: file tree (overlay), model catalogue, and
-/// provider list with API-key form. Owns the per-picker state structs.
+/// The four picker widgets: file tree (overlay), model catalogue,
+/// provider list with API-key form, and the settings panel.
+/// Owns the per-picker state structs.
 pub const PickerStates = struct {
     tree: tree_selector.TreeState,
     models: model_catalogue.ModelCatalogue = .{},
     provider: provider_picker.State = .{},
+    settings: settings_widget.State = .{},
+    help: help_picker.State = .{},
 };
 
 /// Navigation cursors and the cross-pane selection state. Owns the

@@ -1,8 +1,7 @@
 //! The permission overlay widget and its inner command/actions layout.
 //!
-//! Pulled out of `tui.zig` (R5.1a of `_pm/Projects/tui-split`) — the
-//! widget was a self-contained 95-line struct that read the active
-//! thread's approval snapshot, so it earns its own file under `widgets/`.
+//! Renders tool execution approval prompts with modern vxfw Border styling
+//! and decision buttons (Approve / Reject).
 
 const std = @import("std");
 const vaxis = @import("vaxis");
@@ -49,7 +48,7 @@ pub const PermissionWidget = struct {
         inner.* = .{ .snapshot = snapshot, .scroll = app.thread.permission_scroll };
         var border: vxfw.Border = .{
             .child = inner.widget(),
-            .labels = &.{.{ .text = "Unsafe bash command", .alignment = .top_left }},
+            .labels = &.{.{ .text = "Tool Approval Request", .alignment = .top_left }},
             .style = StylePalette.border_label,
         };
         return border.widget().draw(ctx);
@@ -72,7 +71,7 @@ const PermissionInner = struct {
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = width, .height = height });
         if (width == 0 or height == 0) return surface;
 
-        panel.lineStyledAt(&surface, 0, "Review before running", ctx, 1, StylePalette.panel_header) catch {};
+        panel.lineStyledAt(&surface, 0, "Review before running:", ctx, 1, StylePalette.panel_header) catch {};
         const body_rows = height -| 3;
         drawPermissionCommand(&surface, ctx, self.snapshot.command, self.scroll, body_rows);
         drawPermissionActions(&surface, ctx, height -| 1, self.snapshot.selected);
@@ -101,16 +100,15 @@ fn drawPermissionActions(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16
     if (row >= surface.size.height) return;
     const approve_selected = selected == .approve;
     const reject_selected = selected == .reject;
-    panel.lineStyledAt(surface, row, actionLabel(ctx, "Approve", approve_selected), ctx, 1, permissionActionStyle(approve_selected)) catch {};
-    panel.lineStyledAt(surface, row, actionLabel(ctx, "Reject", reject_selected), ctx, 13, permissionActionStyle(reject_selected)) catch {};
+
+    const approve_style: vaxis.Style = if (approve_selected) .{ .fg = .{ .rgb = .{ 34, 197, 94 } }, .bold = true } else StylePalette.thinking_body;
+    const reject_style: vaxis.Style = if (reject_selected) .{ .fg = .{ .rgb = .{ 239, 68, 68 } }, .bold = true } else StylePalette.thinking_body;
+
+    panel.lineStyledAt(surface, row, actionLabel(ctx, "Approve [Y]", approve_selected), ctx, 1, approve_style) catch {};
+    panel.lineStyledAt(surface, row, actionLabel(ctx, "Reject [N]", reject_selected), ctx, 18, reject_style) catch {};
 }
 
 fn actionLabel(ctx: vxfw.DrawContext, text: []const u8, selected: bool) []const u8 {
-    if (selected) return std.fmt.allocPrint(ctx.arena, "[ {s} ]", .{text}) catch text;
-    return std.fmt.allocPrint(ctx.arena, "  {s}  ", .{text}) catch text;
-}
-
-fn permissionActionStyle(selected: bool) vaxis.Style {
-    if (selected) return StylePalette.selected_item;
-    return StylePalette.thinking_body;
+    if (selected) return std.fmt.allocPrint(ctx.arena, "▶ [ {s} ]", .{text}) catch text;
+    return std.fmt.allocPrint(ctx.arena, "    {s}  ", .{text}) catch text;
 }

@@ -7,6 +7,7 @@ pub const background = @import("background.zig");
 pub const bash = @import("bash.zig");
 pub const local_models = @import("local_models.zig");
 pub const bash_safety = @import("bash_safety.zig");
+pub const clipboard = @import("clipboard.zig");
 pub const codex = @import("codex.zig");
 pub const compaction = @import("compaction.zig");
 pub const config = @import("config.zig");

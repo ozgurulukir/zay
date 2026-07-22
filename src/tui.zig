@@ -47,6 +47,8 @@ const diff_utils = @import("tui/diff_utils.zig");
 const lane_lifecycle = @import("tui/lane_lifecycle.zig");
 const lanes_util = @import("tui/lanes.zig");
 const lifecycle = @import("tui/lifecycle.zig");
+const settings_lifecycle = @import("tui/settings_lifecycle.zig");
+const settings_widget = @import("tui/widgets/settings.zig");
 const overlay = @import("tui/widgets/overlay.zig");
 const root_layout = @import("tui/layout.zig");
 const root_layout_widget = @import("tui/root_layout.zig");
@@ -160,6 +162,10 @@ pub const App = struct {
     /// Inline edit buffer for the provider setup form's API-key field. Owned;
     /// freed in `deinit`.
     provider_key_input: std.ArrayList(u8) = .empty,
+    /// Inline edit buffer for the settings panel text fields (system_prompt,
+    /// bash_classifier_url). Shared across all edit targets because only one
+    /// can be active at a time. Owned; freed in `deinit`.
+    settings_text_input: std.ArrayList(u8) = .empty,
     /// Live connectivity per catalogue provider, indexed by `catalogueProviders()`
     /// order. Derived from the model load's per-provider outcome (a key existing
     /// only proves it was entered, not that it works), so the picker badge and
@@ -222,7 +228,7 @@ pub const App = struct {
     /// `deinit`.
     pub const ctrl_c_double_press_ms: u32 = 1500;
 
-    pub const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message, lanes, help };
+    pub const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message, lanes, help, settings };
     pub const LanesPurpose = app_state.NavState.LanesPurpose;
     pub const ModelCatalog = enum { connected_provider, openai_codex };
     const CheckpointState = enum { unknown, ready, unavailable };
@@ -1121,19 +1127,22 @@ pub fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
     return mode_lifecycle.shouldOpenCommandMenuForSlash(app, key);
 }
 
-pub const Command = enum { connect, model, new, resume_session, timeline, diff, parallel, save, close, merge, lanes, clear, compact, status, help, export_session, exit_cmd };
+pub const Command = enum { connect, model, new, resume_session, timeline, diff, parallel, save, close, merge, lanes, clear, compact, status, help, export_session, settings, copy, paste, exit_cmd };
 /// `multi_lane` commands act on another lane, so they're hidden from the palette
 /// (and unresolvable) until more than one lane exists.
 pub const CommandEntry = struct { name: []const u8, command: Command, description: []const u8 = "", category: []const u8 = "", multi_lane: bool = false };
 pub const commands = [_]CommandEntry{
     .{ .name = "Connect", .command = .connect, .description = "Configure AI provider & API key", .category = "AI & MODELS" },
     .{ .name = "Models", .command = .model, .description = "Select model & reasoning effort", .category = "AI & MODELS" },
+    .{ .name = "Settings", .command = .settings, .description = "View and edit configuration settings", .category = "AI & MODELS" },
     .{ .name = "New", .command = .new, .description = "Start a fresh session", .category = "SESSION" },
     .{ .name = "Resume", .command = .resume_session, .description = "Resume a past session", .category = "SESSION" },
     .{ .name = "Timeline", .command = .timeline, .description = "Browse session tree history", .category = "SESSION" },
     .{ .name = "Clear", .command = .clear, .description = "Clear current transcript view", .category = "SESSION" },
     .{ .name = "Compact", .command = .compact, .description = "Compact session context history", .category = "SESSION" },
     .{ .name = "Export", .command = .export_session, .description = "Save conversation transcript as Markdown", .category = "SESSION" },
+    .{ .name = "Copy", .command = .copy, .description = "Copy selected transcript message to clipboard", .category = "SESSION" },
+    .{ .name = "Paste", .command = .paste, .description = "Paste text from clipboard into prompt", .category = "SESSION" },
     .{ .name = "Diff", .command = .diff, .description = "View git diff & add comments", .category = "GIT & WORKTREE" },
     .{ .name = "Parallel", .command = .parallel, .description = "Fork worktree into parallel lane", .category = "GIT & WORKTREE" },
     .{ .name = "Save", .command = .save, .description = "Save working copy snapshot", .category = "GIT & WORKTREE" },
@@ -1213,6 +1222,36 @@ const reasoning_options = [_]model_picker.ReasoningOption{
 
 pub fn reasoningOptions() []const model_picker.ReasoningOption {
     return &reasoning_options;
+}
+
+// --- Settings delegates (settings_lifecycle forwarding) -------------------
+
+pub fn openSettings(app: *App) void {
+    settings_lifecycle.openSettings(app);
+}
+
+pub fn closeSettings(app: *App) void {
+    settings_lifecycle.closeSettings(app);
+}
+
+pub fn saveSettings(app: *App) !bool {
+    return settings_lifecycle.saveSettings(app);
+}
+
+pub fn cancelSettings(app: *App) void {
+    settings_lifecycle.cancelSettings(app);
+}
+
+pub fn submitSettings(app: *App) !void {
+    try settings_lifecycle.submitSettings(app);
+}
+
+pub fn clearSettingsField(app: *App) void {
+    settings_lifecycle.clearCurrentField(app);
+}
+
+pub fn handleSettingsTextEditKey(app: *App, key: vaxis.Key) !bool {
+    return settings_lifecycle.handleTextEditKey(app, key);
 }
 
 test "parse diff counts sums numstat and skips binary" {
@@ -2431,8 +2470,8 @@ test "lane commands stay hidden until a second lane exists" {
     defer app.deinit();
 
     // Single lane: the multi-lane commands (/merge, /close) are filtered out of
-    // the palette and can't be resolved; the sixteen always-on commands remain.
-    try std.testing.expectEqual(@as(u32, 16), commandMatchesCountForFilter(&app, ""));
+    // the palette and can't be resolved; the nineteen always-on commands remain.
+    try std.testing.expectEqual(@as(u32, 19), commandMatchesCountForFilter(&app, ""));
     try std.testing.expect(resolveCommand(&app, "Close") == null);
     try std.testing.expect(resolveCommand(&app, "Merge") == null);
     // `/sync` was removed with the git-shadow pivot and never came back.

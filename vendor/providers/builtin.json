@@ -1,0 +1,118 @@
+{
+  "providers": [
+    {
+      "id": "openai",
+      "name": "OpenAI Codex",
+      "description": "OpenAI ChatGPT & Codex OAuth authentication",
+      "base_url": "https://chatgpt.com/backend-api",
+      "adapter": "codex_responses",
+      "requires_api_key": false,
+      "oauth": true
+    },
+    {
+      "id": "openrouter",
+      "name": "OpenRouter",
+      "description": "Unified router for 200+ AI models",
+      "base_url": "https://openrouter.ai/api/v1",
+      "adapter": "openai_compatible",
+      "requires_api_key": true
+    },
+    {
+      "id": "cerebras",
+      "name": "Cerebras",
+      "description": "Ultra-fast Cerebras WSE-3 wafer inference",
+      "base_url": "https://api.cerebras.ai/v1",
+      "adapter": "openai_compatible",
+      "requires_api_key": true
+    },
+    {
+      "id": "ollama_cloud",
+      "name": "Ollama Cloud",
+      "description": "Hosted Ollama cloud model infrastructure",
+      "base_url": "https://ollama.com/v1",
+      "adapter": "openai_compatible",
+      "requires_api_key": true
+    },
+    {
+      "id": "huggingface",
+      "name": "HuggingFace",
+      "description": "HuggingFace Serverless Inference API",
+      "base_url": "https://router.huggingface.co/v1",
+      "adapter": "openai_compatible",
+      "requires_api_key": true
+    },
+    {
+      "id": "nvidia_nim",
+      "name": "Nvidia Nim",
+      "description": "NVIDIA NIM microservices & GPU platform",
+      "base_url": "https://integrate.api.nvidia.com/v1",
+      "adapter": "openai_compatible",
+      "requires_api_key": true
+    },
+    {
+      "id": "opencode_zen",
+      "name": "OpenCode Zen",
+      "description": "Free public OpenCode Zen endpoint",
+      "base_url": "https://opencode.ai/zen/v1",
+      "adapter": "openai_compatible",
+      "requires_api_key": false,
+      "anonymous_key": "public"
+    },
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "description": "DeepSeek AI models (DeepSeek-V3, DeepSeek-R1)",
+      "base_url": "https://api.deepseek.com",
+      "adapter": "openai_compatible",
+      "requires_api_key": true
+    },
+    {
+      "id": "google",
+      "name": "Google Gemini",
+      "description": "Google Gemini models via OpenAI-compatible endpoint",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "adapter": "openai_compatible",
+      "requires_api_key": true
+    },
+    {
+      "id": "mistral",
+      "name": "Mistral AI",
+      "description": "Mistral AI models (Mistral Large, Codestral, Pixtral)",
+      "base_url": "https://api.mistral.ai/v1",
+      "adapter": "openai_compatible",
+      "requires_api_key": true
+    },
+    {
+      "id": "xai",
+      "name": "xAI Grok",
+      "description": "xAI Grok models (Grok-4, Grok-4.3)",
+      "base_url": "https://api.x.ai/v1",
+      "adapter": "openai_compatible",
+      "requires_api_key": true
+    },
+    {
+      "id": "perplexity",
+      "name": "Perplexity",
+      "description": "Perplexity AI models (Sonar, Sonar Pro)",
+      "base_url": "https://api.perplexity.ai",
+      "adapter": "openai_compatible",
+      "requires_api_key": true
+    },
+    {
+      "id": "cohere",
+      "name": "Cohere",
+      "description": "Cohere Command models (Command R+, Command R7B)",
+      "base_url": "https://api.cohere.com/v1",
+      "adapter": "openai_compatible",
+      "requires_api_key": true
+    },
+    {
+      "id": "alibaba",
+      "name": "Alibaba Qwen",
+      "description": "Alibaba Cloud Qwen models (Qwen3, Qwen2.5)",
+      "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+      "adapter": "openai_compatible",
+      "requires_api_key": true
+    }
+  ]
+}

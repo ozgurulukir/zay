@@ -30,6 +30,7 @@ const tui = @import("../tui.zig");
 const App = tui.App;
 const Mode = App.Mode;
 const provider_model = @import("provider_model.zig");
+const clipboard_helper = @import("clipboard_helper.zig");
 const previousIndex = tui.previousIndex;
 const nextIndex = tui.nextIndex;
 
@@ -44,6 +45,7 @@ pub fn handleCommandKey(app: *App, key: vaxis.Key) !bool {
         .lanes => try Lanes.handle(app, key),
         .help => try HelpPicker.handle(app, key),
         .command => try CommandMenu.handle(app, key),
+        .settings => try SettingsMode.handle(app, key),
         // The diff viewer owns its keys directly in `captureEvent`; nothing
         // reaches the generic dispatch.
         .diff_viewer => false,
@@ -316,6 +318,12 @@ pub const MentionPopup = struct {
 /// there. Auto-scroll follows the navigation state.
 pub const BlockNav = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
+        // Copy selected message block to clipboard via 'y', 'c', or Ctrl+C in block nav.
+        if (app.getBlockNav()) {
+            if (key.matches('y', .{}) or key.matches('c', .{}) or key.matches('c', .{ .ctrl = true })) {
+                if (try clipboard_helper.copySelectedTranscriptBlock(app)) return true;
+            }
+        }
         if (key.matches(vaxis.Key.down, .{ .shift = true })) {
             app.jumpTranscriptToBottom();
             return true;
@@ -368,12 +376,61 @@ pub const LaneSwitch = struct {
 
 pub const HelpPicker = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.escape, .{}) or key.matches(vaxis.Key.enter, .{})) {
+        const body_height: u16 = 21;
+        if (key.matches(vaxis.Key.escape, .{}) or key.matches(vaxis.Key.enter, .{}) or key.matches('q', .{})) {
             app.mode = .normal;
+            app.pickers.help.reset();
             app.clearInput();
             app.clearPaletteInput();
             return true;
         }
+        if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
+            app.pickers.help.scrollUp(1);
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
+            app.pickers.help.scrollDown(1, body_height);
+            return true;
+        }
+        if (key.matches(vaxis.Key.page_up, .{})) {
+            app.pickers.help.scrollUp(8);
+            return true;
+        }
+        if (key.matches(vaxis.Key.page_down, .{})) {
+            app.pickers.help.scrollDown(8, body_height);
+            return true;
+        }
+        if (key.matches(vaxis.Key.home, .{})) {
+            app.pickers.help.scroll = 0;
+            return true;
+        }
+        if (key.matches(vaxis.Key.end, .{})) {
+            const help_picker_mod = @import("widgets/help_picker.zig");
+            app.pickers.help.scroll = help_picker_mod.State.maxScroll(body_height);
+            return true;
+        }
+        return false;
+    }
+};
+
+/// Settings panel mode — tab navigation, toggle, text edit, save.
+const SettingsMode = struct {
+    pub fn handle(app: *App, key: vaxis.Key) !bool {
+        // Text-edit mode: delegate all keys to the inline editor.
+        if (try tui.handleSettingsTextEditKey(app, key)) return true;
+
+        // Ctrl+S: save settings.
+        if (key.matches('s', .{ .ctrl = true })) {
+            _ = try tui.saveSettings(app);
+            return true;
+        }
+        // Delete / Backspace on a non-editing row: clear the field.
+        if (key.matches(vaxis.Key.delete, .{})) {
+            tui.clearSettingsField(app);
+            return true;
+        }
+        // Delegate structural navigation to the State's handleKey.
+        if (app.pickers.settings.handleKey(key)) return true;
         return false;
     }
 };

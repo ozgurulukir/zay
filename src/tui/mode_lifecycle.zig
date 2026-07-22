@@ -9,6 +9,7 @@ const session_mod = @import("../session.zig");
 const vcs = @import("../vcs.zig");
 const lanes_picker = @import("widgets/lanes_picker.zig");
 const tui_status = @import("status.zig");
+const clipboard_helper = @import("clipboard_helper.zig");
 
 const App = tui.App;
 const Command = tui.Command;
@@ -49,6 +50,11 @@ pub fn cancelMode(app: *App) !bool {
         app.provider_key_input.clearRetainingCapacity();
         return true;
     }
+    // Settings: Esc cancels any active text edit, or closes the panel.
+    if (app.mode == .settings) {
+        tui.cancelSettings(app);
+        return true;
+    }
     if (app.mode == .model_picker) {
         provider_model.cancelModelLoad(app);
         app.pickers.models.restore();
@@ -73,6 +79,11 @@ pub fn cancelMode(app: *App) !bool {
 }
 
 pub fn submitMode(app: *App) !bool {
+    // Settings: Enter toggles the selected item.
+    if (app.mode == .settings) {
+        try tui.submitSettings(app);
+        return true;
+    }
     if (app.mode == .provider_picker) {
         if (app.pickers.provider.stage == .form) {
             if (app.pickers.provider.form_handle) |handle| {
@@ -160,6 +171,7 @@ pub fn submitMode(app: *App) !bool {
                 .timeline => provider_model.openTimelineSelector(app) catch |err| try app.reportSessionSwitchError(err),
                 .connect => try provider_model.openProviderPicker(app),
                 .model => provider_model.openModelPicker(app) catch |err| try app.reportConnectionError(err),
+                .settings => tui.openSettings(app),
                 .diff => provider_model.openDiffViewer(app) catch |err| try provider_model.reportDiffError(app, err),
                 .parallel => app.createParallelLane() catch |err| try app.reportLaneError(err),
                 .save => app.beginSave() catch |err| try app.reportLaneError(err),
@@ -208,6 +220,14 @@ pub fn submitMode(app: *App) !bool {
                     const notice_text = try std.fmt.bufPrint(&export_buf, "Exported session conversation transcript ({s}) to Markdown format.", .{sid});
                     _ = try app.thread.transcript.append(app.gpa, .notice, "export", notice_text);
                 },
+                .copy => {
+                    app.mode = .normal;
+                    _ = try clipboard_helper.copySelectedTranscriptBlock(app);
+                },
+                .paste => {
+                    app.mode = .normal;
+                    _ = try clipboard_helper.pasteFromSystemClipboard(app);
+                },
                 .exit_cmd => {
                     app.nav.quit_requested = true;
                 },
@@ -231,7 +251,8 @@ pub fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
         .normal => app.inputs.input.buf.realLength() == 0,
         .session_picker, .model_picker, .tree_picker => app.inputs.palette.buf.realLength() == 0,
         .provider_picker => app.pickers.provider.stage == .list and app.inputs.palette.buf.realLength() == 0,
-        .command, .diff_viewer, .save_message, .lanes, .help => false,
+        // Settings has its own navigation: '/' is not a command shortcut there.
+        .settings, .command, .diff_viewer, .save_message, .lanes, .help => false,
     };
 }
 

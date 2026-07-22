@@ -22,6 +22,7 @@ const tui = @import("../tui.zig");
 const App = tui.App;
 const RootWidget = tui.RootWidget;
 const provider_model = @import("provider_model.zig");
+const clipboard_helper = @import("clipboard_helper.zig");
 
 const command_router = @import("command_router.zig");
 
@@ -38,6 +39,10 @@ pub fn captureEvent(
         .init => try routeInit(app, root, ctx),
         .mouse => |mouse| try routeMouse(app, root, ctx, mouse),
         .key_press => |key| try routeKey(app, root, ctx, key),
+        .paste => |text| {
+            try clipboard_helper.pasteToFocusedInput(app, text);
+            ctx.consumeAndRedraw();
+        },
         else => {},
     }
 }
@@ -65,6 +70,18 @@ fn routeMouse(
     // Scrolling may bring the logo back into view; the tick stops itself
     // again on the next frame if it didn't.
     try root.ensureTick(ctx);
+    if (app.getMode() == .help) {
+        if (mouse.button == .wheel_up) {
+            app.pickers.help.scrollUp(2);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (mouse.button == .wheel_down) {
+            app.pickers.help.scrollDown(2, 21);
+            ctx.consumeAndRedraw();
+            return;
+        }
+    }
     if (mouse.button == .wheel_up) app.setThreadAutoScroll(false);
     if (mouse.button == .wheel_down) app.updateMouseAutoScroll();
     if (mouse.type == .press and mouse.button == .left) {
@@ -91,6 +108,13 @@ fn routeKey(
         try root.handleDiffViewerEvent(ctx, key);
         return;
     }
+    // Global Ctrl+V / Shift+Insert clipboard paste into active input.
+    if (key.matches('v', .{ .ctrl = true }) or key.matches(vaxis.Key.insert, .{ .shift = true })) {
+        if (try clipboard_helper.pasteFromSystemClipboard(app)) {
+            ctx.consumeAndRedraw();
+            return;
+        }
+    }
     if (key.matches(vaxis.Key.escape, .{})) {
         if (app.getBackgroundModal()) {
             app.setBackgroundModal(false);
@@ -108,6 +132,22 @@ fn routeKey(
             return;
         }
         if (try app.cancelMode()) {
+            try root.syncFocus(ctx);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (app.getBlockNav() or app.thread.transcript.selected != null) {
+            app.setBlockNav(false);
+            app.thread.transcript.selected = null;
+            app.setThreadAutoScroll(true);
+            try root.syncFocus(ctx);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (app.inputRealLength() > 0) {
+            app.clearInput();
+            app.closeAtSearch();
+            app.clearPendingQuitAt();
             try root.syncFocus(ctx);
             ctx.consumeAndRedraw();
             return;
