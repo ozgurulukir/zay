@@ -4,17 +4,10 @@ Cross-linked index for project management artifacts.
 
 ## Projects (active)
 
-*(none — both TUI split projects completed and archived)*
-
-## Areas (ongoing)
-
-- [architecture](Areas/architecture/) — Codebase structure, module boundaries, layering
-  - See tci-bfg skill output and `src/tui.zig` as canonical examples of where it breaks
-
-## Resources (reference)
-
-- AGENTS.md — top-level rules
-- `src/` — current code
+- [tui-domain-extract-2](Projects/tui-domain-extract-2/) — Continue Strangler Fig extraction from `tui.zig`
+  - State: Phase 1 (queue) done. `tui.zig` 4141 → **4097**.
+  - Created: 2026-07-22
+  - Plan: background modal, checkpoint, turn lifecycle, agent event, save, command palette, RootWidget, init/deinit.
 
 ## Archives
 

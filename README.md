@@ -47,6 +47,7 @@ concern:
 - `transcript_nav.zig` — transcript scrolling, auto-scroll, long-message paging.
 - `permission.zig` — tool-call approval/rejection overlay.
 - `event_callbacks.zig` — vxfw input-change callbacks (`inputChanged`, `paletteInputChanged`).
+- `queue.zig` — enqueue, flush, and navigate queued user messages.
 - `layout.zig` — `rootLayout` math for `drawRoot` (transcript / loading / input row split).
 - `lane_column.zig` — per-lane bordered transcript column (split view).
 - `diff_viewer_overlay.zig` — full-screen `/diff` overlay.
