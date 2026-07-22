@@ -919,7 +919,7 @@ pub const Agent = struct {
     /// size estimate of every message appended since (tool results, queued user
     /// turns) — the part the provider has not accounted for yet. Falls back to
     /// a full estimate when no usage has been reported.
-    fn currentContextTokens(self: *Agent) u32 {
+    pub fn currentContextTokens(self: *Agent) u32 {
         const usage = self.last_usage orelse return self.estimateContextTokens();
         const anchored = usage.input_tokens +| usage.output_tokens;
         return anchored +| self.estimateTrailingTokens(self.last_usage_anchor_count);

@@ -494,8 +494,22 @@ pub const InputWidget = struct {
             tui_status.formatModelStatus(ctx.arena, status) catch ""
         else
             "";
-        const pct: u32 = if (self.app.metrics.context_tokens_max > 0 and self.app.metrics.context_tokens_used > 0)
-            @min(100, (self.app.metrics.context_tokens_used * 100) / self.app.metrics.context_tokens_max)
+        const live_context_max: u32 = if (self.app.liveRuntime()) |rt|
+            rt.agent.context_window_tokens
+        else if (self.app.metrics.context_tokens_max > 0)
+            self.app.metrics.context_tokens_max
+        else
+            128000;
+
+        const live_context_used: u32 = if (self.app.liveRuntime()) |rt|
+            rt.agent.currentContextTokens()
+        else if (self.app.metrics.context_tokens_used > 0)
+            self.app.metrics.context_tokens_used
+        else
+            0;
+
+        const pct: u32 = if (live_context_max > 0 and live_context_used > 0)
+            @min(100, (live_context_used * 100) / live_context_max)
         else
             0;
         const ctx_bar = formatContextBar(ctx.arena, pct) catch "";

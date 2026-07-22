@@ -99,11 +99,8 @@ pub fn main(init: std.process.Init) !void {
     try file.writeStreamingAll(io, out.written());
 }
 
-fn isAllowed(provider: []const u8) bool {
-    for (allowed_providers) |allowed| {
-        if (std.mem.eql(u8, allowed, provider)) return true;
-    }
-    return false;
+fn isAllowed(_: []const u8) bool {
+    return true;
 }
 
 /// Read an integer field out of a models.dev `limit` object, clamped into the
