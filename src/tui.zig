@@ -82,7 +82,8 @@ const long_message_scroll_step_rows: u16 = 3;
 /// How many recent parent-lane messages ride along as branch-naming context
 /// when a lane is forked with `/parallel`.
 pub const lane_naming_context_max: usize = 3;
-pub const TranscriptNavigation = enum { previous, next };
+const transcript_nav = @import("tui/transcript_nav.zig");
+pub const TranscriptNavigation = transcript_nav.TranscriptNavigation;
 const at_search_mod = @import("tui/at_search.zig");
 pub const MentionSearchKind = at_search_mod.MentionSearchKind;
 
@@ -1602,9 +1603,7 @@ pub const App = struct {
     }
 
     pub fn selectionIsLastMessage(self: *const App) bool {
-        const selected = self.thread.transcript.selected orelse return false;
-        if (self.thread.transcript.messages.items.len == 0) return false;
-        return selected == self.thread.transcript.messages.items.len - 1;
+        return transcript_nav.selectionIsLastMessage(self);
     }
 
     pub fn diffCountsVisible(self: *const App) bool {
@@ -1628,107 +1627,25 @@ pub const App = struct {
     }
 
     pub fn jumpTranscriptToBottom(self: *App) void {
-        self.nav.block_nav = false;
-        self.thread.transcript.selectLast();
-        self.thread.auto_scroll = true;
-        self.thread.transcript_list.scroll.pending_lines = 0;
-        self.thread.transcript_list.scroll.wants_cursor = false;
+        transcript_nav.jumpTranscriptToBottom(self);
     }
 
     pub fn updateMouseAutoScroll(self: *App) void {
-        self.thread.auto_scroll = !self.thread.transcript_list.scroll.has_more and
-            self.selectionIsLastMessage() and
-            !self.selectedMessageIsLong();
+        transcript_nav.updateMouseAutoScroll(self);
     }
 
-    pub fn navigateTranscript(self: *App, direction: TranscriptNavigation) bool {
-        self.thread.auto_scroll = false;
-        if (self.scrollSelectedLongMessage(direction)) return true;
-
-        const selected_before = self.thread.transcript.selected;
-        switch (direction) {
-            .previous => self.thread.transcript.moveSelection(.previous),
-            .next => self.thread.transcript.moveSelection(.next),
-        }
-        if (self.thread.transcript.selected != selected_before) self.anchorSelectedLongMessage(direction);
-        return false;
-    }
-
-    fn scrollSelectedLongMessage(self: *App, direction: TranscriptNavigation) bool {
-        const selected = self.thread.transcript.selected orelse return false;
-        if (selected >= self.thread.transcript.messages.items.len) return false;
-        const rows = messageRowsCached(&self.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(self.thread.transcript_view_width));
-        const height = self.thread.transcript_view_height;
-        if (rows <= height) return false;
-        const rows_hidden = rows - height;
-        const step = scrollStepRows(height);
-
-        switch (direction) {
-            .next => {
-                const offset = self.selectedMessageOffset(selected);
-                if (offset >= rows_hidden) return false;
-                self.setSelectedMessageOffset(selected, @min(rows_hidden, offset + step));
-                return true;
-            },
-            .previous => {
-                const offset = self.selectedMessageOffset(selected);
-                if (offset == 0) return false;
-                self.setSelectedMessageOffset(selected, offset - @min(offset, step));
-                return true;
-            },
-        }
+    pub fn navigateTranscript(self: *App, direction: transcript_nav.TranscriptNavigation) bool {
+        return transcript_nav.navigateTranscript(self, direction);
     }
 
     pub fn selectedMessageIsLong(self: *const App) bool {
-        const selected = self.thread.transcript.selected orelse return false;
-        if (selected >= self.thread.transcript.messages.items.len) return false;
-        const rows = messageRowsCached(&self.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(self.thread.transcript_view_width));
-        return rows > self.thread.transcript_view_height;
+        return transcript_nav.selectedMessageIsLong(self);
     }
 
-    /// True when the selected message is taller than the viewport and still has
-    /// rows hidden below the current scroll offset (mirrors the `.next` branch of
-    /// `scrollSelectedLongMessage`).
     pub fn selectedMessageCanScrollDown(self: *const App) bool {
-        const selected = self.thread.transcript.selected orelse return false;
-        if (selected >= self.thread.transcript.messages.items.len) return false;
-        const rows = messageRowsCached(&self.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(self.thread.transcript_view_width));
-        const height = self.thread.transcript_view_height;
-        if (rows <= height) return false;
-        return self.selectedMessageOffset(selected) < rows - height;
-    }
-
-    fn anchorSelectedLongMessage(self: *App, direction: TranscriptNavigation) void {
-        const selected = self.thread.transcript.selected orelse return;
-        if (selected >= self.thread.transcript.messages.items.len) return;
-        const rows = messageRowsCached(&self.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(self.thread.transcript_view_width));
-        const height = self.thread.transcript_view_height;
-        if (rows <= height) return;
-        const offset = switch (direction) {
-            .next => 0,
-            .previous => rows - height,
-        };
-        self.setSelectedMessageOffset(selected, offset);
-    }
-
-    fn selectedMessageOffset(self: *const App, selected: u32) u16 {
-        if (self.thread.transcript_list.scroll.top == selected) return @intCast(@max(self.thread.transcript_list.scroll.offset, 0));
-        return 0;
-    }
-
-    fn setSelectedMessageOffset(self: *App, selected: u32, offset: u16) void {
-        self.thread.transcript_list.cursor = selected;
-        self.thread.transcript_list.scroll.top = selected;
-        self.thread.transcript_list.scroll.offset = @intCast(offset);
-        self.thread.transcript_list.scroll.pending_lines = 0;
-        self.thread.transcript_list.scroll.wants_cursor = false;
+        return transcript_nav.selectedMessageCanScrollDown(self);
     }
 };
-
-fn scrollStepRows(height: u16) u16 {
-    if (height == 0) return 1;
-    return @min(height, long_message_scroll_step_rows);
-}
 
 pub fn nextIndex(current: u32, count: u32) u32 {
     if (count == 0) return 0;
@@ -2567,9 +2484,9 @@ test "down scrolls through selected long message before moving selection" {
 }
 
 test "long message scroll uses a small fixed step" {
-    try std.testing.expectEqual(@as(u16, 1), scrollStepRows(1));
-    try std.testing.expectEqual(@as(u16, 2), scrollStepRows(2));
-    try std.testing.expectEqual(@as(u16, 3), scrollStepRows(20));
+    try std.testing.expectEqual(@as(u16, 1), transcript_nav.scrollStepRows(1));
+    try std.testing.expectEqual(@as(u16, 2), transcript_nav.scrollStepRows(2));
+    try std.testing.expectEqual(@as(u16, 3), transcript_nav.scrollStepRows(20));
 }
 
 test "down at latest long message bottom does not loop to top" {
@@ -2584,7 +2501,7 @@ test "down at latest long message bottom does not loop to top" {
     app.thread.transcript_view_width = 80;
     app.thread.transcript_view_height = 4;
     const offset = messageRowsCached(&app.thread.transcript.messages.items[0], ConversationLayout.contentWidth(app.thread.transcript_view_width)) - app.thread.transcript_view_height;
-    app.setSelectedMessageOffset(0, offset);
+    transcript_nav.setSelectedMessageOffset(&app, 0, offset);
 
     const scrolled = app.navigateTranscript(.next);
 
@@ -2605,7 +2522,7 @@ test "down moves after selected long message bottom is visible" {
     app.thread.transcript.selected = 0;
     app.thread.transcript_view_width = 80;
     app.thread.transcript_view_height = 4;
-    app.setSelectedMessageOffset(0, messageRowsCached(&app.thread.transcript.messages.items[0], ConversationLayout.contentWidth(app.thread.transcript_view_width)) - app.thread.transcript_view_height);
+    transcript_nav.setSelectedMessageOffset(&app, 0, messageRowsCached(&app.thread.transcript.messages.items[0], ConversationLayout.contentWidth(app.thread.transcript_view_width)) - app.thread.transcript_view_height);
 
     const scrolled = app.navigateTranscript(.next);
 
@@ -2709,7 +2626,7 @@ test "awaiting turn preserves selected long message inner scroll" {
     app.thread.transcript.selected = 0;
     app.thread.auto_scroll = false;
     app.thread.turn_view.awaitModel();
-    app.setSelectedMessageOffset(0, 3);
+    transcript_nav.setSelectedMessageOffset(&app, 0, 3);
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
