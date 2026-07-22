@@ -87,6 +87,7 @@ pub const TranscriptNavigation = transcript_nav.TranscriptNavigation;
 const at_search_mod = @import("tui/at_search.zig");
 const permission_mod = @import("tui/permission.zig");
 const event_callbacks = @import("tui/event_callbacks.zig");
+const queue_mod = @import("tui/queue.zig");
 pub const MentionSearchKind = at_search_mod.MentionSearchKind;
 
 /// A single-row clickable region on screen (absolute coordinates). Used to
@@ -1258,76 +1259,31 @@ pub const App = struct {
     // --- Queue management ------------------------------------------------
 
     fn enqueueSubmit(self: *App) !bool {
-        const prompt = try self.inputs.input.buf.dupe();
-        errdefer self.gpa.free(prompt);
-        if (prompt.len == 0) {
-            self.gpa.free(prompt);
-            return false;
-        }
-        self.thread.agent.?.enqueueUser(prompt) catch |err| switch (err) {
-            error.QueueFull => {
-                self.gpa.free(prompt);
-                try self.appendMessageQueueFullNotice();
-                return false;
-            },
-            else => return err,
-        };
-        try self.thread.queued.append(self.gpa, .{ .text = prompt });
-        self.nav.queued_selection = self.thread.queued.items.len - 1;
-        self.clearInput();
-        return false;
+        return queue_mod.enqueueSubmit(self);
     }
 
     pub fn selectPrevQueued(self: *App) void {
-        if (self.thread.queued.items.len == 0) return;
-        if (self.nav.queued_selection > 0) self.nav.queued_selection -= 1;
+        queue_mod.selectPrevQueued(self);
     }
 
     pub fn selectNextQueued(self: *App) void {
-        const len = self.thread.queued.items.len;
-        if (len == 0) return;
-        if (self.nav.queued_selection + 1 < len) self.nav.queued_selection += 1;
+        queue_mod.selectNextQueued(self);
     }
 
     pub fn steerSelectedQueued(self: *App) void {
-        const items = self.thread.queued.items;
-        if (items.len == 0) return;
-        const index = @min(self.nav.queued_selection, items.len - 1);
-        items[index].steer = true;
-        self.thread.agent.?.setQueuedSteer(@intCast(index));
-    }
-
-    fn appendMessageQueueFullNotice(self: *App) !void {
-        _ = try self.thread.transcript.append(self.gpa, .notice, "notice", "MessageQueueFull");
-    }
-
-    fn appendSkillInvocationsToTranscript(self: *App, prompt: []const u8) !void {
-        const runtime = self.liveRuntime() orelse return;
-        const names = try skill_mod.collectInvocations(self.gpa, runtime.skills, prompt);
-        defer self.gpa.free(names);
-        for (names) |name| {
-            const title = try std.fmt.allocPrint(self.gpa, "[SKILL] {s}", .{name});
-            defer self.gpa.free(title);
-            _ = try self.thread.transcript.append(self.gpa, .skill, title, "");
-        }
+        queue_mod.steerSelectedQueued(self);
     }
 
     fn flushQueuedUserMessagesToTranscript(self: *App, count: u32) !void {
-        const flush_count: usize = @min(count, self.thread.queued.items.len);
-        for (self.thread.queued.items[0..flush_count]) |message| {
-            _ = try self.thread.transcript.append(self.gpa, .user, "you", message.text);
-            try self.appendSkillInvocationsToTranscript(message.text);
-            self.gpa.free(message.text);
-        }
-        std.mem.copyForwards(Thread.QueuedMessage, self.thread.queued.items[0 .. self.thread.queued.items.len - flush_count], self.thread.queued.items[flush_count..]);
-        self.thread.queued.shrinkRetainingCapacity(self.thread.queued.items.len - flush_count);
-        self.nav.queued_selection -|= flush_count;
+        return queue_mod.flushQueuedUserMessagesToTranscript(self, count);
+    }
+
+    fn appendSkillInvocationsToTranscript(self: *App, prompt: []const u8) !void {
+        return queue_mod.appendSkillInvocationsToTranscript(self, prompt);
     }
 
     fn clearQueuedUserMessages(self: *App) void {
-        for (self.thread.queued.items) |message| self.gpa.free(message.text);
-        self.thread.queued.clearRetainingCapacity();
-        self.nav.queued_selection = 0;
+        queue_mod.clearQueuedUserMessages(self);
     }
 
     /// Spawn a parallel lane: a fresh `git worktree` on its own `nova/<id>`
