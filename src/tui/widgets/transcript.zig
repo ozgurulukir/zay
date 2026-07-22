@@ -42,6 +42,7 @@ pub const TranscriptWidget = struct {
             .loading_frame = self.app.metrics.loading_frame,
             .blackhole_frame = self.app.metrics.blackhole_frame,
             .gpa = self.app.gpa,
+            .app = self.app,
         };
         self.thread.transcript_list.children = .{ .builder = .{ .userdata = &builder, .buildFn = MessageListBuilder.build } };
         self.thread.transcript_list.item_count = @intCast(self.thread.transcript.messages.items.len);
@@ -114,6 +115,7 @@ const MessageListBuilder = struct {
     loading_frame: u8,
     blackhole_frame: u16,
     gpa: std.mem.Allocator,
+    app: ?*const tui.App = null,
 
     fn build(ptr: *const anyopaque, idx: usize, cursor: usize) ?vxfw.Widget {
         _ = cursor;
@@ -126,6 +128,7 @@ const MessageListBuilder = struct {
             .loading_frame = self.loading_frame,
             .blackhole_frame = self.blackhole_frame,
             .gpa = self.gpa,
+            .app = self.app,
         };
         return body.widget();
     }

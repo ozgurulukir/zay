@@ -8,6 +8,9 @@ const tui_metrics = @import("../metrics.zig");
 const tui_style = @import("../style.zig");
 const blackhole = @import("../blackhole.zig");
 
+const tui_status = @import("../status.zig");
+const App = @import("../../tui.zig").App;
+
 const logo_text = "N.O.V.A";
 const logo_connect_text = "/connect to begin building";
 const intro_x_padding: u16 = 7;
@@ -54,6 +57,7 @@ pub const MessageWidget = struct {
     /// frame arena (`ctx.arena`) is reset every draw, so the cache that must
     /// survive between frames is allocated from here instead.
     gpa: std.mem.Allocator,
+    app: ?*const App = null,
 
     pub fn widget(self: *MessageWidget) vxfw.Widget {
         return .{
@@ -96,7 +100,7 @@ pub const MessageWidget = struct {
             .notice => drawWrapped(surface, self.message.body, StylePalette.notice, styled_as_selected, &row, ctx, 2, StylePalette.notice),
             .success => drawWrapped(surface, self.message.body, StylePalette.tool, styled_as_selected, &row, ctx, 2, StylePalette.tool),
             .info => drawWrapped(surface, self.message.body, StylePalette.info, styled_as_selected, &row, ctx, 2, StylePalette.info),
-            .logo => drawIntro(surface, self.blackhole_frame, &row, ctx),
+            .logo => self.drawIntro(surface, self.blackhole_frame, &row, ctx),
             .tool => {
                 const title_style = if (self.message.failed) StylePalette.tool_failed else StylePalette.tool;
                 drawToolTitle(surface, self.message.*, title_style, styled_as_selected, self.loading_frame, &row, ctx);
@@ -206,10 +210,10 @@ pub const MessageWidget = struct {
         return null;
     }
 
-    fn drawIntro(surface: *vxfw.Surface, frame_index: u16, row: *u16, ctx: vxfw.DrawContext) void {
+    fn drawIntro(self: *MessageWidget, surface: *vxfw.Surface, frame_index: u16, row: *u16, ctx: vxfw.DrawContext) void {
         const row_start = row.*;
         drawBlackhole(surface, frame_index, row_start);
-        drawLogo(surface, row_start + logo_row_offset, ctx);
+        self.drawLogo(surface, row_start + logo_row_offset, ctx);
         row.* = row_start + blackhole.rows;
     }
 
@@ -226,7 +230,7 @@ pub const MessageWidget = struct {
         }
     }
 
-    fn drawLogo(surface: *vxfw.Surface, row_start: u16, ctx: vxfw.DrawContext) void {
+    fn drawLogo(self: *MessageWidget, surface: *vxfw.Surface, row_start: u16, ctx: vxfw.DrawContext) void {
         const col_start = ConversationLayout.left + intro_x_padding + blackhole.cols + logo_gap;
         if (col_start >= surface.size.width -| ConversationLayout.right) return;
 
@@ -240,6 +244,9 @@ pub const MessageWidget = struct {
             line_start = line_end + 1;
         }
 
+        if (self.app) |app| {
+            if (tui_status.modelStatus(app.liveRuntime(), app.cached_config) != null) return;
+        }
         writeLogoLine(surface, logo_connect_text, row + 1, col_start, ctx);
     }
 
