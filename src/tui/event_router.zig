@@ -23,6 +23,8 @@ const App = tui.App;
 const RootWidget = tui.RootWidget;
 const provider_model = @import("provider_model.zig");
 
+const command_router = @import("command_router.zig");
+
 /// Top-level event entry, called by vxfw for every event the root receives.
 ///
 /// Forwards to the per-event-kind handlers below.
@@ -190,7 +192,7 @@ fn routeKey(
         ctx.consumeAndRedraw();
         return;
     }
-    if (key.matches(vaxis.Key.enter, .{})) {
+    if (command_router.isEnterKey(key)) {
         if (app.isAtSearchActive() and app.atSearchHasResults()) {
             try app.acceptAtSelection();
             ctx.consumeAndRedraw();

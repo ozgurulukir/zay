@@ -95,7 +95,7 @@ pub const OverlayWidget = struct {
     fn drawOverlay(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *OverlayWidget = @ptrCast(@alignCast(ptr));
         const size = if (self.app.mode == .provider_picker and self.app.pickers.provider.stage == .form)
-            OverlaySize{ .width = 64, .height = 6 }
+            OverlaySize{ .width = 72, .height = 12 }
         else
             overlaySize(self.app.mode);
         const max_w: u16 = ctx.max.width orelse size.width;
@@ -286,6 +286,7 @@ const OverlayInner = struct {
             // how the picker iterates its rows.
             .statuses = &app.conn_status,
             .key_input = app.provider_key_input.items,
+            .api_keys = &app.provider_api_keys,
         };
         return content.widget().draw(ctx);
     }

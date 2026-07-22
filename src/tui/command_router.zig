@@ -92,19 +92,37 @@ const TreePicker = struct {
 };
 
 /// Provider picker mode (provider list + API-key setup form).
-///
-/// The setup form hosts its own inline API-key editor: capture typed text
-/// and backspace here so nothing leaks to the (unused) overlay search row.
-/// In list stage, delegate to the picker widget's own handleKey.
+/// Check if a key event corresponds to Enter/Return across terminal protocols and encodings.
+pub fn isEnterKey(key: vaxis.Key) bool {
+    if (key.matches(vaxis.Key.enter, .{})) return true;
+    if (key.codepoint == '\r' or key.codepoint == '\n') return true;
+    if (key.codepoint == vaxis.Key.enter) return true;
+    if (key.text) |text| {
+        if (std.mem.eql(u8, text, "\r") or std.mem.eql(u8, text, "\n") or std.mem.eql(u8, text, "\r\n")) return true;
+    }
+    return false;
+}
+
 const ProviderPicker = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
         if (app.getProviderPicker().stage == .form) {
+            app.getProviderPicker().form_error = null;
+            if (key.matches(vaxis.Key.escape, .{})) return false;
+            if (isEnterKey(key)) return false;
+
             if (key.matches(vaxis.Key.backspace, .{})) {
                 app.popProviderKeyInput();
                 return true;
             }
             if (key.text) |text| {
-                try app.getProviderKeyInput().appendSlice(app.gpa, text);
+                const trimmed = std.mem.trim(u8, text, "\r\n");
+                if (trimmed.len > 0) {
+                    try app.getProviderKeyInput().appendSlice(app.gpa, trimmed);
+                    return true;
+                }
+            } else if (key.codepoint >= 32 and key.codepoint <= 126 and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
+                const byte: u8 = @intCast(key.codepoint);
+                try app.getProviderKeyInput().append(app.gpa, byte);
                 return true;
             }
             // Swallow everything else (arrows, tab) — Enter/Esc are handled upstream.
@@ -359,3 +377,44 @@ pub const HelpPicker = struct {
         return false;
     }
 };
+
+const agent_mod = @import("../agent.zig");
+
+test "provider picker setup form captures key codepoints and text without swallowing Enter" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.pickers.provider.stage = .form;
+
+    try std.testing.expect(try ProviderPicker.handle(&app, .{ .codepoint = 's' }));
+    try std.testing.expectEqualStrings("s", app.provider_key_input.items);
+
+    try std.testing.expect(try ProviderPicker.handle(&app, .{ .codepoint = 'k' }));
+    try std.testing.expectEqualStrings("sk", app.provider_key_input.items);
+
+    try std.testing.expect(try ProviderPicker.handle(&app, .{ .codepoint = vaxis.Key.backspace }));
+    try std.testing.expectEqualStrings("s", app.provider_key_input.items);
+
+    try std.testing.expect(!try ProviderPicker.handle(&app, .{ .codepoint = vaxis.Key.enter }));
+}
+
+test "provider picker setup form submit with empty key sets form_error" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.mode = .provider_picker;
+    app.pickers.provider.stage = .form;
+    app.pickers.provider.form_handle = .{ .builtin = .openrouter };
+
+    provider_model.submitProviderSetup(&app, .openrouter) catch {};
+    try std.testing.expect(app.pickers.provider.form_error != null);
+
+    _ = try ProviderPicker.handle(&app, .{ .codepoint = 'a' });
+    try std.testing.expect(app.pickers.provider.form_error == null);
+}

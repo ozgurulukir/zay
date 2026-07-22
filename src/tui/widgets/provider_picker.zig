@@ -6,15 +6,12 @@ const panel = @import("panel.zig");
 const message = @import("message.zig");
 const tui_style = @import("../style.zig");
 const config_mod = @import("../../config.zig");
+const modelsdev = @import("../../modelsdev.zig");
+const codex = @import("../../codex.zig");
 
 const StylePalette = tui_style.Palette;
-
 const assert = std.debug.assert;
 
-/// Per-provider connection state shown as the row badge. Derived from the model
-/// load's per-provider outcome (see `model_loader.ProviderOutcome`): `connected`
-/// when the provider returned at least one usable model, `failed` when it was
-/// configured but returned none / errored, `unknown` when not configured.
 pub const Status = enum { unknown, connected, failed };
 
 pub const Stage = enum { list, form };
@@ -24,22 +21,64 @@ pub const Action = union(enum) {
     connect_codex,
     sign_out_codex,
     open_form: config_mod.Provider,
+    open_dynamic: modelsdev.Provider,
+};
+
+pub const ProviderHandle = union(enum) {
+    builtin: config_mod.Provider,
+    dynamic: modelsdev.Provider,
+
+    pub fn displayName(self: ProviderHandle) []const u8 {
+        return switch (self) {
+            .builtin => |b| b.displayName(),
+            .dynamic => |d| d.name,
+        };
+    }
+
+    pub fn description(self: ProviderHandle) []const u8 {
+        return switch (self) {
+            .builtin => |b| b.description(),
+            .dynamic => |d| d.description,
+        };
+    }
+
+    pub fn defaultBaseUrl(self: ProviderHandle) ?[]const u8 {
+        return switch (self) {
+            .builtin => |b| b.defaultBaseUrl(),
+            .dynamic => |d| if (d.base_url.len > 0) d.base_url else null,
+        };
+    }
+
+    pub fn requiresApiKey(self: ProviderHandle) bool {
+        return switch (self) {
+            .builtin => |b| b.requiresApiKey(),
+            .dynamic => |d| d.requires_api_key,
+        };
+    }
 };
 
 pub const State = struct {
     stage: Stage = .list,
     selection: u32 = 0,
     column: Column = .provider,
-    form_provider: ?config_mod.Provider = null,
+    form_handle: ?ProviderHandle = null,
+    form_error: ?[]const u8 = null,
+    /// Dynamic models.dev providers shown below the builtin catalogue.
+    dynamics: []const modelsdev.Provider = &.{},
 
     pub fn reset(self: *State) void {
-        self.* = .{};
+        self.* = .{ .dynamics = self.dynamics };
+    }
+
+    pub fn rowCount(self: *const State) u32 {
+        return 1 + @as(u32, @intCast(config_mod.catalogueProviders().len + self.dynamics.len));
     }
 
     pub fn handleKey(self: *State, key: vaxis.Key, codex_signed_in: bool) bool {
         if (self.stage == .form) return false;
 
-        const count = rowCount();
+        const count = self.rowCount();
+        if (count == 0) return false;
         assert(self.selection < count);
         if (key.matches(vaxis.Key.left, .{})) {
             self.column = .provider;
@@ -63,21 +102,40 @@ pub const State = struct {
             self.column = .provider;
             return true;
         }
+        if (key.matches(vaxis.Key.page_up, .{})) {
+            self.selection = self.selection -| 10;
+            self.column = .provider;
+            return true;
+        }
+        if (key.matches(vaxis.Key.page_down, .{})) {
+            self.selection = @min(count - 1, self.selection + 10);
+            self.column = .provider;
+            return true;
+        }
         return false;
     }
 
     pub fn selectedAction(self: *const State) Action {
-        assert(self.selection < rowCount());
+        const count = self.rowCount();
+        assert(self.selection < count);
         if (self.selection == 0) {
             if (self.column == .sign_out) return .sign_out_codex;
             return .connect_codex;
         }
-        return .{ .open_form = config_mod.catalogueProviders()[self.selection - 1] };
+        const builtin_count = config_mod.catalogueProviders().len;
+        const i = self.selection - 1;
+        if (i < builtin_count) {
+            return .{ .open_form = config_mod.catalogueProviders()[i] };
+        }
+        return .{ .open_dynamic = self.dynamics[i - builtin_count] };
     }
 
     pub fn selectedProvider(self: *const State) ?config_mod.Provider {
         if (self.selection == 0) return null;
-        return config_mod.catalogueProviders()[self.selection - 1];
+        const builtin_count = config_mod.catalogueProviders().len;
+        const i = self.selection - 1;
+        if (i < builtin_count) return config_mod.catalogueProviders()[i];
+        return null;
     }
 };
 
@@ -86,6 +144,7 @@ pub const Content = struct {
     codex_signed_in: bool,
     statuses: []const Status,
     key_input: []const u8 = "",
+    api_keys: ?*const codex.ApiKeyMap = null,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -105,19 +164,42 @@ pub const Content = struct {
     }
 
     fn drawList(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
-        try self.drawCodex(surface, ctx);
-        const providers = config_mod.catalogueProviders();
-        for (providers, 0..) |provider, index| {
-            const row: u16 = @intCast(index + 1);
-            const focused = self.state.selection == row and self.state.column == .provider;
-            const prefix = "  ";
-            const base = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, provider.displayName() });
-            try panel.commandLine(surface, row, base, ctx, focused);
-            const status = if (index < self.statuses.len) self.statuses[index] else .unknown;
-            try drawBadge(surface, ctx, row, base, status, focused);
+        const builtins = config_mod.catalogueProviders();
+        const total_count = 1 + @as(u32, @intCast(builtins.len + self.state.dynamics.len));
+        const viewport = panel.ViewportWindow.compute(self.state.selection, total_count, surface.size.height);
+        if (viewport.visible_height == 0) return;
 
-            const desc_style = if (focused) StylePalette.selected_item else StylePalette.thinking_body;
-            _ = panel.writeBorderTextEndingAt(surface, ctx, row, surface.size.width -| 2, provider.description(), desc_style);
+        var i: u32 = viewport.start_index;
+        while (i < viewport.end_index) : (i += 1) {
+            const row = viewport.screenRow(i);
+            if (i == 0) {
+                try self.drawCodex(surface, ctx, row);
+            } else if (i - 1 < builtins.len) {
+                const index = i - 1;
+                const provider = builtins[index];
+                const focused = self.state.selection == i and self.state.column == .provider;
+                const prefix = "  ";
+                const base = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, provider.displayName() });
+                try panel.commandLine(surface, row, base, ctx, focused);
+                const status = if (index < self.statuses.len) self.statuses[index] else .unknown;
+                try drawBadge(surface, ctx, row, base, status, focused);
+                const desc_style = if (focused) StylePalette.selected_item else StylePalette.thinking_body;
+                _ = panel.writeBorderTextEndingAt(surface, ctx, row, surface.size.width -| 2, provider.description(), desc_style);
+            } else {
+                const index = i - 1 - builtins.len;
+                const provider = self.state.dynamics[index];
+                const focused = self.state.selection == i and self.state.column == .provider;
+                const prefix = "  ";
+                const base = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, provider.name });
+                try panel.commandLine(surface, row, base, ctx, focused);
+                const status: Status = if (self.api_keys) |keys|
+                    (if (keys.get(provider.id) != null) .connected else .unknown)
+                else
+                    .unknown;
+                try drawBadge(surface, ctx, row, base, status, focused);
+                const desc_style = if (focused) StylePalette.selected_item else StylePalette.thinking_body;
+                _ = panel.writeBorderTextEndingAt(surface, ctx, row, surface.size.width -| 2, provider.description, desc_style);
+            }
         }
     }
 
@@ -144,59 +226,70 @@ pub const Content = struct {
         try panel.lineStyledAt(surface, row, text, ctx, badge_col, tui_style.onSelectionBg(style, focused));
     }
 
-    fn drawCodex(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
+    fn drawCodex(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16) !void {
         const row_selected = self.state.selection == 0;
         const provider_focused = row_selected and self.state.column == .provider;
-        if (row_selected) panel.fillRow(surface, 0, StylePalette.selected);
+        if (row_selected) panel.fillRow(surface, row, StylePalette.selected);
 
         const prefix = "  ";
         const base = try std.fmt.allocPrint(ctx.arena, "{s}OpenAI Codex", .{prefix});
         const base_style = if (provider_focused) StylePalette.selected_item else tui_style.onSelectionBg(StylePalette.thinking_body, row_selected);
-        try panel.lineStyledAt(surface, 0, base, ctx, message.ConversationLayout.left -| 1, base_style);
+        try panel.lineStyledAt(surface, row, base, ctx, message.ConversationLayout.left -| 1, base_style);
         if (self.codex_signed_in) {
             const badge_col: u16 = (message.ConversationLayout.left -| 1) +
                 @as(u16, @intCast(@min(ctx.stringWidth(base), @as(usize, std.math.maxInt(u16)))));
-            try panel.lineStyledAt(surface, 0, " [CONNECTED]", ctx, badge_col, tui_style.onSelectionBg(StylePalette.success, row_selected));
-            try self.drawSignOut(surface, ctx, row_selected);
+            try panel.lineStyledAt(surface, row, " [CONNECTED]", ctx, badge_col, tui_style.onSelectionBg(StylePalette.success, row_selected));
+            try self.drawSignOut(surface, ctx, row, row_selected);
         } else {
             const desc_style = if (provider_focused) StylePalette.selected_item else StylePalette.thinking_body;
-            _ = panel.writeBorderTextEndingAt(surface, ctx, 0, surface.size.width -| 2, "OpenAI ChatGPT & Codex OAuth authentication", desc_style);
+            _ = panel.writeBorderTextEndingAt(surface, ctx, row, surface.size.width -| 2, "OpenAI ChatGPT & Codex OAuth authentication", desc_style);
         }
     }
 
-    fn drawSignOut(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext, row_selected: bool) !void {
+    fn drawSignOut(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, row_selected: bool) !void {
         const focused = row_selected and self.state.column == .sign_out;
         const prefix = "  ";
         const text = try std.fmt.allocPrint(ctx.arena, "{s}Sign Out", .{prefix});
         const style = if (focused) StylePalette.selected_item else tui_style.onSelectionBg(StylePalette.thinking_body, row_selected);
-        try panel.lineStyledAt(surface, 0, text, ctx, panel.secondaryColumn(surface.size.width), style);
+        try panel.lineStyledAt(surface, row, text, ctx, panel.secondaryColumn(surface.size.width), style);
     }
 
     fn drawForm(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
-        const provider = self.state.form_provider orelse return;
-        const start_col = message.ConversationLayout.left -| 1;
-        try panel.lineStyledAt(surface, 1, provider.displayName(), ctx, start_col, StylePalette.model_status);
+        const handle = self.state.form_handle orelse return;
+        const display_name = handle.displayName();
+        const desc = handle.description();
+        const base_url = handle.defaultBaseUrl();
+        const requires_key = handle.requiresApiKey();
 
-        const desc = provider.description();
+        const start_col = message.ConversationLayout.left -| 1;
+        try panel.lineStyledAt(surface, 1, display_name, ctx, start_col, StylePalette.model_status);
+
         try panel.lineStyledAt(surface, 2, desc, ctx, start_col, StylePalette.thinking_body);
 
-        if (provider.defaultBaseUrl()) |base_url| {
-            const url_text = try std.fmt.allocPrint(ctx.arena, "Endpoint: {s}", .{base_url});
+        if (base_url) |url| {
+            const url_text = try std.fmt.allocPrint(ctx.arena, "Endpoint: {s}", .{url});
             try panel.lineStyledAt(surface, 3, url_text, ctx, start_col, StylePalette.thinking_body);
         }
 
-        const key_row: u16 = if (provider.defaultBaseUrl() != null) 5 else 4;
-        const label = if (provider.requiresApiKey()) "API Key: " else "API Key (optional): ";
+        const key_row: u16 = if (base_url != null) 5 else 4;
+        const label = if (requires_key) "API Key: " else "API Key (optional): ";
         try panel.lineStyledAt(surface, key_row, label, ctx, start_col, StylePalette.panel_header);
         const key_col = start_col + @as(u16, @intCast(@min(ctx.stringWidth(label), @as(usize, std.math.maxInt(u16)))));
         const shown = try std.fmt.allocPrint(ctx.arena, "{s}\u{2588}", .{self.key_input});
         try panel.lineStyledAt(surface, key_row, shown, ctx, key_col, StylePalette.panel_header);
+
+        const hint_row = key_row + 2;
+        if (self.state.form_error) |err_msg| {
+            try panel.lineStyledAt(surface, hint_row, err_msg, ctx, start_col, StylePalette.tool_failed);
+        } else {
+            const hint = if (requires_key and self.key_input.len == 0)
+                "Type or paste your API key, then press Enter to connect (Esc to cancel)"
+            else
+                "Press Enter to submit and connect (Esc to cancel)";
+            try panel.lineStyledAt(surface, hint_row, hint, ctx, start_col, StylePalette.thinking_body);
+        }
     }
 };
-
-pub fn rowCount() u32 {
-    return 1 + @as(u32, @intCast(config_mod.catalogueProviders().len));
-}
 
 fn nextColumn(current: Column) Column {
     return switch (current) {
@@ -301,7 +394,7 @@ test "provider picker badge reflects connectivity status, not key presence" {
     const ctx: vxfw.DrawContext = .{
         .arena = arena.allocator(),
         .min = .{},
-        .max = .{ .width = 80, .height = @intCast(rowCount() + 1) },
+        .max = .{ .width = 80, .height = @intCast(content.state.rowCount() + 1) },
         .cell_size = .{ .width = 10, .height = 20 },
     };
     const surface = try content.widget().draw(ctx);
@@ -316,6 +409,31 @@ test "provider picker badge reflects connectivity status, not key presence" {
     // An unconfigured provider (no credentials) shows no badge at all.
     const unknown_row = try rowText(arena.allocator(), surface, 3);
     try std.testing.expect(std.mem.indexOf(u8, unknown_row, "[") == null);
+}
+
+test "provider picker viewport scrolling renders selected dynamic row" {
+    const dyn = [_]modelsdev.Provider{
+        .{ .id = "p1", .name = "Provider 1", .description = "Desc 1", .base_url = "https://p1.ai", .adapter = .openai_compatible, .requires_api_key = true },
+        .{ .id = "p2", .name = "Provider 2", .description = "Desc 2", .base_url = "https://p2.ai", .adapter = .openai_compatible, .requires_api_key = true },
+    };
+    var content: Content = .{
+        .state = .{ .selection = 8, .dynamics = &dyn },
+        .codex_signed_in = false,
+        .statuses = &.{},
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 4 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try content.widget().draw(ctx);
+
+    const bottom_line = try rowText(arena.allocator(), surface, 3);
+    try std.testing.expect(std.mem.indexOf(u8, bottom_line, "Provider 2") != null);
 }
 
 test "provider picker form stage defers keys to the input field" {
