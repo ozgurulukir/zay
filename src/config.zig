@@ -60,6 +60,22 @@ pub const Provider = enum {
             else => null,
         };
     }
+
+    pub fn description(self: Provider) []const u8 {
+        return switch (self) {
+            .openai => "OpenAI ChatGPT & Codex authentication",
+            .openai_compatible => "Custom OpenAI-compatible REST server",
+            .ollama => "Local Ollama server instance (localhost:11434)",
+            .llama_cpp => "Local llama.cpp HTTP server (localhost:8080)",
+            .openrouter => "Unified router for 200+ AI models",
+            .cerebras => "Ultra-fast Cerebras WSE-3 wafer inference",
+            .ollama_cloud => "Hosted Ollama cloud model infrastructure",
+            .huggingface => "HuggingFace Serverless Inference API",
+            .nvidia_nim => "NVIDIA NIM microservices & GPU platform",
+            .opencode_zen => "Free public OpenCode Zen endpoint",
+            .anthropic => "Direct Anthropic API (Claude 3.5 Sonnet)",
+        };
+    }
 };
 
 pub fn catalogueProviders() []const Provider {

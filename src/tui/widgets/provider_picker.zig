@@ -115,6 +115,9 @@ pub const Content = struct {
             try panel.commandLine(surface, row, base, ctx, focused);
             const status = if (index < self.statuses.len) self.statuses[index] else .unknown;
             try drawBadge(surface, ctx, row, base, status, focused);
+
+            const desc_style = if (focused) StylePalette.selected_item else StylePalette.thinking_body;
+            _ = panel.writeBorderTextEndingAt(surface, ctx, row, surface.size.width -| 2, provider.description(), desc_style);
         }
     }
 
@@ -155,6 +158,9 @@ pub const Content = struct {
                 @as(u16, @intCast(@min(ctx.stringWidth(base), @as(usize, std.math.maxInt(u16)))));
             try panel.lineStyledAt(surface, 0, " [CONNECTED]", ctx, badge_col, tui_style.onSelectionBg(StylePalette.success, row_selected));
             try self.drawSignOut(surface, ctx, row_selected);
+        } else {
+            const desc_style = if (provider_focused) StylePalette.selected_item else StylePalette.thinking_body;
+            _ = panel.writeBorderTextEndingAt(surface, ctx, 0, surface.size.width -| 2, "OpenAI ChatGPT & Codex OAuth authentication", desc_style);
         }
     }
 
@@ -171,11 +177,20 @@ pub const Content = struct {
         const start_col = message.ConversationLayout.left -| 1;
         try panel.lineStyledAt(surface, 1, provider.displayName(), ctx, start_col, StylePalette.model_status);
 
-        const label = if (provider.requiresApiKey()) "Api Key: " else "Api Key (optional): ";
-        try panel.lineStyledAt(surface, 3, label, ctx, start_col, StylePalette.panel_header);
+        const desc = provider.description();
+        try panel.lineStyledAt(surface, 2, desc, ctx, start_col, StylePalette.thinking_body);
+
+        if (provider.defaultBaseUrl()) |base_url| {
+            const url_text = try std.fmt.allocPrint(ctx.arena, "Endpoint: {s}", .{base_url});
+            try panel.lineStyledAt(surface, 3, url_text, ctx, start_col, StylePalette.thinking_body);
+        }
+
+        const key_row: u16 = if (provider.defaultBaseUrl() != null) 5 else 4;
+        const label = if (provider.requiresApiKey()) "API Key: " else "API Key (optional): ";
+        try panel.lineStyledAt(surface, key_row, label, ctx, start_col, StylePalette.panel_header);
         const key_col = start_col + @as(u16, @intCast(@min(ctx.stringWidth(label), @as(usize, std.math.maxInt(u16)))));
         const shown = try std.fmt.allocPrint(ctx.arena, "{s}\u{2588}", .{self.key_input});
-        try panel.lineStyledAt(surface, 3, shown, ctx, key_col, StylePalette.panel_header);
+        try panel.lineStyledAt(surface, key_row, shown, ctx, key_col, StylePalette.panel_header);
     }
 };
 
