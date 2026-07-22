@@ -83,7 +83,8 @@ const long_message_scroll_step_rows: u16 = 3;
 /// when a lane is forked with `/parallel`.
 pub const lane_naming_context_max: usize = 3;
 pub const TranscriptNavigation = enum { previous, next };
-pub const MentionSearchKind = enum { file, skill };
+const at_search_mod = @import("tui/at_search.zig");
+pub const MentionSearchKind = at_search_mod.MentionSearchKind;
 
 /// A single-row clickable region on screen (absolute coordinates). Used to
 /// hit-test mouse clicks against the pink lanes chip.
@@ -1263,116 +1264,15 @@ pub const App = struct {
     // --- At-search (mention popup) ---------------------------------------
 
     fn updateAtSearch(self: *App) !void {
-        const before = self.inputs.input.buf.firstHalf();
-        if (at_mention.activeQuery(before)) |active| {
-            try self.setMentionSearch(.file, active.query);
-            return;
-        }
-        if (skill_mod.activeQuery(before)) |active| {
-            try self.setMentionSearch(.skill, active.query);
-            return;
-        }
-        self.closeAtSearch();
-    }
-
-    fn setMentionSearch(self: *App, kind: MentionSearchKind, query: []const u8) !void {
-        if (kind == .file) self.startAtSearchBackend();
-        self.at_search.active = true;
-        if (kind != self.at_search.kind or !std.mem.eql(u8, query, self.at_search.query)) {
-            const owned: []u8 = if (query.len > 0) try self.gpa.dupe(u8, query) else "";
-            if (self.at_search.query.len > 0) self.gpa.free(self.at_search.query);
-            self.at_search.kind = kind;
-            self.at_search.query = owned;
-            self.at_search.selection = 0;
-            try self.refreshAtResults();
-        }
-    }
-
-    fn startAtSearchBackend(self: *App) void {
-        const cwd = if (self.liveRuntime()) |runtime| runtime.cwd else ".";
-        search_mod.start(std.heap.smp_allocator, self.io, cwd);
-    }
-
-    fn refreshAtResults(self: *App) !void {
-        self.clearAtResults();
-        self.at_search.indexing = false;
-        switch (self.at_search.kind) {
-            .file => try self.refreshFileResults(),
-            .skill => try self.refreshSkillResults(),
-        }
-    }
-
-    fn refreshFileResults(self: *App) !void {
-        if (self.at_search.query.len == 0) return;
-        var result = (try search_mod.runIfReady(self.gpa, self.io, .{
-            .op = .find,
-            .query = self.at_search.query,
-        })) orelse {
-            self.at_search.indexing = true;
-            return;
-        };
-        defer result.deinit(self.gpa);
-        try self.parseAtResults(result.stdout);
-    }
-
-    fn refreshSkillResults(self: *App) !void {
-        const runtime = self.liveRuntime() orelse return;
-        const names = try skill_mod.filterNames(self.gpa, runtime.skills, self.at_search.query);
-        errdefer {
-            for (names) |name| self.gpa.free(name);
-            self.gpa.free(names);
-        }
-        for (names) |name| try self.at_search.results.append(self.gpa, name);
-        self.gpa.free(names);
-        if (self.at_search.selection >= self.at_search.results.items.len) self.at_search.selection = 0;
-    }
-
-    fn parseAtResults(self: *App, stdout: []const u8) !void {
-        const max_results = 50;
-        var iter = std.mem.splitScalar(u8, stdout, '\n');
-        while (iter.next()) |line| {
-            if (self.at_search.results.items.len >= max_results) break;
-            if (line.len == 0) continue;
-            if (isSearchFooter(line)) continue;
-            if (line[line.len - 1] == '/') continue;
-            const owned = try self.gpa.dupe(u8, line);
-            errdefer self.gpa.free(owned);
-            try self.at_search.results.append(self.gpa, owned);
-        }
-        if (self.at_search.selection >= self.at_search.results.items.len) self.at_search.selection = 0;
+        return at_search_mod.updateAtSearch(self);
     }
 
     pub fn acceptAtSelection(self: *App) !void {
-        if (self.at_search.selection >= self.at_search.results.items.len) return;
-        const before = self.inputs.input.buf.firstHalf();
-        const active_start = switch (self.at_search.kind) {
-            .file => if (at_mention.activeQuery(before)) |active| active.start else return,
-            .skill => if (skill_mod.activeQuery(before)) |active| active.start else return,
-        };
-        const value = self.at_search.results.items[self.at_search.selection];
-        const sigil: u8 = if (self.at_search.kind == .file) '@' else '$';
-        const insert = try std.fmt.allocPrint(self.gpa, "{c}{s} ", .{ sigil, value });
-        defer self.gpa.free(insert);
-        self.inputs.input.buf.growGapLeft(before.len - active_start);
-        try self.inputs.input.insertSliceAtCursor(insert);
-        self.closeAtSearch();
-    }
-
-    fn clearAtResults(self: *App) void {
-        for (self.at_search.results.items) |path| self.gpa.free(path);
-        self.at_search.results.clearRetainingCapacity();
+        return at_search_mod.acceptAtSelection(self);
     }
 
     pub fn closeAtSearch(self: *App) void {
-        self.at_search.active = false;
-        self.at_search.indexing = false;
-        self.at_search.selection = 0;
-        self.at_search.kind = .file;
-        self.clearAtResults();
-        if (self.at_search.query.len > 0) {
-            self.gpa.free(self.at_search.query);
-            self.at_search.query = "";
-        }
+        at_search_mod.closeAtSearch(self);
     }
 
     /// Repo root = the primary lane's working directory (it was launched there).
@@ -2034,13 +1934,6 @@ fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
     return std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
 }
 
-/// Non-path trailer lines in `search_mod` path output: the `+N more results`
-/// pagination footer and the empty-result marker. The ready backend never emits
-/// content-search footers or shell-fallback banners on this path.
-fn isSearchFooter(line: []const u8) bool {
-    return std.mem.startsWith(u8, line, "+") or
-        std.mem.eql(u8, line, "0 results.");
-}
 
 fn inputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8) anyerror!void {
     const app: *App = @ptrCast(@alignCast(userdata.?));
