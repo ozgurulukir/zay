@@ -13,3 +13,6 @@ __pycache__
 ## Models
 ModernBERT-bash-classifier/
 vendor/fff/libfff_c.so
+vendor/local-models/
+.code-tandem/
+.opencode/

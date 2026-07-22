@@ -159,6 +159,10 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         idx += 1;
     }
     if (at_visible) {
+        if (app.at_search.indexing) {
+            const at_search_mod = @import("at_search.zig");
+            at_search_mod.updateAtSearch(app) catch {};
+        }
         var at_view: tui.AtSearchWidget = .{ .app = app };
         const panel_height = at_search.panelHeight(app.at_search.results.items.len);
         const panel_width = @min(@as(u16, 72), max_width);

@@ -452,7 +452,7 @@ pub fn syncFocus(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         },
         // The lanes overlay owns its keys via captureEvent; the palette input
         // is unused, so keep focus on the root (typed keys are ignored).
-        .lanes => root.widget(),
+        .lanes, .help => root.widget(),
         .normal => app.inputs.input.widget(),
     };
     try ctx.requestFocus(target);

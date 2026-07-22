@@ -4,7 +4,14 @@ const vxfw = vaxis.vxfw;
 
 const panel = @import("panel.zig");
 
-pub const Entry = struct { name: []const u8 };
+const tui_style = @import("../style.zig");
+const StylePalette = tui_style.Palette;
+
+pub const Entry = struct {
+    name: []const u8,
+    description: []const u8 = "",
+    category: []const u8 = "",
+};
 
 pub const Content = struct {
     entries: []const Entry,
@@ -28,12 +35,14 @@ pub const Content = struct {
         var row: u16 = 0;
         var index: u32 = 0;
         for (self.entries) |entry| {
-            if (!startsWithIgnoreCase(entry.name, self.filter)) continue;
+            if (!matchesCommandFilter(entry.name, entry.description, self.filter)) continue;
             const selected = index == self.selection;
-            // Two-space indent; selection is shown by the row's background fill.
-            const prefix = "  ";
-            const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, entry.name });
+            const text = try std.fmt.allocPrint(ctx.arena, "  /{s}", .{entry.name});
             try panel.commandLine(surface, row, text, ctx, selected);
+            if (entry.description.len > 0 and surface.size.width > 24) {
+                const desc_style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;
+                _ = panel.writeBorderTextEndingAt(surface, ctx, row, surface.size.width -| 2, entry.description, desc_style);
+            }
             row += 1;
             index += 1;
             if (row >= surface.size.height) return;
@@ -41,13 +50,32 @@ pub const Content = struct {
     }
 };
 
+pub fn matchesCommandFilter(name: []const u8, description: []const u8, filter: []const u8) bool {
+    if (filter.len == 0) return true;
+    if (startsWithIgnoreCase(name, filter)) return true;
+    if (containsIgnoreCase(name, filter)) return true;
+    if (containsIgnoreCase(description, filter)) return true;
+    return false;
+}
+
 fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
     if (prefix.len > value.len) return false;
     return std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
 }
 
-test "command panel filters entries case-insensitively" {
-    const entries = [_]Entry{ .{ .name = "Connect" }, .{ .name = "Resume" } };
-    try std.testing.expect(startsWithIgnoreCase(entries[0].name, "co"));
-    try std.testing.expect(!startsWithIgnoreCase(entries[1].name, "co"));
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i <= haystack.len - needle.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+test "command panel filters entries case-insensitively and fuzzy/substring" {
+    const entries = [_]Entry{ .{ .name = "Connect", .description = "Configure AI provider" }, .{ .name = "Resume", .description = "Past session" } };
+    try std.testing.expect(matchesCommandFilter(entries[0].name, entries[0].description, "co"));
+    try std.testing.expect(matchesCommandFilter(entries[0].name, entries[0].description, "nect"));
+    try std.testing.expect(matchesCommandFilter(entries[0].name, entries[0].description, "provider"));
+    try std.testing.expect(!matchesCommandFilter(entries[1].name, entries[1].description, "co"));
 }

@@ -42,6 +42,7 @@ pub fn handleCommandKey(app: *App, key: vaxis.Key) !bool {
         .session_picker => try SessionPicker.handle(app, key),
         .tree_picker => try TreePicker.handle(app, key),
         .lanes => try Lanes.handle(app, key),
+        .help => try HelpPicker.handle(app, key),
         .command => try CommandMenu.handle(app, key),
         // The diff viewer owns its keys directly in `captureEvent`; nothing
         // reaches the generic dispatch.
@@ -251,6 +252,13 @@ const CommandMenu = struct {
 /// extracted.
 pub const Transcript = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
+        // Prompt history navigation: Ctrl+Up / Alt+Up (previous prompt), Ctrl+Down / Alt+Down (next prompt).
+        if (key.matches(vaxis.Key.up, .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{ .alt = true })) {
+            if (try app.navigatePromptHistory(.up)) return true;
+        }
+        if (key.matches(vaxis.Key.down, .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{ .alt = true })) {
+            if (try app.navigatePromptHistory(.down)) return true;
+        }
         // R2.8a: @-mention popup owns up/down while active.
         if (try MentionPopup.handle(app, key)) return true;
         // R2.8b: block navigation owns shift+down and plain up/down.
@@ -334,6 +342,18 @@ pub const LaneSwitch = struct {
         }
         if (key.matches(vaxis.Key.tab, .{})) {
             app.toggleSelectedTranscriptBlock();
+            return true;
+        }
+        return false;
+    }
+};
+
+pub const HelpPicker = struct {
+    pub fn handle(app: *App, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.escape, .{}) or key.matches(vaxis.Key.enter, .{})) {
+            app.mode = .normal;
+            app.clearInput();
+            app.clearPaletteInput();
             return true;
         }
         return false;

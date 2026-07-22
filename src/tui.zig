@@ -30,6 +30,11 @@ const command_router = @import("tui/command_router.zig");
 const session_switcher = @import("tui/session_switcher.zig");
 const app_state = @import("tui/app_state.zig");
 const background_delivery = @import("tui/background_delivery.zig");
+const turn_lifecycle = @import("tui/turn_lifecycle.zig");
+const checkpoint_mod = @import("tui/checkpoint.zig");
+const mode_lifecycle = @import("tui/mode_lifecycle.zig");
+const input_lifecycle = @import("tui/input_lifecycle.zig");
+const transcript_lifecycle = @import("tui/transcript_lifecycle.zig");
 pub const Thread = @import("tui/thread.zig");
 const tui_metrics = @import("tui/metrics.zig");
 const lane_column = @import("tui/lane_column.zig");
@@ -212,7 +217,7 @@ pub const App = struct {
     /// `deinit`.
     pub const ctrl_c_double_press_ms: u32 = 1500;
 
-    pub const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message, lanes };
+    pub const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message, lanes, help };
     pub const LanesPurpose = app_state.NavState.LanesPurpose;
     pub const ModelCatalog = enum { connected_provider, openai_codex };
     const CheckpointState = enum { unknown, ready, unavailable };
@@ -244,6 +249,7 @@ pub const App = struct {
         config: config_mod.Config,
     ) !App {
         var app = try init(io, gpa, &runtime.agent);
+        search_mod.start(gpa, io, runtime.cwd);
         // One shared background manager for the whole session. Heap-allocated so
         // its address stays put as agents (primary + lanes) borrow it.
         const manager = try gpa.create(background_mod.BackgroundManager);
@@ -483,7 +489,7 @@ pub const App = struct {
         lifecycle.deinitApp(self);
     }
 
-    fn awaitTurn(self: *App) void {
+    pub fn awaitTurn(self: *App) void {
         if (self.thread.turn_future) |*future| {
             future.await(self.io);
             self.thread.turn_future = null;
@@ -491,200 +497,37 @@ pub const App = struct {
     }
 
     pub fn handleInterrupt(self: *App) !void {
-        if (self.thread.turn.state != .active) return;
-        self.thread.worker_context.?.requestCancel();
-        // Show the cancellation notice immediately.
-        const message = try self.gpa.dupe(u8, agent_worker.cancel_message);
-        var event: agent_mod.Agent.Event = .{ .turn_failed = message };
-        defer event.deinit(self.gpa);
-        _ = try self.thread.turn_view.apply(self.gpa, &self.thread.transcript, event);
-        self.thread.turn.interrupt();
-        // Tear the worker down now rather than waiting for it to reach its next
-        // cooperative cancellation point. `requestCancel` only takes effect on
-        // the worker's next `emit`, but between stream chunks (and for the whole
-        // duration of a running tool) the worker is blocked in a read and emits
-        // nothing — so a purely cooperative cancel would leave the lane stuck
-        // `interrupting`, i.e. reading as still in-flight long after Esc.
-        // `cancel` aborts that read and joins the worker; we then drop back to
-        // idle and deliver anything the user queued behind the cancelled turn.
-        self.discardAbandonedTurn();
-        _ = try self.restartTurnForQueuedMessages();
+        return turn_lifecycle.handleInterrupt(self);
     }
 
     pub fn discardAbandonedTurn(self: *App) void {
-        if (self.thread.turn.state != .interrupting and self.thread.turn_future == null) return;
-        if (self.thread.turn_future) |*future| {
-            // `cancel` blocks until the task hits its next cancellation point
-            // (typically the network read) and unwinds. On a healthy stream
-            // this is near-instant; on a hung connection it forces the OS
-            // read to abort.
-            _ = future.cancel(self.io);
-            self.thread.turn_future = null;
-        }
-        var batch: std.ArrayList(*agent_mod.Agent.Event) = .empty;
-        defer batch.deinit(self.thread.worker_context.?.gpa);
-        self.thread.worker_context.?.queue.drainInto(
-            self.thread.worker_context.?.io,
-            self.thread.worker_context.?.gpa,
-            &batch,
-        ) catch {};
-        for (batch.items) |event_ptr| {
-            event_ptr.deinit(self.thread.worker_context.?.gpa);
-            self.thread.worker_context.?.gpa.destroy(event_ptr);
-        }
-        if (self.thread.turn.state == .interrupting) self.thread.turn.reset();
+        turn_lifecycle.discardAbandonedTurn(self);
     }
 
-    /// Start a turn from the current input. Returns true when a turn was
-    /// started (the caller should then call `startTurn`); false when the
-    /// prompt was empty, had no provider, or was queued behind a running turn.
     pub fn beginSubmit(self: *App) !bool {
-        self.closeAtSearch();
-        self.nav.block_nav = false;
-        // If a previous turn was Esc-interrupted, force-cancel its worker
-        // before starting a new one. Two concurrent workers would race on
-        // the shared agent message history.
-        if (self.thread.turn.state == .interrupting) self.discardAbandonedTurn();
-        if (self.thread.turn.isActive()) return try self.enqueueSubmit();
-        const prompt = try self.inputs.input.toOwnedSlice();
-        defer self.gpa.free(prompt);
-        if (prompt.len == 0) return false;
-
-        if (self.liveRuntime() != null and self.liveRuntime().?.client == .none) {
-            _ = try self.thread.transcript.append(self.gpa, .user, "you", prompt);
-            const message = try self.formatNoProviderMessage();
-            defer self.gpa.free(message);
-            _ = try self.thread.transcript.append(self.gpa, .agent, "agent", message);
-            return false;
-        }
-
-        self.resetTurnState();
-        self.thread.worker_context.?.resetCancel();
-        _ = try self.thread.transcript.append(self.gpa, .user, "you", prompt);
-        // A worktree lane's first prompt also names its branch: ask the model
-        // in parallel, and rename the hex branch when the answer lands.
-        if (self.thread.title == null and lanes_util.workingLaneOf(self.thread) != null) {
-            self.scheduleLaneNaming(self.thread, prompt) catch {};
-        }
-        try self.setLaneTitleIfUnset(prompt);
-        try self.appendSkillInvocationsToTranscript(prompt);
-        self.thread.turn_view.awaitModel();
-        // The worker expands `@`-mentions (reading files / images) off the UI
-        // thread; stash the raw text for `startTurn` to hand over. The worker
-        // owns and frees it, so it must be allocated with the worker's
-        // allocator (`worker_context.gpa`), not `self.gpa`.
-        self.thread.pending_prompt = try self.thread.worker_context.?.gpa.dupe(u8, prompt);
-        self.thread.turn.submit();
-        return true;
+        return turn_lifecycle.beginSubmit(self);
     }
 
-    /// Label the lane by its first user prompt (one line, truncated) so split
-    /// tiles read as the session, not a generic "lane". Owned; freed in deinit.
-    fn setLaneTitleIfUnset(self: *App, prompt: []const u8) !void {
-        if (self.thread.title != null) return;
-        const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
-        if (trimmed.len == 0) return;
-        const line_end = std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len;
-        const line = std.mem.trim(u8, trimmed[0..line_end], " \t\r");
-        if (line.len == 0) return;
-        const max: usize = 40;
-        if (line.len <= max) {
-            self.thread.title = try self.gpa.dupe(u8, line);
-            return;
-        }
-        var cut: usize = max;
-        while (cut > 0 and (line[cut] & 0xC0) == 0x80) cut -= 1;
-        self.thread.title = try std.fmt.allocPrint(self.gpa, "{s}…", .{line[0..cut]});
+    pub fn setLaneTitleIfUnset(self: *App, prompt: []const u8) !void {
+        return turn_lifecycle.setLaneTitleIfUnset(self, prompt);
     }
 
-    fn formatNoProviderMessage(self: *App) ![]u8 {
-        if (self.liveRuntime()) |rt| {
-            for (rt.diagnostics) |d| {
-                switch (d) {
-                    .config_parse_error => |e| return std.fmt.allocPrint(
-                        self.gpa,
-                        "Failed to load {s}: {s}",
-                        .{ e.path, e.reason },
-                    ),
-                    .bad_env_model => |raw| return std.fmt.allocPrint(
-                        self.gpa,
-                        "Invalid OPENAI_MODEL: expected <provider>/<model>, got '{s}'",
-                        .{raw},
-                    ),
-                }
-            }
-        }
-        if (self.cached_config.provider) |p| {
-            if (p.adapter() == null) {
-                return std.fmt.allocPrint(
-                    self.gpa,
-                    "Provider '{s}' is not yet supported in Nova.",
-                    .{p.label()},
-                );
-            }
-            if (p == .openai) {
-                if (self.liveRuntime()) |rt| {
-                    if (rt.codex_connection_expired) return self.gpa.dupe(u8, runtime_mod.codex_connection_expired_message);
-                }
-                return self.gpa.dupe(u8, "No OpenAI Codex session — type /connect to sign in.");
-            }
-        }
-        return self.gpa.dupe(
-            u8,
-            "No provider connected. Type /connect to pick one, or set OPENAI_MODEL=<provider>/<model>.",
-        );
+    pub fn formatNoProviderMessage(self: *App) ![]u8 {
+        return turn_lifecycle.formatNoProviderMessage(self);
     }
 
     pub fn resetTurnState(self: *App) void {
-        self.thread.turn_view.reset(self.io);
-        self.metrics.loading_frame = 0;
-        // Leave `transcript_auto_scroll` alone — if the user has scrolled away
-        // from the tail to read older context, submitting another message
-        // should not yank them back. They can scroll down (or arrow-down)
-        // to opt back into auto-follow.
+        turn_lifecycle.resetTurnState(self);
     }
 
     pub fn startTurn(self: *App) !void {
-        const prompt = self.thread.pending_prompt;
-        self.thread.pending_prompt = null;
-        errdefer if (prompt) |p| self.thread.worker_context.?.gpa.free(p);
-        self.thread.turn_future = try self.io.concurrent(agent_worker.runAgentTurn, .{
-            self.thread.agent.?,
-            &self.thread.worker_context.?,
-            prompt,
-            false,
-        });
+        return turn_lifecycle.startTurn(self);
     }
 
-    /// After a user interrupt has fully unwound (worker joined, queue stranded),
-    /// deliver any queued messages as a fresh turn: the worker drains the whole
-    /// queue into history (leading messages as context, the last as the latest
-    /// user message the model answers). Returns true if a turn was started.
-    fn restartTurnForQueuedMessages(self: *App) !bool {
-        if (self.thread.queued.items.len == 0) return false;
-        // No connected provider to run a turn: surface the queued text in the
-        // transcript and drop the queue rather than spin up a doomed worker.
-        if (self.liveRuntime() != null and self.liveRuntime().?.client == .none) {
-            try self.flushQueuedUserMessagesToTranscript(@intCast(self.thread.queued.items.len));
-            self.thread.agent.?.clearQueue();
-            return true;
-        }
-        self.resetTurnState();
-        self.thread.worker_context.?.resetCancel();
-        self.thread.turn_view.awaitModel();
-        self.thread.pending_prompt = null;
-        self.thread.turn.submit();
-        self.thread.turn_future = try self.io.concurrent(agent_worker.runAgentTurn, .{
-            self.thread.agent.?,
-            &self.thread.worker_context.?,
-            self.thread.pending_prompt,
-            true,
-        });
-        return true;
+    pub fn restartTurnForQueuedMessages(self: *App) !bool {
+        return turn_lifecycle.restartTurnForQueuedMessages(self);
     }
 
-    /// The lane whose agent is `agent_ptr`, or null if it has been closed. Used
-    /// to route a background-job completion back to the lane that started it.
     pub fn laneForAgent(self: *App, agent_ptr: *agent_mod.Agent) ?*Thread {
         for (self.threads.items) |lane| {
             if (lane.agent) |a| {
@@ -698,15 +541,10 @@ pub const App = struct {
         return background_delivery.freeDelivery(self, delivery);
     }
 
-    /// Whether the drain/animation tick must stay alive for background work:
-    /// jobs still running, or completions waiting to be delivered.
     pub fn backgroundActive(self: *App) bool {
         return background_delivery.backgroundActive(self);
     }
 
-    /// Drain finished jobs from the manager into `background_pending`. Called each
-    /// tick; the actual delivery (notice + turn) happens in
-    /// `deliverPendingBackground` once the owning lane is idle.
     pub fn pollBackgroundJobs(self: *App) !bool {
         return background_delivery.pollBackgroundJobs(self);
     }
@@ -715,92 +553,28 @@ pub const App = struct {
         return background_delivery.formatBackgroundNotice(self, job);
     }
 
-    /// Deliver buffered background completions to idle lanes: append the notice
-    /// to the lane's transcript and, for non-killed jobs, enqueue the model
-    /// message and start a turn to answer it. A lane mid-turn is left alone (the
-    /// completion waits); the visible lane is also left alone while the user is
-    /// typing, so a finishing job never yanks them mid-compose.
     pub fn deliverPendingBackground(self: *App) !bool {
         return background_delivery.deliverPendingBackground(self);
     }
 
-    /// Start a turn on `self.thread` that drains its agent's queued (background)
-    /// messages into history and answers them. Mirrors
-    /// `restartTurnForQueuedMessages` but is gated on the agent queue, not the
-    /// UI's display queue. Caller must have set `self.thread` to the target lane.
     pub fn startDeliveryTurnOnCurrentThread(self: *App) !void {
-        if (self.liveRuntime() != null and self.liveRuntime().?.client == .none) {
-            // No provider to run a turn — drop the queued notice rather than spin
-            // up a doomed worker.
-            self.thread.agent.?.clearQueue();
-            return;
-        }
-        self.resetTurnState();
-        self.thread.worker_context.?.resetCancel();
-        self.thread.turn_view.awaitModel();
-        self.thread.pending_prompt = null;
-        self.thread.turn.submit();
-        self.thread.turn_future = try self.io.concurrent(agent_worker.runAgentTurn, .{
-            self.thread.agent.?,
-            &self.thread.worker_context.?,
-            self.thread.pending_prompt,
-            true,
-        });
+        return turn_lifecycle.startDeliveryTurnOnCurrentThread(self);
     }
 
     pub fn runningBackgroundCount(self: *App) usize {
-        const manager = self.background orelse return 0;
-        return manager.runningCount();
+        return background_delivery.runningBackgroundCount(self);
     }
 
-    /// Toggle the `Ctrl+O` modal. Opening is a no-op when nothing is running, so
-    /// the key only ever surfaces a modal with content.
     pub fn toggleBackgroundModal(self: *App) void {
-        if (!self.background_modal_state.modal and self.runningBackgroundCount() == 0) return;
-        self.background_modal_state.modal = !self.background_modal_state.modal;
-        self.background_modal_state.selection = 0;
-        self.background_modal_state.cancel_focus = false;
+        background_delivery.toggleBackgroundModal(self);
     }
 
-    /// Route a key to the open background-jobs modal. Returns true when the key
-    /// changed visible state (caller redraws), false when it was swallowed.
     pub fn handleBackgroundModalKey(self: *App, key: vaxis.Key) bool {
-        const count = self.runningBackgroundCount();
-        if (count == 0) return false;
-        if (self.background_modal_state.selection >= count) self.background_modal_state.selection = count - 1;
-        if (key.matches(vaxis.Key.up, .{})) {
-            if (self.background_modal_state.selection > 0) self.background_modal_state.selection -= 1;
-            self.background_modal_state.cancel_focus = false;
-            return true;
-        }
-        if (key.matches(vaxis.Key.down, .{})) {
-            if (self.background_modal_state.selection + 1 < count) self.background_modal_state.selection += 1;
-            self.background_modal_state.cancel_focus = false;
-            return true;
-        }
-        if (key.matches(vaxis.Key.left, .{})) {
-            self.background_modal_state.cancel_focus = false;
-            return true;
-        }
-        if (key.matches(vaxis.Key.right, .{})) {
-            self.background_modal_state.cancel_focus = true;
-            return true;
-        }
-        if (self.background_modal_state.cancel_focus and key.matches(vaxis.Key.enter, .{})) {
-            self.cancelSelectedBackgroundJob();
-            return true;
-        }
-        return false;
+        return background_delivery.handleBackgroundModalKey(self, key);
     }
 
-    fn cancelSelectedBackgroundJob(self: *App) void {
-        const manager = self.background orelse return;
-        const views = manager.snapshot(self.gpa) catch return;
-        defer background_mod.BackgroundManager.freeViews(self.gpa, views);
-        if (views.len == 0) return;
-        const sel = @min(self.background_modal_state.selection, views.len - 1);
-        _ = manager.cancel(views[sel].id);
-        self.background_modal_state.cancel_focus = false;
+    pub fn cancelSelectedBackgroundJob(self: *App) void {
+        background_delivery.cancelSelectedBackgroundJob(self);
     }
 
     pub fn advanceLoadingFrame(self: *App) void {
@@ -827,147 +601,39 @@ pub const App = struct {
     }
 
     pub fn applyAgentEvent(self: *App, event: agent_mod.Agent.Event) !bool {
-        const outcome = self.thread.turn.apply(event);
-        if (!outcome.project) {
-            // Interrupting: a discarded turn's output must not mutate the
-            // transcript. Join the worker once it posts its terminal event, then
-            // deliver any messages the user queued behind the cancelled turn as
-            // a fresh turn.
-            if (outcome.finished) {
-                self.awaitTurn();
-                // The worker is joined, so any files the cut-short turn wrote are
-                // settled on disk. Snapshot them now — otherwise they sit
-                // unbound and a later timeline restore can't bring them back.
-                self.checkpointFinishedTurn();
-                return try self.restartTurnForQueuedMessages();
-            }
-            return false;
-        }
-        var visible_change = try self.thread.turn_view.apply(self.gpa, &self.thread.transcript, event);
-        switch (event) {
-            .queued_messages_flushed => |count| {
-                if (count > 0 and self.thread.queued.items.len > 0) {
-                    try self.flushQueuedUserMessagesToTranscript(count);
-                    visible_change = true;
-                }
-            },
-            else => {},
-        }
-        if (outcome.finished) {
-            self.awaitTurn();
-            self.checkpointFinishedTurn();
-            if (self.thread.queued.items.len > 0) {
-                self.clearQueuedUserMessages();
-                visible_change = true;
-            }
-        }
-        return visible_change;
+        return turn_lifecycle.applyAgentEvent(self, event);
     }
 
-    /// What a `sealCheckpoint` attempt did — so callers can tell a genuine
-    /// failure apart from the benign "nothing to bind" and "git unavailable"
-    /// cases and surface only the former.
-    const SealOutcome = enum { sealed, nothing, unavailable, failed };
-
-    /// Snapshot the working tree (git-shadow) and bind the resulting commit id to
-    /// the active conversation leaf, so navigating back here restores this code
-    /// state. HEAD stays attached to the branch; the snapshot is an off-branch
-    /// commit kept alive by a `refs/nova/*` ref. A git or persistence error
-    /// returns `.failed` — never swallowed silently, since a missing binding is
-    /// exactly what broke timeline navigation before.
-    fn sealCheckpoint(self: *App) SealOutcome {
-        const rt = self.liveRuntime() orelse return .unavailable;
-        if (!self.ensureCheckpointReady()) return .unavailable;
-        const index = vcs.indexPath(self.gpa, self.io, rt.cwd) catch return .failed;
-        defer self.gpa.free(index);
-        const sha = vcs.snapshot(self.gpa, self.io, rt.cwd, index) catch return .failed;
-        rt.session_writer.setLeafSnapshot(sha.slice()) catch return .failed;
-        // Bind only makes sense if there is a leaf entry to bind to; otherwise the
-        // snapshot is an orphan (gc'd later) — report nothing happened.
-        const leaf_id = rt.session_writer.leaf() orelse return .nothing;
-        // Keep the snapshot reachable against `git gc`, named by the entry it
-        // binds so it can be pruned with that entry.
-        vcs.keepRef(self.gpa, self.io, rt.cwd, leaf_id, sha) catch {};
-        return .sealed;
+    pub fn sealCheckpoint(self: *App) checkpoint_mod.SealOutcome {
+        return checkpoint_mod.sealCheckpoint(self);
     }
 
-    /// Tell the user a snapshot couldn't be taken — once. A persistently broken
-    /// git would otherwise append this every turn; the flag clears the next time
-    /// a snapshot succeeds (see `noteCheckpointSucceeded`).
-    fn noteCheckpointFailure(self: *App) void {
-        if (self.checkpoint_warned) return;
-        self.checkpoint_warned = true;
-        _ = self.thread.transcript.append(self.gpa, .notice, "notice", "Couldn't snapshot the working tree — timeline navigation may not restore this point's files. Check that `git` works in this repo.") catch {};
+    pub fn noteCheckpointFailure(self: *App) void {
+        checkpoint_mod.noteCheckpointFailure(self);
     }
 
-    fn noteCheckpointSucceeded(self: *App) void {
-        self.checkpoint_warned = false;
+    pub fn noteCheckpointSucceeded(self: *App) void {
+        checkpoint_mod.noteCheckpointSucceeded(self);
     }
 
-    /// Snapshot at a turn boundary and surface a genuine failure to the user
-    /// (deduped). Every place that must bind the current code state to the
-    /// conversation goes through here, so a broken snapshot is never silent.
-    fn checkpointBoundary(self: *App) void {
-        switch (self.sealCheckpoint()) {
-            .sealed => self.noteCheckpointSucceeded(),
-            .failed => self.noteCheckpointFailure(),
-            .nothing, .unavailable => {},
-        }
+    pub fn checkpointBoundary(self: *App) void {
+        checkpoint_mod.checkpointBoundary(self);
     }
 
-    /// Seal at the end of a turn (clean or interrupted, so a turn that wrote
-    /// files before being cut still binds them to a snapshot).
-    fn checkpointFinishedTurn(self: *App) void {
-        self.checkpointBoundary();
+    pub fn checkpointFinishedTurn(self: *App) void {
+        checkpoint_mod.checkpointFinishedTurn(self);
     }
 
-    /// `/save` entry point: reject when the working tree has nothing to commit,
-    /// otherwise open the commit-message prompt. `saveActiveLane` commits on
-    /// confirm.
-    fn beginSave(self: *App) !void {
-        if (self.thread.turn.isActive()) return error.InFlightTurn;
-        const rt = self.liveRuntime() orelse return error.NoActiveRuntime;
-
-        if (!(vcs.workingTreeDirty(self.gpa, self.io, rt.cwd) catch true)) {
-            _ = try self.thread.transcript.append(self.gpa, .notice, "notice", "Nothing to save — the working tree matches the last commit.");
-            return;
-        }
-
-        // Prompt for a commit message; `submitMode` calls `saveActiveLane` on
-        // confirm. Prefill the lane title as an editable suggestion.
-        self.mode = .save_message;
-        self.clearInput();
-        self.clearPaletteInput();
-        if (self.thread.title) |title| self.inputs.palette.insertSliceAtCursor(title) catch {};
+    pub fn beginSave(self: *App) !void {
+        return checkpoint_mod.beginSave(self);
     }
 
-    /// `/save`: commit the current working tree onto the lane's branch with the
-    /// user's message. In the git-shadow model HEAD stays attached, so this is
-    /// just `git add -A && git commit` — the working tree *is* the state to keep;
-    /// the off-branch snapshot chain never reaches the branch. `message` is the
-    /// user-supplied commit message (see `beginSave`).
-    fn saveActiveLane(self: *App, message: []const u8) !void {
-        if (self.thread.turn.isActive()) return error.InFlightTurn;
-        const rt = self.liveRuntime() orelse return error.NoActiveRuntime;
-        try vcs.commitAll(self.gpa, self.io, rt.cwd, message);
-        _ = try self.thread.transcript.append(self.gpa, .success, "notice", "Saved — committed the working tree to the current branch.");
+    pub fn saveActiveLane(self: *App, message: []const u8) !void {
+        return checkpoint_mod.saveActiveLane(self, message);
     }
 
-    /// Resolve once whether the git-shadow snapshot feature can run: git
-    /// installed and the working copy inside a git repo. Cached per session.
-    fn ensureCheckpointReady(self: *App) bool {
-        switch (self.checkpoint_state) {
-            .ready => return true,
-            .unavailable => return false,
-            .unknown => {},
-        }
-        const repo = self.repoRoot() orelse {
-            self.checkpoint_state = .unavailable;
-            return false;
-        };
-        const ok = vcs.isAvailable(self.gpa, self.io) and vcs.isRepo(self.gpa, self.io, repo);
-        self.checkpoint_state = if (ok) .ready else .unavailable;
-        return ok;
+    pub fn ensureCheckpointReady(self: *App) bool {
+        return checkpoint_mod.ensureCheckpointReady(self);
     }
 
     pub fn handleCommandKey(self: *App, key: vaxis.Key) !bool {
@@ -991,168 +657,22 @@ pub const App = struct {
     }
 
     pub fn syncModeWithInput(self: *App, value: []const u8) !void {
-        // While typing an API key in the provider form, the input is the key —
-        // never reinterpret a leading '/' as a command.
-        if (self.mode == .provider_picker and self.pickers.provider.stage == .form) return;
-        if (self.mode == .session_picker or self.mode == .provider_picker or self.mode == .model_picker or self.mode == .tree_picker) {
-            if (value.len > 0 and value[0] == command_prefix) {
-                self.mode = .command;
-                self.nav.command_selection = 0;
-                return;
-            }
-            if (self.mode == .session_picker) {
-                if (self.nav.resume_selection >= try self.visibleResumeCount()) self.nav.resume_selection = 0;
-            }
-            return;
-        }
-        if (value.len > 0 and value[0] == command_prefix) {
-            self.mode = .command;
-            self.nav.command_selection = 0;
-            return;
-        }
-        self.mode = .normal;
-        self.nav.command_selection = 0;
+        return mode_lifecycle.syncModeWithInput(self, value);
     }
 
     pub fn cancelMode(self: *App) !bool {
-        if (self.mode == .normal) return false;
-        // Esc inside the provider setup form returns to the provider list.
-        if (self.mode == .provider_picker and self.pickers.provider.stage == .form) {
-            self.pickers.provider.stage = .list;
-            self.pickers.provider.form_provider = null;
-            self.provider_key_input.clearRetainingCapacity();
-            return true;
-        }
-        if (self.mode == .model_picker) {
-            provider_model.cancelModelLoad(self);
-            try self.revertModelPickerSnapshot();
-        }
-        if (self.mode == .session_picker or self.mode == .provider_picker or self.mode == .model_picker or self.mode == .tree_picker) {
-            try self.openCommandMenu();
-            self.resumeClear();
-            return true;
-        }
-        if (self.mode == .lanes) {
-            self.clearLanesState();
-            self.mode = .normal;
-            self.clearInput();
-            self.clearPaletteInput();
-            return true;
-        }
-        self.mode = .normal;
-        self.clearInput();
-        self.clearPaletteInput();
-        self.resumeClear();
-        return true;
-    }
-
-    fn revertModelPickerSnapshot(self: *App) !void {
-        self.pickers.models.restore();
+        return mode_lifecycle.cancelMode(self);
     }
 
     pub fn submitMode(self: *App) !bool {
-        if (self.mode == .provider_picker) {
-            if (self.pickers.provider.stage == .form) {
-                const provider = self.pickers.provider.form_provider orelse return true;
-                provider_model.submitProviderSetup(self, provider) catch |err| try self.reportConnectionError(err);
-                return true;
-            }
-            switch (self.pickers.provider.selectedAction()) {
-                .connect_codex => provider_model.connectCodex(self) catch |err| try self.reportConnectionError(err),
-                .sign_out_codex => {
-                    if (self.isCodexSignedIn()) {
-                        provider_model.signOutCodex(self) catch |err| try self.reportConnectionError(err);
-                    } else {
-                        provider_model.connectCodex(self) catch |err| try self.reportConnectionError(err);
-                    }
-                },
-                .open_form => |provider| provider_model.openProviderForm(self, provider),
-            }
-            return true;
-        }
-        if (self.mode == .model_picker) {
-            provider_model.applySelectedModel(self) catch |err| try self.reportConnectionError(err);
-            return true;
-        }
-        if (self.mode == .session_picker) {
-            const summary = try self.selectedResumeSummary() orelse return true;
-            self.switchToSession(summary.id) catch |err| {
-                try self.reportSessionSwitchError(err);
-                return true;
-            };
-            return true;
-        }
-        if (self.mode == .tree_picker) {
-            if (self.pickers.tree.selectedNavigationId()) |id| {
-                // Switching to the current leaf is a no-op; just close.
-                if (!self.pickers.tree.selectedIsLeaf()) {
-                    var buffer: [session_mod.entry_id_len]u8 = undefined;
-                    @memcpy(buffer[0..], id);
-                    self.navigateToEntry(buffer[0..]) catch |err| {
-                        try self.reportSessionSwitchError(err);
-                        return true;
-                    };
-                }
-            }
-            self.mode = .normal;
-            self.clearInput();
-            self.clearPaletteInput();
-            return true;
-        }
-        if (self.mode == .save_message) {
-            const raw = try self.peekPaletteInput();
-            defer self.gpa.free(raw);
-            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-            // Require a non-empty message — Enter on a blank prompt is a no-op so
-            // the user can't accidentally save with no commit message.
-            if (trimmed.len == 0) return true;
-            const message = try self.gpa.dupe(u8, trimmed);
-            defer self.gpa.free(message);
-            self.mode = .normal;
-            self.clearInput();
-            self.clearPaletteInput();
-            self.saveActiveLane(message) catch |err| try self.reportLaneError(err);
-            return true;
-        }
-        if (self.mode == .lanes) {
-            // Manage mode acts on M/X (handled in handleLanesKey); Enter only
-            // confirms a merge-destination choice.
-            if (self.nav.lanes_purpose == .merge_dest) try self.confirmMergeDest();
-            return true;
-        }
-        if (self.mode == .command) {
-            const filter = try self.peekPaletteInput();
-            defer self.gpa.free(filter);
-            if (resolveCommand(self, filter)) |command| {
-                self.clearPaletteInput();
-                self.clearInput();
-                switch (command) {
-                    .new => self.switchToNewSession() catch |err| try self.reportSessionSwitchError(err),
-                    .resume_session => try self.openResumePicker(),
-                    .timeline => provider_model.openTimelineSelector(self) catch |err| try self.reportSessionSwitchError(err),
-                    .connect => try provider_model.openProviderPicker(self),
-                    .model => provider_model.openModelPicker(self) catch |err| try self.reportConnectionError(err),
-                    .diff => provider_model.openDiffViewer(self) catch |err| try provider_model.reportDiffError(self, err),
-                    .parallel => self.createParallelLane() catch |err| try self.reportLaneError(err),
-                    .save => self.beginSave() catch |err| try self.reportLaneError(err),
-                    .close => self.closeActiveLane() catch |err| try self.reportLaneError(err),
-                    .merge => self.createMergePicker() catch |err| try self.reportLaneError(err),
-                    .lanes => self.openLanesPicker() catch |err| try self.reportLaneError(err),
-                }
-            }
-            return true;
-        }
-        return false;
+        return mode_lifecycle.submitMode(self);
     }
 
     pub fn openCommandMenu(self: *App) !void {
-        self.mode = .command;
-        self.clearInput();
-        self.clearPaletteInput();
-        self.nav.command_selection = 0;
+        return mode_lifecycle.openCommandMenu(self);
     }
 
-    fn openResumePicker(self: *App) !void {
+    pub fn openResumePicker(self: *App) !void {
         return session_switcher.openResumePicker(self);
     }
 
@@ -1160,7 +680,7 @@ pub const App = struct {
         return session_switcher.reloadResumeSessions(self);
     }
 
-    fn selectedResumeSummary(self: *App) !?*session_mod.SessionSummary {
+    pub fn selectedResumeSummary(self: *App) !?*session_mod.SessionSummary {
         return session_switcher.selectedResumeSummary(self);
     }
 
@@ -1188,15 +708,15 @@ pub const App = struct {
         return session_switcher.reloadTreeNodes(self);
     }
 
-    fn navigateToEntry(self: *App, entry_id: []const u8) !void {
+    pub fn navigateToEntry(self: *App, entry_id: []const u8) !void {
         return session_switcher.navigateToEntry(self, entry_id);
     }
 
-    fn reportSessionSwitchError(self: *App, err: anyerror) !void {
+    pub fn reportSessionSwitchError(self: *App, err: anyerror) !void {
         return session_switcher.reportSessionSwitchError(self, err);
     }
 
-    fn reportConnectionError(self: *App, err: anyerror) !void {
+    pub fn reportConnectionError(self: *App, err: anyerror) !void {
         self.mode = .normal;
         self.clearInput();
         var buffer: [128]u8 = undefined;
@@ -1204,11 +724,11 @@ pub const App = struct {
         _ = try self.thread.transcript.append(self.gpa, .agent, "agent", message);
     }
 
-    fn switchToNewSession(self: *App) !void {
+    pub fn switchToNewSession(self: *App) !void {
         return session_switcher.switchToNewSession(self);
     }
 
-    fn switchToSession(self: *App, session_id: []const u8) !void {
+    pub fn switchToSession(self: *App, session_id: []const u8) !void {
         return session_switcher.switchToSession(self, session_id);
     }
 
@@ -1217,20 +737,15 @@ pub const App = struct {
     }
 
     pub fn clearInput(self: *App) void {
-        self.inputs.input.clearRetainingCapacity();
+        input_lifecycle.clearInput(self);
     }
 
     pub fn clearPaletteInput(self: *App) void {
-        self.inputs.palette.clearRetainingCapacity();
+        input_lifecycle.clearPaletteInput(self);
     }
 
     pub fn peekCommentInput(self: *App) ![]u8 {
-        const left = self.inputs.comment.buf.firstHalf();
-        const right = self.inputs.comment.buf.secondHalf();
-        const out = try self.gpa.alloc(u8, left.len + right.len);
-        @memcpy(out[0..left.len], left);
-        @memcpy(out[left.len..], right);
-        return out;
+        return input_lifecycle.peekCommentInput(self);
     }
 
     // --- At-search (mention popup) ---------------------------------------
@@ -1258,7 +773,7 @@ pub const App = struct {
 
     // --- Queue management ------------------------------------------------
 
-    fn enqueueSubmit(self: *App) !bool {
+    pub fn enqueueSubmit(self: *App) !bool {
         return queue_mod.enqueueSubmit(self);
     }
 
@@ -1274,41 +789,30 @@ pub const App = struct {
         queue_mod.steerSelectedQueued(self);
     }
 
-    fn flushQueuedUserMessagesToTranscript(self: *App, count: u32) !void {
+    pub fn flushQueuedUserMessagesToTranscript(self: *App, count: u32) !void {
         return queue_mod.flushQueuedUserMessagesToTranscript(self, count);
     }
 
-    fn appendSkillInvocationsToTranscript(self: *App, prompt: []const u8) !void {
+    pub fn appendSkillInvocationsToTranscript(self: *App, prompt: []const u8) !void {
         return queue_mod.appendSkillInvocationsToTranscript(self, prompt);
     }
 
-    fn clearQueuedUserMessages(self: *App) void {
+    pub fn clearQueuedUserMessages(self: *App) void {
         queue_mod.clearQueuedUserMessages(self);
     }
 
-    /// Spawn a parallel lane: a fresh `git worktree` on its own `nova/<id>`
-    /// branch forked from the current HEAD, with its own session + agent, then
-    /// switch to it. Isolated while it runs — its own working copy, branch, and
-    /// snapshot index — but can later be folded into another lane via `/merge`
-    /// (or `/lanes` once parked). The hex branch is renamed to a descriptive
-    /// `nova/<name>` once the model names it on the lane's first submit (see
-    /// `scheduleLaneNaming` / `drainLaneNaming`). Refused mid-turn.
-    fn createParallelLane(self: *App) !void {
+    pub fn createParallelLane(self: *App) !void {
         try lifecycle.createParallelLane(self);
     }
 
-    /// Copy the tail of the current lane's conversation (user + agent text,
-    /// oldest first) as naming context for a lane forked from it.
     pub fn captureLaneContext(self: *App, max: usize) ![][]u8 {
         return lane_lifecycle.captureLaneContext(self, max);
     }
 
-    /// Ask the session's model to name the lane's branch from the first prompt.
     pub fn scheduleLaneNaming(self: *App, lane: *Thread, first_message: []const u8) !void {
         return lane_lifecycle.scheduleLaneNaming(self, lane, first_message);
     }
 
-    /// Called from the tick handler: rename any lane whose branch name landed.
     pub fn drainLaneNaming(self: *App) !bool {
         return lane_lifecycle.drainLaneNaming(self);
     }
@@ -1317,7 +821,6 @@ pub const App = struct {
         lane_lifecycle.cancelLaneNaming(self, lane);
     }
 
-    /// Whether any lane has an async branch-naming job in flight.
     pub fn namingActive(self: *const App) bool {
         return lane_lifecycle.namingActive(self);
     }
@@ -1326,7 +829,6 @@ pub const App = struct {
         return lane_lifecycle.reportLaneError(self, err);
     }
 
-    /// True while any lane has a turn in flight.
     pub fn anyTurnActive(self: *const App) bool {
         return lane_lifecycle.anyTurnActive(self);
     }
@@ -1335,197 +837,94 @@ pub const App = struct {
         return lane_lifecycle.activeIndex(self);
     }
 
-    /// Cycle the active lane by `delta` (+1 next, -1 previous), wrapping.
     pub fn cycleLane(self: *App, delta: i32) void {
         lane_lifecycle.cycleLane(self, delta);
     }
 
-    /// Cycle to the next lane (wrapping). No-op with a single lane.
     pub fn switchToNextLane(self: *App) void {
         lane_lifecycle.switchToNextLane(self);
     }
 
-    /// Toggle between tiled split view and fullscreening the active lane.
     pub fn toggleLaneFullscreen(self: *App) void {
         lane_lifecycle.toggleLaneFullscreen(self);
     }
 
-    /// Close the active lane by parking it (preserves worktree on disk).
     pub fn closeActiveLane(self: *App) !void {
         return lane_lifecycle.closeActiveLane(self);
     }
 
-    /// Merge the current lane into another.
     pub fn createMergePicker(self: *App) !void {
         return lane_lifecycle.createMergePicker(self);
     }
 
-    /// Enter in the `/merge` destination picker.
     pub fn confirmMergeDest(self: *App) !void {
         return lane_lifecycle.confirmMergeDest(self);
     }
 
-    /// `/lanes`: list parked worktrees.
     pub fn openLanesPicker(self: *App) !void {
         return lane_lifecycle.openLanesPicker(self);
     }
 
-    /// `/lanes` → M: merge selected parked worktree into current lane.
     pub fn mergeSelectedParked(self: *App) !void {
         return lane_lifecycle.mergeSelectedParked(self);
     }
 
-    /// `/lanes` → X: delete selected parked worktree.
     pub fn deleteSelectedParked(self: *App) !void {
         return lane_lifecycle.deleteSelectedParked(self);
     }
 
-    /// Number of rows in the lanes overlay.
     pub fn laneEntryCount(self: *const App) u32 {
         return lane_lifecycle.laneEntryCount(self);
     }
 
-    /// Free the lanes-overlay working state.
     pub fn clearLanesState(self: *App) void {
         lane_lifecycle.clearLanesState(self);
     }
 
-    /// Rows for the lanes overlay, arena-allocated each draw.
     pub fn buildLaneEntries(self: *App, arena: std.mem.Allocator) ![]lanes_picker.Entry {
         return lane_lifecycle.buildLaneEntries(self, arena);
     }
 
-    /// Route a `/lanes` key event.
     pub fn handleLanesKey(self: *App, key: vaxis.Key) !bool {
         return lane_lifecycle.handleLanesKey(self, key);
     }
 
     pub fn installRuntime(self: *App, runtime: *runtime_mod.AgentRuntime) !void {
-        if (self.thread.turn.isActive()) return error.InFlightTurn;
-        self.cancelLaneNaming(self.thread);
-        if (self.liveRuntime()) |old| {
-            old.deinit();
-            self.gpa.destroy(old);
-        }
-        self.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = true } };
-        self.thread.agent = &runtime.agent;
-        self.thread.id = runtime.session_writer.session.id;
-        // The label belongs to the departed session; the next first prompt
-        // re-derives it.
-        if (self.thread.title) |title| self.gpa.free(title);
-        self.thread.title = null;
-        self.mode = .normal;
-        self.clearInput();
-        self.resetTurnState();
+        return transcript_lifecycle.installRuntime(self, runtime);
     }
 
     pub fn clearConversation(self: *App) !void {
-        if (self.thread.transcript.messages.items.len > 0) {
-            try self.retired_transcripts.append(self.gpa, self.thread.transcript);
-        }
-        self.thread.transcript = .{};
-        self.thread.transcript_list.scroll = .{};
+        return transcript_lifecycle.clearConversation(self);
     }
 
     pub fn rebuildTranscriptFromAgent(self: *App) !void {
-        try self.clearConversation();
-        for (self.thread.agent.?.messages()) |message| {
-            if (message.role == .system) continue;
-            const text = message.text();
-            if (message.role == .user) {
-                _ = try self.thread.transcript.append(self.gpa, .user, "you", text);
-            } else if (message.role == .assistant) {
-                if (text.len > 0) _ = try self.thread.transcript.append(self.gpa, .agent, "agent", text);
-            } else if (message.role == .tool) {
-                const title = try self.resumedToolTitle(message);
-                defer self.gpa.free(title);
-                const index = try self.thread.transcript.append(self.gpa, .tool, title, text);
-                self.thread.transcript.messages.items[index].failed = message.tool_failed;
-            }
-        }
-        if (self.thread.transcript.messages.items.len > 0) self.thread.transcript.selected = @intCast(self.thread.transcript.messages.items.len - 1);
-        // A freshly installed (resumed) session left the label unset; re-derive
-        // it from the conversation's first user message.
-        if (self.thread.title == null) {
-            for (self.thread.agent.?.messages()) |message| {
-                if (message.role != .user) continue;
-                try self.setLaneTitleIfUnset(message.text());
-                break;
-            }
-        }
+        return transcript_lifecycle.rebuildTranscriptFromAgent(self);
     }
 
-    fn resumedToolTitle(self: *App, message: ai.ChatMessage) ![]u8 {
-        if (message.tool_display_label) |label| return transcript_mod.toolTitle(self.gpa, label);
-        const id = message.call_id orelse return transcript_mod.toolTitle(self.gpa, "tool");
-        for (self.thread.agent.?.messages()) |candidate| {
-            for (candidate.content) |block| {
-                if (block != .tool_call) continue;
-                if (!std.mem.eql(u8, block.tool_call.call_id, id)) continue;
-                var display = try agent_mod.formatToolDisplay(self.gpa, block.tool_call.name, block.tool_call.arguments);
-                defer display.deinit(self.gpa);
-                return transcript_mod.toolTitle(self.gpa, display.label);
-            }
-        }
-        return transcript_mod.toolTitle(self.gpa, id);
+    pub fn resumedToolTitle(self: *App, message: ai.ChatMessage) ![]u8 {
+        return transcript_lifecycle.resumedToolTitle(self, message);
     }
 
-    fn peekInput(self: *App) ![]u8 {
-        const left = self.inputs.input.buf.firstHalf();
-        const right = self.inputs.input.buf.secondHalf();
-        const out = try self.gpa.alloc(u8, left.len + right.len);
-        @memcpy(out[0..left.len], left);
-        @memcpy(out[left.len..], right);
-        return out;
+    pub fn peekInput(self: *App) ![]u8 {
+        return input_lifecycle.peekInput(self);
     }
 
     pub fn inputTextRows(self: *App, ctx: vxfw.DrawContext, width: u16) !u16 {
-        const text = try self.peekInput();
-        defer self.gpa.free(text);
-        return input_mod.wrappedTextRows(ctx, text, width);
+        return input_lifecycle.inputTextRows(self, ctx, width);
     }
 
     pub fn insertInputNewline(self: *App) !void {
-        try self.inputs.input.insertSliceAtCursor("\n");
-        try self.updateAtSearch();
+        return input_lifecycle.insertInputNewline(self);
     }
 
-    /// Moves the input cursor up or down by one *visual* row, so navigation
-    /// follows the wrapped layout the user actually sees — a long line with no
-    /// manual breaks behaves like a multi-row text area, not a single logical
-    /// line. Returns false when there is no row to move to (top/bottom), so the
-    /// caller can hand control to block navigation.
     pub fn moveInputCursorVertical(self: *App, move: input_mod.VerticalMove) !bool {
-        const text = try self.peekInput();
-        defer self.gpa.free(text);
-        const cur = self.inputs.input.buf.firstHalf().len;
-        // Before the first draw (only in tests) the width is unknown; a wide
-        // sentinel keeps every logical line on one visual row.
-        const width: u16 = if (self.input_wrap_width == 0) 4096 else self.input_wrap_width;
+        return input_lifecycle.moveInputCursorVertical(self, move);
+    }
 
-        const pos = input_mod.wrappedPosition(text, cur, width);
-        const target_row: u16 = switch (move) {
-            .up => if (pos.row == 0) return false else pos.row - 1,
-            .down => blk: {
-                const last_row = input_mod.wrappedPosition(text, text.len, width).row;
-                if (pos.row >= last_row) return false;
-                break :blk pos.row + 1;
-            },
-        };
+    pub const HistoryDirection = Thread.HistoryDirection;
 
-        const row_start = input_mod.visualRowStart(text, target_row, width);
-        var row_end = input_mod.visualRowStart(text, target_row + 1, width);
-        // A row that ends at a hard break owns the text up to, but not
-        // including, the newline.
-        if (row_end > row_start and text[row_end - 1] == '\n') row_end -= 1;
-        const target = input_mod.byteAtVisualColumn(text, row_start, row_end, pos.col);
-
-        if (target < cur) {
-            self.inputs.input.buf.moveGapLeft(cur - target);
-        } else if (target > cur) {
-            self.inputs.input.buf.moveGapRight(target - cur);
-        }
-        return true;
+    pub fn navigatePromptHistory(self: *App, direction: HistoryDirection) !bool {
+        return input_lifecycle.navigatePromptHistory(self, direction);
     }
 
     pub fn selectionIsLastMessage(self: *const App) bool {
@@ -1705,31 +1104,32 @@ pub const RootWidget = struct {
 };
 
 pub fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
-    if (!key.matches('/', .{})) return false;
-    return switch (app.mode) {
-        .normal => app.inputs.input.buf.realLength() == 0,
-        .session_picker, .model_picker, .tree_picker => app.inputs.palette.buf.realLength() == 0,
-        .provider_picker => app.pickers.provider.stage == .list and app.inputs.palette.buf.realLength() == 0,
-        .command, .diff_viewer, .save_message, .lanes => false,
-    };
+    return mode_lifecycle.shouldOpenCommandMenuForSlash(app, key);
 }
 
-pub const Command = enum { connect, model, new, resume_session, timeline, diff, parallel, save, close, merge, lanes };
+pub const Command = enum { connect, model, new, resume_session, timeline, diff, parallel, save, close, merge, lanes, clear, compact, status, help, export_session, exit_cmd };
 /// `multi_lane` commands act on another lane, so they're hidden from the palette
 /// (and unresolvable) until more than one lane exists.
-pub const CommandEntry = struct { name: []const u8, command: Command, multi_lane: bool = false };
+pub const CommandEntry = struct { name: []const u8, command: Command, description: []const u8 = "", category: []const u8 = "", multi_lane: bool = false };
 pub const commands = [_]CommandEntry{
-    .{ .name = "Connect", .command = .connect },
-    .{ .name = "Models", .command = .model },
-    .{ .name = "New", .command = .new },
-    .{ .name = "Resume", .command = .resume_session },
-    .{ .name = "Timeline", .command = .timeline },
-    .{ .name = "Diff", .command = .diff },
-    .{ .name = "Parallel", .command = .parallel },
-    .{ .name = "Save", .command = .save },
-    .{ .name = "Merge", .command = .merge, .multi_lane = true },
-    .{ .name = "Close", .command = .close, .multi_lane = true },
-    .{ .name = "Lanes", .command = .lanes },
+    .{ .name = "Connect", .command = .connect, .description = "Configure AI provider & API key", .category = "AI & MODELS" },
+    .{ .name = "Models", .command = .model, .description = "Select model & reasoning effort", .category = "AI & MODELS" },
+    .{ .name = "New", .command = .new, .description = "Start a fresh session", .category = "SESSION" },
+    .{ .name = "Resume", .command = .resume_session, .description = "Resume a past session", .category = "SESSION" },
+    .{ .name = "Timeline", .command = .timeline, .description = "Browse session tree history", .category = "SESSION" },
+    .{ .name = "Clear", .command = .clear, .description = "Clear current transcript view", .category = "SESSION" },
+    .{ .name = "Compact", .command = .compact, .description = "Compact session context history", .category = "SESSION" },
+    .{ .name = "Export", .command = .export_session, .description = "Save conversation transcript as Markdown", .category = "SESSION" },
+    .{ .name = "Diff", .command = .diff, .description = "View git diff & add comments", .category = "GIT & WORKTREE" },
+    .{ .name = "Parallel", .command = .parallel, .description = "Fork worktree into parallel lane", .category = "GIT & WORKTREE" },
+    .{ .name = "Save", .command = .save, .description = "Save working copy snapshot", .category = "GIT & WORKTREE" },
+    .{ .name = "Merge", .command = .merge, .description = "Merge lane into target", .category = "GIT & WORKTREE", .multi_lane = true },
+    .{ .name = "Close", .command = .close, .description = "Park and close active lane", .category = "GIT & WORKTREE", .multi_lane = true },
+    .{ .name = "Lanes", .command = .lanes, .description = "Manage parked worktree lanes", .category = "GIT & WORKTREE" },
+    .{ .name = "Status", .command = .status, .description = "Show agent runtime & git state", .category = "SYSTEM" },
+    .{ .name = "Help", .command = .help, .description = "Show keyboard shortcuts & guide", .category = "SYSTEM" },
+    .{ .name = "Exit", .command = .exit_cmd, .description = "Quit Nova agent", .category = "SYSTEM" },
+    .{ .name = "Quit", .command = .exit_cmd, .description = "Quit Nova agent", .category = "SYSTEM" },
 };
 
 /// Whether `entry` should appear in the palette given the current lane count.
@@ -1739,44 +1139,16 @@ pub fn commandVisible(app: *const App, entry: CommandEntry) bool {
 }
 
 fn resolveCommand(app: *App, filter: []const u8) ?Command {
-    var selected: ?Command = null;
-    var index: u32 = 0;
-    for (commands) |entry| {
-        if (!commandVisible(app, entry)) continue;
-        if (!startsWithIgnoreCase(entry.name, filter)) continue;
-        if (index == app.nav.command_selection) selected = entry.command;
-        index += 1;
-    }
-    if (selected) |command| return command;
-    if (index == 1) {
-        for (commands) |entry| {
-            if (!commandVisible(app, entry)) continue;
-            if (startsWithIgnoreCase(entry.name, filter)) return entry.command;
-        }
-    }
-    return null;
+    return mode_lifecycle.resolveCommand(app, filter);
 }
 
 pub fn commandMatchesCount(app: *App) u32 {
-    const filter = app.peekPaletteInput() catch return 0;
-    defer app.gpa.free(filter);
-    return commandMatchesCountForFilter(app, filter);
+    return mode_lifecycle.commandMatchesCount(app);
 }
 
 pub fn commandMatchesCountForFilter(app: *const App, filter: []const u8) u32 {
-    var count: u32 = 0;
-    for (commands) |entry| {
-        if (!commandVisible(app, entry)) continue;
-        if (startsWithIgnoreCase(entry.name, filter)) count += 1;
-    }
-    return count;
+    return mode_lifecycle.commandMatchesCountForFilter(app, filter);
 }
-
-fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
-    if (prefix.len > value.len) return false;
-    return std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
-}
-
 
 /// Builds the floating `@`-results panel from app state. Presentational only;
 /// the main input keeps focus.
@@ -1801,51 +1173,12 @@ pub const AtSearchWidget = struct {
     }
 };
 
-/// Draw `text` on `row` so its last cell ends at `end_col` (inclusive), filling
-/// leftward. Returns the first column the text occupies — or `end_col + 1` when
-/// nothing was drawn — so a caller can place another label further left.
 pub fn writeBorderTextEndingAt(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, end_col: u16, text: []const u8, style: vaxis.Style) u16 {
-    if (text.len == 0 or row >= surface.size.height) return end_col + 1;
-    const text_w: u16 = @intCast(ctx.stringWidth(text));
-    if (text_w == 0 or text_w > end_col + 1) return end_col + 1;
-    const start: u16 = end_col + 1 - text_w;
-    var col = start;
-    var iter = ctx.graphemeIterator(text);
-    while (iter.next()) |grapheme| {
-        const bytes = grapheme.bytes(text);
-        const width: u16 = @intCast(ctx.stringWidth(bytes));
-        if (width == 0) continue;
-        surface.writeCell(col, row, .{
-            .char = .{ .grapheme = bytes, .width = @intCast(width) },
-            .style = style,
-        });
-        col += width;
-    }
-    return start;
+    return panel.writeBorderTextEndingAt(surface, ctx, row, end_col, text, style);
 }
 
 pub fn writeBorderLabelRight(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, text: []const u8, style: vaxis.Style) void {
-    if (text.len == 0 or row >= surface.size.height) return;
-    const w = surface.size.width;
-    if (w < 4) return;
-    const max_w: u16 = w -| 3;
-    const text_w: u16 = @intCast(@min(ctx.stringWidth(text), @as(usize, max_w)));
-    if (text_w == 0) return;
-    var col: u16 = w -| 2 -| text_w;
-    var used: u16 = 0;
-    var iter = ctx.graphemeIterator(text);
-    while (iter.next()) |grapheme| {
-        const bytes = grapheme.bytes(text);
-        const width: u16 = @intCast(ctx.stringWidth(bytes));
-        if (width == 0) continue;
-        if (used + width > text_w) break;
-        surface.writeCell(col, row, .{
-            .char = .{ .grapheme = bytes, .width = @intCast(width) },
-            .style = style,
-        });
-        col += width;
-        used += width;
-    }
+    panel.writeBorderLabelRight(surface, ctx, row, text, style);
 }
 
 pub fn modelPickerScope(scope: App.ModelScope) model_picker.Scope {
@@ -1867,7 +1200,6 @@ const reasoning_options = [_]model_picker.ReasoningOption{
 pub fn reasoningOptions() []const model_picker.ReasoningOption {
     return &reasoning_options;
 }
-
 
 test "parse diff counts sums numstat and skips binary" {
     const counts = diff_utils.parseDiffCounts(
@@ -2274,7 +1606,7 @@ test "root overlay host does not paint outside panel" {
     try std.testing.expectEqual(@as(usize, 1), overlay_host.children.len);
 
     const panel_surface = overlay_host.children[0].surface;
-    try std.testing.expectEqual(@as(u16, 40), panel_surface.size.width);
+    try std.testing.expectEqual(@as(u16, 64), panel_surface.size.width);
     try std.testing.expectEqual(@as(u16, 16), panel_surface.size.height);
 }
 
@@ -3085,9 +2417,8 @@ test "lane commands stay hidden until a second lane exists" {
     defer app.deinit();
 
     // Single lane: the multi-lane commands (/merge, /close) are filtered out of
-    // the palette and can't be resolved; the nine always-on commands remain
-    // (Connect, Models, New, Resume, Timeline, Diff, Parallel, Save, Lanes).
-    try std.testing.expectEqual(@as(u32, 9), commandMatchesCountForFilter(&app, ""));
+    // the palette and can't be resolved; the sixteen always-on commands remain.
+    try std.testing.expectEqual(@as(u32, 16), commandMatchesCountForFilter(&app, ""));
     try std.testing.expect(resolveCommand(&app, "Close") == null);
     try std.testing.expect(resolveCommand(&app, "Merge") == null);
     // `/sync` was removed with the git-shadow pivot and never came back.

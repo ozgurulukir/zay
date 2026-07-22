@@ -18,6 +18,7 @@ const tui_style = @import("style.zig");
 const panel = @import("widgets/panel.zig");
 const diff = @import("widgets/diff.zig");
 const symbols = @import("../symbols.zig");
+const tui_status = @import("status.zig");
 
 const App = tui.App;
 const StylePalette = tui_style.Palette;
@@ -70,6 +71,14 @@ pub fn drawDiffViewer(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext
     } else {
         panel.lineStyledAt(&surface, h -| 2, diff_hint_line1, ctx, 1, StylePalette.thinking_body) catch {};
         panel.lineStyledAt(&surface, h -| 1, diff_hint_line2, ctx, 1, StylePalette.thinking_body) catch {};
+        const status_text = if (tui_status.modelStatus(app.liveRuntime(), app.cached_config)) |status|
+            tui_status.formatModelStatus(ctx.arena, status) catch ""
+        else
+            "";
+        if (status_text.len > 0 or app.metrics.git_label.len > 0) {
+            const label = std.fmt.allocPrint(ctx.arena, " {s} · {s} ", .{ status_text, app.metrics.git_label }) catch "";
+            _ = panel.writeBorderTextEndingAt(&surface, ctx, h -| 1, w -| 1, label, StylePalette.model_status);
+        }
     }
 
     if (app.diff.sub == .file_search) {

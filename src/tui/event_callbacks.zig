@@ -52,7 +52,7 @@ pub fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value
         .diff_viewer => {
             if (app.diff.sub == .file_search) try app.diff.filterFiles(app.gpa, value);
         },
-        .provider_picker, .normal, .save_message, .lanes => {},
+        .provider_picker, .normal, .save_message, .lanes, .help => {},
     }
     ctx.consumeAndRedraw();
 }

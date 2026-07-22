@@ -58,10 +58,10 @@ fn refreshAtResults(app: *App) !void {
 }
 
 fn refreshFileResults(app: *App) !void {
-    if (app.at_search.query.len == 0) return;
+    const search_query = if (app.at_search.query.len == 0) " " else app.at_search.query;
     var result = (try search_mod.runIfReady(app.gpa, app.io, .{
         .op = .find,
-        .query = app.at_search.query,
+        .query = search_query,
     })) orelse {
         app.at_search.indexing = true;
         return;

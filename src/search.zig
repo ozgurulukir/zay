@@ -211,7 +211,7 @@ fn runReadyBackend(gpa: std.mem.Allocator, io: std.Io, request: Request) !?Resul
 
     const api = &backend.api.?;
     const handle = backend.handle orelse return null;
-    if (api.is_scanning(handle)) return null;
+    if (request.op == .grep and api.is_scanning(handle)) return null;
     return runFff(gpa, request, api, handle) catch |err| switch (err) {
         error.OutOfMemory, error.InvalidCursor => err,
         else => {
@@ -479,4 +479,24 @@ test "shell quoting handles single quotes" {
     const quoted = try quoteShell(gpa, "can't");
     defer gpa.free(quoted);
     try std.testing.expectEqualStrings("'can'\\''t'", quoted);
+}
+
+test "fff search initializes and finds files" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    start(gpa, io, ".");
+    defer deinit(gpa, io);
+
+    var tries: usize = 0;
+    while (tries < 50) : (tries += 1) {
+        if (try runIfReady(gpa, io, .{ .op = .find, .query = "main" })) |result| {
+            var res = result;
+            defer res.deinit(gpa);
+            try std.testing.expect(res.stdout.len > 0);
+            return;
+        }
+        io.sleep(std.Io.Duration.fromNanoseconds(10 * 1000 * 1000), .awake) catch {};
+    }
+    return error.SearchStuckInIndexing;
 }

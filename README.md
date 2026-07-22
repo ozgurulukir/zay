@@ -39,7 +39,12 @@ concern:
 - `event_router.zig` — top-level event entry (`captureEvent`).
 - `command_router.zig` — per-mode key dispatch (one struct per `App.Mode`).
 - `app_state.zig` — `App` state grouped into sub-structs.
-- `background_delivery.zig` — background-job poll/format/deliver.
+- `background_delivery.zig` — background-job poll/format/deliver, modal toggling, job cancel.
+- `turn_lifecycle.zig` — turn start, interrupt, event application, cancel/reset.
+- `checkpoint.zig` — git-shadow checkpoint snapshotting, readiness checks, and `/save`.
+- `mode_lifecycle.zig` — command matching, slash menu checks, mode switching.
+- `input_lifecycle.zig` — input buffer peeking, clearing, vertical cursor navigation.
+- `transcript_lifecycle.zig` — runtime installation and transcript rebuilding.
 - `lane_lifecycle.zig` — lane naming, cycling, closing, merging, `/lanes` overlay.
 - `diff_lifecycle.zig` — async diff refresh pipeline (DiffCounts, schedule/cancel/drain).
 - `session_switcher.zig` — resume picker, session creation, timeline navigation.

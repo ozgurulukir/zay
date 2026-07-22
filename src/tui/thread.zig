@@ -51,6 +51,9 @@ turn: Turn = .{},
 turn_view: turn_view_mod.TurnView = .{},
 /// Messages the user queued behind a running turn on this lane. Owned text.
 queued: std.ArrayList(QueuedMessage) = .empty,
+/// Prompt history submitted on this lane for Up/Down navigation.
+prompt_history: std.ArrayList([]u8) = .empty,
+prompt_history_index: ?usize = null,
 /// Per-lane viewport state that outlives any single turn.
 auto_scroll: bool = true,
 /// Per-lane scroll/viewport state for rendering this lane's transcript in its
@@ -120,6 +123,8 @@ pub fn deinit(self: *Thread, gpa: std.mem.Allocator) void {
     self.turn_view.deinit(gpa);
     for (self.queued.items) |*message| gpa.free(message.text);
     self.queued.deinit(gpa);
+    for (self.prompt_history.items) |p| gpa.free(p);
+    self.prompt_history.deinit(gpa);
     if (self.pending_prompt) |prompt| gpa.free(prompt);
     if (self.worker_context) |*worker| {
         worker.approval.deinit(worker.io, gpa);
@@ -138,6 +143,52 @@ pub fn deinit(self: *Thread, gpa: std.mem.Allocator) void {
         },
     }
     self.* = undefined;
+}
+
+pub fn pushPromptHistory(self: *Thread, gpa: std.mem.Allocator, text: []const u8) !void {
+    if (text.len == 0) return;
+    if (self.prompt_history.items.len > 0) {
+        const last = self.prompt_history.items[self.prompt_history.items.len - 1];
+        if (std.mem.eql(u8, last, text)) {
+            self.prompt_history_index = null;
+            return;
+        }
+    }
+    const dup = try gpa.dupe(u8, text);
+    try self.prompt_history.append(gpa, dup);
+    self.prompt_history_index = null;
+}
+
+pub const HistoryDirection = enum { up, down };
+
+pub fn navigatePromptHistory(self: *Thread, direction: HistoryDirection) ?[]const u8 {
+    if (self.prompt_history.items.len == 0) return null;
+    const len = self.prompt_history.items.len;
+    switch (direction) {
+        .up => {
+            if (self.prompt_history_index) |idx| {
+                if (idx > 0) self.prompt_history_index = idx - 1;
+            } else {
+                self.prompt_history_index = len - 1;
+            }
+        },
+        .down => {
+            if (self.prompt_history_index) |idx| {
+                if (idx + 1 < len) {
+                    self.prompt_history_index = idx + 1;
+                } else {
+                    self.prompt_history_index = null;
+                    return "";
+                }
+            } else {
+                return null;
+            }
+        },
+    }
+    if (self.prompt_history_index) |idx| {
+        return self.prompt_history.items[idx];
+    }
+    return null;
 }
 
 test "idle thread frees its owned title, transcript, and queue" {
@@ -163,4 +214,18 @@ test "idle working lane frees its worktree branch and path" {
         .path = try gpa.dupe(u8, "/repo/.nova/worktrees/x"),
     } } } };
     thread.deinit(gpa);
+}
+
+test "prompt history navigation cycles through saved prompts" {
+    const gpa = std.testing.allocator;
+    var thread: Thread = .{};
+    defer thread.deinit(gpa);
+
+    try thread.pushPromptHistory(gpa, "first prompt");
+    try thread.pushPromptHistory(gpa, "second prompt");
+
+    try std.testing.expectEqualStrings("second prompt", thread.navigatePromptHistory(.up).?);
+    try std.testing.expectEqualStrings("first prompt", thread.navigatePromptHistory(.up).?);
+    try std.testing.expectEqualStrings("second prompt", thread.navigatePromptHistory(.down).?);
+    try std.testing.expectEqualStrings("", thread.navigatePromptHistory(.down).?);
 }

@@ -7,6 +7,7 @@
 //! 1-line delegates so existing call sites compile unchanged.
 
 const std = @import("std");
+const vaxis = @import("vaxis");
 const tui = @import("../tui.zig");
 
 const App = tui.App;
@@ -54,7 +55,12 @@ pub fn pollBackgroundJobs(app: *App) !bool {
         };
         job.deinit(app.gpa);
     }
+    if (finished.len > 0) ringBell();
     return finished.len > 0;
+}
+
+pub fn ringBell() void {
+    std.debug.print("\x07", .{});
 }
 
 /// Format the human-readable notice for a finished job.
@@ -103,4 +109,55 @@ pub fn deliverPendingBackground(app: *App) !bool {
         // Removed in place — re-check the same index next iteration.
     }
     return changed;
+}
+
+pub fn runningBackgroundCount(app: *App) usize {
+    const manager = app.background orelse return 0;
+    return manager.runningCount();
+}
+
+pub fn toggleBackgroundModal(app: *App) void {
+    if (!app.background_modal_state.modal and runningBackgroundCount(app) == 0) return;
+    app.background_modal_state.modal = !app.background_modal_state.modal;
+    app.background_modal_state.selection = 0;
+    app.background_modal_state.cancel_focus = false;
+}
+
+pub fn handleBackgroundModalKey(app: *App, key: vaxis.Key) bool {
+    const count = runningBackgroundCount(app);
+    if (count == 0) return false;
+    if (app.background_modal_state.selection >= count) app.background_modal_state.selection = count - 1;
+    if (key.matches(vaxis.Key.up, .{})) {
+        if (app.background_modal_state.selection > 0) app.background_modal_state.selection -= 1;
+        app.background_modal_state.cancel_focus = false;
+        return true;
+    }
+    if (key.matches(vaxis.Key.down, .{})) {
+        if (app.background_modal_state.selection + 1 < count) app.background_modal_state.selection += 1;
+        app.background_modal_state.cancel_focus = false;
+        return true;
+    }
+    if (key.matches(vaxis.Key.left, .{})) {
+        app.background_modal_state.cancel_focus = false;
+        return true;
+    }
+    if (key.matches(vaxis.Key.right, .{})) {
+        app.background_modal_state.cancel_focus = true;
+        return true;
+    }
+    if (app.background_modal_state.cancel_focus and key.matches(vaxis.Key.enter, .{})) {
+        cancelSelectedBackgroundJob(app);
+        return true;
+    }
+    return false;
+}
+
+pub fn cancelSelectedBackgroundJob(app: *App) void {
+    const manager = app.background orelse return;
+    const views = manager.snapshot(app.gpa) catch return;
+    defer tui.background_mod.BackgroundManager.freeViews(app.gpa, views);
+    if (views.len == 0) return;
+    const sel = @min(app.background_modal_state.selection, views.len - 1);
+    _ = manager.cancel(views[sel].id);
+    app.background_modal_state.cancel_focus = false;
 }

@@ -139,8 +139,15 @@ fn routeKey(
         if (app.handleBackgroundModalKey(key)) ctx.consumeAndRedraw() else ctx.consumeEvent();
         return;
     }
-    if (key.matches('c', .{ .ctrl = true })) {
-        if (app.isNormalMode() and app.inputRealLength() > 0) {
+    if (app.nav.quit_requested) {
+        ctx.quit = true;
+        ctx.consume_event = true;
+        return;
+    }
+    const is_ctrl_c = key.matches('c', .{ .ctrl = true });
+    const is_ctrl_d_empty = key.matches('d', .{ .ctrl = true }) and app.isNormalMode() and app.inputRealLength() == 0;
+    if (is_ctrl_c or is_ctrl_d_empty) {
+        if (is_ctrl_c and app.isNormalMode() and app.inputRealLength() > 0) {
             app.clearInput();
             app.closeAtSearch();
             app.setBlockNav(false);
@@ -159,7 +166,7 @@ fn routeKey(
             }
         }
         app.setPendingQuitAt(now);
-        ctx.consume_event = true;
+        ctx.consumeAndRedraw();
         return;
     }
     // Any other key cancels the pending-quit prompt.

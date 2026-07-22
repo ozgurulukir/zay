@@ -65,6 +65,7 @@ pub const NavState = struct {
     lanes_purpose: LanesPurpose = .manage,
     queued_selection: usize = 0,
     pending_quit_at: ?std.Io.Timestamp = null,
+    quit_requested: bool = false,
     lanes_chip_rect: ?tui.ChipRect = null,
 };
 
@@ -94,6 +95,8 @@ pub const MetricsState = struct {
     blackhole_frame: u16 = 0,
     blackhole_visible: bool = true,
     git_label: []const u8 = "",
+    context_tokens_used: u32 = 0,
+    context_tokens_max: u32 = 128000,
     diff_counts: tui.DiffCounts = .{},
     diff_refresh_future: ?std.Io.Future(tui.DiffRefreshOutcome) = null,
     diff_refresh_done: std.atomic.Value(bool) = .init(false),

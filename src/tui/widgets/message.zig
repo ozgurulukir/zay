@@ -93,7 +93,7 @@ pub const MessageWidget = struct {
                     drawWrapped(surface, self.message.body, StylePalette.thinking_body, styled_as_selected, &row, ctx, 0, null);
                 }
             },
-            .notice => drawWrapped(surface, self.message.body, StylePalette.tool_failed, styled_as_selected, &row, ctx, 2, StylePalette.tool_failed),
+            .notice => drawWrapped(surface, self.message.body, StylePalette.notice, styled_as_selected, &row, ctx, 2, StylePalette.notice),
             .success => drawWrapped(surface, self.message.body, StylePalette.tool, styled_as_selected, &row, ctx, 2, StylePalette.tool),
             .info => drawWrapped(surface, self.message.body, StylePalette.info, styled_as_selected, &row, ctx, 2, StylePalette.info),
             .logo => drawIntro(surface, self.blackhole_frame, &row, ctx),
@@ -135,9 +135,9 @@ pub const MessageWidget = struct {
     ) void {
         std.debug.assert(message.kind == .tool);
         std.debug.assert(loading_frame < loading_frames.len);
-        const prefix = if (message.tool_running) loading_frames[loading_frame] else "🛠";
         const title = if (message.expanded) message.tool_expanded_title orelse message.title else message.title;
         const command = toolCommandTitle(title);
+        const prefix = if (message.tool_running) loading_frames[loading_frame] else toolIcon(command);
         drawToolTitleWrapped(surface, prefix, command, style, selected, row, ctx);
     }
 
@@ -187,6 +187,23 @@ pub const MessageWidget = struct {
         const prefix = "🛠  ";
         if (std.mem.startsWith(u8, title, prefix)) return title[prefix.len..];
         return title;
+    }
+
+    fn toolIcon(command: []const u8) []const u8 {
+        if (indexOfIgnoreCase(command, "write") != null or indexOfIgnoreCase(command, "edit") != null or indexOfIgnoreCase(command, "replace") != null) return "📝";
+        if (indexOfIgnoreCase(command, "read") != null or indexOfIgnoreCase(command, "view") != null) return "👁";
+        if (indexOfIgnoreCase(command, "search") != null or indexOfIgnoreCase(command, "grep") != null or indexOfIgnoreCase(command, "find") != null) return "🔍";
+        if (indexOfIgnoreCase(command, "bash") != null or indexOfIgnoreCase(command, "run") != null or indexOfIgnoreCase(command, "exec") != null) return "⚡";
+        return "🛠";
+    }
+
+    fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+        if (needle.len > haystack.len) return null;
+        var i: usize = 0;
+        while (i <= haystack.len - needle.len) : (i += 1) {
+            if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+        }
+        return null;
     }
 
     fn drawIntro(surface: *vxfw.Surface, frame_index: u16, row: *u16, ctx: vxfw.DrawContext) void {

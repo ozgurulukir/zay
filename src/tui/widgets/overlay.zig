@@ -34,13 +34,14 @@ const OverlaySize = struct { width: u16, height: u16 };
 fn overlaySize(mode: App.Mode) OverlaySize {
     return switch (mode) {
         .normal => .{ .width = 0, .height = 0 },
-        .command => .{ .width = 40, .height = 16 },
+        .command => .{ .width = 64, .height = 16 },
         .provider_picker => .{ .width = 72, .height = 16 },
         .session_picker => .{ .width = 80, .height = 16 },
         .model_picker => .{ .width = 90, .height = 16 },
         .tree_picker => .{ .width = 90, .height = 20 },
         .save_message => .{ .width = 60, .height = 3 },
         .lanes => .{ .width = 80, .height = 16 },
+        .help => .{ .width = 80, .height = 18 },
         .diff_viewer => .{ .width = 0, .height = 0 },
     };
 }
@@ -54,6 +55,7 @@ fn overlayLabel(app: *const App) []const u8 {
         .model_picker => "Select Model",
         .tree_picker => "Session Timeline",
         .save_message => "Commit Message",
+        .help => "Help & Keyboard Shortcuts",
         .lanes => switch (app.nav.lanes_purpose) {
             .manage => "Parallel Lanes",
             .merge_dest => "Merge Into",
@@ -188,6 +190,8 @@ const OverlayInner = struct {
         return surface;
     }
 
+    const help_picker = @import("help_picker.zig");
+
     fn drawContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         return switch (app.mode) {
             .command => drawCommandContent(app, ctx),
@@ -197,10 +201,17 @@ const OverlayInner = struct {
             .tree_picker => drawTreeContent(app, ctx),
             .save_message => drawSaveMessageContent(app, ctx),
             .lanes => drawLanesContent(app, ctx),
+            .help => drawHelpContent(app, ctx),
             // The diff viewer is full-screen — `drawRoot` returns before the
             // overlay path, so this is never reached.
             .normal, .diff_viewer => unreachable,
         };
+    }
+
+    fn drawHelpContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        _ = app;
+        var content: help_picker.Content = .{};
+        return content.widget().draw(ctx);
     }
 
     fn drawSaveMessageContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
@@ -241,7 +252,7 @@ const OverlayInner = struct {
         var n: usize = 0;
         for (tui.commands) |entry| {
             if (!tui.commandVisible(app, entry)) continue;
-            buf[n] = .{ .name = entry.name };
+            buf[n] = .{ .name = entry.name, .description = entry.description };
             n += 1;
         }
         var content: command_panel.Content = .{
@@ -309,4 +320,3 @@ const OverlayInner = struct {
         return content.widget().draw(ctx);
     }
 };
-

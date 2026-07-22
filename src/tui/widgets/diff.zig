@@ -266,7 +266,7 @@ pub const DiffCommentEditor = struct {
             .labels = &.{.{ .text = label, .alignment = .top_left }},
         };
         var surface = try border.widget().draw(ctx);
-        tui.writeBorderLabelRight(&surface, ctx, 0, "^S save · Esc cancel", StylePalette.thinking_body);
+        panel.writeBorderLabelRight(&surface, ctx, 0, "^S save · Esc cancel", StylePalette.thinking_body);
         return surface;
     }
 };

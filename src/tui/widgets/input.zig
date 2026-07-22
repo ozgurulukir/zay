@@ -53,22 +53,24 @@ fn writeAscii(surface: *vxfw.Surface, text: []const u8, style: vaxis.Style, col_
 }
 
 fn inputHintText(app: *const App) []const u8 {
+    if (app.getPendingQuitAt() != null) return "Press Ctrl+C or Ctrl+D again to exit";
     return switch (app.mode) {
-        .command => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
-        .session_picker => if (app.nav.resume_global)
-            "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[CTRL+A] Current project" ++ symbols.separator_dot_padded ++ "[TAB] Fold" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back"
-        else
-            "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[CTRL+A] All projects" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
-        .provider_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Actions" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
-        .model_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Column" ++ symbols.separator_dot_padded ++ "[TAB] Toggle Effort/Scope" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Back",
-        .tree_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←→ Filter" ++ symbols.separator_dot_padded ++ "[TAB] Fold" ++ symbols.separator_dot_padded ++ "✦ Checkpoint" ++ symbols.separator_dot_padded ++ "[ENTER] Switch" ++ symbols.separator_dot_padded ++ "[ESC] Back",
+        .command => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Execute" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
+        .session_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Resume" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
+        .provider_picker => switch (app.pickers.provider.stage) {
+            .list => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
+            .form => "[ENTER] Save API Key" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
+        },
+        .model_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←/→ Effort" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
+        .tree_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Jump to branch" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
         .save_message => "[ENTER] Save" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
         .lanes => switch (app.nav.lanes_purpose) {
             .manage => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[M] Merge into current" ++ symbols.separator_dot_padded ++ "[X] Delete" ++ symbols.separator_dot_padded ++ "[ESC] Back",
             .merge_dest => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Merge into" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         },
         .diff_viewer => "",
-        .normal => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[SHIFT] ↓ Jump to Bottom" ++ symbols.separator_dot_padded ++ "[TAB] Expand",
+        .help => "[ESC] / [ENTER] Close Help",
+        .normal => "Type prompt, @file, $skill or / for menu" ++ symbols.separator_dot_padded ++ "Ctrl+O Background" ++ symbols.separator_dot_padded ++ "Ctrl+N Lanes",
     };
 }
 
@@ -492,12 +494,34 @@ pub const InputWidget = struct {
             tui_status.formatModelStatus(ctx.arena, status) catch ""
         else
             "";
-        tui.writeBorderLabelRight(&surface, ctx, 0, status_text, StylePalette.model_status);
+        const pct: u32 = if (self.app.metrics.context_tokens_max > 0 and self.app.metrics.context_tokens_used > 0)
+            @min(100, (self.app.metrics.context_tokens_used * 100) / self.app.metrics.context_tokens_max)
+        else
+            0;
+        const ctx_bar = formatContextBar(ctx.arena, pct) catch "";
+        const label_text = if (ctx_bar.len > 0 and status_text.len > 0)
+            std.fmt.allocPrint(ctx.arena, "{s}  {s}", .{ status_text, ctx_bar }) catch status_text
+        else if (status_text.len > 0)
+            status_text
+        else
+            ctx_bar;
+        panel.writeBorderLabelRight(&surface, ctx, 0, label_text, StylePalette.model_status);
         // Bottom-right: git branch info at the edge.
         const bottom = border_height -| 1;
         const right_edge = max_width -| 3; // last interior cell before the corner margin
-        _ = tui.writeBorderTextEndingAt(&surface, ctx, bottom, right_edge, self.app.metrics.git_label, StylePalette.thinking_body);
+        _ = panel.writeBorderTextEndingAt(&surface, ctx, bottom, right_edge, self.app.metrics.git_label, StylePalette.thinking_body);
         return surface;
+    }
+
+    fn formatContextBar(arena: std.mem.Allocator, pct: u32) ![]const u8 {
+        if (pct == 0) return "";
+        const filled: usize = (pct * 5) / 100;
+        var bar_buf = [5][]const u8{ "░", "░", "░", "░", "░" };
+        var i: usize = 0;
+        while (i < filled and i < 5) : (i += 1) bar_buf[i] = "▓";
+        return std.fmt.allocPrint(arena, "[{s}{s}{s}{s}{s} {d}%]", .{
+            bar_buf[0], bar_buf[1], bar_buf[2], bar_buf[3], bar_buf[4], pct,
+        });
     }
 
     fn drawQueuedMessage(self: *InputWidget, ctx: vxfw.DrawContext, width: u16) std.mem.Allocator.Error!vxfw.Surface {
@@ -518,7 +542,9 @@ pub const InputWidget = struct {
     }
 
     fn drawInputHint(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, child_index: usize, row: u16, col: u16, width: u16) std.mem.Allocator.Error!void {
-        var hint_text: vxfw.Text = .{ .text = inputHintText(self.app), .style = StylePalette.thinking_body, .text_align = .center, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
+        const is_pending_quit = self.app.getPendingQuitAt() != null;
+        const style = if (is_pending_quit) StylePalette.warning else StylePalette.thinking_body;
+        var hint_text: vxfw.Text = .{ .text = inputHintText(self.app), .style = style, .text_align = .center, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
         children[child_index] = .{
             .origin = .{ .row = row, .col = col },
             .surface = try hint_text.widget().draw(ctx.withConstraints(.{ .width = width, .height = 1 }, .{ .width = width, .height = 1 })),
