@@ -43,6 +43,10 @@ concern:
 - `lane_lifecycle.zig` — lane naming, cycling, closing, merging, `/lanes` overlay.
 - `diff_lifecycle.zig` — async diff refresh pipeline (DiffCounts, schedule/cancel/drain).
 - `session_switcher.zig` — resume picker, session creation, timeline navigation.
+- `at_search.zig` — `@` file / `$` skill mention popup.
+- `transcript_nav.zig` — transcript scrolling, auto-scroll, long-message paging.
+- `permission.zig` — tool-call approval/rejection overlay.
+- `event_callbacks.zig` — vxfw input-change callbacks (`inputChanged`, `paletteInputChanged`).
 - `layout.zig` — `rootLayout` math for `drawRoot` (transcript / loading / input row split).
 - `lane_column.zig` — per-lane bordered transcript column (split view).
 - `diff_viewer_overlay.zig` — full-screen `/diff` overlay.

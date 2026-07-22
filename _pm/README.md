@@ -4,11 +4,7 @@ Cross-linked index for project management artifacts.
 
 ## Projects (active)
 
-- [tui-domain-extract](Projects/tui-domain-extract/) — Extract remaining domain clusters from `tui.zig`
-  - State: Planned. `tui.zig` 5100 lines, 227 functions.
-  - Created: 2026-07-22
-  - Source: BFG analysis — coupling 85, code quality 70. `tui.zig` god object.
-  - Result: 3 phases, `tui.zig` 5100 → **4409 (-13.5%)**, 3 new modules (910 lines).
+*(none — both TUI split projects completed and archived)*
 
 ## Areas (ongoing)
 
@@ -19,6 +15,13 @@ Cross-linked index for project management artifacts.
 
 - AGENTS.md — top-level rules
 - `src/` — current code
+
+## Archives
+
+- [tui-split](Archives/tui-split/) — `tui.zig` 8586 → **4141** (-%51.8). Split into 21 modules.
+  - R1–R7.5 (tui-split): 14 modules, 8586 → 5100
+  - Phase 1-7 (tui-domain-extract): 7 domain modules, 5100 → 4141
+  - 49 atomic commits total. All pushed to `origin/main`.
 
 ## Workflow
 

@@ -2,11 +2,10 @@
 
 Notes on module boundaries, layering, and the structural problems that recur.
 
-## Current state (as of 2026-07-21, post-R7.5)
+## Current state (as of 2026-07-22, post-tui-domain-extract Phase 7)
 
-- `src/tui.zig` 5100 lines (down from 8586, -3486 / -40.6% over 42 commits); still mixes App business logic, but event routing, command dispatch, draw, lifecycle, widgets, and provider/model setup are now in dedicated modules.
+- `src/tui.zig` 4141 lines (down from 8586, -4445 / -51.8% over 49 commits); still mixes remaining App business logic (submitMode, beginSubmit, queue, checkpoint), but event routing, command dispatch, draw, lifecycle, widgets, provider/model, lane lifecycle, diff lifecycle, session switching, at-search, transcript navigation, permission, and event callbacks are all in dedicated modules.
 - Pre-R1 cycle in `handleCommandKey` exhaustive call graph (882 nodes, 12491 edges) was broken by R2 (struct-per-mode)
-- Top hubs by edge count pre-R1: `captureEvent` 457, `handleCommandKey` 457, `cancelLaneNaming` 442, `freeDelivery` 441 — R1/R2/R4 cut these down
 - 7 logical components in `code-tandem` (src, lib, py, root, tools, scripts, bench) but cross-component edges = 0 (Zig tree-sitter integration is partial)
 
 ## Recurring smells
@@ -25,4 +24,6 @@ Notes on module boundaries, layering, and the structural problems that recur.
 
 ## Active project
 
-- [tui-split](../Projects/tui-split/) — applying the above to `src/tui.zig`; R1–R7.5 completed, 8586→5100 lines. Sub-project complete.
+- [tui-split](../Archives/tui-split/) — applying the above to `src/tui.zig`; R1–R7.5 completed, 8586→4141 lines.
+- [tui-domain-extract](../Archives/tui-domain-extract/) — Phase 1-7 domain cluster extraction, 5100→4141 lines.
+- Both sub-projects complete and archived.

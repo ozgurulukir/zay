@@ -25,7 +25,8 @@ Prefer to use the primitives provided by the framework as much as possible.
 Architecture for the current module list (kept in sync as `tui.zig` shrinks).
 
 **Domain extraction pattern.** Isolated domain clusters (lane lifecycle, diff
-lifecycle, session switching) live under `src/tui/` as free-function modules.
+lifecycle, session switching, at-search, transcript navigation, permission,
+event callbacks) live under `src/tui/` as free-function modules.
 Each module imports `const tui = @import("../tui.zig")` and defines `pub fn`
 taking `*App` as the first parameter. The original App method stays as a
 1-line delegate (Strangler Fig) so inline tests in `tui.zig` resolve via the
