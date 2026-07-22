@@ -32,9 +32,9 @@ Add the binary (`zig-out/bin/nova`) to your PATH so you can invoke it from anywh
 
 # Architecture
 
-The TUI is a vxfw application. `src/tui.zig` holds the `App` lifecycle
-and the top-level `RootWidget`; the rest of `src/tui/` is split by
-concern:
+The TUI is a vxfw application. `src/tui.zig` holds the `App` lifecycle;
+the top-level `RootWidget` lives in `src/tui/root_widget.zig`. The rest
+of `src/tui/` is split by concern:
 
 - `event_router.zig` — top-level event entry (`captureEvent`).
 - `command_router.zig` — per-mode key dispatch (one struct per `App.Mode`).
@@ -70,6 +70,7 @@ concern:
 - `provider_controller.zig` — provider API controller.
 - `agent_worker.zig` — agent worker plumbing.
 - `blackhole.zig` — startup animation.
+- `root_widget.zig` — top-level vxfw widget (delegates to per-concern modules).
 - `metrics.zig` — runtime metrics.
 - `naming.zig` / `style.zig` / `status.zig` / `tool_policy.zig` —
   shared helpers and policies.

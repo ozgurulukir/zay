@@ -152,6 +152,14 @@ Run:
 
 ## Known Issues
 
+- **Session resume shows blank TUI (fixed).** When the app resumes the last session at
+  startup (`root.zig` → `initResume`), the agent is rehydrated with messages from the
+  session DB but the TUI transcript was never populated — only the logo animation was
+  appended. Fix: call `app.rebuildTranscriptFromAgent()` in `tui.run()` before deciding
+  whether to show the logo. For a resumed session the transcript is populated from the
+  agent's message history; for a new session the transcript stays empty and the logo
+  falls through as before.
+
 - **High CPU usage from spinlocks.** `std.atomic.Mutex` busy-waits and pegs the CPU on multi-core. Use `std.Io.Mutex` and `std.Io.Condition` instead (paired via `static_thread_pool` or similar). Symptom: 80% CPU at idle, drops to ~2% after the fix. Files affected: `lib/logger.zig`, `src/agent.zig`, `src/background.zig`, `src/session.zig`.
 
 - **Double-free in `postAgentEvent` / `postTurnFailed` / `runAgentTurn` (fixed).** `postAgentEvent` takes ownership of the event — on error it frees the event's data internally. The callers' catch blocks were freeing `message_text` again (double-free), and the QueueFull handler in `postAgentEvent` was manually cleaning up `event_ptr` before `return error.TurnCancelled`, which triggered errdefer to repeat the same cleanup. Pattern: caller allocates `message_text`, passes it into `.{ .turn_failed = message_text }`, `postAgentEvent` frees it on error, caller's catch block frees it again. Fix: remove `worker_context.gpa.free(message_text)` from catch blocks in `runAgentTurn` and `postTurnFailed`; remove manual `event_ptr.deinit`+`destroy` before `return error.TurnCancelled` in `postAgentEvent`.
