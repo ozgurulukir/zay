@@ -23,8 +23,6 @@ Prefer to use the primitives provided by the framework as much as possible.
 **TUI module split.** `src/tui.zig` holds the `App` lifecycle and the top-level
 `RootWidget`; the rest of `src/tui/` is split by concern. See `README.md`
 Architecture for the current module list (kept in sync as `tui.zig` shrinks).
-The split is tracked as the `tui-split` sub-project under
-`_pm/Projects/tui-split/` with phases R1–R5 (R1–R4 done).
 
 **Widget extraction pattern.** Isolated widgets live under `src/tui/widgets/`.
 A new widget file declares the outer border widget as
