@@ -741,8 +741,30 @@ fn parseToolCallObject(
     while (builders.items.len <= idx) try builders.append(gpa, .{});
     const target = &builders.items[@as(usize, idx)];
 
-    if (has_pending_id) try target.id.appendSlice(gpa, pending.id.items);
-    if (has_pending_name) try target.name.appendSlice(gpa, pending.name.items);
+    if (has_pending_id) {
+        if (target.id.items.len == 0) {
+            try target.id.appendSlice(gpa, pending.id.items);
+        } else if (!std.mem.eql(u8, target.id.items, pending.id.items)) {
+            if (std.mem.startsWith(u8, pending.id.items, target.id.items)) {
+                target.id.clearRetainingCapacity();
+                try target.id.appendSlice(gpa, pending.id.items);
+            } else {
+                try target.id.appendSlice(gpa, pending.id.items);
+            }
+        }
+    }
+    if (has_pending_name) {
+        if (target.name.items.len == 0) {
+            try target.name.appendSlice(gpa, pending.name.items);
+        } else if (!std.mem.eql(u8, target.name.items, pending.name.items)) {
+            if (std.mem.startsWith(u8, pending.name.items, target.name.items)) {
+                target.name.clearRetainingCapacity();
+                try target.name.appendSlice(gpa, pending.name.items);
+            } else {
+                try target.name.appendSlice(gpa, pending.name.items);
+            }
+        }
+    }
     if (has_pending_arguments) try target.arguments.appendSlice(gpa, pending.arguments.items);
     change.recordToolCall(idx);
 }
@@ -1189,4 +1211,30 @@ test "content chunk carries null usage" {
     , &content, &reasoning, &builders);
 
     try std.testing.expect(change.usage == null);
+}
+
+test "parse streaming tool calls deduplicates repeated tool names (bashbash fix)" {
+    const gpa = std.testing.allocator;
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
+    var builders: std.ArrayList(ToolCallBuilder) = .empty;
+    defer {
+        for (builders.items) |*b| b.deinit(gpa);
+        builders.deinit(gpa);
+    }
+
+    _ = try parseStreamChunk(gpa,
+        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}
+    , &content, &reasoning, &builders);
+
+    // Second chunk repeats function.name: "bash" while sending argument continuation
+    _ = try parseStreamChunk(gpa,
+        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"\"}"}}]}}]}
+    , &content, &reasoning, &builders);
+
+    try std.testing.expectEqual(@as(usize, 1), builders.items.len);
+    try std.testing.expectEqualStrings("bash", builders.items[0].name.items);
+    try std.testing.expectEqualStrings("call_1", builders.items[0].id.items);
 }
