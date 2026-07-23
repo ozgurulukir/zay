@@ -12,23 +12,19 @@ Nova Agent supports two standard MCP transports:
 
 ---
 
-## 2. Configuration (`config.json` / `mcp_servers`)
+## 2. Configuration (`config.json` / `mcpServers` or `mcp_servers`)
 
-MCP servers are configured inside global `~/.config/nova/config.json` or project-local `<cwd>/.nova/config.json` under the `"mcp_servers"` key.
+MCP servers are configured inside global `~/.config/nova/config.json` or project-local `<cwd>/.nova/config.json` under the `"mcpServers"` (Claude Desktop / Cursor format) or `"mcp_servers"` key.
 
-### Example Configuration
+### Example Configuration (Claude Desktop Format)
 
 ```json
 {
   "version": 1,
-  "mcp_servers": {
-    "memory": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-memory"
-      ],
-      "enabled": true
+  "mcpServers": {
+    "codebase-memory-mcp": {
+      "command": "/path/to/codebase-memory-mcp",
+      "args": []
     },
     "github": {
       "command": "npx",

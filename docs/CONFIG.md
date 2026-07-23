@@ -89,6 +89,7 @@ All `config.json` files use formatted, 2-space indented JSON with version taggin
 | `enable_thinking` | `boolean` | `true` to enable extended reasoning (`reasoning_effort`) for supported models. |
 | `system_prompt` | `string` | Base system prompt template (supports `${CWD}` and `${OS}` tokens). |
 | `bash_classifier_url` | `string` | ModernBERT classifier endpoint for shell command safety check. |
+| `mcpServers` / `mcp_servers` | `object` | MCP server configurations (Claude Desktop format compatible). |
 | `providers` | `object` | Provider-specific configurations and reasoning effort overrides. |
 
 > [!IMPORTANT]
