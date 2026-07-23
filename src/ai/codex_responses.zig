@@ -53,8 +53,8 @@ pub const Client = struct {
         self.* = undefined;
     }
 
-    pub fn prompt(self: *Client, messages: []const ai.ChatMessage, observer: ai.StreamObserver) !ai.Turn {
-        var bridge: ObserverBridge = .{ .observer = observer };
+    pub fn prompt(self: *Client, messages: []const ai.ChatMessage, observer: anytype) !ai.Turn {
+        var bridge: ObserverBridge(@TypeOf(observer)) = .{ .observer = observer };
         return self.promptWebSocket(messages, bridge.streamObserver()) catch |err| {
             logger.log("codex.websocket.failure emitted={} error={s}", .{ bridge.emitted, @errorName(err) });
             if (bridge.emitted) return err;
@@ -62,7 +62,7 @@ pub const Client = struct {
         };
     }
 
-    fn promptWebSocket(self: *Client, messages: []const ai.ChatMessage, observer: ai.StreamObserver) !ai.Turn {
+    fn promptWebSocket(self: *Client, messages: []const ai.ChatMessage, observer: anytype) !ai.Turn {
         const gpa = self.core_client.gpa;
         const endpoint = try parseWebSocketEndpoint(gpa, self.core_client.url);
         defer endpoint.deinit(gpa);
@@ -213,43 +213,42 @@ const WebSocketEndpoint = struct {
     }
 };
 
-const ObserverBridge = struct {
-    observer: ai.StreamObserver,
-    emitted: bool = false,
+fn ObserverBridge(comptime T: type) type {
+    return struct {
+        observer: T,
+        emitted: bool = false,
 
-    fn streamObserver(self: *ObserverBridge) ai.StreamObserver {
-        return .{
-            .ptr = self,
-            .on_content = onContent,
-            .on_reasoning = onReasoning,
-            .on_tool_delta = onToolDelta,
-            .on_delta_end = onDeltaEnd,
-        };
-    }
+        fn streamObserver(self: *@This()) ai.StreamObserver(@This()) {
+            return .{
+                .ctx = self,
+                .on_content = onContent,
+                .on_reasoning = onReasoning,
+                .on_tool_delta = onToolDelta,
+                .on_delta_end = onDeltaEnd,
+            };
+        }
 
-    fn onContent(ptr: *anyopaque, delta: []const u8) anyerror!void {
-        const self: *ObserverBridge = @ptrCast(@alignCast(ptr));
-        self.emitted = true;
-        try self.observer.on_content(self.observer.ptr, delta);
-    }
+        fn onContent(ctx: *@This(), delta: []const u8) anyerror!void {
+            ctx.emitted = true;
+            try ctx.observer.on_content(ctx.observer.ctx, delta);
+        }
 
-    fn onReasoning(ptr: *anyopaque, delta: []const u8) anyerror!void {
-        const self: *ObserverBridge = @ptrCast(@alignCast(ptr));
-        self.emitted = true;
-        try self.observer.on_reasoning(self.observer.ptr, delta);
-    }
+        fn onReasoning(ctx: *@This(), delta: []const u8) anyerror!void {
+            ctx.emitted = true;
+            try ctx.observer.on_reasoning(ctx.observer.ctx, delta);
+        }
 
-    fn onToolDelta(ptr: *anyopaque, delta: ai.ToolDelta) anyerror!void {
-        const self: *ObserverBridge = @ptrCast(@alignCast(ptr));
-        self.emitted = true;
-        try self.observer.on_tool_delta(self.observer.ptr, delta);
-    }
+        fn onToolDelta(ctx: *@This(), delta: ai.ToolDelta) anyerror!void {
+            ctx.emitted = true;
+            try ctx.observer.on_tool_delta(ctx.observer.ctx, delta);
+        }
 
-    fn onDeltaEnd(ptr: *anyopaque) anyerror!void {
-        const self: *ObserverBridge = @ptrCast(@alignCast(ptr));
-        try self.observer.on_delta_end(self.observer.ptr);
-    }
-};
+        fn onDeltaEnd(ctx: *@This()) anyerror!void {
+            ctx.emitted = true;
+            try ctx.observer.on_delta_end(ctx.observer.ctx);
+        }
+    };
+}
 
 fn parseWebSocketEndpoint(gpa: std.mem.Allocator, url: []const u8) !WebSocketEndpoint {
     const uri = try std.Uri.parse(url);

@@ -14,7 +14,7 @@ pub const Client = struct {
         self.* = undefined;
     }
 
-    pub fn prompt(self: *Client, messages: []const ai.ChatMessage, observer: ai.StreamObserver) !ai.Turn {
+    pub fn prompt(self: *Client, messages: []const ai.ChatMessage, observer: anytype) !ai.Turn {
         return self.core_client.prompt(messages, observer);
     }
 };

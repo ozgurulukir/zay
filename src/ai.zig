@@ -448,25 +448,37 @@ pub const ToolDelta = struct {
     arguments: []const u8,
 };
 
-pub const StreamObserver = struct {
-    ptr: *anyopaque,
-    on_content: *const fn (*anyopaque, []const u8) anyerror!void,
-    on_reasoning: *const fn (*anyopaque, []const u8) anyerror!void,
-    on_tool_delta: *const fn (*anyopaque, ToolDelta) anyerror!void,
-    on_delta_end: *const fn (*anyopaque) anyerror!void,
+pub const NoopCtx = struct {};
 
-    pub const noop: StreamObserver = .{
-        .ptr = undefined,
+/// Typed stream observer — generic over the consumer's context type.
+/// Replaces the old `*anyopaque` + `@ptrCast` vtable. Callers pass their
+/// own ctx type; the callbacks receive it typed.
+pub fn StreamObserver(comptime Ctx: type) type {
+    return struct {
+        ctx: *Ctx,
+        on_content: *const fn (*Ctx, []const u8) anyerror!void,
+        on_reasoning: *const fn (*Ctx, []const u8) anyerror!void,
+        on_tool_delta: *const fn (*Ctx, ToolDelta) anyerror!void,
+        on_delta_end: *const fn (*Ctx) anyerror!void,
+    };
+}
+
+var noop_ctx: NoopCtx = .{};
+
+/// Noop stream observer for fire-and-forget prompts. Use `streamNoop()`.
+pub fn streamNoop() StreamObserver(NoopCtx) {
+    return .{
+        .ctx = &noop_ctx,
         .on_content = noopBytes,
         .on_reasoning = noopBytes,
         .on_tool_delta = noopToolDelta,
         .on_delta_end = noopVoid,
     };
+}
 
-    pub fn noopBytes(_: *anyopaque, _: []const u8) anyerror!void {}
-    pub fn noopToolDelta(_: *anyopaque, _: ToolDelta) anyerror!void {}
-    pub fn noopVoid(_: *anyopaque) anyerror!void {}
-};
+fn noopBytes(_: *NoopCtx, _: []const u8) anyerror!void {}
+fn noopToolDelta(_: *NoopCtx, _: ToolDelta) anyerror!void {}
+fn noopVoid(_: *NoopCtx) anyerror!void {}
 
 pub const LanguageModel = union(enum) {
     none,
@@ -477,7 +489,7 @@ pub const LanguageModel = union(enum) {
     pub fn prompt(
         self: LanguageModel,
         messages: []const ChatMessage,
-        observer: StreamObserver,
+        observer: anytype,
     ) !Turn {
         return switch (self) {
             .none => error.NoProviderConnected,

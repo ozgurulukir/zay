@@ -529,13 +529,10 @@ pub const Agent = struct {
 
     /// Per-stream context shared between the agent and the ai client's
     /// stream observer callbacks. Holds the typed listener plus the
-    /// delta-tracking list. The `observer()` method builds an
-    /// `ai.StreamObserver` whose callbacks are comptime-baked wrappers
-    /// around this `StreamContext` and its typed listener. The
-    /// `@ptrCast` inside the wrappers is the seam with `ai.StreamObserver`'s
-    /// `*anyopaque` interface — making that vtable generic over the context
-    /// type is sequenced as a follow-up to this PR (see
-    /// type-safety-refactor.md P1-A follow-up: `StreamObserver(Ctx)`).
+    /// delta-tracking list. The `observer()` method builds a
+    /// `StreamObserver(*Self)` whose callbacks are comptime-baked wrappers
+    /// around this `StreamContext` and its typed listener — no
+    /// `@ptrCast` at the seam.
     fn StreamContext(comptime L: type) type {
         return struct {
             agent: *Agent,
@@ -560,9 +557,9 @@ pub const Agent = struct {
                 self.tool_delta_seen.items[tool_index] = true;
             }
 
-            fn observer(self: *Self) ai.StreamObserver {
+            fn observer(self: *Self) ai.StreamObserver(Self) {
                 return .{
-                    .ptr = @ptrCast(self),
+                    .ctx = self,
                     .on_content = onContentDeltaImpl(L),
                     .on_reasoning = onReasoningDeltaImpl(L),
                     .on_tool_delta = onToolDeltaImpl(L),
@@ -572,46 +569,42 @@ pub const Agent = struct {
         };
     }
 
-    fn onContentDeltaImpl(comptime L: type) *const fn (*anyopaque, []const u8) anyerror!void {
+    fn onContentDeltaImpl(comptime L: type) *const fn (*StreamContext(L), []const u8) anyerror!void {
         const F = struct {
-            fn call(ctx: *anyopaque, delta: []const u8) anyerror!void {
-                const concrete: *StreamContext(L) = @ptrCast(@alignCast(ctx));
-                const owned = try concrete.agent.gpa.dupe(u8, delta);
-                errdefer concrete.agent.gpa.free(owned);
-                try concrete.listener.emit(.{ .response_delta = owned });
+            fn call(ctx: *StreamContext(L), delta: []const u8) anyerror!void {
+                const owned = try ctx.agent.gpa.dupe(u8, delta);
+                errdefer ctx.agent.gpa.free(owned);
+                try ctx.listener.emit(.{ .response_delta = owned });
             }
         };
         return &F.call;
     }
 
-    fn onReasoningDeltaImpl(comptime L: type) *const fn (*anyopaque, []const u8) anyerror!void {
+    fn onReasoningDeltaImpl(comptime L: type) *const fn (*StreamContext(L), []const u8) anyerror!void {
         const F = struct {
-            fn call(ctx: *anyopaque, delta: []const u8) anyerror!void {
-                const concrete: *StreamContext(L) = @ptrCast(@alignCast(ctx));
-                const owned = try concrete.agent.gpa.dupe(u8, delta);
-                errdefer concrete.agent.gpa.free(owned);
-                try concrete.listener.emit(.{ .thinking_delta = owned });
+            fn call(ctx: *StreamContext(L), delta: []const u8) anyerror!void {
+                const owned = try ctx.agent.gpa.dupe(u8, delta);
+                errdefer ctx.agent.gpa.free(owned);
+                try ctx.listener.emit(.{ .thinking_delta = owned });
             }
         };
         return &F.call;
     }
 
-    fn onToolDeltaImpl(comptime L: type) *const fn (*anyopaque, ai.ToolDelta) anyerror!void {
+    fn onToolDeltaImpl(comptime L: type) *const fn (*StreamContext(L), ai.ToolDelta) anyerror!void {
         const F = struct {
-            fn call(ctx: *anyopaque, delta: ai.ToolDelta) anyerror!void {
-                const concrete: *StreamContext(L) = @ptrCast(@alignCast(ctx));
-                try concrete.markToolDeltaSeen(delta.index);
-                try Agent.emitToolDelta(L, concrete.agent, concrete.listener, delta.index, delta.name, delta.arguments);
+            fn call(ctx: *StreamContext(L), delta: ai.ToolDelta) anyerror!void {
+                try ctx.markToolDeltaSeen(delta.index);
+                try Agent.emitToolDelta(L, ctx.agent, ctx.listener, delta.index, delta.name, delta.arguments);
             }
         };
         return &F.call;
     }
 
-    fn onDeltaEndImpl(comptime L: type) *const fn (*anyopaque) anyerror!void {
+    fn onDeltaEndImpl(comptime L: type) *const fn (*StreamContext(L)) anyerror!void {
         const F = struct {
-            fn call(ctx: *anyopaque) anyerror!void {
-                const concrete: *StreamContext(L) = @ptrCast(@alignCast(ctx));
-                try concrete.listener.emit(.delta_end);
+            fn call(ctx: *StreamContext(L)) anyerror!void {
+                try ctx.listener.emit(.delta_end);
             }
         };
         return &F.call;
@@ -1072,14 +1065,14 @@ test "streaming callbacks emit owned events" {
     defer context.deinit();
 
     // Drive the wrapper functions the same way the ai stream layer would.
-    try Agent.onReasoningDeltaImpl(Listener)(@ptrCast(&context), "checking");
-    try Agent.onContentDeltaImpl(Listener)(@ptrCast(&context), "hello");
-    try Agent.onToolDeltaImpl(Listener)(@ptrCast(&context), .{
+    try Agent.onReasoningDeltaImpl(Listener)(&context, "checking");
+    try Agent.onContentDeltaImpl(Listener)(&context, "hello");
+    try Agent.onToolDeltaImpl(Listener)(&context, .{
         .index = 1,
         .name = "bash",
         .arguments = "{\"command\":\"pwd\"}",
     });
-    try Agent.onDeltaEndImpl(Listener)(@ptrCast(&context));
+    try Agent.onDeltaEndImpl(Listener)(&context);
 
     try std.testing.expectEqual(@as(usize, 4), seen.events.items.len);
     try std.testing.expectEqualStrings("checking", seen.events.items[0].thinking_delta);

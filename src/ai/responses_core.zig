@@ -88,7 +88,7 @@ pub const Client = struct {
         self.* = undefined;
     }
 
-    pub fn prompt(self: *Client, messages: []const ai.ChatMessage, observer: ai.StreamObserver) !ai.Turn {
+    pub fn prompt(self: *Client, messages: []const ai.ChatMessage, observer: anytype) !ai.Turn {
         var extra_headers_buffer: [8]std.http.Header = undefined;
         const extra_headers = self.extraHeaders(&extra_headers_buffer);
         var req = try self.http_client.request(.POST, try std.Uri.parse(self.url), .{
@@ -393,7 +393,7 @@ const ToolBuilder = struct {
     }
 };
 
-fn readStream(gpa: std.mem.Allocator, reader: *std.Io.Reader, observer: ai.StreamObserver, call_seq: *u64) !ai.Turn {
+fn readStream(gpa: std.mem.Allocator, reader: *std.Io.Reader, observer: anytype, call_seq: *u64) !ai.Turn {
     var state: StreamState = .{};
     defer state.deinit(gpa);
     errdefer state.deinitBlocks(gpa);
@@ -422,7 +422,7 @@ pub const StreamState = struct {
         self.blocks.deinit(gpa);
     }
 
-    pub fn processJson(self: *StreamState, gpa: std.mem.Allocator, data: []const u8, observer: ai.StreamObserver, call_seq: *u64) !void {
+    pub fn processJson(self: *StreamState, gpa: std.mem.Allocator, data: []const u8, observer: anytype, call_seq: *u64) !void {
         try processEvent(gpa, data, &self.blocks, &self.tools, observer, call_seq, &self.completed, &self.usage);
     }
 
@@ -435,7 +435,7 @@ pub const StreamState = struct {
     }
 };
 
-fn processEvent(gpa: std.mem.Allocator, data: []const u8, blocks: *std.ArrayList(ai.ContentBlock), tools: *std.ArrayList(ToolBuilder), observer: ai.StreamObserver, call_seq: *u64, completed: *bool, usage: *?ai.Usage) !void {
+fn processEvent(gpa: std.mem.Allocator, data: []const u8, blocks: *std.ArrayList(ai.ContentBlock), tools: *std.ArrayList(ToolBuilder), observer: anytype, call_seq: *u64, completed: *bool, usage: *?ai.Usage) !void {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, data, .{}) catch return;
     defer parsed.deinit();
     if (parsed.value != .object) return;
@@ -601,7 +601,7 @@ fn onContentPartAdded(gpa: std.mem.Allocator, value: std.json.Value, blocks: *st
     try blocks.append(gpa, .{ .text = .{ .text = try gpa.alloc(u8, 0) } });
 }
 
-fn onItemDone(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), tools: *std.ArrayList(ToolBuilder), observer: ai.StreamObserver) !void {
+fn onItemDone(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), tools: *std.ArrayList(ToolBuilder), observer: anytype) !void {
     const item = value.object.get("item") orelse return;
     if (item != .object) return;
     const kind = item.object.get("type") orelse return;
@@ -622,8 +622,8 @@ fn onItemDone(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayL
     if (std.mem.eql(u8, kind.string, "function_call")) {
         const index = (try updateToolFromItem(gpa, item, tools.items)) orelse return;
         try syncOneToolBlock(gpa, blocks, &tools.items[index]);
-        try observer.on_tool_delta(observer.ptr, .{ .index = index, .name = tools.items[index].name.items, .arguments = tools.items[index].arguments.items });
-        try observer.on_delta_end(observer.ptr);
+        try observer.on_tool_delta(observer.ctx, .{ .index = index, .name = tools.items[index].name.items, .arguments = tools.items[index].arguments.items });
+        try observer.on_delta_end(observer.ctx);
     }
 }
 
@@ -648,7 +648,7 @@ fn outputTextFromItem(item: std.json.Value) ?[]const u8 {
     return null;
 }
 
-fn onTextDelta(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), observer: ai.StreamObserver) !void {
+fn onTextDelta(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), observer: anytype) !void {
     const delta = stringField(value, "delta") orelse return;
     var index = blocks.items.len;
     while (index > 0) {
@@ -656,13 +656,13 @@ fn onTextDelta(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.Array
         if (blocks.items[index] != .text) continue;
         const old = blocks.items[index].text.text;
         blocks.items[index].text.text = try appendOwned(gpa, old, delta);
-        try observer.on_content(observer.ptr, delta);
-        try observer.on_delta_end(observer.ptr);
+        try observer.on_content(observer.ctx, delta);
+        try observer.on_delta_end(observer.ctx);
         return;
     }
 }
 
-fn onReasoningDelta(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), observer: ai.StreamObserver) !void {
+fn onReasoningDelta(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), observer: anytype) !void {
     const delta = stringField(value, "delta") orelse return;
     var index = blocks.items.len;
     while (index > 0) {
@@ -670,29 +670,29 @@ fn onReasoningDelta(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.
         if (blocks.items[index] != .reasoning) continue;
         const old = blocks.items[index].reasoning.text;
         blocks.items[index].reasoning.text = try appendOwned(gpa, old, delta);
-        try observer.on_reasoning(observer.ptr, delta);
-        try observer.on_delta_end(observer.ptr);
+        try observer.on_reasoning(observer.ctx, delta);
+        try observer.on_delta_end(observer.ctx);
         return;
     }
 }
 
-fn onArgumentsDelta(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), tools: *std.ArrayList(ToolBuilder), observer: ai.StreamObserver) !void {
+fn onArgumentsDelta(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), tools: *std.ArrayList(ToolBuilder), observer: anytype) !void {
     const delta = stringField(value, "delta") orelse return;
     const index = toolIndexForEvent(value, tools.items) orelse return;
     try tools.items[index].arguments.appendSlice(gpa, delta);
     try syncOneToolBlock(gpa, blocks, &tools.items[index]);
-    try observer.on_tool_delta(observer.ptr, .{ .index = index, .name = tools.items[index].name.items, .arguments = tools.items[index].arguments.items });
-    try observer.on_delta_end(observer.ptr);
+    try observer.on_tool_delta(observer.ctx, .{ .index = index, .name = tools.items[index].name.items, .arguments = tools.items[index].arguments.items });
+    try observer.on_delta_end(observer.ctx);
 }
 
-fn onArgumentsDone(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), tools: *std.ArrayList(ToolBuilder), observer: ai.StreamObserver) !void {
+fn onArgumentsDone(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), tools: *std.ArrayList(ToolBuilder), observer: anytype) !void {
     const arguments = stringField(value, "arguments") orelse return;
     const index = toolIndexForEvent(value, tools.items) orelse return;
     tools.items[index].arguments.clearRetainingCapacity();
     try tools.items[index].arguments.appendSlice(gpa, arguments);
     try syncOneToolBlock(gpa, blocks, &tools.items[index]);
-    try observer.on_tool_delta(observer.ptr, .{ .index = index, .name = tools.items[index].name.items, .arguments = tools.items[index].arguments.items });
-    try observer.on_delta_end(observer.ptr);
+    try observer.on_tool_delta(observer.ctx, .{ .index = index, .name = tools.items[index].name.items, .arguments = tools.items[index].arguments.items });
+    try observer.on_delta_end(observer.ctx);
 }
 
 fn toolIndexForEvent(value: std.json.Value, tools: []const ToolBuilder) ?u32 {
@@ -718,15 +718,15 @@ fn toolIndexForEvent(value: std.json.Value, tools: []const ToolBuilder) ?u32 {
     return null;
 }
 
-fn finishTextBlock(gpa: std.mem.Allocator, blocks: *std.ArrayList(ai.ContentBlock), observer: ai.StreamObserver, text: []const u8) !void {
+fn finishTextBlock(gpa: std.mem.Allocator, blocks: *std.ArrayList(ai.ContentBlock), observer: anytype, text: []const u8) !void {
     const index = lastTextBlock(blocks.items) orelse return;
     const old = blocks.items[index].text.text;
     if (std.mem.startsWith(u8, text, old)) {
         const suffix = text[old.len..];
         if (suffix.len > 0) {
             blocks.items[index].text.text = try appendOwned(gpa, old, suffix);
-            try observer.on_content(observer.ptr, suffix);
-            try observer.on_delta_end(observer.ptr);
+            try observer.on_content(observer.ctx, suffix);
+            try observer.on_delta_end(observer.ctx);
             return;
         }
     } else {
@@ -734,18 +734,18 @@ fn finishTextBlock(gpa: std.mem.Allocator, blocks: *std.ArrayList(ai.ContentBloc
         gpa.free(old);
         blocks.items[index].text.text = replacement;
         if (text.len > 0) {
-            try observer.on_content(observer.ptr, text);
-            try observer.on_delta_end(observer.ptr);
+            try observer.on_content(observer.ctx, text);
+            try observer.on_delta_end(observer.ctx);
         }
     }
 }
 
-fn onReasoningSummaryPartDone(gpa: std.mem.Allocator, blocks: *std.ArrayList(ai.ContentBlock), observer: ai.StreamObserver) !void {
+fn onReasoningSummaryPartDone(gpa: std.mem.Allocator, blocks: *std.ArrayList(ai.ContentBlock), observer: anytype) !void {
     const index = lastReasoningBlock(blocks.items) orelse return;
     const old = blocks.items[index].reasoning.text;
     blocks.items[index].reasoning.text = try appendOwned(gpa, old, "\n\n");
-    try observer.on_reasoning(observer.ptr, "\n\n");
-    try observer.on_delta_end(observer.ptr);
+    try observer.on_reasoning(observer.ctx, "\n\n");
+    try observer.on_delta_end(observer.ctx);
 }
 
 fn lastTextBlock(blocks: []const ai.ContentBlock) ?u32 {
@@ -949,16 +949,22 @@ test "openresponses emits final item text when no delta arrived" {
             self.text.deinit(allocator);
         }
 
-        fn onContent(context: *anyopaque, delta: []const u8) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(context));
-            try self.text.appendSlice(std.testing.allocator, delta);
+        fn onContent(ctx: *@This(), delta: []const u8) anyerror!void {
+            try ctx.text.appendSlice(std.testing.allocator, delta);
         }
+        fn noopBytes(_: *@This(), _: []const u8) anyerror!void {}
+        fn noopToolDelta(_: *@This(), _: ai.ToolDelta) anyerror!void {}
+        fn noopVoid(_: *@This()) anyerror!void {}
     };
     var seen: Seen = .{};
     defer seen.deinit(gpa);
-    var observer = ai.StreamObserver.noop;
-    observer.ptr = &seen;
-    observer.on_content = Seen.onContent;
+    const observer: ai.StreamObserver(Seen) = .{
+        .ctx = &seen,
+        .on_content = Seen.onContent,
+        .on_reasoning = Seen.noopBytes,
+        .on_tool_delta = Seen.noopToolDelta,
+        .on_delta_end = Seen.noopVoid,
+    };
 
     var call_seq: u64 = 0;
     try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}", observer, &call_seq);
@@ -978,13 +984,13 @@ test "openresponses preserves text tool text block order" {
     defer state.deinitBlocks(gpa);
 
     var call_seq: u64 = 0;
-    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}", ai.StreamObserver.noop, &call_seq);
-    try state.processJson(gpa, "{\"type\":\"response.output_text.delta\",\"delta\":\"before\"}", ai.StreamObserver.noop, &call_seq);
-    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"id\":\"item_a\",\"name\":\"bash\"}}", ai.StreamObserver.noop, &call_seq);
-    try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.done\",\"output_index\":1,\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}", ai.StreamObserver.noop, &call_seq);
-    try state.processJson(gpa, "{\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}", ai.StreamObserver.noop, &call_seq);
-    try state.processJson(gpa, "{\"type\":\"response.output_text.delta\",\"delta\":\"after\"}", ai.StreamObserver.noop, &call_seq);
-    try state.processJson(gpa, "{\"type\":\"response.completed\"}", ai.StreamObserver.noop, &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.output_text.delta\",\"delta\":\"before\"}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"id\":\"item_a\",\"name\":\"bash\"}}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.done\",\"output_index\":1,\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.output_text.delta\",\"delta\":\"after\"}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.completed\"}", ai.streamNoop(), &call_seq);
 
     var turn = try state.finish(gpa, &call_seq);
     defer turn.deinit(gpa);
@@ -1001,7 +1007,7 @@ test "openresponses parses usage from completed event" {
     defer state.deinitBlocks(gpa);
 
     var call_seq: u64 = 0;
-    try state.processJson(gpa, "{\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":2000,\"input_tokens_details\":{\"cached_tokens\":1500},\"output_tokens\":420,\"output_tokens_details\":{\"reasoning_tokens\":256},\"total_tokens\":2420}}}", ai.StreamObserver.noop, &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":2000,\"input_tokens_details\":{\"cached_tokens\":1500},\"output_tokens\":420,\"output_tokens_details\":{\"reasoning_tokens\":256},\"total_tokens\":2420}}}", ai.streamNoop(), &call_seq);
 
     var turn = try state.finish(gpa, &call_seq);
     defer turn.deinit(gpa);
@@ -1020,7 +1026,7 @@ test "openresponses completed event without usage leaves null" {
     defer state.deinitBlocks(gpa);
 
     var call_seq: u64 = 0;
-    try state.processJson(gpa, "{\"type\":\"response.completed\"}", ai.StreamObserver.noop, &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.completed\"}", ai.streamNoop(), &call_seq);
 
     var turn = try state.finish(gpa, &call_seq);
     defer turn.deinit(gpa);
@@ -1034,13 +1040,13 @@ test "openresponses routes parallel argument deltas by output index" {
     defer state.deinitBlocks(gpa);
 
     var call_seq: u64 = 0;
-    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"id\":\"item_a\",\"name\":\"bash\"}}", ai.StreamObserver.noop, &call_seq);
-    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_b\",\"id\":\"item_b\",\"name\":\"bash\"}}", ai.StreamObserver.noop, &call_seq);
-    try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"command\\\":\"}", ai.StreamObserver.noop, &call_seq);
-    try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"path\\\":\"}", ai.StreamObserver.noop, &call_seq);
-    try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"\\\"pwd\\\"}\"}", ai.StreamObserver.noop, &call_seq);
-    try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"\\\"src/main.zig\\\"}\"}", ai.StreamObserver.noop, &call_seq);
-    try state.processJson(gpa, "{\"type\":\"response.completed\"}", ai.StreamObserver.noop, &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"id\":\"item_a\",\"name\":\"bash\"}}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_b\",\"id\":\"item_b\",\"name\":\"bash\"}}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"command\\\":\"}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"path\\\":\"}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"\\\"pwd\\\"}\"}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"\\\"src/main.zig\\\"}\"}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.completed\"}", ai.streamNoop(), &call_seq);
 
     var turn = try state.finish(gpa, &call_seq);
     defer turn.deinit(gpa);

@@ -106,7 +106,7 @@ pub const Client = struct {
     pub fn prompt(
         self: *Client,
         messages: []const ai.ChatMessage,
-        observer: ai.StreamObserver,
+        observer: anytype,
     ) !ai.Turn {
         std.debug.assert(self.url.len > 0);
         self.clearErrorDetail();
@@ -513,7 +513,7 @@ const ToolCallStream = struct {
 fn readStream(
     gpa: std.mem.Allocator,
     reader: *std.Io.Reader,
-    observer: ai.StreamObserver,
+    observer: anytype,
     tool_call_seq: *u64,
 ) !ai.Turn {
     var content: std.ArrayList(u8) = .empty;
@@ -584,24 +584,24 @@ fn applyChunkCallbacks(
     content: []const u8,
     reasoning: []const u8,
     builders: []const ToolCallBuilder,
-    observer: ai.StreamObserver,
+    observer: anytype,
 ) !void {
     if (change.content_start) |start| {
-        try observer.on_content(observer.ptr, content[start..]);
+        try observer.on_content(observer.ctx, content[start..]);
     }
     if (change.reasoning_start) |start| {
-        try observer.on_reasoning(observer.ptr, reasoning[start..]);
+        try observer.on_reasoning(observer.ctx, reasoning[start..]);
     }
     for (change.tool_call_indexes[0..change.tool_call_count]) |idx| {
         const builder = builders[idx];
-        try observer.on_tool_delta(observer.ptr, .{
+        try observer.on_tool_delta(observer.ctx, .{
             .index = idx,
             .name = builder.name.items,
             .arguments = builder.arguments.items,
         });
     }
     if (change.empty()) return;
-    try observer.on_delta_end(observer.ptr);
+    try observer.on_delta_end(observer.ctx);
 }
 
 fn processStreamChunk(
@@ -610,7 +610,7 @@ fn processStreamChunk(
     content: *std.ArrayList(u8),
     reasoning: *std.ArrayList(u8),
     stream: *ToolCallStream,
-    observer: ai.StreamObserver,
+    observer: anytype,
 ) !void {
     const change = try parseStreamChunk(gpa, data, content, reasoning, stream);
     try applyChunkCallbacks(change, content.items, reasoning.items, stream.builders.items, observer);
@@ -1031,7 +1031,7 @@ test "readStream accepts an SSE line larger than the transfer buffer" {
 
     var reader: std.Io.Reader = .fixed(stream.items);
     var tool_call_seq: u64 = 0;
-    var response = try readStream(gpa, &reader, ai.StreamObserver.noop, &tool_call_seq);
+    var response = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq);
     defer response.deinit(gpa);
     try std.testing.expectEqual(@as(usize, transfer_buffer_bytes + 512), response.assistant.assistant.content[0].text.text.len);
 }
@@ -1047,7 +1047,7 @@ test "readStream skips empty data lines without crashing" {
         "data: [DONE]\n";
     var reader: std.Io.Reader = .fixed(stream);
     var tool_call_seq: u64 = 0;
-    var response = try readStream(gpa, &reader, ai.StreamObserver.noop, &tool_call_seq);
+    var response = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq);
     defer response.deinit(gpa);
     try std.testing.expectEqualStrings("hi", response.assistant.assistant.content[0].text.text);
 }
@@ -1084,17 +1084,22 @@ test "parse streaming tool deltas as they arrive" {
         arguments: []const u8 = "",
         index: u32 = 0,
 
-        fn onToolDelta(context: *anyopaque, delta: ai.ToolDelta) anyerror!void {
-            const seen: *@This() = @ptrCast(@alignCast(context));
-            seen.index = delta.index;
-            seen.name = delta.name;
-            seen.arguments = delta.arguments;
+        fn onToolDelta(ctx: *@This(), delta: ai.ToolDelta) anyerror!void {
+            ctx.index = delta.index;
+            ctx.name = delta.name;
+            ctx.arguments = delta.arguments;
         }
+        fn noopBytes(_: *@This(), _: []const u8) anyerror!void {}
+        fn noopVoid(_: *@This()) anyerror!void {}
     };
     var seen: Seen = .{};
-    var observer = ai.StreamObserver.noop;
-    observer.ptr = &seen;
-    observer.on_tool_delta = Seen.onToolDelta;
+    const observer: ai.StreamObserver(Seen) = .{
+        .ctx = &seen,
+        .on_content = Seen.noopBytes,
+        .on_reasoning = Seen.noopBytes,
+        .on_tool_delta = Seen.onToolDelta,
+        .on_delta_end = Seen.noopVoid,
+    };
 
     try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"command\":\"zig"}}]}}]}
@@ -1119,7 +1124,7 @@ test "parse streaming tool deltas tolerate key reorder" {
 
     try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"function":{"name":"bash","arguments":"{}"},"id":"call_1","index":0}]}}]}
-    , &content, &reasoning, &stream, ai.StreamObserver.noop);
+    , &content, &reasoning, &stream, ai.streamNoop());
 
     try std.testing.expectEqual(@as(usize, 1), stream.builders.items.len);
     try std.testing.expectEqualStrings("call_1", stream.builders.items[0].id.items);
@@ -1140,21 +1145,23 @@ test "parse streaming tool deltas batches render notification per event" {
         tool_delta_count: u32 = 0,
         render_count: u32 = 0,
 
-        fn onToolDelta(context: *anyopaque, _: ai.ToolDelta) anyerror!void {
-            const seen: *@This() = @ptrCast(@alignCast(context));
-            seen.tool_delta_count += 1;
+        fn onToolDelta(ctx: *@This(), _: ai.ToolDelta) anyerror!void {
+            ctx.tool_delta_count += 1;
         }
 
-        fn onDeltaEnd(context: *anyopaque) anyerror!void {
-            const seen: *@This() = @ptrCast(@alignCast(context));
-            seen.render_count += 1;
+        fn onDeltaEnd(ctx: *@This()) anyerror!void {
+            ctx.render_count += 1;
         }
+        fn noopBytes(_: *@This(), _: []const u8) anyerror!void {}
     };
     var seen: Seen = .{};
-    var observer = ai.StreamObserver.noop;
-    observer.ptr = &seen;
-    observer.on_tool_delta = Seen.onToolDelta;
-    observer.on_delta_end = Seen.onDeltaEnd;
+    const observer: ai.StreamObserver(Seen) = .{
+        .ctx = &seen,
+        .on_content = Seen.noopBytes,
+        .on_reasoning = Seen.noopBytes,
+        .on_tool_delta = Seen.onToolDelta,
+        .on_delta_end = Seen.onDeltaEnd,
+    };
 
     try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}},{"index":1,"id":"call_2","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}
@@ -1181,16 +1188,22 @@ test "parse streaming reasoning deltas as they arrive" {
             self.reasoning.deinit(self.gpa);
         }
 
-        fn onReasoning(context: *anyopaque, delta: []const u8) anyerror!void {
-            const seen: *@This() = @ptrCast(@alignCast(context));
-            try seen.reasoning.appendSlice(seen.gpa, delta);
+        fn onReasoning(ctx: *@This(), delta: []const u8) anyerror!void {
+            try ctx.reasoning.appendSlice(ctx.gpa, delta);
         }
+        fn noopBytes(_: *@This(), _: []const u8) anyerror!void {}
+        fn noopToolDelta(_: *@This(), _: ai.ToolDelta) anyerror!void {}
+        fn noopVoid(_: *@This()) anyerror!void {}
     };
     var seen: Seen = .{ .gpa = gpa };
     defer seen.deinit();
-    var observer = ai.StreamObserver.noop;
-    observer.ptr = &seen;
-    observer.on_reasoning = Seen.onReasoning;
+    const observer: ai.StreamObserver(Seen) = .{
+        .ctx = &seen,
+        .on_content = Seen.noopBytes,
+        .on_reasoning = Seen.onReasoning,
+        .on_tool_delta = Seen.noopToolDelta,
+        .on_delta_end = Seen.noopVoid,
+    };
 
     try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"reasoning_content":"checking output"}}]}
@@ -1217,16 +1230,22 @@ test "parse streaming content deltas as they arrive" {
             self.content.deinit(self.gpa);
         }
 
-        fn onContent(context: *anyopaque, delta: []const u8) anyerror!void {
-            const seen: *@This() = @ptrCast(@alignCast(context));
-            try seen.content.appendSlice(seen.gpa, delta);
+        fn onContent(ctx: *@This(), delta: []const u8) anyerror!void {
+            try ctx.content.appendSlice(ctx.gpa, delta);
         }
+        fn noopBytes(_: *@This(), _: []const u8) anyerror!void {}
+        fn noopToolDelta(_: *@This(), _: ai.ToolDelta) anyerror!void {}
+        fn noopVoid(_: *@This()) anyerror!void {}
     };
     var seen: Seen = .{ .gpa = gpa };
     defer seen.deinit();
-    var observer = ai.StreamObserver.noop;
-    observer.ptr = &seen;
-    observer.on_content = Seen.onContent;
+    const observer: ai.StreamObserver(Seen) = .{
+        .ctx = &seen,
+        .on_content = Seen.onContent,
+        .on_reasoning = Seen.noopBytes,
+        .on_tool_delta = Seen.noopToolDelta,
+        .on_delta_end = Seen.noopVoid,
+    };
 
     try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"content":"hel"}}]}

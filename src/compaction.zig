@@ -133,7 +133,7 @@ pub fn summarize(gpa: std.mem.Allocator, client: ai.LanguageModel, prefix_text: 
     var message: ai.ChatMessage = .{ .user = .{ .content = blocks } };
     defer message.deinit(gpa);
 
-    var turn = try client.prompt(&.{message}, ai.StreamObserver.noop);
+    var turn = try client.prompt(&.{message}, ai.streamNoop());
     defer turn.deinit(gpa);
 
     var out: std.ArrayList(u8) = .empty;
