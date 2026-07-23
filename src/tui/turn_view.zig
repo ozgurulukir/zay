@@ -576,3 +576,62 @@ test "history compacted appends a white info notice, not a red error" {
     try std.testing.expectEqual(transcript_mod.MessageKind.info, transcript.messages.items[0].mirror().kind);
     try std.testing.expectEqualStrings("compacted context ~90000 -> ~20000 tokens", transcript.messages.items[0].mirror().body);
 }
+
+test "resolveToolPreview classifies bash skill read" {
+    const gpa = std.testing.allocator;
+    const preview = try TurnView.resolveToolPreview(gpa, .{
+        .index = 0,
+        .name = "bash",
+        .arguments = "{\"command\":\"cat .agents/skills/tigerstyle/SKILL.md\"}",
+    });
+    switch (preview) {
+        .skill => |name| {
+            defer gpa.free(name);
+            try std.testing.expectEqualStrings("tigerstyle", name);
+        },
+        else => return error.UnexpectedPreview,
+    }
+}
+
+test "resolveToolPreview classifies bash non-skill as generic" {
+    const gpa = std.testing.allocator;
+    var preview = try TurnView.resolveToolPreview(gpa, .{
+        .index = 0,
+        .name = "bash",
+        .arguments = "{\"command\":\"pwd\",\"reason\":\"Inspect directory\"}",
+    });
+    switch (preview) {
+        .generic => |*display| {
+            defer display.deinit(gpa);
+            try std.testing.expectEqualStrings("Inspect directory", display.label);
+            try std.testing.expectEqualStrings("pwd", display.expanded_label.?);
+        },
+        else => return error.UnexpectedPreview,
+    }
+}
+
+test "resolveToolPreview returns none for partial bash arguments" {
+    const gpa = std.testing.allocator;
+    const preview = try TurnView.resolveToolPreview(gpa, .{
+        .index = 0,
+        .name = "bash",
+        .arguments = "{\"command",
+    });
+    try std.testing.expect(preview == .none);
+}
+
+test "resolveToolPreview classifies unknown tool as generic" {
+    const gpa = std.testing.allocator;
+    var preview = try TurnView.resolveToolPreview(gpa, .{
+        .index = 0,
+        .name = "unknown_tool",
+        .arguments = "{\"x\":1}",
+    });
+    switch (preview) {
+        .generic => |*display| {
+            defer display.deinit(gpa);
+            try std.testing.expectEqualStrings("unknown_tool {\"x\":1}", display.label);
+        },
+        else => return error.UnexpectedPreview,
+    }
+}
