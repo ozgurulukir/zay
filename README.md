@@ -34,6 +34,7 @@ Add the binary (`zig-out/bin/nova`) to your PATH so you can invoke it from anywh
 
 - **`/connect`**: Configure AI providers, custom endpoints, and API key management.
 - **`/model`**: Select LLM model & reasoning effort.
+- **`/mcp`**: Real-time Model Context Protocol server status, tool count, latency monitoring, and toggle controls.
 - **`/settings`**: Interactive tabbed configuration panel (General, System Prompt, Advanced, About) with `Ctrl+S` instant save.
 - **`/copy` & `/paste`**: Copy selected transcript message blocks or diff comments to the system clipboard; paste into prompt fields (`Ctrl+V` / `Shift+Insert`).
 - **`/help`**: Scrollable quick reference guide with keyboard and mouse wheel navigation.
