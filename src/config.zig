@@ -923,8 +923,9 @@ fn writeProviderModels(writer: *std.Io.Writer, models: []const ProviderModel) !v
 
 fn writeKey(writer: *std.Io.Writer, name: []const u8, wrote_any: *bool) !void {
     if (wrote_any.*) try writer.writeByte(',');
+    try writer.writeAll("\n  ");
     try std.json.Stringify.value(name, .{}, writer);
-    try writer.writeByte(':');
+    try writer.writeAll(": ");
     wrote_any.* = true;
 }
 
@@ -1206,7 +1207,7 @@ test "serialize: skips api_key even if present" {
 
     try std.testing.expect(std.mem.indexOf(u8, buf.written(), "api_key") == null);
     try std.testing.expect(std.mem.indexOf(u8, buf.written(), "sk-should-never-appear") == null);
-    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"model\":\"openai/gpt-5.5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"model\": \"openai/gpt-5.5\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"openai\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"reasoningEffort\":\"medium\"") != null);
 }
@@ -1316,4 +1317,36 @@ test "Config.validate validates schema version and base_url scheme" {
     }
 
     try std.testing.expectEqual(@as(usize, 2), diags.len);
+}
+
+test "config.load with missing files returns default config with version 1 and zero diagnostics" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const env: TestEnv = .{ .entries = &.{} };
+
+    var res = try load(gpa, io, "/nonexistent/cwd", "/nonexistent/home", env);
+    defer res.deinit(gpa);
+
+    try std.testing.expectEqual(@as(?u32, 1), res.config.version);
+    try std.testing.expectEqual(@as(?Provider, null), res.config.provider);
+    try std.testing.expectEqual(@as(usize, 0), res.diagnostics.len);
+}
+
+test "serialize outputs version 1 and formatted 2-space indented JSON" {
+    const gpa = std.testing.allocator;
+    var cfg: Config = .{
+        .provider = .openai,
+        .use_responses_endpoint = true,
+        .enable_thinking = false,
+    };
+    defer cfg.deinit(gpa);
+
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, cfg);
+
+    const text = buf.written();
+    try std.testing.expect(std.mem.startsWith(u8, text, "{\n  \"version\": 1"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "  \"provider\": \"openai\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "  \"use_responses_endpoint\": true") != null);
 }
