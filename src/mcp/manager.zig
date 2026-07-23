@@ -27,14 +27,34 @@ pub const McpManager = struct {
 
     /// Reconcile client list against config: remove stale, add new, update status.
     /// No I/O connections — pure list management. Safe to call repeatedly.
+    /// Misconfigured servers (no command/url) are registered as .failed with
+    /// an error message. Duplicate names are skipped with a warning.
     pub fn syncFromConfig(self: *McpManager, io: std.Io, config: *const config_mod.Config) !void {
         // Phase 1: Remove clients no longer in config (zombie cleanup)
         self.removeStaleClients(io, config);
 
         // Phase 2: Add new or update status of existing
-        for (config.mcp_servers) |server_cfg| {
+        for (config.mcp_servers, 0..) |server_cfg, cfg_idx| {
+            // Skip duplicate names within the same config
+            var is_dup = false;
+            for (config.mcp_servers[0..cfg_idx]) |prev| {
+                if (std.mem.eql(u8, server_cfg.name, prev.name)) {
+                    is_dup = true;
+                    break;
+                }
+            }
+            if (is_dup) {
+                std.log.warn("MCP server '{s}': duplicate name in config, skipping", .{server_cfg.name});
+                continue;
+            }
+
+            const has_transport = server_cfg.command != null or server_cfg.url != null;
+
             if (self.findClient(server_cfg.name)) |c| {
-                if (server_cfg.enabled) {
+                if (!has_transport) {
+                    c.status = .failed;
+                    c.setError("No command or url configured", .{});
+                } else if (server_cfg.enabled) {
                     if (c.status != .connected) c.status = .connecting;
                 } else {
                     c.status = .disabled;
@@ -47,7 +67,12 @@ pub const McpManager = struct {
                     server_cfg.args,
                     server_cfg.url,
                 );
-                c.status = if (server_cfg.enabled) .connecting else .disabled;
+                if (!has_transport) {
+                    c.status = .failed;
+                    c.setError("No command or url configured", .{});
+                } else {
+                    c.status = if (server_cfg.enabled) .connecting else .disabled;
+                }
                 try self.clients.append(self.gpa, c);
             }
         }
@@ -251,7 +276,11 @@ test "McpManager does not reconnect already connected clients" {
     defer manager.deinit(std.testing.io);
 
     var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
-    servers[0] = .{ .name = try gpa.dupe(u8, "stable"), .enabled = true };
+    servers[0] = .{
+        .name = try gpa.dupe(u8, "stable"),
+        .command = try gpa.dupe(u8, "echo"),
+        .enabled = true,
+    };
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
     defer cfg.deinit(gpa);
 
@@ -265,4 +294,47 @@ test "McpManager does not reconnect already connected clients" {
     // Second sync: should NOT change status of already-connected client
     try manager.syncFromConfig(std.testing.io, &cfg);
     try std.testing.expectEqual(client_mod.ServerStatus.connected, manager.clients.items[0].status);
+}
+
+test "McpManager marks misconfigured servers as failed" {
+    const gpa = std.testing.allocator;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(std.testing.io);
+
+    // Server with no command and no url
+    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = .{ .name = try gpa.dupe(u8, "broken"), .enabled = true };
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+    defer cfg.deinit(gpa);
+
+    try manager.syncFromConfig(std.testing.io, &cfg);
+    try std.testing.expectEqual(@as(usize, 1), manager.clients.items.len);
+    try std.testing.expectEqual(client_mod.ServerStatus.failed, manager.clients.items[0].status);
+    try std.testing.expect(manager.clients.items[0].error_message != null);
+    try std.testing.expectEqualStrings("No command or url configured", manager.clients.items[0].error_message.?);
+}
+
+test "McpManager skips duplicate server names in config" {
+    const gpa = std.testing.allocator;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(std.testing.io);
+
+    var servers = try gpa.alloc(config_mod.McpServerConfig, 2);
+    servers[0] = .{
+        .name = try gpa.dupe(u8, "dup"),
+        .command = try gpa.dupe(u8, "echo"),
+        .enabled = true,
+    };
+    servers[1] = .{
+        .name = try gpa.dupe(u8, "dup"),
+        .command = try gpa.dupe(u8, "cat"),
+        .enabled = true,
+    };
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+    defer cfg.deinit(gpa);
+
+    try manager.syncFromConfig(std.testing.io, &cfg);
+    // Only the first "dup" should be registered
+    try std.testing.expectEqual(@as(usize, 1), manager.clients.items.len);
+    try std.testing.expectEqualStrings("echo", manager.clients.items[0].command.?);
 }
