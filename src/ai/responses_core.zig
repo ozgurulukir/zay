@@ -199,12 +199,19 @@ fn writeParameters(writer: *std.Io.Writer, schema: tools_common.Schema) !void {
         const kind: []const u8 = switch (prop.kind) {
             .string => "string",
             .integer => "integer",
+            .number => "number",
             .object => "object",
+            .array => "array",
             .boolean => "boolean",
         };
         try std.json.Stringify.value(kind, .{}, writer);
         try writer.writeAll(",\"description\":");
         try std.json.Stringify.value(prop.description, .{}, writer);
+        if (prop.kind == .object) {
+            try writer.writeAll(",\"additionalProperties\":true");
+        } else if (prop.kind == .array) {
+            try writer.writeAll(",\"items\":{}");
+        }
         try writer.writeByte('}');
     }
     try writer.writeAll("},\"required\":[");

@@ -384,7 +384,9 @@ fn extractContentText(gpa: std.mem.Allocator, result: std.json.Value) ![]u8 {
 }
 
 /// Convert a JSON Schema object to a tools_common.Schema.
-/// Handles the standard JSON Schema `properties` object and `required` array.
+/// Handles `properties`, `required`, `type`, `description`, and `enum`.
+/// Unsupported features ($ref, oneOf, anyOf, allOf) log a warning and
+/// fall back to string kind so the tool is still callable.
 fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tools_common.Schema {
     if (value != .object) return tools_common.Schema{ .properties = &.{} };
     const obj = value.object;
@@ -392,15 +394,12 @@ fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tools_co
     const properties_val = obj.get("properties") orelse return tools_common.Schema{ .properties = &.{} };
     if (properties_val != .object) return tools_common.Schema{ .properties = &.{} };
 
-    // Collect required field names
     var required_set: std.StringHashMapUnmanaged(void) = .empty;
     defer required_set.deinit(gpa);
     if (obj.get("required")) |req_val| {
         if (req_val == .array) {
             for (req_val.array.items) |item| {
-                if (item == .string) {
-                    required_set.put(gpa, item.string, {}) catch {};
-                }
+                if (item == .string) required_set.put(gpa, item.string, {}) catch {};
             }
         }
     }
@@ -413,14 +412,54 @@ fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tools_co
         const prop_name = entry.key_ptr.*;
         const prop_val = entry.value_ptr.*;
         if (prop_val != .object) continue;
+        const prop_obj = prop_val.object;
 
-        const kind = if (prop_val.object.get("type")) |t| (if (t == .string) t.string else "string") else "string";
-        const description = if (prop_val.object.get("description")) |d| (if (d == .string) d.string else "") else "";
+        // Determine kind — handle unsupported composition keywords gracefully
+        const kind = blk: {
+            if (prop_obj.get("$ref") != null) {
+                std.log.warn("MCP schema: $ref unsupported for '{s}', using string", .{prop_name});
+                break :blk tools_common.Schema.Kind.string;
+            }
+            if (prop_obj.get("oneOf") != null or prop_obj.get("anyOf") != null) {
+                std.log.warn("MCP schema: oneOf/anyOf unsupported for '{s}', using string", .{prop_name});
+                break :blk tools_common.Schema.Kind.string;
+            }
+            const type_str = if (prop_obj.get("type")) |t|
+                (if (t == .string) t.string else "string")
+            else
+                "string";
+            break :blk kindFromString(type_str);
+        };
+
+        // Build description — append enum values if present
+        const base_desc = if (prop_obj.get("description")) |d|
+            (if (d == .string) d.string else "")
+        else
+            "";
+
+        const desc_owned = if (prop_obj.get("enum")) |enum_val| blk: {
+            if (enum_val != .array or enum_val.array.items.len == 0) break :blk try gpa.dupe(u8, base_desc);
+            var dw: std.Io.Writer.Allocating = .init(gpa);
+            errdefer dw.deinit();
+            try dw.writer.writeAll(base_desc);
+            if (base_desc.len > 0) try dw.writer.writeAll(" ");
+            try dw.writer.writeAll("[enum: ");
+            for (enum_val.array.items, 0..) |ev, ei| {
+                if (ei > 0) try dw.writer.writeAll(", ");
+                switch (ev) {
+                    .string => |s| try dw.writer.writeAll(s),
+                    .integer => |n| try dw.writer.print("{d}", .{n}),
+                    else => try dw.writer.writeAll("?"),
+                }
+            }
+            try dw.writer.writeAll("]");
+            break :blk try dw.toOwnedSlice();
+        } else try gpa.dupe(u8, base_desc);
 
         try props.append(gpa, .{
             .name = try gpa.dupe(u8, prop_name),
-            .kind = kindFromString(kind),
-            .description = try gpa.dupe(u8, description),
+            .kind = kind,
+            .description = desc_owned,
             .required = required_set.contains(prop_name),
         });
     }
@@ -430,7 +469,9 @@ fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tools_co
 
 fn kindFromString(kind: []const u8) tools_common.Schema.Kind {
     if (std.mem.eql(u8, kind, "integer")) return .integer;
+    if (std.mem.eql(u8, kind, "number")) return .number;
     if (std.mem.eql(u8, kind, "object")) return .object;
+    if (std.mem.eql(u8, kind, "array")) return .array;
     if (std.mem.eql(u8, kind, "boolean")) return .boolean;
     return .string;
 }
@@ -554,4 +595,85 @@ test "McpClient callTool round-trip" {
     defer gpa.free(result);
 
     try std.testing.expectEqualStrings("Hello, World!", result);
+}
+
+test "schemaFromJsonSchema handles array and number types" {
+    const gpa = std.testing.allocator;
+    const schema_json =
+        \\{"type":"object","properties":{
+        \\  "items":{"type":"array","description":"List of items"},
+        \\  "price":{"type":"number","description":"Item price"},
+        \\  "count":{"type":"integer","description":"Number of items"}
+        \\}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
+    defer parsed.deinit();
+
+    const schema = try schemaFromJsonSchema(gpa, parsed.value);
+    defer {
+        for (schema.properties) |*prop| {
+            gpa.free(prop.name);
+            gpa.free(prop.description);
+        }
+        if (schema.properties.len > 0) gpa.free(schema.properties);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), schema.properties.len);
+    for (schema.properties) |prop| {
+        if (std.mem.eql(u8, prop.name, "items"))
+            try std.testing.expectEqual(tools_common.Schema.Kind.array, prop.kind);
+        if (std.mem.eql(u8, prop.name, "price"))
+            try std.testing.expectEqual(tools_common.Schema.Kind.number, prop.kind);
+        if (std.mem.eql(u8, prop.name, "count"))
+            try std.testing.expectEqual(tools_common.Schema.Kind.integer, prop.kind);
+    }
+}
+
+test "schemaFromJsonSchema appends enum values to description" {
+    const gpa = std.testing.allocator;
+    const schema_json =
+        \\{"type":"object","properties":{
+        \\  "color":{"type":"string","description":"Color choice","enum":["red","green","blue"]}
+        \\}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
+    defer parsed.deinit();
+
+    const schema = try schemaFromJsonSchema(gpa, parsed.value);
+    defer {
+        for (schema.properties) |*prop| {
+            gpa.free(prop.name);
+            gpa.free(prop.description);
+        }
+        if (schema.properties.len > 0) gpa.free(schema.properties);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), schema.properties.len);
+    try std.testing.expect(std.mem.indexOf(u8, schema.properties[0].description, "[enum: red, green, blue]") != null);
+}
+
+test "schemaFromJsonSchema falls back to string for $ref and oneOf" {
+    const gpa = std.testing.allocator;
+    const schema_json =
+        \\{"type":"object","properties":{
+        \\  "ref_item":{"$ref":"#/definitions/Item","description":"Referenced"},
+        \\  "union":{"oneOf":[{"type":"string"},{"type":"integer"}],"description":"Union type"}
+        \\}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
+    defer parsed.deinit();
+
+    const schema = try schemaFromJsonSchema(gpa, parsed.value);
+    defer {
+        for (schema.properties) |*prop| {
+            gpa.free(prop.name);
+            gpa.free(prop.description);
+        }
+        if (schema.properties.len > 0) gpa.free(schema.properties);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), schema.properties.len);
+    for (schema.properties) |prop| {
+        try std.testing.expectEqual(tools_common.Schema.Kind.string, prop.kind);
+    }
 }

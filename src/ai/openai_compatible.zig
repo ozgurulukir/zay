@@ -265,7 +265,9 @@ fn writeToolDefinition(
         const kind_str: []const u8 = switch (prop.kind) {
             .string => "string",
             .integer => "integer",
+            .number => "number",
             .object => "object",
+            .array => "array",
             .boolean => "boolean",
         };
         try std.json.Stringify.value(kind_str, .{}, writer);
@@ -273,6 +275,8 @@ fn writeToolDefinition(
         try std.json.Stringify.value(prop.description, .{}, writer);
         if (prop.kind == .object) {
             try writer.writeAll(",\"additionalProperties\":true");
+        } else if (prop.kind == .array) {
+            try writer.writeAll(",\"items\":{}");
         }
         try writer.writeByte('}');
     }
