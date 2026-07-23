@@ -268,7 +268,7 @@ pub const ExecutorService = struct {
         errdefer self.gpa.free(name);
         var display = try makeDisplay(self.gpa, call.name, call.arguments);
         errdefer display.deinit(self.gpa);
-        const content = try std.fmt.allocPrint(self.gpa, "tool '{s}' failed to execute: {s}", .{ call.name, @errorName(err) });
+        const content = try std.fmt.allocPrint(self.gpa, "tool '{s}' failed to execute: {s}", .{ call.name, errorDescription(err) });
         errdefer self.gpa.free(content);
         const display_body = try self.gpa.dupe(u8, content);
         return .{
@@ -416,4 +416,21 @@ test "executor rejected bash result is failed and model-facing" {
     try std.testing.expect(result.failed);
     try std.testing.expectEqualStrings("The tool call was rejected by the user for being unsafe. Try something else.", result.content);
     try std.testing.expectEqualStrings(result.content, result.display_body);
+}
+
+/// Map common Zig errors to human-readable descriptions for the model.
+/// Falls back to @errorName for unmapped errors.
+fn errorDescription(err: anyerror) []const u8 {
+    return switch (err) {
+        error.McpServerCrashed => "MCP server process terminated unexpectedly",
+        error.Timeout => "MCP server did not respond within the timeout period",
+        error.NotConnected => "MCP server is not connected",
+        error.McpToolCallFailed => "MCP tool call failed on the server",
+        error.McpServerNotFound => "MCP server not found",
+        error.InvalidMcpToolName => "invalid MCP tool name format",
+        error.McpNotConfigured => "no MCP manager is configured",
+        error.NoTransport => "MCP server has no command or url configured",
+        error.SseNotImplemented => "SSE transport is not yet supported",
+        else => @errorName(err),
+    };
 }

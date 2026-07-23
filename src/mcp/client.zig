@@ -286,8 +286,8 @@ pub const McpClient = struct {
 
     /// Call a tool via `tools/call` JSON-RPC.
     /// Returns the text content from the tool response (owned, caller must free).
-    /// When the server reports `isError: true`, the error text is returned
-    /// (not a Zig error) so the model can read the server's error message.
+    /// JSON-RPC errors and `isError: true` both return the server's message
+    /// as text (not a Zig error) so the model can read what went wrong.
     pub fn callTool(self: *McpClient, io: std.Io, tool_name: []const u8, arguments_json: []const u8) ![]u8 {
         // Build params JSON with proper escaping for tool_name
         var pw: std.Io.Writer.Allocating = .init(self.gpa);
@@ -303,10 +303,34 @@ pub const McpClient = struct {
         const response = try self.sendRequest(io, "tools/call", params);
         defer self.gpa.free(response);
 
-        const parsed = try parseResponse(self.gpa, response) orelse return error.McpToolCallFailed;
+        // Parse response inline to handle JSON-RPC errors with full context
+        const trimmed = std.mem.trim(u8, response, " \t\r\n");
+        if (trimmed.len == 0) return error.McpToolCallFailed;
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, self.gpa, trimmed, .{});
         defer parsed.deinit();
 
-        const result = parsed.value.object.get("result") orelse return error.McpToolCallFailed;
+        if (parsed.value != .object) return error.McpToolCallFailed;
+        const obj = parsed.value.object;
+
+        // JSON-RPC error — return the server's error message as text
+        if (obj.get("error")) |err_val| {
+            if (err_val == .object) {
+                const msg = if (err_val.object.get("message")) |m|
+                    (if (m == .string) m.string else "unknown error")
+                else
+                    "unknown error";
+                const code = if (err_val.object.get("code")) |c|
+                    (if (c == .integer) c.integer else 0)
+                else
+                    0;
+                std.log.warn("MCP tool '{s}' JSON-RPC error (code {d}): {s}", .{ tool_name, code, msg });
+                return self.gpa.dupe(u8, msg);
+            }
+            return error.McpToolCallFailed;
+        }
+
+        const result = obj.get("result") orelse return error.McpToolCallFailed;
         if (result != .object) return error.McpToolCallFailed;
 
         // Log server-side errors but still return the text content so the
