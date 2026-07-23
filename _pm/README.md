@@ -4,17 +4,17 @@ Cross-linked index for project management artifacts.
 
 ## Projects (active)
 
-- [mcp-improvements](Projects/mcp-improvements/) — MCP hardening: transport tests, reconciliation, schema edge cases, RAII
-  - State: Planning done. 10 items in backlog. Starting #6 (transport tests).
-  - Created: 2026-07-23
-  - Source: `MCP-IMPROVEMENTS.md` (codebase-memory-mcp analysis).
-
 - [tui-domain-extract-2](Projects/tui-domain-extract-2/) — Continue Strangler Fig extraction from `tui.zig`
   - State: Phase 1 (queue) done. `tui.zig` 4141 → **4097**.
   - Created: 2026-07-22
   - Plan: background modal, checkpoint, turn lifecycle, agent event, save, command palette, RootWidget, init/deinit.
 
 ## Archives
+
+- [mcp-improvements](Archives/mcp-improvements/) — MCP hardening: 10/10 items complete
+  - State: **Complete**. All P0-P3 items done.
+  - Created: 2026-07-23, Archived: 2026-07-23
+  - 10 commits. Transport tests, reconciliation, schema edges, mutex, error standardization, graceful shutdown.
 
 - [mcp-integration](Archives/mcp-integration/) — Bridge MCP tool discovery to the AI tool pipeline
   - State: **Complete** (P1–P4, P6). P5 (SSE) deferred.

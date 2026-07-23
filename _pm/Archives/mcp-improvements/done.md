@@ -45,3 +45,13 @@
 - callTool returns JSON-RPC error message as text (not Zig error).
 - errorDescription() helper maps Zig errors → human-readable strings.
 - Model now reads server error messages instead of cryptic error names.
+
+## #9 — Token cost / collision detection (commit `8a13f60`)
+- buildMcpToolSchemas deduplicates by full_name (first writer wins + warning).
+- serverSummary() method for system prompt context.
+
+## #10 — Graceful shutdown (commit `b857e07`)
+- stop() sends SIGTERM before SIGKILL.
+- McpManager.disconnectClient: stop + clear tools + disabled.
+- TUI /mcp 'd' key binding for disconnect.
+- Bug fix: poll POLLIN+HUP race — don't crash when buffered data exists.
