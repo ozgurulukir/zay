@@ -468,15 +468,18 @@ pub const App = struct {
     }
 
     pub fn getPendingQuitAt(self: *const App) ?std.Io.Timestamp {
-        return self.nav.pending_quit_at;
+        return switch (self.nav.quit) {
+            .pending => |ts| ts,
+            else => null,
+        };
     }
 
     pub fn setPendingQuitAt(self: *App, v: ?std.Io.Timestamp) void {
-        self.nav.pending_quit_at = v;
+        self.nav.quit = if (v) |ts| .{ .pending = ts } else .none;
     }
 
     pub fn clearPendingQuitAt(self: *App) void {
-        self.nav.pending_quit_at = null;
+        if (self.nav.quit == .pending) self.nav.quit = .none;
     }
 
     pub fn getSplit(self: *const App) bool {
@@ -1590,7 +1593,7 @@ test "ctrl-c clears a non-empty input instead of arming quit" {
 
     // The input is cleared and the quit sequence is not armed.
     try std.testing.expectEqual(@as(usize, 0), app.inputs.input.buf.realLength());
-    try std.testing.expect(app.nav.pending_quit_at == null);
+    try std.testing.expect(app.nav.quit == .none);
     try std.testing.expect(!ctx.quit);
 }
 

@@ -131,6 +131,11 @@ pub const PickerStates = struct {
 /// hit-test rect.
 pub const NavState = struct {
     pub const LanesPurpose = enum { manage, merge_dest };
+    pub const QuitState = union(enum) {
+        none,
+        pending: std.Io.Timestamp,
+        confirmed,
+    };
 
     block_nav: bool = false,
     command_selection: u32 = 0,
@@ -139,8 +144,10 @@ pub const NavState = struct {
     lanes_selection: u32 = 0,
     lanes_purpose: LanesPurpose = .manage,
     queued_selection: usize = 0,
-    pending_quit_at: ?std.Io.Timestamp = null,
-    quit_requested: bool = false,
+    /// Quit state machine: none -> pending (user pressed Ctrl+Q once,
+    /// waiting for a confirm within the window) -> confirmed (a slash
+    /// exit command was issued; the next event loop drains it).
+    quit: QuitState = .none,
     lanes_chip_rect: ?tui.ChipRect = null,
 };
 

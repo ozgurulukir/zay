@@ -230,7 +230,7 @@ pub fn submitMode(app: *App) !bool {
                     _ = try clipboard_helper.pasteFromSystemClipboard(app);
                 },
                 .exit_cmd => {
-                    app.nav.quit_requested = true;
+                    app.nav.quit = .confirmed;
                 },
             }
         }

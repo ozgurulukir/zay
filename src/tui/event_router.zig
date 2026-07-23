@@ -181,7 +181,7 @@ fn routeKey(
         if (app.handleBackgroundModalKey(key)) ctx.consumeAndRedraw() else ctx.consumeEvent();
         return;
     }
-    if (app.nav.quit_requested) {
+    if (app.nav.quit == .confirmed) {
         ctx.quit = true;
         ctx.consume_event = true;
         return;
