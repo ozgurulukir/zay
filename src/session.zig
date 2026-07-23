@@ -1159,13 +1159,19 @@ fn utf8PrefixLen(text: []const u8, limit: u32) u32 {
 }
 
 fn readSummary(gpa: std.mem.Allocator, row: *const db.Row) Error!SessionSummary {
+    var leaf_buffer: [entry_id_len]u8 = undefined;
     return .{
         .id = try gpa.dupe(u8, row.text(0)),
         .title = if (row.columnType(1) == .null) null else try gpa.dupe(u8, row.text(1)),
         .cwd = try gpa.dupe(u8, row.text(2)),
         .created_at_ms = row.int(3),
         .updated_at_ms = row.int(4),
-        .leaf_entry_id = if (row.columnType(5) == .null) null else try gpa.dupe(u8, row.text(5)),
+        .leaf_entry_id = if (row.columnType(5) == .null) null else blk: {
+            const value = row.text(5);
+            if (value.len != entry_id_len) return error.BadEntryId;
+            @memcpy(leaf_buffer[0..], value);
+            break :blk EntryId{ .bytes = leaf_buffer };
+        },
     };
 }
 

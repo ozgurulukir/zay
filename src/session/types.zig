@@ -100,13 +100,16 @@ pub const SessionSummary = struct {
     cwd: []u8,
     created_at_ms: i64,
     updated_at_ms: i64,
-    leaf_entry_id: ?[]u8,
+    /// Last entry id in the branch's leaf chain. Branded as EntryId
+    /// (fixed-size [entry_id_len]u8) instead of a loose []u8 so the
+    /// type system enforces the length invariant the DB layer relies
+    /// on. null when the branch has no entries yet.
+    leaf_entry_id: ?EntryId,
 
     pub fn deinit(self: *SessionSummary, gpa: std.mem.Allocator) void {
         gpa.free(self.id);
         if (self.title) |title| gpa.free(title);
         gpa.free(self.cwd);
-        if (self.leaf_entry_id) |id| gpa.free(id);
         self.* = undefined;
     }
 };
