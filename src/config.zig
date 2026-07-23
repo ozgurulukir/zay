@@ -607,8 +607,9 @@ fn parseObject(
     if (value.object.get("providers")) |providers_value| {
         if (providers_value == .object) out.providers = try parseProviders(gpa, providers_value);
     }
-    if (value.object.get("mcp_servers")) |mcp_value| {
-        if (mcp_value == .object) out.mcp_servers = try parseMcpServers(gpa, mcp_value);
+    const mcp_val = value.object.get("mcp_servers") orelse value.object.get("mcpServers");
+    if (mcp_val) |val| {
+        if (val == .object) out.mcp_servers = try parseMcpServers(gpa, val);
     }
     if (stringField(value, "base_url")) |s| {
         out.base_url = try gpa.dupe(u8, s);
@@ -1442,4 +1443,18 @@ test "parseFile parses mcp_servers objects" {
     try std.testing.expectEqual(@as(usize, 2), cfg.mcp_servers[0].args.len);
     try std.testing.expectEqualStrings("-y", cfg.mcp_servers[0].args[0]);
     try std.testing.expectEqual(true, cfg.mcp_servers[0].enabled);
+}
+
+test "parseFile parses mcpServers (Claude Desktop format)" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    const json = "{\"mcpServers\":{\"codebase-memory-mcp\":{\"command\":\"/path/to/codebase-memory-mcp\",\"args\":[]}}}";
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers.len);
+    try std.testing.expectEqualStrings("codebase-memory-mcp", cfg.mcp_servers[0].name);
+    try std.testing.expectEqualStrings("/path/to/codebase-memory-mcp", cfg.mcp_servers[0].command.?);
+    try std.testing.expectEqual(@as(usize, 0), cfg.mcp_servers[0].args.len);
 }
