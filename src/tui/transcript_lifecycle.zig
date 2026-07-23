@@ -80,13 +80,13 @@ pub fn rebuildTranscriptFromAgent(app: *App) !void {
 pub fn resumedToolTitle(app: *App, message: ai.ChatMessage) ![]u8 {
     if (message == .tool) {
         if (message.tool.display_label) |label| return transcript_mod.toolTitle(app.gpa, label);
-        const id = message.tool.call_id;
+        const id = message.tool.call_id.slice();
         for (app.thread.agent.?.messages()) |candidate| {
             switch (candidate) {
                 .assistant => |a| {
                     for (a.content) |block| {
                         if (block != .tool_call) continue;
-                        if (!std.mem.eql(u8, block.tool_call.call_id, id)) continue;
+                        if (!std.mem.eql(u8, block.tool_call.call_id.slice(), id)) continue;
                         var display = try agent_mod.formatToolDisplay(app.gpa, block.tool_call.name, block.tool_call.arguments);
                         defer display.deinit(app.gpa);
                         return transcript_mod.toolTitle(app.gpa, display.label);

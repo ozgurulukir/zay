@@ -112,14 +112,27 @@ pub const ReasoningBlock = struct {
     }
 };
 
+/// Branded wrapper for an LLM-generated tool call identifier. Carries an
+/// owned `[]u8` slice. The brand prevents accidental cross-wiring with
+/// other `[]u8` id fields (e.g. `model_id`, `account_id`) at call sites
+/// across module boundaries. Use `.slice()` to bridge to `[]const u8`
+/// parameters; use `.value` for direct `gpa.free` / `gpa.dupe`.
+pub const CallId = struct {
+    value: []u8,
+
+    pub fn slice(self: *const CallId) []const u8 {
+        return self.value;
+    }
+};
+
 pub const ToolCall = struct {
-    call_id: []u8,
+    call_id: CallId,
     responses_item_id: ?[]u8 = null,
     name: []u8,
     arguments: []u8,
 
     pub fn deinit(self: *ToolCall, gpa: std.mem.Allocator) void {
-        gpa.free(self.call_id);
+        gpa.free(self.call_id.value);
         if (self.responses_item_id) |id| gpa.free(id);
         gpa.free(self.name);
         gpa.free(self.arguments);
@@ -186,7 +199,7 @@ pub const ContentBlock = union(enum) {
             },
             .tool_call => |call| {
                 try writer.writeAll("{\"type\":\"tool_call\",\"call_id\":");
-                try std.json.Stringify.value(call.call_id, .{}, writer);
+                try std.json.Stringify.value(call.call_id.slice(), .{}, writer);
                 if (call.responses_item_id) |id| {
                     try writer.writeAll(",\"responses_item_id\":");
                     try std.json.Stringify.value(id, .{}, writer);
@@ -245,7 +258,7 @@ pub const ContentBlock = union(enum) {
             if (name != .string) return error.CorruptPayload;
             if (arguments != .string) return error.CorruptPayload;
             return .{ .tool_call = .{
-                .call_id = try gpa.dupe(u8, call_id.string),
+                .call_id = .{ .value = try gpa.dupe(u8, call_id.string) },
                 .responses_item_id = try jsonOptionalString(gpa, value, "responses_item_id"),
                 .name = try gpa.dupe(u8, name.string),
                 .arguments = try gpa.dupe(u8, arguments.string),
@@ -286,7 +299,7 @@ test "ContentBlock JSON round-trips every variant" {
         .{ .text = .{ .text = try gpa.dupe(u8, "hello"), .responses_item_id = try gpa.dupe(u8, "id1"), .responses_phase = try gpa.dupe(u8, "final") } },
         .{ .image = .{ .mime_type = try gpa.dupe(u8, "image/png"), .data_base64 = try gpa.dupe(u8, "AAAA") } },
         .{ .reasoning = .{ .text = try gpa.dupe(u8, "thinking"), .responses_item_json = try gpa.dupe(u8, "{}") } },
-        .{ .tool_call = .{ .call_id = try gpa.dupe(u8, "c1"), .name = try gpa.dupe(u8, "bash"), .arguments = try gpa.dupe(u8, "{}") } },
+        .{ .tool_call = .{ .call_id = .{ .value = try gpa.dupe(u8, "c1") }, .name = try gpa.dupe(u8, "bash"), .arguments = try gpa.dupe(u8, "{}") } },
     };
     defer for (&blocks) |*block| block.deinit(gpa);
 
@@ -337,7 +350,7 @@ pub const ChatMessage = union(enum) {
         content: []ContentBlock,
     },
     tool: struct {
-        call_id: []u8,
+        call_id: CallId,
         content: []ContentBlock,
         display_label: ?[]u8 = null,
         failed: bool = false,
@@ -375,7 +388,7 @@ pub const ChatMessage = union(enum) {
         switch (self.*) {
             inline .system, .user, .assistant => |*m| freeBlocks(gpa, m.content),
             .tool => |*t| {
-                gpa.free(t.call_id);
+                gpa.free(t.call_id.value);
                 if (t.display_label) |label| gpa.free(label);
                 freeBlocks(gpa, t.content);
             },

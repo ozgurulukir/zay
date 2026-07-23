@@ -229,7 +229,7 @@ fn pruneSingleToolMessage(gpa: std.mem.Allocator, msg: ai.ChatMessage, cap_bytes
     return .{
         .tool = .{
             .content = pruned_blocks,
-            .call_id = try gpa.dupe(u8, msg.tool.call_id),
+            .call_id = .{ .value = try gpa.dupe(u8, msg.tool.call_id.slice()) },
             .display_label = if (msg.tool.display_label) |l| try gpa.dupe(u8, l) else null,
             .failed = msg.tool.failed,
         },
@@ -254,7 +254,7 @@ fn cloneChatMessage(gpa: std.mem.Allocator, msg: ai.ChatMessage) !ai.ChatMessage
             const blocks = try cloneBlocks(gpa, m.content);
             return .{ .tool = .{
                 .content = blocks,
-                .call_id = try gpa.dupe(u8, m.call_id),
+                .call_id = .{ .value = try gpa.dupe(u8, m.call_id.slice()) },
                 .display_label = if (m.display_label) |l| try gpa.dupe(u8, l) else null,
                 .failed = m.failed,
             } };
@@ -276,7 +276,7 @@ fn cloneContentBlock(gpa: std.mem.Allocator, block: ai.ContentBlock) !ai.Content
         .text => |t| .{ .text = .{ .text = try gpa.dupe(u8, t.text) } },
         .reasoning => |r| .{ .reasoning = .{ .text = try gpa.dupe(u8, r.text) } },
         .image => |img| .{ .image = .{ .mime_type = try gpa.dupe(u8, img.mime_type), .data_base64 = try gpa.dupe(u8, img.data_base64) } },
-        .tool_call => |call| .{ .tool_call = .{ .call_id = try gpa.dupe(u8, call.call_id), .name = try gpa.dupe(u8, call.name), .arguments = try gpa.dupe(u8, call.arguments) } },
+        .tool_call => |call| .{ .tool_call = .{ .call_id = .{ .value = try gpa.dupe(u8, call.call_id.slice()) }, .name = try gpa.dupe(u8, call.name), .arguments = try gpa.dupe(u8, call.arguments) } },
     };
 }
 
@@ -374,7 +374,7 @@ fn makeToolMessage(gpa: std.mem.Allocator, call_id: []const u8, text: []const u8
     return .{
         .tool = .{
             .content = blocks,
-            .call_id = try gpa.dupe(u8, call_id),
+            .call_id = .{ .value = try gpa.dupe(u8, call_id) },
             .display_label = try gpa.dupe(u8, "bash"),
         },
     };

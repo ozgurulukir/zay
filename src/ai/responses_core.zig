@@ -578,7 +578,7 @@ fn onItemAdded(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.Array
         }
         builder.block_index = @intCast(blocks.items.len);
         try blocks.append(gpa, .{ .tool_call = .{
-            .call_id = try gpa.dupe(u8, builder.call_id.items),
+            .call_id = .{ .value = try gpa.dupe(u8, builder.call_id.items) },
             .responses_item_id = if (builder.item_id.items.len > 0) try gpa.dupe(u8, builder.item_id.items) else null,
             .name = try gpa.dupe(u8, builder.name.items),
             .arguments = try gpa.dupe(u8, builder.arguments.items),
@@ -800,7 +800,7 @@ fn syncOneToolBlock(gpa: std.mem.Allocator, blocks: *std.ArrayList(ai.ContentBlo
     if (tool.block_index >= blocks.items.len) return;
     if (blocks.items[tool.block_index] != .tool_call) return;
     const block = &blocks.items[tool.block_index].tool_call;
-    try replaceSlice(gpa, &block.call_id, tool.call_id.items);
+    try replaceSlice(gpa, &block.call_id.value, tool.call_id.items);
     const next_item_id = if (tool.item_id.items.len > 0) try gpa.dupe(u8, tool.item_id.items) else null;
     if (block.responses_item_id) |id| gpa.free(id);
     block.responses_item_id = next_item_id;

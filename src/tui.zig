@@ -3430,7 +3430,7 @@ test "resumed tool messages keep the tool icon" {
     try agent.takeMessage(.{
         .tool = .{
             .content = blocks,
-            .call_id = try gpa.dupe(u8, "test_call"),
+            .call_id = .{ .value = try gpa.dupe(u8, "test_call") },
             .display_label = try gpa.dupe(u8, "zig build test"),
         },
     });

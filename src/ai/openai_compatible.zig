@@ -481,7 +481,7 @@ const ToolCallBuilder = struct {
             break :id_blk minted;
         };
         return .{
-            .call_id = id,
+            .call_id = .{ .value = id },
             .name = try self.name.toOwnedSlice(gpa),
             .arguments = try self.arguments.toOwnedSlice(gpa),
         };

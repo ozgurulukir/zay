@@ -25,7 +25,7 @@ pub const BackgroundStart = struct {
 /// label/body for the TUI) in one record.
 pub const ToolResult = struct {
     /// LLM channel — the id this result is responding to.
-    call_id: []u8,
+    call_id: ai.CallId,
     /// LLM channel — the terse observation that flows into the assistant's
     /// next `tool` role message in history.
     content: []u8,
@@ -48,7 +48,7 @@ pub const ToolResult = struct {
     failed: bool,
 
     pub fn deinit(self: *ToolResult, gpa: std.mem.Allocator) void {
-        gpa.free(self.call_id);
+        gpa.free(self.call_id.value);
         gpa.free(self.content);
         gpa.free(self.name);
         gpa.free(self.display_label);
@@ -176,7 +176,7 @@ pub const ExecutorService = struct {
         };
         defer output.deinit(self.gpa);
 
-        const call_id = try self.gpa.dupe(u8, call.call_id);
+        const call_id = try self.gpa.dupe(u8, call.call_id.slice());
         errdefer self.gpa.free(call_id);
         const content = try formatLlmObservation(self.gpa, output);
         errdefer self.gpa.free(content);
@@ -193,7 +193,7 @@ pub const ExecutorService = struct {
             .text, .none => .text,
         };
         return .{
-            .call_id = call_id,
+            .call_id = .{ .value = call_id },
             .content = content,
             .name = name,
             .display_label = display.label,
@@ -232,7 +232,7 @@ pub const ExecutorService = struct {
             return self.runFailure(call, err);
         };
 
-        const call_id = try self.gpa.dupe(u8, call.call_id);
+        const call_id = try self.gpa.dupe(u8, call.call_id.slice());
         errdefer self.gpa.free(call_id);
         const content = if (result_text.len > 0) blk: {
             break :blk result_text;
@@ -249,7 +249,7 @@ pub const ExecutorService = struct {
         errdefer self.gpa.free(display_body);
 
         return .{
-            .call_id = call_id,
+            .call_id = .{ .value = call_id },
             .content = content,
             .name = name,
             .display_label = display_label,
@@ -274,7 +274,7 @@ pub const ExecutorService = struct {
     }
 
     fn runFailure(self: *ExecutorService, call: ai.ToolCall, err: anyerror) !ToolResult {
-        const call_id = try self.gpa.dupe(u8, call.call_id);
+        const call_id = try self.gpa.dupe(u8, call.call_id.slice());
         errdefer self.gpa.free(call_id);
         const name = try self.gpa.dupe(u8, call.name);
         errdefer self.gpa.free(name);
@@ -284,7 +284,7 @@ pub const ExecutorService = struct {
         errdefer self.gpa.free(content);
         const display_body = try self.gpa.dupe(u8, content);
         return .{
-            .call_id = call_id,
+            .call_id = .{ .value = call_id },
             .content = content,
             .name = name,
             .display_label = display.label,
@@ -297,7 +297,7 @@ pub const ExecutorService = struct {
 
     fn runRejected(self: *ExecutorService, call: ai.ToolCall) !ToolResult {
         const message = "The tool call was rejected by the user for being unsafe. Try something else.";
-        const call_id = try self.gpa.dupe(u8, call.call_id);
+        const call_id = try self.gpa.dupe(u8, call.call_id.slice());
         errdefer self.gpa.free(call_id);
         const name = try self.gpa.dupe(u8, call.name);
         errdefer self.gpa.free(name);
@@ -307,7 +307,7 @@ pub const ExecutorService = struct {
         errdefer self.gpa.free(content);
         const display_body = try self.gpa.dupe(u8, message);
         return .{
-            .call_id = call_id,
+            .call_id = .{ .value = call_id },
             .content = content,
             .name = name,
             .display_label = display.label,
@@ -365,13 +365,13 @@ test "ExecutorService runs bash and returns both channels" {
 
     const calls = [_]ai.ToolCall{
         .{
-            .call_id = try gpa.dupe(u8, "call_0"),
+            .call_id = .{ .value = try gpa.dupe(u8, "call_0") },
             .name = try gpa.dupe(u8, "bash"),
             .arguments = try gpa.dupe(u8, "{\"command\":\"printf hello\",\"reason\":\"Print hello\"}"),
         },
     };
     defer for (calls) |c| {
-        gpa.free(c.call_id);
+        gpa.free(c.call_id.value);
         gpa.free(c.name);
         gpa.free(c.arguments);
     };
@@ -382,7 +382,7 @@ test "ExecutorService runs bash and returns both channels" {
         gpa.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("call_0", results[0].call_id);
+    try std.testing.expectEqualStrings("call_0", results[0].call_id.slice());
     try std.testing.expectEqualStrings("hello", results[0].content);
     try std.testing.expectEqualStrings("Print hello", results[0].display_label);
     try std.testing.expectEqualStrings("printf hello", results[0].display_expanded_label.?);
@@ -393,12 +393,12 @@ test "executor converts a tool execution error into a failed result" {
     const gpa = std.testing.allocator;
     var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp" });
     const call: ai.ToolCall = .{
-        .call_id = try gpa.dupe(u8, "call_x"),
+        .call_id = .{ .value = try gpa.dupe(u8, "call_x") },
         .name = try gpa.dupe(u8, "bash"),
         .arguments = try gpa.dupe(u8, "{\"command\":\"rg foo\",\"reason\":\"search\"}"),
     };
     defer {
-        gpa.free(call.call_id);
+        gpa.free(call.call_id.value);
         gpa.free(call.name);
         gpa.free(call.arguments);
     }
@@ -406,7 +406,7 @@ test "executor converts a tool execution error into a failed result" {
     var result = try executor.runFailure(call, error.Unexpected);
     defer result.deinit(gpa);
     try std.testing.expect(result.failed);
-    try std.testing.expectEqualStrings("call_x", result.call_id);
+    try std.testing.expectEqualStrings("call_x", result.call_id.slice());
     try std.testing.expectEqualStrings("search", result.display_label);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "failed to execute") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "Unexpected") != null);
@@ -416,12 +416,12 @@ test "executor rejected bash result is failed and model-facing" {
     const gpa = std.testing.allocator;
     var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp" });
     const call: ai.ToolCall = .{
-        .call_id = try gpa.dupe(u8, "call_reject"),
+        .call_id = .{ .value = try gpa.dupe(u8, "call_reject") },
         .name = try gpa.dupe(u8, "bash"),
         .arguments = try gpa.dupe(u8, "{\"command\":\"rm -rf /\",\"reason\":\"clean\"}"),
     };
     defer {
-        gpa.free(call.call_id);
+        gpa.free(call.call_id.value);
         gpa.free(call.name);
         gpa.free(call.arguments);
     }

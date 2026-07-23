@@ -770,7 +770,7 @@ fn messageToJson(gpa: std.mem.Allocator, message: ai.ChatMessage) Error![]u8 {
     try std.json.Stringify.value(message.role().label(), .{}, writer);
     if (message == .tool) {
         try writer.writeAll(",\"call_id\":");
-        try std.json.Stringify.value(message.tool.call_id, .{}, writer);
+        try std.json.Stringify.value(message.tool.call_id.slice(), .{}, writer);
         if (message.tool.display_label) |label| {
             try writer.writeAll(",\"tool_display_label\":");
             try std.json.Stringify.value(label, .{}, writer);
@@ -812,7 +812,7 @@ fn jsonToMessage(gpa: std.mem.Allocator, payload_json: []const u8) Error!ai.Chat
         .tool => .{
             .tool = .{
                 .content = content,
-                .call_id = call_id orelse return error.CorruptPayload,
+                .call_id = .{ .value = call_id orelse return error.CorruptPayload },
                 .display_label = tool_display_label,
                 .failed = tool_failed,
             },
@@ -872,7 +872,7 @@ fn parseToolCalls(gpa: std.mem.Allocator, value: std.json.Value) Error![]const a
         if (name != .string) return error.CorruptPayload;
         if (arguments != .string) return error.CorruptPayload;
         calls[initialized] = .{
-            .call_id = try gpa.dupe(u8, id.string),
+            .call_id = .{ .value = try gpa.dupe(u8, id.string) },
             .name = try gpa.dupe(u8, name.string),
             .arguments = try gpa.dupe(u8, arguments.string),
         };
@@ -1261,7 +1261,7 @@ test "session persists tool display labels and failures" {
     blocks[0] = .{ .text = .{ .text = try std.testing.allocator.dupe(u8, "contents") } };
     const call_id = try std.testing.allocator.dupe(u8, "call_1");
     const label = try std.testing.allocator.dupe(u8, "read AGENTS.md");
-    try session.append(.{ .tool = .{ .content = blocks, .call_id = call_id, .display_label = label, .failed = true } }, &id);
+    try session.append(.{ .tool = .{ .content = blocks, .call_id = .{ .value = call_id }, .display_label = label, .failed = true } }, &id);
     for (blocks) |*block| block.deinit(std.testing.allocator);
     std.testing.allocator.free(blocks);
     std.testing.allocator.free(call_id);
@@ -1274,7 +1274,7 @@ test "session persists tool display labels and failures" {
     }
     try std.testing.expectEqual(@as(usize, 1), messages.len);
     try std.testing.expectEqual(.tool, messages[0].role());
-    try std.testing.expectEqualStrings("call_1", messages[0].tool.call_id);
+    try std.testing.expectEqualStrings("call_1", messages[0].tool.call_id.slice());
     try std.testing.expectEqualStrings("read AGENTS.md", messages[0].tool.display_label.?);
     try std.testing.expect(messages[0].tool.failed);
 }

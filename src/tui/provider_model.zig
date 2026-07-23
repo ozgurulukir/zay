@@ -750,11 +750,14 @@ pub fn modelSelectionUpdates(
     providers[0] = .{ .provider = provider, .models = models };
     models_moved = true;
     if (provider != .openai) {
-        if (compatibleBaseUrl(self, provider)) |base_url| providers[0].base_url = try self.gpa.dupe(u8, base_url);
+        if (compatibleBaseUrl(self, provider)) |base_url| providers[0].base_url = .{ .custom = try self.gpa.dupe(u8, base_url) };
     }
     return .{
         .provider = provider,
-        .base_url = if (providers[0].base_url) |base_url| try self.gpa.dupe(u8, base_url) else null,
+        .base_url = switch (providers[0].base_url) {
+            .custom => |base_url| try self.gpa.dupe(u8, base_url),
+            .default => null,
+        },
         .model = .{ .id = model_id_copy, .reasoning_effort = effort },
         .providers = providers,
     };

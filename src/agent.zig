@@ -182,7 +182,7 @@ pub const Agent = struct {
         defer resolved.deinit();
         for (history) |message| {
             switch (message) {
-                .tool => |t| try resolved.put(t.call_id, {}),
+                .tool => |t| try resolved.put(t.call_id.slice(), {}),
                 else => {},
             }
         }
@@ -199,8 +199,8 @@ pub const Agent = struct {
                 .assistant => |a| {
                     for (a.content) |block| {
                         if (block != .tool_call) continue;
-                        if (resolved.contains(block.tool_call.call_id)) continue;
-                        try missing.append(self.gpa, try self.gpa.dupe(u8, block.tool_call.call_id));
+                        if (resolved.contains(block.tool_call.call_id.slice())) continue;
+                        try missing.append(self.gpa, try self.gpa.dupe(u8, block.tool_call.call_id.slice()));
                     }
                 },
                 else => continue,
@@ -214,7 +214,7 @@ pub const Agent = struct {
             try self.context_manager.appendPersisted(.{
                 .tool = .{
                     .content = blocks,
-                    .call_id = try self.gpa.dupe(u8, id),
+                    .call_id = .{ .value = try self.gpa.dupe(u8, id) },
                     .display_label = try self.gpa.dupe(u8, "cancelled"),
                     .failed = true,
                 },
@@ -495,7 +495,7 @@ pub const Agent = struct {
                     ctx.agent,
                     ctx.listener,
                     ctx.tool_index,
-                    result.call_id,
+                    result.call_id.slice(),
                     result.name,
                     result.display_label,
                     result.display_expanded_label,
@@ -715,7 +715,7 @@ pub const Agent = struct {
         errdefer blocks[0].deinit(self.gpa);
         return .{
             .tool = .{
-                .call_id = try self.gpa.dupe(u8, "test_call"),
+                .call_id = .{ .value = try self.gpa.dupe(u8, "test_call") },
                 .content = blocks,
             },
         };
@@ -808,7 +808,7 @@ pub const Agent = struct {
             for (results[moved..]) |*r| r.deinit(self.gpa);
         }
         for (results) |*r| {
-            assert(r.call_id.len > 0);
+            assert(r.call_id.value.len > 0);
             const blocks = try self.gpa.alloc(ai.ContentBlock, 1);
             errdefer self.gpa.free(blocks);
             blocks[0] = .{ .text = .{ .text = r.content } };
@@ -1113,13 +1113,13 @@ test "interrupted tool calls get synthetic cancelled results" {
     // Assistant issues two tool calls; only the first got a result before the
     // user interrupted — leaving call_b dangling.
     const calls = try gpa.alloc(ai.ContentBlock, 2);
-    calls[0] = .{ .tool_call = .{ .call_id = try gpa.dupe(u8, "call_a"), .name = try gpa.dupe(u8, "read"), .arguments = try gpa.dupe(u8, "{}") } };
-    calls[1] = .{ .tool_call = .{ .call_id = try gpa.dupe(u8, "call_b"), .name = try gpa.dupe(u8, "bash"), .arguments = try gpa.dupe(u8, "{}") } };
+    calls[0] = .{ .tool_call = .{ .call_id = .{ .value = try gpa.dupe(u8, "call_a") }, .name = try gpa.dupe(u8, "read"), .arguments = try gpa.dupe(u8, "{}") } };
+    calls[1] = .{ .tool_call = .{ .call_id = .{ .value = try gpa.dupe(u8, "call_b") }, .name = try gpa.dupe(u8, "bash"), .arguments = try gpa.dupe(u8, "{}") } };
     try agent.context_manager.appendUnpersisted(.{ .assistant = .{ .content = calls } });
 
     const result = try gpa.alloc(ai.ContentBlock, 1);
     result[0] = .{ .text = .{ .text = try gpa.dupe(u8, "ok") } };
-    try agent.context_manager.appendUnpersisted(.{ .tool = .{ .call_id = try gpa.dupe(u8, "call_a"), .content = result } });
+    try agent.context_manager.appendUnpersisted(.{ .tool = .{ .call_id = .{ .value = try gpa.dupe(u8, "call_a") }, .content = result } });
 
     try agent.reconcileInterruptedToolCalls();
 
@@ -1129,7 +1129,7 @@ test "interrupted tool calls get synthetic cancelled results" {
     try std.testing.expectEqual(@as(usize, 3), items.len);
     const synthetic = items[2];
     try std.testing.expect(synthetic == .tool);
-    try std.testing.expectEqualStrings("call_b", synthetic.tool.call_id);
+    try std.testing.expectEqualStrings("call_b", synthetic.tool.call_id.slice());
     try std.testing.expect(synthetic.tool.failed);
 
     // Idempotent: every call now has a result, so a second pass adds nothing.

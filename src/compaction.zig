@@ -445,5 +445,5 @@ fn toolMessage(gpa: std.mem.Allocator, text: []const u8) !ai.ChatMessage {
     const blocks = try gpa.alloc(ai.ContentBlock, 1);
     errdefer gpa.free(blocks);
     blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, text) } };
-    return .{ .tool = .{ .call_id = try gpa.dupe(u8, "c1"), .content = blocks } };
+    return .{ .tool = .{ .call_id = .{ .value = try gpa.dupe(u8, "c1") }, .content = blocks } };
 }
