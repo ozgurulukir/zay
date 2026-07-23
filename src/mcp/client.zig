@@ -274,19 +274,22 @@ pub const McpClient = struct {
     }
 
     /// Call a tool via `tools/call` JSON-RPC.
-    /// Returns the text content of the first content block (owned, caller must free).
-    /// Returns an empty string when the tool returned no text content.
+    /// Returns the text content from the tool response (owned, caller must free).
+    /// When the server reports `isError: true`, the error text is returned
+    /// (not a Zig error) so the model can read the server's error message.
     pub fn callTool(self: *McpClient, io: std.Io, tool_name: []const u8, arguments_json: []const u8) ![]u8 {
-        // Build params JSON: {"name":"tool_name","arguments":{...}}
-        var params: std.ArrayList(u8) = .empty;
-        defer params.deinit(self.gpa);
-        try params.appendSlice(self.gpa, "{\"name\":\"");
-        try params.appendSlice(self.gpa, tool_name);
-        try params.appendSlice(self.gpa, "\",\"arguments\":");
-        try params.appendSlice(self.gpa, arguments_json);
-        try params.append(self.gpa, '}');
+        // Build params JSON with proper escaping for tool_name
+        var pw: std.Io.Writer.Allocating = .init(self.gpa);
+        defer pw.deinit();
+        try pw.writer.writeAll("{\"name\":");
+        try std.json.Stringify.value(tool_name, .{}, &pw.writer);
+        try pw.writer.writeAll(",\"arguments\":");
+        try pw.writer.writeAll(arguments_json);
+        try pw.writer.writeAll("}");
+        const params = try pw.toOwnedSlice();
+        defer self.gpa.free(params);
 
-        const response = try self.sendRequest(io, "tools/call", params.items);
+        const response = try self.sendRequest(io, "tools/call", params);
         defer self.gpa.free(response);
 
         const parsed = try parseResponse(self.gpa, response) orelse return error.McpToolCallFailed;
@@ -295,33 +298,15 @@ pub const McpClient = struct {
         const result = parsed.value.object.get("result") orelse return error.McpToolCallFailed;
         if (result != .object) return error.McpToolCallFailed;
 
-        // Check for isError
+        // Log server-side errors but still return the text content so the
+        // model can read the server's error description (per MCP spec).
         if (result.object.get("isError")) |is_err| {
             if (is_err == .bool and is_err.bool) {
-                return error.McpToolCallFailed;
+                std.log.warn("MCP tool '{s}' returned isError: true", .{tool_name});
             }
         }
 
-        // Extract text content from content array
-        const content_val = result.object.get("content") orelse return "";
-        if (content_val != .array) return "";
-
-        var text_parts: std.ArrayList(u8) = .empty;
-        defer text_parts.deinit(self.gpa);
-
-        for (content_val.array.items) |item| {
-            if (item != .object) continue;
-            const item_type = item.object.get("type") orelse continue;
-            if (item_type != .string) continue;
-            if (!std.mem.eql(u8, item_type.string, "text")) continue;
-            const text_val = item.object.get("text") orelse continue;
-            if (text_val != .string) continue;
-            if (text_parts.items.len > 0) try text_parts.append(self.gpa, '\n');
-            try text_parts.appendSlice(self.gpa, text_val.string);
-        }
-
-        if (text_parts.items.len == 0) return self.gpa.dupe(u8, "");
-        return text_parts.toOwnedSlice(self.gpa);
+        return extractContentText(self.gpa, result);
     }
 
     /// Register a mock or discovered tool for testing / dynamic loading.
@@ -343,6 +328,49 @@ pub const McpClient = struct {
         });
     }
 };
+
+/// Extract text content from a tools/call result.
+/// Non-text content types (image, resource) produce descriptive placeholders
+/// so the model is aware they exist even though it can't consume binary data.
+fn extractContentText(gpa: std.mem.Allocator, result: std.json.Value) ![]u8 {
+    const content_val = result.object.get("content") orelse return gpa.dupe(u8, "");
+    if (content_val != .array) return gpa.dupe(u8, "");
+
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(gpa);
+
+    for (content_val.array.items) |item| {
+        if (item != .object) continue;
+        const item_type = item.object.get("type") orelse continue;
+        if (item_type != .string) continue;
+
+        if (text.items.len > 0) try text.append(gpa, '\n');
+
+        if (std.mem.eql(u8, item_type.string, "text")) {
+            const text_val = item.object.get("text") orelse continue;
+            if (text_val != .string) continue;
+            try text.appendSlice(gpa, text_val.string);
+        } else if (std.mem.eql(u8, item_type.string, "image")) {
+            const mime = if (item.object.get("mimeType")) |m|
+                (if (m == .string) m.string else "unknown")
+            else
+                "unknown";
+            var buf: [128]u8 = undefined;
+            const label = try std.fmt.bufPrint(&buf, "[Image content ({s})]", .{mime});
+            try text.appendSlice(gpa, label);
+        } else {
+            var buf: [128]u8 = undefined;
+            const label = std.fmt.bufPrint(&buf, "[Content type: {s}]", .{item_type.string}) catch "[Unknown content]";
+            try text.appendSlice(gpa, label);
+        }
+    }
+
+    if (text.items.len == 0) {
+        text.deinit(gpa);
+        return gpa.dupe(u8, "");
+    }
+    return text.toOwnedSlice(gpa);
+}
 
 /// Convert a JSON Schema object to a tools_common.Schema.
 /// Handles the standard JSON Schema `properties` object and `required` array.
