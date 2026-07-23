@@ -17,7 +17,7 @@ pub const tool: common.Tool = .{
             .name = "reason",
             .kind = .string,
             .description = "Human-readable single-sentence explanation of what this command does.",
-            .required = true,
+            .required = false,
         }, .{
             .name = "cwd",
             .kind = .string,
@@ -189,8 +189,7 @@ fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args {
     const command = parsed.value.command orelse return error.MissingCommand;
     if (command.len == 0) return error.MissingCommand;
 
-    const reason = parsed.value.reason orelse return error.MissingReason;
-    if (reason.len == 0) return error.MissingReason;
+    const reason = if (parsed.value.reason) |r| (if (r.len > 0) r else "Executing command.") else "Executing command.";
 
     if (parsed.value.cwd) |cwd| {
         if (cwd.len == 0) return error.BadCwd;

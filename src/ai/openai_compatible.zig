@@ -262,6 +262,9 @@ fn writeToolDefinition(
         try std.json.Stringify.value(kind_str, .{}, writer);
         try writer.writeAll(",\"description\":");
         try std.json.Stringify.value(prop.description, .{}, writer);
+        if (prop.kind == .object) {
+            try writer.writeAll(",\"additionalProperties\":true");
+        }
         try writer.writeByte('}');
     }
     try writer.writeAll("},\"required\":[");
@@ -278,6 +281,9 @@ fn writeToolDefinition(
 fn writeMessage(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMessage) !void {
     try out.writeAll("{\"role\":");
     try std.json.Stringify.value(message.role.label(), .{}, out);
+    if (message.cache_control or message.role == .system) {
+        try out.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}");
+    }
     try out.writeAll(",\"content\":");
     if (message.role == .user) {
         try writeUserContent(out, message.content);
@@ -857,7 +863,7 @@ test "buildToolsJson produces a valid JSON array for the registry" {
     defer parsed.deinit();
     try std.testing.expect(parsed.value == .array);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"bash\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"command\",\"reason\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"command\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "Shell command to run.") != null);
 }
 
