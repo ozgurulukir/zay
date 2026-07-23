@@ -218,31 +218,50 @@ pub const ModelSelection = struct {
 
 pub const McpServerConfig = struct {
     name: []u8,
-    command: ?[]u8 = null,
-    args: [][]u8 = &.{},
-    url: ?[]u8 = null,
     enabled: bool = true,
+    /// How the server is reached. Variants make illegal combinations
+    /// unrepresentable: a stdio server must have command+args, an sse
+    /// server must have a url.
+    transport: union(enum) {
+        stdio: struct {
+            command: []u8,
+            args: [][]u8 = &.{},
+        },
+        sse: struct {
+            url: []u8,
+        },
+    },
 
     pub fn deinit(self: *McpServerConfig, gpa: std.mem.Allocator) void {
         gpa.free(self.name);
-        if (self.command) |c| gpa.free(c);
-        for (self.args) |arg| gpa.free(arg);
-        if (self.args.len > 0) gpa.free(self.args);
-        if (self.url) |u| gpa.free(u);
+        switch (self.transport) {
+            .stdio => |t| {
+                gpa.free(t.command);
+                for (t.args) |arg| gpa.free(arg);
+                if (t.args.len > 0) gpa.free(t.args);
+            },
+            .sse => |t| gpa.free(t.url),
+        }
         self.* = undefined;
     }
 
     pub fn clone(self: McpServerConfig, gpa: std.mem.Allocator) !McpServerConfig {
-        var out: McpServerConfig = .{
+        return .{
             .name = try gpa.dupe(u8, self.name),
             .enabled = self.enabled,
+            .transport = switch (self.transport) {
+                .stdio => |t| blk: {
+                    var args = try gpa.alloc([]u8, t.args.len);
+                    errdefer gpa.free(args);
+                    for (t.args, 0..) |arg, i| args[i] = try gpa.dupe(u8, arg);
+                    break :blk .{ .stdio = .{
+                        .command = try gpa.dupe(u8, t.command),
+                        .args = args,
+                    } };
+                },
+                .sse => |t| .{ .sse = .{ .url = try gpa.dupe(u8, t.url) } },
+            },
         };
-        errdefer out.deinit(gpa);
-        if (self.command) |c| out.command = try gpa.dupe(u8, c);
-        if (self.url) |u| out.url = try gpa.dupe(u8, u);
-        out.args = try gpa.alloc([]u8, self.args.len);
-        for (self.args, 0..) |arg, i| out.args[i] = try gpa.dupe(u8, arg);
-        return out;
     }
 };
 
@@ -455,15 +474,19 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
 fn applyMcpServerOverlay(gpa: std.mem.Allocator, target: *Config, updates: McpServerConfig) !void {
     for (target.mcp_servers, 0..) |*server, index| {
         if (!std.mem.eql(u8, server.name, updates.name)) continue;
-        if (updates.command) |cmd| try replaceOptionalSlice(gpa, &server.command, cmd);
-        if (updates.url) |u| try replaceOptionalSlice(gpa, &server.url, u);
         server.enabled = updates.enabled;
-        if (updates.args.len > 0) {
-            for (server.args) |arg| gpa.free(arg);
-            if (server.args.len > 0) gpa.free(server.args);
-            server.args = try gpa.alloc([]u8, updates.args.len);
-            for (updates.args, 0..) |arg, i| server.args[i] = try gpa.dupe(u8, arg);
-        }
+        server.transport = switch (updates.transport) {
+            .stdio => |t| blk: {
+                var args = try gpa.alloc([]u8, t.args.len);
+                errdefer gpa.free(args);
+                for (t.args, 0..) |arg, i| args[i] = try gpa.dupe(u8, arg);
+                break :blk .{ .stdio = .{
+                    .command = try gpa.dupe(u8, t.command),
+                    .args = args,
+                } };
+            },
+            .sse => |t| .{ .sse = .{ .url = try gpa.dupe(u8, t.url) } },
+        };
         target.mcp_servers[index] = server.*;
         return;
     }
@@ -678,29 +701,38 @@ fn parseMcpServers(gpa: std.mem.Allocator, value: std.json.Value) ![]McpServerCo
     while (iterator.next()) |entry| {
         if (entry.value_ptr.* != .object) continue;
         const val = entry.value_ptr.*;
-        var server: McpServerConfig = .{
-            .name = try gpa.dupe(u8, entry.key_ptr.*),
-            .enabled = boolField(val, "enabled") orelse true,
-        };
+        var server: McpServerConfig = undefined;
+        server.name = try gpa.dupe(u8, entry.key_ptr.*);
+        server.enabled = boolField(val, "enabled") orelse true;
         errdefer server.deinit(gpa);
 
-        if (stringField(val, "command")) |cmd| server.command = try gpa.dupe(u8, cmd);
-        if (stringField(val, "url")) |u| server.url = try gpa.dupe(u8, u);
-
-        if (val.object.get("args")) |args_val| {
-            if (args_val == .array) {
-                var args_list: std.ArrayList([]u8) = .empty;
-                errdefer {
-                    for (args_list.items) |arg| gpa.free(arg);
-                    args_list.deinit(gpa);
-                }
-                for (args_val.array.items) |arg_item| {
-                    if (arg_item == .string) {
-                        try args_list.append(gpa, try gpa.dupe(u8, arg_item.string));
+        const cmd = stringField(val, "command");
+        const url = stringField(val, "url");
+        if (cmd) |c| {
+            var args: [][]u8 = &.{};
+            if (val.object.get("args")) |args_val| {
+                if (args_val == .array) {
+                    var args_list: std.ArrayList([]u8) = .empty;
+                    errdefer {
+                        for (args_list.items) |arg| gpa.free(arg);
+                        args_list.deinit(gpa);
                     }
+                    for (args_val.array.items) |arg_item| {
+                        if (arg_item == .string) {
+                            try args_list.append(gpa, try gpa.dupe(u8, arg_item.string));
+                        }
+                    }
+                    args = try args_list.toOwnedSlice(gpa);
                 }
-                server.args = try args_list.toOwnedSlice(gpa);
             }
+            server.transport = .{ .stdio = .{
+                .command = try gpa.dupe(u8, c),
+                .args = args,
+            } };
+        } else if (url) |u| {
+            server.transport = .{ .sse = .{ .url = try gpa.dupe(u8, u) } };
+        } else {
+            return error.InvalidMcpServerConfig;
         }
         try servers.append(gpa, server);
     }
@@ -1044,22 +1076,24 @@ fn writeMcpServers(writer: *std.Io.Writer, servers: []const McpServerConfig) !vo
 fn writeMcpServer(writer: *std.Io.Writer, server: McpServerConfig) !void {
     try writer.writeByte('{');
     var wrote_any = false;
-    if (server.command) |cmd| {
-        try writeKeyNoIndent(writer, "command", &wrote_any);
-        try std.json.Stringify.value(cmd, .{}, writer);
-    }
-    if (server.url) |u| {
-        try writeKeyNoIndent(writer, "url", &wrote_any);
-        try std.json.Stringify.value(u, .{}, writer);
-    }
-    if (server.args.len > 0) {
-        try writeKeyNoIndent(writer, "args", &wrote_any);
-        try writer.writeByte('[');
-        for (server.args, 0..) |arg, i| {
-            if (i > 0) try writer.writeByte(',');
-            try std.json.Stringify.value(arg, .{}, writer);
-        }
-        try writer.writeByte(']');
+    switch (server.transport) {
+        .stdio => |t| {
+            try writeKeyNoIndent(writer, "command", &wrote_any);
+            try std.json.Stringify.value(t.command, .{}, writer);
+            if (t.args.len > 0) {
+                try writeKeyNoIndent(writer, "args", &wrote_any);
+                try writer.writeByte('[');
+                for (t.args, 0..) |arg, i| {
+                    if (i > 0) try writer.writeByte(',');
+                    try std.json.Stringify.value(arg, .{}, writer);
+                }
+                try writer.writeByte(']');
+            }
+        },
+        .sse => |t| {
+            try writeKeyNoIndent(writer, "url", &wrote_any);
+            try std.json.Stringify.value(t.url, .{}, writer);
+        },
     }
     if (!server.enabled) {
         try writeKeyNoIndent(writer, "enabled", &wrote_any);
@@ -1515,9 +1549,14 @@ test "parseFile parses mcp_servers objects" {
 
     try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers.len);
     try std.testing.expectEqualStrings("memory", cfg.mcp_servers[0].name);
-    try std.testing.expectEqualStrings("npx", cfg.mcp_servers[0].command.?);
-    try std.testing.expectEqual(@as(usize, 2), cfg.mcp_servers[0].args.len);
-    try std.testing.expectEqualStrings("-y", cfg.mcp_servers[0].args[0]);
+    switch (cfg.mcp_servers[0].transport) {
+        .stdio => |t| {
+            try std.testing.expectEqualStrings("npx", t.command);
+            try std.testing.expectEqual(@as(usize, 2), t.args.len);
+            try std.testing.expectEqualStrings("-y", t.args[0]);
+        },
+        .sse => return error.Unexpected,
+    }
     try std.testing.expectEqual(true, cfg.mcp_servers[0].enabled);
 }
 
@@ -1531,8 +1570,13 @@ test "parseFile parses mcpServers (Claude Desktop format)" {
 
     try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers.len);
     try std.testing.expectEqualStrings("codebase-memory-mcp", cfg.mcp_servers[0].name);
-    try std.testing.expectEqualStrings("/path/to/codebase-memory-mcp", cfg.mcp_servers[0].command.?);
-    try std.testing.expectEqual(@as(usize, 0), cfg.mcp_servers[0].args.len);
+    switch (cfg.mcp_servers[0].transport) {
+        .stdio => |t| {
+            try std.testing.expectEqualStrings("/path/to/codebase-memory-mcp", t.command);
+            try std.testing.expectEqual(@as(usize, 0), t.args.len);
+        },
+        .sse => return error.Unexpected,
+    }
 }
 
 test "parseFile parses mcp (short key format)" {
@@ -1545,7 +1589,10 @@ test "parseFile parses mcp (short key format)" {
 
     try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers.len);
     try std.testing.expectEqualStrings("test-server", cfg.mcp_servers[0].name);
-    try std.testing.expectEqualStrings("node", cfg.mcp_servers[0].command.?);
+    switch (cfg.mcp_servers[0].transport) {
+        .stdio => |t| try std.testing.expectEqualStrings("node", t.command),
+        .sse => return error.Unexpected,
+    }
 }
 
 test "mergeLayers merges mcp_servers across config layers" {

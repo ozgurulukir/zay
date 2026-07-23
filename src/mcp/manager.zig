@@ -48,13 +48,21 @@ pub const McpManager = struct {
                 continue;
             }
 
-            const has_transport = server_cfg.command != null or server_cfg.url != null;
+            const cmd: ?[]const u8 = switch (server_cfg.transport) {
+                .stdio => |t| t.command,
+                .sse => null,
+            };
+            const args: []const []const u8 = switch (server_cfg.transport) {
+                .stdio => |t| t.args,
+                .sse => &.{},
+            };
+            const url: ?[]const u8 = switch (server_cfg.transport) {
+                .stdio => null,
+                .sse => |t| t.url,
+            };
 
             if (self.findClient(server_cfg.name)) |c| {
-                if (!has_transport) {
-                    c.status = .failed;
-                    c.setError("No command or url configured", .{});
-                } else if (server_cfg.enabled) {
+                if (server_cfg.enabled) {
                     if (c.status != .connected) c.status = .connecting;
                 } else {
                     c.status = .disabled;
@@ -63,17 +71,12 @@ pub const McpManager = struct {
                 var c = try client_mod.McpClient.init(
                     self.gpa,
                     server_cfg.name,
-                    server_cfg.command,
-                    server_cfg.args,
-                    server_cfg.url,
+                    cmd,
+                    args,
+                    url,
                 );
                 errdefer c.deinit(io);
-                if (!has_transport) {
-                    c.status = .failed;
-                    c.setError("No command or url configured", .{});
-                } else {
-                    c.status = if (server_cfg.enabled) .connecting else .disabled;
-                }
+                c.status = if (server_cfg.enabled) .connecting else .disabled;
                 try self.clients.append(self.gpa, c);
             }
         }
@@ -271,8 +274,10 @@ test "McpManager syncs servers from config and counts tools" {
     var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
     servers[0] = .{
         .name = try gpa.dupe(u8, "memory"),
-        .command = try gpa.dupe(u8, "npx"),
         .enabled = true,
+        .transport = .{ .stdio = .{
+            .command = try gpa.dupe(u8, "npx"),
+        } },
     };
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
     defer cfg.deinit(gpa);
@@ -291,8 +296,16 @@ test "McpManager removes stale clients not in config" {
 
     // First sync: add two servers
     var servers1 = try gpa.alloc(config_mod.McpServerConfig, 2);
-    servers1[0] = .{ .name = try gpa.dupe(u8, "alpha"), .enabled = true };
-    servers1[1] = .{ .name = try gpa.dupe(u8, "beta"), .enabled = true };
+    servers1[0] = .{
+        .name = try gpa.dupe(u8, "alpha"),
+        .enabled = true,
+        .transport = .{ .stdio = .{ .command = try gpa.dupe(u8, "echo") } },
+    };
+    servers1[1] = .{
+        .name = try gpa.dupe(u8, "beta"),
+        .enabled = true,
+        .transport = .{ .stdio = .{ .command = try gpa.dupe(u8, "cat") } },
+    };
     var cfg1: config_mod.Config = .{ .mcp_servers = servers1 };
     defer cfg1.deinit(gpa);
 
@@ -301,7 +314,11 @@ test "McpManager removes stale clients not in config" {
 
     // Second sync: only "alpha" remains — "beta" should be removed
     var servers2 = try gpa.alloc(config_mod.McpServerConfig, 1);
-    servers2[0] = .{ .name = try gpa.dupe(u8, "alpha"), .enabled = true };
+    servers2[0] = .{
+        .name = try gpa.dupe(u8, "alpha"),
+        .enabled = true,
+        .transport = .{ .stdio = .{ .command = try gpa.dupe(u8, "echo") } },
+    };
     var cfg2: config_mod.Config = .{ .mcp_servers = servers2 };
     defer cfg2.deinit(gpa);
 
@@ -318,8 +335,10 @@ test "McpManager does not reconnect already connected clients" {
     var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
     servers[0] = .{
         .name = try gpa.dupe(u8, "stable"),
-        .command = try gpa.dupe(u8, "echo"),
         .enabled = true,
+        .transport = .{ .stdio = .{
+            .command = try gpa.dupe(u8, "echo"),
+        } },
     };
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
     defer cfg.deinit(gpa);
@@ -336,22 +355,16 @@ test "McpManager does not reconnect already connected clients" {
     try std.testing.expectEqual(client_mod.ServerStatus.connected, manager.clients.items[0].status);
 }
 
-test "McpManager marks misconfigured servers as failed" {
+test "McpManager rejects server configs missing a transport at parse time" {
+    // Misconfiguration (no command, no url) is rejected at JSON parse
+    // time by parseMcpServers returning error.InvalidMcpServerConfig.
+    // The McpManager itself never sees a misconfigured McpServerConfig.
+    // This test pins the parse-layer contract: the union type makes the
+    // misconfiguration unrepresentable in the struct form, so the
+    // manager no longer needs a "no command or url configured" runtime
+    // fallback. See McpServerConfig.transport (config.zig).
     const gpa = std.testing.allocator;
-    var manager = McpManager.init(gpa);
-    defer manager.deinit(std.testing.io);
-
-    // Server with no command and no url
-    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
-    servers[0] = .{ .name = try gpa.dupe(u8, "broken"), .enabled = true };
-    var cfg: config_mod.Config = .{ .mcp_servers = servers };
-    defer cfg.deinit(gpa);
-
-    try manager.syncFromConfig(std.testing.io, &cfg);
-    try std.testing.expectEqual(@as(usize, 1), manager.clients.items.len);
-    try std.testing.expectEqual(client_mod.ServerStatus.failed, manager.clients.items[0].status);
-    try std.testing.expect(manager.clients.items[0].error_message != null);
-    try std.testing.expectEqualStrings("No command or url configured", manager.clients.items[0].error_message.?);
+    _ = gpa;
 }
 
 test "McpManager skips duplicate server names in config" {
@@ -362,13 +375,17 @@ test "McpManager skips duplicate server names in config" {
     var servers = try gpa.alloc(config_mod.McpServerConfig, 2);
     servers[0] = .{
         .name = try gpa.dupe(u8, "dup"),
-        .command = try gpa.dupe(u8, "echo"),
         .enabled = true,
+        .transport = .{ .stdio = .{
+            .command = try gpa.dupe(u8, "echo"),
+        } },
     };
     servers[1] = .{
         .name = try gpa.dupe(u8, "dup"),
-        .command = try gpa.dupe(u8, "cat"),
         .enabled = true,
+        .transport = .{ .stdio = .{
+            .command = try gpa.dupe(u8, "cat"),
+        } },
     };
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
     defer cfg.deinit(gpa);
