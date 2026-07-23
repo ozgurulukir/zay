@@ -25,16 +25,83 @@ const vxfw = vaxis.vxfw;
 
 const MentionSearchKind = tui.MentionSearchKind;
 
-/// State for the @-mention search popup. Owns the active flag, the
-/// indexing flag (a background scan is in flight), the result list, the
-/// selected index, the kind (file vs skill), and the cached query.
-pub const AtSearchState = struct {
-    active: bool = false,
-    indexing: bool = false,
-    selection: u32 = 0,
-    results: std.ArrayList([]const u8) = .empty,
-    kind: MentionSearchKind = .file,
-    query: []const u8 = "",
+/// State for the @-mention search popup. The logical state is a 3-arm
+/// union: closed (no popup), indexing (a background scan is in flight),
+/// open (a query is active with a result list). The previous flat
+/// struct (active/indexing flags + always-on results/kind/query/
+/// selection) allowed illegal combinations like `active = false` with
+/// non-empty `results`, or `indexing = true` with no query set. The
+/// new shape makes those unrepresentable.
+///
+/// `closed` is a tag-only variant. `indexing` carries kind + results
+/// (the scan populates results as it finds matches). `open` carries
+/// kind + query + results + selection. Callers switch on the variant
+/// to access the payload; there's no flat-field fallback.
+pub const AtSearchState = union(enum) {
+    closed,
+    indexing: IndexingPayload,
+    open: OpenPayload,
+
+    pub const IndexingPayload = struct {
+        kind: MentionSearchKind,
+        results: std.ArrayList([]const u8) = .empty,
+    };
+
+    pub const OpenPayload = struct {
+        kind: MentionSearchKind,
+        query: []const u8 = "",
+        results: std.ArrayList([]const u8) = .empty,
+        selection: u32 = 0,
+    };
+
+    /// Convenience: the kind of mention being searched, regardless of
+    /// which variant is active. Returns `.file` for `closed` (the
+    /// default the UI uses when no popup is open).
+    pub fn kind(self: AtSearchState) MentionSearchKind {
+        return switch (self) {
+            .closed => .file,
+            .indexing => |i| i.kind,
+            .open => |o| o.kind,
+        };
+    }
+
+    /// Convenience: the active result list, or an empty slice when
+    /// closed. Returned slice is owned by the state.
+    pub fn results(self: *const AtSearchState) []const []const u8 {
+        return switch (self.*) {
+            .closed => &.{},
+            .indexing => |*i| i.results.items,
+            .open => |*o| o.results.items,
+        };
+    }
+
+    /// Convenience: the mutable result list pointer, or null when
+    /// closed. Used by at_search.zig to populate the list.
+    pub fn resultsPtr(self: *AtSearchState) ?*std.ArrayList([]const u8) {
+        return switch (self.*) {
+            .closed => null,
+            .indexing => |*i| &i.results,
+            .open => |*o| &o.results,
+        };
+    }
+
+    /// Free every owned buffer in whichever payload is active and
+    /// transition to `closed`. Safe to call multiple times.
+    pub fn close(self: *AtSearchState, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .closed => {},
+            .indexing => |*i| {
+                for (i.results.items) |path| gpa.free(path);
+                i.results.deinit(gpa);
+            },
+            .open => |*o| {
+                if (o.query.len > 0) gpa.free(o.query);
+                for (o.results.items) |path| gpa.free(path);
+                o.results.deinit(gpa);
+            },
+        }
+        self.* = .closed;
+    }
 };
 
 /// The three text-input widgets: the main prompt, the slash-palette

@@ -61,7 +61,7 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
     const overlay_visible = app.mode != .normal;
     const permission_visible = app.permissionPending() and !overlay_visible;
     const background_visible = app.background_modal_state.modal and !overlay_visible and !permission_visible;
-    const at_visible = app.at_search.active and !overlay_visible and !permission_visible and !background_visible;
+    const at_visible = (app.at_search != .closed) and !overlay_visible and !permission_visible and !background_visible;
 
     var child_count: usize = (if (split) app.threads.items.len else 1) + 1;
     if (loading_visible) child_count += 1;
@@ -159,12 +159,12 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         idx += 1;
     }
     if (at_visible) {
-        if (app.at_search.indexing) {
+        if (app.at_search == .indexing) {
             const at_search_mod = @import("at_search.zig");
             at_search_mod.updateAtSearch(app) catch {};
         }
         var at_view: tui.AtSearchWidget = .{ .app = app };
-        const panel_height = at_search.panelHeight(app.at_search.results.items.len);
+        const panel_height = at_search.panelHeight(app.at_search.results().len);
         const panel_width = @min(@as(u16, 72), max_width);
         children[idx] = .{
             .origin = .{ .row = layout.input_row -| panel_height, .col = 0 },

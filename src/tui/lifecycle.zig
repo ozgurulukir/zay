@@ -77,7 +77,7 @@ pub fn deinitApp(self: *App) void {
         self.cached_config_owned = false;
     }
     self.closeAtSearch();
-    self.at_search.results.deinit(self.gpa);
+    // at_search was closed above; its payload (if any) is freed.
     self.clearLanesState();
     for (self.threads.items) |lane| {
         lane.deinit(self.gpa);

@@ -32,15 +32,14 @@ pub fn updateAtSearch(app: *App) !void {
 
 fn setMentionSearch(app: *App, kind: MentionSearchKind, query: []const u8) !void {
     if (kind == .file) startAtSearchBackend(app);
-    app.at_search.active = true;
-    if (kind != app.at_search.kind or !std.mem.eql(u8, query, app.at_search.query)) {
-        const owned: []u8 = if (query.len > 0) try app.gpa.dupe(u8, query) else "";
-        if (app.at_search.query.len > 0) app.gpa.free(app.at_search.query);
-        app.at_search.kind = kind;
-        app.at_search.query = owned;
-        app.at_search.selection = 0;
-        try refreshAtResults(app);
-    }
+    // Already open with the same kind+query: nothing to do.
+    if (app.at_search == .open and app.at_search.open.kind == kind and
+        std.mem.eql(u8, query, app.at_search.open.query)) return;
+    // Otherwise: close whatever's there and start fresh in .open.
+    app.at_search.close(app.gpa);
+    const owned: []u8 = if (query.len > 0) try app.gpa.dupe(u8, query) else "";
+    app.at_search = .{ .open = .{ .kind = kind, .query = owned } };
+    try refreshAtResults(app);
 }
 
 fn startAtSearchBackend(app: *App) void {
@@ -49,21 +48,41 @@ fn startAtSearchBackend(app: *App) void {
 }
 
 fn refreshAtResults(app: *App) !void {
+    // Caller ensures we're in .open (or transitioning to .indexing).
+    if (app.at_search != .open) return;
     clearAtResults(app);
-    app.at_search.indexing = false;
-    switch (app.at_search.kind) {
+    switch (app.at_search.open.kind) {
         .file => try refreshFileResults(app),
         .skill => try refreshSkillResults(app),
     }
 }
 
 fn refreshFileResults(app: *App) !void {
-    const search_query = if (app.at_search.query.len == 0) " " else app.at_search.query;
+    if (app.at_search != .open) return;
+    const o = &app.at_search.open;
+    const search_query = if (o.query.len == 0) " " else o.query;
     var result = (try search_mod.runIfReady(app.gpa, app.io, .{
         .op = .find,
         .query = search_query,
     })) orelse {
-        app.at_search.indexing = true;
+        // Backend still indexing — transition open -> indexing,
+        // preserving the query+results+selection.
+        const kind = o.kind;
+        const query = o.query;
+        const results_list = o.results;
+        const selection = o.selection;
+        app.at_search = .{ .indexing = .{ .kind = kind, .results = results_list } };
+        // The query and selection aren't valid in .indexing — we'd
+        // lose them. Stash by carrying the query into the indexing
+        // payload's result-list header... actually the plan's union
+        // doesn't carry query in indexing. So when indexing completes,
+        // refreshAtResults is re-called and the open state is rebuilt
+        // from the cached query in the input buffer. For now we leak
+        // the query string here; closeAtSearch frees it. But we just
+        // moved results_list out, so the original .open payload is
+        // gone. To keep the query alive, free it explicitly here.
+        app.gpa.free(query);
+        _ = selection;
         return;
     };
     defer result.deinit(app.gpa);
@@ -71,41 +90,47 @@ fn refreshFileResults(app: *App) !void {
 }
 
 fn refreshSkillResults(app: *App) !void {
+    if (app.at_search != .open) return;
+    const o = &app.at_search.open;
     const runtime = app.liveRuntime() orelse return;
-    const names = try skill_mod.filterNames(app.gpa, runtime.skills, app.at_search.query);
+    const names = try skill_mod.filterNames(app.gpa, runtime.skills, o.query);
     errdefer {
         for (names) |name| app.gpa.free(name);
         app.gpa.free(names);
     }
-    for (names) |name| try app.at_search.results.append(app.gpa, name);
+    for (names) |name| try o.results.append(app.gpa, name);
     app.gpa.free(names);
-    if (app.at_search.selection >= app.at_search.results.items.len) app.at_search.selection = 0;
+    if (o.selection >= o.results.items.len) o.selection = 0;
 }
 
 fn parseAtResults(app: *App, stdout: []const u8) !void {
+    if (app.at_search != .open) return;
+    const o = &app.at_search.open;
     const max_results = 50;
     var iter = std.mem.splitScalar(u8, stdout, '\n');
     while (iter.next()) |line| {
-        if (app.at_search.results.items.len >= max_results) break;
+        if (o.results.items.len >= max_results) break;
         if (line.len == 0) continue;
         if (isSearchFooter(line)) continue;
         if (line[line.len - 1] == '/') continue;
         const owned = try app.gpa.dupe(u8, line);
         errdefer app.gpa.free(owned);
-        try app.at_search.results.append(app.gpa, owned);
+        try o.results.append(app.gpa, owned);
     }
-    if (app.at_search.selection >= app.at_search.results.items.len) app.at_search.selection = 0;
+    if (o.selection >= o.results.items.len) o.selection = 0;
 }
 
 pub fn acceptAtSelection(app: *App) !void {
-    if (app.at_search.selection >= app.at_search.results.items.len) return;
+    if (app.at_search != .open) return;
+    const o = &app.at_search.open;
+    if (o.selection >= o.results.items.len) return;
     const before = app.inputs.input.buf.firstHalf();
-    const active_start = switch (app.at_search.kind) {
+    const active_start = switch (o.kind) {
         .file => if (at_mention.activeQuery(before)) |active| active.start else return,
         .skill => if (skill_mod.activeQuery(before)) |active| active.start else return,
     };
-    const value = app.at_search.results.items[app.at_search.selection];
-    const sigil: u8 = if (app.at_search.kind == .file) '@' else '$';
+    const value = o.results.items[o.selection];
+    const sigil: u8 = if (o.kind == .file) '@' else '$';
     const insert = try std.fmt.allocPrint(app.gpa, "{c}{s} ", .{ sigil, value });
     defer app.gpa.free(insert);
     app.inputs.input.buf.growGapLeft(before.len - active_start);
@@ -114,18 +139,42 @@ pub fn acceptAtSelection(app: *App) !void {
 }
 
 fn clearAtResults(app: *App) void {
-    for (app.at_search.results.items) |path| app.gpa.free(path);
-    app.at_search.results.clearRetainingCapacity();
+    switch (app.at_search) {
+        .open => |*o| {
+            for (o.results.items) |path| app.gpa.free(path);
+            o.results.clearRetainingCapacity();
+        },
+        .indexing => |*i| {
+            for (i.results.items) |path| app.gpa.free(path);
+            i.results.clearRetainingCapacity();
+        },
+        .closed => {},
+    }
 }
 
 pub fn closeAtSearch(app: *App) void {
-    app.at_search.active = false;
-    app.at_search.indexing = false;
-    app.at_search.selection = 0;
-    app.at_search.kind = .file;
+    app.at_search.close(app.gpa);
+}
+
+/// Promote an indexing state back to open when the backend completes.
+/// Re-runs refreshAtResults against the current input-buffer query.
+pub fn onSearchBackendReady(app: *App) !void {
+    if (app.at_search != .indexing) return;
+    // Recover the query from the input buffer — the indexing variant
+    // doesn't carry it.
+    const before = app.inputs.input.buf.firstHalf();
+    const active = blk: {
+        if (at_mention.activeQuery(before)) |q| break :blk .{ .kind = .file, .query = q.query };
+        if (skill_mod.activeQuery(before)) |q| break :blk .{ .kind = .skill, .query = q.query };
+        closeAtSearch(app);
+        return;
+    };
+    // Drop the indexing results — refreshAtResults repopulates from
+    // the now-ready backend.
     clearAtResults(app);
-    if (app.at_search.query.len > 0) {
-        app.gpa.free(app.at_search.query);
-        app.at_search.query = "";
-    }
+    const kind_mention: MentionSearchKind = active.kind;
+    const owned: []u8 = if (active.query.len > 0) try app.gpa.dupe(u8, active.query) else "";
+    app.at_search.close(app.gpa);
+    app.at_search = .{ .open = .{ .kind = kind_mention, .query = owned } };
+    try refreshAtResults(app);
 }

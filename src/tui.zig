@@ -218,7 +218,7 @@ pub const App = struct {
     merge_source_index: usize = 0,
     merge_dest_indices: []usize = &.{},
     input_wrap_width: u16 = 0,
-    at_search: app_state.AtSearchState = .{},
+    at_search: app_state.AtSearchState = .closed,
     /// Shared manager for `run_in_background` bash commands. Heap-allocated (so
     /// its address is stable for the agents that borrow it) and owned here; null
     /// on the headless/test path. See `background.zig`.
@@ -429,23 +429,26 @@ pub const App = struct {
     }
 
     pub fn isAtSearchActive(self: *const App) bool {
-        return self.at_search.active;
+        return self.at_search != .closed;
     }
 
     pub fn atSearchHasResults(self: *const App) bool {
-        return self.at_search.results.items.len > 0;
+        return self.at_search.results().len > 0;
     }
 
     pub fn getAtSelection(self: *const App) u32 {
-        return self.at_search.selection;
+        return switch (self.at_search) {
+            .open => |o| o.selection,
+            else => 0,
+        };
     }
 
     pub fn setAtSelection(self: *App, v: u32) void {
-        self.at_search.selection = v;
+        if (self.at_search == .open) self.at_search.open.selection = v;
     }
 
     pub fn atResultsLen(self: *const App) usize {
-        return self.at_search.results.items.len;
+        return self.at_search.results().len;
     }
 
     pub fn threadsCount(self: *const App) usize {
@@ -1214,13 +1217,20 @@ pub const AtSearchWidget = struct {
 
     fn drawAtSearch(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *AtSearchWidget = @ptrCast(@alignCast(ptr));
+        const kind = self.app.at_search.kind();
+        const indexing = self.app.at_search == .indexing;
+        const sel = self.app.getAtSelection();
+        const query: []const u8 = switch (self.app.at_search) {
+            .open => |o| o.query,
+            else => "",
+        };
         var content: at_search.Content = .{
-            .results = self.app.at_search.results.items,
-            .selection = self.app.at_search.selection,
-            .query = self.app.at_search.query,
-            .indexing = self.app.at_search.indexing,
-            .sigil = if (self.app.at_search.kind == .file) '@' else '$',
-            .title = if (self.app.at_search.kind == .file) "Files" else "Skills",
+            .results = self.app.at_search.results(),
+            .selection = sel,
+            .query = query,
+            .indexing = indexing,
+            .sigil = if (kind == .file) '@' else '$',
+            .title = if (kind == .file) "Files" else "Skills",
         };
         return content.widget().draw(ctx);
     }
