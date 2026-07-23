@@ -140,8 +140,7 @@ pub fn openDiffViewer(self: *App) !void {
         self,
     );
 
-    if (self.metrics.diff_cache) |raw| {
-        self.metrics.diff_loading = false;
+    if (self.metrics.diff_cache()) |raw| {
         var state = try diff_viewer.fromRaw(self.gpa, raw);
         if (state.isEmpty()) {
             state.deinit(self.gpa);
@@ -157,8 +156,7 @@ pub fn openDiffViewer(self: *App) !void {
     // Cold start: show the loading state and kick (or ride) a refresh.
     self.diff.deinit(self.gpa);
     self.diff = .{};
-    self.metrics.diff_loading = true;
-    if (self.metrics.diff_refresh_future == null) try self.scheduleDiffRefresh();
+    if (self.metrics.diff_refresh_future() == null) try self.scheduleDiffRefresh();
 }
 
 pub fn enterDiffMode(self: *App) void {
@@ -188,7 +186,6 @@ pub fn reportDiffError(self: *App, err: anyerror) !void {
 pub fn closeDiffViewer(self: *App, send: bool) !bool {
     const composed = if (send) try self.diff.composeMessage(self.gpa) else null;
     self.diff.deinit(self.gpa);
-    self.metrics.diff_loading = false;
     self.mode = .normal;
     self.clearInput();
     self.clearPaletteInput();

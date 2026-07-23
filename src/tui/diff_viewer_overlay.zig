@@ -41,7 +41,7 @@ pub fn drawDiffViewer(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext
     var subs: [3]vxfw.SubSurface = undefined;
     var n: usize = 0;
 
-    if (app.metrics.diff_loading) {
+    if (app.metrics.diff_loading()) {
         // Cold start: navigated in, diff still fetching in the background.
         panel.lineStyledAt(&surface, body_top + body_h / 2, "Loading diff…", ctx, 2, StylePalette.model_status) catch {};
     } else {

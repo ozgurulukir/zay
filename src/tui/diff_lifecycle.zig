@@ -108,11 +108,40 @@ fn installDiffCounts(app: *App, next: DiffCounts) bool {
 }
 
 pub fn scheduleDiffRefresh(app: *App) !void {
-    if (app.metrics.diff_refresh_future != null) {
-        app.metrics.diff_refresh_again = true;
-        return;
+    switch (app.metrics.diff) {
+        .loading, .refreshing => return, // already in flight
+        .ready => |r| {
+            // Already cached — transition to refreshing, keeping the old cache.
+            app.metrics.diff = .{ .refreshing = .{
+                .future = undefined,
+                .done = .init(false),
+                .cache = r.cache,
+            } };
+        },
+        .idle => {
+            const cwd_source = if (app.liveRuntime()) |runtime| runtime.cwd else ".";
+            const cwd = try app.gpa.dupe(u8, cwd_source);
+            errdefer app.gpa.free(cwd);
+
+            const job = try app.gpa.create(DiffRefreshJob);
+            errdefer app.gpa.destroy(job);
+            app.metrics.diff = .{ .loading = .{
+                .future = undefined,
+                .done = .init(false),
+            } };
+            job.* = .{
+                .gpa = app.gpa,
+                .io = app.io,
+                .cwd = cwd,
+                .done = &app.metrics.diff.loading.done,
+            };
+            errdefer job.deinit();
+            app.metrics.diff.loading.future = try app.io.concurrent(runDiffRefresh, .{job});
+            return;
+        },
     }
 
+    // refreshing path — fire off the new future.
     const cwd_source = if (app.liveRuntime()) |runtime| runtime.cwd else ".";
     const cwd = try app.gpa.dupe(u8, cwd_source);
     errdefer app.gpa.free(cwd);
@@ -123,63 +152,86 @@ pub fn scheduleDiffRefresh(app: *App) !void {
         .gpa = app.gpa,
         .io = app.io,
         .cwd = cwd,
-        .done = &app.metrics.diff_refresh_done,
+        .done = &app.metrics.diff.refreshing.done,
     };
     errdefer job.deinit();
-
-    app.metrics.diff_refresh_again = false;
-    app.metrics.diff_refresh_done.store(false, .release);
-    app.metrics.diff_refresh_future = try app.io.concurrent(runDiffRefresh, .{job});
+    app.metrics.diff.refreshing.future = try app.io.concurrent(runDiffRefresh, .{job});
 }
 
 pub fn cancelDiffRefresh(app: *App) void {
-    if (app.metrics.diff_refresh_future) |*future| {
-        var outcome = future.cancel(app.io);
-        outcome.deinit(app.gpa);
-        app.metrics.diff_refresh_future = null;
+    switch (app.metrics.diff) {
+        .loading => |*l| {
+            var future = l.future;
+            var outcome = future.cancel(app.io);
+            outcome.deinit(app.gpa);
+            app.metrics.diff = .idle;
+        },
+        .refreshing => |*r| {
+            var future = r.future;
+            var outcome = future.cancel(app.io);
+            outcome.deinit(app.gpa);
+            // Keep the old cache — promote back to ready.
+            app.metrics.diff = .{ .ready = .{ .cache = r.cache } };
+        },
+        else => {},
     }
-    app.metrics.diff_refresh_again = false;
-    app.metrics.diff_refresh_done.store(false, .release);
 }
 
 pub fn drainDiffRefresh(app: *App) !bool {
-    if (app.metrics.diff_refresh_future == null) return false;
-    if (!app.metrics.diff_refresh_done.load(.acquire)) return false;
+    // Only loading/refreshing states can drain.
+    switch (app.metrics.diff) {
+        .loading => |*l| if (!l.done.load(.acquire)) return false,
+        .refreshing => |*r| if (!r.done.load(.acquire)) return false,
+        else => return false,
+    }
 
-    var outcome = app.metrics.diff_refresh_future.?.await(app.io);
-    app.metrics.diff_refresh_future = null;
-    app.metrics.diff_refresh_done.store(false, .release);
+    var outcome = switch (app.metrics.diff) {
+        .loading => |*l| l.future.await(app.io),
+        .refreshing => |*r| r.future.await(app.io),
+        else => unreachable,
+    };
     defer outcome.deinit(app.gpa);
 
     var visible_change = false;
     switch (outcome) {
         .ready => |raw| {
-            if (app.metrics.diff_cache) |old| app.gpa.free(old);
-            app.metrics.diff_cache = raw;
+            // Free any previous cache, then store the new one in .ready.
+            switch (app.metrics.diff) {
+                .loading => app.metrics.diff = .{ .ready = .{ .cache = raw } },
+                .refreshing => |r| {
+                    app.gpa.free(r.cache);
+                    app.metrics.diff = .{ .ready = .{ .cache = raw } };
+                },
+                else => app.metrics.diff = .{ .ready = .{ .cache = raw } },
+            }
             outcome = .failed;
-            if (installDiffCounts(app, diff_utils.countDiff(app.metrics.diff_cache.?))) visible_change = true;
-            if (app.metrics.diff_loading) {
+            if (installDiffCounts(app, diff_utils.countDiff(app.metrics.diff_cache().?))) visible_change = true;
+            // Diff viewer was waiting for the cache to populate.
+            if (app.metrics.diff_loading()) {
                 try populateDiffFromCache(app);
                 visible_change = true;
             }
         },
         .failed => {
-            if (app.metrics.diff_loading) {
-                app.metrics.diff_loading = false;
+            // Drop the loading state; keep the old cache if refreshing.
+            switch (app.metrics.diff) {
+                .loading => app.metrics.diff = .idle,
+                .refreshing => |r| app.metrics.diff = .{ .ready = .{ .cache = r.cache } },
+                else => {},
+            }
+            if (app.metrics.diff_loading()) {
                 app.mode = .normal;
                 _ = try app.thread.transcript.append(app.gpa, .agent, "agent", "Couldn't load diff.");
                 visible_change = true;
             }
         },
     }
-    if (app.metrics.diff_refresh_again) try scheduleDiffRefresh(app);
     return visible_change;
 }
 
 /// Build the viewer's state from the cached diff (parse only — no git).
 fn populateDiffFromCache(app: *App) !void {
-    app.metrics.diff_loading = false;
-    const raw = app.metrics.diff_cache orelse return;
+    const raw = app.metrics.diff_cache() orelse return;
     var state = try diff_viewer.fromRaw(app.gpa, raw);
     if (state.isEmpty()) {
         state.deinit(app.gpa);

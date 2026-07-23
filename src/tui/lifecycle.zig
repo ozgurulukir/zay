@@ -58,7 +58,7 @@ pub fn deinitApp(self: *App) void {
     // Non-empty labels are always heap-allocated by `loadGitLabel`; the
     // empty default is a literal, so guard on length before freeing.
     if (self.metrics.git_label.len > 0) self.gpa.free(self.metrics.git_label);
-    if (self.metrics.diff_cache) |raw| self.gpa.free(raw);
+    if (self.metrics.diff_cache()) |raw| self.gpa.free(raw);
     self.pickers.models.deinit(self.gpa);
     codex.freeApiKeyMap(self.gpa, &self.provider_api_keys);
     if (self.modelsdev_registry) |*r| {
@@ -141,7 +141,7 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     }
 
     const model_loading = root.app.pickers.models.load == .loading;
-    const diff_loading = root.app.metrics.diff_refresh_future != null;
+    const diff_loading = root.app.metrics.diff_loading();
     // Keep ticking while a turn is active OR interrupting, so the worker's
     // remaining events (and its terminal `turn_finished`) get drained.
     const should_tick = root.app.anyTurnActive() or
@@ -486,7 +486,7 @@ pub fn submit(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         // (e.g. the cold-start "Loading diff…" the /diff command kicked off),
         // or a turn a command started directly (e.g. /sync conflict
         // resolution injects one).
-        if (root.app.thread.turn.isActive() or root.app.pickers.models.load == .loading or root.app.metrics.diff_refresh_future != null) try ensureTick(root, ctx);
+        if (root.app.thread.turn.isActive() or root.app.pickers.models.load == .loading or root.app.metrics.diff_loading()) try ensureTick(root, ctx);
         ctx.consumeAndRedraw();
         return;
     }

@@ -174,8 +174,8 @@ pub const BackgroundModalState = struct {
 
 /// Visual feedback state: the loading spinner frame, the black-hole
 /// intro animation frame, the cached git label, and the diff-cache
-/// fields (counts, refresh future, cache buffer, loading flag). The
-/// rendering code reads from here; the loader thread writes here.
+/// state machine. The rendering code reads from here; the loader
+/// thread writes here.
 pub const MetricsState = struct {
     loading_frame: u8 = 0,
     loading_tick_active: bool = false,
@@ -185,9 +185,70 @@ pub const MetricsState = struct {
     context_tokens_used: u32 = 0,
     context_tokens_max: u32 = 128000,
     diff_counts: tui.DiffCounts = .{},
-    diff_refresh_future: ?std.Io.Future(tui.DiffRefreshOutcome) = null,
-    diff_refresh_done: std.atomic.Value(bool) = .init(false),
-    diff_refresh_again: bool = false,
-    diff_cache: ?[]u8 = null,
-    diff_loading: bool = false,
+    /// Diff-cache state machine. The previous 5 flat fields
+    /// (diff_refresh_future/done/again, diff_cache, diff_loading)
+    /// allowed illegal combinations like future=null with cache set,
+    /// or diff_loading=true with future=null. The union makes those
+    /// unrepresentable.
+    diff: DiffState = .idle,
+
+    pub const DiffState = union(enum) {
+        idle,
+        loading: struct {
+            future: std.Io.Future(tui.DiffRefreshOutcome),
+            /// Set by the worker before it returns; callers check this
+            /// non-blockingly before awaiting.
+            done: std.atomic.Value(bool) = .init(false),
+        },
+        /// A successful fetch has populated `cache`; subsequent renders
+        /// read from it. A refresh transitions to `refreshing`, which
+        /// keeps the old cache visible while the new one loads.
+        ready: struct {
+            cache: []u8,
+        },
+        refreshing: struct {
+            future: std.Io.Future(tui.DiffRefreshOutcome),
+            done: std.atomic.Value(bool) = .init(false),
+            cache: []u8,
+        },
+    };
+
+    /// Backward-compat: future != null.
+    pub fn diff_refresh_future(self: *const MetricsState) ?std.Io.Future(tui.DiffRefreshOutcome) {
+        return switch (self.diff) {
+            .loading => |l| l.future,
+            .refreshing => |r| r.future,
+            else => null,
+        };
+    }
+    /// Backward-compat: done flag.
+    pub fn diff_refresh_done(self: *const MetricsState) std.atomic.Value(bool) {
+        return switch (self.diff) {
+            .loading => |l| l.done,
+            .refreshing => |r| r.done,
+            else => .init(false),
+        };
+    }
+    /// Backward-compat: diff_loading flag (any future-bearing state).
+    pub fn diff_loading(self: *const MetricsState) bool {
+        return switch (self.diff) {
+            .loading, .refreshing => true,
+            else => false,
+        };
+    }
+    /// Backward-compat: diff_refresh_again (superseded by `refreshing`
+    /// but kept for callers that read it). Always false now — the
+    /// union's `refreshing` arm encodes the same intent.
+    pub fn diff_refresh_again(self: *const MetricsState) bool {
+        _ = self;
+        return false;
+    }
+    /// Backward-compat: diff_cache (the cached body, null when idle).
+    pub fn diff_cache(self: *const MetricsState) ?[]u8 {
+        return switch (self.diff) {
+            .ready => |r| r.cache,
+            .refreshing => |r| r.cache,
+            else => null,
+        };
+    }
 };
