@@ -217,7 +217,7 @@ pub const TurnView = struct {
     fn finishThinking(self: *TurnView, gpa: std.mem.Allocator, transcript: *transcript_mod.Transcript) !bool {
         const index = self.thinking_index orelse return false;
         if (index >= transcript.messages.items.len) return false;
-        if (std.mem.eql(u8, transcript.messages.items[index].title, "Thoughts")) return false;
+        if (std.mem.eql(u8, transcript.messages.items[index].mirror().title, "Thoughts")) return false;
         try transcript.finishThinking(gpa, index);
         return true;
     }
@@ -289,15 +289,25 @@ pub const TurnView = struct {
         errdefer gpa.free(owned_title);
         const owned_body = try gpa.dupe(u8, "");
         errdefer gpa.free(owned_body);
-        gpa.free(message.title);
-        gpa.free(message.body);
-        if (message.stderr_body) |stderr| gpa.free(stderr);
-        if (message.tool_expanded_title) |expanded_title| gpa.free(expanded_title);
+        // Free whatever payload the previous variant owned.
+        switch (message.*) {
+            inline .user, .agent, .skill, .logo, .thinking, .status, .notice, .success, .info => |m| {
+                gpa.free(m.title);
+                gpa.free(m.body);
+            },
+            .tool => |*t| {
+                gpa.free(t.title);
+                gpa.free(t.body);
+                if (t.stderr) |stderr| gpa.free(stderr);
+                if (t.expanded_title) |expanded_title| gpa.free(expanded_title);
+            },
+        }
         message.* = .{
-            .kind = .skill,
-            .title = owned_title,
-            .body = owned_body,
-            .expanded = false,
+            .skill = .{
+                .title = owned_title,
+                .body = owned_body,
+                .expanded = false,
+            },
         };
     }
 
@@ -314,7 +324,8 @@ pub const TurnView = struct {
         const was_awaiting = self.awaitingOutput();
         var visible_change = false;
         if (self.toolTranscriptIndex(tool_index)) |index| {
-            visible_change = transcript.messages.items[index].kind != .skill or !std.mem.eql(u8, transcript.messages.items[index].title, title);
+            const m = transcript.messages.items[index].mirror();
+            visible_change = m.kind != .skill or !std.mem.eql(u8, m.title, title);
             if (visible_change) try setSkillMessage(gpa, transcript, index, title);
         } else {
             const index = try transcript.append(gpa, .skill, title, "");
@@ -335,7 +346,7 @@ pub const TurnView = struct {
         const policy = tool_policy.forName(tool.name);
         const existing_index = self.toolTranscriptIndex(tool.index);
         if (existing_index) |index| {
-            if (index < transcript.messages.items.len and transcript.messages.items[index].kind == .skill) {
+            if (index < transcript.messages.items.len and transcript.messages.items[index].mirror().kind == .skill) {
                 try transcript.finishSkill(gpa, index, tool.display_body, tool.failed);
                 self.tool_seen_in_response = true;
                 self.agent_index = null;
@@ -350,14 +361,14 @@ pub const TurnView = struct {
         };
 
         const visible_before = toolFinishVisibleChange(transcript, index, tool.display_label);
-        const was_expanded = transcript.messages.items[index].expanded;
-        const was_running = transcript.messages.items[index].tool_running;
+        const was_expanded = transcript.messages.items[index].mirror().expanded;
+        const was_running = transcript.messages.items[index].mirror().tool_running;
         try transcript.updateToolExpanded(gpa, index, tool.display_label, tool.display_expanded_label);
         try transcript.finishTool(gpa, index, tool.display_body, tool.stderr, tool.failed);
         const is_diff = tool.display_kind == .diff;
         const expand = policy.expand_by_default or is_diff;
         transcript.setExpanded(index, expand);
-        transcript.messages.items[index].tool_render = if (is_diff) .diff else policy.render;
+        transcript.messages.items[index].tool.render = if (is_diff) .diff else policy.render;
         selectGeneratedMessage(transcript, index);
         self.tool_seen_in_response = true;
         self.agent_index = null;
@@ -375,9 +386,9 @@ pub const TurnView = struct {
     fn toolFinishVisibleChange(transcript: *const transcript_mod.Transcript, index: u32, command: []const u8) bool {
         if (index >= transcript.messages.items.len) return true;
         const message = transcript.messages.items[index];
-        if (message.kind != .tool) return true;
-        if (message.expanded) return true;
-        return !toolTitleMatchesCommand(message.title, command);
+        if (message != .tool) return true;
+        if (message.tool.expanded) return true;
+        return !toolTitleMatchesCommand(message.tool.title, command);
     }
 
     fn toolTranscriptIndex(self: *const TurnView, tool_index: u32) ?u32 {
@@ -432,12 +443,13 @@ pub const TurnView = struct {
 };
 
 fn toolDisplayMatches(message: transcript_mod.Message, display: tools_mod.ToolDisplay) bool {
-    if (!toolTitleMatchesText(message.title, display.label)) return false;
+    if (message != .tool) return false;
+    if (!toolTitleMatchesText(message.tool.title, display.label)) return false;
     if (display.expanded_label) |label| {
-        const title = message.tool_expanded_title orelse return false;
+        const title = message.tool.expanded_title orelse return false;
         return toolTitleMatchesText(title, label);
     }
-    return message.tool_expanded_title == null;
+    return message.tool.expanded_title == null;
 }
 
 fn toolTitleMatchesCommand(title: []const u8, command: []const u8) bool {
@@ -471,8 +483,8 @@ test "bash read of skill renders skill row" {
 
     try std.testing.expect(changed);
     try std.testing.expectEqual(@as(usize, 1), transcript.messages.items.len);
-    try std.testing.expectEqual(transcript_mod.MessageKind.skill, transcript.messages.items[0].kind);
-    try std.testing.expectEqualStrings("[SKILL] tigerstyle", transcript.messages.items[0].title);
+    try std.testing.expectEqual(transcript_mod.MessageKind.skill, transcript.messages.items[0].mirror().kind);
+    try std.testing.expectEqualStrings("[SKILL] tigerstyle", transcript.messages.items[0].mirror().title);
 
     const finished = try view.applyToolFinished(gpa, &transcript, .{
         .index = 0,
@@ -482,10 +494,10 @@ test "bash read of skill renders skill row" {
         .display_body = "skill file contents",
     });
     try std.testing.expect(finished);
-    try std.testing.expectEqualStrings("skill file contents", transcript.messages.items[0].body);
-    try std.testing.expect(!transcript.messages.items[0].expanded);
+    try std.testing.expectEqualStrings("skill file contents", transcript.messages.items[0].mirror().body);
+    try std.testing.expect(!transcript.messages.items[0].mirror().expanded);
     transcript.toggleSelected();
-    try std.testing.expect(transcript.messages.items[0].expanded);
+    try std.testing.expect(transcript.messages.items[0].mirror().expanded);
 }
 
 test "bash skill detection uses command, not reason" {
@@ -507,7 +519,7 @@ test "turn view streams content into transcript" {
 
     try std.testing.expect(try turn_view.apply(gpa, &transcript, .{ .response_delta = "hello" }));
     try std.testing.expectEqual(@as(usize, 1), transcript.messages.items.len);
-    try std.testing.expectEqualStrings("hello", transcript.messages.items[0].body);
+    try std.testing.expectEqualStrings("hello", transcript.messages.items[0].mirror().body);
     try std.testing.expect(turn_view.activity == .writing_response);
     try std.testing.expectEqual(@as(u32, 0), turn_view.activity.writing_response);
 }
@@ -524,6 +536,6 @@ test "history compacted appends a white info notice, not a red error" {
     }));
     try std.testing.expectEqual(@as(usize, 1), transcript.messages.items.len);
     // Neutral `.info` (white), distinct from `.notice` (red error).
-    try std.testing.expectEqual(transcript_mod.MessageKind.info, transcript.messages.items[0].kind);
-    try std.testing.expectEqualStrings("compacted context ~90000 -> ~20000 tokens", transcript.messages.items[0].body);
+    try std.testing.expectEqual(transcript_mod.MessageKind.info, transcript.messages.items[0].mirror().kind);
+    try std.testing.expectEqualStrings("compacted context ~90000 -> ~20000 tokens", transcript.messages.items[0].mirror().body);
 }

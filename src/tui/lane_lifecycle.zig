@@ -201,9 +201,14 @@ pub fn captureLaneContext(app: *App, max: usize) ![][]u8 {
     while (index > 0 and out.items.len < max) {
         index -= 1;
         const message = messages[index];
-        if (message.kind != .user and message.kind != .agent) continue;
-        if (message.body.len == 0) continue;
-        try out.append(app.gpa, try app.gpa.dupe(u8, message.body));
+        if (message != .user and message != .agent) continue;
+        const body: []const u8 = switch (message) {
+            .user => |m| m.body,
+            .agent => |m| m.body,
+            else => continue,
+        };
+        if (body.len == 0) continue;
+        try out.append(app.gpa, try app.gpa.dupe(u8, body));
     }
     std.mem.reverse([]u8, out.items);
     return out.toOwnedSlice(app.gpa);

@@ -6,29 +6,30 @@ const blackhole = @import("blackhole.zig");
 const CountingAllocator = @import("counting_allocator").CountingAllocator;
 
 pub fn messageRowsCached(message: *transcript_mod.Message, width: u16) u16 {
-    if (message.row_cache.valid and message.row_cache.width == width) {
-        return message.row_cache.rows;
+    const cache = message.rowCachePtr();
+    if (cache.valid and cache.width == width) {
+        return cache.rows;
     }
     const rows = messageContentRows(message.*, width) + 1;
-    message.row_cache = .{ .valid = true, .width = width, .rows = rows };
+    cache.* = .{ .valid = true, .width = width, .rows = rows };
     return rows;
 }
 
 pub fn messageContentRows(message: transcript_mod.Message, width: u16) u16 {
-    return switch (message.kind) {
-        .user, .notice, .success, .info => textRows(message.body, width -| 2),
-        .agent => terminal_markdown.countRows(message.body, @max(width, 1)),
-        .skill => textRows(message.title, width -| 2) + if (message.expanded and message.body.len > 0) textRows(message.body, width) else 0,
+    return switch (message) {
+        .user, .notice, .success, .info => |m| textRows(m.body, width -| 2),
+        .agent => |m| terminal_markdown.countRows(m.body, @max(width, 1)),
+        .skill => |m| textRows(m.title, width -| 2) + if (m.expanded and m.body.len > 0) textRows(m.body, width) else 0,
         .logo => blackhole.rows,
-        .thinking => if (message.expanded)
-            1 + textRows(message.body, width -| 2)
+        .thinking => |m| if (m.expanded)
+            1 + textRows(m.body, width -| 2)
         else
             1,
         .status => 1,
-        .tool => if (message.expanded)
-            toolTitleRows(toolMessageTitle(message), width) + toolBodyRows(message, width)
+        .tool => |m| if (m.expanded)
+            toolTitleRows(toolMessageTitle(m), width) + toolBodyRows(m, width)
         else
-            toolTitleRows(toolMessageTitle(message), width),
+            toolTitleRows(toolMessageTitle(m), width),
     };
 }
 
@@ -37,15 +38,15 @@ pub fn toolTitleRows(title: []const u8, width: u16) u16 {
     return textRows(toolCommandTitle(title), width -| indent);
 }
 
-fn toolMessageTitle(message: transcript_mod.Message) []const u8 {
-    if (message.expanded) return message.tool_expanded_title orelse message.title;
+fn toolMessageTitle(message: transcript_mod.ToolView) []const u8 {
+    if (message.expanded) return message.expanded_title orelse message.title;
     return message.title;
 }
 
-pub fn toolBodyRows(message: transcript_mod.Message, width: u16) u16 {
+pub fn toolBodyRows(message: transcript_mod.ToolView, width: u16) u16 {
     var rows: u16 = 0;
     if (message.body.len > 0) rows += textRows(message.body, width);
-    if (message.stderr_body) |stderr| rows += textRows(stderr, width);
+    if (message.stderr) |stderr| rows += textRows(stderr, width);
     return rows;
 }
 

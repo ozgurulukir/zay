@@ -1875,7 +1875,7 @@ test "begin submit clears input and starts a turn awaiting output" {
     // The user message is the only transcript entry; the loading spinner is never
     // stored as a message.
     try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqualStrings("hello", app.thread.transcript.messages.items[0].body);
+    try std.testing.expectEqualStrings("hello", app.thread.transcript.messages.items[0].mirror().body);
     try std.testing.expect(app.thread.turn_view.awaitingOutput());
     try std.testing.expectEqual(Turn.State.active, app.thread.turn.state);
     try std.testing.expectEqual(@as(u32, 0), app.thread.transcript.selected.?);
@@ -1959,8 +1959,8 @@ test "begin submit queues while turn is in flight" {
     try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
     // Just the flushed user message; the spinner stays derived UI.
     try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
-    try std.testing.expectEqualStrings("later", app.thread.transcript.messages.items[0].body);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].mirror().kind);
+    try std.testing.expectEqualStrings("later", app.thread.transcript.messages.items[0].mirror().body);
     try std.testing.expect(app.thread.turn_view.awaitingOutput());
 }
 
@@ -2066,8 +2066,8 @@ test "begin submit shows notice when queued message queue is full" {
     try std.testing.expectEqualStrings("later", app.inputs.input.buf.firstHalf());
     // The notice is the only transcript row; the spinner is not a status message.
     try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.notice, app.thread.transcript.messages.items[0].kind);
-    try std.testing.expectEqualStrings("MessageQueueFull", app.thread.transcript.messages.items[0].body);
+    try std.testing.expectEqual(.notice, app.thread.transcript.messages.items[0].mirror().kind);
+    try std.testing.expectEqualStrings("MessageQueueFull", app.thread.transcript.messages.items[0].mirror().body);
     try std.testing.expect(app.thread.turn_view.awaitingOutput());
 }
 
@@ -2660,8 +2660,8 @@ test "interrupt restart flushes queued messages to the transcript when no provid
     try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
     try std.testing.expectEqual(@as(u32, 0), runtime.agent.message_queue.len());
     try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqualStrings("one", app.thread.transcript.messages.items[0].body);
-    try std.testing.expectEqualStrings("two", app.thread.transcript.messages.items[1].body);
+    try std.testing.expectEqualStrings("one", app.thread.transcript.messages.items[0].mirror().body);
+    try std.testing.expectEqualStrings("two", app.thread.transcript.messages.items[1].mirror().body);
 }
 
 test "canceling a picker returns to command menu" {
@@ -2745,11 +2745,11 @@ test "empty text deltas do not create selectable messages" {
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .response_delta = "" }));
     try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].mirror().kind);
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .thinking_delta = "" }));
     try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].mirror().kind);
 }
 
 test "agent app events update transcript on the ui side" {
@@ -2782,12 +2782,12 @@ test "agent app events update transcript on the ui side" {
     } }));
 
     try std.testing.expectEqual(@as(usize, 3), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
-    try std.testing.expectEqual(.thinking, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[2].kind);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].mirror().kind);
+    try std.testing.expectEqual(.thinking, app.thread.transcript.messages.items[1].mirror().kind);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[2].mirror().kind);
     try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);
-    try std.testing.expectEqualStrings("checking files", app.thread.transcript.messages.items[1].body);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[2].title);
+    try std.testing.expectEqualStrings("checking files", app.thread.transcript.messages.items[1].mirror().body);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[2].mirror().title);
 }
 
 test "user can navigate away from a streaming thinking block" {
@@ -2805,13 +2805,13 @@ test "user can navigate away from a streaming thinking block" {
     _ = try app.beginSubmit();
 
     _ = try app.applyAgentEvent(.{ .thinking_delta = "first chunk" });
-    try std.testing.expectEqual(.thinking, app.thread.transcript.messages.items[app.thread.transcript.selected.?].kind);
+    try std.testing.expectEqual(.thinking, app.thread.transcript.messages.items[app.thread.transcript.selected.?].mirror().kind);
 
     app.thread.transcript.moveSelection(.previous);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[app.thread.transcript.selected.?].kind);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[app.thread.transcript.selected.?].mirror().kind);
 
     _ = try app.applyAgentEvent(.{ .thinking_delta = " more" });
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[app.thread.transcript.selected.?].kind);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[app.thread.transcript.selected.?].mirror().kind);
 }
 
 test "user can navigate away from a streaming agent message" {
@@ -2829,13 +2829,13 @@ test "user can navigate away from a streaming agent message" {
     _ = try app.beginSubmit();
 
     _ = try app.applyAgentEvent(.{ .response_delta = "first chunk" });
-    try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[app.thread.transcript.selected.?].kind);
+    try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[app.thread.transcript.selected.?].mirror().kind);
 
     app.thread.transcript.moveSelection(.previous);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[app.thread.transcript.selected.?].kind);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[app.thread.transcript.selected.?].mirror().kind);
 
     _ = try app.applyAgentEvent(.{ .response_delta = " more" });
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[app.thread.transcript.selected.?].kind);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[app.thread.transcript.selected.?].mirror().kind);
 }
 
 test "empty content delta does not finalize thinking" {
@@ -2854,16 +2854,16 @@ test "empty content delta does not finalize thinking" {
 
     _ = try app.applyAgentEvent(.{ .thinking_delta = "thinking" });
     const thinking_index = app.thread.turn_view.thinking_index.?;
-    try std.testing.expectEqualStrings("Thinking...", app.thread.transcript.messages.items[thinking_index].title);
+    try std.testing.expectEqualStrings("Thinking...", app.thread.transcript.messages.items[thinking_index].mirror().title);
 
     _ = try app.applyAgentEvent(.{ .response_delta = "" });
-    try std.testing.expectEqualStrings("Thinking...", app.thread.transcript.messages.items[thinking_index].title);
+    try std.testing.expectEqualStrings("Thinking...", app.thread.transcript.messages.items[thinking_index].mirror().title);
 
     _ = try app.applyAgentEvent(.{ .thinking_delta = " more" });
-    try std.testing.expectEqualStrings("Thinking...", app.thread.transcript.messages.items[thinking_index].title);
+    try std.testing.expectEqualStrings("Thinking...", app.thread.transcript.messages.items[thinking_index].mirror().title);
 
     _ = try app.applyAgentEvent(.{ .response_delta = "answer" });
-    try std.testing.expectEqualStrings("Thoughts", app.thread.transcript.messages.items[thinking_index].title);
+    try std.testing.expectEqualStrings("Thoughts", app.thread.transcript.messages.items[thinking_index].mirror().title);
 }
 
 test "content deltas do not override user scroll state" {
@@ -2923,7 +2923,7 @@ test "loading does not appear during final answer after tool batch" {
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "Final answer" }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
     try std.testing.expectEqual(@as(usize, 3), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[2].kind);
+    try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[2].mirror().kind);
 }
 
 test "loading does not reappear between content chunks" {
@@ -2946,8 +2946,8 @@ test "loading does not reappear between content chunks" {
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "Here's the implementation plan:" }));
     _ = try app.applyAgentEvent(.delta_end);
     try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
-    try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[1].kind);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].mirror().kind);
+    try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[1].mirror().kind);
 }
 
 test "bash tool waits for complete arguments while streaming" {
@@ -2970,7 +2970,7 @@ test "bash tool waits for complete arguments while streaming" {
         .arguments = "{\"command\":\"printf hello",
     } }));
     try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].mirror().kind);
 
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
@@ -2980,8 +2980,8 @@ test "bash tool waits for complete arguments while streaming" {
         .display_body = "hello",
     } }));
     try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].mirror().kind);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].mirror().kind);
 }
 
 test "tool row persists through finish and turn completion" {
@@ -3004,16 +3004,16 @@ test "tool row persists through finish and turn completion" {
         .arguments = "{\"command\":\"ls\",\"reason\":\"List files\"}",
     } }));
     try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].title);
-    try std.testing.expectEqualStrings("🛠  ls", app.thread.transcript.messages.items[1].tool_expanded_title.?);
-    try std.testing.expect(app.thread.transcript.messages.items[1].tool_running);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].mirror().kind);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].mirror().title);
+    try std.testing.expectEqualStrings("🛠  ls", app.thread.transcript.messages.items[1].mirror().tool_expanded_title.?);
+    try std.testing.expect(app.thread.transcript.messages.items[1].mirror().tool_running);
     try std.testing.expect(app.thread.transcript.hasRunningTool());
 
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
     try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].title);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].mirror().kind);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].mirror().title);
 
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
@@ -3023,15 +3023,15 @@ test "tool row persists through finish and turn completion" {
         .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
     try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
-    try std.testing.expect(!app.thread.transcript.messages.items[1].tool_running);
+    try std.testing.expect(!app.thread.transcript.messages.items[1].mirror().tool_running);
     try std.testing.expect(!app.thread.transcript.hasRunningTool());
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].title);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].mirror().kind);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].mirror().title);
 
     try std.testing.expect(try app.applyAgentEvent(.turn_finished));
     try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].title);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].mirror().kind);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].mirror().title);
 }
 
 test "partial tool arguments do not create visible tool rows" {
@@ -3056,7 +3056,7 @@ test "partial tool arguments do not create visible tool rows" {
     // Partial arguments render nothing, so no tool row appears and the spinner
     // stays up (awaiting) over the lone user message.
     try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].mirror().kind);
     try std.testing.expect(app.thread.turn_view.awaitingOutput());
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
@@ -3065,8 +3065,8 @@ test "partial tool arguments do not create visible tool rows" {
         .arguments = "{\"command\":\"ls\",\"reason\":\"List files\"}",
     } }));
     try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].title);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].mirror().kind);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].mirror().title);
 }
 
 test "tool finish creates row if no complete streamed arguments appeared" {
@@ -3097,8 +3097,8 @@ test "tool finish creates row if no complete streamed arguments appeared" {
     } }));
 
     try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].title);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].mirror().kind);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].mirror().title);
 }
 
 test "new tool response index creates a new transcript row" {
@@ -3136,10 +3136,10 @@ test "new tool response index creates a new transcript row" {
     } }));
 
     try std.testing.expectEqual(@as(usize, 3), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[2].kind);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].title);
-    try std.testing.expectEqualStrings("🛠  Print working directory", app.thread.transcript.messages.items[2].title);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].mirror().kind);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[2].mirror().kind);
+    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].mirror().title);
+    try std.testing.expectEqualStrings("🛠  Print working directory", app.thread.transcript.messages.items[2].mirror().title);
 }
 
 test "bash tool after batch creates a new tool row" {
@@ -3180,9 +3180,9 @@ test "bash tool after batch creates a new tool row" {
     } });
 
     try std.testing.expectEqual(@as(usize, 3), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[2].kind);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].mirror().kind);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].mirror().kind);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[2].mirror().kind);
 }
 
 test "late tool finish does not move selection upward" {
@@ -3259,10 +3259,10 @@ test "loading does not resume after post-tool thinking delta" {
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
 
     try std.testing.expectEqual(@as(usize, 3), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqual(.thinking, app.thread.transcript.messages.items[2].kind);
-    try std.testing.expectEqualStrings("Thinking...", app.thread.transcript.messages.items[2].title);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].mirror().kind);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].mirror().kind);
+    try std.testing.expectEqual(.thinking, app.thread.transcript.messages.items[2].mirror().kind);
+    try std.testing.expectEqualStrings("Thinking...", app.thread.transcript.messages.items[2].mirror().title);
 }
 
 test "agent response after tool batch appears below tool rows" {
@@ -3296,13 +3296,13 @@ test "agent response after tool batch appears below tool rows" {
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "The repo is in /tmp." }));
 
     try std.testing.expectEqual(@as(usize, 4), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
-    try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[2].kind);
-    try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[3].kind);
-    try std.testing.expectEqualStrings("I will check.", app.thread.transcript.messages.items[1].body);
-    try std.testing.expectEqualStrings("🛠  Print working directory", app.thread.transcript.messages.items[2].title);
-    try std.testing.expectEqualStrings("The repo is in /tmp.", app.thread.transcript.messages.items[3].body);
+    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].mirror().kind);
+    try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[1].mirror().kind);
+    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[2].mirror().kind);
+    try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[3].mirror().kind);
+    try std.testing.expectEqualStrings("I will check.", app.thread.transcript.messages.items[1].mirror().body);
+    try std.testing.expectEqualStrings("🛠  Print working directory", app.thread.transcript.messages.items[2].mirror().title);
+    try std.testing.expectEqualStrings("The repo is in /tmp.", app.thread.transcript.messages.items[3].mirror().body);
     try std.testing.expectEqual(@as(u32, 3), app.thread.transcript.selected.?);
 }
 
@@ -3344,9 +3344,9 @@ test "content delta after tool preview does not move selection away from tool ro
         .display_body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
     } }));
     try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);
-    try std.testing.expectEqualStrings("I will check.", app.thread.transcript.messages.items[1].body);
-    try std.testing.expectEqualStrings("🛠  Print working directory", app.thread.transcript.messages.items[2].title);
-    try std.testing.expectEqualStrings(" Still checking.", app.thread.transcript.messages.items[3].body);
+    try std.testing.expectEqualStrings("I will check.", app.thread.transcript.messages.items[1].mirror().body);
+    try std.testing.expectEqualStrings("🛠  Print working directory", app.thread.transcript.messages.items[2].mirror().title);
+    try std.testing.expectEqualStrings(" Still checking.", app.thread.transcript.messages.items[3].mirror().body);
 }
 
 test "collapsed thinking and tool rows have stable heights" {
@@ -3371,7 +3371,7 @@ test "collapsed tool title wraps to visible rows" {
     defer transcript.deinit(gpa);
 
     const index = try transcript.startTool(gpa, "python3 - <<'PY'\nprint('a very long patch document')\nPY");
-    try std.testing.expect(!transcript.messages.items[index].expanded);
+    try std.testing.expect(!transcript.messages.items[index].mirror().expanded);
     try std.testing.expect(messageRowsCached(&transcript.messages.items[index], 12) > 3);
 }
 
@@ -3395,7 +3395,7 @@ test "resumed tool messages keep the tool icon" {
     try app.rebuildTranscriptFromAgent();
 
     try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqualStrings("🛠  zig build test", app.thread.transcript.messages.items[0].title);
+    try std.testing.expectEqualStrings("🛠  zig build test", app.thread.transcript.messages.items[0].mirror().title);
 }
 
 test "collapsed tool messages render no body text" {
@@ -3406,11 +3406,11 @@ test "collapsed tool messages render no body text" {
     const index = try transcript.startTool(gpa, "printf hello");
     try transcript.finishTool(gpa, index, "hello", null, false);
 
-    try std.testing.expect(!transcript.messages.items[index].expanded);
+    try std.testing.expect(!transcript.messages.items[index].mirror().expanded);
     try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&transcript.messages.items[index], 80));
     transcript.toggleSelected();
-    try std.testing.expect(transcript.messages.items[index].expanded);
-    try std.testing.expectEqualStrings("hello", transcript.messages.items[index].body);
+    try std.testing.expect(transcript.messages.items[index].mirror().expanded);
+    try std.testing.expectEqualStrings("hello", transcript.messages.items[index].mirror().body);
 }
 
 test "expanded tool surface height cannot overflow vxfw buffer size" {
@@ -3420,12 +3420,13 @@ test "expanded tool surface height cannot overflow vxfw buffer size" {
     @memset(body, 'x');
 
     var message: transcript_mod.Message = .{
-        .kind = .tool,
-        .title = try gpa.dupe(u8, "$ yes"),
-        .body = body,
-        .expanded = true,
+        .tool = .{
+            .title = try gpa.dupe(u8, "$ yes"),
+            .body = body,
+            .expanded = true,
+        },
     };
-    defer gpa.free(message.title);
+    defer gpa.free(message.tool.title);
 
     var widget: MessageWidget = .{
         .message = &message,

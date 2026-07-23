@@ -86,31 +86,31 @@ pub const MessageWidget = struct {
     }
 
     fn drawBody(self: *MessageWidget, surface: *vxfw.Surface, ctx: vxfw.DrawContext) void {
-        const styled_as_selected = self.selected or !self.message.kind.dimmable();
+        const styled_as_selected = self.selected or !self.message.kind().dimmable();
         var row: u16 = 1;
-        switch (self.message.kind) {
-            .user => drawWrapped(surface, self.message.body, StylePalette.user, styled_as_selected, &row, ctx, 2, StylePalette.user),
+        switch (self.message.*) {
+            .user => |m| drawWrapped(surface, m.body, StylePalette.user, styled_as_selected, &row, ctx, 2, StylePalette.user),
             .agent => drawMarkdown(self, surface, styled_as_selected, &row, ctx),
-            .skill => {
-                drawWrapped(surface, self.message.title, StylePalette.skill, styled_as_selected, &row, ctx, 2, StylePalette.skill);
-                if (self.message.expanded and self.message.body.len > 0) {
-                    drawWrapped(surface, self.message.body, StylePalette.thinking_body, styled_as_selected, &row, ctx, 0, null);
+            .skill => |m| {
+                drawWrapped(surface, m.title, StylePalette.skill, styled_as_selected, &row, ctx, 2, StylePalette.skill);
+                if (m.expanded and m.body.len > 0) {
+                    drawWrapped(surface, m.body, StylePalette.thinking_body, styled_as_selected, &row, ctx, 0, null);
                 }
             },
-            .notice => drawWrapped(surface, self.message.body, StylePalette.notice, styled_as_selected, &row, ctx, 2, StylePalette.notice),
-            .success => drawWrapped(surface, self.message.body, StylePalette.tool, styled_as_selected, &row, ctx, 2, StylePalette.tool),
-            .info => drawWrapped(surface, self.message.body, StylePalette.info, styled_as_selected, &row, ctx, 2, StylePalette.info),
+            .notice => |m| drawWrapped(surface, m.body, StylePalette.notice, styled_as_selected, &row, ctx, 2, StylePalette.notice),
+            .success => |m| drawWrapped(surface, m.body, StylePalette.tool, styled_as_selected, &row, ctx, 2, StylePalette.tool),
+            .info => |m| drawWrapped(surface, m.body, StylePalette.info, styled_as_selected, &row, ctx, 2, StylePalette.info),
             .logo => self.drawIntro(surface, self.blackhole_frame, &row, ctx),
-            .tool => {
-                const title_style = if (self.message.failed) StylePalette.tool_failed else StylePalette.tool;
-                drawToolTitle(surface, self.message.*, title_style, styled_as_selected, self.loading_frame, &row, ctx);
-                if (self.message.expanded) drawToolBody(surface, self.message.*, styled_as_selected, &row, ctx);
+            .tool => |m| {
+                const title_style = if (m.failed) StylePalette.tool_failed else StylePalette.tool;
+                drawToolTitle(surface, m, title_style, styled_as_selected, self.loading_frame, &row, ctx);
+                if (m.expanded) drawToolBody(surface, m, styled_as_selected, &row, ctx);
             },
-            .thinking => {
-                drawLine(surface, self.message.title, StylePalette.thinking_label, styled_as_selected, &row, ctx, 2, StylePalette.thinking_bar);
-                if (self.message.expanded) drawWrapped(surface, self.message.body, StylePalette.thinking_body, styled_as_selected, &row, ctx, 2, StylePalette.thinking_bar);
+            .thinking => |m| {
+                drawLine(surface, m.title, StylePalette.thinking_label, styled_as_selected, &row, ctx, 2, StylePalette.thinking_bar);
+                if (m.expanded) drawWrapped(surface, m.body, StylePalette.thinking_body, styled_as_selected, &row, ctx, 2, StylePalette.thinking_bar);
             },
-            .status => drawLoading(surface, self.message.title, self.loading_frame, &row, ctx),
+            .status => |m| drawLoading(surface, m.title, self.loading_frame, &row, ctx),
         }
     }
 
@@ -130,18 +130,17 @@ pub const MessageWidget = struct {
 
     fn drawToolTitle(
         surface: *vxfw.Surface,
-        message: transcript_mod.Message,
+        message: transcript_mod.ToolView,
         style: vaxis.Style,
         selected: bool,
         loading_frame: u8,
         row: *u16,
         ctx: vxfw.DrawContext,
     ) void {
-        std.debug.assert(message.kind == .tool);
         std.debug.assert(loading_frame < loading_frames.len);
-        const title = if (message.expanded) message.tool_expanded_title orelse message.title else message.title;
+        const title = if (message.expanded) message.expanded_title orelse message.title else message.title;
         const command = toolCommandTitle(title);
-        const prefix = if (message.tool_running) loading_frames[loading_frame] else toolIcon(command);
+        const prefix = if (message.running) loading_frames[loading_frame] else toolIcon(command);
         drawToolTitleWrapped(surface, prefix, command, style, selected, row, ctx);
     }
 
@@ -388,20 +387,20 @@ fn drawMarkdown(
     row: *u16,
     ctx: vxfw.DrawContext,
 ) void {
-    const text = self.message.body;
+    const text = self.message.agent.body;
     const content_width = @max(ConversationLayout.contentWidth(surface.size.width), 1);
 
     const rows: []const terminal_markdown.Row = rows: {
         if (text.len > render_cache_max_bytes) {
-            self.message.render_inc.deinit(self.gpa);
-            self.message.render_inc = .{};
+            self.message.renderIncPtr().deinit(self.gpa);
+            self.message.renderIncPtr().* = .{};
             break :rows (terminal_markdown.renderLimited(ctx.arena, text, content_width, surface.size.height) catch {
                 MessageWidget.drawWrapped(surface, text, .{}, selected, row, ctx, 0, null);
                 return;
             }).rows;
         }
 
-        break :rows self.message.render_inc.rows(self.gpa, ctx.arena, text, content_width) catch {
+        break :rows self.message.renderIncPtr().rows(self.gpa, ctx.arena, text, content_width) catch {
             MessageWidget.drawWrapped(surface, text, .{}, selected, row, ctx, 0, null);
             return;
         };
@@ -433,18 +432,18 @@ fn markdownStyle(style: terminal_markdown.Style) vaxis.Style {
 
 fn drawToolBody(
     surface: *vxfw.Surface,
-    message: transcript_mod.Message,
+    message: transcript_mod.ToolView,
     selected: bool,
     row: *u16,
     ctx: vxfw.DrawContext,
 ) void {
     if (message.body.len > 0) {
-        switch (message.tool_render) {
+        switch (message.render) {
             .plain => MessageWidget.drawWrapped(surface, message.body, StylePalette.thinking_body, selected, row, ctx, 0, null),
             .diff => drawWrappedDiff(surface, message.body, selected, row, ctx),
         }
     }
-    if (message.stderr_body) |stderr| {
+    if (message.stderr) |stderr| {
         MessageWidget.drawWrapped(surface, stderr, StylePalette.tool_failed, selected, row, ctx, 0, null);
     }
 }
@@ -525,7 +524,7 @@ test "expanded tool title uses expanded command" {
 
     const index = try transcript.startTool(gpa, "List files");
     try transcript.updateToolExpanded(gpa, index, "List files", "pwd");
-    transcript.messages.items[index].expanded = true;
+    transcript.messages.items[index].tool.expanded = true;
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();

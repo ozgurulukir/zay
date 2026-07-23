@@ -10,6 +10,9 @@ const assert = std.debug.assert;
 /// Failure overrides everything to red at draw time.
 pub const Render = enum { plain, diff };
 
+/// Tag of a transcript message. Kept as a separate enum (not the union
+/// tag directly) so non-Message sites can name a kind without depending
+/// on the union payload layout.
 pub const MessageKind = enum {
     user,
     agent,
@@ -47,40 +50,165 @@ pub const RowCache = struct {
     rows: u16 = 0,
 };
 
-pub const Message = struct {
-    kind: MessageKind,
+/// Payload shared by every non-tool transcript variant (user, agent,
+/// skill, logo, thinking, status, notice, success, info). The fields
+/// that were previously always-present on `Message` — title, body,
+/// expanded — live here; tool-only fields live in `ToolView`. `failed`
+/// is set when the source of the message reported a failure (skill
+/// result); other variants leave it false.
+pub const Basic = struct {
     title: []u8,
     body: []u8,
     expanded: bool = true,
     failed: bool = false,
-    /// Only meaningful when `kind == .tool`. True while the executor owns the
-    /// call and the TUI should animate the title prefix.
-    tool_running: bool = false,
-    /// Only meaningful when `kind == .tool`. Drives per-line styling of the
-    /// body in the TUI; see `Render`.
-    tool_render: Render = .plain,
-    /// Only meaningful when `kind == .tool`. The tool's stderr text, owned,
-    /// rendered in red below the gray body. Null when the tool produced no
-    /// stderr output.
-    stderr_body: ?[]u8 = null,
-    /// Only meaningful when `kind == .tool`. Title shown when the row is
-    /// expanded; used for bash to reveal the exact command behind a summary.
-    tool_expanded_title: ?[]u8 = null,
-    /// Cached row count; see `RowCache`. Not owned, needs no cleanup.
     row_cache: RowCache = .{},
     render_inc: terminal_markdown.Incremental = .{},
+};
+
+/// Tool-specific payload. `running` flips between append (start) and
+/// finishTool; `render` drives per-line styling; `failed` overrides
+/// body color; `stderr_body`/`expanded_title` are optional.
+pub const ToolView = struct {
+    title: []u8,
+    body: []u8,
+    expanded: bool = false,
+    running: bool = true,
+    render: Render = .plain,
+    failed: bool = false,
+    stderr: ?[]u8 = null,
+    expanded_title: ?[]u8 = null,
+    row_cache: RowCache = .{},
+    render_inc: terminal_markdown.Incremental = .{},
+};
+
+/// One entry in the conversation transcript. Variants make illegal
+/// combinations unrepresentable: only the `.tool` variant has `running`
+/// or `stderr`; only the `.user`/`.agent`/`.logo` variants start
+/// `expanded`; the kind drives the draw path via a tag switch.
+pub const Message = union(enum) {
+    user: Basic,
+    agent: Basic,
+    skill: Basic,
+    logo: Basic,
+    thinking: Basic,
+    status: Basic,
+    notice: Basic,
+    success: Basic,
+    info: Basic,
+    tool: ToolView,
+
+    /// Map a variant back to the loose `MessageKind` enum that older
+    /// call sites switch on. Kept for the renderer's switch — once the
+    /// renderer is converted to a tag switch, this can go.
+    pub fn kind(self: Message) MessageKind {
+        return switch (self) {
+            .user => .user,
+            .agent => .agent,
+            .skill => .skill,
+            .logo => .logo,
+            .thinking => .thinking,
+            .tool => .tool,
+            .status => .status,
+            .notice => .notice,
+            .success => .success,
+            .info => .info,
+        };
+    }
+
+    /// Convenience: a reference to the title of whichever variant
+    /// holds one. Used by the selection/toggle paths.
+    pub fn titlePtr(self: *Message) *[]u8 {
+        return switch (self.*) {
+            inline .user, .agent, .skill, .logo, .thinking, .status, .notice, .success, .info => |*m| &m.title,
+            .tool => |*t| &t.title,
+        };
+    }
+
+    /// Convenience: a reference to the body of whichever variant
+    /// holds one. Used by the streaming append paths.
+    pub fn bodyPtr(self: *Message) *[]u8 {
+        return switch (self.*) {
+            inline .user, .agent, .skill, .logo, .thinking, .status, .notice, .success, .info => |*m| &m.body,
+            .tool => |*t| &t.body,
+        };
+    }
+
+    /// Convenience: a reference to the expanded flag.
+    pub fn expandedPtr(self: *Message) *bool {
+        return switch (self.*) {
+            inline .user, .agent, .skill, .logo, .thinking, .status, .notice, .success, .info => |*m| &m.expanded,
+            .tool => |*t| &t.expanded,
+        };
+    }
+
+    /// Convenience: pointer to the `row_cache` field.
+    pub fn rowCachePtr(self: *Message) *RowCache {
+        return switch (self.*) {
+            inline .user, .agent, .skill, .logo, .thinking, .status, .notice, .success, .info => |*m| &m.row_cache,
+            .tool => |*t| &t.row_cache,
+        };
+    }
+
+    /// Convenience: pointer to the `render_inc` field.
+    pub fn renderIncPtr(self: *Message) *terminal_markdown.Incremental {
+        return switch (self.*) {
+            inline .user, .agent, .skill, .logo, .thinking, .status, .notice, .success, .info => |*m| &m.render_inc,
+            .tool => |*t| &t.render_inc,
+        };
+    }
 
     pub fn deinit(self: *Message, gpa: std.mem.Allocator) void {
-        gpa.free(self.title);
-        gpa.free(self.body);
-        if (self.stderr_body) |stderr| gpa.free(stderr);
-        if (self.tool_expanded_title) |title| gpa.free(title);
-        self.render_inc.deinit(gpa);
+        switch (self.*) {
+            inline .user, .agent, .skill, .logo, .thinking, .status, .notice, .success, .info => |*m| {
+                gpa.free(m.title);
+                gpa.free(m.body);
+                m.render_inc.deinit(gpa);
+            },
+            .tool => |*t| {
+                gpa.free(t.title);
+                gpa.free(t.body);
+                if (t.stderr) |stderr| gpa.free(stderr);
+                if (t.expanded_title) |title| gpa.free(title);
+                t.render_inc.deinit(gpa);
+            },
+        }
         self.* = undefined;
     }
 
     pub fn invalidateRowCache(self: *Message) void {
-        self.row_cache.valid = false;
+        self.rowCachePtr().valid = false;
+    }
+
+    /// Test-only flat view of this `Message`. The TUI tests access
+    /// fields like `message.body` directly; with the union shape, those
+    /// become variant-specific. The mirror reconstructs the flat view for
+    /// tests that don't care which variant they're inspecting. Not for
+    /// production use.
+    pub fn mirror(self: Message) Mirror {
+        return switch (self) {
+            inline .user, .agent, .skill, .logo, .thinking, .status, .notice, .success, .info => |m| .{
+                .kind = self.kind(),
+                .title = m.title,
+                .body = m.body,
+                .expanded = m.expanded,
+                .failed = m.failed,
+                .tool_running = false,
+                .tool_render = .plain,
+                .tool_expanded_title = null,
+                .stderr_body = null,
+            },
+            .tool => |t| .{
+                .kind = .tool,
+                .title = t.title,
+                .body = t.body,
+                .expanded = t.expanded,
+                .failed = t.failed,
+                .tool_running = t.running,
+                .tool_render = t.render,
+                .tool_expanded_title = t.expanded_title,
+                .stderr_body = t.stderr,
+            },
+        };
     }
 };
 
@@ -111,12 +239,13 @@ pub const Transcript = struct {
 
         const index: u32 = @intCast(self.messages.items.len);
         const following_tail = self.isFollowingTail();
-        try self.messages.append(gpa, .{
-            .kind = kind,
+        const expanded = kind == .user or kind == .agent or kind == .logo;
+        const payload = Basic{
             .title = owned_title,
             .body = owned_body,
-            .expanded = kind == .user or kind == .agent or kind == .logo,
-        });
+            .expanded = expanded,
+        };
+        try self.messages.append(gpa, payloadToMessage(kind, payload));
         if (kind.selectable() and following_tail) self.selected = index;
         return index;
     }
@@ -133,7 +262,7 @@ pub const Transcript = struct {
         const selected = self.selected orelse return true;
         const count: u32 = @intCast(self.messages.items.len);
         if (selected + 1 == count) return true;
-        if (selected + 2 == count and !self.messages.items[count - 1].kind.selectable()) return true;
+        if (selected + 2 == count and !self.messages.items[count - 1].kind().selectable()) return true;
         return false;
     }
 
@@ -145,8 +274,8 @@ pub const Transcript = struct {
     ) !void {
         assert(index < self.messages.items.len);
         const message = &self.messages.items[index];
-        assert(message.kind == .agent);
-        try appendOwned(gpa, &message.body, delta);
+        assert(message.* == .agent);
+        try appendOwned(gpa, message.bodyPtr(), delta);
         message.invalidateRowCache();
     }
 
@@ -158,9 +287,40 @@ pub const Transcript = struct {
     ) !void {
         assert(index < self.messages.items.len);
         const message = &self.messages.items[index];
-        assert(message.kind == .thinking);
-        try appendOwned(gpa, &message.body, delta);
+        assert(message.* == .thinking);
+        try appendOwned(gpa, message.bodyPtr(), delta);
         message.invalidateRowCache();
+    }
+
+    /// Append a finished tool message (used when rehydrating from a
+    /// session). Distinct from `startTool` because the tool is already
+    /// done — `running` is false, `expanded` follows the diff policy.
+    pub fn appendTool(
+        self: *Transcript,
+        gpa: std.mem.Allocator,
+        title: []const u8,
+        body: []const u8,
+        failed: bool,
+    ) !u32 {
+        assert(title.len > 0);
+        const owned_title = try gpa.dupe(u8, title);
+        errdefer gpa.free(owned_title);
+        const owned_body = try gpa.dupe(u8, body);
+        errdefer gpa.free(owned_body);
+
+        const index: u32 = @intCast(self.messages.items.len);
+        const following_tail = self.isFollowingTail();
+        try self.messages.append(gpa, .{
+            .tool = .{
+                .title = owned_title,
+                .body = owned_body,
+                .expanded = false,
+                .running = false,
+                .failed = failed,
+            },
+        });
+        if (MessageKind.tool.selectable() and following_tail) self.selected = index;
+        return index;
     }
 
     pub fn insert(
@@ -178,12 +338,13 @@ pub const Transcript = struct {
         const owned_body = try gpa.dupe(u8, body);
         errdefer gpa.free(owned_body);
 
-        try self.messages.insert(gpa, index, .{
-            .kind = kind,
+        const expanded = kind == .user or kind == .agent or kind == .logo;
+        const payload = Basic{
             .title = owned_title,
             .body = owned_body,
-            .expanded = kind == .user or kind == .agent or kind == .logo,
-        });
+            .expanded = expanded,
+        };
+        try self.messages.insert(gpa, index, payloadToMessage(kind, payload));
         if (self.selected) |selected| {
             if (selected >= index) self.selected = selected + 1;
         }
@@ -192,7 +353,7 @@ pub const Transcript = struct {
 
     pub fn select(self: *Transcript, index: u32) void {
         assert(index < self.messages.items.len);
-        assert(self.messages.items[index].kind.selectable());
+        assert(self.messages.items[index].kind().selectable());
         self.selected = index;
     }
 
@@ -204,7 +365,7 @@ pub const Transcript = struct {
         var index: u32 = @intCast(self.messages.items.len);
         while (index > 0) {
             index -= 1;
-            if (self.messages.items[index].kind.selectable()) {
+            if (self.messages.items[index].kind().selectable()) {
                 self.selected = index;
                 return;
             }
@@ -235,9 +396,17 @@ pub const Transcript = struct {
     pub fn startTool(self: *Transcript, gpa: std.mem.Allocator, command: []const u8) !u32 {
         const title = try toolTitle(gpa, command);
         defer gpa.free(title);
-        const index = try self.append(gpa, .tool, title, "");
-        self.messages.items[index].expanded = false;
-        self.messages.items[index].tool_running = true;
+        const index: u32 = @intCast(self.messages.items.len);
+        const following_tail = self.isFollowingTail();
+        try self.messages.append(gpa, .{
+            .tool = .{
+                .title = try gpa.dupe(u8, title),
+                .body = try gpa.dupe(u8, ""),
+                .expanded = false,
+                .running = true,
+            },
+        });
+        if (MessageKind.tool.selectable() and following_tail) self.selected = index;
         return index;
     }
 
@@ -254,28 +423,29 @@ pub const Transcript = struct {
     ) !void {
         assert(index < self.messages.items.len);
         const message = &self.messages.items[index];
-        assert(message.kind == .tool);
+        assert(message.* == .tool);
 
         const title = try toolTitle(gpa, command);
         errdefer gpa.free(title);
         const expanded_title = if (expanded_command) |value| try toolTitle(gpa, value) else null;
         errdefer if (expanded_title) |value| gpa.free(value);
-        gpa.free(message.title);
-        if (message.tool_expanded_title) |value| gpa.free(value);
-        message.title = title;
-        message.tool_expanded_title = expanded_title;
+        const t = &message.tool;
+        gpa.free(t.title);
+        if (t.expanded_title) |value| gpa.free(value);
+        t.title = title;
+        t.expanded_title = expanded_title;
         message.invalidateRowCache();
     }
 
     pub fn finishThinking(self: *Transcript, gpa: std.mem.Allocator, index: u32) !void {
         assert(index < self.messages.items.len);
         const message = &self.messages.items[index];
-        assert(message.kind == .thinking);
-        if (std.mem.eql(u8, message.title, "Thoughts")) return;
+        assert(message.* == .thinking);
+        if (std.mem.eql(u8, message.thinking.title, "Thoughts")) return;
 
         const title = try gpa.dupe(u8, "Thoughts");
-        gpa.free(message.title);
-        message.title = title;
+        gpa.free(message.thinking.title);
+        message.thinking.title = title;
     }
 
     pub fn finishTool(
@@ -288,16 +458,17 @@ pub const Transcript = struct {
     ) !void {
         assert(index < self.messages.items.len);
         const message = &self.messages.items[index];
-        assert(message.kind == .tool);
-        message.tool_running = false;
-        try appendOwned(gpa, &message.body, body);
+        assert(message.* == .tool);
+        const t = &message.tool;
+        t.running = false;
+        try appendOwned(gpa, &t.body, body);
         if (stderr_body) |stderr| {
             assert(stderr.len > 0);
             const owned = try gpa.dupe(u8, stderr);
-            if (message.stderr_body) |existing| gpa.free(existing);
-            message.stderr_body = owned;
+            if (t.stderr) |existing| gpa.free(existing);
+            t.stderr = owned;
         }
-        message.failed = failed;
+        t.failed = failed;
         message.invalidateRowCache();
     }
 
@@ -310,9 +481,9 @@ pub const Transcript = struct {
     ) !void {
         assert(index < self.messages.items.len);
         const message = &self.messages.items[index];
-        assert(message.kind == .skill);
-        try appendOwned(gpa, &message.body, body);
-        message.failed = failed;
+        assert(message.* == .skill);
+        try appendOwned(gpa, &message.skill.body, body);
+        message.skill.failed = failed;
         message.invalidateRowCache();
     }
 
@@ -322,7 +493,7 @@ pub const Transcript = struct {
     pub fn setExpanded(self: *Transcript, index: u32, value: bool) void {
         assert(index < self.messages.items.len);
         const message = &self.messages.items[index];
-        message.expanded = value;
+        message.expandedPtr().* = value;
         message.invalidateRowCache();
     }
 
@@ -341,8 +512,8 @@ pub const Transcript = struct {
 
     pub fn hasRunningTool(self: *const Transcript) bool {
         for (self.messages.items) |message| {
-            if (message.kind != .tool) continue;
-            if (message.tool_running) return true;
+            if (message != .tool) continue;
+            if (message.tool.running) return true;
         }
         return false;
     }
@@ -350,9 +521,9 @@ pub const Transcript = struct {
     pub fn stopRunningTools(self: *Transcript) bool {
         var stopped = false;
         for (self.messages.items) |*message| {
-            if (message.kind != .tool) continue;
-            if (!message.tool_running) continue;
-            message.tool_running = false;
+            if (message.* != .tool) continue;
+            if (!message.tool.running) continue;
+            message.tool.running = false;
             stopped = true;
         }
         return stopped;
@@ -362,13 +533,13 @@ pub const Transcript = struct {
         const selected = self.selected orelse return;
         assert(selected < self.messages.items.len);
         const message = &self.messages.items[selected];
-        switch (message.kind) {
+        switch (message.*) {
             .thinking, .tool => {
-                message.expanded = !message.expanded;
+                message.expandedPtr().* = !message.expandedPtr().*;
                 message.invalidateRowCache();
             },
-            .skill => if (message.body.len > 0) {
-                message.expanded = !message.expanded;
+            .skill => if (message.skill.body.len > 0) {
+                message.skill.expanded = !message.skill.expanded;
                 message.invalidateRowCache();
             },
             .user, .agent, .logo, .status, .notice, .success, .info => {},
@@ -378,7 +549,7 @@ pub const Transcript = struct {
     fn nearestSelectable(self: *const Transcript, index: u32) ?u32 {
         assert(self.messages.items.len > 0);
         assert(index < self.messages.items.len);
-        if (self.messages.items[index].kind.selectable()) return index;
+        if (self.messages.items[index].kind().selectable()) return index;
         if (self.nextSelectable(index)) |next| return next;
         return self.previousSelectable(index);
     }
@@ -388,7 +559,7 @@ pub const Transcript = struct {
         var current = index;
         while (current > 0) {
             current -= 1;
-            if (self.messages.items[current].kind.selectable()) return current;
+            if (self.messages.items[current].kind().selectable()) return current;
         }
         return null;
     }
@@ -397,11 +568,26 @@ pub const Transcript = struct {
         assert(index < self.messages.items.len);
         var current = index + 1;
         while (current < self.messages.items.len) : (current += 1) {
-            if (self.messages.items[current].kind.selectable()) return @intCast(current);
+            if (self.messages.items[current].kind().selectable()) return @intCast(current);
         }
         return null;
     }
 };
+
+fn payloadToMessage(kind: MessageKind, payload: Basic) Message {
+    return switch (kind) {
+        .user => .{ .user = payload },
+        .agent => .{ .agent = payload },
+        .skill => .{ .skill = payload },
+        .logo => .{ .logo = payload },
+        .thinking => .{ .thinking = payload },
+        .status => .{ .status = payload },
+        .notice => .{ .notice = payload },
+        .success => .{ .success = payload },
+        .info => .{ .info = payload },
+        .tool => @panic("payloadToMessage: tool uses ToolView, not Basic"),
+    };
+}
 
 fn appendOwned(gpa: std.mem.Allocator, target: *[]u8, suffix: []const u8) !void {
     if (suffix.len == 0) return;
@@ -419,15 +605,31 @@ pub fn toolTitle(gpa: std.mem.Allocator, command: []const u8) ![]u8 {
     return try std.fmt.allocPrint(gpa, "🛠  {s}", .{command});
 }
 
+/// Test-only flat view of a `Message`. The TUI tests access fields like
+/// `message.body` directly; with the union shape, those become
+/// variant-specific. The mirror reconstructs the flat view for tests that
+/// don't care which variant they're inspecting. Not for production use.
+pub const Mirror = struct {
+    kind: MessageKind,
+    title: []const u8,
+    body: []const u8,
+    expanded: bool,
+    failed: bool,
+    tool_running: bool,
+    tool_render: Render,
+    tool_expanded_title: ?[]const u8,
+    stderr_body: ?[]const u8,
+};
+
 test "thinking and tool messages are compact until toggled" {
     const gpa = std.testing.allocator;
     var transcript: Transcript = .{};
     defer transcript.deinit(gpa);
 
     _ = try transcript.append(gpa, .thinking, "thinking", "one two three four");
-    try std.testing.expect(!transcript.messages.items[0].expanded);
+    try std.testing.expect(!transcript.messages.items[0].thinking.expanded);
     transcript.toggleSelected();
-    try std.testing.expect(transcript.messages.items[0].expanded);
+    try std.testing.expect(transcript.messages.items[0].thinking.expanded);
 }
 
 test "selectLast selects last selectable before status tail" {
@@ -454,10 +656,10 @@ test "consecutive tools remain separate messages" {
     const second = try transcript.startTool(gpa, "pwd");
     try std.testing.expect(first != second);
     try std.testing.expectEqual(@as(usize, 2), transcript.messages.items.len);
-    try std.testing.expectEqualStrings("🛠  ls", transcript.messages.items[0].title);
-    try std.testing.expectEqualStrings("🛠  pwd", transcript.messages.items[1].title);
-    try std.testing.expect(!transcript.messages.items[0].expanded);
-    try std.testing.expect(!transcript.messages.items[1].expanded);
+    try std.testing.expectEqualStrings("🛠  ls", transcript.messages.items[0].tool.title);
+    try std.testing.expectEqualStrings("🛠  pwd", transcript.messages.items[1].tool.title);
+    try std.testing.expect(!transcript.messages.items[0].tool.expanded);
+    try std.testing.expect(!transcript.messages.items[1].tool.expanded);
 }
 
 test "remove keeps selection in range" {

@@ -62,8 +62,7 @@ pub fn rebuildTranscriptFromAgent(app: *App) !void {
         } else if (message.role() == .tool) {
             const title = try resumedToolTitle(app, message);
             defer app.gpa.free(title);
-            const index = try app.thread.transcript.append(app.gpa, .tool, title, text);
-            app.thread.transcript.messages.items[index].failed = message.tool.failed;
+            _ = try app.thread.transcript.appendTool(app.gpa, title, text, message.tool.failed);
         }
     }
     if (app.thread.transcript.messages.items.len > 0) app.thread.transcript.selected = @intCast(app.thread.transcript.messages.items.len - 1);

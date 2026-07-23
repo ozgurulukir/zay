@@ -63,7 +63,7 @@ pub const TranscriptWidget = struct {
     fn updateBlackholeVisibility(self: *TranscriptWidget) void {
         const messages = self.thread.transcript.messages.items;
         self.app.metrics.blackhole_visible = messages.len > 0 and
-            messages[0].kind == .logo and
+            messages[0] == .logo and
             self.thread.transcript_list.scroll.top == 0;
     }
 

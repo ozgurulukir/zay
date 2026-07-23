@@ -65,20 +65,21 @@ pub fn copySelectedTranscriptBlock(app: *App) !bool {
         while (i > 0) {
             i -= 1;
             const msg = &app.thread.transcript.messages.items[i];
-            if (msg.kind == .agent) break :blk @as(u32, @intCast(i));
+            if (msg.* == .agent) break :blk @as(u32, @intCast(i));
         }
         break :blk @as(u32, @intCast(app.thread.transcript.messages.items.len - 1));
     };
 
     if (selected_idx >= app.thread.transcript.messages.items.len) return false;
     const msg = &app.thread.transcript.messages.items[selected_idx];
-    const text = msg.body;
+    const mirror = msg.mirror();
+    const text = mirror.body;
     if (text.len == 0) return false;
 
     clipboard_mod.copyToClipboard(app.gpa, app.getIo(), text);
 
     var notice_buf: [256]u8 = undefined;
-    const kind_name = @tagName(msg.kind);
+    const kind_name = @tagName(mirror.kind);
     const notice_text = try std.fmt.bufPrint(&notice_buf, "Copied {s} message block to clipboard ({d} bytes).", .{ kind_name, text.len });
     _ = try app.thread.transcript.append(app.gpa, .notice, "clipboard", notice_text);
     return true;
