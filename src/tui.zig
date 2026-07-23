@@ -263,7 +263,7 @@ pub const App = struct {
     ) !App {
         var app = try init(io, gpa, &runtime.agent);
         app.cached_config = config;
-        app.mcp_manager.syncFromConfig(&app.cached_config) catch {};
+        app.mcp_manager.syncFromConfigEx(gpa, io, &app.cached_config, runtime.home_dir, runtime.cwd) catch {};
         search_mod.start(gpa, io, runtime.cwd);
         // One shared background manager for the whole session. Heap-allocated so
         // its address stays put as agents (primary + lanes) borrow it.
@@ -1163,7 +1163,11 @@ pub const commands = [_]CommandEntry{
 pub fn openMcp(app: *App) void {
     app.mode = .mcp;
     app.pickers.mcp.reset();
-    app.mcp_manager.syncFromConfig(&app.cached_config) catch {};
+    if (app.liveRuntime()) |runtime| {
+        app.mcp_manager.syncFromConfigEx(app.gpa, app.io, &app.cached_config, runtime.home_dir, runtime.cwd) catch {};
+    } else {
+        app.mcp_manager.syncFromConfig(&app.cached_config) catch {};
+    }
     app.clearInput();
     app.clearPaletteInput();
 }

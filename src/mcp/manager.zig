@@ -50,6 +50,45 @@ pub const McpManager = struct {
         }
     }
 
+    /// Extended sync with schema discovery for local & system MCP servers.
+    pub fn syncFromConfigEx(
+        self: *McpManager,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        config: *const config_mod.Config,
+        home_dir: []const u8,
+        cwd: []const u8,
+    ) !void {
+        for (config.mcp_servers) |server_cfg| {
+            var existing: ?*client_mod.McpClient = null;
+            for (self.clients.items) |*c| {
+                if (std.mem.eql(u8, c.name, server_cfg.name)) {
+                    existing = c;
+                    break;
+                }
+            }
+
+            if (existing) |c| {
+                c.status = if (server_cfg.enabled) .connected else .disabled;
+                if (c.tools.items.len == 0 and server_cfg.enabled) {
+                    discoverToolsForClient(gpa, io, c, home_dir, cwd);
+                }
+            } else {
+                var c = try client_mod.McpClient.init(
+                    self.gpa,
+                    server_cfg.name,
+                    server_cfg.command,
+                    server_cfg.url,
+                );
+                c.status = if (server_cfg.enabled) .connected else .disabled;
+                if (server_cfg.enabled) {
+                    discoverToolsForClient(gpa, io, &c, home_dir, cwd);
+                }
+                try self.clients.append(self.gpa, c);
+            }
+        }
+    }
+
     /// Count total active tools across all connected MCP servers.
     pub fn totalActiveTools(self: *const McpManager) usize {
         var count: usize = 0;
@@ -70,6 +109,87 @@ pub const McpManager = struct {
         return count;
     }
 };
+
+fn discoverToolsForClient(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    client: *client_mod.McpClient,
+    home_dir: []const u8,
+    cwd: []const u8,
+) void {
+    if (client.tools.items.len > 0) return;
+
+    var paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (paths.items) |p| gpa.free(p);
+        paths.deinit(gpa);
+    }
+
+    if (home_dir.len > 0) {
+        if (std.fs.path.join(gpa, &.{ home_dir, ".gemini", "antigravity-cli", "mcp", client.name })) |p| {
+            paths.append(gpa, p) catch {};
+        } else |_| {}
+        if (std.fs.path.join(gpa, &.{ home_dir, ".config", "nova", "mcp", client.name })) |p| {
+            paths.append(gpa, p) catch {};
+        } else |_| {}
+        if (std.fs.path.join(gpa, &.{ home_dir, ".nova", "mcp", client.name })) |p| {
+            paths.append(gpa, p) catch {};
+        } else |_| {}
+    }
+    if (cwd.len > 0) {
+        if (std.fs.path.join(gpa, &.{ cwd, ".nova", "mcp", client.name })) |p| {
+            paths.append(gpa, p) catch {};
+        } else |_| {}
+    }
+
+    for (paths.items) |dir_path| {
+        scanSchemaDir(gpa, io, client, dir_path) catch continue;
+        if (client.tools.items.len > 0) break;
+    }
+}
+
+fn scanSchemaDir(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    client: *client_mod.McpClient,
+    dir_path: []const u8,
+) !void {
+    var dir = std.Io.Dir.openDir(.cwd(), io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+
+    var iter = dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+
+        const file_path = try std.fs.path.join(gpa, &.{ dir_path, entry.name });
+        defer gpa.free(file_path);
+
+        const bytes = std.Io.Dir.readFileAllocOptions(.cwd(), io, file_path, gpa, .limited(64 * 1024), .of(u8), 0) catch continue;
+        defer gpa.free(bytes);
+
+        parseAndAddToolSchema(gpa, client, entry.name, bytes) catch continue;
+    }
+}
+
+fn parseAndAddToolSchema(
+    gpa: std.mem.Allocator,
+    client: *client_mod.McpClient,
+    filename: []const u8,
+    json_bytes: []const u8,
+) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, json_bytes, .{}) catch return;
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return;
+    const obj = parsed.value.object;
+
+    const default_name = filename[0 .. filename.len - 5];
+    const tool_name: []const u8 = if (obj.get("name")) |n| (if (n == .string) n.string else default_name) else default_name;
+    const description: []const u8 = if (obj.get("description")) |d| (if (d == .string) d.string else "MCP tool") else "MCP tool";
+
+    client.addTool(tool_name, description, .{ .properties = &.{} }) catch {};
+}
 
 test "McpManager syncs servers from config and counts tools" {
     const gpa = std.testing.allocator;

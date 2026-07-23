@@ -438,12 +438,31 @@ const SettingsMode = struct {
 
 const McpMode = struct {
     fn handle(app: *App, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.escape, .{})) {
+        if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
             tui.closeMcp(app);
             return true;
         }
-        if (key.matches('r', .{ .ctrl = true })) {
-            app.mcp_manager.syncFromConfig(&app.cached_config) catch {};
+        if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
+            app.pickers.mcp.moveUp();
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
+            app.pickers.mcp.moveDown(app.mcp_manager.clients.items.len);
+            return true;
+        }
+        if (key.matches(' ', .{}) or key.matches(vaxis.Key.enter, .{})) {
+            if (app.pickers.mcp.selection < app.mcp_manager.clients.items.len) {
+                const client = &app.mcp_manager.clients.items[app.pickers.mcp.selection];
+                client.status = if (client.status == .connected) .disabled else .connected;
+                return true;
+            }
+        }
+        if (key.matches('r', .{ .ctrl = true }) or key.matches('r', .{})) {
+            if (app.liveRuntime()) |runtime| {
+                app.mcp_manager.syncFromConfigEx(app.gpa, app.io, &app.cached_config, runtime.home_dir, runtime.cwd) catch {};
+            } else {
+                app.mcp_manager.syncFromConfig(&app.cached_config) catch {};
+            }
             return true;
         }
         return false;

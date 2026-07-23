@@ -14,6 +14,16 @@ pub const State = struct {
     pub fn reset(self: *State) void {
         self.selection = 0;
     }
+
+    pub fn moveUp(self: *State) void {
+        if (self.selection > 0) self.selection -= 1;
+    }
+
+    pub fn moveDown(self: *State, count: usize) void {
+        if (count > 0 and self.selection + 1 < count) {
+            self.selection += 1;
+        }
+    }
 };
 
 pub const Content = struct {
