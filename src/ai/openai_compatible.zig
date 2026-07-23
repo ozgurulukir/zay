@@ -353,13 +353,34 @@ fn writeUserContent(out: *std.Io.Writer, blocks: []const ai.ContentBlock) !void 
     try out.writeByte(']');
 }
 
+pub fn sanitizeToolArguments(raw: []const u8) []const u8 {
+    var trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return "{}";
+
+    if (std.mem.startsWith(u8, trimmed, "```")) {
+        if (std.mem.indexOf(u8, trimmed, "\n")) |newline_pos| {
+            trimmed = std.mem.trim(u8, trimmed[newline_pos + 1 ..], " \t\r\n");
+        } else {
+            trimmed = std.mem.trim(u8, trimmed[3..], " \t\r\n");
+        }
+        if (std.mem.endsWith(u8, trimmed, "```")) {
+            trimmed = std.mem.trim(u8, trimmed[0 .. trimmed.len - 3], " \t\r\n");
+        }
+    }
+
+    if (trimmed.len >= 2 and trimmed[0] == '{' and trimmed[trimmed.len - 1] == '}') {
+        return trimmed;
+    }
+    return "{}";
+}
+
 fn writeToolCall(out: *std.Io.Writer, tool_call: ai.ToolCall) !void {
     try out.writeAll("{\"id\":");
     try std.json.Stringify.value(tool_call.call_id, .{}, out);
     try out.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
     try std.json.Stringify.value(tool_call.name, .{}, out);
     try out.writeAll(",\"arguments\":");
-    const args = if (tool_call.arguments.len == 0) "{}" else tool_call.arguments;
+    const args = sanitizeToolArguments(tool_call.arguments);
     try std.json.Stringify.value(args, .{}, out);
     try out.writeAll("}}");
 }
@@ -1244,4 +1265,12 @@ test "parse streaming tool calls deduplicates repeated tool names (bashbash fix)
     try std.testing.expectEqual(@as(usize, 1), builders.items.len);
     try std.testing.expectEqualStrings("bash", builders.items[0].name.items);
     try std.testing.expectEqualStrings("call_1", builders.items[0].id.items);
+}
+
+test "sanitizeToolArguments strips markdown backticks and falls back to empty object" {
+    try std.testing.expectEqualStrings("{}", sanitizeToolArguments(""));
+    try std.testing.expectEqualStrings("{}", sanitizeToolArguments("   "));
+    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", sanitizeToolArguments("{\"command\":\"ls\"}"));
+    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", sanitizeToolArguments("```json\n{\"command\":\"ls\"}\n```"));
+    try std.testing.expectEqualStrings("{}", sanitizeToolArguments("not a json string"));
 }

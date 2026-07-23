@@ -2,6 +2,7 @@ const std = @import("std");
 const logger = @import("logger");
 const ai = @import("../ai.zig");
 const openai_endpoint = @import("openai_endpoint.zig");
+const openai_compatible = @import("openai_compatible.zig");
 const stream_part = @import("stream_part.zig");
 const tools_common = @import("../tools/common.zig");
 
@@ -311,7 +312,7 @@ fn writeFunctionCall(out: *std.Io.Writer, call: ai.ToolCall) !void {
     try out.writeAll(",\"name\":");
     try std.json.Stringify.value(call.name, .{}, out);
     try out.writeAll(",\"arguments\":");
-    const args = if (call.arguments.len == 0) "{}" else call.arguments;
+    const args = openai_compatible.sanitizeToolArguments(call.arguments);
     try std.json.Stringify.value(args, .{}, out);
     try out.writeByte('}');
 }
