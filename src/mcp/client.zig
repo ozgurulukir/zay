@@ -55,6 +55,11 @@ pub const McpClient = struct {
     latency_ms: u32 = 0,
     tools: std.ArrayList(McpTool) = .empty,
     next_request_id: i64 = 1,
+    /// Serializes JSON-RPC requests — stdin/stdout pipes can't handle
+    /// concurrent requests. Defensive for future parallel tool execution.
+    request_mutex: std.Io.Mutex = .init,
+    /// Read timeout for sendRequest poll, in milliseconds.
+    read_timeout_ms: u32 = 30_000,
     /// Subprocess handle for stdio transport. null when not started or using SSE.
     process: ?std.process.Child = null,
     /// Human-readable error message from the last failure. null when no error.
@@ -142,10 +147,15 @@ pub const McpClient = struct {
     /// Send a JSON-RPC request and read the response line.
     /// Returns the raw response line (owned, caller must free).
     /// Blocks up to `read_timeout_ms` waiting for a response.
+    /// Serialized via request_mutex — concurrent calls queue, not interleave.
     pub fn sendRequest(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) ![]u8 {
         const child = &(self.process orelse return error.NotConnected);
         const stdin_file = child.stdin orelse return error.NotConnected;
         const stdout_file = child.stdout orelse return error.NotConnected;
+
+        // Serialize requests: stdin/stdout pipes can't handle concurrent I/O.
+        try self.request_mutex.lock(io);
+        defer self.request_mutex.unlock(io);
 
         const id = self.next_request_id;
         self.next_request_id += 1;
@@ -156,24 +166,25 @@ pub const McpClient = struct {
         try stdin_file.writeStreamingAll(io, request);
 
         // Wait for data on stdout with a timeout to prevent infinite hangs.
-        // 30s is generous enough for npx-based servers to download and start.
         var poll_fds: [1]std.posix.pollfd = .{
             .{ .fd = stdout_file.handle, .events = std.posix.POLL.IN, .revents = 0 },
         };
-        const ready = std.posix.poll(&poll_fds, 30_000) catch return error.ReadFailed;
+        const ready = std.posix.poll(&poll_fds, @intCast(self.read_timeout_ms)) catch return error.ReadFailed;
         if (ready == 0) return error.Timeout;
-        // Process exited (stdout pipe closed) or error
+        // Server exited (stdout pipe closed) or poll error
         if (poll_fds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) {
-            return error.ProcessExited;
+            return error.McpServerCrashed;
         }
 
-        // Read one line from stdout (newline-delimited JSON-RPC)
+        // Read one line from stdout (newline-delimited JSON-RPC).
+        // line_writer grows dynamically — response size is unbounded.
         var buf: [64 * 1024]u8 = undefined;
         var reader = stdout_file.reader(io, &buf);
         var line_writer: std.Io.Writer.Allocating = .init(self.gpa);
         defer line_writer.deinit();
         _ = reader.interface.streamDelimiterEnding(&line_writer.writer, '\n') catch |err| switch (err) {
-            error.ReadFailed => return error.ReadFailed,
+            // Server closed the pipe mid-response
+            error.ReadFailed => return error.McpServerCrashed,
             error.WriteFailed => return error.OutOfMemory,
         };
         // Consume the delimiter
