@@ -330,7 +330,7 @@ pub const Content = struct {
         // Config file paths.
         try panel.lineStyledAt(surface, 6, "Configuration Files", ctx, left_col, StylePalette.panel_header);
 
-        const global_path = try std.fmt.allocPrint(ctx.arena, "  Global config : {s}/.nova/config.json", .{self.home_dir});
+        const global_path = try std.fmt.allocPrint(ctx.arena, "  Global config : {s}/.config/nova/config.json", .{self.home_dir});
         try panel.lineStyledAt(surface, 7, global_path, ctx, left_col, StylePalette.thinking_body);
 
         const project_path = try std.fmt.allocPrint(ctx.arena, "  Project config: {s}/.nova/config.json", .{self.cwd});
@@ -341,7 +341,7 @@ pub const Content = struct {
 
         try panel.lineStyledAt(surface, 11, "Config Layer Priority  (later overrides earlier)", ctx, left_col, StylePalette.panel_header);
         try panel.lineStyledAt(surface, 12, "  1. Built-in defaults", ctx, left_col, StylePalette.thinking_body);
-        try panel.lineStyledAt(surface, 13, "  2. Global config  (~/.nova/config.json)", ctx, left_col, StylePalette.thinking_body);
+        try panel.lineStyledAt(surface, 13, "  2. Global config  (~/.config/nova/config.json)", ctx, left_col, StylePalette.thinking_body);
         try panel.lineStyledAt(surface, 14, "  3. Project config (.nova/config.json)", ctx, left_col, StylePalette.thinking_body);
         try panel.lineStyledAt(surface, 15, "  4. Environment variables (OPENAI_MODEL, OPENAI_API_KEY, …)", ctx, left_col, StylePalette.thinking_body);
     }

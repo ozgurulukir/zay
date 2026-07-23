@@ -217,6 +217,7 @@ pub const ModelSelection = struct {
 };
 
 pub const Config = struct {
+    version: ?u32 = 1,
     provider: ?Provider = null,
     base_url: ?[]u8 = null,
     api_key: ?[]u8 = null,
@@ -240,6 +241,7 @@ pub const Config = struct {
 
     pub fn clone(self: Config, gpa: std.mem.Allocator) !Config {
         var out: Config = .{
+            .version = self.version,
             .provider = self.provider,
             .use_responses_endpoint = self.use_responses_endpoint,
             .enable_thinking = self.enable_thinking,
@@ -253,6 +255,31 @@ pub const Config = struct {
         for (self.providers, 0..) |provider, index| out.providers[index] = try provider.clone(gpa);
         if (self.system_prompt) |s| out.system_prompt = try gpa.dupe(u8, s);
         return out;
+    }
+
+    pub fn validate(self: *const Config, gpa: std.mem.Allocator) ![]Diagnostic {
+        var list: std.ArrayList(Diagnostic) = .empty;
+        errdefer {
+            for (list.items) |*d| d.deinit(gpa);
+            list.deinit(gpa);
+        }
+        if (self.version) |v| {
+            if (v > 1) {
+                try list.append(gpa, .{ .config_parse_error = .{
+                    .path = try gpa.dupe(u8, "version"),
+                    .reason = try std.fmt.allocPrint(gpa, "unsupported schema version {d}", .{v}),
+                } });
+            }
+        }
+        if (self.base_url) |url| {
+            if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) {
+                try list.append(gpa, .{ .config_parse_error = .{
+                    .path = try gpa.dupe(u8, "base_url"),
+                    .reason = try std.fmt.allocPrint(gpa, "invalid URL scheme in '{s}'", .{url}),
+                } });
+            }
+        }
+        return try list.toOwnedSlice(gpa);
     }
 
     /// Alias for `clone`, used by `nova.run` to hand the TUI an owned
@@ -452,7 +479,7 @@ fn loadGlobalFile(
     home_dir: []const u8,
     diagnostics: *std.ArrayList(Diagnostic),
 ) !Config {
-    const path = globalConfigPath(gpa, home_dir) catch return .{};
+    const path = globalConfigPath(gpa, io, home_dir) catch return .{};
     defer gpa.free(path);
     return loadFile(gpa, io, path, diagnostics);
 }
@@ -522,6 +549,15 @@ fn parseObject(
     var out: Config = .{};
     errdefer out.deinit(gpa);
 
+    if (intField(value, "version")) |v| {
+        out.version = @intCast(v);
+        if (v > 1) {
+            try diagnostics.append(gpa, .{ .config_parse_error = .{
+                .path = try gpa.dupe(u8, path),
+                .reason = try std.fmt.allocPrint(gpa, "unsupported config version {d}", .{v}),
+            } });
+        }
+    }
     if (stringField(value, "model")) |s| {
         if (parseModelSelection(gpa, s)) |selection| {
             out.provider = selection.provider;
@@ -538,6 +574,9 @@ fn parseObject(
     }
     if (stringField(value, "base_url")) |s| {
         out.base_url = try gpa.dupe(u8, s);
+    }
+    if (stringField(value, "bash_classifier_url")) |s| {
+        if (s.len > 0) out.bash_classifier_url = try gpa.dupe(u8, s);
     }
     if (boolField(value, "use_responses_endpoint")) |b| out.use_responses_endpoint = b;
     if (boolField(value, "enable_thinking")) |b| out.enable_thinking = b;
@@ -655,6 +694,12 @@ const reasoning_efforts_by_name = std.StaticStringMap(ai.ReasoningEffort).initCo
     .{ "xhigh", .xhigh },
 });
 
+fn intField(value: std.json.Value, name: []const u8) ?i64 {
+    const field = value.object.get(name) orelse return null;
+    if (field != .integer) return null;
+    return field.integer;
+}
+
 fn stringField(value: std.json.Value, name: []const u8) ?[]const u8 {
     const field = value.object.get(name) orelse return null;
     if (field != .string) return null;
@@ -673,7 +718,7 @@ pub fn writeGlobal(
     home_dir: []const u8,
     config: Config,
 ) !void {
-    const path = try globalConfigPath(gpa, home_dir);
+    const path = try globalConfigPath(gpa, io, home_dir);
     defer gpa.free(path);
 
     const dirname = std.fs.path.dirname(path) orelse return error.InvalidPath;
@@ -699,7 +744,7 @@ pub fn writeGlobal(
 }
 
 pub fn readGlobal(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !Config {
-    const path = try globalConfigPath(gpa, home_dir);
+    const path = try globalConfigPath(gpa, io, home_dir);
     defer gpa.free(path);
     var sink: std.ArrayList(Diagnostic) = .empty;
     defer {
@@ -788,8 +833,9 @@ pub fn projectConfigExists(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) 
 /// callers never have to thread a "should I persist the key?" flag through the
 /// merge path. The "serialize: skips api_key even if present" test guards it.
 fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !void {
-    try writer.writeByte('{');
-    var wrote_any = false;
+    try writer.writeAll("{\n  \"version\": 1");
+    var wrote_any = true;
+
     if (config.provider) |p| {
         try writeKey(writer, "provider", &wrote_any);
         try std.json.Stringify.value(p.label(), .{}, writer);
@@ -816,7 +862,11 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
         try writeKey(writer, "system_prompt", &wrote_any);
         try std.json.Stringify.value(s, .{}, writer);
     }
-    try writer.writeAll("}\n");
+    if (config.bash_classifier_url) |url| {
+        try writeKey(writer, "bash_classifier_url", &wrote_any);
+        try std.json.Stringify.value(url, .{}, writer);
+    }
+    try writer.writeAll("\n}\n");
 }
 
 fn writeModelSelection(gpa: std.mem.Allocator, writer: *std.Io.Writer, provider: Provider, model_id: []const u8) !void {
@@ -878,9 +928,29 @@ fn writeKey(writer: *std.Io.Writer, name: []const u8, wrote_any: *bool) !void {
     wrote_any.* = true;
 }
 
-fn globalConfigPath(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
+pub fn globalConfigPath(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) ![]u8 {
     if (home_dir.len == 0) return error.HomeNotSet;
-    return std.fs.path.join(gpa, &.{ home_dir, ".nova", "config.json" });
+
+    // 1. Standard XDG path: ~/.config/nova/config.json
+    const xdg_path = try std.fs.path.join(gpa, &.{ home_dir, ".config", "nova", "config.json" });
+    errdefer gpa.free(xdg_path);
+
+    if (std.Io.Dir.access(.cwd(), io, xdg_path, .{})) |_| {
+        return xdg_path;
+    } else |_| {}
+
+    // 2. Legacy fallback path: ~/.nova/config.json
+    const legacy_path = try std.fs.path.join(gpa, &.{ home_dir, ".nova", "config.json" });
+    errdefer gpa.free(legacy_path);
+
+    if (std.Io.Dir.access(.cwd(), io, legacy_path, .{})) |_| {
+        gpa.free(xdg_path);
+        return legacy_path;
+    } else |_| {}
+
+    // 3. Default to XDG path for new config writes
+    gpa.free(legacy_path);
+    return xdg_path;
 }
 
 fn projectConfigPath(gpa: std.mem.Allocator, cwd: []const u8) ![]u8 {
@@ -1219,4 +1289,31 @@ test "serialize then parse roundtrips" {
     try std.testing.expectEqual(false, roundtrip.use_responses_endpoint.?);
     try std.testing.expectEqual(true, roundtrip.enable_thinking.?);
     try std.testing.expectEqualStrings("llama3.1:8b", roundtrip.model.?.id);
+}
+
+test "globalConfigPath resolves XDG .config/nova/config.json with fallback" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const path = try globalConfigPath(gpa, io, "/home/testuser");
+    defer gpa.free(path);
+
+    try std.testing.expect(std.mem.indexOf(u8, path, ".config/nova/config.json") != null or std.mem.indexOf(u8, path, ".nova/config.json") != null);
+}
+
+test "Config.validate validates schema version and base_url scheme" {
+    const gpa = std.testing.allocator;
+    var cfg: Config = .{
+        .version = 2,
+        .base_url = try gpa.dupe(u8, "ftp://invalid-scheme"),
+    };
+    defer cfg.deinit(gpa);
+
+    const diags = try cfg.validate(gpa);
+    defer {
+        for (diags) |*d| d.deinit(gpa);
+        gpa.free(diags);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), diags.len);
 }
