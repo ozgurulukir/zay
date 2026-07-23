@@ -4,18 +4,31 @@ const assert = std.debug.assert;
 
 pub const DisplayKind = enum(u8) { text, diff };
 
+/// Optional display body a tool can attach to its `Output`. The
+/// variant tells the renderer how to draw the body (plain text vs
+/// per-line diff). `none` means the renderer falls back to stdout.
+/// Variants make illegal combinations unrepresentable: a `.diff` body
+/// must be non-empty, and a `none` body has no kind.
+pub const Display = union(enum) {
+    none,
+    text: []u8,
+    diff: []u8,
+};
+
 pub const Output = struct {
     stdout: []u8,
     stderr: []u8,
     code: u8,
-    display: ?[]u8 = null,
-    display_kind: DisplayKind = .text,
+    display: Display = .none,
     observation: ?Observation = null,
 
     pub fn deinit(self: *Output, gpa: std.mem.Allocator) void {
         gpa.free(self.stdout);
         gpa.free(self.stderr);
-        if (self.display) |display| gpa.free(display);
+        switch (self.display) {
+            inline .text, .diff => |body| gpa.free(body),
+            .none => {},
+        }
         if (self.observation) |*observation| observation.deinit(gpa);
         self.* = undefined;
     }
@@ -114,14 +127,14 @@ pub const Schema = struct {
 
 pub fn ok(gpa: std.mem.Allocator, stdout: []u8) Error!Output {
     const stderr = try gpa.alloc(u8, 0);
-    return .{ .stdout = stdout, .stderr = stderr, .code = 0, .display = null };
+    return .{ .stdout = stdout, .stderr = stderr, .code = 0 };
 }
 
 pub fn okWithDisplay(gpa: std.mem.Allocator, stdout: []u8, display: []u8) Error!Output {
     assert(stdout.len > 0);
     assert(display.len > 0);
     const stderr = try gpa.alloc(u8, 0);
-    return .{ .stdout = stdout, .stderr = stderr, .code = 0, .display = display };
+    return .{ .stdout = stdout, .stderr = stderr, .code = 0, .display = .{ .text = display } };
 }
 
 pub fn fail(gpa: std.mem.Allocator, message: []const u8, code: u8) Error!Output {
@@ -130,7 +143,7 @@ pub fn fail(gpa: std.mem.Allocator, message: []const u8, code: u8) Error!Output 
     const stdout = try gpa.alloc(u8, 0);
     errdefer gpa.free(stdout);
     const stderr = try gpa.dupe(u8, message);
-    return .{ .stdout = stdout, .stderr = stderr, .code = code, .display = null };
+    return .{ .stdout = stdout, .stderr = stderr, .code = code };
 }
 
 pub fn failFmt(
@@ -143,7 +156,7 @@ pub fn failFmt(
     const stdout = try gpa.alloc(u8, 0);
     errdefer gpa.free(stdout);
     const stderr = try std.fmt.allocPrint(gpa, fmt, args);
-    return .{ .stdout = stdout, .stderr = stderr, .code = code, .display = null };
+    return .{ .stdout = stdout, .stderr = stderr, .code = code };
 }
 
 /// Helper for display implementations. Parses the argument JSON and extracts

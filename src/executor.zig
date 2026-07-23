@@ -188,6 +188,10 @@ pub const ExecutorService = struct {
         errdefer self.gpa.free(display_body);
         const stderr = if (output.stderr.len > 0) try self.gpa.dupe(u8, output.stderr) else null;
         const failed = output.code != 0;
+        const display_kind: tools.DisplayKind = switch (output.display) {
+            .diff => .diff,
+            .text, .none => .text,
+        };
         return .{
             .call_id = call_id,
             .content = content,
@@ -195,7 +199,7 @@ pub const ExecutorService = struct {
             .display_label = display.label,
             .display_expanded_label = display.expanded_label,
             .display_body = display_body,
-            .display_kind = output.display_kind,
+            .display_kind = display_kind,
             .stderr = stderr,
             .failed = failed,
         };
@@ -342,7 +346,10 @@ fn makeDisplay(gpa: std.mem.Allocator, name: []const u8, args: []const u8) !tool
 /// sentinel when there is none. The executor passes through; it knows nothing
 /// tool-specific.
 fn makeDisplayBody(gpa: std.mem.Allocator, result: tools.Output) ![]u8 {
-    if (result.display) |display| return gpa.dupe(u8, display);
+    switch (result.display) {
+        inline .text, .diff => |display| return gpa.dupe(u8, display),
+        .none => {},
+    }
     if (result.stdout.len == 0) {
         if (result.stderr.len > 0) return gpa.alloc(u8, 0);
         return gpa.dupe(u8, "no output");

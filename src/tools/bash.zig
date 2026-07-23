@@ -341,12 +341,12 @@ fn finishBashOutput(
     const stderr = try gpa.alloc(u8, 0);
     errdefer gpa.free(stderr);
     const display_block = extraction.takeDisplay();
+    const display_value: common.Display = if (display_block) |block| .{ .diff = block } else .none;
     return .{
         .stdout = display_text,
         .stderr = stderr,
         .code = captured.code,
-        .display = display_block,
-        .display_kind = if (display_block != null) .diff else .text,
+        .display = display_value,
         .observation = observation,
     };
 }
@@ -684,8 +684,8 @@ test "bash tool surfaces a display block as a diff-kind display" {
     defer output.deinit(gpa);
 
     try std.testing.expectEqual(@as(u8, 0), output.code);
-    try std.testing.expectEqualStrings("-old\n+new", output.display.?);
-    try std.testing.expectEqual(common.DisplayKind.diff, output.display_kind);
+    try std.testing.expectEqualStrings("-old\n+new", output.display.diff);
+    try std.testing.expect(output.display == .diff);
     const observation = try testObservationText(gpa, output);
     defer gpa.free(observation);
     try std.testing.expect(std.mem.indexOf(u8, observation, "edited ok") != null);
