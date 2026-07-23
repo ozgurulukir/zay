@@ -125,6 +125,8 @@ pub const McpManager = struct {
     /// Caller owns the returned slice and must free with `gpa.free()`.
     /// Each schema's name/description strings borrow from the McpTool — the
     /// caller must keep the McpManager alive while using the result.
+    /// Duplicate full_names (same server+tool from two sources) are skipped
+    /// with a warning — first writer wins.
     pub fn buildMcpToolSchemas(self: *const McpManager, gpa: std.mem.Allocator) ![]ai.McpToolSchema {
         var total: usize = 0;
         for (self.clients.items) |c| {
@@ -132,9 +134,16 @@ pub const McpManager = struct {
         }
         var schemas = try gpa.alloc(ai.McpToolSchema, total);
         var idx: usize = 0;
-        for (self.clients.items) |c| {
+        next_tool: for (self.clients.items) |c| {
             if (c.status != .connected) continue;
             for (c.tools.items) |tool| {
+                // Collision check: skip if a tool with this full_name was already added
+                for (schemas[0..idx]) |existing| {
+                    if (std.mem.eql(u8, existing.name, tool.full_name)) {
+                        std.log.warn("MCP tool name collision: '{s}' — skipping duplicate", .{tool.full_name});
+                        continue :next_tool;
+                    }
+                }
                 schemas[idx] = .{
                     .name = tool.full_name,
                     .description = tool.description,
@@ -143,7 +152,26 @@ pub const McpManager = struct {
                 idx += 1;
             }
         }
-        return schemas;
+        // Trim unused tail if duplicates were skipped
+        return gpa.realloc(schemas, idx);
+    }
+
+    /// Brief one-line summary of connected servers and tool counts.
+    /// Caller owns the returned slice.
+    pub fn serverSummary(self: *const McpManager, gpa: std.mem.Allocator) ![]u8 {
+        if (self.activeServerCount() == 0) return gpa.dupe(u8, "");
+
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        errdefer out.deinit();
+        try out.writer.writeAll("Connected MCP servers: ");
+        var first = true;
+        for (self.clients.items) |c| {
+            if (c.status != .connected) continue;
+            if (!first) try out.writer.writeAll(", ");
+            first = false;
+            try out.writer.print("{s} ({d} tools)", .{ c.name, c.tools.items.len });
+        }
+        return out.toOwnedSlice();
     }
 
     /// Reconnect a specific client by index: stop, clear tools, and re-discover.
