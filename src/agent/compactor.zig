@@ -29,12 +29,12 @@ const State = enum(u8) { idle, running, ready, failed };
 const Job = struct {
     gpa: std.mem.Allocator,
     client: ai.LanguageModel,
-    first_kept_id: [session_mod.entry_id_len]u8,
+    first_kept_id: session_mod.EntryId,
     prefix_text: []u8,
 };
 
 const Result = struct {
-    first_kept_id: [session_mod.entry_id_len]u8,
+    first_kept_id: session_mod.EntryId,
     stored_summary: []u8,
 };
 
@@ -62,7 +62,6 @@ pub fn runThread(compactor: *Compactor) void {
 fn produceStoredSummary(job: Job) ![]u8 {
     // Validate input before summarization.
     assert(job.prefix_text.len > 0);
-    assert(job.first_kept_id.len > 0);
     const summary = try compaction.summarize(job.gpa, job.client, job.prefix_text);
     defer job.gpa.free(summary);
     if (summary.len == 0) return error.EmptySummary;

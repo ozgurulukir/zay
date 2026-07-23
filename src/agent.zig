@@ -905,7 +905,7 @@ pub const Agent = struct {
         const result = self.compactor.result.?;
         const session_writer = self.context_manager.session_writer orelse return;
         const tokens_before = self.currentContextTokens();
-        try session_writer.appendCompaction(result.first_kept_id[0..], result.stored_summary);
+        try session_writer.appendCompaction(result.first_kept_id.slice(), result.stored_summary);
         try self.reloadFromSession();
         self.resetContextUsage();
         try listener.emit(.{ .history_compacted = .{

@@ -346,15 +346,15 @@ pub const Session = struct {
             for (msgs.items) |*message| deinitMessage(gpa, message);
             msgs.deinit(gpa);
         }
-        var ids: std.ArrayList([entry_id_len]u8) = .empty;
+        var ids: std.ArrayList(EntryId) = .empty;
         defer ids.deinit(gpa);
         for (path[emit_start..]) |entry| {
             if (std.mem.eql(u8, entry.kind, "message")) {
                 try msgs.append(gpa, try jsonToMessage(gpa, entry.payload_json));
-                try ids.append(gpa, entry.id);
+                try ids.append(gpa, .{ .bytes = entry.id });
             } else if (std.mem.eql(u8, entry.kind, "branch_summary")) {
                 try msgs.append(gpa, try branchSummaryToMessage(gpa, entry.payload_json));
-                try ids.append(gpa, entry.id);
+                try ids.append(gpa, .{ .bytes = entry.id });
             }
         }
         if (msgs.items.len == 0) return null;
@@ -1394,7 +1394,7 @@ test "compaction cut splits the branch at the keep-recent budget" {
     // lands on the second entry and the first is summarized.
     const cut = (try session.compactionCut(gpa, 15)) orelse return error.TestFailed;
     defer gpa.free(cut.prefix_text);
-    try std.testing.expectEqualSlices(u8, id_second[0..], cut.first_kept_id[0..]);
+    try std.testing.expectEqualSlices(u8, id_second[0..], cut.first_kept_id.slice());
     try std.testing.expect(std.mem.indexOf(u8, cut.prefix_text, "aaaa") != null);
     try std.testing.expect(std.mem.indexOf(u8, cut.prefix_text, "bbbb") == null);
 }

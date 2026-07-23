@@ -149,7 +149,7 @@ pub const CompactionBoundary = struct {
 
 /// Result of computing where to cut the branch for compaction.
 pub const CompactionCut = struct {
-    first_kept_id: [entry_id_len]u8,
+    first_kept_id: EntryId,
     prefix_text: []u8,
 };
 
