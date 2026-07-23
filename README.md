@@ -34,7 +34,7 @@ Add the binary (`zig-out/bin/nova`) to your PATH so you can invoke it from anywh
 
 - **`/connect`**: Configure AI providers, custom endpoints, and API key management.
 - **`/model`**: Select LLM model & reasoning effort.
-- **`/mcp`**: Real-time Model Context Protocol server status, tool count, latency monitoring, and toggle controls.
+- **`/mcp`**: Real-time Model Context Protocol server status, active tool counts, latency monitoring, server toggling (`Space`/`Enter`), and schema re-syncing (`Ctrl+R`).
 - **`/settings`**: Interactive tabbed configuration panel (General, System Prompt, Advanced, About) with `Ctrl+S` instant save.
 - **`/copy` & `/paste`**: Copy selected transcript message blocks or diff comments to the system clipboard; paste into prompt fields (`Ctrl+V` / `Shift+Insert`).
 - **`/help`**: Scrollable quick reference guide with keyboard and mouse wheel navigation.
@@ -88,12 +88,13 @@ of `src/tui/` is split by concern:
 - `metrics.zig` — runtime metrics.
 - `naming.zig` / `style.zig` / `status.zig` / `tool_policy.zig` — shared helpers and policies.
 
-`src/tui/widgets/` holds the per-widget draw code (`message`, `command_panel`, `at_search`, `background_jobs`, `permission`, `diff`, `loading`, `transcript`, `input`, `overlay`, `lanes_picker`, `model_picker`, `provider_picker`, `resume_picker`, `help_picker`, `settings`, `tree_selector`, `panel`, `tree_art`).
+`src/tui/widgets/` holds the per-widget draw code (`message`, `command_panel`, `at_search`, `background_jobs`, `permission`, `diff`, `loading`, `transcript`, `input`, `overlay`, `lanes_picker`, `model_picker`, `provider_picker`, `resume_picker`, `help_picker`, `mcp_status`, `settings`, `tree_selector`, `panel`, `tree_art`).
 
 ## Core Systems & Engine
 
+- **`mcp/manager.zig` & `mcp/client.zig`**: Multi-server Model Context Protocol supervisor with layer-merged `mcp_servers` configuration (`mcp_servers`, `mcpServers`, `mcp` aliases) and automatic tool schema discovery across Nova standard directories (`~/.config/nova/mcp/`, `~/.nova/mcp/`, `<cwd>/.nova/mcp/`).
 - **`clipboard.zig`**: Cross-platform system clipboard interface supporting OSC 52 terminal escape sequences (`\x1b]52;c;<base64>\x07`) with OS-native execution fallback (`wl-copy`/`xclip`/`pbcopy`/`powershell` via Nova's `bash` subsystem).
-- **`config.zig`**: System configuration parser and disk serializer (`~/.config/nova/config.json`). Controls system prompt, thinking/reasoning toggles, and classifier parameters.
+- **`config.zig`**: System configuration parser and disk serializer (`~/.config/nova/config.json`). Controls system prompt, thinking/reasoning toggles, MCP servers, and classifier parameters.
 - **`modelsdev.zig`**: Provider registry integration combining built-in static providers with dynamic data from `https://models.dev/api.json`. Supports local disk caching in `~/.nova/modelsdev_cache.json` and safe string arena management (`StringRef` / `UnresolvedProvider`).
 - **`compaction.zig`**: Pure decisions for automatic context window compaction. Calculates dynamic retention budgets (`keepRecentTokens`) scaled to the model's context window (%35 max 20,000) so small-context models (e.g. 8K/16K/32K) can always compact cleanly below their swap watermarks.
 - **`agent.zig`**: Autonomous loop orchestrating LLM tool execution, background/synchronous context compaction, and VCS git-shadow checkpointing (`snapshotAfterBatch`).

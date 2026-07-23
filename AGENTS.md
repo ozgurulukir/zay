@@ -38,7 +38,7 @@ and a private `Inner` struct built inside `draw()` from a `vxfw.DrawContext`.
 The file imports `const tui = @import("../../tui.zig");`,
 `const tui_style = @import("../style.zig");`, `const panel = @import("panel.zig");`
 and re-aliases `const App = tui.App;`. Nested types from other modules
-(e.g. `BackgroundManager.JobView`, `ApprovalSnapshot`, `settings_widget.State`) are re-exported through
+(e.g. `BackgroundManager.JobView`, `ApprovalSnapshot`, `settings_widget.State`, `mcp_status.State`) are re-exported through
 `pub const` in `tui.zig` so widget files can reach them as `tui.<module>.<Type>`.
 
 **Per-mode command routing.** `src/tui/command_router.zig` holds one struct per
@@ -54,6 +54,8 @@ private methods on `App` for key handling.
 **System clipboard pattern.** `src/clipboard.zig` handles OS clipboard reading/writing via terminal OSC 52 sequences (`\x1b]52;c;<base64>\x07`) with OS-native execution fallback (`wl-copy`/`xclip`/`pbcopy`/`powershell` via `bash.zig`). `clipboard_helper.zig` routes clipboard data dynamically to focused input fields and transcript message blocks.
 
 **Settings lifecycle pattern.** `src/tui/settings_lifecycle.zig` manages pending tabbed form edits, syncs values to `app.cached_config` in real-time, and serializes user settings to `~/.config/nova/config.json` on `Ctrl+S`.
+
+**MCP Server & Tool Discovery pattern.** `src/mcp/manager.zig` merges `mcp_servers` configuration across global/project layers (supporting `mcp_servers`, `mcpServers`, and `mcp` JSON aliases) and scans Nova standard directories (`~/.config/nova/mcp/`, `~/.nova/mcp/`, `<cwd>/.nova/mcp/`) for tool schema discovery. `McpMode.handle` in `command_router.zig` routes `Up`/`Down`/`j`/`k` list navigation, `Space`/`Enter` server toggling, `Ctrl+R`/`r` re-syncing, and `Esc`/`q` closing.
 
 ## Zig Development
 
