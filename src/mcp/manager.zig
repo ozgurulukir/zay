@@ -179,15 +179,26 @@ pub const McpManager = struct {
         if (index >= self.clients.items.len) return;
         const client = &self.clients.items[index];
         client.stop(io);
-        // Clear existing tools
         for (client.tools.items) |*tool| tool.deinit(self.gpa);
         client.tools.clearRetainingCapacity();
         client.error_message = null;
         client.latency_ms = 0;
-        // Re-discover
         connectAndDiscover(io, client) catch {
             client.status = .failed;
         };
+    }
+
+    /// Disconnect a specific client: stop process, clear tools, set disabled.
+    /// The client stays in the list and can be reconnected later via
+    /// reconnectClient or by toggling in the TUI.
+    pub fn disconnectClient(self: *McpManager, io: std.Io, index: usize) void {
+        if (index >= self.clients.items.len) return;
+        const client = &self.clients.items[index];
+        client.stop(io);
+        for (client.tools.items) |*tool| tool.deinit(self.gpa);
+        client.tools.clearRetainingCapacity();
+        client.error_message = null;
+        client.latency_ms = 0;
     }
 
     fn findClient(self: *McpManager, name: []const u8) ?*client_mod.McpClient {

@@ -125,10 +125,11 @@ pub const McpClient = struct {
         self.status = .connecting;
     }
 
-    /// Stop the subprocess and close pipes.
+    /// Stop the subprocess: SIGTERM first, then SIGKILL via kill().
+    /// Closes stdin/stdout pipes and reaps the child.
     pub fn stop(self: *McpClient, io: std.Io) void {
         if (self.process) |*child| {
-            // Close stdin so the child sees EOF and can exit.
+            // Close stdin so the child sees EOF and can exit gracefully.
             if (child.stdin) |*stdin_file| {
                 stdin_file.close(io);
                 child.stdin = null;
@@ -137,7 +138,11 @@ pub const McpClient = struct {
                 stdout_file.close(io);
                 child.stdout = null;
             }
-            // kill() blocks until the child terminates and cleans up.
+            // SIGTERM first — gives well-behaved servers a chance to clean up.
+            // kill() below sends SIGKILL and reaps the zombie regardless.
+            if (child.id) |pid| {
+                std.posix.kill(@intCast(pid), std.posix.SIG.TERM) catch {};
+            }
             child.kill(io);
         }
         self.process = null;
@@ -171,8 +176,12 @@ pub const McpClient = struct {
         };
         const ready = std.posix.poll(&poll_fds, @intCast(self.read_timeout_ms)) catch return error.ReadFailed;
         if (ready == 0) return error.Timeout;
-        // Server exited (stdout pipe closed) or poll error
-        if (poll_fds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) {
+        // Server exited with no data — only crash when POLLIN is NOT set.
+        // When both POLLIN and HUP are set, the pipe has buffered data from
+        // a just-exited server that we still need to read.
+        if (poll_fds[0].revents & std.posix.POLL.IN == 0 and
+            poll_fds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0)
+        {
             return error.McpServerCrashed;
         }
 

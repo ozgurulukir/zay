@@ -470,6 +470,12 @@ const McpMode = struct {
             }
             return true;
         }
+        if (key.matches('d', .{})) {
+            if (app.pickers.mcp.selection < app.mcp_manager.clients.items.len) {
+                app.mcp_manager.disconnectClient(app.io, app.pickers.mcp.selection);
+            }
+            return true;
+        }
         return false;
     }
 };
