@@ -281,7 +281,7 @@ fn writeToolDefinition(
 fn writeMessage(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMessage) !void {
     try out.writeAll("{\"role\":");
     try std.json.Stringify.value(message.role.label(), .{}, out);
-    if (message.cache_control or message.role == .system) {
+    if (message.role == .system) {
         try out.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}");
     }
     try out.writeAll(",\"content\":");

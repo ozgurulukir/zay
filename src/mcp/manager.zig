@@ -126,9 +126,6 @@ fn discoverToolsForClient(
     }
 
     if (home_dir.len > 0) {
-        if (std.fs.path.join(gpa, &.{ home_dir, ".gemini", "antigravity-cli", "mcp", client.name })) |p| {
-            paths.append(gpa, p) catch {};
-        } else |_| {}
         if (std.fs.path.join(gpa, &.{ home_dir, ".config", "nova", "mcp", client.name })) |p| {
             paths.append(gpa, p) catch {};
         } else |_| {}
