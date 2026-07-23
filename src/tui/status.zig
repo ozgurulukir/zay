@@ -31,7 +31,7 @@ pub fn modelStatus(runtime: ?*const runtime_mod.AgentRuntime, config: config_mod
         }
     }
 
-    const model = if (config.model) |m| m.id else return null;
+    const model = if (config.model_selection) |ms| ms.model.id else return null;
     return .{
         .provider = providerLabel(config) orelse return null,
         .model = model,
@@ -96,7 +96,7 @@ pub fn modifiedTime(io: std.Io, buffer: []u8, updated_at_ms: i64) []const u8 {
 }
 
 fn providerLabel(config: config_mod.Config) ?[]const u8 {
-    const provider = config.provider orelse return null;
+    const provider = if (config.model_selection) |ms| ms.provider else return null;
     return provider.label();
 }
 

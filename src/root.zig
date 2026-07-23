@@ -52,11 +52,19 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
 
     var load_result = try config.load(gpa, init.io, cwd, home_dir, init.environ_map);
     var local_models_handle: ?local_models.Server = null;
-    if (load_result.config.bash_classifier_url == null) {
-        local_models_handle = try local_models.ensure(gpa, init.io, cwd);
-        errdefer if (local_models_handle) |*server| server.deinit(gpa, init.io);
-        if (local_models_handle) |server| {
-            load_result.config.bash_classifier_url = try gpa.dupe(u8, server.url);
+    {
+        const classifier_set = if (load_result.config.model_selection) |*ms|
+            (ms.bash_classifier_url != null)
+        else
+            true;
+        if (!classifier_set) {
+            local_models_handle = try local_models.ensure(gpa, init.io, cwd);
+            errdefer if (local_models_handle) |*server| server.deinit(gpa, init.io);
+            if (local_models_handle) |server| {
+                if (load_result.config.model_selection) |*ms| {
+                    ms.bash_classifier_url = try gpa.dupe(u8, server.url);
+                }
+            }
         }
     }
     defer if (local_models_handle) |*server| server.deinit(gpa, init.io);
@@ -71,7 +79,10 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
 
     defer search.deinit(runtime_gpa, init.io);
 
-    const system_prompt = if (load_result.config.system_prompt) |s| s else @embedFile("prompts/system.md");
+    const system_prompt = if (load_result.config.model_selection) |ms|
+        (ms.system_prompt orelse @embedFile("prompts/system.md"))
+    else
+        @embedFile("prompts/system.md");
     const agent_runtime = try tui_gpa.create(runtime.AgentRuntime);
     errdefer tui_gpa.destroy(agent_runtime);
 

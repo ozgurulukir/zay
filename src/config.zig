@@ -385,12 +385,19 @@ pub const Config = struct {
     }
 };
 
+/// Legacy runtime check. With `model_selection: ?ModelSelection`, the
+/// invariant is encoded in the type: either the selection is fully
+/// populated or it's absent. Kept for callers that still pass a Config
+/// without going through parseObject (tests); it's a no-op when
+/// `model_selection` is set.
 pub fn assertModelSelection(config: *const Config) void {
-    if (config.provider) |_| {
-        assert(config.model != null);
-    } else {
-        assert(config.model == null);
-    }
+    if (config.model_selection) |_| return;
+    // When model_selection is null but the legacy fields are partially
+    // set, that's a programming error. Catch it loudly.
+    assert(config.provider == null);
+    assert(config.model == null);
+    assert(config.base_url == null);
+    assert(config.api_key == null);
 }
 
 pub const Diagnostic = union(enum) {
@@ -504,6 +511,22 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
     if (updates.model) |m| {
         if (target.model) |*old| old.deinit(gpa);
         target.model = try m.clone(gpa);
+    }
+    // When the updates carry a complete `model_selection`, mirror its
+    // fields onto the target's legacy fields so the merge result
+    // (which is hydrated to model_selection via parseObject) round-trips
+    // correctly. parseObject on the merged result will repackage them
+    // into model_selection.
+    if (updates.model_selection) |ms| {
+        target.provider = ms.provider;
+        if (target.model) |*old| old.deinit(gpa);
+        target.model = try ms.model.clone(gpa);
+        try replaceOptionalSlice(gpa, &target.base_url, ms.base_url);
+        try replaceOptionalSlice(gpa, &target.api_key, ms.api_key);
+        target.use_responses_endpoint = ms.use_responses_endpoint;
+        target.enable_thinking = ms.enable_thinking;
+        if (ms.system_prompt) |s| try replaceOptionalSlice(gpa, &target.system_prompt, s);
+        if (ms.bash_classifier_url) |s| try replaceOptionalSlice(gpa, &target.bash_classifier_url, s);
     }
 }
 
@@ -1035,22 +1058,55 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
     try writer.writeAll("{\n  \"version\": 1");
     var wrote_any = true;
 
-    if (config.provider) |p| {
+    // Prefer the typed `model_selection` when present; fall back to
+    // legacy fields for Configs that bypass parseObject (tests).
+    if (config.model_selection) |ms| {
         try writeKey(writer, "provider", &wrote_any);
-        try std.json.Stringify.value(p.label(), .{}, writer);
-    }
-    if (config.use_responses_endpoint) |b| {
-        try writeKey(writer, "use_responses_endpoint", &wrote_any);
-        try writer.writeAll(if (b) "true" else "false");
-    }
-    if (config.enable_thinking) |b| {
-        try writeKey(writer, "enable_thinking", &wrote_any);
-        try writer.writeAll(if (b) "true" else "false");
-    }
-    if (config.model) |m| {
-        if (config.provider) |provider| {
-            try writeKey(writer, "model", &wrote_any);
-            try writeModelSelection(gpa, writer, provider, m.id);
+        try std.json.Stringify.value(ms.provider.label(), .{}, writer);
+        try writeKey(writer, "model", &wrote_any);
+        try writeModelSelection(gpa, writer, ms.provider, ms.model.id);
+        if (ms.use_responses_endpoint) {
+            try writeKey(writer, "use_responses_endpoint", &wrote_any);
+            try writer.writeAll("true");
+        }
+        if (ms.enable_thinking) {
+            try writeKey(writer, "enable_thinking", &wrote_any);
+            try writer.writeAll("true");
+        }
+        if (ms.system_prompt) |s| {
+            try writeKey(writer, "system_prompt", &wrote_any);
+            try std.json.Stringify.value(s, .{}, writer);
+        }
+        if (ms.bash_classifier_url) |url| {
+            try writeKey(writer, "bash_classifier_url", &wrote_any);
+            try std.json.Stringify.value(url, .{}, writer);
+        }
+    } else {
+        if (config.provider) |p| {
+            try writeKey(writer, "provider", &wrote_any);
+            try std.json.Stringify.value(p.label(), .{}, writer);
+        }
+        if (config.use_responses_endpoint) |b| {
+            try writeKey(writer, "use_responses_endpoint", &wrote_any);
+            try writer.writeAll(if (b) "true" else "false");
+        }
+        if (config.enable_thinking) |b| {
+            try writeKey(writer, "enable_thinking", &wrote_any);
+            try writer.writeAll(if (b) "true" else "false");
+        }
+        if (config.model) |m| {
+            if (config.provider) |provider| {
+                try writeKey(writer, "model", &wrote_any);
+                try writeModelSelection(gpa, writer, provider, m.id);
+            }
+        }
+        if (config.system_prompt) |s| {
+            try writeKey(writer, "system_prompt", &wrote_any);
+            try std.json.Stringify.value(s, .{}, writer);
+        }
+        if (config.bash_classifier_url) |url| {
+            try writeKey(writer, "bash_classifier_url", &wrote_any);
+            try std.json.Stringify.value(url, .{}, writer);
         }
     }
     if (config.providers.len > 0) {
@@ -1060,14 +1116,6 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
     if (config.mcp_servers.len > 0) {
         try writeKey(writer, "mcp_servers", &wrote_any);
         try writeMcpServers(writer, config.mcp_servers);
-    }
-    if (config.system_prompt) |s| {
-        try writeKey(writer, "system_prompt", &wrote_any);
-        try std.json.Stringify.value(s, .{}, writer);
-    }
-    if (config.bash_classifier_url) |url| {
-        try writeKey(writer, "bash_classifier_url", &wrote_any);
-        try std.json.Stringify.value(url, .{}, writer);
     }
     try writer.writeAll("\n}\n");
 }

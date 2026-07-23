@@ -138,10 +138,11 @@ pub fn collectModelCacheConfigured(self: *App) !std.ArrayList(model_cache.Config
     }
 
     if (provider_model.shouldLoadConfiguredCompatibleCatalog(self)) {
-        const base_url = self.cached_config.base_url.?;
-        const provider = self.cached_config.provider orelse tui_provider.compatibleProviderFromBaseUrl(base_url);
-        if (!provider.isCatalogue()) {
-            try list.append(self.gpa, .{ .provider = provider, .base_url = base_url, .auth_mode = .keyed });
+        if (self.cached_config.model_selection) |ms| {
+            const provider = ms.provider;
+            if (!provider.isCatalogue()) {
+                try list.append(self.gpa, .{ .provider = provider, .base_url = ms.base_url, .auth_mode = .keyed });
+            }
         }
     }
 

@@ -2176,9 +2176,12 @@ test "local providers are not loaded twice through configured compatible catalog
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    app.cached_config.provider = .ollama;
-    app.cached_config.base_url = @constCast("http://localhost:11434");
-    app.cached_config.api_key = @constCast("ollama");
+    app.cached_config.model_selection = .{
+        .provider = .ollama,
+        .base_url = @constCast("http://localhost:11434"),
+        .api_key = @constCast("ollama"),
+        .model = .{ .id = @constCast("test") },
+    };
 
     try std.testing.expect(!provider_model.shouldLoadConfiguredCompatibleCatalog(&app));
 }
@@ -2216,8 +2219,12 @@ test "compatible base url falls back when cached local provider differs" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    app.cached_config.provider = .llama_cpp;
-    app.cached_config.base_url = @constCast("http://localhost:11434");
+    app.cached_config.model_selection = .{
+        .provider = .llama_cpp,
+        .base_url = @constCast("http://localhost:11434"),
+        .api_key = @constCast(""),
+        .model = .{ .id = @constCast("test") },
+    };
 
     try std.testing.expectEqualStrings("http://localhost:8080", provider_model.compatibleBaseUrl(&app, .llama_cpp).?);
     try std.testing.expectEqualStrings("http://localhost:11434", provider_model.compatibleBaseUrl(&app, .ollama).?);
@@ -2250,13 +2257,17 @@ test "codex sign-in survives selecting local compatible provider" {
     try app.pickers.models.append(gpa, .{ .id = try gpa.dupe(u8, "llama3"), .label = try gpa.dupe(u8, "llama3") }, .{ .openai_compatible = .ollama });
     app.pickers.models.model_selection = 0;
     app.cached_config_owned = true;
-    app.cached_config.base_url = try gpa.dupe(u8, "http://localhost:11434/v1");
-    app.cached_config.api_key = try gpa.dupe(u8, "ollama");
+    app.cached_config.model_selection = .{
+        .provider = .openai_compatible,
+        .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
+        .api_key = try gpa.dupe(u8, "ollama"),
+        .model = .{ .id = try gpa.dupe(u8, "placeholder") },
+    };
 
     try provider_model.applySelectedModel(&app);
 
     try std.testing.expect(app.isCodexSignedIn());
-    try std.testing.expectEqual(config_mod.Provider.ollama, app.cached_config.provider.?);
+    try std.testing.expectEqual(config_mod.Provider.ollama, app.cached_config.model_selection.?.provider);
 }
 
 test "switching from codex to catalogue provider resets cached connection" {
@@ -2288,15 +2299,19 @@ test "switching from codex to catalogue provider resets cached connection" {
     try app.pickers.models.append(gpa, .{ .id = try gpa.dupe(u8, "zen"), .label = try gpa.dupe(u8, "zen") }, .{ .openai_compatible = .opencode_zen });
     app.pickers.models.model_selection = 0;
     app.cached_config_owned = true;
-    app.cached_config.provider = .openai;
-    app.cached_config.base_url = try gpa.dupe(u8, "https://chatgpt.com/backend-api");
-    app.cached_config.api_key = try gpa.dupe(u8, "stale-codex-key");
+    app.cached_config.model_selection = .{
+        .provider = .openai,
+        .base_url = try gpa.dupe(u8, "https://chatgpt.com/backend-api"),
+        .api_key = try gpa.dupe(u8, "stale-codex-key"),
+        .model = .{ .id = try gpa.dupe(u8, "placeholder") },
+    };
 
     try provider_model.applySelectedModel(&app);
 
-    try std.testing.expectEqual(config_mod.Provider.opencode_zen, app.cached_config.provider.?);
-    try std.testing.expectEqualStrings("https://opencode.ai/zen/v1", app.cached_config.base_url.?);
-    try std.testing.expectEqual(@as(?[]u8, null), app.cached_config.api_key);
+    const ms = app.cached_config.model_selection.?;
+    try std.testing.expectEqual(config_mod.Provider.opencode_zen, ms.provider);
+    try std.testing.expectEqualStrings("https://opencode.ai/zen/v1", ms.base_url);
+    try std.testing.expectEqualStrings("", ms.api_key);
     try std.testing.expectEqualStrings("https://opencode.ai/zen/v1/chat/completions", runtime.client.openai_compatible.url);
 }
 
@@ -2311,8 +2326,12 @@ test "active model appears at display position 0 without mutating storage" {
     defer app.deinit();
     const active_model_id = try gpa.dupe(u8, "gpt-5.4-mini");
     defer gpa.free(active_model_id);
-    app.cached_config.provider = .openai;
-    app.cached_config.model = .{ .id = active_model_id };
+    app.cached_config.model_selection = .{
+        .provider = .openai,
+        .base_url = @constCast(""),
+        .api_key = @constCast(""),
+        .model = .{ .id = active_model_id },
+    };
 
     try provider_model.reloadModelCatalog(&app, .openai_codex);
 
@@ -2401,7 +2420,14 @@ test "expired codex connection reports reconnect message" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
-    app.cached_config = .{ .provider = .openai };
+    app.cached_config = .{
+        .model_selection = .{
+            .provider = .openai,
+            .base_url = @constCast(""),
+            .api_key = @constCast(""),
+            .model = .{ .id = @constCast("test") },
+        },
+    };
 
     const message = try app.formatNoProviderMessage();
     defer gpa.free(message);
@@ -2612,15 +2638,19 @@ test "model selection is allowed after interrupt" {
     try app.pickers.models.append(gpa, .{ .id = try gpa.dupe(u8, "llama3"), .label = try gpa.dupe(u8, "llama3") }, .{ .openai_compatible = .ollama });
     app.pickers.models.model_selection = 0;
     app.cached_config_owned = true;
-    app.cached_config.base_url = try gpa.dupe(u8, "http://localhost:11434/v1");
-    app.cached_config.api_key = try gpa.dupe(u8, "ollama");
+    app.cached_config.model_selection = .{
+        .provider = .openai_compatible,
+        .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
+        .api_key = try gpa.dupe(u8, "ollama"),
+        .model = .{ .id = try gpa.dupe(u8, "placeholder") },
+    };
     app.thread.turn.submit();
     app.thread.turn.interrupt();
 
     try provider_model.applySelectedModel(&app);
 
     try std.testing.expectEqual(Turn.State.idle, app.thread.turn.state);
-    try std.testing.expectEqual(config_mod.Provider.ollama, app.cached_config.provider.?);
+    try std.testing.expectEqual(config_mod.Provider.ollama, app.cached_config.model_selection.?.provider);
 }
 
 test "interrupt restart flushes queued messages to the transcript when no provider" {

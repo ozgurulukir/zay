@@ -51,14 +51,14 @@ fn submitGeneralItem(app: *App, state: *State) !void {
         0 => {
             // Toggle enable_thinking. Pending value overrides the config.
             const current = state.pending_enable_thinking orelse
-                (app.cached_config.enable_thinking orelse false);
+                (if (app.cached_config.model_selection) |ms| ms.enable_thinking else false);
             state.pending_enable_thinking = !current;
             state.dirty = true;
         },
         1 => {
             // Toggle use_responses_endpoint.
             const current = state.pending_use_responses_endpoint orelse
-                (app.cached_config.use_responses_endpoint orelse false);
+                (if (app.cached_config.model_selection) |ms| ms.use_responses_endpoint else false);
             state.pending_use_responses_endpoint = !current;
             state.dirty = true;
         },
@@ -71,7 +71,10 @@ fn submitPromptItem(app: *App, state: *State) void {
         0 => {
             // Enter edit mode for system prompt.
             state.edit_target = .system_prompt;
-            const current = app.cached_config.system_prompt orelse "";
+            const current = if (app.cached_config.model_selection) |ms|
+                (ms.system_prompt orelse "")
+            else
+                "";
             app.settings_text_input.clearRetainingCapacity();
             app.settings_text_input.appendSlice(app.gpa, current) catch {};
         },
@@ -84,7 +87,10 @@ fn submitAdvancedItem(app: *App, state: *State) void {
         0 => {
             // Enter edit mode for bash_classifier_url.
             state.edit_target = .bash_classifier_url;
-            const current = app.cached_config.bash_classifier_url orelse "";
+            const current = if (app.cached_config.model_selection) |ms|
+                (ms.bash_classifier_url orelse "")
+            else
+                "";
             app.settings_text_input.clearRetainingCapacity();
             app.settings_text_input.appendSlice(app.gpa, current) catch {};
         },
@@ -105,14 +111,16 @@ pub fn clearCurrentField(app: *App) void {
                 app.gpa.free(old);
                 state.pending_system_prompt = null;
             }
-            if (app.cached_config.system_prompt != null) state.dirty = true;
+            if (app.cached_config.model_selection != null and
+                app.cached_config.model_selection.?.system_prompt != null) state.dirty = true;
         },
         .advanced => {
             if (state.pending_bash_classifier_url) |old| {
                 app.gpa.free(old);
                 state.pending_bash_classifier_url = null;
             }
-            if (app.cached_config.bash_classifier_url != null) state.dirty = true;
+            if (app.cached_config.model_selection != null and
+                app.cached_config.model_selection.?.bash_classifier_url != null) state.dirty = true;
         },
         .general, .about => {},
     }
@@ -131,17 +139,30 @@ pub fn saveSettings(app: *App) !bool {
     // Flush any in-progress text edit before saving.
     if (state.edit_target != .none) try commitTextEdit(app);
 
+    // Build the updates from the cached model_selection (so the merge
+    // preserves the full selection) plus the pending toggles/text fields.
+    // We mutate the model_selection copy rather than carrying both forms.
     var updates: config_mod.Config = .{};
     defer updates.deinit(app.gpa);
-
-    if (state.pending_enable_thinking) |v| updates.enable_thinking = v;
-    if (state.pending_use_responses_endpoint) |v| updates.use_responses_endpoint = v;
+    if (app.cached_config.model_selection) |ms| {
+        updates.model_selection = try ms.clone(app.gpa);
+    }
+    if (state.pending_enable_thinking) |v| {
+        if (updates.model_selection) |*ms| ms.enable_thinking = v;
+    }
+    if (state.pending_use_responses_endpoint) |v| {
+        if (updates.model_selection) |*ms| ms.use_responses_endpoint = v;
+    }
     if (state.pending_system_prompt) |s| {
-        updates.system_prompt = try app.gpa.dupe(u8, s);
+        if (updates.model_selection) |*ms| {
+            if (ms.system_prompt) |old| app.gpa.free(old);
+            ms.system_prompt = try app.gpa.dupe(u8, s);
+        }
     }
     if (state.pending_bash_classifier_url) |s| {
-        if (s.len > 0) {
-            updates.bash_classifier_url = try app.gpa.dupe(u8, s);
+        if (updates.model_selection) |*ms| {
+            if (ms.bash_classifier_url) |old| app.gpa.free(old);
+            ms.bash_classifier_url = if (s.len > 0) try app.gpa.dupe(u8, s) else null;
         }
     }
 
@@ -195,15 +216,17 @@ fn commitTextEdit(app: *App) !void {
 
 fn applyToCachedConfig(app: *App, state: *const State) !void {
     if (!app.cached_config_owned) return;
-    if (state.pending_enable_thinking) |v| app.cached_config.enable_thinking = v;
-    if (state.pending_use_responses_endpoint) |v| app.cached_config.use_responses_endpoint = v;
-    if (state.pending_system_prompt) |s| {
-        if (app.cached_config.system_prompt) |old| app.gpa.free(old);
-        app.cached_config.system_prompt = try app.gpa.dupe(u8, s);
-    }
-    if (state.pending_bash_classifier_url) |s| {
-        if (app.cached_config.bash_classifier_url) |old| app.gpa.free(old);
-        app.cached_config.bash_classifier_url = if (s.len > 0) try app.gpa.dupe(u8, s) else null;
+    if (app.cached_config.model_selection) |*ms| {
+        if (state.pending_enable_thinking) |v| ms.enable_thinking = v;
+        if (state.pending_use_responses_endpoint) |v| ms.use_responses_endpoint = v;
+        if (state.pending_system_prompt) |s| {
+            if (ms.system_prompt) |old| app.gpa.free(old);
+            ms.system_prompt = try app.gpa.dupe(u8, s);
+        }
+        if (state.pending_bash_classifier_url) |s| {
+            if (ms.bash_classifier_url) |old| app.gpa.free(old);
+            ms.bash_classifier_url = if (s.len > 0) try app.gpa.dupe(u8, s) else null;
+        }
     }
 }
 

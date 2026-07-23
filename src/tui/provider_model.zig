@@ -322,11 +322,12 @@ pub fn collectConfiguredProviders(self: *App, catalog: ModelCatalog) ![]model_lo
             }
         }
         if (shouldLoadConfiguredCompatibleCatalog(self)) {
-            const base_url = self.cached_config.base_url.?;
-            const provider = self.cached_config.provider orelse tui_provider.compatibleProviderFromBaseUrl(base_url);
+            const ms = self.cached_config.model_selection orelse return list.toOwnedSlice(self.gpa);
+            const base_url = ms.base_url;
+            const provider = ms.provider;
             // Catalogue providers are already covered by the auth.json keys above.
             if (!provider.isCatalogue()) {
-                try appendConfigured(self, &list, provider, base_url, self.cached_config.api_key.?);
+                try appendConfigured(self, &list, provider, base_url, ms.api_key);
             }
         }
     }
@@ -663,10 +664,23 @@ pub fn updateCachedModelSelection(
     const new_id = try self.gpa.dupe(u8, model_id);
     errdefer self.gpa.free(new_id);
     if (self.cached_config_owned) {
-        if (self.cached_config.model) |*old| old.deinit(self.gpa);
-        self.cached_config.provider = provider;
-        self.cached_config.model = .{ .id = new_id, .reasoning_effort = effort };
-        try updateCachedProviderConnection(self, provider);
+        if (self.cached_config.model_selection) |*ms| {
+            ms.model.deinit(self.gpa);
+            ms.provider = provider;
+            ms.model = .{ .id = new_id, .reasoning_effort = effort };
+            try updateCachedProviderConnection(self, provider);
+        } else {
+            // No selection yet — bootstrap a minimal one. base_url and
+            // api_key come from the provider's defaults.
+            const base_url = provider.defaultBaseUrl() orelse "";
+            self.cached_config.model_selection = .{
+                .provider = provider,
+                .model = .{ .id = new_id, .reasoning_effort = effort },
+                .base_url = try self.gpa.dupe(u8, base_url),
+                .api_key = try self.gpa.dupe(u8, ""),
+            };
+            try updateCachedProviderConnection(self, provider);
+        }
     } else {
         self.gpa.free(new_id);
     }
@@ -683,13 +697,23 @@ pub fn updateCachedProviderConnection(self: *App, provider: config_mod.Provider)
 pub fn replaceCachedBaseUrl(self: *App, base_url: []const u8) !void {
     const owned = try self.gpa.dupe(u8, base_url);
     errdefer self.gpa.free(owned);
-    if (self.cached_config.base_url) |old| self.gpa.free(old);
-    self.cached_config.base_url = owned;
+    if (self.cached_config.model_selection) |*ms| {
+        self.gpa.free(ms.base_url);
+        ms.base_url = owned;
+    } else {
+        self.gpa.free(owned);
+    }
 }
 
 pub fn clearCachedApiKey(self: *App) void {
-    if (self.cached_config.api_key) |old| self.gpa.free(old);
-    self.cached_config.api_key = null;
+    if (self.cached_config.model_selection) |*ms| {
+        // Replace with empty string (api_key is non-optional in
+        // ModelSelection; clearing means the user will be prompted
+        // again). The previous key is freed.
+        const new_key = self.gpa.dupe(u8, "") catch return;
+        self.gpa.free(ms.api_key);
+        ms.api_key = new_key;
+    }
 }
 
 pub fn modelSelectionUpdates(

@@ -139,7 +139,8 @@ pub fn formatNoProviderMessage(app: *App) ![]u8 {
             }
         }
     }
-    if (app.cached_config.provider) |p| {
+    if (app.cached_config.model_selection) |ms| {
+        const p = ms.provider;
         if (p.adapter() == null) {
             return std.fmt.allocPrint(
                 app.gpa,

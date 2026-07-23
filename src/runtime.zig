@@ -167,8 +167,10 @@ pub const AgentRuntime = struct {
         target.agent = agent_mod.Agent.init(gpa, io, cwd, .none);
         errdefer target.agent.deinit();
         target.agent.skills = target.skills;
-        if (config.bash_classifier_url) |url| {
-            target.agent.bash_classifier_url = try gpa.dupe(u8, url);
+        if (config.model_selection) |ms| {
+            if (ms.bash_classifier_url) |url| {
+                target.agent.bash_classifier_url = try gpa.dupe(u8, url);
+            }
         }
         target.agent.attachSessionWriter(&target.session_writer);
         try target.agent.addSystem(owned_system_prompt);
@@ -246,7 +248,9 @@ pub const AgentRuntime = struct {
     fn adapterForConfig(provider: config_mod.Provider, config: config_mod.Config) ?config_mod.AdapterKind {
         const adapter = provider.adapter() orelse return null;
         if (adapter == .openai_compatible) {
-            if (config.use_responses_endpoint orelse false) return .openai_responses;
+            if (config.model_selection) |ms| {
+                if (ms.use_responses_endpoint) return .openai_responses;
+            }
         }
         return adapter;
     }
@@ -257,8 +261,9 @@ pub const AgentRuntime = struct {
         defer creds.deinit(self.gpa);
         try self.refreshCodexCredentialsIfNeeded(&creds);
         if (self.codex_connection_expired) return;
-        const model_id = if (config.model) |m| m.id else "gpt-5.5";
-        const effort = if (config.model) |m| (m.reasoning_effort orelse .medium) else .medium;
+        const ms = config.model_selection orelse return;
+        const model_id = ms.model.id;
+        const effort = ms.model.reasoning_effort orelse .medium;
         try self.connectCodexClient(creds, model_id, effort);
     }
 
@@ -286,12 +291,18 @@ pub const AgentRuntime = struct {
         provider: config_mod.Provider,
         config: config_mod.Config,
     ) !void {
-        const base_url = config.base_url orelse provider.defaultBaseUrl() orelse return;
-        const model = config.model orelse return;
-        const effort = model.reasoning_effort orelse .medium;
+        const ms = config.model_selection orelse {
+            // Fall back to provider defaults when no typed selection exists.
+            const base_url = provider.defaultBaseUrl() orelse return;
+            try self.attachOpenAiCompatibleClient(base_url, "", "default", .medium);
+            return;
+        };
+        const base_url = ms.base_url;
+        const effort = ms.model.reasoning_effort orelse .medium;
         var loaded_key: ?[]u8 = null;
         defer if (loaded_key) |k| self.gpa.free(k);
-        const api_key = config.api_key orelse blk: {
+        const api_key = blk: {
+            if (ms.api_key.len > 0) break :blk ms.api_key;
             if (provider.isCatalogue() and self.home_dir.len > 0) {
                 loaded_key = codex_mod.loadProviderApiKey(self.gpa, self.io, self.home_dir, provider.label()) catch null;
                 if (loaded_key) |k| break :blk k;
@@ -300,7 +311,7 @@ pub const AgentRuntime = struct {
             // `public`) when the provider supports it, else send no key.
             break :blk provider.anonymousApiKey() orelse "";
         };
-        try self.attachOpenAiCompatibleClient(base_url, api_key, model.id, effort);
+        try self.attachOpenAiCompatibleClient(base_url, api_key, ms.model.id, effort);
     }
 
     fn tryAttachOpenAiResponsesFromConfig(
@@ -308,14 +319,13 @@ pub const AgentRuntime = struct {
         provider: config_mod.Provider,
         config: config_mod.Config,
     ) !void {
-        const base_url = config.base_url orelse provider.defaultBaseUrl() orelse return;
-        const api_key = config.api_key orelse "";
-        const model_id = if (config.model) |m| m.id else return;
-        const reasoning: ai.Reasoning = if (config.model) |m|
-            .{ .effort = m.reasoning_effort orelse .medium, .summary = .auto }
-        else
-            .{};
-        try self.attachOpenAiResponsesClient(base_url, api_key, model_id, reasoning);
+        _ = provider;
+        const ms = config.model_selection orelse return;
+        const reasoning: ai.Reasoning = .{
+            .effort = ms.model.reasoning_effort orelse .medium,
+            .summary = .auto,
+        };
+        try self.attachOpenAiResponsesClient(ms.base_url, ms.api_key, ms.model.id, reasoning);
     }
 
     /// Establish a Codex session — uses OAuth credentials to identify
@@ -637,7 +647,15 @@ test "codex refresh starts before token expiry" {
 }
 
 test "runtime selects responses adapter when requested" {
-    const config: config_mod.Config = .{ .use_responses_endpoint = true };
+    const config: config_mod.Config = .{
+        .model_selection = .{
+            .provider = .openai_compatible,
+            .base_url = @constCast(""),
+            .api_key = @constCast(""),
+            .model = .{ .id = @constCast("test") },
+            .use_responses_endpoint = true,
+        },
+    };
     try std.testing.expectEqual(
         config_mod.AdapterKind.openai_responses,
         AgentRuntime.adapterForConfig(.openai_compatible, config).?,

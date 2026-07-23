@@ -225,7 +225,8 @@ pub const Content = struct {
         {
             const selected = sel == 0;
             if (selected) panel.fillRow(surface, 4, StylePalette.selected);
-            const value = self.state.pending_enable_thinking orelse self.config.enable_thinking orelse false;
+            const value = self.state.pending_enable_thinking orelse
+                (if (self.config.model_selection) |ms| ms.enable_thinking else false);
             const label = try std.fmt.allocPrint(ctx.arena, "  Enable Thinking Mode    {s}", .{boolBadge(value)});
             const style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;
             try panel.lineStyledAt(surface, 4, label, ctx, left_col, style);
@@ -237,7 +238,8 @@ pub const Content = struct {
         {
             const selected = sel == 1;
             if (selected) panel.fillRow(surface, 7, StylePalette.selected);
-            const value = self.state.pending_use_responses_endpoint orelse self.config.use_responses_endpoint orelse false;
+            const value = self.state.pending_use_responses_endpoint orelse
+                (if (self.config.model_selection) |ms| ms.use_responses_endpoint else false);
             const label = try std.fmt.allocPrint(ctx.arena, "  Use Responses Endpoint  {s}", .{boolBadge(value)});
             const style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;
             try panel.lineStyledAt(surface, 7, label, ctx, left_col, style);
@@ -274,7 +276,11 @@ pub const Content = struct {
         const text = if (is_editing)
             self.system_prompt_input
         else
-            (self.state.pending_system_prompt orelse (self.config.system_prompt orelse ""));
+            self.state.pending_system_prompt orelse
+                (if (self.config.model_selection) |ms|
+                    (ms.system_prompt orelse "")
+                else
+                    "");
 
         try drawWrappedText(surface, ctx, 6, left_col + 1, surface.size.width -| left_col -| 4, text, 5, StylePalette.info);
 
@@ -305,7 +311,11 @@ pub const Content = struct {
             const url_text = if (is_editing)
                 self.bash_classifier_input
             else
-                (self.state.pending_bash_classifier_url orelse (self.config.bash_classifier_url orelse ""));
+                self.state.pending_bash_classifier_url orelse
+                    (if (self.config.model_selection) |ms|
+                        (ms.bash_classifier_url orelse "")
+                    else
+                        "");
             const style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;
             const label = "  Bash Classifier URL";
             try panel.lineStyledAt(surface, 4, label, ctx, left_col, style);
