@@ -16,3 +16,5 @@ vendor/fff/libfff_c.so
 vendor/local-models/
 .code-tandem/
 .opencode/refactor.md
+_pm/
+type-safety-refactor.md
