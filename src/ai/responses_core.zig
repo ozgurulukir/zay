@@ -311,7 +311,8 @@ fn writeFunctionCall(out: *std.Io.Writer, call: ai.ToolCall) !void {
     try out.writeAll(",\"name\":");
     try std.json.Stringify.value(call.name, .{}, out);
     try out.writeAll(",\"arguments\":");
-    try std.json.Stringify.value(call.arguments, .{}, out);
+    const args = if (call.arguments.len == 0) "{}" else call.arguments;
+    try std.json.Stringify.value(args, .{}, out);
     try out.writeByte('}');
 }
 

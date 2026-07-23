@@ -185,17 +185,17 @@ pub const TreeState = struct {
         while (stack.pop()) |frame| {
             const record = records[frame.index];
             const summary = try session_mod.entrySummary(self.gpa, record);
-            errdefer self.gpa.free(summary.text);
+            errdefer self.gpa.free(summary.text());
             const is_leaf = effective_leaf != null and std.mem.eql(u8, record.id[0..], effective_leaf.?[0..]);
             try nodes.append(self.gpa, .{
                 .id = record.id,
                 .parent_id = record.parent_id,
-                .kind = summary.kind,
-                .tool_failed = summary.tool_failed,
+                .kind = summary.kind(),
+                .tool_failed = summary.toolFailed(),
                 .on_active_path = active.contains(record.id),
                 .is_leaf = is_leaf,
                 .has_snapshot = record.snapshot != null,
-                .text = summary.text,
+                .text = summary.text(),
             });
             const kids = children[frame.index].items;
             var kid_index = kids.len;

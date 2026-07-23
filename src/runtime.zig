@@ -5,6 +5,7 @@ const ai = @import("ai.zig");
 const codex_mod = @import("codex.zig");
 const compaction = @import("compaction.zig");
 const config_mod = @import("config.zig");
+const context_assembly = @import("context_assembly.zig");
 const os = @import("os.zig");
 const session_mod = @import("session.zig");
 const skill_mod = @import("skill.zig");
@@ -615,31 +616,7 @@ fn createSystemPromptWithContext(
     cwd: []const u8,
     skills: []const skill_mod.Skill,
 ) ![]u8 {
-    const system_prompt = try createSystemPrompt(gpa, base_system_prompt, cwd);
-    errdefer gpa.free(system_prompt);
-
-    const maybe_context = try readContextFile(gpa, io, cwd);
-    defer if (maybe_context) |context| gpa.free(context);
-    const skill_prompt = try skill_mod.formatForPrompt(gpa, skills);
-    defer gpa.free(skill_prompt);
-
-    if (maybe_context) |context| {
-        const combined = try std.fmt.allocPrint(
-            gpa,
-            "{s}\n\n<project_instructions path=\"AGENTS.md\">\n{s}\n</project_instructions>\n{s}",
-            .{ system_prompt, context, skill_prompt },
-        );
-        gpa.free(system_prompt);
-        return combined;
-    }
-
-    if (skill_prompt.len > 0) {
-        const combined = try std.fmt.allocPrint(gpa, "{s}{s}", .{ system_prompt, skill_prompt });
-        gpa.free(system_prompt);
-        return combined;
-    }
-
-    return system_prompt;
+    return context_assembly.assembleSystemPrompt(gpa, io, base_system_prompt, cwd, skills);
 }
 
 fn codexRefreshNeeded(expires_ms: i64, now_ms: i64) bool {

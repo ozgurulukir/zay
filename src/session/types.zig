@@ -161,9 +161,46 @@ pub const EntryKind = enum {
     other,
 };
 
-pub const EntrySummary = struct {
-    kind: EntryKind,
-    tool_failed: bool = false,
-    /// One-line display text, owned by the caller.
-    text: []u8,
+pub const EntrySummary = union(enum) {
+    user: struct { text: []u8 },
+    assistant: struct { text: []u8 },
+    assistant_empty: struct { text: []u8 },
+    tool: struct { text: []u8, failed: bool },
+    branch_summary: struct { text: []u8 },
+    session_info: struct { text: []u8 },
+    checkpoint: struct { text: []u8 },
+    other: struct { text: []u8 },
+
+    pub fn deinit(self: *EntrySummary, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            inline else => |info| gpa.free(info.text),
+        }
+        self.* = undefined;
+    }
+
+    pub fn text(self: EntrySummary) []u8 {
+        return switch (self) {
+            inline else => |info| info.text,
+        };
+    }
+
+    pub fn kind(self: EntrySummary) EntryKind {
+        return switch (self) {
+            .user => .user,
+            .assistant => .assistant,
+            .assistant_empty => .assistant_empty,
+            .tool => .tool,
+            .branch_summary => .branch_summary,
+            .session_info => .session_info,
+            .checkpoint => .checkpoint,
+            .other => .other,
+        };
+    }
+
+    pub fn toolFailed(self: EntrySummary) bool {
+        return switch (self) {
+            .tool => |t| t.failed,
+            else => false,
+        };
+    }
 };

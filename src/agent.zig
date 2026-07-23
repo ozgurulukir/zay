@@ -6,6 +6,7 @@ const at_mention = @import("at_mention.zig");
 const background_mod = @import("background.zig");
 const compaction = @import("compaction.zig");
 const context_mod = @import("context.zig");
+const context_assembly = @import("context_assembly.zig");
 const executor_mod = @import("executor.zig");
 const session_mod = @import("session.zig");
 const skill_mod = @import("skill.zig");
@@ -327,7 +328,15 @@ pub const Agent = struct {
                 .listener = listener,
             };
             defer stream_context.deinit();
-            var turn = try self.client.prompt(self.messages(), .{
+            const prompt_messages = try context_assembly.pruneHistoricalToolResults(
+                self.gpa,
+                self.messages(),
+                context_assembly.default_keep_recent_tool_turns,
+                context_assembly.default_historical_tool_cap_bytes,
+            );
+            defer context_assembly.freePrunedMessages(self.gpa, prompt_messages);
+
+            var turn = try self.client.prompt(prompt_messages, .{
                 .ptr = &stream_context,
                 .on_content = onContentDelta,
                 .on_reasoning = onReasoningDelta,

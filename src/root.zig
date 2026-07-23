@@ -12,6 +12,7 @@ pub const codex = @import("codex.zig");
 pub const compaction = @import("compaction.zig");
 pub const config = @import("config.zig");
 pub const context = @import("context.zig");
+pub const context_assembly = @import("context_assembly.zig");
 pub const db = @import("db.zig");
 pub const executor = @import("executor.zig");
 pub const os = @import("os.zig");

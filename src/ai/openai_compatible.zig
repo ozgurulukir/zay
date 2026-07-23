@@ -353,7 +353,8 @@ fn writeToolCall(out: *std.Io.Writer, tool_call: ai.ToolCall) !void {
     try out.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
     try std.json.Stringify.value(tool_call.name, .{}, out);
     try out.writeAll(",\"arguments\":");
-    try std.json.Stringify.value(tool_call.arguments, .{}, out);
+    const args = if (tool_call.arguments.len == 0) "{}" else tool_call.arguments;
+    try std.json.Stringify.value(args, .{}, out);
     try out.writeAll("}}");
 }
 

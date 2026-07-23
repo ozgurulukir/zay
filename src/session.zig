@@ -1018,34 +1018,34 @@ fn renderCompactionPrefix(gpa: std.mem.Allocator, path: []const EntryRecord, bou
 pub fn entrySummary(gpa: std.mem.Allocator, record: EntryRecord) Error!EntrySummary {
     const display_max: u32 = 120;
     if (std.mem.eql(u8, record.kind, "branch_summary")) {
-        return .{ .kind = .branch_summary, .text = try gpa.dupe(u8, "branch summary") };
+        return .{ .branch_summary = .{ .text = try gpa.dupe(u8, "branch summary") } };
     }
     if (std.mem.eql(u8, record.kind, "session_info")) {
         const parsed = std.json.parseFromSlice(std.json.Value, gpa, record.payload_json, .{}) catch
-            return .{ .kind = .session_info, .text = try gpa.dupe(u8, "title") };
+            return .{ .session_info = .{ .text = try gpa.dupe(u8, "title") } };
         defer parsed.deinit();
         if (parsed.value == .object) {
             if (parsed.value.object.get("title")) |title| {
                 if (title == .string) {
                     const collapsed = try collapseWhitespace(gpa, title.string, display_max);
                     defer gpa.free(collapsed);
-                    return .{ .kind = .session_info, .text = try std.fmt.allocPrint(gpa, "title: {s}", .{collapsed}) };
+                    return .{ .session_info = .{ .text = try std.fmt.allocPrint(gpa, "title: {s}", .{collapsed}) } };
                 }
             }
         }
-        return .{ .kind = .session_info, .text = try gpa.dupe(u8, "title") };
+        return .{ .session_info = .{ .text = try gpa.dupe(u8, "title") } };
     }
     if (std.mem.eql(u8, record.kind, "checkpoint")) {
-        return .{ .kind = .checkpoint, .text = try gpa.dupe(u8, "checkpoint") };
+        return .{ .checkpoint = .{ .text = try gpa.dupe(u8, "checkpoint") } };
     }
     if (!std.mem.eql(u8, record.kind, "message")) {
-        return .{ .kind = .other, .text = try gpa.dupe(u8, record.kind) };
+        return .{ .other = .{ .text = try gpa.dupe(u8, record.kind) } };
     }
 
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, record.payload_json, .{}) catch
-        return .{ .kind = .other, .text = try gpa.dupe(u8, "message") };
+        return .{ .other = .{ .text = try gpa.dupe(u8, "message") } };
     defer parsed.deinit();
-    if (parsed.value != .object) return .{ .kind = .other, .text = try gpa.dupe(u8, "message") };
+    if (parsed.value != .object) return .{ .other = .{ .text = try gpa.dupe(u8, "message") } };
     const object = parsed.value.object;
 
     const role = if (object.get("role")) |value| (if (value == .string) value.string else "") else "";
@@ -1053,25 +1053,30 @@ pub fn entrySummary(gpa: std.mem.Allocator, record: EntryRecord) Error!EntrySumm
         const tool_failed = if (object.get("tool_failed")) |field| field == .bool and field.bool else false;
         if (object.get("tool_display_label")) |label| {
             if (label == .string and label.string.len > 0) {
-                return .{ .kind = .tool, .tool_failed = tool_failed, .text = try collapseWhitespace(gpa, label.string, display_max) };
+                return .{ .tool = .{ .text = try collapseWhitespace(gpa, label.string, display_max), .failed = tool_failed } };
             }
         }
-        return .{ .kind = .tool, .tool_failed = tool_failed, .text = try gpa.dupe(u8, "tool result") };
+        return .{ .tool = .{ .text = try gpa.dupe(u8, "tool result"), .failed = tool_failed } };
     }
 
     const is_user = std.mem.eql(u8, role, "user");
     const prefix = if (is_user) "you: " else "agent: ";
     const text = firstTextBlock(object);
     if (text.len == 0) {
-        const kind: EntryKind = if (is_user) .user else .assistant_empty;
-        return .{ .kind = kind, .text = try gpa.dupe(u8, std.mem.trimEnd(u8, prefix, " :")) };
+        if (is_user) {
+            return .{ .user = .{ .text = try gpa.dupe(u8, std.mem.trimEnd(u8, prefix, " :")) } };
+        } else {
+            return .{ .assistant_empty = .{ .text = try gpa.dupe(u8, std.mem.trimEnd(u8, prefix, " :")) } };
+        }
     }
     const collapsed = try collapseWhitespace(gpa, text, display_max);
     defer gpa.free(collapsed);
-    return .{
-        .kind = if (is_user) .user else .assistant,
-        .text = try std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, collapsed }),
-    };
+    const allocated_text = try std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, collapsed });
+    if (is_user) {
+        return .{ .user = .{ .text = allocated_text } };
+    } else {
+        return .{ .assistant = .{ .text = allocated_text } };
+    }
 }
 
 /// First `text` block of a message's content array, or "" if none.

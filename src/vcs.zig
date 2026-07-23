@@ -203,6 +203,16 @@ pub fn isRepo(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) bool {
     return std.mem.eql(u8, std.mem.trim(u8, out.stdout, " \t\r\n"), "true");
 }
 
+/// Get the current git branch name of `dir`, or null if detached / not a repo.
+/// Caller owns the returned slice.
+pub fn currentBranch(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ?[]u8 {
+    const out = runOut(gpa, io, dir, &.{ "rev-parse", "--abbrev-ref", "HEAD" }, null) catch return null;
+    defer gpa.free(out);
+    const trimmed = std.mem.trim(u8, out, " \t\r\n");
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "HEAD")) return null;
+    return gpa.dupe(u8, trimmed) catch null;
+}
+
 /// Whether the working tree of `dir` has any change versus HEAD (tracked edits
 /// or new non-ignored files). Backs `/save`'s "nothing to save" guard.
 pub fn workingTreeDirty(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) CmdError!bool {
