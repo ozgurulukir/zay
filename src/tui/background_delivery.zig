@@ -45,8 +45,13 @@ pub fn pollBackgroundJobs(app: *App) !bool {
         // frees the metadata.
         const message = job.completion_message;
         job.completion_message = null;
+        // Layer crossing: `background.BackgroundManager.Finished.owner` is
+        // `*anyopaque` (the manager is layer-agnostic about which agent
+        // owns a job). The TUI, which knows the agent, types the owner
+        // here — one explicit cast at the boundary, none at the use site.
+        const owner: *tui.Agent = @ptrCast(@alignCast(job.owner));
         app.background_modal_state.pending.append(app.gpa, .{
-            .owner = job.owner,
+            .owner = owner,
             .notice = notice,
             .message = message,
         }) catch {
@@ -84,7 +89,7 @@ pub fn deliverPendingBackground(app: *App) !bool {
     var i: usize = 0;
     while (i < app.background_modal_state.pending.items.len) {
         const delivery = &app.background_modal_state.pending.items[i];
-        const lane = app.laneForAgent(@ptrCast(@alignCast(delivery.owner))) orelse {
+        const lane = app.laneForAgent(delivery.owner) orelse {
             freeDelivery(app, delivery);
             _ = app.background_modal_state.pending.orderedRemove(i);
             continue;

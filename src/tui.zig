@@ -7,6 +7,7 @@ const ai = @import("ai.zig");
 const at_mention = @import("at_mention.zig");
 pub const background_mod = @import("background.zig");
 pub const BackgroundDelivery = app_state.BackgroundModalState.BackgroundDelivery;
+pub const Agent = agent_mod.Agent;
 const pytools = @import("pytools.zig");
 const bash_mod = @import("bash.zig");
 const search_mod = @import("search.zig");
