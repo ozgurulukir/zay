@@ -48,10 +48,35 @@ pub const McpTool = struct {
 pub const McpClient = struct {
     gpa: std.mem.Allocator,
     name: []u8,
-    command: ?[]u8 = null,
-    args: [][]u8 = &.{},
-    url: ?[]u8 = null,
-    status: ServerStatus = .disabled,
+    /// The static transport configuration. Variants make illegal
+    /// combinations unrepresentable: a stdio client always has
+    /// command+args, an sse client always has a url.
+    transport: union(enum) {
+        stdio: struct {
+            command: []u8,
+            args: [][]u8,
+        },
+        sse: struct {
+            url: []u8,
+        },
+    },
+    /// Runtime lifecycle. Variants make illegal combinations
+    /// unrepresentable: only stdio can have a `process`, only failed
+    /// has a reason, only disabled/connecting/ready are valid for the
+    /// inner status.
+    lifecycle: union(enum) {
+        disabled,
+        stdio: struct {
+            process: std.process.Child,
+            status: enum { connecting, ready },
+        },
+        sse: struct {
+            status: enum { connecting, ready },
+        },
+        failed: struct {
+            reason: []u8,
+        },
+    },
     latency_ms: u32 = 0,
     tools: std.ArrayList(McpTool) = .empty,
     next_request_id: i64 = 1,
@@ -60,12 +85,21 @@ pub const McpClient = struct {
     request_mutex: std.Io.Mutex = .init,
     /// Read timeout for sendRequest poll, in milliseconds.
     read_timeout_ms: u32 = 30_000,
-    /// Subprocess handle for stdio transport. null when not started or using SSE.
-    process: ?std.process.Child = null,
-    /// Human-readable error message from the last failure. null when no error.
-    error_message: ?[]u8 = null,
 
     pub fn init(gpa: std.mem.Allocator, name: []const u8, command: ?[]const u8, args: []const []const u8, url: ?[]const u8) !McpClient {
+        // Legacy init: if url is set, build an sse client; otherwise stdio.
+        // The caller picks the transport via the (command, url) pair.
+        if (url) |u| {
+            if (command != null) return error.AmbiguousTransport;
+            return initSse(gpa, name, u);
+        }
+        const cmd = command orelse return error.NoTransport;
+        return initStdio(gpa, name, cmd, args);
+    }
+
+    /// Internal: build a McpClient from explicit stdio parameters. The
+    /// manager now constructs Transport unions directly via this path.
+    pub fn initStdio(gpa: std.mem.Allocator, name: []const u8, command: []const u8, args: []const []const u8) !McpClient {
         var owned_args = try gpa.alloc([]u8, args.len);
         errdefer {
             for (owned_args) |a| gpa.free(a);
@@ -77,41 +111,112 @@ pub const McpClient = struct {
         return .{
             .gpa = gpa,
             .name = try gpa.dupe(u8, name),
-            .command = if (command) |c| try gpa.dupe(u8, c) else null,
-            .args = owned_args,
-            .url = if (url) |u| try gpa.dupe(u8, u) else null,
-            .status = .disabled,
+            .transport = .{
+                .stdio = .{
+                    .command = try gpa.dupe(u8, command),
+                    .args = owned_args,
+                },
+            },
+            .lifecycle = .disabled,
         };
+    }
+
+    pub fn initSse(gpa: std.mem.Allocator, name: []const u8, url: []const u8) !McpClient {
+        return .{
+            .gpa = gpa,
+            .name = try gpa.dupe(u8, name),
+            .transport = .{ .sse = .{ .url = try gpa.dupe(u8, url) } },
+            .lifecycle = .disabled,
+        };
+    }
+
+    /// Map the lifecycle union to the public `ServerStatus` enum. The
+    /// union is the canonical state; this is the legacy API surface
+    /// for callers (manager, TUI) that read the status field.
+    pub fn status(self: *const McpClient) ServerStatus {
+        return switch (self.lifecycle) {
+            .disabled => .disabled,
+            .stdio => |s| switch (s.status) {
+                .connecting => .connecting,
+                .ready => .connected,
+            },
+            .sse => |s| switch (s.status) {
+                .connecting => .connecting,
+                .ready => .connected,
+            },
+            .failed => .failed,
+        };
+    }
+
+    /// Move the lifecycle to connecting (preserves any existing
+    /// stdio process handle or sse url). Used by the manager after
+    /// syncFromConfig to mark a previously-disabled client as
+    /// about-to-connect.
+    pub fn markConnecting(self: *McpClient) void {
+        switch (self.lifecycle) {
+            .stdio => |*s| s.status = .connecting,
+            .sse => |*s| s.status = .connecting,
+            .disabled => {
+                self.lifecycle = switch (self.transport) {
+                    .stdio => .{ .stdio = .{
+                        .process = std.mem.zeroes(std.process.Child),
+                        .status = .connecting,
+                    } },
+                    .sse => .{ .sse = .{ .status = .connecting } },
+                };
+            },
+            .failed => {
+                self.gpa.free(self.lifecycle.failed.reason);
+                self.lifecycle = switch (self.transport) {
+                    .stdio => .{ .stdio = .{
+                        .process = std.mem.zeroes(std.process.Child),
+                        .status = .connecting,
+                    } },
+                    .sse => .{ .sse = .{ .status = .connecting } },
+                };
+            },
+        }
     }
 
     pub fn deinit(self: *McpClient, io: std.Io) void {
         self.stop(io);
         self.gpa.free(self.name);
-        if (self.command) |c| self.gpa.free(c);
-        for (self.args) |arg| self.gpa.free(arg);
-        if (self.args.len > 0) self.gpa.free(self.args);
-        if (self.url) |u| self.gpa.free(u);
-        if (self.error_message) |msg| self.gpa.free(msg);
+        switch (self.transport) {
+            .stdio => |t| {
+                self.gpa.free(t.command);
+                for (t.args) |arg| self.gpa.free(arg);
+                if (t.args.len > 0) self.gpa.free(t.args);
+            },
+            .sse => |t| self.gpa.free(t.url),
+        }
+        switch (self.lifecycle) {
+            .failed => |f| self.gpa.free(f.reason),
+            else => {},
+        }
         for (self.tools.items) |*tool| tool.deinit(self.gpa);
         self.tools.deinit(self.gpa);
         self.* = undefined;
     }
 
-    /// Set a human-readable error message, freeing any previous one.
+    /// Set the lifecycle to failed (or replace the existing reason).
     pub fn setError(self: *McpClient, comptime fmt: []const u8, args: anytype) void {
-        if (self.error_message) |msg| self.gpa.free(msg);
-        self.error_message = std.fmt.allocPrint(self.gpa, fmt, args) catch null;
+        if (self.lifecycle == .failed) self.gpa.free(self.lifecycle.failed.reason);
+        const reason = std.fmt.allocPrint(self.gpa, fmt, args) catch return;
+        self.lifecycle = .{ .failed = .{ .reason = reason } };
     }
 
     /// Spawn the MCP server subprocess (stdio transport).
     /// Sets up stdin/stdout pipes for JSON-RPC communication.
     pub fn startStdio(self: *McpClient, io: std.Io) !void {
-        const cmd = self.command orelse return error.NoCommand;
+        const t = switch (self.transport) {
+            .stdio => |t| t,
+            .sse => return error.NoStdioTransport,
+        };
         // Build argv: command + args
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(self.gpa);
-        try argv.append(self.gpa, cmd);
-        for (self.args) |arg| try argv.append(self.gpa, arg);
+        try argv.append(self.gpa, t.command);
+        for (t.args) |arg| try argv.append(self.gpa, arg);
 
         var child = try std.process.spawn(io, .{
             .argv = argv.items,
@@ -121,14 +226,19 @@ pub const McpClient = struct {
         });
         errdefer child.kill(io);
 
-        self.process = child;
-        self.status = .connecting;
+        self.lifecycle = .{
+            .stdio = .{
+                .process = child,
+                .status = .connecting,
+            },
+        };
     }
 
     /// Stop the subprocess: SIGTERM first, then SIGKILL via kill().
     /// Closes stdin/stdout pipes and reaps the child.
     pub fn stop(self: *McpClient, io: std.Io) void {
-        if (self.process) |*child| {
+        if (self.lifecycle == .stdio) {
+            var child = self.lifecycle.stdio.process;
             // Close stdin so the child sees EOF and can exit gracefully.
             if (child.stdin) |*stdin_file| {
                 stdin_file.close(io);
@@ -145,8 +255,7 @@ pub const McpClient = struct {
             }
             child.kill(io);
         }
-        self.process = null;
-        self.status = .disabled;
+        self.lifecycle = .disabled;
     }
 
     /// Send a JSON-RPC request and read the response line.
@@ -154,7 +263,7 @@ pub const McpClient = struct {
     /// Blocks up to `read_timeout_ms` waiting for a response.
     /// Serialized via request_mutex — concurrent calls queue, not interleave.
     pub fn sendRequest(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) ![]u8 {
-        const child = &(self.process orelse return error.NotConnected);
+        const child = if (self.lifecycle == .stdio) &self.lifecycle.stdio.process else return error.NotConnected;
         const stdin_file = child.stdin orelse return error.NotConnected;
         const stdout_file = child.stdout orelse return error.NotConnected;
 
@@ -203,7 +312,7 @@ pub const McpClient = struct {
 
     /// Send a JSON-RPC notification (no response expected).
     pub fn sendNotification(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) !void {
-        const child = &(self.process orelse return error.NotConnected);
+        const child = if (self.lifecycle == .stdio) &self.lifecycle.stdio.process else return error.NotConnected;
         const stdin_file = child.stdin orelse return error.NotConnected;
 
         const request = try transport.formatNotification(self.gpa, method, params_json);
@@ -254,7 +363,7 @@ pub const McpClient = struct {
             defer p.deinit();
             _ = p.value.object.get("result");
         } else {
-            self.status = .failed;
+            self.setError("handshake returned no result", .{});
             return error.McpHandshakeFailed;
         }
 
@@ -264,7 +373,12 @@ pub const McpClient = struct {
         const end = std.Io.Timestamp.now(io, .awake);
         const elapsed_ns = start.durationTo(end).nanoseconds;
         self.latency_ms = @intCast(@max(elapsed_ns, 0) / std.time.ns_per_ms);
-        self.status = .connected;
+        // Mark the active transport as ready.
+        switch (self.lifecycle) {
+            .stdio => |*s| s.status = .ready,
+            .sse => |*s| s.status = .ready,
+            else => {},
+        }
     }
 
     /// Query tools/list and populate the client's tool list.
@@ -514,11 +628,16 @@ test "McpClient initializes and formats namespaced tool names" {
     var client = try McpClient.init(gpa, "memory", "npx", &.{}, null);
     defer client.deinit(std.testing.io);
 
-    client.status = .connected;
+    client.lifecycle = .{
+        .stdio = .{
+            .process = std.mem.zeroes(std.process.Child),
+            .status = .ready,
+        },
+    };
     try client.addTool("create_entities", "Create entities in graph", .{ .properties = &.{} });
 
     try std.testing.expectEqualStrings("memory", client.name);
-    try std.testing.expectEqual(ServerStatus.connected, client.status);
+    try std.testing.expectEqual(ServerStatus.connected, client.status());
     try std.testing.expectEqual(@as(usize, 1), client.tools.items.len);
     try std.testing.expectEqualStrings("mcp__memory__create_entities", client.tools.items[0].full_name);
 }
@@ -537,8 +656,8 @@ test "McpClient startStdio + stop lifecycle" {
     try client.startStdio(io);
     defer client.stop(io);
 
-    try std.testing.expect(client.process != null);
-    try std.testing.expectEqual(ServerStatus.connecting, client.status);
+    try std.testing.expect(client.lifecycle == .stdio);
+    try std.testing.expectEqual(ServerStatus.connecting, client.status());
 }
 
 test "McpClient sendRequest round-trip" {
@@ -584,7 +703,7 @@ test "McpClient full handshake + tools/list" {
 
     // Handshake
     try client.initialize(io);
-    try std.testing.expectEqual(ServerStatus.connected, client.status);
+    try std.testing.expectEqual(ServerStatus.connected, client.status());
 
     // Tool discovery
     try client.listTools(io);

@@ -224,7 +224,7 @@ pub const ExecutorService = struct {
 
         // Find the client
         const client = for (manager.clients.items) |*c| {
-            if (c.status == .connected and std.mem.eql(u8, c.name, server_name)) break c;
+            if (c.status() == .connected and std.mem.eql(u8, c.name, server_name)) break c;
         } else return self.runFailure(call, error.McpServerNotFound);
 
         // Call the tool

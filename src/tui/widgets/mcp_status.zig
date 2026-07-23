@@ -63,13 +63,13 @@ pub const Content = struct {
             const is_selected = i == self.state.selection;
             if (is_selected) panel.fillRow(&surface, row, StylePalette.selected);
 
-            const badge = client.status.label();
+            const badge = client.status().label();
             const tool_count = client.tools.items.len;
-            const line = if (client.error_message) |err_msg|
+            const line = if (client.lifecycle == .failed)
                 try std.fmt.allocPrint(
                     ctx.arena,
                     "  [{s}] {s} - {d} tools ({d}ms)  ERROR: {s}",
-                    .{ badge, client.name, tool_count, client.latency_ms, err_msg },
+                    .{ badge, client.name, tool_count, client.latency_ms, client.lifecycle.failed.reason },
                 )
             else
                 try std.fmt.allocPrint(

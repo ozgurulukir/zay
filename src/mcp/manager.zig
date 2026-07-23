@@ -63,9 +63,9 @@ pub const McpManager = struct {
 
             if (self.findClient(server_cfg.name)) |c| {
                 if (server_cfg.enabled) {
-                    if (c.status != .connected) c.status = .connecting;
+                    if (c.status() != .connected) c.markConnecting();
                 } else {
-                    c.status = .disabled;
+                    c.lifecycle = .disabled;
                 }
             } else {
                 var c = try client_mod.McpClient.init(
@@ -76,7 +76,7 @@ pub const McpManager = struct {
                     url,
                 );
                 errdefer c.deinit(io);
-                c.status = if (server_cfg.enabled) .connecting else .disabled;
+                if (server_cfg.enabled) c.markConnecting();
                 try self.clients.append(self.gpa, c);
             }
         }
@@ -96,10 +96,10 @@ pub const McpManager = struct {
         _ = cwd;
         self.syncFromConfig(io, config) catch {};
         for (self.clients.items) |*c| {
-            if (c.status != .connecting) continue;
+            if (c.status() != .connecting) continue;
             if (c.tools.items.len > 0) continue;
             connectAndDiscover(io, c) catch {
-                c.status = .failed;
+                c.setError("sync failed", .{});
             };
         }
     }
@@ -108,7 +108,7 @@ pub const McpManager = struct {
     pub fn totalActiveTools(self: *const McpManager) usize {
         var count: usize = 0;
         for (self.clients.items) |c| {
-            if (c.status == .connected) {
+            if (c.status() == .connected) {
                 count += c.tools.items.len;
             }
         }
@@ -119,7 +119,7 @@ pub const McpManager = struct {
     pub fn activeServerCount(self: *const McpManager) usize {
         var count: usize = 0;
         for (self.clients.items) |c| {
-            if (c.status == .connected) count += 1;
+            if (c.status() == .connected) count += 1;
         }
         return count;
     }
@@ -133,12 +133,12 @@ pub const McpManager = struct {
     pub fn buildMcpToolSchemas(self: *const McpManager, gpa: std.mem.Allocator) ![]ai.McpToolSchema {
         var total: usize = 0;
         for (self.clients.items) |c| {
-            if (c.status == .connected) total += c.tools.items.len;
+            if (c.status() == .connected) total += c.tools.items.len;
         }
         var schemas = try gpa.alloc(ai.McpToolSchema, total);
         var idx: usize = 0;
         next_tool: for (self.clients.items) |c| {
-            if (c.status != .connected) continue;
+            if (c.status() != .connected) continue;
             for (c.tools.items) |tool| {
                 // Collision check: skip if a tool with this full_name was already added
                 for (schemas[0..idx]) |existing| {
@@ -169,7 +169,7 @@ pub const McpManager = struct {
         try out.writer.writeAll("Connected MCP servers: ");
         var first = true;
         for (self.clients.items) |c| {
-            if (c.status != .connected) continue;
+            if (c.status() != .connected) continue;
             if (!first) try out.writer.writeAll(", ");
             first = false;
             try out.writer.print("{s} ({d} tools)", .{ c.name, c.tools.items.len });
@@ -184,10 +184,13 @@ pub const McpManager = struct {
         client.stop(io);
         for (client.tools.items) |*tool| tool.deinit(self.gpa);
         client.tools.clearRetainingCapacity();
-        client.error_message = null;
+        if (client.lifecycle == .failed) {
+            client.gpa.free(client.lifecycle.failed.reason);
+            client.lifecycle = .disabled;
+        }
         client.latency_ms = 0;
         connectAndDiscover(io, client) catch {
-            client.status = .failed;
+            client.setError("reconnect failed", .{});
         };
     }
 
@@ -200,7 +203,10 @@ pub const McpManager = struct {
         client.stop(io);
         for (client.tools.items) |*tool| tool.deinit(self.gpa);
         client.tools.clearRetainingCapacity();
-        client.error_message = null;
+        if (client.lifecycle == .failed) {
+            client.gpa.free(client.lifecycle.failed.reason);
+            client.lifecycle = .disabled;
+        }
         client.latency_ms = 0;
     }
 
@@ -237,18 +243,15 @@ pub const McpManager = struct {
 /// On any failure, the caller should set status to .failed.
 fn connectAndDiscover(io: std.Io, client: *client_mod.McpClient) !void {
     // stdio transport: spawn subprocess
-    if (client.command != null) {
+    if (client.transport == .stdio) {
         client.startStdio(io) catch |err| {
             client.setError("Failed to spawn: {s}", .{@errorName(err)});
             return err;
         };
-    } else if (client.url != null) {
+    } else {
         // SSE transport — not yet implemented
         client.setError("SSE transport not yet implemented", .{});
         return error.SseNotImplemented;
-    } else {
-        client.setError("No command or url configured", .{});
-        return error.NoTransport;
     }
 
     // MCP handshake
@@ -285,7 +288,7 @@ test "McpManager syncs servers from config and counts tools" {
     try manager.syncFromConfig(std.testing.io, &cfg);
     try std.testing.expectEqual(@as(usize, 1), manager.clients.items.len);
     // syncFromConfig only registers the client — actual connection happens in syncFromConfigEx
-    try std.testing.expectEqual(client_mod.ServerStatus.connecting, manager.clients.items[0].status);
+    try std.testing.expectEqual(client_mod.ServerStatus.connecting, manager.clients.items[0].status());
     try std.testing.expectEqual(@as(usize, 0), manager.activeServerCount());
 }
 
@@ -345,14 +348,14 @@ test "McpManager does not reconnect already connected clients" {
 
     // First sync: registers as .connecting
     try manager.syncFromConfig(std.testing.io, &cfg);
-    try std.testing.expectEqual(client_mod.ServerStatus.connecting, manager.clients.items[0].status);
+    try std.testing.expectEqual(client_mod.ServerStatus.connecting, manager.clients.items[0].status());
 
     // Simulate a successful connection
-    manager.clients.items[0].status = .connected;
+    manager.clients.items[0].lifecycle = .{ .stdio = .{ .process = std.mem.zeroes(std.process.Child), .status = .ready } };
 
     // Second sync: should NOT change status of already-connected client
     try manager.syncFromConfig(std.testing.io, &cfg);
-    try std.testing.expectEqual(client_mod.ServerStatus.connected, manager.clients.items[0].status);
+    try std.testing.expectEqual(client_mod.ServerStatus.connected, manager.clients.items[0].status());
 }
 
 test "McpManager rejects server configs missing a transport at parse time" {
@@ -393,5 +396,8 @@ test "McpManager skips duplicate server names in config" {
     try manager.syncFromConfig(std.testing.io, &cfg);
     // Only the first "dup" should be registered
     try std.testing.expectEqual(@as(usize, 1), manager.clients.items.len);
-    try std.testing.expectEqualStrings("echo", manager.clients.items[0].command.?);
+    switch (manager.clients.items[0].transport) {
+        .stdio => |t| try std.testing.expectEqualStrings("echo", t.command),
+        .sse => return error.Unexpected,
+    }
 }
