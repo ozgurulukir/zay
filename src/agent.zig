@@ -419,12 +419,7 @@ pub const Agent = struct {
                 null,
             .mcp_manager = self.mcp_manager,
         });
-        const results = try executor.runAll(tool_batch.calls, .{
-            .ptr = &bridge,
-            .on_started = ExecutorBridge(L).onStarted,
-            .on_finished = ExecutorBridge(L).onFinished,
-            .approve_unsafe_bash = ExecutorBridge(L).approveUnsafeBash,
-        });
+        const results = try executor.runAll(tool_batch.calls, bridge.observer());
         defer self.gpa.free(results);
         errdefer for (results) |*r| r.deinit(self.gpa);
         try self.takeToolResults(results);
@@ -478,24 +473,22 @@ pub const Agent = struct {
             stream_context: *const StreamContext(L),
             tool_index: u32 = 0,
 
-            fn onStarted(ptr: *anyopaque, call: ai.ToolCall) anyerror!void {
-                const self: *@This() = @ptrCast(@alignCast(ptr));
+            fn onStarted(ctx: *@This(), call: ai.ToolCall) anyerror!void {
                 // Synthesise a tool_delta for the TUI if the LM did not stream
                 // one for this tool_call (some servers emit the whole call in
                 // one shot without intermediate deltas).
-                if (!self.stream_context.toolDeltaSeen(self.tool_index)) {
-                    try Agent.emitToolDelta(L, self.agent, self.listener, self.tool_index, call.name, call.arguments);
-                    try self.listener.emit(.delta_end);
+                if (!ctx.stream_context.toolDeltaSeen(ctx.tool_index)) {
+                    try Agent.emitToolDelta(L, ctx.agent, ctx.listener, ctx.tool_index, call.name, call.arguments);
+                    try ctx.listener.emit(.delta_end);
                 }
             }
 
-            fn onFinished(ptr: *anyopaque, result: *const executor_mod.ToolResult) anyerror!void {
-                const self: *@This() = @ptrCast(@alignCast(ptr));
+            fn onFinished(ctx: *@This(), result: *const executor_mod.ToolResult) anyerror!void {
                 try Agent.emitToolCallFinished(
                     L,
-                    self.agent,
-                    self.listener,
-                    self.tool_index,
+                    ctx.agent,
+                    ctx.listener,
+                    ctx.tool_index,
                     result.call_id,
                     result.name,
                     result.display_label,
@@ -505,14 +498,25 @@ pub const Agent = struct {
                     result.stderr,
                     result.failed,
                 );
-                self.tool_index += 1;
+                ctx.tool_index += 1;
             }
 
-            fn approveUnsafeBash(ptr: *anyopaque, call: ai.ToolCall, command: []const u8) anyerror!bool {
+            fn approveUnsafeBash(ctx: *@This(), call: ai.ToolCall, command: []const u8) anyerror!bool {
                 _ = call;
-                const self: *@This() = @ptrCast(@alignCast(ptr));
-                const approval = self.agent.bash_approval orelse return true;
+                const approval = ctx.agent.bash_approval orelse return true;
                 return approval.request(approval.ptr, command);
+            }
+
+            /// Build the executor's `ToolCallObserver` for this bridge. The
+            /// observer's ctx is `*@This()` (the bridge itself), and the
+            /// callbacks receive it typed — no `@ptrCast` at the seam.
+            fn observer(self: *@This()) executor_mod.ToolCallObserver(@This()) {
+                return .{
+                    .ctx = self,
+                    .on_started = onStarted,
+                    .on_finished = onFinished,
+                    .approve_unsafe_bash = approveUnsafeBash,
+                };
             }
         };
     }

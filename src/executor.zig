@@ -62,26 +62,34 @@ pub const ToolResult = struct {
 /// The narrow private callback interface ExecutorService uses to report
 /// ToolCall lifecycle back to the agent. `on_finished` receives a const
 /// pointer into the executor's already-allocated result slot — no
-/// projection allocation.
-pub const ToolCallObserver = struct {
-    ptr: *anyopaque,
-    on_started: *const fn (*anyopaque, ai.ToolCall) anyerror!void,
-    on_finished: *const fn (*anyopaque, *const ToolResult) anyerror!void,
-    approve_unsafe_bash: *const fn (*anyopaque, ai.ToolCall, []const u8) anyerror!bool,
-
-    pub const noop: ToolCallObserver = .{
-        .ptr = undefined,
-        .on_started = noopStarted,
-        .on_finished = noopFinished,
-        .approve_unsafe_bash = noopApproveUnsafeBash,
+/// projection allocation. Generic over the consumer's context type so
+/// the callbacks receive `*Ctx` directly (no `@ptrCast` at the seam).
+pub fn ToolCallObserver(Ctx: type) type {
+    return struct {
+        ctx: *Ctx,
+        on_started: *const fn (ctx: *Ctx, call: ai.ToolCall) anyerror!void,
+        on_finished: *const fn (ctx: *Ctx, result: *const ToolResult) anyerror!void,
+        approve_unsafe_bash: *const fn (ctx: *Ctx, call: ai.ToolCall, arg: []const u8) anyerror!bool,
     };
+}
 
-    pub fn noopStarted(_: *anyopaque, _: ai.ToolCall) anyerror!void {}
-    pub fn noopFinished(_: *anyopaque, _: *const ToolResult) anyerror!void {}
-    pub fn noopApproveUnsafeBash(_: *anyopaque, _: ai.ToolCall, _: []const u8) anyerror!bool {
-        return true;
-    }
-};
+/// Build a no-op `ToolCallObserver(Ctx)`. The ctx pointer is left
+/// undefined — the callbacks ignore their context argument.
+pub fn noopObserver(Ctx: type) ToolCallObserver(Ctx) {
+    const Noop = struct {
+        fn onStarted(_: *Ctx, _: ai.ToolCall) anyerror!void {}
+        fn onFinished(_: *Ctx, _: *const ToolResult) anyerror!void {}
+        fn approve(_: *Ctx, _: ai.ToolCall, _: []const u8) anyerror!bool {
+            return true;
+        }
+    };
+    return .{
+        .ctx = undefined,
+        .on_started = Noop.onStarted,
+        .on_finished = Noop.onFinished,
+        .approve_unsafe_bash = Noop.approve,
+    };
+}
 
 pub const ExecutorService = struct {
     gpa: std.mem.Allocator,
@@ -124,7 +132,7 @@ pub const ExecutorService = struct {
     pub fn runAll(
         self: *ExecutorService,
         calls: []const ai.ToolCall,
-        observer: ToolCallObserver,
+        observer: anytype,
     ) ![]ToolResult {
         const results = try self.gpa.alloc(ToolResult, calls.len);
         var initialized: usize = 0;
@@ -133,26 +141,26 @@ pub const ExecutorService = struct {
             self.gpa.free(results);
         }
         for (calls, 0..) |call, i| {
-            try observer.on_started(observer.ptr, call);
+            try observer.on_started(observer.ctx, call);
             if (try self.shouldRejectUnsafeBash(call, observer)) {
                 results[i] = try self.runRejected(call);
             } else {
                 results[i] = try self.runOne(call);
             }
             initialized = i + 1;
-            try observer.on_finished(observer.ptr, &results[i]);
+            try observer.on_finished(observer.ctx, &results[i]);
         }
         return results;
     }
 
-    fn shouldRejectUnsafeBash(self: *ExecutorService, call: ai.ToolCall, observer: ToolCallObserver) !bool {
+    fn shouldRejectUnsafeBash(self: *ExecutorService, call: ai.ToolCall, observer: anytype) !bool {
         const url = self.bash_classifier_url orelse return false;
         if (!std.mem.eql(u8, call.name, "bash")) return false;
         const command = bash_safety.commandFromArguments(self.gpa, call.arguments) catch return false;
         defer self.gpa.free(command);
         const verdict = bash_safety.classify(self.gpa, self.io, url, self.cwd, command);
         if (verdict != .unsafe) return false;
-        const approved = try observer.approve_unsafe_bash(observer.ptr, call, command);
+        const approved = try observer.approve_unsafe_bash(observer.ctx, call, command);
         return !approved;
     }
 
@@ -361,7 +369,7 @@ test "ExecutorService runs bash and returns both channels" {
         gpa.free(c.arguments);
     };
 
-    const results = try executor.runAll(&calls, ToolCallObserver.noop);
+    const results = try executor.runAll(&calls, noopObserver(u8));
     defer {
         for (results) |*r| r.deinit(gpa);
         gpa.free(results);
