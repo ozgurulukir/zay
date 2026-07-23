@@ -92,14 +92,71 @@ const InitOutcome = union(enum) {
 
 const Backend = struct {
     mutex: std.Io.Mutex = .init,
-    future: ?std.Io.Future(InitOutcome) = null,
-    /// Set by the init task immediately before it returns, so callers can
-    /// non-blockingly check whether `await` will be instant.
-    done: std.atomic.Value(bool) = .init(false),
-    api: ?Api = null,
-    handle: ?*anyopaque = null,
-    failed: bool = false,
-    failure_message: []u8 = &.{},
+    /// Background init state machine. The previous flat fields
+    /// (future/done/api/handle/failed/failure_message) allowed illegal
+    /// combinations like future=null with api set, or failed=true with
+    /// future still pending. The union makes those unrepresentable.
+    /// `handle: *anyopaque` stays opaque because it's the C library's
+    /// owned instance pointer (fff FFI standard).
+    state: State = .idle,
+
+    pub const State = union(enum) {
+        idle,
+        loading: struct {
+            future: std.Io.Future(InitOutcome),
+            /// Set by the init task immediately before it returns, so
+            /// callers can non-blockingly check whether await is instant.
+            done: std.atomic.Value(bool),
+        },
+        ready: struct {
+            api: Api,
+            /// fff C library handle — opaque by design (FFI boundary).
+            handle: *anyopaque,
+        },
+        failed: struct {
+            message: []u8,
+        },
+    };
+
+    /// Backward-compat: future != null.
+    fn future(self: *const Backend) ?std.Io.Future(InitOutcome) {
+        return switch (self.state) {
+            .loading => |l| l.future,
+            else => null,
+        };
+    }
+    /// Backward-compat: done flag (default false when not loading).
+    fn doneFlag(self: *const Backend) ?*std.atomic.Value(bool) {
+        return switch (self.*) {
+            .loading => |*l| &l.done,
+            else => null,
+        };
+    }
+    /// Backward-compat: api (null when not ready).
+    fn apiOpt(self: *Backend) ?*Api {
+        return switch (self.state) {
+            .ready => |*r| &r.api,
+            else => null,
+        };
+    }
+    /// Backward-compat: handle (null when not ready).
+    fn handleOpt(self: *const Backend) ?*anyopaque {
+        return switch (self.state) {
+            .ready => |r| r.handle,
+            else => null,
+        };
+    }
+    /// Backward-compat: failed flag.
+    fn isFailed(self: *const Backend) bool {
+        return self.state == .failed;
+    }
+    /// Backward-compat: failure message (empty when not failed).
+    fn failureMessage(self: *const Backend) []u8 {
+        return switch (self.state) {
+            .failed => |f| f.message,
+            else => &.{},
+        };
+    }
 };
 
 var backend: Backend = .{};
@@ -137,34 +194,42 @@ fn initBackend(gpa: std.mem.Allocator, cwd: []u8, done: *std.atomic.Value(bool))
 
 pub fn start(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) void {
     assert(cwd.len > 0);
-    if (backend.future != null or backend.api != null or backend.failed) return;
+    // Already loading, ready, or failed — nothing to do.
+    if (backend.state != .idle) return;
 
     const cwd_owned = gpa.dupe(u8, cwd) catch {
-        backend.failed = true;
+        backend.state = .{ .failed = .{ .message = gpa.dupe(u8, "out of memory") catch &.{} } };
         return;
     };
 
-    backend.done.store(false, .release);
-    backend.future = io.concurrent(initBackend, .{ gpa, cwd_owned, &backend.done }) catch |err| {
+    backend.state = .{
+        .loading = .{
+            .future = undefined, // set below
+            .done = .init(false),
+        },
+    };
+    const done_ptr = &backend.state.loading.done;
+    backend.state.loading.future = io.concurrent(initBackend, .{ gpa, cwd_owned, done_ptr }) catch |err| {
         gpa.free(cwd_owned);
-        backend.failed = true;
-        backend.failure_message = gpa.dupe(u8, @errorName(err)) catch &.{};
+        backend.state = .{ .failed = .{ .message = gpa.dupe(u8, @errorName(err)) catch &.{} } };
         return;
     };
 }
 
 pub fn deinit(gpa: std.mem.Allocator, io: std.Io) void {
-    if (backend.future) |*future| {
+    if (backend.state == .loading) {
+        var future = backend.state.loading.future;
         var outcome = future.cancel(io);
         outcome.deinit(gpa);
-        backend.future = null;
     }
-    backend.done.store(false, .release);
-    if (backend.api) |*api| {
-        if (backend.handle) |handle| api.destroy(handle);
-        api.close();
+    if (backend.state == .ready) {
+        // destroy + close via the api pointer.
+        backend.state.ready.api.destroy(backend.state.ready.handle);
+        backend.state.ready.api.close();
     }
-    if (backend.failure_message.len > 0) gpa.free(backend.failure_message);
+    if (backend.state == .failed and backend.state.failed.message.len > 0) {
+        gpa.free(backend.state.failed.message);
+    }
     backend = .{};
 }
 
@@ -191,33 +256,24 @@ fn runReadyBackend(gpa: std.mem.Allocator, io: std.Io, request: Request) !?Resul
     try backend.mutex.lock(io);
     defer backend.mutex.unlock(io);
 
-    if (backend.future != null and backend.done.load(.acquire)) {
-        const outcome = backend.future.?.await(io);
-        backend.future = null;
+    // Drain the loading future if the worker has signalled done.
+    if (backend.state == .loading and backend.state.loading.done.load(.acquire)) {
+        const outcome = backend.state.loading.future.await(io);
         switch (outcome) {
-            .ready => |r| {
-                backend.api = r.api;
-                backend.handle = r.handle;
-            },
-            .failed => |msg| {
-                backend.failed = true;
-                backend.failure_message = msg;
-            },
+            .ready => |r| backend.state = .{ .ready = .{ .api = r.api, .handle = r.handle } },
+            .failed => |msg| backend.state = .{ .failed = .{ .message = msg } },
         }
     }
 
-    if (backend.failed) return null;
-    if (backend.api == null) return null;
-
-    const api = &backend.api.?;
-    const handle = backend.handle orelse return null;
+    if (backend.isFailed()) return null;
+    const api = backend.apiOpt() orelse return null;
+    const handle = backend.handleOpt() orelse return null;
     if (request.op == .grep and api.is_scanning(handle)) return null;
     return runFff(gpa, request, api, handle) catch |err| switch (err) {
         error.OutOfMemory, error.InvalidCursor => err,
         else => {
-            if (backend.failure_message.len > 0) gpa.free(backend.failure_message);
-            backend.failure_message = gpa.dupe(u8, @errorName(err)) catch &.{};
-            backend.failed = true;
+            if (backend.failureMessage().len > 0) gpa.free(backend.failureMessage());
+            backend.state = .{ .failed = .{ .message = gpa.dupe(u8, @errorName(err)) catch &.{} } };
             return null;
         },
     };
