@@ -67,6 +67,7 @@ pub const McpManager = struct {
                     server_cfg.args,
                     server_cfg.url,
                 );
+                errdefer c.deinit(io);
                 if (!has_transport) {
                     c.status = .failed;
                     c.setError("No command or url configured", .{});
