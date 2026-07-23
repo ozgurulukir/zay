@@ -25,19 +25,20 @@ pub const McpManager = struct {
         self.* = undefined;
     }
 
-    /// Synchronize MCP manager state against loaded Config.
-    pub fn syncFromConfig(self: *McpManager, config: *const config_mod.Config) !void {
-        for (config.mcp_servers) |server_cfg| {
-            var existing: ?*client_mod.McpClient = null;
-            for (self.clients.items) |*c| {
-                if (std.mem.eql(u8, c.name, server_cfg.name)) {
-                    existing = c;
-                    break;
-                }
-            }
+    /// Reconcile client list against config: remove stale, add new, update status.
+    /// No I/O connections — pure list management. Safe to call repeatedly.
+    pub fn syncFromConfig(self: *McpManager, io: std.Io, config: *const config_mod.Config) !void {
+        // Phase 1: Remove clients no longer in config (zombie cleanup)
+        self.removeStaleClients(io, config);
 
-            if (existing) |c| {
-                c.status = if (server_cfg.enabled) .connecting else .disabled;
+        // Phase 2: Add new or update status of existing
+        for (config.mcp_servers) |server_cfg| {
+            if (self.findClient(server_cfg.name)) |c| {
+                if (server_cfg.enabled) {
+                    if (c.status != .connected) c.status = .connecting;
+                } else {
+                    c.status = .disabled;
+                }
             } else {
                 var c = try client_mod.McpClient.init(
                     self.gpa,
@@ -52,8 +53,7 @@ pub const McpManager = struct {
         }
     }
 
-    /// Extended sync: spawns subprocess, performs MCP handshake, and
-    /// discovers tools via `tools/list` JSON-RPC for each enabled server.
+    /// Extended sync: reconcile client list, then connect enabled servers.
     pub fn syncFromConfigEx(
         self: *McpManager,
         gpa: std.mem.Allocator,
@@ -65,41 +65,13 @@ pub const McpManager = struct {
         _ = gpa;
         _ = home_dir;
         _ = cwd;
-        for (config.mcp_servers) |server_cfg| {
-            var existing: ?*client_mod.McpClient = null;
-            for (self.clients.items) |*c| {
-                if (std.mem.eql(u8, c.name, server_cfg.name)) {
-                    existing = c;
-                    break;
-                }
-            }
-
-            if (existing) |c| {
-                if (!server_cfg.enabled) {
-                    c.status = .disabled;
-                    continue;
-                }
-                if (c.tools.items.len > 0) continue;
-                // Re-discover: start, handshake, list tools
-                connectAndDiscover(io, c) catch {
-                    c.status = .failed;
-                };
-            } else {
-                var c = client_mod.McpClient.init(
-                    self.gpa,
-                    server_cfg.name,
-                    server_cfg.command,
-                    server_cfg.args,
-                    server_cfg.url,
-                ) catch continue;
-                c.status = if (server_cfg.enabled) .connecting else .disabled;
-                if (server_cfg.enabled) {
-                    connectAndDiscover(io, &c) catch {
-                        c.status = .failed;
-                    };
-                }
-                self.clients.append(self.gpa, c) catch {};
-            }
+        self.syncFromConfig(io, config) catch {};
+        for (self.clients.items) |*c| {
+            if (c.status != .connecting) continue;
+            if (c.tools.items.len > 0) continue;
+            connectAndDiscover(io, c) catch {
+                c.status = .failed;
+            };
         }
     }
 
@@ -163,6 +135,34 @@ pub const McpManager = struct {
             client.status = .failed;
         };
     }
+
+    fn findClient(self: *McpManager, name: []const u8) ?*client_mod.McpClient {
+        for (self.clients.items) |*c| {
+            if (std.mem.eql(u8, c.name, name)) return c;
+        }
+        return null;
+    }
+
+    /// Remove clients that are no longer in config. Iterates backwards so
+    /// orderedRemove indices stay valid. Deinits the client (kills subprocess).
+    fn removeStaleClients(self: *McpManager, io: std.Io, config: *const config_mod.Config) void {
+        var i: usize = self.clients.items.len;
+        while (i > 0) {
+            i -= 1;
+            const client = &self.clients.items[i];
+            var found = false;
+            for (config.mcp_servers) |server_cfg| {
+                if (std.mem.eql(u8, client.name, server_cfg.name)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                client.deinit(io);
+                _ = self.clients.orderedRemove(i);
+            }
+        }
+    }
 };
 
 /// Spawn the MCP server subprocess, perform handshake, and discover tools.
@@ -212,9 +212,57 @@ test "McpManager syncs servers from config and counts tools" {
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
     defer cfg.deinit(gpa);
 
-    try manager.syncFromConfig(&cfg);
+    try manager.syncFromConfig(std.testing.io, &cfg);
     try std.testing.expectEqual(@as(usize, 1), manager.clients.items.len);
     // syncFromConfig only registers the client — actual connection happens in syncFromConfigEx
     try std.testing.expectEqual(client_mod.ServerStatus.connecting, manager.clients.items[0].status);
     try std.testing.expectEqual(@as(usize, 0), manager.activeServerCount());
+}
+
+test "McpManager removes stale clients not in config" {
+    const gpa = std.testing.allocator;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(std.testing.io);
+
+    // First sync: add two servers
+    var servers1 = try gpa.alloc(config_mod.McpServerConfig, 2);
+    servers1[0] = .{ .name = try gpa.dupe(u8, "alpha"), .enabled = true };
+    servers1[1] = .{ .name = try gpa.dupe(u8, "beta"), .enabled = true };
+    var cfg1: config_mod.Config = .{ .mcp_servers = servers1 };
+    defer cfg1.deinit(gpa);
+
+    try manager.syncFromConfig(std.testing.io, &cfg1);
+    try std.testing.expectEqual(@as(usize, 2), manager.clients.items.len);
+
+    // Second sync: only "alpha" remains — "beta" should be removed
+    var servers2 = try gpa.alloc(config_mod.McpServerConfig, 1);
+    servers2[0] = .{ .name = try gpa.dupe(u8, "alpha"), .enabled = true };
+    var cfg2: config_mod.Config = .{ .mcp_servers = servers2 };
+    defer cfg2.deinit(gpa);
+
+    try manager.syncFromConfig(std.testing.io, &cfg2);
+    try std.testing.expectEqual(@as(usize, 1), manager.clients.items.len);
+    try std.testing.expectEqualStrings("alpha", manager.clients.items[0].name);
+}
+
+test "McpManager does not reconnect already connected clients" {
+    const gpa = std.testing.allocator;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(std.testing.io);
+
+    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = .{ .name = try gpa.dupe(u8, "stable"), .enabled = true };
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+    defer cfg.deinit(gpa);
+
+    // First sync: registers as .connecting
+    try manager.syncFromConfig(std.testing.io, &cfg);
+    try std.testing.expectEqual(client_mod.ServerStatus.connecting, manager.clients.items[0].status);
+
+    // Simulate a successful connection
+    manager.clients.items[0].status = .connected;
+
+    // Second sync: should NOT change status of already-connected client
+    try manager.syncFromConfig(std.testing.io, &cfg);
+    try std.testing.expectEqual(client_mod.ServerStatus.connected, manager.clients.items[0].status);
 }
