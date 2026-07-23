@@ -206,16 +206,6 @@ pub const ModelSelectionRef = struct {
     model: *const Model,
 };
 
-pub const ModelSelection = struct {
-    provider: Provider,
-    model: Model,
-
-    pub fn deinit(self: *ModelSelection, gpa: std.mem.Allocator) void {
-        self.model.deinit(gpa);
-        self.* = undefined;
-    }
-};
-
 pub const McpServerConfig = struct {
     name: []u8,
     enabled: bool = true,
@@ -265,6 +255,45 @@ pub const McpServerConfig = struct {
     }
 };
 
+/// A complete, ready-to-use model selection. The fields that were
+/// previously optional on `Config` and runtime-asserted to be all-set
+/// (provider, base_url, api_key, model) live here as non-optional.
+/// Optional settings stay optional. `Config.model_selection: ?ModelSelection`
+/// is the typed view; legacy callers that read the loose `Config`
+/// fields keep working until the migration PRs land.
+pub const ModelSelection = struct {
+    provider: Provider,
+    model: Model,
+    base_url: []u8,
+    api_key: []u8,
+    use_responses_endpoint: bool = false,
+    enable_thinking: bool = false,
+    system_prompt: ?[]u8 = null,
+    bash_classifier_url: ?[]u8 = null,
+
+    pub fn deinit(self: *ModelSelection, gpa: std.mem.Allocator) void {
+        gpa.free(self.base_url);
+        gpa.free(self.api_key);
+        self.model.deinit(gpa);
+        if (self.system_prompt) |s| gpa.free(s);
+        if (self.bash_classifier_url) |s| gpa.free(s);
+        self.* = undefined;
+    }
+
+    pub fn clone(self: ModelSelection, gpa: std.mem.Allocator) !ModelSelection {
+        return .{
+            .provider = self.provider,
+            .model = try self.model.clone(gpa),
+            .base_url = try gpa.dupe(u8, self.base_url),
+            .api_key = try gpa.dupe(u8, self.api_key),
+            .use_responses_endpoint = self.use_responses_endpoint,
+            .enable_thinking = self.enable_thinking,
+            .system_prompt = if (self.system_prompt) |s| try gpa.dupe(u8, s) else null,
+            .bash_classifier_url = if (self.bash_classifier_url) |s| try gpa.dupe(u8, s) else null,
+        };
+    }
+};
+
 pub const Config = struct {
     version: ?u32 = 1,
     provider: ?Provider = null,
@@ -277,6 +306,11 @@ pub const Config = struct {
     use_responses_endpoint: ?bool = null,
     enable_thinking: ?bool = null,
     system_prompt: ?[]u8 = null,
+    /// Typed view of the model selection. `null` when the required
+    /// fields (provider, base_url, api_key, model) aren't all set.
+    /// Equivalent to the old `assertModelSelection` check — but the
+    /// presence is now encoded in the type, not enforced at runtime.
+    model_selection: ?ModelSelection = null,
 
     pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
         if (self.base_url) |s| gpa.free(s);
@@ -288,6 +322,7 @@ pub const Config = struct {
         for (self.mcp_servers) |*server| server.deinit(gpa);
         if (self.mcp_servers.len > 0) gpa.free(self.mcp_servers);
         if (self.system_prompt) |s| gpa.free(s);
+        if (self.model_selection) |*ms| ms.deinit(gpa);
         self.* = undefined;
     }
 
@@ -308,6 +343,7 @@ pub const Config = struct {
         out.mcp_servers = try gpa.alloc(McpServerConfig, self.mcp_servers.len);
         for (self.mcp_servers, 0..) |server, index| out.mcp_servers[index] = try server.clone(gpa);
         if (self.system_prompt) |s| out.system_prompt = try gpa.dupe(u8, s);
+        if (self.model_selection) |ms| out.model_selection = try ms.clone(gpa);
         return out;
     }
 
@@ -670,6 +706,34 @@ fn parseObject(
     if (stringField(value, "system_prompt")) |s| {
         out.system_prompt = try gpa.dupe(u8, s);
     }
+
+    // Populate the typed `model_selection` when all required fields
+    // are present. Missing any of them leaves it null — the legacy
+    // optional fields stay so existing callers keep working until
+    // they migrate to `model_selection`.
+    if (out.provider != null and out.model != null and
+        out.base_url != null and out.api_key != null)
+    {
+        out.model_selection = .{
+            .provider = out.provider.?,
+            .model = out.model.?, // ownership moves; clear the legacy field
+            .base_url = out.base_url.?,
+            .api_key = out.api_key.?,
+            .use_responses_endpoint = out.use_responses_endpoint orelse false,
+            .enable_thinking = out.enable_thinking orelse false,
+            .system_prompt = out.system_prompt,
+            .bash_classifier_url = out.bash_classifier_url,
+        };
+        out.provider = null;
+        out.model = null;
+        out.base_url = null;
+        out.api_key = null;
+        out.use_responses_endpoint = null;
+        out.enable_thinking = null;
+        out.system_prompt = null;
+        out.bash_classifier_url = null;
+    }
+
     // Parsing is pure: producing a single layer's Config never reaches into the
     // provider catalogue. Hydration runs once after all layers merge, against
     // the fully merged provider list (see `mergeLayers`).
