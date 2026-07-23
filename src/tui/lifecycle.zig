@@ -95,6 +95,22 @@ pub fn deinitApp(self: *App) void {
 /// lanes naming, background completion, spinner animation, and the black-hole
 /// intro. Re-schedules itself when work is still pending.
 pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
+    var visible_change = try drainSubsystems(root, ctx);
+    visible_change = try tickAnimations(root) or visible_change;
+    try processDelayedTimers(root);
+    try scheduleNextTick(root, ctx);
+
+    if (visible_change) {
+        ctx.consumeAndRedraw();
+    } else {
+        ctx.consumeEvent();
+    }
+}
+
+/// Drain all pending subsystem work (agent events, model loads, diff refreshes,
+/// lane naming, background jobs, and buffered background deliveries).
+/// Returns true when any visible state changed.
+fn drainSubsystems(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
     var visible_change = try drainAgentEvents(root, ctx);
     if (try provider_model.drainModelLoad(root.app)) visible_change = true;
     if (try root.app.drainDiffRefresh()) visible_change = true;
@@ -104,6 +120,13 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     // to idle lanes (notice + a turn to answer them).
     if (try root.app.pollBackgroundJobs()) visible_change = true;
     if (try root.app.deliverPendingBackground()) visible_change = true;
+    return visible_change;
+}
+
+/// Advance animations that depend on the tick interval: the loading spinner
+/// and the black-hole intro. Returns true when any visible state changed.
+fn tickAnimations(root: *RootWidget) !bool {
+    var visible_change = false;
 
     if (root.app.thread.turn_view.awaitingOutput() or root.app.thread.transcript.hasRunningTool()) {
         root.spinner_tick_accum += RootWidget.drain_tick_ms;
@@ -114,17 +137,6 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         }
     } else {
         root.spinner_tick_accum = 0;
-    }
-
-    if (root.diff_refresh_pending) {
-        root.diff_tick_accum += RootWidget.drain_tick_ms;
-        if (root.diff_tick_accum >= RootWidget.diff_tick_threshold_ms) {
-            root.diff_tick_accum = 0;
-            root.diff_refresh_pending = false;
-            try root.app.scheduleDiffRefresh();
-        }
-    } else {
-        root.diff_tick_accum = 0;
     }
 
     if (root.app.metrics.blackhole_visible) {
@@ -140,10 +152,30 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         root.blackhole_tick_accum = 0;
     }
 
+    return visible_change;
+}
+
+/// Process timers that schedule deferred work. Currently this drains the
+/// diff-refresh delay and kicks off the actual refresh when it expires.
+fn processDelayedTimers(root: *RootWidget) !void {
+    if (root.diff_refresh_pending) {
+        root.diff_tick_accum += RootWidget.drain_tick_ms;
+        if (root.diff_tick_accum >= RootWidget.diff_tick_threshold_ms) {
+            root.diff_tick_accum = 0;
+            root.diff_refresh_pending = false;
+            try root.app.scheduleDiffRefresh();
+        }
+    } else {
+        root.diff_tick_accum = 0;
+    }
+}
+
+/// Decide whether more ticks are needed and re-schedule the next one.
+/// Keeps ticking while a turn is active OR interrupting, so the worker's
+/// remaining events (and its terminal `turn_finished`) get drained.
+fn scheduleNextTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     const model_loading = root.app.pickers.models.load == .loading;
     const diff_loading = root.app.metrics.diff_loading();
-    // Keep ticking while a turn is active OR interrupting, so the worker's
-    // remaining events (and its terminal `turn_finished`) get drained.
     const should_tick = root.app.anyTurnActive() or
         model_loading or
         diff_loading or
@@ -155,12 +187,6 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         try ctx.tick(RootWidget.drain_tick_ms, root.widget());
     } else {
         root.app.metrics.loading_tick_active = false;
-    }
-
-    if (visible_change) {
-        ctx.consumeAndRedraw();
-    } else {
-        ctx.consumeEvent();
     }
 }
 
