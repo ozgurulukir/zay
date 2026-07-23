@@ -170,8 +170,8 @@ pub fn runAgentTurn(agent: *agent_mod.Agent, worker_context: *Context, pending_p
             return;
         };
     }
-    agent.run(.{
-        .ptr = worker_context,
+    agent.run(agent_mod.Agent.Listener(Context){
+        .ctx = worker_context,
         .on_event = postAgentEvent,
     }) catch |err| {
         const message_text = if (err == error.TurnCancelled)
@@ -216,8 +216,7 @@ fn postTurnFailed(worker_context: *Context, err: anyerror) void {
 
 const queue_full_backoff_ms: u64 = 2;
 
-fn postAgentEvent(context: *anyopaque, event: agent_mod.Agent.Event) anyerror!void {
-    const worker_context: *Context = @ptrCast(@alignCast(context));
+fn postAgentEvent(worker_context: *Context, event: agent_mod.Agent.Event) anyerror!void {
     if (worker_context.cancel_requested.load(.acquire) and
         !worker_context.cancel_signaled.swap(true, .acq_rel))
     {

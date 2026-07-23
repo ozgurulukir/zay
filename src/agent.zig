@@ -301,35 +301,48 @@ pub const Agent = struct {
         }
     };
 
-    /// The typed seam consumers attach to receive `Agent.Event`s. Vtable-
-    /// style — `*anyopaque` is hidden behind `emit(event)` so callers see
-    /// only the typed method. `null_listener` is the branch-free default
-    /// for callers that don't subscribe.
-    pub const Listener = struct {
-        ptr: *anyopaque,
-        on_event: *const fn (*anyopaque, Event) anyerror!void,
+    /// The typed seam consumers attach to receive `Agent.Event`s. Generic
+    /// over the consumer's context type — the `*Ctx` is supplied at the call
+    /// site, so callbacks receive their own typed context without
+    /// `@ptrCast`. `nullListener(Ctx)` is the branch-free default for
+    /// callers that don't subscribe; the `Ctx` type is supplied by the
+    /// caller.
+    pub fn Listener(Ctx: type) type {
+        return struct {
+            ctx: *Ctx,
+            on_event: *const fn (ctx: *Ctx, event: Event) anyerror!void,
 
-        pub fn emit(self: Listener, event: Event) anyerror!void {
-            return self.on_event(self.ptr, event);
-        }
-
-        pub const null_listener: Listener = .{
-            .ptr = undefined,
-            .on_event = onNothing,
+            pub fn emit(self: @This(), event: Event) anyerror!void {
+                return self.on_event(self.ctx, event);
+            }
         };
+    }
 
-        fn onNothing(_: *anyopaque, _: Event) anyerror!void {}
-    };
+    /// Build a no-op `Listener(Ctx)`. The ctx pointer is left undefined —
+    /// the callback ignores its argument.
+    pub fn nullListener(Ctx: type) Listener(Ctx) {
+        return .{
+            .ctx = undefined,
+            .on_event = onNothingCtx,
+        };
+    }
 
-    pub fn run(self: *Agent, listener: Listener) !void {
-        try listener.emit(.turn_started);
+    fn onNothingCtx(_: *anyopaque, _: Event) anyerror!void {}
+
+    pub fn run(self: *Agent, listener: anytype) !void {
+        // The listener's `ctx` field is `*Ctx`; extract `Ctx` (the pointee
+        // type) so `Listener(Ctx)` matches the struct the caller built.
+        const Ctx = @typeInfo(@TypeOf(listener.ctx)).pointer.child;
+        const L = Agent.Listener(Ctx);
+        const l: L = listener;
+        try l.emit(.turn_started);
         const tool_call_limit = 100;
         var calls: u32 = 0;
         while (calls < tool_call_limit) : (calls += 1) {
-            self.maybeCompact(listener);
-            var stream_context: StreamContext = .{
+            self.maybeCompact(l);
+            var stream_context: StreamContext(L) = .{
                 .agent = self,
-                .listener = listener,
+                .listener = l,
             };
             defer stream_context.deinit();
             const prompt_messages = try context_assembly.pruneHistoricalToolResults(
@@ -340,13 +353,7 @@ pub const Agent = struct {
             );
             defer context_assembly.freePrunedMessages(self.gpa, prompt_messages);
 
-            var turn = try self.client.prompt(prompt_messages, .{
-                .ptr = &stream_context,
-                .on_content = onContentDelta,
-                .on_reasoning = onReasoningDelta,
-                .on_tool_delta = onToolDelta,
-                .on_delta_end = onDeltaEnd,
-            });
+            var turn = try self.client.prompt(prompt_messages, stream_context.observer());
             const usage = turn.usage;
             var turn_owned = true;
             defer if (turn_owned) turn.deinit(self.gpa);
@@ -370,18 +377,18 @@ pub const Agent = struct {
                 // handled at the natural turn end.
                 const drained_count = try self.drainQueuedUserMessage(false);
                 if (drained_count > 0) {
-                    try listener.emit(.{ .queued_messages_flushed = drained_count });
+                    try l.emit(.{ .queued_messages_flushed = drained_count });
                     continue;
                 }
                 return;
             }
-            try self.runToolBatch(ToolBatch.init(tool_calls), &stream_context, listener);
+            try Agent.runToolBatch(L, self, ToolBatch.init(tool_calls), &stream_context, l);
             // Mid-turn we only inject messages explicitly marked to steer, and
             // only from the front so FIFO order holds — a default-queued
             // message ahead of a steer one keeps it waiting for turn end.
             var steered: u32 = 0;
             while ((try self.drainQueuedUserMessage(true)) > 0) steered += 1;
-            if (steered > 0) try listener.emit(.{ .queued_messages_flushed = steered });
+            if (steered > 0) try l.emit(.{ .queued_messages_flushed = steered });
         }
         return error.ToolCallLimit;
     }
@@ -390,12 +397,13 @@ pub const Agent = struct {
     /// ToolCallObserver callbacks into the agent's Event stream, and move
     /// the LLM-channel of each ToolResult into history.
     fn runToolBatch(
+        comptime L: type,
         self: *Agent,
         tool_batch: ToolBatch,
-        stream_context: *const StreamContext,
-        listener: Listener,
+        stream_context: *const StreamContext(L),
+        listener: L,
     ) !void {
-        var bridge: ExecutorBridge = .{
+        var bridge: ExecutorBridge(L) = .{
             .agent = self,
             .listener = listener,
             .stream_context = stream_context,
@@ -413,9 +421,9 @@ pub const Agent = struct {
         });
         const results = try executor.runAll(tool_batch.calls, .{
             .ptr = &bridge,
-            .on_started = ExecutorBridge.onStarted,
-            .on_finished = ExecutorBridge.onFinished,
-            .approve_unsafe_bash = ExecutorBridge.approveUnsafeBash,
+            .on_started = ExecutorBridge(L).onStarted,
+            .on_finished = ExecutorBridge(L).onFinished,
+            .approve_unsafe_bash = ExecutorBridge(L).approveUnsafeBash,
         });
         defer self.gpa.free(results);
         errdefer for (results) |*r| r.deinit(self.gpa);
@@ -463,98 +471,146 @@ pub const Agent = struct {
     /// Bridges ExecutorService's `ToolCallObserver` callbacks into the
     /// agent's Event stream. Tracks tool_index across the batch so the
     /// events line up with the tool_indexes the TUI saw during deltas.
-    const ExecutorBridge = struct {
-        agent: *Agent,
-        listener: Listener,
-        stream_context: *const StreamContext,
-        tool_index: u32 = 0,
+    fn ExecutorBridge(comptime L: type) type {
+        return struct {
+            agent: *Agent,
+            listener: L,
+            stream_context: *const StreamContext(L),
+            tool_index: u32 = 0,
 
-        fn onStarted(ptr: *anyopaque, call: ai.ToolCall) anyerror!void {
-            const self: *ExecutorBridge = @ptrCast(@alignCast(ptr));
-            // Synthesise a tool_delta for the TUI if the LM did not stream
-            // one for this tool_call (some servers emit the whole call in
-            // one shot without intermediate deltas).
-            if (!self.stream_context.toolDeltaSeen(self.tool_index)) {
-                try self.agent.emitToolDelta(self.listener, self.tool_index, call.name, call.arguments);
-                try self.listener.emit(.delta_end);
+            fn onStarted(ptr: *anyopaque, call: ai.ToolCall) anyerror!void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                // Synthesise a tool_delta for the TUI if the LM did not stream
+                // one for this tool_call (some servers emit the whole call in
+                // one shot without intermediate deltas).
+                if (!self.stream_context.toolDeltaSeen(self.tool_index)) {
+                    try Agent.emitToolDelta(L, self.agent, self.listener, self.tool_index, call.name, call.arguments);
+                    try self.listener.emit(.delta_end);
+                }
             }
-        }
 
-        fn onFinished(ptr: *anyopaque, result: *const executor_mod.ToolResult) anyerror!void {
-            const self: *ExecutorBridge = @ptrCast(@alignCast(ptr));
-            try self.agent.emitToolCallFinished(
-                self.listener,
-                self.tool_index,
-                result.call_id,
-                result.name,
-                result.display_label,
-                result.display_expanded_label,
-                result.display_body,
-                result.display_kind,
-                result.stderr,
-                result.failed,
-            );
-            self.tool_index += 1;
-        }
-
-        fn approveUnsafeBash(ptr: *anyopaque, call: ai.ToolCall, command: []const u8) anyerror!bool {
-            _ = call;
-            const self: *ExecutorBridge = @ptrCast(@alignCast(ptr));
-            const approval = self.agent.bash_approval orelse return true;
-            return approval.request(approval.ptr, command);
-        }
-    };
-
-    const StreamContext = struct {
-        agent: *Agent,
-        listener: Listener,
-        tool_delta_seen: std.ArrayList(bool) = .empty,
-
-        fn deinit(self: *StreamContext) void {
-            self.tool_delta_seen.deinit(self.agent.gpa);
-        }
-
-        fn toolDeltaSeen(self: *const StreamContext, tool_index: u32) bool {
-            if (tool_index >= self.tool_delta_seen.items.len) return false;
-            return self.tool_delta_seen.items[tool_index];
-        }
-
-        fn markToolDeltaSeen(self: *StreamContext, tool_index: u32) !void {
-            while (self.tool_delta_seen.items.len <= tool_index) {
-                try self.tool_delta_seen.append(self.agent.gpa, false);
+            fn onFinished(ptr: *anyopaque, result: *const executor_mod.ToolResult) anyerror!void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                try Agent.emitToolCallFinished(
+                    L,
+                    self.agent,
+                    self.listener,
+                    self.tool_index,
+                    result.call_id,
+                    result.name,
+                    result.display_label,
+                    result.display_expanded_label,
+                    result.display_body,
+                    result.display_kind,
+                    result.stderr,
+                    result.failed,
+                );
+                self.tool_index += 1;
             }
-            self.tool_delta_seen.items[tool_index] = true;
-        }
-    };
 
-    fn onContentDelta(context: *anyopaque, delta: []const u8) anyerror!void {
-        const concrete: *StreamContext = @ptrCast(@alignCast(context));
-        const owned = try concrete.agent.gpa.dupe(u8, delta);
-        errdefer concrete.agent.gpa.free(owned);
-        try concrete.listener.emit(.{ .response_delta = owned });
+            fn approveUnsafeBash(ptr: *anyopaque, call: ai.ToolCall, command: []const u8) anyerror!bool {
+                _ = call;
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                const approval = self.agent.bash_approval orelse return true;
+                return approval.request(approval.ptr, command);
+            }
+        };
     }
 
-    fn onReasoningDelta(context: *anyopaque, delta: []const u8) anyerror!void {
-        const concrete: *StreamContext = @ptrCast(@alignCast(context));
-        const owned = try concrete.agent.gpa.dupe(u8, delta);
-        errdefer concrete.agent.gpa.free(owned);
-        try concrete.listener.emit(.{ .thinking_delta = owned });
+    /// Per-stream context shared between the agent and the ai client's
+    /// stream observer callbacks. Holds the typed listener plus the
+    /// delta-tracking list. The `observer()` method builds an
+    /// `ai.StreamObserver` whose callbacks are comptime-baked wrappers
+    /// around this `StreamContext` and its typed listener. The
+    /// `@ptrCast` inside the wrappers is the seam with `ai.StreamObserver`'s
+    /// `*anyopaque` interface — making that vtable generic over the context
+    /// type is sequenced as a follow-up to this PR (see
+    /// type-safety-refactor.md P1-A follow-up: `StreamObserver(Ctx)`).
+    fn StreamContext(comptime L: type) type {
+        return struct {
+            agent: *Agent,
+            listener: L,
+            tool_delta_seen: std.ArrayList(bool) = .empty,
+
+            const Self = @This();
+
+            fn deinit(self: *Self) void {
+                self.tool_delta_seen.deinit(self.agent.gpa);
+            }
+
+            fn toolDeltaSeen(self: *const Self, tool_index: u32) bool {
+                if (tool_index >= self.tool_delta_seen.items.len) return false;
+                return self.tool_delta_seen.items[tool_index];
+            }
+
+            fn markToolDeltaSeen(self: *Self, tool_index: u32) !void {
+                while (self.tool_delta_seen.items.len <= tool_index) {
+                    try self.tool_delta_seen.append(self.agent.gpa, false);
+                }
+                self.tool_delta_seen.items[tool_index] = true;
+            }
+
+            fn observer(self: *Self) ai.StreamObserver {
+                return .{
+                    .ptr = @ptrCast(self),
+                    .on_content = onContentDeltaImpl(L),
+                    .on_reasoning = onReasoningDeltaImpl(L),
+                    .on_tool_delta = onToolDeltaImpl(L),
+                    .on_delta_end = onDeltaEndImpl(L),
+                };
+            }
+        };
     }
 
-    fn onToolDelta(context: *anyopaque, delta: ai.ToolDelta) anyerror!void {
-        const concrete: *StreamContext = @ptrCast(@alignCast(context));
-        try concrete.markToolDeltaSeen(delta.index);
-        try concrete.agent.emitToolDelta(concrete.listener, delta.index, delta.name, delta.arguments);
+    fn onContentDeltaImpl(comptime L: type) *const fn (*anyopaque, []const u8) anyerror!void {
+        const F = struct {
+            fn call(ctx: *anyopaque, delta: []const u8) anyerror!void {
+                const concrete: *StreamContext(L) = @ptrCast(@alignCast(ctx));
+                const owned = try concrete.agent.gpa.dupe(u8, delta);
+                errdefer concrete.agent.gpa.free(owned);
+                try concrete.listener.emit(.{ .response_delta = owned });
+            }
+        };
+        return &F.call;
     }
 
-    fn onDeltaEnd(context: *anyopaque) anyerror!void {
-        const concrete: *StreamContext = @ptrCast(@alignCast(context));
-        try concrete.listener.emit(.delta_end);
+    fn onReasoningDeltaImpl(comptime L: type) *const fn (*anyopaque, []const u8) anyerror!void {
+        const F = struct {
+            fn call(ctx: *anyopaque, delta: []const u8) anyerror!void {
+                const concrete: *StreamContext(L) = @ptrCast(@alignCast(ctx));
+                const owned = try concrete.agent.gpa.dupe(u8, delta);
+                errdefer concrete.agent.gpa.free(owned);
+                try concrete.listener.emit(.{ .thinking_delta = owned });
+            }
+        };
+        return &F.call;
+    }
+
+    fn onToolDeltaImpl(comptime L: type) *const fn (*anyopaque, ai.ToolDelta) anyerror!void {
+        const F = struct {
+            fn call(ctx: *anyopaque, delta: ai.ToolDelta) anyerror!void {
+                const concrete: *StreamContext(L) = @ptrCast(@alignCast(ctx));
+                try concrete.markToolDeltaSeen(delta.index);
+                try Agent.emitToolDelta(L, concrete.agent, concrete.listener, delta.index, delta.name, delta.arguments);
+            }
+        };
+        return &F.call;
+    }
+
+    fn onDeltaEndImpl(comptime L: type) *const fn (*anyopaque) anyerror!void {
+        const F = struct {
+            fn call(ctx: *anyopaque) anyerror!void {
+                const concrete: *StreamContext(L) = @ptrCast(@alignCast(ctx));
+                try concrete.listener.emit(.delta_end);
+            }
+        };
+        return &F.call;
     }
 
     fn emitToolDelta(
+        comptime L: type,
         self: *Agent,
-        listener: Listener,
+        listener: L,
         tool_index: u32,
         name: []const u8,
         arguments: []const u8,
@@ -573,8 +629,9 @@ pub const Agent = struct {
     }
 
     fn emitToolCallFinished(
+        comptime L: type,
         self: *Agent,
-        listener: Listener,
+        listener: L,
         tool_index: u32,
         call_id: []const u8,
         name: []const u8,
@@ -747,7 +804,7 @@ pub const Agent = struct {
     /// boundary references a tree entry id and the projection emits from it to
     /// the leaf. Best-effort: every failure is logged and swallowed so
     /// compaction never aborts the turn.
-    fn maybeCompact(self: *Agent, listener: Listener) void {
+    fn maybeCompact(self: *Agent, listener: anytype) void {
         if (self.compaction_client == .none) return;
         if (self.context_window_tokens == 0) return;
         if (self.context_manager.session_writer == null) return;
@@ -756,7 +813,7 @@ pub const Agent = struct {
 
         // Past the swap watermark: install the ready background summary.
         if (compaction.shouldSwap(used, self.context_window_tokens)) {
-            self.applyReadyCompaction(listener) catch |err| std.log.warn("compaction apply failed: {s}", .{@errorName(err)});
+            Agent.applyReadyCompaction(@TypeOf(listener), self, listener) catch |err| std.log.warn("compaction apply failed: {s}", .{@errorName(err)});
         }
 
         // Past the start watermark: kick off the summary so it is ready by the
@@ -773,7 +830,7 @@ pub const Agent = struct {
             self.compactor.stateIs(.running))
         {
             self.joinCompactor();
-            self.applyReadyCompaction(listener) catch |err| std.log.warn("compaction apply failed: {s}", .{@errorName(err)});
+            Agent.applyReadyCompaction(@TypeOf(listener), self, listener) catch |err| std.log.warn("compaction apply failed: {s}", .{@errorName(err)});
         }
     }
 
@@ -803,7 +860,7 @@ pub const Agent = struct {
     /// Install a finished background summary: write the boundary, reproject, and
     /// emit the notice — instant, because the summary already exists. A failed
     /// run is logged and discarded. No-op while idle or still running.
-    fn applyReadyCompaction(self: *Agent, listener: Listener) !void {
+    fn applyReadyCompaction(comptime L: type, self: *Agent, listener: L) !void {
         const state = self.compactor.state.load(.acquire);
         if (state == .idle or state == .running) return;
         self.joinCompactor();
@@ -962,30 +1019,28 @@ test "streaming callbacks emit owned events" {
             self.events.deinit(allocator);
         }
 
-        fn onEvent(context: *anyopaque, event: Agent.Event) !void {
-            const seen: *@This() = @ptrCast(@alignCast(context));
-            try seen.events.append(std.testing.allocator, event);
+        fn onEvent(ctx: *@This(), event: Agent.Event) !void {
+            try ctx.events.append(std.testing.allocator, event);
         }
     };
     var seen: Seen = .{};
     defer seen.deinit(gpa);
-    var context: Agent.StreamContext = .{
+    const Listener = Agent.Listener(Seen);
+    var context: Agent.StreamContext(Listener) = .{
         .agent = &agent,
-        .listener = .{
-            .ptr = &seen,
-            .on_event = Seen.onEvent,
-        },
+        .listener = .{ .ctx = &seen, .on_event = Seen.onEvent },
     };
     defer context.deinit();
 
-    try Agent.onReasoningDelta(&context, "checking");
-    try Agent.onContentDelta(&context, "hello");
-    try Agent.onToolDelta(&context, .{
+    // Drive the wrapper functions the same way the ai stream layer would.
+    try Agent.onReasoningDeltaImpl(Listener)(@ptrCast(&context), "checking");
+    try Agent.onContentDeltaImpl(Listener)(@ptrCast(&context), "hello");
+    try Agent.onToolDeltaImpl(Listener)(@ptrCast(&context), .{
         .index = 1,
         .name = "bash",
         .arguments = "{\"command\":\"pwd\"}",
     });
-    try Agent.onDeltaEnd(&context);
+    try Agent.onDeltaEndImpl(Listener)(@ptrCast(&context));
 
     try std.testing.expectEqual(@as(usize, 4), seen.events.items.len);
     try std.testing.expectEqualStrings("checking", seen.events.items[0].thinking_delta);
