@@ -162,22 +162,12 @@ pub const Model = struct {
     }
 };
 
-pub const ProviderModel = struct {
-    id: []u8,
-    reasoning_effort: ?ai.ReasoningEffort = null,
-
-    pub fn deinit(self: *ProviderModel, gpa: std.mem.Allocator) void {
-        gpa.free(self.id);
-        self.* = undefined;
-    }
-
-    fn clone(self: ProviderModel, gpa: std.mem.Allocator) !ProviderModel {
-        return .{
-            .id = try gpa.dupe(u8, self.id),
-            .reasoning_effort = self.reasoning_effort,
-        };
-    }
-};
+/// Per-provider model entry. Identical in shape to `Model` — kept as a
+/// type alias so callers that conceptually deal with "a model entry
+/// declared inside a ProviderConfig" can name it explicitly. The two
+/// were line-for-line duplicates before; the alias removes the drift
+/// risk for good.
+pub const ProviderModel = Model;
 
 pub const ProviderConfig = struct {
     provider: Provider,
