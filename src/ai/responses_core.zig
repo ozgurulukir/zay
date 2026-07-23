@@ -231,7 +231,7 @@ pub fn writeRequestPayload(out: *std.Io.Writer, config: ai.Config, responses_con
     try out.writeAll(",\"input\":[");
     var written: u32 = 0;
     for (messages) |message| {
-        if (config.system_prompt.len > 0 and message.role == .system) continue;
+        if (config.system_prompt.len > 0 and message == .system) continue;
         if (written > 0) try out.writeByte(',');
         try writeInputMessage(out, message);
         written += 1;
@@ -275,18 +275,25 @@ pub fn writeRequestPayload(out: *std.Io.Writer, config: ai.Config, responses_con
 }
 
 fn writeInputMessage(out: *std.Io.Writer, message: ai.ChatMessage) !void {
-    if (message.role == .assistant) return writeAssistantItems(out, message);
-    if (message.role == .tool) return writeToolOutput(out, message);
-    try out.writeAll("{\"type\":\"message\",\"role\":");
-    try std.json.Stringify.value(message.role.label(), .{}, out);
-    try out.writeAll(",\"content\":");
-    try writeInputContent(out, message.content);
-    try out.writeByte('}');
+    switch (message) {
+        .assistant => return writeAssistantItems(out, message),
+        .tool => return writeToolOutput(out, message),
+        .system => {
+            try out.writeAll("{\"type\":\"message\",\"role\":\"system\",\"content\":");
+            try writeInputContent(out, message.system.content);
+            try out.writeByte('}');
+        },
+        .user => {
+            try out.writeAll("{\"type\":\"message\",\"role\":\"user\",\"content\":");
+            try writeInputContent(out, message.user.content);
+            try out.writeByte('}');
+        },
+    }
 }
 
 fn writeAssistantItems(out: *std.Io.Writer, message: ai.ChatMessage) !void {
     var first = true;
-    for (message.content) |block| {
+    for (message.assistant.content) |block| {
         if (!first) try out.writeByte(',');
         first = false;
         switch (block) {
@@ -333,7 +340,7 @@ fn writeFunctionCall(out: *std.Io.Writer, call: ai.ToolCall) !void {
 
 fn writeToolOutput(out: *std.Io.Writer, message: ai.ChatMessage) !void {
     try out.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
-    try std.json.Stringify.value(message.call_id orelse "", .{}, out);
+    try std.json.Stringify.value(message.tool.call_id, .{}, out);
     try out.writeAll(",\"output\":");
     try std.json.Stringify.value(message.text(), .{}, out);
     try out.writeByte('}');
@@ -424,7 +431,7 @@ pub const StreamState = struct {
         try syncToolBlocks(gpa, &self.blocks, self.tools.items, call_seq);
         const content = try self.blocks.toOwnedSlice(gpa);
         self.blocks = .empty;
-        return .{ .assistant = .{ .role = .assistant, .content = content }, .usage = self.usage };
+        return .{ .assistant = .{ .assistant = .{ .content = content } }, .usage = self.usage };
     }
 };
 
@@ -845,7 +852,7 @@ test "writeRequestPayload puts system prompt in instructions for standard mode" 
     const gpa = std.testing.allocator;
     const empty_content = try gpa.alloc(ai.ContentBlock, 0);
     defer gpa.free(empty_content);
-    const system_message: ai.ChatMessage = .{ .role = .system, .content = empty_content };
+    const system_message: ai.ChatMessage = .{ .system = .{ .content = empty_content } };
     const config: ai.Config = .{
         .base_url = "",
         .api_key = "",
@@ -961,7 +968,7 @@ test "openresponses emits final item text when no delta arrived" {
     var turn = try state.finish(gpa, &call_seq);
     defer turn.deinit(gpa);
     try std.testing.expectEqualStrings("hello", seen.text.items);
-    try std.testing.expectEqualStrings("hello", turn.assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("hello", turn.assistant.assistant.content[0].text.text);
 }
 
 test "openresponses preserves text tool text block order" {
@@ -981,10 +988,10 @@ test "openresponses preserves text tool text block order" {
 
     var turn = try state.finish(gpa, &call_seq);
     defer turn.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, 3), turn.assistant.content.len);
-    try std.testing.expectEqualStrings("before", turn.assistant.content[0].text.text);
-    try std.testing.expectEqualStrings("bash", turn.assistant.content[1].tool_call.name);
-    try std.testing.expectEqualStrings("after", turn.assistant.content[2].text.text);
+    try std.testing.expectEqual(@as(usize, 3), turn.assistant.assistant.content.len);
+    try std.testing.expectEqualStrings("before", turn.assistant.assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("bash", turn.assistant.assistant.content[1].tool_call.name);
+    try std.testing.expectEqualStrings("after", turn.assistant.assistant.content[2].text.text);
 }
 
 test "openresponses parses usage from completed event" {
@@ -1037,8 +1044,8 @@ test "openresponses routes parallel argument deltas by output index" {
 
     var turn = try state.finish(gpa, &call_seq);
     defer turn.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, 2), turn.assistant.content.len);
-    try std.testing.expectEqualStrings("{\"command\":\"pwd\"}", turn.assistant.content[0].tool_call.arguments);
-    try std.testing.expectEqualStrings("{\"path\":\"src/main.zig\"}", turn.assistant.content[1].tool_call.arguments);
-    try std.testing.expectEqualStrings("bash", turn.assistant.content[1].tool_call.name);
+    try std.testing.expectEqual(@as(usize, 2), turn.assistant.assistant.content.len);
+    try std.testing.expectEqualStrings("{\"command\":\"pwd\"}", turn.assistant.assistant.content[0].tool_call.arguments);
+    try std.testing.expectEqualStrings("{\"path\":\"src/main.zig\"}", turn.assistant.assistant.content[1].tool_call.arguments);
+    try std.testing.expectEqualStrings("bash", turn.assistant.assistant.content[1].tool_call.name);
 }

@@ -77,7 +77,7 @@ fn requestSlug(gpa: std.mem.Allocator, job: *BranchJob) !?[]u8 {
     // blocks of the reply.
     const blocks = try gpa.alloc(ai.ContentBlock, 1);
     blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, prompt.written()) } };
-    var message: ai.ChatMessage = .{ .role = .user, .content = blocks };
+    var message: ai.ChatMessage = .{ .user = .{ .content = blocks } };
     defer message.deinit(gpa);
 
     var turn = try job.client.prompt(&.{message}, ai.StreamObserver.noop);
@@ -85,7 +85,7 @@ fn requestSlug(gpa: std.mem.Allocator, job: *BranchJob) !?[]u8 {
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    for (turn.assistant.content) |block| {
+    for (turn.assistant.assistant.content) |block| {
         if (block == .text) try out.appendSlice(gpa, block.text.text);
     }
     return try sanitizeBranchSlug(gpa, out.items);

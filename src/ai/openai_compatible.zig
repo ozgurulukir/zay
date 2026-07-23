@@ -293,23 +293,29 @@ fn writeToolDefinition(
 
 fn writeMessage(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMessage) !void {
     try out.writeAll("{\"role\":");
-    try std.json.Stringify.value(message.role.label(), .{}, out);
-    if (message.role == .system) {
-        try out.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}");
+    const role_label: []const u8 = switch (message) {
+        .system => "system",
+        .user => "user",
+        .assistant => "assistant",
+        .tool => "tool",
+    };
+    try std.json.Stringify.value(role_label, .{}, out);
+    switch (message) {
+        .system => try out.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}"),
+        else => {},
     }
     try out.writeAll(",\"content\":");
-    if (message.role == .user) {
-        try writeUserContent(out, message.content);
-    } else {
-        try writeTextContent(out, gpa, message.content);
+    switch (message) {
+        .user => try writeUserContent(out, message.user.content),
+        inline .system, .assistant, .tool => |m| try writeTextContent(out, gpa, m.content),
     }
-    if (message.call_id) |call_id| {
+    if (message == .tool) {
         try out.writeAll(",\"tool_call_id\":");
-        try std.json.Stringify.value(call_id, .{}, out);
+        try std.json.Stringify.value(message.tool.call_id, .{}, out);
     }
-    if (message.role == .assistant) {
+    if (message == .assistant) {
         var wrote_calls = false;
-        for (message.content) |block| {
+        for (message.assistant.content) |block| {
             if (block != .tool_call) continue;
             if (!wrote_calls) {
                 try out.writeAll(",\"tool_calls\":[");
@@ -544,7 +550,7 @@ fn readStream(
         if (builder.name.items.len == 0) continue;
         try blocks.append(gpa, .{ .tool_call = try builder.toToolCall(gpa, tool_call_seq) });
     }
-    return .{ .assistant = .{ .role = .assistant, .content = try blocks.toOwnedSlice(gpa) }, .usage = usage };
+    return .{ .assistant = .{ .assistant = .{ .content = try blocks.toOwnedSlice(gpa) } }, .usage = usage };
 }
 
 const ChunkChange = struct {
@@ -1027,7 +1033,7 @@ test "readStream accepts an SSE line larger than the transfer buffer" {
     var tool_call_seq: u64 = 0;
     var response = try readStream(gpa, &reader, ai.StreamObserver.noop, &tool_call_seq);
     defer response.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, transfer_buffer_bytes + 512), response.assistant.content[0].text.text.len);
+    try std.testing.expectEqual(@as(usize, transfer_buffer_bytes + 512), response.assistant.assistant.content[0].text.text.len);
 }
 
 test "readStream skips empty data lines without crashing" {
@@ -1043,7 +1049,7 @@ test "readStream skips empty data lines without crashing" {
     var tool_call_seq: u64 = 0;
     var response = try readStream(gpa, &reader, ai.StreamObserver.noop, &tool_call_seq);
     defer response.deinit(gpa);
-    try std.testing.expectEqualStrings("hi", response.assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("hi", response.assistant.assistant.content[0].text.text);
 }
 
 test "parse streaming content tolerates null prelude" {

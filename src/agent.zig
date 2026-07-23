@@ -164,7 +164,7 @@ pub const Agent = struct {
             self.gpa.free(blocks);
         }
         try self.prependSkillBlocks(prompt, blocks);
-        try self.context_manager.appendPersisted(.{ .role = .user, .content = blocks });
+        try self.context_manager.appendPersisted(.{ .user = .{ .content = blocks } });
     }
 
     /// Result text recorded for a tool call the user interrupted before it
@@ -181,8 +181,9 @@ pub const Agent = struct {
         var resolved = std.StringHashMap(void).init(self.gpa);
         defer resolved.deinit();
         for (history) |message| {
-            if (message.role == .tool) {
-                if (message.call_id) |id| try resolved.put(id, {});
+            switch (message) {
+                .tool => |t| try resolved.put(t.call_id, {}),
+                else => {},
             }
         }
 
@@ -194,11 +195,15 @@ pub const Agent = struct {
             missing.deinit(self.gpa);
         }
         for (history) |message| {
-            if (message.role != .assistant) continue;
-            for (message.content) |block| {
-                if (block != .tool_call) continue;
-                if (resolved.contains(block.tool_call.call_id)) continue;
-                try missing.append(self.gpa, try self.gpa.dupe(u8, block.tool_call.call_id));
+            switch (message) {
+                .assistant => |a| {
+                    for (a.content) |block| {
+                        if (block != .tool_call) continue;
+                        if (resolved.contains(block.tool_call.call_id)) continue;
+                        try missing.append(self.gpa, try self.gpa.dupe(u8, block.tool_call.call_id));
+                    }
+                },
+                else => continue,
             }
         }
 
@@ -207,11 +212,12 @@ pub const Agent = struct {
             errdefer self.gpa.free(blocks);
             blocks[0] = .{ .text = .{ .text = try self.gpa.dupe(u8, interrupted_tool_result) } };
             try self.context_manager.appendPersisted(.{
-                .role = .tool,
-                .content = blocks,
-                .call_id = try self.gpa.dupe(u8, id),
-                .tool_display_label = try self.gpa.dupe(u8, "cancelled"),
-                .tool_failed = true,
+                .tool = .{
+                    .content = blocks,
+                    .call_id = try self.gpa.dupe(u8, id),
+                    .display_label = try self.gpa.dupe(u8, "cancelled"),
+                    .failed = true,
+                },
             });
         }
     }
@@ -360,7 +366,7 @@ pub const Agent = struct {
 
             const tool_calls = try self.collectToolCalls(turn.assistant);
             defer self.gpa.free(tool_calls);
-            if (turn.assistant.content.len > 0) {
+            if (turn.assistant == .assistant and turn.assistant.assistant.content.len > 0) {
                 try self.takeAssistantMessage(&turn.assistant);
                 turn_owned = false;
             } else {
@@ -691,7 +697,28 @@ pub const Agent = struct {
         errdefer self.gpa.free(blocks);
         blocks[0] = .{ .text = .{ .text = try self.gpa.dupe(u8, content) } };
         errdefer blocks[0].deinit(self.gpa);
-        return .{ .role = role, .content = blocks };
+        return switch (role) {
+            .system => .{ .system = .{ .content = blocks } },
+            .user => .{ .user = .{ .content = blocks } },
+            .assistant => .{ .assistant = .{ .content = blocks } },
+            .tool => @panic("makeTextMessage: tool role requires makeToolMessage"),
+        };
+    }
+
+    /// Build a fake tool message for tests that need a tool result without
+    /// going through the executor. `call_id` defaults to "test_call".
+    fn makeToolMessage(self: *Agent, content: []const u8) !ai.ChatMessage {
+        assert(content.len > 0);
+        const blocks = try self.gpa.alloc(ai.ContentBlock, 1);
+        errdefer self.gpa.free(blocks);
+        blocks[0] = .{ .text = .{ .text = try self.gpa.dupe(u8, content) } };
+        errdefer blocks[0].deinit(self.gpa);
+        return .{
+            .tool = .{
+                .call_id = try self.gpa.dupe(u8, "test_call"),
+                .content = blocks,
+            },
+        };
     }
 
     fn drainQueuedUserMessage(self: *Agent, steer_only: bool) !u32 {
@@ -752,20 +779,21 @@ pub const Agent = struct {
     }
 
     fn takeAssistantMessage(self: *Agent, assistant: *ai.ChatMessage) !void {
-        assert(assistant.role == .assistant);
+        assert(assistant.* == .assistant);
         try self.context_manager.appendPersisted(assistant.*);
         assistant.* = undefined;
     }
 
     fn collectToolCalls(self: *Agent, assistant: ai.ChatMessage) ![]ai.ToolCall {
-        assert(assistant.role == .assistant);
+        assert(assistant == .assistant);
+        const content = assistant.assistant.content;
         var count: usize = 0;
-        for (assistant.content) |block| {
+        for (content) |block| {
             if (block == .tool_call) count += 1;
         }
         const calls = try self.gpa.alloc(ai.ToolCall, count);
         var index: usize = 0;
-        for (assistant.content) |block| {
+        for (content) |block| {
             if (block != .tool_call) continue;
             calls[index] = block.tool_call;
             index += 1;
@@ -785,11 +813,12 @@ pub const Agent = struct {
             errdefer self.gpa.free(blocks);
             blocks[0] = .{ .text = .{ .text = r.content } };
             try self.context_manager.appendPersisted(.{
-                .role = .tool,
-                .content = blocks,
-                .call_id = r.call_id,
-                .tool_display_label = r.display_label,
-                .tool_failed = r.failed,
+                .tool = .{
+                    .content = blocks,
+                    .call_id = r.call_id,
+                    .display_label = r.display_label,
+                    .failed = r.failed,
+                },
             });
             self.gpa.free(r.name);
             if (r.display_expanded_label) |label| self.gpa.free(label);
@@ -1086,11 +1115,11 @@ test "interrupted tool calls get synthetic cancelled results" {
     const calls = try gpa.alloc(ai.ContentBlock, 2);
     calls[0] = .{ .tool_call = .{ .call_id = try gpa.dupe(u8, "call_a"), .name = try gpa.dupe(u8, "read"), .arguments = try gpa.dupe(u8, "{}") } };
     calls[1] = .{ .tool_call = .{ .call_id = try gpa.dupe(u8, "call_b"), .name = try gpa.dupe(u8, "bash"), .arguments = try gpa.dupe(u8, "{}") } };
-    try agent.context_manager.appendUnpersisted(.{ .role = .assistant, .content = calls });
+    try agent.context_manager.appendUnpersisted(.{ .assistant = .{ .content = calls } });
 
     const result = try gpa.alloc(ai.ContentBlock, 1);
     result[0] = .{ .text = .{ .text = try gpa.dupe(u8, "ok") } };
-    try agent.context_manager.appendUnpersisted(.{ .role = .tool, .content = result, .call_id = try gpa.dupe(u8, "call_a") });
+    try agent.context_manager.appendUnpersisted(.{ .tool = .{ .call_id = try gpa.dupe(u8, "call_a"), .content = result } });
 
     try agent.reconcileInterruptedToolCalls();
 
@@ -1099,9 +1128,9 @@ test "interrupted tool calls get synthetic cancelled results" {
     const items = agent.messages();
     try std.testing.expectEqual(@as(usize, 3), items.len);
     const synthetic = items[2];
-    try std.testing.expectEqual(ai.Role.tool, synthetic.role);
-    try std.testing.expectEqualStrings("call_b", synthetic.call_id.?);
-    try std.testing.expect(synthetic.tool_failed);
+    try std.testing.expect(synthetic == .tool);
+    try std.testing.expectEqualStrings("call_b", synthetic.tool.call_id);
+    try std.testing.expect(synthetic.tool.failed);
 
     // Idempotent: every call now has a result, so a second pass adds nothing.
     try agent.reconcileInterruptedToolCalls();
@@ -1117,7 +1146,7 @@ test "context token estimate anchors on usage plus trailing messages" {
     try agent.context_manager.appendUnpersisted(try agent.makeTextMessage(.assistant, "a" ** 40));
     agent.recordUsage(.{ .input_tokens = 1000, .output_tokens = 200, .total_tokens = 1200 });
     // A tool result appended afterwards (~40 bytes -> 10 estimated tokens).
-    try agent.context_manager.appendUnpersisted(try agent.makeTextMessage(.tool, "b" ** 40));
+    try agent.context_manager.appendUnpersisted(try agent.makeToolMessage("b" ** 40));
 
     // anchor total (1000 + 200) + trailing estimate (10) = 1210
     try std.testing.expectEqual(@as(u32, 1210), agent.currentContextTokens());

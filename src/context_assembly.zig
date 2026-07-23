@@ -127,7 +127,7 @@ pub fn pruneHistoricalToolResults(
     var i: usize = messages.len;
     while (i > 0) {
         i -= 1;
-        if (messages[i].role == .tool) {
+        if (messages[i] == .tool) {
             tool_turns_seen += 1;
             if (tool_turns_seen > keep_recent_tool_turns and cutoff_index == messages.len) {
                 cutoff_index = i + 1; // Everything before cutoff_index is historical
@@ -137,7 +137,7 @@ pub fn pruneHistoricalToolResults(
 
     // Copy messages; prune tool output text if before cutoff_index
     for (messages, 0..) |msg, idx| {
-        if (idx < cutoff_index and msg.role == .tool) {
+        if (idx < cutoff_index and msg == .tool) {
             result[idx] = try pruneSingleToolMessage(gpa, msg, historical_tool_cap_bytes);
         } else {
             result[idx] = try cloneChatMessage(gpa, msg);
@@ -157,15 +157,14 @@ pub fn freePrunedMessages(gpa: std.mem.Allocator, messages: []ai.ChatMessage) vo
 pub fn calculateBudget(messages: []const ai.ChatMessage, system_prompt: []const u8, context_window: u32) ContextBudget {
     var sys_blocks = [_]ai.ContentBlock{.{ .text = .{ .text = @constCast(system_prompt) } }};
     const system_tokens = compaction.estimateMessageTokens(.{
-        .role = .system,
-        .content = &sys_blocks,
+        .system = .{ .content = &sys_blocks },
     });
     var history_tokens: u32 = 0;
     var tool_result_tokens: u32 = 0;
 
     for (messages) |msg| {
         const est = compaction.estimateMessageTokens(msg);
-        if (msg.role == .tool) {
+        if (msg == .tool) {
             tool_result_tokens +|= est;
         } else {
             history_tokens +|= est;
@@ -207,11 +206,12 @@ fn readProjectRuleFile(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, file
 }
 
 fn pruneSingleToolMessage(gpa: std.mem.Allocator, msg: ai.ChatMessage, cap_bytes: u32) !ai.ChatMessage {
-    assert(msg.role == .tool);
-    var pruned_blocks = try gpa.alloc(ai.ContentBlock, msg.content.len);
+    assert(msg == .tool);
+    const content = msg.tool.content;
+    var pruned_blocks = try gpa.alloc(ai.ContentBlock, content.len);
     errdefer gpa.free(pruned_blocks);
 
-    for (msg.content, 0..) |block, b_idx| {
+    for (content, 0..) |block, b_idx| {
         if (block == .text and block.text.text.len > cap_bytes) {
             const original_len = block.text.text.len;
             const head = block.text.text[0..cap_bytes];
@@ -227,27 +227,48 @@ fn pruneSingleToolMessage(gpa: std.mem.Allocator, msg: ai.ChatMessage, cap_bytes
     }
 
     return .{
-        .role = .tool,
-        .content = pruned_blocks,
-        .call_id = if (msg.call_id) |id| try gpa.dupe(u8, id) else null,
-        .tool_display_label = if (msg.tool_display_label) |l| try gpa.dupe(u8, l) else null,
-        .tool_failed = msg.tool_failed,
+        .tool = .{
+            .content = pruned_blocks,
+            .call_id = try gpa.dupe(u8, msg.tool.call_id),
+            .display_label = if (msg.tool.display_label) |l| try gpa.dupe(u8, l) else null,
+            .failed = msg.tool.failed,
+        },
     };
 }
 
 fn cloneChatMessage(gpa: std.mem.Allocator, msg: ai.ChatMessage) !ai.ChatMessage {
-    const blocks = try gpa.alloc(ai.ContentBlock, msg.content.len);
+    switch (msg) {
+        .system => |m| {
+            const blocks = try cloneBlocks(gpa, m.content);
+            return .{ .system = .{ .content = blocks } };
+        },
+        .user => |m| {
+            const blocks = try cloneBlocks(gpa, m.content);
+            return .{ .user = .{ .content = blocks } };
+        },
+        .assistant => |m| {
+            const blocks = try cloneBlocks(gpa, m.content);
+            return .{ .assistant = .{ .content = blocks } };
+        },
+        .tool => |m| {
+            const blocks = try cloneBlocks(gpa, m.content);
+            return .{ .tool = .{
+                .content = blocks,
+                .call_id = try gpa.dupe(u8, m.call_id),
+                .display_label = if (m.display_label) |l| try gpa.dupe(u8, l) else null,
+                .failed = m.failed,
+            } };
+        },
+    }
+}
+
+fn cloneBlocks(gpa: std.mem.Allocator, content: []const ai.ContentBlock) ![]ai.ContentBlock {
+    const blocks = try gpa.alloc(ai.ContentBlock, content.len);
     errdefer gpa.free(blocks);
-    for (msg.content, 0..) |block, i| {
+    for (content, 0..) |block, i| {
         blocks[i] = try cloneContentBlock(gpa, block);
     }
-    return .{
-        .role = msg.role,
-        .content = blocks,
-        .call_id = if (msg.call_id) |id| try gpa.dupe(u8, id) else null,
-        .tool_display_label = if (msg.tool_display_label) |l| try gpa.dupe(u8, l) else null,
-        .tool_failed = msg.tool_failed,
-    };
+    return blocks;
 }
 
 fn cloneContentBlock(gpa: std.mem.Allocator, block: ai.ContentBlock) !ai.ContentBlock {
@@ -309,12 +330,13 @@ test "pruneHistoricalToolResults caps old tool outputs while preserving recent o
 
     try std.testing.expectEqual(@as(usize, 6), pruned.len);
     // Historical tool 1 (index 1) should be truncated
-    const t1_text = pruned[1].content[0].text.text;
+    const t1_text = pruned[1].tool.content[0].text.text;
     try std.testing.expect(std.mem.indexOf(u8, t1_text, "historical tool output truncated") != null);
+
     try std.testing.expect(t1_text.len < 300);
 
     // Recent tool 1 (index 3) should be full length
-    const t3_text = pruned[3].content[0].text.text;
+    const t3_text = pruned[3].tool.content[0].text.text;
     try std.testing.expectEqual(@as(usize, 2000), t3_text.len);
 }
 
@@ -337,7 +359,12 @@ fn makeTextMessage(gpa: std.mem.Allocator, role: ai.Role, text: []const u8) !ai.
     const blocks = try gpa.alloc(ai.ContentBlock, 1);
     errdefer gpa.free(blocks);
     blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, text) } };
-    return .{ .role = role, .content = blocks };
+    return switch (role) {
+        .system => .{ .system = .{ .content = blocks } },
+        .user => .{ .user = .{ .content = blocks } },
+        .assistant => .{ .assistant = .{ .content = blocks } },
+        .tool => @panic("makeTextMessage: tool role requires makeToolMessage"),
+    };
 }
 
 fn makeToolMessage(gpa: std.mem.Allocator, call_id: []const u8, text: []const u8) !ai.ChatMessage {
@@ -345,9 +372,10 @@ fn makeToolMessage(gpa: std.mem.Allocator, call_id: []const u8, text: []const u8
     errdefer gpa.free(blocks);
     blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, text) } };
     return .{
-        .role = .tool,
-        .content = blocks,
-        .call_id = try gpa.dupe(u8, call_id),
-        .tool_display_label = try gpa.dupe(u8, "bash"),
+        .tool = .{
+            .content = blocks,
+            .call_id = try gpa.dupe(u8, call_id),
+            .display_label = try gpa.dupe(u8, "bash"),
+        },
     };
 }

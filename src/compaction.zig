@@ -130,7 +130,7 @@ pub fn summarize(gpa: std.mem.Allocator, client: ai.LanguageModel, prefix_text: 
         return err;
     };
     blocks[0] = .{ .text = .{ .text = request } };
-    var message: ai.ChatMessage = .{ .role = .user, .content = blocks };
+    var message: ai.ChatMessage = .{ .user = .{ .content = blocks } };
     defer message.deinit(gpa);
 
     var turn = try client.prompt(&.{message}, ai.StreamObserver.noop);
@@ -138,7 +138,7 @@ pub fn summarize(gpa: std.mem.Allocator, client: ai.LanguageModel, prefix_text: 
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
-    for (turn.assistant.content) |block| {
+    for (turn.assistant.assistant.content) |block| {
         if (block == .text) try out.appendSlice(gpa, block.text.text);
     }
     return out.toOwnedSlice(gpa);
@@ -148,8 +148,12 @@ pub fn summarize(gpa: std.mem.Allocator, client: ai.LanguageModel, prefix_text: 
 /// (chars/4, rounded up). A fallback for when the provider omits usage and the
 /// unit used to choose the cut point.
 pub fn estimateMessageTokens(message: ai.ChatMessage) u32 {
+    const content: []const ai.ContentBlock = switch (message) {
+        inline .system, .user, .assistant => |m| m.content,
+        .tool => |t| t.content,
+    };
     var bytes: u32 = 0;
-    for (message.content) |block| {
+    for (content) |block| {
         bytes +|= blockBytes(block);
     }
     return divCeil(bytes, tokens_per_char_divisor);
@@ -213,7 +217,7 @@ fn keepRecentUserMessage(messages: []const ai.ChatMessage, cut: u32, kept_tokens
 /// a `.tool` message orphaned from its assistant tool-call.
 fn avoidOrphanToolResult(messages: []const ai.ChatMessage, cut: u32) u32 {
     var index = cut;
-    while (index > 0 and messages[index].role == .tool) {
+    while (index > 0 and messages[index] == .tool) {
         index -= 1;
     }
     return index;
@@ -223,7 +227,7 @@ fn lastUserIndex(messages: []const ai.ChatMessage) ?u32 {
     var index: u32 = @intCast(messages.len);
     while (index > 0) {
         index -= 1;
-        if (messages[index].role == .user) return index;
+        if (messages[index] == .user) return index;
     }
     return null;
 }
@@ -243,22 +247,35 @@ pub fn serializePrefix(gpa: std.mem.Allocator, messages: []const ai.ChatMessage)
 }
 
 fn writeMessage(out: *std.Io.Writer, message: ai.ChatMessage) !void {
-    const label = message.role.label();
-    if (message.role == .tool) {
-        try out.print("[tool result]: {s}\n", .{cappedText(firstText(message))});
-        return;
-    }
-    for (message.content) |block| {
-        switch (block) {
-            .text => |text| try out.print("[{s}]: {s}\n", .{ label, text.text }),
-            .tool_call => |call| try out.print("[{s} tool_call]: {s}({s})\n", .{ label, call.name, call.arguments }),
-            .reasoning, .image => {},
-        }
+    switch (message) {
+        .tool => |t| {
+            try out.print("[tool result]: {s}\n", .{cappedText(firstText(message))});
+            _ = t;
+        },
+        inline .system, .user, .assistant => |m| {
+            const label: []const u8 = switch (message) {
+                .system => "system",
+                .user => "user",
+                .assistant => "assistant",
+                .tool => unreachable,
+            };
+            for (m.content) |block| {
+                switch (block) {
+                    .text => |text| try out.print("[{s}]: {s}\n", .{ label, text.text }),
+                    .tool_call => |call| try out.print("[{s} tool_call]: {s}({s})\n", .{ label, call.name, call.arguments }),
+                    .reasoning, .image => {},
+                }
+            }
+        },
     }
 }
 
 fn firstText(message: ai.ChatMessage) []const u8 {
-    for (message.content) |block| {
+    const content: []const ai.ContentBlock = switch (message) {
+        inline .system, .user, .assistant => |m| m.content,
+        .tool => |t| t.content,
+    };
+    for (content) |block| {
         if (block == .text) return block.text.text;
     }
     return "";
@@ -339,7 +356,7 @@ test "cut index keeps recent budget and never orphans a tool result" {
     // Reached budget at index 1, which is the assistant — not a tool result —
     // so the kept window does not start on an orphaned tool result.
     try std.testing.expect(cut <= 1);
-    try std.testing.expect(messages[cut].role != .tool);
+    try std.testing.expect(messages[cut] != .tool);
 }
 
 test "stored summary injects into the handover placeholder" {
@@ -370,7 +387,7 @@ test "cut keeps a recent user message a large tool result pushed out of the tail
     // budget 80 keeps only the tool (100t); the user ask sits just before it.
     const cut = findCutIndex(&messages, 80);
     try std.testing.expectEqual(@as(u32, 1), cut); // pulled back to the user ask
-    try std.testing.expectEqual(.user, messages[cut].role);
+    try std.testing.expect(messages[cut] == .user);
 }
 
 test "cut does not force-keep an ancient user message behind heavy tool output" {
@@ -416,12 +433,17 @@ fn textMessage(gpa: std.mem.Allocator, role: ai.Role, text: []const u8) !ai.Chat
     const blocks = try gpa.alloc(ai.ContentBlock, 1);
     errdefer gpa.free(blocks);
     blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, text) } };
-    return .{ .role = role, .content = blocks };
+    return switch (role) {
+        .system => .{ .system = .{ .content = blocks } },
+        .user => .{ .user = .{ .content = blocks } },
+        .assistant => .{ .assistant = .{ .content = blocks } },
+        .tool => @panic("textMessage: tool role requires toolMessage"),
+    };
 }
 
 fn toolMessage(gpa: std.mem.Allocator, text: []const u8) !ai.ChatMessage {
     const blocks = try gpa.alloc(ai.ContentBlock, 1);
     errdefer gpa.free(blocks);
     blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, text) } };
-    return .{ .role = .tool, .content = blocks, .call_id = try gpa.dupe(u8, "c1") };
+    return .{ .tool = .{ .call_id = try gpa.dupe(u8, "c1"), .content = blocks } };
 }

@@ -53,17 +53,17 @@ pub fn clearConversation(app: *App) !void {
 pub fn rebuildTranscriptFromAgent(app: *App) !void {
     try clearConversation(app);
     for (app.thread.agent.?.messages()) |message| {
-        if (message.role == .system) continue;
+        if (message.role() == .system) continue;
         const text = message.text();
-        if (message.role == .user) {
+        if (message.role() == .user) {
             _ = try app.thread.transcript.append(app.gpa, .user, "you", text);
-        } else if (message.role == .assistant) {
+        } else if (message.role() == .assistant) {
             if (text.len > 0) _ = try app.thread.transcript.append(app.gpa, .agent, "agent", text);
-        } else if (message.role == .tool) {
+        } else if (message.role() == .tool) {
             const title = try resumedToolTitle(app, message);
             defer app.gpa.free(title);
             const index = try app.thread.transcript.append(app.gpa, .tool, title, text);
-            app.thread.transcript.messages.items[index].failed = message.tool_failed;
+            app.thread.transcript.messages.items[index].failed = message.tool.failed;
         }
     }
     if (app.thread.transcript.messages.items.len > 0) app.thread.transcript.selected = @intCast(app.thread.transcript.messages.items.len - 1);
@@ -71,7 +71,7 @@ pub fn rebuildTranscriptFromAgent(app: *App) !void {
     // it from the conversation's first user message.
     if (app.thread.title == null) {
         for (app.thread.agent.?.messages()) |message| {
-            if (message.role != .user) continue;
+            if (message.role() != .user) continue;
             try app.setLaneTitleIfUnset(message.text());
             break;
         }
@@ -79,16 +79,24 @@ pub fn rebuildTranscriptFromAgent(app: *App) !void {
 }
 
 pub fn resumedToolTitle(app: *App, message: ai.ChatMessage) ![]u8 {
-    if (message.tool_display_label) |label| return transcript_mod.toolTitle(app.gpa, label);
-    const id = message.call_id orelse return transcript_mod.toolTitle(app.gpa, "tool");
-    for (app.thread.agent.?.messages()) |candidate| {
-        for (candidate.content) |block| {
-            if (block != .tool_call) continue;
-            if (!std.mem.eql(u8, block.tool_call.call_id, id)) continue;
-            var display = try agent_mod.formatToolDisplay(app.gpa, block.tool_call.name, block.tool_call.arguments);
-            defer display.deinit(app.gpa);
-            return transcript_mod.toolTitle(app.gpa, display.label);
+    if (message == .tool) {
+        if (message.tool.display_label) |label| return transcript_mod.toolTitle(app.gpa, label);
+        const id = message.tool.call_id;
+        for (app.thread.agent.?.messages()) |candidate| {
+            switch (candidate) {
+                .assistant => |a| {
+                    for (a.content) |block| {
+                        if (block != .tool_call) continue;
+                        if (!std.mem.eql(u8, block.tool_call.call_id, id)) continue;
+                        var display = try agent_mod.formatToolDisplay(app.gpa, block.tool_call.name, block.tool_call.arguments);
+                        defer display.deinit(app.gpa);
+                        return transcript_mod.toolTitle(app.gpa, display.label);
+                    }
+                },
+                else => {},
+            }
         }
+        return transcript_mod.toolTitle(app.gpa, id);
     }
-    return transcript_mod.toolTitle(app.gpa, id);
+    return transcript_mod.toolTitle(app.gpa, "tool");
 }

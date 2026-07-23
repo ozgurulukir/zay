@@ -321,26 +321,71 @@ test "ContentBlock.fromJson rejects malformed payloads" {
     }
 }
 
-pub const ChatMessage = struct {
-    role: Role,
-    content: []ContentBlock,
-    call_id: ?[]u8 = null,
-    tool_display_label: ?[]u8 = null,
-    tool_failed: bool = false,
+/// One entry in the conversation projection. Variants make illegal
+/// combinations unrepresentable: a `.user` message cannot have a
+/// `call_id`, a `.tool` message must have one. `text()` and `deinit()`
+/// are the only cross-variant accessors; everything else touches a
+/// specific variant via a tag switch.
+pub const ChatMessage = union(enum) {
+    system: struct {
+        content: []ContentBlock,
+    },
+    user: struct {
+        content: []ContentBlock,
+    },
+    assistant: struct {
+        content: []ContentBlock,
+    },
+    tool: struct {
+        call_id: []u8,
+        content: []ContentBlock,
+        display_label: ?[]u8 = null,
+        failed: bool = false,
+    },
 
+    /// The first text block in the message's content. Returns "" when
+    /// the message is non-text (e.g. all tool calls or images).
     pub fn text(self: ChatMessage) []const u8 {
-        for (self.content) |block| {
+        const content: []const ContentBlock = switch (self) {
+            inline .system, .user, .assistant => |m| m.content,
+            .tool => |t| t.content,
+        };
+        for (content) |block| {
             if (block == .text) return block.text.text;
         }
         return "";
     }
 
+    /// The Role corresponding to this variant. Useful for serialization
+    /// and for the few call sites that need to switch on role without
+    /// caring about the variant payload.
+    pub fn role(self: ChatMessage) Role {
+        return switch (self) {
+            .system => .system,
+            .user => .user,
+            .assistant => .assistant,
+            .tool => .tool,
+        };
+    }
+
+    /// Free every owned buffer. Safe to call on undefined memory
+    /// after — `self.* = undefined` poisons the slot for use-after-free
+    /// detection.
     pub fn deinit(self: *ChatMessage, gpa: std.mem.Allocator) void {
-        for (self.content) |*block| block.deinit(gpa);
-        gpa.free(self.content);
-        if (self.call_id) |id| gpa.free(id);
-        if (self.tool_display_label) |label| gpa.free(label);
+        switch (self.*) {
+            inline .system, .user, .assistant => |*m| freeBlocks(gpa, m.content),
+            .tool => |*t| {
+                gpa.free(t.call_id);
+                if (t.display_label) |label| gpa.free(label);
+                freeBlocks(gpa, t.content);
+            },
+        }
         self.* = undefined;
+    }
+
+    fn freeBlocks(gpa: std.mem.Allocator, blocks: []ContentBlock) void {
+        for (blocks) |*block| block.deinit(gpa);
+        gpa.free(blocks);
     }
 };
 

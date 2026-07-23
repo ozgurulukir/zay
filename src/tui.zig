@@ -3385,9 +3385,11 @@ test "resumed tool messages keep the tool icon" {
     const blocks = try gpa.alloc(ai.ContentBlock, 1);
     blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "done") } };
     try agent.takeMessage(.{
-        .role = .tool,
-        .content = blocks,
-        .tool_display_label = try gpa.dupe(u8, "zig build test"),
+        .tool = .{
+            .content = blocks,
+            .call_id = try gpa.dupe(u8, "test_call"),
+            .display_label = try gpa.dupe(u8, "zig build test"),
+        },
     });
 
     try app.rebuildTranscriptFromAgent();

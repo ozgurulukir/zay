@@ -65,7 +65,7 @@ pub const ContextManager = struct {
     pub fn clearNonSystem(self: *ContextManager) void {
         var kept: usize = 0;
         for (self.messages.items) |*message| {
-            if (message.role == .system) {
+            if (message.* == .system) {
                 self.messages.items[kept] = message.*;
                 kept += 1;
             } else {
@@ -94,12 +94,17 @@ test "context manager appends and clears keeping system" {
 
     context.clearNonSystem();
     try std.testing.expectEqual(@as(u32, 1), context.count());
-    try std.testing.expectEqual(.system, context.items()[0].role);
+    try std.testing.expectEqual(.system, context.items()[0].role());
 }
 
 fn textMessage(gpa: std.mem.Allocator, role: ai.Role, text: []const u8) !ai.ChatMessage {
     const blocks = try gpa.alloc(ai.ContentBlock, 1);
     errdefer gpa.free(blocks);
     blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, text) } };
-    return .{ .role = role, .content = blocks };
+    return switch (role) {
+        .system => .{ .system = .{ .content = blocks } },
+        .user => .{ .user = .{ .content = blocks } },
+        .assistant => .{ .assistant = .{ .content = blocks } },
+        .tool => @panic("textMessage: tool role requires makeToolMessage"),
+    };
 }
