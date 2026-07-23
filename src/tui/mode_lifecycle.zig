@@ -171,6 +171,7 @@ pub fn submitMode(app: *App) !bool {
                 .timeline => provider_model.openTimelineSelector(app) catch |err| try app.reportSessionSwitchError(err),
                 .connect => try provider_model.openProviderPicker(app),
                 .model => provider_model.openModelPicker(app) catch |err| try app.reportConnectionError(err),
+                .mcp => tui.openMcp(app),
                 .settings => tui.openSettings(app),
                 .diff => provider_model.openDiffViewer(app) catch |err| try provider_model.reportDiffError(app, err),
                 .parallel => app.createParallelLane() catch |err| try app.reportLaneError(err),
@@ -252,7 +253,7 @@ pub fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
         .session_picker, .model_picker, .tree_picker => app.inputs.palette.buf.realLength() == 0,
         .provider_picker => app.pickers.provider.stage == .list and app.inputs.palette.buf.realLength() == 0,
         // Settings has its own navigation: '/' is not a command shortcut there.
-        .settings, .command, .diff_viewer, .save_message, .lanes, .help => false,
+        .settings, .command, .diff_viewer, .save_message, .lanes, .help, .mcp => false,
     };
 }
 

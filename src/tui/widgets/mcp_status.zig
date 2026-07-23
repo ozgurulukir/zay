@@ -6,7 +6,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const mcp_manager = @import("../../mcp/manager.zig");
 const panel = @import("panel.zig");
-const StylePalette = @import("../style.zig").StylePalette;
+const StylePalette = @import("../style.zig").Palette;
 
 pub const State = struct {
     selection: usize = 0,

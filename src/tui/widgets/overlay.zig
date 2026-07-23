@@ -44,6 +44,7 @@ fn overlaySize(mode: App.Mode) OverlaySize {
         .lanes => .{ .width = 80, .height = 16 },
         .help => .{ .width = 90, .height = 22 },
         .settings => .{ .width = 90, .height = 22 },
+        .mcp => .{ .width = 90, .height = 20 },
         .diff_viewer => .{ .width = 0, .height = 0 },
     };
 }
@@ -59,6 +60,7 @@ fn overlayLabel(app: *const App) []const u8 {
         .save_message => "Commit Message",
         .help => "Help & Keyboard Shortcuts",
         .settings => "Settings",
+        .mcp => "Model Context Protocol (MCP)",
         .lanes => switch (app.nav.lanes_purpose) {
             .manage => "Parallel Lanes",
             .merge_dest => "Merge Into",
@@ -141,7 +143,7 @@ const OverlayInner = struct {
         // their own headers/navigation, so they skip the shared search row
         // entirely and fill the panel from the top.
         const is_full_panel = (self.app.mode == .provider_picker and self.app.pickers.provider.stage == .form) or
-            self.app.mode == .settings or self.app.mode == .help;
+            self.app.mode == .settings or self.app.mode == .help or self.app.mode == .mcp;
         if (is_full_panel) {
             const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
             children[0] = .{
@@ -201,6 +203,7 @@ const OverlayInner = struct {
     }
 
     const help_picker = @import("help_picker.zig");
+    const mcp_status = @import("mcp_status.zig");
 
     fn drawContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         return switch (app.mode) {
@@ -213,10 +216,19 @@ const OverlayInner = struct {
             .lanes => drawLanesContent(app, ctx),
             .help => drawHelpContent(app, ctx),
             .settings => drawSettingsContent(app, ctx),
+            .mcp => drawMcpContent(app, ctx),
             // The diff viewer is full-screen — `drawRoot` returns before the
             // overlay path, so this is never reached.
             .normal, .diff_viewer => unreachable,
         };
+    }
+
+    fn drawMcpContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        var content: mcp_status.Content = .{
+            .state = &app.pickers.mcp,
+            .manager = &app.mcp_manager,
+        };
+        return content.widget().draw(ctx);
     }
 
     fn drawHelpContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {

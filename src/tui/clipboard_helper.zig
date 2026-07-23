@@ -42,7 +42,7 @@ pub fn pasteToFocusedInput(app: *App, text: []const u8) !void {
         .save_message => {
             try app.inputs.palette.insertSliceAtCursor(clean_text);
         },
-        .lanes, .help => {},
+        .lanes, .help, .mcp => {},
     }
 }
 

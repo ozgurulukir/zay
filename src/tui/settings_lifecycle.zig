@@ -154,6 +154,7 @@ pub fn saveSettings(app: *App) !bool {
     // Update the live cached_config so the running agent picks up the
     // changes without a restart.
     try applyToCachedConfig(app, state);
+    app.mcp_manager.syncFromConfig(&app.cached_config) catch {};
 
     // Reset pending state.
     if (state.pending_system_prompt) |old| app.gpa.free(old);

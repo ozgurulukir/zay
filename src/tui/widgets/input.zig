@@ -71,6 +71,7 @@ fn inputHintText(app: *const App) []const u8 {
         .diff_viewer => "",
         .help => "[ESC] / [ENTER] Close Help",
         .settings => "Tab Section" ++ symbols.separator_dot_padded ++ "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Toggle/Edit" ++ symbols.separator_dot_padded ++ "Ctrl+S Save" ++ symbols.separator_dot_padded ++ "[ESC] Close",
+        .mcp => "[Space] Toggle" ++ symbols.separator_dot_padded ++ "Ctrl+R Reconnect" ++ symbols.separator_dot_padded ++ "[ESC] Close",
         .normal => "Type prompt, @file, $skill or / for menu" ++ symbols.separator_dot_padded ++ "Ctrl+O Background" ++ symbols.separator_dot_padded ++ "Ctrl+N Lanes",
     };
 }

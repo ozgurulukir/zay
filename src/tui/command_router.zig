@@ -46,6 +46,7 @@ pub fn handleCommandKey(app: *App, key: vaxis.Key) !bool {
         .help => try HelpPicker.handle(app, key),
         .command => try CommandMenu.handle(app, key),
         .settings => try SettingsMode.handle(app, key),
+        .mcp => try McpMode.handle(app, key),
         // The diff viewer owns its keys directly in `captureEvent`; nothing
         // reaches the generic dispatch.
         .diff_viewer => false,
@@ -431,6 +432,20 @@ const SettingsMode = struct {
         }
         // Delegate structural navigation to the State's handleKey.
         if (app.pickers.settings.handleKey(key)) return true;
+        return false;
+    }
+};
+
+const McpMode = struct {
+    fn handle(app: *App, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.escape, .{})) {
+            tui.closeMcp(app);
+            return true;
+        }
+        if (key.matches('r', .{ .ctrl = true })) {
+            app.mcp_manager.syncFromConfig(&app.cached_config) catch {};
+            return true;
+        }
         return false;
     }
 };
