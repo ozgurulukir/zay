@@ -63,7 +63,7 @@ pub const Client = struct {
         owned_config.session_id = try gpa.dupe(u8, config.session_id);
         errdefer gpa.free(owned_config.session_id);
 
-        const tools_json = try buildToolsJson(gpa, config.tools);
+        const tools_json = try buildAllToolsJson(gpa, config.tools, config.mcp_tools);
         errdefer gpa.free(tools_json);
 
         target.* = .{
@@ -220,18 +220,25 @@ test "extractErrorMessage pulls the nested message, plain error, or raw fallback
     try std.testing.expectEqualStrings("upstream timeout", raw);
 }
 
-/// Build the OpenAI `tools` JSON array from the protocol-neutral
-/// **Tool registry**. Each adapter owns its own translation; this is the
-/// OpenAI version of "render a Tool into a tools-schema entry."
+/// Build the OpenAI `tools` JSON array from both builtin tools and MCP tool schemas.
+/// Each adapter owns its own translation; this is the OpenAI version of
+/// "render a Tool into a tools-schema entry."
 /// Substitutes `{{hsep}}` → `~` in each tool's description template.
-fn buildToolsJson(gpa: std.mem.Allocator, tools: []const tools_common.Tool) ![]u8 {
+fn buildAllToolsJson(gpa: std.mem.Allocator, tools: []const tools_common.Tool, mcp_tools: []const ai.McpToolSchema) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     const writer = &aw.writer;
     try writer.writeByte('[');
-    for (tools, 0..) |tool, i| {
-        if (i > 0) try writer.writeByte(',');
-        try writeToolDefinition(gpa, writer, tool);
+    var first = true;
+    for (tools) |tool| {
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try writeToolDefinition(gpa, writer, tool.name, tool.description, tool.schema);
+    }
+    for (mcp_tools) |mcp| {
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try writeToolDefinition(gpa, writer, mcp.name, mcp.description, mcp.schema);
     }
     try writer.writeByte(']');
     return aw.toOwnedSlice();
@@ -240,16 +247,18 @@ fn buildToolsJson(gpa: std.mem.Allocator, tools: []const tools_common.Tool) ![]u
 fn writeToolDefinition(
     gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
-    tool: tools_common.Tool,
+    name: []const u8,
+    description: []const u8,
+    schema: tools_common.Schema,
 ) !void {
-    const description = try std.mem.replaceOwned(u8, gpa, tool.description, "{{hsep}}", "~");
-    defer gpa.free(description);
+    const desc = try std.mem.replaceOwned(u8, gpa, description, "{{hsep}}", "~");
+    defer gpa.free(desc);
     try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
-    try std.json.Stringify.value(tool.name, .{}, writer);
+    try std.json.Stringify.value(name, .{}, writer);
     try writer.writeAll(",\"description\":");
-    try std.json.Stringify.value(description, .{}, writer);
+    try std.json.Stringify.value(desc, .{}, writer);
     try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{");
-    for (tool.schema.properties, 0..) |prop, p| {
+    for (schema.properties, 0..) |prop, p| {
         if (p > 0) try writer.writeByte(',');
         try std.json.Stringify.value(prop.name, .{}, writer);
         try writer.writeAll(":{\"type\":");
@@ -269,7 +278,7 @@ fn writeToolDefinition(
     }
     try writer.writeAll("},\"required\":[");
     var written_required: u32 = 0;
-    for (tool.schema.properties) |prop| {
+    for (schema.properties) |prop| {
         if (!prop.required) continue;
         if (written_required > 0) try writer.writeByte(',');
         try std.json.Stringify.value(prop.name, .{}, writer);
@@ -469,6 +478,28 @@ const ToolCallBuilder = struct {
     }
 };
 
+/// Streaming tool-call accumulator with logical-to-physical index remapping.
+///
+/// Some OpenAI-compatible providers reuse `index: 0` for parallel tool calls
+/// instead of incrementing the index per call. This struct detects that by
+/// comparing tool-call IDs — which are always unique — and forks a new
+/// physical builder slot when a collision is found. Subsequent argument
+/// deltas (which carry no ID) route through the remap to the correct slot.
+const ToolCallStream = struct {
+    builders: std.ArrayList(ToolCallBuilder) = .empty,
+    remapped_slot: [tool_call_count_max]u32 = @splat(0),
+    is_remapped: [tool_call_count_max]bool = @splat(false),
+
+    fn physicalSlot(self: *const ToolCallStream, logical: u32) u32 {
+        return if (self.is_remapped[logical]) self.remapped_slot[logical] else logical;
+    }
+
+    fn deinit(self: *ToolCallStream, gpa: std.mem.Allocator) void {
+        for (self.builders.items) |*b| b.deinit(gpa);
+        self.builders.deinit(gpa);
+    }
+};
+
 fn readStream(
     gpa: std.mem.Allocator,
     reader: *std.Io.Reader,
@@ -479,13 +510,8 @@ fn readStream(
     defer content.deinit(gpa);
     var reasoning: std.ArrayList(u8) = .empty;
     defer reasoning.deinit(gpa);
-    var builders: std.ArrayList(ToolCallBuilder) = .empty;
-    defer {
-        for (builders.items) |*builder| {
-            builder.deinit(gpa);
-        }
-        builders.deinit(gpa);
-    }
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
 
     // Parse and apply each chunk inline (rather than via `processStreamChunk`)
     // so the final usage-only chunk's `change.usage` reaches the Turn. The
@@ -494,9 +520,9 @@ fn readStream(
     var source: stream_part.Source = .{ .reader = reader };
     while (try source.next(gpa)) |data| {
         defer gpa.free(data);
-        const change = try parseStreamChunk(gpa, data, &content, &reasoning, &builders);
+        const change = try parseStreamChunk(gpa, data, &content, &reasoning, &stream);
         if (change.usage) |chunk_usage| usage = chunk_usage;
-        try applyChunkCallbacks(change, content.items, reasoning.items, builders.items, observer);
+        try applyChunkCallbacks(change, content.items, reasoning.items, stream.builders.items, observer);
     }
 
     var blocks: std.ArrayList(ai.ContentBlock) = .empty;
@@ -510,7 +536,7 @@ fn readStream(
     if (content.items.len > 0) {
         try blocks.append(gpa, .{ .text = .{ .text = try content.toOwnedSlice(gpa) } });
     }
-    for (builders.items) |*builder| {
+    for (stream.builders.items) |*builder| {
         if (builder.name.items.len == 0) continue;
         try blocks.append(gpa, .{ .tool_call = try builder.toToolCall(gpa, tool_call_seq) });
     }
@@ -573,11 +599,11 @@ fn processStreamChunk(
     data: []const u8,
     content: *std.ArrayList(u8),
     reasoning: *std.ArrayList(u8),
-    builders: *std.ArrayList(ToolCallBuilder),
+    stream: *ToolCallStream,
     observer: ai.StreamObserver,
 ) !void {
-    const change = try parseStreamChunk(gpa, data, content, reasoning, builders);
-    try applyChunkCallbacks(change, content.items, reasoning.items, builders.items, observer);
+    const change = try parseStreamChunk(gpa, data, content, reasoning, stream);
+    try applyChunkCallbacks(change, content.items, reasoning.items, stream.builders.items, observer);
 }
 
 fn parseStreamChunk(
@@ -585,7 +611,7 @@ fn parseStreamChunk(
     data: []const u8,
     content: *std.ArrayList(u8),
     reasoning: *std.ArrayList(u8),
-    builders: *std.ArrayList(ToolCallBuilder),
+    stream: *ToolCallStream,
 ) !ChunkChange {
     // Empty payloads carry no chunk (keep-alive lines). Return early rather than
     // feeding the scanner an empty document.
@@ -598,7 +624,7 @@ fn parseStreamChunk(
     try expectObjectBegin(&scanner);
     while (try nextObjectKey(&scanner)) |key| {
         if (std.mem.eql(u8, key, "choices")) {
-            try parseChoicesArray(gpa, &scanner, content, reasoning, builders, &change);
+            try parseChoicesArray(gpa, &scanner, content, reasoning, stream, &change);
         } else if (std.mem.eql(u8, key, "usage")) {
             try parseUsageValue(&scanner, &change.usage);
         } else {
@@ -650,7 +676,7 @@ fn parseChoicesArray(
     scanner: *Scanner,
     content: *std.ArrayList(u8),
     reasoning: *std.ArrayList(u8),
-    builders: *std.ArrayList(ToolCallBuilder),
+    stream: *ToolCallStream,
     change: *ChunkChange,
 ) !void {
     try expectArrayBegin(scanner);
@@ -666,7 +692,7 @@ fn parseChoicesArray(
             continue;
         }
         try expectObjectBegin(scanner);
-        try parseChoiceObject(gpa, scanner, content, reasoning, builders, change);
+        try parseChoiceObject(gpa, scanner, content, reasoning, stream, change);
         saw_first = true;
     }
 }
@@ -676,12 +702,12 @@ fn parseChoiceObject(
     scanner: *Scanner,
     content: *std.ArrayList(u8),
     reasoning: *std.ArrayList(u8),
-    builders: *std.ArrayList(ToolCallBuilder),
+    stream: *ToolCallStream,
     change: *ChunkChange,
 ) !void {
     while (try nextObjectKey(scanner)) |key| {
         if (std.mem.eql(u8, key, "delta")) {
-            try parseDeltaObject(gpa, scanner, content, reasoning, builders, change);
+            try parseDeltaObject(gpa, scanner, content, reasoning, stream, change);
         } else {
             try scanner.skipValue();
         }
@@ -693,7 +719,7 @@ fn parseDeltaObject(
     scanner: *Scanner,
     content: *std.ArrayList(u8),
     reasoning: *std.ArrayList(u8),
-    builders: *std.ArrayList(ToolCallBuilder),
+    stream: *ToolCallStream,
     change: *ChunkChange,
 ) !void {
     try expectObjectBegin(scanner);
@@ -711,7 +737,7 @@ fn parseDeltaObject(
                 if (reasoning.items.len > before) change.reasoning_start = before;
             }
         } else if (std.mem.eql(u8, key, "tool_calls")) {
-            try parseToolCallsArray(gpa, scanner, builders, change);
+            try parseToolCallsArray(gpa, scanner, stream, change);
         } else {
             try scanner.skipValue();
         }
@@ -721,7 +747,7 @@ fn parseDeltaObject(
 fn parseToolCallsArray(
     gpa: std.mem.Allocator,
     scanner: *Scanner,
-    builders: *std.ArrayList(ToolCallBuilder),
+    stream: *ToolCallStream,
     change: *ChunkChange,
 ) !void {
     try expectArrayBegin(scanner);
@@ -732,14 +758,14 @@ fn parseToolCallsArray(
             return;
         }
         try expectObjectBegin(scanner);
-        try parseToolCallObject(gpa, scanner, builders, change);
+        try parseToolCallObject(gpa, scanner, stream, change);
     }
 }
 
 fn parseToolCallObject(
     gpa: std.mem.Allocator,
     scanner: *Scanner,
-    builders: *std.ArrayList(ToolCallBuilder),
+    stream: *ToolCallStream,
     change: *ChunkChange,
 ) !void {
     var pending: ToolCallBuilder = .{};
@@ -765,36 +791,35 @@ fn parseToolCallObject(
         }
     }
 
-    const idx = resolved_index orelse return;
-    while (builders.items.len <= idx) try builders.append(gpa, .{});
-    const target = &builders.items[@as(usize, idx)];
+    const logical = resolved_index orelse return;
+    while (stream.builders.items.len <= logical) try stream.builders.append(gpa, .{});
 
+    // Detect ID collision: same logical index but a different tool-call ID.
+    // This happens when a provider reuses index 0 for parallel tool calls.
+    // Fork a new physical slot and remap this logical index to it.
     if (has_pending_id) {
-        if (target.id.items.len == 0) {
-            try target.id.appendSlice(gpa, pending.id.items);
-        } else if (!std.mem.eql(u8, target.id.items, pending.id.items)) {
-            if (std.mem.startsWith(u8, pending.id.items, target.id.items)) {
-                target.id.clearRetainingCapacity();
-                try target.id.appendSlice(gpa, pending.id.items);
-            } else {
-                try target.id.appendSlice(gpa, pending.id.items);
-            }
+        const current = stream.physicalSlot(logical);
+        const existing = &stream.builders.items[@as(usize, current)];
+        if (existing.id.items.len > 0 and !std.mem.eql(u8, existing.id.items, pending.id.items)) {
+            const new_slot: u32 = @intCast(stream.builders.items.len);
+            try stream.builders.append(gpa, .{});
+            stream.remapped_slot[logical] = new_slot;
+            stream.is_remapped[logical] = true;
         }
     }
-    if (has_pending_name) {
-        if (target.name.items.len == 0) {
-            try target.name.appendSlice(gpa, pending.name.items);
-        } else if (!std.mem.eql(u8, target.name.items, pending.name.items)) {
-            if (std.mem.startsWith(u8, pending.name.items, target.name.items)) {
-                target.name.clearRetainingCapacity();
-                try target.name.appendSlice(gpa, pending.name.items);
-            } else {
-                try target.name.appendSlice(gpa, pending.name.items);
-            }
-        }
+
+    const physical = stream.physicalSlot(logical);
+    const target = &stream.builders.items[@as(usize, physical)];
+
+    // Names and IDs are atomic in streaming — first complete value wins.
+    if (has_pending_id and target.id.items.len == 0) {
+        try target.id.appendSlice(gpa, pending.id.items);
+    }
+    if (has_pending_name and target.name.items.len == 0) {
+        try target.name.appendSlice(gpa, pending.name.items);
     }
     if (has_pending_arguments) try target.arguments.appendSlice(gpa, pending.arguments.items);
-    change.recordToolCall(idx);
+    change.recordToolCall(physical);
 }
 
 fn parseToolCallFunction(
@@ -878,7 +903,7 @@ fn appendStringValue(
 test "buildToolsJson produces a valid JSON array for the registry" {
     const tools = @import("../tools.zig");
     const gpa = std.testing.allocator;
-    const json = try buildToolsJson(gpa, tools.registry);
+    const json = try buildAllToolsJson(gpa, tools.registry, &.{});
     defer gpa.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
     defer parsed.deinit();
@@ -899,10 +924,38 @@ test "buildToolsJson substitutes {{hsep}} placeholders with ~" {
             .display = undefined,
         },
     };
-    const json = try buildToolsJson(gpa, &tools);
+    const json = try buildAllToolsJson(gpa, &tools, &.{});
     defer gpa.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "uses ~ marker") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "{{hsep}}") == null);
+}
+
+test "buildAllToolsJson includes MCP tools alongside builtin tools" {
+    const gpa = std.testing.allocator;
+    const tools = [_]tools_common.Tool{
+        .{
+            .name = "bash",
+            .description = "Run shell commands",
+            .schema = .{ .properties = &.{} },
+            .run = undefined,
+            .display = undefined,
+        },
+    };
+    const mcp_tools = [_]ai.McpToolSchema{
+        .{
+            .name = "mcp__server__greet",
+            .description = "Say hello",
+            .schema = .{ .properties = &.{} },
+        },
+    };
+    const json = try buildAllToolsJson(gpa, &tools, &mcp_tools);
+    defer gpa.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .array);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"bash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"mcp__server__greet\"") != null);
 }
 
 test "writeRequestPayload disables thinking for reasoning effort none" {
@@ -995,17 +1048,12 @@ test "parse streaming content tolerates null prelude" {
     defer content.deinit(gpa);
     var reasoning: std.ArrayList(u8) = .empty;
     defer reasoning.deinit(gpa);
-    var builders: std.ArrayList(ToolCallBuilder) = .empty;
-    defer {
-        for (builders.items) |*builder| {
-            builder.deinit(gpa);
-        }
-        builders.deinit(gpa);
-    }
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
 
     const change = try parseStreamChunk(gpa,
         \\{"choices":[{"finish_reason":null,"index":0,"delta":{"role":"assistant","content":null}}]}
-    , &content, &reasoning, &builders);
+    , &content, &reasoning, &stream);
 
     try std.testing.expect(change.empty());
     try std.testing.expectEqual(@as(usize, 0), content.items.len);
@@ -1018,13 +1066,8 @@ test "parse streaming tool deltas as they arrive" {
     defer content.deinit(gpa);
     var reasoning: std.ArrayList(u8) = .empty;
     defer reasoning.deinit(gpa);
-    var builders: std.ArrayList(ToolCallBuilder) = .empty;
-    defer {
-        for (builders.items) |*builder| {
-            builder.deinit(gpa);
-        }
-        builders.deinit(gpa);
-    }
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
 
     const Seen = struct {
         name: []const u8 = "",
@@ -1045,10 +1088,10 @@ test "parse streaming tool deltas as they arrive" {
 
     try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"command\":\"zig"}}]}}]}
-    , &content, &reasoning, &builders, observer);
+    , &content, &reasoning, &stream, observer);
     try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":" build\"}"}}]}}]}
-    , &content, &reasoning, &builders, observer);
+    , &content, &reasoning, &stream, observer);
 
     try std.testing.expectEqualStrings("bash", seen.name);
     try std.testing.expectEqualStrings("{\"command\":\"zig build\"}", seen.arguments);
@@ -1061,22 +1104,17 @@ test "parse streaming tool deltas tolerate key reorder" {
     defer content.deinit(gpa);
     var reasoning: std.ArrayList(u8) = .empty;
     defer reasoning.deinit(gpa);
-    var builders: std.ArrayList(ToolCallBuilder) = .empty;
-    defer {
-        for (builders.items) |*builder| {
-            builder.deinit(gpa);
-        }
-        builders.deinit(gpa);
-    }
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
 
     try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"function":{"name":"bash","arguments":"{}"},"id":"call_1","index":0}]}}]}
-    , &content, &reasoning, &builders, ai.StreamObserver.noop);
+    , &content, &reasoning, &stream, ai.StreamObserver.noop);
 
-    try std.testing.expectEqual(@as(usize, 1), builders.items.len);
-    try std.testing.expectEqualStrings("call_1", builders.items[0].id.items);
-    try std.testing.expectEqualStrings("bash", builders.items[0].name.items);
-    try std.testing.expectEqualStrings("{}", builders.items[0].arguments.items);
+    try std.testing.expectEqual(@as(usize, 1), stream.builders.items.len);
+    try std.testing.expectEqualStrings("call_1", stream.builders.items[0].id.items);
+    try std.testing.expectEqualStrings("bash", stream.builders.items[0].name.items);
+    try std.testing.expectEqualStrings("{}", stream.builders.items[0].arguments.items);
 }
 
 test "parse streaming tool deltas batches render notification per event" {
@@ -1085,13 +1123,8 @@ test "parse streaming tool deltas batches render notification per event" {
     defer content.deinit(gpa);
     var reasoning: std.ArrayList(u8) = .empty;
     defer reasoning.deinit(gpa);
-    var builders: std.ArrayList(ToolCallBuilder) = .empty;
-    defer {
-        for (builders.items) |*builder| {
-            builder.deinit(gpa);
-        }
-        builders.deinit(gpa);
-    }
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
 
     const Seen = struct {
         tool_delta_count: u32 = 0,
@@ -1115,7 +1148,7 @@ test "parse streaming tool deltas batches render notification per event" {
 
     try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}},{"index":1,"id":"call_2","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}
-    , &content, &reasoning, &builders, observer);
+    , &content, &reasoning, &stream, observer);
 
     try std.testing.expectEqual(@as(u32, 2), seen.tool_delta_count);
     try std.testing.expectEqual(@as(u32, 1), seen.render_count);
@@ -1127,13 +1160,8 @@ test "parse streaming reasoning deltas as they arrive" {
     defer content.deinit(gpa);
     var reasoning: std.ArrayList(u8) = .empty;
     defer reasoning.deinit(gpa);
-    var builders: std.ArrayList(ToolCallBuilder) = .empty;
-    defer {
-        for (builders.items) |*builder| {
-            builder.deinit(gpa);
-        }
-        builders.deinit(gpa);
-    }
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
 
     const Seen = struct {
         gpa: std.mem.Allocator,
@@ -1156,7 +1184,7 @@ test "parse streaming reasoning deltas as they arrive" {
 
     try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"reasoning_content":"checking output"}}]}
-    , &content, &reasoning, &builders, observer);
+    , &content, &reasoning, &stream, observer);
 
     try std.testing.expectEqualStrings("checking output", seen.reasoning.items);
     try std.testing.expectEqualStrings("checking output", reasoning.items);
@@ -1168,13 +1196,8 @@ test "parse streaming content deltas as they arrive" {
     defer content.deinit(gpa);
     var reasoning: std.ArrayList(u8) = .empty;
     defer reasoning.deinit(gpa);
-    var builders: std.ArrayList(ToolCallBuilder) = .empty;
-    defer {
-        for (builders.items) |*builder| {
-            builder.deinit(gpa);
-        }
-        builders.deinit(gpa);
-    }
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
 
     const Seen = struct {
         gpa: std.mem.Allocator,
@@ -1197,10 +1220,10 @@ test "parse streaming content deltas as they arrive" {
 
     try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"content":"hel"}}]}
-    , &content, &reasoning, &builders, observer);
+    , &content, &reasoning, &stream, observer);
     try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"content":"lo"}}]}
-    , &content, &reasoning, &builders, observer);
+    , &content, &reasoning, &stream, observer);
 
     try std.testing.expectEqualStrings("hello", seen.content.items);
     try std.testing.expectEqualStrings("hello", content.items);
@@ -1212,12 +1235,12 @@ test "parse streaming usage chunk" {
     defer content.deinit(gpa);
     var reasoning: std.ArrayList(u8) = .empty;
     defer reasoning.deinit(gpa);
-    var builders: std.ArrayList(ToolCallBuilder) = .empty;
-    defer builders.deinit(gpa);
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
 
     const change = try parseStreamChunk(gpa,
         \\{"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":340,"total_tokens":1540}}
-    , &content, &reasoning, &builders);
+    , &content, &reasoning, &stream);
 
     try std.testing.expect(change.usage != null);
     try std.testing.expectEqual(@as(u32, 1200), change.usage.?.input_tokens);
@@ -1231,12 +1254,12 @@ test "content chunk carries null usage" {
     defer content.deinit(gpa);
     var reasoning: std.ArrayList(u8) = .empty;
     defer reasoning.deinit(gpa);
-    var builders: std.ArrayList(ToolCallBuilder) = .empty;
-    defer builders.deinit(gpa);
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
 
     const change = try parseStreamChunk(gpa,
         \\{"choices":[{"delta":{"content":"hi"}}],"usage":null}
-    , &content, &reasoning, &builders);
+    , &content, &reasoning, &stream);
 
     try std.testing.expect(change.usage == null);
 }
@@ -1247,24 +1270,21 @@ test "parse streaming tool calls deduplicates repeated tool names (bashbash fix)
     defer content.deinit(gpa);
     var reasoning: std.ArrayList(u8) = .empty;
     defer reasoning.deinit(gpa);
-    var builders: std.ArrayList(ToolCallBuilder) = .empty;
-    defer {
-        for (builders.items) |*b| b.deinit(gpa);
-        builders.deinit(gpa);
-    }
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
 
     _ = try parseStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}
-    , &content, &reasoning, &builders);
+    , &content, &reasoning, &stream);
 
     // Second chunk repeats function.name: "bash" while sending argument continuation
     _ = try parseStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"\"}"}}]}}]}
-    , &content, &reasoning, &builders);
+    , &content, &reasoning, &stream);
 
-    try std.testing.expectEqual(@as(usize, 1), builders.items.len);
-    try std.testing.expectEqualStrings("bash", builders.items[0].name.items);
-    try std.testing.expectEqualStrings("call_1", builders.items[0].id.items);
+    try std.testing.expectEqual(@as(usize, 1), stream.builders.items.len);
+    try std.testing.expectEqualStrings("bash", stream.builders.items[0].name.items);
+    try std.testing.expectEqualStrings("call_1", stream.builders.items[0].id.items);
 }
 
 test "sanitizeToolArguments strips markdown backticks and falls back to empty object" {
@@ -1273,4 +1293,32 @@ test "sanitizeToolArguments strips markdown backticks and falls back to empty ob
     try std.testing.expectEqualStrings("{\"command\":\"ls\"}", sanitizeToolArguments("{\"command\":\"ls\"}"));
     try std.testing.expectEqualStrings("{\"command\":\"ls\"}", sanitizeToolArguments("```json\n{\"command\":\"ls\"}\n```"));
     try std.testing.expectEqualStrings("{}", sanitizeToolArguments("not a json string"));
+}
+
+test "parse streaming parallel tool calls with reused index does not concatenate names" {
+    const gpa = std.testing.allocator;
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
+
+    // Provider emits two parallel tool calls in separate SSE events, both
+    // with index 0 (a known misbehaviour from some OpenAI-compatible providers).
+    _ = try parseStreamChunk(gpa,
+        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"mcp__server__get_architecture","arguments":"{}"}}]}}]}
+    , &content, &reasoning, &stream);
+
+    _ = try parseStreamChunk(gpa,
+        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_2","function":{"name":"mcp__server__search_graph","arguments":"{}"}}]}}]}
+    , &content, &reasoning, &stream);
+
+    // Queue mechanism forks the second tool call into a new physical slot.
+    // Both tool calls are preserved — names must NOT be concatenated.
+    try std.testing.expectEqual(@as(usize, 2), stream.builders.items.len);
+    try std.testing.expectEqualStrings("mcp__server__get_architecture", stream.builders.items[0].name.items);
+    try std.testing.expectEqualStrings("call_1", stream.builders.items[0].id.items);
+    try std.testing.expectEqualStrings("mcp__server__search_graph", stream.builders.items[1].name.items);
+    try std.testing.expectEqualStrings("call_2", stream.builders.items[1].id.items);
 }

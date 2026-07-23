@@ -224,5 +224,6 @@ pub fn createRuntime(app: *App, cwd: []const u8, session_dir: []const u8, sessio
         );
     }
     runtime.agent.background_manager = app.background;
+    runtime.agent.mcp_manager = &app.mcp_manager;
     return runtime;
 }

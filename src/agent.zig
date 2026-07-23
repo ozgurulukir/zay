@@ -8,6 +8,7 @@ const compaction = @import("compaction.zig");
 const context_mod = @import("context.zig");
 const context_assembly = @import("context_assembly.zig");
 const executor_mod = @import("executor.zig");
+const mcp_mod = @import("mcp/manager.zig");
 const session_mod = @import("session.zig");
 const skill_mod = @import("skill.zig");
 const tools = @import("tools.zig");
@@ -54,6 +55,9 @@ pub const Agent = struct {
     /// `run_in_background`. Borrowed (owned by the App); null disables the
     /// background path so such calls fall back to a normal blocking run.
     background_manager: ?*background_mod.BackgroundManager = null,
+    /// Optional MCP manager for dispatching `mcp__` tool calls.
+    /// Borrowed (owned by the App); null disables MCP dispatch.
+    mcp_manager: ?*mcp_mod.McpManager = null,
     /// Background summarizer state machine.
     compactor: Compactor = .{},
     message_queue: MessageQueue = .{},
@@ -405,6 +409,7 @@ pub const Agent = struct {
                 .{ .manager = manager, .owner = self }
             else
                 null,
+            .mcp_manager = self.mcp_manager,
         });
         const results = try executor.runAll(tool_batch.calls, .{
             .ptr = &bridge,

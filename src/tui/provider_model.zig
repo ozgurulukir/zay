@@ -997,8 +997,14 @@ pub fn connectCodexClient(
 ) !void {
     // The naming client is about to be replaced; no job may still borrow it.
     self.cancelLaneNaming(self.thread);
-    try self.liveRuntime().?.connectCodexClient(credentials, model, effort);
-    self.thread.agent.?.client = self.liveRuntime().?.client;
+    const runtime = self.liveRuntime().?;
+    // Actually connect MCP servers before collecting tool schemas.
+    self.mcp_manager.syncFromConfigEx(self.gpa, self.io, &self.cached_config, runtime.home_dir, runtime.cwd);
+    const mcp_schemas = try self.mcp_manager.buildMcpToolSchemas(self.gpa);
+    defer self.gpa.free(mcp_schemas);
+    runtime.mcp_tools = mcp_schemas;
+    try runtime.connectCodexClient(credentials, model, effort);
+    self.thread.agent.?.client = runtime.client;
 }
 
 pub fn attachOpenAiCompatibleClient(
@@ -1010,6 +1016,12 @@ pub fn attachOpenAiCompatibleClient(
 ) !void {
     // The naming client is about to be replaced; no job may still borrow it.
     self.cancelLaneNaming(self.thread);
-    try self.liveRuntime().?.attachOpenAiCompatibleClient(base_url, api_key, model_id, effort);
-    self.thread.agent.?.client = self.liveRuntime().?.client;
+    const runtime = self.liveRuntime().?;
+    // Actually connect MCP servers before collecting tool schemas.
+    self.mcp_manager.syncFromConfigEx(self.gpa, self.io, &self.cached_config, runtime.home_dir, runtime.cwd);
+    const mcp_schemas = try self.mcp_manager.buildMcpToolSchemas(self.gpa);
+    defer self.gpa.free(mcp_schemas);
+    runtime.mcp_tools = mcp_schemas;
+    try runtime.attachOpenAiCompatibleClient(base_url, api_key, model_id, effort);
+    self.thread.agent.?.client = runtime.client;
 }

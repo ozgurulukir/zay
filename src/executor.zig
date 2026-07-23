@@ -6,6 +6,7 @@ const ai = @import("ai.zig");
 const background = @import("background.zig");
 const bash_safety = @import("bash_safety.zig");
 const bash_tool = @import("tools/bash.zig");
+const mcp_mod = @import("mcp/manager.zig");
 const tools = @import("tools.zig");
 
 const assert = std.debug.assert;
@@ -88,6 +89,8 @@ pub const ExecutorService = struct {
     cwd: []const u8,
     bash_classifier_url: ?[]const u8 = null,
     background: ?BackgroundStart = null,
+    /// MCP manager for dispatching `mcp__` tool calls. null disables MCP dispatch.
+    mcp_manager: ?*mcp_mod.McpManager = null,
 
     pub const InitOptions = struct {
         gpa: std.mem.Allocator,
@@ -95,6 +98,7 @@ pub const ExecutorService = struct {
         cwd: []const u8,
         bash_classifier_url: ?[]const u8 = null,
         background: ?BackgroundStart = null,
+        mcp_manager: ?*mcp_mod.McpManager = null,
     };
 
     pub fn init(options: InitOptions) ExecutorService {
@@ -106,6 +110,7 @@ pub const ExecutorService = struct {
             .cwd = options.cwd,
             .bash_classifier_url = options.bash_classifier_url,
             .background = options.background,
+            .mcp_manager = options.mcp_manager,
         };
     }
 
@@ -152,6 +157,10 @@ pub const ExecutorService = struct {
     }
 
     fn runOne(self: *ExecutorService, call: ai.ToolCall) !ToolResult {
+        // MCP tool calls are dispatched through the MCP manager, not the tool registry.
+        if (std.mem.startsWith(u8, call.name, "mcp__")) {
+            return self.runMcpTool(call);
+        }
         var output = self.produceOutput(call) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled => return error.Canceled,
@@ -181,6 +190,62 @@ pub const ExecutorService = struct {
             .display_kind = output.display_kind,
             .stderr = stderr,
             .failed = failed,
+        };
+    }
+
+    /// Route an `mcp__` tool call to the MCP transport.
+    /// Tool name format: `mcp__<server_name>__<tool_name>`
+    fn runMcpTool(self: *ExecutorService, call: ai.ToolCall) !ToolResult {
+        const manager = self.mcp_manager orelse return self.runFailure(call, error.McpNotConfigured);
+
+        // Parse server name and tool name from `mcp__server__tool`
+        const prefix = "mcp__";
+        if (!std.mem.startsWith(u8, call.name, prefix)) return self.runFailure(call, error.InvalidMcpToolName);
+        const rest = call.name[prefix.len..];
+        const sep = std.mem.indexOfScalar(u8, rest, '_') orelse
+            return self.runFailure(call, error.InvalidMcpToolName);
+        // Skip the second underscore
+        const after_server = rest[sep + 1 ..];
+        if (after_server.len == 0 or after_server[0] != '_') return self.runFailure(call, error.InvalidMcpToolName);
+        const server_name = rest[0..sep];
+        const tool_name = after_server[1..];
+
+        // Find the client
+        const client = for (manager.clients.items) |*c| {
+            if (c.status == .connected and std.mem.eql(u8, c.name, server_name)) break c;
+        } else return self.runFailure(call, error.McpServerNotFound);
+
+        // Call the tool
+        const result_text = client.callTool(self.io, tool_name, call.arguments) catch |err| {
+            return self.runFailure(call, err);
+        };
+
+        const call_id = try self.gpa.dupe(u8, call.call_id);
+        errdefer self.gpa.free(call_id);
+        const content = if (result_text.len > 0) blk: {
+            break :blk result_text;
+        } else blk: {
+            self.gpa.free(result_text);
+            break :blk try self.gpa.dupe(u8, "(no output)");
+        };
+        errdefer self.gpa.free(content);
+        const name = try self.gpa.dupe(u8, call.name);
+        errdefer self.gpa.free(name);
+        const display_label = try self.gpa.dupe(u8, tool_name);
+        errdefer self.gpa.free(display_label);
+        const display_body = try self.gpa.dupe(u8, content);
+        errdefer self.gpa.free(display_body);
+
+        return .{
+            .call_id = call_id,
+            .content = content,
+            .name = name,
+            .display_label = display_label,
+            .display_expanded_label = null,
+            .display_body = display_body,
+            .display_kind = .text,
+            .stderr = null,
+            .failed = false,
         };
     }
 

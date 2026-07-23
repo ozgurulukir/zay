@@ -1,6 +1,7 @@
 //! McpManager — Multi-server MCP supervisor and tool aggregator for Nova Agent.
 
 const std = @import("std");
+const ai = @import("../ai.zig");
 const config_mod = @import("../config.zig");
 const tools_common = @import("../tools/common.zig");
 const client_mod = @import("client.zig");
@@ -18,8 +19,8 @@ pub const McpManager = struct {
         };
     }
 
-    pub fn deinit(self: *McpManager) void {
-        for (self.clients.items) |*client| client.deinit();
+    pub fn deinit(self: *McpManager, io: std.Io) void {
+        for (self.clients.items) |*client| client.deinit(io);
         self.clients.deinit(self.gpa);
         self.* = undefined;
     }
@@ -36,21 +37,23 @@ pub const McpManager = struct {
             }
 
             if (existing) |c| {
-                c.status = if (server_cfg.enabled) .connected else .disabled;
+                c.status = if (server_cfg.enabled) .connecting else .disabled;
             } else {
                 var c = try client_mod.McpClient.init(
                     self.gpa,
                     server_cfg.name,
                     server_cfg.command,
+                    server_cfg.args,
                     server_cfg.url,
                 );
-                c.status = if (server_cfg.enabled) .connected else .disabled;
+                c.status = if (server_cfg.enabled) .connecting else .disabled;
                 try self.clients.append(self.gpa, c);
             }
         }
     }
 
-    /// Extended sync with schema discovery for local & system MCP servers.
+    /// Extended sync: spawns subprocess, performs MCP handshake, and
+    /// discovers tools via `tools/list` JSON-RPC for each enabled server.
     pub fn syncFromConfigEx(
         self: *McpManager,
         gpa: std.mem.Allocator,
@@ -58,7 +61,10 @@ pub const McpManager = struct {
         config: *const config_mod.Config,
         home_dir: []const u8,
         cwd: []const u8,
-    ) !void {
+    ) void {
+        _ = gpa;
+        _ = home_dir;
+        _ = cwd;
         for (config.mcp_servers) |server_cfg| {
             var existing: ?*client_mod.McpClient = null;
             for (self.clients.items) |*c| {
@@ -69,22 +75,30 @@ pub const McpManager = struct {
             }
 
             if (existing) |c| {
-                c.status = if (server_cfg.enabled) .connected else .disabled;
-                if (c.tools.items.len == 0 and server_cfg.enabled) {
-                    discoverToolsForClient(gpa, io, c, home_dir, cwd);
+                if (!server_cfg.enabled) {
+                    c.status = .disabled;
+                    continue;
                 }
+                if (c.tools.items.len > 0) continue;
+                // Re-discover: start, handshake, list tools
+                connectAndDiscover(io, c) catch {
+                    c.status = .failed;
+                };
             } else {
-                var c = try client_mod.McpClient.init(
+                var c = client_mod.McpClient.init(
                     self.gpa,
                     server_cfg.name,
                     server_cfg.command,
+                    server_cfg.args,
                     server_cfg.url,
-                );
-                c.status = if (server_cfg.enabled) .connected else .disabled;
+                ) catch continue;
+                c.status = if (server_cfg.enabled) .connecting else .disabled;
                 if (server_cfg.enabled) {
-                    discoverToolsForClient(gpa, io, &c, home_dir, cwd);
+                    connectAndDiscover(io, &c) catch {
+                        c.status = .failed;
+                    };
                 }
-                try self.clients.append(self.gpa, c);
+                self.clients.append(self.gpa, c) catch {};
             }
         }
     }
@@ -108,90 +122,86 @@ pub const McpManager = struct {
         }
         return count;
     }
+
+    /// Build an `ai.McpToolSchema` slice from all connected clients' tools.
+    /// Caller owns the returned slice and must free with `gpa.free()`.
+    /// Each schema's name/description strings borrow from the McpTool — the
+    /// caller must keep the McpManager alive while using the result.
+    pub fn buildMcpToolSchemas(self: *const McpManager, gpa: std.mem.Allocator) ![]ai.McpToolSchema {
+        var total: usize = 0;
+        for (self.clients.items) |c| {
+            if (c.status == .connected) total += c.tools.items.len;
+        }
+        var schemas = try gpa.alloc(ai.McpToolSchema, total);
+        var idx: usize = 0;
+        for (self.clients.items) |c| {
+            if (c.status != .connected) continue;
+            for (c.tools.items) |tool| {
+                schemas[idx] = .{
+                    .name = tool.full_name,
+                    .description = tool.description,
+                    .schema = tool.schema,
+                };
+                idx += 1;
+            }
+        }
+        return schemas;
+    }
+
+    /// Reconnect a specific client by index: stop, clear tools, and re-discover.
+    pub fn reconnectClient(self: *McpManager, io: std.Io, index: usize) void {
+        if (index >= self.clients.items.len) return;
+        const client = &self.clients.items[index];
+        client.stop(io);
+        // Clear existing tools
+        for (client.tools.items) |*tool| tool.deinit(self.gpa);
+        client.tools.clearRetainingCapacity();
+        client.error_message = null;
+        client.latency_ms = 0;
+        // Re-discover
+        connectAndDiscover(io, client) catch {
+            client.status = .failed;
+        };
+    }
 };
 
-fn discoverToolsForClient(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    client: *client_mod.McpClient,
-    home_dir: []const u8,
-    cwd: []const u8,
-) void {
-    if (client.tools.items.len > 0) return;
-
-    var paths: std.ArrayList([]u8) = .empty;
-    defer {
-        for (paths.items) |p| gpa.free(p);
-        paths.deinit(gpa);
+/// Spawn the MCP server subprocess, perform handshake, and discover tools.
+/// On any failure, the caller should set status to .failed.
+fn connectAndDiscover(io: std.Io, client: *client_mod.McpClient) !void {
+    // stdio transport: spawn subprocess
+    if (client.command != null) {
+        client.startStdio(io) catch |err| {
+            client.setError("Failed to spawn: {s}", .{@errorName(err)});
+            return err;
+        };
+    } else if (client.url != null) {
+        // SSE transport — not yet implemented
+        client.setError("SSE transport not yet implemented", .{});
+        return error.SseNotImplemented;
+    } else {
+        client.setError("No command or url configured", .{});
+        return error.NoTransport;
     }
 
-    if (home_dir.len > 0) {
-        if (std.fs.path.join(gpa, &.{ home_dir, ".config", "nova", "mcp", client.name })) |p| {
-            paths.append(gpa, p) catch {};
-        } else |_| {}
-        if (std.fs.path.join(gpa, &.{ home_dir, ".nova", "mcp", client.name })) |p| {
-            paths.append(gpa, p) catch {};
-        } else |_| {}
-    }
-    if (cwd.len > 0) {
-        if (std.fs.path.join(gpa, &.{ cwd, ".nova", "mcp", client.name })) |p| {
-            paths.append(gpa, p) catch {};
-        } else |_| {}
-    }
+    // MCP handshake
+    client.initialize(io) catch |err| {
+        client.setError("Handshake failed: {s}", .{@errorName(err)});
+        client.stop(io);
+        return err;
+    };
 
-    for (paths.items) |dir_path| {
-        scanSchemaDir(gpa, io, client, dir_path) catch continue;
-        if (client.tools.items.len > 0) break;
-    }
-}
-
-fn scanSchemaDir(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    client: *client_mod.McpClient,
-    dir_path: []const u8,
-) !void {
-    var dir = std.Io.Dir.openDir(.cwd(), io, dir_path, .{ .iterate = true }) catch return;
-    defer dir.close(io);
-
-    var iter = dir.iterate();
-    while (try iter.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
-
-        const file_path = try std.fs.path.join(gpa, &.{ dir_path, entry.name });
-        defer gpa.free(file_path);
-
-        const bytes = std.Io.Dir.readFileAllocOptions(.cwd(), io, file_path, gpa, .limited(64 * 1024), .of(u8), 0) catch continue;
-        defer gpa.free(bytes);
-
-        parseAndAddToolSchema(gpa, client, entry.name, bytes) catch continue;
-    }
-}
-
-fn parseAndAddToolSchema(
-    gpa: std.mem.Allocator,
-    client: *client_mod.McpClient,
-    filename: []const u8,
-    json_bytes: []const u8,
-) !void {
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, json_bytes, .{}) catch return;
-    defer parsed.deinit();
-
-    if (parsed.value != .object) return;
-    const obj = parsed.value.object;
-
-    const default_name = filename[0 .. filename.len - 5];
-    const tool_name: []const u8 = if (obj.get("name")) |n| (if (n == .string) n.string else default_name) else default_name;
-    const description: []const u8 = if (obj.get("description")) |d| (if (d == .string) d.string else "MCP tool") else "MCP tool";
-
-    client.addTool(tool_name, description, .{ .properties = &.{} }) catch {};
+    // Discover tools
+    client.listTools(io) catch |err| {
+        client.setError("Tool discovery failed: {s}", .{@errorName(err)});
+        client.stop(io);
+        return err;
+    };
 }
 
 test "McpManager syncs servers from config and counts tools" {
     const gpa = std.testing.allocator;
     var manager = McpManager.init(gpa);
-    defer manager.deinit();
+    defer manager.deinit(std.testing.io);
 
     var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
     servers[0] = .{
@@ -204,6 +214,7 @@ test "McpManager syncs servers from config and counts tools" {
 
     try manager.syncFromConfig(&cfg);
     try std.testing.expectEqual(@as(usize, 1), manager.clients.items.len);
-    try std.testing.expectEqual(client_mod.ServerStatus.connected, manager.clients.items[0].status);
-    try std.testing.expectEqual(@as(usize, 1), manager.activeServerCount());
+    // syncFromConfig only registers the client — actual connection happens in syncFromConfigEx
+    try std.testing.expectEqual(client_mod.ServerStatus.connecting, manager.clients.items[0].status);
+    try std.testing.expectEqual(@as(usize, 0), manager.activeServerCount());
 }

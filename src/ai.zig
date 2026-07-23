@@ -8,6 +8,16 @@ pub const openai_responses = @import("ai/openai_responses.zig");
 
 pub const Tool = tools_common.Tool;
 
+/// Schema-only representation of an MCP tool, used for serialization into
+/// the provider's `tools` JSON array. MCP tools lack the `run`/`display`
+/// function pointers that `Tool` requires — they are dispatched through the
+/// MCP transport instead.
+pub const McpToolSchema = struct {
+    name: []const u8,
+    description: []const u8,
+    schema: tools_common.Schema,
+};
+
 pub const ReasoningEffort = enum {
     minimal,
     low,
@@ -41,6 +51,7 @@ pub const Config = struct {
     api_key: []const u8,
     model: []const u8,
     tools: []const Tool = &.{},
+    mcp_tools: []const McpToolSchema = &.{},
     reasoning: ?Reasoning = .{},
     account_id: []const u8 = "",
     session_id: []const u8 = "",

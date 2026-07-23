@@ -41,7 +41,7 @@ pub fn formatRequest(gpa: std.mem.Allocator, id: i64, method: []const u8, params
         try out.writer.writeAll(",\"params\":");
         try out.writer.writeAll(p);
     }
-    try out.writer.writeAll("}}\n");
+    try out.writer.writeAll("}\n");
     return out.toOwnedSlice();
 }
 
@@ -56,7 +56,7 @@ pub fn formatNotification(gpa: std.mem.Allocator, method: []const u8, params_jso
         try out.writer.writeAll(",\"params\":");
         try out.writer.writeAll(p);
     }
-    try out.writer.writeAll("}}\n");
+    try out.writer.writeAll("}\n");
     return out.toOwnedSlice();
 }
 
@@ -75,6 +75,21 @@ test "formatRequest formats valid JSON-RPC 2.0 request" {
     try std.testing.expect(std.mem.indexOf(u8, req, "\"jsonrpc\":\"2.0\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req, "\"id\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, req, "\"method\":\"initialize\"") != null);
+    // Must be valid JSON
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, req, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+}
+
+test "formatRequest with null params is valid JSON" {
+    const gpa = std.testing.allocator;
+    const req = try formatRequest(gpa, 2, "tools/list", null);
+    defer gpa.free(req);
+
+    // Must be valid JSON — regression test for double-brace bug
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, req, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
 }
 
 test "formatNotification formats valid JSON-RPC 2.0 notification" {
@@ -84,4 +99,8 @@ test "formatNotification formats valid JSON-RPC 2.0 notification" {
 
     try std.testing.expect(std.mem.indexOf(u8, notif, "\"jsonrpc\":\"2.0\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, notif, "\"method\":\"notifications/initialized\"") != null);
+    // Must be valid JSON
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, notif, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
 }

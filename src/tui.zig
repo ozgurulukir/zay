@@ -263,7 +263,7 @@ pub const App = struct {
     ) !App {
         var app = try init(io, gpa, &runtime.agent);
         app.cached_config = config;
-        app.mcp_manager.syncFromConfigEx(gpa, io, &app.cached_config, runtime.home_dir, runtime.cwd) catch {};
+        app.mcp_manager.syncFromConfig(&app.cached_config) catch {};
         search_mod.start(gpa, io, runtime.cwd);
         // One shared background manager for the whole session. Heap-allocated so
         // its address stays put as agents (primary + lanes) borrow it.
@@ -272,6 +272,9 @@ pub const App = struct {
         manager.* = .init(io, gpa);
         app.background = manager;
         runtime.agent.background_manager = manager;
+        // mcp_manager pointer is set by the caller after `app` settles in its
+        // final stack frame — setting it here would dangle when `app` is
+        // returned by value.
         // Materialize the project-scoped Python helper package (`.nova/`) so the
         // model's `uv run --project .nova` invocations find it. Best-effort —
         // a failure only degrades the python workflow, never blocks startup.
@@ -1015,6 +1018,9 @@ pub fn run(
     defer fw_app.deinit();
 
     var app = try App.initRuntime(init.io, gpa, runtime, config);
+    // Set the MCP manager pointer now that `app` is in its final stack frame.
+    // Inside initRuntime, &app.mcp_manager would dangle after return-by-value.
+    runtime.agent.mcp_manager = &app.mcp_manager;
     app.bindInputCallbacks();
     defer app.deinit();
 
@@ -1164,7 +1170,7 @@ pub fn openMcp(app: *App) void {
     app.mode = .mcp;
     app.pickers.mcp.reset();
     if (app.liveRuntime()) |runtime| {
-        app.mcp_manager.syncFromConfigEx(app.gpa, app.io, &app.cached_config, runtime.home_dir, runtime.cwd) catch {};
+        app.mcp_manager.syncFromConfigEx(app.gpa, app.io, &app.cached_config, runtime.home_dir, runtime.cwd);
     } else {
         app.mcp_manager.syncFromConfig(&app.cached_config) catch {};
     }

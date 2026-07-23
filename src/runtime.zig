@@ -40,6 +40,9 @@ pub const AgentRuntime = struct {
     /// in-flight naming job before this runtime is torn down or reconnected.
     owned_naming_client: ?OwnedClient = null,
     naming_client: ai.LanguageModel = .none,
+    /// MCP tool schemas to inject into the AI config at connection time.
+    /// Set by the App before calling connectXxxClient.
+    mcp_tools: []const ai.McpToolSchema = &.{},
 
     pub const ClientState = union(enum) {
         disconnected,
@@ -331,6 +334,7 @@ pub const AgentRuntime = struct {
             .api_key = credentials.access,
             .model = model_id,
             .tools = tools_mod.registry,
+            .mcp_tools = self.mcp_tools,
             .reasoning = .{ .effort = effort, .summary = .auto },
             .account_id = credentials.account_id,
             .session_id = self.session_writer.session.id.slice(),
@@ -420,6 +424,7 @@ pub const AgentRuntime = struct {
             .api_key = api_key,
             .model = model_id,
             .tools = tools_mod.registry,
+            .mcp_tools = self.mcp_tools,
             .reasoning = .{ .effort = effort },
             .session_id = self.session_writer.session.id.slice(),
         });
@@ -472,6 +477,7 @@ pub const AgentRuntime = struct {
             .api_key = api_key,
             .model = model_id,
             .tools = tools_mod.registry,
+            .mcp_tools = self.mcp_tools,
             .reasoning = reasoning,
             .session_id = self.session_writer.session.id.slice(),
             .system_prompt = self.system_prompt,

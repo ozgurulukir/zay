@@ -62,7 +62,7 @@ pub const Client = struct {
         errdefer gpa.free(owned_config.session_id);
         owned_config.system_prompt = try gpa.dupe(u8, config.system_prompt);
         errdefer gpa.free(owned_config.system_prompt);
-        const tools_json = try buildToolsJson(gpa, config.tools);
+        const tools_json = try buildAllToolsJson(gpa, config.tools, config.mcp_tools);
         errdefer gpa.free(tools_json);
         target.* = .{
             .gpa = gpa,
@@ -159,33 +159,40 @@ fn responsesUrl(gpa: std.mem.Allocator, base_url: []const u8, responses_config: 
     return try std.fmt.allocPrint(gpa, "{s}{s}", .{ root, responses_config.endpoint_path });
 }
 
-fn buildToolsJson(gpa: std.mem.Allocator, tools: []const tools_common.Tool) ![]u8 {
+fn buildAllToolsJson(gpa: std.mem.Allocator, tools: []const tools_common.Tool, mcp_tools: []const ai.McpToolSchema) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     try aw.writer.writeByte('[');
-    for (tools, 0..) |tool, index| {
-        if (index > 0) try aw.writer.writeByte(',');
-        try writeToolDefinition(gpa, &aw.writer, tool);
+    var first = true;
+    for (tools) |tool| {
+        if (!first) try aw.writer.writeByte(',');
+        first = false;
+        try writeToolDefinition(gpa, &aw.writer, tool.name, tool.description, tool.schema);
+    }
+    for (mcp_tools) |mcp| {
+        if (!first) try aw.writer.writeByte(',');
+        first = false;
+        try writeToolDefinition(gpa, &aw.writer, mcp.name, mcp.description, mcp.schema);
     }
     try aw.writer.writeByte(']');
     return aw.toOwnedSlice();
 }
 
-fn writeToolDefinition(gpa: std.mem.Allocator, writer: *std.Io.Writer, tool: tools_common.Tool) !void {
-    const description = try std.mem.replaceOwned(u8, gpa, tool.description, "{{hsep}}", "~");
-    defer gpa.free(description);
+fn writeToolDefinition(gpa: std.mem.Allocator, writer: *std.Io.Writer, name: []const u8, description: []const u8, schema: tools_common.Schema) !void {
+    const desc = try std.mem.replaceOwned(u8, gpa, description, "{{hsep}}", "~");
+    defer gpa.free(desc);
     try writer.writeAll("{\"type\":\"function\",\"name\":");
-    try std.json.Stringify.value(tool.name, .{}, writer);
+    try std.json.Stringify.value(name, .{}, writer);
     try writer.writeAll(",\"description\":");
-    try std.json.Stringify.value(description, .{}, writer);
+    try std.json.Stringify.value(desc, .{}, writer);
     try writer.writeAll(",\"parameters\":");
-    try writeParameters(writer, tool);
+    try writeParameters(writer, schema);
     try writer.writeAll(",\"strict\":false}");
 }
 
-fn writeParameters(writer: *std.Io.Writer, tool: tools_common.Tool) !void {
+fn writeParameters(writer: *std.Io.Writer, schema: tools_common.Schema) !void {
     try writer.writeAll("{\"type\":\"object\",\"properties\":{");
-    for (tool.schema.properties, 0..) |prop, index| {
+    for (schema.properties, 0..) |prop, index| {
         if (index > 0) try writer.writeByte(',');
         try std.json.Stringify.value(prop.name, .{}, writer);
         try writer.writeAll(":{\"type\":");
@@ -202,7 +209,7 @@ fn writeParameters(writer: *std.Io.Writer, tool: tools_common.Tool) !void {
     }
     try writer.writeAll("},\"required\":[");
     var required_count: u32 = 0;
-    for (tool.schema.properties) |prop| {
+    for (schema.properties) |prop| {
         if (!prop.required) continue;
         if (required_count > 0) try writer.writeByte(',');
         try std.json.Stringify.value(prop.name, .{}, writer);
@@ -909,7 +916,7 @@ test "writeRequestPayload omits prompt_cache_key when no session id is set" {
 test "openresponses tools json is an array" {
     const tools = @import("../tools.zig");
     const gpa = std.testing.allocator;
-    const json = try buildToolsJson(gpa, tools.registry);
+    const json = try buildAllToolsJson(gpa, tools.registry, &.{});
     defer gpa.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"function\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"strict\":false") != null);

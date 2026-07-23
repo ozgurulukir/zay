@@ -64,11 +64,19 @@ pub const Content = struct {
             if (is_selected) panel.fillRow(&surface, row, StylePalette.selected);
 
             const badge = client.status.label();
-            const line = try std.fmt.allocPrint(
-                ctx.arena,
-                "  [{s}] {s} - {d} tools ({d}ms)",
-                .{ badge, client.name, client.tools.items.len, client.latency_ms },
-            );
+            const tool_count = client.tools.items.len;
+            const line = if (client.error_message) |err_msg|
+                try std.fmt.allocPrint(
+                    ctx.arena,
+                    "  [{s}] {s} - {d} tools ({d}ms)  ERROR: {s}",
+                    .{ badge, client.name, tool_count, client.latency_ms, err_msg },
+                )
+            else
+                try std.fmt.allocPrint(
+                    ctx.arena,
+                    "  [{s}] {s} - {d} tools ({d}ms)",
+                    .{ badge, client.name, tool_count, client.latency_ms },
+                );
             const style = if (is_selected) StylePalette.selected_item else StylePalette.thinking_body;
             try panel.lineStyledAt(&surface, row, line, ctx, 2, style);
             row += 2;

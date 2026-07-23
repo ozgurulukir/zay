@@ -453,15 +453,20 @@ const McpMode = struct {
         if (key.matches(' ', .{}) or key.matches(vaxis.Key.enter, .{})) {
             if (app.pickers.mcp.selection < app.mcp_manager.clients.items.len) {
                 const client = &app.mcp_manager.clients.items[app.pickers.mcp.selection];
-                client.status = if (client.status == .connected) .disabled else .connected;
+                if (client.status == .connected) {
+                    client.status = .disabled;
+                } else if (client.status == .failed) {
+                    // Reconnect on toggle when failed
+                    app.mcp_manager.reconnectClient(app.io, app.pickers.mcp.selection);
+                } else {
+                    client.status = .connected;
+                }
                 return true;
             }
         }
         if (key.matches('r', .{ .ctrl = true }) or key.matches('r', .{})) {
-            if (app.liveRuntime()) |runtime| {
-                app.mcp_manager.syncFromConfigEx(app.gpa, app.io, &app.cached_config, runtime.home_dir, runtime.cwd) catch {};
-            } else {
-                app.mcp_manager.syncFromConfig(&app.cached_config) catch {};
+            if (app.pickers.mcp.selection < app.mcp_manager.clients.items.len) {
+                app.mcp_manager.reconnectClient(app.io, app.pickers.mcp.selection);
             }
             return true;
         }
