@@ -216,6 +216,36 @@ pub const ModelSelection = struct {
     }
 };
 
+pub const McpServerConfig = struct {
+    name: []u8,
+    command: ?[]u8 = null,
+    args: [][]u8 = &.{},
+    url: ?[]u8 = null,
+    enabled: bool = true,
+
+    pub fn deinit(self: *McpServerConfig, gpa: std.mem.Allocator) void {
+        gpa.free(self.name);
+        if (self.command) |c| gpa.free(c);
+        for (self.args) |arg| gpa.free(arg);
+        if (self.args.len > 0) gpa.free(self.args);
+        if (self.url) |u| gpa.free(u);
+        self.* = undefined;
+    }
+
+    pub fn clone(self: McpServerConfig, gpa: std.mem.Allocator) !McpServerConfig {
+        var out: McpServerConfig = .{
+            .name = try gpa.dupe(u8, self.name),
+            .enabled = self.enabled,
+        };
+        errdefer out.deinit(gpa);
+        if (self.command) |c| out.command = try gpa.dupe(u8, c);
+        if (self.url) |u| out.url = try gpa.dupe(u8, u);
+        out.args = try gpa.alloc([]u8, self.args.len);
+        for (self.args, 0..) |arg, i| out.args[i] = try gpa.dupe(u8, arg);
+        return out;
+    }
+};
+
 pub const Config = struct {
     version: ?u32 = 1,
     provider: ?Provider = null,
@@ -224,6 +254,7 @@ pub const Config = struct {
     bash_classifier_url: ?[]u8 = null,
     model: ?Model = null,
     providers: []ProviderConfig = &.{},
+    mcp_servers: []McpServerConfig = &.{},
     use_responses_endpoint: ?bool = null,
     enable_thinking: ?bool = null,
     system_prompt: ?[]u8 = null,
@@ -235,6 +266,8 @@ pub const Config = struct {
         if (self.model) |*m| m.deinit(gpa);
         for (self.providers) |*provider| provider.deinit(gpa);
         if (self.providers.len > 0) gpa.free(self.providers);
+        for (self.mcp_servers) |*server| server.deinit(gpa);
+        if (self.mcp_servers.len > 0) gpa.free(self.mcp_servers);
         if (self.system_prompt) |s| gpa.free(s);
         self.* = undefined;
     }
@@ -253,6 +286,8 @@ pub const Config = struct {
         if (self.model) |m| out.model = try m.clone(gpa);
         out.providers = try gpa.alloc(ProviderConfig, self.providers.len);
         for (self.providers, 0..) |provider, index| out.providers[index] = try provider.clone(gpa);
+        out.mcp_servers = try gpa.alloc(McpServerConfig, self.mcp_servers.len);
+        for (self.mcp_servers, 0..) |server, index| out.mcp_servers[index] = try server.clone(gpa);
         if (self.system_prompt) |s| out.system_prompt = try gpa.dupe(u8, s);
         return out;
     }
@@ -572,6 +607,9 @@ fn parseObject(
     if (value.object.get("providers")) |providers_value| {
         if (providers_value == .object) out.providers = try parseProviders(gpa, providers_value);
     }
+    if (value.object.get("mcp_servers")) |mcp_value| {
+        if (mcp_value == .object) out.mcp_servers = try parseMcpServers(gpa, mcp_value);
+    }
     if (stringField(value, "base_url")) |s| {
         out.base_url = try gpa.dupe(u8, s);
     }
@@ -602,6 +640,45 @@ fn parseProviders(gpa: std.mem.Allocator, value: std.json.Value) ![]ProviderConf
         try providers.append(gpa, try parseProviderConfig(gpa, provider, entry.value_ptr.*));
     }
     return try providers.toOwnedSlice(gpa);
+}
+
+fn parseMcpServers(gpa: std.mem.Allocator, value: std.json.Value) ![]McpServerConfig {
+    var servers: std.ArrayList(McpServerConfig) = .empty;
+    errdefer {
+        for (servers.items) |*server| server.deinit(gpa);
+        servers.deinit(gpa);
+    }
+    var iterator = value.object.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const val = entry.value_ptr.*;
+        var server: McpServerConfig = .{
+            .name = try gpa.dupe(u8, entry.key_ptr.*),
+            .enabled = boolField(val, "enabled") orelse true,
+        };
+        errdefer server.deinit(gpa);
+
+        if (stringField(val, "command")) |cmd| server.command = try gpa.dupe(u8, cmd);
+        if (stringField(val, "url")) |u| server.url = try gpa.dupe(u8, u);
+
+        if (val.object.get("args")) |args_val| {
+            if (args_val == .array) {
+                var args_list: std.ArrayList([]u8) = .empty;
+                errdefer {
+                    for (args_list.items) |arg| gpa.free(arg);
+                    args_list.deinit(gpa);
+                }
+                for (args_val.array.items) |arg_item| {
+                    if (arg_item == .string) {
+                        try args_list.append(gpa, try gpa.dupe(u8, arg_item.string));
+                    }
+                }
+                server.args = try args_list.toOwnedSlice(gpa);
+            }
+        }
+        try servers.append(gpa, server);
+    }
+    return try servers.toOwnedSlice(gpa);
 }
 
 fn parseProviderConfig(gpa: std.mem.Allocator, provider: Provider, value: std.json.Value) !ProviderConfig {
@@ -1349,4 +1426,20 @@ test "serialize outputs version 1 and formatted 2-space indented JSON" {
     try std.testing.expect(std.mem.startsWith(u8, text, "{\n  \"version\": 1"));
     try std.testing.expect(std.mem.indexOf(u8, text, "  \"provider\": \"openai\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "  \"use_responses_endpoint\": true") != null);
+}
+
+test "parseFile parses mcp_servers objects" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    const json = "{\"mcp_servers\":{\"memory\":{\"command\":\"npx\",\"args\":[\"-y\",\"@modelcontextprotocol/server-memory\"],\"enabled\":true}}}";
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers.len);
+    try std.testing.expectEqualStrings("memory", cfg.mcp_servers[0].name);
+    try std.testing.expectEqualStrings("npx", cfg.mcp_servers[0].command.?);
+    try std.testing.expectEqual(@as(usize, 2), cfg.mcp_servers[0].args.len);
+    try std.testing.expectEqualStrings("-y", cfg.mcp_servers[0].args[0]);
+    try std.testing.expectEqual(true, cfg.mcp_servers[0].enabled);
 }
