@@ -24,7 +24,7 @@ Architecture for the current module list (kept in sync as `tui.zig` shrinks).
 
 **Domain extraction pattern.** Isolated domain clusters (lane lifecycle, diff
 lifecycle, session switching, at-search, transcript navigation, permission,
-event callbacks, queue) live under `src/tui/` as free-function modules.
+event callbacks, queue, settings lifecycle, clipboard helper) live under `src/tui/` as free-function modules.
 Each module imports `const tui = @import("../tui.zig")` and defines `pub fn`
 taking `*App` as the first parameter. The original App method stays as a
 1-line delegate (Strangler Fig) so inline tests in `tui.zig` resolve via the
@@ -38,7 +38,7 @@ and a private `Inner` struct built inside `draw()` from a `vxfw.DrawContext`.
 The file imports `const tui = @import("../../tui.zig");`,
 `const tui_style = @import("../style.zig");`, `const panel = @import("panel.zig");`
 and re-aliases `const App = tui.App;`. Nested types from other modules
-(e.g. `BackgroundManager.JobView`, `ApprovalSnapshot`) are re-exported through
+(e.g. `BackgroundManager.JobView`, `ApprovalSnapshot`, `settings_widget.State`) are re-exported through
 `pub const` in `tui.zig` so widget files can reach them as `tui.<module>.<Type>`.
 
 **Per-mode command routing.** `src/tui/command_router.zig` holds one struct per
@@ -50,6 +50,10 @@ private methods on `App` for key handling.
 **Viewport scrolling pattern.** Standardize overlay list viewports using `panel.ViewportWindow.compute(selection, total_count, surface.size.height)` in `src/tui/widgets/panel.zig`. Use `viewport.screenRow(i)` for row rendering calculations.
 
 **Provider polymorphism pattern.** Unify static builtin `config_mod.Provider` and dynamic `modelsdev.Provider` handles using `ProviderHandle = union(enum) { builtin: config_mod.Provider, dynamic: modelsdev.Provider }` in `src/tui/widgets/provider_picker.zig`.
+
+**System clipboard pattern.** `src/clipboard.zig` handles OS clipboard reading/writing via terminal OSC 52 sequences (`\x1b]52;c;<base64>\x07`) with OS-native execution fallback (`wl-copy`/`xclip`/`pbcopy`/`powershell` via `bash.zig`). `clipboard_helper.zig` routes clipboard data dynamically to focused input fields and transcript message blocks.
+
+**Settings lifecycle pattern.** `src/tui/settings_lifecycle.zig` manages pending tabbed form edits, syncs values to `app.cached_config` in real-time, and serializes user settings to `~/.config/nova/config.json` on `Ctrl+S`.
 
 ## Zig Development
 
@@ -142,6 +146,7 @@ const output = try writer.toOwnedSlice();
 - **POSIX Environment Access:** Never index `std.c.environ` directly in loops (`while (std.c.environ[i]) |e|`). In Zig 0.16 on POSIX, `std.c.environ` is `[*:null]?[*:0]u8`. Use `const env_slice = std.mem.span(std.c.environ);` and pass to `std.process.Environ.createMap(.{ .block = .{ .slice = env_slice } }, gpa)` to prevent null-pointer segfaults in multi-threaded contexts.
 - **Models.dev Registry Allocations:** `modelsdev.Registry` string storage uses an `ArrayList(u8)`. To prevent dangling slice pointers when building or merging providers, accumulate string offsets via `StringRef` (`start`, `len`) and resolve slice pointers only after all string appends complete.
 - **Dynamic Context Compaction:** Never hardcode fixed context retention budgets (e.g. 20,000 tokens) when compacting history. Use `compaction.keepRecentTokens(context_window)` so small-context models (8K/16K/32K) keep a scaled history window (%35 max 20,000) and can always compact below their swap watermark.
+- **Streaming SSE Tool Call Deduplication:** In `src/ai/openai_compatible.zig`, deduplicate tool call names and IDs across streaming SSE chunks. If a provider repeats `function: { name: "tool" }` in subsequent delta chunks, ignore duplicate name appends to prevent tool name corruption (e.g. `bashbash`).
 
 ## Verifying
 
