@@ -445,10 +445,35 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
     if (updates.bash_classifier_url) |s| try replaceOptionalSlice(gpa, &target.bash_classifier_url, s);
     if (updates.system_prompt) |s| try replaceOptionalSlice(gpa, &target.system_prompt, s);
     for (updates.providers) |provider| try applyProviderOverlay(gpa, target, provider);
+    for (updates.mcp_servers) |mcp_server| try applyMcpServerOverlay(gpa, target, mcp_server);
     if (updates.model) |m| {
         if (target.model) |*old| old.deinit(gpa);
         target.model = try m.clone(gpa);
     }
+}
+
+fn applyMcpServerOverlay(gpa: std.mem.Allocator, target: *Config, updates: McpServerConfig) !void {
+    for (target.mcp_servers, 0..) |*server, index| {
+        if (!std.mem.eql(u8, server.name, updates.name)) continue;
+        if (updates.command) |cmd| try replaceOptionalSlice(gpa, &server.command, cmd);
+        if (updates.url) |u| try replaceOptionalSlice(gpa, &server.url, u);
+        server.enabled = updates.enabled;
+        if (updates.args.len > 0) {
+            for (server.args) |arg| gpa.free(arg);
+            if (server.args.len > 0) gpa.free(server.args);
+            server.args = try gpa.alloc([]u8, updates.args.len);
+            for (updates.args, 0..) |arg, i| server.args[i] = try gpa.dupe(u8, arg);
+        }
+        target.mcp_servers[index] = server.*;
+        return;
+    }
+
+    const next = if (target.mcp_servers.len == 0)
+        try gpa.alloc(McpServerConfig, 1)
+    else
+        try gpa.realloc(target.mcp_servers, target.mcp_servers.len + 1);
+    target.mcp_servers = next;
+    target.mcp_servers[target.mcp_servers.len - 1] = try updates.clone(gpa);
 }
 
 fn applyProviderOverlay(gpa: std.mem.Allocator, target: *Config, updates: ProviderConfig) !void {
@@ -607,7 +632,7 @@ fn parseObject(
     if (value.object.get("providers")) |providers_value| {
         if (providers_value == .object) out.providers = try parseProviders(gpa, providers_value);
     }
-    const mcp_val = value.object.get("mcp_servers") orelse value.object.get("mcpServers");
+    const mcp_val = value.object.get("mcp_servers") orelse value.object.get("mcpServers") orelse value.object.get("mcp");
     if (mcp_val) |val| {
         if (val == .object) out.mcp_servers = try parseMcpServers(gpa, val);
     }
@@ -936,6 +961,10 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
         try writeKey(writer, "providers", &wrote_any);
         try writeProviders(writer, config.providers);
     }
+    if (config.mcp_servers.len > 0) {
+        try writeKey(writer, "mcp_servers", &wrote_any);
+        try writeMcpServers(writer, config.mcp_servers);
+    }
     if (config.system_prompt) |s| {
         try writeKey(writer, "system_prompt", &wrote_any);
         try std.json.Stringify.value(s, .{}, writer);
@@ -997,6 +1026,53 @@ fn writeProviderModels(writer: *std.Io.Writer, models: []const ProviderModel) !v
         wrote_model = true;
     }
     try writer.writeByte('}');
+}
+
+fn writeMcpServers(writer: *std.Io.Writer, servers: []const McpServerConfig) !void {
+    try writer.writeByte('{');
+    var wrote_server = false;
+    for (servers) |server| {
+        if (wrote_server) try writer.writeByte(',');
+        try std.json.Stringify.value(server.name, .{}, writer);
+        try writer.writeByte(':');
+        try writeMcpServer(writer, server);
+        wrote_server = true;
+    }
+    try writer.writeByte('}');
+}
+
+fn writeMcpServer(writer: *std.Io.Writer, server: McpServerConfig) !void {
+    try writer.writeByte('{');
+    var wrote_any = false;
+    if (server.command) |cmd| {
+        try writeKeyNoIndent(writer, "command", &wrote_any);
+        try std.json.Stringify.value(cmd, .{}, writer);
+    }
+    if (server.url) |u| {
+        try writeKeyNoIndent(writer, "url", &wrote_any);
+        try std.json.Stringify.value(u, .{}, writer);
+    }
+    if (server.args.len > 0) {
+        try writeKeyNoIndent(writer, "args", &wrote_any);
+        try writer.writeByte('[');
+        for (server.args, 0..) |arg, i| {
+            if (i > 0) try writer.writeByte(',');
+            try std.json.Stringify.value(arg, .{}, writer);
+        }
+        try writer.writeByte(']');
+    }
+    if (!server.enabled) {
+        try writeKeyNoIndent(writer, "enabled", &wrote_any);
+        try writer.writeAll("false");
+    }
+    try writer.writeByte('}');
+}
+
+fn writeKeyNoIndent(writer: *std.Io.Writer, name: []const u8, wrote_any: *bool) !void {
+    if (wrote_any.*) try writer.writeByte(',');
+    try std.json.Stringify.value(name, .{}, writer);
+    try writer.writeByte(':');
+    wrote_any.* = true;
 }
 
 fn writeKey(writer: *std.Io.Writer, name: []const u8, wrote_any: *bool) !void {
@@ -1457,4 +1533,35 @@ test "parseFile parses mcpServers (Claude Desktop format)" {
     try std.testing.expectEqualStrings("codebase-memory-mcp", cfg.mcp_servers[0].name);
     try std.testing.expectEqualStrings("/path/to/codebase-memory-mcp", cfg.mcp_servers[0].command.?);
     try std.testing.expectEqual(@as(usize, 0), cfg.mcp_servers[0].args.len);
+}
+
+test "parseFile parses mcp (short key format)" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    const json = "{\"mcp\":{\"test-server\":{\"command\":\"node\",\"args\":[\"index.js\"]}}}";
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers.len);
+    try std.testing.expectEqualStrings("test-server", cfg.mcp_servers[0].name);
+    try std.testing.expectEqualStrings("node", cfg.mcp_servers[0].command.?);
+}
+
+test "mergeLayers merges mcp_servers across config layers" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+
+    var layer1 = try parseFile(gpa, "<layer1>", "{\"mcp_servers\":{\"global-server\":{\"command\":\"python\",\"args\":[]}}}", &sink);
+    defer layer1.deinit(gpa);
+    var layer2 = try parseFile(gpa, "<layer2>", "{\"mcp\":{\"proj-server\":{\"command\":\"node\",\"args\":[]}}}", &sink);
+    defer layer2.deinit(gpa);
+
+    var merged = try mergeLayers(gpa, &.{ layer1, layer2 });
+    defer merged.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 2), merged.mcp_servers.len);
+    try std.testing.expectEqualStrings("global-server", merged.mcp_servers[0].name);
+    try std.testing.expectEqualStrings("proj-server", merged.mcp_servers[1].name);
 }
