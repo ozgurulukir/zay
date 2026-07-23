@@ -30,6 +30,18 @@ A lane starts on a random `nova/<hex>` branch. On its first prompt, the session'
 
 ## Bash auto-review
 
-## Bash auto-review
-
 We have fine-tuned a ModernBERT base model on a corpus of over 3000 bash commands and classified each command as either safe or unsafe. We run this model on every bash tool call the agent makes, and if it's marked unsafe, we show a permission prompt to either approve or reject the call. Thanks to the efficient architecture of ModernBERT (i.e. Alternating Attention) and its small size the performance overhead of making these inference calls is negligible.
+
+## Type System Discipline
+
+Nova uses `union(enum)` instead of flat structs with optional fields wherever a value can be in one of several mutually-exclusive states. This makes illegal combinations unrepresentable at compile time — the compiler tells the next developer where to add a case when a new variant is introduced.
+
+Key types following this pattern:
+- `ai.ChatMessage` — `union(enum) { system, user, assistant, tool }` (tool carries non-optional `call_id`)
+- `transcript.Message` — `union(enum)` with 10 variants + `Basic`/`ToolView` payload structs
+- `config.McpServerConfig.transport` — `union(enum) { stdio, sse }`
+- `mcp.McpClient` — `transport` + `lifecycle` unions for static config and runtime state
+- `config.Config.model_selection: ?ModelSelection` — typed view replacing 9 loose optional fields
+- `agent.Listener(Ctx)` / `executor.ToolCallObserver(Ctx)` — generic typed callbacks replacing `*anyopaque` vtables
+
+See `AGENTS.md` "Type System Discipline pattern" for the full list and construction patterns.

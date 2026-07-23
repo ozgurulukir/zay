@@ -57,6 +57,24 @@ private methods on `App` for key handling.
 
 **MCP Server & Tool Discovery pattern.** `src/mcp/manager.zig` merges `mcp_servers` configuration across global/project layers (supporting `mcp_servers`, `mcpServers`, and `mcp` JSON aliases) and scans Nova standard directories (`~/.config/nova/mcp/`, `~/.nova/mcp/`, `<cwd>/.nova/mcp/`) for tool schema discovery. `McpMode.handle` in `command_router.zig` routes `Up`/`Down`/`j`/`k` list navigation, `Space`/`Enter` server toggling, `Ctrl+R`/`r` re-syncing, and `Esc`/`q` closing.
 
+**Type System Discipline pattern.** The codebase uses `union(enum)` instead of flat structs with optional fields whenever a value can be in one of several mutually-exclusive states. This makes illegal combinations unrepresentable at compile time. The following types follow this pattern:
+
+- `ai.ChatMessage` — `union(enum) { system, user, assistant, tool }`. The `tool` variant carries `call_id` (non-optional); the other variants cannot have one. `role()` and `text()` are cross-variant accessors.
+- `transcript.Message` — `union(enum)` with 10 variants (`user`/`agent`/`skill`/`logo`/`thinking`/`status`/`notice`/`success`/`info`/`tool`). `Basic` and `ToolView` payload structs group fields by category. `kind()` bridges the loose `MessageKind` enum; `mirror()` is a test-only flat view.
+- `tools.Output.display` — `Display` union with `none`/`text`/`diff` variants. The old `?[]u8 + DisplayKind` pair allowed `null` with `.diff`; the union prevents that.
+- `config.McpServerConfig.transport` — `union(enum) { stdio, sse }`. A server is either stdio (command+args) or sse (url), never both or neither. Misconfigured entries are caught at parse time.
+- `mcp.McpClient` — `transport: union(enum) { stdio, sse }` (static config) + `lifecycle: union(enum) { disabled, stdio, sse, failed }` (runtime state). `status()` maps the lifecycle to the legacy `ServerStatus` enum.
+- `config.Config.model_selection: ?ModelSelection` — typed view replacing 9 loose optional fields. `ModelSelection` has non-optional `provider`/`model`/`base_url`/`api_key`; optional settings stay optional. The legacy fields are still written by parse/merge/serialize for disk round-trip; callers read through `model_selection`.
+- `tui.AtSearchState` — `union(enum) { closed, indexing, open }` with `IndexingPayload` and `OpenPayload` structs. `kind()`/`results()`/`close()` helpers bridge callers.
+- `tui.NavState.quit` — `QuitState = union(enum) { none, pending, confirmed }` replacing `?Timestamp + bool`.
+- `tui.ModelCatalogue.load` — `LoadState = union(enum) { idle, loading, failed }`.
+- `search.Backend.state` — `State = union(enum) { idle, loading, ready, failed }`. `handle: *anyopaque` stays opaque (fff C FFI standard).
+- `tui.MetricsState.diff` — `DiffState = union(enum) { idle, loading, ready, refreshing }`. The `refreshing` arm keeps the old cache while a new fetch is in flight.
+- `config.ProviderModel = Model` — type alias removing duplicate struct drift.
+- `session.SessionSummary.leaf_entry_id: ?EntryId` — branded `EntryId` (fixed-size `[entry_id_len]u8`) instead of loose `[]u8`.
+
+**Typed callback pattern.** `agent.Listener(Ctx)` and `executor.ToolCallObserver(Ctx)` are generic over the consumer's context type. The `*anyopaque` + `@ptrCast` vtable is replaced by `*Ctx` + typed callback functions. `StreamContext(L)` and `ExecutorBridge(L)` are generic over the listener type. The remaining `@ptrCast` sites are the `ai.StreamObserver` bridge (4 sites in `agent.zig:StreamContext.observer()`, deferred to a future `StreamObserver(Ctx)` refactor) and `BashApproval` (1 site, deferred because making it generic would require `Agent` itself to be generic).
+
 ## Zig Development
 
 Use `zigdoc` to discover APIs before coding.

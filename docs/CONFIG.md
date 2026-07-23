@@ -89,11 +89,14 @@ All `config.json` files use formatted, 2-space indented JSON with version taggin
 | `enable_thinking` | `boolean` | `true` to enable extended reasoning (`reasoning_effort`) for supported models. |
 | `system_prompt` | `string` | Base system prompt template (supports `${CWD}` and `${OS}` tokens). |
 | `bash_classifier_url` | `string` | ModernBERT classifier endpoint for shell command safety check. |
-| `mcpServers` / `mcp_servers` | `object` | MCP server configurations (Claude Desktop format compatible). |
-| `providers` | `object` | Provider-specific configurations and reasoning effort overrides. |
+| `mcpServers` / `mcp_servers` / `mcp` | `object` | MCP server configurations (Claude Desktop format compatible). Each server has a `transport: union(enum) { stdio, sse }` — stdio requires `command`+`args`, sse requires `url`. |
+| `providers` | `object` | Provider-specific configurations and reasoning effort overrides. `ProviderModel` is a type alias for `Model` — both carry `id` and `reasoning_effort`. |
 
 > [!IMPORTANT]
 > **API Keys Security Invariant**: API keys (`api_key`) are **NEVER** serialized into `config.json`. API keys are stored separately in `~/.config/nova/auth.json` (or `~/.nova/auth.json`) with strict file permissions (`0o600`).
+
+> [!NOTE]
+> **Typed Model Selection**: The in-memory `Config` struct carries a `model_selection: ?ModelSelection` typed view. `ModelSelection` packages the non-optional `provider`/`model`/`base_url`/`api_key` plus optional settings (`use_responses_endpoint`/`enable_thinking`/`system_prompt`/`bash_classifier_url`). When all required fields are present, `parseObject` populates `model_selection` and clears the legacy optional fields. Callers read through `model_selection`; the legacy fields stay only for disk round-trip via `serialize`/`applyConfigOverlay`.
 
 ---
 
