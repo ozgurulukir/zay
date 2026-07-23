@@ -11,38 +11,36 @@ const tui = @import("../tui.zig");
 const App = tui.App;
 
 pub fn cancelModelLoad(self: *App) void {
-    if (self.pickers.models.model_load_future) |*future| {
+    if (self.pickers.models.load == .loading) {
+        var future = self.pickers.models.load.loading.future;
         var outcome = future.cancel(self.io);
         outcome.deinit(self.gpa);
-        self.pickers.models.model_load_future = null;
+        self.pickers.models.load = .idle;
     }
-    self.pickers.models.model_load_done.store(false, .release);
 }
 
 /// Called from the tick handler. Polls the non-blocking `done` flag, and
 /// only `await`s once the worker has signalled completion. Returns true
 /// if a redraw is needed.
 pub fn drainModelLoad(self: *App) !bool {
-    if (self.pickers.models.model_load_future == null) return false;
-    if (!self.pickers.models.model_load_done.load(.acquire)) return false;
+    if (self.pickers.models.load != .loading) return false;
+    if (!self.pickers.models.load.loading.done.load(.acquire)) return false;
 
-    var outcome = self.pickers.models.model_load_future.?.await(self.io);
-    self.pickers.models.model_load_future = null;
-    self.pickers.models.model_load_done.store(false, .release);
+    var outcome = self.pickers.models.load.loading.future.await(self.io);
+    self.pickers.models.load = .idle;
     defer outcome.deinit(self.gpa);
 
     switch (outcome) {
         .ready => |*result| try installModelLoadResult(self, result),
         .failed => |message| {
-            if (self.pickers.models.model_load_error) |old| self.gpa.free(old);
-            self.pickers.models.model_load_error = try self.gpa.dupe(u8, message);
+            self.pickers.models.load = .{ .failed = .{ .message = try self.gpa.dupe(u8, message) } };
         },
     }
     return true;
 }
 
 pub fn installModelLoadResult(self: *App, result: *model_loader.Result) !void {
-    if (self.pickers.models.model_load_merge) {
+    if (self.pickers.models.load == .loading and self.pickers.models.load.loading.merge) {
         // Incremental load: replace only the freshly-fetched providers'
         // models, leaving previously-cached providers untouched.
         var refreshed = std.EnumSet(config_mod.Provider).initEmpty();
@@ -67,7 +65,8 @@ pub fn installModelLoadResult(self: *App, result: *model_loader.Result) !void {
     }
     result.models.clearRetainingCapacity();
     result.sources.clearRetainingCapacity();
-    self.pickers.models.model_load_merge = false;
+    // load was set to .idle by drainModelLoad before calling us; nothing
+    // else to reset.
     // Same fetch that built the catalogue also tells us which providers are
     // reachable — drive the picker badges from it.
     provider_model.applyProviderOutcomes(self, result.outcomes.items);

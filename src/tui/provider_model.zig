@@ -253,9 +253,9 @@ pub fn startModelLoad(self: *App, catalog: ModelCatalog, merge: bool) !void {
     // result is authoritative for all badges; an openai_codex load touches no
     // catalogue providers and must not reset them.
     self.conn_recompute = catalog == .connected_provider;
-    if (self.pickers.models.model_load_error) |message| {
-        self.gpa.free(message);
-        self.pickers.models.model_load_error = null;
+    if (self.pickers.models.load == .failed) {
+        self.gpa.free(self.pickers.models.load.failed.message);
+        self.pickers.models.load = .idle;
     }
 
     const job = try self.gpa.create(model_loader.Job);
@@ -270,6 +270,16 @@ pub fn startModelLoad(self: *App, catalog: ModelCatalog, merge: bool) !void {
         if (configured.len > 0) self.gpa.free(configured);
     }
 
+    // Transition load to .loading. The job captures the address of the
+    // union's `done` field; the union must stay in .loading (no other
+    // writes to load) until drainModelLoad moves it out.
+    self.pickers.models.load = .{
+        .loading = .{
+            .future = undefined, // set below
+            .done = .init(false),
+            .merge = merge,
+        },
+    };
     job.* = .{
         .gpa = self.gpa,
         .io = self.io,
@@ -280,12 +290,9 @@ pub fn startModelLoad(self: *App, catalog: ModelCatalog, merge: bool) !void {
         .configured = configured,
         .include_locals = catalog == .connected_provider,
         .codex_signed_in = self.isCodexSignedIn(),
-        .done = &self.pickers.models.model_load_done,
+        .done = &self.pickers.models.load.loading.done,
     };
-
-    self.pickers.models.model_load_merge = merge;
-    self.pickers.models.model_load_done.store(false, .release);
-    self.pickers.models.model_load_future = try self.io.concurrent(model_loader.run, .{job});
+    self.pickers.models.load.loading.future = try self.io.concurrent(model_loader.run, .{job});
 }
 
 /// Every OpenAI-compatible provider to fetch for a full catalogue reload:
@@ -517,9 +524,9 @@ pub fn submitDynamicProviderSetup(self: *App, provider: modelsdev.Provider) !voi
 pub fn startDynamicProviderModelLoad(self: *App, provider: modelsdev.Provider, key: []const u8) !void {
     cancelModelLoad(self);
     self.conn_recompute = false;
-    if (self.pickers.models.model_load_error) |message| {
-        self.gpa.free(message);
-        self.pickers.models.model_load_error = null;
+    if (self.pickers.models.load == .failed) {
+        self.gpa.free(self.pickers.models.load.failed.message);
+        self.pickers.models.load = .idle;
     }
 
     var configured = try self.gpa.alloc(model_loader.Configured, 1);
@@ -542,6 +549,11 @@ pub fn startDynamicProviderModelLoad(self: *App, provider: modelsdev.Provider, k
     const job = try self.gpa.create(model_loader.Job);
     errdefer self.gpa.destroy(job);
 
+    self.pickers.models.load = .{ .loading = .{
+        .future = undefined,
+        .done = .init(false),
+        .merge = false,
+    } };
     job.* = .{
         .gpa = self.gpa,
         .io = self.io,
@@ -549,10 +561,9 @@ pub fn startDynamicProviderModelLoad(self: *App, provider: modelsdev.Provider, k
         .configured = configured,
         .include_locals = false,
         .codex_signed_in = false,
-        .done = &self.pickers.models.model_load_done,
+        .done = &self.pickers.models.load.loading.done,
     };
-    self.pickers.models.model_load_done.store(false, .release);
-    self.pickers.models.model_load_future = try self.io.concurrent(model_loader.run, .{job});
+    self.pickers.models.load.loading.future = try self.io.concurrent(model_loader.run, .{job});
 }
 
 /// Incremental, merge-on-arrival load of a single provider's `/models`.
@@ -561,9 +572,9 @@ pub fn startProviderModelLoad(self: *App, provider: config_mod.Provider, key: []
     // Single provider: its outcome updates only this provider's badge, never
     // a full recompute that would wipe the others.
     self.conn_recompute = false;
-    if (self.pickers.models.model_load_error) |message| {
-        self.gpa.free(message);
-        self.pickers.models.model_load_error = null;
+    if (self.pickers.models.load == .failed) {
+        self.gpa.free(self.pickers.models.load.failed.message);
+        self.pickers.models.load = .idle;
     }
 
     const base_url_default = provider.defaultBaseUrl() orelse return error.NotConnected;
@@ -579,6 +590,11 @@ pub fn startProviderModelLoad(self: *App, provider: config_mod.Provider, key: []
     errdefer self.gpa.free(api_key);
     configured[0] = .{ .provider = provider, .base_url = base_url, .api_key = api_key };
 
+    self.pickers.models.load = .{ .loading = .{
+        .future = undefined,
+        .done = .init(false),
+        .merge = true,
+    } };
     job.* = .{
         .gpa = self.gpa,
         .io = self.io,
@@ -586,12 +602,9 @@ pub fn startProviderModelLoad(self: *App, provider: config_mod.Provider, key: []
         .configured = configured,
         .include_locals = false,
         .codex_signed_in = self.isCodexSignedIn(),
-        .done = &self.pickers.models.model_load_done,
+        .done = &self.pickers.models.load.loading.done,
     };
-
-    self.pickers.models.model_load_merge = true;
-    self.pickers.models.model_load_done.store(false, .release);
-    self.pickers.models.model_load_future = try self.io.concurrent(model_loader.run, .{job});
+    self.pickers.models.load.loading.future = try self.io.concurrent(model_loader.run, .{job});
 }
 
 pub fn applySelectedModel(self: *App) !void {

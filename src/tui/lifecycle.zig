@@ -140,7 +140,7 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         root.blackhole_tick_accum = 0;
     }
 
-    const model_loading = root.app.pickers.models.model_load_future != null;
+    const model_loading = root.app.pickers.models.load == .loading;
     const diff_loading = root.app.metrics.diff_refresh_future != null;
     // Keep ticking while a turn is active OR interrupting, so the worker's
     // remaining events (and its terminal `turn_finished`) get drained.
@@ -486,7 +486,7 @@ pub fn submit(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         // (e.g. the cold-start "Loading diff…" the /diff command kicked off),
         // or a turn a command started directly (e.g. /sync conflict
         // resolution injects one).
-        if (root.app.thread.turn.isActive() or root.app.pickers.models.model_load_future != null or root.app.metrics.diff_refresh_future != null) try ensureTick(root, ctx);
+        if (root.app.thread.turn.isActive() or root.app.pickers.models.load == .loading or root.app.metrics.diff_refresh_future != null) try ensureTick(root, ctx);
         ctx.consumeAndRedraw();
         return;
     }

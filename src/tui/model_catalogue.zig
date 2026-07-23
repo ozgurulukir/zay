@@ -43,21 +43,64 @@ pub const ModelCatalogue = struct {
     /// Reasoning indexes captured when the picker opened, restored on cancel.
     reasoning_snapshot: std.ArrayList(u32) = .empty,
     model_selection_snapshot: u32 = 0,
-    /// Handle to the in-flight background catalogue fetch.
-    model_load_future: ?std.Io.Future(model_loader.Outcome) = null,
-    model_load_done: std.atomic.Value(bool) = .init(false),
-    model_load_error: ?[]u8 = null,
-    /// When true the in-flight load merges into the existing catalogue
-    /// (incremental, after connecting a provider) instead of replacing it.
-    model_load_merge: bool = false,
+
+    /// Background catalogue-load state machine. The previous flat fields
+    /// (model_load_future/done/error/merge + models_cached) allowed illegal
+    /// combinations like future=null with error set, or done=true with
+    /// future=null. The union makes those unrepresentable.
+    load: LoadState = .idle,
     /// True once a successful fetch has populated `entries`; subsequent picker
     /// opens skip the network round-trip.
     models_cached: bool = false,
 
+    pub const LoadState = union(enum) {
+        idle,
+        loading: struct {
+            future: std.Io.Future(model_loader.Outcome),
+            done: std.atomic.Value(bool) = .init(false),
+            merge: bool = false,
+        },
+        failed: struct {
+            message: []u8,
+        },
+    };
+
+    /// Backward-compatible view: `model_load_future != null`.
+    pub fn model_load_future(self: *const ModelCatalogue) ?std.Io.Future(model_loader.Outcome) {
+        return switch (self.load) {
+            .loading => |l| l.future,
+            else => null,
+        };
+    }
+    /// Backward-compatible view: `model_load_done`.
+    pub fn model_load_done(self: *const ModelCatalogue) std.atomic.Value(bool) {
+        return switch (self.load) {
+            .loading => |l| l.done,
+            else => .init(false),
+        };
+    }
+    /// Backward-compatible view: `model_load_error`.
+    pub fn model_load_error(self: *const ModelCatalogue) ?[]u8 {
+        return switch (self.load) {
+            .failed => |f| f.message,
+            else => null,
+        };
+    }
+    /// Backward-compatible view: `model_load_merge`.
+    pub fn model_load_merge(self: *const ModelCatalogue) bool {
+        return switch (self.load) {
+            .loading => |l| l.merge,
+            else => false,
+        };
+    }
+
     /// Free every owned model + snapshot. The in-flight future must be
     /// cancelled first by the caller (it needs `io`); see `App.cancelModelLoad`.
     pub fn deinit(self: *ModelCatalogue, gpa: std.mem.Allocator) void {
-        if (self.model_load_error) |message| gpa.free(message);
+        switch (self.load) {
+            .failed => |*f| gpa.free(f.message),
+            else => {},
+        }
         for (self.entries.items) |*entry| entry.model.deinit(gpa);
         self.entries.deinit(gpa);
         for (self.compatible_models.items) |*model| model.deinit(gpa);

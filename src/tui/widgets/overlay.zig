@@ -350,8 +350,8 @@ const OverlayInner = struct {
             .reasoning_indexes = picker_reasoning,
             .scope = tui.modelPickerScope(app.pickers.models.model_scope),
             .filter = filter,
-            .loading = app.pickers.models.model_load_future != null,
-            .error_message = app.pickers.models.model_load_error,
+            .loading = app.pickers.models.load == .loading,
+            .error_message = if (app.pickers.models.load == .failed) app.pickers.models.load.failed.message else null,
         };
         return content.widget().draw(ctx);
     }
