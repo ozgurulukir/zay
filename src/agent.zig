@@ -969,6 +969,12 @@ pub const Agent = struct {
     }
 };
 
+/// Synchronous bash-approval hook. The TUI worker attaches a
+/// `*Context` via the opaque `ptr`; `requestBashApproval` (in
+/// `tui/agent_worker.zig`) is the bridge and is the only `@ptrCast`
+/// left on this seam — making the field generic would require the
+/// `Agent` struct itself to be generic, which is invasive. Kept as a
+/// vtable; see type-safety-refactor.md P1-A follow-up for `BashApproval(Ctx)`.
 pub const BashApproval = struct {
     ptr: *anyopaque,
     request: *const fn (*anyopaque, []const u8) anyerror!bool,
