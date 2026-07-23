@@ -162,6 +162,16 @@ pub const Model = struct {
     }
 };
 
+/// Per-provider base URL: either the provider's built-in default or an
+/// explicit URL supplied by the user. Replaces `?[]u8` where `null` was
+/// ambiguous between "use default" and "not specified in this layer".
+/// In overlay merges, `.default` means "don't override"; at final
+/// resolution, `.default` falls through to `Provider.defaultBaseUrl()`.
+pub const BaseUrl = union(enum) {
+    default,
+    custom: []u8,
+};
+
 /// Per-provider model entry. Identical in shape to `Model` — kept as a
 /// type alias so callers that conceptually deal with "a model entry
 /// declared inside a ProviderConfig" can name it explicitly. The two
@@ -171,11 +181,14 @@ pub const ProviderModel = Model;
 
 pub const ProviderConfig = struct {
     provider: Provider,
-    base_url: ?[]u8 = null,
+    base_url: BaseUrl = .default,
     models: []ProviderModel = &.{},
 
     pub fn deinit(self: *ProviderConfig, gpa: std.mem.Allocator) void {
-        if (self.base_url) |s| gpa.free(s);
+        switch (self.base_url) {
+            .custom => |s| gpa.free(s),
+            .default => {},
+        }
         for (self.models) |*model| model.deinit(gpa);
         if (self.models.len > 0) gpa.free(self.models);
         self.* = undefined;
@@ -184,7 +197,10 @@ pub const ProviderConfig = struct {
     fn clone(self: ProviderConfig, gpa: std.mem.Allocator) !ProviderConfig {
         var out: ProviderConfig = .{ .provider = self.provider };
         errdefer out.deinit(gpa);
-        if (self.base_url) |s| out.base_url = try gpa.dupe(u8, s);
+        switch (self.base_url) {
+            .custom => |s| out.base_url = .{ .custom = try gpa.dupe(u8, s) },
+            .default => {},
+        }
         out.models = try gpa.alloc(ProviderModel, self.models.len);
         for (self.models, 0..) |model, index| out.models[index] = try model.clone(gpa);
         return out;
@@ -551,7 +567,10 @@ fn applyMcpServerOverlay(gpa: std.mem.Allocator, target: *Config, updates: McpSe
 fn applyProviderOverlay(gpa: std.mem.Allocator, target: *Config, updates: ProviderConfig) !void {
     for (target.providers, 0..) |*provider, index| {
         if (provider.provider != updates.provider) continue;
-        if (updates.base_url) |s| try replaceOptionalSlice(gpa, &provider.base_url, s);
+        switch (updates.base_url) {
+            .custom => |s| try replaceBaseUrl(gpa, &provider.base_url, s),
+            .default => {},
+        }
         try applyProviderModelsOverlay(gpa, provider, updates.models);
         target.providers[index] = provider.*;
         return;
@@ -589,7 +608,10 @@ fn hydrateActiveModel(gpa: std.mem.Allocator, config: *Config) !void {
     if (config.model == null) return;
     for (config.providers) |entry| {
         if (entry.provider != provider) continue;
-        if (entry.base_url) |base_url| try replaceOptionalSlice(gpa, &config.base_url, base_url);
+        switch (entry.base_url) {
+            .custom => |base_url| try replaceOptionalSlice(gpa, &config.base_url, base_url),
+            .default => {},
+        }
         for (entry.models) |model| {
             if (!std.mem.eql(u8, model.id, config.model.?.id)) continue;
             config.model.?.reasoning_effort = model.reasoning_effort;
@@ -603,6 +625,15 @@ fn replaceOptionalSlice(gpa: std.mem.Allocator, target: *?[]u8, source: []const 
     const next = try gpa.dupe(u8, source);
     if (target.*) |old| gpa.free(old);
     target.* = next;
+}
+
+fn replaceBaseUrl(gpa: std.mem.Allocator, target: *BaseUrl, source: []const u8) !void {
+    const next = try gpa.dupe(u8, source);
+    switch (target.*) {
+        .custom => |old| gpa.free(old),
+        .default => {},
+    }
+    target.* = .{ .custom = next };
 }
 
 fn loadGlobalFile(
@@ -819,7 +850,7 @@ fn parseMcpServers(gpa: std.mem.Allocator, value: std.json.Value) ![]McpServerCo
 fn parseProviderConfig(gpa: std.mem.Allocator, provider: Provider, value: std.json.Value) !ProviderConfig {
     var out: ProviderConfig = .{ .provider = provider };
     errdefer out.deinit(gpa);
-    if (stringField(value, "base_url")) |s| out.base_url = try gpa.dupe(u8, s);
+    if (stringField(value, "base_url")) |s| out.base_url = .{ .custom = try gpa.dupe(u8, s) };
     if (value.object.get("models")) |models_value| {
         if (models_value == .object) out.models = try parseProviderModels(gpa, models_value);
     }
@@ -1132,9 +1163,12 @@ fn writeProviders(writer: *std.Io.Writer, providers: []const ProviderConfig) !vo
 fn writeProvider(writer: *std.Io.Writer, provider: ProviderConfig) !void {
     try writer.writeByte('{');
     var wrote_any = false;
-    if (provider.base_url) |base_url| {
-        try writeKey(writer, "base_url", &wrote_any);
-        try std.json.Stringify.value(base_url, .{}, writer);
+    switch (provider.base_url) {
+        .custom => |base_url| {
+            try writeKey(writer, "base_url", &wrote_any);
+            try std.json.Stringify.value(base_url, .{}, writer);
+        },
+        .default => {},
     }
     if (provider.models.len > 0) {
         try writeKey(writer, "models", &wrote_any);
@@ -1526,7 +1560,7 @@ test "mergeLayers: active model is hydrated from the merged provider list" {
     const models = try gpa.alloc(ProviderModel, 1);
     models[0] = .{ .id = try gpa.dupe(u8, "gpt-5.5"), .reasoning_effort = .medium };
     const providers = try gpa.alloc(ProviderConfig, 1);
-    providers[0] = .{ .provider = .openai, .base_url = try gpa.dupe(u8, "https://from-provider"), .models = models };
+    providers[0] = .{ .provider = .openai, .base_url = .{ .custom = try gpa.dupe(u8, "https://from-provider") }, .models = models };
     var global: Config = .{ .providers = providers };
     defer global.deinit(gpa);
     // ...the active model selection comes from another, carrying no reasoning.
@@ -1549,7 +1583,7 @@ test "serialize then parse roundtrips" {
     var providers = try gpa.alloc(ProviderConfig, 1);
     providers[0] = .{
         .provider = .ollama,
-        .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
+        .base_url = .{ .custom = try gpa.dupe(u8, "http://localhost:11434/v1") },
         .models = provider_models,
     };
     var original: Config = .{
