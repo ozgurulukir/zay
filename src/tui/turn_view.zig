@@ -245,41 +245,81 @@ pub const TurnView = struct {
         return visible_change;
     }
 
+    /// Classification of an incoming tool delta so `applyToolPreview` can
+    /// dispatch to the right rendering path without nested early returns.
+    const ToolPreview = union(enum) {
+        skill: []const u8,
+        generic: tools_mod.ToolDisplay,
+        none,
+    };
+
+    /// Decide whether a tool delta should render as a skill row, a generic
+    /// tool row, or nothing yet (partial bash arguments). Caller owns the
+    /// payload: `.skill` is heap-allocated, `.generic` must be deinited.
+    fn resolveToolPreview(gpa: std.mem.Allocator, tool: ai.ToolDelta) !ToolPreview {
+        if (std.mem.eql(u8, tool.name, "bash")) {
+            const command = agent_mod.parseCommand(gpa, tool.arguments) catch return .none;
+            gpa.free(command);
+            if (try skillNameFromBashRead(gpa, tool.arguments)) |skill_name| {
+                return .{ .skill = skill_name };
+            }
+        }
+        var display = try agent_mod.formatToolDisplay(gpa, tool.name, tool.arguments);
+        if (std.mem.eql(u8, tool.name, "bash") and display.expanded_label == null) {
+            display.deinit(gpa);
+            return .none;
+        }
+        return .{ .generic = display };
+    }
+
     fn applyToolPreview(
         self: *TurnView,
         gpa: std.mem.Allocator,
         transcript: *transcript_mod.Transcript,
         tool: ai.ToolDelta,
     ) !bool {
-        if (std.mem.eql(u8, tool.name, "bash")) {
-            const command = agent_mod.parseCommand(gpa, tool.arguments) catch return false;
-            gpa.free(command);
-            if (try skillNameFromBashRead(gpa, tool.arguments)) |skill_name| {
-                defer gpa.free(skill_name);
-                return try self.applySkillPreview(gpa, transcript, tool.index, skill_name);
+        var preview = try resolveToolPreview(gpa, tool);
+        const was_awaiting = self.awaitingOutput();
+
+        const visible_change = blk: {
+            switch (preview) {
+                .skill => |skill_name| {
+                    defer gpa.free(skill_name);
+                    break :blk try self.applySkillPreviewInternal(gpa, transcript, tool.index, skill_name);
+                },
+                .generic => |*display| {
+                    defer display.deinit(gpa);
+                    break :blk try self.applyGenericToolPreview(gpa, transcript, tool.index, display.*);
+                },
+                .none => return false,
             }
-        }
-        var display = try agent_mod.formatToolDisplay(gpa, tool.name, tool.arguments);
-        defer display.deinit(gpa);
-        if (std.mem.eql(u8, tool.name, "bash") and display.expanded_label == null) return false;
+        };
 
         // Reached only once arguments parse — partial tool args return above,
         // keeping the spinner up. Clearing it here counts as a visible change.
-        const was_awaiting = self.awaitingOutput();
+        self.tool_seen_in_response = true;
+        self.agent_index = null;
+        return was_awaiting or visible_change;
+    }
 
+    fn applyGenericToolPreview(
+        self: *TurnView,
+        gpa: std.mem.Allocator,
+        transcript: *transcript_mod.Transcript,
+        tool_index: u32,
+        display: tools_mod.ToolDisplay,
+    ) !bool {
         var visible_change = false;
-        if (self.toolTranscriptIndex(tool.index)) |index| {
+        if (self.toolTranscriptIndex(tool_index)) |index| {
             visible_change = !toolDisplayMatches(transcript.messages.items[index], display);
             try transcript.updateToolExpanded(gpa, index, display.label, display.expanded_label);
         } else {
             const index = try transcript.startTool(gpa, display.label);
             try transcript.updateToolExpanded(gpa, index, display.label, display.expanded_label);
-            try self.putToolTranscriptIndex(gpa, tool.index, index);
+            try self.putToolTranscriptIndex(gpa, tool_index, index);
             visible_change = true;
         }
-        self.tool_seen_in_response = true;
-        self.agent_index = null;
-        return was_awaiting or visible_change;
+        return visible_change;
     }
 
     fn setSkillMessage(gpa: std.mem.Allocator, transcript: *transcript_mod.Transcript, index: u32, title: []const u8) !void {
@@ -311,7 +351,7 @@ pub const TurnView = struct {
         };
     }
 
-    fn applySkillPreview(
+    fn applySkillPreviewInternal(
         self: *TurnView,
         gpa: std.mem.Allocator,
         transcript: *transcript_mod.Transcript,
@@ -321,7 +361,6 @@ pub const TurnView = struct {
         const title = try std.fmt.allocPrint(gpa, "[SKILL] {s}", .{skill_name});
         defer gpa.free(title);
 
-        const was_awaiting = self.awaitingOutput();
         var visible_change = false;
         if (self.toolTranscriptIndex(tool_index)) |index| {
             const m = transcript.messages.items[index].mirror();
@@ -332,9 +371,7 @@ pub const TurnView = struct {
             try self.putToolTranscriptIndex(gpa, tool_index, index);
             visible_change = true;
         }
-        self.tool_seen_in_response = true;
-        self.agent_index = null;
-        return was_awaiting or visible_change;
+        return visible_change;
     }
 
     fn finishTool(
