@@ -860,6 +860,36 @@ pub const Agent = struct {
         }
     }
 
+    /// Manually trigger a full compaction cycle: snapshot, summarize, swap.
+    /// Unlike the automatic path (which runs between turns inside `run`), this
+    /// is synchronous — it blocks the caller until the summary is written and
+    /// the projection is rebuilt. Returns the token counts before and after on
+    /// success, or an error describing what went wrong.
+    pub fn forceCompact(self: *Agent) !Event.HistoryCompacted {
+        if (self.compaction_client == .none) return error.NoCompactionClient;
+        if (self.context_window_tokens == 0) return error.UnknownContextWindow;
+        if (self.context_manager.session_writer == null) return error.NoSessionWriter;
+
+        try self.startCompaction();
+        self.joinCompactor();
+
+        const state = self.compactor.state.load(.acquire);
+        if (state == .idle or state == .running) return error.CompactionNotReady;
+        defer self.finishCompactor();
+        if (state == .failed) return error.CompactionFailed;
+
+        const result = self.compactor.result.?;
+        const session_writer = self.context_manager.session_writer.?;
+        const tokens_before = self.currentContextTokens();
+        try session_writer.appendCompaction(result.first_kept_id.slice(), result.stored_summary);
+        try self.reloadFromSession();
+        self.resetContextUsage();
+        return .{
+            .tokens_before = tokens_before,
+            .tokens_after = self.estimateContextTokens(),
+        };
+    }
+
     /// Snapshot the frozen prefix and hand it to the summarizer thread. The
     /// snapshot (rendered text + first-kept entry id) is self-contained, so the
     /// thread never touches live history.

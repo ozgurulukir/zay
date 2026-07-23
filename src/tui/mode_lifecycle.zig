@@ -185,7 +185,34 @@ pub fn submitMode(app: *App) !bool {
                 },
                 .compact => {
                     app.mode = .normal;
-                    _ = try app.thread.transcript.append(app.gpa, .notice, "compaction", "Compacting session conversation context...");
+                    if (app.thread.turn.isActive()) {
+                        _ = try app.thread.transcript.append(app.gpa, .notice, "compaction", "Cannot compact while a turn is in progress. Wait for it to finish.");
+                    } else {
+                        const result = app.liveRuntime().?.agent.forceCompact();
+                        const info = result catch |err| {
+                            const msg = if (err == error.NoCompactionClient)
+                                "No compaction client configured — compaction unavailable"
+                            else if (err == error.UnknownContextWindow)
+                                "Context window unknown — compaction unavailable"
+                            else if (err == error.NoSessionWriter)
+                                "No active session — compaction unavailable"
+                            else if (err == error.CompactionNotReady)
+                                "Compaction did not produce a result"
+                            else if (err == error.CompactionFailed)
+                                "Background compaction failed"
+                            else
+                                @errorName(err);
+                            _ = try app.thread.transcript.append(app.gpa, .notice, "compaction", msg);
+                            return true;
+                        };
+                        var buffer: [128]u8 = undefined;
+                        const text = std.fmt.bufPrint(
+                            &buffer,
+                            "compacted context ~{d} -> ~{d} tokens",
+                            .{ info.tokens_before, info.tokens_after },
+                        ) catch "compacted context";
+                        _ = try app.thread.transcript.append(app.gpa, .info, "notice", text);
+                    }
                 },
                 .status => {
                     app.mode = .normal;

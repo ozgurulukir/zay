@@ -311,7 +311,7 @@ fn writeMessage(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMes
     }
     if (message == .tool) {
         try out.writeAll(",\"tool_call_id\":");
-        try std.json.Stringify.value(message.tool.call_id, .{}, out);
+        try std.json.Stringify.value(message.tool.call_id.slice(), .{}, out);
     }
     if (message == .assistant) {
         var wrote_calls = false;
@@ -395,7 +395,7 @@ pub fn sanitizeToolArguments(raw: []const u8) []const u8 {
 
 fn writeToolCall(out: *std.Io.Writer, tool_call: ai.ToolCall) !void {
     try out.writeAll("{\"id\":");
-    try std.json.Stringify.value(tool_call.call_id, .{}, out);
+    try std.json.Stringify.value(tool_call.call_id.slice(), .{}, out);
     try out.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
     try std.json.Stringify.value(tool_call.name, .{}, out);
     try out.writeAll(",\"arguments\":");
@@ -1016,6 +1016,43 @@ test "writeRequestPayload keeps tools and tool_choice when tools are present" {
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"auto\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":[{\"type\":\"function\"}]") != null);
+}
+
+test "writeRequestPayload serializes tool call ids as strings, not objects" {
+    const gpa = std.testing.allocator;
+
+    // Build an assistant message with a tool_call block
+    const assistant_blocks = try gpa.alloc(ai.ContentBlock, 1);
+    assistant_blocks[0] = .{ .tool_call = .{
+        .call_id = .{ .value = try gpa.dupe(u8, "call_abc123") },
+        .name = try gpa.dupe(u8, "bash"),
+        .arguments = try gpa.dupe(u8, "{\"command\":\"pwd\"}"),
+    } };
+    const assistant_msg: ai.ChatMessage = .{ .assistant = .{ .content = assistant_blocks } };
+
+    // Build a tool result message
+    const tool_blocks = try gpa.alloc(ai.ContentBlock, 1);
+    tool_blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "/home/user") } };
+    const tool_msg: ai.ChatMessage = .{ .tool = .{
+        .call_id = .{ .value = try gpa.dupe(u8, "call_abc123") },
+        .content = tool_blocks,
+    } };
+
+    var messages = [_]ai.ChatMessage{ assistant_msg, tool_msg };
+    defer for (&messages) |*m| m.deinit(gpa);
+
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "test-model", "", messages[0..], "[{\"type\":\"function\"}]", null);
+    const body = payload.written();
+
+    // The tool_call id must be a JSON string, not an object
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"id\":\"call_abc123\"") != null);
+    // The tool_call_id in the tool message must be a string
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_call_id\":\"call_abc123\"") != null);
+    // Negative: must NOT serialize CallId as an object
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"id\":{\"value\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_call_id\":{\"value\":") == null);
 }
 
 test "readStream accepts an SSE line larger than the transfer buffer" {

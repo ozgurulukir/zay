@@ -8,7 +8,7 @@ Always consult the tigerstyle skill when writing code.
 
 - After cloning, vendor `fff` (build into `vendor/fff/libfff_c.so`) and the ModernBERT ONNX model (`vendor/local-models/ModernBERT-bash-classifier`). Both are gitignored.
 - Use `OMP_WAIT_POLICY=passive` at runtime to avoid MKL/CPU spin in the embedding worker.
-- `zig build install -Doptimize=ReleaseFast --prefix $HOME/.local` produces an installable binary under `~/.local/bin/`.
+- `zig build install -Doptimize=ReleaseFast --prefix $HOME/.local` installs to `~/.local/bin/`.
 
 ## Building the TUI
 
@@ -18,34 +18,13 @@ TUI built with libvaxis vxfw (source in zig-pkg). Prefer framework primitives.
 
 **Zig 0.16 field rule:** `pub` cannot precede a field declaration — only functions/variables. Cross-module field access goes through `pub fn` accessors (`getX()` form, never `X()`, because of the field-vs-method name collision).
 
-**TUI module split.** `src/tui.zig` holds the `App` lifecycle and the top-level
-`RootWidget`; the rest of `src/tui/` is split by concern. See `README.md`
-Architecture for the current module list (kept in sync as `tui.zig` shrinks).
+**TUI module split.** `src/tui.zig` holds the `App` lifecycle and the top-level `RootWidget`; the rest of `src/tui/` is split by concern. See `README.md` Architecture for the current module list (kept in sync as `tui.zig` shrinks).
 
-**Domain extraction pattern.** Isolated domain clusters (lane lifecycle, diff
-lifecycle, session switching, at-search, transcript navigation, permission,
-event callbacks, queue, settings lifecycle, clipboard helper) live under `src/tui/` as free-function modules.
-Each module imports `const tui = @import("../tui.zig")` and defines `pub fn`
-taking `*App` as the first parameter. The original App method stays as a
-1-line delegate (Strangler Fig) so inline tests in `tui.zig` resolve via the
-struct. When a private App method is needed from the new module, promote it to
-`pub` — not `pub const` (that is for module-level re-exports of nested types).
+**Domain extraction pattern.** Isolated domain clusters (lane lifecycle, diff lifecycle, session switching, at-search, transcript navigation, permission, event callbacks, queue, settings lifecycle, clipboard helper) live under `src/tui/` as free-function modules. Each module imports `const tui = @import("../tui.zig")` and defines `pub fn` taking `*App` as the first parameter. The original App method stays as a 1-line delegate (Strangler Fig) so inline tests in `tui.zig` resolve via the struct. When a private App method is needed from the new module, promote it to `pub` — not `pub const` (that is for module-level re-exports of nested types).
 
-**Widget extraction pattern.** Isolated widgets live under `src/tui/widgets/`.
-A new widget file declares the outer border widget as
-`pub const NameWidget = struct { app: *App, pub fn widget(...) vxfw.Widget { ... } }`
-and a private `Inner` struct built inside `draw()` from a `vxfw.DrawContext`.
-The file imports `const tui = @import("../../tui.zig");`,
-`const tui_style = @import("../style.zig");`, `const panel = @import("panel.zig");`
-and re-aliases `const App = tui.App;`. Nested types from other modules
-(e.g. `BackgroundManager.JobView`, `ApprovalSnapshot`, `settings_widget.State`, `mcp_status.State`) are re-exported through
-`pub const` in `tui.zig` so widget files can reach them as `tui.<module>.<Type>`.
+**Widget extraction pattern.** Isolated widgets live under `src/tui/widgets/`. A new widget file declares the outer border widget as `pub const NameWidget = struct { app: *App, pub fn widget(...) vxfw.Widget { ... } }` and a private `Inner` struct built inside `draw()` from a `vxfw.DrawContext`. The file imports `const tui = @import("../../tui.zig");`, `const tui_style = @import("../style.zig");`, `const panel = @import("panel.zig");` and re-aliases `const App = tui.App;`. Nested types from other modules (e.g. `BackgroundManager.JobView`, `ApprovalSnapshot`, `settings_widget.State`, `mcp_status.State`) are re-exported through `pub const` in `tui.zig` so widget files can reach them as `tui.<module>.<Type>`.
 
-**Per-mode command routing.** `src/tui/command_router.zig` holds one struct per
-`App.Mode` variant. Each struct owns a `handle` method that used to be a private
-method on `App`; the dispatcher is a free function delegating to the right
-struct. This is the place to add new per-mode logic — don't reintroduce
-private methods on `App` for key handling.
+**Per-mode command routing.** `src/tui/command_router.zig` holds one struct per `App.Mode` variant. Each struct owns a `handle` method that used to be a private method on `App`; the dispatcher is a free function delegating to the right struct. Add new per-mode logic here — don't reintroduce private methods on `App` for key handling.
 
 **Viewport scrolling pattern.** Standardize overlay list viewports using `panel.ViewportWindow.compute(selection, total_count, surface.size.height)` in `src/tui/widgets/panel.zig`. Use `viewport.screenRow(i)` for row rendering calculations.
 
@@ -57,14 +36,14 @@ private methods on `App` for key handling.
 
 **MCP Server & Tool Discovery pattern.** `src/mcp/manager.zig` merges `mcp_servers` configuration across global/project layers (supporting `mcp_servers`, `mcpServers`, and `mcp` JSON aliases) and scans Nova standard directories (`~/.config/nova/mcp/`, `~/.nova/mcp/`, `<cwd>/.nova/mcp/`) for tool schema discovery. `McpMode.handle` in `command_router.zig` routes `Up`/`Down`/`j`/`k` list navigation, `Space`/`Enter` server toggling, `Ctrl+R`/`r` re-syncing, and `Esc`/`q` closing.
 
-**Type System Discipline pattern.** The codebase uses `union(enum)` instead of flat structs with optional fields whenever a value can be in one of several mutually-exclusive states. This makes illegal combinations unrepresentable at compile time. The following types follow this pattern:
+**Type System Discipline pattern.** Use `union(enum)` instead of flat structs with optional fields whenever a value can be in one of several mutually-exclusive states. This makes illegal combinations unrepresentable at compile time. Current types following this pattern:
 
-- `ai.ChatMessage` — `union(enum) { system, user, assistant, tool }`. The `tool` variant carries `call_id` (non-optional); the other variants cannot have one. `role()` and `text()` are cross-variant accessors.
+- `ai.ChatMessage` — `union(enum) { system, user, assistant, tool }`. The `tool` variant carries `call_id` (non-optional); other variants cannot. `role()` and `text()` are cross-variant accessors.
 - `transcript.Message` — `union(enum)` with 10 variants (`user`/`agent`/`skill`/`logo`/`thinking`/`status`/`notice`/`success`/`info`/`tool`). `Basic` and `ToolView` payload structs group fields by category. `kind()` bridges the loose `MessageKind` enum; `mirror()` is a test-only flat view.
-- `tools.Output.display` — `Display` union with `none`/`text`/`diff` variants. The old `?[]u8 + DisplayKind` pair allowed `null` with `.diff`; the union prevents that.
-- `config.McpServerConfig.transport` — `union(enum) { stdio, sse }`. A server is either stdio (command+args) or sse (url), never both or neither. Misconfigured entries are caught at parse time.
-- `mcp.McpClient` — `transport: union(enum) { stdio, sse }` (static config) + `lifecycle: union(enum) { disabled, stdio, sse, failed }` (runtime state). `status()` maps the lifecycle to the legacy `ServerStatus` enum.
-- `config.Config.model_selection: ?ModelSelection` — typed view replacing 9 loose optional fields. `ModelSelection` has non-optional `provider`/`model`/`base_url`/`api_key`; optional settings stay optional. The legacy fields are still written by parse/merge/serialize for disk round-trip; callers read through `model_selection`.
+- `tools.Output.display` — `Display` union with `none`/`text`/`diff` variants. Replaces the old `?[]u8 + DisplayKind` pair that allowed `null` with `.diff`.
+- `config.McpServerConfig.transport` — `union(enum) { stdio, sse }`. A server is either stdio (command+args) or sse (url), never both or neither. Misconfigured entries caught at parse time.
+- `mcp.McpClient` — `transport: union(enum) { stdio, sse }` (static config) + `lifecycle: union(enum) { disabled, stdio, sse, failed }` (runtime state). `status()` maps lifecycle to the legacy `ServerStatus` enum.
+- `config.Config.model_selection: ?ModelSelection` — typed view replacing 9 loose optional fields. `ModelSelection` has non-optional `provider`/`model`/`base_url`/`api_key`; optional settings stay optional. Legacy fields still written by parse/merge/serialize for disk round-trip; callers read through `model_selection`.
 - `tui.AtSearchState` — `union(enum) { closed, indexing, open }` with `IndexingPayload` and `OpenPayload` structs. `kind()`/`results()`/`close()` helpers bridge callers.
 - `tui.NavState.quit` — `QuitState = union(enum) { none, pending, confirmed }` replacing `?Timestamp + bool`.
 - `tui.ModelCatalogue.load` — `LoadState = union(enum) { idle, loading, failed }`.
@@ -73,7 +52,9 @@ private methods on `App` for key handling.
 - `config.ProviderModel = Model` — type alias removing duplicate struct drift.
 - `session.SessionSummary.leaf_entry_id: ?EntryId` — branded `EntryId` (fixed-size `[entry_id_len]u8`) instead of loose `[]u8`.
 
-**Typed callback pattern.** `agent.Listener(Ctx)` and `executor.ToolCallObserver(Ctx)` are generic over the consumer's context type. The `*anyopaque` + `@ptrCast` vtable is replaced by `*Ctx` + typed callback functions. `StreamContext(L)` and `ExecutorBridge(L)` are generic over the listener type. The remaining `@ptrCast` sites are the `ai.StreamObserver` bridge (4 sites in `agent.zig:StreamContext.observer()`, deferred to a future `StreamObserver(Ctx)` refactor) and `BashApproval` (1 site, deferred because making it generic would require `Agent` itself to be generic).
+**Typed callback pattern.** `agent.Listener(Ctx)` and `executor.ToolCallObserver(Ctx)` are generic over the consumer's context type. The `*anyopaque` + `@ptrCast` vtable is replaced by `*Ctx` + typed callback functions. `StreamContext(L)` and `ExecutorBridge(L)` are generic over the listener type. The sole remaining `@ptrCast` is `BashApproval` (1 site, deferred because making it generic would require `Agent` itself to be generic).
+
+**Manual compaction trigger pattern.** `Agent.forceCompact()` is a synchronous public method that runs the full compaction cycle (snapshot → summarize → swap) and returns `!Event.HistoryCompacted` with token counts before/after. Unlike the automatic path (which runs between turns inside `agent.run()`), this is callable from the TUI command handler. The caller is responsible for turn-safety: check `app.thread.turn.isActive()` before calling. Errors are surfaced to the user via transcript notices rather than swallowed in logs.
 
 ## Zig Development
 
@@ -95,7 +76,7 @@ defer list.deinit(allocator);
 try list.append(allocator, 42);
 ```
 
-**HashMap/StringHashMap (default to unmanaged):**
+**HashMap/StringHashMap:**
 
 ```zig
 var map: std.StringHashMapUnmanaged(u32) = .empty;
@@ -166,9 +147,7 @@ const output = try writer.toOwnedSlice();
 - **POSIX Environment Access:** Never index `std.c.environ` directly in loops (`while (std.c.environ[i]) |e|`). In Zig 0.16 on POSIX, `std.c.environ` is `[*:null]?[*:0]u8`. Use `const env_slice = std.mem.span(std.c.environ);` and pass to `std.process.Environ.createMap(.{ .block = .{ .slice = env_slice } }, gpa)` to prevent null-pointer segfaults in multi-threaded contexts.
 - **Models.dev Registry Allocations:** `modelsdev.Registry` string storage uses an `ArrayList(u8)`. To prevent dangling slice pointers when building or merging providers, accumulate string offsets via `StringRef` (`start`, `len`) and resolve slice pointers only after all string appends complete.
 - **Dynamic Context Compaction:** Never hardcode fixed context retention budgets (e.g. 20,000 tokens) when compacting history. Use `compaction.keepRecentTokens(context_window)` so small-context models (8K/16K/32K) keep a scaled history window (%35 max 20,000) and can always compact below their swap watermark.
-- **Streaming SSE Tool Call Deduplication:** In `src/ai/openai_compatible.zig`, tool call names and IDs are atomic in streaming — first complete value wins. Subsequent name/ID deltas are ignored. This deduplicates repeated names (the `bashbash` fix) and prevents cross-tool concatenation when a provider reuses `index: 0` for parallel tool calls.
-
-- **Streaming SSE Parallel Tool Call Queue (logical→physical remap):** Some OpenAI-compatible providers reuse `index: 0` for all parallel tool calls instead of incrementing per call. `ToolCallStream` in `src/ai/openai_compatible.zig` detects this by comparing tool-call IDs (always unique). When a new ID arrives at an occupied logical index, the call is forked into a new physical builder slot. Argument continuation deltas (no ID) route through the remap to the correct slot. This preserves both tool calls instead of silently dropping the second. Limitation: if the provider omits IDs entirely, collision detection is impossible and the second call is lost (first writer wins for the name).
+- **Streaming SSE Tool Call Deduplication & Parallel Remap:** In `src/ai/openai_compatible.zig`, tool call names and IDs are atomic in streaming — first complete value wins. Subsequent name/ID deltas are ignored. This deduplicates repeated names (the `bashbash` fix) and prevents cross-tool concatenation. Some providers reuse `index: 0` for all parallel tool calls; `ToolCallStream` detects this by comparing tool-call IDs (always unique). When a new ID arrives at an occupied logical index, the call is forked into a new physical builder slot. Argument continuation deltas (no ID) route through the remap to the correct slot. Limitation: if the provider omits IDs entirely, collision detection is impossible and the second call is lost (first writer wins for the name).
 
 ## Verifying
 
@@ -179,14 +158,8 @@ Run:
 
 ## Known Issues
 
-- **Session resume shows blank TUI (fixed).** When the app resumes the last session at
-  startup (`root.zig` → `initResume`), the agent is rehydrated with messages from the
-  session DB but the TUI transcript was never populated — only the logo animation was
-  appended. Fix: call `app.rebuildTranscriptFromAgent()` in `tui.run()` before deciding
-  whether to show the logo. For a resumed session the transcript is populated from the
-  agent's message history; for a new session the transcript stays empty and the logo
-  falls through as before.
+- **Session resume shows blank TUI (fixed).** At startup (`root.zig` → `initResume`), the agent is rehydrated from the session DB but the TUI transcript was never populated — only the logo animation was appended. Fix: call `app.rebuildTranscriptFromAgent()` in `tui.run()` before deciding whether to show the logo. For a resumed session the transcript is populated from the agent's message history; for a new session the transcript stays empty and the logo falls through as before.
 
 - **High CPU usage from spinlocks.** `std.atomic.Mutex` busy-waits and pegs the CPU on multi-core. Use `std.Io.Mutex` and `std.Io.Condition` instead (paired via `static_thread_pool` or similar). Symptom: 80% CPU at idle, drops to ~2% after the fix. Files affected: `lib/logger.zig`, `src/agent.zig`, `src/background.zig`, `src/session.zig`.
 
-- **Double-free in `postAgentEvent` / `postTurnFailed` / `runAgentTurn` (fixed).** `postAgentEvent` takes ownership of the event — on error it frees the event's data internally. The callers' catch blocks were freeing `message_text` again (double-free), and the QueueFull handler in `postAgentEvent` was manually cleaning up `event_ptr` before `return error.TurnCancelled`, which triggered errdefer to repeat the same cleanup. Pattern: caller allocates `message_text`, passes it into `.{ .turn_failed = message_text }`, `postAgentEvent` frees it on error, caller's catch block frees it again. Fix: remove `worker_context.gpa.free(message_text)` from catch blocks in `runAgentTurn` and `postTurnFailed`; remove manual `event_ptr.deinit`+`destroy` before `return error.TurnCancelled` in `postAgentEvent`.
+- **Double-free in `postAgentEvent` / `postTurnFailed` / `runAgentTurn` (fixed).** `postAgentEvent` takes ownership of the event — on error it frees the event's data internally. Callers' catch blocks were freeing `message_text` again (double-free), and the QueueFull handler in `postAgentEvent` was manually cleaning up `event_ptr` before `return error.TurnCancelled`, which triggered errdefer to repeat the same cleanup. Fix: remove `worker_context.gpa.free(message_text)` from catch blocks in `runAgentTurn` and `postTurnFailed`; remove manual `event_ptr.deinit`+`destroy` before `return error.TurnCancelled` in `postAgentEvent`.

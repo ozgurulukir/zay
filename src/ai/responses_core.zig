@@ -325,7 +325,7 @@ fn writeAssistantItems(out: *std.Io.Writer, message: ai.ChatMessage) !void {
 
 fn writeFunctionCall(out: *std.Io.Writer, call: ai.ToolCall) !void {
     try out.writeAll("{\"type\":\"function_call\",\"call_id\":");
-    try std.json.Stringify.value(call.call_id, .{}, out);
+    try std.json.Stringify.value(call.call_id.slice(), .{}, out);
     if (call.responses_item_id) |id| {
         try out.writeAll(",\"id\":");
         try std.json.Stringify.value(id, .{}, out);
@@ -340,7 +340,7 @@ fn writeFunctionCall(out: *std.Io.Writer, call: ai.ToolCall) !void {
 
 fn writeToolOutput(out: *std.Io.Writer, message: ai.ChatMessage) !void {
     try out.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
-    try std.json.Stringify.value(message.tool.call_id, .{}, out);
+    try std.json.Stringify.value(message.tool.call_id.slice(), .{}, out);
     try out.writeAll(",\"output\":");
     try std.json.Stringify.value(message.text(), .{}, out);
     try out.writeByte('}');
@@ -925,6 +925,48 @@ test "writeRequestPayload omits prompt_cache_key when no session id is set" {
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_key") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"You are Nova.\"") != null);
+}
+
+test "writeRequestPayload serializes tool call ids as strings, not objects" {
+    const gpa = std.testing.allocator;
+
+    const assistant_blocks = try gpa.alloc(ai.ContentBlock, 1);
+    assistant_blocks[0] = .{ .tool_call = .{
+        .call_id = .{ .value = try gpa.dupe(u8, "call_xyz789") },
+        .name = try gpa.dupe(u8, "read"),
+        .arguments = try gpa.dupe(u8, "{\"path\":\"main.zig\"}"),
+    } };
+    const assistant_msg: ai.ChatMessage = .{ .assistant = .{ .content = assistant_blocks } };
+
+    const tool_blocks = try gpa.alloc(ai.ContentBlock, 1);
+    tool_blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "content") } };
+    const tool_msg: ai.ChatMessage = .{ .tool = .{
+        .call_id = .{ .value = try gpa.dupe(u8, "call_xyz789") },
+        .content = tool_blocks,
+    } };
+
+    var messages = [_]ai.ChatMessage{ assistant_msg, tool_msg };
+    defer for (&messages) |*m| m.deinit(gpa);
+
+    const config: ai.Config = .{
+        .base_url = "",
+        .api_key = "",
+        .model = "gpt-test",
+        .session_id = "",
+        .system_prompt = "",
+        .reasoning = null,
+    };
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(&payload.writer, config, .{}, messages[0..], "[{\"type\":\"function\"}]");
+    const body = payload.written();
+
+    // function_call call_id must be a string
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"call_id\":\"call_xyz789\"") != null);
+    // function_call_output call_id must be a string
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"call_id\":\"call_xyz789\"") != null);
+    // Negative: must NOT serialize CallId as an object
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"call_id\":{\"value\":") == null);
 }
 
 test "openresponses tools json is an array" {
