@@ -26,6 +26,12 @@ const api_url = "https://models.dev/api.json";
 /// 24 hours in milliseconds.
 const cache_ttl_ms: i64 = 24 * 60 * 60 * 1000;
 
+/// HTTP fetch buffers. models.dev sits behind Cloudflare, which serves the
+/// registry gzip-compressed — the body must be decompressed before parsing.
+const redirect_buffer_bytes: u32 = 8192;
+const transfer_buffer_bytes: u32 = 4096;
+const response_bytes_max: u32 = 4 * 1024 * 1024;
+
 pub const Adapter = enum {
     codex_responses,
     openai_compatible,
@@ -454,14 +460,35 @@ fn fetchApiJson(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
     defer request.deinit();
     try request.sendBodiless();
 
-    var redirect_buffer: [8192]u8 = undefined;
+    var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
     var response = try request.receiveHead(&redirect_buffer);
     const status: u16 = @intFromEnum(response.head.status);
     if (status < 200 or status >= 300) return error.HttpError;
 
-    var transfer_buffer: [4096]u8 = undefined;
-    const reader = response.reader(&transfer_buffer);
-    return reader.allocRemaining(gpa, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
+    // Cloudflare serves the registry gzip-compressed; honour the response's
+    // content-encoding instead of reading raw (compressed) bytes. Without
+    // this the cache is seeded with gzip data that parseModelsDevJson rejects.
+    var empty_decompress_buffer: [0]u8 = .{};
+    var decompress_buffer: []u8 = &empty_decompress_buffer;
+    var decompress_buffer_owned = false;
+    switch (response.head.content_encoding) {
+        .identity => {},
+        .zstd => {
+            decompress_buffer = try gpa.alloc(u8, std.compress.zstd.default_window_len);
+            decompress_buffer_owned = true;
+        },
+        .deflate, .gzip => {
+            decompress_buffer = try gpa.alloc(u8, std.compress.flate.max_window_len);
+            decompress_buffer_owned = true;
+        },
+        .compress => return error.UnsupportedCompressionMethod,
+    }
+    defer if (decompress_buffer_owned) gpa.free(decompress_buffer);
+
+    var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+    return reader.allocRemaining(gpa, .limited(response_bytes_max)) catch |err| switch (err) {
         error.StreamTooLong => error.ResponseTooLarge,
         else => |e| e,
     };
