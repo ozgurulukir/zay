@@ -31,6 +31,12 @@ pub fn openProviderPicker(self: *App) !void {
     self.clearInput();
     self.clearPaletteInput();
     try refreshProviderApiKeys(self);
+    // Always refresh the models.dev registry so newly added providers
+    // appear immediately instead of waiting for the 24h cache TTL.
+    if (self.modelsdev_registry) |*r| {
+        r.deinit(self.gpa);
+        self.modelsdev_registry = null;
+    }
     try ensureModelsDevRegistry(self);
     // Refresh the badges from a live model load (merge, so the catalogue isn't
     // cleared). The load's per-provider outcome drives `conn_status`, so the

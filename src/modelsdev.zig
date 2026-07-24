@@ -265,20 +265,13 @@ pub fn fetchAndCache(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !
     return parseModelsDevJson(gpa, bytes);
 }
 
-/// Retrieve the merged provider registry. First tries local cache (if < 24h old).
-/// If cache missing/stale, attempts fetch from models.dev and caches the result.
-/// On fetch error (e.g. offline), falls back to stale cache or builtins.
+/// Retrieve the merged provider registry. Prefers a fresh network fetch so
+/// newly added providers are visible immediately; falls back to cache or
+/// builtins when offline.
 pub fn loadOrFetchRegistry(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) Registry {
     const builtins = loadBuiltins();
 
-    if (loadCache(gpa, io, home_dir) catch null) |cached| {
-        var c = cached;
-        defer c.deinit(gpa);
-        if (buildRegistry(gpa, builtins, &c)) |merged| {
-            return merged;
-        } else |_| {}
-    }
-
+    // Try network first so the picker always shows the latest providers.
     if (fetchAndCache(gpa, io, home_dir)) |fetched| {
         var f = fetched;
         defer f.deinit(gpa);
@@ -287,6 +280,14 @@ pub fn loadOrFetchRegistry(gpa: std.mem.Allocator, io: std.Io, home_dir: []const
         } else |_| {}
     } else |err| {
         logger.log("modelsdev.fetch.failed err={s}", .{@errorName(err)});
+    }
+
+    if (loadCache(gpa, io, home_dir) catch null) |cached| {
+        var c = cached;
+        defer c.deinit(gpa);
+        if (buildRegistry(gpa, builtins, &c)) |merged| {
+            return merged;
+        } else |_| {}
     }
 
     if (loadCacheWithOptions(gpa, io, home_dir, true) catch null) |stale| {
