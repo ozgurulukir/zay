@@ -60,6 +60,10 @@ pub const Connection = struct {
         self.* = undefined;
     }
 
+    /// Execute a SQL statement. SAFETY: sql MUST be a hardcoded string literal,
+    /// never user-controlled input. All callers in this codebase use hardcoded
+    /// SQL (schema migrations, transaction commands). For dynamic queries with
+    /// user input, use prepare() + bindText()/bindInt() etc. for parameterization.
     pub fn exec(self: *Connection, sql: []const u8) Error!void {
         assert(sql.len > 0);
         var statement = try self.prepare(sql);
