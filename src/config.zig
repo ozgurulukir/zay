@@ -300,8 +300,36 @@ pub const ModelSelection = struct {
     }
 };
 
+/// Context window management and automatic compaction policy.
+/// Serialized as `"context"` in JSON (camelCase keys inside).
+pub const ContextSettings = struct {
+    /// Explicit context window override in tokens. When set, overrides
+    /// the model catalogue lookup (useful for local Ollama/LMStudio).
+    override_context_window: ?u32 = null,
+    /// Maximum tokens per single model generation turn.
+    max_output_tokens: ?u32 = null,
+    compaction: CompactionSettings = .{},
+};
+
+/// Automatic context summarization policy when approaching the model
+/// context window limit. All fields have sensible defaults matching
+/// the previous hardcoded constants in compaction.zig.
+pub const CompactionSettings = struct {
+    /// Enable automatic context compaction before reaching limits.
+    auto: bool = true,
+    /// Fraction of context window (0.1–1.0) that triggers compaction.
+    threshold: f64 = 0.75,
+    /// Reserve token buffer for compaction preflight checks.
+    buffer_tokens: u32 = 20_000,
+    /// Recent conversation tokens retained verbatim alongside the summary.
+    keep_recent_tokens: u32 = 8_000,
+};
+
 pub const Config = struct {
-    version: ?u32 = 1,
+    /// Semantic version of the configuration schema instance.
+    /// Null means the default ("2.0.0"). Stored as an owned slice
+    /// when parsed from disk; the default points to static memory.
+    version: ?[]u8 = null,
     provider: ?Provider = null,
     base_url: ?[]u8 = null,
     api_key: ?[]u8 = null,
@@ -312,6 +340,8 @@ pub const Config = struct {
     use_responses_endpoint: ?bool = null,
     enable_thinking: ?bool = null,
     system_prompt: ?[]u8 = null,
+    /// Context window management and compaction policy.
+    context: ContextSettings = .{},
     /// Typed view of the model selection. `null` when the required
     /// fields (provider, base_url, api_key, model) aren't all set.
     /// Equivalent to the old `assertModelSelection` check — but the
@@ -324,7 +354,12 @@ pub const Config = struct {
     /// Falls back to `provider.label()` when null.
     dynamic_provider_name: ?[]u8 = null,
 
+    /// The default schema version written by `serialize` when
+    /// `version` is null.
+    pub const default_version = "2.0.0";
+
     pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
+        if (self.version) |s| gpa.free(s);
         if (self.base_url) |s| gpa.free(s);
         if (self.api_key) |s| gpa.free(s);
         if (self.bash_classifier_url) |s| gpa.free(s);
@@ -341,12 +376,13 @@ pub const Config = struct {
 
     pub fn clone(self: Config, gpa: std.mem.Allocator) !Config {
         var out: Config = .{
-            .version = self.version,
             .provider = self.provider,
             .use_responses_endpoint = self.use_responses_endpoint,
             .enable_thinking = self.enable_thinking,
+            .context = self.context,
         };
         errdefer out.deinit(gpa);
+        if (self.version) |s| out.version = try gpa.dupe(u8, s);
         if (self.base_url) |s| out.base_url = try gpa.dupe(u8, s);
         if (self.api_key) |s| out.api_key = try gpa.dupe(u8, s);
         if (self.bash_classifier_url) |s| out.bash_classifier_url = try gpa.dupe(u8, s);
@@ -368,10 +404,17 @@ pub const Config = struct {
             list.deinit(gpa);
         }
         if (self.version) |v| {
-            if (v > 1) {
+            const major = parseSemverMajor(v) orelse {
                 try list.append(gpa, .{ .config_parse_error = .{
                     .path = try gpa.dupe(u8, "version"),
-                    .reason = try std.fmt.allocPrint(gpa, "unsupported schema version {d}", .{v}),
+                    .reason = try std.fmt.allocPrint(gpa, "invalid semver '{s}'", .{v}),
+                } });
+                return try list.toOwnedSlice(gpa);
+            };
+            if (major > 2) {
+                try list.append(gpa, .{ .config_parse_error = .{
+                    .path = try gpa.dupe(u8, "version"),
+                    .reason = try std.fmt.allocPrint(gpa, "unsupported schema version {s}", .{v}),
                 } });
             }
         }
@@ -551,6 +594,18 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
     }
     for (updates.providers) |provider| try applyProviderOverlay(gpa, target, provider);
     for (updates.mcp_servers) |mcp_server| try applyMcpServerOverlay(gpa, target, mcp_server);
+    applyContextOverlay(&target.context, updates.context);
+}
+
+/// Merge context settings: non-default values in `updates` override `target`.
+fn applyContextOverlay(target: *ContextSettings, updates: ContextSettings) void {
+    if (updates.override_context_window != null) target.override_context_window = updates.override_context_window;
+    if (updates.max_output_tokens != null) target.max_output_tokens = updates.max_output_tokens;
+    const d: CompactionSettings = .{};
+    if (updates.compaction.auto != d.auto) target.compaction.auto = updates.compaction.auto;
+    if (updates.compaction.threshold != d.threshold) target.compaction.threshold = updates.compaction.threshold;
+    if (updates.compaction.buffer_tokens != d.buffer_tokens) target.compaction.buffer_tokens = updates.compaction.buffer_tokens;
+    if (updates.compaction.keep_recent_tokens != d.keep_recent_tokens) target.compaction.keep_recent_tokens = updates.compaction.keep_recent_tokens;
 }
 
 /// After applying legacy-field updates, mirror the changes onto
@@ -762,16 +817,18 @@ fn parseObject(
     var out: Config = .{};
     errdefer out.deinit(gpa);
 
-    if (intField(value, "version")) |v| {
-        out.version = @intCast(v);
-        if (v > 1) {
-            try diagnostics.append(gpa, .{ .config_parse_error = .{
-                .path = try gpa.dupe(u8, path),
-                .reason = try std.fmt.allocPrint(gpa, "unsupported config version {d}", .{v}),
-            } });
+    // Version: accept semver string ("2.0.0") or legacy integer (1).
+    if (value.object.get("version")) |ver| {
+        switch (ver) {
+            .string => |s| out.version = try gpa.dupe(u8, s),
+            .integer => |v| out.version = try std.fmt.allocPrint(gpa, "{d}.0.0", .{v}),
+            else => {},
         }
     }
-    if (stringField(value, "model")) |s| {
+
+    // Model: accept "defaultModel" (camelCase) or "model" (legacy).
+    const model_str = stringFieldCompat(value, "defaultModel", "model");
+    if (model_str) |s| {
         if (parseModelSelection(gpa, s)) |selection| {
             out.provider = selection.provider;
             out.model = selection.model;
@@ -785,20 +842,27 @@ fn parseObject(
     if (value.object.get("providers")) |providers_value| {
         if (providers_value == .object) out.providers = try parseProviders(gpa, providers_value);
     }
-    const mcp_val = value.object.get("mcp_servers") orelse value.object.get("mcpServers") orelse value.object.get("mcp");
+    const mcp_val = value.object.get("mcpServers") orelse value.object.get("mcp_servers") orelse value.object.get("mcp");
     if (mcp_val) |val| {
         if (val == .object) out.mcp_servers = try parseMcpServers(gpa, val);
     }
-    if (stringField(value, "base_url")) |s| {
+
+    // Scalar fields: camelCase primary, snake_case fallback.
+    if (stringFieldCompat(value, "baseURL", "base_url")) |s| {
         out.base_url = try gpa.dupe(u8, s);
     }
-    if (stringField(value, "bash_classifier_url")) |s| {
+    if (stringFieldCompat(value, "bashClassifierUrl", "bash_classifier_url")) |s| {
         if (s.len > 0) out.bash_classifier_url = try gpa.dupe(u8, s);
     }
-    if (boolField(value, "use_responses_endpoint")) |b| out.use_responses_endpoint = b;
-    if (boolField(value, "enable_thinking")) |b| out.enable_thinking = b;
-    if (stringField(value, "system_prompt")) |s| {
+    if (boolFieldCompat(value, "useResponsesEndpoint", "use_responses_endpoint")) |b| out.use_responses_endpoint = b;
+    if (boolFieldCompat(value, "enableThinking", "enable_thinking")) |b| out.enable_thinking = b;
+    if (stringFieldCompat(value, "systemPrompt", "system_prompt")) |s| {
         out.system_prompt = try gpa.dupe(u8, s);
+    }
+
+    // Context window and compaction settings.
+    if (value.object.get("context")) |ctx_val| {
+        if (ctx_val == .object) out.context = parseContext(ctx_val);
     }
 
     // Populate the typed `model_selection` when all required fields
@@ -832,6 +896,53 @@ fn parseObject(
     // provider catalogue. Hydration runs once after all layers merge, against
     // the fully merged provider list (see `mergeLayers`).
     return out;
+}
+
+/// String field with camelCase primary and snake_case fallback.
+fn stringFieldCompat(value: std.json.Value, camel: []const u8, snake: []const u8) ?[]const u8 {
+    if (fieldCompat(value.object, camel, snake)) |field| {
+        if (field == .string) return field.string;
+    }
+    return null;
+}
+
+/// Bool field with camelCase primary and snake_case fallback.
+fn boolFieldCompat(value: std.json.Value, camel: []const u8, snake: []const u8) ?bool {
+    if (fieldCompat(value.object, camel, snake)) |field| {
+        if (field == .bool) return field.bool;
+    }
+    return null;
+}
+
+/// Parse the `"context"` object into `ContextSettings`. Pure — no
+/// allocation (all fields are scalars).
+fn parseContext(value: std.json.Value) ContextSettings {
+    var ctx: ContextSettings = .{};
+    if (intField(value, "overrideContextWindow")) |v| {
+        if (v >= 1024) ctx.override_context_window = @intCast(v);
+    }
+    if (intField(value, "maxOutputTokens")) |v| {
+        if (v >= 1) ctx.max_output_tokens = @intCast(v);
+    }
+    if (value.object.get("compaction")) |comp_val| {
+        if (comp_val == .object) ctx.compaction = parseCompaction(comp_val);
+    }
+    return ctx;
+}
+
+fn parseCompaction(value: std.json.Value) CompactionSettings {
+    var comp: CompactionSettings = .{};
+    if (boolField(value, "auto")) |b| comp.auto = b;
+    if (floatField(value, "threshold")) |f| {
+        if (f >= 0.1 and f <= 1.0) comp.threshold = f;
+    }
+    if (intField(value, "bufferTokens")) |v| {
+        if (v >= 0) comp.buffer_tokens = @intCast(v);
+    }
+    if (intField(value, "keepRecentTokens")) |v| {
+        if (v >= 0) comp.keep_recent_tokens = @intCast(v);
+    }
+    return comp;
 }
 
 fn parseProviders(gpa: std.mem.Allocator, value: std.json.Value) ![]ProviderConfig {
@@ -900,7 +1011,7 @@ fn parseMcpServers(gpa: std.mem.Allocator, value: std.json.Value) ![]McpServerCo
 fn parseProviderConfig(gpa: std.mem.Allocator, provider: Provider, value: std.json.Value) !ProviderConfig {
     var out: ProviderConfig = .{ .provider = provider };
     errdefer out.deinit(gpa);
-    if (stringField(value, "base_url")) |s| out.base_url = .{ .custom = try gpa.dupe(u8, s) };
+    if (stringFieldCompat(value, "baseURL", "base_url")) |s| out.base_url = .{ .custom = try gpa.dupe(u8, s) };
     if (value.object.get("models")) |models_value| {
         if (models_value == .object) out.models = try parseProviderModels(gpa, models_value);
     }
@@ -978,6 +1089,16 @@ fn parseBool(s: []const u8) bool {
     return false;
 }
 
+/// Extract the major version number from a semver string ("2.0.0" → 2).
+/// Returns null when the string is not a valid semver.
+fn parseSemverMajor(s: []const u8) ?u32 {
+    const dot = std.mem.findScalar(u8, s, '.') orelse {
+        // Bare integer ("2") is accepted as major-only.
+        return std.fmt.parseInt(u32, s, 10) catch null;
+    };
+    return std.fmt.parseInt(u32, s[0..dot], 10) catch null;
+}
+
 const reasoning_efforts_by_name = std.StaticStringMap(ai.ReasoningEffort).initComptime(.{
     .{ "minimal", .minimal },
     .{ "low", .low },
@@ -1003,6 +1124,21 @@ fn boolField(value: std.json.Value, name: []const u8) ?bool {
     const field = value.object.get(name) orelse return null;
     if (field != .bool) return null;
     return field.bool;
+}
+
+fn floatField(value: std.json.Value, name: []const u8) ?f64 {
+    const field = value.object.get(name) orelse return null;
+    return switch (field) {
+        .float => field.float,
+        .integer => @floatFromInt(field.integer),
+        else => null,
+    };
+}
+
+/// Look up a JSON key trying camelCase first, then snake_case fallback.
+/// Returns the value from whichever key exists (camelCase wins).
+fn fieldCompat(object: std.json.ObjectMap, camel: []const u8, snake: []const u8) ?std.json.Value {
+    return object.get(camel) orelse object.get(snake);
 }
 
 pub fn writeGlobal(
@@ -1125,8 +1261,13 @@ pub fn projectConfigExists(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) 
 /// auth.json (see codex.ApiKeyMap). This is the one place that enforces it, so
 /// callers never have to thread a "should I persist the key?" flag through the
 /// merge path. The "serialize: skips api_key even if present" test guards it.
+///
+/// JSON keys are camelCase (schema v2). Parse accepts both camelCase and
+/// legacy snake_case for backward compatibility.
 fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !void {
-    try writer.writeAll("{\n  \"version\": 1");
+    // Version: semver string.
+    try writer.writeAll("{\n  \"version\": ");
+    try std.json.Stringify.value(config.version orelse Config.default_version, .{}, writer);
     var wrote_any = true;
 
     // Prefer the typed `model_selection` when present; fall back to
@@ -1134,22 +1275,22 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
     if (config.model_selection) |ms| {
         try writeKey(writer, "provider", &wrote_any);
         try std.json.Stringify.value(ms.provider.label(), .{}, writer);
-        try writeKey(writer, "model", &wrote_any);
+        try writeKey(writer, "defaultModel", &wrote_any);
         try writeModelSelection(gpa, writer, ms.provider, ms.model.id);
         if (ms.use_responses_endpoint) {
-            try writeKey(writer, "use_responses_endpoint", &wrote_any);
+            try writeKey(writer, "useResponsesEndpoint", &wrote_any);
             try writer.writeAll("true");
         }
         if (ms.enable_thinking) {
-            try writeKey(writer, "enable_thinking", &wrote_any);
+            try writeKey(writer, "enableThinking", &wrote_any);
             try writer.writeAll("true");
         }
         if (ms.system_prompt) |s| {
-            try writeKey(writer, "system_prompt", &wrote_any);
+            try writeKey(writer, "systemPrompt", &wrote_any);
             try std.json.Stringify.value(s, .{}, writer);
         }
         if (ms.bash_classifier_url) |url| {
-            try writeKey(writer, "bash_classifier_url", &wrote_any);
+            try writeKey(writer, "bashClassifierUrl", &wrote_any);
             try std.json.Stringify.value(url, .{}, writer);
         }
     } else {
@@ -1158,25 +1299,25 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
             try std.json.Stringify.value(p.label(), .{}, writer);
         }
         if (config.use_responses_endpoint) |b| {
-            try writeKey(writer, "use_responses_endpoint", &wrote_any);
+            try writeKey(writer, "useResponsesEndpoint", &wrote_any);
             try writer.writeAll(if (b) "true" else "false");
         }
         if (config.enable_thinking) |b| {
-            try writeKey(writer, "enable_thinking", &wrote_any);
+            try writeKey(writer, "enableThinking", &wrote_any);
             try writer.writeAll(if (b) "true" else "false");
         }
         if (config.model) |m| {
             if (config.provider) |provider| {
-                try writeKey(writer, "model", &wrote_any);
+                try writeKey(writer, "defaultModel", &wrote_any);
                 try writeModelSelection(gpa, writer, provider, m.id);
             }
         }
         if (config.system_prompt) |s| {
-            try writeKey(writer, "system_prompt", &wrote_any);
+            try writeKey(writer, "systemPrompt", &wrote_any);
             try std.json.Stringify.value(s, .{}, writer);
         }
         if (config.bash_classifier_url) |url| {
-            try writeKey(writer, "bash_classifier_url", &wrote_any);
+            try writeKey(writer, "bashClassifierUrl", &wrote_any);
             try std.json.Stringify.value(url, .{}, writer);
         }
     }
@@ -1185,10 +1326,65 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
         try writeProviders(writer, config.providers);
     }
     if (config.mcp_servers.len > 0) {
-        try writeKey(writer, "mcp_servers", &wrote_any);
+        try writeKey(writer, "mcpServers", &wrote_any);
         try writeMcpServers(writer, config.mcp_servers);
     }
+    // Context: only written when at least one field differs from defaults.
+    if (hasNonDefaultContext(config.context)) {
+        try writeKey(writer, "context", &wrote_any);
+        try writeContext(writer, config.context);
+    }
     try writer.writeAll("\n}\n");
+}
+
+fn hasNonDefaultContext(ctx: ContextSettings) bool {
+    const d: ContextSettings = .{};
+    if (ctx.override_context_window != null) return true;
+    if (ctx.max_output_tokens != null) return true;
+    if (ctx.compaction.auto != d.compaction.auto) return true;
+    if (ctx.compaction.threshold != d.compaction.threshold) return true;
+    if (ctx.compaction.buffer_tokens != d.compaction.buffer_tokens) return true;
+    if (ctx.compaction.keep_recent_tokens != d.compaction.keep_recent_tokens) return true;
+    return false;
+}
+
+fn writeContext(writer: *std.Io.Writer, ctx: ContextSettings) !void {
+    try writer.writeByte('{');
+    var wrote_any = false;
+    if (ctx.override_context_window) |v| {
+        try writeKeyNoIndent(writer, "overrideContextWindow", &wrote_any);
+        try writer.print("{d}", .{v});
+    }
+    if (ctx.max_output_tokens) |v| {
+        try writeKeyNoIndent(writer, "maxOutputTokens", &wrote_any);
+        try writer.print("{d}", .{v});
+    }
+    // Compaction: always written when context is present.
+    try writeKeyNoIndent(writer, "compaction", &wrote_any);
+    try writeCompaction(writer, ctx.compaction);
+    try writer.writeByte('}');
+}
+
+fn writeCompaction(writer: *std.Io.Writer, comp: CompactionSettings) !void {
+    try writer.writeByte('{');
+    var wrote_any = false;
+    if (!comp.auto) {
+        try writeKeyNoIndent(writer, "auto", &wrote_any);
+        try writer.writeAll("false");
+    }
+    {
+        try writeKeyNoIndent(writer, "threshold", &wrote_any);
+        try writer.print("{d:.2}", .{comp.threshold});
+    }
+    {
+        try writeKeyNoIndent(writer, "bufferTokens", &wrote_any);
+        try writer.print("{d}", .{comp.buffer_tokens});
+    }
+    {
+        try writeKeyNoIndent(writer, "keepRecentTokens", &wrote_any);
+        try writer.print("{d}", .{comp.keep_recent_tokens});
+    }
+    try writer.writeByte('}');
 }
 
 fn writeModelSelection(gpa: std.mem.Allocator, writer: *std.Io.Writer, provider: Provider, model_id: []const u8) !void {
@@ -1215,7 +1411,7 @@ fn writeProvider(writer: *std.Io.Writer, provider: ProviderConfig) !void {
     var wrote_any = false;
     switch (provider.base_url) {
         .custom => |base_url| {
-            try writeKey(writer, "base_url", &wrote_any);
+            try writeKeyNoIndent(writer, "baseURL", &wrote_any);
             try std.json.Stringify.value(base_url, .{}, writer);
         },
         .default => {},
@@ -1571,7 +1767,7 @@ test "serialize: skips api_key even if present" {
 
     try std.testing.expect(std.mem.indexOf(u8, buf.written(), "api_key") == null);
     try std.testing.expect(std.mem.indexOf(u8, buf.written(), "sk-should-never-appear") == null);
-    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"model\": \"openai/gpt-5.5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"defaultModel\": \"openai/gpt-5.5\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"openai\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"reasoningEffort\":\"medium\"") != null);
 }
@@ -1669,7 +1865,7 @@ test "globalConfigPath resolves XDG .config/nova/config.json" {
 test "Config.validate validates schema version and base_url scheme" {
     const gpa = std.testing.allocator;
     var cfg: Config = .{
-        .version = 2,
+        .version = try gpa.dupe(u8, "3.0.0"),
         .base_url = try gpa.dupe(u8, "ftp://invalid-scheme"),
     };
     defer cfg.deinit(gpa);
@@ -1691,12 +1887,12 @@ test "config.load with missing files returns default config with version 1 and z
     var res = try load(gpa, io, "/nonexistent/cwd", "/nonexistent/home", env);
     defer res.deinit(gpa);
 
-    try std.testing.expectEqual(@as(?u32, 1), res.config.version);
+    try std.testing.expectEqual(@as(?[]u8, null), res.config.version);
     try std.testing.expectEqual(@as(?Provider, null), res.config.provider);
     try std.testing.expectEqual(@as(usize, 0), res.diagnostics.len);
 }
 
-test "serialize outputs version 1 and formatted 2-space indented JSON" {
+test "serialize outputs semver version and camelCase 2-space indented JSON" {
     const gpa = std.testing.allocator;
     var cfg: Config = .{
         .provider = .openai,
@@ -1710,9 +1906,9 @@ test "serialize outputs version 1 and formatted 2-space indented JSON" {
     try serialize(gpa, &buf.writer, cfg);
 
     const text = buf.written();
-    try std.testing.expect(std.mem.startsWith(u8, text, "{\n  \"version\": 1"));
+    try std.testing.expect(std.mem.startsWith(u8, text, "{\n  \"version\": \"2.0.0\""));
     try std.testing.expect(std.mem.indexOf(u8, text, "  \"provider\": \"openai\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "  \"use_responses_endpoint\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "  \"useResponsesEndpoint\": true") != null);
 }
 
 test "parseFile parses mcp_servers objects" {
@@ -1891,4 +2087,230 @@ test "mergeLayers: settings-only overlay does not overwrite provider/model" {
     try std.testing.expectEqualStrings("llama3.1:8b", merged.model.?.id);
     // enable_thinking should come from settings.
     try std.testing.expectEqual(true, merged.enable_thinking.?);
+}
+
+// ---------------------------------------------------------------------------
+// Schema v2: camelCase, semver version, context/compaction
+// ---------------------------------------------------------------------------
+
+test "parseObject accepts camelCase keys (schema v2)" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    const json =
+        \\{"defaultModel":"ollama/llama3.1:8b","baseURL":"http://localhost:11434","useResponsesEndpoint":true,"enableThinking":true,"systemPrompt":"You are Nova.","bashClassifierUrl":"http://localhost:9999"}
+    ;
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqual(Provider.ollama, cfg.provider.?);
+    try std.testing.expectEqualStrings("llama3.1:8b", cfg.model.?.id);
+    try std.testing.expectEqualStrings("http://localhost:11434", cfg.base_url.?);
+    try std.testing.expectEqual(true, cfg.use_responses_endpoint.?);
+    try std.testing.expectEqual(true, cfg.enable_thinking.?);
+    try std.testing.expectEqualStrings("You are Nova.", cfg.system_prompt.?);
+    try std.testing.expectEqualStrings("http://localhost:9999", cfg.bash_classifier_url.?);
+    try std.testing.expectEqual(@as(usize, 0), sink.items.len);
+}
+
+test "parseObject accepts legacy snake_case keys (backward compat)" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    const json =
+        \\{"model":"openai/gpt-5.5","base_url":"https://api.openai.com","use_responses_endpoint":false,"enable_thinking":false,"system_prompt":"Legacy.","bash_classifier_url":"http://old:8080"}
+    ;
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqual(Provider.openai, cfg.provider.?);
+    try std.testing.expectEqualStrings("gpt-5.5", cfg.model.?.id);
+    try std.testing.expectEqualStrings("https://api.openai.com", cfg.base_url.?);
+    try std.testing.expectEqual(false, cfg.use_responses_endpoint.?);
+    try std.testing.expectEqual(false, cfg.enable_thinking.?);
+    try std.testing.expectEqualStrings("Legacy.", cfg.system_prompt.?);
+    try std.testing.expectEqualStrings("http://old:8080", cfg.bash_classifier_url.?);
+}
+
+test "parseObject: camelCase wins over snake_case when both present" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    const json =
+        \\{"defaultModel":"ollama/llama3.1:8b","model":"openai/gpt-5.5","baseURL":"http://camel","base_url":"http://snake"}
+    ;
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqual(Provider.ollama, cfg.provider.?);
+    try std.testing.expectEqualStrings("http://camel", cfg.base_url.?);
+}
+
+test "parseObject: semver string version" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    var cfg = try parseFile(gpa, "<test>", "{\"version\":\"2.1.0\"}", &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqualStrings("2.1.0", cfg.version.?);
+}
+
+test "parseObject: legacy integer version normalized to semver" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    var cfg = try parseFile(gpa, "<test>", "{\"version\":1}", &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqualStrings("1.0.0", cfg.version.?);
+}
+
+test "parseObject: context with compaction settings" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    const json =
+        \\{"context":{"overrideContextWindow":32000,"maxOutputTokens":4096,"compaction":{"auto":false,"threshold":0.80,"bufferTokens":10000,"keepRecentTokens":5000}}}
+    ;
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 32_000), cfg.context.override_context_window.?);
+    try std.testing.expectEqual(@as(u32, 4_096), cfg.context.max_output_tokens.?);
+    try std.testing.expectEqual(false, cfg.context.compaction.auto);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.80), cfg.context.compaction.threshold, 0.001);
+    try std.testing.expectEqual(@as(u32, 10_000), cfg.context.compaction.buffer_tokens);
+    try std.testing.expectEqual(@as(u32, 5_000), cfg.context.compaction.keep_recent_tokens);
+}
+
+test "parseObject: context defaults when absent" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    var cfg = try parseFile(gpa, "<test>", "{}", &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqual(@as(?u32, null), cfg.context.override_context_window);
+    try std.testing.expectEqual(@as(?u32, null), cfg.context.max_output_tokens);
+    try std.testing.expectEqual(true, cfg.context.compaction.auto);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), cfg.context.compaction.threshold, 0.001);
+    try std.testing.expectEqual(@as(u32, 20_000), cfg.context.compaction.buffer_tokens);
+    try std.testing.expectEqual(@as(u32, 8_000), cfg.context.compaction.keep_recent_tokens);
+}
+
+test "parseObject: compaction threshold clamped to valid range" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    var cfg = try parseFile(gpa, "<test>", "{\"context\":{\"compaction\":{\"threshold\":5.0}}}", &sink);
+    defer cfg.deinit(gpa);
+    // Out-of-range threshold keeps the default.
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), cfg.context.compaction.threshold, 0.001);
+}
+
+test "serialize writes camelCase keys and context section" {
+    const gpa = std.testing.allocator;
+    var cfg: Config = .{
+        .provider = .ollama,
+        .model = .{ .id = try gpa.dupe(u8, "llama3.1:8b") },
+        .use_responses_endpoint = true,
+        .enable_thinking = true,
+        .system_prompt = try gpa.dupe(u8, "Be helpful."),
+        .context = .{
+            .override_context_window = 32_000,
+            .compaction = .{ .threshold = 0.80, .keep_recent_tokens = 5_000 },
+        },
+    };
+    defer cfg.deinit(gpa);
+
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, cfg);
+
+    const text = buf.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"defaultModel\": \"ollama/llama3.1:8b\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"useResponsesEndpoint\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"enableThinking\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"systemPrompt\": \"Be helpful.\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"context\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"overrideContextWindow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"compaction\"") != null);
+}
+
+test "serialize omits context section when all defaults" {
+    const gpa = std.testing.allocator;
+    var cfg: Config = .{ .provider = .openai };
+    defer cfg.deinit(gpa);
+
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, cfg);
+
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"context\"") == null);
+}
+
+test "serialize then parse roundtrips with camelCase and context" {
+    const gpa = std.testing.allocator;
+    var original: Config = .{
+        .provider = .ollama,
+        .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
+        .use_responses_endpoint = false,
+        .enable_thinking = true,
+        .model = .{ .id = try gpa.dupe(u8, "llama3.1:8b") },
+        .context = .{
+            .override_context_window = 16_000,
+            .compaction = .{ .auto = false, .keep_recent_tokens = 4_000 },
+        },
+    };
+    defer original.deinit(gpa);
+
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, original);
+
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    var parsed = try parseFile(gpa, "<test>", buf.written(), &sink);
+    defer parsed.deinit(gpa);
+    var roundtrip = try mergeLayers(gpa, &.{parsed});
+    defer roundtrip.deinit(gpa);
+
+    try std.testing.expectEqual(Provider.ollama, roundtrip.provider.?);
+    try std.testing.expectEqualStrings("llama3.1:8b", roundtrip.model.?.id);
+    try std.testing.expectEqual(false, roundtrip.use_responses_endpoint.?);
+    try std.testing.expectEqual(true, roundtrip.enable_thinking.?);
+    try std.testing.expectEqual(@as(u32, 16_000), roundtrip.context.override_context_window.?);
+    try std.testing.expectEqual(false, roundtrip.context.compaction.auto);
+    try std.testing.expectEqual(@as(u32, 4_000), roundtrip.context.compaction.keep_recent_tokens);
+}
+
+test "parseSemverMajor extracts major from various formats" {
+    try std.testing.expectEqual(@as(?u32, 2), parseSemverMajor("2.0.0"));
+    try std.testing.expectEqual(@as(?u32, 1), parseSemverMajor("1.2.3"));
+    try std.testing.expectEqual(@as(?u32, 10), parseSemverMajor("10.0.0"));
+    try std.testing.expectEqual(@as(?u32, 3), parseSemverMajor("3"));
+    try std.testing.expectEqual(@as(?u32, null), parseSemverMajor("abc"));
+    try std.testing.expectEqual(@as(?u32, null), parseSemverMajor(""));
+}
+
+test "parseProviderConfig accepts baseURL (camelCase)" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    const json = "{\"providers\":{\"ollama\":{\"baseURL\":\"http://custom:11434\"}}}";
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), cfg.providers.len);
+    switch (cfg.providers[0].base_url) {
+        .custom => |url| try std.testing.expectEqualStrings("http://custom:11434", url),
+        .default => return error.Unexpected,
+    }
+}
+
+test "applyContextOverlay merges non-default values" {
+    var target: ContextSettings = .{};
+    const updates: ContextSettings = .{
+        .override_context_window = 64_000,
+        .compaction = .{ .threshold = 0.90 },
+    };
+    applyContextOverlay(&target, updates);
+    try std.testing.expectEqual(@as(u32, 64_000), target.override_context_window.?);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.90), target.compaction.threshold, 0.001);
+    // Defaults preserved for fields not in updates.
+    try std.testing.expectEqual(true, target.compaction.auto);
+    try std.testing.expectEqual(@as(u32, 20_000), target.compaction.buffer_tokens);
 }

@@ -43,6 +43,11 @@ pub const AgentRuntime = struct {
     /// MCP tool schemas to inject into the AI config at connection time.
     /// Set by the App before calling connectXxxClient.
     mcp_tools: []const ai.McpToolSchema = &.{},
+    /// Context window and compaction settings from config. Stored so
+    /// the attach/connect functions can pass the override to
+    /// `compaction.contextWindowTokens` and the agent can use the
+    /// compaction policy.
+    context_settings: config_mod.ContextSettings = .{},
 
     pub const ClientState = union(enum) {
         disconnected,
@@ -155,6 +160,7 @@ pub const AgentRuntime = struct {
             .agent = undefined,
             .diagnostics = diagnostics,
             .codex_connection_expired = false,
+            .context_settings = config.context,
         };
 
         if (session_id) |id| {
@@ -167,6 +173,7 @@ pub const AgentRuntime = struct {
         target.agent = agent_mod.Agent.init(gpa, io, cwd, .none);
         errdefer target.agent.deinit();
         target.agent.skills = target.skills;
+        target.agent.compaction_settings = config.context.compaction;
         if (config.model_selection) |ms| {
             if (ms.bash_classifier_url) |url| {
                 target.agent.bash_classifier_url = try gpa.dupe(u8, url);
@@ -396,7 +403,7 @@ pub const AgentRuntime = struct {
         });
         errdefer client.deinit();
         self.replaceClient(.{ .codex_responses = client });
-        self.agent.context_window_tokens = compaction.contextWindowTokens(model_id);
+        self.agent.context_window_tokens = compaction.contextWindowTokens(model_id, self.context_settings.override_context_window);
         self.agent.resetContextUsage();
 
         attach_compaction: {
@@ -484,7 +491,7 @@ pub const AgentRuntime = struct {
         });
         errdefer client.deinit();
         self.replaceClient(.{ .openai_compatible = client });
-        self.agent.context_window_tokens = compaction.contextWindowTokens(model_id);
+        self.agent.context_window_tokens = compaction.contextWindowTokens(model_id, self.context_settings.override_context_window);
         self.agent.resetContextUsage();
 
         attach_compaction: {
@@ -538,7 +545,7 @@ pub const AgentRuntime = struct {
         });
         errdefer client.deinit();
         self.replaceClient(.{ .openai_responses = client });
-        self.agent.context_window_tokens = compaction.contextWindowTokens(model_id);
+        self.agent.context_window_tokens = compaction.contextWindowTokens(model_id, self.context_settings.override_context_window);
         self.agent.resetContextUsage();
 
         attach_compaction: {

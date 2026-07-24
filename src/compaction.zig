@@ -43,14 +43,15 @@ const tokens_per_char_divisor: u32 = 4;
 /// Background summarization starts once the footprint crosses this fraction of
 /// the window. Kicking off early gives the summary time to finish before it is
 /// needed, so the swap is instant and the agent never blocks.
-const start_watermark_percent: u32 = 70;
+/// Configurable via `context.compaction.threshold` (default 0.75).
+const start_watermark_default: f64 = 0.75;
 
 /// The summary is swapped into history once the footprint crosses this higher
-/// fraction. Started at `start_watermark_percent`, the background summary is
-/// normally ready by here. Everything appended between the two watermarks
-/// survives the swap verbatim: the boundary references a tree entry id and the
-/// projection emits every entry from it to the leaf (see `Session.messages`).
-const swap_watermark_percent: u32 = 90;
+/// fraction. Derived from the start threshold: `threshold + 0.20`, capped at
+/// 0.95. Started at the start watermark, the background summary is normally
+/// ready by here.
+const swap_watermark_margin: f64 = 0.20;
+const swap_watermark_cap: f64 = 0.95;
 
 /// Tokens of the most recent conversation kept verbatim; the older prefix is
 /// summarized. Mirrors the codex/pi retention budget.
@@ -66,13 +67,16 @@ const tool_output_render_cap_bytes: u32 = 2048;
 
 /// Context window in tokens for `model_id`, from the generated models.dev
 /// catalogue, or a conservative default when the id matches no catalogue entry.
+/// When `override` is non-null it wins unconditionally (config-driven
+/// `context.overrideContextWindow`).
 ///
 /// Matches by longest id prefix: an exact id wins, and a dated/suffixed variant
 /// (e.g. `gpt-5-2025-08-07`) falls back to its base family (`gpt-5`). The
 /// catalogue carries only the providers Nova integrates with; anything else
 /// lands on the conservative default, which only compacts early — the safe
 /// direction.
-pub fn contextWindowTokens(raw_model_id: []const u8) u32 {
+pub fn contextWindowTokens(raw_model_id: []const u8, override: ?u32) u32 {
+    if (override) |v| return v;
     var model_id = raw_model_id;
     while (std.mem.indexOfScalar(u8, model_id, '/')) |slash| {
         model_id = model_id[slash + 1 ..];
@@ -91,31 +95,32 @@ pub fn contextWindowTokens(raw_model_id: []const u8) u32 {
 /// Target tokens of recent conversation to keep verbatim during compaction.
 /// Scaled dynamically based on `context_window` so small-context models keep
 /// a proportionate window and can always compact cleanly below their swap
-/// watermark.
-pub fn keepRecentTokens(context_window: u32) u32 {
-    if (context_window == 0) return keep_recent_tokens_default;
+/// watermark. `config_keep` is the user-configured ceiling
+/// (`context.compaction.keepRecentTokens`, default 8 000).
+pub fn keepRecentTokens(context_window: u32, config_keep: u32) u32 {
+    if (context_window == 0) return config_keep;
     const target: u32 = @intCast(@as(u64, context_window) * 35 / 100);
-    return @max(1000, @min(keep_recent_tokens_default, target));
+    return @max(1000, @min(config_keep, target));
 }
 
 /// True once `used_tokens` crosses the start watermark: begin producing the
-/// background summary. `used_tokens` is the conversation's footprint — prompt
-/// plus completion of the last turn — since the completion becomes part of the
-/// next request's prompt.
-pub fn shouldStartSummary(used_tokens: u32, context_window: u32) bool {
+/// background summary. `threshold` is the configurable fraction
+/// (`context.compaction.threshold`, default 0.75).
+pub fn shouldStartSummary(used_tokens: u32, context_window: u32, threshold: f64) bool {
     assert(context_window > 0);
-    const threshold: u32 = @intCast(@as(u64, context_window) * start_watermark_percent / 100);
-    return used_tokens > threshold;
+    const effective = if (threshold >= 0.1 and threshold <= 1.0) threshold else start_watermark_default;
+    const limit: u32 = @intFromFloat(@round(@as(f64, @floatFromInt(context_window)) * effective));
+    return used_tokens > limit;
 }
 
 /// True once `used_tokens` crosses the swap watermark: install the background
-/// summary, replacing the summarized prefix while the recent tail survives
-/// verbatim. By here the summary started at `shouldStartSummary` is normally
-/// ready, so the swap does not block.
-pub fn shouldSwap(used_tokens: u32, context_window: u32) bool {
+/// summary. The swap watermark is `threshold + 0.20`, capped at 0.95.
+pub fn shouldSwap(used_tokens: u32, context_window: u32, threshold: f64) bool {
     assert(context_window > 0);
-    const threshold: u32 = @intCast(@as(u64, context_window) * swap_watermark_percent / 100);
-    return used_tokens > threshold;
+    const effective = if (threshold >= 0.1 and threshold <= 1.0) threshold else start_watermark_default;
+    const swap = @min(effective + swap_watermark_margin, swap_watermark_cap);
+    const limit: u32 = @intFromFloat(@round(@as(f64, @floatFromInt(context_window)) * swap));
+    return used_tokens > limit;
 }
 
 /// Summarize `prefix_text` with `client`: one user message (instruction +
@@ -315,23 +320,35 @@ fn divCeil(numerator: u32, denominator: u32) u32 {
 
 test "context window lookup uses the generated catalogue with a default fallback" {
     // Unknown ids fall back to the conservative default.
-    try std.testing.expectEqual(context_window_default_tokens, contextWindowTokens("some-unknown-model"));
+    try std.testing.expectEqual(context_window_default_tokens, contextWindowTokens("some-unknown-model", null));
     // Exact ids resolve to their real models.dev context window.
-    try std.testing.expectEqual(@as(u32, 1_000_000), contextWindowTokens("claude-opus-4-8"));
-    try std.testing.expectEqual(@as(u32, 1_047_576), contextWindowTokens("gpt-4.1-mini"));
+    try std.testing.expectEqual(@as(u32, 1_000_000), contextWindowTokens("claude-opus-4-8", null));
+    try std.testing.expectEqual(@as(u32, 1_047_576), contextWindowTokens("gpt-4.1-mini", null));
     // A dated/suffixed variant falls back to its longest-prefix base family.
-    try std.testing.expectEqual(@as(u32, 400_000), contextWindowTokens("gpt-5-2025-08-07"));
+    try std.testing.expectEqual(@as(u32, 400_000), contextWindowTokens("gpt-5-2025-08-07", null));
+    // Override wins unconditionally.
+    try std.testing.expectEqual(@as(u32, 32_000), contextWindowTokens("claude-opus-4-8", 32_000));
 }
 
-test "summary starts at the lower watermark and swaps at the higher" {
-    const window: u32 = 100_000; // start 70_000, swap 90_000
-    try std.testing.expect(!shouldStartSummary(70_000, window));
-    try std.testing.expect(shouldStartSummary(70_001, window));
-    try std.testing.expect(!shouldStartSummary(0, window));
-    // The swap watermark sits above the start watermark.
-    try std.testing.expect(!shouldSwap(90_000, window));
-    try std.testing.expect(shouldSwap(90_001, window));
-    try std.testing.expect(!shouldSwap(80_000, window));
+test "summary starts at the threshold and swaps at threshold + margin" {
+    const window: u32 = 100_000;
+    // Default threshold 0.75 → start at 75_000, swap at 95_000.
+    try std.testing.expect(!shouldStartSummary(75_000, window, 0.75));
+    try std.testing.expect(shouldStartSummary(75_001, window, 0.75));
+    try std.testing.expect(!shouldStartSummary(0, window, 0.75));
+    // Swap = 0.75 + 0.20 = 0.95 → 95_000.
+    try std.testing.expect(!shouldSwap(95_000, window, 0.75));
+    try std.testing.expect(shouldSwap(95_001, window, 0.75));
+    try std.testing.expect(!shouldSwap(80_000, window, 0.75));
+}
+
+test "summary watermarks respect custom threshold" {
+    const window: u32 = 100_000;
+    // threshold 0.70 → start at 70_000, swap at 90_000 (old behavior).
+    try std.testing.expect(!shouldStartSummary(70_000, window, 0.70));
+    try std.testing.expect(shouldStartSummary(70_001, window, 0.70));
+    try std.testing.expect(!shouldSwap(90_000, window, 0.70));
+    try std.testing.expect(shouldSwap(90_001, window, 0.70));
 }
 
 test "estimate message tokens from content bytes" {
@@ -416,16 +433,23 @@ test "serialize prefix drops reasoning and tags roles" {
     try std.testing.expectEqualStrings("[user]: hello\n[tool result]: output\n", text);
 }
 
-test "keepRecentTokens scales with context window" {
-    try std.testing.expectEqual(@as(u32, 20_000), keepRecentTokens(200_000));
-    try std.testing.expectEqual(@as(u32, 11_200), keepRecentTokens(32_000));
-    try std.testing.expectEqual(@as(u32, 5_600), keepRecentTokens(16_000));
-    try std.testing.expectEqual(@as(u32, 2_800), keepRecentTokens(8_000));
+test "keepRecentTokens scales with context window and respects config ceiling" {
+    // config_keep = 20_000 (old default): large window hits the ceiling.
+    try std.testing.expectEqual(@as(u32, 20_000), keepRecentTokens(200_000, 20_000));
+    // Small windows scale proportionally (35%).
+    try std.testing.expectEqual(@as(u32, 11_200), keepRecentTokens(32_000, 20_000));
+    try std.testing.expectEqual(@as(u32, 5_600), keepRecentTokens(16_000, 20_000));
+    try std.testing.expectEqual(@as(u32, 2_800), keepRecentTokens(8_000, 20_000));
+    // config_keep = 8_000 (new default): ceiling is lower.
+    try std.testing.expectEqual(@as(u32, 8_000), keepRecentTokens(200_000, 8_000));
+    try std.testing.expectEqual(@as(u32, 8_000), keepRecentTokens(32_000, 8_000));
+    // Zero context window returns config_keep directly.
+    try std.testing.expectEqual(@as(u32, 8_000), keepRecentTokens(0, 8_000));
 }
 
 test "contextWindowTokens strips provider prefix" {
-    const tokens1 = contextWindowTokens("gpt-4o");
-    const tokens2 = contextWindowTokens("openai/gpt-4o");
+    const tokens1 = contextWindowTokens("gpt-4o", null);
+    const tokens2 = contextWindowTokens("openai/gpt-4o", null);
     try std.testing.expectEqual(tokens1, tokens2);
 }
 

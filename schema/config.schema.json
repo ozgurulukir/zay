@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nova-agent.dev/v2/config.schema.json",
+  "title": "Nova Agent Configuration",
+  "description": "Configuration schema for Nova coding agent (v2). Supports layered merging: global (~/.config/nova/config.json) → project (.nova/config.json) → environment variables. JSON keys are camelCase; legacy snake_case keys are accepted for backward compatibility.",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "default": "2.0.0",
+      "description": "Semantic version of the configuration schema instance."
+    },
+    "defaultModel": {
+      "type": "string",
+      "pattern": "^[a-z_]+/.+$",
+      "description": "Primary model selection as '<provider>/<model-id>' (e.g., 'openai/gpt-5.5', 'ollama/llama3.1:8b'). Legacy key 'model' is also accepted."
+    },
+    "provider": {
+      "type": "string",
+      "description": "Provider label (redundant with defaultModel, kept for readability)."
+    },
+    "baseURL": {
+      "type": "string",
+      "format": "uri",
+      "description": "Override base URL for the active provider. Legacy key 'base_url' is also accepted."
+    },
+    "useResponsesEndpoint": {
+      "type": "boolean",
+      "default": false,
+      "description": "Use the OpenAI Responses API instead of Chat Completions. Legacy key 'use_responses_endpoint' is also accepted."
+    },
+    "enableThinking": {
+      "type": "boolean",
+      "default": false,
+      "description": "Enable extended thinking / reasoning mode. Legacy key 'enable_thinking' is also accepted."
+    },
+    "systemPrompt": {
+      "type": "string",
+      "maxLength": 10000,
+      "description": "Custom system prompt override. Legacy key 'system_prompt' is also accepted."
+    },
+    "bashClassifierUrl": {
+      "type": "string",
+      "format": "uri",
+      "description": "URL of the local bash command safety classifier endpoint. Legacy key 'bash_classifier_url' is also accepted."
+    },
+    "providers": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/ProviderConfig" },
+      "description": "Per-provider configuration keyed by provider label (e.g., 'openai', 'ollama')."
+    },
+    "mcpServers": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/MCPServerConfig" },
+      "description": "Model Context Protocol server integrations. Legacy keys 'mcp_servers' and 'mcp' are also accepted."
+    },
+    "context": {
+      "$ref": "#/$defs/ContextSettings",
+      "description": "Context window management and automatic compaction policy."
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "ProviderConfig": {
+      "type": "object",
+      "properties": {
+        "baseURL": {
+          "type": "string",
+          "format": "uri",
+          "description": "Custom base URL for this provider. Legacy key 'base_url' is also accepted."
+        },
+        "models": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/ModelConfig" },
+          "description": "Per-model configuration keyed by model id."
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModelConfig": {
+      "type": "object",
+      "properties": {
+        "reasoningEffort": {
+          "type": "string",
+          "enum": ["minimal", "low", "none", "medium", "high", "xhigh"],
+          "description": "Reasoning effort level for this model."
+        }
+      },
+      "additionalProperties": false
+    },
+    "MCPServerConfig": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string",
+          "description": "Executable command for stdio transport."
+        },
+        "args": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Command arguments for stdio transport."
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Server URL for SSE transport."
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether this server is active."
+        }
+      },
+      "additionalProperties": false
+    },
+    "ContextSettings": {
+      "type": "object",
+      "properties": {
+        "overrideContextWindow": {
+          "type": "integer",
+          "minimum": 1024,
+          "description": "Explicit context window size in tokens. Overrides the model catalogue lookup (useful for local Ollama/LMStudio models)."
+        },
+        "maxOutputTokens": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum tokens per single model generation turn."
+        },
+        "compaction": { "$ref": "#/$defs/CompactionSettings" }
+      },
+      "additionalProperties": false
+    },
+    "CompactionSettings": {
+      "type": "object",
+      "description": "Automatic context summarization policy when approaching the model context window limit.",
+      "properties": {
+        "auto": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable automatic context compaction before reaching limits."
+        },
+        "threshold": {
+          "type": "number",
+          "minimum": 0.1,
+          "maximum": 1.0,
+          "default": 0.75,
+          "description": "Fraction of context window (0.1–1.0) that triggers background summarization. The swap watermark is derived as threshold + 0.20 (capped at 0.95)."
+        },
+        "bufferTokens": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 20000,
+          "description": "Reserve token buffer for compaction preflight checks."
+        },
+        "keepRecentTokens": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 8000,
+          "description": "Recent conversation tokens retained verbatim alongside the generated summary. Scaled down proportionally for small-context models."
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

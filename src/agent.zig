@@ -5,6 +5,7 @@ const ai = @import("ai.zig");
 const at_mention = @import("at_mention.zig");
 const background_mod = @import("background.zig");
 const compaction = @import("compaction.zig");
+const config_mod = @import("config.zig");
 const context_mod = @import("context.zig");
 const context_assembly = @import("context_assembly.zig");
 const executor_mod = @import("executor.zig");
@@ -60,6 +61,10 @@ pub const Agent = struct {
     mcp_manager: ?*mcp_mod.McpManager = null,
     /// Background summarizer state machine.
     compactor: Compactor = .{},
+    /// Config-driven compaction policy. Set by the runtime from
+    /// `config.context.compaction`; defaults match the old hardcoded
+    /// constants so agents created without a config still compact.
+    compaction_settings: config_mod.CompactionSettings = .{},
     message_queue: MessageQueue = .{},
     message_queue_storage: [agent_queue.capacity]QueuedUserMessage = undefined,
     message_queue_mutex: std.Io.Mutex = .init,
@@ -831,20 +836,22 @@ pub const Agent = struct {
     /// the leaf. Best-effort: every failure is logged and swallowed so
     /// compaction never aborts the turn.
     fn maybeCompact(self: *Agent, listener: anytype) void {
+        if (!self.compaction_settings.auto) return;
         if (self.compaction_client == .none) return;
         if (self.context_window_tokens == 0) return;
         if (self.context_manager.session_writer == null) return;
 
         const used = self.currentContextTokens();
+        const threshold = self.compaction_settings.threshold;
 
         // Past the swap watermark: install the ready background summary.
-        if (compaction.shouldSwap(used, self.context_window_tokens)) {
+        if (compaction.shouldSwap(used, self.context_window_tokens, threshold)) {
             Agent.applyReadyCompaction(@TypeOf(listener), self, listener) catch |err| std.log.warn("compaction apply failed: {s}", .{@errorName(err)});
         }
 
         // Past the start watermark: kick off the summary so it is ready by the
         // time the footprint reaches the swap watermark.
-        if (compaction.shouldStartSummary(used, self.context_window_tokens) and
+        if (compaction.shouldStartSummary(used, self.context_window_tokens, threshold) and
             self.compactor.stateIs(.idle))
         {
             self.startCompaction() catch |err| std.log.warn("compaction start failed: {s}", .{@errorName(err)});
@@ -852,7 +859,7 @@ pub const Agent = struct {
 
         // If used tokens still exceed the swap watermark and compaction is running,
         // wait synchronously so prompt sent to LLM fits within window.
-        if (compaction.shouldSwap(self.currentContextTokens(), self.context_window_tokens) and
+        if (compaction.shouldSwap(self.currentContextTokens(), self.context_window_tokens, threshold) and
             self.compactor.stateIs(.running))
         {
             self.joinCompactor();
@@ -895,7 +902,7 @@ pub const Agent = struct {
     /// thread never touches live history.
     fn startCompaction(self: *Agent) !void {
         const session_writer = self.context_manager.session_writer orelse return;
-        const recent_tokens = compaction.keepRecentTokens(self.context_window_tokens);
+        const recent_tokens = compaction.keepRecentTokens(self.context_window_tokens, self.compaction_settings.keep_recent_tokens);
         const cut = (try session_writer.compactionCut(self.gpa, recent_tokens)) orelse return;
         self.compactor.result = null;
         self.compactor.job = .{
