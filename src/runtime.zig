@@ -208,7 +208,7 @@ pub const AgentRuntime = struct {
                             .id = summary.model_id orelse "",
                             .reasoning_effort = null,
                         },
-                        .base_url = "",
+                        .base_url = @constCast(provider_enum.defaultBaseUrl() orelse ""),
                         .api_key = "",
                         .use_responses_endpoint = false,
                         .bash_classifier_url = null,
@@ -341,7 +341,7 @@ pub const AgentRuntime = struct {
             try self.attachOpenAiCompatibleClient(base_url, "", "default", .medium);
             return;
         };
-        const base_url = ms.base_url;
+        const base_url = if (ms.base_url.len > 0) ms.base_url else provider.defaultBaseUrl() orelse return;
         const effort = ms.model.reasoning_effort orelse .medium;
         var loaded_key: ?[]u8 = null;
         defer if (loaded_key) |k| self.gpa.free(k);
@@ -363,13 +363,13 @@ pub const AgentRuntime = struct {
         provider: config_mod.Provider,
         config: config_mod.Config,
     ) !void {
-        _ = provider;
         const ms = config.model_selection orelse return;
+        const base_url = if (ms.base_url.len > 0) ms.base_url else provider.defaultBaseUrl() orelse return;
         const reasoning: ai.Reasoning = .{
             .effort = ms.model.reasoning_effort orelse .medium,
             .summary = .auto,
         };
-        try self.attachOpenAiResponsesClient(ms.base_url, ms.api_key, ms.model.id, reasoning);
+        try self.attachOpenAiResponsesClient(base_url, ms.api_key, ms.model.id, reasoning);
     }
 
     /// Establish a Codex session — uses OAuth credentials to identify
