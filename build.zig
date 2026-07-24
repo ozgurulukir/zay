@@ -174,6 +174,12 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    // Install the vendored models.dev snapshot alongside the binary so
+    // loadOrFetchRegistry can seed the cache from it when the network is
+    // unavailable. Installed to <prefix>/share/nova/api.json.
+    const install_vendor = b.addInstallFile(b.path("vendor/models.dev/api.json"), "share/nova/api.json");
+    b.getInstallStep().dependOn(&install_vendor.step);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.

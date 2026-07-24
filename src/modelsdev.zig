@@ -267,8 +267,8 @@ pub fn fetchAndCache(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !
 }
 
 /// Retrieve the merged provider registry. Prefers a fresh network fetch so
-/// newly added providers are visible immediately; falls back to cache or
-/// builtins when offline.
+/// newly added providers are visible immediately; falls back to cache, the
+/// vendored snapshot, or builtins when offline.
 pub fn loadOrFetchRegistry(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) Registry {
     const builtins = loadBuiltins();
 
@@ -276,9 +276,13 @@ pub fn loadOrFetchRegistry(gpa: std.mem.Allocator, io: std.Io, home_dir: []const
     if (fetchAndCache(gpa, io, home_dir)) |fetched| {
         var f = fetched;
         defer f.deinit(gpa);
+        logger.log("modelsdev.fetch.ok remote_providers={d}", .{f.providers.len});
         if (buildRegistry(gpa, builtins, &f)) |merged| {
+            logger.log("modelsdev.registry.merged total={d} builtins={d} remote={d}", .{ merged.providers.len, builtins.len, f.providers.len });
             return merged;
-        } else |_| {}
+        } else |err| {
+            logger.log("modelsdev.build.failed err={s}", .{@errorName(err)});
+        }
     } else |err| {
         logger.log("modelsdev.fetch.failed err={s}", .{@errorName(err)});
     }
@@ -286,19 +290,51 @@ pub fn loadOrFetchRegistry(gpa: std.mem.Allocator, io: std.Io, home_dir: []const
     if (loadCache(gpa, io, home_dir) catch null) |cached| {
         var c = cached;
         defer c.deinit(gpa);
+        logger.log("modelsdev.cache.fresh remote_providers={d}", .{c.providers.len});
         if (buildRegistry(gpa, builtins, &c)) |merged| {
+            logger.log("modelsdev.registry.merged total={d}", .{merged.providers.len});
             return merged;
-        } else |_| {}
+        } else |err| {
+            logger.log("modelsdev.build.failed err={s}", .{@errorName(err)});
+        }
     }
 
     if (loadCacheWithOptions(gpa, io, home_dir, true) catch null) |stale| {
         var s = stale;
         defer s.deinit(gpa);
+        logger.log("modelsdev.cache.stale remote_providers={d}", .{s.providers.len});
         if (buildRegistry(gpa, builtins, &s)) |merged| {
+            logger.log("modelsdev.registry.merged total={d}", .{merged.providers.len});
             return merged;
-        } else |_| {}
+        } else |err| {
+            logger.log("modelsdev.build.failed err={s}", .{@errorName(err)});
+        }
     }
 
+    // All network and cache sources failed — try the vendored snapshot
+    // installed alongside the binary at <prefix>/share/nova/api.json.
+    // Skip when home_dir is empty (test environments without a real io).
+    if (home_dir.len > 0) {
+        if (loadVendored(gpa, io)) |vendored| {
+            var v = vendored;
+            defer v.deinit(gpa);
+            logger.log("modelsdev.vendored remote_providers={d}", .{v.registry.providers.len});
+            // Seed the cache so subsequent starts can skip this step.
+            cacheApiJson(gpa, io, home_dir, v.raw_json) catch |err| {
+                logger.log("modelsdev.vendored.cache.seed.failed err={s}", .{@errorName(err)});
+            };
+            if (buildRegistry(gpa, builtins, &v.registry)) |merged| {
+                logger.log("modelsdev.registry.merged total={d}", .{merged.providers.len});
+                return merged;
+            } else |err| {
+                logger.log("modelsdev.build.failed err={s}", .{@errorName(err)});
+            }
+        } else |err| {
+            logger.log("modelsdev.vendored.failed err={s}", .{@errorName(err)});
+        }
+    }
+
+    logger.log("modelsdev.registry.fallback builtins_only={d}", .{builtins.len});
     var empty_remote: Registry = .{ .providers = &.{}, .strings = .empty };
     return buildRegistry(gpa, builtins, &empty_remote) catch .{
         .providers = &.{},
@@ -456,6 +492,43 @@ fn cachePath(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
     const dir = try cacheDir(gpa, home_dir);
     defer gpa.free(dir);
     return std.fs.path.join(gpa, &.{ dir, cache_filename });
+}
+
+/// Result of loading the vendored snapshot — owns both the raw bytes and the
+/// parsed registry so the caller can seed the cache from `raw_json`.
+const VendoredResult = struct {
+    registry: Registry,
+    raw_json: []const u8,
+
+    fn deinit(self: *VendoredResult, gpa: std.mem.Allocator) void {
+        self.registry.deinit(gpa);
+        gpa.free(self.raw_json);
+    }
+};
+
+/// Load the vendored api.json installed alongside the binary at
+/// `<exe_dir>/../share/nova/api.json`. Returns an error when the file is
+/// missing or the executable path cannot be resolved.
+fn loadVendored(gpa: std.mem.Allocator, io: std.Io) !VendoredResult {
+    const exe_path = std.process.executablePathAlloc(io, gpa) catch
+        return error.FileNotFound;
+    defer gpa.free(exe_path);
+    const exe_dir = std.fs.path.dirname(exe_path) orelse return error.FileNotFound;
+    const vendored_path = try std.fs.path.join(gpa, &.{ exe_dir, "..", "share", "nova", "api.json" });
+    defer gpa.free(vendored_path);
+
+    const file = std.Io.Dir.openFile(.cwd(), io, vendored_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.FileNotFound,
+        else => |e| return e,
+    };
+    defer file.close(io);
+
+    var reader = file.reader(io, &.{});
+    const bytes = try reader.interface.allocRemaining(gpa, .limited(4 * 1024 * 1024));
+    errdefer gpa.free(bytes);
+
+    const registry = try parseModelsDevJson(gpa, bytes);
+    return .{ .registry = registry, .raw_json = bytes };
 }
 
 // ── JSON parsing ──

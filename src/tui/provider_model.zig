@@ -507,6 +507,23 @@ pub fn submitDynamicProviderSetup(self: *App, provider: modelsdev.Provider) !voi
     }
     try refreshProviderApiKeys(self);
 
+    // Stash the dynamic provider's base_url and api_key into cached_config so
+    // that applySelectedModel can resolve them via compatibleBaseUrl and
+    // compatibleApiKey. Without this, both see .openai_compatible (which has no
+    // default URL and no stored key) and return null/empty, yielding
+    // NotConnected.
+    if (self.cached_config_owned) {
+        const owned_url = try self.gpa.dupe(u8, provider.base_url);
+        if (self.cached_config.base_url) |prev| self.gpa.free(prev);
+        self.cached_config.base_url = owned_url;
+
+        const owned_key = try self.gpa.dupe(u8, key);
+        if (self.cached_config.api_key) |prev| self.gpa.free(prev);
+        self.cached_config.api_key = owned_key;
+
+        self.cached_config.provider = .openai_compatible;
+    }
+
     const connect_key = if (key.len > 0) key else (provider.anonymous_key orelse key);
     try startDynamicProviderModelLoad(self, provider, connect_key);
 
