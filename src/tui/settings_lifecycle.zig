@@ -166,20 +166,14 @@ pub fn saveSettings(app: *App) !bool {
 
     const runtime = app.liveRuntime() orelse return false;
 
-    // Write to global config.
+    // Write to global config only. Settings are user-level preferences,
+    // not project-specific configuration. Provider/model selection can be
+    // project-specific, but enable_thinking, system_prompt, etc. should
+    // apply globally across all projects.
     config_mod.mergeAndWriteGlobal(app.gpa, app.io, runtime.home_dir, updates) catch |err| {
         std.log.warn("settings.save.failed err={s}", .{@errorName(err)});
         return false;
     };
-
-    // If a project config exists, write the same changes there too.
-    // Otherwise project-level overrides would mask the user's changes
-    // on the next config load.
-    if (config_mod.projectConfigExists(app.gpa, app.io, runtime.cwd)) {
-        config_mod.mergeAndWriteProject(app.gpa, app.io, runtime.cwd, updates) catch |err| {
-            std.log.warn("settings.save.project.failed err={s}", .{@errorName(err)});
-        };
-    }
 
     // Update the live cached_config so the running agent picks up the
     // changes without a restart.
