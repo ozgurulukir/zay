@@ -506,3 +506,21 @@ pub const LanguageModel = union(enum) {
         };
     }
 };
+
+test "clampTokenCount clamps negative values to zero" {
+    try std.testing.expectEqual(@as(u32, 0), clampTokenCount(-1));
+    try std.testing.expectEqual(@as(u32, 0), clampTokenCount(-100));
+    try std.testing.expectEqual(@as(u32, 0), clampTokenCount(std.math.minInt(i64)));
+}
+
+test "clampTokenCount clamps oversized values to max_u32" {
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), clampTokenCount(std.math.maxInt(u32) + 1));
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), clampTokenCount(std.math.maxInt(i64)));
+}
+
+test "clampTokenCount passes through valid values" {
+    try std.testing.expectEqual(@as(u32, 0), clampTokenCount(0));
+    try std.testing.expectEqual(@as(u32, 100), clampTokenCount(100));
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), clampTokenCount(std.math.maxInt(u32)));
+    try std.testing.expectEqual(@as(u32, 1_000_000), clampTokenCount(1_000_000));
+}
