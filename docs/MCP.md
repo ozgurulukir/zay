@@ -36,10 +36,7 @@ MCP servers are configured inside global `~/.config/nova/config.json` or project
     },
     "github": {
       "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-github"
-      ],
+      "args": ["-y", "@modelcontextprotocol/server-github"],
       "enabled": true
     },
     "remote-db": {
@@ -52,12 +49,12 @@ MCP servers are configured inside global `~/.config/nova/config.json` or project
 
 ### Server Configuration Options
 
-| Field | Type | Description |
-|---|---|---|
-| `command` | `string` | Binary / CLI command to execute for stdio servers (e.g. `npx`, `python`). |
-| `args` | `string[]` | Command line arguments passed to the stdio child process. |
-| `url` | `string` | Endpoint URL for remote HTTP/SSE servers (e.g. `https://mcp.dev/sse`). SSE not yet implemented. |
-| `enabled` | `boolean` | `true` (default) to connect and expose tools; `false` to disable. |
+| Field     | Type       | Description                                                                                     |
+| --------- | ---------- | ----------------------------------------------------------------------------------------------- |
+| `command` | `string`   | Binary / CLI command to execute for stdio servers (e.g. `npx`, `python`).                       |
+| `args`    | `string[]` | Command line arguments passed to the stdio child process.                                       |
+| `url`     | `string`   | Endpoint URL for remote HTTP/SSE servers (e.g. `https://mcp.dev/sse`). SSE not yet implemented. |
+| `enabled` | `boolean`  | `true` (default) to connect and expose tools; `false` to disable.                               |
 
 ---
 
@@ -110,7 +107,7 @@ When the model calls an MCP tool:
   `tools/list` via JSON-RPC.
 - Exposed MCP tools are automatically namespaced as:
   `mcp__<server_name>__<tool_name>`
-  *(Example: `mcp__memory__create_entities`)*
+  _(Example: `mcp__memory__create_entities`)_
 - Tool schemas (`inputSchema`) are parsed from JSON Schema into Nova's internal
   `tools_common.Schema` format, preserving property types, descriptions, and
   required fields.

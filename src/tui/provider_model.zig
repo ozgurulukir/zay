@@ -77,7 +77,7 @@ pub fn catalogueIndexById(id: []const u8) ?usize {
     return null;
 }
 
-/// Reload the cached provider API keys from `~/.nova/auth.json`. Drives the
+/// Reload the cached provider API keys from `~/.config/nova/auth.json`. Drives the
 /// picker badges and the multi-provider model catalogue.
 pub fn refreshProviderApiKeys(self: *App) !void {
     const home = self.liveRuntime().?.home_dir;
@@ -463,6 +463,12 @@ pub fn submitProviderSetup(self: *App, provider: config_mod.Provider) !void {
         self,
     );
 
+    // Clear any dynamic provider name when switching to a builtin.
+    if (self.cached_config_owned) {
+        if (self.cached_config.dynamic_provider_name) |prev| self.gpa.free(prev);
+        self.cached_config.dynamic_provider_name = null;
+    }
+
     // With no key, connect via the provider's anonymous sentinel (e.g.
     // OpenCode Zen's `public`, which the gateway limits to free models).
     const connect_key = if (key.len > 0) key else (provider.anonymousApiKey() orelse key);
@@ -522,6 +528,10 @@ pub fn submitDynamicProviderSetup(self: *App, provider: modelsdev.Provider) !voi
         self.cached_config.api_key = owned_key;
 
         self.cached_config.provider = .openai_compatible;
+
+        // Stash the human-readable provider name for the status bar.
+        if (self.cached_config.dynamic_provider_name) |prev| self.gpa.free(prev);
+        self.cached_config.dynamic_provider_name = try self.gpa.dupe(u8, provider.name);
     }
 
     const connect_key = if (key.len > 0) key else (provider.anonymous_key orelse key);

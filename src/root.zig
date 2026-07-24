@@ -141,7 +141,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
 fn resolveLogPath(gpa: std.mem.Allocator, env: anytype) ![]u8 {
     if (env.get("NOVA_LOG_FILE")) |path| return gpa.dupe(u8, path);
     const home = env.get("HOME") orelse env.get("USERPROFILE") orelse return error.HomeNotSet;
-    return std.fs.path.join(gpa, &.{ home, ".nova", "nova.log" });
+    return std.fs.path.join(gpa, &.{ home, ".config", "nova", "nova.log" });
 }
 
 fn resolveHomeDir(gpa: std.mem.Allocator, env: anytype) std.mem.Allocator.Error![]u8 {

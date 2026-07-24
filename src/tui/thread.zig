@@ -211,7 +211,7 @@ test "idle working lane frees its worktree branch and path" {
     const gpa = std.testing.allocator;
     var thread: Thread = .{ .engine = .{ .idle = .{ .working = .{
         .branch = try gpa.dupe(u8, "nova/x"),
-        .path = try gpa.dupe(u8, "/repo/.nova/worktrees/x"),
+        .path = try gpa.dupe(u8, "/home/user/.config/nova/worktrees/x"),
     } } } };
     thread.deinit(gpa);
 }

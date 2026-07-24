@@ -22,13 +22,14 @@ code-tandem search "handle" 2>&1
 ```
 
 From the output:
+
 - Pick the symbol with the **highest edge count** as your `<hub>`.
 - Use real component names from `integration` output, not `cli`/`server`/`other`.
 - Replace ALL placeholder symbol names in the workflow below.
 
 **If `integration` returns `generation: 0`** (no config exists), run at least 2 evo-loop iterations first:
 
-```
+```text
 1. code-tandem integration --learn 2>&1
 2. Extract noise_identifiers from suspicious_patterns
 3. Define component_rules from directory structure

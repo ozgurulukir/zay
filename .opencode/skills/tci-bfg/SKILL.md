@@ -74,7 +74,7 @@ code-tandem tests 2>&1
 
 Check `generation: 0` → run evo-loop before continuing.
 
-```
+```text
 STATS: <files> files, <symbols> symbols, <components> components, cache <hit_rate>
 HUBS: <fn> (<N> edges, <kind>, <file>)
 CYCLES: <root>: <cycles: bool>

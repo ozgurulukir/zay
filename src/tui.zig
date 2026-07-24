@@ -157,7 +157,7 @@ pub const App = struct {
     pickers: app_state.PickerStates,
     codex_signed_in: bool = false,
     /// Stored API keys for catalogue providers (label -> key), mirrored from
-    /// `~/.nova/auth.json`. Drives the picker's [CONNECTED] badges and supplies
+    /// `~/.config/nova/auth.json`. Drives the picker's [CONNECTED] badges and supplies
     /// keys when (re)building the model catalogue. Owned; freed in `deinit`.
     provider_api_keys: codex.ApiKeyMap = .empty,
     /// Merged models.dev provider registry (builtins + cached/fetched). Owned; freed in `deinit`.

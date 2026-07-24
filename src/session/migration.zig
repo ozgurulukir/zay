@@ -8,8 +8,8 @@ const assert = std.debug.assert;
 /// Current schema version for the sessions database.
 pub const schema_version: u32 = 4;
 
-/// Default path relative to the nova home directory.
-pub const default_db_relative_path = ".nova/sessions.sqlite";
+/// Default path relative to the nova config directory.
+pub const default_db_relative_path = ".config/nova/sessions.sqlite";
 
 /// Resolve the default sessions database path under `home_dir`.
 pub fn defaultPath(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {

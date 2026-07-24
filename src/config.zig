@@ -1,7 +1,7 @@
 //! Nova's resolved preferences record and its layered loader.
 //! Four sources, field-merged, later overrides earlier:
 //!   1. built-in defaults
-//!   2. global  `<home>/.nova/config.json`
+//!   2. global  `<home>/.config/nova/config.json`
 //!   3. project `<cwd>/.nova/config.json`
 //!   4. env vars: OPENAI_BASE_URL, OPENAI_API_KEY, OPENAI_MODEL,
 //!                NOVA_USE_RESPONSES_ENDPOINT, NOVA_ENABLE_THINKING,
@@ -318,6 +318,12 @@ pub const Config = struct {
     /// presence is now encoded in the type, not enforced at runtime.
     model_selection: ?ModelSelection = null,
 
+    /// Runtime-only: the human-readable provider name from models.dev
+    /// (e.g. "StepFun", "DeepSeek"). Set when a dynamic provider is
+    /// selected; cleared when switching to a builtin. Never serialized.
+    /// Falls back to `provider.label()` when null.
+    dynamic_provider_name: ?[]u8 = null,
+
     pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
         if (self.base_url) |s| gpa.free(s);
         if (self.api_key) |s| gpa.free(s);
@@ -328,6 +334,7 @@ pub const Config = struct {
         for (self.mcp_servers) |*server| server.deinit(gpa);
         if (self.mcp_servers.len > 0) gpa.free(self.mcp_servers);
         if (self.system_prompt) |s| gpa.free(s);
+        if (self.dynamic_provider_name) |s| gpa.free(s);
         if (self.model_selection) |*ms| ms.deinit(gpa);
         self.* = undefined;
     }
@@ -349,6 +356,7 @@ pub const Config = struct {
         out.mcp_servers = try gpa.alloc(McpServerConfig, self.mcp_servers.len);
         for (self.mcp_servers, 0..) |server, index| out.mcp_servers[index] = try server.clone(gpa);
         if (self.system_prompt) |s| out.system_prompt = try gpa.dupe(u8, s);
+        if (self.dynamic_provider_name) |s| out.dynamic_provider_name = try gpa.dupe(u8, s);
         if (self.model_selection) |ms| out.model_selection = try ms.clone(gpa);
         return out;
     }
@@ -1298,7 +1306,7 @@ fn writeKey(writer: *std.Io.Writer, name: []const u8, wrote_any: *bool) !void {
 pub fn globalConfigPath(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) ![]u8 {
     if (home_dir.len == 0) return error.HomeNotSet;
 
-    // 1. Standard XDG path: ~/.config/nova/config.json
+    // Standard XDG path: ~/.config/nova/config.json
     const xdg_path = try std.fs.path.join(gpa, &.{ home_dir, ".config", "nova", "config.json" });
     errdefer gpa.free(xdg_path);
 
@@ -1306,17 +1314,7 @@ pub fn globalConfigPath(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8
         return xdg_path;
     } else |_| {}
 
-    // 2. Legacy fallback path: ~/.nova/config.json
-    const legacy_path = try std.fs.path.join(gpa, &.{ home_dir, ".nova", "config.json" });
-    errdefer gpa.free(legacy_path);
-
-    if (std.Io.Dir.access(.cwd(), io, legacy_path, .{})) |_| {
-        gpa.free(xdg_path);
-        return legacy_path;
-    } else |_| {}
-
-    // 3. Default to XDG path for new config writes
-    gpa.free(legacy_path);
+    // Default to XDG path for new config writes
     return xdg_path;
 }
 
@@ -1658,14 +1656,14 @@ test "serialize then parse roundtrips" {
     try std.testing.expectEqualStrings("llama3.1:8b", roundtrip.model.?.id);
 }
 
-test "globalConfigPath resolves XDG .config/nova/config.json with fallback" {
+test "globalConfigPath resolves XDG .config/nova/config.json" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
     const path = try globalConfigPath(gpa, io, "/home/testuser");
     defer gpa.free(path);
 
-    try std.testing.expect(std.mem.indexOf(u8, path, ".config/nova/config.json") != null or std.mem.indexOf(u8, path, ".nova/config.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, path, ".config/nova/config.json") != null);
 }
 
 test "Config.validate validates schema version and base_url scheme" {

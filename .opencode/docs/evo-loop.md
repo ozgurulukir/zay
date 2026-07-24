@@ -62,7 +62,11 @@ Classify each cross-ref as true/false positive. Define patterns to filter noise.
     }
   ],
   "classification": [
-    {"ref_key": "BatchError@server/src/ops/symbol_ops/batch.rs", "is_true_positive": true, "reason": "Serialized type between CLI and server"}
+    {
+      "ref_key": "BatchError@server/src/ops/symbol_ops/batch.rs",
+      "is_true_positive": true,
+      "reason": "Serialized type between CLI and server"
+    }
   ],
   "noise_identifiers": ["to_json", "clone", "push"]
 }

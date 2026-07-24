@@ -12,24 +12,25 @@ akışı için geliştirici-seviyesinde iyileştirme önerilerini içerir. Öner
 
 ## Önceliklendirme özeti
 
-| #   | Konu                                          | Etki | Efor | Öncelik |
-| --- | --------------------------------------------- | ---- | ---- | ------- |
-| 1   | `sendRequest` concurrency/framing             | Yüksek | Orta | 🔴 P0  |
-| 2   | `syncFromConfigEx` state machine              | Orta  | Düşük | 🟠 P1 |
-| 5   | `McpClient` ownership/RAII                    | Orta  | Orta | 🟠 P1  |
-| 4   | `schemaFromJsonSchema` edge cases             | Yüksek | Yüksek | 🟠 P1 |
-| 7   | Error mesajları                               | Orta  | Düşük | 🟡 P2 |
-| 3   | `callTool` refactor                           | Düşük | Düşük | 🟡 P2 |
-| 8   | Validation                                    | Orta  | Düşük | 🟡 P2 |
-| 6   | Transport test coverage                       | Düşük | Düşük | 🟢 P3 |
-| 9   | Tool discovery token cost                     | Düşük | Yüksek | 🟢 P3 |
-| 10  | TUI graceful shutdown                         | Düşük | Orta | 🟢 P3  |
+| #   | Konu                              | Etki   | Efor   | Öncelik |
+| --- | --------------------------------- | ------ | ------ | ------- |
+| 1   | `sendRequest` concurrency/framing | Yüksek | Orta   | 🔴 P0   |
+| 2   | `syncFromConfigEx` state machine  | Orta   | Düşük  | 🟠 P1   |
+| 5   | `McpClient` ownership/RAII        | Orta   | Orta   | 🟠 P1   |
+| 4   | `schemaFromJsonSchema` edge cases | Yüksek | Yüksek | 🟠 P1   |
+| 7   | Error mesajları                   | Orta   | Düşük  | 🟡 P2   |
+| 3   | `callTool` refactor               | Düşük  | Düşük  | 🟡 P2   |
+| 8   | Validation                        | Orta   | Düşük  | 🟡 P2   |
+| 6   | Transport test coverage           | Düşük  | Düşük  | 🟢 P3   |
+| 9   | Tool discovery token cost         | Düşük  | Yüksek | 🟢 P3   |
+| 10  | TUI graceful shutdown             | Düşük  | Orta   | 🟢 P3   |
 
 ---
 
 ## 1. `sendRequest` — concurrency & framing sınırları (P0)
 
 ### Kanıt
+
 `src/mcp/client.zig:145-182` (47 satır, complexity 3):
 
 ```zig
@@ -46,6 +47,7 @@ _ = reader.interface.streamDelimiterEnding(&line_writer.writer, '\n') catch ...;
 ```
 
 ### Problemler
+
 - **Id race condition'ı.** `next_request_id` lock'suz artırılıyor. Manager
   seviyesinde `McpClient` paylaşımlı kullanılıyor; executor bugün serial
   çalışıyor ama gelecekte paralel tool çağrılarına geçiş anında bu sessizce
@@ -61,6 +63,7 @@ _ = reader.interface.streamDelimiterEnding(&line_writer.writer, '\n') catch ...;
   sinyali kayboluyor.
 
 ### Öneriler
+
 1. `Mutex` (veya `std.Io.Mutex`) ile `next_request_id`'yi koru, veya
    atomik ile monotonically-unique id üret.
 2. Framing'i **Content-Length** destekleyecek şekilde genişlet; framing
@@ -76,9 +79,11 @@ _ = reader.interface.streamDelimiterEnding(&line_writer.writer, '\n') catch ...;
 ## 2. `manager.syncFromConfigEx` — state machine'e böl (P1)
 
 ### Kanıt
+
 `src/mcp/manager.zig:57-104` (48 satır, **complexity 7**).
 
 ### Problemler
+
 - 4 farklı durum dalı (yeni ekle / var olan enabled / var olan disabled
   / değişiklik var) tek fonksiyonda, comment yok.
 - **Removed server'lar ne oluyor?** `syncFromConfigEx` sadece
@@ -89,14 +94,17 @@ _ = reader.interface.streamDelimiterEnding(&line_writer.writer, '\n') catch ...;
   onu çağırmıyor — diff detection'ı re-implement etmiş.
 
 ### Öneriler
+
 1. **Reconciliation pattern'i uygula** (Kubernetes controller tarzı):
-   ```
+
+   ```text
    desired = config.mcp_servers
    current = self.clients
    for d in desired \\ current: add(d)
    for c in current \\ desired: remove(c)        // deinit + free
    for d in desired ∩ current:  reconcile(d, c)  // toggle/reconnect
    ```
+
 2. Set theory farklarını gerçek `StringHashMap` ile yap (linear scan
    O(n²) yerine, nadir önemli ama okunabilirlik için).
 3. `syncFromConfig` ve `syncFromConfigEx` çiftinin sebebini netleştir;
@@ -107,6 +115,7 @@ _ = reader.interface.streamDelimiterEnding(&line_writer.writer, '\n') catch ...;
 ## 3. `client.callTool` — complexity 11, manuel JSON birleştirme (P2)
 
 ### Kanıt
+
 `src/mcp/client.zig:279-325` (47 satır, **complexity 11**):
 
 ```zig
@@ -120,6 +129,7 @@ try params.append(self.gpa, '}');
 ```
 
 ### Problemler
+
 - **String escape yapılmıyor.** `tool_name` JSON'a direkt concatenate
   ediliyor. MCP standardı tool adlarında `[a-zA-Z0-9_-]` zorunlu kılıyor
   ama defensive programming adına `std.json.Stringify.value` kullan.
@@ -130,6 +140,7 @@ try params.append(self.gpa, '}');
   bilinçliyse yorum yok, değilse TODO.
 
 ### Öneriler
+
 1. `transport.formatRequest` gibi `formatCallToolParams` helper'ı yaz,
    `std.json.Stringify.value` ile.
 2. `arguments_json` zaten JSON string — direkt embed et; aynısını `name`
@@ -142,9 +153,11 @@ try params.append(self.gpa, '}');
 ## 4. `schemaFromJsonSchema` — complexity 8, edge cases (P1)
 
 ### Kanıt
+
 `src/mcp/client.zig` (42 satır, **complexity 8**).
 
 ### Problemler
+
 - **Graf indeksinde gözükmüyor** detayı, ama complexity 8 yüksek —
   muhtemelen nested type/array/union handling'i tek yerde.
 - **`$ref` / `oneOf` / `anyOf` desteği?** MCP serverları bunları yaygın
@@ -154,6 +167,7 @@ try params.append(self.gpa, '}');
   var ama `tools_common.Schema` yapısı bunları destekliyor mu belirsiz.
 
 ### Öneriler
+
 1. `Schema` struct'ına `oneOf`/`anyOf`/`enum` field'ları ekle, veya
    dönüşüm sırasında bilinen sınırlı küme için yeterli olduğunu test et.
 2. En az 5-6 representative JSON Schema örneğiyle (nested object, array
@@ -167,11 +181,13 @@ try params.append(self.gpa, '}');
 ## 5. `McpClient` ownership & deinit — fan-in 17 (P1)
 
 ### Kanıt
+
 - `mcp.client.deinit` fan-in: 17 (graph indeksi)
 - `mcp.client.init` fan-in: 11
 - `mcp.client.stop` fan-in: 7
 
 ### Problemler
+
 - 17 ayrı test veya owner — her test bir `McpClient` alloc/dealloc
   ediyor. Test fixture standardizasyonu eksik.
 - `McpClient` struct'ında 9+ `gpa.dupe(u8, ...)` allocation var (init
@@ -181,13 +197,16 @@ try params.append(self.gpa, '}');
   `defer` zinciri her yerde tutulmalı.
 
 ### Öneriler
+
 1. `McpClient` için **RAII guard** benzeri bir `ScopedMcp` helper yaz:
+
    ```zig
    pub fn scoped(self: *McpClient, io: std.Io) ScopedMcp {
        return .{ .client = self, .io = io };
    }
    // ScopedMcp.deinit() → client.stop(io)
    ```
+
    Testlerde `defer scoped.deinit()` standardı.
 2. `process != null` ise otomatik kill eden bir `childWatcher` thread
    veya signal handler ekle — orphan process'leri engelle.
@@ -199,6 +218,7 @@ try params.append(self.gpa, '}');
 ## 6. `mcp.transport` — gözlem/test coverage (P3)
 
 ### Kanıt
+
 - `formatRequest` 3 test var, `formatNotification` 1 test, `parseMessage`
   test yok.
 - Transport katmanı 5 satırla çalışıyor ama sınır durumları test
@@ -206,6 +226,7 @@ try params.append(self.gpa, '}');
   uzun satır.
 
 ### Öneriler
+
 - Property-based test: `formatRequest(id, method, params)` → parse →
   roundtrip eşitliği.
 - Malformed input testleri: `parseMessage("{malformed")`,
@@ -218,13 +239,15 @@ try params.append(self.gpa, '}');
 ## 7. Error set'leri — error passthrough kaosa yol açıyor (P2)
 
 ### Kanıt
+
 - `executor.runMcpTool` `client.callTool(...) catch |err| { return
-  self.runFailure(call, err); }` — MCP error'ları generic `ToolResult
-  { failed = true, content = err }` olarak dönüyor.
+self.runFailure(call, err); }` — MCP error'ları generic `ToolResult
+{ failed = true, content = err }` olarak dönüyor.
 - MCP `parseResponse`'da error code → Zig error set dönüşümü var ama
   **error code → kullanıcı-okunabilir mesaj** mapping'i yok.
 
 ### Problemler
+
 - Model `error.McpServerError: -32603` alıyor, bunun anlamı "internal
   server error" — modele yardımcı olmuyor.
 - `error_message: ?[]u8` field'ı `McpClient`'da var ama kullanıcıya
@@ -232,6 +255,7 @@ try params.append(self.gpa, '}');
   sadece status label gösteriyor olabilir).
 
 ### Öneriler
+
 1. `McpClient`'a `lastErrorFormatted()` helper'ı ekle, error code →
    string.
 2. ToolResult'a `display_body` olarak `lastErrorFormatted()` yaz
@@ -243,10 +267,12 @@ try params.append(self.gpa, '}');
 ## 8. Manager'ın sıfır validasyon katmanı (P2)
 
 ### Kanıt
+
 `syncFromConfig` server_cfg.command, args, url alanlarını doğrulamadan
 `McpClient.init`'e geçiriyor.
 
 ### Problemler
+
 - `command = null` ve `url = null` aynı anda olan server config →
   `McpClient.init` `error.NoCommand` fırlatır ama bu ancak `startStdio`
   çağrılınca ortaya çıkar.
@@ -256,6 +282,7 @@ try params.append(self.gpa, '}');
   `syncFromConfig` sadece ilkini tutar, sessizce.
 
 ### Öneriler
+
 1. `syncFromConfig`'a validation pass'ı ekle, validation hatalarını
    ayrı listede topla ve `error_message`'a yaz.
 2. Server name uniqueness check.
@@ -267,11 +294,13 @@ try params.append(self.gpa, '}');
 ## 9. MCP tool'larının modele sunumu — discoverability (P3)
 
 ### Kanıt
+
 - `buildMcpToolSchemas` tüm connected tool'ları düz liste olarak döner.
 - `full_name = "mcp__<server>__<tool>"` (örn.
   `mcp__github__create_issue`).
 
 ### Problemler
+
 - Model için context window'a tüm tool'ların schema'sı gönderiliyor. 10
   server × 20 tool = 200 schema → token cost.
 - Prefix `mcp__` zorunlu ama **server adının** ne olduğu tool adından
@@ -279,6 +308,7 @@ try params.append(self.gpa, '}');
   `mcp__filesystem__read_file` — hangisi?).
 
 ### Öneriler
+
 1. **Server gruplama:** System prompt'ta "available MCP servers" ayrı
    bir blok olarak listele, sonra tool'ları referansla. Bu token'ı
    azaltır.
@@ -293,11 +323,13 @@ try params.append(self.gpa, '}');
 ## 10. TUI ile MCP bağlantısı — UX (P3)
 
 ### Kanıt
+
 - `McpMode.handle` command_router'da Up/Down/j/k, Space/Enter, Ctrl+R/r,
   Esc/q routing'i var.
 - `reconnectClient` var ama **disconnect** yok (sadece `disable`).
 
 ### Problemler
+
 - Kullanıcı bir server'ı "durdur" isteyebilir ama sadece `disable` var.
   Process hala arka planda zombi olabilir.
 - Server status güncellemesi event-driven değil, polling gerekebilir.
@@ -306,6 +338,7 @@ try params.append(self.gpa, '}');
   bir tool çağrısını yarıda keser.
 
 ### Öneriler
+
 1. `McpClient`'a `pause()`/`resume()` ekle (server çalışsın ama tool
    çağrılarını kuyruğa al).
 2. Status değişikliklerini event olarak yay, TUI subscribe etsin —

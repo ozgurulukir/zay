@@ -23,7 +23,7 @@ pub fn modelStatus(runtime: ?*const runtime_mod.AgentRuntime, config: config_mod
                     .model = client.core_client.config.model,
                 },
                 .openai_compatible => |client| return .{
-                    .provider = providerLabel(config) orelse "openai_compatible",
+                    .provider = providerDisplayName(config) orelse "openai_compatible",
                     .model = client.config.model,
                 },
                 .none => unreachable,
@@ -33,13 +33,13 @@ pub fn modelStatus(runtime: ?*const runtime_mod.AgentRuntime, config: config_mod
 
     const model = if (config.model_selection) |ms| ms.model.id else return null;
     return .{
-        .provider = providerLabel(config) orelse return null,
+        .provider = providerDisplayName(config) orelse return null,
         .model = model,
     };
 }
 
 pub fn formatModelStatus(gpa: std.mem.Allocator, status: ModelStatus) ![]u8 {
-    return std.fmt.allocPrint(gpa, "{s}/{s}", .{ status.provider, status.model });
+    return std.fmt.allocPrint(gpa, "{s} · {s}", .{ status.provider, status.model });
 }
 
 pub fn formatCwdRelative(
@@ -100,11 +100,19 @@ fn providerLabel(config: config_mod.Config) ?[]const u8 {
     return provider.label();
 }
 
-test "model status formats as provider/model" {
+/// Returns the display name for the status bar. Prefers the dynamic
+/// provider name (e.g. "StepFun") when set; falls back to the builtin
+/// provider label (e.g. "ollama", "openrouter").
+fn providerDisplayName(config: config_mod.Config) ?[]const u8 {
+    if (config.dynamic_provider_name) |name| return name;
+    return providerLabel(config);
+}
+
+test "model status formats as provider · model" {
     const gpa = std.testing.allocator;
     const text = try formatModelStatus(gpa, .{ .provider = "ollama", .model = "llama" });
     defer gpa.free(text);
-    try std.testing.expectEqualStrings("ollama/llama", text);
+    try std.testing.expectEqualStrings("ollama · llama", text);
 }
 
 test "modifiedTime buckets" {

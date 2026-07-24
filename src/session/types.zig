@@ -69,6 +69,7 @@ pub const Error = db.Error || error{
     ThreadQuotaExceeded,
     QueueFull,
     Canceled,
+    InvalidPath,
 };
 
 /// A single entry queued for the background writer thread.

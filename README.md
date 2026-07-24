@@ -4,7 +4,7 @@ The coding agent for shipping to the stars.
 
 > Alpha software. Expect things to break.
 
-# Quick Start
+## Quick Start
 
 Git clone `fff` (used for file search) into `third_party/` and build it. Specific instructions
 in [vendor/fff/README.md](vendor/fff/README.md).
@@ -30,7 +30,7 @@ zig build run
 
 Add the binary (`zig-out/bin/nova`) to your PATH so you can invoke it from anywhere.
 
-# Slash Commands & Key Features
+## Slash Commands & Key Features
 
 - **`/connect`**: Configure AI providers, custom endpoints, and API key management.
 - **`/model`**: Select LLM model & reasoning effort.
@@ -43,7 +43,7 @@ Add the binary (`zig-out/bin/nova`) to your PATH so you can invoke it from anywh
 - **`/parallel` & `/lanes`**: Manage parallel worktree lanes and merge folded branches.
 - **`/save`**: Commit git-shadow working copy snapshots.
 
-# Architecture
+## Architecture
 
 The TUI is a vxfw application. `src/tui.zig` holds the `App` lifecycle;
 the top-level `RootWidget` lives in `src/tui/root_widget.zig`. The rest
@@ -90,12 +90,12 @@ of `src/tui/` is split by concern:
 
 `src/tui/widgets/` holds the per-widget draw code (`message`, `command_panel`, `at_search`, `background_jobs`, `permission`, `diff`, `loading`, `transcript`, `input`, `overlay`, `lanes_picker`, `model_picker`, `provider_picker`, `resume_picker`, `help_picker`, `mcp_status`, `settings`, `tree_selector`, `panel`, `tree_art`).
 
-## Core Systems & Engine
+### Core Systems & Engine
 
-- **`mcp/manager.zig` & `mcp/client.zig`**: Multi-server Model Context Protocol supervisor with layer-merged `mcp_servers` configuration (`mcp_servers`, `mcpServers`, `mcp` aliases) and automatic tool schema discovery across Nova standard directories (`~/.config/nova/mcp/`, `~/.nova/mcp/`, `<cwd>/.nova/mcp/`). `McpServerConfig.transport` is a `union(enum) { stdio, sse }` — a server is either stdio (command+args) or sse (url), never both. `McpClient` carries a `lifecycle: union(enum) { disabled, stdio, sse, failed }` for runtime state.
+- **`mcp/manager.zig` & `mcp/client.zig`**: Multi-server Model Context Protocol supervisor with layer-merged `mcp_servers` configuration (`mcp_servers`, `mcpServers`, `mcp` aliases) and automatic tool schema discovery across Nova standard directories (`~/.config/nova/mcp/`, `<cwd>/.nova/mcp/`). `McpServerConfig.transport` is a `union(enum) { stdio, sse }` — a server is either stdio (command+args) or sse (url), never both. `McpClient` carries a `lifecycle: union(enum) { disabled, stdio, sse, failed }` for runtime state.
 - **`clipboard.zig`**: Cross-platform system clipboard interface supporting OSC 52 terminal escape sequences (`\x1b]52;c;<base64>\x07`) with OS-native execution fallback (`wl-copy`/`xclip`/`pbcopy`/`powershell` via Nova's `bash` subsystem).
 - **`config.zig`**: System configuration parser and disk serializer (`~/.config/nova/config.json`). Controls system prompt, thinking/reasoning toggles, MCP servers, and classifier parameters. `Config.model_selection: ?ModelSelection` is the typed view replacing 9 loose optional fields — `ModelSelection` carries non-optional `provider`/`model`/`base_url`/`api_key`.
-- **`modelsdev.zig`**: Provider registry integration combining built-in static providers with dynamic data from `https://models.dev/api.json`. Supports local disk caching in `~/.nova/modelsdev_cache.json` and safe string arena management (`StringRef` / `UnresolvedProvider`).
+- **`modelsdev.zig`**: Provider registry integration combining built-in static providers with dynamic data from `https://models.dev/api.json`. Supports local disk caching at `~/.config/nova/cache/models.dev/api.json` and safe string arena management (`StringRef` / `UnresolvedProvider`).
 - **`compaction.zig`**: Pure decisions for automatic context window compaction. Calculates dynamic retention budgets (`keepRecentTokens`) scaled to the model's context window (%35 max 20,000) so small-context models (e.g. 8K/16K/32K) can always compact cleanly below their swap watermarks.
 - **`agent.zig`**: Autonomous loop orchestrating LLM tool execution, background/synchronous context compaction, and VCS git-shadow checkpointing (`snapshotAfterBatch`). `Listener(Ctx)` is a generic typed callback seam — callers pass their own context type instead of `*anyopaque` + `@ptrCast`.
 - **`ai/openai_compatible.zig`**: OpenAI-compatible API client with SSE stream parsing and tool-call delta deduplication (prevents tool name corruption when providers stream repeated tool names). `ChatMessage` is a `union(enum) { system, user, assistant, tool }` — illegal combinations (e.g. `.user` with `call_id`) are unrepresentable.

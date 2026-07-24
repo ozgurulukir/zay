@@ -3,15 +3,11 @@
   "files": {
     "/home/aristo/Projects/nova-agent/README.md": {
       "mtime": 1784589245527.9976,
-      "chunkIds": [
-        "/home/aristo/Projects/nova-agent/README.md:0"
-      ]
+      "chunkIds": ["/home/aristo/Projects/nova-agent/README.md:0"]
     },
     "/home/aristo/Projects/nova-agent/AGENTS.md": {
       "mtime": 1784589245527.9976,
-      "chunkIds": [
-        "/home/aristo/Projects/nova-agent/AGENTS.md:0"
-      ]
+      "chunkIds": ["/home/aristo/Projects/nova-agent/AGENTS.md:0"]
     },
     "/home/aristo/Projects/nova-agent/scripts/gen_blackhole.py": {
       "mtime": 1784589245528.9133,
@@ -22,21 +18,15 @@
     },
     "/home/aristo/Projects/nova-agent/docs/ARCHITECTURE.md": {
       "mtime": 1784589245527.9976,
-      "chunkIds": [
-        "/home/aristo/Projects/nova-agent/docs/ARCHITECTURE.md:0"
-      ]
+      "chunkIds": ["/home/aristo/Projects/nova-agent/docs/ARCHITECTURE.md:0"]
     },
     "/home/aristo/Projects/nova-agent/docs/README.md": {
       "mtime": 1784589245528.5225,
-      "chunkIds": [
-        "/home/aristo/Projects/nova-agent/docs/README.md:0"
-      ]
+      "chunkIds": ["/home/aristo/Projects/nova-agent/docs/README.md:0"]
     },
     "/home/aristo/Projects/nova-agent/docs/PHILOSOPHY.md": {
       "mtime": 1784589245528.5225,
-      "chunkIds": [
-        "/home/aristo/Projects/nova-agent/docs/PHILOSOPHY.md:0"
-      ]
+      "chunkIds": ["/home/aristo/Projects/nova-agent/docs/PHILOSOPHY.md:0"]
     },
     "/home/aristo/Projects/nova-agent/vendor/models.dev/models.json": {
       "mtime": 1784589245541.0437,
@@ -46,9 +36,7 @@
     },
     "/home/aristo/Projects/nova-agent/vendor/fff/README.md": {
       "mtime": 1784589245540.229,
-      "chunkIds": [
-        "/home/aristo/Projects/nova-agent/vendor/fff/README.md:0"
-      ]
+      "chunkIds": ["/home/aristo/Projects/nova-agent/vendor/fff/README.md:0"]
     },
     "/home/aristo/Projects/nova-agent/vendor/zigdown/LICENSE.txt": {
       "mtime": 1784589245584.2354,
@@ -106,9 +94,7 @@
     },
     "/home/aristo/Projects/nova-agent/src/prompts/handover.md": {
       "mtime": 1784589245534.784,
-      "chunkIds": [
-        "/home/aristo/Projects/nova-agent/src/prompts/handover.md:0"
-      ]
+      "chunkIds": ["/home/aristo/Projects/nova-agent/src/prompts/handover.md:0"]
     },
     "/home/aristo/Projects/nova-agent/src/prompts/compaction.md": {
       "mtime": 1784589245532.2278,
@@ -118,33 +104,23 @@
     },
     "/home/aristo/Projects/nova-agent/src/prompts/system.md": {
       "mtime": 1784589245534.784,
-      "chunkIds": [
-        "/home/aristo/Projects/nova-agent/src/prompts/system.md:0"
-      ]
+      "chunkIds": ["/home/aristo/Projects/nova-agent/src/prompts/system.md:0"]
     },
     "/home/aristo/Projects/nova-agent/src/py/nova/_display.py": {
       "mtime": 1784589245535.1384,
-      "chunkIds": [
-        "/home/aristo/Projects/nova-agent/src/py/nova/_display.py:0"
-      ]
+      "chunkIds": ["/home/aristo/Projects/nova-agent/src/py/nova/_display.py:0"]
     },
     "/home/aristo/Projects/nova-agent/src/py/nova/__init__.py": {
       "mtime": 1784589245535.0974,
-      "chunkIds": [
-        "/home/aristo/Projects/nova-agent/src/py/nova/__init__.py:0"
-      ]
+      "chunkIds": ["/home/aristo/Projects/nova-agent/src/py/nova/__init__.py:0"]
     },
     "/home/aristo/Projects/nova-agent/src/py/nova/_edit.py": {
       "mtime": 1784589245535.1384,
-      "chunkIds": [
-        "/home/aristo/Projects/nova-agent/src/py/nova/_edit.py:0"
-      ]
+      "chunkIds": ["/home/aristo/Projects/nova-agent/src/py/nova/_edit.py:0"]
     },
     "/home/aristo/Projects/nova-agent/src/py/nova/_search.py": {
       "mtime": 1784589245535.1384,
-      "chunkIds": [
-        "/home/aristo/Projects/nova-agent/src/py/nova/_search.py:0"
-      ]
+      "chunkIds": ["/home/aristo/Projects/nova-agent/src/py/nova/_search.py:0"]
     },
     "/home/aristo/Projects/nova-agent/third_party/fff/package-lock.json": {
       "mtime": 1784589659974.6204,

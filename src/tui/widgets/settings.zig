@@ -346,7 +346,7 @@ pub const Content = struct {
         const project_path = try std.fmt.allocPrint(ctx.arena, "  Project config: {s}/.nova/config.json", .{self.cwd});
         try panel.lineStyledAt(surface, 8, project_path, ctx, left_col, StylePalette.thinking_body);
 
-        const auth_path = try std.fmt.allocPrint(ctx.arena, "  API keys      : {s}/.nova/auth.json", .{self.home_dir});
+        const auth_path = try std.fmt.allocPrint(ctx.arena, "  API keys      : {s}/.config/nova/auth.json", .{self.home_dir});
         try panel.lineStyledAt(surface, 9, auth_path, ctx, left_col, StylePalette.thinking_body);
 
         try panel.lineStyledAt(surface, 11, "Config Layer Priority  (later overrides earlier)", ctx, left_col, StylePalette.panel_header);

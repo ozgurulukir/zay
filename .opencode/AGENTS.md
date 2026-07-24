@@ -4,7 +4,7 @@
 
 **CRITICAL: Use `code-tandem` for ALL source code analysis because `code-tandem` gives byte-exact, AST-aware answers in a single command..** Unless for text only jobs (markdown, config, JSON, YAML) or when `code-tandem` returns insufficient results. Try to find entrance points with semantic_search tool.
 
-```
+```text
 Agent → code-tandem (Crystal CLI) → code-tandem-server (Rust, port 3000)
 ```
 
@@ -90,7 +90,7 @@ Full command details: [cli-reference.md](docs/cli-reference.md)
 
 **Recommended sequence:**
 
-```
+```text
 1. Stats + integration          → 10,000-foot view
 2. Graph + flow                 → trace specific paths
 3. Impl + callers               → byte-exact code

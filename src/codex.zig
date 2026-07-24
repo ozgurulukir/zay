@@ -471,7 +471,7 @@ fn nowMs(io: std.Io) i64 {
 
 fn authPath(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
     if (home_dir.len == 0) return error.HomeNotSet;
-    return std.fs.path.join(gpa, &.{ home_dir, ".nova", "auth.json" });
+    return std.fs.path.join(gpa, &.{ home_dir, ".config", "nova", "auth.json" });
 }
 
 const AuthFile = struct {

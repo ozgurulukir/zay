@@ -2,7 +2,7 @@
 
 Fast file search. Used by the `search_codebase` tool and the TUI to generate filepath / code autocompletions.
 
-Source: https://github.com/dmtrKovalenko/fff
+Source: <https://github.com/dmtrKovalenko/fff>
 
 ## Building
 

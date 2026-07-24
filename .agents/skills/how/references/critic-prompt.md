@@ -45,7 +45,7 @@ If the architecture is sound, say so. An empty critique is a valid outcome.
 
 ## Output
 
-```
+```text
 ## Findings
 
 ### 1. [Severity] Short title

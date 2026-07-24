@@ -229,9 +229,9 @@ pub fn createParallelLane(self: *App) !void {
     const branch = try std.fmt.allocPrint(self.gpa, "nova/{s}", .{id[0..]});
     errdefer self.gpa.free(branch);
 
-    // Worktrees live under the global `<home>/.nova/worktrees`, OUTSIDE the
+    // Worktrees live under the global `<home>/.config/nova/worktrees`, OUTSIDE the
     // repo, so `git add -A`/snapshots/`/save` never see them.
-    const parent = try std.fs.path.join(self.gpa, &.{ home, ".nova", "worktrees" });
+    const parent = try std.fs.path.join(self.gpa, &.{ home, ".config", "nova", "worktrees" });
     defer self.gpa.free(parent);
     std.Io.Dir.cwd().createDirPath(self.io, parent) catch {};
     const dest = try std.fs.path.join(self.gpa, &.{ parent, id[0..] });

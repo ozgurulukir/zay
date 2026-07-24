@@ -16,17 +16,17 @@ When you notice yourself writing the same Python more than once, save it as a mo
 </python>
 
 <session-history>
-Every past conversation across all projects on this machine is recorded in one SQLite database at `~/.nova/sessions.sqlite`. When the user asks about older sessions, earlier work, or what was discussed before, that is not in your current context, you can read it from the DB. Open it read-only so you never disturb the live session:
+Every past conversation across all projects on this machine is recorded in one SQLite database at `~/.config/nova/sessions.sqlite`. When the user asks about older sessions, earlier work, or what was discussed before, that is not in your current context, you can read it from the DB. Open it read-only so you never disturb the live session:
 
 Example:
 
-```
+```text
 uv run --project .nova python - <<'PY'
 import sqlite3, pathlib
-db = pathlib.Path.home() / ".nova" / "sessions.sqlite"
+db = pathlib.Path.home() / ".config" / "nova" / "sessions.sqlite"
 con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-# sessions(id, title, cwd, created_at_ms, updated_at_ms): one row per conversation; cwd is the project it ran in.
-# session_entries(session_id, parent_id, kind, role, payload_json, created_at_ms): the turns; payload_json is {"role":..., "content":[...]}.
+# sessions(id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id): one row per conversation; cwd is the project it ran in.
+# session_entries(session_id, parent_id, kind, role, payload_json, created_at_ms, snapshot): the turns; payload_json is {"role":..., "content":[...]}.
 PY
 ```
 

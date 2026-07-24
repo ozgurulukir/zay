@@ -37,6 +37,7 @@ We have fine-tuned a ModernBERT base model on a corpus of over 3000 bash command
 Nova uses `union(enum)` instead of flat structs with optional fields wherever a value can be in one of several mutually-exclusive states. This makes illegal combinations unrepresentable at compile time — the compiler tells the next developer where to add a case when a new variant is introduced.
 
 Key types following this pattern:
+
 - `ai.ChatMessage` — `union(enum) { system, user, assistant, tool }` (tool carries non-optional `call_id`)
 - `transcript.Message` — `union(enum)` with 10 variants + `Basic`/`ToolView` payload structs
 - `config.McpServerConfig.transport` — `union(enum) { stdio, sse }`

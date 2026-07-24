@@ -54,7 +54,7 @@ description: Use when writing any code. It describes how to write beautiful, mai
 - State invariants positively. When working with lengths and indexes, this
   form is easy to get right (and understand):
 
-  ```
+  ```text
   if (index < length) {
     // The invariant holds.
   } else {
@@ -65,14 +65,13 @@ description: Use when writing any code. It describes how to write beautiful, mai
   This form is harder, and also goes against the grain of how `index` would typically be compared to
   `length`, for example, in a loop condition:
 
-  ```
+  ```text
   if (index >= length) {
     // It's not true that the invariant holds.
   }
   ```
 
 - All errors must be handled. If a path can throw, that exception must be handled.
-
 - Explicitly pass options to library functions at the call site, instead of relying on the
   defaults. This improves readability but most of all avoids latent, potentially
   catastrophic bugs in case the library ever changes its defaults.
@@ -141,7 +140,7 @@ description: Use when writing any code. It describes how to write beautiful, mai
 
   The same goes for objects or structs, the order is fields then types then methods:
 
-  ```
+  ```text
   time: Time,
   process_id: ProcessID,
 

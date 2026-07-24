@@ -98,31 +98,33 @@ Use `pseudocode` quality metadata to iteratively improve transformation rules:
 
 Tree-sitter queries can be dynamically customized by placing a `.tsq` file in `.code-tandem/queries/` within the project root:
 
-```
+```text
 .code-tandem/queries/<language>.tsq
 ```
 
 Supported headers for language query blocks:
-*   `[symbols]`: Matches symbols. Captures `@symbol.name` and `@symbol.def`.
-*   `[callers]`: Matches callee call expressions. Captures `@callee`.
-*   `[id_refs]`: Matches identifier references for inverted indexing. Captures `@callee`.
-*   `[variables]`: Matches local variables for scope filtering. Captures `@var.name`.
-*   `[string]`: Matches string literals. Captures `@string_content`.
-*   `[template_string]`: Matches template string literals. Captures `@string_content`.
-*   `[imports]`: Matches imports/requires. Captures `@import.source` and `@import.def`.
-*   `[fields]`: Matches struct/class fields. Captures `@field.name` and `@field.type`.
-*   `[annotations]`: Matches annotations/decorators. Captures `@annotation.name`.
+
+- `[symbols]`: Matches symbols. Captures `@symbol.name` and `@symbol.def`.
+- `[callers]`: Matches callee call expressions. Captures `@callee`.
+- `[id_refs]`: Matches identifier references for inverted indexing. Captures `@callee`.
+- `[variables]`: Matches local variables for scope filtering. Captures `@var.name`.
+- `[string]`: Matches string literals. Captures `@string_content`.
+- `[template_string]`: Matches template string literals. Captures `@string_content`.
+- `[imports]`: Matches imports/requires. Captures `@import.source` and `@import.def`.
+- `[fields]`: Matches struct/class fields. Captures `@field.name` and `@field.type`.
+- `[annotations]`: Matches annotations/decorators. Captures `@annotation.name`.
 
 The server hot-reloads these queries dynamically when the `.tsq` files are modified (monitored via `mtime` modification timestamps).
 
 ### Use Cases (Usage Scenarios)
-1.  **Targeted Symbol Extraction (Noise Reduction):** For large projects, reduce index size by targeting only core definitions (e.g., matching only `(struct_item)` and `(impl_item)` under `[symbols]`), ignoring constants, local imports, and inline helper functions.
-2.  **Custom Macro/Router Parsing:** Capture framework-specific handler dispatches or macros (e.g., custom HTTP handlers, logging hooks) as valid callees under `[callers]` that the standard parser misses.
-3.  **Specific String Literal Scoping:** Filter string references by customizing the `[string]` and `[template_string]` patterns to only index specific string types (e.g. matching SQL blocks or configuration keys).
-4.  **Special Annotation Mapping:** Track custom framework attributes (e.g. TS `@Injectable()` or Python `@route`) under `[annotations]` to trace decorator dependency trees.
+
+1. **Targeted Symbol Extraction (Noise Reduction):** For large projects, reduce index size by targeting only core definitions (e.g., matching only `(struct_item)` and `(impl_item)` under `[symbols]`), ignoring constants, local imports, and inline helper functions.
+2. **Custom Macro/Router Parsing:** Capture framework-specific handler dispatches or macros (e.g., custom HTTP handlers, logging hooks) as valid callees under `[callers]` that the standard parser misses.
+3. **Specific String Literal Scoping:** Filter string references by customizing the `[string]` and `[template_string]` patterns to only index specific string types (e.g. matching SQL blocks or configuration keys).
+4. **Special Annotation Mapping:** Track custom framework attributes (e.g. TS `@Injectable()` or Python `@route`) under `[annotations]` to trace decorator dependency trees.
 
 ### Benefits
-*   **Zero Downtime Hot-Reloading:** The server automatically monitors file modification timestamps (`mtime`) and dynamically reloads modified `.tsq` rules on the next query without requiring a server restart.
-*   **Token & Memory Savings:** Filtering out noisy AST nodes at extraction time drastically reduces database footprint and improves LLM token efficiency during graph representation.
-*   **Localized & Safe:** Configured under the `.code-tandem/queries/` directory (which is gitignored), keeping project-specific rules sandboxed and out of the main codebase repository.
 
+- **Zero Downtime Hot-Reloading:** The server automatically monitors file modification timestamps (`mtime`) and dynamically reloads modified `.tsq` rules on the next query without requiring a server restart.
+- **Token & Memory Savings:** Filtering out noisy AST nodes at extraction time drastically reduces database footprint and improves LLM token efficiency during graph representation.
+- **Localized & Safe:** Configured under the `.code-tandem/queries/` directory (which is gitignored), keeping project-specific rules sandboxed and out of the main codebase repository.

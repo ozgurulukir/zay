@@ -2,7 +2,7 @@
 
 How to reason about confidence when evidence is historical, fragmentary, and sometimes contradictory, and how to communicate it without flattening it into false certainty.
 
-Code doesn't carry its own motivation. You can read what code does; you can't read *why it exists*. That lives in commits, PRs, tickets, docs, and conversations, all incomplete, biased, and sometimes missing entirely. Pretending otherwise produces confident-sounding guesses that mislead the user.
+Code doesn't carry its own motivation. You can read what code does; you can't read _why it exists_. That lives in commits, PRs, tickets, docs, and conversations, all incomplete, biased, and sometimes missing entirely. Pretending otherwise produces confident-sounding guesses that mislead the user.
 
 ## Confidence Tiers
 
@@ -10,9 +10,10 @@ Every claim in the final output must sit in one of these tiers. The tier determi
 
 ### 1. Direct
 
-An explicit, textual citation that answers the question. Not "the code does X so the author must have wanted X." Something an author actually *wrote* that says why.
+An explicit, textual citation that answers the question. Not "the code does X so the author must have wanted X." Something an author actually _wrote_ that says why.
 
 Examples:
+
 - A PR description that says "this fixes the bug where users with >1000 items couldn't paginate"
 - A ticket that says "we're adding this because customer Acme requested it in their security review"
 - A code comment that says "// clamp to 100 because the upstream API rejects larger values"
@@ -26,6 +27,7 @@ Phrasing: confident, present tense. "This exists because X." Cite the source.
 Multiple pieces of indirect evidence converge. No single source states it explicitly, but the pattern across sources makes it likely.
 
 Examples:
+
 - The PR title says "improve performance," the ticket is labeled "perf," and the surrounding commits all touch the same hot path
 - Multiple tests were added alongside the change, all exercising edge cases with very large inputs
 - The author's other PRs from the same week all mention the same incident in their descriptions
@@ -34,9 +36,10 @@ Phrasing: confident but clearly derived. "The evidence points strongly to X: [th
 
 ### 3. Inferred
 
-A reasonable reading of the context, but nothing explicitly supports it. The reader should understand this is *your interpretation*, not a fact from the record.
+A reasonable reading of the context, but nothing explicitly supports it. The reader should understand this is _your interpretation_, not a fact from the record.
 
 Examples:
+
 - The PR doesn't say why, but given the error was happening in production (per the incident channel timing) and the fix was rushed (merged the same day), it was likely a hotfix.
 - The function name suggests retry logic; the retry count is 3; this matches the team's general convention of "3 retries" seen elsewhere in the codebase.
 
@@ -47,6 +50,7 @@ Phrasing: hedged. "It appears", "likely", "suggests", "is consistent with", "one
 A plausible hypothesis, but the evidence is thin and other explanations fit equally well. Presenting these is valuable, but mark them clearly as guesses.
 
 Examples:
+
 - "This might be a workaround for a browser bug that's since been fixed, but we found no contemporary evidence of that."
 - "It's possible this threshold was chosen to match an SLA commitment, but no SLA doc references it."
 
@@ -56,7 +60,7 @@ Phrasing: explicitly speculative. "One possibility is X, but we have no direct e
 
 You looked and couldn't find out. A valid and important outcome. Document it.
 
-Phrasing: "We searched X, Y, and Z and found no evidence of why." Be specific about *what* you searched. "We couldn't find out" is less useful than "we searched the ticket tracker with keywords A and B, scanned the 6 PRs that touched this file since 2023, and grep'd the repo for string literals matching the threshold; none surfaced a rationale."
+Phrasing: "We searched X, Y, and Z and found no evidence of why." Be specific about _what_ you searched. "We couldn't find out" is less useful than "we searched the ticket tracker with keywords A and B, scanned the 6 PRs that touched this file since 2023, and grep'd the repo for string literals matching the threshold; none surfaced a rationale."
 
 ## Phrasing Guide
 
@@ -99,13 +103,14 @@ These signal that you're interpreting, not reporting. Use them liberally in the 
 Code that "makes sense" today may have been written for reasons that no longer apply, or that were wrong when they were written. Don't retrofit a clean rationale onto messy history.
 
 Resist the urge to:
+
 - Assume the author did the "right" thing and work backward to justify it
 - Assume a consistent pattern across the codebase was intentional when it might be copy-paste
 - Turn an absence of evidence into evidence of absence ("no one mentioned security concerns, so it must not have been a concern")
 
 ## The Sycophancy Trap
 
-Users often phrase `why` questions with an embedded hypothesis: "Why do we do it this way, I assume it's for performance?" Don't simply confirm it. Treat it as one candidate among others and check the evidence independently. If the evidence supports it, say so with citations; if not, say so and present what the evidence *does* support.
+Users often phrase `why` questions with an embedded hypothesis: "Why do we do it this way, I assume it's for performance?" Don't simply confirm it. Treat it as one candidate among others and check the evidence independently. If the evidence supports it, say so with citations; if not, say so and present what the evidence _does_ support.
 
 The user's guess is a prompt for investigation, not a conclusion to validate.
 
@@ -129,6 +134,7 @@ An honest "we don't know" is one of the most valuable outputs this skill can pro
 Failing to mark a gap and filling it with a confident guess actively harms the user; they'll act on the guess.
 
 When you hit a gap, name it concretely:
+
 - What question you were trying to answer
 - What sources you searched
 - What you searched for in each

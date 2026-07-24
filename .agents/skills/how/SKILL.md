@@ -1,6 +1,6 @@
 ---
 name: how
-description: "Use for \"how does X work\", code walkthroughs before changing something, and placement / ownership / layering questions (\"where should this live\", \"which package owns this\", \"is this the right layer\"). Explains subsystem architecture, runtime flow, onboarding mental models. Can critique architecture. Use why for motivation."
+description: 'Use for "how does X work", code walkthroughs before changing something, and placement / ownership / layering questions ("where should this live", "which package owns this", "is this the right layer"). Explains subsystem architecture, runtime flow, onboarding mental models. Can critique architecture. Use why for motivation.'
 ---
 
 # How
@@ -49,6 +49,7 @@ Spawn all explorers in a single message:
 - `readonly`: `true`
 
 Each explorer gets the same base prompt from `references/explorer-prompt.md` plus a specific exploration angle naming its slice. Each explorer should:
+
 - Start broad: Glob for relevant directories, Grep for key types/interfaces/class names
 - Follow the thread: from an entry point, trace the call chain (callers, callees, data flow, type definitions)
 - Read the actual code, don't guess from file names
@@ -111,18 +112,20 @@ Run the full explain flow above (Steps 1-4). You must understand the architectur
 
 After the explanation is complete, spawn architectural critics. Launch all in a single message:
 
-| Subagent | Model |
-|----------|-------|
+| Subagent | Model                            |
+| -------- | -------------------------------- |
 | Critic A | `claude-opus-4-8-thinking-xhigh` |
-| Critic B | `gpt-5.3-codex-high-fast` |
-| Critic C | `gpt-5.5-high-fast` |
+| Critic B | `gpt-5.3-codex-high-fast`        |
+| Critic C | `gpt-5.5-high-fast`              |
 
 For each critic:
+
 - `subagent_type`: `generalPurpose`
 - `model`: the model from the table. These are minimum reasoning levels. The lead should escalate any model when the architecture warrants deeper analysis.
 - `readonly`: `true`
 
 Read `references/critic-prompt.md` for the prompt template. Each critic gets:
+
 1. The explanation from Step 1 (so they don't re-explore)
 2. The relevant file paths (so they can read the actual code)
 3. The architectural critique rubric from `references/critique-rubric.md`
@@ -132,6 +135,7 @@ Read `references/critic-prompt.md` for the prompt template. Each critic gets:
 Same framework as the interrogate skill. You're a pragmatic lead, not an aggregator.
 
 Categorize findings:
+
 - **Act on.** Architectural problems worth fixing now
 - **Consider.** Real concerns, but the cost/benefit is unclear
 - **Noted.** Valid observations, low priority

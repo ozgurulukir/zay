@@ -244,7 +244,7 @@ fn writeKey(writer: *std.Io.Writer, name: []const u8, wrote_any: *bool) !void {
 
 fn path(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
     if (home_dir.len == 0) return error.HomeNotSet;
-    return std.fs.path.join(gpa, &.{ home_dir, ".nova", "models.json" });
+    return std.fs.path.join(gpa, &.{ home_dir, ".config", "nova", "models.json" });
 }
 
 test "parse keeps only currently configured provider models" {

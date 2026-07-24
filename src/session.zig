@@ -41,6 +41,14 @@ pub const SessionManager = struct {
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, path: []const u8) Error!SessionManager {
         assert(path.len > 0);
+        // :memory: is a special SQLite path — no filesystem directory needed.
+        if (!std.mem.eql(u8, path, ":memory:")) {
+            const dirname = std.fs.path.dirname(path) orelse return error.InvalidPath;
+            std.Io.Dir.createDirPath(.cwd(), io, dirname) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return error.SystemResources,
+            };
+        }
         var connection = try db.Connection.open(path, .{});
         errdefer connection.close();
         try migrate(&connection, io);

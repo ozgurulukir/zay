@@ -4,7 +4,7 @@
 //!   1. Builtin providers (OpenAI Codex OAuth, OpenRouter, Cerebras, etc.)
 //!      defined as a comptime constant in this file.
 //!   2. `https://models.dev/api.json` — fetched on demand, cached to
-//!      `~/.nova/cache/models.dev/api.json` with a 24-hour TTL.
+//!      `~/.config/nova/cache/models.dev/api.json` with a 24-hour TTL.
 //!
 //! Builtin providers always take precedence: when a models.dev provider
 //! shares an id with a builtin, the builtin wins (its base_url, adapter,
@@ -485,7 +485,7 @@ fn cacheApiJson(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, bytes:
 }
 
 fn cacheDir(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
-    return std.fs.path.join(gpa, &.{ home_dir, ".nova", "cache", cache_subdir });
+    return std.fs.path.join(gpa, &.{ home_dir, ".config", "nova", "cache", cache_subdir });
 }
 
 fn cachePath(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
