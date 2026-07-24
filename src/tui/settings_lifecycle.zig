@@ -43,6 +43,30 @@ fn hasActualChanges(state: *const State, config: *const config_mod.Config) bool 
 }
 
 // ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
+const MAX_SYSTEM_PROMPT_LENGTH = 10000;
+
+/// Validate bash classifier URL format.
+fn validateBashClassifierUrl(url: []const u8) !void {
+    if (url.len == 0) return;
+    // Must start with http:// or https://
+    if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) {
+        return error.InvalidUrl;
+    }
+    // Basic length check
+    if (url.len > 2048) return error.UrlTooLong;
+}
+
+/// Validate system prompt content.
+fn validateSystemPrompt(prompt: []const u8) !void {
+    if (prompt.len > MAX_SYSTEM_PROMPT_LENGTH) {
+        return error.PromptTooLong;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Open / close
 // ---------------------------------------------------------------------------
 
@@ -190,6 +214,20 @@ pub fn saveSettings(app: *App) !bool {
         return false;
     }
 
+    // Validate inputs before saving.
+    if (state.pending_bash_classifier_url) |url| {
+        validateBashClassifierUrl(url) catch |err| {
+            std.log.warn("settings.validation.url_failed err={s}", .{@errorName(err)});
+            return false;
+        };
+    }
+    if (state.pending_system_prompt) |prompt| {
+        validateSystemPrompt(prompt) catch |err| {
+            std.log.warn("settings.validation.prompt_failed err={s}", .{@errorName(err)});
+            return false;
+        };
+    }
+
     // Build updates with only the fields the settings panel manages.
     // Do NOT clone model_selection from cached_config — that would
     // copy project-level provider/model overrides into the global config.
@@ -242,6 +280,12 @@ fn commitTextEdit(app: *App) !void {
     const text = app.settings_text_input.items;
     switch (state.edit_target) {
         .system_prompt => {
+            // Validate before committing
+            validateSystemPrompt(text) catch |err| {
+                std.log.warn("settings.validation.prompt_failed err={s}", .{@errorName(err)});
+                // Don't commit invalid prompt
+                return;
+            };
             if (state.pending_system_prompt) |old| app.gpa.free(old);
             if (text.len > 0) {
                 state.pending_system_prompt = try app.gpa.dupe(u8, text);
@@ -251,6 +295,12 @@ fn commitTextEdit(app: *App) !void {
             state.dirty = true;
         },
         .bash_classifier_url => {
+            // Validate before committing
+            validateBashClassifierUrl(text) catch |err| {
+                std.log.warn("settings.validation.url_failed err={s}", .{@errorName(err)});
+                // Don't commit invalid URL
+                return;
+            };
             if (state.pending_bash_classifier_url) |old| app.gpa.free(old);
             state.pending_bash_classifier_url = try app.gpa.dupe(u8, text);
             state.dirty = true;
