@@ -50,7 +50,7 @@ pub const Agent = struct {
     /// Optional local classifier endpoint for bash approval gating.
     bash_classifier_url: ?[]const u8 = null,
     /// Optional synchronous approval hook used by the TUI worker.
-    bash_approval: ?AnyBashApproval = null,
+    bash_approval: ?BashApproval = null,
     /// Optional shared manager for long-running bash commands launched with
     /// `run_in_background`. Borrowed (owned by the App); null disables the
     /// background path so such calls fall back to a normal blocking run.
@@ -1027,30 +1027,9 @@ pub const Agent = struct {
 /// left on this seam — making the field generic would require the
 /// `Agent` struct itself to be generic, which is invasive. Kept as a
 /// vtable; see type-safety-refactor.md P1-A follow-up for `BashApproval(Ctx)`.
-pub fn BashApproval(comptime Ctx: type) type {
-    return struct {
-        ptr: *Ctx,
-        request: *const fn (*Ctx, []const u8) anyerror!bool,
-    };
-}
-
-/// A type-erased wrapper for BashApproval so Agent doesn't have to be generic.
-pub const AnyBashApproval = struct {
+pub const BashApproval = struct {
     ptr: *anyopaque,
     request: *const fn (*anyopaque, []const u8) anyerror!bool,
-
-    pub fn from(comptime Ctx: type, typed: BashApproval(Ctx)) AnyBashApproval {
-        const Gen = struct {
-            fn request_erased(ptr: *anyopaque, command: []const u8) anyerror!bool {
-                const typed_ptr: *Ctx = @ptrCast(@alignCast(ptr));
-                return typed.request(typed_ptr, command);
-            }
-        };
-        return .{
-            .ptr = typed.ptr,
-            .request = Gen.request_erased,
-        };
-    }
 };
 
 /// Parse just the `command` field of bash's argument JSON. The TUI uses

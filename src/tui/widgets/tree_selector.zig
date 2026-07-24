@@ -334,12 +334,9 @@ pub const TreeState = struct {
         const child_lists = try arena.alloc(std.ArrayList(usize), self.nodes.len);
         for (child_lists) |*list| list.* = .empty;
         var roots: std.ArrayList(usize) = .empty;
-
-        var visible_ancestor_cache = std.AutoHashMapUnmanaged(usize, ?usize){};
-
         for (self.nodes, 0..) |node, i| {
             if (visible_mask[i]) {
-                const ancestor = self.nearestVisibleAncestor(i, visible_mask, &visible_ancestor_cache, arena);
+                const ancestor = self.nearestVisibleAncestor(i, visible_mask);
                 visible_parent[i] = ancestor;
                 if (ancestor) |parent| {
                     try child_lists[parent].append(arena, i);
@@ -353,7 +350,7 @@ pub const TreeState = struct {
             } else {
                 visible_parent[i] = null;
                 if (node.has_snapshot) {
-                    if (self.nearestVisibleAncestor(i, visible_mask, &visible_ancestor_cache, arena)) |anc| {
+                    if (self.nearestVisibleAncestor(i, visible_mask)) |anc| {
                         has_snap[anc] = true;
                         snap_id[anc] = node.id; // last-wins: deepest in the segment
                     }
@@ -485,41 +482,14 @@ pub const TreeState = struct {
         return false;
     }
 
-    fn nearestVisibleAncestor(
-        self: *const TreeState,
-        i: usize,
-        visible_mask: []const bool,
-        cache: *std.AutoHashMapUnmanaged(usize, ?usize),
-        arena: std.mem.Allocator,
-    ) ?usize {
+    fn nearestVisibleAncestor(self: *const TreeState, i: usize, visible_mask: []const bool) ?usize {
         var current = self.nodes[i].parent_id;
-        var path: std.ArrayList(usize) = .empty;
-        defer path.deinit(self.gpa);
-
-        var result: ?usize = null;
-
         while (current) |parent_id| {
-            const parent_index = self.index_by_id.get(parent_id) orelse break;
-
-            if (cache.get(parent_index)) |cached| {
-                result = cached;
-                break;
-            }
-
-            path.append(self.gpa, parent_index) catch {};
-
-            if (visible_mask[parent_index]) {
-                result = parent_index;
-                break;
-            }
+            const parent_index = self.index_by_id.get(parent_id) orelse return null;
+            if (visible_mask[parent_index]) return parent_index;
             current = self.nodes[parent_index].parent_id;
         }
-
-        for (path.items) |p_index| {
-            cache.put(arena, p_index, result) catch {};
-        }
-
-        return result;
+        return null;
     }
 };
 

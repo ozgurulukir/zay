@@ -148,10 +148,10 @@ pub const cancel_message = "Interrupted.";
 /// turn's first prompt — used to deliver a queue stranded by a user interrupt as
 /// a fresh turn. The @-mention expansion lands here, off the UI thread.
 pub fn runAgentTurn(agent: *agent_mod.Agent, worker_context: *Context, pending_prompt: ?[]u8, drain_queue_first: bool) void {
-    agent.bash_approval = agent_mod.AnyBashApproval.from(Context, .{
+    agent.bash_approval = .{
         .ptr = worker_context,
         .request = requestBashApproval,
-    });
+    };
     defer agent.bash_approval = null;
 
     if (drain_queue_first) {
@@ -194,8 +194,9 @@ pub fn runAgentTurn(agent: *agent_mod.Agent, worker_context: *Context, pending_p
     postAgentEvent(worker_context, .turn_finished) catch {};
 }
 
-fn requestBashApproval(context: *Context, command: []const u8) anyerror!bool {
-    return context.approval.request(context.io, context.gpa, command);
+fn requestBashApproval(context: *anyopaque, command: []const u8) anyerror!bool {
+    const worker_context: *Context = @ptrCast(@alignCast(context));
+    return worker_context.approval.request(worker_context.io, worker_context.gpa, command);
 }
 
 /// Post a `turn_failed` notice followed by the terminal `turn_finished`, so the

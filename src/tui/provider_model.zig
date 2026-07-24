@@ -617,49 +617,29 @@ pub fn applySelectedModel(self: *App) !void {
     const source = selectedModelSource(
         self,
     ) orelse return error.NoModels;
-    const provider = switch (source) {
-        .openai_codex => try connectCodexSelectedModel(self, model.id, effort),
-        .openai_compatible => |p| try attachCompatibleSelectedModel(self, p, model.id, effort),
-    };
-    try persistModelSelection(self, provider, model.id, effort, self.pickers.models.model_scope);
+    switch (source) {
+        .openai_codex => {
+            const loaded = try codex.load(self.gpa, self.io, self.liveRuntime().?.home_dir);
+            if (loaded) |codex_creds| {
+                var credentials = codex_creds;
+                defer credentials.deinit(self.gpa);
+                try connectCodexClient(self, credentials, model.id, effort);
+                self.codex_signed_in = true;
+                try persistModelSelection(self, .openai, model.id, effort, self.pickers.models.model_scope);
+            } else {
+                return error.NotConnected;
+            }
+        },
+        .openai_compatible => |provider| {
+            const base_url = compatibleBaseUrl(self, provider) orelse return error.NotConnected;
+            const api_key = compatibleApiKey(self, provider);
+            if (api_key.len == 0 and provider.requiresApiKey()) return error.NotConnected;
+            try attachOpenAiCompatibleClient(self, base_url, api_key, model.id, effort);
+            try persistModelSelection(self, provider, model.id, effort, self.pickers.models.model_scope);
+        },
+    }
     self.mode = .normal;
     self.clearInput();
-}
-
-/// Connect the OpenAI Codex provider for the selected model. Returns the
-/// provider identity to persist. Errors with `error.NotConnected` when no
-/// credentials are available.
-fn connectCodexSelectedModel(
-    self: *App,
-    model_id: []const u8,
-    effort: ai.ReasoningEffort,
-) !config_mod.Provider {
-    const loaded = try codex.load(self.gpa, self.io, self.liveRuntime().?.home_dir);
-    if (loaded) |codex_creds| {
-        var credentials = codex_creds;
-        defer credentials.deinit(self.gpa);
-        try connectCodexClient(self, credentials, model_id, effort);
-        self.codex_signed_in = true;
-        return .openai;
-    } else {
-        return error.NotConnected;
-    }
-}
-
-/// Attach an OpenAI-compatible provider for the selected model. Returns the
-/// provider identity to persist. Errors with `error.NotConnected` when the
-/// base URL or required API key is missing.
-fn attachCompatibleSelectedModel(
-    self: *App,
-    provider: config_mod.Provider,
-    model_id: []const u8,
-    effort: ai.ReasoningEffort,
-) !config_mod.Provider {
-    const base_url = compatibleBaseUrl(self, provider) orelse return error.NotConnected;
-    const api_key = compatibleApiKey(self, provider);
-    if (api_key.len == 0 and provider.requiresApiKey()) return error.NotConnected;
-    try attachOpenAiCompatibleClient(self, base_url, api_key, model_id, effort);
-    return provider;
 }
 
 pub fn persistModelSelection(

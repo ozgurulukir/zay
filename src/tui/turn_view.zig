@@ -245,81 +245,41 @@ pub const TurnView = struct {
         return visible_change;
     }
 
-    /// Classification of an incoming tool delta so `applyToolPreview` can
-    /// dispatch to the right rendering path without nested early returns.
-    const ToolPreview = union(enum) {
-        skill: []const u8,
-        generic: tools_mod.ToolDisplay,
-        none,
-    };
-
-    /// Decide whether a tool delta should render as a skill row, a generic
-    /// tool row, or nothing yet (partial bash arguments). Caller owns the
-    /// payload: `.skill` is heap-allocated, `.generic` must be deinited.
-    fn resolveToolPreview(gpa: std.mem.Allocator, tool: ai.ToolDelta) !ToolPreview {
-        if (std.mem.eql(u8, tool.name, "bash")) {
-            const command = agent_mod.parseCommand(gpa, tool.arguments) catch return .none;
-            gpa.free(command);
-            if (try skillNameFromBashRead(gpa, tool.arguments)) |skill_name| {
-                return .{ .skill = skill_name };
-            }
-        }
-        var display = try agent_mod.formatToolDisplay(gpa, tool.name, tool.arguments);
-        if (std.mem.eql(u8, tool.name, "bash") and display.expanded_label == null) {
-            display.deinit(gpa);
-            return .none;
-        }
-        return .{ .generic = display };
-    }
-
     fn applyToolPreview(
         self: *TurnView,
         gpa: std.mem.Allocator,
         transcript: *transcript_mod.Transcript,
         tool: ai.ToolDelta,
     ) !bool {
-        var preview = try resolveToolPreview(gpa, tool);
-        const was_awaiting = self.awaitingOutput();
-
-        const visible_change = blk: {
-            switch (preview) {
-                .skill => |skill_name| {
-                    defer gpa.free(skill_name);
-                    break :blk try self.applySkillPreviewInternal(gpa, transcript, tool.index, skill_name);
-                },
-                .generic => |*display| {
-                    defer display.deinit(gpa);
-                    break :blk try self.applyGenericToolPreview(gpa, transcript, tool.index, display.*);
-                },
-                .none => return false,
+        if (std.mem.eql(u8, tool.name, "bash")) {
+            const command = agent_mod.parseCommand(gpa, tool.arguments) catch return false;
+            gpa.free(command);
+            if (try skillNameFromBashRead(gpa, tool.arguments)) |skill_name| {
+                defer gpa.free(skill_name);
+                return try self.applySkillPreview(gpa, transcript, tool.index, skill_name);
             }
-        };
+        }
+        var display = try agent_mod.formatToolDisplay(gpa, tool.name, tool.arguments);
+        defer display.deinit(gpa);
+        if (std.mem.eql(u8, tool.name, "bash") and display.expanded_label == null) return false;
 
         // Reached only once arguments parse — partial tool args return above,
         // keeping the spinner up. Clearing it here counts as a visible change.
-        self.tool_seen_in_response = true;
-        self.agent_index = null;
-        return was_awaiting or visible_change;
-    }
+        const was_awaiting = self.awaitingOutput();
 
-    fn applyGenericToolPreview(
-        self: *TurnView,
-        gpa: std.mem.Allocator,
-        transcript: *transcript_mod.Transcript,
-        tool_index: u32,
-        display: tools_mod.ToolDisplay,
-    ) !bool {
         var visible_change = false;
-        if (self.toolTranscriptIndex(tool_index)) |index| {
+        if (self.toolTranscriptIndex(tool.index)) |index| {
             visible_change = !toolDisplayMatches(transcript.messages.items[index], display);
             try transcript.updateToolExpanded(gpa, index, display.label, display.expanded_label);
         } else {
             const index = try transcript.startTool(gpa, display.label);
             try transcript.updateToolExpanded(gpa, index, display.label, display.expanded_label);
-            try self.putToolTranscriptIndex(gpa, tool_index, index);
+            try self.putToolTranscriptIndex(gpa, tool.index, index);
             visible_change = true;
         }
-        return visible_change;
+        self.tool_seen_in_response = true;
+        self.agent_index = null;
+        return was_awaiting or visible_change;
     }
 
     fn setSkillMessage(gpa: std.mem.Allocator, transcript: *transcript_mod.Transcript, index: u32, title: []const u8) !void {
@@ -351,7 +311,7 @@ pub const TurnView = struct {
         };
     }
 
-    fn applySkillPreviewInternal(
+    fn applySkillPreview(
         self: *TurnView,
         gpa: std.mem.Allocator,
         transcript: *transcript_mod.Transcript,
@@ -361,6 +321,7 @@ pub const TurnView = struct {
         const title = try std.fmt.allocPrint(gpa, "[SKILL] {s}", .{skill_name});
         defer gpa.free(title);
 
+        const was_awaiting = self.awaitingOutput();
         var visible_change = false;
         if (self.toolTranscriptIndex(tool_index)) |index| {
             const m = transcript.messages.items[index].mirror();
@@ -371,7 +332,9 @@ pub const TurnView = struct {
             try self.putToolTranscriptIndex(gpa, tool_index, index);
             visible_change = true;
         }
-        return visible_change;
+        self.tool_seen_in_response = true;
+        self.agent_index = null;
+        return was_awaiting or visible_change;
     }
 
     fn finishTool(
@@ -575,63 +538,4 @@ test "history compacted appends a white info notice, not a red error" {
     // Neutral `.info` (white), distinct from `.notice` (red error).
     try std.testing.expectEqual(transcript_mod.MessageKind.info, transcript.messages.items[0].mirror().kind);
     try std.testing.expectEqualStrings("compacted context ~90000 -> ~20000 tokens", transcript.messages.items[0].mirror().body);
-}
-
-test "resolveToolPreview classifies bash skill read" {
-    const gpa = std.testing.allocator;
-    const preview = try TurnView.resolveToolPreview(gpa, .{
-        .index = 0,
-        .name = "bash",
-        .arguments = "{\"command\":\"cat .agents/skills/tigerstyle/SKILL.md\"}",
-    });
-    switch (preview) {
-        .skill => |name| {
-            defer gpa.free(name);
-            try std.testing.expectEqualStrings("tigerstyle", name);
-        },
-        else => return error.UnexpectedPreview,
-    }
-}
-
-test "resolveToolPreview classifies bash non-skill as generic" {
-    const gpa = std.testing.allocator;
-    var preview = try TurnView.resolveToolPreview(gpa, .{
-        .index = 0,
-        .name = "bash",
-        .arguments = "{\"command\":\"pwd\",\"reason\":\"Inspect directory\"}",
-    });
-    switch (preview) {
-        .generic => |*display| {
-            defer display.deinit(gpa);
-            try std.testing.expectEqualStrings("Inspect directory", display.label);
-            try std.testing.expectEqualStrings("pwd", display.expanded_label.?);
-        },
-        else => return error.UnexpectedPreview,
-    }
-}
-
-test "resolveToolPreview returns none for partial bash arguments" {
-    const gpa = std.testing.allocator;
-    const preview = try TurnView.resolveToolPreview(gpa, .{
-        .index = 0,
-        .name = "bash",
-        .arguments = "{\"command",
-    });
-    try std.testing.expect(preview == .none);
-}
-
-test "resolveToolPreview classifies unknown tool as generic" {
-    const gpa = std.testing.allocator;
-    var preview = try TurnView.resolveToolPreview(gpa, .{
-        .index = 0,
-        .name = "unknown_tool",
-        .arguments = "{\"x\":1}",
-    });
-    switch (preview) {
-        .generic => |*display| {
-            defer display.deinit(gpa);
-            try std.testing.expectEqualStrings("unknown_tool {\"x\":1}", display.label);
-        },
-        else => return error.UnexpectedPreview,
-    }
 }

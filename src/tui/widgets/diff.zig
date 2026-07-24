@@ -124,8 +124,7 @@ fn drawDiffRow(surface: *vxfw.Surface, ctx: vxfw.DrawContext, app: *App, idx: us
 
     const number = if (line.kind == .removed) line.old_no else line.new_no;
     if (number) |value| {
-        var num_buf: [32]u8 = undefined;
-        const num = std.fmt.bufPrint(&num_buf, "{d: >4}", .{value}) catch "    ";
+        const num = std.fmt.allocPrint(ctx.arena, "{d: >4}", .{value}) catch "    ";
         panel.lineStyledAt(surface, row, num, ctx, 0, bgMerged(StylePalette.diff_gutter, row_bg)) catch {};
     }
 
@@ -224,8 +223,7 @@ fn drawCommentPreview(surface: *vxfw.Surface, ctx: vxfw.DrawContext, app: *App, 
     const bracket_style = if (active) StylePalette.diff_bracket_active else StylePalette.diff_bracket;
     panel.lineStyledAt(surface, row, "└", ctx, diff_bracket_col, bracket_style) catch {};
     const marker: []const u8 = if (active) "  💬 " else "💬 ";
-    var text_buf: [1024]u8 = undefined;
-    const text = std.fmt.bufPrint(&text_buf, "{s}{s}", .{ marker, comment.text }) catch comment.text;
+    const text = std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ marker, comment.text }) catch comment.text;
     const text_style = if (active) StylePalette.diff_comment_active else StylePalette.diff_comment;
     panel.lineStyledAt(surface, row, text, ctx, diff_content_col, text_style) catch {};
 }
@@ -350,8 +348,7 @@ const DiffSearchInner = struct {
             const index = first + r;
             const selected = index == app.diff.search_sel;
             const prefix = if (selected) "  " else "  ";
-            var text_buf: [1024]u8 = undefined;
-            const text = std.fmt.bufPrint(&text_buf, "{s}{s}", .{ prefix, files[matches[index]].path }) catch files[matches[index]].path;
+            const text = std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, files[matches[index]].path }) catch files[matches[index]].path;
             panel.lineAt(&surface, 2 + r, text, ctx, selected, 0) catch {};
         }
         return surface;

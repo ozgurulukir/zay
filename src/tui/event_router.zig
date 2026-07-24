@@ -116,7 +116,52 @@ fn routeKey(
         }
     }
     if (key.matches(vaxis.Key.escape, .{})) {
-        if (try handleEscapeKey(app, root, ctx)) return;
+        if (app.getBackgroundModal()) {
+            app.setBackgroundModal(false);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (app.permissionPending()) {
+            try app.resolvePermission(.reject);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (app.isAtSearchActive()) {
+            app.closeAtSearch();
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (try app.cancelMode()) {
+            try root.syncFocus(ctx);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (app.getBlockNav() or app.thread.transcript.selected != null) {
+            app.setBlockNav(false);
+            app.thread.transcript.selected = null;
+            app.setThreadAutoScroll(true);
+            try root.syncFocus(ctx);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (app.inputRealLength() > 0) {
+            app.clearInput();
+            app.closeAtSearch();
+            app.clearPendingQuitAt();
+            try root.syncFocus(ctx);
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (app.turnStateIsActive()) {
+            try app.handleInterrupt();
+            ctx.consumeAndRedraw();
+            return;
+        }
+        // No in-flight turn and no overlay to close — swallow the key so
+        // the user doesn't accidentally exit the TUI.
+        app.clearPendingQuitAt();
+        ctx.consume_event = true;
+        return;
     }
     if (key.matches('o', .{ .ctrl = true })) {
         app.clearPendingQuitAt();
@@ -144,7 +189,27 @@ fn routeKey(
     const is_ctrl_c = key.matches('c', .{ .ctrl = true });
     const is_ctrl_d_empty = key.matches('d', .{ .ctrl = true }) and app.isNormalMode() and app.inputRealLength() == 0;
     if (is_ctrl_c or is_ctrl_d_empty) {
-        if (try handleQuitKey(app, root, ctx, is_ctrl_c)) return;
+        if (is_ctrl_c and app.isNormalMode() and app.inputRealLength() > 0) {
+            app.clearInput();
+            app.closeAtSearch();
+            app.setBlockNav(false);
+            app.clearPendingQuitAt();
+            ctx.consumeAndRedraw();
+            return;
+        }
+        const now = std.Io.Timestamp.now(app.getIo(), .awake);
+        if (app.getPendingQuitAt()) |first_press| {
+            const elapsed_ns = first_press.durationTo(now).nanoseconds;
+            const threshold_ns: i128 = @as(i128, App.ctrl_c_double_press_ms) * std.time.ns_per_ms;
+            if (elapsed_ns >= 0 and elapsed_ns <= threshold_ns) {
+                ctx.quit = true;
+                ctx.consume_event = true;
+                return;
+            }
+        }
+        app.setPendingQuitAt(now);
+        ctx.consumeAndRedraw();
+        return;
     }
     // Any other key cancels the pending-quit prompt.
     app.clearPendingQuitAt();
@@ -176,132 +241,58 @@ fn routeKey(
         try root.submit(ctx);
         return;
     }
-    if (app.isNormalMode() and !app.isAtSearchActive()) {
-        if (try handleArrowNavigation(app, root, ctx, key)) return;
-    }
-    if (try app.handleCommandKey(key)) {
-        ctx.consumeAndRedraw();
-    }
-}
-
-
-fn handleEscapeKey(app: *App, root: *RootWidget, ctx: *vxfw.EventContext) !bool {
-    if (app.getBackgroundModal()) {
-        app.setBackgroundModal(false);
-        ctx.consumeAndRedraw();
-        return true;
-    }
-    if (app.permissionPending()) {
-        try app.resolvePermission(.reject);
-        ctx.consumeAndRedraw();
-        return true;
-    }
-    if (app.isAtSearchActive()) {
-        app.closeAtSearch();
-        ctx.consumeAndRedraw();
-        return true;
-    }
-    if (try app.cancelMode()) {
-        try root.syncFocus(ctx);
-        ctx.consumeAndRedraw();
-        return true;
-    }
-    if (app.getBlockNav() or app.thread.transcript.selected != null) {
-        app.setBlockNav(false);
-        app.thread.transcript.selected = null;
-        app.setThreadAutoScroll(true);
-        try root.syncFocus(ctx);
-        ctx.consumeAndRedraw();
-        return true;
-    }
-    if (app.inputRealLength() > 0) {
-        app.clearInput();
-        app.closeAtSearch();
-        app.clearPendingQuitAt();
-        try root.syncFocus(ctx);
-        ctx.consumeAndRedraw();
-        return true;
-    }
-    if (app.turnStateIsActive()) {
-        try app.handleInterrupt();
-        ctx.consumeAndRedraw();
-        return true;
-    }
-    // No in-flight turn and no overlay to close — swallow the key so
-    // the user doesn't accidentally exit the TUI.
-    app.clearPendingQuitAt();
-    ctx.consume_event = true;
-    return true;
-}
-
-fn handleQuitKey(app: *App, root: *RootWidget, ctx: *vxfw.EventContext, is_ctrl_c: bool) !bool {
-    _ = root;
-    if (is_ctrl_c and app.isNormalMode() and app.inputRealLength() > 0) {
-        app.clearInput();
-        app.closeAtSearch();
-        app.setBlockNav(false);
-        app.clearPendingQuitAt();
-        ctx.consumeAndRedraw();
-        return true;
-    }
-    const now = std.Io.Timestamp.now(app.getIo(), .awake);
-    if (app.getPendingQuitAt()) |first_press| {
-        const elapsed_ns = first_press.durationTo(now).nanoseconds;
-        const threshold_ns: i128 = @as(i128, App.ctrl_c_double_press_ms) * std.time.ns_per_ms;
-        if (elapsed_ns >= 0 and elapsed_ns <= threshold_ns) {
-            ctx.quit = true;
-            ctx.consume_event = true;
-            return true;
-        }
-    }
-    app.setPendingQuitAt(now);
-    ctx.consumeAndRedraw();
-    return true;
-}
-
-fn handleArrowNavigation(app: *App, root: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
-    _ = root;
-    if (app.queuedCount() > 0) {
+    // Arrow keys are owned by the input until the cursor leaves the top of
+    // it. While the input owns them (`!block_nav`) up/down move the cursor
+    // between lines; going up past the first line hands control to block
+    // navigation, and down stays trapped in the input. Once in block
+    // navigation the arrows fall through to `handleTranscriptKey`, which
+    // walks blocks and re-enters the input when you press down past the
+    // last block. The @-mention popup keeps the arrows for itself.
+    if (app.isNormalMode() and !app.isAtSearchActive() and app.queuedCount() > 0) {
         // ALT+←/→ navigate queued messages; CTRL+→ steers the selected
         // one. Gated on a non-empty queue so the keys fall through to
         // normal cursor/word movement otherwise.
         if (key.matches(vaxis.Key.left, .{ .alt = true })) {
             app.selectPrevQueued();
             ctx.consumeAndRedraw();
-            return true;
+            return;
         } else if (key.matches(vaxis.Key.right, .{ .alt = true })) {
             app.selectNextQueued();
             ctx.consumeAndRedraw();
-            return true;
+            return;
         } else if (key.matches(vaxis.Key.right, .{ .ctrl = true })) {
             app.steerSelectedQueued();
             ctx.consumeAndRedraw();
-            return true;
+            return;
         }
     }
-    if (key.matches(vaxis.Key.up, .{})) {
-        if (!app.getBlockNav()) {
-            if (try app.moveInputCursorVertical(.up)) {
-                ctx.consumeAndRedraw();
-                return true;
-            }
-            // Top line: leave the input and start walking blocks.
-            app.setBlockNav(true);
-        }
-    } else if (key.matches(vaxis.Key.down, .{})) {
-        if (app.getBlockNav()) {
-            if (!app.transcriptHasSelection()) {
-                if (try app.moveInputCursorVertical(.down)) {
-                    app.setBlockNav(false);
+    if (app.isNormalMode() and !app.isAtSearchActive()) {
+        if (key.matches(vaxis.Key.up, .{})) {
+            if (!app.getBlockNav()) {
+                if (try app.moveInputCursorVertical(.up)) {
                     ctx.consumeAndRedraw();
-                    return true;
+                    return;
                 }
+                // Top line: leave the input and start walking blocks.
+                app.setBlockNav(true);
             }
-        } else {
-            _ = try app.moveInputCursorVertical(.down);
-            ctx.consumeAndRedraw();
-            return true;
+        } else if (key.matches(vaxis.Key.down, .{})) {
+            if (app.getBlockNav()) {
+                if (!app.transcriptHasSelection()) {
+                    if (try app.moveInputCursorVertical(.down)) {
+                        app.setBlockNav(false);
+                        ctx.consumeAndRedraw();
+                        return;
+                    }
+                }
+            } else {
+                _ = try app.moveInputCursorVertical(.down);
+                ctx.consumeAndRedraw();
+                return;
+            }
         }
     }
-    return false;
+    if (try app.handleCommandKey(key)) {
+        ctx.consumeAndRedraw();
+    }
 }
