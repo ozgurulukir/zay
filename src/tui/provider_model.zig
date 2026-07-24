@@ -752,14 +752,33 @@ pub fn modelSelectionUpdates(
     if (provider != .openai) {
         if (compatibleBaseUrl(self, provider)) |base_url| providers[0].base_url = .{ .custom = try self.gpa.dupe(u8, base_url) };
     }
+
+    const base_url_slice: ?[]u8 = switch (providers[0].base_url) {
+        .custom => |base_url| try self.gpa.dupe(u8, base_url),
+        .default => null,
+    };
+    errdefer if (base_url_slice) |s| self.gpa.free(s);
+
+    const ms_model_id = try self.gpa.dupe(u8, model_id);
+    errdefer self.gpa.free(ms_model_id);
+
+    const ms_base_url = if (base_url_slice) |s| try self.gpa.dupe(u8, s) else try self.gpa.dupe(u8, "");
+    errdefer self.gpa.free(ms_base_url);
+
+    const ms_api_key = try self.gpa.dupe(u8, "");
+    errdefer self.gpa.free(ms_api_key);
+
     return .{
         .provider = provider,
-        .base_url = switch (providers[0].base_url) {
-            .custom => |base_url| try self.gpa.dupe(u8, base_url),
-            .default => null,
-        },
+        .base_url = base_url_slice,
         .model = .{ .id = model_id_copy, .reasoning_effort = effort },
         .providers = providers,
+        .model_selection = .{
+            .provider = provider,
+            .model = .{ .id = ms_model_id, .reasoning_effort = effort },
+            .base_url = ms_base_url,
+            .api_key = ms_api_key,
+        },
     };
 }
 

@@ -130,8 +130,15 @@ pub fn clearCurrentField(app: *App) void {
 // Ctrl+S — save pending changes
 // ---------------------------------------------------------------------------
 
-/// Save all pending settings to the global config file and update the live
-/// cached_config. Returns true if anything was written.
+/// Save all pending settings to the global config file (and the project
+/// config if one exists) and update the live cached_config. Returns true
+/// if anything was written.
+///
+/// Only writes the fields that the settings panel manages (enable_thinking,
+/// use_responses_endpoint, system_prompt, bash_classifier_url). Provider
+/// and model selection are managed by the model picker, not here — cloning
+/// the merged model_selection would leak project-level overrides into the
+/// global config.
 pub fn saveSettings(app: *App) !bool {
     const state = &app.pickers.settings;
     if (!state.dirty and state.edit_target == .none) return false;
@@ -139,38 +146,40 @@ pub fn saveSettings(app: *App) !bool {
     // Flush any in-progress text edit before saving.
     if (state.edit_target != .none) try commitTextEdit(app);
 
-    // Build the updates from the cached model_selection (so the merge
-    // preserves the full selection) plus the pending toggles/text fields.
-    // We mutate the model_selection copy rather than carrying both forms.
+    // Build updates with only the fields the settings panel manages.
+    // Do NOT clone model_selection from cached_config — that would
+    // copy project-level provider/model overrides into the global config.
     var updates: config_mod.Config = .{};
     defer updates.deinit(app.gpa);
-    if (app.cached_config.model_selection) |ms| {
-        updates.model_selection = try ms.clone(app.gpa);
-    }
     if (state.pending_enable_thinking) |v| {
-        if (updates.model_selection) |*ms| ms.enable_thinking = v;
+        updates.enable_thinking = v;
     }
     if (state.pending_use_responses_endpoint) |v| {
-        if (updates.model_selection) |*ms| ms.use_responses_endpoint = v;
+        updates.use_responses_endpoint = v;
     }
     if (state.pending_system_prompt) |s| {
-        if (updates.model_selection) |*ms| {
-            if (ms.system_prompt) |old| app.gpa.free(old);
-            ms.system_prompt = try app.gpa.dupe(u8, s);
-        }
+        updates.system_prompt = try app.gpa.dupe(u8, s);
     }
     if (state.pending_bash_classifier_url) |s| {
-        if (updates.model_selection) |*ms| {
-            if (ms.bash_classifier_url) |old| app.gpa.free(old);
-            ms.bash_classifier_url = if (s.len > 0) try app.gpa.dupe(u8, s) else null;
-        }
+        updates.bash_classifier_url = if (s.len > 0) try app.gpa.dupe(u8, s) else null;
     }
 
     const runtime = app.liveRuntime() orelse return false;
+
+    // Write to global config.
     config_mod.mergeAndWriteGlobal(app.gpa, app.io, runtime.home_dir, updates) catch |err| {
         std.log.warn("settings.save.failed err={s}", .{@errorName(err)});
         return false;
     };
+
+    // If a project config exists, write the same changes there too.
+    // Otherwise project-level overrides would mask the user's changes
+    // on the next config load.
+    if (config_mod.projectConfigExists(app.gpa, app.io, runtime.cwd)) {
+        config_mod.mergeAndWriteProject(app.gpa, app.io, runtime.cwd, updates) catch |err| {
+            std.log.warn("settings.save.project.failed err={s}", .{@errorName(err)});
+        };
+    }
 
     // Update the live cached_config so the running agent picks up the
     // changes without a restart.

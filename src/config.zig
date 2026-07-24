@@ -504,26 +504,17 @@ fn mergeLayers(gpa: std.mem.Allocator, layers: []const Config) !Config {
 /// concern: `serialize` is the single seam that decides what reaches disk, and
 /// it never writes `api_key` (keys live only in auth.json). So this overlay
 /// needs no "should I keep the key?" flag — the write path strips it anyway.
+///
+/// When `updates.model_selection` is present it is treated as the canonical
+/// form and all legacy fields are derived from it. When absent, individual
+/// legacy fields are applied and `target.model_selection` (if present) is
+/// kept in sync so `serialize` — which prefers `model_selection` — always
+/// writes the correct values.
 fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) !void {
-    if (updates.provider) |v| target.provider = v;
-    if (updates.use_responses_endpoint) |v| target.use_responses_endpoint = v;
-    if (updates.enable_thinking) |v| target.enable_thinking = v;
-    if (updates.base_url) |s| try replaceOptionalSlice(gpa, &target.base_url, s);
-    if (updates.api_key) |s| try replaceOptionalSlice(gpa, &target.api_key, s);
-    if (updates.bash_classifier_url) |s| try replaceOptionalSlice(gpa, &target.bash_classifier_url, s);
-    if (updates.system_prompt) |s| try replaceOptionalSlice(gpa, &target.system_prompt, s);
-    for (updates.providers) |provider| try applyProviderOverlay(gpa, target, provider);
-    for (updates.mcp_servers) |mcp_server| try applyMcpServerOverlay(gpa, target, mcp_server);
-    if (updates.model) |m| {
-        if (target.model) |*old| old.deinit(gpa);
-        target.model = try m.clone(gpa);
-    }
-    // When the updates carry a complete `model_selection`, mirror its
-    // fields onto the target's legacy fields so the merge result
-    // (which is hydrated to model_selection via parseObject) round-trips
-    // correctly. parseObject on the merged result will repackage them
-    // into model_selection.
     if (updates.model_selection) |ms| {
+        // Canonical form: model_selection is the single source of truth.
+        // Mirror all fields onto the target's legacy fields so the merge
+        // result is self-consistent regardless of which path serialize uses.
         target.provider = ms.provider;
         if (target.model) |*old| old.deinit(gpa);
         target.model = try ms.model.clone(gpa);
@@ -533,6 +524,55 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
         target.enable_thinking = ms.enable_thinking;
         if (ms.system_prompt) |s| try replaceOptionalSlice(gpa, &target.system_prompt, s);
         if (ms.bash_classifier_url) |s| try replaceOptionalSlice(gpa, &target.bash_classifier_url, s);
+    } else {
+        // Legacy fields: apply individual field overrides.
+        if (updates.provider) |v| target.provider = v;
+        if (updates.use_responses_endpoint) |v| target.use_responses_endpoint = v;
+        if (updates.enable_thinking) |v| target.enable_thinking = v;
+        if (updates.base_url) |s| try replaceOptionalSlice(gpa, &target.base_url, s);
+        if (updates.api_key) |s| try replaceOptionalSlice(gpa, &target.api_key, s);
+        if (updates.bash_classifier_url) |s| try replaceOptionalSlice(gpa, &target.bash_classifier_url, s);
+        if (updates.system_prompt) |s| try replaceOptionalSlice(gpa, &target.system_prompt, s);
+        if (updates.model) |m| {
+            if (target.model) |*old| old.deinit(gpa);
+            target.model = try m.clone(gpa);
+        }
+        // Keep model_selection in sync with legacy fields so serialize
+        // (which prefers model_selection) picks up the changes.
+        try syncModelSelectionFromLegacy(gpa, target);
+    }
+    for (updates.providers) |provider| try applyProviderOverlay(gpa, target, provider);
+    for (updates.mcp_servers) |mcp_server| try applyMcpServerOverlay(gpa, target, mcp_server);
+}
+
+/// After applying legacy-field updates, mirror the changes onto
+/// `target.model_selection` (if present) so `serialize` — which
+/// prefers `model_selection` — writes the correct values.
+fn syncModelSelectionFromLegacy(gpa: std.mem.Allocator, target: *Config) !void {
+    if (target.model_selection) |*ms| {
+        if (target.provider) |p| ms.provider = p;
+        if (target.model) |m| {
+            ms.model.deinit(gpa);
+            ms.model = try m.clone(gpa);
+        }
+        if (target.base_url) |s| {
+            gpa.free(ms.base_url);
+            ms.base_url = try gpa.dupe(u8, s);
+        }
+        if (target.api_key) |s| {
+            gpa.free(ms.api_key);
+            ms.api_key = try gpa.dupe(u8, s);
+        }
+        if (target.use_responses_endpoint) |v| ms.use_responses_endpoint = v;
+        if (target.enable_thinking) |v| ms.enable_thinking = v;
+        if (target.system_prompt) |s| {
+            if (ms.system_prompt) |old| gpa.free(old);
+            ms.system_prompt = try gpa.dupe(u8, s);
+        }
+        if (target.bash_classifier_url) |s| {
+            if (ms.bash_classifier_url) |old| gpa.free(old);
+            ms.bash_classifier_url = try gpa.dupe(u8, s);
+        }
     }
 }
 
@@ -614,6 +654,8 @@ fn hydrateActiveModel(gpa: std.mem.Allocator, config: *Config) !void {
         }
         for (entry.models) |model| {
             if (!std.mem.eql(u8, model.id, config.model.?.id)) continue;
+            // When adding fields to Model, also copy them here so they
+            // survive the merge → hydrate cycle.
             config.model.?.reasoning_effort = model.reasoning_effort;
             return;
         }
@@ -1747,4 +1789,108 @@ test "mergeLayers merges mcp_servers across config layers" {
     try std.testing.expectEqual(@as(usize, 2), merged.mcp_servers.len);
     try std.testing.expectEqualStrings("global-server", merged.mcp_servers[0].name);
     try std.testing.expectEqualStrings("proj-server", merged.mcp_servers[1].name);
+}
+
+test "applyConfigOverlay: model_selection present uses canonical form" {
+    const gpa = std.testing.allocator;
+    var target: Config = .{
+        .provider = .ollama,
+        .model = .{ .id = try gpa.dupe(u8, "llama3.1:8b") },
+    };
+    defer target.deinit(gpa);
+
+    // Updates carry model_selection (canonical) — legacy fields should be
+    // ignored in favour of model_selection.
+    var updates: Config = .{
+        .provider = .openai, // legacy — should be ignored
+        .model_selection = .{
+            .provider = .anthropic,
+            .model = .{ .id = try gpa.dupe(u8, "claude-3.7-sonnet") },
+            .base_url = try gpa.dupe(u8, "https://api.anthropic.com"),
+            .api_key = try gpa.dupe(u8, ""),
+        },
+    };
+    defer updates.deinit(gpa);
+
+    try applyConfigOverlay(gpa, &target, updates);
+
+    try std.testing.expectEqual(Provider.anthropic, target.provider.?);
+    try std.testing.expectEqualStrings("claude-3.7-sonnet", target.model.?.id);
+    try std.testing.expectEqualStrings("https://api.anthropic.com", target.base_url.?);
+}
+
+test "applyConfigOverlay: legacy fields sync to model_selection" {
+    const gpa = std.testing.allocator;
+
+    // Target starts with model_selection populated.
+    var target: Config = .{};
+    defer target.deinit(gpa);
+    target.provider = .openai;
+    target.model = .{ .id = try gpa.dupe(u8, "gpt-5.5") };
+    target.base_url = try gpa.dupe(u8, "https://api.openai.com");
+    target.api_key = try gpa.dupe(u8, "sk-test");
+    target.use_responses_endpoint = false;
+    target.enable_thinking = false;
+    // Manually populate model_selection (normally done by parseObject).
+    target.model_selection = .{
+        .provider = .openai,
+        .model = .{ .id = try gpa.dupe(u8, "gpt-5.5") },
+        .base_url = try gpa.dupe(u8, "https://api.openai.com"),
+        .api_key = try gpa.dupe(u8, "sk-test"),
+    };
+
+    // Updates carry only legacy fields (no model_selection).
+    var updates: Config = .{
+        .enable_thinking = true,
+        .system_prompt = try gpa.dupe(u8, "You are a helpful assistant."),
+    };
+    defer updates.deinit(gpa);
+
+    try applyConfigOverlay(gpa, &target, updates);
+
+    // Legacy fields updated.
+    try std.testing.expectEqual(true, target.enable_thinking.?);
+    try std.testing.expectEqualStrings("You are a helpful assistant.", target.system_prompt.?);
+
+    // model_selection should also be in sync.
+    try std.testing.expectEqual(true, target.model_selection.?.enable_thinking);
+    try std.testing.expectEqualStrings("You are a helpful assistant.", target.model_selection.?.system_prompt.?);
+
+    // Provider/model should be unchanged.
+    try std.testing.expectEqual(Provider.openai, target.provider.?);
+    try std.testing.expectEqualStrings("gpt-5.5", target.model.?.id);
+}
+
+test "mergeLayers: settings-only overlay does not overwrite provider/model" {
+    const gpa = std.testing.allocator;
+
+    // Simulate a global config with provider/model set.
+    var global: Config = .{
+        .provider = .openai,
+        .model = .{ .id = try gpa.dupe(u8, "gpt-5.5") },
+    };
+    defer global.deinit(gpa);
+
+    // Simulate a project config with a different provider/model.
+    var project: Config = .{
+        .provider = .ollama,
+        .model = .{ .id = try gpa.dupe(u8, "llama3.1:8b") },
+    };
+    defer project.deinit(gpa);
+
+    // Simulate a settings-only update (no provider/model, just enable_thinking).
+    var settings: Config = .{
+        .enable_thinking = true,
+    };
+    defer settings.deinit(gpa);
+
+    // Merge: global → project → settings
+    var merged = try mergeLayers(gpa, &.{ global, project, settings });
+    defer merged.deinit(gpa);
+
+    // Provider/model should come from project (last layer that set them).
+    try std.testing.expectEqual(Provider.ollama, merged.provider.?);
+    try std.testing.expectEqualStrings("llama3.1:8b", merged.model.?.id);
+    // enable_thinking should come from settings.
+    try std.testing.expectEqual(true, merged.enable_thinking.?);
 }
