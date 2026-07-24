@@ -226,6 +226,7 @@ fn commitTextEdit(app: *App) !void {
 fn applyToCachedConfig(app: *App, state: *const State) !void {
     if (!app.cached_config_owned) return;
     if (app.cached_config.model_selection) |*ms| {
+        // Model selection exists: update it directly
         if (state.pending_enable_thinking) |v| ms.enable_thinking = v;
         if (state.pending_use_responses_endpoint) |v| ms.use_responses_endpoint = v;
         if (state.pending_system_prompt) |s| {
@@ -236,6 +237,20 @@ fn applyToCachedConfig(app: *App, state: *const State) !void {
             if (ms.bash_classifier_url) |old| app.gpa.free(old);
             ms.bash_classifier_url = if (s.len > 0) try app.gpa.dupe(u8, s) else null;
         }
+    } else {
+        // Legacy config: update legacy fields directly
+        if (state.pending_enable_thinking) |v| app.cached_config.enable_thinking = v;
+        if (state.pending_use_responses_endpoint) |v| app.cached_config.use_responses_endpoint = v;
+        if (state.pending_system_prompt) |s| {
+            if (app.cached_config.system_prompt) |old| app.gpa.free(old);
+            app.cached_config.system_prompt = try app.gpa.dupe(u8, s);
+        }
+        if (state.pending_bash_classifier_url) |s| {
+            if (app.cached_config.bash_classifier_url) |old| app.gpa.free(old);
+            app.cached_config.bash_classifier_url = if (s.len > 0) try app.gpa.dupe(u8, s) else null;
+        }
+        // Sync legacy field updates to model_selection for consistency
+        try config_mod.syncModelSelectionFromLegacy(app.gpa, &app.cached_config);
     }
 }
 

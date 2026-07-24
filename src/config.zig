@@ -548,7 +548,7 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
 /// After applying legacy-field updates, mirror the changes onto
 /// `target.model_selection` (if present) so `serialize` — which
 /// prefers `model_selection` — writes the correct values.
-fn syncModelSelectionFromLegacy(gpa: std.mem.Allocator, target: *Config) !void {
+pub fn syncModelSelectionFromLegacy(gpa: std.mem.Allocator, target: *Config) !void {
     if (target.model_selection) |*ms| {
         if (target.provider) |p| ms.provider = p;
         if (target.model) |m| {
