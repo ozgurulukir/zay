@@ -222,7 +222,7 @@ fn refreshAccessToken(gpa: std.mem.Allocator, io: std.Io, refresh_token: []const
 fn tokenRequest(gpa: std.mem.Allocator, io: std.Io, body: []const u8) !Credentials {
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
-    logger.log("codex.token.request POST {s} body={s}", .{ token_url, body });
+    logger.log("codex.token.request POST {s}", .{token_url}); // body omitted (contains sensitive tokens)
     var req = try client.request(.POST, try std.Uri.parse(token_url), .{ .headers = .{ .content_type = .{ .override = "application/x-www-form-urlencoded" } } });
     defer req.deinit();
     req.transfer_encoding = .{ .content_length = body.len };
@@ -236,7 +236,7 @@ fn tokenRequest(gpa: std.mem.Allocator, io: std.Io, body: []const u8) !Credentia
     const status: u16 = @intFromEnum(response.head.status);
     const bytes = try readResponseBody(gpa, &response);
     defer gpa.free(bytes);
-    logger.log("codex.token.response status={d} body={s}", .{ status, logBytes(bytes) });
+    logger.log("codex.token.response status={d}", .{status}); // body omitted (contains access tokens)
     if (status < 200 or status >= 300) return error.TokenRequestFailed;
     return try parseTokenResponse(gpa, io, bytes);
 }
