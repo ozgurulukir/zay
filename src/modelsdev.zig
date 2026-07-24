@@ -9,8 +9,8 @@
 //! Builtin providers always take precedence: when a models.dev provider
 //! shares an id with a builtin, the builtin wins (its base_url, adapter,
 //! and metadata are authoritative). The models.dev registry fills in
-//! every other OpenAI-compatible provider (npm == `@ai-sdk/openai-compatible`
-//! with an `api` field).
+//! every other OpenAI-compatible provider (npm is `@ai-sdk/openai-compatible`
+//! or `@ai-sdk/openai`, with an `api` field).
 //!
 //! Callers get a flat `[]Provider` slice. The first entry is always the
 //! OpenAI Codex OAuth provider (id == "openai").
@@ -454,6 +454,11 @@ fn cachePath(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
 
 // ── JSON parsing ──
 
+fn isOpenAiCompatibleNpm(npm: []const u8) bool {
+    return std.mem.eql(u8, npm, "@ai-sdk/openai-compatible") or
+        std.mem.eql(u8, npm, "@ai-sdk/openai");
+}
+
 fn parseModelsDevJson(gpa: std.mem.Allocator, bytes: []const u8) !Registry {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
     defer parsed.deinit();
@@ -471,7 +476,7 @@ fn parseModelsDevJson(gpa: std.mem.Allocator, bytes: []const u8) !Registry {
 
         const npm_field = kv.value_ptr.object.get("npm") orelse continue;
         if (npm_field != .string) continue;
-        if (!std.mem.eql(u8, npm_field.string, "@ai-sdk/openai-compatible")) continue;
+        if (!isOpenAiCompatibleNpm(npm_field.string)) continue;
 
         const api_field = kv.value_ptr.object.get("api") orelse continue;
         if (api_field != .string) continue;
@@ -531,6 +536,12 @@ test "parseModelsDevJson filters to openai-compatible providers" {
         \\    "name": "DeepSeek",
         \\    "models": { "deepseek-chat": {} }
         \\  },
+        \\  "meta": {
+        \\    "npm": "@ai-sdk/openai",
+        \\    "api": "https://api.meta.ai/v1",
+        \\    "name": "Meta",
+        \\    "models": { "llama-3-70b": {} }
+        \\  },
         \\  "google": {
         \\    "npm": "@ai-sdk/google",
         \\    "name": "Google",
@@ -547,10 +558,14 @@ test "parseModelsDevJson filters to openai-compatible providers" {
     var registry = try parseModelsDevJson(gpa, json);
     defer registry.deinit(gpa);
 
-    try std.testing.expectEqual(@as(usize, 1), registry.providers.len);
+    // deepseek (openai-compatible) + meta (openai) pass; google (google) and no-api fail.
+    try std.testing.expectEqual(@as(usize, 2), registry.providers.len);
     try std.testing.expectEqualStrings("deepseek", registry.providers[0].id);
     try std.testing.expectEqualStrings("DeepSeek", registry.providers[0].name);
     try std.testing.expectEqualStrings("https://api.deepseek.com", registry.providers[0].base_url);
+    try std.testing.expectEqualStrings("meta", registry.providers[1].id);
+    try std.testing.expectEqualStrings("Meta", registry.providers[1].name);
+    try std.testing.expectEqualStrings("https://api.meta.ai/v1", registry.providers[1].base_url);
 }
 
 test "buildRegistry merges builtins and remote, builtins win" {
