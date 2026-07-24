@@ -16,6 +16,33 @@ const Tab = settings_widget.Tab;
 const EditTarget = settings_widget.EditTarget;
 
 // ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+/// Check if pending values differ from current config values.
+fn hasActualChanges(state: *const State, config: *const config_mod.Config) bool {
+    if (state.pending_enable_thinking) |v| {
+        const current_value = if (config.model_selection) |ms| ms.enable_thinking else config.enable_thinking orelse false;
+        if (v != current_value) return true;
+    }
+    if (state.pending_use_responses_endpoint) |v| {
+        const current_value = if (config.model_selection) |ms| ms.use_responses_endpoint else config.use_responses_endpoint orelse false;
+        if (v != current_value) return true;
+    }
+    if (state.pending_system_prompt) |s| {
+        const current_value = if (config.model_selection) |ms| ms.system_prompt else config.system_prompt;
+        const current_prompt = current_value orelse "";
+        if (!std.mem.eql(u8, s, current_prompt)) return true;
+    }
+    if (state.pending_bash_classifier_url) |s| {
+        const current_value = if (config.model_selection) |ms| ms.bash_classifier_url else config.bash_classifier_url;
+        const current_url = current_value orelse "";
+        if (!std.mem.eql(u8, s, current_url)) return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // Open / close
 // ---------------------------------------------------------------------------
 
@@ -51,16 +78,22 @@ fn submitGeneralItem(app: *App, state: *State) !void {
         0 => {
             // Toggle enable_thinking. Pending value overrides the config.
             const current = state.pending_enable_thinking orelse
-                (if (app.cached_config.model_selection) |ms| ms.enable_thinking else false);
-            state.pending_enable_thinking = !current;
-            state.dirty = true;
+                (if (app.cached_config.model_selection) |ms| ms.enable_thinking else app.cached_config.enable_thinking orelse false);
+            const new_value = !current;
+            state.pending_enable_thinking = new_value;
+            // Only mark dirty if the new value differs from the config
+            const config_value = if (app.cached_config.model_selection) |ms| ms.enable_thinking else app.cached_config.enable_thinking orelse false;
+            state.dirty = (new_value != config_value);
         },
         1 => {
             // Toggle use_responses_endpoint.
             const current = state.pending_use_responses_endpoint orelse
-                (if (app.cached_config.model_selection) |ms| ms.use_responses_endpoint else false);
-            state.pending_use_responses_endpoint = !current;
-            state.dirty = true;
+                (if (app.cached_config.model_selection) |ms| ms.use_responses_endpoint else app.cached_config.use_responses_endpoint orelse false);
+            const new_value = !current;
+            state.pending_use_responses_endpoint = new_value;
+            // Only mark dirty if the new value differs from the config
+            const config_value = if (app.cached_config.model_selection) |ms| ms.use_responses_endpoint else app.cached_config.use_responses_endpoint orelse false;
+            state.dirty = (new_value != config_value);
         },
         else => {},
     }
@@ -145,6 +178,17 @@ pub fn saveSettings(app: *App) !bool {
 
     // Flush any in-progress text edit before saving.
     if (state.edit_target != .none) try commitTextEdit(app);
+
+    // Check if there are actual changes vs just toggling back.
+    if (!hasActualChanges(state, &app.cached_config)) {
+        // No real changes, just reset pending state.
+        state.dirty = false;
+        state.pending_enable_thinking = null;
+        state.pending_use_responses_endpoint = null;
+        state.pending_system_prompt = null;
+        state.pending_bash_classifier_url = null;
+        return false;
+    }
 
     // Build updates with only the fields the settings panel manages.
     // Do NOT clone model_selection from cached_config — that would
