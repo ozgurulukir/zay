@@ -404,12 +404,16 @@ fn lookupBuiltin(builtins: []const Provider, id: []const u8) ?Provider {
 
 // ── HTTP fetch ──
 
+const fetch_user_agent = "nova-agent/1.0 (models.dev registry fetcher)";
+
 fn fetchApiJson(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
     const uri = try std.Uri.parse(api_url);
-    var request = try client.request(.GET, uri, .{});
+    var request = try client.request(.GET, uri, .{
+        .headers = .{ .user_agent = .{ .override = fetch_user_agent } },
+    });
     defer request.deinit();
     try request.sendBodiless();
 
