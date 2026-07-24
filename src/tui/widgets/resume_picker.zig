@@ -360,9 +360,9 @@ fn resumeLeftWidth(ctx: vxfw.DrawContext, row_width: u16, modified: []const u8) 
 
 test "session tree counts project rows and folds children" {
     var summaries = [_]session_mod.SessionSummary{
-        .{ .id = @constCast("1"), .title = @constCast("one"), .cwd = @constCast("/repo/a"), .created_at_ms = 0, .updated_at_ms = 2, .leaf_entry_id = null },
-        .{ .id = @constCast("2"), .title = @constCast("two"), .cwd = @constCast("/repo/a"), .created_at_ms = 0, .updated_at_ms = 1, .leaf_entry_id = null },
-        .{ .id = @constCast("3"), .title = @constCast("three"), .cwd = @constCast("/repo/b"), .created_at_ms = 0, .updated_at_ms = 3, .leaf_entry_id = null },
+        .{ .id = @constCast("1"), .title = @constCast("one"), .cwd = @constCast("/repo/a"), .created_at_ms = 0, .updated_at_ms = 2, .leaf_entry_id = null, .model_provider = null, .model_id = null },
+        .{ .id = @constCast("2"), .title = @constCast("two"), .cwd = @constCast("/repo/a"), .created_at_ms = 0, .updated_at_ms = 1, .leaf_entry_id = null, .model_provider = null, .model_id = null },
+        .{ .id = @constCast("3"), .title = @constCast("three"), .cwd = @constCast("/repo/b"), .created_at_ms = 0, .updated_at_ms = 3, .leaf_entry_id = null, .model_provider = null, .model_id = null },
     };
 
     try std.testing.expectEqual(@as(u32, 3), visibleCount(&summaries, "", &.{}, false));

@@ -92,6 +92,8 @@ pub const EntryQueue = bounded_queue.BoundedQueue(QueuedEntry);
 pub const CreateOptions = struct {
     id: ?[]const u8 = null,
     title: ?[]const u8 = null,
+    model_provider: ?[]const u8 = null,
+    model_id: ?[]const u8 = null,
 };
 
 pub const SessionSummary = struct {
@@ -105,11 +107,17 @@ pub const SessionSummary = struct {
     /// type system enforces the length invariant the DB layer relies
     /// on. null when the branch has no entries yet.
     leaf_entry_id: ?EntryId,
+    /// Model provider and ID used in this session. null for sessions
+    /// created before schema v4 or when model info is not available.
+    model_provider: ?[]u8,
+    model_id: ?[]u8,
 
     pub fn deinit(self: *SessionSummary, gpa: std.mem.Allocator) void {
         gpa.free(self.id);
         if (self.title) |title| gpa.free(title);
         gpa.free(self.cwd);
+        if (self.model_provider) |mp| gpa.free(mp);
+        if (self.model_id) |mid| gpa.free(mid);
         self.* = undefined;
     }
 };

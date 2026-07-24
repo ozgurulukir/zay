@@ -181,7 +181,48 @@ pub const AgentRuntime = struct {
             for (messages) |message| try target.agent.takeMessage(message);
         }
 
-        try target.applyFromConfig(config);
+        // When resuming a session, try to restore the model used in that session
+        if (session_id) |id| {
+            _ = id;
+            var summary = try target.session_writer.session.summary(gpa);
+            defer summary.deinit(gpa);
+            if (summary.model_provider) |mp| {
+                // Session has model info - create a config with that model
+                const provider_enum = std.meta.stringToEnum(config_mod.Provider, mp) orelse {
+                    std.log.warn("session.resume.unknown_provider: {s}, using config default", .{mp});
+                    try target.applyFromConfig(config);
+                    return;
+                };
+                var session_config = config;
+                if (session_config.model_selection) |*ms| {
+                    ms.provider = provider_enum;
+                    if (summary.model_id) |mid| {
+                        ms.model.id = mid;
+                    }
+                    try target.applyFromConfig(session_config);
+                } else {
+                    // No model_selection in config, create one from session
+                    session_config.model_selection = .{
+                        .provider = provider_enum,
+                        .model = .{
+                            .id = summary.model_id orelse "",
+                            .reasoning_effort = null,
+                        },
+                        .base_url = "",
+                        .api_key = "",
+                        .use_responses_endpoint = false,
+                        .bash_classifier_url = null,
+                    };
+                    try target.applyFromConfig(session_config);
+                }
+            } else {
+                // No model saved in session, use config as-is
+                try target.applyFromConfig(config);
+            }
+        } else {
+            // New session - will save model info after applyFromConfig
+            try target.applyFromConfig(config);
+        }
     }
 
     /// Rehydrate the agent's conversation from the session's current leaf.
@@ -243,6 +284,9 @@ pub const AgentRuntime = struct {
             .openai_compatible => try self.tryAttachOpenAiCompatibleFromConfig(selection.provider, config),
             .openai_responses => try self.tryAttachOpenAiResponsesFromConfig(selection.provider, config),
         }
+        // Save the model selection to the session so it can be restored on resume
+        const provider_str = @tagName(selection.provider);
+        try self.session_writer.session.updateModel(provider_str, selection.model.id);
     }
 
     fn adapterForConfig(provider: config_mod.Provider, config: config_mod.Config) ?config_mod.AdapterKind {

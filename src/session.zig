@@ -72,7 +72,7 @@ pub const SessionManager = struct {
         };
 
         const timestamp_ms = nowMs(self.io);
-        var statement = try self.connection.prepare("insert into sessions(id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id) values (?, ?, ?, ?, ?, null)");
+        var statement = try self.connection.prepare("insert into sessions(id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id) values (?, ?, ?, ?, ?, null, ?, ?)");
         defer statement.finalize();
         try statement.bindText(1, session_id);
         if (options.title) |title| {
@@ -83,6 +83,16 @@ pub const SessionManager = struct {
         try statement.bindText(3, cwd);
         try statement.bindInt(4, timestamp_ms);
         try statement.bindInt(5, timestamp_ms);
+        if (options.model_provider) |mp| {
+            try statement.bindText(6, mp);
+        } else {
+            try statement.bindNull(6);
+        }
+        if (options.model_id) |mid| {
+            try statement.bindText(7, mid);
+        } else {
+            try statement.bindNull(7);
+        }
         try expectDone(&statement);
 
         const session = Session{
@@ -183,11 +193,11 @@ pub const Session = struct {
         try expectDone(&statement);
     }
 
-    pub fn branch(self: *Session, entry_id: []const u8, summary: ?[]const u8, id_out: ?*[entry_id_len]u8) Error!void {
+    pub fn branch(self: *Session, entry_id: []const u8, branch_summary: ?[]const u8, id_out: ?*[entry_id_len]u8) Error!void {
         assert(entry_id.len > 0);
         if (entry_id.len != entry_id_len) return error.BadEntryId;
         try self.requireEntry(entry_id);
-        if (summary) |text| {
+        if (branch_summary) |text| {
             const out = id_out orelse return error.BadEntryId;
             fillHex(self.manager.io, out);
             const payload = try branchSummaryToJson(self.manager.gpa, entry_id, text);
@@ -207,12 +217,12 @@ pub const Session = struct {
     /// that `first_kept_id` exists in this session before writing — the
     /// write-time half of the branch-safety guarantee whose read-time half is
     /// `findCompactionBoundary`.
-    pub fn appendCompaction(self: *Session, first_kept_id: []const u8, summary: []const u8, id_out: *[entry_id_len]u8) Error!void {
+    pub fn appendCompaction(self: *Session, first_kept_id: []const u8, compaction_summary: []const u8, id_out: *[entry_id_len]u8) Error!void {
         assert(first_kept_id.len == entry_id_len);
-        assert(summary.len > 0);
+        assert(compaction_summary.len > 0);
         try self.requireEntry(first_kept_id);
         fillHex(self.manager.io, id_out);
-        const payload = try compactionToJson(self.manager.gpa, first_kept_id, summary);
+        const payload = try compactionToJson(self.manager.gpa, first_kept_id, compaction_summary);
         defer self.manager.gpa.free(payload);
         try self.insertEntry(id_out, "compaction", null, payload);
     }
@@ -266,6 +276,28 @@ pub const Session = struct {
             try prompts.append(gpa, try gpa.dupe(u8, row.text(0)));
         }
         return prompts.toOwnedSlice(gpa);
+    }
+
+    /// Update the model provider and ID for this session.
+    pub fn updateModel(self: *Session, provider: []const u8, model_id: []const u8) Error!void {
+        assert(self.id.slice().len > 0);
+        var statement = try self.manager.connection.prepare("update sessions set model_provider = ?, model_id = ?, updated_at_ms = ? where id = ?");
+        defer statement.finalize();
+        try statement.bindText(1, provider);
+        try statement.bindText(2, model_id);
+        const timestamp_ms = nowMs(self.manager.io);
+        try statement.bindInt(3, timestamp_ms);
+        try statement.bindText(4, self.id.slice());
+        try expectDone(&statement);
+    }
+
+    /// Load the summary for this session. Caller owns the memory.
+    pub fn summary(self: *Session, gpa: std.mem.Allocator) Error!SessionSummary {
+        var statement = try self.manager.connection.prepare("select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id from sessions where id = ?");
+        defer statement.finalize();
+        try statement.bindText(1, self.id.slice());
+        const row = (try statement.step()) orelse return error.MissingSession;
+        return try readSummary(gpa, &row);
     }
 
     /// The git commit id of the nearest entry at or above the current leaf that
@@ -665,6 +697,14 @@ pub const SessionWriter = struct {
         self.quiesce();
         defer self.restart() catch {};
         try self.session.branch(entry_id, null, null);
+    }
+
+    /// Update the model provider and ID for the current session.
+    /// Called when the model selection changes during a session.
+    pub fn updateModel(self: *SessionWriter, provider: []const u8, model_id: []const u8) Error!void {
+        self.quiesce();
+        defer self.restart() catch {};
+        try self.session.updateModel(provider, model_id);
     }
 
     pub fn leaf(self: *const SessionWriter) ?[]const u8 {
@@ -1172,6 +1212,8 @@ fn readSummary(gpa: std.mem.Allocator, row: *const db.Row) Error!SessionSummary 
             @memcpy(leaf_buffer[0..], value);
             break :blk EntryId{ .bytes = leaf_buffer };
         },
+        .model_provider = if (row.columnType(6) == .null) null else try gpa.dupe(u8, row.text(6)),
+        .model_id = if (row.columnType(7) == .null) null else try gpa.dupe(u8, row.text(7)),
     };
 }
 
