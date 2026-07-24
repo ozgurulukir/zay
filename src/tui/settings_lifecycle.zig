@@ -47,6 +47,7 @@ fn hasActualChanges(state: *const State, config: *const config_mod.Config) bool 
 // ---------------------------------------------------------------------------
 
 const MAX_SYSTEM_PROMPT_LENGTH = 10000;
+const MAX_SYSTEM_PROMPT_LENGTH_STR = "10000";
 
 /// Validate bash classifier URL format.
 fn validateBashClassifierUrl(url: []const u8) !void {
@@ -211,6 +212,7 @@ pub fn saveSettings(app: *App) !bool {
         state.pending_use_responses_endpoint = null;
         state.pending_system_prompt = null;
         state.pending_bash_classifier_url = null;
+        _ = try app.thread.transcript.append(app.gpa, .info, "Settings", "No changes to save");
         return false;
     }
 
@@ -218,12 +220,21 @@ pub fn saveSettings(app: *App) !bool {
     if (state.pending_bash_classifier_url) |url| {
         validateBashClassifierUrl(url) catch |err| {
             std.log.warn("settings.validation.url_failed err={s}", .{@errorName(err)});
+            const msg = switch (err) {
+                error.InvalidUrl => "URL must start with http:// or https://",
+                error.UrlTooLong => "URL is too long (max 2048 characters)",
+            };
+            _ = try app.thread.transcript.append(app.gpa, .notice, "Settings", msg);
             return false;
         };
     }
     if (state.pending_system_prompt) |prompt| {
         validateSystemPrompt(prompt) catch |err| {
             std.log.warn("settings.validation.prompt_failed err={s}", .{@errorName(err)});
+            const msg = switch (err) {
+                error.PromptTooLong => "System prompt is too long (max " ++ MAX_SYSTEM_PROMPT_LENGTH_STR ++ " characters)",
+            };
+            _ = try app.thread.transcript.append(app.gpa, .notice, "Settings", msg);
             return false;
         };
     }
@@ -254,6 +265,9 @@ pub fn saveSettings(app: *App) !bool {
     // apply globally across all projects.
     config_mod.mergeAndWriteGlobal(app.gpa, app.io, runtime.home_dir, updates) catch |err| {
         std.log.warn("settings.save.failed err={s}", .{@errorName(err)});
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "Failed to save settings: {s}", .{@errorName(err)}) catch "Failed to save settings";
+        _ = try app.thread.transcript.append(app.gpa, .notice, "Settings", msg);
         return false;
     };
 
@@ -271,6 +285,9 @@ pub fn saveSettings(app: *App) !bool {
     state.pending_system_prompt = null;
     state.pending_bash_classifier_url = null;
     state.edit_target = .none;
+
+    // Show success feedback to user.
+    _ = try app.thread.transcript.append(app.gpa, .success, "Settings", "Settings saved successfully");
 
     return true;
 }
