@@ -14,7 +14,13 @@ const assert = std.debug.assert;
 
 pub const Status = enum { unknown, connected, failed };
 
-pub const Stage = enum { list, form };
+pub const Stage = union(enum) {
+    list: void,
+    form: struct {
+        handle: ?ProviderHandle = null,
+        error_msg: ?[]const u8 = null,
+    },
+};
 pub const Column = enum { provider, sign_out };
 
 pub const Action = union(enum) {
@@ -58,11 +64,9 @@ pub const ProviderHandle = union(enum) {
 };
 
 pub const State = struct {
-    stage: Stage = .list,
+    stage: Stage = .{ .list = {} },
     selection: u32 = 0,
     column: Column = .provider,
-    form_handle: ?ProviderHandle = null,
-    form_error: ?[]const u8 = null,
     /// Dynamic models.dev providers shown below the builtin catalogue.
     dynamics: []const modelsdev.Provider = &.{},
 

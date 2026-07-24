@@ -45,8 +45,8 @@ pub fn cancelMode(app: *App) !bool {
     if (app.mode == .normal) return false;
     // Esc inside the provider setup form returns to the provider list.
     if (app.mode == .provider_picker and app.pickers.provider.stage == .form) {
-        app.pickers.provider.stage = .list;
-        app.pickers.provider.form_handle = null;
+        app.pickers.provider.stage = .{ .list = {} };
+
         app.provider_key_input.clearRetainingCapacity();
         return true;
     }
@@ -84,64 +84,16 @@ pub fn submitMode(app: *App) !bool {
         try tui.submitSettings(app);
         return true;
     }
-    if (app.mode == .provider_picker) {
-        if (app.pickers.provider.stage == .form) {
-            if (app.pickers.provider.form_handle) |handle| {
-                switch (handle) {
-                    .builtin => |provider| provider_model.submitProviderSetup(app, provider) catch |err| try app.reportConnectionError(err),
-                    .dynamic => |provider| provider_model.submitDynamicProviderSetup(app, provider) catch |err| try app.reportConnectionError(err),
-                }
-                return true;
-            }
-            return true;
-        }
-        switch (app.pickers.provider.selectedAction()) {
-            .connect_codex => provider_model.connectCodex(app) catch |err| try app.reportConnectionError(err),
-            .sign_out_codex => {
-                if (app.isCodexSignedIn()) {
-                    provider_model.signOutCodex(app) catch |err| try app.reportConnectionError(err);
-                } else {
-                    provider_model.connectCodex(app) catch |err| try app.reportConnectionError(err);
-                }
-            },
-            .open_form => |provider| provider_model.openProviderForm(app, provider),
-            .open_dynamic => |provider| provider_model.openDynamicProviderForm(app, provider),
-        }
-        return true;
-    }
-    if (app.mode == .model_picker) {
-        provider_model.applySelectedModel(app) catch |err| try app.reportConnectionError(err);
-        return true;
-    }
-    if (app.mode == .session_picker) {
-        const summary = try app.selectedResumeSummary() orelse return true;
-        app.switchToSession(summary.id) catch |err| {
-            try app.reportSessionSwitchError(err);
-            return true;
-        };
-        return true;
-    }
-    if (app.mode == .tree_picker) {
-        if (app.pickers.tree.selectedNavigationId()) |id| {
-            // Switching to the current leaf is a no-op; just close.
-            if (!app.pickers.tree.selectedIsLeaf()) {
-                var buffer: [session_mod.entry_id_len]u8 = undefined;
-                @memcpy(buffer[0..], id);
-                app.navigateToEntry(buffer[0..]) catch |err| {
-                    try app.reportSessionSwitchError(err);
-                    return true;
-                };
-            }
-        }
-        app.mode = .normal;
-        app.clearInput();
-        app.clearPaletteInput();
-        return true;
-    }
+    if (app.mode == .provider_picker) return try command_router.ProviderPicker.submit(app);
+    if (app.mode == .model_picker) return try command_router.ModelPicker.submit(app);
+    if (app.mode == .session_picker) return try command_router.SessionPicker.submit(app);
+    if (app.mode == .tree_picker) return try command_router.TreePicker.submit(app);
+
     if (app.mode == .save_message) {
         const raw = try app.peekPaletteInput();
         defer app.gpa.free(raw);
-        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        const trimmed = std.mem.trim(u8, raw, "
+");
         // Require a non-empty message — Enter on a blank prompt is a no-op so
         // the user can't accidentally save with no commit message.
         if (trimmed.len == 0) return true;
@@ -227,12 +179,18 @@ pub fn submitMode(app: *App) !bool {
                     const sid: []const u8 = if (app.thread.id) |id| id.slice()[0..@min(8, id.bytes.len)] else "none";
                     const status_text = try std.fmt.bufPrint(
                         &status_buf,
-                        "System Status:\n" ++
-                            "  • Provider: {s}\n" ++
-                            "  • Model: {s}\n" ++
-                            "  • Git Branch: {s}\n" ++
-                            "  • Active Lane: {d}/{d}\n" ++
-                            "  • Background Tasks: {d} running\n" ++
+                        "System Status:
+" ++
+                            "  • Provider: {s}
+" ++
+                            "  • Model: {s}
+" ++
+                            "  • Git Branch: {s}
+" ++
+                            "  • Active Lane: {d}/{d}
+" ++
+                            "  • Background Tasks: {d} running
+" ++
                             "  • Session ID: {s}",
                         .{ provider_name, model_name, git_branch, active_lane, total_lanes, bg_count, sid[0..@min(8, sid.len)] },
                     );

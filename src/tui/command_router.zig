@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const vaxis = @import("vaxis");
+const session_mod = @import("../session.zig");
 const tui = @import("../tui.zig");
 
 const App = tui.App;
@@ -63,6 +64,24 @@ pub fn handleCommandKey(app: *App, key: vaxis.Key) !bool {
 /// the fold state of the currently selected node. Every other key falls
 /// through to the input.
 const TreePicker = struct {
+    pub fn submit(app: *App) !bool {
+        if (app.pickers.tree.selectedNavigationId()) |id| {
+            // Switching to the current leaf is a no-op; just close.
+            if (!app.pickers.tree.selectedIsLeaf()) {
+                var buffer: [session_mod.entry_id_len]u8 = undefined;
+                @memcpy(buffer[0..], id);
+                app.navigateToEntry(buffer[0..]) catch |err| {
+                    try app.reportSessionSwitchError(err);
+                    return true;
+                };
+            }
+        }
+        app.mode = .normal;
+        app.clearInput();
+        app.clearPaletteInput();
+        return true;
+    }
+
     pub fn handle(app: *App, key: vaxis.Key) !bool {
         if (key.matches(vaxis.Key.up, .{})) {
             app.getTreeState().moveUp();
@@ -107,6 +126,32 @@ pub fn isEnterKey(key: vaxis.Key) bool {
 }
 
 const ProviderPicker = struct {
+    pub fn submit(app: *App) !bool {
+        if (app.pickers.provider.stage == .form) {
+            if (app.pickers.provider.stage.form.handle) |handle| {
+                switch (handle) {
+                    .builtin => |provider| provider_model.submitProviderSetup(app, provider) catch |err| try app.reportConnectionError(err),
+                    .dynamic => |provider| provider_model.submitDynamicProviderSetup(app, provider) catch |err| try app.reportConnectionError(err),
+                }
+                return true;
+            }
+            return true;
+        }
+        switch (app.pickers.provider.selectedAction()) {
+            .connect_codex => provider_model.connectCodex(app) catch |err| try app.reportConnectionError(err),
+            .sign_out_codex => {
+                if (app.isCodexSignedIn()) {
+                    provider_model.signOutCodex(app) catch |err| try app.reportConnectionError(err);
+                } else {
+                    provider_model.connectCodex(app) catch |err| try app.reportConnectionError(err);
+                }
+            },
+            .open_form => |provider| provider_model.openProviderForm(app, provider),
+            .open_dynamic => |provider| provider_model.openDynamicProviderForm(app, provider),
+        }
+        return true;
+    }
+
     pub fn handle(app: *App, key: vaxis.Key) !bool {
         if (app.getProviderPicker().stage == .form) {
             app.getProviderPicker().form_error = null;
@@ -141,6 +186,11 @@ const ProviderPicker = struct {
 /// value (column -> reasoning -> scope -> column); up/down step the
 /// selection through filtered entries.
 const ModelPicker = struct {
+    pub fn submit(app: *App) !bool {
+        provider_model.applySelectedModel(app) catch |err| try app.reportConnectionError(err);
+        return true;
+    }
+
     pub fn handle(app: *App, key: vaxis.Key) !bool {
         const models = app.getModels();
         if (key.matches(vaxis.Key.left, .{})) {
@@ -177,6 +227,15 @@ const ModelPicker = struct {
 /// disk); tab toggles fold of the selected project when in global mode;
 /// up/down step the selection through the visible (filtered) entries.
 const SessionPicker = struct {
+    pub fn submit(app: *App) !bool {
+        const summary = try app.selectedResumeSummary() orelse return true;
+        app.switchToSession(summary.id) catch |err| {
+            try app.reportSessionSwitchError(err);
+            return true;
+        };
+        return true;
+    }
+
     pub fn handle(app: *App, key: vaxis.Key) !bool {
         if (key.matches('a', .{ .ctrl = true })) {
             app.toggleResumeGlobal();
@@ -494,7 +553,7 @@ test "provider picker setup form captures key codepoints and text without swallo
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    app.pickers.provider.stage = .form;
+    app.pickers.provider.stage = .{ .form = .{} };
 
     try std.testing.expect(try ProviderPicker.handle(&app, .{ .codepoint = 's' }));
     try std.testing.expectEqualStrings("s", app.provider_key_input.items);
@@ -516,12 +575,12 @@ test "provider picker setup form submit with empty key sets form_error" {
     defer app.deinit();
 
     app.mode = .provider_picker;
-    app.pickers.provider.stage = .form;
-    app.pickers.provider.form_handle = .{ .builtin = .openrouter };
+    app.pickers.provider.stage = .{ .form = .{} };
+    app.pickers.provider.stage.form.handle = .{ .builtin = .openrouter };
 
     provider_model.submitProviderSetup(&app, .openrouter) catch {};
-    try std.testing.expect(app.pickers.provider.form_error != null);
+    try std.testing.expect(app.pickers.provider.stage.form.error_msg != null);
 
     _ = try ProviderPicker.handle(&app, .{ .codepoint = 'a' });
-    try std.testing.expect(app.pickers.provider.form_error == null);
+    try std.testing.expect(app.pickers.provider.stage.form.error_msg == null);
 }

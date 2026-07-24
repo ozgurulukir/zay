@@ -445,6 +445,10 @@ const ChangeBlock = struct {
 };
 
 fn parse(state: *State, gpa: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
     var current_file: i64 = -1;
     var new_no: u32 = 0;
     var old_no: u32 = 0;
