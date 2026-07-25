@@ -116,51 +116,7 @@ fn routeKey(
         }
     }
     if (key.matches(vaxis.Key.escape, .{})) {
-        if (app.getBackgroundModal()) {
-            app.setBackgroundModal(false);
-            ctx.consumeAndRedraw();
-            return;
-        }
-        if (app.permissionPending()) {
-            try app.resolvePermission(.reject);
-            ctx.consumeAndRedraw();
-            return;
-        }
-        if (app.isAtSearchActive()) {
-            app.closeAtSearch();
-            ctx.consumeAndRedraw();
-            return;
-        }
-        if (try app.cancelMode()) {
-            try root.syncFocus(ctx);
-            ctx.consumeAndRedraw();
-            return;
-        }
-        if (app.getBlockNav() or app.thread.transcript.selected != null) {
-            app.setBlockNav(false);
-            app.thread.transcript.selected = null;
-            app.setThreadAutoScroll(true);
-            try root.syncFocus(ctx);
-            ctx.consumeAndRedraw();
-            return;
-        }
-        if (app.inputRealLength() > 0) {
-            app.clearInput();
-            app.closeAtSearch();
-            app.clearPendingQuitAt();
-            try root.syncFocus(ctx);
-            ctx.consumeAndRedraw();
-            return;
-        }
-        if (app.turnStateIsActive()) {
-            try app.handleInterrupt();
-            ctx.consumeAndRedraw();
-            return;
-        }
-        // No in-flight turn and no overlay to close — swallow the key so
-        // the user doesn't accidentally exit the TUI.
-        app.clearPendingQuitAt();
-        ctx.consume_event = true;
+        try handleEscapeSequence(app, root, ctx);
         return;
     }
     if (key.matches('o', .{ .ctrl = true })) {
@@ -186,31 +142,7 @@ fn routeKey(
         ctx.consume_event = true;
         return;
     }
-    const is_ctrl_c = key.matches('c', .{ .ctrl = true });
-    const is_ctrl_d_empty = key.matches('d', .{ .ctrl = true }) and app.isNormalMode() and app.inputRealLength() == 0;
-    if (is_ctrl_c or is_ctrl_d_empty) {
-        if (is_ctrl_c and app.isNormalMode() and app.inputRealLength() > 0) {
-            app.clearInput();
-            app.closeAtSearch();
-            app.setBlockNav(false);
-            app.clearPendingQuitAt();
-            ctx.consumeAndRedraw();
-            return;
-        }
-        const now = std.Io.Timestamp.now(app.getIo(), .awake);
-        if (app.getPendingQuitAt()) |first_press| {
-            const elapsed_ns = first_press.durationTo(now).nanoseconds;
-            const threshold_ns: i128 = @as(i128, App.ctrl_c_double_press_ms) * std.time.ns_per_ms;
-            if (elapsed_ns >= 0 and elapsed_ns <= threshold_ns) {
-                ctx.quit = true;
-                ctx.consume_event = true;
-                return;
-            }
-        }
-        app.setPendingQuitAt(now);
-        ctx.consumeAndRedraw();
-        return;
-    }
+    if (try handleQuitSequence(app, ctx, key)) return;
     // Any other key cancels the pending-quit prompt.
     app.clearPendingQuitAt();
     if (app.permissionPending()) {
@@ -295,4 +227,92 @@ fn routeKey(
     if (try app.handleCommandKey(key)) {
         ctx.consumeAndRedraw();
     }
+}
+
+/// Handle Escape key: close modals, overlays, cancel modes, clear input,
+/// or interrupt active turn. Returns after consuming the key.
+fn handleEscapeSequence(
+    app: *App,
+    root: *RootWidget,
+    ctx: *vxfw.EventContext,
+) !void {
+    if (app.getBackgroundModal()) {
+        app.setBackgroundModal(false);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (app.permissionPending()) {
+        try app.resolvePermission(.reject);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (app.isAtSearchActive()) {
+        app.closeAtSearch();
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (try app.cancelMode()) {
+        try root.syncFocus(ctx);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (app.getBlockNav() or app.thread.transcript.selected != null) {
+        app.setBlockNav(false);
+        app.thread.transcript.selected = null;
+        app.setThreadAutoScroll(true);
+        try root.syncFocus(ctx);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (app.inputRealLength() > 0) {
+        app.clearInput();
+        app.closeAtSearch();
+        app.clearPendingQuitAt();
+        try root.syncFocus(ctx);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (app.turnStateIsActive()) {
+        try app.handleInterrupt();
+        ctx.consumeAndRedraw();
+        return;
+    }
+    // No in-flight turn and no overlay to close — swallow the key so
+    // the user doesn't accidentally exit the TUI.
+    app.clearPendingQuitAt();
+    ctx.consume_event = true;
+}
+
+/// Handle Ctrl+C / Ctrl+D quit sequence. Returns true if the key was handled
+/// (either cleared input, armed quit, or confirmed quit).
+fn handleQuitSequence(
+    app: *App,
+    ctx: *vxfw.EventContext,
+    key: vaxis.Key,
+) !bool {
+    const is_ctrl_c = key.matches('c', .{ .ctrl = true });
+    const is_ctrl_d_empty = key.matches('d', .{ .ctrl = true }) and app.isNormalMode() and app.inputRealLength() == 0;
+    if (!is_ctrl_c and !is_ctrl_d_empty) return false;
+
+    if (is_ctrl_c and app.isNormalMode() and app.inputRealLength() > 0) {
+        app.clearInput();
+        app.closeAtSearch();
+        app.setBlockNav(false);
+        app.clearPendingQuitAt();
+        ctx.consumeAndRedraw();
+        return true;
+    }
+    const now = std.Io.Timestamp.now(app.getIo(), .awake);
+    if (app.getPendingQuitAt()) |first_press| {
+        const elapsed_ns = first_press.durationTo(now).nanoseconds;
+        const threshold_ns: i128 = @as(i128, App.ctrl_c_double_press_ms) * std.time.ns_per_ms;
+        if (elapsed_ns >= 0 and elapsed_ns <= threshold_ns) {
+            ctx.quit = true;
+            ctx.consume_event = true;
+            return true;
+        }
+    }
+    app.setPendingQuitAt(now);
+    ctx.consumeAndRedraw();
+    return true;
 }
