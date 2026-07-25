@@ -1,10 +1,25 @@
+//! OpenAI Codex OAuth flow and static model catalog.
+//!
+//! Generic provider API key storage lives in `auth.zig` — all providers
+//! (builtin, dynamic, config) use that module. This file only handles the
+//! OpenAI-specific OAuth PKCE flow and the hardcoded Codex model list.
+
 const std = @import("std");
 const logger = @import("logger");
 const os = @import("os.zig");
 const symbols = @import("symbols.zig");
-const keyring = @import("keyring.zig");
+const auth = @import("auth.zig");
 
-const keyring_service = "Nova";
+// Re-export so existing `codex.Credentials` / `codex.ApiKeyMap` callers
+// keep compiling during the migration window.
+pub const Credentials = auth.Credentials;
+pub const ApiKeyMap = auth.ApiKeyMap;
+pub const freeApiKeyMap = auth.freeApiKeyMap;
+pub const loadAllProviderApiKeys = auth.loadAllProviderApiKeys;
+pub const loadProviderApiKey = auth.loadProviderApiKey;
+pub const saveProviderApiKey = auth.saveProviderApiKey;
+pub const removeProviderApiKey = auth.removeProviderApiKey;
+pub const pruneOrphanKeys = auth.pruneOrphanKeys;
 
 const auth_port: u16 = 1455;
 const auth_host = "127.0.0.1";
@@ -14,6 +29,10 @@ const token_url = "https://auth.openai.com/oauth/token";
 const redirect_uri = "http://localhost:1455/auth/callback";
 const scope = "openid profile email offline_access";
 const jwt_claim_path = "https://api.openai.com/auth";
+
+// ---------------------------------------------------------------------------
+// Static Model Catalog
+// ---------------------------------------------------------------------------
 
 pub const Model = struct {
     id: []u8,
@@ -54,19 +73,9 @@ pub fn loadStaticModels(gpa: std.mem.Allocator) ![]Model {
     return out;
 }
 
-pub const Credentials = struct {
-    access: []u8,
-    refresh: []u8,
-    account_id: []u8,
-    expires: i64,
-
-    pub fn deinit(self: *Credentials, gpa: std.mem.Allocator) void {
-        gpa.free(self.access);
-        gpa.free(self.refresh);
-        gpa.free(self.account_id);
-        self.* = undefined;
-    }
-};
+// ---------------------------------------------------------------------------
+// OAuth Flow
+// ---------------------------------------------------------------------------
 
 const AuthorizationFlow = struct {
     verifier: []u8,
@@ -89,32 +98,28 @@ pub fn login(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !Credenti
     defer gpa.free(code);
     var credentials = try exchangeAuthorizationCode(gpa, io, code, flow.verifier);
     errdefer credentials.deinit(gpa);
-    try save(gpa, io, home_dir, credentials);
+    try auth.saveCredentials(gpa, io, home_dir, credentials);
     return credentials;
 }
 
 pub fn load(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !?Credentials {
-    const bytes = (try readBlob(gpa, io, home_dir)) orelse return null;
-    defer gpa.free(bytes);
-    return try parseAuthFile(gpa, bytes);
+    return auth.loadCredentials(gpa, io, home_dir);
 }
 
 pub fn refresh(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, refresh_token: []const u8) !Credentials {
     var credentials = try refreshAccessToken(gpa, io, refresh_token);
     errdefer credentials.deinit(gpa);
-    try save(gpa, io, home_dir, credentials);
+    try auth.saveCredentials(gpa, io, home_dir, credentials);
     return credentials;
 }
 
 pub fn signOut(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !void {
-    var keys = try loadAllProviderApiKeys(gpa, io, home_dir);
-    defer freeApiKeyMap(gpa, &keys);
-    if (apiKeysCount(&keys) > 0) {
-        try writeAuthFile(gpa, io, home_dir, null, &keys);
-        return;
-    }
-    try deleteBlob(gpa, io, home_dir);
+    try auth.removeCredentials(gpa, io, home_dir);
 }
+
+// ---------------------------------------------------------------------------
+// OAuth Internals
+// ---------------------------------------------------------------------------
 
 fn createAuthorizationFlow(gpa: std.mem.Allocator, io: std.Io) !AuthorizationFlow {
     var random: [32]u8 = undefined;
@@ -222,7 +227,7 @@ fn refreshAccessToken(gpa: std.mem.Allocator, io: std.Io, refresh_token: []const
 fn tokenRequest(gpa: std.mem.Allocator, io: std.Io, body: []const u8) !Credentials {
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
-    logger.log("codex.token.request POST {s}", .{token_url}); // body omitted (contains sensitive tokens)
+    logger.log("codex.token.request POST {s}", .{token_url});
     var req = try client.request(.POST, try std.Uri.parse(token_url), .{ .headers = .{ .content_type = .{ .override = "application/x-www-form-urlencoded" } } });
     defer req.deinit();
     req.transfer_encoding = .{ .content_length = body.len };
@@ -236,7 +241,7 @@ fn tokenRequest(gpa: std.mem.Allocator, io: std.Io, body: []const u8) !Credentia
     const status: u16 = @intFromEnum(response.head.status);
     const bytes = try readResponseBody(gpa, &response);
     defer gpa.free(bytes);
-    logger.log("codex.token.response status={d}", .{status}); // body omitted (contains access tokens)
+    logger.log("codex.token.response status={d}", .{status});
     if (status < 200 or status >= 300) return error.TokenRequestFailed;
     return try parseTokenResponse(gpa, io, bytes);
 }
@@ -308,322 +313,12 @@ fn accountIdFromAccessToken(gpa: std.mem.Allocator, access: []const u8) ![]u8 {
     return try gpa.dupe(u8, @field(parsed.value, jwt_claim_path).chatgpt_account_id);
 }
 
-fn save(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, credentials: Credentials) !void {
-    // Preserve any stored provider API keys when (re)writing Codex credentials.
-    var keys = try loadAllProviderApiKeys(gpa, io, home_dir);
-    defer freeApiKeyMap(gpa, &keys);
-    try writeAuthFile(gpa, io, home_dir, credentials, &keys);
-}
-
-fn writeAuthFile(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    home_dir: []const u8,
-    credentials: ?Credentials,
-    api_keys: *const ApiKeyMap,
-) !void {
-    var payload: std.Io.Writer.Allocating = .init(gpa);
-    defer payload.deinit();
-    try payload.writer.writeByte('{');
-    var wrote_any = false;
-    if (credentials) |value| {
-        try writeAuthKey(&payload.writer, "openaiCodex", &wrote_any);
-        try writeCredentials(&payload.writer, &value);
-    }
-    if (apiKeysCount(api_keys) > 0) {
-        try writeAuthKey(&payload.writer, "apiKeys", &wrote_any);
-        try writeApiKeys(&payload.writer, api_keys);
-    }
-    try payload.writer.writeAll("}\n");
-    try writeBlob(gpa, io, home_dir, payload.written());
-}
-
-fn keyringAccount(home_dir: []const u8, buf: *[20]u8) []const u8 {
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(home_dir, &digest, .{});
-    const hex = "0123456789abcdef";
-    @memcpy(buf[0..4], "cli|");
-    for (digest[0..8], 0..) |byte, i| {
-        buf[4 + i * 2] = hex[byte >> 4];
-        buf[4 + i * 2 + 1] = hex[byte & 0x0f];
-    }
-    return buf[0..20];
-}
-
-/// Read the serialized auth blob, preferring the keychain and falling back to
-/// `auth.json`. Returns gpa-owned bytes, or null when neither has an entry.
-/// A keychain miss must still try the file: it's where the blob lives on hosts
-/// with no keychain (Linux), and where a blob too large for the OS keychain
-/// (Windows caps credentials at 2560 bytes, so a Codex JWT bundle spills here)
-/// was written by `writeBlob`'s fallback. Not just a migration read.
-fn readBlob(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !?[]u8 {
-    var account_buf: [20]u8 = undefined;
-    const account = keyringAccount(home_dir, &account_buf);
-    if (keyring.load(gpa, keyring_service, account)) |maybe| {
-        if (maybe) |bytes| return bytes;
-    } else |err| {
-        if (err != error.Unsupported) logger.log("keyring load failed ({s}); using auth.json", .{@errorName(err)});
-    }
-    return readBlobFile(gpa, io, home_dir);
-}
-
-/// Persist the blob: try the keychain, and on success drop the plaintext file so
-/// the secret isn't left on disk. If the keychain is unavailable or rejects it
-/// (e.g. blob too large for Windows), write `auth.json` instead.
-fn writeBlob(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, bytes: []const u8) !void {
-    var account_buf: [20]u8 = undefined;
-    const account = keyringAccount(home_dir, &account_buf);
-    keyring.save(gpa, keyring_service, account, bytes) catch |err| {
-        if (err != error.Unsupported) logger.log("keyring save failed ({s}); writing auth.json", .{@errorName(err)});
-        return writeBlobFile(gpa, io, home_dir, bytes);
-    };
-    deleteBlobFile(gpa, io, home_dir) catch {};
-}
-
-/// Remove the blob from both the keychain and the plaintext file.
-fn deleteBlob(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !void {
-    var account_buf: [20]u8 = undefined;
-    const account = keyringAccount(home_dir, &account_buf);
-    _ = keyring.delete(gpa, keyring_service, account) catch |err| {
-        if (err != error.Unsupported) logger.log("keyring delete failed ({s})", .{@errorName(err)});
-    };
-    try deleteBlobFile(gpa, io, home_dir);
-}
-
-fn readBlobFile(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !?[]u8 {
-    const path = try authPath(gpa, home_dir);
-    defer gpa.free(path);
-    return std.Io.Dir.readFileAllocOptions(.cwd(), io, path, gpa, .limited(32 * 1024), .of(u8), 0) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => err,
-    };
-}
-
-fn writeBlobFile(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, bytes: []const u8) !void {
-    const path = try authPath(gpa, home_dir);
-    defer gpa.free(path);
-    const dirname = std.fs.path.dirname(path) orelse return error.InvalidPath;
-    try std.Io.Dir.createDirPath(.cwd(), io, dirname);
-    var file = try std.Io.Dir.createFile(.cwd(), io, path, .{ .truncate = true });
-    defer file.close(io);
-    var buffer: [4096]u8 = undefined;
-    var writer = file.writer(io, &buffer);
-    try writer.interface.writeAll(bytes);
-    try writer.interface.flush();
-}
-
-fn deleteBlobFile(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !void {
-    const path = try authPath(gpa, home_dir);
-    defer gpa.free(path);
-    std.Io.Dir.deleteFile(.cwd(), io, path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-}
-
-fn apiKeysCount(api_keys: *const ApiKeyMap) usize {
-    var count: usize = 0;
-    var it = api_keys.iterator();
-    while (it.next()) |entry| {
-        if (entry.value_ptr.*.len > 0) count += 1;
-    }
-    return count;
-}
-
-fn writeApiKeys(writer: *std.Io.Writer, api_keys: *const ApiKeyMap) !void {
-    try writer.writeByte('{');
-    var wrote_any = false;
-    var it = api_keys.iterator();
-    while (it.next()) |entry| {
-        if (entry.value_ptr.*.len == 0) continue;
-        if (wrote_any) try writer.writeByte(',');
-        try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
-        try writer.writeByte(':');
-        try std.json.Stringify.value(entry.value_ptr.*, .{}, writer);
-        wrote_any = true;
-    }
-    try writer.writeByte('}');
-}
-
-fn writeAuthKey(writer: *std.Io.Writer, name: []const u8, wrote_any: *bool) !void {
-    if (wrote_any.*) try writer.writeByte(',');
-    try std.json.Stringify.value(name, .{}, writer);
-    try writer.writeByte(':');
-    wrote_any.* = true;
-}
-
-fn writeCredentials(writer: *std.Io.Writer, credentials: *const Credentials) !void {
-    try writer.writeByte('{');
-    try writer.writeAll("\"access\":");
-    try std.json.Stringify.value(credentials.access, .{}, writer);
-    try writer.writeAll(",\"refresh\":");
-    try std.json.Stringify.value(credentials.refresh, .{}, writer);
-    try writer.writeAll(",\"expires\":");
-    try std.json.Stringify.value(credentials.expires, .{}, writer);
-    try writer.writeAll(",\"accountId\":");
-    try std.json.Stringify.value(credentials.account_id, .{}, writer);
-    try writer.writeByte('}');
-}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 fn nowMs(io: std.Io) i64 {
     return std.Io.Clock.now(.real, io).toMilliseconds();
-}
-
-fn authPath(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
-    if (home_dir.len == 0) return error.HomeNotSet;
-    return std.fs.path.join(gpa, &.{ home_dir, ".config", "nova", "auth.json" });
-}
-
-const AuthFile = struct {
-    openaiCodex: ?CredentialsJson = null,
-    /// Map of `provider.label()` -> API key. Parsed as a raw object because
-    /// the keys are provider labels, not known field names.
-    apiKeys: ?std.json.Value = null,
-};
-
-pub const ApiKeyMap = std.StringArrayHashMapUnmanaged([]u8);
-
-pub fn freeApiKeyMap(gpa: std.mem.Allocator, map: *ApiKeyMap) void {
-    var it = map.iterator();
-    while (it.next()) |entry| {
-        gpa.free(entry.key_ptr.*);
-        gpa.free(entry.value_ptr.*);
-    }
-    map.deinit(gpa);
-}
-
-/// Read every stored provider API key. Returns an empty map when the auth
-/// file is absent or carries no `apiKeys` section.
-pub fn loadAllProviderApiKeys(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !ApiKeyMap {
-    const bytes = (try readBlob(gpa, io, home_dir)) orelse return .empty;
-    defer gpa.free(bytes);
-    return parseApiKeys(gpa, bytes);
-}
-
-/// Read a single provider's stored API key, or null if none is stored.
-pub fn loadProviderApiKey(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, label: []const u8) !?[]u8 {
-    var map = try loadAllProviderApiKeys(gpa, io, home_dir);
-    defer freeApiKeyMap(gpa, &map);
-    const value = map.get(label) orelse return null;
-    return try gpa.dupe(u8, value);
-}
-
-/// Upsert a provider API key, preserving any Codex credentials and other keys.
-pub fn saveProviderApiKey(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, label: []const u8, key: []const u8) !void {
-    var keys = try loadAllProviderApiKeys(gpa, io, home_dir);
-    defer freeApiKeyMap(gpa, &keys);
-    if (keys.fetchOrderedRemove(label)) |old| {
-        gpa.free(old.key);
-        gpa.free(old.value);
-    }
-    const owned_label = try gpa.dupe(u8, label);
-    errdefer gpa.free(owned_label);
-    const owned_key = try gpa.dupe(u8, key);
-    errdefer gpa.free(owned_key);
-    try keys.put(gpa, owned_label, owned_key);
-
-    var creds = try load(gpa, io, home_dir);
-    defer if (creds) |*c| c.deinit(gpa);
-    try writeAuthFile(gpa, io, home_dir, creds, &keys);
-}
-
-/// Remove a provider API key, preserving Codex credentials and other keys.
-pub fn removeProviderApiKey(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, label: []const u8) !void {
-    var keys = try loadAllProviderApiKeys(gpa, io, home_dir);
-    defer freeApiKeyMap(gpa, &keys);
-    if (keys.fetchOrderedRemove(label)) |old| {
-        gpa.free(old.key);
-        gpa.free(old.value);
-    }
-    var creds = try load(gpa, io, home_dir);
-    defer if (creds) |*c| c.deinit(gpa);
-    try writeAuthFile(gpa, io, home_dir, creds, &keys);
-}
-
-/// Remove auth.json keys that don't correspond to any known provider.
-/// Keys matching `valid_names` (builtin labels + config provider names)
-/// are kept; everything else is an orphan and gets removed.
-/// Idempotent: running again after a prune removes nothing.
-/// Returns the number of keys removed.
-pub fn pruneOrphanKeys(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    home_dir: []const u8,
-    valid_names: []const []const u8,
-) !u32 {
-    var keys = try loadAllProviderApiKeys(gpa, io, home_dir);
-    defer freeApiKeyMap(gpa, &keys);
-
-    // Collect orphan names first (can't modify map while iterating).
-    var orphans: std.ArrayList([]const u8) = .empty;
-    defer orphans.deinit(gpa);
-
-    var it = keys.iterator();
-    while (it.next()) |entry| {
-        const name = entry.key_ptr.*;
-        var found = false;
-        for (valid_names) |valid| {
-            if (std.mem.eql(u8, name, valid)) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) try orphans.append(gpa, name);
-    }
-
-    if (orphans.items.len == 0) return 0;
-
-    for (orphans.items) |name| {
-        if (keys.fetchOrderedRemove(name)) |old| {
-            gpa.free(old.key);
-            gpa.free(old.value);
-        }
-    }
-
-    var creds = try load(gpa, io, home_dir);
-    defer if (creds) |*c| c.deinit(gpa);
-    try writeAuthFile(gpa, io, home_dir, creds, &keys);
-
-    return @intCast(orphans.items.len);
-}
-
-fn parseApiKeys(gpa: std.mem.Allocator, bytes: []const u8) !ApiKeyMap {
-    const parsed = std.json.parseFromSlice(AuthFile, gpa, bytes, .{ .ignore_unknown_fields = true }) catch return error.InvalidCredentials;
-    defer parsed.deinit();
-    var map: ApiKeyMap = .empty;
-    errdefer freeApiKeyMap(gpa, &map);
-    const keys_value = parsed.value.apiKeys orelse return map;
-    if (keys_value != .object) return map;
-    var it = keys_value.object.iterator();
-    while (it.next()) |entry| {
-        if (entry.value_ptr.* != .string) continue;
-        if (entry.value_ptr.*.string.len == 0) continue;
-        const owned_label = try gpa.dupe(u8, entry.key_ptr.*);
-        errdefer gpa.free(owned_label);
-        const owned_key = try gpa.dupe(u8, entry.value_ptr.*.string);
-        errdefer gpa.free(owned_key);
-        try map.put(gpa, owned_label, owned_key);
-    }
-    return map;
-}
-
-const CredentialsJson = struct {
-    access: []const u8,
-    refresh: []const u8,
-    accountId: []const u8,
-    expires: i64,
-};
-
-fn parseAuthFile(gpa: std.mem.Allocator, bytes: []const u8) !?Credentials {
-    const parsed = std.json.parseFromSlice(AuthFile, gpa, bytes, .{ .ignore_unknown_fields = true }) catch return error.InvalidCredentials;
-    defer parsed.deinit();
-    const provider = parsed.value.openaiCodex orelse return null;
-    return .{
-        .access = try gpa.dupe(u8, provider.access),
-        .refresh = try gpa.dupe(u8, provider.refresh),
-        .account_id = try gpa.dupe(u8, provider.accountId),
-        .expires = provider.expires,
-    };
 }
 
 fn queryValue(query: []const u8, name: []const u8) ?[]const u8 {
@@ -688,11 +383,9 @@ fn percentDecode(gpa: std.mem.Allocator, value: []const u8) ![]u8 {
     return try out.toOwnedSlice();
 }
 
-fn logBytes(bytes: []const u8) []const u8 {
-    const limit = 12 * 1024;
-    if (bytes.len <= limit) return bytes;
-    return bytes[0..limit];
-}
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 test "pkce helpers use base64url without padding" {
     const gpa = std.testing.allocator;
@@ -732,51 +425,4 @@ test "static models match openai codex catalog" {
 
 test "sign out removes missing auth file without error" {
     try signOut(std.testing.allocator, std.testing.io, "/tmp/nova-missing-home-for-signout-test");
-}
-
-test "auth file parser loads openai codex credentials" {
-    const gpa = std.testing.allocator;
-    const loaded = try parseAuthFile(gpa, "{\"openaiCodex\":{\"access\":\"a\",\"refresh\":\"r\",\"expires\":12,\"accountId\":\"acct\"}}");
-    var credentials = loaded.?;
-    defer credentials.deinit(gpa);
-    try std.testing.expectEqualStrings("a", credentials.access);
-    try std.testing.expectEqualStrings("r", credentials.refresh);
-    try std.testing.expectEqualStrings("acct", credentials.account_id);
-    try std.testing.expectEqual(@as(i64, 12), credentials.expires);
-}
-
-test "auth file parser still reads codex creds alongside apiKeys" {
-    const gpa = std.testing.allocator;
-    const loaded = try parseAuthFile(gpa, "{\"openaiCodex\":{\"access\":\"a\",\"refresh\":\"r\",\"expires\":12,\"accountId\":\"acct\"},\"apiKeys\":{\"cerebras\":\"csk\"}}");
-    var credentials = loaded.?;
-    defer credentials.deinit(gpa);
-    try std.testing.expectEqualStrings("a", credentials.access);
-}
-
-test "parseApiKeys reads keys and skips empty/non-string entries" {
-    const gpa = std.testing.allocator;
-    var map = try parseApiKeys(gpa, "{\"apiKeys\":{\"cerebras\":\"csk\",\"openrouter\":\"\",\"nvidia_nim\":42,\"huggingface\":\"hf\"}}");
-    defer freeApiKeyMap(gpa, &map);
-    try std.testing.expectEqual(@as(usize, 2), map.count());
-    try std.testing.expectEqualStrings("csk", map.get("cerebras").?);
-    try std.testing.expectEqualStrings("hf", map.get("huggingface").?);
-    try std.testing.expectEqual(@as(?[]u8, null), map.get("openrouter"));
-}
-
-test "parseApiKeys returns empty map when section absent" {
-    const gpa = std.testing.allocator;
-    var map = try parseApiKeys(gpa, "{\"openaiCodex\":{\"access\":\"a\",\"refresh\":\"r\",\"expires\":1,\"accountId\":\"x\"}}");
-    defer freeApiKeyMap(gpa, &map);
-    try std.testing.expectEqual(@as(usize, 0), map.count());
-}
-
-test "writeApiKeys serializes non-empty entries as a json object" {
-    const gpa = std.testing.allocator;
-    var map: ApiKeyMap = .empty;
-    defer freeApiKeyMap(gpa, &map);
-    try map.put(gpa, try gpa.dupe(u8, "cerebras"), try gpa.dupe(u8, "csk"));
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try writeApiKeys(&out.writer, &map);
-    try std.testing.expectEqualStrings("{\"cerebras\":\"csk\"}", out.written());
 }

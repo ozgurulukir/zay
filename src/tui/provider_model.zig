@@ -5,6 +5,7 @@ const vxfw = vaxis.vxfw;
 
 const tui = @import("../tui.zig");
 const ai = @import("../ai.zig");
+const auth = @import("../auth.zig");
 const bash_mod = @import("../bash.zig");
 const codex = @import("../codex.zig");
 const config_mod = @import("../config.zig");
@@ -113,8 +114,8 @@ pub fn catalogueIndexById(id: []const u8) ?usize {
 pub fn refreshProviderApiKeys(self: *App) !void {
     const home = self.liveRuntime().?.home_dir;
     if (home.len == 0) return;
-    var fresh = try codex.loadAllProviderApiKeys(self.gpa, self.io, home);
-    codex.freeApiKeyMap(self.gpa, &self.provider_api_keys);
+    var fresh = try auth.loadAllProviderApiKeys(self.gpa, self.io, home);
+    auth.freeApiKeyMap(self.gpa, &self.provider_api_keys);
     self.provider_api_keys = fresh;
     fresh = .empty;
 }
@@ -478,10 +479,10 @@ pub fn submitProviderSetup(self: *App, provider: config_mod.Provider) !void {
 
     const home = self.liveRuntime().?.home_dir;
     if (key.len > 0) {
-        try codex.saveProviderApiKey(self.gpa, self.io, home, provider.label(), key);
+        try auth.saveProviderApiKey(self.gpa, self.io, home, provider.label(), key);
     } else {
         // Anonymous free tier: drop any stale key so we connect without one.
-        codex.removeProviderApiKey(self.gpa, self.io, home, provider.label()) catch {};
+        auth.removeProviderApiKey(self.gpa, self.io, home, provider.label()) catch {};
     }
     try refreshProviderApiKeys(
         self,
@@ -534,9 +535,9 @@ pub fn submitDynamicProviderSetup(self: *App, provider: modelsdev.Provider) !voi
 
     const home = self.liveRuntime().?.home_dir;
     if (key.len > 0) {
-        try codex.saveProviderApiKey(self.gpa, self.io, home, provider.id, key);
+        try auth.saveProviderApiKey(self.gpa, self.io, home, provider.id, key);
     } else {
-        codex.removeProviderApiKey(self.gpa, self.io, home, provider.id) catch {};
+        auth.removeProviderApiKey(self.gpa, self.io, home, provider.id) catch {};
     }
     try refreshProviderApiKeys(self);
 
@@ -599,7 +600,7 @@ pub fn submitConfigProviderSetup(self: *App, provider: config_mod.ProviderConfig
     }
 
     const home = self.liveRuntime().?.home_dir;
-    try codex.saveProviderApiKey(self.gpa, self.io, home, provider.name, key);
+    try auth.saveProviderApiKey(self.gpa, self.io, home, provider.name, key);
     try refreshProviderApiKeys(self);
 
     // Resolve the base URL: explicit custom URL wins, otherwise fall back

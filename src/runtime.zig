@@ -2,6 +2,7 @@ const std = @import("std");
 
 const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
+const auth_mod = @import("auth.zig");
 const codex_mod = @import("codex.zig");
 const compaction = @import("compaction.zig");
 const config_mod = @import("config.zig");
@@ -389,7 +390,7 @@ pub const AgentRuntime = struct {
             // prefix) so custom providers like "qwen-cloud" resolve their own
             // stored key from auth.json.
             if (self.home_dir.len > 0) {
-                loaded_key = codex_mod.loadProviderApiKey(self.gpa, self.io, self.home_dir, ms.provider_name) catch null;
+                loaded_key = auth_mod.loadProviderApiKey(self.gpa, self.io, self.home_dir, ms.provider_name) catch null;
                 if (loaded_key) |k| break :blk k;
             }
             // No stored key — log for diagnostics when the provider requires

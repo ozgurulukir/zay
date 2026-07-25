@@ -11,6 +11,7 @@ pub const Agent = agent_mod.Agent;
 const pytools = @import("pytools.zig");
 const bash_mod = @import("bash.zig");
 const search_mod = @import("search.zig");
+const auth = @import("auth.zig");
 const codex = @import("codex.zig");
 const config_mod = @import("config.zig");
 const mcp_mod = @import("mcp/manager.zig");
@@ -159,7 +160,7 @@ pub const App = struct {
     /// Stored API keys for catalogue providers (label -> key), mirrored from
     /// `~/.config/nova/auth.json`. Drives the picker's [CONNECTED] badges and supplies
     /// keys when (re)building the model catalogue. Owned; freed in `deinit`.
-    provider_api_keys: codex.ApiKeyMap = .empty,
+    provider_api_keys: auth.ApiKeyMap = .empty,
     /// Merged models.dev provider registry (builtins + cached/fetched). Owned; freed in `deinit`.
     modelsdev_registry: ?modelsdev.Registry = null,
     /// Backing slice for provider picker's merged provider list. Owned; freed in `deinit`.

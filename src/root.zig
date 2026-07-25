@@ -3,6 +3,7 @@ const std = @import("std");
 pub const agent = @import("agent.zig");
 pub const ai = @import("ai.zig");
 pub const at_mention = @import("at_mention.zig");
+pub const auth = @import("auth.zig");
 pub const background = @import("background.zig");
 pub const bash = @import("bash.zig");
 pub const local_models = @import("local_models.zig");
@@ -102,7 +103,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
         if (load_result.config.dynamic_provider_id) |id| {
             valid_names.append(runtime_gpa, id) catch {};
         }
-        const pruned = codex.pruneOrphanKeys(runtime_gpa, init.io, home_dir, valid_names.items) catch 0;
+        const pruned = auth.pruneOrphanKeys(runtime_gpa, init.io, home_dir, valid_names.items) catch 0;
         if (pruned > 0) {
             logger.log("auth.integrity.pruned count={d}", .{pruned});
         }

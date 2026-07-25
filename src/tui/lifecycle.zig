@@ -11,6 +11,7 @@ const vxfw = vaxis.vxfw;
 
 const tui = @import("../tui.zig");
 const agent_mod = @import("../agent.zig");
+const auth = @import("../auth.zig");
 const blackhole = @import("../tui/blackhole.zig");
 const codex = @import("../codex.zig");
 const provider_model = @import("provider_model.zig");
@@ -60,7 +61,7 @@ pub fn deinitApp(self: *App) void {
     if (self.metrics.git_label.len > 0) self.gpa.free(self.metrics.git_label);
     if (self.metrics.diff_cache()) |raw| self.gpa.free(raw);
     self.pickers.models.deinit(self.gpa);
-    codex.freeApiKeyMap(self.gpa, &self.provider_api_keys);
+    auth.freeApiKeyMap(self.gpa, &self.provider_api_keys);
     if (self.modelsdev_registry) |*r| {
         r.deinit(self.gpa);
         self.modelsdev_registry = null;

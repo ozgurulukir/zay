@@ -5,6 +5,7 @@ const vxfw = vaxis.vxfw;
 const panel = @import("panel.zig");
 const message = @import("message.zig");
 const tui_style = @import("../style.zig");
+const auth = @import("../../auth.zig");
 const config_mod = @import("../../config.zig");
 const modelsdev = @import("../../modelsdev.zig");
 const codex = @import("../../codex.zig");
@@ -164,7 +165,7 @@ pub const Content = struct {
     codex_signed_in: bool,
     statuses: []const Status,
     key_input: []const u8 = "",
-    api_keys: ?*const codex.ApiKeyMap = null,
+    api_keys: ?*const auth.ApiKeyMap = null,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };

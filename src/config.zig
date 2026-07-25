@@ -1407,7 +1407,7 @@ pub fn projectConfigExists(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) 
 
 /// The single seam between an in-memory Config and config.json on disk.
 /// Invariant: `api_key` is NEVER written here — API keys live only in
-/// auth.json (see codex.ApiKeyMap). This is the one place that enforces it, so
+/// auth.json (see auth.ApiKeyMap). This is the one place that enforces it, so
 /// callers never have to thread a "should I persist the key?" flag through the
 /// merge path. The "serialize: skips api_key even if present" test guards it.
 ///
