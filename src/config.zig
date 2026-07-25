@@ -148,6 +148,11 @@ fn providerSpec(provider: Provider) ProviderSpec {
 pub const Model = struct {
     id: []u8,
     reasoning_effort: ?ai.ReasoningEffort = null,
+    /// Explicit context window override for this model (tokens).
+    /// When set, overrides the model catalogue lookup.
+    context_window: ?u32 = null,
+    /// Maximum output tokens per generation turn for this model.
+    max_output_tokens: ?u32 = null,
 
     pub fn deinit(self: *Model, gpa: std.mem.Allocator) void {
         gpa.free(self.id);
@@ -158,6 +163,8 @@ pub const Model = struct {
         return .{
             .id = try gpa.dupe(u8, self.id),
             .reasoning_effort = self.reasoning_effort,
+            .context_window = self.context_window,
+            .max_output_tokens = self.max_output_tokens,
         };
     }
 };
@@ -180,11 +187,15 @@ pub const BaseUrl = union(enum) {
 pub const ProviderModel = Model;
 
 pub const ProviderConfig = struct {
+    /// The JSON map key. For builtins this equals `provider.label()`;
+    /// for custom providers it's the user-chosen name (e.g. "qwen-cloud").
+    name: []u8,
     provider: Provider,
     base_url: BaseUrl = .default,
     models: []ProviderModel = &.{},
 
     pub fn deinit(self: *ProviderConfig, gpa: std.mem.Allocator) void {
+        gpa.free(self.name);
         switch (self.base_url) {
             .custom => |s| gpa.free(s),
             .default => {},
@@ -195,7 +206,10 @@ pub const ProviderConfig = struct {
     }
 
     fn clone(self: ProviderConfig, gpa: std.mem.Allocator) !ProviderConfig {
-        var out: ProviderConfig = .{ .provider = self.provider };
+        var out: ProviderConfig = .{
+            .name = try gpa.dupe(u8, self.name),
+            .provider = self.provider,
+        };
         errdefer out.deinit(gpa);
         switch (self.base_url) {
             .custom => |s| out.base_url = .{ .custom = try gpa.dupe(u8, s) },
@@ -209,6 +223,7 @@ pub const ProviderConfig = struct {
 
 pub const ModelSelectionRef = struct {
     provider: Provider,
+    provider_name: []const u8,
     model: *const Model,
 };
 
@@ -269,6 +284,11 @@ pub const McpServerConfig = struct {
 /// fields keep working until the migration PRs land.
 pub const ModelSelection = struct {
     provider: Provider,
+    /// The provider name as written in config (map key or defaultModel prefix).
+    /// For builtins this equals `provider.label()`; for custom providers it's
+    /// the user-chosen name. Used for display, auth.json lookup, and session
+    /// persistence.
+    provider_name: []u8,
     model: Model,
     base_url: []u8,
     api_key: []u8,
@@ -278,6 +298,7 @@ pub const ModelSelection = struct {
     bash_classifier_url: ?[]u8 = null,
 
     pub fn deinit(self: *ModelSelection, gpa: std.mem.Allocator) void {
+        gpa.free(self.provider_name);
         gpa.free(self.base_url);
         gpa.free(self.api_key);
         self.model.deinit(gpa);
@@ -289,6 +310,7 @@ pub const ModelSelection = struct {
     pub fn clone(self: ModelSelection, gpa: std.mem.Allocator) !ModelSelection {
         return .{
             .provider = self.provider,
+            .provider_name = try gpa.dupe(u8, self.provider_name),
             .model = try self.model.clone(gpa),
             .base_url = try gpa.dupe(u8, self.base_url),
             .api_key = try gpa.dupe(u8, self.api_key),
@@ -331,6 +353,11 @@ pub const Config = struct {
     /// when parsed from disk; the default points to static memory.
     version: ?[]u8 = null,
     provider: ?Provider = null,
+    /// The provider name as written in config (defaultModel prefix or
+    /// providers map key). For builtins equals `provider.label()`; for
+    /// custom providers it's the user-chosen name. Used for display,
+    /// auth.json lookup, and providers-map matching.
+    provider_name: ?[]u8 = null,
     base_url: ?[]u8 = null,
     api_key: ?[]u8 = null,
     bash_classifier_url: ?[]u8 = null,
@@ -360,6 +387,7 @@ pub const Config = struct {
 
     pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
         if (self.version) |s| gpa.free(s);
+        if (self.provider_name) |s| gpa.free(s);
         if (self.base_url) |s| gpa.free(s);
         if (self.api_key) |s| gpa.free(s);
         if (self.bash_classifier_url) |s| gpa.free(s);
@@ -383,6 +411,7 @@ pub const Config = struct {
         };
         errdefer out.deinit(gpa);
         if (self.version) |s| out.version = try gpa.dupe(u8, s);
+        if (self.provider_name) |s| out.provider_name = try gpa.dupe(u8, s);
         if (self.base_url) |s| out.base_url = try gpa.dupe(u8, s);
         if (self.api_key) |s| out.api_key = try gpa.dupe(u8, s);
         if (self.bash_classifier_url) |s| out.bash_classifier_url = try gpa.dupe(u8, s);
@@ -438,7 +467,8 @@ pub const Config = struct {
     pub fn activeModelSelection(self: *const Config) ?ModelSelectionRef {
         const provider = self.provider orelse return null;
         const model = if (self.model) |*model| model else return null;
-        return .{ .provider = provider, .model = model };
+        const name = self.provider_name orelse provider.label();
+        return .{ .provider = provider, .provider_name = name, .model = model };
     }
 };
 
@@ -709,8 +739,9 @@ fn applyProviderModelsOverlay(gpa: std.mem.Allocator, target: *ProviderConfig, u
 fn hydrateActiveModel(gpa: std.mem.Allocator, config: *Config) !void {
     const provider = config.provider orelse return;
     if (config.model == null) return;
+    const name = config.provider_name orelse provider.label();
     for (config.providers) |entry| {
-        if (entry.provider != provider) continue;
+        if (!std.mem.eql(u8, entry.name, name)) continue;
         switch (entry.base_url) {
             .custom => |base_url| try replaceOptionalSlice(gpa, &config.base_url, base_url),
             .default => {},
@@ -720,6 +751,8 @@ fn hydrateActiveModel(gpa: std.mem.Allocator, config: *Config) !void {
             // When adding fields to Model, also copy them here so they
             // survive the merge → hydrate cycle.
             config.model.?.reasoning_effort = model.reasoning_effort;
+            config.model.?.context_window = model.context_window;
+            config.model.?.max_output_tokens = model.max_output_tokens;
             return;
         }
         return;
@@ -831,6 +864,7 @@ fn parseObject(
     if (model_str) |s| {
         if (parseModelSelection(gpa, s)) |selection| {
             out.provider = selection.provider;
+            out.provider_name = selection.provider_name;
             out.model = selection.model;
         } else |err| {
             try diagnostics.append(gpa, .{ .config_parse_error = .{
@@ -874,6 +908,7 @@ fn parseObject(
     {
         out.model_selection = .{
             .provider = out.provider.?,
+            .provider_name = out.provider_name orelse try gpa.dupe(u8, out.provider.?.label()),
             .model = out.model.?, // ownership moves; clear the legacy field
             .base_url = out.base_url.?,
             .api_key = out.api_key.?,
@@ -883,6 +918,7 @@ fn parseObject(
             .bash_classifier_url = out.bash_classifier_url,
         };
         out.provider = null;
+        out.provider_name = null;
         out.model = null;
         out.base_url = null;
         out.api_key = null;
@@ -953,9 +989,11 @@ fn parseProviders(gpa: std.mem.Allocator, value: std.json.Value) ![]ProviderConf
     }
     var iterator = value.object.iterator();
     while (iterator.next()) |entry| {
-        const provider = providers_by_name.get(entry.key_ptr.*) orelse continue;
         if (entry.value_ptr.* != .object) continue;
-        try providers.append(gpa, try parseProviderConfig(gpa, provider, entry.value_ptr.*));
+        // Builtin labels resolve to their enum; unknown keys are custom
+        // providers using the openai_compatible adapter.
+        const provider = providers_by_name.get(entry.key_ptr.*) orelse .openai_compatible;
+        try providers.append(gpa, try parseProviderConfig(gpa, entry.key_ptr.*, provider, entry.value_ptr.*));
     }
     return try providers.toOwnedSlice(gpa);
 }
@@ -1008,8 +1046,11 @@ fn parseMcpServers(gpa: std.mem.Allocator, value: std.json.Value) ![]McpServerCo
     return try servers.toOwnedSlice(gpa);
 }
 
-fn parseProviderConfig(gpa: std.mem.Allocator, provider: Provider, value: std.json.Value) !ProviderConfig {
-    var out: ProviderConfig = .{ .provider = provider };
+fn parseProviderConfig(gpa: std.mem.Allocator, name: []const u8, provider: Provider, value: std.json.Value) !ProviderConfig {
+    var out: ProviderConfig = .{
+        .name = try gpa.dupe(u8, name),
+        .provider = provider,
+    };
     errdefer out.deinit(gpa);
     if (stringFieldCompat(value, "baseURL", "base_url")) |s| out.base_url = .{ .custom = try gpa.dupe(u8, s) };
     if (value.object.get("models")) |models_value| {
@@ -1027,10 +1068,18 @@ fn parseProviderModels(gpa: std.mem.Allocator, value: std.json.Value) ![]Provide
     var iterator = value.object.iterator();
     while (iterator.next()) |entry| {
         if (entry.value_ptr.* != .object) continue;
-        try models.append(gpa, .{
+        const val = entry.value_ptr.*;
+        var model: ProviderModel = .{
             .id = try gpa.dupe(u8, entry.key_ptr.*),
-            .reasoning_effort = if (stringField(entry.value_ptr.*, "reasoningEffort")) |effort| reasoning_efforts_by_name.get(effort) else null,
-        });
+            .reasoning_effort = if (stringField(val, "reasoningEffort")) |effort| reasoning_efforts_by_name.get(effort) else null,
+        };
+        if (intField(val, "contextWindow")) |v| {
+            if (v >= 1024) model.context_window = @intCast(v);
+        }
+        if (intField(val, "maxOutputTokens")) |v| {
+            if (v >= 1) model.max_output_tokens = @intCast(v);
+        }
+        try models.append(gpa, model);
     }
     return try models.toOwnedSlice(gpa);
 }
@@ -1057,6 +1106,7 @@ fn loadEnv(
     if (env.get("OPENAI_MODEL")) |raw| {
         if (parseModelSelection(gpa, raw)) |parsed| {
             out.provider = parsed.provider;
+            out.provider_name = parsed.provider_name;
             out.model = parsed.model;
         } else |_| {
             try diagnostics.append(gpa, .{ .bad_env_model = try gpa.dupe(u8, raw) });
@@ -1066,7 +1116,12 @@ fn loadEnv(
 }
 
 const ParsedModelSelection = struct {
+    /// Resolved builtin provider, or `.openai_compatible` for custom names.
     provider: Provider,
+    /// The raw provider name as written in the selection string. For
+    /// builtins this equals `provider.label()`; for custom providers
+    /// it's the user-chosen name (e.g. "qwen-cloud").
+    provider_name: []u8,
     model: Model,
 };
 
@@ -1076,9 +1131,13 @@ fn parseModelSelection(gpa: std.mem.Allocator, raw: []const u8) !ParsedModelSele
     const model_part = raw[slash + 1 ..];
     if (provider_part.len == 0) return error.MissingProvider;
     if (model_part.len == 0) return error.MissingModel;
-    const provider = providers_by_name.get(provider_part) orelse return error.UnknownProvider;
+    // Builtin providers resolve to their enum; unknown names are treated
+    // as custom providers using the openai_compatible adapter. The name
+    // is preserved for display, auth lookup, and providers-map matching.
+    const provider = providers_by_name.get(provider_part) orelse .openai_compatible;
     return .{
         .provider = provider,
+        .provider_name = try gpa.dupe(u8, provider_part),
         .model = .{ .id = try gpa.dupe(u8, model_part) },
     };
 }
@@ -1398,7 +1457,7 @@ fn writeProviders(writer: *std.Io.Writer, providers: []const ProviderConfig) !vo
     var wrote_provider = false;
     for (providers) |provider| {
         if (wrote_provider) try writer.writeByte(',');
-        try std.json.Stringify.value(provider.provider.label(), .{}, writer);
+        try std.json.Stringify.value(provider.name, .{}, writer);
         try writer.writeByte(':');
         try writeProvider(writer, provider);
         wrote_provider = true;
@@ -1431,10 +1490,25 @@ fn writeProviderModels(writer: *std.Io.Writer, models: []const ProviderModel) !v
         try std.json.Stringify.value(model.id, .{}, writer);
         try writer.writeByte(':');
         try writer.writeByte('{');
+        var wrote_field = false;
         if (model.reasoning_effort) |effort| {
             try std.json.Stringify.value("reasoningEffort", .{}, writer);
             try writer.writeByte(':');
             try std.json.Stringify.value(effort.label(), .{}, writer);
+            wrote_field = true;
+        }
+        if (model.context_window) |cw| {
+            if (wrote_field) try writer.writeByte(',');
+            try std.json.Stringify.value("contextWindow", .{}, writer);
+            try writer.writeByte(':');
+            try writer.print("{d}", .{cw});
+            wrote_field = true;
+        }
+        if (model.max_output_tokens) |mot| {
+            if (wrote_field) try writer.writeByte(',');
+            try std.json.Stringify.value("maxOutputTokens", .{}, writer);
+            try writer.writeByte(':');
+            try writer.print("{d}", .{mot});
         }
         try writer.writeByte('}');
         wrote_model = true;
@@ -1570,7 +1644,9 @@ test "parseModelSelection: valid <provider>/<model>" {
     const gpa = std.testing.allocator;
     var parsed = try parseModelSelection(gpa, "openai/gpt-5.5");
     defer parsed.model.deinit(gpa);
+    defer gpa.free(parsed.provider_name);
     try std.testing.expectEqual(Provider.openai, parsed.provider);
+    try std.testing.expectEqualStrings("openai", parsed.provider_name);
     try std.testing.expectEqualStrings("gpt-5.5", parsed.model.id);
 }
 
@@ -1578,6 +1654,7 @@ test "parseModelSelection: ollama/llama3.1:8b" {
     const gpa = std.testing.allocator;
     var parsed = try parseModelSelection(gpa, "ollama/llama3.1:8b");
     defer parsed.model.deinit(gpa);
+    defer gpa.free(parsed.provider_name);
     try std.testing.expectEqual(Provider.ollama, parsed.provider);
     try std.testing.expectEqualStrings("llama3.1:8b", parsed.model.id);
 }
@@ -1591,19 +1668,26 @@ test "parseModelSelection: model id may contain slashes" {
     const gpa = std.testing.allocator;
     var parsed = try parseModelSelection(gpa, "openrouter/anthropic/claude-3.7-sonnet");
     defer parsed.model.deinit(gpa);
+    defer gpa.free(parsed.provider_name);
     try std.testing.expectEqual(Provider.openrouter, parsed.provider);
     try std.testing.expectEqualStrings("anthropic/claude-3.7-sonnet", parsed.model.id);
 }
 
-test "parseModelSelection: unknown provider is error" {
+test "parseModelSelection: unknown provider resolves to openai_compatible" {
     const gpa = std.testing.allocator;
-    try std.testing.expectError(error.UnknownProvider, parseModelSelection(gpa, "mystery/foo"));
+    var parsed = try parseModelSelection(gpa, "qwen-cloud/qwen-plus");
+    defer parsed.model.deinit(gpa);
+    defer gpa.free(parsed.provider_name);
+    try std.testing.expectEqual(Provider.openai_compatible, parsed.provider);
+    try std.testing.expectEqualStrings("qwen-cloud", parsed.provider_name);
+    try std.testing.expectEqualStrings("qwen-plus", parsed.model.id);
 }
 
 test "parseModelSelection: anthropic parses (validity checked downstream)" {
     const gpa = std.testing.allocator;
     var parsed = try parseModelSelection(gpa, "anthropic/claude-3.7-sonnet");
     defer parsed.model.deinit(gpa);
+    defer gpa.free(parsed.provider_name);
     try std.testing.expectEqual(Provider.anthropic, parsed.provider);
 }
 
@@ -1632,18 +1716,19 @@ test "parseFile is pure; merge hydrates model reasoningEffort from providers" {
     try std.testing.expectEqual(ai.ReasoningEffort.high, merged.model.?.reasoning_effort.?);
 }
 
-test "parseObject: unknown provider records diagnostic" {
+test "parseObject: unknown provider resolves to openai_compatible custom" {
     const gpa = std.testing.allocator;
     var sink: std.ArrayList(Diagnostic) = .empty;
     defer {
         for (sink.items) |*d| d.deinit(gpa);
         sink.deinit(gpa);
     }
-    var cfg = try parseFile(gpa, "<test>", "{\"model\":\"mystery/foo\"}", &sink);
+    var cfg = try parseFile(gpa, "<test>", "{\"defaultModel\":\"qwen-cloud/qwen-plus\"}", &sink);
     defer cfg.deinit(gpa);
-    try std.testing.expectEqual(@as(?Provider, null), cfg.provider);
-    try std.testing.expectEqual(@as(usize, 1), sink.items.len);
-    try std.testing.expect(sink.items[0] == .config_parse_error);
+    try std.testing.expectEqual(Provider.openai_compatible, cfg.provider.?);
+    try std.testing.expectEqualStrings("qwen-cloud", cfg.provider_name.?);
+    try std.testing.expectEqualStrings("qwen-plus", cfg.model.?.id);
+    try std.testing.expectEqual(@as(usize, 0), sink.items.len);
 }
 
 test "parseObject: invalid JSON records diagnostic" {
@@ -1752,7 +1837,7 @@ test "serialize: skips api_key even if present" {
     var provider_models = try gpa.alloc(ProviderModel, 1);
     provider_models[0] = .{ .id = try gpa.dupe(u8, "gpt-5.5"), .reasoning_effort = .medium };
     var providers = try gpa.alloc(ProviderConfig, 1);
-    providers[0] = .{ .provider = .openai, .models = provider_models };
+    providers[0] = .{ .name = try gpa.dupe(u8, "openai"), .provider = .openai, .models = provider_models };
     var cfg: Config = .{
         .provider = .openai,
         .api_key = try gpa.dupe(u8, "sk-should-never-appear"),
@@ -1796,7 +1881,7 @@ test "mergeLayers: active model is hydrated from the merged provider list" {
     const models = try gpa.alloc(ProviderModel, 1);
     models[0] = .{ .id = try gpa.dupe(u8, "gpt-5.5"), .reasoning_effort = .medium };
     const providers = try gpa.alloc(ProviderConfig, 1);
-    providers[0] = .{ .provider = .openai, .base_url = .{ .custom = try gpa.dupe(u8, "https://from-provider") }, .models = models };
+    providers[0] = .{ .name = try gpa.dupe(u8, "openai"), .provider = .openai, .base_url = .{ .custom = try gpa.dupe(u8, "https://from-provider") }, .models = models };
     var global: Config = .{ .providers = providers };
     defer global.deinit(gpa);
     // ...the active model selection comes from another, carrying no reasoning.
@@ -1818,6 +1903,7 @@ test "serialize then parse roundtrips" {
     provider_models[0] = .{ .id = try gpa.dupe(u8, "llama3.1:8b") };
     var providers = try gpa.alloc(ProviderConfig, 1);
     providers[0] = .{
+        .name = try gpa.dupe(u8, "ollama"),
         .provider = .ollama,
         .base_url = .{ .custom = try gpa.dupe(u8, "http://localhost:11434/v1") },
         .models = provider_models,
@@ -1999,6 +2085,7 @@ test "applyConfigOverlay: model_selection present uses canonical form" {
         .provider = .openai, // legacy — should be ignored
         .model_selection = .{
             .provider = .anthropic,
+            .provider_name = try gpa.dupe(u8, "anthropic"),
             .model = .{ .id = try gpa.dupe(u8, "claude-3.7-sonnet") },
             .base_url = try gpa.dupe(u8, "https://api.anthropic.com"),
             .api_key = try gpa.dupe(u8, ""),
@@ -2028,6 +2115,7 @@ test "applyConfigOverlay: legacy fields sync to model_selection" {
     // Manually populate model_selection (normally done by parseObject).
     target.model_selection = .{
         .provider = .openai,
+        .provider_name = try gpa.dupe(u8, "openai"),
         .model = .{ .id = try gpa.dupe(u8, "gpt-5.5") },
         .base_url = try gpa.dupe(u8, "https://api.openai.com"),
         .api_key = try gpa.dupe(u8, "sk-test"),

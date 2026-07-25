@@ -2191,6 +2191,7 @@ test "local providers are not loaded twice through configured compatible catalog
 
     app.cached_config.model_selection = .{
         .provider = .ollama,
+        .provider_name = @constCast("ollama"),
         .base_url = @constCast("http://localhost:11434"),
         .api_key = @constCast("ollama"),
         .model = .{ .id = @constCast("test") },
@@ -2234,6 +2235,7 @@ test "compatible base url falls back when cached local provider differs" {
 
     app.cached_config.model_selection = .{
         .provider = .llama_cpp,
+        .provider_name = @constCast("llama.cpp"),
         .base_url = @constCast("http://localhost:11434"),
         .api_key = @constCast(""),
         .model = .{ .id = @constCast("test") },
@@ -2272,6 +2274,7 @@ test "codex sign-in survives selecting local compatible provider" {
     app.cached_config_owned = true;
     app.cached_config.model_selection = .{
         .provider = .openai_compatible,
+        .provider_name = try gpa.dupe(u8, "openai_compatible"),
         .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
         .api_key = try gpa.dupe(u8, "ollama"),
         .model = .{ .id = try gpa.dupe(u8, "placeholder") },
@@ -2314,6 +2317,7 @@ test "switching from codex to catalogue provider resets cached connection" {
     app.cached_config_owned = true;
     app.cached_config.model_selection = .{
         .provider = .openai,
+        .provider_name = try gpa.dupe(u8, "openai"),
         .base_url = try gpa.dupe(u8, "https://chatgpt.com/backend-api"),
         .api_key = try gpa.dupe(u8, "stale-codex-key"),
         .model = .{ .id = try gpa.dupe(u8, "placeholder") },
@@ -2341,6 +2345,7 @@ test "active model appears at display position 0 without mutating storage" {
     defer gpa.free(active_model_id);
     app.cached_config.model_selection = .{
         .provider = .openai,
+        .provider_name = @constCast("openai"),
         .base_url = @constCast(""),
         .api_key = @constCast(""),
         .model = .{ .id = active_model_id },
@@ -2436,6 +2441,7 @@ test "expired codex connection reports reconnect message" {
     app.cached_config = .{
         .model_selection = .{
             .provider = .openai,
+            .provider_name = @constCast("openai"),
             .base_url = @constCast(""),
             .api_key = @constCast(""),
             .model = .{ .id = @constCast("test") },
@@ -2653,6 +2659,7 @@ test "model selection is allowed after interrupt" {
     app.cached_config_owned = true;
     app.cached_config.model_selection = .{
         .provider = .openai_compatible,
+        .provider_name = try gpa.dupe(u8, "openai_compatible"),
         .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
         .api_key = try gpa.dupe(u8, "ollama"),
         .model = .{ .id = try gpa.dupe(u8, "placeholder") },

@@ -53,6 +53,11 @@ pub const Config = struct {
     tools: []const Tool = &.{},
     mcp_tools: []const McpToolSchema = &.{},
     reasoning: ?Reasoning = .{},
+    /// Maximum tokens per generation turn. Sent as `max_tokens` in the
+    /// request body when non-null. Sourced from per-model config
+    /// (`providers.<name>.models.<id>.maxOutputTokens`) or global
+    /// `context.maxOutputTokens`.
+    max_output_tokens: ?u32 = null,
     account_id: []const u8 = "",
     session_id: []const u8 = "",
     system_prompt: []const u8 = "You are a helpful assistant.",

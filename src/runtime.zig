@@ -211,6 +211,7 @@ pub const AgentRuntime = struct {
                     // No model_selection in config, create one from session
                     session_config.model_selection = .{
                         .provider = provider_enum,
+                        .provider_name = @constCast(provider_enum.label()),
                         .model = .{
                             .id = summary.model_id orelse "",
                             .reasoning_effort = null,
@@ -291,9 +292,9 @@ pub const AgentRuntime = struct {
             .openai_compatible => try self.tryAttachOpenAiCompatibleFromConfig(selection.provider, config),
             .openai_responses => try self.tryAttachOpenAiResponsesFromConfig(selection.provider, config),
         }
-        // Save the model selection to the session so it can be restored on resume
-        const provider_str = @tagName(selection.provider);
-        try self.session_writer.session.updateModel(provider_str, selection.model.id);
+        // Save the model selection to the session so it can be restored on resume.
+        // Use provider_name (the config key) so custom providers round-trip.
+        try self.session_writer.session.updateModel(selection.provider_name, selection.model.id);
     }
 
     fn adapterForConfig(provider: config_mod.Provider, config: config_mod.Config) ?config_mod.AdapterKind {
@@ -350,12 +351,25 @@ pub const AgentRuntime = struct {
         };
         const base_url = if (ms.base_url.len > 0) ms.base_url else provider.defaultBaseUrl() orelse return;
         const effort = ms.model.reasoning_effort orelse .medium;
+        // Per-model context_window from providers map acts as a fallback
+        // when the global overrideContextWindow is not set.
+        if (self.context_settings.override_context_window == null) {
+            self.context_settings.override_context_window = ms.model.context_window;
+        }
+        // Per-model max_output_tokens from providers map acts as a fallback
+        // when the global context.maxOutputTokens is not set.
+        if (self.context_settings.max_output_tokens == null) {
+            self.context_settings.max_output_tokens = ms.model.max_output_tokens;
+        }
         var loaded_key: ?[]u8 = null;
         defer if (loaded_key) |k| self.gpa.free(k);
         const api_key = blk: {
             if (ms.api_key.len > 0) break :blk ms.api_key;
-            if (provider.isCatalogue() and self.home_dir.len > 0) {
-                loaded_key = codex_mod.loadProviderApiKey(self.gpa, self.io, self.home_dir, provider.label()) catch null;
+            // Auth lookup uses provider_name (the config map key / defaultModel
+            // prefix) so custom providers like "qwen-cloud" resolve their own
+            // stored key from auth.json.
+            if (self.home_dir.len > 0) {
+                loaded_key = codex_mod.loadProviderApiKey(self.gpa, self.io, self.home_dir, ms.provider_name) catch null;
                 if (loaded_key) |k| break :blk k;
             }
             // No stored key — use the anonymous sentinel (e.g. OpenCode Zen's
@@ -487,6 +501,7 @@ pub const AgentRuntime = struct {
             .tools = tools_mod.registry,
             .mcp_tools = self.mcp_tools,
             .reasoning = .{ .effort = effort },
+            .max_output_tokens = self.context_settings.max_output_tokens,
             .session_id = self.session_writer.session.id.slice(),
         });
         errdefer client.deinit();
@@ -701,6 +716,7 @@ test "runtime selects responses adapter when requested" {
     const config: config_mod.Config = .{
         .model_selection = .{
             .provider = .openai_compatible,
+            .provider_name = @constCast("openai_compatible"),
             .base_url = @constCast(""),
             .api_key = @constCast(""),
             .model = .{ .id = @constCast("test") },

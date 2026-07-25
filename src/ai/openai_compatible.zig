@@ -129,6 +129,7 @@ pub const Client = struct {
             messages,
             self.tools_json,
             self.config.reasoning,
+            self.config.max_output_tokens,
         );
         logger.log("openai_compatible.request POST {s} body={s}", .{ self.url, logBytes(payload.written()) });
 
@@ -412,6 +413,7 @@ fn writeRequestPayload(
     messages: []const ai.ChatMessage,
     tools_json: []const u8,
     reasoning: ?ai.Reasoning,
+    max_output_tokens: ?u32,
 ) !void {
     std.debug.assert(model.len > 0);
     std.debug.assert(tools_json.len > 0);
@@ -428,6 +430,10 @@ fn writeRequestPayload(
     // carry no token counts. Some OpenAI-compatible servers ignore it, so the
     // parser treats usage as optional.
     try out.writeAll("],\"stream\":true,\"stream_options\":{\"include_usage\":true}");
+    if (max_output_tokens) |mot| {
+        try out.writeAll(",\"max_tokens\":");
+        try out.print("{d}", .{mot});
+    }
     if (!std.mem.eql(u8, tools_json, "[]")) {
         try out.writeAll(",\"tools\":");
         try out.writeAll(tools_json);
@@ -972,7 +978,7 @@ test "writeRequestPayload disables thinking for reasoning effort none" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "", &.{}, "[]", .{ .effort = .none });
+    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "", &.{}, "[]", .{ .effort = .none }, null);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_effort") == null);
@@ -982,7 +988,7 @@ test "writeRequestPayload emits prompt_cache_key from the session id" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "session-abc", &.{}, "[]", null);
+    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "session-abc", &.{}, "[]", null, null);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"session-abc\"") != null);
 }
@@ -991,7 +997,7 @@ test "writeRequestPayload omits prompt_cache_key when no session id is set" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "", &.{}, "[]", null);
+    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "", &.{}, "[]", null, null);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_key") == null);
 }
@@ -1002,7 +1008,7 @@ test "writeRequestPayload omits tools and tool_choice when there are none" {
     defer payload.deinit();
     // The background summarizer sends no tools ("[]"); the request must not carry
     // a `tool_choice` (rejected by strict providers) or invite a tool-call reply.
-    try writeRequestPayload(gpa, &payload.writer, "summarizer", "", &.{}, "[]", null);
+    try writeRequestPayload(gpa, &payload.writer, "summarizer", "", &.{}, "[]", null, null);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "tool_choice") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") == null);
@@ -1012,7 +1018,7 @@ test "writeRequestPayload keeps tools and tool_choice when tools are present" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "agent", "", &.{}, "[{\"type\":\"function\"}]", null);
+    try writeRequestPayload(gpa, &payload.writer, "agent", "", &.{}, "[{\"type\":\"function\"}]", null, null);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"auto\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":[{\"type\":\"function\"}]") != null);
@@ -1043,7 +1049,7 @@ test "writeRequestPayload serializes tool call ids as strings, not objects" {
 
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "test-model", "", messages[0..], "[{\"type\":\"function\"}]", null);
+    try writeRequestPayload(gpa, &payload.writer, "test-model", "", messages[0..], "[{\"type\":\"function\"}]", null, null);
     const body = payload.written();
 
     // The tool_call id must be a JSON string, not an object

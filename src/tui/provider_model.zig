@@ -718,6 +718,7 @@ pub fn updateCachedModelSelection(
             const base_url = provider.defaultBaseUrl() orelse "";
             self.cached_config.model_selection = .{
                 .provider = provider,
+                .provider_name = try self.gpa.dupe(u8, provider.label()),
                 .model = .{ .id = new_id, .reasoning_effort = effort },
                 .base_url = try self.gpa.dupe(u8, base_url),
                 .api_key = try self.gpa.dupe(u8, ""),
@@ -780,7 +781,7 @@ pub fn modelSelectionUpdates(
         for (providers) |*entry| entry.deinit(self.gpa);
         self.gpa.free(providers);
     }
-    providers[0] = .{ .provider = provider, .models = models };
+    providers[0] = .{ .name = try self.gpa.dupe(u8, provider.label()), .provider = provider, .models = models };
     models_moved = true;
     if (provider != .openai) {
         if (compatibleBaseUrl(self, provider)) |base_url| providers[0].base_url = .{ .custom = try self.gpa.dupe(u8, base_url) };
@@ -808,6 +809,7 @@ pub fn modelSelectionUpdates(
         .providers = providers,
         .model_selection = .{
             .provider = provider,
+            .provider_name = try self.gpa.dupe(u8, provider.label()),
             .model = .{ .id = ms_model_id, .reasoning_effort = effort },
             .base_url = ms_base_url,
             .api_key = ms_api_key,
