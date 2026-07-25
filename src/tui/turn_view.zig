@@ -245,12 +245,15 @@ pub const TurnView = struct {
         return visible_change;
     }
 
-    fn applyToolPreview(
+fn applyToolPreview(
         self: *TurnView,
         gpa: std.mem.Allocator,
         transcript: *transcript_mod.Transcript,
         tool: ai.ToolDelta,
     ) !bool {
+        // Streaming deltas can arrive with an empty name before the provider
+        // sends the tool-call name chunk. Skip until the name is populated.
+        if (tool.name.len == 0) return false;
         if (std.mem.eql(u8, tool.name, "bash")) {
             const command = agent_mod.parseCommand(gpa, tool.arguments) catch return false;
             gpa.free(command);
