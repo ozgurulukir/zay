@@ -31,6 +31,15 @@ The session store (`sessions.sqlite`) records the active `model_provider` and `m
 
 This means custom providers (e.g., `"qwen-cloud"` pointing to a DashScope endpoint) round-trip correctly across restarts, and the `provider` field in `config.json` preserves the user-chosen name rather than the internal enum label.
 
+### Empty `base_url` resolution
+
+When `model_selection.base_url` is synthesized from session metadata or legacy fields, it may be an empty string. Two guards prevent this from crashing the model catalogue loader:
+
+1. `collectConfiguredProviders` resolves an empty `base_url` through `provider.defaultBaseUrl()` before appending to the catalog job.
+2. `loadConfigured` falls back to `provider.defaultBaseUrl()` if `configured.base_url` is empty, skipping the provider entirely if no default exists.
+
+This ensures `listModels` never receives an empty URL, avoiding the `assert(base_url.len > 0)` panic on startup.
+
 ## Parallel
 
 Subagent workflows are achieved by the `/parallel` command which creates a separate git worktree for your agent to work in. The TUI supports tiling so you can have multiple agents on the screen at any time. We call each tile a `lane`. The maximum number of lanes that can be active is currently 4, because that is the empirical limit for the mental load required to manage all agents effectively.
