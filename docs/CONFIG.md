@@ -170,6 +170,8 @@ Each entry in `providers` is keyed by provider name. Builtin labels (`openai`, `
 
 > [!NOTE]
 > **Custom provider session persistence**: Custom provider names (e.g., `"qwen-cloud"`) are preserved in `config.json` and remembered across sessions. On resume, Nova resolves the provider from the `providers` map and restores the stored `baseURL`. If the stored URL is empty (legacy session metadata), it falls back to the provider's configured `baseURL` or builtin default, preventing startup crashes.
+>
+> **Dynamic providers (models.dev)** use a separate runtime-only `dynamic_provider_id` field (e.g., `"stepfun-ai"`) as the `provider_name` in `model_selection` so that `tryAttachOpenAiCompatibleFromConfig` can look up the correct API key in `auth.json`. The human-readable name (e.g., `"StepFun AI"`) is stored in `dynamic_provider_name` and used only for status bar display. This separation prevents the auth.json lookup from using the wrong key (e.g., `"openai_compatible"`) and failing with HTTP 402.
 
 ### MCP Server Configuration
 

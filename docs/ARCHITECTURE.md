@@ -40,6 +40,15 @@ When `model_selection.base_url` is synthesized from session metadata or legacy f
 
 This ensures `listModels` never receives an empty URL, avoiding the `assert(base_url.len > 0)` panic on startup.
 
+### Dynamic provider auth key resolution
+
+Dynamic providers selected from models.dev store their API key in `auth.json` under the provider ID (e.g., `"stepfun-ai"`), not the enum label (`"openai_compatible"`). Two fields track the identity at runtime:
+
+- `dynamic_provider_name`: human-readable display name (e.g., `"StepFun AI"`), used by the status bar
+- `dynamic_provider_id`: the auth.json key (e.g., `"stepfun-ai"`), used for session resume and API key lookup
+
+`updateCachedProviderConnection` mirrors `dynamic_provider_id` into `model_selection.provider_name` on selection, so `tryAttachOpenAiCompatibleFromConfig` looks up the correct auth.json entry on resume. `compatibleApiKey` also uses `dynamic_provider_id` directly for the lookup, avoiding the fragile stash fallback.
+
 ## Parallel
 
 Subagent workflows are achieved by the `/parallel` command which creates a separate git worktree for your agent to work in. The TUI supports tiling so you can have multiple agents on the screen at any time. We call each tile a `lane`. The maximum number of lanes that can be active is currently 4, because that is the empirical limit for the mental load required to manage all agents effectively.
