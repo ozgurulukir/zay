@@ -1201,6 +1201,21 @@ fn expandEnvVars(gpa: std.mem.Allocator, input: []const u8, env_map: *const std.
     return out.toOwnedSlice();
 }
 
+/// Build a remote (Streamable HTTP) MCP server config from a name and a raw
+/// URL, expanding any `{env:VAR}` placeholders against the process environment.
+/// Used by the TUI's "add server by URL" flow so env expansion stays in one
+/// place (the same `expandEnvVars` the JSON parser uses). Caller owns the
+/// result; free with `McpServerConfig.deinit`.
+pub fn mcpServerFromUrl(gpa: std.mem.Allocator, name: []const u8, raw_url: []const u8) !McpServerConfig {
+    var env_map = try loadEnvMap(gpa);
+    defer env_map.deinit();
+    return .{
+        .name = try gpa.dupe(u8, name),
+        .enabled = true,
+        .transport = .{ .sse = .{ .url = try expandEnvVars(gpa, raw_url, &env_map) } },
+    };
+}
+
 fn parseProviderConfig(gpa: std.mem.Allocator, name: []const u8, provider: Provider, value: std.json.Value) !ProviderConfig {
     var out: ProviderConfig = .{
         .name = try gpa.dupe(u8, name),
@@ -2355,6 +2370,18 @@ test "parseFile expands {env:VAR} placeholders in mcp url" {
     try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers.len);
     switch (cfg.mcp_servers[0].transport) {
         .sse => |t| try std.testing.expectEqualStrings("https://mcp.tavily.com/mcp/?key=", t.url),
+        .stdio => return error.Unexpected,
+    }
+}
+
+test "mcpServerFromUrl builds an enabled remote server with duped name and url" {
+    const gpa = std.testing.allocator;
+    var server = try mcpServerFromUrl(gpa, "tavily", "https://mcp.tavily.com/mcp/");
+    defer server.deinit(gpa);
+    try std.testing.expectEqualStrings("tavily", server.name);
+    try std.testing.expect(server.enabled);
+    switch (server.transport) {
+        .sse => |t| try std.testing.expectEqualStrings("https://mcp.tavily.com/mcp/", t.url),
         .stdio => return error.Unexpected,
     }
 }

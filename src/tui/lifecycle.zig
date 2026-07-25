@@ -72,6 +72,7 @@ pub fn deinitApp(self: *App) void {
     }
     self.provider_key_input.deinit(self.gpa);
     self.settings_text_input.deinit(self.gpa);
+    self.mcp_url_input.deinit(self.gpa);
     self.mcp_manager.deinit(self.io);
     if (self.cached_config_owned) {
         self.cached_config.deinit(self.gpa);

@@ -177,6 +177,9 @@ pub const App = struct {
     /// bash_classifier_url). Shared across all edit targets because only one
     /// can be active at a time. Owned; freed in `deinit`.
     settings_text_input: std.ArrayList(u8) = .empty,
+    /// Inline edit buffer for the MCP overlay's "add server by URL" form.
+    /// Owned; freed in `deinit`.
+    mcp_url_input: std.ArrayList(u8) = .empty,
     /// Live connectivity per catalogue provider, indexed by `catalogueProviders()`
     /// order. Derived from the model load's per-provider outcome (a key existing
     /// only proves it was entered, not that it works), so the picker badge and
@@ -411,6 +414,14 @@ pub const App = struct {
         var cut = items.len - 1;
         while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
         self.provider_key_input.shrinkRetainingCapacity(cut);
+    }
+
+    pub fn popMcpUrlInput(self: *App) void {
+        const items = self.mcp_url_input.items;
+        if (items.len == 0) return;
+        var cut = items.len - 1;
+        while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
+        self.mcp_url_input.shrinkRetainingCapacity(cut);
     }
 
     pub fn isCodexSignedIn(self: *const App) bool {

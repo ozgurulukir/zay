@@ -1324,3 +1324,57 @@ pub fn refreshMcpTools(self: *App) void {
     self.mcp_manager.syncFromConfigEx(self.gpa, self.io, &self.cached_config, runtime.home_dir, runtime.cwd);
     injectMcpTools(self);
 }
+
+/// Add a remote (Streamable HTTP) MCP server from a URL typed in the overlay's
+/// add-form. The server is appended to the live `cached_config` and connected
+/// immediately via `refreshMcpTools`. Runtime-only: it is NOT written to
+/// config.json (persistence is a follow-up). Best-effort — a failure leaves the
+/// config unchanged.
+pub fn addMcpServerByUrl(self: *App, raw_url: []const u8) !void {
+    _ = self.liveRuntime() orelse return;
+    const name = try deriveMcpServerName(self.gpa, raw_url);
+    defer self.gpa.free(name);
+    const server = try config_mod.mcpServerFromUrl(self.gpa, name, raw_url);
+    const new_len = self.cached_config.mcp_servers.len + 1;
+    const new_servers = self.gpa.realloc(self.cached_config.mcp_servers, new_len) catch |err| {
+        var owned = server;
+        owned.deinit(self.gpa);
+        return err;
+    };
+    new_servers[new_len - 1] = server;
+    self.cached_config.mcp_servers = new_servers;
+    refreshMcpTools(self);
+}
+
+/// Derive a server name from a URL's host (the part between "://" and the next
+/// "/"). Manual host extraction avoids full URI parsing, which rejects
+/// `{env:VAR}` placeholders in the query string. Falls back to "remote".
+fn deriveMcpServerName(gpa: std.mem.Allocator, url: []const u8) ![]u8 {
+    const after_scheme = if (std.mem.indexOf(u8, url, "://")) |i| url[i + 3 ..] else url;
+    const host_end = std.mem.indexOfScalar(u8, after_scheme, '/') orelse after_scheme.len;
+    const host = after_scheme[0..host_end];
+    if (host.len == 0) return try gpa.dupe(u8, "remote");
+    return try gpa.dupe(u8, host);
+}
+
+test "deriveMcpServerName extracts the URL host" {
+    const gpa = std.testing.allocator;
+    // {env:VAR} in the query must not break host extraction (no full URI parse).
+    {
+        const name = try deriveMcpServerName(gpa, "https://mcp.tavily.com/mcp/?tavilyApiKey={env:TAVILY_API_KEY}");
+        defer gpa.free(name);
+        try std.testing.expectEqualStrings("mcp.tavily.com", name);
+    }
+    // Host with an explicit port.
+    {
+        const name = try deriveMcpServerName(gpa, "http://localhost:8080/sse");
+        defer gpa.free(name);
+        try std.testing.expectEqualStrings("localhost:8080", name);
+    }
+    // No path — the whole authority is the host.
+    {
+        const name = try deriveMcpServerName(gpa, "https://example.org");
+        defer gpa.free(name);
+        try std.testing.expectEqualStrings("example.org", name);
+    }
+}

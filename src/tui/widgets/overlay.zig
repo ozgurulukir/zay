@@ -227,6 +227,7 @@ const OverlayInner = struct {
         var content: mcp_status.Content = .{
             .state = &app.pickers.mcp,
             .manager = &app.mcp_manager,
+            .url_input = app.mcp_url_input.items,
         };
         return content.widget().draw(ctx);
     }

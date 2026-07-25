@@ -179,10 +179,21 @@ Each entry in `mcpServers` is keyed by server name:
 | --- | --- | --- |
 | `command` | `string` | Executable for stdio transport. |
 | `args` | `string[]` | Command arguments for stdio transport. |
-| `url` | `string` | Server URL for SSE transport. |
+| `url` | `string` | Endpoint URL for remote Streamable HTTP transport. |
 | `enabled` | `boolean` | Whether this server is active (default `true`). |
 
-A server is either stdio (`command` + `args`) or SSE (`url`), never both. Misconfigured entries are caught at parse time.
+A server is either stdio (`command` + `args`) or remote (`url`), never both. Misconfigured entries are caught at parse time.
+
+`command`, `args`, and `url` support `{env:VAR}` placeholders, expanded against the process environment at parse time — keep secrets out of `config.json` (an unset variable expands to an empty string and logs a warning):
+
+```json
+"tavily": {
+  "url": "https://mcp.tavily.com/mcp/?tavilyApiKey={env:TAVILY_API_KEY}"
+}
+```
+
+> [!NOTE]
+> **Adding servers from the TUI**: the `/mcp` overlay's `a` (add) key connects a remote server by URL for the current session only. Such servers are **runtime-only** — they are not written to `config.json` and do not survive a restart. Add them here by hand to make them permanent. See [MCP Integration](MCP.md) for details.
 
 > [!IMPORTANT]
 > **API Keys Security Invariant**: API keys (`api_key`) are **NEVER** serialized into `config.json`. API keys are stored separately in `~/.config/nova/auth.json` with strict file permissions (`0o600`).

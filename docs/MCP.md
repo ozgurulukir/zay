@@ -11,10 +11,16 @@ APIs, and file services.
 Nova Agent supports two standard MCP transports:
 
 1. **Stdio (`stdio`)**: Child processes launched locally by Nova Agent (e.g. via `npx`,
-   `python`, `uv`, or precompiled binaries). **Implemented.**
-2. **HTTP/SSE (`sse`)**: Remote MCP server connections communicating via Server-Sent
-   Events and HTTP POST JSON-RPC 2.0 requests. **Not yet implemented** — `url`-based
-   servers are parsed from config but not connected.
+   `python`, `uv`, or precompiled binaries).
+2. **Streamable HTTP (`sse`)**: Remote MCP servers reached over HTTP. Each JSON-RPC
+   request is a `POST` with `Accept: application/json, text/event-stream`; the response
+   is either a single `application/json` body or a `text/event-stream` searched for the
+   matching response id. Sessions are tracked via the `Mcp-Session-Id` header
+   (Streamable HTTP, protocol `2025-03-26`). The config key is still named `sse` for
+   backward compatibility, but the wire protocol is the modern Streamable HTTP transport.
+
+A server carries **exactly one** transport: a `command` makes it stdio, a `url` makes it
+remote. Providing both (or neither) is rejected at parse time.
 
 ---
 
@@ -24,7 +30,7 @@ MCP servers are configured inside global `~/.config/nova/config.json` or project
 `<cwd>/.nova/config.json` under the `"mcpServers"` (Claude Desktop / Cursor format) or
 `"mcp_servers"` key.
 
-### Example Configuration (Claude Desktop Format)
+### Example Configuration
 
 ```json
 {
@@ -39,8 +45,8 @@ MCP servers are configured inside global `~/.config/nova/config.json` or project
       "args": ["-y", "@modelcontextprotocol/server-github"],
       "enabled": true
     },
-    "remote-db": {
-      "url": "https://mcp.internal.dev/sse",
+    "tavily": {
+      "url": "https://mcp.tavily.com/mcp/?tavilyApiKey={env:TAVILY_API_KEY}",
       "enabled": true
     }
   }
@@ -49,44 +55,72 @@ MCP servers are configured inside global `~/.config/nova/config.json` or project
 
 ### Server Configuration Options
 
-| Field     | Type       | Description                                                                                     |
-| --------- | ---------- | ----------------------------------------------------------------------------------------------- |
-| `command` | `string`   | Binary / CLI command to execute for stdio servers (e.g. `npx`, `python`).                       |
-| `args`    | `string[]` | Command line arguments passed to the stdio child process.                                       |
-| `url`     | `string`   | Endpoint URL for remote HTTP/SSE servers (e.g. `https://mcp.dev/sse`). SSE not yet implemented. |
-| `enabled` | `boolean`  | `true` (default) to connect and expose tools; `false` to disable.                               |
+| Field     | Type       | Description                                                                                  |
+| --------- | ---------- | -------------------------------------------------------------------------------------------- |
+| `command` | `string`   | Binary / CLI command to execute for stdio servers (e.g. `npx`, `python`).                    |
+| `args`    | `string[]` | Command line arguments passed to the stdio child process.                                    |
+| `url`     | `string`   | Endpoint URL for remote Streamable HTTP servers (e.g. `https://mcp.tavily.com/mcp/`).        |
+| `enabled` | `boolean`  | `true` (default) to connect and expose tools; `false` to disable.                            |
+
+### Environment variable expansion (`{env:VAR}`)
+
+`command`, `args`, and `url` values support `{env:VAR}` placeholders, expanded against
+the process environment at parse time. This keeps secrets (API keys, tokens) out of
+`config.json` — store them in the environment instead. A placeholder whose variable is
+unset expands to an empty string and logs a warning, so a missing secret surfaces rather
+than silently producing a broken command or URL.
+
+```json
+"tavily": {
+  "url": "https://mcp.tavily.com/mcp/?tavilyApiKey={env:TAVILY_API_KEY}"
+}
+```
 
 ---
 
 ## 3. Connection Lifecycle
 
-MCP server connections follow a three-phase lifecycle:
+MCP server connections follow a multi-phase lifecycle:
 
 ### Phase A — Registration (app startup, no I/O)
 
-`McpManager.syncFromConfig()` creates `McpClient` objects from config. No subprocess
-is spawned — the client is marked as `[CONNECTING]`. This phase is instant and never
-blocks the TUI.
+`McpManager.syncFromConfig()` creates `McpClient` objects from config. No subprocess is
+spawned and no network call is made — the client is marked as `[CONNECTING]`. This phase
+is instant and never blocks the TUI.
 
-### Phase B — Connection (provider connect or `/mcp` open)
+### Phase B — Connection (startup, provider connect, or `/mcp` open)
 
 `McpManager.syncFromConfigEx()` performs real I/O for each enabled server:
 
-1. **Spawn**: Subprocess launched via `command` + `args` with stdin/stdout pipes.
-2. **Handshake**: JSON-RPC `initialize` request → server responds with protocol version
+- **Stdio**: subprocess launched via `command` + `args` with stdin/stdout pipes.
+- **Streamable HTTP**: connectionless — nothing is spawned; each JSON-RPC call is a fresh
+  `POST`.
+
+Then, for both transports:
+
+1. **Handshake**: JSON-RPC `initialize` request → server responds with protocol version
    and capabilities → client sends `notifications/initialized`.
-3. **Discovery**: JSON-RPC `tools/list` request → server returns tool schemas →
-   parsed into `tools_common.Schema` format.
+2. **Discovery**: JSON-RPC `tools/list` request → server returns tool schemas → parsed
+   into `tools_common.Schema` format.
 
-Each step has a **30-second timeout** via `std.posix.poll`. If a server doesn't respond
-within that window, it's marked as `[FAILED]` with an error message.
+Stdio reads use a **30-second timeout** via `std.posix.poll`; remote requests use the
+HTTP client's socket timeout. A server that doesn't respond in time is marked `[FAILED]`
+with an error message.
 
-### Phase C — Tool injection (provider connect)
+### Phase C — Tool injection (startup and on every MCP change)
 
-When the user connects to an AI provider, `buildMcpToolSchemas()` collects all
-discovered MCP tools from `.connected` servers and injects them into the AI config's
-`tools` array alongside built-in tools (bash). The model sees them as regular
-function-calling tools with namespaced names (`mcp__<server>__<tool>`).
+The AI client serializes its tool list (`tools_json`) once, at attach time. Because the
+client is attached during session init — before the MCP manager exists — Nova rebuilds
+and re-injects the serialized tools whenever the MCP tool set changes:
+
+- **On startup** (`run()`), after configured servers connect.
+- **On `/mcp` open** and after **toggle / reconnect / disconnect** in the overlay.
+- **On provider connect** (the interactive `/connect` flow).
+
+`buildMcpToolSchemas()` collects all discovered tools from `.connected` servers and
+`updateMcpTools()` rebuilds the client's serialized tool list in place, alongside the
+built-in tools. The model sees them as regular function-calling tools with namespaced
+names (`mcp__<server>__<tool>`).
 
 ### Phase D — Execution (agent turn)
 
@@ -95,26 +129,25 @@ When the model calls an MCP tool:
 1. Executor parses `mcp__<server>__<tool>` to extract server and tool name.
 2. Finds the connected `McpClient` by server name.
 3. Sends `tools/call` JSON-RPC request with the tool name and arguments.
-4. Parses the response `content` array (text blocks) and returns the result to the
-   model.
+4. Parses the response `content` array (text blocks) and returns the result to the model.
 
 ---
 
 ## 4. Dynamic Tool Discovery & Namespacing
 
-- When Nova Agent starts or when the MCP overlay is opened, `McpManager` spawns each
-  stdio server subprocess, performs the MCP `initialize` handshake, and queries
-  `tools/list` via JSON-RPC.
+- On startup and whenever the MCP overlay is opened, `McpManager` connects each enabled
+  server (spawning stdio subprocesses or POSTing to remote endpoints), performs the MCP
+  `initialize` handshake, and queries `tools/list` via JSON-RPC.
 - Exposed MCP tools are automatically namespaced as:
   `mcp__<server_name>__<tool_name>`
-  _(Example: `mcp__memory__create_entities`)_
+  _(Example: `mcp__tavily__tavily_search`)_
 - Tool schemas (`inputSchema`) are parsed from JSON Schema into Nova's internal
-  `tools_common.Schema` format, preserving property types, descriptions, and
-  required fields.
-- Discovered tools are injected into the AI provider's `tools` array alongside
-  built-in tools (bash), so the model can call them directly.
-- **Planned**: `notifications/tools/list_changed` for real-time tool catalog updates
-  without restarting the session.
+  `tools_common.Schema` format, preserving property types, descriptions, and required
+  fields.
+- Discovered tools are injected into the AI provider's `tools` array alongside built-in
+  tools (bash), so the model can call them directly.
+- **Planned**: `notifications/tools/list_changed` for real-time tool catalog updates.
+  Until then, reopen `/mcp` (or press `r`) to re-sync the catalog manually.
 
 ---
 
@@ -124,14 +157,30 @@ Nova Agent includes a dedicated TUI monitoring screen:
 
 - Run `/mcp` in chat to bring up the MCP Status Overlay.
 - View connection badges: `[CONNECTED]`, `[CONNECTING]`, `[FAILED]`, `[DISABLED]`.
+- View the **transport** per server: `(stdio)` or `(remote)`.
 - View **tool count** per server (number of tools discovered via `tools/list`).
 - View **ping latency** in milliseconds (from the `initialize` handshake round-trip).
 - View **error messages** for failed servers (e.g. "Handshake failed: Timeout").
 - Controls:
-  - **Space**: Toggle enable / disable status. On a failed server, toggling
-    triggers a reconnect attempt.
+  - **Space**: Toggle enable / disable status. On a failed server, toggling triggers a
+    reconnect attempt.
+  - **a**: Add a remote server by URL (opens a single-line input form; paste is
+    supported). See below.
   - **Ctrl+R** / **r**: Reconnect the selected server (stop + restart + re-discover).
+  - **d**: Disconnect the selected server.
   - **Esc** / **q**: Close overlay.
+
+### Adding a remote server by URL (`a`)
+
+Press `a` in the overlay to open a URL input form. Type or paste a remote MCP endpoint
+(`{env:VAR}` placeholders are expanded), then press **Enter** to connect it immediately
+or **Esc** to cancel. The server name is derived from the URL host.
+
+> [!NOTE]
+> **Runtime-only**: servers added through the overlay live in the running session's
+> config only — they are **not** written to `config.json` and disappear on restart. To
+> make a server permanent, add it to `mcpServers` in `~/.config/nova/config.json` (or the
+> project `.nova/config.json`) by hand.
 
 ---
 
@@ -140,20 +189,22 @@ Nova Agent includes a dedicated TUI monitoring screen:
 > [!IMPORTANT]
 > **Fault Isolation**: If a local stdio MCP child process crashes or terminates
 > unexpectedly, Nova Agent catches the signal, flags the server as `[FAILED]`, and
-> isolates the fault. Nova Agent TUI and agent reasoning loop continue running
-> without interruption.
+> isolates the fault. The Nova Agent TUI and agent reasoning loop continue running
+> without interruption. A remote server that errors or drops its session is likewise
+> flagged `[FAILED]` (a `404` is treated as an expired session) without affecting the
+> rest of the app.
 
 ---
 
 ## 7. Known Limitations
 
-- **SSE transport**: Remote `url`-based MCP servers are not yet supported. Only
-  stdio (`command` + `args`) servers work.
-- **Auto-connect**: When Nova Agent auto-connects to a saved provider at startup,
-  MCP tools are not yet available. Reconnect the provider after MCP servers are
-  connected to include MCP tools.
-- **`notifications/tools/list_changed`**: Not yet handled. Tool catalog is static
-  after initial discovery.
-- **Server names with underscores**: The `mcp__server__tool` namespace uses `__` as
-  separator. Server names containing `_` will be incorrectly parsed. Use hyphens
-  instead.
+- **`notifications/tools/list_changed`**: Not yet handled. The tool catalog is static
+  after discovery; reopen `/mcp` (or press `r`) to re-sync manually.
+- **Server-push requests**: Nova does not act on server-initiated Streamable HTTP GET
+  streams (sampling/roots). The POST path (tool discovery + tool calls) is fully
+  supported, which covers normal tool use.
+- **Overlay-added servers are runtime-only**: not persisted to `config.json` (see §5).
+- **Server names with underscores**: The `mcp__server__tool` namespace uses `__` as the
+  separator. Server names containing `_` will be incorrectly parsed. Use hyphens instead.
+- **OAuth 2.1**: Remote servers requiring OAuth (`401` + `WWW-Authenticate`) are not yet
+  supported. Use a server that accepts an API key in the URL or headers via `{env:VAR}`.

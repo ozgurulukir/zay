@@ -10,9 +10,13 @@ const StylePalette = @import("../style.zig").Palette;
 
 pub const State = struct {
     selection: usize = 0,
+    /// True while the "add server by URL" form is open. The overlay swaps the
+    /// server list for a single-line URL input; Enter submits, Esc cancels.
+    adding: bool = false,
 
     pub fn reset(self: *State) void {
         self.selection = 0;
+        self.adding = false;
     }
 
     pub fn moveUp(self: *State) void {
@@ -29,6 +33,9 @@ pub const State = struct {
 pub const Content = struct {
     state: *State,
     manager: *const mcp_manager.McpManager,
+    /// Current text of the "add server by URL" form (borrowed from the App's
+    /// `mcp_url_input` buffer). Only rendered while `state.adding`.
+    url_input: []const u8 = "",
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -52,9 +59,19 @@ pub const Content = struct {
         });
         try panel.lineStyledAt(&surface, 2, summary, ctx, 2, StylePalette.info);
 
+        // The add-server form replaces the list while active.
+        if (self.state.adding) {
+            try panel.lineStyledAt(&surface, 4, "Add remote MCP server (Streamable HTTP):", ctx, 2, StylePalette.panel_header);
+            const prompt = try std.fmt.allocPrint(ctx.arena, "  > {s}_", .{self.url_input});
+            try panel.lineStyledAt(&surface, 6, prompt, ctx, 2, StylePalette.selected_item);
+            try panel.lineStyledAt(&surface, height - 2, "[Enter] Add Server  |  [Esc] Cancel", ctx, 2, StylePalette.thinking_body);
+            return surface;
+        }
+
         var row: u16 = 4;
         if (self.manager.clients.items.len == 0) {
-            try panel.lineStyledAt(&surface, row, "No MCP servers configured in config.json under \"mcp_servers\".", ctx, 2, StylePalette.thinking_body);
+            try panel.lineStyledAt(&surface, row, "No MCP servers configured. Press [a] to add a remote server by URL.", ctx, 2, StylePalette.thinking_body);
+            try panel.lineStyledAt(&surface, height - 2, "[a] Add Server  |  [Esc] Close", ctx, 2, StylePalette.thinking_body);
             return surface;
         }
 
@@ -65,24 +82,28 @@ pub const Content = struct {
 
             const badge = client.status().label();
             const tool_count = client.tools.items.len;
+            const transport_tag: []const u8 = switch (client.transport) {
+                .stdio => "stdio",
+                .sse => "remote",
+            };
             const line = if (client.lifecycle == .failed)
                 try std.fmt.allocPrint(
                     ctx.arena,
-                    "  [{s}] {s} - {d} tools ({d}ms)  ERROR: {s}",
-                    .{ badge, client.name, tool_count, client.latency_ms, client.lifecycle.failed.reason },
+                    "  [{s}] {s} ({s}) - {d} tools ({d}ms)  ERROR: {s}",
+                    .{ badge, client.name, transport_tag, tool_count, client.latency_ms, client.lifecycle.failed.reason },
                 )
             else
                 try std.fmt.allocPrint(
                     ctx.arena,
-                    "  [{s}] {s} - {d} tools ({d}ms)",
-                    .{ badge, client.name, tool_count, client.latency_ms },
+                    "  [{s}] {s} ({s}) - {d} tools ({d}ms)",
+                    .{ badge, client.name, transport_tag, tool_count, client.latency_ms },
                 );
             const style = if (is_selected) StylePalette.selected_item else StylePalette.thinking_body;
             try panel.lineStyledAt(&surface, row, line, ctx, 2, style);
             row += 2;
         }
 
-        try panel.lineStyledAt(&surface, height - 2, "[Space] Toggle Enable/Disable  |  [Ctrl+R] Reconnect  |  [Esc] Close", ctx, 2, StylePalette.thinking_body);
+        try panel.lineStyledAt(&surface, height - 2, "[Space] Toggle  |  [a] Add Server  |  [Ctrl+R] Reconnect  |  [Esc] Close", ctx, 2, StylePalette.thinking_body);
 
         return surface;
     }

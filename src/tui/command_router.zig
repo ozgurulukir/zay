@@ -438,6 +438,8 @@ const SettingsMode = struct {
 
 const McpMode = struct {
     fn handle(app: *App, key: vaxis.Key) !bool {
+        // The add-server form owns all keys until it is submitted or cancelled.
+        if (app.pickers.mcp.adding) return handleAddInput(app, key);
         if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
             tui.closeMcp(app);
             return true;
@@ -484,7 +486,45 @@ const McpMode = struct {
             }
             return true;
         }
+        if (key.matches('a', .{})) {
+            app.pickers.mcp.adding = true;
+            app.mcp_url_input.clearRetainingCapacity();
+            return true;
+        }
         return false;
+    }
+
+    /// Text input for the "add server by URL" form. Enter submits, Esc cancels;
+    /// printable keys append to the URL buffer and everything else is swallowed.
+    fn handleAddInput(app: *App, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.escape, .{})) {
+            app.pickers.mcp.adding = false;
+            app.mcp_url_input.clearRetainingCapacity();
+            return true;
+        }
+        if (isEnterKey(key)) {
+            const url = std.mem.trim(u8, app.mcp_url_input.items, " \t\r\n");
+            if (url.len > 0) provider_model.addMcpServerByUrl(app, url) catch {};
+            app.pickers.mcp.adding = false;
+            app.mcp_url_input.clearRetainingCapacity();
+            return true;
+        }
+        if (key.matches(vaxis.Key.backspace, .{})) {
+            app.popMcpUrlInput();
+            return true;
+        }
+        if (key.text) |text| {
+            const trimmed = std.mem.trim(u8, text, "\r\n");
+            if (trimmed.len > 0) {
+                try app.mcp_url_input.appendSlice(app.gpa, trimmed);
+                return true;
+            }
+        } else if (key.codepoint >= 32 and key.codepoint <= 126 and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
+            const byte: u8 = @intCast(key.codepoint);
+            try app.mcp_url_input.append(app.gpa, byte);
+            return true;
+        }
+        return true;
     }
 };
 

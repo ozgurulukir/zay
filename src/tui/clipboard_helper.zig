@@ -42,7 +42,12 @@ pub fn pasteToFocusedInput(app: *App, text: []const u8) !void {
         .save_message => {
             try app.inputs.palette.insertSliceAtCursor(clean_text);
         },
-        .lanes, .help, .mcp => {},
+        .mcp => {
+            if (app.pickers.mcp.adding) {
+                try app.mcp_url_input.appendSlice(app.gpa, clean_text);
+            }
+        },
+        .lanes, .help => {},
     }
 }
 

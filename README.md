@@ -34,7 +34,7 @@ Add the binary (`zig-out/bin/nova`) to your PATH so you can invoke it from anywh
 
 - **`/connect`**: Configure AI providers, custom endpoints, and API key management.
 - **`/model`**: Select LLM model & reasoning effort.
-- **`/mcp`**: Real-time Model Context Protocol server status, active tool counts, latency monitoring, server toggling (`Space`/`Enter`), and schema re-syncing (`Ctrl+R`).
+- **`/mcp`**: Real-time Model Context Protocol server status (stdio & remote transports), active tool counts, latency monitoring, server toggling (`Space`/`Enter`), schema re-syncing (`Ctrl+R`), and adding a remote server by URL (`a`, runtime-only).
 - **`/settings`**: Interactive tabbed configuration panel (General, System Prompt, Advanced, About) with `Ctrl+S` instant save.
 - **`/copy` & `/paste`**: Copy selected transcript message blocks or diff comments to the system clipboard; paste into prompt fields (`Ctrl+V` / `Shift+Insert`).
 - **`/help`**: Scrollable quick reference guide with keyboard and mouse wheel navigation.
@@ -92,7 +92,7 @@ of `src/tui/` is split by concern:
 
 ### Core Systems & Engine
 
-- **`mcp/manager.zig` & `mcp/client.zig`**: Multi-server Model Context Protocol supervisor with layer-merged `mcp_servers` configuration (`mcp_servers`, `mcpServers`, `mcp` aliases) and automatic tool schema discovery across Nova standard directories (`~/.config/nova/mcp/`, `<cwd>/.nova/mcp/`). `McpServerConfig.transport` is a `union(enum) { stdio, sse }` — a server is either stdio (command+args) or sse (url), never both. `McpClient` carries a `lifecycle: union(enum) { disabled, stdio, sse, failed }` for runtime state.
+- **`mcp/manager.zig` & `mcp/client.zig`**: Multi-server Model Context Protocol supervisor with layer-merged `mcp_servers` configuration (`mcp_servers`, `mcpServers`, `mcp` aliases) and automatic tool schema discovery across Nova standard directories (`~/.config/nova/mcp/`, `<cwd>/.nova/mcp/`). `McpServerConfig.transport` is a `union(enum) { stdio, sse }` — a server is either stdio (command+args) or remote Streamable HTTP (url), never both; `{env:VAR}` placeholders in command/args/url expand from the environment. `McpClient` carries a `lifecycle: union(enum) { disabled, stdio, sse, failed }` for runtime state. Discovered tools are re-injected into the live AI client (`updateMcpTools`) on startup and whenever the server set changes, so the model sees `mcp__<server>__<tool>` definitions without a provider reconnect.
 - **`clipboard.zig`**: Cross-platform system clipboard interface supporting OSC 52 terminal escape sequences (`\x1b]52;c;<base64>\x07`) with OS-native execution fallback (`wl-copy`/`xclip`/`pbcopy`/`powershell` via Nova's `bash` subsystem).
 - **`config.zig`**: System configuration parser and disk serializer (`~/.config/nova/config.json`). Controls system prompt, thinking/reasoning toggles, MCP servers, and classifier parameters. `Config.model_selection: ?ModelSelection` is the typed view replacing 9 loose optional fields — `ModelSelection` carries non-optional `provider`/`model`/`base_url`/`api_key`.
 - **`modelsdev.zig`**: Provider registry integration combining built-in static providers with dynamic data from `https://models.dev/api.json`. Supports local disk caching at `~/.config/nova/cache/models.dev/api.json` and safe string arena management (`StringRef` / `UnresolvedProvider`).
