@@ -1,10 +1,9 @@
 {
-  "version": 1,
+  "version": "1.0.0",
   "provider": "ollama",
-  "use_responses_endpoint": false,
-  "enable_thinking": false,
-  "model": "ollama/llama3",
-  "providers": {"ollama":{
-  "base_url": "http://localhost:11434",
-  "models": {"llama3":{"reasoningEffort":"medium"}}}}
+  "useResponsesEndpoint": false,
+  "enableThinking": false,
+  "defaultModel": "ollama/llama3",
+  "providers": {"ollama":{"baseURL":"http://localhost:11434",
+  "models": {"llama3":{"reasoningEffort":"default"}}}}
 }

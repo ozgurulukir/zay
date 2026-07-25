@@ -483,6 +483,8 @@ const ToolCallBuilder = struct {
     /// Finalise the accumulated chunks into a canonical `ai.ToolCall`.
     /// When the server omitted an id, synthesise one from `tool_call_seq`
     /// — the agent never sees an empty id.
+    /// Arguments are sanitised (markdown fences stripped, empty → "{}")
+    /// so downstream consumers (executor, display) always see valid JSON.
     fn toToolCall(self: *ToolCallBuilder, gpa: std.mem.Allocator, tool_call_seq: *u64) !ai.ToolCall {
         const id = if (self.id.items.len > 0)
             try self.id.toOwnedSlice(gpa)
@@ -491,10 +493,19 @@ const ToolCallBuilder = struct {
             tool_call_seq.* += 1;
             break :id_blk minted;
         };
+        const raw_args = try self.arguments.toOwnedSlice(gpa);
+        const sanitized = sanitizeToolArguments(raw_args);
+        const arguments = if (sanitized.ptr == raw_args.ptr and sanitized.len == raw_args.len)
+            raw_args
+        else blk: {
+            const duped = try gpa.dupe(u8, sanitized);
+            gpa.free(raw_args);
+            break :blk duped;
+        };
         return .{
             .call_id = .{ .value = id },
             .name = try self.name.toOwnedSlice(gpa),
-            .arguments = try self.arguments.toOwnedSlice(gpa),
+            .arguments = arguments,
         };
     }
 };
