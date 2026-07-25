@@ -487,10 +487,12 @@ pub fn submitProviderSetup(self: *App, provider: config_mod.Provider) !void {
         self,
     );
 
-    // Clear any dynamic provider name when switching to a builtin.
+    // Clear any dynamic provider name/id when switching to a builtin.
     if (self.cached_config_owned) {
         if (self.cached_config.dynamic_provider_name) |prev| self.gpa.free(prev);
         self.cached_config.dynamic_provider_name = null;
+        if (self.cached_config.dynamic_provider_id) |prev| self.gpa.free(prev);
+        self.cached_config.dynamic_provider_id = null;
     }
 
     // With no key, connect via the provider's anonymous sentinel (e.g.
@@ -554,11 +556,14 @@ pub fn submitDynamicProviderSetup(self: *App, provider: modelsdev.Provider) !voi
 
         self.cached_config.provider = .openai_compatible;
 
-        // Stash the provider *id* (the auth.json key, e.g. "stepfun-ai"),
-        // NOT the human-readable name. provider_name in model_selection must
-        // match the auth.json key so resume can resolve the stored API key.
+        // Stash the human-readable provider name for the status bar.
         if (self.cached_config.dynamic_provider_name) |prev| self.gpa.free(prev);
-        self.cached_config.dynamic_provider_name = try self.gpa.dupe(u8, provider.id);
+        self.cached_config.dynamic_provider_name = try self.gpa.dupe(u8, provider.name);
+
+        // Stash the provider id (auth.json key, e.g. "stepfun-ai") so
+        // model_selection.provider_name and auth lookups resolve correctly.
+        if (self.cached_config.dynamic_provider_id) |prev| self.gpa.free(prev);
+        self.cached_config.dynamic_provider_id = try self.gpa.dupe(u8, provider.id);
     }
 
     const connect_key = if (key.len > 0) key else (provider.anonymous_key orelse key);
@@ -617,6 +622,10 @@ pub fn submitConfigProviderSetup(self: *App, provider: config_mod.ProviderConfig
 
         if (self.cached_config.dynamic_provider_name) |prev| self.gpa.free(prev);
         self.cached_config.dynamic_provider_name = try self.gpa.dupe(u8, provider.name);
+
+        // For config providers, the auth.json key equals the config map key.
+        if (self.cached_config.dynamic_provider_id) |prev| self.gpa.free(prev);
+        self.cached_config.dynamic_provider_id = try self.gpa.dupe(u8, provider.name);
     }
 
     try startOpenAiCompatibleModelLoad(self, base_url, key, provider.name);
@@ -827,7 +836,7 @@ pub fn updateCachedProviderConnection(self: *App, provider: config_mod.Provider)
         // legacy fields. Mirror them into model_selection so applyFromConfig
         // resolves the correct endpoint and auth.json key on resume.
         if (self.cached_config.base_url) |url| try replaceCachedBaseUrl(self, url);
-        if (self.cached_config.dynamic_provider_name) |name| try replaceCachedProviderName(self, name);
+        if (self.cached_config.dynamic_provider_id) |id| try replaceCachedProviderName(self, id);
         return;
     }
     if (provider.defaultBaseUrl()) |base_url| try replaceCachedBaseUrl(self, base_url);
@@ -895,7 +904,7 @@ pub fn modelSelectionUpdates(
     // ("openai_compatible"). Using the label would make resume look up the
     // wrong auth.json entry and connect with an empty API key.
     const resolved_name: []const u8 = if (provider == .openai_compatible)
-        self.cached_config.dynamic_provider_name orelse provider.label()
+        self.cached_config.dynamic_provider_id orelse provider.label()
     else
         provider.label();
 
@@ -1082,8 +1091,17 @@ pub fn compatibleBaseUrl(self: *const App, provider: config_mod.Provider) ?[]con
 /// Resolve the API key for an OpenAI-compatible provider: a key stored in
 /// auth.json wins, then the env/config key, then the provider's anonymous
 /// sentinel (e.g. OpenCode Zen's `public`), then the local-daemon sentinel.
+/// For dynamic/custom providers (.openai_compatible), the auth.json key is
+/// the stashed provider id (e.g. "stepfun-ai"), not the enum label.
 pub fn compatibleApiKey(self: *const App, provider: config_mod.Provider) []const u8 {
-    if (self.provider_api_keys.get(provider.label())) |key| return key;
+    // Dynamic/custom providers: auth.json key is the stashed provider id.
+    if (provider == .openai_compatible) {
+        if (self.cached_config.dynamic_provider_id) |id| {
+            if (self.provider_api_keys.get(id)) |key| return key;
+        }
+    } else {
+        if (self.provider_api_keys.get(provider.label())) |key| return key;
+    }
     if (self.cached_config.api_key) |key| return key;
     if (provider.anonymousApiKey()) |anon| return anon;
     return providerLocalApiKey(provider);

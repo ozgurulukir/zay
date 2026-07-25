@@ -416,6 +416,12 @@ pub const Config = struct {
     /// Falls back to `provider.label()` when null.
     dynamic_provider_name: ?[]u8 = null,
 
+    /// Runtime-only: the provider ID used as the auth.json key
+    /// (e.g. "stepfun-ai"). For dynamic providers this is `provider.id`;
+    /// for config providers it equals `provider.name`. Used to resolve
+    /// the stored API key on session resume.
+    dynamic_provider_id: ?[]u8 = null,
+
     /// The default schema version written by `serialize` when
     /// `version` is null.
     pub const default_version = "2.0.0";
@@ -433,6 +439,7 @@ pub const Config = struct {
         if (self.mcp_servers.len > 0) gpa.free(self.mcp_servers);
         if (self.system_prompt) |s| gpa.free(s);
         if (self.dynamic_provider_name) |s| gpa.free(s);
+        if (self.dynamic_provider_id) |s| gpa.free(s);
         if (self.model_selection) |*ms| ms.deinit(gpa);
         self.* = undefined;
     }
@@ -457,6 +464,7 @@ pub const Config = struct {
         for (self.mcp_servers, 0..) |server, index| out.mcp_servers[index] = try server.clone(gpa);
         if (self.system_prompt) |s| out.system_prompt = try gpa.dupe(u8, s);
         if (self.dynamic_provider_name) |s| out.dynamic_provider_name = try gpa.dupe(u8, s);
+        if (self.dynamic_provider_id) |s| out.dynamic_provider_id = try gpa.dupe(u8, s);
         if (self.model_selection) |ms| out.model_selection = try ms.clone(gpa);
         return out;
     }
