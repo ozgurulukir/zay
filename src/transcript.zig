@@ -245,7 +245,7 @@ pub const Transcript = struct {
             .body = owned_body,
             .expanded = expanded,
         };
-        try self.messages.append(gpa, payloadToMessage(kind, payload));
+        try self.messages.append(gpa, try payloadToMessage(kind, payload));
         if (kind.selectable() and following_tail) self.selected = index;
         return index;
     }
@@ -344,7 +344,7 @@ pub const Transcript = struct {
             .body = owned_body,
             .expanded = expanded,
         };
-        try self.messages.insert(gpa, index, payloadToMessage(kind, payload));
+        try self.messages.insert(gpa, index, try payloadToMessage(kind, payload));
         if (self.selected) |selected| {
             if (selected >= index) self.selected = selected + 1;
         }
@@ -574,7 +574,7 @@ pub const Transcript = struct {
     }
 };
 
-fn payloadToMessage(kind: MessageKind, payload: Basic) Message {
+fn payloadToMessage(kind: MessageKind, payload: Basic) !Message {
     return switch (kind) {
         .user => .{ .user = payload },
         .agent => .{ .agent = payload },
@@ -585,7 +585,7 @@ fn payloadToMessage(kind: MessageKind, payload: Basic) Message {
         .notice => .{ .notice = payload },
         .success => .{ .success = payload },
         .info => .{ .info = payload },
-        .tool => @panic("payloadToMessage: tool uses ToolView, not Basic"),
+        .tool => error.InvalidToolRole,
     };
 }
 

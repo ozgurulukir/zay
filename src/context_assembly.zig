@@ -363,7 +363,7 @@ fn makeTextMessage(gpa: std.mem.Allocator, role: ai.Role, text: []const u8) !ai.
         .system => .{ .system = .{ .content = blocks } },
         .user => .{ .user = .{ .content = blocks } },
         .assistant => .{ .assistant = .{ .content = blocks } },
-        .tool => @panic("makeTextMessage: tool role requires makeToolMessage"),
+        .tool => error.InvalidToolRole,
     };
 }
 

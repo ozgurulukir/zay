@@ -105,6 +105,6 @@ fn textMessage(gpa: std.mem.Allocator, role: ai.Role, text: []const u8) !ai.Chat
         .system => .{ .system = .{ .content = blocks } },
         .user => .{ .user = .{ .content = blocks } },
         .assistant => .{ .assistant = .{ .content = blocks } },
-        .tool => @panic("textMessage: tool role requires makeToolMessage"),
+        .tool => error.InvalidToolRole,
     };
 }

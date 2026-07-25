@@ -18,6 +18,8 @@ def _raw_stdout():
     try:
         sys.stdout.reconfigure(newline="\n")
     except (AttributeError, ValueError):
+        # reconfigure() unavailable when stdout is redirected to pipe/file;
+        # safe to continue with default newline handling.
         pass
     return sys.stdout
 

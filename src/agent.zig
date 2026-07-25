@@ -699,7 +699,7 @@ pub const Agent = struct {
             .system => .{ .system = .{ .content = blocks } },
             .user => .{ .user = .{ .content = blocks } },
             .assistant => .{ .assistant = .{ .content = blocks } },
-            .tool => @panic("makeTextMessage: tool role requires makeToolMessage"),
+            .tool => error.InvalidToolRole,
         };
     }
 
