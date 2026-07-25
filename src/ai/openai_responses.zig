@@ -14,6 +14,11 @@ pub const Client = struct {
         self.* = undefined;
     }
 
+    /// Rebuild the serialized tool definitions after the MCP tool set changes.
+    pub fn updateMcpTools(self: *Client, mcp_tools: []const ai.McpToolSchema) !void {
+        try self.core_client.updateMcpTools(mcp_tools);
+    }
+
     pub fn prompt(self: *Client, messages: []const ai.ChatMessage, observer: anytype) !ai.Turn {
         return self.core_client.prompt(messages, observer);
     }

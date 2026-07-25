@@ -88,6 +88,15 @@ pub const Client = struct {
         self.* = undefined;
     }
 
+    /// Rebuild the serialized tool definitions after the MCP tool set changes.
+    /// `mcp_tools` is borrowed only for the duration of the call; the result is
+    /// the owned `tools_json`. Call between turns, never mid-turn.
+    pub fn updateMcpTools(self: *Client, mcp_tools: []const ai.McpToolSchema) !void {
+        const new_json = try buildAllToolsJson(self.gpa, self.config.tools, mcp_tools);
+        self.gpa.free(self.tools_json);
+        self.tools_json = new_json;
+    }
+
     pub fn prompt(self: *Client, messages: []const ai.ChatMessage, observer: anytype) !ai.Turn {
         var extra_headers_buffer: [8]std.http.Header = undefined;
         const extra_headers = self.extraHeaders(&extra_headers_buffer);

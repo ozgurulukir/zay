@@ -1302,3 +1302,25 @@ pub fn attachOpenAiCompatibleClient(
     try runtime.attachOpenAiCompatibleClient(base_url, api_key, model_id, effort);
     self.thread.agent.?.client = runtime.client;
 }
+
+/// Rebuild the MCP tool schemas from the currently connected servers and inject
+/// them into the live AI client. Does not connect or disconnect anything — call
+/// after the MCP client set changes (toggle, reconnect, disconnect) so the
+/// model's tool list stays in sync. Best-effort: a failure leaves the previous
+/// tool set in place.
+pub fn injectMcpTools(self: *App) void {
+    const runtime = self.liveRuntime() orelse return;
+    const schemas = self.mcp_manager.buildMcpToolSchemas(self.gpa) catch return;
+    defer self.gpa.free(schemas);
+    runtime.client.updateMcpTools(schemas) catch {};
+}
+
+/// Connect MCP servers per config, then inject their tool schemas into the live
+/// AI client so the model sees `mcp__<server>__<tool>` definitions. The client
+/// serializes its tool list at attach time, so MCP servers that connect
+/// afterwards must push their schemas in explicitly.
+pub fn refreshMcpTools(self: *App) void {
+    const runtime = self.liveRuntime() orelse return;
+    self.mcp_manager.syncFromConfigEx(self.gpa, self.io, &self.cached_config, runtime.home_dir, runtime.cwd);
+    injectMcpTools(self);
+}

@@ -91,6 +91,15 @@ pub const Client = struct {
         self.* = undefined;
     }
 
+    /// Rebuild the serialized tool definitions after the MCP tool set changes.
+    /// `mcp_tools` is borrowed only for the duration of the call; the result is
+    /// the owned `tools_json`. Call between turns, never mid-turn.
+    pub fn updateMcpTools(self: *Client, mcp_tools: []const ai.McpToolSchema) !void {
+        const new_json = try buildAllToolsJson(self.gpa, self.config.tools, mcp_tools);
+        self.gpa.free(self.tools_json);
+        self.tools_json = new_json;
+    }
+
     fn clearErrorDetail(self: *Client) void {
         if (self.last_error_detail) |d| self.gpa.free(d);
         self.last_error_detail = null;
@@ -1043,6 +1052,44 @@ test "buildAllToolsJson includes MCP tools alongside builtin tools" {
     try std.testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"bash\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"mcp__server__greet\"") != null);
+}
+
+test "updateMcpTools rebuilds the serialized tool list in place" {
+    const gpa = std.testing.allocator;
+    const tools = [_]tools_common.Tool{
+        .{
+            .name = "bash",
+            .description = "Run shell commands",
+            .schema = .{ .properties = &.{} },
+            .run = undefined,
+            .display = undefined,
+        },
+    };
+    var client: Client = undefined;
+    try client.init(gpa, std.testing.io, .{
+        .base_url = "http://localhost:8080/v1",
+        .api_key = "test-key",
+        .model = "test-model",
+        .tools = &tools,
+        .mcp_tools = &.{},
+    });
+    defer client.deinit();
+
+    // No MCP tools yet — only the builtin "bash" is serialized.
+    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "mcp__tavily__search") == null);
+
+    // Injecting an MCP tool set must add it alongside the builtin tool.
+    const mcp_tools = [_]ai.McpToolSchema{
+        .{ .name = "mcp__tavily__search", .description = "Search the web", .schema = .{ .properties = &.{} } },
+    };
+    try client.updateMcpTools(&mcp_tools);
+    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "\"name\":\"bash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "\"name\":\"mcp__tavily__search\"") != null);
+
+    // Replacing with an empty set removes the MCP tool but keeps the builtin.
+    try client.updateMcpTools(&.{});
+    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "mcp__tavily__search") == null);
+    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "\"name\":\"bash\"") != null);
 }
 
 test "writeRequestPayload disables thinking for reasoning effort none" {

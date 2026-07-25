@@ -520,6 +520,18 @@ pub const LanguageModel = union(enum) {
             else => null,
         };
     }
+
+    /// Rebuild the active client's serialized tool definitions after the MCP
+    /// tool set changes. No-op when no client is connected. `mcp_tools` is
+    /// borrowed only for the duration of the call.
+    pub fn updateMcpTools(self: LanguageModel, mcp_tools: []const McpToolSchema) !void {
+        switch (self) {
+            .none => {},
+            .codex_responses => |c| try c.updateMcpTools(mcp_tools),
+            .openai_compatible => |c| try c.updateMcpTools(mcp_tools),
+            .openai_responses => |c| try c.updateMcpTools(mcp_tools),
+        }
+    }
 };
 
 test "clampTokenCount clamps negative values to zero" {

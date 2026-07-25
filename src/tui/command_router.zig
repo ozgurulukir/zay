@@ -466,18 +466,21 @@ const McpMode = struct {
                         client.markConnecting();
                     },
                 }
+                provider_model.injectMcpTools(app);
                 return true;
             }
         }
         if (key.matches('r', .{ .ctrl = true }) or key.matches('r', .{})) {
             if (app.pickers.mcp.selection < app.mcp_manager.clients.items.len) {
                 app.mcp_manager.reconnectClient(app.io, app.pickers.mcp.selection);
+                provider_model.injectMcpTools(app);
             }
             return true;
         }
         if (key.matches('d', .{})) {
             if (app.pickers.mcp.selection < app.mcp_manager.clients.items.len) {
                 app.mcp_manager.disconnectClient(app.io, app.pickers.mcp.selection);
+                provider_model.injectMcpTools(app);
             }
             return true;
         }
