@@ -87,7 +87,7 @@ pub const MessageWidget = struct {
 
     fn drawBody(self: *MessageWidget, surface: *vxfw.Surface, ctx: vxfw.DrawContext) void {
         const styled_as_selected = self.selected or !self.message.kind().dimmable();
-        var row: u16 = 1;
+        var row: u16 = ConversationLayout.top;
         switch (self.message.*) {
             .user => |m| drawWrapped(surface, m.body, StylePalette.user, styled_as_selected, &row, ctx, 2, StylePalette.user),
             .agent => drawMarkdown(self, surface, styled_as_selected, &row, ctx),
@@ -193,20 +193,26 @@ pub const MessageWidget = struct {
     }
 
     fn toolIcon(command: []const u8) []const u8 {
-        if (indexOfIgnoreCase(command, "write") != null or indexOfIgnoreCase(command, "edit") != null or indexOfIgnoreCase(command, "replace") != null) return "📝";
-        if (indexOfIgnoreCase(command, "read") != null or indexOfIgnoreCase(command, "view") != null) return "👁";
-        if (indexOfIgnoreCase(command, "search") != null or indexOfIgnoreCase(command, "grep") != null or indexOfIgnoreCase(command, "find") != null) return "🔍";
-        if (indexOfIgnoreCase(command, "bash") != null or indexOfIgnoreCase(command, "run") != null or indexOfIgnoreCase(command, "exec") != null) return "⚡";
+        if (containsWord(command, "write") or containsWord(command, "edit") or containsWord(command, "replace")) return "📝";
+        if (containsWord(command, "read") or containsWord(command, "view")) return "👁";
+        if (containsWord(command, "search") or containsWord(command, "grep") or containsWord(command, "find")) return "🔍";
+        if (containsWord(command, "bash") or containsWord(command, "run") or containsWord(command, "exec")) return "⚡";
         return "🛠";
     }
 
-    fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
-        if (needle.len > haystack.len) return null;
+    /// Case-insensitive whole-word search: the match must be bounded by
+    /// non-alphanumeric characters (or string edges) on both sides.
+    fn containsWord(haystack: []const u8, word: []const u8) bool {
+        if (word.len > haystack.len) return false;
         var i: usize = 0;
-        while (i <= haystack.len - needle.len) : (i += 1) {
-            if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+        while (i <= haystack.len - word.len) : (i += 1) {
+            if (!std.ascii.eqlIgnoreCase(haystack[i .. i + word.len], word)) continue;
+            if (i > 0 and std.ascii.isAlphanumeric(haystack[i - 1])) continue;
+            const end = i + word.len;
+            if (end < haystack.len and std.ascii.isAlphanumeric(haystack[end])) continue;
+            return true;
         }
-        return null;
+        return false;
     }
 
     fn drawIntro(self: *MessageWidget, surface: *vxfw.Surface, frame_index: u16, row: *u16, ctx: vxfw.DrawContext) void {
@@ -368,11 +374,11 @@ pub const MessageWidget = struct {
         while (iter.next()) |grapheme| {
             if (col >= col_limit) return;
             const bytes = grapheme.bytes(text);
-            const width: u8 = @intCast(ctx.stringWidth(bytes));
+            const width: u16 = @intCast(ctx.stringWidth(bytes));
             if (width == 0) continue;
             if (col + width > col_limit) return;
             surface.writeCell(col, row, .{
-                .char = .{ .grapheme = bytes, .width = width },
+                .char = .{ .grapheme = bytes, .width = @intCast(width) },
                 .style = mergedSelectedStyle(style, selected),
             });
             col += width;
