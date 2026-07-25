@@ -554,9 +554,11 @@ pub fn submitDynamicProviderSetup(self: *App, provider: modelsdev.Provider) !voi
 
         self.cached_config.provider = .openai_compatible;
 
-        // Stash the human-readable provider name for the status bar.
+        // Stash the provider *id* (the auth.json key, e.g. "stepfun-ai"),
+        // NOT the human-readable name. provider_name in model_selection must
+        // match the auth.json key so resume can resolve the stored API key.
         if (self.cached_config.dynamic_provider_name) |prev| self.gpa.free(prev);
-        self.cached_config.dynamic_provider_name = try self.gpa.dupe(u8, provider.name);
+        self.cached_config.dynamic_provider_name = try self.gpa.dupe(u8, provider.id);
     }
 
     const connect_key = if (key.len > 0) key else (provider.anonymous_key orelse key);
@@ -820,7 +822,14 @@ pub fn updateCachedModelSelection(
 }
 
 pub fn updateCachedProviderConnection(self: *App, provider: config_mod.Provider) !void {
-    if (provider == .openai_compatible) return;
+    if (provider == .openai_compatible) {
+        // Dynamic/custom providers stash their connection in cached_config's
+        // legacy fields. Mirror them into model_selection so applyFromConfig
+        // resolves the correct endpoint and auth.json key on resume.
+        if (self.cached_config.base_url) |url| try replaceCachedBaseUrl(self, url);
+        if (self.cached_config.dynamic_provider_name) |name| try replaceCachedProviderName(self, name);
+        return;
+    }
     if (provider.defaultBaseUrl()) |base_url| try replaceCachedBaseUrl(self, base_url);
     clearCachedApiKey(
         self,
@@ -833,6 +842,17 @@ pub fn replaceCachedBaseUrl(self: *App, base_url: []const u8) !void {
     if (self.cached_config.model_selection) |*ms| {
         self.gpa.free(ms.base_url);
         ms.base_url = owned;
+    } else {
+        self.gpa.free(owned);
+    }
+}
+
+pub fn replaceCachedProviderName(self: *App, name: []const u8) !void {
+    const owned = try self.gpa.dupe(u8, name);
+    errdefer self.gpa.free(owned);
+    if (self.cached_config.model_selection) |*ms| {
+        self.gpa.free(ms.provider_name);
+        ms.provider_name = owned;
     } else {
         self.gpa.free(owned);
     }
@@ -870,7 +890,16 @@ pub fn modelSelectionUpdates(
         for (providers) |*entry| entry.deinit(self.gpa);
         self.gpa.free(providers);
     }
-    providers[0] = .{ .name = try self.gpa.dupe(u8, provider.label()), .provider = provider, .models = models };
+    // For dynamic/custom providers the config-map key and auth.json key is
+    // the stashed provider id (e.g. "stepfun-ai"), NOT the enum label
+    // ("openai_compatible"). Using the label would make resume look up the
+    // wrong auth.json entry and connect with an empty API key.
+    const resolved_name: []const u8 = if (provider == .openai_compatible)
+        self.cached_config.dynamic_provider_name orelse provider.label()
+    else
+        provider.label();
+
+    providers[0] = .{ .name = try self.gpa.dupe(u8, resolved_name), .provider = provider, .models = models };
     models_moved = true;
     if (provider != .openai) {
         if (compatibleBaseUrl(self, provider)) |base_url| providers[0].base_url = .{ .custom = try self.gpa.dupe(u8, base_url) };
@@ -898,7 +927,7 @@ pub fn modelSelectionUpdates(
         .providers = providers,
         .model_selection = .{
             .provider = provider,
-            .provider_name = try self.gpa.dupe(u8, provider.label()),
+            .provider_name = try self.gpa.dupe(u8, resolved_name),
             .model = .{ .id = ms_model_id, .reasoning = .{ .effort = effort } },
             .base_url = ms_base_url,
             .api_key = ms_api_key,
