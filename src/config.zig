@@ -646,6 +646,11 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
         // Mirror all fields onto the target's legacy fields so the merge
         // result is self-consistent regardless of which path serialize uses.
         target.provider = ms.provider;
+        // Propagate provider_name so serialize's legacy fallback writes the
+        // correct config key (e.g. "stepfun-ai-step-plan") instead of the
+        // enum label ("openai_compatible").
+        if (target.provider_name) |old| gpa.free(old);
+        target.provider_name = try gpa.dupe(u8, ms.provider_name);
         if (target.model) |*old| old.deinit(gpa);
         target.model = try ms.model.clone(gpa);
         try replaceOptionalSlice(gpa, &target.base_url, ms.base_url);
@@ -800,25 +805,43 @@ fn hydrateActiveModel(gpa: std.mem.Allocator, config: *Config) !void {
     const name = config.provider_name orelse provider.label();
     for (config.providers) |entry| {
         if (!std.mem.eql(u8, entry.name, name)) continue;
-        switch (entry.base_url) {
-            .custom => |base_url| try replaceOptionalSlice(gpa, &config.base_url, base_url),
-            .default => {},
-        }
-        for (entry.models) |model| {
-            if (!std.mem.eql(u8, model.id, config.model.?.id)) continue;
-            // When adding fields to Model, also copy them here so they
-            // survive the merge → hydrate cycle.
-            switch (model.reasoning) {
-                .effort => config.model.?.reasoning = model.reasoning,
-                .unset => {},
-            }
-            config.model.?.context_window = model.context_window;
-            config.model.?.max_output_tokens = model.max_output_tokens;
-            if (model.reasoning_options.len > 0) {
-                if (config.model.?.reasoning_options.len > 0) gpa.free(config.model.?.reasoning_options);
-                config.model.?.reasoning_options = try gpa.dupe(ai.ReasoningEffort, model.reasoning_options);
-            }
+        try hydrateFromProviderEntry(gpa, config, entry);
+        return;
+    }
+    // Recovery: configs written before the provider_name serialization
+    // fix have provider_name = "openai_compatible" (the enum label)
+    // while the providers[] key is the actual id (e.g. "stepfun-ai").
+    // Match by provider enum and repair provider_name so auth.json
+    // lookups and subsequent serializations use the correct key.
+    if (provider == .openai_compatible) {
+        for (config.providers) |entry| {
+            if (entry.provider != .openai_compatible) continue;
+            if (config.provider_name) |old| gpa.free(old);
+            config.provider_name = try gpa.dupe(u8, entry.name);
+            try hydrateFromProviderEntry(gpa, config, entry);
             return;
+        }
+    }
+}
+
+fn hydrateFromProviderEntry(gpa: std.mem.Allocator, config: *Config, entry: ProviderConfig) !void {
+    switch (entry.base_url) {
+        .custom => |base_url| try replaceOptionalSlice(gpa, &config.base_url, base_url),
+        .default => {},
+    }
+    for (entry.models) |model| {
+        if (!std.mem.eql(u8, model.id, config.model.?.id)) continue;
+        // When adding fields to Model, also copy them here so they
+        // survive the merge → hydrate cycle.
+        switch (model.reasoning) {
+            .effort => config.model.?.reasoning = model.reasoning,
+            .unset => {},
+        }
+        config.model.?.context_window = model.context_window;
+        config.model.?.max_output_tokens = model.max_output_tokens;
+        if (model.reasoning_options.len > 0) {
+            if (config.model.?.reasoning_options.len > 0) gpa.free(config.model.?.reasoning_options);
+            config.model.?.reasoning_options = try gpa.dupe(ai.ReasoningEffort, model.reasoning_options);
         }
         return;
     }
@@ -1421,9 +1444,10 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
 
     // Prefer the typed `model_selection` when present; fall back to
     // legacy fields for Configs that bypass parseObject (tests).
+    // "provider" is NOT written — defaultModel already encodes the
+    // provider name as its "provider/model" prefix, and parseObject
+    // only reads defaultModel (via parseModelSelection).
     if (config.model_selection) |ms| {
-        try writeKey(writer, "provider", &wrote_any);
-        try std.json.Stringify.value(ms.provider_name, .{}, writer);
         try writeKey(writer, "defaultModel", &wrote_any);
         try writeModelSelection(gpa, writer, ms.provider_name, ms.model.id);
         if (ms.use_responses_endpoint) {
@@ -1443,10 +1467,6 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
             try std.json.Stringify.value(url, .{}, writer);
         }
     } else {
-        if (config.provider) |p| {
-            try writeKey(writer, "provider", &wrote_any);
-            try std.json.Stringify.value(p.label(), .{}, writer);
-        }
         if (config.use_responses_endpoint) |b| {
             try writeKey(writer, "useResponsesEndpoint", &wrote_any);
             try writer.writeAll(if (b) "true" else "false");
@@ -1458,7 +1478,8 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
         if (config.model) |m| {
             if (config.provider) |provider| {
                 try writeKey(writer, "defaultModel", &wrote_any);
-                try writeModelSelection(gpa, writer, provider.label(), m.id);
+                const name = config.provider_name orelse provider.label();
+                try writeModelSelection(gpa, writer, name, m.id);
             }
         }
         if (config.system_prompt) |s| {
@@ -2105,7 +2126,8 @@ test "serialize outputs semver version and camelCase 2-space indented JSON" {
 
     const text = buf.written();
     try std.testing.expect(std.mem.startsWith(u8, text, "{\n  \"version\": \"2.0.0\""));
-    try std.testing.expect(std.mem.indexOf(u8, text, "  \"provider\": \"openai\"") != null);
+    // "provider" is no longer written — defaultModel encodes the provider.
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"provider\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "  \"useResponsesEndpoint\": true") != null);
 }
 

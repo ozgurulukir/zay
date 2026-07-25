@@ -79,8 +79,16 @@ fn buildMergedProviderList(self: *App, all_providers: []const modelsdev.Provider
     }
 
     // Layer 3: config providers (overrides everything with same name).
+    // Skip entries already covered by the models.dev registry — those are
+    // dynamic providers whose model selection is persisted in the providers
+    // array but whose identity (name, base_url) comes from the registry.
+    // Without this guard the config entry shadows the .dynamic handle and
+    // the picker shows the provider as a custom/config provider.
     if (self.cached_config_owned) {
         for (self.cached_config.providers) |cp| {
+            if (self.modelsdev_registry) |*reg| {
+                if (reg.lookup(cp.name) != null) continue;
+            }
             if (findEntryIndex(entries.items, cp.name)) |idx| {
                 entries.items[idx] = .{ .config = cp };
             } else {
@@ -357,12 +365,33 @@ pub fn collectConfiguredProviders(self: *App, catalog: ModelCatalog) ![]model_lo
         if (shouldLoadConfiguredCompatibleCatalog(self)) {
             const ms = self.cached_config.model_selection orelse return list.toOwnedSlice(self.gpa);
             const provider = ms.provider;
-            // Catalogue providers are already covered by the auth.json keys above.
-            if (!provider.isCatalogue()) {
+            // Catalogue providers are covered by block 1; dynamic providers
+            // with a stored key are covered by block 2 (models.dev registry).
+            // Only add a block-3 entry for providers neither block handles
+            // (e.g. a config-defined custom endpoint not in models.dev).
+            const covered_by_registry = blk: {
+                // After session resume dynamic_provider_id is null (runtime-only);
+                // fall back to the serialized model_selection.provider_name.
+                const id = self.cached_config.dynamic_provider_id orelse ms.provider_name;
+                if (self.provider_api_keys.get(id) == null) break :blk false;
+                if (self.modelsdev_registry) |*reg| {
+                    if (reg.lookup(id) != null) break :blk true;
+                }
+                break :blk false;
+            };
+            if (!provider.isCatalogue() and !covered_by_registry) {
                 // base_url may be "" when synthesized from session metadata or
                 // legacy fields; resolve through the provider default.
                 const base_url = if (ms.base_url.len > 0) ms.base_url else provider.defaultBaseUrl() orelse return list.toOwnedSlice(self.gpa);
-                try appendConfigured(self, &list, provider, base_url, ms.api_key);
+                // ms.api_key is always "" (keys live in auth.json). Resolve
+                // the stored key so the model fetch authenticates correctly.
+                const api_key = if (ms.api_key.len > 0)
+                    ms.api_key
+                else if (self.cached_config.dynamic_provider_id) |id|
+                    self.provider_api_keys.get(id) orelse ""
+                else
+                    self.provider_api_keys.get(ms.provider_name) orelse "";
+                try appendConfigured(self, &list, provider, base_url, api_key);
             }
         }
     }
@@ -488,12 +517,20 @@ pub fn submitProviderSetup(self: *App, provider: config_mod.Provider) !void {
         self,
     );
 
-    // Clear any dynamic provider name/id when switching to a builtin.
+    // Clear stale connection state when switching to a builtin. Without
+    // this, legacy fields from a previous dynamic/config provider linger
+    // and hasOpenAICompatibleCredentials (or any direct legacy reader)
+    // sees the wrong provider's URL and key.
     if (self.cached_config_owned) {
         if (self.cached_config.dynamic_provider_name) |prev| self.gpa.free(prev);
         self.cached_config.dynamic_provider_name = null;
         if (self.cached_config.dynamic_provider_id) |prev| self.gpa.free(prev);
         self.cached_config.dynamic_provider_id = null;
+        if (self.cached_config.base_url) |prev| self.gpa.free(prev);
+        self.cached_config.base_url = null;
+        if (self.cached_config.api_key) |prev| self.gpa.free(prev);
+        self.cached_config.api_key = null;
+        self.cached_config.provider = provider;
     }
 
     // With no key, connect via the provider's anonymous sentinel (e.g.
@@ -904,8 +941,11 @@ pub fn modelSelectionUpdates(
     // the stashed provider id (e.g. "stepfun-ai"), NOT the enum label
     // ("openai_compatible"). Using the label would make resume look up the
     // wrong auth.json entry and connect with an empty API key.
+    // After session resume dynamic_provider_id is null (runtime-only);
+    // fall back to the serialized model_selection.provider_name.
     const resolved_name: []const u8 = if (provider == .openai_compatible)
-        self.cached_config.dynamic_provider_id orelse provider.label()
+        self.cached_config.dynamic_provider_id orelse
+            (if (self.cached_config.model_selection) |ms| ms.provider_name else provider.label())
     else
         provider.label();
 
@@ -1099,6 +1139,11 @@ pub fn compatibleApiKey(self: *const App, provider: config_mod.Provider) []const
     if (provider == .openai_compatible) {
         if (self.cached_config.dynamic_provider_id) |id| {
             if (self.provider_api_keys.get(id)) |key| return key;
+        }
+        // After session resume dynamic_provider_id is null (runtime-only).
+        // Fall back to model_selection.provider_name which IS serialized.
+        if (self.cached_config.model_selection) |ms| {
+            if (self.provider_api_keys.get(ms.provider_name)) |key| return key;
         }
     } else {
         if (self.provider_api_keys.get(provider.label())) |key| return key;

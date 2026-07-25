@@ -365,9 +365,24 @@ pub const AgentRuntime = struct {
         config: config_mod.Config,
     ) !void {
         const ms = config.model_selection orelse {
-            // Fall back to provider defaults when no typed selection exists.
-            const base_url = provider.defaultBaseUrl() orelse return;
-            try self.attachOpenAiCompatibleClient(base_url, "", "default", .medium);
+            // No typed selection — fall back to legacy fields. For builtin
+            // providers defaultBaseUrl() suffices; for .openai_compatible
+            // the base_url was hydrated from the providers[] map by
+            // hydrateActiveModel during config merge.
+            const base_url = config.base_url orelse provider.defaultBaseUrl() orelse return;
+            const model_id = if (config.model) |m| m.id else "default";
+            const effort = if (config.model) |m| m.reasoning.resolve() else ai.ReasoningEffort.medium;
+            var loaded_key: ?[]u8 = null;
+            defer if (loaded_key) |k| self.gpa.free(k);
+            const api_key = blk: {
+                const name = config.provider_name orelse provider.label();
+                if (self.home_dir.len > 0) {
+                    loaded_key = auth_mod.loadProviderApiKey(self.gpa, self.io, self.home_dir, name) catch null;
+                    if (loaded_key) |k| break :blk k;
+                }
+                break :blk provider.anonymousApiKey() orelse "";
+            };
+            try self.attachOpenAiCompatibleClient(base_url, api_key, model_id, effort);
             return;
         };
         const base_url = if (ms.base_url.len > 0) ms.base_url else provider.defaultBaseUrl() orelse return;

@@ -1,6 +1,5 @@
 {
   "version": "1.0.0",
-  "provider": "ollama",
   "useResponsesEndpoint": false,
   "enableThinking": false,
   "defaultModel": "ollama/llama3",
