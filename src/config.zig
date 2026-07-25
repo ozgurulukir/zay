@@ -263,6 +263,46 @@ pub const ModelSelectionRef = struct {
     model: *const Model,
 };
 
+/// An extra HTTP header sent with every remote MCP request (e.g. an API key).
+/// Both fields are owned. Values support `{env:VAR}` expansion at parse time so
+/// secrets stay in the environment, not config.json.
+pub const McpHeader = struct {
+    name: []u8,
+    value: []u8,
+};
+
+/// Deep-copy a header list. Returns the empty static slice for an empty input.
+pub fn cloneHeaders(gpa: std.mem.Allocator, headers: []const McpHeader) ![]McpHeader {
+    if (headers.len == 0) return &.{};
+    const out = try gpa.alloc(McpHeader, headers.len);
+    var done: usize = 0;
+    errdefer {
+        for (out[0..done]) |h| {
+            gpa.free(h.name);
+            gpa.free(h.value);
+        }
+        gpa.free(out);
+    }
+    for (headers, 0..) |h, i| {
+        out[i] = .{
+            .name = try gpa.dupe(u8, h.name),
+            .value = try gpa.dupe(u8, h.value),
+        };
+        done += 1;
+    }
+    return out;
+}
+
+/// Free a header list produced by `cloneHeaders` (or the parser). No-op for the
+/// empty static slice.
+pub fn freeHeaders(gpa: std.mem.Allocator, headers: []McpHeader) void {
+    for (headers) |h| {
+        gpa.free(h.name);
+        gpa.free(h.value);
+    }
+    if (headers.len > 0) gpa.free(headers);
+}
+
 pub const McpServerConfig = struct {
     name: []u8,
     enabled: bool = true,
@@ -276,6 +316,8 @@ pub const McpServerConfig = struct {
         },
         sse: struct {
             url: []u8,
+            /// Extra HTTP headers sent with every request (e.g. API keys).
+            headers: []McpHeader = &.{},
         },
     },
 
@@ -287,7 +329,10 @@ pub const McpServerConfig = struct {
                 for (t.args) |arg| gpa.free(arg);
                 if (t.args.len > 0) gpa.free(t.args);
             },
-            .sse => |t| gpa.free(t.url),
+            .sse => |t| {
+                gpa.free(t.url);
+                freeHeaders(gpa, t.headers);
+            },
         }
         self.* = undefined;
     }
@@ -306,7 +351,10 @@ pub const McpServerConfig = struct {
                         .args = args,
                     } };
                 },
-                .sse => |t| .{ .sse = .{ .url = try gpa.dupe(u8, t.url) } },
+                .sse => |t| .{ .sse = .{
+                    .url = try gpa.dupe(u8, t.url),
+                    .headers = try cloneHeaders(gpa, t.headers),
+                } },
             },
         };
     }
@@ -1099,11 +1147,10 @@ fn parseMcpServers(gpa: std.mem.Allocator, value: std.json.Value) ![]McpServerCo
         for (servers.items) |*server| server.deinit(gpa);
         servers.deinit(gpa);
     }
-    // Process environment, captured once so `{env:VAR}` placeholders in
-    // command/args/url expand against a consistent snapshot.
-    var env_map = try loadEnvMap(gpa);
-    defer env_map.deinit();
-
+    // `{env:VAR}` placeholders in command/args/url/headers are stored RAW here
+    // and expanded only at connect time (`expandMcpServer`, called by the MCP
+    // manager). Keeping the raw placeholder means `serialize` writes the
+    // placeholder back to config.json rather than the resolved secret.
     var iterator = value.object.iterator();
     while (iterator.next()) |entry| {
         if (entry.value_ptr.* != .object) continue;
@@ -1135,19 +1182,44 @@ fn parseMcpServers(gpa: std.mem.Allocator, value: std.json.Value) ![]McpServerCo
                     }
                     for (args_val.array.items) |arg_item| {
                         if (arg_item == .string) {
-                            try args_list.append(gpa, try expandEnvVars(gpa, arg_item.string, &env_map));
+                            try args_list.append(gpa, try gpa.dupe(u8, arg_item.string));
                         }
                     }
                     args = try args_list.toOwnedSlice(gpa);
                 }
             }
             server.transport = .{ .stdio = .{
-                .command = try expandEnvVars(gpa, c, &env_map),
+                .command = try gpa.dupe(u8, c),
                 .args = args,
             } };
         } else {
             // url is guaranteed non-null by the guards above (exactly one transport).
-            server.transport = .{ .sse = .{ .url = try expandEnvVars(gpa, url.?, &env_map) } };
+            var headers: []McpHeader = &.{};
+            if (val.object.get("headers")) |headers_val| {
+                if (headers_val == .object) {
+                    var headers_list: std.ArrayList(McpHeader) = .empty;
+                    errdefer {
+                        for (headers_list.items) |h| {
+                            gpa.free(h.name);
+                            gpa.free(h.value);
+                        }
+                        headers_list.deinit(gpa);
+                    }
+                    var header_it = headers_val.object.iterator();
+                    while (header_it.next()) |header_entry| {
+                        if (header_entry.value_ptr.* != .string) continue;
+                        try headers_list.append(gpa, .{
+                            .name = try gpa.dupe(u8, header_entry.key_ptr.*),
+                            .value = try gpa.dupe(u8, header_entry.value_ptr.string),
+                        });
+                    }
+                    headers = try headers_list.toOwnedSlice(gpa);
+                }
+            }
+            server.transport = .{ .sse = .{
+                .url = try gpa.dupe(u8, url.?),
+                .headers = headers,
+            } };
         }
         try servers.append(gpa, server);
     }
@@ -1201,19 +1273,84 @@ fn expandEnvVars(gpa: std.mem.Allocator, input: []const u8, env_map: *const std.
     return out.toOwnedSlice();
 }
 
-/// Build a remote (Streamable HTTP) MCP server config from a name and a raw
-/// URL, expanding any `{env:VAR}` placeholders against the process environment.
-/// Used by the TUI's "add server by URL" flow so env expansion stays in one
-/// place (the same `expandEnvVars` the JSON parser uses). Caller owns the
-/// result; free with `McpServerConfig.deinit`.
+/// Build a remote (Streamable HTTP) MCP server config from a name and a raw URL.
+/// The URL is stored verbatim (any `{env:VAR}` placeholder is expanded later, at
+/// connect time, by `expandMcpServer`). Used by the TUI's "add server by URL"
+/// flow. Caller owns the result; free with `McpServerConfig.deinit`.
 pub fn mcpServerFromUrl(gpa: std.mem.Allocator, name: []const u8, raw_url: []const u8) !McpServerConfig {
-    var env_map = try loadEnvMap(gpa);
-    defer env_map.deinit();
     return .{
         .name = try gpa.dupe(u8, name),
         .enabled = true,
-        .transport = .{ .sse = .{ .url = try expandEnvVars(gpa, raw_url, &env_map) } },
+        .transport = .{ .sse = .{ .url = try gpa.dupe(u8, raw_url) } },
     };
+}
+
+/// Resolve every `{env:VAR}` placeholder in a server's command/args/url/header
+/// values against the process environment, returning a newly-allocated server
+/// ready for actual use (spawning / HTTP). The input keeps its raw placeholders
+/// so it stays safe to `serialize` back to config.json; only this expanded copy
+/// — held by the MCP client, never written to disk — carries resolved secrets.
+/// Caller owns the result; free with `McpServerConfig.deinit`.
+pub fn expandMcpServer(gpa: std.mem.Allocator, server: McpServerConfig) !McpServerConfig {
+    var env_map = try loadEnvMap(gpa);
+    defer env_map.deinit();
+
+    var out: McpServerConfig = .{
+        .name = try gpa.dupe(u8, server.name),
+        .enabled = server.enabled,
+        .transport = undefined,
+    };
+    errdefer out.deinit(gpa);
+
+    switch (server.transport) {
+        .stdio => |t| {
+            var args: [][]u8 = &.{};
+            if (t.args.len > 0) {
+                const expanded = try gpa.alloc([]u8, t.args.len);
+                var done: usize = 0;
+                errdefer {
+                    for (expanded[0..done]) |arg| gpa.free(arg);
+                    gpa.free(expanded);
+                }
+                for (t.args, 0..) |arg, i| {
+                    expanded[i] = try expandEnvVars(gpa, arg, &env_map);
+                    done += 1;
+                }
+                args = expanded;
+            }
+            out.transport = .{ .stdio = .{
+                .command = try expandEnvVars(gpa, t.command, &env_map),
+                .args = args,
+            } };
+        },
+        .sse => |t| {
+            var headers: []McpHeader = &.{};
+            if (t.headers.len > 0) {
+                const expanded = try gpa.alloc(McpHeader, t.headers.len);
+                var done: usize = 0;
+                errdefer {
+                    for (expanded[0..done]) |h| {
+                        gpa.free(h.name);
+                        gpa.free(h.value);
+                    }
+                    gpa.free(expanded);
+                }
+                for (t.headers, 0..) |h, i| {
+                    expanded[i] = .{
+                        .name = try gpa.dupe(u8, h.name),
+                        .value = try expandEnvVars(gpa, h.value, &env_map),
+                    };
+                    done += 1;
+                }
+                headers = expanded;
+            }
+            out.transport = .{ .sse = .{
+                .url = try expandEnvVars(gpa, t.url, &env_map),
+                .headers = headers,
+            } };
+        },
+    }
+    return out;
 }
 
 fn parseProviderConfig(gpa: std.mem.Allocator, name: []const u8, provider: Provider, value: std.json.Value) !ProviderConfig {
@@ -2279,6 +2416,27 @@ test "parseFile parses remote mcp server (url transport)" {
     }
 }
 
+test "parseFile parses remote mcp server headers (kept raw)" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    const json = "{\"mcp_servers\":{\"context7\":{\"url\":\"https://mcp.context7.com/mcp\",\"headers\":{\"CONTEXT7_API_KEY\":\"{env:NOVA_TEST_UNSET_MCP_VAR}\"}}}}";
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers.len);
+    switch (cfg.mcp_servers[0].transport) {
+        .sse => |t| {
+            try std.testing.expectEqualStrings("https://mcp.context7.com/mcp", t.url);
+            try std.testing.expectEqual(@as(usize, 1), t.headers.len);
+            try std.testing.expectEqualStrings("CONTEXT7_API_KEY", t.headers[0].name);
+            // Header values keep their placeholder until expandMcpServer runs.
+            try std.testing.expectEqualStrings("{env:NOVA_TEST_UNSET_MCP_VAR}", t.headers[0].value);
+        },
+        .stdio => return error.Unexpected,
+    }
+}
+
 test "parseFile rejects mcp server configuring both transports" {
     const gpa = std.testing.allocator;
     var sink: std.ArrayList(Diagnostic) = .empty;
@@ -2357,19 +2515,52 @@ test "expandEnvVars emits an unterminated placeholder verbatim" {
     try std.testing.expectEqualStrings("https://x.com/?key={env:FOO", out);
 }
 
-test "parseFile expands {env:VAR} placeholders in mcp url" {
+test "parseFile keeps {env:VAR} placeholders raw in mcp url" {
     const gpa = std.testing.allocator;
     var sink: std.ArrayList(Diagnostic) = .empty;
     defer sink.deinit(gpa);
-    // Unset variable → empty substitution; verifies the parse→expand wiring
-    // against the real environment without depending on a specific value.
+    // Placeholders are stored verbatim at parse time so serialize() can write
+    // them back unchanged; expansion happens later, at connect time
+    // (expandMcpServer). This keeps resolved secrets out of config.json.
     const json = "{\"mcp_servers\":{\"tavily\":{\"url\":\"https://mcp.tavily.com/mcp/?key={env:NOVA_TEST_UNSET_MCP_VAR}\"}}}";
     var cfg = try parseFile(gpa, "<test>", json, &sink);
     defer cfg.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers.len);
     switch (cfg.mcp_servers[0].transport) {
-        .sse => |t| try std.testing.expectEqualStrings("https://mcp.tavily.com/mcp/?key=", t.url),
+        .sse => |t| try std.testing.expectEqualStrings("https://mcp.tavily.com/mcp/?key={env:NOVA_TEST_UNSET_MCP_VAR}", t.url),
+        .stdio => return error.Unexpected,
+    }
+}
+
+test "expandMcpServer resolves {env:VAR} in url and headers, leaving the source raw" {
+    const gpa = std.testing.allocator;
+    // A raw server as the parser produces it: placeholders in url + header value.
+    var raw = try mcpServerFromUrl(gpa, "ctx", "https://mcp.context7.com/mcp?key={env:NOVA_TEST_UNSET_MCP_VAR}");
+    defer raw.deinit(gpa);
+    const headers = try gpa.alloc(McpHeader, 1);
+    headers[0] = .{
+        .name = try gpa.dupe(u8, "CONTEXT7_API_KEY"),
+        .value = try gpa.dupe(u8, "{env:NOVA_TEST_UNSET_MCP_VAR}"),
+    };
+    raw.transport.sse.headers = headers;
+
+    var expanded = try expandMcpServer(gpa, raw);
+    defer expanded.deinit(gpa);
+
+    // Unset variable → empty substitution, in both the url and the header value.
+    switch (expanded.transport) {
+        .sse => |t| {
+            try std.testing.expectEqualStrings("https://mcp.context7.com/mcp?key=", t.url);
+            try std.testing.expectEqual(@as(usize, 1), t.headers.len);
+            try std.testing.expectEqualStrings("CONTEXT7_API_KEY", t.headers[0].name);
+            try std.testing.expectEqualStrings("", t.headers[0].value);
+        },
+        .stdio => return error.Unexpected,
+    }
+    // The source keeps its placeholders (still safe to serialize).
+    switch (raw.transport) {
+        .sse => |t| try std.testing.expectEqualStrings("https://mcp.context7.com/mcp?key={env:NOVA_TEST_UNSET_MCP_VAR}", t.url),
         .stdio => return error.Unexpected,
     }
 }

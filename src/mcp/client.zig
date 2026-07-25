@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const ai = @import("../ai.zig");
+const config_mod = @import("../config.zig");
 const tools_common = @import("../tools/common.zig");
 const transport = @import("transport.zig");
 
@@ -64,6 +65,9 @@ pub const McpClient = struct {
         },
         sse: struct {
             url: []u8,
+            /// Extra HTTP headers sent with every request (already `{env:VAR}`-
+            /// expanded by the manager). Owned; freed in `stop`.
+            headers: []config_mod.McpHeader = &.{},
         },
     },
     /// Runtime lifecycle. Variants make illegal combinations
@@ -196,7 +200,10 @@ pub const McpClient = struct {
                 for (t.args) |arg| self.gpa.free(arg);
                 if (t.args.len > 0) self.gpa.free(t.args);
             },
-            .sse => |t| self.gpa.free(t.url),
+            .sse => |t| {
+                self.gpa.free(t.url);
+                config_mod.freeHeaders(self.gpa, t.headers);
+            },
         }
         switch (self.lifecycle) {
             .failed => |f| self.gpa.free(f.reason),
@@ -288,9 +295,10 @@ pub const McpClient = struct {
         };
         var client: std.http.Client = .{ .allocator = self.gpa, .io = io };
         defer client.deinit();
-        var extra_headers_buffer: [2]std.http.Header = undefined;
+        const extra_headers = self.buildExtraHeaders(self.gpa) catch return;
+        defer self.gpa.free(extra_headers);
         var req = client.request(.DELETE, std.Uri.parse(url) catch return, .{
-            .extra_headers = self.buildExtraHeaders(&extra_headers_buffer),
+            .extra_headers = extra_headers,
         }) catch return;
         defer req.deinit();
         // Best-effort: send the termination, don't wait for the response.
@@ -403,10 +411,11 @@ pub const McpClient = struct {
         var client: std.http.Client = .{ .allocator = self.gpa, .io = io };
         defer client.deinit();
 
-        var extra_headers_buffer: [2]std.http.Header = undefined;
+        const extra_headers = try self.buildExtraHeaders(self.gpa);
+        defer self.gpa.free(extra_headers);
         var req = try client.request(.POST, try std.Uri.parse(url), .{
             .headers = .{ .content_type = .{ .override = "application/json" } },
-            .extra_headers = self.buildExtraHeaders(&extra_headers_buffer),
+            .extra_headers = extra_headers,
         });
         defer req.deinit();
         try writeBody(&req, body);
@@ -448,10 +457,11 @@ pub const McpClient = struct {
         var client: std.http.Client = .{ .allocator = self.gpa, .io = io };
         defer client.deinit();
 
-        var extra_headers_buffer: [2]std.http.Header = undefined;
+        const extra_headers = try self.buildExtraHeaders(self.gpa);
+        defer self.gpa.free(extra_headers);
         var req = try client.request(.POST, try std.Uri.parse(url), .{
             .headers = .{ .content_type = .{ .override = "application/json" } },
-            .extra_headers = self.buildExtraHeaders(&extra_headers_buffer),
+            .extra_headers = extra_headers,
         });
         defer req.deinit();
         try writeBody(&req, body);
@@ -464,18 +474,29 @@ pub const McpClient = struct {
         if (status_code >= 400) return error.McpHttpRequestFailed;
     }
 
-    /// Build the extra request headers into `buffer`: the Streamable HTTP
-    /// `Accept` header plus `Mcp-Session-Id` once a session is established.
-    /// Returns a slice of `buffer` (which the caller must keep alive).
-    fn buildExtraHeaders(self: *const McpClient, buffer: *[2]std.http.Header) []const std.http.Header {
-        var count: usize = 0;
-        buffer[count] = .{ .name = "Accept", .value = "application/json, text/event-stream" };
-        count += 1;
+    /// Build the extra request headers: the Streamable HTTP `Accept` header,
+    /// `Mcp-Session-Id` once a session is established, and any custom headers
+    /// configured for the server (e.g. API keys). Returned slice is owned; free
+    /// with `gpa.free`.
+    fn buildExtraHeaders(self: *const McpClient, gpa: std.mem.Allocator) ![]std.http.Header {
+        const custom: []const config_mod.McpHeader = switch (self.transport) {
+            .sse => |t| t.headers,
+            .stdio => &.{},
+        };
+        const count = 1 + custom.len + (if (self.session_id != null) @as(usize, 1) else 0);
+        const headers = try gpa.alloc(std.http.Header, count);
+        var i: usize = 0;
+        headers[i] = .{ .name = "Accept", .value = "application/json, text/event-stream" };
+        i += 1;
         if (self.session_id) |sid| {
-            buffer[count] = .{ .name = "Mcp-Session-Id", .value = sid };
-            count += 1;
+            headers[i] = .{ .name = "Mcp-Session-Id", .value = sid };
+            i += 1;
         }
-        return buffer[0..count];
+        for (custom) |h| {
+            headers[i] = .{ .name = h.name, .value = h.value };
+            i += 1;
+        }
+        return headers;
     }
 
     /// Update `session_id` from the response's `Mcp-Session-Id` header (if
@@ -1060,25 +1081,41 @@ test "schemaFromJsonSchema falls back to string for $ref and oneOf" {
 // Streamable HTTP transport tests
 // ---------------------------------------------------------------------------
 
-test "buildExtraHeaders sends Accept, adding Mcp-Session-Id once known" {
+test "buildExtraHeaders sends Accept, session id, and custom headers" {
     const gpa = std.testing.allocator;
     var client = try McpClient.initSse(gpa, "x", "http://x/mcp");
     defer client.deinit(std.testing.io);
 
-    var buf: [2]std.http.Header = undefined;
-
-    // No session yet → only Accept.
-    const before = client.buildExtraHeaders(&buf);
-    try std.testing.expectEqual(@as(usize, 1), before.len);
-    try std.testing.expectEqualStrings("Accept", before[0].name);
-    try std.testing.expectEqualStrings("application/json, text/event-stream", before[0].value);
+    // No session, no custom headers → only Accept.
+    {
+        const headers = try client.buildExtraHeaders(gpa);
+        defer gpa.free(headers);
+        try std.testing.expectEqual(@as(usize, 1), headers.len);
+        try std.testing.expectEqualStrings("Accept", headers[0].name);
+        try std.testing.expectEqualStrings("application/json, text/event-stream", headers[0].value);
+    }
 
     // With a session → Accept + Mcp-Session-Id.
     client.session_id = try gpa.dupe(u8, "sess-1");
-    const after = client.buildExtraHeaders(&buf);
-    try std.testing.expectEqual(@as(usize, 2), after.len);
-    try std.testing.expectEqualStrings("Mcp-Session-Id", after[1].name);
-    try std.testing.expectEqualStrings("sess-1", after[1].value);
+    {
+        const headers = try client.buildExtraHeaders(gpa);
+        defer gpa.free(headers);
+        try std.testing.expectEqual(@as(usize, 2), headers.len);
+        try std.testing.expectEqualStrings("Mcp-Session-Id", headers[1].name);
+        try std.testing.expectEqualStrings("sess-1", headers[1].value);
+    }
+
+    // With a custom header → Accept + Mcp-Session-Id + custom (e.g. an API key).
+    client.transport.sse.headers = try config_mod.cloneHeaders(gpa, &[_]config_mod.McpHeader{
+        .{ .name = @constCast("CONTEXT7_API_KEY"), .value = @constCast("secret") },
+    });
+    {
+        const headers = try client.buildExtraHeaders(gpa);
+        defer gpa.free(headers);
+        try std.testing.expectEqual(@as(usize, 3), headers.len);
+        try std.testing.expectEqualStrings("CONTEXT7_API_KEY", headers[2].name);
+        try std.testing.expectEqualStrings("secret", headers[2].value);
+    }
 }
 
 test "captureSessionId + isEventStream read the response head" {

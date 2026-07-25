@@ -114,15 +114,19 @@
     "MCPServerStdio": {
       "type": "object",
       "properties": {
+        "type": {
+          "type": "string",
+          "description": "Optional transport discriminator (e.g. 'stdio') for compatibility with other MCP clients. Nova infers the transport from 'command'/'url' and ignores this field."
+        },
         "command": {
           "type": "string",
           "minLength": 1,
-          "description": "Executable command for the stdio transport (local subprocess). Supports '{env:VAR}' placeholders, expanded from the process environment at load time."
+          "description": "Executable command for the stdio transport (local subprocess). Supports '{env:VAR}' placeholders, expanded from the process environment when the server connects."
         },
         "args": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Command arguments for the stdio transport. Supports '{env:VAR}' placeholders, expanded from the process environment at load time."
+          "description": "Command arguments for the stdio transport. Supports '{env:VAR}' placeholders, expanded from the process environment when the server connects."
         },
         "enabled": {
           "type": "boolean",
@@ -136,11 +140,20 @@
     "MCPServerRemote": {
       "type": "object",
       "properties": {
+        "type": {
+          "type": "string",
+          "description": "Optional transport discriminator (e.g. 'remote' or 'http') for compatibility with other MCP clients. Nova infers the transport from 'command'/'url' and ignores this field."
+        },
         "url": {
           "type": "string",
           "format": "uri",
           "pattern": "^https?://",
-          "description": "Endpoint URL for the remote transport (Streamable HTTP; legacy HTTP+SSE fallback). Must be http(s). Supports '{env:VAR}' placeholders (e.g. an API key), expanded from the process environment at load time."
+          "description": "Endpoint URL for the remote transport (Streamable HTTP; legacy HTTP+SSE fallback). Must be http(s). Supports '{env:VAR}' placeholders (e.g. an API key), expanded from the process environment when the server connects."
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Extra HTTP headers sent with every request (e.g. an API key for servers that authenticate via headers, like Context7). Values support '{env:VAR}' placeholders, expanded from the process environment when the server connects; keep secrets in the environment, not config.json."
         },
         "enabled": {
           "type": "boolean",

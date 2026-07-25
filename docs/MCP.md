@@ -48,6 +48,13 @@ MCP servers are configured inside global `~/.config/nova/config.json` or project
     "tavily": {
       "url": "https://mcp.tavily.com/mcp/?tavilyApiKey={env:TAVILY_API_KEY}",
       "enabled": true
+    },
+    "context7": {
+      "type": "remote",
+      "url": "https://mcp.context7.com/mcp",
+      "headers": {
+        "CONTEXT7_API_KEY": "{env:CONTEXT7_API_KEY}"
+      }
     }
   }
 }
@@ -60,19 +67,37 @@ MCP servers are configured inside global `~/.config/nova/config.json` or project
 | `command` | `string`   | Binary / CLI command to execute for stdio servers (e.g. `npx`, `python`).                    |
 | `args`    | `string[]` | Command line arguments passed to the stdio child process.                                    |
 | `url`     | `string`   | Endpoint URL for remote Streamable HTTP servers (e.g. `https://mcp.tavily.com/mcp/`).        |
+| `headers` | `object`   | Extra HTTP headers sent with every remote request (e.g. API keys for header-auth servers).   |
+| `type`    | `string`   | Optional transport discriminator (`"stdio"`/`"remote"`) for compatibility; Nova ignores it.  |
 | `enabled` | `boolean`  | `true` (default) to connect and expose tools; `false` to disable.                            |
 
 ### Environment variable expansion (`{env:VAR}`)
 
-`command`, `args`, and `url` values support `{env:VAR}` placeholders, expanded against
-the process environment at parse time. This keeps secrets (API keys, tokens) out of
+`command`, `args`, `url`, and `headers` values support `{env:VAR}` placeholders, expanded
+against the process environment. This keeps secrets (API keys, tokens) out of
 `config.json` — store them in the environment instead. A placeholder whose variable is
 unset expands to an empty string and logs a warning, so a missing secret surfaces rather
 than silently producing a broken command or URL.
 
+> [!IMPORTANT]
+> **Secrets stay out of config.json.** Placeholders are stored verbatim in the parsed
+> config and expanded only at connect time, into an in-memory copy held by the MCP
+> client. When Nova rewrites `config.json` (e.g. on a settings save) it writes the
+> `{env:VAR}` placeholder back — never the resolved value — so a secret is never
+> persisted to disk.
+
+Two common auth shapes for remote servers:
+
 ```json
+// API key in the URL query string (e.g. Tavily)
 "tavily": {
   "url": "https://mcp.tavily.com/mcp/?tavilyApiKey={env:TAVILY_API_KEY}"
+}
+
+// API key in a request header (e.g. Context7)
+"context7": {
+  "url": "https://mcp.context7.com/mcp",
+  "headers": { "CONTEXT7_API_KEY": "{env:CONTEXT7_API_KEY}" }
 }
 ```
 

@@ -48,15 +48,25 @@ pub const McpManager = struct {
                 continue;
             }
 
-            const cmd: ?[]const u8 = switch (server_cfg.transport) {
+            // Expand {env:VAR} placeholders for actual use (spawning / HTTP).
+            // The config keeps the raw placeholders so serialize() never writes
+            // resolved secrets to disk; only this expanded copy — owned by the
+            // client — carries them.
+            var expanded = config_mod.expandMcpServer(self.gpa, server_cfg) catch {
+                std.log.warn("MCP server '{s}': failed to resolve env vars, skipping", .{server_cfg.name});
+                continue;
+            };
+            defer expanded.deinit(self.gpa);
+
+            const cmd: ?[]const u8 = switch (expanded.transport) {
                 .stdio => |t| t.command,
                 .sse => null,
             };
-            const args: []const []const u8 = switch (server_cfg.transport) {
+            const args: []const []const u8 = switch (expanded.transport) {
                 .stdio => |t| t.args,
                 .sse => &.{},
             };
-            const url: ?[]const u8 = switch (server_cfg.transport) {
+            const url: ?[]const u8 = switch (expanded.transport) {
                 .stdio => null,
                 .sse => |t| t.url,
             };
@@ -76,6 +86,9 @@ pub const McpManager = struct {
                     url,
                 );
                 errdefer c.deinit(io);
+                if (c.transport == .sse) {
+                    c.transport.sse.headers = try config_mod.cloneHeaders(self.gpa, expanded.transport.sse.headers);
+                }
                 if (server_cfg.enabled) c.markConnecting();
                 try self.clients.append(self.gpa, c);
             }

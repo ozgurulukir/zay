@@ -180,17 +180,26 @@ Each entry in `mcpServers` is keyed by server name:
 | `command` | `string` | Executable for stdio transport. |
 | `args` | `string[]` | Command arguments for stdio transport. |
 | `url` | `string` | Endpoint URL for remote Streamable HTTP transport. |
+| `headers` | `object` | Extra HTTP headers for remote servers (string values), e.g. API keys for header-auth servers like Context7. |
+| `type` | `string` | Optional transport discriminator (`"stdio"`/`"remote"`) for compatibility with other MCP clients; Nova ignores it. |
 | `enabled` | `boolean` | Whether this server is active (default `true`). |
 
 A server is either stdio (`command` + `args`) or remote (`url`), never both. Misconfigured entries are caught at parse time.
 
-`command`, `args`, and `url` support `{env:VAR}` placeholders, expanded against the process environment at parse time — keep secrets out of `config.json` (an unset variable expands to an empty string and logs a warning):
+`command`, `args`, `url`, and `headers` values support `{env:VAR}` placeholders, expanded against the process environment when the server connects — keep secrets out of `config.json` (an unset variable expands to an empty string and logs a warning):
 
 ```json
 "tavily": {
   "url": "https://mcp.tavily.com/mcp/?tavilyApiKey={env:TAVILY_API_KEY}"
+},
+"context7": {
+  "url": "https://mcp.context7.com/mcp",
+  "headers": { "CONTEXT7_API_KEY": "{env:CONTEXT7_API_KEY}" }
 }
 ```
+
+> [!IMPORTANT]
+> **Secrets are never written to config.json.** Placeholders are kept verbatim in the parsed config and resolved only at connect time (into an in-memory copy held by the MCP client). When Nova rewrites `config.json` it writes the `{env:VAR}` placeholder back, never the resolved value.
 
 > [!NOTE]
 > **Adding servers from the TUI**: the `/mcp` overlay's `a` (add) key connects a remote server by URL for the current session only. Such servers are **runtime-only** — they are not written to `config.json` and do not survive a restart. Add them here by hand to make them permanent. See [MCP Integration](MCP.md) for details.
