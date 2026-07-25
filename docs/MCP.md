@@ -28,7 +28,7 @@ MCP servers are configured inside global `~/.config/nova/config.json` or project
 
 ```json
 {
-  "version": 1,
+  "version": "2.0.0",
   "mcpServers": {
     "codebase-memory-mcp": {
       "command": "/path/to/codebase-memory-mcp",

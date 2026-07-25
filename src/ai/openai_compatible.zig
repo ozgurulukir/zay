@@ -454,6 +454,11 @@ fn writeRequestPayload(
     };
 
     switch (value) {
+        .default => {
+            // Model's own default — don't send any reasoning parameter.
+            try out.writeByte('}');
+            return;
+        },
         .none => try out.writeAll(",\"enable_thinking\":false}"),
         else => {
             try out.writeAll(",\"reasoning_effort\":\"");

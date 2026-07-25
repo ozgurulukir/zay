@@ -142,7 +142,7 @@ Each entry in `providers` is keyed by provider name. Builtin labels (`openai`, `
 | --- | --- | --- |
 | `baseURL` | `string` | Custom base URL for this provider. Legacy key `base_url` is also accepted. |
 | `models` | `object` | Per-model overrides keyed by model id. |
-| `models.<id>.reasoningEffort` | `string` | One of `minimal`, `low`, `none`, `medium`, `high`, `xhigh`. |
+| `models.<id>.reasoningEffort` | `string` | One of `default`, `minimal`, `low`, `none`, `medium`, `high`, `xhigh`. `default` sends no reasoning parameter (model decides); `none` disables thinking explicitly. |
 | `models.<id>.contextWindow` | `integer` | Context window size in tokens. Overrides the catalogue lookup; falls back to `context.overrideContextWindow`. Minimum 1024. |
 | `models.<id>.maxOutputTokens` | `integer` | Maximum tokens per generation turn. Sent as `max_tokens` in the request body; falls back to `context.maxOutputTokens`. Minimum 1. |
 

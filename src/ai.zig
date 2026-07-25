@@ -19,6 +19,9 @@ pub const McpToolSchema = struct {
 };
 
 pub const ReasoningEffort = enum {
+    /// Don't override the model's default reasoning behaviour — no
+    /// `reasoning_effort` parameter is sent in the request.
+    default,
     minimal,
     low,
     none,

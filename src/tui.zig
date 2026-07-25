@@ -1256,7 +1256,8 @@ pub fn modelPickerScope(scope: App.ModelScope) model_picker.Scope {
 }
 
 const reasoning_options = [_]model_picker.ReasoningOption{
-    .{ .label = "medium (Default)", .effort = .medium },
+    .{ .label = "default", .effort = .default },
+    .{ .label = "medium", .effort = .medium },
     .{ .label = "high", .effort = .high },
     .{ .label = "xhigh", .effort = .xhigh },
     .{ .label = "low", .effort = .low },

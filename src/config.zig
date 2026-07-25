@@ -1159,6 +1159,7 @@ fn parseSemverMajor(s: []const u8) ?u32 {
 }
 
 const reasoning_efforts_by_name = std.StaticStringMap(ai.ReasoningEffort).initComptime(.{
+    .{ "default", .default },
     .{ "minimal", .minimal },
     .{ "low", .low },
     .{ "none", .none },

@@ -83,8 +83,8 @@
       "properties": {
         "reasoningEffort": {
           "type": "string",
-          "enum": ["minimal", "low", "none", "medium", "high", "xhigh"],
-          "description": "Reasoning effort level for this model."
+          "enum": ["default", "minimal", "low", "none", "medium", "high", "xhigh"],
+          "description": "Reasoning effort level for this model. 'default' sends no reasoning parameter (model decides); 'none' disables thinking explicitly."
         },
         "contextWindow": {
           "type": "integer",
