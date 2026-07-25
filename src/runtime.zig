@@ -392,8 +392,11 @@ pub const AgentRuntime = struct {
                 loaded_key = codex_mod.loadProviderApiKey(self.gpa, self.io, self.home_dir, ms.provider_name) catch null;
                 if (loaded_key) |k| break :blk k;
             }
-            // No stored key — use the anonymous sentinel (e.g. OpenCode Zen's
-            // `public`) when the provider supports it, else send no key.
+            // No stored key — log for diagnostics when the provider requires
+            // one, so a 402/401 on the first turn is traceable.
+            if (provider.requiresApiKey()) {
+                std.log.warn("auth.missing_key provider={s} — requests will likely fail with 402", .{ms.provider_name});
+            }
             break :blk provider.anonymousApiKey() orelse "";
         };
         try self.attachOpenAiCompatibleClient(base_url, api_key, ms.model.id, effort);

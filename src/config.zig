@@ -138,6 +138,12 @@ const providers_by_name = std.StaticStringMap(Provider).initComptime(.{
     .{ "anthropic", .anthropic },
 });
 
+/// All builtin provider labels, for auth.json integrity checks.
+/// Builtin keys are never pruned — they're always valid.
+pub fn allBuiltinLabels() []const []const u8 {
+    return &.{ "openai", "openai_compatible", "ollama", "llama.cpp", "openrouter", "cerebras", "ollama_cloud", "huggingface", "nvidia_nim", "opencode_zen", "anthropic" };
+}
+
 fn providerSpec(provider: Provider) ProviderSpec {
     const index: usize = @intFromEnum(provider);
     comptime std.debug.assert(provider_specs.len == @typeInfo(Provider).@"enum".fields.len);

@@ -86,6 +86,28 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     const agent_runtime = try tui_gpa.create(runtime.AgentRuntime);
     errdefer tui_gpa.destroy(agent_runtime);
 
+    // Auth integrity: prune orphan keys that no longer correspond to any
+    // known provider. Builtin labels are always valid; config provider
+    // names and the current dynamic_provider_id are collected as the
+    // valid set. Idempotent — running again after a prune removes nothing.
+    {
+        var valid_names: std.ArrayList([]const u8) = .empty;
+        defer valid_names.deinit(runtime_gpa);
+        for (config.allBuiltinLabels()) |label| {
+            valid_names.append(runtime_gpa, label) catch continue;
+        }
+        for (load_result.config.providers) |p| {
+            valid_names.append(runtime_gpa, p.name) catch continue;
+        }
+        if (load_result.config.dynamic_provider_id) |id| {
+            valid_names.append(runtime_gpa, id) catch {};
+        }
+        const pruned = codex.pruneOrphanKeys(runtime_gpa, init.io, home_dir, valid_names.items) catch 0;
+        if (pruned > 0) {
+            logger.log("auth.integrity.pruned count={d}", .{pruned});
+        }
+    }
+
     // Auto-resume: find the most recently updated session for this cwd.
     const resume_session_id = blk: {
         var manager = session.SessionManager.initDefault(runtime_gpa, init.io, home_dir) catch break :blk null;

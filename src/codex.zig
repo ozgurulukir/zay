@@ -540,6 +540,53 @@ pub fn removeProviderApiKey(gpa: std.mem.Allocator, io: std.Io, home_dir: []cons
     try writeAuthFile(gpa, io, home_dir, creds, &keys);
 }
 
+/// Remove auth.json keys that don't correspond to any known provider.
+/// Keys matching `valid_names` (builtin labels + config provider names)
+/// are kept; everything else is an orphan and gets removed.
+/// Idempotent: running again after a prune removes nothing.
+/// Returns the number of keys removed.
+pub fn pruneOrphanKeys(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    home_dir: []const u8,
+    valid_names: []const []const u8,
+) !u32 {
+    var keys = try loadAllProviderApiKeys(gpa, io, home_dir);
+    defer freeApiKeyMap(gpa, &keys);
+
+    // Collect orphan names first (can't modify map while iterating).
+    var orphans: std.ArrayList([]const u8) = .empty;
+    defer orphans.deinit(gpa);
+
+    var it = keys.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        var found = false;
+        for (valid_names) |valid| {
+            if (std.mem.eql(u8, name, valid)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) try orphans.append(gpa, name);
+    }
+
+    if (orphans.items.len == 0) return 0;
+
+    for (orphans.items) |name| {
+        if (keys.fetchOrderedRemove(name)) |old| {
+            gpa.free(old.key);
+            gpa.free(old.value);
+        }
+    }
+
+    var creds = try load(gpa, io, home_dir);
+    defer if (creds) |*c| c.deinit(gpa);
+    try writeAuthFile(gpa, io, home_dir, creds, &keys);
+
+    return @intCast(orphans.items.len);
+}
+
 fn parseApiKeys(gpa: std.mem.Allocator, bytes: []const u8) !ApiKeyMap {
     const parsed = std.json.parseFromSlice(AuthFile, gpa, bytes, .{ .ignore_unknown_fields = true }) catch return error.InvalidCredentials;
     defer parsed.deinit();
