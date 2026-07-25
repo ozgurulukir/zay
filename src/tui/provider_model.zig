@@ -227,6 +227,7 @@ pub fn closeDiffViewer(self: *App, send: bool) !bool {
 
 pub fn openModelPicker(self: *App) !void {
     self.mode = .model_picker;
+    tui.rebuildReasoningOptsCache(self);
     self.pickers.models.model_column = .model;
     self.pickers.models.model_selection = 0;
     self.pickers.models.model_scope = defaultModelScope(
@@ -501,6 +502,7 @@ pub fn submitProviderSetup(self: *App, provider: config_mod.Provider) !void {
     self.provider_key_input.clearRetainingCapacity();
 
     self.mode = .model_picker;
+    tui.rebuildReasoningOptsCache(self);
     self.pickers.models.model_column = .model;
     self.pickers.models.model_selection = 0;
     self.pickers.models.model_scope = defaultModelScope(
@@ -563,6 +565,7 @@ pub fn submitDynamicProviderSetup(self: *App, provider: modelsdev.Provider) !voi
     self.provider_key_input.clearRetainingCapacity();
 
     self.mode = .model_picker;
+    tui.rebuildReasoningOptsCache(self);
     self.pickers.models.model_column = .model;
     self.pickers.models.model_selection = 0;
     self.pickers.models.model_scope = defaultModelScope(self);
@@ -619,6 +622,7 @@ pub fn submitConfigProviderSetup(self: *App, provider: config_mod.ProviderConfig
     self.provider_key_input.clearRetainingCapacity();
 
     self.mode = .model_picker;
+    tui.rebuildReasoningOptsCache(self);
     self.pickers.models.model_column = .model;
     self.pickers.models.model_selection = 0;
     self.pickers.models.model_scope = defaultModelScope(self);
@@ -1087,7 +1091,10 @@ pub fn selectedReasoningIndex(self: *const App) u32 {
 }
 
 pub fn selectedReasoningEffort(self: *const App) ai.ReasoningEffort {
-    return tui.reasoningOptions()[selectedReasoningIndex(self)].effort;
+    const opts = tui.activeReasoningOptions(self);
+    const idx = selectedReasoningIndex(self);
+    if (idx >= opts.len) return .medium;
+    return opts[idx].effort;
 }
 
 pub fn cycleModelScope(self: *App) void {
@@ -1101,7 +1108,8 @@ pub fn cycleModelScope(self: *App) void {
 pub fn cycleSelectedReasoning(self: *App) !void {
     if (self.pickers.models.model_selection >= self.pickers.models.len()) return;
     const entry = &self.pickers.models.entries.items[self.pickers.models.model_selection];
-    entry.reasoning_index = tui.nextIndex(entry.reasoning_index, @intCast(tui.reasoningOptions().len));
+    const opts = tui.activeReasoningOptions(self);
+    entry.reasoning_index = tui.nextIndex(entry.reasoning_index, @intCast(opts.len));
 }
 
 pub fn selectedCodexModel(self: *App) ?codex.Model {

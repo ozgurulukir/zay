@@ -95,6 +95,14 @@
           "type": "integer",
           "minimum": 1,
           "description": "Maximum tokens per generation turn for this model. Sent as max_tokens in the request body. Falls back to context.maxOutputTokens when unset."
+        },
+        "reasoningOptions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["default", "minimal", "low", "none", "medium", "high", "xhigh"]
+          },
+          "description": "Reasoning efforts this model supports. The TUI model picker filters its reasoning cycle to this list. Empty or absent means all efforts are available."
         }
       },
       "additionalProperties": false

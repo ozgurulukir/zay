@@ -145,6 +145,7 @@ Each entry in `providers` is keyed by provider name. Builtin labels (`openai`, `
 | `models.<id>.reasoningEffort` | `string` | One of `default`, `minimal`, `low`, `none`, `medium`, `high`, `xhigh`. `default` sends no reasoning parameter (model decides); `none` disables thinking explicitly. Internally stored as a `ReasoningSetting` union: when unset in a config layer, the lower layer's value is preserved during merge; when set, it overrides. |
 | `models.<id>.contextWindow` | `integer` | Context window size in tokens. Overrides the catalogue lookup; falls back to `context.overrideContextWindow`. Minimum 1024. |
 | `models.<id>.maxOutputTokens` | `integer` | Maximum tokens per generation turn. Sent as `max_tokens` in the request body; falls back to `context.maxOutputTokens`. Minimum 1. |
+| `models.<id>.reasoningOptions` | `string[]` | Reasoning efforts this model supports (e.g. `["default", "low", "medium", "high", "xhigh"]`). The TUI model picker filters its reasoning cycle to this list. Empty or absent means all efforts are available. |
 
 **Example — custom provider with per-model limits:**
 

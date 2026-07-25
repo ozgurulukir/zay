@@ -164,6 +164,11 @@ pub const App = struct {
     modelsdev_registry: ?modelsdev.Registry = null,
     /// Backing slice for provider picker's merged provider list. Owned; freed in `deinit`.
     entries_slice: ?[]const provider_picker.ProviderHandle = null,
+    /// Per-model reasoning options from config, cached for the model picker.
+    /// Rebuilt when the picker opens or the active model changes. Empty
+    /// means "fall back to the global hardcoded list".
+    reasoning_opts_cache: [7]model_picker.ReasoningOption = undefined,
+    reasoning_opts_len: u32 = 0,
     /// Inline edit buffer for the provider setup form's API-key field. Owned;
     /// freed in `deinit`.
     provider_key_input: std.ArrayList(u8) = .empty,
@@ -1265,6 +1270,30 @@ const reasoning_options = [_]model_picker.ReasoningOption{
 };
 
 pub fn reasoningOptions() []const model_picker.ReasoningOption {
+    return &reasoning_options;
+}
+
+/// Rebuild the per-model reasoning options cache from the active model's
+/// config entry. Call when the model picker opens or the active model
+/// changes. Empty cache → fall back to the global hardcoded list.
+pub fn rebuildReasoningOptsCache(self: *App) void {
+    self.reasoning_opts_len = 0;
+    if (!self.cached_config_owned) return;
+    const ms = self.cached_config.model_selection orelse return;
+    for (ms.model.reasoning_options) |effort| {
+        if (self.reasoning_opts_len >= self.reasoning_opts_cache.len) break;
+        self.reasoning_opts_cache[self.reasoning_opts_len] = .{
+            .label = effort.label(),
+            .effort = effort,
+        };
+        self.reasoning_opts_len += 1;
+    }
+}
+
+/// Effective reasoning options: per-model config list if non-empty,
+/// otherwise the global hardcoded list.
+pub fn activeReasoningOptions(self: *const App) []const model_picker.ReasoningOption {
+    if (self.reasoning_opts_len > 0) return self.reasoning_opts_cache[0..self.reasoning_opts_len];
     return &reasoning_options;
 }
 

@@ -153,19 +153,28 @@ pub const Model = struct {
     context_window: ?u32 = null,
     /// Maximum output tokens per generation turn for this model.
     max_output_tokens: ?u32 = null,
+    /// Reasoning efforts this model supports. Empty = all efforts
+    /// available (backward compatible). The TUI model picker filters
+    /// its reasoning cycle to this list.
+    reasoning_options: []const ai.ReasoningEffort = &.{},
 
     pub fn deinit(self: *Model, gpa: std.mem.Allocator) void {
         gpa.free(self.id);
+        if (self.reasoning_options.len > 0) gpa.free(self.reasoning_options);
         self.* = undefined;
     }
 
     fn clone(self: Model, gpa: std.mem.Allocator) !Model {
-        return .{
+        var out: Model = .{
             .id = try gpa.dupe(u8, self.id),
             .reasoning = self.reasoning,
             .context_window = self.context_window,
             .max_output_tokens = self.max_output_tokens,
         };
+        if (self.reasoning_options.len > 0) {
+            out.reasoning_options = try gpa.dupe(ai.ReasoningEffort, self.reasoning_options);
+        }
+        return out;
     }
 };
 
@@ -746,6 +755,10 @@ fn applyProviderModelsOverlay(gpa: std.mem.Allocator, target: *ProviderConfig, u
                 .effort => model.reasoning = update.reasoning,
                 .unset => {},
             }
+            if (update.reasoning_options.len > 0) {
+                if (model.reasoning_options.len > 0) gpa.free(model.reasoning_options);
+                model.reasoning_options = try gpa.dupe(ai.ReasoningEffort, update.reasoning_options);
+            }
             replaced = true;
             break;
         }
@@ -779,6 +792,10 @@ fn hydrateActiveModel(gpa: std.mem.Allocator, config: *Config) !void {
             }
             config.model.?.context_window = model.context_window;
             config.model.?.max_output_tokens = model.max_output_tokens;
+            if (model.reasoning_options.len > 0) {
+                if (config.model.?.reasoning_options.len > 0) gpa.free(config.model.?.reasoning_options);
+                config.model.?.reasoning_options = try gpa.dupe(ai.ReasoningEffort, model.reasoning_options);
+            }
             return;
         }
         return;
@@ -1107,6 +1124,21 @@ fn parseProviderModels(gpa: std.mem.Allocator, value: std.json.Value) ![]Provide
         }
         if (intField(val, "maxOutputTokens")) |v| {
             if (v >= 1) model.max_output_tokens = @intCast(v);
+        }
+        if (val.object.get("reasoningOptions")) |opts| {
+            if (opts == .array) {
+                var list: std.ArrayList(ai.ReasoningEffort) = .empty;
+                errdefer list.deinit(gpa);
+                for (opts.array.items) |item| {
+                    if (item != .string) continue;
+                    if (reasoning_efforts_by_name.get(item.string)) |e| {
+                        try list.append(gpa, e);
+                    }
+                }
+                if (list.items.len > 0) {
+                    model.reasoning_options = try list.toOwnedSlice(gpa);
+                }
+            }
         }
         try models.append(gpa, model);
     }
@@ -1539,6 +1571,18 @@ fn writeProviderModels(writer: *std.Io.Writer, models: []const ProviderModel) !v
             try std.json.Stringify.value("maxOutputTokens", .{}, writer);
             try writer.writeByte(':');
             try writer.print("{d}", .{mot});
+            wrote_field = true;
+        }
+        if (model.reasoning_options.len > 0) {
+            if (wrote_field) try writer.writeByte(',');
+            try std.json.Stringify.value("reasoningOptions", .{}, writer);
+            try writer.writeByte(':');
+            try writer.writeByte('[');
+            for (model.reasoning_options, 0..) |opt, idx| {
+                if (idx > 0) try writer.writeByte(',');
+                try std.json.Stringify.value(opt.label(), .{}, writer);
+            }
+            try writer.writeByte(']');
         }
         try writer.writeByte('}');
         wrote_model = true;
