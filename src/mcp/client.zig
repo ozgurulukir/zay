@@ -8,6 +8,12 @@ const transport = @import("transport.zig");
 
 const assert = std.debug.assert;
 
+// Streamable HTTP transport buffer/bound sizes.
+const http_body_buffer_bytes = 8 * 1024;
+const http_redirect_buffer_bytes = 16 * 1024;
+const http_transfer_buffer_bytes = 64 * 1024;
+const http_response_bytes_max = 64 * 1024 * 1024;
+
 pub const ServerStatus = enum {
     connecting,
     connected,
@@ -85,6 +91,9 @@ pub const McpClient = struct {
     request_mutex: std.Io.Mutex = .init,
     /// Read timeout for sendRequest poll, in milliseconds.
     read_timeout_ms: u32 = 30_000,
+    /// Server-assigned `Mcp-Session-Id` for the Streamable HTTP transport.
+    /// null until the initialize response provides one. Owned; freed in deinit.
+    session_id: ?[]u8 = null,
 
     pub fn init(gpa: std.mem.Allocator, name: []const u8, command: ?[]const u8, args: []const []const u8, url: ?[]const u8) !McpClient {
         // Legacy init: if url is set, build an sse client; otherwise stdio.
@@ -195,6 +204,7 @@ pub const McpClient = struct {
         }
         for (self.tools.items) |*tool| tool.deinit(self.gpa);
         self.tools.deinit(self.gpa);
+        if (self.session_id) |sid| self.gpa.free(sid);
         self.* = undefined;
     }
 
@@ -235,7 +245,9 @@ pub const McpClient = struct {
     }
 
     /// Stop the subprocess: SIGTERM first, then SIGKILL via kill().
-    /// Closes stdin/stdout pipes and reaps the child.
+    /// Closes stdin/stdout pipes and reaps the child. For the Streamable HTTP
+    /// transport, terminates the remote session (best-effort) and drops the
+    /// session id.
     pub fn stop(self: *McpClient, io: std.Io) void {
         if (self.lifecycle == .stdio) {
             var child = self.lifecycle.stdio.process;
@@ -255,14 +267,52 @@ pub const McpClient = struct {
             }
             child.kill(io);
         }
+        if (self.transport == .sse) self.terminateHttpSession(io);
         self.lifecycle = .disabled;
     }
 
-    /// Send a JSON-RPC request and read the response line.
-    /// Returns the raw response line (owned, caller must free).
-    /// Blocks up to `read_timeout_ms` waiting for a response.
-    /// Serialized via request_mutex — concurrent calls queue, not interleave.
+    /// Terminate the remote session via HTTP DELETE (best-effort) and free the
+    /// stored session id. Servers may refuse DELETE; failures are ignored since
+    /// the connection is being torn down regardless. Idempotent.
+    fn terminateHttpSession(self: *McpClient, io: std.Io) void {
+        defer {
+            if (self.session_id) |sid| {
+                self.gpa.free(sid);
+                self.session_id = null;
+            }
+        }
+        if (self.session_id == null) return;
+        const url = switch (self.transport) {
+            .sse => |t| t.url,
+            .stdio => return,
+        };
+        var client: std.http.Client = .{ .allocator = self.gpa, .io = io };
+        defer client.deinit();
+        var extra_headers_buffer: [2]std.http.Header = undefined;
+        var req = client.request(.DELETE, std.Uri.parse(url) catch return, .{
+            .extra_headers = self.buildExtraHeaders(&extra_headers_buffer),
+        }) catch return;
+        defer req.deinit();
+        // Best-effort: send the termination, don't wait for the response.
+        req.sendBodiless() catch return;
+    }
+
+    /// Send a JSON-RPC request and read the response. Dispatches on the
+    /// transport: stdio reads a newline-delimited response line; Streamable
+    /// HTTP POSTs and reads a JSON body or an SSE stream. Returns the raw
+    /// JSON-RPC response (owned, caller must free). Serialized via
+    /// request_mutex — concurrent calls queue, not interleave.
     pub fn sendRequest(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) ![]u8 {
+        return switch (self.transport) {
+            .stdio => self.sendRequestStdio(io, method, params_json),
+            .sse => self.sendRequestHttp(io, method, params_json),
+        };
+    }
+
+    /// stdio transport: write the request line to the child's stdin and read
+    /// one newline-delimited response line from stdout. Blocks up to
+    /// `read_timeout_ms`.
+    fn sendRequestStdio(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) ![]u8 {
         const child = if (self.lifecycle == .stdio) &self.lifecycle.stdio.process else return error.NotConnected;
         const stdin_file = child.stdin orelse return error.NotConnected;
         const stdout_file = child.stdout orelse return error.NotConnected;
@@ -310,8 +360,16 @@ pub const McpClient = struct {
         return line_writer.toOwnedSlice();
     }
 
-    /// Send a JSON-RPC notification (no response expected).
+    /// Send a JSON-RPC notification (no response expected). Dispatches on the
+    /// transport.
     pub fn sendNotification(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) !void {
+        return switch (self.transport) {
+            .stdio => self.sendNotificationStdio(io, method, params_json),
+            .sse => self.sendNotificationHttp(io, method, params_json),
+        };
+    }
+
+    fn sendNotificationStdio(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) !void {
         const child = if (self.lifecycle == .stdio) &self.lifecycle.stdio.process else return error.NotConnected;
         const stdin_file = child.stdin orelse return error.NotConnected;
 
@@ -319,6 +377,117 @@ pub const McpClient = struct {
         defer self.gpa.free(request);
 
         try stdin_file.writeStreamingAll(io, request);
+    }
+
+    // ── Streamable HTTP transport ──
+
+    /// POST a JSON-RPC request to the remote endpoint and return the matching
+    /// JSON-RPC response (owned). The response is either a single
+    /// `application/json` body or a `text/event-stream` searched for the
+    /// request `id`. Captures the server-assigned `Mcp-Session-Id`.
+    fn sendRequestHttp(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) ![]u8 {
+        const url = switch (self.transport) {
+            .sse => |t| t.url,
+            .stdio => return error.NoHttpTransport,
+        };
+
+        try self.request_mutex.lock(io);
+        defer self.request_mutex.unlock(io);
+
+        const id = self.next_request_id;
+        self.next_request_id += 1;
+
+        const body = try transport.formatRequest(self.gpa, id, method, params_json);
+        defer self.gpa.free(body);
+
+        var client: std.http.Client = .{ .allocator = self.gpa, .io = io };
+        defer client.deinit();
+
+        var extra_headers_buffer: [2]std.http.Header = undefined;
+        var req = try client.request(.POST, try std.Uri.parse(url), .{
+            .headers = .{ .content_type = .{ .override = "application/json" } },
+            .extra_headers = self.buildExtraHeaders(&extra_headers_buffer),
+        });
+        defer req.deinit();
+        try writeBody(&req, body);
+
+        var redirect_buffer: [http_redirect_buffer_bytes]u8 = undefined;
+        var response = try req.receiveHead(&redirect_buffer);
+        const status_code: u16 = @intFromEnum(response.head.status);
+        if (status_code == 404) return error.McpSessionExpired;
+        if (status_code == 401 or status_code == 403) return error.McpUnauthorized;
+        if (status_code < 200 or status_code >= 300) return error.McpHttpRequestFailed;
+
+        // Capture session id + content type BEFORE the body reader invalidates
+        // the head's borrowed pointers.
+        try self.captureSessionId(response.head);
+        const is_sse = isEventStream(response.head);
+
+        if (is_sse) {
+            var transfer_buffer: [http_transfer_buffer_bytes]u8 = undefined;
+            const reader = response.reader(&transfer_buffer);
+            return try transport.readSseResponse(self.gpa, reader, id);
+        }
+        return try readJsonBody(self.gpa, &response);
+    }
+
+    /// POST a JSON-RPC notification to the remote endpoint. Expects
+    /// 202 Accepted (or 200); the response body is not consumed.
+    fn sendNotificationHttp(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) !void {
+        const url = switch (self.transport) {
+            .sse => |t| t.url,
+            .stdio => return error.NoHttpTransport,
+        };
+
+        try self.request_mutex.lock(io);
+        defer self.request_mutex.unlock(io);
+
+        const body = try transport.formatNotification(self.gpa, method, params_json);
+        defer self.gpa.free(body);
+
+        var client: std.http.Client = .{ .allocator = self.gpa, .io = io };
+        defer client.deinit();
+
+        var extra_headers_buffer: [2]std.http.Header = undefined;
+        var req = try client.request(.POST, try std.Uri.parse(url), .{
+            .headers = .{ .content_type = .{ .override = "application/json" } },
+            .extra_headers = self.buildExtraHeaders(&extra_headers_buffer),
+        });
+        defer req.deinit();
+        try writeBody(&req, body);
+
+        var redirect_buffer: [http_redirect_buffer_bytes]u8 = undefined;
+        const response = try req.receiveHead(&redirect_buffer);
+        try self.captureSessionId(response.head);
+        const status_code: u16 = @intFromEnum(response.head.status);
+        if (status_code == 404) return error.McpSessionExpired;
+        if (status_code >= 400) return error.McpHttpRequestFailed;
+    }
+
+    /// Build the extra request headers into `buffer`: the Streamable HTTP
+    /// `Accept` header plus `Mcp-Session-Id` once a session is established.
+    /// Returns a slice of `buffer` (which the caller must keep alive).
+    fn buildExtraHeaders(self: *const McpClient, buffer: *[2]std.http.Header) []const std.http.Header {
+        var count: usize = 0;
+        buffer[count] = .{ .name = "Accept", .value = "application/json, text/event-stream" };
+        count += 1;
+        if (self.session_id) |sid| {
+            buffer[count] = .{ .name = "Mcp-Session-Id", .value = sid };
+            count += 1;
+        }
+        return buffer[0..count];
+    }
+
+    /// Update `session_id` from the response's `Mcp-Session-Id` header (if
+    /// present). Header values borrow the response head, so the value is duped.
+    fn captureSessionId(self: *McpClient, head: std.http.Client.Response.Head) !void {
+        var it = head.iterateHeaders();
+        while (it.next()) |header| {
+            if (!std.ascii.eqlIgnoreCase(header.name, "mcp-session-id")) continue;
+            if (self.session_id) |old| self.gpa.free(old);
+            self.session_id = try self.gpa.dupe(u8, header.value);
+            return;
+        }
     }
 
     /// Parse a JSON-RPC response line and extract the `result` value.
@@ -353,9 +522,18 @@ pub const McpClient = struct {
     pub fn initialize(self: *McpClient, io: std.Io) !void {
         const start = std.Io.Timestamp.now(io, .awake);
 
-        const response = try self.sendRequest(io, "initialize",
-            \\{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"nova","version":"1.0"}}
-        );
+        // Streamable HTTP requires protocol 2025-03-26+; stdio keeps the
+        // original version so existing local servers are unaffected.
+        const protocol_version: []const u8 = switch (self.transport) {
+            .stdio => "2024-11-05",
+            .sse => "2025-03-26",
+        };
+        const params = try std.fmt.allocPrint(self.gpa,
+            \\{{"protocolVersion":"{s}","capabilities":{{}},"clientInfo":{{"name":"nova","version":"1.0"}}}}
+        , .{protocol_version});
+        defer self.gpa.free(params);
+
+        const response = try self.sendRequest(io, "initialize", params);
         defer self.gpa.free(response);
 
         const parsed = try parseResponse(self.gpa, response);
@@ -486,6 +664,54 @@ pub const McpClient = struct {
         });
     }
 };
+
+/// Write the request `body` with an explicit content-length and flush it, so
+/// the server receives a complete request before we read the response head.
+fn writeBody(req: *std.http.Client.Request, body: []const u8) !void {
+    req.transfer_encoding = .{ .content_length = body.len };
+    var body_buffer: [http_body_buffer_bytes]u8 = undefined;
+    var body_writer = try req.sendBodyUnflushed(&body_buffer);
+    try body_writer.writer.writeAll(body);
+    try body_writer.end();
+    try req.connection.?.flush();
+}
+
+/// True when the response `Content-Type` is `text/event-stream` (an SSE
+/// stream) rather than a single `application/json` body.
+fn isEventStream(head: std.http.Client.Response.Head) bool {
+    const content_type = head.content_type orelse return false;
+    return std.mem.indexOf(u8, content_type, "text/event-stream") != null;
+}
+
+/// Read a single `application/json` response body, honouring content-encoding
+/// (mirrors `modelsdev.fetchApiJson`: Cloudflare-style hosts may gzip it).
+/// Returns the owned body; caller frees.
+fn readJsonBody(gpa: std.mem.Allocator, response: *std.http.Client.Response) ![]u8 {
+    var empty_decompress_buffer: [0]u8 = .{};
+    var decompress_buffer: []u8 = &empty_decompress_buffer;
+    var decompress_buffer_owned = false;
+    switch (response.head.content_encoding) {
+        .identity => {},
+        .zstd => {
+            decompress_buffer = try gpa.alloc(u8, std.compress.zstd.default_window_len);
+            decompress_buffer_owned = true;
+        },
+        .deflate, .gzip => {
+            decompress_buffer = try gpa.alloc(u8, std.compress.flate.max_window_len);
+            decompress_buffer_owned = true;
+        },
+        .compress => return error.UnsupportedCompressionMethod,
+    }
+    defer if (decompress_buffer_owned) gpa.free(decompress_buffer);
+
+    var transfer_buffer: [http_transfer_buffer_bytes]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+    return reader.allocRemaining(gpa, .limited(http_response_bytes_max)) catch |err| switch (err) {
+        error.StreamTooLong => error.McpResponseTooLarge,
+        else => |e| e,
+    };
+}
 
 /// Extract text content from a tools/call result.
 /// Non-text content types (image, resource) produce descriptive placeholders
@@ -828,4 +1054,47 @@ test "schemaFromJsonSchema falls back to string for $ref and oneOf" {
     for (schema.properties) |prop| {
         try std.testing.expectEqual(tools_common.Schema.Kind.string, prop.kind);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Streamable HTTP transport tests
+// ---------------------------------------------------------------------------
+
+test "buildExtraHeaders sends Accept, adding Mcp-Session-Id once known" {
+    const gpa = std.testing.allocator;
+    var client = try McpClient.initSse(gpa, "x", "http://x/mcp");
+    defer client.deinit(std.testing.io);
+
+    var buf: [2]std.http.Header = undefined;
+
+    // No session yet → only Accept.
+    const before = client.buildExtraHeaders(&buf);
+    try std.testing.expectEqual(@as(usize, 1), before.len);
+    try std.testing.expectEqualStrings("Accept", before[0].name);
+    try std.testing.expectEqualStrings("application/json, text/event-stream", before[0].value);
+
+    // With a session → Accept + Mcp-Session-Id.
+    client.session_id = try gpa.dupe(u8, "sess-1");
+    const after = client.buildExtraHeaders(&buf);
+    try std.testing.expectEqual(@as(usize, 2), after.len);
+    try std.testing.expectEqualStrings("Mcp-Session-Id", after[1].name);
+    try std.testing.expectEqualStrings("sess-1", after[1].value);
+}
+
+test "captureSessionId + isEventStream read the response head" {
+    const gpa = std.testing.allocator;
+    var client = try McpClient.initSse(gpa, "x", "http://x/mcp");
+    defer client.deinit(std.testing.io);
+
+    const json_head = try std.http.Client.Response.Head.parse(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: sess-42\r\n\r\n",
+    );
+    try client.captureSessionId(json_head);
+    try std.testing.expectEqualStrings("sess-42", client.session_id.?);
+    try std.testing.expect(!isEventStream(json_head));
+
+    const sse_head = try std.http.Client.Response.Head.parse(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
+    );
+    try std.testing.expect(isEventStream(sse_head));
 }

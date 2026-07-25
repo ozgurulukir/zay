@@ -67,6 +67,122 @@ pub fn parseMessage(gpa: std.mem.Allocator, line: []const u8) !std.json.Parsed(s
     return std.json.parseFromSlice(std.json.Value, gpa, trimmed, .{});
 }
 
+// ---------------------------------------------------------------------------
+// MCP Streamable HTTP — Server-Sent Events framing
+// ---------------------------------------------------------------------------
+//
+// A remote MCP server answers a POST either with a single `application/json`
+// body or with a `text/event-stream` stream that eventually carries the
+// JSON-RPC response. SSE frames a message as `event: <type>` + one or more
+// `data: <payload>` lines, terminated by a blank line. Unlike the OpenAI
+// completions stream there is no `[DONE]` sentinel — the stream ends when the
+// connection closes.
+
+/// Upper bounds on a single SSE response stream. Hit either and the reader
+/// errors rather than letting a misbehaving server stream unbounded work.
+pub const sse_event_max: u32 = 100_000;
+pub const sse_data_bytes_max: u32 = 64 * 1024 * 1024;
+
+/// The classification of one raw SSE line. Returned slices borrow the input.
+pub const SseLine = union(enum) {
+    /// `event: <type>` — names the following event (e.g. "message").
+    event: []const u8,
+    /// `data: <payload>` — a chunk of the event's JSON-RPC payload.
+    data: []const u8,
+    /// A blank line — marks the end of an event.
+    blank,
+    /// Anything else: comments (`: ...`), `id:`, `retry:`, unknown fields.
+    other,
+};
+
+/// Classify one raw SSE line. No allocation; slices borrow `line`.
+pub fn classifySseLine(line: []const u8) SseLine {
+    const trimmed = std.mem.trim(u8, line, " \r");
+    if (trimmed.len == 0) return .blank;
+    if (std.mem.startsWith(u8, trimmed, "event:")) {
+        return .{ .event = std.mem.trim(u8, trimmed["event:".len..], " ") };
+    }
+    if (std.mem.startsWith(u8, trimmed, "data:")) {
+        return .{ .data = std.mem.trim(u8, trimmed["data:".len..], " ") };
+    }
+    return .other;
+}
+
+/// Read one `\n`-terminated SSE line (delimiter stripped). Returns null at end
+/// of stream when no trailing bytes remain.
+fn readSseLine(gpa: std.mem.Allocator, reader: *std.Io.Reader) !?[]u8 {
+    var line: std.Io.Writer.Allocating = .init(gpa);
+    errdefer line.deinit();
+    _ = reader.streamDelimiterEnding(&line.writer, '\n') catch |err| switch (err) {
+        error.ReadFailed => return error.ReadFailed,
+        error.WriteFailed => return error.OutOfMemory,
+    };
+    const delimiter = reader.take(1) catch |err| switch (err) {
+        error.EndOfStream => {
+            if (line.written().len == 0) return null;
+            return try line.toOwnedSlice();
+        },
+        else => |e| return e,
+    };
+    std.debug.assert(delimiter.len == 1);
+    std.debug.assert(delimiter[0] == '\n');
+    return try line.toOwnedSlice();
+}
+
+/// True when `payload` is a JSON-RPC **response** (has an `id`, a `result` or
+/// `error`, and no `method`) whose `id` equals `request_id`. Server-initiated
+/// requests/notifications carry a `method` and are rejected here.
+fn isResponseForId(gpa: std.mem.Allocator, payload: []const u8, request_id: i64) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, payload, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const obj = parsed.value.object;
+    if (obj.get("method") != null) return false;
+    const id_val = obj.get("id") orelse return false;
+    if (id_val != .integer) return false;
+    return id_val.integer == request_id;
+}
+
+/// Read MCP SSE events from `reader` until a JSON-RPC response whose `id`
+/// equals `request_id` arrives; return that response's raw JSON (owned, caller
+/// frees). Events of type other than `message` (or the default empty type) are
+/// skipped, as are server-initiated requests/notifications — Nova drives MCP
+/// request/response only. Bounded by `sse_event_max` / `sse_data_bytes_max`.
+pub fn readSseResponse(gpa: std.mem.Allocator, reader: *std.Io.Reader, request_id: i64) ![]u8 {
+    var event_type: std.ArrayList(u8) = .empty;
+    defer event_type.deinit(gpa);
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(gpa);
+
+    var events_seen: u32 = 0;
+    while (events_seen < sse_event_max) {
+        const line = (try readSseLine(gpa, reader)) orelse return error.McpStreamEndedEarly;
+        defer gpa.free(line);
+        switch (classifySseLine(line)) {
+            .event => |e| try event_type.appendSlice(gpa, e),
+            .data => |d| {
+                if (data.items.len > 0) try data.append(gpa, '\n');
+                try data.appendSlice(gpa, d);
+                if (data.items.len > sse_data_bytes_max) return error.McpStreamTooLarge;
+            },
+            .other => {},
+            .blank => {
+                events_seen += 1;
+                const is_message = event_type.items.len == 0 or
+                    std.mem.eql(u8, event_type.items, "message");
+                if (is_message and data.items.len > 0) {
+                    if (isResponseForId(gpa, data.items, request_id)) {
+                        return try gpa.dupe(u8, data.items);
+                    }
+                }
+                event_type.clearRetainingCapacity();
+                data.clearRetainingCapacity();
+            },
+        }
+    }
+    return error.McpStreamTooManyEvents;
+}
+
 test "formatRequest formats valid JSON-RPC 2.0 request" {
     const gpa = std.testing.allocator;
     const req = try formatRequest(gpa, 1, "initialize", "{\"protocolVersion\":\"2024-11-05\"}");
@@ -247,4 +363,86 @@ test "parseMessage handles large params without truncation" {
     const data = parsed.value.object.get("params").?.object
         .get("data").?.string;
     try std.testing.expectEqual(@as(usize, 2000), data.len);
+}
+
+// ---------------------------------------------------------------------------
+// SSE framing tests
+// ---------------------------------------------------------------------------
+
+test "classifySseLine distinguishes event, data, blank, and other lines" {
+    switch (classifySseLine("event: message")) {
+        .event => |e| try std.testing.expectEqualStrings("message", e),
+        else => return error.Unexpected,
+    }
+    switch (classifySseLine("data: {\"id\":1}")) {
+        .data => |d| try std.testing.expectEqualStrings("{\"id\":1}", d),
+        else => return error.Unexpected,
+    }
+    try std.testing.expectEqual(SseLine.blank, classifySseLine(""));
+    try std.testing.expectEqual(SseLine.blank, classifySseLine("\r"));
+    try std.testing.expectEqual(SseLine.other, classifySseLine(": keep-alive comment"));
+    try std.testing.expectEqual(SseLine.other, classifySseLine("id: 42"));
+    try std.testing.expectEqual(SseLine.other, classifySseLine("retry: 3000"));
+}
+
+test "readSseResponse returns the matching response from a single message event" {
+    const gpa = std.testing.allocator;
+    const stream =
+        "event: message\n" ++
+        "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n" ++
+        "\n";
+    var reader: std.Io.Reader = .fixed(stream);
+    const response = try readSseResponse(gpa, &reader, 7);
+    defer gpa.free(response);
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}", response);
+}
+
+test "readSseResponse skips notifications and other events, finds the response" {
+    const gpa = std.testing.allocator;
+    const stream =
+        "event: message\n" ++
+        "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n" ++
+        "\n" ++
+        "event: ping\n" ++
+        "data: {}\n" ++
+        "\n" ++
+        "event: message\n" ++
+        "data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[]}}\n" ++
+        "\n";
+    var reader: std.Io.Reader = .fixed(stream);
+    const response = try readSseResponse(gpa, &reader, 3);
+    defer gpa.free(response);
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[]}}", response);
+}
+
+test "readSseResponse joins multi-line data fields" {
+    const gpa = std.testing.allocator;
+    // Two data: lines in one event are joined with a newline before parsing.
+    const stream =
+        "data: {\"jsonrpc\":\"2.0\",\"id\":1,\n" ++
+        "data: \"result\":{}}\n" ++
+        "\n";
+    var reader: std.Io.Reader = .fixed(stream);
+    const response = try readSseResponse(gpa, &reader, 1);
+    defer gpa.free(response);
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\n\"result\":{}}", response);
+}
+
+test "readSseResponse errors when the stream ends before the response" {
+    const gpa = std.testing.allocator;
+    const stream =
+        "event: message\n" ++
+        "data: {\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}\n" ++
+        "\n";
+    var reader: std.Io.Reader = .fixed(stream);
+    try std.testing.expectError(error.McpStreamEndedEarly, readSseResponse(gpa, &reader, 1));
+}
+
+test "readSseResponse treats a default (no event:) event as a message" {
+    const gpa = std.testing.allocator;
+    const stream = "data: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{}}\n\n";
+    var reader: std.Io.Reader = .fixed(stream);
+    const response = try readSseResponse(gpa, &reader, 5);
+    defer gpa.free(response);
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{}}", response);
 }

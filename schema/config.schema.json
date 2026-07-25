@@ -105,20 +105,24 @@
     },
     "MCPServerConfig": {
       "type": "object",
+      "description": "A Model Context Protocol server. Exactly one transport must be configured: 'command' (+ optional 'args') for a local stdio subprocess, or 'url' for a remote server (Streamable HTTP, with legacy HTTP+SSE fallback). The two are mutually exclusive — providing both or neither is invalid, mirroring the transport union in src/config.zig.",
+      "oneOf": [
+        { "$ref": "#/$defs/MCPServerStdio" },
+        { "$ref": "#/$defs/MCPServerRemote" }
+      ]
+    },
+    "MCPServerStdio": {
+      "type": "object",
       "properties": {
         "command": {
           "type": "string",
-          "description": "Executable command for stdio transport."
+          "minLength": 1,
+          "description": "Executable command for the stdio transport (local subprocess). Supports '{env:VAR}' placeholders, expanded from the process environment at load time."
         },
         "args": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Command arguments for stdio transport."
-        },
-        "url": {
-          "type": "string",
-          "format": "uri",
-          "description": "Server URL for SSE transport."
+          "description": "Command arguments for the stdio transport. Supports '{env:VAR}' placeholders, expanded from the process environment at load time."
         },
         "enabled": {
           "type": "boolean",
@@ -126,6 +130,25 @@
           "description": "Whether this server is active."
         }
       },
+      "required": ["command"],
+      "additionalProperties": false
+    },
+    "MCPServerRemote": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https?://",
+          "description": "Endpoint URL for the remote transport (Streamable HTTP; legacy HTTP+SSE fallback). Must be http(s). Supports '{env:VAR}' placeholders (e.g. an API key), expanded from the process environment at load time."
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether this server is active."
+        }
+      },
+      "required": ["url"],
       "additionalProperties": false
     },
     "ContextSettings": {

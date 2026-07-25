@@ -11,6 +11,7 @@
 //! fields such as `reasoningEffort` live under `providers.<provider>.models`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ai = @import("ai.zig");
 
 const assert = std.debug.assert;
@@ -1098,17 +1099,31 @@ fn parseMcpServers(gpa: std.mem.Allocator, value: std.json.Value) ![]McpServerCo
         for (servers.items) |*server| server.deinit(gpa);
         servers.deinit(gpa);
     }
+    // Process environment, captured once so `{env:VAR}` placeholders in
+    // command/args/url expand against a consistent snapshot.
+    var env_map = try loadEnvMap(gpa);
+    defer env_map.deinit();
+
     var iterator = value.object.iterator();
     while (iterator.next()) |entry| {
         if (entry.value_ptr.* != .object) continue;
         const val = entry.value_ptr.*;
+
+        const cmd = stringField(val, "command");
+        const url = stringField(val, "url");
+        // Exactly one transport: stdio (command) or remote (url). Both or
+        // neither is invalid — mirrors the transport union and the
+        // MCPServerConfig oneOf in schema/config.schema.json. Checked before
+        // `server`/its errdefer so a rejection never deinits a server whose
+        // transport is still undefined.
+        if (cmd != null and url != null) return error.InvalidMcpServerConfig;
+        if (cmd == null and url == null) return error.InvalidMcpServerConfig;
+
         var server: McpServerConfig = undefined;
         server.name = try gpa.dupe(u8, entry.key_ptr.*);
         server.enabled = boolField(val, "enabled") orelse true;
         errdefer server.deinit(gpa);
 
-        const cmd = stringField(val, "command");
-        const url = stringField(val, "url");
         if (cmd) |c| {
             var args: [][]u8 = &.{};
             if (val.object.get("args")) |args_val| {
@@ -1120,24 +1135,70 @@ fn parseMcpServers(gpa: std.mem.Allocator, value: std.json.Value) ![]McpServerCo
                     }
                     for (args_val.array.items) |arg_item| {
                         if (arg_item == .string) {
-                            try args_list.append(gpa, try gpa.dupe(u8, arg_item.string));
+                            try args_list.append(gpa, try expandEnvVars(gpa, arg_item.string, &env_map));
                         }
                     }
                     args = try args_list.toOwnedSlice(gpa);
                 }
             }
             server.transport = .{ .stdio = .{
-                .command = try gpa.dupe(u8, c),
+                .command = try expandEnvVars(gpa, c, &env_map),
                 .args = args,
             } };
-        } else if (url) |u| {
-            server.transport = .{ .sse = .{ .url = try gpa.dupe(u8, u) } };
         } else {
-            return error.InvalidMcpServerConfig;
+            // url is guaranteed non-null by the guards above (exactly one transport).
+            server.transport = .{ .sse = .{ .url = try expandEnvVars(gpa, url.?, &env_map) } };
         }
         try servers.append(gpa, server);
     }
     return try servers.toOwnedSlice(gpa);
+}
+
+/// Capture the process environment as a lookup map for `{env:VAR}` expansion.
+/// POSIX reads the raw environ block via `std.mem.span` (null-safe in
+/// multi-threaded contexts); Windows uses the global block. Mirrors the
+/// established pattern in `tools/bash.zig:currentEnvMap`.
+fn loadEnvMap(gpa: std.mem.Allocator) !std.process.Environ.Map {
+    if (builtin.os.tag == .windows) {
+        return std.process.Environ.createMap(.{ .block = .global }, gpa);
+    }
+    const env_slice = std.mem.span(std.c.environ);
+    return std.process.Environ.createMap(.{ .block = .{ .slice = env_slice } }, gpa);
+}
+
+/// Expand `{env:VAR}` placeholders in `input`, looking each name up in
+/// `env_map`. Returns a newly-allocated string (caller frees). A placeholder
+/// whose variable is unset is replaced with an empty string and a warning is
+/// logged, so a missing secret surfaces instead of silently producing a
+/// broken URL. Mirrors the `{env:VAR}` convention used by other MCP clients
+/// so existing server snippets work unchanged.
+fn expandEnvVars(gpa: std.mem.Allocator, input: []const u8, env_map: *const std.process.Environ.Map) ![]u8 {
+    // Fast path: no placeholder — dupe as-is.
+    if (std.mem.indexOf(u8, input, "{env:") == null) return try gpa.dupe(u8, input);
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var rest = input;
+    while (std.mem.indexOf(u8, rest, "{env:")) |start| {
+        try out.writer.writeAll(rest[0..start]);
+        const name_begin = start + "{env:".len;
+        const close_rel = std.mem.indexOfScalar(u8, rest[name_begin..], '}') orelse {
+            // Unterminated placeholder — emit the remainder verbatim and stop.
+            try out.writer.writeAll(rest[start..]);
+            rest = "";
+            break;
+        };
+        const name = rest[name_begin .. name_begin + close_rel];
+        if (env_map.get(name)) |value| {
+            try out.writer.writeAll(value);
+        } else {
+            std.log.warn("MCP config: environment variable '{s}' is not set; substituting empty string. Export it or remove the placeholder.", .{name});
+        }
+        rest = rest[name_begin + close_rel + 1 ..];
+    }
+    try out.writer.writeAll(rest);
+    return out.toOwnedSlice();
 }
 
 fn parseProviderConfig(gpa: std.mem.Allocator, name: []const u8, provider: Provider, value: std.json.Value) !ProviderConfig {
@@ -2184,6 +2245,117 @@ test "parseFile parses mcp (short key format)" {
     switch (cfg.mcp_servers[0].transport) {
         .stdio => |t| try std.testing.expectEqualStrings("node", t.command),
         .sse => return error.Unexpected,
+    }
+}
+
+test "parseFile parses remote mcp server (url transport)" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    const json = "{\"mcp_servers\":{\"remote\":{\"url\":\"https://mcp.example.com/mcp\"}}}";
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers.len);
+    try std.testing.expectEqualStrings("remote", cfg.mcp_servers[0].name);
+    switch (cfg.mcp_servers[0].transport) {
+        .sse => |t| try std.testing.expectEqualStrings("https://mcp.example.com/mcp", t.url),
+        .stdio => return error.Unexpected,
+    }
+}
+
+test "parseFile rejects mcp server configuring both transports" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    // command + url is ambiguous — the transport union allows exactly one,
+    // matching schema/config.schema.json's MCPServerConfig oneOf.
+    const json = "{\"mcp_servers\":{\"bad\":{\"command\":\"npx\",\"url\":\"https://mcp.example.com/mcp\"}}}";
+    try std.testing.expectError(
+        error.InvalidMcpServerConfig,
+        parseFile(gpa, "<test>", json, &sink),
+    );
+}
+
+test "parseFile rejects mcp server with neither command nor url" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    const json = "{\"mcp_servers\":{\"bad\":{\"enabled\":true}}}";
+    try std.testing.expectError(
+        error.InvalidMcpServerConfig,
+        parseFile(gpa, "<test>", json, &sink),
+    );
+}
+
+test "expandEnvVars leaves input without placeholders unchanged" {
+    const gpa = std.testing.allocator;
+    var env_map = std.process.Environ.Map.init(gpa);
+    defer env_map.deinit();
+
+    const out = try expandEnvVars(gpa, "https://example.com/mcp", &env_map);
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("https://example.com/mcp", out);
+}
+
+test "expandEnvVars substitutes a known variable" {
+    const gpa = std.testing.allocator;
+    var env_map = std.process.Environ.Map.init(gpa);
+    defer env_map.deinit();
+    try env_map.put("TAVILY_API_KEY", "secret123");
+
+    const out = try expandEnvVars(gpa, "https://mcp.tavily.com/mcp/?tavilyApiKey={env:TAVILY_API_KEY}", &env_map);
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("https://mcp.tavily.com/mcp/?tavilyApiKey=secret123", out);
+}
+
+test "expandEnvVars substitutes multiple variables with surrounding text" {
+    const gpa = std.testing.allocator;
+    var env_map = std.process.Environ.Map.init(gpa);
+    defer env_map.deinit();
+    try env_map.put("HOST", "example.com");
+    try env_map.put("TOKEN", "abc");
+
+    const out = try expandEnvVars(gpa, "https://{env:HOST}/mcp?token={env:TOKEN}&x=1", &env_map);
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("https://example.com/mcp?token=abc&x=1", out);
+}
+
+test "expandEnvVars replaces an unset variable with an empty string" {
+    const gpa = std.testing.allocator;
+    var env_map = std.process.Environ.Map.init(gpa);
+    defer env_map.deinit();
+
+    const out = try expandEnvVars(gpa, "https://x.com/?key={env:NOVA_TEST_UNSET_VAR}", &env_map);
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("https://x.com/?key=", out);
+}
+
+test "expandEnvVars emits an unterminated placeholder verbatim" {
+    const gpa = std.testing.allocator;
+    var env_map = std.process.Environ.Map.init(gpa);
+    defer env_map.deinit();
+    try env_map.put("FOO", "bar");
+
+    const out = try expandEnvVars(gpa, "https://x.com/?key={env:FOO", &env_map);
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("https://x.com/?key={env:FOO", out);
+}
+
+test "parseFile expands {env:VAR} placeholders in mcp url" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    // Unset variable → empty substitution; verifies the parse→expand wiring
+    // against the real environment without depending on a specific value.
+    const json = "{\"mcp_servers\":{\"tavily\":{\"url\":\"https://mcp.tavily.com/mcp/?key={env:NOVA_TEST_UNSET_MCP_VAR}\"}}}";
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers.len);
+    switch (cfg.mcp_servers[0].transport) {
+        .sse => |t| try std.testing.expectEqualStrings("https://mcp.tavily.com/mcp/?key=", t.url),
+        .stdio => return error.Unexpected,
     }
 }
 

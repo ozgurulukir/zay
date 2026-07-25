@@ -239,22 +239,20 @@ pub const McpManager = struct {
     }
 };
 
-/// Spawn the MCP server subprocess, perform handshake, and discover tools.
-/// On any failure, the caller should set status to .failed.
+/// Spawn the MCP server subprocess (stdio) and perform the handshake + tool
+/// discovery over whichever transport the client is configured for. The
+/// Streamable HTTP transport is connectionless — each JSON-RPC call is a fresh
+/// POST — so there is nothing to spawn for it. On any failure, the caller
+/// should set status to .failed.
 fn connectAndDiscover(io: std.Io, client: *client_mod.McpClient) !void {
-    // stdio transport: spawn subprocess
     if (client.transport == .stdio) {
         client.startStdio(io) catch |err| {
             client.setError("Failed to spawn: {s}", .{@errorName(err)});
             return err;
         };
-    } else {
-        // SSE transport — not yet implemented
-        client.setError("SSE transport not yet implemented", .{});
-        return error.SseNotImplemented;
     }
 
-    // MCP handshake
+    // MCP handshake (stdio pipes or HTTP POST).
     client.initialize(io) catch |err| {
         client.setError("Handshake failed: {s}", .{@errorName(err)});
         client.stop(io);
