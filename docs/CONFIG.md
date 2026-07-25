@@ -51,7 +51,6 @@ JSON keys are **camelCase**. Legacy snake_case keys from schema v1 are still acc
 {
   "version": "2.0.0",
   "defaultModel": "ollama/llama3.1:8b",
-  "provider": "ollama",
   "baseURL": "http://localhost:11434",
   "useResponsesEndpoint": false,
   "enableThinking": true,
@@ -96,8 +95,7 @@ JSON keys are **camelCase**. Legacy snake_case keys from schema v1 are still acc
 | Field | Type | Description |
 | --- | --- | --- |
 | `version` | `string` | Semver schema version (currently `"2.0.0"`). Legacy integer `1` is normalized to `"1.0.0"` at parse time. |
-| `defaultModel` | `string` | Model selection in `<provider>/<model-id>` format (e.g., `"openai/gpt-5.5"`, `"ollama/llama3.1:8b"`, `"qwen-cloud/qwen3.7-plus"`). The provider part is split on the first `/`; model ids may contain further slashes (e.g., `"huggingface/meta-llama/Llama-3.1-8B"`). Custom provider names are supported. Legacy key `model` is also accepted. |
-| `provider` | `string` | Active provider name. For builtins this is the enum label (`openai`, `openrouter`, etc.); for custom providers it is the user-chosen name from the `providers` map. This value is preserved across sessions. |
+| `defaultModel` | `string` | Model selection in `<provider>/<model-id>` format (e.g., `"openai/gpt-5.5"`, `"ollama/llama3.1:8b"`, `"qwen-cloud/qwen3.7-plus"`). The provider part is split on the first `/`; model ids may contain further slashes (e.g., `"huggingface/meta-llama/Llama-3.1-8B"`). Custom provider names are supported. This is the **single source of truth** for provider identity — there is no separate `provider` field. Legacy key `model` is also accepted. |
 | `baseURL` | `string` | Custom API endpoint base URL. Must start with `http://` or `https://`. In memory, this may be `""` when synthesized from session metadata or legacy fields; it is resolved through the provider's default before any network request. Legacy key `base_url` is also accepted. |
 | `useResponsesEndpoint` | `boolean` | `true` to route via OpenAI Responses API instead of ChatCompletions. Legacy key `use_responses_endpoint` is also accepted. |
 | `enableThinking` | `boolean` | `true` to enable extended reasoning for supported models. Legacy key `enable_thinking` is also accepted. |
@@ -166,12 +164,12 @@ Each entry in `providers` is keyed by provider name. Builtin labels (`openai`, `
 }
 ```
 
-**Provider merge order in `/connect`:** builtin catalogue → models.dev registry (overrides builtins with same id) → config providers (overrides everything with same name). All three sources share the same display surface.
+**Provider merge order in `/connect`:** builtin catalogue → models.dev registry (overrides builtins with same id) → config providers (overrides everything with same name, **except** entries already covered by the models.dev registry). All three sources share the same display surface.
 
 > [!NOTE]
-> **Custom provider session persistence**: Custom provider names (e.g., `"qwen-cloud"`) are preserved in `config.json` and remembered across sessions. On resume, Nova resolves the provider from the `providers` map and restores the stored `baseURL`. If the stored URL is empty (legacy session metadata), it falls back to the provider's configured `baseURL` or builtin default, preventing startup crashes.
+> **Custom provider session persistence**: Custom provider names (e.g., `"qwen-cloud"`) are preserved in `config.json` via the `defaultModel` field (e.g., `"qwen-cloud/qwen3.7-plus"`) and the `providers` map. On restart, Nova resolves the provider from `defaultModel`, hydrates `baseURL` from the `providers` map via `hydrateActiveModel`, and looks up the API key in `auth.json` using the provider name.
 >
-> **Dynamic providers (models.dev)** use a separate runtime-only `dynamic_provider_id` field (e.g., `"stepfun-ai"`) as the `provider_name` in `model_selection` so that `tryAttachOpenAiCompatibleFromConfig` can look up the correct API key in `auth.json`. The human-readable name (e.g., `"StepFun AI"`) is stored in `dynamic_provider_name` and used only for status bar display. This separation prevents the auth.json lookup from using the wrong key (e.g., `"openai_compatible"`) and failing with HTTP 402.
+> **Dynamic providers (models.dev)** persist their identity through `defaultModel: "provider-id/model-id"` (e.g., `"stepfun-ai/step-3.7-flash"`). The `providers` map stores the `baseURL` and per-model metadata. Runtime-only fields (`dynamic_provider_id`, `dynamic_provider_name`) are never serialized; after restart, all rehydration paths fall back to the serialized `provider_name` from `defaultModel` and the `providers` map. `hydrateActiveModel` includes a recovery fallback for configs written before the `provider_name` serialization fix (where `provider_name` was the generic `"openai_compatible"` label).
 
 ### MCP Server Configuration
 
@@ -190,7 +188,7 @@ A server is either stdio (`command` + `args`) or SSE (`url`), never both. Miscon
 > **API Keys Security Invariant**: API keys (`api_key`) are **NEVER** serialized into `config.json`. API keys are stored separately in `~/.config/nova/auth.json` with strict file permissions (`0o600`).
 
 > [!NOTE]
-> **Typed Model Selection**: The in-memory `Config` struct carries a `model_selection: ?ModelSelection` typed view. `ModelSelection` packages the non-optional `provider`/`model`/`base_url`/`api_key` plus optional settings. When all required fields are present, `parseObject` populates `model_selection` and clears the legacy optional fields.
+> **Typed Model Selection**: The in-memory `Config` struct carries a `model_selection: ?ModelSelection` typed view. `ModelSelection` packages the non-optional `provider`/`model`/`base_url`/`api_key` plus optional settings. `parseObject` only populates `model_selection` when all four fields are non-null — since `api_key` is never serialized to config.json (it lives in `auth.json`), disk-loaded configs **never** have `model_selection`. All rehydration paths fall back to the legacy fields (`provider`, `model`, `base_url`, `provider_name`), which ARE populated from `defaultModel` and `hydrateActiveModel`.
 
 ---
 
@@ -202,6 +200,7 @@ Configs written by older Nova versions (schema v1, snake_case keys, integer vers
 | --- | --- | --- |
 | `"version": 1` | `"version": "2.0.0"` | Integer normalized to semver at parse |
 | `"model"` | `"defaultModel"` | Both accepted; v2 written on save |
+| `"provider"` | _(removed)_ | Was write-only and redundant with `defaultModel`; no longer serialized. Still accepted at parse time if present (ignored). |
 | `"base_url"` | `"baseURL"` | Both accepted; v2 written on save |
 | `"use_responses_endpoint"` | `"useResponsesEndpoint"` | Both accepted; v2 written on save |
 | `"enable_thinking"` | `"enableThinking"` | Both accepted; v2 written on save |
