@@ -90,6 +90,7 @@ pub fn submitMode(app: *App) !bool {
                 switch (handle) {
                     .builtin => |provider| provider_model.submitProviderSetup(app, provider) catch |err| try app.reportConnectionError(err),
                     .dynamic => |provider| provider_model.submitDynamicProviderSetup(app, provider) catch |err| try app.reportConnectionError(err),
+                    .config => |provider| provider_model.submitConfigProviderSetup(app, provider) catch |err| try app.reportConnectionError(err),
                 }
                 return true;
             }
@@ -104,8 +105,7 @@ pub fn submitMode(app: *App) !bool {
                     provider_model.connectCodex(app) catch |err| try app.reportConnectionError(err);
                 }
             },
-            .open_form => |provider| provider_model.openProviderForm(app, provider),
-            .open_dynamic => |provider| provider_model.openDynamicProviderForm(app, provider),
+            .open_entry => |handle| provider_model.openProviderEntryForm(app, handle),
         }
         return true;
     }

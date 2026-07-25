@@ -65,9 +65,9 @@ pub fn deinitApp(self: *App) void {
         r.deinit(self.gpa);
         self.modelsdev_registry = null;
     }
-    if (self.dynamics_slice) |slice| {
+    if (self.entries_slice) |slice| {
         self.gpa.free(slice);
-        self.dynamics_slice = null;
+        self.entries_slice = null;
     }
     self.provider_key_input.deinit(self.gpa);
     self.settings_text_input.deinit(self.gpa);

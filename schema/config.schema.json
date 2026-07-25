@@ -13,8 +13,8 @@
     },
     "defaultModel": {
       "type": "string",
-      "pattern": "^[a-z_]+/.+$",
-      "description": "Primary model selection as '<provider>/<model-id>' (e.g., 'openai/gpt-5.5', 'ollama/llama3.1:8b'). Legacy key 'model' is also accepted."
+      "pattern": "^[a-zA-Z0-9._-]+/.+$",
+      "description": "Primary model selection as '<provider>/<model-id>' (e.g., 'openai/gpt-5.5', 'ollama/llama3.1:8b', 'qwen-cloud/qwen3.7-plus'). The provider part is split on the first '/'; model ids may contain further slashes (e.g., 'huggingface/meta-llama/Llama-3.1-8B'). Legacy key 'model' is also accepted."
     },
     "provider": {
       "type": "string",
@@ -48,7 +48,7 @@
     "providers": {
       "type": "object",
       "additionalProperties": { "$ref": "#/$defs/ProviderConfig" },
-      "description": "Per-provider configuration keyed by provider label (e.g., 'openai', 'ollama')."
+      "description": "Per-provider configuration keyed by provider name. Accepts builtin labels ('openai', 'ollama', 'openrouter', ...) and custom provider names ('qwen-cloud', 'my-endpoint'). Custom providers appear in the /connect picker and use the OpenAI-compatible adapter."
     },
     "mcpServers": {
       "type": "object",
@@ -85,6 +85,16 @@
           "type": "string",
           "enum": ["minimal", "low", "none", "medium", "high", "xhigh"],
           "description": "Reasoning effort level for this model."
+        },
+        "contextWindow": {
+          "type": "integer",
+          "minimum": 1024,
+          "description": "Context window size in tokens for this model. Overrides the catalogue lookup. Falls back to context.overrideContextWindow when unset."
+        },
+        "maxOutputTokens": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum tokens per generation turn for this model. Sent as max_tokens in the request body. Falls back to context.maxOutputTokens when unset."
         }
       },
       "additionalProperties": false

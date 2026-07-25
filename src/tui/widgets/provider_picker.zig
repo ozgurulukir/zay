@@ -20,18 +20,32 @@ pub const Column = enum { provider, sign_out };
 pub const Action = union(enum) {
     connect_codex,
     sign_out_codex,
-    open_form: config_mod.Provider,
-    open_dynamic: modelsdev.Provider,
+    open_entry: ProviderHandle,
 };
 
+/// Unified handle for any provider source: builtin catalogue, models.dev
+/// registry, or user-defined config entry. All three expose the same
+/// accessor surface so the picker renders and routes them uniformly.
 pub const ProviderHandle = union(enum) {
     builtin: config_mod.Provider,
     dynamic: modelsdev.Provider,
+    config: config_mod.ProviderConfig,
+
+    /// Deduplication key: `label()` for builtins, `id` for models.dev,
+    /// `name` for config entries.
+    pub fn id(self: ProviderHandle) []const u8 {
+        return switch (self) {
+            .builtin => |b| b.label(),
+            .dynamic => |d| d.id,
+            .config => |c| c.name,
+        };
+    }
 
     pub fn displayName(self: ProviderHandle) []const u8 {
         return switch (self) {
             .builtin => |b| b.displayName(),
             .dynamic => |d| d.name,
+            .config => |c| c.name,
         };
     }
 
@@ -39,6 +53,7 @@ pub const ProviderHandle = union(enum) {
         return switch (self) {
             .builtin => |b| b.description(),
             .dynamic => |d| d.description,
+            .config => "Custom provider from config",
         };
     }
 
@@ -46,6 +61,10 @@ pub const ProviderHandle = union(enum) {
         return switch (self) {
             .builtin => |b| b.defaultBaseUrl(),
             .dynamic => |d| if (d.base_url.len > 0) d.base_url else null,
+            .config => |c| switch (c.base_url) {
+                .custom => |url| url,
+                .default => c.provider.defaultBaseUrl(),
+            },
         };
     }
 
@@ -53,7 +72,21 @@ pub const ProviderHandle = union(enum) {
         return switch (self) {
             .builtin => |b| b.requiresApiKey(),
             .dynamic => |d| d.requires_api_key,
+            .config => true,
         };
+    }
+
+    /// Position within `catalogueProviders()` for badge lookup. Null for
+    /// non-builtin entries (their badge comes from the API-key map).
+    pub fn catalogueIndex(self: ProviderHandle) ?usize {
+        const b = switch (self) {
+            .builtin => |v| v,
+            else => return null,
+        };
+        for (config_mod.catalogueProviders(), 0..) |candidate, index| {
+            if (candidate == b) return index;
+        }
+        return null;
     }
 };
 
@@ -63,15 +96,15 @@ pub const State = struct {
     column: Column = .provider,
     form_handle: ?ProviderHandle = null,
     form_error: ?[]const u8 = null,
-    /// Dynamic models.dev providers shown below the builtin catalogue.
-    dynamics: []const modelsdev.Provider = &.{},
+    /// Merged provider list: builtins → models.dev → config (later overrides).
+    entries: []const ProviderHandle = &.{},
 
     pub fn reset(self: *State) void {
-        self.* = .{ .dynamics = self.dynamics };
+        self.* = .{ .entries = self.entries };
     }
 
     pub fn rowCount(self: *const State) u32 {
-        return 1 + @as(u32, @intCast(config_mod.catalogueProviders().len + self.dynamics.len));
+        return 1 + @as(u32, @intCast(self.entries.len));
     }
 
     pub fn handleKey(self: *State, key: vaxis.Key, codex_signed_in: bool) bool {
@@ -122,20 +155,7 @@ pub const State = struct {
             if (self.column == .sign_out) return .sign_out_codex;
             return .connect_codex;
         }
-        const builtin_count = config_mod.catalogueProviders().len;
-        const i = self.selection - 1;
-        if (i < builtin_count) {
-            return .{ .open_form = config_mod.catalogueProviders()[i] };
-        }
-        return .{ .open_dynamic = self.dynamics[i - builtin_count] };
-    }
-
-    pub fn selectedProvider(self: *const State) ?config_mod.Provider {
-        if (self.selection == 0) return null;
-        const builtin_count = config_mod.catalogueProviders().len;
-        const i = self.selection - 1;
-        if (i < builtin_count) return config_mod.catalogueProviders()[i];
-        return null;
+        return .{ .open_entry = self.entries[self.selection - 1] };
     }
 };
 
@@ -164,8 +184,7 @@ pub const Content = struct {
     }
 
     fn drawList(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
-        const builtins = config_mod.catalogueProviders();
-        const total_count = 1 + @as(u32, @intCast(builtins.len + self.state.dynamics.len));
+        const total_count = 1 + @as(u32, @intCast(self.state.entries.len));
         const viewport = panel.ViewportWindow.compute(self.state.selection, total_count, surface.size.height);
         if (viewport.visible_height == 0) return;
 
@@ -174,32 +193,25 @@ pub const Content = struct {
             const row = viewport.screenRow(i);
             if (i == 0) {
                 try self.drawCodex(surface, ctx, row);
-            } else if (i - 1 < builtins.len) {
-                const index = i - 1;
-                const provider = builtins[index];
-                const focused = self.state.selection == i and self.state.column == .provider;
-                const prefix = "  ";
-                const base = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, provider.displayName() });
-                try panel.commandLine(surface, row, base, ctx, focused);
-                const status = if (index < self.statuses.len) self.statuses[index] else .unknown;
-                try drawBadge(surface, ctx, row, base, status, focused);
-                const desc_style = if (focused) StylePalette.selected_item else StylePalette.thinking_body;
-                _ = panel.writeBorderTextEndingAt(surface, ctx, row, surface.size.width -| 2, provider.description(), desc_style);
-            } else {
-                const index = i - 1 - builtins.len;
-                const provider = self.state.dynamics[index];
-                const focused = self.state.selection == i and self.state.column == .provider;
-                const prefix = "  ";
-                const base = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, provider.name });
-                try panel.commandLine(surface, row, base, ctx, focused);
-                const status: Status = if (self.api_keys) |keys|
-                    (if (keys.get(provider.id) != null) .connected else .unknown)
-                else
-                    .unknown;
-                try drawBadge(surface, ctx, row, base, status, focused);
-                const desc_style = if (focused) StylePalette.selected_item else StylePalette.thinking_body;
-                _ = panel.writeBorderTextEndingAt(surface, ctx, row, surface.size.width -| 2, provider.description, desc_style);
+                continue;
             }
+            const entry = self.state.entries[i - 1];
+            const focused = self.state.selection == i and self.state.column == .provider;
+            const base = try std.fmt.allocPrint(ctx.arena, "  {s}", .{entry.displayName()});
+            try panel.commandLine(surface, row, base, ctx, focused);
+
+            // Badge: builtins use the catalogue status array; everything else
+            // derives connectivity from the API-key map.
+            const status: Status = if (entry.catalogueIndex()) |ci|
+                (if (ci < self.statuses.len) self.statuses[ci] else .unknown)
+            else if (self.api_keys) |keys|
+                (if (keys.get(entry.id()) != null) .connected else .unknown)
+            else
+                .unknown;
+            try drawBadge(surface, ctx, row, base, status, focused);
+
+            const desc_style = if (focused) StylePalette.selected_item else StylePalette.thinking_body;
+            _ = panel.writeBorderTextEndingAt(surface, ctx, row, surface.size.width -| 2, entry.description(), desc_style);
         }
     }
 
@@ -360,13 +372,16 @@ test "provider picker keeps sign out on the selected row background" {
 }
 
 test "provider picker selecting a catalogue row opens its form" {
-    var state: State = .{};
+    const count = comptime config_mod.catalogueProviders().len;
+    var entries: [count]ProviderHandle = undefined;
+    for (config_mod.catalogueProviders(), 0..) |b, idx| entries[idx] = .{ .builtin = b };
+
+    var state: State = .{ .entries = &entries };
     try std.testing.expectEqual(Action.connect_codex, state.selectedAction());
     try std.testing.expect(state.handleKey(.{ .codepoint = vaxis.Key.down }, false));
     const action = state.selectedAction();
-    try std.testing.expect(action == .open_form);
-    try std.testing.expectEqual(config_mod.catalogueProviders()[0], action.open_form);
-    try std.testing.expectEqual(config_mod.catalogueProviders()[0], state.selectedProvider().?);
+    try std.testing.expect(action == .open_entry);
+    try std.testing.expectEqual(config_mod.catalogueProviders()[0], action.open_entry.builtin);
 }
 
 fn rowText(arena: std.mem.Allocator, surface: vxfw.Surface, row: u16) ![]u8 {
@@ -384,8 +399,11 @@ test "provider picker badge reflects connectivity status, not key presence" {
     statuses[0] = .connected;
     statuses[1] = .failed;
 
+    var entries: [count]ProviderHandle = undefined;
+    for (config_mod.catalogueProviders(), 0..) |b, idx| entries[idx] = .{ .builtin = b };
+
     var content: Content = .{
-        .state = .{},
+        .state = .{ .entries = &entries },
         .codex_signed_in = false,
         .statuses = &statuses,
     };
@@ -412,12 +430,19 @@ test "provider picker badge reflects connectivity status, not key presence" {
 }
 
 test "provider picker viewport scrolling renders selected dynamic row" {
-    const dyn = [_]modelsdev.Provider{
-        .{ .id = "p1", .name = "Provider 1", .description = "Desc 1", .base_url = "https://p1.ai", .adapter = .openai_compatible, .requires_api_key = true },
-        .{ .id = "p2", .name = "Provider 2", .description = "Desc 2", .base_url = "https://p2.ai", .adapter = .openai_compatible, .requires_api_key = true },
+    const count = comptime config_mod.catalogueProviders().len;
+    const dyn = [_]ProviderHandle{
+        .{ .dynamic = .{ .id = "p1", .name = "Provider 1", .description = "Desc 1", .base_url = "https://p1.ai", .adapter = .openai_compatible, .requires_api_key = true } },
+        .{ .dynamic = .{ .id = "p2", .name = "Provider 2", .description = "Desc 2", .base_url = "https://p2.ai", .adapter = .openai_compatible, .requires_api_key = true } },
     };
+    // builtins + 2 dynamics; selection=8 should land on "Provider 2"
+    var entries: [count + 2]ProviderHandle = undefined;
+    for (config_mod.catalogueProviders(), 0..) |b, idx| entries[idx] = .{ .builtin = b };
+    entries[count] = dyn[0];
+    entries[count + 1] = dyn[1];
+
     var content: Content = .{
-        .state = .{ .selection = 8, .dynamics = &dyn },
+        .state = .{ .selection = 8, .entries = &entries },
         .codex_signed_in = false,
         .statuses = &.{},
     };

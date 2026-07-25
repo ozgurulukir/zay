@@ -14,6 +14,7 @@ const model_cache = @import("model_cache.zig");
 const model_loader = @import("model_loader.zig");
 const model_picker = @import("widgets/model_picker.zig");
 const openai_compatible_mod = @import("../ai/openai_compatible.zig");
+const provider_picker = @import("widgets/provider_picker.zig");
 const runtime_mod = @import("../runtime.zig");
 const session_mod = @import("../session.zig");
 const tui_provider = @import("provider_controller.zig");
@@ -50,24 +51,54 @@ pub fn ensureModelsDevRegistry(self: *App) !void {
         self.modelsdev_registry = modelsdev.loadOrFetchRegistry(self.gpa, self.io, home);
     }
     if (self.modelsdev_registry) |*reg| {
-        try updateDynamicProvidersList(self, reg.providers);
+        try buildMergedProviderList(self, reg.providers);
     }
 }
 
-fn updateDynamicProvidersList(self: *App, all_providers: []const modelsdev.Provider) !void {
-    var dynamics: std.ArrayList(modelsdev.Provider) = .empty;
-    defer dynamics.deinit(self.gpa);
+/// Three-layer merge: builtin catalogue → models.dev (overrides) → config
+/// (overrides). The result is a single `[]ProviderHandle` that the picker
+/// renders uniformly.
+fn buildMergedProviderList(self: *App, all_providers: []const modelsdev.Provider) !void {
+    var entries: std.ArrayList(provider_picker.ProviderHandle) = .empty;
+    defer entries.deinit(self.gpa);
 
-    for (all_providers) |p| {
-        if (std.mem.eql(u8, p.id, "openai")) continue;
-        if (catalogueIndexById(p.id) != null) continue;
-        try dynamics.append(self.gpa, p);
+    // Layer 1: builtin catalogue (lowest priority).
+    for (config_mod.catalogueProviders()) |p| {
+        try entries.append(self.gpa, .{ .builtin = p });
     }
 
-    if (self.dynamics_slice) |old| self.gpa.free(old);
-    const owned = try dynamics.toOwnedSlice(self.gpa);
-    self.dynamics_slice = owned;
-    self.pickers.provider.dynamics = owned;
+    // Layer 2: models.dev registry (overrides builtins with same id).
+    for (all_providers) |p| {
+        if (std.mem.eql(u8, p.id, "openai")) continue;
+        if (findEntryIndex(entries.items, p.id)) |idx| {
+            entries.items[idx] = .{ .dynamic = p };
+        } else {
+            try entries.append(self.gpa, .{ .dynamic = p });
+        }
+    }
+
+    // Layer 3: config providers (overrides everything with same name).
+    if (self.cached_config_owned) {
+        for (self.cached_config.providers) |cp| {
+            if (findEntryIndex(entries.items, cp.name)) |idx| {
+                entries.items[idx] = .{ .config = cp };
+            } else {
+                try entries.append(self.gpa, .{ .config = cp });
+            }
+        }
+    }
+
+    if (self.entries_slice) |old| self.gpa.free(old);
+    const owned = try entries.toOwnedSlice(self.gpa);
+    self.entries_slice = owned;
+    self.pickers.provider.entries = owned;
+}
+
+fn findEntryIndex(entries: []const provider_picker.ProviderHandle, id: []const u8) ?usize {
+    for (entries, 0..) |e, i| {
+        if (std.mem.eql(u8, e.id(), id)) return i;
+    }
+    return null;
 }
 
 pub fn catalogueIndexById(id: []const u8) ?usize {
@@ -110,22 +141,12 @@ pub fn applyProviderOutcomes(self: *App, outcomes: []const model_loader.Provider
     }
 }
 
-pub fn openProviderForm(self: *App, provider: config_mod.Provider) void {
+pub fn openProviderEntryForm(self: *App, handle: provider_picker.ProviderHandle) void {
     self.pickers.provider.stage = .form;
-    self.pickers.provider.form_handle = .{ .builtin = provider };
+    self.pickers.provider.form_handle = handle;
     self.pickers.provider.form_error = null;
     self.provider_key_input.clearRetainingCapacity();
-    if (self.provider_api_keys.get(provider.label())) |existing| {
-        self.provider_key_input.appendSlice(self.gpa, existing) catch {};
-    }
-}
-
-pub fn openDynamicProviderForm(self: *App, provider: modelsdev.Provider) void {
-    self.pickers.provider.stage = .form;
-    self.pickers.provider.form_handle = .{ .dynamic = provider };
-    self.pickers.provider.form_error = null;
-    self.provider_key_input.clearRetainingCapacity();
-    if (self.provider_api_keys.get(provider.id)) |existing| {
+    if (self.provider_api_keys.get(handle.id())) |existing| {
         self.provider_key_input.appendSlice(self.gpa, existing) catch {};
     }
 }
@@ -551,7 +572,69 @@ pub fn submitDynamicProviderSetup(self: *App, provider: modelsdev.Provider) !voi
     self.clearPaletteInput();
 }
 
+pub fn submitConfigProviderSetup(self: *App, provider: config_mod.ProviderConfig) !void {
+    if (self.thread.turn.isActive()) return error.InFlightTurn;
+    var key = std.mem.trim(u8, self.provider_key_input.items, " \t\r\n");
+    if (key.len == 0) {
+        if (self.provider_api_keys.get(provider.name)) |existing| {
+            key = existing;
+        }
+    }
+
+    if (key.len == 0) {
+        self.pickers.provider.form_error = "API key is required to connect to this provider.";
+        return;
+    }
+
+    const home = self.liveRuntime().?.home_dir;
+    try codex.saveProviderApiKey(self.gpa, self.io, home, provider.name, key);
+    try refreshProviderApiKeys(self);
+
+    // Resolve the base URL: explicit custom URL wins, otherwise fall back
+    // to the provider enum's default (e.g. openai_compatible has none).
+    const base_url: []const u8 = switch (provider.base_url) {
+        .custom => |url| url,
+        .default => provider.provider.defaultBaseUrl() orelse "",
+    };
+
+    if (self.cached_config_owned) {
+        const owned_url = try self.gpa.dupe(u8, base_url);
+        if (self.cached_config.base_url) |prev| self.gpa.free(prev);
+        self.cached_config.base_url = owned_url;
+
+        const owned_key = try self.gpa.dupe(u8, key);
+        if (self.cached_config.api_key) |prev| self.gpa.free(prev);
+        self.cached_config.api_key = owned_key;
+
+        self.cached_config.provider = .openai_compatible;
+
+        if (self.cached_config.dynamic_provider_name) |prev| self.gpa.free(prev);
+        self.cached_config.dynamic_provider_name = try self.gpa.dupe(u8, provider.name);
+    }
+
+    try startOpenAiCompatibleModelLoad(self, base_url, key, provider.name);
+
+    self.pickers.provider.stage = .list;
+    self.pickers.provider.form_handle = null;
+    self.provider_key_input.clearRetainingCapacity();
+
+    self.mode = .model_picker;
+    self.pickers.models.model_column = .model;
+    self.pickers.models.model_selection = 0;
+    self.pickers.models.model_scope = defaultModelScope(self);
+    self.pickers.models.reasoning_snapshot.clearRetainingCapacity();
+    self.pickers.models.model_selection_snapshot = 0;
+    self.clearInput();
+    self.clearPaletteInput();
+}
+
 pub fn startDynamicProviderModelLoad(self: *App, provider: modelsdev.Provider, key: []const u8) !void {
+    try startOpenAiCompatibleModelLoad(self, provider.base_url, key, provider.name);
+}
+
+/// Shared model-load path for any OpenAI-compatible endpoint (models.dev
+/// dynamic providers and user-defined config providers).
+pub fn startOpenAiCompatibleModelLoad(self: *App, base_url: []const u8, key: []const u8, display_name: []const u8) !void {
     cancelModelLoad(self);
     self.conn_recompute = false;
     if (self.pickers.models.load == .failed) {
@@ -562,11 +645,11 @@ pub fn startDynamicProviderModelLoad(self: *App, provider: modelsdev.Provider, k
     var configured = try self.gpa.alloc(model_loader.Configured, 1);
     errdefer self.gpa.free(configured);
 
-    const url = try self.gpa.dupe(u8, provider.base_url);
+    const url = try self.gpa.dupe(u8, base_url);
     errdefer self.gpa.free(url);
     const k = try self.gpa.dupe(u8, key);
     errdefer self.gpa.free(k);
-    const name = try self.gpa.dupe(u8, provider.name);
+    const name = try self.gpa.dupe(u8, display_name);
     errdefer self.gpa.free(name);
 
     configured[0] = .{

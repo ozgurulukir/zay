@@ -162,8 +162,8 @@ pub const App = struct {
     provider_api_keys: codex.ApiKeyMap = .empty,
     /// Merged models.dev provider registry (builtins + cached/fetched). Owned; freed in `deinit`.
     modelsdev_registry: ?modelsdev.Registry = null,
-    /// Backing slice for provider picker's dynamic provider list. Owned; freed in `deinit`.
-    dynamics_slice: ?[]const modelsdev.Provider = null,
+    /// Backing slice for provider picker's merged provider list. Owned; freed in `deinit`.
+    entries_slice: ?[]const provider_picker.ProviderHandle = null,
     /// Inline edit buffer for the provider setup form's API-key field. Owned;
     /// freed in `deinit`.
     provider_key_input: std.ArrayList(u8) = .empty,
@@ -2156,13 +2156,17 @@ test "model picker without models stays on model column" {
 }
 
 test "provider picker navigates from codex to catalogue providers" {
-    var state: provider_picker.State = .{};
+    const count = comptime config_mod.catalogueProviders().len;
+    var entries: [count]provider_picker.ProviderHandle = undefined;
+    for (config_mod.catalogueProviders(), 0..) |b, idx| entries[idx] = .{ .builtin = b };
+
+    var state: provider_picker.State = .{ .entries = &entries };
     try std.testing.expectEqual(@as(u32, 0), state.selection);
     try std.testing.expectEqual(provider_picker.Action.connect_codex, state.selectedAction());
     // Below the Codex row sit the catalogue providers; selecting one opens its form.
     try std.testing.expect(state.handleKey(.{ .codepoint = vaxis.Key.down }, false));
     try std.testing.expectEqual(@as(u32, 1), state.selection);
-    try std.testing.expect(state.selectedAction() == .open_form);
+    try std.testing.expect(state.selectedAction() == .open_entry);
 }
 
 test "local provider model labels use correct separator" {

@@ -96,7 +96,7 @@ JSON keys are **camelCase**. Legacy snake_case keys from schema v1 are still acc
 | Field | Type | Description |
 | --- | --- | --- |
 | `version` | `string` | Semver schema version (currently `"2.0.0"`). Legacy integer `1` is normalized to `"1.0.0"` at parse time. |
-| `defaultModel` | `string` | Model selection in `<provider>/<model-id>` format (e.g., `"openai/gpt-5.5"`, `"ollama/llama3.1:8b"`). Legacy key `model` is also accepted. |
+| `defaultModel` | `string` | Model selection in `<provider>/<model-id>` format (e.g., `"openai/gpt-5.5"`, `"ollama/llama3.1:8b"`, `"qwen-cloud/qwen3.7-plus"`). The provider part is split on the first `/`; model ids may contain further slashes (e.g., `"huggingface/meta-llama/Llama-3.1-8B"`). Custom provider names are supported. Legacy key `model` is also accepted. |
 | `provider` | `string` | Active provider label (redundant with `defaultModel`, kept for readability). |
 | `baseURL` | `string` | Custom API endpoint base URL. Must start with `http://` or `https://`. Legacy key `base_url` is also accepted. |
 | `useResponsesEndpoint` | `boolean` | `true` to route via OpenAI Responses API instead of ChatCompletions. Legacy key `use_responses_endpoint` is also accepted. |
@@ -105,7 +105,7 @@ JSON keys are **camelCase**. Legacy snake_case keys from schema v1 are still acc
 | `bashClassifierUrl` | `string` | ModernBERT classifier endpoint for shell command safety check. Legacy key `bash_classifier_url` is also accepted. |
 | `context` | `object` | Context window management and compaction policy (see below). |
 | `mcpServers` | `object` | MCP server configurations (Claude Desktop format compatible). Legacy keys `mcp_servers` and `mcp` are also accepted. |
-| `providers` | `object` | Per-provider configuration keyed by provider label. |
+| `providers` | `object` | Per-provider configuration keyed by provider name. Accepts builtin labels and custom provider names (see below). |
 
 ### Context & Compaction Settings
 
@@ -136,13 +136,36 @@ The `context` object controls context window management and automatic summarizat
 
 ### Provider Configuration
 
-Each entry in `providers` is keyed by provider label:
+Each entry in `providers` is keyed by provider name. Builtin labels (`openai`, `ollama`, `openrouter`, `cerebras`, `huggingface`, `nvidia_nim`, `opencode_zen`, `ollama_cloud`, `llama.cpp`, `anthropic`) are recognized and mapped to their typed enum. Any other key is treated as a **custom provider** using the OpenAI-compatible adapter — it appears in the `/connect` picker alongside builtins and models.dev providers.
 
 | Field | Type | Description |
 | --- | --- | --- |
 | `baseURL` | `string` | Custom base URL for this provider. Legacy key `base_url` is also accepted. |
 | `models` | `object` | Per-model overrides keyed by model id. |
 | `models.<id>.reasoningEffort` | `string` | One of `minimal`, `low`, `none`, `medium`, `high`, `xhigh`. |
+| `models.<id>.contextWindow` | `integer` | Context window size in tokens. Overrides the catalogue lookup; falls back to `context.overrideContextWindow`. Minimum 1024. |
+| `models.<id>.maxOutputTokens` | `integer` | Maximum tokens per generation turn. Sent as `max_tokens` in the request body; falls back to `context.maxOutputTokens`. Minimum 1. |
+
+**Example — custom provider with per-model limits:**
+
+```json
+{
+  "defaultModel": "qwen-cloud/qwen3.7-plus",
+  "providers": {
+    "qwen-cloud": {
+      "baseURL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "models": {
+        "qwen3.7-plus": {
+          "contextWindow": 131072,
+          "maxOutputTokens": 16384
+        }
+      }
+    }
+  }
+}
+```
+
+**Provider merge order in `/connect`:** builtin catalogue → models.dev registry (overrides builtins with same id) → config providers (overrides everything with same name). All three sources share the same display surface.
 
 ### MCP Server Configuration
 

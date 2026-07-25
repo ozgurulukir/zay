@@ -28,7 +28,7 @@ TUI built with libvaxis vxfw (source in zig-pkg). Prefer framework primitives.
 
 **Viewport scrolling pattern.** Standardize overlay list viewports using `panel.ViewportWindow.compute(selection, total_count, surface.size.height)` in `src/tui/widgets/panel.zig`. Use `viewport.screenRow(i)` for row rendering calculations.
 
-**Provider polymorphism pattern.** Unify static builtin `config_mod.Provider` and dynamic `modelsdev.Provider` handles using `ProviderHandle = union(enum) { builtin: config_mod.Provider, dynamic: modelsdev.Provider }` in `src/tui/widgets/provider_picker.zig`.
+**Provider polymorphism pattern.** Unify static builtin `config_mod.Provider`, dynamic `modelsdev.Provider`, and user-defined `config_mod.ProviderConfig` handles using `ProviderHandle = union(enum) { builtin, dynamic, config }` in `src/tui/widgets/provider_picker.zig`. All three expose the same accessor surface (`id()`, `displayName()`, `description()`, `defaultBaseUrl()`, `requiresApiKey()`, `catalogueIndex()`). The `/connect` picker builds a single merged list via `buildMergedProviderList` in `src/tui/provider_model.zig`: builtin catalogue → models.dev registry (overrides builtins with same id) → config providers (overrides everything with same name).
 
 **System clipboard pattern.** `src/clipboard.zig` handles OS clipboard reading/writing via terminal OSC 52 sequences (`\x1b]52;c;<base64>\x07`) with OS-native execution fallback (`wl-copy`/`xclip`/`pbcopy`/`powershell` via `bash.zig`). `clipboard_helper.zig` routes clipboard data dynamically to focused input fields and transcript message blocks.
 
