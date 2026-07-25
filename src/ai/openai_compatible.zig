@@ -570,6 +570,9 @@ fn readStream(
     }
     for (stream.builders.items) |*builder| {
         if (builder.name.items.len == 0) continue;
+        // Safety net: providers that echo the same tool-call ID across
+        // multiple indices can leave duplicate builders with no arguments.
+        if (builder.arguments.items.len == 0) continue;
         try blocks.append(gpa, .{ .tool_call = try builder.toToolCall(gpa, tool_call_seq) });
     }
     return .{ .assistant = .{ .assistant = .{ .content = try blocks.toOwnedSlice(gpa) } }, .usage = usage };
@@ -829,7 +832,25 @@ fn parseToolCallObject(
     // Detect ID collision: same logical index but a different tool-call ID.
     // This happens when a provider reuses index 0 for parallel tool calls.
     // Fork a new physical slot and remap this logical index to it.
+    //
+    // Also detect ID duplication: different logical index but the same ID.
+    // Some providers (Qwen/DashScope) echo the same tool-call ID across
+    // multiple indices. Remap this logical index to the existing builder
+    // so argument chunks accumulate in one place instead of creating an
+    // empty duplicate.
     if (has_pending_id) {
+        // Merge: same ID already lives in another physical slot.
+        for (stream.builders.items, 0..) |*existing, i| {
+            if (existing.id.items.len == 0) continue;
+            if (!std.mem.eql(u8, existing.id.items, pending.id.items)) continue;
+            const existing_physical: u32 = @intCast(i);
+            if (existing_physical != stream.physicalSlot(logical)) {
+                stream.remapped_slot[logical] = existing_physical;
+                stream.is_remapped[logical] = true;
+            }
+            break;
+        }
+        // Fork: same logical index, different ID → new physical slot.
         const current = stream.physicalSlot(logical);
         const existing = &stream.builders.items[@as(usize, current)];
         if (existing.id.items.len > 0 and !std.mem.eql(u8, existing.id.items, pending.id.items)) {
@@ -1409,4 +1430,39 @@ test "parse streaming parallel tool calls with reused index does not concatenate
     try std.testing.expectEqualStrings("call_1", stream.builders.items[0].id.items);
     try std.testing.expectEqualStrings("mcp__server__search_graph", stream.builders.items[1].name.items);
     try std.testing.expectEqualStrings("call_2", stream.builders.items[1].id.items);
+}
+
+test "parse streaming duplicate ID across indices merges into one builder" {
+    const gpa = std.testing.allocator;
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
+
+    // Qwen/DashScope echoes the same tool-call ID across multiple indices.
+    // The first chunk carries the name at index 0; a duplicate arrives at
+    // index 1 with the same ID. Arguments follow on index 0.
+    _ = try parseStreamChunk(gpa,
+        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":""}}]}}]}
+    , &content, &reasoning, &stream);
+
+    _ = try parseStreamChunk(gpa,
+        \\{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_1","function":{"name":"bash","arguments":""}}]}}]}
+    , &content, &reasoning, &stream);
+
+    _ = try parseStreamChunk(gpa,
+        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":\"ls\"}"}}]}}]}
+    , &content, &reasoning, &stream);
+
+    // Index 1 is remapped to the same physical slot as index 0.
+    // Only one builder should carry the name + arguments.
+    var with_args: usize = 0;
+    for (stream.builders.items) |b| {
+        if (b.name.items.len > 0 and b.arguments.items.len > 0) with_args += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), with_args);
+    try std.testing.expectEqualStrings("bash", stream.builders.items[0].name.items);
+    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", stream.builders.items[0].arguments.items);
 }
