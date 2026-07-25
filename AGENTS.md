@@ -175,14 +175,8 @@ Run:
 - `zig fmt`
 - `zig build test`
 
-## Known Issues
+## Gotchas
 
-- **Session resume shows blank TUI (fixed).** At startup (`root.zig` → `initResume`), the agent is rehydrated from the session DB but the TUI transcript was never populated — only the logo animation was appended. Fix: call `app.rebuildTranscriptFromAgent()` in `tui.run()` before deciding whether to show the logo. For a resumed session the transcript populates from the agent's message history; for a new session it stays empty and the logo falls through as before.
+- **`std.atomic.Mutex` is a spinlock.** In Zig 0.16, `std.atomic.Mutex` busy-waits and pegs the CPU on multi-core (80% at idle). Always use `std.Io.Mutex` / `std.Io.Condition` (paired via `static_thread_pool` or similar). All existing sites have been migrated — do not reintroduce `std.atomic.Mutex`.
 
-- **High CPU usage from spinlocks.** `std.atomic.Mutex` busy-waits and pegs the CPU on multi-core. Use `std.Io.Mutex` and `std.Io.Condition` instead (paired via `static_thread_pool` or similar). Symptom: 80% CPU at idle, drops to ~2% after the fix. Files affected: `lib/logger.zig`, `src/agent.zig`, `src/background.zig`, `src/session.zig`.
-
-- **Double-free in `postAgentEvent` / `postTurnFailed` / `runAgentTurn` (fixed).** `postAgentEvent` takes ownership of the event — on error it frees the event's data internally. Callers' catch blocks were freeing `message_text` again (double-free), and the QueueFull handler was manually cleaning up `event_ptr` before `return error.TurnCancelled`, which triggered errdefer to repeat the same cleanup. Fix: remove `worker_context.gpa.free(message_text)` from catch blocks in `runAgentTurn` and `postTurnFailed`; remove manual `event_ptr.deinit`+`destroy` before `return error.TurnCancelled` in `postAgentEvent`.
-
-- **Session resume panics on empty `base_url` (fixed).** When resuming a session with no `model_selection` in config, `initSession` synthesized one with `.base_url = ""`. That empty string reached `openai_compatible.Client.init`, which asserts `base_url.len > 0`. Fix: initialize `model_selection.base_url` from `provider.defaultBaseUrl()` instead of `""`, and add fallback resolution in `tryAttachOpenAiCompatibleFromConfig` / `tryAttachOpenAiResponsesFromConfig` so client `init` never sees an empty URL.
-
-- **Dynamic provider identity lost across restart (fixed).** Three independent bugs: (1) `buildMergedProviderList` Layer 3 overrode models.dev `.dynamic` handles with persisted `ProviderConfig` entries, converting dynamic providers to "custom" in the picker. (2) `applyConfigOverlay` didn't propagate `ms.provider_name` to `target.provider_name`, so `serialize`'s legacy path wrote `"provider": "openai_compatible"` instead of the actual id. (3) `tryAttachOpenAiCompatibleFromConfig` returned early when `model_selection` was null (always, since `api_key` is never serialized) and `defaultBaseUrl()` was null for `.openai_compatible`. Fix: Layer 3 registry guard, `provider_name` propagation + `serialize` uses `provider_name`, legacy field fallback in `tryAttachOpenAiCompatibleFromConfig`, `hydrateActiveModel` recovery for broken configs, and removal of the redundant `"provider"` field from `serialize` (the `"provider"` field was write-only — `parseObject` only reads `defaultModel`).
+- **`postAgentEvent` owns the event.** It frees the event's data internally on error. Callers must NOT free `message_text` or `event_ptr` in catch blocks or before `return error.TurnCancelled` — doing so causes a double-free (errdefer repeats the cleanup).
