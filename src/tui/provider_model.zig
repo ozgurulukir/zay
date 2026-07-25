@@ -355,10 +355,12 @@ pub fn collectConfiguredProviders(self: *App, catalog: ModelCatalog) ![]model_lo
         }
         if (shouldLoadConfiguredCompatibleCatalog(self)) {
             const ms = self.cached_config.model_selection orelse return list.toOwnedSlice(self.gpa);
-            const base_url = ms.base_url;
             const provider = ms.provider;
             // Catalogue providers are already covered by the auth.json keys above.
             if (!provider.isCatalogue()) {
+                // base_url may be "" when synthesized from session metadata or
+                // legacy fields; resolve through the provider default.
+                const base_url = if (ms.base_url.len > 0) ms.base_url else provider.defaultBaseUrl() orelse return list.toOwnedSlice(self.gpa);
                 try appendConfigured(self, &list, provider, base_url, ms.api_key);
             }
         }

@@ -144,7 +144,13 @@ fn loadAndRecord(job: *Job, configured: Configured, result: *Result) !void {
 }
 
 fn loadConfigured(job: *Job, configured: Configured, result: *Result) !void {
-    const fetched = try openai_compatible_mod.listModels(job.gpa, job.io, configured.base_url, configured.api_key);
+    // base_url may be "" when synthesized from session metadata or legacy
+    // fields; resolve through the provider's default before hitting the wire.
+    const base_url = if (configured.base_url.len > 0)
+        configured.base_url
+    else
+        configured.provider.defaultBaseUrl() orelse return;
+    const fetched = try openai_compatible_mod.listModels(job.gpa, job.io, base_url, configured.api_key);
     defer {
         for (fetched) |*entry| entry.deinit(job.gpa);
         job.gpa.free(fetched);
