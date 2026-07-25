@@ -139,9 +139,9 @@ pub const SessionManager = struct {
 
     pub fn list(self: *SessionManager, gpa: std.mem.Allocator, cwd: ?[]const u8) Error![]SessionSummary {
         const sql = if (cwd == null)
-            "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id from sessions where leaf_entry_id is not null order by updated_at_ms desc"
+            "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id from sessions where leaf_entry_id is not null order by updated_at_ms desc"
         else
-            "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id from sessions where cwd = ? and leaf_entry_id is not null order by updated_at_ms desc";
+            "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id from sessions where cwd = ? and leaf_entry_id is not null order by updated_at_ms desc";
         var statement = try self.connection.prepare(sql);
         defer statement.finalize();
         if (cwd) |path| try statement.bindText(1, path);

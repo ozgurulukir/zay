@@ -359,6 +359,12 @@ pub const ContextSettings = struct {
     override_context_window: ?u32 = null,
     /// Maximum tokens per single model generation turn.
     max_output_tokens: ?u32 = null,
+    /// Upper bound on parallel tool calls accepted from the model.
+    /// Providers exceeding this get a logged error. Default 16.
+    max_parallel_tool_calls: ?u32 = null,
+    /// Socket read timeout in seconds for streaming responses.
+    /// Prevents indefinite hangs when the server stops mid-stream.
+    request_timeout_seconds: ?u32 = null,
     compaction: CompactionSettings = .{},
 };
 
@@ -660,6 +666,8 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
 fn applyContextOverlay(target: *ContextSettings, updates: ContextSettings) void {
     if (updates.override_context_window != null) target.override_context_window = updates.override_context_window;
     if (updates.max_output_tokens != null) target.max_output_tokens = updates.max_output_tokens;
+    if (updates.max_parallel_tool_calls != null) target.max_parallel_tool_calls = updates.max_parallel_tool_calls;
+    if (updates.request_timeout_seconds != null) target.request_timeout_seconds = updates.request_timeout_seconds;
     const d: CompactionSettings = .{};
     if (updates.compaction.auto != d.auto) target.compaction.auto = updates.compaction.auto;
     if (updates.compaction.threshold != d.threshold) target.compaction.threshold = updates.compaction.threshold;
@@ -1002,6 +1010,12 @@ fn parseContext(value: std.json.Value) ContextSettings {
     }
     if (intField(value, "maxOutputTokens")) |v| {
         if (v >= 1) ctx.max_output_tokens = @intCast(v);
+    }
+    if (intField(value, "maxParallelToolCalls")) |v| {
+        if (v >= 1 and v <= 64) ctx.max_parallel_tool_calls = @intCast(v);
+    }
+    if (intField(value, "requestTimeoutSeconds")) |v| {
+        if (v >= 1) ctx.request_timeout_seconds = @intCast(v);
     }
     if (value.object.get("compaction")) |comp_val| {
         if (comp_val == .object) ctx.compaction = parseCompaction(comp_val);
@@ -1395,9 +1409,9 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
     // legacy fields for Configs that bypass parseObject (tests).
     if (config.model_selection) |ms| {
         try writeKey(writer, "provider", &wrote_any);
-        try std.json.Stringify.value(ms.provider.label(), .{}, writer);
+        try std.json.Stringify.value(ms.provider_name, .{}, writer);
         try writeKey(writer, "defaultModel", &wrote_any);
-        try writeModelSelection(gpa, writer, ms.provider, ms.model.id);
+        try writeModelSelection(gpa, writer, ms.provider_name, ms.model.id);
         if (ms.use_responses_endpoint) {
             try writeKey(writer, "useResponsesEndpoint", &wrote_any);
             try writer.writeAll("true");
@@ -1430,7 +1444,7 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
         if (config.model) |m| {
             if (config.provider) |provider| {
                 try writeKey(writer, "defaultModel", &wrote_any);
-                try writeModelSelection(gpa, writer, provider, m.id);
+                try writeModelSelection(gpa, writer, provider.label(), m.id);
             }
         }
         if (config.system_prompt) |s| {
@@ -1462,6 +1476,8 @@ fn hasNonDefaultContext(ctx: ContextSettings) bool {
     const d: ContextSettings = .{};
     if (ctx.override_context_window != null) return true;
     if (ctx.max_output_tokens != null) return true;
+    if (ctx.max_parallel_tool_calls != null) return true;
+    if (ctx.request_timeout_seconds != null) return true;
     if (ctx.compaction.auto != d.compaction.auto) return true;
     if (ctx.compaction.threshold != d.compaction.threshold) return true;
     if (ctx.compaction.buffer_tokens != d.compaction.buffer_tokens) return true;
@@ -1478,6 +1494,14 @@ fn writeContext(writer: *std.Io.Writer, ctx: ContextSettings) !void {
     }
     if (ctx.max_output_tokens) |v| {
         try writeKeyNoIndent(writer, "maxOutputTokens", &wrote_any);
+        try writer.print("{d}", .{v});
+    }
+    if (ctx.max_parallel_tool_calls) |v| {
+        try writeKeyNoIndent(writer, "maxParallelToolCalls", &wrote_any);
+        try writer.print("{d}", .{v});
+    }
+    if (ctx.request_timeout_seconds) |v| {
+        try writeKeyNoIndent(writer, "requestTimeoutSeconds", &wrote_any);
         try writer.print("{d}", .{v});
     }
     // Compaction: always written when context is present.
@@ -1508,8 +1532,8 @@ fn writeCompaction(writer: *std.Io.Writer, comp: CompactionSettings) !void {
     try writer.writeByte('}');
 }
 
-fn writeModelSelection(gpa: std.mem.Allocator, writer: *std.Io.Writer, provider: Provider, model_id: []const u8) !void {
-    const selection = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ provider.label(), model_id });
+fn writeModelSelection(gpa: std.mem.Allocator, writer: *std.Io.Writer, provider_name: []const u8, model_id: []const u8) !void {
+    const selection = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ provider_name, model_id });
     defer gpa.free(selection);
     try std.json.Stringify.value(selection, .{}, writer);
 }

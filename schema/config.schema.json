@@ -145,6 +145,19 @@
           "minimum": 1,
           "description": "Maximum tokens per single model generation turn."
         },
+        "maxParallelToolCalls": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "default": 16,
+          "description": "Upper bound on parallel tool calls accepted from the model. Providers exceeding this get a logged error."
+        },
+        "requestTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 300,
+          "description": "Socket read timeout in seconds for streaming responses. Prevents indefinite hangs when the server stops mid-stream."
+        },
         "compaction": { "$ref": "#/$defs/CompactionSettings" }
       },
       "additionalProperties": false

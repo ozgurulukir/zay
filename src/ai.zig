@@ -61,6 +61,13 @@ pub const Config = struct {
     /// (`providers.<name>.models.<id>.maxOutputTokens`) or global
     /// `context.maxOutputTokens`.
     max_output_tokens: ?u32 = null,
+    /// Upper bound on parallel tool calls the stream parser will accept.
+    /// Providers that exceed this get a logged error instead of silent
+    /// truncation. Hard array capacity is 64; this is the runtime gate.
+    max_parallel_tool_calls: u32 = 16,
+    /// Socket-level read timeout in seconds for streaming responses.
+    /// Prevents indefinite hangs when the server stops mid-stream.
+    request_timeout_seconds: u32 = 300,
     account_id: []const u8 = "",
     session_id: []const u8 = "",
     system_prompt: []const u8 = "You are a helpful assistant.",

@@ -194,29 +194,49 @@ pub const AgentRuntime = struct {
             var summary = try target.session_writer.session.summary(gpa);
             defer summary.deinit(gpa);
             if (summary.model_provider) |mp| {
-                // Session has model info - create a config with that model
-                const provider_enum = std.meta.stringToEnum(config_mod.Provider, mp) orelse {
+                // Resolve the provider: try builtin enum first, then the
+                // providers[] config map (custom providers like "qwen-cloud").
+                const provider_enum = std.meta.stringToEnum(config_mod.Provider, mp) orelse blk: {
+                    for (config.providers) |pc| {
+                        if (std.mem.eql(u8, pc.name, mp)) break :blk pc.provider;
+                    }
                     std.log.warn("session.resume.unknown_provider: {s}, using config default", .{mp});
                     try target.applyFromConfig(config);
                     return;
                 };
+
+                // Resolve base_url from the providers[] map when the provider
+                // is custom (defaultBaseUrl() is null for .openai_compatible).
+                var resolved_base_url: []const u8 = provider_enum.defaultBaseUrl() orelse "";
+                for (config.providers) |pc| {
+                    if (!std.mem.eql(u8, pc.name, mp)) continue;
+                    switch (pc.base_url) {
+                        .custom => |url| resolved_base_url = url,
+                        .default => {},
+                    }
+                    break;
+                }
+
                 var session_config = config;
                 if (session_config.model_selection) |*ms| {
                     ms.provider = provider_enum;
+                    ms.provider_name = @constCast(mp);
                     if (summary.model_id) |mid| {
                         ms.model.id = mid;
                     }
+                    if (ms.base_url.len == 0 and resolved_base_url.len > 0) {
+                        ms.base_url = @constCast(resolved_base_url);
+                    }
                     try target.applyFromConfig(session_config);
                 } else {
-                    // No model_selection in config, create one from session
                     session_config.model_selection = .{
                         .provider = provider_enum,
-                        .provider_name = @constCast(provider_enum.label()),
+                        .provider_name = @constCast(mp),
                         .model = .{
                             .id = summary.model_id orelse "",
                             .reasoning = .unset,
                         },
-                        .base_url = @constCast(provider_enum.defaultBaseUrl() orelse ""),
+                        .base_url = @constCast(resolved_base_url),
                         .api_key = "",
                         .use_responses_endpoint = false,
                         .bash_classifier_url = null,
@@ -502,6 +522,8 @@ pub const AgentRuntime = struct {
             .mcp_tools = self.mcp_tools,
             .reasoning = .{ .effort = effort },
             .max_output_tokens = self.context_settings.max_output_tokens,
+            .max_parallel_tool_calls = self.context_settings.max_parallel_tool_calls orelse 16,
+            .request_timeout_seconds = self.context_settings.request_timeout_seconds orelse 300,
             .session_id = self.session_writer.session.id.slice(),
         });
         errdefer client.deinit();

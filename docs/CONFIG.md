@@ -97,7 +97,7 @@ JSON keys are **camelCase**. Legacy snake_case keys from schema v1 are still acc
 | --- | --- | --- |
 | `version` | `string` | Semver schema version (currently `"2.0.0"`). Legacy integer `1` is normalized to `"1.0.0"` at parse time. |
 | `defaultModel` | `string` | Model selection in `<provider>/<model-id>` format (e.g., `"openai/gpt-5.5"`, `"ollama/llama3.1:8b"`, `"qwen-cloud/qwen3.7-plus"`). The provider part is split on the first `/`; model ids may contain further slashes (e.g., `"huggingface/meta-llama/Llama-3.1-8B"`). Custom provider names are supported. Legacy key `model` is also accepted. |
-| `provider` | `string` | Active provider label (redundant with `defaultModel`, kept for readability). |
+| `provider` | `string` | Active provider name. For builtins this is the enum label (`openai`, `openrouter`, etc.); for custom providers it is the user-chosen name from the `providers` map. This value is preserved across sessions. |
 | `baseURL` | `string` | Custom API endpoint base URL. Must start with `http://` or `https://`. Legacy key `base_url` is also accepted. |
 | `useResponsesEndpoint` | `boolean` | `true` to route via OpenAI Responses API instead of ChatCompletions. Legacy key `use_responses_endpoint` is also accepted. |
 | `enableThinking` | `boolean` | `true` to enable extended reasoning for supported models. Legacy key `enable_thinking` is also accepted. |
@@ -167,6 +167,9 @@ Each entry in `providers` is keyed by provider name. Builtin labels (`openai`, `
 ```
 
 **Provider merge order in `/connect`:** builtin catalogue → models.dev registry (overrides builtins with same id) → config providers (overrides everything with same name). All three sources share the same display surface.
+
+> [!NOTE]
+> **Custom provider session persistence**: Custom provider names (e.g., `"qwen-cloud"`) are preserved in `config.json` and remembered across sessions. On resume, Nova resolves the provider from the `providers` map and restores the stored `baseURL`, so your custom endpoint and API key survive restarts.
 
 ### MCP Server Configuration
 

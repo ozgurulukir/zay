@@ -11,7 +11,10 @@ const Scanner = std.json.Scanner;
 const redirect_buffer_bytes: u32 = 8192;
 const transfer_buffer_bytes: u32 = 4096;
 const body_buffer_bytes: u32 = 4096;
-const tool_call_count_max: u32 = 16;
+/// Hard upper bound for fixed-size remap/index arrays in ToolCallStream
+/// and ChunkChange. The runtime-configurable gate is `max_parallel_tool_calls`
+/// in ai.Config (default 16); this cap just sizes the stack arrays.
+const tool_call_array_cap: u32 = 64;
 
 pub const ModelEntry = model_catalog.ModelEntry;
 pub const listModels = model_catalog.listModels;
@@ -157,9 +160,27 @@ pub const Client = struct {
         }
         if (status_code < 200 or status_code >= 300) return error.HttpUnexpectedStatus;
 
+        // Socket-level read timeout: prevents indefinite hangs when the
+        // server stops mid-stream. Applied after the head is received so
+        // the (fast) head exchange is not affected.
+        if (req.connection) |conn| {
+            const tv: std.posix.timeval = .{
+                .sec = @intCast(self.config.request_timeout_seconds),
+                .usec = 0,
+            };
+            std.posix.setsockopt(
+                conn.stream_reader.stream.socket.handle,
+                std.posix.SOL.SOCKET,
+                std.posix.SO.RCVTIMEO,
+                std.mem.asBytes(&tv),
+            ) catch |err| {
+                logger.log("openai_compatible.setsockopt.RCVTIMEO failed: {}", .{err});
+            };
+        }
+
         var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
         const reader = http_response.reader(&transfer_buffer);
-        return try readStream(self.gpa, reader, observer, &self.tool_call_seq);
+        return try readStream(self.gpa, reader, observer, &self.tool_call_seq, self.config.max_parallel_tool_calls);
     }
 };
 
@@ -519,8 +540,12 @@ const ToolCallBuilder = struct {
 /// deltas (which carry no ID) route through the remap to the correct slot.
 const ToolCallStream = struct {
     builders: std.ArrayList(ToolCallBuilder) = .empty,
-    remapped_slot: [tool_call_count_max]u32 = @splat(0),
-    is_remapped: [tool_call_count_max]bool = @splat(false),
+    remapped_slot: [tool_call_array_cap]u32 = @splat(0),
+    is_remapped: [tool_call_array_cap]bool = @splat(false),
+    /// Runtime-configurable upper bound on parallel tool calls (from
+    /// ai.Config.max_parallel_tool_calls). Indices at or above this
+    /// are rejected with a logged error.
+    max_calls: u32 = 16,
 
     fn physicalSlot(self: *const ToolCallStream, logical: u32) u32 {
         return if (self.is_remapped[logical]) self.remapped_slot[logical] else logical;
@@ -537,12 +562,13 @@ fn readStream(
     reader: *std.Io.Reader,
     observer: anytype,
     tool_call_seq: *u64,
+    max_calls: u32,
 ) !ai.Turn {
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(gpa);
     var reasoning: std.ArrayList(u8) = .empty;
     defer reasoning.deinit(gpa);
-    var stream: ToolCallStream = .{};
+    var stream: ToolCallStream = .{ .max_calls = max_calls };
     defer stream.deinit(gpa);
 
     // Parse and apply each chunk inline (rather than via `processStreamChunk`)
@@ -568,20 +594,22 @@ fn readStream(
     if (content.items.len > 0) {
         try blocks.append(gpa, .{ .text = .{ .text = try content.toOwnedSlice(gpa) } });
     }
-    for (stream.builders.items) |*builder| {
+    for (stream.builders.items, 0..) |*builder, i| {
         if (builder.name.items.len == 0) continue;
-        // Safety net: providers that echo the same tool-call ID across
-        // multiple indices can leave duplicate builders with no arguments.
-        if (builder.arguments.items.len == 0) continue;
+        logger.log(
+            "readStream.builder[{d}] name={s} id_len={d} args_len={d}",
+            .{ i, builder.name.items, builder.id.items.len, builder.arguments.items.len },
+        );
         try blocks.append(gpa, .{ .tool_call = try builder.toToolCall(gpa, tool_call_seq) });
     }
+    logger.log("readStream.done content_len={d} reasoning_len={d} blocks={d}", .{ content.items.len, reasoning.items.len, blocks.items.len });
     return .{ .assistant = .{ .assistant = .{ .content = try blocks.toOwnedSlice(gpa) } }, .usage = usage };
 }
 
 const ChunkChange = struct {
     content_start: ?u32 = null,
     reasoning_start: ?u32 = null,
-    tool_call_indexes: [tool_call_count_max]u32 = @splat(0),
+    tool_call_indexes: [tool_call_array_cap]u32 = @splat(0),
     tool_call_count: u32 = 0,
     /// Token usage when this chunk was the final usage-only chunk; otherwise
     /// null. Does not affect `empty()` — a usage chunk emits no callbacks.
@@ -598,7 +626,7 @@ const ChunkChange = struct {
         for (self.tool_call_indexes[0..self.tool_call_count]) |existing| {
             if (existing == index) return;
         }
-        std.debug.assert(self.tool_call_count < tool_call_count_max);
+        std.debug.assert(self.tool_call_count < tool_call_array_cap);
         self.tool_call_indexes[self.tool_call_count] = index;
         self.tool_call_count += 1;
     }
@@ -814,7 +842,11 @@ fn parseToolCallObject(
         if (std.mem.eql(u8, key, "index")) {
             const index = try nextInteger(scanner);
             if (index < 0) return error.InvalidToolCallIndex;
-            if (index >= tool_call_count_max) return error.TooManyToolCalls;
+            if (index >= tool_call_array_cap) return error.TooManyToolCalls;
+            if (index >= stream.max_calls) {
+                logger.log("parseToolCall.reject index={d} exceeds max_parallel_tool_calls={d}", .{ index, stream.max_calls });
+                return error.TooManyToolCalls;
+            }
             resolved_index = @intCast(index);
         } else if (std.mem.eql(u8, key, "id")) {
             _ = try appendStringValue(scanner, gpa, &pending.id, .reject_null);
@@ -845,6 +877,7 @@ fn parseToolCallObject(
             if (!std.mem.eql(u8, existing.id.items, pending.id.items)) continue;
             const existing_physical: u32 = @intCast(i);
             if (existing_physical != stream.physicalSlot(logical)) {
+                logger.log("parseToolCall.merge logical={d} → physical={d} id={s}", .{ logical, existing_physical, pending.id.items });
                 stream.remapped_slot[logical] = existing_physical;
                 stream.is_remapped[logical] = true;
             }
@@ -855,6 +888,7 @@ fn parseToolCallObject(
         const existing = &stream.builders.items[@as(usize, current)];
         if (existing.id.items.len > 0 and !std.mem.eql(u8, existing.id.items, pending.id.items)) {
             const new_slot: u32 = @intCast(stream.builders.items.len);
+            logger.log("parseToolCall.fork logical={d} → new_slot={d} old_id={s} new_id={s}", .{ logical, new_slot, existing.id.items, pending.id.items });
             try stream.builders.append(gpa, .{});
             stream.remapped_slot[logical] = new_slot;
             stream.is_remapped[logical] = true;
@@ -1111,7 +1145,7 @@ test "readStream accepts an SSE line larger than the transfer buffer" {
 
     var reader: std.Io.Reader = .fixed(stream.items);
     var tool_call_seq: u64 = 0;
-    var response = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq);
+    var response = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 16);
     defer response.deinit(gpa);
     try std.testing.expectEqual(@as(usize, transfer_buffer_bytes + 512), response.assistant.assistant.content[0].text.text.len);
 }
@@ -1127,7 +1161,7 @@ test "readStream skips empty data lines without crashing" {
         "data: [DONE]\n";
     var reader: std.Io.Reader = .fixed(stream);
     var tool_call_seq: u64 = 0;
-    var response = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq);
+    var response = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 16);
     defer response.deinit(gpa);
     try std.testing.expectEqualStrings("hi", response.assistant.assistant.content[0].text.text);
 }

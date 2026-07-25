@@ -22,6 +22,15 @@ Steering is done by enqueuing messages into a bounded queue. By default, the fro
 
 User's can branch off at any point in their conversation to pursue different paths and try different approaches. These are saved into the session and are resumable. When a branch occurs, we actually revert the entire project state to that point in time, not just the conversation. This is achieved via git shadow snapshots. User messages, assistant messages and even tool calls are all valid branching points. Once you're happy with a certain branch, you can `/save` it to commit to the working tree.
 
+## Session Persistence
+
+The session store (`sessions.sqlite`) records the active `model_provider` and `model_id` on every turn. On resume, Nova resolves the provider through two paths:
+
+1. **Builtin providers**: resolved by enum label (`openai`, `openrouter`, etc.)
+2. **Custom providers**: resolved by name from the `providers[]` config map, with `baseURL` pulled from the same entry
+
+This means custom providers (e.g., `"qwen-cloud"` pointing to a DashScope endpoint) round-trip correctly across restarts, and the `provider` field in `config.json` preserves the user-chosen name rather than the internal enum label.
+
 ## Parallel
 
 Subagent workflows are achieved by the `/parallel` command which creates a separate git worktree for your agent to work in. The TUI supports tiling so you can have multiple agents on the screen at any time. We call each tile a `lane`. The maximum number of lanes that can be active is currently 4, because that is the empirical limit for the mental load required to manage all agents effectively.
