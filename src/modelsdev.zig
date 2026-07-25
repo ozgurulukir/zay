@@ -736,3 +736,21 @@ test "loadOrFetchRegistry fallback to builtins when no cache or network" {
     const ds = registry.lookup("deepseek").?;
     try std.testing.expectEqualStrings("DeepSeek", ds.name);
 }
+
+test "parseModelsDevJson returns empty registry for empty object" {
+    const gpa = std.testing.allocator;
+    var registry = try parseModelsDevJson(gpa, "{}");
+    defer registry.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 0), registry.providers.len);
+}
+
+test "parseModelsDevJson rejects malformed JSON" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.SyntaxError, parseModelsDevJson(gpa, "{invalid"));
+}
+
+test "parseModelsDevJson rejects non-object root" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.InvalidApiJson, parseModelsDevJson(gpa, "[]"));
+}
