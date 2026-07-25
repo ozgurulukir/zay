@@ -147,7 +147,7 @@ fn providerSpec(provider: Provider) ProviderSpec {
 
 pub const Model = struct {
     id: []u8,
-    reasoning_effort: ?ai.ReasoningEffort = null,
+    reasoning: ReasoningSetting = .unset,
     /// Explicit context window override for this model (tokens).
     /// When set, overrides the model catalogue lookup.
     context_window: ?u32 = null,
@@ -162,7 +162,7 @@ pub const Model = struct {
     fn clone(self: Model, gpa: std.mem.Allocator) !Model {
         return .{
             .id = try gpa.dupe(u8, self.id),
-            .reasoning_effort = self.reasoning_effort,
+            .reasoning = self.reasoning,
             .context_window = self.context_window,
             .max_output_tokens = self.max_output_tokens,
         };
@@ -177,6 +177,26 @@ pub const Model = struct {
 pub const BaseUrl = union(enum) {
     default,
     custom: []u8,
+};
+
+/// Per-model reasoning effort setting. Follows the same overlay-merge
+/// pattern as `BaseUrl`: `.unset` means "not specified in this layer,
+/// don't override"; `.effort` carries an explicit level (including
+/// `.default` which tells the request builder to omit the parameter).
+pub const ReasoningSetting = union(enum) {
+    /// Not specified in this config layer — inherit from lower layer.
+    unset,
+    /// Explicit effort level.
+    effort: ai.ReasoningEffort,
+
+    /// Resolve to a concrete effort for the AI client. `.unset` falls
+    /// back to `.medium` (the runtime default).
+    pub fn resolve(self: ReasoningSetting) ai.ReasoningEffort {
+        return switch (self) {
+            .unset => .medium,
+            .effort => |e| e,
+        };
+    }
 };
 
 /// Per-provider model entry. Identical in shape to `Model` — kept as a
@@ -722,7 +742,10 @@ fn applyProviderModelsOverlay(gpa: std.mem.Allocator, target: *ProviderConfig, u
         var replaced = false;
         for (target.models) |*model| {
             if (!std.mem.eql(u8, model.id, update.id)) continue;
-            model.reasoning_effort = update.reasoning_effort;
+            switch (update.reasoning) {
+                .effort => model.reasoning = update.reasoning,
+                .unset => {},
+            }
             replaced = true;
             break;
         }
@@ -750,7 +773,10 @@ fn hydrateActiveModel(gpa: std.mem.Allocator, config: *Config) !void {
             if (!std.mem.eql(u8, model.id, config.model.?.id)) continue;
             // When adding fields to Model, also copy them here so they
             // survive the merge → hydrate cycle.
-            config.model.?.reasoning_effort = model.reasoning_effort;
+            switch (model.reasoning) {
+                .effort => config.model.?.reasoning = model.reasoning,
+                .unset => {},
+            }
             config.model.?.context_window = model.context_window;
             config.model.?.max_output_tokens = model.max_output_tokens;
             return;
@@ -1071,7 +1097,10 @@ fn parseProviderModels(gpa: std.mem.Allocator, value: std.json.Value) ![]Provide
         const val = entry.value_ptr.*;
         var model: ProviderModel = .{
             .id = try gpa.dupe(u8, entry.key_ptr.*),
-            .reasoning_effort = if (stringField(val, "reasoningEffort")) |effort| reasoning_efforts_by_name.get(effort) else null,
+            .reasoning = if (stringField(val, "reasoningEffort")) |effort|
+                if (reasoning_efforts_by_name.get(effort)) |e| .{ .effort = e } else .unset
+            else
+                .unset,
         };
         if (intField(val, "contextWindow")) |v| {
             if (v >= 1024) model.context_window = @intCast(v);
@@ -1492,10 +1521,10 @@ fn writeProviderModels(writer: *std.Io.Writer, models: []const ProviderModel) !v
         try writer.writeByte(':');
         try writer.writeByte('{');
         var wrote_field = false;
-        if (model.reasoning_effort) |effort| {
+        if (model.reasoning == .effort) {
             try std.json.Stringify.value("reasoningEffort", .{}, writer);
             try writer.writeByte(':');
-            try std.json.Stringify.value(effort.label(), .{}, writer);
+            try std.json.Stringify.value(model.reasoning.effort.label(), .{}, writer);
             wrote_field = true;
         }
         if (model.context_window) |cw| {
@@ -1710,11 +1739,11 @@ test "parseFile is pure; merge hydrates model reasoningEffort from providers" {
     var cfg = try parseFile(gpa, "<test>", "{\"model\":\"openai/gpt-5.5\",\"providers\":{\"openai\":{\"models\":{\"gpt-5.5\":{\"reasoningEffort\":\"high\"}}}}}", &sink);
     defer cfg.deinit(gpa);
     // Parsing one layer never reaches into the provider catalogue.
-    try std.testing.expectEqual(@as(?ai.ReasoningEffort, null), cfg.model.?.reasoning_effort);
+    try std.testing.expectEqual(ReasoningSetting.unset, cfg.model.?.reasoning);
     // Merging hydrates the active model against the parsed providers.
     var merged = try mergeLayers(gpa, &.{cfg});
     defer merged.deinit(gpa);
-    try std.testing.expectEqual(ai.ReasoningEffort.high, merged.model.?.reasoning_effort.?);
+    try std.testing.expectEqual(ai.ReasoningEffort.high, merged.model.?.reasoning.effort);
 }
 
 test "parseObject: unknown provider resolves to openai_compatible custom" {
@@ -1750,7 +1779,7 @@ test "mergeLayers: later layer overrides earlier" {
     var layer1: Config = .{
         .provider = .openai,
         .base_url = try gpa.dupe(u8, "http://layer1"),
-        .model = .{ .id = try gpa.dupe(u8, "m1"), .reasoning_effort = .low },
+        .model = .{ .id = try gpa.dupe(u8, "m1"), .reasoning = .{ .effort = .low } },
     };
     defer layer1.deinit(gpa);
     var layer2: Config = .{
@@ -1764,17 +1793,17 @@ test "mergeLayers: later layer overrides earlier" {
     try std.testing.expectEqual(Provider.openai, merged.provider.?);
     try std.testing.expectEqualStrings("http://layer2", merged.base_url.?);
     try std.testing.expectEqualStrings("m1", merged.model.?.id);
-    try std.testing.expectEqual(ai.ReasoningEffort.low, merged.model.?.reasoning_effort.?);
+    try std.testing.expectEqual(ai.ReasoningEffort.low, merged.model.?.reasoning.effort);
 }
 
 test "mergeLayers: model is indivisible — higher layer's model replaces whole" {
     const gpa = std.testing.allocator;
     var layer1: Config = .{
-        .model = .{ .id = try gpa.dupe(u8, "m1"), .reasoning_effort = .high },
+        .model = .{ .id = try gpa.dupe(u8, "m1"), .reasoning = .{ .effort = .high } },
     };
     defer layer1.deinit(gpa);
     var layer2: Config = .{
-        .model = .{ .id = try gpa.dupe(u8, "m2") }, // no reasoning_effort
+        .model = .{ .id = try gpa.dupe(u8, "m2") }, // no reasoning
     };
     defer layer2.deinit(gpa);
 
@@ -1782,9 +1811,9 @@ test "mergeLayers: model is indivisible — higher layer's model replaces whole"
     defer merged.deinit(gpa);
 
     try std.testing.expectEqualStrings("m2", merged.model.?.id);
-    // Higher layer's model replaces whole — lower layer's reasoning_effort
+    // Higher layer's model replaces whole — lower layer's reasoning
     // does NOT survive, because model is indivisible during merge.
-    try std.testing.expectEqual(@as(?ai.ReasoningEffort, null), merged.model.?.reasoning_effort);
+    try std.testing.expectEqual(ReasoningSetting.unset, merged.model.?.reasoning);
 }
 
 test "loadEnv: OPENAI_MODEL sets both provider and model" {
@@ -1836,13 +1865,13 @@ test "loadEnv: NOVA_USE_RESPONSES_ENDPOINT parses bools" {
 test "serialize: skips api_key even if present" {
     const gpa = std.testing.allocator;
     var provider_models = try gpa.alloc(ProviderModel, 1);
-    provider_models[0] = .{ .id = try gpa.dupe(u8, "gpt-5.5"), .reasoning_effort = .medium };
+    provider_models[0] = .{ .id = try gpa.dupe(u8, "gpt-5.5"), .reasoning = .{ .effort = .medium } };
     var providers = try gpa.alloc(ProviderConfig, 1);
     providers[0] = .{ .name = try gpa.dupe(u8, "openai"), .provider = .openai, .models = provider_models };
     var cfg: Config = .{
         .provider = .openai,
         .api_key = try gpa.dupe(u8, "sk-should-never-appear"),
-        .model = .{ .id = try gpa.dupe(u8, "gpt-5.5"), .reasoning_effort = .medium },
+        .model = .{ .id = try gpa.dupe(u8, "gpt-5.5"), .reasoning = .{ .effort = .medium } },
         .providers = providers,
     };
     defer cfg.deinit(gpa);
@@ -1880,7 +1909,7 @@ test "mergeLayers: active model is hydrated from the merged provider list" {
     const gpa = std.testing.allocator;
     // The provider catalogue entry (reasoning + base_url) comes from one layer...
     const models = try gpa.alloc(ProviderModel, 1);
-    models[0] = .{ .id = try gpa.dupe(u8, "gpt-5.5"), .reasoning_effort = .medium };
+    models[0] = .{ .id = try gpa.dupe(u8, "gpt-5.5"), .reasoning = .{ .effort = .medium } };
     const providers = try gpa.alloc(ProviderConfig, 1);
     providers[0] = .{ .name = try gpa.dupe(u8, "openai"), .provider = .openai, .base_url = .{ .custom = try gpa.dupe(u8, "https://from-provider") }, .models = models };
     var global: Config = .{ .providers = providers };
@@ -1894,7 +1923,7 @@ test "mergeLayers: active model is hydrated from the merged provider list" {
 
     // Hydration runs once over the merged providers, so the cross-layer match
     // copies reasoning effort and base_url onto the chosen model.
-    try std.testing.expectEqual(ai.ReasoningEffort.medium, merged.model.?.reasoning_effort.?);
+    try std.testing.expectEqual(ai.ReasoningEffort.medium, merged.model.?.reasoning.effort);
     try std.testing.expectEqualStrings("https://from-provider", merged.base_url.?);
 }
 

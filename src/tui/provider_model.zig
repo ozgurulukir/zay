@@ -793,7 +793,7 @@ pub fn updateCachedModelSelection(
         if (self.cached_config.model_selection) |*ms| {
             ms.model.deinit(self.gpa);
             ms.provider = provider;
-            ms.model = .{ .id = new_id, .reasoning_effort = effort };
+            ms.model = .{ .id = new_id, .reasoning = .{ .effort = effort } };
             try updateCachedProviderConnection(self, provider);
         } else {
             // No selection yet — bootstrap a minimal one. base_url and
@@ -802,7 +802,7 @@ pub fn updateCachedModelSelection(
             self.cached_config.model_selection = .{
                 .provider = provider,
                 .provider_name = try self.gpa.dupe(u8, provider.label()),
-                .model = .{ .id = new_id, .reasoning_effort = effort },
+                .model = .{ .id = new_id, .reasoning = .{ .effort = effort } },
                 .base_url = try self.gpa.dupe(u8, base_url),
                 .api_key = try self.gpa.dupe(u8, ""),
             };
@@ -857,7 +857,7 @@ pub fn modelSelectionUpdates(
     var models_moved = false;
     var models = try self.gpa.alloc(config_mod.ProviderModel, 1);
     errdefer if (!models_moved) self.gpa.free(models);
-    models[0] = .{ .id = provider_model_id, .reasoning_effort = effort };
+    models[0] = .{ .id = provider_model_id, .reasoning = .{ .effort = effort } };
     provider_model_id_moved = true;
     var providers = try self.gpa.alloc(config_mod.ProviderConfig, 1);
     errdefer {
@@ -888,12 +888,12 @@ pub fn modelSelectionUpdates(
     return .{
         .provider = provider,
         .base_url = base_url_slice,
-        .model = .{ .id = model_id_copy, .reasoning_effort = effort },
+        .model = .{ .id = model_id_copy, .reasoning = .{ .effort = effort } },
         .providers = providers,
         .model_selection = .{
             .provider = provider,
             .provider_name = try self.gpa.dupe(u8, provider.label()),
-            .model = .{ .id = ms_model_id, .reasoning_effort = effort },
+            .model = .{ .id = ms_model_id, .reasoning = .{ .effort = effort } },
             .base_url = ms_base_url,
             .api_key = ms_api_key,
         },

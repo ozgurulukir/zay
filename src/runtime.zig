@@ -214,7 +214,7 @@ pub const AgentRuntime = struct {
                         .provider_name = @constCast(provider_enum.label()),
                         .model = .{
                             .id = summary.model_id orelse "",
-                            .reasoning_effort = null,
+                            .reasoning = .unset,
                         },
                         .base_url = @constCast(provider_enum.defaultBaseUrl() orelse ""),
                         .api_key = "",
@@ -315,7 +315,7 @@ pub const AgentRuntime = struct {
         if (self.codex_connection_expired) return;
         const ms = config.model_selection orelse return;
         const model_id = ms.model.id;
-        const effort = ms.model.reasoning_effort orelse .medium;
+        const effort = ms.model.reasoning.resolve();
         try self.connectCodexClient(creds, model_id, effort);
     }
 
@@ -350,7 +350,7 @@ pub const AgentRuntime = struct {
             return;
         };
         const base_url = if (ms.base_url.len > 0) ms.base_url else provider.defaultBaseUrl() orelse return;
-        const effort = ms.model.reasoning_effort orelse .medium;
+        const effort = ms.model.reasoning.resolve();
         // Per-model context_window from providers map acts as a fallback
         // when the global overrideContextWindow is not set.
         if (self.context_settings.override_context_window == null) {
@@ -387,7 +387,7 @@ pub const AgentRuntime = struct {
         const ms = config.model_selection orelse return;
         const base_url = if (ms.base_url.len > 0) ms.base_url else provider.defaultBaseUrl() orelse return;
         const reasoning: ai.Reasoning = .{
-            .effort = ms.model.reasoning_effort orelse .medium,
+            .effort = ms.model.reasoning.resolve(),
             .summary = .auto,
         };
         try self.attachOpenAiResponsesClient(base_url, ms.api_key, ms.model.id, reasoning);
