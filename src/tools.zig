@@ -17,9 +17,11 @@ pub const ToolDisplay = common.ToolDisplay;
 /// adapter (for building its provider-specific tools schema). Bash is the only
 /// tool: everything richer (edits, search, reusable helpers) is Python run
 /// through it — see `src/py/` and the system prompt.
-pub const registry: []const Tool = &.{
-    bash_tool.tool,
-};
+pub fn registry() []const Tool {
+    return &.{
+        bash_tool.tool,
+    };
+}
 
 pub fn run(
     gpa: std.mem.Allocator,
@@ -37,7 +39,7 @@ pub fn run(
 /// handful of tools Nova exposes.
 pub fn lookup(name: []const u8) ?Tool {
     assert(name.len > 0);
-    for (registry) |tool| {
+    for (registry()) |tool| {
         if (std.mem.eql(u8, tool.name, name)) return tool;
     }
     return null;
@@ -50,11 +52,11 @@ fn failFmt(gpa: std.mem.Allocator, code: u8, comptime fmt: []const u8, args: any
 test "registry contains every tool exactly once" {
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(std.testing.allocator);
-    for (registry) |tool| {
+    for (registry()) |tool| {
         const gop = try seen.getOrPut(std.testing.allocator, tool.name);
         try std.testing.expect(!gop.found_existing);
     }
-    try std.testing.expectEqual(@as(usize, 1), registry.len);
+    try std.testing.expectEqual(@as(usize, 1), registry().len);
 }
 
 test "lookup finds a registered tool" {

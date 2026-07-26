@@ -283,7 +283,8 @@ fn writeToolDefinition(
     try std.json.Stringify.value(name, .{}, writer);
     try writer.writeAll(",\"description\":");
     try std.json.Stringify.value(desc, .{}, writer);
-    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{");
+    try writer.writeAll(",\"strict\":true,");
+    try writer.writeAll("\"parameters\":{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{");
     for (schema.properties, 0..) |prop, p| {
         if (p > 0) try writer.writeByte(',');
         try std.json.Stringify.value(prop.name, .{}, writer);
@@ -296,7 +297,11 @@ fn writeToolDefinition(
             .array => "array",
             .boolean => "boolean",
         };
-        try std.json.Stringify.value(kind_str, .{}, writer);
+        if (prop.nullable) {
+            try std.json.Stringify.value(&[_][]const u8{ kind_str, "null" }, .{}, writer);
+        } else {
+            try std.json.Stringify.value(kind_str, .{}, writer);
+        }
         try writer.writeAll(",\"description\":");
         try std.json.Stringify.value(prop.description, .{}, writer);
         if (prop.kind == .object) {
@@ -309,7 +314,6 @@ fn writeToolDefinition(
     try writer.writeAll("},\"required\":[");
     var written_required: u32 = 0;
     for (schema.properties) |prop| {
-        if (!prop.required) continue;
         if (written_required > 0) try writer.writeByte(',');
         try std.json.Stringify.value(prop.name, .{}, writer);
         written_required += 1;
@@ -498,17 +502,17 @@ fn writeRequestPayload(
     }
 }
 
-
 test "buildToolsJson produces a valid JSON array for the registry" {
     const tools = @import("../tools.zig");
     const gpa = std.testing.allocator;
-    const json = try buildAllToolsJson(gpa, tools.registry, &.{});
+    const json = try buildAllToolsJson(gpa, tools.registry(), &.{});
     defer gpa.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value == .array);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"bash\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"command\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"strict\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"additionalProperties\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "Shell command to run.") != null);
 }
 

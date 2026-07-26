@@ -120,6 +120,7 @@ pub const Schema = struct {
         kind: Kind,
         description: []const u8,
         required: bool,
+        nullable: bool = false,
     };
 
     pub const Kind = enum { string, integer, number, object, array, boolean };

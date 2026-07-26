@@ -13,7 +13,7 @@ const entries = [_]struct { name: []const u8, policy: Policy }{
 };
 
 comptime {
-    for (tools_mod.registry) |tool| {
+    for (tools_mod.registry()) |tool| {
         var found = false;
         for (entries) |entry| if (std.mem.eql(u8, entry.name, tool.name)) {
             found = true;
@@ -23,7 +23,7 @@ comptime {
 
     for (entries) |entry| {
         var found = false;
-        for (tools_mod.registry) |tool| if (std.mem.eql(u8, entry.name, tool.name)) {
+        for (tools_mod.registry()) |tool| if (std.mem.eql(u8, entry.name, tool.name)) {
             found = true;
         };
         if (!found) @compileError("orphan TUI policy entry: " ++ entry.name);

@@ -13,26 +13,31 @@ pub const tool: common.Tool = .{
             .kind = .string,
             .description = "Shell command to run.",
             .required = true,
+            .nullable = false,
         }, .{
             .name = "reason",
             .kind = .string,
             .description = "Human-readable single-sentence explanation of what this command does.",
             .required = false,
+            .nullable = true,
         }, .{
             .name = "cwd",
             .kind = .string,
             .description = "Working directory. Relative to the project unless absolute.",
             .required = false,
+            .nullable = true,
         }, .{
             .name = "env",
             .kind = .object,
             .description = "Extra environment variables, merged over the inherited env. String values only.",
             .required = false,
-        }, .{ .name = "timeout", .kind = .integer, .description = "Timeout in seconds (default 10).", .required = false }, .{
+            .nullable = true,
+        }, .{ .name = "timeout", .kind = .integer, .description = "Timeout in seconds (default 10).", .required = false, .nullable = true }, .{
             .name = "run_in_background",
             .kind = .boolean,
             .description = "Run the command in the background and return immediately. Use for long-running commands (builds, dev servers, watchers) so you are not blocked. The command's exit will be delivered to you as a message; meanwhile read its log file or use ps to check on it. The `timeout` field is ignored for background commands.",
             .required = false,
+            .nullable = true,
         } },
     },
     .run = runTool,
