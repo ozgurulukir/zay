@@ -365,7 +365,33 @@ fn writeTextContent(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []const
             .reasoning, .image, .tool_call => {},
         }
     }
-    try std.json.Stringify.value(aw.written(), .{}, out);
+    const text = aw.written();
+    // Ensure the tool/history text we send is valid UTF-8. Some MCP/tool
+    // results can contain stray bytes; replace invalid sequences rather
+    // than sending a malformed JSON string that providers reject.
+    if (!std.unicode.utf8ValidateSlice(text)) {
+        const repaired = try gpa.alloc(u8, text.len * 4);
+        errdefer gpa.free(repaired);
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i < text.len) {
+            const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+            if (i + len <= text.len and std.unicode.utf8ValidateSlice(text[i..][0..len])) {
+                @memcpy(repaired[j..][0..len], text[i..][0..len]);
+                j += len;
+            } else {
+                // replacement character for invalid sequence
+                repaired[j] = 0xef;
+                repaired[j + 1] = 0xbf;
+                repaired[j + 2] = 0xbd;
+                j += 3;
+            }
+            i += len;
+        }
+        try std.json.Stringify.value(repaired[0..j], .{}, out);
+    } else {
+        try std.json.Stringify.value(text, .{}, out);
+    }
 }
 
 fn writeUserContent(out: *std.Io.Writer, blocks: []const ai.ContentBlock) !void {
