@@ -1022,3 +1022,9 @@ test "snapshotAt reads the nearest ancestor-or-self snapshot, branch-aware" {
         try std.testing.expectEqualStrings(sha_a, got);
     }
 }
+
+test "create rejects session id with wrong length" {
+    var manager = try SessionManager.init(std.testing.allocator, std.testing.io, ":memory:");
+    defer manager.deinit();
+    try std.testing.expectError(error.BadSessionId, manager.create("/tmp/nova", .{ .id = "short" }));
+}

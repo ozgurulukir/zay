@@ -191,18 +191,18 @@ pub fn readProjectRuleFile(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, 
     const path = try std.fs.path.join(gpa, &.{ cwd, filename });
     defer gpa.free(path);
 
-    return std.Io.Dir.readFileAllocOptions(
-        .cwd(),
-        io,
-        path,
-        gpa,
-        .limited(64 * 1024),
-        .of(u8),
-        null,
-    ) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => return err,
+    const file = std.Io.Dir.openFile(.cwd(), io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => |e| return e,
     };
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size > 64 * 1024) return error.FileTooBig;
+    const bytes = try gpa.alloc(u8, @intCast(stat.size));
+    errdefer gpa.free(bytes);
+    var reader = file.reader(io, &.{});
+    try reader.interface.readSliceAll(bytes);
+    return bytes;
 }
 
 fn pruneSingleToolMessage(gpa: std.mem.Allocator, msg: ai.ChatMessage, cap_bytes: u32) !ai.ChatMessage {

@@ -217,8 +217,14 @@ fn loadFromDir(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, include
 }
 
 fn loadOne(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Skill {
-    const raw = try std.Io.Dir.readFileAllocOptions(.cwd(), io, path, gpa, .limited(256 * 1024), .of(u8), 0);
-    defer gpa.free(raw);
+    const file = try std.Io.Dir.openFile(.cwd(), io, path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size > 256 * 1024) return error.FileTooBig;
+    const raw = try gpa.alloc(u8, @intCast(stat.size));
+    errdefer gpa.free(raw);
+    var reader = file.reader(io, &.{});
+    try reader.interface.readSliceAll(raw);
     const frontmatter = parseFrontmatter(raw);
     const description = frontmatterValue(frontmatter, "description") orelse return error.MissingDescription;
     const name_value = frontmatterValue(frontmatter, "name") orelse std.fs.path.basename(std.fs.path.dirname(path) orelse path);
@@ -273,8 +279,14 @@ fn stripQuotes(value: []const u8) []const u8 {
 }
 
 fn appendSkillBlock(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, skill: *const Skill) !void {
-    const raw = try std.Io.Dir.readFileAllocOptions(.cwd(), io, skill.path, gpa, .limited(256 * 1024), .of(u8), 0);
-    defer gpa.free(raw);
+    const file = try std.Io.Dir.openFile(.cwd(), io, skill.path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size > 256 * 1024) return error.FileTooBig;
+    const raw = try gpa.alloc(u8, @intCast(stat.size));
+    errdefer gpa.free(raw);
+    var reader = file.reader(io, &.{});
+    try reader.interface.readSliceAll(raw);
     const body = stripFrontmatter(raw);
     try writer.print("<skill name=\"{s}\" location=\"{s}\">\n", .{ skill.name, skill.path });
     try writer.print("References are relative to {s}.\n\n", .{skill.base_dir});

@@ -361,10 +361,18 @@ fn keyringAccount(home_dir: []const u8, buf: *[20]u8) []const u8 {
 fn readBlobFile(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !?[]u8 {
     const path = try authPath(gpa, home_dir);
     defer gpa.free(path);
-    return std.Io.Dir.readFileAllocOptions(.cwd(), io, path, gpa, .limited(32 * 1024), .of(u8), 0) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => err,
+    const file = std.Io.Dir.openFile(.cwd(), io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => |e| return e,
     };
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size > 32 * 1024) return error.FileTooBig;
+    const bytes = try gpa.alloc(u8, @intCast(stat.size));
+    errdefer gpa.free(bytes);
+    var reader = file.reader(io, &.{});
+    try reader.interface.readSliceAll(bytes);
+    return bytes;
 }
 
 fn writeBlobFile(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, bytes: []const u8) !void {
@@ -438,4 +446,19 @@ test "writeApiKeys serializes non-empty entries as a json object" {
     defer out.deinit();
     try writeApiKeys(&out.writer, &map);
     try std.testing.expectEqualStrings("{\"cerebras\":\"csk\"}", out.written());
+}
+
+test "saveProviderApiKey and removeProviderApiKey round-trip" {
+    const gpa = std.testing.allocator;
+    const home_dir = "/tmp/nova-auth-test";
+    defer deleteBlob(gpa, std.testing.io, home_dir) catch {};
+
+    try saveProviderApiKey(gpa, std.testing.io, home_dir, "cerebras", "csk-123");
+    const loaded = try loadProviderApiKey(gpa, std.testing.io, home_dir, "cerebras");
+    try std.testing.expectEqualStrings("csk-123", loaded.?);
+    gpa.free(loaded.?);
+
+    try removeProviderApiKey(gpa, std.testing.io, home_dir, "cerebras");
+    const after = try loadProviderApiKey(gpa, std.testing.io, home_dir, "cerebras");
+    try std.testing.expect(after == null);
 }

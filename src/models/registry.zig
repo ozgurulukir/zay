@@ -754,3 +754,12 @@ test "parseModelsDevJson rejects non-object root" {
     const gpa = std.testing.allocator;
     try std.testing.expectError(error.InvalidApiJson, parseModelsDevJson(gpa, "[]"));
 }
+
+test "fetchAndCache returns error.HomeNotSet when home_dir is empty" {
+    try std.testing.expectError(error.HomeNotSet, fetchAndCache(std.testing.allocator, std.testing.io, ""));
+}
+
+test "loadCacheWithOptions returns null when home_dir is empty" {
+    const result = try loadCacheWithOptions(std.testing.allocator, std.testing.io, "", false);
+    try std.testing.expect(result == null);
+}

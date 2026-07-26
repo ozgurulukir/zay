@@ -391,7 +391,7 @@ fn loadFile(
     path: []const u8,
     diagnostics: *std.ArrayList(Diagnostic),
 ) !Config {
-    const bytes = std.Io.Dir.readFileAllocOptions(.cwd(), io, path, gpa, .limited(32 * 1024), .of(u8), 0) catch |err| switch (err) {
+    const file = std.Io.Dir.openFile(.cwd(), io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return .{},
         else => {
             try diagnostics.append(gpa, .{ .config_parse_error = .{
@@ -401,7 +401,19 @@ fn loadFile(
             return .{};
         },
     };
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size > 32 * 1024) {
+        try diagnostics.append(gpa, .{ .config_parse_error = .{
+            .path = try gpa.dupe(u8, path),
+            .reason = try gpa.dupe(u8, "FileTooBig"),
+        } });
+        return .{};
+    }
+    const bytes = try gpa.alloc(u8, @intCast(stat.size));
     defer gpa.free(bytes);
+    var reader = file.reader(io, &.{});
+    try reader.interface.readSliceAll(bytes);
     return parseFile(gpa, path, bytes, diagnostics);
 }
 

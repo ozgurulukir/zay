@@ -50,11 +50,17 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, configured
 
     const cache_path = try path(gpa, home_dir);
     defer gpa.free(cache_path);
-    const bytes = std.Io.Dir.readFileAllocOptions(.cwd(), io, cache_path, gpa, .limited(file_bytes_max), .of(u8), 0) catch |err| switch (err) {
+    const file = std.Io.Dir.openFile(.cwd(), io, cache_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return .{},
-        else => return err,
+        else => |e| return e,
     };
-    defer gpa.free(bytes);
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size > file_bytes_max) return error.FileTooBig;
+    const bytes = try gpa.alloc(u8, @intCast(stat.size));
+    errdefer gpa.free(bytes);
+    var reader = file.reader(io, &.{});
+    try reader.interface.readSliceAll(bytes);
     return parse(gpa, bytes, configured) catch .{};
 }
 
