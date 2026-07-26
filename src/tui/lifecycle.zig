@@ -11,9 +11,9 @@ const vxfw = vaxis.vxfw;
 
 const tui = @import("../tui.zig");
 const agent_mod = @import("../agent.zig");
-const auth = @import("../auth.zig");
+const auth = @import("../auth/store.zig");
 const blackhole = @import("../tui/blackhole.zig");
-const codex = @import("../codex.zig");
+const codex = @import("../auth/codex.zig");
 const provider_model = @import("provider_model.zig");
 const runtime_mod = @import("../runtime.zig");
 const vcs = @import("../vcs.zig");

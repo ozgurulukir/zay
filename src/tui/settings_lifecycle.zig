@@ -7,7 +7,7 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const tui = @import("../tui.zig");
-const config_mod = @import("../config.zig");
+const config_mod = @import("../config/config.zig");
 const settings_widget = @import("widgets/settings.zig");
 
 const App = tui.App;

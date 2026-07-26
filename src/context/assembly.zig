@@ -9,12 +9,12 @@
 //!   5. Context Budget Metrics: High-level usage breakdown (system, history, tool output, margin).
 
 const std = @import("std");
-const ai = @import("ai.zig");
-const at_mention = @import("at_mention.zig");
+const ai = @import("../ai.zig");
+const at_mention = @import("../at_mention.zig");
 const compaction = @import("compaction.zig");
-const os = @import("os.zig");
-const skill_mod = @import("skill.zig");
-const vcs = @import("vcs.zig");
+const os = @import("../os.zig");
+const skill_mod = @import("../skill.zig");
+const vcs = @import("../vcs.zig");
 
 const assert = std.debug.assert;
 

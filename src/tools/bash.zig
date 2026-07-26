@@ -1,6 +1,6 @@
 const std = @import("std");
 const background = @import("../background.zig");
-const bash = @import("../bash.zig");
+const bash = @import("bash_exec.zig");
 const common = @import("common.zig");
 const os = @import("../os.zig");
 

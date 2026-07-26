@@ -10,7 +10,7 @@ const std = @import("std");
 const logger = @import("logger");
 
 const ai = @import("../ai.zig");
-const compaction = @import("../compaction.zig");
+const compaction = @import("../context/compaction.zig");
 const session_mod = @import("../session.zig");
 
 const assert = std.debug.assert;

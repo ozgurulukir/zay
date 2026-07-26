@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const config_mod = @import("../config.zig");
+const config_mod = @import("../config/config.zig");
 const os = @import("../os.zig");
 const runtime_mod = @import("../runtime.zig");
 

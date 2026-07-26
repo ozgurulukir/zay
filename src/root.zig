@@ -3,17 +3,17 @@ const std = @import("std");
 pub const agent = @import("agent.zig");
 pub const ai = @import("ai.zig");
 pub const at_mention = @import("at_mention.zig");
-pub const auth = @import("auth.zig");
+pub const auth = @import("auth/store.zig");
 pub const background = @import("background.zig");
-pub const bash = @import("bash.zig");
-pub const local_models = @import("local_models.zig");
-pub const bash_safety = @import("bash_safety.zig");
+pub const bash = @import("tools/bash_exec.zig");
+pub const local_models = @import("models/local.zig");
+pub const bash_safety = @import("tools/bash_safety.zig");
 pub const clipboard = @import("clipboard.zig");
-pub const codex = @import("codex.zig");
-pub const compaction = @import("compaction.zig");
-pub const config = @import("config.zig");
-pub const context = @import("context.zig");
-pub const context_assembly = @import("context_assembly.zig");
+pub const codex = @import("auth/codex.zig");
+pub const compaction = @import("context/compaction.zig");
+pub const config = @import("config/config.zig");
+pub const context = @import("context/manager.zig");
+pub const context_assembly = @import("context/assembly.zig");
 pub const db = @import("db.zig");
 pub const executor = @import("executor.zig");
 pub const os = @import("os.zig");
@@ -35,7 +35,7 @@ pub const tui = @import("tui.zig");
 pub const thread = @import("tui/thread.zig");
 
 pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
-    @import("bash.zig").disablePseudoConsole();
+    @import("tools/bash_exec.zig").disablePseudoConsole();
 
     if (logger.enabled) {
         if (resolveLogPath(gpa, init.environ_map)) |log_path| {

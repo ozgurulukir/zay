@@ -1,5 +1,5 @@
 const std = @import("std");
-const os = @import("os.zig");
+const os = @import("../os.zig");
 
 const assert = std.debug.assert;
 

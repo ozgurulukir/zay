@@ -7,7 +7,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const tui = @import("../tui.zig");
-const config_mod = @import("../config.zig");
+const config_mod = @import("../config/config.zig");
 const resume_picker = @import("widgets/resume_picker.zig");
 const runtime_mod = @import("../runtime.zig");
 const session_mod = @import("../session.zig");

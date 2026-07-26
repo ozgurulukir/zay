@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const DiffCounts = @import("../tui.zig").DiffCounts;
-const bash_mod = @import("../bash.zig");
+const bash_mod = @import("../tools/bash_exec.zig");
 
 /// Parse `git diff --stat` output into additions/deletions.
 /// `+N` / `-M` lines are summed; binary stanzas are skipped.

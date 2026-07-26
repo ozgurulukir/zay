@@ -19,7 +19,7 @@ const vxfw = vaxis.vxfw;
 
 const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
-const config_mod = @import("../../config.zig");
+const config_mod = @import("../../config/config.zig");
 
 const StylePalette = tui_style.Palette;
 const assert = std.debug.assert;

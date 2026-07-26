@@ -10,7 +10,7 @@
 
 const std = @import("std");
 
-const ai = @import("ai.zig");
+const ai = @import("../ai.zig");
 /// Static model→token-limit table generated at build time from the vendored
 /// models.dev snapshot (see `build.zig` and `tools/gen_model_catalog.zig`).
 const model_catalog = @import("model_catalog");
@@ -19,13 +19,13 @@ const assert = std.debug.assert;
 
 /// Instruction sent to the summarizer (codex's CONTEXT CHECKPOINT COMPACTION
 /// prompt). Combined with the rendered conversation in `buildSummaryRequest`.
-pub const compaction_prompt = @embedFile("prompts/compaction.md");
+pub const compaction_prompt = @embedFile("../prompts/compaction.md");
 
 /// Handover template stored as the boundary message, so the resuming model
 /// knows the summary came from a prior model (codex's summary_prefix). It
 /// carries a `${SUMMARY}` placeholder that `buildStoredSummary` replaces with
 /// the produced summary.
-pub const handover_template = @embedFile("prompts/handover.md");
+pub const handover_template = @embedFile("../prompts/handover.md");
 
 /// Placeholder in `handover_template` where the summary is injected. Its
 /// position is resolved at compile time; a build fails loudly if the template

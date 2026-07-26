@@ -14,8 +14,8 @@
 
 const std = @import("std");
 
-const ai = @import("ai.zig");
-const session_mod = @import("session.zig");
+const ai = @import("../ai.zig");
+const session_mod = @import("../session.zig");
 
 const assert = std.debug.assert;
 

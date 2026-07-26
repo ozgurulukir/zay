@@ -7,7 +7,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const tui = @import("../tui.zig");
-const bash_mod = @import("../bash.zig");
+const bash_mod = @import("../tools/bash_exec.zig");
 const diff_utils = @import("diff_utils.zig");
 const diff_viewer = @import("diff_viewer.zig");
 

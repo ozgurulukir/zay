@@ -8,7 +8,7 @@
 //! upserts; `delete` removes and reports whether anything was there.
 
 const std = @import("std");
-const os = @import("os.zig");
+const os = @import("../os.zig");
 
 pub const Error = error{
     /// No keychain backend on this OS — caller should use the file fallback.

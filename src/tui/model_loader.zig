@@ -1,8 +1,8 @@
 const std = @import("std");
 const logger = @import("logger");
 
-const codex = @import("../codex.zig");
-const config_mod = @import("../config.zig");
+const codex = @import("../auth/codex.zig");
+const config_mod = @import("../config/config.zig");
 const openai_compatible_mod = @import("../ai/openai_compatible.zig");
 const symbols = @import("../symbols.zig");
 

@@ -4,7 +4,7 @@ const std = @import("std");
 
 const ai = @import("ai.zig");
 const background = @import("background.zig");
-const bash_safety = @import("bash_safety.zig");
+const bash_safety = @import("tools/bash_safety.zig");
 const bash_tool = @import("tools/bash.zig");
 const mcp_mod = @import("mcp/manager.zig");
 const tools = @import("tools.zig");

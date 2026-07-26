@@ -1,7 +1,7 @@
 //! Async model loading jobs, outcome installation, and disk cache persistence.
 
 const std = @import("std");
-const config_mod = @import("../config.zig");
+const config_mod = @import("../config/config.zig");
 const model_cache = @import("model_cache.zig");
 const model_loader = @import("model_loader.zig");
 const provider_model = @import("provider_model.zig");

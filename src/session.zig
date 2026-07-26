@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const ai = @import("ai.zig");
-const compaction = @import("compaction.zig");
+const compaction = @import("context/compaction.zig");
 const db = @import("db.zig");
 
 const assert = std.debug.assert;

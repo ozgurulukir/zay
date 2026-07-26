@@ -3,7 +3,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const ai = @import("../../ai.zig");
-const codex = @import("../../codex.zig");
+const codex = @import("../../auth/codex.zig");
 const message = @import("message.zig");
 const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");

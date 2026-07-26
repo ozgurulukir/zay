@@ -4,7 +4,7 @@
 //! `tui.zig` renders from this state and feeds key presses back into it.
 
 const std = @import("std");
-const bash_mod = @import("../bash.zig");
+const bash_mod = @import("../tools/bash_exec.zig");
 
 const assert = std.debug.assert;
 

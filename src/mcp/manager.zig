@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const ai = @import("../ai.zig");
-const config_mod = @import("../config.zig");
+const config_mod = @import("../config/config.zig");
 const tools_common = @import("../tools/common.zig");
 const client_mod = @import("client.zig");
 

@@ -18,7 +18,7 @@
 
 const std = @import("std");
 
-const bash = @import("bash.zig");
+const bash = @import("tools/bash_exec.zig");
 const os = @import("os.zig");
 
 const assert = std.debug.assert;

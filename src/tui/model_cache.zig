@@ -2,8 +2,8 @@
 
 const std = @import("std");
 
-const codex = @import("../codex.zig");
-const config_mod = @import("../config.zig");
+const codex = @import("../auth/codex.zig");
+const config_mod = @import("../config/config.zig");
 const model_loader = @import("model_loader.zig");
 
 const assert = std.debug.assert;

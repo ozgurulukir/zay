@@ -10,7 +10,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const bash = @import("bash.zig");
+const bash = @import("tools/bash_exec.zig");
 
 const assert = std.debug.assert;
 

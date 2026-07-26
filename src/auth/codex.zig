@@ -6,9 +6,9 @@
 
 const std = @import("std");
 const logger = @import("logger");
-const os = @import("os.zig");
-const symbols = @import("symbols.zig");
-const auth = @import("auth.zig");
+const os = @import("../os.zig");
+const symbols = @import("../symbols.zig");
+const auth = @import("store.zig");
 
 // Re-export so existing `codex.Credentials` / `codex.ApiKeyMap` callers
 // keep compiling during the migration window.

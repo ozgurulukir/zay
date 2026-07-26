@@ -24,7 +24,7 @@ const provider_picker = @import("provider_picker.zig");
 const resume_picker = @import("resume_picker.zig");
 const tree_selector = @import("tree_selector.zig");
 const tui_status = @import("../status.zig");
-const codex = @import("../../codex.zig");
+const codex = @import("../../auth/codex.zig");
 const settings_widget = @import("settings.zig");
 
 const App = tui.App;

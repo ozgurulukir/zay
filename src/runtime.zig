@@ -2,11 +2,11 @@ const std = @import("std");
 
 const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
-const auth_mod = @import("auth.zig");
-const codex_mod = @import("codex.zig");
-const compaction = @import("compaction.zig");
-const config_mod = @import("config.zig");
-const context_assembly = @import("context_assembly.zig");
+const auth_mod = @import("auth/store.zig");
+const codex_mod = @import("auth/codex.zig");
+const compaction = @import("context/compaction.zig");
+const config_mod = @import("config/config.zig");
+const context_assembly = @import("context/assembly.zig");
 const os = @import("os.zig");
 const session_mod = @import("session.zig");
 const skill_mod = @import("skill.zig");

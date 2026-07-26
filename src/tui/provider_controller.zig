@@ -1,7 +1,7 @@
 const std = @import("std");
 
-const codex = @import("../codex.zig");
-const config_mod = @import("../config.zig");
+const codex = @import("../auth/codex.zig");
+const config_mod = @import("../config/config.zig");
 
 pub fn detectCodexSignIn(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) bool {
     if (home_dir.len == 0) return false;

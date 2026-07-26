@@ -1,7 +1,7 @@
 const std = @import("std");
 const c = @import("c");
 const dynlib = @import("dynlib");
-const bash = @import("bash.zig");
+const bash = @import("tools/bash_exec.zig");
 
 const assert = std.debug.assert;
 
