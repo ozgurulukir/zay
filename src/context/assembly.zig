@@ -181,13 +181,13 @@ pub fn calculateBudget(messages: []const ai.ChatMessage, system_prompt: []const 
     };
 }
 
-fn substituteBaseTemplate(gpa: std.mem.Allocator, template: []const u8, cwd: []const u8) ![]u8 {
+pub fn substituteBaseTemplate(gpa: std.mem.Allocator, template: []const u8, cwd: []const u8) ![]u8 {
     const cwd_resolved = try std.mem.replaceOwned(u8, gpa, template, "${CWD}", cwd);
     defer gpa.free(cwd_resolved);
     return try std.mem.replaceOwned(u8, gpa, cwd_resolved, "${OS}", os.label);
 }
 
-fn readProjectRuleFile(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, filename: []const u8) !?[]u8 {
+pub fn readProjectRuleFile(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, filename: []const u8) !?[]u8 {
     const path = try std.fs.path.join(gpa, &.{ cwd, filename });
     defer gpa.free(path);
 

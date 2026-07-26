@@ -8,6 +8,7 @@ const bash_safety = @import("tools/bash_safety.zig");
 const bash_tool = @import("tools/bash.zig");
 const mcp_mod = @import("mcp/manager.zig");
 const tools = @import("tools.zig");
+const tool_display = @import("tools/display.zig");
 
 const assert = std.debug.assert;
 
@@ -178,13 +179,13 @@ pub const ExecutorService = struct {
 
         const call_id = try self.gpa.dupe(u8, call.call_id.slice());
         errdefer self.gpa.free(call_id);
-        const content = try formatLlmObservation(self.gpa, output);
+        const content = try tool_display.formatLlmObservation(self.gpa, output);
         errdefer self.gpa.free(content);
         const name = try self.gpa.dupe(u8, call.name);
         errdefer self.gpa.free(name);
-        var display = try makeDisplay(self.gpa, call.name, call.arguments);
+        var display = try tool_display.lookupDisplay(self.gpa, call.name, call.arguments);
         errdefer display.deinit(self.gpa);
-        const display_body = try makeDisplayBody(self.gpa, output);
+        const display_body = try tool_display.makeDisplayBody(self.gpa, output);
         errdefer self.gpa.free(display_body);
         const stderr = if (output.stderr.len > 0) try self.gpa.dupe(u8, output.stderr) else null;
         const failed = output.code != 0;
@@ -278,7 +279,7 @@ pub const ExecutorService = struct {
         errdefer self.gpa.free(call_id);
         const name = try self.gpa.dupe(u8, call.name);
         errdefer self.gpa.free(name);
-        var display = try makeDisplay(self.gpa, call.name, call.arguments);
+        var display = try tool_display.lookupDisplay(self.gpa, call.name, call.arguments);
         errdefer display.deinit(self.gpa);
         const content = try std.fmt.allocPrint(self.gpa, "tool '{s}' failed to execute: {s}", .{ call.name, errorDescription(err) });
         errdefer self.gpa.free(content);
@@ -301,7 +302,7 @@ pub const ExecutorService = struct {
         errdefer self.gpa.free(call_id);
         const name = try self.gpa.dupe(u8, call.name);
         errdefer self.gpa.free(name);
-        var display = try makeDisplay(self.gpa, call.name, call.arguments);
+        var display = try tool_display.lookupDisplay(self.gpa, call.name, call.arguments);
         errdefer display.deinit(self.gpa);
         const content = try self.gpa.dupe(u8, message);
         errdefer self.gpa.free(content);
@@ -318,44 +319,6 @@ pub const ExecutorService = struct {
         };
     }
 };
-
-/// The LLM-facing observation: stdout if non-empty, else stderr if
-/// non-empty, else the literal "empty". When both are non-empty (typical
-/// for bash commands writing to both) concatenate so we don't drop signal.
-fn formatLlmObservation(gpa: std.mem.Allocator, result: tools.Output) ![]u8 {
-    if (result.observation) |observation| return observation.render(gpa);
-    if (result.stdout.len > 0 and result.stderr.len > 0) {
-        return std.fmt.allocPrint(gpa, "{s}\n{s}", .{ result.stdout, result.stderr });
-    }
-    if (result.stdout.len > 0) return gpa.dupe(u8, result.stdout);
-    if (result.stderr.len > 0) return gpa.dupe(u8, result.stderr);
-    return gpa.dupe(u8, "empty");
-}
-
-/// Look up the tool in the registry and delegate to its display formatter.
-/// Falls back to the tool name itself when unknown — shouldn't happen
-/// outside test code, since callers source the name from a `ToolCall`
-/// that the LM emitted.
-fn makeDisplay(gpa: std.mem.Allocator, name: []const u8, args: []const u8) !tools.ToolDisplay {
-    const tool = tools.lookup(name) orelse return .{ .label = try gpa.dupe(u8, name) };
-    return tool.display(gpa, args);
-}
-
-/// The human-facing body. Each tool owns its own display: when it sets a
-/// `display`, that is the body. Otherwise the body is the raw stdout, or a
-/// sentinel when there is none. The executor passes through; it knows nothing
-/// tool-specific.
-fn makeDisplayBody(gpa: std.mem.Allocator, result: tools.Output) ![]u8 {
-    switch (result.display) {
-        inline .text, .diff => |display| return gpa.dupe(u8, display),
-        .none => {},
-    }
-    if (result.stdout.len == 0) {
-        if (result.stderr.len > 0) return gpa.alloc(u8, 0);
-        return gpa.dupe(u8, "no output");
-    }
-    return gpa.dupe(u8, result.stdout);
-}
 
 test "ExecutorService runs bash and returns both channels" {
     const gpa = std.testing.allocator;

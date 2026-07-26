@@ -22,3 +22,13 @@ pub const label: []const u8 = switch (tag) {
     .openbsd => "OpenBSD",
     else => @tagName(tag),
 };
+
+/// Extract the exit code from a child process termination. Non-exit
+/// terminations (signal, stop, unknown) map to 255 so callers always see a
+/// u8. Shared by `vcs.zig` and `background.zig` — the single source of truth.
+pub fn termCode(term: std.process.Child.Term) u8 {
+    return switch (term) {
+        .exited => |value| value,
+        .signal, .stopped, .unknown => 255,
+    };
+}

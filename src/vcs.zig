@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const os = @import("os.zig");
 
 const assert = std.debug.assert;
 
@@ -128,12 +129,6 @@ const Captured = struct {
     }
 };
 
-fn termCode(term: std.process.Child.Term) u8 {
-    return switch (term) {
-        .exited => |value| value,
-        .signal, .stopped, .unknown => 255,
-    };
-}
 
 /// Run one git subcommand in `cwd`. `args` must NOT include the binary — it is
 /// prepended here. `env` overrides the child environment (used to point
@@ -166,7 +161,7 @@ fn run(
         error.OutOfMemory => error.OutOfMemory,
         else => error.GitSpawnFailed,
     };
-    return .{ .stdout = result.stdout, .stderr = result.stderr, .code = termCode(result.term) };
+    return .{ .stdout = result.stdout, .stderr = result.stderr, .code = os.termCode(result.term) };
 }
 
 /// Run a git subcommand, returning its trimmed stdout on success (code 0) or a

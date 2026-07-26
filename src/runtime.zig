@@ -145,7 +145,7 @@ pub const AgentRuntime = struct {
         // the workspace (which is a checkout of the same repo).
         const skills = if (template) |t| try skill_mod.cloneAll(gpa, t.skills) else try skill_mod.loadProject(gpa, io, cwd);
         errdefer skill_mod.deinitAll(gpa, skills);
-        const owned_system_prompt = if (template) |t| try gpa.dupe(u8, t.system_prompt) else try createSystemPromptWithContext(gpa, io, owned_base_system_prompt, cwd, skills);
+        const owned_system_prompt = if (template) |t| try gpa.dupe(u8, t.system_prompt) else try context_assembly.assembleSystemPrompt(gpa, io, owned_base_system_prompt, cwd, skills);
         errdefer gpa.free(owned_system_prompt);
 
         target.* = .{
@@ -700,48 +700,6 @@ pub const AgentRuntime = struct {
         self.naming_client = .none;
     }
 };
-
-/// Substitute the `${CWD}` and `${OS}` placeholders in a system-prompt template
-/// with the working directory and host operating system. The template may come
-/// from the embedded `src/prompts/system.md` or from a user-supplied override in
-/// `config.json`
-fn createSystemPrompt(gpa: std.mem.Allocator, template: []const u8, cwd: []const u8) ![]u8 {
-    assert(template.len > 0);
-    assert(cwd.len > 0);
-    const cwd_resolved = try std.mem.replaceOwned(u8, gpa, template, "${CWD}", cwd);
-    defer gpa.free(cwd_resolved);
-    return try std.mem.replaceOwned(u8, gpa, cwd_resolved, "${OS}", os.label);
-}
-
-/// Reads AGENTS.md in the root directory if it exists. Returns null otherwise.
-fn readContextFile(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) !?[]u8 {
-    assert(cwd.len > 0);
-    const context_file_path = try std.fs.path.join(gpa, &.{ cwd, "AGENTS.md" });
-    defer gpa.free(context_file_path);
-    return std.Io.Dir.readFileAllocOptions(
-        .cwd(),
-        io,
-        context_file_path,
-        gpa,
-        .limited(64 * 1024),
-        .of(u8),
-        null,
-    ) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => return err,
-    };
-}
-
-fn createSystemPromptWithContext(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    base_system_prompt: []const u8,
-    cwd: []const u8,
-    skills: []const skill_mod.Skill,
-) ![]u8 {
-    return context_assembly.assembleSystemPrompt(gpa, io, base_system_prompt, cwd, skills);
-}
-
 fn codexRefreshNeeded(expires_ms: i64, now_ms: i64) bool {
     return expires_ms <= now_ms + codex_refresh_margin_ms;
 }
@@ -780,21 +738,21 @@ test "runtime keeps codex adapter for openai provider" {
 
 test "createSystemPrompt substitutes ${CWD} with the working directory" {
     const gpa = std.testing.allocator;
-    const rendered = try createSystemPrompt(gpa, "header\nYou are in ${CWD}.\n", "C:\\repos\\nova");
+    const rendered = try context_assembly.substituteBaseTemplate(gpa, "header\nYou are in ${CWD}.\n", "C:\\repos\\nova");
     defer gpa.free(rendered);
     try std.testing.expectEqualStrings("header\nYou are in C:\\repos\\nova.\n", rendered);
 }
 
 test "createSystemPrompt leaves a template without the placeholder untouched" {
     const gpa = std.testing.allocator;
-    const rendered = try createSystemPrompt(gpa, "no placeholder here", "/tmp/nova");
+    const rendered = try context_assembly.substituteBaseTemplate(gpa, "no placeholder here", "/tmp/nova");
     defer gpa.free(rendered);
     try std.testing.expectEqualStrings("no placeholder here", rendered);
 }
 
 test "createSystemPrompt substitutes ${OS} with the host operating system" {
     const gpa = std.testing.allocator;
-    const rendered = try createSystemPrompt(gpa, "OS: ${OS}", "/tmp/nova");
+    const rendered = try context_assembly.substituteBaseTemplate(gpa, "OS: ${OS}", "/tmp/nova");
     defer gpa.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "${OS}") == null);
     try std.testing.expect(std.mem.startsWith(u8, rendered, "OS: "));
@@ -820,7 +778,7 @@ test "readContextFile reads AGENTS.md when it exists" {
     const cwd = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer gpa.free(cwd);
 
-    const agents_md = (try readContextFile(gpa, io, cwd)) orelse return error.MissingContextFile;
+    const agents_md = (try context_assembly.readProjectRuleFile(gpa, io, cwd, "AGENTS.md")) orelse return error.MissingContextFile;
     defer gpa.free(agents_md);
     try std.testing.expectEqualStrings("# Guidelines\nThis is a test.", agents_md);
 }

@@ -234,7 +234,7 @@ pub const BackgroundManager = struct {
 
         const term = job.child.wait(io) catch std.process.Child.Term{ .unknown = 0 };
         job.log_file.close(io);
-        job.exit_code = termCode(term);
+        job.exit_code = os.termCode(term);
 
         // A user/shutdown kill is surfaced in the UI only — don't wake the model
         // with output it didn't ask to wait for.
@@ -477,12 +477,6 @@ fn formatElapsed(buf: []u8, total_seconds: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d}h {d:0>2}m", .{ hours, rem_minutes }) catch "?";
 }
 
-fn termCode(term: std.process.Child.Term) u8 {
-    return switch (term) {
-        .exited => |value| value,
-        .signal, .stopped, .unknown => 255,
-    };
-}
 
 /// Kill a job's whole process tree by pid. Best-effort and side-effect free on
 /// the caller's data — runs outside the manager lock.

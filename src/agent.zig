@@ -1039,35 +1039,9 @@ pub const BashApproval = struct {
     request: *const fn (*anyopaque, []const u8) anyerror!bool,
 };
 
-/// Parse just the `command` field of bash's argument JSON. The TUI uses
-/// this to detect whether the streaming bash JSON is complete enough to
-/// surface a meaningful title — for partial JSON we hold the title back.
-pub fn parseCommand(gpa: std.mem.Allocator, arguments: []const u8) ![]u8 {
-    const JsonArgs = struct {
-        command: ?[]const u8 = null,
-    };
-    const parsed = std.json.parseFromSlice(JsonArgs, gpa, arguments, .{ .ignore_unknown_fields = true }) catch return error.InvalidToolArguments;
-    defer parsed.deinit();
-
-    const command = parsed.value.command orelse return error.InvalidToolArguments;
-    return try gpa.dupe(u8, command);
-}
-
-/// Render friendly display metadata for a tool call by delegating to the
-/// registered tool. Falls back to `<name> <arguments>` for tools that aren't
-/// in the registry (shouldn't happen outside test paths).
-pub fn formatToolDisplay(gpa: std.mem.Allocator, name: []const u8, arguments: []const u8) !tools.ToolDisplay {
-    const tool = tools.lookup(name) orelse
-        return .{ .label = try std.fmt.allocPrint(gpa, "{s} {s}", .{ name, arguments }) };
-    return tool.display(gpa, arguments);
-}
-
-test "parse bash command arguments" {
-    const gpa = std.testing.allocator;
-    const command = try parseCommand(gpa, "{\"command\":\"zig build test\"}");
-    defer gpa.free(command);
-    try std.testing.expectEqualStrings("zig build test", command);
-}
+const tool_display = @import("tools/display.zig");
+pub const parseCommand = tool_display.parseCommand;
+pub const formatToolDisplay = tool_display.formatToolDisplay;
 
 test "streaming callbacks emit owned events" {
     const gpa = std.testing.allocator;
