@@ -52,6 +52,19 @@ pub const McpTool = struct {
     }
 };
 
+/// Server identity reported in the `initialize` response. Owned; freed in
+/// `McpClient.deinit`. Used for diagnostics and TUI display.
+pub const ServerInfo = struct {
+    name: []u8,
+    version: []u8,
+
+    pub fn deinit(self: *ServerInfo, gpa: std.mem.Allocator) void {
+        gpa.free(self.name);
+        gpa.free(self.version);
+        self.* = undefined;
+    }
+};
+
 pub const McpClient = struct {
     gpa: std.mem.Allocator,
     name: []u8,
@@ -98,6 +111,17 @@ pub const McpClient = struct {
     /// Server-assigned `Mcp-Session-Id` for the Streamable HTTP transport.
     /// null until the initialize response provides one. Owned; freed in deinit.
     session_id: ?[]u8 = null,
+    /// Server identity from the `initialize` response. Owned; freed in deinit.
+    /// null until the handshake completes (or if the server omitted serverInfo).
+    server_info: ?ServerInfo = null,
+    /// Protocol version the server echoed back in `initialize`. May differ
+    /// from what we sent — the server may downgrade. Owned; freed in deinit.
+    negotiated_protocol: ?[]u8 = null,
+    /// True when the server advertised `capabilities.tools.listChanged`. When
+    /// set, the server may send `notifications/tools/list_changed` and the
+    /// App should re-discover tools. False otherwise (including when the
+    /// server advertises tools but not the listChanged flag).
+    server_supports_tools_list_changed: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, name: []const u8, command: ?[]const u8, args: []const []const u8, url: ?[]const u8) !McpClient {
         // Legacy init: if url is set, build an sse client; otherwise stdio.
@@ -212,6 +236,8 @@ pub const McpClient = struct {
         for (self.tools.items) |*tool| tool.deinit(self.gpa);
         self.tools.deinit(self.gpa);
         if (self.session_id) |sid| self.gpa.free(sid);
+        if (self.server_info) |*si| si.deinit(self.gpa);
+        if (self.negotiated_protocol) |pv| self.gpa.free(pv);
         self.* = undefined;
     }
 
@@ -539,7 +565,11 @@ pub const McpClient = struct {
     }
 
     /// Perform the MCP initialize handshake.
-    /// On success, sets status to .connected and records latency.
+    /// On success, sets status to .connected, records latency, and captures
+    /// the server's reported protocol version, serverInfo, and the
+    /// `tools.listChanged` capability flag (for `notifications/tools/list_changed`
+    /// subscription). Nova is a client only — it advertises no client
+    /// capabilities (no sampling, no roots, no elicitation server-side).
     pub fn initialize(self: *McpClient, io: std.Io) !void {
         const start = std.Io.Timestamp.now(io, .awake);
 
@@ -557,13 +587,57 @@ pub const McpClient = struct {
         const response = try self.sendRequest(io, "initialize", params);
         defer self.gpa.free(response);
 
-        const parsed = try parseResponse(self.gpa, response);
-        if (parsed) |p| {
-            defer p.deinit();
-            _ = p.value.object.get("result");
-        } else {
+        const parsed = try parseResponse(self.gpa, response) orelse {
             self.setError("handshake returned no result", .{});
             return error.McpHandshakeFailed;
+        };
+        defer parsed.deinit();
+
+        const result = parsed.value.object.get("result") orelse {
+            self.setError("handshake result missing", .{});
+            return error.McpHandshakeFailed;
+        };
+        if (result != .object) {
+            self.setError("handshake result not an object", .{});
+            return error.McpHandshakeFailed;
+        }
+        const result_obj = result.object;
+
+        // Negotiate protocol version — the server may echo or downgrade.
+        // We accept whatever the server returns; no version pinning yet.
+        if (result_obj.get("protocolVersion")) |pv| {
+            if (pv == .string) {
+                if (self.negotiated_protocol) |old| self.gpa.free(old);
+                self.negotiated_protocol = self.gpa.dupe(u8, pv.string) catch null;
+            }
+        }
+
+        // Capture server identity for diagnostics and TUI display.
+        if (result_obj.get("serverInfo")) |si| {
+            if (si == .object) {
+                const sname = if (si.object.get("name")) |n| (if (n == .string) n.string else "") else "";
+                const sver = if (si.object.get("version")) |v| (if (v == .string) v.string else "") else "";
+                if (self.server_info) |*old| old.deinit(self.gpa);
+                self.server_info = .{
+                    .name = self.gpa.dupe(u8, sname) catch "",
+                    .version = self.gpa.dupe(u8, sver) catch "",
+                };
+            }
+        }
+
+        // Parse server capabilities — record `tools.listChanged` so the App
+        // can subscribe to `notifications/tools/list_changed` and re-discover.
+        self.server_supports_tools_list_changed = false;
+        if (result_obj.get("capabilities")) |caps| {
+            if (caps == .object) {
+                if (caps.object.get("tools")) |tools_cap| {
+                    if (tools_cap == .object) {
+                        if (tools_cap.object.get("listChanged")) |lc| {
+                            if (lc == .bool) self.server_supports_tools_list_changed = lc.bool;
+                        }
+                    }
+                }
+            }
         }
 
         // Send initialized notification
@@ -952,6 +1026,15 @@ test "McpClient full handshake + tools/list" {
     try client.initialize(io);
     try std.testing.expectEqual(ServerStatus.connected, client.status());
 
+    // Capability negotiation — server reported serverInfo + protocolVersion
+    // and `capabilities.tools` without the listChanged flag.
+    try std.testing.expect(client.server_info != null);
+    try std.testing.expectEqualStrings("mock", client.server_info.?.name);
+    try std.testing.expectEqualStrings("1.0", client.server_info.?.version);
+    try std.testing.expect(client.negotiated_protocol != null);
+    try std.testing.expectEqualStrings("2024-11-05", client.negotiated_protocol.?);
+    try std.testing.expectEqual(false, client.server_supports_tools_list_changed);
+
     // Tool discovery
     try client.listTools(io);
     try std.testing.expectEqual(@as(usize, 1), client.tools.items.len);
@@ -962,6 +1045,29 @@ test "McpClient full handshake + tools/list" {
     try std.testing.expectEqualStrings("name", client.tools.items[0].schema.properties[0].name);
     try std.testing.expectEqual(tools_common.Schema.Kind.string, client.tools.items[0].schema.properties[0].kind);
     try std.testing.expect(client.tools.items[0].schema.properties[0].required);
+}
+
+test "McpClient initialize captures tools.listChanged capability" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Mock server that advertises tools.listChanged: true.
+    var client = try McpClient.init(gpa, "changeful", "bash", &.{
+        "-c",
+        \\read line
+        \\echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"changeful","version":"2.0"},"capabilities":{"tools":{"listChanged":true}}}}'
+        \\read line
+    }, null);
+    defer client.deinit(io);
+
+    try client.startStdio(io);
+    defer client.stop(io);
+
+    try client.initialize(io);
+    try std.testing.expectEqual(ServerStatus.connected, client.status());
+    try std.testing.expect(client.server_supports_tools_list_changed);
+    try std.testing.expectEqualStrings("changeful", client.server_info.?.name);
+    try std.testing.expectEqualStrings("2.0", client.server_info.?.version);
 }
 
 test "McpClient callTool round-trip" {
