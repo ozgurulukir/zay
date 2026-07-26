@@ -100,7 +100,7 @@ pub const ToolCallStream = struct {
         return if (self.is_remapped[logical]) self.remapped_slot[logical] else logical;
     }
 
-    fn deinit(self: *ToolCallStream, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: *ToolCallStream, gpa: std.mem.Allocator) void {
         for (self.builders.items) |*b| b.deinit(gpa);
         self.builders.deinit(gpa);
     }
@@ -164,7 +164,7 @@ pub const ChunkChange = struct {
     /// null. Does not affect `empty()` — a usage chunk emits no callbacks.
     usage: ?ai.Usage = null,
 
-    fn empty(self: *const ChunkChange) bool {
+    pub fn empty(self: *const ChunkChange) bool {
         if (self.content_start != null) return false;
         if (self.reasoning_start != null) return false;
         if (self.tool_call_count > 0) return false;

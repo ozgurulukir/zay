@@ -12,10 +12,17 @@ pub fn parseResponse(gpa: std.mem.Allocator, response: []const u8) !?std.json.Pa
     const trimmed = std.mem.trim(u8, response, " \t\r\n");
     if (trimmed.len == 0) return null;
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, trimmed, .{});
-    errdefer parsed.deinit();
+    // Allocate parsed via a temporary optional so the `result`-found path can
+    // transfer ownership; every other path deinits to avoid leaks.
+    var maybe_parsed: ?std.json.Parsed(std.json.Value) =
+        try std.json.parseFromSlice(std.json.Value, gpa, trimmed, .{});
+    errdefer if (maybe_parsed) |*p| p.deinit();
+    const parsed = &(maybe_parsed orelse return null);
 
-    if (parsed.value != .object) return null;
+    if (parsed.value != .object) {
+        parsed.deinit();
+        return null;
+    }
     const obj = parsed.value.object;
 
     // Check for error
@@ -25,11 +32,16 @@ pub fn parseResponse(gpa: std.mem.Allocator, response: []const u8) !?std.json.Pa
             const message = if (err_val.object.get("message")) |m| (if (m == .string) m.string else "unknown error") else "unknown error";
             std.log.warn("MCP JSON-RPC error (code {d}): {s}", .{ code, message });
         }
+        parsed.deinit();
         return null;
     }
 
-    _ = obj.get("result") orelse return null;
-    return parsed;
+    if (obj.get("result") == null) {
+        parsed.deinit();
+        return null;
+    }
+
+    return maybe_parsed;
 }
 
 /// Extract text content from a `tools/call` result.

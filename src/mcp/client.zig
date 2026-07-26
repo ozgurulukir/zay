@@ -412,19 +412,14 @@ pub const McpClient = struct {
         // routed to handleNotification and we keep reading.
         while (true) {
             // Wait for data on stdout with a timeout to prevent infinite hangs.
+            // HUP alone is not treated as a crash — a server that has written
+            // its response and exited still has buffered data in the pipe we
+            // need to drain. Only a read failure after poll is a true crash.
             var poll_fds: [1]std.posix.pollfd = .{
                 .{ .fd = stdout_file.handle, .events = std.posix.POLL.IN, .revents = 0 },
             };
             const ready = std.posix.poll(&poll_fds, @intCast(self.read_timeout_ms)) catch return error.ReadFailed;
             if (ready == 0) return error.Timeout;
-            // Server exited with no data — only crash when POLLIN is NOT set.
-            // When both POLLIN and HUP are set, the pipe has buffered data from
-            // a just-exited server that we still need to read.
-            if (poll_fds[0].revents & std.posix.POLL.IN == 0 and
-                poll_fds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0)
-            {
-                return error.McpServerCrashed;
-            }
 
             // Read one line from stdout (newline-delimited JSON-RPC).
             var line_writer: std.Io.Writer.Allocating = .init(self.gpa);
