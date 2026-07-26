@@ -14,6 +14,17 @@ Nova exposes the following tools:
 
 `bash` has some middleware written for it that makes it friendlier for agent use. For example, large outputs from a `cat` command are written to a temp file and the agent is told the full is in that file if needed.
 
+### Tool schema strict mode
+
+Builtin and MCP tool schemas are serialized with OpenAI strict-mode semantics:
+
+- `strict: true`
+- Top-level `parameters` uses `additionalProperties: false`
+- Optional fields carry `nullable: true` and emit `["<type>", "null"]` union arrays
+- Nested free-form objects like `env` keep `additionalProperties: true`
+
+The registry accessor `tools.registry()` is runtime-extensible; both the executor and the AI client adapters consume it to build the `tools` JSON payload sent on every request.
+
 ## Steering
 
 Steering is done by enqueuing messages into a bounded queue. By default, the front of the queue is popped and appended to the conversation after the agent's turn is finished. You can also choose to _steer_ instead and send the queued message after the next tool call is done. If the agent stops and there are still messages in the queue we flush all the messages and append them into the conversation.
