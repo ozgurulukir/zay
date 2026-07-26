@@ -15,6 +15,7 @@ const auth = @import("../auth/store.zig");
 const blackhole = @import("../tui/blackhole.zig");
 const codex = @import("../auth/codex.zig");
 const provider_model = @import("provider_model.zig");
+const diff_lifecycle = @import("diff_lifecycle.zig");
 const runtime_mod = @import("../runtime.zig");
 const vcs = @import("../vcs.zig");
 
@@ -373,7 +374,7 @@ pub fn handleDiffBrowseKey(root: *RootWidget, ctx: *vxfw.EventContext, key: vaxi
 /// Close the `/diff` viewer, optionally saving any pending comments.
 /// When saved comments exist, begins a turn so the agent sees them.
 pub fn closeDiff(root: *RootWidget, ctx: *vxfw.EventContext, send: bool) !void {
-    const has_comments = try provider_model.closeDiffViewer(root.app, send);
+    const has_comments = try diff_lifecycle.closeDiffViewer(root.app, send);
     try syncFocus(root, ctx);
     if (has_comments) {
         if (try root.app.beginSubmit()) try root.app.startTurn();

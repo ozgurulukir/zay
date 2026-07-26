@@ -5,6 +5,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const tui = @import("../tui.zig");
 const provider_model = @import("provider_model.zig");
+const diff_lifecycle = @import("diff_lifecycle.zig");
 const session_mod = @import("../session.zig");
 const vcs = @import("../vcs.zig");
 const lanes_picker = @import("widgets/lanes_picker.zig");
@@ -168,12 +169,12 @@ pub fn submitMode(app: *App) !bool {
             switch (command) {
                 .new => app.switchToNewSession() catch |err| try app.reportSessionSwitchError(err),
                 .resume_session => try app.openResumePicker(),
-                .timeline => provider_model.openTimelineSelector(app) catch |err| try app.reportSessionSwitchError(err),
+                .timeline => diff_lifecycle.openTimelineSelector(app) catch |err| try app.reportSessionSwitchError(err),
                 .connect => try provider_model.openProviderPicker(app),
                 .model => provider_model.openModelPicker(app) catch |err| try app.reportConnectionError(err),
                 .mcp => tui.openMcp(app),
                 .settings => tui.openSettings(app),
-                .diff => provider_model.openDiffViewer(app) catch |err| try provider_model.reportDiffError(app, err),
+                .diff => diff_lifecycle.openDiffViewer(app) catch |err| try diff_lifecycle.reportDiffError(app, err),
                 .parallel => app.createParallelLane() catch |err| try app.reportLaneError(err),
                 .save => app.beginSave() catch |err| try app.reportLaneError(err),
                 .close => app.closeActiveLane() catch |err| try app.reportLaneError(err),

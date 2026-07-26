@@ -8,6 +8,10 @@ const assert = std.debug.assert;
 
 const session_type = @import("session/types.zig");
 const session_migration = @import("session/migration.zig");
+const serialize = @import("session/serialize.zig");
+const session_writer = @import("session/writer.zig");
+
+pub const SessionWriter = session_writer.SessionWriter;
 
 pub const entry_id_len = session_type.entry_id_len;
 const session_id_len = session_type.session_id_len;
@@ -174,7 +178,7 @@ pub const Session = struct {
 
     pub fn append(self: *Session, message: ai.ChatMessage, id_out: *[entry_id_len]u8) Error!void {
         fillHex(self.manager.io, id_out);
-        const payload = try messageToJson(self.manager.gpa, message);
+        const payload = try serialize.messageToJson(self.manager.gpa, message);
         defer self.manager.gpa.free(payload);
         try self.insertEntry(id_out, "message", message.role().label(), payload);
     }
@@ -189,7 +193,7 @@ pub const Session = struct {
     pub fn info(self: *Session, title: []const u8, id_out: *[entry_id_len]u8) Error!void {
         assert(title.len > 0);
         fillHex(self.manager.io, id_out);
-        const payload = try titleToJson(self.manager.gpa, title);
+        const payload = try serialize.titleToJson(self.manager.gpa, title);
         defer self.manager.gpa.free(payload);
         try self.insertEntry(id_out, "session_info", null, payload);
 
@@ -208,7 +212,7 @@ pub const Session = struct {
         if (branch_summary) |text| {
             const out = id_out orelse return error.BadEntryId;
             fillHex(self.manager.io, out);
-            const payload = try branchSummaryToJson(self.manager.gpa, entry_id, text);
+            const payload = try serialize.branchSummaryToJson(self.manager.gpa, entry_id, text);
             defer self.manager.gpa.free(payload);
             try self.insertEntryWithParent(out, entry_id, "branch_summary", null, payload);
         } else {
@@ -230,7 +234,7 @@ pub const Session = struct {
         assert(compaction_summary.len > 0);
         try self.requireEntry(first_kept_id);
         fillHex(self.manager.io, id_out);
-        const payload = try compactionToJson(self.manager.gpa, first_kept_id, compaction_summary);
+        const payload = try serialize.compactionToJson(self.manager.gpa, first_kept_id, compaction_summary);
         defer self.manager.gpa.free(payload);
         try self.insertEntry(id_out, "compaction", null, payload);
     }
@@ -356,7 +360,7 @@ pub const Session = struct {
             messages_list.deinit(gpa);
         }
         if (boundary) |b| {
-            try messages_list.append(gpa, try compactionSummaryToMessage(gpa, path[b.summary_index].payload_json));
+            try messages_list.append(gpa, try serialize.compactionSummaryToMessage(gpa, path[b.summary_index].payload_json));
         }
         for (path[emit_start..]) |entry| {
             try appendProjectedEntry(gpa, &messages_list, entry);
@@ -390,10 +394,10 @@ pub const Session = struct {
         defer ids.deinit(gpa);
         for (path[emit_start..]) |entry| {
             if (std.mem.eql(u8, entry.kind, "message")) {
-                try msgs.append(gpa, try jsonToMessage(gpa, entry.payload_json));
+                try msgs.append(gpa, try serialize.jsonToMessage(gpa, entry.payload_json));
                 try ids.append(gpa, .{ .bytes = entry.id });
             } else if (std.mem.eql(u8, entry.kind, "branch_summary")) {
-                try msgs.append(gpa, try branchSummaryToMessage(gpa, entry.payload_json));
+                try msgs.append(gpa, try serialize.branchSummaryToMessage(gpa, entry.payload_json));
                 try ids.append(gpa, .{ .bytes = entry.id });
             }
         }
@@ -536,429 +540,9 @@ pub const Session = struct {
     }
 };
 
-pub const SessionWriter = struct {
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    manager: SessionManager,
-    session: Session,
-    mutex: std.Io.Mutex = .init,
-    condition: std.Io.Condition = .init,
-    queue: []QueuedEntry,
-    entry_queue: EntryQueue = .{},
-    stopping: bool = false,
-    title_written: bool = false,
-    thread: ?std.Thread = null,
-
-    pub const queue_capacity_default: u32 = 256;
-
-    pub fn initDefault(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, cwd: []const u8) Error!void {
-        return initDefaultWithCapacity(target, gpa, io, home_dir, cwd, queue_capacity_default);
-    }
-
-    pub fn initResumeDefault(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, session_id: []const u8) Error!void {
-        return initResumeDefaultWithCapacity(target, gpa, io, home_dir, session_id, queue_capacity_default);
-    }
-
-    pub fn initDefaultWithCapacity(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, cwd: []const u8, capacity: u32) Error!void {
-        assert(home_dir.len > 0);
-        assert(cwd.len > 0);
-        assert(capacity > 0);
-        var manager = try SessionManager.initDefault(gpa, io, home_dir);
-        errdefer manager.deinit();
-        const session = try manager.create(cwd, .{});
-        try target.initWithSession(gpa, io, manager, session, capacity);
-    }
-
-    pub fn initResumeDefaultWithCapacity(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, session_id: []const u8, capacity: u32) Error!void {
-        assert(home_dir.len > 0);
-        assert(session_id.len > 0);
-        assert(capacity > 0);
-        var manager = try SessionManager.initDefault(gpa, io, home_dir);
-        errdefer manager.deinit();
-        const session = try manager.@"resume"(session_id);
-        try target.initWithSession(gpa, io, manager, session, capacity);
-    }
-
-    fn initWithSession(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, manager: SessionManager, session: Session, capacity: u32) Error!void {
-        const queue = try gpa.alloc(QueuedEntry, capacity);
-        errdefer gpa.free(queue);
-        target.* = .{
-            .gpa = gpa,
-            .io = io,
-            .manager = manager,
-            .session = session,
-            .queue = queue,
-        };
-        target.session.manager = &target.manager;
-        target.title_written = try target.session.hasTitle();
-        target.thread = try std.Thread.spawn(.{}, runWriter, .{target});
-    }
-
-    pub fn deinit(self: *SessionWriter) void {
-        if (self.mutex.lock(self.io)) |_| {
-            self.stopping = true;
-            self.condition.signal(self.io);
-            self.mutex.unlock(self.io);
-        } else |_| {
-            // Lock failed (canceled) — signal/cleanup will happen via thread join.
-        }
-        if (self.thread) |thread| thread.join();
-        while (self.entry_queue.pop(self.queue)) |entry| {
-            var owned = entry;
-            owned.deinit(self.gpa);
-        }
-        self.gpa.free(self.queue);
-        self.manager.deinit();
-        self.* = undefined;
-    }
-
-    pub fn append(self: *SessionWriter, message: ai.ChatMessage) Error!void {
-        if (message.role() == .system) return;
-        const payload = try messageToJson(self.gpa, message);
-        errdefer self.gpa.free(payload);
-        const role = try self.gpa.dupe(u8, message.role().label());
-        errdefer self.gpa.free(role);
-        const title_candidate = if (message.role() == .user)
-            try titleFromUserMessage(self.gpa, message.text())
-        else
-            null;
-        errdefer if (title_candidate) |title| self.gpa.free(title);
-        try self.enqueue(.{ .kind = "message", .role = role, .payload_json = payload, .title_candidate = title_candidate });
-    }
-
-    /// Enqueue a compaction boundary for the background writer. Mirrors
-    /// `append`: builds the payload and hands it to the writer thread. The
-    /// branch on which it lands is whatever leaf is current when the writer
-    /// drains it; a stale boundary is ignored at projection time, so no
-    /// quiesce is needed here.
-    pub fn appendCompaction(self: *SessionWriter, first_kept_id: []const u8, summary: []const u8) Error!void {
-        assert(first_kept_id.len == entry_id_len);
-        assert(summary.len > 0);
-        const payload = try compactionToJson(self.gpa, first_kept_id, summary);
-        errdefer self.gpa.free(payload);
-        try self.enqueue(.{ .kind = "compaction", .role = null, .payload_json = payload });
-    }
-
-    /// Bind a git snapshot id to the current leaf entry, race-free. Flushes
-    /// queued writes first so the leaf reflects the entries the turn just wrote,
-    /// then annotates that entry. No-op if the session has no leaf yet.
-    pub fn setLeafSnapshot(self: *SessionWriter, sha: []const u8) Error!void {
-        self.quiesce();
-        defer self.restart() catch {};
-        const leaf_id = self.session.leaf() orelse return;
-        return self.session.setSnapshot(leaf_id, sha);
-    }
-
-    /// Race-free `Session.snapshotAt`: the git snapshot bound to the active
-    /// conversation position (nearest entry at/above the leaf). Caller owns it.
-    pub fn snapshotAt(self: *SessionWriter, gpa: std.mem.Allocator) Error!?[]u8 {
-        self.quiesce();
-        defer self.restart() catch {};
-        return self.session.snapshotAt(gpa);
-    }
-
-    /// Save a prompt to the session's prompt history, race-free. Deduplicates
-    /// against the most recent entry so consecutive identical prompts aren't
-    /// stored twice.
-    pub fn savePromptHistory(self: *SessionWriter, prompt: []const u8) Error!void {
-        self.quiesce();
-        defer self.restart() catch {};
-        try self.session.savePromptHistory(prompt);
-    }
-
-    /// Load the prompt history for this session, race-free. Caller owns the
-    /// slice and each string.
-    pub fn loadPromptHistory(self: *SessionWriter, gpa: std.mem.Allocator) Error![][]u8 {
-        self.quiesce();
-        defer self.restart() catch {};
-        return self.session.loadPromptHistory(gpa);
-    }
-
-    /// Load the whole session tree, race-free. Stops the background writer so
-    /// the read has exclusive access to the connection, then restarts it.
-    pub fn entries(self: *SessionWriter, gpa: std.mem.Allocator) Error![]EntryRecord {
-        self.quiesce();
-        defer self.restart() catch {};
-        return self.session.entries(gpa);
-    }
-
-    /// Reconstruct the active-path messages (leaf→root), race-free. Used after
-    /// `navigate` to rehydrate the agent's conversation from the new branch.
-    pub fn messages(self: *SessionWriter, gpa: std.mem.Allocator) Error![]ai.ChatMessage {
-        self.quiesce();
-        defer self.restart() catch {};
-        return self.session.messages(gpa);
-    }
-
-    /// Race-free `Session.compactionCut`: flushes queued writes so the cut is
-    /// computed against the persisted tree, then restarts the writer.
-    pub fn compactionCut(self: *SessionWriter, gpa: std.mem.Allocator, keep_recent_tokens: u32) Error!?CompactionCut {
-        self.quiesce();
-        defer self.restart() catch {};
-        return self.session.compactionCut(gpa, keep_recent_tokens);
-    }
-
-    /// Move the session leaf to `entry_id` (branch switch, no summary),
-    /// race-free with the background writer. The next appended message becomes
-    /// a child of `entry_id`, forming a new branch.
-    pub fn navigate(self: *SessionWriter, entry_id: []const u8) Error!void {
-        self.quiesce();
-        defer self.restart() catch {};
-        try self.session.branch(entry_id, null, null);
-    }
-
-    /// Update the model provider and ID for the current session.
-    /// Called when the model selection changes during a session.
-    pub fn updateModel(self: *SessionWriter, provider: []const u8, model_id: []const u8) Error!void {
-        self.quiesce();
-        defer self.restart() catch {};
-        try self.session.updateModel(provider, model_id);
-    }
-
-    pub fn leaf(self: *const SessionWriter) ?[]const u8 {
-        return self.session.leaf();
-    }
-
-    /// Stop the writer thread and flush any queued entries synchronously,
-    /// leaving the calling thread sole owner of the sqlite connection. Pair
-    /// with `restart`. Queued entries are written (not dropped) so an
-    /// in-flight assistant turn isn't lost.
-    fn quiesce(self: *SessionWriter) void {
-        if (self.mutex.lock(self.io)) |_| {
-            self.stopping = true;
-            self.condition.signal(self.io);
-            self.mutex.unlock(self.io);
-        } else |_| {
-            // Lock failed (canceled) — stop flag will be observed on next poll.
-        }
-        if (self.thread) |thread| {
-            thread.join();
-            self.thread = null;
-        }
-        while (self.entry_queue.pop(self.queue)) |entry| {
-            var owned = entry;
-            defer owned.deinit(self.gpa);
-            writeQueuedEntry(self, &owned) catch {};
-        }
-    }
-
-    fn restart(self: *SessionWriter) Error!void {
-        assert(self.thread == null);
-        self.stopping = false;
-        self.thread = try std.Thread.spawn(.{}, runWriter, .{self});
-    }
-
-    fn enqueue(self: *SessionWriter, entry: QueuedEntry) Error!void {
-        try self.mutex.lock(self.io);
-        if (!self.entry_queue.push(self.queue, entry)) {
-            self.mutex.unlock(self.io);
-            return error.QueueFull;
-        }
-        self.condition.signal(self.io);
-        self.mutex.unlock(self.io);
-    }
-};
-
-fn runWriter(writer: *SessionWriter) void {
-    while (true) {
-        if (takeQueuedEntry(writer)) |entry| {
-            var owned = entry;
-            defer owned.deinit(writer.gpa);
-            writeQueuedEntry(writer, &owned) catch continue;
-        } else {
-            // Queue is empty: wait for a signal rather than busy-yielding.
-            // We hold the lock around the check+wait so we can't miss a
-            // signal that lands between the check and the wait.
-            writer.mutex.lock(writer.io) catch return;
-            while (writer.entry_queue.empty() and !writer.stopping) {
-                writer.condition.waitUncancelable(writer.io, &writer.mutex);
-            }
-            const done = writer.stopping and writer.entry_queue.empty();
-            writer.mutex.unlock(writer.io);
-            if (done) return;
-        }
-    }
-}
-
-fn writeQueuedEntry(writer: *SessionWriter, entry: *const QueuedEntry) Error!void {
-    assert(entry.kind.len > 0);
-    assert(entry.payload_json.len > 0);
-
-    const previous_leaf = writer.session.leaf_entry_id;
-    try writer.manager.connection.exec("begin immediate");
-    errdefer {
-        writer.manager.connection.exec("rollback") catch {};
-        writer.session.leaf_entry_id = previous_leaf;
-    }
-
-    var id: [entry_id_len]u8 = undefined;
-    try writer.session.appendPayload(entry.kind, entry.role, entry.payload_json, &id);
-    const should_write_title = !writer.title_written and entry.title_candidate != null;
-    if (should_write_title) try writer.session.setTitle(entry.title_candidate.?);
-
-    try writer.manager.connection.exec("commit");
-    if (should_write_title) writer.title_written = true;
-}
-
-fn takeQueuedEntry(writer: *SessionWriter) ?QueuedEntry {
-    writer.mutex.lock(writer.io) catch return null;
-    defer writer.mutex.unlock(writer.io);
-    return writer.entry_queue.pop(writer.queue);
-}
 
 fn expectDone(statement: *db.Statement) Error!void {
     if (try statement.step()) |_| return error.Sqlite;
-}
-
-fn messageToJson(gpa: std.mem.Allocator, message: ai.ChatMessage) Error![]u8 {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    const writer = &out.writer;
-    try writer.writeAll("{\"role\":");
-    try std.json.Stringify.value(message.role().label(), .{}, writer);
-    if (message == .tool) {
-        try writer.writeAll(",\"call_id\":");
-        try std.json.Stringify.value(message.tool.call_id.slice(), .{}, writer);
-        if (message.tool.display_label) |label| {
-            try writer.writeAll(",\"tool_display_label\":");
-            try std.json.Stringify.value(label, .{}, writer);
-        }
-        if (message.tool.failed) try writer.writeAll(",\"tool_failed\":true");
-    }
-    try writer.writeAll(",\"content\":[");
-    const content: []const ai.ContentBlock = switch (message) {
-        inline .system, .user, .assistant => |m| m.content,
-        .tool => |t| t.content,
-    };
-    for (content, 0..) |block, index| {
-        if (index > 0) try writer.writeByte(',');
-        try block.writeJson(writer);
-    }
-    try writer.writeAll("]}");
-    return out.toOwnedSlice();
-}
-
-fn jsonToMessage(gpa: std.mem.Allocator, payload_json: []const u8) Error!ai.ChatMessage {
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, payload_json, .{}) catch return error.CorruptPayload;
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.CorruptPayload;
-    const role_value = parsed.value.object.get("role") orelse return error.CorruptPayload;
-    if (role_value != .string) return error.CorruptPayload;
-    const role = ai.Role.fromString(role_value.string) catch return error.CorruptPayload;
-    const call_id = try optionalString(gpa, parsed.value, "call_id");
-    errdefer if (call_id) |id| gpa.free(id);
-    const tool_display_label = try optionalString(gpa, parsed.value, "tool_display_label");
-    errdefer if (tool_display_label) |label| gpa.free(label);
-    const tool_failed = try optionalBool(parsed.value, "tool_failed");
-    const content_value = parsed.value.object.get("content") orelse return error.CorruptPayload;
-    const content = try parseContentBlocks(gpa, content_value);
-    errdefer freeContentBlocks(gpa, content);
-    return switch (role) {
-        .system => .{ .system = .{ .content = content } },
-        .user => .{ .user = .{ .content = content } },
-        .assistant => .{ .assistant = .{ .content = content } },
-        .tool => .{
-            .tool = .{
-                .content = content,
-                .call_id = .{ .value = call_id orelse return error.CorruptPayload },
-                .display_label = tool_display_label,
-                .failed = tool_failed,
-            },
-        },
-    };
-}
-
-fn branchSummaryToMessage(gpa: std.mem.Allocator, payload_json: []const u8) Error!ai.ChatMessage {
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, payload_json, .{}) catch return error.CorruptPayload;
-    defer parsed.deinit();
-    const summary = parsed.value.object.get("summary") orelse return error.CorruptPayload;
-    if (summary != .string) return error.CorruptPayload;
-    const content = try std.fmt.allocPrint(gpa, "Branch summary: {s}", .{summary.string});
-    errdefer gpa.free(content);
-    const blocks = try gpa.alloc(ai.ContentBlock, 1);
-    blocks[0] = .{ .text = .{ .text = content } };
-    return .{ .user = .{ .content = blocks } };
-}
-
-fn parseContentBlocks(gpa: std.mem.Allocator, value: std.json.Value) Error![]ai.ContentBlock {
-    if (value == .string) {
-        const blocks = try gpa.alloc(ai.ContentBlock, 1);
-        blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, value.string) } };
-        return blocks;
-    }
-    if (value != .array) return error.CorruptPayload;
-    const blocks = try gpa.alloc(ai.ContentBlock, value.array.items.len);
-    var initialized: usize = 0;
-    errdefer freeContentBlocks(gpa, blocks[0..initialized]);
-    for (value.array.items) |item| {
-        blocks[initialized] = try ai.ContentBlock.fromJson(gpa, item);
-        initialized += 1;
-    }
-    return blocks;
-}
-
-fn freeContentBlocks(gpa: std.mem.Allocator, blocks: []ai.ContentBlock) void {
-    for (blocks) |*block| block.deinit(gpa);
-    gpa.free(blocks);
-}
-
-fn parseToolCalls(gpa: std.mem.Allocator, value: std.json.Value) Error![]const ai.ToolCall {
-    const calls_value = value.object.get("tool_calls") orelse return &.{};
-    if (calls_value != .array) return error.CorruptPayload;
-    const calls = try gpa.alloc(ai.ToolCall, calls_value.array.items.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (calls[0..initialized]) |*call| call.deinit(gpa);
-        gpa.free(calls);
-    }
-    for (calls_value.array.items) |item| {
-        if (item != .object) return error.CorruptPayload;
-        const id = item.object.get("id") orelse return error.CorruptPayload;
-        const name = item.object.get("name") orelse return error.CorruptPayload;
-        const arguments = item.object.get("arguments") orelse return error.CorruptPayload;
-        if (id != .string) return error.CorruptPayload;
-        if (name != .string) return error.CorruptPayload;
-        if (arguments != .string) return error.CorruptPayload;
-        calls[initialized] = .{
-            .call_id = .{ .value = try gpa.dupe(u8, id.string) },
-            .name = try gpa.dupe(u8, name.string),
-            .arguments = try gpa.dupe(u8, arguments.string),
-        };
-        initialized += 1;
-    }
-    return calls;
-}
-
-fn optionalString(gpa: std.mem.Allocator, value: std.json.Value, name: []const u8) Error!?[]u8 {
-    const field = value.object.get(name) orelse return null;
-    if (field != .string) return error.CorruptPayload;
-    return try gpa.dupe(u8, field.string);
-}
-
-fn optionalBool(value: std.json.Value, name: []const u8) Error!bool {
-    const field = value.object.get(name) orelse return false;
-    if (field != .bool) return error.CorruptPayload;
-    return field.bool;
-}
-
-fn titleToJson(gpa: std.mem.Allocator, title: []const u8) Error![]u8 {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try out.writer.writeAll("{\"title\":");
-    try std.json.Stringify.value(title, .{}, &out.writer);
-    try out.writer.writeByte('}');
-    return out.toOwnedSlice();
-}
-
-fn branchSummaryToJson(gpa: std.mem.Allocator, from_id: []const u8, summary: []const u8) Error![]u8 {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try out.writer.writeAll("{\"from_id\":");
-    try std.json.Stringify.value(from_id, .{}, &out.writer);
-    try out.writer.writeAll(",\"summary\":");
-    try std.json.Stringify.value(summary, .{}, &out.writer);
-    try out.writer.writeByte('}');
-    return out.toOwnedSlice();
 }
 
 /// Emit one branch entry into the projected message list, dispatching on its
@@ -968,11 +552,11 @@ fn appendProjectedEntry(gpa: std.mem.Allocator, list: *std.ArrayList(ai.ChatMess
     assert(entry.kind.len > 0);
     assert(entry.payload_json.len > 0);
     if (std.mem.eql(u8, entry.kind, "message")) {
-        try list.append(gpa, try jsonToMessage(gpa, entry.payload_json));
+        try list.append(gpa, try serialize.jsonToMessage(gpa, entry.payload_json));
         return;
     }
     if (std.mem.eql(u8, entry.kind, "branch_summary")) {
-        try list.append(gpa, try branchSummaryToMessage(gpa, entry.payload_json));
+        try list.append(gpa, try serialize.branchSummaryToMessage(gpa, entry.payload_json));
         return;
     }
 }
@@ -997,7 +581,7 @@ fn findCompactionBoundary(gpa: std.mem.Allocator, path: []const EntryRecord) Err
     }
     if (!found) return null;
 
-    const first_kept_id = try compactionFirstKeptId(gpa, path[summary_index].payload_json);
+    const first_kept_id = try serialize.compactionFirstKeptId(gpa, path[summary_index].payload_json);
     const first_kept_index = indexOfEntry(path, first_kept_id[0..]) orelse return null;
     if (first_kept_index > summary_index) return null;
     assert(first_kept_index <= summary_index);
@@ -1014,51 +598,6 @@ fn indexOfEntry(path: []const EntryRecord, id: []const u8) ?u32 {
     return null;
 }
 
-fn compactionToJson(gpa: std.mem.Allocator, first_kept_id: []const u8, summary: []const u8) Error![]u8 {
-    assert(first_kept_id.len == entry_id_len);
-    assert(summary.len > 0);
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try out.writer.writeAll("{\"first_kept_id\":");
-    try std.json.Stringify.value(first_kept_id, .{}, &out.writer);
-    try out.writer.writeAll(",\"summary\":");
-    try std.json.Stringify.value(summary, .{}, &out.writer);
-    try out.writer.writeByte('}');
-    return out.toOwnedSlice();
-}
-
-fn compactionFirstKeptId(gpa: std.mem.Allocator, payload_json: []const u8) Error![entry_id_len]u8 {
-    assert(payload_json.len > 0);
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, payload_json, .{}) catch return error.CorruptPayload;
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.CorruptPayload;
-    const field = parsed.value.object.get("first_kept_id") orelse return error.CorruptPayload;
-    if (field != .string) return error.CorruptPayload;
-    if (field.string.len != entry_id_len) return error.BadEntryId;
-    var bytes: [entry_id_len]u8 = undefined;
-    @memcpy(bytes[0..], field.string);
-    return bytes;
-}
-
-fn compactionSummaryToMessage(gpa: std.mem.Allocator, payload_json: []const u8) Error!ai.ChatMessage {
-    const summary = try compactionSummaryText(gpa, payload_json);
-    errdefer gpa.free(summary);
-    const blocks = try gpa.alloc(ai.ContentBlock, 1);
-    errdefer gpa.free(blocks);
-    blocks[0] = .{ .text = .{ .text = summary } };
-    return .{ .user = .{ .content = blocks } };
-}
-
-fn compactionSummaryText(gpa: std.mem.Allocator, payload_json: []const u8) Error![]u8 {
-    assert(payload_json.len > 0);
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, payload_json, .{}) catch return error.CorruptPayload;
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.CorruptPayload;
-    const summary = parsed.value.object.get("summary") orelse return error.CorruptPayload;
-    if (summary != .string) return error.CorruptPayload;
-    return gpa.dupe(u8, summary.string);
-}
-
 /// Render the text handed to the summarizer: any prior summary (folded in so
 /// repeated compactions stay cumulative) followed by the rendered prefix
 /// messages. Caller owns the result.
@@ -1066,7 +605,7 @@ fn renderCompactionPrefix(gpa: std.mem.Allocator, path: []const EntryRecord, bou
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     if (boundary) |b| {
-        const prev_summary = try compactionSummaryText(gpa, path[b.summary_index].payload_json);
+        const prev_summary = try serialize.compactionSummaryText(gpa, path[b.summary_index].payload_json);
         defer gpa.free(prev_summary);
         try out.writer.print("{s}\n", .{prev_summary});
     }
@@ -1183,27 +722,6 @@ fn collapseWhitespace(gpa: std.mem.Allocator, text: []const u8, max: u32) Error!
         }
     }
     return out.toOwnedSlice(gpa);
-}
-
-fn titleFromUserMessage(gpa: std.mem.Allocator, content: []const u8) Error!?[]u8 {
-    const trimmed = std.mem.trim(u8, content, " \t\r\n");
-    if (trimmed.len == 0) return null;
-    const line_end = std.mem.findScalar(u8, trimmed, '\n') orelse trimmed.len;
-    const line = std.mem.trim(u8, trimmed[0..line_end], " \t\r");
-    if (line.len == 0) return null;
-    const title_max: u32 = 80;
-    if (line.len <= title_max) return try gpa.dupe(u8, line);
-    const cut = utf8PrefixLen(line, title_max - 3);
-    return try std.fmt.allocPrint(gpa, "{s}...", .{line[0..cut]});
-}
-
-fn utf8PrefixLen(text: []const u8, limit: u32) u32 {
-    assert(limit < text.len);
-    var end: u32 = limit;
-    while (end > 0) : (end -= 1) {
-        if ((text[end] & 0xc0) != 0x80) return end;
-    }
-    return limit;
 }
 
 fn readSummary(gpa: std.mem.Allocator, row: *const db.Row) Error!SessionSummary {

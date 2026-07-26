@@ -9,7 +9,6 @@ const auth = @import("../auth/store.zig");
 const bash_mod = @import("../tools/bash_exec.zig");
 const codex = @import("../auth/codex.zig");
 const config_mod = @import("../config/config.zig");
-const diff_viewer = @import("diff_viewer.zig");
 const model_catalogue = @import("model_catalogue.zig");
 const model_cache = @import("model_cache.zig");
 const model_loader = @import("model_loader.zig");
@@ -26,7 +25,6 @@ const App = tui.App;
 const ModelCatalog = tui.App.ModelCatalog;
 const ModelScope = model_catalogue.ModelScope;
 const ModelSource = model_loader.ModelSource;
-const DiffCounts = tui.DiffCounts;
 pub fn openProviderPicker(self: *App) !void {
     self.mode = .provider_picker;
     self.pickers.provider.reset();
@@ -158,80 +156,6 @@ pub fn openProviderEntryForm(self: *App, handle: provider_picker.ProviderHandle)
     if (self.provider_api_keys.get(handle.id())) |existing| {
         self.provider_key_input.appendSlice(self.gpa, existing) catch {};
     }
-}
-
-pub fn openTimelineSelector(self: *App) !void {
-    if (self.thread.turn.isActive()) return error.InFlightTurn;
-    self.mode = .tree_picker;
-    self.clearInput();
-    try self.reloadTreeNodes();
-}
-
-/// Enter the full-screen diff viewer. Warm path: parse the cached diff
-/// instantly. Cold path: navigate immediately and show "Loading diff…" while
-/// a background refresh fetches it (never blocks on git).
-pub fn openDiffViewer(self: *App) !void {
-    if (self.liveRuntime() == null) return error.NoWorkingDirectory;
-    enterDiffMode(
-        self,
-    );
-
-    if (self.metrics.diff_cache()) |raw| {
-        var state = try diff_viewer.fromRaw(self.gpa, raw);
-        if (state.isEmpty()) {
-            state.deinit(self.gpa);
-            self.mode = .normal;
-            _ = try self.thread.transcript.append(self.gpa, .agent, "agent", "No changes to review.");
-            return;
-        }
-        self.diff.deinit(self.gpa);
-        self.diff = state;
-        return;
-    }
-
-    // Cold start: show the loading state and kick (or ride) a refresh.
-    self.diff.deinit(self.gpa);
-    self.diff = .{};
-    if (self.metrics.diff_refresh_future() == null) try self.scheduleDiffRefresh();
-}
-
-pub fn enterDiffMode(self: *App) void {
-    self.mode = .diff_viewer;
-    // The diff viewer never draws the transcript, so the black-hole visibility
-    // (recomputed only there) would stay stuck true and drive a pointless
-    // continuous redraw/tick loop. Park it off while in the viewer.
-    self.metrics.blackhole_visible = false;
-    self.clearInput();
-    self.clearPaletteInput();
-    self.inputs.comment.clearRetainingCapacity();
-}
-
-pub fn reportDiffError(self: *App, err: anyerror) !void {
-    const message = try std.fmt.allocPrint(self.gpa, "Couldn't open diff: {s}", .{@errorName(err)});
-    defer self.gpa.free(message);
-    _ = try self.thread.transcript.append(self.gpa, .agent, "agent", message);
-    self.mode = .normal;
-    self.clearInput();
-    self.clearPaletteInput();
-}
-
-/// Leave the diff viewer. When `send` is set, composed review comments (if
-/// any) are stuffed into the main input so the caller can run them through
-/// the normal submit path; an Esc-style exit discards them. Returns true when
-/// there is text queued to submit.
-pub fn closeDiffViewer(self: *App, send: bool) !bool {
-    const composed = if (send) try self.diff.composeMessage(self.gpa) else null;
-    self.diff.deinit(self.gpa);
-    self.mode = .normal;
-    self.clearInput();
-    self.clearPaletteInput();
-    self.inputs.comment.clearRetainingCapacity();
-    if (composed) |message| {
-        defer self.gpa.free(message);
-        try self.inputs.input.insertSliceAtCursor(message);
-        return true;
-    }
-    return false;
 }
 
 pub fn openModelPicker(self: *App) !void {

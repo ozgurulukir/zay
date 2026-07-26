@@ -243,3 +243,79 @@ fn populateDiffFromCache(app: *App) !void {
     app.diff.deinit(app.gpa);
     app.diff = state;
 }
+
+// ---------------------------------------------------------------------------
+// Viewer navigation (moved from provider_model.zig)
+// ---------------------------------------------------------------------------
+
+pub fn openTimelineSelector(app: *App) !void {
+    if (app.thread.turn.isActive()) return error.InFlightTurn;
+    app.mode = .tree_picker;
+    app.clearInput();
+    try app.reloadTreeNodes();
+}
+
+/// Enter the full-screen diff viewer. Warm path: parse the cached diff
+/// instantly. Cold path: navigate immediately and show "Loading diff…" while
+/// a background refresh fetches it (never blocks on git).
+pub fn openDiffViewer(app: *App) !void {
+    if (app.liveRuntime() == null) return error.NoWorkingDirectory;
+    enterDiffMode(app);
+
+    if (app.metrics.diff_cache()) |raw| {
+        var state = try diff_viewer.fromRaw(app.gpa, raw);
+        if (state.isEmpty()) {
+            state.deinit(app.gpa);
+            app.mode = .normal;
+            _ = try app.thread.transcript.append(app.gpa, .agent, "agent", "No changes to review.");
+            return;
+        }
+        app.diff.deinit(app.gpa);
+        app.diff = state;
+        return;
+    }
+
+    // Cold start: show the loading state and kick (or ride) a refresh.
+    app.diff.deinit(app.gpa);
+    app.diff = .{};
+    if (app.metrics.diff_refresh_future() == null) try scheduleDiffRefresh(app);
+}
+
+pub fn enterDiffMode(app: *App) void {
+    app.mode = .diff_viewer;
+    // The diff viewer never draws the transcript, so the black-hole visibility
+    // (recomputed only there) would stay stuck true and drive a pointless
+    // continuous redraw/tick loop. Park it off while in the viewer.
+    app.metrics.blackhole_visible = false;
+    app.clearInput();
+    app.clearPaletteInput();
+    app.inputs.comment.clearRetainingCapacity();
+}
+
+pub fn reportDiffError(app: *App, err: anyerror) !void {
+    const message = try std.fmt.allocPrint(app.gpa, "Couldn't open diff: {s}", .{@errorName(err)});
+    defer app.gpa.free(message);
+    _ = try app.thread.transcript.append(app.gpa, .agent, "agent", message);
+    app.mode = .normal;
+    app.clearInput();
+    app.clearPaletteInput();
+}
+
+/// Leave the diff viewer. When `send` is set, composed review comments (if
+/// any) are stuffed into the main input so the caller can run them through
+/// the normal submit path; an Esc-style exit discards them. Returns true when
+/// there is text queued to submit.
+pub fn closeDiffViewer(app: *App, send: bool) !bool {
+    const composed = if (send) try app.diff.composeMessage(app.gpa) else null;
+    app.diff.deinit(app.gpa);
+    app.mode = .normal;
+    app.clearInput();
+    app.clearPaletteInput();
+    app.inputs.comment.clearRetainingCapacity();
+    if (composed) |message| {
+        defer app.gpa.free(message);
+        try app.inputs.input.insertSliceAtCursor(message);
+        return true;
+    }
+    return false;
+}
