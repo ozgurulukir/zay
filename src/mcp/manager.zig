@@ -98,15 +98,9 @@ pub const McpManager = struct {
     /// Extended sync: reconcile client list, then connect enabled servers.
     pub fn syncFromConfigEx(
         self: *McpManager,
-        gpa: std.mem.Allocator,
         io: std.Io,
         config: *const config_mod.Config,
-        home_dir: []const u8,
-        cwd: []const u8,
     ) void {
-        _ = gpa;
-        _ = home_dir;
-        _ = cwd;
         self.syncFromConfig(io, config) catch {};
         for (self.clients.items) |*c| {
             if (c.status() != .connecting) continue;

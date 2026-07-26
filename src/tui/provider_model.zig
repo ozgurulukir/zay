@@ -1200,7 +1200,7 @@ pub fn connectCodexClient(
     self.cancelLaneNaming(self.thread);
     const runtime = self.liveRuntime().?;
     // Actually connect MCP servers before collecting tool schemas.
-    self.mcp_manager.syncFromConfigEx(self.gpa, self.io, &self.cached_config, runtime.home_dir, runtime.cwd);
+    self.mcp_manager.syncFromConfigEx(self.io, &self.cached_config);
     const mcp_schemas = try self.mcp_manager.buildMcpToolSchemas(self.gpa);
     defer self.gpa.free(mcp_schemas);
     runtime.mcp_tools = mcp_schemas;
@@ -1219,7 +1219,7 @@ pub fn attachOpenAiCompatibleClient(
     self.cancelLaneNaming(self.thread);
     const runtime = self.liveRuntime().?;
     // Actually connect MCP servers before collecting tool schemas.
-    self.mcp_manager.syncFromConfigEx(self.gpa, self.io, &self.cached_config, runtime.home_dir, runtime.cwd);
+    self.mcp_manager.syncFromConfigEx(self.io, &self.cached_config);
     const mcp_schemas = try self.mcp_manager.buildMcpToolSchemas(self.gpa);
     defer self.gpa.free(mcp_schemas);
     runtime.mcp_tools = mcp_schemas;
@@ -1244,8 +1244,8 @@ pub fn injectMcpTools(self: *App) void {
 /// serializes its tool list at attach time, so MCP servers that connect
 /// afterwards must push their schemas in explicitly.
 pub fn refreshMcpTools(self: *App) void {
-    const runtime = self.liveRuntime() orelse return;
-    self.mcp_manager.syncFromConfigEx(self.gpa, self.io, &self.cached_config, runtime.home_dir, runtime.cwd);
+    if (self.liveRuntime() == null) return;
+    self.mcp_manager.syncFromConfigEx(self.io, &self.cached_config);
     injectMcpTools(self);
 }
 
