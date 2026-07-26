@@ -29,7 +29,7 @@ The session store (`sessions.sqlite`) records the active `model_provider` and `m
 1. **Builtin providers**: resolved by enum label (`openai`, `openrouter`, etc.)
 2. **Custom providers**: resolved by name from the `providers[]` config map, with `baseURL` pulled from the same entry
 
-This means custom providers (e.g., `"qwen-cloud"` pointing to a DashScope endpoint) round-trip correctly across restarts, and the `provider` field in `config.json` preserves the user-chosen name rather than the internal enum label.
+This means custom providers (e.g., `"qwen-cloud"` pointing to a DashScope endpoint) round-trip correctly across restarts: `defaultModel: "<provider-name>/<model-id>"` carries the user-chosen provider name as its prefix (there is no separate `provider` field in `config.json`), and the `providers[]` map supplies the `baseURL` for that name.
 
 ### Empty `base_url` resolution
 

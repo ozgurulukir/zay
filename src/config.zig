@@ -1895,6 +1895,20 @@ fn writeMcpServer(writer: *std.Io.Writer, server: McpServerConfig) !void {
         .sse => |t| {
             try writeKeyNoIndent(writer, "url", &wrote_any);
             try std.json.Stringify.value(t.url, .{}, writer);
+            // Headers are written back RAW (placeholder preserved) so a settings
+            // save never drops them nor leaks a resolved secret to disk. Mirrors
+            // the parser, which reads this same `headers` object.
+            if (t.headers.len > 0) {
+                try writeKeyNoIndent(writer, "headers", &wrote_any);
+                try writer.writeByte('{');
+                for (t.headers, 0..) |h, i| {
+                    if (i > 0) try writer.writeByte(',');
+                    try std.json.Stringify.value(h.name, .{}, writer);
+                    try writer.writeByte(':');
+                    try std.json.Stringify.value(h.value, .{}, writer);
+                }
+                try writer.writeByte('}');
+            }
         },
     }
     if (!server.enabled) {
@@ -2344,6 +2358,48 @@ test "serialize outputs semver version and camelCase 2-space indented JSON" {
     try std.testing.expect(std.mem.indexOf(u8, text, "  \"useResponsesEndpoint\": true") != null);
 }
 
+test "serialize writes sse headers raw and round-trips through parseFile" {
+    const gpa = std.testing.allocator;
+
+    var servers = try gpa.alloc(McpServerConfig, 1);
+    servers[0] = .{
+        .name = try gpa.dupe(u8, "context7"),
+        .enabled = true,
+        .transport = .{ .sse = .{
+            .url = try gpa.dupe(u8, "https://mcp.context7.com/mcp"),
+            .headers = try cloneHeaders(gpa, &[_]McpHeader{
+                .{ .name = @constCast("CONTEXT7_API_KEY"), .value = @constCast("{env:CONTEXT7_API_KEY}") },
+            }),
+        } },
+    };
+    var cfg: Config = .{ .mcp_servers = servers };
+    defer cfg.deinit(gpa);
+
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, cfg);
+    const text = buf.written();
+
+    // Headers are written back raw — placeholder preserved, never a resolved secret.
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"headers\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "{env:CONTEXT7_API_KEY}") != null);
+
+    // Round-trip: parse the serialized text and confirm the header survives a save.
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    var parsed = try parseFile(gpa, "<test>", text, &sink);
+    defer parsed.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), parsed.mcp_servers.len);
+    switch (parsed.mcp_servers[0].transport) {
+        .sse => |t| {
+            try std.testing.expectEqual(@as(usize, 1), t.headers.len);
+            try std.testing.expectEqualStrings("CONTEXT7_API_KEY", t.headers[0].name);
+            try std.testing.expectEqualStrings("{env:CONTEXT7_API_KEY}", t.headers[0].value);
+        },
+        .stdio => return error.Unexpected,
+    }
+}
+
 test "parseFile parses mcp_servers objects" {
     const gpa = std.testing.allocator;
     var sink: std.ArrayList(Diagnostic) = .empty;
@@ -2561,6 +2617,32 @@ test "expandMcpServer resolves {env:VAR} in url and headers, leaving the source 
     // The source keeps its placeholders (still safe to serialize).
     switch (raw.transport) {
         .sse => |t| try std.testing.expectEqualStrings("https://mcp.context7.com/mcp?key={env:NOVA_TEST_UNSET_MCP_VAR}", t.url),
+        .stdio => return error.Unexpected,
+    }
+}
+
+test "expandMcpServer resolves a SET {env:VAR} from the real environment" {
+    const gpa = std.testing.allocator;
+    // Read PATH through the same raw-environ path loadEnvMap uses, so the
+    // expected value matches what expandMcpServer sees. Exercises the SET-var
+    // path the unset-only test above never covers.
+    const env_slice = std.mem.span(std.c.environ);
+    var env_map = try std.process.Environ.createMap(.{ .block = .{ .slice = env_slice } }, gpa);
+    defer env_map.deinit();
+    const path = env_map.get("PATH") orelse return error.SkipZigTest;
+
+    var raw = try mcpServerFromUrl(gpa, "tavily", "https://x/mcp/?key={env:PATH}");
+    defer raw.deinit(gpa);
+
+    var expanded = try expandMcpServer(gpa, raw);
+    defer expanded.deinit(gpa);
+
+    switch (expanded.transport) {
+        .sse => |t| {
+            // Placeholder fully resolved to the real PATH value.
+            try std.testing.expect(std.mem.indexOf(u8, t.url, "{env:") == null);
+            try std.testing.expect(std.mem.indexOf(u8, t.url, path) != null);
+        },
         .stdio => return error.Unexpected,
     }
 }

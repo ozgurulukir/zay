@@ -208,6 +208,7 @@ try params.append(self.gpa, '}');
    ```
 
    Testlerde `defer scoped.deinit()` standardı.
+
 2. `process != null` ise otomatik kill eden bir `childWatcher` thread
    veya signal handler ekle — orphan process'leri engelle.
 3. `mcp.client.deinit` çağrılarını 17 → 2-3'e indir (manager üzerinden

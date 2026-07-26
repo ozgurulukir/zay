@@ -172,6 +172,7 @@ const output = try writer.toOwnedSlice();
 ## Verifying
 
 Run:
+
 - `zig fmt`
 - `zig build test`
 

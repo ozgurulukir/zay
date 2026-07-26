@@ -62,14 +62,14 @@ MCP servers are configured inside global `~/.config/nova/config.json` or project
 
 ### Server Configuration Options
 
-| Field     | Type       | Description                                                                                  |
-| --------- | ---------- | -------------------------------------------------------------------------------------------- |
-| `command` | `string`   | Binary / CLI command to execute for stdio servers (e.g. `npx`, `python`).                    |
-| `args`    | `string[]` | Command line arguments passed to the stdio child process.                                    |
-| `url`     | `string`   | Endpoint URL for remote Streamable HTTP servers (e.g. `https://mcp.tavily.com/mcp/`).        |
-| `headers` | `object`   | Extra HTTP headers sent with every remote request (e.g. API keys for header-auth servers).   |
-| `type`    | `string`   | Optional transport discriminator (`"stdio"`/`"remote"`) for compatibility; Nova ignores it.  |
-| `enabled` | `boolean`  | `true` (default) to connect and expose tools; `false` to disable.                            |
+| Field     | Type       | Description                                                                                 |
+| --------- | ---------- | ------------------------------------------------------------------------------------------- |
+| `command` | `string`   | Binary / CLI command to execute for stdio servers (e.g. `npx`, `python`).                   |
+| `args`    | `string[]` | Command line arguments passed to the stdio child process.                                   |
+| `url`     | `string`   | Endpoint URL for remote Streamable HTTP servers (e.g. `https://mcp.tavily.com/mcp/`).       |
+| `headers` | `object`   | Extra HTTP headers sent with every remote request (e.g. API keys for header-auth servers).  |
+| `type`    | `string`   | Optional transport discriminator (`"stdio"`/`"remote"`) for compatibility; Nova ignores it. |
+| `enabled` | `boolean`  | `true` (default) to connect and expose tools; `false` to disable.                           |
 
 ### Environment variable expansion (`{env:VAR}`)
 

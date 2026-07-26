@@ -79,7 +79,15 @@
       "properties": {
         "reasoningEffort": {
           "type": "string",
-          "enum": ["default", "minimal", "low", "none", "medium", "high", "xhigh"],
+          "enum": [
+            "default",
+            "minimal",
+            "low",
+            "none",
+            "medium",
+            "high",
+            "xhigh"
+          ],
           "description": "Reasoning effort level for this model. 'default' sends no reasoning parameter (model decides); 'none' disables thinking explicitly."
         },
         "contextWindow": {
@@ -96,7 +104,15 @@
           "type": "array",
           "items": {
             "type": "string",
-            "enum": ["default", "minimal", "low", "none", "medium", "high", "xhigh"]
+            "enum": [
+              "default",
+              "minimal",
+              "low",
+              "none",
+              "medium",
+              "high",
+              "xhigh"
+            ]
           },
           "description": "Reasoning efforts this model supports. The TUI model picker filters its reasoning cycle to this list. Empty or absent means all efforts are available."
         }
