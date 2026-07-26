@@ -1054,12 +1054,6 @@ pub fn run(
     // picker silently skipped (and then cached) every keyed provider.
     provider_model.refreshProviderApiKeys(&app) catch {};
 
-    // Connect configured MCP servers and inject their tool schemas into the
-    // live client. The client was attached during session init (before the MCP
-    // manager existed) with an empty tool set, so without this the model never
-    // sees `mcp__<server>__<tool>` definitions on a cold start.
-    provider_model.refreshMcpTools(&app);
-
     // Rebuild transcript from agent when resuming a session (the agent was
     // rehydrated with messages in runtime.zig initSession). For a new session
     // the rebuild is a no-op — agent only has system messages, which are
@@ -1076,15 +1070,17 @@ pub fn run(
     _ = app.refreshDiffCounts() catch false;
 
     var root: RootWidget = .{ .app = &app };
+    root.mcp_connect_pending = true;
     try fw_app.run(root.widget(), .{});
 }
 
-pub const RootWidget = struct {
-    app: *App,
-    spinner_tick_accum: u32 = 0,
-    blackhole_tick_accum: u32 = 0,
-    diff_tick_accum: u32 = 0,
-    diff_refresh_pending: bool = false,
+    pub const RootWidget = struct {
+        app: *App,
+        spinner_tick_accum: u32 = 0,
+        blackhole_tick_accum: u32 = 0,
+        diff_tick_accum: u32 = 0,
+        diff_refresh_pending: bool = false,
+        mcp_connect_pending: bool = false,
 
     pub fn widget(self: *RootWidget) vxfw.Widget {
         return .{

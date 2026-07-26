@@ -33,7 +33,7 @@ This means custom providers (e.g., `"qwen-cloud"` pointing to a DashScope endpoi
 
 ### Empty `base_url` resolution
 
-When `model_selection.base_url` is synthesized from session metadata or legacy fields, it may be an empty string. Two guards prevent this from crashing the model catalogue loader:
+When `model_selection` is synthesized from session metadata or legacy fields, its `base_url` may be an empty string. Two guards prevent this from crashing the model catalogue loader:
 
 1. `collectConfiguredProviders` resolves an empty `base_url` through `provider.defaultBaseUrl()` before appending to the catalog job.
 2. `loadConfigured` falls back to `provider.defaultBaseUrl()` if `configured.base_url` is empty, skipping the provider entirely if no default exists.
@@ -47,7 +47,7 @@ Dynamic providers selected from models.dev store their API key in `auth.json` un
 - `dynamic_provider_name`: human-readable display name (e.g., `"StepFun AI"`), used by the status bar
 - `dynamic_provider_id`: the auth.json key (e.g., `"stepfun-ai"`), used for session resume and API key lookup
 
-`updateCachedProviderConnection` mirrors `dynamic_provider_id` into `model_selection.provider_name` on selection, so `tryAttachOpenAiCompatibleFromConfig` looks up the correct auth.json entry on resume. `compatibleApiKey` also uses `dynamic_provider_id` directly for the lookup, avoiding the fragile stash fallback.
+`updateCachedModelSelection` rebuilds `model_selection` as the `.custom` variant with `provider_name` set to `dynamic_provider_id` on selection, so `tryAttachOpenAiCompatibleFromConfig` looks up the correct auth.json entry on resume. `compatibleApiKey` also uses `dynamic_provider_id` directly for the lookup, avoiding the fragile stash fallback.
 
 ## Parallel
 
@@ -69,7 +69,7 @@ Key types following this pattern:
 - `transcript.Message` — `union(enum)` with 10 variants + `Basic`/`ToolView` payload structs
 - `config.McpServerConfig.transport` — `union(enum) { stdio, sse }`
 - `mcp.McpClient` — `transport` + `lifecycle` unions for static config and runtime state
-- `config.Config.model_selection: ?ModelSelection` — typed view replacing 9 loose optional fields
+- `config.Config.model_selection: ?ModelSelection` — `union(enum) { builtin, custom }` typed view replacing 9 loose optional fields; builtin carries `Provider` enum, custom carries `provider_name`/`base_url`/`api_key`
 - `agent.Listener(Ctx)` / `executor.ToolCallObserver(Ctx)` — generic typed callbacks replacing `*anyopaque` vtables
 
 See `AGENTS.md` "Type System Discipline pattern" for the full list and construction patterns.

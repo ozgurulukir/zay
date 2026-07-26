@@ -241,35 +241,41 @@ pub const AgentRuntime = struct {
                     try target.applyFromConfig(session_config);
                 } else {
                     const is_builtin = std.meta.stringToEnum(config_mod.Provider, mp) != null;
-                    if (is_builtin) {
-                        session_config.model_selection = .{
-                            .builtin = .{
-                                .provider = provider_enum,
-                                .provider_name = @constCast(mp),
-                                .model = .{
-                                    .id = summary.model_id orelse "",
-                                    .reasoning = .unset,
+                    if (summary.model_id) |mid| {
+                        if (is_builtin) {
+                            session_config.model_selection = .{
+                                .builtin = .{
+                                    .provider = provider_enum,
+                                    .provider_name = @constCast(mp),
+                                    .model = .{
+                                        .id = mid,
+                                        .reasoning = .unset,
+                                    },
+                                    .use_responses_endpoint = false,
+                                    .bash_classifier_url = null,
                                 },
-                                .use_responses_endpoint = false,
-                                .bash_classifier_url = null,
-                            },
-                        };
+                            };
+                        } else {
+                            session_config.model_selection = .{
+                                .custom = .{
+                                    .provider_name = @constCast(mp),
+                                    .base_url = @constCast(resolved_base_url),
+                                    .api_key = "",
+                                    .model = .{
+                                        .id = mid,
+                                        .reasoning = .unset,
+                                    },
+                                    .use_responses_endpoint = false,
+                                    .bash_classifier_url = null,
+                                },
+                            };
+                        }
+                        try target.applyFromConfig(session_config);
                     } else {
-                        session_config.model_selection = .{
-                            .custom = .{
-                                .provider_name = @constCast(mp),
-                                .base_url = @constCast(resolved_base_url),
-                                .api_key = "",
-                                .model = .{
-                                    .id = summary.model_id orelse "",
-                                    .reasoning = .unset,
-                                },
-                                .use_responses_endpoint = false,
-                                .bash_classifier_url = null,
-                            },
-                        };
+                        // No model_id saved in session — fall back to config's
+                        // default model rather than synthesizing an empty one.
+                        try target.applyFromConfig(config);
                     }
-                    try target.applyFromConfig(session_config);
                 }
             } else {
                 // No model saved in session, use config as-is

@@ -98,6 +98,12 @@ pub fn deinitApp(self: *App) void {
 /// lanes naming, background completion, spinner animation, and the black-hole
 /// intro. Re-schedules itself when work is still pending.
 pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
+    // Lazy MCP connect: trigger once after the UI is responsive so startup
+    // doesn't block on subprocess spawn / handshake / tool discovery.
+    if (root.mcp_connect_pending) {
+        root.mcp_connect_pending = false;
+        provider_model.refreshMcpTools(root.app);
+    }
     var visible_change = try drainAgentEvents(root, ctx);
     if (try provider_model.drainModelLoad(root.app)) visible_change = true;
     // Re-discover MCP tools when a server pushed `notifications/tools/list_changed`
