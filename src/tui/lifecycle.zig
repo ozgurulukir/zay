@@ -100,6 +100,9 @@ pub fn deinitApp(self: *App) void {
 pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     var visible_change = try drainAgentEvents(root, ctx);
     if (try provider_model.drainModelLoad(root.app)) visible_change = true;
+    // Re-discover MCP tools when a server pushed `notifications/tools/list_changed`
+    // mid-request — the client buffered the flag and we poll it here.
+    if (provider_model.drainMcpNotifications(root.app)) visible_change = true;
     if (try root.app.drainDiffRefresh()) visible_change = true;
     // Lanes whose branch name landed get renamed in place.
     if (try root.app.drainLaneNaming()) visible_change = true;

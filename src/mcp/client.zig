@@ -122,6 +122,12 @@ pub const McpClient = struct {
     /// App should re-discover tools. False otherwise (including when the
     /// server advertises tools but not the listChanged flag).
     server_supports_tools_list_changed: bool = false,
+    /// Set by `handleNotification` when a `notifications/tools/list_changed`
+    /// arrives mid-request. The App polls `pollToolsRefresh` on each tick and,
+    /// if true, calls `refreshMcpTools` to re-discover the tool list. This
+    /// avoids re-entering `listTools` synchronously from inside a JSON-RPC
+    /// read loop (which would deadlock the request mutex).
+    pending_tools_refresh: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, name: []const u8, command: ?[]const u8, args: []const []const u8, url: ?[]const u8) !McpClient {
         // Legacy init: if url is set, build an sse client; otherwise stdio.
@@ -248,6 +254,37 @@ pub const McpClient = struct {
         self.lifecycle = .{ .failed = .{ .reason = reason } };
     }
 
+    /// Route a server-initiated notification captured during a request read.
+    /// Only `notifications/tools/list_changed` is consumed (sets
+    /// `pending_tools_refresh`); other notifications (progress, logging,
+    /// resources/list_changed, prompts/list_changed) are accepted but ignored
+    /// — Nova doesn't expose those primitives yet. `payload` is unused for
+    /// the list_changed path (the spec carries no params), but kept on the
+    /// signature for future notifications that do carry params.
+    fn handleNotification(self: *McpClient, method: []const u8, payload: []const u8) void {
+        _ = payload;
+        if (std.mem.eql(u8, method, "notifications/tools/list_changed")) {
+            // Honor the capability flag — a server that didn't advertise
+            // listChanged shouldn't be sending these, but we still set the
+            // flag: re-discovery is idempotent and harmless.
+            self.pending_tools_refresh = true;
+            return;
+        }
+        // Silently accept other notifications — they're informational.
+    }
+
+    /// True when a `notifications/tools/list_changed` arrived since the last
+    /// check. The App calls this on each tick and, when true, calls
+    /// `refreshMcpTools` (which re-runs `tools/list` and reinjects schemas).
+    /// The flag is cleared atomically with the read.
+    pub fn pollToolsRefresh(self: *McpClient) bool {
+        if (self.pending_tools_refresh) {
+            self.pending_tools_refresh = false;
+            return true;
+        }
+        return false;
+    }
+
     /// Spawn the MCP server subprocess (stdio transport).
     /// Sets up stdin/stdout pipes for JSON-RPC communication.
     pub fn startStdio(self: *McpClient, io: std.Io) !void {
@@ -345,7 +382,10 @@ pub const McpClient = struct {
 
     /// stdio transport: write the request line to the child's stdin and read
     /// one newline-delimited response line from stdout. Blocks up to
-    /// `read_timeout_ms`.
+    /// `read_timeout_ms`. The server may push notifications (method, no id)
+    /// between the request and its response — those are routed to
+    /// `handleNotification` and the read continues until the matching
+    /// response (id present) arrives.
     fn sendRequestStdio(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) ![]u8 {
         const child = if (self.lifecycle == .stdio) &self.lifecycle.stdio.process else return error.NotConnected;
         const stdin_file = child.stdin orelse return error.NotConnected;
@@ -363,35 +403,54 @@ pub const McpClient = struct {
 
         try stdin_file.writeStreamingAll(io, request);
 
-        // Wait for data on stdout with a timeout to prevent infinite hangs.
-        var poll_fds: [1]std.posix.pollfd = .{
-            .{ .fd = stdout_file.handle, .events = std.posix.POLL.IN, .revents = 0 },
-        };
-        const ready = std.posix.poll(&poll_fds, @intCast(self.read_timeout_ms)) catch return error.ReadFailed;
-        if (ready == 0) return error.Timeout;
-        // Server exited with no data — only crash when POLLIN is NOT set.
-        // When both POLLIN and HUP are set, the pipe has buffered data from
-        // a just-exited server that we still need to read.
-        if (poll_fds[0].revents & std.posix.POLL.IN == 0 and
-            poll_fds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0)
-        {
-            return error.McpServerCrashed;
-        }
-
-        // Read one line from stdout (newline-delimited JSON-RPC).
-        // line_writer grows dynamically — response size is unbounded.
         var buf: [64 * 1024]u8 = undefined;
         var reader = stdout_file.reader(io, &buf);
-        var line_writer: std.Io.Writer.Allocating = .init(self.gpa);
-        defer line_writer.deinit();
-        _ = reader.interface.streamDelimiterEnding(&line_writer.writer, '\n') catch |err| switch (err) {
-            // Server closed the pipe mid-response
-            error.ReadFailed => return error.McpServerCrashed,
-            error.WriteFailed => return error.OutOfMemory,
-        };
-        // Consume the delimiter
-        _ = reader.interface.take(1) catch {};
-        return line_writer.toOwnedSlice();
+
+        // Read newline-delimited lines until the response with our `id`
+        // arrives. Server-initiated notifications (method, no id) are
+        // routed to handleNotification and we keep reading.
+        while (true) {
+            // Wait for data on stdout with a timeout to prevent infinite hangs.
+            var poll_fds: [1]std.posix.pollfd = .{
+                .{ .fd = stdout_file.handle, .events = std.posix.POLL.IN, .revents = 0 },
+            };
+            const ready = std.posix.poll(&poll_fds, @intCast(self.read_timeout_ms)) catch return error.ReadFailed;
+            if (ready == 0) return error.Timeout;
+            // Server exited with no data — only crash when POLLIN is NOT set.
+            // When both POLLIN and HUP are set, the pipe has buffered data from
+            // a just-exited server that we still need to read.
+            if (poll_fds[0].revents & std.posix.POLL.IN == 0 and
+                poll_fds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0)
+            {
+                return error.McpServerCrashed;
+            }
+
+            // Read one line from stdout (newline-delimited JSON-RPC).
+            var line_writer: std.Io.Writer.Allocating = .init(self.gpa);
+            errdefer line_writer.deinit();
+            _ = reader.interface.streamDelimiterEnding(&line_writer.writer, '\n') catch |err| switch (err) {
+                error.ReadFailed => return error.McpServerCrashed,
+                error.WriteFailed => return error.OutOfMemory,
+            };
+            _ = reader.interface.take(1) catch {};
+            const line = try line_writer.toOwnedSlice();
+            errdefer self.gpa.free(line);
+
+            // Classify: notification (method, no id) → handle + continue;
+            // anything else → return for the caller to parse.
+            const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, line, .{}) catch return line;
+            defer parsed.deinit();
+            if (parsed.value != .object) return line;
+            const obj = parsed.value.object;
+            if (obj.get("method") != null and obj.get("id") == null) {
+                // Server-initiated notification — route and keep reading.
+                const method_str = if (obj.get("method").? == .string) obj.get("method").?.string else "";
+                self.handleNotification(method_str, line);
+                self.gpa.free(line);
+                continue;
+            }
+            return line;
+        }
     }
 
     /// Send a JSON-RPC notification (no response expected). Dispatches on the
@@ -461,7 +520,16 @@ pub const McpClient = struct {
         if (is_sse) {
             var transfer_buffer: [http_transfer_buffer_bytes]u8 = undefined;
             const reader = response.reader(&transfer_buffer);
-            return try transport.readSseResponse(self.gpa, reader, id);
+            var notifications: std.ArrayList(transport.Notification) = .empty;
+            defer {
+                for (notifications.items) |*n| n.deinit(self.gpa);
+                notifications.deinit(self.gpa);
+            }
+            const response_body = try transport.readSseResponse(self.gpa, reader, id, &notifications);
+            // Route accumulated server notifications — they may set
+            // pending_tools_refresh, which the App polls on the next tick.
+            for (notifications.items) |n| self.handleNotification(n.method, n.payload);
+            return response_body;
         }
         return try readJsonBody(self.gpa, &response);
     }
@@ -1240,4 +1308,65 @@ test "captureSessionId + isEventStream read the response head" {
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
     );
     try std.testing.expect(isEventStream(sse_head));
+}
+
+// ---------------------------------------------------------------------------
+// Notification handling tests
+// ---------------------------------------------------------------------------
+
+test "handleNotification sets pending_tools_refresh for tools/list_changed" {
+    const gpa = std.testing.allocator;
+    var client = try McpClient.init(gpa, "x", "echo", &.{}, null);
+    defer client.deinit(std.testing.io);
+
+    // Initially no pending refresh.
+    try std.testing.expectEqual(false, client.pollToolsRefresh());
+
+    // Simulate a server-initiated tools/list_changed notification.
+    client.handleNotification("notifications/tools/list_changed", "");
+    try std.testing.expect(client.pollToolsRefresh());
+
+    // The flag clears on read — a second poll returns false.
+    try std.testing.expectEqual(false, client.pollToolsRefresh());
+
+    // Other notifications do NOT set the flag.
+    client.handleNotification("notifications/progress", "{}");
+    client.handleNotification("notifications/resources/list_changed", "");
+    try std.testing.expectEqual(false, client.pollToolsRefresh());
+}
+
+test "sendRequestStdio routes interleaved notifications to handleNotification" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Mock MCP server that advertises tools.listChanged. For the tools/list
+    // request it emits a notification BEFORE the response — exercises the
+    // stdio read loop's notification routing.
+    var client = try McpClient.init(gpa, "notif-server", "bash", &.{
+        "-c",
+        \\read line
+        \\echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"mock","version":"1.0"},"capabilities":{"tools":{"listChanged":true}}}}'
+        \\read line
+        \\read line
+        \\echo '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}'
+        \\echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"greet","description":"Say hello","inputSchema":{"type":"object","properties":{}}}]}}'
+    }, null);
+    defer client.deinit(io);
+
+    try client.startStdio(io);
+    defer client.stop(io);
+
+    // Handshake records the listChanged capability.
+    try client.initialize(io);
+    try std.testing.expect(client.server_supports_tools_list_changed);
+
+    // tools/list arrives after a notification — the loop routes the
+    // notification and keeps reading until the response.
+    try client.listTools(io);
+    try std.testing.expectEqual(@as(usize, 1), client.tools.items.len);
+    try std.testing.expectEqualStrings("mcp__notif-server__greet", client.tools.items[0].full_name);
+
+    // The interleaved notification was buffered — poll drains it.
+    try std.testing.expect(client.pollToolsRefresh());
+    try std.testing.expectEqual(false, client.pollToolsRefresh());
 }

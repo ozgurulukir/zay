@@ -1249,6 +1249,26 @@ pub fn refreshMcpTools(self: *App) void {
     injectMcpTools(self);
 }
 
+/// Poll each connected MCP client for a pending `tools/list_changed` flag set
+/// by a server-initiated notification mid-request. When any client has it,
+/// re-run `tools/list` for that client and re-inject schemas into the live AI
+/// client. Called from the TUI tick (`lifecycle.handleTick`). Idempotent —
+/// returns false (no-op) when no client has a pending flag.
+pub fn drainMcpNotifications(self: *App) bool {
+    var any_pending = false;
+    for (self.mcp_manager.clients.items) |*c| {
+        if (c.status() != .connected) continue;
+        if (c.pollToolsRefresh()) {
+            any_pending = true;
+            c.listTools(self.io) catch {
+                c.setError("list_changed re-discovery failed", .{});
+            };
+        }
+    }
+    if (any_pending) injectMcpTools(self);
+    return any_pending;
+}
+
 /// Add a remote (Streamable HTTP) MCP server from a URL typed in the overlay's
 /// add-form. The server is appended to the live `cached_config` and connected
 /// immediately via `refreshMcpTools`. Runtime-only: it is NOT written to

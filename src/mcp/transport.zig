@@ -30,6 +30,25 @@ pub const JsonRpcError = struct {
     message: []const u8,
 };
 
+/// A server-initiated notification captured while waiting for a response.
+/// Owned; the caller frees `method` (and `payload` if non-empty). Per the MCP
+/// spec, a notification has a `method` and no `id` — `notifications/*` events
+/// (e.g. `notifications/tools/list_changed`, `notifications/progress`) flow
+/// here. We only consume `tools/list_changed` for now; others are accepted
+/// and forwarded so the App can ignore them.
+pub const Notification = struct {
+    method: []u8,
+    /// The full JSON-RPC message payload (the SSE `data:` body). Empty when
+    /// the notification carries no params (the common case for list_changed).
+    payload: []u8,
+
+    pub fn deinit(self: *Notification, gpa: std.mem.Allocator) void {
+        gpa.free(self.method);
+        gpa.free(self.payload);
+        self.* = undefined;
+    }
+};
+
 /// Format a JSON-RPC 2.0 Request frame into an allocated string slice.
 pub fn formatRequest(gpa: std.mem.Allocator, id: i64, method: []const u8, params_json: ?[]const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -143,12 +162,36 @@ fn isResponseForId(gpa: std.mem.Allocator, payload: []const u8, request_id: i64)
     return id_val.integer == request_id;
 }
 
+/// If `payload` is a server-initiated notification (has `method`, no `id`),
+/// return an owned `Notification` with the method string and the raw payload.
+/// Returns null for responses, requests with an id, or unparseable input.
+/// Caller owns the result and must `deinit` it.
+fn extractNotification(gpa: std.mem.Allocator, payload: []const u8) ?Notification {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, payload, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const obj = parsed.value.object;
+    const method_val = obj.get("method") orelse return null;
+    if (method_val != .string) return null;
+    if (obj.get("id") != null) return null;
+    const method = gpa.dupe(u8, method_val.string) catch return null;
+    errdefer gpa.free(method);
+    const payload_dup = gpa.dupe(u8, payload) catch return null;
+    return .{ .method = method, .payload = payload_dup };
+}
+
 /// Read MCP SSE events from `reader` until a JSON-RPC response whose `id`
 /// equals `request_id` arrives; return that response's raw JSON (owned, caller
 /// frees). Events of type other than `message` (or the default empty type) are
-/// skipped, as are server-initiated requests/notifications — Nova drives MCP
-/// request/response only. Bounded by `sse_event_max` / `sse_data_bytes_max`.
-pub fn readSseResponse(gpa: std.mem.Allocator, reader: *std.Io.Reader, request_id: i64) ![]u8 {
+/// skipped. Server-initiated notifications (method, no id) are appended to
+/// `notifications` (owned, caller frees each entry) so the caller can route
+/// them. Bounded by `sse_event_max` / `sse_data_bytes_max`.
+pub fn readSseResponse(
+    gpa: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    request_id: i64,
+    notifications: *std.ArrayList(Notification),
+) ![]u8 {
     var event_type: std.ArrayList(u8) = .empty;
     defer event_type.deinit(gpa);
     var data: std.ArrayList(u8) = .empty;
@@ -173,6 +216,11 @@ pub fn readSseResponse(gpa: std.mem.Allocator, reader: *std.Io.Reader, request_i
                 if (is_message and data.items.len > 0) {
                     if (isResponseForId(gpa, data.items, request_id)) {
                         return try gpa.dupe(u8, data.items);
+                    }
+                    // Not our response — record it as a notification if it
+                    // has a method and no id; otherwise drop silently.
+                    if (extractNotification(gpa, data.items)) |n| {
+                        try notifications.append(gpa, n);
                     }
                 }
                 event_type.clearRetainingCapacity();
@@ -392,16 +440,25 @@ test "readSseResponse returns the matching response from a single message event"
         "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n" ++
         "\n";
     var reader: std.Io.Reader = .fixed(stream);
-    const response = try readSseResponse(gpa, &reader, 7);
+    var notifications: std.ArrayList(Notification) = .empty;
+    defer {
+        for (notifications.items) |*n| n.deinit(gpa);
+        notifications.deinit(gpa);
+    }
+    const response = try readSseResponse(gpa, &reader, 7, &notifications);
     defer gpa.free(response);
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}", response);
+    try std.testing.expectEqual(@as(usize, 0), notifications.items.len);
 }
 
-test "readSseResponse skips notifications and other events, finds the response" {
+test "readSseResponse accumulates notifications while searching for the response" {
     const gpa = std.testing.allocator;
     const stream =
         "event: message\n" ++
         "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n" ++
+        "\n" ++
+        "event: message\n" ++
+        "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n" ++
         "\n" ++
         "event: ping\n" ++
         "data: {}\n" ++
@@ -410,9 +467,18 @@ test "readSseResponse skips notifications and other events, finds the response" 
         "data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[]}}\n" ++
         "\n";
     var reader: std.Io.Reader = .fixed(stream);
-    const response = try readSseResponse(gpa, &reader, 3);
+    var notifications: std.ArrayList(Notification) = .empty;
+    defer {
+        for (notifications.items) |*n| n.deinit(gpa);
+        notifications.deinit(gpa);
+    }
+    const response = try readSseResponse(gpa, &reader, 3, &notifications);
     defer gpa.free(response);
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[]}}", response);
+    // progress + tools/list_changed captured; the `ping` event is dropped.
+    try std.testing.expectEqual(@as(usize, 2), notifications.items.len);
+    try std.testing.expectEqualStrings("notifications/progress", notifications.items[0].method);
+    try std.testing.expectEqualStrings("notifications/tools/list_changed", notifications.items[1].method);
 }
 
 test "readSseResponse joins multi-line data fields" {
@@ -423,7 +489,12 @@ test "readSseResponse joins multi-line data fields" {
         "data: \"result\":{}}\n" ++
         "\n";
     var reader: std.Io.Reader = .fixed(stream);
-    const response = try readSseResponse(gpa, &reader, 1);
+    var notifications: std.ArrayList(Notification) = .empty;
+    defer {
+        for (notifications.items) |*n| n.deinit(gpa);
+        notifications.deinit(gpa);
+    }
+    const response = try readSseResponse(gpa, &reader, 1, &notifications);
     defer gpa.free(response);
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\n\"result\":{}}", response);
 }
@@ -435,14 +506,24 @@ test "readSseResponse errors when the stream ends before the response" {
         "data: {\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}\n" ++
         "\n";
     var reader: std.Io.Reader = .fixed(stream);
-    try std.testing.expectError(error.McpStreamEndedEarly, readSseResponse(gpa, &reader, 1));
+    var notifications: std.ArrayList(Notification) = .empty;
+    defer {
+        for (notifications.items) |*n| n.deinit(gpa);
+        notifications.deinit(gpa);
+    }
+    try std.testing.expectError(error.McpStreamEndedEarly, readSseResponse(gpa, &reader, 1, &notifications));
 }
 
 test "readSseResponse treats a default (no event:) event as a message" {
     const gpa = std.testing.allocator;
     const stream = "data: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{}}\n\n";
     var reader: std.Io.Reader = .fixed(stream);
-    const response = try readSseResponse(gpa, &reader, 5);
+    var notifications: std.ArrayList(Notification) = .empty;
+    defer {
+        for (notifications.items) |*n| n.deinit(gpa);
+        notifications.deinit(gpa);
+    }
+    const response = try readSseResponse(gpa, &reader, 5, &notifications);
     defer gpa.free(response);
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{}}", response);
 }
