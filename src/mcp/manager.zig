@@ -191,17 +191,19 @@ pub const McpManager = struct {
     }
 
     /// Reconnect a specific client by index: stop, clear tools, and re-discover.
+    /// `markConnecting` is required before `connectAndDiscover` so the SSE
+    /// transport's lifecycle is in `.connecting` — `stop` leaves it `.disabled`,
+    /// and `initialize` only flips `.stdio`/`.sse` variants to `.ready`, not the
+    /// `.disabled` arm. Without this, a reconnected SSE server stays
+    /// "connecting" in the TUI despite actually being live.
     pub fn reconnectClient(self: *McpManager, io: std.Io, index: usize) void {
         if (index >= self.clients.items.len) return;
         const client = &self.clients.items[index];
         client.stop(io);
         for (client.tools.items) |*tool| tool.deinit(self.gpa);
         client.tools.clearRetainingCapacity();
-        if (client.lifecycle == .failed) {
-            client.gpa.free(client.lifecycle.failed.reason);
-            client.lifecycle = .disabled;
-        }
         client.latency_ms = 0;
+        client.markConnecting();
         connectAndDiscover(io, client) catch {
             client.setError("reconnect failed", .{});
         };
@@ -209,17 +211,14 @@ pub const McpManager = struct {
 
     /// Disconnect a specific client: stop process, clear tools, set disabled.
     /// The client stays in the list and can be reconnected later via
-    /// reconnectClient or by toggling in the TUI.
+    /// `reconnectClient` or by toggling in the TUI. `stop` already sets
+    /// lifecycle to `.disabled`, so no explicit lifecycle mutation here.
     pub fn disconnectClient(self: *McpManager, io: std.Io, index: usize) void {
         if (index >= self.clients.items.len) return;
         const client = &self.clients.items[index];
         client.stop(io);
         for (client.tools.items) |*tool| tool.deinit(self.gpa);
         client.tools.clearRetainingCapacity();
-        if (client.lifecycle == .failed) {
-            client.gpa.free(client.lifecycle.failed.reason);
-            client.lifecycle = .disabled;
-        }
         client.latency_ms = 0;
     }
 
