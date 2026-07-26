@@ -991,6 +991,31 @@ test "openresponses tools json is an array" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"strict\":true") != null);
 }
 
+test "openresponses strict schema includes nullable union types and top-level additionalProperties:false" {
+    const gpa = std.testing.allocator;
+    const tools = [_]tools_common.Tool{
+        .{
+            .name = "demo",
+            .description = "Demo tool",
+            .schema = .{
+                .properties = &.{
+                    .{ .name = "id", .kind = .string, .description = "ID", .required = true, .nullable = false },
+                    .{ .name = "tag", .kind = .string, .description = "Tag", .required = false, .nullable = true },
+                },
+            },
+            .run = undefined,
+            .display = undefined,
+        },
+    };
+    const json = try buildAllToolsJson(gpa, &tools, &.{});
+    defer gpa.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"strict\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"additionalProperties\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":{\"type\":\"string\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"tag\":{\"type\":[\"string\",\"null\"]") != null);
+}
+
 test "openresponses emits final item text when no delta arrived" {
     const gpa = std.testing.allocator;
     var state: StreamState = .{};

@@ -718,3 +718,63 @@ test "bash tool truncates observation tail and keeps full output path" {
     try std.testing.expect(std.mem.indexOf(u8, observation, "line-0\n") == null);
     try std.testing.expect(std.mem.indexOf(u8, observation, "Full output:") != null);
 }
+
+test "bash tool accepts null for optional fields under strict schema" {
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+
+    // Null for optional string, object, integer, and boolean fields.
+    var output = try runTool(gpa, std.testing.io, cwd,
+        \\{"command":"printf ok","reason":null,"cwd":null,"env":null,"timeout":null,"run_in_background":null}
+    );
+    defer output.deinit(gpa);
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    try std.testing.expectEqualStrings("ok", output.stdout);
+}
+
+test "bash tool accepts partial nulls alongside populated optional fields" {
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+
+    // Mix of null and real values: null reason, populated cwd, null env, populated timeout, null run_in_background.
+    var output = try runTool(gpa, std.testing.io, cwd,
+        \\{"command":"printf ok","reason":null,"cwd":".","env":null,"timeout":30,"run_in_background":null}
+    );
+    defer output.deinit(gpa);
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    try std.testing.expectEqualStrings("ok", output.stdout);
+}
+
+test "bash tool parses null timeout as default" {
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+
+    var output = try runTool(gpa, std.testing.io, cwd,
+        \\{"command":"printf ok","timeout":null}
+    );
+    defer output.deinit(gpa);
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    try std.testing.expectEqualStrings("ok", output.stdout);
+}
+
+test "bash tool rejects invalid type for nullable field when model sends wrong type" {
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+
+    // Strict schema allows string|null for `reason`, but not integer. The
+    // JSON parser rejects the type mismatch, so parseArgs returns InvalidJson
+    // and the tool exits non-zero instead of silently misinterpreting it.
+    var output = try runTool(gpa, std.testing.io, cwd,
+        \\{"command":"printf ok","reason":42}
+    );
+    defer output.deinit(gpa);
+
+    try std.testing.expect(output.code != 0);
+}

@@ -561,6 +561,81 @@ test "buildAllToolsJson includes MCP tools alongside builtin tools" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"mcp__server__greet\"") != null);
 }
 
+test "buildToolsJson emits strict schema with nullable union types for optional fields" {
+    const gpa = std.testing.allocator;
+    const tools = [_]tools_common.Tool{
+        .{
+            .name = "demo",
+            .description = "Demo tool with mixed required/optional fields",
+            .schema = .{
+                .properties = &.{
+                    .{ .name = "required_str", .kind = .string, .description = "Required string", .required = true, .nullable = false },
+                    .{ .name = "optional_str", .kind = .string, .description = "Optional string", .required = false, .nullable = true },
+                    .{ .name = "optional_int", .kind = .integer, .description = "Optional int", .required = false, .nullable = true },
+                    .{ .name = "optional_bool", .kind = .boolean, .description = "Optional bool", .required = false, .nullable = true },
+                    .{ .name = "optional_obj", .kind = .object, .description = "Optional object", .required = false, .nullable = true },
+                    .{ .name = "optional_arr", .kind = .array, .description = "Optional array", .required = false, .nullable = true },
+                    .{ .name = "non_nullable_str", .kind = .string, .description = "Non-nullable string", .required = true, .nullable = false },
+                },
+            },
+            .run = undefined,
+            .display = undefined,
+        },
+    };
+    const json = try buildAllToolsJson(gpa, &tools, &.{});
+    defer gpa.free(json);
+
+    // Top-level strict marker and top-level additionalProperties:false
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"strict\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"additionalProperties\":false") != null);
+
+    // Non-nullable required field stays as a single type string
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"required_str\":{\"type\":\"string\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"non_nullable_str\":{\"type\":\"string\"") != null);
+
+    // Nullable optional fields become union type arrays
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_str\":{\"type\":[\"string\",\"null\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_int\":{\"type\":[\"integer\",\"null\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_bool\":{\"type\":[\"boolean\",\"null\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_obj\":{\"type\":[\"object\",\"null\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_arr\":{\"type\":[\"array\",\"null\"]") != null);
+
+    // Nested object keeps additionalProperties:true for free-form keys
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"additionalProperties\":true") != null);
+
+    // Required array lists all properties under strict mode
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"required_str\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"non_nullable_str\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_str\"") != null);
+}
+
+test "buildToolsJson preserves nested object additionalProperties for free-form env" {
+    const gpa = std.testing.allocator;
+    const tools = [_]tools_common.Tool{
+        .{
+            .name = "bash",
+            .description = "Run shell commands",
+            .schema = .{
+                .properties = &.{
+                    .{ .name = "command", .kind = .string, .description = "Shell command", .required = true, .nullable = false },
+                    .{ .name = "env", .kind = .object, .description = "Env vars", .required = false, .nullable = true },
+                },
+            },
+            .run = undefined,
+            .display = undefined,
+        },
+    };
+    const json = try buildAllToolsJson(gpa, &tools, &.{});
+    defer gpa.free(json);
+
+    // Top-level parameters object is strict
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"parameters\":{\"type\":\"object\",\"additionalProperties\":false") != null);
+    // Nested env object remains free-form
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"env\":{\"type\":[\"object\",\"null\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"additionalProperties\":true") != null);
+}
+
 test "updateMcpTools rebuilds the serialized tool list in place" {
     const gpa = std.testing.allocator;
     const tools = [_]tools_common.Tool{
