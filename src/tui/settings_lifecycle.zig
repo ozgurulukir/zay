@@ -22,20 +22,20 @@ const EditTarget = settings_widget.EditTarget;
 /// Check if pending values differ from current config values.
 fn hasActualChanges(state: *const State, config: *const config_mod.Config) bool {
     if (state.pending_enable_thinking) |v| {
-        const current_value = if (config.model_selection) |ms| ms.enable_thinking else config.enable_thinking orelse false;
+        const current_value = if (config.model_selection) |ms| ms.enableThinking() else config.enable_thinking orelse false;
         if (v != current_value) return true;
     }
     if (state.pending_use_responses_endpoint) |v| {
-        const current_value = if (config.model_selection) |ms| ms.use_responses_endpoint else config.use_responses_endpoint orelse false;
+        const current_value = if (config.model_selection) |ms| ms.useResponsesEndpoint() else config.use_responses_endpoint orelse false;
         if (v != current_value) return true;
     }
     if (state.pending_system_prompt) |s| {
-        const current_value = if (config.model_selection) |ms| ms.system_prompt else config.system_prompt;
+        const current_value = if (config.model_selection) |ms| ms.systemPrompt() else config.system_prompt;
         const current_prompt = current_value orelse "";
         if (!std.mem.eql(u8, s, current_prompt)) return true;
     }
     if (state.pending_bash_classifier_url) |s| {
-        const current_value = if (config.model_selection) |ms| ms.bash_classifier_url else config.bash_classifier_url;
+        const current_value = if (config.model_selection) |ms| ms.bashClassifierUrl() else config.bash_classifier_url;
         const current_url = current_value orelse "";
         if (!std.mem.eql(u8, s, current_url)) return true;
     }
@@ -103,21 +103,21 @@ fn submitGeneralItem(app: *App, state: *State) !void {
         0 => {
             // Toggle enable_thinking. Pending value overrides the config.
             const current = state.pending_enable_thinking orelse
-                (if (app.cached_config.model_selection) |ms| ms.enable_thinking else app.cached_config.enable_thinking orelse false);
+                (if (app.cached_config.model_selection) |ms| ms.enableThinking() else app.cached_config.enable_thinking orelse false);
             const new_value = !current;
             state.pending_enable_thinking = new_value;
             // Only mark dirty if the new value differs from the config
-            const config_value = if (app.cached_config.model_selection) |ms| ms.enable_thinking else app.cached_config.enable_thinking orelse false;
+            const config_value = if (app.cached_config.model_selection) |ms| ms.enableThinking() else app.cached_config.enable_thinking orelse false;
             state.dirty = (new_value != config_value);
         },
         1 => {
             // Toggle use_responses_endpoint.
             const current = state.pending_use_responses_endpoint orelse
-                (if (app.cached_config.model_selection) |ms| ms.use_responses_endpoint else app.cached_config.use_responses_endpoint orelse false);
+                (if (app.cached_config.model_selection) |ms| ms.useResponsesEndpoint() else app.cached_config.use_responses_endpoint orelse false);
             const new_value = !current;
             state.pending_use_responses_endpoint = new_value;
             // Only mark dirty if the new value differs from the config
-            const config_value = if (app.cached_config.model_selection) |ms| ms.use_responses_endpoint else app.cached_config.use_responses_endpoint orelse false;
+            const config_value = if (app.cached_config.model_selection) |ms| ms.useResponsesEndpoint() else app.cached_config.use_responses_endpoint orelse false;
             state.dirty = (new_value != config_value);
         },
         else => {},
@@ -130,7 +130,7 @@ fn submitPromptItem(app: *App, state: *State) void {
             // Enter edit mode for system prompt.
             state.edit_target = .system_prompt;
             const current = if (app.cached_config.model_selection) |ms|
-                (ms.system_prompt orelse "")
+                (ms.systemPrompt() orelse "")
             else
                 "";
             app.settings_text_input.clearRetainingCapacity();
@@ -146,7 +146,7 @@ fn submitAdvancedItem(app: *App, state: *State) void {
             // Enter edit mode for bash_classifier_url.
             state.edit_target = .bash_classifier_url;
             const current = if (app.cached_config.model_selection) |ms|
-                (ms.bash_classifier_url orelse "")
+                (ms.bashClassifierUrl() orelse "")
             else
                 "";
             app.settings_text_input.clearRetainingCapacity();
@@ -170,7 +170,7 @@ pub fn clearCurrentField(app: *App) void {
                 state.pending_system_prompt = null;
             }
             if (app.cached_config.model_selection != null and
-                app.cached_config.model_selection.?.system_prompt != null) state.dirty = true;
+                app.cached_config.model_selection.?.systemPrompt() != null) state.dirty = true;
         },
         .advanced => {
             if (state.pending_bash_classifier_url) |old| {
@@ -178,7 +178,7 @@ pub fn clearCurrentField(app: *App) void {
                 state.pending_bash_classifier_url = null;
             }
             if (app.cached_config.model_selection != null and
-                app.cached_config.model_selection.?.bash_classifier_url != null) state.dirty = true;
+                app.cached_config.model_selection.?.bashClassifierUrl() != null) state.dirty = true;
         },
         .general, .about => {},
     }
@@ -332,15 +332,31 @@ fn applyToCachedConfig(app: *App, state: *const State) !void {
     if (!app.cached_config_owned) return;
     if (app.cached_config.model_selection) |*ms| {
         // Model selection exists: update it directly
-        if (state.pending_enable_thinking) |v| ms.enable_thinking = v;
-        if (state.pending_use_responses_endpoint) |v| ms.use_responses_endpoint = v;
-        if (state.pending_system_prompt) |s| {
-            if (ms.system_prompt) |old| app.gpa.free(old);
-            ms.system_prompt = try app.gpa.dupe(u8, s);
-        }
-        if (state.pending_bash_classifier_url) |s| {
-            if (ms.bash_classifier_url) |old| app.gpa.free(old);
-            ms.bash_classifier_url = if (s.len > 0) try app.gpa.dupe(u8, s) else null;
+        switch (ms.*) {
+            .builtin => |*b| {
+                if (state.pending_enable_thinking) |v| b.enable_thinking = v;
+                if (state.pending_use_responses_endpoint) |v| b.use_responses_endpoint = v;
+                if (state.pending_system_prompt) |s| {
+                    if (b.system_prompt) |old| app.gpa.free(old);
+                    b.system_prompt = try app.gpa.dupe(u8, s);
+                }
+                if (state.pending_bash_classifier_url) |s| {
+                    if (b.bash_classifier_url) |old| app.gpa.free(old);
+                    b.bash_classifier_url = if (s.len > 0) try app.gpa.dupe(u8, s) else null;
+                }
+            },
+            .custom => |*c| {
+                if (state.pending_enable_thinking) |v| c.enable_thinking = v;
+                if (state.pending_use_responses_endpoint) |v| c.use_responses_endpoint = v;
+                if (state.pending_system_prompt) |s| {
+                    if (c.system_prompt) |old| app.gpa.free(old);
+                    c.system_prompt = try app.gpa.dupe(u8, s);
+                }
+                if (state.pending_bash_classifier_url) |s| {
+                    if (c.bash_classifier_url) |old| app.gpa.free(old);
+                    c.bash_classifier_url = if (s.len > 0) try app.gpa.dupe(u8, s) else null;
+                }
+            },
         }
     } else {
         // Legacy config: update legacy fields directly

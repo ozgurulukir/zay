@@ -1299,7 +1299,7 @@ pub fn rebuildReasoningOptsCache(self: *App) void {
     self.reasoning_opts_len = 0;
     if (!self.cached_config_owned) return;
     const ms = self.cached_config.model_selection orelse return;
-    for (ms.model.reasoning_options) |effort| {
+    for (ms.model().reasoning_options) |effort| {
         if (self.reasoning_opts_len >= self.reasoning_opts_cache.len) break;
         self.reasoning_opts_cache[self.reasoning_opts_len] = .{
             .label = effort.label(),
@@ -2243,11 +2243,11 @@ test "local providers are not loaded twice through configured compatible catalog
     defer app.deinit();
 
     app.cached_config.model_selection = .{
-        .provider = .ollama,
-        .provider_name = @constCast("ollama"),
-        .base_url = @constCast("http://localhost:11434"),
-        .api_key = @constCast("ollama"),
-        .model = .{ .id = @constCast("test") },
+        .builtin = .{
+            .provider = .ollama,
+            .provider_name = @constCast("ollama"),
+            .model = .{ .id = @constCast("test") },
+        },
     };
 
     try std.testing.expect(!provider_model.shouldLoadConfiguredCompatibleCatalog(&app));
@@ -2287,11 +2287,11 @@ test "compatible base url falls back when cached local provider differs" {
     defer app.deinit();
 
     app.cached_config.model_selection = .{
-        .provider = .llama_cpp,
-        .provider_name = @constCast("llama.cpp"),
-        .base_url = @constCast("http://localhost:11434"),
-        .api_key = @constCast(""),
-        .model = .{ .id = @constCast("test") },
+        .builtin = .{
+            .provider = .llama_cpp,
+            .provider_name = @constCast("llama.cpp"),
+            .model = .{ .id = @constCast("test") },
+        },
     };
 
     try std.testing.expectEqualStrings("http://localhost:8080", provider_model.compatibleBaseUrl(&app, .llama_cpp).?);
@@ -2326,17 +2326,18 @@ test "codex sign-in survives selecting local compatible provider" {
     app.pickers.models.model_selection = 0;
     app.cached_config_owned = true;
     app.cached_config.model_selection = .{
-        .provider = .openai_compatible,
-        .provider_name = try gpa.dupe(u8, "openai_compatible"),
-        .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
-        .api_key = try gpa.dupe(u8, "ollama"),
-        .model = .{ .id = try gpa.dupe(u8, "placeholder") },
+        .custom = .{
+            .provider_name = try gpa.dupe(u8, "openai_compatible"),
+            .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
+            .api_key = try gpa.dupe(u8, "ollama"),
+            .model = .{ .id = try gpa.dupe(u8, "placeholder") },
+        },
     };
 
     try provider_model.applySelectedModel(&app);
 
     try std.testing.expect(app.isCodexSignedIn());
-    try std.testing.expectEqual(config_mod.Provider.ollama, app.cached_config.model_selection.?.provider);
+    try std.testing.expectEqual(config_mod.Provider.ollama, app.cached_config.model_selection.?.provider());
 }
 
 test "switching from codex to catalogue provider resets cached connection" {
@@ -2369,19 +2370,19 @@ test "switching from codex to catalogue provider resets cached connection" {
     app.pickers.models.model_selection = 0;
     app.cached_config_owned = true;
     app.cached_config.model_selection = .{
-        .provider = .openai,
-        .provider_name = try gpa.dupe(u8, "openai"),
-        .base_url = try gpa.dupe(u8, "https://chatgpt.com/backend-api"),
-        .api_key = try gpa.dupe(u8, "stale-codex-key"),
-        .model = .{ .id = try gpa.dupe(u8, "placeholder") },
+        .builtin = .{
+            .provider = .openai,
+            .provider_name = try gpa.dupe(u8, "openai"),
+            .model = .{ .id = try gpa.dupe(u8, "placeholder") },
+        },
     };
 
     try provider_model.applySelectedModel(&app);
 
     const ms = app.cached_config.model_selection.?;
-    try std.testing.expectEqual(config_mod.Provider.opencode_zen, ms.provider);
-    try std.testing.expectEqualStrings("https://opencode.ai/zen/v1", ms.base_url);
-    try std.testing.expectEqualStrings("", ms.api_key);
+    try std.testing.expectEqual(config_mod.Provider.opencode_zen, ms.provider());
+    try std.testing.expectEqualStrings("https://opencode.ai/zen/v1", ms.provider().defaultBaseUrl().?);
+    try std.testing.expect(ms.apiKey() == null);
     try std.testing.expectEqualStrings("https://opencode.ai/zen/v1/chat/completions", runtime.client.openai_compatible.url);
 }
 
@@ -2397,11 +2398,11 @@ test "active model appears at display position 0 without mutating storage" {
     const active_model_id = try gpa.dupe(u8, "gpt-5.4-mini");
     defer gpa.free(active_model_id);
     app.cached_config.model_selection = .{
-        .provider = .openai,
-        .provider_name = @constCast("openai"),
-        .base_url = @constCast(""),
-        .api_key = @constCast(""),
-        .model = .{ .id = active_model_id },
+        .builtin = .{
+            .provider = .openai,
+            .provider_name = @constCast("openai"),
+            .model = .{ .id = active_model_id },
+        },
     };
 
     try provider_model.reloadModelCatalog(&app, .openai_codex);
@@ -2493,11 +2494,11 @@ test "expired codex connection reports reconnect message" {
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
     app.cached_config = .{
         .model_selection = .{
-            .provider = .openai,
-            .provider_name = @constCast("openai"),
-            .base_url = @constCast(""),
-            .api_key = @constCast(""),
-            .model = .{ .id = @constCast("test") },
+            .builtin = .{
+                .provider = .openai,
+                .provider_name = @constCast("openai"),
+                .model = .{ .id = @constCast("test") },
+            },
         },
     };
 
@@ -2711,11 +2712,12 @@ test "model selection is allowed after interrupt" {
     app.pickers.models.model_selection = 0;
     app.cached_config_owned = true;
     app.cached_config.model_selection = .{
-        .provider = .openai_compatible,
-        .provider_name = try gpa.dupe(u8, "openai_compatible"),
-        .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
-        .api_key = try gpa.dupe(u8, "ollama"),
-        .model = .{ .id = try gpa.dupe(u8, "placeholder") },
+        .custom = .{
+            .provider_name = try gpa.dupe(u8, "openai_compatible"),
+            .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
+            .api_key = try gpa.dupe(u8, "ollama"),
+            .model = .{ .id = try gpa.dupe(u8, "placeholder") },
+        },
     };
     app.thread.turn.submit();
     app.thread.turn.interrupt();
@@ -2723,7 +2725,7 @@ test "model selection is allowed after interrupt" {
     try provider_model.applySelectedModel(&app);
 
     try std.testing.expectEqual(Turn.State.idle, app.thread.turn.state);
-    try std.testing.expectEqual(config_mod.Provider.ollama, app.cached_config.model_selection.?.provider);
+    try std.testing.expectEqual(config_mod.Provider.ollama, app.cached_config.model_selection.?.provider());
 }
 
 test "interrupt restart flushes queued messages to the transcript when no provider" {

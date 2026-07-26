@@ -248,9 +248,56 @@ pub const ProviderConfig = struct {
     }
 };
 
-pub const ModelSelectionRef = struct {
+pub const ModelSelectionRef = union(enum) {
+    builtin: BuiltinSelectionRef,
+    custom: CustomSelectionRef,
+
+    pub fn provider(self: ModelSelectionRef) Provider {
+        return switch (self) {
+            .builtin => |b| b.provider,
+            .custom => .openai_compatible,
+        };
+    }
+
+    pub fn providerName(self: ModelSelectionRef) []const u8 {
+        return switch (self) {
+            .builtin => |b| b.provider_name,
+            .custom => |c| c.provider_name,
+        };
+    }
+
+    pub fn model(self: ModelSelectionRef) *const Model {
+        return switch (self) {
+            .builtin => |b| b.model,
+            .custom => |c| c.model,
+        };
+    }
+
+    pub fn baseUrl(self: ModelSelectionRef) ?[]const u8 {
+        return switch (self) {
+            .builtin => null,
+            .custom => |c| c.base_url,
+        };
+    }
+
+    pub fn apiKey(self: ModelSelectionRef) ?[]const u8 {
+        return switch (self) {
+            .builtin => null,
+            .custom => |c| c.api_key,
+        };
+    }
+};
+
+const BuiltinSelectionRef = struct {
     provider: Provider,
     provider_name: []const u8,
+    model: *const Model,
+};
+
+const CustomSelectionRef = struct {
+    provider_name: []const u8,
+    base_url: []const u8,
+    api_key: []const u8,
     model: *const Model,
 };
 
@@ -260,22 +307,132 @@ pub const ModelSelectionRef = struct {
 /// Optional settings stay optional. `Config.model_selection: ?ModelSelection`
 /// is the typed view; legacy callers that read the loose `Config`
 /// fields keep working until the migration PRs land.
-pub const ModelSelection = struct {
+pub const ModelSelection = union(enum) {
+    builtin: BuiltinSelection,
+    custom: CustomSelection,
+
+    pub fn deinit(self: *ModelSelection, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .builtin => |*b| b.deinit(gpa),
+            .custom => |*c| c.deinit(gpa),
+        }
+        self.* = undefined;
+    }
+
+    pub fn clone(self: ModelSelection, gpa: std.mem.Allocator) !ModelSelection {
+        return switch (self) {
+            .builtin => |b| ModelSelection{ .builtin = try b.clone(gpa) },
+            .custom => |c| ModelSelection{ .custom = try c.clone(gpa) },
+        };
+    }
+
+    pub fn provider(self: ModelSelection) Provider {
+        return switch (self) {
+            .builtin => |b| b.provider,
+            .custom => .openai_compatible,
+        };
+    }
+
+    pub fn providerName(self: ModelSelection) []const u8 {
+        return switch (self) {
+            .builtin => |b| b.provider_name,
+            .custom => |c| c.provider_name,
+        };
+    }
+
+    pub fn model(self: ModelSelection) *const Model {
+        return switch (self) {
+            .builtin => |b| &b.model,
+            .custom => |c| &c.model,
+        };
+    }
+
+    pub fn baseUrl(self: ModelSelection) ?[]const u8 {
+        return switch (self) {
+            .builtin => null,
+            .custom => |c| c.base_url,
+        };
+    }
+
+    pub fn apiKey(self: ModelSelection) ?[]const u8 {
+        return switch (self) {
+            .builtin => null,
+            .custom => |c| c.api_key,
+        };
+    }
+
+    pub fn useResponsesEndpoint(self: ModelSelection) bool {
+        return switch (self) {
+            .builtin => |b| b.use_responses_endpoint,
+            .custom => |c| c.use_responses_endpoint,
+        };
+    }
+
+    pub fn enableThinking(self: ModelSelection) bool {
+        return switch (self) {
+            .builtin => |b| b.enable_thinking,
+            .custom => |c| c.enable_thinking,
+        };
+    }
+
+    pub fn systemPrompt(self: ModelSelection) ?[]const u8 {
+        return switch (self) {
+            .builtin => |b| b.system_prompt,
+            .custom => |c| c.system_prompt,
+        };
+    }
+
+    pub fn bashClassifierUrl(self: ModelSelection) ?[]const u8 {
+        return switch (self) {
+            .builtin => |b| b.bash_classifier_url,
+            .custom => |c| c.bash_classifier_url,
+        };
+    }
+};
+
+const BuiltinSelection = struct {
     provider: Provider,
     /// The provider name as written in config (map key or defaultModel prefix).
-    /// For builtins this equals `provider.label()`; for custom providers it's
-    /// the user-chosen name. Used for display, auth.json lookup, and session
-    /// persistence.
+    /// For builtins this equals `provider.label()`.
     provider_name: []u8,
     model: Model,
-    base_url: []u8,
-    api_key: []u8,
     use_responses_endpoint: bool = false,
     enable_thinking: bool = false,
     system_prompt: ?[]u8 = null,
     bash_classifier_url: ?[]u8 = null,
 
-    pub fn deinit(self: *ModelSelection, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: *BuiltinSelection, gpa: std.mem.Allocator) void {
+        gpa.free(self.provider_name);
+        self.model.deinit(gpa);
+        if (self.system_prompt) |s| gpa.free(s);
+        if (self.bash_classifier_url) |s| gpa.free(s);
+        self.* = undefined;
+    }
+
+    pub fn clone(self: BuiltinSelection, gpa: std.mem.Allocator) !BuiltinSelection {
+        return .{
+            .provider = self.provider,
+            .provider_name = try gpa.dupe(u8, self.provider_name),
+            .model = try self.model.clone(gpa),
+            .use_responses_endpoint = self.use_responses_endpoint,
+            .enable_thinking = self.enable_thinking,
+            .system_prompt = if (self.system_prompt) |s| try gpa.dupe(u8, s) else null,
+            .bash_classifier_url = if (self.bash_classifier_url) |s| try gpa.dupe(u8, s) else null,
+        };
+    }
+};
+
+const CustomSelection = struct {
+    provider_name: []u8,
+    base_url: []u8,
+    api_key: []u8,
+    model: Model,
+    use_responses_endpoint: bool = false,
+    enable_thinking: bool = false,
+    system_prompt: ?[]u8 = null,
+    bash_classifier_url: ?[]u8 = null,
+
+    pub fn deinit(self: *CustomSelection, gpa: std.mem.Allocator) void {
         gpa.free(self.provider_name);
         gpa.free(self.base_url);
         gpa.free(self.api_key);
@@ -285,13 +442,12 @@ pub const ModelSelection = struct {
         self.* = undefined;
     }
 
-    pub fn clone(self: ModelSelection, gpa: std.mem.Allocator) !ModelSelection {
+    pub fn clone(self: CustomSelection, gpa: std.mem.Allocator) !CustomSelection {
         return .{
-            .provider = self.provider,
             .provider_name = try gpa.dupe(u8, self.provider_name),
-            .model = try self.model.clone(gpa),
             .base_url = try gpa.dupe(u8, self.base_url),
             .api_key = try gpa.dupe(u8, self.api_key),
+            .model = try self.model.clone(gpa),
             .use_responses_endpoint = self.use_responses_endpoint,
             .enable_thinking = self.enable_thinking,
             .system_prompt = if (self.system_prompt) |s| try gpa.dupe(u8, s) else null,

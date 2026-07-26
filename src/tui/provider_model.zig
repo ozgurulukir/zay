@@ -288,7 +288,7 @@ pub fn collectConfiguredProviders(self: *App, catalog: ModelCatalog) ![]model_lo
         }
         if (shouldLoadConfiguredCompatibleCatalog(self)) {
             const ms = self.cached_config.model_selection orelse return list.toOwnedSlice(self.gpa);
-            const provider = ms.provider;
+            const provider = ms.provider();
             // Catalogue providers are covered by block 1; dynamic providers
             // with a stored key are covered by block 2 (models.dev registry).
             // Only add a block-3 entry for providers neither block handles
@@ -296,7 +296,7 @@ pub fn collectConfiguredProviders(self: *App, catalog: ModelCatalog) ![]model_lo
             const covered_by_registry = blk: {
                 // After session resume dynamic_provider_id is null (runtime-only);
                 // fall back to the serialized model_selection.provider_name.
-                const id = self.cached_config.dynamic_provider_id orelse ms.provider_name;
+                const id = self.cached_config.dynamic_provider_id orelse ms.providerName();
                 if (self.provider_api_keys.get(id) == null) break :blk false;
                 if (self.modelsdev_registry) |*reg| {
                     if (reg.lookup(id) != null) break :blk true;
@@ -306,15 +306,18 @@ pub fn collectConfiguredProviders(self: *App, catalog: ModelCatalog) ![]model_lo
             if (!provider.isCatalogue() and !covered_by_registry) {
                 // base_url may be "" when synthesized from session metadata or
                 // legacy fields; resolve through the provider default.
-                const base_url = if (ms.base_url.len > 0) ms.base_url else provider.defaultBaseUrl() orelse return list.toOwnedSlice(self.gpa);
+                const base_url = if (ms.baseUrl()) |url| if (url.len > 0) url else provider.defaultBaseUrl() orelse return list.toOwnedSlice(self.gpa) else provider.defaultBaseUrl() orelse return list.toOwnedSlice(self.gpa);
                 // ms.api_key is always "" (keys live in auth.json). Resolve
                 // the stored key so the model fetch authenticates correctly.
-                const api_key = if (ms.api_key.len > 0)
-                    ms.api_key
-                else if (self.cached_config.dynamic_provider_id) |id|
-                    self.provider_api_keys.get(id) orelse ""
-                else
-                    self.provider_api_keys.get(ms.provider_name) orelse "";
+                const api_key = blk: {
+                    if (ms.apiKey()) |key| {
+                        if (key.len > 0) break :blk key;
+                    }
+                    if (self.cached_config.dynamic_provider_id) |id| {
+                        break :blk self.provider_api_keys.get(id) orelse "";
+                    }
+                    break :blk self.provider_api_keys.get(ms.providerName()) orelse "";
+                };
                 try appendConfigured(self, &list, provider, base_url, api_key);
             }
         }
@@ -770,21 +773,49 @@ pub fn updateCachedModelSelection(
     errdefer self.gpa.free(new_id);
     if (self.cached_config_owned) {
         if (self.cached_config.model_selection) |*ms| {
-            ms.model.deinit(self.gpa);
-            ms.provider = provider;
-            ms.model = .{ .id = new_id, .reasoning = .{ .effort = effort } };
+            ms.deinit(self.gpa);
+            const base_url = provider.defaultBaseUrl() orelse "";
+            if (provider == .openai_compatible) {
+                self.cached_config.model_selection = .{
+                    .custom = .{
+                        .provider_name = try self.gpa.dupe(u8, self.cached_config.dynamic_provider_id orelse provider.label()),
+                        .base_url = try self.gpa.dupe(u8, base_url),
+                        .api_key = try self.gpa.dupe(u8, ""),
+                        .model = .{ .id = new_id, .reasoning = .{ .effort = effort } },
+                    },
+                };
+            } else {
+                self.cached_config.model_selection = .{
+                    .builtin = .{
+                        .provider = provider,
+                        .provider_name = try self.gpa.dupe(u8, provider.label()),
+                        .model = .{ .id = new_id, .reasoning = .{ .effort = effort } },
+                    },
+                };
+            }
             try updateCachedProviderConnection(self, provider);
         } else {
             // No selection yet — bootstrap a minimal one. base_url and
             // api_key come from the provider's defaults.
             const base_url = provider.defaultBaseUrl() orelse "";
-            self.cached_config.model_selection = .{
-                .provider = provider,
-                .provider_name = try self.gpa.dupe(u8, provider.label()),
-                .model = .{ .id = new_id, .reasoning = .{ .effort = effort } },
-                .base_url = try self.gpa.dupe(u8, base_url),
-                .api_key = try self.gpa.dupe(u8, ""),
-            };
+            if (provider == .openai_compatible) {
+                self.cached_config.model_selection = .{
+                    .custom = .{
+                        .provider_name = try self.gpa.dupe(u8, self.cached_config.dynamic_provider_id orelse provider.label()),
+                        .base_url = try self.gpa.dupe(u8, base_url),
+                        .api_key = try self.gpa.dupe(u8, ""),
+                        .model = .{ .id = new_id, .reasoning = .{ .effort = effort } },
+                    },
+                };
+            } else {
+                self.cached_config.model_selection = .{
+                    .builtin = .{
+                        .provider = provider,
+                        .provider_name = try self.gpa.dupe(u8, provider.label()),
+                        .model = .{ .id = new_id, .reasoning = .{ .effort = effort } },
+                    },
+                };
+            }
             try updateCachedProviderConnection(self, provider);
         }
     } else {
@@ -809,10 +840,16 @@ pub fn updateCachedProviderConnection(self: *App, provider: config_mod.Provider)
 
 pub fn replaceCachedBaseUrl(self: *App, base_url: []const u8) !void {
     const owned = try self.gpa.dupe(u8, base_url);
-    errdefer self.gpa.free(owned);
     if (self.cached_config.model_selection) |*ms| {
-        self.gpa.free(ms.base_url);
-        ms.base_url = owned;
+        switch (ms.*) {
+            .builtin => {
+                self.gpa.free(owned);
+            },
+            .custom => |*c| {
+                self.gpa.free(c.base_url);
+                c.base_url = owned;
+            },
+        }
     } else {
         self.gpa.free(owned);
     }
@@ -822,8 +859,16 @@ pub fn replaceCachedProviderName(self: *App, name: []const u8) !void {
     const owned = try self.gpa.dupe(u8, name);
     errdefer self.gpa.free(owned);
     if (self.cached_config.model_selection) |*ms| {
-        self.gpa.free(ms.provider_name);
-        ms.provider_name = owned;
+        switch (ms.*) {
+            .builtin => |*b| {
+                self.gpa.free(b.provider_name);
+                b.provider_name = owned;
+            },
+            .custom => |*c| {
+                self.gpa.free(c.provider_name);
+                c.provider_name = owned;
+            },
+        }
     } else {
         self.gpa.free(owned);
     }
@@ -834,9 +879,14 @@ pub fn clearCachedApiKey(self: *App) void {
         // Replace with empty string (api_key is non-optional in
         // ModelSelection; clearing means the user will be prompted
         // again). The previous key is freed.
-        const new_key = self.gpa.dupe(u8, "") catch return;
-        self.gpa.free(ms.api_key);
-        ms.api_key = new_key;
+        switch (ms.*) {
+            .custom => |*c| {
+                const new_key = self.gpa.dupe(u8, "") catch return;
+                self.gpa.free(c.api_key);
+                c.api_key = new_key;
+            },
+            .builtin => {},
+        }
     }
 }
 
@@ -869,7 +919,7 @@ pub fn modelSelectionUpdates(
     // fall back to the serialized model_selection.provider_name.
     const resolved_name: []const u8 = if (provider == .openai_compatible)
         self.cached_config.dynamic_provider_id orelse
-            (if (self.cached_config.model_selection) |ms| ms.provider_name else provider.label())
+            (if (self.cached_config.model_selection) |ms| ms.providerName() else provider.label())
     else
         provider.label();
 
@@ -888,24 +938,33 @@ pub fn modelSelectionUpdates(
     const ms_model_id = try self.gpa.dupe(u8, model_id);
     errdefer self.gpa.free(ms_model_id);
 
-    const ms_base_url = if (base_url_slice) |s| try self.gpa.dupe(u8, s) else try self.gpa.dupe(u8, "");
-    errdefer self.gpa.free(ms_base_url);
-
-    const ms_api_key = try self.gpa.dupe(u8, "");
-    errdefer self.gpa.free(ms_api_key);
+    const model_selection = if (provider == .openai_compatible) blk: {
+        const ms_base_url = if (base_url_slice) |s| try self.gpa.dupe(u8, s) else try self.gpa.dupe(u8, "");
+        const ms_api_key = try self.gpa.dupe(u8, "");
+        break :blk config_mod.ModelSelection{
+            .custom = .{
+                .provider_name = try self.gpa.dupe(u8, resolved_name),
+                .base_url = ms_base_url,
+                .api_key = ms_api_key,
+                .model = .{ .id = ms_model_id, .reasoning = .{ .effort = effort } },
+            },
+        };
+    } else blk: {
+        break :blk config_mod.ModelSelection{
+            .builtin = .{
+                .provider = provider,
+                .provider_name = try self.gpa.dupe(u8, resolved_name),
+                .model = .{ .id = ms_model_id, .reasoning = .{ .effort = effort } },
+            },
+        };
+    };
 
     return .{
         .provider = provider,
         .base_url = base_url_slice,
         .model = .{ .id = model_id_copy, .reasoning = .{ .effort = effort } },
         .providers = providers,
-        .model_selection = .{
-            .provider = provider,
-            .provider_name = try self.gpa.dupe(u8, resolved_name),
-            .model = .{ .id = ms_model_id, .reasoning = .{ .effort = effort } },
-            .base_url = ms_base_url,
-            .api_key = ms_api_key,
-        },
+        .model_selection = model_selection,
     };
 }
 
@@ -1067,7 +1126,7 @@ pub fn compatibleApiKey(self: *const App, provider: config_mod.Provider) []const
         // After session resume dynamic_provider_id is null (runtime-only).
         // Fall back to model_selection.provider_name which IS serialized.
         if (self.cached_config.model_selection) |ms| {
-            if (self.provider_api_keys.get(ms.provider_name)) |key| return key;
+            if (self.provider_api_keys.get(ms.providerName())) |key| return key;
         }
     } else {
         if (self.provider_api_keys.get(provider.label())) |key| return key;

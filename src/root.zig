@@ -55,7 +55,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     var local_models_handle: ?local_models.Server = null;
     {
         const classifier_set = if (load_result.config.model_selection) |*ms|
-            (ms.bash_classifier_url != null)
+            (ms.bashClassifierUrl() != null)
         else
             true;
         if (!classifier_set) {
@@ -63,7 +63,10 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
             errdefer if (local_models_handle) |*server| server.deinit(gpa, init.io);
             if (local_models_handle) |server| {
                 if (load_result.config.model_selection) |*ms| {
-                    ms.bash_classifier_url = try gpa.dupe(u8, server.url);
+                    switch (ms.*) {
+                        .builtin => |*b| b.bash_classifier_url = try gpa.dupe(u8, server.url),
+                        .custom => |*c| c.bash_classifier_url = try gpa.dupe(u8, server.url),
+                    }
                 }
             }
         }
@@ -81,7 +84,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     defer search.deinit(runtime_gpa, init.io);
 
     const system_prompt = if (load_result.config.model_selection) |ms|
-        (ms.system_prompt orelse @embedFile("prompts/system.md"))
+        (ms.systemPrompt() orelse @embedFile("prompts/system.md"))
     else
         @embedFile("prompts/system.md");
     const agent_runtime = try tui_gpa.create(runtime.AgentRuntime);

@@ -31,7 +31,7 @@ pub fn modelStatus(runtime: ?*const runtime_mod.AgentRuntime, config: config_mod
         }
     }
 
-    const model = if (config.model_selection) |ms| ms.model.id else if (config.model) |m| m.id else return null;
+    const model = if (config.model_selection) |ms| ms.model().id else if (config.model) |m| m.id else return null;
     return .{
         .provider = providerDisplayName(config) orelse return null,
         .model = model,
@@ -96,7 +96,7 @@ pub fn modifiedTime(io: std.Io, buffer: []u8, updated_at_ms: i64) []const u8 {
 }
 
 fn providerLabel(config: config_mod.Config) ?[]const u8 {
-    if (config.model_selection) |ms| return ms.provider.label();
+    if (config.model_selection) |ms| return ms.provider().label();
     // After restart model_selection is null (api_key is never serialized);
     // fall back to the legacy provider field populated by parseObject.
     if (config.provider) |p| return p.label();
@@ -112,7 +112,7 @@ fn providerLabel(config: config_mod.Config) ?[]const u8 {
 fn providerDisplayName(config: config_mod.Config) ?[]const u8 {
     if (config.dynamic_provider_name) |name| return name;
     if (config.model_selection) |ms| {
-        if (ms.provider == .openai_compatible and ms.provider_name.len > 0) return ms.provider_name;
+        if (ms.provider() == .openai_compatible and ms.providerName().len > 0) return ms.providerName();
     }
     // After restart model_selection is null; the legacy provider_name
     // IS populated from the "defaultModel" config field (e.g. "stepfun-ai").

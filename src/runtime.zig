@@ -176,7 +176,7 @@ pub const AgentRuntime = struct {
         target.agent.skills = target.skills;
         target.agent.compaction_settings = config.context.compaction;
         if (config.model_selection) |ms| {
-            if (ms.bash_classifier_url) |url| {
+            if (ms.bashClassifierUrl()) |url| {
                 target.agent.bash_classifier_url = try gpa.dupe(u8, url);
             }
         }
@@ -220,28 +220,55 @@ pub const AgentRuntime = struct {
 
                 var session_config = config;
                 if (session_config.model_selection) |*ms| {
-                    ms.provider = provider_enum;
-                    ms.provider_name = @constCast(mp);
-                    if (summary.model_id) |mid| {
-                        ms.model.id = mid;
-                    }
-                    if (ms.base_url.len == 0 and resolved_base_url.len > 0) {
-                        ms.base_url = @constCast(resolved_base_url);
+                    switch (ms.*) {
+                        .builtin => |*b| {
+                            b.provider = provider_enum;
+                            b.provider_name = @constCast(mp);
+                            if (summary.model_id) |mid| {
+                                b.model.id = @constCast(mid);
+                            }
+                        },
+                        .custom => |*c| {
+                            c.provider_name = @constCast(mp);
+                            if (summary.model_id) |mid| {
+                                c.model.id = @constCast(mid);
+                            }
+                            if (c.base_url.len == 0 and resolved_base_url.len > 0) {
+                                c.base_url = @constCast(resolved_base_url);
+                            }
+                        },
                     }
                     try target.applyFromConfig(session_config);
                 } else {
-                    session_config.model_selection = .{
-                        .provider = provider_enum,
-                        .provider_name = @constCast(mp),
-                        .model = .{
-                            .id = summary.model_id orelse "",
-                            .reasoning = .unset,
-                        },
-                        .base_url = @constCast(resolved_base_url),
-                        .api_key = "",
-                        .use_responses_endpoint = false,
-                        .bash_classifier_url = null,
-                    };
+                    const is_builtin = std.meta.stringToEnum(config_mod.Provider, mp) != null;
+                    if (is_builtin) {
+                        session_config.model_selection = .{
+                            .builtin = .{
+                                .provider = provider_enum,
+                                .provider_name = @constCast(mp),
+                                .model = .{
+                                    .id = summary.model_id orelse "",
+                                    .reasoning = .unset,
+                                },
+                                .use_responses_endpoint = false,
+                                .bash_classifier_url = null,
+                            },
+                        };
+                    } else {
+                        session_config.model_selection = .{
+                            .custom = .{
+                                .provider_name = @constCast(mp),
+                                .base_url = @constCast(resolved_base_url),
+                                .api_key = "",
+                                .model = .{
+                                    .id = summary.model_id orelse "",
+                                    .reasoning = .unset,
+                                },
+                                .use_responses_endpoint = false,
+                                .bash_classifier_url = null,
+                            },
+                        };
+                    }
                     try target.applyFromConfig(session_config);
                 }
             } else {
@@ -307,22 +334,22 @@ pub const AgentRuntime = struct {
     /// Also handles providers that require sign-in (codex).
     pub fn applyFromConfig(self: *AgentRuntime, config: config_mod.Config) !void {
         const selection = config.activeModelSelection() orelse return;
-        const adapter = adapterForConfig(selection.provider, config) orelse return;
+        const adapter = adapterForConfig(selection.provider(), config) orelse return;
         switch (adapter) {
             .codex_responses => try self.tryConnectCodexFromAuth(config),
-            .openai_compatible => try self.tryAttachOpenAiCompatibleFromConfig(selection.provider, config),
-            .openai_responses => try self.tryAttachOpenAiResponsesFromConfig(selection.provider, config),
+            .openai_compatible => try self.tryAttachOpenAiCompatibleFromConfig(selection.provider(), config),
+            .openai_responses => try self.tryAttachOpenAiResponsesFromConfig(selection.provider(), config),
         }
         // Save the model selection to the session so it can be restored on resume.
         // Use provider_name (the config key) so custom providers round-trip.
-        try self.session_writer.session.updateModel(selection.provider_name, selection.model.id);
+        try self.session_writer.session.updateModel(selection.providerName(), selection.model().id);
     }
 
     fn adapterForConfig(provider: config_mod.Provider, config: config_mod.Config) ?config_mod.AdapterKind {
         const adapter = provider.adapter() orelse return null;
         if (adapter == .openai_compatible) {
             if (config.model_selection) |ms| {
-                if (ms.use_responses_endpoint) return .openai_responses;
+                if (ms.useResponsesEndpoint()) return .openai_responses;
             }
         }
         return adapter;
@@ -335,8 +362,8 @@ pub const AgentRuntime = struct {
         try self.refreshCodexCredentialsIfNeeded(&creds);
         if (self.codex_connection_expired) return;
         const ms = config.model_selection orelse return;
-        const model_id = ms.model.id;
-        const effort = ms.model.reasoning.resolve();
+        const model_id = ms.model().id;
+        const effort = ms.model().reasoning.resolve();
         try self.connectCodexClient(creds, model_id, effort);
     }
 
@@ -385,37 +412,44 @@ pub const AgentRuntime = struct {
             try self.attachOpenAiCompatibleClient(base_url, api_key, model_id, effort);
             return;
         };
-        const base_url = if (ms.base_url.len > 0) ms.base_url else provider.defaultBaseUrl() orelse return;
-        const effort = ms.model.reasoning.resolve();
+        const base_url = blk: {
+            if (ms.baseUrl()) |url| {
+                if (url.len > 0) break :blk url;
+            }
+            break :blk provider.defaultBaseUrl() orelse return;
+        };
+        const effort = ms.model().reasoning.resolve();
         // Per-model context_window from providers map acts as a fallback
         // when the global overrideContextWindow is not set.
         if (self.context_settings.override_context_window == null) {
-            self.context_settings.override_context_window = ms.model.context_window;
+            self.context_settings.override_context_window = ms.model().context_window;
         }
         // Per-model max_output_tokens from providers map acts as a fallback
         // when the global context.maxOutputTokens is not set.
         if (self.context_settings.max_output_tokens == null) {
-            self.context_settings.max_output_tokens = ms.model.max_output_tokens;
+            self.context_settings.max_output_tokens = ms.model().max_output_tokens;
         }
         var loaded_key: ?[]u8 = null;
         defer if (loaded_key) |k| self.gpa.free(k);
         const api_key = blk: {
-            if (ms.api_key.len > 0) break :blk ms.api_key;
+            if (ms.apiKey()) |key| {
+                if (key.len > 0) break :blk key;
+            }
             // Auth lookup uses provider_name (the config map key / defaultModel
             // prefix) so custom providers like "qwen-cloud" resolve their own
             // stored key from auth.json.
             if (self.home_dir.len > 0) {
-                loaded_key = auth_mod.loadProviderApiKey(self.gpa, self.io, self.home_dir, ms.provider_name) catch null;
+                loaded_key = auth_mod.loadProviderApiKey(self.gpa, self.io, self.home_dir, ms.providerName()) catch null;
                 if (loaded_key) |k| break :blk k;
             }
             // No stored key — log for diagnostics when the provider requires
             // one, so a 402/401 on the first turn is traceable.
             if (provider.requiresApiKey()) {
-                std.log.warn("auth.missing_key provider={s} — requests will likely fail with 402", .{ms.provider_name});
+                std.log.warn("auth.missing_key provider={s} — requests will likely fail with 402", .{ms.providerName()});
             }
             break :blk provider.anonymousApiKey() orelse "";
         };
-        try self.attachOpenAiCompatibleClient(base_url, api_key, ms.model.id, effort);
+        try self.attachOpenAiCompatibleClient(base_url, api_key, ms.model().id, effort);
     }
 
     fn tryAttachOpenAiResponsesFromConfig(
@@ -424,12 +458,12 @@ pub const AgentRuntime = struct {
         config: config_mod.Config,
     ) !void {
         const ms = config.model_selection orelse return;
-        const base_url = if (ms.base_url.len > 0) ms.base_url else provider.defaultBaseUrl() orelse return;
+        const base_url = if (ms.baseUrl()) |url| if (url.len > 0) url else provider.defaultBaseUrl() orelse return else provider.defaultBaseUrl() orelse return;
         const reasoning: ai.Reasoning = .{
-            .effort = ms.model.reasoning.resolve(),
+            .effort = ms.model().reasoning.resolve(),
             .summary = .auto,
         };
-        try self.attachOpenAiResponsesClient(base_url, ms.api_key, ms.model.id, reasoning);
+        try self.attachOpenAiResponsesClient(base_url, ms.apiKey() orelse "", ms.model().id, reasoning);
     }
 
     /// Establish a Codex session — uses OAuth credentials to identify
@@ -714,12 +748,13 @@ test "codex refresh starts before token expiry" {
 test "runtime selects responses adapter when requested" {
     const config: config_mod.Config = .{
         .model_selection = .{
-            .provider = .openai_compatible,
-            .provider_name = @constCast("openai_compatible"),
-            .base_url = @constCast(""),
-            .api_key = @constCast(""),
-            .model = .{ .id = @constCast("test") },
-            .use_responses_endpoint = true,
+            .custom = .{
+                .provider_name = @constCast("openai_compatible"),
+                .base_url = @constCast(""),
+                .api_key = @constCast(""),
+                .model = .{ .id = @constCast("test") },
+                .use_responses_endpoint = true,
+            },
         },
     };
     try std.testing.expectEqual(

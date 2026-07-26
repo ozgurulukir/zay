@@ -103,20 +103,24 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
         // Canonical form: model_selection is the single source of truth.
         // Mirror all fields onto the target's legacy fields so the merge
         // result is self-consistent regardless of which path serialize uses.
-        target.provider = ms.provider;
+        target.provider = ms.provider();
         // Propagate provider_name so serialize's legacy fallback writes the
         // correct config key (e.g. "stepfun-ai-step-plan") instead of the
         // enum label ("openai_compatible").
         if (target.provider_name) |old| gpa.free(old);
-        target.provider_name = try gpa.dupe(u8, ms.provider_name);
+        target.provider_name = try gpa.dupe(u8, ms.providerName());
         if (target.model) |*old| old.deinit(gpa);
-        target.model = try ms.model.clone(gpa);
-        try replaceOptionalSlice(gpa, &target.base_url, ms.base_url);
-        try replaceOptionalSlice(gpa, &target.api_key, ms.api_key);
-        target.use_responses_endpoint = ms.use_responses_endpoint;
-        target.enable_thinking = ms.enable_thinking;
-        if (ms.system_prompt) |s| try replaceOptionalSlice(gpa, &target.system_prompt, s);
-        if (ms.bash_classifier_url) |s| try replaceOptionalSlice(gpa, &target.bash_classifier_url, s);
+        const model = switch (ms) {
+            .builtin => |b| b.model,
+            .custom => |c| c.model,
+        };
+        target.model = try model.clone(gpa);
+        if (ms.baseUrl()) |base_url| try replaceOptionalSlice(gpa, &target.base_url, base_url);
+        if (ms.apiKey()) |api_key| try replaceOptionalSlice(gpa, &target.api_key, api_key);
+        target.use_responses_endpoint = ms.useResponsesEndpoint();
+        target.enable_thinking = ms.enableThinking();
+        if (ms.systemPrompt()) |s| try replaceOptionalSlice(gpa, &target.system_prompt, s);
+        if (ms.bashClassifierUrl()) |s| try replaceOptionalSlice(gpa, &target.bash_classifier_url, s);
     } else {
         // Legacy fields: apply individual field overrides.
         if (updates.provider) |v| target.provider = v;
@@ -157,29 +161,38 @@ fn applyContextOverlay(target: *ContextSettings, updates: ContextSettings) void 
 /// prefers `model_selection` — writes the correct values.
 pub fn syncModelSelectionFromLegacy(gpa: std.mem.Allocator, target: *Config) !void {
     if (target.model_selection) |*ms| {
-        if (target.provider) |p| ms.provider = p;
-        if (target.model) |m| {
-            ms.model.deinit(gpa);
-            ms.model = try m.clone(gpa);
-        }
-        if (target.base_url) |s| {
-            gpa.free(ms.base_url);
-            ms.base_url = try gpa.dupe(u8, s);
-        }
-        if (target.api_key) |s| {
-            gpa.free(ms.api_key);
-            ms.api_key = try gpa.dupe(u8, s);
-        }
-        if (target.use_responses_endpoint) |v| ms.use_responses_endpoint = v;
-        if (target.enable_thinking) |v| ms.enable_thinking = v;
-        if (target.system_prompt) |s| {
-            if (ms.system_prompt) |old| gpa.free(old);
-            ms.system_prompt = try gpa.dupe(u8, s);
-        }
-        if (target.bash_classifier_url) |s| {
-            if (ms.bash_classifier_url) |old| gpa.free(old);
-            ms.bash_classifier_url = try gpa.dupe(u8, s);
-        }
+        // Sync fields from legacy into the typed selection. If the provider
+        // enum changed, rebuild the selection with the correct variant so
+        // illegal state combinations are impossible.
+        const provider = target.provider orelse return;
+        const model = target.model orelse return;
+        const provider_name = if (target.provider_name) |s| s else provider.label();
+        const base_url = if (target.base_url) |s| s else "";
+        const api_key = if (target.api_key) |s| s else "";
+        const new_selection: ModelSelection = if (provider == .openai_compatible) .{
+            .custom = .{
+                .provider_name = try gpa.dupe(u8, provider_name),
+                .base_url = try gpa.dupe(u8, base_url),
+                .api_key = try gpa.dupe(u8, api_key),
+                .model = try model.clone(gpa),
+                .use_responses_endpoint = target.use_responses_endpoint orelse false,
+                .enable_thinking = target.enable_thinking orelse false,
+                .system_prompt = if (target.system_prompt) |s| try gpa.dupe(u8, s) else null,
+                .bash_classifier_url = if (target.bash_classifier_url) |s| try gpa.dupe(u8, s) else null,
+            },
+        } else .{
+            .builtin = .{
+                .provider = provider,
+                .provider_name = try gpa.dupe(u8, provider_name),
+                .model = try model.clone(gpa),
+                .use_responses_endpoint = target.use_responses_endpoint orelse false,
+                .enable_thinking = target.enable_thinking orelse false,
+                .system_prompt = if (target.system_prompt) |s| try gpa.dupe(u8, s) else null,
+                .bash_classifier_url = if (target.bash_classifier_url) |s| try gpa.dupe(u8, s) else null,
+            },
+        };
+        ms.deinit(gpa);
+        target.model_selection = new_selection;
     }
 }
 
@@ -212,8 +225,12 @@ fn applyMcpServerOverlay(gpa: std.mem.Allocator, target: *Config, updates: McpSe
 }
 
 fn applyProviderOverlay(gpa: std.mem.Allocator, target: *Config, updates: ProviderConfig) !void {
+    // Match by config map key, not by provider enum. Multiple custom/dynamic
+    // providers share the `.openai_compatible` enum, so enum-based matching
+    // causes collisions where the first matching entry absorbs all updates
+    // and subsequent entries silently overwrite it.
     for (target.providers, 0..) |*provider, index| {
-        if (provider.provider != updates.provider) continue;
+        if (!std.mem.eql(u8, provider.name, updates.name)) continue;
         switch (updates.base_url) {
             .custom => |s| try replaceBaseUrl(gpa, &provider.base_url, s),
             .default => {},
@@ -258,6 +275,32 @@ fn applyProviderModelsOverlay(gpa: std.mem.Allocator, target: *ProviderConfig, u
 }
 
 fn hydrateActiveModel(gpa: std.mem.Allocator, config: *Config) !void {
+    const ms_opt = &config.model_selection;
+    if (ms_opt.*) |*ms| {
+        // Hydrate the model inside model_selection from the providers map.
+        const name = ms.providerName();
+        const model_ptr: *Model = switch (ms.*) {
+            .builtin => |*b| &b.model,
+            .custom => |*c| &c.model,
+        };
+        for (config.providers) |entry| {
+            if (!std.mem.eql(u8, entry.name, name)) continue;
+            for (entry.models) |entry_model| {
+                if (!std.mem.eql(u8, entry_model.id, model_ptr.id)) continue;
+                if (model_ptr.reasoning == .unset and entry_model.reasoning == .effort) {
+                    model_ptr.reasoning = entry_model.reasoning;
+                }
+                model_ptr.context_window = entry_model.context_window;
+                model_ptr.max_output_tokens = entry_model.max_output_tokens;
+                if (entry_model.reasoning_options.len > 0) {
+                    if (model_ptr.reasoning_options.len > 0) gpa.free(model_ptr.reasoning_options);
+                    model_ptr.reasoning_options = try gpa.dupe(ai.ReasoningEffort, entry_model.reasoning_options);
+                }
+                return;
+            }
+        }
+        return;
+    }
     const provider = config.provider orelse return;
     if (config.model == null) return;
     const name = config.provider_name orelse provider.label();
@@ -452,17 +495,34 @@ fn parseObject(
     if (out.provider != null and out.model != null and
         out.base_url != null and out.api_key != null)
     {
-        out.model_selection = .{
-            .provider = out.provider.?,
-            .provider_name = out.provider_name orelse try gpa.dupe(u8, out.provider.?.label()),
-            .model = out.model.?, // ownership moves; clear the legacy field
-            .base_url = out.base_url.?,
-            .api_key = out.api_key.?,
-            .use_responses_endpoint = out.use_responses_endpoint orelse false,
-            .enable_thinking = out.enable_thinking orelse false,
-            .system_prompt = out.system_prompt,
-            .bash_classifier_url = out.bash_classifier_url,
-        };
+        const provider = out.provider.?;
+        const model = out.model.?; // ownership moves; clear the legacy field
+        if (provider == .openai_compatible) {
+            out.model_selection = .{
+                .custom = .{
+                    .provider_name = out.provider_name orelse try gpa.dupe(u8, provider.label()),
+                    .base_url = out.base_url.?,
+                    .api_key = out.api_key.?,
+                    .model = model,
+                    .use_responses_endpoint = out.use_responses_endpoint orelse false,
+                    .enable_thinking = out.enable_thinking orelse false,
+                    .system_prompt = out.system_prompt,
+                    .bash_classifier_url = out.bash_classifier_url,
+                },
+            };
+        } else {
+            out.model_selection = .{
+                .builtin = .{
+                    .provider = provider,
+                    .provider_name = out.provider_name orelse try gpa.dupe(u8, provider.label()),
+                    .model = model,
+                    .use_responses_endpoint = out.use_responses_endpoint orelse false,
+                    .enable_thinking = out.enable_thinking orelse false,
+                    .system_prompt = out.system_prompt,
+                    .bash_classifier_url = out.bash_classifier_url,
+                },
+            };
+        }
         out.provider = null;
         out.provider_name = null;
         out.model = null;
@@ -944,20 +1004,20 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
     // only reads defaultModel (via parseModelSelection).
     if (config.model_selection) |ms| {
         try writeKey(writer, "defaultModel", &wrote_any);
-        try writeModelSelection(gpa, writer, ms.provider_name, ms.model.id);
-        if (ms.use_responses_endpoint) {
+        try writeModelSelection(gpa, writer, ms.providerName(), ms.model().id);
+        if (ms.useResponsesEndpoint()) {
             try writeKey(writer, "useResponsesEndpoint", &wrote_any);
             try writer.writeAll("true");
         }
-        if (ms.enable_thinking) {
+        if (ms.enableThinking()) {
             try writeKey(writer, "enableThinking", &wrote_any);
             try writer.writeAll("true");
         }
-        if (ms.system_prompt) |s| {
+        if (ms.systemPrompt()) |s| {
             try writeKey(writer, "systemPrompt", &wrote_any);
             try std.json.Stringify.value(s, .{}, writer);
         }
-        if (ms.bash_classifier_url) |url| {
+        if (ms.bashClassifierUrl()) |url| {
             try writeKey(writer, "bashClassifierUrl", &wrote_any);
             try std.json.Stringify.value(url, .{}, writer);
         }
@@ -1918,11 +1978,11 @@ test "applyConfigOverlay: model_selection present uses canonical form" {
     var updates: Config = .{
         .provider = .openai, // legacy — should be ignored
         .model_selection = .{
-            .provider = .anthropic,
-            .provider_name = try gpa.dupe(u8, "anthropic"),
-            .model = .{ .id = try gpa.dupe(u8, "claude-3.7-sonnet") },
-            .base_url = try gpa.dupe(u8, "https://api.anthropic.com"),
-            .api_key = try gpa.dupe(u8, ""),
+            .builtin = .{
+                .provider = .anthropic,
+                .provider_name = try gpa.dupe(u8, "anthropic"),
+                .model = .{ .id = try gpa.dupe(u8, "claude-3.7-sonnet") },
+            },
         },
     };
     defer updates.deinit(gpa);
@@ -1931,7 +1991,10 @@ test "applyConfigOverlay: model_selection present uses canonical form" {
 
     try std.testing.expectEqual(Provider.anthropic, target.provider.?);
     try std.testing.expectEqualStrings("claude-3.7-sonnet", target.model.?.id);
-    try std.testing.expectEqualStrings("https://api.anthropic.com", target.base_url.?);
+    // builtin providers don't carry base_url/api_key in model_selection;
+    // they resolve from the provider catalogue at connection time.
+    try std.testing.expect(target.base_url == null);
+    try std.testing.expect(target.api_key == null);
 }
 
 test "applyConfigOverlay: legacy fields sync to model_selection" {
@@ -1948,11 +2011,11 @@ test "applyConfigOverlay: legacy fields sync to model_selection" {
     target.enable_thinking = false;
     // Manually populate model_selection (normally done by parseObject).
     target.model_selection = .{
-        .provider = .openai,
-        .provider_name = try gpa.dupe(u8, "openai"),
-        .model = .{ .id = try gpa.dupe(u8, "gpt-5.5") },
-        .base_url = try gpa.dupe(u8, "https://api.openai.com"),
-        .api_key = try gpa.dupe(u8, "sk-test"),
+        .builtin = .{
+            .provider = .openai,
+            .provider_name = try gpa.dupe(u8, "openai"),
+            .model = .{ .id = try gpa.dupe(u8, "gpt-5.5") },
+        },
     };
 
     // Updates carry only legacy fields (no model_selection).
@@ -1969,8 +2032,8 @@ test "applyConfigOverlay: legacy fields sync to model_selection" {
     try std.testing.expectEqualStrings("You are a helpful assistant.", target.system_prompt.?);
 
     // model_selection should also be in sync.
-    try std.testing.expectEqual(true, target.model_selection.?.enable_thinking);
-    try std.testing.expectEqualStrings("You are a helpful assistant.", target.model_selection.?.system_prompt.?);
+    try std.testing.expectEqual(true, target.model_selection.?.enableThinking());
+    try std.testing.expectEqualStrings("You are a helpful assistant.", target.model_selection.?.systemPrompt().?);
 
     // Provider/model should be unchanged.
     try std.testing.expectEqual(Provider.openai, target.provider.?);

@@ -226,7 +226,7 @@ pub const Content = struct {
             const selected = sel == 0;
             if (selected) panel.fillRow(surface, 4, StylePalette.selected);
             const value = self.state.pending_enable_thinking orelse
-                (if (self.config.model_selection) |ms| ms.enable_thinking else false);
+                (if (self.config.model_selection) |ms| ms.enableThinking() else false);
             const label = try std.fmt.allocPrint(ctx.arena, "  Enable Thinking Mode    {s}", .{boolBadge(value)});
             const style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;
             try panel.lineStyledAt(surface, 4, label, ctx, left_col, style);
@@ -239,7 +239,7 @@ pub const Content = struct {
             const selected = sel == 1;
             if (selected) panel.fillRow(surface, 7, StylePalette.selected);
             const value = self.state.pending_use_responses_endpoint orelse
-                (if (self.config.model_selection) |ms| ms.use_responses_endpoint else false);
+                (if (self.config.model_selection) |ms| ms.useResponsesEndpoint() else false);
             const label = try std.fmt.allocPrint(ctx.arena, "  Use Responses Endpoint  {s}", .{boolBadge(value)});
             const style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;
             try panel.lineStyledAt(surface, 7, label, ctx, left_col, style);
@@ -278,7 +278,7 @@ pub const Content = struct {
         else
             self.state.pending_system_prompt orelse
                 (if (self.config.model_selection) |ms|
-                    (ms.system_prompt orelse "")
+                    (ms.systemPrompt() orelse "")
                 else
                     "");
 
@@ -313,7 +313,7 @@ pub const Content = struct {
             else
                 self.state.pending_bash_classifier_url orelse
                     (if (self.config.model_selection) |ms|
-                        (ms.bash_classifier_url orelse "")
+                        (ms.bashClassifierUrl() orelse "")
                     else
                         "");
             const style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;

@@ -217,10 +217,19 @@ pub const Config = struct {
     }
 
     pub fn activeModelSelection(self: *const Config) ?ModelSelectionRef {
+        if (self.model_selection) |ms| {
+            return switch (ms) {
+                .builtin => |b| ModelSelectionRef{ .builtin = .{ .provider = b.provider, .provider_name = b.provider_name, .model = &b.model } },
+                .custom => |c| ModelSelectionRef{ .custom = .{ .provider_name = c.provider_name, .base_url = c.base_url, .api_key = c.api_key, .model = &c.model } },
+            };
+        }
         const provider = self.provider orelse return null;
-        const model = if (self.model) |*model| model else return null;
+        const model_ptr = if (self.model) |*m| m else return null;
         const name = self.provider_name orelse provider.label();
-        return .{ .provider = provider, .provider_name = name, .model = model };
+        if (provider == .openai_compatible) {
+            return ModelSelectionRef{ .custom = .{ .provider_name = name, .base_url = self.base_url orelse "", .api_key = self.api_key orelse "", .model = model_ptr } };
+        }
+        return ModelSelectionRef{ .builtin = .{ .provider = provider, .provider_name = name, .model = model_ptr } };
     }
 };
 

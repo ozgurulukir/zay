@@ -138,9 +138,9 @@ pub fn collectModelCacheConfigured(self: *App) !std.ArrayList(model_cache.Config
 
     if (provider_model.shouldLoadConfiguredCompatibleCatalog(self)) {
         if (self.cached_config.model_selection) |ms| {
-            const provider = ms.provider;
+            const provider = ms.provider();
             if (!provider.isCatalogue()) {
-                try list.append(self.gpa, .{ .provider = provider, .base_url = ms.base_url, .auth_mode = .keyed });
+                try list.append(self.gpa, .{ .provider = provider, .base_url = ms.baseUrl().?, .auth_mode = .keyed });
             }
         }
     }
