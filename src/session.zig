@@ -50,6 +50,11 @@ pub const SessionManager = struct {
             const dirname = std.fs.path.dirname(path) orelse return error.InvalidPath;
             std.Io.Dir.createDirPath(.cwd(), io, dirname) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
+                error.FileNotFound,
+                error.NotDir,
+                error.BadPathName,
+                => return error.InvalidPath,
+                error.Canceled => return error.Canceled,
                 else => return error.SystemResources,
             };
         }
@@ -697,13 +702,19 @@ fn firstTextBlock(object: std.json.ObjectMap) []const u8 {
     return "";
 }
 
-/// Collapse runs of whitespace to single spaces and truncate to `max` columns
-/// (byte-approximate; trailing "..." added when cut). Caller owns the result.
+/// Collapse runs of whitespace to single spaces and truncate to `max` columns.
+/// Trailing "..." is added when cut and counts toward the `max` budget. Caller
+/// owns the result.
 fn collapseWhitespace(gpa: std.mem.Allocator, text: []const u8, max: u32) Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     var pending_space = false;
     var started = false;
+    // Reserve 3 bytes for the "..." suffix so the total output never exceeds
+    // `max`. Without this, a byte that pushes past max is appended first, then
+    // "..." adds 3 more bytes — producing max + 3 (or max + 4 with a pending
+    // space).
+    const cap = max -| 3;
     for (text) |byte| {
         const is_space = byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
         if (is_space) {
@@ -711,15 +722,19 @@ fn collapseWhitespace(gpa: std.mem.Allocator, text: []const u8, max: u32) Error!
             continue;
         }
         if (pending_space) {
+            if (out.items.len >= cap) {
+                try out.appendSlice(gpa, "...");
+                break;
+            }
             try out.append(gpa, ' ');
             pending_space = false;
         }
-        try out.append(gpa, byte);
-        started = true;
-        if (out.items.len >= max) {
+        if (out.items.len >= cap) {
             try out.appendSlice(gpa, "...");
             break;
         }
+        try out.append(gpa, byte);
+        started = true;
     }
     return out.toOwnedSlice(gpa);
 }

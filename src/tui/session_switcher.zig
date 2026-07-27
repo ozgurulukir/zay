@@ -26,6 +26,39 @@ fn resumeFoldIndex(app: *const App, cwd: []const u8) ?usize {
     return null;
 }
 
+/// Build a cwd → max_updated_at_ms map for O(1) project-lookup in the sort
+/// comparator. Caller owns the map and its backing allocator.
+fn buildProjectMaxMap(gpa: std.mem.Allocator, summaries: []const session_mod.SessionSummary) !std.StringHashMap(i64) {
+    var map = std.StringHashMap(i64).init(gpa);
+    errdefer map.deinit();
+    for (summaries) |summary| {
+        const entry = try map.getOrPut(summary.cwd);
+        if (!entry.found_existing) {
+            entry.key_ptr.* = summary.cwd;
+            entry.value_ptr.* = summary.updated_at_ms;
+        } else {
+            entry.value_ptr.* = @max(entry.value_ptr.*, summary.updated_at_ms);
+        }
+    }
+    return map;
+}
+
+/// Sort comparator that uses a precomputed cwd → max_updated_at_ms map for O(1)
+/// project lookups instead of scanning all summaries per comparison.
+fn resumeSummaryLessThanWithMap(map: *const std.StringHashMap(i64), left: session_mod.SessionSummary, right: session_mod.SessionSummary) bool {
+    if (std.mem.eql(u8, left.cwd, right.cwd)) return left.updated_at_ms > right.updated_at_ms;
+
+    const left_project_updated_at_ms = map.get(left.cwd) orelse std.math.minInt(i64);
+    const right_project_updated_at_ms = map.get(right.cwd) orelse std.math.minInt(i64);
+    if (left_project_updated_at_ms != right_project_updated_at_ms) {
+        return left_project_updated_at_ms > right_project_updated_at_ms;
+    }
+
+    return std.mem.lessThan(u8, left.cwd, right.cwd);
+}
+
+/// Legacy comparator (O(n) per comparison). Kept for the cross-module test in
+/// tui.zig. Prefer `resumeSummaryLessThanWithMap` for production use.
 pub fn resumeSummaryLessThan(summaries: []const session_mod.SessionSummary, left: session_mod.SessionSummary, right: session_mod.SessionSummary) bool {
     if (std.mem.eql(u8, left.cwd, right.cwd)) return left.updated_at_ms > right.updated_at_ms;
 
@@ -71,6 +104,7 @@ pub fn openResumePicker(app: *App) !void {
     try app.reloadResumeSessions();
     const summaries = app.resume_summaries.items;
     const filter = app.peekPaletteInput() catch "";
+    defer if (filter.len > 0) app.gpa.free(filter);
     _ = resume_picker.visibleCount(summaries, filter, app.resume_folded_projects.items, app.nav.resume_global);
     app.nav.resume_selection = 0;
     app.nav.block_nav = false;
@@ -88,12 +122,20 @@ pub fn reloadResumeSessions(app: *App) !void {
     const summaries = try manager.list(app.gpa, cwd);
     defer app.gpa.free(summaries);
     try app.resume_summaries.appendSlice(app.gpa, summaries);
-    if (app.nav.resume_global) std.mem.sort(
-        session_mod.SessionSummary,
-        app.resume_summaries.items,
-        app.resume_summaries.items,
-        resumeSummaryLessThan,
-    );
+    if (app.nav.resume_global) {
+        var map = try buildProjectMaxMap(app.gpa, app.resume_summaries.items);
+        defer map.deinit();
+        std.mem.sort(
+            session_mod.SessionSummary,
+            app.resume_summaries.items,
+            &map,
+            struct {
+                fn cmp(m: *const std.StringHashMap(i64), a: session_mod.SessionSummary, b: session_mod.SessionSummary) bool {
+                    return resumeSummaryLessThanWithMap(m, a, b);
+                }
+            }.cmp,
+        );
+    }
     if (app.nav.resume_selection >= try visibleResumeCount(app)) app.nav.resume_selection = 0;
     syncResumeListCursor(app);
 }
