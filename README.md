@@ -51,7 +51,7 @@ of `src/tui/` is split by concern:
 
 - `event_router.zig` — top-level event entry (`captureEvent`), key/mouse dispatch, and modal focus routing.
 - `command_router.zig` — per-mode key dispatch (one struct per `App.Mode`).
-- `app_state.zig` — `App` state grouped into sub-structs (`InputState`, `PickerStates`, `NavState`).
+- `app_state.zig` — `App` state grouped into sub-structs (`InputState`, `PickerStates`, `NavState`, `ListWidgets`, `ProviderState`, `InputBuffers`, `AtSearchState`, `BackgroundModalState`, `MetricsState`).
 - `settings_lifecycle.zig` — settings panel tabbed navigation, inline text editing, live config sync, and `Ctrl+S` disk save.
 - `clipboard_helper.zig` — TUI integration for system clipboard operations (`copySelectedTranscriptBlock`, `copyDiffToClipboard`, `pasteToFocusedInput`).
 - `background_delivery.zig` — background-job poll/format/deliver, modal toggling, job cancel.

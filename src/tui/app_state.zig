@@ -15,6 +15,9 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const tui = @import("../tui.zig");
 const agent_mod = @import("../agent.zig");
+const auth = @import("../auth/store.zig");
+const modelsdev = @import("../models/registry.zig");
+const model_picker = @import("widgets/model_picker.zig");
 const tree_selector = @import("widgets/tree_selector.zig");
 const model_catalogue = @import("model_catalogue.zig");
 const provider_picker = @import("widgets/provider_picker.zig");
@@ -170,6 +173,70 @@ pub const BackgroundModalState = struct {
     selection: usize = 0,
     cancel_focus: bool = false,
     pending: std.ArrayList(BackgroundDelivery) = .empty,
+};
+
+/// The four scrollable list views used by overlays: session resume,
+/// file tree, model picker, and lanes management. Grouped to keep the
+/// `App` struct lean.
+pub const ListWidgets = struct {
+    resume_list: vxfw.ListView = .{
+        .children = .{ .slice = &.{} },
+        .draw_cursor = false,
+        .wheel_scroll = 3,
+    },
+    tree_list: vxfw.ListView = .{
+        .children = .{ .slice = &.{} },
+        .draw_cursor = false,
+        .wheel_scroll = 3,
+    },
+    model_list: vxfw.ListView = .{
+        .children = .{ .slice = &.{} },
+        .draw_cursor = false,
+        .wheel_scroll = 3,
+    },
+    lanes_list: vxfw.ListView = .{
+        .children = .{ .slice = &.{} },
+        .draw_cursor = false,
+        .wheel_scroll = 3,
+    },
+};
+
+/// Provider connectivity, model catalogue, and API key state. Grouped
+/// to keep the `App` struct lean.
+pub const ProviderState = struct {
+    /// API keys per provider, loaded from `auth.json`. Owned; freed in `deinit`.
+    api_keys: auth.ApiKeyMap = .empty,
+    /// Models.dev dynamic provider registry, loaded on `/connect` open.
+    /// Owned; freed in `deinit`.
+    modelsdev_registry: ?modelsdev.Registry = null,
+    /// Backing slice for provider picker's merged provider list. Owned; freed in `deinit`.
+    entries_slice: ?[]const provider_picker.ProviderHandle = null,
+    /// Per-model reasoning options from config, cached for the model picker.
+    /// Rebuilt when the picker opens or the active model changes. Empty
+    /// means "fall back to the global hardcoded list".
+    reasoning_opts_cache: [7]model_picker.ReasoningOption = undefined,
+    reasoning_opts_len: u32 = 0,
+    /// Live connectivity per catalogue provider, indexed by `catalogueProviders()`
+    /// order. Derived from the model load's per-provider outcome.
+    conn_status: [tui.catalogue_provider_count]provider_picker.Status = @splat(.unknown),
+    /// True while the in-flight model load is a full connected-provider sweep,
+    /// so the picker knows to reset `conn_status` when outcomes arrive.
+    conn_recompute: bool = false,
+};
+
+/// Inline edit buffers for text fields across overlays. Grouped to keep
+/// the `App` struct lean.
+pub const InputBuffers = struct {
+    /// Inline edit buffer for the provider setup form's API-key field. Owned;
+    /// freed in `deinit`.
+    provider_key: std.ArrayList(u8) = .empty,
+    /// Inline edit buffer for the settings panel text fields (system_prompt,
+    /// bash_classifier_url). Shared across all edit targets because only one
+    /// can be active at a time. Owned; freed in `deinit`.
+    settings_text: std.ArrayList(u8) = .empty,
+    /// Inline edit buffer for the MCP overlay's "add server by URL" form.
+    /// Owned; freed in `deinit`.
+    mcp_url: std.ArrayList(u8) = .empty,
 };
 
 /// Visual feedback state: the loading spinner frame, the black-hole

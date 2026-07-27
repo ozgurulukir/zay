@@ -227,7 +227,7 @@ const OverlayInner = struct {
         var content: mcp_status.Content = .{
             .state = &app.pickers.mcp,
             .manager = &app.mcp_manager,
-            .url_input = app.mcp_url_input.items,
+            .url_input = app.input_buffers.mcp_url.items,
         };
         return content.widget().draw(ctx);
     }
@@ -244,8 +244,8 @@ const OverlayInner = struct {
             .config = &app.cached_config,
             .home_dir = if (runtime) |r| r.home_dir else "",
             .cwd = if (runtime) |r| r.cwd else ".",
-            .system_prompt_input = app.settings_text_input.items,
-            .bash_classifier_input = app.settings_text_input.items,
+            .system_prompt_input = app.input_buffers.settings_text.items,
+            .bash_classifier_input = app.input_buffers.settings_text.items,
         };
         return content.widget().draw(ctx);
     }
@@ -260,7 +260,7 @@ const OverlayInner = struct {
     fn drawTreeContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         var content: tree_selector.Content = .{
             .state = &app.pickers.tree,
-            .list = &app.tree_list,
+            .list = &app.list_widgets.tree_list,
         };
         return content.widget().draw(ctx);
     }
@@ -268,7 +268,7 @@ const OverlayInner = struct {
     fn drawLanesContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const entries = try app.buildLaneEntries(ctx.arena);
         var content: lanes_picker.Content = .{
-            .list = &app.lanes_list,
+            .list = &app.list_widgets.lanes_list,
             .entries = entries,
             .selection = app.nav.lanes_selection,
             .empty_message = switch (app.nav.lanes_purpose) {
@@ -304,7 +304,7 @@ const OverlayInner = struct {
         defer app.gpa.free(filter);
         var content: resume_picker.Content = .{
             .io = app.io,
-            .list = &app.resume_list,
+            .list = &app.list_widgets.resume_list,
             .summaries = app.resume_summaries.items,
             .selection = app.nav.resume_selection,
             .folded_projects = app.resume_folded_projects.items,
@@ -320,9 +320,9 @@ const OverlayInner = struct {
             .codex_signed_in = app.isCodexSignedIn(),
             // `conn_status` is indexed by `catalogueProviders()` order, exactly
             // how the picker iterates its rows.
-            .statuses = &app.conn_status,
-            .key_input = app.provider_key_input.items,
-            .api_keys = &app.provider_api_keys,
+            .statuses = &app.provider_state.conn_status,
+            .key_input = app.input_buffers.provider_key.items,
+            .api_keys = &app.provider_state.api_keys,
         };
         return content.widget().draw(ctx);
     }
@@ -343,7 +343,7 @@ const OverlayInner = struct {
         }
         var content: model_picker.Content = .{
             .models = picker_models,
-            .list = &app.model_list,
+            .list = &app.list_widgets.model_list,
             .selection = app.pickers.models.model_selection,
             .column = app.pickers.models.model_column,
             .active_model = if (status) |value| value.model else null,

@@ -48,7 +48,7 @@ pub fn cancelMode(app: *App) !bool {
     if (app.mode == .provider_picker and app.pickers.provider.stage == .form) {
         app.pickers.provider.stage = .list;
         app.pickers.provider.form_handle = null;
-        app.provider_key_input.clearRetainingCapacity();
+        app.input_buffers.provider_key.clearRetainingCapacity();
         return true;
     }
     // Settings: Esc cancels any active text edit, or closes the panel.

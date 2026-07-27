@@ -488,7 +488,7 @@ const McpMode = struct {
         }
         if (key.matches('a', .{})) {
             app.pickers.mcp.adding = true;
-            app.mcp_url_input.clearRetainingCapacity();
+            app.input_buffers.mcp_url.clearRetainingCapacity();
             return true;
         }
         return false;
@@ -499,14 +499,14 @@ const McpMode = struct {
     fn handleAddInput(app: *App, key: vaxis.Key) !bool {
         if (key.matches(vaxis.Key.escape, .{})) {
             app.pickers.mcp.adding = false;
-            app.mcp_url_input.clearRetainingCapacity();
+            app.input_buffers.mcp_url.clearRetainingCapacity();
             return true;
         }
         if (isEnterKey(key)) {
-            const url = std.mem.trim(u8, app.mcp_url_input.items, " \t\r\n");
+            const url = std.mem.trim(u8, app.input_buffers.mcp_url.items, " \t\r\n");
             if (url.len > 0) provider_model.addMcpServerByUrl(app, url) catch {};
             app.pickers.mcp.adding = false;
-            app.mcp_url_input.clearRetainingCapacity();
+            app.input_buffers.mcp_url.clearRetainingCapacity();
             return true;
         }
         if (key.matches(vaxis.Key.backspace, .{})) {
@@ -516,12 +516,12 @@ const McpMode = struct {
         if (key.text) |text| {
             const trimmed = std.mem.trim(u8, text, "\r\n");
             if (trimmed.len > 0) {
-                try app.mcp_url_input.appendSlice(app.gpa, trimmed);
+                try app.input_buffers.mcp_url.appendSlice(app.gpa, trimmed);
                 return true;
             }
         } else if (key.codepoint >= 32 and key.codepoint <= 126 and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
             const byte: u8 = @intCast(key.codepoint);
-            try app.mcp_url_input.append(app.gpa, byte);
+            try app.input_buffers.mcp_url.append(app.gpa, byte);
             return true;
         }
         return true;
@@ -540,13 +540,13 @@ test "provider picker setup form captures key codepoints and text without swallo
     app.pickers.provider.stage = .form;
 
     try std.testing.expect(try ProviderPicker.handle(&app, .{ .codepoint = 's' }));
-    try std.testing.expectEqualStrings("s", app.provider_key_input.items);
+    try std.testing.expectEqualStrings("s", app.input_buffers.provider_key.items);
 
     try std.testing.expect(try ProviderPicker.handle(&app, .{ .codepoint = 'k' }));
-    try std.testing.expectEqualStrings("sk", app.provider_key_input.items);
+    try std.testing.expectEqualStrings("sk", app.input_buffers.provider_key.items);
 
     try std.testing.expect(try ProviderPicker.handle(&app, .{ .codepoint = vaxis.Key.backspace }));
-    try std.testing.expectEqualStrings("s", app.provider_key_input.items);
+    try std.testing.expectEqualStrings("s", app.input_buffers.provider_key.items);
 
     try std.testing.expect(!try ProviderPicker.handle(&app, .{ .codepoint = vaxis.Key.enter }));
 }

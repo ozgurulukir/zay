@@ -33,9 +33,9 @@ pub fn openProviderPicker(self: *App) !void {
     try refreshProviderApiKeys(self);
     // Always refresh the models.dev registry so newly added providers
     // appear immediately instead of waiting for the 24h cache TTL.
-    if (self.modelsdev_registry) |*r| {
+    if (self.provider_state.modelsdev_registry) |*r| {
         r.deinit(self.gpa);
-        self.modelsdev_registry = null;
+        self.provider_state.modelsdev_registry = null;
     }
     try ensureModelsDevRegistry(self);
     // Refresh the badges from a live model load (merge, so the catalogue isn't
@@ -45,11 +45,11 @@ pub fn openProviderPicker(self: *App) !void {
 }
 
 pub fn ensureModelsDevRegistry(self: *App) !void {
-    if (self.modelsdev_registry == null) {
+    if (self.provider_state.modelsdev_registry == null) {
         const home = if (self.liveRuntime()) |r| r.home_dir else "";
-        self.modelsdev_registry = modelsdev.loadOrFetchRegistry(self.gpa, self.io, home);
+        self.provider_state.modelsdev_registry = modelsdev.loadOrFetchRegistry(self.gpa, self.io, home);
     }
-    if (self.modelsdev_registry) |*reg| {
+    if (self.provider_state.modelsdev_registry) |*reg| {
         try buildMergedProviderList(self, reg.providers);
     }
 }
@@ -84,7 +84,7 @@ fn buildMergedProviderList(self: *App, all_providers: []const modelsdev.Provider
     // the picker shows the provider as a custom/config provider.
     if (self.cached_config_owned) {
         for (self.cached_config.providers) |cp| {
-            if (self.modelsdev_registry) |*reg| {
+            if (self.provider_state.modelsdev_registry) |*reg| {
                 if (reg.lookup(cp.name) != null) continue;
             }
             if (findEntryIndex(entries.items, cp.name)) |idx| {
@@ -95,9 +95,9 @@ fn buildMergedProviderList(self: *App, all_providers: []const modelsdev.Provider
         }
     }
 
-    if (self.entries_slice) |old| self.gpa.free(old);
+    if (self.provider_state.entries_slice) |old| self.gpa.free(old);
     const owned = try entries.toOwnedSlice(self.gpa);
-    self.entries_slice = owned;
+    self.provider_state.entries_slice = owned;
     self.pickers.provider.entries = owned;
 }
 
@@ -121,8 +121,8 @@ pub fn refreshProviderApiKeys(self: *App) !void {
     const home = self.liveRuntime().?.home_dir;
     if (home.len == 0) return;
     var fresh = try auth.loadAllProviderApiKeys(self.gpa, self.io, home);
-    auth.freeApiKeyMap(self.gpa, &self.provider_api_keys);
-    self.provider_api_keys = fresh;
+    auth.freeApiKeyMap(self.gpa, &self.provider_state.api_keys);
+    self.provider_state.api_keys = fresh;
     fresh = .empty;
 }
 
@@ -141,10 +141,10 @@ pub fn catalogueIndex(provider: config_mod.Provider) ?usize {
 /// stops reading connected; a single-provider load updates only what it
 /// fetched.
 pub fn applyProviderOutcomes(self: *App, outcomes: []const model_loader.ProviderOutcome) void {
-    if (self.conn_recompute) self.conn_status = @splat(.unknown);
+    if (self.provider_state.conn_recompute) self.provider_state.conn_status = @splat(.unknown);
     for (outcomes) |outcome| {
         const index = catalogueIndex(outcome.provider) orelse continue;
-        self.conn_status[index] = if (outcome.ok) .connected else .failed;
+        self.provider_state.conn_status[index] = if (outcome.ok) .connected else .failed;
     }
 }
 
@@ -152,9 +152,9 @@ pub fn openProviderEntryForm(self: *App, handle: provider_picker.ProviderHandle)
     self.pickers.provider.stage = .form;
     self.pickers.provider.form_handle = handle;
     self.pickers.provider.form_error = null;
-    self.provider_key_input.clearRetainingCapacity();
-    if (self.provider_api_keys.get(handle.id())) |existing| {
-        self.provider_key_input.appendSlice(self.gpa, existing) catch {};
+    self.input_buffers.provider_key.clearRetainingCapacity();
+    if (self.provider_state.api_keys.get(handle.id())) |existing| {
+        self.input_buffers.provider_key.appendSlice(self.gpa, existing) catch {};
     }
 }
 
@@ -210,7 +210,7 @@ pub fn startModelLoad(self: *App, catalog: ModelCatalog, merge: bool) !void {
     // A connected-provider sweep fetches every configured provider, so its
     // result is authoritative for all badges; an openai_codex load touches no
     // catalogue providers and must not reset them.
-    self.conn_recompute = catalog == .connected_provider;
+    self.provider_state.conn_recompute = catalog == .connected_provider;
     if (self.pickers.models.load == .failed) {
         self.gpa.free(self.pickers.models.load.failed.message);
         self.pickers.models.load = .idle;
@@ -271,13 +271,13 @@ pub fn collectConfiguredProviders(self: *App, catalog: ModelCatalog) ![]model_lo
             const base_url = provider.defaultBaseUrl() orelse continue;
             // Stored key wins; otherwise an anonymous-tier provider (OpenCode
             // Zen) still loads via its `public` sentinel (free models only).
-            const key = self.provider_api_keys.get(provider.label()) orelse anon: {
+            const key = self.provider_state.api_keys.get(provider.label()) orelse anon: {
                 break :anon provider.anonymousApiKey() orelse continue;
             };
             try appendConfigured(self, &list, provider, base_url, key);
         }
-        if (self.modelsdev_registry) |*reg| {
-            var it = self.provider_api_keys.iterator();
+        if (self.provider_state.modelsdev_registry) |*reg| {
+            var it = self.provider_state.api_keys.iterator();
             while (it.next()) |entry| {
                 const id = entry.key_ptr.*;
                 if (catalogueIndexById(id) != null) continue;
@@ -297,8 +297,8 @@ pub fn collectConfiguredProviders(self: *App, catalog: ModelCatalog) ![]model_lo
                 // After session resume dynamic_provider_id is null (runtime-only);
                 // fall back to the serialized model_selection.provider_name.
                 const id = self.cached_config.dynamic_provider_id orelse ms.providerName();
-                if (self.provider_api_keys.get(id) == null) break :blk false;
-                if (self.modelsdev_registry) |*reg| {
+                if (self.provider_state.api_keys.get(id) == null) break :blk false;
+                if (self.provider_state.modelsdev_registry) |*reg| {
                     if (reg.lookup(id) != null) break :blk true;
                 }
                 break :blk false;
@@ -314,9 +314,9 @@ pub fn collectConfiguredProviders(self: *App, catalog: ModelCatalog) ![]model_lo
                         if (key.len > 0) break :blk key;
                     }
                     if (self.cached_config.dynamic_provider_id) |id| {
-                        break :blk self.provider_api_keys.get(id) orelse "";
+                        break :blk self.provider_state.api_keys.get(id) orelse "";
                     }
-                    break :blk self.provider_api_keys.get(ms.providerName()) orelse "";
+                    break :blk self.provider_state.api_keys.get(ms.providerName()) orelse "";
                 };
                 try appendConfigured(self, &list, provider, base_url, api_key);
             }
@@ -420,9 +420,9 @@ pub fn signOutCodex(self: *App) !void {
 /// require one (`requiresApiKey() == false`); all current ones do.
 pub fn submitProviderSetup(self: *App, provider: config_mod.Provider) !void {
     if (self.thread.turn.isActive()) return error.InFlightTurn;
-    var key = std.mem.trim(u8, self.provider_key_input.items, " \t\r\n");
+    var key = std.mem.trim(u8, self.input_buffers.provider_key.items, " \t\r\n");
     if (key.len == 0) {
-        if (self.provider_api_keys.get(provider.label())) |existing| {
+        if (self.provider_state.api_keys.get(provider.label())) |existing| {
             key = existing;
         }
     }
@@ -468,7 +468,7 @@ pub fn submitProviderSetup(self: *App, provider: config_mod.Provider) !void {
 
     self.pickers.provider.stage = .list;
     self.pickers.provider.form_handle = null;
-    self.provider_key_input.clearRetainingCapacity();
+    self.input_buffers.provider_key.clearRetainingCapacity();
 
     self.mode = .model_picker;
     tui.rebuildReasoningOptsCache(self);
@@ -485,9 +485,9 @@ pub fn submitProviderSetup(self: *App, provider: config_mod.Provider) !void {
 
 pub fn submitDynamicProviderSetup(self: *App, provider: modelsdev.Provider) !void {
     if (self.thread.turn.isActive()) return error.InFlightTurn;
-    var key = std.mem.trim(u8, self.provider_key_input.items, " \t\r\n");
+    var key = std.mem.trim(u8, self.input_buffers.provider_key.items, " \t\r\n");
     if (key.len == 0) {
-        if (self.provider_api_keys.get(provider.id)) |existing| {
+        if (self.provider_state.api_keys.get(provider.id)) |existing| {
             key = existing;
         }
     }
@@ -536,7 +536,7 @@ pub fn submitDynamicProviderSetup(self: *App, provider: modelsdev.Provider) !voi
 
     self.pickers.provider.stage = .list;
     self.pickers.provider.form_handle = null;
-    self.provider_key_input.clearRetainingCapacity();
+    self.input_buffers.provider_key.clearRetainingCapacity();
 
     self.mode = .model_picker;
     tui.rebuildReasoningOptsCache(self);
@@ -551,9 +551,9 @@ pub fn submitDynamicProviderSetup(self: *App, provider: modelsdev.Provider) !voi
 
 pub fn submitConfigProviderSetup(self: *App, provider: config_mod.ProviderConfig) !void {
     if (self.thread.turn.isActive()) return error.InFlightTurn;
-    var key = std.mem.trim(u8, self.provider_key_input.items, " \t\r\n");
+    var key = std.mem.trim(u8, self.input_buffers.provider_key.items, " \t\r\n");
     if (key.len == 0) {
-        if (self.provider_api_keys.get(provider.name)) |existing| {
+        if (self.provider_state.api_keys.get(provider.name)) |existing| {
             key = existing;
         }
     }
@@ -597,7 +597,7 @@ pub fn submitConfigProviderSetup(self: *App, provider: config_mod.ProviderConfig
 
     self.pickers.provider.stage = .list;
     self.pickers.provider.form_handle = null;
-    self.provider_key_input.clearRetainingCapacity();
+    self.input_buffers.provider_key.clearRetainingCapacity();
 
     self.mode = .model_picker;
     tui.rebuildReasoningOptsCache(self);
@@ -618,7 +618,7 @@ pub fn startDynamicProviderModelLoad(self: *App, provider: modelsdev.Provider, k
 /// dynamic providers and user-defined config providers).
 pub fn startOpenAiCompatibleModelLoad(self: *App, base_url: []const u8, key: []const u8, display_name: []const u8) !void {
     cancelModelLoad(self);
-    self.conn_recompute = false;
+    self.provider_state.conn_recompute = false;
     if (self.pickers.models.load == .failed) {
         self.gpa.free(self.pickers.models.load.failed.message);
         self.pickers.models.load = .idle;
@@ -666,7 +666,7 @@ pub fn startProviderModelLoad(self: *App, provider: config_mod.Provider, key: []
     cancelModelLoad(self);
     // Single provider: its outcome updates only this provider's badge, never
     // a full recompute that would wipe the others.
-    self.conn_recompute = false;
+    self.provider_state.conn_recompute = false;
     if (self.pickers.models.load == .failed) {
         self.gpa.free(self.pickers.models.load.failed.message);
         self.pickers.models.load = .idle;
@@ -1121,15 +1121,15 @@ pub fn compatibleApiKey(self: *const App, provider: config_mod.Provider) []const
     // Dynamic/custom providers: auth.json key is the stashed provider id.
     if (provider == .openai_compatible) {
         if (self.cached_config.dynamic_provider_id) |id| {
-            if (self.provider_api_keys.get(id)) |key| return key;
+            if (self.provider_state.api_keys.get(id)) |key| return key;
         }
         // After session resume dynamic_provider_id is null (runtime-only).
         // Fall back to model_selection.provider_name which IS serialized.
         if (self.cached_config.model_selection) |ms| {
-            if (self.provider_api_keys.get(ms.providerName())) |key| return key;
+            if (self.provider_state.api_keys.get(ms.providerName())) |key| return key;
         }
     } else {
-        if (self.provider_api_keys.get(provider.label())) |key| return key;
+        if (self.provider_state.api_keys.get(provider.label())) |key| return key;
     }
     if (self.cached_config.api_key) |key| return key;
     if (provider.anonymousApiKey()) |anon| return anon;

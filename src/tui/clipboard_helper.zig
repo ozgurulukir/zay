@@ -29,7 +29,7 @@ pub fn pasteToFocusedInput(app: *App, text: []const u8) !void {
         },
         .settings => {
             if (app.pickers.settings.edit_target != .none) {
-                try app.settings_text_input.appendSlice(app.gpa, clean_text);
+                try app.input_buffers.settings_text.appendSlice(app.gpa, clean_text);
             }
         },
         .diff_viewer => {
@@ -44,7 +44,7 @@ pub fn pasteToFocusedInput(app: *App, text: []const u8) !void {
         },
         .mcp => {
             if (app.pickers.mcp.adding) {
-                try app.mcp_url_input.appendSlice(app.gpa, clean_text);
+                try app.input_buffers.mcp_url.appendSlice(app.gpa, clean_text);
             }
         },
         .lanes, .help => {},
@@ -131,5 +131,5 @@ test "pasteToFocusedInput inserts text into provider key input in provider form"
     app.pickers.provider.stage = .form;
 
     try pasteToFocusedInput(&app, "sk-proj-12345");
-    try std.testing.expectEqualStrings("sk-proj-12345", app.provider_key_input.items);
+    try std.testing.expectEqualStrings("sk-proj-12345", app.input_buffers.provider_key.items);
 }

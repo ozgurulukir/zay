@@ -117,7 +117,7 @@ pub const ChipRect = struct {
 };
 
 const CheckpointState = enum { unknown, ready, unavailable };
-const catalogue_provider_count = config_mod.catalogueProviders().len;
+pub const catalogue_provider_count = config_mod.catalogueProviders().len;
 
 pub const App = struct {
     io: std.Io,
@@ -157,68 +157,17 @@ pub const App = struct {
     resume_folded_projects: std.ArrayList([]u8) = .empty,
     pickers: app_state.PickerStates,
     codex_signed_in: bool = false,
-    /// Stored API keys for catalogue providers (label -> key), mirrored from
-    /// `~/.config/nova/auth.json`. Drives the picker's [CONNECTED] badges and supplies
-    /// keys when (re)building the model catalogue. Owned; freed in `deinit`.
-    provider_api_keys: auth.ApiKeyMap = .empty,
-    /// Merged models.dev provider registry (builtins + cached/fetched). Owned; freed in `deinit`.
-    modelsdev_registry: ?modelsdev.Registry = null,
-    /// Backing slice for provider picker's merged provider list. Owned; freed in `deinit`.
-    entries_slice: ?[]const provider_picker.ProviderHandle = null,
-    /// Per-model reasoning options from config, cached for the model picker.
-    /// Rebuilt when the picker opens or the active model changes. Empty
-    /// means "fall back to the global hardcoded list".
-    reasoning_opts_cache: [7]model_picker.ReasoningOption = undefined,
-    reasoning_opts_len: u32 = 0,
-    /// Inline edit buffer for the provider setup form's API-key field. Owned;
-    /// freed in `deinit`.
-    provider_key_input: std.ArrayList(u8) = .empty,
-    /// Inline edit buffer for the settings panel text fields (system_prompt,
-    /// bash_classifier_url). Shared across all edit targets because only one
-    /// can be active at a time. Owned; freed in `deinit`.
-    settings_text_input: std.ArrayList(u8) = .empty,
-    /// Inline edit buffer for the MCP overlay's "add server by URL" form.
-    /// Owned; freed in `deinit`.
-    mcp_url_input: std.ArrayList(u8) = .empty,
-    /// Live connectivity per catalogue provider, indexed by `catalogueProviders()`
-    /// order. Derived from the model load's per-provider outcome (a key existing
-    /// only proves it was entered, not that it works), so the picker badge and
-    /// the model picker read the same source and can't disagree. Only
-    /// `.connected` shows [CONNECTED]; `.failed` shows [DISCONNECTED].
-    conn_status: [catalogue_provider_count]provider_picker.Status = @splat(.unknown),
-    /// True while the in-flight model load is a full connected-provider sweep,
-    /// so its result recomputes every badge (providers absent from the result
-    /// reset to `.unknown`). False for single-provider loads, which touch only
-    /// the provider they fetched.
-    conn_recompute: bool = false,
+    /// Provider connectivity, model catalogue, and API key state.
+    provider_state: app_state.ProviderState = .{},
+    /// Inline edit buffers for text fields across overlays.
+    input_buffers: app_state.InputBuffers = .{},
     cached_config: config_mod.Config = .{},
     cached_config_owned: bool = false,
     retired_transcripts: std.ArrayList(transcript_mod.Transcript) = .empty,
     /// Visual feedback state (loading spinner, black-hole intro, diff
     /// cache, git label) lives in MetricsState.
     metrics: app_state.MetricsState = .{},
-    resume_list: vxfw.ListView = .{
-        .children = .{ .slice = &.{} },
-        .draw_cursor = false,
-        .wheel_scroll = 3,
-    },
-    tree_list: vxfw.ListView = .{
-        .children = .{ .slice = &.{} },
-        .draw_cursor = false,
-        .wheel_scroll = 3,
-    },
-    model_list: vxfw.ListView = .{
-        .children = .{ .slice = &.{} },
-        .draw_cursor = false,
-        .wheel_scroll = 3,
-    },
-    /// Scroll state for the `/lanes` overlay (shared by the `/merge` destination
-    /// picker — both use `Mode.lanes`).
-    lanes_list: vxfw.ListView = .{
-        .children = .{ .slice = &.{} },
-        .draw_cursor = false,
-        .wheel_scroll = 3,
-    },
+    list_widgets: app_state.ListWidgets = .{},
     /// What the `Mode.lanes` overlay is doing: managing parked worktrees
     /// (`/lanes`, M/X) or choosing a merge destination (`/merge`, Enter).
     parked_lanes: []vcs.WorktreeEntry = &.{},
@@ -293,7 +242,6 @@ pub const App = struct {
         app.thread.id = runtime.session_writer.session.id;
         app.codex_signed_in = !runtime.codex_connection_expired and
             (runtime.hasCodexClient() or tui_provider.detectCodexSignIn(gpa, io, runtime.home_dir));
-        app.cached_config = config;
         app.cached_config_owned = true;
         return app;
     }
@@ -365,7 +313,7 @@ pub const App = struct {
     }
 
     pub fn getProviderKeyInput(self: *App) *std.ArrayList(u8) {
-        return &self.provider_key_input;
+        return &self.input_buffers.provider_key;
     }
 
     pub fn getModels(self: *App) *model_catalogue.ModelCatalogue {
@@ -409,19 +357,19 @@ pub const App = struct {
     }
 
     pub fn popProviderKeyInput(self: *App) void {
-        const items = self.provider_key_input.items;
+        const items = self.input_buffers.provider_key.items;
         if (items.len == 0) return;
         var cut = items.len - 1;
         while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
-        self.provider_key_input.shrinkRetainingCapacity(cut);
+        self.input_buffers.provider_key.shrinkRetainingCapacity(cut);
     }
 
     pub fn popMcpUrlInput(self: *App) void {
-        const items = self.mcp_url_input.items;
+        const items = self.input_buffers.mcp_url.items;
         if (items.len == 0) return;
         var cut = items.len - 1;
         while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
-        self.mcp_url_input.shrinkRetainingCapacity(cut);
+        self.input_buffers.mcp_url.shrinkRetainingCapacity(cut);
     }
 
     pub fn isCodexSignedIn(self: *const App) bool {
@@ -1292,23 +1240,24 @@ pub fn reasoningOptions() []const model_picker.ReasoningOption {
 /// config entry. Call when the model picker opens or the active model
 /// changes. Empty cache → fall back to the global hardcoded list.
 pub fn rebuildReasoningOptsCache(self: *App) void {
-    self.reasoning_opts_len = 0;
+    self.provider_state.reasoning_opts_len = 0;
     if (!self.cached_config_owned) return;
     const ms = self.cached_config.model_selection orelse return;
     for (ms.model().reasoning_options) |effort| {
-        if (self.reasoning_opts_len >= self.reasoning_opts_cache.len) break;
-        self.reasoning_opts_cache[self.reasoning_opts_len] = .{
+        if (self.provider_state.reasoning_opts_len >= self.provider_state.reasoning_opts_cache.len) break;
+        self.provider_state.reasoning_opts_cache[self.provider_state.reasoning_opts_len] = .{
             .label = effort.label(),
             .effort = effort,
         };
-        self.reasoning_opts_len += 1;
+        self.provider_state.reasoning_opts_len += 1;
     }
+    std.debug.assert(self.provider_state.reasoning_opts_len == ms.model().reasoning_options.len);
 }
 
 /// Effective reasoning options: per-model config list if non-empty,
 /// otherwise the global hardcoded list.
 pub fn activeReasoningOptions(self: *const App) []const model_picker.ReasoningOption {
-    if (self.reasoning_opts_len > 0) return self.reasoning_opts_cache[0..self.reasoning_opts_len];
+    if (self.provider_state.reasoning_opts_len > 0) return self.provider_state.reasoning_opts_cache[0..self.provider_state.reasoning_opts_len];
     return &reasoning_options;
 }
 

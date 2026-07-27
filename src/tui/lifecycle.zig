@@ -62,18 +62,18 @@ pub fn deinitApp(self: *App) void {
     if (self.metrics.git_label.len > 0) self.gpa.free(self.metrics.git_label);
     if (self.metrics.diff_cache()) |raw| self.gpa.free(raw);
     self.pickers.models.deinit(self.gpa);
-    auth.freeApiKeyMap(self.gpa, &self.provider_api_keys);
-    if (self.modelsdev_registry) |*r| {
+    auth.freeApiKeyMap(self.gpa, &self.provider_state.api_keys);
+    if (self.provider_state.modelsdev_registry) |*r| {
         r.deinit(self.gpa);
-        self.modelsdev_registry = null;
+        self.provider_state.modelsdev_registry = null;
     }
-    if (self.entries_slice) |slice| {
+    if (self.provider_state.entries_slice) |slice| {
         self.gpa.free(slice);
-        self.entries_slice = null;
+        self.provider_state.entries_slice = null;
     }
-    self.provider_key_input.deinit(self.gpa);
-    self.settings_text_input.deinit(self.gpa);
-    self.mcp_url_input.deinit(self.gpa);
+    self.input_buffers.provider_key.deinit(self.gpa);
+    self.input_buffers.settings_text.deinit(self.gpa);
+    self.input_buffers.mcp_url.deinit(self.gpa);
     self.mcp_manager.deinit(self.io);
     if (self.cached_config_owned) {
         self.cached_config.deinit(self.gpa);

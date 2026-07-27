@@ -135,8 +135,8 @@ pub fn resumeClear(app: *App) void {
 }
 
 pub fn syncResumeListCursor(app: *App) void {
-    app.resume_list.cursor = app.nav.resume_selection;
-    app.resume_list.ensureScroll();
+    app.list_widgets.resume_list.cursor = app.nav.resume_selection;
+    app.list_widgets.resume_list.ensureScroll();
 }
 
 pub fn reloadTreeNodes(app: *App) !void {

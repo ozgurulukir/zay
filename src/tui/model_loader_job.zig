@@ -127,7 +127,7 @@ pub fn collectModelCacheConfigured(self: *App) !std.ArrayList(model_cache.Config
 
     for (config_mod.catalogueProviders()) |provider| {
         const base_url = provider.defaultBaseUrl() orelse continue;
-        const auth_mode: model_cache.AuthMode = if (self.provider_api_keys.get(provider.label())) |_|
+        const auth_mode: model_cache.AuthMode = if (self.provider_state.api_keys.get(provider.label())) |_|
             .keyed
         else if (provider.anonymousApiKey() != null)
             .anonymous

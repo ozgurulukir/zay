@@ -133,8 +133,8 @@ fn submitPromptItem(app: *App, state: *State) void {
                 (ms.systemPrompt() orelse "")
             else
                 "";
-            app.settings_text_input.clearRetainingCapacity();
-            app.settings_text_input.appendSlice(app.gpa, current) catch {};
+            app.input_buffers.settings_text.clearRetainingCapacity();
+            app.input_buffers.settings_text.appendSlice(app.gpa, current) catch {};
         },
         else => {},
     }
@@ -149,8 +149,8 @@ fn submitAdvancedItem(app: *App, state: *State) void {
                 (ms.bashClassifierUrl() orelse "")
             else
                 "";
-            app.settings_text_input.clearRetainingCapacity();
-            app.settings_text_input.appendSlice(app.gpa, current) catch {};
+            app.input_buffers.settings_text.clearRetainingCapacity();
+            app.input_buffers.settings_text.appendSlice(app.gpa, current) catch {};
         },
         else => {},
     }
@@ -294,7 +294,7 @@ pub fn saveSettings(app: *App) !bool {
 
 fn commitTextEdit(app: *App) !void {
     const state = &app.pickers.settings;
-    const text = app.settings_text_input.items;
+    const text = app.input_buffers.settings_text.items;
     switch (state.edit_target) {
         .system_prompt => {
             // Validate before committing
@@ -325,7 +325,7 @@ fn commitTextEdit(app: *App) !void {
         .none => {},
     }
     state.edit_target = .none;
-    app.settings_text_input.clearRetainingCapacity();
+    app.input_buffers.settings_text.clearRetainingCapacity();
 }
 
 fn applyToCachedConfig(app: *App, state: *const State) !void {
@@ -383,7 +383,7 @@ pub fn cancelSettings(app: *App) void {
     const state = &app.pickers.settings;
     if (state.edit_target != .none) {
         state.edit_target = .none;
-        app.settings_text_input.clearRetainingCapacity();
+        app.input_buffers.settings_text.clearRetainingCapacity();
         return;
     }
     closeSettings(app);
@@ -402,7 +402,7 @@ pub fn handleTextEditKey(app: *App, key: vaxis.Key) !bool {
     if (key.matches(vaxis.Key.escape, .{})) {
         // Cancel — discard changes.
         state.edit_target = .none;
-        app.settings_text_input.clearRetainingCapacity();
+        app.input_buffers.settings_text.clearRetainingCapacity();
         return true;
     }
     if (key.matches('s', .{ .ctrl = true })) {
@@ -424,14 +424,14 @@ pub fn handleTextEditKey(app: *App, key: vaxis.Key) !bool {
     }
     if (key.text) |text| {
         if (text.len > 0) {
-            try app.settings_text_input.appendSlice(app.gpa, text);
+            try app.input_buffers.settings_text.appendSlice(app.gpa, text);
             return true;
         }
     } else if (key.codepoint >= 32 and key.codepoint <= 126 and
         !key.mods.ctrl and !key.mods.alt and !key.mods.super)
     {
         const byte: u8 = @intCast(key.codepoint);
-        try app.settings_text_input.append(app.gpa, byte);
+        try app.input_buffers.settings_text.append(app.gpa, byte);
         return true;
     }
     // Swallow all remaining keys while in text-edit mode so they do not
@@ -440,10 +440,10 @@ pub fn handleTextEditKey(app: *App, key: vaxis.Key) !bool {
 }
 
 fn popSettingsTextInput(app: *App) void {
-    const items = app.settings_text_input.items;
+    const items = app.input_buffers.settings_text.items;
     if (items.len == 0) return;
     // Walk back over continuation bytes to preserve UTF-8 codepoint boundary.
     var cut = items.len - 1;
     while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
-    app.settings_text_input.shrinkRetainingCapacity(cut);
+    app.input_buffers.settings_text.shrinkRetainingCapacity(cut);
 }
