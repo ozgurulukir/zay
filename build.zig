@@ -64,6 +64,7 @@ pub fn build(b: *std.Build) void {
     });
     translate_c.addIncludePath(b.path("vendor/fff"));
     translate_c.addIncludePath(b.path("vendor/sqlite"));
+    translate_c.addIncludePath(b.path("vendor/lua"));
     const c_mod = translate_c.createModule();
 
     // Generate the models.dev context-window catalogue at build time. A small
@@ -107,6 +108,7 @@ pub fn build(b: *std.Build) void {
     });
 
     mod.link_libc = true;
+    mod.addIncludePath(b.path("vendor/lua"));
     // Native keychain backends (src/keyring.zig): Windows Credential Manager
     // lives in advapi32; macOS Keychain Services needs Security (+ CoreFoundation
     // for CFRelease). Other targets use the plaintext file fallback.
@@ -133,6 +135,134 @@ pub fn build(b: *std.Build) void {
             "-Wno-implicit-function-declaration",
             "-Wno-unused-but-set-variable",
         },
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/lapi.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/lauxlib.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/lbaselib.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/lcode.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/lcorolib.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/lctype.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/ldblib.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/ldebug.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/ldo.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/ldump.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/lfunc.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/lgc.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/linit.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/liolib.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/llex.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/lmathlib.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/lmem.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/loadlib.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/lobject.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/lopcodes.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/loslib.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/lparser.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/lstate.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/lstring.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/lstrlib.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/ltable.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/ltablib.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/ltm.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/lundump.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/lutf8lib.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/lvm.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/lua/lzio.c"),
+        .flags = &.{"-std=c99"},
     });
 
     // If neither case applies to you, feel free to delete the declaration you
@@ -271,6 +401,28 @@ pub fn build(b: *std.Build) void {
             }),
         });
         bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
+    }
+
+    // Lua plugin test runner: `zig build test-plugin` runs Lua test files
+    // through the Nova Lua sandbox. Tests are standalone .lua files under
+    // examples/plugins/ that use the test_runner module.
+    const lua_test_step = b.step("test-plugin", "Run Lua plugin tests");
+    {
+        const lua_test_exe = b.addExecutable(.{
+            .name = "lua-test-runner",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/lua_test_runner.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "nova", .module = mod },
+                },
+            }),
+        });
+        const run_lua_tests = b.addRunArtifact(lua_test_exe);
+        // Pass test file paths as arguments
+        run_lua_tests.addArg("examples/plugins/hello-world/test.lua");
+        lua_test_step.dependOn(&run_lua_tests.step);
     }
 
     // Just like flags, top level steps are also listed in the `--help` menu.

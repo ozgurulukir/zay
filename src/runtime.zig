@@ -225,13 +225,15 @@ pub const AgentRuntime = struct {
                             b.provider = provider_enum;
                             b.provider_name = @constCast(mp);
                             if (summary.model_id) |mid| {
-                                b.model.id = @constCast(mid);
+                                // mid is borrowed from summary — dupe into owned memory.
+                                b.model.id = try gpa.dupe(u8, mid);
                             }
                         },
                         .custom => |*c| {
                             c.provider_name = @constCast(mp);
                             if (summary.model_id) |mid| {
-                                c.model.id = @constCast(mid);
+                                // mid is borrowed from summary — dupe into owned memory.
+                                c.model.id = try gpa.dupe(u8, mid);
                             }
                             if (c.base_url.len == 0 and resolved_base_url.len > 0) {
                                 c.base_url = @constCast(resolved_base_url);
@@ -239,16 +241,29 @@ pub const AgentRuntime = struct {
                         },
                     }
                     try target.applyFromConfig(session_config);
+                    // Free the dupe'd model_id — applyFromConfig dupe'd it again
+                    // into the client, so the session_config copy is no longer needed.
+                    if (summary.model_id) |_| {
+                        const mid_to_free = switch (ms.*) {
+                            .builtin => |b| b.model.id,
+                            .custom => |c| c.model.id,
+                        };
+                        gpa.free(mid_to_free);
+                    }
                 } else {
                     const is_builtin = std.meta.stringToEnum(config_mod.Provider, mp) != null;
                     if (summary.model_id) |mid| {
+                        // mid is borrowed from summary's internal allocation.
+                        // Dupe it into owned memory so it survives summary.deinit.
+                        const owned_mid = try gpa.dupe(u8, mid);
+                        errdefer gpa.free(owned_mid);
                         if (is_builtin) {
                             session_config.model_selection = .{
                                 .builtin = .{
                                     .provider = provider_enum,
                                     .provider_name = @constCast(mp),
                                     .model = .{
-                                        .id = mid,
+                                        .id = owned_mid,
                                         .reasoning = .unset,
                                     },
                                     .use_responses_endpoint = false,
@@ -262,7 +277,7 @@ pub const AgentRuntime = struct {
                                     .base_url = @constCast(resolved_base_url),
                                     .api_key = "",
                                     .model = .{
-                                        .id = mid,
+                                        .id = owned_mid,
                                         .reasoning = .unset,
                                     },
                                     .use_responses_endpoint = false,
@@ -271,6 +286,9 @@ pub const AgentRuntime = struct {
                             };
                         }
                         try target.applyFromConfig(session_config);
+                        // Free the dupe'd model_id — applyFromConfig dupe'd it
+                        // again into the client.
+                        gpa.free(owned_mid);
                     } else {
                         // No model_id saved in session — fall back to config's
                         // default model rather than synthesizing an empty one.
@@ -340,6 +358,11 @@ pub const AgentRuntime = struct {
     /// Also handles providers that require sign-in (codex).
     pub fn applyFromConfig(self: *AgentRuntime, config: config_mod.Config) !void {
         const selection = config.activeModelSelection() orelse return;
+        const model_id = selection.model().id;
+        if (model_id.len == 0) {
+            std.log.warn("runtime.applyFromConfig: empty model_id for provider {s}, skipping model attachment", .{selection.providerName()});
+            return;
+        }
         const adapter = adapterForConfig(selection.provider(), config) orelse return;
         switch (adapter) {
             .codex_responses => try self.tryConnectCodexFromAuth(config),
@@ -348,7 +371,7 @@ pub const AgentRuntime = struct {
         }
         // Save the model selection to the session so it can be restored on resume.
         // Use provider_name (the config key) so custom providers round-trip.
-        try self.session_writer.session.updateModel(selection.providerName(), selection.model().id);
+        try self.session_writer.session.updateModel(selection.providerName(), model_id);
     }
 
     fn adapterForConfig(provider: config_mod.Provider, config: config_mod.Config) ?config_mod.AdapterKind {
@@ -455,7 +478,11 @@ pub const AgentRuntime = struct {
             }
             break :blk provider.anonymousApiKey() orelse "";
         };
-        try self.attachOpenAiCompatibleClient(base_url, api_key, ms.model().id, effort);
+        const model_id_to_attach = switch (ms) {
+            .builtin => |b| b.model.id,
+            .custom => |c| c.model.id,
+        };
+        try self.attachOpenAiCompatibleClient(base_url, api_key, model_id_to_attach, effort);
     }
 
     fn tryAttachOpenAiResponsesFromConfig(

@@ -51,6 +51,11 @@
       "additionalProperties": { "$ref": "#/$defs/MCPServerConfig" },
       "description": "Model Context Protocol server integrations. Legacy keys 'mcp_servers' and 'mcp' are also accepted."
     },
+    "plugins": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/PluginConfig" },
+      "description": "Lua plugin configuration keyed by plugin name. Each entry controls whether the plugin is enabled and its custom settings. Settings are passed to the plugin's Lua code via plugin.get_config()."
+    },
     "context": {
       "$ref": "#/$defs/ContextSettings",
       "description": "Context window management and automatic compaction policy."
@@ -178,6 +183,22 @@
         }
       },
       "required": ["url"],
+      "additionalProperties": false
+    },
+    "PluginConfig": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether this plugin is active."
+        },
+        "settings": {
+          "type": "string",
+          "maxLength": 65536,
+          "description": "Plugin-specific settings as a JSON object string (e.g. '{\"theme\":\"dark\"}'). The plugin's Lua code parses this via plugin.get_config()."
+        }
+      },
       "additionalProperties": false
     },
     "ContextSettings": {

@@ -75,6 +75,7 @@ pub fn deinitApp(self: *App) void {
     self.input_buffers.settings_text.deinit(self.gpa);
     self.input_buffers.mcp_url.deinit(self.gpa);
     self.mcp_manager.deinit(self.io);
+    self.plugin_manager.deinit();
     if (self.cached_config_owned) {
         self.cached_config.deinit(self.gpa);
         self.cached_config_owned = false;
@@ -474,7 +475,7 @@ pub fn syncFocus(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         },
         // The lanes overlay owns its keys via captureEvent; the palette input
         // is unused, so keep focus on the root (typed keys are ignored).
-        .lanes, .help, .settings, .mcp => root.widget(),
+        .lanes, .help, .settings, .mcp, .plugins => root.widget(),
         .normal => app.inputs.input.widget(),
     };
     try ctx.requestFocus(target);

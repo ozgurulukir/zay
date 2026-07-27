@@ -15,6 +15,7 @@ const auth = @import("auth/store.zig");
 const codex = @import("auth/codex.zig");
 const config_mod = @import("config/config.zig");
 const mcp_mod = @import("mcp/manager.zig");
+const lua_mod = @import("lua/root.zig");
 const openai_compatible_mod = @import("ai/openai_compatible.zig");
 const runtime_mod = @import("runtime.zig");
 const session_mod = @import("session.zig");
@@ -186,12 +187,13 @@ pub const App = struct {
     /// Mirrors the permission overlay's lightweight, mode-less state.
     background_modal_state: app_state.BackgroundModalState = .{},
     mcp_manager: mcp_mod.McpManager = undefined,
+    plugin_manager: lua_mod.PluginManager = undefined,
     /// Completed background jobs awaiting delivery. Held here (not pushed into a
     /// busy transcript) so the notice + model message land only when the owning
     /// lane is idle — "auto-start if idle, queue if in-flight". Owned; freed in
     /// `deinit`.
     pub const ctrl_c_double_press_ms: u32 = 1500;
-    pub const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message, lanes, help, settings, mcp };
+    pub const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message, lanes, help, settings, mcp, plugins };
     pub const LanesPurpose = app_state.NavState.LanesPurpose;
     pub const ModelCatalog = enum { connected_provider, openai_codex };
     pub const ModelScope = model_catalogue.ModelScope;
@@ -211,6 +213,7 @@ pub const App = struct {
             .inputs = .{ .input = .init(gpa), .palette = .init(gpa), .comment = .init(gpa) },
             .pickers = .{ .tree = .init(gpa) },
             .mcp_manager = mcp_mod.McpManager.init(gpa),
+            .plugin_manager = lua_mod.PluginManager.init(gpa, io, "", ""),
         };
     }
 
@@ -223,6 +226,8 @@ pub const App = struct {
         var app = try init(io, gpa, &runtime.agent);
         app.cached_config = config;
         app.mcp_manager.syncFromConfig(io, &app.cached_config) catch {};
+        app.plugin_manager = lua_mod.PluginManager.init(gpa, io, runtime.home_dir, runtime.cwd);
+        _ = app.plugin_manager.loadAll() catch {};
         search_mod.start(gpa, io, runtime.cwd);
         // One shared background manager for the whole session. Heap-allocated so
         // its address stays put as agents (primary + lanes) borrow it.
@@ -1111,7 +1116,7 @@ pub fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
     return mode_lifecycle.shouldOpenCommandMenuForSlash(app, key);
 }
 
-pub const Command = enum { connect, model, mcp, new, resume_session, timeline, diff, parallel, save, close, merge, lanes, clear, compact, status, help, export_session, settings, copy, paste, exit_cmd };
+pub const Command = enum { connect, model, mcp, new, resume_session, timeline, diff, parallel, save, close, merge, lanes, clear, compact, status, help, export_session, settings, copy, paste, exit_cmd, plugins };
 /// `multi_lane` commands act on another lane, so they're hidden from the palette
 /// (and unresolvable) until more than one lane exists.
 pub const CommandEntry = struct { name: []const u8, command: Command, description: []const u8 = "", category: []const u8 = "", multi_lane: bool = false };
@@ -1119,6 +1124,7 @@ pub const commands = [_]CommandEntry{
     .{ .name = "Connect", .command = .connect, .description = "Configure AI provider & API key", .category = "AI & MODELS" },
     .{ .name = "Models", .command = .model, .description = "Select model & reasoning effort", .category = "AI & MODELS" },
     .{ .name = "Mcp", .command = .mcp, .description = "Model Context Protocol status & servers", .category = "AI & MODELS" },
+    .{ .name = "Plugins", .command = .plugins, .description = "List & manage Lua plugins", .category = "AI & MODELS" },
     .{ .name = "Settings", .command = .settings, .description = "View and edit configuration settings", .category = "AI & MODELS" },
     .{ .name = "New", .command = .new, .description = "Start a fresh session", .category = "SESSION" },
     .{ .name = "Resume", .command = .resume_session, .description = "Resume a past session", .category = "SESSION" },
@@ -1154,6 +1160,19 @@ pub fn openMcp(app: *App) void {
 }
 
 pub fn closeMcp(app: *App) void {
+    app.mode = .normal;
+    app.clearInput();
+    app.clearPaletteInput();
+}
+
+pub fn openPlugins(app: *App) void {
+    app.mode = .plugins;
+    app.pickers.plugins.reset();
+    app.clearInput();
+    app.clearPaletteInput();
+}
+
+pub fn closePlugins(app: *App) void {
     app.mode = .normal;
     app.clearInput();
     app.clearPaletteInput();
@@ -2544,8 +2563,8 @@ test "lane commands stay hidden until a second lane exists" {
     defer app.deinit();
 
     // Single lane: the multi-lane commands (/merge, /close) are filtered out of
-    // the palette and can't be resolved; the twenty always-on commands remain.
-    try std.testing.expectEqual(@as(u32, 20), commandMatchesCountForFilter(&app, ""));
+    // the palette and can't be resolved; the twenty-one always-on commands remain.
+    try std.testing.expectEqual(@as(u32, 21), commandMatchesCountForFilter(&app, ""));
     try std.testing.expect(resolveCommand(&app, "Close") == null);
     try std.testing.expect(resolveCommand(&app, "Merge") == null);
     // `/sync` was removed with the git-shadow pivot and never came back.

@@ -47,7 +47,7 @@ pub fn pasteToFocusedInput(app: *App, text: []const u8) !void {
                 try app.input_buffers.mcp_url.appendSlice(app.gpa, clean_text);
             }
         },
-        .lanes, .help => {},
+        .lanes, .help, .plugins => {},
     }
 }
 

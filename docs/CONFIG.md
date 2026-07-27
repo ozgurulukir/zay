@@ -103,6 +103,7 @@ JSON keys are **camelCase**. Legacy snake_case keys from schema v1 are still acc
 | `bashClassifierUrl`    | `string`  | ModernBERT classifier endpoint for shell command safety check. Legacy key `bash_classifier_url` is also accepted.                                                                                                                                                                                                                                                                                                                                      |
 | `context`              | `object`  | Context window management and compaction policy (see below).                                                                                                                                                                                                                                                                                                                                                                                           |
 | `mcpServers`           | `object`  | MCP server configurations (Claude Desktop format compatible). Legacy keys `mcp_servers` and `mcp` are also accepted.                                                                                                                                                                                                                                                                                                                                   |
+| `plugins`              | `object`  | Lua plugin configuration keyed by plugin name. Each entry controls whether the plugin is enabled and its custom settings (JSON string). Settings are passed to the plugin's Lua code via `plugin.get_config()`.                                                                                                                                                                                                                                        |
 | `providers`            | `object`  | Per-provider configuration keyed by provider name. Accepts builtin labels and custom provider names (see below).                                                                                                                                                                                                                                                                                                                                       |
 
 ### Context & Compaction Settings
@@ -206,6 +207,30 @@ A server is either stdio (`command` + `args`) or remote (`url`), never both. Mis
 
 > [!IMPORTANT]
 > **API Keys Security Invariant**: API keys (`api_key`) are **NEVER** serialized into `config.json`. API keys are stored separately in `~/.config/nova/auth.json` with strict file permissions (`0o600`).
+
+### Plugin Configuration
+
+Each entry in `plugins` is keyed by plugin name (matching the plugin's manifest `name` field):
+
+| Field      | Type      | Description                                                                                             |
+| ---------- | --------- | ------------------------------------------------------------------------------------------------------- |
+| `enabled`  | `boolean` | Whether this plugin is active (default `true`).                                                         |
+| `settings` | `string`  | Plugin-specific settings as a JSON object string (max 65536 chars). The plugin's Lua code parses this.   |
+
+**Example — configuring the custom-search plugin:**
+
+```json
+{
+  "plugins": {
+    "custom-search": {
+      "enabled": true,
+      "settings": "{\"max_results\":20,\"case_sensitive\":true,\"default_pattern\":\"*.zig\"}"
+    }
+  }
+}
+```
+
+Settings are opaque to the config system — the plugin's Lua code is responsible for parsing and validating its own settings via `plugin.get_config()`. See `docs/plugins/` for the full plugin development guide.
 
 > [!NOTE]
 > **Typed Model Selection**: The in-memory `Config` struct carries a `model_selection: ?ModelSelection` typed view. `ModelSelection` is `union(enum) { builtin, custom }` — builtin providers carry `provider: Provider` + `provider_name`; custom providers carry `provider_name`, `base_url`, `api_key`. Optional settings (`use_responses_endpoint`, `enable_thinking`, `system_prompt`, `bash_classifier_url`) live on both variants. Callers use typed accessors (`provider()`, `providerName()`, `model()`, `baseUrl()`, `apiKey()`, `useResponsesEndpoint()`, `enableThinking()`, `systemPrompt()`, `bashClassifierUrl()`) so builtin/custom differences are hidden. `parseObject` only populates `model_selection` when all required fields are present — since `api_key` is never serialized to config.json (it lives in `auth.json`), disk-loaded configs **never** have `model_selection`. All rehydration paths fall back to the legacy fields (`provider`, `model`, `base_url`, `provider_name`), which ARE populated from `defaultModel` and `hydrateActiveModel`.

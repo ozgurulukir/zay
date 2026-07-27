@@ -2,6 +2,7 @@
 const std = @import("std");
 
 const assert = std.debug.assert;
+const log = std.log.scoped(.skill);
 
 pub const Skill = struct {
     name: []u8,
@@ -191,7 +192,7 @@ fn loadFromDir(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, include
         return;
     } else |err| switch (err) {
         error.FileNotFound => {},
-        else => return err,
+        else => log.warn("skipping skill {s}: {s}", .{ skill_path, @errorName(err) }),
     }
 
     var iter = dir.iterate();
@@ -208,7 +209,7 @@ fn loadFromDir(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, include
                     try skills.append(gpa, skill);
                 } else |err| switch (err) {
                     error.FileNotFound => {},
-                    else => return err,
+                    else => log.warn("skipping skill {s}: {s}", .{ child, @errorName(err) }),
                 }
             },
             else => {},

@@ -20,6 +20,7 @@ const assert = std.debug.assert;
 
 const provider_types = @import("provider.zig");
 const mcp_types = @import("mcp.zig");
+const plugin_types = @import("plugin.zig");
 const parse_mod = @import("parse.zig");
 
 // --- Provider & model re-exports ---
@@ -44,6 +45,10 @@ pub const cloneHeaders = mcp_types.cloneHeaders;
 pub const freeHeaders = mcp_types.freeHeaders;
 pub const mcpServerFromUrl = mcp_types.mcpServerFromUrl;
 pub const expandMcpServer = mcp_types.expandMcpServer;
+
+// --- Plugin config re-exports ---
+
+pub const PluginConfig = plugin_types.PluginConfig;
 
 // --- Parse / serialize / IO re-exports ---
 
@@ -108,6 +113,10 @@ pub const Config = struct {
     model: ?Model = null,
     providers: []ProviderConfig = &.{},
     mcp_servers: []McpServerConfig = &.{},
+    /// Plugin configuration. Each entry maps a plugin name to its
+    /// enabled state and settings. Merged across config layers:
+    /// project plugins override global plugins with the same name.
+    plugins: []PluginConfig = &.{},
     use_responses_endpoint: ?bool = null,
     enable_thinking: ?bool = null,
     system_prompt: ?[]u8 = null,
@@ -146,6 +155,8 @@ pub const Config = struct {
         if (self.providers.len > 0) gpa.free(self.providers);
         for (self.mcp_servers) |*server| server.deinit(gpa);
         if (self.mcp_servers.len > 0) gpa.free(self.mcp_servers);
+        for (self.plugins) |*plugin| plugin.deinit(gpa);
+        if (self.plugins.len > 0) gpa.free(self.plugins);
         if (self.system_prompt) |s| gpa.free(s);
         if (self.dynamic_provider_name) |s| gpa.free(s);
         if (self.dynamic_provider_id) |s| gpa.free(s);
@@ -171,6 +182,8 @@ pub const Config = struct {
         for (self.providers, 0..) |provider, index| out.providers[index] = try provider.clone(gpa);
         out.mcp_servers = try gpa.alloc(McpServerConfig, self.mcp_servers.len);
         for (self.mcp_servers, 0..) |server, index| out.mcp_servers[index] = try server.clone(gpa);
+        out.plugins = try gpa.alloc(PluginConfig, self.plugins.len);
+        for (self.plugins, 0..) |plugin, index| out.plugins[index] = try plugin.clone(gpa);
         if (self.system_prompt) |s| out.system_prompt = try gpa.dupe(u8, s);
         if (self.dynamic_provider_name) |s| out.dynamic_provider_name = try gpa.dupe(u8, s);
         if (self.dynamic_provider_id) |s| out.dynamic_provider_id = try gpa.dupe(u8, s);

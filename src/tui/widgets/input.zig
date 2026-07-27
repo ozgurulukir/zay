@@ -72,6 +72,7 @@ fn inputHintText(app: *const App) []const u8 {
         .help => "[ESC] / [ENTER] Close Help",
         .settings => "Tab Section" ++ symbols.separator_dot_padded ++ "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Toggle/Edit" ++ symbols.separator_dot_padded ++ "Ctrl+S Save" ++ symbols.separator_dot_padded ++ "[ESC] Close",
         .mcp => "[Space] Toggle" ++ symbols.separator_dot_padded ++ "Ctrl+R Reconnect" ++ symbols.separator_dot_padded ++ "[ESC] Close",
+        .plugins => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ESC] Close",
         .normal => "Type prompt, @file, $skill or / for menu" ++ symbols.separator_dot_padded ++ "Ctrl+O Background" ++ symbols.separator_dot_padded ++ "Ctrl+N Lanes",
     };
 }
@@ -493,9 +494,9 @@ pub const InputWidget = struct {
         var surface = try box.widget().draw(ctx.withConstraints(.{ .width = max_width, .height = border_height }, .{ .width = max_width, .height = border_height }));
 
         const status_text = if (tui_status.modelStatus(self.app.liveRuntime(), self.app.cached_config)) |status|
-            tui_status.formatModelStatus(ctx.arena, status) catch ""
+            tui_status.formatModelStatus(ctx.arena, status) catch "no model"
         else
-            "";
+            "no model";
         const live_context_max: u32 = if (self.app.liveRuntime()) |rt|
             rt.agent.context_window_tokens
         else if (self.app.metrics.context_tokens_max > 0)

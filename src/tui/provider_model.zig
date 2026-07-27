@@ -19,6 +19,7 @@ const runtime_mod = @import("../runtime.zig");
 const session_mod = @import("../session.zig");
 const tui_provider = @import("provider_controller.zig");
 const tui_status = @import("status.zig");
+const tools_common = @import("../tools/common.zig");
 const modelsdev = @import("../models/registry.zig");
 
 const App = tui.App;
@@ -1298,6 +1299,99 @@ pub fn injectMcpTools(self: *App) void {
     runtime.client.updateMcpTools(schemas) catch {};
 }
 
+/// Build Lua plugin tool schemas and inject them into the live AI client.
+/// Plugin tools use the naming convention `lua__<plugin>__<tool>` to avoid
+/// collisions with builtin and MCP tools. Best-effort: a failure leaves the
+/// previous tool set in place.
+pub fn injectPluginTools(self: *App) void {
+    const runtime = self.liveRuntime() orelse return;
+    const schemas = buildPluginToolSchemas(self) catch return;
+    defer self.gpa.free(schemas);
+    runtime.client.updateMcpTools(schemas) catch {};
+}
+
+/// Build tool schemas from all loaded Lua plugins.
+/// Each plugin's `nova.register_tool()` calls store specs in the Lua registry.
+/// We iterate all plugins, read their "nova_tools" table, and convert each
+/// entry to an `ai.McpToolSchema` with the naming convention
+/// `lua__<plugin_name>__<tool_name>`.
+fn buildPluginToolSchemas(self: *App) ![]ai.McpToolSchema {
+    const c = @import("c");
+    const plugin_api = @import("../lua/plugin_api.zig");
+
+    // Count total tools across all plugins
+    var total: u32 = 0;
+    var iter = self.plugin_manager.iterator();
+    while (iter.next()) |entry| {
+        const plugin = entry.value_ptr.*;
+        if (!plugin.active) continue;
+        total += plugin_api.countTools(plugin.state.handle);
+    }
+
+    if (total == 0) return &.{};
+
+    var schemas = try self.gpa.alloc(ai.McpToolSchema, total);
+    var idx: u32 = 0;
+
+    // Iterate plugins again and build schemas
+    var iter2 = self.plugin_manager.iterator();
+    while (iter2.next()) |entry| {
+        const plugin = entry.value_ptr.*;
+        if (!plugin.active) continue;
+
+        const L = plugin.state.handle;
+
+        // Get nova_tools table from registry
+        _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "nova_tools");
+        if (c.lua_isnil(L, -1)) {
+            c.lua_pop(L, 1);
+            continue;
+        }
+
+        const tools_len = c.lua_rawlen(L, -1);
+        var tool_i: c_int = 1;
+        while (tool_i <= @as(c_int, @intCast(tools_len))) : (tool_i += 1) {
+            _ = c.lua_rawgeti(L, -1, tool_i);
+
+            // Get name and description
+            _ = c.lua_getfield(L, -1, "name");
+            var name_len: usize = 0;
+            const name_ptr = c.lua_tolstring(L, -1, &name_len);
+            const tool_name = if (name_ptr) |p| p[0..name_len] else "";
+
+            _ = c.lua_getfield(L, -2, "description");
+            var desc_len: usize = 0;
+            const desc_ptr = c.lua_tolstring(L, -1, &desc_len);
+            const desc = if (desc_ptr) |p| p[0..desc_len] else "";
+
+            // Build full name: lua__<plugin>__<tool>
+            const full_name = std.fmt.allocPrint(self.gpa, "lua__{s}__{s}", .{ plugin.manifest.name, tool_name }) catch {
+                c.lua_pop(L, 3);
+                continue;
+            };
+
+            // Build a simple schema (empty for now — will be filled from parameters)
+            const schema = tools_common.Schema{
+                .properties = &.{},
+            };
+
+            schemas[idx] = .{
+                .name = full_name,
+                .description = self.gpa.dupe(u8, desc) catch "",
+                .schema = schema,
+            };
+            idx += 1;
+
+            c.lua_pop(L, 3); // pop description, name, entry
+        }
+
+        c.lua_pop(L, 1); // pop nova_tools
+    }
+
+    // Trim unused tail if any tools were skipped
+    return self.gpa.realloc(schemas, idx);
+}
+
 /// Connect MCP servers per config, then inject their tool schemas into the live
 /// AI client so the model sees `mcp__<server>__<tool>` definitions. The client
 /// serializes its tool list at attach time, so MCP servers that connect
@@ -1306,6 +1400,7 @@ pub fn refreshMcpTools(self: *App) void {
     if (self.liveRuntime() == null) return;
     self.mcp_manager.syncFromConfigEx(self.io, &self.cached_config);
     injectMcpTools(self);
+    injectPluginTools(self);
 }
 
 /// Poll each connected MCP client for a pending `tools/list_changed` flag set

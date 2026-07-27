@@ -104,3 +104,17 @@ Key types following this pattern:
 - `agent.Listener(Ctx)` / `executor.ToolCallObserver(Ctx)` — generic typed callbacks replacing `*anyopaque` vtables
 
 See `AGENTS.md` "Type System Discipline pattern" for the full list and construction patterns.
+
+## Lua Plugin System
+
+Nova supports extending its capabilities through Lua 5.4 plugins. The plugin system lives in `src/lua/` and provides:
+
+- **Sandboxed runtime**: Each plugin runs in a restricted Lua environment with configurable permissions (file access, network, os.execute, etc.) and resource limits (instruction count, memory, timeout).
+- **Plugin lifecycle**: Plugins are discovered from `~/.config/nova/plugins/` (global) and `.nova/plugins/` (project). Each plugin has a `plugin.lua` manifest and an `init.lua` entry point.
+- **Event bus**: Plugins can subscribe to lifecycle events (`turn_started`, `tool_call_started`, etc.) via `nova.on()`.
+- **Tool registration**: Plugins register tools via `nova.register_tool()` that appear alongside builtin and MCP tools.
+- **Config integration**: Plugin settings are stored in `config.json` under the `plugins` key, following the same layered merge pattern as MCP servers.
+- **Bytecode caching**: `State.dump()` and `State.loadBuffer()` enable caching compiled Lua bytecode to avoid re-parsing on reload.
+- **TUI integration**: The `/plugins` command opens an overlay listing loaded plugins with their active/inactive status.
+
+See `docs/plugins/` for the full plugin development guide, API reference, and example plugins.

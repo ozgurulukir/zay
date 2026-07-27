@@ -31,6 +31,8 @@ pub const runtime = @import("runtime.zig");
 pub const vcs = @import("vcs.zig");
 pub const transcript = @import("transcript.zig");
 pub const tools = @import("tools.zig");
+pub const lua = @import("lua/root.zig");
+pub const lua_test_runner = @import("lua/test_runner.zig");
 pub const tui = @import("tui.zig");
 pub const thread = @import("tui/thread.zig");
 
@@ -178,4 +180,12 @@ fn resolveHomeDir(gpa: std.mem.Allocator, env: anytype) std.mem.Allocator.Error!
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("lua/root.zig");
+    _ = @import("lua/state.zig");
+    _ = @import("lua/bridge.zig");
+    _ = @import("lua/sandbox.zig");
+    _ = @import("lua/plugin.zig");
+    _ = @import("lua/manifest.zig");
+    _ = @import("lua/manager.zig");
+    _ = @import("lua/events.zig");
 }

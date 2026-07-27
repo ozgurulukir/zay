@@ -45,6 +45,7 @@ fn overlaySize(mode: App.Mode) OverlaySize {
         .help => .{ .width = 90, .height = 22 },
         .settings => .{ .width = 90, .height = 22 },
         .mcp => .{ .width = 90, .height = 20 },
+        .plugins => .{ .width = 80, .height = 16 },
         .diff_viewer => .{ .width = 0, .height = 0 },
     };
 }
@@ -61,6 +62,7 @@ fn overlayLabel(app: *const App) []const u8 {
         .help => "Help & Keyboard Shortcuts",
         .settings => "Settings",
         .mcp => "Model Context Protocol (MCP)",
+        .plugins => "Lua Plugins",
         .lanes => switch (app.nav.lanes_purpose) {
             .manage => "Parallel Lanes",
             .merge_dest => "Merge Into",
@@ -204,6 +206,7 @@ const OverlayInner = struct {
 
     const help_picker = @import("help_picker.zig");
     const mcp_status = @import("mcp_status.zig");
+    const plugins_status = @import("plugins_status.zig");
 
     fn drawContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         return switch (app.mode) {
@@ -217,6 +220,7 @@ const OverlayInner = struct {
             .help => drawHelpContent(app, ctx),
             .settings => drawSettingsContent(app, ctx),
             .mcp => drawMcpContent(app, ctx),
+            .plugins => drawPluginsContent(app, ctx),
             // The diff viewer is full-screen — `drawRoot` returns before the
             // overlay path, so this is never reached.
             .normal, .diff_viewer => unreachable,
@@ -228,6 +232,26 @@ const OverlayInner = struct {
             .state = &app.pickers.mcp,
             .manager = &app.mcp_manager,
             .url_input = app.input_buffers.mcp_url.items,
+        };
+        return content.widget().draw(ctx);
+    }
+
+    fn drawPluginsContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        // Build plugin entries from the plugin manager
+        var entries: std.ArrayList(plugins_status.PluginEntry) = .empty;
+        defer entries.deinit(app.gpa);
+
+        var iter = app.plugin_manager.iterator();
+        while (iter.next()) |entry| {
+            try entries.append(app.gpa, .{
+                .name = entry.value_ptr.*.manifest.name,
+                .active = entry.value_ptr.*.active,
+            });
+        }
+
+        var content: plugins_status.Content = .{
+            .state = &app.pickers.plugins,
+            .plugins = entries.items,
         };
         return content.widget().draw(ctx);
     }

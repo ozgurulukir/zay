@@ -16,6 +16,7 @@ const ai = @import("../ai.zig");
 const config_mod = @import("config.zig");
 const provider_types = @import("provider.zig");
 const mcp_types = @import("mcp.zig");
+const plugin_types = @import("plugin.zig");
 
 const Config = config_mod.Config;
 const ContextSettings = config_mod.ContextSettings;
@@ -40,6 +41,8 @@ const cloneHeaders = mcp_types.cloneHeaders;
 const freeHeaders = mcp_types.freeHeaders;
 const mcpServerFromUrl = mcp_types.mcpServerFromUrl;
 const expandMcpServer = mcp_types.expandMcpServer;
+
+const PluginConfig = plugin_types.PluginConfig;
 
 const assert = std.debug.assert;
 
@@ -140,6 +143,7 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
     }
     for (updates.providers) |provider| try applyProviderOverlay(gpa, target, provider);
     for (updates.mcp_servers) |mcp_server| try applyMcpServerOverlay(gpa, target, mcp_server);
+    for (updates.plugins) |plugin| try applyPluginOverlay(gpa, target, plugin);
     applyContextOverlay(&target.context, updates.context);
 }
 
@@ -222,6 +226,26 @@ fn applyMcpServerOverlay(gpa: std.mem.Allocator, target: *Config, updates: McpSe
         try gpa.realloc(target.mcp_servers, target.mcp_servers.len + 1);
     target.mcp_servers = next;
     target.mcp_servers[target.mcp_servers.len - 1] = try updates.clone(gpa);
+}
+
+fn applyPluginOverlay(gpa: std.mem.Allocator, target: *Config, updates: PluginConfig) !void {
+    for (target.plugins, 0..) |*plugin, index| {
+        if (!std.mem.eql(u8, plugin.name, updates.name)) continue;
+        plugin.enabled = updates.enabled;
+        if (updates.settings.len > 0) {
+            if (plugin.settings.len > 0) gpa.free(plugin.settings);
+            plugin.settings = try gpa.dupe(u8, updates.settings);
+        }
+        target.plugins[index] = plugin.*;
+        return;
+    }
+
+    const next = if (target.plugins.len == 0)
+        try gpa.alloc(PluginConfig, 1)
+    else
+        try gpa.realloc(target.plugins, target.plugins.len + 1);
+    target.plugins = next;
+    target.plugins[target.plugins.len - 1] = try updates.clone(gpa);
 }
 
 fn applyProviderOverlay(gpa: std.mem.Allocator, target: *Config, updates: ProviderConfig) !void {
@@ -481,6 +505,9 @@ fn parseObject(
     if (mcp_val) |val| {
         if (val == .object) out.mcp_servers = try parseMcpServers(gpa, val);
     }
+    if (value.object.get("plugins")) |plugins_val| {
+        if (plugins_val == .object) out.plugins = try parsePlugins(gpa, plugins_val);
+    }
 
     // Scalar fields: camelCase primary, snake_case fallback.
     if (stringFieldCompat(value, "baseURL", "base_url")) |s| {
@@ -705,6 +732,32 @@ fn parseMcpServers(gpa: std.mem.Allocator, value: std.json.Value) ![]McpServerCo
         try servers.append(gpa, server);
     }
     return try servers.toOwnedSlice(gpa);
+}
+
+fn parsePlugins(gpa: std.mem.Allocator, value: std.json.Value) ![]PluginConfig {
+    var plugins: std.ArrayList(PluginConfig) = .empty;
+    errdefer {
+        for (plugins.items) |*plugin| plugin.deinit(gpa);
+        plugins.deinit(gpa);
+    }
+    var iterator = value.object.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const val = entry.value_ptr.*;
+
+        var plugin: PluginConfig = .{
+            .name = try gpa.dupe(u8, entry.key_ptr.*),
+            .enabled = boolField(val, "enabled") orelse true,
+        };
+        errdefer plugin.deinit(gpa);
+
+        if (stringField(val, "settings")) |s| {
+            plugin.settings = try gpa.dupe(u8, s);
+        }
+
+        try plugins.append(gpa, plugin);
+    }
+    return try plugins.toOwnedSlice(gpa);
 }
 
 fn parseProviderConfig(gpa: std.mem.Allocator, name: []const u8, provider: Provider, value: std.json.Value) !ProviderConfig {
@@ -1066,6 +1119,10 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
         try writeKey(writer, "mcpServers", &wrote_any);
         try writeMcpServers(writer, config.mcp_servers);
     }
+    if (config.plugins.len > 0) {
+        try writeKey(writer, "plugins", &wrote_any);
+        try writePlugins(writer, config.plugins);
+    }
     // Context: only written when at least one field differs from defaults.
     if (hasNonDefaultContext(config.context)) {
         try writeKey(writer, "context", &wrote_any);
@@ -1268,6 +1325,33 @@ fn writeMcpServer(writer: *std.Io.Writer, server: McpServerConfig) !void {
     if (!server.enabled) {
         try writeKeyNoIndent(writer, "enabled", &wrote_any);
         try writer.writeAll("false");
+    }
+    try writer.writeByte('}');
+}
+
+fn writePlugins(writer: *std.Io.Writer, plugins: []const PluginConfig) !void {
+    try writer.writeByte('{');
+    var wrote_plugin = false;
+    for (plugins) |plugin| {
+        if (wrote_plugin) try writer.writeByte(',');
+        try std.json.Stringify.value(plugin.name, .{}, writer);
+        try writer.writeByte(':');
+        try writePlugin(writer, plugin);
+        wrote_plugin = true;
+    }
+    try writer.writeByte('}');
+}
+
+fn writePlugin(writer: *std.Io.Writer, plugin: PluginConfig) !void {
+    try writer.writeByte('{');
+    var wrote_any = false;
+    if (!plugin.enabled) {
+        try writeKeyNoIndent(writer, "enabled", &wrote_any);
+        try writer.writeAll("false");
+    }
+    if (plugin.settings.len > 0) {
+        try writeKeyNoIndent(writer, "settings", &wrote_any);
+        try std.json.Stringify.value(plugin.settings, .{}, writer);
     }
     try writer.writeByte('}');
 }

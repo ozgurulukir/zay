@@ -140,7 +140,8 @@ pub const Statement = struct {
 
     pub fn bindText(self: *Statement, index: i32, value: []const u8) Error!void {
         assert(index > 0);
-        try self.check(c.sqlite3_bind_text(self.handle, index, value.ptr, @intCast(value.len), sqlite_static));
+        const len = std.math.cast(c_int, value.len) orelse return error.Misuse;
+        try self.check(c.sqlite3_bind_text(self.handle, index, value.ptr, len, sqlite_static));
     }
 
     pub fn bindBlob(self: *Statement, index: i32, value: []const u8) Error!void {

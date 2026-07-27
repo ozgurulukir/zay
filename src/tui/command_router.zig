@@ -47,6 +47,7 @@ pub fn handleCommandKey(app: *App, key: vaxis.Key) !bool {
         .command => try CommandMenu.handle(app, key),
         .settings => try SettingsMode.handle(app, key),
         .mcp => try McpMode.handle(app, key),
+        .plugins => try PluginsMode.handle(app, key),
         // The diff viewer owns its keys directly in `captureEvent`; nothing
         // reaches the generic dispatch.
         .diff_viewer => false,
@@ -525,6 +526,24 @@ const McpMode = struct {
             return true;
         }
         return true;
+    }
+};
+
+const PluginsMode = struct {
+    fn handle(app: *App, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
+            tui.closePlugins(app);
+            return true;
+        }
+        if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
+            app.pickers.plugins.moveUp();
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
+            app.pickers.plugins.moveDown(0); // count comes from plugin manager
+            return true;
+        }
+        return false;
     }
 };
 
