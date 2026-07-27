@@ -70,6 +70,26 @@ A lane starts on a random `nova/<hex>` branch. On its first prompt, the session'
 
 We have fine-tuned a ModernBERT base model on a corpus of over 3000 bash commands and classified each command as either safe or unsafe. We run this model on every bash tool call the agent makes, and if it's marked unsafe, we show a permission prompt to either approve or reject the call. Thanks to the efficient architecture of ModernBERT (i.e. Alternating Attention) and its small size the performance overhead of making these inference calls is negligible.
 
+### Local safety fallback
+
+When the remote classifier is unavailable (network error, service down), a local pattern matcher in `src/tools/bash_safety.zig` provides defense-in-depth. It flags obviously destructive commands:
+
+- `rm -rf /`, `rm -rf /*`, `rm -rf --no-preserve-root /`
+- Fork bombs (`:(){ :|:& };:`)
+- Destructive `dd` to block devices (`of=/dev/sda`, `of=/boot/`, etc.)
+- `mkfs` targeting `/dev/`
+- Redirects into critical system paths (`/etc/`, `/boot/`, `/sys/`, `/proc/`, `/dev/sd*`)
+
+The local matcher is intentionally conservative — it only catches clearly destructive patterns. The remote model is the primary classifier.
+
+### Working directory validation
+
+The `cwd` parameter in bash tool calls is validated against the project root in `src/tools/bash.zig` (`validateCwd`). The resolved path is normalized (resolving `..` and `.` segments) and checked to stay within the project root. This prevents the model from escaping the project via absolute paths like `/etc` or relative paths like `../../sensitive`.
+
+### Temp file safety
+
+Temporary log files use hex-only filenames (`nova-bash-<hex>.log` via `bytesToHex`), making path traversal impossible. The `namedTempPath` public API asserts that the provided name contains no path separators.
+
 ## Type System Discipline
 
 Nova uses `union(enum)` instead of flat structs with optional fields wherever a value can be in one of several mutually-exclusive states. This makes illegal combinations unrepresentable at compile time — the compiler tells the next developer where to add a case when a new variant is introduced.

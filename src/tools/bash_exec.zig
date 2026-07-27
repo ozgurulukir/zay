@@ -315,7 +315,7 @@ fn countNewlines(bytes: []const u8) u32 {
 fn openSpill(gpa: std.mem.Allocator, io: std.Io) !Sink.Spill {
     const path = try tempSpillPath(gpa, io);
     errdefer gpa.free(path);
-    const file = try std.Io.Dir.createFile(.cwd(), io, path, .{});
+    const file = try std.Io.Dir.createFileAbsolute(io, path, .{});
     return .{ .file = file, .path = path };
 }
 
@@ -435,7 +435,9 @@ pub fn shellPath(io: std.Io) []const u8 {
 /// Join `name` under the temp directory both the shell and Nova agree on (see
 /// `tempDir`). Used for background-job log files so the model can `tail` a stable
 /// path. Caller owns the result.
+/// Asserts that `name` contains no path separators (to prevent path traversal).
 pub fn namedTempPath(gpa: std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]u8 {
+    assert(std.mem.indexOfScalar(u8, name, std.fs.path.sep) == null);
     const dir = try tempDir(gpa);
     defer gpa.free(dir);
     return std.fs.path.join(gpa, &.{ dir, name });

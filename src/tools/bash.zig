@@ -60,6 +60,10 @@ pub fn runTool(
         break :value command_cwd.?;
     } else cwd;
 
+    if (!validateCwd(gpa, cwd, resolved_cwd)) {
+        return common.failFmt(gpa, 1, "bash: cwd '{s}' escapes the project root\n", .{resolved_cwd});
+    }
+
     var env_map = try currentEnvMap(gpa, io);
     defer env_map.deinit();
     if (args.env) |env| try applyEnv(&env_map, env);
@@ -123,6 +127,10 @@ pub fn runBackground(
         break :value command_cwd.?;
     } else cwd;
 
+    if (!validateCwd(gpa, cwd, resolved_cwd)) {
+        return common.failFmt(gpa, 1, "bash: cwd '{s}' escapes the project root\n", .{resolved_cwd});
+    }
+
     var env_map = try currentEnvMap(gpa, io);
     defer env_map.deinit();
     if (args.env) |env| try applyEnv(&env_map, env);
@@ -143,6 +151,23 @@ pub fn runBackground(
         .{ started.label, started.pid, started.log_path },
     );
     return common.ok(gpa, text);
+}
+
+/// Validate that `resolved_cwd` stays within the project root. `project_root`
+/// must be absolute; `resolved_cwd` may be absolute or relative. Returns
+/// `false` when the resolved path escapes the project root.
+fn validateCwd(gpa: std.mem.Allocator, project_root: []const u8, resolved_cwd: []const u8) bool {
+    // Resolve `..` and `.` segments without syscalls (no symlink resolution).
+    // This is a best-effort guard: a symlink inside the project root that points
+    // outside would not be caught here, but the common case of `../../etc` is.
+    const normalized = std.fs.path.resolve(gpa, &.{ project_root, resolved_cwd }) catch return false;
+    defer gpa.free(normalized);
+
+    if (!std.mem.startsWith(u8, normalized, project_root)) return false;
+    // Also check that the next byte after the project root is a separator or end-of-string,
+    // so `/home/project-evil` is not considered inside `/home/project`.
+    if (normalized.len > project_root.len and normalized[project_root.len] != std.fs.path.sep) return false;
+    return true;
 }
 
 fn mapBackgroundError(gpa: std.mem.Allocator, err: anyerror) common.Error!common.Output {

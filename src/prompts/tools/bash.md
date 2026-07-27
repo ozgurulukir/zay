@@ -1,7 +1,8 @@
 Run a shell command.
 
-- Set the working directory with the `cwd` param, not `cd dir && ...` because each call starts a fresh shell.
+- Set the working directory with the `cwd` param, not `cd dir && ...` because each call starts a fresh shell. The `cwd` must be within the project root.
 - Pass values via `env: { NAME: "..." }` for multiline or complex values. Reference them as `"$NAME"`.
+- Provide a `reason` for every command — a human-readable single-sentence explanation of what it does.
 - Quote every expansion: `"$var"`, `"$(cmd)"`, `"${arr[@]}"`.
 - Default timeout is 10 seconds. Raise it with the `timeout` parameter when a command needs longer.
 - Prefer targeted commands (`rg`, `find`, `git diff --stat`, `head`, `tail`) over dumping large files or full build logs.
