@@ -314,6 +314,7 @@ fn writeToolDefinition(
     try writer.writeAll("},\"required\":[");
     var written_required: u32 = 0;
     for (schema.properties) |prop| {
+        if (!prop.required) continue;
         if (written_required > 0) try writer.writeByte(',');
         try std.json.Stringify.value(prop.name, .{}, writer);
         written_required += 1;
@@ -603,11 +604,14 @@ test "buildToolsJson emits strict schema with nullable union types for optional 
     // Nested object keeps additionalProperties:true for free-form keys
     try std.testing.expect(std.mem.indexOf(u8, json, "\"additionalProperties\":true") != null);
 
-    // Required array lists all properties under strict mode
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"required_str\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"non_nullable_str\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_str\"") != null);
+    // Required array only includes properties with required=true
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"required_str\",\"non_nullable_str\"]") != null);
+    // Optional fields appear in properties but NOT in the required array
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_str\"") != null); // in properties
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_int\"") != null);  // in properties
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_bool\"") != null); // in properties
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_obj\"") != null);  // in properties
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_arr\"") != null);  // in properties
 }
 
 test "buildToolsJson preserves nested object additionalProperties for free-form env" {

@@ -231,6 +231,7 @@ fn writeParameters(writer: *std.Io.Writer, schema: tools_common.Schema) !void {
     try writer.writeAll("},\"required\":[");
     var required_count: u32 = 0;
     for (schema.properties) |prop| {
+        if (!prop.required) continue;
         if (required_count > 0) try writer.writeByte(',');
         try std.json.Stringify.value(prop.name, .{}, writer);
         required_count += 1;
@@ -1014,6 +1015,8 @@ test "openresponses strict schema includes nullable union types and top-level ad
     try std.testing.expect(std.mem.indexOf(u8, json, "\"additionalProperties\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":{\"type\":\"string\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tag\":{\"type\":[\"string\",\"null\"]") != null);
+    // Required array only includes properties with required=true
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"id\"]") != null);
 }
 
 test "openresponses emits final item text when no delta arrived" {
