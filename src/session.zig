@@ -509,37 +509,37 @@ pub const Session = struct {
 
     fn loadBranch(self: *Session, gpa: std.mem.Allocator) Error![]EntryRecord {
         const leaf_id = self.leaf_entry_id orelse return try gpa.alloc(EntryRecord, 0);
+
+        var statement = try self.manager.connection.prepare(
+            \\with recursive branch(id, parent_id, kind, role, payload_json, created_at_ms, snapshot, rowid) as (
+            \\  select id, parent_id, kind, role, payload_json, created_at_ms, snapshot, rowid
+            \\    from session_entries where session_id = ? and id = ?
+            \\  union all
+            \\  select e.id, e.parent_id, e.kind, e.role, e.payload_json, e.created_at_ms, e.snapshot, e.rowid
+            \\    from session_entries e join branch on e.id = branch.parent_id
+            \\    where branch.parent_id is not null
+            \\)
+            \\select id, parent_id, kind, role, payload_json, created_at_ms, snapshot from branch order by created_at_ms, rowid
+        );
+        defer statement.finalize();
+        try statement.bindText(1, self.id.slice());
+        try statement.bindText(2, leaf_id.slice());
+
         var records: std.ArrayList(EntryRecord) = .empty;
         errdefer {
             for (records.items) |*record| record.deinit(gpa);
             records.deinit(gpa);
         }
 
-        var current = leaf_id;
-        while (true) {
-            const record = try self.loadEntry(gpa, current.slice());
-            const parent = record.parent_id;
-            try records.append(gpa, record);
-            if (parent) |value| {
-                current = .{ .bytes = value };
-            } else {
-                break;
-            }
+        var found = false;
+        while (try statement.step()) |row| {
+            found = true;
+            try records.append(gpa, try readEntry(gpa, &row));
         }
-        std.mem.reverse(EntryRecord, records.items);
+        if (!found) return error.MissingEntry;
         return records.toOwnedSlice(gpa);
     }
-
-    fn loadEntry(self: *Session, gpa: std.mem.Allocator, entry_id: []const u8) Error!EntryRecord {
-        var statement = try self.manager.connection.prepare("select id, parent_id, kind, role, payload_json, created_at_ms, snapshot from session_entries where session_id = ? and id = ?");
-        defer statement.finalize();
-        try statement.bindText(1, self.id.slice());
-        try statement.bindText(2, entry_id);
-        const row = (try statement.step()) orelse return error.MissingEntry;
-        return readEntry(gpa, &row);
-    }
 };
-
 
 fn expectDone(statement: *db.Statement) Error!void {
     if (try statement.step()) |_| return error.Sqlite;
