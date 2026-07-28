@@ -48,9 +48,9 @@ nova.register_tool({
 
 Key points:
 - `nova.register_tool()` is the primary API for exposing functionality to the AI model
-- The `name` must be unique across all plugins
+- The `name` must be unique within the plugin (the system prefixes it as `lua__<plugin>__<name>`)
 - `parameters` follows JSON Schema conventions — each key is a parameter name
-- The `handler` receives a table of parameter values and returns a string
+- The `handler` receives a Lua table of parameter values (JSON parsed automatically) and returns a string
 - Parameters declared without `optional = true` are required
 
 ### test.lua

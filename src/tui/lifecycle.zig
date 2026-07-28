@@ -76,6 +76,8 @@ pub fn deinitApp(self: *App) void {
     self.input_buffers.mcp_url.deinit(self.gpa);
     self.mcp_manager.deinit(self.io);
     self.plugin_manager.deinit();
+    self.tool_registry.deinit(self.gpa);
+    self.gpa.destroy(self.tool_registry);
     if (self.cached_config_owned) {
         self.cached_config.deinit(self.gpa);
         self.cached_config_owned = false;

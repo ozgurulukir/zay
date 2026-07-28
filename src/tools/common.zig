@@ -91,6 +91,11 @@ pub const ToolDisplay = struct {
 /// is a slice of these; it is the single source of truth for what tools
 /// exist. Display policy (Expand-by-default, render mode) is NOT carried
 /// here — that lives TUI-side.
+///
+/// `userdata` is passed as the last argument to every callback so the
+/// same shared `*const fn` signature can route through per-tool state
+/// without resorting to a global mutable slot. Builtin tools pass
+/// `undefined` (it is never read); plugin tools pass a `*PluginToolKey`.
 pub const Tool = struct {
     name: []const u8,
     /// Raw description template. May contain `{{hsep}}` placeholders that
@@ -102,6 +107,7 @@ pub const Tool = struct {
         io: std.Io,
         cwd: []const u8,
         args: []const u8,
+        userdata: *anyopaque,
     ) Error!Output,
     /// Produce the human display metadata shown in the TUI's tool row.
     /// `label` is the collapsed summary; `expanded_label`, when present,
@@ -109,7 +115,17 @@ pub const Tool = struct {
     display: *const fn (
         gpa: std.mem.Allocator,
         args: []const u8,
+        userdata: *anyopaque,
     ) std.mem.Allocator.Error!ToolDisplay,
+    /// Optional per-tool context. Plugin tools use this to carry their
+    /// `(plugin_name, tool_name, manager)` key; builtin tools leave it
+    /// `undefined`. Borrowed; freed via `userdata_free` on registry teardown.
+    userdata: *anyopaque = undefined,
+    /// Frees the heap allocation behind `userdata`. Null when the tool
+    /// has no per-tool state (e.g. all builtins). The allocator matches
+    /// the one that originally allocated `userdata`; the registry passes
+    /// it through so the lifetime is unambiguous.
+    userdata_free: ?*const fn (gpa: std.mem.Allocator, ud: *anyopaque) void = null,
 };
 
 pub const Schema = struct {
@@ -121,9 +137,32 @@ pub const Schema = struct {
         description: []const u8,
         required: bool,
         nullable: bool = false,
+        /// Enum constraint values. When present, the property is restricted
+        /// to one of these values. Serialized as `"enum": [...]` in the
+        /// tool definition JSON so the model knows the valid options.
+        enum_values: ?[]const []const u8 = null,
+        /// Default value stored as a raw JSON string fragment (e.g. `"42"`,
+        /// `"true"`, `"\"auto\""`). When present, serialized as
+        /// `"default": <value>` in the tool definition JSON.
+        default_value: ?[]const u8 = null,
     };
 
     pub const Kind = enum { string, integer, number, object, array, boolean };
+
+    /// Free all owned slices in the schema's properties.
+    pub fn deinit(self: *Schema, gpa: std.mem.Allocator) void {
+        for (self.properties) |*prop| {
+            gpa.free(prop.name);
+            gpa.free(prop.description);
+            if (prop.enum_values) |ev| {
+                for (ev) |v| gpa.free(v);
+                gpa.free(ev);
+            }
+            if (prop.default_value) |dv| gpa.free(dv);
+        }
+        if (self.properties.len > 0) gpa.free(self.properties);
+        self.* = undefined;
+    }
 };
 
 pub fn ok(gpa: std.mem.Allocator, stdout: []u8) Error!Output {

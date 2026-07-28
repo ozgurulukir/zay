@@ -41,10 +41,17 @@ nova.register_tool({
     name = { type = "string", description = "Who to greet" },
   },
   handler = function(params)
+    -- params is a Lua table (JSON parsed automatically)
     return "Hello, " .. (params.name or "World") .. "!"
   end,
 })
 ```
+
+**Tool naming:** Tools are exposed to the AI model as `lua__<plugin>__<tool>`
+(e.g. `lua__my-plugin__hello`). The prefix is added automatically.
+
+**Parameters:** JSON arguments from the AI model are automatically parsed into
+a Lua table before the handler is called. Access `params.param_name` directly.
 
 ## Plugin Discovery
 

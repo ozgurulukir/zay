@@ -5,6 +5,7 @@ const model_catalog = @import("openai_compatible_models.zig");
 const openai_endpoint = @import("openai_endpoint.zig");
 const stream_parser = @import("stream_parser.zig");
 const tools_common = @import("../tools/common.zig");
+const tools_mod = @import("../tools.zig");
 
 const redirect_buffer_bytes: u32 = 8192;
 const transfer_buffer_bytes: u32 = 4096;
@@ -61,7 +62,7 @@ pub const Client = struct {
         owned_config.session_id = try gpa.dupe(u8, config.session_id);
         errdefer gpa.free(owned_config.session_id);
 
-        const tools_json = try buildAllToolsJson(gpa, config.tools, config.mcp_tools);
+        const tools_json = try buildAllToolsJson(gpa, config.tools, config.mcp_tools, null);
         errdefer gpa.free(tools_json);
 
         target.* = .{
@@ -89,8 +90,19 @@ pub const Client = struct {
     /// Rebuild the serialized tool definitions after the MCP tool set changes.
     /// `mcp_tools` is borrowed only for the duration of the call; the result is
     /// the owned `tools_json`. Call between turns, never mid-turn.
-    pub fn updateMcpTools(self: *Client, mcp_tools: []const ai.McpToolSchema) !void {
-        const new_json = try buildAllToolsJson(self.gpa, self.config.tools, mcp_tools);
+    /// `registry`, when non-null, contributes its builtin + plugin tools so
+    /// the model sees them as first-class definitions. `builtin_override`
+    /// lets the caller pick what `config.tools` contributes at call time —
+    /// typically `&.{}` because the registry's builtin already covers
+    /// bash, and emitting both creates a duplicate name that most APIs
+    /// reject outright.
+    pub fn updateMcpTools(
+        self: *Client,
+        mcp_tools: []const ai.McpToolSchema,
+        registry: ?*tools_mod.ToolRegistry,
+        builtin_override: []const tools_common.Tool,
+    ) !void {
+        const new_json = try buildAllToolsJson(self.gpa, builtin_override, mcp_tools, registry);
         self.gpa.free(self.tools_json);
         self.tools_json = new_json;
     }
@@ -105,6 +117,11 @@ pub const Client = struct {
     fn recordErrorDetail(self: *Client, status_code: u16, body: []const u8) void {
         const message = extractErrorMessage(self.gpa, body) catch return;
         defer self.gpa.free(message);
+        // Temporary diagnostic — log every API error verbatim so we can see
+        // the actual reason for "HTTP 400" (most often: schema validation
+        // or duplicate tool name). The UI also shows last_error_detail;
+        // this is the stderr variant.
+        std.debug.print("[trace] openai_compatible.recordErrorDetail: status={d} body={s}\n", .{ status_code, message });
         const detail = std.fmt.allocPrint(self.gpa, "HTTP {d}: {s}", .{ status_code, message }) catch return;
         self.clearErrorDetail();
         self.last_error_detail = detail;
@@ -250,7 +267,12 @@ test "extractErrorMessage pulls the nested message, plain error, or raw fallback
 /// Each adapter owns its own translation; this is the OpenAI version of
 /// "render a Tool into a tools-schema entry."
 /// Substitutes `{{hsep}}` → `~` in each tool's description template.
-fn buildAllToolsJson(gpa: std.mem.Allocator, tools: []const tools_common.Tool, mcp_tools: []const ai.McpToolSchema) ![]u8 {
+fn buildAllToolsJson(
+    gpa: std.mem.Allocator,
+    tools: []const tools_common.Tool,
+    mcp_tools: []const ai.McpToolSchema,
+    registry: ?*tools_mod.ToolRegistry,
+) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     const writer = &aw.writer;
@@ -260,6 +282,14 @@ fn buildAllToolsJson(gpa: std.mem.Allocator, tools: []const tools_common.Tool, m
         if (!first) try writer.writeByte(',');
         first = false;
         try writeToolDefinition(gpa, writer, tool.name, tool.description, tool.schema);
+    }
+    if (registry) |r| {
+        const plugin_slice = try r.all(gpa);
+        for (plugin_slice) |tool| {
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writeToolDefinition(gpa, writer, tool.name, tool.description, tool.schema);
+        }
     }
     for (mcp_tools) |mcp| {
         if (!first) try writer.writeByte(',');
@@ -297,13 +327,29 @@ fn writeToolDefinition(
             .array => "array",
             .boolean => "boolean",
         };
-        if (prop.nullable) {
+        if (prop.nullable or !prop.required) {
             try std.json.Stringify.value(&[_][]const u8{ kind_str, "null" }, .{}, writer);
         } else {
             try std.json.Stringify.value(kind_str, .{}, writer);
         }
         try writer.writeAll(",\"description\":");
         try std.json.Stringify.value(prop.description, .{}, writer);
+        // Emit enum constraint when present.
+        if (prop.enum_values) |ev| {
+            if (ev.len > 0) {
+                try writer.writeAll(",\"enum\":[");
+                for (ev, 0..) |v, ei| {
+                    if (ei > 0) try writer.writeByte(',');
+                    try std.json.Stringify.value(v, .{}, writer);
+                }
+                try writer.writeByte(']');
+            }
+        }
+        // Emit default value when present (already a raw JSON fragment).
+        if (prop.default_value) |dv| {
+            try writer.writeAll(",\"default\":");
+            try writer.writeAll(dv);
+        }
         if (prop.kind == .object) {
             try writer.writeAll(",\"additionalProperties\":true");
         } else if (prop.kind == .array) {
@@ -312,12 +358,9 @@ fn writeToolDefinition(
         try writer.writeByte('}');
     }
     try writer.writeAll("},\"required\":[");
-    var written_required: u32 = 0;
-    for (schema.properties) |prop| {
-        if (!prop.required) continue;
-        if (written_required > 0) try writer.writeByte(',');
+    for (schema.properties, 0..) |prop, i| {
+        if (i > 0) try writer.writeByte(',');
         try std.json.Stringify.value(prop.name, .{}, writer);
-        written_required += 1;
     }
     try writer.writeAll("]}}}");
 }
@@ -508,7 +551,7 @@ fn writeRequestPayload(
 test "buildToolsJson produces a valid JSON array for the registry" {
     const tools = @import("../tools.zig");
     const gpa = std.testing.allocator;
-    const json = try buildAllToolsJson(gpa, tools.registry(), &.{});
+    const json = try buildAllToolsJson(gpa, tools.builtinRegistry(), &.{}, null);
     defer gpa.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
     defer parsed.deinit();
@@ -530,7 +573,7 @@ test "buildToolsJson substitutes {{hsep}} placeholders with ~" {
             .display = undefined,
         },
     };
-    const json = try buildAllToolsJson(gpa, &tools, &.{});
+    const json = try buildAllToolsJson(gpa, &tools, &.{}, null);
     defer gpa.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "uses ~ marker") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "{{hsep}}") == null);
@@ -554,7 +597,7 @@ test "buildAllToolsJson includes MCP tools alongside builtin tools" {
             .schema = .{ .properties = &.{} },
         },
     };
-    const json = try buildAllToolsJson(gpa, &tools, &mcp_tools);
+    const json = try buildAllToolsJson(gpa, &tools, &mcp_tools, null);
     defer gpa.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
     defer parsed.deinit();
@@ -562,6 +605,125 @@ test "buildAllToolsJson includes MCP tools alongside builtin tools" {
     try std.testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"bash\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"mcp__server__greet\"") != null);
+}
+
+test "buildAllToolsJson via updateMcpTools: registry builtin suppresses duplicate bash" {
+    // Regression: the tick-driven `injectAllTools` path used to call
+    // `updateMcpTools(mcp_tools, registry)` without an override, so
+    // `buildAllToolsJson` would emit bash twice — once from
+    // `self.config.tools` and again from `r.all.builtin`. Most
+    // OpenAI-compatible APIs reject duplicate tool names with HTTP 400,
+    // dropping the entire tool list including the plugin tools.
+    const gpa = std.testing.allocator;
+
+    // Build a minimal Client with just a bash builtin in `config.tools`.
+    var client: Client = undefined;
+    try client.init(gpa, std.testing.io, .{
+        .base_url = "https://example.invalid",
+        .api_key = "test-key",
+        .model = "test-model",
+        .tools = tools_mod.builtinRegistry(),
+        .mcp_tools = &.{},
+        .session_id = "test",
+        .system_prompt = "",
+    });
+    defer client.deinit();
+
+    // Build a registry with a plugin tool; its builtin is bash too.
+    const reg = try gpa.create(tools_mod.ToolRegistry);
+    defer {
+        reg.deinit(gpa);
+        gpa.destroy(reg);
+    }
+    reg.* = tools_mod.ToolRegistry.init(tools_mod.builtinRegistry());
+    // Ownership of `plugin_name` and `plugin_desc` transfers to the
+    // registry via addPluginTool; registry.deinit frees them.
+    const plugin_name = try gpa.dupe(u8, "lua__p__t");
+    const plugin_desc = try gpa.dupe(u8, "plugin tool");
+    try reg.addPluginTool(gpa, .{
+        .name = plugin_name,
+        .description = plugin_desc,
+        .schema = .{ .properties = &.{} },
+        .run = undefined,
+        .display = undefined,
+    });
+
+    // The fix: pass &.{} as builtin_override so config.tools isn't
+    // emitted alongside the registry's builtin (which already has it).
+    try client.updateMcpTools(&.{}, reg, &.{});
+
+    const json = client.tools_json;
+    var first: ?usize = null;
+    var count: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, json, idx, "\"name\":\"bash\"")) |pos| {
+        if (first == null) first = pos;
+        count += 1;
+        idx = pos + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"lua__p__t\"") != null);
+}
+
+test "updateMcpTools propagates plugin tools into tools_json end-to-end" {
+    // End-to-end regression for the user-reported "plugin tools not
+    // visible to AI" bug. We simulate the exact call site:
+    //   attachOpenAiCompatibleClient → injectPluginTools → injectAllTools →
+    //   runtime.client.updateMcpTools(mcp_schemas, registry, &.{}).
+    // After the call, `client.tools_json` must contain every plugin
+    // tool's name so the next prompt includes them.
+    const gpa = std.testing.allocator;
+
+    var client: Client = undefined;
+    try client.init(gpa, std.testing.io, .{
+        .base_url = "https://example.invalid",
+        .api_key = "test-key",
+        .model = "test-model",
+        .tools = tools_mod.builtinRegistry(),
+        .mcp_tools = &.{},
+        .session_id = "test",
+        .system_prompt = "",
+    });
+    defer client.deinit();
+
+    // Build a registry carrying two plugin tools, exactly the way
+    // registerPluginTools would after initRuntime runs.
+    const reg = try gpa.create(tools_mod.ToolRegistry);
+    defer {
+        reg.deinit(gpa);
+        gpa.destroy(reg);
+    }
+    reg.* = tools_mod.ToolRegistry.init(tools_mod.builtinRegistry());
+
+    for ([_][]const u8{ "lua__hello-world__greet", "lua__hello-world__current_time" }) |tool_name| {
+        const owned_name = try gpa.dupe(u8, tool_name);
+        const owned_desc = try gpa.dupe(u8, "test");
+        try reg.addPluginTool(gpa, .{
+            .name = owned_name,
+            .description = owned_desc,
+            .schema = .{ .properties = &.{} },
+            .run = undefined,
+            .display = undefined,
+        });
+    }
+
+    // The exact call shape from injectAllTools.
+    try client.updateMcpTools(&.{}, reg, &.{});
+
+    const json = client.tools_json;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"bash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"lua__hello-world__greet\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"lua__hello-world__current_time\"") != null);
+
+    // And the count of name occurrences must be exactly 3 (no duplicate
+    // bash, no dropped plugin tools).
+    var name_count: usize = 0;
+    var scan_idx: usize = 0;
+    while (std.mem.indexOfPos(u8, json, scan_idx, "\"name\":\"")) |pos| {
+        name_count += 1;
+        scan_idx = pos + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), name_count);
 }
 
 test "buildToolsJson emits strict schema with nullable union types for optional fields" {
@@ -585,7 +747,7 @@ test "buildToolsJson emits strict schema with nullable union types for optional 
             .display = undefined,
         },
     };
-    const json = try buildAllToolsJson(gpa, &tools, &.{});
+    const json = try buildAllToolsJson(gpa, &tools, &.{}, null);
     defer gpa.free(json);
 
     // Top-level strict marker and top-level additionalProperties:false
@@ -606,14 +768,15 @@ test "buildToolsJson emits strict schema with nullable union types for optional 
     // Nested object keeps additionalProperties:true for free-form keys
     try std.testing.expect(std.mem.indexOf(u8, json, "\"additionalProperties\":true") != null);
 
-    // Required array only includes properties with required=true
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"required_str\",\"non_nullable_str\"]") != null);
-    // Optional fields appear in properties but NOT in the required array
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_str\"") != null); // in properties
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_int\"") != null); // in properties
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_bool\"") != null); // in properties
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_obj\"") != null); // in properties
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_arr\"") != null); // in properties
+    // Required array includes ALL properties for strict mode compliance.
+    // Optional fields are marked nullable so the model knows they can be absent.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"required_str\",\"optional_str\",\"optional_int\",\"optional_bool\",\"optional_obj\",\"optional_arr\",\"non_nullable_str\"]") != null);
+    // Optional fields appear in properties.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_str\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_int\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_bool\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_obj\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_arr\"") != null);
 }
 
 test "buildToolsJson preserves nested object additionalProperties for free-form env" {
@@ -632,7 +795,7 @@ test "buildToolsJson preserves nested object additionalProperties for free-form 
             .display = undefined,
         },
     };
-    const json = try buildAllToolsJson(gpa, &tools, &.{});
+    const json = try buildAllToolsJson(gpa, &tools, &.{}, null);
     defer gpa.free(json);
 
     // Top-level parameters object is strict
@@ -670,12 +833,12 @@ test "updateMcpTools rebuilds the serialized tool list in place" {
     const mcp_tools = [_]ai.McpToolSchema{
         .{ .name = "mcp__tavily__search", .description = "Search the web", .schema = .{ .properties = &.{} } },
     };
-    try client.updateMcpTools(&mcp_tools);
+    try client.updateMcpTools(&mcp_tools, null, tools_mod.builtinRegistry());
     try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "\"name\":\"bash\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "\"name\":\"mcp__tavily__search\"") != null);
 
     // Replacing with an empty set removes the MCP tool but keeps the builtin.
-    try client.updateMcpTools(&.{});
+    try client.updateMcpTools(&.{}, null, tools_mod.builtinRegistry());
     try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "mcp__tavily__search") == null);
     try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "\"name\":\"bash\"") != null);
 }

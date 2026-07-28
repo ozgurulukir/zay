@@ -262,7 +262,11 @@ fn applyToolPreview(
                 return try self.applySkillPreview(gpa, transcript, tool.index, skill_name);
             }
         }
-        var display = try agent_mod.formatToolDisplay(gpa, tool.name, tool.arguments);
+        var display = try agent_mod.formatToolDisplay(
+            gpa,
+            tools_mod.lookupIn(tools_mod.builtinRegistry(), tool.name),
+            tool.arguments,
+        );
         defer display.deinit(gpa);
         if (std.mem.eql(u8, tool.name, "bash") and display.expanded_label == null) return false;
 

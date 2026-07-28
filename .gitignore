@@ -18,3 +18,6 @@ vendor/local-models/
 .opencode/refactor.md
 _pm/
 type-safety-refactor.md
+.zig-cache-test/
+.zig-cache-session/
+.soloncode/

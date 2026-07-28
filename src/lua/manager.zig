@@ -9,6 +9,7 @@ const std = @import("std");
 const c = @import("c");
 const State = @import("state.zig").State;
 const sandbox = @import("sandbox.zig");
+const plugin_api = @import("plugin_api.zig");
 const Manifest = @import("manifest.zig").Manifest;
 
 /// A loaded plugin instance with its manifest and sandboxed Lua state.
@@ -89,13 +90,17 @@ pub const PluginManager = struct {
         if (self.initialized) return self.plugins.count();
         self.initialized = true;
 
+        std.log.debug("plugin.loadAll.start global_dir={s} project_dir={s}", .{ self.global_dir, self.project_dir });
+
         // Load global plugins first
         try self.loadFromDir(self.global_dir, false);
 
         // Load project plugins (override globals)
         try self.loadFromDir(self.project_dir, false);
 
-        return self.plugins.count();
+        const loaded = self.plugins.count();
+        std.log.debug("plugin.loadAll.done loaded={}", .{loaded});
+        return loaded;
     }
 
     /// Load a single plugin from a directory path.
@@ -123,14 +128,23 @@ pub const PluginManager = struct {
         else
             manifest.permissions;
 
-        // Create the plugin instance
-        var L = sandbox.createSandboxedState(permissions);
+        // Create the plugin instance with Io so nova.* bridge functions
+        // (register_tool, read_file, etc.) are available in the sandbox.
+        var L = sandbox.createSandboxedStateWithIo(permissions, self.io);
 
         // Load the plugin's init.lua
         const init_path = try std.fs.path.join(self.allocator, &.{ dir_path, "init.lua" });
         defer self.allocator.free(init_path);
 
-        _ = self.loadLuaFile(&L, init_path);
+        const loaded = self.loadLuaFile(&L, init_path);
+        std.log.debug("plugin.loadOne.init path={s} loaded={}", .{ init_path, loaded });
+        if (!loaded) {
+            std.log.warn("plugin.loadOne.init_failed path={s}", .{init_path});
+            sandbox.freeHookData(L.handle);
+            L.deinit();
+            manifest.deinit(self.allocator);
+            return error.PluginInitFailed;
+        }
 
         const instance = try self.allocator.create(PluginInstance);
         instance.* = .{
@@ -186,6 +200,17 @@ pub const PluginManager = struct {
         return self.plugins.get(name);
     }
 
+    /// Dispatch a tool call to a loaded plugin by name.
+    /// `params_json` is forwarded to the Lua handler as a JSON string.
+    /// Returns the handler's output string (owned by caller).
+    pub fn callTool(self: *Self, plugin_name: []const u8, tool_name: []const u8, params_json: []const u8) ![]u8 {
+        const plugin = self.plugins.get(plugin_name) orelse return error.PluginNotFound;
+        if (!plugin.active) return error.PluginDisabled;
+        const tool_index = plugin_api.findToolIndex(plugin.state.handle, tool_name) orelse
+            return error.ToolNotFound;
+        return plugin_api.callToolHandler(plugin.state.handle, self.allocator, tool_index, params_json);
+    }
+
     /// Get the number of loaded plugins.
     pub fn count(self: *Self) usize {
         return self.plugins.count();
@@ -200,10 +225,20 @@ pub const PluginManager = struct {
 
     /// Load all plugins from a directory.
     fn loadFromDir(self: *Self, dir_path: []const u8, is_embedded: bool) !void {
+        std.log.debug("plugin.loadFromDir.start dir={s} is_embedded={}", .{ dir_path, is_embedded });
         var dir = std.Io.Dir.openDir(.cwd(), self.io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return,
-            error.NotDir => return,
-            else => return err,
+            error.FileNotFound => {
+                std.log.warn("plugin.loadFromDir.not_found dir={s}", .{dir_path});
+                return;
+            },
+            error.NotDir => {
+                std.log.warn("plugin.loadFromDir.not_dir dir={s}", .{dir_path});
+                return;
+            },
+            else => {
+                std.log.warn("plugin.loadFromDir.open_failed dir={s} err={s}", .{ dir_path, @errorName(err) });
+                return err;
+            },
         };
         defer dir.close(self.io);
 
@@ -211,7 +246,7 @@ pub const PluginManager = struct {
         while (try iter.next(self.io)) |entry| {
             if (entry.name.len == 0) continue;
             if (entry.name[0] == '.') continue;
-            if (entry.kind != .directory) continue;
+            if (entry.kind != .directory and entry.kind != .sym_link) continue;
 
             const plugin_dir = try std.fs.path.join(self.allocator, &.{ dir_path, entry.name });
             defer self.allocator.free(plugin_dir);
@@ -246,21 +281,52 @@ pub const PluginManager = struct {
 
     /// Load a Lua file and execute it, leaving the result on the stack.
     fn loadLuaFile(self: *Self, L: *State, path: []const u8) bool {
-        const content = self.readFileBytes(path) catch return false;
+        const content = self.readFileBytes(path) catch |err| {
+            std.log.warn("plugin.loadLuaFile.read_failed path={s} err={s}", .{ path, @errorName(err) });
+            return false;
+        };
         defer self.allocator.free(content);
 
         // Ensure null-terminated for Lua C API
-        const null_term = self.allocator.alloc(u8, content.len + 1) catch return false;
+        const null_term = self.allocator.dupeZ(u8, content) catch |err| {
+            std.log.warn("plugin.loadLuaFile.dupZ_failed path={s} err={s}", .{ path, @errorName(err) });
+            return false;
+        };
         defer self.allocator.free(null_term);
-        @memcpy(null_term[0..content.len], content);
-        null_term[content.len] = 0;
 
-        return L.doString(null_term[0 .. content.len + 1 :0]);
+        // Strip UTF-8 BOM if present
+        var script_ptr = null_term.ptr;
+        if (null_term.len >= 3 and std.mem.startsWith(u8, null_term, "\xEF\xBB\xBF")) {
+            script_ptr = null_term[3..].ptr;
+        }
+
+        const load_rc = c.luaL_loadstring(L.handle, script_ptr);
+        if (load_rc != c.LUA_OK) {
+            const err_ptr = c.lua_tolstring(L.handle, -1, null);
+            const msg = if (err_ptr) |p| std.mem.sliceTo(p, 0) else "unknown Lua load error";
+            std.log.warn("plugin.loadLuaFile.lua_load_error path={s} err={s}", .{ path, msg });
+            c.lua_pop(L.handle, 1);
+            return false;
+        }
+
+        const pcall_rc = c.lua_pcallk(L.handle, 0, c.LUA_MULTRET, 0, 0, null);
+        if (pcall_rc != c.LUA_OK) {
+            const err_ptr = c.lua_tolstring(L.handle, -1, null);
+            const msg = if (err_ptr) |p| std.mem.sliceTo(p, 0) else "unknown Lua runtime error";
+            std.log.warn("plugin.loadLuaFile.lua_runtime_error path={s} err={s}", .{ path, msg });
+            c.lua_pop(L.handle, 1);
+            return false;
+        }
+
+        return true;
     }
 
     /// Read a file's contents into an owned slice.
     fn readFileBytes(self: *Self, path: []const u8) ![]u8 {
-        var file = try std.Io.Dir.openFileAbsolute(self.io, path, .{});
+        var file = if (std.fs.path.isAbsolute(path))
+            try std.Io.Dir.openFileAbsolute(self.io, path, .{})
+        else
+            try std.Io.Dir.openFile(.cwd(), self.io, path, .{});
         defer file.close(self.io);
         var reader = file.reader(self.io, &.{});
         return reader.interface.allocRemaining(self.allocator, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
@@ -301,7 +367,10 @@ pub const PluginManager = struct {
 
     /// Check if a file exists.
     fn fileExists(self: *PluginManager, path: []const u8) bool {
-        var file = std.Io.Dir.openFile(.cwd(), self.io, path, .{}) catch return false;
+        var file = if (std.fs.path.isAbsolute(path))
+            std.Io.Dir.openFileAbsolute(self.io, path, .{}) catch return false
+        else
+            std.Io.Dir.openFile(.cwd(), self.io, path, .{}) catch return false;
         file.close(self.io);
         return true;
     }
@@ -318,4 +387,55 @@ test "plugin manager: loadAll with no plugins" {
     defer manager.deinit();
     const count = try manager.loadAll();
     try std.testing.expectEqual(@as(usize, 0), count);
+}
+
+test "plugin manager: end-to-end loadOne with register_tool" {
+    const testing = std.testing;
+
+    const dir_path = try std.fs.path.join(testing.allocator, &.{ "/tmp", "nova_test_plugin_disk" });
+    defer testing.allocator.free(dir_path);
+
+    var io_dir = try std.Io.Dir.openDir(.cwd(), testing.io, "/tmp", .{});
+    defer io_dir.close(testing.io);
+
+    std.Io.Dir.cwd().createDirPath(testing.io, "/tmp/nova_test_plugin_disk") catch {};
+    defer std.Io.Dir.cwd().deleteTree(testing.io, "/tmp/nova_test_plugin_disk") catch {};
+
+    var plugin_dir = try std.Io.Dir.openDir(.cwd(), testing.io, dir_path, .{});
+    defer plugin_dir.close(testing.io);
+
+    // Create plugin.lua
+    try plugin_dir.writeFile(testing.io, .{
+        .sub_path = "plugin.lua",
+        .data =
+        \\return {
+        \\  name = "disk_plugin",
+        \\  version = "1.0.0",
+        \\  description = "Disk test plugin"
+        \\}
+        ,
+    });
+
+    // Create init.lua
+    try plugin_dir.writeFile(testing.io, .{
+        .sub_path = "init.lua",
+        .data =
+        \\nova.register_tool({
+        \\  name = "disk_tool",
+        \\  description = "Tool from disk plugin",
+        \\  parameters = {},
+        \\  handler = function() return "disk ok" end,
+        \\})
+        ,
+    });
+
+    var manager = PluginManager.init(testing.allocator, testing.io, "", "");
+    defer manager.deinit();
+
+    const instance = try manager.loadOne(dir_path, false);
+    try testing.expectEqualStrings("disk_plugin", instance.manifest.name);
+    try testing.expect(instance.active);
+
+    const tool_count = plugin_api.countTools(instance.state.handle);
+    try testing.expectEqual(@as(u32, 1), tool_count);
 }

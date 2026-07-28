@@ -55,12 +55,20 @@ nova.register_tool({
     },
   },
   handler = function(params)
-    -- params is a table with parameter values
+    -- params is a Lua table with parameter values (JSON parsed automatically)
     -- Must return a string
     return "result"
   end,
 })
 ```
+
+**Tool naming:** Tools are exposed to the AI model as `lua__<plugin>__<tool>` (e.g.
+`lua__my-plugin__my_tool`). The prefix is added automatically — use short,
+descriptive names in `register_tool`.
+
+**Parameters:** The JSON arguments from the AI model are automatically parsed
+into a Lua table before the handler is called. You can access `params.param_name`
+directly — no manual JSON parsing needed.
 
 ## Available Bridge Functions (18 total)
 

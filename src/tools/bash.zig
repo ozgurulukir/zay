@@ -49,6 +49,29 @@ pub fn runTool(
     io: std.Io,
     cwd: []const u8,
     arguments: []const u8,
+    userdata: *anyopaque,
+) common.Error!common.Output {
+    _ = userdata;
+    return runToolImpl(gpa, io, cwd, arguments);
+}
+
+/// Test convenience wrapper — forwards to `runTool` with a null
+/// `userdata` pointer. Production code uses the 5-argument form so
+/// `Tool.run` callbacks can route through per-tool context.
+pub fn runToolForTest(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    arguments: []const u8,
+) common.Error!common.Output {
+    return runToolImpl(gpa, io, cwd, arguments);
+}
+
+fn runToolImpl(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    arguments: []const u8,
 ) common.Error!common.Output {
     var args = parseArgs(gpa, arguments) catch |err| return parseError(gpa, err);
     defer args.deinit();
@@ -562,7 +585,8 @@ fn mapBashError(err: anyerror) common.Error {
 
 /// The bash display summary is the model-provided reason; the expanded title
 /// is the executable command, so users can inspect exactly what ran.
-fn display(gpa: std.mem.Allocator, args: []const u8) std.mem.Allocator.Error!common.ToolDisplay {
+fn display(gpa: std.mem.Allocator, args: []const u8, userdata: *anyopaque) std.mem.Allocator.Error!common.ToolDisplay {
+    _ = userdata;
     const parsed = std.json.parseFromSlice(JsonArgs, gpa, args, .{ .ignore_unknown_fields = true }) catch {
         return .{ .label = try gpa.dupe(u8, "bash") };
     };
@@ -580,7 +604,7 @@ fn display(gpa: std.mem.Allocator, args: []const u8) std.mem.Allocator.Error!com
 
 test "bash display uses reason with command as expanded label" {
     const gpa = std.testing.allocator;
-    var label = try display(gpa, "{\"command\":\"pwd\",\"reason\":\"Inspect the current directory\"}");
+    var label = try display(gpa, "{\"command\":\"pwd\",\"reason\":\"Inspect the current directory\"}", undefined);
     defer label.deinit(gpa);
     try std.testing.expectEqualStrings("Inspect the current directory", label.label);
     try std.testing.expectEqualStrings("pwd", label.expanded_label.?);
@@ -588,7 +612,7 @@ test "bash display uses reason with command as expanded label" {
 
 test "bash display falls back on partial JSON" {
     const gpa = std.testing.allocator;
-    var label = try display(gpa, "{\"command");
+    var label = try display(gpa, "{\"command", undefined);
     defer label.deinit(gpa);
     try std.testing.expectEqualStrings("bash", label.label);
     try std.testing.expect(label.expanded_label == null);
@@ -599,7 +623,7 @@ test "bash tool applies env object" {
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
 
-    var output = try runTool(gpa, std.testing.io, cwd, "{\"command\":\"printf \\\"$BASH_TOOL_TEST\\\"\",\"reason\":\"read\",\"env\":{\"BASH_TOOL_TEST\":\"hello-env\"}}");
+    var output = try runToolForTest(gpa, std.testing.io, cwd, "{\"command\":\"printf \\\"$BASH_TOOL_TEST\\\"\",\"reason\":\"read\",\"env\":{\"BASH_TOOL_TEST\":\"hello-env\"}}");
     defer output.deinit(gpa);
 
     try std.testing.expectEqual(@as(u8, 0), output.code);
@@ -613,7 +637,7 @@ test "bash tool applies relative cwd" {
 
     try std.Io.Dir.cwd().createDirPath(std.testing.io, ".zig-cache/bash-tool-test");
 
-    var output = try runTool(gpa, std.testing.io, cwd, "{\"command\":\"printf \\\"$PWD\\\"\",\"reason\":\"read\",\"cwd\":\".zig-cache/bash-tool-test\"}");
+    var output = try runToolForTest(gpa, std.testing.io, cwd, "{\"command\":\"printf \\\"$PWD\\\"\",\"reason\":\"read\",\"cwd\":\".zig-cache/bash-tool-test\"}");
     defer output.deinit(gpa);
 
     // `$PWD` is reported in the shell's native notation (MSYS forward-slash form
@@ -647,7 +671,7 @@ test "bash tool reports exit code in observation" {
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
 
-    var output = try runTool(gpa, std.testing.io, cwd, "{\"command\":\"printf nope; exit 7\",\"reason\":\"read\"}");
+    var output = try runToolForTest(gpa, std.testing.io, cwd, "{\"command\":\"printf nope; exit 7\",\"reason\":\"read\"}");
     defer output.deinit(gpa);
     const observation = try testObservationText(gpa, output);
     defer gpa.free(observation);
@@ -710,7 +734,7 @@ test "bash tool surfaces a display block as a diff-kind display" {
     // The JSON-escaped RS byte (backslash-u-001e) is the sentinel; the shell
     // receives it literally and printf echoes it back out.
     const args = "{\"command\":\"printf 'edited ok\\n\\u001enova:diff\\n-old\\n+new\\n\\u001enova:end\\n'\",\"reason\":\"edit\"}";
-    var output = try runTool(gpa, std.testing.io, cwd, args);
+    var output = try runToolForTest(gpa, std.testing.io, cwd, args);
     defer output.deinit(gpa);
 
     try std.testing.expectEqual(@as(u8, 0), output.code);
@@ -727,7 +751,7 @@ test "bash tool truncates observation tail and keeps full output path" {
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
 
-    var output = try runTool(gpa, std.testing.io, cwd, "{\"command\":\"i=0; while [ $i -lt 2105 ]; do echo line-$i; i=$((i+1)); done\",\"reason\":\"read\"}");
+    var output = try runToolForTest(gpa, std.testing.io, cwd, "{\"command\":\"i=0; while [ $i -lt 2105 ]; do echo line-$i; i=$((i+1)); done\",\"reason\":\"read\"}");
     defer {
         if (output.observation) |observation| switch (observation) {
             .complete => {},
@@ -750,7 +774,7 @@ test "bash tool accepts null for optional fields under strict schema" {
     defer gpa.free(cwd);
 
     // Null for optional string, object, integer, and boolean fields.
-    var output = try runTool(gpa, std.testing.io, cwd,
+    var output = try runToolForTest(gpa, std.testing.io, cwd,
         \\{"command":"printf ok","reason":null,"cwd":null,"env":null,"timeout":null,"run_in_background":null}
     );
     defer output.deinit(gpa);
@@ -765,7 +789,7 @@ test "bash tool accepts partial nulls alongside populated optional fields" {
     defer gpa.free(cwd);
 
     // Mix of null and real values: null reason, populated cwd, null env, populated timeout, null run_in_background.
-    var output = try runTool(gpa, std.testing.io, cwd,
+    var output = try runToolForTest(gpa, std.testing.io, cwd,
         \\{"command":"printf ok","reason":null,"cwd":".","env":null,"timeout":30,"run_in_background":null}
     );
     defer output.deinit(gpa);
@@ -779,7 +803,7 @@ test "bash tool parses null timeout as default" {
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
 
-    var output = try runTool(gpa, std.testing.io, cwd,
+    var output = try runToolForTest(gpa, std.testing.io, cwd,
         \\{"command":"printf ok","timeout":null}
     );
     defer output.deinit(gpa);
@@ -796,7 +820,7 @@ test "bash tool rejects invalid type for nullable field when model sends wrong t
     // Strict schema allows string|null for `reason`, but not integer. The
     // JSON parser rejects the type mismatch, so parseArgs returns InvalidJson
     // and the tool exits non-zero instead of silently misinterpreting it.
-    var output = try runTool(gpa, std.testing.io, cwd,
+    var output = try runToolForTest(gpa, std.testing.io, cwd,
         \\{"command":"printf ok","reason":42}
     );
     defer output.deinit(gpa);

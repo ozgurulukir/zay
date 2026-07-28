@@ -5,6 +5,7 @@ const openai_endpoint = @import("openai_endpoint.zig");
 const openai_compatible = @import("openai_compatible.zig");
 const stream_part = @import("stream_part.zig");
 const tools_common = @import("../tools/common.zig");
+const tools_mod = @import("../tools.zig");
 
 const redirect_buffer_bytes: u32 = 8192;
 const transfer_buffer_bytes: u32 = 4096;
@@ -62,7 +63,7 @@ pub const Client = struct {
         errdefer gpa.free(owned_config.session_id);
         owned_config.system_prompt = try gpa.dupe(u8, config.system_prompt);
         errdefer gpa.free(owned_config.system_prompt);
-        const tools_json = try buildAllToolsJson(gpa, config.tools, config.mcp_tools);
+        const tools_json = try buildAllToolsJson(gpa, config.tools, config.mcp_tools, null);
         errdefer gpa.free(tools_json);
         target.* = .{
             .gpa = gpa,
@@ -91,8 +92,26 @@ pub const Client = struct {
     /// Rebuild the serialized tool definitions after the MCP tool set changes.
     /// `mcp_tools` is borrowed only for the duration of the call; the result is
     /// the owned `tools_json`. Call between turns, never mid-turn.
-    pub fn updateMcpTools(self: *Client, mcp_tools: []const ai.McpToolSchema) !void {
-        const new_json = try buildAllToolsJson(self.gpa, self.config.tools, mcp_tools);
+    /// `registry`, when non-null, contributes its builtin + plugin tools so
+    /// the model sees them as first-class definitions. When null, only the
+    /// builtin slice (`config.tools`) is used — the legacy path used by
+    /// tests that don't construct a full registry.
+    ///
+    /// The caller is responsible for choosing what `self.config.tools`
+    /// contains at call time. `attachXxxClient` initializes it with
+    /// `builtinRegistry()` so bash is present; the tick-driven
+    /// `injectAllTools` path passes an empty slice because the registry's
+    /// `builtin` already covers the same tool — passing both would emit
+    /// duplicate definitions and most OpenAI-compatible APIs reject
+    /// duplicate tool names outright (HTTP 400), dropping the entire
+    /// tool list including the plugin tools the caller wants exposed.
+    pub fn updateMcpTools(
+        self: *Client,
+        mcp_tools: []const ai.McpToolSchema,
+        registry: ?*tools_mod.ToolRegistry,
+        builtin_override: []const tools_common.Tool,
+    ) !void {
+        const new_json = try buildAllToolsJson(self.gpa, builtin_override, mcp_tools, registry);
         self.gpa.free(self.tools_json);
         self.tools_json = new_json;
     }
@@ -168,7 +187,12 @@ fn responsesUrl(gpa: std.mem.Allocator, base_url: []const u8, responses_config: 
     return try std.fmt.allocPrint(gpa, "{s}{s}", .{ root, responses_config.endpoint_path });
 }
 
-fn buildAllToolsJson(gpa: std.mem.Allocator, tools: []const tools_common.Tool, mcp_tools: []const ai.McpToolSchema) ![]u8 {
+fn buildAllToolsJson(
+    gpa: std.mem.Allocator,
+    tools: []const tools_common.Tool,
+    mcp_tools: []const ai.McpToolSchema,
+    registry: ?*tools_mod.ToolRegistry,
+) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     try aw.writer.writeByte('[');
@@ -177,6 +201,14 @@ fn buildAllToolsJson(gpa: std.mem.Allocator, tools: []const tools_common.Tool, m
         if (!first) try aw.writer.writeByte(',');
         first = false;
         try writeToolDefinition(gpa, &aw.writer, tool.name, tool.description, tool.schema);
+    }
+    if (registry) |r| {
+        const plugin_slice = try r.all(gpa);
+        for (plugin_slice) |tool| {
+            if (!first) try aw.writer.writeByte(',');
+            first = false;
+            try writeToolDefinition(gpa, &aw.writer, tool.name, tool.description, tool.schema);
+        }
     }
     for (mcp_tools) |mcp| {
         if (!first) try aw.writer.writeByte(',');
@@ -214,13 +246,29 @@ fn writeParameters(writer: *std.Io.Writer, schema: tools_common.Schema) !void {
             .array => "array",
             .boolean => "boolean",
         };
-        if (prop.nullable) {
+        if (prop.nullable or !prop.required) {
             try std.json.Stringify.value(&[_][]const u8{ kind, "null" }, .{}, writer);
         } else {
             try std.json.Stringify.value(kind, .{}, writer);
         }
         try writer.writeAll(",\"description\":");
         try std.json.Stringify.value(prop.description, .{}, writer);
+        // Emit enum constraint when present.
+        if (prop.enum_values) |ev| {
+            if (ev.len > 0) {
+                try writer.writeAll(",\"enum\":[");
+                for (ev, 0..) |v, ei| {
+                    if (ei > 0) try writer.writeByte(',');
+                    try std.json.Stringify.value(v, .{}, writer);
+                }
+                try writer.writeByte(']');
+            }
+        }
+        // Emit default value when present (already a raw JSON fragment).
+        if (prop.default_value) |dv| {
+            try writer.writeAll(",\"default\":");
+            try writer.writeAll(dv);
+        }
         if (prop.kind == .object) {
             try writer.writeAll(",\"additionalProperties\":true");
         } else if (prop.kind == .array) {
@@ -229,12 +277,9 @@ fn writeParameters(writer: *std.Io.Writer, schema: tools_common.Schema) !void {
         try writer.writeByte('}');
     }
     try writer.writeAll("},\"required\":[");
-    var required_count: u32 = 0;
-    for (schema.properties) |prop| {
-        if (!prop.required) continue;
-        if (required_count > 0) try writer.writeByte(',');
+    for (schema.properties, 0..) |prop, i| {
+        if (i > 0) try writer.writeByte(',');
         try std.json.Stringify.value(prop.name, .{}, writer);
-        required_count += 1;
     }
     try writer.writeAll("]}");
 }
@@ -986,7 +1031,7 @@ test "writeRequestPayload serializes tool call ids as strings, not objects" {
 test "openresponses tools json is an array" {
     const tools = @import("../tools.zig");
     const gpa = std.testing.allocator;
-    const json = try buildAllToolsJson(gpa, tools.registry(), &.{});
+    const json = try buildAllToolsJson(gpa, tools.builtinRegistry(), &.{}, null);
     defer gpa.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"function\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"strict\":true") != null);
@@ -1008,15 +1053,15 @@ test "openresponses strict schema includes nullable union types and top-level ad
             .display = undefined,
         },
     };
-    const json = try buildAllToolsJson(gpa, &tools, &.{});
+    const json = try buildAllToolsJson(gpa, &tools, &.{}, null);
     defer gpa.free(json);
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"strict\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"additionalProperties\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":{\"type\":\"string\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tag\":{\"type\":[\"string\",\"null\"]") != null);
-    // Required array only includes properties with required=true
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"id\"]") != null);
+    // Required array includes ALL properties for strict mode compliance.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"id\",\"tag\"]") != null);
 }
 
 test "openresponses emits final item text when no delta arrived" {

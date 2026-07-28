@@ -171,6 +171,9 @@ fn createRestrictedEnvironment(L: *c.lua_State, permissions: Permissions) void {
     copyGlobal(L, env_index, "coroutine");
     copyGlobal(L, env_index, "utf8");
 
+    // Copy the Nova plugin API table so plugins can call nova.register_tool, etc.
+    copyGlobal(L, env_index, "nova");
+
     // Safe os subset
     c.lua_newtable(L);
     const os_index = c.lua_gettop(L);

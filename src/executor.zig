@@ -6,6 +6,7 @@ const ai = @import("ai.zig");
 const background = @import("background.zig");
 const bash_safety = @import("tools/bash_safety.zig");
 const bash_tool = @import("tools/bash.zig");
+const lua_mod = @import("lua/root.zig");
 const mcp_mod = @import("mcp/manager.zig");
 const tools = @import("tools.zig");
 const tool_display = @import("tools/display.zig");
@@ -100,6 +101,17 @@ pub const ExecutorService = struct {
     background: ?BackgroundStart = null,
     /// MCP manager for dispatching `mcp__` tool calls. null disables MCP dispatch.
     mcp_manager: ?*mcp_mod.McpManager = null,
+    /// Tool registry (builtin + plugin). null falls back to `builtinRegistry`
+    /// only, which is what tests use.
+    tool_registry: ?*tools.ToolRegistry = null,
+    /// Pointer to the App's `plugin_manager`. Set on every by-value copy
+    /// of the App so the dispatcher can reach the live field, no matter
+    /// how many times the App has been copied through the run call
+    /// chain (`init` → `initRuntime` → `run`). Without this, plugin
+    /// tool dispatch segfaults because the `PluginToolKey.manager`
+    /// indirection slot is written from `initRuntime`'s scope — which
+    /// is freed by the time `run` calls `executor.runOne`.
+    plugin_manager: ?*lua_mod.PluginManager = null,
 
     pub const InitOptions = struct {
         gpa: std.mem.Allocator,
@@ -108,6 +120,8 @@ pub const ExecutorService = struct {
         bash_classifier_url: ?[]const u8 = null,
         background: ?BackgroundStart = null,
         mcp_manager: ?*mcp_mod.McpManager = null,
+        tool_registry: ?*tools.ToolRegistry = null,
+        plugin_manager: ?*lua_mod.PluginManager = null,
     };
 
     pub fn init(options: InitOptions) ExecutorService {
@@ -120,6 +134,8 @@ pub const ExecutorService = struct {
             .bash_classifier_url = options.bash_classifier_url,
             .background = options.background,
             .mcp_manager = options.mcp_manager,
+            .tool_registry = options.tool_registry,
+            .plugin_manager = options.plugin_manager,
         };
     }
 
@@ -170,6 +186,10 @@ pub const ExecutorService = struct {
         if (std.mem.startsWith(u8, call.name, "mcp__")) {
             return self.runMcpTool(call);
         }
+        // Plugin and builtin tool calls share one path: the registry's
+        // `all` slice backs a single lookup, and the matched tool's `run`
+        // callback routes through whatever `userdata` it carries (bash
+        // ignores it, plugins carry their `(manager, plugin, tool)` key).
         var output = self.produceOutput(call) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled => return error.Canceled,
@@ -183,7 +203,11 @@ pub const ExecutorService = struct {
         errdefer self.gpa.free(content);
         const name = try self.gpa.dupe(u8, call.name);
         errdefer self.gpa.free(name);
-        var display = try tool_display.lookupDisplay(self.gpa, call.name, call.arguments);
+        const looked_up = if (self.tool_registry) |r|
+            try r.lookup(self.gpa, call.name)
+        else
+            tools.lookupIn(tools.builtinRegistry(), call.name);
+        var display = try tool_display.lookupDisplay(self.gpa, looked_up, call.name, call.arguments);
         errdefer display.deinit(self.gpa);
         const display_body = try tool_display.makeDisplayBody(self.gpa, output);
         errdefer self.gpa.free(display_body);
@@ -264,12 +288,27 @@ pub const ExecutorService = struct {
 
     /// Source the tool's `Output`, routing a `run_in_background` bash call to the
     /// `BackgroundManager` (which spawns the job and returns immediately) and
-    /// everything else through the normal blocking tool registry.
+    /// everything else through the tool registry (builtin + plugin, looked up
+    /// in one shot).
     fn produceOutput(self: *ExecutorService, call: ai.ToolCall) tools.Error!tools.Output {
         if (self.background) |bg| {
             if (std.mem.eql(u8, call.name, "bash") and bash_tool.wantsBackground(self.gpa, call.arguments)) {
                 return bash_tool.runBackground(self.gpa, self.io, self.cwd, call.arguments, bg.manager, bg.owner);
             }
+        }
+        if (self.tool_registry) |r| {
+            // Plugin tool dispatchers reach `*PluginManager` through a
+            // thread-local slot (the `Tool.run` signature is fixed and
+            // can't take a `*ExecutorService`). The slot must point at
+            // the live `self.plugin_manager` for the duration of the
+            // call — set it here, dispatch, then clear it in a defer
+            // so a panic doesn't leak a dangling pointer into the next
+            // call.
+            const prev = lua_mod.registry_bridge.plugin_manager_slot;
+            lua_mod.registry_bridge.plugin_manager_slot = self.plugin_manager;
+            defer lua_mod.registry_bridge.plugin_manager_slot = prev;
+            const slice = try r.all(self.gpa);
+            return tools.runWith(slice, self.gpa, self.io, self.cwd, call.name, call.arguments);
         }
         return tools.run(self.gpa, self.io, self.cwd, call.name, call.arguments);
     }
@@ -279,7 +318,7 @@ pub const ExecutorService = struct {
         errdefer self.gpa.free(call_id);
         const name = try self.gpa.dupe(u8, call.name);
         errdefer self.gpa.free(name);
-        var display = try tool_display.lookupDisplay(self.gpa, call.name, call.arguments);
+        var display = try tool_display.lookupDisplay(self.gpa, tools.lookupIn(tools.builtinRegistry(), call.name), call.name, call.arguments);
         errdefer display.deinit(self.gpa);
         const content = try std.fmt.allocPrint(self.gpa, "tool '{s}' failed to execute: {s}", .{ call.name, errorDescription(err) });
         errdefer self.gpa.free(content);
@@ -302,7 +341,7 @@ pub const ExecutorService = struct {
         errdefer self.gpa.free(call_id);
         const name = try self.gpa.dupe(u8, call.name);
         errdefer self.gpa.free(name);
-        var display = try tool_display.lookupDisplay(self.gpa, call.name, call.arguments);
+        var display = try tool_display.lookupDisplay(self.gpa, tools.lookupIn(tools.builtinRegistry(), call.name), call.name, call.arguments);
         errdefer display.deinit(self.gpa);
         const content = try self.gpa.dupe(u8, message);
         errdefer self.gpa.free(content);
@@ -412,7 +451,6 @@ fn errorDescription(err: anyerror) []const u8 {
         else => @errorName(err),
     };
 }
-
 
 test "ExecutorService.runAll errdefer cleanup exists" {
     // This test verifies the errdefer cleanup logic exists in runAll.

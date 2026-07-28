@@ -23,20 +23,30 @@ pub fn parseCommand(gpa: std.mem.Allocator, arguments: []const u8) ![]u8 {
 }
 
 /// Render friendly display metadata for a tool call by delegating to the
-/// registered tool. Falls back to `<name> <arguments>` for tools that aren't
-/// in the registry (shouldn't happen outside test paths).
-pub fn formatToolDisplay(gpa: std.mem.Allocator, name: []const u8, arguments: []const u8) !tools.ToolDisplay {
-    const tool = tools.lookup(name) orelse
-        return .{ .label = try std.fmt.allocPrint(gpa, "{s} {s}", .{ name, arguments }) };
-    return tool.display(gpa, arguments);
+/// tool's display formatter. Falls back to `<name> <arguments>` when the
+/// tool is unknown (shouldn't happen outside test paths).
+pub fn formatToolDisplay(
+    gpa: std.mem.Allocator,
+    tool: ?tools.Tool,
+    arguments: []const u8,
+) !tools.ToolDisplay {
+    const t = tool orelse
+        return .{ .label = try std.fmt.allocPrint(gpa, "<unknown> {s}", .{arguments}) };
+    return t.display(gpa, arguments, t.userdata);
 }
 
-/// Look up the tool in the registry and delegate to its display formatter.
-/// Falls back to the tool name itself when unknown — used by the executor
-/// internally where the full arguments string would be noisy.
-pub fn lookupDisplay(gpa: std.mem.Allocator, name: []const u8, args: []const u8) !tools.ToolDisplay {
-    const tool = tools.lookup(name) orelse return .{ .label = try gpa.dupe(u8, name) };
-    return tool.display(gpa, args);
+/// Look up a display label for a tool. Falls back to the tool name when
+/// unknown — used by the executor internally where the full arguments
+/// string would be noisy. Pass `null` for `tool` when the registry did
+/// not resolve the call.
+pub fn lookupDisplay(
+    gpa: std.mem.Allocator,
+    tool: ?tools.Tool,
+    name: []const u8,
+    args: []const u8,
+) !tools.ToolDisplay {
+    const t = tool orelse return .{ .label = try gpa.dupe(u8, name) };
+    return t.display(gpa, args, t.userdata);
 }
 
 /// The human-facing body. Each tool owns its own display: when it sets a

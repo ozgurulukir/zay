@@ -1,5 +1,6 @@
 const std = @import("std");
 const tools_common = @import("tools/common.zig");
+const tools_mod = @import("tools.zig");
 
 pub const codex_responses = @import("ai/codex_responses.zig");
 pub const websocket = @import("websocket");
@@ -523,13 +524,24 @@ pub const LanguageModel = union(enum) {
 
     /// Rebuild the active client's serialized tool definitions after the MCP
     /// tool set changes. No-op when no client is connected. `mcp_tools` is
-    /// borrowed only for the duration of the call.
-    pub fn updateMcpTools(self: LanguageModel, mcp_tools: []const McpToolSchema) !void {
+    /// borrowed only for the duration of the call. `registry`, when
+    /// non-null, contributes its builtin + plugin tools so the model sees
+    /// them as first-class definitions. `builtin_override` lets the caller
+    /// choose what `self.config.tools` contains at call time: most callers
+    /// pass `&.{}` because the registry's builtin already covers bash,
+    /// and emitting both would create a duplicate name that most APIs
+    /// reject (HTTP 400), dropping the entire tool list.
+    pub fn updateMcpTools(
+        self: LanguageModel,
+        mcp_tools: []const McpToolSchema,
+        registry: ?*tools_mod.ToolRegistry,
+        builtin_override: []const tools_common.Tool,
+    ) !void {
         switch (self) {
             .none => {},
-            .codex_responses => |c| try c.updateMcpTools(mcp_tools),
-            .openai_compatible => |c| try c.updateMcpTools(mcp_tools),
-            .openai_responses => |c| try c.updateMcpTools(mcp_tools),
+            .codex_responses => |c| try c.updateMcpTools(mcp_tools, registry, builtin_override),
+            .openai_compatible => |c| try c.updateMcpTools(mcp_tools, registry, builtin_override),
+            .openai_responses => |c| try c.updateMcpTools(mcp_tools, registry, builtin_override),
         }
     }
 };

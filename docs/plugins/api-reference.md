@@ -13,10 +13,10 @@ Register a tool that the AI model can invoke.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | string | yes | Tool identifier (lowercase, underscores). Must be unique across all plugins. |
+| `name` | string | yes | Tool identifier (lowercase, underscores). Must be unique within the plugin. Exposed to the AI model as `lua__<plugin>__<name>`. |
 | `description` | string | yes | Natural language description of what the tool does. The model uses this to decide when to call the tool. |
 | `parameters` | table | yes | JSON Schema-like parameter definitions. Each key is a parameter name, each value is a table with `type`, `description`, and optional `optional` fields. |
-| `handler` | function | yes | Called with `(params)` when the model invokes the tool. Must return a string. |
+| `handler` | function | yes | Called with `(params)` when the model invokes the tool. `params` is a Lua table — JSON arguments from the model are automatically parsed. Must return a string. |
 
 **Parameter schema:**
 

@@ -17,6 +17,7 @@ const config_mod = @import("config/config.zig");
 const mcp_mod = @import("mcp/manager.zig");
 const lua_mod = @import("lua/root.zig");
 const openai_compatible_mod = @import("ai/openai_compatible.zig");
+const tools_mod = @import("tools.zig");
 const runtime_mod = @import("runtime.zig");
 const session_mod = @import("session.zig");
 const vcs = @import("vcs.zig");
@@ -188,6 +189,10 @@ pub const App = struct {
     background_modal_state: app_state.BackgroundModalState = .{},
     mcp_manager: mcp_mod.McpManager = undefined,
     plugin_manager: lua_mod.PluginManager = undefined,
+    /// Single source of truth for tools: builtin slice + plugin tools
+    /// appended at runtime through `registerPluginTools`. Heap-allocated so
+    /// its address stays put while agents borrow it; freed in `deinit`.
+    tool_registry: *tools_mod.ToolRegistry = undefined,
     /// Completed background jobs awaiting delivery. Held here (not pushed into a
     /// busy transcript) so the notice + model message land only when the owning
     /// lane is idle — "auto-start if idle, queue if in-flight". Owned; freed in
@@ -205,6 +210,9 @@ pub const App = struct {
         var threads: std.ArrayList(*Thread) = .empty;
         errdefer threads.deinit(gpa);
         try threads.append(gpa, primary);
+        const registry = try gpa.create(tools_mod.ToolRegistry);
+        errdefer gpa.destroy(registry);
+        registry.* = tools_mod.ToolRegistry.init(tools_mod.builtinRegistry());
         return .{
             .io = io,
             .gpa = gpa,
@@ -214,6 +222,7 @@ pub const App = struct {
             .pickers = .{ .tree = .init(gpa) },
             .mcp_manager = mcp_mod.McpManager.init(gpa),
             .plugin_manager = lua_mod.PluginManager.init(gpa, io, "", ""),
+            .tool_registry = registry,
         };
     }
 
@@ -226,8 +235,26 @@ pub const App = struct {
         var app = try init(io, gpa, &runtime.agent);
         app.cached_config = config;
         app.mcp_manager.syncFromConfig(io, &app.cached_config) catch {};
+        // The placeholder plugin_manager from `App.init` was built with
+        // empty `home_dir`/`cwd` (the runtime values weren't available
+        // there). Tear it down so the real one below is the only owner
+        // of any Lua state — without this, a second `initRuntime` call
+        // (session resume / new session) leaks the previous manager's
+        // Lua state and double-frees the underlying allocations on
+        // App.deinit.
+        app.plugin_manager.deinit();
         app.plugin_manager = lua_mod.PluginManager.init(gpa, io, runtime.home_dir, runtime.cwd);
-        _ = app.plugin_manager.loadAll() catch {};
+        const loaded_plugins = app.plugin_manager.loadAll() catch |err| blk: {
+            std.log.warn("plugin_manager.loadAll failed: {s}", .{@errorName(err)});
+            break :blk @as(usize, 0);
+        };
+        std.log.debug("plugin_manager loaded {d} plugin(s); home_dir={s} cwd={s}", .{ loaded_plugins, runtime.home_dir, runtime.cwd });
+        // Materialize every active plugin's registered tools as `Tool`
+        // entries on the app's `ToolRegistry`. From this point on, the
+        // tool list is consistent across dispatch, display, and the AI
+        // client's serialized schema — without waiting for a
+        // `mcp_connect_pending` tick.
+        provider_model.registerPluginTools(&app);
         search_mod.start(gpa, io, runtime.cwd);
         // One shared background manager for the whole session. Heap-allocated so
         // its address stays put as agents (primary + lanes) borrow it.
@@ -995,9 +1022,11 @@ pub fn run(
     defer fw_app.deinit();
 
     var app = try App.initRuntime(init.io, gpa, runtime, config);
-    // Set the MCP manager pointer now that `app` is in its final stack frame.
-    // Inside initRuntime, &app.mcp_manager would dangle after return-by-value.
+    // Set the manager pointers now that `app` is in its final stack frame.
+    // Inside initRuntime, &app.X would dangle after return-by-value.
     runtime.agent.mcp_manager = &app.mcp_manager;
+    runtime.agent.tool_registry = app.tool_registry;
+    runtime.agent.plugin_manager = &app.plugin_manager;
     app.bindInputCallbacks();
     defer app.deinit();
 
@@ -1027,13 +1056,13 @@ pub fn run(
     try fw_app.run(root.widget(), .{});
 }
 
-    pub const RootWidget = struct {
-        app: *App,
-        spinner_tick_accum: u32 = 0,
-        blackhole_tick_accum: u32 = 0,
-        diff_tick_accum: u32 = 0,
-        diff_refresh_pending: bool = false,
-        mcp_connect_pending: bool = false,
+pub const RootWidget = struct {
+    app: *App,
+    spinner_tick_accum: u32 = 0,
+    blackhole_tick_accum: u32 = 0,
+    diff_tick_accum: u32 = 0,
+    diff_refresh_pending: bool = false,
+    mcp_connect_pending: bool = false,
 
     pub fn widget(self: *RootWidget) vxfw.Widget {
         return .{
@@ -1168,6 +1197,14 @@ pub fn closeMcp(app: *App) void {
 pub fn openPlugins(app: *App) void {
     app.mode = .plugins;
     app.pickers.plugins.reset();
+    if (app.liveRuntime() != null) {
+        // Sync plugin descriptors into the registry and push the
+        // resulting tool set into the live AI client — same path
+        // `openMcp` takes. Ensures the model sees `lua__<plugin>__*`
+        // entries on the next prompt after the overlay opens.
+        provider_model.registerPluginTools(app);
+        provider_model.refreshMcpTools(app);
+    }
     app.clearInput();
     app.clearPaletteInput();
 }

@@ -88,9 +88,9 @@ pub fn extractContentText(gpa: std.mem.Allocator, result: std.json.Value) ![]u8 
 }
 
 /// Convert a JSON Schema object to a tools_common.Schema.
-/// Handles `properties`, `required`, `type`, `description`, and `enum`.
-/// Unsupported features ($ref, oneOf, anyOf, allOf) log a warning and
-/// fall back to string kind so the tool is still callable.
+/// Handles `properties`, `required`, `type`, `description`, `enum`,
+/// and `default`. Unsupported composition keywords ($ref, oneOf, anyOf, allOf)
+/// log a warning and fall back to string kind so the tool is still callable.
 pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tools_common.Schema {
     if (value != .object) return tools_common.Schema{ .properties = &.{} };
     const obj = value.object;
@@ -109,7 +109,18 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
     }
 
     var props: std.ArrayList(tools_common.Schema.Property) = .empty;
-    errdefer props.deinit(gpa);
+    errdefer {
+        for (props.items) |*p| {
+            gpa.free(p.name);
+            gpa.free(p.description);
+            if (p.enum_values) |ev| {
+                for (ev) |v| gpa.free(v);
+                gpa.free(ev);
+            }
+            if (p.default_value) |dv| gpa.free(dv);
+        }
+        props.deinit(gpa);
+    }
 
     var iter = properties_val.object.iterator();
     while (iter.next()) |entry| {
@@ -141,34 +152,84 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
         else
             "";
 
-        const desc_owned = if (prop_obj.get("enum")) |enum_val| blk: {
-            if (enum_val != .array or enum_val.array.items.len == 0) break :blk try gpa.dupe(u8, base_desc);
+        // Extract enum values into the dedicated field.
+        var enum_values: ?[]const []const u8 = null;
+        if (prop_obj.get("enum")) |enum_val| {
+            if (enum_val == .array and enum_val.array.items.len > 0) {
+                var ev_list = try gpa.alloc([]const u8, enum_val.array.items.len);
+                var ev_idx: usize = 0;
+                for (enum_val.array.items) |ev| {
+                    switch (ev) {
+                        .string => |s| ev_list[ev_idx] = try gpa.dupe(u8, s),
+                        .integer => |n| ev_list[ev_idx] = try std.fmt.allocPrint(gpa, "{d}", .{n}),
+                        else => continue,
+                    }
+                    ev_idx += 1;
+                }
+                if (ev_idx == 0) {
+                    gpa.free(ev_list);
+                } else {
+                    enum_values = try gpa.realloc(ev_list, ev_idx);
+                }
+            }
+        }
+
+        const desc_owned = if (enum_values != null) blk: {
+            // Append [enum: ...] to description when enum values exist
             var dw: std.Io.Writer.Allocating = .init(gpa);
             errdefer dw.deinit();
             try dw.writer.writeAll(base_desc);
             if (base_desc.len > 0) try dw.writer.writeAll(" ");
             try dw.writer.writeAll("[enum: ");
-            for (enum_val.array.items, 0..) |ev, ei| {
-                if (ei > 0) try dw.writer.writeAll(", ");
-                switch (ev) {
-                    .string => |s| try dw.writer.writeAll(s),
-                    .integer => |n| try dw.writer.print("{d}", .{n}),
-                    else => try dw.writer.writeAll("?"),
+            if (enum_values) |ev| {
+                for (ev, 0..) |v, ei| {
+                    if (ei > 0) try dw.writer.writeAll(", ");
+                    try dw.writer.writeAll(v);
                 }
             }
             try dw.writer.writeAll("]");
             break :blk try dw.toOwnedSlice();
         } else try gpa.dupe(u8, base_desc);
 
+        // Extract default value as a raw JSON string fragment.
+        var default_value: ?[]const u8 = null;
+        if (prop_obj.get("default")) |def_val| {
+            default_value = try jsonValueToRawFragment(gpa, def_val);
+        }
+
         try props.append(gpa, .{
             .name = try gpa.dupe(u8, prop_name),
             .kind = kind,
             .description = desc_owned,
             .required = required_set.contains(prop_name),
+            .enum_values = enum_values,
+            .default_value = default_value,
         });
     }
 
     return .{ .properties = try props.toOwnedSlice(gpa) };
+}
+
+/// Convert a std.json.Value to a raw JSON fragment string suitable for
+/// embedding in a tool definition's `"default"` field. Strings are JSON-quoted;
+/// numbers/booleans/null are emitted as their JSON literal; objects and arrays
+/// fall back to `"null"`.
+fn jsonValueToRawFragment(gpa: std.mem.Allocator, value: std.json.Value) ![]const u8 {
+    switch (value) {
+        .string => |s| {
+            var aw: std.Io.Writer.Allocating = .init(gpa);
+            errdefer aw.deinit();
+            try aw.writer.writeByte('"');
+            try aw.writer.writeAll(s);
+            try aw.writer.writeByte('"');
+            return aw.toOwnedSlice();
+        },
+        .integer => |n| return std.fmt.allocPrint(gpa, "{d}", .{n}),
+        .float => |f| return std.fmt.allocPrint(gpa, "{d}", .{f}),
+        .bool => |b| return gpa.dupe(u8, if (b) "true" else "false"),
+        .null => return gpa.dupe(u8, "null"),
+        else => return gpa.dupe(u8, "null"),
+    }
 }
 
 fn kindFromString(kind: []const u8) tools_common.Schema.Kind {
@@ -196,14 +257,8 @@ test "schemaFromJsonSchema handles array and number types" {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
     defer parsed.deinit();
 
-    const schema = try schemaFromJsonSchema(gpa, parsed.value);
-    defer {
-        for (schema.properties) |*prop| {
-            gpa.free(prop.name);
-            gpa.free(prop.description);
-        }
-        if (schema.properties.len > 0) gpa.free(schema.properties);
-    }
+    var schema = try schemaFromJsonSchema(gpa, parsed.value);
+    defer schema.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 3), schema.properties.len);
     for (schema.properties) |prop| {
@@ -216,7 +271,7 @@ test "schemaFromJsonSchema handles array and number types" {
     }
 }
 
-test "schemaFromJsonSchema appends enum values to description" {
+test "schemaFromJsonSchema appends enum values to description and populates enum_values" {
     const gpa = std.testing.allocator;
     const schema_json =
         \\{"type":"object","properties":{
@@ -226,17 +281,43 @@ test "schemaFromJsonSchema appends enum values to description" {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
     defer parsed.deinit();
 
-    const schema = try schemaFromJsonSchema(gpa, parsed.value);
-    defer {
-        for (schema.properties) |*prop| {
-            gpa.free(prop.name);
-            gpa.free(prop.description);
-        }
-        if (schema.properties.len > 0) gpa.free(schema.properties);
-    }
+    var schema = try schemaFromJsonSchema(gpa, parsed.value);
+    defer schema.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 1), schema.properties.len);
     try std.testing.expect(std.mem.indexOf(u8, schema.properties[0].description, "[enum: red, green, blue]") != null);
+    // Verify enum_values field is populated.
+    const ev = schema.properties[0].enum_values orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqual(@as(usize, 3), ev.len);
+    try std.testing.expectEqualStrings("red", ev[0]);
+    try std.testing.expectEqualStrings("green", ev[1]);
+    try std.testing.expectEqualStrings("blue", ev[2]);
+}
+
+test "schemaFromJsonSchema extracts default value" {
+    const gpa = std.testing.allocator;
+    const schema_json =
+        \\{"type":"object","properties":{
+        \\  "mode":{"type":"string","description":"Run mode","default":"fast"},
+        \\  "count":{"type":"integer","description":"Repeat count","default":3}
+        \\}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
+    defer parsed.deinit();
+
+    var schema = try schemaFromJsonSchema(gpa, parsed.value);
+    defer schema.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 2), schema.properties.len);
+    // String default → JSON-quoted.
+    const mode_default = schema.properties[0].default_value orelse "";
+    try std.testing.expectEqualStrings("\"fast\"", mode_default);
+    // Integer default → bare number.
+    const count_default = schema.properties[1].default_value orelse "";
+    try std.testing.expectEqualStrings("3", count_default);
 }
 
 test "schemaFromJsonSchema falls back to string for $ref and oneOf" {
@@ -250,14 +331,8 @@ test "schemaFromJsonSchema falls back to string for $ref and oneOf" {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
     defer parsed.deinit();
 
-    const schema = try schemaFromJsonSchema(gpa, parsed.value);
-    defer {
-        for (schema.properties) |*prop| {
-            gpa.free(prop.name);
-            gpa.free(prop.description);
-        }
-        if (schema.properties.len > 0) gpa.free(schema.properties);
-    }
+    var schema = try schemaFromJsonSchema(gpa, parsed.value);
+    defer schema.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 2), schema.properties.len);
     for (schema.properties) |prop| {

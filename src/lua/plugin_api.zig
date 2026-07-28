@@ -812,6 +812,8 @@ pub fn registerTool(L: ?*c.lua_State) callconv(.c) c_int {
         return 2;
     }
 
+    std.log.debug("plugin.registerTool.start", .{});
+
     // Extract fields from spec
     const name = bridge.getTableString(&state, 1, "name") orelse {
         state.pushNil();
@@ -874,6 +876,7 @@ pub fn registerTool(L: ?*c.lua_State) callconv(.c) c_int {
     // Pop tools table
     state.pop(1);
 
+    std.log.debug("plugin.registerTool.ok name={s}", .{name});
     state.pushBoolean(true);
     return 1;
 }
@@ -941,6 +944,73 @@ pub fn countTools(L: *c.lua_State) u32 {
     return @intCast(c.lua_rawlen(L, -1));
 }
 
+/// Find the index of a registered tool by name in the Lua registry.
+/// Returns the 1-based index used by `callToolHandler`, or null if not found.
+pub fn findToolIndex(L: *c.lua_State, tool_name: []const u8) ?c_int {
+    _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "nova_tools");
+    defer c.lua_pop(L, 1);
+    if (c.lua_isnil(L, -1)) return null;
+
+    const tools_len = c.lua_rawlen(L, -1);
+    var i: c_int = 1;
+    while (i <= @as(c_int, @intCast(tools_len))) : (i += 1) {
+        _ = c.lua_rawgeti(L, -1, i);
+        _ = c.lua_getfield(L, -1, "name");
+        var len: usize = 0;
+        const ptr = c.lua_tolstring(L, -1, &len);
+        const found = if (ptr) |p| std.mem.eql(u8, p[0..len], tool_name) else false;
+        c.lua_pop(L, 2); // pop name string and entry table
+        if (found) return i;
+    }
+    return null;
+}
+
+/// Parse a JSON string and push the result onto the Lua stack as a Lua value
+/// (table, string, number, boolean, or nil). The caller owns the parsed JSON
+/// value; it is freed before returning.
+fn pushJsonToLua(L: *c.lua_State, gpa: std.mem.Allocator, json: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+    defer parsed.deinit();
+    try pushJsonValue(L, gpa, parsed.value);
+}
+
+/// Recursively push a `std.json.Value` onto the Lua stack.
+fn pushJsonValue(L: *c.lua_State, gpa: std.mem.Allocator, value: std.json.Value) !void {
+    switch (value) {
+        .null => c.lua_pushnil(L),
+        .bool => |b| c.lua_pushboolean(L, if (b) 1 else 0),
+        .integer => |i| c.lua_pushinteger(L, i),
+        .float => |f| c.lua_pushnumber(L, f),
+        .number_string => |s| {
+            // Try integer first, then float
+            const num = std.fmt.parseFloat(f64, s) catch {
+                _ = c.lua_pushstring(L, s.ptr);
+                return;
+            };
+            c.lua_pushnumber(L, num);
+        },
+        .string => |s| {
+            _ = c.lua_pushlstring(L, s.ptr, s.len);
+        },
+        .array => |items| {
+            c.lua_createtable(L, @intCast(items.items.len), 0);
+            for (items.items, 0..) |item, i| {
+                try pushJsonValue(L, gpa, item);
+                c.lua_rawseti(L, -2, @intCast(i + 1));
+            }
+        },
+        .object => |obj| {
+            c.lua_createtable(L, 0, @intCast(obj.count()));
+            var iter = obj.iterator();
+            while (iter.next()) |entry| {
+                _ = c.lua_pushlstring(L, entry.key_ptr.ptr, entry.key_ptr.len);
+                try pushJsonValue(L, gpa, entry.value_ptr.*);
+                _ = c.lua_settable(L, -3);
+            }
+        },
+    }
+}
+
 /// Call a registered tool handler by index. Pushes the params table onto
 /// the Lua stack, calls the handler, and returns the result string.
 /// The caller must keep the Lua state alive during the call.
@@ -959,16 +1029,18 @@ pub fn callToolHandler(
     }
     _ = c.lua_rawgeti(L, -1, tool_index);
     _ = c.lua_getfield(L, -1, "handler_ref");
-    const handler_ref = @as(c_int, @intCast(c.lua_tointeger(L, -1)));
+    var isnum: c_int = 0;
+    const handler_ref = @as(c_int, @intCast(c.lua_tointegerx(L, -1, &isnum)));
     c.lua_pop(L, 2); // pop handler_ref and entry table
 
     // Get the handler function from registry
     _ = c.lua_rawgeti(L, c.LUA_REGISTRYINDEX, handler_ref);
 
-    // Push params as a Lua table (simple: just push the JSON string for now)
-    // In a full implementation, we'd parse JSON to a Lua table.
-    // For now, push the raw string — plugins can parse it.
-    c.lua_pushlstring(L, params_json.ptr, params_json.len);
+    // Parse JSON params into a Lua table so handlers can use table access
+    // (e.g. params.depth, params.pattern) instead of manual JSON parsing.
+    pushJsonToLua(L, gpa, params_json) catch {
+        c.lua_newtable(L);
+    };
 
     // Call handler(params_json)
     const rc = c.lua_pcallk(L, 1, 1, 0, 0, null);
@@ -1267,4 +1339,39 @@ test "applyLineRange: start and end" {
 test "applyLineRange: past end returns empty" {
     const content = "line1\nline2";
     try std.testing.expectEqualStrings("", applyLineRange(content, 10, null));
+}
+
+test "registerTool + countTools: sandboxed state" {
+    const sandbox = @import("sandbox.zig");
+
+    // Create a sandboxed state with Io (so registerPluginApi is called).
+    var L = sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+
+    // Before registration, there should be 0 tools.
+    try std.testing.expectEqual(@as(u32, 0), countTools(L.handle));
+
+    // Register a tool via Lua code (same as what init.lua does).
+    const ok = L.doString(
+        \\nova.register_tool({
+        \\  name = "test_tool",
+        \\  description = "A test tool",
+        \\  parameters = {
+        \\    foo = { type = "string", description = "A foo param" },
+        \\  },
+        \\  handler = function(params) return "ok" end,
+        \\})
+    );
+    if (!ok) {
+        const err = L.getErrorMessage();
+        std.debug.print("Lua error: {s}\n", .{err orelse "unknown"});
+        L.pop(1);
+    }
+    try std.testing.expect(ok);
+
+    // After registration, countTools should see 1 tool.
+    try std.testing.expectEqual(@as(u32, 1), countTools(L.handle));
 }

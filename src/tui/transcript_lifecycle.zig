@@ -5,6 +5,7 @@ const std = @import("std");
 const tui = @import("../tui.zig");
 const ai = @import("../ai.zig");
 const agent_mod = @import("../agent.zig");
+const tools_mod = @import("../tools.zig");
 const transcript_mod = @import("../transcript.zig");
 const runtime_mod = @import("../runtime.zig");
 
@@ -87,7 +88,11 @@ pub fn resumedToolTitle(app: *App, message: ai.ChatMessage) ![]u8 {
                     for (a.content) |block| {
                         if (block != .tool_call) continue;
                         if (!std.mem.eql(u8, block.tool_call.call_id.slice(), id)) continue;
-                        var display = try agent_mod.formatToolDisplay(app.gpa, block.tool_call.name, block.tool_call.arguments);
+                        var display = try agent_mod.formatToolDisplay(
+                            app.gpa,
+                            tools_mod.lookupIn(tools_mod.builtinRegistry(), block.tool_call.name),
+                            block.tool_call.arguments,
+                        );
                         defer display.deinit(app.gpa);
                         return transcript_mod.toolTitle(app.gpa, display.label);
                     }

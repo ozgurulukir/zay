@@ -1268,6 +1268,11 @@ pub fn connectCodexClient(
     try runtime.connectCodexClient(credentials, model, effort);
     self.thread.agent.?.client = runtime.client;
     injectPluginTools(self);
+    // The plugin tools just landed in the registry; the AI client's
+    // `tools_json` was serialized at attach time (with only the
+    // builtin slice) and does NOT know about them yet. Push the merged
+    // list to the client so the next prompt includes plugin tools.
+    injectAllTools(self);
 }
 
 pub fn attachOpenAiCompatibleClient(
@@ -1288,6 +1293,9 @@ pub fn attachOpenAiCompatibleClient(
     try runtime.attachOpenAiCompatibleClient(base_url, api_key, model_id, effort);
     self.thread.agent.?.client = runtime.client;
     injectPluginTools(self);
+    // See connectCodexClient — without this, plugin tools sit in the
+    // registry but never reach the AI client until the next MCP-tick.
+    injectAllTools(self);
 }
 
 /// Rebuild the MCP tool schemas from the currently connected servers and inject
@@ -1311,6 +1319,12 @@ pub fn injectPluginTools(self: *App) void {
 /// the live AI client in one call. `updateMcpTools` replaces the entire
 /// `tools_json`, so calling it separately for MCP and plugin tools would cause
 /// the second call to overwrite the first.
+///
+/// As of the plugin-via-`ToolRegistry` refactor, plugin tools live in
+/// `self.tool_registry` and are surfaced through `registerPluginTools` →
+/// `updateMcpTools` via the registry's `all` slice. This function only
+/// handles the MCP transport — the rest of the tool list comes from
+/// `self.tool_registry.all(...)` on the next `updateMcpTools` call.
 fn injectAllTools(self: *App) void {
     const runtime = self.liveRuntime() orelse {
         std.log.warn("injectAllTools: no live runtime, skipping tool injection", .{});
@@ -1321,194 +1335,55 @@ fn injectAllTools(self: *App) void {
         return;
     };
     defer self.gpa.free(mcp_schemas);
-    const plugin_schemas = buildPluginToolSchemas(self) catch |err| {
-        std.log.warn("injectAllTools: buildPluginToolSchemas failed: {s}", .{@errorName(err)});
+    std.log.debug("injectAllTools: mcp={} (plugin tools come from ToolRegistry)", .{mcp_schemas.len});
+    // Pass an empty builtin_override so we don't double-emit bash: the
+    // registry's builtin already contains it, and most OpenAI-compatible
+    // APIs reject duplicate tool names with HTTP 400, dropping the
+    // entire tool list (including the plugin tools we want exposed).
+    runtime.client.updateMcpTools(mcp_schemas, self.tool_registry, &.{}) catch |err| {
+        std.log.warn("injectAllTools: updateMcpTools failed: {s}", .{@errorName(err)});
+    };
+}
+
+/// Walk every loaded Lua plugin, materialize a `Tool` for each registered
+/// handler, and append them to `self.tool_registry`. Called from
+/// `initRuntime` after `plugin_manager.loadAll` and again whenever a
+/// plugin is (re)loaded at runtime. The AI client picks them up on its
+/// next `updateMcpTools` call (driven by `attachXxxClient` or
+/// `refreshMcpTools`).
+pub fn registerPluginTools(self: *App) void {
+    const lua_mod = @import("../lua/root.zig");
+    const descriptors = lua_mod.registry_bridge.buildPluginToolDescriptors(self.gpa, &self.plugin_manager) catch |err| {
+        std.log.warn("registerPluginTools: buildPluginToolDescriptors failed: {s}", .{@errorName(err)});
         return;
     };
-    defer self.gpa.free(plugin_schemas);
-
-    const total = mcp_schemas.len + plugin_schemas.len;
-    std.log.debug("injectAllTools: mcp={}, plugin={}, total={}", .{ mcp_schemas.len, plugin_schemas.len, total });
-    if (total == 0) {
-        runtime.client.updateMcpTools(&.{}) catch |err| {
-            std.log.warn("injectAllTools: updateMcpTools(empty) failed: {s}", .{@errorName(err)});
+    defer {
+        // The descriptor struct is fully consumed by `addPluginTool`:
+        // - `name` and `description` are `gpa.dupe` slices that the
+        //   registry's `plugin` ArrayList now owns (its `deinit` frees
+        //   them).
+        // - `userdata` is a `*PluginToolKey` that the registry now owns
+        //   (its `deinit` calls `userdata_free`).
+        // Freeing any of these here would dangle the registry's tool
+        // records and crash the next `injectAllTools` or
+        // `tool_registry.deinit`. We only free the outer slice — the
+        // backing array of `[]Tool` — which is the one allocation
+        // whose ownership stays with the caller.
+        self.gpa.free(descriptors);
+    }
+    for (descriptors) |t| {
+        self.tool_registry.addPluginTool(self.gpa, t) catch |err| {
+            std.log.warn("registerPluginTools: addPluginTool failed: {s}", .{@errorName(err)});
+            if (t.userdata_free) |free_fn| free_fn(self.gpa, t.userdata);
+            self.gpa.free(t.name);
+            self.gpa.free(t.description);
         };
-        return;
     }
-    var merged = self.gpa.alloc(ai.McpToolSchema, total) catch |err| {
-        std.log.warn("injectAllTools: alloc merged schema failed: {s}", .{@errorName(err)});
-        return;
-    };
-    defer self.gpa.free(merged);
-    @memcpy(merged[0..mcp_schemas.len], mcp_schemas);
-    @memcpy(merged[mcp_schemas.len..], plugin_schemas);
-    runtime.client.updateMcpTools(merged) catch |err| {
-        std.log.warn("injectAllTools: updateMcpTools({} tools) failed: {s}", .{ total, @errorName(err) });
-    };
-}
-
-/// Build tool schemas from all loaded Lua plugins.
-/// Each plugin's `nova.register_tool()` calls store specs in the Lua registry.
-/// We iterate all plugins, read their "nova_tools" table, and convert each
-/// entry to an `ai.McpToolSchema` with the naming convention
-/// `lua__<plugin_name>__<tool_name>`.
-fn buildPluginToolSchemas(self: *App) ![]ai.McpToolSchema {
-    const plugin_api = @import("../lua/plugin_api.zig");
-
-    // Count total tools across all plugins
-    var total: u32 = 0;
-    var iter = self.plugin_manager.iterator();
-    while (iter.next()) |entry| {
-        const plugin = entry.value_ptr.*;
-        if (!plugin.active) continue;
-        total += plugin_api.countTools(plugin.state.handle);
-    }
-
-    if (total == 0) return &.{};
-
-    var schemas = try self.gpa.alloc(ai.McpToolSchema, total);
-    var idx: u32 = 0;
-
-    // Iterate plugins again and build schemas
-    var iter2 = self.plugin_manager.iterator();
-    while (iter2.next()) |entry| {
-        const plugin = entry.value_ptr.*;
-        if (!plugin.active) continue;
-
-        const L = plugin.state.handle;
-
-        // Get nova_tools table from registry
-        _ = lua_c.lua_getfield(L, lua_c.LUA_REGISTRYINDEX, "nova_tools");
-        if (lua_c.lua_isnil(L, -1)) {
-            lua_c.lua_pop(L, 1);
-            continue;
-        }
-
-        const tools_len = lua_c.lua_rawlen(L, -1);
-        var tool_i: c_int = 1;
-        while (tool_i <= @as(c_int, @intCast(tools_len))) : (tool_i += 1) {
-            _ = lua_c.lua_rawgeti(L, -1, tool_i);
-
-            // Get name and description
-            _ = lua_c.lua_getfield(L, -1, "name");
-            var name_len: usize = 0;
-            const name_ptr = lua_c.lua_tolstring(L, -1, &name_len);
-            const tool_name = if (name_ptr) |p| p[0..name_len] else "";
-
-            _ = lua_c.lua_getfield(L, -2, "description");
-            var desc_len: usize = 0;
-            const desc_ptr = lua_c.lua_tolstring(L, -1, &desc_len);
-            const desc = if (desc_ptr) |p| p[0..desc_len] else "";
-
-            // Build full name: lua__<plugin>__<tool>
-            const full_name = std.fmt.allocPrint(self.gpa, "lua__{s}__{s}", .{ plugin.manifest.name, tool_name }) catch {
-                lua_c.lua_pop(L, 3);
-                continue;
-            };
-
-            // Build schema from the stored parameters table.
-            // Entry table is at -3 (below name at -2 and description at -1).
-            // Push a copy to top so buildToolSchemaFromLua can read from -1.
-            _ = lua_c.lua_pushvalue(L, -3);
-            const schema = buildToolSchemaFromLua(self.gpa, L) catch |err| blk: {
-                std.log.warn("plugin.tool.schema.failed plugin={s} tool={s} err={s}", .{
-                    plugin.manifest.name,
-                    tool_name,
-                    @errorName(err),
-                });
-                break :blk tools_common.Schema{ .properties = &.{} };
-            };
-            lua_c.lua_pop(L, 1); // pop the entry copy
-
-            schemas[idx] = .{
-                .name = full_name,
-                .description = self.gpa.dupe(u8, desc) catch "",
-                .schema = schema,
-            };
-            idx += 1;
-
-            lua_c.lua_pop(L, 3); // pop description, name, entry
-        }
-
-        lua_c.lua_pop(L, 1); // pop nova_tools
-    }
-
-    // Trim unused tail if any tools were skipped
-    return self.gpa.realloc(schemas, idx);
-}
-
-/// Build a `tools_common.Schema` from a Lua `parameters` table stored inside the
-/// current `nova_tools` entry on the stack. The entry table must be on top.
-/// Returns an owned `properties` slice (caller must eventually free).
-fn buildToolSchemaFromLua(gpa: std.mem.Allocator, L: *lua_c.lua_State) !tools_common.Schema {
-    _ = lua_c.lua_getfield(L, -1, "parameters");
-    defer lua_c.lua_pop(L, 1);
-    if (!lua_c.lua_istable(L, -1)) {
-        return .{ .properties = &.{} };
-    }
-
-    var props: std.ArrayList(tools_common.Schema.Property) = .empty;
-    errdefer {
-        for (props.items) |p| {
-            gpa.free(p.name);
-            gpa.free(p.description);
-        }
-        props.deinit(gpa);
-    }
-
-    lua_c.lua_pushnil(L);
-    while (lua_c.lua_next(L, -2) != 0) {
-        // stack: [parameters, key, value]
-        var key_len: usize = 0;
-        const key_ptr = lua_c.lua_tolstring(L, -2, &key_len);
-        const param_name = if (key_ptr) |p| try gpa.dupe(u8, p[0..key_len]) else {
-            lua_c.lua_pop(L, 1);
-            continue;
-        };
-
-        if (!lua_c.lua_istable(L, -1)) {
-            gpa.free(param_name);
-            lua_c.lua_pop(L, 1);
-            continue;
-        }
-
-        _ = lua_c.lua_getfield(L, -1, "type");
-        var type_len: usize = 0;
-        const type_ptr = lua_c.lua_tolstring(L, -1, &type_len);
-        const kind = if (type_ptr) |p| parseToolParamType(p[0..type_len]) else .string;
-        lua_c.lua_pop(L, 1);
-
-        _ = lua_c.lua_getfield(L, -1, "description");
-        var desc_len: usize = 0;
-        const desc_ptr = lua_c.lua_tolstring(L, -1, &desc_len);
-        const description = if (desc_ptr) |p| try gpa.dupe(u8, p[0..desc_len]) else try gpa.dupe(u8, "");
-        lua_c.lua_pop(L, 1);
-
-        _ = lua_c.lua_getfield(L, -1, "optional");
-        const optional = lua_c.lua_isboolean(L, -1) and lua_c.lua_toboolean(L, -1) != 0;
-        lua_c.lua_pop(L, 1);
-
-        try props.append(gpa, .{
-            .name = param_name,
-            .kind = kind,
-            .description = description,
-            .required = !optional,
-        });
-
-        lua_c.lua_pop(L, 1); // pop value, keep key for next iteration
-    }
-
-    return .{ .properties = try props.toOwnedSlice(gpa) };
-}
-
-fn parseToolParamType(type_str: []const u8) tools_common.Schema.Kind {
-    if (std.mem.eql(u8, type_str, "string")) return .string;
-    if (std.mem.eql(u8, type_str, "integer")) return .integer;
-    if (std.mem.eql(u8, type_str, "number")) return .number;
-    if (std.mem.eql(u8, type_str, "boolean")) return .boolean;
-    if (std.mem.eql(u8, type_str, "object")) return .object;
-    if (std.mem.eql(u8, type_str, "array")) return .array;
-    return .string;
+    // The dispatcher no longer reads `*PluginManager` from `PluginToolKey`;
+    // it reads it from a thread-local slot that the executor writes
+    // before each call. There is therefore nothing to rebind here — the
+    // slot is always repopulated on the next dispatch.
+    std.log.debug("registerPluginTools: registered {} plugin tools", .{descriptors.len});
 }
 
 /// Connect MCP servers per config, then inject their tool schemas into the live

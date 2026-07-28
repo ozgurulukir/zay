@@ -2,6 +2,7 @@ const std = @import("std");
 
 const bash_tool = @import("tools/bash.zig");
 const common = @import("tools/common.zig");
+const registry_mod = @import("tools/registry.zig");
 
 const assert = std.debug.assert;
 
@@ -12,12 +13,16 @@ pub const Tool = common.Tool;
 pub const Schema = common.Schema;
 pub const ToolDisplay = common.ToolDisplay;
 
-/// The Tool registry — single source of truth for the native tools that exist.
-/// Consumed by `ExecutorService` (for dispatch) and by each `LanguageModel`
-/// adapter (for building its provider-specific tools schema). Bash is the only
-/// tool: everything richer (edits, search, reusable helpers) is Python run
-/// through it — see `src/py/` and the system prompt.
-pub fn registry() []const Tool {
+/// Runtime-mutable tool registry. The App owns one; builtin tools live in
+/// its immutable `builtin` slice, plugin tools are appended at runtime
+/// through `addPluginTool`. This is the single source of truth for tools
+/// in the agent — both `tools.run` (dispatch) and each `LanguageModel`
+/// adapter (schema serialization) read from it.
+pub const ToolRegistry = registry_mod.ToolRegistry;
+
+/// Static builtin slice — the only thing the runtime cannot synthesize.
+/// Consumed by `ToolRegistry.init` and by tests.
+pub fn builtinRegistry() []const Tool {
     return &.{
         bash_tool.tool,
     };
@@ -30,16 +35,29 @@ pub fn run(
     name: []const u8,
     arguments: []const u8,
 ) Error!Output {
-    const tool = lookup(name) orelse return failFmt(gpa, 2, "unknown tool: {s}\n", .{name});
-    return tool.run(gpa, io, cwd, arguments);
+    return runWith(builtinRegistry(), gpa, io, cwd, name, arguments);
 }
 
-/// Locate a tool in the registry by name. Returns null when no tool with
-/// that name exists. Linear scan over a fixed-size slice — fine for the
-/// handful of tools Nova exposes.
-pub fn lookup(name: []const u8) ?Tool {
+/// Dispatch a tool by name through a registry slice. Used by the executor
+/// after it has resolved which registry owns the call.
+pub fn runWith(
+    tools: []const Tool,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    name: []const u8,
+    arguments: []const u8,
+) Error!Output {
+    const tool = lookupIn(tools, name) orelse return failFmt(gpa, 2, "unknown tool: {s}\n", .{name});
+    return tool.run(gpa, io, cwd, arguments, tool.userdata);
+}
+
+/// Locate a tool by name in an arbitrary slice. Returns null when no
+/// tool with that name exists. Linear scan — fine for the handful of
+/// tools Nova exposes.
+pub fn lookupIn(slice: []const Tool, name: []const u8) ?Tool {
     assert(name.len > 0);
-    for (registry()) |tool| {
+    for (slice) |tool| {
         if (std.mem.eql(u8, tool.name, name)) return tool;
     }
     return null;
@@ -52,20 +70,20 @@ fn failFmt(gpa: std.mem.Allocator, code: u8, comptime fmt: []const u8, args: any
 test "registry contains every tool exactly once" {
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(std.testing.allocator);
-    for (registry()) |tool| {
+    for (builtinRegistry()) |tool| {
         const gop = try seen.getOrPut(std.testing.allocator, tool.name);
         try std.testing.expect(!gop.found_existing);
     }
-    try std.testing.expectEqual(@as(usize, 1), registry().len);
+    try std.testing.expectEqual(@as(usize, 1), builtinRegistry().len);
 }
 
 test "lookup finds a registered tool" {
-    const tool = lookup("bash") orelse return error.TestFailed;
+    const tool = lookupIn(builtinRegistry(), "bash") orelse return error.TestFailed;
     try std.testing.expectEqualStrings("bash", tool.name);
 }
 
 test "lookup returns null for unknown tool" {
-    try std.testing.expect(lookup("does_not_exist") == null);
+    try std.testing.expect(lookupIn(builtinRegistry(), "does_not_exist") == null);
 }
 
 test {

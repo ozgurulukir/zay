@@ -9,6 +9,7 @@ const config_mod = @import("config/config.zig");
 const context_mod = @import("context/manager.zig");
 const context_assembly = @import("context/assembly.zig");
 const executor_mod = @import("executor.zig");
+const lua_mod = @import("lua/root.zig");
 const mcp_mod = @import("mcp/manager.zig");
 const session_mod = @import("session.zig");
 const skill_mod = @import("skill.zig");
@@ -59,6 +60,16 @@ pub const Agent = struct {
     /// Optional MCP manager for dispatching `mcp__` tool calls.
     /// Borrowed (owned by the App); null disables MCP dispatch.
     mcp_manager: ?*mcp_mod.McpManager = null,
+    /// Optional tool registry (builtin + plugin). Borrowed (owned by the
+    /// App); null falls back to the builtin-only registry, which is what
+    /// headless tests use. The registry is read at every `runToolBatch` to
+    /// route plugin calls through the shared dispatcher.
+    tool_registry: ?*tools.ToolRegistry = null,
+    /// Optional plugin manager (set from the App). Null falls back to
+    /// `builtinRegistry()` only, which is what headless tests use. The
+    /// manager is read at every `runToolBatch` to route plugin tool
+    /// calls through the shared dispatcher.
+    plugin_manager: ?*lua_mod.PluginManager = null,
     /// Background summarizer state machine.
     compactor: Compactor = .{},
     /// Config-driven compaction policy. Set by the runtime from
@@ -429,6 +440,8 @@ pub const Agent = struct {
             else
                 null,
             .mcp_manager = self.mcp_manager,
+            .tool_registry = self.tool_registry,
+            .plugin_manager = self.plugin_manager,
         });
         const results = try executor.runAll(tool_batch.calls, bridge.observer());
         defer self.gpa.free(results);

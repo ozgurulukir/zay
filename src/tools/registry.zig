@@ -1,0 +1,281 @@
+const std = @import("std");
+
+const common = @import("common.zig");
+const Tool = common.Tool;
+
+/// Runtime-mutable tool registry. The App owns one; builtin tools live in
+/// its immutable `builtin` slice, plugin tools are appended at runtime
+/// through `addPluginTool`. This is the single source of truth for tools
+/// in the agent — `tools.runWith` (dispatch) and each `LanguageModel`
+/// adapter (schema serialization) read from `all`.
+///
+/// `all()` returns a borrowed slice that aliases the registry's internal
+/// storage. It is invalidated by any `addPluginTool` / `removePluginToolsOf`
+/// call — callers must consume the slice before mutating.
+pub const ToolRegistry = struct {
+    /// Immutable builtin tools (bash today). Same backing as `builtinRegistry()`.
+    builtin: []const Tool,
+    /// Plugin tools appended at runtime. Each owns its `userdata` allocation
+    /// through `Tool.userdata_free`; `deinit` calls them.
+    plugin: std.ArrayList(Tool) = .empty,
+    /// Backing storage for the borrowed slice returned by `all`. The capacity
+    /// is reused across calls so the `all()` pointer is stable between calls
+    /// that don't add or remove tools.
+    scratch: std.ArrayList(Tool) = .empty,
+
+    pub fn init(builtin: []const Tool) ToolRegistry {
+        return .{ .builtin = builtin };
+    }
+
+    pub fn deinit(self: *ToolRegistry, gpa: std.mem.Allocator) void {
+        for (self.plugin.items) |*t| {
+            // Plugin tool's `name` and `description` are always owned and
+            // heap-allocated (see `buildPluginTool` in the registry
+            // bridge). Free them here so the registry is the single
+            // source of truth for plugin tool lifetimes.
+            gpa.free(t.name);
+            gpa.free(t.description);
+            if (t.userdata_free) |free_fn| free_fn(gpa, t.userdata);
+        }
+        self.plugin.deinit(gpa);
+        self.scratch.deinit(gpa);
+    }
+
+    /// Borrowed flat slice of every registered tool (builtin + plugin). The
+    /// slice aliases `scratch` storage; it is invalidated by any mutation
+    /// that adds or removes a tool. Callers should consume the slice
+    /// synchronously — do not stash it across `addPluginTool` calls.
+    pub fn all(self: *ToolRegistry, gpa: std.mem.Allocator) ![]const Tool {
+        self.scratch.clearRetainingCapacity();
+        try self.scratch.appendSlice(gpa, self.builtin);
+        try self.scratch.appendSlice(gpa, self.plugin.items);
+        return self.scratch.items;
+    }
+
+    /// Look up a tool by name. Searches builtin first (so builtins always
+    /// win name collisions), then plugin tools. Returns null when absent.
+    pub fn lookup(self: *ToolRegistry, gpa: std.mem.Allocator, name: []const u8) !?Tool {
+        for (self.builtin) |tool| {
+            if (std.mem.eql(u8, tool.name, name)) return tool;
+        }
+        for (self.plugin.items) |tool| {
+            if (std.mem.eql(u8, tool.name, name)) return tool;
+        }
+        _ = gpa;
+        return null;
+    }
+
+    /// Append a plugin tool. The registry takes ownership of `tool.userdata`
+    /// and will free it via `tool.userdata_free` on `deinit` or when
+    /// `removePluginToolsWithPrefix` strips the tool.
+    pub fn addPluginTool(self: *ToolRegistry, gpa: std.mem.Allocator, tool: Tool) !void {
+        try self.plugin.append(gpa, tool);
+    }
+
+    /// Remove every plugin tool whose name starts with the
+    /// `<prefix>__` namespace (e.g. `lua__<plugin_name>__`). Frees each
+    /// matching tool's `userdata` before splicing it out. Idempotent: a
+    /// no-op when no tools match.
+    pub fn removePluginToolsWithPrefix(
+        self: *ToolRegistry,
+        gpa: std.mem.Allocator,
+        prefix: []const u8,
+    ) void {
+        var i: usize = 0;
+        while (i < self.plugin.items.len) {
+            const t = self.plugin.items[i];
+            if (std.mem.startsWith(u8, t.name, prefix)) {
+                gpa.free(t.name);
+                gpa.free(t.description);
+                if (t.userdata_free) |free_fn| free_fn(gpa, t.userdata);
+                _ = self.plugin.orderedRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+};
+
+const tools_common = @import("common.zig");
+
+// Sentinel tool for testing — has a valid name/description/schema so the
+// test doesn't trip on dereferencing dangling slices.
+const dummy_free: *const fn (gpa: std.mem.Allocator, ud: *anyopaque) void = struct {
+    fn free(gpa: std.mem.Allocator, ud: *anyopaque) void {
+        _ = gpa;
+        _ = ud;
+    }
+}.free;
+
+const dummy_run: *const fn (
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    args: []const u8,
+    userdata: *anyopaque,
+) tools_common.Error!tools_common.Output = struct {
+    fn run(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        cwd: []const u8,
+        args: []const u8,
+        userdata: *anyopaque,
+    ) tools_common.Error!tools_common.Output {
+        _ = io;
+        _ = cwd;
+        _ = args;
+        _ = userdata;
+        const stdout = try gpa.dupe(u8, "ok");
+        const stderr = try gpa.alloc(u8, 0);
+        return .{ .stdout = stdout, .stderr = stderr, .code = 0 };
+    }
+}.run;
+
+const dummy_display: *const fn (
+    gpa: std.mem.Allocator,
+    args: []const u8,
+    userdata: *anyopaque,
+) std.mem.Allocator.Error!tools_common.ToolDisplay = struct {
+    fn display(
+        gpa: std.mem.Allocator,
+        args: []const u8,
+        userdata: *anyopaque,
+    ) std.mem.Allocator.Error!tools_common.ToolDisplay {
+        _ = args;
+        _ = userdata;
+        return .{ .label = try gpa.dupe(u8, "dummy") };
+    }
+}.display;
+
+test "ToolRegistry: lookup finds builtin tools" {
+    const gpa = std.testing.allocator;
+    var reg: ToolRegistry = .init(@import("../tools.zig").builtinRegistry());
+    defer reg.deinit(gpa);
+
+    const maybe_tool = try reg.lookup(gpa, "bash");
+    try std.testing.expect(maybe_tool != null);
+    const tool = maybe_tool.?;
+    try std.testing.expectEqualStrings("bash", tool.name);
+}
+
+test "ToolRegistry: lookup returns null for unknown tool" {
+    const gpa = std.testing.allocator;
+    var reg: ToolRegistry = .init(@import("../tools.zig").builtinRegistry());
+    defer reg.deinit(gpa);
+
+    try std.testing.expect((try reg.lookup(gpa, "nope")) == null);
+}
+
+test "ToolRegistry: addPluginTool makes plugin tool discoverable" {
+    const gpa = std.testing.allocator;
+    var reg: ToolRegistry = .init(@import("../tools.zig").builtinRegistry());
+    defer reg.deinit(gpa);
+
+    const name = try gpa.dupe(u8, "lua__p__t");
+    errdefer gpa.free(name);
+    const desc = try gpa.dupe(u8, "plugin tool");
+    errdefer gpa.free(desc);
+
+    try reg.addPluginTool(gpa, .{
+        .name = name,
+        .description = desc,
+        .schema = .{ .properties = &.{} },
+        .run = dummy_run,
+        .display = dummy_display,
+        .userdata = undefined,
+        .userdata_free = dummy_free,
+    });
+
+    const maybe_tool = try reg.lookup(gpa, "lua__p__t");
+    try std.testing.expect(maybe_tool != null);
+    const tool = maybe_tool.?;
+    try std.testing.expectEqualStrings("lua__p__t", tool.name);
+    try std.testing.expectEqualStrings("plugin tool", tool.description);
+
+    const all = try reg.all(gpa);
+    try std.testing.expectEqual(@as(usize, 2), all.len); // bash + plugin
+    try std.testing.expectEqualStrings("bash", all[0].name);
+    try std.testing.expectEqualStrings("lua__p__t", all[1].name);
+}
+
+test "ToolRegistry: removePluginToolsWithPrefix strips matching tools" {
+    const gpa = std.testing.allocator;
+    var reg: ToolRegistry = .init(@import("../tools.zig").builtinRegistry());
+    defer reg.deinit(gpa);
+
+    const mk = struct {
+        fn make(gpa_: std.mem.Allocator, reg_: *ToolRegistry, n: []const u8) !void {
+            const name = try gpa_.dupe(u8, n);
+            errdefer gpa_.free(name);
+            const desc = try gpa_.dupe(u8, "d");
+            errdefer gpa_.free(desc);
+            try reg_.addPluginTool(gpa_, .{
+                .name = name,
+                .description = desc,
+                .schema = .{ .properties = &.{} },
+                .run = dummy_run,
+                .display = dummy_display,
+                .userdata = undefined,
+                .userdata_free = dummy_free,
+            });
+        }
+    }.make;
+    try mk(gpa, &reg, "lua__p__a");
+    try mk(gpa, &reg, "lua__p__b");
+    try mk(gpa, &reg, "mcp__x__c"); // should not be removed
+
+    reg.removePluginToolsWithPrefix(gpa, "lua__p__");
+    try std.testing.expect((try reg.lookup(gpa, "lua__p__a")) == null);
+    try std.testing.expect((try reg.lookup(gpa, "lua__p__b")) == null);
+    try std.testing.expect((try reg.lookup(gpa, "mcp__x__c")) != null);
+    try std.testing.expect((try reg.lookup(gpa, "bash")) != null);
+}
+
+test "ToolRegistry: all() returns valid slices after multiple calls" {
+    // Regression: a refactor that frees a tool's `name`/`description` after
+    // addPluginTool corrupts the registry. all() must always return slices
+    // whose tool data is fully owned by the registry.
+    const gpa = std.testing.allocator;
+    var reg: ToolRegistry = .init(@import("../tools.zig").builtinRegistry());
+    defer reg.deinit(gpa);
+
+    const mk = struct {
+        fn make(gpa_: std.mem.Allocator, reg_: *ToolRegistry, n: []const u8) !void {
+            const name = try gpa_.dupe(u8, n);
+            errdefer gpa_.free(name);
+            const desc = try gpa_.dupe(u8, "test desc");
+            errdefer gpa_.free(desc);
+            try reg_.addPluginTool(gpa_, .{
+                .name = name,
+                .description = desc,
+                .schema = .{ .properties = &.{} },
+                .run = dummy_run,
+                .display = dummy_display,
+                .userdata = undefined,
+                .userdata_free = dummy_free,
+            });
+        }
+    }.make;
+    try mk(gpa, &reg, "lua__p__a");
+    try mk(gpa, &reg, "lua__p__b");
+
+    // First all(): tools are still allocated.
+    {
+        const all = try reg.all(gpa);
+        try std.testing.expect(all.len == 3); // bash + 2 plugin
+        for (all) |t| {
+            try std.testing.expect(t.name.len > 0);
+            try std.testing.expect(t.description.len > 0);
+        }
+    }
+
+    // Reuse the same registry; backing storage must still be intact.
+    {
+        const all = try reg.all(gpa);
+        try std.testing.expect(all.len == 3);
+        for (all) |t| {
+            try std.testing.expect(t.name.len > 0);
+            try std.testing.expect(t.description.len > 0);
+        }
+    }
+}
