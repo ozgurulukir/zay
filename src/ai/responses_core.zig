@@ -41,6 +41,11 @@ pub const Client = struct {
     url: []u8,
     authorization: []u8,
     tools_json: []u8,
+    /// Whether tool definitions carry OpenAI strict structured-outputs mode.
+    /// Captured at `init` so `updateMcpTools` can rebuild `tools_json`
+    /// consistently. Default `false` — strict mode is OpenAI-only and breaks
+    /// function-calling on gateways (OpenRouter/Ollama/vLLM).
+    strict: bool = false,
     responses_config: ResponsesConfig,
     http_client: std.http.Client,
     call_seq: u64 = 0,
@@ -63,7 +68,7 @@ pub const Client = struct {
         errdefer gpa.free(owned_config.session_id);
         owned_config.system_prompt = try gpa.dupe(u8, config.system_prompt);
         errdefer gpa.free(owned_config.system_prompt);
-        const tools_json = try buildAllToolsJson(gpa, config.tools, config.mcp_tools, null);
+        const tools_json = try buildAllToolsJson(gpa, config.tools, config.mcp_tools, null, config.strict);
         errdefer gpa.free(tools_json);
         target.* = .{
             .gpa = gpa,
@@ -72,6 +77,7 @@ pub const Client = struct {
             .url = url,
             .authorization = authorization,
             .tools_json = tools_json,
+            .strict = config.strict,
             .responses_config = responses_config,
             .http_client = .{ .allocator = gpa, .io = io },
         };
@@ -111,7 +117,7 @@ pub const Client = struct {
         registry: ?*tools_mod.ToolRegistry,
         builtin_override: []const tools_common.Tool,
     ) !void {
-        const new_json = try buildAllToolsJson(self.gpa, builtin_override, mcp_tools, registry);
+        const new_json = try buildAllToolsJson(self.gpa, builtin_override, mcp_tools, registry, self.strict);
         self.gpa.free(self.tools_json);
         self.tools_json = new_json;
     }
@@ -192,6 +198,7 @@ fn buildAllToolsJson(
     tools: []const tools_common.Tool,
     mcp_tools: []const ai.McpToolSchema,
     registry: ?*tools_mod.ToolRegistry,
+    strict: bool,
 ) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
@@ -200,39 +207,46 @@ fn buildAllToolsJson(
     for (tools) |tool| {
         if (!first) try aw.writer.writeByte(',');
         first = false;
-        try writeToolDefinition(gpa, &aw.writer, tool.name, tool.description, tool.schema);
+        try writeToolDefinition(gpa, &aw.writer, tool.name, tool.description, tool.schema, strict);
     }
     if (registry) |r| {
         const plugin_slice = try r.all(gpa);
         for (plugin_slice) |tool| {
             if (!first) try aw.writer.writeByte(',');
             first = false;
-            try writeToolDefinition(gpa, &aw.writer, tool.name, tool.description, tool.schema);
+            try writeToolDefinition(gpa, &aw.writer, tool.name, tool.description, tool.schema, strict);
         }
     }
     for (mcp_tools) |mcp| {
         if (!first) try aw.writer.writeByte(',');
         first = false;
-        try writeToolDefinition(gpa, &aw.writer, mcp.name, mcp.description, mcp.schema);
+        try writeToolDefinition(gpa, &aw.writer, mcp.name, mcp.description, mcp.schema, strict);
     }
     try aw.writer.writeByte(']');
     return aw.toOwnedSlice();
 }
 
-fn writeToolDefinition(gpa: std.mem.Allocator, writer: *std.Io.Writer, name: []const u8, description: []const u8, schema: tools_common.Schema) !void {
+fn writeToolDefinition(gpa: std.mem.Allocator, writer: *std.Io.Writer, name: []const u8, description: []const u8, schema: tools_common.Schema, strict: bool) !void {
     const desc = try std.mem.replaceOwned(u8, gpa, description, "{{hsep}}", "~");
     defer gpa.free(desc);
     try writer.writeAll("{\"type\":\"function\",\"name\":");
     try std.json.Stringify.value(name, .{}, writer);
     try writer.writeAll(",\"description\":");
     try std.json.Stringify.value(desc, .{}, writer);
-    try writer.writeAll(",\"strict\":true,");
-    try writer.writeAll("\"parameters\":");
-    try writeParameters(writer, schema);
+    // Strict structured-outputs mode is OpenAI-only and breaks
+    // function-calling on gateways, so it's opt-in via `ai.Config.strict`.
+    // The leading comma is always written so the next `parameters` key is a
+    // valid object member regardless of strict.
+    if (strict) {
+        try writer.writeAll(",\"strict\":true,\"parameters\":");
+    } else {
+        try writer.writeAll(",\"parameters\":");
+    }
+    try writeParameters(writer, schema, strict);
     try writer.writeAll("}");
 }
 
-fn writeParameters(writer: *std.Io.Writer, schema: tools_common.Schema) !void {
+fn writeParameters(writer: *std.Io.Writer, schema: tools_common.Schema, strict: bool) !void {
     try writer.writeAll("{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{");
     for (schema.properties, 0..) |prop, index| {
         if (index > 0) try writer.writeByte(',');
@@ -276,9 +290,15 @@ fn writeParameters(writer: *std.Io.Writer, schema: tools_common.Schema) !void {
         }
         try writer.writeByte('}');
     }
+    // In strict mode OpenAI requires EVERY property in `required` (optional
+    // ones are made nullable above). Outside strict mode list only the
+    // genuinely-required properties so optional parameters stay optional.
     try writer.writeAll("},\"required\":[");
-    for (schema.properties, 0..) |prop, i| {
-        if (i > 0) try writer.writeByte(',');
+    var required_first = true;
+    for (schema.properties) |prop| {
+        if (!strict and !prop.required) continue;
+        if (!required_first) try writer.writeByte(',');
+        required_first = false;
         try std.json.Stringify.value(prop.name, .{}, writer);
     }
     try writer.writeAll("]}");
@@ -1031,7 +1051,7 @@ test "writeRequestPayload serializes tool call ids as strings, not objects" {
 test "openresponses tools json is an array" {
     const tools = @import("../tools.zig");
     const gpa = std.testing.allocator;
-    const json = try buildAllToolsJson(gpa, tools.builtinRegistry(), &.{}, null);
+    const json = try buildAllToolsJson(gpa, tools.builtinRegistry(), &.{}, null, true);
     defer gpa.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"function\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"strict\":true") != null);
@@ -1053,7 +1073,7 @@ test "openresponses strict schema includes nullable union types and top-level ad
             .display = undefined,
         },
     };
-    const json = try buildAllToolsJson(gpa, &tools, &.{}, null);
+    const json = try buildAllToolsJson(gpa, &tools, &.{}, null, true);
     defer gpa.free(json);
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"strict\":true") != null);
@@ -1062,6 +1082,34 @@ test "openresponses strict schema includes nullable union types and top-level ad
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tag\":{\"type\":[\"string\",\"null\"]") != null);
     // Required array includes ALL properties for strict mode compliance.
     try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"id\",\"tag\"]") != null);
+}
+
+test "openresponses omits strict mode and filters required when strict is false (gateway compatibility)" {
+    // Regression for function-calling breaking on gateways: strict
+    // structured-outputs is OpenAI-only, so it must be omitted when the
+    // client is built with strict=false. `required` then lists only the
+    // genuinely-required properties.
+    const gpa = std.testing.allocator;
+    const tools = [_]tools_common.Tool{
+        .{
+            .name = "demo",
+            .description = "Demo tool",
+            .schema = .{
+                .properties = &.{
+                    .{ .name = "id", .kind = .string, .description = "ID", .required = true, .nullable = false },
+                    .{ .name = "tag", .kind = .string, .description = "Tag", .required = false, .nullable = true },
+                },
+            },
+            .run = undefined,
+            .display = undefined,
+        },
+    };
+    const json = try buildAllToolsJson(gpa, &tools, &.{}, null, false);
+    defer gpa.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"strict\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"id\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"tag\":{\"type\":[\"string\",\"null\"]") != null);
 }
 
 test "openresponses emits final item text when no delta arrived" {

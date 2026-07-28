@@ -101,7 +101,10 @@ pub const ModelCatalogue = struct {
             .failed => |*f| gpa.free(f.message),
             else => {},
         }
-        for (self.entries.items) |*entry| entry.model.deinit(gpa);
+        for (self.entries.items) |*entry| {
+            entry.model.deinit(gpa);
+            entry.source.deinit(gpa);
+        }
         self.entries.deinit(gpa);
         for (self.compatible_models.items) |*model| model.deinit(gpa);
         self.compatible_models.deinit(gpa);
@@ -121,7 +124,10 @@ pub const ModelCatalogue = struct {
 
     /// Free every entry's model and drop all rows.
     pub fn clearEntries(self: *ModelCatalogue, gpa: std.mem.Allocator) void {
-        for (self.entries.items) |*entry| entry.model.deinit(gpa);
+        for (self.entries.items) |*entry| {
+            entry.model.deinit(gpa);
+            entry.source.deinit(gpa);
+        }
         self.entries.clearRetainingCapacity();
     }
 
@@ -131,11 +137,12 @@ pub const ModelCatalogue = struct {
         var i: usize = 0;
         while (i < self.entries.items.len) {
             const matches = switch (self.entries.items[i].source) {
-                .openai_compatible => |entry_provider| entry_provider == provider,
+                .openai_compatible => |conn| conn.provider == provider,
                 .openai_codex => false,
             };
             if (matches) {
                 self.entries.items[i].model.deinit(gpa);
+                self.entries.items[i].source.deinit(gpa);
                 _ = self.entries.orderedRemove(i);
             } else {
                 i += 1;
@@ -181,14 +188,24 @@ fn testModel(gpa: std.mem.Allocator, id: []const u8) !codex.Model {
     return .{ .id = try gpa.dupe(u8, id), .label = try gpa.dupe(u8, id) };
 }
 
+/// Test helper: gpa-owned `Compatible` source. `catalogue.deinit`/`dropProvider`
+/// string'leri serbest bırakır.
+fn testCompatibleSource(gpa: std.mem.Allocator, provider: config_mod.Provider, base_url: []const u8, auth_key_id: []const u8) !model_loader.Compatible {
+    return .{
+        .provider = provider,
+        .base_url = try gpa.dupe(u8, base_url),
+        .auth_key_id = try gpa.dupe(u8, auth_key_id),
+    };
+}
+
 test "dropProvider removes model, source, and reasoning together" {
     const gpa = std.testing.allocator;
     var catalogue: ModelCatalogue = .{};
     defer catalogue.deinit(gpa);
 
     try catalogue.append(gpa, try testModel(gpa, "gpt"), .openai_codex);
-    try catalogue.append(gpa, try testModel(gpa, "llama"), .{ .openai_compatible = .ollama });
-    try catalogue.append(gpa, try testModel(gpa, "qwen"), .{ .openai_compatible = .ollama });
+    try catalogue.append(gpa, try testModel(gpa, "llama"), .{ .openai_compatible = try testCompatibleSource(gpa, .ollama, "http://localhost:11434/v1", "ollama") });
+    try catalogue.append(gpa, try testModel(gpa, "qwen"), .{ .openai_compatible = try testCompatibleSource(gpa, .ollama, "http://localhost:11434/v1", "ollama") });
     // Give the middle entry a non-default reasoning index — it must leave with
     // its row, never stranding a stale index behind.
     catalogue.entries.items[1].reasoning_index = 2;

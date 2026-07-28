@@ -276,7 +276,9 @@ pub fn collectConfiguredProviders(self: *App, catalog: ModelCatalog) ![]model_lo
             const key = self.provider_state.api_keys.get(provider.label()) orelse anon: {
                 break :anon provider.anonymousApiKey() orelse continue;
             };
-            try appendConfigured(self, &list, provider, base_url, key);
+            // Katalog provider'ları auth.json'a label'larıyla kaydolur; null
+            // bırakmak compatibleSource'a label'a düşürür.
+            try appendConfigured(self, &list, provider, base_url, key, null);
         }
         if (self.provider_state.modelsdev_registry) |*reg| {
             var it = self.provider_state.api_keys.iterator();
@@ -284,7 +286,9 @@ pub fn collectConfiguredProviders(self: *App, catalog: ModelCatalog) ![]model_lo
                 const id = entry.key_ptr.*;
                 if (catalogueIndexById(id) != null) continue;
                 if (reg.lookup(id)) |dyn_p| {
-                    try appendConfiguredDynamic(self, &list, dyn_p.base_url, entry.value_ptr.*, dyn_p.name);
+                    // auth_key_id = registry id (auth.json anahtarı). entry.key_ptr.*
+                    // zaten bu id'ye eşittir.
+                    try appendConfiguredDynamic(self, &list, dyn_p.base_url, entry.value_ptr.*, dyn_p.name, id);
                 }
             }
         }
@@ -320,7 +324,7 @@ pub fn collectConfiguredProviders(self: *App, catalog: ModelCatalog) ![]model_lo
                     }
                     break :blk self.provider_state.api_keys.get(ms.providerName()) orelse "";
                 };
-                try appendConfigured(self, &list, provider, base_url, api_key);
+                try appendConfigured(self, &list, provider, base_url, api_key, ms.providerName());
             }
         }
     }
@@ -333,6 +337,7 @@ pub fn appendConfiguredDynamic(
     base_url: []const u8,
     api_key: []const u8,
     display_name: []const u8,
+    auth_key_id: []const u8,
 ) !void {
     const url = try self.gpa.dupe(u8, base_url);
     errdefer self.gpa.free(url);
@@ -340,11 +345,14 @@ pub fn appendConfiguredDynamic(
     errdefer self.gpa.free(key);
     const name = try self.gpa.dupe(u8, display_name);
     errdefer self.gpa.free(name);
+    const id = try self.gpa.dupe(u8, auth_key_id);
+    errdefer self.gpa.free(id);
     try list.append(self.gpa, .{
         .provider = .openai_compatible,
         .base_url = url,
         .api_key = key,
         .display_name = name,
+        .auth_key_id = id,
     });
 }
 
@@ -354,12 +362,15 @@ pub fn appendConfigured(
     provider: config_mod.Provider,
     base_url: []const u8,
     api_key: []const u8,
+    auth_key_id: ?[]const u8,
 ) !void {
     const url = try self.gpa.dupe(u8, base_url);
     errdefer self.gpa.free(url);
     const key = try self.gpa.dupe(u8, api_key);
     errdefer self.gpa.free(key);
-    try list.append(self.gpa, .{ .provider = provider, .base_url = url, .api_key = key });
+    const id: ?[]u8 = if (auth_key_id) |k| try self.gpa.dupe(u8, k) else null;
+    errdefer if (id) |owned| self.gpa.free(owned);
+    try list.append(self.gpa, .{ .provider = provider, .base_url = url, .api_key = key, .auth_key_id = id });
 }
 
 pub const model_loader_job = @import("model_loader_job.zig");
@@ -392,7 +403,7 @@ pub fn connectCodex(self: *App) !void {
     try connectCodexClient(self, credentials, model.id, effort);
     self.codex_signed_in = true;
     self.liveRuntime().?.codex_connection_expired = false;
-    try persistModelSelection(self, .openai, model.id, effort, .global);
+    try persistModelSelection(self, .openai, null, model.id, effort, .global);
     self.mode = .normal;
     self.clearInput();
     _ = try self.thread.transcript.append(self.gpa, .agent, "agent", "Connected to OpenAI Codex.");
@@ -507,11 +518,12 @@ pub fn submitDynamicProviderSetup(self: *App, provider: modelsdev.Provider) !voi
     }
     try refreshProviderApiKeys(self);
 
-    // Stash the dynamic provider's base_url and api_key into cached_config so
-    // that applySelectedModel can resolve them via compatibleBaseUrl and
-    // compatibleApiKey. Without this, both see .openai_compatible (which has no
-    // default URL and no stored key) and return null/empty, yielding
-    // NotConnected.
+    // Stash the dynamic provider's base_url and api_key into cached_config.
+    // applySelectedModel artık doğrudan seçili entry'nin conn'undan çözüm
+    // yaptığı için bunlara güvenmez; stash session resume
+    // (tryAttachOpenAiCompatibleFromConfig) ve hasOpenAICompatibleCredentials
+    // için tutulur. Seçim anında updateCachedModelSelection bunları entry'den
+    // gelen değerlerle tutarlı kılar.
     if (self.cached_config_owned) {
         const owned_url = try self.gpa.dupe(u8, provider.base_url);
         if (self.cached_config.base_url) |prev| self.gpa.free(prev);
@@ -725,17 +737,20 @@ pub fn applySelectedModel(self: *App) !void {
                 defer credentials.deinit(self.gpa);
                 try connectCodexClient(self, credentials, model.id, effort);
                 self.codex_signed_in = true;
-                try persistModelSelection(self, .openai, model.id, effort, self.pickers.models.model_scope);
+                try persistModelSelection(self, .openai, null, model.id, effort, self.pickers.models.model_scope);
             } else {
                 return error.NotConnected;
             }
         },
-        .openai_compatible => |provider| {
-            const base_url = compatibleBaseUrl(self, provider) orelse return error.NotConnected;
-            const api_key = compatibleApiKey(self, provider);
-            if (api_key.len == 0 and provider.requiresApiKey()) return error.NotConnected;
-            try attachOpenAiCompatibleClient(self, base_url, api_key, model.id, effort);
-            try persistModelSelection(self, provider, model.id, effort, self.pickers.models.model_scope);
+        .openai_compatible => |conn| {
+            // Entry kendi tam bağlantı bilgisini taşır (base_url + auth_key_id).
+            // cached_config'in global tek değerine bakmak yerine doğrudan entry'den
+            // çözümle — çoklu provider kataloğunda yanlış provider'a bağlanmayı
+            // önler.
+            const api_key = compatibleApiKeyForConn(self, conn);
+            if (api_key.len == 0 and conn.provider.requiresApiKey()) return error.NotConnected;
+            try attachOpenAiCompatibleClient(self, conn.base_url, api_key, model.id, effort);
+            try persistModelSelection(self, conn.provider, conn, model.id, effort, self.pickers.models.model_scope);
         },
     }
     self.mode = .normal;
@@ -745,14 +760,15 @@ pub fn applySelectedModel(self: *App) !void {
 pub fn persistModelSelection(
     self: *App,
     provider: config_mod.Provider,
+    conn: ?model_loader.Compatible,
     model_id: []const u8,
     effort: ai.ReasoningEffort,
     scope: ModelScope,
 ) !void {
-    try updateCachedModelSelection(self, provider, model_id, effort);
+    try updateCachedModelSelection(self, provider, conn, model_id, effort);
     if (scope == .session) return;
 
-    var updates = try modelSelectionUpdates(self, provider, model_id, effort);
+    var updates = try modelSelectionUpdates(self, provider, conn, model_id, effort);
     defer updates.deinit(self.gpa);
     switch (scope) {
         .global => config_mod.mergeAndWriteGlobal(self.gpa, self.io, self.liveRuntime().?.home_dir, updates) catch |err| {
@@ -768,20 +784,21 @@ pub fn persistModelSelection(
 pub fn updateCachedModelSelection(
     self: *App,
     provider: config_mod.Provider,
+    conn: ?model_loader.Compatible,
     model_id: []const u8,
     effort: ai.ReasoningEffort,
 ) !void {
     const new_id = try self.gpa.dupe(u8, model_id);
     errdefer self.gpa.free(new_id);
     if (self.cached_config_owned) {
+        const resolved = resolveConn(provider, conn);
         if (self.cached_config.model_selection) |*ms| {
             ms.deinit(self.gpa);
-            const base_url = provider.defaultBaseUrl() orelse "";
             if (provider == .openai_compatible) {
                 self.cached_config.model_selection = .{
                     .custom = .{
-                        .provider_name = try self.gpa.dupe(u8, self.cached_config.dynamic_provider_id orelse provider.label()),
-                        .base_url = try self.gpa.dupe(u8, base_url),
+                        .provider_name = try self.gpa.dupe(u8, resolved.auth_key_id),
+                        .base_url = try self.gpa.dupe(u8, resolved.base_url),
                         .api_key = try self.gpa.dupe(u8, ""),
                         .model = .{ .id = new_id, .reasoning = .{ .effort = effort } },
                     },
@@ -790,21 +807,21 @@ pub fn updateCachedModelSelection(
                 self.cached_config.model_selection = .{
                     .builtin = .{
                         .provider = provider,
-                        .provider_name = try self.gpa.dupe(u8, provider.label()),
+                        .provider_name = try self.gpa.dupe(u8, resolved.auth_key_id),
                         .model = .{ .id = new_id, .reasoning = .{ .effort = effort } },
                     },
                 };
             }
-            try updateCachedProviderConnection(self, provider);
+            try updateCachedProviderConnection(self, provider, resolved);
         } else {
-            // No selection yet — bootstrap a minimal one. base_url and
-            // api_key come from the provider's defaults.
-            const base_url = provider.defaultBaseUrl() orelse "";
+            // No selection yet — bootstrap a minimal one from the resolved
+            // connection (provider default for builtins, entry values for
+            // compatible).
             if (provider == .openai_compatible) {
                 self.cached_config.model_selection = .{
                     .custom = .{
-                        .provider_name = try self.gpa.dupe(u8, self.cached_config.dynamic_provider_id orelse provider.label()),
-                        .base_url = try self.gpa.dupe(u8, base_url),
+                        .provider_name = try self.gpa.dupe(u8, resolved.auth_key_id),
+                        .base_url = try self.gpa.dupe(u8, resolved.base_url),
                         .api_key = try self.gpa.dupe(u8, ""),
                         .model = .{ .id = new_id, .reasoning = .{ .effort = effort } },
                     },
@@ -813,25 +830,51 @@ pub fn updateCachedModelSelection(
                 self.cached_config.model_selection = .{
                     .builtin = .{
                         .provider = provider,
-                        .provider_name = try self.gpa.dupe(u8, provider.label()),
+                        .provider_name = try self.gpa.dupe(u8, resolved.auth_key_id),
                         .model = .{ .id = new_id, .reasoning = .{ .effort = effort } },
                     },
                 };
             }
-            try updateCachedProviderConnection(self, provider);
+            try updateCachedProviderConnection(self, provider, resolved);
         }
     } else {
         self.gpa.free(new_id);
     }
 }
 
-pub fn updateCachedProviderConnection(self: *App, provider: config_mod.Provider) !void {
+/// Bir seçim için çözümlenmiş bağlantı: provider default URL/key (builtin'ler
+/// için) ya da entry'nin kendi `conn` değerleri (compatible yolu). `conn` null
+/// olduğunda (codex, veya güvenli olmayan eski çağrılar) cached_config'in
+/// dynamic_provider_id/base_url stash'ine düşer.
+const ResolvedConn = struct {
+    base_url: []const u8,
+    auth_key_id: []const u8,
+};
+
+fn resolveConn(provider: config_mod.Provider, conn: ?model_loader.Compatible) ResolvedConn {
+    if (conn) |c| return .{ .base_url = c.base_url, .auth_key_id = c.auth_key_id };
+    // conn null yalnızca codex (.openai) yolunda olabilir; builtin/custom
+    // seçimleri daima conn ile gelir. Provider default'una düş.
+    return .{
+        .base_url = provider.defaultBaseUrl() orelse "",
+        .auth_key_id = provider.label(),
+    };
+}
+
+pub fn updateCachedProviderConnection(self: *App, provider: config_mod.Provider, resolved: ResolvedConn) !void {
     if (provider == .openai_compatible) {
-        // Dynamic/custom providers stash their connection in cached_config's
-        // legacy fields. Mirror them into model_selection so applyFromConfig
-        // resolves the correct endpoint and auth.json key on resume.
-        if (self.cached_config.base_url) |url| try replaceCachedBaseUrl(self, url);
-        if (self.cached_config.dynamic_provider_id) |id| try replaceCachedProviderName(self, id);
+        // Compatible providers: entry'nin tam bağlantısını cached_config
+        // legacy alanlarına ve model_selection'a aynala, böylece session resume
+        // (tryAttachOpenAiCompatibleFromConfig) doğru endpoint + auth.json
+        // anahtarını çözümler.
+        if (resolved.base_url.len > 0) {
+            try stashCachedBaseUrl(self, resolved.base_url);
+            try replaceCachedBaseUrl(self, resolved.base_url);
+        }
+        if (resolved.auth_key_id.len > 0) {
+            try stashCachedDynamicId(self, resolved.auth_key_id);
+            try replaceCachedProviderName(self, resolved.auth_key_id);
+        }
         return;
     }
     if (provider.defaultBaseUrl()) |base_url| try replaceCachedBaseUrl(self, base_url);
@@ -892,9 +935,27 @@ pub fn clearCachedApiKey(self: *App) void {
     }
 }
 
+/// `cached_config.base_url` legacy alanını (runtime-only, serialize edilmez)
+/// yenisiyle değiştir. Session resume ve hasOpenAICompatibleCredentials hâlâ
+/// bu alanı okur.
+pub fn stashCachedBaseUrl(self: *App, base_url: []const u8) !void {
+    const owned = try self.gpa.dupe(u8, base_url);
+    if (self.cached_config.base_url) |prev| self.gpa.free(prev);
+    self.cached_config.base_url = owned;
+}
+
+/// `cached_config.dynamic_provider_id` legacy alanını (runtime-only) yenisiyle
+/// değiştir. compatibleApiKey ve status bar bu alanı okur.
+pub fn stashCachedDynamicId(self: *App, id: []const u8) !void {
+    const owned = try self.gpa.dupe(u8, id);
+    if (self.cached_config.dynamic_provider_id) |prev| self.gpa.free(prev);
+    self.cached_config.dynamic_provider_id = owned;
+}
+
 pub fn modelSelectionUpdates(
     self: *App,
     provider: config_mod.Provider,
+    conn: ?model_loader.Compatible,
     model_id: []const u8,
     effort: ai.ReasoningEffort,
 ) !config_mod.Config {
@@ -914,21 +975,14 @@ pub fn modelSelectionUpdates(
         self.gpa.free(providers);
     }
     // For dynamic/custom providers the config-map key and auth.json key is
-    // the stashed provider id (e.g. "stepfun-ai"), NOT the enum label
-    // ("openai_compatible"). Using the label would make resume look up the
-    // wrong auth.json entry and connect with an empty API key.
-    // After session resume dynamic_provider_id is null (runtime-only);
-    // fall back to the serialized model_selection.provider_name.
-    const resolved_name: []const u8 = if (provider == .openai_compatible)
-        self.cached_config.dynamic_provider_id orelse
-            (if (self.cached_config.model_selection) |ms| ms.providerName() else provider.label())
-    else
-        provider.label();
+    // the provider id (e.g. "stepfun-ai"), carried by the selected entry's
+    // conn.auth_key_id. Codex (.openai) için provider.label() kullanılır.
+    const resolved = resolveConn(provider, conn);
 
-    providers[0] = .{ .name = try self.gpa.dupe(u8, resolved_name), .provider = provider, .models = models };
+    providers[0] = .{ .name = try self.gpa.dupe(u8, resolved.auth_key_id), .provider = provider, .models = models };
     models_moved = true;
     if (provider != .openai) {
-        if (compatibleBaseUrl(self, provider)) |base_url| providers[0].base_url = .{ .custom = try self.gpa.dupe(u8, base_url) };
+        if (resolved.base_url.len > 0) providers[0].base_url = .{ .custom = try self.gpa.dupe(u8, resolved.base_url) };
     }
 
     const base_url_slice: ?[]u8 = switch (providers[0].base_url) {
@@ -941,11 +995,11 @@ pub fn modelSelectionUpdates(
     errdefer self.gpa.free(ms_model_id);
 
     const model_selection = if (provider == .openai_compatible) blk: {
-        const ms_base_url = if (base_url_slice) |s| try self.gpa.dupe(u8, s) else try self.gpa.dupe(u8, "");
+        const ms_base_url = if (base_url_slice) |s| try self.gpa.dupe(u8, s) else try self.gpa.dupe(u8, resolved.base_url);
         const ms_api_key = try self.gpa.dupe(u8, "");
         break :blk config_mod.ModelSelection{
             .custom = .{
-                .provider_name = try self.gpa.dupe(u8, resolved_name),
+                .provider_name = try self.gpa.dupe(u8, resolved.auth_key_id),
                 .base_url = ms_base_url,
                 .api_key = ms_api_key,
                 .model = .{ .id = ms_model_id, .reasoning = .{ .effort = effort } },
@@ -955,7 +1009,7 @@ pub fn modelSelectionUpdates(
         break :blk config_mod.ModelSelection{
             .builtin = .{
                 .provider = provider,
-                .provider_name = try self.gpa.dupe(u8, resolved_name),
+                .provider_name = try self.gpa.dupe(u8, resolved.auth_key_id),
                 .model = .{ .id = ms_model_id, .reasoning = .{ .effort = effort } },
             },
         };
@@ -1028,13 +1082,19 @@ pub fn loadCompatibleCatalog(self: *App) !void {
     if (!self.pickers.models.compatible_models_fetched) try fetchCompatibleCatalog(
         self,
     );
-    const provider = tui_provider.compatibleProviderFromBaseUrl(self.cached_config.base_url.?);
+    const base_url = self.cached_config.base_url.?;
+    const provider = tui_provider.compatibleProviderFromBaseUrl(base_url);
+    // Bu yol yalnızca cached_config.base_url'den gelen tek bir (env/config)
+    // provider için geçerlidir; auth_key_id olarak provider label'ını kullan
+    // (catalogue dışı config provider'ları auth.json'a isimle kaydolur).
     for (self.pickers.models.compatible_models.items) |model| {
         const id = try self.gpa.dupe(u8, model.id);
         errdefer self.gpa.free(id);
         const label = try self.gpa.dupe(u8, model.label);
         errdefer self.gpa.free(label);
-        try self.pickers.models.append(self.gpa, .{ .id = id, .label = label }, .{ .openai_compatible = provider });
+        try self.pickers.models.append(self.gpa, .{ .id = id, .label = label }, .{
+            .openai_compatible = try model_loader.compatibleSource(self.gpa, provider, base_url, provider.label()),
+        });
     }
 }
 
@@ -1057,7 +1117,9 @@ pub fn loadLocalCompatibleCatalog(self: *App, provider: config_mod.Provider) !vo
         errdefer self.gpa.free(id);
         const label = try localModelLabel(self.gpa, provider, entry.id);
         errdefer self.gpa.free(label);
-        try self.pickers.models.append(self.gpa, .{ .id = id, .label = label }, .{ .openai_compatible = provider });
+        try self.pickers.models.append(self.gpa, .{ .id = id, .label = label }, .{
+            .openai_compatible = try model_loader.compatibleSource(self.gpa, provider, base_url, providerLocalApiKey(provider)),
+        });
     }
 }
 
@@ -1136,6 +1198,17 @@ pub fn compatibleApiKey(self: *const App, provider: config_mod.Provider) []const
     if (self.cached_config.api_key) |key| return key;
     if (provider.anonymousApiKey()) |anon| return anon;
     return providerLocalApiKey(provider);
+}
+
+/// `compatibleApiKey`'ın conn-bazlı versiyonu: seçilen entry'nin kendi
+/// `auth_key_id`'sini birincil çözüm olarak kullanır (cached_config'in global
+/// stash'ine bağımlı olmadan). Bu, çoklu provider kataloğunda yanlış
+/// provider'ın anahtarını çözümlemeyi önler.
+pub fn compatibleApiKeyForConn(self: *const App, conn: model_loader.Compatible) []const u8 {
+    if (self.provider_state.api_keys.get(conn.auth_key_id)) |key| return key;
+    if (self.cached_config.api_key) |key| return key;
+    if (conn.provider.anonymousApiKey()) |anon| return anon;
+    return providerLocalApiKey(conn.provider);
 }
 
 pub fn providerLocalApiKey(provider: config_mod.Provider) []const u8 {
@@ -1265,6 +1338,7 @@ pub fn connectCodexClient(
     const mcp_schemas = try self.mcp_manager.buildMcpToolSchemas(self.gpa);
     defer self.gpa.free(mcp_schemas);
     runtime.mcp_tools = mcp_schemas;
+    runtime.strict_outputs = self.cached_config.strict_outputs orelse false;
     try runtime.connectCodexClient(credentials, model, effort);
     self.thread.agent.?.client = runtime.client;
     injectPluginTools(self);
@@ -1290,6 +1364,7 @@ pub fn attachOpenAiCompatibleClient(
     const mcp_schemas = try self.mcp_manager.buildMcpToolSchemas(self.gpa);
     defer self.gpa.free(mcp_schemas);
     runtime.mcp_tools = mcp_schemas;
+    runtime.strict_outputs = self.cached_config.strict_outputs orelse false;
     try runtime.attachOpenAiCompatibleClient(base_url, api_key, model_id, effort);
     self.thread.agent.?.client = runtime.client;
     injectPluginTools(self);

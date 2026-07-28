@@ -45,10 +45,10 @@ pub fn installModelLoadResult(self: *App, result: *model_loader.Result) !void {
         // models, leaving previously-cached providers untouched.
         var refreshed = std.EnumSet(config_mod.Provider).initEmpty();
         for (result.sources.items) |source| switch (source) {
-            .openai_compatible => |provider| {
-                if (!refreshed.contains(provider)) {
-                    dropModelsForProvider(self, provider);
-                    refreshed.insert(provider);
+            .openai_compatible => |conn| {
+                if (!refreshed.contains(conn.provider)) {
+                    dropModelsForProvider(self, conn.provider);
+                    refreshed.insert(conn.provider);
                 }
             },
             .openai_codex => {},
@@ -94,7 +94,11 @@ pub fn restoreModelCache(self: *App) !bool {
     provider_model.codexModelsClear(self);
     for (cached.items.items) |*record| {
         try self.pickers.models.append(self.gpa, record.model, record.source);
+        // Model ve source artık entry'ye taşındı (struct field'ları alias
+        // ediyor); sahipliği devret ve cached.deinit'in onları tekrar free
+        // etmesini önle.
         record.model = .{ .id = &.{}, .label = &.{} };
+        record.source = .openai_codex;
     }
     if (self.isCodexSignedIn()) try provider_model.loadCodexStaticCatalog(self);
     if (self.pickers.models.len() == 0) return false;
@@ -133,20 +137,38 @@ pub fn collectModelCacheConfigured(self: *App) !std.ArrayList(model_cache.Config
             .anonymous
         else
             continue;
-        try list.append(self.gpa, .{ .provider = provider, .base_url = base_url, .auth_mode = auth_mode });
+        try list.append(self.gpa, .{
+            .provider = provider,
+            .base_url = base_url,
+            .auth_mode = auth_mode,
+            .auth_key_id = provider.label(),
+        });
     }
 
     if (provider_model.shouldLoadConfiguredCompatibleCatalog(self)) {
         if (self.cached_config.model_selection) |ms| {
             const provider = ms.provider();
             if (!provider.isCatalogue()) {
-                try list.append(self.gpa, .{ .provider = provider, .base_url = ms.baseUrl().?, .auth_mode = .keyed });
+                // Dynamic/config provider: auth_key_id serialize edilmiş
+                // provider_name'dir (ör. "stepfun-ai"), böylece restart sonrası
+                // cache doğru dynamic provider'a eşleşir.
+                try list.append(self.gpa, .{
+                    .provider = provider,
+                    .base_url = ms.baseUrl().?,
+                    .auth_mode = .keyed,
+                    .auth_key_id = ms.providerName(),
+                });
             }
         }
     }
 
     if (config_mod.Provider.ollama.defaultBaseUrl()) |base_url| {
-        try list.append(self.gpa, .{ .provider = .ollama, .base_url = base_url, .auth_mode = .anonymous });
+        try list.append(self.gpa, .{
+            .provider = .ollama,
+            .base_url = base_url,
+            .auth_mode = .anonymous,
+            .auth_key_id = "ollama",
+        });
     }
 
     return list;

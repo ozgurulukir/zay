@@ -44,6 +44,11 @@ pub const AgentRuntime = struct {
     /// MCP tool schemas to inject into the AI config at connection time.
     /// Set by the App before calling connectXxxClient.
     mcp_tools: []const ai.McpToolSchema = &.{},
+    /// Whether to send OpenAI strict structured-outputs mode in tool
+    /// definitions. Forwarded to every attached client's `ai.Config`.
+    /// Default `false` — strict is OpenAI-only and breaks function-calling
+    /// on gateways. Set from `config.strict_outputs` at session init.
+    strict_outputs: bool = false,
     /// Context window and compaction settings from config. Stored so
     /// the attach/connect functions can pass the override to
     /// `compaction.contextWindowTokens` and the agent can use the
@@ -83,6 +88,31 @@ pub const AgentRuntime = struct {
                 .openai_compatible => |client| .{ .openai_compatible = client },
                 .openai_responses => |client| .{ .openai_responses = client },
             };
+        }
+
+        /// Rebuild the client's serialized tool list from the registry
+        /// (builtin + plugin tools) and the MCP schemas. Every concrete
+        /// client exposes `updateMcpTools` with the same signature; this
+        /// helper dispatches through the union so `replaceClient` can push
+        /// the current tool set into the freshly-attached client without
+        /// the attach functions each repeating the call.
+        ///
+        /// Without this, a newly-attached client keeps the `tools_json`
+        /// it built at `init` time (builtin only) and never learns about
+        /// `lua__<plugin>__<tool>` entries — so the model can't see plugin
+        /// tools and tries to invoke them as shell commands
+        /// (`bash: lua__write-tool__edit: command not found`).
+        fn updateMcpTools(
+            self: OwnedClient,
+            mcp_tools: []const ai.McpToolSchema,
+            registry: ?*tools_mod.ToolRegistry,
+            builtin_override: []const tools_mod.Tool,
+        ) !void {
+            switch (self) {
+                .codex_responses => |client| try client.updateMcpTools(mcp_tools, registry, builtin_override),
+                .openai_compatible => |client| try client.updateMcpTools(mcp_tools, registry, builtin_override),
+                .openai_responses => |client| try client.updateMcpTools(mcp_tools, registry, builtin_override),
+            }
         }
     };
 
@@ -161,6 +191,7 @@ pub const AgentRuntime = struct {
             .agent = undefined,
             .diagnostics = diagnostics,
             .codex_connection_expired = false,
+            .strict_outputs = config.strict_outputs orelse false,
             .context_settings = config.context,
         };
 
@@ -517,6 +548,7 @@ pub const AgentRuntime = struct {
             .tools = tools_mod.builtinRegistry(),
             .mcp_tools = self.mcp_tools,
             .reasoning = .{ .effort = effort, .summary = .auto },
+            .strict = self.strict_outputs,
             .account_id = credentials.account_id,
             .session_id = self.session_writer.session.id.slice(),
             .system_prompt = self.system_prompt,
@@ -607,6 +639,7 @@ pub const AgentRuntime = struct {
             .tools = tools_mod.builtinRegistry(),
             .mcp_tools = self.mcp_tools,
             .reasoning = .{ .effort = effort },
+            .strict = self.strict_outputs,
             .max_output_tokens = self.context_settings.max_output_tokens,
             .max_parallel_tool_calls = self.context_settings.max_parallel_tool_calls orelse 16,
             .request_timeout_seconds = self.context_settings.request_timeout_seconds orelse 300,
@@ -663,6 +696,7 @@ pub const AgentRuntime = struct {
             .tools = tools_mod.builtinRegistry(),
             .mcp_tools = self.mcp_tools,
             .reasoning = reasoning,
+            .strict = self.strict_outputs,
             .session_id = self.session_writer.session.id.slice(),
             .system_prompt = self.system_prompt,
         });
@@ -729,6 +763,14 @@ pub const AgentRuntime = struct {
         self.client = next.languageModel();
         self.agent.client = self.client;
         self.assertClientInvariant();
+        // The client built its `tools_json` from builtin + mcp_tools only.
+        // Rebuild it now from the live registry so plugin tools
+        // (`lua__<plugin>__<tool>`) are visible to the model on the next
+        // prompt. Best-effort: a failure leaves the builtin-only set and is
+        // logged — the attach itself already succeeded.
+        next.updateMcpTools(self.mcp_tools, self.agent.tool_registry, &.{}) catch |err| {
+            std.log.warn("replaceClient: updateMcpTools failed: {s}", .{@errorName(err)});
+        };
     }
 
     /// Install the dedicated background-summarizer client, replacing any
@@ -769,6 +811,58 @@ pub const AgentRuntime = struct {
 };
 fn codexRefreshNeeded(expires_ms: i64, now_ms: i64) bool {
     return expires_ms <= now_ms + codex_refresh_margin_ms;
+}
+
+test "OwnedClient.updateMcpTools pushes plugin tools into a freshly-attached client" {
+    // Regression for the user-reported "lua__write-tool__edit: command not
+    // found" bug: a newly-attached client built `tools_json` from builtin +
+    // mcp_tools only, so plugin tools never reached the model and it tried
+    // to invoke them as shell commands. `replaceClient` now calls
+    // `OwnedClient.updateMcpTools` with the live registry right after the
+    // client is attached — this test pins that dispatch in place by driving
+    // the helper directly with an openai_compatible client + a registry
+    // carrying one plugin tool.
+    const gpa = std.testing.allocator;
+
+    var client = try gpa.create(ai.openai_compatible.Client);
+    try client.init(gpa, std.testing.io, .{
+        .base_url = "https://example.invalid",
+        .api_key = "test-key",
+        .model = "test-model",
+        .tools = tools_mod.builtinRegistry(),
+        .mcp_tools = &.{},
+        .session_id = "test",
+        .system_prompt = "",
+    });
+    defer {
+        client.deinit();
+        gpa.destroy(client);
+    }
+
+    // Plugin tools are absent from the initial tools_json (builtin only).
+    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "lua__p__t") == null);
+
+    const reg = try gpa.create(tools_mod.ToolRegistry);
+    defer {
+        reg.deinit(gpa);
+        gpa.destroy(reg);
+    }
+    reg.* = tools_mod.ToolRegistry.init(tools_mod.builtinRegistry());
+    const owned_name = try gpa.dupe(u8, "lua__p__t");
+    const owned_desc = try gpa.dupe(u8, "test");
+    try reg.addPluginTool(gpa, .{
+        .name = owned_name,
+        .description = owned_desc,
+        .schema = .{ .properties = &.{} },
+        .run = undefined,
+        .display = undefined,
+    });
+
+    // The exact dispatch path `replaceClient` now uses.
+    const owned: AgentRuntime.OwnedClient = .{ .openai_compatible = client };
+    try owned.updateMcpTools(&.{}, reg, &.{});
+
+    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "lua__p__t") != null);
 }
 
 test "codex refresh starts before token expiry" {

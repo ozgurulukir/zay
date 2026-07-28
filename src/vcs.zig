@@ -129,7 +129,6 @@ const Captured = struct {
     }
 };
 
-
 /// Run one git subcommand in `cwd`. `args` must NOT include the binary — it is
 /// prepended here. `env` overrides the child environment (used to point
 /// `GIT_INDEX_FILE` at the dedicated snapshot index); null inherits this

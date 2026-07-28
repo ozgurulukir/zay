@@ -6,7 +6,37 @@ const config_mod = @import("../config/config.zig");
 const openai_compatible_mod = @import("../ai/openai_compatible.zig");
 const symbols = @import("../symbols.zig");
 
-pub const ModelSource = union(enum) { openai_codex, openai_compatible: config_mod.Provider };
+/// Bir modelin provenance'ı + bağlantı bilgisi. Entry ile birlikte dolaşır;
+/// `applySelectedModel` cached_config'in global tek değerine bakmadan bunu
+/// kullanır. Önceki `openai_compatible: Provider` armı dynamic/config
+/// provider'larını `.openai_compatible` enum'ına çöktürdüğü için çoklu
+/// provider kataloğunda yanlış provider'a bağlanmaya yol açıyordu —
+/// `base_url` + `auth_key_id` artık modelle birlikte taşındığından
+/// uyuşmazlık temsil edilemez.
+pub const ModelSource = union(enum) {
+    openai_codex,
+    openai_compatible: Compatible,
+
+    pub fn deinit(self: ModelSource, gpa: std.mem.Allocator) void {
+        switch (self) {
+            .openai_codex => {},
+            .openai_compatible => |conn| {
+                gpa.free(conn.base_url);
+                gpa.free(conn.auth_key_id);
+            },
+        }
+    }
+};
+
+/// Bir OpenAI-uyumlu provider'a bağlanmak için gereken üç bilgi: provider enum
+/// (display/default-URL fallback için), tam `base_url` (bağlantı için), ve
+/// auth.json anahtar kimliği (API key çözümlemesi için). Bir modelden
+/// ayrılamazlar — entry ile construction sırasında bağlanırlar.
+pub const Compatible = struct {
+    provider: config_mod.Provider,
+    base_url: []const u8,
+    auth_key_id: []const u8,
+};
 
 pub const Catalog = enum {
     connected_provider,
@@ -31,6 +61,7 @@ pub const Result = struct {
     pub fn deinit(self: *Result, gpa: std.mem.Allocator) void {
         for (self.models.items) |*model| model.deinit(gpa);
         self.models.deinit(gpa);
+        for (self.sources.items) |*source| source.deinit(gpa);
         self.sources.deinit(gpa);
         self.outcomes.deinit(gpa);
         self.* = undefined;
@@ -58,6 +89,10 @@ pub const Configured = struct {
     base_url: []u8, // gpa-owned
     api_key: []u8, // gpa-owned
     display_name: ?[]u8 = null, // gpa-owned
+    /// auth.json anahtar kimliği. Katalog provider'ları için `provider.label()`,
+    /// dynamic/config provider'ları için provider id'si (ör. "stepfun-ai").
+    /// null → `provider.label()`'a düşer (katalog provider'ları için).
+    auth_key_id: ?[]u8 = null, // gpa-owned
 };
 
 /// Snapshot of everything the worker needs. Owned by the job and freed when
@@ -79,6 +114,7 @@ pub const Job = struct {
             self.gpa.free(c.base_url);
             self.gpa.free(c.api_key);
             if (c.display_name) |d| self.gpa.free(d);
+            if (c.auth_key_id) |id| self.gpa.free(id);
         }
         if (self.configured.len > 0) self.gpa.free(self.configured);
         self.* = undefined;
@@ -164,7 +200,12 @@ fn loadConfigured(job: *Job, configured: Configured, result: *Result) !void {
         const label = try std.fmt.allocPrint(job.gpa, "{s}{s}{s}", .{ prefix_name, symbols.separator_dot_padded, entry.id });
         errdefer job.gpa.free(label);
         try result.models.append(job.gpa, .{ .id = id, .label = label });
-        try result.sources.append(job.gpa, .{ .openai_compatible = configured.provider });
+        try result.sources.append(job.gpa, .{ .openai_compatible = try compatibleSource(
+            job.gpa,
+            configured.provider,
+            base_url,
+            configured.auth_key_id,
+        ) });
     }
 }
 
@@ -183,8 +224,29 @@ fn loadLocal(job: *Job, provider: config_mod.Provider, result: *Result) !void {
         const label = try std.fmt.allocPrint(job.gpa, "{s}{s}{s}", .{ providerModelLabel(provider), symbols.separator_dot_padded, entry.id });
         errdefer job.gpa.free(label);
         try result.models.append(job.gpa, .{ .id = id, .label = label });
-        try result.sources.append(job.gpa, .{ .openai_compatible = provider });
+        try result.sources.append(job.gpa, .{ .openai_compatible = try compatibleSource(
+            job.gpa,
+            provider,
+            base_url,
+            providerLocalApiKey(provider),
+        ) });
     }
+}
+
+/// Bir `Compatible` source'u gpa-owned `base_url` + `auth_key_id` ile kurar.
+/// `auth_key_id` null ise `provider.label()`'a düşer (katalog provider'ları
+/// auth.json'a label'larıyla kaydolur). Caller (Entry/Record) `source.deinit`
+/// ile string'leri serbest bırakır.
+pub fn compatibleSource(
+    gpa: std.mem.Allocator,
+    provider: config_mod.Provider,
+    base_url: []const u8,
+    auth_key_id: ?[]const u8,
+) !Compatible {
+    const owned_url = try gpa.dupe(u8, base_url);
+    errdefer gpa.free(owned_url);
+    const owned_key = try gpa.dupe(u8, auth_key_id orelse provider.label());
+    return .{ .provider = provider, .base_url = owned_url, .auth_key_id = owned_key };
 }
 
 fn loadStatic(job: *Job, result: *Result) !void {

@@ -129,6 +129,7 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
         if (updates.provider) |v| target.provider = v;
         if (updates.use_responses_endpoint) |v| target.use_responses_endpoint = v;
         if (updates.enable_thinking) |v| target.enable_thinking = v;
+        if (updates.strict_outputs) |v| target.strict_outputs = v;
         if (updates.base_url) |s| try replaceOptionalSlice(gpa, &target.base_url, s);
         if (updates.api_key) |s| try replaceOptionalSlice(gpa, &target.api_key, s);
         if (updates.bash_classifier_url) |s| try replaceOptionalSlice(gpa, &target.bash_classifier_url, s);
@@ -518,6 +519,7 @@ fn parseObject(
     }
     if (boolFieldCompat(value, "useResponsesEndpoint", "use_responses_endpoint")) |b| out.use_responses_endpoint = b;
     if (boolFieldCompat(value, "enableThinking", "enable_thinking")) |b| out.enable_thinking = b;
+    if (boolFieldCompat(value, "strictOutputs", "strict_outputs")) |b| out.strict_outputs = b;
     if (stringFieldCompat(value, "systemPrompt", "system_prompt")) |s| {
         out.system_prompt = try gpa.dupe(u8, s);
     }
@@ -835,6 +837,9 @@ fn loadEnv(
     if (env.get("NOVA_ENABLE_THINKING")) |s| {
         out.enable_thinking = parseBool(s);
     }
+    if (env.get("NOVA_STRICT_OUTPUTS")) |s| {
+        out.strict_outputs = parseBool(s);
+    }
     if (env.get("OPENAI_MODEL")) |raw| {
         if (parseModelSelection(gpa, raw)) |parsed| {
             out.provider = parsed.provider;
@@ -1093,6 +1098,10 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
         }
         if (config.enable_thinking) |b| {
             try writeKey(writer, "enableThinking", &wrote_any);
+            try writer.writeAll(if (b) "true" else "false");
+        }
+        if (config.strict_outputs) |b| {
+            try writeKey(writer, "strictOutputs", &wrote_any);
             try writer.writeAll(if (b) "true" else "false");
         }
         if (config.model) |m| {
@@ -1711,6 +1720,7 @@ test "serialize then parse roundtrips" {
         .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
         .use_responses_endpoint = false,
         .enable_thinking = true,
+        .strict_outputs = true,
         .model = .{ .id = try gpa.dupe(u8, "llama3.1:8b") },
         .providers = providers,
     };
@@ -1733,6 +1743,7 @@ test "serialize then parse roundtrips" {
     try std.testing.expectEqualStrings("http://localhost:11434/v1", roundtrip.base_url.?);
     try std.testing.expectEqual(false, roundtrip.use_responses_endpoint.?);
     try std.testing.expectEqual(true, roundtrip.enable_thinking.?);
+    try std.testing.expectEqual(true, roundtrip.strict_outputs.?);
     try std.testing.expectEqualStrings("llama3.1:8b", roundtrip.model.?.id);
 }
 

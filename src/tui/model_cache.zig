@@ -8,7 +8,10 @@ const model_loader = @import("model_loader.zig");
 
 const assert = std.debug.assert;
 const file_bytes_max: u32 = 2 * 1024 * 1024;
-const version_current: u32 = 1;
+/// v2: provider blokları artık `authKeyId` taşıyor (dynamic provider'ları
+/// ayırt etmek için). v1 cache `authKeyId` olmadan gelir; parse configured
+/// lookup'tan geri çözer.
+const version_current: u32 = 2;
 
 pub const AuthMode = enum {
     anonymous,
@@ -28,6 +31,9 @@ pub const Configured = struct {
     provider: config_mod.Provider,
     base_url: []const u8,
     auth_mode: AuthMode,
+    /// auth.json anahtar kimliği (katalog → label, dynamic → id). dynamic
+    /// provider'ları birbirinden ayırt etmek için serialize edilir.
+    auth_key_id: ?[]const u8 = null,
 };
 
 pub const Record = struct {
@@ -39,7 +45,10 @@ pub const Records = struct {
     items: std.ArrayList(Record) = .empty,
 
     pub fn deinit(self: *Records, gpa: std.mem.Allocator) void {
-        for (self.items.items) |*record| record.model.deinit(gpa);
+        for (self.items.items) |*record| {
+            record.model.deinit(gpa);
+            record.source.deinit(gpa);
+        }
         self.items.deinit(gpa);
         self.* = undefined;
     }
@@ -104,7 +113,9 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8, configured: []const Conf
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidCache;
     const version = intField(parsed.value, "version") orelse return error.InvalidCache;
-    if (version != version_current) return .{};
+    // v1 (authKeyId yok) geriye dönük uyumlu: parse authKeyId alanı yoksa
+    // configured lookup'tan çözer. Daha eski/bilinmeyen sürümler reddedilir.
+    if (version != 1 and version != version_current) return .{};
 
     var out: Records = .{};
     errdefer out.deinit(gpa);
@@ -121,9 +132,10 @@ fn parseProvider(gpa: std.mem.Allocator, out: *Records, value: std.json.Value, c
     const provider_label = stringField(value, "provider") orelse return;
     const base_url = stringField(value, "baseUrl") orelse return;
     const auth_mode_label = stringField(value, "authMode") orelse return;
+    const auth_key_id = stringField(value, "authKeyId");
     const provider = providerFromLabel(provider_label) orelse return;
     const auth_mode = authModeFromLabel(auth_mode_label) orelse return;
-    if (!containsConfigured(configured, provider, base_url, auth_mode)) return;
+    const matched = containsConfigured(configured, provider, base_url, auth_mode, auth_key_id) orelse return;
 
     const models = value.object.get("models") orelse return;
     if (models != .array) return;
@@ -137,7 +149,14 @@ fn parseProvider(gpa: std.mem.Allocator, out: *Records, value: std.json.Value, c
         errdefer gpa.free(label_copy);
         try out.items.append(gpa, .{
             .model = .{ .id = id_copy, .label = label_copy },
-            .source = .{ .openai_compatible = provider },
+            .source = .{
+                .openai_compatible = try model_loader.compatibleSource(
+                    gpa,
+                    provider,
+                    base_url,
+                    matched.auth_key_id,
+                ),
+            },
         });
     }
 }
@@ -151,7 +170,7 @@ fn serialize(writer: *std.Io.Writer, records: []const Record, configured: []cons
     try writer.writeByte('[');
     var wrote_provider = false;
     for (configured) |configured_provider| {
-        if (!hasRecordsForProvider(records, configured_provider.provider)) continue;
+        if (!hasRecordsForConfigured(records, configured_provider)) continue;
         if (wrote_provider) try writer.writeByte(',');
         try writeProvider(writer, records, configured_provider);
         wrote_provider = true;
@@ -169,11 +188,18 @@ fn writeProvider(writer: *std.Io.Writer, records: []const Record, configured: Co
     try std.json.Stringify.value(configured.base_url, .{}, writer);
     try writeKey(writer, "authMode", &wrote_key);
     try std.json.Stringify.value(configured.auth_mode.label(), .{}, writer);
+    // auth_key_id dynamic provider'ları (aynı .openai_compatible enum'ını
+    // paylaşan StepFun, Kimi, vb.) birbirinden ayırır. Katalog provider'ları
+    // için label'a eşittir; yine de yazılır ki restart'ta birebir eşleşsin.
+    if (configured.auth_key_id) |id| {
+        try writeKey(writer, "authKeyId", &wrote_key);
+        try std.json.Stringify.value(id, .{}, writer);
+    }
     try writeKey(writer, "models", &wrote_key);
     try writer.writeByte('[');
     var wrote_model = false;
     for (records) |record| {
-        if (!recordMatchesProvider(record, configured.provider)) continue;
+        if (!recordMatchesConfigured(record, configured)) continue;
         if (wrote_model) try writer.writeByte(',');
         try writer.writeByte('{');
         var wrote_model_key = false;
@@ -188,28 +214,44 @@ fn writeProvider(writer: *std.Io.Writer, records: []const Record, configured: Co
     try writer.writeByte('}');
 }
 
-fn hasRecordsForProvider(records: []const Record, provider: config_mod.Provider) bool {
+fn hasRecordsForConfigured(records: []const Record, configured: Configured) bool {
     for (records) |record| {
-        if (recordMatchesProvider(record, provider)) return true;
+        if (recordMatchesConfigured(record, configured)) return true;
     }
     return false;
 }
 
-fn recordMatchesProvider(record: Record, provider: config_mod.Provider) bool {
+/// Bir record configured'a provider + base_url + auth_key_id üçlüsüyle
+/// eşleşiyorsa true. Dynamic provider'lar `.openai_compatible` enum'ını
+/// paylaştığından, yalnızca provider enum karşılaştırmak onları birleştirirdi;
+/// base_url + auth_key_id ayırt eder.
+fn recordMatchesConfigured(record: Record, configured: Configured) bool {
     return switch (record.source) {
-        .openai_compatible => |record_provider| record_provider == provider,
+        .openai_compatible => |conn| blk: {
+            if (conn.provider != configured.provider) break :blk false;
+            if (!std.mem.eql(u8, conn.base_url, configured.base_url)) break :blk false;
+            const cfg_id = configured.auth_key_id orelse configured.provider.label();
+            break :blk std.mem.eql(u8, conn.auth_key_id, cfg_id);
+        },
         .openai_codex => false,
     };
 }
 
-fn containsConfigured(configured: []const Configured, provider: config_mod.Provider, base_url: []const u8, auth_mode: AuthMode) bool {
+/// Eşleşen configured kaydını döndürür (auth_key_id çözümlemek için), yoksa
+/// null. `auth_key_id` null (eski v1 cache) ise provider+base_url+auth_mode
+/// eşleşmesi yeterli; `auth_key_id` dolu ise (v2 cache) o da eşleşmeli.
+fn containsConfigured(configured: []const Configured, provider: config_mod.Provider, base_url: []const u8, auth_mode: AuthMode, auth_key_id: ?[]const u8) ?Configured {
     for (configured) |entry| {
         if (entry.provider != provider) continue;
         if (entry.auth_mode != auth_mode) continue;
         if (!std.mem.eql(u8, entry.base_url, base_url)) continue;
-        return true;
+        if (auth_key_id) |id| {
+            const entry_id = entry.auth_key_id orelse continue;
+            if (!std.mem.eql(u8, entry_id, id)) continue;
+        }
+        return entry;
     }
-    return false;
+    return null;
 }
 
 fn providerFromLabel(label: []const u8) ?config_mod.Provider {
@@ -255,13 +297,57 @@ fn path(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
 
 test "parse keeps only currently configured provider models" {
     const gpa = std.testing.allocator;
-    const configured = [_]Configured{.{ .provider = .openrouter, .base_url = "https://openrouter.ai/api", .auth_mode = .keyed }};
+    const configured = [_]Configured{.{ .provider = .openrouter, .base_url = "https://openrouter.ai/api", .auth_mode = .keyed, .auth_key_id = "openrouter" }};
     var records = try parse(gpa,
-        \\{"version":1,"providers":[{"provider":"openrouter","baseUrl":"https://openrouter.ai/api","authMode":"keyed","models":[{"id":"m","label":"OpenRouter · m"}]},{"provider":"cerebras","baseUrl":"https://api.cerebras.ai/v1","authMode":"keyed","models":[{"id":"c"}]}]}
+        \\{"version":2,"providers":[{"provider":"openrouter","baseUrl":"https://openrouter.ai/api","authMode":"keyed","authKeyId":"openrouter","models":[{"id":"m","label":"OpenRouter · m"}]},{"provider":"cerebras","baseUrl":"https://api.cerebras.ai/v1","authMode":"keyed","authKeyId":"cerebras","models":[{"id":"c"}]}]}
     , &configured);
     defer records.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 1), records.items.items.len);
     try std.testing.expectEqualStrings("m", records.items.items[0].model.id);
-    try std.testing.expectEqual(model_loader.ModelSource{ .openai_compatible = .openrouter }, records.items.items[0].source);
+    const conn = records.items.items[0].source.openai_compatible;
+    try std.testing.expectEqual(config_mod.Provider.openrouter, conn.provider);
+    try std.testing.expectEqualStrings("https://openrouter.ai/api", conn.base_url);
+    try std.testing.expectEqualStrings("openrouter", conn.auth_key_id);
+}
+
+test "parse distinguishes dynamic providers sharing the openai_compatible enum" {
+    // İki dynamic provider (StepFun + Kimi) aynı .openai_compatible enum'ını
+    // paylaşır. authKeyId olmadan birleştirilirlerdi; v2 şema auth_key_id ile
+    // ayırt eder. Bu, multi-provider kataloğundaki eşleşme hatasının cache
+    // tarafındaki tezahürüdür.
+    const gpa = std.testing.allocator;
+    const configured = [_]Configured{
+        .{ .provider = .openai_compatible, .base_url = "https://api.stepfun.com/v1", .auth_mode = .keyed, .auth_key_id = "stepfun-ai" },
+        .{ .provider = .openai_compatible, .base_url = "https://api.moonshot.cn/v1", .auth_mode = .keyed, .auth_key_id = "moonshot" },
+    };
+    var records = try parse(gpa,
+        \\{"version":2,"providers":[
+        \\  {"provider":"openai_compatible","baseUrl":"https://api.stepfun.com/v1","authMode":"keyed","authKeyId":"stepfun-ai","models":[{"id":"step-1"}]},
+        \\  {"provider":"openai_compatible","baseUrl":"https://api.moonshot.cn/v1","authMode":"keyed","authKeyId":"moonshot","models":[{"id":"kimi"}]}
+        \\]}
+    , &configured);
+    defer records.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 2), records.items.items.len);
+    // Her iki record da kendi base_url + auth_key_id'sini taşır — cache
+    // restore edildikten sonra applySelectedModel yanlış provider'a gitmez.
+    const ids = [_][]const u8{ records.items.items[0].source.openai_compatible.auth_key_id, records.items.items[1].source.openai_compatible.auth_key_id };
+    try std.testing.expect(
+        std.mem.eql(u8, ids[0], "stepfun-ai") or std.mem.eql(u8, ids[0], "moonshot"),
+    );
+    try std.testing.expect(ids[0].len != ids[1].len or !std.mem.eql(u8, ids[0], ids[1]));
+}
+
+test "parse v1 cache (no authKeyId) resolves auth_key_id from configured label" {
+    // Eski v1 cache geriye dönük uyumlu: authKeyId yok, configured.label'a düşer.
+    const gpa = std.testing.allocator;
+    const configured = [_]Configured{.{ .provider = .openrouter, .base_url = "https://openrouter.ai/api", .auth_mode = .keyed }};
+    var records = try parse(gpa,
+        \\{"version":1,"providers":[{"provider":"openrouter","baseUrl":"https://openrouter.ai/api","authMode":"keyed","models":[{"id":"m","label":"OpenRouter · m"}]}]}
+    , &configured);
+    defer records.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), records.items.items.len);
+    try std.testing.expectEqualStrings("openrouter", records.items.items[0].source.openai_compatible.auth_key_id);
 }

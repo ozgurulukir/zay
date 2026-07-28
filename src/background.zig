@@ -477,7 +477,6 @@ fn formatElapsed(buf: []u8, total_seconds: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d}h {d:0>2}m", .{ hours, rem_minutes }) catch "?";
 }
 
-
 /// Kill a job's whole process tree by pid. Best-effort and side-effect free on
 /// the caller's data — runs outside the manager lock.
 fn terminateTree(io: std.Io, gpa: std.mem.Allocator, pid: i64) void {

@@ -245,7 +245,7 @@ pub const TurnView = struct {
         return visible_change;
     }
 
-fn applyToolPreview(
+    fn applyToolPreview(
         self: *TurnView,
         gpa: std.mem.Allocator,
         transcript: *transcript_mod.Transcript,

@@ -69,6 +69,12 @@ pub const Config = struct {
     /// Socket-level read timeout in seconds for streaming responses.
     /// Prevents indefinite hangs when the server stops mid-stream.
     request_timeout_seconds: u32 = 300,
+    /// Structured-outputs mode. `true` only works against the OpenAI API;
+    /// gateways (OpenRouter/Ollama/vLLM/Together) reject or silently break
+    /// strict schemas, which disables function-calling — the model then
+    /// emits tool calls as plain text instead of `tool_calls` deltas.
+    /// Default `false` keeps tool-calling working everywhere.
+    strict: bool = false,
     account_id: []const u8 = "",
     session_id: []const u8 = "",
     system_prompt: []const u8 = "You are a helpful assistant.",

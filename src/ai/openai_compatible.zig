@@ -24,6 +24,12 @@ pub const Client = struct {
     url: []u8,
     authorization: ?[]u8,
     tools_json: []u8,
+    /// Whether tool definitions carry OpenAI strict structured-outputs mode.
+    /// Captured at `init` so `updateMcpTools` can rebuild `tools_json`
+    /// consistently without the caller re-passing it. Default `false` —
+    /// strict mode is OpenAI-only and silently breaks function-calling on
+    /// gateways (OpenRouter/Ollama/vLLM).
+    strict: bool = false,
     http_client: std.http.Client,
     /// Monotonic counter for synthesised tool_call ids when the inference
     /// server omits them. OpenAI's protocol requires stable ids linking
@@ -62,7 +68,7 @@ pub const Client = struct {
         owned_config.session_id = try gpa.dupe(u8, config.session_id);
         errdefer gpa.free(owned_config.session_id);
 
-        const tools_json = try buildAllToolsJson(gpa, config.tools, config.mcp_tools, null);
+        const tools_json = try buildAllToolsJson(gpa, config.tools, config.mcp_tools, null, config.strict);
         errdefer gpa.free(tools_json);
 
         target.* = .{
@@ -72,6 +78,7 @@ pub const Client = struct {
             .url = url,
             .authorization = authorization,
             .tools_json = tools_json,
+            .strict = config.strict,
             .http_client = .{ .allocator = gpa, .io = io },
         };
     }
@@ -102,7 +109,7 @@ pub const Client = struct {
         registry: ?*tools_mod.ToolRegistry,
         builtin_override: []const tools_common.Tool,
     ) !void {
-        const new_json = try buildAllToolsJson(self.gpa, builtin_override, mcp_tools, registry);
+        const new_json = try buildAllToolsJson(self.gpa, builtin_override, mcp_tools, registry, self.strict);
         self.gpa.free(self.tools_json);
         self.tools_json = new_json;
     }
@@ -272,6 +279,7 @@ fn buildAllToolsJson(
     tools: []const tools_common.Tool,
     mcp_tools: []const ai.McpToolSchema,
     registry: ?*tools_mod.ToolRegistry,
+    strict: bool,
 ) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
@@ -281,20 +289,20 @@ fn buildAllToolsJson(
     for (tools) |tool| {
         if (!first) try writer.writeByte(',');
         first = false;
-        try writeToolDefinition(gpa, writer, tool.name, tool.description, tool.schema);
+        try writeToolDefinition(gpa, writer, tool.name, tool.description, tool.schema, strict);
     }
     if (registry) |r| {
         const plugin_slice = try r.all(gpa);
         for (plugin_slice) |tool| {
             if (!first) try writer.writeByte(',');
             first = false;
-            try writeToolDefinition(gpa, writer, tool.name, tool.description, tool.schema);
+            try writeToolDefinition(gpa, writer, tool.name, tool.description, tool.schema, strict);
         }
     }
     for (mcp_tools) |mcp| {
         if (!first) try writer.writeByte(',');
         first = false;
-        try writeToolDefinition(gpa, writer, mcp.name, mcp.description, mcp.schema);
+        try writeToolDefinition(gpa, writer, mcp.name, mcp.description, mcp.schema, strict);
     }
     try writer.writeByte(']');
     return aw.toOwnedSlice();
@@ -306,6 +314,7 @@ fn writeToolDefinition(
     name: []const u8,
     description: []const u8,
     schema: tools_common.Schema,
+    strict: bool,
 ) !void {
     const desc = try std.mem.replaceOwned(u8, gpa, description, "{{hsep}}", "~");
     defer gpa.free(desc);
@@ -313,8 +322,16 @@ fn writeToolDefinition(
     try std.json.Stringify.value(name, .{}, writer);
     try writer.writeAll(",\"description\":");
     try std.json.Stringify.value(desc, .{}, writer);
-    try writer.writeAll(",\"strict\":true,");
-    try writer.writeAll("\"parameters\":{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{");
+    // Strict structured-outputs mode is OpenAI-only. Gateways that don't
+    // support it silently break function-calling, so it's opt-in via
+    // `ai.Config.strict`. The leading comma is always written so the next
+    // `parameters` key is a valid object member regardless of strict.
+    if (strict) {
+        try writer.writeAll(",\"strict\":true,\"parameters\":");
+    } else {
+        try writer.writeAll(",\"parameters\":");
+    }
+    try writer.writeAll("{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{");
     for (schema.properties, 0..) |prop, p| {
         if (p > 0) try writer.writeByte(',');
         try std.json.Stringify.value(prop.name, .{}, writer);
@@ -357,9 +374,17 @@ fn writeToolDefinition(
         }
         try writer.writeByte('}');
     }
+    // In strict mode OpenAI requires EVERY property in `required` (optional
+    // ones are made nullable above). Outside strict mode list only the
+    // genuinely-required properties so optional parameters stay optional —
+    // listing all of them forces the model to fill every field.
     try writer.writeAll("},\"required\":[");
-    for (schema.properties, 0..) |prop, i| {
-        if (i > 0) try writer.writeByte(',');
+    var required_first = true;
+    for (schema.properties) |prop| {
+        // Strict mode: all properties required. Non-strict: only required ones.
+        if (!strict and !prop.required) continue;
+        if (!required_first) try writer.writeByte(',');
+        required_first = false;
         try std.json.Stringify.value(prop.name, .{}, writer);
     }
     try writer.writeAll("]}}}");
@@ -551,7 +576,7 @@ fn writeRequestPayload(
 test "buildToolsJson produces a valid JSON array for the registry" {
     const tools = @import("../tools.zig");
     const gpa = std.testing.allocator;
-    const json = try buildAllToolsJson(gpa, tools.builtinRegistry(), &.{}, null);
+    const json = try buildAllToolsJson(gpa, tools.builtinRegistry(), &.{}, null, true);
     defer gpa.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
     defer parsed.deinit();
@@ -573,7 +598,7 @@ test "buildToolsJson substitutes {{hsep}} placeholders with ~" {
             .display = undefined,
         },
     };
-    const json = try buildAllToolsJson(gpa, &tools, &.{}, null);
+    const json = try buildAllToolsJson(gpa, &tools, &.{}, null, false);
     defer gpa.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "uses ~ marker") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "{{hsep}}") == null);
@@ -597,7 +622,7 @@ test "buildAllToolsJson includes MCP tools alongside builtin tools" {
             .schema = .{ .properties = &.{} },
         },
     };
-    const json = try buildAllToolsJson(gpa, &tools, &mcp_tools, null);
+    const json = try buildAllToolsJson(gpa, &tools, &mcp_tools, null, false);
     defer gpa.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
     defer parsed.deinit();
@@ -747,7 +772,7 @@ test "buildToolsJson emits strict schema with nullable union types for optional 
             .display = undefined,
         },
     };
-    const json = try buildAllToolsJson(gpa, &tools, &.{}, null);
+    const json = try buildAllToolsJson(gpa, &tools, &.{}, null, true);
     defer gpa.free(json);
 
     // Top-level strict marker and top-level additionalProperties:false
@@ -779,6 +804,54 @@ test "buildToolsJson emits strict schema with nullable union types for optional 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_arr\"") != null);
 }
 
+test "buildToolsJson omits strict mode and filters required when strict is false (gateway compatibility)" {
+    // Regression for the "model emits tool calls as plain text" bug:
+    // gateways (OpenRouter/Ollama/vLLM) reject or silently break OpenAI
+    // strict structured-outputs mode, which disables function-calling.
+    // With strict=false the schema must (a) NOT carry "strict":true and
+    // (b) list only genuinely-required properties in `required`.
+    const gpa = std.testing.allocator;
+    const tools = [_]tools_common.Tool{
+        .{
+            .name = "demo",
+            .description = "Demo",
+            .schema = .{
+                .properties = &.{
+                    .{ .name = "required_str", .kind = .string, .description = "Required", .required = true, .nullable = false },
+                    .{ .name = "optional_str", .kind = .string, .description = "Optional", .required = false, .nullable = true },
+                    .{ .name = "optional_int", .kind = .integer, .description = "Optional", .required = false, .nullable = true },
+                },
+            },
+            .run = undefined,
+            .display = undefined,
+        },
+    };
+    const json = try buildAllToolsJson(gpa, &tools, &.{}, null, false);
+    defer gpa.free(json);
+
+    // No strict marker.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"strict\"") == null);
+    // Only the required property is required — optionals stay optional.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"required_str\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "optional_str") != null);
+    // Optionals still listed in properties (nullable unions preserved).
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_str\":{\"type\":[\"string\",\"null\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_int\":{\"type\":[\"integer\",\"null\"]") != null);
+    // Empty `required` (no required props) is still valid JSON.
+    const no_required_tools = [_]tools_common.Tool{
+        .{
+            .name = "noargs",
+            .description = "No args",
+            .schema = .{ .properties = &.{} },
+            .run = undefined,
+            .display = undefined,
+        },
+    };
+    const json2 = try buildAllToolsJson(gpa, &no_required_tools, &.{}, null, false);
+    defer gpa.free(json2);
+    try std.testing.expect(std.mem.indexOf(u8, json2, "\"required\":[]") != null);
+}
+
 test "buildToolsJson preserves nested object additionalProperties for free-form env" {
     const gpa = std.testing.allocator;
     const tools = [_]tools_common.Tool{
@@ -795,7 +868,7 @@ test "buildToolsJson preserves nested object additionalProperties for free-form 
             .display = undefined,
         },
     };
-    const json = try buildAllToolsJson(gpa, &tools, &.{}, null);
+    const json = try buildAllToolsJson(gpa, &tools, &.{}, null, true);
     defer gpa.free(json);
 
     // Top-level parameters object is strict

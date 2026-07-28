@@ -31,6 +31,11 @@
       "default": false,
       "description": "Enable extended thinking / reasoning mode. Legacy key 'enable_thinking' is also accepted."
     },
+    "strictOutputs": {
+      "type": "boolean",
+      "default": false,
+      "description": "Send OpenAI strict structured-outputs mode in tool definitions. Only works against the OpenAI API — gateways (OpenRouter/Ollama/vLLM/Together) reject or silently break it, disabling function-calling. Enable only when talking directly to OpenAI. Legacy key 'strict_outputs' is also accepted."
+    },
     "systemPrompt": {
       "type": "string",
       "maxLength": 10000,

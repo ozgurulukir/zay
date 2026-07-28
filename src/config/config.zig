@@ -120,6 +120,12 @@ pub const Config = struct {
     use_responses_endpoint: ?bool = null,
     enable_thinking: ?bool = null,
     system_prompt: ?[]u8 = null,
+    /// Whether to send OpenAI strict structured-outputs mode in tool
+    /// definitions. Default `false` — strict mode is OpenAI-only and
+    /// silently breaks function-calling on gateways (OpenRouter/Ollama/
+    /// vLLM), causing the model to emit tool calls as plain text. Enable
+    /// only when talking directly to the OpenAI API.
+    strict_outputs: ?bool = null,
     /// Context window management and compaction policy.
     context: ContextSettings = .{},
     /// Typed view of the model selection. `null` when the required
@@ -169,6 +175,7 @@ pub const Config = struct {
             .provider = self.provider,
             .use_responses_endpoint = self.use_responses_endpoint,
             .enable_thinking = self.enable_thinking,
+            .strict_outputs = self.strict_outputs,
             .context = self.context,
         };
         errdefer out.deinit(gpa);

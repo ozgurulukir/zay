@@ -3,6 +3,6 @@
   "useResponsesEndpoint": false,
   "enableThinking": false,
   "defaultModel": "ollama/llama3",
-  "providers": {"ollama":{"baseURL":"http://localhost:11434",
+  "providers": {"ollama":{"baseURL":"http://localhost:11434/v1",
   "models": {"llama3":{"reasoningEffort":"default"}}}}
 }

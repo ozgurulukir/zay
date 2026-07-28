@@ -47,7 +47,7 @@ const HookData = struct {
 fn instructionHook(L: ?*c.lua_State, ar: [*c]c.lua_Debug) callconv(.c) void {
     _ = ar;
     const L_ptr = L orelse return;
-    const slot = @as(*?*HookData, @alignCast(@ptrCast(c.lua_getextraspace(L_ptr))));
+    const slot = @as(*?*HookData, @ptrCast(@alignCast(c.lua_getextraspace(L_ptr))));
     const data = slot.* orelse return;
     data.instruction_count += 1;
     if (data.instruction_count >= data.instruction_limit) {
@@ -74,7 +74,7 @@ pub fn createSandboxedStateWithIo(permissions: Permissions, io: ?std.Io) State {
     const L = c.luaL_newstate() orelse @panic("luaL_newstate returned null");
 
     // Initialize extraspace to null (no hook data yet)
-    @as(*?*HookData, @alignCast(@ptrCast(c.lua_getextraspace(L)))).* = null;
+    @as(*?*HookData, @ptrCast(@alignCast(c.lua_getextraspace(L)))).* = null;
 
     // Open all standard libraries
     c.luaL_openlibs(L);
@@ -236,14 +236,14 @@ fn setupInstructionHook(L: *c.lua_State, permissions: Permissions) void {
         .instruction_count = 0,
         .memory_limit = if (permissions.memory_limit_mb > 0) @as(usize, @intCast(permissions.memory_limit_mb)) * 1024 * 1024 else std.math.maxInt(usize),
     };
-    @as(*?*HookData, @alignCast(@ptrCast(c.lua_getextraspace(L)))).* = data;
+    @as(*?*HookData, @ptrCast(@alignCast(c.lua_getextraspace(L)))).* = data;
     c.lua_sethook(L, instructionHook, c.LUA_MASKCOUNT, 1000);
 }
 
 /// Free the hook data allocated in setupInstructionHook.
 /// Must be called before lua_close.
 pub fn freeHookData(L: *c.lua_State) void {
-    const slot = @as(*?*HookData, @alignCast(@ptrCast(c.lua_getextraspace(L))));
+    const slot = @as(*?*HookData, @ptrCast(@alignCast(c.lua_getextraspace(L))));
     if (slot.*) |data| {
         std.heap.page_allocator.destroy(data);
         slot.* = null;

@@ -1195,6 +1195,22 @@ fn findGitRoot(io: std.Io, cwd: []const u8) ![]u8 {
     return error.GitRootNotFound;
 }
 
+/// Test whether `name` matches the user-supplied `file_pattern`.
+///
+/// `file_pattern` is the loose glob the plugin passed (e.g. `"*.lua"`). It is
+/// matched as a suffix test:
+///   - empty  → matches everything (the historical segfault: `fp[1..]` indexed
+///     a zero-length slice and panicked with SIGABRT on `list_project_files("")`)
+///   - `"*x"` → strip the leading `*`, then suffix-match on `"x"`
+///   - `"x"`  → suffix-match verbatim
+///
+/// Kept as a free function so the suffix logic is unit-testable in isolation.
+fn fileNameMatches(name: []const u8, file_pattern: []const u8) bool {
+    if (file_pattern.len == 0) return true;
+    const suffix = if (file_pattern[0] == '*') file_pattern[1..] else file_pattern;
+    return std.mem.endsWith(u8, name, suffix);
+}
+
 /// Walk directory recursively and search for pattern.
 fn walkAndSearch(
     io: std.Io,
@@ -1225,7 +1241,7 @@ fn walkAndSearch(
             },
             .file => {
                 if (file_pattern) |fp| {
-                    if (!std.mem.endsWith(u8, entry.name, fp[1..])) continue;
+                    if (!fileNameMatches(entry.name, fp)) continue;
                 }
 
                 var file = std.Io.Dir.openFileAbsolute(io, full_path, .{}) catch continue;
@@ -1252,8 +1268,16 @@ fn walkAndSearch(
                         total.* += 1;
                         if (result_count.* < max_results) {
                             result_count.* += 1;
+                            // Stack layout here: [ ... | results_table ]
+                            // Build the entry, then `results[result_count] = entry`
+                            // via lua_rawseti which pops it and leaves the
+                            // results table on top. The previous code pushed an
+                            // extra integer and used -3 as the table index,
+                            // which leaked one entry table per match and wrote
+                            // the bare integer into results[i] instead of the
+                            // entry.
                             var st = State{ .handle = L_ptr };
-                            st.newTable();
+                            st.newTable(); // [ ... | results_table | entry ]
                             st.pushString(full_path);
                             _ = c.lua_setfield(L_ptr, -2, "file");
                             st.pushInteger(@as(i64, @intCast(line_num)));
@@ -1261,8 +1285,8 @@ fn walkAndSearch(
                             const truncated = if (line.len > 200) line[0..200] else line;
                             st.pushString(truncated);
                             _ = c.lua_setfield(L_ptr, -2, "content");
-                            st.pushInteger(@as(i64, @intCast(result_count.*)));
-                            _ = c.lua_rawseti(L_ptr, -3, @as(c_int, @intCast(result_count.*)));
+                            _ = c.lua_rawseti(L_ptr, -2, @as(c_int, @intCast(result_count.*)));
+                            // [ ... | results_table ]
                         }
                     }
                 }
@@ -1273,6 +1297,31 @@ fn walkAndSearch(
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
+
+test "fileNameMatches: empty pattern matches everything (regression for SIGABRT)" {
+    // Used to be `fp[1..]` which panicked (index-out-of-bounds) on `""`,
+    // crashing the agent when a plugin passed an empty file_pattern
+    // (Lua treats "" as truthy, so project-info/search-tool forwarded it).
+    try std.testing.expect(fileNameMatches("anything.lua", ""));
+    try std.testing.expect(fileNameMatches("Makefile", ""));
+}
+
+test "fileNameMatches: star glob strips leading star" {
+    try std.testing.expect(fileNameMatches("main.lua", "*.lua"));
+    try std.testing.expect(fileNameMatches("vendor/init.lua", "*.lua"));
+    try std.testing.expect(!fileNameMatches("main.zig", "*.lua"));
+}
+
+test "fileNameMatches: bare suffix matches verbatim" {
+    try std.testing.expect(fileNameMatches("main.lua", ".lua"));
+    try std.testing.expect(fileNameMatches("config.json", "json"));
+    try std.testing.expect(!fileNameMatches("config.json", ".lua"));
+}
+
+test "fileNameMatches: star-only pattern matches everything" {
+    try std.testing.expect(fileNameMatches("anything.lua", "*"));
+    try std.testing.expect(fileNameMatches("README", "*"));
+}
 
 test "detectLanguage: known extensions" {
     try std.testing.expectEqualStrings("zig", detectLanguage("main.zig", ""));

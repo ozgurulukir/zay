@@ -423,7 +423,6 @@ test "PluginManager: init+deinit cycle (no plugins)" {
     try std.testing.expect(m2.plugins.count() == 0);
 }
 
-
 test "buildPluginToolDescriptors: returns empty slice when no plugins" {
     var manager = PluginManager.init(std.testing.allocator, std.testing.io, "", "");
     defer manager.deinit();

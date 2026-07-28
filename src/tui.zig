@@ -2323,7 +2323,7 @@ test "codex sign-in survives selecting local compatible provider" {
     defer runtime.disconnectClient();
 
     app.codex_signed_in = true;
-    try app.pickers.models.append(gpa, .{ .id = try gpa.dupe(u8, "llama3"), .label = try gpa.dupe(u8, "llama3") }, .{ .openai_compatible = .ollama });
+    try app.pickers.models.append(gpa, .{ .id = try gpa.dupe(u8, "llama3"), .label = try gpa.dupe(u8, "llama3") }, .{ .openai_compatible = try model_loader.compatibleSource(gpa, .ollama, "http://localhost:11434/v1", "ollama") });
     app.pickers.models.model_selection = 0;
     app.cached_config_owned = true;
     app.cached_config.model_selection = .{
@@ -2367,7 +2367,7 @@ test "switching from codex to catalogue provider resets cached connection" {
     defer app.deinit();
 
     app.pickers.models.model_scope = .session;
-    try app.pickers.models.append(gpa, .{ .id = try gpa.dupe(u8, "zen"), .label = try gpa.dupe(u8, "zen") }, .{ .openai_compatible = .opencode_zen });
+    try app.pickers.models.append(gpa, .{ .id = try gpa.dupe(u8, "zen"), .label = try gpa.dupe(u8, "zen") }, .{ .openai_compatible = try model_loader.compatibleSource(gpa, .opencode_zen, "https://opencode.ai/zen/v1", "opencode_zen") });
     app.pickers.models.model_selection = 0;
     app.cached_config_owned = true;
     app.cached_config.model_selection = .{
@@ -2709,7 +2709,7 @@ test "model selection is allowed after interrupt" {
     defer app.deinit();
     defer runtime.disconnectClient();
 
-    try app.pickers.models.append(gpa, .{ .id = try gpa.dupe(u8, "llama3"), .label = try gpa.dupe(u8, "llama3") }, .{ .openai_compatible = .ollama });
+    try app.pickers.models.append(gpa, .{ .id = try gpa.dupe(u8, "llama3"), .label = try gpa.dupe(u8, "llama3") }, .{ .openai_compatible = try model_loader.compatibleSource(gpa, .ollama, "http://localhost:11434/v1", "ollama") });
     app.pickers.models.model_selection = 0;
     app.cached_config_owned = true;
     app.cached_config.model_selection = .{
