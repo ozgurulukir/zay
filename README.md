@@ -105,3 +105,45 @@ of `src/tui/` is split by concern:
 - **`session.zig`**: SQLite-backed session persistence (`sessions.sqlite`). Tolerant payload decoding handles both standard text strings and byte array JSON encodings. `SessionSummary.leaf_entry_id` is branded as `?EntryId` (fixed-size `[entry_id_len]u8`) enforcing the DB length invariant at compile time.
 - **`lua/`**: Lua 5.4 plugin SDK — sandboxed plugin runtime with configurable permissions, resource limits (instruction count, memory), event bus, plugin lifecycle management, and 18 bridge functions (filesystem, shell, git, tool registration). See `docs/plugins/` for the full plugin development guide.
 - **`tools/lua_test_runner.zig`**: Standalone Lua test runner — `zig build test-plugin` runs Lua test files through the Nova sandbox.
+
+## Documentation
+
+### Guides
+
+| Document | Description |
+|----------|-------------|
+| [docs/README.md](docs/README.md) | Documentation index |
+| [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md) | Design philosophy — human-in-the-loop, what Nova optimizes for |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture — LLM gateway, agent loop, session, TUI layers |
+| [docs/CONFIG.md](docs/CONFIG.md) | Configuration system — layered JSON, schema v2, field-level merging, project vs global |
+| [docs/MCP.md](docs/MCP.md) | MCP integration — stdio & Streamable HTTP transports, server config, tool discovery |
+| [docs/plugins/README.md](docs/plugins/README.md) | Plugin development guide — manifests, `nova.*` bridge API, events, permissions |
+| [docs/plugins/api-reference.md](docs/plugins/api-reference.md) | Full `nova.*` API reference with parameter/return shapes |
+| [docs/plugins/examples.md](docs/plugins/examples.md) | Example plugin walkthroughs |
+
+### Reference
+
+| Document | Description |
+|----------|-------------|
+| [AGENTS.md](AGENTS.md) | Guidelines for contributors — Zig 0.16 patterns, build setup, architectural conventions, type-system discipline, gotchas |
+| [schema/config.schema.json](schema/config.schema.json) | JSON Schema for editor autocompletion of `config.json` |
+| [src/prompts/system.md](src/prompts/system.md) | Base system prompt template (uses `${CWD}` / `${OS}` placeholders) |
+| [src/prompts/compaction.md](src/prompts/compaction.md) | Context-compaction summarization prompt |
+| [src/prompts/handover.md](src/prompts/handover.md) | Session handover / resume prompt |
+
+### Plugin tools (`examples/plugins/*/prompt.md`)
+
+Each plugin ships a `prompt.md` whose body is injected into the model's system
+prompt so it learns how to use the plugin's tools. These are the model-facing
+references, but useful for users too:
+
+| Plugin | Tools | prompt.md |
+|--------|-------|-----------|
+| file-tools | `read`, `write`, `edit`, `list_directory` | [prompt.md](examples/plugins/file-tools/prompt.md) |
+| search-tools | `grep`, `glob` | [prompt.md](examples/plugins/search-tools/prompt.md) |
+| path-tools | `create_directory`, `copy_path`, `move_path`, `delete_path` | [prompt.md](examples/plugins/path-tools/prompt.md) |
+| git-tools | `git_status`, `git_diff`, `git_log`, `git_branch`, `git_commit` | [prompt.md](examples/plugins/git-tools/prompt.md) |
+| todo | `todo_list`, `todo_add`, `todo_done`, `todo_delete`, `todo_prioritize`, `todo_write` | [prompt.md](examples/plugins/todo/prompt.md) |
+| file-watcher | `track_file_op`, `file_stats` | [prompt.md](examples/plugins/file-watcher/prompt.md) |
+| hello-world | `greet`, `current_time` | [prompt.md](examples/plugins/hello-world/prompt.md) |
+
