@@ -473,6 +473,8 @@ fn writeRequestPayload(
         try out.writeAll(",\"tools\":");
         try out.writeAll(tools_json);
         try out.writeAll(",\"tool_choice\":\"auto\"");
+    } else {
+        logger.log("openai_compatible: sending request with NO tools (tools_json is empty)", .{});
     }
     // Standard OpenAI cache-routing hint: steers requests sharing this session's
     // prefix to the same backend, raising prefix-cache hit rates (used by
@@ -608,10 +610,10 @@ test "buildToolsJson emits strict schema with nullable union types for optional 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"required_str\",\"non_nullable_str\"]") != null);
     // Optional fields appear in properties but NOT in the required array
     try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_str\"") != null); // in properties
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_int\"") != null);  // in properties
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_int\"") != null); // in properties
     try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_bool\"") != null); // in properties
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_obj\"") != null);  // in properties
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_arr\"") != null);  // in properties
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_obj\"") != null); // in properties
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"optional_arr\"") != null); // in properties
 }
 
 test "buildToolsJson preserves nested object additionalProperties for free-form env" {

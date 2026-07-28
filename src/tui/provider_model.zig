@@ -4,6 +4,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const tui = @import("../tui.zig");
+const lua_c = @import("c");
 const ai = @import("../ai.zig");
 const auth = @import("../auth/store.zig");
 const bash_mod = @import("../tools/bash_exec.zig");
@@ -1266,6 +1267,7 @@ pub fn connectCodexClient(
     runtime.mcp_tools = mcp_schemas;
     try runtime.connectCodexClient(credentials, model, effort);
     self.thread.agent.?.client = runtime.client;
+    injectPluginTools(self);
 }
 
 pub fn attachOpenAiCompatibleClient(
@@ -1285,6 +1287,7 @@ pub fn attachOpenAiCompatibleClient(
     runtime.mcp_tools = mcp_schemas;
     try runtime.attachOpenAiCompatibleClient(base_url, api_key, model_id, effort);
     self.thread.agent.?.client = runtime.client;
+    injectPluginTools(self);
 }
 
 /// Rebuild the MCP tool schemas from the currently connected servers and inject
@@ -1293,10 +1296,7 @@ pub fn attachOpenAiCompatibleClient(
 /// model's tool list stays in sync. Best-effort: a failure leaves the previous
 /// tool set in place.
 pub fn injectMcpTools(self: *App) void {
-    const runtime = self.liveRuntime() orelse return;
-    const schemas = self.mcp_manager.buildMcpToolSchemas(self.gpa) catch return;
-    defer self.gpa.free(schemas);
-    runtime.client.updateMcpTools(schemas) catch {};
+    injectAllTools(self);
 }
 
 /// Build Lua plugin tool schemas and inject them into the live AI client.
@@ -1304,10 +1304,47 @@ pub fn injectMcpTools(self: *App) void {
 /// collisions with builtin and MCP tools. Best-effort: a failure leaves the
 /// previous tool set in place.
 pub fn injectPluginTools(self: *App) void {
-    const runtime = self.liveRuntime() orelse return;
-    const schemas = buildPluginToolSchemas(self) catch return;
-    defer self.gpa.free(schemas);
-    runtime.client.updateMcpTools(schemas) catch {};
+    injectAllTools(self);
+}
+
+/// Merge MCP and plugin tool schemas into a single slice and inject them into
+/// the live AI client in one call. `updateMcpTools` replaces the entire
+/// `tools_json`, so calling it separately for MCP and plugin tools would cause
+/// the second call to overwrite the first.
+fn injectAllTools(self: *App) void {
+    const runtime = self.liveRuntime() orelse {
+        std.log.warn("injectAllTools: no live runtime, skipping tool injection", .{});
+        return;
+    };
+    const mcp_schemas = self.mcp_manager.buildMcpToolSchemas(self.gpa) catch |err| {
+        std.log.warn("injectAllTools: buildMcpToolSchemas failed: {s}", .{@errorName(err)});
+        return;
+    };
+    defer self.gpa.free(mcp_schemas);
+    const plugin_schemas = buildPluginToolSchemas(self) catch |err| {
+        std.log.warn("injectAllTools: buildPluginToolSchemas failed: {s}", .{@errorName(err)});
+        return;
+    };
+    defer self.gpa.free(plugin_schemas);
+
+    const total = mcp_schemas.len + plugin_schemas.len;
+    std.log.debug("injectAllTools: mcp={}, plugin={}, total={}", .{ mcp_schemas.len, plugin_schemas.len, total });
+    if (total == 0) {
+        runtime.client.updateMcpTools(&.{}) catch |err| {
+            std.log.warn("injectAllTools: updateMcpTools(empty) failed: {s}", .{@errorName(err)});
+        };
+        return;
+    }
+    var merged = self.gpa.alloc(ai.McpToolSchema, total) catch |err| {
+        std.log.warn("injectAllTools: alloc merged schema failed: {s}", .{@errorName(err)});
+        return;
+    };
+    defer self.gpa.free(merged);
+    @memcpy(merged[0..mcp_schemas.len], mcp_schemas);
+    @memcpy(merged[mcp_schemas.len..], plugin_schemas);
+    runtime.client.updateMcpTools(merged) catch |err| {
+        std.log.warn("injectAllTools: updateMcpTools({} tools) failed: {s}", .{ total, @errorName(err) });
+    };
 }
 
 /// Build tool schemas from all loaded Lua plugins.
@@ -1316,7 +1353,6 @@ pub fn injectPluginTools(self: *App) void {
 /// entry to an `ai.McpToolSchema` with the naming convention
 /// `lua__<plugin_name>__<tool_name>`.
 fn buildPluginToolSchemas(self: *App) ![]ai.McpToolSchema {
-    const c = @import("c");
     const plugin_api = @import("../lua/plugin_api.zig");
 
     // Count total tools across all plugins
@@ -1342,38 +1378,47 @@ fn buildPluginToolSchemas(self: *App) ![]ai.McpToolSchema {
         const L = plugin.state.handle;
 
         // Get nova_tools table from registry
-        _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "nova_tools");
-        if (c.lua_isnil(L, -1)) {
-            c.lua_pop(L, 1);
+        _ = lua_c.lua_getfield(L, lua_c.LUA_REGISTRYINDEX, "nova_tools");
+        if (lua_c.lua_isnil(L, -1)) {
+            lua_c.lua_pop(L, 1);
             continue;
         }
 
-        const tools_len = c.lua_rawlen(L, -1);
+        const tools_len = lua_c.lua_rawlen(L, -1);
         var tool_i: c_int = 1;
         while (tool_i <= @as(c_int, @intCast(tools_len))) : (tool_i += 1) {
-            _ = c.lua_rawgeti(L, -1, tool_i);
+            _ = lua_c.lua_rawgeti(L, -1, tool_i);
 
             // Get name and description
-            _ = c.lua_getfield(L, -1, "name");
+            _ = lua_c.lua_getfield(L, -1, "name");
             var name_len: usize = 0;
-            const name_ptr = c.lua_tolstring(L, -1, &name_len);
+            const name_ptr = lua_c.lua_tolstring(L, -1, &name_len);
             const tool_name = if (name_ptr) |p| p[0..name_len] else "";
 
-            _ = c.lua_getfield(L, -2, "description");
+            _ = lua_c.lua_getfield(L, -2, "description");
             var desc_len: usize = 0;
-            const desc_ptr = c.lua_tolstring(L, -1, &desc_len);
+            const desc_ptr = lua_c.lua_tolstring(L, -1, &desc_len);
             const desc = if (desc_ptr) |p| p[0..desc_len] else "";
 
             // Build full name: lua__<plugin>__<tool>
             const full_name = std.fmt.allocPrint(self.gpa, "lua__{s}__{s}", .{ plugin.manifest.name, tool_name }) catch {
-                c.lua_pop(L, 3);
+                lua_c.lua_pop(L, 3);
                 continue;
             };
 
-            // Build a simple schema (empty for now — will be filled from parameters)
-            const schema = tools_common.Schema{
-                .properties = &.{},
+            // Build schema from the stored parameters table.
+            // Entry table is at -3 (below name at -2 and description at -1).
+            // Push a copy to top so buildToolSchemaFromLua can read from -1.
+            _ = lua_c.lua_pushvalue(L, -3);
+            const schema = buildToolSchemaFromLua(self.gpa, L) catch |err| blk: {
+                std.log.warn("plugin.tool.schema.failed plugin={s} tool={s} err={s}", .{
+                    plugin.manifest.name,
+                    tool_name,
+                    @errorName(err),
+                });
+                break :blk tools_common.Schema{ .properties = &.{} };
             };
+            lua_c.lua_pop(L, 1); // pop the entry copy
 
             schemas[idx] = .{
                 .name = full_name,
@@ -1382,14 +1427,88 @@ fn buildPluginToolSchemas(self: *App) ![]ai.McpToolSchema {
             };
             idx += 1;
 
-            c.lua_pop(L, 3); // pop description, name, entry
+            lua_c.lua_pop(L, 3); // pop description, name, entry
         }
 
-        c.lua_pop(L, 1); // pop nova_tools
+        lua_c.lua_pop(L, 1); // pop nova_tools
     }
 
     // Trim unused tail if any tools were skipped
     return self.gpa.realloc(schemas, idx);
+}
+
+/// Build a `tools_common.Schema` from a Lua `parameters` table stored inside the
+/// current `nova_tools` entry on the stack. The entry table must be on top.
+/// Returns an owned `properties` slice (caller must eventually free).
+fn buildToolSchemaFromLua(gpa: std.mem.Allocator, L: *lua_c.lua_State) !tools_common.Schema {
+    _ = lua_c.lua_getfield(L, -1, "parameters");
+    defer lua_c.lua_pop(L, 1);
+    if (!lua_c.lua_istable(L, -1)) {
+        return .{ .properties = &.{} };
+    }
+
+    var props: std.ArrayList(tools_common.Schema.Property) = .empty;
+    errdefer {
+        for (props.items) |p| {
+            gpa.free(p.name);
+            gpa.free(p.description);
+        }
+        props.deinit(gpa);
+    }
+
+    lua_c.lua_pushnil(L);
+    while (lua_c.lua_next(L, -2) != 0) {
+        // stack: [parameters, key, value]
+        var key_len: usize = 0;
+        const key_ptr = lua_c.lua_tolstring(L, -2, &key_len);
+        const param_name = if (key_ptr) |p| try gpa.dupe(u8, p[0..key_len]) else {
+            lua_c.lua_pop(L, 1);
+            continue;
+        };
+
+        if (!lua_c.lua_istable(L, -1)) {
+            gpa.free(param_name);
+            lua_c.lua_pop(L, 1);
+            continue;
+        }
+
+        _ = lua_c.lua_getfield(L, -1, "type");
+        var type_len: usize = 0;
+        const type_ptr = lua_c.lua_tolstring(L, -1, &type_len);
+        const kind = if (type_ptr) |p| parseToolParamType(p[0..type_len]) else .string;
+        lua_c.lua_pop(L, 1);
+
+        _ = lua_c.lua_getfield(L, -1, "description");
+        var desc_len: usize = 0;
+        const desc_ptr = lua_c.lua_tolstring(L, -1, &desc_len);
+        const description = if (desc_ptr) |p| try gpa.dupe(u8, p[0..desc_len]) else try gpa.dupe(u8, "");
+        lua_c.lua_pop(L, 1);
+
+        _ = lua_c.lua_getfield(L, -1, "optional");
+        const optional = lua_c.lua_isboolean(L, -1) and lua_c.lua_toboolean(L, -1) != 0;
+        lua_c.lua_pop(L, 1);
+
+        try props.append(gpa, .{
+            .name = param_name,
+            .kind = kind,
+            .description = description,
+            .required = !optional,
+        });
+
+        lua_c.lua_pop(L, 1); // pop value, keep key for next iteration
+    }
+
+    return .{ .properties = try props.toOwnedSlice(gpa) };
+}
+
+fn parseToolParamType(type_str: []const u8) tools_common.Schema.Kind {
+    if (std.mem.eql(u8, type_str, "string")) return .string;
+    if (std.mem.eql(u8, type_str, "integer")) return .integer;
+    if (std.mem.eql(u8, type_str, "number")) return .number;
+    if (std.mem.eql(u8, type_str, "boolean")) return .boolean;
+    if (std.mem.eql(u8, type_str, "object")) return .object;
+    if (std.mem.eql(u8, type_str, "array")) return .array;
+    return .string;
 }
 
 /// Connect MCP servers per config, then inject their tool schemas into the live
@@ -1419,7 +1538,7 @@ pub fn drainMcpNotifications(self: *App) bool {
             };
         }
     }
-    if (any_pending) injectMcpTools(self);
+    if (any_pending) injectAllTools(self);
     return any_pending;
 }
 
