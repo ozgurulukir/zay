@@ -24,3 +24,4 @@ zig-cache-test/
 zig-cache-session/
 .zcode/
 .soloncode/
+.opencode/
