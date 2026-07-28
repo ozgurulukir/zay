@@ -27,6 +27,8 @@ Then
 ```sh
 zig build run
 ```
+Add the binary (`zig-out/bin/nova`) to your PATH so you can invoke it from anywhere.
+
 
 To install a release build to `~/.local/bin/`:
 
@@ -34,7 +36,7 @@ To install a release build to `~/.local/bin/`:
 zig build install -Doptimize=ReleaseFast --prefix $HOME/.local
 ```
 
-Add the binary (`zig-out/bin/nova`) to your PATH so you can invoke it from anywhere.
+
 
 ## Slash Commands & Key Features
 
