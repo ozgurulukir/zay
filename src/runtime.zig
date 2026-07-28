@@ -8,6 +8,7 @@ const compaction = @import("context/compaction.zig");
 const config_mod = @import("config/config.zig");
 const context_assembly = @import("context/assembly.zig");
 const os = @import("os.zig");
+const plugin_prompt = @import("plugin_prompt.zig");
 const session_mod = @import("session.zig");
 const skill_mod = @import("skill.zig");
 const tools_mod = @import("tools.zig");
@@ -27,6 +28,10 @@ pub const AgentRuntime = struct {
     base_system_prompt: []const u8,
     system_prompt: []const u8,
     skills: []skill_mod.Skill,
+    /// Per-plugin `prompt.md` bodies, injected into the system prompt at
+    /// assembly time so the model learns how to use each plugin's tools.
+    /// Cloned from the primary lane for sub-lanes (same project, same plugins).
+    plugin_prompts: []plugin_prompt.PluginPrompt,
     session_writer: session_mod.SessionWriter,
     agent: agent_mod.Agent,
     diagnostics: []config_mod.Diagnostic,
@@ -171,11 +176,13 @@ pub const AgentRuntime = struct {
         const owned_base_system_prompt = try gpa.dupe(u8, base_system_prompt);
         errdefer gpa.free(owned_base_system_prompt);
         // A `template` (the primary lane) shares the same project, so clone its
-        // already-loaded skills + assembled system prompt instead of re-scanning
-        // the workspace (which is a checkout of the same repo).
+        // already-loaded skills + plugin prompts + assembled system prompt
+        // instead of re-scanning the workspace (which is a checkout of the same repo).
         const skills = if (template) |t| try skill_mod.cloneAll(gpa, t.skills) else try skill_mod.loadProject(gpa, io, cwd);
         errdefer skill_mod.deinitAll(gpa, skills);
-        const owned_system_prompt = if (template) |t| try gpa.dupe(u8, t.system_prompt) else try context_assembly.assembleSystemPrompt(gpa, io, owned_base_system_prompt, cwd, skills);
+        const plugin_prompts = if (template) |t| try plugin_prompt.cloneAll(gpa, t.plugin_prompts) else try plugin_prompt.loadAll(gpa, io, home_dir, cwd);
+        errdefer plugin_prompt.deinitAll(gpa, plugin_prompts);
+        const owned_system_prompt = if (template) |t| try gpa.dupe(u8, t.system_prompt) else try context_assembly.assembleSystemPrompt(gpa, io, owned_base_system_prompt, cwd, skills, plugin_prompts);
         errdefer gpa.free(owned_system_prompt);
 
         target.* = .{
@@ -187,6 +194,7 @@ pub const AgentRuntime = struct {
             .base_system_prompt = owned_base_system_prompt,
             .system_prompt = owned_system_prompt,
             .skills = skills,
+            .plugin_prompts = plugin_prompts,
             .session_writer = undefined,
             .agent = undefined,
             .diagnostics = diagnostics,
@@ -374,6 +382,7 @@ pub const AgentRuntime = struct {
         self.gpa.free(self.base_system_prompt);
         self.gpa.free(self.system_prompt);
         skill_mod.deinitAll(self.gpa, self.skills);
+        plugin_prompt.deinitAll(self.gpa, self.plugin_prompts);
         // `agent.deinit` above joined the summarizer thread, so its client is
         // no longer in use and is safe to free. The naming client's borrower
         // (the App's branch-naming job) is cancelled before runtime teardown.

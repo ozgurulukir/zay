@@ -11,8 +11,13 @@
 //! - `nova.write_file(path, content)` — atomic file write
 //! - `nova.edit_file(path, old_string, new_string)` — safe find-and-replace
 //! - `nova.search_files(root, pattern, opts?)` — recursive grep
+//! - `nova.find_files(root, pattern, opts?)` — recursive filename glob match
 //! - `nova.list_dir(path)` — list directory contents
 //! - `nova.file_info(path)` — file metadata
+//! - `nova.mkdir(path)` — create a directory (recursive)
+//! - `nova.copy_path(src, dst)` — copy a file
+//! - `nova.move_path(src, dst)` — move/rename a file or directory
+//! - `nova.delete_path(path, opts?)` — delete a file or directory
 //! - `nova.run_bash(cmd, opts?)` — shell command execution
 //! - `nova.get_env(name)` — environment variable reading
 //! - `nova.get_cwd()` — current working directory
@@ -388,6 +393,422 @@ pub fn listDir(L: ?*c.lua_State) callconv(.c) c_int {
     _ = c.lua_setfield(L_ptr, -2, "files");
     state.pushInteger(@as(i64, @intCast(file_count + dir_count)));
     _ = c.lua_setfield(L_ptr, -2, "total_items");
+    return 1;
+}
+
+/// ── nova.find_files(root, pattern, opts?) ───────────────────────────
+///
+/// Recursively walk `root` and return every file whose **path relative to
+/// root** matches a glob `pattern`. The match covers the path relative to
+/// `root`, so `**/*.zig` matches every `.zig` file at any depth and
+/// `src/**/*.ts` only matches under `src/`.
+///
+/// Optional `opts` table fields:
+///   max_results (number) — cap on returned paths (default 100, hard cap 200)
+///
+/// Returns a table: `{ root, total_matches, truncated, results: [{path, name}] }`.
+/// `truncated` is true when more files matched than were returned. Directory
+/// walk skips dotfile entries (names beginning with `.`). gitignore is NOT
+/// honored (documented gap — use `run_bash` with `rg --files` if needed).
+pub fn findFiles(L: ?*c.lua_State) callconv(.c) c_int {
+    const L_ptr = L orelse return 0;
+    var state = State{ .handle = L_ptr };
+    const io = getIo(L_ptr);
+
+    const root = bridge.pullValue(&state, []const u8, 1) orelse {
+        state.pushNil();
+        state.pushString("root path argument is required");
+        return 2;
+    };
+    const pattern = bridge.pullValue(&state, []const u8, 2) orelse {
+        state.pushNil();
+        state.pushString("pattern argument is required");
+        return 2;
+    };
+
+    var max_results: u32 = 100;
+    if (state.getTop() >= 3 and state.isTable(3)) {
+        if (bridge.getTableInteger(&state, 3, "max_results")) |v| {
+            max_results = @min(@as(u32, @intCast(v)), max_search_results);
+        }
+    }
+
+    const clean_root = sanitizePath(io, root) catch |err| {
+        state.pushNil();
+        state.pushString(@errorName(err));
+        return 2;
+    };
+    defer std.heap.page_allocator.free(clean_root);
+
+    state.newTable();
+    state.pushString(clean_root);
+    _ = c.lua_setfield(L_ptr, -2, "root");
+
+    state.newTable();
+    var ctx = FindCtx{ .total = 0, .result_count = 0, .max_results = max_results, .root_len = clean_root.len, .L = L_ptr };
+    walkAndMatch(io, clean_root, pattern, &ctx) catch |err| {
+        _ = c.lua_setfield(L_ptr, -2, "results");
+        state.pushString(@errorName(err));
+        _ = c.lua_setfield(L_ptr, -2, "error");
+        state.pushInteger(@as(i64, @intCast(ctx.total)));
+        _ = c.lua_setfield(L_ptr, -2, "total_matches");
+        return 1;
+    };
+
+    _ = c.lua_setfield(L_ptr, -2, "results");
+    state.pushInteger(@as(i64, @intCast(ctx.total)));
+    _ = c.lua_setfield(L_ptr, -2, "total_matches");
+    state.pushBoolean(ctx.result_count < ctx.total);
+    _ = c.lua_setfield(L_ptr, -2, "truncated");
+    return 1;
+}
+
+/// Accumulator threaded through `walkAndMatch`.
+const FindCtx = struct {
+    total: u32,
+    result_count: u32,
+    max_results: u32,
+    /// Length of the cleaned root path, used to derive the relative path
+    /// (the portion of `full_path` after `root + sep`) for glob matching.
+    root_len: usize,
+    L: ?*c.lua_State,
+};
+
+/// Walk a directory recursively, matching each file's relative path against
+/// `pattern`. Mirrors `walkAndSearch`'s structure but matches filenames
+/// instead of file contents, and never opens the file body.
+fn walkAndMatch(io: std.Io, dir_path: []const u8, pattern: []const u8, ctx: *FindCtx) !void {
+    var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+
+    var iter = dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (entry.name.len == 0) continue;
+        if (entry.name[0] == '.') continue;
+
+        const full_path = try std.fs.path.join(std.heap.page_allocator, &.{ dir_path, entry.name });
+        defer std.heap.page_allocator.free(full_path);
+
+        switch (entry.kind) {
+            .directory => try walkAndMatch(io, full_path, pattern, ctx),
+            .file => {
+                // Relative path = full_path with the root prefix stripped.
+                const rel_offset = if (full_path.len > ctx.root_len) ctx.root_len + 1 else full_path.len;
+                const rel_path = if (rel_offset <= full_path.len) full_path[rel_offset..] else entry.name;
+                if (!matchGlob(rel_path, pattern) and !matchGlob(entry.name, pattern)) continue;
+
+                ctx.total += 1;
+                if (ctx.result_count < ctx.max_results) {
+                    ctx.result_count += 1;
+                    var st = State{ .handle = ctx.L orelse return };
+                    // [ ... | results_table ]
+                    st.newTable();
+                    st.pushString(full_path);
+                    _ = c.lua_setfield(ctx.L.?, -2, "path");
+                    st.pushString(entry.name);
+                    _ = c.lua_setfield(ctx.L.?, -2, "name");
+                    _ = c.lua_rawseti(ctx.L.?, -2, @as(c_int, @intCast(ctx.result_count)));
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+/// Glob match `name` (a relative path or a bare filename) against `pattern`.
+///
+/// Supports the wildcards coding-agent models commonly emit:
+///   `**` — match any number of path segments (incl. across separators)
+///   `*`  — match any run of characters within a single path segment
+///   `?`  — match exactly one character
+///   literal text — match verbatim
+/// An empty pattern matches everything. Matching is case-sensitive (paths are
+/// case-sensitive on Linux); the `*` and `?` semantics deliberately do not
+/// cross `/` so `src/*.ts` does not match `src/nested/a.ts`.
+pub fn matchGlob(name: []const u8, pattern: []const u8) bool {
+    if (pattern.len == 0) return true;
+    return globMatchSegment(name, pattern);
+}
+
+/// Recursive segment-aware glob matcher. `*` and `?` stop at `/`; only `**`
+/// spans separators. Implemented iteratively over pattern segments to keep the
+/// recursion bounded by pattern length (not input length).
+fn globMatchSegment(name: []const u8, pattern: []const u8) bool {
+    // Split the pattern and name into `/`-delimited segments and match segment
+    // by segment. A `**` segment consumes zero or more name segments.
+    var n_it = std.mem.splitScalar(u8, name, '/');
+    var p_it = std.mem.splitScalar(u8, pattern, '/');
+    var n_segs: std.ArrayList([]const u8) = .empty;
+    defer n_segs.deinit(std.heap.page_allocator);
+    var p_segs: std.ArrayList([]const u8) = .empty;
+    defer p_segs.deinit(std.heap.page_allocator);
+    while (n_it.next()) |s| n_segs.append(std.heap.page_allocator, s) catch return false;
+    while (p_it.next()) |s| p_segs.append(std.heap.page_allocator, s) catch return false;
+    return globMatchSegs(n_segs.items, p_segs.items);
+}
+
+fn globMatchSegs(name_segs: []const []const u8, pat_segs: []const []const u8) bool {
+    var ni: usize = 0;
+    var pi: usize = 0;
+    var star_pi: ?usize = null;
+    var star_ni: usize = 0;
+
+    while (ni < name_segs.len) {
+        if (pi < pat_segs.len and std.mem.eql(u8, pat_segs[pi], "**")) {
+            // `**` matches zero or more segments; record backtrack point.
+            star_pi = pi;
+            star_ni = ni;
+            pi += 1;
+        }
+        if (pi < pat_segs.len and segMatch(name_segs[ni], pat_segs[pi])) {
+            ni += 1;
+            pi += 1;
+        } else if (star_pi) |spi| {
+            // Backtrack: let `**` consume one more segment.
+            pi = spi + 1;
+            star_ni += 1;
+            ni = star_ni;
+        } else {
+            return false;
+        }
+    }
+    // Trailing `**` segments match the (now-empty) remainder.
+    while (pi < pat_segs.len and std.mem.eql(u8, pat_segs[pi], "**")) pi += 1;
+    return pi == pat_segs.len;
+}
+
+/// Match a single path segment (no `/`) against a single pattern segment
+/// supporting `*` (zero+ chars) and `?` (one char).
+fn segMatch(seg: []const u8, pat: []const u8) bool {
+    if (std.mem.eql(u8, pat, "*")) return true;
+    if (std.mem.eql(u8, pat, "**")) return true;
+    var si: usize = 0;
+    var pi: usize = 0;
+    var star_pi: ?usize = null;
+    var star_si: usize = 0;
+    while (si < seg.len) {
+        if (pi < pat.len and pat[pi] == '*') {
+            star_pi = pi;
+            star_si = si;
+            pi += 1;
+        } else if (pi < pat.len and (pat[pi] == '?' or pat[pi] == seg[si])) {
+            si += 1;
+            pi += 1;
+        } else if (star_pi) |spi| {
+            pi = spi + 1;
+            star_si += 1;
+            si = star_si;
+        } else {
+            return false;
+        }
+    }
+    while (pi < pat.len and pat[pi] == '*') pi += 1;
+    return pi == pat.len;
+}
+
+/// ── nova.mkdir(path) ─────────────────────────────────────────────────
+///
+/// Create a directory, including parents (recursive). Returns `true` or
+/// `nil, err`. The path is sanitized — traversal outside the project root is
+/// rejected. Prefer this over `run_bash("mkdir ...")` so the path stays
+/// sandboxed.
+pub fn mkdir(L: ?*c.lua_State) callconv(.c) c_int {
+    const L_ptr = L orelse return 0;
+    var state = State{ .handle = L_ptr };
+    const io = getIo(L_ptr);
+
+    const path = bridge.pullValue(&state, []const u8, 1) orelse {
+        state.pushNil();
+        state.pushString("path argument is required");
+        return 2;
+    };
+
+    const clean_path = sanitizePath(io, path) catch |err| {
+        state.pushNil();
+        state.pushString(@errorName(err));
+        return 2;
+    };
+    defer std.heap.page_allocator.free(clean_path);
+
+    std.Io.Dir.createDirPath(.cwd(), io, clean_path) catch |err| {
+        state.pushNil();
+        state.pushString(@errorName(err));
+        return 2;
+    };
+    state.pushBoolean(true);
+    return 1;
+}
+
+/// ── nova.copy_path(src, dst) ─────────────────────────────────────────
+///
+/// Copy a file from `src` to `dst`. Both paths are sanitized. Returns `true`
+/// or `nil, err`. Directories are not supported (use `run_bash` for tree
+/// copies); this keeps the operation simple and predictable.
+pub fn copyPath(L: ?*c.lua_State) callconv(.c) c_int {
+    const L_ptr = L orelse return 0;
+    var state = State{ .handle = L_ptr };
+    const io = getIo(L_ptr);
+
+    const src = bridge.pullValue(&state, []const u8, 1) orelse {
+        state.pushNil();
+        state.pushString("source path argument is required");
+        return 2;
+    };
+    const dst = bridge.pullValue(&state, []const u8, 2) orelse {
+        state.pushNil();
+        state.pushString("destination path argument is required");
+        return 2;
+    };
+
+    const clean_src = sanitizePath(io, src) catch |err| {
+        state.pushNil();
+        state.pushString(@errorName(err));
+        return 2;
+    };
+    defer std.heap.page_allocator.free(clean_src);
+    const clean_dst = sanitizePath(io, dst) catch |err| {
+        state.pushNil();
+        state.pushString(@errorName(err));
+        return 2;
+    };
+    defer std.heap.page_allocator.free(clean_dst);
+
+    std.Io.Dir.copyFileAbsolute(clean_src, clean_dst, io, .{}) catch |err| {
+        state.pushNil();
+        state.pushString(@errorName(err));
+        return 2;
+    };
+    state.pushBoolean(true);
+    return 1;
+}
+
+/// ── nova.move_path(src, dst) ─────────────────────────────────────────
+///
+/// Move (rename) a file or directory from `src` to `dst`. Both paths are
+/// sanitized; works across directory boundaries on the same filesystem.
+/// Returns `true` or `nil, err`.
+pub fn movePath(L: ?*c.lua_State) callconv(.c) c_int {
+    const L_ptr = L orelse return 0;
+    var state = State{ .handle = L_ptr };
+    const io = getIo(L_ptr);
+
+    const src = bridge.pullValue(&state, []const u8, 1) orelse {
+        state.pushNil();
+        state.pushString("source path argument is required");
+        return 2;
+    };
+    const dst = bridge.pullValue(&state, []const u8, 2) orelse {
+        state.pushNil();
+        state.pushString("destination path argument is required");
+        return 2;
+    };
+
+    const clean_src = sanitizePath(io, src) catch |err| {
+        state.pushNil();
+        state.pushString(@errorName(err));
+        return 2;
+    };
+    defer std.heap.page_allocator.free(clean_src);
+    const clean_dst = sanitizePath(io, dst) catch |err| {
+        state.pushNil();
+        state.pushString(@errorName(err));
+        return 2;
+    };
+    defer std.heap.page_allocator.free(clean_dst);
+
+    std.Io.Dir.renameAbsolute(clean_src, clean_dst, io) catch |err| {
+        state.pushNil();
+        state.pushString(@errorName(err));
+        return 2;
+    };
+    state.pushBoolean(true);
+    return 1;
+}
+
+/// ── nova.delete_path(path, opts?) ───────────────────────────────────
+///
+/// Delete a file or directory. Optional `opts.recursive` (boolean, default
+/// `false`) controls whether a non-empty directory is removed with its
+/// contents. The path is sanitized — traversal outside the project root is
+/// rejected, and `recursive` defaults off so a plugin must explicitly opt in
+/// to tree deletion. Prefer this over `run_bash("rm -rf ...")` which runs
+/// unclassified and unguarded in the plugin sandbox.
+pub fn deletePath(L: ?*c.lua_State) callconv(.c) c_int {
+    const L_ptr = L orelse return 0;
+    var state = State{ .handle = L_ptr };
+    const io = getIo(L_ptr);
+
+    const path = bridge.pullValue(&state, []const u8, 1) orelse {
+        state.pushNil();
+        state.pushString("path argument is required");
+        return 2;
+    };
+    var recursive = false;
+    if (state.getTop() >= 2 and state.isTable(2)) {
+        if (bridge.getTableBoolean(&state, 2, "recursive")) |v| recursive = v;
+    }
+
+    const clean_path = sanitizePath(io, path) catch |err| {
+        state.pushNil();
+        state.pushString(@errorName(err));
+        return 2;
+    };
+    defer std.heap.page_allocator.free(clean_path);
+
+    // Stat to decide file vs directory, then call the matching deleter. This
+    // avoids relying on error-kind discrimination from the delete call.
+    var dir = std.Io.Dir.openDirAbsolute(io, clean_path, .{}) catch |err| {
+        state.pushNil();
+        state.pushString(@errorName(err));
+        return 2;
+    };
+    const is_dir = blk: {
+        const dstat = dir.stat(io) catch {
+            dir.close(io);
+            state.pushNil();
+            state.pushString("stat failed");
+            return 2;
+        };
+        break :blk dstat.kind == .directory;
+    };
+    dir.close(io);
+
+    if (is_dir) {
+        if (recursive) {
+            // No static `deleteTreeAbsolute`; open the parent and delete the
+            // leaf by basename so the whole tree is removed in one call.
+            const parent = std.fs.path.dirname(clean_path) orelse {
+                state.pushNil();
+                state.pushString("cannot determine parent directory");
+                return 2;
+            };
+            const base = std.fs.path.basename(clean_path);
+            var parent_dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch |err| {
+                state.pushNil();
+                state.pushString(@errorName(err));
+                return 2;
+            };
+            defer parent_dir.close(io);
+            parent_dir.deleteTree(io, base) catch |err| {
+                state.pushNil();
+                state.pushString(@errorName(err));
+                return 2;
+            };
+        } else {
+            std.Io.Dir.deleteDirAbsolute(io, clean_path) catch |err| {
+                state.pushNil();
+                state.pushString(@errorName(err));
+                return 2;
+            };
+        }
+    } else {
+        std.Io.Dir.deleteFileAbsolute(io, clean_path) catch |err| {
+            state.pushNil();
+            state.pushString(@errorName(err));
+            return 2;
+        };
+    }
+    state.pushBoolean(true);
     return 1;
 }
 
@@ -1423,4 +1844,52 @@ test "registerTool + countTools: sandboxed state" {
 
     // After registration, countTools should see 1 tool.
     try std.testing.expectEqual(@as(u32, 1), countTools(L.handle));
+}
+
+// ── glob matcher unit tests ──────────────────────────────────────────
+
+test "matchGlob: empty pattern matches everything" {
+    try std.testing.expect(matchGlob("a.zig", ""));
+    try std.testing.expect(matchGlob("src/foo.ts", ""));
+}
+
+test "matchGlob: literal pattern matches verbatim" {
+    try std.testing.expect(matchGlob("main.zig", "main.zig"));
+    try std.testing.expect(!matchGlob("main.zig", "main.lua"));
+}
+
+test "matchGlob: star within segment" {
+    try std.testing.expect(matchGlob("main.zig", "*.zig"));
+    try std.testing.expect(matchGlob("a.ts", "*.ts"));
+    try std.testing.expect(!matchGlob("a.js", "*.ts"));
+}
+
+test "matchGlob: star does not cross separator" {
+    try std.testing.expect(!matchGlob("src/a.ts", "*.ts"));
+    try std.testing.expect(matchGlob("a.ts", "*"));
+}
+
+test "matchGlob: double-star spans directories" {
+    try std.testing.expect(matchGlob("src/a.zig", "**/*.zig"));
+    try std.testing.expect(matchGlob("src/nested/b.zig", "**/*.zig"));
+    try std.testing.expect(matchGlob("a.zig", "**/*.zig"));
+    try std.testing.expect(!matchGlob("a.lua", "**/*.zig"));
+}
+
+test "matchGlob: double-star under prefix" {
+    try std.testing.expect(matchGlob("src/nested/a.ts", "src/**/*.ts"));
+    try std.testing.expect(matchGlob("src/a.ts", "src/**/*.ts"));
+    try std.testing.expect(!matchGlob("lib/a.ts", "src/**/*.ts"));
+}
+
+test "matchGlob: single-char question mark" {
+    try std.testing.expect(matchGlob("a.ts", "?.ts"));
+    try std.testing.expect(matchGlob("ab.ts", "a?.ts"));
+    try std.testing.expect(!matchGlob("abc.ts", "a?.ts"));
+}
+
+test "matchGlob: trailing double-star matches remainder" {
+    try std.testing.expect(matchGlob("src/a/b/c", "src/**"));
+    try std.testing.expect(matchGlob("src", "src/**"));
+    try std.testing.expect(!matchGlob("lib/a", "src/**"));
 }

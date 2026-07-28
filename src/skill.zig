@@ -295,7 +295,9 @@ fn appendSkillBlock(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, 
     try writer.writeAll("\n</skill>");
 }
 
-fn stripFrontmatter(raw: []const u8) []const u8 {
+/// Public so `plugin_prompt.zig` can reuse the exact same body extraction
+/// logic (frontmatter → markdown body) for `prompt.md` files.
+pub fn stripFrontmatter(raw: []const u8) []const u8 {
     const open_len = frontmatterOpenLen(raw) orelse return raw;
     const rest = raw[open_len..];
     const end = std.mem.indexOf(u8, rest, "\n---") orelse return raw;
@@ -330,7 +332,9 @@ fn writeXmlTag(writer: *std.Io.Writer, tag: []const u8, value: []const u8, space
     try writer.print("</{s}>\n", .{tag});
 }
 
-fn writeXmlEscaped(writer: *std.Io.Writer, value: []const u8) !void {
+/// Public so `plugin_prompt.zig` can reuse XML escaping for the
+/// `<plugin_prompts>` block it emits into the system prompt.
+pub fn writeXmlEscaped(writer: *std.Io.Writer, value: []const u8) !void {
     for (value) |byte| {
         switch (byte) {
             '&' => try writer.writeAll("&amp;"),

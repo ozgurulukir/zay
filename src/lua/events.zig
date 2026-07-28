@@ -1,7 +1,8 @@
-//! Event types and event bus for the plugin system.
+//! Event types for the plugin system.
 //!
-//! The EventBus dispatches lifecycle events to subscribed Lua callbacks.
-//! Events are emitted by the agent loop and executor at key points.
+//! Events are emitted by the agent loop (`Agent.ExecutorBridge`) at tool-call
+//! boundaries and dispatched to every plugin by `PluginManager.emitEvent`,
+//! which drains each plugin's `"nova_events"` Lua registry table.
 
 const std = @import("std");
 const c = @import("c");
@@ -9,7 +10,7 @@ const State = @import("state.zig").State;
 
 // ── Event type ─────────────────────────────────────────────────────
 
-/// All event types that can be emitted on the plugin event bus.
+/// All event types that can be emitted to plugin callbacks.
 pub const Event = union(enum) {
     /// A new agent turn has started.
     turn_started: void,
@@ -55,133 +56,14 @@ pub const Event = union(enum) {
     }
 };
 
-// ── Event Bus ──────────────────────────────────────────────────────
+// ── Payload marshalling ─────────────────────────────────────────────
 
-/// A subscription: a Lua function reference stored as a registry reference.
-const Subscription = struct {
-    /// Lua registry reference (LUA_NOREF = no reference)
-    func_ref: c_int,
-    /// Plugin name (for error reporting)
-    plugin_name: []const u8,
-};
-
-/// The event bus dispatches events to subscribed Lua callbacks.
-/// Each plugin registers callbacks via `nova.on(event_name, callback)`.
-pub const EventBus = struct {
-    allocator: std.mem.Allocator,
-    /// Per-event subscriptions: event_name -> list of subscriptions
-    subscriptions: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(Subscription)),
-    /// Lua state where callbacks are registered (the main plugin state)
-    L: ?*State,
-
-    const Self = @This();
-
-    /// Initialize the event bus.
-    pub fn init(allocator: std.mem.Allocator) Self {
-        return Self{
-            .allocator = allocator,
-            .subscriptions = .empty,
-            .L = null,
-        };
-    }
-
-    /// Deinitialize the event bus, freeing all subscriptions.
-    pub fn deinit(self: *Self) void {
-        var it = self.subscriptions.iterator();
-        while (it.next()) |entry| {
-            for (entry.value_ptr.items) |sub| {
-                if (self.L) |L| {
-                    c.luaL_unref(L.handle, c.LUA_REGISTRYINDEX, sub.func_ref);
-                }
-                self.allocator.free(sub.plugin_name);
-            }
-            entry.value_ptr.deinit(self.allocator);
-        }
-        self.subscriptions.deinit(self.allocator);
-    }
-
-    /// Set the Lua state used for callback dispatch.
-    pub fn setState(self: *Self, L: *State) void {
-        self.L = L;
-    }
-
-    /// Subscribe a Lua function to an event.
-    /// `func_ref` is a Lua registry reference to the callback function.
-    /// `plugin_name` is used for error reporting.
-    pub fn subscribe(self: *Self, event_name: []const u8, func_ref: c_int, plugin_name: []const u8) !void {
-        var subs = self.subscriptions.getOrPut(self.allocator, event_name) catch return error.OutOfMemory;
-        if (!subs.found_existing) {
-            subs.value_ptr.* = .empty;
-        }
-        try subs.value_ptr.append(self.allocator, .{
-            .func_ref = func_ref,
-            .plugin_name = try self.allocator.dupe(u8, plugin_name),
-        });
-    }
-
-    /// Unsubscribe all callbacks for a plugin.
-    pub fn unsubscribePlugin(self: *Self, plugin_name: []const u8) void {
-        var it = self.subscriptions.iterator();
-        while (it.next()) |entry| {
-            var subs = entry.value_ptr;
-            var i: usize = 0;
-            while (i < subs.items.len) {
-                if (std.mem.eql(u8, subs.items[i].plugin_name, plugin_name)) {
-                    if (self.L) |L| {
-                        c.luaL_unref(L.handle, c.LUA_REGISTRYINDEX, subs.items[i].func_ref);
-                    }
-                    self.allocator.free(subs.items[i].plugin_name);
-                    _ = subs.orderedRemove(i);
-                } else {
-                    i += 1;
-                }
-            }
-        }
-    }
-
-    /// Emit an event to all subscribed callbacks.
-    /// Errors in individual callbacks are caught and logged — other callbacks
-    /// still run. Returns the number of callbacks that were invoked.
-    pub fn emit(self: *Self, event: Event) usize {
-        const L = self.L orelse return 0;
-        const event_name = event.name();
-        const subs = self.subscriptions.get(event_name) orelse return 0;
-
-        var count: usize = 0;
-        for (subs.items) |sub| {
-            // Push the callback function from the registry
-            _ = c.lua_rawgeti(L.handle, c.LUA_REGISTRYINDEX, sub.func_ref);
-            if (!L.isFunction(-1)) {
-                L.pop(1);
-                continue;
-            }
-
-            // Push event data as a Lua table
-            L.newTable();
-            pushEventData(L, event);
-
-            // Call the callback
-            const rc = L.pcall(1, 0);
-            if (rc != c.LUA_OK) {
-                const err = L.getErrorMessage();
-                std.log.warn("plugin.event.error plugin={s} event={s} err={s}", .{
-                    sub.plugin_name,
-                    event_name,
-                    err orelse "unknown",
-                });
-                L.pop(1); // pop error message
-            }
-            count += 1;
-        }
-        return count;
-    }
-};
-
-/// Push event data as a Lua table on top of the stack.
-fn pushEventData(L: *State, event: Event) void {
+/// Push event data as a Lua table on top of the stack. Public so
+/// `PluginManager.emitEvent` (manager.zig) can build the callback argument.
+pub fn pushEventData(L: *State, event: Event) void {
     switch (event) {
         .turn_started, .turn_ended, .response_received => {
-            // No payload for these events
+            // No payload for these events.
         },
         .tool_call_started => |payload| {
             L.pushString(payload.name);
@@ -208,6 +90,8 @@ fn pushEventData(L: *State, event: Event) void {
     }
 }
 
+// ── Tests ──────────────────────────────────────────────────────────
+
 test "event: name returns correct string" {
     const e1 = Event{ .turn_started = {} };
     try std.testing.expectEqualStrings("turn_started", e1.name());
@@ -223,114 +107,4 @@ test "event: name returns correct string" {
     try std.testing.expectEqualStrings("plugin_loaded", e6.name());
     const e7 = Event{ .plugin_unloaded = .{ .name = @as([]const u8, "test") } };
     try std.testing.expectEqualStrings("plugin_unloaded", e7.name());
-}
-
-test "event bus: init and deinit" {
-    var bus = EventBus.init(std.testing.allocator);
-    defer bus.deinit();
-    try std.testing.expect(bus.L == null);
-}
-
-test "event bus: emit with no subscribers does nothing" {
-    var L = State.init();
-    defer L.deinit();
-
-    var bus = EventBus.init(std.testing.allocator);
-    defer bus.deinit();
-    bus.setState(&L);
-
-    const count = bus.emit(.{ .turn_started = {} });
-    try std.testing.expectEqual(@as(usize, 0), count);
-}
-
-test "event bus: subscribe and emit" {
-    var L = State.init();
-    defer L.deinit();
-
-    var bus = EventBus.init(std.testing.allocator);
-    defer bus.deinit();
-    bus.setState(&L);
-    bus.setState(&L);
-
-    // Register a Lua callback that sets a global flag
-    try std.testing.expect(L.doString(
-        \\function on_turn_started(data)
-        \\  _G.event_fired = true
-        \\end
-    ));
-
-    // Get a registry reference to the function
-    _ = c.lua_getglobal(L.handle, "on_turn_started");
-    try std.testing.expect(L.isFunction(-1));
-    const func_ref = c.luaL_ref(L.handle, c.LUA_REGISTRYINDEX);
-
-    try bus.subscribe("turn_started", func_ref, "test_plugin");
-
-    const count = bus.emit(.{ .turn_started = {} });
-    try std.testing.expectEqual(@as(usize, 1), count);
-
-    // Check the global flag was set
-    _ = c.lua_getglobal(L.handle, "event_fired");
-    try std.testing.expect(L.toBoolean(-1));
-    L.pop(1);
-}
-
-test "event bus: error in one callback doesn't affect others" {
-    var L = State.init();
-    defer L.deinit();
-
-    var bus = EventBus.init(std.testing.allocator);
-    defer bus.deinit();
-    bus.setState(&L);
-
-    // First callback errors
-    try std.testing.expect(L.doString(
-        \\function on_turn_error(data)
-        \\  error("this callback failed")
-        \\end
-    ));
-    _ = c.lua_getglobal(L.handle, "on_turn_error");
-    const ref1 = c.luaL_ref(L.handle, c.LUA_REGISTRYINDEX);
-    try bus.subscribe("turn_started", ref1, "faulty_plugin");
-
-    // Second callback succeeds
-    try std.testing.expect(L.doString(
-        \\function on_turn_ok(data)
-        \\  _G.ok_fired = true
-        \\end
-    ));
-    _ = c.lua_getglobal(L.handle, "on_turn_ok");
-    const ref2 = c.luaL_ref(L.handle, c.LUA_REGISTRYINDEX);
-    try bus.subscribe("turn_started", ref2, "good_plugin");
-
-    const count = bus.emit(.{ .turn_started = {} });
-    try std.testing.expectEqual(@as(usize, 2), count);
-
-    // The good callback should have run
-    _ = c.lua_getglobal(L.handle, "ok_fired");
-    try std.testing.expect(L.toBoolean(-1));
-    L.pop(1);
-}
-
-test "event bus: unsubscribe plugin" {
-    var L = State.init();
-    defer L.deinit();
-
-    var bus = EventBus.init(std.testing.allocator);
-    defer bus.deinit();
-    bus.setState(&L);
-
-    try std.testing.expect(L.doString(
-        \\function on_event(data)
-        \\  _G.fired = true
-        \\end
-    ));
-    _ = c.lua_getglobal(L.handle, "on_event");
-    const ref = c.luaL_ref(L.handle, c.LUA_REGISTRYINDEX);
-    try bus.subscribe("turn_started", ref, "test_plugin");
-
-    try std.testing.expectEqual(@as(usize, 1), bus.emit(.{ .turn_started = {} }));
-
-    bus.unsubscribePlugin("test_plugin");
-    try std.testing.expectEqual(@as(usize, 0), bus.emit(.{ .turn_started = {} }));
 }

@@ -53,6 +53,55 @@ nova.register_tool({
 **Parameters:** JSON arguments from the AI model are automatically parsed into
 a Lua table before the handler is called. Access `params.param_name` directly.
 
+### prompt.md (optional model instructions)
+
+A plugin MAY include a `prompt.md` next to `plugin.lua`. Its body is injected
+into the AI model's system prompt, so the model learns how to call the
+plugin's tools correctly before it ever invokes one.
+
+```
+my-plugin/
+├── plugin.lua
+├── init.lua
+└── prompt.md      ← optional, plain markdown (frontmatter optional)
+```
+
+`prompt.md` is plain markdown. An optional YAML frontmatter block is stripped
+before injection (same format as `SKILL.md`):
+
+```markdown
+---
+description: Short summary of what these tools do.
+---
+
+Always confirm with the user before overwriting an existing file.
+Prefer the `edit` tool for small changes over `write`.
+
+When the user asks to create a new file, use `write` with the full path.
+```
+
+**How it works:** Nova scans `<home>/.config/nova/plugins/*/prompt.md` and
+`.nova/plugins/*/prompt.md` at session start (a pure text scan — no Lua state
+is created). Each non-empty body is wrapped in a `<plugin_prompts>` block in
+the system prompt:
+
+```
+<plugin_prompts>
+  <plugin name="my-plugin">
+    Always confirm with the user before overwriting an existing file.
+    ...
+  </plugin>
+</plugin_prompts>
+```
+
+Notes:
+- A plugin with no `prompt.md` contributes nothing — only tools registered via
+  `nova.register_tool` are visible to the model.
+- A plugin with `prompt.md` but no `plugin.lua` still contributes prompt text.
+- A project plugin overrides a global plugin with the same directory name
+  (including its `prompt.md`).
+- Changes to `prompt.md` take effect on the next session or lane.
+
 ## Plugin Discovery
 
 Nova discovers plugins from two directories:
@@ -72,10 +121,26 @@ Each subdirectory containing a `plugin.lua` file is treated as a plugin.
 |----------|-----------|---------|-------------|
 | `nova.read_file(path, opts?)` | `path`, `opts.start_line`, `opts.end_line`, `opts.max_size` | `{path, content, size, lines, language, mime_type}` | Read file with metadata |
 | `nova.write_file(path, content)` | `path`, `content` | `true` or `nil` | Atomic file write |
-| `nova.edit_file(path, old, new)` | `path`, `old_string`, `new_string` | `true` or `nil` | Find-and-replace |
-| `nova.search_files(root, pattern, opts?)` | `root`, `pattern`, `opts.file_pattern`, `opts.case_sensitive`, `opts.max_results` | `{query, total_matches, results, truncated}` | Recursive grep |
-| `nova.list_dir(path)` | `path` | `{path, files, directories, total_items}` | Directory listing |
+| `nova.edit_file(path, old, new)` | `path`, `old_string`, `new_string` | `true` or `nil` | Find-and-replace (first occurrence) |
+| `nova.search_files(root, pattern, opts?)` | `root`, `pattern`, `opts.file_pattern`, `opts.case_sensitive`, `opts.max_results` | `{query, total_matches, results, truncated}` | Recursive content grep (substring) |
+| `nova.find_files(root, pattern, opts?)` | `root`, `pattern` (glob), `opts.max_results` | `{root, total_matches, truncated, results}` | Recursive filename glob match |
+| `nova.list_dir(path)` | `path` | `{path, files, directories, total_items}` | Directory listing (single level) |
 | `nova.file_info(path)` | `path` | `{size, type, extension, language, mime_type}` | File metadata |
+| `nova.mkdir(path)` | `path` | `true` or `nil` | Create directory (recursive, with parents) |
+| `nova.copy_path(src, dst)` | `source_path`, `destination_path` | `true` or `nil` | Copy a single file |
+| `nova.move_path(src, dst)` | `source_path`, `destination_path` | `true` or `nil` | Move/rename a file or directory |
+| `nova.delete_path(path, opts?)` | `path`, `opts.recursive` | `true` or `nil` | Delete file or directory (recursive opt-in) |
+
+All filesystem functions validate paths through `sanitizePath`: paths are
+resolved against the project root and **rejected if they escape it**. This
+makes the dedicated path ops (`mkdir`/`copy_path`/`move_path`/`delete_path`)
+strictly safer than `nova.run_bash("rm -rf ...")`, which runs unclassified and
+unguarded in the plugin sandbox. Prefer the dedicated tools for file
+operations.
+
+`nova.find_files` supports glob patterns: `**` (spans directories), `*`
+(within a segment), `?` (single char). Example: `find_files(".", "**/*.zig")`
+matches every `.zig` file at any depth. gitignore is NOT honored.
 
 ### Shell & Environment
 
@@ -101,40 +166,59 @@ Each subdirectory containing a `plugin.lua` file is treated as a plugin.
 | Function | Parameters | Returns | Description |
 |----------|-----------|---------|-------------|
 | `nova.register_tool(spec)` | `spec.name`, `spec.description`, `spec.parameters`, `spec.handler` | `true` | Register a tool |
-| `nova.on(event, callback)` | `event`, `callback` | `true` | Subscribe to event |
+| `nova.on(event, callback)` | `event`, `callback` | `true` | Subscribe to a lifecycle event |
 | `nova.think(prompt)` | `prompt` | _(stub)_ | Recursive LLM call (not yet implemented) |
 
-### `plugin.get_config()`
+### Events
 
-Returns the plugin's settings from `config.json` as a Lua table, or `nil` if
-no settings are configured. Settings are set in the `plugins` section:
+`nova.on(event_name, callback)` subscribes to a lifecycle event. The callback
+receives a `data` table whose shape depends on the event. Events are emitted by
+the agent loop at tool-call boundaries and delivered to every active plugin.
 
-```json
-{
-  "plugins": {
-    "my-plugin": {
-      "enabled": true,
-      "settings": "{\"theme\":\"dark\",\"max_results\":20}"
-    }
-  }
-}
-```
-
-### `plugin.get_state()` / `plugin.set_state(state)`
-
-Persist state across plugin reloads. State is a string (JSON recommended).
+| Event | `data` shape | When it fires |
+|-------|--------------|---------------|
+| `turn_started` | `{}` | A new agent turn starts |
+| `turn_ended` | `{}` | An agent turn ends |
+| `tool_call_started` | `{ name, call_id }` | A tool call begins |
+| `tool_call_finished` | `{ name, call_id, success }` | A tool call completes |
+| `response_received` | `{}` | A response was received from the LLM |
+| `plugin_loaded` | `{ name }` | A plugin was loaded |
+| `plugin_unloaded` | `{ name }` | A plugin was unloaded |
 
 ```lua
--- Save state
+nova.on("tool_call_finished", function(data)
+  if data.name == "lua__file-tools__write" and data.success then
+    -- track that a file was written this turn
+  end
+end)
+```
+
+Callbacks run synchronously on the agent worker thread, at the boundary
+between tool calls (after the plugin's own handler has returned), so it is safe
+to read/write the plugin's own Lua state.
+
+### Plugin state persistence (reload)
+
+State persistence across plugin reloads uses **global functions**, not a
+`plugin.*` namespace. Define top-level `get_state()` and `set_state(state)`
+functions in your `init.lua`. `PluginManager` calls them at reload time:
+
+```lua
+-- Return a string (JSON recommended) to be saved.
 function get_state()
-  return require("json").encode(my_state_table)
+  return encode_state(my_state_table)
 end
 
--- Restore state
+-- Receive the previously-saved string.
 function set_state(state)
-  my_state_table = require("json").decode(state)
+  my_state_table = decode_state(state)
 end
 ```
+
+> **Note:** There is no `plugin.get_config()` bridge. Plugin settings from
+> `config.json` are not currently injected into the Lua state. If your plugin
+> needs configuration, read it yourself from a known file path via
+> `nova.read_file`.
 
 ## Permissions
 
@@ -219,22 +303,36 @@ zig build test-plugin
 
 ## Example Plugins
 
-See `examples/plugins/` for complete examples:
+See `examples/plugins/` for complete, tested examples. These mirror the tool
+shapes models already know from Claude Code / OpenCode / Zed agents:
 
-- **hello-world** — Minimal tool registration
-- **file-watcher** — Event-driven plugin using `nova.on()`
-- **custom-search** — Tool with configurable settings
-- **read-tool** — File reading with line range, language detection, git status
-- **write-tool** — File writing, editing, git-aware write+stage
-- **search-tool** — Recursive grep with ripgrep fallback
+- **file-tools** — `read` (numbered lines, binary guard, paging),
+  `write`, `edit` (with `replace_all`), `list_directory` (folders/files split)
+- **search-tools** — `grep` (grouped output, regex via ripgrep fallback),
+  `glob` (recursive filename match via `nova.find_files`)
+- **path-tools** — `create_directory`, `copy_path`, `move_path`, `delete_path`
+  (sandboxed alternatives to bash cp/mv/rm/mkdir)
+- **git-tools** — `git_status`, `git_diff`, `git_log`, `git_branch`,
+  `git_commit` (with commit-discipline guidance in `prompt.md`)
+- **todo** — todo.txt-format task tracker: `todo_list`, `todo_add`, `todo_done`,
+  `todo_delete`, `todo_prioritize`, `todo_write`. Persists to `.nova/todos.txt`;
+  refreshes on `turn_started` events.
+- **file-watcher** — Event-driven plugin using `nova.on("tool_call_finished", ...)`
+- **hello-world** — Minimal tool registration (demo)
+
+Each plugin ships a `prompt.md` whose body is injected into the system prompt
+(see the "prompt.md" section above), teaching the model when and how to use
+the plugin's tools.
 
 ## Best Practices
 
 1. **Use `nova.*` bridge functions** instead of blocked Lua libraries
-2. **Declare only needed permissions** in manifest — least privilege
+2. **Prefer dedicated tools over bash** — `delete_path` over `run_bash("rm")`,
+   `find_files` over `run_bash("find")`. The dedicated tools are sandboxed;
+   `run_bash` runs unclassified.
 3. **Handle errors gracefully** — return descriptive error strings
 4. **Keep handlers fast** — events are dispatched synchronously
 5. **Test with `test_runner`** — create `test.lua` in your plugin directory
-6. **Use `plugin.get_config()`** for user-configurable settings
+6. **Ship a `prompt.md`** — teach the model when to use each tool
 7. **Name tools with underscores** — `my_tool`, not `myTool`
 8. **Return strings from handlers** — the model reads the return value

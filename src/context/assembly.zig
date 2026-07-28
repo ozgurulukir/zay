@@ -13,6 +13,7 @@ const ai = @import("../ai.zig");
 const at_mention = @import("../at_mention.zig");
 const compaction = @import("compaction.zig");
 const os = @import("../os.zig");
+const plugin_prompt = @import("../plugin_prompt.zig");
 const skill_mod = @import("../skill.zig");
 const vcs = @import("../vcs.zig");
 
@@ -54,13 +55,14 @@ pub const ContextBudget = struct {
 };
 
 /// Assembles the complete system prompt for a turn with dynamic environment,
-/// git metadata, ingested project rules, and active skills.
+/// git metadata, ingested project rules, active skills, and plugin prompts.
 pub fn assembleSystemPrompt(
     gpa: std.mem.Allocator,
     io: std.Io,
     base_template: []const u8,
     cwd: []const u8,
     skills: []const skill_mod.Skill,
+    plugin_prompts: []const plugin_prompt.PluginPrompt,
 ) ![]u8 {
     assert(base_template.len > 0);
     assert(cwd.len > 0);
@@ -103,6 +105,14 @@ pub fn assembleSystemPrompt(
     if (skill_prompt.len > 0) {
         try out.writer.writeAll("\n\n");
         try out.writer.writeAll(skill_prompt);
+    }
+
+    // 5. Append Plugin prompts (optional per-plugin prompt.md bodies)
+    const plugin_prompt_text = try plugin_prompt.formatForPrompt(gpa, plugin_prompts);
+    defer gpa.free(plugin_prompt_text);
+    if (plugin_prompt_text.len > 0) {
+        try out.writer.writeAll("\n\n");
+        try out.writer.writeAll(plugin_prompt_text);
     }
 
     return out.toOwnedSlice();
@@ -304,12 +314,40 @@ test "assembleSystemPrompt substitutes placeholders and ingests AGENTS.md" {
     defer gpa.free(cwd);
 
     const template = "System: ${CWD} on ${OS}";
-    const prompt = try assembleSystemPrompt(gpa, io, template, cwd, &.{});
+    const prompt = try assembleSystemPrompt(gpa, io, template, cwd, &.{}, &.{});
     defer gpa.free(prompt);
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, cwd) != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<project_instructions path=\"AGENTS.md\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Rule: Always test code.") != null);
+}
+
+test "assembleSystemPrompt appends plugin prompts block" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const rel_dir = ".zig-cache/context-assembly-plugin-test";
+    try std.Io.Dir.createDirPath(.cwd(), io, rel_dir);
+    const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
+    defer gpa.free(cwd);
+
+    var prompts = try gpa.alloc(plugin_prompt.PluginPrompt, 1);
+    prompts[0] = .{
+        .name = try gpa.dupe(u8, "write-tool"),
+        .body = try gpa.dupe(u8, "Always confirm before overwrite."),
+        .path = try gpa.dupe(u8, "/tmp/prompt.md"),
+    };
+    defer plugin_prompt.deinitAll(gpa, prompts);
+
+    const template = "System: ${CWD} on ${OS}";
+    const prompt = try assembleSystemPrompt(gpa, io, template, cwd, &.{}, prompts);
+    defer gpa.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<plugin_prompts>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<plugin name=\"write-tool\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Always confirm before overwrite.") != null);
 }
 
 test "pruneHistoricalToolResults caps old tool outputs while preserving recent ones" {

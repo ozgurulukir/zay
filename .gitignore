@@ -20,4 +20,7 @@ _pm/
 type-safety-refactor.md
 .zig-cache-test/
 .zig-cache-session/
+zig-cache-test/
+zig-cache-session/
+.zcode/
 .soloncode/

@@ -10,6 +10,7 @@ const c = @import("c");
 const State = @import("state.zig").State;
 const sandbox = @import("sandbox.zig");
 const plugin_api = @import("plugin_api.zig");
+const events = @import("events.zig");
 const Manifest = @import("manifest.zig").Manifest;
 
 /// A loaded plugin instance with its manifest and sandboxed Lua state.
@@ -221,7 +222,74 @@ pub const PluginManager = struct {
         return self.plugins.iterator();
     }
 
+    /// Emit a lifecycle event to every active plugin. Each plugin's sandboxed
+    /// Lua state holds a `"nova_events"` registry table (populated by
+    /// `nova.on`); this drains the sub-table for `event.name()`, pcalling
+    /// every stored callback ref with the event payload as a Lua table.
+    ///
+    /// Errors in individual callbacks are logged and do not stop delivery to
+    /// other plugins. Must be called on the agent worker thread, at tool-call
+    /// boundaries, so a plugin's state is never re-entered mid-handler.
+    pub fn emitEvent(self: *Self, event: events.Event) void {
+        const event_name = event.name();
+        var iter = self.plugins.iterator();
+        while (iter.next()) |entry| {
+            const plugin = entry.value_ptr.*;
+            if (!plugin.active) continue;
+            drainEventCallbacks(plugin.state.handle, plugin.manifest.name, event_name, event);
+        }
+    }
+
     // ── private helpers ─────────────────────────────────────────────
+
+    /// Read the `"nova_events"` registry table on `L`, find the sub-table for
+    /// `event_name`, and pcall every stored callback ref with `event`'s payload
+    /// pushed as a Lua table. Each callback error is logged with `plugin_name`
+    /// but does not stop the remaining callbacks. Stack-neutral.
+    fn drainEventCallbacks(L: *c.lua_State, plugin_name: []const u8, event_name: []const u8, event: events.Event) void {
+        _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "nova_events");
+        if (c.lua_isnil(L, -1)) {
+            c.lua_pop(L, 1);
+            return;
+        }
+        defer c.lua_pop(L, 1); // pop nova_events table
+
+        _ = c.lua_getfield(L, -1, event_name.ptr);
+        if (c.lua_isnil(L, -1)) {
+            c.lua_pop(L, 1);
+            return;
+        }
+        defer c.lua_pop(L, 1); // pop event sub-table
+
+        const subs_len = c.lua_rawlen(L, -1);
+        var i: c_int = 1;
+        var state = State{ .handle = L };
+        while (i <= @as(c_int, @intCast(subs_len))) : (i += 1) {
+            _ = c.lua_rawgeti(L, -1, i); // push callback ref (integer)
+            const func_ref = state.toInteger(-1);
+            state.pop(1); // pop the integer ref
+
+            // Resolve the ref to the actual function.
+            _ = c.lua_rawgeti(L, c.LUA_REGISTRYINDEX, @as(c_int, @intCast(func_ref)));
+            if (!c.lua_isfunction(L, -1)) {
+                c.lua_pop(L, 1);
+                continue;
+            }
+
+            // Push the event payload as a Lua table argument.
+            state.newTable();
+            events.pushEventData(&state, event);
+
+            const rc = state.pcall(1, 0);
+            if (rc != c.LUA_OK) {
+                const err = state.getErrorMessage();
+                std.log.warn("plugin.event.error plugin={s} event={s} err={s}", .{
+                    plugin_name, event_name, err orelse "unknown",
+                });
+                state.pop(1); // pop error message
+            }
+        }
+    }
 
     /// Load all plugins from a directory.
     fn loadFromDir(self: *Self, dir_path: []const u8, is_embedded: bool) !void {
@@ -438,4 +506,109 @@ test "plugin manager: end-to-end loadOne with register_tool" {
 
     const tool_count = plugin_api.countTools(instance.state.handle);
     try testing.expectEqual(@as(u32, 1), tool_count);
+}
+
+// Load every shipped example plugin and confirm each registered at least one
+// tool. This catches syntax errors, missing bridge functions, and registration
+// regressions across the whole plugin set in one test.
+test "plugin manager: loads all shipped example plugins" {
+    const testing = std.testing;
+
+    // examples/plugins is resolved from cwd. The test binary runs with cwd
+    // set to the repo root (same convention as the other plugin tests), so a
+    // relative "examples/plugins" works without needing @src().
+    const examples_plugins = try std.fs.path.join(testing.allocator, &.{ "examples", "plugins" });
+    defer testing.allocator.free(examples_plugins);
+
+    // Each entry: directory name and the minimum number of tools expected.
+    const expectations = [_]struct { dir: []const u8, min_tools: u32 }{
+        .{ .dir = "file-tools", .min_tools = 4 }, // read, write, edit, list_directory
+        .{ .dir = "search-tools", .min_tools = 2 }, // grep, glob
+        .{ .dir = "path-tools", .min_tools = 4 }, // create_directory, copy_path, move_path, delete_path
+        .{ .dir = "git-tools", .min_tools = 5 }, // git_status, git_diff, git_log, git_branch, git_commit
+        .{ .dir = "hello-world", .min_tools = 1 }, // greet (demo, at least one)
+        .{ .dir = "file-watcher", .min_tools = 1 }, // track_file_op / file_stats
+        .{ .dir = "todo", .min_tools = 6 }, // todo_list, todo_add, todo_done, todo_delete, todo_prioritize, todo_write
+    };
+
+    var manager = PluginManager.init(testing.allocator, testing.io, "", "");
+    defer manager.deinit();
+
+    for (expectations) |exp| {
+        const plugin_dir = try std.fs.path.join(testing.allocator, &.{ examples_plugins, exp.dir });
+        defer testing.allocator.free(plugin_dir);
+
+        const instance = manager.loadOne(plugin_dir, false) catch |err| {
+            std.debug.print("\nFAIL load plugin {s}: {s}\n", .{ exp.dir, @errorName(err) });
+            return err;
+        };
+        const tool_count = plugin_api.countTools(instance.state.handle);
+        if (tool_count < exp.min_tools) {
+            std.debug.print("\nFAIL plugin {s}: expected >={d} tools, got {d}\n", .{ exp.dir, exp.min_tools, tool_count });
+        }
+        try testing.expect(tool_count >= exp.min_tools);
+    }
+}
+
+// Verify that a plugin's registered event callback fires when emitEvent is
+// called. This is the integration test for the event wiring (agent.zig emits
+// -> PluginManager.emitEvent -> drains nova_events -> pcalls callback).
+test "plugin manager: emitEvent delivers to plugin callbacks" {
+    const testing = std.testing;
+
+    const dir_path = try std.fs.path.join(testing.allocator, &.{ "/tmp", "nova_test_plugin_events" });
+    defer testing.allocator.free(dir_path);
+
+    std.Io.Dir.cwd().createDirPath(testing.io, "/tmp/nova_test_plugin_events") catch {};
+    defer std.Io.Dir.cwd().deleteTree(testing.io, "/tmp/nova_test_plugin_events") catch {};
+
+    var plugin_dir = try std.Io.Dir.openDir(.cwd(), testing.io, dir_path, .{});
+    defer plugin_dir.close(testing.io);
+
+    try plugin_dir.writeFile(testing.io, .{
+        .sub_path = "plugin.lua",
+        .data =
+        \\return {
+        \\  name = "event_plugin",
+        \\  version = "1.0.0",
+        \\  description = "Event test plugin"
+        \\}
+        ,
+    });
+    try plugin_dir.writeFile(testing.io, .{
+        .sub_path = "init.lua",
+        .data =
+        \\-- Register a callback that records the tool name in a global.
+        \\nova.on("tool_call_started", function(data)
+        \\  _G.received_tool = data.name
+        \\end)
+        \\nova.register_tool({
+        \\  name = "noop",
+        \\  description = "noop",
+        \\  parameters = {},
+        \\  handler = function() return "ok" end,
+        \\})
+        ,
+    });
+
+    var manager = PluginManager.init(testing.allocator, testing.io, "", "");
+    defer manager.deinit();
+
+    const instance = try manager.loadOne(dir_path, false);
+    try testing.expect(instance.active);
+
+    // Emit a tool_call_started event; the callback should record the name.
+    manager.emitEvent(.{
+        .tool_call_started = .{ .name = "bash", .call_id = "call-1" },
+    });
+
+    // Read back the global the callback set.
+    _ = c.lua_getglobal(instance.state.handle, "received_tool");
+    const got = c.lua_tolstring(instance.state.handle, -1, null);
+    c.lua_pop(instance.state.handle, 1);
+    if (got) |ptr| {
+        try testing.expectEqualStrings("bash", std.mem.span(ptr));
+    } else {
+        return error.CallbackDidNotFire;
+    }
 }

@@ -505,9 +505,22 @@ pub const Agent = struct {
                     try Agent.emitToolDelta(L, ctx.agent, ctx.listener, ctx.tool_index, call.name, call.arguments);
                     try ctx.listener.emit(.delta_end);
                 }
+                // Notify plugins at the tool-call boundary — safe because the
+                // plugin's own handler has not been entered yet on this thread.
+                if (ctx.agent.plugin_manager) |pm| pm.emitEvent(.{
+                    .tool_call_started = .{ .name = call.name, .call_id = call.call_id.slice() },
+                });
             }
 
             fn onFinished(ctx: *@This(), result: *const executor_mod.ToolResult) anyerror!void {
+                // Notify plugins that the tool call completed.
+                if (ctx.agent.plugin_manager) |pm| pm.emitEvent(.{
+                    .tool_call_finished = .{
+                        .name = result.name,
+                        .call_id = result.call_id.slice(),
+                        .success = !result.failed,
+                    },
+                });
                 try Agent.emitToolCallFinished(
                     L,
                     ctx.agent,

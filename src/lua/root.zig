@@ -12,7 +12,6 @@ pub const Manifest = @import("manifest.zig").Manifest;
 pub const PluginManager = @import("manager.zig").PluginManager;
 pub const PluginInstance = @import("manager.zig").PluginInstance;
 pub const Event = @import("events.zig").Event;
-pub const EventBus = @import("events.zig").EventBus;
 pub const plugin_api = @import("plugin_api.zig");
 pub const registry_bridge = @import("registry_bridge.zig");
 
@@ -26,5 +25,4 @@ test {
     std.testing.refAllDecls(PluginManager);
     std.testing.refAllDecls(PluginInstance);
     std.testing.refAllDecls(Event);
-    std.testing.refAllDecls(EventBus);
 }
