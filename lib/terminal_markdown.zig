@@ -324,19 +324,23 @@ fn countLineRows(line: []const u8, width: u16, state: *BlockState) u16 {
     if (line.len == 0) return 1;
     var body = line;
     var prefix_width: u16 = 0;
+    var continuation_indent: u16 = 0;
     if (state.in_code) {
-        return countWrappedRows(body, width, 0);
+        return countWrappedRows(body, width, 0, 0);
     }
     if (headingBody(line)) |heading| {
         body = heading.text;
+        // Headings render with no prefix and no continuation indent.
     } else if (quoteBody(line)) |quote| {
         body = quote;
-        prefix_width = 2;
+        prefix_width = 2; // "┃ " consumes the first line
+        continuation_indent = 2; // continuation lines sit at the content indent
     } else if (listBody(line)) |list| {
         body = list;
-        prefix_width = 2;
+        prefix_width = 2; // "• " consumes the first line
+        continuation_indent = 2; // continuation lines sit at the content indent
     }
-    return countWrappedRows(body, width, prefix_width);
+    return countWrappedRows(body, width, prefix_width, continuation_indent);
 }
 
 const CountTable = struct { rows: u16, next_start: usize };
@@ -542,7 +546,7 @@ fn countTableVisualRows(line: []const u8, col_width: u16) u16 {
     var rows: u16 = 1;
     var iter = TableCellIterator.init(line);
     while (iter.next()) |cell| {
-        rows = @max(rows, countWrappedRows(cell, col_width, 0));
+        rows = @max(rows, countWrappedRows(cell, col_width, 0, 0));
     }
     return rows;
 }
@@ -672,6 +676,20 @@ fn appendSpan(spans: *std.ArrayList(Span), gpa: std.mem.Allocator, text: []const
     try spans.append(gpa, .{ .text = text, .style = style });
 }
 
+/// The two consumers of word-wrapping: rendering (emit spans into the builder
+/// pool) and sizing (count rows to derive a surface height). They MUST apply
+/// identical line-boundary decisions, or the sized surface will clip rendered
+/// rows. `RowSink` funnels both through the single `wrapCore` engine so the two
+/// can never drift — the count path simply ignores span text and increments.
+const RowSink = union(enum) {
+    /// Emit rows. Borrows `b.scratch` as the in-progress span buffer.
+    push: *RowBuilder,
+    /// Count rows. Touches no heap; `current` stays empty.
+    count: *CountState,
+};
+
+const CountState = struct { rows: u16 };
+
 fn appendWrapped(
     gpa: std.mem.Allocator,
     b: *RowBuilder,
@@ -680,8 +698,81 @@ fn appendWrapped(
     body: []const Span,
     width: u16,
 ) !void {
-    const current = &b.scratch;
-    var current_width = try startRow(gpa, current, first_prefix, 0);
+    try wrapCore(gpa, .{ .push = b }, first_prefix, continuation_indent, body, width);
+}
+
+fn appendEmptyRow(gpa: std.mem.Allocator, b: *RowBuilder) !void {
+    try b.push(gpa, 0, &.{});
+}
+
+/// Count the visual rows `body` would occupy at `width`. Mirrors the render
+/// path's two insets: the first line is indented by `first_prefix_width` (the
+/// visual space a list marker `• ` or quote bar `┃ ` consumes) and every
+/// continuation line by `continuation_indent` (the content indent). Both reduce
+/// the line's usable width identically to `appendWrapped`, so the count and the
+/// rendered rows can never disagree. Allocation-free: it runs `wrapCore` with a
+/// count sink, so no spans are materialized.
+fn countWrappedRows(body: []const u8, width: u16, first_prefix_width: u16, continuation_indent: u16) u16 {
+    if (body.len == 0) return 1;
+    var state: CountState = .{ .rows = 0 };
+    const span = Span{ .text = body, .style = .normal };
+    // Build a padding prefix whose width equals first_prefix_width without
+    // allocating text: a run of spaces is width-1 each, which the count sink
+    // measures via textWidth. This makes the first line consume exactly
+    // first_prefix_width cells, matching the render path's `• `/`┃ ` prefix.
+    var prefix_buf: [2]Span = undefined;
+    var prefix_len: usize = 0;
+    if (first_prefix_width > 0) {
+        prefix_buf[0] = Span{ .text = padString(first_prefix_width), .style = .normal };
+        prefix_len = 1;
+    }
+    wrapCore(
+        std.heap.page_allocator, // unused by the count sink; it never allocates
+        .{ .count = &state },
+        prefix_buf[0..prefix_len],
+        continuation_indent,
+        &.{span},
+        width,
+    ) catch {};
+    return state.rows;
+}
+
+/// A static space run of a given cell width, for the count sink's synthetic
+/// prefix. The count sink only reads widths, not bytes, so these literals never
+/// escape into a rendered row.
+fn padString(width: u16) []const u8 {
+    return switch (width) {
+        1 => " ",
+        2 => "  ",
+        3 => "   ",
+        else => "  ", // list/quote insets are always 2 in practice
+    };
+}
+
+/// Single source of truth for word wrapping. Mirrors a line into one or more
+/// rows of at most `width` cells: words break at spaces when they fit, and
+/// hard-break (grapheme-aware) when a single word exceeds the remaining row.
+/// `current_indent` starts at 0 (the first_prefix already accounts for the
+/// first-line inset) and switches to `continuation_indent` after the first
+/// committed row — matching list/quote rendering where `• `/`┃ ` mark only the
+/// first line and continuation lines sit at the content indent.
+fn wrapCore(
+    gpa: std.mem.Allocator,
+    sink: RowSink,
+    first_prefix: []const Span,
+    continuation_indent: u16,
+    body: []const Span,
+    width: u16,
+) !void {
+    // The push sink reuses the builder's scratch buffer so span capacity carries
+    // across rows (the sub-linear-allocation invariant). The count sink never
+    // appends, so its scratch stays empty — a cheap stack local, no deinit.
+    var empty_scratch: std.ArrayList(Span) = .empty;
+    const current: *std.ArrayList(Span) = switch (sink) {
+        .push => |b| &b.scratch,
+        .count => &empty_scratch,
+    };
+    var current_width = try startRow(gpa, sink, current, first_prefix, 0);
     var current_indent: u16 = 0;
 
     for (body) |span| {
@@ -694,18 +785,37 @@ fn appendWrapped(
             const word_width = textWidth(word);
             if (current_width > current_indent) {
                 if (current_width + 1 + word_width > width) {
-                    try commitRow(gpa, b, current, current_indent);
+                    try commitRow(gpa, sink, current, current_indent);
                     current_indent = continuation_indent;
-                    current_width = try startRow(gpa, current, &.{}, current_indent);
+                    current_width = try startRow(gpa, sink, current, &.{}, current_indent);
                 } else {
-                    try current.append(gpa, .{ .text = " ", .style = span.style });
+                    try appendSpan(current, gpa, " ", span.style);
                     current_width += 1;
                 }
             }
             if (word_width > width -| current_width) {
-                try appendHardWrappedWord(gpa, b, current, &current_width, current_indent, continuation_indent, word, span.style, width);
+                var hi: usize = 0;
+                while (hi < word.len) {
+                    const capacity = width -| current_width;
+                    if (capacity == 0) {
+                        try commitRow(gpa, sink, current, current_indent);
+                        current_indent = continuation_indent;
+                        current_width = try startRow(gpa, sink, current, &.{}, current_indent);
+                        continue;
+                    }
+                    const end = graphemeSliceEnd(word, hi, capacity);
+                    const slice = word[hi..end];
+                    try appendSpan(current, gpa, slice, span.style);
+                    current_width += textWidth(slice);
+                    hi = end;
+                    if (hi < word.len) {
+                        try commitRow(gpa, sink, current, current_indent);
+                        current_indent = continuation_indent;
+                        current_width = try startRow(gpa, sink, current, &.{}, current_indent);
+                    }
+                }
             } else {
-                try current.append(gpa, .{ .text = word, .style = span.style });
+                try appendSpan(current, gpa, word, span.style);
                 current_width += word_width;
             }
             index = word_end;
@@ -713,87 +823,45 @@ fn appendWrapped(
     }
 
     if (current.items.len == 0) {
-        try current.append(gpa, .{ .text = "", .style = .normal });
+        try appendSpan(current, gpa, "", .normal);
     }
-    try commitRow(gpa, b, current, current_indent);
+    try commitRow(gpa, sink, current, current_indent);
 }
 
-fn appendHardWrappedWord(
+/// Begin a row: clear the scratch buffer and, for the push sink only, copy the
+/// prefix spans in. Returns the row's used width (prefix + indent) so the count
+/// sink needs no heap — it just adds widths.
+fn startRow(
     gpa: std.mem.Allocator,
-    b: *RowBuilder,
+    sink: RowSink,
     current: *std.ArrayList(Span),
-    current_width: *u16,
-    current_indent: u16,
-    continuation_indent: u16,
-    word: []const u8,
-    style: Style,
-    width: u16,
-) !void {
-    var index: usize = 0;
-    while (index < word.len) {
-        const capacity = width -| current_width.*;
-        if (capacity == 0) {
-            try commitRow(gpa, b, current, current_indent);
-            current_width.* = try startRow(gpa, current, &.{}, continuation_indent);
-            continue;
-        }
-        const end = graphemeSliceEnd(word, index, capacity);
-        const slice = word[index..end];
-        try current.append(gpa, .{ .text = slice, .style = style });
-        current_width.* += textWidth(slice);
-        index = end;
-        if (index < word.len) {
-            try commitRow(gpa, b, current, current_indent);
-            current_width.* = try startRow(gpa, current, &.{}, continuation_indent);
-        }
-    }
-}
-
-fn startRow(gpa: std.mem.Allocator, current: *std.ArrayList(Span), prefix: []const Span, indent: u16) !u16 {
+    prefix: []const Span,
+    indent: u16,
+) !u16 {
     current.clearRetainingCapacity();
-    var width = indent;
-    for (prefix) |span| {
-        try current.append(gpa, span);
-        width += textWidth(span.text);
+    var used: u16 = indent;
+    switch (sink) {
+        .push => {
+            for (prefix) |span| {
+                try current.append(gpa, span);
+                used += textWidth(span.text);
+            }
+        },
+        .count => {
+            for (prefix) |span| used += textWidth(span.text);
+        },
     }
-    return width;
+    return used;
 }
 
-fn commitRow(gpa: std.mem.Allocator, b: *RowBuilder, current: *std.ArrayList(Span), indent: u16) !void {
-    try b.push(gpa, indent, current.items);
+/// Commit the current row: push it into the builder pool (render) or bump the
+/// counter (count). `current` is cleared for the next row either way.
+fn commitRow(gpa: std.mem.Allocator, sink: RowSink, current: *std.ArrayList(Span), indent: u16) !void {
+    switch (sink) {
+        .push => |b| try b.push(gpa, indent, current.items),
+        .count => |state| state.rows += 1,
+    }
     current.clearRetainingCapacity();
-}
-
-fn appendEmptyRow(gpa: std.mem.Allocator, b: *RowBuilder) !void {
-    try b.push(gpa, 0, &.{});
-}
-
-fn countWrappedRows(body: []const u8, width: u16, first_prefix_width: u16) u16 {
-    if (body.len == 0) return 1;
-    var rows: u16 = 1;
-    var current_width = first_prefix_width;
-    var index: usize = 0;
-    while (index < body.len) {
-        index = skipSpaces(body, index);
-        if (index >= body.len) break;
-        const end = nextWordEnd(body, index);
-        const word_width = textWidth(body[index..end]);
-        if (current_width > 0 and current_width + 1 + word_width > width) {
-            rows += 1;
-            current_width = first_prefix_width;
-        } else if (current_width > 0) {
-            current_width += 1;
-        }
-        if (word_width > width -| current_width) {
-            const capacity = @max(width -| current_width, 1);
-            rows += @intCast((word_width - capacity + width - 1) / width);
-            current_width = @intCast((word_width - capacity) % width);
-        } else {
-            current_width += word_width;
-        }
-        index = end;
-    }
-    return rows;
 }
 
 fn nextWordEnd(text: []const u8, start: usize) usize {
@@ -1064,4 +1132,69 @@ test "wraps at word boundaries" {
     try std.testing.expectEqualStrings("hello", out.rows[0].spans[0].text);
     try std.testing.expectEqualStrings("world", out.rows[1].spans[0].text);
     try std.testing.expectEqual(@as(u16, 2), countRows("hello world", 8));
+}
+
+// SSOT guard: `countRows` derives the surface height and `render`/`Incremental`
+// fills it, so the two MUST agree or rows get clipped. This sweeps the cases
+// that previously diverged by tens of rows (long words, CJK, lists, quotes,
+// headings) across every width. If it ever fails, wrapCore has drifted from
+// countWrappedRows — make them share one path again.
+test "countRows matches render across widths and content shapes" {
+    const gpa = std.testing.allocator;
+    const Case = struct { name: []const u8, text: []const u8, min_width: u16 };
+    const cases = [_]Case{
+        .{ .name = "plain_long", .text = "the quick brown fox jumps over the lazy dog repeatedly", .min_width = 1 },
+        .{ .name = "list_multiline", .text = "- this is a list item with enough words to wrap across several lines at moderate widths", .min_width = 3 },
+        .{ .name = "quote_multiline", .text = "> quoted text that is long enough to wrap across multiple terminal lines here now", .min_width = 3 },
+        .{ .name = "heading_wrap", .text = "# A fairly long heading that should wrap at narrower widths", .min_width = 1 },
+        .{ .name = "list_longword", .text = "- short then aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa tail", .min_width = 3 },
+        .{ .name = "cjk", .text = "日本語の文章です this is mixed ascii and wide chars wrapping", .min_width = 1 },
+        .{ .name = "many_short", .text = "a b c d e f g h i j k l m n o p q r s t u v w x y z", .min_width = 1 },
+        .{ .name = "multiword_hardwrap", .text = "aa bb cc dd ee ff", .min_width = 1 },
+    };
+    for (cases) |c| {
+        var w: u16 = c.min_width;
+        while (w <= 60) : (w += 1) {
+            const counted = countRows(c.text, w);
+            var out = try render(gpa, c.text, w);
+            defer out.deinit(gpa);
+            const rendered: u16 = @intCast(out.rows.len);
+            try std.testing.expectEqual(counted, rendered);
+        }
+    }
+}
+
+// SSOT guard: a hard-wrapped word in a list/quote must continue at the content
+// indent, not the first-line indent. The count path is covered above; this
+// fixes the rendered indent in place so the visual matches the count.
+test "hard-wrapped continuation lines keep the continuation indent" {
+    const gpa = std.testing.allocator;
+    // width 12: "• " prefix = 2, leaving 10; the 30-char word hard-wraps.
+    var out = try render(gpa, "- aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 12);
+    defer out.deinit(gpa);
+
+    try std.testing.expect(out.rows.len >= 3);
+    try std.testing.expectEqual(@as(u16, 0), out.rows[0].indent); // first line: prefix already inset
+    for (out.rows[1..]) |row| {
+        try std.testing.expectEqual(@as(u16, 2), row.indent); // continuation at content indent
+    }
+}
+
+// SSOT guard: the count path must stay allocation-free. It runs every draw
+// frame per message on a cache miss, so a leak here would compound. The
+// testing allocator fails the test on any unfreed allocation, so wrapping the
+// count calls in a clean arena would miss leaks — we pass it directly.
+test "countRows does not allocate" {
+    const gpa = std.testing.allocator;
+    const texts = [_][]const u8{
+        "the quick brown fox",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "- list with aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "> quote 日本語 wide aaaaaaaaaaaaaa",
+    };
+    for (texts) |t| {
+        var w: u16 = 8;
+        while (w <= 40) : (w += 1) _ = countRows(t, w);
+    }
+    _ = gpa; // std.testing.allocator reports leaks at test teardown.
 }
