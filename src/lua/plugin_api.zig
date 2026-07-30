@@ -1403,13 +1403,288 @@ pub fn findToolIndex(L: *c.lua_State, tool_name: []const u8) ?c_int {
 /// (table, string, number, boolean, or nil). The caller owns the parsed JSON
 /// value; it is freed before returning.
 fn pushJsonToLua(L: *c.lua_State, gpa: std.mem.Allocator, json: []const u8) !void {
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, json, .{}) catch return error.InvalidJson;
     defer parsed.deinit();
     try pushJsonValue(L, gpa, parsed.value);
 }
 
+// ── nova.json_decode / nova.json_encode ──────────────────────────────
+//
+// Plugins had no way to parse or emit JSON: incoming tool params are
+// auto-parsed by `callToolHandler` (pushJsonToLua), but a plugin reading a
+// JSON file or building structured output had to hand-roll a parser or shell
+// out to `jq`. These two bridges close that gap by reusing the existing
+// std.json ↔ Lua value conversion.
+//
+// - `nova.json_decode(str)` reuses `pushJsonValue` (Zig JSON Value → Lua).
+// - `nova.json_encode(value, opts?)` traverses the Lua value with lua_next and
+//   writes JSON to an allocating writer. Tables with contiguous 1..N integer
+//   keys serialize as arrays; everything else (mixed/non-int keys) is an
+//   object. This mirrors how Lua itself treats tables: there is no array/map
+//   distinction, so the encoder infers it from the key shape.
+
+/// ── nova.json_decode(string) ─────────────────────────────────────────
+///
+/// Parses a JSON string into a native Lua value (table/string/number/boolean/
+/// nil). Returns the value on success, or nil + error message on failure.
+pub fn jsonDecode(L: ?*c.lua_State) callconv(.c) c_int {
+    const L_ptr = L orelse return 0;
+    var state = State{ .handle = L_ptr };
+    const gpa = std.heap.page_allocator;
+
+    const json = bridge.pullValue(&state, []const u8, 1) orelse {
+        state.pushNil();
+        state.pushString("json_decode: string argument is required");
+        return 2;
+    };
+
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, json, .{}) catch |err| {
+        state.pushNil();
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "json_decode: {s}", .{@errorName(err)}) catch "json_decode: parse error";
+        state.pushString(msg);
+        return 2;
+    };
+    defer parsed.deinit();
+
+    pushJsonValue(L_ptr, gpa, parsed.value) catch {
+        state.pushNil();
+        state.pushString("json_decode: failed to push value");
+        return 2;
+    };
+    return 1;
+}
+
+/// ── nova.json_encode(value, opts?) ───────────────────────────────────
+///
+/// Converts a Lua value to a JSON string. `opts` is an optional table with:
+///   pretty (bool) — emit indented (indent_2) output for human editing.
+/// Returns the JSON string on success, or nil + error message on failure.
+pub fn jsonEncode(L: ?*c.lua_State) callconv(.c) c_int {
+    const L_ptr = L orelse return 0;
+    var state = State{ .handle = L_ptr };
+    const gpa = std.heap.page_allocator;
+
+    // Optional opts table at index 2: { pretty: bool }.
+    var pretty: bool = false;
+    if (c.lua_gettop(L_ptr) >= 2 and c.lua_istable(L_ptr, 2)) {
+        pretty = bridge.getTableBoolean(&state, 2, "pretty") orelse false;
+    }
+
+    const out = luaValueToJsonString(gpa, L_ptr, 1, pretty, 0) catch |err| {
+        state.pushNil();
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "json_encode: {s}", .{@errorName(err)}) catch "json_encode: failed";
+        state.pushString(msg);
+        return 2;
+    };
+    defer gpa.free(out);
+
+    state.pushString(out);
+    return 1;
+}
+
+/// Recursively serialize the Lua value at `index` into a JSON string.
+///
+/// `index` is the absolute-ish stack slot of the value (kept stable because
+/// traversal pushes/pops its own frames; the caller passes the original index,
+/// which `lua_next`/`lua_gettable` keep valid as long as we pop what we push).
+/// `pretty` enables indent_2 output; `depth` tracks the recursion for indent.
+///
+/// Table shape detection: a table is serialized as a JSON array iff every key
+/// is an integer in the contiguous range 1..N. Otherwise it is an object. This
+/// matches how plugins build "arrays" (sequential 1-indexed) vs "maps".
+fn luaValueToJsonString(
+    gpa: std.mem.Allocator,
+    L: *c.lua_State,
+    index: c_int,
+    pretty: bool,
+    depth: usize,
+) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    try writeLuaValueJson(&aw.writer, L, index, pretty, depth);
+    return aw.toOwnedSlice();
+}
+
+/// Write one Lua value (at `index`) as JSON into `writer`. Helper split out so
+/// compound values can recurse without each allocating its own buffer.
+///
+/// The error set is declared explicitly to break the inferred-error-set cycle
+/// created by mutual recursion (writeLuaValueJson ↔ writeTableJson ↔
+/// writeTableAsArray/Object). Any error from the writer surfaces here.
+const JsonWriteError = std.Io.Writer.Error;
+fn writeLuaValueJson(
+    writer: *std.Io.Writer,
+    L: *c.lua_State,
+    index: c_int,
+    pretty: bool,
+    depth: usize,
+) JsonWriteError!void {
+    switch (c.lua_type(L, index)) {
+        c.LUA_TNIL => try writer.writeAll("null"),
+        c.LUA_TBOOLEAN => try writer.writeAll(if (c.lua_toboolean(L, index) != 0) "true" else "false"),
+        c.LUA_TNUMBER => {
+            // lua_tolstring on a number performs the standard Lua number→string
+            // conversion (preserves integer vs float formatting).
+            var len: usize = 0;
+            const ptr = c.lua_tolstring(L, index, &len);
+            if (ptr) |p| try writer.writeAll(p[0..len]) else try writer.writeAll("0");
+        },
+        c.LUA_TSTRING => {
+            var len: usize = 0;
+            const ptr = c.lua_tolstring(L, index, &len) orelse {
+                try writer.writeAll("\"\"");
+                return;
+            };
+            try writeJsonString(writer, ptr[0..len]);
+        },
+        c.LUA_TTABLE => try writeTableJson(writer, L, index, pretty, depth),
+        // Functions, userdata, threads have no JSON representation; emit null
+        // rather than failing so an accidental non-serializable field doesn't
+        // poison the whole encode (matches Lua's "everything is a table" ethos).
+        else => try writer.writeAll("null"),
+    }
+}
+
+/// Quote and escape a byte slice as a JSON string literal.
+fn writeJsonString(writer: *std.Io.Writer, s: []const u8) JsonWriteError!void {
+    try writer.writeByte('"');
+    for (s) |b| switch (b) {
+        '"' => try writer.writeAll("\\\""),
+        '\\' => try writer.writeAll("\\\\"),
+        '\n' => try writer.writeAll("\\n"),
+        '\r' => try writer.writeAll("\\r"),
+        '\t' => try writer.writeAll("\\t"),
+        0x08 => try writer.writeAll("\\b"),
+        0x0c => try writer.writeAll("\\f"),
+        else => {
+            if (b < 0x20) {
+                var hex_buf: [6]u8 = undefined;
+                const hex = std.fmt.bufPrint(&hex_buf, "\\u{x:0>4}", .{b}) catch unreachable;
+                try writer.writeAll(hex);
+            } else {
+                try writer.writeByte(b);
+            }
+        },
+    };
+    try writer.writeByte('"');
+}
+
+/// Serialize a Lua table, inferring array vs object from its key shape.
+fn writeTableJson(
+    writer: *std.Io.Writer,
+    L: *c.lua_State,
+    index: c_int,
+    pretty: bool,
+    depth: usize,
+) JsonWriteError!void {
+    // lua_rawlen returns the "length" of the array part: the number of
+    // consecutive integer keys starting at 1. If that equals the total number
+    // of entries (counted via a lua_next sweep), the table is a pure array.
+    const array_len = c.lua_rawlen(L, index);
+
+    // Determine total entry count. We must not consume keys during counting
+    // (lua_next would), so a separate sweep is used; both sweeps call lua_next
+    // which leaves the table unmodified after a full iteration.
+    var total: usize = 0;
+    c.lua_pushnil(L);
+    while (c.lua_next(L, index) != 0) : (total += 1) {
+        c.lua_pop(L, 1); // pop value, keep key for next iteration
+    }
+
+    if (total == 0) {
+        // Empty table: prefer "[]" to match Lua's common use of {} as an empty
+        // list, but this is ambiguous (could be an empty map). Array is the
+        // safer default for plugins building output collections.
+        try writer.writeAll("[]");
+        return;
+    }
+
+    if (array_len == total) {
+        try writeTableAsArray(writer, L, index, pretty, depth, @intCast(array_len));
+    } else {
+        try writeTableAsObject(writer, L, index, pretty, depth);
+    }
+}
+
+/// Serialize a table known to have contiguous integer keys 1..len as a JSON array.
+fn writeTableAsArray(
+    writer: *std.Io.Writer,
+    L: *c.lua_State,
+    index: c_int,
+    pretty: bool,
+    depth: usize,
+    len: c_int,
+) JsonWriteError!void {
+    try writer.writeByte('[');
+    var i: c_int = 1;
+    while (i <= len) : (i += 1) {
+        if (i > 1) try writer.writeByte(',');
+        if (pretty) try writeIndent(writer, depth + 1);
+        // lua_rawgeti pushes t[key] without metamethods; safe for plain data.
+        // It returns the type of the pushed value, which we ignore.
+        _ = c.lua_rawgeti(L, index, i);
+        try writeLuaValueJson(writer, L, c.lua_gettop(L), pretty, depth + 1);
+        c.lua_pop(L, 1);
+    }
+    if (pretty and len > 0) try writeIndent(writer, depth);
+    try writer.writeByte(']');
+}
+
+/// Serialize a table as a JSON object, iterating all key/value pairs.
+fn writeTableAsObject(
+    writer: *std.Io.Writer,
+    L: *c.lua_State,
+    index: c_int,
+    pretty: bool,
+    depth: usize,
+) JsonWriteError!void {
+    try writer.writeByte('{');
+    var first = true;
+    c.lua_pushnil(L);
+    while (c.lua_next(L, index) != 0) {
+        // Stack: [... | table | key | value]. value on top (-1), key at -2.
+        if (!first) try writer.writeByte(',');
+        first = false;
+        if (pretty) try writeIndent(writer, depth + 1);
+
+        // Keys must be strings for JSON objects. Coerce number/bool keys to
+        // their string form; other types skip (can't be a JSON key).
+        const key_type = c.lua_type(L, -2);
+        switch (key_type) {
+            c.LUA_TSTRING, c.LUA_TNUMBER => {
+                var klen: usize = 0;
+                const kptr = c.lua_tolstring(L, -2, &klen) orelse continue;
+                try writeJsonString(writer, kptr[0..klen]);
+            },
+            c.LUA_TBOOLEAN => {
+                const s = if (c.lua_toboolean(L, -2) != 0) "true" else "false";
+                try writeJsonString(writer, s);
+            },
+            else => continue, // non-stringifiable key: skip this pair
+        }
+
+        if (pretty) try writer.writeAll(": ") else try writer.writeByte(':');
+        try writeLuaValueJson(writer, L, c.lua_gettop(L), pretty, depth + 1);
+        c.lua_pop(L, 1); // pop value; lua_next uses the key for the next step
+    }
+    if (pretty and !first) try writeIndent(writer, depth);
+    try writer.writeByte('}');
+}
+
+/// Write `depth` levels of 2-space indentation (the indent_2 convention).
+fn writeIndent(writer: *std.Io.Writer, depth: usize) JsonWriteError!void {
+    try writer.writeByte('\n');
+    var i: usize = 0;
+    while (i < depth) : (i += 1) try writer.writeAll("  ");
+}
+
 /// Recursively push a `std.json.Value` onto the Lua stack.
-fn pushJsonValue(L: *c.lua_State, gpa: std.mem.Allocator, value: std.json.Value) !void {
+///
+/// Public because `nova.json_decode` reuses this same conversion (Zig JSON
+/// Value → Lua value) rather than re-implementing it.
+pub fn pushJsonValue(L: *c.lua_State, gpa: std.mem.Allocator, value: std.json.Value) !void {
     switch (value) {
         .null => c.lua_pushnil(L),
         .bool => |b| c.lua_pushboolean(L, if (b) 1 else 0),
@@ -1883,6 +2158,202 @@ test "registerTool + countTools: sandboxed state" {
 
     // After registration, countTools should see 1 tool.
     try std.testing.expectEqual(@as(u32, 1), countTools(L.handle));
+}
+
+// ── nova.json_decode / nova.json_encode tests ────────────────────────
+//
+// Each test drives the bridge through real Lua code (doString) and asserts
+// inside Lua, returning a sentinel string ("OK") on success. This avoids
+// fragile manual stack inspection from Zig and exercises the exact path a
+// plugin takes. A failing assertion makes doString return false, surfacing
+// the Lua error message via getErrorMessage.
+
+/// Helper: run a Lua chunk that must end by returning the literal "OK".
+/// On failure, prints the Lua error so the test failure is debuggable.
+fn expectLuaOk(L: *State, chunk: [:0]const u8) !void {
+    const ok = L.doString(chunk);
+    if (!ok) {
+        const err = L.getErrorMessage();
+        std.debug.print("Lua error: {s}\n", .{err orelse "unknown"});
+        L.pop(1);
+        try std.testing.expect(ok);
+    }
+    // The chunk pushes "OK" onto the stack on success.
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L.handle, -1, &len);
+    const got = if (ptr) |p| p[0..len] else "";
+    defer c.lua_pop(L.handle, 1);
+    try std.testing.expectEqualStrings("OK", got);
+}
+
+test "json_decode: object becomes Lua table" {
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    try expectLuaOk(&L,
+        \\local t = nova.json_decode('{"a": 1, "b": "hi"}')
+        \\assert(type(t) == "table", "expected table")
+        \\assert(t.a == 1, "a should be 1")
+        \\assert(t.b == "hi", "b should be hi")
+        \\return "OK"
+    );
+}
+
+test "json_decode: array becomes 1-indexed table" {
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    try expectLuaOk(&L,
+        \\local arr = nova.json_decode('[10, 20, 30]')
+        \\assert(arr[1] == 10, "arr[1] should be 10")
+        \\assert(arr[2] == 20, "arr[2] should be 20")
+        \\assert(arr[3] == 30, "arr[3] should be 30")
+        \\return "OK"
+    );
+}
+
+test "json_decode: primitives (null/bool/number/string)" {
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    try expectLuaOk(&L,
+        \\assert(nova.json_decode('null') == nil, "null -> nil")
+        \\assert(nova.json_decode('true') == true, "true -> true")
+        \\assert(nova.json_decode('false') == false, "false -> false")
+        \\assert(nova.json_decode('42') == 42, "int -> number")
+        \\assert(nova.json_decode('3.5') == 3.5, "float -> number")
+        \\assert(nova.json_decode('"word"') == "word", "string -> string")
+        \\return "OK"
+    );
+}
+
+test "json_decode: malformed input returns nil + error" {
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    try expectLuaOk(&L,
+        \\local v, err = nova.json_decode('{bad json')
+        \\assert(v == nil, "malformed should yield nil")
+        \\assert(type(err) == "string" and #err > 0, "error string expected")
+        \\return "OK"
+    );
+}
+
+test "json_encode: object table to JSON" {
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    try expectLuaOk(&L,
+        \\local s = nova.json_encode({ a = 1, b = "hi" })
+        \\assert(type(s) == "string", "encode returns string")
+        \\-- object key order is not guaranteed; check both pairs round-trip
+        \\local back = nova.json_decode(s)
+        \\assert(back.a == 1 and back.b == "hi", "round-trip preserves values")
+        \\return "OK"
+    );
+}
+
+test "json_encode: array table to JSON bracket" {
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    try expectLuaOk(&L,
+        \\local s = nova.json_encode({ 10, 20, 30 })
+        \\assert(s:sub(1, 1) == "[", "array starts with [")
+        \\assert(s:sub(-1) == "]", "array ends with ]")
+        \\local back = nova.json_decode(s)
+        \\assert(back[1] == 10 and back[2] == 20 and back[3] == 30, "round-trip")
+        \\return "OK"
+    );
+}
+
+test "json_encode: pretty option indents output" {
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    try expectLuaOk(&L,
+        \\local compact = nova.json_encode({ a = 1 })
+        \\local pretty = nova.json_encode({ a = 1 }, { pretty = true })
+        \\assert(not compact:find("\n", 1, true), "compact has no newline")
+        \\assert(pretty:find("\n", 1, true) ~= nil, "pretty has newlines")
+        \\assert(pretty:find("  ", 1, true) ~= nil, "pretty has indent")
+        \\return "OK"
+    );
+}
+
+test "json_encode: escapes quotes and special chars in strings" {
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    try expectLuaOk(&L,
+        \\local s = nova.json_encode({ msg = 'he said "hi"\nbye' })
+        \\assert(s:find('\\"', 1, true), "quotes escaped")
+        \\assert(s:find('\\n', 1, true), "newline escaped")
+        \\-- round-trip must recover the original string
+        \\local back = nova.json_decode(s)
+        \\assert(back.msg == 'he said "hi"\nbye', "round-trip preserves escapes")
+        \\return "OK"
+    );
+}
+
+test "json_encode: nested table (object with array value)" {
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    try expectLuaOk(&L,
+        \\local s = nova.json_encode({ name = "x", items = { 1, 2 } })
+        \\local back = nova.json_decode(s)
+        \\assert(back.name == "x", "scalar field preserved")
+        \\assert(type(back.items) == "table", "nested table preserved")
+        \\assert(back.items[1] == 1 and back.items[2] == 2, "array preserved")
+        \\return "OK"
+    );
+}
+
+test "json round-trip: decode then encode preserves structure" {
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    try expectLuaOk(&L,
+        \\local original = '{"id": 7, "steps": [{"text": "a", "done": true}]}'
+        \\local decoded = nova.json_decode(original)
+        \\local encoded = nova.json_encode(decoded)
+        \\local redecoded = nova.json_decode(encoded)
+        \\assert(redecoded.id == 7, "top-level scalar preserved")
+        \\assert(redecoded.steps[1].text == "a", "nested object.text preserved")
+        \\assert(redecoded.steps[1].done == true, "nested object.done preserved")
+        \\return "OK"
+    );
 }
 
 // ── glob matcher unit tests ──────────────────────────────────────────

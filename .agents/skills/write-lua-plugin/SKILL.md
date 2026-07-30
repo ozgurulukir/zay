@@ -70,7 +70,7 @@ descriptive names in `register_tool`.
 into a Lua table before the handler is called. You can access `params.param_name`
 directly — no manual JSON parsing needed.
 
-## Available Bridge Functions (18 total)
+## Available Bridge Functions (25 total)
 
 ### Filesystem (no permission needed)
 - `nova.read_file(path, opts?)` → `{path, content, size, lines, language, mime_type}`
@@ -81,8 +81,18 @@ directly — no manual JSON parsing needed.
   - Find-and-replace first occurrence
 - `nova.search_files(root, pattern, opts?)` → `{query, total_matches, results, truncated}`
   - opts: `file_pattern`, `case_sensitive`, `max_results` (max 200)
+- `nova.find_files(root, pattern, opts?)` → `{root, total_matches, truncated, results}`
+  - Recursive filename glob: `**` (spans dirs), `*` (within segment), `?` (one char)
+  - opts: `max_results` (default 100, max 200). gitignore NOT honored.
 - `nova.list_dir(path)` → `{path, files[], directories[], total_items}`
 - `nova.file_info(path)` → `{size, type, extension, language, mime_type}`
+- `nova.mkdir(path)` → `true` or `nil` — create directory recursively
+- `nova.copy_path(src, dst)` → `true` or `nil` — copy a single file
+- `nova.move_path(src, dst)` → `true` or `nil` — move/rename file or directory
+- `nova.delete_path(path, opts?)` → `true` or `nil` — delete file/dir (`opts.recursive`)
+
+Prefer these dedicated path ops over `nova.run_bash("rm -rf ...")`: they go
+through `sanitizePath` (cwd-confinement guard) and are strictly safer.
 
 ### Shell & Environment (no permission needed)
 - `nova.run_bash(cmd, opts?)` → `{stdout, stderr, code}`
@@ -104,6 +114,18 @@ directly — no manual JSON parsing needed.
 - `nova.on(event, callback)` → `true` — subscribe to lifecycle event
   - Events: `turn_started`, `turn_ended`, `tool_call_started`, `tool_call_finished`, `response_received`, `plugin_loaded`, `plugin_unloaded`
 - `nova.think(prompt)` → _(stub, not yet implemented)_
+
+### JSON (no permission needed)
+- `nova.json_decode(str)` → Lua value or `nil, err`
+  - Parse JSON into a native Lua value (objects → tables, arrays → 1-indexed tables)
+- `nova.json_encode(value, opts?)` → JSON `string` or `nil, err`
+  - Serialize a Lua value to JSON. Contiguous 1..N integer keys → array `[...]`;
+    otherwise object `{...}`. Empty tables → `[]`.
+  - opts: `pretty` (bool) — indent_2 output for human-editable files
+  - Functions/userdata/threads (no JSON form) emit `null`
+
+Use these instead of hand-rolling a JSON parser or shelling out to `jq`. They
+round-trip cleanly for data tables: `json_decode(json_encode(t))` recovers `t`.
 
 ### Plugin Config
 - `plugin.get_config()` → table or nil (from `config.json` `plugins.<name>.settings`)
@@ -131,6 +153,16 @@ parameters = {
 6. **Name tools with underscores** — `my_tool`, not `myTool`
 7. **Use `plugin.get_config()`** for user-configurable settings
 8. **Test with `test_runner`** — create `test.lua` in your plugin directory
+9. **Prefer dedicated tools over bash** — `delete_path` over `run_bash("rm")`,
+   `find_files` over `run_bash("find")`. Dedicated tools are sandboxed; `run_bash`
+   runs unclassified.
+10. **Use `nova.json_encode`/`json_decode` for structured persistence.** When a
+    plugin needs to store structured data (checklists, configs, records), write
+    it as JSON via `nova.write_file(path, nova.json_encode(data, {pretty=true}))`
+    and read it back with `nova.json_decode`. The `pretty` flag makes the file
+    human-editable. A corrupt file should yield `{}` from your loader (guard
+    `json_decode` returning `nil`) so a bad sidecar never blocks the plugin.
+    The todo plugin's `.nova/todos/plans.json` sidecar is the reference pattern.
 
 ## Example: Read + Git Status Tool
 

@@ -122,6 +122,8 @@ fn registerPluginApi(L: *c.lua_State) void {
         .{ .name = "get_project_root", .func = plugin_api.getProjectRoot },
         .{ .name = "register_tool", .func = plugin_api.registerTool },
         .{ .name = "on", .func = plugin_api.onEvent },
+        .{ .name = "json_decode", .func = plugin_api.jsonDecode },
+        .{ .name = "json_encode", .func = plugin_api.jsonEncode },
         .{ .name = "git_status", .func = plugin_api.gitStatus },
         .{ .name = "git_diff", .func = plugin_api.gitDiff },
         .{ .name = "git_log", .func = plugin_api.gitLog },

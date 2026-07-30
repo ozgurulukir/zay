@@ -23,7 +23,7 @@ Plugin structure:
 Plugins register tools using `nova.register_tool()`. Registered tools appear
 in your tool list with the prefix `lua__<plugin>__<tool>` and can be called
 like any other tool. Inside a plugin's Lua sandbox, `nova.*` bridge functions
-(filesystem, shell, git) are available for the plugin's own code.
+(filesystem, shell, git, json) are available for the plugin's own code.
 
 When the user asks you to write a plugin, load the skill:
 ```

@@ -204,3 +204,14 @@ Run all registered test suites. Returns `true` if all tests pass.
 | `nova.register_tool(spec)` | `spec.name`, `spec.description`, `spec.parameters`, `spec.handler` | `true` | Register a tool |
 | `nova.on(event, callback)` | `event`, `callback` | `true` | Subscribe to event |
 | `nova.think(prompt)` | `prompt` | _(stub)_ | Recursive LLM call (not yet implemented) |
+
+### JSON
+
+| Function | Parameters | Returns | Description |
+|----------|-----------|---------|-------------|
+| `nova.json_decode(str)` | JSON `string` | Lua value or `nil, err` | Parse JSON into a native Lua value (objects → tables, arrays → 1-indexed tables). |
+| `nova.json_encode(value, opts?)` | any value, `opts.pretty` | JSON `string` or `nil, err` | Serialize a Lua value to JSON. Contiguous 1..N integer keys → array; otherwise object. `pretty=true` → indent_2. |
+
+These bridges let plugins parse and emit structured data without hand-rolling a
+parser or shelling out to `jq`. `json_decode` reuses Nova's `std.json` parser;
+`json_encode` traverses the Lua value and infers array vs object from key shape.

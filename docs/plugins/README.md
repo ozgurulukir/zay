@@ -169,6 +169,18 @@ matches every `.zig` file at any depth. gitignore is NOT honored.
 | `nova.on(event, callback)` | `event`, `callback` | `true` | Subscribe to a lifecycle event |
 | `nova.think(prompt)` | `prompt` | _(stub)_ | Recursive LLM call (not yet implemented) |
 
+### JSON
+
+| Function | Parameters | Returns | Description |
+|----------|-----------|---------|-------------|
+| `nova.json_decode(str)` | JSON `string` | Lua value (table/string/number/boolean/nil) or `nil, err` | Parse JSON into a native Lua value. Objects → tables, arrays → 1-indexed tables. |
+| `nova.json_encode(value, opts?)` | any Lua value, `opts.pretty` (bool) | JSON `string` or `nil, err` | Serialize a Lua value to JSON. Tables with contiguous 1..N integer keys become arrays `[...]`; others become objects `{...}`. Empty tables serialize as `[]`. Set `opts.pretty = true` for indent_2 output (human-editable files). Functions/userdata/threads (no JSON form) emit `null`. |
+
+Use these instead of hand-rolling a JSON parser or shelling out to `jq`. They
+round-trip cleanly: `json_decode(json_encode(t))` recovers `t` for data tables.
+Note: Lua tables have no array/map distinction, so the encoder infers it from the
+key shape — a table with non-integer or sparse keys serializes as an object.
+
 ### Events
 
 `nova.on(event_name, callback)` subscribes to a lifecycle event. The callback
@@ -314,9 +326,15 @@ shapes models already know from Claude Code / OpenCode / Zed agents:
   (sandboxed alternatives to bash cp/mv/rm/mkdir)
 - **git-tools** — `git_status`, `git_diff`, `git_log`, `git_branch`,
   `git_commit` (with commit-discipline guidance in `prompt.md`)
-- **todo** — todo.txt-format task tracker: `todo_list`, `todo_add`, `todo_done`,
-  `todo_delete`, `todo_prioritize`, `todo_write`. Persists to `.nova/todos.txt`;
-  refreshes on `turn_started` events.
+- **todo** — todo.txt-format task tracker with detailed plans. List tools:
+  `todo_list`, `todo_add`, `todo_done`, `todo_delete`, `todo_prioritize`,
+  `todo_write`. Plan tools (lazy-loaded so the list stays compact):
+  `todo_get_plan`, `todo_set_plan`, `todo_check_step`. The task list persists to
+  `.nova/todos.txt` (todo.txt standard, editable in any editor); detailed
+  per-task plans live in a sidecar `.nova/todos/plans.json` keyed by a stable
+  `id:N` tag. `todo_list` shows only a `[plan:N steps]` marker — plan bodies are
+  fetched on demand via `todo_get_plan` to keep context small. Refreshes on
+  `turn_started` events.
 - **file-watcher** — Event-driven plugin using `nova.on("tool_call_finished", ...)`
 - **hello-world** — Minimal tool registration (demo)
 

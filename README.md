@@ -43,7 +43,7 @@ zig build install -Doptimize=ReleaseFast --prefix $HOME/.local
 - **`/connect`**: Configure AI providers, custom endpoints, and API key management.
 - **`/model`**: Select LLM model & reasoning effort.
 - **`/mcp`**: Real-time Model Context Protocol server status (stdio & remote transports), active tool counts, latency monitoring, server toggling (`Space`/`Enter`), schema re-syncing (`Ctrl+R`), and adding a remote server by URL (`a`, runtime-only).
-- **`/plugins`**: List loaded Lua plugins with active/inactive status. Plugins extend Nova with custom tools, filesystem access, shell commands, and git operations.
+- **`/plugins`**: List loaded Lua plugins with active/inactive status. Plugins extend Nova with custom tools, filesystem access, shell commands, git operations, and JSON persistence.
 - **`/settings`**: Interactive tabbed configuration panel (General, System Prompt, Advanced, About) with `Ctrl+S` instant save.
 - **`/copy` & `/paste`**: Copy selected transcript message blocks or diff comments to the system clipboard; paste into prompt fields (`Ctrl+V` / `Shift+Insert`).
 - **`/help`**: Scrollable quick reference guide with keyboard and mouse wheel navigation.
@@ -111,7 +111,7 @@ of `src/tui/` is split by concern:
 - **`ai/openai_compatible.zig`**: OpenAI-compatible API client with SSE stream parsing and tool-call delta deduplication (prevents tool name corruption when providers stream repeated tool names). `ChatMessage` is a `union(enum) { system, user, assistant, tool }` — illegal combinations (e.g. `.user` with `call_id`) are unrepresentable.
 - **`runtime.zig`**: Dual client lifecycle (primary turn client + compaction/naming secondary clients), context usage tracking reset on model switch, and robust session initialization/resume error recovery.
 - **`session.zig`**: SQLite-backed session persistence (`sessions.sqlite`). Tolerant payload decoding handles both standard text strings and byte array JSON encodings. `SessionSummary.leaf_entry_id` is branded as `?EntryId` (fixed-size `[entry_id_len]u8`) enforcing the DB length invariant at compile time.
-- **`lua/`**: Lua 5.4 plugin SDK — sandboxed plugin runtime with configurable permissions, resource limits (instruction count, memory), event bus, plugin lifecycle management, and 18 bridge functions (filesystem, shell, git, tool registration). See `docs/plugins/` for the full plugin development guide.
+- **`lua/`**: Lua 5.4 plugin SDK — sandboxed plugin runtime with configurable permissions, resource limits (instruction count, memory), event bus, plugin lifecycle management, and 25 bridge functions (filesystem, shell, git, json, tool registration). See `docs/plugins/` for the full plugin development guide.
 - **`tools/lua_test_runner.zig`**: Standalone Lua test runner — `zig build test-plugin` runs Lua test files through the Nova sandbox.
 
 ## Documentation
@@ -151,7 +151,7 @@ references, but useful for users too:
 | search-tools | `grep`, `glob` | [prompt.md](examples/plugins/search-tools/prompt.md) |
 | path-tools | `create_directory`, `copy_path`, `move_path`, `delete_path` | [prompt.md](examples/plugins/path-tools/prompt.md) |
 | git-tools | `git_status`, `git_diff`, `git_log`, `git_branch`, `git_commit` | [prompt.md](examples/plugins/git-tools/prompt.md) |
-| todo | `todo_list`, `todo_add`, `todo_done`, `todo_delete`, `todo_prioritize`, `todo_write` | [prompt.md](examples/plugins/todo/prompt.md) |
+| todo | `todo_list`, `todo_add`, `todo_done`, `todo_delete`, `todo_prioritize`, `todo_write`, `todo_get_plan`, `todo_set_plan`, `todo_check_step` | [prompt.md](examples/plugins/todo/prompt.md) |
 | file-watcher | `track_file_op`, `file_stats` | [prompt.md](examples/plugins/file-watcher/prompt.md) |
 | hello-world | `greet`, `current_time` | [prompt.md](examples/plugins/hello-world/prompt.md) |
 
