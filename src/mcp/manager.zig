@@ -376,7 +376,21 @@ test "McpManager rejects server configs missing a transport at parse time" {
     // manager no longer needs a "no command or url configured" runtime
     // fallback. See McpServerConfig.transport (config.zig).
     const gpa = std.testing.allocator;
-    _ = gpa;
+    const config_json =
+        \\{
+        \\  "mcpServers": {
+        \\    "broken_server": {
+        \\      "env": { "FOO": "bar" }
+        \\    }
+        \\  }
+        \\}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, config_json, .{});
+    defer parsed.deinit();
+
+    const config_mod = @import("../config/parse.zig");
+    const result = config_mod.parseMcpServers(gpa, parsed.value);
+    try std.testing.expectError(error.InvalidMcpServerConfig, result);
 }
 
 test "McpManager skips duplicate server names in config" {

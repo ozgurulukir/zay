@@ -424,5 +424,25 @@ test "static models match openai codex catalog" {
 }
 
 test "sign out removes missing auth file without error" {
-    try signOut(std.testing.allocator, std.testing.io, "/tmp/nova-missing-home-for-signout-test");
+    const gpa = std.testing.allocator;
+    const home_dir = "/tmp/nova-missing-home-for-signout-test";
+
+    // Ensure file is absent before testing
+    const auth_file = try std.fs.path.join(gpa, &.{ home_dir, ".config", "nova", "auth.json" });
+    defer gpa.free(auth_file);
+
+    if (std.fs.cwd().access(auth_file, .{})) {
+        try std.fs.cwd().deleteFile(auth_file);
+    } else |err| {
+        try std.testing.expect(err == error.FileNotFound);
+    }
+
+    try signOut(gpa, std.testing.io, home_dir);
+
+    // Assert it is still absent
+    std.fs.cwd().access(auth_file, .{}) catch |err| {
+        try std.testing.expect(err == error.FileNotFound);
+        return;
+    };
+    return error.TestExpectedFileNotFound;
 }
