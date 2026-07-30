@@ -26,6 +26,11 @@ pub const RunOptions = struct {
     command: []const u8,
     env_map: ?*const std.process.Environ.Map = null,
     timeout: std.Io.Timeout = timeoutFromSeconds(timeout_seconds_default),
+    /// Bytes piped to the child's stdin before it sees EOF. Null (default)
+    /// inherits no stdin. Piping data — rather than embedding it in `command` —
+    /// keeps it out of shell interpretation, which is how the git bridge passes
+    /// commit messages (`git commit -F -`) without injection risk.
+    stdin: ?[]const u8 = null,
 };
 
 pub fn timeoutFromSeconds(seconds: u32) std.Io.Timeout {
@@ -40,6 +45,13 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, command: []const
 pub fn runWithOptions(gpa: std.mem.Allocator, io: std.Io, options: RunOptions) !Result {
     assert(options.cwd.len > 0);
     assert(options.command.len > 0);
+
+    // The `stdin` path must spawn a child (so the pipe can be fed) rather than
+    // use `std.process.run`. The no-stdin path keeps the simpler one-shot run.
+    if (options.stdin) |stdin_bytes| {
+        return runWithStdinImpl(gpa, io, options.cwd, options.command, stdin_bytes, options.env_map, options.timeout);
+    }
+
     const child_result = try std.process.run(gpa, io, .{
         .argv = &.{ bashPath(io), "-c", options.command },
         .cwd = .{ .path = options.cwd },
@@ -67,9 +79,22 @@ pub fn runWithStdin(
 ) !Result {
     assert(cwd.len > 0);
     assert(command.len > 0);
+    return runWithStdinImpl(gpa, io, cwd, command, stdin, null, timeoutFromSeconds(timeout_seconds_default));
+}
+
+fn runWithStdinImpl(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    command: []const u8,
+    stdin: []const u8,
+    env_map: ?*const std.process.Environ.Map,
+    timeout: std.Io.Timeout,
+) !Result {
     var child = try std.process.spawn(io, .{
         .argv = &.{ bashPath(io), "-c", command },
         .cwd = .{ .path = cwd },
+        .environ_map = env_map,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -85,10 +110,10 @@ pub fn runWithStdin(
         child.stdin = null;
     }
 
-    return drainChild(gpa, io, &child);
+    return drainChild(gpa, io, &child, timeout);
 }
 
-fn drainChild(gpa: std.mem.Allocator, io: std.Io, child: *std.process.Child) !Result {
+fn drainChild(gpa: std.mem.Allocator, io: std.Io, child: *std.process.Child, timeout: std.Io.Timeout) !Result {
     assert(child.stdout != null);
     assert(child.stderr != null);
 
@@ -100,7 +125,7 @@ fn drainChild(gpa: std.mem.Allocator, io: std.Io, child: *std.process.Child) !Re
     const stdout_reader = multi_reader.reader(0);
     const stderr_reader = multi_reader.reader(1);
 
-    while (multi_reader.fill(64, .none)) |_| {
+    while (multi_reader.fill(64, timeout)) |_| {
         if (stdout_reader.buffered().len > stdout_bytes_limit) return error.StreamTooLong;
         if (stderr_reader.buffered().len > stderr_bytes_limit) return error.StreamTooLong;
     } else |err| switch (err) {

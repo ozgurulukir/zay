@@ -1051,21 +1051,33 @@ pub fn gitDiff(L: ?*c.lua_State) callconv(.c) c_int {
     };
     defer std.heap.page_allocator.free(cwd);
 
-    const cmd = if (path) |p|
-        std.fmt.allocPrint(std.heap.page_allocator, "git diff -- {s}", .{p}) catch {
-            state.pushNil();
-            state.pushString("out of memory");
-            return 2;
-        }
-    else
-        std.heap.page_allocator.dupe(u8, "git diff") catch {
+    // Build `git diff [-- <escaped-path>]`. The path is single-quote-escaped so
+    // a malicious `path = "x; rm -rf ~"` cannot break out of the argument —
+    // it becomes a literal argument to `git diff`, not shell syntax. Quotes
+    // inside the path are neutralized by the `'` → `'\''` transform.
+    var cmd: []u8 = undefined;
+    if (path) |p| {
+        const quoted = shellQuote(std.heap.page_allocator, p) catch {
             state.pushNil();
             state.pushString("out of memory");
             return 2;
         };
+        defer std.heap.page_allocator.free(quoted);
+        cmd = std.fmt.allocPrint(std.heap.page_allocator, "git diff -- {s}", .{quoted}) catch {
+            state.pushNil();
+            state.pushString("out of memory");
+            return 2;
+        };
+    } else {
+        cmd = std.heap.page_allocator.dupe(u8, "git diff") catch {
+            state.pushNil();
+            state.pushString("out of memory");
+            return 2;
+        };
+    }
     defer std.heap.page_allocator.free(cmd);
 
-    var result = bash_exec.run(std.heap.page_allocator, io, cwd, cmd) catch |err| {
+    var result = bash_exec.runWithOptions(std.heap.page_allocator, io, .{ .cwd = cwd, .command = cmd }) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -1101,7 +1113,9 @@ pub fn gitLog(L: ?*c.lua_State) callconv(.c) c_int {
     };
     defer std.heap.page_allocator.free(cmd);
 
-    var result = bash_exec.run(std.heap.page_allocator, io, cwd, cmd) catch |err| {
+    // `n` is a clamped integer, so it carries no injection risk; routing through
+    // runWithOptions keeps the command on the classified path regardless.
+    var result = bash_exec.runWithOptions(std.heap.page_allocator, io, .{ .cwd = cwd, .command = cmd }) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -1161,15 +1175,14 @@ pub fn gitCommit(L: ?*c.lua_State) callconv(.c) c_int {
     };
     defer std.heap.page_allocator.free(cwd);
 
-    // Stage all and commit
-    const cmd = std.fmt.allocPrint(std.heap.page_allocator, "git add -A && git commit -m \"{s}\"", .{msg}) catch {
-        state.pushNil();
-        state.pushString("out of memory");
-        return 2;
-    };
-    defer std.heap.page_allocator.free(cmd);
-
-    var result = bash_exec.run(std.heap.page_allocator, io, cwd, cmd) catch |err| {
+    // Stage all and commit. The message is piped via stdin to `git commit -F -`
+    // so shell metacharacters in `msg` are never interpreted — embedding it in
+    // `-m "{msg}"` would let `msg = 'x"; rm -rf ~; #'` break out of the quotes.
+    var result = bash_exec.runWithOptions(std.heap.page_allocator, io, .{
+        .cwd = cwd,
+        .command = "git add -A && git commit -F -",
+        .stdin = msg,
+    }) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -1616,6 +1629,32 @@ fn findGitRoot(io: std.Io, cwd: []const u8) ![]u8 {
     return error.GitRootNotFound;
 }
 
+/// Single-quote-escape `arg` so it can be embedded as a single shell argument
+/// without being interpreted. Wraps the result in `'...'` and rewrites every
+/// embedded `'` as `'\''` — the standard idiom that closes the quote, emits a
+/// literal quote, and reopens. A malicious `path = "x'; rm -rf ~; #"` becomes
+/// `'x'\''; rm -rf ~; #'`, which the shell sees as one inert argument.
+/// Caller owns the returned slice.
+fn shellQuote(gpa: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]u8 {
+    // Worst case: every byte is a quote, each expanding to 4 bytes (`'\''`),
+    // plus the two wrapping quotes.
+    const max_len = arg.len * 4 + 2;
+    var out: std.ArrayList(u8) = .empty;
+    try out.ensureTotalCapacity(gpa, max_len);
+    errdefer out.deinit(gpa);
+
+    try out.append(gpa, '\'');
+    for (arg) |byte| {
+        if (byte == '\'') {
+            try out.appendSlice(gpa, "'\\''");
+        } else {
+            try out.append(gpa, byte);
+        }
+    }
+    try out.append(gpa, '\'');
+    return out.toOwnedSlice(gpa);
+}
+
 /// Test whether `name` matches the user-supplied `file_pattern`.
 ///
 /// `file_pattern` is the loose glob the plugin passed (e.g. `"*.lua"`). It is
@@ -1892,4 +1931,159 @@ test "matchGlob: trailing double-star matches remainder" {
     try std.testing.expect(matchGlob("src/a/b/c", "src/**"));
     try std.testing.expect(matchGlob("src", "src/**"));
     try std.testing.expect(!matchGlob("lib/a", "src/**"));
+}
+
+// ── P0: shell-injection regression tests ──────────────────────────────
+//
+// The git bridges (`gitDiff`/`gitLog`/`gitCommit`) previously embedded
+// plugin-supplied strings into a `bash -c` command, letting a malicious plugin
+// break out of quotes. Each test drives the exact escaping/stdin path the
+// bridges now use and asserts an injection payload leaves no side effect.
+
+/// Run a shell command, discarding its output and any error. For best-effort
+/// test cleanup (`rm -rf`) where the result is irrelevant; keeps call sites a
+/// single line instead of repeating the bind/deinit/discard ladder.
+fn ignoreRun(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, command: []const u8) void {
+    var result = bash_exec.run(gpa, io, cwd, command) catch return;
+    result.deinit(gpa);
+}
+
+/// True when `git` is on PATH (so the git-backed injection tests can run).
+fn gitAvailable() bool {
+    if (std.process.run(std.testing.allocator, std.testing.io, .{
+        .argv = &.{ "git", "--version" },
+    })) |r| {
+        std.testing.allocator.free(r.stdout);
+        std.testing.allocator.free(r.stderr);
+        return true;
+    } else |_| return false;
+}
+
+/// Create an empty git repo under `/tmp/nova-inject-test`, returning the path.
+/// Caller frees the path; the dir is removed via the shell. Sets a deterministic
+/// identity so `git commit` does not refuse to run.
+fn makeInjectionTestRepo(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
+    const dir = try std.fs.path.join(gpa, &.{ "/tmp", "nova-inject-test" });
+    errdefer gpa.free(dir);
+    ignoreRun(gpa, io, "/tmp", "rm -rf nova-inject-test");
+    var result = try bash_exec.run(
+        gpa,
+        io,
+        "/tmp",
+        "mkdir -p nova-inject-test && git -C nova-inject-test init -q && " ++
+            "git -C nova-inject-test config user.email t@t && " ++
+            "git -C nova-inject-test config user.name t",
+    );
+    result.deinit(gpa);
+    return dir;
+}
+
+/// True iff the file at `absolute_path` exists. Routed through the shell so the
+/// test does not depend on a specific Dir API name for absolute paths.
+fn fileExists(gpa: std.mem.Allocator, io: std.Io, absolute_path: []const u8) bool {
+    const cmd = std.fmt.allocPrint(gpa, "test -f {s}", .{absolute_path}) catch return false;
+    defer gpa.free(cmd);
+    var result = bash_exec.run(gpa, io, "/tmp", cmd) catch return false;
+    defer result.deinit(gpa);
+    return result.code == 0;
+}
+
+test "shellQuote: plain argument is wrapped in single quotes" {
+    const gpa = std.testing.allocator;
+    const quoted = try shellQuote(gpa, "src/main.zig");
+    defer gpa.free(quoted);
+    try std.testing.expectEqualStrings("'src/main.zig'", quoted);
+}
+
+test "shellQuote: embedded quote is escaped (injection vector neutralized)" {
+    const gpa = std.testing.allocator;
+    const quoted = try shellQuote(gpa, "x'; rm -rf ~; #");
+    defer gpa.free(quoted);
+    try std.testing.expectEqualStrings("'x'\\''; rm -rf ~; #'", quoted);
+}
+
+test "shellQuote: empty argument becomes two quotes" {
+    const gpa = std.testing.allocator;
+    const quoted = try shellQuote(gpa, "");
+    defer gpa.free(quoted);
+    try std.testing.expectEqualStrings("''", quoted);
+}
+
+test "gitCommit: injection payload stays a literal commit message (stdin path)" {
+    if (!gitAvailable()) return;
+
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = try makeInjectionTestRepo(gpa, io);
+    defer {
+        ignoreRun(gpa, io, "/tmp", "rm -rf nova-inject-test");
+        gpa.free(dir);
+    }
+
+    // The injection vector from the plan: a quote-break-out attempt. With the
+    // old `-m "{msg}"` it would run `touch /tmp/pwned_nova`; with `-F -` +
+    // stdin it must become the literal commit subject.
+    const marker = "/tmp/pwned_nova_commit";
+    ignoreRun(gpa, io, "/tmp", "rm -f pwned_nova_commit");
+    const payload = "x\"; touch " ++ marker ++ "; #";
+    var result = try bash_exec.runWithOptions(gpa, io, .{
+        .cwd = dir,
+        .command = "git add -A && git commit -F -",
+        .stdin = payload,
+    });
+    result.deinit(gpa);
+
+    // The marker file must NOT exist: the payload never reached the shell.
+    try std.testing.expect(!fileExists(gpa, io, marker));
+    ignoreRun(gpa, io, "/tmp", "rm -f pwned_nova_commit");
+}
+
+test "gitDiff: injection payload stays a literal pathspec (shellQuote path)" {
+    if (!gitAvailable()) return;
+
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = try makeInjectionTestRepo(gpa, io);
+    defer {
+        ignoreRun(gpa, io, "/tmp", "rm -rf nova-inject-test");
+        gpa.free(dir);
+    }
+
+    // A commit so `git diff` has something to diff against.
+    var setup = try bash_exec.run(gpa, io, dir, "echo a > f && git add -A && git commit -q -m init");
+    setup.deinit(gpa);
+
+    const marker = "/tmp/pwned_nova_diff";
+    ignoreRun(gpa, io, "/tmp", "rm -f pwned_nova_diff");
+    // The quote-break-out payload, funneled through `shellQuote` exactly as
+    // `gitDiff` does, must become one inert pathspec.
+    const quoted = try shellQuote(gpa, "x'; touch " ++ marker ++ "; #");
+    defer gpa.free(quoted);
+    const cmd = try std.fmt.allocPrint(gpa, "git diff -- {s}", .{quoted});
+    defer gpa.free(cmd);
+    var result = try bash_exec.runWithOptions(gpa, io, .{
+        .cwd = dir,
+        .command = cmd,
+    });
+    result.deinit(gpa);
+
+    try std.testing.expect(!fileExists(gpa, io, marker));
+    ignoreRun(gpa, io, "/tmp", "rm -f pwned_nova_diff");
+}
+
+test "RunOptions.stdin bypasses shell interpretation" {
+    // The stdin path passes the payload verbatim to the child, so shell
+    // metacharacters in it are data, not syntax. Confirm `cat` echoes the
+    // payload untouched (no command-substitution, no quoting collapse).
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+    var result = try bash_exec.runWithOptions(gpa, std.testing.io, .{
+        .cwd = cwd,
+        .command = "cat",
+        .stdin = "a$(touch /tmp/pwned_nova_stdin)b",
+    });
+    defer result.deinit(gpa);
+    try std.testing.expectEqualStrings("a$(touch /tmp/pwned_nova_stdin)b", result.stdout);
+    ignoreRun(gpa, std.testing.io, "/tmp", "rm -f pwned_nova_stdin");
 }

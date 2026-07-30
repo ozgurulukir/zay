@@ -145,6 +145,36 @@ pub fn deinit(self: *Thread, gpa: std.mem.Allocator) void {
     self.* = undefined;
 }
 
+/// Build a live lane `Thread` for `createParallelLane`: a worktree identity
+/// (`branch`/`path`) plus the owned runtime driving it, carrying the
+/// fork-time parent context. The moved fields (`branch`, `path`, `context`,
+/// `runtime`) are adopted by the returned thread, so the caller keeps the
+/// `errdefer`s that free/destroy them until this returns. Centralizes the
+/// nested `.engine.live` literal so the lane-creation call site reads as
+/// intent, not boilerplate.
+pub fn initLive(
+    id: session.SessionId,
+    agent: *agent_mod.Agent,
+    io: std.Io,
+    runtime_gpa: std.mem.Allocator,
+    context: [][]u8,
+    branch: []u8,
+    path: []u8,
+    live_runtime: *runtime.AgentRuntime,
+) Thread {
+    return .{
+        .id = id,
+        .agent = agent,
+        .worker_context = .{ .io = io, .gpa = runtime_gpa },
+        .parent_context = context,
+        .engine = .{ .live = .{
+            .lane = .{ .working = .{ .branch = branch, .path = path } },
+            .runtime = live_runtime,
+            .owns = true,
+        } },
+    };
+}
+
 pub fn pushPromptHistory(self: *Thread, gpa: std.mem.Allocator, text: []const u8) !void {
     if (text.len == 0) return;
     if (self.prompt_history.items.len > 0) {

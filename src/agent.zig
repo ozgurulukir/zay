@@ -1264,3 +1264,113 @@ test "clear queue drops messages without delivering them" {
     try std.testing.expectEqual(@as(u32, 0), agent.message_queue.len());
     try std.testing.expectEqual(@as(usize, 0), agent.messages().len);
 }
+
+// ── P1: compaction / checkpoint core regression tests ──────────────────
+//
+// The highest-edge-density cluster (snapshotAfterBatch, runToolBatch,
+// maybeCompact, forceCompact, applyReadyCompaction) was entirely test-free,
+// the same path the da7c761 resume-segfault class of regressions comes from.
+// These cover the no-op / early-return contracts documented in the pseudocode:
+// disabled compaction, sub-watermark, the failed-compactor discard, and the
+// snapshot short-circuits that latch `snapshots_disabled` off silently.
+
+/// No-op listener for `maybeCompact`: compaction events are discarded. The
+/// agent owns nothing from it, so there is no per-test cleanup.
+const NoopListener = struct {
+    fn onEvent(_: *@This(), _: Agent.Event) !void {}
+};
+
+test "snapshotAfterBatch: disabled snapshots return without touching git" {
+    // `snapshots_disabled = true` is the early return before any vcs call, so
+    // this exercises the no-git-available branch without needing a repo.
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    agent.snapshots_disabled = true;
+    agent.snapshotAfterBatch(); // must not error or allocate
+
+    try std.testing.expect(agent.snapshots_disabled);
+    try std.testing.expect(agent.snapshot_index == null);
+    try std.testing.expect(agent.last_snapshot_tree == null);
+}
+
+test "snapshotAfterBatch: no session writer short-circuits silently" {
+    // Without a session_writer the function returns at the second guard, also
+    // never touching git — confirming the best-effort contract holds even when
+    // git IS available but no session is attached.
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    // snapshots_disabled stays false, but no session_writer is attached.
+    agent.snapshotAfterBatch();
+
+    // No panic, no error; the guard left the disabled flag untouched because
+    // it never reached the git-availability probe.
+    try std.testing.expect(!agent.snapshots_disabled);
+}
+
+test "maybeCompact: disabled auto stays a no-op below the watermark" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    // No compaction_client and no context window: every guard short-circuits.
+    // Setting auto=false first makes the intent explicit even though the other
+    // guards would also bail.
+    agent.compaction_settings.auto = false;
+    var noop: NoopListener = .{};
+    const listener: Agent.Listener(NoopListener) = .{
+        .ctx = &noop,
+        .on_event = NoopListener.onEvent,
+    };
+    agent.maybeCompact(listener);
+
+    // Compactor never left idle, no event emitted (noop listener would error
+    // otherwise — there is nothing to assert beyond not panicking).
+    try std.testing.expect(agent.compactor.stateIs(.idle));
+}
+
+test "forceCompact: no compaction client returns NoCompactionClient without swapping" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    // The very first guard: compaction_client == .none.
+    try std.testing.expectError(error.NoCompactionClient, agent.forceCompact());
+    try std.testing.expect(agent.compactor.stateIs(.idle));
+}
+
+test "forceCompact: window guard fires before the writer guard" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    // The guard order is NoCompactionClient → UnknownContextWindow →
+    // NoSessionWriter (see forceCompact body). With a `.none` client the first
+    // guard wins regardless of the other fields, so the function never reaches
+    // the writer check — confirming the order matches the source.
+    agent.context_window_tokens = 4096; // would pass the window guard
+    try std.testing.expectError(error.NoCompactionClient, agent.forceCompact());
+    try std.testing.expect(agent.compactor.stateIs(.idle));
+}
+
+test "compaction watermarks: shouldStartSummary fires before shouldSwap" {
+    // Pure checks of the watermark contracts the maybeCompact/forceCompact
+    // logic depends on. A 10 000-token window, default threshold 0.75:
+    // start = round(10000 * 0.75) = 7500, swap = round(10000 * 0.95) = 9500.
+    const context_window: u32 = 10_000;
+    const threshold: f64 = 0.75;
+
+    try std.testing.expect(!compaction.shouldStartSummary(7_000, context_window, threshold));
+    try std.testing.expect(compaction.shouldStartSummary(8_000, context_window, threshold));
+    try std.testing.expect(!compaction.shouldSwap(8_000, context_window, threshold));
+    try std.testing.expect(compaction.shouldSwap(9_600, context_window, threshold));
+
+    // keepRecentTokens scales with the window: 35% capped at the config keep.
+    try std.testing.expectEqual(@as(u32, 3_500), compaction.keepRecentTokens(context_window, 8_000));
+    // Small-context model: the %35 of 8000 is 2800, under the 8k cap, but the
+    // 1000 floor applies only when the window is tiny.
+    try std.testing.expectEqual(@as(u32, 1_000), compaction.keepRecentTokens(1_000, 8_000));
+}

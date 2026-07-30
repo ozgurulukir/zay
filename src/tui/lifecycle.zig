@@ -263,17 +263,16 @@ pub fn createParallelLane(self: *App) !void {
 
     const lane = try self.gpa.create(Thread);
     errdefer self.gpa.destroy(lane);
-    lane.* = .{
-        .id = runtime.session_writer.session.id,
-        .agent = &runtime.agent,
-        .worker_context = .{ .io = self.io, .gpa = runtime.gpa },
-        .parent_context = context,
-        .engine = .{ .live = .{
-            .lane = .{ .working = .{ .branch = branch, .path = dest } },
-            .runtime = runtime,
-            .owns = true,
-        } },
-    };
+    lane.* = Thread.initLive(
+        runtime.session_writer.session.id,
+        &runtime.agent,
+        self.io,
+        runtime.gpa,
+        context,
+        branch,
+        dest,
+        runtime,
+    );
     try self.threads.append(self.gpa, lane);
 
     // Committed: `threads` owns `lane`, which owns `runtime`/`branch`/`dest`.
