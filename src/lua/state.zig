@@ -15,8 +15,9 @@ pub const State = struct {
     const Self = @This();
 
     /// Create a new Lua state with all standard libraries opened.
-    pub fn init() Self {
-        const L = c.luaL_newstate() orelse @panic("luaL_newstate returned null");
+    /// Returns `error.LuaInitFailed` if the Lua runtime cannot allocate the state.
+    pub fn init() error{LuaInitFailed}!Self {
+        const L = c.luaL_newstate() orelse return error.LuaInitFailed;
         c.luaL_openlibs(L);
         return Self{ .handle = L };
     }
@@ -262,13 +263,13 @@ pub const State = struct {
 };
 
 test "lua state: create and destroy" {
-    var L = State.init();
+    var L = try State.init();
     defer L.deinit();
     try std.testing.expect(L.getTop() == 0);
 }
 
 test "lua state: doString with arithmetic" {
-    var L = State.init();
+    var L = try State.init();
     defer L.deinit();
 
     // Run a simple expression
@@ -279,7 +280,7 @@ test "lua state: doString with arithmetic" {
 }
 
 test "lua state: doString with string" {
-    var L = State.init();
+    var L = try State.init();
     defer L.deinit();
 
     try std.testing.expect(L.doString("return 'hello, world'"));
@@ -291,7 +292,7 @@ test "lua state: doString with string" {
 }
 
 test "lua state: loadString + pcall" {
-    var L = State.init();
+    var L = try State.init();
     defer L.deinit();
 
     try L.loadString("return 3 * 4");
@@ -302,7 +303,7 @@ test "lua state: loadString + pcall" {
 }
 
 test "lua state: load error" {
-    var L = State.init();
+    var L = try State.init();
     defer L.deinit();
 
     // Syntax error
@@ -310,7 +311,7 @@ test "lua state: load error" {
 }
 
 test "lua state: pcall runtime error" {
-    var L = State.init();
+    var L = try State.init();
     defer L.deinit();
 
     try L.loadString("error('boom')");
@@ -323,7 +324,7 @@ test "lua state: pcall runtime error" {
 }
 
 test "lua state: table operations" {
-    var L = State.init();
+    var L = try State.init();
     defer L.deinit();
 
     try std.testing.expect(L.doString(
@@ -345,7 +346,7 @@ test "lua state: table operations" {
 
 test "lua state: loadBuffer loads pre-compiled bytecode" {
     const gpa = std.testing.allocator;
-    var L = State.init();
+    var L = try State.init();
     defer L.deinit();
 
     // Load source, dump to bytecode
@@ -355,7 +356,7 @@ test "lua state: loadBuffer loads pre-compiled bytecode" {
     L.pop(1); // pop the loaded function
 
     // Load bytecode in a fresh state
-    var L2 = State.init();
+    var L2 = try State.init();
     defer L2.deinit();
     try L2.loadBuffer(bytecode, "test");
     const rc = L2.pcall(0, 1);
@@ -366,7 +367,7 @@ test "lua state: loadBuffer loads pre-compiled bytecode" {
 
 test "lua state: dump and loadBuffer round-trips" {
     const gpa = std.testing.allocator;
-    var L = State.init();
+    var L = try State.init();
     defer L.deinit();
 
     try L.loadString("return 'hello, bytecode!'");

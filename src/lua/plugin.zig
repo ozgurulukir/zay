@@ -23,11 +23,11 @@ pub const Plugin = struct {
     const Self = @This();
 
     /// Initialize a new plugin with a sandboxed Lua state.
-    pub fn init(name: []const u8, is_embedded: bool, permissions: sandbox.Permissions) Self {
+    pub fn init(name: []const u8, is_embedded: bool, permissions: sandbox.Permissions) error{ LuaInitFailed, OutOfMemory }!Self {
         const perms = if (is_embedded) sandbox.Permissions{
             .full_access = true,
         } else permissions;
-        const L = sandbox.createSandboxedState(perms);
+        const L = try sandbox.createSandboxedState(perms);
         return Self{
             .name = name,
             .state = L,
@@ -65,13 +65,13 @@ pub const Plugin = struct {
 };
 
 test "plugin: create and destroy" {
-    var p = Plugin.init("test_plugin", false, .{});
+    var p = try Plugin.init("test_plugin", false, .{});
     defer p.deinit();
     try std.testing.expectEqualStrings("test_plugin", p.name);
 }
 
 test "plugin: load and run code" {
-    var p = Plugin.init("test_plugin", false, .{});
+    var p = try Plugin.init("test_plugin", false, .{});
     defer p.deinit();
 
     try std.testing.expect(p.loadChunk("return 2 + 2"));
@@ -81,7 +81,7 @@ test "plugin: load and run code" {
 }
 
 test "plugin: sandbox blocks dangerous access" {
-    var p = Plugin.init("test_plugin", false, .{});
+    var p = try Plugin.init("test_plugin", false, .{});
     defer p.deinit();
 
     // io should be nil in sandbox
@@ -96,7 +96,7 @@ test "plugin: sandbox blocks dangerous access" {
 }
 
 test "plugin: embedded plugin has full access" {
-    var p = Plugin.init("embedded", true, .{});
+    var p = try Plugin.init("embedded", true, .{});
     defer p.deinit();
 
     try std.testing.expect(p.loadChunk("return type(io) == 'table'"));
@@ -105,7 +105,7 @@ test "plugin: embedded plugin has full access" {
 }
 
 test "plugin: permissions are respected" {
-    var p = Plugin.init("test_plugin", false, .{
+    var p = try Plugin.init("test_plugin", false, .{
         .allow_os_execute = true,
     });
     defer p.deinit();

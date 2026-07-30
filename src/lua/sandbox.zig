@@ -65,13 +65,14 @@ fn instructionHook(L: ?*c.lua_State, ar: [*c]c.lua_Debug) callconv(.c) void {
 /// are registered in the `nova` table. When undefined, only the sandboxed
 /// environment is created (for test runners that don't have a real Io).
 /// Caller owns the returned State and must call `deinit`.
-pub fn createSandboxedState(permissions: Permissions) State {
+pub fn createSandboxedState(permissions: Permissions) !State {
     return createSandboxedStateWithIo(permissions, null);
 }
 
 /// Create a sandboxed state with a specific Io instance (for plugin API).
-pub fn createSandboxedStateWithIo(permissions: Permissions, io: ?std.Io) State {
-    const L = c.luaL_newstate() orelse @panic("luaL_newstate returned null");
+/// Returns `error.LuaInitFailed` if the Lua runtime cannot allocate the state.
+pub fn createSandboxedStateWithIo(permissions: Permissions, io: ?std.Io) error{ LuaInitFailed, OutOfMemory }!State {
+    const L = c.luaL_newstate() orelse return error.LuaInitFailed;
 
     // Initialize extraspace to null (no hook data yet)
     @as(*?*HookData, @ptrCast(@alignCast(c.lua_getextraspace(L)))).* = null;
@@ -89,7 +90,7 @@ pub fn createSandboxedStateWithIo(permissions: Permissions, io: ?std.Io) State {
 
     if (!permissions.full_access) {
         createRestrictedEnvironment(L, permissions);
-        setupInstructionHook(L, permissions);
+        try setupInstructionHook(L, permissions);
     }
 
     return State{ .handle = L };
@@ -231,11 +232,11 @@ fn copyOsFunction(L: *c.lua_State, os_index: c_int, name: [:0]const u8) void {
 }
 
 /// Set up the instruction count hook for resource limits.
-fn setupInstructionHook(L: *c.lua_State, permissions: Permissions) void {
+fn setupInstructionHook(L: *c.lua_State, permissions: Permissions) std.mem.Allocator.Error!void {
     if (permissions.instruction_limit == 0 and permissions.memory_limit_mb == 0) return;
 
     const allocator = std.heap.page_allocator;
-    const data = allocator.create(HookData) catch @panic("OOM");
+    const data = try allocator.create(HookData);
     data.* = HookData{
         .instruction_limit = if (permissions.instruction_limit > 0) permissions.instruction_limit else std.math.maxInt(u32),
         .instruction_count = 0,
@@ -258,7 +259,7 @@ pub fn freeHookData(L: *c.lua_State) void {
 // ── Tests ────────────────────────────────────────────────────────────
 
 test "sandbox: basic creation" {
-    var L = createSandboxedState(.{});
+    var L = try createSandboxedState(.{});
     defer {
         freeHookData(L.handle);
         L.deinit();
@@ -270,7 +271,7 @@ test "sandbox: basic creation" {
 }
 
 test "sandbox: blocks io" {
-    var L = createSandboxedState(.{});
+    var L = try createSandboxedState(.{});
     defer {
         freeHookData(L.handle);
         L.deinit();
@@ -282,7 +283,7 @@ test "sandbox: blocks io" {
 }
 
 test "sandbox: blocks debug" {
-    var L = createSandboxedState(.{});
+    var L = try createSandboxedState(.{});
     defer {
         freeHookData(L.handle);
         L.deinit();
@@ -294,7 +295,7 @@ test "sandbox: blocks debug" {
 }
 
 test "sandbox: blocks package" {
-    var L = createSandboxedState(.{});
+    var L = try createSandboxedState(.{});
     defer {
         freeHookData(L.handle);
         L.deinit();
@@ -306,7 +307,7 @@ test "sandbox: blocks package" {
 }
 
 test "sandbox: globals like type() still work" {
-    var L = createSandboxedState(.{});
+    var L = try createSandboxedState(.{});
     defer {
         freeHookData(L.handle);
         L.deinit();
@@ -318,7 +319,7 @@ test "sandbox: globals like type() still work" {
 }
 
 test "sandbox: full access exposes all libraries" {
-    var L = createSandboxedState(.{ .full_access = true });
+    var L = try createSandboxedState(.{ .full_access = true });
     defer L.deinit();
 
     try std.testing.expect(L.doString("return type(io) == 'table'"));
@@ -327,7 +328,7 @@ test "sandbox: full access exposes all libraries" {
 }
 
 test "sandbox: blocks rawget by default" {
-    var L = createSandboxedState(.{});
+    var L = try createSandboxedState(.{});
     defer {
         freeHookData(L.handle);
         L.deinit();
@@ -339,7 +340,7 @@ test "sandbox: blocks rawget by default" {
 }
 
 test "sandbox: allows rawget when permitted" {
-    var L = createSandboxedState(.{ .allow_rawget_rawset = true });
+    var L = try createSandboxedState(.{ .allow_rawget_rawset = true });
     defer {
         freeHookData(L.handle);
         L.deinit();
@@ -351,7 +352,7 @@ test "sandbox: allows rawget when permitted" {
 }
 
 test "sandbox: blocks os.execute by default" {
-    var L = createSandboxedState(.{});
+    var L = try createSandboxedState(.{});
     defer {
         freeHookData(L.handle);
         L.deinit();
@@ -363,7 +364,7 @@ test "sandbox: blocks os.execute by default" {
 }
 
 test "sandbox: allows os.execute when permitted" {
-    var L = createSandboxedState(.{ .allow_os_execute = true });
+    var L = try createSandboxedState(.{ .allow_os_execute = true });
     defer {
         freeHookData(L.handle);
         L.deinit();
@@ -375,7 +376,7 @@ test "sandbox: allows os.execute when permitted" {
 }
 
 test "sandbox: blocks dofile and loadfile" {
-    var L = createSandboxedState(.{});
+    var L = try createSandboxedState(.{});
     defer {
         freeHookData(L.handle);
         L.deinit();
@@ -391,7 +392,7 @@ test "sandbox: blocks dofile and loadfile" {
 }
 
 test "sandbox: _G points to restricted environment" {
-    var L = createSandboxedState(.{});
+    var L = try createSandboxedState(.{});
     defer {
         freeHookData(L.handle);
         L.deinit();
@@ -409,7 +410,7 @@ test "sandbox: _G points to restricted environment" {
 }
 
 test "sandbox: instruction limit triggers error" {
-    var L = createSandboxedState(.{ .instruction_limit = 100 });
+    var L = try createSandboxedState(.{ .instruction_limit = 100 });
     defer {
         freeHookData(L.handle);
         L.deinit();
@@ -424,7 +425,7 @@ test "sandbox: instruction limit triggers error" {
 }
 
 test "sandbox: memory limit triggers error" {
-    var L = createSandboxedState(.{ .memory_limit_mb = 1 });
+    var L = try createSandboxedState(.{ .memory_limit_mb = 1 });
     defer {
         freeHookData(L.handle);
         L.deinit();

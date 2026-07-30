@@ -326,3 +326,79 @@ fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
     if (prefix.len > value.len) return false;
     return std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+//
+// `submitMode` is reached via the public `App.submitMode` delegate. These cover
+// the pure mode-transition and no-op branches — the side-effectful branches
+// (network/file IO) are exercised elsewhere through their error reporters.
+
+const agent_mod = @import("../agent.zig");
+
+test "submitMode returns false in normal mode" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.mode = .normal;
+    // normal mode does not handle Enter — falls through to beginSubmit.
+    try std.testing.expect(!try app.submitMode());
+}
+
+test "submitMode /exit sets quit confirmed" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.mode = .command;
+    app.nav.command_selection = 0;
+    try app.inputs.palette.buf.insertSliceAtCursor("exit");
+    try std.testing.expect(try app.submitMode());
+    try std.testing.expect(app.nav.quit == .confirmed);
+}
+
+test "submitMode /help opens help mode" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.mode = .command;
+    app.nav.command_selection = 0;
+    try app.inputs.palette.buf.insertSliceAtCursor("help");
+    try std.testing.expect(try app.submitMode());
+    try std.testing.expectEqual(App.Mode.help, app.mode);
+}
+
+test "submitMode save_message rejects an empty message" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.mode = .save_message;
+    // Empty palette: Enter is a no-op (no save attempted), mode unchanged.
+    try std.testing.expect(try app.submitMode());
+    try std.testing.expectEqual(App.Mode.save_message, app.mode);
+}
+
+test "submitMode lanes is a no-op when not confirming a merge" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.mode = .lanes;
+    app.nav.lanes_purpose = .manage; // not .merge_dest
+    try std.testing.expect(try app.submitMode());
+    // No merge attempted; mode stays lanes.
+    try std.testing.expectEqual(App.Mode.lanes, app.mode);
+}

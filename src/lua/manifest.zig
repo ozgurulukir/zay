@@ -91,7 +91,7 @@ fn parsePermissions(L: *State) !sandbox.Permissions {
 
 test "manifest: parse valid table" {
     const testing = std.testing;
-    var L = State.init();
+    var L = try State.init();
     defer L.deinit();
 
     try testing.expect(L.doString(
@@ -107,7 +107,7 @@ test "manifest: parse valid table" {
 }
 
 test "manifest: missing name returns error" {
-    var L = State.init();
+    var L = try State.init();
     defer L.deinit();
 
     try std.testing.expect(L.doString("return { version = '1.0.0' }"));
@@ -115,7 +115,7 @@ test "manifest: missing name returns error" {
 }
 
 test "manifest: missing version returns error" {
-    var L = State.init();
+    var L = try State.init();
     defer L.deinit();
 
     try std.testing.expect(L.doString("return { name = 'test' }"));
@@ -124,7 +124,7 @@ test "manifest: missing version returns error" {
 
 test "manifest: parse permissions" {
     const testing = std.testing;
-    var L = State.init();
+    var L = try State.init();
     defer L.deinit();
 
     try testing.expect(L.doString(
@@ -154,7 +154,7 @@ test "manifest: parse permissions" {
 
 test "manifest: default permissions when not specified" {
     const testing = std.testing;
-    var L = State.init();
+    var L = try State.init();
     defer L.deinit();
 
     try testing.expect(L.doString(

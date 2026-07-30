@@ -59,6 +59,52 @@ pub const ToolResult = struct {
         if (self.stderr) |s| gpa.free(s);
         self.* = undefined;
     }
+
+    /// Build inputs for `ToolResult.init`. Split into "moved" (ownership
+    /// transferred into the result on success; the caller keeps an `errdefer`
+    /// for each until the call returns) and "borrowed" (`init` dupes these),
+    /// so each call site states its intent explicitly instead of repeating
+    /// the `call_id`/`name`/`stderr` dupe + struct-literal ladder inline.
+    pub const Spec = struct {
+        /// Borrowed; `init` dupes these.
+        call_id: []const u8,
+        name: []const u8,
+        stderr: ?[]const u8 = null,
+        /// MOVED into the result on success.
+        content: []u8,
+        display: tools.ToolDisplay,
+        display_body: []u8,
+        /// Copied by value.
+        display_kind: tools.DisplayKind = .text,
+        failed: bool = false,
+    };
+
+    /// Centralized constructor. Dupes `call_id`/`name`/`stderr` and assembles
+    /// the result, adopting the moved fields (`content`, `display`,
+    /// `display_body`) on success. `init` frees only the bytes it allocates
+    /// (the dupes) on its own error; the caller's `errdefer`s still own the
+    /// moved fields on that path, so the two never double-free. This removes
+    /// the per-call-site identity-dupe + struct-literal boilerplate.
+    pub fn init(gpa: std.mem.Allocator, spec: Spec) std.mem.Allocator.Error!ToolResult {
+        const call_id = try gpa.dupe(u8, spec.call_id);
+        errdefer gpa.free(call_id);
+        const name = try gpa.dupe(u8, spec.name);
+        errdefer gpa.free(name);
+        const stderr = if (spec.stderr) |s| try gpa.dupe(u8, s) else null;
+        errdefer if (stderr) |s| gpa.free(s);
+
+        return .{
+            .call_id = .{ .value = call_id },
+            .content = spec.content,
+            .name = name,
+            .display_label = spec.display.label,
+            .display_expanded_label = spec.display.expanded_label,
+            .display_body = spec.display_body,
+            .display_kind = spec.display_kind,
+            .stderr = stderr,
+            .failed = spec.failed,
+        };
+    }
 };
 
 /// The narrow private callback interface ExecutorService uses to report
@@ -197,12 +243,8 @@ pub const ExecutorService = struct {
         };
         defer output.deinit(self.gpa);
 
-        const call_id = try self.gpa.dupe(u8, call.call_id.slice());
-        errdefer self.gpa.free(call_id);
         const content = try tool_display.formatLlmObservation(self.gpa, output);
         errdefer self.gpa.free(content);
-        const name = try self.gpa.dupe(u8, call.name);
-        errdefer self.gpa.free(name);
         const looked_up = if (self.tool_registry) |r|
             try r.lookup(self.gpa, call.name)
         else
@@ -211,23 +253,22 @@ pub const ExecutorService = struct {
         errdefer display.deinit(self.gpa);
         const display_body = try tool_display.makeDisplayBody(self.gpa, output);
         errdefer self.gpa.free(display_body);
-        const stderr = if (output.stderr.len > 0) try self.gpa.dupe(u8, output.stderr) else null;
-        const failed = output.code != 0;
-        const display_kind: tools.DisplayKind = switch (output.display) {
-            .diff => .diff,
-            .text, .none => .text,
-        };
-        return .{
-            .call_id = .{ .value = call_id },
+
+        // `ToolResult.init` dupes call_id/name/stderr and adopts the moved
+        // fields above on success; the errdefers clean up only on error.
+        return try ToolResult.init(self.gpa, .{
+            .call_id = call.call_id.slice(),
+            .name = call.name,
             .content = content,
-            .name = name,
-            .display_label = display.label,
-            .display_expanded_label = display.expanded_label,
+            .display = display,
             .display_body = display_body,
-            .display_kind = display_kind,
-            .stderr = stderr,
-            .failed = failed,
-        };
+            .stderr = if (output.stderr.len > 0) output.stderr else null,
+            .display_kind = switch (output.display) {
+                .diff => .diff,
+                .text, .none => .text,
+            },
+            .failed = output.code != 0,
+        });
     }
 
     /// Route an `mcp__` tool call to the MCP transport.
@@ -257,8 +298,6 @@ pub const ExecutorService = struct {
             return self.runFailure(call, err);
         };
 
-        const call_id = try self.gpa.dupe(u8, call.call_id.slice());
-        errdefer self.gpa.free(call_id);
         const content = if (result_text.len > 0) blk: {
             break :blk result_text;
         } else blk: {
@@ -266,24 +305,20 @@ pub const ExecutorService = struct {
             break :blk try self.gpa.dupe(u8, "(no output)");
         };
         errdefer self.gpa.free(content);
-        const name = try self.gpa.dupe(u8, call.name);
-        errdefer self.gpa.free(name);
         const display_label = try self.gpa.dupe(u8, tool_name);
         errdefer self.gpa.free(display_label);
         const display_body = try self.gpa.dupe(u8, content);
         errdefer self.gpa.free(display_body);
 
-        return .{
-            .call_id = .{ .value = call_id },
+        // `ToolResult.init` dupes call_id/name (stderr stays null) and adopts
+        // the moved fields above on success.
+        return try ToolResult.init(self.gpa, .{
+            .call_id = call.call_id.slice(),
+            .name = call.name,
             .content = content,
-            .name = name,
-            .display_label = display_label,
-            .display_expanded_label = null,
+            .display = .{ .label = display_label },
             .display_body = display_body,
-            .display_kind = .text,
-            .stderr = null,
-            .failed = false,
-        };
+        });
     }
 
     /// Source the tool's `Output`, routing a `run_in_background` bash call to the
@@ -314,48 +349,38 @@ pub const ExecutorService = struct {
     }
 
     fn runFailure(self: *ExecutorService, call: ai.ToolCall, err: anyerror) !ToolResult {
-        const call_id = try self.gpa.dupe(u8, call.call_id.slice());
-        errdefer self.gpa.free(call_id);
-        const name = try self.gpa.dupe(u8, call.name);
-        errdefer self.gpa.free(name);
         var display = try tool_display.lookupDisplay(self.gpa, tools.lookupIn(tools.builtinRegistry(), call.name), call.name, call.arguments);
         errdefer display.deinit(self.gpa);
         const content = try std.fmt.allocPrint(self.gpa, "tool '{s}' failed to execute: {s}", .{ call.name, errorDescription(err) });
         errdefer self.gpa.free(content);
         const display_body = try self.gpa.dupe(u8, content);
-        return .{
-            .call_id = .{ .value = call_id },
+        errdefer self.gpa.free(display_body);
+        return try ToolResult.init(self.gpa, .{
+            .call_id = call.call_id.slice(),
+            .name = call.name,
             .content = content,
-            .name = name,
-            .display_label = display.label,
-            .display_expanded_label = display.expanded_label,
+            .display = display,
             .display_body = display_body,
-            .stderr = null,
             .failed = true,
-        };
+        });
     }
 
     fn runRejected(self: *ExecutorService, call: ai.ToolCall) !ToolResult {
         const message = "The tool call was rejected by the user for being unsafe. Try something else.";
-        const call_id = try self.gpa.dupe(u8, call.call_id.slice());
-        errdefer self.gpa.free(call_id);
-        const name = try self.gpa.dupe(u8, call.name);
-        errdefer self.gpa.free(name);
         var display = try tool_display.lookupDisplay(self.gpa, tools.lookupIn(tools.builtinRegistry(), call.name), call.name, call.arguments);
         errdefer display.deinit(self.gpa);
         const content = try self.gpa.dupe(u8, message);
         errdefer self.gpa.free(content);
         const display_body = try self.gpa.dupe(u8, message);
-        return .{
-            .call_id = .{ .value = call_id },
+        errdefer self.gpa.free(display_body);
+        return try ToolResult.init(self.gpa, .{
+            .call_id = call.call_id.slice(),
+            .name = call.name,
             .content = content,
-            .name = name,
-            .display_label = display.label,
-            .display_expanded_label = display.expanded_label,
+            .display = display,
             .display_body = display_body,
-            .stderr = null,
             .failed = true,
-        };
+        });
     }
 };
 

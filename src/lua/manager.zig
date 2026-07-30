@@ -131,7 +131,7 @@ pub const PluginManager = struct {
 
         // Create the plugin instance with Io so nova.* bridge functions
         // (register_tool, read_file, etc.) are available in the sandbox.
-        var L = sandbox.createSandboxedStateWithIo(permissions, self.io);
+        var L = try sandbox.createSandboxedStateWithIo(permissions, self.io);
 
         // Load the plugin's init.lua
         const init_path = try std.fs.path.join(self.allocator, &.{ dir_path, "init.lua" });
@@ -337,7 +337,7 @@ pub const PluginManager = struct {
         const manifest_path = try std.fs.path.join(self.allocator, &.{ dir_path, "plugin.lua" });
         defer self.allocator.free(manifest_path);
 
-        var L = State.init();
+        var L = try State.init();
         defer L.deinit();
 
         if (!self.loadLuaFile(&L, manifest_path)) {

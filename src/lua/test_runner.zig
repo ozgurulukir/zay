@@ -27,7 +27,7 @@ fn runSingleTestFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool
     defer gpa.free(content);
 
     // Create a sandboxed state with full access (tests need io for output)
-    var L = sandbox.createSandboxedState(.{ .full_access = true });
+    var L = try sandbox.createSandboxedState(.{ .full_access = true });
     defer {
         sandbox.freeHookData(L.handle);
         L.deinit();

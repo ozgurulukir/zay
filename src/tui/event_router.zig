@@ -316,3 +316,140 @@ fn handleQuitSequence(
     ctx.consumeAndRedraw();
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+//
+// The quit state machine (`none` → `pending` → `ctx.quit`) and the
+// confirmed-quit exit live in the private `handleQuitSequence` / `routeKey`.
+// They are reached through the public `RootWidget.captureEvent` surface, the
+// same path the 88 tui.zig tests use. `agent` and `app` are declared as
+// sibling locals so the `&agent` pointer App copies into its heap `Thread`
+// stays valid for the test's lifetime.
+
+const agent_mod = @import("../agent.zig");
+
+test "single Ctrl-C with empty input arms pending quit" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } });
+
+    // First press arms the pending prompt without exiting.
+    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(!ctx.quit);
+}
+
+test "Ctrl-C pressed twice within the window confirms quit" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    const ctrl_c: vxfw.Event = .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } };
+    try captureEvent(&app, &root, &ctx, ctrl_c);
+    try captureEvent(&app, &root, &ctx, ctrl_c);
+
+    // Back-to-back presses land inside the double-press window.
+    try std.testing.expect(ctx.quit);
+}
+
+test "Ctrl-D with empty input arms pending quit like Ctrl-C" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = 'd', .mods = .{ .ctrl = true } } });
+
+    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(!ctx.quit);
+}
+
+test "a non-quit key cancels an armed pending quit" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } });
+    try std.testing.expect(app.nav.quit == .pending);
+
+    // Any ordinary key falls through handleQuitSequence (returns false) and
+    // routeKey cancels the pending prompt.
+    try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = 'x', .mods = .{} } });
+    try std.testing.expect(app.nav.quit == .none);
+}
+
+test "confirmed quit state exits the TUI on the next key" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    // Simulate the `/exit` command having set the confirmed state.
+    app.nav.quit = .confirmed;
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = 'a', .mods = .{} } });
+
+    try std.testing.expect(ctx.quit);
+}
+
+test "Escape in normal mode with non-empty input clears the input" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    try app.inputs.input.insertSliceAtCursor("draft");
+    try std.testing.expect(app.inputs.input.buf.realLength() > 0);
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.escape } });
+
+    try std.testing.expectEqual(@as(usize, 0), app.inputs.input.buf.realLength());
+    try std.testing.expect(app.nav.quit == .none);
+}

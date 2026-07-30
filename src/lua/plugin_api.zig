@@ -1815,7 +1815,7 @@ test "registerTool + countTools: sandboxed state" {
     const sandbox = @import("sandbox.zig");
 
     // Create a sandboxed state with Io (so registerPluginApi is called).
-    var L = sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
         sandbox.freeHookData(L.handle);
         L.deinit();

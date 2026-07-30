@@ -114,7 +114,7 @@ pub fn getTableBoolean(L: *State, table_index: c_int, key: [:0]const u8) ?bool {
 }
 
 test "push and pull integer" {
-    var L = State.init();
+    var L = try State.init();
     defer L.deinit();
 
     pushValue(&L, @as(i64, 42));
@@ -123,7 +123,7 @@ test "push and pull integer" {
 }
 
 test "push and pull string" {
-    var L = State.init();
+    var L = try State.init();
     defer L.deinit();
 
     pushValue(&L, "hello");
@@ -132,7 +132,7 @@ test "push and pull string" {
 }
 
 test "push and pull boolean" {
-    var L = State.init();
+    var L = try State.init();
     defer L.deinit();
 
     pushValue(&L, true);
@@ -145,7 +145,7 @@ test "push and pull boolean" {
 }
 
 test "push nil" {
-    var L = State.init();
+    var L = try State.init();
     defer L.deinit();
 
     pushValue(&L, {});
@@ -154,7 +154,7 @@ test "push nil" {
 }
 
 test "pull from nil returns null" {
-    var L = State.init();
+    var L = try State.init();
     defer L.deinit();
 
     L.pushNil();
