@@ -225,6 +225,10 @@ test "idle thread frees its owned title, transcript, and queue" {
     const gpa = std.testing.allocator;
     var thread: Thread = .{ .title = try gpa.dupe(u8, "feature x") };
     try thread.queued.append(gpa, .{ .text = try gpa.dupe(u8, "queued prompt") });
+
+    try std.testing.expectEqualStrings("feature x", thread.title.?);
+    try std.testing.expectEqual(@as(usize, 1), thread.queued.items.len);
+
     thread.deinit(gpa);
 }
 
@@ -234,6 +238,10 @@ test "lane frees its captured parent context" {
     context[0] = try gpa.dupe(u8, "fix the login race");
     context[1] = try gpa.dupe(u8, "I found the mutex issue");
     var thread: Thread = .{ .parent_context = context };
+
+    try std.testing.expectEqual(@as(usize, 2), thread.parent_context.len);
+    try std.testing.expectEqualStrings("fix the login race", thread.parent_context[0]);
+
     thread.deinit(gpa);
 }
 
@@ -243,6 +251,10 @@ test "idle working lane frees its worktree branch and path" {
         .branch = try gpa.dupe(u8, "nova/x"),
         .path = try gpa.dupe(u8, "/home/user/.config/nova/worktrees/x"),
     } } } };
+
+    try std.testing.expectEqualStrings("nova/x", thread.engine.idle.working.branch);
+    try std.testing.expectEqualStrings("/home/user/.config/nova/worktrees/x", thread.engine.idle.working.path);
+
     thread.deinit(gpa);
 }
 

@@ -424,5 +424,29 @@ test "static models match openai codex catalog" {
 }
 
 test "sign out removes missing auth file without error" {
-    try signOut(std.testing.allocator, std.testing.io, "/tmp/nova-missing-home-for-signout-test");
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const home_dir = "/tmp/nova-missing-home-for-signout-test";
+
+    const auth_file = try std.fs.path.join(gpa, &.{ home_dir, ".config", "nova", "auth.json" });
+    defer gpa.free(auth_file);
+
+    // Precondition: ensure the auth file is absent (idempotent cleanup of any
+    // leftover from a previous run). This and the post-condition below use the
+    // Io fs API, matching the rest of this module — `std.fs.cwd()` is gone in
+    // Zig 0.16.
+    if (std.Io.Dir.openFile(.cwd(), io, auth_file, .{})) |file| {
+        file.close(io);
+        std.Io.Dir.deleteFile(.cwd(), io, auth_file) catch {};
+    } else |err| try std.testing.expectEqual(error.FileNotFound, err);
+
+    // The actual exercise: signOut on a missing file must not error.
+    try signOut(gpa, io, home_dir);
+
+    // Post-condition: still absent. signOut went through the whole code path,
+    // so reaching here without the file being created is the meaningful check.
+    if (std.Io.Dir.openFile(.cwd(), io, auth_file, .{})) |file| {
+        file.close(io);
+        return error.TestUnexpectedFilePresent;
+    } else |err| try std.testing.expectEqual(error.FileNotFound, err);
 }
