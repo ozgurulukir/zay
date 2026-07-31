@@ -367,32 +367,6 @@ test "McpManager does not reconnect already connected clients" {
     try std.testing.expectEqual(client_mod.ServerStatus.connected, manager.clients.items[0].status());
 }
 
-test "McpManager rejects server configs missing a transport at parse time" {
-    // Misconfiguration (no command, no url) is rejected at JSON parse
-    // time by parseMcpServers returning error.InvalidMcpServerConfig.
-    // The McpManager itself never sees a misconfigured McpServerConfig.
-    // This test pins the parse-layer contract: the union type makes the
-    // misconfiguration unrepresentable in the struct form, so the
-    // manager no longer needs a "no command or url configured" runtime
-    // fallback. See McpServerConfig.transport (config.zig).
-    const gpa = std.testing.allocator;
-    const config_json =
-        \\{
-        \\  "mcpServers": {
-        \\    "broken_server": {
-        \\      "env": { "FOO": "bar" }
-        \\    }
-        \\  }
-        \\}
-    ;
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, config_json, .{});
-    defer parsed.deinit();
-
-    const config_mod = @import("../config/parse.zig");
-    const result = config_mod.parseMcpServers(gpa, parsed.value);
-    try std.testing.expectError(error.InvalidMcpServerConfig, result);
-}
-
 test "McpManager skips duplicate server names in config" {
     const gpa = std.testing.allocator;
     var manager = McpManager.init(gpa);

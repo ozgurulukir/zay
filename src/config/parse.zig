@@ -1551,6 +1551,29 @@ test "parseObject: invalid JSON records diagnostic" {
     try std.testing.expectEqual(@as(usize, 1), sink.items.len);
 }
 
+test "parseMcpServers rejects a server config missing a transport" {
+    // A server with neither `command` nor `url` is rejected at parse time:
+    // the transport union makes the misconfiguration unrepresentable in the
+    // struct form, so the manager never needs a runtime fallback. The error
+    // propagates up through the public parseFile → parseObject path.
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    const config_json =
+        \\{
+        \\  "mcpServers": {
+        \\    "broken_server": {
+        \\      "env": { "FOO": "bar" }
+        \\    }
+        \\  }
+        \\}
+    ;
+    try std.testing.expectError(
+        error.InvalidMcpServerConfig,
+        parseFile(gpa, "<test>", config_json, &sink),
+    );
+}
+
 test "mergeLayers: later layer overrides earlier" {
     const gpa = std.testing.allocator;
     var layer1: Config = .{
