@@ -170,6 +170,15 @@ pub fn openModelPicker(self: *App) !void {
     );
     self.clearInput();
 
+    // Disk cache restore, bağlı dynamic (models.dev) provider'ları görmek için
+    // registry'ye ihtiyaç duyar (`collectModelCacheConfigured` onu tarar). Şu
+    // ana kadar yalnızca `openProviderPicker` yükleyordu; model picker'ı açarken
+    // de yükle ki restart sonrası dynamic provider modelleri restore edilsin.
+    // Idempotent ve network-first → cache → vendored → builtins fallback'ine
+    // sahip olduğundan asla bloke olmaz; hatayı sessizce yutuyoruz (registry
+    // yoksa dynamic provider kolu atlanır, katalog provider'ları yine gelir).
+    ensureModelsDevRegistry(self) catch {};
+
     if (self.pickers.models.models_cached and self.pickers.models.len() > 0) {
         try finishModelCatalogReload(
             self,
@@ -378,6 +387,7 @@ pub const cancelModelLoad = model_loader_job.cancelModelLoad;
 pub const drainModelLoad = model_loader_job.drainModelLoad;
 pub const installModelLoadResult = model_loader_job.installModelLoadResult;
 pub const dropModelsForProvider = model_loader_job.dropModelsForProvider;
+pub const dropModelsForConn = model_loader_job.dropModelsForConn;
 pub const restoreModelCache = model_loader_job.restoreModelCache;
 pub const saveModelCache = model_loader_job.saveModelCache;
 pub const collectModelCacheConfigured = model_loader_job.collectModelCacheConfigured;
@@ -680,11 +690,20 @@ pub fn startOpenAiCompatibleModelLoad(
     const job = try self.gpa.create(model_loader.Job);
     errdefer self.gpa.destroy(job);
 
-    self.pickers.models.load = .{ .loading = .{
-        .future = undefined,
-        .done = .init(false),
-        .merge = false,
-    } };
+    self.pickers.models.load = .{
+        .loading = .{
+            .future = undefined,
+            .done = .init(false),
+            // `merge = true`: mevcut kataloğu korur ve yeni provider'ın
+            // modellerini ekler (sadece aynı conn'a ait eski entry'ler drop edilip
+            // yenilenir — bkz. `installModelLoadResult`). Önceki `merge = false`
+            // tüm kataloğu silip yalnızca bu provider'ın modellerini yüklerdi;
+            // kullanıcı bir provider eklediğinde mevcut olanlar kaybolurdu.
+            // `startProviderModelLoad` (builtin yolu) zaten `merge = true`
+            // kullanır — bu onunla tutarlılık sağlar.
+            .merge = true,
+        },
+    };
     job.* = .{
         .gpa = self.gpa,
         .io = self.io,

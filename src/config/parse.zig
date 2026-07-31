@@ -1091,6 +1091,18 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
             try writeKey(writer, "bashClassifierUrl", &wrote_any);
             try std.json.Stringify.value(url, .{}, writer);
         }
+        // `strict_outputs` is a global setting (re-synced from cached_config at
+        // every client attach), not a model-selection-specific one like the
+        // four fields above. `parseObject` doesn't clear `out.strict_outputs`
+        // when building `model_selection` (the other four are cleared), so it
+        // stays on `config` and is read here. Without this, a user enabling
+        // `strictOutputs: true` would see it vanish on the next serialize —
+        // `model_selection` is set in normal operation, so the legacy branch
+        // below (which does write it) never runs.
+        if (config.strict_outputs) |b| {
+            try writeKey(writer, "strictOutputs", &wrote_any);
+            try writer.writeAll(if (b) "true" else "false");
+        }
     } else {
         if (config.use_responses_endpoint) |b| {
             try writeKey(writer, "useResponsesEndpoint", &wrote_any);
@@ -1745,6 +1757,36 @@ test "serialize then parse roundtrips" {
     try std.testing.expectEqual(true, roundtrip.enable_thinking.?);
     try std.testing.expectEqual(true, roundtrip.strict_outputs.?);
     try std.testing.expectEqualStrings("llama3.1:8b", roundtrip.model.?.id);
+}
+
+test "serialize writes strictOutputs even when model_selection is set" {
+    // Regression: serialize'in `model_selection` kolu (normal üretim durumu)
+    // eskiden useResponsesEndpoint/enableThinking/systemPrompt/bashClassifierUrl
+    // yazıyordu ama strictOutputs'u yazmıyordu — yalnızca legacy kol (model_selection
+    // null iken) yazıyordu. Üretimde model_selection set olduğu için kullanıcı
+    // strictOutputs: true ayarlasa bile config'e kayboluyor, restart'ta false'a
+    // düşüyordu. strict_outputs global bir ayardır (model_selection'a bağlı değil),
+    // bu yüzden config.strict_outputs'tan doğrudan okunur.
+    const gpa = std.testing.allocator;
+    var cfg: Config = .{};
+    defer cfg.deinit(gpa);
+    // Normal üretim durumu: model_selection set (parseObject böyle kurar),
+    // strict_outputs ise cleared EDİLMEMİŞ (diğer 4 ayarın aksine) ve config'te kalır.
+    cfg.model_selection = .{
+        .builtin = .{
+            .provider = .openai,
+            .provider_name = try gpa.dupe(u8, "openai"),
+            .model = .{ .id = try gpa.dupe(u8, "gpt-5.5") },
+        },
+    };
+    cfg.strict_outputs = true;
+
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, cfg);
+
+    // strictOutputs serialize çıktısında görünmeli.
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"strictOutputs\": true") != null);
 }
 
 test "globalConfigPath resolves XDG .config/nova/config.json" {

@@ -13,38 +13,38 @@
     },
     "defaultModel": {
       "type": "string",
-      "pattern": "^[a-zA-Z0-9._-]+/.+$",
-      "description": "Primary model selection as '<provider>/<model-id>' (e.g., 'openai/gpt-5.5', 'ollama/llama3.1:8b', 'qwen-cloud/qwen3.7-plus'). The provider part is split on the first '/'; model ids may contain further slashes (e.g., 'huggingface/meta-llama/Llama-3.1-8B'). This is the single source of truth for provider + model. Legacy key 'model' is also accepted."
+      "pattern": "^[a-zA-Z0-9._:+-]+/.+$",
+      "description": "Primary model selection as '<provider>/<model-id>' (e.g., 'openai/gpt-5.5', 'ollama/llama3.1:8b', 'qwen-cloud/qwen3.7-plus'). The provider part is split on the first '/'; model ids may contain further slashes (e.g., 'huggingface/meta-llama/Llama-3.1-8B'). Both parts may contain ':', '+', '.', '_' and '-'. This is the single source of truth for provider + model. Legacy key 'model' is parsed for backward compatibility but is not schema-valid; new configs must use 'defaultModel'."
     },
     "baseURL": {
       "type": "string",
       "format": "uri",
-      "description": "Override base URL for the active provider. Legacy key 'base_url' is also accepted."
+      "description": "Override base URL for the active provider. Legacy key 'base_url' is parsed for backward compatibility but is not schema-valid; new configs must use 'baseURL'."
     },
     "useResponsesEndpoint": {
       "type": "boolean",
       "default": false,
-      "description": "Use the OpenAI Responses API instead of Chat Completions. Legacy key 'use_responses_endpoint' is also accepted."
+      "description": "Use the OpenAI Responses API instead of Chat Completions. Legacy key 'use_responses_endpoint' is parsed for backward compatibility but is not schema-valid; new configs must use 'useResponsesEndpoint'."
     },
     "enableThinking": {
       "type": "boolean",
       "default": false,
-      "description": "Enable extended thinking / reasoning mode. Legacy key 'enable_thinking' is also accepted."
+      "description": "Enable extended thinking / reasoning mode. Legacy key 'enable_thinking' is parsed for backward compatibility but is not schema-valid; new configs must use 'enableThinking'."
     },
     "strictOutputs": {
       "type": "boolean",
       "default": false,
-      "description": "Send OpenAI strict structured-outputs mode in tool definitions. Only works against the OpenAI API — gateways (OpenRouter/Ollama/vLLM/Together) reject or silently break it, disabling function-calling. Enable only when talking directly to OpenAI. Legacy key 'strict_outputs' is also accepted."
+      "description": "Send OpenAI strict structured-outputs mode in tool definitions. Only works against the OpenAI API — gateways (OpenRouter/Ollama/vLLM/Together) reject or silently break it, disabling function-calling. Enable only when talking directly to OpenAI. Legacy key 'strict_outputs' is parsed for backward compatibility but is not schema-valid; new configs must use 'strictOutputs'."
     },
     "systemPrompt": {
       "type": "string",
       "maxLength": 10000,
-      "description": "Custom system prompt override. Legacy key 'system_prompt' is also accepted."
+      "description": "Custom system prompt override. Legacy key 'system_prompt' is parsed for backward compatibility but is not schema-valid; new configs must use 'systemPrompt'."
     },
     "bashClassifierUrl": {
       "type": "string",
       "format": "uri",
-      "description": "URL of the local bash command safety classifier endpoint. Legacy key 'bash_classifier_url' is also accepted."
+      "description": "URL of the local bash command safety classifier endpoint. Legacy key 'bash_classifier_url' is parsed for backward compatibility but is not schema-valid; new configs must use 'bashClassifierUrl'."
     },
     "providers": {
       "type": "object",
@@ -54,7 +54,7 @@
     "mcpServers": {
       "type": "object",
       "additionalProperties": { "$ref": "#/$defs/MCPServerConfig" },
-      "description": "Model Context Protocol server integrations. Legacy keys 'mcp_servers' and 'mcp' are also accepted."
+      "description": "Model Context Protocol server integrations. Legacy keys 'mcp_servers' and 'mcp' are parsed for backward compatibility but are not schema-valid; new configs must use 'mcpServers'."
     },
     "plugins": {
       "type": "object",
@@ -74,7 +74,7 @@
         "baseURL": {
           "type": "string",
           "format": "uri",
-          "description": "Custom base URL for this provider. Legacy key 'base_url' is also accepted."
+          "description": "Custom base URL for this provider. Legacy key 'base_url' is parsed for backward compatibility but is not schema-valid; new configs must use 'baseURL'."
         },
         "models": {
           "type": "object",

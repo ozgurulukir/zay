@@ -351,3 +351,57 @@ test "parse v1 cache (no authKeyId) resolves auth_key_id from configured label" 
     try std.testing.expectEqual(@as(usize, 1), records.items.items.len);
     try std.testing.expectEqualStrings("openrouter", records.items.items[0].source.openai_compatible.auth_key_id);
 }
+
+test "save+load round-trips two dynamic providers without collapsing them" {
+    // Düzeltme 1'in sonucu: `collectModelCacheConfigured` artık bağlı tüm
+    // dynamic provider'ları toplar; `save` her birini ayrı blok yazar ve
+    // restart'ta `parse` her ikisini de doğru `Compatible`'a geri çözer.
+    // Önceki kod yalnızca `model_selection`'daki tek provider'ı topladığı için
+    // ikinci dynamic provider cache'e yazılmaz, restart'ta kaybolurdu.
+    const gpa = std.testing.allocator;
+    const configured = [_]Configured{
+        .{ .provider = .openai_compatible, .base_url = "https://api.stepfun.com/v1", .auth_mode = .keyed, .auth_key_id = "stepfun-ai" },
+        .{ .provider = .openai_compatible, .base_url = "https://api.moonshot.cn/v1", .auth_mode = .keyed, .auth_key_id = "moonshot" },
+    };
+    // `codex.Model.id`/`.label` are owned `[]u8`; `model_loader.compatibleSource`
+    // dupes its strings. Build owned records and free them after serialize.
+    var records = [_]Record{
+        .{ .model = .{ .id = try gpa.dupe(u8, "step-1"), .label = try gpa.dupe(u8, "StepFun · step-1") }, .source = .{ .openai_compatible = try model_loader.compatibleSource(gpa, .openai_compatible, "https://api.stepfun.com/v1", "stepfun-ai") } },
+        .{ .model = .{ .id = try gpa.dupe(u8, "kimi"), .label = try gpa.dupe(u8, "Kimi · kimi") }, .source = .{ .openai_compatible = try model_loader.compatibleSource(gpa, .openai_compatible, "https://api.moonshot.cn/v1", "moonshot") } },
+    };
+    defer {
+        for (&records) |*r| {
+            r.model.deinit(gpa);
+            r.source.deinit(gpa);
+        }
+    }
+
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try serialize(&payload.writer, &records, &configured);
+
+    var loaded = try parse(gpa, payload.written(), &configured);
+    defer loaded.deinit(gpa);
+
+    // İki record da geri gelmeli — "kayıp dynamic provider" belirtisi yok.
+    try std.testing.expectEqual(@as(usize, 2), loaded.items.items.len);
+    // Her biri kendi auth_key_id'sini korumalı (uyuşmazlık temsil edilemez).
+    var found_stepfun = false;
+    var found_moonshot = false;
+    for (loaded.items.items) |r| {
+        const conn = r.source.openai_compatible;
+        if (std.mem.eql(u8, conn.auth_key_id, "stepfun-ai")) {
+            try std.testing.expectEqualStrings("https://api.stepfun.com/v1", conn.base_url);
+            try std.testing.expectEqualStrings("step-1", r.model.id);
+            found_stepfun = true;
+        } else if (std.mem.eql(u8, conn.auth_key_id, "moonshot")) {
+            try std.testing.expectEqualStrings("https://api.moonshot.cn/v1", conn.base_url);
+            try std.testing.expectEqualStrings("kimi", r.model.id);
+            found_moonshot = true;
+        } else {
+            try std.testing.expect(false); // beklenmeyen auth_key_id
+        }
+    }
+    try std.testing.expect(found_stepfun);
+    try std.testing.expect(found_moonshot);
+}

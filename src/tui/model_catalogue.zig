@@ -133,11 +133,43 @@ pub const ModelCatalogue = struct {
 
     /// Remove every entry sourced from `provider`. Model, source, and reasoning
     /// leave together — nothing can drift out of alignment.
+    ///
+    /// Enum-bazlıdır ve her builtin katalog provider'ı ayrı bir enum değerine
+    /// sahip olduğu için onlar için doğru çalışır. Çoklu `.openai_compatible`
+    /// provider'lar aynı enum değerini paylaştığından onları birleştirir —
+    /// dynamic/config provider'lar için `dropConn` kullanın.
     pub fn dropProvider(self: *ModelCatalogue, gpa: std.mem.Allocator, provider: config_mod.Provider) void {
         var i: usize = 0;
         while (i < self.entries.items.len) {
             const matches = switch (self.entries.items[i].source) {
                 .openai_compatible => |conn| conn.provider == provider,
+                .openai_codex => false,
+            };
+            if (matches) {
+                self.entries.items[i].model.deinit(gpa);
+                self.entries.items[i].source.deinit(gpa);
+                _ = self.entries.orderedRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Remove every entry sourced from `conn`. Conn-bazlıdır: provider enum'u
+    /// + `base_url` + `auth_key_id` üçlüsü eşleşmelidir. Çoklu
+    /// `.openai_compatible` provider'lar aynı enum değerini paylaştığından,
+    /// enum-bazlı `dropProvider` onları ayıramazdı — bu versiyon yalnızca
+    /// verilen bağlantıya ait entry'leri düşürür, böylece "bir dynamic
+    /// provider refresh edildiğinde diğerlerinin modelleri kaybolmaz"
+    /// (illegal state temsil edilemez: `Compatible` üç bilgiyi birlikte taşır,
+    /// karşılaştırma da üçünü birlikte yapar).
+    pub fn dropConn(self: *ModelCatalogue, gpa: std.mem.Allocator, conn: model_loader.Compatible) void {
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const matches = switch (self.entries.items[i].source) {
+                .openai_compatible => |c| c.provider == conn.provider and
+                    std.mem.eql(u8, c.base_url, conn.base_url) and
+                    std.mem.eql(u8, c.auth_key_id, conn.auth_key_id),
                 .openai_codex => false,
             };
             if (matches) {
@@ -216,6 +248,43 @@ test "dropProvider removes model, source, and reasoning together" {
     try std.testing.expectEqualStrings("gpt", catalogue.entries.items[0].model.id);
     try std.testing.expectEqual(model_loader.ModelSource.openai_codex, catalogue.entries.items[0].source);
     try std.testing.expectEqual(@as(u32, 0), catalogue.entries.items[0].reasoning_index);
+}
+
+test "dropConn drops only the matching dynamic provider, not sibling openai_compatible ones" {
+    // İki dynamic provider (StepFun + Kimi) aynı `.openai_compatible` enum
+    // değerini paylaşır. `dropConn` yalnızca (provider + base_url + auth_key_id)
+    // üçlüsü eşleşen entry'leri düşürmelidir — kardeşi korumalıdır. Enum-bazlı
+    // `dropProvider` bunu yapamazdı (her ikisini de düşürürdü).
+    const gpa = std.testing.allocator;
+    var catalogue: ModelCatalogue = .{};
+    defer catalogue.deinit(gpa);
+
+    try catalogue.append(gpa, try testModel(gpa, "step-1"), .{ .openai_compatible = try testCompatibleSource(gpa, .openai_compatible, "https://api.stepfun.com/v1", "stepfun-ai") });
+    try catalogue.append(gpa, try testModel(gpa, "step-2"), .{ .openai_compatible = try testCompatibleSource(gpa, .openai_compatible, "https://api.stepfun.com/v1", "stepfun-ai") });
+    try catalogue.append(gpa, try testModel(gpa, "kimi"), .{ .openai_compatible = try testCompatibleSource(gpa, .openai_compatible, "https://api.moonshot.cn/v1", "moonshot") });
+    try catalogue.append(gpa, try testModel(gpa, "gpt"), .openai_codex);
+
+    // Refresh StepFun: sadece onun entry'leri düşürülmeli, Kimi ve Codex kalır.
+    catalogue.dropConn(gpa, .{
+        .provider = .openai_compatible,
+        .base_url = "https://api.stepfun.com/v1",
+        .auth_key_id = "stepfun-ai",
+    });
+
+    try std.testing.expectEqual(@as(u32, 2), catalogue.len());
+    try std.testing.expectEqualStrings("kimi", catalogue.entries.items[0].model.id);
+    try std.testing.expectEqualStrings("moonshot", catalogue.entries.items[0].source.openai_compatible.auth_key_id);
+    try std.testing.expectEqualStrings("gpt", catalogue.entries.items[1].model.id);
+    try std.testing.expectEqual(model_loader.ModelSource.openai_codex, catalogue.entries.items[1].source);
+
+    // Kimi'yi de drop et — geriye yalnızca Codex kalmalı.
+    catalogue.dropConn(gpa, .{
+        .provider = .openai_compatible,
+        .base_url = "https://api.moonshot.cn/v1",
+        .auth_key_id = "moonshot",
+    });
+    try std.testing.expectEqual(@as(u32, 1), catalogue.len());
+    try std.testing.expectEqual(model_loader.ModelSource.openai_codex, catalogue.entries.items[0].source);
 }
 
 test "snapshot then restore round-trips reasoning and selection" {
