@@ -144,6 +144,17 @@ pub const App = struct {
     inputs: app_state.InputState,
     /// Cross-pane navigation cursors and the lane-chip hit-test rect.
     nav: app_state.NavState = .{},
+    /// Back-pointer to the vxfw App that owns the event loop. Set in `tui.run`
+    /// after both `App` and `fw_app` are constructed in their final stack
+    /// frames. Lets `installRuntime` (called outside an event handler, with no
+    /// EventContext) request a focus reset to the root widget before it deinits
+    /// the old runtime — otherwise vxfw's `focused_widget` keeps pointing at a
+    /// destroyed TextField and the next key event crashes (empty focus path).
+    fw_app: ?*vxfw.App = null,
+    /// The root widget vtable, captured so `installRuntime` can pin vxfw focus
+    /// to it without holding a RootWidget pointer (the root lives in `tui.run`'s
+    /// frame). Set alongside `fw_app`.
+    root_widget: ?vxfw.Widget = null,
     /// Parsed state for the `/diff` viewer. Populated by `openDiffViewer`, reset
     /// to `.{}` on exit. Only meaningful while `mode == .diff_viewer`.
     diff: diff_viewer.State = .{},
@@ -1053,6 +1064,11 @@ pub fn run(
 
     var root: RootWidget = .{ .app = &app };
     root.mcp_connect_pending = true;
+    // Expose the framework handle + root widget to `installRuntime` so a
+    // session switch/resume can reset focus to the root before the old
+    // runtime (and its TextField userdata) is destroyed.
+    app.fw_app = &fw_app;
+    app.root_widget = root.widget();
     try fw_app.run(root.widget(), .{});
 }
 
