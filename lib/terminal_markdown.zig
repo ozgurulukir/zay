@@ -1,5 +1,6 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
+const CountingAllocator = @import("counting_allocator").CountingAllocator;
 
 const assert = std.debug.assert;
 
@@ -95,7 +96,7 @@ pub fn renderLimited(gpa: std.mem.Allocator, text: []const u8, width: u16, max_r
     var builder: RowBuilder = .{};
     errdefer builder.deinit(gpa);
 
-    const est_rows = @min(@as(usize, countRows(text, width)), max_rows);
+    const est_rows = @min(@as(usize, countRows(gpa, text, width)), max_rows);
     try builder.rows.ensureTotalCapacity(gpa, est_rows + 1);
     try builder.pool.ensureTotalCapacity(gpa, est_rows * 3 + 8);
 
@@ -136,7 +137,7 @@ fn renderInto(
     }
 }
 
-pub fn countRows(text: []const u8, width: u16) u16 {
+pub fn countRows(gpa: std.mem.Allocator, text: []const u8, width: u16) u16 {
     assert(width > 0);
     if (text.len == 0) return 1;
     var rows: u16 = 0;
@@ -145,14 +146,14 @@ pub fn countRows(text: []const u8, width: u16) u16 {
     while (line_start <= text.len) {
         const line = lineAt(text, line_start);
         if (!state.in_code) {
-            if (countTableRows(text, line_start, width)) |table| {
+            if (countTableRows(gpa, text, line_start, width)) |table| {
                 rows += table.rows;
                 if (table.next_start >= text.len) break;
                 line_start = table.next_start;
                 continue;
             }
         }
-        rows += countLineRows(line.bytes, width, &state);
+        rows += countLineRows(gpa, line.bytes, width, &state);
         if (line.next_start == null) break;
         line_start = line.next_start.?;
     }
@@ -316,7 +317,7 @@ fn renderPlainLine(
     return appendWrapped(gpa, b, prefix, continuation_indent, &spans, width);
 }
 
-fn countLineRows(line: []const u8, width: u16, state: *BlockState) u16 {
+fn countLineRows(gpa: std.mem.Allocator, line: []const u8, width: u16, state: *BlockState) u16 {
     if (isFence(line)) {
         state.in_code = !state.in_code;
         return 0;
@@ -326,7 +327,7 @@ fn countLineRows(line: []const u8, width: u16, state: *BlockState) u16 {
     var prefix_width: u16 = 0;
     var continuation_indent: u16 = 0;
     if (state.in_code) {
-        return countWrappedRows(body, width, 0, 0);
+        return countWrappedRows(gpa, body, width, 0, 0);
     }
     if (headingBody(line)) |heading| {
         body = heading.text;
@@ -340,7 +341,7 @@ fn countLineRows(line: []const u8, width: u16, state: *BlockState) u16 {
         prefix_width = 2; // "• " consumes the first line
         continuation_indent = 2; // continuation lines sit at the content indent
     }
-    return countWrappedRows(body, width, prefix_width, continuation_indent);
+    return countWrappedRows(gpa, body, width, prefix_width, continuation_indent);
 }
 
 const CountTable = struct { rows: u16, next_start: usize };
@@ -386,7 +387,7 @@ fn renderTable(
     return text.len;
 }
 
-fn countTableRows(text: []const u8, table_start: usize, width: u16) ?CountTable {
+fn countTableRows(gpa: std.mem.Allocator, text: []const u8, table_start: usize, width: u16) ?CountTable {
     const header = lineAt(text, table_start);
     const separator_start = header.next_start orelse return null;
     const separator = lineAt(text, separator_start);
@@ -396,13 +397,13 @@ fn countTableRows(text: []const u8, table_start: usize, width: u16) ?CountTable 
     const ncol = tableColumnCount(header.bytes);
     if (ncol == 0) return null;
     const col_width = tableColumnWidth(ncol, width);
-    var table_lines = countTableVisualRows(header.bytes, col_width);
+    var table_lines = countTableVisualRows(gpa, header.bytes, col_width);
     var table_rows: u16 = 1;
     var row_start = separator.next_start orelse return .{ .rows = table_lines + table_rows + 1, .next_start = text.len };
     while (row_start <= text.len) {
         const line = lineAt(text, row_start);
         if (!isTableRow(line.bytes)) return .{ .rows = table_lines + table_rows + 1, .next_start = row_start };
-        table_lines += countTableVisualRows(line.bytes, col_width);
+        table_lines += countTableVisualRows(gpa, line.bytes, col_width);
         table_rows += 1;
         row_start = line.next_start orelse return .{ .rows = table_lines + table_rows + 1, .next_start = text.len };
     }
@@ -542,11 +543,11 @@ fn tableColumnCount(line: []const u8) usize {
     return count;
 }
 
-fn countTableVisualRows(line: []const u8, col_width: u16) u16 {
+fn countTableVisualRows(gpa: std.mem.Allocator, line: []const u8, col_width: u16) u16 {
     var rows: u16 = 1;
     var iter = TableCellIterator.init(line);
     while (iter.next()) |cell| {
-        rows = @max(rows, countWrappedRows(cell, col_width, 0, 0));
+        rows = @max(rows, countWrappedRows(gpa, cell, col_width, 0, 0));
     }
     return rows;
 }
@@ -688,7 +689,19 @@ const RowSink = union(enum) {
     count: *CountState,
 };
 
-const CountState = struct { rows: u16 };
+const CountState = struct { rows: u16, has_content: bool = false };
+
+/// Sink-aware span addition: the push sink materializes spans into the
+/// builder's scratch buffer for rendering; the count sink only tracks whether
+/// the current row has content (via `has_content`), so it touches no heap.
+fn addSpan(sink: RowSink, current: *std.ArrayList(Span), gpa: std.mem.Allocator, text: []const u8, style: Style) !void {
+    switch (sink) {
+        .push => try appendSpan(current, gpa, text, style),
+        .count => |state| {
+            if (text.len > 0) state.has_content = true;
+        },
+    }
+}
 
 fn appendWrapped(
     gpa: std.mem.Allocator,
@@ -711,8 +724,9 @@ fn appendEmptyRow(gpa: std.mem.Allocator, b: *RowBuilder) !void {
 /// continuation line by `continuation_indent` (the content indent). Both reduce
 /// the line's usable width identically to `appendWrapped`, so the count and the
 /// rendered rows can never disagree. Allocation-free: it runs `wrapCore` with a
-/// count sink, so no spans are materialized.
-fn countWrappedRows(body: []const u8, width: u16, first_prefix_width: u16, continuation_indent: u16) u16 {
+/// count sink whose `addSpan` skips the ArrayList, so no spans are materialized
+/// and `gpa` is never used to allocate.
+fn countWrappedRows(gpa: std.mem.Allocator, body: []const u8, width: u16, first_prefix_width: u16, continuation_indent: u16) u16 {
     if (body.len == 0) return 1;
     var state: CountState = .{ .rows = 0 };
     const span = Span{ .text = body, .style = .normal };
@@ -727,7 +741,7 @@ fn countWrappedRows(body: []const u8, width: u16, first_prefix_width: u16, conti
         prefix_len = 1;
     }
     wrapCore(
-        std.heap.page_allocator, // unused by the count sink; it never allocates
+        gpa, // unused by the count sink; addSpan skips allocation for .count
         .{ .count = &state },
         prefix_buf[0..prefix_len],
         continuation_indent,
@@ -766,7 +780,8 @@ fn wrapCore(
 ) !void {
     // The push sink reuses the builder's scratch buffer so span capacity carries
     // across rows (the sub-linear-allocation invariant). The count sink never
-    // appends, so its scratch stays empty — a cheap stack local, no deinit.
+    // allocates — `addSpan` skips the ArrayList for `.count` and only flips a
+    // `has_content` bool on the CountState, so `empty_scratch` stays empty.
     var empty_scratch: std.ArrayList(Span) = .empty;
     const current: *std.ArrayList(Span) = switch (sink) {
         .push => |b| &b.scratch,
@@ -789,7 +804,7 @@ fn wrapCore(
                     current_indent = continuation_indent;
                     current_width = try startRow(gpa, sink, current, &.{}, current_indent);
                 } else {
-                    try appendSpan(current, gpa, " ", span.style);
+                    try addSpan(sink, current, gpa, " ", span.style);
                     current_width += 1;
                 }
             }
@@ -805,7 +820,7 @@ fn wrapCore(
                     }
                     const end = graphemeSliceEnd(word, hi, capacity);
                     const slice = word[hi..end];
-                    try appendSpan(current, gpa, slice, span.style);
+                    try addSpan(sink, current, gpa, slice, span.style);
                     current_width += textWidth(slice);
                     hi = end;
                     if (hi < word.len) {
@@ -815,15 +830,19 @@ fn wrapCore(
                     }
                 }
             } else {
-                try appendSpan(current, gpa, word, span.style);
+                try addSpan(sink, current, gpa, word, span.style);
                 current_width += word_width;
             }
             index = word_end;
         }
     }
 
-    if (current.items.len == 0) {
-        try appendSpan(current, gpa, "", .normal);
+    const row_is_empty = switch (sink) {
+        .push => current.items.len == 0,
+        .count => |state| !state.has_content,
+    };
+    if (row_is_empty) {
+        try addSpan(sink, current, gpa, "", .normal);
     }
     try commitRow(gpa, sink, current, current_indent);
 }
@@ -847,8 +866,9 @@ fn startRow(
                 used += textWidth(span.text);
             }
         },
-        .count => {
+        .count => |state| {
             for (prefix) |span| used += textWidth(span.text);
+            state.has_content = false;
         },
     }
     return used;
@@ -859,7 +879,10 @@ fn startRow(
 fn commitRow(gpa: std.mem.Allocator, sink: RowSink, current: *std.ArrayList(Span), indent: u16) !void {
     switch (sink) {
         .push => |b| try b.push(gpa, indent, current.items),
-        .count => |state| state.rows += 1,
+        .count => |state| {
+            state.rows += 1;
+            state.has_content = false;
+        },
     }
     current.clearRetainingCapacity();
 }
@@ -993,7 +1016,7 @@ test "tables render cells and strip strong markers from header" {
     try std.testing.expectEqual(Style.strong, out.rows[1].spans[2].style);
     try std.testing.expectEqualStrings("Name", out.rows[1].spans[2].text);
     try std.testing.expect(std.mem.indexOf(u8, out.rows[1].spans[2].text, "**") == null);
-    try std.testing.expectEqual(@as(u16, 5), countRows("| **Name** | Value |\n| --- | --- |\n| alpha | beta |", 80));
+    try std.testing.expectEqual(@as(u16, 5), countRows(gpa, "| **Name** | Value |\n| --- | --- |\n| alpha | beta |", 80));
 }
 
 test "table cells wrap within column width" {
@@ -1002,7 +1025,7 @@ test "table cells wrap within column width" {
     defer out.deinit(gpa);
 
     try std.testing.expect(out.rows.len > 5);
-    try std.testing.expectEqual(@as(u16, @intCast(out.rows.len)), countRows("| Name | Value |\n| --- | --- |\n| alpha beta gamma | delta |", 24));
+    try std.testing.expectEqual(@as(u16, @intCast(out.rows.len)), countRows(gpa, "| Name | Value |\n| --- | --- |\n| alpha beta gamma | delta |", 24));
 }
 
 test "strong markers are removed" {
@@ -1131,7 +1154,7 @@ test "wraps at word boundaries" {
     try std.testing.expectEqual(@as(usize, 2), out.rows.len);
     try std.testing.expectEqualStrings("hello", out.rows[0].spans[0].text);
     try std.testing.expectEqualStrings("world", out.rows[1].spans[0].text);
-    try std.testing.expectEqual(@as(u16, 2), countRows("hello world", 8));
+    try std.testing.expectEqual(@as(u16, 2), countRows(gpa, "hello world", 8));
 }
 
 // SSOT guard: `countRows` derives the surface height and `render`/`Incremental`
@@ -1155,7 +1178,7 @@ test "countRows matches render across widths and content shapes" {
     for (cases) |c| {
         var w: u16 = c.min_width;
         while (w <= 60) : (w += 1) {
-            const counted = countRows(c.text, w);
+            const counted = countRows(gpa, c.text, w);
             var out = try render(gpa, c.text, w);
             defer out.deinit(gpa);
             const rendered: u16 = @intCast(out.rows.len);
@@ -1181,11 +1204,23 @@ test "hard-wrapped continuation lines keep the continuation indent" {
 }
 
 // SSOT guard: the count path must stay allocation-free. It runs every draw
-// frame per message on a cache miss, so a leak here would compound. The
-// testing allocator fails the test on any unfreed allocation, so wrapping the
-// count calls in a clean arena would miss leaks — we pass it directly.
-test "countRows does not allocate" {
+// frame per message on a cache miss, so a leak here would compound. We prove
+// zero allocations with a CountingAllocator — std.testing.allocator only
+// catches leaks, not allocations that are freed, so a counter is the correct
+// tool to lock the "no allocation" invariant in place.
+test "countRows returns expected values and makes no allocations" {
     const gpa = std.testing.allocator;
+
+    // Explicit return-value checks for known (text, width) pairs.
+    try std.testing.expectEqual(@as(u16, 4), countRows(gpa, "the quick brown fox", 8));
+    try std.testing.expectEqual(@as(u16, 1), countRows(gpa, "the quick brown fox", 80));
+    try std.testing.expectEqual(@as(u16, 2), countRows(gpa, "hello world", 8));
+
+    // Allocation proof: wrap each countRows call with a CountingAllocator
+    // whose child is std.testing.allocator. The count path's addSpan skips
+    // the ArrayList for .count (only flipping a has_content bool), so
+    // alloc_count must stay 0. std.testing.allocator also catches leaks at
+    // teardown as a secondary guard.
     const texts = [_][]const u8{
         "the quick brown fox",
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -1194,7 +1229,10 @@ test "countRows does not allocate" {
     };
     for (texts) |t| {
         var w: u16 = 8;
-        while (w <= 40) : (w += 1) _ = countRows(t, w);
+        while (w <= 40) : (w += 1) {
+            var counting: CountingAllocator = .{ .child = gpa };
+            _ = countRows(counting.allocator(), t, w);
+            try std.testing.expectEqual(@as(usize, 0), counting.count);
+        }
     }
-    _ = gpa; // std.testing.allocator reports leaks at test teardown.
 }

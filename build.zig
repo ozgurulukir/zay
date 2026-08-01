@@ -44,18 +44,19 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const counting_allocator_mod = b.createModule(.{
+        .root_source_file = b.path("lib/counting_allocator.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const terminal_markdown_mod = b.createModule(.{
         .root_source_file = b.path("lib/terminal_markdown.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
+            .{ .name = "counting_allocator", .module = counting_allocator_mod },
         },
-    });
-    const counting_allocator_mod = b.createModule(.{
-        .root_source_file = b.path("lib/counting_allocator.zig"),
-        .target = target,
-        .optimize = optimize,
     });
     const translate_c = b.addTranslateC(.{
         .root_source_file = b.path("src/c.h"),

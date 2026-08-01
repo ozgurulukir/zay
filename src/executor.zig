@@ -478,14 +478,13 @@ fn errorDescription(err: anyerror) []const u8 {
 }
 
 test "ExecutorService.runAll errdefer cleanup exists" {
-    // This test verifies the errdefer cleanup logic exists in runAll.
-    // The errdefer at executor.zig:138-141 deinitializes already-completed
-    // results if a later tool call fails, preventing memory leaks.
+    // This test verifies the errdefer cleanup logic in runAll (lines 202-205).
+    // The errdefer deinitializes already-completed results if a later tool
+    // call fails, preventing memory leaks.
     //
-    // Manual verification: create a mock observer that errors on the 2nd call,
-    // run runAll, and confirm zig test's leak checker reports no leaks.
-    //
-    // For now, just verify runAll works correctly with noopObserver.
+    // Strategy: add a 2nd tool call whose on_started errors, so initialized=1
+    // when the error fires and the errdefer loop deinits results[0].
+    // std.testing.allocator catches any leak if cleanup is wrong.
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
@@ -497,6 +496,11 @@ test "ExecutorService.runAll errdefer cleanup exists" {
             .name = try gpa.dupe(u8, "bash"),
             .arguments = try gpa.dupe(u8, "{\"command\":\"printf test\",\"reason\":\"Test\"}"),
         },
+        .{
+            .call_id = .{ .value = try gpa.dupe(u8, "call_1") },
+            .name = try gpa.dupe(u8, "bash"),
+            .arguments = try gpa.dupe(u8, "{\"command\":\"printf fail\",\"reason\":\"Fail\"}"),
+        },
     };
     defer for (calls) |c| {
         gpa.free(c.call_id.value);
@@ -504,10 +508,25 @@ test "ExecutorService.runAll errdefer cleanup exists" {
         gpa.free(c.arguments);
     };
 
-    const results = try executor.runAll(&calls, noopObserver(void));
-    defer {
-        for (results) |*r| r.deinit(gpa);
-        gpa.free(results);
-    }
-    try std.testing.expectEqual(@as(usize, 1), results.len);
+    const FailOnSecond = struct {
+        call_count: usize = 0,
+        fn onStarted(ctx: *@This(), _: ai.ToolCall) anyerror!void {
+            ctx.call_count += 1;
+            if (ctx.call_count == 2) return error.TestError;
+        }
+        fn onFinished(_: *@This(), _: *const ToolResult) anyerror!void {}
+        fn approve(_: *@This(), _: ai.ToolCall, _: []const u8) anyerror!bool {
+            return true;
+        }
+    };
+
+    var fail_state = FailOnSecond{};
+    const observer = ToolCallObserver(FailOnSecond){
+        .ctx = &fail_state,
+        .on_started = FailOnSecond.onStarted,
+        .on_finished = FailOnSecond.onFinished,
+        .approve_unsafe_bash = FailOnSecond.approve,
+    };
+
+    try std.testing.expectError(error.TestError, executor.runAll(&calls, observer));
 }

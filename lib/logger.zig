@@ -168,4 +168,6 @@ fn writeLine(writer: *std.Io.File.Writer, bytes: []const u8) void {
 
 test "logger stays disabled without init" {
     log("test {d}", .{1});
+    try std.testing.expectEqual(@as(u64, 0), state.dropped);
+    try std.testing.expect(state.entry_queue.empty());
 }

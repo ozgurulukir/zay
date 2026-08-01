@@ -69,5 +69,5 @@ test "frame wraps around the loop" {
 
 test "void and ramp colours" {
     try std.testing.expect(colorAt(' ') == null);
-    try std.testing.expect(colorAt('@') != null);
+    try std.testing.expectEqual(Rgb{ 255, 226, 194 }, colorAt('@').?);
 }
