@@ -7,7 +7,9 @@ const background = @import("background.zig");
 const bash_safety = @import("tools/bash_safety.zig");
 const bash_tool = @import("tools/bash.zig");
 const lua_mod = @import("lua/root.zig");
+const mcp_client_mod = @import("mcp/client.zig");
 const mcp_mod = @import("mcp/manager.zig");
+const schema_mod = @import("tools/schema.zig");
 const tools = @import("tools.zig");
 const tool_display = @import("tools/display.zig");
 
@@ -227,7 +229,65 @@ pub const ExecutorService = struct {
         return !approved;
     }
 
+    /// Run one ToolCall. Tool arguments are validated against the tool's
+    /// schema BEFORE dispatch, in a single choke point shared by all three
+    /// channels (builtin / plugin / MCP): an invalid call returns a structured
+    /// validation error to the model instead of letting the tool run on garbage
+    /// input. Unknown tools (no schema) skip validation and dispatch — they
+    /// already fail in `produceOutput`.
     fn runOne(self: *ExecutorService, call: ai.ToolCall) !ToolResult {
+        if (self.resolveSchema(call)) |schema| {
+            // `validateArgs` turns every non-allocation failure (parse errors,
+            // type mismatches, missing fields) into a violation internally, so
+            // the only error that propagates is OutOfMemory — propagate it; the
+            // tool does not run unvalidated under memory pressure.
+            var validation = schema_mod.validateArgs(self.gpa, schema, call.arguments) catch return error.OutOfMemory;
+            defer validation.deinit(self.gpa);
+            if (!validation.isValid()) {
+                return self.runValidationError(call, &validation);
+            }
+        }
+        return self.dispatchCall(call);
+    }
+
+    /// Resolve the `tools.Schema` for a call across all three channels.
+    /// Returns null when the tool is unknown — validation is then skipped.
+    fn resolveSchema(self: *ExecutorService, call: ai.ToolCall) ?tools.Schema {
+        // MCP: `mcp__<server>__<tool>` → the connected client's tool schema.
+        // Same parse as `runMcpTool`, then match the tool's `full_name`.
+        if (std.mem.startsWith(u8, call.name, "mcp__")) {
+            const manager = self.mcp_manager orelse return null;
+            const rest = call.name["mcp__".len..];
+            const sep = std.mem.indexOfScalar(u8, rest, '_') orelse return null;
+            const after_server = rest[sep + 1 ..];
+            if (after_server.len == 0 or after_server[0] != '_') return null;
+            const server_name = rest[0..sep];
+            for (manager.clients.items) |*client| {
+                if (client.status() != .connected) continue;
+                if (!std.mem.eql(u8, client.name, server_name)) continue;
+                for (client.tools.items) |*tool| {
+                    if (std.mem.eql(u8, tool.full_name, call.name)) return tool.schema;
+                }
+            }
+            return null;
+        }
+        // Builtin + plugin: one registry lookup.
+        if (self.tool_registry) |registry| {
+            const slice = registry.all(self.gpa) catch return null;
+            for (slice) |tool| {
+                if (std.mem.eql(u8, tool.name, call.name)) return tool.schema;
+            }
+            return null;
+        }
+        for (tools.builtinRegistry()) |tool| {
+            if (std.mem.eql(u8, tool.name, call.name)) return tool.schema;
+        }
+        return null;
+    }
+
+    /// Dispatch a call that passed validation. MCP calls route through the
+    /// manager; plugin and builtin calls share the registry-backed path.
+    fn dispatchCall(self: *ExecutorService, call: ai.ToolCall) !ToolResult {
         // MCP tool calls are dispatched through the MCP manager, not the tool registry.
         if (std.mem.startsWith(u8, call.name, "mcp__")) {
             return self.runMcpTool(call);
@@ -346,6 +406,34 @@ pub const ExecutorService = struct {
             return tools.runWith(slice, self.gpa, self.io, self.cwd, call.name, call.arguments);
         }
         return tools.run(self.gpa, self.io, self.cwd, call.name, call.arguments);
+    }
+
+    /// Validation error — the tool never ran; the model sent bad arguments.
+    /// Distinct from `runFailure` (execution errors): the message carries the
+    /// structured violation list the model can act on directly.
+    fn runValidationError(
+        self: *ExecutorService,
+        call: ai.ToolCall,
+        validation: *const schema_mod.ValidationResult,
+    ) !ToolResult {
+        const detail = try validation.formatMessage(self.gpa);
+        defer self.gpa.free(detail);
+        const content = try std.fmt.allocPrint(self.gpa, "Invalid arguments for tool '{s}': {s}", .{ call.name, detail });
+        errdefer self.gpa.free(content);
+
+        var display = try tool_display.lookupDisplay(self.gpa, tools.lookupIn(tools.builtinRegistry(), call.name), call.name, call.arguments);
+        errdefer display.deinit(self.gpa);
+        const display_body = try self.gpa.dupe(u8, content);
+        errdefer self.gpa.free(display_body);
+
+        return try ToolResult.init(self.gpa, .{
+            .call_id = call.call_id.slice(),
+            .name = call.name,
+            .content = content,
+            .display = display,
+            .display_body = display_body,
+            .failed = true,
+        });
     }
 
     fn runFailure(self: *ExecutorService, call: ai.ToolCall, err: anyerror) !ToolResult {
@@ -529,4 +617,297 @@ test "ExecutorService.runAll errdefer cleanup exists" {
     };
 
     try std.testing.expectError(error.TestError, executor.runAll(&calls, observer));
+}
+
+// ── Schema validation tests (builtin / plugin / MCP) ──
+
+// Test doubles for fake plugin tools: validation rejects before `run` ever
+// fires, but `addPluginTool` requires well-formed callbacks.
+const test_dummy_free: *const fn (gpa: std.mem.Allocator, ud: *anyopaque) void = struct {
+    fn free(gpa: std.mem.Allocator, ud: *anyopaque) void {
+        _ = gpa;
+        _ = ud;
+    }
+}.free;
+
+const test_dummy_run: *const fn (
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    args: []const u8,
+    userdata: *anyopaque,
+) tools.Error!tools.Output = struct {
+    fn run(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        cwd: []const u8,
+        args: []const u8,
+        userdata: *anyopaque,
+    ) tools.Error!tools.Output {
+        _ = io;
+        _ = cwd;
+        _ = args;
+        _ = userdata;
+        const stdout = try gpa.dupe(u8, "ok");
+        const stderr = try gpa.alloc(u8, 0);
+        return .{ .stdout = stdout, .stderr = stderr, .code = 0 };
+    }
+}.run;
+
+const test_dummy_display: *const fn (
+    gpa: std.mem.Allocator,
+    args: []const u8,
+    userdata: *anyopaque,
+) std.mem.Allocator.Error!tools.ToolDisplay = struct {
+    fn display(
+        gpa: std.mem.Allocator,
+        args: []const u8,
+        userdata: *anyopaque,
+    ) std.mem.Allocator.Error!tools.ToolDisplay {
+        _ = args;
+        _ = userdata;
+        return .{ .label = try gpa.dupe(u8, "dummy") };
+    }
+}.display;
+
+/// Register a fake plugin tool with a required string enum property, the
+/// `lua__<plugin>__<tool>` shape the registry dispatches.
+fn addPluginModeTool(gpa: std.mem.Allocator, registry: *tools.ToolRegistry) !void {
+    const name = try gpa.dupe(u8, "lua__p__mode");
+    errdefer gpa.free(name);
+    const desc = try gpa.dupe(u8, "plugin mode tool");
+    errdefer gpa.free(desc);
+    try registry.addPluginTool(gpa, .{
+        .name = name,
+        .description = desc,
+        .schema = .{ .properties = &.{
+            .{
+                .name = "mode",
+                .kind = .string,
+                .description = "Run mode",
+                .required = true,
+                .enum_values = &.{ "fast", "slow" },
+            },
+        } },
+        .run = test_dummy_run,
+        .display = test_dummy_display,
+        .userdata = undefined,
+        .userdata_free = test_dummy_free,
+    });
+}
+
+/// Attach a connected stdio client named `test` carrying one tool
+/// `mcp__test__search` with a required string `query` property. The client has
+/// no live process — validation rejects before any transport I/O.
+///
+/// The properties array is heap-allocated (not a `&.{…}` compound literal,
+/// which lives on this frame's stack): `McpTool.deinit` frees each property's
+/// `name`/`description` and reads the array back when the manager is torn
+/// down, long after this helper has returned.
+fn addTestMcpSearchTool(gpa: std.mem.Allocator, manager: *mcp_mod.McpManager) !void {
+    const props = try gpa.alloc(tools.Schema.Property, 1);
+    errdefer gpa.free(props);
+    props[0] = .{
+        .name = try gpa.dupe(u8, "query"),
+        .kind = .string,
+        .description = try gpa.dupe(u8, "Query text"),
+        .required = true,
+    };
+    var client = try mcp_client_mod.McpClient.init(gpa, "test", "echo", &.{}, null);
+    client.lifecycle = .{
+        .stdio = .{
+            .process = std.mem.zeroes(std.process.Child),
+            .status = .ready,
+        },
+    };
+    try client.addTool("search", "Search the index", .{ .properties = props });
+    try manager.clients.append(gpa, client);
+}
+
+fn makeCall(gpa: std.mem.Allocator, id: []const u8, name: []const u8, args: []const u8) !ai.ToolCall {
+    return .{
+        .call_id = .{ .value = try gpa.dupe(u8, id) },
+        .name = try gpa.dupe(u8, name),
+        .arguments = try gpa.dupe(u8, args),
+    };
+}
+
+test "valid bash call still dispatches after schema validation" {
+    // Positive control: the runAll happy path. Asserted on runOne directly so
+    // a regression that rejects everything is caught here, not only downstream.
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = cwd });
+
+    const call = try makeCall(gpa, "call_ok", "bash", "{\"command\":\"printf ok\",\"reason\":\"Print ok\"}");
+    defer {
+        gpa.free(call.call_id.value);
+        gpa.free(call.name);
+        gpa.free(call.arguments);
+    }
+
+    var result = try executor.runOne(call);
+    defer result.deinit(gpa);
+    try std.testing.expect(!result.failed);
+    try std.testing.expectEqualStrings("ok", result.content);
+}
+
+test "executor rejects bash call with missing required argument" {
+    const gpa = std.testing.allocator;
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp" });
+
+    const call = try makeCall(gpa, "call_v", "bash", "{}");
+    defer {
+        gpa.free(call.call_id.value);
+        gpa.free(call.name);
+        gpa.free(call.arguments);
+    }
+
+    var result = try executor.runOne(call);
+    defer result.deinit(gpa);
+    try std.testing.expect(result.failed);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "Invalid arguments for tool 'bash'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "`command` is required") != null);
+}
+
+test "executor rejects bash call with wrong type" {
+    const gpa = std.testing.allocator;
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp" });
+
+    const call = try makeCall(gpa, "call_t", "bash", "{\"command\":42}");
+    defer {
+        gpa.free(call.call_id.value);
+        gpa.free(call.name);
+        gpa.free(call.arguments);
+    }
+
+    var result = try executor.runOne(call);
+    defer result.deinit(gpa);
+    try std.testing.expect(result.failed);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "`command` must be string") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "(got: 42)") != null);
+}
+
+test "executor rejects bash call with invalid JSON" {
+    const gpa = std.testing.allocator;
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp" });
+
+    const call = try makeCall(gpa, "call_j", "bash", "{bad");
+    defer {
+        gpa.free(call.call_id.value);
+        gpa.free(call.name);
+        gpa.free(call.arguments);
+    }
+
+    var result = try executor.runOne(call);
+    defer result.deinit(gpa);
+    try std.testing.expect(result.failed);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "must be valid JSON") != null);
+}
+
+test "executor rejects plugin tool call with enum violation" {
+    const gpa = std.testing.allocator;
+    var registry = tools.ToolRegistry.init(tools.builtinRegistry());
+    defer registry.deinit(gpa);
+    try addPluginModeTool(gpa, &registry);
+
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp", .tool_registry = &registry });
+
+    const call = try makeCall(gpa, "call_e", "lua__p__mode", "{\"mode\":\"turbo\"}");
+    defer {
+        gpa.free(call.call_id.value);
+        gpa.free(call.name);
+        gpa.free(call.arguments);
+    }
+
+    var result = try executor.runOne(call);
+    defer result.deinit(gpa);
+    try std.testing.expect(result.failed);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "`mode` must be one of: fast, slow") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "turbo") != null);
+}
+
+test "executor rejects plugin tool call with missing required argument" {
+    const gpa = std.testing.allocator;
+    var registry = tools.ToolRegistry.init(tools.builtinRegistry());
+    defer registry.deinit(gpa);
+    try addPluginModeTool(gpa, &registry);
+
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp", .tool_registry = &registry });
+
+    const call = try makeCall(gpa, "call_m", "lua__p__mode", "{}");
+    defer {
+        gpa.free(call.call_id.value);
+        gpa.free(call.name);
+        gpa.free(call.arguments);
+    }
+
+    var result = try executor.runOne(call);
+    defer result.deinit(gpa);
+    try std.testing.expect(result.failed);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "`mode` is required") != null);
+}
+
+test "executor rejects MCP tool call with missing required field" {
+    const gpa = std.testing.allocator;
+    var manager = mcp_mod.McpManager.init(gpa);
+    defer manager.deinit(std.testing.io);
+    try addTestMcpSearchTool(gpa, &manager);
+
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp", .mcp_manager = &manager });
+
+    const call = try makeCall(gpa, "call_mcp", "mcp__test__search", "{}");
+    defer {
+        gpa.free(call.call_id.value);
+        gpa.free(call.name);
+        gpa.free(call.arguments);
+    }
+
+    var result = try executor.runOne(call);
+    defer result.deinit(gpa);
+    try std.testing.expect(result.failed);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "`query` is required") != null);
+}
+
+test "executor rejects MCP tool call with wrong type" {
+    const gpa = std.testing.allocator;
+    var manager = mcp_mod.McpManager.init(gpa);
+    defer manager.deinit(std.testing.io);
+    try addTestMcpSearchTool(gpa, &manager);
+
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp", .mcp_manager = &manager });
+
+    const call = try makeCall(gpa, "call_mcp", "mcp__test__search", "{\"query\":42}");
+    defer {
+        gpa.free(call.call_id.value);
+        gpa.free(call.name);
+        gpa.free(call.arguments);
+    }
+
+    var result = try executor.runOne(call);
+    defer result.deinit(gpa);
+    try std.testing.expect(result.failed);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "`query` must be string") != null);
+}
+
+test "executor rejects MCP tool call with invalid JSON" {
+    const gpa = std.testing.allocator;
+    var manager = mcp_mod.McpManager.init(gpa);
+    defer manager.deinit(std.testing.io);
+    try addTestMcpSearchTool(gpa, &manager);
+
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp", .mcp_manager = &manager });
+
+    const call = try makeCall(gpa, "call_mcp", "mcp__test__search", "{bad");
+    defer {
+        gpa.free(call.call_id.value);
+        gpa.free(call.name);
+        gpa.free(call.arguments);
+    }
+
+    var result = try executor.runOne(call);
+    defer result.deinit(gpa);
+    try std.testing.expect(result.failed);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "must be valid JSON") != null);
 }
