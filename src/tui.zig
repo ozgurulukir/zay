@@ -363,12 +363,16 @@ pub const App = struct {
         return &self.pickers.models;
     }
 
-    pub fn toggleResumeGlobal(self: *App) void {
-        self.nav.resume_global = !self.nav.resume_global;
+    pub fn toggleResumeGroupBy(self: *App) void {
+        self.nav.resume_group_by = switch (self.nav.resume_group_by) {
+            .flat => .project,
+            .project => .date,
+            .date => .flat,
+        };
     }
 
-    pub fn getResumeGlobal(self: *const App) bool {
-        return self.nav.resume_global;
+    pub fn getResumeGroupBy(self: *const App) app_state.NavState.ResumeGroupBy {
+        return self.nav.resume_group_by;
     }
 
     pub fn getResumeSelection(self: *const App) u32 {
@@ -413,6 +417,14 @@ pub const App = struct {
         var cut = items.len - 1;
         while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
         self.input_buffers.mcp_url.shrinkRetainingCapacity(cut);
+    }
+
+    pub fn popSessionRenameInput(self: *App) void {
+        const items = self.input_buffers.session_rename_text.items;
+        if (items.len == 0) return;
+        var cut = items.len - 1;
+        while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
+        self.input_buffers.session_rename_text.shrinkRetainingCapacity(cut);
     }
 
     pub fn isCodexSignedIn(self: *const App) bool {
@@ -747,6 +759,26 @@ pub const App = struct {
 
     pub fn reportSessionSwitchError(self: *App, err: anyerror) !void {
         return session_switcher.reportSessionSwitchError(self, err);
+    }
+
+    pub fn beginRenameSelectedSession(self: *App) !void {
+        return session_switcher.beginRenameSelectedSession(self);
+    }
+
+    pub fn confirmRenameSelectedSession(self: *App) !void {
+        return session_switcher.confirmRenameSelectedSession(self);
+    }
+
+    pub fn beginDeleteSelectedSession(self: *App) !void {
+        return session_switcher.beginDeleteSelectedSession(self);
+    }
+
+    pub fn confirmDeleteSelectedSession(self: *App) !void {
+        return session_switcher.confirmDeleteSelectedSession(self);
+    }
+
+    pub fn cancelSessionAction(self: *App) void {
+        session_switcher.cancelSessionAction(self);
     }
 
     pub fn reportConnectionError(self: *App, err: anyerror) !void {

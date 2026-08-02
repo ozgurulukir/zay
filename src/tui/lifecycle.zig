@@ -74,6 +74,7 @@ pub fn deinitApp(self: *App) void {
     self.input_buffers.provider_key.deinit(self.gpa);
     self.input_buffers.settings_text.deinit(self.gpa);
     self.input_buffers.mcp_url.deinit(self.gpa);
+    self.input_buffers.session_rename_text.deinit(self.gpa);
     self.mcp_manager.deinit(self.io);
     self.plugin_manager.deinit();
     self.tool_registry.deinit(self.gpa);
@@ -465,7 +466,15 @@ pub fn syncFocus(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         return;
     }
     const target = switch (app.mode) {
-        .command, .session_picker, .provider_picker, .model_picker, .tree_picker, .save_message => app.inputs.palette.widget(),
+        .command, .provider_picker, .model_picker, .tree_picker, .save_message => app.inputs.palette.widget(),
+        // The session picker uses the palette input for filtering while
+        // browsing, but sub-states (rename/delete) handle keys via the
+        // command router — focus stays on root so the palette input
+        // doesn't swallow printable keys meant for the rename buffer.
+        .session_picker => switch (app.nav.session_action) {
+            .browsing => app.inputs.palette.widget(),
+            .renaming, .deleting, .blocked => root.widget(),
+        },
         // The diff viewer routes focus by sub-state: the comment editor and
         // the file-search field each host a drawn TextField; while browsing
         // the root widget owns every key.

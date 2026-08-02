@@ -136,6 +136,16 @@ pub const PickerStates = struct {
 /// hit-test rect.
 pub const NavState = struct {
     pub const LanesPurpose = enum { manage, merge_dest };
+    /// Sub-state of the session resume picker: browsing the list, typing a
+    /// new title (rename), confirming a deletion, or showing a blocked-action
+    /// popup (e.g. "cannot delete active session"). Follows the MCP `adding`
+    /// pattern — a sub-state that captures all keys until submitted or
+    /// cancelled.
+    pub const SessionAction = enum { browsing, renaming, deleting, blocked };
+    /// How the resume picker groups sessions. `flat` shows only the current
+    /// project's sessions (no grouping). `project` groups by project
+    /// directory. `date` groups by date (Today, Yesterday, This Week, etc.).
+    pub const ResumeGroupBy = enum { flat, project, date };
     pub const QuitState = union(enum) {
         none,
         pending: std.Io.Timestamp,
@@ -145,7 +155,11 @@ pub const NavState = struct {
     block_nav: bool = false,
     command_selection: u32 = 0,
     resume_selection: u32 = 0,
-    resume_global: bool = false,
+    /// How the resume picker groups sessions. Cycles through flat (current
+    /// project, no grouping), project (all projects, grouped by project), and
+    /// date (all projects, grouped by date).
+    resume_group_by: ResumeGroupBy = .flat,
+    session_action: SessionAction = .browsing,
     lanes_selection: u32 = 0,
     lanes_purpose: LanesPurpose = .manage,
     queued_selection: usize = 0,
@@ -239,6 +253,9 @@ pub const InputBuffers = struct {
     /// Inline edit buffer for the MCP overlay's "add server by URL" form.
     /// Owned; freed in `deinit`.
     mcp_url: std.ArrayList(u8) = .empty,
+    /// Inline edit buffer for the resume picker's rename-session form.
+    /// Owned; freed in `deinit`.
+    session_rename_text: std.ArrayList(u8) = .empty,
 };
 
 /// Visual feedback state: the loading spinner frame, the black-hole

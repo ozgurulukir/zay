@@ -54,7 +54,12 @@ fn overlayLabel(app: *const App) []const u8 {
     return switch (app.mode) {
         .normal => "",
         .command => "Command",
-        .session_picker => "Search for Sessions",
+        .session_picker => switch (app.nav.session_action) {
+            .browsing => "Search for Sessions",
+            .renaming => "Rename Session",
+            .deleting => "Delete Session",
+            .blocked => "Cannot Delete Active Session",
+        },
         .provider_picker => "Connect to Provider",
         .model_picker => "Select Model",
         .tree_picker => "Session Timeline",
@@ -333,7 +338,9 @@ const OverlayInner = struct {
             .selection = app.nav.resume_selection,
             .folded_projects = app.resume_folded_projects.items,
             .filter = filter,
-            .tree_mode = app.nav.resume_global,
+            .group_by = app.nav.resume_group_by,
+            .action = app.nav.session_action,
+            .rename_text = app.input_buffers.session_rename_text.items,
         };
         return content.widget().draw(ctx);
     }

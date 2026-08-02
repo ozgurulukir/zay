@@ -105,7 +105,7 @@ pub fn openResumePicker(app: *App) !void {
     const summaries = app.resume_summaries.items;
     const filter = app.peekPaletteInput() catch "";
     defer if (filter.len > 0) app.gpa.free(filter);
-    _ = resume_picker.visibleCount(summaries, filter, app.resume_folded_projects.items, app.nav.resume_global);
+    _ = resume_picker.visibleCount(app.io, summaries, filter, app.resume_folded_projects.items, app.nav.resume_group_by);
     app.nav.resume_selection = 0;
     app.nav.block_nav = false;
     app.mode = .session_picker;
@@ -118,11 +118,11 @@ pub fn reloadResumeSessions(app: *App) !void {
     resumeClear(app);
     var manager = try session_mod.SessionManager.initDefault(app.gpa, app.io, app.liveRuntime().?.home_dir);
     defer manager.deinit();
-    const cwd = if (app.nav.resume_global) null else (app.repoRoot() orelse app.liveRuntime().?.cwd);
+    const cwd = if (app.nav.resume_group_by != .flat) null else (app.repoRoot() orelse app.liveRuntime().?.cwd);
     const summaries = try manager.list(app.gpa, cwd);
     defer app.gpa.free(summaries);
     try app.resume_summaries.appendSlice(app.gpa, summaries);
-    if (app.nav.resume_global) {
+    if (app.nav.resume_group_by != .flat) {
         var map = try buildProjectMaxMap(app.gpa, app.resume_summaries.items);
         defer map.deinit();
         std.mem.sort(
@@ -143,13 +143,13 @@ pub fn reloadResumeSessions(app: *App) !void {
 pub fn selectedResumeSummary(app: *App) !?*session_mod.SessionSummary {
     const filter = try app.peekPaletteInput();
     defer app.gpa.free(filter);
-    return @constCast(resume_picker.selectedSummary(app.resume_summaries.items, filter, app.resume_folded_projects.items, app.nav.resume_selection, app.nav.resume_global));
+    return @constCast(resume_picker.selectedSummary(app.resume_summaries.items, filter, app.resume_folded_projects.items, app.nav.resume_selection, app.nav.resume_group_by));
 }
 
 pub fn visibleResumeCount(app: *App) !u32 {
     const filter = try app.peekPaletteInput();
     defer app.gpa.free(filter);
-    return resume_picker.visibleCount(app.resume_summaries.items, filter, app.resume_folded_projects.items, app.nav.resume_global);
+    return resume_picker.visibleCount(app.io, app.resume_summaries.items, filter, app.resume_folded_projects.items, app.nav.resume_group_by);
 }
 
 pub fn toggleSelectedResumeProject(app: *App) !void {
@@ -174,6 +174,9 @@ pub fn resumeClearFolds(app: *App) void {
 pub fn resumeClear(app: *App) void {
     for (app.resume_summaries.items) |*summary| summary.deinit(app.gpa);
     app.resume_summaries.clearRetainingCapacity();
+    // Reset any pending sub-state so it doesn't persist into the next open.
+    app.nav.session_action = .browsing;
+    app.input_buffers.session_rename_text.clearRetainingCapacity();
 }
 
 pub fn syncResumeListCursor(app: *App) void {
@@ -209,6 +212,86 @@ pub fn reportSessionSwitchError(app: *App, err: anyerror) !void {
     var buffer: [128]u8 = undefined;
     const message = std.fmt.bufPrint(&buffer, "Could not switch session: {s}", .{@errorName(err)}) catch "Could not switch session.";
     _ = try app.thread.transcript.append(app.gpa, .agent, "agent", message);
+}
+
+/// Enter the rename sub-state for the currently selected session. Prefills
+/// the rename buffer with the existing title (or empty if untitled). No-op
+/// when the selection is a project header or no session is selected.
+pub fn beginRenameSelectedSession(app: *App) !void {
+    const summary = try app.selectedResumeSummary() orelse return;
+    app.input_buffers.session_rename_text.clearRetainingCapacity();
+    if (summary.title) |title| {
+        try app.input_buffers.session_rename_text.appendSlice(app.gpa, title);
+    }
+    app.nav.session_action = .renaming;
+}
+
+/// Confirm the rename: write the new title to the DB and reload the list.
+/// The caller has already validated that the text is non-empty.
+pub fn confirmRenameSelectedSession(app: *App) !void {
+    const text = std.mem.trim(u8, app.input_buffers.session_rename_text.items, " \t\r\n");
+    if (text.len == 0) return;
+    const summary = try app.selectedResumeSummary() orelse return;
+    var manager = try session_mod.SessionManager.initDefault(app.gpa, app.io, app.liveRuntime().?.home_dir);
+    defer manager.deinit();
+    manager.renameSession(summary.id, text) catch |err| {
+        app.nav.session_action = .browsing;
+        app.input_buffers.session_rename_text.clearRetainingCapacity();
+        try app.reportSessionSwitchError(err);
+        return;
+    };
+    app.nav.session_action = .browsing;
+    app.input_buffers.session_rename_text.clearRetainingCapacity();
+    try app.reloadResumeSessions();
+}
+
+/// Enter the delete-confirmation sub-state for the currently selected
+/// session. No-op when the selection is a project header or the session
+/// is the currently active one (deleting it would leave the runtime
+/// orphaned — the DB row is gone but the in-memory session persists
+/// until restart).
+pub fn beginDeleteSelectedSession(app: *App) !void {
+    const summary = try app.selectedResumeSummary() orelse return;
+    // Reject deletion of the active session: the runtime holds it in
+    // memory but the DB row would be gone, so the session is lost on
+    // restart. Show a popup explaining why.
+    if (app.thread.id) |active_id| {
+        if (std.mem.eql(u8, summary.id, active_id.slice())) {
+            app.nav.session_action = .blocked;
+            return;
+        }
+    }
+    app.nav.session_action = .deleting;
+}
+
+/// Confirm the deletion: remove the session from the DB and reload the
+/// list. The selection is clamped after reload.
+pub fn confirmDeleteSelectedSession(app: *App) !void {
+    const summary = try app.selectedResumeSummary() orelse {
+        app.nav.session_action = .browsing;
+        return;
+    };
+    const id = try app.gpa.dupe(u8, summary.id);
+    defer app.gpa.free(id);
+    var manager = try session_mod.SessionManager.initDefault(app.gpa, app.io, app.liveRuntime().?.home_dir);
+    defer manager.deinit();
+    manager.deleteSession(id) catch |err| {
+        app.nav.session_action = .browsing;
+        try app.reportSessionSwitchError(err);
+        return;
+    };
+    app.nav.session_action = .browsing;
+    // The deleted session is gone; clamp the selection before reload so it
+    // doesn't point past the end of the now-shorter list.
+    if (app.nav.resume_selection > 0) app.nav.resume_selection -= 1;
+    try app.reloadResumeSessions();
+}
+
+/// Cancel any session picker sub-state (rename or delete) and return to
+/// browsing. Clears the rename buffer.
+pub fn cancelSessionAction(app: *App) void {
+    app.nav.session_action = .browsing;
+    app.input_buffers.session_rename_text.clearRetainingCapacity();
 }
 
 pub fn switchToNewSession(app: *App) !void {

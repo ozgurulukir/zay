@@ -22,6 +22,9 @@ pub fn syncModeWithInput(app: *App, value: []const u8) !void {
     // While typing an API key in the provider form, the input is the key —
     // never reinterpret a leading '/' as a command.
     if (app.mode == .provider_picker and app.pickers.provider.stage == .form) return;
+    // While renaming a session, the palette input is not the rename target —
+    // don't reinterpret a leading '/' as a command.
+    if (app.mode == .session_picker and app.nav.session_action != .browsing) return;
     if (app.mode == .session_picker or app.mode == .provider_picker or app.mode == .model_picker or app.mode == .tree_picker) {
         if (value.len > 0 and value[0] == command_prefix) {
             app.mode = .command;
@@ -61,6 +64,12 @@ pub fn cancelMode(app: *App) !bool {
         app.pickers.models.restore();
     }
     if (app.mode == .session_picker or app.mode == .provider_picker or app.mode == .model_picker or app.mode == .tree_picker) {
+        // Session picker sub-states (rename/delete) capture Esc to cancel
+        // the sub-state, not the entire picker.
+        if (app.mode == .session_picker and app.nav.session_action != .browsing) {
+            app.cancelSessionAction();
+            return true;
+        }
         try openCommandMenu(app);
         app.resumeClear();
         return true;
@@ -115,6 +124,24 @@ pub fn submitMode(app: *App) !bool {
         return true;
     }
     if (app.mode == .session_picker) {
+        // Sub-states route their Enter submit here (routeKey intercepts
+        // Enter before it reaches handleCommandKey). Browsing falls
+        // through to the normal resume flow below.
+        switch (app.nav.session_action) {
+            .renaming => {
+                try app.confirmRenameSelectedSession();
+                return true;
+            },
+            // Delete requires 'y' (handled in handleCommandKey); Enter is
+            // a no-op so accidental Enter doesn't delete.
+            .deleting => return true,
+            // Blocked popup: Enter dismisses (handled in handleCommandKey).
+            .blocked => {
+                app.cancelSessionAction();
+                return true;
+            },
+            .browsing => {},
+        }
         const summary = try app.selectedResumeSummary() orelse return true;
         app.switchToSession(summary.id) catch |err| {
             try app.reportSessionSwitchError(err);
@@ -279,7 +306,9 @@ pub fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
     if (!key.matches('/', .{})) return false;
     return switch (app.mode) {
         .normal => app.inputs.input.buf.realLength() == 0,
-        .session_picker, .model_picker, .tree_picker => app.inputs.palette.buf.realLength() == 0,
+        // Don't open the command menu while the user is renaming or deleting.
+        .session_picker => app.nav.session_action == .browsing and app.inputs.palette.buf.realLength() == 0,
+        .model_picker, .tree_picker => app.inputs.palette.buf.realLength() == 0,
         .provider_picker => app.pickers.provider.stage == .list and app.inputs.palette.buf.realLength() == 0,
         // Settings has its own navigation: '/' is not a command shortcut there.
         .settings, .command, .diff_viewer, .save_message, .lanes, .help, .mcp, .plugins => false,

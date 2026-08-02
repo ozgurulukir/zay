@@ -37,9 +37,13 @@ pub fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value
             if (app.nav.command_selection >= count) app.nav.command_selection = 0;
         },
         .session_picker => {
-            const count = resume_picker.visibleCount(app.resume_summaries.items, value, app.resume_folded_projects.items, app.nav.resume_global);
-            if (app.nav.resume_selection >= count) app.nav.resume_selection = 0;
-            app.syncResumeListCursor();
+            // Sub-states (rename/delete) don't use the palette input for
+            // filtering — skip the visible-count recompute.
+            if (app.nav.session_action == .browsing) {
+                const count = resume_picker.visibleCount(app.io, app.resume_summaries.items, value, app.resume_folded_projects.items, app.nav.resume_group_by);
+                if (app.nav.resume_selection >= count) app.nav.resume_selection = 0;
+                app.syncResumeListCursor();
+            }
         },
         .tree_picker => {
             try app.pickers.tree.reflattenKeepingSelection(value);

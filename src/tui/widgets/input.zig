@@ -56,7 +56,12 @@ fn inputHintText(app: *const App) []const u8 {
     if (app.getPendingQuitAt() != null) return "Press Ctrl+C or Ctrl+D again to exit";
     return switch (app.mode) {
         .command => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Execute" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
-        .session_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Resume" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
+        .session_picker => switch (app.nav.session_action) {
+            .browsing => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Resume" ++ symbols.separator_dot_padded ++ "[D] Delete" ++ symbols.separator_dot_padded ++ "[R] Rename" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
+            .renaming => "[ENTER] Save" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
+            .deleting => "[Y] Delete" ++ symbols.separator_dot_padded ++ "[N/ESC] Cancel",
+            .blocked => "[Any key] Dismiss",
+        },
         .provider_picker => switch (app.pickers.provider.stage) {
             .list => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
             .form => "[ENTER] Save API Key" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",

@@ -19,8 +19,15 @@ pub fn pasteToFocusedInput(app: *App, text: []const u8) !void {
         .normal => {
             try app.inputs.input.insertSliceAtCursor(clean_text);
         },
-        .command, .session_picker, .model_picker, .tree_picker => {
+        .command, .model_picker, .tree_picker => {
             try app.inputs.palette.insertSliceAtCursor(clean_text);
+        },
+        .session_picker => {
+            if (app.nav.session_action == .renaming) {
+                try app.input_buffers.session_rename_text.appendSlice(app.gpa, clean_text);
+            } else {
+                try app.inputs.palette.insertSliceAtCursor(clean_text);
+            }
         },
         .provider_picker => {
             if (app.pickers.provider.stage == .form) {

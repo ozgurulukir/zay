@@ -3,6 +3,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const session_mod = @import("../../session.zig");
+const app_state = @import("../app_state.zig");
 const message = @import("message.zig");
 const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
@@ -16,7 +17,15 @@ pub const Content = struct {
     selection: u32,
     folded_projects: []const []const u8,
     filter: []const u8,
-    tree_mode: bool,
+    /// How sessions are grouped: flat (current project only), project
+    /// (grouped by project directory), or date (grouped by date bucket).
+    group_by: app_state.NavState.ResumeGroupBy = .flat,
+    /// Sub-state of the session picker: browsing, renaming, deleting, or
+    /// showing a blocked-action popup.
+    action: app_state.NavState.SessionAction = .browsing,
+    /// Rename text buffer (borrowed from `app.input_buffers.session_rename_text`).
+    /// Only rendered while `action == .renaming`.
+    rename_text: []const u8 = "",
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -24,6 +33,7 @@ pub const Content = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Content = @ptrCast(@alignCast(ptr));
+        if (self.action != .browsing) return self.drawSubState(ctx);
         const widgets = try self.resumeWidgets(ctx);
         self.list.children = .{ .slice = widgets };
         self.list.item_count = @intCast(widgets.len);
@@ -32,8 +42,43 @@ pub const Content = struct {
         return panel.listSurface(ctx, self.widget(), self.list.widget());
     }
 
+    /// Draw the rename, delete-confirmation, or blocked-action prompt instead
+    /// of the session list. The list stays behind (not redrawn) but the
+    /// overlay border label changes to indicate the active sub-state.
+    fn drawSubState(self: *Content, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const width = ctx.max.width orelse 0;
+        const height = ctx.max.height orelse 0;
+        var surface = try vxfw.Surface.initWithChildren(
+            ctx.arena,
+            self.widget(),
+            .{ .width = width, .height = height },
+            &.{},
+        );
+
+        switch (self.action) {
+            .renaming => {
+                try panel.lineStyledAt(&surface, 0, "Rename Session", ctx, 2, tui_style.Palette.panel_header);
+                const prompt = try std.fmt.allocPrint(ctx.arena, "  > {s}_", .{self.rename_text});
+                try panel.lineStyledAt(&surface, 2, prompt, ctx, 2, tui_style.Palette.selected_item);
+                try panel.lineStyledAt(&surface, height -| 2, "[Enter] Save  |  [Esc] Cancel", ctx, 2, tui_style.Palette.thinking_body);
+            },
+            .deleting => {
+                try panel.lineStyledAt(&surface, 0, "Delete Session", ctx, 2, tui_style.Palette.panel_header);
+                try panel.lineStyledAt(&surface, 2, "  Delete this session? This cannot be undone.", ctx, 2, tui_style.Palette.tool_failed);
+                try panel.lineStyledAt(&surface, height -| 2, "[Y] Delete  |  [N/Esc] Cancel", ctx, 2, tui_style.Palette.thinking_body);
+            },
+            .blocked => {
+                try panel.lineStyledAt(&surface, 0, "Cannot Delete Active Session", ctx, 2, tui_style.Palette.panel_header);
+                try panel.lineStyledAt(&surface, 2, "  Switch to another session first, then delete this one.", ctx, 2, tui_style.Palette.tool_failed);
+                try panel.lineStyledAt(&surface, height -| 2, "[Any key] Dismiss", ctx, 2, tui_style.Palette.thinking_body);
+            },
+            .browsing => unreachable,
+        }
+        return surface;
+    }
+
     fn resumeWidgets(self: *Content, ctx: vxfw.DrawContext) ![]vxfw.Widget {
-        const count = visibleCount(self.summaries, self.filter, self.folded_projects, self.tree_mode);
+        const count = visibleCount(self.io, self.summaries, self.filter, self.folded_projects, self.group_by);
         const widgets = try ctx.arena.alloc(vxfw.Widget, count);
         const rows = try ctx.arena.alloc(Row, count);
         var builder: RowBuilder = .{
@@ -42,7 +87,7 @@ pub const Content = struct {
             .summaries = self.summaries,
             .filter = self.filter,
             .folded_projects = self.folded_projects,
-            .tree_mode = self.tree_mode,
+            .group_by = self.group_by,
             .rows = rows,
             .widgets = widgets,
             .selection = self.selection,
@@ -52,21 +97,37 @@ pub const Content = struct {
     }
 };
 
+/// Date bucket for grouping sessions by recency.
+const DateBucket = enum(u3) { today, yesterday, this_week, this_month, this_year, older };
+
 const RowBuilder = struct {
     io: std.Io,
     ctx: vxfw.DrawContext,
     summaries: []const session_mod.SessionSummary,
     filter: []const u8,
     folded_projects: []const []const u8,
-    tree_mode: bool,
+    group_by: app_state.NavState.ResumeGroupBy,
     rows: []Row,
     widgets: []vxfw.Widget,
     selection: u32,
     index: u32 = 0,
 
     fn build(self: *RowBuilder) !void {
-        if (!self.tree_mode) return self.buildFlat();
+        switch (self.group_by) {
+            .flat => return self.buildFlat(),
+            .project => return self.buildProject(),
+            .date => return self.buildDate(),
+        }
+    }
 
+    fn buildFlat(self: *RowBuilder) !void {
+        for (self.summaries) |*summary| {
+            if (!matches(summary, self.filter)) continue;
+            try self.appendSession(summary, false, false);
+        }
+    }
+
+    fn buildProject(self: *RowBuilder) !void {
         var summary_index: usize = 0;
         while (summary_index < self.summaries.len) {
             const cwd = self.summaries[summary_index].cwd;
@@ -89,11 +150,47 @@ const RowBuilder = struct {
         }
     }
 
-    fn buildFlat(self: *RowBuilder) !void {
+    fn buildDate(self: *RowBuilder) !void {
+        const now_ms = std.Io.Clock.now(.real, self.io).toMilliseconds();
+        // Build date buckets: Today, Yesterday, This Week, This Month,
+        // This Year, Older. Each bucket gets a header row.
+        var buckets: [6]std.ArrayListUnmanaged(*const session_mod.SessionSummary) = .{
+            .empty, .empty, .empty, .empty, .empty, .empty,
+        };
+        defer for (&buckets) |*b| b.deinit(self.ctx.arena);
+
         for (self.summaries) |*summary| {
             if (!matches(summary, self.filter)) continue;
-            try self.appendSession(summary, false, false);
+            const bucket = dateBucket(now_ms, summary.updated_at_ms);
+            try buckets[@intFromEnum(bucket)].append(self.ctx.arena, summary);
         }
+
+        const labels = [_][]const u8{ "Today", "Yesterday", "This Week", "This Month", "This Year", "Older" };
+
+        for (&buckets, 0..) |*bucket, i| {
+            if (bucket.items.len == 0) continue;
+            const label = labels[i];
+            try self.appendDateHeader(label, bucket.items.len);
+            // Sort within bucket by updated_at_ms descending.
+            std.mem.sort(*const session_mod.SessionSummary, bucket.items, {}, struct {
+                fn desc(_: void, a: *const session_mod.SessionSummary, b: *const session_mod.SessionSummary) bool {
+                    return a.updated_at_ms > b.updated_at_ms;
+                }
+            }.desc);
+            for (bucket.items, 0..) |summary, j| {
+                try self.appendSession(summary, j == bucket.items.len - 1, false);
+            }
+        }
+    }
+
+    fn appendDateHeader(self: *RowBuilder, label: []const u8, count: usize) !void {
+        self.rows[self.index] = .{
+            .io = self.io,
+            .kind = .{ .date_header = .{ .label = label, .count = @intCast(@min(count, std.math.maxInt(u32))) } },
+            .selected = false,
+        };
+        self.widgets[self.index] = self.rows[self.index].widget();
+        self.index += 1;
     }
 
     fn appendProject(self: *RowBuilder, cwd: []const u8, count: usize, folded: bool, has_children: bool) !void {
@@ -123,6 +220,22 @@ const RowBuilder = struct {
     }
 };
 
+/// Classify a timestamp into a date bucket for grouping.
+fn dateBucket(now_ms: i64, updated_at_ms: i64) DateBucket {
+    const diff_ms = now_ms - updated_at_ms;
+    if (diff_ms < 0) return .today;
+    const seconds = @divTrunc(diff_ms, 1000);
+    const minutes = @divTrunc(seconds, 60);
+    const hours = @divTrunc(minutes, 60);
+    const days = @divTrunc(hours, 24);
+    if (days < 1) return .today;
+    if (days < 2) return .yesterday;
+    if (days < 7) return .this_week;
+    if (days < 30) return .this_month;
+    if (days < 365) return .this_year;
+    return .older;
+}
+
 const Row = struct {
     io: std.Io,
     kind: Kind,
@@ -131,6 +244,12 @@ const Row = struct {
     const Kind = union(enum) {
         project: Project,
         session: Session,
+        date_header: DateHeader,
+    };
+
+    const DateHeader = struct {
+        label: []const u8,
+        count: u32,
     };
 
     const Session = struct {
@@ -156,8 +275,15 @@ const Row = struct {
         switch (self.kind) {
             .project => |project| try self.drawProject(&surface, ctx, project),
             .session => |session| try self.drawSession(&surface, ctx, session),
+            .date_header => |header| try self.drawDateHeader(&surface, ctx, header),
         }
         return surface;
+    }
+
+    fn drawDateHeader(self: *Row, surface: *vxfw.Surface, ctx: vxfw.DrawContext, header: DateHeader) !void {
+        _ = self;
+        const text = try std.fmt.allocPrint(ctx.arena, "  {s} ({d})", .{ header.label, header.count });
+        try panel.lineStyledAt(surface, 0, text, ctx, 2, tui_style.Palette.panel_header);
     }
 
     fn drawProject(self: *Row, surface: *vxfw.Surface, ctx: vxfw.DrawContext, project: Project) !void {
@@ -204,9 +330,15 @@ const Row = struct {
     }
 };
 
-pub fn visibleCount(summaries: []const session_mod.SessionSummary, filter: []const u8, folded_projects: []const []const u8, tree_mode: bool) u32 {
-    if (!tree_mode) return flatVisibleCount(summaries, filter);
+pub fn visibleCount(io: std.Io, summaries: []const session_mod.SessionSummary, filter: []const u8, folded_projects: []const []const u8, group_by: app_state.NavState.ResumeGroupBy) u32 {
+    return switch (group_by) {
+        .flat => flatVisibleCount(summaries, filter),
+        .project => projectVisibleCount(summaries, filter, folded_projects),
+        .date => dateVisibleCount(io, summaries, filter),
+    };
+}
 
+fn projectVisibleCount(summaries: []const session_mod.SessionSummary, filter: []const u8, folded_projects: []const []const u8) u32 {
     var count: u32 = 0;
     var index: usize = 0;
     while (index < summaries.len) {
@@ -226,6 +358,24 @@ pub fn visibleCount(summaries: []const session_mod.SessionSummary, filter: []con
     return count;
 }
 
+fn dateVisibleCount(io: std.Io, summaries: []const session_mod.SessionSummary, filter: []const u8) u32 {
+    // Count matching sessions, then add one header per non-empty date bucket.
+    const now_ms = std.Io.Clock.now(.real, io).toMilliseconds();
+    var seen_buckets: [6]bool = .{false} ** 6;
+    var session_count: u32 = 0;
+    for (summaries) |*summary| {
+        if (!matches(summary, filter)) continue;
+        session_count += 1;
+        const bucket = dateBucket(now_ms, summary.updated_at_ms);
+        seen_buckets[@intFromEnum(bucket)] = true;
+    }
+    var header_count: u32 = 0;
+    for (seen_buckets) |seen| {
+        if (seen) header_count += 1;
+    }
+    return session_count + header_count;
+}
+
 fn flatVisibleCount(summaries: []const session_mod.SessionSummary, filter: []const u8) u32 {
     var count: u32 = 0;
     for (summaries) |*summary| {
@@ -234,9 +384,15 @@ fn flatVisibleCount(summaries: []const session_mod.SessionSummary, filter: []con
     return count;
 }
 
-pub fn selectedSummary(summaries: []const session_mod.SessionSummary, filter: []const u8, folded_projects: []const []const u8, selection: u32, tree_mode: bool) ?*const session_mod.SessionSummary {
-    if (!tree_mode) return selectedFlatSummary(summaries, filter, selection);
+pub fn selectedSummary(summaries: []const session_mod.SessionSummary, filter: []const u8, folded_projects: []const []const u8, selection: u32, group_by: app_state.NavState.ResumeGroupBy) ?*const session_mod.SessionSummary {
+    return switch (group_by) {
+        .flat => selectedFlatSummary(summaries, filter, selection),
+        .project => selectedProjectSummary(summaries, filter, folded_projects, selection),
+        .date => selectedFlatSummary(summaries, filter, selection),
+    };
+}
 
+fn selectedProjectSummary(summaries: []const session_mod.SessionSummary, filter: []const u8, folded_projects: []const []const u8, selection: u32) ?*const session_mod.SessionSummary {
     var row: u32 = 0;
     var index: usize = 0;
     while (index < summaries.len) {
@@ -365,11 +521,11 @@ test "session tree counts project rows and folds children" {
         .{ .id = @constCast("3"), .title = @constCast("three"), .cwd = @constCast("/repo/b"), .created_at_ms = 0, .updated_at_ms = 3, .leaf_entry_id = null, .model_provider = null, .model_id = null },
     };
 
-    try std.testing.expectEqual(@as(u32, 3), visibleCount(&summaries, "", &.{}, false));
-    try std.testing.expectEqual(@as(u32, 5), visibleCount(&summaries, "", &.{}, true));
-    try std.testing.expectEqual(@as(u32, 3), visibleCount(&summaries, "", &.{"/repo/a"}, true));
+    try std.testing.expectEqual(@as(u32, 3), visibleCount(std.testing.io, &summaries, "", &.{}, .flat));
+    try std.testing.expectEqual(@as(u32, 5), visibleCount(std.testing.io, &summaries, "", &.{}, .project));
+    try std.testing.expectEqual(@as(u32, 3), visibleCount(std.testing.io, &summaries, "", &.{"/repo/a"}, .project));
     try std.testing.expect(selectedProject(&summaries, "", &.{}, 0) != null);
-    try std.testing.expect(selectedSummary(&summaries, "", &.{}, 1, true) != null);
+    try std.testing.expect(selectedSummary(&summaries, "", &.{}, 1, .project) != null);
 }
 
 fn truncateText(ctx: vxfw.DrawContext, text: []const u8, width: usize) ![]const u8 {

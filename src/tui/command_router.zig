@@ -177,20 +177,41 @@ const ModelPicker = struct {
 /// Ctrl+A toggles global vs project-scoped resume list (and reloads from
 /// disk); tab toggles fold of the selected project when in global mode;
 /// up/down step the selection through the visible (filtered) entries.
+/// 'd' enters a delete-confirmation sub-state; 'r' enters a rename
+/// sub-state with a prefilled text buffer. Sub-states capture all keys
+/// until submitted (Enter / y) or cancelled (Esc / n).
 const SessionPicker = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
+        switch (app.nav.session_action) {
+            .renaming => return handleRenameInput(app, key),
+            .deleting => return handleDeleteConfirm(app, key),
+            .blocked => {
+                // Any key dismisses the blocked-action popup.
+                app.cancelSessionAction();
+                return true;
+            },
+            .browsing => {},
+        }
+
         if (key.matches('a', .{ .ctrl = true })) {
-            app.toggleResumeGlobal();
+            app.toggleResumeGroupBy();
             app.setResumeSelection(0);
             app.resumeClearFolds();
             try app.reloadResumeSessions();
             return true;
         }
         if (key.matches(vaxis.Key.tab, .{})) {
-            // global mode means: the resume list is grouped by project, so
-            // tab folds/unfolds the selected project. Otherwise tab is a
-            // no-op (the picker has no other column to switch to).
-            if (app.getResumeGlobal()) try app.toggleSelectedResumeProject();
+            // In project mode, tab folds/unfolds the selected project.
+            // In date mode, tab is a no-op (no folding by date).
+            if (app.getResumeGroupBy() == .project) try app.toggleSelectedResumeProject();
+            return true;
+        }
+        if (key.matches('d', .{})) {
+            try app.beginDeleteSelectedSession();
+            return true;
+        }
+        if (key.matches('r', .{})) {
+            try app.beginRenameSelectedSession();
             return true;
         }
         if (key.matches(vaxis.Key.up, .{})) {
@@ -206,6 +227,51 @@ const SessionPicker = struct {
             return true;
         }
         return false;
+    }
+
+    /// Text input for the rename form. Enter submits, Esc cancels; printable
+    /// keys append to the rename buffer and everything else is swallowed.
+    fn handleRenameInput(app: *App, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.escape, .{})) {
+            app.cancelSessionAction();
+            return true;
+        }
+        if (isEnterKey(key)) {
+            try app.confirmRenameSelectedSession();
+            return true;
+        }
+        if (key.matches(vaxis.Key.backspace, .{})) {
+            app.popSessionRenameInput();
+            return true;
+        }
+        if (key.text) |text| {
+            const trimmed = std.mem.trim(u8, text, "\r\n");
+            if (trimmed.len > 0) {
+                try app.input_buffers.session_rename_text.appendSlice(app.gpa, trimmed);
+                return true;
+            }
+        } else if (key.codepoint >= 32 and key.codepoint <= 126 and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
+            const byte: u8 = @intCast(key.codepoint);
+            try app.input_buffers.session_rename_text.append(app.gpa, byte);
+            return true;
+        }
+        // Swallow everything else (arrows, tab) — the rename buffer is the
+        // sole input target while this sub-state is active.
+        return true;
+    }
+
+    /// Delete confirmation: 'y' confirms, Esc/'n' cancels. All other keys
+    /// are swallowed so the user can't accidentally navigate away.
+    fn handleDeleteConfirm(app: *App, key: vaxis.Key) !bool {
+        if (key.matches('y', .{}) or key.matches('y', .{ .shift = true })) {
+            try app.confirmDeleteSelectedSession();
+            return true;
+        }
+        if (key.matches(vaxis.Key.escape, .{}) or key.matches('n', .{}) or key.matches('n', .{ .shift = true })) {
+            app.cancelSessionAction();
+            return true;
+        }
+        return true;
     }
 };
 

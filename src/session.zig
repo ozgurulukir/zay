@@ -175,6 +175,28 @@ pub const SessionManager = struct {
         const row = (try statement.step()) orelse return null;
         return try gpa.dupe(u8, row.text(0));
     }
+
+    /// Delete a session and its entries (cascade delete handles entries via
+    /// the `on delete cascade` foreign key). Safe to call on a non-existent
+    /// id — the statement simply matches no rows.
+    pub fn deleteSession(self: *SessionManager, session_id: []const u8) Error!void {
+        var statement = try self.connection.prepare("delete from sessions where id = ?");
+        defer statement.finalize();
+        try statement.bindText(1, session_id);
+        try expectDone(&statement);
+    }
+
+    /// Rename a session by id. The title is overwritten (or set if null).
+    /// `new_title` must be non-empty — the caller validates.
+    pub fn renameSession(self: *SessionManager, session_id: []const u8, new_title: []const u8) Error!void {
+        assert(new_title.len > 0);
+        var statement = try self.connection.prepare("update sessions set title = ?, updated_at_ms = ? where id = ?");
+        defer statement.finalize();
+        try statement.bindText(1, new_title);
+        try statement.bindInt(2, nowMs(self.io));
+        try statement.bindText(3, session_id);
+        try expectDone(&statement);
+    }
 };
 pub const Session = struct {
     manager: *SessionManager,
@@ -749,7 +771,11 @@ fn readSummary(gpa: std.mem.Allocator, row: *const db.Row) Error!SessionSummary 
         .updated_at_ms = row.int(4),
         .leaf_entry_id = if (row.columnType(5) == .null) null else blk: {
             const value = row.text(5);
-            if (value.len != entry_id_len) return error.BadEntryId;
+            // A wrong-length leaf_entry_id is corrupt data (e.g. a test row or a
+            // leftover from an older schema). Treat it as null so one bad row
+            // doesn't crash the entire resume picker; the session still shows up
+            // and a resume attempt fails gracefully via manager.@"resume".
+            if (value.len != entry_id_len) break :blk null;
             @memcpy(leaf_buffer[0..], value);
             break :blk EntryId{ .bytes = leaf_buffer };
         },
@@ -1042,4 +1068,145 @@ test "create rejects session id with wrong length" {
     var manager = try SessionManager.init(std.testing.allocator, std.testing.io, ":memory:");
     defer manager.deinit();
     try std.testing.expectError(error.BadSessionId, manager.create("/tmp/nova", .{ .id = "short" }));
+}
+
+test "list treats corrupt leaf_entry_id as null instead of crashing" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+
+    // Valid session: create + append an entry so it has a proper 8-char leaf.
+    var session = try manager.create("/tmp/nova", .{ .id = "a" ** session_id_len });
+    var id: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "hello", &id);
+
+    // Corrupt session: mimic the production write order (insert session with
+    // null leaf, insert entry, then update leaf) but end with a wrong-length
+    // leaf_entry_id, simulating stale test data or an older-schema leftover.
+    // The composite FK on sessions(id, leaf_entry_id) → session_entries(session_id, id)
+    // requires the entry row to exist before the update.
+    var sess_stmt = try manager.connection.prepare(
+        "insert into sessions(id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id) values (?, null, ?, 0, 0, null)",
+    );
+    defer sess_stmt.finalize();
+    try sess_stmt.bindText(1, "b" ** session_id_len);
+    try sess_stmt.bindText(2, "/tmp/nova");
+    try expectDone(&sess_stmt);
+
+    var entry_stmt = try manager.connection.prepare(
+        "insert into session_entries(id, session_id, parent_id, kind, role, payload_json, created_at_ms) values (?, ?, null, 'message', 'user', '{}', 0)",
+    );
+    defer entry_stmt.finalize();
+    try entry_stmt.bindText(1, "entry-123"); // 9 chars, not 8
+    try entry_stmt.bindText(2, "b" ** session_id_len);
+    try expectDone(&entry_stmt);
+
+    var upd_stmt = try manager.connection.prepare("update sessions set leaf_entry_id = ? where id = ?");
+    defer upd_stmt.finalize();
+    try upd_stmt.bindText(1, "entry-123");
+    try upd_stmt.bindText(2, "b" ** session_id_len);
+    try expectDone(&upd_stmt);
+
+    const summaries = try manager.list(gpa, null);
+    defer {
+        for (summaries) |*s| s.deinit(gpa);
+        gpa.free(summaries);
+    }
+    // Both sessions are returned — the corrupt one must not crash the list.
+    try std.testing.expectEqual(@as(usize, 2), summaries.len);
+    for (summaries) |s| {
+        if (std.mem.eql(u8, s.id, "b" ** session_id_len)) {
+            try std.testing.expect(s.leaf_entry_id == null);
+        }
+    }
+}
+
+test "deleteSession removes a session and its entries" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+
+    var session = try manager.create("/tmp/nova", .{ .id = "a" ** session_id_len });
+    var id: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "hello", &id);
+
+    // The session shows up in list.
+    {
+        const summaries = try manager.list(gpa, null);
+        defer {
+            for (summaries) |*s| s.deinit(gpa);
+            gpa.free(summaries);
+        }
+        try std.testing.expectEqual(@as(usize, 1), summaries.len);
+    }
+
+    // Delete it.
+    try manager.deleteSession("a" ** session_id_len);
+
+    // The list is now empty.
+    {
+        const summaries = try manager.list(gpa, null);
+        defer {
+            for (summaries) |*s| s.deinit(gpa);
+            gpa.free(summaries);
+        }
+        try std.testing.expectEqual(@as(usize, 0), summaries.len);
+    }
+}
+
+test "renameSession updates the title" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+
+    _ = try manager.create("/tmp/nova", .{ .id = "b" ** session_id_len });
+
+    // No title initially.
+    {
+        const summaries = try manager.list(gpa, null);
+        defer {
+            for (summaries) |*s| s.deinit(gpa);
+            gpa.free(summaries);
+        }
+        try std.testing.expectEqual(@as(usize, 0), summaries.len);
+    }
+
+    // Rename (set a title). But list filters by leaf_entry_id is not null,
+    // so we need an entry. Use a direct insert + update like the corrupt test.
+    var sess_stmt = try manager.connection.prepare(
+        "insert into sessions(id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id) values (?, null, ?, 0, 0, null)",
+    );
+    defer sess_stmt.finalize();
+    try sess_stmt.bindText(1, "c" ** session_id_len);
+    try sess_stmt.bindText(2, "/tmp/nova");
+    try expectDone(&sess_stmt);
+
+    var entry_stmt = try manager.connection.prepare(
+        "insert into session_entries(id, session_id, parent_id, kind, role, payload_json, created_at_ms) values (?, ?, null, 'message', 'user', '{}', 0)",
+    );
+    defer entry_stmt.finalize();
+    try entry_stmt.bindText(1, "12345678");
+    try entry_stmt.bindText(2, "c" ** session_id_len);
+    try expectDone(&entry_stmt);
+
+    var upd_stmt = try manager.connection.prepare("update sessions set leaf_entry_id = ? where id = ?");
+    defer upd_stmt.finalize();
+    try upd_stmt.bindText(1, "12345678");
+    try upd_stmt.bindText(2, "c" ** session_id_len);
+    try expectDone(&upd_stmt);
+
+    // Rename the session.
+    try manager.renameSession("c" ** session_id_len, "My Renamed Session");
+
+    // The list now shows the new title.
+    {
+        const summaries = try manager.list(gpa, null);
+        defer {
+            for (summaries) |*s| s.deinit(gpa);
+            gpa.free(summaries);
+        }
+        try std.testing.expectEqual(@as(usize, 1), summaries.len);
+        try std.testing.expect(summaries[0].title != null);
+        try std.testing.expectEqualStrings("My Renamed Session", summaries[0].title.?);
+    }
 }
