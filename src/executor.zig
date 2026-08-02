@@ -849,6 +849,49 @@ test "executor rejects plugin tool call with missing required argument" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "`mode` is required") != null);
 }
 
+test "executor rejects plugin tool call with wrong type" {
+    const gpa = std.testing.allocator;
+    var registry = tools.ToolRegistry.init(tools.builtinRegistry());
+    defer registry.deinit(gpa);
+    try addPluginModeTool(gpa, &registry);
+
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp", .tool_registry = &registry });
+
+    const call = try makeCall(gpa, "call_pt", "lua__p__mode", "{\"mode\":42}");
+    defer {
+        gpa.free(call.call_id.value);
+        gpa.free(call.name);
+        gpa.free(call.arguments);
+    }
+
+    var result = try executor.runOne(call);
+    defer result.deinit(gpa);
+    try std.testing.expect(result.failed);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "`mode` must be string") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "(got: 42)") != null);
+}
+
+test "executor rejects plugin tool call with invalid JSON" {
+    const gpa = std.testing.allocator;
+    var registry = tools.ToolRegistry.init(tools.builtinRegistry());
+    defer registry.deinit(gpa);
+    try addPluginModeTool(gpa, &registry);
+
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp", .tool_registry = &registry });
+
+    const call = try makeCall(gpa, "call_pj", "lua__p__mode", "{bad");
+    defer {
+        gpa.free(call.call_id.value);
+        gpa.free(call.name);
+        gpa.free(call.arguments);
+    }
+
+    var result = try executor.runOne(call);
+    defer result.deinit(gpa);
+    try std.testing.expect(result.failed);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "must be valid JSON") != null);
+}
+
 test "executor rejects MCP tool call with missing required field" {
     const gpa = std.testing.allocator;
     var manager = mcp_mod.McpManager.init(gpa);
