@@ -234,10 +234,17 @@ pub const Config = struct {
     }
 
     pub fn activeModelSelection(self: *const Config) ?ModelSelectionRef {
-        if (self.model_selection) |ms| {
-            return switch (ms) {
-                .builtin => |b| ModelSelectionRef{ .builtin = .{ .provider = b.provider, .provider_name = b.provider_name, .model = &b.model } },
-                .custom => |c| ModelSelectionRef{ .custom = .{ .provider_name = c.provider_name, .base_url = c.base_url, .api_key = c.api_key, .model = &c.model } },
+        if (self.model_selection) |*ms| {
+            // Pointer captures (`|*|`), NOT value captures: `&b.model` must
+            // point into `self.model_selection`'s own storage, which lives as
+            // long as the Config does. A value capture would hand back a
+            // pointer into this function's (popped) stack frame — a dangling
+            // ref that reads garbage once the caller makes any further calls
+            // (e.g. applyFromConfig reading `reasoning` after attaching a
+            // client). Regression: switch-on-corrupt-value in ReasoningSetting.resolve.
+            return switch (ms.*) {
+                .builtin => |*b| ModelSelectionRef{ .builtin = .{ .provider = b.provider, .provider_name = b.provider_name, .model = &b.model } },
+                .custom => |*c| ModelSelectionRef{ .custom = .{ .provider_name = c.provider_name, .base_url = c.base_url, .api_key = c.api_key, .model = &c.model } },
             };
         }
         const provider = self.provider orelse return null;

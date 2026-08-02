@@ -326,59 +326,68 @@ pub const ModelSelection = union(enum) {
         };
     }
 
-    pub fn provider(self: ModelSelection) Provider {
-        return switch (self) {
-            .builtin => |b| b.provider,
+    // NOTE: every accessor below takes `self: *const ModelSelection` (pointer
+    // receiver), NOT a value receiver. Returning `&b.model` / `b.provider_name`
+    // from a *value* receiver would point into this function's popped stack
+    // frame — a dangling ref that reads garbage once the caller makes any
+    // further call (the same bug class as Config.activeModelSelection, which
+    // crashed ReasoningSetting.resolve with "switch on corrupt value"). With a
+    // pointer receiver the returned pointers/slices resolve into the caller's
+    // own ModelSelection storage, which outlives the read. Method-call syntax
+    // auto-references value receivers, so no call site changes.
+    pub fn provider(self: *const ModelSelection) Provider {
+        return switch (self.*) {
+            .builtin => |*b| b.provider,
             .custom => .openai_compatible,
         };
     }
 
-    pub fn providerName(self: ModelSelection) []const u8 {
-        return switch (self) {
-            .builtin => |b| b.provider_name,
-            .custom => |c| c.provider_name,
+    pub fn providerName(self: *const ModelSelection) []const u8 {
+        return switch (self.*) {
+            .builtin => |*b| b.provider_name,
+            .custom => |*c| c.provider_name,
         };
     }
 
-    pub fn model(self: ModelSelection) *const Model {
-        return switch (self) {
-            .builtin => |b| &b.model,
-            .custom => |c| &c.model,
+    pub fn model(self: *const ModelSelection) *const Model {
+        return switch (self.*) {
+            .builtin => |*b| &b.model,
+            .custom => |*c| &c.model,
         };
     }
 
-    pub fn baseUrl(self: ModelSelection) ?[]const u8 {
-        return switch (self) {
+    pub fn baseUrl(self: *const ModelSelection) ?[]const u8 {
+        return switch (self.*) {
             .builtin => null,
-            .custom => |c| c.base_url,
+            .custom => |*c| c.base_url,
         };
     }
 
-    pub fn apiKey(self: ModelSelection) ?[]const u8 {
-        return switch (self) {
+    pub fn apiKey(self: *const ModelSelection) ?[]const u8 {
+        return switch (self.*) {
             .builtin => null,
-            .custom => |c| c.api_key,
+            .custom => |*c| c.api_key,
         };
     }
 
-    pub fn useResponsesEndpoint(self: ModelSelection) bool {
-        return switch (self) {
-            .builtin => |b| b.use_responses_endpoint,
-            .custom => |c| c.use_responses_endpoint,
+    pub fn useResponsesEndpoint(self: *const ModelSelection) bool {
+        return switch (self.*) {
+            .builtin => |*b| b.use_responses_endpoint,
+            .custom => |*c| c.use_responses_endpoint,
         };
     }
 
-    pub fn systemPrompt(self: ModelSelection) ?[]const u8 {
-        return switch (self) {
-            .builtin => |b| b.system_prompt,
-            .custom => |c| c.system_prompt,
+    pub fn systemPrompt(self: *const ModelSelection) ?[]const u8 {
+        return switch (self.*) {
+            .builtin => |*b| b.system_prompt,
+            .custom => |*c| c.system_prompt,
         };
     }
 
-    pub fn bashClassifierUrl(self: ModelSelection) ?[]const u8 {
-        return switch (self) {
-            .builtin => |b| b.bash_classifier_url,
-            .custom => |c| c.bash_classifier_url,
+    pub fn bashClassifierUrl(self: *const ModelSelection) ?[]const u8 {
+        return switch (self.*) {
+            .builtin => |*b| b.bash_classifier_url,
+            .custom => |*c| c.bash_classifier_url,
         };
     }
 };
