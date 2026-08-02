@@ -1,157 +1,114 @@
+<div align="center">
+
 # Nova
 
-The coding agent for shipping to the stars.
+**The terminal AI agent for shipping code.**
 
-> Alpha software. Expect things to break.
+[![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?style=flat-square&logo=zig&logoColor=white)](https://ziglang.org)
+[![License](https://img.shields.io/github/license/ozgurulukir/nova-agent?style=flat-square)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/ozgurulukir/nova-agent?style=flat-square)](https://github.com/ozgurulukir/nova-agent/stargazers)
+
+</div>
+
+<!--
+  README-ASSET-TODO: Hero visual needed
+
+  What to capture: A terminal recording showing Nova in action — open the TUI,
+  type a prompt, watch the agent respond with tool calls. Show the split-view
+  lanes and a slash command menu.
+
+  Recommended format: GIF (under 15s, optimized with gifski) or asciinema SVG
+  Recommended size: ~1200px wide
+  Tools: asciinema (terminal recording), Kap/ScreenToGif (screen capture)
+  Save to: docs/assets/hero.gif
+-->
+
+Nova is a native terminal UI for working with AI coding agents. It runs in your terminal — no Electron, no browser tab, no Docker. Just a Zig binary that connects to any OpenAI-compatible provider, manages parallel conversation lanes, and keeps your session history in SQLite.
+
+> [!WARNING]
+> Alpha software. Things break. Things change. Things get better.
+
+## Features
+
+| Feature | Description |
+|---------|-------------|
+| **Terminal-native TUI** | Built with [VXFW](https://github.com/vaxis/vaxis) — no Electron, no web tech, just your terminal |
+| **Any AI provider** | OpenAI, Anthropic, or any OpenAI-compatible endpoint. Bring your own key. |
+| **Parallel lanes** | Run multiple agent conversations side-by-side, merge when ready |
+| **MCP tool integration** | Connect any [Model Context Protocol](https://modelcontextprotocol.io) server — stdio or remote |
+| **Lua plugin system** | Extend Nova with sandboxed Lua plugins — filesystem, git, JSON, custom tools |
+| **Session persistence** | Full conversation history in SQLite. Resume any session, any time. |
 
 ## Quick Start
 
-Git clone `fff` (used for file search) into `third_party/` and build it. Specific instructions
-in [vendor/fff/README.md](vendor/fff/README.md).
-
-Download `P0u4a/ModernBERT-bash-classifier` from huggingface (used for classifying the bash tool calls). Easiest way is with huggingface cli.
-
 ```bash
-hf download P0u4a/ModernBERT-bash-classifier
-```
+# Prerequisites: Zig 0.16, uv (Python), huggingface-cli
 
-And export the model to ONNX
+git clone https://github.com/ozgurulukir/nova-agent.git
+cd nova-agent
 
-```bash
-cd vendor/local-models
-uv run python export_onnx.py --model-dir /path/to/model
-```
+# Vendor dependencies (fff + ModernBERT classifier)
+git clone https://github.com/acecilia/fff.git vendor/fff && make -C vendor/fff
+hf download P0u4a/ModernBERT-bash-classifier --local-dir vendor/local-models
+uv run python vendor/local-models/export_onnx.py --model-dir vendor/local-models
 
-Then
-
-```sh
+# Build and run
 zig build run
 ```
-Add the binary (`zig-out/bin/nova`) to your PATH so you can invoke it from anywhere.
 
+Or install to `~/.local/bin/`:
 
-To install a release build to `~/.local/bin/`:
-
-```sh
+```bash
 zig build install -Doptimize=ReleaseFast --prefix $HOME/.local
+nova
 ```
 
+## How It Works
 
+```mermaid
+flowchart LR
+    A[Terminal] --> B[Nova TUI]
+    B --> C[Agent Loop]
+    C --> D[LLM Provider]
+    C --> E[MCP Servers]
+    C --> F[Lua Plugins]
+    C --> G[Bash Tool]
+    B --> H[SQLite Sessions]
 
-## Slash Commands & Key Features
+    style A fill:#2d2d2d,color:#fff
+    style B fill:#1a1a2e,color:#fff
+    style C fill:#16213e,color:#fff
+    style D fill:#0f3460,color:#fff
+    style E fill:#533483,color:#fff
+    style F fill:#3a1c5e,color:#fff
+    style G fill:#1a3a3a,color:#fff
+    style H fill:#2d2d2d,color:#fff
+```
 
-- **`/connect`**: Configure AI providers, custom endpoints, and API key management.
-- **`/model`**: Select LLM model & reasoning effort.
-- **`/mcp`**: Real-time Model Context Protocol server status (stdio & remote transports), active tool counts, latency monitoring, server toggling (`Space`/`Enter`), schema re-syncing (`Ctrl+R`), and adding a remote server by URL (`a`, runtime-only).
-- **`/plugins`**: List loaded Lua plugins with active/inactive status. Plugins extend Nova with custom tools, filesystem access, shell commands, git operations, and JSON persistence.
-- **`/settings`**: Interactive tabbed configuration panel (General, System Prompt, Advanced, About) with `Ctrl+S` instant save.
-- **`/copy` & `/paste`**: Copy selected transcript message blocks or diff comments to the system clipboard; paste into prompt fields (`Ctrl+V` / `Shift+Insert`).
-- **`/help`**: Scrollable quick reference guide with keyboard and mouse wheel navigation.
-- **`/timeline`**: Interactive session tree browser for exploring branching conversation paths.
-- **`/diff`**: Full-screen git diff viewer with inline commentary.
-- **`/parallel` & `/lanes`**: Manage parallel worktree lanes and merge folded branches.
-- **`/save`**: Commit git-shadow working copy snapshots.
+The TUI dispatches events through a modular pipeline — input routing, turn lifecycle, background jobs, and transcript rendering are all separate concerns. The agent loop orchestrates LLM calls, tool execution, and context compaction. Everything is logged to a global SQLite database for session resume and timeline browsing.
 
-## Architecture
+## Configuration
 
-The TUI is a vxfw application. `src/tui.zig` holds the `App` lifecycle;
-the top-level `RootWidget` lives in `src/tui/root_widget.zig`. The rest
-of `src/tui/` is split by concern:
+Nova uses layered JSON config:
 
-- `event_router.zig` — top-level event entry (`captureEvent`), key/mouse dispatch, and modal focus routing.
-- `command_router.zig` — per-mode key dispatch (one struct per `App.Mode`).
-- `app_state.zig` — `App` state grouped into sub-structs (`InputState`, `PickerStates`, `NavState`, `ListWidgets`, `ProviderState`, `InputBuffers`, `AtSearchState`, `BackgroundModalState`, `MetricsState`).
-- `settings_lifecycle.zig` — settings panel tabbed navigation, inline text editing, live config sync, and `Ctrl+S` disk save.
-- `clipboard_helper.zig` — TUI integration for system clipboard operations (`copySelectedTranscriptBlock`, `copyDiffToClipboard`, `pasteToFocusedInput`).
-- `background_delivery.zig` — background-job poll/format/deliver, modal toggling, job cancel.
-- `turn_lifecycle.zig` — turn start, interrupt, event application, cancel/reset.
-- `checkpoint.zig` — git-shadow checkpoint snapshotting, readiness checks, and `/save`.
-- `mode_lifecycle.zig` — command matching, slash menu checks, mode switching.
-- `input_lifecycle.zig` — input buffer peeking, clearing, vertical cursor navigation.
-- `transcript_lifecycle.zig` — runtime installation and transcript rebuilding.
-- `lane_lifecycle.zig` — lane naming, cycling, closing, merging, `/lanes` overlay.
-- `diff_lifecycle.zig` — async diff refresh pipeline (DiffCounts, schedule/cancel/drain).
-- `session_switcher.zig` — resume picker, session creation, timeline navigation.
-- `at_search.zig` — `@` file / `$` skill mention popup.
-- `transcript_nav.zig` — transcript scrolling, auto-scroll, long-message paging.
-- `permission.zig` — tool-call approval/rejection overlay.
-- `event_callbacks.zig` — vxfw input-change callbacks (`inputChanged`, `paletteInputChanged`).
-- `queue.zig` — enqueue, flush, and navigate queued user messages.
-- `layout.zig` — `rootLayout` math for `drawRoot` (transcript / loading / input row split).
-- `lane_column.zig` — per-lane bordered transcript column (split view).
-- `diff_viewer_overlay.zig` — full-screen `/diff` overlay.
-- `root_layout.zig` — top-level `drawRoot` layout (tile grid, loading, input, overlay stack).
-- `lifecycle.zig` — `deinit`, `handleTick`, `createParallelLane`, diff key handlers, `syncFocus`, `submit`, `ensureTick`.
-- `diff_utils.zig` — pure diff-count stat/numstat parsers, git label loader.
-- `lanes.zig` — `MergeSource` type + lane merge helpers (`workingLaneOf`, `laneErrorText`).
-- `provider_model.zig` — provider connection, model catalogue loading, dynamic models.dev integration, provider setup forms, and ProviderHandle dispatch.
-- `model_loader_job.zig` — async model loading background jobs, outcome installation, and disk cache persistence.
-- `thread.zig` — `Thread` (lane) state, multi-lane state machine.
-- `turn.zig` / `turn_view.zig` — turn lifecycle + render.
-- `diff_viewer.zig` — `/diff` inline-diff helpers (used by `widgets/diff.zig`).
-- `model_catalogue.zig` / `model_loader.zig` / `model_cache.zig` — model catalogue, async loader, cached model handles.
-- `provider_controller.zig` — provider API controller.
-- `agent_worker.zig` — agent worker plumbing.
-- `blackhole.zig` — startup animation.
-- `root_widget.zig` — top-level vxfw widget (delegates to per-concern modules).
-- `metrics.zig` — runtime metrics.
-- `naming.zig` / `style.zig` / `status.zig` / `tool_policy.zig` — shared helpers and policies.
+| Layer | File |
+|-------|------|
+| Global | `~/.config/nova/config.json` |
+| Project | `.nova/config.json` |
+| Env vars | `NOVA_*` environment variables |
 
-`src/tui/widgets/` holds the per-widget draw code (`message`, `command_panel`, `at_search`, `background_jobs`, `permission`, `diff`, `loading`, `transcript`, `input`, `overlay`, `lanes_picker`, `model_picker`, `provider_picker`, `resume_picker`, `help_picker`, `mcp_status`, `plugins_status`, `settings`, `tree_selector`, `panel`, `tree_art`).
+See [docs/CONFIG.md](docs/CONFIG.md) for the full reference.
 
-### Core Systems & Engine
+## Contributing
 
-- **`mcp/manager.zig` & `mcp/client.zig`**: Multi-server Model Context Protocol supervisor with layer-merged `mcp_servers` configuration (`mcp_servers`, `mcpServers`, `mcp` aliases). `McpServerConfig.transport` is a `union(enum) { stdio, sse }` — a server is either stdio (command+args) or remote Streamable HTTP (url), never both; `{env:VAR}` placeholders in command/args/url expand from the environment. `McpClient` carries a `lifecycle: union(enum) { disabled, stdio, sse, failed }` for runtime state. Discovered tools are re-injected into the live AI client (`updateMcpTools`) on startup and whenever the server set changes, so the model sees `mcp__<server>__<tool>` definitions without a provider reconnect.
-- **`clipboard.zig`**: Cross-platform system clipboard interface supporting OSC 52 terminal escape sequences (`\x1b]52;c;<base64>\x07`) with OS-native execution fallback (`wl-copy`/`xclip`/`pbcopy`/`powershell` via Nova's `bash` subsystem).
-- **`config.zig`**: System configuration parser and disk serializer (`~/.config/nova/config.json`). Controls system prompt, thinking/reasoning toggles, MCP servers, and classifier parameters. `Config.model_selection: ?ModelSelection` is the typed view replacing 9 loose optional fields — `ModelSelection` is `union(enum) { builtin, custom }` where builtin carries `Provider` enum and custom carries `provider_name`, `base_url`, `api_key`; accessors hide the variant difference.
-- **`tools.zig` / `tools/common.zig`**: Builtin tool registry and schema contract. Bash is the only builtin tool; everything richer is Python run through it. Tool schemas use `nullable: bool` to emit OpenAI strict-mode union types (`["string","null"]`) for optional fields, while `tools.registry()` is a runtime-extensible accessor consumed by both the executor and the AI adapters.
-- **`models/registry.zig`**: Provider registry integration combining built-in static providers with dynamic data from `https://models.dev/api.json`. Supports local disk caching at `~/.config/nova/cache/models.dev/api.json` and safe string arena management (`StringRef` / `UnresolvedProvider`).
-- **`compaction.zig`**: Pure decisions for automatic context window compaction. Calculates dynamic retention budgets (`keepRecentTokens`) scaled to the model's context window (%35 max 20,000) so small-context models (e.g. 8K/16K/32K) can always compact cleanly below their swap watermarks.
-- **`agent.zig`**: Autonomous loop orchestrating LLM tool execution, background/synchronous context compaction, and VCS git-shadow checkpointing (`snapshotAfterBatch`). `Listener(Ctx)` is a generic typed callback seam — callers pass their own context type instead of `*anyopaque` + `@ptrCast`.
-- **`ai/openai_compatible.zig`**: OpenAI-compatible API client with SSE stream parsing and tool-call delta deduplication (prevents tool name corruption when providers stream repeated tool names). `ChatMessage` is a `union(enum) { system, user, assistant, tool }` — illegal combinations (e.g. `.user` with `call_id`) are unrepresentable.
-- **`runtime.zig`**: Dual client lifecycle (primary turn client + compaction/naming secondary clients), context usage tracking reset on model switch, and robust session initialization/resume error recovery.
-- **`session.zig`**: SQLite-backed session persistence (`sessions.sqlite`). Tolerant payload decoding handles both standard text strings and byte array JSON encodings. `SessionSummary.leaf_entry_id` is branded as `?EntryId` (fixed-size `[entry_id_len]u8`) enforcing the DB length invariant at compile time.
-- **`lua/`**: Lua 5.4 plugin SDK — sandboxed plugin runtime with configurable permissions, resource limits (instruction count, memory), event bus, plugin lifecycle management, and 25 bridge functions (filesystem, shell, git, json, tool registration). See `docs/plugins/` for the full plugin development guide.
-- **`tools/lua_test_runner.zig`**: Standalone Lua test runner — `zig build test-plugin` runs Lua test files through the Nova sandbox.
+Contributions are welcome. Read [AGENTS.md](AGENTS.md) for the architecture guide and coding conventions.
 
-## Documentation
+```bash
+git clone https://github.com/ozgurulukir/nova-agent.git
+cd nova-agent
+zig build test
+```
 
-### Guides
+## License
 
-| Document | Description |
-|----------|-------------|
-| [docs/README.md](docs/README.md) | Documentation index |
-| [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md) | Design philosophy — human-in-the-loop, what Nova optimizes for |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture — LLM gateway, agent loop, session, TUI layers |
-| [docs/CONFIG.md](docs/CONFIG.md) | Configuration system — layered JSON, schema v2, field-level merging, project vs global |
-| [docs/MCP.md](docs/MCP.md) | MCP integration — stdio & Streamable HTTP transports, server config, tool discovery |
-| [docs/plugins/README.md](docs/plugins/README.md) | Plugin development guide — manifests, `nova.*` bridge API, events, permissions |
-| [docs/plugins/api-reference.md](docs/plugins/api-reference.md) | Full `nova.*` API reference with parameter/return shapes |
-| [docs/plugins/examples.md](docs/plugins/examples.md) | Example plugin walkthroughs |
-
-### Reference
-
-| Document | Description |
-|----------|-------------|
-| [AGENTS.md](AGENTS.md) | Guidelines for contributors — Zig 0.16 patterns, build setup, architectural conventions, type-system discipline, gotchas |
-| [schema/config.schema.json](schema/config.schema.json) | JSON Schema for editor autocompletion of `config.json` |
-| [src/prompts/system.md](src/prompts/system.md) | Base system prompt template (uses `${CWD}` / `${OS}` placeholders) |
-| [src/prompts/compaction.md](src/prompts/compaction.md) | Context-compaction summarization prompt |
-| [src/prompts/handover.md](src/prompts/handover.md) | Session handover / resume prompt |
-
-### Plugin tools (`examples/plugins/*/prompt.md`)
-
-Each plugin ships a `prompt.md` whose body is injected into the model's system
-prompt so it learns how to use the plugin's tools. These are the model-facing
-references, but useful for users too:
-
-| Plugin | Tools | prompt.md |
-|--------|-------|-----------|
-| file-tools | `read`, `write`, `edit`, `list_directory` | [prompt.md](examples/plugins/file-tools/prompt.md) |
-| search-tools | `grep`, `glob` | [prompt.md](examples/plugins/search-tools/prompt.md) |
-| path-tools | `create_directory`, `copy_path`, `move_path`, `delete_path` | [prompt.md](examples/plugins/path-tools/prompt.md) |
-| git-tools | `git_status`, `git_diff`, `git_log`, `git_branch`, `git_commit` | [prompt.md](examples/plugins/git-tools/prompt.md) |
-| todo | `todo_list`, `todo_add`, `todo_done`, `todo_delete`, `todo_prioritize`, `todo_write`, `todo_get_plan`, `todo_set_plan`, `todo_check_step` | [prompt.md](examples/plugins/todo/prompt.md) |
-| file-watcher | `track_file_op`, `file_stats` | [prompt.md](examples/plugins/file-watcher/prompt.md) |
-| hello-world | `greet`, `current_time` | [prompt.md](examples/plugins/hello-world/prompt.md) |
-
+[MIT](LICENSE)
