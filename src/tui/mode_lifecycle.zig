@@ -143,7 +143,7 @@ pub fn submitMode(app: *App) !bool {
             .browsing => {},
         }
         const summary = try app.selectedResumeSummary() orelse return true;
-        app.switchToSession(summary.id) catch |err| {
+        app.switchToSession(summary.id, summary.cwd) catch |err| {
             try app.reportSessionSwitchError(err);
             return true;
         };

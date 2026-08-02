@@ -305,9 +305,9 @@ pub fn switchToNewSession(app: *App) !void {
     try app.clearConversation();
 }
 
-pub fn switchToSession(app: *App, session_id: []const u8) !void {
+pub fn switchToSession(app: *App, session_id: []const u8, cwd: []const u8) !void {
     if (app.thread.turn.isActive()) return error.InFlightTurn;
-    const runtime = try createRuntime(app, app.liveRuntime().?.cwd, app.repoRoot() orelse app.liveRuntime().?.cwd, session_id);
+    const runtime = try createRuntime(app, cwd, app.repoRoot() orelse app.liveRuntime().?.cwd, session_id);
     errdefer {
         runtime.deinit();
         app.gpa.destroy(runtime);
@@ -318,6 +318,35 @@ pub fn switchToSession(app: *App, session_id: []const u8) !void {
 
 pub fn createRuntime(app: *App, cwd: []const u8, session_dir: []const u8, session_id: ?[]const u8) !*runtime_mod.AgentRuntime {
     const current = app.templateRuntime() orelse return error.NoActiveRuntime;
+    // When resuming a session from a different project, don't use the current
+    // runtime as template — skills and plugin prompts must load from the
+    // session's own cwd, not the current project's.
+    const cross_project = session_id != null and !std.mem.eql(u8, cwd, current.cwd);
+    const template: ?*const runtime_mod.AgentRuntime = if (cross_project) null else current;
+
+    // Cross-project resume: reload config from the target project's
+    // `.nova/config.json` so MCP servers, model selection, and project-scoped
+    // settings match the session's own project. The env layer is constant
+    // (process env vars don't change between projects), so we reuse the
+    // environ_map captured at startup.
+    var reloaded_config: ?config_mod.Config = null;
+    var reloaded_diagnostics: []config_mod.Diagnostic = &.{};
+    if (cross_project and app.environ_map != null) {
+        var result = config_mod.load(app.gpa, app.io, cwd, current.home_dir, app.environ_map.?) catch null;
+        if (result) |*lr| {
+            reloaded_diagnostics = lr.takeDiagnostics();
+            reloaded_config = lr.config;
+        } else {
+            std.log.warn("session.resume.config_reload_failed cwd={s}, using current config", .{cwd});
+        }
+    }
+    defer {
+        for (reloaded_diagnostics) |*d| d.deinit(app.gpa);
+        app.gpa.free(reloaded_diagnostics);
+    }
+
+    const config = if (reloaded_config) |*rc| rc else &app.cached_config;
+
     const runtime = try app.gpa.create(runtime_mod.AgentRuntime);
     errdefer app.gpa.destroy(runtime);
     const diagnostics = try current.gpa.alloc(config_mod.Diagnostic, 0);
@@ -330,10 +359,10 @@ pub fn createRuntime(app: *App, cwd: []const u8, session_dir: []const u8, sessio
             session_dir,
             current.home_dir,
             current.base_system_prompt,
-            app.cached_config,
+            config.*,
             diagnostics,
             id,
-            current,
+            template,
         );
     } else {
         try runtime.initNew(
@@ -343,11 +372,20 @@ pub fn createRuntime(app: *App, cwd: []const u8, session_dir: []const u8, sessio
             session_dir,
             current.home_dir,
             current.base_system_prompt,
-            app.cached_config,
+            config.*,
             diagnostics,
-            current,
+            template,
         );
     }
+
+    // If config was reloaded, replace the app's cached config and re-sync MCP.
+    if (reloaded_config) |rc| {
+        if (app.cached_config_owned) app.cached_config.deinit(app.gpa);
+        app.cached_config = rc;
+        app.cached_config_owned = true;
+        app.mcp_manager.syncFromConfig(app.io, &app.cached_config) catch {};
+    }
+
     runtime.agent.background_manager = app.background;
     runtime.agent.mcp_manager = &app.mcp_manager;
     runtime.agent.tool_registry = app.tool_registry;

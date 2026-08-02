@@ -176,6 +176,10 @@ pub const App = struct {
     input_buffers: app_state.InputBuffers = .{},
     cached_config: config_mod.Config = .{},
     cached_config_owned: bool = false,
+    /// Process environment map — stored once at startup so cross-project
+    /// session resume can reload config (`.nova/config.json`) from the
+    /// target project's cwd without re-reading the OS environment.
+    environ_map: ?*std.process.Environ.Map = null,
     retired_transcripts: std.ArrayList(transcript_mod.Transcript) = .empty,
     /// Visual feedback state (loading spinner, black-hole intro, diff
     /// cache, git label) lives in MetricsState.
@@ -242,9 +246,11 @@ pub const App = struct {
         gpa: std.mem.Allocator,
         runtime: *runtime_mod.AgentRuntime,
         config: config_mod.Config,
+        environ_map: ?*std.process.Environ.Map,
     ) !App {
         var app = try init(io, gpa, &runtime.agent);
         app.cached_config = config;
+        app.environ_map = environ_map;
         app.mcp_manager.syncFromConfig(io, &app.cached_config) catch {};
         // The placeholder plugin_manager from `App.init` was built with
         // empty `home_dir`/`cwd` (the runtime values weren't available
@@ -793,8 +799,8 @@ pub const App = struct {
         return session_switcher.switchToNewSession(self);
     }
 
-    pub fn switchToSession(self: *App, session_id: []const u8) !void {
-        return session_switcher.switchToSession(self, session_id);
+    pub fn switchToSession(self: *App, session_id: []const u8, cwd: []const u8) !void {
+        return session_switcher.switchToSession(self, session_id, cwd);
     }
 
     pub fn createRuntime(self: *App, cwd: []const u8, session_dir: []const u8, session_id: ?[]const u8) !*runtime_mod.AgentRuntime {
@@ -1064,7 +1070,7 @@ pub fn run(
     var fw_app = try vxfw.App.init(init.io, gpa, init.environ_map, &tty_buffer);
     defer fw_app.deinit();
 
-    var app = try App.initRuntime(init.io, gpa, runtime, config);
+    var app = try App.initRuntime(init.io, gpa, runtime, config, init.environ_map);
     // Set the manager pointers now that `app` is in its final stack frame.
     // Inside initRuntime, &app.X would dangle after return-by-value.
     runtime.agent.mcp_manager = &app.mcp_manager;
