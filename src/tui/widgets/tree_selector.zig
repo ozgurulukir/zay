@@ -94,6 +94,9 @@ pub const TreeState = struct {
     filter_mode: FilterMode = .default,
     selection: u32 = 0,
     visible: []VisibleNode = &.{},
+    /// Direct-child count per node, indexed by node index. Structural property —
+    /// computed once in `load`, constant across reflattens. Freed with nodes.
+    child_count: []u32 = &.{},
 
     pub fn init(gpa: std.mem.Allocator) TreeState {
         return .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa) };
@@ -111,6 +114,8 @@ pub const TreeState = struct {
         for (self.nodes) |*node| self.gpa.free(node.text);
         self.gpa.free(self.nodes);
         self.nodes = &.{};
+        self.gpa.free(self.child_count);
+        self.child_count = &.{};
     }
 
     /// Replace the tree from a session's entries (oldest-first). `leaf_id` marks
@@ -208,6 +213,22 @@ pub const TreeState = struct {
         self.nodes = try nodes.toOwnedSlice(self.gpa);
         try self.index_by_id.ensureTotalCapacity(self.gpa, @intCast(self.nodes.len));
         for (self.nodes, 0..) |node, i| self.index_by_id.putAssumeCapacity(node.id, i);
+
+        // Direct-child counts: a structural property of the tree (depends only
+        // on parent_id links), so compute it once here rather than scanning all
+        // nodes for every isFoldable call inside reflatten. Every non-root node
+        // was reached from a root in the pre-order above, so its parent always
+        // exists in `nodes`; the `orelse continue` is defensive only.
+        const counts = try self.gpa.alloc(u32, self.nodes.len);
+        errdefer self.gpa.free(counts);
+        @memset(counts, 0);
+        for (self.nodes) |node| {
+            if (node.parent_id) |parent_id| {
+                const parent_index = self.index_by_id.get(parent_id) orelse continue;
+                counts[parent_index] += 1;
+            }
+        }
+        self.child_count = counts;
 
         try self.reflatten("");
         self.selection = self.leafSelection() orelse 0;
@@ -449,16 +470,10 @@ pub const TreeState = struct {
         return self.childCount(parent_index) > 1;
     }
 
+    /// O(1): counts are precomputed in `load` (structural property of the tree).
     fn childCount(self: *const TreeState, index: usize) u32 {
-        assert(index < self.nodes.len);
-        const id = self.nodes[index].id;
-        var count: u32 = 0;
-        for (self.nodes) |node| {
-            if (node.parent_id) |parent_id| {
-                if (std.mem.eql(u8, parent_id[0..], id[0..])) count += 1;
-            }
-        }
-        return count;
+        assert(index < self.child_count.len);
+        return self.child_count[index];
     }
 
     fn kindPasses(self: *const TreeState, kind: session_mod.EntryKind) bool {
@@ -634,6 +649,40 @@ test "linear chains stay flush; only branch children get connectors" {
     // Its two children are the branch arms: one tee, one corner.
     try std.testing.expect(std.mem.indexOf(u8, state.visible[2].prefix, "├") != null);
     try std.testing.expect(std.mem.indexOf(u8, state.visible[3].prefix, "╰") != null);
+}
+
+test "child_count is structural and drives foldability" {
+    const gpa = std.testing.allocator;
+    var state = TreeState.init(gpa);
+    defer state.deinit();
+
+    // root -> {b, c}; b -> d. Pre-order build: a, b, d, c — but the test
+    // resolves indices by id so it stays correct regardless of order.
+    var records = [_]session_mod.EntryRecord{
+        makeRecord("aaaaaaaa", null),
+        makeRecord("bbbbbbbb", "aaaaaaaa"),
+        makeRecord("cccccccc", "aaaaaaaa"),
+        makeRecord("dddddddd", "bbbbbbbb"),
+    };
+    try state.load(&records, "dddddddd");
+
+    const a = state.index_by_id.get(nodeId("aaaaaaaa")) orelse unreachable;
+    const b = state.index_by_id.get(nodeId("bbbbbbbb")) orelse unreachable;
+    const d = state.index_by_id.get(nodeId("dddddddd")) orelse unreachable;
+    const c = state.index_by_id.get(nodeId("cccccccc")) orelse unreachable;
+
+    // Structural counts: a has children {b,c}; b has child d; d and c are leaves.
+    try std.testing.expectEqual(@as(u32, 2), state.child_count[a]);
+    try std.testing.expectEqual(@as(u32, 1), state.child_count[b]);
+    try std.testing.expectEqual(@as(u32, 0), state.child_count[d]);
+    try std.testing.expectEqual(@as(u32, 0), state.child_count[c]);
+
+    // isFoldable: a branches (2 kids); b is a single-child arm of a branch (the
+    // parent-childCount branch of isFoldable); d and c are leaves, not foldable.
+    try std.testing.expect(state.isFoldable(a));
+    try std.testing.expect(state.isFoldable(b));
+    try std.testing.expect(!state.isFoldable(d));
+    try std.testing.expect(!state.isFoldable(c));
 }
 
 test "tool rows carry icon gray state" {
@@ -837,6 +886,12 @@ test "reflattenKeepingSelection preserves the selected id and clamps when filter
     try state.reflattenKeepingSelection("zzz");
     try std.testing.expectEqual(@as(usize, 0), state.visible.len);
     try std.testing.expectEqual(@as(u32, 0), state.selection);
+}
+
+fn nodeId(comptime text: []const u8) Id {
+    var id: Id = undefined;
+    @memcpy(id[0..], text);
+    return id;
 }
 
 fn makeRecord(id: *const [8]u8, parent: ?*const [8]u8) session_mod.EntryRecord {
