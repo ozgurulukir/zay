@@ -437,24 +437,38 @@ pub fn signOutCodex(self: *App) !void {
     _ = try self.thread.transcript.append(self.gpa, .agent, "agent", "Signed out from OpenAI Codex.");
 }
 
+/// Resolve the typed-or-saved API key for a provider form submission. Returns
+/// the trimmed typed key, falling back to the previously saved key when the
+/// input is blank. Returns null when the provider requires a key and none is
+/// available — the caller keeps the form open and shows an error. The result
+/// borrows from the input/saved sources; callers must dupe before storing.
+fn resolveProviderKey(
+    key_input: []const u8,
+    existing: ?[]const u8,
+    requires_key: bool,
+) ?[]const u8 {
+    var key = std.mem.trim(u8, key_input, " \t\r\n");
+    if (key.len == 0) {
+        if (existing) |e| key = e;
+    }
+    if (key.len == 0 and requires_key) return null;
+    return key;
+}
+
 /// Save the entered API key for a catalogue provider, then fetch just that
 /// provider's models and merge them into the catalogue before handing off to
 /// the model picker. A blank key is allowed only for providers that don't
 /// require one (`requiresApiKey() == false`); all current ones do.
 pub fn submitProviderSetup(self: *App, provider: config_mod.Provider) !void {
     if (self.thread.turn.isActive()) return error.InFlightTurn;
-    var key = std.mem.trim(u8, self.input_buffers.provider_key.items, " \t\r\n");
-    if (key.len == 0) {
-        if (self.provider_state.api_keys.get(provider.label())) |existing| {
-            key = existing;
-        }
-    }
-
-    // A required key cannot be blank — keep the form open so the user can type.
-    if (key.len == 0 and provider.requiresApiKey()) {
+    const key = resolveProviderKey(
+        self.input_buffers.provider_key.items,
+        self.provider_state.api_keys.get(provider.label()),
+        provider.requiresApiKey(),
+    ) orelse {
         self.pickers.provider.form_error = "API key is required to connect to this provider.";
         return;
-    }
+    };
 
     const home = self.liveRuntime().?.home_dir;
     if (key.len > 0) {
@@ -508,17 +522,14 @@ pub fn submitProviderSetup(self: *App, provider: config_mod.Provider) !void {
 
 pub fn submitDynamicProviderSetup(self: *App, provider: modelsdev.Provider) !void {
     if (self.thread.turn.isActive()) return error.InFlightTurn;
-    var key = std.mem.trim(u8, self.input_buffers.provider_key.items, " \t\r\n");
-    if (key.len == 0) {
-        if (self.provider_state.api_keys.get(provider.id)) |existing| {
-            key = existing;
-        }
-    }
-
-    if (key.len == 0 and provider.requires_api_key) {
+    const key = resolveProviderKey(
+        self.input_buffers.provider_key.items,
+        self.provider_state.api_keys.get(provider.id),
+        provider.requires_api_key,
+    ) orelse {
         self.pickers.provider.form_error = "API key is required to connect to this provider.";
         return;
-    }
+    };
 
     const home = self.liveRuntime().?.home_dir;
     if (key.len > 0) {
@@ -1543,9 +1554,24 @@ pub fn registerPluginTools(self: *App) void {
 /// afterwards must push their schemas in explicitly.
 pub fn refreshMcpTools(self: *App) void {
     if (self.liveRuntime() == null) return;
+    // syncFromConfigEx launches connects asynchronously; completed handshakes
+    // are installed by drainMcpConnects on subsequent ticks.
     self.mcp_manager.syncFromConfigEx(self.io, &self.cached_config);
     injectMcpTools(self);
     injectPluginTools(self);
+}
+
+/// Poll in-flight async MCP connects (launched by `refreshMcpTools`) and
+/// install completed handshakes on the main thread. Returns true when any
+/// connect landed (status may be CONNECTED or FAILED) so the caller redraws
+/// and the live client picks up newly discovered tools. Called from the TUI
+/// tick alongside `drainMcpNotifications`.
+pub fn drainMcpConnects(self: *App) bool {
+    if (self.mcp_manager.drainConnects(self.io)) {
+        injectAllTools(self);
+        return true;
+    }
+    return false;
 }
 
 /// Poll each connected MCP client for a pending `tools/list_changed` flag set
@@ -1620,4 +1646,18 @@ test "deriveMcpServerName extracts the URL host" {
         defer gpa.free(name);
         try std.testing.expectEqualStrings("example.org", name);
     }
+}
+
+test "resolveProviderKey resolves typed, saved, and blank-required keys" {
+    // A trimmed typed key wins.
+    try std.testing.expectEqualStrings("sk-abc", resolveProviderKey("  sk-abc  ", null, true).?);
+    // The typed key beats a previously saved one.
+    try std.testing.expectEqualStrings("sk-new", resolveProviderKey("sk-new", "sk-old", true).?);
+    // A blank input falls back to the saved key (form stays functional on reload).
+    try std.testing.expectEqualStrings("sk-saved", resolveProviderKey("   ", "sk-saved", true).?);
+    // Blank + required provider -> null, so the form stays open with an error.
+    try std.testing.expect(resolveProviderKey("", null, true) == null);
+    try std.testing.expect(resolveProviderKey(" \t", null, true) == null);
+    // Blank + optional provider -> empty key (anonymous free-tier path).
+    try std.testing.expectEqualStrings("", resolveProviderKey("", null, false).?);
 }

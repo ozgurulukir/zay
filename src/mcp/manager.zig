@@ -11,6 +11,9 @@ const assert = std.debug.assert;
 pub const McpManager = struct {
     gpa: std.mem.Allocator,
     clients: std.ArrayList(client_mod.McpClient) = .empty,
+    /// In-flight async connect jobs. Touched only from the main thread; each
+    /// job's worker mutates only the job's private clone, never the live list.
+    pending_connects: std.ArrayList(*ConnectJob) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) McpManager {
         return .{
@@ -20,6 +23,10 @@ pub const McpManager = struct {
     }
 
     pub fn deinit(self: *McpManager, io: std.Io) void {
+        // Join + tear down any in-flight connects so their spawned subprocesses
+        // (stdio) are reaped before the io runtime shuts down.
+        self.cancelAllConnects(io);
+        self.pending_connects.deinit(self.gpa);
         for (self.clients.items) |*client| client.deinit(io);
         self.clients.deinit(self.gpa);
         self.* = undefined;
@@ -96,18 +103,22 @@ pub const McpManager = struct {
     }
 
     /// Extended sync: reconcile client list, then connect enabled servers.
+    ///
+    /// Connects run asynchronously (`io.concurrent` + `drainConnects`) so a
+    /// slow or unreachable server — the Streamable HTTP handshake has no
+    /// timeout — can never block the UI thread. Each TUI tick drains completed
+    /// handshakes.
     pub fn syncFromConfigEx(
         self: *McpManager,
         io: std.Io,
         config: *const config_mod.Config,
     ) void {
         self.syncFromConfig(io, config) catch {};
-        for (self.clients.items) |*c| {
+        for (self.clients.items) |c| {
             if (c.status() != .connecting) continue;
             if (c.tools.items.len > 0) continue;
-            connectAndDiscover(io, c) catch {
-                c.setError("sync failed", .{});
-            };
+            if (self.hasPendingConnect(c.name)) continue;
+            self.launchConnect(io, c.name);
         }
     }
 
@@ -189,12 +200,12 @@ pub const McpManager = struct {
         return out.toOwnedSlice();
     }
 
-    /// Reconnect a specific client by index: stop, clear tools, and re-discover.
-    /// `markConnecting` is required before `connectAndDiscover` so the SSE
-    /// transport's lifecycle is in `.connecting` — `stop` leaves it `.disabled`,
-    /// and `initialize` only flips `.stdio`/`.sse` variants to `.ready`, not the
-    /// `.disabled` arm. Without this, a reconnected SSE server stays
-    /// "connecting" in the TUI despite actually being live.
+    /// Reconnect a specific client by index: stop, clear tools, and re-discover
+    /// asynchronously. `markConnecting` is required so the transport lifecycle
+    /// is `.connecting` — `stop` leaves it `.disabled`, and `initialize` only
+    /// flips `.stdio`/`.sse` variants to `.ready`, not the `.disabled` arm.
+    /// Without this, a reconnecting SSE server stays "connecting" in the TUI
+    /// despite actually being live.
     pub fn reconnectClient(self: *McpManager, io: std.Io, index: usize) void {
         if (index >= self.clients.items.len) return;
         const client = &self.clients.items[index];
@@ -203,9 +214,7 @@ pub const McpManager = struct {
         client.tools.clearRetainingCapacity();
         client.latency_ms = 0;
         client.markConnecting();
-        connectAndDiscover(io, client) catch {
-            client.setError("reconnect failed", .{});
-        };
+        self.launchConnect(io, client.name);
     }
 
     /// Disconnect a specific client: stop process, clear tools, set disabled.
@@ -219,6 +228,130 @@ pub const McpManager = struct {
         for (client.tools.items) |*tool| tool.deinit(self.gpa);
         client.tools.clearRetainingCapacity();
         client.latency_ms = 0;
+        // An in-flight connect is NOT canceled here — cancel blocks the main
+        // thread on a hung handshake. `drainConnects` observes the target is
+        // no longer `.connecting` and tears the job down instead.
+    }
+
+    /// Poll in-flight connect jobs and install the completed ones. Called from
+    /// the TUI tick; the worker flips `done` before returning, so `await` never
+    /// blocks on a live handshake. Returns true when any job completed (caller
+    /// should re-inject tool schemas and redraw).
+    pub fn drainConnects(self: *McpManager, io: std.Io) bool {
+        var completed = false;
+        var i: usize = 0;
+        while (i < self.pending_connects.items.len) {
+            const job = self.pending_connects.items[i];
+            if (!job.done.load(.acquire)) {
+                i += 1;
+                continue;
+            }
+            const result = job.future.await(io);
+            _ = self.pending_connects.orderedRemove(i);
+            self.installConnectResult(job, result, io);
+            self.gpa.free(job.client_name);
+            self.gpa.destroy(job);
+            completed = true;
+        }
+        return completed;
+    }
+
+    /// True while any connect job is still in flight. The TUI keeps ticking
+    /// (so `drainConnects` keeps running) while this is true.
+    pub fn hasPendingConnects(self: *const McpManager) bool {
+        return self.pending_connects.items.len > 0;
+    }
+
+    fn hasPendingConnect(self: *const McpManager, name: []const u8) bool {
+        for (self.pending_connects.items) |job| {
+            if (std.mem.eql(u8, job.client_name, name)) return true;
+        }
+        return false;
+    }
+
+    /// Spawn an async connect for the named client. No-op when a job for that
+    /// client is already pending, the client isn't `.connecting`, or it already
+    /// discovered tools. The worker owns `job.clone`; the main thread installs
+    /// it via `drainConnects`.
+    fn launchConnect(self: *McpManager, io: std.Io, name: []const u8) void {
+        if (self.hasPendingConnect(name)) return;
+        const client = self.findClient(name) orelse return;
+        if (client.status() != .connecting) return;
+        if (client.tools.items.len > 0) return;
+
+        const job = self.gpa.create(ConnectJob) catch return;
+        job.gpa = self.gpa;
+        job.io = io;
+        job.client_name = self.gpa.dupe(u8, name) catch {
+            self.gpa.destroy(job);
+            return;
+        };
+        job.clone = client.cloneForConnect(io) catch {
+            self.gpa.free(job.client_name);
+            self.gpa.destroy(job);
+            return;
+        };
+        job.future = io.concurrent(runConnect, .{job}) catch {
+            job.clone.deinit(io);
+            self.gpa.free(job.client_name);
+            self.gpa.destroy(job);
+            return;
+        };
+        self.pending_connects.append(self.gpa, job) catch {
+            _ = job.future.cancel(io);
+            job.clone.deinit(io);
+            self.gpa.free(job.client_name);
+            self.gpa.destroy(job);
+        };
+    }
+
+    /// Move a completed connect's outcome into the live client list. Runs on
+    /// the main thread only. If the target was disconnected/removed while the
+    /// connect was in flight, the outcome (clone + message) is torn down.
+    fn installConnectResult(self: *McpManager, job: *ConnectJob, result: ConnectResult, io: std.Io) void {
+        const target = self.findClient(job.client_name) orelse {
+            // Client removed while the connect was in flight.
+            job.clone.deinit(io);
+            if (job.failed_message) |msg| self.gpa.free(msg);
+            return;
+        };
+        switch (result) {
+            .ok => {
+                // Install only if the target is still connecting — the user may
+                // have disconnected it while we were connecting.
+                if (target.status() != .connecting) {
+                    job.clone.deinit(io);
+                    return;
+                }
+                target.deinit(io);
+                target.* = job.clone;
+            },
+            .failed => {
+                const msg = job.failed_message orelse (self.gpa.dupe(u8, "connect failed") catch return);
+                if (target.status() != .connecting) {
+                    self.gpa.free(msg);
+                    job.clone.deinit(io);
+                    return;
+                }
+                target.stop(io);
+                target.lifecycle = .{ .failed = .{ .reason = msg } };
+                job.clone.deinit(io);
+            },
+        }
+    }
+
+    /// Join and tear down every in-flight connect job. Used by `deinit` only —
+    /// on the hot path `drainConnects` cleans up lazily instead (cancel can
+    /// block the main thread on a hung handshake).
+    fn cancelAllConnects(self: *McpManager, io: std.Io) void {
+        for (self.pending_connects.items) |job| {
+            _ = job.future.cancel(io);
+            job.clone.deinit(io);
+            if (job.failed_message) |msg| self.gpa.free(msg);
+            self.gpa.free(job.client_name);
+            self.gpa.destroy(job);
+        }
+        self.pending_connects.clearRetainingCapacity();
     }
 
     fn findClient(self: *McpManager, name: []const u8) ?*client_mod.McpClient {
@@ -250,32 +383,83 @@ pub const McpManager = struct {
     }
 };
 
+/// Result of an async connect worker. The worker never touches the live
+/// McpClient list; it builds `job.clone` and the main thread installs it.
+const ConnectResult = enum { ok, failed };
+
+/// One in-flight async MCP connect. Owned by the manager; the worker owns the
+/// clone until it flips `done`. The main thread polls `done`, awaits, and moves
+/// the clone into the client list.
+const ConnectJob = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    /// Name of the live client this connect belongs to — stable across list
+    /// churn, so the install looks the client up by name, not index.
+    client_name: []u8,
+    /// Private transport copy the worker spawns/handshakes on.
+    clone: client_mod.McpClient,
+    future: std.Io.Future(ConnectResult),
+    /// gpa-owned failure message; written before `done.store(true, .release)`
+    /// and read only after the main thread observes the flag.
+    failed_message: ?[]u8 = null,
+    done: std.atomic.Value(bool) = .init(false),
+};
+
 /// Spawn the MCP server subprocess (stdio) and perform the handshake + tool
-/// discovery over whichever transport the client is configured for. The
+/// discovery over whichever transport the job's clone is configured for. The
 /// Streamable HTTP transport is connectionless — each JSON-RPC call is a fresh
-/// POST — so there is nothing to spawn for it. On any failure, the caller
-/// should set status to .failed.
-fn connectAndDiscover(io: std.Io, client: *client_mod.McpClient) !void {
+/// POST — so there is nothing to spawn for it. Runs on a concurrent worker
+/// thread; only `job.*` is touched, never the live client list.
+fn runConnect(job: *ConnectJob) ConnectResult {
+    defer job.done.store(true, .release);
+    const io = job.io;
+    const client = &job.clone;
     if (client.transport == .stdio) {
         client.startStdio(io) catch |err| {
-            client.setError("Failed to spawn: {s}", .{@errorName(err)});
-            return err;
+            job.failed_message = std.fmt.allocPrint(job.gpa, "Failed to spawn: {s}", .{@errorName(err)}) catch null;
+            return .failed;
         };
     }
-
-    // MCP handshake (stdio pipes or HTTP POST).
     client.initialize(io) catch |err| {
-        client.setError("Handshake failed: {s}", .{@errorName(err)});
         client.stop(io);
-        return err;
+        job.failed_message = std.fmt.allocPrint(job.gpa, "Handshake failed: {s}", .{@errorName(err)}) catch null;
+        return .failed;
     };
-
-    // Discover tools
     client.listTools(io) catch |err| {
-        client.setError("Tool discovery failed: {s}", .{@errorName(err)});
         client.stop(io);
-        return err;
+        job.failed_message = std.fmt.allocPrint(job.gpa, "Tool discovery failed: {s}", .{@errorName(err)}) catch null;
+        return .failed;
     };
+    return .ok;
+}
+
+/// Build a stdio MCP server config that runs the given `bash -c` script —
+/// used by the async-connect tests to mock a JSON-RPC server over stdio.
+/// Caller owns the returned config (free via `McpServerConfig.deinit`).
+fn mockStdioConfig(gpa: std.mem.Allocator, name: []const u8, script: []const u8) !config_mod.McpServerConfig {
+    var args = try gpa.alloc([]u8, 2);
+    errdefer gpa.free(args);
+    args[0] = try gpa.dupe(u8, "-c");
+    args[1] = try gpa.dupe(u8, script);
+    return .{
+        .name = try gpa.dupe(u8, name),
+        .enabled = true,
+        .transport = .{ .stdio = .{
+            .command = try gpa.dupe(u8, "bash"),
+            .args = args,
+        } },
+    };
+}
+
+/// Poll `drainConnects` until every pending connect job has completed and
+/// been installed (or torn down). Mirrors the TUI tick loop's role.
+fn drainUntilConnected(manager: *McpManager, io: std.Io) !void {
+    var deadline: usize = 0;
+    while (manager.hasPendingConnects()) : (deadline += 1) {
+        if (deadline > 2000) return error.ConnectTimedOut;
+        _ = manager.drainConnects(io);
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
 }
 
 test "McpManager syncs servers from config and counts tools" {
@@ -397,4 +581,131 @@ test "McpManager skips duplicate server names in config" {
         .stdio => |t| try std.testing.expectEqualStrings("echo", t.command),
         .sse => return error.Unexpected,
     }
+}
+
+test "McpManager async connect spawns, handshakes, discovers, and installs" {
+    const gpa = std.testing.allocator;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(std.testing.io);
+
+    // Mock stdio MCP server: initialize -> initialized -> tools/list.
+    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(gpa, "mock",
+        \\read line
+        \\echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"mock","version":"1.0"},"capabilities":{"tools":{}}}}'
+        \\read line
+        \\read line
+        \\echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"greet","description":"Say hello","inputSchema":{"type":"object","properties":{}}}]}}'
+    );
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+    defer cfg.deinit(gpa);
+
+    manager.syncFromConfigEx(std.testing.io, &cfg);
+    try std.testing.expect(manager.hasPendingConnects());
+
+    try drainUntilConnected(&manager, std.testing.io);
+
+    try std.testing.expectEqual(client_mod.ServerStatus.connected, manager.clients.items[0].status());
+    try std.testing.expectEqual(@as(usize, 1), manager.clients.items[0].tools.items.len);
+    try std.testing.expectEqualStrings("mcp__mock__greet", manager.clients.items[0].tools.items[0].full_name);
+    try std.testing.expectEqual(@as(usize, 1), manager.activeServerCount());
+    try std.testing.expect(!manager.hasPendingConnects());
+}
+
+test "McpManager async connect failure marks the client failed with a reason" {
+    const gpa = std.testing.allocator;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(std.testing.io);
+
+    // Mock server that exits immediately without speaking JSON-RPC.
+    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(gpa, "dead", "exit 1");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+    defer cfg.deinit(gpa);
+
+    manager.syncFromConfigEx(std.testing.io, &cfg);
+    try std.testing.expect(manager.hasPendingConnects());
+    try drainUntilConnected(&manager, std.testing.io);
+
+    try std.testing.expectEqual(client_mod.ServerStatus.failed, manager.clients.items[0].status());
+    try std.testing.expectEqual(@as(usize, 0), manager.activeServerCount());
+    switch (manager.clients.items[0].lifecycle) {
+        .failed => |f| {
+            try std.testing.expect(f.reason.len > 0);
+            try std.testing.expect(std.mem.indexOf(u8, f.reason, "Handshake failed") != null);
+        },
+        else => return error.UnexpectedLifecycle,
+    }
+}
+
+test "McpManager async connect fails on a malformed tool discovery response" {
+    const gpa = std.testing.allocator;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(std.testing.io);
+
+    // Handshake succeeds, but tools/list answers with non-JSON garbage.
+    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(gpa, "bad-tools",
+        \\read line
+        \\echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"m","version":"1"},"capabilities":{"tools":{}}}}'
+        \\read line
+        \\read line
+        \\echo 'this is not json'
+    );
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+    defer cfg.deinit(gpa);
+
+    manager.syncFromConfigEx(std.testing.io, &cfg);
+    try drainUntilConnected(&manager, std.testing.io);
+
+    try std.testing.expectEqual(client_mod.ServerStatus.failed, manager.clients.items[0].status());
+    switch (manager.clients.items[0].lifecycle) {
+        .failed => |f| try std.testing.expect(std.mem.indexOf(u8, f.reason, "Tool discovery failed") != null),
+        else => return error.UnexpectedLifecycle,
+    }
+}
+
+test "McpManager discards a connect outcome when the client is disconnected mid-flight" {
+    const gpa = std.testing.allocator;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(std.testing.io);
+
+    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(gpa, "flaky",
+        \\read line
+        \\echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"m","version":"1"},"capabilities":{"tools":{}}}}'
+        \\read line
+        \\read line
+        \\echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"g","description":"x","inputSchema":{"type":"object","properties":{}}}]}}'
+    );
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+    defer cfg.deinit(gpa);
+
+    manager.syncFromConfigEx(std.testing.io, &cfg);
+    try std.testing.expect(manager.hasPendingConnects());
+
+    // Disconnect while the connect is in flight — the completed outcome must
+    // be discarded, never resurrecting the server.
+    manager.disconnectClient(std.testing.io, 0);
+    try drainUntilConnected(&manager, std.testing.io);
+
+    try std.testing.expectEqual(client_mod.ServerStatus.disabled, manager.clients.items[0].status());
+    try std.testing.expectEqual(@as(usize, 0), manager.clients.items[0].tools.items.len);
+    try std.testing.expect(!manager.hasPendingConnects());
+}
+
+test "McpManager does not launch a second connect while one is pending" {
+    const gpa = std.testing.allocator;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(std.testing.io);
+
+    // A slow server keeps the job pending long enough to double-sync.
+    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(gpa, "slow", "sleep 0.2");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+    defer cfg.deinit(gpa);
+
+    manager.syncFromConfigEx(std.testing.io, &cfg);
+    manager.syncFromConfigEx(std.testing.io, &cfg);
+    try std.testing.expectEqual(@as(usize, 1), manager.pending_connects.items.len);
 }

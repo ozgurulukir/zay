@@ -174,6 +174,24 @@ pub const McpClient = struct {
         };
     }
 
+    /// Build a fresh client with the same transport configuration (name, stdio
+    /// command/args, sse url/headers) in `.connecting` lifecycle, for an async
+    /// connect worker. The worker spawns and handshakes on the clone; the
+    /// manager moves the completed client into the live list slot on the main
+    /// thread, so the live client is never mutated off-thread.
+    pub fn cloneForConnect(self: *const McpClient, io: std.Io) !McpClient {
+        var clone: McpClient = switch (self.transport) {
+            .stdio => |t| try initStdio(self.gpa, self.name, t.command, t.args),
+            .sse => |t| try initSse(self.gpa, self.name, t.url),
+        };
+        errdefer clone.deinit(io);
+        if (self.transport == .sse) {
+            clone.transport.sse.headers = try config_mod.cloneHeaders(self.gpa, self.transport.sse.headers);
+        }
+        clone.markConnecting();
+        return clone;
+    }
+
     /// Map the lifecycle union to the public `ServerStatus` enum. The
     /// union is the canonical state; this is the legacy API surface
     /// for callers (manager, TUI) that read the status field.
@@ -339,6 +357,11 @@ pub const McpClient = struct {
             child.kill(io);
         }
         if (self.transport == .sse) self.terminateHttpSession(io);
+        // A failed client may carry an owned reason (set via `setError`, e.g.
+        // by the async connect worker before tearing the clone down). Free it
+        // before the lifecycle is clobbered, or deinit's failed-arm can never
+        // see it and the reason leaks.
+        if (self.lifecycle == .failed) self.gpa.free(self.lifecycle.failed.reason);
         self.lifecycle = .disabled;
     }
 
@@ -365,7 +388,9 @@ pub const McpClient = struct {
             .extra_headers = extra_headers,
         }) catch return;
         defer req.deinit();
-        // Best-effort: send the termination, don't wait for the response.
+        // Best-effort: bound the send so teardown can't hang on a dead server,
+        // then send the termination without waiting for the response.
+        if (req.connection) |conn| self.applyHttpTimeout(conn);
         req.sendBodiless() catch return;
     }
 
@@ -470,6 +495,33 @@ pub const McpClient = struct {
 
     // ── Streamable HTTP transport ──
 
+    /// Apply a socket-level send/recv timeout so a server that accepts the
+    /// connection but then stalls — no response head, or a mid-body stop —
+    /// fails the handshake instead of blocking the worker forever.
+    ///
+    /// `std.http.Client` exposes no connect-phase timeout in Zig 0.16, so the
+    /// connect itself is bounded only by kernel TCP/DNS timeouts. Connects now
+    /// run on a worker thread (`McpManager.launchConnect`), so a connect hang
+    /// can never freeze the UI; this bounds everything after connect.
+    fn applyHttpTimeout(self: *McpClient, conn: *std.http.Client.Connection) void {
+        const tv: std.posix.timeval = .{
+            .sec = @intCast(self.read_timeout_ms / 1000),
+            .usec = @intCast((self.read_timeout_ms % 1000) * 1000),
+        };
+        std.posix.setsockopt(
+            conn.stream_reader.stream.socket.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            std.mem.asBytes(&tv),
+        ) catch {};
+        std.posix.setsockopt(
+            conn.stream_reader.stream.socket.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.SNDTIMEO,
+            std.mem.asBytes(&tv),
+        ) catch {};
+    }
+
     /// POST a JSON-RPC request to the remote endpoint and return the matching
     /// JSON-RPC response (owned). The response is either a single
     /// `application/json` body or a `text/event-stream` searched for the
@@ -499,6 +551,8 @@ pub const McpClient = struct {
             .extra_headers = extra_headers,
         });
         defer req.deinit();
+        // Bound send + head + body reads so a stalled server fails fast.
+        if (req.connection) |conn| self.applyHttpTimeout(conn);
         try writeBody(&req, body);
 
         var redirect_buffer: [http_redirect_buffer_bytes]u8 = undefined;
@@ -554,6 +608,8 @@ pub const McpClient = struct {
             .extra_headers = extra_headers,
         });
         defer req.deinit();
+        // Bound send + head reads so a stalled server fails fast.
+        if (req.connection) |conn| self.applyHttpTimeout(conn);
         try writeBody(&req, body);
 
         var redirect_buffer: [http_redirect_buffer_bytes]u8 = undefined;

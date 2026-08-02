@@ -113,6 +113,7 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     // Re-discover MCP tools when a server pushed `notifications/tools/list_changed`
     // mid-request — the client buffered the flag and we poll it here.
     if (provider_model.drainMcpNotifications(root.app)) visible_change = true;
+    if (provider_model.drainMcpConnects(root.app)) visible_change = true;
     if (try root.app.drainDiffRefresh()) visible_change = true;
     // Lanes whose branch name landed get renamed in place.
     if (try root.app.drainLaneNaming()) visible_change = true;
@@ -166,7 +167,10 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         root.app.metrics.blackhole_visible or
         root.diff_refresh_pending or
         root.app.backgroundActive() or
-        root.app.namingActive();
+        root.app.namingActive() or
+        // Keep polling while an async MCP connect is in flight so
+        // drainMcpConnects keeps installing completed handshakes.
+        root.app.mcp_manager.hasPendingConnects();
     if (should_tick) {
         try ctx.tick(RootWidget.drain_tick_ms, root.widget());
     } else {
@@ -509,7 +513,7 @@ pub fn submit(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         // (e.g. the cold-start "Loading diff…" the /diff command kicked off),
         // or a turn a command started directly (e.g. /sync conflict
         // resolution injects one).
-        if (root.app.thread.turn.isActive() or root.app.pickers.models.load == .loading or root.app.metrics.diff_loading()) try ensureTick(root, ctx);
+        if (root.app.thread.turn.isActive() or root.app.pickers.models.load == .loading or root.app.metrics.diff_loading() or root.app.mcp_manager.hasPendingConnects()) try ensureTick(root, ctx);
         ctx.consumeAndRedraw();
         return;
     }
