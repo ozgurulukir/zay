@@ -243,15 +243,9 @@
         "threshold": {
           "type": "number",
           "minimum": 0.1,
-          "maximum": 1.0,
+          "maximum": 0.9,
           "default": 0.75,
-          "description": "Fraction of context window (0.1–1.0) that triggers background summarization. The swap watermark is derived as threshold + 0.20 (capped at 0.95)."
-        },
-        "bufferTokens": {
-          "type": "integer",
-          "minimum": 0,
-          "default": 20000,
-          "description": "Reserve token buffer for compaction preflight checks."
+          "description": "Fraction of context window (0.1–0.9) that triggers background summarization. The swap watermark is derived as threshold + 0.20 (capped at 0.95); values above 0.9 are clamped at parse time so the swap watermark never falls below the start watermark."
         },
         "keepRecentTokens": {
           "type": "integer",

@@ -200,6 +200,10 @@ pub fn reloadTreeNodes(app: *App) !void {
 pub fn navigateToEntry(app: *App, entry_id: []const u8) !void {
     if (app.thread.turn.isActive()) return error.InFlightTurn;
     const rt = app.liveRuntime() orelse return error.NoActiveRuntime;
+    // A summary in flight holds a first_kept_id from the old branch; applied
+    // after the leaf moves it would corrupt (shared ancestor) or pollute
+    // (dead boundary) the new branch. Discard it before switching (TD-2).
+    rt.agent.drainBackgroundCompaction();
     try rt.session_writer.navigate(entry_id);
     try rt.reloadMessages();
     try app.rebuildTranscriptFromAgent();

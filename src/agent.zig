@@ -27,6 +27,11 @@ const ToolBatch = tool_batch_mod.ToolBatch;
 const agent_compactor = @import("agent/compactor.zig");
 const Compactor = agent_compactor.Compactor;
 
+/// After this many consecutive background-compaction failures the automatic
+/// path backs off (emitting one notice); the manual `/compact` command is
+/// never gated (TD-6).
+pub const compaction_failure_limit: u32 = 3;
+
 pub const Agent = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -76,6 +81,16 @@ pub const Agent = struct {
     /// `config.context.compaction`; defaults match the old hardcoded
     /// constants so agents created without a config still compact.
     compaction_settings: config_mod.CompactionSettings = .{},
+    /// Consecutive background-compaction failures. The automatic path
+    /// disables itself (emitting one notice) once this reaches
+    /// `compaction_failure_limit`; `/compact` stays available (TD-6).
+    compaction_failures: u32 = 0,
+    /// Whether the one-shot "automatic compaction disabled" notice was
+    /// already emitted for this trip. Reset on a successful apply.
+    compaction_breaker_notified: bool = false,
+    /// Whether the one-shot "context full but nothing to cut" notice was
+    /// already emitted. Reset on a successful apply.
+    compaction_stuck_notified: bool = false,
     message_queue: MessageQueue = .{},
     message_queue_storage: [agent_queue.capacity]QueuedUserMessage = undefined,
     message_queue_mutex: std.Io.Mutex = .init,
@@ -282,6 +297,23 @@ pub const Agent = struct {
         turn_finished,
         turn_failed: []const u8,
         history_compacted: HistoryCompacted,
+        /// One-shot user-facing compaction notices (breaker tripped, stuck above
+        /// the swap watermark with nothing to cut, overflow wait). The variant
+        /// is a bare enum so no allocation is involved — the renderer owns the
+        /// message text (TD-6, TD-2 event plumbing).
+        compaction_notice: CompactionNotice,
+
+        /// The fixed notice kinds `maybeCompact` can emit while it degrades
+        /// gracefully instead of looping into provider overflow errors.
+        pub const CompactionNotice = enum {
+            /// Automatic compaction disabled after 3 consecutive failures.
+            breaker_tripped,
+            /// Past the swap watermark but nothing can be cut — the recent
+            /// history already fits the retention budget.
+            stuck,
+            /// A synchronous overflow wait is about to join the summarizer.
+            waiting,
+        };
 
         /// Emitted after the agent replaces summarized history with a compaction
         /// summary. Token counts are estimates for display only.
@@ -317,7 +349,7 @@ pub const Agent = struct {
                     gpa.free(tool.display_body);
                     if (tool.stderr) |stderr| gpa.free(stderr);
                 },
-                .turn_started, .delta_end, .tool_batch_finished, .queued_messages_flushed, .turn_finished, .history_compacted => {},
+                .turn_started, .delta_end, .tool_batch_finished, .queued_messages_flushed, .turn_finished, .history_compacted, .compaction_notice => {},
             }
             self.* = undefined;
         }
@@ -867,6 +899,17 @@ pub const Agent = struct {
         if (self.context_window_tokens == 0) return;
         if (self.context_manager.session_writer == null) return;
 
+        // Circuit breaker (TD-6): after `compaction_failure_limit` consecutive
+        // failures the automatic path backs off so it stops respawning a doomed
+        // summarizer every turn. One notice is emitted; `/compact` is not gated.
+        if (self.compactionBreakerTripped()) {
+            if (!self.compaction_breaker_notified) {
+                self.compaction_breaker_notified = true;
+                self.emitCompactionNotice(listener, .breaker_tripped);
+            }
+            return;
+        }
+
         const used = self.currentContextTokens();
         const threshold = self.compaction_settings.threshold;
 
@@ -880,14 +923,28 @@ pub const Agent = struct {
         if (compaction.shouldStartSummary(used, self.context_window_tokens, threshold) and
             self.compactor.stateIs(.idle))
         {
-            self.startCompaction() catch |err| std.log.warn("compaction start failed: {s}", .{@errorName(err)});
+            self.startCompaction() catch |err| switch (err) {
+                // Nothing worth cutting while already past the swap watermark:
+                // emit a one-shot notice instead of looping silently into
+                // provider overflow errors (TD-6).
+                error.NothingToCompact => if (compaction.shouldSwap(used, self.context_window_tokens, threshold)) {
+                    if (!self.compaction_stuck_notified) {
+                        self.compaction_stuck_notified = true;
+                        self.emitCompactionNotice(listener, .stuck);
+                    }
+                },
+                else => std.log.warn("compaction start failed: {s}", .{@errorName(err)}),
+            };
         }
 
         // If used tokens still exceed the swap watermark and compaction is running,
-        // wait synchronously so prompt sent to LLM fits within window.
+        // wait synchronously so prompt sent to LLM fits within window. The wait
+        // can take up to the (user-configurable) request timeout, so make it
+        // visible before blocking (H2).
         if (compaction.shouldSwap(self.currentContextTokens(), self.context_window_tokens, threshold) and
             self.compactor.stateIs(.running))
         {
+            self.emitCompactionNotice(listener, .waiting);
             self.joinCompactor();
             Agent.applyReadyCompaction(@TypeOf(listener), self, listener) catch |err| std.log.warn("compaction apply failed: {s}", .{@errorName(err)});
         }
@@ -903,6 +960,12 @@ pub const Agent = struct {
         if (self.context_window_tokens == 0) return error.UnknownContextWindow;
         if (self.context_manager.session_writer == null) return error.NoSessionWriter;
 
+        // A background summary may still be in flight from the previous turn
+        // (run() exits without joining when between watermarks). Its cut is
+        // stale by definition — the user asked to compact *now* — so discard it
+        // rather than racing job/thread/state below (TD-1).
+        self.drainBackgroundCompaction();
+
         try self.startCompaction();
         self.joinCompactor();
 
@@ -913,10 +976,15 @@ pub const Agent = struct {
 
         const result = self.compactor.result.?;
         const session_writer = self.context_manager.session_writer.?;
-        const tokens_before = self.currentContextTokens();
+        const tokens_before = self.estimateContextTokens();
         try session_writer.appendCompaction(result.first_kept_id.slice(), result.stored_summary);
         try self.reloadFromSession();
         self.resetContextUsage();
+        // A successful manual compact proves the pipeline works: reset the
+        // breaker so automatic compaction resumes.
+        self.compaction_failures = 0;
+        self.compaction_breaker_notified = false;
+        self.compaction_stuck_notified = false;
         return .{
             .tokens_before = tokens_before,
             .tokens_after = self.estimateContextTokens(),
@@ -928,8 +996,14 @@ pub const Agent = struct {
     /// thread never touches live history.
     fn startCompaction(self: *Agent) !void {
         const session_writer = self.context_manager.session_writer orelse return;
-        const recent_tokens = compaction.keepRecentTokens(self.context_window_tokens, self.compaction_settings.keep_recent_tokens);
-        const cut = (try session_writer.compactionCut(self.gpa, recent_tokens)) orelse return;
+        // Scale the keep-recent budget by the ratio of the provider's real
+        // token count to this estimator's, so languages where chars/4
+        // undercounts (CJK ≈ 1.5 chars/token) keep fewer messages and still
+        // compact below the swap watermark (TD-6). Falls back to the base
+        // budget when there is no usage anchor yet.
+        const base_keep = compaction.keepRecentTokens(self.context_window_tokens, self.compaction_settings.keep_recent_tokens);
+        const recent_tokens = compaction.calibrateKeepBudget(base_keep, self.currentContextTokens(), self.estimateContextTokens());
+        const cut = (try session_writer.compactionCut(self.gpa, recent_tokens)) orelse return error.NothingToCompact;
         self.compactor.result = null;
         self.compactor.job = .{
             .gpa = self.gpa,
@@ -955,15 +1029,21 @@ pub const Agent = struct {
         self.joinCompactor();
         defer self.finishCompactor();
         if (state == .failed) {
-            std.log.warn("background compaction failed", .{});
+            self.compaction_failures +|= 1;
+            std.log.warn("background compaction failed ({d}/{d})", .{ self.compaction_failures, compaction_failure_limit });
             return;
         }
         const result = self.compactor.result.?;
         const session_writer = self.context_manager.session_writer orelse return;
-        const tokens_before = self.currentContextTokens();
+        const tokens_before = self.estimateContextTokens();
         try session_writer.appendCompaction(result.first_kept_id.slice(), result.stored_summary);
         try self.reloadFromSession();
         self.resetContextUsage();
+        // A successful apply proves the pipeline works: clear the breaker and
+        // re-arm the one-shot stuck notice for a future episode.
+        self.compaction_failures = 0;
+        self.compaction_breaker_notified = false;
+        self.compaction_stuck_notified = false;
         try listener.emit(.{ .history_compacted = .{
             .tokens_before = tokens_before,
             .tokens_after = self.estimateContextTokens(),
@@ -995,16 +1075,35 @@ pub const Agent = struct {
         self.finishCompactor();
     }
 
+    /// Whether the automatic path should back off after repeated failures.
+    fn compactionBreakerTripped(self: *const Agent) bool {
+        return self.compaction_failures >= compaction_failure_limit;
+    }
+
+    /// Emit a one-shot compaction notice through the agent's event stream. The
+    /// notice is a bare enum — no allocation — so the renderer owns the text
+    /// and a dropped event (noop listener, full queue) leaks nothing.
+    fn emitCompactionNotice(self: *Agent, listener: anytype, notice: Event.CompactionNotice) void {
+        _ = self;
+        const Ctx = @typeInfo(@TypeOf(listener.ctx)).pointer.child;
+        const L = Listener(Ctx);
+        const l: L = listener;
+        l.emit(.{ .compaction_notice = notice }) catch {};
+    }
+
     /// Rehydrate the cached message list from the session projection after a
     /// compaction boundary was written — the swap. Keeps the system prompt.
     /// Called between turn iterations, where every message is already persisted
     /// and no stream is active; never mid-stream.
     fn reloadFromSession(self: *Agent) !void {
         const session_writer = self.context_manager.session_writer orelse return;
-        self.context_manager.clearNonSystem();
+        // Project first, swap second: a failed reprojection leaves the live
+        // cache intact instead of stranded with only the system prompt (TD-5).
         const projected = try session_writer.messages(self.gpa);
-        defer self.gpa.free(projected);
+        errdefer self.gpa.free(projected);
+        self.context_manager.clearNonSystem();
         for (projected) |message| try self.context_manager.appendUnpersisted(message);
+        self.gpa.free(projected);
     }
 
     /// Best estimate of the footprint the *next* request will carry: the last
@@ -1373,4 +1472,164 @@ test "compaction watermarks: shouldStartSummary fires before shouldSwap" {
     // Small-context model: the %35 of 8000 is 2800, under the 8k cap, but the
     // 1000 floor applies only when the window is tiny.
     try std.testing.expectEqual(@as(u32, 1_000), compaction.keepRecentTokens(1_000, 8_000));
+}
+
+test "drain discards a ready summary and returns the compactor to idle" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    // A finished background summary sitting in `.ready` — no thread. Drain
+    // must free the stored summary (leak-checked) and return to idle (TD-1).
+    agent.compactor.result = .{
+        .first_kept_id = undefined,
+        .stored_summary = try gpa.dupe(u8, "stale summary"),
+    };
+    agent.compactor.state.store(.ready, .release);
+
+    agent.drainBackgroundCompaction();
+
+    try std.testing.expect(agent.compactor.stateIs(.idle));
+    try std.testing.expect(agent.compactor.result == null);
+    try std.testing.expect(agent.compactor.thread == null);
+}
+
+test "drain joins a running summarizer that fails against a dead server" {
+    const gpa = std.testing.allocator;
+    const openai_compatible = @import("ai/openai_compatible.zig");
+    var client: openai_compatible.Client = undefined;
+    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer client.deinit();
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    // Fake an in-flight job: the summarizer thread will fail (dead server →
+    // connection refused) and flip to `.failed`; drain must join it and return
+    // the compactor to idle without leaking the result slot (TD-1).
+    agent.compactor.job = .{
+        .gpa = gpa,
+        .client = .{ .openai_compatible = &client },
+        .first_kept_id = undefined, // never read on the failure path
+        .prefix_text = try gpa.dupe(u8, "some prefix"),
+    };
+    agent.compactor.state.store(.running, .release);
+    agent.compactor.thread = try std.Thread.spawn(.{}, agent_compactor.Compactor.runThread, .{&agent.compactor});
+
+    // Wait for the summarizer to fail (connection refused, so this is fast).
+    var spins: u32 = 0;
+    while (!agent.compactor.stateIs(.failed) and spins < 10_000) : (spins += 1) {
+        std.testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expect(agent.compactor.stateIs(.failed));
+
+    agent.drainBackgroundCompaction();
+    try std.testing.expect(agent.compactor.stateIs(.idle));
+    try std.testing.expect(agent.compactor.thread == null);
+}
+
+test "compaction breaker trips after repeated failures and backs off automatically" {
+    const gpa = std.testing.allocator;
+    const openai_compatible = @import("ai/openai_compatible.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".config/nova");
+    const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_dir);
+
+    var writer: session_mod.SessionWriter = undefined;
+    try session_mod.SessionWriter.initDefault(&writer, gpa, std.testing.io, home_dir, "/tmp");
+    defer writer.deinit();
+
+    var client: openai_compatible.Client = undefined;
+    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer client.deinit();
+
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    agent.attachSessionWriter(&writer);
+    agent.compaction_client = .{ .openai_compatible = &client };
+    agent.context_window_tokens = 4096;
+    agent.compaction_failures = compaction_failure_limit;
+    agent.compaction_breaker_notified = false;
+
+    const Seen = struct {
+        notices: std.ArrayList(Agent.Event.CompactionNotice) = .empty,
+
+        fn onEvent(ctx: *@This(), event: Agent.Event) !void {
+            switch (event) {
+                .compaction_notice => |notice| try ctx.notices.append(std.testing.allocator, notice),
+                else => {},
+            }
+        }
+    };
+    var seen: Seen = .{};
+    defer seen.notices.deinit(gpa);
+    const Listener = Agent.Listener(Seen);
+    const listener: Listener = .{ .ctx = &seen, .on_event = Seen.onEvent };
+
+    // Tripped: maybeCompact emits the one-shot breaker notice and backs off.
+    agent.maybeCompact(listener);
+    try std.testing.expectEqual(@as(usize, 1), seen.notices.items.len);
+    try std.testing.expectEqual(Agent.Event.CompactionNotice.breaker_tripped, seen.notices.items[0]);
+    try std.testing.expect(agent.compactor.stateIs(.idle));
+
+    // The notice is one-shot: a second call emits nothing new.
+    agent.maybeCompact(listener);
+    try std.testing.expectEqual(@as(usize, 1), seen.notices.items.len);
+
+    // Failure bookkeeping: each failed apply increments toward the limit.
+    agent.compaction_failures = compaction_failure_limit - 1;
+    agent.compactor.state.store(.failed, .release);
+    try Agent.applyReadyCompaction(Listener, &agent, listener);
+    try std.testing.expectEqual(compaction_failure_limit, agent.compaction_failures);
+}
+
+test "applyReadyCompaction resets the breaker on a successful swap" {
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".config/nova");
+    const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_dir);
+
+    var writer: session_mod.SessionWriter = undefined;
+    try session_mod.SessionWriter.initDefault(&writer, gpa, std.testing.io, home_dir, "/tmp");
+    defer writer.deinit();
+
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    agent.attachSessionWriter(&writer);
+
+    // Two persisted user messages so a 1-token keep budget cuts after the first.
+    try agent.addUser("hello");
+    try agent.addUser("world");
+    const cut = (try writer.compactionCut(gpa, 1)) orelse return error.TestFailed;
+    defer gpa.free(cut.prefix_text);
+
+    // Simulate a ready background summary while the breaker was tripped.
+    agent.compactor.result = .{
+        .first_kept_id = cut.first_kept_id,
+        .stored_summary = try gpa.dupe(u8, "SUMMARY"),
+    };
+    agent.compactor.state.store(.ready, .release);
+    agent.compaction_failures = compaction_failure_limit;
+    agent.compaction_breaker_notified = true;
+    agent.compaction_stuck_notified = true;
+
+    const Seen = struct {
+        fn onEvent(_: *@This(), _: Agent.Event) !void {}
+    };
+    var seen: Seen = .{};
+    const Listener = Agent.Listener(Seen);
+    const listener: Listener = .{ .ctx = &seen, .on_event = Seen.onEvent };
+
+    try Agent.applyReadyCompaction(Listener, &agent, listener);
+
+    // A successful swap proves the pipeline works: breaker cleared, notices
+    // re-armed for a future episode.
+    try std.testing.expectEqual(@as(u32, 0), agent.compaction_failures);
+    try std.testing.expect(!agent.compaction_breaker_notified);
+    try std.testing.expect(!agent.compaction_stuck_notified);
 }

@@ -6,6 +6,7 @@
 //! focused on `SessionManager` and `Session` (the read/append API).
 
 const std = @import("std");
+const logger = @import("logger");
 const ai = @import("../ai.zig");
 
 const session_type = @import("types.zig");
@@ -132,7 +133,7 @@ pub const SessionWriter = struct {
     /// then annotates that entry. No-op if the session has no leaf yet.
     pub fn setLeafSnapshot(self: *SessionWriter, sha: []const u8) Error!void {
         self.quiesce();
-        defer self.restart() catch {};
+        defer self.restart() catch |err| logger.log("session writer restart failed: {s}", .{@errorName(err)});
         const leaf_id = self.session.leaf() orelse return;
         return self.session.setSnapshot(leaf_id, sha);
     }
@@ -141,7 +142,7 @@ pub const SessionWriter = struct {
     /// conversation position (nearest entry at/above the leaf). Caller owns it.
     pub fn snapshotAt(self: *SessionWriter, gpa: std.mem.Allocator) Error!?[]u8 {
         self.quiesce();
-        defer self.restart() catch {};
+        defer self.restart() catch |err| logger.log("session writer restart failed: {s}", .{@errorName(err)});
         return self.session.snapshotAt(gpa);
     }
 
@@ -150,7 +151,7 @@ pub const SessionWriter = struct {
     /// stored twice.
     pub fn savePromptHistory(self: *SessionWriter, prompt: []const u8) Error!void {
         self.quiesce();
-        defer self.restart() catch {};
+        defer self.restart() catch |err| logger.log("session writer restart failed: {s}", .{@errorName(err)});
         try self.session.savePromptHistory(prompt);
     }
 
@@ -158,7 +159,7 @@ pub const SessionWriter = struct {
     /// slice and each string.
     pub fn loadPromptHistory(self: *SessionWriter, gpa: std.mem.Allocator) Error![][]u8 {
         self.quiesce();
-        defer self.restart() catch {};
+        defer self.restart() catch |err| logger.log("session writer restart failed: {s}", .{@errorName(err)});
         return self.session.loadPromptHistory(gpa);
     }
 
@@ -166,7 +167,7 @@ pub const SessionWriter = struct {
     /// the read has exclusive access to the connection, then restarts it.
     pub fn entries(self: *SessionWriter, gpa: std.mem.Allocator) Error![]EntryRecord {
         self.quiesce();
-        defer self.restart() catch {};
+        defer self.restart() catch |err| logger.log("session writer restart failed: {s}", .{@errorName(err)});
         return self.session.entries(gpa);
     }
 
@@ -174,7 +175,7 @@ pub const SessionWriter = struct {
     /// `navigate` to rehydrate the agent's conversation from the new branch.
     pub fn messages(self: *SessionWriter, gpa: std.mem.Allocator) Error![]ai.ChatMessage {
         self.quiesce();
-        defer self.restart() catch {};
+        defer self.restart() catch |err| logger.log("session writer restart failed: {s}", .{@errorName(err)});
         return self.session.messages(gpa);
     }
 
@@ -182,7 +183,7 @@ pub const SessionWriter = struct {
     /// computed against the persisted tree, then restarts the writer.
     pub fn compactionCut(self: *SessionWriter, gpa: std.mem.Allocator, keep_recent_tokens: u32) Error!?CompactionCut {
         self.quiesce();
-        defer self.restart() catch {};
+        defer self.restart() catch |err| logger.log("session writer restart failed: {s}", .{@errorName(err)});
         return self.session.compactionCut(gpa, keep_recent_tokens);
     }
 
@@ -191,7 +192,7 @@ pub const SessionWriter = struct {
     /// a child of `entry_id`, forming a new branch.
     pub fn navigate(self: *SessionWriter, entry_id: []const u8) Error!void {
         self.quiesce();
-        defer self.restart() catch {};
+        defer self.restart() catch |err| logger.log("session writer restart failed: {s}", .{@errorName(err)});
         try self.session.branch(entry_id, null, null);
     }
 
@@ -199,7 +200,7 @@ pub const SessionWriter = struct {
     /// session. Called when the model selection changes during a session.
     pub fn updateModel(self: *SessionWriter, provider: []const u8, model_id: []const u8, effort_label: ?[]const u8) Error!void {
         self.quiesce();
-        defer self.restart() catch {};
+        defer self.restart() catch |err| logger.log("session writer restart failed: {s}", .{@errorName(err)});
         try self.session.updateModel(provider, model_id, effort_label);
     }
 
@@ -226,7 +227,7 @@ pub const SessionWriter = struct {
         while (self.entry_queue.pop(self.queue)) |entry| {
             var owned = entry;
             defer owned.deinit(self.gpa);
-            writeQueuedEntry(self, &owned) catch {};
+            writeQueuedEntry(self, &owned) catch |err| logger.log("session writer flush failed: {s}", .{@errorName(err)});
         }
     }
 

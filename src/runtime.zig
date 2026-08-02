@@ -382,9 +382,11 @@ pub const AgentRuntime = struct {
     /// in-memory messages (keeping the system prompt) and reloads the new
     /// active path. Must not be called mid-turn.
     pub fn reloadMessages(self: *AgentRuntime) !void {
-        self.agent.clearNonSystemMessages();
+        // Project first, swap second: a failed reprojection leaves the live
+        // cache intact instead of stranded with only the system prompt (TD-5).
         const messages = try self.session_writer.messages(self.gpa);
         defer self.gpa.free(messages);
+        self.agent.clearNonSystemMessages();
         for (messages) |message| try self.agent.takeMessage(message);
         // The conversation is now a different branch; the usage anchor no
         // longer refers to these messages.
@@ -621,7 +623,10 @@ pub const AgentRuntime = struct {
                 .reasoning = .{ .effort = effort, .summary = .auto },
                 .account_id = credentials.account_id,
                 .session_id = self.session_writer.session.id.slice(),
-                .system_prompt = self.system_prompt,
+                // The summarizer gets a minimal carrier prompt, NOT the full
+                // agent system prompt (AGENTS.md + skills + plugins) — that can
+                // push the summary request itself over a small window (C4).
+                .system_prompt = compaction.summarizer_system_prompt,
             }) catch {
                 self.gpa.destroy(compaction_client);
                 break :attach_compaction;
@@ -712,6 +717,11 @@ pub const AgentRuntime = struct {
                 .model = model_id,
                 .tools = &.{},
                 .reasoning = .{ .effort = effort },
+                // Parity with the main client: the summarizer must speak the
+                // same wire dialect (DashScope's top-level enable_thinking vs
+                // reasoning_effort) and honor the user's request timeout (H2).
+                .wire_dialect = self.wire_dialect,
+                .request_timeout_seconds = self.context_settings.request_timeout_seconds orelse 300,
             }) catch {
                 self.gpa.destroy(compaction_client);
                 break :attach_compaction;
@@ -768,7 +778,8 @@ pub const AgentRuntime = struct {
                 .tools = &.{},
                 .reasoning = reasoning,
                 .session_id = self.session_writer.session.id.slice(),
-                .system_prompt = self.system_prompt,
+                // Minimal carrier prompt, not the full agent system prompt (C4).
+                .system_prompt = compaction.summarizer_system_prompt,
             }) catch {
                 self.gpa.destroy(compaction_client);
                 break :attach_compaction;

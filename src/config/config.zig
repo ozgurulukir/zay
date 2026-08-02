@@ -87,10 +87,11 @@ pub const ContextSettings = struct {
 pub const CompactionSettings = struct {
     /// Enable automatic context compaction before reaching limits.
     auto: bool = true,
-    /// Fraction of context window (0.1–1.0) that triggers compaction.
+    /// Fraction of context window (0.1–0.9) that triggers compaction. The swap
+    /// watermark is derived as threshold + 0.20 (capped at 0.95); values above
+    /// 0.90 would let the swap watermark fall below the start watermark, so
+    /// parse clamps to this ceiling (C3).
     threshold: f64 = 0.75,
-    /// Reserve token buffer for compaction preflight checks.
-    buffer_tokens: u32 = 20_000,
     /// Recent conversation tokens retained verbatim alongside the summary.
     keep_recent_tokens: u32 = 8_000,
 };

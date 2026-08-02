@@ -21,6 +21,15 @@ const assert = std.debug.assert;
 /// prompt). Combined with the rendered conversation in `buildSummaryRequest`.
 pub const compaction_prompt = @embedFile("../prompts/compaction.md");
 
+/// Minimal system prompt for the dedicated summarization client. The full
+/// agent system prompt (project rules, skills, plugin prompts) is irrelevant
+/// to summarization and on small-window models can push the summary request
+/// itself over the limit (C4). Non-empty so codex_responses' init assert
+/// passes. The instructions live in `compaction_prompt`, delivered as the
+/// single user message — this prompt is only a carrier.
+pub const summarizer_system_prompt =
+    "You are a conversation summarizer. Follow the summarization instructions exactly.";
+
 /// Handover template stored as the boundary message, so the resuming model
 /// knows the summary came from a prior model (codex's summary_prefix). It
 /// carries a `${SUMMARY}` placeholder that `buildStoredSummary` replaces with
@@ -53,10 +62,6 @@ const start_watermark_default: f64 = 0.75;
 const swap_watermark_margin: f64 = 0.20;
 const swap_watermark_cap: f64 = 0.95;
 
-/// Tokens of the most recent conversation kept verbatim; the older prefix is
-/// summarized. Mirrors the codex/pi retention budget.
-pub const keep_recent_tokens_default: u32 = 20_000;
-
 /// Conservative fallback context window when the model id is unknown. Smaller
 /// than most real windows on purpose — a low denominator only compacts early.
 const context_window_default_tokens: u32 = 128_000;
@@ -84,12 +89,27 @@ pub fn contextWindowTokens(raw_model_id: []const u8, override: ?u32) u32 {
 
     var best: ?model_catalog.Entry = null;
     for (model_catalog.entries) |entry| {
-        if (std.mem.startsWith(u8, model_id, entry.id) or std.mem.startsWith(u8, entry.id, model_id)) {
+        // Prefix match only in the safe direction (model id is longer than or
+        // equal to the catalogue id), and only across a segment boundary — so
+        // `gpt-4` never matches `gpt-4o*`, while `gpt-5-2025-08-07` still
+        // resolves to `gpt-5` (TD-8). Longest match wins.
+        if (std.mem.startsWith(u8, model_id, entry.id) and segmentBoundary(model_id, entry.id.len)) {
             if (best == null or entry.id.len > best.?.id.len) best = entry;
         }
     }
     if (best) |entry| return entry.context;
     return context_window_default_tokens;
+}
+
+/// True when `prefix_len` is the whole model id, or the character right after
+/// the catalogue prefix is a segment separator (`-`, `.`, `_`, `:`). Guards
+/// family-prefix matching against longer ids of a different family.
+fn segmentBoundary(model_id: []const u8, prefix_len: usize) bool {
+    if (model_id.len == prefix_len) return true;
+    return switch (model_id[prefix_len]) {
+        '-', '.', '_', ':' => true,
+        else => false,
+    };
 }
 
 /// Target tokens of recent conversation to keep verbatim during compaction.
@@ -103,12 +123,29 @@ pub fn keepRecentTokens(context_window: u32, config_keep: u32) u32 {
     return @max(1000, @min(config_keep, target));
 }
 
+/// Scale the keep-recent budget by the ratio of the provider's real token
+/// count to this estimator's, so languages where chars/4 undercounts
+/// (CJK ≈ 1.5 chars/token) keep fewer messages and still compact below the
+/// swap watermark (TD-6). Only ever shrinks the budget; falls back to
+/// `base_keep` when either count is zero. Ratio clamped to [0.25, 2.0]
+/// (×1000 fixed point).
+pub fn calibrateKeepBudget(base_keep: u32, real_tokens: u32, estimated_tokens: u32) u32 {
+    if (real_tokens == 0 or estimated_tokens == 0) return base_keep;
+    const ratio_x1000 = @divFloor(@as(u64, real_tokens) * 1000, estimated_tokens);
+    const clamped = @min(2000, @max(250, ratio_x1000)); // [0.25, 2.0]
+    if (clamped <= 1000) return base_keep; // never grow
+    const scaled = @as(u64, base_keep) * 1000 / clamped;
+    return @max(1000, @as(u32, @intCast(scaled)));
+}
+
 /// True once `used_tokens` crosses the start watermark: begin producing the
 /// background summary. `threshold` is the configurable fraction
-/// (`context.compaction.threshold`, default 0.75).
+/// (`context.compaction.threshold`, default 0.75). Accepted range [0.1, 0.90]:
+/// anything above the ceiling (parse-clamped anyway) would let the swap
+/// watermark fall at or below the start watermark (C3).
 pub fn shouldStartSummary(used_tokens: u32, context_window: u32, threshold: f64) bool {
     assert(context_window > 0);
-    const effective = if (threshold >= 0.1 and threshold <= 1.0) threshold else start_watermark_default;
+    const effective = if (threshold >= 0.1 and threshold <= 0.90) threshold else start_watermark_default;
     const limit: u32 = @intFromFloat(@round(@as(f64, @floatFromInt(context_window)) * effective));
     return used_tokens > limit;
 }
@@ -117,7 +154,7 @@ pub fn shouldStartSummary(used_tokens: u32, context_window: u32, threshold: f64)
 /// summary. The swap watermark is `threshold + 0.20`, capped at 0.95.
 pub fn shouldSwap(used_tokens: u32, context_window: u32, threshold: f64) bool {
     assert(context_window > 0);
-    const effective = if (threshold >= 0.1 and threshold <= 1.0) threshold else start_watermark_default;
+    const effective = if (threshold >= 0.1 and threshold <= 0.90) threshold else start_watermark_default;
     const swap = @min(effective + swap_watermark_margin, swap_watermark_cap);
     const limit: u32 = @intFromFloat(@round(@as(f64, @floatFromInt(context_window)) * swap));
     return used_tokens > limit;
@@ -268,7 +305,13 @@ fn writeMessage(out: *std.Io.Writer, message: ai.ChatMessage) !void {
                 switch (block) {
                     .text => |text| try out.print("[{s}]: {s}\n", .{ label, text.text }),
                     .tool_call => |call| try out.print("[{s} tool_call]: {s}({s})\n", .{ label, call.name, call.arguments }),
-                    .reasoning, .image => {},
+                    // Images vanish without a marker today; leave an explicit
+                    // placeholder so the summary keeps a positional hint (M6).
+                    .image => |image| {
+                        _ = image;
+                        try out.print("[{s} image omitted]\n", .{label});
+                    },
+                    .reasoning => {},
                 }
             }
         },
@@ -295,7 +338,10 @@ fn cappedText(text: []const u8) []const u8 {
 /// the rendered conversation, wrapped so the model treats it as data to
 /// summarize rather than a conversation to continue. Caller owns the result.
 pub fn buildSummaryRequest(gpa: std.mem.Allocator, prefix_text: []const u8) ![]u8 {
-    return std.fmt.allocPrint(gpa, "{s}\n\n<conversation>\n{s}\n</conversation>", .{ compaction_prompt, prefix_text });
+    // `<nova_transcript>` framing rather than `<conversation>`: a literal
+    // `</conversation>` inside tool output (common) would break the wrapper;
+    // `nova_transcript` is far rarer in user text (M6).
+    return std.fmt.allocPrint(gpa, "{s}\n\n<nova_transcript>\n{s}\n</nova_transcript>", .{ compaction_prompt, prefix_text });
 }
 
 /// Inject a produced summary into the handover template's `${SUMMARY}`
@@ -306,6 +352,16 @@ pub fn buildStoredSummary(gpa: std.mem.Allocator, summary: []const u8) ![]u8 {
     const before = handover_template[0..summary_placeholder_index];
     const after = handover_template[summary_placeholder_index + summary_placeholder.len ..];
     return std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ before, summary, after });
+}
+
+/// The inner summary text without the handover template's framing, so
+/// repeated compactions don't accumulate boilerplate (M7). Returns the input
+/// unchanged when the framing tags are absent.
+pub fn stripSummaryFraming(text: []const u8) []const u8 {
+    const open = std.mem.indexOf(u8, text, "<summary>") orelse return text;
+    const close = std.mem.lastIndexOf(u8, text, "</summary>") orelse return text;
+    if (close <= open) return text;
+    return std.mem.trim(u8, text[open + "<summary>".len .. close], " \n");
 }
 
 fn saturatingLen(slice: []const u8) u32 {
@@ -451,6 +507,81 @@ test "contextWindowTokens strips provider prefix" {
     const tokens1 = contextWindowTokens("gpt-4o", null);
     const tokens2 = contextWindowTokens("openai/gpt-4o", null);
     try std.testing.expectEqual(tokens1, tokens2);
+}
+
+test "summarizer system prompt is non-empty and small" {
+    // Non-empty so codex_responses' init assert passes; small so it can't push
+    // the summary request itself over a small context window (C4).
+    try std.testing.expect(summarizer_system_prompt.len > 0);
+    try std.testing.expect(summarizer_system_prompt.len <= 200);
+}
+
+test "swap never fires before start for every accepted threshold" {
+    // Non-circular oracle: sweep every accepted threshold × window × usage and
+    // assert shouldSwap(used) ⇒ shouldStartSummary(used). This encodes the
+    // ordering directly, without recomputing the watermark formula (C3).
+    const windows = [_]u32{ 8_000, 32_000, 128_000, 1_000_000 };
+    var threshold_tenths: u32 = 2; // 0.10
+    while (threshold_tenths <= 18) : (threshold_tenths += 1) { // ... 0.90
+        const threshold: f64 = @as(f64, @floatFromInt(threshold_tenths)) / 20.0;
+        for (windows) |window| {
+            const step = @max(@as(u32, 1), window / 1000);
+            var used: u32 = 0;
+            while (used < window) : (used +|= step) {
+                if (shouldSwap(used, window, threshold)) {
+                    try std.testing.expect(shouldStartSummary(used, window, threshold));
+                }
+            }
+        }
+    }
+}
+
+test "calibrated keep budget shrinks when real usage outruns the estimate" {
+    // ratio 1.6 → budget scaled down 8000 / 1.6 = 5000.
+    try std.testing.expectEqual(@as(u32, 5_000), calibrateKeepBudget(8_000, 16_000, 10_000));
+    // ratio clamped to 2.0 → 8000 / 2.0 = 4000.
+    try std.testing.expectEqual(@as(u32, 4_000), calibrateKeepBudget(8_000, 100_000, 1_000));
+    // ratio below 1.0 never grows the budget.
+    try std.testing.expectEqual(@as(u32, 8_000), calibrateKeepBudget(8_000, 100, 10_000));
+    // Zero counts fall back to the base budget.
+    try std.testing.expectEqual(@as(u32, 8_000), calibrateKeepBudget(8_000, 0, 0));
+    // The 1000-token floor applies for tiny scaled budgets.
+    try std.testing.expectEqual(@as(u32, 1_000), calibrateKeepBudget(1_200, 4_000, 1_000));
+}
+
+test "context window lookup requires a segment boundary after the family prefix" {
+    // `gpt-4` resolves to the exact gpt-4 entry (8192), NOT the longer gpt-4o
+    // family (128000) — the reverse direction is gone (TD-8). The plan's
+    // "default" wording assumed no bare gpt-4 entry; the catalogue has one.
+    try std.testing.expectEqual(@as(u32, 8_192), contextWindowTokens("gpt-4", null));
+    // A dated/suffixed variant still resolves to its base family across `-`.
+    try std.testing.expectEqual(@as(u32, 400_000), contextWindowTokens("gpt-5-2025-08-07", null));
+    // Provider prefixes still strip.
+    try std.testing.expectEqual(contextWindowTokens("gpt-4o", null), contextWindowTokens("openai/gpt-4o", null));
+}
+
+test "folded summary strips the handover framing" {
+    const gpa = std.testing.allocator;
+    const stored = try buildStoredSummary(gpa, "INNER");
+    defer gpa.free(stored);
+    try std.testing.expectEqualStrings("INNER", stripSummaryFraming(stored));
+    // Text without framing passes through unchanged.
+    try std.testing.expectEqualStrings("plain", stripSummaryFraming("plain"));
+}
+
+test "serialize prefix marks omitted images" {
+    const gpa = std.testing.allocator;
+    const blocks = try gpa.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .image = .{
+        .mime_type = try gpa.dupe(u8, "image/png"),
+        .data_base64 = try gpa.dupe(u8, "aGVsbG8="),
+    } };
+    var message: ai.ChatMessage = .{ .user = .{ .content = blocks } };
+    defer message.deinit(gpa); // frees the blocks array too
+
+    const text = try serializePrefix(gpa, &.{message});
+    defer gpa.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[user image omitted]") != null);
 }
 
 fn textMessage(gpa: std.mem.Allocator, role: ai.Role, text: []const u8) !ai.ChatMessage {

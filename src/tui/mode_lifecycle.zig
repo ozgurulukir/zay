@@ -229,6 +229,8 @@ pub fn submitMode(app: *App) !bool {
                                 "Compaction did not produce a result"
                             else if (err == error.CompactionFailed)
                                 "Background compaction failed"
+                            else if (err == error.NothingToCompact)
+                                "Nothing to compact — the recent history already fits the retention budget"
                             else
                                 @errorName(err);
                             _ = try app.thread.transcript.append(app.gpa, .notice, "compaction", msg);

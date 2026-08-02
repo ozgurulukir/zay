@@ -640,7 +640,10 @@ fn renderCompactionPrefix(gpa: std.mem.Allocator, path: []const EntryRecord, bou
     if (boundary) |b| {
         const prev_summary = try serialize.compactionSummaryText(gpa, path[b.summary_index].payload_json);
         defer gpa.free(prev_summary);
-        try out.writer.print("{s}\n", .{prev_summary});
+        // Fold in only the inner summary, not the handover template's framing,
+        // so repeated compactions don't re-ingest the boilerplate (M7).
+        const inner = compaction.stripSummaryFraming(prev_summary);
+        try out.writer.print("{s}\n", .{inner});
     }
     const rendered = try compaction.serializePrefix(gpa, prefix_msgs);
     defer gpa.free(rendered);

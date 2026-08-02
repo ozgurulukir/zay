@@ -155,7 +155,6 @@ fn applyContextOverlay(target: *ContextSettings, updates: ContextSettings) void 
     const d: CompactionSettings = .{};
     if (updates.compaction.auto != d.auto) target.compaction.auto = updates.compaction.auto;
     if (updates.compaction.threshold != d.threshold) target.compaction.threshold = updates.compaction.threshold;
-    if (updates.compaction.buffer_tokens != d.buffer_tokens) target.compaction.buffer_tokens = updates.compaction.buffer_tokens;
     if (updates.compaction.keep_recent_tokens != d.keep_recent_tokens) target.compaction.keep_recent_tokens = updates.compaction.keep_recent_tokens;
 }
 
@@ -615,14 +614,17 @@ fn parseContext(value: std.json.Value) ContextSettings {
     return ctx;
 }
 
+/// Ceiling for the configurable compaction threshold. The swap watermark is
+/// `threshold + 0.20` capped at 0.95, so a threshold above 0.90 would let the
+/// swap watermark fall *below* the start watermark and invert the watermarks
+/// (C3). Values are clamped here so configs self-heal on next save.
+const compaction_threshold_max: f64 = 0.90;
+
 fn parseCompaction(value: std.json.Value) CompactionSettings {
     var comp: CompactionSettings = .{};
     if (boolField(value, "auto")) |b| comp.auto = b;
     if (floatField(value, "threshold")) |f| {
-        if (f >= 0.1 and f <= 1.0) comp.threshold = f;
-    }
-    if (intField(value, "bufferTokens")) |v| {
-        if (v >= 0) comp.buffer_tokens = @intCast(v);
+        if (f >= 0.1 and f <= 1.0) comp.threshold = @min(f, compaction_threshold_max);
     }
     if (intField(value, "keepRecentTokens")) |v| {
         if (v >= 0) comp.keep_recent_tokens = @intCast(v);
@@ -1145,7 +1147,6 @@ fn hasNonDefaultContext(ctx: ContextSettings) bool {
     if (ctx.request_timeout_seconds != null) return true;
     if (ctx.compaction.auto != d.compaction.auto) return true;
     if (ctx.compaction.threshold != d.compaction.threshold) return true;
-    if (ctx.compaction.buffer_tokens != d.compaction.buffer_tokens) return true;
     if (ctx.compaction.keep_recent_tokens != d.compaction.keep_recent_tokens) return true;
     return false;
 }
@@ -1185,10 +1186,6 @@ fn writeCompaction(writer: *std.Io.Writer, comp: CompactionSettings) !void {
     {
         try writeKeyNoIndent(writer, "threshold", &wrote_any);
         try writer.print("{d:.2}", .{comp.threshold});
-    }
-    {
-        try writeKeyNoIndent(writer, "bufferTokens", &wrote_any);
-        try writer.print("{d}", .{comp.buffer_tokens});
     }
     {
         try writeKeyNoIndent(writer, "keepRecentTokens", &wrote_any);
@@ -2299,7 +2296,7 @@ test "parseObject: context with compaction settings" {
     var sink: std.ArrayList(Diagnostic) = .empty;
     defer sink.deinit(gpa);
     const json =
-        \\{"context":{"overrideContextWindow":32000,"maxOutputTokens":4096,"compaction":{"auto":false,"threshold":0.80,"bufferTokens":10000,"keepRecentTokens":5000}}}
+        \\{"context":{"overrideContextWindow":32000,"maxOutputTokens":4096,"compaction":{"auto":false,"threshold":0.80,"keepRecentTokens":5000}}}
     ;
     var cfg = try parseFile(gpa, "<test>", json, &sink);
     defer cfg.deinit(gpa);
@@ -2307,7 +2304,6 @@ test "parseObject: context with compaction settings" {
     try std.testing.expectEqual(@as(u32, 4_096), cfg.context.max_output_tokens.?);
     try std.testing.expectEqual(false, cfg.context.compaction.auto);
     try std.testing.expectApproxEqAbs(@as(f64, 0.80), cfg.context.compaction.threshold, 0.001);
-    try std.testing.expectEqual(@as(u32, 10_000), cfg.context.compaction.buffer_tokens);
     try std.testing.expectEqual(@as(u32, 5_000), cfg.context.compaction.keep_recent_tokens);
 }
 
@@ -2321,7 +2317,6 @@ test "parseObject: context defaults when absent" {
     try std.testing.expectEqual(@as(?u32, null), cfg.context.max_output_tokens);
     try std.testing.expectEqual(true, cfg.context.compaction.auto);
     try std.testing.expectApproxEqAbs(@as(f64, 0.75), cfg.context.compaction.threshold, 0.001);
-    try std.testing.expectEqual(@as(u32, 20_000), cfg.context.compaction.buffer_tokens);
     try std.testing.expectEqual(@as(u32, 8_000), cfg.context.compaction.keep_recent_tokens);
 }
 
@@ -2333,6 +2328,31 @@ test "parseObject: compaction threshold clamped to valid range" {
     defer cfg.deinit(gpa);
     // Out-of-range threshold keeps the default.
     try std.testing.expectApproxEqAbs(@as(f64, 0.75), cfg.context.compaction.threshold, 0.001);
+}
+
+test "parseCompaction clamps threshold to the 0.90 ceiling" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+
+    // Above the ceiling (0.90): clamped so swap = min(t+0.20, 0.95) stays > t.
+    var high = try parseFile(gpa, "<test>", "{\"context\":{\"compaction\":{\"threshold\":0.97}}}", &sink);
+    defer high.deinit(gpa);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.90), high.context.compaction.threshold, 0.001);
+
+    var maxed = try parseFile(gpa, "<test>", "{\"context\":{\"compaction\":{\"threshold\":1.0}}}", &sink);
+    defer maxed.deinit(gpa);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.90), maxed.context.compaction.threshold, 0.001);
+
+    // In-range values pass through unchanged.
+    var mid = try parseFile(gpa, "<test>", "{\"context\":{\"compaction\":{\"threshold\":0.5}}}", &sink);
+    defer mid.deinit(gpa);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.50), mid.context.compaction.threshold, 0.001);
+
+    // Below the floor keeps the default.
+    var low = try parseFile(gpa, "<test>", "{\"context\":{\"compaction\":{\"threshold\":0.05}}}", &sink);
+    defer low.deinit(gpa);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), low.context.compaction.threshold, 0.001);
 }
 
 test "serialize writes camelCase keys and context section" {
@@ -2441,5 +2461,5 @@ test "applyContextOverlay merges non-default values" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.90), target.compaction.threshold, 0.001);
     // Defaults preserved for fields not in updates.
     try std.testing.expectEqual(true, target.compaction.auto);
-    try std.testing.expectEqual(@as(u32, 20_000), target.compaction.buffer_tokens);
+    try std.testing.expectEqual(@as(u32, 8_000), target.compaction.keep_recent_tokens);
 }

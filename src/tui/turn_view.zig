@@ -68,6 +68,7 @@ pub const TurnView = struct {
             .turn_failed => |message| return try self.applyTurnFailed(gpa, transcript, message),
             .turn_finished => return try self.applyTurnFinished(gpa, transcript),
             .history_compacted => |info| return try self.applyHistoryCompacted(gpa, transcript, info),
+            .compaction_notice => |notice| return try self.applyCompactionNotice(gpa, transcript, notice),
         }
     }
 
@@ -185,6 +186,22 @@ pub const TurnView = struct {
             .{ info.tokens_before, info.tokens_after },
         ) catch "compacted context";
         _ = try transcript.append(gpa, .info, "notice", text);
+        return true;
+    }
+
+    fn applyCompactionNotice(
+        self: *TurnView,
+        gpa: std.mem.Allocator,
+        transcript: *transcript_mod.Transcript,
+        notice: agent_mod.Agent.Event.CompactionNotice,
+    ) !bool {
+        _ = self;
+        const text = switch (notice) {
+            .breaker_tripped => "automatic compaction disabled for this session after 3 failures — use /compact to retry manually",
+            .stuck => "context is full but nothing can be summarized — start a new session or raise context.overrideContextWindow",
+            .waiting => "waiting for background summary before continuing…",
+        };
+        _ = try transcript.append(gpa, .notice, "compaction", text);
         return true;
     }
 
