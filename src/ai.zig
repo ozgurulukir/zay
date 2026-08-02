@@ -75,6 +75,15 @@ pub const Config = struct {
     /// emits tool calls as plain text instead of `tool_calls` deltas.
     /// Default `false` keeps tool-calling working everywhere.
     strict: bool = false,
+    /// Maximum number of retries for transient HTTP errors (429 + 5xx).
+    /// 0 disables retries entirely (single attempt — the legacy behavior).
+    /// Only head-phase statuses are retried; once the response body streams,
+    /// an error is never retried (partial deltas may already be visible).
+    max_retries: u32 = 2,
+    /// Base delay for exponential retry backoff, in milliseconds. The actual
+    /// delay is `base * 2^attempt`, capped; a server-sent `Retry-After` header
+    /// (integer seconds) takes precedence over the backoff.
+    retry_base_delay_ms: u64 = 500,
     account_id: []const u8 = "",
     session_id: []const u8 = "",
     system_prompt: []const u8 = "You are a helpful assistant.",
@@ -424,6 +433,33 @@ pub const ChatMessage = union(enum) {
     }
 };
 
+/// A read-only view of one message destined for the model request.
+///
+/// Unchanged messages are BORROWED straight from the ContextManager — no byte
+/// copy, so base64 images are never duplicated per turn. Only pruned
+/// historical tool messages (older than the keep-recent cutoff) are OWNED
+/// copies produced by `context_assembly.pruneHistoricalToolResultsViews`.
+/// `freePrunedViews` releases only the `.owned` variants.
+///
+/// Borrowed pointers are valid for the duration of the synchronous
+/// `client.prompt` call: the manager appends messages only AFTER the call
+/// returns (`takeAssistantMessage`/`takeToolResults`), never mid-call.
+pub const MessageView = union(enum) {
+    /// Points into the ContextManager's live message list; we do not own it.
+    borrowed: *const ChatMessage,
+    /// A pruned historical tool message; we own it and free it.
+    owned: ChatMessage,
+
+    /// The message this view refers to. `.borrowed` aliases the live message;
+    /// `.owned` is the pruned copy stored in the view.
+    pub fn message(self: *const MessageView) *const ChatMessage {
+        return switch (self.*) {
+            .borrowed => |m| m,
+            .owned => |*m| m,
+        };
+    }
+};
+
 /// Token accounting for one model response, normalized across provider
 /// dialects. Chat Completions reports `prompt_tokens`/`completion_tokens`;
 /// the Responses API reports `input_tokens`/`output_tokens`. We store the
@@ -510,7 +546,7 @@ pub const LanguageModel = union(enum) {
 
     pub fn prompt(
         self: LanguageModel,
-        messages: []const ChatMessage,
+        messages: []const MessageView,
         observer: anytype,
     ) !Turn {
         return switch (self) {

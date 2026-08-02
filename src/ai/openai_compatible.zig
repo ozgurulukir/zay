@@ -4,12 +4,16 @@ const ai = @import("../ai.zig");
 const model_catalog = @import("openai_compatible_models.zig");
 const openai_endpoint = @import("openai_endpoint.zig");
 const stream_parser = @import("stream_parser.zig");
+const tool_schema = @import("tool_schema.zig");
 const tools_common = @import("../tools/common.zig");
 const tools_mod = @import("../tools.zig");
 
 const redirect_buffer_bytes: u32 = 8192;
 const transfer_buffer_bytes: u32 = 4096;
 const body_buffer_bytes: u32 = 4096;
+/// Upper bound on exponential retry backoff, in milliseconds. A server-sent
+/// `Retry-After` header is honored verbatim (not capped here).
+const retry_max_delay_ms: u64 = 8000;
 
 pub const ModelEntry = model_catalog.ModelEntry;
 pub const listModels = model_catalog.listModels;
@@ -68,7 +72,7 @@ pub const Client = struct {
         owned_config.session_id = try gpa.dupe(u8, config.session_id);
         errdefer gpa.free(owned_config.session_id);
 
-        const tools_json = try buildAllToolsJson(gpa, config.tools, config.mcp_tools, null, config.strict);
+        const tools_json = try tool_schema.buildAllToolsJson(gpa, config.tools, config.mcp_tools, null, config.strict, .completions);
         errdefer gpa.free(tools_json);
 
         target.* = .{
@@ -109,7 +113,7 @@ pub const Client = struct {
         registry: ?*tools_mod.ToolRegistry,
         builtin_override: []const tools_common.Tool,
     ) !void {
-        const new_json = try buildAllToolsJson(self.gpa, builtin_override, mcp_tools, registry, self.strict);
+        const new_json = try tool_schema.buildAllToolsJson(self.gpa, builtin_override, mcp_tools, registry, self.strict, .completions);
         self.gpa.free(self.tools_json);
         self.tools_json = new_json;
     }
@@ -136,20 +140,17 @@ pub const Client = struct {
 
     pub fn prompt(
         self: *Client,
-        messages: []const ai.ChatMessage,
+        messages: []const ai.MessageView,
         observer: anytype,
     ) !ai.Turn {
         std.debug.assert(self.url.len > 0);
         self.clearErrorDetail();
 
-        var req = try self.http_client.request(.POST, try std.Uri.parse(self.url), .{
-            .headers = .{
-                .authorization = if (self.authorization) |a| .{ .override = a } else .omit,
-                .content_type = .{ .override = "application/json" },
-            },
-        });
-        defer req.deinit();
-
+        // The payload is serialized ONCE; every retry attempt re-sends the
+        // same bytes. This is safe because retries only happen on head-phase
+        // 429/5xx — the model has not produced anything and no tool has run,
+        // so the request is idempotent. Stream-mid errors are never retried
+        // (partial deltas may already be visible to the observer).
         var payload: std.Io.Writer.Allocating = .init(self.gpa);
         defer payload.deinit();
         try writeRequestPayload(
@@ -164,10 +165,48 @@ pub const Client = struct {
         );
         logger.log("openai_compatible.request POST {s} body={s}", .{ self.url, logBytes(payload.written()) });
 
+        var attempt: u32 = 0;
+        while (attempt <= self.config.max_retries) : (attempt += 1) {
+            var retry_after_secs: ?u64 = null;
+            const turn = self.sendOnce(payload.written(), observer, &retry_after_secs) catch |err| {
+                // Only head-phase transient statuses (429 + 5xx) are retried.
+                // Every other 4xx is permanent — a schema/auth/model error
+                // won't fix itself, and stream-mid errors never surface as
+                // these codes, so they propagate immediately too.
+                if (attempt >= self.config.max_retries) return err;
+                switch (err) {
+                    error.HttpServerError, error.HttpRateLimited => {},
+                    else => return err,
+                }
+                const delay_ms = self.retryDelayMs(attempt, retry_after_secs);
+                logger.log("openai_compatible.retry attempt={d} err={s} delay_ms={d}", .{ attempt + 1, @errorName(err), delay_ms });
+                self.sleepMs(delay_ms);
+                continue;
+            };
+            return turn;
+        }
+        unreachable;
+    }
+
+    /// Perform one HTTP round-trip with the already-serialized payload.
+    /// Transient head-phase statuses (429, 5xx) surface as
+    /// `error.HttpRateLimited` / `error.HttpServerError` so `prompt` can
+    /// decide whether to retry; every other failure propagates unchanged.
+    /// When a retryable status is hit, `retry_after_secs` receives the
+    /// server's `Retry-After` value (integer seconds) if one was sent.
+    fn sendOnce(self: *Client, payload: []const u8, observer: anytype, retry_after_secs: *?u64) !ai.Turn {
+        var req = try self.http_client.request(.POST, try std.Uri.parse(self.url), .{
+            .headers = .{
+                .authorization = if (self.authorization) |a| .{ .override = a } else .omit,
+                .content_type = .{ .override = "application/json" },
+            },
+        });
+        defer req.deinit();
+
         req.transfer_encoding = .chunked;
         var body_buffer: [body_buffer_bytes]u8 = undefined;
         var body_writer = try req.sendBodyUnflushed(&body_buffer);
-        try body_writer.writer.writeAll(payload.written());
+        try body_writer.writer.writeAll(payload);
         try body_writer.end();
         try req.connection.?.flush();
 
@@ -176,6 +215,11 @@ pub const Client = struct {
         const status_code: u16 = @intFromEnum(http_response.head.status);
         logger.log("openai_compatible.response.head status={d}", .{status_code});
         if (status_code >= 400) {
+            // Read `Retry-After` before initializing the body reader — the
+            // head pointers are invalidated once the body stream starts.
+            if (status_code == 429 or status_code >= 500) {
+                retry_after_secs.* = parseRetryAfterSeconds(http_response.head.bytes);
+            }
             var error_buffer: [transfer_buffer_bytes]u8 = undefined;
             const error_reader = http_response.reader(&error_buffer);
             var error_body: std.Io.Writer.Allocating = .init(self.gpa);
@@ -183,6 +227,7 @@ pub const Client = struct {
             _ = error_reader.streamRemaining(&error_body.writer) catch 0;
             logger.log("openai_compatible.response.error status={d} body={s}", .{ status_code, logBytes(error_body.written()) });
             self.recordErrorDetail(status_code, error_body.written());
+            if (status_code == 429) return error.HttpRateLimited;
             if (status_code >= 500) return error.HttpServerError;
             return error.HttpClientError;
         }
@@ -210,7 +255,48 @@ pub const Client = struct {
         const reader = http_response.reader(&transfer_buffer);
         return try stream_parser.readStream(self.gpa, reader, observer, &self.tool_call_seq, self.config.max_parallel_tool_calls);
     }
+
+    /// Delay before a retry: the server's `Retry-After` (integer seconds)
+    /// when present, otherwise exponential backoff `base * 2^attempt` capped
+    /// at `retry_max_delay_ms`. Pure — tested directly.
+    fn retryDelayMs(self: *const Client, attempt: u32, retry_after_secs: ?u64) u64 {
+        if (retry_after_secs) |secs| {
+            // Saturating: an absurd header value must not wrap and stall or
+            // skip the wait.
+            return secs *| std.time.ms_per_s;
+        }
+        // Exponential backoff `base * 2^attempt`, saturating so an absurd
+        // base can't wrap, then capped.
+        var backoff = self.config.retry_base_delay_ms;
+        var i: u32 = 0;
+        while (i < attempt) : (i += 1) backoff *|= 2;
+        return @min(backoff, retry_max_delay_ms);
+    }
+
+    /// Block the worker for the backoff delay. Best-effort — a cancel error
+    /// just falls through (the turn is being torn down anyway).
+    fn sleepMs(self: *const Client, ms: u64) void {
+        if (ms == 0) return;
+        const clamped: i64 = @intCast(@min(ms, std.math.maxInt(i64)));
+        self.io.sleep(std.Io.Duration.fromMilliseconds(clamped), .awake) catch {};
+    }
 };
+
+/// Extract an integer-seconds `Retry-After` value from a raw HTTP head.
+/// HTTP-date formatted values are out of scope and yield null (gateways
+/// practically send integer seconds). Pure — tested directly.
+fn parseRetryAfterSeconds(head_bytes: []const u8) ?u64 {
+    var it = std.mem.splitSequence(u8, head_bytes, "\r\n");
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.ascii.eqlIgnoreCase(name, "retry-after")) continue;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        return std.fmt.parseInt(u64, value, 10) catch null;
+    }
+    return null;
+}
 
 fn logBytes(bytes: []const u8) []const u8 {
     const limit = 12 * 1024;
@@ -268,126 +354,6 @@ test "extractErrorMessage pulls the nested message, plain error, or raw fallback
     const raw = try extractErrorMessage(gpa, "  upstream timeout  ");
     defer gpa.free(raw);
     try std.testing.expectEqualStrings("upstream timeout", raw);
-}
-
-/// Build the OpenAI `tools` JSON array from both builtin tools and MCP tool schemas.
-/// Each adapter owns its own translation; this is the OpenAI version of
-/// "render a Tool into a tools-schema entry."
-/// Substitutes `{{hsep}}` → `~` in each tool's description template.
-fn buildAllToolsJson(
-    gpa: std.mem.Allocator,
-    tools: []const tools_common.Tool,
-    mcp_tools: []const ai.McpToolSchema,
-    registry: ?*tools_mod.ToolRegistry,
-    strict: bool,
-) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(gpa);
-    defer aw.deinit();
-    const writer = &aw.writer;
-    try writer.writeByte('[');
-    var first = true;
-    for (tools) |tool| {
-        if (!first) try writer.writeByte(',');
-        first = false;
-        try writeToolDefinition(gpa, writer, tool.name, tool.description, tool.schema, strict);
-    }
-    if (registry) |r| {
-        const plugin_slice = try r.all(gpa);
-        for (plugin_slice) |tool| {
-            if (!first) try writer.writeByte(',');
-            first = false;
-            try writeToolDefinition(gpa, writer, tool.name, tool.description, tool.schema, strict);
-        }
-    }
-    for (mcp_tools) |mcp| {
-        if (!first) try writer.writeByte(',');
-        first = false;
-        try writeToolDefinition(gpa, writer, mcp.name, mcp.description, mcp.schema, strict);
-    }
-    try writer.writeByte(']');
-    return aw.toOwnedSlice();
-}
-
-fn writeToolDefinition(
-    gpa: std.mem.Allocator,
-    writer: *std.Io.Writer,
-    name: []const u8,
-    description: []const u8,
-    schema: tools_common.Schema,
-    strict: bool,
-) !void {
-    const desc = try std.mem.replaceOwned(u8, gpa, description, "{{hsep}}", "~");
-    defer gpa.free(desc);
-    try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
-    try std.json.Stringify.value(name, .{}, writer);
-    try writer.writeAll(",\"description\":");
-    try std.json.Stringify.value(desc, .{}, writer);
-    // Strict structured-outputs mode is OpenAI-only. Gateways that don't
-    // support it silently break function-calling, so it's opt-in via
-    // `ai.Config.strict`. The leading comma is always written so the next
-    // `parameters` key is a valid object member regardless of strict.
-    if (strict) {
-        try writer.writeAll(",\"strict\":true,\"parameters\":");
-    } else {
-        try writer.writeAll(",\"parameters\":");
-    }
-    try writer.writeAll("{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{");
-    for (schema.properties, 0..) |prop, p| {
-        if (p > 0) try writer.writeByte(',');
-        try std.json.Stringify.value(prop.name, .{}, writer);
-        try writer.writeAll(":{\"type\":");
-        const kind_str: []const u8 = switch (prop.kind) {
-            .string => "string",
-            .integer => "integer",
-            .number => "number",
-            .object => "object",
-            .array => "array",
-            .boolean => "boolean",
-        };
-        if (prop.nullable or !prop.required) {
-            try std.json.Stringify.value(&[_][]const u8{ kind_str, "null" }, .{}, writer);
-        } else {
-            try std.json.Stringify.value(kind_str, .{}, writer);
-        }
-        try writer.writeAll(",\"description\":");
-        try std.json.Stringify.value(prop.description, .{}, writer);
-        // Emit enum constraint when present.
-        if (prop.enum_values) |ev| {
-            if (ev.len > 0) {
-                try writer.writeAll(",\"enum\":[");
-                for (ev, 0..) |v, ei| {
-                    if (ei > 0) try writer.writeByte(',');
-                    try std.json.Stringify.value(v, .{}, writer);
-                }
-                try writer.writeByte(']');
-            }
-        }
-        // Emit default value when present (already a raw JSON fragment).
-        if (prop.default_value) |dv| {
-            try writer.writeAll(",\"default\":");
-            try writer.writeAll(dv);
-        }
-        if (prop.kind == .object) {
-            try writer.writeAll(",\"additionalProperties\":true");
-        } else if (prop.kind == .array) {
-            try writer.writeAll(",\"items\":{}");
-        }
-        try writer.writeByte('}');
-    }
-    // In strict mode OpenAI requires EVERY property in `required` (optional
-    // ones are made nullable above). Outside strict mode list only the
-    // genuinely-required properties so optional parameters stay optional —
-    // listing all of them forces the model to fill every field.
-    try writer.writeAll("},\"required\":[");
-    var required_first = true;
-    for (schema.properties) |prop| {
-        // Strict mode: all properties required. Non-strict: only required ones.
-        if (!strict and !prop.required) continue;
-        if (!required_first) try writer.writeByte(',');
-        required_first = false;
-        try std.json.Stringify.value(prop.name, .{}, writer);
-    }
-    try writer.writeAll("]}}}");
 }
 
 fn writeMessage(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMessage) !void {
@@ -513,7 +479,7 @@ fn writeRequestPayload(
     out: *std.Io.Writer,
     model: []const u8,
     session_id: []const u8,
-    messages: []const ai.ChatMessage,
+    messages: []const ai.MessageView,
     tools_json: []const u8,
     reasoning: ?ai.Reasoning,
     max_output_tokens: ?u32,
@@ -524,9 +490,9 @@ fn writeRequestPayload(
     try out.writeAll("{\"model\":");
     try std.json.Stringify.value(model, .{}, out);
     try out.writeAll(",\"messages\":[");
-    for (messages, 0..) |message, index| {
+    for (messages, 0..) |*view, index| {
         if (index > 0) try out.writeByte(',');
-        try writeMessage(out, gpa, message);
+        try writeMessage(out, gpa, view.message().*);
     }
     // `stream_options.include_usage` makes the server emit a final usage-only
     // chunk (empty `choices`) before `[DONE]`. Without it, streaming responses
@@ -576,7 +542,7 @@ fn writeRequestPayload(
 test "buildToolsJson produces a valid JSON array for the registry" {
     const tools = @import("../tools.zig");
     const gpa = std.testing.allocator;
-    const json = try buildAllToolsJson(gpa, tools.builtinRegistry(), &.{}, null, true);
+    const json = try tool_schema.buildAllToolsJson(gpa, tools.builtinRegistry(), &.{}, null, true, .completions);
     defer gpa.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
     defer parsed.deinit();
@@ -598,7 +564,7 @@ test "buildToolsJson substitutes {{hsep}} placeholders with ~" {
             .display = undefined,
         },
     };
-    const json = try buildAllToolsJson(gpa, &tools, &.{}, null, false);
+    const json = try tool_schema.buildAllToolsJson(gpa, &tools, &.{}, null, false, .completions);
     defer gpa.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "uses ~ marker") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "{{hsep}}") == null);
@@ -622,7 +588,7 @@ test "buildAllToolsJson includes MCP tools alongside builtin tools" {
             .schema = .{ .properties = &.{} },
         },
     };
-    const json = try buildAllToolsJson(gpa, &tools, &mcp_tools, null, false);
+    const json = try tool_schema.buildAllToolsJson(gpa, &tools, &mcp_tools, null, false, .completions);
     defer gpa.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
     defer parsed.deinit();
@@ -772,7 +738,7 @@ test "buildToolsJson emits strict schema with nullable union types for optional 
             .display = undefined,
         },
     };
-    const json = try buildAllToolsJson(gpa, &tools, &.{}, null, true);
+    const json = try tool_schema.buildAllToolsJson(gpa, &tools, &.{}, null, true, .completions);
     defer gpa.free(json);
 
     // Top-level strict marker and top-level additionalProperties:false
@@ -826,7 +792,7 @@ test "buildToolsJson omits strict mode and filters required when strict is false
             .display = undefined,
         },
     };
-    const json = try buildAllToolsJson(gpa, &tools, &.{}, null, false);
+    const json = try tool_schema.buildAllToolsJson(gpa, &tools, &.{}, null, false, .completions);
     defer gpa.free(json);
 
     // No strict marker.
@@ -847,7 +813,7 @@ test "buildToolsJson omits strict mode and filters required when strict is false
             .display = undefined,
         },
     };
-    const json2 = try buildAllToolsJson(gpa, &no_required_tools, &.{}, null, false);
+    const json2 = try tool_schema.buildAllToolsJson(gpa, &no_required_tools, &.{}, null, false, .completions);
     defer gpa.free(json2);
     try std.testing.expect(std.mem.indexOf(u8, json2, "\"required\":[]") != null);
 }
@@ -868,7 +834,7 @@ test "buildToolsJson preserves nested object additionalProperties for free-form 
             .display = undefined,
         },
     };
-    const json = try buildAllToolsJson(gpa, &tools, &.{}, null, true);
+    const json = try tool_schema.buildAllToolsJson(gpa, &tools, &.{}, null, true, .completions);
     defer gpa.free(json);
 
     // Top-level parameters object is strict
@@ -988,10 +954,14 @@ test "writeRequestPayload serializes tool call ids as strings, not objects" {
 
     var messages = [_]ai.ChatMessage{ assistant_msg, tool_msg };
     defer for (&messages) |*m| m.deinit(gpa);
+    const views = [_]ai.MessageView{
+        .{ .borrowed = &messages[0] },
+        .{ .borrowed = &messages[1] },
+    };
 
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "test-model", "", messages[0..], "[{\"type\":\"function\"}]", null, null);
+    try writeRequestPayload(gpa, &payload.writer, "test-model", "", &views, "[{\"type\":\"function\"}]", null, null);
     const body = payload.written();
 
     // The tool_call id must be a JSON string, not an object
@@ -1370,4 +1340,230 @@ test "parse streaming duplicate ID across indices merges into one builder" {
     try std.testing.expectEqual(@as(usize, 1), with_args);
     try std.testing.expectEqualStrings("bash", stream.builders.items[0].name.items);
     try std.testing.expectEqualStrings("{\"command\":\"ls\"}", stream.builders.items[0].arguments.items);
+}
+
+// ── Retry / backoff ───────────────────────────────────────────────────────
+
+test "parseRetryAfterSeconds extracts integer seconds from a head" {
+    try std.testing.expectEqual(@as(?u64, 5), parseRetryAfterSeconds("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 5\r\nContent-Length: 0\r\n\r\n"));
+    // Header name is case-insensitive.
+    try std.testing.expectEqual(@as(?u64, 2), parseRetryAfterSeconds("HTTP/1.1 503 Service Unavailable\r\nretry-after: 2\r\n\r\n"));
+    // Missing header → null.
+    try std.testing.expectEqual(@as(?u64, null), parseRetryAfterSeconds("HTTP/1.1 200 OK\r\n\r\n"));
+    // HTTP-date value → null (integer seconds only, per scope).
+    try std.testing.expectEqual(@as(?u64, null), parseRetryAfterSeconds("HTTP/1.1 429 Too Many Requests\r\nRetry-After: Wed, 21 Oct 2026 07:28:00 GMT\r\n\r\n"));
+}
+
+test "retryDelayMs honors Retry-After over backoff and caps exponential growth" {
+    const gpa = std.testing.allocator;
+    var client: Client = undefined;
+    try client.init(gpa, std.testing.io, .{
+        .base_url = "http://127.0.0.1:1/v1",
+        .api_key = "test-key",
+        .model = "test-model",
+        .tools = &.{},
+        .mcp_tools = &.{},
+    });
+    defer client.deinit();
+
+    // Retry-After wins regardless of the attempt count.
+    try std.testing.expectEqual(@as(u64, 3000), client.retryDelayMs(0, 3));
+    try std.testing.expectEqual(@as(u64, 3000), client.retryDelayMs(5, 3));
+    // Without the header: base * 2^attempt, capped at 8000ms.
+    try std.testing.expectEqual(@as(u64, 500), client.retryDelayMs(0, null));
+    try std.testing.expectEqual(@as(u64, 1000), client.retryDelayMs(1, null));
+    try std.testing.expectEqual(@as(u64, 2000), client.retryDelayMs(2, null));
+    try std.testing.expectEqual(@as(u64, 4000), client.retryDelayMs(3, null));
+    try std.testing.expectEqual(@as(u64, 8000), client.retryDelayMs(4, null)); // capped
+    try std.testing.expectEqual(@as(u64, 8000), client.retryDelayMs(10, null)); // stays capped
+}
+
+/// Minimal blocking HTTP server for retry tests. Serves exactly one canned
+/// response per accepted connection (each `Connection: close`), on a
+/// dedicated thread. The ephemeral port comes from `server.socket.address`.
+const MockRetryServer = struct {
+    const Response = struct {
+        status: std.http.Status,
+        retry_after: ?[]const u8 = null,
+        body: []const u8 = "",
+    };
+
+    io: std.Io,
+    server: std.Io.net.Server,
+    responses: []const Response,
+    connection_count: std.atomic.Value(u32) = .init(0),
+
+    fn init(io: std.Io, responses: []const Response) !MockRetryServer {
+        const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        const server = try addr.listen(io, .{ .reuse_address = true });
+        return .{ .io = io, .server = server, .responses = responses };
+    }
+
+    fn deinit(self: *MockRetryServer) void {
+        self.server.deinit(self.io);
+    }
+
+    fn port(self: *const MockRetryServer) u16 {
+        return self.server.socket.address.ip4.port;
+    }
+
+    fn serve(self: *MockRetryServer) void {
+        var read_buf: [8192]u8 = undefined;
+        var write_buf: [8192]u8 = undefined;
+        for (self.responses) |resp| {
+            var stream = self.server.accept(self.io) catch return;
+            defer stream.close(self.io);
+            _ = self.connection_count.fetchAdd(1, .monotonic);
+            var reader = stream.reader(self.io, &read_buf);
+            var writer = stream.writer(self.io, &write_buf);
+            var http_server = std.http.Server.init(&reader.interface, &writer.interface);
+            var request = http_server.receiveHead() catch return;
+            var extra: [1]std.http.Header = undefined;
+            const headers: []const std.http.Header = if (resp.retry_after) |ra| blk: {
+                extra[0] = .{ .name = "Retry-After", .value = ra };
+                break :blk &extra;
+            } else &.{};
+            request.respond(resp.body, .{
+                .status = resp.status,
+                .keep_alive = false,
+                .extra_headers = headers,
+            }) catch return;
+        }
+    }
+};
+
+const ok_sse_body =
+    "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n" ++
+    "data: [DONE]\n";
+
+fn retryTestClient(gpa: std.mem.Allocator, io: std.Io, port: u16) !Client {
+    const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/v1", .{port});
+    errdefer gpa.free(base_url);
+    var client: Client = undefined;
+    try client.init(gpa, io, .{
+        .base_url = base_url,
+        .api_key = "test-key",
+        .model = "test-model",
+        .tools = &.{},
+        .mcp_tools = &.{},
+        // No sleeping between retries in tests.
+        .retry_base_delay_ms = 0,
+    });
+    // `init` deep-copies the config (including the request URL) — the
+    // temporary base_url is not retained, so free it.
+    gpa.free(base_url);
+    return client;
+}
+
+test "prompt retries a transient 503 and succeeds" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server = try MockRetryServer.init(io, &.{
+        .{ .status = .service_unavailable },
+        .{ .status = .ok, .body = ok_sse_body },
+    });
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, MockRetryServer.serve, .{&server});
+    defer thread.join();
+
+    var client = try retryTestClient(gpa, io, server.port());
+    defer client.deinit();
+
+    var turn = try client.prompt(&.{}, ai.streamNoop());
+    defer turn.deinit(gpa);
+    // Two connections: the failed 503 attempt plus the successful retry.
+    try std.testing.expectEqual(@as(u32, 2), server.connection_count.load(.monotonic));
+    try std.testing.expectEqualStrings("hi", turn.assistant.assistant.content[0].text.text);
+}
+
+test "prompt retries a 429 and honors Retry-After" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server = try MockRetryServer.init(io, &.{
+        .{ .status = .too_many_requests, .retry_after = "0" },
+        .{ .status = .ok, .body = ok_sse_body },
+    });
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, MockRetryServer.serve, .{&server});
+    defer thread.join();
+
+    var client = try retryTestClient(gpa, io, server.port());
+    defer client.deinit();
+
+    var turn = try client.prompt(&.{}, ai.streamNoop());
+    defer turn.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 2), server.connection_count.load(.monotonic));
+    try std.testing.expectEqualStrings("hi", turn.assistant.assistant.content[0].text.text);
+}
+
+test "prompt does not retry a permanent 4xx" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server = try MockRetryServer.init(io, &.{
+        .{ .status = .bad_request },
+    });
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, MockRetryServer.serve, .{&server});
+    defer thread.join();
+
+    var client = try retryTestClient(gpa, io, server.port());
+    defer client.deinit();
+
+    try std.testing.expectError(error.HttpClientError, client.prompt(&.{}, ai.streamNoop()));
+    // Exactly one attempt — 4xx is permanent.
+    try std.testing.expectEqual(@as(u32, 1), server.connection_count.load(.monotonic));
+}
+
+test "prompt with max_retries 0 makes a single attempt on a transient 5xx" {
+    // Kill-switch regression: max_retries = 0 must reproduce the legacy
+    // single-attempt behavior even for otherwise-retryable 5xx errors.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server = try MockRetryServer.init(io, &.{
+        .{ .status = .internal_server_error },
+    });
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, MockRetryServer.serve, .{&server});
+    defer thread.join();
+
+    const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/v1", .{server.port()});
+    defer gpa.free(base_url);
+    var client: Client = undefined;
+    try client.init(gpa, io, .{
+        .base_url = base_url,
+        .api_key = "test-key",
+        .model = "test-model",
+        .tools = &.{},
+        .mcp_tools = &.{},
+        .max_retries = 0,
+    });
+    defer client.deinit();
+
+    try std.testing.expectError(error.HttpServerError, client.prompt(&.{}, ai.streamNoop()));
+    try std.testing.expectEqual(@as(u32, 1), server.connection_count.load(.monotonic));
+}
+
+test "prompt exhausts retries on a persistent 5xx" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Default max_retries = 2 → three attempts total.
+    var server = try MockRetryServer.init(io, &.{
+        .{ .status = .internal_server_error },
+        .{ .status = .internal_server_error },
+        .{ .status = .internal_server_error },
+    });
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, MockRetryServer.serve, .{&server});
+    defer thread.join();
+
+    var client = try retryTestClient(gpa, io, server.port());
+    defer client.deinit();
+
+    try std.testing.expectError(error.HttpServerError, client.prompt(&.{}, ai.streamNoop()));
+    try std.testing.expectEqual(@as(u32, 3), server.connection_count.load(.monotonic));
 }

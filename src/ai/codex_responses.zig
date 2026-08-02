@@ -65,7 +65,7 @@ pub const Client = struct {
         try self.core_client.updateMcpTools(mcp_tools, registry, builtin_override);
     }
 
-    pub fn prompt(self: *Client, messages: []const ai.ChatMessage, observer: anytype) !ai.Turn {
+    pub fn prompt(self: *Client, messages: []const ai.MessageView, observer: anytype) !ai.Turn {
         var bridge: ObserverBridge(@TypeOf(observer)) = .{ .observer = observer };
         return self.promptWebSocket(messages, bridge.streamObserver()) catch |err| {
             logger.log("codex.websocket.failure emitted={} error={s}", .{ bridge.emitted, @errorName(err) });
@@ -74,7 +74,7 @@ pub const Client = struct {
         };
     }
 
-    fn promptWebSocket(self: *Client, messages: []const ai.ChatMessage, observer: anytype) !ai.Turn {
+    fn promptWebSocket(self: *Client, messages: []const ai.MessageView, observer: anytype) !ai.Turn {
         const gpa = self.core_client.gpa;
         const endpoint = try parseWebSocketEndpoint(gpa, self.core_client.url);
         defer endpoint.deinit(gpa);

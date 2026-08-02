@@ -80,7 +80,7 @@ fn requestSlug(gpa: std.mem.Allocator, job: *BranchJob) !?[]u8 {
     var message: ai.ChatMessage = .{ .user = .{ .content = blocks } };
     defer message.deinit(gpa);
 
-    var turn = try job.client.prompt(&.{message}, ai.streamNoop());
+    var turn = try job.client.prompt(&.{.{ .borrowed = &message }}, ai.streamNoop());
     defer turn.deinit(gpa);
 
     var out: std.ArrayList(u8) = .empty;

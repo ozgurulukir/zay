@@ -26,7 +26,7 @@ pub const Client = struct {
         try self.core_client.updateMcpTools(mcp_tools, registry, builtin_override);
     }
 
-    pub fn prompt(self: *Client, messages: []const ai.ChatMessage, observer: anytype) !ai.Turn {
+    pub fn prompt(self: *Client, messages: []const ai.MessageView, observer: anytype) !ai.Turn {
         return self.core_client.prompt(messages, observer);
     }
 };

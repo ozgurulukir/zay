@@ -118,20 +118,11 @@ pub fn assembleSystemPrompt(
     return out.toOwnedSlice();
 }
 
-/// Prunes historical tool results in conversation history before sending to the model.
-/// Keeps recent tool turns (`keep_recent_tool_turns`) in full, while capping older tool output text
-/// at `historical_tool_cap_bytes`. Leaves tool call IDs, roles, labels, and failed flags intact.
-/// Caller owns the returned slice and must free with `freePrunedMessages`.
-pub fn pruneHistoricalToolResults(
-    gpa: std.mem.Allocator,
-    messages: []const ai.ChatMessage,
-    keep_recent_tool_turns: u32,
-    historical_tool_cap_bytes: u32,
-) ![]ai.ChatMessage {
-    var result = try gpa.alloc(ai.ChatMessage, messages.len);
-    errdefer gpa.free(result);
-
-    // Count tool result turns backwards to find cutoff
+/// Count tool result turns backwards from the end of `messages` and return the
+/// index at which historical pruning begins: everything at `idx < cutoff` is a
+/// tool turn older than the `keep_recent_tool_turns` most recent ones.
+/// Messages at `>= cutoff` are kept in full.
+fn computeCutoff(messages: []const ai.ChatMessage, keep_recent_tool_turns: u32) usize {
     var tool_turns_seen: u32 = 0;
     var cutoff_index: usize = messages.len;
     var i: usize = messages.len;
@@ -144,23 +135,45 @@ pub fn pruneHistoricalToolResults(
             }
         }
     }
-
-    // Copy messages; prune tool output text if before cutoff_index
-    for (messages, 0..) |msg, idx| {
-        if (idx < cutoff_index and msg == .tool) {
-            result[idx] = try pruneSingleToolMessage(gpa, msg, historical_tool_cap_bytes);
-        } else {
-            result[idx] = try cloneChatMessage(gpa, msg);
-        }
-    }
-
-    return result;
+    return cutoff_index;
 }
 
-/// Free a message slice allocated by `pruneHistoricalToolResults`.
-pub fn freePrunedMessages(gpa: std.mem.Allocator, messages: []ai.ChatMessage) void {
-    for (messages) |*msg| msg.deinit(gpa);
-    gpa.free(messages);
+/// Borrow-based view of the pruned history. Unchanged messages BORROW from
+/// `messages` — no byte copy, so base64 images are never duplicated per turn —
+/// and only historical tool messages older than the cutoff become owned pruned
+/// copies. Caller owns the returned slice and must free with `freePrunedViews`.
+///
+/// Safe while `messages` is stable: the caller (`Agent.run`) holds the
+/// ContextManager list and does not append between building the views and the
+/// synchronous `client.prompt` returning.
+pub fn pruneHistoricalToolResultsViews(
+    gpa: std.mem.Allocator,
+    messages: []const ai.ChatMessage,
+    keep_recent_tool_turns: u32,
+    historical_tool_cap_bytes: u32,
+) ![]ai.MessageView {
+    const views = try gpa.alloc(ai.MessageView, messages.len);
+    errdefer gpa.free(views);
+    const cutoff_index = computeCutoff(messages, keep_recent_tool_turns);
+    for (messages, 0..) |*msg, idx| {
+        if (idx < cutoff_index and msg.* == .tool) {
+            views[idx] = .{ .owned = try pruneSingleToolMessage(gpa, msg.*, historical_tool_cap_bytes) };
+        } else {
+            views[idx] = .{ .borrowed = msg };
+        }
+    }
+    return views;
+}
+
+/// Free a view slice produced by `pruneHistoricalToolResultsViews`. Only the
+/// `.owned` pruned copies are released; borrowed views point into the
+/// ContextManager and are left untouched.
+pub fn freePrunedViews(gpa: std.mem.Allocator, views: []ai.MessageView) void {
+    for (views) |*view| switch (view.*) {
+        .owned => |*m| m.deinit(gpa),
+        .borrowed => {},
+    };
+    gpa.free(views);
 }
 
 /// Compute context budget breakdown for a message history against a target window.
@@ -246,41 +259,6 @@ fn pruneSingleToolMessage(gpa: std.mem.Allocator, msg: ai.ChatMessage, cap_bytes
     };
 }
 
-fn cloneChatMessage(gpa: std.mem.Allocator, msg: ai.ChatMessage) !ai.ChatMessage {
-    switch (msg) {
-        .system => |m| {
-            const blocks = try cloneBlocks(gpa, m.content);
-            return .{ .system = .{ .content = blocks } };
-        },
-        .user => |m| {
-            const blocks = try cloneBlocks(gpa, m.content);
-            return .{ .user = .{ .content = blocks } };
-        },
-        .assistant => |m| {
-            const blocks = try cloneBlocks(gpa, m.content);
-            return .{ .assistant = .{ .content = blocks } };
-        },
-        .tool => |m| {
-            const blocks = try cloneBlocks(gpa, m.content);
-            return .{ .tool = .{
-                .content = blocks,
-                .call_id = .{ .value = try gpa.dupe(u8, m.call_id.slice()) },
-                .display_label = if (m.display_label) |l| try gpa.dupe(u8, l) else null,
-                .failed = m.failed,
-            } };
-        },
-    }
-}
-
-fn cloneBlocks(gpa: std.mem.Allocator, content: []const ai.ContentBlock) ![]ai.ContentBlock {
-    const blocks = try gpa.alloc(ai.ContentBlock, content.len);
-    errdefer gpa.free(blocks);
-    for (content, 0..) |block, i| {
-        blocks[i] = try cloneContentBlock(gpa, block);
-    }
-    return blocks;
-}
-
 fn cloneContentBlock(gpa: std.mem.Allocator, block: ai.ContentBlock) !ai.ContentBlock {
     return switch (block) {
         .text => |t| .{ .text = .{ .text = try gpa.dupe(u8, t.text) } },
@@ -350,7 +328,7 @@ test "assembleSystemPrompt appends plugin prompts block" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Always confirm before overwrite.") != null);
 }
 
-test "pruneHistoricalToolResults caps old tool outputs while preserving recent ones" {
+test "pruneHistoricalToolResultsViews caps old tool outputs while preserving recent ones" {
     const gpa = std.testing.allocator;
 
     var messages: [6]ai.ChatMessage = undefined;
@@ -363,19 +341,54 @@ test "pruneHistoricalToolResults caps old tool outputs while preserving recent o
     defer for (&messages) |*m| m.deinit(gpa);
 
     // Keep recent 2 tool turns intact, prune older tools at 100 bytes
-    const pruned = try pruneHistoricalToolResults(gpa, &messages, 2, 100);
-    defer freePrunedMessages(gpa, pruned);
+    const pruned = try pruneHistoricalToolResultsViews(gpa, &messages, 2, 100);
+    defer freePrunedViews(gpa, pruned);
 
     try std.testing.expectEqual(@as(usize, 6), pruned.len);
-    // Historical tool 1 (index 1) should be truncated
-    const t1_text = pruned[1].tool.content[0].text.text;
+    // Historical tool 1 (index 1) should be owned and truncated
+    try std.testing.expect(pruned[1] == .owned);
+    const t1_text = pruned[1].owned.tool.content[0].text.text;
     try std.testing.expect(std.mem.indexOf(u8, t1_text, "historical tool output truncated") != null);
-
     try std.testing.expect(t1_text.len < 300);
 
-    // Recent tool 1 (index 3) should be full length
-    const t3_text = pruned[3].tool.content[0].text.text;
+    // Recent tool 1 (index 3) should be borrowed and kept in full
+    try std.testing.expect(pruned[3] == .borrowed);
+    const t3_text = pruned[3].borrowed.tool.content[0].text.text;
     try std.testing.expectEqual(@as(usize, 2000), t3_text.len);
+}
+
+test "pruneHistoricalToolResultsViews borrows unchanged messages without copying" {
+    // The zero-copy contract: an image user message must be BORROWED with
+    // pointer identity (its base64 bytes are never re-duped), while a
+    // historical tool message older than the cutoff becomes an owned pruned
+    // copy. Recent tool messages are borrowed in full.
+    const gpa = std.testing.allocator;
+
+    var messages: [3]ai.ChatMessage = undefined;
+    messages[0] = try makeToolMessage(gpa, "c_old", "a" ** 2000); // historical (over cap)
+    messages[1] = try makeImageUserMessage(gpa); // image user message
+    messages[2] = try makeToolMessage(gpa, "c_new", "b" ** 2000); // recent tool
+    defer for (&messages) |*m| m.deinit(gpa);
+
+    const views = try pruneHistoricalToolResultsViews(gpa, &messages, 1, 100);
+    defer freePrunedViews(gpa, views);
+
+    try std.testing.expectEqual(@as(usize, 3), views.len);
+
+    // Historical tool message → owned, pruned.
+    try std.testing.expect(views[0] == .owned);
+    const pruned_text = views[0].owned.tool.content[0].text.text;
+    try std.testing.expect(std.mem.indexOf(u8, pruned_text, "historical tool output truncated") != null);
+
+    // Image user message → borrowed with pointer identity: no copy was made.
+    try std.testing.expect(views[1] == .borrowed);
+    try std.testing.expect(views[1].borrowed == &messages[1]);
+    const image = views[1].borrowed.user.content[0].image;
+    try std.testing.expect(image.data_base64.ptr == messages[1].user.content[0].image.data_base64.ptr);
+
+    // Recent tool message → borrowed, kept in full.
+    try std.testing.expect(views[2] == .borrowed);
+    try std.testing.expectEqual(@as(usize, 2000), views[2].borrowed.tool.content[0].text.text.len);
 }
 
 test "calculateBudget returns accurate token breakdown" {
@@ -403,6 +416,16 @@ fn makeTextMessage(gpa: std.mem.Allocator, role: ai.Role, text: []const u8) !ai.
         .assistant => .{ .assistant = .{ .content = blocks } },
         .tool => error.InvalidToolRole,
     };
+}
+
+fn makeImageUserMessage(gpa: std.mem.Allocator) !ai.ChatMessage {
+    const blocks = try gpa.alloc(ai.ContentBlock, 1);
+    errdefer gpa.free(blocks);
+    blocks[0] = .{ .image = .{
+        .mime_type = try gpa.dupe(u8, "image/png"),
+        .data_base64 = try gpa.dupe(u8, "QUJD"),
+    } };
+    return .{ .user = .{ .content = blocks } };
 }
 
 fn makeToolMessage(gpa: std.mem.Allocator, call_id: []const u8, text: []const u8) !ai.ChatMessage {

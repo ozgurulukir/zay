@@ -367,13 +367,13 @@ pub const Agent = struct {
                 .listener = l,
             };
             defer stream_context.deinit();
-            const prompt_messages = try context_assembly.pruneHistoricalToolResults(
+            const prompt_messages = try context_assembly.pruneHistoricalToolResultsViews(
                 self.gpa,
                 self.messages(),
                 context_assembly.default_keep_recent_tool_turns,
                 context_assembly.default_historical_tool_cap_bytes,
             );
-            defer context_assembly.freePrunedMessages(self.gpa, prompt_messages);
+            defer context_assembly.freePrunedViews(self.gpa, prompt_messages);
 
             var turn = try self.client.prompt(prompt_messages, stream_context.observer());
             const usage = turn.usage;
