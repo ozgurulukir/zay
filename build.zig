@@ -109,6 +109,10 @@ pub fn build(b: *std.Build) void {
     });
 
     mod.link_libc = true;
+    // C UB sanitizer for Debug builds: traps at the exact instruction on
+    // undefined behavior in sqlite3.c / lua, giving a precise crash site
+    // for gdb without needing the UBSan runtime library.
+    if (optimize == .Debug) mod.sanitize_c = .trap;
     mod.addIncludePath(b.path("vendor/lua"));
     // Native keychain backends (src/keyring.zig): Windows Credential Manager
     // lives in advapi32; macOS Keychain Services needs Security (+ CoreFoundation

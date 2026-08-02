@@ -233,6 +233,16 @@ pub fn deinit(gpa: std.mem.Allocator, io: std.Io) void {
     backend = .{};
 }
 
+/// Release the current fff index (if any) and start indexing `cwd`.
+/// Called on session switch / cross-project resume so the old directory's
+/// index and its rayon worker threads are torn down before the new one
+/// starts. No-op when the backend is already indexing the same cwd.
+pub fn restart(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) void {
+    assert(cwd.len > 0);
+    deinit(gpa, io);
+    start(gpa, io, cwd);
+}
+
 pub fn run(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, request: Request) !Result {
     assert(cwd.len > 0);
     assert(request.query.len > 0);

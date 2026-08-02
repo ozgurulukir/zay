@@ -8,12 +8,15 @@ const agent_mod = @import("../agent.zig");
 const tools_mod = @import("../tools.zig");
 const transcript_mod = @import("../transcript.zig");
 const runtime_mod = @import("../runtime.zig");
+const search_mod = @import("../search.zig");
 
 const App = tui.App;
 
 pub fn installRuntime(app: *App, runtime: *runtime_mod.AgentRuntime) !void {
     if (app.thread.turn.isActive()) return error.InFlightTurn;
     app.cancelLaneNaming(app.thread);
+    // Compare before destroying: the old cwd is freed by deinit.
+    const cwd_changed = if (app.liveRuntime()) |old| !std.mem.eql(u8, old.cwd, runtime.cwd) else true;
     if (app.liveRuntime()) |old| {
         // Before destroying the old runtime, reset vxfw focus to the root
         // widget. The focused TextField's userdata points into the old
@@ -28,6 +31,11 @@ pub fn installRuntime(app: *App, runtime: *runtime_mod.AgentRuntime) !void {
         old.deinit();
         app.gpa.destroy(old);
     }
+    // Tear down the stale fff index and re-index the new project directory.
+    // The old index's rayon worker threads keep scanning the previous cwd
+    // until destroyed; releasing here prevents stale search results and
+    // frees the embedding memory before the new index allocates.
+    if (cwd_changed) search_mod.restart(app.gpa, app.io, runtime.cwd);
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = true } };
     app.thread.agent = &runtime.agent;
     app.thread.id = runtime.session_writer.session.id;

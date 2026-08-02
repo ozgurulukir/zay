@@ -180,6 +180,13 @@ pub const AgentRuntime = struct {
 
         const owned_base_system_prompt = try gpa.dupe(u8, base_system_prompt);
         errdefer gpa.free(owned_base_system_prompt);
+        // `cwd` is borrowed from callers that may free it — a cross-project
+        // resume hands us `summary.cwd`, and the next `reloadResumeSessions`
+        // frees the summaries via `resumeClear`. Own it so the runtime's
+        // workspace path can't dangle underneath later reads (e.g. the resume
+        // picker's `bindText(1, cwd)`, which sqlite_transient copies at bind).
+        const owned_cwd = try gpa.dupe(u8, cwd);
+        errdefer gpa.free(owned_cwd);
         // A `template` (the primary lane) shares the same project, so clone its
         // already-loaded skills + plugin prompts + assembled system prompt
         // instead of re-scanning the workspace (which is a checkout of the same repo).
@@ -193,7 +200,7 @@ pub const AgentRuntime = struct {
         target.* = .{
             .gpa = gpa,
             .io = io,
-            .cwd = cwd,
+            .cwd = owned_cwd,
             .home_dir = home_dir,
             .client = .none,
             .base_system_prompt = owned_base_system_prompt,
@@ -387,6 +394,9 @@ pub const AgentRuntime = struct {
         self.session_writer.deinit();
         self.gpa.free(self.base_system_prompt);
         self.gpa.free(self.system_prompt);
+        // `cwd` is runtime-owned (duped in initSession); `home_dir` is borrowed
+        // from the root config and lives until the app exits — not freed here.
+        self.gpa.free(self.cwd);
         skill_mod.deinitAll(self.gpa, self.skills);
         plugin_prompt.deinitAll(self.gpa, self.plugin_prompts);
         // `agent.deinit` above joined the summarizer thread, so its client is

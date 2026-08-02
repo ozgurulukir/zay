@@ -75,7 +75,7 @@ pub const Connection = struct {
 
     pub fn prepare(self: *Connection, sql: []const u8) Error!Statement {
         assert(sql.len > 0);
-        var sql_buffer: [64 * 1024:0]u8 = undefined;
+        var sql_buffer: [4096:0]u8 = undefined;
         if (sql.len >= sql_buffer.len) return error.Misuse;
         @memcpy(sql_buffer[0..sql.len], sql);
         sql_buffer[sql.len] = 0;
@@ -141,12 +141,12 @@ pub const Statement = struct {
     pub fn bindText(self: *Statement, index: i32, value: []const u8) Error!void {
         assert(index > 0);
         const len = std.math.cast(c_int, value.len) orelse return error.Misuse;
-        try self.check(c.sqlite3_bind_text(self.handle, index, value.ptr, len, sqlite_static));
+        try self.check(c.sqlite3_bind_text(self.handle, index, value.ptr, len, sqlite_transient));
     }
 
     pub fn bindBlob(self: *Statement, index: i32, value: []const u8) Error!void {
         assert(index > 0);
-        try self.check(c.sqlite3_bind_blob(self.handle, index, value.ptr, @intCast(value.len), sqlite_static));
+        try self.check(c.sqlite3_bind_blob(self.handle, index, value.ptr, @intCast(value.len), sqlite_transient));
     }
 
     pub fn bindValue(self: *Statement, index: i32, value: Value) Error!void {
@@ -265,7 +265,10 @@ pub const ColumnType = enum {
     }
 };
 
-const sqlite_static: ?*const fn (?*anyopaque) callconv(.c) void = null;
+/// SQLITE_TRANSIENT ((sqlite3_destructor_type)-1): SQLite copies the bound
+/// content immediately. Eliminates the entire class of dangling-pointer bugs
+/// where the caller's buffer is freed or reallocated between bind and step.
+const sqlite_transient: ?*const fn (?*anyopaque) callconv(.c) void = @ptrFromInt(std.math.maxInt(usize));
 
 test "open in-memory database and query row" {
     var connection = try Connection.open(":memory:", .{});
