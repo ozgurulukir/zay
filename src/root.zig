@@ -114,6 +114,11 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
         }
     }
 
+    // Temp hygiene: drop stale spill (`nova-bash-*`) and background-log
+    // (`nova-bg_*`) files older than the retention window. Startup is the one
+    // moment no session can be mid-read of a previous process's output.
+    bash.pruneStaleTempFiles(init.io, gpa, bash.temp_retention_ns);
+
     // Auto-resume: find the most recently updated session for this cwd.
     const resume_session_id = blk: {
         var manager = session.SessionManager.initDefault(runtime_gpa, init.io, home_dir) catch break :blk null;

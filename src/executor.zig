@@ -219,11 +219,13 @@ pub const ExecutorService = struct {
     }
 
     fn shouldRejectUnsafeBash(self: *ExecutorService, call: ai.ToolCall, observer: anytype) !bool {
-        const url = self.bash_classifier_url orelse return false;
         if (!std.mem.eql(u8, call.name, "bash")) return false;
         const command = bash_safety.commandFromArguments(self.gpa, call.arguments) catch return false;
         defer self.gpa.free(command);
-        const verdict = bash_safety.classify(self.gpa, self.io, url, self.cwd, command);
+        // The optional URL is threaded straight through: with a classifier set it
+        // does the remote+local-fallback dance; with none the local destructive-
+        // command matcher runs directly, so `rm -rf /` is always caught.
+        const verdict = bash_safety.classify(self.gpa, self.io, self.bash_classifier_url, self.cwd, command);
         if (verdict != .unsafe) return false;
         const approved = try observer.approve_unsafe_bash(observer.ctx, call, command);
         return !approved;

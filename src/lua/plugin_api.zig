@@ -896,7 +896,7 @@ pub fn runBash(L: ?*c.lua_State) callconv(.c) c_int {
 
     if (state.getTop() >= 2 and state.isTable(2)) {
         if (bridge.getTableString(&state, 2, "cwd")) |v| cwd = v;
-        if (bridge.getTableInteger(&state, 2, "timeout")) |v| timeout_seconds = @max(@as(u32, @intCast(v)), 1);
+        if (bridge.getTableInteger(&state, 2, "timeout")) |v| timeout_seconds = @min(@max(@as(u32, @intCast(v)), 1), bash_exec.timeout_seconds_max);
     }
 
     const resolved_cwd = if (cwd) |path| blk: {

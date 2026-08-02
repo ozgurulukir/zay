@@ -83,7 +83,7 @@ fn runToolImpl(
         break :value command_cwd.?;
     } else cwd;
 
-    if (!validateCwd(gpa, cwd, resolved_cwd)) {
+    if (!validateCwd(gpa, io, cwd, resolved_cwd)) {
         return common.failFmt(gpa, 1, "bash: cwd '{s}' escapes the project root\n", .{resolved_cwd});
     }
 
@@ -112,7 +112,13 @@ pub fn runCaptured(
         .env_map = env_map,
         .timeout = bash.timeoutFromSeconds(timeout_seconds),
         .limits = capture_limits,
-    }) catch |err| return mapBashError(err);
+    }) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (err == error.Canceled) return error.Canceled;
+        // Surface the real spawn/capture failure to the model instead of the
+        // opaque "Unexpected" (M4).
+        return common.failFmt(gpa, 1, "bash: command failed to run: {s}\n", .{describeBashError(err)});
+    };
     defer captured.deinit(gpa);
 
     const status: FinishStatus = if (captured.timed_out) .{ .timeout_seconds = timeout_seconds } else .{};
@@ -150,7 +156,7 @@ pub fn runBackground(
         break :value command_cwd.?;
     } else cwd;
 
-    if (!validateCwd(gpa, cwd, resolved_cwd)) {
+    if (!validateCwd(gpa, io, cwd, resolved_cwd)) {
         return common.failFmt(gpa, 1, "bash: cwd '{s}' escapes the project root\n", .{resolved_cwd});
     }
 
@@ -179,17 +185,37 @@ pub fn runBackground(
 /// Validate that `resolved_cwd` stays within the project root. `project_root`
 /// must be absolute; `resolved_cwd` may be absolute or relative. Returns
 /// `false` when the resolved path escapes the project root.
-fn validateCwd(gpa: std.mem.Allocator, project_root: []const u8, resolved_cwd: []const u8) bool {
-    // Resolve `..` and `.` segments without syscalls (no symlink resolution).
-    // This is a best-effort guard: a symlink inside the project root that points
-    // outside would not be caught here, but the common case of `../../etc` is.
+///
+/// Two containment checks, both against a normalized root: a lexical one (after
+/// collapsing `..`/`.`/double-slashes) and a best-effort symlink one (realpath on
+/// both sides, so `link -> /etc` inside the root is caught). The symlink check
+/// is an optimization over the lexical one: realpath has limited platform
+/// support and is racy, so any realpath failure falls back to the lexical
+/// verdict instead of rejecting the command — a missing path is still rejected
+/// by the spawn with a clear error.
+fn validateCwd(gpa: std.mem.Allocator, io: std.Io, project_root: []const u8, resolved_cwd: []const u8) bool {
     const normalized = std.fs.path.resolve(gpa, &.{ project_root, resolved_cwd }) catch return false;
     defer gpa.free(normalized);
+    // Normalize the root too so a trailing slash (or `.`/`..`/double-slash) in
+    // `project_root` can't defeat the prefix compare (resolve() already
+    // collapsed `resolved_cwd`).
+    const normalized_root = std.fs.path.resolve(gpa, &.{project_root}) catch return false;
+    defer gpa.free(normalized_root);
 
-    if (!std.mem.startsWith(u8, normalized, project_root)) return false;
+    if (!std.mem.startsWith(u8, normalized, normalized_root)) return false;
     // Also check that the next byte after the project root is a separator or end-of-string,
     // so `/home/project-evil` is not considered inside `/home/project`.
-    if (normalized.len > project_root.len and normalized[project_root.len] != std.fs.path.sep) return false;
+    if (normalized.len > normalized_root.len and normalized[normalized_root.len] != std.fs.path.sep) return false;
+
+    // Best-effort symlink resolution (TD-4): canonicalize the resolved cwd and
+    // the root and re-check containment. Any error skips this check — never a
+    // hard failure.
+    const real_cwd = std.Io.Dir.realPathFileAbsoluteAlloc(io, normalized, gpa) catch return true;
+    defer gpa.free(real_cwd);
+    const real_root = std.Io.Dir.realPathFileAbsoluteAlloc(io, normalized_root, gpa) catch return true;
+    defer gpa.free(real_root);
+    if (!std.mem.startsWith(u8, real_cwd, real_root)) return false;
+    if (real_cwd.len > real_root.len and real_cwd[real_root.len] != std.fs.path.sep) return false;
     return true;
 }
 
@@ -253,7 +279,10 @@ fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args {
         try validateEnv(env);
     }
 
-    const timeout_seconds = parsed.value.timeout orelse bash.timeout_seconds_default;
+    // Clamp before the `0` check so a clamped-to-0 input is impossible
+    // (max >= 1). The cap keeps a model from passing a ~136-year timeout that
+    // effectively disables the deadline; long work belongs in background.
+    const timeout_seconds = @min(parsed.value.timeout orelse bash.timeout_seconds_default, bash.timeout_seconds_max);
     if (timeout_seconds == 0) return error.BadTimeout;
 
     return .{
@@ -331,6 +360,10 @@ const capture_limits: bash.CaptureLimits = .{
     .bytes_max = observation_bytes_max,
     .lines_max = observation_lines_max,
     .tail_bytes_max = rolling_bytes_max,
+    // 10MB ≫ any realistic "read the rest" need; bounds disk growth for a
+    // command that emits endless output (the observation only ever shows the
+    // last 50KB regardless).
+    .spill_bytes_max = 10 * 1024 * 1024,
 };
 
 const FinishStatus = struct {
@@ -394,7 +427,16 @@ fn finishBashOutput(
     const stderr = try gpa.alloc(u8, 0);
     errdefer gpa.free(stderr);
     const display_block = extraction.takeDisplay();
-    const display_value: common.Display = if (display_block) |block| .{ .diff = block } else .none;
+    const display_value: common.Display = if (display_block) |block| blk: {
+        // Uphold `common.Display`'s invariant that a `.diff` body is non-empty:
+        // a begin/end sentinel pair with nothing between would otherwise hand
+        // the model a zero-length diff next to the "(no output)" observation.
+        if (block.len == 0) {
+            gpa.free(block);
+            break :blk .none;
+        }
+        break :blk .{ .diff = block };
+    } else .none;
     return .{
         .stdout = display_text,
         .stderr = stderr,
@@ -575,11 +617,18 @@ fn countLines(text: []const u8) u32 {
     return count;
 }
 
-fn mapBashError(err: anyerror) common.Error {
+/// Map a `capture`/spawn failure to a model-readable reason. OOM and Canceled
+/// propagate on the caller's error surface; everything else becomes a tool
+/// output carrying the real cause — a missing shell, a bad cwd, fd exhaustion —
+/// instead of the opaque "Unexpected".
+fn describeBashError(err: anyerror) []const u8 {
     return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.Canceled => error.Canceled,
-        else => error.Unexpected,
+        error.FileNotFound => "command or shell not found (check PATH / the cwd exists)",
+        error.AccessDenied, error.PermissionDenied => "permission denied",
+        error.NotDir => "cwd is not a directory",
+        error.StreamTooLong => "output exceeded the capture limit",
+        error.Timeout => "timed out",
+        else => @errorName(err),
     };
 }
 
@@ -826,4 +875,64 @@ test "bash tool rejects invalid type for nullable field when model sends wrong t
     defer output.deinit(gpa);
 
     try std.testing.expect(output.code != 0);
+}
+
+test "validateCwd accepts a trailing-slash project root" {
+    // Regression for H2: the containment compare used the RAW project root, so
+    // a trailing slash (resolve() strips it) made every relative cwd escape.
+    try std.testing.expect(validateCwd(std.testing.allocator, std.testing.io, "/tmp/x/", "/tmp/x"));
+    try std.testing.expect(validateCwd(std.testing.allocator, std.testing.io, "/tmp/x/", "."));
+}
+
+test "validateCwd rejects an absolute cwd outside the root" {
+    // Existing behavior, kept green: an absolute cwd outside the root is refused.
+    try std.testing.expect(!validateCwd(std.testing.allocator, std.testing.io, "/tmp/x", "/etc"));
+}
+
+test "validateCwd blocks a symlink that escapes the root" {
+    // Regression for H3: the lexical check alone let `link -> /etc` inside the
+    // project pass; the best-effort realpath re-check must catch it.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const root_abs = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(root_abs);
+
+    // Create `<tmp>/link -> /etc`; skip the test if the sandbox forbids symlinks.
+    tmp.dir.symLink(std.testing.io, "/etc", "link", .{}) catch return error.SkipZigTest;
+
+    const link_abs = try std.fs.path.join(gpa, &.{ root_abs, "link" });
+    defer gpa.free(link_abs);
+
+    try std.testing.expect(!validateCwd(gpa, std.testing.io, root_abs, link_abs));
+}
+
+test "parseArgs clamps timeout to the max" {
+    var args = try parseArgs(std.testing.allocator, "{\"command\":\"true\",\"timeout\":999999}");
+    defer args.deinit();
+    try std.testing.expectEqual(bash.timeout_seconds_max, args.timeout_seconds);
+    try std.testing.expectError(error.BadTimeout, parseArgs(std.testing.allocator, "{\"command\":\"true\",\"timeout\":0}"));
+}
+
+test "describeBashError names common failures" {
+    try std.testing.expect(std.mem.indexOf(u8, describeBashError(error.FileNotFound), "not found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describeBashError(error.NotDir), "not a directory") != null);
+    try std.testing.expect(std.mem.eql(u8, "BadPipe", describeBashError(error.BadPipe)));
+}
+
+test "empty sentinel block yields no display" {
+    // Regression for L1: a begin/end sentinel pair with nothing between must not
+    // produce a zero-length `.diff` display (the `common.Display` invariant).
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+    const args = "{\"command\":\"printf '\\u001enova:diff\\n\\u001enova:end\\n'\",\"reason\":\"edit\"}";
+    var output = try runToolForTest(gpa, std.testing.io, cwd, args);
+    defer output.deinit(gpa);
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    try std.testing.expect(output.display == .none);
 }

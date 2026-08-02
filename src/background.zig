@@ -124,10 +124,15 @@ pub const BackgroundManager = struct {
         const gpa = self.gpa;
         const io = self.io;
 
+        // The mutex guards only `next_id` and the job list; the allocation and
+        // spawn work below touches locals only, so drop the lock right after the
+        // increment. A function-scoped `defer` unlock here would re-lock the same
+        // non-recursive mutex at the :job-append and :reader-publish sites below
+        // and deadlock (std.Io.Mutex has no owner tracking).
         try self.mutex.lock(io);
         const id = self.next_id;
         self.next_id += 1;
-        defer self.mutex.unlock(self.io);
+        self.mutex.unlock(io);
 
         const label = try std.fmt.allocPrint(gpa, "bg_{d}", .{id});
         errdefer gpa.free(label);
@@ -544,6 +549,53 @@ test "BackgroundManager tracks active and running counts" {
     std.testing.allocator.free(finished2);
     try std.testing.expectEqual(@as(usize, 0), finished1.len);
     try std.testing.expectEqual(@as(usize, 0), finished2.len);
+}
+
+test "BackgroundManager.start returns and the job completes" {
+    // Regression for the self-deadlock: `start` took the manager mutex via a
+    // function-scoped `defer` and re-locked the non-recursive mutex mid-function,
+    // so every launch hung in futexWait. With the bug present this test times
+    // out (CI) — `start` never returns; on a healthy manager the `true` job
+    // finishes within a few hundred ms and takeFinished hands it back.
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+
+    const env_slice = std.mem.span(std.c.environ);
+    var env_map = try std.process.Environ.createMap(.{ .block = .{ .slice = env_slice } }, gpa);
+    defer env_map.deinit();
+
+    var manager = BackgroundManager.init(std.testing.io, gpa);
+    defer manager.shutdownAll();
+
+    var started = try manager.start(.{
+        .command = "true",
+        .cwd = cwd,
+        .env_map = &env_map,
+        .owner = @as(*anyopaque, @ptrFromInt(1)),
+    });
+    defer started.deinit(gpa);
+    try std.testing.expect(started.pid > 0);
+
+    var finished: []BackgroundManager.Finished = &.{};
+    var attempts: u32 = 0;
+    while (attempts < 100) : (attempts += 1) {
+        const pending = try manager.takeFinished(gpa);
+        if (pending.len > 0) {
+            finished = pending;
+            break;
+        }
+        gpa.free(pending);
+        std.testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    defer {
+        for (finished) |*f| f.deinit(gpa);
+        gpa.free(finished);
+    }
+    try std.testing.expectEqual(@as(usize, 1), finished.len);
+    try std.testing.expectEqual(@as(u8, 0), finished[0].exit_code);
+    try std.testing.expect(!finished[0].killed);
+    try std.testing.expectEqual(@as(u32, 1), finished[0].id);
 }
 
 test "bash subprocess executes and returns captured output" {

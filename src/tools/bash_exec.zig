@@ -20,6 +20,12 @@ pub const Result = struct {
 const stdout_bytes_limit: usize = 512 * 1024;
 const stderr_bytes_limit: usize = 512 * 1024;
 pub const timeout_seconds_default: u32 = 10;
+/// Foreground timeout cap. 1h is 360× the default — generous for any
+/// interactive command — while `run_in_background` is the documented escape
+/// hatch for longer work (and ignores `timeout`). Requests above the cap are
+/// clamped, not rejected, so a model over-shooting by a huge factor degrades
+/// gracefully instead of failing the call.
+pub const timeout_seconds_max: u32 = 3600;
 
 pub const RunOptions = struct {
     cwd: []const u8,
@@ -45,29 +51,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, command: []const
 pub fn runWithOptions(gpa: std.mem.Allocator, io: std.Io, options: RunOptions) !Result {
     assert(options.cwd.len > 0);
     assert(options.command.len > 0);
-
-    // The `stdin` path must spawn a child (so the pipe can be fed) rather than
-    // use `std.process.run`. The no-stdin path keeps the simpler one-shot run.
-    if (options.stdin) |stdin_bytes| {
-        return runWithStdinImpl(gpa, io, options.cwd, options.command, stdin_bytes, options.env_map, options.timeout);
-    }
-
-    const child_result = try std.process.run(gpa, io, .{
-        .argv = &.{ bashPath(io), "-c", options.command },
-        .cwd = .{ .path = options.cwd },
-        .environ_map = options.env_map,
-        .stdout_limit = .limited(stdout_bytes_limit),
-        .stderr_limit = .limited(stderr_bytes_limit),
-        .timeout = options.timeout,
-    });
-    errdefer gpa.free(child_result.stdout);
-    errdefer gpa.free(child_result.stderr);
-
-    return .{
-        .stdout = child_result.stdout,
-        .stderr = child_result.stderr,
-        .code = termCode(child_result.term),
-    };
+    // One run path for both the stdin and no-stdin shapes: spawn + drain under a
+    // total-runtime deadline (see `runUnderBash`). The old no-stdin
+    // `std.process.run` path had idle-timeout semantics internally — the
+    // deadline reset whenever bytes arrived — so chatty commands never timed out
+    // and quiet ones died on silence. Here `timeout` is the total runtime cap.
+    return runUnderBash(gpa, io, options);
 }
 
 pub fn runWithStdin(
@@ -79,43 +68,59 @@ pub fn runWithStdin(
 ) !Result {
     assert(cwd.len > 0);
     assert(command.len > 0);
-    return runWithStdinImpl(gpa, io, cwd, command, stdin, null, timeoutFromSeconds(timeout_seconds_default));
+    return runUnderBash(gpa, io, .{
+        .cwd = cwd,
+        .command = command,
+        .stdin = stdin,
+    });
 }
 
-fn runWithStdinImpl(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    cwd: []const u8,
-    command: []const u8,
-    stdin: []const u8,
-    env_map: ?*const std.process.Environ.Map,
-    timeout: std.Io.Timeout,
-) !Result {
+/// Spawn `bash -c <command>` and drain stdout/stderr to completion under a
+/// TOTAL runtime deadline (TD-2). When `stdin` is non-null a writer thread
+/// feeds it concurrently (TD-7 / M5) so a child that writes before it reads
+/// cannot deadlock the drain.
+fn runUnderBash(gpa: std.mem.Allocator, io: std.Io, options: RunOptions) !Result {
+    assert(options.cwd.len > 0);
+    assert(options.command.len > 0);
     var child = try std.process.spawn(io, .{
-        .argv = &.{ bashPath(io), "-c", command },
-        .cwd = .{ .path = cwd },
-        .environ_map = env_map,
-        .stdin = .pipe,
+        .argv = &.{ bashPath(io), "-c", options.command },
+        .cwd = .{ .path = options.cwd },
+        .environ_map = options.env_map,
+        .stdin = if (options.stdin != null) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
     });
+    // Join registered FIRST so it runs LAST (LIFO): the kill must land before we
+    // wait on the writer, or a blocked writer deadlocks the join.
+    var writer: ?std.Thread = null;
+    defer if (writer) |*t| t.join();
     defer child.kill(io);
 
-    // Write the full stdin buffer up front, then close so the child sees EOF.
-    // Intercept handler output is byte-bounded (well under the OS pipe buffer),
-    // so a write-then-drain ordering does not deadlock for our usage.
-    if (child.stdin) |stdin_file| {
-        try stdin_file.writeStreamingAll(io, stdin);
-        stdin_file.close(io);
-        child.stdin = null;
+    if (options.stdin) |stdin_bytes| {
+        if (child.stdin) |stdin_file| {
+            writer = try std.Thread.spawn(.{}, writeStdinAndClose, .{ io, stdin_file, stdin_bytes });
+            child.stdin = null; // ownership moved to the writer
+        }
     }
+    return drainChild(gpa, io, &child, options.timeout);
+}
 
-    return drainChild(gpa, io, &child, timeout);
+fn writeStdinAndClose(io: std.Io, stdin_file: std.Io.File, data: []const u8) void {
+    // Best-effort: on EPIPE (the child exited before reading all of it) or any
+    // other write error, drop the data and close. The main thread is never
+    // blocked writing stdin, so it always drains stdout and the child progresses.
+    stdin_file.writeStreamingAll(io, data) catch {};
+    stdin_file.close(io);
 }
 
 fn drainChild(gpa: std.mem.Allocator, io: std.Io, child: *std.process.Child, timeout: std.Io.Timeout) !Result {
     assert(child.stdout != null);
     assert(child.stderr != null);
+    // Convert the idle-reset timeout to an absolute deadline once, so the cap is
+    // TOTAL runtime: every fill below waits against the same timestamp, and a
+    // chatty command can no longer push the deadline out (TD-2). `error.Timeout`
+    // propagates to the caller exactly as before.
+    const deadline = timeout.toDeadline(io);
 
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
     var multi_reader: std.Io.File.MultiReader = undefined;
@@ -125,7 +130,7 @@ fn drainChild(gpa: std.mem.Allocator, io: std.Io, child: *std.process.Child, tim
     const stdout_reader = multi_reader.reader(0);
     const stderr_reader = multi_reader.reader(1);
 
-    while (multi_reader.fill(64, timeout)) |_| {
+    while (multi_reader.fill(64, deadline)) |_| {
         if (stdout_reader.buffered().len > stdout_bytes_limit) return error.StreamTooLong;
         if (stderr_reader.buffered().len > stderr_bytes_limit) return error.StreamTooLong;
     } else |err| switch (err) {
@@ -144,14 +149,7 @@ fn drainChild(gpa: std.mem.Allocator, io: std.Io, child: *std.process.Child, tim
     return .{
         .stdout = stdout_slice,
         .stderr = stderr_slice,
-        .code = termCode(term),
-    };
-}
-
-fn termCode(term: std.process.Child.Term) u8 {
-    return switch (term) {
-        .exited => |value| value,
-        .signal, .stopped, .unknown => 255,
+        .code = os.termCode(term),
     };
 }
 
@@ -164,6 +162,11 @@ pub const CaptureLimits = struct {
     /// is seeded from the still-untrimmed tail the instant the threshold trips,
     /// so the tail must hold the full output up to that point.
     tail_bytes_max: usize,
+    /// Hard cap on the spill file size. The observation only ever shows the
+    /// last `bytes_max` bytes, so a command emitting endless output must not be
+    /// able to grow an unbounded file on disk; once the cap is hit the spill
+    /// stops growing while the in-memory tail keeps serving the observation.
+    spill_bytes_max: usize,
 };
 
 pub const CaptureOptions = struct {
@@ -209,6 +212,9 @@ pub fn capture(gpa: std.mem.Allocator, io: std.Io, options: CaptureOptions) !Cap
     assert(options.cwd.len > 0);
     assert(options.command.len > 0);
     assert(options.limits.tail_bytes_max > options.limits.bytes_max);
+    // The seed write (the untrimmed tail, <= tail_bytes_max) must always fit, or
+    // the spill would be created over its own cap.
+    assert(options.limits.spill_bytes_max >= options.limits.tail_bytes_max);
 
     // `exec 2>&1` merges stderr into stdout so the captured stream preserves
     // chronological interleaving. The shell is non-login (see `bashPath`), so no
@@ -235,8 +241,12 @@ pub fn capture(gpa: std.mem.Allocator, io: std.Io, options: CaptureOptions) !Cap
     defer multi_reader.deinit();
     const reader = multi_reader.reader(0);
 
+    // Total-runtime deadline, same as the run path (TD-2): the loop must stop at
+    // `timeout` even when output keeps flowing.
+    const deadline = options.timeout.toDeadline(io);
+
     var timed_out = false;
-    while (multi_reader.fill(capture_read_reserve, options.timeout)) |_| {
+    while (multi_reader.fill(capture_read_reserve, deadline)) |_| {
         const chunk = reader.buffered();
         if (chunk.len == 0) continue;
         try sink.ingest(gpa, io, chunk);
@@ -248,7 +258,7 @@ pub fn capture(gpa: std.mem.Allocator, io: std.Io, options: CaptureOptions) !Cap
     }
 
     if (!timed_out) try multi_reader.checkAnyError();
-    const code = if (timed_out) 124 else termCode(try child.wait(io));
+    const code = if (timed_out) 124 else os.termCode(try child.wait(io));
 
     return sink.finish(gpa, io, code, timed_out);
 }
@@ -262,6 +272,8 @@ const Sink = struct {
     newline_count: u32 = 0,
     ended_with_newline: bool = false,
     spill: ?Spill = null,
+    /// Bytes written to the spill file so far; capped by `limits.spill_bytes_max`.
+    spill_bytes: usize = 0,
 
     const Spill = struct {
         file: std.Io.File,
@@ -285,8 +297,20 @@ const Sink = struct {
         if (self.spill == null and (new_total > self.limits.bytes_max or new_total_lines > self.limits.lines_max)) {
             self.spill = try openSpill(gpa, io);
             try self.spill.?.file.writeStreamingAll(io, self.tail.items);
+            self.spill_bytes = self.tail.items.len;
         }
-        if (self.spill) |spill| try spill.file.writeStreamingAll(io, chunk);
+        // Cap the spill file at `spill_bytes_max` (TD-9): once reached, stop
+        // appending while the in-memory rolling tail keeps serving the
+        // observation. `spill_bytes_max >= tail_bytes_max` (asserted in
+        // `capture`), so the seed write always fits.
+        if (self.spill) |spill| {
+            const room = self.limits.spill_bytes_max -| self.spill_bytes;
+            if (room > 0) {
+                const n = @min(chunk.len, room);
+                try spill.file.writeStreamingAll(io, chunk[0..n]);
+                self.spill_bytes += n;
+            }
+        }
 
         try self.tail.appendSlice(gpa, chunk);
         self.total_bytes = new_total;
@@ -422,7 +446,7 @@ fn captureLoginEnv(io: std.Io) ![]const u8 {
     });
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);
-    if (termCode(result.term) != 0) return error.LoginEnvFailed;
+    if (os.termCode(result.term) != 0) return error.LoginEnvFailed;
     const marker_at = std.mem.indexOf(u8, result.stdout, login_env_marker) orelse return error.LoginEnvFailed;
     return gpa.dupe(u8, result.stdout[marker_at + login_env_marker.len ..]);
 }
@@ -468,6 +492,42 @@ pub fn namedTempPath(gpa: std.mem.Allocator, name: []const u8) std.mem.Allocator
     return std.fs.path.join(gpa, &.{ dir, name });
 }
 
+pub const temp_retention_ns: u64 = 24 * std.time.ns_per_hour;
+
+/// Best-effort cleanup of stale spill (`nova-bash-*`) and background-log
+/// (`nova-bg_*`) files older than `max_age_ns`. Called once at startup, when no
+/// session can still be reading a previous process's output (TD-6).
+pub fn pruneStaleTempFiles(io: std.Io, gpa: std.mem.Allocator, max_age_ns: u64) void {
+    const dir_path = tempDir(gpa) catch return;
+    defer gpa.free(dir_path);
+    pruneTempDir(io, dir_path, max_age_ns);
+}
+
+/// The dir-parameterized core of `pruneStaleTempFiles`, separated so tests can
+/// target a scratch dir instead of the shared temp dir. Prefix-scoped (matches
+/// only `nova-bash-`/`nova-bg_`, not bare `nova-`) so unrelated temp files are
+/// untouched; mtime is compared against the wall clock (`.real`); every
+/// operation is `catch`-tolerant so cleanup can never break startup.
+fn pruneTempDir(io: std.Io, dir_path: []const u8, max_age_ns: u64) void {
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    const now = std.Io.Timestamp.now(io, .real); // Stat.mtime is wall-clock
+    var iter = dir.iterate();
+    // `catch null` treats an iteration error as end-of-listing — best-effort
+    // cleanup never fails startup.
+    while (iter.next(io) catch null) |entry| {
+        if (entry.kind != .file and entry.kind != .unknown) continue;
+        const name = entry.name;
+        const match = std.mem.startsWith(u8, name, "nova-bash-") or std.mem.startsWith(u8, name, "nova-bg_");
+        if (!match) continue;
+        const st = dir.statFile(io, name, .{}) catch continue;
+        const age_ns = st.mtime.durationTo(now).nanoseconds;
+        if (age_ns > 0 and @as(u128, @intCast(age_ns)) > max_age_ns) {
+            dir.deleteFile(io, name) catch {};
+        }
+    }
+}
+
 var bash_path_value: ?[]const u8 = null;
 
 fn bashPath(io: std.Io) []const u8 {
@@ -506,4 +566,107 @@ test "bash forwards stdin from buffer" {
 
     try std.testing.expectEqualStrings("piped-bytes", result.stdout);
     try std.testing.expectEqual(@as(u8, 0), result.code);
+}
+
+test "capture enforces total runtime even when output keeps flowing" {
+    // Regression for H1: the timeout was an idle timeout (reset on every byte),
+    // so a chatty command never died. The command prints ~20 lines over 2.5s;
+    // under a 1s TOTAL deadline the fill loop must stop and report timed_out.
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+    var captured = try capture(gpa, std.testing.io, .{
+        .cwd = cwd,
+        .command = "i=0; while [ $i -lt 50 ]; do echo t$i; sleep 0.05; done",
+        .timeout = timeoutFromSeconds(1),
+        .limits = .{
+            .bytes_max = 50 * 1024,
+            .lines_max = 2000,
+            .tail_bytes_max = 100 * 1024,
+            .spill_bytes_max = 10 * 1024 * 1024,
+        },
+    });
+    defer captured.deinit(gpa);
+    try std.testing.expect(captured.timed_out);
+    try std.testing.expectEqual(@as(u8, 124), captured.code);
+}
+
+test "capture still returns all output for a fast command" {
+    // Positive control: the deadline conversion must not change fast commands.
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+    var captured = try capture(gpa, std.testing.io, .{
+        .cwd = cwd,
+        .command = "printf hello",
+        .timeout = timeoutFromSeconds(2),
+        .limits = .{
+            .bytes_max = 50 * 1024,
+            .lines_max = 2000,
+            .tail_bytes_max = 100 * 1024,
+            .spill_bytes_max = 10 * 1024 * 1024,
+        },
+    });
+    defer captured.deinit(gpa);
+    try std.testing.expect(!captured.timed_out);
+    try std.testing.expectEqual(@as(u8, 0), captured.code);
+    try std.testing.expectEqualStrings("hello", captured.tail);
+}
+
+test "spill stops growing at spill_bytes_max" {
+    // Pure Sink test: once the spill cap is hit, further chunks are not written
+    // to disk (the in-memory tail still serves the observation).
+    const gpa = std.testing.allocator;
+    var sink: Sink = .{ .limits = .{
+        .bytes_max = 4,
+        .lines_max = 100,
+        .tail_bytes_max = 64,
+        .spill_bytes_max = 16,
+    } };
+    defer sink.deinit(gpa, std.testing.io);
+
+    try sink.ingest(gpa, std.testing.io, "aaaa"); // 4 bytes — not over budget yet
+    try sink.ingest(gpa, std.testing.io, "bbbb"); // 8 > 4 → spill trips, seed+chunk
+    try std.testing.expect(sink.spill != null);
+    try sink.ingest(gpa, std.testing.io, "cccc");
+    try sink.ingest(gpa, std.testing.io, "dddd"); // reaches the 16-byte cap
+    try sink.ingest(gpa, std.testing.io, "eeee"); // past the cap — not written
+    try std.testing.expectEqual(@as(usize, 16), sink.spill_bytes);
+
+    const st = std.Io.Dir.statFile(.cwd(), std.testing.io, sink.spill.?.path, .{}) catch unreachable;
+    try std.testing.expect(st.size <= 16);
+}
+
+test "pruneTempDir removes only matching stale files" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const dir_path = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(dir_path);
+
+    (try tmp.dir.createFile(std.testing.io, "nova-bash-abcdef.log", .{})).close(std.testing.io);
+    (try tmp.dir.createFile(std.testing.io, "nova-bg_1.log", .{})).close(std.testing.io);
+    (try tmp.dir.createFile(std.testing.io, "keep.txt", .{})).close(std.testing.io);
+
+    const tmp_has = struct {
+        fn has(io: std.Io, dir: std.Io.Dir, name: []const u8) bool {
+            return (dir.access(io, name, .{}) catch null) != null;
+        }
+    }.has;
+
+    // Fresh files are younger than the retention window: nothing is removed.
+    pruneTempDir(std.testing.io, dir_path, temp_retention_ns);
+    try std.testing.expect(tmp_has(std.testing.io, tmp.dir, "nova-bash-abcdef.log"));
+    try std.testing.expect(tmp_has(std.testing.io, tmp.dir, "nova-bg_1.log"));
+    try std.testing.expect(tmp_has(std.testing.io, tmp.dir, "keep.txt"));
+
+    // With a ~1ns window the nova files are stale and removed, while keep.txt
+    // (a different prefix) survives — prefix-scoping is the property under test.
+    pruneTempDir(std.testing.io, dir_path, 1);
+    try std.testing.expect(!tmp_has(std.testing.io, tmp.dir, "nova-bash-abcdef.log"));
+    try std.testing.expect(!tmp_has(std.testing.io, tmp.dir, "nova-bg_1.log"));
+    try std.testing.expect(tmp_has(std.testing.io, tmp.dir, "keep.txt"));
 }

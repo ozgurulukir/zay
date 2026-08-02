@@ -27,18 +27,26 @@ pub fn commandFromArguments(gpa: std.mem.Allocator, arguments: []const u8) ![]u8
     return try gpa.dupe(u8, command);
 }
 
+/// Classify `command` as safe/unsafe. `url` is the remote classifier endpoint,
+/// or null when none is configured. With a URL the remote classifies and the
+/// local matcher only runs on fetch failure; with null (no classifier — the
+/// local-ONNX server couldn't start, or the user set none) the local matcher
+/// runs directly so the destructive-command backstop is always armed, per the
+/// module's defense-in-depth contract.
 pub fn classify(
     gpa: std.mem.Allocator,
     io: std.Io,
-    url: []const u8,
+    url: ?[]const u8,
     cwd: []const u8,
     command: []const u8,
 ) Verdict {
-    assert(url.len > 0);
     assert(cwd.len > 0);
     assert(command.len > 0);
 
-    const remote = classifyFallible(gpa, io, url, cwd, command) catch {
+    const u = url orelse return localClassify(command);
+    if (u.len == 0) return localClassify(command);
+
+    const remote = classifyFallible(gpa, io, u, cwd, command) catch {
         // Remote classifier unavailable — fall back to local pattern matching.
         return localClassify(command);
     };
@@ -232,6 +240,14 @@ test "bash safety parses classifier responses" {
     try std.testing.expectEqual(Verdict.safe, try parseResponse(gpa, "{\"label\":\"safe\"}"));
     try std.testing.expectEqual(Verdict.unsafe, try parseResponse(gpa, "{\"label\":\"unsafe\",\"score\":0.99}"));
     try std.testing.expectError(error.InvalidClassifierResponse, parseResponse(gpa, "{\"label\":\"maybe\"}"));
+}
+
+test "classify with no URL falls back to the local matcher" {
+    // Regression for H4: with no classifier configured the local destructive-
+    // command backstop must still run (it used to be reachable only through the
+    // remote-fetch-failure path).
+    try std.testing.expectEqual(Verdict.unsafe, classify(std.testing.allocator, std.testing.io, null, "/x", "rm -rf /"));
+    try std.testing.expectEqual(Verdict.safe, classify(std.testing.allocator, std.testing.io, null, "/x", "ls"));
 }
 
 test "local classifier flags rm -rf /" {
