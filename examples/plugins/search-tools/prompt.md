@@ -22,9 +22,11 @@ Use the `search-tools` plugin to locate code and files across the project.
 - **Narrow before widening.** If `grep` returns too many matches, add an
   `include` glob filter (e.g. `"*.zig"`) before raising `max_results`. Filtering
   by file type is cheaper than fetching more matches.
-- **Regex support.** By default `grep` does a substring match. Set `regex=true`
-  to use ripgrep for real regex (e.g. `func\s+\w+`). Regex runs via bash, so it
-  needs `rg` installed.
+- **Substring vs regex.** By default `grep` matches the pattern as a **literal
+  substring** using Nova's built-in search — no external tools, but it skips
+  only dotfiles, so gitignored dirs (vendor/, zig-cache/) are scanned too. Set
+  `regex=true` for full regular expressions (e.g. `func\s+\w+`, `mcp__|lua__`);
+  regex runs via ripgrep, respects `.gitignore`, and needs `rg` installed.
 - **Counting matches.** If you need the number of matches within files (not the
   matches themselves), use `bash` with `rg --count` directly instead of this
   tool.

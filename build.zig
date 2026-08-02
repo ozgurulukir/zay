@@ -427,6 +427,7 @@ pub fn build(b: *std.Build) void {
         const run_lua_tests = b.addRunArtifact(lua_test_exe);
         // Pass test file paths as arguments
         run_lua_tests.addArg("examples/plugins/hello-world/test.lua");
+        run_lua_tests.addArg("examples/plugins/search-tools/test.lua");
         lua_test_step.dependOn(&run_lua_tests.step);
     }
 
