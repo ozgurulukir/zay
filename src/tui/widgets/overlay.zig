@@ -14,6 +14,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
+const ai = @import("../../ai.zig");
 const tui = @import("../../tui.zig");
 const tui_style = @import("../style.zig");
 const panel = @import("panel.zig");
@@ -380,11 +381,33 @@ const OverlayInner = struct {
             .active_model = if (status) |value| value.model else null,
             .reasoning_options = tui.activeReasoningOptions(app),
             .reasoning_indexes = picker_reasoning,
-            .scope = tui.modelPickerScope(app.pickers.models.model_scope),
+            .footer = try buildModelPickerFooter(app, ctx.arena, status),
             .filter = filter,
             .loading = app.pickers.models.load == .loading,
             .error_message = if (app.pickers.models.load == .failed) app.pickers.models.load.failed.message else null,
         };
         return content.widget().draw(ctx);
+    }
+
+    /// Footer status line for the model picker: the save scope (moved out of
+    /// the table, cycled with Ctrl+S) and the wire parameter the selected
+    /// model+effort would actually emit (dialect-aware — DashScope uses
+    /// `enable_thinking`, everything else `reasoning_effort`).
+    fn buildModelPickerFooter(app: *App, arena: std.mem.Allocator, status: ?tui_status.ModelStatus) std.mem.Allocator.Error![]const u8 {
+        const scope_text = switch (app.pickers.models.model_scope) {
+            .global => "Global",
+            .project => "Project",
+            .session => "Session",
+        };
+        const opts = tui.activeReasoningOptions(app);
+        const r_index: u32 = if (app.pickers.models.model_selection < app.pickers.models.entries.items.len)
+            app.pickers.models.entries.items[app.pickers.models.model_selection].reasoning_index
+        else
+            0;
+        const effort_label = if (r_index < opts.len) opts[r_index].label else "medium";
+        const dialect = if (app.liveRuntime()) |rt| rt.wire_dialect else ai.WireDialect.minimal;
+        const wire_param: []const u8 = if (dialect.usesEnableThinking()) "enable_thinking" else "reasoning_effort";
+        const provider = if (status) |s| s.provider else "unknown provider";
+        return std.fmt.allocPrint(arena, "  Scope: {s}  │  Ctrl+S to change      →  {s}:\"{s}\" ({s})", .{ scope_text, wire_param, effort_label, provider });
     }
 };

@@ -148,9 +148,9 @@ pub const SessionManager = struct {
 
     pub fn list(self: *SessionManager, gpa: std.mem.Allocator, cwd: ?[]const u8) Error![]SessionSummary {
         const sql = if (cwd == null)
-            "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id from sessions where leaf_entry_id is not null order by updated_at_ms desc"
+            "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id, reasoning_effort from sessions where leaf_entry_id is not null order by updated_at_ms desc"
         else
-            "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id from sessions where cwd = ? and leaf_entry_id is not null order by updated_at_ms desc";
+            "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id, reasoning_effort from sessions where cwd = ? and leaf_entry_id is not null order by updated_at_ms desc";
         var statement = try self.connection.prepare(sql);
         defer statement.finalize();
         if (cwd) |path| try statement.bindText(1, path);
@@ -317,22 +317,28 @@ pub const Session = struct {
         return prompts.toOwnedSlice(gpa);
     }
 
-    /// Update the model provider and ID for this session.
-    pub fn updateModel(self: *Session, provider: []const u8, model_id: []const u8) Error!void {
+    /// Update the model provider, ID, and reasoning effort for this session.
+    /// `effort_label` is null to clear a stored override (use config/default).
+    pub fn updateModel(self: *Session, provider: []const u8, model_id: []const u8, effort_label: ?[]const u8) Error!void {
         assert(self.id.slice().len > 0);
-        var statement = try self.manager.connection.prepare("update sessions set model_provider = ?, model_id = ?, updated_at_ms = ? where id = ?");
+        var statement = try self.manager.connection.prepare("update sessions set model_provider = ?, model_id = ?, reasoning_effort = ?, updated_at_ms = ? where id = ?");
         defer statement.finalize();
         try statement.bindText(1, provider);
         try statement.bindText(2, model_id);
+        if (effort_label) |label| {
+            try statement.bindText(3, label);
+        } else {
+            try statement.bindNull(3);
+        }
         const timestamp_ms = nowMs(self.manager.io);
-        try statement.bindInt(3, timestamp_ms);
-        try statement.bindText(4, self.id.slice());
+        try statement.bindInt(4, timestamp_ms);
+        try statement.bindText(5, self.id.slice());
         try expectDone(&statement);
     }
 
     /// Load the summary for this session. Caller owns the memory.
     pub fn summary(self: *Session, gpa: std.mem.Allocator) Error!SessionSummary {
-        var statement = try self.manager.connection.prepare("select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id from sessions where id = ?");
+        var statement = try self.manager.connection.prepare("select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id, reasoning_effort from sessions where id = ?");
         defer statement.finalize();
         try statement.bindText(1, self.id.slice());
         const row = (try statement.step()) orelse return error.MissingSession;
@@ -781,6 +787,7 @@ fn readSummary(gpa: std.mem.Allocator, row: *const db.Row) Error!SessionSummary 
         },
         .model_provider = if (row.columnType(6) == .null) null else try gpa.dupe(u8, row.text(6)),
         .model_id = if (row.columnType(7) == .null) null else try gpa.dupe(u8, row.text(7)),
+        .reasoning_effort = if (row.columnType(8) == .null) null else try gpa.dupe(u8, row.text(8)),
     };
 }
 
@@ -1152,6 +1159,30 @@ test "deleteSession removes a session and its entries" {
         }
         try std.testing.expectEqual(@as(usize, 0), summaries.len);
     }
+}
+
+test "updateModel persists reasoning effort and summary reads it back" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/nova", .{ .id = "e" ** session_id_len });
+
+    // Direct session-row update (no writer thread in this harness).
+    try session.updateModel("ollama", "llama3.1:8b", "high");
+
+    var summary = try session.summary(gpa);
+    defer summary.deinit(gpa);
+    try std.testing.expectEqualStrings("ollama", summary.model_provider.?);
+    try std.testing.expectEqualStrings("llama3.1:8b", summary.model_id.?);
+    try std.testing.expectEqualStrings("high", summary.reasoning_effort.?);
+
+    // Clearing the override (null) round-trips back to NULL — resume then
+    // falls back to config/default.
+    try session.updateModel("ollama", "llama3.1:8b", null);
+    var summary2 = try session.summary(gpa);
+    defer summary2.deinit(gpa);
+    try std.testing.expect(summary2.reasoning_effort == null);
+    try std.testing.expectEqualStrings("ollama", summary2.model_provider.?);
 }
 
 test "renameSession updates the title" {

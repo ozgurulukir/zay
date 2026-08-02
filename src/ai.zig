@@ -33,6 +33,15 @@ pub const ReasoningEffort = enum {
     pub fn label(self: ReasoningEffort) []const u8 {
         return @tagName(self);
     }
+
+    /// Parse a persisted effort label back into the enum. Mirrors
+    /// `Role.fromString`: a string match → enum or error. Used to restore
+    /// session-scoped reasoning effort from the DB on resume. An unknown
+    /// label (e.g. from a newer schema or hand-edited data) errors instead
+    /// of silently mapping to a wrong level.
+    pub fn fromString(text: []const u8) !ReasoningEffort {
+        return std.meta.stringToEnum(ReasoningEffort, text) orelse error.InvalidReasoningEffort;
+    }
 };
 
 pub const ReasoningSummary = enum {
@@ -48,6 +57,72 @@ pub const ReasoningSummary = enum {
 pub const Reasoning = struct {
     effort: ?ReasoningEffort = .medium,
     summary: ?ReasoningSummary = .auto,
+};
+
+/// Wire-format dialect: which vendor-specific request fields a provider
+/// accepts beyond the baseline OpenAI Chat Completions schema. Providers
+/// not explicitly mapped fall through to `.minimal`, which sends only
+/// universally-safe fields (`reasoning_effort` for reasoning control).
+pub const WireDialect = enum {
+    /// OpenAI native: `prompt_cache_key` ✓, `reasoning_effort` ✓.
+    openai,
+    /// OpenRouter: `cache_control` (message + top-level) ✓,
+    /// `prompt_cache_key` ✓, `reasoning_effort` ✓.
+    openrouter,
+    /// Qwen / DashScope: top-level `enable_thinking` ✓,
+    /// `reasoning_effort` ✓.
+    dashscope,
+    /// Safe default for Ollama, Groq, vLLM, Together, DeepSeek, and
+    /// any unknown provider. Only `reasoning_effort` is emitted; all
+    /// vendor-specific cache/thinking fields are suppressed.
+    minimal,
+
+    /// Resolve the wire dialect from available provider identity.
+    /// First match wins: builtin enum → dynamic id string → base URL
+    /// heuristic → `.minimal` fallback.
+    pub fn resolve(
+        builtin: ?@import("config/provider.zig").Provider,
+        provider_id: []const u8,
+        base_url: []const u8,
+    ) WireDialect {
+        // 1. Builtin provider enum.
+        if (builtin) |p| {
+            return switch (p) {
+                .openai => .openai,
+                .openrouter => .openrouter,
+                else => .minimal,
+            };
+        }
+        // 2. Dynamic provider id (models.dev registry key).
+        const id_lower = provider_id;
+        if (std.mem.eql(u8, id_lower, "openrouter")) return .openrouter;
+        if (std.mem.eql(u8, id_lower, "openai")) return .openai;
+        if (std.mem.eql(u8, id_lower, "dashscope") or
+            std.mem.eql(u8, id_lower, "qwen") or
+            std.mem.eql(u8, id_lower, "tongyi")) return .dashscope;
+        // 3. Base URL heuristic (covers user-defined providers).
+        if (std.mem.indexOf(u8, base_url, "openrouter.ai") != null) return .openrouter;
+        if (std.mem.indexOf(u8, base_url, "api.openai.com") != null) return .openai;
+        if (std.mem.indexOf(u8, base_url, "dashscope.aliyuncs.com") != null) return .dashscope;
+        // 4. Safe fallback.
+        return .minimal;
+    }
+
+    /// Whether message-level `cache_control` should be emitted.
+    pub fn allowsCacheControl(self: WireDialect) bool {
+        return self == .openrouter;
+    }
+
+    /// Whether top-level `prompt_cache_key` should be emitted.
+    pub fn allowsPromptCacheKey(self: WireDialect) bool {
+        return self == .openai or self == .openrouter;
+    }
+
+    /// Whether top-level `enable_thinking` (DashScope-style) should be
+    /// used instead of the standard `reasoning_effort` field.
+    pub fn usesEnableThinking(self: WireDialect) bool {
+        return self == .dashscope;
+    }
 };
 
 pub const Config = struct {
@@ -75,6 +150,11 @@ pub const Config = struct {
     /// emits tool calls as plain text instead of `tool_calls` deltas.
     /// Default `false` keeps tool-calling working everywhere.
     strict: bool = false,
+    /// Wire-format dialect: gates vendor-specific request fields
+    /// (`cache_control`, `prompt_cache_key`, `enable_thinking`).
+    /// Resolved at client-attach time from provider identity.
+    /// Default `.minimal` is safe for all providers.
+    wire_dialect: WireDialect = .minimal,
     /// Maximum number of retries for transient HTTP errors (429 + 5xx).
     /// 0 disables retries entirely (single attempt — the legacy behavior).
     /// Only head-phase statuses are retried; once the response body streams,
@@ -604,4 +684,63 @@ test "clampTokenCount passes through valid values" {
     try std.testing.expectEqual(@as(u32, 100), clampTokenCount(100));
     try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), clampTokenCount(std.math.maxInt(u32)));
     try std.testing.expectEqual(@as(u32, 1_000_000), clampTokenCount(1_000_000));
+}
+
+test "ReasoningEffort.fromString round-trips labels and rejects unknowns" {
+    try std.testing.expectEqual(ReasoningEffort.default, try ReasoningEffort.fromString("default"));
+    try std.testing.expectEqual(ReasoningEffort.high, try ReasoningEffort.fromString("high"));
+    try std.testing.expectEqual(ReasoningEffort.none, try ReasoningEffort.fromString("none"));
+    try std.testing.expectError(error.InvalidReasoningEffort, ReasoningEffort.fromString("turbo"));
+    try std.testing.expectError(error.InvalidReasoningEffort, ReasoningEffort.fromString(""));
+}
+
+test "WireDialect.resolve maps builtin providers correctly" {
+    const provider_mod = @import("config/provider.zig");
+    // Builtin enum takes priority.
+    try std.testing.expectEqual(WireDialect.openai, WireDialect.resolve(.openai, "", ""));
+    try std.testing.expectEqual(WireDialect.openrouter, WireDialect.resolve(.openrouter, "", ""));
+    try std.testing.expectEqual(WireDialect.minimal, WireDialect.resolve(.ollama, "", ""));
+    try std.testing.expectEqual(WireDialect.minimal, WireDialect.resolve(.ollama_cloud, "", ""));
+    try std.testing.expectEqual(WireDialect.minimal, WireDialect.resolve(.cerebras, "", ""));
+    try std.testing.expectEqual(WireDialect.minimal, WireDialect.resolve(.anthropic, "", ""));
+    _ = provider_mod.Provider.openai; // ensure import is used
+}
+
+test "WireDialect.resolve maps dynamic provider ids" {
+    // No builtin → falls through to id string matching.
+    try std.testing.expectEqual(WireDialect.dashscope, WireDialect.resolve(null, "dashscope", ""));
+    try std.testing.expectEqual(WireDialect.dashscope, WireDialect.resolve(null, "qwen", ""));
+    try std.testing.expectEqual(WireDialect.dashscope, WireDialect.resolve(null, "tongyi", ""));
+    try std.testing.expectEqual(WireDialect.openrouter, WireDialect.resolve(null, "openrouter", ""));
+    try std.testing.expectEqual(WireDialect.openai, WireDialect.resolve(null, "openai", ""));
+    // DeepSeek and unknown → minimal.
+    try std.testing.expectEqual(WireDialect.minimal, WireDialect.resolve(null, "deepseek", ""));
+    try std.testing.expectEqual(WireDialect.minimal, WireDialect.resolve(null, "some-random-provider", ""));
+}
+
+test "WireDialect.resolve falls back to base URL heuristic" {
+    try std.testing.expectEqual(WireDialect.openrouter, WireDialect.resolve(null, "", "https://openrouter.ai/api/v1"));
+    try std.testing.expectEqual(WireDialect.openai, WireDialect.resolve(null, "", "https://api.openai.com/v1"));
+    try std.testing.expectEqual(WireDialect.dashscope, WireDialect.resolve(null, "", "https://dashscope.aliyuncs.com/compatible-mode/v1"));
+    // Unknown URL → minimal.
+    try std.testing.expectEqual(WireDialect.minimal, WireDialect.resolve(null, "", "https://api.deepseek.com"));
+    try std.testing.expectEqual(WireDialect.minimal, WireDialect.resolve(null, "", "http://localhost:11434"));
+}
+
+test "WireDialect capability gates" {
+    // cache_control: only openrouter
+    try std.testing.expect(WireDialect.openrouter.allowsCacheControl());
+    try std.testing.expect(!WireDialect.openai.allowsCacheControl());
+    try std.testing.expect(!WireDialect.dashscope.allowsCacheControl());
+    try std.testing.expect(!WireDialect.minimal.allowsCacheControl());
+    // prompt_cache_key: openai + openrouter
+    try std.testing.expect(WireDialect.openai.allowsPromptCacheKey());
+    try std.testing.expect(WireDialect.openrouter.allowsPromptCacheKey());
+    try std.testing.expect(!WireDialect.dashscope.allowsPromptCacheKey());
+    try std.testing.expect(!WireDialect.minimal.allowsPromptCacheKey());
+    // enable_thinking: only dashscope
+    try std.testing.expect(WireDialect.dashscope.usesEnableThinking());
+    try std.testing.expect(!WireDialect.openai.usesEnableThinking());
+    try std.testing.expect(!WireDialect.openrouter.usesEnableThinking());
+    try std.testing.expect(!WireDialect.minimal.usesEnableThinking());
 }

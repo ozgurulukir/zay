@@ -10,48 +10,31 @@ const tui_style = @import("../style.zig");
 
 const StylePalette = tui_style.Palette;
 
-fn scopeColumn(width: u16) u16 {
-    const secondary = panel.secondaryColumn(width);
-    return secondary +| 24;
-}
-
 fn columnStyle(focused: bool, selected: bool) vaxis.Style {
     if (focused) return StylePalette.selected_item;
     return tui_style.onSelectionBg(StylePalette.thinking_body, selected);
 }
 
-fn scopeLabel(scope: Scope) []const u8 {
-    return switch (scope) {
-        .global => "Global",
-        .project => "Project",
-        .session => "Session",
-    };
-}
-
 pub const Column = enum {
     model,
     reasoning,
-    scope,
 
     pub fn next(self: Column) Column {
         return switch (self) {
             .model => .reasoning,
-            .reasoning => .scope,
-            .scope => .model,
+            .reasoning => .model,
         };
     }
 
     pub fn previous(self: Column) Column {
         return switch (self) {
-            .model => .scope,
+            .model => .reasoning,
             .reasoning => .model,
-            .scope => .reasoning,
         };
     }
 };
 
 pub const ReasoningOption = struct { label: []const u8, effort: ai.ReasoningEffort };
-pub const Scope = enum { global, project, session };
 
 pub fn matches(model: codex.Model, filter: []const u8) bool {
     if (filter.len == 0) return true;
@@ -91,8 +74,11 @@ pub const Content = struct {
     active_model: ?[]const u8,
     reasoning_options: []const ReasoningOption,
     reasoning_indexes: []const u32,
-    scope: Scope,
     filter: []const u8 = "",
+    /// Pre-rendered status footer (scope, wire parameter preview). Empty
+    /// hides the footer row entirely. Built by the caller (overlay.zig),
+    /// which knows the scope, provider, and wire dialect.
+    footer: []const u8 = "",
     loading: bool = false,
     error_message: ?[]const u8 = null,
 
@@ -111,7 +97,26 @@ pub const Content = struct {
         self.list.item_count = @intCast(built.widgets.len);
         self.list.cursor = built.cursor;
         self.syncListScroll();
-        return panel.listSurface(ctx, self.widget(), self.list.widget());
+        const width = ctx.max.width orelse 0;
+        const height = ctx.max.height orelse 0;
+        // Reserve the bottom row for the status footer when one is set, so
+        // the footer never overlaps the last visible model row.
+        const list_height = if (self.footer.len > 0) height -| 1 else height;
+        const list_surface = try self.list.widget().draw(ctx.withConstraints(
+            .{ .width = width, .height = list_height },
+            .{ .width = width, .height = list_height },
+        ));
+        const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
+        children[0] = .{
+            .origin = .{ .row = 0, .col = 0 },
+            .surface = list_surface,
+            .z_index = 0,
+        };
+        var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, children);
+        if (self.footer.len > 0 and height > 0) {
+            try panel.lineStyledAt(&surface, height -| 1, self.footer, ctx, 0, StylePalette.thinking_body);
+        }
+        return surface;
     }
 
     fn drawStatus(self: *Content, ctx: vxfw.DrawContext, text: []const u8, style: vaxis.Style) std.mem.Allocator.Error!vxfw.Surface {
@@ -159,7 +164,6 @@ pub const Content = struct {
                 .column = self.column,
                 .active_model = self.active_model,
                 .reasoning_label = self.reasoningLabel(d),
-                .scope_label = scopeLabel(self.scope),
             };
             widgets[vis + 1] = rows[vis].widget();
             if (self.selection == d) cursor = @intCast(vis + 1);
@@ -198,7 +202,6 @@ const Header = struct {
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
         try panel.lineStyledAt(&surface, 0, "NAME", ctx, message.ConversationLayout.left + 1, StylePalette.panel_header);
         try panel.lineStyledAt(&surface, 0, "REASONING EFFORT", ctx, panel.secondaryColumn(surface.size.width) + 2, StylePalette.panel_header);
-        try panel.lineStyledAt(&surface, 0, "SCOPE", ctx, scopeColumn(surface.size.width) + 2, StylePalette.panel_header);
         return surface;
     }
 };
@@ -230,7 +233,6 @@ test "selection wrap to first row restores header" {
         .active_model = null,
         .reasoning_options = &options,
         .reasoning_indexes = &reasoning,
-        .scope = .global,
     };
     const ctx: vxfw.DrawContext = .{
         .arena = arena.allocator(),
@@ -278,7 +280,6 @@ test "filter limits the visible model rows" {
         .active_model = null,
         .reasoning_options = &options,
         .reasoning_indexes = &reasoning,
-        .scope = .global,
         .filter = "gpt",
     };
     const ctx: vxfw.DrawContext = .{
@@ -299,7 +300,6 @@ pub const Row = struct {
     column: Column,
     active_model: ?[]const u8,
     reasoning_label: []const u8,
-    scope_label: []const u8,
 
     pub fn widget(self: *Row) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -321,10 +321,7 @@ pub const Row = struct {
                 @as(u16, @intCast(@min(ctx.stringWidth(base), @as(usize, std.math.maxInt(u16)))));
             try panel.lineStyledAt(&surface, 0, " ✓", ctx, badge_col, tui_style.onSelectionBg(StylePalette.success, self.selected));
         }
-        if (self.selected) {
-            try self.drawReasoning(&surface, ctx);
-            try self.drawScope(&surface, ctx);
-        }
+        if (self.selected) try self.drawReasoning(&surface, ctx);
         return surface;
     }
 
@@ -338,12 +335,5 @@ pub const Row = struct {
         const prefix = "  ";
         const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.reasoning_label });
         try panel.lineStyledAt(surface, 0, text, ctx, panel.secondaryColumn(surface.size.width), columnStyle(focused, self.selected));
-    }
-
-    fn drawScope(self: *const Row, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
-        const focused = self.column == .scope;
-        const prefix = "  ";
-        const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.scope_label });
-        try panel.lineStyledAt(surface, 0, text, ctx, scopeColumn(surface.size.width), columnStyle(focused, self.selected));
     }
 };

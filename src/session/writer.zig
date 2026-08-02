@@ -195,12 +195,12 @@ pub const SessionWriter = struct {
         try self.session.branch(entry_id, null, null);
     }
 
-    /// Update the model provider and ID for the current session.
-    /// Called when the model selection changes during a session.
-    pub fn updateModel(self: *SessionWriter, provider: []const u8, model_id: []const u8) Error!void {
+    /// Update the model provider, ID, and reasoning effort for the current
+    /// session. Called when the model selection changes during a session.
+    pub fn updateModel(self: *SessionWriter, provider: []const u8, model_id: []const u8, effort_label: ?[]const u8) Error!void {
         self.quiesce();
         defer self.restart() catch {};
-        try self.session.updateModel(provider, model_id);
+        try self.session.updateModel(provider, model_id, effort_label);
     }
 
     pub fn leaf(self: *const SessionWriter) ?[]const u8 {

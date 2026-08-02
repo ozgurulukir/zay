@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const ai = @import("../ai.zig");
 const config_mod = @import("../config/config.zig");
 const os = @import("../os.zig");
 const runtime_mod = @import("../runtime.zig");
@@ -7,8 +8,16 @@ const runtime_mod = @import("../runtime.zig");
 pub const ModelStatus = struct {
     provider: []const u8,
     model: []const u8,
+    /// Active reasoning effort label ("default", "medium", "high", …).
+    /// Borrowed: from the live client's config or the model selection,
+    /// both of which resolve to static @tagName memory.
+    reasoning: []const u8 = "medium",
 };
 
+/// Resolve the active reasoning effort for display. Source priority:
+/// 1. live client config (what's actually being sent on the wire)
+/// 2. the model selection's configured reasoning
+/// 3. "medium" (the runtime default)
 pub fn modelStatus(runtime: ?*const runtime_mod.AgentRuntime, config: config_mod.Config) ?ModelStatus {
     if (runtime) |rt| {
         switch (rt.clientState()) {
@@ -17,14 +26,17 @@ pub fn modelStatus(runtime: ?*const runtime_mod.AgentRuntime, config: config_mod
                 .codex_responses => |client| return .{
                     .provider = "openai",
                     .model = client.core_client.config.model,
+                    .reasoning = effortLabel(if (client.core_client.config.reasoning) |r| r.effort else null),
                 },
                 .openai_responses => |client| return .{
                     .provider = providerLabel(config) orelse "openai",
                     .model = client.core_client.config.model,
+                    .reasoning = effortLabel(if (client.core_client.config.reasoning) |r| r.effort else null),
                 },
                 .openai_compatible => |client| return .{
                     .provider = providerDisplayName(config) orelse "openai_compatible",
                     .model = client.config.model,
+                    .reasoning = effortLabel(if (client.config.reasoning) |r| r.effort else null),
                 },
                 .none => unreachable,
             },
@@ -32,14 +44,24 @@ pub fn modelStatus(runtime: ?*const runtime_mod.AgentRuntime, config: config_mod
     }
 
     const model = if (config.model_selection) |ms| ms.model().id else if (config.model) |m| m.id else return null;
+    const reasoning = if (config.model_selection) |ms|
+        effortLabel(ms.model().reasoning.resolve())
+    else
+        "medium";
     return .{
         .provider = providerDisplayName(config) orelse return null,
         .model = model,
+        .reasoning = reasoning,
     };
 }
 
 pub fn formatModelStatus(gpa: std.mem.Allocator, status: ModelStatus) ![]u8 {
-    return std.fmt.allocPrint(gpa, "{s} · {s}", .{ status.provider, status.model });
+    return std.fmt.allocPrint(gpa, "{s} · {s} [{s}]", .{ status.provider, status.model, status.reasoning });
+}
+
+/// Render an optional effort as its label; unset falls back to "medium".
+fn effortLabel(effort: ?ai.ReasoningEffort) []const u8 {
+    return if (effort) |e| e.label() else "medium";
 }
 
 pub fn formatCwdRelative(
@@ -122,11 +144,24 @@ fn providerDisplayName(config: config_mod.Config) ?[]const u8 {
     return providerLabel(config);
 }
 
-test "model status formats as provider · model" {
+test "model status formats as provider · model [effort]" {
     const gpa = std.testing.allocator;
     const text = try formatModelStatus(gpa, .{ .provider = "ollama", .model = "llama" });
     defer gpa.free(text);
-    try std.testing.expectEqualStrings("ollama · llama", text);
+    try std.testing.expectEqualStrings("ollama · llama [medium]", text);
+}
+
+test "model status renders a non-default reasoning effort" {
+    const gpa = std.testing.allocator;
+    const text = try formatModelStatus(gpa, .{ .provider = "ollama", .model = "llama3.1:8b", .reasoning = "high" });
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("ollama · llama3.1:8b [high]", text);
+}
+
+test "effortLabel defaults unset to medium" {
+    try std.testing.expectEqualStrings("medium", effortLabel(null));
+    try std.testing.expectEqualStrings("high", effortLabel(.high));
+    try std.testing.expectEqualStrings("none", effortLabel(.none));
 }
 
 test "modifiedTime buckets" {

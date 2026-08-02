@@ -112,6 +112,10 @@ pub const SessionSummary = struct {
     /// created before schema v4 or when model info is not available.
     model_provider: ?[]u8,
     model_id: ?[]u8,
+    /// Session-scoped reasoning effort label ("default", "high", …).
+    /// null for sessions created before schema v5 or when the user never
+    /// overrode the effort — resume then falls back to config/default.
+    reasoning_effort: ?[]u8,
 
     pub fn deinit(self: *SessionSummary, gpa: std.mem.Allocator) void {
         gpa.free(self.id);
@@ -119,6 +123,7 @@ pub const SessionSummary = struct {
         gpa.free(self.cwd);
         if (self.model_provider) |mp| gpa.free(mp);
         if (self.model_id) |mid| gpa.free(mid);
+        if (self.reasoning_effort) |effort| gpa.free(effort);
         self.* = undefined;
     }
 };

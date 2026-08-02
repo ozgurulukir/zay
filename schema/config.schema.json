@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://nova-agent.dev/v2/config.schema.json",
   "title": "Nova Agent Configuration",
-  "description": "Configuration schema for Nova coding agent (v2). Supports layered merging: global (~/.config/nova/config.json) → project (.nova/config.json) → environment variables. JSON keys are camelCase; legacy snake_case keys are accepted for backward compatibility.",
+  "description": "Configuration schema for Nova coding agent (v2). Supports layered merging: global (~/.config/nova/config.json) → project (.nova/config.json) → environment variables. JSON keys are camelCase; legacy snake_case keys are accepted for backward compatibility. Reasoning effort is controlled per-model via providers.<name>.models.<id>.reasoningEffort; the legacy top-level 'enableThinking' boolean was removed — Nova still parses and discards it for backward compatibility.",
   "type": "object",
   "properties": {
     "version": {
@@ -25,11 +25,6 @@
       "type": "boolean",
       "default": false,
       "description": "Use the OpenAI Responses API instead of Chat Completions. Legacy key 'use_responses_endpoint' is parsed for backward compatibility but is not schema-valid; new configs must use 'useResponsesEndpoint'."
-    },
-    "enableThinking": {
-      "type": "boolean",
-      "default": false,
-      "description": "Enable extended thinking / reasoning mode. Legacy key 'enable_thinking' is parsed for backward compatibility but is not schema-valid; new configs must use 'enableThinking'."
     },
     "strictOutputs": {
       "type": "boolean",

@@ -21,10 +21,6 @@ const EditTarget = settings_widget.EditTarget;
 
 /// Check if pending values differ from current config values.
 fn hasActualChanges(state: *const State, config: *const config_mod.Config) bool {
-    if (state.pending_enable_thinking) |v| {
-        const current_value = if (config.model_selection) |ms| ms.enableThinking() else config.enable_thinking orelse false;
-        if (v != current_value) return true;
-    }
     if (state.pending_use_responses_endpoint) |v| {
         const current_value = if (config.model_selection) |ms| ms.useResponsesEndpoint() else config.use_responses_endpoint orelse false;
         if (v != current_value) return true;
@@ -101,16 +97,6 @@ pub fn submitSettings(app: *App) !void {
 fn submitGeneralItem(app: *App, state: *State) !void {
     switch (state.selection[@intFromEnum(Tab.general)]) {
         0 => {
-            // Toggle enable_thinking. Pending value overrides the config.
-            const current = state.pending_enable_thinking orelse
-                (if (app.cached_config.model_selection) |ms| ms.enableThinking() else app.cached_config.enable_thinking orelse false);
-            const new_value = !current;
-            state.pending_enable_thinking = new_value;
-            // Only mark dirty if the new value differs from the config
-            const config_value = if (app.cached_config.model_selection) |ms| ms.enableThinking() else app.cached_config.enable_thinking orelse false;
-            state.dirty = (new_value != config_value);
-        },
-        1 => {
             // Toggle use_responses_endpoint.
             const current = state.pending_use_responses_endpoint orelse
                 (if (app.cached_config.model_selection) |ms| ms.useResponsesEndpoint() else app.cached_config.use_responses_endpoint orelse false);
@@ -192,8 +178,8 @@ pub fn clearCurrentField(app: *App) void {
 /// config if one exists) and update the live cached_config. Returns true
 /// if anything was written.
 ///
-/// Only writes the fields that the settings panel manages (enable_thinking,
-/// use_responses_endpoint, system_prompt, bash_classifier_url). Provider
+/// Only writes the fields that the settings panel manages
+/// (use_responses_endpoint, system_prompt, bash_classifier_url). Provider
 /// and model selection are managed by the model picker, not here — cloning
 /// the merged model_selection would leak project-level overrides into the
 /// global config.
@@ -208,7 +194,6 @@ pub fn saveSettings(app: *App) !bool {
     if (!hasActualChanges(state, &app.cached_config)) {
         // No real changes, just reset pending state.
         state.dirty = false;
-        state.pending_enable_thinking = null;
         state.pending_use_responses_endpoint = null;
         state.pending_system_prompt = null;
         state.pending_bash_classifier_url = null;
@@ -244,9 +229,6 @@ pub fn saveSettings(app: *App) !bool {
     // copy project-level provider/model overrides into the global config.
     var updates: config_mod.Config = .{};
     defer updates.deinit(app.gpa);
-    if (state.pending_enable_thinking) |v| {
-        updates.enable_thinking = v;
-    }
     if (state.pending_use_responses_endpoint) |v| {
         updates.use_responses_endpoint = v;
     }
@@ -261,7 +243,7 @@ pub fn saveSettings(app: *App) !bool {
 
     // Write to global config only. Settings are user-level preferences,
     // not project-specific configuration. Provider/model selection can be
-    // project-specific, but enable_thinking, system_prompt, etc. should
+    // project-specific, but use_responses_endpoint, system_prompt, etc. should
     // apply globally across all projects.
     config_mod.mergeAndWriteGlobal(app.gpa, app.io, runtime.home_dir, updates) catch |err| {
         std.log.warn("settings.save.failed err={s}", .{@errorName(err)});
@@ -280,7 +262,6 @@ pub fn saveSettings(app: *App) !bool {
     if (state.pending_system_prompt) |old| app.gpa.free(old);
     if (state.pending_bash_classifier_url) |old| app.gpa.free(old);
     state.dirty = false;
-    state.pending_enable_thinking = null;
     state.pending_use_responses_endpoint = null;
     state.pending_system_prompt = null;
     state.pending_bash_classifier_url = null;
@@ -334,7 +315,6 @@ fn applyToCachedConfig(app: *App, state: *const State) !void {
         // Model selection exists: update it directly
         switch (ms.*) {
             .builtin => |*b| {
-                if (state.pending_enable_thinking) |v| b.enable_thinking = v;
                 if (state.pending_use_responses_endpoint) |v| b.use_responses_endpoint = v;
                 if (state.pending_system_prompt) |s| {
                     if (b.system_prompt) |old| app.gpa.free(old);
@@ -346,7 +326,6 @@ fn applyToCachedConfig(app: *App, state: *const State) !void {
                 }
             },
             .custom => |*c| {
-                if (state.pending_enable_thinking) |v| c.enable_thinking = v;
                 if (state.pending_use_responses_endpoint) |v| c.use_responses_endpoint = v;
                 if (state.pending_system_prompt) |s| {
                     if (c.system_prompt) |old| app.gpa.free(old);
@@ -360,7 +339,6 @@ fn applyToCachedConfig(app: *App, state: *const State) !void {
         }
     } else {
         // Legacy config: update legacy fields directly
-        if (state.pending_enable_thinking) |v| app.cached_config.enable_thinking = v;
         if (state.pending_use_responses_endpoint) |v| app.cached_config.use_responses_endpoint = v;
         if (state.pending_system_prompt) |s| {
             if (app.cached_config.system_prompt) |old| app.gpa.free(old);

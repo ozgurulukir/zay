@@ -4,8 +4,7 @@
 //!   2. global  `<home>/.config/nova/config.json`
 //!   3. project `<cwd>/.nova/config.json`
 //!   4. env vars: OPENAI_BASE_URL, OPENAI_API_KEY, OPENAI_MODEL,
-//!                NOVA_USE_RESPONSES_ENDPOINT, NOVA_ENABLE_THINKING,
-//!                NOVA_BASH_CLASSIFIER_URL
+//!                NOVA_USE_RESPONSES_ENDPOINT, NOVA_BASH_CLASSIFIER_URL
 //!
 //! `model` is a `<provider>/<model-id>` selection string. Model-specific
 //! fields such as `reasoningEffort` live under `providers.<provider>.models`.
@@ -118,7 +117,6 @@ pub const Config = struct {
     /// project plugins override global plugins with the same name.
     plugins: []PluginConfig = &.{},
     use_responses_endpoint: ?bool = null,
-    enable_thinking: ?bool = null,
     system_prompt: ?[]u8 = null,
     /// Whether to send OpenAI strict structured-outputs mode in tool
     /// definitions. Default `false` — strict mode is OpenAI-only and
@@ -174,7 +172,6 @@ pub const Config = struct {
         var out: Config = .{
             .provider = self.provider,
             .use_responses_endpoint = self.use_responses_endpoint,
-            .enable_thinking = self.enable_thinking,
             .strict_outputs = self.strict_outputs,
             .context = self.context,
         };

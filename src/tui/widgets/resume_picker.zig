@@ -568,7 +568,7 @@ test "resume picker shows a no-match empty state when the filter filters everyth
         .io = std.testing.io,
         .list = &list,
         .summaries = &.{
-            .{ .id = @constCast("1"), .title = @constCast("one"), .cwd = @constCast("/repo/a"), .created_at_ms = 0, .updated_at_ms = 1, .leaf_entry_id = null, .model_provider = null, .model_id = null },
+            .{ .id = @constCast("1"), .title = @constCast("one"), .cwd = @constCast("/repo/a"), .created_at_ms = 0, .updated_at_ms = 1, .leaf_entry_id = null, .model_provider = null, .model_id = null, .reasoning_effort = null },
         },
         .selection = 0,
         .folded_projects = &.{},
@@ -591,9 +591,9 @@ test "resume picker shows a no-match empty state when the filter filters everyth
 
 test "session tree counts project rows and folds children" {
     var summaries = [_]session_mod.SessionSummary{
-        .{ .id = @constCast("1"), .title = @constCast("one"), .cwd = @constCast("/repo/a"), .created_at_ms = 0, .updated_at_ms = 2, .leaf_entry_id = null, .model_provider = null, .model_id = null },
-        .{ .id = @constCast("2"), .title = @constCast("two"), .cwd = @constCast("/repo/a"), .created_at_ms = 0, .updated_at_ms = 1, .leaf_entry_id = null, .model_provider = null, .model_id = null },
-        .{ .id = @constCast("3"), .title = @constCast("three"), .cwd = @constCast("/repo/b"), .created_at_ms = 0, .updated_at_ms = 3, .leaf_entry_id = null, .model_provider = null, .model_id = null },
+        .{ .id = @constCast("1"), .title = @constCast("one"), .cwd = @constCast("/repo/a"), .created_at_ms = 0, .updated_at_ms = 2, .leaf_entry_id = null, .model_provider = null, .model_id = null, .reasoning_effort = null },
+        .{ .id = @constCast("2"), .title = @constCast("two"), .cwd = @constCast("/repo/a"), .created_at_ms = 0, .updated_at_ms = 1, .leaf_entry_id = null, .model_provider = null, .model_id = null, .reasoning_effort = null },
+        .{ .id = @constCast("3"), .title = @constCast("three"), .cwd = @constCast("/repo/b"), .created_at_ms = 0, .updated_at_ms = 3, .leaf_entry_id = null, .model_provider = null, .model_id = null, .reasoning_effort = null },
     };
 
     try std.testing.expectEqual(@as(u32, 3), visibleCount(std.testing.io, &summaries, "", &.{}, .flat));

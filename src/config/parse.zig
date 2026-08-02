@@ -121,14 +121,12 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
         if (ms.baseUrl()) |base_url| try replaceOptionalSlice(gpa, &target.base_url, base_url);
         if (ms.apiKey()) |api_key| try replaceOptionalSlice(gpa, &target.api_key, api_key);
         target.use_responses_endpoint = ms.useResponsesEndpoint();
-        target.enable_thinking = ms.enableThinking();
         if (ms.systemPrompt()) |s| try replaceOptionalSlice(gpa, &target.system_prompt, s);
         if (ms.bashClassifierUrl()) |s| try replaceOptionalSlice(gpa, &target.bash_classifier_url, s);
     } else {
         // Legacy fields: apply individual field overrides.
         if (updates.provider) |v| target.provider = v;
         if (updates.use_responses_endpoint) |v| target.use_responses_endpoint = v;
-        if (updates.enable_thinking) |v| target.enable_thinking = v;
         if (updates.strict_outputs) |v| target.strict_outputs = v;
         if (updates.base_url) |s| try replaceOptionalSlice(gpa, &target.base_url, s);
         if (updates.api_key) |s| try replaceOptionalSlice(gpa, &target.api_key, s);
@@ -181,7 +179,6 @@ pub fn syncModelSelectionFromLegacy(gpa: std.mem.Allocator, target: *Config) !vo
                 .api_key = try gpa.dupe(u8, api_key),
                 .model = try model.clone(gpa),
                 .use_responses_endpoint = target.use_responses_endpoint orelse false,
-                .enable_thinking = target.enable_thinking orelse false,
                 .system_prompt = if (target.system_prompt) |s| try gpa.dupe(u8, s) else null,
                 .bash_classifier_url = if (target.bash_classifier_url) |s| try gpa.dupe(u8, s) else null,
             },
@@ -191,7 +188,6 @@ pub fn syncModelSelectionFromLegacy(gpa: std.mem.Allocator, target: *Config) !vo
                 .provider_name = try gpa.dupe(u8, provider_name),
                 .model = try model.clone(gpa),
                 .use_responses_endpoint = target.use_responses_endpoint orelse false,
-                .enable_thinking = target.enable_thinking orelse false,
                 .system_prompt = if (target.system_prompt) |s| try gpa.dupe(u8, s) else null,
                 .bash_classifier_url = if (target.bash_classifier_url) |s| try gpa.dupe(u8, s) else null,
             },
@@ -518,7 +514,10 @@ fn parseObject(
         if (s.len > 0) out.bash_classifier_url = try gpa.dupe(u8, s);
     }
     if (boolFieldCompat(value, "useResponsesEndpoint", "use_responses_endpoint")) |b| out.use_responses_endpoint = b;
-    if (boolFieldCompat(value, "enableThinking", "enable_thinking")) |b| out.enable_thinking = b;
+    // The legacy `enableThinking` / `enable_thinking` key is accepted but
+    // discarded: reasoning is controlled per-model via `reasoningEffort`
+    // (see the reasoning-effort-lifecycle plan, Phase 2). Existing configs
+    // that still carry the key parse without error; the next save drops it.
     if (boolFieldCompat(value, "strictOutputs", "strict_outputs")) |b| out.strict_outputs = b;
     if (stringFieldCompat(value, "systemPrompt", "system_prompt")) |s| {
         out.system_prompt = try gpa.dupe(u8, s);
@@ -546,7 +545,6 @@ fn parseObject(
                     .api_key = out.api_key.?,
                     .model = model,
                     .use_responses_endpoint = out.use_responses_endpoint orelse false,
-                    .enable_thinking = out.enable_thinking orelse false,
                     .system_prompt = out.system_prompt,
                     .bash_classifier_url = out.bash_classifier_url,
                 },
@@ -558,7 +556,6 @@ fn parseObject(
                     .provider_name = out.provider_name orelse try gpa.dupe(u8, provider.label()),
                     .model = model,
                     .use_responses_endpoint = out.use_responses_endpoint orelse false,
-                    .enable_thinking = out.enable_thinking orelse false,
                     .system_prompt = out.system_prompt,
                     .bash_classifier_url = out.bash_classifier_url,
                 },
@@ -570,7 +567,6 @@ fn parseObject(
         out.base_url = null;
         out.api_key = null;
         out.use_responses_endpoint = null;
-        out.enable_thinking = null;
         out.system_prompt = null;
         out.bash_classifier_url = null;
     }
@@ -834,9 +830,6 @@ fn loadEnv(
     if (env.get("NOVA_USE_RESPONSES_ENDPOINT")) |s| {
         out.use_responses_endpoint = parseBool(s);
     }
-    if (env.get("NOVA_ENABLE_THINKING")) |s| {
-        out.enable_thinking = parseBool(s);
-    }
     if (env.get("NOVA_STRICT_OUTPUTS")) |s| {
         out.strict_outputs = parseBool(s);
     }
@@ -1079,10 +1072,6 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
             try writeKey(writer, "useResponsesEndpoint", &wrote_any);
             try writer.writeAll("true");
         }
-        if (ms.enableThinking()) {
-            try writeKey(writer, "enableThinking", &wrote_any);
-            try writer.writeAll("true");
-        }
         if (ms.systemPrompt()) |s| {
             try writeKey(writer, "systemPrompt", &wrote_any);
             try std.json.Stringify.value(s, .{}, writer);
@@ -1106,10 +1095,6 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
     } else {
         if (config.use_responses_endpoint) |b| {
             try writeKey(writer, "useResponsesEndpoint", &wrote_any);
-            try writer.writeAll(if (b) "true" else "false");
-        }
-        if (config.enable_thinking) |b| {
-            try writeKey(writer, "enableThinking", &wrote_any);
             try writer.writeAll(if (b) "true" else "false");
         }
         if (config.strict_outputs) |b| {
@@ -1666,12 +1651,10 @@ test "loadEnv: NOVA_USE_RESPONSES_ENDPOINT parses bools" {
     defer sink.deinit(gpa);
     const env: TestEnv = .{ .entries = &.{
         .{ .key = "NOVA_USE_RESPONSES_ENDPOINT", .value = "1" },
-        .{ .key = "NOVA_ENABLE_THINKING", .value = "true" },
     } };
     var cfg = try loadEnv(gpa, env, &sink);
     defer cfg.deinit(gpa);
     try std.testing.expectEqual(true, cfg.use_responses_endpoint.?);
-    try std.testing.expectEqual(true, cfg.enable_thinking.?);
 }
 
 test "serialize: skips api_key even if present" {
@@ -1754,7 +1737,6 @@ test "serialize then parse roundtrips" {
         .provider = .ollama,
         .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
         .use_responses_endpoint = false,
-        .enable_thinking = true,
         .strict_outputs = true,
         .model = .{ .id = try gpa.dupe(u8, "llama3.1:8b") },
         .providers = providers,
@@ -1777,14 +1759,13 @@ test "serialize then parse roundtrips" {
     try std.testing.expectEqual(Provider.ollama, roundtrip.provider.?);
     try std.testing.expectEqualStrings("http://localhost:11434/v1", roundtrip.base_url.?);
     try std.testing.expectEqual(false, roundtrip.use_responses_endpoint.?);
-    try std.testing.expectEqual(true, roundtrip.enable_thinking.?);
     try std.testing.expectEqual(true, roundtrip.strict_outputs.?);
     try std.testing.expectEqualStrings("llama3.1:8b", roundtrip.model.?.id);
 }
 
 test "serialize writes strictOutputs even when model_selection is set" {
     // Regression: serialize'in `model_selection` kolu (normal üretim durumu)
-    // eskiden useResponsesEndpoint/enableThinking/systemPrompt/bashClassifierUrl
+    // eskiden useResponsesEndpoint/systemPrompt/bashClassifierUrl
     // yazıyordu ama strictOutputs'u yazmıyordu — yalnızca legacy kol (model_selection
     // null iken) yazıyordu. Üretimde model_selection set olduğu için kullanıcı
     // strictOutputs: true ayarlasa bile config'e kayboluyor, restart'ta false'a
@@ -1857,7 +1838,6 @@ test "serialize outputs semver version and camelCase 2-space indented JSON" {
     var cfg: Config = .{
         .provider = .openai,
         .use_responses_endpoint = true,
-        .enable_thinking = false,
     };
     defer cfg.deinit(gpa);
 
@@ -2180,7 +2160,6 @@ test "applyConfigOverlay: legacy fields sync to model_selection" {
     target.base_url = try gpa.dupe(u8, "https://api.openai.com");
     target.api_key = try gpa.dupe(u8, "sk-test");
     target.use_responses_endpoint = false;
-    target.enable_thinking = false;
     // Manually populate model_selection (normally done by parseObject).
     target.model_selection = .{
         .builtin = .{
@@ -2192,7 +2171,6 @@ test "applyConfigOverlay: legacy fields sync to model_selection" {
 
     // Updates carry only legacy fields (no model_selection).
     var updates: Config = .{
-        .enable_thinking = true,
         .system_prompt = try gpa.dupe(u8, "You are a helpful assistant."),
     };
     defer updates.deinit(gpa);
@@ -2200,11 +2178,9 @@ test "applyConfigOverlay: legacy fields sync to model_selection" {
     try applyConfigOverlay(gpa, &target, updates);
 
     // Legacy fields updated.
-    try std.testing.expectEqual(true, target.enable_thinking.?);
     try std.testing.expectEqualStrings("You are a helpful assistant.", target.system_prompt.?);
 
     // model_selection should also be in sync.
-    try std.testing.expectEqual(true, target.model_selection.?.enableThinking());
     try std.testing.expectEqualStrings("You are a helpful assistant.", target.model_selection.?.systemPrompt().?);
 
     // Provider/model should be unchanged.
@@ -2229,9 +2205,9 @@ test "mergeLayers: settings-only overlay does not overwrite provider/model" {
     };
     defer project.deinit(gpa);
 
-    // Simulate a settings-only update (no provider/model, just enable_thinking).
+    // Simulate a settings-only update (no provider/model).
     var settings: Config = .{
-        .enable_thinking = true,
+        .use_responses_endpoint = true,
     };
     defer settings.deinit(gpa);
 
@@ -2242,8 +2218,8 @@ test "mergeLayers: settings-only overlay does not overwrite provider/model" {
     // Provider/model should come from project (last layer that set them).
     try std.testing.expectEqual(Provider.ollama, merged.provider.?);
     try std.testing.expectEqualStrings("llama3.1:8b", merged.model.?.id);
-    // enable_thinking should come from settings.
-    try std.testing.expectEqual(true, merged.enable_thinking.?);
+    // use_responses_endpoint should come from settings.
+    try std.testing.expectEqual(true, merged.use_responses_endpoint.?);
 }
 
 // ---------------------------------------------------------------------------
@@ -2263,9 +2239,9 @@ test "parseObject accepts camelCase keys (schema v2)" {
     try std.testing.expectEqualStrings("llama3.1:8b", cfg.model.?.id);
     try std.testing.expectEqualStrings("http://localhost:11434", cfg.base_url.?);
     try std.testing.expectEqual(true, cfg.use_responses_endpoint.?);
-    try std.testing.expectEqual(true, cfg.enable_thinking.?);
     try std.testing.expectEqualStrings("You are Nova.", cfg.system_prompt.?);
     try std.testing.expectEqualStrings("http://localhost:9999", cfg.bash_classifier_url.?);
+    // The legacy `enableThinking` key is accepted and discarded — no diagnostics.
     try std.testing.expectEqual(@as(usize, 0), sink.items.len);
 }
 
@@ -2282,9 +2258,9 @@ test "parseObject accepts legacy snake_case keys (backward compat)" {
     try std.testing.expectEqualStrings("gpt-5.5", cfg.model.?.id);
     try std.testing.expectEqualStrings("https://api.openai.com", cfg.base_url.?);
     try std.testing.expectEqual(false, cfg.use_responses_endpoint.?);
-    try std.testing.expectEqual(false, cfg.enable_thinking.?);
     try std.testing.expectEqualStrings("Legacy.", cfg.system_prompt.?);
     try std.testing.expectEqualStrings("http://old:8080", cfg.bash_classifier_url.?);
+    // The legacy snake_case `enable_thinking` key is accepted and discarded.
 }
 
 test "parseObject: camelCase wins over snake_case when both present" {
@@ -2365,7 +2341,6 @@ test "serialize writes camelCase keys and context section" {
         .provider = .ollama,
         .model = .{ .id = try gpa.dupe(u8, "llama3.1:8b") },
         .use_responses_endpoint = true,
-        .enable_thinking = true,
         .system_prompt = try gpa.dupe(u8, "Be helpful."),
         .context = .{
             .override_context_window = 32_000,
@@ -2381,7 +2356,6 @@ test "serialize writes camelCase keys and context section" {
     const text = buf.written();
     try std.testing.expect(std.mem.indexOf(u8, text, "\"defaultModel\": \"ollama/llama3.1:8b\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"useResponsesEndpoint\": true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "\"enableThinking\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"systemPrompt\": \"Be helpful.\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"context\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"overrideContextWindow\"") != null);
@@ -2406,7 +2380,6 @@ test "serialize then parse roundtrips with camelCase and context" {
         .provider = .ollama,
         .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
         .use_responses_endpoint = false,
-        .enable_thinking = true,
         .model = .{ .id = try gpa.dupe(u8, "llama3.1:8b") },
         .context = .{
             .override_context_window = 16_000,
@@ -2429,7 +2402,6 @@ test "serialize then parse roundtrips with camelCase and context" {
     try std.testing.expectEqual(Provider.ollama, roundtrip.provider.?);
     try std.testing.expectEqualStrings("llama3.1:8b", roundtrip.model.?.id);
     try std.testing.expectEqual(false, roundtrip.use_responses_endpoint.?);
-    try std.testing.expectEqual(true, roundtrip.enable_thinking.?);
     try std.testing.expectEqual(@as(u32, 16_000), roundtrip.context.override_context_window.?);
     try std.testing.expectEqual(false, roundtrip.context.compaction.auto);
     try std.testing.expectEqual(@as(u32, 4_000), roundtrip.context.compaction.keep_recent_tokens);

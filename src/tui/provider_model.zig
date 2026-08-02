@@ -827,7 +827,7 @@ pub fn applySelectedModel(self: *App) !void {
     // runtime with an undefined session_writer.
     if (self.liveRuntime()) |rt| {
         if (rt.session_writer_started) {
-            rt.session_writer.updateModel(provider_name, model.id) catch |err| {
+            rt.session_writer.updateModel(provider_name, model.id, effort.label()) catch |err| {
                 std.log.warn("session.updateModel.failed provider={s} model={s} err={s}", .{ provider_name, model.id, @errorName(err) });
             };
         }
@@ -1452,6 +1452,11 @@ pub fn attachOpenAiCompatibleClient(
     defer self.gpa.free(mcp_schemas);
     runtime.mcp_tools = mcp_schemas;
     runtime.strict_outputs = self.cached_config.strict_outputs orelse false;
+    runtime.wire_dialect = ai.WireDialect.resolve(
+        self.cached_config.provider,
+        self.cached_config.provider_name orelse "",
+        base_url,
+    );
     try runtime.attachOpenAiCompatibleClient(base_url, api_key, model_id, effort);
     self.thread.agent.?.client = runtime.client;
     injectPluginTools(self);

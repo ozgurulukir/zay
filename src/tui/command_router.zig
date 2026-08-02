@@ -156,8 +156,14 @@ const ModelPicker = struct {
             switch (models.model_column) {
                 .model => models.model_column = models.model_column.next(),
                 .reasoning => try provider_model.cycleSelectedReasoning(app),
-                .scope => provider_model.cycleModelScope(app),
             }
+            return true;
+        }
+        // Ctrl+S cycles the save scope (global → project → session) from the
+        // picker. The scope no longer has a table column — it's shown in the
+        // footer status line instead.
+        if (key.matches('s', .{ .ctrl = true })) {
+            provider_model.cycleModelScope(app);
             return true;
         }
         if (key.matches(vaxis.Key.up, .{})) {

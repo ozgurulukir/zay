@@ -54,6 +54,11 @@ pub const AgentRuntime = struct {
     /// Default `false` — strict is OpenAI-only and breaks function-calling
     /// on gateways. Set from `config.strict_outputs` at session init.
     strict_outputs: bool = false,
+    /// Wire-format dialect for vendor-specific request fields.
+    /// Resolved from provider identity at connect time and forwarded
+    /// to every attached client's `ai.Config`. Default `.minimal` is
+    /// safe for all providers (no vendor-specific fields emitted).
+    wire_dialect: ai.WireDialect = .minimal,
     /// Context window and compaction settings from config. Stored so
     /// the attach/connect functions can pass the override to
     /// `compaction.contextWindowTokens` and the agent can use the
@@ -246,6 +251,13 @@ pub const AgentRuntime = struct {
             _ = id;
             var summary = try target.session_writer.session.summary(gpa);
             defer summary.deinit(gpa);
+            // Resolve the session's stored reasoning effort (if any) so resume
+            // restores the exact effort in use at save time. Invalid DB values
+            // (newer schema, hand-edited) degrade to "no override" — never fatal.
+            const resume_effort: ?ai.ReasoningEffort = if (summary.reasoning_effort) |label|
+                (ai.ReasoningEffort.fromString(label) catch null)
+            else
+                null;
             if (summary.model_provider) |mp| {
                 // Resolve the provider: try builtin enum first, then the
                 // providers[] config map (custom providers like "qwen-cloud").
@@ -292,6 +304,14 @@ pub const AgentRuntime = struct {
                             }
                         },
                     }
+                    // Restore the session's reasoning effort override (if any)
+                    // onto the selection before applying it to the client.
+                    if (resume_effort) |effort| {
+                        switch (ms.*) {
+                            .builtin => |*b| b.model.reasoning = .{ .effort = effort },
+                            .custom => |*c| c.model.reasoning = .{ .effort = effort },
+                        }
+                    }
                     try target.applyFromConfig(session_config);
                     // Free the dupe'd model_id — applyFromConfig dupe'd it again
                     // into the client, so the session_config copy is no longer needed.
@@ -316,7 +336,7 @@ pub const AgentRuntime = struct {
                                     .provider_name = @constCast(mp),
                                     .model = .{
                                         .id = owned_mid,
-                                        .reasoning = .unset,
+                                        .reasoning = if (resume_effort) |effort| .{ .effort = effort } else .unset,
                                     },
                                     .use_responses_endpoint = false,
                                     .bash_classifier_url = null,
@@ -330,7 +350,7 @@ pub const AgentRuntime = struct {
                                     .api_key = "",
                                     .model = .{
                                         .id = owned_mid,
-                                        .reasoning = .unset,
+                                        .reasoning = if (resume_effort) |effort| .{ .effort = effort } else .unset,
                                     },
                                     .use_responses_endpoint = false,
                                     .bash_classifier_url = null,
@@ -427,7 +447,9 @@ pub const AgentRuntime = struct {
         }
         // Save the model selection to the session so it can be restored on resume.
         // Use provider_name (the config key) so custom providers round-trip.
-        try self.session_writer.session.updateModel(selection.providerName(), model_id);
+        // The resolved reasoning effort is persisted too so session-scoped
+        // effort survives restart.
+        try self.session_writer.session.updateModel(selection.providerName(), model_id, selection.model().reasoning.resolve().label());
     }
 
     fn adapterForConfig(provider: config_mod.Provider, config: config_mod.Config) ?config_mod.AdapterKind {
@@ -476,6 +498,12 @@ pub const AgentRuntime = struct {
         provider: config_mod.Provider,
         config: config_mod.Config,
     ) !void {
+        // Resolve wire dialect from provider identity before any attach.
+        self.wire_dialect = ai.WireDialect.resolve(
+            provider,
+            config.provider_name orelse "",
+            config.base_url orelse "",
+        );
         const ms = config.model_selection orelse {
             // No typed selection — fall back to legacy fields. For builtin
             // providers defaultBaseUrl() suffices; for .openai_compatible
@@ -665,6 +693,7 @@ pub const AgentRuntime = struct {
             .mcp_tools = self.mcp_tools,
             .reasoning = .{ .effort = effort },
             .strict = self.strict_outputs,
+            .wire_dialect = self.wire_dialect,
             .max_output_tokens = self.context_settings.max_output_tokens,
             .max_parallel_tool_calls = self.context_settings.max_parallel_tool_calls orelse 16,
             .request_timeout_seconds = self.context_settings.request_timeout_seconds orelse 300,

@@ -6,7 +6,7 @@ const db = @import("../db.zig");
 const assert = std.debug.assert;
 
 /// Current schema version for the sessions database.
-pub const schema_version: u32 = 4;
+pub const schema_version: u32 = 5;
 
 /// Default path relative to the nova config directory.
 pub const default_db_relative_path = ".config/nova/sessions.sqlite";
@@ -28,7 +28,7 @@ pub fn migrate(connection: *db.Connection, io: std.Io) !void {
     try connection.exec("pragma foreign_keys = on");
     try connection.exec("pragma journal_mode = wal");
     try connection.exec("create table if not exists schema_migrations(version integer primary key, applied_at_ms integer not null)");
-    try connection.exec("create table if not exists sessions(id text primary key, title text, cwd text not null, created_at_ms integer not null, updated_at_ms integer not null, leaf_entry_id text, model_provider text, model_id text, foreign key(id, leaf_entry_id) references session_entries(session_id, id))");
+    try connection.exec("create table if not exists sessions(id text primary key, title text, cwd text not null, created_at_ms integer not null, updated_at_ms integer not null, leaf_entry_id text, model_provider text, model_id text, reasoning_effort text, foreign key(id, leaf_entry_id) references session_entries(session_id, id))");
     try connection.exec("create table if not exists session_entries(id text not null, session_id text not null, parent_id text, kind text not null, role text, payload_json text not null, created_at_ms integer not null, snapshot text, primary key(session_id, id), foreign key(session_id) references sessions(id) on delete cascade, foreign key(session_id, parent_id) references session_entries(session_id, id))");
     // Upgrade DBs created before the git-shadow model: add the `snapshot` column
     // (a git commit id binding the entry to its code state). On a fresh DB the
@@ -37,6 +37,10 @@ pub fn migrate(connection: *db.Connection, io: std.Io) !void {
     // Upgrade DBs from schema v3 to v4: add model_provider and model_id columns
     connection.exec("alter table sessions add column model_provider text") catch {};
     connection.exec("alter table sessions add column model_id text") catch {};
+    // Upgrade DBs from schema v4 to v5: add the session-scoped reasoning effort
+    // label. Nullable (NULL = "use config/default"). On a fresh DB the column
+    // already exists in the CREATE TABLE, so the ALTER fails — ignore.
+    connection.exec("alter table sessions add column reasoning_effort text") catch {};
     try connection.exec("create index if not exists session_entries_parent on session_entries(session_id, parent_id)");
     try connection.exec("create index if not exists session_entries_kind on session_entries(session_id, kind)");
     try connection.exec("create index if not exists session_entries_role on session_entries(session_id, role)");

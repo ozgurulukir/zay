@@ -4,7 +4,7 @@
 //! configuration screen with live toggle controls and a multi-line
 //! system-prompt editor. Sections:
 //!
-//!   General   — enable_thinking, use_responses_endpoint
+//!   General   — use_responses_endpoint
 //!   Prompt    — system_prompt multi-line editor
 //!   Advanced  — bash_classifier_url
 //!   About     — version, config paths
@@ -65,7 +65,6 @@ pub const State = struct {
     selection: TabSelection = @splat(0),
     edit_target: EditTarget = .none,
     /// Pending (unsaved) edits — null means use the live cached_config value.
-    pending_enable_thinking: ?bool = null,
     pending_use_responses_endpoint: ?bool = null,
     /// Pending system prompt text (owned by App, edited via the settings input).
     pending_system_prompt: ?[]const u8 = null,
@@ -137,7 +136,7 @@ pub const State = struct {
 };
 
 // Item counts per section (used for wrapping navigation).
-const general_item_count: u32 = 2; // enable_thinking, use_responses_endpoint
+const general_item_count: u32 = 1; // use_responses_endpoint
 const prompt_item_count: u32 = 1; // system_prompt editor entry
 const advanced_item_count: u32 = 1; // bash_classifier_url
 const about_item_count: u32 = 0; // read-only info
@@ -221,30 +220,17 @@ pub const Content = struct {
         // Row 2: section header.
         try panel.lineStyledAt(surface, 2, "GENERAL SETTINGS", ctx, left_col, StylePalette.panel_header);
 
-        // Row 4: enable_thinking toggle.
+        // Row 4: use_responses_endpoint toggle.
         {
             const selected = sel == 0;
             if (selected) panel.fillRow(surface, 4, StylePalette.selected);
-            const value = self.state.pending_enable_thinking orelse
-                (if (self.config.model_selection) |ms| ms.enableThinking() else false);
-            const label = try std.fmt.allocPrint(ctx.arena, "  Enable Thinking Mode    {s}", .{boolBadge(value)});
-            const style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;
-            try panel.lineStyledAt(surface, 4, label, ctx, left_col, style);
-            const desc = "Enables extended reasoning (o1/o3 models). Has no effect on models without reasoning support.";
-            try self.drawDescription(surface, ctx, 5, desc, selected);
-        }
-
-        // Row 7: use_responses_endpoint toggle.
-        {
-            const selected = sel == 1;
-            if (selected) panel.fillRow(surface, 7, StylePalette.selected);
             const value = self.state.pending_use_responses_endpoint orelse
                 (if (self.config.model_selection) |ms| ms.useResponsesEndpoint() else false);
             const label = try std.fmt.allocPrint(ctx.arena, "  Use Responses Endpoint  {s}", .{boolBadge(value)});
             const style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;
-            try panel.lineStyledAt(surface, 7, label, ctx, left_col, style);
+            try panel.lineStyledAt(surface, 4, label, ctx, left_col, style);
             const desc = "Route completions through the OpenAI Responses API instead of Chat Completions.";
-            try self.drawDescription(surface, ctx, 8, desc, selected);
+            try self.drawDescription(surface, ctx, 5, desc, selected);
         }
     }
 
@@ -510,12 +496,10 @@ test "settings tab cycles forward and back" {
 test "settings selection wraps within section" {
     var state: State = .{};
     try std.testing.expectEqual(@as(u32, 0), state.currentSelection());
-    state.moveDown();
-    try std.testing.expectEqual(@as(u32, 1), state.currentSelection());
-    state.moveDown(); // wraps back to 0
+    state.moveDown(); // general has a single item — wraps to itself
     try std.testing.expectEqual(@as(u32, 0), state.currentSelection());
-    state.moveUp(); // wraps to last
-    try std.testing.expectEqual(@as(u32, 1), state.currentSelection());
+    state.moveUp();
+    try std.testing.expectEqual(@as(u32, 0), state.currentSelection());
 }
 
 test "settings boolBadge returns correct label" {

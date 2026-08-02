@@ -368,13 +368,6 @@ pub const ModelSelection = union(enum) {
         };
     }
 
-    pub fn enableThinking(self: ModelSelection) bool {
-        return switch (self) {
-            .builtin => |b| b.enable_thinking,
-            .custom => |c| c.enable_thinking,
-        };
-    }
-
     pub fn systemPrompt(self: ModelSelection) ?[]const u8 {
         return switch (self) {
             .builtin => |b| b.system_prompt,
@@ -397,7 +390,6 @@ const BuiltinSelection = struct {
     provider_name: []u8,
     model: Model,
     use_responses_endpoint: bool = false,
-    enable_thinking: bool = false,
     system_prompt: ?[]u8 = null,
     bash_classifier_url: ?[]u8 = null,
 
@@ -415,7 +407,6 @@ const BuiltinSelection = struct {
             .provider_name = try gpa.dupe(u8, self.provider_name),
             .model = try self.model.clone(gpa),
             .use_responses_endpoint = self.use_responses_endpoint,
-            .enable_thinking = self.enable_thinking,
             .system_prompt = if (self.system_prompt) |s| try gpa.dupe(u8, s) else null,
             .bash_classifier_url = if (self.bash_classifier_url) |s| try gpa.dupe(u8, s) else null,
         };
@@ -428,7 +419,6 @@ const CustomSelection = struct {
     api_key: []u8,
     model: Model,
     use_responses_endpoint: bool = false,
-    enable_thinking: bool = false,
     system_prompt: ?[]u8 = null,
     bash_classifier_url: ?[]u8 = null,
 
@@ -449,7 +439,6 @@ const CustomSelection = struct {
             .api_key = try gpa.dupe(u8, self.api_key),
             .model = try self.model.clone(gpa),
             .use_responses_endpoint = self.use_responses_endpoint,
-            .enable_thinking = self.enable_thinking,
             .system_prompt = if (self.system_prompt) |s| try gpa.dupe(u8, s) else null,
             .bash_classifier_url = if (self.bash_classifier_url) |s| try gpa.dupe(u8, s) else null,
         };

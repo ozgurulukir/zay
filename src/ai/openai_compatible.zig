@@ -162,6 +162,7 @@ pub const Client = struct {
             self.tools_json,
             self.config.reasoning,
             self.config.max_output_tokens,
+            self.config.wire_dialect,
         );
         logger.log("openai_compatible.request POST {s} body={s}", .{ self.url, logBytes(payload.written()) });
 
@@ -356,7 +357,7 @@ test "extractErrorMessage pulls the nested message, plain error, or raw fallback
     try std.testing.expectEqualStrings("upstream timeout", raw);
 }
 
-fn writeMessage(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMessage) !void {
+fn writeMessage(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMessage, dialect: ai.WireDialect) !void {
     try out.writeAll("{\"role\":");
     const role_label: []const u8 = switch (message) {
         .system => "system",
@@ -365,9 +366,11 @@ fn writeMessage(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMes
         .tool => "tool",
     };
     try std.json.Stringify.value(role_label, .{}, out);
-    switch (message) {
-        .system => try out.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}"),
-        else => {},
+    if (dialect.allowsCacheControl()) {
+        switch (message) {
+            .system => try out.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}"),
+            else => {},
+        }
     }
     try out.writeAll(",\"content\":");
     switch (message) {
@@ -483,6 +486,7 @@ fn writeRequestPayload(
     tools_json: []const u8,
     reasoning: ?ai.Reasoning,
     max_output_tokens: ?u32,
+    dialect: ai.WireDialect,
 ) !void {
     std.debug.assert(model.len > 0);
     std.debug.assert(tools_json.len > 0);
@@ -492,7 +496,7 @@ fn writeRequestPayload(
     try out.writeAll(",\"messages\":[");
     for (messages, 0..) |*view, index| {
         if (index > 0) try out.writeByte(',');
-        try writeMessage(out, gpa, view.message().*);
+        try writeMessage(out, gpa, view.message().*, dialect);
     }
     // `stream_options.include_usage` makes the server emit a final usage-only
     // chunk (empty `choices`) before `[DONE]`. Without it, streaming responses
@@ -513,8 +517,8 @@ fn writeRequestPayload(
     // Standard OpenAI cache-routing hint: steers requests sharing this session's
     // prefix to the same backend, raising prefix-cache hit rates (used by
     // gateways like OpenCode Zen; servers that don't support it, e.g. Ollama,
-    // ignore the unknown field).
-    if (session_id.len > 0) {
+    // reject the unknown field with 400).
+    if (session_id.len > 0 and dialect.allowsPromptCacheKey()) {
         try out.writeAll(",\"prompt_cache_key\":");
         try std.json.Stringify.value(session_id, .{}, out);
     }
@@ -530,7 +534,13 @@ fn writeRequestPayload(
             try out.writeByte('}');
             return;
         },
-        .none => try out.writeAll(",\"enable_thinking\":false}"),
+        .none => {
+            if (dialect.usesEnableThinking()) {
+                try out.writeAll(",\"enable_thinking\":false}");
+            } else {
+                try out.writeAll(",\"reasoning_effort\":\"none\"}");
+            }
+        },
         else => {
             try out.writeAll(",\"reasoning_effort\":\"");
             try out.writeAll(value.label());
@@ -886,26 +896,46 @@ test "writeRequestPayload disables thinking for reasoning effort none" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "", &.{}, "[]", .{ .effort = .none }, null);
+    // DashScope dialect uses enable_thinking:false
+    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "", &.{}, "[]", .{ .effort = .none }, null, .dashscope);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_effort") == null);
+}
+
+test "writeRequestPayload uses reasoning_effort none for minimal dialect" {
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "ollama-model", "", &.{}, "[]", .{ .effort = .none }, null, .minimal);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"none\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "enable_thinking") == null);
 }
 
 test "writeRequestPayload emits prompt_cache_key from the session id" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "session-abc", &.{}, "[]", null, null);
+    try writeRequestPayload(gpa, &payload.writer, "gpt-test", "session-abc", &.{}, "[]", null, null, .openai);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"session-abc\"") != null);
+}
+
+test "writeRequestPayload omits prompt_cache_key for minimal dialect" {
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "ollama-model", "session-abc", &.{}, "[]", null, null, .minimal);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_key") == null);
 }
 
 test "writeRequestPayload omits prompt_cache_key when no session id is set" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "", &.{}, "[]", null, null);
+    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "", &.{}, "[]", null, null, .openai);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_key") == null);
 }
@@ -916,7 +946,7 @@ test "writeRequestPayload omits tools and tool_choice when there are none" {
     defer payload.deinit();
     // The background summarizer sends no tools ("[]"); the request must not carry
     // a `tool_choice` (rejected by strict providers) or invite a tool-call reply.
-    try writeRequestPayload(gpa, &payload.writer, "summarizer", "", &.{}, "[]", null, null);
+    try writeRequestPayload(gpa, &payload.writer, "summarizer", "", &.{}, "[]", null, null, .minimal);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "tool_choice") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") == null);
@@ -926,7 +956,7 @@ test "writeRequestPayload keeps tools and tool_choice when tools are present" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "agent", "", &.{}, "[{\"type\":\"function\"}]", null, null);
+    try writeRequestPayload(gpa, &payload.writer, "agent", "", &.{}, "[{\"type\":\"function\"}]", null, null, .minimal);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"auto\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":[{\"type\":\"function\"}]") != null);
@@ -961,7 +991,7 @@ test "writeRequestPayload serializes tool call ids as strings, not objects" {
 
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "test-model", "", &views, "[{\"type\":\"function\"}]", null, null);
+    try writeRequestPayload(gpa, &payload.writer, "test-model", "", &views, "[{\"type\":\"function\"}]", null, null, .minimal);
     const body = payload.written();
 
     // The tool_call id must be a JSON string, not an object
