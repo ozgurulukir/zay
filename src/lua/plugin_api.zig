@@ -2160,6 +2160,118 @@ test "registerTool + countTools: sandboxed state" {
     try std.testing.expectEqual(@as(u32, 1), countTools(L.handle));
 }
 
+// ── nova.write_file / writeFileAtomic tests ──────────────────────────
+//
+// writeFileAtomic is the shared write+rename core behind both nova.write_file
+// and nova.edit_file; the Lua-level tests exercise the binding surface
+// (argument validation, path sanitization, and a real write under cwd).
+
+test "writeFileAtomic writes, overwrites, and leaves no temp file" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // std.testing.tmpDir lives under <cwd>/.zig-cache/tmp/<sub_path>.
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const target = try std.fs.path.join(gpa, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "write-test.txt" });
+    defer gpa.free(target);
+
+    // First write creates the file.
+    try writeFileAtomic(io, target, "hello");
+    {
+        const content = try readFileBytes(io, target, 4096);
+        defer std.heap.page_allocator.free(content);
+        try std.testing.expectEqualStrings("hello", content);
+    }
+
+    // A second write replaces the whole content atomically.
+    try writeFileAtomic(io, target, "hello world");
+    {
+        const content = try readFileBytes(io, target, 4096);
+        defer std.heap.page_allocator.free(content);
+        try std.testing.expectEqualStrings("hello world", content);
+    }
+
+    // The temp file was renamed away — nothing is left behind.
+    const tmp_path = try std.fmt.allocPrint(gpa, "{s}.tmp", .{target});
+    defer gpa.free(tmp_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.openFileAbsolute(io, tmp_path, .{}));
+}
+
+test "nova.write_file validates its arguments" {
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+
+    try expectLuaOk(&L,
+        \\local ok, err = nova.write_file()
+        \\assert(ok == nil, "missing path should fail")
+        \\assert(err == "path argument is required", tostring(err))
+        \\local ok2, err2 = nova.write_file("x.txt")
+        \\assert(ok2 == nil, "missing content should fail")
+        \\assert(err2 == "content argument is required", tostring(err2))
+        \\return "OK"
+    );
+}
+
+test "nova.write_file rejects traversal and invalid paths without writing" {
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+
+    try expectLuaOk(&L,
+        \\local ok, err = nova.write_file("../escape.txt", "x")
+        \\assert(ok == nil, "path traversal should fail")
+        \\assert(err == "PathTraversal", tostring(err))
+        \\local p = "bad" .. string.char(0) .. "path.txt"
+        \\local ok2, err2 = nova.write_file(p, "x")
+        \\assert(ok2 == nil, "nul byte should fail")
+        \\assert(err2 == "InvalidPath", tostring(err2))
+        \\return "OK"
+    );
+}
+
+test "nova.write_file writes content to a path under cwd" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // sanitizePath resolves relative paths against cwd and rejects writes that
+    // escape it; the tmp dir sits under <cwd>/.zig-cache/tmp so a relative path
+    // reaches it.
+    const rel = try std.fmt.allocPrintSentinel(gpa, ".zig-cache/tmp/{s}/lua-write.txt", .{&tmp.sub_path}, 0);
+    defer gpa.free(rel);
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const target = try std.fs.path.join(gpa, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "lua-write.txt" });
+    defer gpa.free(target);
+
+    const chunk = try std.fmt.allocPrintSentinel(gpa, "local ok, err = nova.write_file(\"{s}\", \"hello from lua\")\nassert(ok == true, tostring(err))\nreturn \"OK\"", .{rel}, 0);
+    defer gpa.free(chunk);
+
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    try expectLuaOk(&L, chunk);
+
+    // The file exists with the exact content written from Lua.
+    const content = try readFileBytes(io, target, 4096);
+    defer std.heap.page_allocator.free(content);
+    try std.testing.expectEqualStrings("hello from lua", content);
+}
+
 // ── nova.json_decode / nova.json_encode tests ────────────────────────
 //
 // Each test drives the bridge through real Lua code (doString) and asserts

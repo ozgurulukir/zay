@@ -723,6 +723,122 @@ test "a snapshot-bearing row maps navigation to that entry" {
     try std.testing.expectEqualStrings("cccccccc", state.selectedNavigationId().?);
 }
 
+test "reflatten search filters text case-insensitively and re-roots orphans" {
+    const gpa = std.testing.allocator;
+    var state = TreeState.init(gpa);
+    defer state.deinit();
+
+    // a matches "HELLO", b doesn't, c matches "hello". b is hidden by the
+    // search, so its child c re-roots under the nearest visible ancestor a.
+    var records = [_]session_mod.EntryRecord{
+        makeMessage("aaaaaaaa", null, "user", "Hello world"),
+        makeMessage("bbbbbbbb", "aaaaaaaa", "assistant", "Response one"),
+        makeMessage("cccccccc", "bbbbbbbb", "user", "hello again"),
+    };
+    try state.load(&records, "cccccccc");
+    try std.testing.expectEqual(@as(usize, 3), state.visible.len);
+
+    // Case-insensitive search keeps only matching rows, c under a. User rows
+    // render with the "you: " display prefix.
+    try state.reflatten("HELLO");
+    try std.testing.expectEqual(@as(usize, 2), state.visible.len);
+    try std.testing.expect(std.mem.indexOf(u8, state.visible[0].text, "Hello world") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.visible[1].text, "hello again") != null);
+
+    // A search that hides the parent re-roots the matching row at the top.
+    try state.reflatten("again");
+    try std.testing.expectEqual(@as(usize, 1), state.visible.len);
+    try std.testing.expect(std.mem.indexOf(u8, state.visible[0].text, "hello again") != null);
+
+    // Empty search restores the full tree.
+    try state.reflatten("");
+    try std.testing.expectEqual(@as(usize, 3), state.visible.len);
+}
+
+test "checkpoint entries never appear; descendants attach to nearest visible ancestor" {
+    const gpa = std.testing.allocator;
+    var state = TreeState.init(gpa);
+    defer state.deinit();
+
+    var records = [_]session_mod.EntryRecord{
+        makeMessage("aaaaaaaa", null, "user", "top"),
+        makeMessage("bbbbbbbb", "aaaaaaaa", "user", "mid"),
+        makeMessage("cccccccc", "bbbbbbbb", "user", "leaf"),
+    };
+    // Legacy checkpoint entries (from old jj-era sessions) never render as
+    // rows; their children attach to the nearest visible ancestor instead.
+    records[1].kind = @constCast("checkpoint");
+    try state.load(&records, "cccccccc");
+
+    try std.testing.expectEqual(@as(usize, 2), state.visible.len);
+    try std.testing.expect(std.mem.indexOf(u8, state.visible[0].text, "top") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.visible[1].text, "leaf") != null);
+}
+
+test "hidden snapshot entries tag their nearest visible ancestor, deepest wins" {
+    const gpa = std.testing.allocator;
+    var state = TreeState.init(gpa);
+    defer state.deinit();
+
+    // user -> tool(snapshot1) -> tool(snapshot2) -> assistant(leaf). Under the
+    // user_only filter both tools are hidden; their snapshots migrate up to the
+    // visible user row, and the deepest one (snapshot2) wins the ✦ target.
+    // The assistant leaf stays visible — the conversation leaf always renders.
+    var records = [_]session_mod.EntryRecord{
+        makeMessage("aaaaaaaa", null, "user", "do it"),
+        makeSnapshotTool("bbbbbbbb", "aaaaaaaa"),
+        makeSnapshotTool("cccccccc", "bbbbbbbb"),
+        makeMessage("dddddddd", "cccccccc", "assistant", "done"),
+    };
+    try state.load(&records, "dddddddd");
+    try state.cycleFilter("", true); // default -> no_tools
+    try state.cycleFilter("", true); // no_tools -> user_only
+
+    // Rows: user + leaf. Both hidden tool snapshots land on the user row.
+    try std.testing.expectEqual(FilterMode.user_only, state.filter_mode);
+    try std.testing.expectEqual(@as(usize, 2), state.visible.len);
+    try std.testing.expect(state.visible[0].has_snapshot);
+    try std.testing.expect(!state.visible[1].has_snapshot);
+    state.selection = 0;
+    // Deepest snapshot in the collapsed segment drives navigation.
+    try std.testing.expectEqualStrings("cccccccc", state.selectedNavigationId().?);
+}
+
+test "reflattenKeepingSelection preserves the selected id and clamps when filtered out" {
+    const gpa = std.testing.allocator;
+    var state = TreeState.init(gpa);
+    defer state.deinit();
+
+    var records = [_]session_mod.EntryRecord{
+        makeMessage("aaaaaaaa", null, "user", "apple"),
+        makeMessage("bbbbbbbb", "aaaaaaaa", "user", "banana"),
+        makeMessage("cccccccc", "bbbbbbbb", "user", "cherry"),
+    };
+    try state.load(&records, "cccccccc");
+    try std.testing.expectEqual(@as(usize, 3), state.visible.len);
+
+    // Select "banana", search keeps only it → selection follows the row.
+    state.selection = 1;
+    try state.reflattenKeepingSelection("an");
+    try std.testing.expectEqual(@as(usize, 1), state.visible.len);
+    try std.testing.expectEqualStrings("bbbbbbbb", state.selectedId().?);
+    try std.testing.expectEqual(@as(u32, 0), state.selection);
+
+    // Restore, select "cherry", then search that hides it → clamped to the
+    // last visible row (now "apple").
+    try state.reflatten("");
+    state.selection = 2;
+    try state.reflattenKeepingSelection("ap");
+    try std.testing.expectEqual(@as(usize, 1), state.visible.len);
+    try std.testing.expectEqualStrings("aaaaaaaa", state.selectedId().?);
+    try std.testing.expectEqual(@as(u32, 0), state.selection);
+
+    // A search matching nothing → empty layout, selection clamped to 0.
+    try state.reflattenKeepingSelection("zzz");
+    try std.testing.expectEqual(@as(usize, 0), state.visible.len);
+    try std.testing.expectEqual(@as(u32, 0), state.selection);
+}
+
 fn makeRecord(id: *const [8]u8, parent: ?*const [8]u8) session_mod.EntryRecord {
     return makeMessage(id, parent, "user", "x");
 }
