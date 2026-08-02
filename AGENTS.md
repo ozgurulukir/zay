@@ -193,7 +193,7 @@ const output = try writer.toOwnedSlice();
 - prefer `const foo: Type = .{ .field = value };` over `const foo = Type{ .field = value };`
 - preferred file order: `//!` module doc comment, `const Self = @This();`, imports, `const log = std.log.scoped(...)`
 - pass allocators explicitly; use `errdefer` for cleanup on error
-- keep tests inline with the code they cover; register them in `src/main.zig`
+- keep tests inline with the code they cover; a new file's tests only run once the file is reachable from the `src/root.zig` test root (its `refAllDecls`) — see **Test runner quirks**
 
 ## Safety
 
@@ -215,6 +215,18 @@ Run:
 
 - `zig fmt`
 - `zig build test`
+
+### Test runner quirks (read before debugging a failure)
+
+The authoritative signal for a test run is `zig build test`'s **exit code**, not its printed output:
+
+- **`--listen=-` false failures.** `zig build test` drives the build-server protocol and intermittently prints `failed command: /usr/lib/zig/... zig test ...` with a red Build Summary even when every test passes (pre-existing environmental flakiness, reproducible on a clean baseline). If `EXIT=0` the run passed — ignore that line. Filter it out: `zig build test 2>&1 | grep -v '^failed command'`.
+- **Test output is on stderr.** Both the `zig build test` step and the standalone `test` binary write their results to STDERR, so `2>/dev/null` hides everything and `2>&1 >/dev/null` reveals it. The standalone binary is authoritative when you need a real count: `ls -t .zig-cache/o/*/test | head -1 | xargs -I{} sh -c '{} 2>&1 >/dev/null | tail -3'` (expect `All N tests passed.`).
+- **Stale cache with `-Dtest-filter`.** The `addTest` cache key does not distinguish `-Dtest-filter` filters, and `ls -t .zig-cache/o/*/test` can surface an older binary. After changing filters or code, trust `zig build test`'s exit code or the freshly built standalone binary — never a cached artifact's count.
+- **Silent test discovery.** The test root is `src/root.zig`, which ends with `std.testing.refAllDecls(@This())` — only `test` blocks in files reachable through its `pub const` imports are compiled. A new file that nothing imports compiles fine but its tests **silently never run** (the count doesn't move, no error). Wire the file into the module graph — add a `pub const` in `root.zig`, or import it from a module already in the graph (e.g. the executor importing `tools/schema.zig` pulls its tests in) — to make its tests appear.
+- **Test-fixture lifetime pitfalls** (crash modes surfaced by running the tests, both caught by `std.testing.allocator`):
+  - A helper that dupes its inputs leaks the temp: `appendViolation` dupes `got`/`expected`, so a caller passing `valueShortRepr(...)` / `toOwnedSlice(...)` results must `defer gpa.free` those temps, or DebugAllocator reports a leak at teardown.
+  - A `&.{…}` compound literal with runtime elements lives on the **current frame's stack**. If later teardown (e.g. `McpManager.deinit` → `McpTool.deinit`) dereferences the schema after the helper returned, the free hits garbage → "General protection exception" at `gpa.free`. Test fixtures that outlive the helper must `gpa.alloc` the backing array; empty `&.{}` literals are fine because they live in read-only memory.
 
 ## Gotchas
 
