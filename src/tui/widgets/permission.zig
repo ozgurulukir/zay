@@ -74,6 +74,9 @@ const PermissionInner = struct {
         panel.lineStyledAt(&surface, 0, "Review before running:", ctx, 1, StylePalette.panel_header) catch {};
         const body_rows = height -| 3;
         drawPermissionCommand(&surface, ctx, self.snapshot.command, self.scroll, body_rows);
+        // TUX03: tell the user when a long command is scrollable and where
+        // they are in it (Up/Down scroll, see handlePermissionKey).
+        drawScrollHint(&surface, ctx, self.snapshot.command, self.scroll, body_rows, height);
         drawPermissionActions(&surface, ctx, height -| 1, self.snapshot.selected);
         return surface;
     }
@@ -96,6 +99,32 @@ fn drawPermissionCommand(surface: *vxfw.Surface, ctx: vxfw.DrawContext, command:
     }
 }
 
+fn drawScrollHint(surface: *vxfw.Surface, ctx: vxfw.DrawContext, command: []const u8, scroll: u32, body_rows: u16, height: u16) void {
+    if (body_rows == 0) return;
+    const hint_row = height -| 2;
+    if (hint_row == 0 or hint_row >= surface.size.height) return;
+    const hint = scrollHintText(ctx.arena, command, scroll, body_rows) orelse return;
+    panel.lineStyledAt(surface, hint_row, hint, ctx, 1, StylePalette.thinking_body) catch {};
+}
+
+/// Pure: build the scroll-affordance text, or null when the command fits the
+/// body. Clamps over-scroll for display so the numbers stay sane.
+fn scrollHintText(arena: std.mem.Allocator, command: []const u8, scroll: u32, body_rows: u16) ?[]const u8 {
+    const total_lines: u32 = @intCast(std.mem.count(u8, command, "\n") + 1);
+    if (total_lines <= body_rows) return null;
+    const max_scroll = total_lines -| @as(u32, body_rows);
+    const eff = @min(scroll, max_scroll);
+    const first = eff + 1;
+    const last = eff + @as(u32, body_rows);
+    return std.fmt.allocPrint(arena, " {s} lines {d}-{d} of {d} {s} ", .{
+        if (eff > 0) "↑" else " ",
+        first,
+        last,
+        total_lines,
+        if (last < total_lines) "↓" else " ",
+    }) catch null;
+}
+
 fn drawPermissionActions(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, selected: tui.agent_worker.ApprovalDecision) void {
     if (row >= surface.size.height) return;
     const approve_selected = selected == .approve;
@@ -111,4 +140,14 @@ fn drawPermissionActions(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16
 fn actionLabel(ctx: vxfw.DrawContext, text: []const u8, selected: bool) []const u8 {
     if (selected) return std.fmt.allocPrint(ctx.arena, "▶ [ {s} ]", .{text}) catch text;
     return std.fmt.allocPrint(ctx.arena, "    {s}  ", .{text}) catch text;
+}
+
+test "permission scroll hint reports the visible window of a long command" {
+    const gpa = std.testing.allocator;
+    const cmd = "a\nb\nc\nd\ne"; // 5 lines
+    try std.testing.expect(scrollHintText(gpa, cmd, 0, 5) == null); // fits
+    const top = (scrollHintText(gpa, cmd, 0, 2)).?;
+    defer gpa.free(top);
+    try std.testing.expect(std.mem.indexOf(u8, top, "of 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, top, "↓") != null);
 }

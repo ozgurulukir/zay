@@ -35,11 +35,36 @@ pub const Content = struct {
         const self: *Content = @ptrCast(@alignCast(ptr));
         if (self.action != .browsing) return self.drawSubState(ctx);
         const widgets = try self.resumeWidgets(ctx);
+        // TUX01: never render a blank overlay — show a first-run or
+        // no-match empty state (mirrors model_picker.drawEmpty).
+        if (widgets.len == 0) return self.drawEmpty(ctx);
         self.list.children = .{ .slice = widgets };
         self.list.item_count = @intCast(widgets.len);
         self.list.cursor = self.selection;
         self.list.ensureScroll();
         return panel.listSurface(ctx, self.widget(), self.list.widget());
+    }
+
+    /// Empty state: distinguish "no sessions exist yet" (first run) from
+    /// "nothing matches the current search". Keeps the overlay informative
+    /// instead of blank, with a concrete next step.
+    fn drawEmpty(self: *Content, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const width = ctx.max.width orelse 0;
+        const height = ctx.max.height orelse 0;
+        var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
+        const col = message.ConversationLayout.left -| 1;
+        if (self.summaries.len == 0) {
+            try panel.lineStyledAt(&surface, 0, "No sessions yet.", ctx, col, tui_style.Palette.panel_header);
+            try panel.lineStyledAt(&surface, 1, "Start a conversation and it will show up here.", ctx, col, tui_style.Palette.thinking_body);
+        } else if (self.filter.len > 0) {
+            const text = try std.fmt.allocPrint(ctx.arena, "No sessions match \"{s}\".", .{self.filter});
+            try panel.lineStyledAt(&surface, 0, text, ctx, col, tui_style.Palette.panel_header);
+            try panel.lineStyledAt(&surface, 1, "Adjust the search text above.", ctx, col, tui_style.Palette.thinking_body);
+        } else {
+            try panel.lineStyledAt(&surface, 0, "No sessions to show.", ctx, col, tui_style.Palette.panel_header);
+            try panel.lineStyledAt(&surface, 1, "Try a different grouping (Ctrl+A) or unfold a project (Tab).", ctx, col, tui_style.Palette.thinking_body);
+        }
+        return surface;
     }
 
     /// Draw the rename, delete-confirmation, or blocked-action prompt instead
@@ -512,6 +537,56 @@ fn resumeLeftWidth(ctx: vxfw.DrawContext, row_width: u16, modified: []const u8) 
     if (end_col <= start_col) return 0;
     if (date_width + 1 >= end_col - start_col) return 0;
     return end_col - start_col - date_width - 1;
+}
+
+test "resume picker shows a first-run empty state when there are no sessions" {
+    var list: vxfw.ListView = .{ .children = .{ .slice = &.{} }, .draw_cursor = false };
+    var content: Content = .{
+        .io = std.testing.io,
+        .list = &list,
+        .summaries = &.{},
+        .selection = 0,
+        .folded_projects = &.{},
+        .filter = "",
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 8 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try content.widget().draw(ctx);
+
+    try std.testing.expectEqualStrings("N", surface.readCell(message.ConversationLayout.left -| 1, 0).char.grapheme);
+}
+
+test "resume picker shows a no-match empty state when the filter filters everything out" {
+    var list: vxfw.ListView = .{ .children = .{ .slice = &.{} }, .draw_cursor = false };
+    var content: Content = .{
+        .io = std.testing.io,
+        .list = &list,
+        .summaries = &.{
+            .{ .id = @constCast("1"), .title = @constCast("one"), .cwd = @constCast("/repo/a"), .created_at_ms = 0, .updated_at_ms = 1, .leaf_entry_id = null, .model_provider = null, .model_id = null },
+        },
+        .selection = 0,
+        .folded_projects = &.{},
+        .filter = "zzz",
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 8 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try content.widget().draw(ctx);
+
+    try std.testing.expectEqualStrings("N", surface.readCell(message.ConversationLayout.left -| 1, 0).char.grapheme);
+    const row1 = surface.readCell(message.ConversationLayout.left -| 1, 1).char.grapheme;
+    try std.testing.expect(std.mem.eql(u8, row1, "A")); // "Adjust the search text above."
 }
 
 test "session tree counts project rows and folds children" {

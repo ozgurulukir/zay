@@ -288,7 +288,10 @@ pub const Content = struct {
         const label = if (requires_key) "API Key: " else "API Key (optional): ";
         try panel.lineStyledAt(surface, key_row, label, ctx, start_col, StylePalette.panel_header);
         const key_col = start_col + @as(u16, @intCast(@min(ctx.stringWidth(label), @as(usize, std.math.maxInt(u16)))));
-        const shown = try std.fmt.allocPrint(ctx.arena, "{s}\u{2588}", .{self.key_input});
+        // TUX02: never render the secret in plaintext — mask it for display.
+        // The real value stays in the input buffer; submit reads the buffer.
+        const masked = maskSecret(ctx.arena, self.key_input);
+        const shown = try std.fmt.allocPrint(ctx.arena, "{s}\u{2588}", .{masked});
         try panel.lineStyledAt(surface, key_row, shown, ctx, key_col, StylePalette.panel_header);
 
         const hint_row = key_row + 2;
@@ -311,6 +314,19 @@ fn nextColumn(current: Column) Column {
     };
 }
 
+/// Render a secret as one bullet per entered grapheme so an API key is never
+/// shown in plaintext on screen (shoulder-surfing / screen-share safe). Only
+/// the display is masked; length is preserved for typing feedback.
+fn maskSecret(arena: std.mem.Allocator, secret: []const u8) []const u8 {
+    if (secret.len == 0) return "";
+    var out: std.ArrayList(u8) = .empty;
+    var iter = vaxis.unicode.graphemeIterator(secret);
+    while (iter.next()) |_| {
+        out.appendSlice(arena, "•") catch return "";
+    }
+    return out.toOwnedSlice(arena) catch "";
+}
+
 fn nextIndex(current: u32, count: u32) u32 {
     assert(count > 0);
     assert(current < count);
@@ -321,6 +337,15 @@ fn previousIndex(current: u32, count: u32) u32 {
     assert(count > 0);
     assert(current < count);
     return if (current == 0) count - 1 else current - 1;
+}
+
+test "provider form masks the API key in the display" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectEqualStrings("", maskSecret(gpa, ""));
+    const masked = maskSecret(gpa, "sk-123");
+    defer gpa.free(masked);
+    try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, masked, "•"));
+    try std.testing.expect(std.mem.indexOf(u8, masked, "sk") == null);
 }
 
 test "provider picker navigation reaches sign out only when signed in" {
