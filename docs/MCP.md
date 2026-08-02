@@ -113,9 +113,21 @@ MCP server connections follow a multi-phase lifecycle:
 spawned and no network call is made — the client is marked as `[CONNECTING]`. This phase
 is instant and never blocks the TUI.
 
-### Phase B — Connection (startup, provider connect, or `/mcp` open)
+### Phase B — Connection (async; startup, provider connect, or `/mcp` open)
 
-`McpManager.syncFromConfigEx()` performs real I/O for each enabled server:
+Connects are **asynchronous** — they never block the TUI. `McpManager.syncFromConfigEx()`
+(and `reconnectClient`) launch one `io.concurrent` worker per enabled server instead of
+doing I/O inline: a `ConnectJob` (kept in `pending_connects`) whose worker spawns,
+handshakes, and discovers tools on a **private transport clone**
+(`McpClient.cloneForConnect`) — the live client list is only ever mutated on the main
+thread. Each TUI tick, `McpManager.drainConnects` polls the worker's `done` flag, awaits
+the finished future (instant), and installs the completed client into the list by name
+(`installConnectResult`); `provider_model.drainMcpConnects` then re-injects the freshly
+discovered tool schemas. A slow or unreachable server stays `[CONNECTING]` without
+freezing the UI, and a disconnect during the handshake discards the outcome instead of
+resurrecting the server.
+
+Per server:
 
 - **Stdio**: subprocess launched via `command` + `args` with stdin/stdout pipes.
 - **Streamable HTTP**: connectionless — nothing is spawned; each JSON-RPC call is a fresh
@@ -128,9 +140,23 @@ Then, for both transports:
 2. **Discovery**: JSON-RPC `tools/list` request → server returns tool schemas → parsed
    into `tools_common.Schema` format.
 
-Stdio reads use a **30-second timeout** via `std.posix.poll`; remote requests use the
-HTTP client's socket timeout. A server that doesn't respond in time is marked `[FAILED]`
-with an error message.
+**Timeouts** — a server that doesn't respond in time is marked `[FAILED]` with an error
+message:
+
+- Stdio reads use a **30-second timeout** (`read_timeout_ms`) via `std.posix.poll`.
+- Remote requests apply a socket-level send/recv timeout (`applyHttpTimeout`,
+  SO_RCVTIMEO/SO_SNDTIMEO = `read_timeout_ms`) so a server that accepts the connection but
+  stalls fails the handshake instead of hanging the worker. The connect phase itself is
+  bounded only by kernel TCP/DNS timeouts — `std.http.Client` exposes no connect timeout in
+  Zig 0.16 — but because connects run off-thread, that cannot block the UI either.
+
+**Testing the async path** — `src/mcp/manager.zig`'s async tests mock a stdio MCP server
+with a `bash -c` script that `read`s each request line and `echo`s a canned JSON-RPC
+response (initialize → initialized notification → tools/list), then poll `drainConnects`
+the way the TUI tick does (`drainUntilConnected` helper). Coverage: successful
+discovery+install, handshake failure against a dead server, malformed `tools/list`
+response, disconnect-mid-flight (the outcome is discarded, never resurrecting the
+client), and the single-pending-job launch guard.
 
 ### Phase C — Tool injection (startup and on every MCP change)
 
@@ -171,8 +197,11 @@ When the model calls an MCP tool:
   fields.
 - Discovered tools are injected into the AI provider's `tools` array alongside built-in
   tools (bash), so the model can call them directly.
-- **Planned**: `notifications/tools/list_changed` for real-time tool catalog updates.
-  Until then, reopen `/mcp` (or press `r`) to re-sync the catalog manually.
+- **`notifications/tools/list_changed`**: Handled for servers that advertise
+  `capabilities.tools.listChanged`. The notification sets `pending_tools_refresh` on the
+  client; the TUI tick's `drainMcpNotifications` polls it, re-runs `tools/list`, and
+  re-injects the refreshed schemas automatically. (The notification is captured when it
+  arrives during a request read; reopen `/mcp` or press `r` to force a re-sync any time.)
 
 ---
 
@@ -223,8 +252,8 @@ or **Esc** to cancel. The server name is derived from the URL host.
 
 ## 7. Known Limitations
 
-- **`notifications/tools/list_changed`**: Not yet handled. The tool catalog is static
-  after discovery; reopen `/mcp` (or press `r`) to re-sync manually.
+- **`notifications/tools/list_changed`**: Handled via `drainMcpNotifications` (see §4);
+  the catalog refreshes automatically for servers that advertise `listChanged`.
 - **Server-push requests**: Nova does not act on server-initiated Streamable HTTP GET
   streams (sampling/roots). The POST path (tool discovery + tool calls) is fully
   supported, which covers normal tool use.
