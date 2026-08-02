@@ -36,6 +36,11 @@ const project_rule_filenames = [_][]const u8{
     "CONVENTIONS.md",
 };
 
+/// Maximum bytes of a single project rule file ingested into the prompt. A file
+/// larger than this is truncated to the head with a visible notice rather than
+/// rejected, so an oversized AGENTS.md can never brick startup.
+pub const max_project_rule_file_bytes: usize = 64 * 1024;
+
 pub const ContextBudget = struct {
     system_tokens: u32,
     history_tokens: u32,
@@ -220,11 +225,24 @@ pub fn readProjectRuleFile(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, 
     };
     defer file.close(io);
     const stat = try file.stat(io);
-    if (stat.size > 64 * 1024) return error.FileTooBig;
-    const bytes = try gpa.alloc(u8, @intCast(stat.size));
+    const head_len: usize = @intCast(@min(stat.size, max_project_rule_file_bytes));
+    const bytes = try gpa.alloc(u8, head_len);
     errdefer gpa.free(bytes);
     var reader = file.reader(io, &.{});
     try reader.interface.readSliceAll(bytes);
+    if (stat.size > max_project_rule_file_bytes) {
+        const notice = try std.fmt.allocPrint(
+            gpa,
+            "\n\n[project rule file truncated: {s} is {d} bytes, only the first {d} ingested]",
+            .{ filename, stat.size, max_project_rule_file_bytes },
+        );
+        defer gpa.free(notice);
+        const joined = try gpa.alloc(u8, head_len + notice.len);
+        @memcpy(joined[0..head_len], bytes);
+        @memcpy(joined[head_len..], notice);
+        gpa.free(bytes);
+        return joined;
+    }
     return bytes;
 }
 
@@ -326,6 +344,40 @@ test "assembleSystemPrompt appends plugin prompts block" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<plugin_prompts>") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<plugin name=\"write-tool\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Always confirm before overwrite.") != null);
+}
+
+test "readProjectRuleFile truncates an oversized rule file with a notice instead of failing" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const rel_dir = ".zig-cache/context-rule-truncate-test";
+    try std.Io.Dir.createDirPath(.cwd(), io, rel_dir);
+    const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
+    defer gpa.free(cwd);
+
+    const filename = "BIG.md";
+    const path = try std.fs.path.join(gpa, &.{ cwd, filename });
+    defer gpa.free(path);
+    var file = try std.Io.Dir.createFile(.cwd(), io, path, .{ .truncate = true });
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    const filler = "x" ** 100; // 100-byte chunk
+    var written: usize = 0;
+    while (written < max_project_rule_file_bytes + 100) {
+        try writer.interface.writeAll(filler);
+        written += filler.len;
+    }
+    try writer.interface.flush();
+
+    const content = (try readProjectRuleFile(gpa, io, cwd, filename)).?;
+    defer gpa.free(content);
+    try std.testing.expect(content.len > max_project_rule_file_bytes); // head + notice
+    try std.testing.expect(std.mem.indexOf(u8, content, "truncated") != null);
+    // Head bytes are preserved verbatim.
+    try std.testing.expect(std.mem.startsWith(u8, content, "xxxxxxxxxx"));
 }
 
 test "pruneHistoricalToolResultsViews caps old tool outputs while preserving recent ones" {
