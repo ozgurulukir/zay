@@ -567,6 +567,72 @@ fn errorDescription(err: anyerror) []const u8 {
     };
 }
 
+test "executor converts errorDescription accurately" {
+    try std.testing.expectEqualStrings("MCP server process terminated unexpectedly", errorDescription(error.McpServerCrashed));
+    try std.testing.expectEqualStrings("MCP server did not respond within the timeout period", errorDescription(error.Timeout));
+    try std.testing.expectEqualStrings("OutOfMemory", errorDescription(error.OutOfMemory));
+}
+
+test "ExecutorService shouldRejectUnsafeBash consults the approval hook" {
+    // No classifier URL configured (the default) routes straight through the
+    // local destructive-command matcher — no network in this test.
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = cwd });
+
+    const ApprovalContext = struct {
+        should_approve: bool = false,
+    };
+    const MockObserver = struct {
+        fn onStarted(_: *ApprovalContext, _: ai.ToolCall) anyerror!void {}
+        fn onFinished(_: *ApprovalContext, _: *const ToolResult) anyerror!void {}
+        fn approve(ctx: *ApprovalContext, _: ai.ToolCall, _: []const u8) anyerror!bool {
+            return ctx.should_approve;
+        }
+    };
+
+    var ctx = ApprovalContext{};
+    const observer: ToolCallObserver(ApprovalContext) = .{
+        .ctx = &ctx,
+        .on_started = MockObserver.onStarted,
+        .on_finished = MockObserver.onFinished,
+        .approve_unsafe_bash = MockObserver.approve,
+    };
+
+    // 1. Not a bash tool call => never rejected, approval hook not consulted.
+    const non_bash_call = ai.ToolCall{
+        .call_id = .{ .value = try gpa.dupe(u8, "call_1") },
+        .name = try gpa.dupe(u8, "not_bash"),
+        .arguments = try gpa.dupe(u8, "{}"),
+    };
+    defer {
+        gpa.free(non_bash_call.call_id.value);
+        gpa.free(non_bash_call.name);
+        gpa.free(non_bash_call.arguments);
+    }
+    try std.testing.expect(!(try executor.shouldRejectUnsafeBash(non_bash_call, observer)));
+
+    // 2. The local matcher flags `rm -rf /` unsafe and the observer declines
+    //    => the call is rejected.
+    const unsafe_call = ai.ToolCall{
+        .call_id = .{ .value = try gpa.dupe(u8, "call_2") },
+        .name = try gpa.dupe(u8, "bash"),
+        .arguments = try gpa.dupe(u8, "{\"command\":\"rm -rf /\",\"reason\":\"clean\"}"),
+    };
+    defer {
+        gpa.free(unsafe_call.call_id.value);
+        gpa.free(unsafe_call.name);
+        gpa.free(unsafe_call.arguments);
+    }
+    ctx.should_approve = false;
+    try std.testing.expect(try executor.shouldRejectUnsafeBash(unsafe_call, observer));
+
+    // 3. Same unsafe call, but the observer approves => allowed.
+    ctx.should_approve = true;
+    try std.testing.expect(!(try executor.shouldRejectUnsafeBash(unsafe_call, observer)));
+}
+
 test "ExecutorService.runAll errdefer cleanup exists" {
     // This test verifies the errdefer cleanup logic in runAll (lines 202-205).
     // The errdefer deinitializes already-completed results if a later tool
