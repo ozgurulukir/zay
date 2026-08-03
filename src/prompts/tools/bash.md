@@ -8,6 +8,17 @@ Run a shell command.
 - Prefer targeted commands (`rg`, `find`, `git diff --stat`, `head`, `tail`) over dumping large files or full build logs.
 - Bash output may be truncated. If output is truncated, use the reported full-output path to read the rest or rerun with a narrower command.
 
+## Reading files (sliding window)
+
+Never dump a whole file into the transcript. Locate, then read a bounded window, then slide:
+
+- Locate first: `rg -n "pattern" path` gives exact line numbers — never guess with a blind `cat`.
+- Read a bounded window: `sed -n 'START,ENDp' path`, or `rg -C 5 "pattern"` for context around each match.
+- Slide as needed: `sed -n 'END,NEW_ENDp'` continues below; `sed -n 'NEW_START,STARTp'` looks above.
+- Full read only when the whole file matters: `cat -n path` (line numbers keep later windows addressable). Use `head`/`tail` for boundary checks.
+
+Bounded reads stay under the truncation limit and leave context for reasoning.
+
 ## Long-running commands
 
 - For commands that take a long time or never return on their own — builds, dev servers, watchers, `tail -f` — set `run_in_background: true`. The call returns immediately with a job id, pid, and a log file path instead of blocking.
@@ -18,6 +29,7 @@ Run a shell command.
 ## Error handling
 
 - A non-zero exit code is returned in the result. For multi-step commands, chain with `&&` or start scripts with `set -euo pipefail`.
+- Prefer non-interactive flags (`-y`, `--no-input`, `< /dev/null`) so a command never blocks waiting for a prompt — a hanging prompt stalls the turn until the timeout.
 - Commands that may legitimately fail should end with `|| true` so later steps still run.
 
 ## Useful patterns
