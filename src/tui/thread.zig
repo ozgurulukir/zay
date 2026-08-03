@@ -99,6 +99,18 @@ acknowledged: bool = false,
 /// Set once a finished worker's completion has been delivered (or dropped).
 /// Guards the park+deliver pass so it runs exactly once per worker.
 completion_delivered: bool = false,
+/// Activity bookkeeping for the model-driven `lane` ops. UI-thread writes:
+/// `resetTurnState` anchors the clock at submit (a fresh worker legitimately
+/// sits silent while its first model request is in flight) and
+/// `applyAgentEvent` advances it on every event the worker emits; the
+/// `lane` ops read it to tell a busy worker from a stalled one. `stall_warned`
+/// latches once `lane await` has already surfaced the current silent stretch,
+/// so the blocking wait doesn't resolve a stall notice every tick. Monotonic
+/// milliseconds (`Clock.now(.awake)`) so NTP/wall-clock jumps can't false-
+/// trigger a stall.
+last_activity_ms: i64 = 0,
+turn_tool_calls: u32 = 0,
+stall_warned: bool = false,
 
 /// A user message queued behind a running turn. `steer` injects it after the
 /// next tool batch instead of waiting for the turn to go idle. Text is owned.

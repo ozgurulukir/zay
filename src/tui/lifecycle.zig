@@ -241,10 +241,11 @@ fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
 }
 
 /// Fork a parallel lane: create a git worktree, new runtime, and a fresh
-/// Thread. Up to 4 lanes (2×2 grid). Called from the command palette (/parallel)
-/// and from `App.submitMode` (command palette dispatch).
+/// Thread. Max 4 threads total — the driver's main lane + 3 lanes (2×2 grid).
+/// Called from the command palette (/parallel) and from `App.submitMode`
+/// (command palette dispatch).
 pub fn createParallelLane(self: *App) !void {
-    if (self.threads.items.len >= 4) return error.TooManyLanes; // the split grid is 2×2
+    if (self.threads.items.len >= 4) return error.TooManyLanes; // driver + 3 lanes, not 4 extra
     const repo = self.repoRoot() orelse return error.NoActiveRuntime;
     const home = (self.liveRuntime() orelse return error.NoActiveRuntime).home_dir;
     if (!vcs.isRepo(self.gpa, self.io, repo)) return error.NotAGitRepo;

@@ -164,6 +164,13 @@ pub fn formatNoProviderMessage(app: *App) ![]u8 {
 pub fn resetTurnState(app: *App) void {
     app.thread.turn_view.reset(app.getIo());
     app.metrics.loading_frame = 0;
+    // Turn-start bookkeeping for the model-driven `lane` ops: a fresh turn
+    // has made no progress yet, so anchor the activity clock now (a worker
+    // is legitimately silent while its first model request is in flight)
+    // and reset the tool-call tally + stall-warning latch.
+    app.thread.last_activity_ms = std.Io.Clock.now(.awake, app.getIo()).toMilliseconds();
+    app.thread.turn_tool_calls = 0;
+    app.thread.stall_warned = false;
 }
 
 pub fn startTurn(app: *App) !void {
@@ -231,6 +238,17 @@ pub fn startDeliveryTurnOnCurrentThread(app: *App) !void {
 
 pub fn applyAgentEvent(app: *App, event: agent_mod.Agent.Event) !bool {
     const outcome = app.thread.turn.apply(event);
+    // Any event the worker emitted means it is alive — stamp the activity
+    // clock `lane read`/`await`/`list` use to detect a stalled worker (one
+    // blocked in a hung read emits nothing), clear the stall-warning latch
+    // (progress resumed), and tally tool calls.
+    app.thread.last_activity_ms = std.Io.Clock.now(.awake, app.getIo()).toMilliseconds();
+    app.thread.stall_warned = false;
+    switch (event) {
+        .tool_call_finished => app.thread.turn_tool_calls += 1,
+        .turn_started => app.thread.turn_tool_calls = 0,
+        else => {},
+    }
     if (!outcome.project) {
         // Interrupting: a discarded turn's output must not mutate the
         // transcript. Join the worker once it posts its terminal event, then

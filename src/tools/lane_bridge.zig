@@ -8,10 +8,10 @@
 //! condition; the UI services it every tick and resolves it with a
 //! `Response`. Layer-agnostic — the App is a consumer, not a dependency.
 //!
-//! One request is in flight at a time. Contention is bounded by the 4-lane
-//! cap and by the requester guard (only the primary lane spawns/enters/
-//! merges; other lanes only `list`/`read`), so a second lane's call simply
-//! waits for the first to resolve.
+//! Requests are tracked as an intrusive linked list: the driver's `spawn`
+//! can be in flight while a spawned worker's `list`/`read` is serviced in
+//! the same tick, so a single-slot primitive would clobber the earlier
+//! request and leave its lane blocked forever.
 
 const std = @import("std");
 
@@ -40,6 +40,13 @@ pub const Request = struct {
     lane: ?[]const u8 = null,
     steer: ?[]const u8 = null,
     requester: *anyopaque,
+    /// Written by the UI's `service` when the handler resolves this request;
+    /// the waiting worker wakes once it is non-null. Not part of the public
+    /// request payload — the bridge uses it to hand back the response.
+    response: ?Response = null,
+    /// Intrusive in-flight-list link (the bridge tracks multiple concurrent
+    /// requests — the driver plus its spawned workers share one bridge).
+    next: ?*Request = null,
 
     pub fn deinit(self: *Request, gpa: std.mem.Allocator) void {
         if (self.purpose) |s| gpa.free(s);
@@ -67,8 +74,12 @@ pub const Response = struct {
 pub const LaneBridge = struct {
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
+    /// Head of the in-flight request list. More than one lane can be blocked
+    /// at once (the driver spawning while a spawned worker calls `list`/`read`
+    /// concurrently), so a single-slot primitive would clobber the earlier
+    /// request and leave it blocked forever.
     pending: ?*Request = null,
-    response: ?Response = null,
+    last: ?*Request = null,
 
     /// Worker-side: post a request and block until the UI resolves it.
     /// Returns `error.Canceled` when the owning future is cancelled (turn
@@ -77,24 +88,44 @@ pub const LaneBridge = struct {
     pub fn request(self: *LaneBridge, io: std.Io, req: *Request) error{Canceled}!Response {
         self.mutex.lock(io) catch return error.Canceled;
         defer self.mutex.unlock(io);
-        std.debug.assert(self.pending == null);
-        self.pending = req;
-        while (self.response == null) {
+        // Append to the in-flight list; each request waits on its OWN
+        // response field, so concurrent requesters never clobber each other.
+        req.next = null;
+        if (self.last) |tail| tail.next = req else self.pending = req;
+        self.last = req;
+        while (req.response == null) {
             self.condition.wait(io, &self.mutex) catch {
-                self.pending = null;
+                _ = self.remove(req);
                 return error.Canceled;
             };
         }
-        const resp = self.response.?;
-        self.response = null;
-        self.pending = null;
+        const resp = req.response.?;
+        _ = self.remove(req);
         return resp;
     }
 
-    /// UI-side: if a request is in flight, build a response and wake the
-    /// worker. `handler` runs with the bridge lock held and returns null
-    /// while the request is still pending (e.g. `await` polling a running
-    /// lane) — in that case the request stays in flight for the next tick.
+    /// Unlink `req` from the in-flight list. Returns whether it was present
+    /// (a cancelled wait can race a service that already resolved it).
+    fn remove(self: *LaneBridge, req: *Request) bool {
+        var prev: ?*Request = null;
+        var cur = self.pending;
+        while (cur) |c| {
+            if (c == req) {
+                if (prev) |p| p.next = c.next else self.pending = c.next;
+                if (self.last == req) self.last = prev;
+                c.next = null;
+                return true;
+            }
+            prev = c;
+            cur = c.next;
+        }
+        return false;
+    }
+
+    /// UI-side: resolve every request whose handler answers; leave the rest
+    /// in flight (e.g. `await` polling a running lane) for the next tick.
+    /// `handler` runs with the bridge lock held. Wakes all waiters after any
+    /// resolution so a worker whose request was answered resumes immediately.
     pub fn service(
         self: *LaneBridge,
         io: std.Io,
@@ -103,11 +134,18 @@ pub const LaneBridge = struct {
     ) void {
         self.mutex.lock(io) catch return;
         defer self.mutex.unlock(io);
-        const req = self.pending orelse return;
-        const resp = handler(ctx, req) orelse return;
-        self.response = resp;
-        self.pending = null;
-        self.condition.signal(io);
+        var resolved = false;
+        var cur = self.pending;
+        while (cur) |req| {
+            const next = req.next; // snapshot before a possible unlink
+            if (handler(ctx, req)) |resp| {
+                req.response = resp;
+                _ = self.remove(req);
+                resolved = true;
+            }
+            cur = next;
+        }
+        if (resolved) self.condition.broadcast(io);
     }
 };
 
@@ -212,7 +250,71 @@ test "service with a still-pending handler leaves the request in flight" {
 
     bridge.service(std.testing.io, undefined, &PendingHandler.handle);
     try std.testing.expect(bridge.pending == &req);
-    try std.testing.expect(bridge.response == null);
+    try std.testing.expect(req.response == null);
+}
+
+test "two concurrent requesters both resolve (multi-request collision regression)" {
+    // The single-slot bridge originally asserted `pending == null`, but the
+    // orchestration model puts the driver AND its spawned workers on the same
+    // bridge — a worker's `lane list` racing the driver's next `lane spawn`
+    // must not clobber the in-flight request. Both must resolve.
+    const gpa = std.testing.allocator;
+    var bridge: LaneBridge = .{};
+    var result_a: Response = undefined;
+    var result_b: Response = undefined;
+    var req_a = Request{ .op = .list, .requester = undefined };
+    var req_b = Request{ .op = .list, .requester = undefined };
+
+    const Worker = struct {
+        fn run(b: *LaneBridge, r: *Request, out: *Response, delay_ms: i64) void {
+            if (delay_ms > 0) std.testing.io.sleep(.fromMilliseconds(delay_ms), .awake) catch {};
+            out.* = b.request(std.testing.io, r) catch unreachable;
+        }
+    };
+    const Ctx = struct { a: *Request, b: *Request };
+    const Handler = struct {
+        fn handle(ctx: *anyopaque, req: *const Request) ?Response {
+            const c: *Ctx = @ptrCast(@alignCast(ctx));
+            const tag = if (@intFromPtr(req) == @intFromPtr(c.a))
+                "A"
+            else if (@intFromPtr(req) == @intFromPtr(c.b))
+                "B"
+            else
+                return null;
+            return response(std.testing.allocator, "resp {s}", .{tag}, null, null) catch unreachable;
+        }
+    };
+    var handler_ctx = Ctx{ .a = &req_a, .b = &req_b };
+
+    const thread_a = try std.Thread.spawn(.{}, Worker.run, .{ &bridge, &req_a, &result_a, 0 });
+    // Let A post first so both are in flight before the first service pass.
+    var spins: u32 = 0;
+    while (spins < 10_000) : (spins += 1) {
+        std.testing.io.sleep(.fromMilliseconds(2), .awake) catch {};
+        bridge.mutex.lock(std.testing.io) catch continue;
+        const posted = bridge.pending != null;
+        bridge.mutex.unlock(std.testing.io);
+        if (posted) break;
+    }
+    try std.testing.expect(bridge.pending != null);
+    const thread_b = try std.Thread.spawn(.{}, Worker.run, .{ &bridge, &req_b, &result_b, 10 });
+
+    // Service until both requests carry a response.
+    var spins2: u32 = 0;
+    while (spins2 < 100_000) : (spins2 += 1) {
+        bridge.service(std.testing.io, &handler_ctx, &Handler.handle);
+        bridge.mutex.lock(std.testing.io) catch continue;
+        const done = req_a.response != null and req_b.response != null;
+        bridge.mutex.unlock(std.testing.io);
+        if (done) break;
+        std.testing.io.sleep(.fromMilliseconds(2), .awake) catch {};
+    }
+    thread_a.join();
+    thread_b.join();
+    defer gpa.free(result_a.text);
+    defer gpa.free(result_b.text);
+    try std.testing.expectEqualStrings("resp A", result_a.text);
+    try std.testing.expectEqualStrings("resp B", result_b.text);
 }
 
 test "request with an owned lane field frees cleanly" {

@@ -547,6 +547,59 @@ fn failResp(gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) Res
     return lane_bridge.fail(gpa, fmt, args) catch unreachable;
 }
 
+/// A running worker that has emitted NO event for this long is reported as
+/// possibly stalled to an orchestrator (`lane read`/`await`/`list`). Generous:
+/// model requests legitimately stream for minutes and a long bash call (raised
+/// timeout) is silent for its whole run; the stall signal is "zero events at
+/// all", which a blocked network read or hung tool produces indefinitely.
+const worker_stall_ms: i64 = 180 * std.time.ms_per_s;
+
+/// Whether `lane`'s active turn has produced no event for at least
+/// `worker_stall_ms` — the signal an orchestrator uses to stop polling and act
+/// (`lane cancel` / `lane steer`). `last_activity_ms == 0` means no baseline
+/// yet (fresh worker awaiting its first token), never a stall.
+fn laneStalled(lane: *const Thread, now_ms: i64) bool {
+    if (lane.turn.state != .active) return false;
+    if (lane.last_activity_ms == 0) return false;
+    return now_ms - lane.last_activity_ms >= worker_stall_ms;
+}
+
+/// One-line activity summary for a lane, surfaced by `lane list` and as the
+/// status prefix of `lane read`/`await`. For a running worker it reports how
+/// far it has gotten (tool-call count) and how long since its last output —
+/// and flags a worker silent past `worker_stall_ms` as stalled, so an
+/// orchestrator can tell busy from stuck instead of polling a "running" that
+/// means nothing. Owned; the caller frees it.
+fn laneStatus(app: *App, lane: *Thread) []u8 {
+    const now_ms = std.Io.Clock.now(.awake, app.io).toMilliseconds();
+    switch (lane.turn.state) {
+        .idle => {
+            if (lane.turn_tool_calls > 0) {
+                return std.fmt.allocPrint(app.gpa, "idle — {d} tool calls", .{lane.turn_tool_calls}) catch unreachable;
+            }
+            return app.gpa.dupe(u8, "idle") catch unreachable;
+        },
+        .interrupting => return app.gpa.dupe(u8, "cancelling") catch unreachable,
+        .active => {},
+    }
+    if (lane.last_activity_ms == 0) {
+        return std.fmt.allocPrint(app.gpa, "running — {d} tool calls", .{lane.turn_tool_calls}) catch unreachable;
+    }
+    const silent_s: i64 = @max(0, @divTrunc(now_ms - lane.last_activity_ms, std.time.ms_per_s));
+    if (now_ms - lane.last_activity_ms >= worker_stall_ms) {
+        return std.fmt.allocPrint(
+            app.gpa,
+            "running — STALLED: {d} tool calls, no output for {d}s — `lane cancel` to stop",
+            .{ lane.turn_tool_calls, silent_s },
+        ) catch unreachable;
+    }
+    return std.fmt.allocPrint(
+        app.gpa,
+        "running — {d} tool calls, last output {d}s ago",
+        .{ lane.turn_tool_calls, silent_s },
+    ) catch unreachable;
+}
+
 /// Service the in-flight `lane` bridge request, if any. Called every UI tick
 /// (see `handleTick`); a worker lane is blocked on the bridge until this
 /// resolves it.
@@ -644,11 +697,8 @@ fn listLanes(app: *App) ?Resp {
         const id = laneIdOf(lane) orelse "0";
         const title = lane.title orelse "";
         const branch = if (lanes_util.workingLaneOf(lane)) |wl| wl.branch else "(primary)";
-        const status = switch (lane.turn.state) {
-            .idle => "idle",
-            .active => "running",
-            .interrupting => "cancelling",
-        };
+        const status = laneStatus(app, lane);
+        defer app.gpa.free(status);
         const ws_marker: []const u8 = if (driver_ws) |ws| blk: {
             if (lanes_util.workingLaneOf(lane)) |wl| {
                 if (std.mem.eql(u8, ws, wl.path)) break :blk "  <- workspace";
@@ -713,7 +763,10 @@ fn createLane(app: *App, req: *const lane_bridge.Request) ?Resp {
     const repo = app.repoRoot() orelse return failResp(app.gpa, "lane: no active runtime\n", .{});
     const home = (app.templateRuntime() orelse return failResp(app.gpa, "lane: no active runtime\n", .{})).home_dir;
     if (!vcs.isRepo(app.gpa, app.io, repo)) return failResp(app.gpa, "lane: not a git repo — lanes need one\n", .{});
-    if (app.threads.items.len >= 4) return failResp(app.gpa, "lane: too many lanes open (max 4)\n", .{});
+    // The cap counts the DRIVER's main lane too: threads.len starts at 1
+    // (the primary), so >= 4 means "driver + 3 lanes" — a 4th lane would need
+    // a 5th pane in the 2×2 grid.
+    if (app.threads.items.len >= 4) return failResp(app.gpa, "lane: too many lanes open (max 4 total: driver + 3)\n", .{});
 
     const wt = createLaneWorktree(app, repo, home) catch |err| return failResp(app.gpa, "lane: worktree create failed: {s}\n", .{@errorName(err)});
     // Every failure path below returns a `Resp` (never an error), so cleanup
@@ -823,7 +876,10 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
     const repo = app.repoRoot() orelse return failResp(app.gpa, "lane: no active runtime\n", .{});
     const home = (app.templateRuntime() orelse return failResp(app.gpa, "lane: no active runtime\n", .{})).home_dir;
     if (!vcs.isRepo(app.gpa, app.io, repo)) return failResp(app.gpa, "lane: not a git repo — lanes need one\n", .{});
-    if (app.threads.items.len >= 4) return failResp(app.gpa, "lane: too many lanes open (max 4)\n", .{});
+    // The cap counts the DRIVER's main lane too: threads.len starts at 1
+    // (the primary), so >= 4 means "driver + 3 lanes" — a 4th lane would need
+    // a 5th pane in the 2×2 grid.
+    if (app.threads.items.len >= 4) return failResp(app.gpa, "lane: too many lanes open (max 4 total: driver + 3)\n", .{});
 
     // H2: the naming context comes from the SPAWNER lane, not whatever lane
     // the user is currently viewing. Scope-swap app.thread for the capture.
@@ -934,6 +990,12 @@ fn startTurnForLane(app: *App, lane: *Thread, prompt: []const u8, title_source: 
         app.scheduleLaneNaming(lane, title_source) catch {};
     }
     lane.turn_view.awaitModel();
+    // The spawn path bypasses `resetTurnState`, so anchor the `lane`-op
+    // activity clock here — a freshly spawned worker is legitimately silent
+    // while its first model request is in flight.
+    lane.last_activity_ms = std.Io.Clock.now(.awake, app.io).toMilliseconds();
+    lane.turn_tool_calls = 0;
+    lane.stall_warned = false;
     lane.turn.submit();
     lane.turn_future = try app.getIo().concurrent(agent_worker.runAgentTurn, .{
         lane.agent.?,
@@ -948,10 +1010,15 @@ fn startTurnForLane(app: *App, lane: *Thread, prompt: []const u8, title_source: 
 fn readLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     const id = req.lane orelse return failResp(app.gpa, "lane: read needs a `lane` id\n", .{});
     const target = resolveLane(app, id) orelse return failResp(app.gpa, "lane: no open lane with id '{s}'\n", .{id});
+    const status = laneStatus(app, target);
+    defer app.gpa.free(status);
     const tail = transcriptTail(app, target, 8);
     defer app.gpa.free(tail);
-    target.acknowledged = true; // M2: the result was consumed
-    return resp(app.gpa, "Lane {s}: {s}\n", .{ id, tail }, id, null);
+    // M2: only an idle (finished) read consumes the result — peeking at a
+    // running worker (the poll-until-done pattern) must not suppress its
+    // eventual completion delivery.
+    if (target.turn.state == .idle) target.acknowledged = true;
+    return resp(app.gpa, "Lane {s} ({s}): {s}\n", .{ id, status, tail }, id, null);
 }
 
 /// Tail of a lane's transcript (last `max` user/agent bodies, oldest first).
@@ -966,9 +1033,15 @@ fn transcriptTail(app: *App, lane: *Thread, max: usize) []u8 {
     while (i > 0 and bodies.items.len < max) {
         i -= 1;
         const m = messages[i];
+        // Include tool titles (and lane notices) alongside user/agent text:
+        // a worker whose tail would otherwise be just its initial prompt
+        // ("You are a worker agent in lane …") shows its actual activity —
+        // an orchestrator must see progress, not a silent blank.
         const body: []const u8 = switch (m) {
             .user => |x| x.body,
             .agent => |x| x.body,
+            .tool => |x| x.title,
+            .notice => |x| x.body,
             else => continue,
         };
         if (body.len == 0) continue;
@@ -1034,10 +1107,24 @@ fn discardAbandonedTurnOnLane(app: *App, lane: *Thread) void {
 /// `lane await {lane}`: resolve once the target lane's turn is idle (or the
 /// lane is rested — S11's park is transparent). Returns null while the target
 /// is still running; the tick stays alive because the awaiting orchestrator's
-/// own turn is active.
+/// own turn is active. A worker silent past the stall window resolves ONCE
+/// with a stall notice (latched by `stall_warned`) so the orchestrator can
+/// cancel/steer instead of blocking here forever.
 fn awaitLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     const id = req.lane orelse return failResp(app.gpa, "lane: await needs a `lane` id\n", .{});
     const target = resolveLane(app, id) orelse return failResp(app.gpa, "lane: no open lane with id '{s}'\n", .{id});
+    const now_ms = std.Io.Clock.now(.awake, app.io).toMilliseconds();
+    if (target.turn.state == .active and laneStalled(target, now_ms) and !target.stall_warned) {
+        target.stall_warned = true;
+        const silent_s: i64 = @max(0, @divTrunc(now_ms - target.last_activity_ms, std.time.ms_per_s));
+        return resp(
+            app.gpa,
+            "Lane {s} may be stalled — still running, no output for {d}s ({d} tool calls so far). Stop it with `lane cancel`, redirect with `lane steer`, or keep waiting.\n",
+            .{ id, silent_s, target.turn_tool_calls },
+            id,
+            null,
+        );
+    }
     if (target.turn.state != .idle) return null; // poll again next tick
     target.acknowledged = true; // M2: the result was consumed
     const tail = transcriptTail(app, target, 12);
@@ -1171,7 +1258,7 @@ test "serviceLaneBridge resolves a list request against a test App" {
     serviceLaneBridge(&app);
 
     try std.testing.expect(bridge.pending == null);
-    const result = bridge.response.?;
+    const result = req.response.?;
     defer app.gpa.free(result.text);
     try std.testing.expectEqual(@as(u8, 0), result.code);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "open lanes:") != null);
@@ -1199,7 +1286,7 @@ test "serviceLaneBridge refuses a non-primary spawn with the crisp F2 message" {
     serviceLaneBridge(&app);
 
     try std.testing.expect(bridge.pending == null);
-    const result = bridge.response.?;
+    const result = req.response.?;
     defer app.gpa.free(result.text);
     try std.testing.expect(result.code != 0);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "only to the driver lane") != null);
@@ -1228,8 +1315,7 @@ fn postAndService(io: std.Io, app: *App, req: *lane_bridge.Request) lane_bridge.
     bridge.mutex.unlock(io);
     serviceLaneBridge(app);
     std.debug.assert(bridge.pending == null);
-    const out = bridge.response.?;
-    bridge.response = null;
+    const out = req.response.?;
     return out;
 }
 
@@ -1588,6 +1674,114 @@ test "lane await resolves an idle lane immediately and polls a running one" {
     serviceLaneBridge(&app);
     try std.testing.expect(bridge.pending == &run_req); // still in flight
     bridge.pending = null; // test teardown: drop the poll
+}
+
+test "lane await resolves a stalled worker once, then latches the stall warning" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    // A worker that has emitted nothing past the stall window: the wait must
+    // resolve once with a stall notice so the orchestrator can cancel/steer
+    // instead of blocking forever.
+    const stalled = try addFakeWorkingLane(gpa, &app, "stalled");
+    stalled.turn.submit();
+    stalled.turn_tool_calls = 4;
+    stalled.last_activity_ms = std.Io.Clock.now(.awake, io).toMilliseconds() - worker_stall_ms - 1000;
+
+    var req = lane_bridge.Request{ .op = .await, .lane = try gpa.dupe(u8, "stalled"), .requester = &agent };
+    defer req.deinit(gpa);
+    const result = postAndService(io, &app, &req);
+    defer app.gpa.free(result.text);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "may be stalled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "4 tool calls") != null);
+    try std.testing.expect(stalled.stall_warned);
+
+    // Re-awaiting while the same silent stretch continues must NOT resolve
+    // again every tick — it commits to waiting (the latch held until the
+    // worker emits again).
+    var req2 = lane_bridge.Request{ .op = .await, .lane = try gpa.dupe(u8, "stalled"), .requester = &agent };
+    defer req2.deinit(gpa);
+    const bridge = app.lane_bridge.?;
+    bridge.mutex.lock(io) catch unreachable;
+    bridge.pending = &req2;
+    bridge.mutex.unlock(io);
+    serviceLaneBridge(&app);
+    try std.testing.expect(bridge.pending == &req2); // back to blocking
+    bridge.pending = null;
+}
+
+test "lane read reports activity and does not acknowledge a running worker" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    // A running worker with progress: read surfaces the activity so the
+    // orchestrator can see it is busy, and must NOT consume its eventual
+    // result (M2 is gated on idle).
+    const busy = try addFakeWorkingLane(gpa, &app, "busy");
+    busy.turn.submit();
+    busy.turn_tool_calls = 3;
+    busy.last_activity_ms = std.Io.Clock.now(.awake, io).toMilliseconds() - 2000;
+    var busy_req = lane_bridge.Request{ .op = .read, .lane = try gpa.dupe(u8, "busy"), .requester = &agent };
+    defer busy_req.deinit(gpa);
+    const busy_resp = postAndService(io, &app, &busy_req);
+    defer app.gpa.free(busy_resp.text);
+    try std.testing.expectEqual(@as(u8, 0), busy_resp.code);
+    try std.testing.expect(std.mem.indexOf(u8, busy_resp.text, "running — 3 tool calls") != null);
+    try std.testing.expect(!busy.acknowledged); // running: result not yet consumed
+
+    // A stalled worker is flagged with an actionable hint.
+    const stuck = try addFakeWorkingLane(gpa, &app, "stuck");
+    stuck.turn.submit();
+    stuck.turn_tool_calls = 1;
+    stuck.last_activity_ms = std.Io.Clock.now(.awake, io).toMilliseconds() - worker_stall_ms - 1000;
+    var stuck_req = lane_bridge.Request{ .op = .read, .lane = try gpa.dupe(u8, "stuck"), .requester = &agent };
+    defer stuck_req.deinit(gpa);
+    const stuck_resp = postAndService(io, &app, &stuck_req);
+    defer app.gpa.free(stuck_resp.text);
+    try std.testing.expect(std.mem.indexOf(u8, stuck_resp.text, "STALLED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stuck_resp.text, "lane cancel") != null);
+
+    // An idle finished worker reads back its tool-call tally.
+    const done = try addFakeWorkingLane(gpa, &app, "done2");
+    done.turn_tool_calls = 9;
+    _ = try done.transcript.append(gpa, .agent, "agent", "final verdict");
+    var done_req = lane_bridge.Request{ .op = .read, .lane = try gpa.dupe(u8, "done2"), .requester = &agent };
+    defer done_req.deinit(gpa);
+    const done_resp = postAndService(io, &app, &done_req);
+    defer app.gpa.free(done_resp.text);
+    try std.testing.expect(std.mem.indexOf(u8, done_resp.text, "idle — 9 tool calls") != null);
+    try std.testing.expect(done.acknowledged); // idle read consumed the result
+}
+
+test "lane list surfaces worker activity in the status column" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    const busy = try addFakeWorkingLane(gpa, &app, "busy2");
+    busy.turn.submit();
+    busy.turn_tool_calls = 5;
+    busy.last_activity_ms = std.Io.Clock.now(.awake, io).toMilliseconds() - 5000;
+
+    var req = lane_bridge.Request{ .op = .list, .requester = &agent };
+    defer req.deinit(gpa);
+    const result = postAndService(io, &app, &req);
+    defer app.gpa.free(result.text);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "busy2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "running — 5 tool calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "last output") != null);
 }
 
 test "lane steer is refused on a rested lane and reaches a running worker" {

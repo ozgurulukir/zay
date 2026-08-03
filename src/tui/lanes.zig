@@ -51,7 +51,7 @@ pub fn laneErrorText(err: anyerror) []const u8 {
         error.CannotMergePrimaryLane => "can't merge the primary lane; switch to a working lane first",
         error.CannotClosePrimaryLane => "can't close the primary lane",
         error.NoMergeDestination => "no other lane to merge into",
-        error.TooManyLanes => "too many lanes (max 4)",
+        error.TooManyLanes => "too many lanes (max 4 total: driver + 3)",
         else => @errorName(err),
     };
 }

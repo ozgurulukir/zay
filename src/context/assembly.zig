@@ -507,6 +507,9 @@ test "assembleSystemPrompt includes the unconditional <lanes> block from system.
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<lanes>") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Workspace mode") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Orchestration mode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Fan out when the work decomposes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Sequence what depends") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Discipline (hard)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Dispatch, don't block") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "lane spawn") != null);
 }
