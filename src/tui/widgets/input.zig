@@ -79,7 +79,7 @@ fn inputHintText(app: *const App) []const u8 {
         .mcp => "[Space] Toggle" ++ symbols.separator_dot_padded ++ "Ctrl+R Reconnect" ++ symbols.separator_dot_padded ++ "[ESC] Close",
         .plugins => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ESC] Close",
         .search => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Jump to message" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
-        .normal => "Type prompt, @file, $skill or / for menu" ++ symbols.separator_dot_padded ++ "Ctrl+O Background" ++ symbols.separator_dot_padded ++ "Ctrl+N Lanes" ++ symbols.separator_dot_padded ++ "Ctrl+F Search",
+        .normal => "Type prompt, @file, $skill or / for menu" ++ symbols.separator_dot_padded ++ "Ctrl+O Background" ++ symbols.separator_dot_padded ++ "Shift+Tab Lanes" ++ symbols.separator_dot_padded ++ "Ctrl+F Search",
     };
 }
 

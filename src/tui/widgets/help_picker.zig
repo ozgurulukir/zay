@@ -37,7 +37,7 @@ pub const help_lines = [_]HelpLine{
     .{ .key = "Up / Down", .desc = "Scroll transcript messages / select blocks" },
     .{ .key = "Tab", .desc = "Expand / collapse active message" },
     .{ .key = "Ctrl+O", .desc = "Toggle background jobs modal" },
-    .{ .key = "Ctrl+N", .desc = "Cycle through open parallel lanes" },
+    .{ .key = "Shift+Tab", .desc = "Cycle through open parallel lanes" },
     .{ .key = "Ctrl+L", .desc = "Toggle lane fullscreen / split view", .scope = .lanes },
     .{ .key = "Esc", .desc = "Cancel turn / unselect block / close modal" },
 
