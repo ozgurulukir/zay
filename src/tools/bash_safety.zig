@@ -230,7 +230,7 @@ fn parseResponse(gpa: std.mem.Allocator, bytes: []const u8) !Verdict {
 
 test "bash safety extracts command from tool arguments" {
     const gpa = std.testing.allocator;
-    const command = try commandFromArguments(gpa, "{\"command\":\"rm -rf /tmp/x\",\"reason\":\"clean\"}");
+    const command = try commandFromArguments(gpa, "{\"command\":\"rm -rf /tmp/x\",\"description\":\"clean\"}");
     defer gpa.free(command);
     try std.testing.expectEqualStrings("rm -rf /tmp/x", command);
 }

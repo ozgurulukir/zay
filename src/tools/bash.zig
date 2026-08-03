@@ -15,9 +15,9 @@ pub const tool: common.Tool = .{
             .required = true,
             .nullable = false,
         }, .{
-            .name = "reason",
+            .name = "description",
             .kind = .string,
-            .description = "Human-readable single-sentence explanation of what this command does.",
+            .description = "Human-readable single-sentence explanation of what this command does — shown as the tool's title.",
             .required = false,
             .nullable = true,
         }, .{
@@ -32,7 +32,7 @@ pub const tool: common.Tool = .{
             .description = "Extra environment variables, merged over the inherited env. String values only.",
             .required = false,
             .nullable = true,
-        }, .{ .name = "timeout", .kind = .integer, .description = "Timeout in seconds (default 10).", .required = false, .nullable = true }, .{
+        }, .{ .name = "timeout", .kind = .integer, .description = "Timeout in seconds (default 30).", .required = false, .nullable = true }, .{
             .name = "run_in_background",
             .kind = .boolean,
             .description = "Run the command in the background and return immediately. Use for long-running commands (builds, dev servers, watchers) so you are not blocked. The command's exit will be delivered to you as a message; meanwhile read its log file or use ps to check on it. The `timeout` field is ignored for background commands.",
@@ -122,7 +122,7 @@ pub fn runCaptured(
     defer captured.deinit(gpa);
 
     const status: FinishStatus = if (captured.timed_out) .{ .timeout_seconds = timeout_seconds } else .{};
-    return finishBashOutput(gpa, &captured, status);
+    return finishBashOutput(gpa, &captured, status, command);
 }
 
 /// Whether the bash arguments request a background launch. Cheap parse used by
@@ -229,7 +229,7 @@ fn mapBackgroundError(gpa: std.mem.Allocator, err: anyerror) common.Error!common
 
 const Args = struct {
     command: []const u8,
-    reason: []const u8,
+    summary: []const u8,
     cwd: ?[]const u8 = null,
     env: ?std.json.Value = null,
     parsed: std.json.Parsed(JsonArgs),
@@ -243,7 +243,7 @@ const Args = struct {
 
 const JsonArgs = struct {
     command: ?[]const u8 = null,
-    reason: ?[]const u8 = null,
+    description: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
     env: ?std.json.Value = null,
     timeout: ?u32 = null,
@@ -252,7 +252,6 @@ const JsonArgs = struct {
 const ParseError = error{
     InvalidJson,
     MissingCommand,
-    MissingReason,
     BadCommand,
     BadCwd,
     BadEnv,
@@ -268,7 +267,12 @@ fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args {
     const command = parsed.value.command orelse return error.MissingCommand;
     if (command.len == 0) return error.MissingCommand;
 
-    const reason = if (parsed.value.reason) |r| (if (r.len > 0) r else "Executing command.") else "Executing command.";
+    // `description` is the summary field; null/empty → the generic fallback
+    // keeps the display honest. (`reason` was removed — the schema is the
+    // contract, and unknown fields are ignored like any other.)
+    const summary = if (parsed.value.description) |d|
+        (if (d.len > 0) d else "Executing command.")
+    else "Executing command.";
 
     if (parsed.value.cwd) |cwd| {
         if (cwd.len == 0) return error.BadCwd;
@@ -287,7 +291,7 @@ fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args {
 
     return .{
         .command = command,
-        .reason = reason,
+        .summary = summary,
         .cwd = parsed.value.cwd,
         .env = parsed.value.env,
         .parsed = parsed,
@@ -307,7 +311,6 @@ fn parseError(gpa: std.mem.Allocator, err: ParseError) common.Error!common.Outpu
     return switch (err) {
         error.InvalidJson => common.fail(gpa, "bash: invalid JSON arguments\n", 2),
         error.MissingCommand => common.fail(gpa, "bash: missing command\n", 2),
-        error.MissingReason => common.fail(gpa, "bash: missing reason\n", 2),
         error.BadCommand => common.fail(gpa, "bash: command must be a string\n", 2),
         error.BadCwd => common.fail(gpa, "bash: cwd must be a non-empty string\n", 2),
         error.BadEnv => common.fail(gpa, "bash: env must be an object\n", 2),
@@ -391,11 +394,14 @@ pub const display_diff_end = "\x1enova:end";
 /// Turn a `bash.Capture` into the tool's observation: split out any
 /// display-block sentinel content, trim the rolling tail to the display
 /// budget, and — when the output was spilled to disk — surface the spill path
-/// so the model can read the full output.
+/// so the model can read the full output. The observation is prefixed with
+/// `$ <command>` so a truncated, timed-out, or empty result still shows what
+/// was invoked.
 fn finishBashOutput(
     gpa: std.mem.Allocator,
     captured: *const bash.Capture,
     status: FinishStatus,
+    command: []const u8,
 ) common.Error!common.Output {
     var extraction = extractDisplayBlocks(gpa, captured.tail) catch return error.OutOfMemory;
     defer extraction.deinit(gpa);
@@ -403,7 +409,7 @@ fn finishBashOutput(
     var snapshot = truncateTailBuffer(gpa, extraction.remainder, captured.total_lines, captured.total_bytes) catch return error.OutOfMemory;
     defer snapshotDeinit(gpa, &snapshot);
 
-    const observation_text = formatBashText(gpa, snapshot.text, captured.code, status) catch return error.OutOfMemory;
+    const observation_text = formatBashText(gpa, snapshot.text, captured.code, status, command) catch return error.OutOfMemory;
     var observation_text_moved = false;
     errdefer if (!observation_text_moved) gpa.free(observation_text);
 
@@ -544,17 +550,58 @@ fn snapshotDeinit(gpa: std.mem.Allocator, snapshot: *TailSnapshot) void {
     snapshot.* = undefined;
 }
 
-fn formatBashText(gpa: std.mem.Allocator, text: []const u8, code: u8, status: FinishStatus) std.mem.Allocator.Error![]u8 {
+fn formatBashText(
+    gpa: std.mem.Allocator,
+    text: []const u8,
+    code: u8,
+    status: FinishStatus,
+    command: []const u8,
+) std.mem.Allocator.Error![]u8 {
+    const prefix = try echoCommand(gpa, command);
+    defer gpa.free(prefix);
     if (status.timeout_seconds) |seconds| {
-        if (text.len == 0) return std.fmt.allocPrint(gpa, "Command timed out after {d} seconds", .{seconds});
-        return std.fmt.allocPrint(gpa, "{s}\n\nCommand timed out after {d} seconds", .{ text, seconds });
+        if (text.len == 0) {
+            return std.fmt.allocPrint(
+                gpa,
+                "{s}Command timed out after {d} seconds — retry with a larger `timeout` or use `run_in_background`",
+                .{ prefix, seconds },
+            );
+        }
+        return std.fmt.allocPrint(
+            gpa,
+            "{s}{s}\n\nCommand timed out after {d} seconds — retry with a larger `timeout` or use `run_in_background`",
+            .{ prefix, text, seconds },
+        );
     }
     if (code != 0) {
-        if (text.len == 0) return std.fmt.allocPrint(gpa, "Command exited with code {d}", .{code});
-        return std.fmt.allocPrint(gpa, "{s}\n\nCommand exited with code {d}", .{ text, code });
+        if (text.len == 0) return std.fmt.allocPrint(gpa, "{s}Command exited with code {d}", .{ prefix, code });
+        return std.fmt.allocPrint(gpa, "{s}{s}\n\nCommand exited with code {d}", .{ prefix, text, code });
     }
-    if (text.len == 0) return gpa.dupe(u8, "(no output)");
-    return gpa.dupe(u8, text);
+    if (text.len == 0) return std.fmt.allocPrint(gpa, "{s}(no output)", .{prefix});
+    return std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, text });
+}
+
+/// `$ <command>\n`, the observation prefix that ties a result back to what was
+/// invoked. The display-channel sentinel byte (`\x1e`) is escaped to the two
+/// characters `\x1e` when a command embeds it (the model routing content to
+/// the human display), so the model-facing observation never carries the raw
+/// byte — the display channel is its only legitimate carrier.
+fn echoCommand(gpa: std.mem.Allocator, command: []const u8) std.mem.Allocator.Error![]u8 {
+    if (std.mem.indexOfScalar(u8, command, '\x1e') == null) {
+        return std.fmt.allocPrint(gpa, "$ {s}\n", .{command});
+    }
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, "$ ");
+    for (command) |byte| {
+        if (byte == '\x1e') {
+            try out.appendSlice(gpa, "\\x1e");
+        } else {
+            try out.append(gpa, byte);
+        }
+    }
+    try out.append(gpa, '\n');
+    return out.toOwnedSlice(gpa);
 }
 
 fn truncateTailBuffer(gpa: std.mem.Allocator, tail: []const u8, total_lines: u32, total_bytes: u64) !TailSnapshot {
@@ -632,31 +679,45 @@ fn describeBashError(err: anyerror) []const u8 {
     };
 }
 
-/// The bash display summary is the model-provided reason; the expanded title
-/// is the executable command, so users can inspect exactly what ran.
+/// The bash display summary is the model-provided `description`; the expanded
+/// title is the executable command, so users can inspect exactly what ran.
+/// When no summary is present the command itself becomes the collapsed title,
+/// so the invoked command is never invisible.
 fn display(gpa: std.mem.Allocator, args: []const u8, userdata: *anyopaque) std.mem.Allocator.Error!common.ToolDisplay {
     _ = userdata;
     const parsed = std.json.parseFromSlice(JsonArgs, gpa, args, .{ .ignore_unknown_fields = true }) catch {
         return .{ .label = try gpa.dupe(u8, "bash") };
     };
     defer parsed.deinit();
-    const reason = parsed.value.reason orelse return .{ .label = try gpa.dupe(u8, "bash") };
-    if (reason.len == 0) return .{ .label = try gpa.dupe(u8, "bash") };
+
+    const summary: ?[]const u8 = blk: {
+        if (parsed.value.description) |d| {
+            if (d.len > 0) break :blk d;
+        }
+        break :blk null;
+    };
+    if (summary) |s| {
+        const label = try gpa.dupe(u8, s);
+        errdefer gpa.free(label);
+        const command = parsed.value.command orelse return .{ .label = label };
+        if (command.len == 0) return .{ .label = label };
+        const expanded_label = try gpa.dupe(u8, command);
+        return .{ .label = label, .expanded_label = expanded_label };
+    }
+
     const command = parsed.value.command orelse return .{ .label = try gpa.dupe(u8, "bash") };
     if (command.len == 0) return .{ .label = try gpa.dupe(u8, "bash") };
-
-    const label = try gpa.dupe(u8, reason);
-    errdefer gpa.free(label);
-    const expanded_label = try gpa.dupe(u8, command);
-    return .{ .label = label, .expanded_label = expanded_label };
+    return .{ .label = try gpa.dupe(u8, command) };
 }
 
-test "bash display uses reason with command as expanded label" {
+test "bash display ignores a legacy reason field" {
+    // `reason` was removed from the contract; a model that still sends it gets
+    // the command-as-title fallback, not a bogus summary.
     const gpa = std.testing.allocator;
     var label = try display(gpa, "{\"command\":\"pwd\",\"reason\":\"Inspect the current directory\"}", undefined);
     defer label.deinit(gpa);
-    try std.testing.expectEqualStrings("Inspect the current directory", label.label);
-    try std.testing.expectEqualStrings("pwd", label.expanded_label.?);
+    try std.testing.expectEqualStrings("pwd", label.label);
+    try std.testing.expect(label.expanded_label == null);
 }
 
 test "bash display falls back on partial JSON" {
@@ -667,16 +728,36 @@ test "bash display falls back on partial JSON" {
     try std.testing.expect(label.expanded_label == null);
 }
 
+test "bash display uses description with command as expanded label" {
+    // The canonical field: what current models emit for the summary.
+    const gpa = std.testing.allocator;
+    var label = try display(gpa, "{\"command\":\"pwd\",\"description\":\"Inspect the current directory\"}", undefined);
+    defer label.deinit(gpa);
+    try std.testing.expectEqualStrings("Inspect the current directory", label.label);
+    try std.testing.expectEqualStrings("pwd", label.expanded_label.?);
+}
+
+test "bash display falls back to the command when no summary is present" {
+    // A model that omits the description must not produce a bare "bash" row —
+    // the invoked command becomes the title.
+    const gpa = std.testing.allocator;
+    var label = try display(gpa, "{\"command\":\"git status\"}", undefined);
+    defer label.deinit(gpa);
+    try std.testing.expectEqualStrings("git status", label.label);
+    try std.testing.expect(label.expanded_label == null);
+}
+
 test "bash tool applies env object" {
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
 
-    var output = try runToolForTest(gpa, std.testing.io, cwd, "{\"command\":\"printf \\\"$BASH_TOOL_TEST\\\"\",\"reason\":\"read\",\"env\":{\"BASH_TOOL_TEST\":\"hello-env\"}}");
+    var output = try runToolForTest(gpa, std.testing.io, cwd, "{\"command\":\"printf \\\"$BASH_TOOL_TEST\\\"\",\"description\":\"read\",\"env\":{\"BASH_TOOL_TEST\":\"hello-env\"}}");
     defer output.deinit(gpa);
 
     try std.testing.expectEqual(@as(u8, 0), output.code);
-    try std.testing.expectEqualStrings("hello-env", output.stdout);
+    // stdout is the rendered observation — it now echoes the command first.
+    try std.testing.expect(std.mem.indexOf(u8, output.stdout, "hello-env") != null);
 }
 
 test "bash tool applies relative cwd" {
@@ -686,7 +767,7 @@ test "bash tool applies relative cwd" {
 
     try std.Io.Dir.cwd().createDirPath(std.testing.io, ".zig-cache/bash-tool-test");
 
-    var output = try runToolForTest(gpa, std.testing.io, cwd, "{\"command\":\"printf \\\"$PWD\\\"\",\"reason\":\"read\",\"cwd\":\".zig-cache/bash-tool-test\"}");
+    var output = try runToolForTest(gpa, std.testing.io, cwd, "{\"command\":\"printf \\\"$PWD\\\"\",\"description\":\"read\",\"cwd\":\".zig-cache/bash-tool-test\"}");
     defer output.deinit(gpa);
 
     // `$PWD` is reported in the shell's native notation (MSYS forward-slash form
@@ -697,17 +778,53 @@ test "bash tool applies relative cwd" {
 }
 
 test "bash tool parses timeout" {
-    var args = try parseArgs(std.testing.allocator, "{\"command\":\"printf ok\",\"reason\":\"read\",\"timeout\":42}");
+    var args = try parseArgs(std.testing.allocator, "{\"command\":\"printf ok\",\"description\":\"read\",\"timeout\":42}");
     defer args.deinit();
 
     try std.testing.expectEqual(@as(u32, 42), args.timeout_seconds);
 }
 
-test "bash tool accepts freeform reason" {
+test "bash tool ignores a legacy reason field" {
     var args = try parseArgs(std.testing.allocator, "{\"command\":\"printf ok\",\"reason\":\"Print ok\"}");
     defer args.deinit();
 
-    try std.testing.expectEqualStrings("Print ok", args.reason);
+    try std.testing.expectEqualStrings("Executing command.", args.summary);
+}
+
+test "bash tool accepts description as the canonical summary" {
+    var args = try parseArgs(std.testing.allocator, "{\"command\":\"printf ok\",\"description\":\"Print ok\"}");
+    defer args.deinit();
+
+    try std.testing.expectEqualStrings("Print ok", args.summary);
+}
+
+test "bash observation echoes the invoked command" {
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+
+    var output = try runToolForTest(gpa, std.testing.io, cwd, "{\"command\":\"printf hello\",\"description\":\"Print hello\"}");
+    defer output.deinit(gpa);
+    const observation = try testObservationText(gpa, output);
+    defer gpa.free(observation);
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    try std.testing.expectEqualStrings("$ printf hello\nhello", observation);
+}
+
+test "bash timeout observation echoes the command and retry guidance" {
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+
+    var output = try runToolForTest(gpa, std.testing.io, cwd, "{\"command\":\"sleep 5\",\"timeout\":1}");
+    defer output.deinit(gpa);
+    const observation = try testObservationText(gpa, output);
+    defer gpa.free(observation);
+
+    try std.testing.expect(std.mem.indexOf(u8, observation, "$ sleep 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observation, "timed out after 1 seconds") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observation, "run_in_background") != null);
 }
 
 fn testObservationText(gpa: std.mem.Allocator, output: common.Output) ![]u8 {
@@ -720,7 +837,7 @@ test "bash tool reports exit code in observation" {
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
 
-    var output = try runToolForTest(gpa, std.testing.io, cwd, "{\"command\":\"printf nope; exit 7\",\"reason\":\"read\"}");
+    var output = try runToolForTest(gpa, std.testing.io, cwd, "{\"command\":\"printf nope; exit 7\",\"description\":\"read\"}");
     defer output.deinit(gpa);
     const observation = try testObservationText(gpa, output);
     defer gpa.free(observation);
@@ -782,7 +899,7 @@ test "bash tool surfaces a display block as a diff-kind display" {
 
     // The JSON-escaped RS byte (backslash-u-001e) is the sentinel; the shell
     // receives it literally and printf echoes it back out.
-    const args = "{\"command\":\"printf 'edited ok\\n\\u001enova:diff\\n-old\\n+new\\n\\u001enova:end\\n'\",\"reason\":\"edit\"}";
+    const args = "{\"command\":\"printf 'edited ok\\n\\u001enova:diff\\n-old\\n+new\\n\\u001enova:end\\n'\",\"description\":\"edit\"}";
     var output = try runToolForTest(gpa, std.testing.io, cwd, args);
     defer output.deinit(gpa);
 
@@ -800,7 +917,7 @@ test "bash tool truncates observation tail and keeps full output path" {
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
 
-    var output = try runToolForTest(gpa, std.testing.io, cwd, "{\"command\":\"i=0; while [ $i -lt 2105 ]; do echo line-$i; i=$((i+1)); done\",\"reason\":\"read\"}");
+    var output = try runToolForTest(gpa, std.testing.io, cwd, "{\"command\":\"i=0; while [ $i -lt 2105 ]; do echo line-$i; i=$((i+1)); done\",\"description\":\"read\"}");
     defer {
         if (output.observation) |observation| switch (observation) {
             .complete => {},
@@ -824,12 +941,13 @@ test "bash tool accepts null for optional fields under strict schema" {
 
     // Null for optional string, object, integer, and boolean fields.
     var output = try runToolForTest(gpa, std.testing.io, cwd,
-        \\{"command":"printf ok","reason":null,"cwd":null,"env":null,"timeout":null,"run_in_background":null}
+        \\{"command":"printf ok","description":null,"cwd":null,"env":null,"timeout":null,"run_in_background":null}
     );
     defer output.deinit(gpa);
 
     try std.testing.expectEqual(@as(u8, 0), output.code);
-    try std.testing.expectEqualStrings("ok", output.stdout);
+    // stdout is the rendered observation — it echoes the command first.
+    try std.testing.expect(std.mem.indexOf(u8, output.stdout, "ok") != null);
 }
 
 test "bash tool accepts partial nulls alongside populated optional fields" {
@@ -837,14 +955,14 @@ test "bash tool accepts partial nulls alongside populated optional fields" {
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
 
-    // Mix of null and real values: null reason, populated cwd, null env, populated timeout, null run_in_background.
+    // Mix of null and real values: null description, populated cwd, null env, populated timeout, null run_in_background.
     var output = try runToolForTest(gpa, std.testing.io, cwd,
-        \\{"command":"printf ok","reason":null,"cwd":".","env":null,"timeout":30,"run_in_background":null}
+        \\{"command":"printf ok","description":null,"cwd":".","env":null,"timeout":30,"run_in_background":null}
     );
     defer output.deinit(gpa);
 
     try std.testing.expectEqual(@as(u8, 0), output.code);
-    try std.testing.expectEqualStrings("ok", output.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, output.stdout, "ok") != null);
 }
 
 test "bash tool parses null timeout as default" {
@@ -858,7 +976,7 @@ test "bash tool parses null timeout as default" {
     defer output.deinit(gpa);
 
     try std.testing.expectEqual(@as(u8, 0), output.code);
-    try std.testing.expectEqualStrings("ok", output.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, output.stdout, "ok") != null);
 }
 
 test "bash tool rejects invalid type for nullable field when model sends wrong type" {
@@ -866,11 +984,11 @@ test "bash tool rejects invalid type for nullable field when model sends wrong t
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
 
-    // Strict schema allows string|null for `reason`, but not integer. The
+    // Strict schema allows string|null for `description`, but not integer. The
     // JSON parser rejects the type mismatch, so parseArgs returns InvalidJson
     // and the tool exits non-zero instead of silently misinterpreting it.
     var output = try runToolForTest(gpa, std.testing.io, cwd,
-        \\{"command":"printf ok","reason":42}
+        \\{"command":"printf ok","description":42}
     );
     defer output.deinit(gpa);
 
@@ -929,7 +1047,7 @@ test "empty sentinel block yields no display" {
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
-    const args = "{\"command\":\"printf '\\u001enova:diff\\n\\u001enova:end\\n'\",\"reason\":\"edit\"}";
+    const args = "{\"command\":\"printf '\\u001enova:diff\\n\\u001enova:end\\n'\",\"description\":\"edit\"}";
     var output = try runToolForTest(gpa, std.testing.io, cwd, args);
     defer output.deinit(gpa);
 

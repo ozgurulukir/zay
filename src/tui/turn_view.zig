@@ -502,7 +502,7 @@ test "bash read of skill renders skill row" {
     const changed = try view.applyToolPreview(gpa, &transcript, .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"cat .agents/skills/tigerstyle/SKILL.md\",\"reason\":\"Read the tigerstyle skill instructions\"}",
+        .arguments = "{\"command\":\"cat .agents/skills/tigerstyle/SKILL.md\",\"description\":\"Read the tigerstyle skill instructions\"}",
     });
 
     try std.testing.expect(changed);
@@ -526,7 +526,7 @@ test "bash read of skill renders skill row" {
 
 test "bash skill detection uses command, not reason" {
     const gpa = std.testing.allocator;
-    const skill_name = try TurnView.skillNameFromBashRead(gpa, "{\"command\":\"cat .agents/skills/tigerstyle/SKILL.md\",\"reason\":\"Read the skill file\"}");
+    const skill_name = try TurnView.skillNameFromBashRead(gpa, "{\"command\":\"cat .agents/skills/tigerstyle/SKILL.md\",\"description\":\"Read the skill file\"}");
     defer if (skill_name) |name| gpa.free(name);
     try std.testing.expectEqualStrings("tigerstyle", skill_name.?);
 }

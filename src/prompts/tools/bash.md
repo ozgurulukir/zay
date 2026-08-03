@@ -2,11 +2,11 @@ Run a shell command.
 
 - Set the working directory with the `cwd` param, not `cd dir && ...` because each call starts a fresh shell. The `cwd` must be within the project root.
 - Pass values via `env: { NAME: "..." }` for multiline or complex values. Reference them as `"$NAME"`.
-- Provide a `reason` for every command — a human-readable single-sentence explanation of what it does.
+- Provide a `description` for every command — a human-readable single-sentence explanation of what it does.
 - Quote every expansion: `"$var"`, `"$(cmd)"`, `"${arr[@]}"`.
-- Default timeout is 10 seconds. Raise it with the `timeout` parameter when a command needs longer.
+- Default timeout is 30 seconds. Raise it with the `timeout` parameter when a command needs longer; a timed-out result tells you how to retry.
 - Prefer targeted commands (`rg`, `find`, `git diff --stat`, `head`, `tail`) over dumping large files or full build logs.
-- Bash output may be truncated. If output is truncated, use the reported full-output path to read the rest or rerun with a narrower command.
+- Each result echoes the command you ran, then its output. Output may be truncated to the tail; if it is, use the reported full-output path to read the rest or rerun with a narrower command.
 
 ## Reading files (sliding window)
 

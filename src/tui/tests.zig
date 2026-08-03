@@ -1589,7 +1589,7 @@ test "agent app events update transcript on the ui side" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"ls\",\"reason\":\"List files\"}",
+        .arguments = "{\"command\":\"ls\",\"description\":\"List files\"}",
     } }));
     try std.testing.expect(!try app.applyAgentEvent(.{ .thinking_delta = " files" }));
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
@@ -1724,7 +1724,7 @@ test "loading does not appear during final answer after tool batch" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"pwd\",\"reason\":\"Print working directory\"}",
+        .arguments = "{\"command\":\"pwd\",\"description\":\"Print working directory\"}",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
@@ -1820,7 +1820,7 @@ test "tool row persists through finish and turn completion" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"ls\",\"reason\":\"List files\"}",
+        .arguments = "{\"command\":\"ls\",\"description\":\"List files\"}",
     } }));
     try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
     try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].mirror().kind);
@@ -1881,7 +1881,7 @@ test "partial tool arguments do not create visible tool rows" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"ls\",\"reason\":\"List files\"}",
+        .arguments = "{\"command\":\"ls\",\"description\":\"List files\"}",
     } }));
     try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
     try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].mirror().kind);
@@ -1937,7 +1937,7 @@ test "new tool response index creates a new transcript row" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"ls\",\"reason\":\"List files\"}",
+        .arguments = "{\"command\":\"ls\",\"description\":\"List files\"}",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
@@ -1951,7 +1951,7 @@ test "new tool response index creates a new transcript row" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"pwd\",\"reason\":\"Print working directory\"}",
+        .arguments = "{\"command\":\"pwd\",\"description\":\"Print working directory\"}",
     } }));
 
     try std.testing.expectEqual(@as(usize, 3), app.thread.transcript.messages.items.len);
@@ -1978,7 +1978,7 @@ test "bash tool after batch creates a new tool row" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"ls\",\"reason\":\"List files\"}",
+        .arguments = "{\"command\":\"ls\",\"description\":\"List files\"}",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
@@ -1995,7 +1995,7 @@ test "bash tool after batch creates a new tool row" {
     _ = try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"printf done\",\"reason\":\"Print done\"}",
+        .arguments = "{\"command\":\"printf done\",\"description\":\"Print done\"}",
     } });
 
     try std.testing.expectEqual(@as(usize, 3), app.thread.transcript.messages.items.len);
@@ -2021,14 +2021,14 @@ test "late tool finish does not move selection upward" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"ls\",\"reason\":\"List files\"}",
+        .arguments = "{\"command\":\"ls\",\"description\":\"List files\"}",
     } }));
     try std.testing.expectEqual(@as(u32, 1), app.thread.transcript.selected.?);
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 1,
         .name = "bash",
-        .arguments = "{\"command\":\"pwd\",\"reason\":\"Print working directory\"}",
+        .arguments = "{\"command\":\"pwd\",\"description\":\"Print working directory\"}",
     } }));
     try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);
 
@@ -2063,7 +2063,7 @@ test "loading does not resume after post-tool thinking delta" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"pwd\",\"reason\":\"Print working directory\"}",
+        .arguments = "{\"command\":\"pwd\",\"description\":\"Print working directory\"}",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
@@ -2102,7 +2102,7 @@ test "agent response after tool batch appears below tool rows" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"pwd\",\"reason\":\"Print working directory\"}",
+        .arguments = "{\"command\":\"pwd\",\"description\":\"Print working directory\"}",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
@@ -2146,7 +2146,7 @@ test "content delta after tool preview does not move selection away from tool ro
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
-        .arguments = "{\"command\":\"pwd\",\"reason\":\"Print working directory\"}",
+        .arguments = "{\"command\":\"pwd\",\"description\":\"Print working directory\"}",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
     try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);

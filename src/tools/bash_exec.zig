@@ -19,8 +19,8 @@ pub const Result = struct {
 
 const stdout_bytes_limit: usize = 512 * 1024;
 const stderr_bytes_limit: usize = 512 * 1024;
-pub const timeout_seconds_default: u32 = 10;
-/// Foreground timeout cap. 1h is 360× the default — generous for any
+pub const timeout_seconds_default: u32 = 30;
+/// Foreground timeout cap. 1h is 120× the default — generous for any
 /// interactive command — while `run_in_background` is the documented escape
 /// hatch for longer work (and ignores `timeout`). Requests above the cap are
 /// clamped, not rejected, so a model over-shooting by a huge factor degrades

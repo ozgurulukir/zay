@@ -504,7 +504,7 @@ test "ExecutorService runs bash and returns both channels" {
         .{
             .call_id = .{ .value = try gpa.dupe(u8, "call_0") },
             .name = try gpa.dupe(u8, "bash"),
-            .arguments = try gpa.dupe(u8, "{\"command\":\"printf hello\",\"reason\":\"Print hello\"}"),
+            .arguments = try gpa.dupe(u8, "{\"command\":\"printf hello\",\"description\":\"Print hello\"}"),
         },
     };
     defer for (calls) |c| {
@@ -520,7 +520,8 @@ test "ExecutorService runs bash and returns both channels" {
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqualStrings("call_0", results[0].call_id.slice());
-    try std.testing.expectEqualStrings("hello", results[0].content);
+    // The model-facing observation echoes the command first.
+    try std.testing.expect(std.mem.indexOf(u8, results[0].content, "hello") != null);
     try std.testing.expectEqualStrings("Print hello", results[0].display_label);
     try std.testing.expectEqualStrings("printf hello", results[0].display_expanded_label.?);
     try std.testing.expect(!results[0].failed);
@@ -532,7 +533,7 @@ test "executor converts a tool execution error into a failed result" {
     const call: ai.ToolCall = .{
         .call_id = .{ .value = try gpa.dupe(u8, "call_x") },
         .name = try gpa.dupe(u8, "bash"),
-        .arguments = try gpa.dupe(u8, "{\"command\":\"rg foo\",\"reason\":\"search\"}"),
+        .arguments = try gpa.dupe(u8, "{\"command\":\"rg foo\",\"description\":\"search\"}"),
     };
     defer {
         gpa.free(call.call_id.value);
@@ -555,7 +556,7 @@ test "executor rejected bash result is failed and model-facing" {
     const call: ai.ToolCall = .{
         .call_id = .{ .value = try gpa.dupe(u8, "call_reject") },
         .name = try gpa.dupe(u8, "bash"),
-        .arguments = try gpa.dupe(u8, "{\"command\":\"rm -rf /\",\"reason\":\"clean\"}"),
+        .arguments = try gpa.dupe(u8, "{\"command\":\"rm -rf /\",\"description\":\"clean\"}"),
     };
     defer {
         gpa.free(call.call_id.value);
@@ -638,7 +639,7 @@ test "ExecutorService shouldRejectUnsafeBash consults the approval hook" {
     const unsafe_call = ai.ToolCall{
         .call_id = .{ .value = try gpa.dupe(u8, "call_2") },
         .name = try gpa.dupe(u8, "bash"),
-        .arguments = try gpa.dupe(u8, "{\"command\":\"rm -rf /\",\"reason\":\"clean\"}"),
+        .arguments = try gpa.dupe(u8, "{\"command\":\"rm -rf /\",\"description\":\"clean\"}"),
     };
     defer {
         gpa.free(unsafe_call.call_id.value);
@@ -670,12 +671,12 @@ test "ExecutorService.runAll errdefer cleanup exists" {
         .{
             .call_id = .{ .value = try gpa.dupe(u8, "call_0") },
             .name = try gpa.dupe(u8, "bash"),
-            .arguments = try gpa.dupe(u8, "{\"command\":\"printf test\",\"reason\":\"Test\"}"),
+            .arguments = try gpa.dupe(u8, "{\"command\":\"printf test\",\"description\":\"Test\"}"),
         },
         .{
             .call_id = .{ .value = try gpa.dupe(u8, "call_1") },
             .name = try gpa.dupe(u8, "bash"),
-            .arguments = try gpa.dupe(u8, "{\"command\":\"printf fail\",\"reason\":\"Fail\"}"),
+            .arguments = try gpa.dupe(u8, "{\"command\":\"printf fail\",\"description\":\"Fail\"}"),
         },
     };
     defer for (calls) |c| {
@@ -828,7 +829,7 @@ test "valid bash call still dispatches after schema validation" {
     defer gpa.free(cwd);
     var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = cwd });
 
-    const call = try makeCall(gpa, "call_ok", "bash", "{\"command\":\"printf ok\",\"reason\":\"Print ok\"}");
+    const call = try makeCall(gpa, "call_ok", "bash", "{\"command\":\"printf ok\",\"description\":\"Print ok\"}");
     defer {
         gpa.free(call.call_id.value);
         gpa.free(call.name);
@@ -838,7 +839,8 @@ test "valid bash call still dispatches after schema validation" {
     var result = try executor.runOne(call);
     defer result.deinit(gpa);
     try std.testing.expect(!result.failed);
-    try std.testing.expectEqualStrings("ok", result.content);
+    // The model-facing observation echoes the command first.
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "ok") != null);
 }
 
 test "executor rejects bash call with missing required argument" {
