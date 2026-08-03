@@ -193,9 +193,10 @@ test "ToolRegistry: addPluginTool makes plugin tool discoverable" {
     try std.testing.expectEqualStrings("plugin tool", tool.description);
 
     const all = try reg.all(gpa);
-    try std.testing.expectEqual(@as(usize, 2), all.len); // bash + plugin
+    try std.testing.expectEqual(@as(usize, 3), all.len); // bash + lane + plugin
     try std.testing.expectEqualStrings("bash", all[0].name);
-    try std.testing.expectEqualStrings("lua__p__t", all[1].name);
+    try std.testing.expectEqualStrings("lane", all[1].name);
+    try std.testing.expectEqualStrings("lua__p__t", all[2].name);
 }
 
 test "ToolRegistry: removePluginToolsWithPrefix strips matching tools" {
@@ -262,7 +263,7 @@ test "ToolRegistry: all() returns valid slices after multiple calls" {
     // First all(): tools are still allocated.
     {
         const all = try reg.all(gpa);
-        try std.testing.expect(all.len == 3); // bash + 2 plugin
+        try std.testing.expect(all.len == 4); // bash + lane + 2 plugin
         for (all) |t| {
             try std.testing.expect(t.name.len > 0);
             try std.testing.expect(t.description.len > 0);
@@ -272,7 +273,7 @@ test "ToolRegistry: all() returns valid slices after multiple calls" {
     // Reuse the same registry; backing storage must still be intact.
     {
         const all = try reg.all(gpa);
-        try std.testing.expect(all.len == 3);
+        try std.testing.expect(all.len == 4);
         for (all) |t| {
             try std.testing.expect(t.name.len > 0);
             try std.testing.expect(t.description.len > 0);

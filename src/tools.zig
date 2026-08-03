@@ -2,6 +2,7 @@ const std = @import("std");
 
 const bash_tool = @import("tools/bash.zig");
 const common = @import("tools/common.zig");
+const lane_tool = @import("tools/lane.zig");
 const registry_mod = @import("tools/registry.zig");
 
 const assert = std.debug.assert;
@@ -25,6 +26,7 @@ pub const ToolRegistry = registry_mod.ToolRegistry;
 pub fn builtinRegistry() []const Tool {
     return &.{
         bash_tool.tool,
+        lane_tool.tool,
     };
 }
 
@@ -74,7 +76,7 @@ test "registry contains every tool exactly once" {
         const gop = try seen.getOrPut(std.testing.allocator, tool.name);
         try std.testing.expect(!gop.found_existing);
     }
-    try std.testing.expectEqual(@as(usize, 1), builtinRegistry().len);
+    try std.testing.expectEqual(@as(usize, 2), builtinRegistry().len);
 }
 
 test "lookup finds a registered tool" {
@@ -88,5 +90,6 @@ test "lookup returns null for unknown tool" {
 
 test {
     _ = bash_tool;
+    _ = lane_tool;
     _ = common;
 }

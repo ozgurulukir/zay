@@ -9,6 +9,7 @@ const config_mod = @import("config/config.zig");
 const context_mod = @import("context/manager.zig");
 const context_assembly = @import("context/assembly.zig");
 const executor_mod = @import("executor.zig");
+const lane_bridge = @import("tools/lane_bridge.zig");
 const lua_mod = @import("lua/root.zig");
 const mcp_mod = @import("mcp/manager.zig");
 const session_mod = @import("session.zig");
@@ -36,6 +37,16 @@ pub const Agent = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
+    /// Workspace-mode scoping (S5): when set (a borrowed lane worktree path),
+    /// tools root at this path instead of `cwd`; `effectiveCwd()` is the
+    /// single read. Written only by the `lane` tool on this agent's worker
+    /// thread, between tool batches; reset to null by the tool (`lane leave`)
+    /// or by the UI's S17 invariant while this agent's turn is idle. The path
+    /// is owned by the lane's `Thread`, never freed here.
+    workspace: ?[]const u8 = null,
+    /// The App-owned `LaneBridge` the `lane` tool posts across. Borrowed
+    /// (owned by the App); null disables the lane tool (headless/tests).
+    lane_bridge: ?*lane_bridge.LaneBridge = null,
     client: ai.LanguageModel,
     context_manager: context_mod.ContextManager,
     skills: []const skill_mod.Skill = &.{},
@@ -111,6 +122,14 @@ pub const Agent = struct {
         };
     }
 
+    /// The directory tools run in: the workspace root when entered in a lane
+    /// (S5), else the session cwd. Read per tool batch by `runToolBatch` and
+    /// per `@`-mention expansion by `addUserPrompt` — both on the worker
+    /// thread, so no lock is needed against the worker-side `lane` writes.
+    pub fn effectiveCwd(self: *const Agent) []const u8 {
+        return self.workspace orelse self.cwd;
+    }
+
     /// The cached message projection the agent prompts with. Source of truth
     /// is the session tree; see `ContextManager`.
     pub fn messages(self: *const Agent) []ai.ChatMessage {
@@ -169,6 +188,18 @@ pub const Agent = struct {
         if (!self.message_queue.push(&self.message_queue_storage, .{ .prompt = owned, .raw = true })) return error.QueueFull;
     }
 
+    /// Queue a user message marked to steer (inject after the next tool batch).
+    /// Atomic push + mark under one lock, so the lane-steer path can't
+    /// interleave a concurrent drain between `enqueueUser` and `setQueuedSteer`.
+    pub fn enqueueSteer(self: *Agent, content: []const u8) !void {
+        assert(content.len > 0);
+        const owned = try self.gpa.dupe(u8, content);
+        errdefer self.gpa.free(owned);
+        try self.message_queue_mutex.lock(self.io);
+        defer self.message_queue_mutex.unlock(self.io);
+        if (!self.message_queue.push(&self.message_queue_storage, .{ .prompt = owned, .steer = true })) return error.QueueFull;
+    }
+
     /// Whether any user message is waiting in the queue. The UI uses this to
     /// decide whether an idle lane should start a turn to deliver a background
     /// completion that was enqueued while no turn was running.
@@ -189,7 +220,10 @@ pub const Agent = struct {
         // assistant call, ahead of the new user turn.
         try self.reconcileInterruptedToolCalls();
 
-        const blocks = try at_mention.buildUserMessage(self.gpa, self.io, self.cwd, prompt);
+        // @-mention expansion follows the workspace (M6): in workspace mode a
+        // mention of a file edited in the lane reads the lane's copy. Runs on
+        // the worker thread, so `effectiveCwd` is race-free against the tool.
+        const blocks = try at_mention.buildUserMessage(self.gpa, self.io, self.effectiveCwd(), prompt);
         errdefer {
             for (blocks) |*block| block.deinit(self.gpa);
             self.gpa.free(blocks);
@@ -465,7 +499,7 @@ pub const Agent = struct {
         var executor = executor_mod.ExecutorService.init(.{
             .gpa = self.gpa,
             .io = self.io,
-            .cwd = self.cwd,
+            .cwd = self.effectiveCwd(),
             .bash_classifier_url = self.bash_classifier_url,
             .background = if (self.background_manager) |manager|
                 .{ .manager = manager, .owner = self }
@@ -474,6 +508,8 @@ pub const Agent = struct {
             .mcp_manager = self.mcp_manager,
             .tool_registry = self.tool_registry,
             .plugin_manager = self.plugin_manager,
+            .lane_bridge = self.lane_bridge,
+            .lane_requester = self,
         });
         const results = try executor.runAll(tool_batch.calls, bridge.observer());
         defer self.gpa.free(results);

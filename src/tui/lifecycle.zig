@@ -16,6 +16,7 @@ const blackhole = @import("../tui/blackhole.zig");
 const codex = @import("../auth/codex.zig");
 const provider_model = @import("provider_model.zig");
 const diff_lifecycle = @import("diff_lifecycle.zig");
+const lane_lifecycle = @import("lane_lifecycle.zig");
 const runtime_mod = @import("../runtime.zig");
 const vcs = @import("../vcs.zig");
 
@@ -96,6 +97,12 @@ pub fn deinitApp(self: *App) void {
     self.inputs.input.deinit();
     self.inputs.palette.deinit();
     self.inputs.comment.deinit();
+    // Every lane's turn future was cancelled at the top of deinitApp, so no
+    // worker is still blocked on the bridge — safe to destroy it now.
+    if (self.lane_bridge) |bridge| {
+        self.gpa.destroy(bridge);
+        self.lane_bridge = null;
+    }
     self.* = undefined;
 }
 
@@ -110,6 +117,10 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         provider_model.refreshMcpTools(root.app);
     }
     var visible_change = try drainAgentEvents(root, ctx);
+    // Service any in-flight `lane` tool request (a worker lane is blocked on
+    // the bridge while it waits). Runs every tick — a blocked worker posts no
+    // agent events, so this is the only thing that makes it progress.
+    lane_lifecycle.serviceLaneBridge(root.app);
     if (try provider_model.drainModelLoad(root.app)) visible_change = true;
     // Re-discover MCP tools when a server pushed `notifications/tools/list_changed`
     // mid-request — the client buffered the flag and we poll it here.
@@ -122,6 +133,9 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     // to idle lanes (notice + a turn to answer them).
     if (try root.app.pollBackgroundJobs()) visible_change = true;
     if (try root.app.deliverPendingBackground()) visible_change = true;
+    // Rest finished spawned workers and deliver their completions to the
+    // spawner (notice + answer turn); acknowledged/gone spawners drop it.
+    if (try lane_lifecycle.deliverPendingLaneCompletions(root.app)) visible_change = true;
 
     if (root.app.thread.turn_view.awaitingOutput() or root.app.thread.transcript.hasRunningTool()) {
         root.spinner_tick_accum += RootWidget.drain_tick_ms;
@@ -266,6 +280,10 @@ pub fn createParallelLane(self: *App) !void {
         runtime.deinit();
         self.gpa.destroy(runtime);
     }
+    // A lane's agent needs the App's shared handles (the lane bridge among
+    // them) so its own `lane` tool calls can reach the bridge. Mirrors the
+    // wiring in `createRuntime` for the primary/new/resume runtimes.
+    runtime.agent.lane_bridge = self.lane_bridge;
 
     const lane = try self.gpa.create(Thread);
     errdefer self.gpa.destroy(lane);

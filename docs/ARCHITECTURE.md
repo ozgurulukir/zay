@@ -11,8 +11,16 @@ We try to normalise the request to a shape that is most compatible with the targ
 Nova exposes the following tools:
 
 - `bash`
+- `lane`
 
 `bash` has some middleware written for it that makes it friendlier for agent use. For example, large outputs from a `cat` command are written to a temp file and the agent is told the full is in that file if needed.
+
+`lane` gives the model first-class access to Nova's parallel-lane substrate: isolated git worktrees the TUI tiles side-by-side. It is a *bridge* tool — the tool runs on the lane's worker thread, so every action is posted across a `LaneBridge` (`src/tools/lane_bridge.zig`) and resolved by the UI on its tick. Two modes:
+
+- **Workspace mode** (`lane create`/`enter`/`leave`/`merge`): the driver's `Agent.workspace` is set to the lane's worktree path, and the per-batch executor re-roots at it (`effectiveCwd`) — bash/file/python calls then run inside the lane, and the lane branch folds back with `lane merge`.
+- **Orchestration mode** (`lane spawn`/`read`/`await`/`cancel`/`steer`): the driver spawns independent worker agents into fresh live lanes that run concurrently on their own worker threads; completion is delivered back to the driver (`deliverPendingLaneCompletions`) and finished workers are auto-parked (runtime freed, transcript kept).
+
+Only the driver lane may `spawn`/`enter`/`merge` — a worker gets `list`/`read` only. The 4-lane cap applies; `validateCwd`'s containment guarantees are unchanged (lane roots are valid only because Nova owns them).
 
 ### Tool schema strict mode
 

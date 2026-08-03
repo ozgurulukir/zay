@@ -10,6 +10,7 @@ pub const Policy = struct {
 
 const entries = [_]struct { name: []const u8, policy: Policy }{
     .{ .name = "bash", .policy = .{ .expand_by_default = false, .render = .plain } },
+    .{ .name = "lane", .policy = .{ .expand_by_default = false, .render = .plain } },
 };
 
 comptime {

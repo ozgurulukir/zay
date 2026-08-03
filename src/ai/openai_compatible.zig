@@ -713,18 +713,19 @@ test "updateMcpTools propagates plugin tools into tools_json end-to-end" {
 
     const json = client.tools_json;
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"bash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"lane\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"lua__hello-world__greet\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"lua__hello-world__current_time\"") != null);
 
-    // And the count of name occurrences must be exactly 3 (no duplicate
-    // bash, no dropped plugin tools).
+    // And the count of name occurrences must be exactly 4 (no duplicate
+    // bash/lane, no dropped plugin tools).
     var name_count: usize = 0;
     var scan_idx: usize = 0;
     while (std.mem.indexOfPos(u8, json, scan_idx, "\"name\":\"")) |pos| {
         name_count += 1;
         scan_idx = pos + 1;
     }
-    try std.testing.expectEqual(@as(usize, 3), name_count);
+    try std.testing.expectEqual(@as(usize, 4), name_count);
 }
 
 test "buildToolsJson emits strict schema with nullable union types for optional fields" {

@@ -10,15 +10,47 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const tui = @import("../tui.zig");
+const lanes_util = @import("lanes.zig");
 const tx_widget = @import("widgets/transcript.zig");
+const tui_message = @import("widgets/message.zig");
 
 const App = tui.App;
 const Thread = tui.Thread;
 
+/// The driver's workspace borrow, if any — the lane whose worktree path the
+/// driver (threads[0]) entered. Only the driver enters lanes, so its agent is
+/// the only one that can hold a workspace.
+fn driverWorkspacePath(app: *const App) ?[]const u8 {
+    if (app.threads.items.len == 0) return null;
+    const agent = app.threads.items[0].agent orelse return null;
+    return agent.workspace;
+}
+
 pub fn drawLaneColumn(app: *App, ctx: vxfw.DrawContext, lane: *Thread, width: u16, height: u16, active: bool) std.mem.Allocator.Error!vxfw.Surface {
     var transcript_view: tx_widget.TranscriptWidget = .{ .app = app, .thread = lane };
     const title = if (lane.title) |t| t else "untitled";
-    const label_text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ if (active) "● " else "○ ", title });
+    // Active-view marker (●/○) + turn-state marker (S14): a spinner frame
+    // while the lane's turn is running, a stop glyph while interrupting, a
+    // quiet dot when idle.
+    const state_glyph: []const u8 = switch (lane.turn.state) {
+        .active => tui_message.loading_frames[app.metrics.loading_frame % tui_message.loading_frames.len],
+        .interrupting => "■",
+        .idle => "·",
+    };
+    // Distinct marker on the lane the driver's workspace currently points at —
+    // the "active lane tracking" the model needs to see at a glance.
+    const ws_marker: []const u8 = if (driverWorkspacePath(app)) |ws| blk: {
+        if (lanes_util.workingLaneOf(lane)) |w| {
+            if (std.mem.eql(u8, ws, w.path)) break :blk " ⇄";
+        }
+        break :blk "";
+    } else "";
+    const label_text = try std.fmt.allocPrint(ctx.arena, "{s}{s} {s}{s}", .{
+        if (active) "● " else "○ ",
+        state_glyph,
+        title,
+        ws_marker,
+    });
     var border: vxfw.Border = .{
         .child = transcript_view.widget(),
         .labels = &.{.{ .text = label_text, .alignment = .top_left }},

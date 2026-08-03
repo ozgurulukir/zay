@@ -492,3 +492,21 @@ fn makeToolMessage(gpa: std.mem.Allocator, call_id: []const u8, text: []const u8
         },
     };
 }
+
+test "assembleSystemPrompt includes the unconditional <lanes> block from system.md" {
+    // The `lane` tool is a builtin, so its <lanes> guidance is always in the
+    // assembled prompt (unlike the conditional lua/mcp blocks).
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const template = @embedFile("../prompts/system.md");
+    const prompt = try assembleSystemPrompt(gpa, io, template, root, &.{}, &.{});
+    defer gpa.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<lanes>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Workspace mode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Orchestration mode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "lane spawn") != null);
+}

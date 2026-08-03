@@ -6,6 +6,7 @@ const ai = @import("ai.zig");
 const background = @import("background.zig");
 const bash_safety = @import("tools/bash_safety.zig");
 const bash_tool = @import("tools/bash.zig");
+const lane_bridge = @import("tools/lane_bridge.zig");
 const lua_mod = @import("lua/root.zig");
 const mcp_client_mod = @import("mcp/client.zig");
 const mcp_mod = @import("mcp/manager.zig");
@@ -160,6 +161,12 @@ pub const ExecutorService = struct {
     /// indirection slot is written from `initRuntime`'s scope — which
     /// is freed by the time `run` calls `executor.runOne`.
     plugin_manager: ?*lua_mod.PluginManager = null,
+    /// The App-owned `LaneBridge` the `lane` tool posts its requests across,
+    /// plus the requesting `*Agent` (as `*anyopaque`) that identifies the lane
+    /// for the role guard and completion routing. Both are threaded through
+    /// the slot in `produceOutput`; null disables the lane tool (headless).
+    lane_bridge: ?*lane_bridge.LaneBridge = null,
+    lane_requester: ?*anyopaque = null,
 
     pub const InitOptions = struct {
         gpa: std.mem.Allocator,
@@ -170,6 +177,8 @@ pub const ExecutorService = struct {
         mcp_manager: ?*mcp_mod.McpManager = null,
         tool_registry: ?*tools.ToolRegistry = null,
         plugin_manager: ?*lua_mod.PluginManager = null,
+        lane_bridge: ?*lane_bridge.LaneBridge = null,
+        lane_requester: ?*anyopaque = null,
     };
 
     pub fn init(options: InitOptions) ExecutorService {
@@ -184,6 +193,8 @@ pub const ExecutorService = struct {
             .mcp_manager = options.mcp_manager,
             .tool_registry = options.tool_registry,
             .plugin_manager = options.plugin_manager,
+            .lane_bridge = options.lane_bridge,
+            .lane_requester = options.lane_requester,
         };
     }
 
@@ -388,6 +399,15 @@ pub const ExecutorService = struct {
     /// everything else through the tool registry (builtin + plugin, looked up
     /// in one shot).
     fn produceOutput(self: *ExecutorService, call: ai.ToolCall) tools.Error!tools.Output {
+        // The `lane` tool reaches the App-owned bridge + the requesting agent
+        // through a thread-local slot (the `Tool.run` signature is fixed and
+        // can't take a `*ExecutorService`). Set it around the WHOLE dispatch —
+        // both the registry branch below and the registry-less fallback — so a
+        // headless run never reads a stale slot, and restore in a defer so a
+        // panic doesn't leak a dangling pointer into the next call.
+        const prev_lane = lane_bridge.lane_bridge_slot;
+        lane_bridge.lane_bridge_slot = .{ .bridge = self.lane_bridge, .requester = self.lane_requester };
+        defer lane_bridge.lane_bridge_slot = prev_lane;
         if (self.background) |bg| {
             if (std.mem.eql(u8, call.name, "bash") and bash_tool.wantsBackground(self.gpa, call.arguments)) {
                 return bash_tool.runBackground(self.gpa, self.io, self.cwd, call.arguments, bg.manager, bg.owner);

@@ -86,6 +86,19 @@ parent_context: [][]u8 = &.{},
 /// `io` to cancel, so the App (not `deinit` here) is responsible for it.
 naming_future: ?std.Io.Future(naming.BranchOutcome) = null,
 naming_done: std.atomic.Value(bool) = .init(false),
+/// Set on a lane spawned by the model via `lane spawn`: the `*Agent` that
+/// spawned it (as `?*agent_mod.Agent`). Completion delivery routes to that
+/// agent's lane; a spawner that is closed/abandoned first makes
+/// `laneForAgent` return null and the delivery is dropped (M7). Never
+/// dereferenced — only compared against live `lane.agent` pointers.
+spawned_by_agent: ?*agent_mod.Agent = null,
+/// Set by `lane read`/`await`/successful `merge` (M2): the orchestrator has
+/// consumed the worker's result, so completion delivery appends only a terse
+/// notice — no raw enqueue, no answer turn.
+acknowledged: bool = false,
+/// Set once a finished worker's completion has been delivered (or dropped).
+/// Guards the park+deliver pass so it runs exactly once per worker.
+completion_delivered: bool = false,
 
 /// A user message queued behind a running turn. `steer` injects it after the
 /// next tool batch instead of waiting for the turn to go idle. Text is owned.
@@ -106,8 +119,10 @@ pub const Live = struct {
 
 /// Whether — and how — this lane is attached to an execution engine. A lane is
 /// either parked (`idle`, no runtime) or running (`live`). Closing a lane tears
-/// it down and removes it from the list — there is no archived state (lanes
-/// don't merge; they land on `main` via a PR).
+/// it down and removes it from the list. A live lane can be *rested* (S11): a
+/// finished worker's runtime is freed and the engine downgraded to `.idle` —
+/// the lane stays in the grid, its transcript intact, so `read`/`await`/`merge`
+/// keep working on it.
 pub const Engine = union(enum) {
     idle: vcs.Lane,
     live: Live,

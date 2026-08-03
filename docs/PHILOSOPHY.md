@@ -10,7 +10,7 @@ With these three tools and some well-written skills, an agent can achieve _anyth
 
 ## Bash is enough
 
-Nova treats the shell as the substrate, not the fallback. A setup with nothing but the `bash` tool is a complete Nova, not a degraded one — the agent reads, edits, builds, searches, and ships using only shell commands. We deliberately keep no extension a prerequisite: if a task is best done with `rg`, `sed`, and a heredoc, that is the answer, not a missing tool.
+Nova treats the shell as the substrate, not the fallback. A setup with nothing but the core tools — `bash` (plus the built-in `lane` machinery for parallel worktrees) — is a complete Nova, not a degraded one: the agent reads, edits, builds, searches, and ships using only shell commands, and isolates or parallelizes work with lanes when it needs to. We deliberately keep no *extension* a prerequisite: if a task is best done with `rg`, `sed`, and a heredoc, that is the answer, not a missing tool.
 
 Bash-only is a choice, and a valid one. It keeps the agent minimal, auditable, and always inside the terminal's native vocabulary.
 

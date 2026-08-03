@@ -394,5 +394,6 @@ pub fn createRuntime(app: *App, cwd: []const u8, session_dir: []const u8, sessio
     runtime.agent.mcp_manager = &app.mcp_manager;
     runtime.agent.tool_registry = app.tool_registry;
     runtime.agent.plugin_manager = &app.plugin_manager;
+    runtime.agent.lane_bridge = app.lane_bridge;
     return runtime;
 }

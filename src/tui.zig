@@ -8,6 +8,7 @@ const at_mention = @import("at_mention.zig");
 pub const background_mod = @import("background.zig");
 pub const BackgroundDelivery = app_state.BackgroundModalState.BackgroundDelivery;
 pub const Agent = agent_mod.Agent;
+pub const lane_bridge_mod = @import("tools/lane_bridge.zig");
 const pytools = @import("pytools.zig");
 const bash_mod = @import("tools/bash_exec.zig");
 const search_mod = @import("search.zig");
@@ -205,6 +206,11 @@ pub const App = struct {
     background_modal_state: app_state.BackgroundModalState = .{},
     mcp_manager: mcp_mod.McpManager = undefined,
     plugin_manager: lua_mod.PluginManager = undefined,
+    /// The `lane` tool's request/response bridge. Heap-allocated so its
+    /// address stays stable while worker threads block on it; owned here,
+    /// destroyed in `deinitApp` (after every lane's turn future is cancelled,
+    /// which wakes any worker blocked on the bridge). See `tools/lane_bridge.zig`.
+    lane_bridge: ?*lane_bridge_mod.LaneBridge = null,
     /// Single source of truth for tools: builtin slice + plugin tools
     /// appended at runtime through `registerPluginTools`. Heap-allocated so
     /// its address stays put while agents borrow it; freed in `deinit`.
@@ -229,6 +235,11 @@ pub const App = struct {
         const registry = try gpa.create(tools_mod.ToolRegistry);
         errdefer gpa.destroy(registry);
         registry.* = tools_mod.ToolRegistry.init(tools_mod.builtinRegistry());
+        const bridge = try gpa.create(lane_bridge_mod.LaneBridge);
+        errdefer gpa.destroy(bridge);
+        // `create` allocates raw bytes — the mutex/condition must be
+        // initialized to their `.init` values or the first lock waits forever.
+        bridge.* = .{};
         return .{
             .io = io,
             .gpa = gpa,
@@ -239,6 +250,7 @@ pub const App = struct {
             .mcp_manager = mcp_mod.McpManager.init(gpa),
             .plugin_manager = lua_mod.PluginManager.init(gpa, io, "", ""),
             .tool_registry = registry,
+            .lane_bridge = bridge,
         };
     }
 
@@ -1101,6 +1113,7 @@ pub fn run(
     runtime.agent.mcp_manager = &app.mcp_manager;
     runtime.agent.tool_registry = app.tool_registry;
     runtime.agent.plugin_manager = &app.plugin_manager;
+    runtime.agent.lane_bridge = app.lane_bridge;
     app.bindInputCallbacks();
     defer app.deinit();
 
