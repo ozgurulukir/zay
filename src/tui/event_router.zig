@@ -25,6 +25,7 @@ const provider_model = @import("provider_model.zig");
 const clipboard_helper = @import("clipboard_helper.zig");
 
 const command_router = @import("command_router.zig");
+const help_picker = @import("widgets/help_picker.zig");
 
 /// Top-level event entry, called by vxfw for every event the root receives.
 ///
@@ -77,7 +78,7 @@ fn routeMouse(
             return;
         }
         if (mouse.button == .wheel_down) {
-            app.pickers.help.scrollDown(2, 21);
+            app.pickers.help.scrollDown(2, help_picker.bodyRows(help_picker.help_overlay_height));
             ctx.consumeAndRedraw();
             return;
         }
@@ -128,6 +129,16 @@ fn routeKey(
     if (key.matches('l', .{ .ctrl = true }) or key.matches('l', .{ .super = true })) {
         app.clearPendingQuitAt();
         app.toggleLaneFullscreen();
+        ctx.consumeAndRedraw();
+        return;
+    }
+    // Transcript search: the universal "find" affordance. `/search` is the
+    // guaranteed, terminal-agnostic path; Ctrl+F works when the terminal lets
+    // it through (verified free across all modes — nothing else binds it).
+    if (key.matches('f', .{ .ctrl = true }) and app.isNormalMode()) {
+        app.clearPendingQuitAt();
+        try app.openSearch();
+        try root.syncFocus(ctx);
         ctx.consumeAndRedraw();
         return;
     }
@@ -323,9 +334,9 @@ fn handleQuitSequence(
 // The quit state machine (`none` → `pending` → `ctx.quit`) and the
 // confirmed-quit exit live in the private `handleQuitSequence` / `routeKey`.
 // They are reached through the public `RootWidget.captureEvent` surface, the
-// same path the 88 tui.zig tests use. `agent` and `app` are declared as
-// sibling locals so the `&agent` pointer App copies into its heap `Thread`
-// stays valid for the test's lifetime.
+// same path the tests in `src/tui/tests.zig` use. `agent` and `app` are
+// declared as sibling locals so the `&agent` pointer App copies into its heap
+// `Thread` stays valid for the test's lifetime.
 
 const agent_mod = @import("../agent.zig");
 

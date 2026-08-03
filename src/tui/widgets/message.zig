@@ -28,7 +28,9 @@ pub const loading_frame_ms = 40;
 /// across frames (see `transcript_mod.RenderCache`). Larger bodies fall back to a
 /// per-frame, viewport-bounded render so a giant message never materializes its
 /// whole row list into a long-lived cache — preserving the draw-time OOM guard.
-const render_cache_max_bytes: usize = 64 * 1024;
+/// Defined in `tui_metrics` (SSOT) so the row-counting path gates on the same
+/// threshold as the render path here.
+const render_cache_max_bytes = tui_metrics.render_cache_max_bytes;
 
 pub const ConversationLayout = struct {
     pub const left: u16 = 2;
@@ -75,7 +77,7 @@ pub const MessageWidget = struct {
             .width = width,
             .height = height,
         });
-        self.drawBody(&surface, ctx);
+        try self.drawBody(&surface, ctx);
         return surface;
     }
 
@@ -85,7 +87,7 @@ pub const MessageWidget = struct {
         return @min(requested_height, max_height);
     }
 
-    fn drawBody(self: *MessageWidget, surface: *vxfw.Surface, ctx: vxfw.DrawContext) void {
+    fn drawBody(self: *MessageWidget, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
         const styled_as_selected = self.selected or !self.message.kind().dimmable();
         var row: u16 = ConversationLayout.top;
         switch (self.message.*) {
@@ -103,8 +105,8 @@ pub const MessageWidget = struct {
             .logo => self.drawIntro(surface, self.blackhole_frame, &row, ctx),
             .tool => |m| {
                 const title_style = if (m.failed) StylePalette.tool_failed else StylePalette.tool;
-                drawToolTitle(surface, m, title_style, styled_as_selected, self.loading_frame, &row, ctx);
-                if (m.expanded) drawToolBody(surface, m, styled_as_selected, &row, ctx);
+                try drawToolTitle(surface, m, title_style, styled_as_selected, self.loading_frame, &row, ctx);
+                if (m.expanded) try drawToolBody(surface, m, styled_as_selected, &row, ctx);
             },
             .thinking => |m| {
                 drawLine(surface, m.title, StylePalette.thinking_label, styled_as_selected, &row, ctx, 2, StylePalette.thinking_bar);
@@ -136,11 +138,20 @@ pub const MessageWidget = struct {
         loading_frame: u8,
         row: *u16,
         ctx: vxfw.DrawContext,
-    ) void {
+    ) !void {
         std.debug.assert(loading_frame < loading_frames.len);
         const title = if (message.expanded) message.expanded_title orelse message.title else message.title;
         const command = toolCommandTitle(title);
         const prefix = if (message.running) loading_frames[loading_frame] else toolIcon(command);
+        // Tool success vs failure is conveyed by foreground color alone (green →
+        // red). Prefix a ✗ on the command text so a failed tool is unmistakable
+        // without color (red-green CVD, non-RGB terminals) — because it rides on
+        // the text, it survives wrapping, selection styling, and future themes.
+        if (!message.running and message.failed) {
+            const marked = try std.fmt.allocPrint(ctx.arena, "✗ {s}", .{command});
+            drawToolTitleWrapped(surface, prefix, marked, style, selected, row, ctx);
+            return;
+        }
         drawToolTitleWrapped(surface, prefix, command, style, selected, row, ctx);
     }
 
@@ -442,11 +453,11 @@ fn drawToolBody(
     selected: bool,
     row: *u16,
     ctx: vxfw.DrawContext,
-) void {
+) !void {
     if (message.body.len > 0) {
         switch (message.render) {
             .plain => MessageWidget.drawWrapped(surface, message.body, StylePalette.thinking_body, selected, row, ctx, 0, null),
-            .diff => drawWrappedDiff(surface, message.body, selected, row, ctx),
+            .diff => try drawWrappedDiff(surface, message.body, selected, row, ctx),
         }
     }
     if (message.stderr) |stderr| {
@@ -460,7 +471,7 @@ fn drawWrappedDiff(
     selected: bool,
     row: *u16,
     ctx: vxfw.DrawContext,
-) void {
+) !void {
     const content_width = ConversationLayout.contentWidth(surface.size.width);
     const width = @max(content_width, 1);
     if (text.len == 0) {
@@ -521,6 +532,39 @@ fn skipLinearWhitespace(line: []const u8, start: usize) usize {
 
 fn isLinearWhitespace(bytes: []const u8) bool {
     return std.mem.eql(u8, bytes, " ") or std.mem.eql(u8, bytes, "\t");
+}
+
+test "failed tool title renders a non-color ✗ marker" {
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.startTool(gpa, "pwd");
+    try transcript.finishTool(gpa, index, "", null, true);
+    transcript.messages.items[index].tool.expanded = false;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var message_widget: MessageWidget = .{
+        .message = &transcript.messages.items[index],
+        .selected = true,
+        .loading_frame = 0,
+        .blackhole_frame = 0,
+        .gpa = gpa,
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 40, .height = 4 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try message_widget.widget().draw(ctx);
+
+    // The marker is part of the title text (col 3, after the icon), so it is
+    // independent of the red/green style entirely.
+    try std.testing.expectEqualStrings("✗", surface.readCell(ConversationLayout.left + 3, 1).char.grapheme);
+    // And the command follows on the same row.
+    try std.testing.expectEqualStrings("p", surface.readCell(ConversationLayout.left + 5, 1).char.grapheme);
 }
 
 test "expanded tool title uses expanded command" {

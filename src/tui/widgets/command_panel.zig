@@ -91,7 +91,9 @@ fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return std.ascii.startsWithIgnoreCase(haystack, needle);
 }
 
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+/// Case-insensitive substring match, shared by the command-palette filter and
+/// the transcript-search matcher (`widgets/search.zig`) so the two never drift.
+pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len > haystack.len) return false;
     return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
 }

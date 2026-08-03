@@ -191,6 +191,12 @@ pub fn stableBoundary(text: []const u8) usize {
     return boundary;
 }
 
+/// The module-level full-scan row counter. `Incremental.countRows` (the
+/// method) is a struct declaration, so the bare name would shadow this inside
+/// the struct body and self-recurs; the method calls the full scan through
+/// this alias instead.
+const countRowsFull = countRows;
+
 /// Incremental renderer for an append-only body (a streaming agent message).
 /// Caches the rendered rows of the stable prefix and re-renders only the
 /// volatile trailing block on each call, turning the O(deltas x rows) full
@@ -272,6 +278,24 @@ pub const Incremental = struct {
             out[base + i] = .{ .indent = meta.indent, .spans = tail.pool.items[meta.start..][0..meta.len] };
         }
         return out;
+    }
+
+    /// Count the visual rows `body` would render at `width` WITHOUT allocating
+    /// or mutating the stable cache: the cached stable rows already own their
+    /// count, and the unstabilized tail is counted with the allocation-free
+    /// `countRows` scan. Must equal `rows().len` for the same (body, width) —
+    /// the SSOT parity test enforces it — so the height request and the
+    /// rendered rows never desync. A stale cache (width change or a replaced,
+    /// shorter body) falls back to the full scan, mirroring `rows()`'s reset.
+    pub fn countRows(self: *Incremental, body: []const u8, width: u16) u16 {
+        if (self.primed and self.width == width and body.len >= self.boundary) {
+            const stable_rows: u16 = @intCast(self.stable.rows.items.len);
+            // The tail sits just past a blank line outside a code fence, so its
+            // block state is clean and counting it in isolation matches the
+            // `final=true` render `rows()` applies to it.
+            return stable_rows + countRowsFull(std.heap.page_allocator, body[self.boundary..], width);
+        }
+        return countRowsFull(std.heap.page_allocator, body, width);
     }
 };
 
@@ -1175,6 +1199,10 @@ test "countRows matches render across widths and content shapes" {
         .{ .name = "many_short", .text = "a b c d e f g h i j k l m n o p q r s t u v w x y z", .min_width = 1 },
         .{ .name = "multiword_hardwrap", .text = "aa bb cc dd ee ff", .min_width = 1 },
     };
+    // One shared incremental across the sweep: on a cold (unprimed) cache it
+    // falls back to the full scan, so this exercises the fallback parity.
+    var inc: Incremental = .{};
+    defer inc.deinit(gpa);
     for (cases) |c| {
         var w: u16 = c.min_width;
         while (w <= 60) : (w += 1) {
@@ -1183,7 +1211,35 @@ test "countRows matches render across widths and content shapes" {
             defer out.deinit(gpa);
             const rendered: u16 = @intCast(out.rows.len);
             try std.testing.expectEqual(counted, rendered);
+            try std.testing.expectEqual(counted, inc.countRows(c.text, w));
         }
+    }
+}
+
+// The `Incremental` count must also match on a *warm* cache — where it is
+// `stable.rows.len` plus a count of the volatile tail — because that is exactly
+// the state `messageRowsCached` sees mid-session. Feeding every prefix through
+// `rows()` (as a stream would) then counting must agree with the full scan.
+test "Incremental.countRows matches the full count across streaming appends" {
+    const gpa = std.testing.allocator;
+    const body =
+        "# Title\n\nA paragraph with **bold** words long enough to wrap across this narrow column more than once.\n\n" ++
+        "- item one with words\n- item two with `code`\n\n" ++
+        "| Name | Value |\n| --- | --- |\n| alpha | beta |\n\n" ++
+        "```\ncode line one\n\ncode line two\n```\n\nClosing paragraph here.\n";
+
+    var inc: Incremental = .{};
+    defer inc.deinit(gpa);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    var i: usize = 0;
+    while (i <= body.len) : (i += 1) {
+        _ = arena.reset(.retain_capacity);
+        const prefix = body[0..i];
+        _ = try inc.rows(gpa, arena.allocator(), prefix, 40);
+        const counted = countRows(gpa, prefix, 40);
+        try std.testing.expectEqual(counted, inc.countRows(prefix, 40));
     }
 }
 

@@ -25,6 +25,7 @@ const settings_widget = @import("widgets/settings.zig");
 const help_picker = @import("widgets/help_picker.zig");
 const mcp_status = @import("widgets/mcp_status.zig");
 const plugins_status = @import("widgets/plugins_status.zig");
+const search_widget = @import("widgets/search.zig");
 const vxfw = vaxis.vxfw;
 
 const MentionSearchKind = tui.MentionSearchKind;
@@ -128,6 +129,7 @@ pub const PickerStates = struct {
     help: help_picker.State = .{},
     mcp: mcp_status.State = .{},
     plugins: plugins_status.State = .{},
+    search: search_widget.State = .{},
 };
 
 /// Navigation cursors and the cross-pane selection state. Owns the

@@ -81,6 +81,13 @@ pub fn cancelMode(app: *App) !bool {
         app.clearPaletteInput();
         return true;
     }
+    if (app.mode == .search) {
+        app.pickers.search.reset(app.gpa);
+        app.mode = .normal;
+        app.clearInput();
+        app.clearPaletteInput();
+        return true;
+    }
     app.mode = .normal;
     app.clearInput();
     app.clearPaletteInput();
@@ -89,6 +96,11 @@ pub fn cancelMode(app: *App) !bool {
 }
 
 pub fn submitMode(app: *App) !bool {
+    // Transcript search: Enter jumps to the selected match (and closes search).
+    if (app.mode == .search) {
+        try app.acceptSearchSelection();
+        return true;
+    }
     // Settings: Enter toggles the selected item.
     if (app.mode == .settings) {
         try tui.submitSettings(app);
@@ -205,6 +217,7 @@ pub fn submitMode(app: *App) !bool {
                 .diff => diff_lifecycle.openDiffViewer(app) catch |err| try diff_lifecycle.reportDiffError(app, err),
                 .parallel => app.createParallelLane() catch |err| try app.reportLaneError(err),
                 .save => app.beginSave() catch |err| try app.reportLaneError(err),
+                .search => try app.openSearch(),
                 .close => app.closeActiveLane() catch |err| try app.reportLaneError(err),
                 .merge => app.createMergePicker() catch |err| try app.reportLaneError(err),
                 .lanes => app.openLanesPicker() catch |err| try app.reportLaneError(err),
@@ -312,6 +325,9 @@ pub fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
         .session_picker => app.nav.session_action == .browsing and app.inputs.palette.buf.realLength() == 0,
         .model_picker, .tree_picker => app.inputs.palette.buf.realLength() == 0,
         .provider_picker => app.pickers.provider.stage == .list and app.inputs.palette.buf.realLength() == 0,
+        // In search mode a leading '/' opens the command menu only when the
+        // search box is still empty; once a query is active it stays part of it.
+        .search => app.inputs.palette.buf.realLength() == 0,
         // Settings has its own navigation: '/' is not a command shortcut there.
         .settings, .command, .diff_viewer, .save_message, .lanes, .help, .mcp, .plugins => false,
     };

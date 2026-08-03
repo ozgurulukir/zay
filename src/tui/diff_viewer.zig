@@ -162,6 +162,33 @@ pub const State = struct {
         self.cursor = self.files.items[file_index].header_row;
     }
 
+    /// Jump the cursor to the next/previous hunk marker (`@@` row), clamping at
+    /// both ends (no wrap). `dir` is +1 (forward) or -1 (backward); a plain
+    /// jump drops any selection anchor. Hunks are detected at zero parsing cost
+    /// — the parser already tags `hunk_header` rows.
+    pub fn jumpHunk(self: *State, dir: i32) void {
+        self.sel_anchor = null;
+        if (self.lines.items.len == 0) return;
+        if (dir > 0) {
+            var i = self.cursor + 1;
+            while (i < self.lines.items.len) : (i += 1) {
+                if (self.lines.items[i].kind == .hunk_header) {
+                    self.cursor = i;
+                    return;
+                }
+            }
+        } else {
+            var i = self.cursor;
+            while (i > 0) {
+                i -= 1;
+                if (self.lines.items[i].kind == .hunk_header) {
+                    self.cursor = i;
+                    return;
+                }
+            }
+        }
+    }
+
     /// Rebuild the file-search match list from `query` (case-insensitive
     /// substring). An empty query matches every file. The query itself lives in
     /// the popup's text field (`palette_input`); this just consumes its value.
@@ -791,4 +818,82 @@ test "jumpFile moves the cursor between file headers" {
     try std.testing.expectEqual(state.files.items[1].header_row, state.cursor);
     state.jumpFile(-1);
     try std.testing.expectEqual(state.files.items[0].header_row, state.cursor);
+}
+
+const hunk_sample =
+    \\diff --git a/a.zig b/a.zig
+    \\--- a/a.zig
+    \\+++ b/a.zig
+    \\@@ -1,3 +1,4 @@
+    \\ const a = 1;
+    \\+const b = 2;
+    \\@@ -10,3 +11,4 @@
+    \\ const x = 9;
+    \\-const y = 8;
+    \\+const y = 7;
+    \\diff --git a/b.zig b/b.zig
+    \\--- a/b.zig
+    \\+++ b/b.zig
+    \\@@ -1,2 +1,3 @@
+    \\+hello
+    \\ world
+    \\@@ -5,2 +6,3 @@
+    \\-bye
+    \\+bye!
+    \\
+;
+
+fn hunkRows(state: *const State) struct { hunks: [4]usize, count: usize } {
+    var out: [4]usize = undefined;
+    var count: usize = 0;
+    for (state.lines.items, 0..) |line, i| {
+        if (line.kind == .hunk_header and count < 4) {
+            out[count] = i;
+            count += 1;
+        }
+    }
+    return .{ .hunks = out, .count = count };
+}
+
+test "jumpHunk walks hunks across files and clamps at both ends" {
+    const gpa = std.testing.allocator;
+    var state: State = .{ .raw = try gpa.dupe(u8, hunk_sample) };
+    defer state.deinit(gpa);
+    try parse(&state, gpa);
+
+    const rows = hunkRows(&state);
+    try std.testing.expectEqual(@as(usize, 4), rows.count);
+
+    // From the top, `]` lands on the first hunk of file 1.
+    state.cursor = 0;
+    state.jumpHunk(1);
+    try std.testing.expectEqual(rows.hunks[0], state.cursor);
+    try std.testing.expectEqual(@as(u32, 0), state.lines.items[state.cursor].file);
+
+    // Repeated `]` walks the remaining hunks, crossing into file 2.
+    state.jumpHunk(1);
+    try std.testing.expectEqual(rows.hunks[1], state.cursor);
+    state.jumpHunk(1);
+    try std.testing.expectEqual(rows.hunks[2], state.cursor);
+    try std.testing.expectEqual(@as(u32, 1), state.lines.items[state.cursor].file);
+    state.jumpHunk(1);
+    try std.testing.expectEqual(rows.hunks[3], state.cursor);
+
+    // Past the last hunk, `]` clamps (no wrap).
+    state.jumpHunk(1);
+    try std.testing.expectEqual(rows.hunks[3], state.cursor);
+
+    // `[` walks back, then clamps at the top.
+    state.jumpHunk(-1);
+    try std.testing.expectEqual(rows.hunks[2], state.cursor);
+    state.jumpHunk(-1);
+    state.jumpHunk(-1);
+    try std.testing.expectEqual(rows.hunks[0], state.cursor);
+    state.jumpHunk(-1);
+    try std.testing.expectEqual(rows.hunks[0], state.cursor);
+
+    // From the very top, `[` clamps at the start.
+    state.cursor = 0;
+    state.jumpHunk(-1);
+    try std.testing.expectEqual(@as(usize, 0), state.cursor);
 }

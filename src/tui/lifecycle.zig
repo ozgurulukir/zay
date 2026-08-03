@@ -56,6 +56,7 @@ pub fn deinitApp(self: *App) void {
     self.resumeClearFolds();
     self.resume_folded_projects.deinit(self.gpa);
     self.pickers.tree.deinit();
+    self.pickers.search.deinit(self.gpa);
     self.cancelDiffRefresh();
     // Non-empty labels are always heap-allocated by `loadGitLabel`; the
     // empty default is a literal, so guard on length before freeing.
@@ -352,6 +353,17 @@ pub fn handleDiffBrowseKey(root: *RootWidget, ctx: *vxfw.EventContext, key: vaxi
         ctx.consumeAndRedraw();
         return;
     }
+    // Hunk-level jumps: `[` / `]` walk the `@@` markers within and across files.
+    if (key.matches('[', .{})) {
+        app.diff.jumpHunk(-1);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (key.matches(']', .{})) {
+        app.diff.jumpHunk(1);
+        ctx.consumeAndRedraw();
+        return;
+    }
     if (key.matches(vaxis.Key.up, .{ .shift = true })) {
         app.diff.extendSelection(-1);
         ctx.consumeAndRedraw();
@@ -470,7 +482,7 @@ pub fn syncFocus(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         return;
     }
     const target = switch (app.mode) {
-        .command, .provider_picker, .model_picker, .tree_picker, .save_message => app.inputs.palette.widget(),
+        .command, .provider_picker, .model_picker, .tree_picker, .save_message, .search => app.inputs.palette.widget(),
         // The session picker uses the palette input for filtering while
         // browsing, but sub-states (rename/delete) handle keys via the
         // command router — focus stays on root so the palette input

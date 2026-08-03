@@ -13,10 +13,17 @@ const tui_style = @import("../style.zig");
 
 const StylePalette = tui_style.Palette;
 
+/// Which mode's keybindings a help line documents. Rendered as a dim `[tag]`
+/// prefix rather than used to filter — discoverability beats hiding — and
+/// asserted by the guard test below so a handler change that orphans a help
+/// line (or a help line that no longer matches a handler) fails the suite.
+pub const Scope = enum { global, block_nav, diff_viewer, jobs_modal, lanes };
+
 pub const HelpLine = struct {
     key: []const u8,
     desc: []const u8,
     is_header: bool = false,
+    scope: Scope = .global,
 };
 
 pub const help_lines = [_]HelpLine{
@@ -31,6 +38,7 @@ pub const help_lines = [_]HelpLine{
     .{ .key = "Tab", .desc = "Expand / collapse active message" },
     .{ .key = "Ctrl+O", .desc = "Toggle background jobs modal" },
     .{ .key = "Ctrl+N", .desc = "Cycle through open parallel lanes" },
+    .{ .key = "Ctrl+L", .desc = "Toggle lane fullscreen / split view", .scope = .lanes },
     .{ .key = "Esc", .desc = "Cancel turn / unselect block / close modal" },
 
     .{ .key = "CONTEXT MENTIONS & SKILLS", .desc = "", .is_header = true },
@@ -56,7 +64,74 @@ pub const help_lines = [_]HelpLine{
     .{ .key = "/clear", .desc = "Clear current transcript view" },
     .{ .key = "/help", .desc = "Open this quick reference guide" },
     .{ .key = "/exit", .desc = "Quit Nova agent" },
+
+    .{ .key = "DIFF VIEWER", .desc = "", .is_header = true },
+    .{ .key = "Ctrl+W", .desc = "Add comment on selected range", .scope = .diff_viewer },
+    .{ .key = "Ctrl+E", .desc = "Edit the active comment", .scope = .diff_viewer },
+    .{ .key = "Ctrl+D", .desc = "Delete the active comment", .scope = .diff_viewer },
+    .{ .key = "Ctrl+P", .desc = "Search files in the diff", .scope = .diff_viewer },
+    .{ .key = "Ctrl+↑ / Ctrl+↓", .desc = "Jump between files", .scope = .diff_viewer },
+    .{ .key = "Shift+↑ / Shift+↓", .desc = "Extend the selection range", .scope = .diff_viewer },
+    .{ .key = "[ / ]", .desc = "Jump between hunks", .scope = .diff_viewer },
+    .{ .key = "Esc / Ctrl+C", .desc = "Close the diff viewer", .scope = .diff_viewer },
+    .{ .key = "Ctrl+S", .desc = "Close & send comments to agent", .scope = .diff_viewer },
+
+    .{ .key = "JOBS MODAL", .desc = "", .is_header = true },
+    .{ .key = "↑ / ↓", .desc = "Select a running job", .scope = .jobs_modal },
+    .{ .key = "← / →", .desc = "Move focus to Cancel", .scope = .jobs_modal },
+    .{ .key = "Enter", .desc = "Cancel the selected job", .scope = .jobs_modal },
+    .{ .key = "Esc", .desc = "Close the jobs modal", .scope = .jobs_modal },
 };
+
+fn scopeLabel(scope: Scope) []const u8 {
+    return switch (scope) {
+        .global => "global",
+        .block_nav => "blocks",
+        .diff_viewer => "diff",
+        .jobs_modal => "jobs",
+        .lanes => "lanes",
+    };
+}
+
+/// Index of the first help line whose key contains `key` within `scope`, or
+/// null. Used by the guard test below.
+fn indexOfKey(key: []const u8, scope: Scope) ?usize {
+    for (help_lines, 0..) |line, i| {
+        if (line.scope == scope and std.mem.indexOf(u8, line.key, key) != null) return i;
+    }
+    return null;
+}
+
+// Compile-time guard: every documented diff-viewer, jobs-modal, and lane
+// binding must still have a help entry. If a handler key is removed or rebound,
+// this fails instead of letting the help screen drift from the implementation.
+test "help documents every diff-viewer, jobs-modal, and lane binding" {
+    const diff_keys = [_][]const u8{ "Ctrl+W", "Ctrl+E", "Ctrl+D", "Ctrl+P", "Ctrl+↑", "Ctrl+↓", "Shift+↑", "Shift+↓", "Esc", "Ctrl+C", "Ctrl+S" };
+    for (diff_keys) |k| {
+        try std.testing.expect(indexOfKey(k, .diff_viewer) != null);
+    }
+    for ([_][]const u8{ "↑", "↓", "←", "→", "Enter", "Esc" }) |k| {
+        try std.testing.expect(indexOfKey(k, .jobs_modal) != null);
+    }
+    for ([_][]const u8{"Ctrl+L"}) |k| {
+        try std.testing.expect(indexOfKey(k, .lanes) != null);
+    }
+}
+
+/// The help overlay's outer height in rows, as sized by `overlaySize` in
+/// `overlay.zig`. Lives here (not there) so the scroll clamp and the layout
+/// read one value.
+pub const help_overlay_height: u16 = 22;
+
+/// Body rows a help overlay of `overlay_height` rows can display: the vxfw
+/// border consumes one row per side and the bottom row is the hint bar.
+/// Single source of truth for the height the scroll clamps (`scrollDown`) and
+/// `Content.draw` both use — the wheel handler previously clamped against a
+/// hardcoded 21 while draw rendered 19, letting wheel-scroll run 2 rows past
+/// the visible window.
+pub fn bodyRows(overlay_height: u16) u16 {
+    return overlay_height -| 3;
+}
 
 pub const State = struct {
     scroll: u16 = 0,
@@ -80,6 +155,23 @@ pub const State = struct {
     }
 };
 
+test "help scroll saturates at the visible body rows across overlay heights" {
+    const heights = [_]u16{ 22, 10, 4 };
+    for (heights) |h| {
+        var state: State = .{};
+        const rows = bodyRows(h);
+        // Force saturation: scroll past the end with a content taller than the
+        // window. The floor must be `total -| bodyRows(h)`, i.e. the last
+        // visible row is the last item — never past it.
+        state.scrollDown(@intCast(help_lines.len + 1), rows);
+        const total: u16 = @intCast(help_lines.len);
+        try std.testing.expectEqual(total -| rows, state.scroll);
+        // And scrolling back up stays in range.
+        state.scrollUp(@intCast(help_lines.len + 1));
+        try std.testing.expectEqual(@as(u16, 0), state.scroll);
+    }
+}
+
 pub const Content = struct {
     state: *State,
 
@@ -94,7 +186,9 @@ pub const Content = struct {
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
         if (width == 0 or height == 0) return surface;
 
-        // Reserve last row for bottom hint bar.
+        // Reserve last row for bottom hint bar. The border consumed 2 rows
+        // upstream, so `height` is the inner panel and `height -| 1` equals
+        // `bodyRows(overlay_height)` — the same number the scroll clamps use.
         const body_height: u16 = height -| 1;
         const total_count: u16 = @intCast(help_lines.len);
         const max_s = State.maxScroll(body_height);
@@ -111,7 +205,13 @@ pub const Content = struct {
                 }
                 panel.lineStyledAt(&surface, row, item.key, ctx, 1, StylePalette.border_label) catch {};
             } else {
-                panel.lineStyledAt(&surface, row, item.key, ctx, 2, StylePalette.user) catch {};
+                var key_col: u16 = 2;
+                if (item.scope != .global) {
+                    const tag = try std.fmt.allocPrint(ctx.arena, "[{s}] ", .{scopeLabel(item.scope)});
+                    panel.lineStyledAt(&surface, row, tag, ctx, key_col, StylePalette.thinking_body) catch {};
+                    key_col += @intCast(ctx.stringWidth(tag));
+                }
+                panel.lineStyledAt(&surface, row, item.key, ctx, key_col, StylePalette.user) catch {};
                 if (width > 30 and item.desc.len > 0) {
                     _ = panel.writeBorderTextEndingAt(&surface, ctx, row, width -| 3, item.desc, StylePalette.thinking_body);
                 }

@@ -56,6 +56,10 @@ pub fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value
         .diff_viewer => {
             if (app.diff.sub == .file_search) try app.diff.filterFiles(app.gpa, value);
         },
+        .search => {
+            const search_lifecycle = @import("search_lifecycle.zig");
+            try search_lifecycle.rebuildMatches(app, value);
+        },
         .provider_picker, .normal, .save_message, .lanes, .help, .settings, .mcp, .plugins => {},
     }
     ctx.consumeAndRedraw();

@@ -19,7 +19,9 @@ const tui = @import("../../tui.zig");
 const tui_style = @import("../style.zig");
 const panel = @import("panel.zig");
 const command_panel = @import("command_panel.zig");
+const help_picker = @import("help_picker.zig");
 const lanes_picker = @import("lanes_picker.zig");
+const search_widget = @import("search.zig");
 const model_picker = @import("model_picker.zig");
 const provider_picker = @import("provider_picker.zig");
 const resume_picker = @import("resume_picker.zig");
@@ -43,10 +45,11 @@ fn overlaySize(mode: App.Mode) OverlaySize {
         .tree_picker => .{ .width = 90, .height = 20 },
         .save_message => .{ .width = 60, .height = 3 },
         .lanes => .{ .width = 80, .height = 16 },
-        .help => .{ .width = 90, .height = 22 },
+        .help => .{ .width = 90, .height = help_picker.help_overlay_height },
         .settings => .{ .width = 90, .height = 22 },
         .mcp => .{ .width = 90, .height = 20 },
         .plugins => .{ .width = 80, .height = 16 },
+        .search => .{ .width = 90, .height = 20 },
         .diff_viewer => .{ .width = 0, .height = 0 },
     };
 }
@@ -69,6 +72,7 @@ fn overlayLabel(app: *const App) []const u8 {
         .settings => "Settings",
         .mcp => "Model Context Protocol (MCP)",
         .plugins => "Lua Plugins",
+        .search => "Search Transcript",
         .lanes => switch (app.nav.lanes_purpose) {
             .manage => "Parallel Lanes",
             .merge_dest => "Merge Into",
@@ -210,7 +214,6 @@ const OverlayInner = struct {
         return surface;
     }
 
-    const help_picker = @import("help_picker.zig");
     const mcp_status = @import("mcp_status.zig");
     const plugins_status = @import("plugins_status.zig");
 
@@ -227,10 +230,16 @@ const OverlayInner = struct {
             .settings => drawSettingsContent(app, ctx),
             .mcp => drawMcpContent(app, ctx),
             .plugins => drawPluginsContent(app, ctx),
+            .search => drawSearchContent(app, ctx),
             // The diff viewer is full-screen — `drawRoot` returns before the
             // overlay path, so this is never reached.
             .normal, .diff_viewer => unreachable,
         };
+    }
+
+    fn drawSearchContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        var content: search_widget.Content = .{ .state = &app.pickers.search };
+        return content.widget().draw(ctx);
     }
 
     fn drawMcpContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
@@ -310,8 +319,9 @@ const OverlayInner = struct {
     }
 
     fn drawCommandContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const filter = try app.peekPaletteInput();
-        defer app.gpa.free(filter);
+        // The filter lives only for this frame's draw; the frame arena bounds
+        // its lifetime, so skip the per-frame gpa alloc + free.
+        const filter = try app.peekPaletteInputArena(ctx.arena);
         // Build the visible entry list (lane commands appear only with >1 lane);
         // resolveCommand applies the same visibility + filter, so indices align.
         var buf: [tui.commands.len]command_panel.Entry = undefined;
@@ -330,8 +340,7 @@ const OverlayInner = struct {
     }
 
     fn drawSessionContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const filter = try app.peekPaletteInput();
-        defer app.gpa.free(filter);
+        const filter = try app.peekPaletteInputArena(ctx.arena);
         var content: resume_picker.Content = .{
             .io = app.io,
             .list = &app.list_widgets.resume_list,
@@ -360,8 +369,7 @@ const OverlayInner = struct {
     }
 
     fn drawModelContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const filter = try app.peekPaletteInput();
-        defer app.gpa.free(filter);
+        const filter = try app.peekPaletteInputArena(ctx.arena);
         const status = tui_status.modelStatus(app.liveRuntime(), app.cached_config);
         // Project the consolidated entries into the parallel slices the picker
         // widget consumes. Arena-allocated, rebuilt each draw — cheap, and it

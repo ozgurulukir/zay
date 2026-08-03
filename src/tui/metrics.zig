@@ -5,20 +5,29 @@ const transcript_mod = @import("../transcript.zig");
 const blackhole = @import("blackhole.zig");
 const CountingAllocator = @import("counting_allocator").CountingAllocator;
 
+/// Agent bodies at or below this size keep their fully rendered markdown cached
+/// across frames via the message's `Incremental` render cache. Larger bodies
+/// fall back to a per-frame, viewport-bounded render (`renderLimited` in the
+/// message widget) so a giant message never materializes its whole row list
+/// into a long-lived cache. Shared with the message widget so the row-counting
+/// path gates on exactly the same threshold the render path uses — they must
+/// stay consistent or ListView rows desync from rendered content.
+pub const render_cache_max_bytes: usize = 64 * 1024;
+
 pub fn messageRowsCached(message: *transcript_mod.Message, width: u16) u16 {
     const cache = message.rowCachePtr();
     if (cache.valid and cache.width == width) {
         return cache.rows;
     }
-    const rows = messageContentRows(message.*, width) + 1;
+    const rows = messageContentRows(message, width) + 1;
     cache.* = .{ .valid = true, .width = width, .rows = rows };
     return rows;
 }
 
-pub fn messageContentRows(message: transcript_mod.Message, width: u16) u16 {
-    return switch (message) {
+pub fn messageContentRows(message: *transcript_mod.Message, width: u16) u16 {
+    return switch (message.*) {
         .user, .notice, .success, .info => |m| textRows(m.body, width -| 2),
-        .agent => |m| terminal_markdown.countRows(std.heap.page_allocator, m.body, @max(width, 1)),
+        .agent => |m| agentContentRows(message, m, width),
         .skill => |m| textRows(m.title, width -| 2) + if (m.expanded and m.body.len > 0) textRows(m.body, width) else 0,
         .logo => blackhole.rows,
         .thinking => |m| if (m.expanded)
@@ -31,6 +40,19 @@ pub fn messageContentRows(message: transcript_mod.Message, width: u16) u16 {
         else
             toolTitleRows(toolMessageTitle(m), width),
     };
+}
+
+fn agentContentRows(message: *transcript_mod.Message, m: transcript_mod.Basic, width: u16) u16 {
+    const w = @max(width, 1);
+    // Bodies above the render cache cap are drawn via `renderLimited` at draw
+    // time — count with the plain allocation-free scan to mirror that branch.
+    // Smaller bodies render through `Incremental`, whose cached stable rows
+    // already own their count; counting them allocates nothing (no more
+    // `page_allocator` traffic on every width change).
+    if (m.body.len > render_cache_max_bytes) {
+        return terminal_markdown.countRows(std.heap.page_allocator, m.body, w);
+    }
+    return message.renderIncPtr().countRows(m.body, w);
 }
 
 pub fn toolTitleRows(title: []const u8, width: u16) u16 {

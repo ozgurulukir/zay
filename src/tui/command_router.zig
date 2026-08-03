@@ -31,6 +31,7 @@ const App = tui.App;
 const Mode = App.Mode;
 const provider_model = @import("provider_model.zig");
 const clipboard_helper = @import("clipboard_helper.zig");
+const help_picker = @import("widgets/help_picker.zig");
 const previousIndex = tui.previousIndex;
 const nextIndex = tui.nextIndex;
 
@@ -48,6 +49,7 @@ pub fn handleCommandKey(app: *App, key: vaxis.Key) !bool {
         .settings => try SettingsMode.handle(app, key),
         .mcp => try McpMode.handle(app, key),
         .plugins => try PluginsMode.handle(app, key),
+        .search => try SearchMode.handle(app, key),
         // The diff viewer owns its keys directly in `captureEvent`; nothing
         // reaches the generic dispatch.
         .diff_viewer => false,
@@ -450,7 +452,9 @@ pub const LaneSwitch = struct {
 
 pub const HelpPicker = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
-        const body_height: u16 = 21;
+        // Same body-row derivation `Content.draw` renders with — the keyboard
+        // and mouse clamps must agree or the last items become unreachable.
+        const body_height: u16 = help_picker.bodyRows(help_picker.help_overlay_height);
         if (key.matches(vaxis.Key.escape, .{}) or key.matches(vaxis.Key.enter, .{}) or key.matches('q', .{})) {
             app.mode = .normal;
             app.pickers.help.reset();
@@ -479,8 +483,31 @@ pub const HelpPicker = struct {
             return true;
         }
         if (key.matches(vaxis.Key.end, .{})) {
-            const help_picker_mod = @import("widgets/help_picker.zig");
-            app.pickers.help.scroll = help_picker_mod.State.maxScroll(body_height);
+            app.pickers.help.scroll = help_picker.State.maxScroll(body_height);
+            return true;
+        }
+        return false;
+    }
+};
+
+/// Transcript search mode (Ctrl+F / /search).
+///
+/// Up/down step the match selection. Enter jumps (routed through `submitMode`
+/// in `mode_lifecycle`), Esc cancels, and every other key falls through to the
+/// palette input, whose `paletteInputChanged` hook re-filters live.
+const SearchMode = struct {
+    pub fn handle(app: *App, key: vaxis.Key) !bool {
+        const state = &app.pickers.search;
+        if (key.matches(vaxis.Key.up, .{})) {
+            if (state.matches.items.len > 0) {
+                state.selection = previousIndex(state.selection, @intCast(state.matches.items.len));
+            }
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{})) {
+            if (state.matches.items.len > 0) {
+                state.selection = nextIndex(state.selection, @intCast(state.matches.items.len));
+            }
             return true;
         }
         return false;
