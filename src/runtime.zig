@@ -228,7 +228,13 @@ pub const AgentRuntime = struct {
         target.session_writer_started = true;
         errdefer target.session_writer.deinit();
 
-        target.agent = agent_mod.Agent.init(gpa, io, cwd, .none);
+        // The agent must share the runtime's owned cwd, NOT the borrowed
+        // `cwd` parameter — a cross-project resume hands us `summary.cwd`,
+        // and the next `reloadResumeSessions` frees it via `resumeClear`
+        // while the worker thread may still be running tools against it.
+        // `agent.deinit` does not free cwd; `deinit` frees `self.cwd` (this
+        // same allocation) after the agent, so ownership is unambiguous.
+        target.agent = agent_mod.Agent.init(gpa, io, owned_cwd, .none);
         errdefer target.agent.deinit();
         target.agent.skills = target.skills;
         target.agent.compaction_settings = config.context.compaction;
@@ -984,6 +990,33 @@ test "createSystemPrompt substitutes ${OS} with the host operating system" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "${OS}") == null);
     try std.testing.expect(std.mem.startsWith(u8, rendered, "OS: "));
     try std.testing.expect(rendered.len > "OS: ".len);
+}
+
+test "runtime agent aliases the owned cwd, not the borrowed input" {
+    // Regression for the segfault in `std.fs.path.isAbsolute` reached from
+    // `bash.validateCwd`: `Agent.init` was handed the raw borrowed `cwd`
+    // parameter, which callers (a cross-project resume hands us
+    // `summary.cwd`) free via `resumeClear` while the runtime still lives.
+    // The agent must point at the runtime-owned dupe so a later bash tool
+    // call can't dereference freed memory.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_abs = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_abs);
+
+    var runtime: AgentRuntime = undefined;
+    try runtime.initNew(gpa, std.testing.io, home_abs, home_abs, home_abs, "test system prompt", .{}, &.{}, null);
+    defer runtime.deinit();
+
+    try std.testing.expectEqualStrings(home_abs, runtime.cwd);
+    try std.testing.expectEqualStrings(home_abs, runtime.agent.cwd);
+    // The agent must alias the runtime's owned dupe — never the borrowed
+    // parameter the caller may free.
+    try std.testing.expect(runtime.agent.cwd.ptr == runtime.cwd.ptr);
 }
 
 test "readContextFile reads AGENTS.md when it exists" {
