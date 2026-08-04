@@ -258,7 +258,7 @@ fn pruneSingleToolMessage(gpa: std.mem.Allocator, msg: ai.ChatMessage, cap_bytes
             const head = block.text.text[0..cap_bytes];
             const notice = try std.fmt.allocPrint(
                 gpa,
-                "{s}\n\n[... historical tool output truncated ({d} bytes original) ...]",
+                "{s}\n\n[... earlier tool result compacted to save context (was {d} bytes) ...]",
                 .{ head, original_len },
             );
             pruned_blocks[b_idx] = .{ .text = .{ .text = notice } };
@@ -400,7 +400,7 @@ test "pruneHistoricalToolResultsViews caps old tool outputs while preserving rec
     // Historical tool 1 (index 1) should be owned and truncated
     try std.testing.expect(pruned[1] == .owned);
     const t1_text = pruned[1].owned.tool.content[0].text.text;
-    try std.testing.expect(std.mem.indexOf(u8, t1_text, "historical tool output truncated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t1_text, "compacted to save context") != null);
     try std.testing.expect(t1_text.len < 300);
 
     // Recent tool 1 (index 3) should be borrowed and kept in full
@@ -430,7 +430,7 @@ test "pruneHistoricalToolResultsViews borrows unchanged messages without copying
     // Historical tool message → owned, pruned.
     try std.testing.expect(views[0] == .owned);
     const pruned_text = views[0].owned.tool.content[0].text.text;
-    try std.testing.expect(std.mem.indexOf(u8, pruned_text, "historical tool output truncated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pruned_text, "compacted to save context") != null);
 
     // Image user message → borrowed with pointer identity: no copy was made.
     try std.testing.expect(views[1] == .borrowed);

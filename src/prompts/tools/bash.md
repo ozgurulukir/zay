@@ -6,7 +6,7 @@ Run a shell command.
 - Quote every expansion: `"$var"`, `"$(cmd)"`, `"${arr[@]}"`.
 - Default timeout is 30 seconds. Raise it with the `timeout` parameter when a command needs longer; a timed-out result tells you how to retry.
 - Prefer targeted commands (`rg`, `find`, `git diff --stat`, `head`, `tail`) over dumping large files or full build logs.
-- Each result echoes the command you ran, then its output. Output may be truncated to the tail; if it is, use the reported full-output path to read the rest or rerun with a narrower command.
+- Each result echoes the command you ran, then its full output. A result is complete unless it ends with a truncation notice — `[Showing last N of M lines (X of Y bytes). Full output: /path]` — which appears only when output exceeded 50 KB or 2000 lines. No notice means you have the entire output: trust it, do not assume truncation, and do not re-read the same content. If a notice is present, follow the full-output path to read the rest or rerun with a narrower command.
 
 ## Reading files (sliding window)
 
@@ -17,7 +17,7 @@ Never dump a whole file into the transcript. Locate, then read a bounded window,
 - Slide as needed: `sed -n 'END,NEW_ENDp'` continues below; `sed -n 'NEW_START,STARTp'` looks above.
 - Full read only when the whole file matters: `cat -n path` (line numbers keep later windows addressable). Use `head`/`tail` for boundary checks.
 
-Bounded reads stay under the truncation limit and leave context for reasoning.
+Bounded reads keep the transcript small and leave more context for reasoning.
 
 ## Long-running commands
 
