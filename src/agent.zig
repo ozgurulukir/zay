@@ -45,6 +45,12 @@ pub const Agent = struct {
     /// or by the UI's S17 invariant while this agent's turn is idle. The path
     /// is owned by the lane's `Thread`, never freed here.
     workspace: ?[]const u8 = null,
+    /// Root-containment for lane workers: when set, the agent's bash tool
+    /// refuses `cd` to a directory outside the project root (the lane
+    /// worktree), so a worker can't drift into the main tree and write there.
+    /// The driver/primary agents keep this false — they legitimately `cd` to
+    /// lane worktrees to inspect them.
+    contained: bool = false,
     /// The App-owned `LaneBridge` the `lane` tool posts across. Borrowed
     /// (owned by the App); null disables the lane tool (headless/tests).
     lane_bridge: ?*lane_bridge.LaneBridge = null,
@@ -524,6 +530,7 @@ pub const Agent = struct {
             .gpa = self.gpa,
             .io = self.io,
             .cwd = self.effectiveCwd(),
+            .contained = self.contained,
             .bash_classifier_url = self.bash_classifier_url,
             .background = if (self.background_manager) |manager|
                 .{ .manager = manager, .owner = self }

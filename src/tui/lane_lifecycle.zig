@@ -909,6 +909,10 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
     runtime.agent.tool_registry = app.tool_registry;
     runtime.agent.plugin_manager = &app.plugin_manager;
     runtime.agent.lane_bridge = app.lane_bridge;
+    // A spawned worker is root-contained: its bash tool refuses `cd` out of the
+    // worktree, so a task prompt leaking the main-tree path can't drift the
+    // worker's writes into the main tree (L2).
+    runtime.agent.contained = true;
 
     const lane = app.gpa.create(Thread) catch {
         freeLaneContext(app.gpa, context);
@@ -938,11 +942,15 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
 
     const id = lanes_util.lastPathSegment(wt.dest);
     const path = wt.dest; // now owned by the lane
-    // F2: worker-role framing makes the role unambiguous from turn one.
+    // F2: worker-role framing makes the role unambiguous from turn one. It
+    // also names the worker's ACTUAL working directory (its isolated worktree)
+    // so a task that mentions the main tree's absolute path — e.g. the driver's
+    // own cwd — doesn't steer the worker into `cd`-ing there. The bash
+    // containment guard is the mechanical backstop (L2).
     const framed = std.fmt.allocPrint(
         app.gpa,
-        "You are a worker agent in lane {s} on branch {s}. Complete this task and report the result concisely. You cannot create lanes or worktrees — do the work here and hand back a summary.\n\n{s}",
-        .{ id, wt.branch, task },
+        "You are a worker agent in lane {s} on branch {s}. Your working directory is {s} — an isolated git worktree of the repo at {s}; work ONLY with relative paths inside it. The main tree is off-limits. Complete this task and report the result concisely. You cannot create lanes or worktrees.\n\n{s}",
+        .{ id, wt.branch, wt.dest, repo, task },
     ) catch {
         removeFailedSpawn(app, lane);
         return failResp(app.gpa, "lane: out of memory\n", .{});

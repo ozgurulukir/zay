@@ -146,6 +146,12 @@ pub const ExecutorService = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
+    /// Root-containment for lane workers (see `Agent.contained`): when set, a
+    /// bash call is dispatched through `bash_tool.runContained`, which prepends
+    /// a `cd` guard refusing to leave `cwd`. The guard is scoped here, not in
+    /// the tool registry, so the driver's own bash (which legitimately `cd`s to
+    /// lane worktrees) is unaffected.
+    contained: bool = false,
     bash_classifier_url: ?[]const u8 = null,
     background: ?BackgroundStart = null,
     /// MCP manager for dispatching `mcp__` tool calls. null disables MCP dispatch.
@@ -172,6 +178,7 @@ pub const ExecutorService = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         cwd: []const u8,
+        contained: bool = false,
         bash_classifier_url: ?[]const u8 = null,
         background: ?BackgroundStart = null,
         mcp_manager: ?*mcp_mod.McpManager = null,
@@ -188,6 +195,7 @@ pub const ExecutorService = struct {
             .gpa = options.gpa,
             .io = options.io,
             .cwd = options.cwd,
+            .contained = options.contained,
             .bash_classifier_url = options.bash_classifier_url,
             .background = options.background,
             .mcp_manager = options.mcp_manager,
@@ -408,6 +416,19 @@ pub const ExecutorService = struct {
         const prev_lane = lane_bridge.lane_bridge_slot;
         lane_bridge.lane_bridge_slot = .{ .bridge = self.lane_bridge, .requester = self.lane_requester };
         defer lane_bridge.lane_bridge_slot = prev_lane;
+        if (self.contained) {
+            // Lane worker: route through `runContained`, which prepends the `cd`
+            // containment guard before running (background or foreground). This
+            // bypasses the registry so the fixed `Tool.run` signature — shared
+            // with plugins — stays untouched.
+            if (std.mem.eql(u8, call.name, "bash")) {
+                const background_ctx: ?bash_tool.BackgroundCtx = if (self.background) |bg|
+                    .{ .manager = bg.manager, .owner = bg.owner }
+                else
+                    null;
+                return bash_tool.runContained(self.gpa, self.io, self.cwd, call.arguments, background_ctx);
+            }
+        }
         if (self.background) |bg| {
             if (std.mem.eql(u8, call.name, "bash") and bash_tool.wantsBackground(self.gpa, call.arguments)) {
                 return bash_tool.runBackground(self.gpa, self.io, self.cwd, call.arguments, bg.manager, bg.owner);

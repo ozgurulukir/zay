@@ -44,6 +44,26 @@ pub const tool: common.Tool = .{
     .display = display,
 };
 
+/// Background launch context threaded into `runContained` for lane workers
+/// whose bash call requests `run_in_background`. Mirrors the executor's
+/// `BackgroundStart`; null means background is unavailable for this call.
+pub const BackgroundCtx = struct {
+    manager: *background.BackgroundManager,
+    owner: *anyopaque,
+};
+
+/// Per-call execution options for the internal run path.
+const RunOpts = struct {
+    /// When set, prepend the `cd` containment guard so the shell cannot leave
+    /// `cwd` (the lane worktree). The guard anchors on the PROJECT root (the
+    /// `cwd` param), not the resolved cwd, so a `cwd` subdir argument doesn't
+    /// tighten containment to that subdir.
+    contained: bool = false,
+    /// When set and the call requests `run_in_background`, launch the guarded
+    /// command through the manager instead of capturing it synchronously.
+    background: ?BackgroundCtx = null,
+};
+
 pub fn runTool(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -52,7 +72,7 @@ pub fn runTool(
     userdata: *anyopaque,
 ) common.Error!common.Output {
     _ = userdata;
-    return runToolImpl(gpa, io, cwd, arguments);
+    return runToolImpl(gpa, io, cwd, arguments, .{});
 }
 
 /// Test convenience wrapper — forwards to `runTool` with a null
@@ -64,7 +84,21 @@ pub fn runToolForTest(
     cwd: []const u8,
     arguments: []const u8,
 ) common.Error!common.Output {
-    return runToolImpl(gpa, io, cwd, arguments);
+    return runToolImpl(gpa, io, cwd, arguments, .{});
+}
+
+/// Root-contained bash run for lane workers (see `Agent.contained`). Parses
+/// the call like `runTool`, then prepends the `cd` guard so the command cannot
+/// `cd` out of `cwd` into the main tree. Background launches (when `background`
+/// is non-null and the call asks for one) are guarded too.
+pub fn runContained(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    arguments: []const u8,
+    background_ctx: ?BackgroundCtx,
+) common.Error!common.Output {
+    return runToolImpl(gpa, io, cwd, arguments, .{ .contained = true, .background = background_ctx });
 }
 
 fn runToolImpl(
@@ -72,6 +106,7 @@ fn runToolImpl(
     io: std.Io,
     cwd: []const u8,
     arguments: []const u8,
+    opts: RunOpts,
 ) common.Error!common.Output {
     var args = parseArgs(gpa, arguments) catch |err| return parseError(gpa, err);
     defer args.deinit();
@@ -91,7 +126,23 @@ fn runToolImpl(
     defer env_map.deinit();
     if (args.env) |env| try applyEnv(&env_map, env);
 
-    return runCaptured(gpa, io, resolved_cwd, args.command, &env_map, args.timeout_seconds);
+    // A contained run replaces the model's command with the guard-prefixed
+    // form; the guard definition is silent, so the observation still reads as
+    // the original command (`finishBashOutput` echoes `command`, not the guard).
+    var owned_command: ?[]u8 = null;
+    defer if (owned_command) |command| gpa.free(command);
+    const command = if (opts.contained) blk: {
+        owned_command = prependCdGuard(gpa, cwd, args.command) catch return error.OutOfMemory;
+        break :blk owned_command.?;
+    } else args.command;
+
+    if (opts.background) |bg| {
+        if (wantsBackground(gpa, arguments)) {
+            return runBackgroundImpl(gpa, io, resolved_cwd, command, bg.manager, bg.owner, &env_map);
+        }
+    }
+
+    return runCaptured(gpa, io, resolved_cwd, command, &env_map, args.timeout_seconds);
 }
 
 /// Run `command` under bash with the tool's standard capture limits and shape
@@ -164,10 +215,26 @@ pub fn runBackground(
     defer env_map.deinit();
     if (args.env) |env| try applyEnv(&env_map, env);
 
+    return runBackgroundImpl(gpa, io, resolved_cwd, args.command, manager, owner, &env_map);
+}
+
+/// The shared background launch tail: start `command` (already cwd-resolved,
+/// possibly guard-prefixed) through `manager` and return the observation. The
+/// job's eventual exit is delivered to the agent as a message by the manager.
+fn runBackgroundImpl(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    command: []const u8,
+    manager: *background.BackgroundManager,
+    owner: *anyopaque,
+    env_map: *const std.process.Environ.Map,
+) common.Error!common.Output {
+    _ = io;
     var started = manager.start(.{
-        .command = args.command,
-        .cwd = resolved_cwd,
-        .env_map = &env_map,
+        .command = command,
+        .cwd = cwd,
+        .env_map = env_map,
         .owner = owner,
     }) catch |err| return mapBackgroundError(gpa, err);
     defer started.deinit(gpa);
@@ -180,6 +247,41 @@ pub fn runBackground(
         .{ started.label, started.pid, started.log_path },
     );
     return common.ok(gpa, text);
+}
+
+/// Shell function definitions prepended to a contained command. The `cd`
+/// override runs `builtin cd`, then compares the shell's PHYSICAL cwd (`pwd -P`)
+/// against `_nova_root` (set to the project root by `prependCdGuard`): a target
+/// that resolves outside the root is refused and the shell restored, so a model
+/// that `cd`s to the main tree's absolute path stays put. `pushd`/`popd` are
+/// rejected outright (they'd bypass the guard). This is defense-in-depth, not a
+/// sandbox — it neutralizes `cd`-based escapes, not absolute-path writes.
+const cd_guard_functions =
+    \\cd() { while [ $# -gt 0 ] && { [ "$1" = -P ] || [ "$1" = -L ] || [ "$1" = -- ]; }; do shift; done; local _prev="$PWD"; builtin cd "$@" || return 1; local _phys="$(pwd -P)"; if [ "$_phys" != "$_nova_root" ] && [ "${_phys#$_nova_root}" = "$_phys" ]; then printf 'cd: %s escapes the workspace root\n' "$_phys" >&2; builtin cd "$_prev" 2>/dev/null || builtin cd "$_nova_root"; return 1; fi; return 0; };
+    \\pushd() { printf 'pushd: not allowed in this workspace\n' >&2; return 1; };
+    \\popd() { printf 'popd: not allowed in this workspace\n' >&2; return 1; };
+    \\
+;
+
+/// Prefix `command` with `_nova_root` (the literal, shell-escaped project root)
+/// and the `cd`/`pushd`/`popd` guard functions. `_nova_root` anchors on the
+/// project root — not the shell's start cwd — so a `cwd` subdir argument does
+/// not tighten containment to that subdir.
+fn prependCdGuard(gpa: std.mem.Allocator, project_root: []const u8, command: []const u8) std.mem.Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, "_nova_root=\"");
+    for (project_root) |c| switch (c) {
+        '\\' => try out.appendSlice(gpa, "\\\\"),
+        '"' => try out.appendSlice(gpa, "\\\""),
+        '$' => try out.appendSlice(gpa, "\\$"),
+        '`' => try out.appendSlice(gpa, "\\`"),
+        else => try out.append(gpa, c),
+    };
+    try out.appendSlice(gpa, "\";\n");
+    try out.appendSlice(gpa, cd_guard_functions);
+    try out.appendSlice(gpa, command);
+    return out.toOwnedSlice(gpa);
 }
 
 /// Validate that `resolved_cwd` stays within the project root. `project_root`
@@ -272,7 +374,8 @@ fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args {
     // contract, and unknown fields are ignored like any other.)
     const summary = if (parsed.value.description) |d|
         (if (d.len > 0) d else "Executing command.")
-    else "Executing command.";
+    else
+        "Executing command.";
 
     if (parsed.value.cwd) |cwd| {
         if (cwd.len == 0) return error.BadCwd;
@@ -1053,4 +1156,118 @@ test "empty sentinel block yields no display" {
 
     try std.testing.expectEqual(@as(u8, 0), output.code);
     try std.testing.expect(output.display == .none);
+}
+
+test "prependCdGuard anchors on the project root and defines the guard" {
+    const gpa = std.testing.allocator;
+    const guarded = try prependCdGuard(gpa, "/home/u/repo", "printf hi");
+    defer gpa.free(guarded);
+
+    try std.testing.expect(std.mem.startsWith(u8, guarded, "_nova_root=\"/home/u/repo\";\n"));
+    try std.testing.expect(std.mem.indexOf(u8, guarded, "cd() {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, guarded, "pushd()") != null);
+    try std.testing.expect(std.mem.endsWith(u8, guarded, "printf hi"));
+}
+
+test "prependCdGuard escapes shell metacharacters in the root path" {
+    const gpa = std.testing.allocator;
+    const guarded = try prependCdGuard(gpa, "/tmp/a b\"c$d`e", "true");
+    defer gpa.free(guarded);
+
+    try std.testing.expect(std.mem.indexOf(u8, guarded, "_nova_root=\"/tmp/a b\\\"c\\$d\\`e\";") != null);
+}
+
+test "contained bash refuses cd to a directory outside the workspace root" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(test_cwd);
+    const root_abs = try std.fs.path.join(gpa, &.{ test_cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(root_abs);
+
+    // The main-tree escape that broke lane isolation: `cd` to an absolute path
+    // outside the worktree, then run. The guard must refuse the cd so the
+    // command never executes in the escaped directory.
+    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"cd /etc && pwd\",\"description\":\"escape\"}", null);
+    defer output.deinit(gpa);
+
+    try std.testing.expect(output.code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, output.stdout, "escapes the workspace root") != null);
+}
+
+test "contained bash refuses cd via a symlink that leaves the root" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(test_cwd);
+    const root_abs = try std.fs.path.join(gpa, &.{ test_cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(root_abs);
+
+    // `link -> /etc` inside the root: `cd link` resolves physically to /etc, so
+    // the guard's `pwd -P` check must catch it (not just the lexical check).
+    tmp.dir.symLink(std.testing.io, "/etc", "link", .{}) catch return error.SkipZigTest;
+
+    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"cd link && pwd\",\"description\":\"escape\"}", null);
+    defer output.deinit(gpa);
+
+    try std.testing.expect(output.code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, output.stdout, "escapes the workspace root") != null);
+}
+
+test "contained bash allows cd within the workspace root" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(test_cwd);
+    const root_abs = try std.fs.path.join(gpa, &.{ test_cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(root_abs);
+    const sub_abs = try std.fs.path.join(gpa, &.{ root_abs, "sub" });
+    defer gpa.free(sub_abs);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, sub_abs);
+
+    // `cd sub` stays inside the worktree and must be allowed; `$PWD` reports the
+    // native path form, so assert the relative segment landed.
+    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"cd sub && printf \\\"$PWD\\\"\",\"description\":\"read\"}", null);
+    defer output.deinit(gpa);
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    try std.testing.expect(std.mem.endsWith(u8, output.stdout, "/sub"));
+}
+
+test "contained bash refuses pushd outright" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(test_cwd);
+    const root_abs = try std.fs.path.join(gpa, &.{ test_cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(root_abs);
+
+    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"pushd /etc\",\"description\":\"escape\"}", null);
+    defer output.deinit(gpa);
+
+    try std.testing.expect(output.code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, output.stdout, "pushd: not allowed") != null);
+}
+
+test "contained bash still validates a cwd argument escaping the root" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(test_cwd);
+    const root_abs = try std.fs.path.join(gpa, &.{ test_cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(root_abs);
+
+    // The existing `cwd`-argument containment still applies under `runContained`.
+    // The refusal is a tool-level failure (no shell spawned), so the message
+    // lands in `stderr`, not the captured stdout.
+    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"pwd\",\"cwd\":\"/etc\",\"description\":\"read\"}", null);
+    defer output.deinit(gpa);
+
+    try std.testing.expect(output.code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "escapes the project root") != null);
 }
