@@ -125,7 +125,7 @@ pub const MessageWidget = struct {
     ) void {
         std.debug.assert(loading_frame < loading_frames.len);
         if (row.* >= surface.size.height) return;
-        writeText(surface, loading_frames[loading_frame], StylePalette.thinking_label, true, row.*, ctx, 0);
+        writeText(surface, loading_frames[loading_frame % loading_frames.len], StylePalette.thinking_label, true, row.*, ctx, 0);
         writeText(surface, text, StylePalette.thinking_body, true, row.*, ctx, 2);
         row.* += 1;
     }
@@ -142,7 +142,7 @@ pub const MessageWidget = struct {
         std.debug.assert(loading_frame < loading_frames.len);
         const title = if (message.expanded) message.expanded_title orelse message.title else message.title;
         const command = toolCommandTitle(title);
-        const prefix = if (message.running) loading_frames[loading_frame] else toolIcon(command);
+        const prefix = if (message.running) loading_frames[loading_frame % loading_frames.len] else toolIcon(command);
         // Tool success vs failure is conveyed by foreground color alone (green →
         // red). Prefix a ✗ on the command text so a failed tool is unmistakable
         // without color (red-green CVD, non-RGB terminals) — because it rides on

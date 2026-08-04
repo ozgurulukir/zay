@@ -13,6 +13,7 @@ const lane_bridge = tui.lane_bridge_mod;
 const lanes_util = @import("lanes.zig");
 const lanes_picker = @import("widgets/lanes_picker.zig");
 const naming_mod = @import("naming.zig");
+const turn_view_mod = @import("turn_view.zig");
 const runtime_mod = @import("../runtime.zig");
 const command_router = @import("command_router.zig");
 const vcs = @import("../vcs.zig");
@@ -989,6 +990,9 @@ fn startTurnForLane(app: *App, lane: *Thread, prompt: []const u8, title_source: 
     if (lanes_util.workingLaneOf(lane) != null) {
         app.scheduleLaneNaming(lane, title_source) catch {};
     }
+    // The spawn path bypasses `resetTurnState`, so pick the spinner word
+    // here — every other `awaitModel` caller runs `resetTurnState` first.
+    lane.turn_view.loading_word_index = turn_view_mod.chooseLoadingWordIndex(app.io);
     lane.turn_view.awaitModel();
     // The spawn path bypasses `resetTurnState`, so anchor the `lane`-op
     // activity clock here — a freshly spawned worker is legitimately silent

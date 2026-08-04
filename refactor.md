@@ -19,10 +19,11 @@
 - Toplam: 6 delegate kaldırıldı, ~30 satır azaldı
 - Kalan ~75 delegate: testler `tui.zig` içinde olduğu için toplu kaldırma kırılıyor. Her modül tek tek ele alınmalı.
 
-### ⏳ Adım 3: RootWidget'ı `tui/root_widget.zig`'e çıkar
+### ❌ Adım 3: RootWidget'ı `tui/root_widget.zig`'e çıkar (VAZGEÇİLDİ)
 
-- `captureEvent`, `handleEvent`, `handleTick`, `drainAgentEvents`
-- `drawRoot`, diff key handler'ları, `closeDiff`
+- Çıkarma denemesi terk edildi; inline `RootWidget` (`tui.zig` içinde) canlı ve test edilmiş halidir.
+- Kısmi `tui/root_widget.zig` (105 satır, `_ms` son ekli diverged alan adları) 2026-08-04'te silindi — kimse import etmiyordu.
+- `captureEvent`, `handleEvent`, `handleTick`, `drainAgentEvents`, `drawRoot` inline yapıda kalır.
 
 ### ⏳ Adım 4: Komut çözümleme + yardımcı fonksiyonları ayır
 

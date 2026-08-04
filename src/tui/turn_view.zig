@@ -497,8 +497,13 @@ fn toolTitleMatchesText(title: []const u8, text: []const u8) bool {
     return std.mem.startsWith(u8, title, prefix) and std.mem.eql(u8, title[prefix.len..], text);
 }
 
-fn chooseLoadingWordIndex(io: std.Io) u8 {
+pub fn chooseLoadingWordIndex(io: std.Io) u8 {
     assert(loading_spinners.len > 0);
+    // Note: @mod(nanoseconds, len) has a slight bias when 1e9 % len != 0
+    // (indices 0..(1e9 % len - 1) are marginally more likely). Negligible for
+    // visual variety at len=12 (bias ~4e-9). If len changes or uniformity
+    // becomes required, use a rejection-sampled range or seed from a wider
+    // clock field.
     const timestamp: std.Io.Timestamp = .now(io, .awake);
     const index = @mod(timestamp.nanoseconds, loading_spinners.len);
     return @intCast(index);

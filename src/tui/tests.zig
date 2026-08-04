@@ -23,6 +23,8 @@ const tui = @import("../tui.zig");
 const agent_mod = @import("../agent.zig");
 const ai = @import("../ai.zig");
 const compaction_lifecycle = @import("compaction_lifecycle.zig");
+const lifecycle = @import("lifecycle.zig");
+const turn_view_mod = @import("turn_view.zig");
 const openai_compatible_mod = @import("../ai/openai_compatible.zig");
 const codex = @import("../auth/codex.zig");
 const config_mod = @import("../config/config.zig");
@@ -750,6 +752,153 @@ test "compact request appends an animated status row while the summary is produc
     }
     try std.testing.expect(app.thread.manual_compact_waiting_row == null);
     try std.testing.expectEqualStrings("Background compaction failed", messages[messages.len - 1].mirror().body);
+}
+
+test "spinner frame advances while visible lane writes a response" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // Visible lane is mid-response: turn active, but not awaiting model and no
+    // tool running — the state the old visible-lane-only gate froze on.
+    app.thread.turn.submit();
+    app.thread.turn_view.activity = .{ .writing_response = 0 };
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root: RootWidget = .{ .app = &app };
+    root.spinner_tick_accum = RootWidget.spinner_tick_threshold_ms - 1;
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    try lifecycle.handleTick(&root, &ctx);
+    try std.testing.expectEqual(@as(u8, 1), app.metrics.loading_frame);
+}
+
+test "spinner frame advances while a background lane is active and visible lane is idle" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    const lane2 = try gpa.create(Thread);
+    lane2.* = .{};
+    lane2.turn.submit();
+    try app.threads.append(gpa, lane2);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root: RootWidget = .{ .app = &app };
+    root.spinner_tick_accum = RootWidget.spinner_tick_threshold_ms - 1;
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    try lifecycle.handleTick(&root, &ctx);
+    try std.testing.expectEqual(@as(u8, 1), app.metrics.loading_frame);
+}
+
+test "spinner frame does not advance when all lanes are idle" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root: RootWidget = .{ .app = &app };
+    root.spinner_tick_accum = RootWidget.spinner_tick_threshold_ms - 1;
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    try lifecycle.handleTick(&root, &ctx);
+    try std.testing.expectEqual(@as(u8, 0), app.metrics.loading_frame);
+    // Idle resets the accumulator instead of parking it near the threshold.
+    try std.testing.expectEqual(@as(u32, 0), root.spinner_tick_accum);
+}
+
+test "spinner frame advances during manual compact with no active turn" {
+    const gpa = std.testing.allocator;
+    var client: openai_compatible_mod.Client = undefined;
+    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &client });
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    // A manual /compact is mid-flight with no turn running: the summarizer is
+    // still producing, so the tick gate must keep advancing the frame for the
+    // waiting row and lane glyph. (A `.none` compaction client would make
+    // `pollManualCompact` treat this as a torn-down client and abort it.)
+    agent.compaction_client = .{ .openai_compatible = &client };
+    agent.manual_compact_pending = true;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root: RootWidget = .{ .app = &app };
+    root.spinner_tick_accum = RootWidget.spinner_tick_threshold_ms - 1;
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    try lifecycle.handleTick(&root, &ctx);
+    try std.testing.expectEqual(@as(u8, 1), app.metrics.loading_frame);
+}
+
+test "spinner tick accumulator respects the 40ms threshold" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.thread.turn.submit();
+    app.thread.turn_view.awaitModel();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root: RootWidget = .{ .app = &app };
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    // One 30ms tick stays under the 40ms threshold: no advance, accumulator grows.
+    try lifecycle.handleTick(&root, &ctx);
+    try std.testing.expectEqual(@as(u8, 0), app.metrics.loading_frame);
+    try std.testing.expectEqual(RootWidget.drain_tick_ms, root.spinner_tick_accum);
+
+    // A second tick crosses it: advance and reset.
+    try lifecycle.handleTick(&root, &ctx);
+    try std.testing.expectEqual(@as(u8, 1), app.metrics.loading_frame);
+    try std.testing.expectEqual(@as(u32, 0), root.spinner_tick_accum);
+}
+
+test "advanceLoadingFrame wraps at 8" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.metrics.loading_frame = @intCast(tui_message.loading_frames.len - 1);
+    app.advanceLoadingFrame();
+    try std.testing.expectEqual(@as(u8, 0), app.metrics.loading_frame);
+    app.advanceLoadingFrame();
+    try std.testing.expectEqual(@as(u8, 1), app.metrics.loading_frame);
+    app.advanceLoadingFrame();
+    try std.testing.expectEqual(@as(u8, 2), app.metrics.loading_frame);
+}
+
+test "chooseLoadingWordIndex returns a valid spinner index" {
+    const index = turn_view_mod.chooseLoadingWordIndex(std.testing.io);
+    try std.testing.expect(index < turn_view_mod.loading_spinners.len);
+}
+
+test "spawn path assigns the spinner word before awaitModel" {
+    // A fresh lane's turn view defaults to the first word (index 0); the spawn
+    // path (`startTurnForLane`) assigns a fresh one via `chooseLoadingWordIndex`
+    // before `awaitModel`, so every spawned lane doesn't show "Firing Neurons".
+    var lane: Thread = .{};
+    const chosen = turn_view_mod.chooseLoadingWordIndex(std.testing.io);
+    lane.turn_view.loading_word_index = chosen;
+    lane.turn_view.awaitModel();
+    try std.testing.expect(lane.turn_view.loading_word_index < turn_view_mod.loading_spinners.len);
+    try std.testing.expect(lane.turn_view.awaitingOutput());
 }
 
 test "awaiting turn draws loading outside the transcript list" {

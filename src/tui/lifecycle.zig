@@ -141,10 +141,12 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     // spawner (notice + answer turn); acknowledged/gone spawners drop it.
     if (try lane_lifecycle.deliverPendingLaneCompletions(root.app)) visible_change = true;
 
-    // The loading frame animates not just a running turn but any in-flight
-    // manual /compact — its "waiting" status row and lane glyph spin until the
-    // summary lands.
-    if (root.app.thread.turn_view.awaitingOutput() or root.app.thread.transcript.hasRunningTool() or compaction_lifecycle.manualCompactActive(root.app)) {
+    // The loading frame animates any time a spinner is visible: a running turn
+    // on any lane (border glyph + transcript strip + tool title), or an
+    // in-flight manual /compact (its "waiting" status row spins). `anyTurnActive`
+    // covers all lanes' `.active` and `.interrupting` states; a running tool
+    // implies an active turn, so `hasRunningTool()` is subsumed.
+    if (root.app.anyTurnActive() or compaction_lifecycle.manualCompactActive(root.app)) {
         root.spinner_tick_accum += RootWidget.drain_tick_ms;
         if (root.spinner_tick_accum >= RootWidget.spinner_tick_threshold_ms) {
             root.spinner_tick_accum = 0;
