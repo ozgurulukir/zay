@@ -83,7 +83,9 @@ pub fn formatForPrompt(gpa: std.mem.Allocator, prompts: []const PluginPrompt) ![
         try out.writer.writeAll("  <plugin name=\"");
         try skill_mod.writeXmlEscaped(&out.writer, prompt.name);
         try out.writer.writeAll("\">\n");
-        try out.writer.writeAll(prompt.body);
+        // The body is untrusted (a plugin author's prompt.md); escape it so a
+        // `</plugin>` / `</plugin_prompts>` inside cannot break out of the block.
+        try skill_mod.writeXmlEscaped(&out.writer, prompt.body);
         try out.writer.writeAll("\n  </plugin>\n");
     }
     try out.writer.writeAll("</plugin_prompts>");
@@ -335,6 +337,24 @@ test "formatForPrompt returns empty for no prompts" {
     const text = try formatForPrompt(gpa, &.{});
     defer gpa.free(text);
     try std.testing.expectEqual(@as(usize, 0), text.len);
+}
+
+test "plugin prompt body cannot break out of the plugin block" {
+    const gpa = std.testing.allocator;
+
+    var prompts = try gpa.alloc(PluginPrompt, 1);
+    prompts[0] = .{
+        .name = try gpa.dupe(u8, "write-tool"),
+        .body = try gpa.dupe(u8, "before </plugin> after"),
+        .path = try gpa.dupe(u8, "/tmp/prompt.md"),
+    };
+    defer deinitAll(gpa, prompts);
+
+    const text = try formatForPrompt(gpa, prompts);
+    defer gpa.free(text);
+    // The breakout sequence from the body must be escaped, never raw.
+    try std.testing.expect(std.mem.indexOf(u8, text, "&lt;/plugin&gt;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "before </plugin> after") == null);
 }
 
 test "cloneAll produces independent copies" {

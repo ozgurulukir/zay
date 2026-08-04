@@ -95,4 +95,6 @@ Filter `sessions.cwd` to the current project, or query across all of them for a 
 You are in ${CWD}
 
 The user's operating system is ${OS}
+
+Today's date is ${DATE}
 </environment>

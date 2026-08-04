@@ -971,21 +971,21 @@ test "runtime keeps codex adapter for openai provider" {
 
 test "createSystemPrompt substitutes ${CWD} with the working directory" {
     const gpa = std.testing.allocator;
-    const rendered = try context_assembly.substituteBaseTemplate(gpa, "header\nYou are in ${CWD}.\n", "C:\\repos\\nova");
+    const rendered = try context_assembly.substituteBaseTemplate(gpa, "header\nYou are in ${CWD}.\n", "C:\\repos\\nova", "2026-08-04");
     defer gpa.free(rendered);
     try std.testing.expectEqualStrings("header\nYou are in C:\\repos\\nova.\n", rendered);
 }
 
 test "createSystemPrompt leaves a template without the placeholder untouched" {
     const gpa = std.testing.allocator;
-    const rendered = try context_assembly.substituteBaseTemplate(gpa, "no placeholder here", "/tmp/nova");
+    const rendered = try context_assembly.substituteBaseTemplate(gpa, "no placeholder here", "/tmp/nova", "2026-08-04");
     defer gpa.free(rendered);
     try std.testing.expectEqualStrings("no placeholder here", rendered);
 }
 
 test "createSystemPrompt substitutes ${OS} with the host operating system" {
     const gpa = std.testing.allocator;
-    const rendered = try context_assembly.substituteBaseTemplate(gpa, "OS: ${OS}", "/tmp/nova");
+    const rendered = try context_assembly.substituteBaseTemplate(gpa, "OS: ${OS}", "/tmp/nova", "2026-08-04");
     defer gpa.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "${OS}") == null);
     try std.testing.expect(std.mem.startsWith(u8, rendered, "OS: "));

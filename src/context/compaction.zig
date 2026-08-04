@@ -70,6 +70,14 @@ const context_window_default_tokens: u32 = 128_000;
 /// so a single huge command output cannot dominate the summary input.
 const tool_output_render_cap_bytes: u32 = 2048;
 
+/// Flat token estimate for an image block. Vision models price images by tile,
+/// not by file size; base64 length / 4 overestimates a 5 MB image at ~1.7M
+/// tokens (real cost: low thousands) and alone can push a session past the swap
+/// watermark with nothing to cut. 1024 covers typical screenshots at common
+/// tile pricing; the estimator is only used for watermark decisions, never
+/// billing.
+const image_estimate_tokens: u32 = 1_024;
+
 /// Context window in tokens for `model_id`, from the generated models.dev
 /// catalogue, or a conservative default when the id matches no catalogue entry.
 /// When `override` is non-null it wins unconditionally (config-driven
@@ -188,25 +196,49 @@ pub fn summarize(gpa: std.mem.Allocator, client: ai.LanguageModel, prefix_text: 
 
 /// Estimate the token cost of one message from the byte length of its content
 /// (chars/4, rounded up). A fallback for when the provider omits usage and the
-/// unit used to choose the cut point.
+/// unit used to choose the cut point. Images estimate flat (TD-11).
 pub fn estimateMessageTokens(message: ai.ChatMessage) u32 {
     const content: []const ai.ContentBlock = switch (message) {
         inline .system, .user, .assistant => |m| m.content,
         .tool => |t| t.content,
     };
-    var bytes: u32 = 0;
+    var tokens: u32 = 0;
     for (content) |block| {
-        bytes +|= blockBytes(block);
+        tokens +|= blockTokens(block);
     }
-    return divCeil(bytes, tokens_per_char_divisor);
+    return tokens;
 }
 
-fn blockBytes(block: ai.ContentBlock) u32 {
+/// Estimate the token cost of one message, capping each text block at
+/// `cap_bytes` before counting. Used by the pruning-aware watermark estimator
+/// (TD-9) so the estimate matches what the pruned request actually sends.
+pub fn estimateMessageTokensCapped(message: ai.ChatMessage, cap_bytes: u32) u32 {
+    const content: []const ai.ContentBlock = switch (message) {
+        inline .system, .user, .assistant => |m| m.content,
+        .tool => |t| t.content,
+    };
+    var tokens: u32 = 0;
+    for (content) |block| {
+        tokens +|= blockTokensCapped(block, cap_bytes);
+    }
+    return tokens;
+}
+
+fn blockTokens(block: ai.ContentBlock) u32 {
     return switch (block) {
-        .text => |text| saturatingLen(text.text),
-        .reasoning => |reasoning| saturatingLen(reasoning.text),
-        .image => |image| saturatingLen(image.data_base64),
-        .tool_call => |call| saturatingLen(call.name) +| saturatingLen(call.arguments),
+        .text => |text| divCeil(saturatingLen(text.text), tokens_per_char_divisor),
+        .reasoning => |reasoning| divCeil(saturatingLen(reasoning.text), tokens_per_char_divisor),
+        .image => image_estimate_tokens,
+        .tool_call => |call| divCeil(saturatingLen(call.name) +| saturatingLen(call.arguments), tokens_per_char_divisor),
+    };
+}
+
+fn blockTokensCapped(block: ai.ContentBlock, cap_bytes: u32) u32 {
+    return switch (block) {
+        .text => |text| divCeil(@min(saturatingLen(text.text), cap_bytes), tokens_per_char_divisor),
+        .reasoning => |reasoning| divCeil(@min(saturatingLen(reasoning.text), cap_bytes), tokens_per_char_divisor),
+        .image => image_estimate_tokens,
+        .tool_call => |call| divCeil(saturatingLen(call.name) +| saturatingLen(call.arguments), tokens_per_char_divisor),
     };
 }
 
@@ -291,8 +323,7 @@ pub fn serializePrefix(gpa: std.mem.Allocator, messages: []const ai.ChatMessage)
 fn writeMessage(out: *std.Io.Writer, message: ai.ChatMessage) !void {
     switch (message) {
         .tool => |t| {
-            try out.print("[tool result]: {s}\n", .{cappedText(firstText(message))});
-            _ = t;
+            try out.print("[tool result]: {s}\n", .{cappedText(firstText(t.content))});
         },
         inline .system, .user, .assistant => |m| {
             const label: []const u8 = switch (message) {
@@ -304,7 +335,7 @@ fn writeMessage(out: *std.Io.Writer, message: ai.ChatMessage) !void {
             for (m.content) |block| {
                 switch (block) {
                     .text => |text| try out.print("[{s}]: {s}\n", .{ label, text.text }),
-                    .tool_call => |call| try out.print("[{s} tool_call]: {s}({s})\n", .{ label, call.name, call.arguments }),
+                    .tool_call => |call| try out.print("[{s} tool_call]: {s}({s})\n", .{ label, call.name, cappedText(call.arguments) }),
                     // Images vanish without a marker today; leave an explicit
                     // placeholder so the summary keeps a positional hint (M6).
                     .image => |image| {
@@ -318,11 +349,7 @@ fn writeMessage(out: *std.Io.Writer, message: ai.ChatMessage) !void {
     }
 }
 
-fn firstText(message: ai.ChatMessage) []const u8 {
-    const content: []const ai.ContentBlock = switch (message) {
-        inline .system, .user, .assistant => |m| m.content,
-        .tool => |t| t.content,
-    };
+fn firstText(content: []const ai.ContentBlock) []const u8 {
     for (content) |block| {
         if (block == .text) return block.text.text;
     }
@@ -582,6 +609,50 @@ test "serialize prefix marks omitted images" {
     const text = try serializePrefix(gpa, &.{message});
     defer gpa.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "[user image omitted]") != null);
+}
+
+test "serializePrefix caps tool call arguments like tool results" {
+    const gpa = std.testing.allocator;
+    const blocks = try gpa.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .tool_call = .{
+        .call_id = .{ .value = try gpa.dupe(u8, "c1") },
+        .name = try gpa.dupe(u8, "write"),
+        .arguments = try gpa.dupe(u8, "x" ** 5000),
+    } };
+    var message: ai.ChatMessage = .{ .assistant = .{ .content = blocks } };
+    defer message.deinit(gpa);
+
+    const text = try serializePrefix(gpa, &.{message});
+    defer gpa.free(text);
+    // The arguments are capped at tool_output_render_cap_bytes.
+    const call_at = std.mem.indexOf(u8, text, "[assistant tool_call]: write(").?;
+    const args_start = call_at + "[assistant tool_call]: write(".len;
+    const args_len = text.len - args_start - 2; // minus the trailing ")\n"
+    try std.testing.expectEqual(@as(usize, tool_output_render_cap_bytes), args_len);
+}
+
+test "image token estimate is flat regardless of base64 size" {
+    const gpa = std.testing.allocator;
+
+    const small_blocks = try gpa.alloc(ai.ContentBlock, 1);
+    small_blocks[0] = .{ .image = .{
+        .mime_type = try gpa.dupe(u8, "image/png"),
+        .data_base64 = try gpa.dupe(u8, "aGVsbG8="),
+    } };
+    var small: ai.ChatMessage = .{ .user = .{ .content = small_blocks } };
+    defer small.deinit(gpa);
+
+    const big_blocks = try gpa.alloc(ai.ContentBlock, 1);
+    big_blocks[0] = .{ .image = .{
+        .mime_type = try gpa.dupe(u8, "image/png"),
+        .data_base64 = try gpa.dupe(u8, "x" ** (5 * 1024 * 1024)),
+    } };
+    var big: ai.ChatMessage = .{ .user = .{ .content = big_blocks } };
+    defer big.deinit(gpa);
+
+    // A 10-byte and a 5 MB base64 image estimate identically.
+    try std.testing.expectEqual(estimateMessageTokens(small), estimateMessageTokens(big));
+    try std.testing.expectEqual(@as(u32, image_estimate_tokens), estimateMessageTokens(small));
 }
 
 fn textMessage(gpa: std.mem.Allocator, role: ai.Role, text: []const u8) !ai.ChatMessage {

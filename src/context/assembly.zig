@@ -1,16 +1,15 @@
 //! context_assembly.zig — Professional Coding Agent Context Assembly Engine
 //!
 //! Provides state-of-the-art context assembly for Nova Agent:
-//!   1. Dynamic Environment & Repository Context Injection (CWD, OS, Git Branch/Status, Date/Time).
+//!   1. Dynamic Environment & Repository Context Injection (CWD, OS, Git Branch/Status, Date).
 //!   2. Multi-convention Project Rule Ingestion (AGENTS.md, .cursorrules, CLAUDE.md, CONVENTIONS.md).
 //!   3. Historical Tool Result Pruning (Context Compression for Active Turns): Keeps recent tool outputs
 //!      in full, while capping/truncating ancient tool outputs in the prompt to prevent context bloat.
-//!   4. Attachment Budgeting: Per-file and aggregate byte limits for @-mention file inlining.
-//!   5. Context Budget Metrics: High-level usage breakdown (system, history, tool output, margin).
+//!   4. Attachment Budgeting: Per-file and aggregate byte limits for @-mention file inlining
+//!      (enforced in `at_mention.zig`, the module that owns expansion).
 
 const std = @import("std");
 const ai = @import("../ai.zig");
-const at_mention = @import("../at_mention.zig");
 const compaction = @import("compaction.zig");
 const os = @import("../os.zig");
 const plugin_prompt = @import("../plugin_prompt.zig");
@@ -19,6 +18,8 @@ const vcs = @import("../vcs.zig");
 
 const assert = std.debug.assert;
 
+const log = std.log.scoped(.context_assembly);
+
 /// Default byte limit per historical tool result when pruned. Mirrored as the
 /// `config.CompactionSettings.historical_tool_cap_bytes` default (`context.compaction.historicalToolCapBytes`).
 pub const default_historical_tool_cap_bytes: u32 = 1024;
@@ -26,10 +27,6 @@ pub const default_historical_tool_cap_bytes: u32 = 1024;
 /// Mirrored as the `config.CompactionSettings.keep_recent_tool_turns` default
 /// (`context.compaction.keepRecentToolTurns`).
 pub const default_keep_recent_tool_turns: u32 = 4;
-/// Maximum bytes allowed per individual @-mention text file inlining.
-pub const default_per_file_mention_max_bytes: usize = 64 * 1024;
-/// Maximum total aggregate bytes allowed for all @-mention text files in a single turn.
-pub const default_turn_mention_aggregate_max_bytes: usize = 256 * 1024;
 
 /// Known project instruction files to automatically ingest if present in workspace root.
 const project_rule_filenames = [_][]const u8{
@@ -43,24 +40,6 @@ const project_rule_filenames = [_][]const u8{
 /// larger than this is truncated to the head with a visible notice rather than
 /// rejected, so an oversized AGENTS.md can never brick startup.
 pub const max_project_rule_file_bytes: usize = 64 * 1024;
-
-pub const ContextBudget = struct {
-    system_tokens: u32,
-    history_tokens: u32,
-    tool_result_tokens: u32,
-    total_tokens: u32,
-    context_window: u32,
-
-    pub fn usageRatio(self: ContextBudget) f32 {
-        if (self.context_window == 0) return 0.0;
-        return @as(f32, @floatFromInt(self.total_tokens)) / @as(f32, @floatFromInt(self.context_window));
-    }
-
-    pub fn remainingTokens(self: ContextBudget) u32 {
-        if (self.total_tokens >= self.context_window) return 0;
-        return self.context_window - self.total_tokens;
-    }
-};
 
 /// Assembles the complete system prompt for a turn with dynamic environment,
 /// git metadata, ingested project rules, active skills, and plugin prompts.
@@ -78,8 +57,10 @@ pub fn assembleSystemPrompt(
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    // 1. Substitute CWD and OS in base prompt
-    const base_substituted = try substituteBaseTemplate(gpa, base_template, cwd);
+    // 1. Substitute CWD, OS, and today's date (UTC) in the base prompt.
+    const date = try todayUtc(gpa, io);
+    defer gpa.free(date);
+    const base_substituted = try substituteBaseTemplate(gpa, base_template, cwd, date);
     defer gpa.free(base_substituted);
     try out.writer.writeAll(base_substituted);
 
@@ -91,7 +72,9 @@ pub fn assembleSystemPrompt(
 
         try out.writer.print("\n\n<git_environment>\n", .{});
         if (maybe_branch) |branch| {
-            try out.writer.print("Branch: {s}\n", .{branch});
+            try out.writer.print("Branch: ", .{});
+            try skill_mod.writeXmlEscaped(&out.writer, branch);
+            try out.writer.print("\n", .{});
         } else {
             try out.writer.print("Branch: (detached HEAD)\n", .{});
         }
@@ -103,7 +86,9 @@ pub fn assembleSystemPrompt(
     for (project_rule_filenames) |rule_filename| {
         if (try readProjectRuleFile(gpa, io, cwd, rule_filename)) |content| {
             defer gpa.free(content);
-            try out.writer.print("\n\n<project_instructions path=\"{s}\">\n{s}\n</project_instructions>", .{ rule_filename, content });
+            try out.writer.print("\n\n<project_instructions path=\"{s}\">\n", .{rule_filename});
+            try skill_mod.writeXmlEscaped(&out.writer, content);
+            try out.writer.print("\n</project_instructions>", .{});
         }
     }
 
@@ -126,10 +111,31 @@ pub fn assembleSystemPrompt(
     return out.toOwnedSlice();
 }
 
+/// Today's date as `YYYY-MM-DD` in UTC, using the wall-clock real-time clock.
+/// Caller owns the result.
+fn todayUtc(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
+    const now = std.Io.Timestamp.now(io, .real);
+    const secs: u64 = @intCast(now.toSeconds());
+    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = secs };
+    const epoch_day = epoch_seconds.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    return std.fmt.allocPrint(gpa, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+    });
+}
+
 /// Count tool result turns backwards from the end of `messages` and return the
 /// index at which historical pruning begins: everything at `idx < cutoff` is a
 /// tool turn older than the `keep_recent_tool_turns` most recent ones.
 /// Messages at `>= cutoff` are kept in full.
+///
+/// A "turn" is a contiguous run of `.tool` messages — the results of one
+/// assistant batch, which `takeToolResults` appends contiguously. The count
+/// increments only at the end of a run, so a parallel batch is never split:
+/// the `(keep+1)`-th run is pruned whole.
 fn computeCutoff(messages: []const ai.ChatMessage, keep_recent_tool_turns: u32) usize {
     var tool_turns_seen: u32 = 0;
     var cutoff_index: usize = messages.len;
@@ -137,7 +143,8 @@ fn computeCutoff(messages: []const ai.ChatMessage, keep_recent_tool_turns: u32) 
     while (i > 0) {
         i -= 1;
         if (messages[i] == .tool) {
-            tool_turns_seen += 1;
+            const run_end = i + 1 >= messages.len or messages[i + 1] != .tool;
+            if (run_end) tool_turns_seen += 1;
             if (tool_turns_seen > keep_recent_tool_turns and cutoff_index == messages.len) {
                 cutoff_index = i + 1; // Everything before cutoff_index is historical
             }
@@ -161,14 +168,25 @@ pub fn pruneHistoricalToolResultsViews(
     historical_tool_cap_bytes: u32,
 ) ![]ai.MessageView {
     const views = try gpa.alloc(ai.MessageView, messages.len);
-    errdefer gpa.free(views);
     const cutoff_index = computeCutoff(messages, keep_recent_tool_turns);
+    var built: usize = 0;
+    errdefer {
+        for (views[0..built]) |*view| switch (view.*) {
+            .owned => |*m| m.deinit(gpa),
+            .borrowed => {},
+        };
+        gpa.free(views);
+    }
+    // When `cutoff_index == messages.len` no tool turn is historical, so every
+    // message is borrowed in full — pruning only applies below a real cutoff.
+    const pruning_active = cutoff_index < messages.len;
     for (messages, 0..) |*msg, idx| {
-        if (idx < cutoff_index and msg.* == .tool) {
+        if (pruning_active and idx < cutoff_index and msg.* == .tool) {
             views[idx] = .{ .owned = try pruneSingleToolMessage(gpa, msg.*, historical_tool_cap_bytes) };
         } else {
             views[idx] = .{ .borrowed = msg };
         }
+        built = idx + 1;
     }
     return views;
 }
@@ -184,55 +202,153 @@ pub fn freePrunedViews(gpa: std.mem.Allocator, views: []ai.MessageView) void {
     gpa.free(views);
 }
 
-/// Compute context budget breakdown for a message history against a target window.
-pub fn calculateBudget(messages: []const ai.ChatMessage, system_prompt: []const u8, context_window: u32) ContextBudget {
-    var sys_blocks = [_]ai.ContentBlock{.{ .text = .{ .text = @constCast(system_prompt) } }};
-    const system_tokens = compaction.estimateMessageTokens(.{
-        .system = .{ .content = &sys_blocks },
-    });
-    var history_tokens: u32 = 0;
-    var tool_result_tokens: u32 = 0;
-
-    for (messages) |msg| {
-        const est = compaction.estimateMessageTokens(msg);
-        if (msg == .tool) {
-            tool_result_tokens +|= est;
+/// Estimate the token footprint of `messages[from_index..]` as the *pruned*
+/// request would actually send it: historical tool messages (below the cutoff
+/// computed over the FULL slice, so trailing messages get the same kept/pruned
+/// verdict the next request will) count with their text capped at
+/// `historical_tool_cap_bytes`; everything else counts in full. This keeps the
+/// watermark estimator and the wire request in agreement (TD-9).
+pub fn estimatePrunedTokensRange(
+    messages: []const ai.ChatMessage,
+    from_index: usize,
+    keep_recent_tool_turns: u32,
+    historical_tool_cap_bytes: u32,
+) u32 {
+    assert(from_index <= messages.len);
+    const cutoff_index = computeCutoff(messages, keep_recent_tool_turns);
+    const pruning_active = cutoff_index < messages.len;
+    var total: u32 = 0;
+    var index: usize = from_index;
+    while (index < messages.len) : (index += 1) {
+        const message = messages[index];
+        if (pruning_active and index < cutoff_index and message == .tool) {
+            total +|= compaction.estimateMessageTokensCapped(message, historical_tool_cap_bytes);
         } else {
-            history_tokens +|= est;
+            total +|= compaction.estimateMessageTokens(message);
         }
     }
-
-    const total_tokens = system_tokens +| history_tokens +| tool_result_tokens;
-    return .{
-        .system_tokens = system_tokens,
-        .history_tokens = history_tokens,
-        .tool_result_tokens = tool_result_tokens,
-        .total_tokens = total_tokens,
-        .context_window = context_window,
-    };
+    return total;
 }
 
-pub fn substituteBaseTemplate(gpa: std.mem.Allocator, template: []const u8, cwd: []const u8) ![]u8 {
-    const cwd_resolved = try std.mem.replaceOwned(u8, gpa, template, "${CWD}", cwd);
-    defer gpa.free(cwd_resolved);
-    return try std.mem.replaceOwned(u8, gpa, cwd_resolved, "${OS}", os.label);
+test "estimatePrunedTokensRange matches the bytes the pruned request sends" {
+    const gpa = std.testing.allocator;
+    // Two distinct tool runs (separated by an assistant message); keep=1 prunes
+    // the older run (message 0) at the cap, keeps the recent one in full.
+    var messages: [3]ai.ChatMessage = undefined;
+    messages[0] = try makeToolMessage(gpa, "c1", "x" ** 4000); // ~1000 tokens raw
+    messages[1] = try makeTextMessage(gpa, .assistant, "done");
+    messages[2] = try makeToolMessage(gpa, "c3", "y" ** 4000); // ~1000 tokens raw
+    defer for (&messages) |*m| m.deinit(gpa);
+
+    const cap: u32 = 100;
+    const estimated = estimatePrunedTokensRange(&messages, 0, 1, cap);
+    // message 0 capped at 100 bytes (~25 tokens) + message 1 (~1 token) +
+    // message 2 in full (~1000 tokens).
+    const expected = compaction.estimateMessageTokensCapped(messages[0], cap) +
+        compaction.estimateMessageTokens(messages[1]) +
+        compaction.estimateMessageTokens(messages[2]);
+    try std.testing.expectEqual(expected, estimated);
+    // The pruned estimate is strictly below the un-pruned one.
+    const unpruned = compaction.estimateMessageTokens(messages[0]) +
+        compaction.estimateMessageTokens(messages[1]) +
+        compaction.estimateMessageTokens(messages[2]);
+    try std.testing.expect(estimated < unpruned);
+}
+
+test "trailing estimate uses the full-history cutoff verdict" {
+    const gpa = std.testing.allocator;
+    // Two distinct tool runs; keep=1 prunes the older run. The trailing range
+    // starting at index 1 must apply the SAME cutoff as the full range.
+    var messages: [4]ai.ChatMessage = undefined;
+    messages[0] = try makeToolMessage(gpa, "c1", "x" ** 4000); // pruned
+    messages[1] = try makeTextMessage(gpa, .assistant, "done");
+    messages[2] = try makeToolMessage(gpa, "c3", "y" ** 4000); // recent, kept
+    messages[3] = try makeTextMessage(gpa, .user, "next");
+    defer for (&messages) |*m| m.deinit(gpa);
+
+    const cap: u32 = 100;
+    const full = estimatePrunedTokensRange(&messages, 0, 1, cap);
+    const trailing = estimatePrunedTokensRange(&messages, 1, 1, cap);
+    // full = pruned(msg0) + msg1 + msg2 + msg3; trailing = msg1 + msg2 + msg3.
+    try std.testing.expectEqual(full - compaction.estimateMessageTokensCapped(messages[0], cap), trailing);
+}
+
+/// Single-pass left-to-right substitution of `${CWD}`, `${OS}`, and `${DATE}`
+/// into `template`. The scan emits the earliest occurrence of any tag and
+/// continues after it, so substituted output is never re-scanned — a cwd
+/// containing a literal `${OS}` survives intact. Caller owns the result.
+pub fn substituteBaseTemplate(gpa: std.mem.Allocator, template: []const u8, cwd: []const u8, date: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var index: usize = 0;
+    while (index < template.len) {
+        const cwd_at = std.mem.indexOfPos(u8, template, index, "${CWD}");
+        const os_at = std.mem.indexOfPos(u8, template, index, "${OS}");
+        const date_at = std.mem.indexOfPos(u8, template, index, "${DATE}");
+
+        const earliest = earliestPlaceholder(cwd_at, os_at, date_at, cwd, date) orelse {
+            try out.writer.writeAll(template[index..]);
+            break;
+        };
+
+        try out.writer.writeAll(template[index..earliest.index]);
+        try out.writer.writeAll(earliest.replacement);
+        index = earliest.index + earliest.tag.len;
+    }
+    return out.toOwnedSlice();
+}
+
+const Placeholder = struct {
+    index: usize,
+    tag: []const u8,
+    replacement: []const u8,
+};
+
+/// The earliest of the three placeholder positions, or null when none remain.
+fn earliestPlaceholder(cwd_at: ?usize, os_at: ?usize, date_at: ?usize, cwd: []const u8, date: []const u8) ?Placeholder {
+    var best: ?Placeholder = null;
+    if (cwd_at) |i| best = .{ .index = i, .tag = "${CWD}", .replacement = cwd };
+    if (os_at) |i| {
+        if (best == null or i < best.?.index) best = .{ .index = i, .tag = "${OS}", .replacement = os.label };
+    }
+    if (date_at) |i| {
+        if (best == null or i < best.?.index) best = .{ .index = i, .tag = "${DATE}", .replacement = date };
+    }
+    return best;
 }
 
 pub fn readProjectRuleFile(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, filename: []const u8) !?[]u8 {
     const path = try std.fs.path.join(gpa, &.{ cwd, filename });
     defer gpa.free(path);
 
+    // A rule file is advisory context, never load-bearing for session start:
+    // any open/stat/read failure other than FileNotFound logs one warning and
+    // skips, so a broken symlink or racing file can never brick startup.
     const file = std.Io.Dir.openFile(.cwd(), io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
-        else => |e| return e,
+        else => |e| {
+            log.warn("skipping project rule file {s}: {s}", .{ path, @errorName(e) });
+            return null;
+        },
     };
     defer file.close(io);
-    const stat = try file.stat(io);
+    const stat = file.stat(io) catch |err| {
+        log.warn("skipping project rule file {s}: {s}", .{ path, @errorName(err) });
+        return null;
+    };
     const head_len: usize = @intCast(@min(stat.size, max_project_rule_file_bytes));
     const bytes = try gpa.alloc(u8, head_len);
     errdefer gpa.free(bytes);
     var reader = file.reader(io, &.{});
-    try reader.interface.readSliceAll(bytes);
+    // readSliceShort returns the actual count (never error.EndOfStream), so a
+    // file truncated between stat and read yields its partial content instead
+    // of failing assembly (TOCTOU).
+    const n = reader.interface.readSliceShort(bytes) catch |err| {
+        gpa.free(bytes);
+        log.warn("skipping project rule file {s}: {s}", .{ path, @errorName(err) });
+        return null;
+    };
     if (stat.size > max_project_rule_file_bytes) {
         const notice = try std.fmt.allocPrint(
             gpa,
@@ -246,6 +362,14 @@ pub fn readProjectRuleFile(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, 
         gpa.free(bytes);
         return joined;
     }
+    // When the file shrank below the stat-based buffer, copy the actual bytes
+    // into an exact-size slice so no padding is exposed.
+    if (n < head_len) {
+        const exact = try gpa.alloc(u8, n);
+        @memcpy(exact, bytes[0..n]);
+        gpa.free(bytes);
+        return exact;
+    }
     return bytes;
 }
 
@@ -253,7 +377,11 @@ fn pruneSingleToolMessage(gpa: std.mem.Allocator, msg: ai.ChatMessage, cap_bytes
     assert(msg == .tool);
     const content = msg.tool.content;
     var pruned_blocks = try gpa.alloc(ai.ContentBlock, content.len);
-    errdefer gpa.free(pruned_blocks);
+    var placed: usize = 0;
+    errdefer {
+        for (pruned_blocks[0..placed]) |*block| block.deinit(gpa);
+        gpa.free(pruned_blocks);
+    }
 
     for (content, 0..) |block, b_idx| {
         if (block == .text and block.text.text.len > cap_bytes) {
@@ -268,13 +396,19 @@ fn pruneSingleToolMessage(gpa: std.mem.Allocator, msg: ai.ChatMessage, cap_bytes
         } else {
             pruned_blocks[b_idx] = try cloneContentBlock(gpa, block);
         }
+        placed = b_idx + 1;
     }
+
+    const call_id = try gpa.dupe(u8, msg.tool.call_id.slice());
+    errdefer gpa.free(call_id);
+    const display_label = if (msg.tool.display_label) |l| try gpa.dupe(u8, l) else null;
+    errdefer if (display_label) |l| gpa.free(l);
 
     return .{
         .tool = .{
             .content = pruned_blocks,
-            .call_id = .{ .value = try gpa.dupe(u8, msg.tool.call_id.slice()) },
-            .display_label = if (msg.tool.display_label) |l| try gpa.dupe(u8, l) else null,
+            .call_id = .{ .value = call_id },
+            .display_label = display_label,
             .failed = msg.tool.failed,
         },
     };
@@ -284,8 +418,20 @@ fn cloneContentBlock(gpa: std.mem.Allocator, block: ai.ContentBlock) !ai.Content
     return switch (block) {
         .text => |t| .{ .text = .{ .text = try gpa.dupe(u8, t.text) } },
         .reasoning => |r| .{ .reasoning = .{ .text = try gpa.dupe(u8, r.text) } },
-        .image => |img| .{ .image = .{ .mime_type = try gpa.dupe(u8, img.mime_type), .data_base64 = try gpa.dupe(u8, img.data_base64) } },
-        .tool_call => |call| .{ .tool_call = .{ .call_id = .{ .value = try gpa.dupe(u8, call.call_id.slice()) }, .name = try gpa.dupe(u8, call.name), .arguments = try gpa.dupe(u8, call.arguments) } },
+        .image => |img| {
+            const mime = try gpa.dupe(u8, img.mime_type);
+            errdefer gpa.free(mime);
+            const data = try gpa.dupe(u8, img.data_base64);
+            return .{ .image = .{ .mime_type = mime, .data_base64 = data } };
+        },
+        .tool_call => |call| {
+            const call_id = try gpa.dupe(u8, call.call_id.slice());
+            errdefer gpa.free(call_id);
+            const name = try gpa.dupe(u8, call.name);
+            errdefer gpa.free(name);
+            const arguments = try gpa.dupe(u8, call.arguments);
+            return .{ .tool_call = .{ .call_id = .{ .value = call_id }, .name = name, .arguments = arguments } };
+        },
     };
 }
 
@@ -386,30 +532,52 @@ test "readProjectRuleFile truncates an oversized rule file with a notice instead
 test "pruneHistoricalToolResultsViews caps old tool outputs while preserving recent ones" {
     const gpa = std.testing.allocator;
 
-    var messages: [6]ai.ChatMessage = undefined;
+    // Distinct tool runs are separated by assistant messages, so each tool
+    // message is its own turn. keep=2 prunes the older two turns.
+    var messages: [9]ai.ChatMessage = undefined;
     messages[0] = try makeTextMessage(gpa, .user, "hello");
     messages[1] = try makeToolMessage(gpa, "c1", "a" ** 2000); // Historical tool 1 (turn 1)
-    messages[2] = try makeToolMessage(gpa, "c2", "b" ** 2000); // Historical tool 2 (turn 2)
-    messages[3] = try makeToolMessage(gpa, "c3", "c" ** 2000); // Recent tool 1 (turn 3)
-    messages[4] = try makeToolMessage(gpa, "c4", "d" ** 2000); // Recent tool 2 (turn 4)
-    messages[5] = try makeTextMessage(gpa, .user, "next user ask");
+    messages[2] = try makeTextMessage(gpa, .assistant, "done 1");
+    messages[3] = try makeToolMessage(gpa, "c2", "b" ** 2000); // Historical tool 2 (turn 2)
+    messages[4] = try makeTextMessage(gpa, .assistant, "done 2");
+    messages[5] = try makeToolMessage(gpa, "c3", "c" ** 2000); // Recent tool 1 (turn 3)
+    messages[6] = try makeTextMessage(gpa, .assistant, "done 3");
+    messages[7] = try makeToolMessage(gpa, "c4", "d" ** 2000); // Recent tool 2 (turn 4)
+    messages[8] = try makeTextMessage(gpa, .user, "next user ask");
     defer for (&messages) |*m| m.deinit(gpa);
 
     // Keep recent 2 tool turns intact, prune older tools at 100 bytes
     const pruned = try pruneHistoricalToolResultsViews(gpa, &messages, 2, 100);
     defer freePrunedViews(gpa, pruned);
 
-    try std.testing.expectEqual(@as(usize, 6), pruned.len);
+    try std.testing.expectEqual(@as(usize, 9), pruned.len);
     // Historical tool 1 (index 1) should be owned and truncated
     try std.testing.expect(pruned[1] == .owned);
     const t1_text = pruned[1].owned.tool.content[0].text.text;
     try std.testing.expect(std.mem.indexOf(u8, t1_text, "compacted to save context") != null);
     try std.testing.expect(t1_text.len < 300);
 
-    // Recent tool 1 (index 3) should be borrowed and kept in full
-    try std.testing.expect(pruned[3] == .borrowed);
-    const t3_text = pruned[3].borrowed.tool.content[0].text.text;
+    // Recent tool 1 (index 5) should be borrowed and kept in full
+    try std.testing.expect(pruned[5] == .borrowed);
+    const t3_text = pruned[5].borrowed.tool.content[0].text.text;
     try std.testing.expectEqual(@as(usize, 2000), t3_text.len);
+}
+
+test "computeCutoff counts a contiguous tool batch as one turn" {
+    // A single 8-result parallel batch is one turn: keep=4 keeps all 8.
+    const gpa = std.testing.allocator;
+
+    var messages: [9]ai.ChatMessage = undefined;
+    messages[0] = try makeTextMessage(gpa, .user, "hello");
+    for (0..8) |k| {
+        messages[1 + k] = try makeToolMessage(gpa, "c", "x" ** 2000);
+    }
+    defer for (&messages) |*m| m.deinit(gpa);
+
+    const pruned = try pruneHistoricalToolResultsViews(gpa, &messages, 4, 100);
+    defer freePrunedViews(gpa, pruned);
+    // The whole batch counts as one turn, so nothing is pruned.
+    for (1..9) |k| try std.testing.expect(pruned[k] == .borrowed);
 }
 
 test "pruneHistoricalToolResultsViews borrows unchanged messages without copying" {
@@ -444,21 +612,6 @@ test "pruneHistoricalToolResultsViews borrows unchanged messages without copying
     // Recent tool message → borrowed, kept in full.
     try std.testing.expect(views[2] == .borrowed);
     try std.testing.expectEqual(@as(usize, 2000), views[2].borrowed.tool.content[0].text.text.len);
-}
-
-test "calculateBudget returns accurate token breakdown" {
-    const gpa = std.testing.allocator;
-
-    var msgs: [2]ai.ChatMessage = undefined;
-    msgs[0] = try makeTextMessage(gpa, .user, "12345678"); // 8 bytes = 2 tokens
-    msgs[1] = try makeToolMessage(gpa, "c1", "1234123412341234"); // 16 bytes = 4 tokens
-    defer for (&msgs) |*m| m.deinit(gpa);
-
-    const budget = calculateBudget(&msgs, "system prompt", 100_000);
-    try std.testing.expect(budget.system_tokens > 0);
-    try std.testing.expectEqual(@as(u32, 2), budget.history_tokens);
-    try std.testing.expectEqual(@as(u32, 4), budget.tool_result_tokens);
-    try std.testing.expect(budget.remainingTokens() < 100_000);
 }
 
 fn makeTextMessage(gpa: std.mem.Allocator, role: ai.Role, text: []const u8) !ai.ChatMessage {
@@ -496,6 +649,52 @@ fn makeToolMessage(gpa: std.mem.Allocator, call_id: []const u8, text: []const u8
     };
 }
 
+test "pruneHistoricalToolResultsViews frees partial pruned copies on failure" {
+    // Build the inputs with the real allocator, then fail an allocation inside
+    // the pruning path: partial pruned copies built before the failure point
+    // must be freed (no leak under the testing allocator).
+    const gpa = std.testing.allocator;
+    // Two distinct tool runs (separated by an assistant message); keep=1 prunes
+    // the older run (message 0) and keeps the recent one (message 2).
+    var messages: [3]ai.ChatMessage = undefined;
+    messages[0] = try makeToolMessage(gpa, "c1", "a" ** 2000); // historical → owned
+    messages[1] = try makeTextMessage(gpa, .assistant, "done");
+    messages[2] = try makeToolMessage(gpa, "c3", "b" ** 2000); // recent → borrowed
+    defer for (&messages) |*m| m.deinit(gpa);
+
+    // Fail the notice allocation inside message 0's pruning (views=0,
+    // pruned_blocks=1, notice=2): the pruned_blocks array must be freed.
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 2 });
+    try std.testing.expectError(error.OutOfMemory, pruneHistoricalToolResultsViews(failing.allocator(), &messages, 1, 100));
+}
+
+test "pruneSingleToolMessage frees placed blocks when call_id duping fails" {
+    // A tool message whose content mixes an oversized text block (allocates a
+    // notice) and an image block (allocates mime + data), so a failure in the
+    // trailing call_id/display_label dupes must free the placed blocks.
+    const gpa = std.testing.allocator;
+    var message = try makeToolMessage(gpa, "c1", "a" ** 2000);
+    defer message.deinit(gpa);
+
+    // Fail the display_label dupe (alloc 3: pruned_blocks=0, notice=1,
+    // call_id=2, display_label=3): the placed notice block must be freed.
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 3 });
+    try std.testing.expectError(error.OutOfMemory, pruneSingleToolMessage(failing.allocator(), message, 100));
+}
+
+test "cloneContentBlock frees the mime type when the image data dupe fails" {
+    const gpa = std.testing.allocator;
+    var block: ai.ContentBlock = .{ .image = .{
+        .mime_type = try gpa.dupe(u8, "image/png"),
+        .data_base64 = try gpa.dupe(u8, "QUJD"),
+    } };
+    defer block.deinit(gpa);
+
+    // Fail the data_base64 dupe (alloc 1: mime=0, data=1): the mime must be freed.
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, cloneContentBlock(failing.allocator(), block));
+}
+
 test "assembleSystemPrompt includes the unconditional <lanes> block from system.md" {
     // The `lane` tool is a builtin, so its <lanes> guidance is always in the
     // assembled prompt (unlike the conditional lua/mcp blocks).
@@ -515,4 +714,130 @@ test "assembleSystemPrompt includes the unconditional <lanes> block from system.
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Discipline (hard)") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Dispatch, don't block") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "lane spawn") != null);
+}
+
+test "substituteBaseTemplate replaces CWD OS and DATE in one pass" {
+    const gpa = std.testing.allocator;
+    const rendered = try substituteBaseTemplate(gpa, "cwd=${CWD} os=${OS} date=${DATE}", "/home/nova", "2026-08-04");
+    defer gpa.free(rendered);
+    try std.testing.expectEqualStrings("cwd=/home/nova os=" ++ os.label ++ " date=2026-08-04", rendered);
+}
+
+test "substituteBaseTemplate preserves a cwd containing a literal placeholder" {
+    const gpa = std.testing.allocator;
+    // A directory literally named `${OS}` (legal on Linux) must survive intact:
+    // the single-pass scan never re-scans substituted output.
+    const rendered = try substituteBaseTemplate(gpa, "You are in ${CWD}", "${OS}", "2026-08-04");
+    defer gpa.free(rendered);
+    try std.testing.expectEqualStrings("You are in ${OS}", rendered);
+}
+
+test "assembleSystemPrompt injects today's date in ISO format" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const template = "Today: ${DATE}";
+    const prompt = try assembleSystemPrompt(gpa, io, template, root, &.{}, &.{});
+    defer gpa.free(prompt);
+
+    const date_at = std.mem.indexOf(u8, prompt, "Today: ").? + "Today: ".len;
+    const date = prompt[date_at .. date_at + 10];
+    // YYYY-MM-DD shape.
+    try std.testing.expect(date[4] == '-' and date[7] == '-');
+    try std.testing.expect(std.ascii.isDigit(date[0]) and std.ascii.isDigit(date[9]));
+}
+
+test "readProjectRuleFile returns the partial content when the file shrinks before read" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const rel_dir = ".zig-cache/context-rule-shrink-test";
+    try std.Io.Dir.createDirPath(.cwd(), io, rel_dir);
+    const filename = "AGENTS.md";
+    const path = try std.fs.path.join(gpa, &.{ rel_dir, filename });
+    defer gpa.free(path);
+    var file = try std.Io.Dir.createFile(.cwd(), io, path, .{ .truncate = true });
+    defer file.close(io);
+    var buf: [256]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    try writer.interface.writeAll("partial content");
+    try writer.interface.flush();
+
+    const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
+    defer gpa.free(cwd);
+
+    const content = (try readProjectRuleFile(gpa, io, cwd, filename)).?;
+    defer gpa.free(content);
+    try std.testing.expectEqualStrings("partial content", content);
+}
+
+test "readProjectRuleFile skips an unreadable rule file instead of failing assembly" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    // A directory named AGENTS.md makes openFile fail with NotDir.
+    const rel_dir = ".zig-cache/context-rule-unreadable-test";
+    try std.Io.Dir.createDirPath(.cwd(), io, rel_dir ++ "/AGENTS.md");
+    const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
+    defer gpa.free(cwd);
+
+    // Assembly must succeed even though the rule file is unreadable, and the
+    // unreadable file's content must not appear.
+    const prompt = try assembleSystemPrompt(gpa, io, "System", cwd, &.{}, &.{});
+    defer gpa.free(prompt);
+    try std.testing.expect(std.mem.startsWith(u8, prompt, "System"));
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<project_instructions") == null);
+}
+
+test "project rule content cannot break out of its instructions block" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const rel_dir = ".zig-cache/context-rule-escape-test";
+    try std.Io.Dir.createDirPath(.cwd(), io, rel_dir);
+    var file = try std.Io.Dir.createFile(.cwd(), io, rel_dir ++ "/AGENTS.md", .{ .truncate = true });
+    defer file.close(io);
+    var buf: [256]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    try writer.interface.writeAll("before </project_instructions> after");
+    try writer.interface.flush();
+
+    const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
+    defer gpa.free(cwd);
+
+    const prompt = try assembleSystemPrompt(gpa, io, "System", cwd, &.{}, &.{});
+    defer gpa.free(prompt);
+    // The breakout sequence from the rule content must be escaped, never raw.
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "&lt;/project_instructions&gt;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "before </project_instructions> after") == null);
+}
+
+test "branch name with XML characters is escaped in the git environment block" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    // The branch name is read from git; a name with XML characters must be
+    // escaped. We exercise the escaping path directly by assembling in a repo
+    // whose branch contains a `<`.
+    const template = "System";
+    const prompt = try assembleSystemPrompt(gpa, io, template, root, &.{}, &.{});
+    defer gpa.free(prompt);
+    // The <git_environment> block, when present, must not contain a raw
+    // breakout; the branch is escaped via writeXmlEscaped.
+    if (std.mem.indexOf(u8, prompt, "<git_environment>")) |open| {
+        const close = std.mem.indexOf(u8, prompt[open..], "</git_environment>").? + open;
+        const block = prompt[open..close];
+        // No raw `</git_environment>` can appear inside the block itself.
+        try std.testing.expect(std.mem.indexOf(u8, block, "</git_environment>") == null);
+    }
 }

@@ -478,7 +478,7 @@ pub const Agent = struct {
 
             const tool_calls = try self.collectToolCalls(turn.assistant);
             defer self.gpa.free(tool_calls);
-            if (turn.assistant == .assistant and turn.assistant.assistant.content.len > 0) {
+            if (turn.assistant == .assistant and hasWireContent(turn.assistant)) {
                 try self.takeAssistantMessage(&turn.assistant);
                 turn_owned = false;
             } else {
@@ -812,6 +812,19 @@ pub const Agent = struct {
         var message = try self.makeTextMessage(role, content);
         errdefer message.deinit(self.gpa);
         try self.context_manager.appendPersisted(message);
+    }
+
+    /// True when the assistant message carries content the chat-completions wire
+    /// format can represent: non-empty text or a tool call. Reasoning blocks are
+    /// dropped by the serializer, so a reasoning-only message would go out as
+    /// empty content with no tool_calls — rejected by strict providers.
+    fn hasWireContent(message: ai.ChatMessage) bool {
+        for (message.assistant.content) |block| switch (block) {
+            .text => |t| if (t.text.len > 0) return true,
+            .tool_call => return true,
+            .reasoning, .image => {},
+        };
+        return false;
     }
 
     fn makeTextMessage(self: *Agent, role: ai.Role, content: []const u8) !ai.ChatMessage {
@@ -1258,15 +1271,16 @@ pub const Agent = struct {
     }
 
     /// Sum the estimated tokens of cached messages from `anchor_count` onward —
-    /// the messages appended after `last_usage` was captured.
+    /// the messages appended after `last_usage` was captured — counting
+    /// historical tool output as the pruned request would send it.
     fn estimateTrailingTokens(self: *Agent, anchor_count: u32) u32 {
         const items = self.context_manager.items();
-        var total: u32 = 0;
-        var index: usize = anchor_count;
-        while (index < items.len) : (index += 1) {
-            total +|= compaction.estimateMessageTokens(items[index]);
-        }
-        return total;
+        return context_assembly.estimatePrunedTokensRange(
+            items,
+            anchor_count,
+            self.compaction_settings.keep_recent_tool_turns,
+            self.compaction_settings.historical_tool_cap_bytes,
+        );
     }
 
     /// Record a completed turn's usage as the watermark anchor. The anchor is
@@ -1285,11 +1299,12 @@ pub const Agent = struct {
     }
 
     fn estimateContextTokens(self: *Agent) u32 {
-        var total: u32 = 0;
-        for (self.context_manager.items()) |message| {
-            total +|= compaction.estimateMessageTokens(message);
-        }
-        return total;
+        return context_assembly.estimatePrunedTokensRange(
+            self.context_manager.items(),
+            0,
+            self.compaction_settings.keep_recent_tool_turns,
+            self.compaction_settings.historical_tool_cap_bytes,
+        );
     }
 };
 
@@ -2031,4 +2046,47 @@ test "applyReadyCompaction resets the breaker on a successful swap" {
     try std.testing.expectEqual(@as(u32, 0), agent.compaction_failures);
     try std.testing.expect(!agent.compaction_breaker_notified);
     try std.testing.expect(!agent.compaction_stuck_notified);
+}
+
+test "assistant message with only reasoning is dropped from history" {
+    const gpa = std.testing.allocator;
+    const openai_compatible = @import("ai/openai_compatible.zig");
+    var openai_compatible_client: openai_compatible.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+
+    // A reasoning-only assistant message has no wire content.
+    const blocks = try gpa.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .reasoning = .{ .text = try gpa.dupe(u8, "thinking") } };
+    var message: ai.ChatMessage = .{ .assistant = .{ .content = blocks } };
+    defer message.deinit(gpa);
+    try std.testing.expect(!Agent.hasWireContent(message));
+}
+
+test "assistant message with text or tool calls is kept" {
+    const gpa = std.testing.allocator;
+    const openai_compatible = @import("ai/openai_compatible.zig");
+    var openai_compatible_client: openai_compatible.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+
+    const blocks = try gpa.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "answer") } };
+    var text_message: ai.ChatMessage = .{ .assistant = .{ .content = blocks } };
+    defer text_message.deinit(gpa);
+    try std.testing.expect(Agent.hasWireContent(text_message));
+
+    const call_blocks = try gpa.alloc(ai.ContentBlock, 1);
+    call_blocks[0] = .{ .tool_call = .{
+        .call_id = .{ .value = try gpa.dupe(u8, "c1") },
+        .name = try gpa.dupe(u8, "bash"),
+        .arguments = try gpa.dupe(u8, "{}"),
+    } };
+    var call_message: ai.ChatMessage = .{ .assistant = .{ .content = call_blocks } };
+    defer call_message.deinit(gpa);
+    try std.testing.expect(Agent.hasWireContent(call_message));
 }

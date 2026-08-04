@@ -53,9 +53,15 @@ pub const ContextManager = struct {
 
     /// Append to the cached list AND persist to the tree — the dual-write for
     /// a live conversation turn. Takes ownership of `message`.
+    ///
+    /// Persists FIRST: the tree is the source of truth. On cache-append failure
+    /// (OOM) the tree is momentarily ahead — healable via `reloadFromSession` —
+    /// whereas the reverse (cache ahead) is undetectable. The writer holds its
+    /// own serialized copy (`messageToJson`), so caller cleanup on failure never
+    /// dangles the tree.
     pub fn appendPersisted(self: *ContextManager, message: ai.ChatMessage) !void {
+        if (self.session_writer) |sw| try sw.append(message);
         try self.messages.append(self.gpa, message);
-        try self.persistLast();
     }
 
     /// Drop every non-system message, freeing it; keep the system prompt(s) so
@@ -73,12 +79,6 @@ pub const ContextManager = struct {
             }
         }
         self.messages.shrinkRetainingCapacity(kept);
-    }
-
-    fn persistLast(self: *ContextManager) !void {
-        const session_writer = self.session_writer orelse return;
-        assert(self.messages.items.len > 0);
-        try session_writer.append(self.messages.items[self.messages.items.len - 1]);
     }
 };
 
@@ -107,4 +107,70 @@ fn textMessage(gpa: std.mem.Allocator, role: ai.Role, text: []const u8) !ai.Chat
         .assistant => .{ .assistant = .{ .content = blocks } },
         .tool => error.InvalidToolRole,
     };
+}
+
+test "appendPersisted leaves the cache empty when persistence fails" {
+    // Persistence (serialization) fails with OOM: the cache must stay empty so
+    // the caller's `errdefer message.deinit` frees a message nothing references
+    // — no UAF under the testing allocator.
+    const gpa = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(gpa, .{});
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".config/nova");
+    const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_dir);
+
+    var writer: session_mod.SessionWriter = undefined;
+    try session_mod.SessionWriter.initDefault(&writer, failing.allocator(), std.testing.io, home_dir, "/tmp");
+    defer writer.deinit();
+    // Fail the first allocation of the append's serialization.
+    failing.fail_index = failing.alloc_index;
+
+    var context: ContextManager = .{ .gpa = gpa };
+    defer context.deinit();
+    context.attachSessionWriter(&writer);
+
+    var message = try textMessage(gpa, .user, "hello");
+    defer message.deinit(gpa);
+    // The serializer's allocating writer maps OOM to error.WriteFailed.
+    try std.testing.expectError(error.WriteFailed, context.appendPersisted(message));
+    try std.testing.expectEqual(@as(u32, 0), context.count());
+}
+
+test "appendPersisted persists before caching" {
+    // The writer's append succeeds (tree gains the entry) even when the cache
+    // append fails: the tree is the source of truth and stays ahead, never the
+    // cache. The message remains freeable by the caller.
+    const gpa = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".config/nova");
+    const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_dir);
+
+    var writer: session_mod.SessionWriter = undefined;
+    try session_mod.SessionWriter.initDefault(&writer, gpa, std.testing.io, home_dir, "/tmp");
+    defer writer.deinit();
+
+    var context: ContextManager = .{ .gpa = failing.allocator() };
+    defer context.deinit();
+    context.attachSessionWriter(&writer);
+
+    var message = try textMessage(gpa, .user, "hello");
+    defer message.deinit(gpa);
+    try std.testing.expectError(error.OutOfMemory, context.appendPersisted(message));
+    try std.testing.expectEqual(@as(u32, 0), context.count());
+
+    // The tree still gained the entry despite the cache append failing.
+    const persisted = try writer.messages(gpa);
+    defer {
+        for (persisted) |*m| m.deinit(gpa);
+        gpa.free(persisted);
+    }
+    try std.testing.expectEqual(@as(usize, 1), persisted.len);
+    try std.testing.expectEqual(.user, persisted[0].role());
 }
