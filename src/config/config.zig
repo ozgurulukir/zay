@@ -21,6 +21,7 @@ const provider_types = @import("provider.zig");
 const mcp_types = @import("mcp.zig");
 const plugin_types = @import("plugin.zig");
 const parse_mod = @import("parse.zig");
+const context_assembly = @import("../context/assembly.zig");
 
 // --- Provider & model re-exports ---
 
@@ -94,6 +95,14 @@ pub const CompactionSettings = struct {
     threshold: f64 = 0.75,
     /// Recent conversation tokens retained verbatim alongside the summary.
     keep_recent_tokens: u32 = 8_000,
+    /// Number of most recent tool-result turns kept in full when assembling
+    /// each prompt. Older tool results are pruned to `historical_tool_cap_bytes`
+    /// (see `context/assembly.zig`). Minimum 1.
+    keep_recent_tool_turns: u32 = context_assembly.default_keep_recent_tool_turns,
+    /// Byte cap applied to tool results older than `keep_recent_tool_turns` —
+    /// the head is kept with a "[... compacted to save context ...]" notice.
+    /// Defaults match the previous hardcoded constant in context/assembly.zig.
+    historical_tool_cap_bytes: u32 = context_assembly.default_historical_tool_cap_bytes,
 };
 
 pub const Config = struct {

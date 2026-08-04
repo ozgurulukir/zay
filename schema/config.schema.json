@@ -252,6 +252,18 @@
           "minimum": 0,
           "default": 8000,
           "description": "Recent conversation tokens retained verbatim alongside the generated summary. Scaled down proportionally for small-context models."
+        },
+        "keepRecentToolTurns": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 4,
+          "description": "Number of most recent tool-result turns kept in full when assembling each prompt. Older tool results are pruned to historicalToolCapBytes with a '[... compacted to save context ...]' notice. Raise this when an agentic turn needs earlier tool outputs in full (e.g. multi-phase skills). Minimum 1 — a value of 0 would prune every tool result and break tool-calling."
+        },
+        "historicalToolCapBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1024,
+          "description": "Byte cap applied to tool results older than keepRecentToolTurns — the head is kept followed by a '[... compacted to save context (was N bytes) ...]' notice. Raise for large command outputs the model must re-read later in the same turn."
         }
       },
       "additionalProperties": false

@@ -156,6 +156,8 @@ fn applyContextOverlay(target: *ContextSettings, updates: ContextSettings) void 
     if (updates.compaction.auto != d.auto) target.compaction.auto = updates.compaction.auto;
     if (updates.compaction.threshold != d.threshold) target.compaction.threshold = updates.compaction.threshold;
     if (updates.compaction.keep_recent_tokens != d.keep_recent_tokens) target.compaction.keep_recent_tokens = updates.compaction.keep_recent_tokens;
+    if (updates.compaction.keep_recent_tool_turns != d.keep_recent_tool_turns) target.compaction.keep_recent_tool_turns = updates.compaction.keep_recent_tool_turns;
+    if (updates.compaction.historical_tool_cap_bytes != d.historical_tool_cap_bytes) target.compaction.historical_tool_cap_bytes = updates.compaction.historical_tool_cap_bytes;
 }
 
 /// After applying legacy-field updates, mirror the changes onto
@@ -628,6 +630,15 @@ fn parseCompaction(value: std.json.Value) CompactionSettings {
     }
     if (intField(value, "keepRecentTokens")) |v| {
         if (v >= 0) comp.keep_recent_tokens = @intCast(v);
+    }
+    if (intField(value, "keepRecentToolTurns")) |v| {
+        // Minimum 1: 0 would prune every tool result immediately and break
+        // tool-calling (the model would never see a result in full).
+        if (v >= 1) comp.keep_recent_tool_turns = @intCast(v);
+    }
+    if (intField(value, "historicalToolCapBytes")) |v| {
+        // Minimum 1: a 0 cap would render every pruned result empty.
+        if (v >= 1) comp.historical_tool_cap_bytes = @intCast(v);
     }
     return comp;
 }
@@ -1148,6 +1159,8 @@ fn hasNonDefaultContext(ctx: ContextSettings) bool {
     if (ctx.compaction.auto != d.compaction.auto) return true;
     if (ctx.compaction.threshold != d.compaction.threshold) return true;
     if (ctx.compaction.keep_recent_tokens != d.compaction.keep_recent_tokens) return true;
+    if (ctx.compaction.keep_recent_tool_turns != d.compaction.keep_recent_tool_turns) return true;
+    if (ctx.compaction.historical_tool_cap_bytes != d.compaction.historical_tool_cap_bytes) return true;
     return false;
 }
 
@@ -1190,6 +1203,15 @@ fn writeCompaction(writer: *std.Io.Writer, comp: CompactionSettings) !void {
     {
         try writeKeyNoIndent(writer, "keepRecentTokens", &wrote_any);
         try writer.print("{d}", .{comp.keep_recent_tokens});
+    }
+    const d: CompactionSettings = .{};
+    if (comp.keep_recent_tool_turns != d.keep_recent_tool_turns) {
+        try writeKeyNoIndent(writer, "keepRecentToolTurns", &wrote_any);
+        try writer.print("{d}", .{comp.keep_recent_tool_turns});
+    }
+    if (comp.historical_tool_cap_bytes != d.historical_tool_cap_bytes) {
+        try writeKeyNoIndent(writer, "historicalToolCapBytes", &wrote_any);
+        try writer.print("{d}", .{comp.historical_tool_cap_bytes});
     }
     try writer.writeByte('}');
 }
@@ -2296,7 +2318,7 @@ test "parseObject: context with compaction settings" {
     var sink: std.ArrayList(Diagnostic) = .empty;
     defer sink.deinit(gpa);
     const json =
-        \\{"context":{"overrideContextWindow":32000,"maxOutputTokens":4096,"compaction":{"auto":false,"threshold":0.80,"keepRecentTokens":5000}}}
+        \\{"context":{"overrideContextWindow":32000,"maxOutputTokens":4096,"compaction":{"auto":false,"threshold":0.80,"keepRecentTokens":5000,"keepRecentToolTurns":8,"historicalToolCapBytes":8192}}}
     ;
     var cfg = try parseFile(gpa, "<test>", json, &sink);
     defer cfg.deinit(gpa);
@@ -2305,6 +2327,8 @@ test "parseObject: context with compaction settings" {
     try std.testing.expectEqual(false, cfg.context.compaction.auto);
     try std.testing.expectApproxEqAbs(@as(f64, 0.80), cfg.context.compaction.threshold, 0.001);
     try std.testing.expectEqual(@as(u32, 5_000), cfg.context.compaction.keep_recent_tokens);
+    try std.testing.expectEqual(@as(u32, 8), cfg.context.compaction.keep_recent_tool_turns);
+    try std.testing.expectEqual(@as(u32, 8_192), cfg.context.compaction.historical_tool_cap_bytes);
 }
 
 test "parseObject: context defaults when absent" {
@@ -2318,6 +2342,27 @@ test "parseObject: context defaults when absent" {
     try std.testing.expectEqual(true, cfg.context.compaction.auto);
     try std.testing.expectApproxEqAbs(@as(f64, 0.75), cfg.context.compaction.threshold, 0.001);
     try std.testing.expectEqual(@as(u32, 8_000), cfg.context.compaction.keep_recent_tokens);
+    try std.testing.expectEqual(@as(u32, 4), cfg.context.compaction.keep_recent_tool_turns);
+    try std.testing.expectEqual(@as(u32, 1_024), cfg.context.compaction.historical_tool_cap_bytes);
+}
+
+test "parseCompaction clamps pruning knobs to their minimum" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+
+    // Below minimum (0): keep the defaults — 0 turns would prune every tool
+    // result and a 0-byte cap would render pruned results empty.
+    var zero = try parseFile(gpa, "<test>", "{\"context\":{\"compaction\":{\"keepRecentToolTurns\":0,\"historicalToolCapBytes\":0}}}", &sink);
+    defer zero.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 4), zero.context.compaction.keep_recent_tool_turns);
+    try std.testing.expectEqual(@as(u32, 1_024), zero.context.compaction.historical_tool_cap_bytes);
+
+    // Minimum 1 passes through.
+    var min = try parseFile(gpa, "<test>", "{\"context\":{\"compaction\":{\"keepRecentToolTurns\":1,\"historicalToolCapBytes\":1}}}", &sink);
+    defer min.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 1), min.context.compaction.keep_recent_tool_turns);
+    try std.testing.expectEqual(@as(u32, 1), min.context.compaction.historical_tool_cap_bytes);
 }
 
 test "parseObject: compaction threshold clamped to valid range" {
@@ -2403,7 +2448,7 @@ test "serialize then parse roundtrips with camelCase and context" {
         .model = .{ .id = try gpa.dupe(u8, "llama3.1:8b") },
         .context = .{
             .override_context_window = 16_000,
-            .compaction = .{ .auto = false, .keep_recent_tokens = 4_000 },
+            .compaction = .{ .auto = false, .keep_recent_tokens = 4_000, .keep_recent_tool_turns = 6, .historical_tool_cap_bytes = 4_096 },
         },
     };
     defer original.deinit(gpa);
@@ -2425,6 +2470,8 @@ test "serialize then parse roundtrips with camelCase and context" {
     try std.testing.expectEqual(@as(u32, 16_000), roundtrip.context.override_context_window.?);
     try std.testing.expectEqual(false, roundtrip.context.compaction.auto);
     try std.testing.expectEqual(@as(u32, 4_000), roundtrip.context.compaction.keep_recent_tokens);
+    try std.testing.expectEqual(@as(u32, 6), roundtrip.context.compaction.keep_recent_tool_turns);
+    try std.testing.expectEqual(@as(u32, 4_096), roundtrip.context.compaction.historical_tool_cap_bytes);
 }
 
 test "parseSemverMajor extracts major from various formats" {
@@ -2454,11 +2501,13 @@ test "applyContextOverlay merges non-default values" {
     var target: ContextSettings = .{};
     const updates: ContextSettings = .{
         .override_context_window = 64_000,
-        .compaction = .{ .threshold = 0.90 },
+        .compaction = .{ .threshold = 0.90, .keep_recent_tool_turns = 10, .historical_tool_cap_bytes = 16_384 },
     };
     applyContextOverlay(&target, updates);
     try std.testing.expectEqual(@as(u32, 64_000), target.override_context_window.?);
     try std.testing.expectApproxEqAbs(@as(f64, 0.90), target.compaction.threshold, 0.001);
+    try std.testing.expectEqual(@as(u32, 10), target.compaction.keep_recent_tool_turns);
+    try std.testing.expectEqual(@as(u32, 16_384), target.compaction.historical_tool_cap_bytes);
     // Defaults preserved for fields not in updates.
     try std.testing.expectEqual(true, target.compaction.auto);
     try std.testing.expectEqual(@as(u32, 8_000), target.compaction.keep_recent_tokens);

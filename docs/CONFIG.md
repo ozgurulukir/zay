@@ -62,7 +62,9 @@ JSON keys are **camelCase**. Legacy snake_case keys from schema v1 are still acc
     "compaction": {
       "auto": true,
       "threshold": 0.75,
-      "keepRecentTokens": 8000
+      "keepRecentTokens": 8000,
+      "keepRecentToolTurns": 4,
+      "historicalToolCapBytes": 1024
     }
   },
   "providers": {
@@ -117,8 +119,10 @@ The `context` object controls context window management and automatic summarizat
 | `context.compaction.auto`             | `boolean` | `true`   | Enable automatic context compaction before reaching limits.                                                                                                  |
 | `context.compaction.threshold`        | `number`  | `0.75`   | Fraction of context window (0.1–0.9) that triggers background summarization. The swap watermark is derived as `threshold + 0.20` (capped at 0.95); values above 0.9 are clamped at parse time so the swap watermark never falls below the start watermark. |
 | `context.compaction.keepRecentTokens` | `integer` | `8000`   | Recent conversation tokens retained verbatim alongside the generated summary. Scaled down proportionally for small-context models (35% of window, min 1000). When real provider usage outruns the chars/4 estimate (CJK text), the budget is shrunk by the measured ratio so compaction still lands below the swap watermark. |
+| `context.compaction.keepRecentToolTurns` | `integer` | `4`   | Number of most recent tool-result turns kept in full when assembling each prompt. Older tool results are pruned to `historicalToolCapBytes` with a `[... compacted to save context ...]` notice. Raise this when an agentic turn needs earlier tool outputs in full (e.g. multi-phase skills like `tci-bfg` that fire dozens of commands). Minimum 1 — a value of 0 would prune every tool result and break tool-calling. |
+| `context.compaction.historicalToolCapBytes` | `integer` | `1024` | Byte cap applied to tool results older than `keepRecentToolTurns` — the head is kept followed by a `[... compacted to save context (was N bytes) ...]` notice. Raise for large command outputs the model must re-read later in the same turn. |
 
-**Example — local Ollama with aggressive compaction:**
+**Example — local Ollama with aggressive compaction and lenient tool-result pruning:**
 
 ```json
 {
@@ -126,7 +130,9 @@ The `context` object controls context window management and automatic summarizat
     "overrideContextWindow": 8192,
     "compaction": {
       "threshold": 0.6,
-      "keepRecentTokens": 3000
+      "keepRecentTokens": 3000,
+      "keepRecentToolTurns": 12,
+      "historicalToolCapBytes": 8192
     }
   }
 }

@@ -19,9 +19,12 @@ const vcs = @import("../vcs.zig");
 
 const assert = std.debug.assert;
 
-/// Default byte limit per historical tool result when pruned.
+/// Default byte limit per historical tool result when pruned. Mirrored as the
+/// `config.CompactionSettings.historical_tool_cap_bytes` default (`context.compaction.historicalToolCapBytes`).
 pub const default_historical_tool_cap_bytes: u32 = 1024;
 /// Number of recent tool result turns kept in full before historical pruning kicks in.
+/// Mirrored as the `config.CompactionSettings.keep_recent_tool_turns` default
+/// (`context.compaction.keepRecentToolTurns`).
 pub const default_keep_recent_tool_turns: u32 = 4;
 /// Maximum bytes allowed per individual @-mention text file inlining.
 pub const default_per_file_mention_max_bytes: usize = 64 * 1024;
