@@ -395,5 +395,8 @@ pub fn createRuntime(app: *App, cwd: []const u8, session_dir: []const u8, sessio
     runtime.agent.tool_registry = app.tool_registry;
     runtime.agent.plugin_manager = &app.plugin_manager;
     runtime.agent.lane_bridge = app.lane_bridge;
+    // Every lane's requests gate on the App's shared limiter, so the provider
+    // sees at most `maxConcurrentRequests` in flight across all lanes.
+    runtime.agent.request_limiter = app.request_limiter;
     return runtime;
 }

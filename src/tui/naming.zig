@@ -10,6 +10,7 @@
 const std = @import("std");
 
 const ai = @import("../ai.zig");
+const request_limiter_mod = @import("../request_limiter.zig");
 
 /// Per-message excerpt cap when building the prompt — naming only needs the
 /// gist, not whole pasted files.
@@ -18,10 +19,17 @@ pub const branch_slug_max: usize = 40;
 
 pub const BranchJob = struct {
     gpa: std.mem.Allocator,
+    /// The shared `std.Io` — needed for the limiter's I/O-condition wait on
+    /// the naming thread (the client owns no exposed io handle).
+    io: std.Io,
     /// The lane runtime's dedicated naming client (`.none` resolves to no
     /// name). Borrowed — the App cancels this job before the client's runtime
     /// is torn down or reconnected.
     client: ai.LanguageModel,
+    /// The app-wide concurrency limiter, borrowed (null = no gate). The naming
+    /// request fires concurrently with the lane's first turn request, so it
+    /// must share the same provider budget or the cap is meaningless.
+    limiter: ?*request_limiter_mod.RequestLimiter = null,
     /// Recent parent-lane messages (oldest first). Owned.
     context: [][]u8,
     /// The lane's first prompt. Owned.
@@ -80,7 +88,13 @@ fn requestSlug(gpa: std.mem.Allocator, job: *BranchJob) !?[]u8 {
     var message: ai.ChatMessage = .{ .user = .{ .content = blocks } };
     defer message.deinit(gpa);
 
-    var turn = try job.client.prompt(&.{.{ .borrowed = &message }}, ai.streamNoop());
+    // The naming future is cancelled via `future.cancel`, which aborts the
+    // limiter's I/O-condition wait — same interrupt semantics as the turn gate.
+    var turn = if (job.limiter) |limiter| blk: {
+        try limiter.acquire(job.io);
+        defer limiter.release(job.io);
+        break :blk try job.client.prompt(&.{.{ .borrowed = &message }}, ai.streamNoop());
+    } else try job.client.prompt(&.{.{ .borrowed = &message }}, ai.streamNoop());
     defer turn.deinit(gpa);
 
     var out: std.ArrayList(u8) = .empty;

@@ -227,6 +227,12 @@
           "default": 300,
           "description": "Socket read timeout in seconds for streaming responses. Prevents indefinite hangs when the server stops mid-stream."
         },
+        "maxConcurrentRequests": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 2,
+          "description": "Maximum number of LLM requests in flight across ALL lanes at once. Each lane runs its own worker + HTTP client, so without this cap N active lanes fire N independent requests at the provider, which degrades or rate-limits the burst. 1 serializes requests."
+        },
         "compaction": { "$ref": "#/$defs/CompactionSettings" }
       },
       "additionalProperties": false

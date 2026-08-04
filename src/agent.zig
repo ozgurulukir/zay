@@ -10,6 +10,7 @@ const context_mod = @import("context/manager.zig");
 const context_assembly = @import("context/assembly.zig");
 const executor_mod = @import("executor.zig");
 const lane_bridge = @import("tools/lane_bridge.zig");
+const request_limiter_mod = @import("request_limiter.zig");
 const lua_mod = @import("lua/root.zig");
 const mcp_mod = @import("mcp/manager.zig");
 const session_mod = @import("session.zig");
@@ -101,6 +102,11 @@ pub const Agent = struct {
     /// `config.context.compaction`; defaults match the old hardcoded
     /// constants so agents created without a config still compact.
     compaction_settings: config_mod.CompactionSettings = .{},
+    /// Process-wide cap on concurrent LLM requests to the provider, shared by
+    /// every lane's agent. Borrowed from the App (never freed here); null in
+    /// headless/tests = no gate. Acquired around each `client.prompt` so at
+    /// most `permits` requests are in flight at once (see `request_limiter.zig`).
+    request_limiter: ?*request_limiter_mod.RequestLimiter = null,
     /// Consecutive background-compaction failures. The automatic path
     /// disables itself (emitting one notice) once this reaches
     /// `compaction_failure_limit`; `/compact` stays available (TD-6).
@@ -450,7 +456,16 @@ pub const Agent = struct {
             );
             defer context_assembly.freePrunedViews(self.gpa, prompt_messages);
 
-            var turn = try self.client.prompt(prompt_messages, stream_context.observer());
+            // A permit is held only for the request itself (not across tool
+            // execution), so a long bash call on one lane never head-of-line
+            // blocks another lane's next request. Retries inside `prompt` hold
+            // the permit too, so lanes can't retry-burst the provider together.
+            const limiter = self.request_limiter;
+            var turn = blk: {
+                if (limiter) |lim| try lim.acquire(self.io);
+                defer if (limiter) |lim| lim.release(self.io);
+                break :blk try self.client.prompt(prompt_messages, stream_context.observer());
+            };
             const usage = turn.usage;
             var turn_owned = true;
             defer if (turn_owned) turn.deinit(self.gpa);
@@ -1118,7 +1133,9 @@ pub const Agent = struct {
         self.compactor.result = null;
         self.compactor.job = .{
             .gpa = self.gpa,
+            .io = self.io,
             .client = self.compaction_client,
+            .limiter = self.request_limiter,
             .first_kept_id = cut.first_kept_id,
             .prefix_text = cut.prefix_text,
         };
@@ -1335,6 +1352,30 @@ test "streaming callbacks emit owned events" {
     try std.testing.expectEqual(.delta_end, seen.events.items[3]);
     try std.testing.expect(context.toolDeltaSeen(1));
     try std.testing.expect(!context.toolDeltaSeen(0));
+}
+
+test "run gates the request on the limiter and releases on the error path" {
+    const gpa = std.testing.allocator;
+    const openai_compatible = @import("ai/openai_compatible.zig");
+    var client: openai_compatible.Client = undefined;
+    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer client.deinit();
+
+    var agent = Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &client });
+    defer agent.deinit();
+
+    var limiter: request_limiter_mod.RequestLimiter = .{ .permits = 1 };
+    agent.request_limiter = &limiter;
+
+    var noop: NoopListener = .{};
+    const listener: Agent.Listener(NoopListener) = .{
+        .ctx = &noop,
+        .on_event = NoopListener.onEvent,
+    };
+    // Dead server → the request fails after its retries; the labeled-block
+    // `defer` must have released the permit, so none leaks on the error path.
+    try std.testing.expectError(error.ConnectionFailed, agent.run(listener));
+    try std.testing.expectEqual(@as(u32, 0), limiter.in_flight);
 }
 
 test "queued user messages wait for completed assistant turn" {
@@ -1729,7 +1770,9 @@ test "pollManualCompact: a failed summarizer surfaces CompactionFailed and clear
     // return the compactor to idle without leaking the result slot.
     agent.compactor.job = .{
         .gpa = gpa,
+        .io = std.testing.io,
         .client = .{ .openai_compatible = &client },
+        .limiter = null,
         .first_kept_id = undefined, // never read on the failure path
         .prefix_text = try gpa.dupe(u8, "some prefix"),
     };
@@ -1855,7 +1898,9 @@ test "drain joins a running summarizer that fails against a dead server" {
     // the compactor to idle without leaking the result slot (TD-1).
     agent.compactor.job = .{
         .gpa = gpa,
+        .io = std.testing.io,
         .client = .{ .openai_compatible = &client },
+        .limiter = null,
         .first_kept_id = undefined, // never read on the failure path
         .prefix_text = try gpa.dupe(u8, "some prefix"),
     };

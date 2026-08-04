@@ -152,6 +152,7 @@ fn applyContextOverlay(target: *ContextSettings, updates: ContextSettings) void 
     if (updates.max_output_tokens != null) target.max_output_tokens = updates.max_output_tokens;
     if (updates.max_parallel_tool_calls != null) target.max_parallel_tool_calls = updates.max_parallel_tool_calls;
     if (updates.request_timeout_seconds != null) target.request_timeout_seconds = updates.request_timeout_seconds;
+    if (updates.max_concurrent_requests != null) target.max_concurrent_requests = updates.max_concurrent_requests;
     const d: CompactionSettings = .{};
     if (updates.compaction.auto != d.auto) target.compaction.auto = updates.compaction.auto;
     if (updates.compaction.threshold != d.threshold) target.compaction.threshold = updates.compaction.threshold;
@@ -609,6 +610,9 @@ fn parseContext(value: std.json.Value) ContextSettings {
     }
     if (intField(value, "requestTimeoutSeconds")) |v| {
         if (v >= 1) ctx.request_timeout_seconds = @intCast(v);
+    }
+    if (intField(value, "maxConcurrentRequests")) |v| {
+        if (v >= 1) ctx.max_concurrent_requests = @intCast(v);
     }
     if (value.object.get("compaction")) |comp_val| {
         if (comp_val == .object) ctx.compaction = parseCompaction(comp_val);
@@ -1156,6 +1160,7 @@ fn hasNonDefaultContext(ctx: ContextSettings) bool {
     if (ctx.max_output_tokens != null) return true;
     if (ctx.max_parallel_tool_calls != null) return true;
     if (ctx.request_timeout_seconds != null) return true;
+    if (ctx.max_concurrent_requests != null) return true;
     if (ctx.compaction.auto != d.compaction.auto) return true;
     if (ctx.compaction.threshold != d.compaction.threshold) return true;
     if (ctx.compaction.keep_recent_tokens != d.compaction.keep_recent_tokens) return true;
@@ -1181,6 +1186,10 @@ fn writeContext(writer: *std.Io.Writer, ctx: ContextSettings) !void {
     }
     if (ctx.request_timeout_seconds) |v| {
         try writeKeyNoIndent(writer, "requestTimeoutSeconds", &wrote_any);
+        try writer.print("{d}", .{v});
+    }
+    if (ctx.max_concurrent_requests) |v| {
+        try writeKeyNoIndent(writer, "maxConcurrentRequests", &wrote_any);
         try writer.print("{d}", .{v});
     }
     // Compaction: always written when context is present.
@@ -2318,12 +2327,13 @@ test "parseObject: context with compaction settings" {
     var sink: std.ArrayList(Diagnostic) = .empty;
     defer sink.deinit(gpa);
     const json =
-        \\{"context":{"overrideContextWindow":32000,"maxOutputTokens":4096,"compaction":{"auto":false,"threshold":0.80,"keepRecentTokens":5000,"keepRecentToolTurns":8,"historicalToolCapBytes":8192}}}
+        \\{"context":{"overrideContextWindow":32000,"maxOutputTokens":4096,"maxConcurrentRequests":3,"compaction":{"auto":false,"threshold":0.80,"keepRecentTokens":5000,"keepRecentToolTurns":8,"historicalToolCapBytes":8192}}}
     ;
     var cfg = try parseFile(gpa, "<test>", json, &sink);
     defer cfg.deinit(gpa);
     try std.testing.expectEqual(@as(u32, 32_000), cfg.context.override_context_window.?);
     try std.testing.expectEqual(@as(u32, 4_096), cfg.context.max_output_tokens.?);
+    try std.testing.expectEqual(@as(u32, 3), cfg.context.max_concurrent_requests.?);
     try std.testing.expectEqual(false, cfg.context.compaction.auto);
     try std.testing.expectApproxEqAbs(@as(f64, 0.80), cfg.context.compaction.threshold, 0.001);
     try std.testing.expectEqual(@as(u32, 5_000), cfg.context.compaction.keep_recent_tokens);
@@ -2339,6 +2349,7 @@ test "parseObject: context defaults when absent" {
     defer cfg.deinit(gpa);
     try std.testing.expectEqual(@as(?u32, null), cfg.context.override_context_window);
     try std.testing.expectEqual(@as(?u32, null), cfg.context.max_output_tokens);
+    try std.testing.expectEqual(@as(?u32, null), cfg.context.max_concurrent_requests);
     try std.testing.expectEqual(true, cfg.context.compaction.auto);
     try std.testing.expectApproxEqAbs(@as(f64, 0.75), cfg.context.compaction.threshold, 0.001);
     try std.testing.expectEqual(@as(u32, 8_000), cfg.context.compaction.keep_recent_tokens);
@@ -2363,6 +2374,23 @@ test "parseCompaction clamps pruning knobs to their minimum" {
     defer min.deinit(gpa);
     try std.testing.expectEqual(@as(u32, 1), min.context.compaction.keep_recent_tool_turns);
     try std.testing.expectEqual(@as(u32, 1), min.context.compaction.historical_tool_cap_bytes);
+}
+
+test "parseContext clamps maxConcurrentRequests to its minimum" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+
+    // Below minimum (0): keep the default (null) — a 0 cap would deadlock
+    // every request behind the limiter.
+    var zero = try parseFile(gpa, "<test>", "{\"context\":{\"maxConcurrentRequests\":0}}", &sink);
+    defer zero.deinit(gpa);
+    try std.testing.expectEqual(@as(?u32, null), zero.context.max_concurrent_requests);
+
+    // Minimum 1 passes through.
+    var min = try parseFile(gpa, "<test>", "{\"context\":{\"maxConcurrentRequests\":1}}", &sink);
+    defer min.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 1), min.context.max_concurrent_requests.?);
 }
 
 test "parseObject: compaction threshold clamped to valid range" {
@@ -2448,6 +2476,7 @@ test "serialize then parse roundtrips with camelCase and context" {
         .model = .{ .id = try gpa.dupe(u8, "llama3.1:8b") },
         .context = .{
             .override_context_window = 16_000,
+            .max_concurrent_requests = 3,
             .compaction = .{ .auto = false, .keep_recent_tokens = 4_000, .keep_recent_tool_turns = 6, .historical_tool_cap_bytes = 4_096 },
         },
     };
@@ -2468,6 +2497,7 @@ test "serialize then parse roundtrips with camelCase and context" {
     try std.testing.expectEqualStrings("llama3.1:8b", roundtrip.model.?.id);
     try std.testing.expectEqual(false, roundtrip.use_responses_endpoint.?);
     try std.testing.expectEqual(@as(u32, 16_000), roundtrip.context.override_context_window.?);
+    try std.testing.expectEqual(@as(u32, 3), roundtrip.context.max_concurrent_requests.?);
     try std.testing.expectEqual(false, roundtrip.context.compaction.auto);
     try std.testing.expectEqual(@as(u32, 4_000), roundtrip.context.compaction.keep_recent_tokens);
     try std.testing.expectEqual(@as(u32, 6), roundtrip.context.compaction.keep_recent_tool_turns);
@@ -2501,10 +2531,12 @@ test "applyContextOverlay merges non-default values" {
     var target: ContextSettings = .{};
     const updates: ContextSettings = .{
         .override_context_window = 64_000,
+        .max_concurrent_requests = 4,
         .compaction = .{ .threshold = 0.90, .keep_recent_tool_turns = 10, .historical_tool_cap_bytes = 16_384 },
     };
     applyContextOverlay(&target, updates);
     try std.testing.expectEqual(@as(u32, 64_000), target.override_context_window.?);
+    try std.testing.expectEqual(@as(u32, 4), target.max_concurrent_requests.?);
     try std.testing.expectApproxEqAbs(@as(f64, 0.90), target.compaction.threshold, 0.001);
     try std.testing.expectEqual(@as(u32, 10), target.compaction.keep_recent_tool_turns);
     try std.testing.expectEqual(@as(u32, 16_384), target.compaction.historical_tool_cap_bytes);

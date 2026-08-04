@@ -104,6 +104,12 @@ pub fn deinitApp(self: *App) void {
         self.gpa.destroy(bridge);
         self.lane_bridge = null;
     }
+    // Same: every worker was joined above, so none can still hold a permit —
+    // safe to destroy the shared limiter.
+    if (self.request_limiter) |limiter| {
+        self.gpa.destroy(limiter);
+        self.request_limiter = null;
+    }
     self.* = undefined;
 }
 

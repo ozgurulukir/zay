@@ -116,6 +116,7 @@ The `context` object controls context window management and automatic summarizat
 | ------------------------------------- | --------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `context.overrideContextWindow`       | `integer` | _(auto)_ | Explicit context window in tokens. Overrides the model catalogue lookup — useful for local Ollama/LMStudio models with non-standard windows. Minimum 1024.   |
 | `context.maxOutputTokens`             | `integer` | _(auto)_ | Maximum tokens per single model generation turn.                                                                                                             |
+| `context.maxConcurrentRequests`       | `integer` | `2`      | Cap on LLM requests in flight across ALL lanes at once. Each lane runs its own worker + HTTP client, so without this cap N active lanes fire N independent requests at the provider, which degrades or rate-limits the burst (every lane slows down together). Minimum 1 — a value of 0 would deadlock every request. Set `1` to serialize requests; raise it only if your provider handles more concurrent streams without degrading. |
 | `context.compaction.auto`             | `boolean` | `true`   | Enable automatic context compaction before reaching limits.                                                                                                  |
 | `context.compaction.threshold`        | `number`  | `0.75`   | Fraction of context window (0.1–0.9) that triggers background summarization. The swap watermark is derived as `threshold + 0.20` (capped at 0.95); values above 0.9 are clamped at parse time so the swap watermark never falls below the start watermark. |
 | `context.compaction.keepRecentTokens` | `integer` | `8000`   | Recent conversation tokens retained verbatim alongside the generated summary. Scaled down proportionally for small-context models (35% of window, min 1000). When real provider usage outruns the chars/4 estimate (CJK text), the budget is shrunk by the measured ratio so compaction still lands below the swap watermark. |
@@ -128,6 +129,7 @@ The `context` object controls context window management and automatic summarizat
 {
   "context": {
     "overrideContextWindow": 8192,
+    "maxConcurrentRequests": 2,
     "compaction": {
       "threshold": 0.6,
       "keepRecentTokens": 3000,

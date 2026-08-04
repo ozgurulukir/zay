@@ -65,6 +65,12 @@ pub const globalConfigPath = parse_mod.globalConfigPath;
 
 // --- Types owned by this file ---
 
+/// Default cap on concurrent LLM requests across all lanes when the config
+/// knob is unset. Single lane (1 request at a time) is unaffected; 2 lets a
+/// lane stream while bounding the burst that saturates the provider. Mirrors
+/// `request_limiter.default_permits`.
+pub const default_max_concurrent_requests: u32 = 2;
+
 /// Context window management and automatic compaction policy.
 /// Serialized as `"context"` in JSON (camelCase keys inside).
 pub const ContextSettings = struct {
@@ -79,6 +85,12 @@ pub const ContextSettings = struct {
     /// Socket read timeout in seconds for streaming responses.
     /// Prevents indefinite hangs when the server stops mid-stream.
     request_timeout_seconds: ?u32 = null,
+    /// Maximum number of LLM requests in flight across ALL lanes at once.
+    /// Lanes each run their own worker + HTTP client, so without this cap N
+    /// active lanes fire N independent requests at the provider, which
+    /// degrades or rate-limits the burst (every lane slows down together).
+    /// Null = `default_max_concurrent_requests`. 1 serializes requests.
+    max_concurrent_requests: ?u32 = null,
     compaction: CompactionSettings = .{},
 };
 

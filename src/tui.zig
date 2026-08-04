@@ -10,6 +10,7 @@ pub const BackgroundDelivery = app_state.BackgroundModalState.BackgroundDelivery
 pub const Agent = agent_mod.Agent;
 pub const lane_bridge_mod = @import("tools/lane_bridge.zig");
 const pytools = @import("pytools.zig");
+const request_limiter_mod = @import("request_limiter.zig");
 const bash_mod = @import("tools/bash_exec.zig");
 const search_mod = @import("search.zig");
 const auth = @import("auth/store.zig");
@@ -211,6 +212,13 @@ pub const App = struct {
     /// destroyed in `deinitApp` (after every lane's turn future is cancelled,
     /// which wakes any worker blocked on the bridge). See `tools/lane_bridge.zig`.
     lane_bridge: ?*lane_bridge_mod.LaneBridge = null,
+    /// App-wide cap on concurrent LLM requests to the provider, shared by every
+    /// lane's agent (turn, naming, and compaction requests all gate on it).
+    /// Heap-allocated so its address stays stable while worker threads block
+    /// on it; sized from `config.context.maxConcurrentRequests`; freed in
+    /// `deinitApp` (after every lane's turn future is cancelled, which wakes
+    /// any worker blocked on the limiter). See `request_limiter.zig`.
+    request_limiter: ?*request_limiter_mod.RequestLimiter = null,
     /// Single source of truth for tools: builtin slice + plugin tools
     /// appended at runtime through `registerPluginTools`. Heap-allocated so
     /// its address stays put while agents borrow it; freed in `deinit`.
@@ -240,6 +248,9 @@ pub const App = struct {
         // `create` allocates raw bytes — the mutex/condition must be
         // initialized to their `.init` values or the first lock waits forever.
         bridge.* = .{};
+        const limiter = try gpa.create(request_limiter_mod.RequestLimiter);
+        errdefer gpa.destroy(limiter);
+        limiter.* = .{};
         return .{
             .io = io,
             .gpa = gpa,
@@ -251,6 +262,7 @@ pub const App = struct {
             .plugin_manager = lua_mod.PluginManager.init(gpa, io, "", ""),
             .tool_registry = registry,
             .lane_bridge = bridge,
+            .request_limiter = limiter,
         };
     }
 
@@ -264,6 +276,11 @@ pub const App = struct {
         var app = try init(io, gpa, &runtime.agent);
         app.cached_config = config;
         app.environ_map = environ_map;
+        // Size the shared request limiter from the config knob (default 2 —
+        // single lane is unaffected; 2 bounds the multi-lane burst).
+        if (app.request_limiter) |limiter| {
+            limiter.setPermits(io, config.context.max_concurrent_requests orelse config_mod.default_max_concurrent_requests);
+        }
         app.mcp_manager.syncFromConfig(io, &app.cached_config) catch {};
         // The placeholder plugin_manager from `App.init` was built with
         // empty `home_dir`/`cwd` (the runtime values weren't available
@@ -1114,6 +1131,7 @@ pub fn run(
     runtime.agent.tool_registry = app.tool_registry;
     runtime.agent.plugin_manager = &app.plugin_manager;
     runtime.agent.lane_bridge = app.lane_bridge;
+    runtime.agent.request_limiter = app.request_limiter;
     app.bindInputCallbacks();
     defer app.deinit();
 

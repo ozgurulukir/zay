@@ -261,7 +261,9 @@ pub fn scheduleLaneNaming(app: *App, lane: *Thread, first_message: []const u8) !
     const job = try app.gpa.create(naming_mod.BranchJob);
     job.* = .{
         .gpa = app.gpa,
+        .io = app.io,
         .client = runtime.naming_client,
+        .limiter = app.request_limiter,
         .context = lane.parent_context,
         .first_message = first,
         .done = &lane.naming_done,

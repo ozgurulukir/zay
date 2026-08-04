@@ -12,6 +12,7 @@ const logger = @import("logger");
 const ai = @import("../ai.zig");
 const compaction = @import("../context/compaction.zig");
 const session_mod = @import("../session.zig");
+const request_limiter_mod = @import("../request_limiter.zig");
 
 const assert = std.debug.assert;
 
@@ -28,7 +29,14 @@ const State = enum(u8) { idle, running, ready, failed };
 /// prefix to summarize and the entry the kept history resumes from.
 const Job = struct {
     gpa: std.mem.Allocator,
+    /// The shared `std.Io` — needed for the limiter's I/O-condition wait on
+    /// the summarizer thread (the client owns no exposed io handle).
+    io: std.Io,
     client: ai.LanguageModel,
+    /// The app-wide concurrency limiter, borrowed (null = no gate). Keeps the
+    /// summarizer request inside the same at-most-`permits` provider budget as
+    /// turn and naming requests.
+    limiter: ?*request_limiter_mod.RequestLimiter,
     first_kept_id: session_mod.EntryId,
     prefix_text: []u8,
 };
@@ -62,7 +70,11 @@ pub fn runThread(compactor: *Compactor) void {
 fn produceStoredSummary(job: Job) ![]u8 {
     // Validate input before summarization.
     assert(job.prefix_text.len > 0);
-    const summary = try compaction.summarize(job.gpa, job.client, job.prefix_text);
+    const summary = if (job.limiter) |limiter| blk: {
+        try limiter.acquire(job.io);
+        defer limiter.release(job.io);
+        break :blk try compaction.summarize(job.gpa, job.client, job.prefix_text);
+    } else try compaction.summarize(job.gpa, job.client, job.prefix_text);
     defer job.gpa.free(summary);
     if (summary.len == 0) return error.EmptySummary;
     return compaction.buildStoredSummary(job.gpa, summary);
