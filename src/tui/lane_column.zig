@@ -31,8 +31,12 @@ pub fn drawLaneColumn(app: *App, ctx: vxfw.DrawContext, lane: *Thread, width: u1
     const title = if (lane.title) |t| t else "untitled";
     // Active-view marker (●/○) + turn-state marker (S14): a spinner frame
     // while the lane's turn is running, a stop glyph while interrupting, a
-    // quiet dot when idle.
-    const state_glyph: []const u8 = switch (lane.turn.state) {
+    // quiet dot when idle. A manual /compact on this lane spins the same
+    // frame — the "lane is busy" signal the model watches for.
+    const compacting = if (lane.agent) |agent| agent.manual_compact_pending else false;
+    const state_glyph: []const u8 = if (compacting)
+        tui_message.loading_frames[app.metrics.loading_frame % tui_message.loading_frames.len]
+    else switch (lane.turn.state) {
         .active => tui_message.loading_frames[app.metrics.loading_frame % tui_message.loading_frames.len],
         .interrupting => "■",
         .idle => "·",

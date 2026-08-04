@@ -69,6 +69,15 @@ pub fn beginSubmit(app: *App) !bool {
     // the shared agent message history.
     if (app.thread.turn.state == .interrupting) discardAbandonedTurn(app);
     if (app.thread.turn.isActive()) return try app.enqueueSubmit();
+    // A manual `/compact` is mid-flight on this lane: the summarizer will swap
+    // the context on the UI thread, so starting a turn now would race that
+    // reload. Keep the input — the user can submit once the notice lands.
+    if (app.thread.agent) |agent| {
+        if (agent.manual_compact_pending) {
+            _ = try app.thread.transcript.append(app.gpa, .notice, "compaction", "Compaction in progress — wait for the summary before submitting.");
+            return false;
+        }
+    }
     const prompt = try app.inputs.input.toOwnedSlice();
     defer app.gpa.free(prompt);
     if (prompt.len == 0) return false;

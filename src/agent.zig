@@ -88,6 +88,15 @@ pub const Agent = struct {
     plugin_manager: ?*lua_mod.PluginManager = null,
     /// Background summarizer state machine.
     compactor: Compactor = .{},
+    /// A manual `/compact` was requested and is mid-flight. The TUI drives it
+    /// by polling `pollManualCompact` from its tick loop instead of blocking
+    /// on `joinCompactor`, so the UI stays live while the summarizer runs.
+    manual_compact_pending: bool = false,
+    /// Whether the manual compact's own summarizer run has been started, as
+    /// opposed to still waiting on a stale auto-run to land first. When false
+    /// and the compactor reaches a terminal state, that state belongs to the
+    /// stale run and must be discarded before starting the manual one.
+    manual_compact_started: bool = false,
     /// Config-driven compaction policy. Set by the runtime from
     /// `config.context.compaction`; defaults match the old hardcoded
     /// constants so agents created without a config still compact.
@@ -987,27 +996,93 @@ pub const Agent = struct {
     }
 
     /// Manually trigger a full compaction cycle: snapshot, summarize, swap.
-    /// Unlike the automatic path (which runs between turns inside `run`), this
-    /// is synchronous — it blocks the caller until the summary is written and
-    /// the projection is rebuilt. Returns the token counts before and after on
+    /// Synchronous wrapper over `requestManualCompact` + `pollManualCompact`,
+    /// kept for the headless/test path. The TUI does NOT use this — it drives
+    /// the two phases from its tick loop so the UI never blocks on the
+    /// summarizer request. Returns the token counts before and after on
     /// success, or an error describing what went wrong.
     pub fn forceCompact(self: *Agent) !Event.HistoryCompacted {
+        try self.requestManualCompact();
+        // A deferred start (a stale auto-run was still producing) resolves on
+        // the first poll; loop until the manual run lands. The poll returns
+        // non-null or an error once the state resolves, so this always
+        // terminates. 1000 yields is a defensive bound against a state that
+        // never resolves (e.g. a torn-down client the poll failed to clear).
+        var spins: u32 = 0;
+        while (spins < 1000) : (spins += 1) {
+            if (try self.pollManualCompact()) |info| return info;
+            std.Thread.yield() catch {};
+        }
+        return error.CompactionNotReady;
+    }
+
+    /// Non-blocking phase 1 of the manual compact: snapshot the prefix and
+    /// hand it to the summarizer thread, then return. The UI polls
+    /// `pollManualCompact` to learn when the summary lands. A stale
+    /// auto-compaction still in flight is not joined here — the poll discards
+    /// it when it lands and starts the manual run then, so this never blocks
+    /// on the summarizer's request.
+    pub fn requestManualCompact(self: *Agent) !void {
         if (self.compaction_client == .none) return error.NoCompactionClient;
         if (self.context_window_tokens == 0) return error.UnknownContextWindow;
         if (self.context_manager.session_writer == null) return error.NoSessionWriter;
+        if (self.manual_compact_pending) return error.CompactionInProgress;
 
-        // A background summary may still be in flight from the previous turn
-        // (run() exits without joining when between watermarks). Its cut is
-        // stale by definition — the user asked to compact *now* — so discard it
-        // rather than racing job/thread/state below (TD-1).
+        if (self.compactor.stateIs(.running)) {
+            // A stale auto-run is still producing. Wait for it to land; the
+            // poll discards it and starts the manual run (TD-1).
+            self.manual_compact_pending = true;
+            self.manual_compact_started = false;
+            return;
+        }
+
+        // Instant when no thread is alive: a `.ready`/`.failed` residue is
+        // drained, then the manual run starts.
         self.drainBackgroundCompaction();
-
         try self.startCompaction();
-        self.joinCompactor();
+        self.manual_compact_pending = true;
+        self.manual_compact_started = true;
+    }
+
+    /// Non-blocking phase 2 of the manual compact: polled by the UI each tick
+    /// while `manual_compact_pending`. Returns null while the summarizer is
+    /// still producing, the token-count event once the manual summary is
+    /// installed, or an error describing what went wrong. Never blocks —
+    /// `joinCompactor` is only reached once the thread has already finished.
+    pub fn pollManualCompact(self: *Agent) !?Event.HistoryCompacted {
+        if (!self.manual_compact_pending) return null;
+
+        // Client torn down mid-flight (disconnect/reconnect): the summarizer
+        // was drained, so abort the manual compact rather than strand the
+        // submit gate forever.
+        if (self.compaction_client == .none) {
+            self.manual_compact_pending = false;
+            self.manual_compact_started = false;
+            return error.CompactionFailed;
+        }
 
         const state = self.compactor.state.load(.acquire);
-        if (state == .idle or state == .running) return error.CompactionNotReady;
+        if (state == .running or state == .idle) return null;
+
+        if (!self.manual_compact_started) {
+            // The run that just landed is the stale auto one — discard it,
+            // then start the manual run (TD-1).
+            self.joinCompactor();
+            self.finishCompactor();
+            self.startCompaction() catch |err| {
+                self.manual_compact_pending = false;
+                self.manual_compact_started = false;
+                return err;
+            };
+            self.manual_compact_started = true;
+            return null;
+        }
+
+        // The manual run landed.
+        self.joinCompactor();
         defer self.finishCompactor();
+        self.manual_compact_pending = false;
+        self.manual_compact_started = false;
         if (state == .failed) return error.CompactionFailed;
 
         const result = self.compactor.result.?;
@@ -1106,9 +1181,14 @@ pub const Agent = struct {
     /// Wait for any in-flight background summary and discard it. Call before
     /// freeing or replacing `compaction_client` so the summarizer thread is
     /// never left running against a client that is about to be torn down.
+    /// Also aborts any in-flight manual compact: the run (if any) is gone, so
+    /// the pending flags are reset to keep the TUI's submit gate from
+    /// dangling on a summary that can never land.
     pub fn drainBackgroundCompaction(self: *Agent) void {
         self.joinCompactor();
         self.finishCompactor();
+        self.manual_compact_pending = false;
+        self.manual_compact_started = false;
     }
 
     /// Whether the automatic path should back off after repeated failures.
@@ -1488,6 +1568,237 @@ test "forceCompact: window guard fires before the writer guard" {
     // the writer check — confirming the order matches the source.
     agent.context_window_tokens = 4096; // would pass the window guard
     try std.testing.expectError(error.NoCompactionClient, agent.forceCompact());
+    try std.testing.expect(agent.compactor.stateIs(.idle));
+}
+
+/// Add `count` long persisted user messages so a compaction cut exists under
+/// the default keep budget. Each message is ~370 tokens; `cutByTokenBudget`
+/// only cuts once the newest (len-1) messages already exceed the budget, so
+/// `count` must be comfortably past the 1433-token budget for a 4096 window.
+/// 10 × 370 = 3700 total, newest 9 = 3330 > budget — a cut past the first
+/// message. Pub so the TUI tests can reuse the same session shape.
+pub fn fillSessionForCompaction(agent: *Agent, count: usize) !void {
+    const filler =
+        "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserunt mollit anim id est laborum " ++
+        "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserunt mollit anim id est laborum " ++
+        "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserunt mollit anim id est laborum " ++
+        "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua";
+    var i: usize = 0;
+    while (i < count) : (i += 1) try agent.addUser(filler);
+}
+
+test "requestManualCompact: guard order matches forceCompact" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    // The very first guard: compaction_client == .none.
+    try std.testing.expectError(error.NoCompactionClient, agent.requestManualCompact());
+    try std.testing.expect(!agent.manual_compact_pending);
+    try std.testing.expect(agent.compactor.stateIs(.idle));
+
+    // Window guard fires before the writer guard (same order as forceCompact).
+    agent.context_window_tokens = 4096;
+    try std.testing.expectError(error.NoCompactionClient, agent.requestManualCompact());
+    try std.testing.expect(!agent.manual_compact_pending);
+}
+
+test "requestManualCompact: defers to a stale run instead of starting a second" {
+    const gpa = std.testing.allocator;
+    const openai_compatible = @import("ai/openai_compatible.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".config/nova");
+    const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_dir);
+
+    var writer: session_mod.SessionWriter = undefined;
+    try session_mod.SessionWriter.initDefault(&writer, gpa, std.testing.io, home_dir, "/tmp");
+    defer writer.deinit();
+
+    var client: openai_compatible.Client = undefined;
+    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer client.deinit();
+
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    agent.attachSessionWriter(&writer);
+    agent.compaction_client = .{ .openai_compatible = &client };
+    agent.context_window_tokens = 4096;
+
+    // A stale auto-run is in flight: request must defer, not spawn a second
+    // thread or disturb the running state.
+    agent.compactor.state.store(.running, .release);
+    try agent.requestManualCompact();
+    try std.testing.expect(agent.manual_compact_pending);
+    try std.testing.expect(!agent.manual_compact_started);
+    try std.testing.expect(agent.compactor.stateIs(.running));
+
+    // A second request while pending is refused.
+    try std.testing.expectError(error.CompactionInProgress, agent.requestManualCompact());
+}
+
+test "requestManualCompact starts a run; poll fails it against a dead server" {
+    const gpa = std.testing.allocator;
+    const openai_compatible = @import("ai/openai_compatible.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".config/nova");
+    const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_dir);
+
+    var writer: session_mod.SessionWriter = undefined;
+    try session_mod.SessionWriter.initDefault(&writer, gpa, std.testing.io, home_dir, "/tmp");
+    defer writer.deinit();
+
+    var client: openai_compatible.Client = undefined;
+    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer client.deinit();
+
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    agent.attachSessionWriter(&writer);
+    agent.compaction_client = .{ .openai_compatible = &client };
+    agent.context_window_tokens = 4096;
+    try fillSessionForCompaction(&agent, 10);
+
+    try agent.requestManualCompact();
+    try std.testing.expect(agent.manual_compact_pending);
+    try std.testing.expect(agent.manual_compact_started);
+    try std.testing.expect(agent.compactor.stateIs(.running));
+
+    // The summarizer fails against the dead server; the poll surfaces it and
+    // clears the pending flags.
+    var spins: u32 = 0;
+    while (!agent.compactor.stateIs(.failed) and spins < 10_000) : (spins += 1) {
+        std.testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expect(agent.compactor.stateIs(.failed));
+    try std.testing.expectError(error.CompactionFailed, agent.pollManualCompact());
+    try std.testing.expect(!agent.manual_compact_pending);
+    try std.testing.expect(!agent.manual_compact_started);
+    try std.testing.expect(agent.compactor.stateIs(.idle));
+}
+
+test "pollManualCompact: returns null while the summarizer is running" {
+    const gpa = std.testing.allocator;
+    const openai_compatible = @import("ai/openai_compatible.zig");
+    var client: openai_compatible.Client = undefined;
+    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer client.deinit();
+
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    agent.compaction_client = .{ .openai_compatible = &client };
+    agent.manual_compact_pending = true;
+    agent.manual_compact_started = true;
+    agent.compactor.state.store(.running, .release);
+
+    try std.testing.expect((try agent.pollManualCompact()) == null);
+    try std.testing.expect(agent.manual_compact_pending);
+}
+
+test "pollManualCompact: torn-down client aborts and clears the pending flags" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    agent.manual_compact_pending = true;
+    agent.manual_compact_started = true;
+
+    // compaction_client stays .none — simulates a disconnect mid-compact.
+    try std.testing.expectError(error.CompactionFailed, agent.pollManualCompact());
+    try std.testing.expect(!agent.manual_compact_pending);
+    try std.testing.expect(!agent.manual_compact_started);
+}
+
+test "pollManualCompact: a failed summarizer surfaces CompactionFailed and clears the flags" {
+    const gpa = std.testing.allocator;
+    const openai_compatible = @import("ai/openai_compatible.zig");
+    var client: openai_compatible.Client = undefined;
+    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer client.deinit();
+
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    agent.compaction_client = .{ .openai_compatible = &client };
+
+    // Fake an in-flight manual run: the summarizer thread fails (dead server →
+    // connection refused) and flips to `.failed`; poll must surface it and
+    // return the compactor to idle without leaking the result slot.
+    agent.compactor.job = .{
+        .gpa = gpa,
+        .client = .{ .openai_compatible = &client },
+        .first_kept_id = undefined, // never read on the failure path
+        .prefix_text = try gpa.dupe(u8, "some prefix"),
+    };
+    agent.compactor.state.store(.running, .release);
+    agent.compactor.thread = try std.Thread.spawn(.{}, agent_compactor.Compactor.runThread, .{&agent.compactor});
+    agent.manual_compact_pending = true;
+    agent.manual_compact_started = true;
+
+    var spins: u32 = 0;
+    while (!agent.compactor.stateIs(.failed) and spins < 10_000) : (spins += 1) {
+        std.testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expect(agent.compactor.stateIs(.failed));
+
+    try std.testing.expectError(error.CompactionFailed, agent.pollManualCompact());
+    try std.testing.expect(!agent.manual_compact_pending);
+    try std.testing.expect(!agent.manual_compact_started);
+    try std.testing.expect(agent.compactor.stateIs(.idle));
+}
+
+test "pollManualCompact: discards a stale background result before the manual run" {
+    const gpa = std.testing.allocator;
+    const openai_compatible = @import("ai/openai_compatible.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".config/nova");
+    const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_dir);
+
+    var writer: session_mod.SessionWriter = undefined;
+    try session_mod.SessionWriter.initDefault(&writer, gpa, std.testing.io, home_dir, "/tmp");
+    defer writer.deinit();
+
+    var client: openai_compatible.Client = undefined;
+    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer client.deinit();
+
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    agent.attachSessionWriter(&writer);
+    agent.compaction_client = .{ .openai_compatible = &client };
+    agent.context_window_tokens = 4096;
+    try fillSessionForCompaction(&agent, 10);
+
+    // A stale auto summary is ready (no thread) and the manual run has not
+    // started yet: the request deferred on an in-flight auto-run.
+    agent.manual_compact_pending = true;
+    agent.manual_compact_started = false;
+    agent.compactor.result = .{
+        .first_kept_id = undefined,
+        .stored_summary = try gpa.dupe(u8, "stale summary"),
+    };
+    agent.compactor.state.store(.ready, .release);
+
+    // First poll: the stale result is discarded (TD-1) and the manual run
+    // starts. Returns null — the manual run is now in flight.
+    try std.testing.expect((try agent.pollManualCompact()) == null);
+    try std.testing.expect(agent.manual_compact_started);
+
+    // The manual run fails against the dead server; the poll surfaces it.
+    var spins: u32 = 0;
+    while (!agent.compactor.stateIs(.failed) and spins < 10_000) : (spins += 1) {
+        std.testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expect(agent.compactor.stateIs(.failed));
+    try std.testing.expectError(error.CompactionFailed, agent.pollManualCompact());
+    try std.testing.expect(!agent.manual_compact_pending);
+    try std.testing.expect(!agent.manual_compact_started);
     try std.testing.expect(agent.compactor.stateIs(.idle));
 }
 

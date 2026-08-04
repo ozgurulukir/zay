@@ -6,6 +6,7 @@ const vaxis = @import("vaxis");
 const tui = @import("../tui.zig");
 const provider_model = @import("provider_model.zig");
 const diff_lifecycle = @import("diff_lifecycle.zig");
+const compaction_lifecycle = @import("compaction_lifecycle.zig");
 const session_mod = @import("../session.zig");
 const vcs = @import("../vcs.zig");
 const lanes_picker = @import("widgets/lanes_picker.zig");
@@ -228,36 +229,10 @@ pub fn submitMode(app: *App) !bool {
                 },
                 .compact => {
                     app.mode = .normal;
-                    if (app.thread.turn.isActive()) {
-                        _ = try app.thread.transcript.append(app.gpa, .notice, "compaction", "Cannot compact while a turn is in progress. Wait for it to finish.");
-                    } else {
-                        const result = app.liveRuntime().?.agent.forceCompact();
-                        const info = result catch |err| {
-                            const msg = if (err == error.NoCompactionClient)
-                                "No compaction client configured — compaction unavailable"
-                            else if (err == error.UnknownContextWindow)
-                                "Context window unknown — compaction unavailable"
-                            else if (err == error.NoSessionWriter)
-                                "No active session — compaction unavailable"
-                            else if (err == error.CompactionNotReady)
-                                "Compaction did not produce a result"
-                            else if (err == error.CompactionFailed)
-                                "Background compaction failed"
-                            else if (err == error.NothingToCompact)
-                                "Nothing to compact — the recent history already fits the retention budget"
-                            else
-                                @errorName(err);
-                            _ = try app.thread.transcript.append(app.gpa, .notice, "compaction", msg);
-                            return true;
-                        };
-                        var buffer: [128]u8 = undefined;
-                        const text = std.fmt.bufPrint(
-                            &buffer,
-                            "compacted context ~{d} -> ~{d} tokens",
-                            .{ info.tokens_before, info.tokens_after },
-                        ) catch "compacted context";
-                        _ = try app.thread.transcript.append(app.gpa, .info, "notice", text);
-                    }
+                    // Non-blocking: the summarizer runs on the agent's own
+                    // thread and the tick loop polls it to completion, so the
+                    // UI never freezes on the request.
+                    _ = try compaction_lifecycle.requestManualCompact(app);
                 },
                 .status => {
                     app.mode = .normal;

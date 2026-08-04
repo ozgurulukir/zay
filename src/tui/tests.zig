@@ -22,6 +22,7 @@ const tui = @import("../tui.zig");
 
 const agent_mod = @import("../agent.zig");
 const ai = @import("../ai.zig");
+const compaction_lifecycle = @import("compaction_lifecycle.zig");
 const openai_compatible_mod = @import("../ai/openai_compatible.zig");
 const codex = @import("../auth/codex.zig");
 const config_mod = @import("../config/config.zig");
@@ -656,6 +657,81 @@ test "begin submit clears input and starts a turn awaiting output" {
     try std.testing.expect(app.thread.turn_view.awaitingOutput());
     try std.testing.expectEqual(Turn.State.active, app.thread.turn.state);
     try std.testing.expectEqual(@as(u32, 0), app.thread.transcript.selected.?);
+}
+
+test "begin submit defers while a manual compact is pending and keeps the input" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // A manual /compact is mid-flight: the summarizer will swap the context on
+    // the UI thread, so a new turn must not race that reload.
+    agent.manual_compact_pending = true;
+    agent.manual_compact_started = true;
+
+    try app.inputs.input.insertSliceAtCursor("hello");
+    try std.testing.expect(!try app.beginSubmit());
+
+    // The prompt stays in the input for a later submit; no turn started.
+    try std.testing.expectEqualStrings("hello", app.inputs.input.buf.firstHalf());
+    try std.testing.expectEqual(Turn.State.idle, app.thread.turn.state);
+    try std.testing.expect(!app.thread.turn_view.awaitingOutput());
+    // A one-line notice explains why.
+    try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
+}
+
+test "compact request with no compaction client appends the guard notice" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try std.testing.expect(!try compaction_lifecycle.requestManualCompact(&app));
+    // The first guard error maps to a static notice; no waiting row is added.
+    try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqualStrings(
+        "No compaction client configured — compaction unavailable",
+        app.thread.transcript.messages.items[0].mirror().body,
+    );
+}
+
+test "compact request appends an animated status row while the summary is produced" {
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".config/nova");
+    const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_dir);
+
+    var writer: session_mod.SessionWriter = undefined;
+    try session_mod.SessionWriter.initDefault(&writer, gpa, std.testing.io, home_dir, "/tmp");
+    defer writer.deinit();
+
+    var client: openai_compatible_mod.Client = undefined;
+    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer client.deinit();
+
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &client });
+    defer agent.deinit();
+    agent.attachSessionWriter(&writer);
+    agent.compaction_client = .{ .openai_compatible = &client };
+    agent.context_window_tokens = 4096;
+    try agent_mod.fillSessionForCompaction(&agent, 10);
+
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try std.testing.expect(try compaction_lifecycle.requestManualCompact(&app));
+    // The last transcript message is the animated waiting row (a spinner
+    // frame + text), not a static notice — what the user sees while the
+    // summary is produced.
+    const messages = app.thread.transcript.messages.items;
+    try std.testing.expectEqual(transcript_mod.MessageKind.status, messages[messages.len - 1].kind());
+    try std.testing.expectEqualStrings("waiting for background summary…", messages[messages.len - 1].mirror().title);
 }
 
 test "awaiting turn draws loading outside the transcript list" {

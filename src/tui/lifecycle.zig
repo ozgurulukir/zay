@@ -16,6 +16,7 @@ const blackhole = @import("../tui/blackhole.zig");
 const codex = @import("../auth/codex.zig");
 const provider_model = @import("provider_model.zig");
 const diff_lifecycle = @import("diff_lifecycle.zig");
+const compaction_lifecycle = @import("compaction_lifecycle.zig");
 const lane_lifecycle = @import("lane_lifecycle.zig");
 const runtime_mod = @import("../runtime.zig");
 const vcs = @import("../vcs.zig");
@@ -129,6 +130,9 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     if (try root.app.drainDiffRefresh()) visible_change = true;
     // Lanes whose branch name landed get renamed in place.
     if (try root.app.drainLaneNaming()) visible_change = true;
+    // A manual `/compact` is being polled to completion on its summarizer
+    // thread; install the result here so the UI thread never blocks on it.
+    if (try compaction_lifecycle.drainManualCompactions(root.app)) visible_change = true;
     // Collect any finished background jobs, then deliver buffered completions
     // to idle lanes (notice + a turn to answer them).
     if (try root.app.pollBackgroundJobs()) visible_change = true;
@@ -137,7 +141,10 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     // spawner (notice + answer turn); acknowledged/gone spawners drop it.
     if (try lane_lifecycle.deliverPendingLaneCompletions(root.app)) visible_change = true;
 
-    if (root.app.thread.turn_view.awaitingOutput() or root.app.thread.transcript.hasRunningTool()) {
+    // The loading frame animates not just a running turn but any in-flight
+    // manual /compact — its "waiting" status row and lane glyph spin until the
+    // summary lands.
+    if (root.app.thread.turn_view.awaitingOutput() or root.app.thread.transcript.hasRunningTool() or compaction_lifecycle.manualCompactActive(root.app)) {
         root.spinner_tick_accum += RootWidget.drain_tick_ms;
         if (root.spinner_tick_accum >= RootWidget.spinner_tick_threshold_ms) {
             root.spinner_tick_accum = 0;
@@ -185,7 +192,10 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         root.app.namingActive() or
         // Keep polling while an async MCP connect is in flight so
         // drainMcpConnects keeps installing completed handshakes.
-        root.app.mcp_manager.hasPendingConnects();
+        root.app.mcp_manager.hasPendingConnects() or
+        // Keep polling while a manual /compact summarizer is running so
+        // drainManualCompactions installs the result without blocking.
+        compaction_lifecycle.manualCompactActive(root.app);
     if (should_tick) {
         try ctx.tick(RootWidget.drain_tick_ms, root.widget());
     } else {
@@ -544,7 +554,7 @@ pub fn submit(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         // (e.g. the cold-start "Loading diff…" the /diff command kicked off),
         // or a turn a command started directly (e.g. /sync conflict
         // resolution injects one).
-        if (root.app.thread.turn.isActive() or root.app.pickers.models.load == .loading or root.app.metrics.diff_loading() or root.app.mcp_manager.hasPendingConnects()) try ensureTick(root, ctx);
+        if (root.app.thread.turn.isActive() or root.app.pickers.models.load == .loading or root.app.metrics.diff_loading() or root.app.mcp_manager.hasPendingConnects() or compaction_lifecycle.manualCompactActive(root.app)) try ensureTick(root, ctx);
         ctx.consumeAndRedraw();
         return;
     }
