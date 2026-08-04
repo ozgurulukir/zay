@@ -16,6 +16,7 @@ const std = @import("std");
 const tui = @import("../tui.zig");
 
 const App = tui.App;
+const Thread = tui.Thread;
 
 /// Error → user-facing notice text for the manual compact path. `@errorName`
 /// covers anything the switch doesn't name (provider errors, etc.).
@@ -32,11 +33,14 @@ pub fn compactErrorText(err: anyerror) []const u8 {
     };
 }
 
-/// Whether any lane's agent has a manual compact in flight. Feeds the tick
-/// loop's `should_tick` and the submit-time `ensureTick`, so the poll keeps
-/// running (and the first tick gets scheduled) while a compact is pending.
+/// Whether any lane has a manual compact in flight (pending) or a waiting
+/// status row still to clean up (aborted). Feeds the tick loop's `should_tick`
+/// and the submit-time `ensureTick`, so the poll keeps running (and the first
+/// tick gets scheduled) while a compact is pending, and an orphaned row is
+/// dropped on the next tick after a disconnect.
 pub fn manualCompactActive(app: *const App) bool {
     for (app.threads.items) |lane| {
+        if (lane.manual_compact_waiting_row != null) return true;
         if (lane.agent) |agent| {
             if (agent.manual_compact_pending) return true;
         }
@@ -62,9 +66,11 @@ pub fn requestManualCompact(app: *App) !bool {
         return false;
     };
     // An animated status row (spinner + text) so the user sees the compact is
-    // in flight, not a frozen transcript. The glyph advances with the shared
-    // loading frame; the row freezes once the summary lands.
-    _ = try app.thread.transcript.append(app.gpa, .status, "waiting for background summary…", "");
+    // in flight. The glyph advances with the shared loading frame and the row
+    // is removed when the compact completes (drainManualCompactions), so it
+    // never lingers or re-animates with a later turn's spinner.
+    const index = try app.thread.transcript.append(app.gpa, .status, "waiting for background summary…", "");
+    app.thread.manual_compact_waiting_row = index;
     return true;
 }
 
@@ -77,18 +83,30 @@ pub fn drainManualCompactions(app: *App) !bool {
     var visible_change = false;
     const active = app.thread;
     for (app.threads.items) |lane| {
-        const agent = lane.agent orelse continue;
-        if (!agent.manual_compact_pending) continue;
+        const pending = if (lane.agent) |a| a.manual_compact_pending else false;
+        if (!pending and lane.manual_compact_waiting_row == null) continue;
 
         app.thread = lane;
         defer app.thread = active;
 
+        // The compact was aborted out-of-band (disconnect drained the compactor
+        // and reset the pending flag) but its waiting row is still up — drop
+        // the spinner without a result notice.
+        if (!pending) {
+            removeWaitingRow(lane, app.gpa);
+            visible_change = true;
+            continue;
+        }
+
+        const agent = lane.agent.?;
         const result = agent.pollManualCompact() catch |err| {
+            removeWaitingRow(lane, app.gpa);
             _ = try app.thread.transcript.append(app.gpa, .notice, "compaction", compactErrorText(err));
             visible_change = true;
             continue;
         };
         if (result) |info| {
+            removeWaitingRow(lane, app.gpa);
             var buffer: [128]u8 = undefined;
             const text = std.fmt.bufPrint(
                 &buffer,
@@ -102,4 +120,15 @@ pub fn drainManualCompactions(app: *App) !bool {
         // going because `manualCompactActive` stays true.
     }
     return visible_change;
+}
+
+/// Drop the "waiting for background summary…" status row once the compact it
+/// belongs to finishes or is aborted, so it neither lingers in the stream nor
+/// re-animates with a later turn's spinner. `remove` fixes up the selection.
+fn removeWaitingRow(lane: *Thread, gpa: std.mem.Allocator) void {
+    const index = lane.manual_compact_waiting_row orelse return;
+    lane.manual_compact_waiting_row = null;
+    if (index < lane.transcript.messages.items.len) {
+        lane.transcript.remove(gpa, index);
+    }
 }

@@ -728,10 +728,28 @@ test "compact request appends an animated status row while the summary is produc
     try std.testing.expect(try compaction_lifecycle.requestManualCompact(&app));
     // The last transcript message is the animated waiting row (a spinner
     // frame + text), not a static notice — what the user sees while the
-    // summary is produced.
-    const messages = app.thread.transcript.messages.items;
+    // summary is produced. Its index is tracked for the completion cleanup.
+    var messages = app.thread.transcript.messages.items;
     try std.testing.expectEqual(transcript_mod.MessageKind.status, messages[messages.len - 1].kind());
     try std.testing.expectEqualStrings("waiting for background summary…", messages[messages.len - 1].mirror().title);
+    try std.testing.expect(app.thread.manual_compact_waiting_row != null);
+
+    // The summarizer fails against the dead server; the drain drops the
+    // waiting row and appends the error notice — no lingering spinner that
+    // could re-animate with a later turn.
+    var spins: u32 = 0;
+    while (!agent.compactor.stateIs(.failed) and spins < 10_000) : (spins += 1) {
+        std.testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expect(agent.compactor.stateIs(.failed));
+    try std.testing.expect(try compaction_lifecycle.drainManualCompactions(&app));
+
+    messages = app.thread.transcript.messages.items;
+    for (messages) |message| {
+        try std.testing.expect(message.kind() != transcript_mod.MessageKind.status);
+    }
+    try std.testing.expect(app.thread.manual_compact_waiting_row == null);
+    try std.testing.expectEqualStrings("Background compaction failed", messages[messages.len - 1].mirror().body);
 }
 
 test "awaiting turn draws loading outside the transcript list" {

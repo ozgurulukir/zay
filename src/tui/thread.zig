@@ -49,6 +49,11 @@ transcript: transcript_mod.Transcript = .{},
 turn: Turn = .{},
 /// Streaming positions + synthetic UI state for the current turn.
 turn_view: turn_view_mod.TurnView = .{},
+/// Index of the animated "waiting for background summary…" status row a manual
+/// /compact appended to this lane's transcript. Removed when the compact
+/// completes (or is aborted), so the row neither lingers nor re-animates with
+/// a later turn's spinner. Null when no compact is in flight.
+manual_compact_waiting_row: ?u32 = null,
 /// Messages the user queued behind a running turn on this lane. Owned text.
 queued: std.ArrayList(QueuedMessage) = .empty,
 /// Prompt history submitted on this lane for Up/Down navigation.
