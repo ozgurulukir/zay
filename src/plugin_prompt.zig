@@ -106,13 +106,18 @@ pub fn cloneAll(gpa: std.mem.Allocator, prompts: []const PluginPrompt) ![]Plugin
     var built: usize = 0;
     errdefer for (out[0..built]) |*p| p.deinit(gpa);
 
-    for (prompts) |prompt| {
-        out[built] = .{
-            .name = try gpa.dupe(u8, prompt.name),
-            .body = try gpa.dupe(u8, prompt.body),
-            .path = try gpa.dupe(u8, prompt.path),
+    for (prompts, 0..) |prompt, i| {
+        const name = try gpa.dupe(u8, prompt.name);
+        errdefer gpa.free(name);
+        const body = try gpa.dupe(u8, prompt.body);
+        errdefer gpa.free(body);
+        const path = try gpa.dupe(u8, prompt.path);
+        out[i] = .{
+            .name = name,
+            .body = body,
+            .path = path,
         };
-        built += 1;
+        built = i + 1;
     }
     return out;
 }

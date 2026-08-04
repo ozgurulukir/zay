@@ -433,24 +433,36 @@ pub const TurnView = struct {
     }
 
     fn commandReadsSkill(command: []const u8) bool {
-        if (std.mem.indexOf(u8, command, "cat") == null) return false;
+        // Verb-agnostic (TD-13): any read tool qualifies; the filename
+        // boundary check in `skillNameFromCommand` handles the false positive.
         if (std.mem.indexOf(u8, command, ".agents/") == null) return false;
         return std.mem.indexOf(u8, command, "/SKILL.md") != null;
     }
 
     fn skillNameFromCommand(command: []const u8) ?[]const u8 {
         const skill_suffix = "/SKILL.md";
-        const suffix_start = std.mem.indexOf(u8, command, skill_suffix) orelse return null;
-        var name_start = suffix_start;
-        while (name_start > 0) {
-            const byte = command[name_start - 1];
-            if (byte == '/' or byte == '\'' or byte == '"' or std.ascii.isWhitespace(byte)) break;
-            name_start -= 1;
+        var search_from: usize = 0;
+        while (std.mem.indexOfPos(u8, command, search_from, skill_suffix)) |suffix_start| {
+            const after = suffix_start + skill_suffix.len;
+            const boundary = after >= command.len or isSkillPathBoundary(command[after]);
+            if (boundary) {
+                var name_start = suffix_start;
+                while (name_start > 0) {
+                    const byte = command[name_start - 1];
+                    if (byte == '/' or byte == '\'' or byte == '"' or std.ascii.isWhitespace(byte)) break;
+                    name_start -= 1;
+                }
+                const name = command[name_start..suffix_start];
+                if (name.len > 0 and std.mem.indexOfScalar(u8, name, '/') == null) return name;
+            }
+            search_from = suffix_start + 1;
         }
-        const name = command[name_start..suffix_start];
-        if (name.len == 0) return null;
-        if (std.mem.indexOfScalar(u8, name, '/') != null) return null;
-        return name;
+        return null;
+    }
+
+    fn isSkillPathBoundary(byte: u8) bool {
+        return byte == ' ' or byte == '\t' or byte == '\'' or byte == '"' or
+            byte == ';' or byte == '|' or byte == '&' or byte == ')' or byte == '\n';
     }
 
     fn putToolTranscriptIndex(
@@ -529,6 +541,20 @@ test "bash skill detection uses command, not reason" {
     const skill_name = try TurnView.skillNameFromBashRead(gpa, "{\"command\":\"cat .agents/skills/tigerstyle/SKILL.md\",\"description\":\"Read the skill file\"}");
     defer if (skill_name) |name| gpa.free(name);
     try std.testing.expectEqualStrings("tigerstyle", skill_name.?);
+}
+
+test "head read of skill renders skill row" {
+    const gpa = std.testing.allocator;
+    const skill_name = try TurnView.skillNameFromBashRead(gpa, "{\"command\":\"head -50 .agents/skills/tigerstyle/SKILL.md\"}");
+    defer if (skill_name) |name| gpa.free(name);
+    try std.testing.expectEqualStrings("tigerstyle", skill_name.?);
+}
+
+test "SKILL.md.bak does not render skill row" {
+    const gpa = std.testing.allocator;
+    const skill_name = try TurnView.skillNameFromBashRead(gpa, "{\"command\":\"cat .agents/skills/tigerstyle/SKILL.md.bak\"}");
+    defer if (skill_name) |name| gpa.free(name);
+    try std.testing.expect(skill_name == null);
 }
 
 test "turn view streams content into transcript" {

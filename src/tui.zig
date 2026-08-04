@@ -1237,7 +1237,7 @@ pub fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
     return mode_lifecycle.shouldOpenCommandMenuForSlash(app, key);
 }
 
-pub const Command = enum { connect, model, mcp, new, resume_session, timeline, diff, parallel, save, close, merge, lanes, search, clear, compact, status, help, export_session, settings, copy, paste, exit_cmd, plugins };
+pub const Command = enum { connect, model, mcp, new, resume_session, timeline, diff, parallel, save, close, merge, lanes, search, clear, compact, status, help, export_session, settings, copy, paste, exit_cmd, plugins, skills };
 /// `multi_lane` commands act on another lane, so they're hidden from the palette
 /// (and unresolvable) until more than one lane exists.
 pub const CommandEntry = struct { name: []const u8, command: Command, description: []const u8 = "", category: []const u8 = "", multi_lane: bool = false };
@@ -1247,6 +1247,7 @@ pub const commands = [_]CommandEntry{
     .{ .name = "Mcp", .command = .mcp, .description = "Model Context Protocol status & servers", .category = "AI & MODELS" },
     .{ .name = "Plugins", .command = .plugins, .description = "List & manage Lua plugins", .category = "AI & MODELS" },
     .{ .name = "Settings", .command = .settings, .description = "View and edit configuration settings", .category = "AI & MODELS" },
+    .{ .name = "Skills", .command = .skills, .description = "List loaded skills & invocation names", .category = "AI & MODELS" },
     .{ .name = "New", .command = .new, .description = "Start a fresh session", .category = "SESSION" },
     .{ .name = "Resume", .command = .resume_session, .description = "Resume a past session", .category = "SESSION" },
     .{ .name = "Timeline", .command = .timeline, .description = "Browse session tree history", .category = "SESSION" },

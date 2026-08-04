@@ -195,7 +195,7 @@ pub const AgentRuntime = struct {
         // A `template` (the primary lane) shares the same project, so clone its
         // already-loaded skills + plugin prompts + assembled system prompt
         // instead of re-scanning the workspace (which is a checkout of the same repo).
-        const skills = if (template) |t| try skill_mod.cloneAll(gpa, t.skills) else try skill_mod.loadProject(gpa, io, cwd);
+        const skills = if (template) |t| try skill_mod.cloneAll(gpa, t.skills) else try skill_mod.loadProject(gpa, io, home_dir, cwd);
         errdefer skill_mod.deinitAll(gpa, skills);
         const plugin_prompts = if (template) |t| try plugin_prompt.cloneAll(gpa, t.plugin_prompts) else try plugin_prompt.loadAll(gpa, io, home_dir, cwd);
         errdefer plugin_prompt.deinitAll(gpa, plugin_prompts);

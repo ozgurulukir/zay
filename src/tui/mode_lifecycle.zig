@@ -11,6 +11,7 @@ const vcs = @import("../vcs.zig");
 const lanes_picker = @import("widgets/lanes_picker.zig");
 const tui_status = @import("status.zig");
 const clipboard_helper = @import("clipboard_helper.zig");
+const skill_mod = @import("../skill.zig");
 
 const App = tui.App;
 const Command = tui.Command;
@@ -281,6 +282,13 @@ pub fn submitMode(app: *App) !bool {
                         .{ provider_name, model_name, git_branch, active_lane, total_lanes, bg_count, sid[0..@min(8, sid.len)] },
                     );
                     _ = try app.thread.transcript.append(app.gpa, .notice, "system", status_text);
+                },
+                .skills => {
+                    app.mode = .normal;
+                    const runtime = app.liveRuntime();
+                    const list = if (runtime) |rt| try skill_mod.formatSkillsList(app.gpa, rt.skills) else try app.gpa.dupe(u8, "No active runtime.");
+                    defer app.gpa.free(list);
+                    _ = try app.thread.transcript.append(app.gpa, .notice, "skills", list);
                 },
                 .help => {
                     app.mode = .help;

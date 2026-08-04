@@ -61,6 +61,7 @@ pub const help_lines = [_]HelpLine{
     .{ .key = "/copy", .desc = "Copy selected transcript message to clipboard" },
     .{ .key = "/paste", .desc = "Paste text from clipboard into prompt" },
     .{ .key = "/status", .desc = "Show system status & active model details" },
+    .{ .key = "/skills", .desc = "List loaded skills & invocation names" },
     .{ .key = "/clear", .desc = "Clear current transcript view" },
     .{ .key = "/help", .desc = "Open this quick reference guide" },
     .{ .key = "/exit", .desc = "Quit Nova agent" },

@@ -9,6 +9,7 @@ const tools_mod = @import("../tools.zig");
 const transcript_mod = @import("../transcript.zig");
 const runtime_mod = @import("../runtime.zig");
 const search_mod = @import("../search.zig");
+const skill_mod = @import("../skill.zig");
 
 const App = tui.App;
 
@@ -76,6 +77,16 @@ pub fn rebuildTranscriptFromAgent(app: *App) !void {
         const text = message.text();
         if (message.role() == .user) {
             _ = try app.thread.transcript.append(app.gpa, .user, "you", text);
+            const injected = try skill_mod.collectInjectedSkillNames(app.gpa, text);
+            defer {
+                for (injected) |n| app.gpa.free(n);
+                app.gpa.free(injected);
+            }
+            for (injected) |name| {
+                const title = try std.fmt.allocPrint(app.gpa, "[SKILL] {s}", .{name});
+                defer app.gpa.free(title);
+                _ = try app.thread.transcript.append(app.gpa, .skill, title, "");
+            }
         } else if (message.role() == .assistant) {
             if (text.len > 0) _ = try app.thread.transcript.append(app.gpa, .agent, "agent", text);
         } else if (message.role() == .tool) {
