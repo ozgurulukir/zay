@@ -2,8 +2,15 @@
 test_runner.lua — Minimal Lua test framework for Nova plugins.
 
 Provides describe/it/assert API similar to Busted or LuaUnit.
+
+The module is pre-set as a global (`test_runner`) by the Zig runner
+(test_runner.zig), NOT loaded via `require("test_runner")`. Test files may
+call `test.run()` explicitly (readable when run standalone), but the Zig
+runner also auto-runs it after loading the file, so an explicit call is
+optional and never double-executes (run() is idempotent).
+
 Usage:
-  local test = require("test_runner")
+  local test = test_runner
   test.describe("my plugin", function()
     test.it("does something", function()
       test.assert.equal(4, 2 + 2)
@@ -116,15 +123,30 @@ function test_runner.assert.contains(sub, str, message)
 end
 
 --- Run all registered test suites and print results.
--- @return boolean: true if all tests passed
+-- Idempotent: the first call executes the suites, clears them, and caches the
+-- verdict; a second call (e.g. the Zig runner auto-running after a file that
+-- already called run()) returns the cached verdict without re-executing. This
+-- lets the Zig runner always call run() after loading a file without
+-- double-executing files that call it themselves.
+-- @return boolean: true if all tests passed. False when there are zero tests
+--   (a test file with no `it` blocks is a failure — it proves nothing).
 function test_runner.run()
+  if test_runner._has_run then
+    return test_runner._last_result
+  end
+  test_runner._has_run = true
+
+  local suites_snapshot = suites
+  suites = {}
+  current_suite = nil
+
   local total = 0
   local passed = 0
   local failed = 0
 
   io.write(color.cyan .. "Running Lua plugin tests...\n" .. color.reset)
 
-  for _, suite in ipairs(suites) do
+  for _, suite in ipairs(suites_snapshot) do
     io.write(string.format("  %s:\n", suite.name))
     for _, test in ipairs(suite.tests) do
       total = total + 1
@@ -142,13 +164,20 @@ function test_runner.run()
 
   io.write(string.format("\n%d tests: %d passed, %d failed\n", total, passed, failed))
 
-  if failed > 0 then
+  local result
+  if total == 0 then
+    io.write(color.red .. "NO TESTS FOUND — a test file with no `it` blocks is a failure\n" .. color.reset)
+    result = false
+  elseif failed > 0 then
     io.write(color.red .. "SOME TESTS FAILED\n" .. color.reset)
+    result = false
   else
     io.write(color.green .. "ALL TESTS PASSED\n" .. color.reset)
+    result = true
   end
 
-  return failed == 0
+  test_runner._last_result = result
+  return result
 end
 
 return test_runner

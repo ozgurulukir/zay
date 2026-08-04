@@ -6,6 +6,7 @@ return {
   description = "A minimal example plugin that registers a greeting tool",
   license = "MIT",
   permissions = {
+    -- require_others is advisory pending enforcement (T3).
     require_others = false,
   },
 }

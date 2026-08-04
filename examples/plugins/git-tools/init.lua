@@ -15,7 +15,13 @@ nova.register_tool({
     if status == nil then
       return "Error: not a git repository (or git failed)"
     end
-    local out = string.format("Branch: %s\n", branch or "unknown")
+    -- git branch --show-current returns "" on a detached HEAD (and the bridge
+    -- now returns nil + error outside a repo). Treat empty as a distinct case
+    -- rather than printing a blank "Branch: ".
+    if branch == nil or branch == "" then
+      return "Error: could not determine branch (detached HEAD or not a git repository)"
+    end
+    local out = string.format("Branch: %s\n", branch)
     if status and #status > 0 then
       out = out .. status
     else
@@ -56,20 +62,29 @@ nova.register_tool({
   description = "Show recent commit history. Use this to understand recent work and to match the project's existing commit message style before writing a new commit.",
   parameters = {
     n = {
-      type = "number",
+      type = "integer",
       description = "Number of commits to show (default 10)",
       optional = true,
     },
   },
   handler = function(params)
-    local count = params.n or 10
-    local log = nova.git_log(count)
+    -- Validate n as a positive integer <= 1000; anything else defaults to 10.
+    -- A fractional n (e.g. 2.5) would otherwise raise in string.format.
+    local n = params.n
+    if type(n) ~= "number" or n < 1 or n > 1000 or math.floor(n) ~= n then
+      n = 10
+    end
+    local log = nova.git_log(n)
     if log == nil then
       return "Error: git log failed"
     end
     if log == "" then
       return "No commits found."
     end
+    -- Count the lines actually returned instead of echoing the requested n
+    -- (fixes "Last 0 commits" when n clamps to 1).
+    local count = 0
+    for _ in log:gmatch("[^\n]+") do count = count + 1 end
     return string.format("Last %d commits:\n\n%s", count, log)
   end,
 })

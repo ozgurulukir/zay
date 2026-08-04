@@ -6,6 +6,7 @@ return {
   description = "todo.txt-format task tracking with priorities, projects, and dates",
   license = "MIT",
   permissions = {
+    -- require_others is advisory pending enforcement (T3).
     require_others = false,
   },
 }

@@ -1,21 +1,40 @@
 -- init.lua — File Watcher plugin initialization
 -- Demonstrates event-driven plugin using the Nova event bus.
--- Listens for tool calls and tracks file-related operations.
+-- Counts file-related tool calls by kind (write/edit/delete/rename/copy).
+--
+-- The `tool_call_finished` payload carries only `name`/`call_id`/`success`
+-- (no args, no paths), so event-driven tracking can only classify by the
+-- tool name. Manual `track_file_op` records stay separate.
 
--- Track file operations across the session
+-- Per-kind counters derived from tool_call_finished events.
+local event_counts = {
+  write = 0,
+  edit = 0,
+  delete = 0,
+  rename = 0,
+  copy = 0,
+}
+
+-- Manual records added via track_file_op.
 local file_ops = {}
 
--- Subscribe to tool call events
-nova.on("tool_call_started", function(data)
-  if data.name == "bash" then
-    -- We'll check the result when it finishes
-  end
-end)
+-- Classify a fully-qualified tool name (`lua__<plugin>__<tool>`) into a
+-- file-operation kind, or nil if it isn't a file operation we track.
+local function classify(name)
+  if name == "lua__file-tools__write" then return "write" end
+  if name == "lua__file-tools__edit" then return "edit" end
+  if name == "lua__path-tools__delete_path" then return "delete" end
+  if name == "lua__path-tools__move_path" then return "rename" end
+  if name == "lua__path-tools__copy_path" then return "copy" end
+  return nil
+end
 
+-- Count successful file-operation tool calls by kind.
 nova.on("tool_call_finished", function(data)
-  if data.name == "bash" and data.success then
-    -- A bash command completed successfully
-    -- In a real plugin, you might parse the output for file changes
+  if not data.success then return end
+  local kind = classify(data.name)
+  if kind then
+    event_counts[kind] = event_counts[kind] + 1
   end
 end)
 
@@ -25,12 +44,23 @@ nova.register_tool({
   description = "Returns statistics about file operations in this session",
   parameters = {},
   handler = function()
-    local count = #file_ops
-    return "File operations tracked this session: " .. count
+    local parts = {}
+    for _, kind in ipairs({ "write", "edit", "delete", "rename", "copy" }) do
+      if event_counts[kind] > 0 then
+        table.insert(parts, kind .. "=" .. event_counts[kind])
+      end
+    end
+    local event_summary = #parts > 0 and table.concat(parts, ", ") or "none"
+    local manual_count = #file_ops
+    return string.format(
+      "Event-tracked file operations: %s. Manually tracked: %d.",
+      event_summary,
+      manual_count
+    )
   end,
 })
 
--- Register a tool that records a file operation
+-- Register a tool that records a file operation manually
 nova.register_tool({
   name = "track_file_op",
   description = "Records a file operation for tracking",

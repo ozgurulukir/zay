@@ -42,5 +42,8 @@ read, write, edit, or listing.
   the user explicitly asks.
 - **For large files**, pass `offset` to page through sections; the footer
   tells you the next offset to use.
+- **1 MB read cap.** `read` refuses to inline more than 1 MB of a file and
+  appends `[file truncated: showing first 1 MB of N bytes]`; page the rest with
+  `bash sed -n` when you need beyond the cap.
 - **Relative paths** resolve against the project root; absolute paths must
   stay inside the project.

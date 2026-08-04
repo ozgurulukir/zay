@@ -6,6 +6,7 @@ return {
   description = "Grep file contents and glob for files by name",
   license = "MIT",
   permissions = {
+    -- require_others is advisory pending enforcement (T3).
     require_others = false,
   },
 }

@@ -11,11 +11,14 @@ const plugin_api = @import("plugin_api.zig");
 
 /// Permissions granted to a plugin.
 pub const Permissions = struct {
-    /// Allow file read/write via io.*
+    /// Advisory: the `nova.*` bridge is always sandboxed and `io.*`/`socket.*`
+    /// are never exposed, so this field gates nothing today. Kept for forward
+    /// compatibility; do not rely on it to grant or deny access.
     file_access: bool = false,
-    /// Allow network access via socket.*
+    /// Advisory: `socket.*` is never exposed, so this gates nothing today.
     network_access: bool = false,
-    /// Allow requiring other plugins
+    /// Advisory: the `package` library is never exposed, so this gates nothing
+    /// today. Kept for forward compatibility.
     require_others: bool = true,
     /// Full access to all Lua standard libraries (embedded plugins only)
     full_access: bool = false,
@@ -27,11 +30,16 @@ pub const Permissions = struct {
     allow_os_exit: bool = false,
     /// Allow os.remove/os.rename
     allow_os_remove: bool = false,
-    /// Maximum Lua instructions before abort (0 = unlimited)
+    /// Maximum Lua instructions before abort (0 = unlimited). This is a
+    /// **per-dispatch** budget — reset before each tool call / event callback
+    /// by `resetInstructionBudget`, so a busy plugin can't exhaust it for the
+    /// rest of the session.
     instruction_limit: u32 = 100_000,
     /// Maximum memory in MB (0 = unlimited)
     memory_limit_mb: u32 = 16,
-    /// Timeout in ms (approximate, based on instruction count)
+    /// Timeout in ms (approximate, based on instruction count — the hook
+    /// checks the deadline every 1000 instructions, so a short timeout may
+    /// overshoot by up to ~1000 instructions of work).
     timeout_ms: u32 = 5000,
 };
 
@@ -40,7 +48,21 @@ const HookData = struct {
     instruction_limit: u32,
     instruction_count: u32,
     memory_limit: usize,
+    /// Timeout in ms for the current dispatch (0 = no timeout).
+    timeout_ms: u32,
+    /// Absolute deadline (ns since epoch) for the current dispatch, or 0 when
+    /// no timeout is set. Reset per-dispatch by `resetInstructionBudget`.
+    deadline_ns: i128 = 0,
 };
+
+/// Monotonic clock reading in nanoseconds, used for the per-dispatch timeout.
+/// The instruction hook has no `Io` handle, so it reads the OS clock directly.
+/// Falls back to 0 (no timeout) if the clock is unavailable.
+fn monotonicNowNs() i128 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) != 0) return 0;
+    return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
+}
 
 /// Instruction count hook function.
 /// Fires every 1000 instructions and checks resource limits.
@@ -53,11 +75,31 @@ fn instructionHook(L: ?*c.lua_State, ar: [*c]c.lua_Debug) callconv(.c) void {
     if (data.instruction_count >= data.instruction_limit) {
         _ = c.luaL_error(L_ptr, "instruction limit exceeded");
     }
+    // Approximate timeout check (1000-instruction granularity, by design).
+    if (data.deadline_ns != 0 and monotonicNowNs() >= data.deadline_ns) {
+        _ = c.luaL_error(L_ptr, "timeout exceeded");
+    }
     // Check memory every 1000 instructions
     const mem_kb = c.lua_gc(L_ptr, c.LUA_GCCOUNT, @as(c_int, 0));
     if (@as(usize, @intCast(mem_kb)) * 1024 >= data.memory_limit) {
         _ = c.luaL_error(L_ptr, "memory limit exceeded");
     }
+}
+
+/// Reset the per-dispatch instruction budget and timeout deadline on `L`.
+/// The instruction count is a per-session accumulator that nothing else
+/// resets; without this, a busy plugin eventually fails every call with
+/// "instruction limit exceeded" for the rest of the session. Resetting here
+/// makes the limit mean "per tool call / per event", which matches intuition.
+/// No-op when the hook data is null (full-access sandboxes have no hook).
+pub fn resetInstructionBudget(L: *c.lua_State) void {
+    const slot = @as(*?*HookData, @ptrCast(@alignCast(c.lua_getextraspace(L))));
+    const data = slot.* orelse return;
+    data.instruction_count = 0;
+    data.deadline_ns = if (data.timeout_ms > 0)
+        monotonicNowNs() + @as(i128, data.timeout_ms) * std.time.ns_per_ms
+    else
+        0;
 }
 
 /// Create a new sandboxed Lua state with restricted permissions.
@@ -243,6 +285,7 @@ fn setupInstructionHook(L: *c.lua_State, permissions: Permissions) std.mem.Alloc
         .instruction_limit = if (permissions.instruction_limit > 0) permissions.instruction_limit else std.math.maxInt(u32),
         .instruction_count = 0,
         .memory_limit = if (permissions.memory_limit_mb > 0) @as(usize, @intCast(permissions.memory_limit_mb)) * 1024 * 1024 else std.math.maxInt(usize),
+        .timeout_ms = permissions.timeout_ms,
     };
     @as(*?*HookData, @ptrCast(@alignCast(c.lua_getextraspace(L)))).* = data;
     c.lua_sethook(L, instructionHook, c.LUA_MASKCOUNT, 1000);
@@ -443,5 +486,67 @@ test "sandbox: memory limit triggers error" {
     const err = L.getErrorMessage();
     try std.testing.expect(err != null);
     try std.testing.expect(std.mem.indexOf(u8, err.?, "memory limit") != null);
+    L.pop(1);
+}
+
+// ── T1/T2: per-dispatch budget reset + timeout enforcement ───────────
+
+test "sandbox: instruction budget resets between dispatches (T1)" {
+    // Set a low limit so one busy chunk passes but two cumulative would not.
+    // The hook fires every 1000 instructions, so a 30k-iteration table loop is
+    // ~40 hook ticks — under a limit of 100, but two cumulative would exceed it.
+    var L = try createSandboxedState(.{ .instruction_limit = 100 });
+    defer {
+        freeHookData(L.handle);
+        L.deinit();
+    }
+
+    // First dispatch consumes most of the budget but stays under it.
+    // A successful doString with no return values leaves nothing on the stack.
+    try std.testing.expect(L.doString("local t = {} for i = 1, 30000 do t[i] = i end"));
+
+    // Without a reset, a second similar chunk would exceed the cumulative
+    // budget. With resetInstructionBudget between dispatches, it passes.
+    resetInstructionBudget(L.handle);
+    try std.testing.expect(L.doString("local t = {} for i = 1, 30000 do t[i] = i end"));
+}
+
+test "sandbox: without a reset the cumulative budget is exhausted (T1 pins mechanism)" {
+    var L = try createSandboxedState(.{ .instruction_limit = 100 });
+    defer {
+        freeHookData(L.handle);
+        L.deinit();
+    }
+
+    // Consume most of the budget. A table-accumulating loop can't be optimized
+    // away and produces enough instructions to cross the 100-tick limit across
+    // two dispatches (the hook fires every 1000 instructions).
+    try std.testing.expect(L.doString("local t = {} for i = 1, 30000 do t[i] = i end"));
+
+    // A second chunk with NO reset must hit the instruction limit.
+    try std.testing.expect(!L.doString("local t = {} for i = 1, 30000 do t[i] = i end"));
+    const err = L.getErrorMessage();
+    try std.testing.expect(err != null);
+    try std.testing.expect(std.mem.indexOf(u8, err.?, "instruction limit") != null);
+    L.pop(1);
+}
+
+test "sandbox: timeout_ms is enforced (T2)" {
+    // High instruction limit so the timeout (not the count) is what fires.
+    var L = try createSandboxedState(.{ .instruction_limit = 1_000_000, .timeout_ms = 1 });
+    defer {
+        freeHookData(L.handle);
+        L.deinit();
+    }
+
+    // Arm the per-dispatch deadline, mirroring production (callToolHandler /
+    // drainEventCallbacks call resetInstructionBudget before each dispatch).
+    resetInstructionBudget(L.handle);
+
+    // A tight infinite loop must error with "timeout", not "instruction limit".
+    try std.testing.expect(!L.doString("while true do end"));
+    const err = L.getErrorMessage();
+    try std.testing.expect(err != null);
+    try std.testing.expect(std.mem.indexOf(u8, err.?, "timeout") != null);
     L.pop(1);
 }

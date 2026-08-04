@@ -5,8 +5,9 @@ return {
   author = "Nova",
   description = "Listens for file changes and notifies the agent",
   license = "MIT",
+  -- require_others is advisory pending enforcement (T3); file_access is
+  -- omitted because this plugin does no file I/O of its own.
   permissions = {
-    file_access = true,
     require_others = false,
   },
 }

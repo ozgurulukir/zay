@@ -165,7 +165,7 @@ nova.register_tool({
       optional = true,
     },
     max_results = {
-      type = "number",
+      type = "integer",
       description = "Maximum matches to return (default 50, max 200)",
       optional = true,
     },
@@ -173,7 +173,10 @@ nova.register_tool({
   handler = function(params)
     local root = params.path or "."
     local case_sensitive = params.case_sensitive or false
-    local max_results = math.min(params.max_results or 50, 200)
+    -- Clamp to a positive integer (defense in depth with the Zig-side clamp):
+    -- a fractional/negative max_results would otherwise reach the bridge and
+    -- (before the Zig clamp) panic on the u32 cast.
+    local max_results = math.max(1, math.min(math.floor(params.max_results or 50), 200))
 
     -- Substring (default): Nova's native search. Self-contained, no external
     -- binary, identical behavior in every environment.
@@ -185,7 +188,8 @@ nova.register_tool({
     -- are not PCRE). Quoting in build_rg_command keeps `|`, spaces, etc. from
     -- being parsed by the shell.
     local cmd = build_rg_command(params.pattern, root, params.include, case_sensitive)
-    local bash_result = nova.run_bash(cmd, { cwd = root })
+    -- rg over large repos can exceed the 30 s default; give it a 60 s budget.
+    local bash_result = nova.run_bash(cmd, { cwd = root, timeout = 60 })
 
     if bash_result == nil then
       return "Error: regex search failed"
@@ -207,7 +211,7 @@ nova.register_tool({
 
 nova.register_tool({
   name = "glob",
-  description = "Find files by name using a glob pattern (e.g. '**/*.zig', 'src/**/*.ts'). Returns matching file paths, one per line. Fast and works on any codebase size. When searching, you can call this tool multiple times in a single response with different patterns to find files efficiently.",
+  description = "Find files by name using a glob pattern (e.g. '**/*.zig', 'src/**/*.ts'). Returns matching file paths, one per line. Skips dotfiles. Fast and works on any codebase size. When searching, you can call this tool multiple times in a single response with different patterns to find files efficiently.",
   parameters = {
     pattern = {
       type = "string",
@@ -219,14 +223,15 @@ nova.register_tool({
       optional = true,
     },
     max_results = {
-      type = "number",
+      type = "integer",
       description = "Maximum results (default 100)",
       optional = true,
     },
   },
   handler = function(params)
     local root = params.path or "."
-    local opts = { max_results = params.max_results or 100 }
+    local max_results = math.max(1, math.min(math.floor(params.max_results or 100), 200))
+    local opts = { max_results = max_results }
 
     local result = nova.find_files(root, params.pattern, opts)
     if result == nil then

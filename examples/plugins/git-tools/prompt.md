@@ -29,8 +29,10 @@ Use the `git-tools` plugin to inspect repository state and create commits.
   one.
 - **If a commit fails** (e.g. hooks reject it, or the message is wrong), fix
   the issue and create a **new** commit. Do not amend the failed commit.
-- **`git_commit` stages everything** (`git add -A`). There is no selective
-  staging API — if you need to stage only specific files, use `bash git add
-  <files>` first, then call `git_commit`.
+- **`git_commit` always stages all changes** (`git add -A && git commit`).
+  There is no selective-staging API — if you need to stage only specific files,
+  do the whole commit in bash (`git add <files> && git commit -m "..."`) and
+  do not mix the two approaches. Staging files with `git add` and then calling
+  `git_commit` will re-stage everything and void the selective staging.
 - **Do not** update git config, skip hooks, use interactive `-i`, force-push,
   or create empty commits unless the user explicitly requests it.

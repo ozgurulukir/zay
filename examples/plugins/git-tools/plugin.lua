@@ -6,6 +6,7 @@ return {
   description = "Inspect git status, diff, log, branch, and create commits",
   license = "MIT",
   permissions = {
+    -- require_others is advisory pending enforcement (T3).
     require_others = false,
   },
 }

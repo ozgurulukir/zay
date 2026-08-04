@@ -17,11 +17,14 @@ local BINARY_EXTS = {
   docx = true, xlsx = true, pptx = true, odt = true, ods = true,
 }
 
--- Extract the file extension (without the dot), lowercased.
+-- Extract the file extension (without the dot), lowercased. Basename first so
+-- a dot in a directory name (e.g. "src.d/file") does not defeat the match; a
+-- dotfile (".gitignore") has no extension: `.+` requires at least one char
+-- before the final dot, while ".hidden.txt" still yields "txt".
 local function extension(path)
-  local dot = path:reverse():find("%.")
-  if not dot then return "" end
-  local ext = path:sub(#path - dot + 2)
+  local name = path:match("[^/]+$") or path
+  local _, ext = name:match("^(.+)%.(%w+)$")
+  if not ext then return "" end
   return ext:lower()
 end
 
@@ -39,17 +42,32 @@ local function is_binary(ext, sample)
   return (nonprint / #sample) > 0.30
 end
 
+-- Deterministic line splitter. `gmatch("[^\n]*")` cannot count empty lines
+-- reliably in Lua 5.4, so walk explicitly. A trailing "\n" TERMINATES the last
+-- line (so "a\n" -> 1 line, "a\n\n" -> 2 lines, "" -> 0 lines).
+local function split_lines(text)
+  if text == "" then return {} end
+  local lines, rest = {}, text
+  while true do
+    local nl = rest:find("\n", 1, true)
+    if not nl then
+      table.insert(lines, rest) -- final segment (may be "")
+      break
+    end
+    table.insert(lines, rest:sub(1, nl - 1))
+    rest = rest:sub(nl + 1)
+  end
+  -- A trailing "\n" TERMINATES the last line; drop the artifact it leaves.
+  if lines[#lines] == "" and text:sub(-1) == "\n" then table.remove(lines) end
+  return lines
+end
+
 -- Truncate output to a byte/line budget, appending a clear marker. Mirrors
 -- OpenCode's central truncation: keep the head, report how much was dropped.
 local function truncate(text, max_lines, max_bytes)
   max_lines = max_lines or 2000
   max_bytes = max_bytes or 50000
-  local lines = {}
-  for line in text:gmatch("([^\n]*)\n?") do
-    table.insert(lines, line)
-  end
-  -- Drop the trailing empty string from a final newline.
-  if #lines > 0 and lines[#lines] == "" then table.remove(lines) end
+  local lines = split_lines(text)
 
   local kept, bytes = {}, 0
   for _, line in ipairs(lines) do
@@ -80,20 +98,19 @@ nova.register_tool({
       description = "File path to read (relative to project root or absolute)",
     },
     offset = {
-      type = "number",
+      type = "integer",
       description = "Line number to start reading from (1-indexed, optional)",
       optional = true,
     },
     limit = {
-      type = "number",
+      type = "integer",
       description = "Maximum number of lines to read (default 2000)",
       optional = true,
     },
   },
   handler = function(params)
-    local limit = params.limit or 2000
-    local offset = params.offset or 1
-    if offset < 1 then offset = 1 end
+    local limit = math.max(1, math.floor(params.limit or 2000))
+    local offset = math.max(1, math.floor(params.offset or 1))
 
     local result = nova.read_file(params.path, {})
     if result == nil then
@@ -107,11 +124,7 @@ nova.register_tool({
     end
 
     -- Split into numbered lines, applying offset/limit.
-    local lines = {}
-    for line in result.content:gmatch("([^\n]*)\n?") do
-      table.insert(lines, line)
-    end
-    if #lines > 0 and lines[#lines] == "" then table.remove(lines) end
+    local lines = split_lines(result.content)
     local total = #lines
 
     local out = {}
@@ -121,6 +134,10 @@ nova.register_tool({
     end
 
     local body = table.concat(out, "\n")
+    -- Apply the byte/line budget to the window (mirrors OpenCode's central
+    -- truncation) so wide lines cannot return megabytes.
+    local truncated_body = truncate(body, 2000, 50000)
+
     -- Context-aware footer so the model knows whether to page further.
     local footer
     if last >= total then
@@ -129,8 +146,13 @@ nova.register_tool({
       footer = string.format("\n(Showing lines %d-%d of %d. Use offset=%d to continue.)", offset, last, total, last + 1)
     end
 
+    -- Expose the bridge's 1 MB read cap so the model knows to page via bash.
+    if result.truncated then
+      footer = footer .. string.format("\n[file truncated: showing first 1 MB of %d bytes; page the rest with bash `sed -n`]", result.full_size or result.size)
+    end
+
     local header = string.format("<path>%s</path>\n", result.path)
-    return header .. body .. footer
+    return header .. truncated_body .. footer
   end,
 })
 
@@ -216,6 +238,11 @@ nova.register_tool({
   },
   handler = function(params)
     local replace_all_flag = params.replace_all == true
+
+    -- The description promises new_string must differ from old_string.
+    if params.old_string == params.new_string then
+      return "Error: new_string must differ from old_string"
+    end
 
     -- Read current content to validate before mutating.
     local result = nova.read_file(params.path, {})

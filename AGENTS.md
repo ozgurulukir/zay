@@ -116,6 +116,9 @@ const output = try writer.toOwnedSlice();
 - **`readSliceShort` vs `readSliceAll`.** `readSliceShort` returns the actual byte count and never `error.EndOfStream`; `readSliceAll` returns `error.EndOfStream` when the buffer can't fill. Use `readSliceShort` when truncating oversized inputs (e.g. project rule files capped at 64KB) and shrink the slice on a short read. Also: a `return null` inside a `catch` block does **not** fire an `errdefer` — free the buffer explicitly before returning.
 - **Mention/image ingestion caps.** `at_mention.zig` caps a single file mention at 64KB (`per_file_mention_max_bytes`), an aggregate of 256KB per turn (`turn_mention_aggregate_max_bytes`), and 4 images per message (`max_images_per_message`). Oversized files are head-truncated with a visible `[file truncated: {n} bytes, first {cap} inlined]` notice; over-cap images are skipped, not truncated.
 - **Epoch date math for `todayUtc`.** `std.Io.Timestamp.now(io, .real)` → `EpochSeconds.getEpochDay()` → `EpochDay.calculateYearDay()` → `YearAndDay.calculateMonthDay()` → `MonthAndDay`. `month.numeric()` is 1-based; `day_index` is 0-based (add 1).
+- **Lua sandbox instruction budget is per-dispatch, not per-session.** `resetInstructionBudget(L)` (`src/lua/sandbox.zig`) zeroes the instruction count and re-arms the timeout deadline before each tool call / event dispatch (`callToolHandler` in `plugin_api.zig`, `drainEventCallbacks` in `manager.zig`). Without it the count is a session accumulator and a busy plugin eventually fails every call with "instruction limit exceeded" for the rest of the session. The hook reads its state via `lua_getextraspace` hook data; the timeout check runs every 1000 instructions (coarse granularity, by design).
+- **Bridge integer-clamp idiom.** When a Lua-supplied integer flows into a `u32` field, clamp on the `i64` *before* the `@intCast` so a negative value (a model-supplied `-1` or a manifest typo) can't wrap to ~4e9: `@intCast(@max(v, 1))` for positive-only params, `@intCast(@max(v, 0))` for "0 = unlimited" params. For capped params, wrap the clamp in `@min(..., cap)`. See `searchFiles`/`findFiles`/`runBash` (`plugin_api.zig`) and `parsePermissions` (`manifest.zig`).
+- **`sanitizePath` realpath re-check mirrors `validateCwd`.** `sanitizePath` (`plugin_api.zig`) does a lexical `startsWith(cwd)` check, then a best-effort `std.c.realpath` re-check so a symlink escaping the project root is caught. `realpath` returns null on ENOENT (a new file being written), so fall back to the lexical verdict on null — never reject a legitimately-new path. This mirrors the bash tool's `validateCwd` (AGENTS.md §Safety).
 
 ## Verifying
 
@@ -123,6 +126,7 @@ Run:
 
 - `zig fmt`
 - `zig build test`
+- `zig build test-plugin` — runs the example Lua plugins' `test.lua` suites (via `src/lua/test_runner.zig` + `src/lua/test_runner.lua`). Its exit code is the gate: it must be 0 (green). `test_runner.run()` is idempotent — it caches the first verdict (`_has_run`/`_last_result`) so the explicit `test.run()` call and the Zig auto-run both return the same pass/fail. `test_runner.zig` logs at `warn` (not `err`) so the intentional syntax-error test doesn't fail the build. Add a new plugin's `test.lua` to the `test-plugin` arg list in `build.zig`. The Zig runner auto-runs `return test_runner.run()` after loading each file and **fails on 0 tests** — a test file with no `it` blocks is a failure, so a file that forgets `describe` entirely is caught.
 
 ### Test runner quirks (read before debugging a failure)
 
@@ -145,6 +149,8 @@ The authoritative signal for a test run is `zig build test`'s **exit code**, not
 - **`std.Io.Mutex` is not recursive — a function-scoped `defer unlock` plus a later re-lock deadlocks.** `BackgroundManager.start` hit this; fixed by unlocking immediately after `next_id += 1` (background.zig:135) — it guards only the id/job list. Lock only around the minimal critical section; never pair a function-scoped deferred unlock with a second `lock`. Related: `MultiReader.fill(timeout)` is an **idle** timeout, never a total cap; `bash_exec` converts once to an absolute deadline (`Io.Timeout.toDeadline`).
 
 - **`postAgentEvent` owns the event.** It frees the event's data internally on error. Callers must NOT free `message_text` or `event_ptr` in catch blocks or before `return error.TurnCancelled` — doing so causes a double-free (errdefer repeats the cleanup).
+
+- **Zig 0.16 std API gaps.** Several APIs from earlier Zig versions do not exist in 0.16.0 — use the C shims or `std.Io` equivalents instead: no `std.fs.realpathAlloc` → `std.c.realpath` (returns null on ENOENT); no `std.posix.symlink` → `std.c.symlink`; no `std.fs.makeDirAbsolute` → `std.Io.Dir.cwd().createDirPath`; no `std.time.nanoTimestamp` → `std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts)` (the instruction hook has no `Io` handle, so it reads the OS clock directly; fall back to 0 = no timeout on failure).
 
 ## Known Issues
 

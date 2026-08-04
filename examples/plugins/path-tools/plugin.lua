@@ -6,6 +6,7 @@ return {
   description = "Create directories and copy/move/delete paths safely",
   license = "MIT",
   permissions = {
+    -- require_others is advisory pending enforcement (T3).
     require_others = false,
   },
 }

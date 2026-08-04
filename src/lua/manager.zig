@@ -280,6 +280,10 @@ pub const PluginManager = struct {
             state.newTable();
             events.pushEventData(&state, event);
 
+            // Reset the per-dispatch instruction budget and timeout deadline so
+            // the limits mean "per event", not "per session" (T1/T2).
+            sandbox.resetInstructionBudget(L);
+
             const rc = state.pcall(1, 0);
             if (rc != c.LUA_OK) {
                 const err = state.getErrorMessage();

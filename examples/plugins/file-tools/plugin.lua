@@ -8,6 +8,7 @@ return {
   description = "Read, write, edit, and list files safely",
   license = "MIT",
   permissions = {
+    -- require_others is advisory pending enforcement (T3).
     require_others = false,
   },
 }

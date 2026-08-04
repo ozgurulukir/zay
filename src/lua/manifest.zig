@@ -72,6 +72,8 @@ fn parsePermissions(L: *State) !sandbox.Permissions {
 
     if (t != c.LUA_TTABLE) return sandbox.Permissions{};
 
+    validatePermissionKeys(L);
+
     var perms = sandbox.Permissions{};
 
     if (bridge.getTableBoolean(L, -1, "file_access")) |v| perms.file_access = v;
@@ -82,11 +84,55 @@ fn parsePermissions(L: *State) !sandbox.Permissions {
     if (bridge.getTableBoolean(L, -1, "allow_os_exit")) |v| perms.allow_os_exit = v;
     if (bridge.getTableBoolean(L, -1, "allow_os_remove")) |v| perms.allow_os_remove = v;
 
-    if (bridge.getTableInteger(L, -1, "instruction_limit")) |v| perms.instruction_limit = @intCast(v);
-    if (bridge.getTableInteger(L, -1, "memory_limit_mb")) |v| perms.memory_limit_mb = @intCast(v);
-    if (bridge.getTableInteger(L, -1, "timeout_ms")) |v| perms.timeout_ms = @intCast(v);
+    // Clamp on the i64 before the u32 cast so a negative value (a manifest typo
+    // or a hand-edited plugin.lua) cannot wrap to ~4e9. 0 keeps its "unlimited"
+    // semantics, so clamp only the lower bound at 0.
+    if (bridge.getTableInteger(L, -1, "instruction_limit")) |v| perms.instruction_limit = @intCast(@max(v, 0));
+    if (bridge.getTableInteger(L, -1, "memory_limit_mb")) |v| perms.memory_limit_mb = @intCast(@max(v, 0));
+    if (bridge.getTableInteger(L, -1, "timeout_ms")) |v| perms.timeout_ms = @intCast(@max(v, 0));
 
     return perms;
+}
+
+/// Whether `key` is a recognized permission key. Pure — testable without a
+/// Lua state or log capture.
+fn isRecognizedPermissionKey(key: []const u8) bool {
+    const recognized = [_][]const u8{
+        "file_access",
+        "network_access",
+        "require_others",
+        "allow_rawget_rawset",
+        "allow_os_execute",
+        "allow_os_exit",
+        "allow_os_remove",
+        "instruction_limit",
+        "memory_limit_mb",
+        "timeout_ms",
+    };
+    for (recognized) |r| {
+        if (std.mem.eql(u8, key, r)) return true;
+    }
+    return false;
+}
+
+/// Warn on any key in the permissions table that isn't a recognized
+/// permission. Catches typos like `reqiure_others`, which today are silently
+/// swallowed. Pure iteration over the table — no stack mutation.
+fn validatePermissionKeys(L: *State) void {
+    // Push a nil key to start the iteration (lua_next).
+    c.lua_pushnil(L.handle);
+    while (c.lua_next(L.handle, -2) != 0) {
+        // Key is at -2, value at -1.
+        if (c.lua_type(L.handle, -2) == c.LUA_TSTRING) {
+            var key_len: usize = 0;
+            const key = std.mem.span(c.lua_tolstring(L.handle, -2, &key_len));
+            if (!isRecognizedPermissionKey(key)) {
+                std.log.warn("manifest.permissions.unknown_key key={s}", .{key});
+            }
+        }
+        // Pop the value, keep the key for the next lua_next.
+        c.lua_pop(L.handle, 1);
+    }
 }
 
 test "manifest: parse valid table" {
@@ -167,4 +213,30 @@ test "manifest: default permissions when not specified" {
     try testing.expect(!manifest.permissions.file_access);
     try testing.expect(!manifest.permissions.network_access);
     try testing.expect(manifest.permissions.require_others);
+}
+
+test "manifest: isRecognizedPermissionKey accepts all valid keys (T3)" {
+    const testing = std.testing;
+    for ([_][]const u8{
+        "file_access",
+        "network_access",
+        "require_others",
+        "allow_rawget_rawset",
+        "allow_os_execute",
+        "allow_os_exit",
+        "allow_os_remove",
+        "instruction_limit",
+        "memory_limit_mb",
+        "timeout_ms",
+    }) |key| {
+        try testing.expect(isRecognizedPermissionKey(key));
+    }
+}
+
+test "manifest: isRecognizedPermissionKey rejects a typo (T3)" {
+    const testing = std.testing;
+    // A typo'd key must be flagged so it isn't silently swallowed.
+    try testing.expect(!isRecognizedPermissionKey("reqiure_others"));
+    try testing.expect(!isRecognizedPermissionKey("file_acces"));
+    try testing.expect(!isRecognizedPermissionKey(""));
 }

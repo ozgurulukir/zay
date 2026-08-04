@@ -36,6 +36,13 @@ end
 
 -- ── id helpers ──────────────────────────────────────────────────────
 
+-- Validate a numeric index: a number that is an integer in [1, n]. Rejects
+-- fractional/zero/negative values (which would otherwise index _G.todos[2.5]
+-- -> nil -> .done raises a Lua tool error) and non-numbers.
+local function is_index(v, n)
+  return type(v) == "number" and v >= 1 and v <= n and math.floor(v) == v
+end
+
 -- Resolve a task's stable id from its id: tag, falling back to its array
 -- index. The id: tag is the durable handle for plan lookups; the index is the
 -- transient handle todo_list/todo_done/todo_delete use within one call.
@@ -45,6 +52,19 @@ local function task_id(t, index)
 end
 
 -- ── todo.txt parser ─────────────────────────────────────────────────
+
+-- Match an anchored YYYY-MM-DD date at the start of `s`. The date must be
+-- followed by a run of spaces OR end the line entirely; a date glued to text
+-- ("2026-08-01urgent") is rejected. Returns the date and the remainder of the
+-- string after the date+spaces, or nil (and the unchanged string) when there
+-- is no valid date. Centralizing this keeps both date sites in parse_line
+-- (completion/creation before the priority, creation after it) identical.
+local function take_date(s)
+  local date, spaces = s:match("^(%d%d%d%d%-%d%d%-%d%d)(%s*)")
+  if not date then return nil, s end
+  if spaces == "" and #s > #date then return nil, s end -- glued to text
+  return date, s:sub(#date + #spaces + 1)
+end
 
 -- Parse one todo.txt line into a structured record. Returns:
 --   { done=bool, priority=?, created=?, completed=?, text=string, id=?number,
@@ -73,34 +93,40 @@ local function parse_line(line)
   end
 
   -- After optional completion, an optional completion date (YYYY-MM-DD).
-  local m = rest:match("^(%d%d%d%d%-%d%d%-%d%d)%s+")
-  if m then
+  -- take_date cuts by the real match length, so a multi-space separator can't
+  -- leave a leading space that breaks the anchored date match below (the old
+  -- `sub(#m + 2)` assumed exactly one space), and a date at end-of-line (a
+  -- completed task with no text) still parses as the completion date.
+  local date
+  date, rest = take_date(rest)
+  if date then
     if t.done then
-      t.completed = m
+      t.completed = date
     else
       -- A bare date at the start of an open task is the creation date.
-      t.created = m
+      t.created = date
     end
-    rest = rest:sub(#m + 2)
   end
 
-  -- Priority: (A) through (Z) at the very start.
-  local pri = rest:match("^%(([A-Z])%)%s+")
+  -- Priority: (A) through (Z) at the very start. Capture the WHOLE match
+  -- (marker + run of spaces) and cut by its length.
+  local pri = rest:match("^(%(([A-Z])%)%s+)")
   if pri then
-    t.priority = pri
-    rest = rest:sub(4) -- "(X) " is 4 chars
+    t.priority = pri:match("%(([A-Z])%)")
+    rest = rest:sub(#pri + 1)
   end
 
   -- After optional priority, another optional date: for a completed task this
   -- is the creation date; for an open task it could be creation (if the first
   -- date was absent). todo.txt allows: "x <completed> <created> <pri?> text"
-  -- and "(<pri>) <created> text".
-  local m2 = rest:match("^(%d%d%d%d%-%d%d%-%d%d)%s+")
-  if m2 then
+  -- and "(<pri>) <created> text". Same acceptance rules as the first date
+  -- site (take_date): end-of-line OK, glued-to-text rejected.
+  local date2
+  date2, rest = take_date(rest)
+  if date2 then
     if t.created == nil then
-      t.created = m2
+      t.created = date2
     end
-    rest = rest:sub(#m2 + 2)
   end
 
   -- The remainder is the task text. Extract projects, contexts, key:value.
@@ -194,14 +220,16 @@ local function load_todos()
   return true
 end
 
--- Persist _G.todos back to disk.
+-- Persist _G.todos back to disk. Returns true on success, or nil + err so
+-- mutating handlers can surface a failed write instead of reporting success
+-- while nothing was persisted (persist-before-cache doctrine).
 local function save_todos()
   local lines = {}
   for _, t in ipairs(_G.todos) do
     local line = render_line(t)
     if line ~= "" then table.insert(lines, line) end
   end
-  nova.write_file(TODOS_FILE, table.concat(lines, "\n") .. "\n")
+  return nova.write_file(TODOS_FILE, table.concat(lines, "\n") .. "\n")
 end
 
 -- ── plans.json file I/O ─────────────────────────────────────────────
@@ -219,15 +247,33 @@ local function load_plans()
     -- Corrupt JSON: start fresh rather than failing the whole plugin.
     return {}
   end
+  -- The sidecar is hand-editable; it may contain valid-but-scalar JSON (42,
+  -- "x", [1]). Callers index plans[key], which raises on a non-table. Guard
+  -- here so a bad sidecar degrades to an empty plan set, never a crash.
+  if type(decoded) ~= "table" then
+    return {}
+  end
   return decoded
 end
 
 -- Persist plans back to the sidecar with pretty indentation so a human can read
--- or hand-edit it in a text editor.
+-- or hand-edit it in a text editor. Returns true on success, or nil + err.
 local function save_plans(plans)
   nova.mkdir(PLANS_DIR)
   local json = nova.json_encode(plans, { pretty = true })
-  nova.write_file(PLANS_FILE, json)
+  if json == nil then
+    return nil, "could not encode plans"
+  end
+  return nova.write_file(PLANS_FILE, json)
+end
+
+-- Surface a failed save as a clean error string (B5). Returns the error string
+-- when `ok` is nil, else nil so the caller proceeds to report success.
+local function save_error(ok, err, what)
+  if ok == nil then
+    return string.format("Error: could not save %s: %s", what, err or "unknown error")
+  end
+  return nil
 end
 
 -- Count the steps in a plan, defensively (missing steps table -> 0).
@@ -346,13 +392,10 @@ nova.register_tool({
     local new_id = max_id + 1
 
     -- Append id:N to the text so it round-trips through todo.txt on disk.
-    -- Avoid a double id: if the caller already included one, replace it.
-    local text = params.text
-    if text:match("%sid:%d+") then
-      text = text:gsub("%sid:%d+", " id:" .. new_id)
-    else
-      text = text .. " id:" .. new_id
-    end
+    -- Strip only a TRAILING id tag, then append the new one — a mid-sentence
+    -- `id:N` mention (e.g. "Fix id:3 reference") must be left untouched, not
+    -- globally rewritten (the old gsub rewrote every ` id:N` occurrence).
+    local text = (params.text:gsub("%s*id:%d+%s*$", "")) .. " id:" .. new_id
 
     local t = {
       done = false,
@@ -372,7 +415,8 @@ nova.register_tool({
       if key ~= "http" and key ~= "https" then t.tags[key] = val end
     end
     table.insert(_G.todos, t)
-    save_todos()
+    local save_err = save_error(save_todos(), "todos")
+    if save_err then return save_err end
     return "Added task #" .. #_G.todos .. " (id:" .. new_id .. "): " .. render_line(t) .. "\n\n" .. summarize(false)
   end,
 })
@@ -383,13 +427,13 @@ nova.register_tool({
   description = "Mark a task as done (completed). Sets the completion date automatically. Only mark a task done AFTER the required work is actually done and verified — never based on intent. Returns the updated list.",
   parameters = {
     id = {
-      type = "number",
+      type = "integer",
       description = "Task number (from todo_list) to mark complete",
     },
   },
   handler = function(params)
     load_todos()
-    if params.id == nil or params.id < 1 or params.id > #_G.todos then
+    if not is_index(params.id, #_G.todos) then
       return "Error: invalid task id (use todo_list to see valid ids)"
     end
     local t = _G.todos[params.id]
@@ -398,7 +442,8 @@ nova.register_tool({
     end
     t.done = true
     t.completed = today()
-    save_todos()
+    local save_err = save_error(save_todos(), "todos")
+    if save_err then return save_err end
     return "Completed task #" .. params.id .. ": " .. t.text .. "\n\n" .. summarize(false)
   end,
 })
@@ -409,17 +454,18 @@ nova.register_tool({
   description = "Delete a task permanently from the todo list. Use this for tasks that were added by mistake or are no longer relevant (not for completed work — use todo_done for that). Returns the updated list.",
   parameters = {
     id = {
-      type = "number",
+      type = "integer",
       description = "Task number (from todo_list) to delete",
     },
   },
   handler = function(params)
     load_todos()
-    if params.id == nil or params.id < 1 or params.id > #_G.todos then
+    if not is_index(params.id, #_G.todos) then
       return "Error: invalid task id (use todo_list to see valid ids)"
     end
     local removed = table.remove(_G.todos, params.id)
-    save_todos()
+    local save_err = save_error(save_todos(), "todos")
+    if save_err then return save_err end
     return "Deleted: " .. removed.text .. "\n\n" .. summarize(false)
   end,
 })
@@ -430,7 +476,7 @@ nova.register_tool({
   description = "Set or change a task's priority (A=high through Z=low). Pass priority as a single uppercase letter. Pass empty string or nil to remove priority. Returns the updated list.",
   parameters = {
     id = {
-      type = "number",
+      type = "integer",
       description = "Task number (from todo_list)",
     },
     priority = {
@@ -441,7 +487,7 @@ nova.register_tool({
   },
   handler = function(params)
     load_todos()
-    if params.id == nil or params.id < 1 or params.id > #_G.todos then
+    if not is_index(params.id, #_G.todos) then
       return "Error: invalid task id (use todo_list to see valid ids)"
     end
     local t = _G.todos[params.id]
@@ -458,7 +504,8 @@ nova.register_tool({
     else
       return "Error: priority must be a single letter A-Z or empty"
     end
-    save_todos()
+    local save_err = save_error(save_todos(), "todos")
+    if save_err then return save_err end
     return "Set priority " .. (t.priority or "(none)") .. " on task #" .. params.id .. "\n\n" .. summarize(false)
   end,
 })
@@ -497,7 +544,8 @@ nova.register_tool({
         t.text = t.text .. " id:" .. max_id
       end
     end
-    save_todos()
+    local save_err = save_error(save_todos(), "todos")
+    if save_err then return save_err end
     return "Replaced todo list with " .. #_G.todos .. " tasks.\n\n" .. summarize(false)
   end,
 })
@@ -510,13 +558,13 @@ nova.register_tool({
   description = "Get the detailed plan for a task (summary, checklist steps with done state, and notes). Call this BEFORE starting work on a task whose todo_list line showed [plan:N steps] — it shows how the work was decomposed. Returns 'No plan for task #N' if none exists; use todo_set_plan to create one.",
   parameters = {
     id = {
-      type = "number",
+      type = "integer",
       description = "Task number (from todo_list) whose plan to read",
     },
   },
   handler = function(params)
     load_todos()
-    if params.id == nil or params.id < 1 or params.id > #_G.todos then
+    if not is_index(params.id, #_G.todos) then
       return "Error: invalid task id (use todo_list to see valid ids)"
     end
     local t = _G.todos[params.id]
@@ -562,7 +610,7 @@ nova.register_tool({
   description = "Create or replace a task's detailed plan before doing multi-step work. Write a one-line summary, break the work into checklist steps (newline-separated), and optionally add free-form notes. The plan is stored separately in plans.json so todo_list stays compact — plan bodies are fetched on demand via todo_get_plan. Returns the saved plan.",
   parameters = {
     id = {
-      type = "number",
+      type = "integer",
       description = "Task number (from todo_list) to plan",
     },
     summary = {
@@ -581,7 +629,7 @@ nova.register_tool({
   },
   handler = function(params)
     load_todos()
-    if params.id == nil or params.id < 1 or params.id > #_G.todos then
+    if not is_index(params.id, #_G.todos) then
       return "Error: invalid task id (use todo_list to see valid ids)"
     end
     if not params.summary or params.summary == "" then
@@ -609,7 +657,8 @@ nova.register_tool({
       steps = step_list,
       notes = params.notes or "",
     }
-    save_plans(plans)
+    local save_err = save_error(save_plans(plans), "plans")
+    if save_err then return save_err end
 
     return string.format("Plan set for task #%d (id:%s): %s\n%d steps recorded.\n\nUse todo_get_plan to view it.",
       params.id, key, t.text, #step_list)
@@ -622,17 +671,17 @@ nova.register_tool({
   description = "Toggle a step's completion (done <-> not done) in a task's plan checklist. Use this right after finishing a planned step to track granular progress. Returns the updated plan. Requires a plan to exist (create one with todo_set_plan first).",
   parameters = {
     id = {
-      type = "number",
+      type = "integer",
       description = "Task number (from todo_list)",
     },
     step = {
-      type = "number",
+      type = "integer",
       description = "Step number to toggle (1-indexed, as shown by todo_get_plan)",
     },
   },
   handler = function(params)
     load_todos()
-    if params.id == nil or params.id < 1 or params.id > #_G.todos then
+    if not is_index(params.id, #_G.todos) then
       return "Error: invalid task id (use todo_list to see valid ids)"
     end
     local t = _G.todos[params.id]
@@ -643,26 +692,17 @@ nova.register_tool({
       return "Error: no plan steps for task #" .. params.id
         .. ". Use todo_set_plan to create one first."
     end
-    if params.step == nil or params.step < 1 or params.step > #plan.steps then
+    if not is_index(params.step, #plan.steps) then
       return string.format("Error: invalid step number (1-%d). Use todo_get_plan to see steps.", #plan.steps)
     end
 
     local s = plan.steps[params.step]
     s.done = not s.done
-    save_plans(plans)
+    local save_err = save_error(save_plans(plans), "plans")
+    if save_err then return save_err end
 
     local state = s.done and "done" or "open"
     return string.format("Step %d marked %s for task #%d.\n\n", params.step, state, params.id)
       .. "Use todo_get_plan to view the full plan."
   end,
 })
-
--- ── event hook: keep cache fresh on turn start ──────────────────────
-
--- On each turn start, force a reload of the todo cache so the first todo_*
--- call this turn reflects any external edits to todos.txt. This stays silent:
--- it does not inject plan bodies or task text into the turn's context — the
--- model must call todo_list / todo_get_plan explicitly to see anything.
-nova.on("turn_started", function(data)
-  load_todos()
-end)

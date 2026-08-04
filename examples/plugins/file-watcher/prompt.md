@@ -4,25 +4,39 @@ description: Session-scoped file-operation tracking driven by tool-call events.
 
 Use the `file-watcher` plugin to track and report file operations performed
 during the current session. It subscribes to `tool_call_finished` events and
-records file operations in memory for the lifetime of the session. State is
-not persisted across restarts.
+counts successful file-operation tool calls by kind (write/edit/delete/rename/
+copy) in memory for the lifetime of the session. State is not persisted across
+restarts.
 
 ## When to use each tool
 
-- `lua__file-watcher__track_file_op` — Manually record a file operation
-  (`read`, `write`, `delete`, `rename`) against a `path`. Call this when you
-  perform or observe a notable file operation you want counted.
 - `lua__file-watcher__file_stats` — Report how many file operations have been
-  tracked this session. Use this to summarize activity.
+  tracked this session, broken down by kind. Use this to summarize activity.
+- `lua__file-watcher__track_file_op` — Manually record a file operation
+  (`read`, `write`, `delete`, `rename`) against a `path`. Use this for
+  operations the event-driven counter can't see (e.g. reads, or bash-driven
+  changes).
+
+## How event tracking works
+
+The `tool_call_finished` event payload carries only the tool `name`, `call_id`,
+and `success` — **no arguments and no file paths**. So the plugin classifies
+events purely by tool name:
+
+- `lua__file-tools__write` → write
+- `lua__file-tools__edit` → edit
+- `lua__path-tools__delete_path` → delete
+- `lua__path-tools__move_path` → rename
+- `lua__path-tools__copy_path` → copy
+
+Only successful calls are counted. Because the payload has no path data, the
+event-derived counts cannot tell you *which* file changed — they are a
+per-kind tally only. For actual paths, use `track_file_op` or `lua__git-tools__git_status`.
 
 ## Guidelines
 
-- Tracking is **session-scoped and opt-in.** The plugin listens for
-  `tool_call_finished` events to observe bash tool calls, but operations are
-  only counted if someone calls `track_file_op` — the event hook records
-  context, it does not auto-classify every operation.
-- Use `track_file_op` after performing a file write/edit/delete/rename so the
-  session log reflects what actually happened.
-- `file_stats` returns a simple count. It is a lightweight summary, not a diff
-  or audit log — do not treat it as a source of truth for what changed in the
-  repo; use `lua__git-tools__git_status` for that.
+- Tracking is **session-scoped and opt-in.** The plugin only counts the
+  file-operation tools listed above; it does not observe bash or other tools.
+- `file_stats` is a lightweight summary, not a diff or audit log — do not
+  treat it as a source of truth for what changed in the repo; use
+  `lua__git-tools__git_status` for that.
