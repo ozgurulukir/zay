@@ -996,6 +996,9 @@ fn startTurnForLane(app: *App, lane: *Thread, prompt: []const u8, title_source: 
     lane.last_activity_ms = std.Io.Clock.now(.awake, app.io).toMilliseconds();
     lane.turn_tool_calls = 0;
     lane.stall_warned = false;
+    // A fresh worker turn invalidates any prior failure record.
+    if (lane.turn_failed) |old| app.gpa.free(old);
+    lane.turn_failed = null;
     lane.turn.submit();
     lane.turn_future = try app.getIo().concurrent(agent_worker.runAgentTurn, .{
         lane.agent.?,
@@ -1226,7 +1229,15 @@ pub fn deliverPendingLaneCompletions(app: *App) !bool {
         for (lane.transcript.messages.items) |m| {
             if (m.kind() == .tool) tool_count += 1;
         }
-        const message = try std.fmt.allocPrint(app.gpa, "Lane {s} ({s}) finished — {d} tool calls, final state: done. Read with `lane read {s}`; fold back with `lane merge {s}`.", .{ title, id, tool_count, id, id });
+        // A worker that failed mid-turn gets an honest completion — reporting
+        // it as "final state: done" hides the failure from the spawner, which
+        // then has no reason to read the lane or clean it up. The reason also
+        // sits in the lane's transcript as a notice, so `lane read` shows the
+        // full detail.
+        const message = if (lane.turn_failed) |reason|
+            try std.fmt.allocPrint(app.gpa, "Lane {s} ({s}) FAILED after {d} tool calls: {s}. Read with `lane read {s}`; the worker did not complete — fold what's salvageable with `lane merge {s}` or /close it.", .{ title, id, tool_count, reason, id, id })
+        else
+            try std.fmt.allocPrint(app.gpa, "Lane {s} ({s}) finished — {d} tool calls, final state: done. Read with `lane read {s}`; fold back with `lane merge {s}`.", .{ title, id, tool_count, id, id });
         defer app.gpa.free(message);
         _ = spawner.transcript.append(app.gpa, .notice, "lane", message) catch {};
         if (spawner == active) changed = true;
@@ -2008,6 +2019,40 @@ test "S11: a finished spawned worker rests — runtime freed, transcript + workt
     try std.testing.expect(lane.completion_delivered);
     // The spawner got the completion notice.
     try std.testing.expect(transcriptContains(app.threads.items[0], "finished"));
+}
+
+test "S11: a failed spawned worker is reported honestly, not as done" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
+    var fx = try GitFixture.init(gpa, io);
+    defer fx.deinit(gpa);
+    const app = &fx.app;
+
+    // A spawned worker lane (real runtime, finished turn) whose turn FAILED —
+    // e.g. the model request errored out. The failure reason is recorded on
+    // the lane by `applyAgentEvent` before delivery.
+    const wt = try createLaneWorktree(app, fx.repo, fx.home_dir);
+    const rt = app.createRuntime(wt.dest, fx.repo, null) catch |err| {
+        app.gpa.free(wt.branch);
+        app.gpa.free(wt.dest);
+        return err;
+    };
+    const lane = try gpa.create(Thread);
+    lane.* = Thread.initLive(rt.session_writer.session.id, &rt.agent, io, rt.gpa, &.{}, wt.branch, wt.dest, rt);
+    lane.spawned_by_agent = &fx.runtime.agent;
+    lane.turn_failed = try gpa.dupe(u8, "agent turn failed: ConnectionLost");
+    try app.threads.append(gpa, lane);
+    _ = try lane.transcript.append(gpa, .user, "you", "worker task");
+
+    const changed = try deliverPendingLaneCompletions(app);
+    try std.testing.expect(changed);
+    try std.testing.expect(lane.completion_delivered);
+    // The spawner is told the truth: FAILED + the reason, never "done".
+    const spawner = app.threads.items[0];
+    try std.testing.expect(transcriptContains(spawner, "FAILED"));
+    try std.testing.expect(transcriptContains(spawner, "ConnectionLost"));
+    try std.testing.expect(!transcriptContains(spawner, "final state: done"));
 }
 
 test "lane merge: dirty primary refused (M3), conflict rolls back, dirty source auto-commits" {

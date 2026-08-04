@@ -35,6 +35,7 @@ Example — spawn a worker: `{"command":"spawn","task":"Review the diff in PR #5
 ## Rules
 
 - **Only the driver lane may `spawn`/`enter`/`merge`/`create`/`cancel`/`await`/`steer`.** If you are a spawned worker, you get `list`/`read` only — do your task and hand back a summary; never open lanes yourself.
+- **Clean up every lane you spawn.** When a worker finishes — or fails — `lane read` its result, then fold it back with `lane merge`. A completion message that says **FAILED** means the worker did not finish: read the reason and salvage what's useful, but never leave the lane parked — parked lanes still count toward the 4-lane grid.
 - **Never run `git worktree add`.** Lanes exist only via `lane create`/`lane spawn`; a worktree Nova does not track is invisible to merge and cleanup.
 - **Max 4 lanes total — the driver's main lane plus 3 workers** (the split grid is 2×2). Fan out deliberately — one lane per independent unit, not a scattergun.
 - **`lane merge` refuses while you are entered** in the target lane — `lane leave` first (the tool batch's working directory is still rooted there).

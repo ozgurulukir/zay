@@ -116,6 +116,12 @@ completion_delivered: bool = false,
 last_activity_ms: i64 = 0,
 turn_tool_calls: u32 = 0,
 stall_warned: bool = false,
+/// Why the lane's last turn failed (the `turn_failed` notice text), or null
+/// when the turn finished cleanly. Owned. Set by `applyAgentEvent`, read by
+/// spawned-worker completion delivery so a failed worker is reported to its
+/// spawner honestly (not as "final state: done"), and reset when a new turn
+/// starts on the lane.
+turn_failed: ?[]u8 = null,
 
 /// A user message queued behind a running turn. `steer` injects it after the
 /// next tool batch instead of waiting for the turn to go idle. Text is owned.
@@ -149,6 +155,7 @@ pub const Engine = union(enum) {
 /// destroying the owned `AgentRuntime` — the lane is the runtime's owner.
 pub fn deinit(self: *Thread, gpa: std.mem.Allocator) void {
     if (self.title) |title| gpa.free(title);
+    if (self.turn_failed) |reason| gpa.free(reason);
     for (self.parent_context) |message| gpa.free(message);
     if (self.parent_context.len > 0) gpa.free(self.parent_context);
     self.transcript.deinit(gpa);

@@ -173,6 +173,11 @@ pub fn formatNoProviderMessage(app: *App) ![]u8 {
 pub fn resetTurnState(app: *App) void {
     app.thread.turn_view.reset(app.getIo());
     app.metrics.loading_frame = 0;
+    // A fresh turn invalidates the previous turn's failure record.
+    if (app.thread.turn_failed) |old| {
+        app.gpa.free(old);
+        app.thread.turn_failed = null;
+    }
     // Turn-start bookkeeping for the model-driven `lane` ops: a fresh turn
     // has made no progress yet, so anchor the activity clock now (a worker
     // is legitimately silent while its first model request is in flight)
@@ -256,6 +261,14 @@ pub fn applyAgentEvent(app: *App, event: agent_mod.Agent.Event) !bool {
     switch (event) {
         .tool_call_finished => app.thread.turn_tool_calls += 1,
         .turn_started => app.thread.turn_tool_calls = 0,
+        .turn_failed => |message| {
+            // Record why the turn failed (the same text lands in the
+            // transcript as a notice). Spawned-worker completion delivery
+            // reads this so a failed worker isn't reported as "done"; a new
+            // turn on the lane resets it.
+            if (app.thread.turn_failed) |old| app.gpa.free(old);
+            app.thread.turn_failed = try app.gpa.dupe(u8, message);
+        },
         else => {},
     }
     if (!outcome.project) {
