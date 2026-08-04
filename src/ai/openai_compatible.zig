@@ -170,13 +170,16 @@ pub const Client = struct {
         while (attempt <= self.config.max_retries) : (attempt += 1) {
             var retry_after_secs: ?u64 = null;
             const turn = self.sendOnce(payload.written(), observer, &retry_after_secs) catch |err| {
-                // Only head-phase transient statuses (429 + 5xx) are retried.
-                // Every other 4xx is permanent — a schema/auth/model error
-                // won't fix itself, and stream-mid errors never surface as
-                // these codes, so they propagate immediately too.
+                // Only head-phase transient failures are retried: 429/5xx
+                // statuses and connection drops before any response bytes.
+                // The model has produced nothing and no tool has run, so the
+                // request is idempotent. Every other 4xx is permanent — a
+                // schema/auth/model error won't fix itself — and stream-mid
+                // errors never surface as these codes, so they propagate
+                // immediately too.
                 if (attempt >= self.config.max_retries) return err;
                 switch (err) {
-                    error.HttpServerError, error.HttpRateLimited => {},
+                    error.HttpServerError, error.HttpRateLimited, error.ConnectionFailed => {},
                     else => return err,
                 }
                 const delay_ms = self.retryDelayMs(attempt, retry_after_secs);
@@ -196,23 +199,38 @@ pub const Client = struct {
     /// When a retryable status is hit, `retry_after_secs` receives the
     /// server's `Retry-After` value (integer seconds) if one was sent.
     fn sendOnce(self: *Client, payload: []const u8, observer: anytype, retry_after_secs: *?u64) !ai.Turn {
-        var req = try self.http_client.request(.POST, try std.Uri.parse(self.url), .{
+        // Everything up to and including the response head is "head phase":
+        // the model has produced nothing and no tool has run, so `prompt`
+        // may retry the same payload verbatim. Connection/read drops here
+        // are mapped to `error.ConnectionFailed` (retryable); protocol-level
+        // rejects pass through unchanged (permanent).
+        var req = self.http_client.request(.POST, try std.Uri.parse(self.url), .{
             .headers = .{
                 .authorization = if (self.authorization) |a| .{ .override = a } else .omit,
                 .content_type = .{ .override = "application/json" },
             },
-        });
+        }) catch |err| return self.headPhaseFailure(err);
         defer req.deinit();
 
         req.transfer_encoding = .chunked;
         var body_buffer: [body_buffer_bytes]u8 = undefined;
-        var body_writer = try req.sendBodyUnflushed(&body_buffer);
-        try body_writer.writer.writeAll(payload);
-        try body_writer.end();
-        try req.connection.?.flush();
+        var body_writer = req.sendBodyUnflushed(&body_buffer) catch |err| return self.headPhaseFailure(err);
+        body_writer.writer.writeAll(payload) catch |err| return self.headPhaseFailure(err);
+        body_writer.end() catch |err| return self.headPhaseFailure(err);
+        req.connection.?.flush() catch |err| return self.headPhaseFailure(err);
 
         var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
-        var http_response = try req.receiveHead(&redirect_buffer);
+        var http_response = req.receiveHead(&redirect_buffer) catch |err| {
+            // `receiveHead` fails with `error.ReadFailed` when the connection
+            // drops; capture the underlying socket error so the UI shows what
+            // actually went wrong instead of the opaque `ReadFailed`.
+            if (err == error.ReadFailed) {
+                if (req.connection) |conn| {
+                    if (conn.getReadError()) |read_err| self.recordReadFailure(read_err);
+                }
+            }
+            return self.headPhaseFailure(err);
+        };
         const status_code: u16 = @intFromEnum(http_response.head.status);
         logger.log("openai_compatible.response.head status={d}", .{status_code});
         if (status_code >= 400) {
@@ -255,6 +273,41 @@ pub const Client = struct {
         var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
         const reader = http_response.reader(&transfer_buffer);
         return try stream_parser.readStream(self.gpa, reader, observer, &self.tool_call_seq, self.config.max_parallel_tool_calls);
+    }
+
+    /// Map a failure that occurred before any response bytes (connect, body
+    /// send, or head read) to `error.ConnectionFailed` when it is a transient
+    /// connection/read drop. `prompt` retries those verbatim — the model has
+    /// produced nothing and no tool has run, so the request is idempotent,
+    /// exactly like a head-phase 429/5xx. Protocol-level rejects are returned
+    /// unchanged; a retry will not fix them.
+    fn headPhaseFailure(self: *Client, err: anyerror) anyerror {
+        _ = self;
+        return switch (err) {
+            error.ReadFailed,
+            error.WriteFailed,
+            error.EndOfStream,
+            error.ConnectionRefused,
+            error.ConnectionResetByPeer,
+            error.ConnectionTimedOut,
+            error.BrokenPipe,
+            => error.ConnectionFailed,
+            else => err,
+        };
+    }
+
+    /// Record the underlying socket error from a dropped response read for
+    /// the UI, so a connection failure shows something actionable instead of
+    /// the opaque `ReadFailed`. Best-effort: a failure to build the string
+    /// just leaves the detail unset.
+    fn recordReadFailure(self: *Client, read_err: anyerror) void {
+        const detail = std.fmt.allocPrint(
+            self.gpa,
+            "Connection to the model provider was lost: {s}",
+            .{@errorName(read_err)},
+        ) catch return;
+        self.clearErrorDetail();
+        self.last_error_detail = detail;
     }
 
     /// Delay before a retry: the server's `Retry-After` (integer seconds)
@@ -1527,6 +1580,36 @@ test "prompt retries a 429 and honors Retry-After" {
     defer turn.deinit(gpa);
     try std.testing.expectEqual(@as(u32, 2), server.connection_count.load(.monotonic));
     try std.testing.expectEqualStrings("hi", turn.assistant.assistant.content[0].text.text);
+}
+
+test "headPhaseFailure maps transient connection drops to a retryable error" {
+    // The head phase is idempotent — the model has produced nothing and no
+    // tool has run — so connection/read drops must surface as the retryable
+    // `error.ConnectionFailed`, while protocol-level rejects pass through as
+    // permanent. (A TCP-level drop can't be simulated over `std.testing.io`,
+    // whose event loop never wakes a blocked head read on peer-close, so the
+    // mapping is tested directly.)
+    const gpa = std.testing.allocator;
+    var client: Client = undefined;
+    try client.init(gpa, std.testing.io, .{
+        .base_url = "http://127.0.0.1:1/v1",
+        .api_key = "test-key",
+        .model = "test-model",
+        .tools = &.{},
+        .mcp_tools = &.{},
+    });
+    defer client.deinit();
+
+    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.ReadFailed));
+    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.WriteFailed));
+    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.EndOfStream));
+    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.ConnectionRefused));
+    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.ConnectionResetByPeer));
+    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.ConnectionTimedOut));
+    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.BrokenPipe));
+    // Permanent failures are returned unchanged.
+    try std.testing.expectEqual(error.HttpClientError, client.headPhaseFailure(error.HttpClientError));
+    try std.testing.expectEqual(error.HttpHeadersInvalid, client.headPhaseFailure(error.HttpHeadersInvalid));
 }
 
 test "prompt does not retry a permanent 4xx" {
