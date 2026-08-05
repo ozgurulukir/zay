@@ -5,15 +5,11 @@
 **The terminal AI agent for shipping code.**
 
 [![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?style=flat-square&logo=zig&logoColor=white)](https://ziglang.org)
+[![Version](https://img.shields.io/badge/version-0.2.0--beta.1-blue?style=flat-square)](https://github.com/ozgurulukir/nova-agent/releases)
 [![License](https://img.shields.io/github/license/ozgurulukir/nova-agent?style=flat-square)](LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/ozgurulukir/nova-agent?style=flat-square)](https://github.com/ozgurulukir/nova-agent/stargazers)
 
 </div>
-
-<!--
-  README-ASSET-TODO: Replace the inline demo below with a real terminal
-  recording (GIF via gifski, or asciinema SVG, ~1200px wide, <15s).
--->
 
 ## Nova in action
 
@@ -32,31 +28,35 @@ agent> The PR replaces random sampling with LRU eviction so hot keys survive
        the test in src/cache_test.zig:11.
 ```
 
-Nova is a native terminal UI for working with AI coding agents. It runs in your terminal — no Electron, no browser tab, no Docker. Just a Zig binary that connects to any OpenAI-compatible provider, manages parallel conversation lanes, and keeps your session history in SQLite.
+Nova is a native terminal AI agent for working with code. It runs in your terminal — no Electron, no browser tab, no Docker. Just a Zig binary that connects to any OpenAI-compatible provider, orchestrates parallel work across git worktree lanes, and keeps every session in SQLite.
 
-> [!WARNING]
-> Alpha software. Things break. Things change. Things get better.
+> [!IMPORTANT]
+> Beta software. The core is stable and daily-driven, but edges are still being hardened. APIs and config formats may shift before 1.0. Things get better.
 
 ## Why Nova?
 
 - **Runs where you already work.** A native TUI built with [VXFW](https://github.com/vaxis/vaxis) — no Electron, no web stack, no container to babysit.
-- **Local-first.** Every conversation is recorded in a SQLite database on your machine. Resume any session later, browse its full timeline, or export it as Markdown.
-- **Bring your own provider.** OpenAI Codex, Anthropic, or any OpenAI-compatible endpoint (Ollama, llama.cpp, OpenRouter, Cerebras, ...). Bring your own key, no lock-in.
-- **Think in parallel.** Fork your workspace into lanes, run several agents side by side, merge the winner back into the main line.
-- **Safe by default.** Dangerous shell commands are gated by a classifier with a built-in local backstop — anything destructive waits for your approval.
-- **Extensible.** Sandboxed Lua plugins and MCP servers add tools and data sources without touching the core.
+- **Local-first.** Every conversation is recorded in a SQLite database on your machine. Resume any session, browse its full timeline tree, or export it as Markdown.
+- **Bring your own provider.** OpenAI, Anthropic, or any OpenAI-compatible endpoint (Ollama, llama.cpp, OpenRouter, Cerebras, ...). Bring your own key, no lock-in.
+- **Think in parallel.** Fork your workspace into isolated git worktree lanes, run several agents side by side, and merge the winner back. Workers are contained to their worktree — destructive commands stay in their lane.
+- **Safe by default.** Dangerous shell commands are gated by a ModernBERT classifier with a built-in local pattern-matching backstop. Anything destructive waits for your approval, and the gate surfaces even when the worker runs in a background lane.
+- **Extensible.** Sandboxed Lua plugins and MCP servers (stdio or Streamable HTTP) add tools and data sources without touching the core.
 
 ## Features
 
 | Feature | Description |
 |---------|-------------|
 | **Terminal-native TUI** | Built with [VXFW](https://github.com/vaxis/vaxis) — no Electron, no web tech, just your terminal |
-| **Any AI provider** | OpenAI, Anthropic, or any OpenAI-compatible endpoint. Bring your own key. |
-| **Parallel lanes** | Fork worktrees into side-by-side agent conversations; merge when ready |
+| **Any AI provider** | OpenAI, Anthropic, or any OpenAI-compatible endpoint. Multi-provider catalogue with per-session model selection. |
+| **Parallel lanes** | Fork git worktrees into side-by-side agent conversations; workers are contained to their worktree; merge when ready |
+| **Reasoning effort** | Per-session reasoning-effort control (minimal / low / medium / high) wired end-to-end through the request path |
+| **Bash safety** | ModernBERT ONNX classifier + local destructive-command backstop; destructive ops gated behind approval |
 | **Diff viewer** | Full-screen git diff review with inline comments sent back to the agent |
-| **MCP tool integration** | Connect any [Model Context Protocol](https://modelcontextprotocol.io) server — stdio or remote |
-| **Lua plugin system** | Extend Nova with sandboxed Lua plugins — filesystem, git, JSON, custom tools |
-| **Session persistence** | Full conversation history in SQLite. Resume any session, any time. |
+| **MCP integration** | Connect any [Model Context Protocol](https://modelcontextprotocol.io) server — stdio or Streamable HTTP, with custom headers and async connects |
+| **Lua plugins** | Extend Nova with sandboxed Lua plugins — filesystem, git, JSON bridge, custom tools, event hooks, prompt injection |
+| **Session persistence** | Full conversation history in SQLite. Resume any session, browse the timeline tree, rename or delete past sessions. |
+| **Context compaction** | Non-blocking context compaction with calibrated retention budgets — keeps long sessions under the model's context window without losing your place |
+| **Background jobs** | Run shell commands in the background; results land as messages when the owning lane is idle |
 
 ## Getting around
 
@@ -67,14 +67,18 @@ Type a prompt and press Enter. A leading `/` opens the command palette; `@file` 
 | `/` | Open the command palette |
 | `@file` | Attach a file's contents to the prompt |
 | `$skill` | Invoke a specialized skill |
+| `Ctrl+↑ / Alt+↑` | Previous prompt in history |
+| `Ctrl+↓ / Alt+↓` | Next prompt in history |
+| `Shift+↓` | Jump to bottom of conversation |
 | `Ctrl+F` | Search the current transcript |
 | `Ctrl+O` | Background jobs & logs |
 | `Shift+Tab` | Cycle through parallel lanes |
 | `Ctrl+L` | Fullscreen / split lane view |
-| `Ctrl+V` / `Shift+Ins` | Paste from the system clipboard |
-| `Esc` | Cancel / unselect / close |
+| `Ctrl+V / Shift+Ins` | Paste from the system clipboard |
+| `Tab` | Expand / collapse active message |
+| `Esc` | Cancel turn / unselect / close |
 
-Handy commands: `/connect` (providers & keys), `/model` (model & reasoning effort), `/new` and `/resume` (sessions), `/parallel` and `/lanes` (parallel work), `/diff` (diff review & comments), `/export` (Markdown). Press `/help` for the full reference.
+Slash commands: `/connect` (providers & keys), `/model` (model & reasoning effort), `/settings` (config editor), `/new` and `/resume` (sessions), `/timeline` (session tree browser), `/parallel` and `/lanes` (parallel work), `/diff` (diff review & comments), `/save` (git-shadow snapshot), `/export` (Markdown), `/status`, `/skills`, `/copy`, `/paste`, `/clear`, `/help`, `/exit`.
 
 ## Quick Start
 
@@ -112,6 +116,7 @@ flowchart LR
     C --> E[MCP Servers]
     C --> F[Lua Plugins]
     C --> G[Bash Tool]
+    C --> L[Parallel Lanes]
     B --> H[SQLite Sessions]
 
     style A fill:#2d2d2d,color:#fff
@@ -121,10 +126,11 @@ flowchart LR
     style E fill:#533483,color:#fff
     style F fill:#3a1c5e,color:#fff
     style G fill:#1a3a3a,color:#fff
+    style L fill:#2a1a3e,color:#fff
     style H fill:#2d2d2d,color:#fff
 ```
 
-The TUI dispatches events through a modular pipeline — input routing, turn lifecycle, background jobs, and transcript rendering are all separate concerns. The agent loop orchestrates LLM calls, tool execution, and context compaction. Everything is logged to a global SQLite database for session resume and timeline browsing.
+The TUI dispatches events through a modular pipeline — input routing, turn lifecycle, background jobs, lane bridge, and transcript rendering are all separate concerns. The agent loop orchestrates LLM calls (with retry/backoff and a shared concurrent-request limiter across lanes), tool execution (schema-validated), and context compaction. Everything is logged to a global SQLite database for session resume and timeline browsing.
 
 ## Configuration
 
@@ -154,12 +160,13 @@ nova.register_tool({
 })
 ```
 
-The tool appears in the agent's tool list as `lua__my-tools__greet` and is invoked like any other. Prefer an existing ecosystem? MCP servers plug in with a few lines of config — see [docs/MCP.md](docs/MCP.md). Full plugin guide: [docs/plugins/](docs/plugins/).
+The tool appears in the agent's tool list as `lua__my-tools__greet` and is invoked like any other. Plugins can also hook events, inject system-prompt fragments, and use the `nova.json_decode`/`nova.json_encode` bridge for structured data. Prefer an existing ecosystem? MCP servers plug in with a few lines of config — stdio or Streamable HTTP, with custom request headers for authenticated endpoints. See [docs/MCP.md](docs/MCP.md) and [docs/plugins/](docs/plugins/) for the full guides.
 
 ## Under the hood
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the pieces fit together
 - [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md) — design principles
+- [docs/PATTERNS.md](docs/PATTERNS.md) — codebase patterns and engineering notes
 - [docs/MCP.md](docs/MCP.md) — connecting MCP servers
 - [docs/plugins/](docs/plugins/) — writing Lua plugins
 
