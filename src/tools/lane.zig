@@ -4,9 +4,11 @@
 //! `LaneBridge` and resolved by the UI on its tick (see `lane_bridge.zig`).
 //!
 //! Workspace scoping (S5/S6): `lane enter`/`leave` mutate `Agent.workspace`
-//! on this worker thread, between tool batches — the next batch's executor is
-//! rebuilt from `effectiveCwd()`, so the scoping is atomic per batch. `enter`
-//! borrows the lane's path (owned by that lane's `Thread`), never copies it.
+//! (via `setWorkspace`) on this worker thread. The re-root takes effect from
+//! the next tool call — the executor refreshes its cwd from `effectiveCwd()`
+//! after every `lane` call mid-batch, so sibling calls in the same batch
+//! already run at the new root. `enter` borrows the lane's path (owned by
+//! that lane's `Thread`), never copies it.
 
 const std = @import("std");
 
@@ -173,17 +175,19 @@ pub fn runTool(
     // `text` is owned by the UI; everything else in the response is borrowed.
     defer gpa.free(resp.text);
 
-    // Workspace scoping is a worker-thread write, read by the next batch's
-    // executor (H4). `enter` borrows the lane's path; `leave` drops the
-    // borrow. The lane Thread owns the path and is guaranteed alive (S17).
+    // Workspace scoping is a worker-thread write, read by the next tool call
+    // (H4). `enter` borrows the lane's path; `leave` drops the borrow. The
+    // lane Thread owns the path and is guaranteed alive (S17). The write goes
+    // through `setWorkspace` so the UI thread's reads (`driverWorkspace`,
+    // `clearWorkspaceBorrowForPath`) are mutex-guarded against the tear.
     // Only enter/leave touch the agent — list/read/etc. skip the cast.
     if (parsed.command == .enter or parsed.command == .leave) {
         const agent: *agent_mod.Agent = @ptrCast(@alignCast(requester));
         switch (parsed.command) {
             .enter => {
-                if (resp.path) |path| agent.workspace = path;
+                if (resp.path) |path| agent.setWorkspace(path);
             },
-            .leave => agent.workspace = null,
+            .leave => agent.setWorkspace(null),
             else => {},
         }
     }
@@ -386,7 +390,7 @@ test "lane enter/leave write the agent workspace via the bridge" {
     try std.testing.expect(bridge.pending != null);
     bridge.service(std.testing.io, undefined, &Handler.handle);
     thread1.join();
-    try std.testing.expectEqualStrings(Handler.path, agent.workspace.?);
+    try std.testing.expectEqualStrings(Handler.path, agent.workspaceBorrow().?);
     try std.testing.expectEqualStrings(Handler.path, agent.effectiveCwd());
 
     // ── leave: the tool clears the borrow.
@@ -402,6 +406,6 @@ test "lane enter/leave write the agent workspace via the bridge" {
     try std.testing.expect(bridge.pending != null);
     bridge.service(std.testing.io, undefined, &Handler.handle);
     thread2.join();
-    try std.testing.expect(agent.workspace == null);
+    try std.testing.expect(agent.workspaceBorrow() == null);
     try std.testing.expectEqualStrings(".", agent.effectiveCwd());
 }

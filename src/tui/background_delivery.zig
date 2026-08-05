@@ -9,6 +9,7 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const tui = @import("../tui.zig");
+const queue_mod = @import("queue.zig");
 
 const App = tui.App;
 const BackgroundDelivery = tui.BackgroundDelivery;
@@ -102,7 +103,12 @@ pub fn deliverPendingBackground(app: *App) !bool {
         _ = lane.transcript.append(app.gpa, .notice, "background", delivery.notice) catch {};
         if (lane == active) changed = true;
         const start_turn = delivery.message != null;
-        if (delivery.message) |message| lane.agent.?.enqueueRaw(message) catch {};
+        if (delivery.message) |message| {
+            // Atomic enqueue + mirror: a QueueFull drop writes nothing on
+            // either side, so the mirror stays 1:1 with the agent queue and
+            // `steerSelectedQueued` indices stay aligned.
+            _ = queue_mod.enqueueRawMirrored(app, lane, message);
+        }
         freeDelivery(app, delivery);
         _ = app.background_modal_state.pending.orderedRemove(i);
         if (start_turn) {
@@ -165,4 +171,108 @@ pub fn cancelSelectedBackgroundJob(app: *App) void {
     const sel = @min(app.background_modal_state.selection, views.len - 1);
     _ = manager.cancel(views[sel].id);
     app.background_modal_state.cancel_focus = false;
+}
+
+// ── Tests ──
+
+const agent_mod = @import("../agent.zig");
+const runtime_mod = @import("../runtime.zig");
+
+/// A live primary runtime with no provider: delivery takes the
+/// `startDeliveryTurnOnCurrentThread` flush+clearQueue branch instead of
+/// starting a real worker turn. Same field shape as GitFixture's runtime
+/// (lane_lifecycle.zig), minus the git scaffolding.
+fn createNoProviderRuntime(gpa: std.mem.Allocator, io: std.Io) !*runtime_mod.AgentRuntime {
+    const runtime = try gpa.create(runtime_mod.AgentRuntime);
+    errdefer gpa.destroy(runtime);
+    runtime.gpa = gpa;
+    runtime.io = io;
+    runtime.cwd = ".";
+    runtime.home_dir = ".";
+    runtime.client = .none;
+    runtime.base_system_prompt = "test";
+    runtime.system_prompt = "test";
+    runtime.session_writer = undefined;
+    runtime.agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    runtime.diagnostics = &.{};
+    runtime.owned_client = null;
+    runtime.owned_compaction_client = null;
+    runtime.owned_naming_client = null;
+    runtime.naming_client = .none;
+    runtime.skills = &.{};
+    runtime.plugin_prompts = &.{};
+    return runtime;
+}
+
+test "M2: a QueueFull background drop gains no mirror entry" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const runtime = try createNoProviderRuntime(gpa, io);
+    defer gpa.destroy(runtime);
+    defer runtime.agent.deinit();
+    var app = try tui.App.init(io, gpa, &runtime.agent);
+    defer app.deinit();
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = false } };
+
+    // Fill the agent queue to capacity so the delivery's enqueue fails.
+    for (0..runtime.agent.message_queue_storage.len) |_| try runtime.agent.enqueueRaw("filler");
+
+    try app.background_modal_state.pending.append(app.gpa, .{
+        .owner = &runtime.agent,
+        .notice = try gpa.dupe(u8, "job (cmd) finished — exit 0"),
+        .message = try gpa.dupe(u8, "job result"),
+    });
+
+    _ = try deliverPendingBackground(&app);
+
+    // The message is dropped (QueueFull) and the mirror must NOT gain the
+    // orphan entry — a mirror ahead of the agent queue shifts every
+    // `steerSelectedQueued` index. The notice still lands, the delivery is
+    // consumed, and the no-provider branch clears the stranded queue.
+    try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.background_modal_state.pending.items.len);
+    try std.testing.expectEqual(@as(u32, 0), runtime.agent.message_queue.len());
+    try std.testing.expect(transcriptContains(app.thread, "finished — exit 0"));
+}
+
+test "M2: a no-provider delivery clears the mirror in lockstep with the agent queue" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const runtime = try createNoProviderRuntime(gpa, io);
+    defer gpa.destroy(runtime);
+    defer runtime.agent.deinit();
+    var app = try tui.App.init(io, gpa, &runtime.agent);
+    defer app.deinit();
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = false } };
+
+    try app.background_modal_state.pending.append(app.gpa, .{
+        .owner = &runtime.agent,
+        .notice = try gpa.dupe(u8, "job (cmd) finished — exit 0"),
+        .message = try gpa.dupe(u8, "job result"),
+    });
+
+    _ = try deliverPendingBackground(&app);
+
+    // The enqueue succeeded, then the no-provider branch dropped the message
+    // instead of starting a doomed turn: the mirror must be flushed in
+    // lockstep with the cleared agent queue (the raw entry is dropped
+    // unrendered — the notice above is the only transcript record).
+    try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
+    try std.testing.expectEqual(@as(u32, 0), runtime.agent.message_queue.len());
+    try std.testing.expectEqual(@as(usize, 0), app.background_modal_state.pending.items.len);
+    try std.testing.expect(transcriptContains(app.thread, "finished — exit 0"));
+    try std.testing.expect(!transcriptContains(app.thread, "job result"));
+}
+
+fn transcriptContains(lane: *tui.Thread, needle: []const u8) bool {
+    for (lane.transcript.messages.items) |m| {
+        const body: []const u8 = switch (m) {
+            .user => |x| x.body,
+            .agent => |x| x.body,
+            .notice => |x| x.body,
+            else => continue,
+        };
+        if (std.mem.indexOf(u8, body, needle) != null) return true;
+    }
+    return false;
 }

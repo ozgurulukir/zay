@@ -91,12 +91,19 @@ parent_context: [][]u8 = &.{},
 /// `io` to cancel, so the App (not `deinit` here) is responsible for it.
 naming_future: ?std.Io.Future(naming.BranchOutcome) = null,
 naming_done: std.atomic.Value(bool) = .init(false),
-/// Set on a lane spawned by the model via `lane spawn`: the `*Agent` that
-/// spawned it (as `?*agent_mod.Agent`). Completion delivery routes to that
-/// agent's lane; a spawner that is closed/abandoned first makes
-/// `laneForAgent` return null and the delivery is dropped (M7). Never
-/// dereferenced — only compared against live `lane.agent` pointers.
-spawned_by_agent: ?*agent_mod.Agent = null,
+/// Set on a lane spawned by the model via `lane spawn`: the generation of
+/// the `Thread` that spawned it. Completion delivery routes to the lane
+/// whose `generation` matches; a spawner that is closed/abandoned first
+/// makes `laneByGeneration` return null and the delivery is dropped (M7).
+/// A generation counter (not a raw `*Agent` pointer) survives session
+/// switches, where the spawner's agent is freed and allocator address
+/// reuse could otherwise misroute a completion.
+spawned_by_generation: ?u64 = null,
+/// Monotonic identity for this lane, assigned from the App's
+/// `lane_generation_counter` at every Thread creation site. Used to route
+/// spawned-worker completions across session switches (see
+/// `spawned_by_generation`).
+generation: u64 = 0,
 /// Set by `lane read`/`await`/successful `merge` (M2): the orchestrator has
 /// consumed the worker's result, so completion delivery appends only a terse
 /// notice — no raw enqueue, no answer turn.
@@ -124,10 +131,15 @@ stall_warned: bool = false,
 turn_failed: ?[]u8 = null,
 
 /// A user message queued behind a running turn. `steer` injects it after the
-/// next tool batch instead of waiting for the turn to go idle. Text is owned.
+/// next tool batch instead of waiting for the turn to go idle. `raw` marks a
+/// machine-generated message (lane completion / background delivery) that the
+/// mirror holds only to keep 1:1 parity with the agent queue — it is never
+/// rendered as a user row (the delivery path already wrote its own notice).
+/// Text is owned.
 pub const QueuedMessage = struct {
     text: []const u8,
     steer: bool = false,
+    raw: bool = false,
 };
 
 /// A live lane: its git worktree identity plus the owned runtime driving it.

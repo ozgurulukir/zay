@@ -14,6 +14,7 @@ const lanes_util = @import("lanes.zig");
 const lanes_picker = @import("widgets/lanes_picker.zig");
 const naming_mod = @import("naming.zig");
 const turn_view_mod = @import("turn_view.zig");
+const queue_mod = @import("queue.zig");
 const runtime_mod = @import("../runtime.zig");
 const command_router = @import("command_router.zig");
 const vcs = @import("../vcs.zig");
@@ -161,10 +162,10 @@ fn reloadParkedLanes(app: *App) !void {
 fn clearWorkspaceBorrowForPath(app: *App, path: []const u8) !void {
     for (app.threads.items) |other| {
         const agent = other.agent orelse continue;
-        const ws = agent.workspace orelse continue;
+        const ws = agent.workspaceBorrow() orelse continue;
         if (!std.mem.eql(u8, ws, path)) continue;
         if (other.turn.isActive()) return error.InFlightTurn;
-        agent.workspace = null;
+        agent.setWorkspace(null);
     }
 }
 
@@ -585,6 +586,14 @@ fn laneStatus(app: *App, lane: *Thread) []u8 {
         .interrupting => return app.gpa.dupe(u8, "cancelling") catch unreachable,
         .active => {},
     }
+    // A worker blocked on a tool approval is waiting on the human, not stuck —
+    // report it before the stall check so the orchestrator gets an honest
+    // signal instead of a fake "STALLED" after `worker_stall_ms`.
+    if (lane.worker_context) |*worker| {
+        if (worker.approval.pending(worker.io)) {
+            return app.gpa.dupe(u8, "running — waiting for approval (a tool needs your OK in that lane's pane)") catch unreachable;
+        }
+    }
     if (lane.last_activity_ms == 0) {
         return std.fmt.allocPrint(app.gpa, "running — {d} tool calls", .{lane.turn_tool_calls}) catch unreachable;
     }
@@ -683,7 +692,7 @@ fn laneIdOf(lane: *Thread) ?[]const u8 {
 fn driverWorkspace(app: *const App) ?[]const u8 {
     if (app.threads.items.len == 0) return null;
     const agent = app.threads.items[0].agent orelse return null;
-    return agent.workspace;
+    return agent.workspaceBorrow();
 }
 
 fn listLanes(app: *App) ?Resp {
@@ -780,6 +789,7 @@ fn createLane(app: *App, req: *const lane_bridge.Request) ?Resp {
         return failResp(app.gpa, "lane: out of memory\n", .{});
     };
     lane.* = .{ .engine = .{ .idle = .{ .working = .{ .branch = wt.branch, .path = wt.dest } } } };
+    lane.generation = app.nextLaneGeneration();
     // An idle lane has no runtime to name itself — `purpose` becomes its
     // visible title instead, so the split grid reads as the task, not
     // "untitled".
@@ -868,7 +878,12 @@ fn mergeLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     }
     abandonLane(app, index) catch {};
     if (app.threads.items.len < 2) app.split = false;
-    return resp(app.gpa, "Merged lane {s} into the primary tree and removed it. Working root is {s} (repo root).\n", .{ id, repo }, null, null);
+    // Report the driver's REAL workspace root: it may hold a borrow in another
+    // lane (H5b only refuses merging the lane the driver is currently entered
+    // in), so claiming the repo root would lie to the model.
+    const ws_root = driverWorkspace(app) orelse repo;
+    const suffix: []const u8 = if (driverWorkspace(app) != null) "" else " (repo root)";
+    return resp(app.gpa, "Merged lane {s} into the primary tree and removed it. Working root is {s}{s}.\n", .{ id, ws_root, suffix }, null, null);
 }
 
 /// `lane spawn {task}`: start an independent worker agent in a fresh live
@@ -932,7 +947,8 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
         wt.dest, // adopted by the lane
         runtime,
     );
-    lane.spawned_by_agent = spawner.agent;
+    lane.generation = app.nextLaneGeneration();
+    lane.spawned_by_generation = spawner.generation;
     app.threads.append(app.gpa, lane) catch {
         lane.deinit(app.gpa); // frees the adopted runtime, context, branch, path
         app.gpa.destroy(lane);
@@ -1000,19 +1016,13 @@ fn startTurnForLane(app: *App, lane: *Thread, prompt: []const u8, title_source: 
     if (lanes_util.workingLaneOf(lane) != null) {
         app.scheduleLaneNaming(lane, title_source) catch {};
     }
-    // The spawn path bypasses `resetTurnState`, so pick the spinner word
-    // here — every other `awaitModel` caller runs `resetTurnState` first.
-    lane.turn_view.loading_word_index = turn_view_mod.chooseLoadingWordIndex(app.io);
-    lane.turn_view.awaitModel();
-    // The spawn path bypasses `resetTurnState`, so anchor the `lane`-op
-    // activity clock here — a freshly spawned worker is legitimately silent
-    // while its first model request is in flight.
-    lane.last_activity_ms = std.Io.Clock.now(.awake, app.io).toMilliseconds();
-    lane.turn_tool_calls = 0;
-    lane.stall_warned = false;
-    // A fresh worker turn invalidates any prior failure record.
-    if (lane.turn_failed) |old| app.gpa.free(old);
-    lane.turn_failed = null;
+    // `app.thread` is scope-swapped to `lane` above, so `resetTurnState`
+    // operates on the lane: it picks the spinner word, frees any prior
+    // `turn_failed`, anchors the activity clock, and zeroes the tool-call
+    // tally + stall latch — exactly the bookkeeping the spawn path used to
+    // hand-roll. `awaitModel` follows, as in `beginSubmit`.
+    app.resetTurnState();
+    app.thread.turn_view.awaitModel();
     lane.turn.submit();
     lane.turn_future = try app.getIo().concurrent(agent_worker.runAgentTurn, .{
         lane.agent.?,
@@ -1099,6 +1109,12 @@ fn cancelLaneTurn(app: *App, lane: *Thread) void {
     var event: agent_mod.Agent.Event = .{ .turn_failed = message };
     defer event.deinit(app.gpa);
     _ = lane.turn_view.apply(app.gpa, &lane.transcript, event) catch {};
+    // Record the interrupt as a failure so completion delivery reports the
+    // worker honestly ("FAILED — Interrupted.") instead of "final state: done".
+    // The event's copy is freed by `event.deinit`; this is a second dupe owned
+    // by `lane.turn_failed` (reset by the next `resetTurnState`).
+    if (lane.turn_failed) |old| app.gpa.free(old);
+    lane.turn_failed = app.gpa.dupe(u8, agent_worker.cancel_message) catch null;
     if (lane.turn.state == .active) lane.turn.interrupt();
     discardAbandonedTurnOnLane(app, lane);
 }
@@ -1179,8 +1195,8 @@ fn steerLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
 /// Rest a finished spawned worker: free its runtime + worker context, keep
 /// the Thread + transcript + worktree identity as an idle engine. The lane
 /// stays in the grid (distinct from `/close`, which removes it), read/await/
-/// merge keep working on the in-memory transcript, and `laneForAgent` can no
-/// longer match the freed agent (M7).
+/// merge keep working on the in-memory transcript, and `laneByGeneration` can
+/// no longer match the freed agent's lane (M7).
 fn parkFinishedWorker(app: *App, lane: *Thread) void {
     const live = switch (lane.engine) {
         .live => |*l| l,
@@ -1210,7 +1226,7 @@ pub fn deliverPendingLaneCompletions(app: *App) !bool {
 
     // 1. Rest finished spawned workers.
     for (app.threads.items) |lane| {
-        if (lane.spawned_by_agent == null) continue;
+        if (lane.spawned_by_generation == null) continue;
         if (lane.completion_delivered) continue;
         if (lane.engine == .live and lane.turn.state == .idle and lane.transcript.messages.items.len > 0) {
             parkFinishedWorker(app, lane);
@@ -1220,10 +1236,10 @@ pub fn deliverPendingLaneCompletions(app: *App) !bool {
 
     // 2. Deliver parked completions to idle spawners.
     for (app.threads.items) |lane| {
-        if (lane.spawned_by_agent == null) continue;
+        if (lane.spawned_by_generation == null) continue;
         if (lane.completion_delivered) continue;
         if (lane.engine != .idle) continue; // still running / not yet parked
-        const spawner = app.laneForAgent(lane.spawned_by_agent.?) orelse {
+        const spawner = app.laneByGeneration(lane.spawned_by_generation.?) orelse {
             lane.completion_delivered = true; // spawner gone — drop it (M7)
             continue;
         };
@@ -1253,15 +1269,17 @@ pub fn deliverPendingLaneCompletions(app: *App) !bool {
         else
             try std.fmt.allocPrint(app.gpa, "Lane {s} ({s}) finished — {d} tool calls, final state: done. Read with `lane read {s}`; fold back with `lane merge {s}`.", .{ title, id, tool_count, id, id });
         defer app.gpa.free(message);
+        // Enqueue FIRST, then notice, then mark delivered: if the spawner's
+        // queue is full, nothing has been written yet (agent queue and mirror
+        // alike) and the next tick retries — the worker's result is never
+        // dropped while a notice claims delivery.
+        if (!queue_mod.enqueueRawMirrored(app, spawner, message)) continue;
         _ = spawner.transcript.append(app.gpa, .notice, "lane", message) catch {};
         if (spawner == active) changed = true;
         lane.completion_delivered = true;
-        if (spawner.agent) |agent| {
-            agent.enqueueRaw(message) catch {};
-            app.thread = spawner;
-            app.startDeliveryTurnOnCurrentThread() catch {};
-            return true;
-        }
+        app.thread = spawner;
+        app.startDeliveryTurnOnCurrentThread() catch {};
+        return true;
     }
     return changed;
 }
@@ -1424,7 +1442,7 @@ test "lane workspace ops create → enter → merge(refused) → leave → merge
     try std.testing.expect(std.mem.indexOf(u8, enter_resp.text, "working root is now") != null);
     // The tool-side workspace write (tested in lane.zig) is what adopts the
     // returned path — simulate it here so the H5b merge guard sees it.
-    runtime.agent.workspace = working.path;
+    runtime.agent.setWorkspace(working.path);
 
     // ── lane merge while entered: refused with the leave-first message (H5b).
     var merge_entered_req = lane_bridge.Request{ .op = .merge, .lane = try gpa.dupe(u8, id), .requester = &runtime.agent };
@@ -1443,7 +1461,7 @@ test "lane workspace ops create → enter → merge(refused) → leave → merge
     try std.testing.expectEqual(@as(u8, 0), leave_resp.code);
     try std.testing.expect(std.mem.indexOf(u8, leave_resp.text, "repo root") != null);
     // Simulate the tool clearing the borrow (see the lane.zig leave test).
-    runtime.agent.workspace = null;
+    runtime.agent.setWorkspace(null);
 
     // ── lane merge: the branch folds back and the lane is removed.
     var merge_req = lane_bridge.Request{ .op = .merge, .lane = try gpa.dupe(u8, id), .requester = &runtime.agent };
@@ -1466,6 +1484,87 @@ test "lane workspace ops create → enter → merge(refused) → leave → merge
     try std.testing.expectEqual(@as(usize, 4), app.threads.items.len); // refused, not added
 }
 
+test "M3: merge reports the driver's real workspace, not the repo root" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
+    var fx = try GitFixture.init(gpa, io);
+    defer fx.deinit(gpa);
+    const app = &fx.app;
+
+    // Two working lanes: A (the driver enters it) and B (the merge target).
+    var create_a = lane_bridge.Request{ .op = .create, .purpose = try gpa.dupe(u8, "lane A"), .requester = &fx.runtime.agent };
+    defer create_a.deinit(gpa);
+    const resp_a = postAndService(io, app, &create_a);
+    defer app.gpa.free(resp_a.text);
+    try std.testing.expectEqual(@as(u8, 0), resp_a.code);
+    const lane_a = app.threads.items[1];
+    const path_a = try gpa.dupe(u8, lanes_util.workingLaneOf(lane_a).?.path);
+    defer gpa.free(path_a);
+    const id_a = try gpa.dupe(u8, resp_a.lane_id.?);
+    defer gpa.free(id_a);
+
+    var create_b = lane_bridge.Request{ .op = .create, .purpose = try gpa.dupe(u8, "lane B"), .requester = &fx.runtime.agent };
+    defer create_b.deinit(gpa);
+    const resp_b = postAndService(io, app, &create_b);
+    defer app.gpa.free(resp_b.text);
+    try std.testing.expectEqual(@as(u8, 0), resp_b.code);
+    const id_b = try gpa.dupe(u8, resp_b.lane_id.?);
+    defer gpa.free(id_b);
+
+    // The driver enters lane A (simulate the tool-side workspace write).
+    var enter_a = lane_bridge.Request{ .op = .enter, .lane = try gpa.dupe(u8, id_a), .requester = &fx.runtime.agent };
+    defer enter_a.deinit(gpa);
+    const enter_resp = postAndService(io, app, &enter_a);
+    defer app.gpa.free(enter_resp.text);
+    try std.testing.expectEqual(@as(u8, 0), enter_resp.code);
+    fx.runtime.agent.setWorkspace(path_a);
+
+    // Merge lane B while entered in A: H5b only refuses merging the lane the
+    // driver is currently entered in, so B merges — and the response must
+    // name A's path, not the repo root.
+    var merge_b = lane_bridge.Request{ .op = .merge, .lane = try gpa.dupe(u8, id_b), .requester = &fx.runtime.agent };
+    defer merge_b.deinit(gpa);
+    const merge_resp = postAndService(io, app, &merge_b);
+    defer app.gpa.free(merge_resp.text);
+    try std.testing.expectEqual(@as(u8, 0), merge_resp.code);
+    try std.testing.expectEqual(@as(usize, 2), app.threads.items.len); // B removed
+    try std.testing.expect(std.mem.indexOf(u8, merge_resp.text, path_a) != null);
+    try std.testing.expect(std.mem.indexOf(u8, merge_resp.text, "repo root") == null);
+}
+
+test "I1: a freshly spawned lane resets turn bookkeeping via resetTurnState" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
+    var fx = try GitFixture.init(gpa, io);
+    defer fx.deinit(gpa);
+    const app = &fx.app;
+
+    // A spawned worker lane with a real runtime, then start its turn.
+    const wt = try createLaneWorktree(app, fx.repo, fx.home_dir);
+    const rt = app.createRuntime(wt.dest, fx.repo, null) catch |err| {
+        app.gpa.free(wt.branch);
+        app.gpa.free(wt.dest);
+        return err;
+    };
+    const lane = try gpa.create(Thread);
+    lane.* = Thread.initLive(rt.session_writer.session.id, &rt.agent, io, rt.gpa, &.{}, wt.branch, wt.dest, rt);
+    lane.spawned_by_generation = 1; // the primary is the spawner
+    // Simulate a prior failure record that a fresh turn must clear.
+    lane.turn_failed = try gpa.dupe(u8, "stale failure");
+    try app.threads.append(gpa, lane);
+
+    try startTurnForLane(app, lane, "do the work", "do the work");
+    defer {
+        // The turn future is cancelled by deinitApp; nothing to join here.
+    }
+    try std.testing.expectEqual(@as(u32, 0), lane.turn_tool_calls);
+    try std.testing.expect(lane.turn_failed == null);
+    try std.testing.expect(lane.turn_view.loading_word_index < turn_view_mod.loading_spinners.len);
+    try std.testing.expect(lane.turn.state == .active);
+}
+
 test "S17: teardown of a lane the workspace borrows is refused while the owner's turn is active" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
@@ -1481,17 +1580,17 @@ test "S17: teardown of a lane the workspace borrows is refused while the owner's
     } } } };
     try app.threads.append(gpa, lane2);
     app.thread = lane2; // the driver's view is on this lane
-    agent.workspace = "/tmp/lane-x"; // simulate `lane enter`
+    agent.setWorkspace("/tmp/lane-x"); // simulate `lane enter`
 
     // Owner's turn active → teardown refused (H5a), the borrow stays.
     app.threads.items[0].turn.submit();
     try std.testing.expectError(error.InFlightTurn, clearWorkspaceBorrows(&app, lane2));
-    try std.testing.expect(agent.workspace != null);
+    try std.testing.expect(agent.workspaceBorrow() != null);
 
     // Owner idle → the borrow is dropped first, then teardown proceeds.
     app.threads.items[0].turn.reset();
     try clearWorkspaceBorrows(&app, lane2);
-    try std.testing.expect(agent.workspace == null);
+    try std.testing.expect(agent.workspaceBorrow() == null);
 }
 
 test "S17: collectParkedLanes surfaces a nova/* worktree not open as a lane" {
@@ -1884,17 +1983,41 @@ test "S11: a gone spawner drops the completion without crashing" {
     var app = try tui.App.init(io, gpa, &agent);
     defer app.deinit();
 
-    // A spawner agent that matches no open lane (its lane was closed).
-    var stranger = agent_mod.Agent.init(gpa, io, ".", .none);
-    defer stranger.deinit();
+    // A spawner generation that matches no open lane (its lane was closed).
     const lane = try addFakeWorkingLane(gpa, &app, "orphaned");
-    lane.spawned_by_agent = &stranger;
+    lane.spawned_by_generation = 999; // no live lane has this generation
     _ = try lane.transcript.append(gpa, .agent, "agent", "late result");
 
     const changed = try deliverPendingLaneCompletions(&app);
     try std.testing.expect(!changed);
     try std.testing.expect(lane.completion_delivered); // dropped, not delivered
     try std.testing.expect(!transcriptContains(app.threads.items[0], "late result"));
+}
+
+test "M1: completion routes to the spawner by generation, not by agent pointer" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    // A fake spawner lane with a distinct generation (not the primary's 1).
+    const spawner = try addFakeWorkingLane(gpa, &app, "spawner");
+    spawner.generation = 7;
+
+    // A finished worker whose completion routes to generation 7. Acknowledged
+    // so delivery takes the notice-only path (no answer turn / worker context
+    // needed) — the routing lookup still runs first.
+    const worker = try addFakeWorkingLane(gpa, &app, "worker");
+    worker.spawned_by_generation = 7;
+    worker.acknowledged = true;
+
+    _ = try deliverPendingLaneCompletions(&app);
+    try std.testing.expect(worker.completion_delivered);
+    // The notice landed on the spawner lane (generation 7), not the primary.
+    try std.testing.expect(transcriptContains(spawner, "result consumed"));
+    try std.testing.expect(!transcriptContains(app.threads.items[0], "result consumed"));
 }
 
 test "S11: an acknowledged worker delivers a notice only — no answer turn" {
@@ -1908,7 +2031,7 @@ test "S11: an acknowledged worker delivers a notice only — no answer turn" {
     // Rested shape: engine idle, completion pending, result already consumed
     // via await/read (M2).
     const lane = try addFakeWorkingLane(gpa, &app, "acked");
-    lane.spawned_by_agent = &agent; // the primary is the spawner
+    lane.spawned_by_generation = 1; // the primary is the spawner
     lane.acknowledged = true;
     const before = app.threads.items[0].transcript.messages.items.len;
 
@@ -2011,7 +2134,7 @@ test "S11: a finished spawned worker rests — runtime freed, transcript + workt
     };
     const lane = try gpa.create(Thread);
     lane.* = Thread.initLive(rt.session_writer.session.id, &rt.agent, io, rt.gpa, &.{}, wt.branch, wt.dest, rt);
-    lane.spawned_by_agent = &fx.runtime.agent;
+    lane.spawned_by_generation = 1; // the primary is the spawner
     try app.threads.append(gpa, lane);
     _ = try lane.transcript.append(gpa, .user, "you", "worker task");
     _ = try lane.transcript.append(gpa, .agent, "agent", "worker result");
@@ -2054,7 +2177,7 @@ test "S11: a failed spawned worker is reported honestly, not as done" {
     };
     const lane = try gpa.create(Thread);
     lane.* = Thread.initLive(rt.session_writer.session.id, &rt.agent, io, rt.gpa, &.{}, wt.branch, wt.dest, rt);
-    lane.spawned_by_agent = &fx.runtime.agent;
+    lane.spawned_by_generation = 1; // the primary is the spawner
     lane.turn_failed = try gpa.dupe(u8, "agent turn failed: ConnectionLost");
     try app.threads.append(gpa, lane);
     _ = try lane.transcript.append(gpa, .user, "you", "worker task");
@@ -2066,6 +2189,43 @@ test "S11: a failed spawned worker is reported honestly, not as done" {
     const spawner = app.threads.items[0];
     try std.testing.expect(transcriptContains(spawner, "FAILED"));
     try std.testing.expect(transcriptContains(spawner, "ConnectionLost"));
+    try std.testing.expect(!transcriptContains(spawner, "final state: done"));
+}
+
+test "S11: a cancelled spawned worker is delivered as FAILED, not done" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
+    var fx = try GitFixture.init(gpa, io);
+    defer fx.deinit(gpa);
+    const app = &fx.app;
+
+    // A spawned worker lane with a real runtime and an ACTIVE turn, cancelled
+    // via the model-driven `lane cancel` path. `cancelLaneTurn` must record
+    // the interrupt as a failure so delivery reports it honestly.
+    const wt = try createLaneWorktree(app, fx.repo, fx.home_dir);
+    const rt = app.createRuntime(wt.dest, fx.repo, null) catch |err| {
+        app.gpa.free(wt.branch);
+        app.gpa.free(wt.dest);
+        return err;
+    };
+    const lane = try gpa.create(Thread);
+    lane.* = Thread.initLive(rt.session_writer.session.id, &rt.agent, io, rt.gpa, &.{}, wt.branch, wt.dest, rt);
+    lane.spawned_by_generation = 1; // the primary is the spawner
+    lane.turn.state = .active;
+    try app.threads.append(gpa, lane);
+    _ = try lane.transcript.append(gpa, .user, "you", "worker task");
+
+    cancelLaneTurn(app, lane);
+    try std.testing.expect(lane.turn_failed != null);
+    try std.testing.expect(std.mem.indexOf(u8, lane.turn_failed.?, "Interrupted.") != null);
+
+    const changed = try deliverPendingLaneCompletions(app);
+    try std.testing.expect(changed);
+    try std.testing.expect(lane.completion_delivered);
+    const spawner = app.threads.items[0];
+    try std.testing.expect(transcriptContains(spawner, "FAILED"));
+    try std.testing.expect(transcriptContains(spawner, "Interrupted."));
     try std.testing.expect(!transcriptContains(spawner, "final state: done"));
 }
 
@@ -2143,4 +2303,27 @@ test "lane merge: dirty primary refused (M3), conflict rolls back, dirty source 
     defer gpa.free(primary_extra);
     const extra_content = std.Io.Dir.cwd().readFile(io, primary_extra, &buf) catch unreachable;
     try std.testing.expectEqualStrings("new work\n", extra_content);
+}
+
+test "laneStatus reports waiting-for-approval before stall" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    const lane = try addFakeWorkingLane(gpa, &app, "abc123");
+    lane.worker_context = .{ .io = io, .gpa = gpa };
+    lane.turn.state = .active;
+    // Anchor activity far enough in the past that the stall check would fire —
+    // the approval branch must win over it.
+    const now_ms = std.Io.Clock.now(.awake, io).toMilliseconds();
+    lane.last_activity_ms = now_ms - worker_stall_ms - 1;
+    lane.worker_context.?.approval.command = try gpa.dupe(u8, "rm -rf /scratch");
+
+    const status = laneStatus(&app, lane);
+    defer app.gpa.free(status);
+    try std.testing.expect(std.mem.indexOf(u8, status, "waiting for approval") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "STALLED") == null);
 }

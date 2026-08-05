@@ -2,6 +2,7 @@
 
 const std = @import("std");
 
+const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
 const background = @import("background.zig");
 const bash_safety = @import("tools/bash_safety.zig");
@@ -233,8 +234,23 @@ pub const ExecutorService = struct {
             }
             initialized = i + 1;
             try observer.on_finished(observer.ctx, &results[i]);
+            // A `lane enter`/`leave` in this batch re-rooted the requester's
+            // workspace mid-batch; refresh so the remaining calls run at the
+            // new root instead of the batch-start snapshot.
+            if (std.mem.eql(u8, call.name, "lane")) self.rerootFromRequester();
         }
         return results;
+    }
+
+    /// Refresh `cwd` from the requester's live workspace after a `lane` call:
+    /// `enter`/`leave` write `Agent.workspace` (via `setWorkspace`) before the
+    /// tool returns, so the remaining calls in the batch must run at the new
+    /// root, not the batch-start snapshot. No-op when no requester is attached
+    /// (headless/tests) or when the workspace didn't change.
+    fn rerootFromRequester(self: *ExecutorService) void {
+        const ptr = self.lane_requester orelse return;
+        const agent: *agent_mod.Agent = @ptrCast(@alignCast(ptr));
+        self.cwd = agent.effectiveCwd();
     }
 
     fn shouldRejectUnsafeBash(self: *ExecutorService, call: ai.ToolCall, observer: anytype) !bool {
@@ -1064,4 +1080,173 @@ test "executor rejects MCP tool call with invalid JSON" {
     defer result.deinit(gpa);
     try std.testing.expect(result.failed);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "must be valid JSON") != null);
+}
+
+// ── Mid-batch re-rooting tests (C1) ──
+
+/// Outcome shuttle for running `runAll` on a worker thread while the main
+/// thread services the bridge.
+const RerootOutcome = struct {
+    results: []ToolResult = &.{},
+    err: ?anyerror = null,
+};
+
+/// Spin until the bridge has a pending request, then service until `done` —
+/// covers batches that post several lane ops in sequence.
+fn serviceUntilDone(
+    bridge: *lane_bridge.LaneBridge,
+    ctx: *anyopaque,
+    handler: *const fn (*anyopaque, *const lane_bridge.Request) ?lane_bridge.Response,
+    done: *const std.atomic.Value(bool),
+) void {
+    while (!done.load(.acquire)) {
+        bridge.service(std.testing.io, ctx, handler);
+        std.testing.io.sleep(.fromMilliseconds(2), .awake) catch {};
+    }
+    // Drain anything posted between the last service and the done flag.
+    bridge.service(std.testing.io, ctx, handler);
+}
+
+test "executor re-roots mid-batch after lane enter" {
+    const gpa = std.testing.allocator;
+
+    // The lane worktree the fake UI resolves `enter` with.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const lane_path = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(lane_path);
+
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, cwd_abs, .none);
+    defer agent.deinit();
+    var bridge: lane_bridge.LaneBridge = .{};
+
+    const Handler = struct {
+        fn handle(ctx: *anyopaque, req: *const lane_bridge.Request) ?lane_bridge.Response {
+            const path: *const []u8 = @ptrCast(@alignCast(ctx));
+            std.debug.assert(req.op == .enter);
+            return lane_bridge.response(std.testing.allocator, "entered\n", .{}, null, path.*) catch unreachable;
+        }
+    };
+
+    const calls = [_]ai.ToolCall{
+        try makeCall(gpa, "call_enter", "lane", "{\"command\":\"enter\",\"lane\":\"abc\"}"),
+        try makeCall(gpa, "call_pwd", "bash", "{\"command\":\"pwd\",\"description\":\"Show cwd\"}"),
+    };
+    defer for (calls) |c| {
+        gpa.free(c.call_id.value);
+        gpa.free(c.name);
+        gpa.free(c.arguments);
+    };
+
+    var executor = ExecutorService.init(.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .cwd = cwd_abs,
+        .lane_bridge = &bridge,
+        .lane_requester = &agent,
+    });
+
+    const Worker = struct {
+        fn run(exec: *ExecutorService, batch: []const ai.ToolCall, out: *RerootOutcome, done: *std.atomic.Value(bool)) void {
+            out.results = exec.runAll(batch, noopObserver(u8)) catch |err| {
+                out.err = err;
+                done.store(true, .release);
+                return;
+            };
+            done.store(true, .release);
+        }
+    };
+
+    var outcome = RerootOutcome{};
+    var done: std.atomic.Value(bool) = .init(false);
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{ &executor, &calls, &outcome, &done });
+    const lane_ctx: *anyopaque = @ptrCast(@constCast(&lane_path));
+    serviceUntilDone(&bridge, lane_ctx, &Handler.handle, &done);
+    thread.join();
+
+    if (outcome.err) |err| return err;
+    defer {
+        for (outcome.results) |*r| r.deinit(gpa);
+        gpa.free(outcome.results);
+    }
+    try std.testing.expectEqual(@as(usize, 2), outcome.results.len);
+    try std.testing.expect(!outcome.results[1].failed);
+    // The bash call after `enter` ran in the lane worktree, not the batch-start root.
+    try std.testing.expect(std.mem.indexOf(u8, outcome.results[1].content, lane_path) != null);
+}
+
+test "executor re-roots back on lane leave" {
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const lane_path = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(lane_path);
+
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, cwd_abs, .none);
+    defer agent.deinit();
+    var bridge: lane_bridge.LaneBridge = .{};
+
+    const Handler = struct {
+        fn handle(ctx: *anyopaque, req: *const lane_bridge.Request) ?lane_bridge.Response {
+            const path: *const []u8 = @ptrCast(@alignCast(ctx));
+            return switch (req.op) {
+                .enter => lane_bridge.response(std.testing.allocator, "entered\n", .{}, null, path.*) catch unreachable,
+                .leave => lane_bridge.response(std.testing.allocator, "left\n", .{}, null, null) catch unreachable,
+                else => unreachable,
+            };
+        }
+    };
+
+    const calls = [_]ai.ToolCall{
+        try makeCall(gpa, "call_enter", "lane", "{\"command\":\"enter\",\"lane\":\"abc\"}"),
+        try makeCall(gpa, "call_leave", "lane", "{\"command\":\"leave\",\"lane\":\"abc\"}"),
+        try makeCall(gpa, "call_pwd", "bash", "{\"command\":\"pwd\",\"description\":\"Show cwd\"}"),
+    };
+    defer for (calls) |c| {
+        gpa.free(c.call_id.value);
+        gpa.free(c.name);
+        gpa.free(c.arguments);
+    };
+
+    var executor = ExecutorService.init(.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .cwd = cwd_abs,
+        .lane_bridge = &bridge,
+        .lane_requester = &agent,
+    });
+
+    const Worker = struct {
+        fn run(exec: *ExecutorService, batch: []const ai.ToolCall, out: *RerootOutcome, done: *std.atomic.Value(bool)) void {
+            out.results = exec.runAll(batch, noopObserver(u8)) catch |err| {
+                out.err = err;
+                done.store(true, .release);
+                return;
+            };
+            done.store(true, .release);
+        }
+    };
+
+    var outcome = RerootOutcome{};
+    var done: std.atomic.Value(bool) = .init(false);
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{ &executor, &calls, &outcome, &done });
+    const lane_ctx: *anyopaque = @ptrCast(@constCast(&lane_path));
+    serviceUntilDone(&bridge, lane_ctx, &Handler.handle, &done);
+    thread.join();
+
+    if (outcome.err) |err| return err;
+    defer {
+        for (outcome.results) |*r| r.deinit(gpa);
+        gpa.free(outcome.results);
+    }
+    try std.testing.expectEqual(@as(usize, 3), outcome.results.len);
+    try std.testing.expect(!outcome.results[2].failed);
+    // After `leave` the root is back at the session cwd.
+    try std.testing.expect(std.mem.indexOf(u8, outcome.results[2].content, cwd_abs) != null);
+    try std.testing.expect(agent.workspaceBorrow() == null);
 }

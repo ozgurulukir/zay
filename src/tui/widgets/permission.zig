@@ -10,6 +10,8 @@ const vxfw = vaxis.vxfw;
 const tui = @import("../../tui.zig");
 const tui_style = @import("../style.zig");
 const panel = @import("panel.zig");
+const permission_mod = @import("../permission.zig");
+const lanes_util = @import("../lanes.zig");
 
 const App = tui.App;
 const StylePalette = tui_style.Palette;
@@ -26,7 +28,15 @@ pub const PermissionWidget = struct {
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *PermissionWidget = @ptrCast(@alignCast(ptr));
         const app = self.app;
-        const worker = if (app.thread.worker_context) |*context| context else {
+        // The gate may belong to a background lane — a worker blocked on a
+        // destructive-bash approval is invisible without this scan.
+        const lane = permission_mod.approvalLane(app) orelse {
+            return vxfw.Surface.init(ctx.arena, self.widget(), .{
+                .width = ctx.max.width orelse 0,
+                .height = ctx.max.height orelse 0,
+            });
+        };
+        const worker = if (lane.worker_context) |*context| context else {
             return vxfw.Surface.init(ctx.arena, self.widget(), .{
                 .width = ctx.max.width orelse 0,
                 .height = ctx.max.height orelse 0,
@@ -44,14 +54,28 @@ pub const PermissionWidget = struct {
         const surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = width, .height = height });
         if (width == 0 or height == 0) return surface;
 
+        // When the gate's owner is not the lane on screen, name it so the
+        // user knows which pane is asking.
+        const label: []const u8 = if (lane != app.thread)
+            std.fmt.allocPrint(ctx.arena, "Lane {s} requests approval", .{laneLabel(lane) orelse "?"}) catch "Tool Approval Request"
+        else
+            "Tool Approval Request";
+
         const inner = try ctx.arena.create(PermissionInner);
         inner.* = .{ .snapshot = snapshot, .scroll = app.thread.permission_scroll };
         var border: vxfw.Border = .{
             .child = inner.widget(),
-            .labels = &.{.{ .text = "Tool Approval Request", .alignment = .top_left }},
+            .labels = &.{.{ .text = label, .alignment = .top_left }},
             .style = StylePalette.border_label,
         };
         return border.widget().draw(ctx);
+    }
+
+    /// The hex id of a working lane (its worktree's last path segment), or
+    /// null for the primary lane.
+    fn laneLabel(lane: *tui.Thread) ?[]const u8 {
+        const working = lanes_util.workingLaneOf(lane) orelse return null;
+        return lanes_util.lastPathSegment(working.path);
     }
 };
 

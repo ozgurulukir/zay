@@ -23,7 +23,7 @@ const Thread = tui.Thread;
 fn driverWorkspacePath(app: *const App) ?[]const u8 {
     if (app.threads.items.len == 0) return null;
     const agent = app.threads.items[0].agent orelse return null;
-    return agent.workspace;
+    return agent.workspaceBorrow();
 }
 
 pub fn drawLaneColumn(app: *App, ctx: vxfw.DrawContext, lane: *Thread, width: u16, height: u16, active: bool) std.mem.Allocator.Error!vxfw.Surface {

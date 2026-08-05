@@ -40,11 +40,18 @@ pub const Agent = struct {
     cwd: []const u8,
     /// Workspace-mode scoping (S5): when set (a borrowed lane worktree path),
     /// tools root at this path instead of `cwd`; `effectiveCwd()` is the
-    /// single read. Written only by the `lane` tool on this agent's worker
-    /// thread, between tool batches; reset to null by the tool (`lane leave`)
-    /// or by the UI's S17 invariant while this agent's turn is idle. The path
-    /// is owned by the lane's `Thread`, never freed here.
+    /// single read. Written by the `lane` tool on this agent's worker thread
+    /// (`setWorkspace`), between tool batches; reset to null by the tool
+    /// (`lane leave`) or by the UI's S17 invariant while this agent's turn is
+    /// idle. The path is owned by the lane's `Thread`, never freed here.
+    ///
+    /// Cross-thread: the worker thread writes it (`lane enter`/`leave`), the
+    /// UI thread reads it (`driverWorkspace`, `clearWorkspaceBorrowForPath`).
+    /// A 16-byte slice store can tear, so the field is guarded by
+    /// `workspace_mutex`; `setWorkspace`/`workspaceBorrow`/`effectiveCwd` are
+    /// the only accessors. The lock is never held across tool dispatch.
     workspace: ?[]const u8 = null,
+    workspace_mutex: std.Io.Mutex = .init,
     /// Root-containment for lane workers: when set, the agent's bash tool
     /// refuses `cd` to a directory outside the project root (the lane
     /// worktree), so a worker can't drift into the main tree and write there.
@@ -146,9 +153,29 @@ pub const Agent = struct {
     /// The directory tools run in: the workspace root when entered in a lane
     /// (S5), else the session cwd. Read per tool batch by `runToolBatch` and
     /// per `@`-mention expansion by `addUserPrompt` — both on the worker
-    /// thread, so no lock is needed against the worker-side `lane` writes.
-    pub fn effectiveCwd(self: *const Agent) []const u8 {
+    /// thread, but the UI thread reads the same field, so the read is guarded
+    /// by `workspace_mutex`. The returned slice is borrowed (the backing path
+    /// is Thread-owned and outlives the borrow).
+    pub fn effectiveCwd(self: *Agent) []const u8 {
+        self.workspace_mutex.lock(self.io) catch return self.cwd;
+        defer self.workspace_mutex.unlock(self.io);
         return self.workspace orelse self.cwd;
+    }
+
+    /// Set the workspace borrow (worker thread, `lane enter`/`leave`). The
+    /// path is borrowed from the lane's `Thread`, never copied or freed here.
+    pub fn setWorkspace(self: *Agent, path: ?[]const u8) void {
+        self.workspace_mutex.lock(self.io) catch return;
+        defer self.workspace_mutex.unlock(self.io);
+        self.workspace = path;
+    }
+
+    /// Read the workspace borrow (UI thread). Returns a borrowed slice; the
+    /// backing path is Thread-owned and outlives the borrow.
+    pub fn workspaceBorrow(self: *Agent) ?[]const u8 {
+        self.workspace_mutex.lock(self.io) catch return null;
+        defer self.workspace_mutex.unlock(self.io);
+        return self.workspace;
     }
 
     /// The cached message projection the agent prompts with. Source of truth
@@ -2089,4 +2116,24 @@ test "assistant message with text or tool calls is kept" {
     var call_message: ai.ChatMessage = .{ .assistant = .{ .content = call_blocks } };
     defer call_message.deinit(gpa);
     try std.testing.expect(Agent.hasWireContent(call_message));
+}
+
+test "I3: setWorkspace/effectiveCwd round-trip under the test allocator" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    // No borrow: effectiveCwd falls back to the session cwd.
+    try std.testing.expectEqualStrings(".", agent.effectiveCwd());
+    try std.testing.expect(agent.workspaceBorrow() == null);
+
+    // Set a borrow (a lane worktree path, borrowed — never freed here).
+    agent.setWorkspace("/tmp/nova-lanes/abc123");
+    try std.testing.expectEqualStrings("/tmp/nova-lanes/abc123", agent.effectiveCwd());
+    try std.testing.expectEqualStrings("/tmp/nova-lanes/abc123", agent.workspaceBorrow().?);
+
+    // Clear it back.
+    agent.setWorkspace(null);
+    try std.testing.expectEqualStrings(".", agent.effectiveCwd());
+    try std.testing.expect(agent.workspaceBorrow() == null);
 }

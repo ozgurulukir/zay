@@ -14,6 +14,14 @@ const skill_mod = @import("../skill.zig");
 const App = tui.App;
 
 pub fn installRuntime(app: *App, runtime: *runtime_mod.AgentRuntime) !void {
+    // Session switch: only the ACTIVE lane's turn is checked and only the
+    // active lane's runtime is swapped. Non-primary lanes keep running against
+    // their OWN runtimes/sessions — a deliberate decision, not an oversight:
+    // each lane owns its runtime, so a switch must not tear down lanes the
+    // user is still working in. Completion routing is generation-safe across
+    // the switch (M1: `laneByGeneration`, not a raw `*Agent` pointer), so a
+    // worker finishing after the switch still reaches its spawner. See
+    // `_plan/plan-lane-worker-hardening-2026-08-05.md` (I4).
     if (app.thread.turn.isActive()) return error.InFlightTurn;
     app.cancelLaneNaming(app.thread);
     // Compare before destroying: the old cwd is freed by deinit.

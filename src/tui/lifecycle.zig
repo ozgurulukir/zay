@@ -319,6 +319,7 @@ pub fn createParallelLane(self: *App) !void {
         dest,
         runtime,
     );
+    lane.generation = self.nextLaneGeneration();
     try self.threads.append(self.gpa, lane);
 
     // Committed: `threads` owns `lane`, which owns `runtime`/`branch`/`dest`.

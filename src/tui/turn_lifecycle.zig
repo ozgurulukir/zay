@@ -21,6 +21,14 @@ pub fn handleInterrupt(app: *App) !void {
     var event: agent_mod.Agent.Event = .{ .turn_failed = message };
     defer event.deinit(app.gpa);
     _ = try app.thread.turn_view.apply(app.gpa, &app.thread.transcript, event);
+    // Record the interrupt as a failure so a spawned worker's completion
+    // delivery reports it honestly ("FAILED — Interrupted.") instead of
+    // "final state: done". The event's copy is freed by `event.deinit`; this
+    // is a second dupe owned by `turn_failed`. If the user queued messages,
+    // `restartTurnForQueuedMessages` starts a fresh turn whose `resetTurnState`
+    // clears it — correct, a new turn is running.
+    if (app.thread.turn_failed) |old| app.gpa.free(old);
+    app.thread.turn_failed = app.gpa.dupe(u8, agent_worker.cancel_message) catch null;
     app.thread.turn.interrupt();
     // Tear the worker down now rather than waiting for it to reach its next
     // cooperative cancellation point. `requestCancel` only takes effect on
@@ -215,12 +223,19 @@ pub fn restartTurnForQueuedMessages(app: *App) !bool {
     resetTurnState(app);
     app.thread.worker_context.?.resetCancel();
     app.thread.turn_view.awaitModel();
-    app.thread.pending_prompt = null;
+    // Free any prompt left over from a failed `startTurn` (the window is
+    // theoretical — beginSubmit→startTurn are contiguous — but the cleanup
+    // costs nothing). Messages travel via `drain_queue_first`, so no prompt
+    // is handed over here.
+    if (app.thread.pending_prompt) |p| {
+        app.thread.worker_context.?.gpa.free(p);
+        app.thread.pending_prompt = null;
+    }
     app.thread.turn.submit();
     app.thread.turn_future = try app.getIo().concurrent(agent_worker.runAgentTurn, .{
         app.thread.agent.?,
         &app.thread.worker_context.?,
-        app.thread.pending_prompt,
+        @as(?[]u8, null),
         true,
     });
     return true;
@@ -233,19 +248,27 @@ pub fn restartTurnForQueuedMessages(app: *App) !bool {
 pub fn startDeliveryTurnOnCurrentThread(app: *App) !void {
     if (app.liveRuntime() != null and app.liveRuntime().?.client == .none) {
         // No provider to run a turn — drop the queued notice rather than spin
-        // up a doomed worker.
+        // up a doomed worker. Flush the mirror first so it stays 1:1 with the
+        // cleared agent queue (raw entries are dropped unrendered; a stray
+        // mirror entry would shift every `steerSelectedQueued` index).
+        try app.flushQueuedUserMessagesToTranscript(@intCast(app.thread.queued.items.len));
         app.thread.agent.?.clearQueue();
         return;
     }
     resetTurnState(app);
     app.thread.worker_context.?.resetCancel();
     app.thread.turn_view.awaitModel();
-    app.thread.pending_prompt = null;
+    // Free any prompt left over from a failed `startTurn`; messages travel via
+    // `drain_queue_first`, so no prompt is handed over here.
+    if (app.thread.pending_prompt) |p| {
+        app.thread.worker_context.?.gpa.free(p);
+        app.thread.pending_prompt = null;
+    }
     app.thread.turn.submit();
     app.thread.turn_future = try app.getIo().concurrent(agent_worker.runAgentTurn, .{
         app.thread.agent.?,
         &app.thread.worker_context.?,
-        app.thread.pending_prompt,
+        @as(?[]u8, null),
         true,
     });
 }

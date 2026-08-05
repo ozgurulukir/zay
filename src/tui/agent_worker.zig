@@ -80,7 +80,9 @@ const ApprovalGate = struct {
     command: ?[]u8 = null,
     decision: ?ApprovalDecision = null,
 
-    fn request(self: *ApprovalGate, io: std.Io, gpa: std.mem.Allocator, command: []const u8) !bool {
+    /// Block until the gate is resolved; returns whether the command was
+    /// approved. Pub so tests can drive the worker side of the handshake.
+    pub fn request(self: *ApprovalGate, io: std.Io, gpa: std.mem.Allocator, command: []const u8) !bool {
         const owned = try gpa.dupe(u8, command);
         errdefer gpa.free(owned);
 

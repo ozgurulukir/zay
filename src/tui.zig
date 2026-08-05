@@ -131,6 +131,12 @@ pub const App = struct {
     /// stable while live runtimes and (later) worker threads hold references.
     /// Owns the `Thread`s; freed in `deinit`.
     threads: std.ArrayList(*Thread) = .empty,
+    /// Monotonic lane-generation counter, assigned to every Thread at its
+    /// creation site (UI thread only). Spawned-worker completion routing uses
+    /// it instead of a raw `*Agent` pointer so a session switch (which frees
+    /// the spawner's agent) can't misroute a delivery via allocator address
+    /// reuse.
+    lane_generation_counter: u64 = 0,
     /// The lane currently on screen — always one of `threads`. A pointer (not an
     /// index) so every `self.thread.X` site reads/mutates the active lane through
     /// auto-deref, even from a `*const App`.
@@ -251,11 +257,15 @@ pub const App = struct {
         const limiter = try gpa.create(request_limiter_mod.RequestLimiter);
         errdefer gpa.destroy(limiter);
         limiter.* = .{};
+        // The primary lane is generation 1; every later lane gets the next
+        // counter value at its creation site.
+        primary.generation = 1;
         return .{
             .io = io,
             .gpa = gpa,
             .threads = threads,
             .thread = primary,
+            .lane_generation_counter = 1,
             .inputs = .{ .input = .init(gpa), .palette = .init(gpa), .comment = .init(gpa) },
             .pickers = .{ .tree = .init(gpa) },
             .mcp_manager = mcp_mod.McpManager.init(gpa),
@@ -628,6 +638,20 @@ pub const App = struct {
             if (lane.agent) |a| {
                 if (a == agent_ptr) return lane;
             }
+        }
+        return null;
+    }
+
+    pub fn nextLaneGeneration(self: *App) u64 {
+        self.lane_generation_counter += 1;
+        return self.lane_generation_counter;
+    }
+
+    /// The open lane whose `generation` matches `g`, or null. Used to route a
+    /// spawned worker's completion to its spawner across session switches.
+    pub fn laneByGeneration(self: *App, g: u64) ?*Thread {
+        for (self.threads.items) |lane| {
+            if (lane.generation == g) return lane;
         }
         return null;
     }
