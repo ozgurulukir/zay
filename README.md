@@ -89,9 +89,12 @@ git clone https://github.com/ozgurulukir/nova-agent.git
 cd nova-agent
 
 # Vendor dependencies (fff + ModernBERT classifier)
-git clone https://github.com/acecilia/fff.git vendor/fff && make -C vendor/fff
-hf download P0u4a/ModernBERT-bash-classifier --local-dir vendor/local-models
-uv run python vendor/local-models/export_onnx.py --model-dir vendor/local-models
+git clone --depth 1 https://github.com/dmtrKovalenko/fff third_party/fff
+make -C third_party/fff build-c-lib
+hf download P0u4a/ModernBERT-bash-classifier --local-dir vendor/local-models/ModernBERT-bash-classifier
+uv run --project vendor/local-models python vendor/local-models/export_onnx.py \
+  --model-dir vendor/local-models/ModernBERT-bash-classifier \
+  --output vendor/local-models/ModernBERT-bash-classifier/model.onnx
 
 # Build and run
 zig build run
@@ -140,7 +143,7 @@ Nova uses layered JSON config:
 |-------|------|
 | Global | `~/.config/nova/config.json` |
 | Project | `.nova/config.json` |
-| Env vars | `NOVA_*` environment variables |
+| Env vars | `OPENAI_*` and `NOVA_*` environment variables |
 
 See [docs/CONFIG.md](docs/CONFIG.md) for the full reference.
 
