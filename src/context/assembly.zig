@@ -765,8 +765,8 @@ test "cloneContentBlock frees the mime type when the image data dupe fails" {
     try std.testing.expectError(error.OutOfMemory, cloneContentBlock(failing.allocator(), block));
 }
 
-test "assembleSystemPrompt includes the unconditional <lanes> block from system.md" {
-    // The `lane` tool is a builtin, so its <lanes> guidance is always in the
+test "assembleSystemPrompt includes the unconditional Lanes section from system.md" {
+    // The `lane` tool is a builtin, so its Lanes guidance is always in the
     // assembled prompt (unlike the conditional lua/mcp blocks).
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -777,7 +777,7 @@ test "assembleSystemPrompt includes the unconditional <lanes> block from system.
     const prompt = try assembleSystemPrompt(gpa, io, template, root, &.{}, &.{});
     defer gpa.free(prompt);
 
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "<lanes>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "## Lanes") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Workspace mode") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Fan out when the work decomposes") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Sequence what depends") != null);
