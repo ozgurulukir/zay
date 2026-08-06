@@ -130,6 +130,58 @@ pub fn validateArgs(
     return result;
 }
 
+/// Coerce quoted numeric strings to real JSON numbers for `integer`/`number`
+/// properties, returning an owned re-serialized arguments JSON when any value
+/// changed (null when nothing did or the args aren't a parseable object).
+///
+/// Some models emit numbers as strings despite the schema (`"offset":"130"`).
+/// Real tool-calling frameworks coerce these; without it such a call fails
+/// validation and the model loops retrying the same quoted value. Coercing
+/// before dispatch lets the tool actually run on inputs it can already handle
+/// (plugin handlers `math.floor` a string just fine). Non-numeric strings are
+/// left untouched so validation still reports them clearly.
+pub fn coerceNumericStrings(
+    gpa: std.mem.Allocator,
+    schema: tools_common.Schema,
+    args_json: []const u8,
+) !?[]u8 {
+    const trimmed = std.mem.trim(u8, args_json, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, trimmed, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+
+    var changed = false;
+    for (schema.properties) |prop| {
+        if (prop.kind != .integer and prop.kind != .number) continue;
+        const v = parsed.value.object.getPtr(prop.name) orelse continue;
+        if (v.* != .string) continue;
+        const num = coerceNumericString(v.string) orelse continue;
+        v.* = num;
+        changed = true;
+    }
+    if (!changed) return null;
+
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try std.json.Stringify.value(parsed.value, .{}, &buf.writer);
+    return try buf.toOwnedSlice();
+}
+
+/// Interpret a string as a JSON number, or null when it isn't one. Integer
+/// first so a whole number stays an integer; otherwise float.
+fn coerceNumericString(s: []const u8) ?std.json.Value {
+    const trimmed = std.mem.trim(u8, s, " \t");
+    if (trimmed.len == 0) return null;
+    if (std.fmt.parseInt(i64, trimmed, 10)) |n| {
+        return .{ .integer = n };
+    } else |_| {}
+    if (std.fmt.parseFloat(f64, trimmed)) |f| {
+        return .{ .float = f };
+    } else |_| {}
+    return null;
+}
+
 /// One type/nullable/enum check against a present value.
 fn checkProperty(
     gpa: std.mem.Allocator,
@@ -448,4 +500,48 @@ test "formatMessage renders the plan's message shape" {
     const msg = try result.formatMessage(gpa);
     defer gpa.free(msg);
     try std.testing.expectEqualStrings("`command` must be string (got: 42)", msg);
+}
+
+test "coerceNumericStrings converts quoted integers for integer/number props" {
+    const gpa = std.testing.allocator;
+    // test_schema has `timeout` integer; `command` is string and must be untouched.
+    const coerced = try coerceNumericStrings(gpa, test_schema, "{\"command\":\"x\",\"timeout\":\"130\"}");
+    defer if (coerced) |c| gpa.free(c);
+    try std.testing.expect(coerced != null);
+    try std.testing.expectEqualStrings("{\"command\":\"x\",\"timeout\":130}", coerced.?);
+    // And the coerced args now validate (the quoted version would not).
+    var result = try validateArgs(gpa, test_schema, coerced.?);
+    defer result.deinit(gpa);
+    try std.testing.expect(result.isValid());
+}
+
+test "coerceNumericStrings leaves non-numeric strings and non-number props alone" {
+    const gpa = std.testing.allocator;
+    // `timeout":"abc"` is not a number -> unchanged -> null (no coercion).
+    const n = try coerceNumericStrings(gpa, test_schema, "{\"command\":\"x\",\"timeout\":\"abc\"}");
+    defer if (n) |c| gpa.free(c);
+    try std.testing.expect(n == null);
+    // Integer already a number -> null.
+    const m = try coerceNumericStrings(gpa, test_schema, "{\"command\":\"x\",\"timeout\":30}");
+    defer if (m) |c| gpa.free(c);
+    try std.testing.expect(m == null);
+}
+
+test "coerceNumericStrings handles floats and string-typed fields" {
+    const gpa = std.testing.allocator;
+    const number_schema = tools_common.Schema{
+        .properties = &.{
+            .{ .name = "n", .kind = .number, .description = "", .required = true },
+            .{ .name = "s", .kind = .string, .description = "", .required = true },
+        },
+    };
+    // "42.5" -> 42.5 (float); "42" stays an integer for a number field.
+    const a = try coerceNumericStrings(gpa, number_schema, "{\"n\":\"42.5\",\"s\":\"keep\"}");
+    defer if (a) |c| gpa.free(c);
+    try std.testing.expect(a != null);
+    try std.testing.expectEqualStrings("{\"n\":42.5,\"s\":\"keep\"}", a.?);
+    // `s` is string-typed; a quoted numeric string for it must NOT be coerced.
+    const b = try coerceNumericStrings(gpa, number_schema, "{\"n\":1,\"s\":\"42\"}");
+    defer if (b) |c| gpa.free(c);
+    try std.testing.expect(b == null);
 }

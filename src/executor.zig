@@ -274,15 +274,33 @@ pub const ExecutorService = struct {
     /// already fail in `produceOutput`.
     fn runOne(self: *ExecutorService, call: ai.ToolCall) !ToolResult {
         if (self.resolveSchema(call)) |schema| {
+            // Some models emit numbers as strings despite the schema (e.g.
+            // `offset:"130"`). Coerce those to real JSON numbers so the call
+            // passes validation AND dispatch reaches the tool with proper
+            // numeric args — otherwise a weak model loops retrying the same
+            // quoted value. `coerceNumericStrings` returns null when nothing
+            // changed (or the args aren't a parseable object), so validation
+            // still reports genuine type errors clearly.
+            const coerced = schema_mod.coerceNumericStrings(self.gpa, schema, call.arguments) catch return error.OutOfMemory;
+            defer if (coerced) |c| self.gpa.free(c);
+
             // `validateArgs` turns every non-allocation failure (parse errors,
             // type mismatches, missing fields) into a violation internally, so
             // the only error that propagates is OutOfMemory — propagate it; the
             // tool does not run unvalidated under memory pressure.
-            var validation = schema_mod.validateArgs(self.gpa, schema, call.arguments) catch return error.OutOfMemory;
+            const args = coerced orelse call.arguments;
+            var validation = schema_mod.validateArgs(self.gpa, schema, args) catch return error.OutOfMemory;
             defer validation.deinit(self.gpa);
             if (!validation.isValid()) {
                 return self.runValidationError(call, &validation);
             }
+            // Dispatch the (possibly coerced) args so the tool receives real
+            // numbers, not quoted strings. A shallow copy swaps only the
+            // arguments slice; the rest of `call` is untouched and the coerced
+            // buffer stays alive for the duration of dispatch.
+            var effective = call;
+            effective.arguments = args;
+            return self.dispatchCall(effective);
         }
         return self.dispatchCall(call);
     }
