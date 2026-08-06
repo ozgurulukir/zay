@@ -495,6 +495,76 @@ test "assembleSystemPrompt appends plugin prompts block" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Always confirm before overwrite.") != null);
 }
 
+test "assembleSystemPrompt injects every skill and plugin prompt without truncation" {
+    // Servis katmanını doğrudan çağırıp, çok sayıda skill + plugin prompt'un
+    // system prompt'a EKSİKSİZ (kesilmeden, sırayla, hiçbiri düşmeden) inject
+    // edildiğini kanıtlar. `buildAllToolsJson` gibi bu da tamamıyla serialize
+    // eder — truncation yalnızca AGENTS.md >64KB path'inde bilinçli olur.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const rel_dir = ".zig-cache/context-assembly-scale-test";
+    try std.Io.Dir.createDirPath(.cwd(), io, rel_dir);
+    const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
+    defer gpa.free(cwd);
+
+    // 8 skill + 4 plugin prompt — hepsi uzun body'li.
+    const skill_names = [_][]const u8{ "tigerstyle", "tui-dev", "why", "how", "find-invariants", "write-lua-plugin", "remotion", "shadcn-ui" };
+    var skills = try gpa.alloc(skill_mod.Skill, skill_names.len);
+    defer skill_mod.deinitAll(gpa, skills);
+    for (skill_names, 0..) |name, i| {
+        skills[i] = .{
+            .name = try gpa.dupe(u8, name),
+            .description = try std.fmt.allocPrint(gpa, "Skill {s} description {{hsep}} with a long tail to exceed any naive cap.", .{name}),
+            .path = try std.fmt.allocPrint(gpa, "/skills/{s}/SKILL.md", .{name}),
+            .base_dir = try std.fmt.allocPrint(gpa, "/skills/{s}", .{name}),
+        };
+    }
+
+    const prompts = try gpa.alloc(plugin_prompt.PluginPrompt, 4);
+    for (prompts, 0..) |*p, i| {
+        const body = try std.fmt.allocPrint(gpa, "Plugin body #{d} " ++ ("x" ** 200), .{i});
+        p.* = .{
+            .name = try std.fmt.allocPrint(gpa, "plugin-{d}", .{i}),
+            .body = body,
+            .path = try std.fmt.allocPrint(gpa, "/tmp/plugin-{d}.md", .{i}),
+        };
+    }
+    defer plugin_prompt.deinitAll(gpa, prompts);
+
+    const template = "System: ${CWD} on ${OS}";
+    const prompt = try assembleSystemPrompt(gpa, io, template, cwd, skills, prompts);
+    defer gpa.free(prompt);
+
+    for (skill_names) |name| {
+        const needle = try std.fmt.allocPrint(gpa, "<name>{s}</name>", .{name});
+        defer gpa.free(needle);
+        try std.testing.expect(std.mem.indexOf(u8, prompt, needle) != null);
+    }
+    for (0..4) |i| {
+        const needle = try std.fmt.allocPrint(gpa, "<plugin name=\"plugin-{d}\">", .{i});
+        defer gpa.free(needle);
+        try std.testing.expect(std.mem.indexOf(u8, prompt, needle) != null);
+        const body_needle = try std.fmt.allocPrint(gpa, "Plugin body #{d}", .{i});
+        defer gpa.free(body_needle);
+        try std.testing.expect(std.mem.indexOf(u8, prompt, body_needle) != null);
+    }
+    // Hiçbir skill düşmedi: 8 ayrı <skill> bloğu olmalı.
+    try std.testing.expectEqual(@as(usize, skill_names.len), countStr(prompt, "<skill>\n"));
+}
+
+fn countStr(haystack: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, idx, needle)) |pos| {
+        count += 1;
+        idx = pos + 1;
+    }
+    return count;
+}
+
 test "readProjectRuleFile truncates an oversized rule file with a notice instead of failing" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

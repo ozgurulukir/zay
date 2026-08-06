@@ -233,6 +233,11 @@
           "default": 2,
           "description": "Maximum number of LLM requests in flight across ALL lanes at once. Each lane runs its own worker + HTTP client, so without this cap N active lanes fire N independent requests at the provider, which degrades or rate-limits the burst. 1 serializes requests."
         },
+        "disablePromptCache": {
+          "type": "boolean",
+          "default": false,
+          "description": "Disable provider prompt-caching fields (message-level cache_control and top-level prompt_cache_key) entirely, in both the chat-completions and Responses API clients. Use for OpenRouter models that reject these fields with HTTP 400 (some :free / gateway-fronted models)."
+        },
         "compaction": { "$ref": "#/$defs/CompactionSettings" }
       },
       "additionalProperties": false

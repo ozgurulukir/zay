@@ -59,6 +59,11 @@ pub const AgentRuntime = struct {
     /// to every attached client's `ai.Config`. Default `.minimal` is
     /// safe for all providers (no vendor-specific fields emitted).
     wire_dialect: ai.WireDialect = .minimal,
+    /// Disable provider prompt-caching fields (C1). Populated from
+    /// `context_settings.disable_prompt_cache` at the dialect-resolution
+    /// site and forwarded to every attached client's `ai.Config`. When
+    /// true, neither `cache_control` nor `prompt_cache_key` is emitted.
+    disable_prompt_cache: bool = false,
     /// Context window and compaction settings from config. Stored so
     /// the attach/connect functions can pass the override to
     /// `compaction.contextWindowTokens` and the agent can use the
@@ -512,6 +517,9 @@ pub const AgentRuntime = struct {
             config.provider_name orelse "",
             config.base_url orelse "",
         );
+        // C1: read the prompt-cache-disable flag once here so all three
+        // attached clients (main / compaction / naming) inherit it.
+        self.disable_prompt_cache = config.context.disable_prompt_cache orelse false;
         const ms = config.model_selection orelse {
             // No typed selection — fall back to legacy fields. For builtin
             // providers defaultBaseUrl() suffices; for .openai_compatible
@@ -612,6 +620,7 @@ pub const AgentRuntime = struct {
             .strict = self.strict_outputs,
             .account_id = credentials.account_id,
             .session_id = self.session_writer.session.id.slice(),
+            .disable_prompt_cache = self.disable_prompt_cache,
             .system_prompt = self.system_prompt,
         });
         errdefer client.deinit();
@@ -629,6 +638,7 @@ pub const AgentRuntime = struct {
                 .reasoning = .{ .effort = effort, .summary = .auto },
                 .account_id = credentials.account_id,
                 .session_id = self.session_writer.session.id.slice(),
+                .disable_prompt_cache = self.disable_prompt_cache,
                 // The summarizer gets a minimal carrier prompt, NOT the full
                 // agent system prompt (AGENTS.md + skills + plugins) — that can
                 // push the summary request itself over a small window (C4).
@@ -649,6 +659,7 @@ pub const AgentRuntime = struct {
                 .reasoning = .{ .effort = effort, .summary = .auto },
                 .account_id = credentials.account_id,
                 .session_id = self.session_writer.session.id.slice(),
+                .disable_prompt_cache = self.disable_prompt_cache,
                 .system_prompt = self.system_prompt,
             }) catch {
                 self.gpa.destroy(naming_client);
@@ -708,6 +719,7 @@ pub const AgentRuntime = struct {
             .max_output_tokens = self.context_settings.max_output_tokens,
             .max_parallel_tool_calls = self.context_settings.max_parallel_tool_calls orelse 16,
             .request_timeout_seconds = self.context_settings.request_timeout_seconds orelse 300,
+            .disable_prompt_cache = self.disable_prompt_cache,
             .session_id = self.session_writer.session.id.slice(),
         });
         errdefer client.deinit();
@@ -728,6 +740,7 @@ pub const AgentRuntime = struct {
                 // reasoning_effort) and honor the user's request timeout (H2).
                 .wire_dialect = self.wire_dialect,
                 .request_timeout_seconds = self.context_settings.request_timeout_seconds orelse 300,
+                .disable_prompt_cache = self.disable_prompt_cache,
             }) catch {
                 self.gpa.destroy(compaction_client);
                 break :attach_compaction;
@@ -742,6 +755,7 @@ pub const AgentRuntime = struct {
                 .model = model_id,
                 .tools = &.{},
                 .reasoning = .{ .effort = effort },
+                .disable_prompt_cache = self.disable_prompt_cache,
             }) catch {
                 self.gpa.destroy(naming_client);
                 break :attach_naming;
@@ -768,6 +782,7 @@ pub const AgentRuntime = struct {
             .reasoning = reasoning,
             .strict = self.strict_outputs,
             .session_id = self.session_writer.session.id.slice(),
+            .disable_prompt_cache = self.disable_prompt_cache,
             .system_prompt = self.system_prompt,
         });
         errdefer client.deinit();
@@ -784,6 +799,7 @@ pub const AgentRuntime = struct {
                 .tools = &.{},
                 .reasoning = reasoning,
                 .session_id = self.session_writer.session.id.slice(),
+                .disable_prompt_cache = self.disable_prompt_cache,
                 // Minimal carrier prompt, not the full agent system prompt (C4).
                 .system_prompt = compaction.summarizer_system_prompt,
             }) catch {
@@ -801,6 +817,7 @@ pub const AgentRuntime = struct {
                 .tools = &.{},
                 .reasoning = reasoning,
                 .session_id = self.session_writer.session.id.slice(),
+                .disable_prompt_cache = self.disable_prompt_cache,
                 .system_prompt = self.system_prompt,
             }) catch {
                 self.gpa.destroy(naming_client);

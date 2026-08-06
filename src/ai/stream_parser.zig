@@ -95,6 +95,10 @@ pub const ToolCallStream = struct {
     /// ai.Config.max_parallel_tool_calls). Indices at or above this
     /// are rejected with a logged error.
     max_calls: u32 = 16,
+    /// Model id, borrowed and used only so the over-cap reject log can name
+    /// which model tripped the cap. Empty in tests / when the caller has no
+    /// model id; never affects parsing behaviour.
+    model: []const u8 = "",
 
     fn physicalSlot(self: *const ToolCallStream, logical: u32) u32 {
         return if (self.is_remapped[logical]) self.remapped_slot[logical] else logical;
@@ -112,12 +116,13 @@ pub fn readStream(
     observer: anytype,
     tool_call_seq: *u64,
     max_calls: u32,
+    model: []const u8,
 ) !ai.Turn {
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(gpa);
     var reasoning: std.ArrayList(u8) = .empty;
     defer reasoning.deinit(gpa);
-    var stream: ToolCallStream = .{ .max_calls = max_calls };
+    var stream: ToolCallStream = .{ .max_calls = max_calls, .model = model };
     defer stream.deinit(gpa);
 
     // Parse and apply each chunk inline (rather than via `processStreamChunk`)
@@ -393,7 +398,7 @@ fn parseToolCallObject(
             if (index < 0) return error.InvalidToolCallIndex;
             if (index >= tool_call_array_cap) return error.TooManyToolCalls;
             if (index >= stream.max_calls) {
-                logger.log("parseToolCall.reject index={d} exceeds max_parallel_tool_calls={d}", .{ index, stream.max_calls });
+                logger.log("parseToolCall.reject index={d} exceeds max_parallel_tool_calls={d} model={s}", .{ index, stream.max_calls, stream.model });
                 return error.TooManyToolCalls;
             }
             resolved_index = @intCast(index);
@@ -534,4 +539,22 @@ fn appendStringValue(
             else => return error.UnexpectedToken,
         }
     }
+}
+
+test "readStream rejects tool calls whose index exceeds max_calls" {
+    // Regression guard for the L3 model-attribution change: the new `model`
+    // param is accepted and never changes the over-cap rejection behaviour.
+    // (The logger line itself isn't captured by tests; this asserts the
+    // observable contract — error.TooManyToolCalls at the right threshold.)
+    const gpa = std.testing.allocator;
+    // max_calls = 1, but the delta claims index 1 → reject.
+    const stream =
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_x\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}}]}\n" ++
+        "data: [DONE]\n";
+    var reader: std.Io.Reader = .fixed(stream);
+    var tool_call_seq: u64 = 0;
+    try std.testing.expectError(
+        error.TooManyToolCalls,
+        readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 1, "ling-3.0-flash"),
+    );
 }

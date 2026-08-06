@@ -198,4 +198,8 @@ test {
     _ = @import("lua/manifest.zig");
     _ = @import("lua/manager.zig");
     _ = @import("lua/events.zig");
+    // The text-tool-call recovery module (T1). Pure module, only consumed by
+    // the agent at call sites — reference it explicitly so its exhaustive
+    // unit tests run (silent-drop guard per AGENTS.md §Test runner quirks).
+    _ = @import("ai/text_tool_call.zig");
 }

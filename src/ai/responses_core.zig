@@ -212,7 +212,7 @@ pub fn writeRequestPayload(out: *std.Io.Writer, config: ai.Config, responses_con
         try out.writeAll(",\"instructions\":");
         try std.json.Stringify.value(config.system_prompt, .{}, out);
     }
-    if (config.session_id.len > 0) {
+    if (config.session_id.len > 0 and !config.disable_prompt_cache) {
         try out.writeAll(",\"prompt_cache_key\":");
         try std.json.Stringify.value(config.session_id, .{}, out);
     }
@@ -894,6 +894,27 @@ test "writeRequestPayload omits prompt_cache_key when no session id is set" {
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_key") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"You are Nova.\"") != null);
+}
+
+test "writeRequestPayload omits prompt_cache_key when disable_prompt_cache is true" {
+    // C1: this site is NOT dialect-gated (it emits whenever session_id is
+    // non-empty), so the flag is the sole gate. When set, prompt_cache_key
+    // must be suppressed even with a non-empty session id.
+    const gpa = std.testing.allocator;
+    const config: ai.Config = .{
+        .base_url = "",
+        .api_key = "",
+        .model = "gpt-test",
+        .session_id = "session-abc",
+        .system_prompt = "You are Nova.",
+        .reasoning = null,
+        .disable_prompt_cache = true,
+    };
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(&payload.writer, config, .{}, &.{}, "[]");
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_key") == null);
 }
 
 test "writeRequestPayload serializes tool call ids as strings, not objects" {

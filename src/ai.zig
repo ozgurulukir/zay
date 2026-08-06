@@ -6,6 +6,7 @@ pub const codex_responses = @import("ai/codex_responses.zig");
 pub const websocket = @import("websocket");
 pub const openai_compatible = @import("ai/openai_compatible.zig");
 pub const openai_responses = @import("ai/openai_responses.zig");
+pub const text_tool_call = @import("ai/text_tool_call.zig");
 
 pub const Tool = tools_common.Tool;
 
@@ -155,6 +156,15 @@ pub const Config = struct {
     /// Resolved at client-attach time from provider identity.
     /// Default `.minimal` is safe for all providers.
     wire_dialect: WireDialect = .minimal,
+    /// Disable provider prompt-caching fields entirely (C1). When true,
+    /// neither message-level `cache_control` (OpenRouter) nor top-level
+    /// `prompt_cache_key` (OpenAI/OpenRouter) is emitted, in BOTH wire
+    /// clients (chat-completions and Responses API), regardless of dialect.
+    /// Use for OpenRouter models that reject these fields with HTTP 400
+    /// (some `:free` / gateway-fronted models). The flag is the durable
+    /// escape hatch; C2's downgrade retry auto-recovers for users who
+    /// haven't set it.
+    disable_prompt_cache: bool = false,
     /// Maximum number of retries for transient HTTP errors (429 + 5xx).
     /// 0 disables retries entirely (single attempt — the legacy behavior).
     /// Only head-phase statuses are retried; once the response body streams,

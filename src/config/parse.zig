@@ -153,6 +153,7 @@ fn applyContextOverlay(target: *ContextSettings, updates: ContextSettings) void 
     if (updates.max_parallel_tool_calls != null) target.max_parallel_tool_calls = updates.max_parallel_tool_calls;
     if (updates.request_timeout_seconds != null) target.request_timeout_seconds = updates.request_timeout_seconds;
     if (updates.max_concurrent_requests != null) target.max_concurrent_requests = updates.max_concurrent_requests;
+    if (updates.disable_prompt_cache != null) target.disable_prompt_cache = updates.disable_prompt_cache;
     const d: CompactionSettings = .{};
     if (updates.compaction.auto != d.auto) target.compaction.auto = updates.compaction.auto;
     if (updates.compaction.threshold != d.threshold) target.compaction.threshold = updates.compaction.threshold;
@@ -613,6 +614,9 @@ fn parseContext(value: std.json.Value) ContextSettings {
     }
     if (intField(value, "maxConcurrentRequests")) |v| {
         if (v >= 1) ctx.max_concurrent_requests = @intCast(v);
+    }
+    if (boolFieldCompat(value, "disablePromptCache", "disable_prompt_cache")) |b| {
+        ctx.disable_prompt_cache = b;
     }
     if (value.object.get("compaction")) |comp_val| {
         if (comp_val == .object) ctx.compaction = parseCompaction(comp_val);
@@ -1161,6 +1165,7 @@ fn hasNonDefaultContext(ctx: ContextSettings) bool {
     if (ctx.max_parallel_tool_calls != null) return true;
     if (ctx.request_timeout_seconds != null) return true;
     if (ctx.max_concurrent_requests != null) return true;
+    if (ctx.disable_prompt_cache != null) return true;
     if (ctx.compaction.auto != d.compaction.auto) return true;
     if (ctx.compaction.threshold != d.compaction.threshold) return true;
     if (ctx.compaction.keep_recent_tokens != d.compaction.keep_recent_tokens) return true;
@@ -1191,6 +1196,10 @@ fn writeContext(writer: *std.Io.Writer, ctx: ContextSettings) !void {
     if (ctx.max_concurrent_requests) |v| {
         try writeKeyNoIndent(writer, "maxConcurrentRequests", &wrote_any);
         try writer.print("{d}", .{v});
+    }
+    if (ctx.disable_prompt_cache) |b| {
+        try writeKeyNoIndent(writer, "disablePromptCache", &wrote_any);
+        try writer.writeAll(if (b) "true" else "false");
     }
     // Compaction: always written when context is present.
     try writeKeyNoIndent(writer, "compaction", &wrote_any);
@@ -2511,6 +2520,50 @@ test "parseSemverMajor extracts major from various formats" {
     try std.testing.expectEqual(@as(?u32, 3), parseSemverMajor("3"));
     try std.testing.expectEqual(@as(?u32, null), parseSemverMajor("abc"));
     try std.testing.expectEqual(@as(?u32, null), parseSemverMajor(""));
+}
+
+test "serialize then parse roundtrips disablePromptCache" {
+    // C1: the cache-disable flag survives serialize → parse and merges into
+    // both camelCase and snake_case form. Mirrors the existing context
+    // round-trip test for max_concurrent_requests.
+    const gpa = std.testing.allocator;
+    var original: Config = .{
+        .provider = .ollama,
+        .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
+        .model = .{ .id = try gpa.dupe(u8, "llama3.1:8b") },
+        .context = .{ .disable_prompt_cache = true },
+    };
+    defer original.deinit(gpa);
+
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, original);
+
+    // Sanity: the serialized JSON carries the camelCase key. `writeContext`
+    // uses `writeKeyNoIndent` (no space after the colon), so the form is
+    // `"disablePromptCache":true`.
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"disablePromptCache\":true") != null);
+
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    var parsed = try parseFile(gpa, "<test>", buf.written(), &sink);
+    defer parsed.deinit(gpa);
+    var roundtrip = try mergeLayers(gpa, &.{parsed});
+    defer roundtrip.deinit(gpa);
+
+    try std.testing.expectEqual(@as(?bool, true), roundtrip.context.disable_prompt_cache);
+
+    // snake_case form parses too (the helper is a compat reader).
+    const snake_json =
+        \\{"version":"2.0.0","provider":"ollama","baseUrl":"http://localhost:11434/v1",
+        \\ "model":{"id":"llama3.1:8b"},
+        \\ "context":{"disable_prompt_cache":true}}
+    ;
+    var snake_parsed = try parseFile(gpa, "<snake>", snake_json, &sink);
+    defer snake_parsed.deinit(gpa);
+    var snake_rt = try mergeLayers(gpa, &.{snake_parsed});
+    defer snake_rt.deinit(gpa);
+    try std.testing.expectEqual(@as(?bool, true), snake_rt.context.disable_prompt_cache);
 }
 
 test "parseProviderConfig accepts baseURL (camelCase)" {

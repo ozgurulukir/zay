@@ -91,6 +91,14 @@ pub const ContextSettings = struct {
     /// degrades or rate-limits the burst (every lane slows down together).
     /// Null = `default_max_concurrent_requests`. 1 serializes requests.
     max_concurrent_requests: ?u32 = null,
+    /// Disable provider prompt-caching fields entirely. When true, neither
+    /// message-level `cache_control` (OpenRouter) nor top-level
+    /// `prompt_cache_key` (OpenAI/OpenRouter, emitted by BOTH the
+    /// chat-completions client and the Responses API client) is emitted,
+    /// regardless of the resolved wire dialect. Use for providers/models
+    /// that reject these fields with HTTP 400 (some OpenRouter `:free` /
+    /// gateway-fronted models — kimi, inclusionai/ling).
+    disable_prompt_cache: ?bool = null,
     compaction: CompactionSettings = .{},
 };
 

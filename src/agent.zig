@@ -15,6 +15,7 @@ const lua_mod = @import("lua/root.zig");
 const mcp_mod = @import("mcp/manager.zig");
 const session_mod = @import("session.zig");
 const skill_mod = @import("skill.zig");
+const text_tool_call = @import("ai/text_tool_call.zig");
 const tools = @import("tools.zig");
 const vcs = @import("vcs.zig");
 
@@ -139,6 +140,11 @@ pub const Agent = struct {
     snapshot_index: ?[]u8 = null,
     last_snapshot_tree: ?vcs.ObjectId = null,
     snapshots_disabled: bool = false,
+    /// Monotonic counter minting `textcall_<n>` ids for tool calls recovered
+    /// from text (T3). Kept on the agent (not the stream parser) because
+    /// recovery runs on the finished turn, post-stream, so the stream's own
+    /// `tool_call_seq` is not in scope.
+    text_tool_seq: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, client: ai.LanguageModel) Agent {
         return .{
@@ -503,8 +509,36 @@ pub const Agent = struct {
             var turn_owned = true;
             defer if (turn_owned) turn.deinit(self.gpa);
 
-            const tool_calls = try self.collectToolCalls(turn.assistant);
-            defer self.gpa.free(tool_calls);
+            const tool_calls_initial = try self.collectToolCalls(turn.assistant);
+            defer self.gpa.free(tool_calls_initial);
+
+            // T3: recover tool calls the model emitted as literal text (weak
+            // function-calling models do this). Only when there were zero
+            // structured calls, and only over the assistant's text blocks —
+            // never mid-stream. Runs BEFORE takeAssistantMessage so the
+            // recovered calls are persisted (turn.assistant is still live and
+            // owned by the turn here). See plan §1.1, §2.2.
+            var recovered: []ai.ToolCall = &.{};
+            if (tool_calls_initial.len == 0) {
+                recovered = try self.recoverTextToolCalls(turn.assistant);
+            }
+            // Ownership: when recovered.len > 0 the payloads were MOVED into
+            // the message's new blocks by injectRecoveredToolCalls; the
+            // `recovered` slice shell itself is freed here, but NOT its
+            // element strings (they were moved). When recovery didn't fire,
+            // recovered is &.{} (empty literal, nothing to free).
+            defer if (recovered.len > 0) self.gpa.free(recovered);
+            if (recovered.len > 0) {
+                try self.injectRecoveredToolCalls(&turn.assistant, recovered);
+            }
+            // The slice that drives execution. When recovery fired, execution
+            // runs the recovered calls; otherwise it runs the structured ones.
+            // Both `tool_calls_initial` and `recovered` are freed by their
+            // defers at scope end; execution (runToolBatch) completes before
+            // that, and runToolBatch copies the ToolCall values into the
+            // executor before returning, so neither slice is read post-free.
+            const tool_calls: []const ai.ToolCall = if (recovered.len > 0) recovered else tool_calls_initial;
+
             if (turn.assistant == .assistant and hasWireContent(turn.assistant)) {
                 try self.takeAssistantMessage(&turn.assistant);
                 turn_owned = false;
@@ -962,6 +996,58 @@ pub const Agent = struct {
             index += 1;
         }
         return calls;
+    }
+
+    /// T3: scan the assistant message's text blocks for tool calls a model
+    /// emitted as literal text (weak function-calling models do this). Returns
+    /// a freshly-allocated `[]ai.ToolCall` (possibly empty) whose element
+    /// strings are independently owned — NOT aliased onto the message — so
+    /// `injectRecoveredToolCalls` can move them into new blocks cleanly.
+    /// Only scans `.text` blocks; reasoning blocks are ignored.
+    fn recoverTextToolCalls(self: *Agent, assistant: ai.ChatMessage) ![]ai.ToolCall {
+        if (assistant != .assistant) return &.{};
+        var all: std.ArrayList(ai.ToolCall) = .empty;
+        errdefer {
+            for (all.items) |*c| c.deinit(self.gpa);
+            all.deinit(self.gpa);
+        }
+        for (assistant.assistant.content) |block| {
+            if (block != .text) continue;
+            const found = try text_tool_call.extractFromText(self.gpa, block.text.text, &self.text_tool_seq);
+            // `found`'s element strings are owned; appendSlice copies the
+            // ToolCall values (shallow) into `all` — the element strings stay
+            // alive because `all` now holds the only references. Free `found`'s
+            // shell; the strings move with the values into `all`.
+            defer self.gpa.free(found);
+            try all.appendSlice(self.gpa, found);
+        }
+        return all.toOwnedSlice(self.gpa);
+    }
+
+    /// T3: append recovered tool calls as new `.tool_call` ContentBlocks into
+    /// the assistant message's content slice, reallocating the slice.
+    ///
+    /// Ownership contract: the recovered `ToolCall`s' owned strings
+    /// (call_id/name/arguments) are MOVED into the new blocks — callers must
+    /// NOT free those strings, only the `recovered` slice shell. This mirrors
+    /// `collectToolCalls`'s aliasing contract (slice shell caller-freed,
+    /// element strings belong to the message). Existing blocks keep their
+    /// strings — only the slice shell is reallocated.
+    fn injectRecoveredToolCalls(self: *Agent, assistant: *ai.ChatMessage, recovered: []ai.ToolCall) !void {
+        assert(assistant.* == .assistant);
+        if (recovered.len == 0) return;
+        const old = assistant.assistant.content;
+        const new_blocks = try self.gpa.alloc(ai.ContentBlock, old.len + recovered.len);
+        // Shallow copy: old blocks keep their owned strings.
+        @memcpy(new_blocks[0..old.len], old);
+        var i: usize = old.len;
+        for (recovered) |tc| {
+            new_blocks[i] = .{ .tool_call = tc }; // MOVED: strings now owned by this block
+            i += 1;
+        }
+        // Free only the old slice shell — element strings were moved into new_blocks.
+        self.gpa.free(old);
+        assistant.assistant.content = new_blocks;
     }
 
     fn takeToolResults(self: *Agent, results: []executor_mod.ToolResult) !void {
@@ -1470,6 +1556,104 @@ test "interrupted tool calls get synthetic cancelled results" {
     // Idempotent: every call now has a result, so a second pass adds nothing.
     try agent.reconcileInterruptedToolCalls();
     try std.testing.expectEqual(@as(usize, 3), agent.messages().len);
+}
+
+test "recoverTextToolCalls recovers from a text block when there are zero structured calls" {
+    // T3 unit test: the recovery helper, exercised on a realistic assistant
+    // message — a single text block containing the DB-observed XML shape.
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    const blocks = try gpa.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "<tool_call>bash<arg_key=\"command\">echo recovered</arg_key></tool_call>") } };
+    var assistant: ai.ChatMessage = .{ .assistant = .{ .content = blocks } };
+    defer assistant.deinit(gpa);
+
+    const recovered = try agent.recoverTextToolCalls(assistant);
+    defer {
+        for (recovered) |*c| c.deinit(gpa);
+        gpa.free(recovered);
+    }
+    try std.testing.expectEqual(@as(usize, 1), recovered.len);
+    try std.testing.expectEqualStrings("bash", recovered[0].name);
+    // The arg_key="command" pair is captured (the value sits on the opening tag).
+    try std.testing.expectEqualStrings("{\"arg_key\":\"command\"}", recovered[0].arguments);
+    try std.testing.expect(std.mem.startsWith(u8, recovered[0].call_id.slice(), "textcall_"));
+}
+
+test "injectRecoveredToolCalls appends without dropping existing blocks" {
+    // T3 ownership test — the highest-risk failure mode. Build an assistant
+    // with a text block, recover one call, inject it, and assert the message
+    // now has 2 blocks (text + tool_call) with the original text intact. Run
+    // under std.testing.allocator to catch any leak/double-free (the recovered
+    // strings are MOVED into the new block, so the slice shell is freed but
+    // NOT the element strings).
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    const blocks = try gpa.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "prefix <tool_call>{\"name\":\"bash\",\"arguments\":{\"command\":\"x\"}}</tool_call> suffix") } };
+    var assistant: ai.ChatMessage = .{ .assistant = .{ .content = blocks } };
+    defer assistant.deinit(gpa);
+
+    const recovered = try agent.recoverTextToolCalls(assistant);
+    // After inject, the element strings belong to the message — free only the shell.
+    defer gpa.free(recovered);
+    try std.testing.expectEqual(@as(usize, 1), recovered.len);
+
+    try agent.injectRecoveredToolCalls(&assistant, recovered);
+    // 2 blocks now: the original text + the injected tool_call.
+    try std.testing.expectEqual(@as(usize, 2), assistant.assistant.content.len);
+    try std.testing.expect(assistant.assistant.content[0] == .text);
+    try std.testing.expectEqualStrings("prefix <tool_call>{\"name\":\"bash\",\"arguments\":{\"command\":\"x\"}}</tool_call> suffix", assistant.assistant.content[0].text.text);
+    try std.testing.expect(assistant.assistant.content[1] == .tool_call);
+    try std.testing.expectEqualStrings("bash", assistant.assistant.content[1].tool_call.name);
+
+    // collectToolCalls now sees the recovered call (the turn-loop window).
+    const recollected = try agent.collectToolCalls(assistant);
+    defer gpa.free(recollected);
+    try std.testing.expectEqual(@as(usize, 1), recollected.len);
+    try std.testing.expectEqualStrings("bash", recollected[0].name);
+}
+
+test "T3 turn-loop window: zero structured calls + text recovery yields executable tool_calls" {
+    // Integration of the exact turn-loop window (collect → recover → inject)
+    // without firing a full HTTP turn. Mirrors the ordering fact in plan §1.1:
+    // recovery must run BEFORE takeAssistantMessage, and the recovered slice
+    // drives execution via re-collection. No use-after-free because the
+    // message is live throughout the window.
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    // Simulate a turn whose assistant emitted a tool call as TEXT (zero
+    // structured .tool_call blocks).
+    const blocks = try gpa.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "Sure! <tool_call>{\"name\":\"bash\",\"arguments\":{\"command\":\"echo done\"}}</tool_call>") } };
+    var assistant: ai.ChatMessage = .{ .assistant = .{ .content = blocks } };
+    defer assistant.deinit(gpa);
+
+    // Step 1: collect — zero structured calls.
+    const initial = try agent.collectToolCalls(assistant);
+    defer gpa.free(initial);
+    try std.testing.expectEqual(@as(usize, 0), initial.len);
+
+    // Step 2: recover — fire because initial is empty.
+    const recovered = try agent.recoverTextToolCalls(assistant);
+    defer gpa.free(recovered);
+    try std.testing.expectEqual(@as(usize, 1), recovered.len);
+
+    // Step 3: inject so takeAssistantMessage persists the recovered call.
+    try agent.injectRecoveredToolCalls(&assistant, recovered);
+
+    // Step 4: the slice that would drive execution (recovered, per plan §2.2)
+    // has length > 0 → runToolBatch would fire, not the idle-drain branch.
+    const tool_calls: []const ai.ToolCall = recovered;
+    try std.testing.expect(tool_calls.len > 0);
+    try std.testing.expectEqualStrings("bash", tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"command\":\"echo done\"}", tool_calls[0].arguments);
 }
 
 test "context token estimate anchors on usage plus trailing messages" {

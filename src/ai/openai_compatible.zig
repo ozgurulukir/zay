@@ -123,6 +123,17 @@ pub const Client = struct {
         self.last_error_detail = null;
     }
 
+    /// Conservative check: does the last recorded error detail mention "cache"?
+    /// Used (C2) to decide whether a 400 might be a `cache_control` /
+    /// `prompt_cache_key` rejection worth a single cache-stripped retry.
+    /// Case-insensitive. False positives (a 400 mentioning "cache" for an
+    /// unrelated reason) cost one extra request and then fail normally — the
+    /// retry is bounded and idempotent (a 400 means the model produced nothing).
+    fn errorDetailMentionsCache(self: *Client) bool {
+        const detail = self.last_error_detail orelse return false;
+        return std.ascii.indexOfIgnoreCase(detail, "cache") != null;
+    }
+
     /// Record `HTTP <status>: <message>` from a failed response body for the UI.
     /// Best-effort: a failure to build the string just leaves the detail unset.
     fn recordErrorDetail(self: *Client, status_code: u16, body: []const u8) void {
@@ -146,13 +157,18 @@ pub const Client = struct {
         std.debug.assert(self.url.len > 0);
         self.clearErrorDetail();
 
-        // The payload is serialized ONCE; every retry attempt re-sends the
-        // same bytes. This is safe because retries only happen on head-phase
-        // 429/5xx — the model has not produced anything and no tool has run,
-        // so the request is idempotent. Stream-mid errors are never retried
-        // (partial deltas may already be visible to the observer).
+        // The payload is serialized ONCE per cache mode; every retry attempt
+        // re-sends the same bytes. This is safe because retries only happen on
+        // head-phase 429/5xx — the model has not produced anything and no tool
+        // has run, so the request is idempotent. Stream-mid errors are never
+        // retried (partial deltas may already be visible to the observer).
         var payload: std.Io.Writer.Allocating = .init(self.gpa);
         defer payload.deinit();
+        // C1/C2: `disable_cache` starts from the user's config flag. C2 may
+        // flip it to `true` after a cache-related 400 and re-send the same
+        // payload with cache fields stripped — exactly once, independently of
+        // the 429/5xx retry budget (different failure mode).
+        var disable_cache = self.config.disable_prompt_cache;
         try writeRequestPayload(
             self.gpa,
             &payload.writer,
@@ -163,33 +179,87 @@ pub const Client = struct {
             self.config.reasoning,
             self.config.max_output_tokens,
             self.config.wire_dialect,
+            disable_cache,
         );
-        logger.log("openai_compatible.request POST {s} body={s}", .{ self.url, logBytes(payload.written()) });
-
-        var attempt: u32 = 0;
-        while (attempt <= self.config.max_retries) : (attempt += 1) {
-            var retry_after_secs: ?u64 = null;
-            const turn = self.sendOnce(payload.written(), observer, &retry_after_secs) catch |err| {
-                // Only head-phase transient failures are retried: 429/5xx
-                // statuses and connection drops before any response bytes.
-                // The model has produced nothing and no tool has run, so the
-                // request is idempotent. Every other 4xx is permanent — a
-                // schema/auth/model error won't fix itself — and stream-mid
-                // errors never surface as these codes, so they propagate
-                // immediately too.
-                if (attempt >= self.config.max_retries) return err;
-                switch (err) {
-                    error.HttpServerError, error.HttpRateLimited, error.ConnectionFailed => {},
-                    else => return err,
-                }
-                const delay_ms = self.retryDelayMs(attempt, retry_after_secs);
-                logger.log("openai_compatible.retry attempt={d} err={s} delay_ms={d}", .{ attempt + 1, @errorName(err), delay_ms });
-                self.sleepMs(delay_ms);
-                continue;
-            };
-            return turn;
+        const req_body_log = try logBytes(self.gpa, payload.written());
+        defer if (req_body_log.ptr != payload.written().ptr) self.gpa.free(req_body_log);
+        logger.log("openai_compatible.request POST {s} body={s}", .{ self.url, req_body_log });
+        // L2: when this client carries no tools, say so next to the request log
+        // with the client identity. `writeRequestPayload` is a free function
+        // (no `self.url`), so the URL disambiguation lives here — it tells the
+        // main agent apart from the summarizer/naming clients (which are
+        // correctly tool-less) when several clients are alive.
+        if (std.mem.eql(u8, self.tools_json, "[]")) {
+            logger.log("openai_compatible.no_tools client model={s} url={s}", .{ self.config.model, self.url });
         }
-        unreachable;
+
+        // C2: a cache-related 400 earns exactly ONE cache-stripped re-send,
+        // independent of the 429/5xx retry budget (different failure mode).
+        // `downgrade_done` gates it to a single rebuild; the outer loop runs at
+        // most twice (original payload, then stripped). Note Zig's
+        // `while … : (step) { continue }` runs the step expr, so a downgrade
+        // cannot ride the `attempt` counter — it is a separate state bit.
+        var downgrade_done = false;
+        while (true) {
+            var attempt: u32 = 0;
+            while (attempt <= self.config.max_retries) : (attempt += 1) {
+                var retry_after_secs: ?u64 = null;
+                const turn = self.sendOnce(payload.written(), observer, &retry_after_secs) catch |err| {
+                    // Only head-phase transient failures are retried: 429/5xx
+                    // statuses and connection drops before any response bytes.
+                    // The model has produced nothing and no tool has run, so the
+                    // request is idempotent. Every other 4xx is permanent — a
+                    // schema/auth/model error won't fix itself — and stream-mid
+                    // errors never surface as these codes, so they propagate
+                    // immediately too.
+                    if (attempt >= self.config.max_retries) {
+                        // C2: before giving up on a 400, try the cache-stripped
+                        // variant once — some OpenRouter `:free` / gateway-
+                        // fronted models reject `cache_control` /
+                        // `prompt_cache_key` with 400. Conservative: only when
+                        // the error body mentions "cache" AND we haven't
+                        // downgraded yet AND the user didn't already disable
+                        // caching (no fields to strip).
+                        if (err == error.HttpClientError and !downgrade_done and !disable_cache and self.errorDetailMentionsCache()) {
+                            downgrade_done = true;
+                            disable_cache = true;
+                            payload.deinit();
+                            payload = .init(self.gpa);
+                            try writeRequestPayload(
+                                self.gpa,
+                                &payload.writer,
+                                self.config.model,
+                                self.config.session_id,
+                                messages,
+                                self.tools_json,
+                                self.config.reasoning,
+                                self.config.max_output_tokens,
+                                self.config.wire_dialect,
+                                disable_cache,
+                            );
+                            logger.log("openai_compatible.cache_downgrade retrying without cache_control/prompt_cache_key after HTTP 400", .{});
+                            break; // break inner loop → outer loop re-runs the full retry budget on the stripped payload
+                        }
+                        return err;
+                    }
+                    switch (err) {
+                        error.HttpServerError, error.HttpRateLimited, error.ConnectionFailed => {},
+                        else => return err,
+                    }
+                    const delay_ms = self.retryDelayMs(attempt, retry_after_secs);
+                    logger.log("openai_compatible.retry attempt={d} err={s} delay_ms={d}", .{ attempt + 1, @errorName(err), delay_ms });
+                    self.sleepMs(delay_ms);
+                    continue;
+                };
+                return turn;
+            }
+            // Inner loop exhausted its retry budget without returning a turn.
+            // This only happens after a downgrade (the break above) — the
+            // original-payload path always returns err or a turn. Surface the
+            // persistent 400 rather than looping forever.
+            if (downgrade_done) return error.HttpClientError;
+            unreachable; // guarded by the return paths above
+        }
     }
 
     /// Perform one HTTP round-trip with the already-serialized payload.
@@ -244,7 +314,9 @@ pub const Client = struct {
             var error_body: std.Io.Writer.Allocating = .init(self.gpa);
             defer error_body.deinit();
             _ = error_reader.streamRemaining(&error_body.writer) catch 0;
-            logger.log("openai_compatible.response.error status={d} body={s}", .{ status_code, logBytes(error_body.written()) });
+            const err_body_log = try logBytes(self.gpa, error_body.written());
+            defer if (err_body_log.ptr != error_body.written().ptr) self.gpa.free(err_body_log);
+            logger.log("openai_compatible.response.error status={d} body={s}", .{ status_code, err_body_log });
             self.recordErrorDetail(status_code, error_body.written());
             if (status_code == 429) return error.HttpRateLimited;
             if (status_code >= 500) return error.HttpServerError;
@@ -272,7 +344,7 @@ pub const Client = struct {
 
         var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
         const reader = http_response.reader(&transfer_buffer);
-        return try stream_parser.readStream(self.gpa, reader, observer, &self.tool_call_seq, self.config.max_parallel_tool_calls);
+        return try stream_parser.readStream(self.gpa, reader, observer, &self.tool_call_seq, self.config.max_parallel_tool_calls, self.config.model);
     }
 
     /// Map a failure that occurred before any response bytes (connect, body
@@ -352,10 +424,35 @@ fn parseRetryAfterSeconds(head_bytes: []const u8) ?u64 {
     return null;
 }
 
-fn logBytes(bytes: []const u8) []const u8 {
+/// Truncate a request/response body for logging. When the body exceeds
+/// `limit`, keep the head AND append a tail slice so the `tools` array
+/// (which serializes after `messages` and is usually past the head) is
+/// still visible. The tail is found by locating `"tools":` in the full
+/// body; if absent (or already inside the head), a plain
+/// `[...{n} more bytes]` ellipsis is used.
+///
+/// Returns either `bytes` verbatim (short body, or long body without a
+/// tools array past the head — caller frees nothing) or a freshly
+/// allocated slice (caller frees via `gpa` when `result.ptr != bytes.ptr`).
+fn logBytes(gpa: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     const limit = 12 * 1024;
     if (bytes.len <= limit) return bytes;
-    return bytes[0..limit];
+    // Look for the tools array past the head — the common debug target when
+    // triaging "the model can't call tools" reports. The tools array is
+    // serialised after messages, so a realistic system prompt + a few turns
+    // already pushes it past the head.
+    if (std.mem.indexOf(u8, bytes, "\"tools\":")) |pos| {
+        if (pos >= limit) {
+            const tail_max: usize = 4096;
+            const tail_end = @min(bytes.len, pos + tail_max);
+            return std.fmt.allocPrint(gpa, "{s}\n   [...{d} bytes truncated...]\n   {s}", .{
+                bytes[0..limit],
+                bytes.len - limit,
+                bytes[pos..tail_end],
+            });
+        }
+    }
+    return std.fmt.allocPrint(gpa, "{s}\n   [...{d} more bytes]", .{ bytes[0..limit], bytes.len - limit });
 }
 
 /// Pull a human-readable message out of an error response body. Handles the
@@ -410,7 +507,95 @@ test "extractErrorMessage pulls the nested message, plain error, or raw fallback
     try std.testing.expectEqualStrings("upstream timeout", raw);
 }
 
-fn writeMessage(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMessage, dialect: ai.WireDialect) !void {
+test "logBytes passes short bodies through untouched (no allocation)" {
+    const gpa = std.testing.allocator;
+    const short = "hello world";
+    const out = try logBytes(gpa, short);
+    // Pointer equality proves no allocation happened — the slice is aliased.
+    try std.testing.expect(out.ptr == short.ptr);
+    try std.testing.expectEqualStrings(short, out);
+}
+
+test "logBytes truncation surfaces the tools array past the head" {
+    const gpa = std.testing.allocator;
+
+    // Build a ~20KB body: ~13KB of message filler, then the `tools` array the
+    // old head-only truncation would have hidden. JSON key order is
+    // model → messages → … → tools, so this mirrors a real payload.
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try body.appendSlice(gpa, "{\"model\":\"m\",\"messages\":[{\"role\":\"system\",\"content\":\"");
+    var filler: usize = 0;
+    while (filler < 13 * 1024) : (filler += 1) try body.append(gpa, 'x');
+    try body.appendSlice(gpa, "\"}],\"stream\":true,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"bash\"}}]}");
+
+    const out = try logBytes(gpa, body.items);
+    defer if (out.ptr != body.items.ptr) gpa.free(out);
+
+    // The tools array is now visible despite living past the 12KB head.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"tools\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"name\":\"bash\"") != null);
+    // The truncation marker is present.
+    try std.testing.expect(std.mem.indexOf(u8, out, "bytes truncated") != null);
+    // And it was allocated (not aliased).
+    try std.testing.expect(out.ptr != body.items.ptr);
+}
+
+test "logBytes truncation falls back to an ellipsis when there is no tools array" {
+    const gpa = std.testing.allocator;
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try body.appendSlice(gpa, "{\"model\":\"m\",\"content\":\"");
+    var filler: usize = 0;
+    while (filler < 13 * 1024) : (filler += 1) try body.append(gpa, 'x');
+    try body.appendSlice(gpa, "\"}");
+
+    const out = try logBytes(gpa, body.items);
+    defer gpa.free(out);
+    try std.testing.expect(out.ptr != body.items.ptr);
+    try std.testing.expect(std.mem.indexOf(u8, out, "more bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"tools\":") == null);
+}
+
+test "errorDetailMentionsCache is case-insensitive and handles null" {
+    // C2: the downgrade decision is driven by this predicate. Verify the
+    // conservative "cache" substring match in both cases and the null path.
+    const gpa = std.testing.allocator;
+    const tools = [_]tools_common.Tool{
+        .{ .name = "bash", .description = "x", .schema = .{ .properties = &.{} }, .run = undefined, .display = undefined },
+    };
+    var client: Client = undefined;
+    try client.init(gpa, std.testing.io, .{
+        .base_url = "http://localhost:8080/v1",
+        .api_key = "test-key",
+        .model = "test-model",
+        .tools = &tools,
+        .mcp_tools = &.{},
+    });
+    defer client.deinit();
+
+    // No detail recorded yet → no mention.
+    try std.testing.expect(!client.errorDetailMentionsCache());
+
+    // Lowercase "cache".
+    client.last_error_detail = try gpa.dupe(u8, "HTTP 400: unknown field cache_control");
+    try std.testing.expect(client.errorDetailMentionsCache());
+    gpa.free(client.last_error_detail.?);
+
+    // Mixed-case "Cache".
+    client.last_error_detail = try gpa.dupe(u8, "Cache-Control header rejected");
+    try std.testing.expect(client.errorDetailMentionsCache());
+    gpa.free(client.last_error_detail.?);
+
+    // Unrelated error → no mention (downgrade must not fire).
+    client.last_error_detail = try gpa.dupe(u8, "HTTP 400: invalid model id");
+    try std.testing.expect(!client.errorDetailMentionsCache());
+    gpa.free(client.last_error_detail.?);
+    client.last_error_detail = null;
+}
+
+fn writeMessage(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMessage, dialect: ai.WireDialect, disable_prompt_cache: bool) !void {
     try out.writeAll("{\"role\":");
     const role_label: []const u8 = switch (message) {
         .system => "system",
@@ -419,7 +604,7 @@ fn writeMessage(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMes
         .tool => "tool",
     };
     try std.json.Stringify.value(role_label, .{}, out);
-    if (dialect.allowsCacheControl()) {
+    if (dialect.allowsCacheControl() and !disable_prompt_cache) {
         switch (message) {
             .system => try out.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}"),
             else => {},
@@ -540,16 +725,27 @@ fn writeRequestPayload(
     reasoning: ?ai.Reasoning,
     max_output_tokens: ?u32,
     dialect: ai.WireDialect,
+    disable_prompt_cache: bool,
 ) !void {
-    std.debug.assert(model.len > 0);
-    std.debug.assert(tools_json.len > 0);
+    // Real early returns — these MUST survive into the ReleaseFast install
+    // build. `std.debug.assert` compiles to `unreachable` (UB) in ReleaseFast,
+    // so it asserts nothing there (AGENTS.md §Safety). An empty model id is a
+    // genuine error state — the same `error.EmptyModelId` the upstream guards
+    // surface (`tui.applySelectedModel`, `runtime.applyFromConfig`) — so callers
+    // already handle it.
+    if (model.len == 0) return error.EmptyModelId;
+    // NOTE: tools_json may legitimately be "[]" — the compaction and naming
+    // clients send no tools, and a tools-less main client is a real (if broken)
+    // state. The `else` branch below logs it (with model+url, see L2) rather
+    // than erroring; never reintroduce an assert or an early return for the
+    // empty-tools case.
 
     try out.writeAll("{\"model\":");
     try std.json.Stringify.value(model, .{}, out);
     try out.writeAll(",\"messages\":[");
     for (messages, 0..) |*view, index| {
         if (index > 0) try out.writeByte(',');
-        try writeMessage(out, gpa, view.message().*, dialect);
+        try writeMessage(out, gpa, view.message().*, dialect, disable_prompt_cache);
     }
     // `stream_options.include_usage` makes the server emit a final usage-only
     // chunk (empty `choices`) before `[DONE]`. Without it, streaming responses
@@ -565,13 +761,13 @@ fn writeRequestPayload(
         try out.writeAll(tools_json);
         try out.writeAll(",\"tool_choice\":\"auto\"");
     } else {
-        logger.log("openai_compatible: sending request with NO tools (tools_json is empty)", .{});
+        logger.log("openai_compatible: sending request with NO tools (tools_json is empty) model={s}", .{model});
     }
     // Standard OpenAI cache-routing hint: steers requests sharing this session's
     // prefix to the same backend, raising prefix-cache hit rates (used by
     // gateways like OpenCode Zen; servers that don't support it, e.g. Ollama,
     // reject the unknown field with 400).
-    if (session_id.len > 0 and dialect.allowsPromptCacheKey()) {
+    if (session_id.len > 0 and dialect.allowsPromptCacheKey() and !disable_prompt_cache) {
         try out.writeAll(",\"prompt_cache_key\":");
         try std.json.Stringify.value(session_id, .{}, out);
     }
@@ -951,7 +1147,7 @@ test "writeRequestPayload disables thinking for reasoning effort none" {
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
     // DashScope dialect uses enable_thinking:false
-    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "", &.{}, "[]", .{ .effort = .none }, null, .dashscope);
+    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "", &.{}, "[]", .{ .effort = .none }, null, .dashscope, false);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_effort") == null);
@@ -961,7 +1157,7 @@ test "writeRequestPayload uses reasoning_effort none for minimal dialect" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "ollama-model", "", &.{}, "[]", .{ .effort = .none }, null, .minimal);
+    try writeRequestPayload(gpa, &payload.writer, "ollama-model", "", &.{}, "[]", .{ .effort = .none }, null, .minimal, false);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"none\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "enable_thinking") == null);
@@ -971,7 +1167,7 @@ test "writeRequestPayload emits prompt_cache_key from the session id" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "gpt-test", "session-abc", &.{}, "[]", null, null, .openai);
+    try writeRequestPayload(gpa, &payload.writer, "gpt-test", "session-abc", &.{}, "[]", null, null, .openai, false);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"session-abc\"") != null);
 }
@@ -980,7 +1176,7 @@ test "writeRequestPayload omits prompt_cache_key for minimal dialect" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "ollama-model", "session-abc", &.{}, "[]", null, null, .minimal);
+    try writeRequestPayload(gpa, &payload.writer, "ollama-model", "session-abc", &.{}, "[]", null, null, .minimal, false);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_key") == null);
 }
@@ -989,9 +1185,45 @@ test "writeRequestPayload omits prompt_cache_key when no session id is set" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "", &.{}, "[]", null, null, .openai);
+    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "", &.{}, "[]", null, null, .openai, false);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_key") == null);
+}
+
+test "writeRequestPayload suppresses cache_control when disable_prompt_cache is true" {
+    // C1: an OpenRouter model that rejects cache_control must have BOTH the
+    // per-message cache_control AND the top-level prompt_cache_key suppressed.
+    const gpa = std.testing.allocator;
+    const system_blocks = try gpa.alloc(ai.ContentBlock, 1);
+    system_blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "You are a helpful agent.") } };
+    var system_msg: ai.ChatMessage = .{ .system = .{ .content = system_blocks } };
+    defer system_msg.deinit(gpa);
+    const views = [_]ai.MessageView{.{ .borrowed = &system_msg }};
+
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "inclusionai/ling-3.0-flash:free", "sess-abc", &views, "[]", null, null, .openrouter, true);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "cache_control") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_key") == null);
+}
+
+test "writeRequestPayload emits cache_control when disable_prompt_cache is false" {
+    // Regression guard: the flag defaults off, so the existing OpenRouter
+    // cache behaviour is preserved.
+    const gpa = std.testing.allocator;
+    const system_blocks = try gpa.alloc(ai.ContentBlock, 1);
+    system_blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "You are a helpful agent.") } };
+    var system_msg: ai.ChatMessage = .{ .system = .{ .content = system_blocks } };
+    defer system_msg.deinit(gpa);
+    const views = [_]ai.MessageView{.{ .borrowed = &system_msg }};
+
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "inclusionai/ling-3.0-flash:free", "sess-abc", &views, "[]", null, null, .openrouter, false);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"sess-abc\"") != null);
 }
 
 test "writeRequestPayload omits tools and tool_choice when there are none" {
@@ -1000,17 +1232,26 @@ test "writeRequestPayload omits tools and tool_choice when there are none" {
     defer payload.deinit();
     // The background summarizer sends no tools ("[]"); the request must not carry
     // a `tool_choice` (rejected by strict providers) or invite a tool-call reply.
-    try writeRequestPayload(gpa, &payload.writer, "summarizer", "", &.{}, "[]", null, null, .minimal);
+    try writeRequestPayload(gpa, &payload.writer, "summarizer", "", &.{}, "[]", null, null, .minimal, false);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "tool_choice") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") == null);
+}
+
+test "writeRequestPayload rejects an empty model id with EmptyModelId" {
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    // Empty tools ("[]") is legal; empty model is not. The guard must be a real
+    // early return that fires in ReleaseFast, not a stripped `unreachable`.
+    try std.testing.expectError(error.EmptyModelId, writeRequestPayload(gpa, &payload.writer, "", "", &.{}, "[]", null, null, .minimal, false));
 }
 
 test "writeRequestPayload keeps tools and tool_choice when tools are present" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "agent", "", &.{}, "[{\"type\":\"function\"}]", null, null, .minimal);
+    try writeRequestPayload(gpa, &payload.writer, "agent", "", &.{}, "[{\"type\":\"function\"}]", null, null, .minimal, false);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"auto\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":[{\"type\":\"function\"}]") != null);
@@ -1045,7 +1286,7 @@ test "writeRequestPayload serializes tool call ids as strings, not objects" {
 
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "test-model", "", &views, "[{\"type\":\"function\"}]", null, null, .minimal);
+    try writeRequestPayload(gpa, &payload.writer, "test-model", "", &views, "[{\"type\":\"function\"}]", null, null, .minimal, false);
     const body = payload.written();
 
     // The tool_call id must be a JSON string, not an object
@@ -1055,6 +1296,152 @@ test "writeRequestPayload serializes tool call ids as strings, not objects" {
     // Negative: must NOT serialize CallId as an object
     try std.testing.expect(std.mem.indexOf(u8, body, "\"id\":{\"value\":") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_call_id\":{\"value\":") == null);
+}
+
+test "writeRequestPayload ships the full tools array for OpenRouter byte-for-byte" {
+    // Tersine mühendislik yerine servis katmanını uçtan uca çalıştırıp, gerçek
+    // wire payload'ı üretir ve OpenRouter'a giden `tools` array'inin log
+    // truncation'ına takılmadan tam doğruluğunu (hiçbir tool düşmeden, tam
+    // byte-for-byte) kanıtlar. Payload `writeRequestPayload` tarafından tek
+    // parça üretilir — `logBytes` yalnızca loglama için kırpar, test ham byte'ı
+    // olduğu gibi alır.
+    const gpa = std.testing.allocator;
+
+    // Registry: builtin (bash, lane) + plugin tools, aynen üretimdeki gibi.
+    var registry: tools_mod.ToolRegistry = .init(tools_mod.builtinRegistry());
+    defer registry.deinit(gpa);
+    const plugin_names = [_][]const u8{
+        "lua__file-tools__read",        "lua__file-tools__write",        "lua__file-tools__edit",
+        "lua__search-tools__grep",      "lua__search-tools__glob",       "lua__path-tools__create_directory",
+        "lua__path-tools__delete_path", "lua__git-tools__git_status",    "lua__git-tools__git_diff",
+        "lua__git-tools__git_commit",   "lua__todo__todo_list",          "lua__todo__todo_add",
+        "lua__todo__todo_done",         "lua__file-watcher__file_stats", "lua__hello-world__greet",
+    };
+    for (plugin_names) |name| {
+        try registry.addPluginTool(gpa, .{
+            .name = try gpa.dupe(u8, name),
+            .description = try std.fmt.allocPrint(gpa, "Plugin tool {{hsep}} for {s}", .{name}),
+            .schema = .{
+                .properties = &.{
+                    .{ .name = "path", .kind = .string, .description = "A path", .required = true, .nullable = false },
+                    .{ .name = "recursive", .kind = .boolean, .description = "Recurse", .required = false, .nullable = true },
+                },
+            },
+            .run = undefined,
+            .display = undefined,
+        });
+    }
+    const mcp_tools = [_]ai.McpToolSchema{
+        .{ .name = "mcp__tavily__search", .description = "Web search", .schema = .{ .properties = &.{} } },
+        .{ .name = "mcp__chrome-devtools__click", .description = "Click element", .schema = .{ .properties = &.{} } },
+    };
+
+    // Tools array'i servis katmanıyla, OpenRouter'ın gerçekte aldığı biçimde üret.
+    const tools_json = try tool_schema.buildAllToolsJson(gpa, &.{}, &mcp_tools, &registry, false, .completions);
+    defer gpa.free(tools_json);
+
+    // Full wire payload — writeRequestPayload applies no truncation. Include a
+    // system message so OpenRouter's per-message cache_control is emitted.
+    const system_blocks = try gpa.alloc(ai.ContentBlock, 1);
+    system_blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "You are a helpful agent.") } };
+    var system_msg: ai.ChatMessage = .{ .system = .{ .content = system_blocks } };
+    defer system_msg.deinit(gpa);
+    const views = [_]ai.MessageView{.{ .borrowed = &system_msg }};
+
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "inclusionai/ling-3.0-flash:free", "session-abc", &views, tools_json, null, null, .openrouter, false);
+    const body = payload.written();
+
+    // Payload gerçekten JSON parse edilebilir olmalı (kırpılmamış, geçerli).
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+
+    // 1. OpenRouter dialect'i: system mesajı cache_control + prompt_cache_key.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"session-abc\"") != null);
+
+    // 2. tools array'i tam ve kırpılmamış — üretilen byte'larla birebir aynı.
+    const tools_str = try std.fmt.allocPrint(gpa, "\"tools\":{s}", .{tools_json});
+    defer gpa.free(tools_str);
+    try std.testing.expect(std.mem.indexOf(u8, body, tools_str) != null);
+    try std.testing.expectEqual(@as(usize, tools_mod.builtinRegistry().len + plugin_names.len + mcp_tools.len), countWireTools(tools_json));
+
+    // 3. tool_choice auto (tools varken) + stream true.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"auto\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+}
+
+fn countWireTools(tools_json: []const u8) usize {
+    var count: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, tools_json, idx, "\"type\":\"function\"")) |pos| {
+        count += 1;
+        idx = pos + 1;
+    }
+    return count;
+}
+
+test "ollama_cloud(minimal) vs openrouter dialect: identical tools array, only cache fields differ" {
+    // Kullanıcının gözlemi: ollama_cloud üzerindeki temel bir model (gemma4:31b)
+    // tool çağırabiliyor ama openrouter'daki ling-3.0-flash çağıramıyor. Dialect
+    // farkının tools array'ini ETKİLEMEDİĞİNİ kanıtlar — ikisi de aynı `tools`
+    // array'ini üretir; tek fark OpenRouter'ın eklediği cache_control /
+    // prompt_cache_key alanlarıdır. Yani tool çağıramama sorunu dialect'ten
+    // değil, modelin kendisinden gelir.
+    const gpa = std.testing.allocator;
+
+    // Aynı tool seti, her iki dialect için.
+    var registry: tools_mod.ToolRegistry = .init(tools_mod.builtinRegistry());
+    defer registry.deinit(gpa);
+    try registry.addPluginTool(gpa, .{
+        .name = try gpa.dupe(u8, "lua__file-tools__read"),
+        .description = try gpa.dupe(u8, "Read a file"),
+        .schema = .{ .properties = &.{.{ .name = "path", .kind = .string, .description = "A path", .required = true, .nullable = false }} },
+        .run = undefined,
+        .display = undefined,
+    });
+    const mcp_tools = [_]ai.McpToolSchema{
+        .{ .name = "mcp__tavily__search", .description = "Web search", .schema = .{ .properties = &.{} } },
+    };
+    const tools_json = try tool_schema.buildAllToolsJson(gpa, &.{}, &mcp_tools, &registry, false, .completions);
+    defer gpa.free(tools_json);
+
+    const system_blocks = try gpa.alloc(ai.ContentBlock, 1);
+    system_blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "You are a helpful agent.") } };
+    var system_msg: ai.ChatMessage = .{ .system = .{ .content = system_blocks } };
+    defer system_msg.deinit(gpa);
+    const views = [_]ai.MessageView{.{ .borrowed = &system_msg }};
+
+    // .minimal = ollama_cloud'ın çözümü; .openrouter = openrouter'ın çözümü.
+    var payload_min: std.Io.Writer.Allocating = .init(gpa);
+    defer payload_min.deinit();
+    try writeRequestPayload(gpa, &payload_min.writer, "gemma4:31b", "", &views, tools_json, null, null, .minimal, false);
+    const body_min = payload_min.written();
+
+    var payload_or: std.Io.Writer.Allocating = .init(gpa);
+    defer payload_or.deinit();
+    try writeRequestPayload(gpa, &payload_or.writer, "inclusionai/ling-3.0-flash:free", "sess", &views, tools_json, null, null, .openrouter, false);
+    const body_or = payload_or.written();
+
+    // 1. tools array'i İKİSİNDE DE aynıdır — byte-for-byte.
+    const tools_needle = try std.fmt.allocPrint(gpa, "\"tools\":{s}", .{tools_json});
+    defer gpa.free(tools_needle);
+    try std.testing.expect(std.mem.indexOf(u8, body_min, tools_needle) != null);
+    try std.testing.expect(std.mem.indexOf(u8, body_or, tools_needle) != null);
+    try std.testing.expectEqual(countWireTools(tools_json), tools_mod.builtinRegistry().len + 1 + mcp_tools.len);
+
+    // 2. tool_choice auto her ikisinde de var (tools varken).
+    try std.testing.expect(std.mem.indexOf(u8, body_min, "\"tool_choice\":\"auto\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body_or, "\"tool_choice\":\"auto\"") != null);
+
+    // 3. TEK fark: openrouter, system mesajına cache_control + prompt_cache_key
+    //    ekler; minimal bunları hiç üretmez.
+    try std.testing.expect(std.mem.indexOf(u8, body_min, "cache_control") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body_min, "prompt_cache_key") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body_or, "\"cache_control\":{\"type\":\"ephemeral\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body_or, "\"prompt_cache_key\":\"sess\"") != null);
 }
 
 test "readStream accepts an SSE line larger than the transfer buffer" {
@@ -1070,7 +1457,7 @@ test "readStream accepts an SSE line larger than the transfer buffer" {
 
     var reader: std.Io.Reader = .fixed(stream.items);
     var tool_call_seq: u64 = 0;
-    var response = try stream_parser.readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 16);
+    var response = try stream_parser.readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 16, "test-model");
     defer response.deinit(gpa);
     try std.testing.expectEqual(@as(usize, transfer_buffer_bytes + 512), response.assistant.assistant.content[0].text.text.len);
 }
@@ -1086,7 +1473,7 @@ test "readStream skips empty data lines without crashing" {
         "data: [DONE]\n";
     var reader: std.Io.Reader = .fixed(stream);
     var tool_call_seq: u64 = 0;
-    var response = try stream_parser.readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 16);
+    var response = try stream_parser.readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 16, "test-model");
     defer response.deinit(gpa);
     try std.testing.expectEqualStrings("hi", response.assistant.assistant.content[0].text.text);
 }

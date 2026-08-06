@@ -185,6 +185,81 @@ const test_mcp_tools = [_]ai.McpToolSchema{
     },
 };
 
+test "buildAllToolsJson emits every plugin+builtin+MCP tool at production scale" {
+    // Tersine mühendislik yerine servis katmanını doğrudan çalıştırıp, gerçek
+    // kurulum ölçeğinde (28 plugin tool + 2 builtin + N MCP tool) hiçbir
+    // tool'un enjeksiyon sırasında truncate edilmediğini / düşmediğini kanıtlar.
+    const gpa = std.testing.allocator;
+
+    var registry: tools_mod.ToolRegistry = .init(tools_mod.builtinRegistry());
+    defer registry.deinit(gpa);
+
+    const plugin_names = [_][]const u8{
+        "lua__file-tools__read",            "lua__file-tools__write",
+        "lua__file-tools__edit",            "lua__search-tools__grep",
+        "lua__search-tools__glob",          "lua__path-tools__create_directory",
+        "lua__path-tools__copy_path",       "lua__path-tools__move_path",
+        "lua__path-tools__delete_path",     "lua__git-tools__git_status",
+        "lua__git-tools__git_diff",         "lua__git-tools__git_log",
+        "lua__git-tools__git_branch",       "lua__git-tools__git_commit",
+        "lua__todo__todo_list",             "lua__todo__todo_add",
+        "lua__todo__todo_done",             "lua__todo__todo_delete",
+        "lua__todo__todo_prioritize",       "lua__todo__todo_write",
+        "lua__todo__todo_get_plan",         "lua__todo__todo_set_plan",
+        "lua__todo__todo_check_step",       "lua__file-watcher__file_stats",
+        "lua__file-watcher__track_file_op", "lua__hello-world__greet",
+        "lua__hello-world__current_time",
+    };
+    for (plugin_names) |name| {
+        const owned_name = try gpa.dupe(u8, name);
+        const owned_desc = try std.fmt.allocPrint(gpa, "Plugin tool {{hsep}} for {{hsep}} testing", .{});
+        try registry.addPluginTool(gpa, .{
+            .name = owned_name,
+            .description = owned_desc,
+            .schema = .{
+                .properties = &.{
+                    .{ .name = "path", .kind = .string, .description = "A path", .required = true, .nullable = false },
+                    .{ .name = "recursive", .kind = .boolean, .description = "Recurse", .required = false, .nullable = true },
+                },
+            },
+            .run = undefined,
+            .display = undefined,
+        });
+    }
+    const mcp_tools = [_]ai.McpToolSchema{
+        .{ .name = "mcp__tavily__search", .description = "Web search", .schema = .{ .properties = &.{} } },
+        .{ .name = "mcp__tavily__extract", .description = "URL extract", .schema = .{ .properties = &.{} } },
+        .{ .name = "mcp__chrome-devtools__click", .description = "Click element", .schema = .{ .properties = &.{} } },
+    };
+
+    const json = try buildAllToolsJson(gpa, &.{}, &mcp_tools, &registry, false, .completions);
+    defer gpa.free(json);
+
+    // Her tool adı çıktıda tam olarak bir kez geçmeli — hiçbiri kesilmemiş.
+    for (plugin_names) |name| {
+        try std.testing.expectEqual(@as(usize, 1), countSubstr(json, name));
+    }
+    for ([_][]const u8{ "bash", "lane" }) |builtin| {
+        const needle = try std.fmt.allocPrint(gpa, "\"name\":\"{s}\"", .{builtin});
+        defer gpa.free(needle);
+        try std.testing.expectEqual(@as(usize, 1), countSubstr(json, needle));
+    }
+    for ([_][]const u8{ "mcp__tavily__search", "mcp__tavily__extract", "mcp__chrome-devtools__click" }) |mcp| {
+        try std.testing.expectEqual(@as(usize, 1), countSubstr(json, mcp));
+    }
+    try std.testing.expectEqual(@as(usize, plugin_names.len + 2 + mcp_tools.len), countSubstr(json, "\"type\":\"function\""));
+}
+
+fn countSubstr(haystack: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, idx, needle)) |pos| {
+        count += 1;
+        idx = pos + 1;
+    }
+    return count;
+}
+
 test "tool_schema golden: byte-identical output for all envelope × strict combos" {
     // Locks the serialized bytes for the canonical tool set so any future
     // drift (wrong closing brace count, dropped nullable union, missing enum)
