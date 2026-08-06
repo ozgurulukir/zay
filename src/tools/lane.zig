@@ -51,7 +51,7 @@ pub const tool: common.Tool = .{
             .{
                 .name = "lane",
                 .kind = .string,
-                .description = "Lane id (the hex id shown by `lane list`). Required for `enter`, `leave`, `merge`, `read`, `cancel`, `await`, `steer`; unused for `list`/`create`/`spawn`.",
+                .description = "Lane id (the hex id shown by `lane list`). Required for `enter`, `leave`, `merge`, `read`, `cancel`, `await`, `steer`; optional for `spawn` (targets an existing idle lane to reuse its worktree — omit to create a fresh one). Unused for `list`/`create`.",
                 .required = false,
                 .nullable = true,
             },

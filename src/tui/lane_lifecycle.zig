@@ -892,23 +892,101 @@ fn mergeLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
 fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Thread) ?Resp {
     const task = req.task orelse return failResp(app.gpa, "lane: spawn needs a `task` (the worker's first prompt)\n", .{});
     const repo = app.repoRoot() orelse return failResp(app.gpa, "lane: no active runtime\n", .{});
-    const home = (app.templateRuntime() orelse return failResp(app.gpa, "lane: no active runtime\n", .{})).home_dir;
     if (!vcs.isRepo(app.gpa, app.io, repo)) return failResp(app.gpa, "lane: not a git repo — lanes need one\n", .{});
-    // The cap counts the DRIVER's main lane too: threads.len starts at 1
-    // (the primary), so >= 4 means "driver + 3 lanes" — a 4th lane would need
-    // a 5th pane in the 2×2 grid.
-    if (app.threads.items.len >= 4) return failResp(app.gpa, "lane: too many lanes open (max 4 total: driver + 3)\n", .{});
 
     // H2: the naming context comes from the SPAWNER lane, not whatever lane
     // the user is currently viewing. Scope-swap app.thread for the capture.
+    // Captured once up front; the req.lane branch passes it to `wakeIdleLane`
+    // (which adopts it), the fresh-worktree branch passes it to `Thread.initLive`
+    // (which adopts it). Every failure path below returns a `Resp` (never an
+    // error), so cleanup is explicit at each site — an `errdefer` would never
+    // fire here. `context` is freed by the caller on each pre-adoption failure.
     const spawner = requester_lane orelse return failResp(app.gpa, "lane: no spawner lane\n", .{});
     const prev_thread = app.thread;
     app.thread = spawner;
     const context = app.captureLaneContext(tui.lane_naming_context_max) catch @as([][]u8, &.{});
     app.thread = prev_thread;
 
-    // Every failure path below returns a `Resp` (never an error), so cleanup
-    // is explicit at each site — an `errdefer` would never fire here.
+    // H1: if req.lane targets an existing idle lane, reuse its worktree+
+    // branch and wake it as a worker (TD-3/TD-4). Null or unresolvable
+    // req.lane falls through to the fresh-worktree path (current behavior).
+    if (req.lane) |target_id| {
+        const target = resolveLane(app, target_id) orelse {
+            freeLaneContext(app.gpa, context);
+            return failResp(app.gpa, "lane: no open lane with id '{s}' — `lane list` shows open lanes\n", .{target_id});
+        };
+        // TD-6: refuse on the primary (no worktree to reuse).
+        if (lanes_util.workingLaneOf(target) == null) {
+            freeLaneContext(app.gpa, context);
+            return failResp(app.gpa, "lane: can't spawn into the primary lane — spawn creates a worker in an isolated worktree\n", .{});
+        }
+        // TD-6: refuse on a running/live lane (would race on the worktree).
+        if (target.engine != .idle) {
+            freeLaneContext(app.gpa, context);
+            return failResp(app.gpa, "lane: lane {s} is already running — spawn targets an idle lane\n", .{target_id});
+        }
+        if (target.turn.isActive()) {
+            freeLaneContext(app.gpa, context);
+            return failResp(app.gpa, "lane: lane {s} is still running — wait or cancel before re-tasking\n", .{target_id});
+        }
+        // The cap counts the driver too; reusing an idle lane does NOT
+        // add a new Thread, so the cap check is skipped here (the lane
+        // is already in the grid).
+
+        wakeIdleLane(app, target, repo, context) catch |err| {
+            // `context` is still caller-owned on failure — `wakeIdleLane`
+            // only adopts it on success.
+            freeLaneContext(app.gpa, context);
+            return failResp(app.gpa, "lane: wake idle lane failed: {s}\n", .{@errorName(err)});
+        };
+        // `target` is now live; `target.agent`/`worker_context` are set.
+        target.spawned_by_generation = spawner.generation;
+        const id = laneIdOf(target) orelse target_id;
+        const working = lanes_util.workingLaneOf(target).?;
+        const path = working.path;
+        const branch = working.branch;
+
+        const framed = std.fmt.allocPrint(
+            app.gpa,
+            "You are a worker agent in lane {s} on branch {s}. Your working directory is {s} — an isolated git worktree of the repo at {s}; work ONLY with relative paths inside it. The main tree is off-limits. Complete this task and report the result concisely. You cannot create lanes or worktrees.\n\n{s}",
+            .{ id, branch, path, repo, task },
+        ) catch {
+            // Rollback: re-park the lane to idle (frees the runtime we just
+            // attached). `context` is owned by `lane.parent_context` now;
+            // `parkFinishedWorker` leaves the lane idle and does not touch
+            // parent_context, so it survives.
+            parkFinishedWorker(app, target);
+            return failResp(app.gpa, "lane: out of memory\n", .{});
+        };
+        defer app.gpa.free(framed);
+        startTurnForLane(app, target, framed, task) catch |err| {
+            parkFinishedWorker(app, target);
+            return failResp(app.gpa, "lane: worker start failed: {s}\n", .{@errorName(err)});
+        };
+        return resp(
+            app.gpa,
+            "Spawned worker into existing lane {s} (branch {s}, path {s}) — running in the background; results arrive as a message. Read with `lane read {s}`, wait with `lane await {s}`, fold back with `lane merge {s}`.\n",
+            .{ id, branch, path, id, id, id },
+            id,
+            path,
+        );
+    }
+
+    // --- fresh-worktree path (current behavior, unchanged) ---
+    // The cap counts the DRIVER's main lane too: threads.len starts at 1
+    // (the primary), so >= 4 means "driver + 3 lanes" — a 4th lane would need
+    // a 5th pane in the 2×2 grid.
+    if (app.threads.items.len >= 4) {
+        freeLaneContext(app.gpa, context);
+        return failResp(app.gpa, "lane: too many lanes open (max 4 total: driver + 3)\n", .{});
+    }
+
+    // `home` is only needed for creating a new worktree; compute it here.
+    const home = (app.templateRuntime() orelse {
+        freeLaneContext(app.gpa, context);
+        return failResp(app.gpa, "lane: no active runtime\n", .{});
+    }).home_dir;
+
     const wt = createLaneWorktree(app, repo, home) catch |err| {
         freeLaneContext(app.gpa, context);
         return failResp(app.gpa, "lane: worktree create failed: {s}\n", .{@errorName(err)});
@@ -996,6 +1074,47 @@ fn removeFailedSpawn(app: *App, lane: *Thread) void {
     const index = indexOfLane(app, lane) orelse return;
     abandonLane(app, index) catch {};
     if (app.threads.items.len < 2) app.split = false;
+}
+
+/// Attach a runtime to an existing idle `Thread`, turning it live. Reuses
+/// the lane's worktree+branch (already owned via `engine.idle.working`) —
+/// no new worktree is created. Mirrors `spawnLane`'s runtime wiring (lines
+/// 916-930) but mutates the `Thread` in place instead of creating a new one
+/// (TD-3). The caller must `startTurnForLane` after this returns.
+fn wakeIdleLane(app: *App, lane: *Thread, repo: []const u8, context: [][]u8) !void {
+    // Read the working out of the idle engine BEFORE overwriting it.
+    // `vcs.Lane.Working` is two owned slices (branch, path); copying the
+    // struct copies the pointers, not the backing memory. The lane owns
+    // the backing memory for the lifetime of the Thread, so the move is
+    // safe across the union overwrite.
+    const working = lane.engine.idle.working;
+    const runtime = try app.createRuntime(working.path, repo, null);
+    errdefer {
+        runtime.deinit();
+        app.gpa.destroy(runtime);
+    }
+    runtime.agent.background_manager = app.background;
+    runtime.agent.mcp_manager = &app.mcp_manager;
+    runtime.agent.tool_registry = app.tool_registry;
+    runtime.agent.plugin_manager = &app.plugin_manager;
+    runtime.agent.lane_bridge = app.lane_bridge;
+    // A spawned worker is root-contained: its bash tool refuses `cd` out
+    // of the worktree (L2), so a task prompt leaking the main-tree path
+    // can't drift the worker's writes into the main tree.
+    runtime.agent.contained = true;
+
+    // Adopt the spawner's naming context so the first turn can rename the
+    // `nova/<hex>` branch, just like the fresh-worktree path. The caller
+    // already captured it from the spawner; we take ownership here.
+    lane.parent_context = context;
+
+    lane.agent = &runtime.agent;
+    lane.worker_context = .{ .io = app.io, .gpa = runtime.gpa };
+    lane.engine = .{ .live = .{
+        .lane = .{ .working = working },
+        .runtime = runtime,
+        .owns = true,
+    } };
 }
 
 /// Start a turn on `lane` with `prompt` (duped into the lane worker's
@@ -1754,6 +1873,187 @@ test "lane read returns the transcript tail and marks the lane acknowledged" {
     const second = std.mem.indexOf(u8, result.text, "second user line").?;
     try std.testing.expect(first < second);
     try std.testing.expect(lane.acknowledged); // M2: the result was consumed
+}
+
+test "beginSubmit refuses on an idle lane with a guiding notice, not a crash" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    // An idle lane (the `lane create` shape): engine idle, no worker_context.
+    _ = try addFakeWorkingLane(gpa, &app, "idle1");
+    app.thread = app.threads.items[1]; // focus the idle lane (cycleLane shape)
+    try std.testing.expect(app.thread.worker_context == null);
+
+    // Seed the input so we can assert it is preserved (TD-2).
+    try app.inputs.input.insertSliceAtCursor("let me work here");
+    const started = try app.beginSubmit();
+    try std.testing.expect(!started);
+    // The notice names both escape hatches.
+    try std.testing.expect(transcriptContains(app.thread, "idle"));
+    try std.testing.expect(transcriptContains(app.thread, "lane enter"));
+    try std.testing.expect(transcriptContains(app.thread, "lane spawn"));
+    // Input preserved — not consumed by toOwnedSlice.
+    try std.testing.expectEqualStrings("let me work here", app.inputs.input.buf.firstHalf());
+}
+
+test "lane spawn reuses an existing idle lane and wakes it as a worker" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
+    var fx = try GitFixture.init(gpa, io);
+    defer fx.deinit(gpa);
+    const app = &fx.app;
+
+    // Seed a user message on the driver so `captureLaneContext` has a
+    // non-empty parent context to copy into the woken lane.
+    _ = try app.thread.transcript.append(gpa, .user, "you", "driver context");
+
+    // Create an idle lane via the tool (real worktree + branch).
+    var create_req = lane_bridge.Request{
+        .op = .create,
+        .purpose = try gpa.dupe(u8, "scratch work"),
+        .requester = &fx.runtime.agent,
+    };
+    defer create_req.deinit(gpa);
+    const create_resp = postAndService(io, app, &create_req);
+    defer app.gpa.free(create_resp.text);
+    try std.testing.expectEqual(@as(u8, 0), create_resp.code);
+    try std.testing.expectEqual(@as(usize, 2), app.threads.items.len);
+    const idle_lane = app.threads.items[1];
+    try std.testing.expect(idle_lane.engine == .idle);
+    try std.testing.expect(idle_lane.worker_context == null);
+    const idle_id = laneIdOf(idle_lane).?;
+    const idle_gen = idle_lane.generation;
+
+    // Spawn a worker INTO that idle lane.
+    var spawn_req = lane_bridge.Request{
+        .op = .spawn,
+        .task = try gpa.dupe(u8, "run the tests and report"),
+        .lane = try gpa.dupe(u8, idle_id),
+        .requester = &fx.runtime.agent,
+    };
+    defer spawn_req.deinit(gpa);
+    const spawn_resp = postAndService(io, app, &spawn_req);
+    defer app.gpa.free(spawn_resp.text);
+    try std.testing.expectEqual(@as(u8, 0), spawn_resp.code);
+    // No new lane was created — the idle one was woken in place.
+    try std.testing.expectEqual(@as(usize, 2), app.threads.items.len);
+    const woken = app.threads.items[1];
+    try std.testing.expect(woken == idle_lane); // same Thread pointer
+    try std.testing.expect(woken.engine == .live);
+    try std.testing.expect(woken.worker_context != null);
+    try std.testing.expect(woken.agent != null);
+    try std.testing.expectEqual(idle_gen, woken.generation); // generation stable
+    try std.testing.expect(woken.spawned_by_generation == app.threads.items[0].generation);
+    // The worktree path is the same one `lane create` made.
+    try std.testing.expectEqualStrings(idle_id, laneIdOf(woken).?);
+    // Parent context was copied in, not left empty.
+    try std.testing.expect(woken.parent_context.len > 0);
+    var has_driver_ctx = false;
+    for (woken.parent_context) |m| {
+        if (std.mem.indexOf(u8, m, "driver context") != null) has_driver_ctx = true;
+    }
+    try std.testing.expect(has_driver_ctx);
+}
+
+test "lane spawn with req.lane refuses on a running lane" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
+    var fx = try GitFixture.init(gpa, io);
+    defer fx.deinit(gpa);
+    const app = &fx.app;
+
+    // A fake live lane with an active turn. Keep the fake idle's branch/path
+    // (last segment "busy") so `resolveLane` matches the id.
+    const lane = try addFakeWorkingLane(gpa, app, "busy");
+    const branch = lane.engine.idle.working.branch;
+    const path = lane.engine.idle.working.path;
+    lane.engine = .{ .live = .{ .lane = .{ .working = .{ .branch = branch, .path = path } }, .runtime = undefined, .owns = false } };
+    lane.worker_context = .{ .io = io, .gpa = gpa };
+    lane.turn.submit(); // mark active
+
+    var req = lane_bridge.Request{
+        .op = .spawn,
+        .task = try gpa.dupe(u8, "do something"),
+        .lane = try gpa.dupe(u8, "busy"),
+        .requester = &fx.runtime.agent,
+    };
+    defer req.deinit(gpa);
+    const result = postAndService(io, app, &req);
+    defer app.gpa.free(result.text);
+    try std.testing.expect(result.code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "already running") != null);
+}
+
+test "lane spawn with req.lane refuses on the primary lane" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
+    var fx = try GitFixture.init(gpa, io);
+    defer fx.deinit(gpa);
+    const app = &fx.app;
+    // An unresolvable id exercises the "no open lane" refuse path.
+    var req = lane_bridge.Request{
+        .op = .spawn,
+        .task = try gpa.dupe(u8, "x"),
+        .lane = try gpa.dupe(u8, "nonexistent"),
+        .requester = &fx.runtime.agent,
+    };
+    defer req.deinit(gpa);
+    const result = postAndService(io, app, &req);
+    defer app.gpa.free(result.text);
+    try std.testing.expect(result.code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "no open lane") != null);
+}
+
+test "lane spawn into a rested worker preserves the transcript and appends" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
+    var fx = try GitFixture.init(gpa, io);
+    defer fx.deinit(gpa);
+    const app = &fx.app;
+
+    // Spawn a worker, let it finish, rest it (the S11 shape).
+    const wt = try createLaneWorktree(app, fx.repo, fx.home_dir);
+    const rt = app.createRuntime(wt.dest, fx.repo, null) catch |err| {
+        app.gpa.free(wt.branch);
+        app.gpa.free(wt.dest);
+        return err;
+    };
+    const lane = try gpa.create(Thread);
+    lane.* = Thread.initLive(rt.session_writer.session.id, &rt.agent, io, rt.gpa, &.{}, wt.branch, wt.dest, rt);
+    lane.spawned_by_generation = 1;
+    try app.threads.append(gpa, lane);
+    _ = try lane.transcript.append(gpa, .user, "you", "first task");
+    _ = try lane.transcript.append(gpa, .agent, "agent", "first result");
+    _ = try deliverPendingLaneCompletions(app); // rests the lane
+
+    try std.testing.expect(lane.engine == .idle);
+    const id = laneIdOf(lane).?;
+    const old_msg_count = lane.transcript.messages.items.len;
+
+    // Re-task the rested lane.
+    var spawn_req = lane_bridge.Request{
+        .op = .spawn,
+        .task = try gpa.dupe(u8, "second task"),
+        .lane = try gpa.dupe(u8, id),
+        .requester = &fx.runtime.agent,
+    };
+    defer spawn_req.deinit(gpa);
+    const spawn_resp = postAndService(io, app, &spawn_req);
+    defer app.gpa.free(spawn_resp.text);
+    try std.testing.expectEqual(@as(u8, 0), spawn_resp.code);
+    try std.testing.expect(lane.engine == .live);
+    // Transcript preserved (TD-5): old messages still there + new ones appended.
+    try std.testing.expect(lane.transcript.messages.items.len > old_msg_count);
+    try std.testing.expect(transcriptContains(lane, "first result"));
+    try std.testing.expect(transcriptContains(lane, "second task"));
 }
 
 test "lane await resolves an idle lane immediately and polls a running one" {

@@ -86,6 +86,25 @@ pub fn beginSubmit(app: *App) !bool {
             return false;
         }
     }
+    // C1: an idle lane (from `lane create` or a rested worker) has no
+    // worker_context — submitting here would deref null at the
+    // `resetCancel`/`dupe` sites below. Refuse with a guiding notice
+    // instead of crashing. The guard is before `toOwnedSlice` so the
+    // user's typed input is preserved (TD-2).
+    if (app.thread.worker_context == null) {
+        const id = if (lanes_util.workingLaneOf(app.thread)) |w|
+            lanes_util.lastPathSegment(w.path)
+        else
+            "this lane";
+        const notice = std.fmt.allocPrint(
+            app.gpa,
+            "Lane {s} is idle — no agent is attached. From the driver, `lane enter {s}` to work here, or `lane spawn` to start a worker in it.\n",
+            .{ id, id },
+        ) catch return false;
+        defer app.gpa.free(notice);
+        _ = app.thread.transcript.append(app.gpa, .notice, "lane", notice) catch {};
+        return false;
+    }
     const prompt = try app.inputs.input.toOwnedSlice();
     defer app.gpa.free(prompt);
     if (prompt.len == 0) return false;
