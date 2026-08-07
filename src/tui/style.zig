@@ -22,6 +22,8 @@ pub const Palette = struct {
     pub const success: vaxis.Style = .{ .fg = .{ .rgb = success_green } };
     pub const notice: vaxis.Style = .{ .fg = .{ .rgb = amber_yellow } };
     pub const warning: vaxis.Style = .{ .fg = .{ .rgb = amber_yellow }, .bold = true };
+    /// Toast error accent — the failure red, bold so it reads as an error.
+    pub const error_style: vaxis.Style = .{ .fg = .{ .rgb = failure_red }, .bold = true };
     /// Neutral informational notice (e.g. context compaction) — plain white, so
     /// it reads as status rather than an error (red) or a win (green).
     pub const info: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } } };

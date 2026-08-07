@@ -37,6 +37,7 @@ const event_router = @import("tui/event_router.zig");
 const command_router = @import("tui/command_router.zig");
 const session_switcher = @import("tui/session_switcher.zig");
 const app_state = @import("tui/app_state.zig");
+const toast = @import("tui/toast.zig");
 const background_delivery = @import("tui/background_delivery.zig");
 const turn_lifecycle = @import("tui/turn_lifecycle.zig");
 const checkpoint_mod = @import("tui/checkpoint.zig");
@@ -1147,6 +1148,13 @@ pub fn run(
     var tty_buffer: [8192]u8 = undefined;
     var fw_app = try vxfw.App.init(init.io, gpa, init.environ_map, &tty_buffer);
     defer fw_app.deinit();
+
+    // Init the global toast bus (needs an io handle for its mutex) and apply
+    // the config's toast settings.
+    toast.global.init(init.io);
+    if (config.toast.enabled) |enabled| toast.global.enabled = enabled;
+    if (config.toast.duration_ms) |ms| toast.global.duration_ms = ms;
+    if (config.toast.max_visible) |n| toast.global.max_visible = n;
 
     var app = try App.initRuntime(init.io, gpa, runtime, config, init.environ_map);
     // Set the manager pointers now that `app` is in its final stack frame.

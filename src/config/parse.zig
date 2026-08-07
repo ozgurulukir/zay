@@ -21,6 +21,7 @@ const plugin_types = @import("plugin.zig");
 const Config = config_mod.Config;
 const ContextSettings = config_mod.ContextSettings;
 const CompactionSettings = config_mod.CompactionSettings;
+const ToastSettings = config_mod.ToastSettings;
 const Diagnostic = config_mod.Diagnostic;
 const LoadResult = config_mod.LoadResult;
 
@@ -144,6 +145,20 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
     for (updates.mcp_servers) |mcp_server| try applyMcpServerOverlay(gpa, target, mcp_server);
     for (updates.plugins) |plugin| try applyPluginOverlay(gpa, target, plugin);
     applyContextOverlay(&target.context, updates.context);
+    try applyToastOverlay(gpa, target, updates.toast);
+}
+
+/// Merge toast settings: non-default values in `updates` override `target`.
+/// `position` is owned by `updates`; when it changes, the target's old value
+/// is freed and the new one is duped.
+fn applyToastOverlay(gpa: std.mem.Allocator, target: *Config, updates: ToastSettings) !void {
+    if (updates.enabled != null) target.toast.enabled = updates.enabled;
+    if (updates.duration_ms != null) target.toast.duration_ms = updates.duration_ms;
+    if (updates.max_visible != null) target.toast.max_visible = updates.max_visible;
+    if (updates.position) |s| {
+        if (target.toast.position) |old| gpa.free(old);
+        target.toast.position = try gpa.dupe(u8, s);
+    }
 }
 
 /// Merge context settings: non-default values in `updates` override `target`.
@@ -531,6 +546,11 @@ fn parseObject(
         if (ctx_val == .object) out.context = parseContext(ctx_val);
     }
 
+    // Toast notification settings.
+    if (value.object.get("toast")) |toast_val| {
+        if (toast_val == .object) out.toast = try parseToast(gpa, toast_val);
+    }
+
     // Populate the typed `model_selection` when all required fields
     // are present. Missing any of them leaves it null — the legacy
     // optional fields stay so existing callers keep working until
@@ -649,6 +669,27 @@ fn parseCompaction(value: std.json.Value) CompactionSettings {
         if (v >= 1) comp.historical_tool_cap_bytes = @intCast(v);
     }
     return comp;
+}
+
+/// Clamp bounds for the toast knobs. `duration_ms` is clamped to [500, 30000]
+/// and `max_visible` to [1, 5] so a config typo can't produce a toast that
+/// never dismisses or a stack that covers the whole screen.
+const toast_duration_min: u32 = 500;
+const toast_duration_max: u32 = 30_000;
+const toast_max_visible_min: u8 = 1;
+const toast_max_visible_max: u8 = 5;
+
+fn parseToast(gpa: std.mem.Allocator, value: std.json.Value) !ToastSettings {
+    var toast: ToastSettings = .{};
+    if (boolField(value, "enabled")) |b| toast.enabled = b;
+    if (intField(value, "durationMs")) |v| {
+        if (v >= toast_duration_min and v <= toast_duration_max) toast.duration_ms = @intCast(v);
+    }
+    if (intField(value, "maxVisible")) |v| {
+        if (v >= toast_max_visible_min and v <= toast_max_visible_max) toast.max_visible = @intCast(v);
+    }
+    if (stringField(value, "position")) |s| toast.position = try gpa.dupe(u8, s);
+    return toast;
 }
 
 fn parseProviders(gpa: std.mem.Allocator, value: std.json.Value) ![]ProviderConfig {
@@ -1155,7 +1196,42 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
         try writeKey(writer, "context", &wrote_any);
         try writeContext(writer, config.context);
     }
+    // Toast: only written when at least one field differs from defaults.
+    if (hasNonDefaultToast(config.toast)) {
+        try writeKey(writer, "toast", &wrote_any);
+        try writeToast(writer, config.toast);
+    }
     try writer.writeAll("\n}\n");
+}
+
+fn hasNonDefaultToast(toast: ToastSettings) bool {
+    if (toast.enabled != null) return true;
+    if (toast.duration_ms != null) return true;
+    if (toast.max_visible != null) return true;
+    if (toast.position != null) return true;
+    return false;
+}
+
+fn writeToast(writer: *std.Io.Writer, toast: ToastSettings) !void {
+    try writer.writeByte('{');
+    var wrote_any = false;
+    if (toast.enabled) |b| {
+        try writeKeyNoIndent(writer, "enabled", &wrote_any);
+        try writer.writeAll(if (b) "true" else "false");
+    }
+    if (toast.duration_ms) |v| {
+        try writeKeyNoIndent(writer, "durationMs", &wrote_any);
+        try writer.print("{d}", .{v});
+    }
+    if (toast.max_visible) |v| {
+        try writeKeyNoIndent(writer, "maxVisible", &wrote_any);
+        try writer.print("{d}", .{v});
+    }
+    if (toast.position) |s| {
+        try writeKeyNoIndent(writer, "position", &wrote_any);
+        try std.json.Stringify.value(s, .{}, writer);
+    }
+    try writer.writeByte('}');
 }
 
 fn hasNonDefaultContext(ctx: ContextSettings) bool {
@@ -2596,4 +2672,75 @@ test "applyContextOverlay merges non-default values" {
     // Defaults preserved for fields not in updates.
     try std.testing.expectEqual(true, target.compaction.auto);
     try std.testing.expectEqual(@as(u32, 8_000), target.compaction.keep_recent_tokens);
+}
+
+test "parseToast clamps out-of-range values" {
+    const gpa = std.testing.allocator;
+    const json = std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"enabled":true,"durationMs":999999,"maxVisible":99,"position":"top-right"}
+    , .{}) catch unreachable;
+    defer json.deinit();
+
+    const toast = try parseToast(gpa, json.value);
+    defer if (toast.position) |pos| gpa.free(pos);
+    // Out-of-range values are dropped (left null), not clamped to a bad value.
+    try std.testing.expectEqual(true, toast.enabled.?);
+    try std.testing.expectEqual(@as(?u32, null), toast.duration_ms);
+    try std.testing.expectEqual(@as(?u8, null), toast.max_visible);
+    try std.testing.expectEqualStrings("top-right", toast.position.?);
+}
+
+test "parseToast accepts in-range values" {
+    const gpa = std.testing.allocator;
+    const json = std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"enabled":false,"durationMs":2500,"maxVisible":2}
+    , .{}) catch unreachable;
+    defer json.deinit();
+
+    const toast = try parseToast(gpa, json.value);
+    defer if (toast.position) |pos| gpa.free(pos);
+    try std.testing.expectEqual(false, toast.enabled.?);
+    try std.testing.expectEqual(@as(u32, 2500), toast.duration_ms.?);
+    try std.testing.expectEqual(@as(u8, 2), toast.max_visible.?);
+}
+
+test "serialize then parse roundtrips toast section" {
+    const gpa = std.testing.allocator;
+    var original: Config = .{
+        .toast = .{
+            .enabled = false,
+            .duration_ms = 2500,
+            .max_visible = 2,
+            .position = try gpa.dupe(u8, "top-right"),
+        },
+    };
+    defer original.deinit(gpa);
+
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, original);
+    const text = buf.written();
+    // Section is written only when non-default.
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"toast\"") != null);
+
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    var parsed = try parseFile(gpa, "<test>", text, &sink);
+    defer parsed.deinit(gpa);
+    try std.testing.expectEqual(false, parsed.toast.enabled.?);
+    try std.testing.expectEqual(@as(u32, 2500), parsed.toast.duration_ms.?);
+    try std.testing.expectEqual(@as(u8, 2), parsed.toast.max_visible.?);
+    try std.testing.expectEqualStrings("top-right", parsed.toast.position.?);
+}
+
+test "default config omits toast section" {
+    const gpa = std.testing.allocator;
+    var cfg: Config = .{};
+    defer cfg.deinit(gpa);
+
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, cfg);
+    const text = buf.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"toast\"") == null);
 }

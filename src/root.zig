@@ -37,16 +37,35 @@ pub const lua = @import("lua/root.zig");
 pub const lua_test_runner = @import("lua/test_runner.zig");
 pub const tui = @import("tui.zig");
 pub const thread = @import("tui/thread.zig");
+pub const toast = @import("tui/toast.zig");
+
+/// Logger → toast-bus adapter. Installed as the logger's `toast_sink` so warn+
+/// messages surface as TUI toasts instead of tearing the frame on stderr. The
+/// bus's `initialized` guard makes this a no-op before `tui.run` inits it.
+fn toastSink(level: std.log.Level, msg: []const u8) void {
+    const toast_level: toast.Level = switch (level) {
+        .err => .err,
+        .warn => .warn,
+        else => .info,
+    };
+    toast.global.push(toast_level, msg);
+}
 
 pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     @import("tools/bash_exec.zig").disablePseudoConsole();
 
     if (resolveLogPath(gpa, init.environ_map)) |log_path| {
         defer gpa.free(log_path);
+        const stderr_level = resolveStderrLevel(init.environ_map);
         logger.init(.{
             .io = init.io,
             .log_path = log_path,
-            .stderr_level = resolveStderrLevel(init.environ_map),
+            .stderr_level = stderr_level orelse switch (builtin.mode) {
+                .Debug => .err,
+                else => .warn,
+            },
+            .stderr_explicit = stderr_level != null,
+            .toast_sink = toastSink,
             .max_bytes = resolveMaxBytes(init.environ_map),
         }) catch {};
     } else |_| {}
@@ -184,8 +203,13 @@ fn resolveLogPath(gpa: std.mem.Allocator, env: anytype) ![]u8 {
 
 /// G1a: parse `NOVA_LOG_STDERR_LEVEL` (err|warn|info|debug). Defaults to
 /// `warn` in release, `err` in debug — stderr is the TUI-adjacent stream, so
-/// `warn` is the highest default that won't routinely tear a frame.
-fn resolveStderrLevel(env: anytype) std.log.Level {
+/// G1a: parse `NOVA_LOG_STDERR_LEVEL` (err|warn|info|debug). Returns null when
+/// the env var is absent — the caller distinguishes "explicitly set" (which
+/// restores full stderr output even when a toast sink is installed) from the
+/// default. The default level is `warn` in release, `err` in debug — stderr is
+/// the TUI-adjacent stream, so `warn` is the highest default that won't
+/// routinely tear a frame.
+fn resolveStderrLevel(env: anytype) ?std.log.Level {
     if (env.get("NOVA_LOG_STDERR_LEVEL")) |raw| {
         const LevelMap = struct { name: []const u8, level: std.log.Level };
         const map = [_]LevelMap{
@@ -198,10 +222,7 @@ fn resolveStderrLevel(env: anytype) std.log.Level {
             if (std.ascii.eqlIgnoreCase(raw, m.name)) return m.level;
         }
     }
-    return switch (builtin.mode) {
-        .Debug => .err,
-        else => .warn,
-    };
+    return null;
 }
 
 /// P2: parse `NOVA_LOG_MAX_BYTES` (decimal). Defaults to the logger's built-in

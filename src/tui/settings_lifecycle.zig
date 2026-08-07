@@ -10,6 +10,7 @@ const vaxis = @import("vaxis");
 const tui = @import("../tui.zig");
 const config_mod = @import("../config/config.zig");
 const settings_widget = @import("widgets/settings.zig");
+const toast = @import("toast.zig");
 
 const App = tui.App;
 const State = settings_widget.State;
@@ -105,6 +106,15 @@ fn submitGeneralItem(app: *App, state: *State) !void {
             state.pending_use_responses_endpoint = new_value;
             // Only mark dirty if the new value differs from the config
             const config_value = if (app.cached_config.model_selection) |ms| ms.useResponsesEndpoint() else app.cached_config.use_responses_endpoint orelse false;
+            state.dirty = (new_value != config_value);
+        },
+        1 => {
+            // Toggle toast notifications.
+            const current = state.pending_toast_enabled orelse
+                (app.cached_config.toast.enabled orelse true);
+            const new_value = !current;
+            state.pending_toast_enabled = new_value;
+            const config_value = app.cached_config.toast.enabled orelse true;
             state.dirty = (new_value != config_value);
         },
         else => {},
@@ -239,6 +249,9 @@ pub fn saveSettings(app: *App) !bool {
     if (state.pending_bash_classifier_url) |s| {
         updates.bash_classifier_url = if (s.len > 0) try app.gpa.dupe(u8, s) else null;
     }
+    if (state.pending_toast_enabled) |v| {
+        updates.toast.enabled = v;
+    }
 
     const runtime = app.liveRuntime() orelse return false;
 
@@ -259,6 +272,9 @@ pub fn saveSettings(app: *App) !bool {
     try applyToCachedConfig(app, state);
     app.mcp_manager.syncFromConfig(app.io, &app.cached_config) catch {};
 
+    // Apply the toast toggle live to the global bus.
+    if (state.pending_toast_enabled) |v| toast.global.enabled = v;
+
     // Reset pending state.
     if (state.pending_system_prompt) |old| app.gpa.free(old);
     if (state.pending_bash_classifier_url) |old| app.gpa.free(old);
@@ -266,6 +282,7 @@ pub fn saveSettings(app: *App) !bool {
     state.pending_use_responses_endpoint = null;
     state.pending_system_prompt = null;
     state.pending_bash_classifier_url = null;
+    state.pending_toast_enabled = null;
     state.edit_target = .none;
 
     // Show success feedback to user.
@@ -352,6 +369,8 @@ fn applyToCachedConfig(app: *App, state: *const State) !void {
         // Sync legacy field updates to model_selection for consistency
         try config_mod.syncModelSelectionFromLegacy(app.gpa, &app.cached_config);
     }
+    // Toast toggle applies regardless of model_selection shape.
+    if (state.pending_toast_enabled) |v| app.cached_config.toast.enabled = v;
 }
 
 // ---------------------------------------------------------------------------

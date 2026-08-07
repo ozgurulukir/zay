@@ -70,6 +70,8 @@ pub const State = struct {
     pending_system_prompt: ?[]const u8 = null,
     /// Pending bash classifier URL.
     pending_bash_classifier_url: ?[]const u8 = null,
+    /// Pending toast-notifications toggle.
+    pending_toast_enabled: ?bool = null,
     /// True when there are unsaved changes.
     dirty: bool = false,
 
@@ -136,7 +138,7 @@ pub const State = struct {
 };
 
 // Item counts per section (used for wrapping navigation).
-const general_item_count: u32 = 1; // use_responses_endpoint
+const general_item_count: u32 = 2; // use_responses_endpoint, toast_enabled
 const prompt_item_count: u32 = 1; // system_prompt editor entry
 const advanced_item_count: u32 = 1; // bash_classifier_url
 const about_item_count: u32 = 0; // read-only info
@@ -231,6 +233,19 @@ pub const Content = struct {
             try panel.lineStyledAt(surface, 4, label, ctx, left_col, style);
             const desc = "Route completions through the OpenAI Responses API instead of Chat Completions.";
             try self.drawDescription(surface, ctx, 5, desc, selected);
+        }
+
+        // Row 7: toast notifications toggle.
+        {
+            const selected = sel == 1;
+            if (selected) panel.fillRow(surface, 7, StylePalette.selected);
+            const value = self.state.pending_toast_enabled orelse
+                (self.config.toast.enabled orelse true);
+            const label = try std.fmt.allocPrint(ctx.arena, "  Toast Notifications  {s}", .{boolBadge(value)});
+            const style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;
+            try panel.lineStyledAt(surface, 7, label, ctx, left_col, style);
+            const desc = "Show transient notifications (e.g. warnings) in the top-right corner.";
+            try self.drawDescription(surface, ctx, 8, desc, selected);
         }
     }
 
@@ -496,10 +511,12 @@ test "settings tab cycles forward and back" {
 test "settings selection wraps within section" {
     var state: State = .{};
     try std.testing.expectEqual(@as(u32, 0), state.currentSelection());
-    state.moveDown(); // general has a single item — wraps to itself
+    state.moveDown(); // general has two items — moves to the second
+    try std.testing.expectEqual(@as(u32, 1), state.currentSelection());
+    state.moveDown(); // wraps back to the first
     try std.testing.expectEqual(@as(u32, 0), state.currentSelection());
-    state.moveUp();
-    try std.testing.expectEqual(@as(u32, 0), state.currentSelection());
+    state.moveUp(); // wraps to the last
+    try std.testing.expectEqual(@as(u32, 1), state.currentSelection());
 }
 
 test "settings boolBadge returns correct label" {

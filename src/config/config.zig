@@ -125,6 +125,19 @@ pub const CompactionSettings = struct {
     historical_tool_cap_bytes: u32 = context_assembly.default_historical_tool_cap_bytes,
 };
 
+/// Toast notification settings for the generic toast bus. All fields are
+/// optional so a default config omits the section entirely.
+pub const ToastSettings = struct {
+    /// Master switch. When false, no toasts are shown.
+    enabled: ?bool = null,
+    /// Auto-dismiss delay in milliseconds. Clamped to [500, 30000] at parse.
+    duration_ms: ?u32 = null,
+    /// Max toasts stacked at once. Clamped to [1, 5] at parse.
+    max_visible: ?u8 = null,
+    /// Corner position. Only "top-right" is supported today.
+    position: ?[]u8 = null,
+};
+
 pub const Config = struct {
     /// Semantic version of the configuration schema instance.
     /// Null means the default ("2.0.0"). Stored as an owned slice
@@ -156,6 +169,8 @@ pub const Config = struct {
     strict_outputs: ?bool = null,
     /// Context window management and compaction policy.
     context: ContextSettings = .{},
+    /// Toast notification settings (the generic toast bus).
+    toast: ToastSettings = .{},
     /// Typed view of the model selection. `null` when the required
     /// fields (provider, base_url, api_key, model) aren't all set.
     /// Equivalent to the old `assertModelSelection` check — but the
@@ -194,6 +209,7 @@ pub const Config = struct {
         if (self.system_prompt) |s| gpa.free(s);
         if (self.dynamic_provider_name) |s| gpa.free(s);
         if (self.dynamic_provider_id) |s| gpa.free(s);
+        if (self.toast.position) |s| gpa.free(s);
         if (self.model_selection) |*ms| ms.deinit(gpa);
         self.* = undefined;
     }
@@ -221,6 +237,7 @@ pub const Config = struct {
         if (self.system_prompt) |s| out.system_prompt = try gpa.dupe(u8, s);
         if (self.dynamic_provider_name) |s| out.dynamic_provider_name = try gpa.dupe(u8, s);
         if (self.dynamic_provider_id) |s| out.dynamic_provider_id = try gpa.dupe(u8, s);
+        if (self.toast.position) |s| out.toast.position = try gpa.dupe(u8, s);
         if (self.model_selection) |ms| out.model_selection = try ms.clone(gpa);
         return out;
     }

@@ -27,6 +27,7 @@ const permission = @import("widgets/permission.zig");
 const background_jobs = @import("widgets/background_jobs.zig");
 const at_search = @import("widgets/at_search.zig");
 const overlay = @import("widgets/overlay.zig");
+const toast = @import("toast.zig");
 
 const App = tui.App;
 
@@ -62,6 +63,7 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
     const permission_visible = app.permissionPending() and !overlay_visible;
     const background_visible = app.background_modal_state.modal and !overlay_visible and !permission_visible;
     const at_visible = (app.at_search != .closed) and !overlay_visible and !permission_visible and !background_visible;
+    const toast_visible = toast.global.hasToasts();
 
     var child_count: usize = (if (split) app.threads.items.len else 1) + 1;
     if (loading_visible) child_count += 1;
@@ -69,6 +71,7 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
     if (permission_visible) child_count += 1;
     if (background_visible) child_count += 1;
     if (at_visible) child_count += 1;
+    if (toast_visible) child_count += 1;
     const children = try ctx.arena.alloc(vxfw.SubSurface, child_count);
     var idx: usize = 0;
     if (split) {
@@ -173,6 +176,20 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
                 .{ .width = panel_width, .height = panel_height },
             )),
             .z_index = 1,
+        };
+        idx += 1;
+    }
+    if (toast_visible) {
+        // Top-right toast stack, above every other child (z_index 4).
+        const toast_w: u16 = @min(max_width, 60);
+        var toast_view: toast.Widget = .{ .bus = &toast.global };
+        children[idx] = .{
+            .origin = .{ .row = 0, .col = max_width -| toast_w },
+            .surface = try toast_view.widget().draw(ctx.withConstraints(
+                .{ .width = toast_w, .height = max_height },
+                .{ .width = toast_w, .height = max_height },
+            )),
+            .z_index = 4,
         };
         idx += 1;
     }

@@ -39,6 +39,14 @@ const State = struct {
     enabled_file: bool = false,
     stderr_ready: bool = false,
     stderr_level: std.log.Level = .warn,
+    /// True when `NOVA_LOG_STDERR_LEVEL` was explicitly set. When false and a
+    /// `toast_sink` is installed, warn+ routes to the toast instead of stderr
+    /// (the TUI frame-tearing fix); when false and no sink, stderr keeps the
+    /// default `warn` gate (headless/tests).
+    stderr_explicit: bool = false,
+    /// Opaque sink for warn+ messages. When set, warn+ routes here (TUI toast)
+    /// unless `stderr_explicit` is true (which restores full stderr output).
+    toast_sink: ?*const fn (level: std.log.Level, msg: []const u8) void = null,
     max_bytes: u64 = default_max_bytes,
     stopping: bool = false,
     dropped: u64 = 0,
@@ -60,6 +68,13 @@ pub const Options = struct {
     log_path: []const u8,
     /// Min level emitted to the stderr sink. Defaults to `warn`.
     stderr_level: std.log.Level = .warn,
+    /// True when `stderr_level` came from `NOVA_LOG_STDERR_LEVEL` (an explicit
+    /// user choice). When false and `toast_sink` is set, warn+ routes to the
+    /// toast instead of stderr.
+    stderr_explicit: bool = false,
+    /// Opaque sink for warn+ messages. When set and `stderr_explicit` is false,
+    /// warn+ routes here (TUI toast) instead of stderr.
+    toast_sink: ?*const fn (level: std.log.Level, msg: []const u8) void = null,
     /// File rotation cap in bytes. Defaults to `default_max_bytes`.
     max_bytes: u64 = default_max_bytes,
 };
@@ -72,6 +87,8 @@ pub fn init(options: Options) error{PathTooLong}!void {
         state.io = options.io;
         state.stderr_ready = true;
         state.stderr_level = options.stderr_level;
+        state.stderr_explicit = options.stderr_explicit;
+        state.toast_sink = options.toast_sink;
         state.max_bytes = options.max_bytes;
 
         if (enabled_file) {
@@ -117,12 +134,20 @@ pub fn dispatch(level: std.log.Level, scope_name: []const u8, comptime fmt: []co
     if (state.mutex.lock(state.io)) |_| {
         defer state.mutex.unlock(state.io);
 
-        // Tee: stderr sink (all builds, runtime level-gated). `std.log.Level`
-        // orders by severity — err=0 < warn=1 < info=2 < debug=3 — so
-        // "stderr_level and more severe" is `<=`, not `>=`.
-        if (@intFromEnum(level) <= @intFromEnum(state.stderr_level)) {
-            writeStderrLine(formatted);
-        }
+        // Routing: warn+ goes to the toast sink when one is installed and the
+        // user did NOT explicitly set `NOVA_LOG_STDERR_LEVEL`. Otherwise it
+        // goes to stderr (the operational channel). `std.log.Level` orders by
+        // severity — err=0 < warn=1 < info=2 < debug=3 — so "warn and more
+        // severe" is `<= .warn`, and "stderr_level and more severe" is `<=`.
+        const is_warn_or_worse = @intFromEnum(level) <= @intFromEnum(std.log.Level.warn);
+        const to_stderr = if (state.stderr_explicit)
+            @intFromEnum(level) <= @intFromEnum(state.stderr_level)
+        else
+            state.toast_sink == null and is_warn_or_worse;
+        const to_toast = state.toast_sink != null and is_warn_or_worse;
+
+        if (to_stderr) writeStderrLine(formatted);
+        if (to_toast) if (state.toast_sink) |sink| sink(level, formatted);
 
         // Tee: file sink (Debug only).
         if (enabled_file and state.enabled_file) {
@@ -318,6 +343,20 @@ fn formatTimestamp(out: []u8) []const u8 {
     }) catch "ts_err";
 }
 
+// Module-level capture state for the toast-sink tests. Nested struct closures
+// can't see outer test locals, so the sink writes to these globals.
+var test_sink_count: usize = 0;
+var test_sink_levels: [4]std.log.Level = undefined;
+var test_sink_msgs: [4][64]u8 = undefined;
+
+fn testToastSink(level: std.log.Level, msg: []const u8) void {
+    if (test_sink_count >= test_sink_levels.len) return;
+    test_sink_levels[test_sink_count] = level;
+    const n = @min(msg.len, test_sink_msgs[test_sink_count].len);
+    @memcpy(test_sink_msgs[test_sink_count][0..n], msg[0..n]);
+    test_sink_count += 1;
+}
+
 test "dispatch before init does not crash and drops no queue entries" {
     // Pre-init path: stderr_ready is false here (no init ran in the test), so
     // dispatch must take the raw-stderr fallback and must not touch the queue.
@@ -370,6 +409,111 @@ test "stderr sink is level-gated and deinit flushes the dropped count" {
     try std.testing.expect(std.mem.indexOf(u8, content, "severe passes") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "dropped 3 entries") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "below threshold") == null);
+
+    std.Io.Dir.deleteFile(.cwd(), io, capture_path) catch {};
+}
+
+test "toast sink receives warn+ when stderr is not explicit" {
+    const io = std.testing.io;
+    const capture_path = "nova_logger_toast_capture.log";
+    var capture = try std.Io.Dir.createFile(.cwd(), io, capture_path, .{});
+    var capture_buf: [4096]u8 = undefined;
+
+    const prev_io = state.io;
+    const prev_ready = state.stderr_ready;
+    const prev_level = state.stderr_level;
+    const prev_explicit = state.stderr_explicit;
+    const prev_sink = state.toast_sink;
+    const prev_writer = state.stderr_writer;
+    const prev_dropped = state.dropped;
+    defer {
+        state.io = prev_io;
+        state.stderr_ready = prev_ready;
+        state.stderr_level = prev_level;
+        state.stderr_explicit = prev_explicit;
+        state.toast_sink = prev_sink;
+        state.stderr_writer = prev_writer;
+        state.dropped = prev_dropped;
+    }
+
+    state.io = io;
+    state.stderr_ready = true;
+    state.stderr_level = .warn;
+    state.stderr_explicit = false; // env var NOT set
+    state.stderr_writer = capture.writer(io, &capture_buf);
+    state.dropped = 0;
+
+    // Module-level capture state (nested struct closures can't see outer
+    // locals, so the sink writes to these).
+    test_sink_count = 0;
+    test_sink_levels = undefined;
+    test_sink_msgs = undefined;
+    state.toast_sink = testToastSink;
+
+    dispatch(.info, "test", "below threshold", .{}); // gated off (info < warn)
+    dispatch(.warn, "test", "toast warn", .{});
+    dispatch(.err, "test", "toast err", .{});
+
+    // warn+ went to the sink, NOT stderr.
+    try std.testing.expectEqual(@as(usize, 2), test_sink_count);
+    try std.testing.expectEqual(std.log.Level.warn, test_sink_levels[0]);
+    try std.testing.expectEqual(std.log.Level.err, test_sink_levels[1]);
+    try std.testing.expectEqualStrings("toast warn", test_sink_msgs[0][0..10]);
+    try std.testing.expectEqualStrings("toast err", test_sink_msgs[1][0..9]);
+
+    capture.close(io);
+    const content = try std.Io.Dir.readFileAlloc(.cwd(), io, capture_path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "toast warn") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "toast err") == null);
+
+    std.Io.Dir.deleteFile(.cwd(), io, capture_path) catch {};
+}
+
+test "explicit stderr level restores stderr alongside the toast sink" {
+    const io = std.testing.io;
+    const capture_path = "nova_logger_toast_explicit_capture.log";
+    var capture = try std.Io.Dir.createFile(.cwd(), io, capture_path, .{});
+    var capture_buf: [4096]u8 = undefined;
+
+    const prev_io = state.io;
+    const prev_ready = state.stderr_ready;
+    const prev_level = state.stderr_level;
+    const prev_explicit = state.stderr_explicit;
+    const prev_sink = state.toast_sink;
+    const prev_writer = state.stderr_writer;
+    const prev_dropped = state.dropped;
+    defer {
+        state.io = prev_io;
+        state.stderr_ready = prev_ready;
+        state.stderr_level = prev_level;
+        state.stderr_explicit = prev_explicit;
+        state.toast_sink = prev_sink;
+        state.stderr_writer = prev_writer;
+        state.dropped = prev_dropped;
+    }
+
+    state.io = io;
+    state.stderr_ready = true;
+    state.stderr_level = .debug; // explicit: full stderr
+    state.stderr_explicit = true;
+    state.stderr_writer = capture.writer(io, &capture_buf);
+    state.dropped = 0;
+
+    test_sink_count = 0;
+    state.toast_sink = testToastSink;
+
+    dispatch(.info, "test", "info to stderr", .{});
+    dispatch(.warn, "test", "warn to both", .{});
+
+    capture.close(io);
+    const content = try std.Io.Dir.readFileAlloc(.cwd(), io, capture_path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(content);
+    // Explicit level: stderr gets info AND warn.
+    try std.testing.expect(std.mem.indexOf(u8, content, "info to stderr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "warn to both") != null);
+    // And the sink still got the warn.
+    try std.testing.expectEqual(@as(usize, 1), test_sink_count);
 
     std.Io.Dir.deleteFile(.cwd(), io, capture_path) catch {};
 }

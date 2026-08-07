@@ -18,6 +18,7 @@ const provider_model = @import("provider_model.zig");
 const diff_lifecycle = @import("diff_lifecycle.zig");
 const compaction_lifecycle = @import("compaction_lifecycle.zig");
 const lane_lifecycle = @import("lane_lifecycle.zig");
+const toast = @import("toast.zig");
 const runtime_mod = @import("../runtime.zig");
 const vcs = @import("../vcs.zig");
 
@@ -124,6 +125,12 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         provider_model.refreshMcpTools(root.app);
     }
     var visible_change = try drainAgentEvents(root, ctx);
+    // Drain the toast bus (UI thread only) so new toasts appear and expired
+    // ones are dropped. The widget re-draws on the next frame.
+    {
+        var toast_items: [toast.max_items]toast.Item = undefined;
+        if (toast.global.drain(&toast_items) > 0) visible_change = true;
+    }
     // Service any in-flight `lane` tool request (a worker lane is blocked on
     // the bridge while it waits). Runs every tick — a blocked worker posts no
     // agent events, so this is the only thing that makes it progress.
@@ -203,7 +210,10 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         root.app.mcp_manager.hasPendingConnects() or
         // Keep polling while a manual /compact summarizer is running so
         // drainManualCompactions installs the result without blocking.
-        compaction_lifecycle.manualCompactActive(root.app);
+        compaction_lifecycle.manualCompactActive(root.app) or
+        // Keep polling while a toast is on screen so its auto-dismiss deadline
+        // is evaluated and the widget re-draws when it expires.
+        toast.global.hasToasts();
     if (should_tick) {
         try ctx.tick(RootWidget.drain_tick_ms, root.widget());
     } else {
