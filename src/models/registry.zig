@@ -503,13 +503,6 @@ pub fn buildRegistry(gpa: std.mem.Allocator, builtins: []const Provider, remote_
         });
     }
 
-    const providers = try gpa.alloc(Provider, unresolved.items.len);
-    errdefer gpa.free(providers);
-
-    for (unresolved.items, 0..) |item, i| {
-        providers[i] = item.resolve(strings.items);
-    }
-
     // Carry over model-level data from the remote registry. Builtin providers
     // don't carry model data; it all comes from api.json.
     var unresolved_models: std.ArrayList(UnresolvedModel) = .empty;
@@ -521,6 +514,19 @@ pub fn buildRegistry(gpa: std.mem.Allocator, builtins: []const Provider, remote_
             .context_window = m.context_window,
         });
     }
+
+    // Resolve every slice pointer only after ALL string appends complete.
+    // Resolving `providers` before the model appends below would leave its
+    // `id`/`name`/... slices dangling when `strings` reallocs to fit the
+    // model ids (api.json carries hundreds of models, so a realloc is
+    // guaranteed) — the picker then reads freed memory and SIGABRTs.
+    const providers = try gpa.alloc(Provider, unresolved.items.len);
+    errdefer gpa.free(providers);
+
+    for (unresolved.items, 0..) |item, i| {
+        providers[i] = item.resolve(strings.items);
+    }
+
     const models: []ModelInfo = if (unresolved_models.items.len > 0) blk: {
         const m = try gpa.alloc(ModelInfo, unresolved_models.items.len);
         errdefer gpa.free(m);
@@ -905,6 +911,40 @@ test "buildRegistry merges builtins and remote, builtins win" {
     // 302ai should be present from remote
     const ai302 = merged.lookup("302ai").?;
     try std.testing.expectEqualStrings("302.AI", ai302.name);
+}
+
+test "buildRegistry provider slices survive model-string realloc" {
+    const gpa = std.testing.allocator;
+
+    const builtins = loadBuiltins();
+
+    // A remote registry with enough models that appending their ids to the
+    // backing `strings` buffer forces a realloc. If `providers` were resolved
+    // before the model appends, every provider's id/name/base_url slice would
+    // dangle after the realloc and the assertions below would read freed
+    // memory (SIGABRT under DebugAllocator).
+    var json: std.ArrayList(u8) = .empty;
+    defer json.deinit(gpa);
+    try json.appendSlice(gpa, "{\"302ai\":{\"npm\":\"@ai-sdk/openai-compatible\",\"api\":\"https://api.302.ai/v1\",\"name\":\"302.AI\",\"models\":{");
+    for (0..2000) |i| {
+        if (i > 0) try json.appendSlice(gpa, ",");
+        const entry = try std.fmt.allocPrint(gpa, "\"model-{d}\":{{\"context_length\":128000}}", .{i});
+        defer gpa.free(entry);
+        try json.appendSlice(gpa, entry);
+    }
+    try json.appendSlice(gpa, "}}}");
+
+    var remote_registry = try parseModelsDevJson(gpa, json.items);
+    defer remote_registry.deinit(gpa);
+
+    var merged = try buildRegistry(gpa, builtins, &remote_registry);
+    defer merged.deinit(gpa);
+
+    const ai302 = merged.lookup("302ai").?;
+    try std.testing.expectEqualStrings("302.AI", ai302.name);
+    try std.testing.expectEqualStrings("https://api.302.ai/v1", ai302.base_url);
+    try std.testing.expectEqual(@as(usize, 2000), merged.models.len);
+    try std.testing.expectEqualStrings("model-1999", merged.models[1999].id);
 }
 
 test "loadOrFetchRegistry fallback to builtins when no cache or network" {
