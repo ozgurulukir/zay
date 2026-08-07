@@ -12,6 +12,7 @@ const vcs = @import("../vcs.zig");
 const lanes_picker = @import("widgets/lanes_picker.zig");
 const tui_status = @import("status.zig");
 const clipboard_helper = @import("clipboard_helper.zig");
+const lanes_util = @import("lanes.zig");
 const skill_mod = @import("../skill.zig");
 
 const App = tui.App;
@@ -97,6 +98,32 @@ pub fn cancelMode(app: *App) !bool {
     return true;
 }
 
+/// On a focused idle lane there is no runtime; several `submitMode` branches
+/// call into `session_switcher`/`provider_model`, which deref
+/// `app.liveRuntime().?` and would SIGABRT (Debug) / hit UB (ReleaseFast).
+/// Refuse with the same guiding notice `beginSubmit` posts, returning true
+/// ("handled") so `submit` short-circuits without starting a turn. Same idle-
+/// lane crash class as the C1 guard in `turn_lifecycle.beginSubmit`; this
+/// covers the picker/command branches that run before `beginSubmit`. Safe
+/// lanes never enter this branch — the primary is always live, and a live
+/// worker carries a runtime, so `liveRuntime() == null` only on a focused
+/// idle lane (`lane create` / a rested worker).
+fn refuseOnIdleLane(app: *App) bool {
+    if (app.liveRuntime() != null) return false;
+    const id = if (lanes_util.workingLaneOf(app.thread)) |w|
+        lanes_util.lastPathSegment(w.path)
+    else
+        "this lane";
+    const notice = std.fmt.allocPrint(
+        app.gpa,
+        "Lane {s} is idle — no agent is attached. From the driver, `lane enter {s}` to work here, or `lane spawn` to start a worker in it.\n",
+        .{ id, id },
+    ) catch return true;
+    defer app.gpa.free(notice);
+    _ = app.thread.transcript.append(app.gpa, .notice, "lane", notice) catch {};
+    return true;
+}
+
 pub fn submitMode(app: *App) !bool {
     // Transcript search: Enter jumps to the selected match (and closes search).
     if (app.mode == .search) {
@@ -109,6 +136,12 @@ pub fn submitMode(app: *App) !bool {
         return true;
     }
     if (app.mode == .provider_picker) {
+        // The provider-picker submit handlers (form submit, connect/sign-out
+        // codex) all deref `app.liveRuntime().?`; on a focused idle lane that
+        // is null → SIGABRT. Refuse with the idle-lane notice before any of
+        // them run. Opening a fresh entry form on an idle lane is blocked too
+        // — its submit would crash, so blocking at entry is consistent.
+        if (refuseOnIdleLane(app)) return true;
         if (app.pickers.provider.stage == .form) {
             if (app.pickers.provider.form_handle) |handle| {
                 switch (handle) {
@@ -134,10 +167,19 @@ pub fn submitMode(app: *App) !bool {
         return true;
     }
     if (app.mode == .model_picker) {
+        // `applySelectedModel` derefs `app.liveRuntime().?` (codex/config
+        // paths) — refuse on a focused idle lane instead of crashing.
+        if (refuseOnIdleLane(app)) return true;
         provider_model.applySelectedModel(app) catch |err| try app.reportConnectionError(err);
         return true;
     }
     if (app.mode == .session_picker) {
+        // Renaming and resume both route through `session_switcher`, which
+        // derefs `app.liveRuntime().?` (`home_dir`/`cwd`/`session_writer`).
+        // Refuse on a focused idle lane before the switch runs. The `.deleting`
+        // /`.blocked` dismiss-actions land here too; blocking them with the
+        // notice is strictly more informative than the silent no-op.
+        if (refuseOnIdleLane(app)) return true;
         // Sub-states route their Enter submit here (routeKey intercepts
         // Enter before it reaches handleCommandKey). Browsing falls
         // through to the normal resume flow below.
@@ -205,6 +247,18 @@ pub fn submitMode(app: *App) !bool {
         const filter = try app.peekPaletteInput();
         defer app.gpa.free(filter);
         if (resolveCommand(app, filter)) |command| {
+            // These four deref `app.liveRuntime().?` down their call chains
+            // (session_switcher / provider_model.refreshProviderApiKeys);
+            // refuse on a focused idle lane BEFORE clearing the command bar,
+            // so the user's typed `/resume` survives the refuse (matches the
+            // picker guards above and beginSubmit's TD-2 preserve-input rule).
+            // The other commands are idle-lane-safe (self-guarded or
+            // runtime-free) and don't reach this guard.
+            const crashes_on_idle = switch (command) {
+                .new, .resume_session, .timeline, .connect => true,
+                else => false,
+            };
+            if (crashes_on_idle and refuseOnIdleLane(app)) return true;
             app.clearPaletteInput();
             app.clearInput();
             switch (command) {
@@ -431,4 +485,91 @@ test "submitMode lanes is a no-op when not confirming a merge" {
     try std.testing.expect(try app.submitMode());
     // No merge attempted; mode stays lanes.
     try std.testing.expectEqual(App.Mode.lanes, app.mode);
+}
+
+// Builds a focused idle lane (the `lane create` shape: engine idle,
+// `worker_context` null) so submitMode's idle-lane guards can be exercised
+// without a full lane lifecycle. Mirrors `addFakeWorkingLane` in
+// lane_lifecycle.zig — `Thread` is fully default-initialized except `engine`.
+fn addIdleFocusedLane(gpa: std.mem.Allocator, app: *App, id: []const u8) !void {
+    const lane = try gpa.create(tui.Thread);
+    errdefer gpa.destroy(lane);
+    const branch = try std.fmt.allocPrint(gpa, "nova/{s}", .{id});
+    errdefer gpa.free(branch);
+    const path = try std.fmt.allocPrint(gpa, "/tmp/nova-lanes/{s}", .{id});
+    errdefer gpa.free(path);
+    lane.* = .{ .engine = .{ .idle = .{ .working = .{ .branch = branch, .path = path } } } };
+    try app.threads.append(gpa, lane);
+    app.thread = lane; // focus the idle lane
+}
+
+fn transcriptNoticeContains(app: *App, needle: []const u8) bool {
+    for (app.thread.transcript.messages.items) |m| {
+        const body: []const u8 = switch (m) {
+            .notice => |x| x.body,
+            else => continue,
+        };
+        if (std.mem.indexOf(u8, body, needle) != null) return true;
+    }
+    return false;
+}
+
+test "submitMode refuses on a focused idle lane instead of crashing (provider/model/session)" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // The primary stays at threads[0]; focus a fresh idle lane.
+    try addIdleFocusedLane(gpa, &app, "idle1");
+    try std.testing.expect(app.liveRuntime() == null); // idle → null (the precondition)
+
+    // Each crashing branch refuses with the idle-lane notice instead of
+    // dereferencing null. Before the guard each of these panicked in Debug.
+    app.mode = .provider_picker;
+    try std.testing.expect(try app.submitMode());
+    try std.testing.expect(transcriptNoticeContains(&app, "idle"));
+
+    app.mode = .model_picker;
+    try std.testing.expect(try app.submitMode());
+
+    app.mode = .session_picker;
+    try std.testing.expect(try app.submitMode());
+}
+
+test "submitMode refuses on the crashing commands but leaves safe commands working" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try addIdleFocusedLane(gpa, &app, "idle2");
+    try std.testing.expect(app.liveRuntime() == null);
+
+    // A crashing command (.resume_session) refuses with the notice.
+    app.mode = .command;
+    try app.inputs.palette.buf.insertSliceAtCursor("resume");
+    app.nav.command_selection = 0;
+    try std.testing.expect(try app.submitMode());
+    try std.testing.expect(transcriptNoticeContains(&app, "idle"));
+    // The guard fires before clearPaletteInput, so the typed command survives
+    // the refuse (matches beginSubmit's TD-2 preserve-input rule). The user
+    // can edit it or switch lanes instead of retyping.
+    const kept = try app.peekPaletteInput();
+    defer gpa.free(kept);
+    try std.testing.expectEqualStrings("resume", kept);
+
+    // A safe command (.help) is NOT blocked by the idle-lane guard — the
+    // guard is per-case, not blanket. This pins that /help, /close, /exit,
+    // /status, etc. keep working on an idle lane. Clear the preserved
+    // "resume" text first (the refuse left it, by design) so the next
+    // submit resolves a clean "help" command.
+    app.inputs.palette.clearRetainingCapacity();
+    app.mode = .command;
+    try app.inputs.palette.buf.insertSliceAtCursor("help");
+    app.nav.command_selection = 0;
+    try std.testing.expect(try app.submitMode());
+    try std.testing.expectEqual(App.Mode.help, app.mode);
 }
