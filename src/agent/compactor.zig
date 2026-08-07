@@ -7,7 +7,7 @@
 //! own allocations — so the boundary is clean.
 
 const std = @import("std");
-const logger = @import("logger");
+const log = std.log.scoped(.agent);
 
 const ai = @import("../ai.zig");
 const compaction = @import("../context/compaction.zig");
@@ -59,7 +59,7 @@ pub fn runThread(compactor: *Compactor) void {
     const job = compactor.job.?;
     defer job.gpa.free(job.prefix_text);
     const stored = produceStoredSummary(job) catch |err| {
-        logger.log("compaction summarize failed: {s}", .{@errorName(err)});
+        log.warn("compaction summarize failed: {s}", .{@errorName(err)});
         compactor.state.store(.failed, .release);
         return;
     };

@@ -1,5 +1,6 @@
 const std = @import("std");
-const logger = @import("logger");
+const log = std.log.scoped(.ai);
+
 const ai = @import("../ai.zig");
 const model_catalog = @import("openai_compatible_models.zig");
 const openai_endpoint = @import("openai_endpoint.zig");
@@ -139,11 +140,7 @@ pub const Client = struct {
     fn recordErrorDetail(self: *Client, status_code: u16, body: []const u8) void {
         const message = extractErrorMessage(self.gpa, body) catch return;
         defer self.gpa.free(message);
-        // Temporary diagnostic — log every API error verbatim so we can see
-        // the actual reason for "HTTP 400" (most often: schema validation
-        // or duplicate tool name). The UI also shows last_error_detail;
-        // this is the stderr variant.
-        std.debug.print("[trace] openai_compatible.recordErrorDetail: status={d} body={s}\n", .{ status_code, message });
+        log.warn("openai_compatible.recordErrorDetail status={d} body={s}", .{ status_code, message });
         const detail = std.fmt.allocPrint(self.gpa, "HTTP {d}: {s}", .{ status_code, message }) catch return;
         self.clearErrorDetail();
         self.last_error_detail = detail;
@@ -183,14 +180,14 @@ pub const Client = struct {
         );
         const req_body_log = try logBytes(self.gpa, payload.written());
         defer if (req_body_log.ptr != payload.written().ptr) self.gpa.free(req_body_log);
-        logger.log("openai_compatible.request POST {s} body={s}", .{ self.url, req_body_log });
+        log.info("openai_compatible.request POST {s} body={s}", .{ self.url, req_body_log });
         // L2: when this client carries no tools, say so next to the request log
         // with the client identity. `writeRequestPayload` is a free function
         // (no `self.url`), so the URL disambiguation lives here — it tells the
         // main agent apart from the summarizer/naming clients (which are
         // correctly tool-less) when several clients are alive.
         if (std.mem.eql(u8, self.tools_json, "[]")) {
-            logger.log("openai_compatible.no_tools client model={s} url={s}", .{ self.config.model, self.url });
+            log.info("openai_compatible.no_tools client model={s} url={s}", .{ self.config.model, self.url });
         }
 
         // C2: a cache-related 400 earns exactly ONE cache-stripped re-send,
@@ -237,7 +234,7 @@ pub const Client = struct {
                                 self.config.wire_dialect,
                                 disable_cache,
                             );
-                            logger.log("openai_compatible.cache_downgrade retrying without cache_control/prompt_cache_key after HTTP 400", .{});
+                            log.warn("openai_compatible.cache_downgrade retrying without cache_control/prompt_cache_key after HTTP 400", .{});
                             break; // break inner loop → outer loop re-runs the full retry budget on the stripped payload
                         }
                         return err;
@@ -247,7 +244,7 @@ pub const Client = struct {
                         else => return err,
                     }
                     const delay_ms = self.retryDelayMs(attempt, retry_after_secs);
-                    logger.log("openai_compatible.retry attempt={d} err={s} delay_ms={d}", .{ attempt + 1, @errorName(err), delay_ms });
+                    log.warn("openai_compatible.retry attempt={d} err={s} delay_ms={d}", .{ attempt + 1, @errorName(err), delay_ms });
                     self.sleepMs(delay_ms);
                     continue;
                 };
@@ -302,7 +299,7 @@ pub const Client = struct {
             return self.headPhaseFailure(err);
         };
         const status_code: u16 = @intFromEnum(http_response.head.status);
-        logger.log("openai_compatible.response.head status={d}", .{status_code});
+        log.info("openai_compatible.response.head status={d}", .{status_code});
         if (status_code >= 400) {
             // Read `Retry-After` before initializing the body reader — the
             // head pointers are invalidated once the body stream starts.
@@ -316,7 +313,7 @@ pub const Client = struct {
             _ = error_reader.streamRemaining(&error_body.writer) catch 0;
             const err_body_log = try logBytes(self.gpa, error_body.written());
             defer if (err_body_log.ptr != error_body.written().ptr) self.gpa.free(err_body_log);
-            logger.log("openai_compatible.response.error status={d} body={s}", .{ status_code, err_body_log });
+            log.warn("openai_compatible.response.error status={d} body={s}", .{ status_code, err_body_log });
             self.recordErrorDetail(status_code, error_body.written());
             if (status_code == 429) return error.HttpRateLimited;
             if (status_code >= 500) return error.HttpServerError;
@@ -338,7 +335,7 @@ pub const Client = struct {
                 std.posix.SO.RCVTIMEO,
                 std.mem.asBytes(&tv),
             ) catch |err| {
-                logger.log("openai_compatible.setsockopt.RCVTIMEO failed: {}", .{err});
+                log.warn("openai_compatible.setsockopt.RCVTIMEO failed: {}", .{err});
             };
         }
 
@@ -767,7 +764,7 @@ fn writeRequestPayload(
         try out.writeAll(tools_json);
         try out.writeAll(",\"tool_choice\":\"auto\"");
     } else {
-        logger.log("openai_compatible: sending request with NO tools (tools_json is empty) model={s}", .{model});
+        log.warn("openai_compatible: sending request with NO tools (tools_json is empty) model={s}", .{model});
     }
     // Standard OpenAI cache-routing hint: steers requests sharing this session's
     // prefix to the same backend, raising prefix-cache hit rates (used by

@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = std.log.scoped(.runtime);
 
 const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
@@ -276,7 +277,7 @@ pub const AgentRuntime = struct {
                     for (config.providers) |pc| {
                         if (std.mem.eql(u8, pc.name, mp)) break :blk pc.provider;
                     }
-                    std.log.warn("session.resume.unknown_provider: {s}, using config default", .{mp});
+                    log.warn("session.resume.unknown_provider: {s}, using config default", .{mp});
                     try target.applyFromConfig(config);
                     return;
                 };
@@ -449,7 +450,7 @@ pub const AgentRuntime = struct {
         const selection = config.activeModelSelection() orelse return;
         const model_id = selection.model().id;
         if (model_id.len == 0) {
-            std.log.warn("runtime.applyFromConfig: empty model_id for provider {s}, skipping model attachment", .{selection.providerName()});
+            log.warn("runtime.applyFromConfig: empty model_id for provider {s}, skipping model attachment", .{selection.providerName()});
             return;
         }
         const adapter = adapterForConfig(selection.provider(), config) orelse return;
@@ -496,7 +497,7 @@ pub const AgentRuntime = struct {
         const refresh_token = try self.gpa.dupe(u8, creds.refresh);
         defer self.gpa.free(refresh_token);
         var refreshed = codex_mod.refresh(self.gpa, self.io, self.home_dir, refresh_token) catch |err| {
-            std.log.warn("codex.refresh.failed err={s}", .{@errorName(err)});
+            log.warn("codex.refresh.failed err={s}", .{@errorName(err)});
             self.codex_connection_expired = true;
             return;
         };
@@ -574,7 +575,7 @@ pub const AgentRuntime = struct {
             // No stored key — log for diagnostics when the provider requires
             // one, so a 402/401 on the first turn is traceable.
             if (provider.requiresApiKey()) {
-                std.log.warn("auth.missing_key provider={s} — requests will likely fail with 402", .{ms.providerName()});
+                log.warn("auth.missing_key provider={s} — requests will likely fail with 402", .{ms.providerName()});
             }
             break :blk provider.anonymousApiKey() orelse "";
         };
@@ -857,7 +858,7 @@ pub const AgentRuntime = struct {
         // prompt. Best-effort: a failure leaves the builtin-only set and is
         // logged — the attach itself already succeeded.
         next.updateMcpTools(self.mcp_tools, self.agent.tool_registry, &.{}) catch |err| {
-            std.log.warn("replaceClient: updateMcpTools failed: {s}", .{@errorName(err)});
+            log.warn("replaceClient: updateMcpTools failed: {s}", .{@errorName(err)});
         };
     }
 

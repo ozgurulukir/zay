@@ -1,6 +1,7 @@
 //! McpManager — Multi-server MCP supervisor and tool aggregator for Nova Agent.
 
 const std = @import("std");
+const log = std.log.scoped(.mcp);
 const ai = @import("../ai.zig");
 const config_mod = @import("../config/config.zig");
 const tools_common = @import("../tools/common.zig");
@@ -51,7 +52,7 @@ pub const McpManager = struct {
                 }
             }
             if (is_dup) {
-                std.log.warn("MCP server '{s}': duplicate name in config, skipping", .{server_cfg.name});
+                log.warn("MCP server '{s}': duplicate name in config, skipping", .{server_cfg.name});
                 continue;
             }
 
@@ -60,7 +61,7 @@ pub const McpManager = struct {
             // resolved secrets to disk; only this expanded copy — owned by the
             // client — carries them.
             var expanded = config_mod.expandMcpServer(self.gpa, server_cfg) catch {
-                std.log.warn("MCP server '{s}': failed to resolve env vars, skipping", .{server_cfg.name});
+                log.warn("MCP server '{s}': failed to resolve env vars, skipping", .{server_cfg.name});
                 continue;
             };
             defer expanded.deinit(self.gpa);
@@ -166,7 +167,7 @@ pub const McpManager = struct {
                 // per-tick) and the slice stays cache-hot over ~10-200 tools.
                 for (schemas[0..idx]) |existing| {
                     if (std.mem.eql(u8, existing.name, tool.full_name)) {
-                        std.log.warn("MCP tool name collision: '{s}' — skipping duplicate", .{tool.full_name});
+                        log.warn("MCP tool name collision: '{s}' — skipping duplicate", .{tool.full_name});
                         continue :next_tool;
                     }
                 }

@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const c = @import("c");
+const log = std.log.scoped(.lua);
 const State = @import("state.zig").State;
 const bridge = @import("bridge.zig");
 const sandbox = @import("sandbox.zig");
@@ -127,7 +128,7 @@ fn validatePermissionKeys(L: *State) void {
             var key_len: usize = 0;
             const key = std.mem.span(c.lua_tolstring(L.handle, -2, &key_len));
             if (!isRecognizedPermissionKey(key)) {
-                std.log.warn("manifest.permissions.unknown_key key={s}", .{key});
+                log.warn("manifest.permissions.unknown_key key={s}", .{key});
             }
         }
         // Pop the value, keep the key for the next lua_next.

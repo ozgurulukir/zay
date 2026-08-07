@@ -1,5 +1,5 @@
 const std = @import("std");
-const logger = @import("logger");
+const log = std.log.scoped(.agent);
 
 const ai = @import("ai.zig");
 const at_mention = @import("at_mention.zig");
@@ -1108,7 +1108,7 @@ pub const Agent = struct {
 
         // Past the swap watermark: install the ready background summary.
         if (compaction.shouldSwap(used, self.context_window_tokens, threshold)) {
-            Agent.applyReadyCompaction(@TypeOf(listener), self, listener) catch |err| std.log.warn("compaction apply failed: {s}", .{@errorName(err)});
+            Agent.applyReadyCompaction(@TypeOf(listener), self, listener) catch |err| log.warn("compaction apply failed: {s}", .{@errorName(err)});
         }
 
         // Past the start watermark: kick off the summary so it is ready by the
@@ -1126,7 +1126,7 @@ pub const Agent = struct {
                         self.emitCompactionNotice(listener, .stuck);
                     }
                 },
-                else => std.log.warn("compaction start failed: {s}", .{@errorName(err)}),
+                else => log.warn("compaction start failed: {s}", .{@errorName(err)}),
             };
         }
 
@@ -1139,7 +1139,7 @@ pub const Agent = struct {
         {
             self.emitCompactionNotice(listener, .waiting);
             self.joinCompactor();
-            Agent.applyReadyCompaction(@TypeOf(listener), self, listener) catch |err| std.log.warn("compaction apply failed: {s}", .{@errorName(err)});
+            Agent.applyReadyCompaction(@TypeOf(listener), self, listener) catch |err| log.warn("compaction apply failed: {s}", .{@errorName(err)});
         }
     }
 
@@ -1291,7 +1291,7 @@ pub const Agent = struct {
         defer self.finishCompactor();
         if (state == .failed) {
             self.compaction_failures +|= 1;
-            std.log.warn("background compaction failed ({d}/{d})", .{ self.compaction_failures, compaction_failure_limit });
+            log.warn("background compaction failed ({d}/{d})", .{ self.compaction_failures, compaction_failure_limit });
             return;
         }
         const result = self.compactor.result.?;

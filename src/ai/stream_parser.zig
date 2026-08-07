@@ -6,7 +6,8 @@
 //! no Client state — just the wire format → `ai.Turn` projection.
 
 const std = @import("std");
-const logger = @import("logger");
+const log = std.log.scoped(.ai);
+
 const ai = @import("../ai.zig");
 const stream_part = @import("stream_part.zig");
 
@@ -150,13 +151,13 @@ pub fn readStream(
     }
     for (stream.builders.items, 0..) |*builder, i| {
         if (builder.name.items.len == 0) continue;
-        logger.log(
+        log.info(
             "readStream.builder[{d}] name={s} id_len={d} args_len={d}",
             .{ i, builder.name.items, builder.id.items.len, builder.arguments.items.len },
         );
         try blocks.append(gpa, .{ .tool_call = try builder.toToolCall(gpa, tool_call_seq) });
     }
-    logger.log("readStream.done content_len={d} reasoning_len={d} blocks={d}", .{ content.items.len, reasoning.items.len, blocks.items.len });
+    log.info("readStream.done content_len={d} reasoning_len={d} blocks={d}", .{ content.items.len, reasoning.items.len, blocks.items.len });
     return .{ .assistant = .{ .assistant = .{ .content = try blocks.toOwnedSlice(gpa) } }, .usage = usage };
 }
 
@@ -398,7 +399,7 @@ fn parseToolCallObject(
             if (index < 0) return error.InvalidToolCallIndex;
             if (index >= tool_call_array_cap) return error.TooManyToolCalls;
             if (index >= stream.max_calls) {
-                logger.log("parseToolCall.reject index={d} exceeds max_parallel_tool_calls={d} model={s}", .{ index, stream.max_calls, stream.model });
+                log.warn("parseToolCall.reject index={d} exceeds max_parallel_tool_calls={d} model={s}", .{ index, stream.max_calls, stream.model });
                 return error.TooManyToolCalls;
             }
             resolved_index = @intCast(index);
@@ -431,7 +432,7 @@ fn parseToolCallObject(
             if (!std.mem.eql(u8, existing.id.items, pending.id.items)) continue;
             const existing_physical: u32 = @intCast(i);
             if (existing_physical != stream.physicalSlot(logical)) {
-                logger.log("parseToolCall.merge logical={d} → physical={d} id={s}", .{ logical, existing_physical, pending.id.items });
+                log.info("parseToolCall.merge logical={d} → physical={d} id={s}", .{ logical, existing_physical, pending.id.items });
                 stream.remapped_slot[logical] = existing_physical;
                 stream.is_remapped[logical] = true;
             }
@@ -442,7 +443,7 @@ fn parseToolCallObject(
         const existing = &stream.builders.items[@as(usize, current)];
         if (existing.id.items.len > 0 and !std.mem.eql(u8, existing.id.items, pending.id.items)) {
             const new_slot: u32 = @intCast(stream.builders.items.len);
-            logger.log("parseToolCall.fork logical={d} → new_slot={d} old_id={s} new_id={s}", .{ logical, new_slot, existing.id.items, pending.id.items });
+            log.info("parseToolCall.fork logical={d} → new_slot={d} old_id={s} new_id={s}", .{ logical, new_slot, existing.id.items, pending.id.items });
             try stream.builders.append(gpa, .{});
             stream.remapped_slot[logical] = new_slot;
             stream.is_remapped[logical] = true;

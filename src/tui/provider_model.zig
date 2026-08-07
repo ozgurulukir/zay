@@ -1,5 +1,6 @@
 //! Provider connection, model catalogue loading, and model selection.
 const std = @import("std");
+const log = std.log.scoped(.tui);
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
@@ -828,7 +829,7 @@ pub fn applySelectedModel(self: *App) !void {
     if (self.liveRuntime()) |rt| {
         if (rt.session_writer_started) {
             rt.session_writer.updateModel(provider_name, model.id, effort.label()) catch |err| {
-                std.log.warn("session.updateModel.failed provider={s} model={s} err={s}", .{ provider_name, model.id, @errorName(err) });
+                log.warn("session.updateModel.failed provider={s} model={s} err={s}", .{ provider_name, model.id, @errorName(err) });
             };
         }
     }
@@ -851,10 +852,10 @@ pub fn persistModelSelection(
     defer updates.deinit(self.gpa);
     switch (scope) {
         .global => config_mod.mergeAndWriteGlobal(self.gpa, self.io, self.liveRuntime().?.home_dir, updates) catch |err| {
-            std.log.warn("config.write.failed err={s}", .{@errorName(err)});
+            log.warn("config.write.failed err={s}", .{@errorName(err)});
         },
         .project => config_mod.mergeAndWriteProject(self.gpa, self.io, self.liveRuntime().?.cwd, updates) catch |err| {
-            std.log.warn("project.config.write.failed err={s}", .{@errorName(err)});
+            log.warn("project.config.write.failed err={s}", .{@errorName(err)});
         },
         .session => unreachable,
     }
@@ -1116,7 +1117,7 @@ pub fn reloadModelCatalog(self: *App, catalog: ModelCatalog) !void {
                     self,
                 ) catch |err| {
                     if (!self.isCodexSignedIn()) return err;
-                    std.log.warn("compatible.models.failed err={s}", .{@errorName(err)});
+                    log.warn("compatible.models.failed err={s}", .{@errorName(err)});
                 };
             }
             try loadLocalCompatibleCatalogs(
@@ -1494,21 +1495,21 @@ pub fn injectPluginTools(self: *App) void {
 /// `self.tool_registry.all(...)` on the next `updateMcpTools` call.
 fn injectAllTools(self: *App) void {
     const runtime = self.liveRuntime() orelse {
-        std.log.warn("injectAllTools: no live runtime, skipping tool injection", .{});
+        log.warn("injectAllTools: no live runtime, skipping tool injection", .{});
         return;
     };
     const mcp_schemas = self.mcp_manager.buildMcpToolSchemas(self.gpa) catch |err| {
-        std.log.warn("injectAllTools: buildMcpToolSchemas failed: {s}", .{@errorName(err)});
+        log.warn("injectAllTools: buildMcpToolSchemas failed: {s}", .{@errorName(err)});
         return;
     };
     defer self.gpa.free(mcp_schemas);
-    std.log.debug("injectAllTools: mcp={} (plugin tools come from ToolRegistry)", .{mcp_schemas.len});
+    log.debug("injectAllTools: mcp={} (plugin tools come from ToolRegistry)", .{mcp_schemas.len});
     // Pass an empty builtin_override so we don't double-emit bash: the
     // registry's builtin already contains it, and most OpenAI-compatible
     // APIs reject duplicate tool names with HTTP 400, dropping the
     // entire tool list (including the plugin tools we want exposed).
     runtime.client.updateMcpTools(mcp_schemas, self.tool_registry, &.{}) catch |err| {
-        std.log.warn("injectAllTools: updateMcpTools failed: {s}", .{@errorName(err)});
+        log.warn("injectAllTools: updateMcpTools failed: {s}", .{@errorName(err)});
     };
 }
 
@@ -1521,7 +1522,7 @@ fn injectAllTools(self: *App) void {
 pub fn registerPluginTools(self: *App) void {
     const lua_mod = @import("../lua/root.zig");
     const descriptors = lua_mod.registry_bridge.buildPluginToolDescriptors(self.gpa, &self.plugin_manager) catch |err| {
-        std.log.warn("registerPluginTools: buildPluginToolDescriptors failed: {s}", .{@errorName(err)});
+        log.warn("registerPluginTools: buildPluginToolDescriptors failed: {s}", .{@errorName(err)});
         return;
     };
     defer {
@@ -1540,7 +1541,7 @@ pub fn registerPluginTools(self: *App) void {
     }
     for (descriptors) |t| {
         self.tool_registry.addPluginTool(self.gpa, t) catch |err| {
-            std.log.warn("registerPluginTools: addPluginTool failed: {s}", .{@errorName(err)});
+            log.warn("registerPluginTools: addPluginTool failed: {s}", .{@errorName(err)});
             if (t.userdata_free) |free_fn| free_fn(self.gpa, t.userdata);
             self.gpa.free(t.name);
             self.gpa.free(t.description);
@@ -1550,7 +1551,7 @@ pub fn registerPluginTools(self: *App) void {
     // it reads it from a thread-local slot that the executor writes
     // before each call. There is therefore nothing to rebind here — the
     // slot is always repopulated on the next dispatch.
-    std.log.debug("registerPluginTools: registered {} plugin tools", .{descriptors.len});
+    log.debug("registerPluginTools: registered {} plugin tools", .{descriptors.len});
 }
 
 /// Connect MCP servers per config, then inject their tool schemas into the live

@@ -2,6 +2,7 @@
 //! Implements protocol state machine, tool discovery, execution, and health monitoring.
 
 const std = @import("std");
+const log = std.log.scoped(.mcp);
 const ai = @import("../ai.zig");
 const config_mod = @import("../config/config.zig");
 const tools_common = @import("../tools/common.zig");
@@ -813,7 +814,7 @@ pub const McpClient = struct {
                     (if (c == .integer) c.integer else 0)
                 else
                     0;
-                std.log.warn("MCP tool '{s}' JSON-RPC error (code {d}): {s}", .{ tool_name, code, msg });
+                log.warn("MCP tool '{s}' JSON-RPC error (code {d}): {s}", .{ tool_name, code, msg });
                 return self.gpa.dupe(u8, msg);
             }
             return error.McpToolCallFailed;
@@ -826,7 +827,7 @@ pub const McpClient = struct {
         // model can read the server's error description (per MCP spec).
         if (result.object.get("isError")) |is_err| {
             if (is_err == .bool and is_err.bool) {
-                std.log.warn("MCP tool '{s}' returned isError: true", .{tool_name});
+                log.warn("MCP tool '{s}' returned isError: true", .{tool_name});
             }
         }
 

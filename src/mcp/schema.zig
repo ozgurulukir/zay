@@ -3,6 +3,7 @@
 //! tested in isolation and reused by future MCP server tooling.
 
 const std = @import("std");
+const log = std.log.scoped(.mcp);
 const tools_common = @import("../tools/common.zig");
 
 /// Parse a JSON-RPC response line and extract the `result` value.
@@ -30,7 +31,7 @@ pub fn parseResponse(gpa: std.mem.Allocator, response: []const u8) !?std.json.Pa
         if (err_val == .object) {
             const code = if (err_val.object.get("code")) |c| (if (c == .integer) c.integer else 0) else 0;
             const message = if (err_val.object.get("message")) |m| (if (m == .string) m.string else "unknown error") else "unknown error";
-            std.log.warn("MCP JSON-RPC error (code {d}): {s}", .{ code, message });
+            log.warn("MCP JSON-RPC error (code {d}): {s}", .{ code, message });
         }
         parsed.deinit();
         return null;
@@ -132,11 +133,11 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
         // Determine kind — handle unsupported composition keywords gracefully
         const kind = blk: {
             if (prop_obj.get("$ref") != null) {
-                std.log.warn("MCP schema: $ref unsupported for '{s}', using string", .{prop_name});
+                log.warn("MCP schema: $ref unsupported for '{s}', using string", .{prop_name});
                 break :blk tools_common.Schema.Kind.string;
             }
             if (prop_obj.get("oneOf") != null or prop_obj.get("anyOf") != null) {
-                std.log.warn("MCP schema: oneOf/anyOf unsupported for '{s}', using string", .{prop_name});
+                log.warn("MCP schema: oneOf/anyOf unsupported for '{s}', using string", .{prop_name});
                 break :blk tools_common.Schema.Kind.string;
             }
             const type_str = if (prop_obj.get("type")) |t|

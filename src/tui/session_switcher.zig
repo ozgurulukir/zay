@@ -3,6 +3,7 @@
 //! (Phase 3 of `_pm/Projects/tui-domain-extract`).
 
 const std = @import("std");
+const log = std.log.scoped(.tui);
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
@@ -341,7 +342,7 @@ pub fn createRuntime(app: *App, cwd: []const u8, session_dir: []const u8, sessio
             reloaded_diagnostics = lr.takeDiagnostics();
             reloaded_config = lr.config;
         } else {
-            std.log.warn("session.resume.config_reload_failed cwd={s}, using current config", .{cwd});
+            log.warn("session.resume.config_reload_failed cwd={s}, using current config", .{cwd});
         }
     }
     defer {

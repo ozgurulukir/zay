@@ -1,4 +1,7 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const logger = @import("logger");
+const log = std.log.scoped(.root);
 
 pub const agent = @import("agent.zig");
 pub const ai = @import("ai.zig");
@@ -23,7 +26,6 @@ pub const session = @import("session.zig");
 pub const skill = @import("skill.zig");
 pub const symbols = @import("symbols.zig");
 pub const terminal_markdown = @import("terminal_markdown");
-pub const logger = @import("logger");
 pub const mcp = @import("mcp/manager.zig");
 pub const mcp_client = @import("mcp/client.zig");
 pub const mcp_transport = @import("mcp/transport.zig");
@@ -39,12 +41,15 @@ pub const thread = @import("tui/thread.zig");
 pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     @import("tools/bash_exec.zig").disablePseudoConsole();
 
-    if (logger.enabled) {
-        if (resolveLogPath(gpa, init.environ_map)) |log_path| {
-            defer gpa.free(log_path);
-            try logger.init(.{ .io = init.io, .log_path = log_path });
-        } else |_| {}
-    }
+    if (resolveLogPath(gpa, init.environ_map)) |log_path| {
+        defer gpa.free(log_path);
+        logger.init(.{
+            .io = init.io,
+            .log_path = log_path,
+            .stderr_level = resolveStderrLevel(init.environ_map),
+            .max_bytes = resolveMaxBytes(init.environ_map),
+        }) catch {};
+    } else |_| {}
     defer logger.deinit();
 
     const cwd = try std.process.currentPathAlloc(init.io, gpa);
@@ -110,7 +115,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
         }
         const pruned = auth.pruneOrphanKeys(runtime_gpa, init.io, home_dir, valid_names.items) catch 0;
         if (pruned > 0) {
-            logger.log("auth.integrity.pruned count={d}", .{pruned});
+            log.warn("auth.integrity.pruned count={d}", .{pruned});
         }
     }
 
@@ -140,7 +145,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
             id,
             null,
         ) catch |err| {
-            std.log.warn("session.resume.failed err={s}, starting new session", .{@errorName(err)});
+            log.warn("session.resume.failed err={s}, starting new session", .{@errorName(err)});
             try agent_runtime.initNew(
                 runtime_gpa,
                 init.io,
@@ -175,6 +180,40 @@ fn resolveLogPath(gpa: std.mem.Allocator, env: anytype) ![]u8 {
     if (env.get("NOVA_LOG_FILE")) |path| return gpa.dupe(u8, path);
     const home = env.get("HOME") orelse env.get("USERPROFILE") orelse return error.HomeNotSet;
     return std.fs.path.join(gpa, &.{ home, ".config", "nova", "nova.log" });
+}
+
+/// G1a: parse `NOVA_LOG_STDERR_LEVEL` (err|warn|info|debug). Defaults to
+/// `warn` in release, `err` in debug — stderr is the TUI-adjacent stream, so
+/// `warn` is the highest default that won't routinely tear a frame.
+fn resolveStderrLevel(env: anytype) std.log.Level {
+    if (env.get("NOVA_LOG_STDERR_LEVEL")) |raw| {
+        const LevelMap = struct { name: []const u8, level: std.log.Level };
+        const map = [_]LevelMap{
+            .{ .name = "debug", .level = .debug },
+            .{ .name = "info", .level = .info },
+            .{ .name = "warn", .level = .warn },
+            .{ .name = "err", .level = .err },
+        };
+        for (map) |m| {
+            if (std.ascii.eqlIgnoreCase(raw, m.name)) return m.level;
+        }
+    }
+    return switch (builtin.mode) {
+        .Debug => .err,
+        else => .warn,
+    };
+}
+
+/// P2: parse `NOVA_LOG_MAX_BYTES` (decimal). Defaults to the logger's built-in
+/// 10 MB cap. Bad input falls back to the default rather than disabling
+/// rotation silently.
+fn resolveMaxBytes(env: anytype) u64 {
+    if (env.get("NOVA_LOG_MAX_BYTES")) |raw| {
+        if (std.fmt.parseInt(u64, raw, 10)) |n| {
+            if (n > 0) return n;
+        } else |_| {}
+    }
+    return 10 * 1024 * 1024;
 }
 
 fn resolveHomeDir(gpa: std.mem.Allocator, env: anytype) std.mem.Allocator.Error![]u8 {

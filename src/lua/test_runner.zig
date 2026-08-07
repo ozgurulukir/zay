@@ -7,6 +7,7 @@
 //! verdict is the pass/fail gate — a file with zero tests fails.
 
 const std = @import("std");
+const log = std.log.scoped(.lua);
 const c = @import("c");
 const State = @import("../lua/state.zig").State;
 const sandbox = @import("../lua/sandbox.zig");
@@ -51,7 +52,7 @@ fn runTestSource(gpa: std.mem.Allocator, content: []const u8) !bool {
     // Load and execute the test runner library
     if (!L.doString(null_term_runner)) {
         const err = L.getErrorMessage();
-        std.log.warn("lua.test_runner.load_failed err={s}", .{err orelse "unknown"});
+        log.warn("lua.test_runner.load_failed err={s}", .{err orelse "unknown"});
         return false;
     }
 
@@ -66,7 +67,7 @@ fn runTestSource(gpa: std.mem.Allocator, content: []const u8) !bool {
     // Load the test file as a function
     L.loadString(null_term_test) catch {
         const err = L.getErrorMessage();
-        std.log.warn("lua.test_file.load_failed err={s}", .{err orelse "unknown"});
+        log.warn("lua.test_file.load_failed err={s}", .{err orelse "unknown"});
         L.pop(1);
         return false;
     };
@@ -76,7 +77,7 @@ fn runTestSource(gpa: std.mem.Allocator, content: []const u8) !bool {
     const rc = L.pcall(0, 0);
     if (rc != c.LUA_OK) {
         const err = L.getErrorMessage();
-        std.log.warn("lua.test_file.run_failed err={s}", .{err orelse "unknown"});
+        log.warn("lua.test_file.run_failed err={s}", .{err orelse "unknown"});
         L.pop(1);
         return false;
     }
@@ -88,14 +89,14 @@ fn runTestSource(gpa: std.mem.Allocator, content: []const u8) !bool {
     const auto_run = "return test_runner.run()";
     L.loadString(auto_run) catch {
         const err = L.getErrorMessage();
-        std.log.warn("lua.test_runner.autorun_load_failed err={s}", .{err orelse "unknown"});
+        log.warn("lua.test_runner.autorun_load_failed err={s}", .{err orelse "unknown"});
         L.pop(1);
         return false;
     };
     const run_rc = L.pcall(0, 1);
     if (run_rc != c.LUA_OK) {
         const err = L.getErrorMessage();
-        std.log.warn("lua.test_runner.autorun_failed err={s}", .{err orelse "unknown"});
+        log.warn("lua.test_runner.autorun_failed err={s}", .{err orelse "unknown"});
         L.pop(1);
         return false;
     }

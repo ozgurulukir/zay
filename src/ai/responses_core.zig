@@ -1,5 +1,6 @@
 const std = @import("std");
-const logger = @import("logger");
+const log = std.log.scoped(.ai);
+
 const ai = @import("../ai.zig");
 const openai_endpoint = @import("openai_endpoint.zig");
 const openai_compatible = @import("openai_compatible.zig");
@@ -139,7 +140,7 @@ pub const Client = struct {
         var payload: std.Io.Writer.Allocating = .init(self.gpa);
         defer payload.deinit();
         try writeRequestPayload(&payload.writer, self.config, self.responses_config, messages, self.tools_json);
-        logger.log("responses.request POST {s} profile={s} body={s}", .{ self.url, self.responses_config.log_name, logBytes(payload.written()) });
+        log.info("responses.request POST {s} profile={s} body={s}", .{ self.url, self.responses_config.log_name, logBytes(payload.written()) });
         req.transfer_encoding = .chunked;
         var body_buffer: [body_buffer_bytes]u8 = undefined;
         var body_writer = try req.sendBodyUnflushed(&body_buffer);
@@ -150,14 +151,14 @@ pub const Client = struct {
         var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
         var http_response = try req.receiveHead(&redirect_buffer);
         const status_code: u16 = @intFromEnum(http_response.head.status);
-        logger.log("responses.response.head status={d} profile={s}", .{ status_code, self.responses_config.log_name });
+        log.info("responses.response.head status={d} profile={s}", .{ status_code, self.responses_config.log_name });
         if (status_code >= 400) {
             var error_buffer: [transfer_buffer_bytes]u8 = undefined;
             const error_reader = http_response.reader(&error_buffer);
             var error_body: std.Io.Writer.Allocating = .init(self.gpa);
             defer error_body.deinit();
             _ = error_reader.streamRemaining(&error_body.writer) catch 0;
-            logger.log("responses.response.error status={d} body={s}", .{ status_code, logBytes(error_body.written()) });
+            log.warn("responses.response.error status={d} body={s}", .{ status_code, logBytes(error_body.written()) });
             if (status_code >= 500) return error.HttpServerError;
             return error.HttpClientError;
         }
@@ -369,7 +370,7 @@ fn readStream(gpa: std.mem.Allocator, reader: *std.Io.Reader, observer: anytype,
     var source: stream_part.Source = .{ .reader = reader };
     while (try source.next(gpa)) |data| {
         defer gpa.free(data);
-        logger.log("responses.response.sse data={s}", .{logBytes(data)});
+        log.info("responses.response.sse data={s}", .{logBytes(data)});
         try state.processJson(gpa, data, observer, call_seq);
     }
     return try state.finish(gpa, call_seq);
@@ -411,7 +412,7 @@ fn processEvent(gpa: std.mem.Allocator, data: []const u8, blocks: *std.ArrayList
     const type_value = parsed.value.object.get("type") orelse return;
     if (type_value != .string) return;
     const event_type = responseEventFromString(type_value.string) orelse {
-        logger.log("responses.response.ignored_event type={s}", .{type_value.string});
+        log.warn("responses.response.ignored_event type={s}", .{type_value.string});
         return;
     };
     switch (event_type) {

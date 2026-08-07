@@ -1,6 +1,7 @@
 //! Async model loading jobs, outcome installation, and disk cache persistence.
 
 const std = @import("std");
+const log = std.log.scoped(.tui);
 const config_mod = @import("../config/config.zig");
 const model_cache = @import("model_cache.zig");
 const model_loader = @import("model_loader.zig");
@@ -76,7 +77,7 @@ pub fn installModelLoadResult(self: *App, result: *model_loader.Result) !void {
     try provider_model.finishModelCatalogReload(self);
     try provider_model.snapshotModelPickerState(self);
     self.pickers.models.models_cached = true;
-    saveModelCache(self) catch |err| std.log.warn("models.cache.save.failed err={s}", .{@errorName(err)});
+    saveModelCache(self) catch |err| log.warn("models.cache.save.failed err={s}", .{@errorName(err)});
 }
 
 /// Remove every cached model that came from `provider`. Builtin katalog

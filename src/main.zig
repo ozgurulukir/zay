@@ -14,7 +14,7 @@ fn novaLog(
     args: anytype,
 ) void {
     const prefix = "[" ++ comptime level.asText() ++ "] (" ++ @tagName(scope) ++ ") ";
-    logger.log(prefix ++ format, args);
+    logger.dispatch(level, @tagName(scope), prefix ++ format, args);
 }
 
 pub const panic = std.debug.FullPanic(novaPanic);

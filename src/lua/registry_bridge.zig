@@ -13,6 +13,7 @@
 //! schema parsing for free.
 
 const std = @import("std");
+const log = std.log.scoped(.lua);
 const c = @import("c");
 const lua_mod = @import("root.zig");
 const PluginManager = lua_mod.PluginManager;
@@ -234,7 +235,7 @@ pub fn buildPluginToolDescriptors(
             // -3 (before name+description were pushed); push a copy.
             _ = c.lua_pushvalue(L, -3);
             const schema = buildToolSchemaFromLua(gpa, L) catch |err| blk: {
-                std.log.warn(
+                log.warn(
                     "plugin.tool.schema.failed plugin={s} tool={s} err={s}",
                     .{ plugin.manifest.name, tn, @errorName(err) },
                 );
@@ -249,7 +250,7 @@ pub fn buildPluginToolDescriptors(
                 desc,
                 schema,
             ) catch |err| {
-                std.log.warn(
+                log.warn(
                     "plugin.tool.build.failed plugin={s} tool={s} err={s}",
                     .{ plugin.manifest.name, tn, @errorName(err) },
                 );

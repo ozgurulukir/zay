@@ -1,5 +1,5 @@
 const std = @import("std");
-const logger = @import("logger");
+const log = std.log.scoped(.tui);
 
 const codex = @import("../auth/codex.zig");
 const config_mod = @import("../config/config.zig");
@@ -174,7 +174,7 @@ fn loadAndRecord(job: *Job, configured: Configured, result: *Result) !void {
         const added = result.models.items.len - before;
         try result.outcomes.append(job.gpa, .{ .provider = configured.provider, .ok = added > 0 });
     } else |err| {
-        logger.log("model load {s}: failed: {s}", .{ configured.provider.label(), @errorName(err) });
+        log.warn("model load {s}: failed: {s}", .{ configured.provider.label(), @errorName(err) });
         try result.outcomes.append(job.gpa, .{ .provider = configured.provider, .ok = false });
     }
 }

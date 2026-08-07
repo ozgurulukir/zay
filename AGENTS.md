@@ -181,3 +181,12 @@ The authoritative signal for a test run is `zig build test`'s **exit code**, not
   Verify: build ReleaseFast, run the PTY repro (open `/resume`, select a session, type a prompt, press keys) — must NOT signal 11.
 
 - **`installRuntime` (session switch) checks only the active lane's turn — by design.** Other lanes keep running against their own runtimes; each lane owns its runtime, so a switch must not tear down lanes still in use. Completion routing is generation-safe across the switch (M1). Documented in `transcript_lifecycle.zig` and `_plan/plan-lane-worker-hardening-2026-08-05.md` (I4).
+
+## Logging
+- **Sinks:** In Debug mode, logs go to both `nova.log` and stderr. In Release builds, logs go to stderr only (`warn` level and above by default). The file-writer thread is Debug-only (`logger.enabled_file`); the stderr sink is compiled in all builds, so the shipped ReleaseFast binary keeps an operational trail. Every line carries an ISO-8601 UTC timestamp prefix (`lib/logger.zig` `formatTimestamp`, via `clock_gettime(REALTIME)` — no `Io` handle available in the writer thread / pre-init path).
+- **Knobs:**
+    - `NOVA_LOG_FILE`: Path to the log file (path max 1024 bytes).
+    - `NOVA_LOG_STDERR_LEVEL`: Min level for stderr (default: `warn` in release, `err` in debug). One of `err|warn|info|debug`, case-insensitive.
+    - `NOVA_LOG_MAX_BYTES`: Max size before rotation (default: 10MB). On launch, if the existing log exceeds this, `nova.log` is renamed to `nova.log.1` (one generation) and a fresh file starts.
+- **Diagnostics:** To see all logs in release: `NOVA_LOG_STDERR_LEVEL=debug nova 2> err.log`.
+- **Use `warn`, not `err`, for logged failures.** Zig 0.16's test runner hard-wires `log_err_count == 0` as a success gate (`Build/Step.zig` `isSuccess`): any `log.err(...)` from a passing test marks it failed. Many tests deliberately exercise error paths (HTTP 5xx retry, dead MCP server, compaction failure), so those messages must be `warn`. The stderr sink (B1) surfaces `warn` in **all** builds including ReleaseFast, so operational visibility is preserved without tripping the test gate. Reserve `err` for nothing in this codebase today — the gate makes it unusable. The pre-init escape hatch (`dispatch` when `stderr_ready == false`) writes raw to fd 2 via `std.c.write` (no `io`, no lock).

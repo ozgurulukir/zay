@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const log = std.log.scoped(.mcp);
 
 /// An extra HTTP header sent with every remote MCP request (e.g. an API key).
 /// Both fields are owned. Values support `{env:VAR}` expansion at parse time so
@@ -222,7 +223,7 @@ fn expandEnvVars(gpa: std.mem.Allocator, input: []const u8, env_map: *const std.
         if (env_map.get(name)) |value| {
             try out.writer.writeAll(value);
         } else {
-            std.log.warn("MCP config: environment variable '{s}' is not set; substituting empty string. Export it or remove the placeholder.", .{name});
+            log.warn("MCP config: environment variable '{s}' is not set; substituting empty string. Export it or remove the placeholder.", .{name});
         }
         rest = rest[name_begin + close_rel + 1 ..];
     }

@@ -10,7 +10,8 @@
 //! OAuth business logic.
 
 const std = @import("std");
-const logger = @import("logger");
+const log = std.log.scoped(.auth);
+
 const keyring = @import("keyring.zig");
 
 const keyring_service = "Nova";
@@ -200,7 +201,7 @@ pub fn readBlob(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !?[]u8
     if (keyring.load(gpa, keyring_service, account)) |maybe| {
         if (maybe) |bytes| return bytes;
     } else |err| {
-        if (err != error.Unsupported) logger.log("keyring load failed ({s}); using auth.json", .{@errorName(err)});
+        if (err != error.Unsupported) log.warn("keyring load failed ({s}); using auth.json", .{@errorName(err)});
     }
     return readBlobFile(gpa, io, home_dir);
 }
@@ -212,7 +213,7 @@ pub fn writeBlob(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, bytes
     var account_buf: [20]u8 = undefined;
     const account = keyringAccount(home_dir, &account_buf);
     keyring.save(gpa, keyring_service, account, bytes) catch |err| {
-        if (err != error.Unsupported) logger.log("keyring save failed ({s}); writing auth.json", .{@errorName(err)});
+        if (err != error.Unsupported) log.warn("keyring save failed ({s}); writing auth.json", .{@errorName(err)});
         return writeBlobFile(gpa, io, home_dir, bytes);
     };
     deleteBlobFile(gpa, io, home_dir) catch {};
@@ -223,7 +224,7 @@ pub fn deleteBlob(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !voi
     var account_buf: [20]u8 = undefined;
     const account = keyringAccount(home_dir, &account_buf);
     _ = keyring.delete(gpa, keyring_service, account) catch |err| {
-        if (err != error.Unsupported) logger.log("keyring delete failed ({s})", .{@errorName(err)});
+        if (err != error.Unsupported) log.warn("keyring delete failed ({s})", .{@errorName(err)});
     };
     try deleteBlobFile(gpa, io, home_dir);
 }

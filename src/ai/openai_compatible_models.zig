@@ -1,5 +1,6 @@
 const std = @import("std");
-const logger = @import("logger");
+const log = std.log.scoped(.ai);
+
 const openai_endpoint = @import("openai_endpoint.zig");
 
 const redirect_buffer_bytes: u32 = 8192;
@@ -43,12 +44,12 @@ pub fn listModels(
     });
     defer request.deinit();
     try request.sendBodiless();
-    logger.log("openai_compatible.models.request GET {s}", .{url});
+    log.info("openai_compatible.models.request GET {s}", .{url});
 
     var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
     var response = try request.receiveHead(&redirect_buffer);
     const status: u16 = @intFromEnum(response.head.status);
-    logger.log("openai_compatible.models.response.head status={d}", .{status});
+    log.info("openai_compatible.models.response.head status={d}", .{status});
     if (status < 200) return error.HttpUnexpectedStatus;
     if (status >= 300) {
         if (status >= 500) return error.HttpServerError;

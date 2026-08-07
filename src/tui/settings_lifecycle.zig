@@ -5,6 +5,7 @@
 //! `command_router.zig` stay thin: they just delegate here.
 
 const std = @import("std");
+const log = std.log.scoped(.tui);
 const vaxis = @import("vaxis");
 const tui = @import("../tui.zig");
 const config_mod = @import("../config/config.zig");
@@ -204,7 +205,7 @@ pub fn saveSettings(app: *App) !bool {
     // Validate inputs before saving.
     if (state.pending_bash_classifier_url) |url| {
         validateBashClassifierUrl(url) catch |err| {
-            std.log.warn("settings.validation.url_failed err={s}", .{@errorName(err)});
+            log.warn("settings.validation.url_failed err={s}", .{@errorName(err)});
             const msg = switch (err) {
                 error.InvalidUrl => "URL must start with http:// or https://",
                 error.UrlTooLong => "URL is too long (max 2048 characters)",
@@ -215,7 +216,7 @@ pub fn saveSettings(app: *App) !bool {
     }
     if (state.pending_system_prompt) |prompt| {
         validateSystemPrompt(prompt) catch |err| {
-            std.log.warn("settings.validation.prompt_failed err={s}", .{@errorName(err)});
+            log.warn("settings.validation.prompt_failed err={s}", .{@errorName(err)});
             const msg = switch (err) {
                 error.PromptTooLong => "System prompt is too long (max " ++ MAX_SYSTEM_PROMPT_LENGTH_STR ++ " characters)",
             };
@@ -246,7 +247,7 @@ pub fn saveSettings(app: *App) !bool {
     // project-specific, but use_responses_endpoint, system_prompt, etc. should
     // apply globally across all projects.
     config_mod.mergeAndWriteGlobal(app.gpa, app.io, runtime.home_dir, updates) catch |err| {
-        std.log.warn("settings.save.failed err={s}", .{@errorName(err)});
+        log.warn("settings.save.failed err={s}", .{@errorName(err)});
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "Failed to save settings: {s}", .{@errorName(err)}) catch "Failed to save settings";
         _ = try app.thread.transcript.append(app.gpa, .notice, "Settings", msg);
@@ -280,7 +281,7 @@ fn commitTextEdit(app: *App) !void {
         .system_prompt => {
             // Validate before committing
             validateSystemPrompt(text) catch |err| {
-                std.log.warn("settings.validation.prompt_failed err={s}", .{@errorName(err)});
+                log.warn("settings.validation.prompt_failed err={s}", .{@errorName(err)});
                 // Don't commit invalid prompt
                 return;
             };
@@ -295,7 +296,7 @@ fn commitTextEdit(app: *App) !void {
         .bash_classifier_url => {
             // Validate before committing
             validateBashClassifierUrl(text) catch |err| {
-                std.log.warn("settings.validation.url_failed err={s}", .{@errorName(err)});
+                log.warn("settings.validation.url_failed err={s}", .{@errorName(err)});
                 // Don't commit invalid URL
                 return;
             };

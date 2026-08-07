@@ -6,6 +6,7 @@
 //!   - `.nova/plugins/` — project plugins (override globals with same name)
 
 const std = @import("std");
+const log = std.log.scoped(.lua);
 const c = @import("c");
 const State = @import("state.zig").State;
 const sandbox = @import("sandbox.zig");
@@ -91,7 +92,7 @@ pub const PluginManager = struct {
         if (self.initialized) return self.plugins.count();
         self.initialized = true;
 
-        std.log.debug("plugin.loadAll.start global_dir={s} project_dir={s}", .{ self.global_dir, self.project_dir });
+        log.debug("plugin.loadAll.start global_dir={s} project_dir={s}", .{ self.global_dir, self.project_dir });
 
         // Load global plugins first
         try self.loadFromDir(self.global_dir, false);
@@ -100,7 +101,7 @@ pub const PluginManager = struct {
         try self.loadFromDir(self.project_dir, false);
 
         const loaded = self.plugins.count();
-        std.log.debug("plugin.loadAll.done loaded={}", .{loaded});
+        log.debug("plugin.loadAll.done loaded={}", .{loaded});
         return loaded;
     }
 
@@ -138,9 +139,9 @@ pub const PluginManager = struct {
         defer self.allocator.free(init_path);
 
         const loaded = self.loadLuaFile(&L, init_path);
-        std.log.debug("plugin.loadOne.init path={s} loaded={}", .{ init_path, loaded });
+        log.debug("plugin.loadOne.init path={s} loaded={}", .{ init_path, loaded });
         if (!loaded) {
-            std.log.warn("plugin.loadOne.init_failed path={s}", .{init_path});
+            log.warn("plugin.loadOne.init_failed path={s}", .{init_path});
             sandbox.freeHookData(L.handle);
             L.deinit();
             manifest.deinit(self.allocator);
@@ -287,7 +288,7 @@ pub const PluginManager = struct {
             const rc = state.pcall(1, 0);
             if (rc != c.LUA_OK) {
                 const err = state.getErrorMessage();
-                std.log.warn("plugin.event.error plugin={s} event={s} err={s}", .{
+                log.warn("plugin.event.error plugin={s} event={s} err={s}", .{
                     plugin_name, event_name, err orelse "unknown",
                 });
                 state.pop(1); // pop error message
@@ -297,18 +298,18 @@ pub const PluginManager = struct {
 
     /// Load all plugins from a directory.
     fn loadFromDir(self: *Self, dir_path: []const u8, is_embedded: bool) !void {
-        std.log.debug("plugin.loadFromDir.start dir={s} is_embedded={}", .{ dir_path, is_embedded });
+        log.debug("plugin.loadFromDir.start dir={s} is_embedded={}", .{ dir_path, is_embedded });
         var dir = std.Io.Dir.openDir(.cwd(), self.io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => {
-                std.log.warn("plugin.loadFromDir.not_found dir={s}", .{dir_path});
+                log.warn("plugin.loadFromDir.not_found dir={s}", .{dir_path});
                 return;
             },
             error.NotDir => {
-                std.log.warn("plugin.loadFromDir.not_dir dir={s}", .{dir_path});
+                log.warn("plugin.loadFromDir.not_dir dir={s}", .{dir_path});
                 return;
             },
             else => {
-                std.log.warn("plugin.loadFromDir.open_failed dir={s} err={s}", .{ dir_path, @errorName(err) });
+                log.warn("plugin.loadFromDir.open_failed dir={s} err={s}", .{ dir_path, @errorName(err) });
                 return err;
             },
         };
@@ -330,7 +331,7 @@ pub const PluginManager = struct {
             if (!self.fileExists(manifest_path)) continue;
 
             _ = self.loadOne(plugin_dir, is_embedded) catch |err| {
-                std.log.warn("plugin.load.failed path={s} reason={s}", .{ plugin_dir, @errorName(err) });
+                log.warn("plugin.load.failed path={s} reason={s}", .{ plugin_dir, @errorName(err) });
                 continue;
             };
         }
@@ -354,14 +355,14 @@ pub const PluginManager = struct {
     /// Load a Lua file and execute it, leaving the result on the stack.
     fn loadLuaFile(self: *Self, L: *State, path: []const u8) bool {
         const content = self.readFileBytes(path) catch |err| {
-            std.log.warn("plugin.loadLuaFile.read_failed path={s} err={s}", .{ path, @errorName(err) });
+            log.warn("plugin.loadLuaFile.read_failed path={s} err={s}", .{ path, @errorName(err) });
             return false;
         };
         defer self.allocator.free(content);
 
         // Ensure null-terminated for Lua C API
         const null_term = self.allocator.dupeZ(u8, content) catch |err| {
-            std.log.warn("plugin.loadLuaFile.dupZ_failed path={s} err={s}", .{ path, @errorName(err) });
+            log.warn("plugin.loadLuaFile.dupZ_failed path={s} err={s}", .{ path, @errorName(err) });
             return false;
         };
         defer self.allocator.free(null_term);
@@ -376,7 +377,7 @@ pub const PluginManager = struct {
         if (load_rc != c.LUA_OK) {
             const err_ptr = c.lua_tolstring(L.handle, -1, null);
             const msg = if (err_ptr) |p| std.mem.sliceTo(p, 0) else "unknown Lua load error";
-            std.log.warn("plugin.loadLuaFile.lua_load_error path={s} err={s}", .{ path, msg });
+            log.warn("plugin.loadLuaFile.lua_load_error path={s} err={s}", .{ path, msg });
             c.lua_pop(L.handle, 1);
             return false;
         }
@@ -385,7 +386,7 @@ pub const PluginManager = struct {
         if (pcall_rc != c.LUA_OK) {
             const err_ptr = c.lua_tolstring(L.handle, -1, null);
             const msg = if (err_ptr) |p| std.mem.sliceTo(p, 0) else "unknown Lua runtime error";
-            std.log.warn("plugin.loadLuaFile.lua_runtime_error path={s} err={s}", .{ path, msg });
+            log.warn("plugin.loadLuaFile.lua_runtime_error path={s} err={s}", .{ path, msg });
             c.lua_pop(L.handle, 1);
             return false;
         }

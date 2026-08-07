@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = std.log.scoped(.tui);
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
@@ -82,7 +83,6 @@ const panel = @import("tui/widgets/panel.zig");
 const tui_provider = @import("tui/provider_controller.zig");
 const tui_status = @import("tui/status.zig");
 const tui_style = @import("tui/style.zig");
-const logger = @import("logger");
 pub const modelsdev = @import("models/registry.zig");
 
 const ConversationLayout = tui_message.ConversationLayout;
@@ -302,10 +302,10 @@ pub const App = struct {
         app.plugin_manager.deinit();
         app.plugin_manager = lua_mod.PluginManager.init(gpa, io, runtime.home_dir, runtime.cwd);
         const loaded_plugins = app.plugin_manager.loadAll() catch |err| blk: {
-            std.log.warn("plugin_manager.loadAll failed: {s}", .{@errorName(err)});
+            log.warn("plugin_manager.loadAll failed: {s}", .{@errorName(err)});
             break :blk @as(usize, 0);
         };
-        std.log.debug("plugin_manager loaded {d} plugin(s); home_dir={s} cwd={s}", .{ loaded_plugins, runtime.home_dir, runtime.cwd });
+        log.debug("plugin_manager loaded {d} plugin(s); home_dir={s} cwd={s}", .{ loaded_plugins, runtime.home_dir, runtime.cwd });
         // Materialize every active plugin's registered tools as `Tool`
         // entries on the app's `ToolRegistry`. From this point on, the
         // tool list is consistent across dispatch, display, and the AI

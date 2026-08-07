@@ -1,5 +1,6 @@
 const std = @import("std");
-const logger = @import("logger");
+const log = std.log.scoped(.ai);
+
 const ai = @import("../ai.zig");
 const core = @import("responses_core.zig");
 const websocket = @import("websocket");
@@ -68,7 +69,7 @@ pub const Client = struct {
     pub fn prompt(self: *Client, messages: []const ai.MessageView, observer: anytype) !ai.Turn {
         var bridge: ObserverBridge(@TypeOf(observer)) = .{ .observer = observer };
         return self.promptWebSocket(messages, bridge.streamObserver()) catch |err| {
-            logger.log("codex.websocket.failure emitted={} error={s}", .{ bridge.emitted, @errorName(err) });
+            log.warn("codex.websocket.failure emitted={} error={s}", .{ bridge.emitted, @errorName(err) });
             if (bridge.emitted) return err;
             return self.core_client.prompt(messages, observer);
         };
@@ -96,14 +97,14 @@ pub const Client = struct {
         const headers = try buildHandshakeHeaders(gpa, endpoint.host_header, self.core_client.authorization, self.core_client.config);
         defer gpa.free(headers);
 
-        logger.log("codex.websocket.request GET {s} session_id={s}", .{ self.core_client.url, self.core_client.config.session_id });
+        log.info("codex.websocket.request GET {s} session_id={s}", .{ self.core_client.url, self.core_client.config.session_id });
         watchdog.armMs(websocket_handshake_timeout_ms);
         client.handshake(endpoint.path, .{
             .timeout_ms = websocket_handshake_timeout_ms,
             .headers = headers,
         }) catch |err| return watchdog.timeoutError(err);
         watchdog.armSeconds(websocket_idle_timeout_seconds);
-        logger.log("codex.websocket.timeout.read_idle_seconds={d}", .{websocket_idle_timeout_seconds});
+        log.info("codex.websocket.timeout.read_idle_seconds={d}", .{websocket_idle_timeout_seconds});
 
         var body: std.Io.Writer.Allocating = .init(gpa);
         defer body.deinit();
@@ -112,7 +113,7 @@ pub const Client = struct {
         defer payload.deinit();
         try core.writeRequestPayload(&payload.writer, self.core_client.config, self.core_client.responses_config, messages, self.core_client.tools_json);
         try body.writer.writeAll(payload.written()[1..]);
-        logger.log("codex.websocket.request.body {s}", .{logBytes(body.written())});
+        log.info("codex.websocket.request.body {s}", .{logBytes(body.written())});
         try client.writeText(body.written());
 
         var state: core.StreamState = .{};
@@ -125,7 +126,7 @@ pub const Client = struct {
             watchdog.armSeconds(websocket_idle_timeout_seconds);
             switch (message.type) {
                 .text => {
-                    logger.log("codex.websocket.response.frame {s}", .{logBytes(message.data)});
+                    log.info("codex.websocket.response.frame {s}", .{logBytes(message.data)});
                     try state.processJson(gpa, message.data, observer, &self.core_client.call_seq);
                 },
                 .binary => return error.UnsupportedWebSocketFrame,

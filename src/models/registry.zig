@@ -17,7 +17,7 @@
 //! OpenAI Codex OAuth provider (id == "openai").
 
 const std = @import("std");
-const logger = @import("logger");
+const log = std.log.scoped(.models);
 
 const cache_subdir = "models.dev";
 const cache_filename = "api.json";
@@ -266,7 +266,7 @@ pub fn fetchAndCache(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !
     defer gpa.free(bytes);
 
     cacheApiJson(gpa, io, home_dir, bytes) catch |err| {
-        logger.log("modelsdev.cache.write.failed err={s}", .{@errorName(err)});
+        log.warn("modelsdev.cache.write.failed err={s}", .{@errorName(err)});
     };
 
     return parseModelsDevJson(gpa, bytes);
@@ -282,38 +282,38 @@ pub fn loadOrFetchRegistry(gpa: std.mem.Allocator, io: std.Io, home_dir: []const
     if (fetchAndCache(gpa, io, home_dir)) |fetched| {
         var f = fetched;
         defer f.deinit(gpa);
-        logger.log("modelsdev.fetch.ok remote_providers={d}", .{f.providers.len});
+        log.info("modelsdev.fetch.ok remote_providers={d}", .{f.providers.len});
         if (buildRegistry(gpa, builtins, &f)) |merged| {
-            logger.log("modelsdev.registry.merged total={d} builtins={d} remote={d}", .{ merged.providers.len, builtins.len, f.providers.len });
+            log.info("modelsdev.registry.merged total={d} builtins={d} remote={d}", .{ merged.providers.len, builtins.len, f.providers.len });
             return merged;
         } else |err| {
-            logger.log("modelsdev.build.failed err={s}", .{@errorName(err)});
+            log.warn("modelsdev.build.failed err={s}", .{@errorName(err)});
         }
     } else |err| {
-        logger.log("modelsdev.fetch.failed err={s}", .{@errorName(err)});
+        log.warn("modelsdev.fetch.failed err={s}", .{@errorName(err)});
     }
 
     if (loadCache(gpa, io, home_dir) catch null) |cached| {
         var c = cached;
         defer c.deinit(gpa);
-        logger.log("modelsdev.cache.fresh remote_providers={d}", .{c.providers.len});
+        log.info("modelsdev.cache.fresh remote_providers={d}", .{c.providers.len});
         if (buildRegistry(gpa, builtins, &c)) |merged| {
-            logger.log("modelsdev.registry.merged total={d}", .{merged.providers.len});
+            log.info("modelsdev.registry.merged total={d}", .{merged.providers.len});
             return merged;
         } else |err| {
-            logger.log("modelsdev.build.failed err={s}", .{@errorName(err)});
+            log.warn("modelsdev.build.failed err={s}", .{@errorName(err)});
         }
     }
 
     if (loadCacheWithOptions(gpa, io, home_dir, true) catch null) |stale| {
         var s = stale;
         defer s.deinit(gpa);
-        logger.log("modelsdev.cache.stale remote_providers={d}", .{s.providers.len});
+        log.warn("modelsdev.cache.stale remote_providers={d}", .{s.providers.len});
         if (buildRegistry(gpa, builtins, &s)) |merged| {
-            logger.log("modelsdev.registry.merged total={d}", .{merged.providers.len});
+            log.info("modelsdev.registry.merged total={d}", .{merged.providers.len});
             return merged;
         } else |err| {
-            logger.log("modelsdev.build.failed err={s}", .{@errorName(err)});
+            log.warn("modelsdev.build.failed err={s}", .{@errorName(err)});
         }
     }
 
@@ -324,23 +324,23 @@ pub fn loadOrFetchRegistry(gpa: std.mem.Allocator, io: std.Io, home_dir: []const
         if (loadVendored(gpa, io)) |vendored| {
             var v = vendored;
             defer v.deinit(gpa);
-            logger.log("modelsdev.vendored remote_providers={d}", .{v.registry.providers.len});
+            log.warn("modelsdev.vendored remote_providers={d}", .{v.registry.providers.len});
             // Seed the cache so subsequent starts can skip this step.
             cacheApiJson(gpa, io, home_dir, v.raw_json) catch |err| {
-                logger.log("modelsdev.vendored.cache.seed.failed err={s}", .{@errorName(err)});
+                log.warn("modelsdev.vendored.cache.seed.failed err={s}", .{@errorName(err)});
             };
             if (buildRegistry(gpa, builtins, &v.registry)) |merged| {
-                logger.log("modelsdev.registry.merged total={d}", .{merged.providers.len});
+                log.info("modelsdev.registry.merged total={d}", .{merged.providers.len});
                 return merged;
             } else |err| {
-                logger.log("modelsdev.build.failed err={s}", .{@errorName(err)});
+                log.warn("modelsdev.build.failed err={s}", .{@errorName(err)});
             }
         } else |err| {
-            logger.log("modelsdev.vendored.failed err={s}", .{@errorName(err)});
+            log.warn("modelsdev.vendored.failed err={s}", .{@errorName(err)});
         }
     }
 
-    logger.log("modelsdev.registry.fallback builtins_only={d}", .{builtins.len});
+    log.warn("modelsdev.registry.fallback builtins_only={d}", .{builtins.len});
     var empty_remote: Registry = .{ .providers = &.{}, .strings = .empty };
     return buildRegistry(gpa, builtins, &empty_remote) catch .{
         .providers = &.{},

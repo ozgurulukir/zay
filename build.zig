@@ -35,6 +35,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("lib/logger.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .imports = &.{
             .{ .name = "bounded_queue", .module = bounded_queue_mod },
         },
