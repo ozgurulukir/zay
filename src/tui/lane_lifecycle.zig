@@ -820,7 +820,7 @@ fn createLane(app: *App, req: *const lane_bridge.Request) ?Resp {
 /// path back so the tool can borrow it as the driver's workspace. The next
 /// tool batch's executor re-roots at the lane (S5).
 fn enterLane(app: *App, req: *const lane_bridge.Request) ?Resp {
-    const id = req.lane orelse return failResp(app.gpa, "lane: enter needs a `lane` id\n", .{});
+    const id = req.lane orelse return failResp(app.gpa, "lane: enter needs a `lane` field — the hex id shown by `lane list`\n", .{});
     const target = resolveLane(app, id) orelse return failResp(app.gpa, "lane: no open lane with id '{s}'\n", .{id});
     // M5: entering a running lane would put two agents writing the same
     // worktree concurrently.
@@ -848,7 +848,7 @@ fn leaveLane(app: *App) ?Resp {
 /// never bypass `InFlightTurn`): the driver's own turn is active here by
 /// definition, so the git fold is safe at the lane level.
 fn mergeLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
-    const id = req.lane orelse return failResp(app.gpa, "lane: merge needs a `lane` id\n", .{});
+    const id = req.lane orelse return failResp(app.gpa, "lane: merge needs a `lane` field — the hex id shown by `lane list`\n", .{});
     const target = resolveLane(app, id) orelse return failResp(app.gpa, "lane: no open lane with id '{s}'\n", .{id});
     // H5b: leave-before-merge. Merging frees the lane's worktree, and the
     // current tool batch's executor is still rooted in it.
@@ -1154,7 +1154,7 @@ fn startTurnForLane(app: *App, lane: *Thread, prompt: []const u8, title_source: 
 /// `lane read {lane}`: snapshot the tail of a worker lane's conversation.
 /// Works on live, rested, and (in-memory) parked-by-rest lanes alike.
 fn readLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
-    const id = req.lane orelse return failResp(app.gpa, "lane: read needs a `lane` id\n", .{});
+    const id = req.lane orelse return failResp(app.gpa, "lane: read needs a `lane` field — the hex id shown by `lane list`\n", .{});
     const target = resolveLane(app, id) orelse return failResp(app.gpa, "lane: no open lane with id '{s}'\n", .{id});
     const status = laneStatus(app, target);
     defer app.gpa.free(status);
@@ -1206,7 +1206,7 @@ fn transcriptTail(app: *App, lane: *Thread, max: usize) []u8 {
 
 /// `lane cancel {lane}`: two-phase interrupt of the target lane's turn (S10).
 fn cancelLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
-    const id = req.lane orelse return failResp(app.gpa, "lane: cancel needs a `lane` id\n", .{});
+    const id = req.lane orelse return failResp(app.gpa, "lane: cancel needs a `lane` field — the hex id shown by `lane list`\n", .{});
     const target = resolveLane(app, id) orelse return failResp(app.gpa, "lane: no open lane with id '{s}'\n", .{id});
     cancelLaneTurn(app, target);
     target.acknowledged = true; // the orchestrator knows it was cancelled
@@ -1263,7 +1263,7 @@ fn discardAbandonedTurnOnLane(app: *App, lane: *Thread) void {
 /// with a stall notice (latched by `stall_warned`) so the orchestrator can
 /// cancel/steer instead of blocking here forever.
 fn awaitLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
-    const id = req.lane orelse return failResp(app.gpa, "lane: await needs a `lane` id\n", .{});
+    const id = req.lane orelse return failResp(app.gpa, "lane: await needs a `lane` field — the hex id shown by `lane list`\n", .{});
     const target = resolveLane(app, id) orelse return failResp(app.gpa, "lane: no open lane with id '{s}'\n", .{id});
     const now_ms = std.Io.Clock.now(.awake, app.io).toMilliseconds();
     if (target.turn.state == .active and laneStalled(target, now_ms) and !target.stall_warned) {
@@ -1292,7 +1292,7 @@ fn awaitLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
 /// steer (drained after the next tool batch), and the lane's UI mirror
 /// appends it so the flushed event renders it.
 fn steerLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
-    const id = req.lane orelse return failResp(app.gpa, "lane: steer needs a `lane` id\n", .{});
+    const id = req.lane orelse return failResp(app.gpa, "lane: steer needs a `lane` field — the hex id shown by `lane list`\n", .{});
     const text = req.steer orelse return failResp(app.gpa, "lane: steer needs a `steer` message\n", .{});
     const target = resolveLane(app, id) orelse return failResp(app.gpa, "lane: no open lane with id '{s}'\n", .{id});
     const agent = target.agent orelse return failResp(app.gpa, "lane: lane {s} is not running — nothing to steer\n", .{id});

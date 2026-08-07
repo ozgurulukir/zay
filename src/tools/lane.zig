@@ -90,9 +90,13 @@ const JsonArgs = struct {
     task: ?[]const u8 = null,
     lane: ?[]const u8 = null,
     steer: ?[]const u8 = null,
+    // Detector only — never read. `ignore_unknown_fields` would silently drop
+    // an `id` the model sent instead of the canonical `lane`, leaving it stuck
+    // repeating the same miss. Surfaced as a WrongField error below instead.
+    id: ?[]const u8 = null,
 };
 
-const ParseError = error{ InvalidAction, OutOfMemory };
+const ParseError = error{ InvalidAction, WrongField, OutOfMemory };
 
 fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args {
     const parsed = std.json.parseFromSlice(JsonArgs, gpa, arguments, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
@@ -102,6 +106,13 @@ fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args {
     defer parsed.deinit();
     const command_str = parsed.value.command orelse return error.InvalidAction;
     const command = opFromString(command_str) orelse return error.InvalidAction;
+
+    // The canonical field is `lane`. `id` is a common model guess (the bare
+    // value surfaces unlabelled in `lane list`), so reject it explicitly instead
+    // of letting `ignore_unknown_fields` drop it — otherwise the model loops on
+    // "needs a lane id" while believing it already sent one. When both are
+    // present, the canonical `lane` wins.
+    if (parsed.value.id != null and parsed.value.lane == null) return error.WrongField;
 
     var out = Args{ .command = command };
     errdefer out.deinit(gpa);
@@ -127,6 +138,15 @@ fn parseError(gpa: std.mem.Allocator, err: ParseError) common.Error!common.Outpu
             gpa,
             1,
             "lane: invalid arguments — `command` must be one of: list, create, enter, leave, merge, spawn, read, cancel, await, steer\n",
+            .{},
+        ),
+        // Models learn the field name from output + schema; a misspelled `id`
+        // must surface as a named-field hint, not a silent drop. Points at the
+        // canonical `lane` field for id-bearing ops and at `purpose` for create.
+        error.WrongField => common.failFmt(
+            gpa,
+            1,
+            "lane: this tool has no `id` parameter — pass a lane id as the `lane` field (e.g. {{\"command\":\"read\",\"lane\":\"e1e94861c257\"}}); for `create`, the title is the `purpose` field\n",
             .{},
         ),
     };
@@ -228,6 +248,26 @@ test "lane rejects a missing or unknown command" {
     // The dispatch key is `command` — the old `action`-keyed shape (the
     // model's original miss) is unknown fields only, so it must fail too.
     try std.testing.expectError(error.InvalidAction, parseArgs(gpa, "{\"action\":\"list\"}"));
+}
+
+test "lane rejects an `id` field and points at the canonical `lane` field" {
+    // The canonical lane-id field is `lane`. A common model guess is `id`
+    // (the bare value surfaces unlabelled in `lane list`, so models infer the
+    // wrong key). It must surface as WrongField, not be silently dropped —
+    // otherwise the model loops on "needs a lane id" while believing it sent one.
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.WrongField, parseArgs(gpa, "{\"command\":\"read\",\"id\":\"e1e94861c257\"}"));
+    // Same on create: the model often tries `id` for a lane name, but create's
+    // title field is `purpose`.
+    try std.testing.expectError(error.WrongField, parseArgs(gpa, "{\"command\":\"create\",\"id\":\"dh01-defaults\"}"));
+}
+
+test "lane prefers the canonical `lane` field when both `lane` and `id` are present" {
+    const gpa = std.testing.allocator;
+    var args = try parseArgs(gpa, "{\"command\":\"read\",\"lane\":\"abc\",\"id\":\"xyz\"}");
+    defer args.deinit(gpa);
+    // Canonical wins; the stray `id` is ignored because `lane` satisfied it.
+    try std.testing.expectEqualStrings("abc", args.lane.?);
 }
 
 test "lane opFromString round-trips every op" {
