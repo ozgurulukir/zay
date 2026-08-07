@@ -6,7 +6,7 @@ Every call takes `command` (always required) naming the operation. Which other a
 
 | command | required args | what it does |
 |---|---|---|
-| `list` | — | every open lane (id, title, branch, status, activity), your workspace root, parked lanes |
+| `list` | — | every open lane (lane id, title, branch, status, activity), your workspace root, parked lanes |
 | `create` | `purpose` | open a NEW idle lane for you to work in (the purpose becomes its title) |
 | `enter` | `lane` | re-root your tools into that lane's worktree |
 | `leave` | — | return your tools to the repo root |
@@ -17,11 +17,13 @@ Every call takes `command` (always required) naming the operation. Which other a
 | `await` | `lane` | block until the worker lane is done (or resolves once if it stalls — no output for 3+ min), then return its transcript |
 | `steer` | `lane`, `steer` | inject a short message into a running worker mid-turn |
 
+The lane id always goes in the `lane` field — `lane list` prints the hex id (e.g. `e1e94861c257`) for each open lane. This tool has no `id` parameter.
+
 Example — spawn a worker: `{"command":"spawn","task":"Review the diff in PR #57 and report findings."}`
 
 ## When to use which command
 
-- `lane list` — always a good first step: shows every open lane (id, title, branch, status), your current workspace root, and any parked lanes on disk. `read` reports a running worker's activity (tool-call count, time since last output) so you can tell busy from stalled.
+- `lane list` — always a good first step: shows every open lane (lane id, title, branch, status), your current workspace root, and any parked lanes on disk. `read` reports a running worker's activity (tool-call count, time since last output) so you can tell busy from stalled.
 - `lane create` — open a NEW idle lane for you to work in. Use it when you need to edit/test/build in isolation without dirtying the main tree: create, `lane enter`, work, `lane leave`, then `lane merge` when done.
 - `lane enter` — re-root your tools into that lane's worktree. After entering, bash/file calls run against the lane checkout and the `@file` mention reads files from the lane. `git` inside is on the lane's branch. The re-root applies from your next tool call — including calls later in the same batch as the `enter`.
 - `lane leave` — return your tools to the repo root (workspace mode is tool scoping; your role is unchanged).
