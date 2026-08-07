@@ -11,9 +11,8 @@
 const std = @import("std");
 
 const ai = @import("../ai.zig");
-/// Static model→token-limit table generated at build time from the vendored
-/// models.dev snapshot (see `build.zig` and `tools/gen_model_catalog.zig`).
-const model_catalog = @import("model_catalog");
+/// Runtime models.dev registry — provides `ModelInfo` for capability lookups.
+const modelsdev = @import("../models/registry.zig");
 
 const assert = std.debug.assert;
 
@@ -78,46 +77,31 @@ const tool_output_render_cap_bytes: u32 = 2048;
 /// billing.
 const image_estimate_tokens: u32 = 1_024;
 
-/// Context window in tokens for `model_id`, from the generated models.dev
-/// catalogue, or a conservative default when the id matches no catalogue entry.
+/// Context window in tokens for the active model, from the runtime models.dev
+/// registry, or a conservative default when the model is not in the registry.
 /// When `override` is non-null it wins unconditionally (config-driven
 /// `context.overrideContextWindow`).
 ///
-/// Matches by longest id prefix: an exact id wins, and a dated/suffixed variant
-/// (e.g. `gpt-5-2025-08-07`) falls back to its base family (`gpt-5`). The
-/// catalogue carries only the providers Nova integrates with; anything else
-/// lands on the conservative default, which only compacts early — the safe
-/// direction.
-pub fn contextWindowTokens(raw_model_id: []const u8, override: ?u32) u32 {
+/// When `model_info` is null (model not in the registry, or registry not loaded),
+/// falls back to the conservative default — which only compacts early, the safe
+/// direction. A model with `context_window = 0` (missing `limit` in api.json)
+/// also falls back to the default.
+pub fn contextWindowTokens(model_info: ?modelsdev.ModelInfo, override: ?u32) u32 {
     if (override) |v| return v;
-    var model_id = raw_model_id;
-    while (std.mem.indexOfScalar(u8, model_id, '/')) |slash| {
-        model_id = model_id[slash + 1 ..];
+    if (model_info) |m| {
+        // A model with context_window = 0 (missing `limit` in api.json) falls
+        // back to the conservative default — the safe direction (compacts early).
+        if (m.context_window > 0) return m.context_window;
     }
-
-    var best: ?model_catalog.Entry = null;
-    for (model_catalog.entries) |entry| {
-        // Prefix match only in the safe direction (model id is longer than or
-        // equal to the catalogue id), and only across a segment boundary — so
-        // `gpt-4` never matches `gpt-4o*`, while `gpt-5-2025-08-07` still
-        // resolves to `gpt-5` (TD-8). Longest match wins.
-        if (std.mem.startsWith(u8, model_id, entry.id) and segmentBoundary(model_id, entry.id.len)) {
-            if (best == null or entry.id.len > best.?.id.len) best = entry;
-        }
-    }
-    if (best) |entry| return entry.context;
     return context_window_default_tokens;
 }
 
-/// True when `prefix_len` is the whole model id, or the character right after
-/// the catalogue prefix is a segment separator (`-`, `.`, `_`, `:`). Guards
-/// family-prefix matching against longer ids of a different family.
-fn segmentBoundary(model_id: []const u8, prefix_len: usize) bool {
-    if (model_id.len == prefix_len) return true;
-    return switch (model_id[prefix_len]) {
-        '-', '.', '_', ':' => true,
-        else => false,
-    };
+/// Whether the model supports reasoning, from the runtime models.dev registry.
+/// Unknown models default to `false` — the safe direction, since the
+/// reasoning-specific wire fields are only emitted when this is true.
+pub fn isReasoningModel(model_info: ?modelsdev.ModelInfo) bool {
+    if (model_info) |m| return m.reasoning;
+    return false;
 }
 
 /// Target tokens of recent conversation to keep verbatim during compaction.
@@ -401,16 +385,25 @@ fn divCeil(numerator: u32, denominator: u32) u32 {
     return (numerator + denominator - 1) / denominator;
 }
 
-test "context window lookup uses the generated catalogue with a default fallback" {
-    // Unknown ids fall back to the conservative default.
-    try std.testing.expectEqual(context_window_default_tokens, contextWindowTokens("some-unknown-model", null));
-    // Exact ids resolve to their real models.dev context window.
-    try std.testing.expectEqual(@as(u32, 1_000_000), contextWindowTokens("claude-opus-4-8", null));
-    try std.testing.expectEqual(@as(u32, 1_047_576), contextWindowTokens("gpt-4.1-mini", null));
-    // A dated/suffixed variant falls back to its longest-prefix base family.
-    try std.testing.expectEqual(@as(u32, 400_000), contextWindowTokens("gpt-5-2025-08-07", null));
+test "contextWindowTokens uses model info with override and default fallback" {
+    // Unknown/null model falls back to the conservative default.
+    try std.testing.expectEqual(context_window_default_tokens, contextWindowTokens(null, null));
+    // A known model resolves to its context window.
+    const m: modelsdev.ModelInfo = .{ .id = "gpt-5", .reasoning = true, .context_window = 400_000 };
+    try std.testing.expectEqual(@as(u32, 400_000), contextWindowTokens(m, null));
     // Override wins unconditionally.
-    try std.testing.expectEqual(@as(u32, 32_000), contextWindowTokens("claude-opus-4-8", 32_000));
+    try std.testing.expectEqual(@as(u32, 32_000), contextWindowTokens(m, 32_000));
+    // Override wins even when model_info is null.
+    try std.testing.expectEqual(@as(u32, 32_000), contextWindowTokens(null, 32_000));
+}
+
+test "isReasoningModel uses model info with false default" {
+    const reasoning: modelsdev.ModelInfo = .{ .id = "gpt-5", .reasoning = true, .context_window = 400_000 };
+    const non_reasoning: modelsdev.ModelInfo = .{ .id = "gpt-4o", .reasoning = false, .context_window = 128_000 };
+    try std.testing.expect(isReasoningModel(reasoning));
+    try std.testing.expect(!isReasoningModel(non_reasoning));
+    // Unknown models default to false (the safe direction).
+    try std.testing.expect(!isReasoningModel(null));
 }
 
 test "summary starts at the threshold and swaps at threshold + margin" {
@@ -530,9 +523,10 @@ test "keepRecentTokens scales with context window and respects config ceiling" {
     try std.testing.expectEqual(@as(u32, 8_000), keepRecentTokens(0, 8_000));
 }
 
-test "contextWindowTokens strips provider prefix" {
-    const tokens1 = contextWindowTokens("gpt-4o", null);
-    const tokens2 = contextWindowTokens("openai/gpt-4o", null);
+test "contextWindowTokens is pure — same ModelInfo yields same result" {
+    const m: modelsdev.ModelInfo = .{ .id = "gpt-4o", .reasoning = false, .context_window = 128_000 };
+    const tokens1 = contextWindowTokens(m, null);
+    const tokens2 = contextWindowTokens(m, null);
     try std.testing.expectEqual(tokens1, tokens2);
 }
 
@@ -576,15 +570,11 @@ test "calibrated keep budget shrinks when real usage outruns the estimate" {
     try std.testing.expectEqual(@as(u32, 1_000), calibrateKeepBudget(1_200, 4_000, 1_000));
 }
 
-test "context window lookup requires a segment boundary after the family prefix" {
-    // `gpt-4` resolves to the exact gpt-4 entry (8192), NOT the longer gpt-4o
-    // family (128000) — the reverse direction is gone (TD-8). The plan's
-    // "default" wording assumed no bare gpt-4 entry; the catalogue has one.
-    try std.testing.expectEqual(@as(u32, 8_192), contextWindowTokens("gpt-4", null));
-    // A dated/suffixed variant still resolves to its base family across `-`.
-    try std.testing.expectEqual(@as(u32, 400_000), contextWindowTokens("gpt-5-2025-08-07", null));
-    // Provider prefixes still strip.
-    try std.testing.expectEqual(contextWindowTokens("gpt-4o", null), contextWindowTokens("openai/gpt-4o", null));
+test "contextWindowTokens respects override over model info" {
+    // Override always wins, regardless of the model's context window.
+    const m: modelsdev.ModelInfo = .{ .id = "gpt-4", .reasoning = false, .context_window = 8_192 };
+    try std.testing.expectEqual(@as(u32, 8_192), contextWindowTokens(m, null));
+    try std.testing.expectEqual(@as(u32, 400_000), contextWindowTokens(m, 400_000));
 }
 
 test "folded summary strips the handover framing" {

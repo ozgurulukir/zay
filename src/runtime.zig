@@ -8,6 +8,7 @@ const codex_mod = @import("auth/codex.zig");
 const compaction = @import("context/compaction.zig");
 const config_mod = @import("config/config.zig");
 const context_assembly = @import("context/assembly.zig");
+const modelsdev = @import("models/registry.zig");
 const os = @import("os.zig");
 const plugin_prompt = @import("plugin_prompt.zig");
 const session_mod = @import("session.zig");
@@ -70,11 +71,22 @@ pub const AgentRuntime = struct {
     /// `compaction.contextWindowTokens` and the agent can use the
     /// compaction policy.
     context_settings: config_mod.ContextSettings = .{},
+    /// Runtime models.dev registry (cache-only, no network). Loaded once
+    /// at init for model capability lookups (reasoning, context window).
+    /// The TUI's lazy `loadOrFetchRegistry` refreshes the cache for next time.
+    modelsdev_registry: ?modelsdev.Registry = null,
     /// True once `initSession` has brought up `session_writer` (background
     /// thread + sqlite handle). Some TUI test harnesses construct a partial
     /// runtime with `session_writer = undefined`; gates session-DB writes so
     /// those harnesses can still exercise the picker without touching sqlite.
     session_writer_started: bool = false,
+
+    /// Look up per-model capability data from the runtime's models.dev registry.
+    /// Returns null when the registry isn't loaded or the model isn't found.
+    fn lookupModelInfo(self: *const AgentRuntime, model_id: []const u8) ?modelsdev.ModelInfo {
+        if (self.modelsdev_registry) |*reg| return reg.lookupModel(model_id);
+        return null;
+    }
 
     pub const ClientState = union(enum) {
         disconnected,
@@ -225,6 +237,15 @@ pub const AgentRuntime = struct {
             .strict_outputs = config.strict_outputs orelse false,
             .context_settings = config.context,
         };
+
+        // Load the models.dev registry (cache-only, no network) for model
+        // capability lookups (reasoning, context window). The TUI's lazy
+        // loadOrFetchRegistry refreshes the cache for next time. Skipped in
+        // test environments where home_dir is empty.
+        if (home_dir.len > 0) {
+            target.modelsdev_registry = modelsdev.loadRegistryCached(gpa, io, home_dir);
+            errdefer if (target.modelsdev_registry) |*reg| reg.deinit(gpa);
+        }
 
         if (session_id) |id| {
             try target.session_writer.initResumeDefault(gpa, io, home_dir, id);
@@ -439,6 +460,7 @@ pub const AgentRuntime = struct {
         if (self.owned_naming_client) |client| client.deinit(self.gpa);
         if (self.owned_compaction_client) |client| client.deinit(self.gpa);
         if (self.owned_client) |client| client.deinit(self.gpa);
+        if (self.modelsdev_registry) |*reg| reg.deinit(self.gpa);
         for (self.diagnostics) |*d| d.deinit(self.gpa);
         self.gpa.free(self.diagnostics);
         self.* = undefined;
@@ -626,7 +648,8 @@ pub const AgentRuntime = struct {
         });
         errdefer client.deinit();
         self.replaceClient(.{ .codex_responses = client });
-        self.agent.context_window_tokens = compaction.contextWindowTokens(model_id, self.context_settings.override_context_window);
+        const model_info = self.lookupModelInfo(model_id);
+        self.agent.context_window_tokens = compaction.contextWindowTokens(model_info, self.context_settings.override_context_window);
         self.agent.resetContextUsage();
 
         attach_compaction: {
@@ -706,6 +729,7 @@ pub const AgentRuntime = struct {
         model_id: []const u8,
         effort: ai.ReasoningEffort,
     ) !void {
+        const model_info = self.lookupModelInfo(model_id);
         const client = try self.gpa.create(ai.openai_compatible.Client);
         errdefer self.gpa.destroy(client);
         try client.init(self.gpa, self.io, .{
@@ -717,6 +741,7 @@ pub const AgentRuntime = struct {
             .reasoning = .{ .effort = effort },
             .strict = self.strict_outputs,
             .wire_dialect = self.wire_dialect,
+            .is_reasoning_model = compaction.isReasoningModel(model_info),
             .max_output_tokens = self.context_settings.max_output_tokens,
             .max_parallel_tool_calls = self.context_settings.max_parallel_tool_calls orelse 16,
             .request_timeout_seconds = self.context_settings.request_timeout_seconds orelse 300,
@@ -725,7 +750,7 @@ pub const AgentRuntime = struct {
         });
         errdefer client.deinit();
         self.replaceClient(.{ .openai_compatible = client });
-        self.agent.context_window_tokens = compaction.contextWindowTokens(model_id, self.context_settings.override_context_window);
+        self.agent.context_window_tokens = compaction.contextWindowTokens(model_info, self.context_settings.override_context_window);
         self.agent.resetContextUsage();
 
         attach_compaction: {
@@ -740,6 +765,7 @@ pub const AgentRuntime = struct {
                 // same wire dialect (DashScope's top-level enable_thinking vs
                 // reasoning_effort) and honor the user's request timeout (H2).
                 .wire_dialect = self.wire_dialect,
+                .is_reasoning_model = compaction.isReasoningModel(model_info),
                 .request_timeout_seconds = self.context_settings.request_timeout_seconds orelse 300,
                 .disable_prompt_cache = self.disable_prompt_cache,
             }) catch {
@@ -756,6 +782,7 @@ pub const AgentRuntime = struct {
                 .model = model_id,
                 .tools = &.{},
                 .reasoning = .{ .effort = effort },
+                .is_reasoning_model = compaction.isReasoningModel(model_info),
                 .disable_prompt_cache = self.disable_prompt_cache,
             }) catch {
                 self.gpa.destroy(naming_client);
@@ -772,6 +799,7 @@ pub const AgentRuntime = struct {
         model_id: []const u8,
         reasoning: ai.Reasoning,
     ) !void {
+        const model_info = self.lookupModelInfo(model_id);
         const client = try self.gpa.create(ai.openai_responses.Client);
         errdefer self.gpa.destroy(client);
         try client.init(self.gpa, self.io, .{
@@ -788,7 +816,7 @@ pub const AgentRuntime = struct {
         });
         errdefer client.deinit();
         self.replaceClient(.{ .openai_responses = client });
-        self.agent.context_window_tokens = compaction.contextWindowTokens(model_id, self.context_settings.override_context_window);
+        self.agent.context_window_tokens = compaction.contextWindowTokens(model_info, self.context_settings.override_context_window);
         self.agent.resetContextUsage();
 
         attach_compaction: {

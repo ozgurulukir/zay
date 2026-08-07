@@ -1272,6 +1272,7 @@ test "codex sign-in survives selecting local compatible provider" {
     runtime.owned_client = null;
     runtime.owned_compaction_client = null;
     runtime.owned_naming_client = null;
+    runtime.modelsdev_registry = null;
     runtime.naming_client = .none;
     var app = try App.init(std.testing.io, gpa, &runtime.agent);
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
@@ -1315,6 +1316,7 @@ test "switching from codex to catalogue provider resets cached connection" {
     runtime.owned_client = null;
     runtime.owned_compaction_client = null;
     runtime.owned_naming_client = null;
+    runtime.modelsdev_registry = null;
     runtime.naming_client = .none;
     defer runtime.disconnectClient();
 
@@ -1659,6 +1661,7 @@ test "model selection is allowed after interrupt" {
     runtime.owned_client = null;
     runtime.owned_compaction_client = null;
     runtime.owned_naming_client = null;
+    runtime.modelsdev_registry = null;
     runtime.naming_client = .none;
     var app = try App.init(std.testing.io, gpa, &runtime.agent);
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
@@ -1702,6 +1705,7 @@ test "interrupt restart flushes queued messages to the transcript when no provid
     runtime.owned_client = null;
     runtime.owned_compaction_client = null;
     runtime.owned_naming_client = null;
+    runtime.modelsdev_registry = null;
     runtime.naming_client = .none;
     var app = try App.init(std.testing.io, gpa, &runtime.agent);
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };

@@ -1524,6 +1524,7 @@ test "lane workspace ops create → enter → merge(refused) → leave → merge
     runtime.owned_client = null;
     runtime.owned_compaction_client = null;
     runtime.owned_naming_client = null;
+    runtime.modelsdev_registry = null;
     runtime.naming_client = .none;
     var app = try tui.App.init(io, gpa, &runtime.agent);
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
@@ -1828,6 +1829,7 @@ test "lane create uses purpose as the idle lane's title" {
     runtime.owned_client = null;
     runtime.owned_compaction_client = null;
     runtime.owned_naming_client = null;
+    runtime.modelsdev_registry = null;
     runtime.naming_client = .none;
     runtime.skills = &.{};
     runtime.plugin_prompts = &.{};
@@ -2396,6 +2398,7 @@ const GitFixture = struct {
         runtime.owned_client = null;
         runtime.owned_compaction_client = null;
         runtime.owned_naming_client = null;
+        runtime.modelsdev_registry = null;
         runtime.naming_client = .none;
         runtime.skills = &.{};
         runtime.plugin_prompts = &.{};

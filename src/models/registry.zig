@@ -53,14 +53,26 @@ pub const Provider = struct {
     anonymous_key: ?[]const u8 = null,
 };
 
+/// Per-model capability data extracted from the models.dev `api.json`.
+/// All string fields are borrowed from the registry's backing store.
+pub const ModelInfo = struct {
+    id: []const u8,
+    reasoning: bool,
+    context_window: u32,
+};
+
 /// The merged, deduplicated provider list. Owns all string memory.
 pub const Registry = struct {
     providers: []Provider,
+    /// Flat list of all models across all providers, from `api.json`.
+    /// Empty when only builtins are available (no remote fetch).
+    models: []ModelInfo = &.{},
     /// Backing store for all string fields. Freed in deinit.
     strings: std.ArrayList(u8),
 
     pub fn deinit(self: *Registry, gpa: std.mem.Allocator) void {
         gpa.free(self.providers);
+        if (self.models.len > 0) gpa.free(self.models);
         self.strings.deinit(gpa);
         self.* = undefined;
     }
@@ -72,7 +84,45 @@ pub const Registry = struct {
         }
         return null;
     }
+
+    /// Look up per-model capability data by model id. Strips any provider
+    /// prefix (`openai/gpt-4o` → `gpt-4o`), then tries exact match, then
+    /// longest-prefix match across a segment boundary (so `gpt-5-2025-08-07`
+    /// resolves to `gpt-5`). Returns null when no match is found.
+    pub fn lookupModel(self: *const Registry, raw_model_id: []const u8) ?ModelInfo {
+        var model_id = raw_model_id;
+        while (std.mem.indexOfScalar(u8, model_id, '/')) |slash| {
+            model_id = model_id[slash + 1 ..];
+        }
+
+        // Exact match first.
+        for (self.models) |m| {
+            if (std.mem.eql(u8, m.id, model_id)) return m;
+        }
+
+        // Longest-prefix match across a segment boundary.
+        var best: ?ModelInfo = null;
+        for (self.models) |m| {
+            if (m.id.len > model_id.len) continue;
+            if (!std.mem.startsWith(u8, model_id, m.id)) continue;
+            if (!segmentBoundary(model_id, m.id.len)) continue;
+            if (best == null or m.id.len > best.?.id.len) best = m;
+        }
+        return best;
+    }
 };
+
+/// True when `prefix_len` is the whole model id, or the character right after
+/// the prefix is a segment separator (`-`, `.`, `_`, `:`). Guards family-prefix
+/// matching against longer ids of a different family (e.g. `gpt-4` must not
+/// match `gpt-4o`).
+fn segmentBoundary(model_id: []const u8, prefix_len: usize) bool {
+    if (model_id.len == prefix_len) return true;
+    return switch (model_id[prefix_len]) {
+        '-', '.', '_', ':' => true,
+        else => false,
+    };
+}
 
 /// Builtin providers shipped with the binary. These always take precedence
 /// over models.dev entries with the same id.
@@ -276,21 +326,35 @@ pub fn fetchAndCache(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !
 /// newly added providers are visible immediately; falls back to cache, the
 /// vendored snapshot, or builtins when offline.
 pub fn loadOrFetchRegistry(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) Registry {
+    return loadRegistryImpl(gpa, io, home_dir, true);
+}
+
+/// Like `loadOrFetchRegistry` but skips the network fetch — uses only cache,
+/// vendored snapshot, or builtins. Suitable for runtime paths where blocking
+/// on network I/O is undesirable (e.g. model capability lookup at attach time).
+/// The TUI's lazy `loadOrFetchRegistry` call refreshes the cache for next time.
+pub fn loadRegistryCached(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) Registry {
+    return loadRegistryImpl(gpa, io, home_dir, false);
+}
+
+fn loadRegistryImpl(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, allow_network: bool) Registry {
     const builtins = loadBuiltins();
 
     // Try network first so the picker always shows the latest providers.
-    if (fetchAndCache(gpa, io, home_dir)) |fetched| {
-        var f = fetched;
-        defer f.deinit(gpa);
-        log.info("modelsdev.fetch.ok remote_providers={d}", .{f.providers.len});
-        if (buildRegistry(gpa, builtins, &f)) |merged| {
-            log.info("modelsdev.registry.merged total={d} builtins={d} remote={d}", .{ merged.providers.len, builtins.len, f.providers.len });
-            return merged;
+    if (allow_network) {
+        if (fetchAndCache(gpa, io, home_dir)) |fetched| {
+            var f = fetched;
+            defer f.deinit(gpa);
+            log.info("modelsdev.fetch.ok remote_providers={d}", .{f.providers.len});
+            if (buildRegistry(gpa, builtins, &f)) |merged| {
+                log.info("modelsdev.registry.merged total={d} builtins={d} remote={d}", .{ merged.providers.len, builtins.len, f.providers.len });
+                return merged;
+            } else |err| {
+                log.warn("modelsdev.build.failed err={s}", .{@errorName(err)});
+            }
         } else |err| {
-            log.warn("modelsdev.build.failed err={s}", .{@errorName(err)});
+            log.warn("modelsdev.fetch.failed err={s}", .{@errorName(err)});
         }
-    } else |err| {
-        log.warn("modelsdev.fetch.failed err={s}", .{@errorName(err)});
     }
 
     if (loadCache(gpa, io, home_dir) catch null) |cached| {
@@ -387,6 +451,20 @@ const UnresolvedProvider = struct {
     }
 };
 
+const UnresolvedModel = struct {
+    id: StringRef,
+    reasoning: bool,
+    context_window: u32,
+
+    fn resolve(self: UnresolvedModel, buf: []const u8) ModelInfo {
+        return .{
+            .id = self.id.slice(buf),
+            .reasoning = self.reasoning,
+            .context_window = self.context_window,
+        };
+    }
+};
+
 /// Build the full merged registry: builtins first, then models.dev providers
 /// that don't shadow a builtin id. Caller owns the returned Registry.
 pub fn buildRegistry(gpa: std.mem.Allocator, builtins: []const Provider, remote_registry: *const Registry) !Registry {
@@ -432,8 +510,29 @@ pub fn buildRegistry(gpa: std.mem.Allocator, builtins: []const Provider, remote_
         providers[i] = item.resolve(strings.items);
     }
 
+    // Carry over model-level data from the remote registry. Builtin providers
+    // don't carry model data; it all comes from api.json.
+    var unresolved_models: std.ArrayList(UnresolvedModel) = .empty;
+    defer unresolved_models.deinit(gpa);
+    for (remote_registry.models) |m| {
+        try unresolved_models.append(gpa, .{
+            .id = try appendString(gpa, &strings, m.id),
+            .reasoning = m.reasoning,
+            .context_window = m.context_window,
+        });
+    }
+    const models: []ModelInfo = if (unresolved_models.items.len > 0) blk: {
+        const m = try gpa.alloc(ModelInfo, unresolved_models.items.len);
+        errdefer gpa.free(m);
+        for (unresolved_models.items, 0..) |item, i| {
+            m[i] = item.resolve(strings.items);
+        }
+        break :blk m;
+    } else &.{};
+
     return .{
         .providers = providers,
+        .models = models,
         .strings = strings,
     };
 }
@@ -571,6 +670,9 @@ fn parseModelsDevJson(gpa: std.mem.Allocator, bytes: []const u8) !Registry {
     var unresolved: std.ArrayList(UnresolvedProvider) = .empty;
     defer unresolved.deinit(gpa);
 
+    var unresolved_models: std.ArrayList(UnresolvedModel) = .empty;
+    defer unresolved_models.deinit(gpa);
+
     var it = parsed.value.object.iterator();
     while (it.next()) |kv| {
         if (kv.value_ptr.* != .object) continue;
@@ -601,6 +703,30 @@ fn parseModelsDevJson(gpa: std.mem.Allocator, bytes: []const u8) !Registry {
             .adapter = .openai_compatible,
             .requires_api_key = true,
         });
+
+        // Extract per-model capability data (reasoning, context window).
+        var model_it = models_field.object.iterator();
+        while (model_it.next()) |mkv| {
+            if (mkv.value_ptr.* != .object) continue;
+            const reasoning = blk: {
+                const r = mkv.value_ptr.object.get("reasoning") orelse break :blk false;
+                if (r == .bool) break :blk r.bool;
+                break :blk false;
+            };
+            const context_window = blk: {
+                const limit_field = mkv.value_ptr.object.get("limit") orelse break :blk 0;
+                if (limit_field != .object) break :blk 0;
+                const ctx = limit_field.object.get("context") orelse break :blk 0;
+                if (ctx != .integer) break :blk 0;
+                if (ctx.integer < 0) break :blk 0;
+                break :blk @as(u32, @intCast(ctx.integer));
+            };
+            try unresolved_models.append(gpa, .{
+                .id = try appendString(gpa, &strings, mkv.key_ptr.*),
+                .reasoning = reasoning,
+                .context_window = context_window,
+            });
+        }
     }
 
     const providers = try gpa.alloc(Provider, unresolved.items.len);
@@ -610,8 +736,18 @@ fn parseModelsDevJson(gpa: std.mem.Allocator, bytes: []const u8) !Registry {
         providers[i] = item.resolve(strings.items);
     }
 
+    const models: []ModelInfo = if (unresolved_models.items.len > 0) blk: {
+        const m = try gpa.alloc(ModelInfo, unresolved_models.items.len);
+        errdefer gpa.free(m);
+        for (unresolved_models.items, 0..) |item, i| {
+            m[i] = item.resolve(strings.items);
+        }
+        break :blk m;
+    } else &.{};
+
     return .{
         .providers = providers,
+        .models = models,
         .strings = strings,
     };
 }
@@ -683,6 +819,51 @@ test "parseModelsDevJson includes any provider with api field and models" {
     try std.testing.expectEqualStrings("kimi-for-coding", registry.providers[2].id);
     try std.testing.expectEqualStrings("Kimi for Coding", registry.providers[2].name);
     try std.testing.expectEqualStrings("https://api.kimi.com/coding/v1", registry.providers[2].base_url);
+}
+
+test "parseModelsDevJson extracts model-level reasoning and context window" {
+    const gpa = std.testing.allocator;
+    const json =
+        \\{
+        \\  "openai": {
+        \\    "api": "https://api.openai.com/v1",
+        \\    "name": "OpenAI",
+        \\    "models": {
+        \\      "gpt-4o": { "reasoning": false, "limit": { "context": 128000 } },
+        \\      "gpt-5": { "reasoning": true, "limit": { "context": 400000 } },
+        \\      "no-limit": { "reasoning": true }
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var registry = try parseModelsDevJson(gpa, json);
+    defer registry.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 3), registry.models.len);
+
+    // Exact match.
+    const gpt4o = registry.lookupModel("gpt-4o").?;
+    try std.testing.expect(!gpt4o.reasoning);
+    try std.testing.expectEqual(@as(u32, 128_000), gpt4o.context_window);
+
+    const gpt5 = registry.lookupModel("gpt-5").?;
+    try std.testing.expect(gpt5.reasoning);
+    try std.testing.expectEqual(@as(u32, 400_000), gpt5.context_window);
+
+    // Missing limit defaults to 0.
+    const no_limit = registry.lookupModel("no-limit").?;
+    try std.testing.expect(no_limit.reasoning);
+    try std.testing.expectEqual(@as(u32, 0), no_limit.context_window);
+
+    // Provider prefix is stripped.
+    try std.testing.expectEqual(gpt5.id, registry.lookupModel("openai/gpt-5").?.id);
+
+    // Longest-prefix match: dated variant resolves to base family.
+    try std.testing.expectEqual(gpt5.id, registry.lookupModel("gpt-5-2025-08-07").?.id);
+
+    // Unknown model returns null.
+    try std.testing.expect(registry.lookupModel("unknown-model") == null);
 }
 
 test "buildRegistry merges builtins and remote, builtins win" {

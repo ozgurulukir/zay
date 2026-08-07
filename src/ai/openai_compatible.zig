@@ -177,6 +177,7 @@ pub const Client = struct {
             self.config.max_output_tokens,
             self.config.wire_dialect,
             disable_cache,
+            self.config.is_reasoning_model,
         );
         const req_body_log = try logBytes(self.gpa, payload.written());
         defer if (req_body_log.ptr != payload.written().ptr) self.gpa.free(req_body_log);
@@ -233,6 +234,7 @@ pub const Client = struct {
                                 self.config.max_output_tokens,
                                 self.config.wire_dialect,
                                 disable_cache,
+                                self.config.is_reasoning_model,
                             );
                             log.warn("openai_compatible.cache_downgrade retrying without cache_control/prompt_cache_key after HTTP 400", .{});
                             break; // break inner loop → outer loop re-runs the full retry budget on the stripped payload
@@ -729,6 +731,7 @@ fn writeRequestPayload(
     max_output_tokens: ?u32,
     dialect: ai.WireDialect,
     disable_prompt_cache: bool,
+    is_reasoning_model: bool,
 ) !void {
     // Real early returns — these MUST survive into the ReleaseFast install
     // build. `std.debug.assert` compiles to `unreachable` (UB) in ReleaseFast,
@@ -755,8 +758,17 @@ fn writeRequestPayload(
     // carry no token counts. Some OpenAI-compatible servers ignore it, so the
     // parser treats usage as optional.
     try out.writeAll("],\"stream\":true,\"stream_options\":{\"include_usage\":true}");
+    // OpenAI reasoning models (o-series, gpt-5) ignore the legacy `max_tokens`
+    // field; the openai-compatible provider maps it to `max_completion_tokens`
+    // for them. Emit `max_completion_tokens` only for the OpenAI-native dialect
+    // on a reasoning model; all other dialects keep `max_tokens`, the
+    // universally-supported field.
     if (max_output_tokens) |mot| {
-        try out.writeAll(",\"max_tokens\":");
+        if (dialect == .openai and is_reasoning_model) {
+            try out.writeAll(",\"max_completion_tokens\":");
+        } else {
+            try out.writeAll(",\"max_tokens\":");
+        }
         try out.print("{d}", .{mot});
     }
     if (!std.mem.eql(u8, tools_json, "[]")) {
@@ -789,14 +801,25 @@ fn writeRequestPayload(
         .none => {
             if (dialect.usesEnableThinking()) {
                 try out.writeAll(",\"enable_thinking\":false}");
+            } else if (dialect == .openrouter) {
+                // OpenRouter controls reasoning via the `reasoning` object,
+                // not the OpenAI-native `reasoning_effort` field. `none` is a
+                // valid effort level (see openrouter.ai/docs/guides/best-practices/reasoning-tokens).
+                try out.writeAll(",\"reasoning\":{\"effort\":\"none\"}}");
             } else {
                 try out.writeAll(",\"reasoning_effort\":\"none\"}");
             }
         },
         else => {
-            try out.writeAll(",\"reasoning_effort\":\"");
-            try out.writeAll(value.label());
-            try out.writeAll("\"}");
+            if (dialect == .openrouter) {
+                try out.writeAll(",\"reasoning\":{\"effort\":\"");
+                try out.writeAll(value.label());
+                try out.writeAll("\"}}");
+            } else {
+                try out.writeAll(",\"reasoning_effort\":\"");
+                try out.writeAll(value.label());
+                try out.writeAll("\"}");
+            }
         },
     }
 }
@@ -1150,7 +1173,7 @@ test "writeRequestPayload disables thinking for reasoning effort none" {
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
     // DashScope dialect uses enable_thinking:false
-    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "", &.{}, "[]", .{ .effort = .none }, null, .dashscope, false);
+    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "", &.{}, "[]", .{ .effort = .none }, null, .dashscope, false, false);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_effort") == null);
@@ -1160,17 +1183,86 @@ test "writeRequestPayload uses reasoning_effort none for minimal dialect" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "ollama-model", "", &.{}, "[]", .{ .effort = .none }, null, .minimal, false);
+    try writeRequestPayload(gpa, &payload.writer, "ollama-model", "", &.{}, "[]", .{ .effort = .none }, null, .minimal, false, false);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"none\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "enable_thinking") == null);
+}
+
+test "writeRequestPayload uses reasoning object for openrouter dialect" {
+    // OpenRouter controls reasoning via the `reasoning` object, not the
+    // OpenAI-native `reasoning_effort` field. See
+    // openrouter.ai/docs/guides/best-practices/reasoning-tokens.
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "anthropic/claude-opus-5", "", &.{}, "[]", .{ .effort = .high }, null, .openrouter, false, false);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"high\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_effort") == null);
+}
+
+test "writeRequestPayload uses reasoning object with none for openrouter dialect" {
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "anthropic/claude-opus-5", "", &.{}, "[]", .{ .effort = .none }, null, .openrouter, false, false);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"none\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_effort") == null);
+}
+
+test "writeRequestPayload omits reasoning object for openrouter default effort" {
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "anthropic/claude-opus-5", "", &.{}, "[]", .{ .effort = .default }, null, .openrouter, false, false);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "reasoning") == null);
+}
+
+test "writeRequestPayload emits max_completion_tokens for openai reasoning models" {
+    // OpenAI reasoning models (o-series, gpt-5) ignore the legacy `max_tokens`
+    // field; the openai-compatible provider maps it to `max_completion_tokens`.
+    // The OpenAI-native dialect on a reasoning model must emit the latter.
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "gpt-5", "", &.{}, "[]", .{ .effort = .high }, 4096, .openai, false, true);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\"") == null);
+}
+
+test "writeRequestPayload keeps max_tokens for openai non-reasoning models" {
+    // A non-reasoning OpenAI model (gpt-4o) keeps the legacy `max_tokens`.
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "gpt-4o", "", &.{}, "[]", .{ .effort = .high }, 4096, .openai, false, false);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\"") == null);
+}
+
+test "writeRequestPayload keeps max_tokens for non-openai reasoning models" {
+    // The max_completion_tokens mapping is OpenAI-native only; other dialects
+    // (minimal, openrouter) keep the universally-supported `max_tokens` even
+    // for reasoning models.
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "deepseek-reasoner", "", &.{}, "[]", .{ .effort = .high }, 4096, .minimal, false, true);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\"") == null);
 }
 
 test "writeRequestPayload emits prompt_cache_key from the session id" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "gpt-test", "session-abc", &.{}, "[]", null, null, .openai, false);
+    try writeRequestPayload(gpa, &payload.writer, "gpt-test", "session-abc", &.{}, "[]", null, null, .openai, false, false);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"session-abc\"") != null);
 }
@@ -1179,7 +1271,7 @@ test "writeRequestPayload omits prompt_cache_key for minimal dialect" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "ollama-model", "session-abc", &.{}, "[]", null, null, .minimal, false);
+    try writeRequestPayload(gpa, &payload.writer, "ollama-model", "session-abc", &.{}, "[]", null, null, .minimal, false, false);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_key") == null);
 }
@@ -1188,7 +1280,7 @@ test "writeRequestPayload omits prompt_cache_key when no session id is set" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "", &.{}, "[]", null, null, .openai, false);
+    try writeRequestPayload(gpa, &payload.writer, "qwen-test", "", &.{}, "[]", null, null, .openai, false, false);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_key") == null);
 }
@@ -1205,7 +1297,7 @@ test "writeRequestPayload suppresses cache_control when disable_prompt_cache is 
 
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "inclusionai/ling-3.0-flash:free", "sess-abc", &views, "[]", null, null, .openrouter, true);
+    try writeRequestPayload(gpa, &payload.writer, "inclusionai/ling-3.0-flash:free", "sess-abc", &views, "[]", null, null, .openrouter, true, false);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "cache_control") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_key") == null);
@@ -1223,7 +1315,7 @@ test "writeRequestPayload emits cache_control when disable_prompt_cache is false
 
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "inclusionai/ling-3.0-flash:free", "sess-abc", &views, "[]", null, null, .openrouter, false);
+    try writeRequestPayload(gpa, &payload.writer, "inclusionai/ling-3.0-flash:free", "sess-abc", &views, "[]", null, null, .openrouter, false, false);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"sess-abc\"") != null);
@@ -1235,7 +1327,7 @@ test "writeRequestPayload omits tools and tool_choice when there are none" {
     defer payload.deinit();
     // The background summarizer sends no tools ("[]"); the request must not carry
     // a `tool_choice` (rejected by strict providers) or invite a tool-call reply.
-    try writeRequestPayload(gpa, &payload.writer, "summarizer", "", &.{}, "[]", null, null, .minimal, false);
+    try writeRequestPayload(gpa, &payload.writer, "summarizer", "", &.{}, "[]", null, null, .minimal, false, false);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "tool_choice") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") == null);
@@ -1258,7 +1350,7 @@ test "writeRequestPayload repairs invalid UTF-8 in a user message text block" {
 
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "summarizer", "", &views, "[]", null, null, .minimal, false);
+    try writeRequestPayload(gpa, &payload.writer, "summarizer", "", &views, "[]", null, null, .minimal, false, false);
     const body = payload.written();
     // The text must be a JSON string, not an array of integers.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":[") == null);
@@ -1272,14 +1364,14 @@ test "writeRequestPayload rejects an empty model id with EmptyModelId" {
     defer payload.deinit();
     // Empty tools ("[]") is legal; empty model is not. The guard must be a real
     // early return that fires in ReleaseFast, not a stripped `unreachable`.
-    try std.testing.expectError(error.EmptyModelId, writeRequestPayload(gpa, &payload.writer, "", "", &.{}, "[]", null, null, .minimal, false));
+    try std.testing.expectError(error.EmptyModelId, writeRequestPayload(gpa, &payload.writer, "", "", &.{}, "[]", null, null, .minimal, false, false));
 }
 
 test "writeRequestPayload keeps tools and tool_choice when tools are present" {
     const gpa = std.testing.allocator;
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "agent", "", &.{}, "[{\"type\":\"function\"}]", null, null, .minimal, false);
+    try writeRequestPayload(gpa, &payload.writer, "agent", "", &.{}, "[{\"type\":\"function\"}]", null, null, .minimal, false, false);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"auto\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":[{\"type\":\"function\"}]") != null);
@@ -1314,7 +1406,7 @@ test "writeRequestPayload serializes tool call ids as strings, not objects" {
 
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "test-model", "", &views, "[{\"type\":\"function\"}]", null, null, .minimal, false);
+    try writeRequestPayload(gpa, &payload.writer, "test-model", "", &views, "[{\"type\":\"function\"}]", null, null, .minimal, false, false);
     const body = payload.written();
 
     // The tool_call id must be a JSON string, not an object
@@ -1378,7 +1470,7 @@ test "writeRequestPayload ships the full tools array for OpenRouter byte-for-byt
 
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(gpa, &payload.writer, "inclusionai/ling-3.0-flash:free", "session-abc", &views, tools_json, null, null, .openrouter, false);
+    try writeRequestPayload(gpa, &payload.writer, "inclusionai/ling-3.0-flash:free", "session-abc", &views, tools_json, null, null, .openrouter, false, false);
     const body = payload.written();
 
     // Payload gerçekten JSON parse edilebilir olmalı (kırpılmamış, geçerli).
@@ -1445,12 +1537,12 @@ test "ollama_cloud(minimal) vs openrouter dialect: identical tools array, only c
     // .minimal = ollama_cloud'ın çözümü; .openrouter = openrouter'ın çözümü.
     var payload_min: std.Io.Writer.Allocating = .init(gpa);
     defer payload_min.deinit();
-    try writeRequestPayload(gpa, &payload_min.writer, "gemma4:31b", "", &views, tools_json, null, null, .minimal, false);
+    try writeRequestPayload(gpa, &payload_min.writer, "gemma4:31b", "", &views, tools_json, null, null, .minimal, false, false);
     const body_min = payload_min.written();
 
     var payload_or: std.Io.Writer.Allocating = .init(gpa);
     defer payload_or.deinit();
-    try writeRequestPayload(gpa, &payload_or.writer, "inclusionai/ling-3.0-flash:free", "sess", &views, tools_json, null, null, .openrouter, false);
+    try writeRequestPayload(gpa, &payload_or.writer, "inclusionai/ling-3.0-flash:free", "sess", &views, tools_json, null, null, .openrouter, false, false);
     const body_or = payload_or.written();
 
     // 1. tools array'i İKİSİNDE DE aynıdır — byte-for-byte.
@@ -1731,6 +1823,31 @@ test "parse streaming usage chunk" {
     try std.testing.expectEqual(@as(u32, 1540), change.usage.?.total_tokens);
 }
 
+test "parse streaming usage chunk captures cached and reasoning token details" {
+    // The chat-completions parser must populate the same cached/reasoning
+    // breakdown the Responses API parser does, so both wire dialects report
+    // `ai.Usage` consistently (mirrors the openai-compatible provider's
+    // `prompt_tokens_details.cached_tokens` / `completion_tokens_details.reasoning_tokens`).
+    const gpa = std.testing.allocator;
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
+    var stream: stream_parser.ToolCallStream = .{};
+    defer stream.deinit(gpa);
+
+    const change = try stream_parser.parseStreamChunk(gpa,
+        \\{"choices":[],"usage":{"prompt_tokens":2000,"prompt_tokens_details":{"cached_tokens":1500},"completion_tokens":420,"completion_tokens_details":{"reasoning_tokens":256},"total_tokens":2420}}
+    , &content, &reasoning, &stream);
+
+    try std.testing.expect(change.usage != null);
+    try std.testing.expectEqual(@as(u32, 2000), change.usage.?.input_tokens);
+    try std.testing.expectEqual(@as(u32, 1500), change.usage.?.cached_input_tokens);
+    try std.testing.expectEqual(@as(u32, 420), change.usage.?.output_tokens);
+    try std.testing.expectEqual(@as(u32, 256), change.usage.?.reasoning_tokens);
+    try std.testing.expectEqual(@as(u32, 2420), change.usage.?.total_tokens);
+}
+
 test "content chunk carries null usage" {
     const gpa = std.testing.allocator;
     var content: std.ArrayList(u8) = .empty;
@@ -1745,6 +1862,29 @@ test "content chunk carries null usage" {
     , &content, &reasoning, &stream);
 
     try std.testing.expect(change.usage == null);
+}
+
+test "parse streaming usage tolerates null token details sub-objects" {
+    // Some providers send `prompt_tokens_details: null` / `completion_tokens_details: null`
+    // (the openai-compatible schema marks them nullish). The parser must not
+    // fail the whole stream on a null nested object.
+    const gpa = std.testing.allocator;
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
+    var stream: stream_parser.ToolCallStream = .{};
+    defer stream.deinit(gpa);
+
+    const change = try stream_parser.parseStreamChunk(gpa,
+        \\{"choices":[],"usage":{"prompt_tokens":100,"prompt_tokens_details":null,"completion_tokens":50,"completion_tokens_details":null,"total_tokens":150}}
+    , &content, &reasoning, &stream);
+
+    try std.testing.expect(change.usage != null);
+    try std.testing.expectEqual(@as(u32, 100), change.usage.?.input_tokens);
+    try std.testing.expectEqual(@as(u32, 0), change.usage.?.cached_input_tokens);
+    try std.testing.expectEqual(@as(u32, 0), change.usage.?.reasoning_tokens);
+    try std.testing.expectEqual(@as(u32, 150), change.usage.?.total_tokens);
 }
 
 test "parse streaming tool calls deduplicates repeated tool names (bashbash fix)" {

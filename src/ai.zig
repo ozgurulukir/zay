@@ -156,6 +156,11 @@ pub const Config = struct {
     /// Resolved at client-attach time from provider identity.
     /// Default `.minimal` is safe for all providers.
     wire_dialect: WireDialect = .minimal,
+    /// Whether the active model is a reasoning model (o-series, gpt-5, etc.),
+    /// from the runtime models.dev registry. Reasoning models ignore the
+    /// legacy `max_tokens` field, so the OpenAI-native dialect emits
+    /// `max_completion_tokens` instead. Default `false` — the safe direction.
+    is_reasoning_model: bool = false,
     /// Disable provider prompt-caching fields entirely (C1). When true,
     /// neither message-level `cache_control` (OpenRouter) nor top-level
     /// `prompt_cache_key` (OpenAI/OpenRouter) is emitted, in BOTH wire

@@ -263,14 +263,17 @@ fn parseUsageValue(scanner: *Scanner, usage: *?ai.Usage) !void {
     usage.* = try parseUsageObject(scanner);
 }
 
-/// Parse the chat-completions usage object. Only the top-level totals are
-/// captured; the optional `*_tokens_details` sub-objects are skipped (their
-/// cached/reasoning breakdown is informational and not needed for budgeting).
+/// Parse the chat-completions usage object. Captures the top-level totals
+/// plus the optional `*_tokens_details` sub-objects (cached input tokens and
+/// reasoning output tokens), mirroring the Responses API parser so both wire
+/// dialects populate `ai.Usage` consistently.
 fn parseUsageObject(scanner: *Scanner) !ai.Usage {
     try expectObjectBegin(scanner);
     var input_tokens: i64 = 0;
     var output_tokens: i64 = 0;
     var total_tokens: i64 = 0;
+    var cached_input_tokens: i64 = 0;
+    var reasoning_tokens: i64 = 0;
     while (try nextObjectKey(scanner)) |key| {
         if (std.mem.eql(u8, key, "prompt_tokens")) {
             input_tokens = try nextInteger(scanner);
@@ -278,6 +281,10 @@ fn parseUsageObject(scanner: *Scanner) !ai.Usage {
             output_tokens = try nextInteger(scanner);
         } else if (std.mem.eql(u8, key, "total_tokens")) {
             total_tokens = try nextInteger(scanner);
+        } else if (std.mem.eql(u8, key, "prompt_tokens_details")) {
+            cached_input_tokens = try parseNestedInteger(scanner, "cached_tokens");
+        } else if (std.mem.eql(u8, key, "completion_tokens_details")) {
+            reasoning_tokens = try parseNestedInteger(scanner, "reasoning_tokens");
         } else {
             try scanner.skipValue();
         }
@@ -286,7 +293,32 @@ fn parseUsageObject(scanner: *Scanner) !ai.Usage {
         .input_tokens = ai.clampTokenCount(input_tokens),
         .output_tokens = ai.clampTokenCount(output_tokens),
         .total_tokens = ai.clampTokenCount(total_tokens),
+        .cached_input_tokens = ai.clampTokenCount(cached_input_tokens),
+        .reasoning_tokens = ai.clampTokenCount(reasoning_tokens),
     };
+}
+
+/// Parse an integer field from a nested object, skipping the rest of the
+/// object. Returns 0 when the field is absent, not an integer, or the nested
+/// value is not an object (some providers send `prompt_tokens_details: null`).
+/// Mirrors the Responses API parser's leniency so a malformed details object
+/// never fails the whole stream.
+fn parseNestedInteger(scanner: *Scanner, field_name: []const u8) !i64 {
+    const peeked = try scanner.peekNextTokenType();
+    if (peeked != .object_begin) {
+        try scanner.skipValue();
+        return 0;
+    }
+    try expectObjectBegin(scanner);
+    var value: i64 = 0;
+    while (try nextObjectKey(scanner)) |key| {
+        if (std.mem.eql(u8, key, field_name)) {
+            value = try nextInteger(scanner);
+        } else {
+            try scanner.skipValue();
+        }
+    }
+    return value;
 }
 
 fn parseChoicesArray(
@@ -413,7 +445,21 @@ fn parseToolCallObject(
         }
     }
 
-    const logical = resolved_index orelse return;
+    // Some OpenAI-compatible providers (e.g. Google Gemini via the OpenAI
+    // compatibility layer) omit the `index` field entirely. Append such calls
+    // to the end so a missing index never silently drops the tool call. The
+    // same cap that guards explicit indices applies here — the remap arrays
+    // are sized `tool_call_array_cap`, so an unbounded append would overflow
+    // them.
+    const logical = resolved_index orelse blk: {
+        const next: u32 = @intCast(stream.builders.items.len);
+        if (next >= tool_call_array_cap) return error.TooManyToolCalls;
+        if (next >= stream.max_calls) {
+            log.warn("parseToolCall.reject index={d} exceeds max_parallel_tool_calls={d} model={s}", .{ next, stream.max_calls, stream.model });
+            return error.TooManyToolCalls;
+        }
+        break :blk next;
+    };
     while (stream.builders.items.len <= logical) try stream.builders.append(gpa, .{});
 
     // Detect ID collision: same logical index but a different tool-call ID.
@@ -542,6 +588,28 @@ fn appendStringValue(
     }
 }
 
+test "parse streaming tool call with no index appends to the end" {
+    // Some OpenAI-compatible providers (Google Gemini via the OpenAI compat
+    // layer) omit the `index` field. A missing index must not silently drop
+    // the tool call.
+    const gpa = std.testing.allocator;
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
+
+    _ = try parseStreamChunk(gpa,
+        \\{"choices":[{"delta":{"tool_calls":[{"id":"call_1","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}
+    , &content, &reasoning, &stream);
+
+    try std.testing.expectEqual(@as(usize, 1), stream.builders.items.len);
+    try std.testing.expectEqualStrings("call_1", stream.builders.items[0].id.items);
+    try std.testing.expectEqualStrings("bash", stream.builders.items[0].name.items);
+    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", stream.builders.items[0].arguments.items);
+}
+
 test "readStream rejects tool calls whose index exceeds max_calls" {
     // Regression guard for the L3 model-attribution change: the new `model`
     // param is accepted and never changes the over-cap rejection behaviour.
@@ -551,6 +619,24 @@ test "readStream rejects tool calls whose index exceeds max_calls" {
     // max_calls = 1, but the delta claims index 1 → reject.
     const stream =
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_x\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}}]}\n" ++
+        "data: [DONE]\n";
+    var reader: std.Io.Reader = .fixed(stream);
+    var tool_call_seq: u64 = 0;
+    try std.testing.expectError(
+        error.TooManyToolCalls,
+        readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 1, "ling-3.0-flash"),
+    );
+}
+
+test "readStream rejects index-less tool calls beyond max_calls" {
+    // The index-less fallback appends to the end; it must respect the same
+    // max_parallel_tool_calls cap so the remap arrays can't overflow.
+    const gpa = std.testing.allocator;
+    // max_calls = 1, but two index-less tool calls arrive → the second append
+    // would land at index 1, which exceeds the cap → reject.
+    const stream =
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_2\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}}]}\n" ++
         "data: [DONE]\n";
     var reader: std.Io.Reader = .fixed(stream);
     var tool_call_seq: u64 = 0;
