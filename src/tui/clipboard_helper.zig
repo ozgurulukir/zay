@@ -32,6 +32,10 @@ pub fn pasteToFocusedInput(app: *App, text: []const u8) !void {
         .provider_picker => {
             if (app.pickers.provider.stage == .form) {
                 try app.getProviderKeyInput().appendSlice(app.gpa, clean_text);
+                // Paste bypasses ProviderPicker.handle, so mark the key dirty
+                // here too — otherwise a pasted key over a pre-filled one stays
+                // masked and the user can't verify the paste.
+                app.pickers.provider.key_dirty = true;
             }
         },
         .settings => {
@@ -139,4 +143,7 @@ test "pasteToFocusedInput inserts text into provider key input in provider form"
 
     try pasteToFocusedInput(&app, "sk-proj-12345");
     try std.testing.expectEqualStrings("sk-proj-12345", app.input_buffers.provider_key.items);
+    // Paste bypasses ProviderPicker.handle, so it must mark the key dirty to
+    // reveal the pasted value for verification.
+    try std.testing.expect(app.pickers.provider.key_dirty);
 }

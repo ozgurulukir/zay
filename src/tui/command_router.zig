@@ -118,17 +118,20 @@ const ProviderPicker = struct {
 
             if (key.matches(vaxis.Key.backspace, .{})) {
                 app.popProviderKeyInput();
+                app.getProviderPicker().key_dirty = true;
                 return true;
             }
             if (key.text) |text| {
                 const trimmed = std.mem.trim(u8, text, "\r\n");
                 if (trimmed.len > 0) {
                     try app.getProviderKeyInput().appendSlice(app.gpa, trimmed);
+                    app.getProviderPicker().key_dirty = true;
                     return true;
                 }
             } else if (key.codepoint >= 32 and key.codepoint <= 126 and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
                 const byte: u8 = @intCast(key.codepoint);
                 try app.getProviderKeyInput().append(app.gpa, byte);
+                app.getProviderPicker().key_dirty = true;
                 return true;
             }
             // Swallow everything else (arrows, tab) — Enter/Esc are handled upstream.
@@ -667,6 +670,36 @@ test "provider picker setup form captures key codepoints and text without swallo
     try std.testing.expectEqualStrings("s", app.input_buffers.provider_key.items);
 
     try std.testing.expect(!try ProviderPicker.handle(&app, .{ .codepoint = vaxis.Key.enter }));
+}
+
+test "provider picker setup form marks the key dirty on any edit" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.pickers.provider.stage = .form;
+    try std.testing.expect(!app.pickers.provider.key_dirty);
+
+    // A codepoint edit marks it dirty.
+    _ = try ProviderPicker.handle(&app, .{ .codepoint = 's' });
+    try std.testing.expect(app.pickers.provider.key_dirty);
+
+    // Backspace keeps it dirty.
+    _ = try ProviderPicker.handle(&app, .{ .codepoint = vaxis.Key.backspace });
+    try std.testing.expect(app.pickers.provider.key_dirty);
+
+    // Enter does not mark it dirty (it submits, not edits).
+    app.pickers.provider.key_dirty = false;
+    _ = try ProviderPicker.handle(&app, .{ .codepoint = vaxis.Key.enter });
+    try std.testing.expect(!app.pickers.provider.key_dirty);
+
+    // A non-editing key (arrow) does not mark it dirty — a pre-filled key
+    // must stay masked until an actual edit.
+    app.pickers.provider.key_dirty = false;
+    _ = try ProviderPicker.handle(&app, .{ .codepoint = vaxis.Key.down });
+    try std.testing.expect(!app.pickers.provider.key_dirty);
 }
 
 test "provider picker setup form submit with empty key sets form_error" {

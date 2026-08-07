@@ -155,6 +155,7 @@ pub fn openProviderEntryForm(self: *App, handle: provider_picker.ProviderHandle)
     self.pickers.provider.stage = .form;
     self.pickers.provider.form_handle = handle;
     self.pickers.provider.form_error = null;
+    self.pickers.provider.key_dirty = false;
     self.input_buffers.provider_key.clearRetainingCapacity();
     if (self.provider_state.api_keys.get(handle.id())) |existing| {
         self.input_buffers.provider_key.appendSlice(self.gpa, existing) catch {};

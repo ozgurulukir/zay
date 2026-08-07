@@ -97,6 +97,10 @@ pub const State = struct {
     column: Column = .provider,
     form_handle: ?ProviderHandle = null,
     form_error: ?[]const u8 = null,
+    /// True once the user has typed/pasted into the key field. While false
+    /// (a pre-filled existing key), the value stays masked; once true, the
+    /// live input renders in plaintext so paste correctness is verifiable.
+    key_dirty: bool = false,
     /// Merged provider list: builtins → models.dev → config (later overrides).
     entries: []const ProviderHandle = &.{},
 
@@ -288,10 +292,13 @@ pub const Content = struct {
         const label = if (requires_key) "API Key: " else "API Key (optional): ";
         try panel.lineStyledAt(surface, key_row, label, ctx, start_col, StylePalette.panel_header);
         const key_col = start_col + @as(u16, @intCast(@min(ctx.stringWidth(label), @as(usize, std.math.maxInt(u16)))));
-        // TUX02: never render the secret in plaintext — mask it for display.
-        // The real value stays in the input buffer; submit reads the buffer.
-        const masked = maskSecret(ctx.arena, self.key_input);
-        const shown = try std.fmt.allocPrint(ctx.arena, "{s}\u{2588}", .{masked});
+        // Show the live input in plaintext once the user is editing it, so a
+        // pasted key is verifiable. A pre-filled existing key (form opened to
+        // edit) stays masked until the first keystroke.
+        const shown = if (self.state.key_dirty)
+            try std.fmt.allocPrint(ctx.arena, "{s}\u{2588}", .{self.key_input})
+        else
+            try std.fmt.allocPrint(ctx.arena, "{s}\u{2588}", .{maskSecret(ctx.arena, self.key_input)});
         try panel.lineStyledAt(surface, key_row, shown, ctx, key_col, StylePalette.panel_header);
 
         const hint_row = key_row + 2;
