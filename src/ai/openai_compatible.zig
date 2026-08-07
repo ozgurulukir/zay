@@ -612,7 +612,7 @@ fn writeMessage(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMes
     }
     try out.writeAll(",\"content\":");
     switch (message) {
-        .user => try writeUserContent(out, message.user.content),
+        .user => try writeUserContent(out, gpa, message.user.content),
         inline .system, .assistant, .tool => |m| try writeTextContent(out, gpa, m.content),
     }
     if (message == .tool) {
@@ -645,36 +645,42 @@ fn writeTextContent(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []const
             .reasoning, .image, .tool_call => {},
         }
     }
-    const text = aw.written();
-    // Ensure the tool/history text we send is valid UTF-8. Some MCP/tool
-    // results can contain stray bytes; replace invalid sequences rather
-    // than sending a malformed JSON string that providers reject.
-    if (!std.unicode.utf8ValidateSlice(text)) {
-        const repaired = try gpa.alloc(u8, text.len * 4);
-        errdefer gpa.free(repaired);
-        var i: usize = 0;
-        var j: usize = 0;
-        while (i < text.len) {
-            const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
-            if (i + len <= text.len and std.unicode.utf8ValidateSlice(text[i..][0..len])) {
-                @memcpy(repaired[j..][0..len], text[i..][0..len]);
-                j += len;
-            } else {
-                // replacement character for invalid sequence
-                repaired[j] = 0xef;
-                repaired[j + 1] = 0xbf;
-                repaired[j + 2] = 0xbd;
-                j += 3;
-            }
-            i += len;
-        }
-        try std.json.Stringify.value(repaired[0..j], .{}, out);
-    } else {
-        try std.json.Stringify.value(text, .{}, out);
-    }
+    try writeJsonString(out, gpa, aw.written());
 }
 
-fn writeUserContent(out: *std.Io.Writer, blocks: []const ai.ContentBlock) !void {
+/// Serialize `text` as a JSON string, repairing invalid UTF-8 first. Some
+/// MCP/tool results can contain stray bytes; `std.json.Stringify.value` on a
+/// `[]u8` with invalid UTF-8 falls back to emitting an array of integers
+/// (`[89,111,117,...]`) instead of a string, which providers reject with
+/// `400 invalid message format`. Replace invalid sequences with U+FFFD rather
+/// than sending a malformed JSON string.
+fn writeJsonString(out: *std.Io.Writer, gpa: std.mem.Allocator, text: []const u8) !void {
+    if (std.unicode.utf8ValidateSlice(text)) {
+        try std.json.Stringify.value(text, .{}, out);
+        return;
+    }
+    const repaired = try gpa.alloc(u8, text.len * 4);
+    defer gpa.free(repaired);
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        if (i + len <= text.len and std.unicode.utf8ValidateSlice(text[i..][0..len])) {
+            @memcpy(repaired[j..][0..len], text[i..][0..len]);
+            j += len;
+        } else {
+            // replacement character for invalid sequence
+            repaired[j] = 0xef;
+            repaired[j + 1] = 0xbf;
+            repaired[j + 2] = 0xbd;
+            j += 3;
+        }
+        i += len;
+    }
+    try std.json.Stringify.value(repaired[0..j], .{}, out);
+}
+
+fn writeUserContent(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []const ai.ContentBlock) !void {
     try out.writeByte('[');
     var count: u32 = 0;
     for (blocks) |block| {
@@ -682,7 +688,7 @@ fn writeUserContent(out: *std.Io.Writer, blocks: []const ai.ContentBlock) !void 
             .text => |text| {
                 if (count > 0) try out.writeByte(',');
                 try out.writeAll("{\"type\":\"text\",\"text\":");
-                try std.json.Stringify.value(text.text, .{}, out);
+                try writeJsonString(out, gpa, text.text);
                 try out.writeByte('}');
                 count += 1;
             },
@@ -1236,6 +1242,31 @@ test "writeRequestPayload omits tools and tool_choice when there are none" {
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "tool_choice") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") == null);
+}
+
+test "writeRequestPayload repairs invalid UTF-8 in a user message text block" {
+    // Regression: the compaction request is a single *user* message, so it
+    // serializes through writeUserContent. A tool result with stray bytes in
+    // the prefix made Stringify.value fall back to an array of integers
+    // (`"text":[89,111,...]`), which providers reject with `400 invalid
+    // message format`. The text must be emitted as a JSON string with the
+    // invalid bytes replaced by U+FFFD.
+    const gpa = std.testing.allocator;
+    const blocks = try gpa.alloc(ai.ContentBlock, 1);
+    // "ok" followed by an invalid UTF-8 byte 0xFF.
+    blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "ok\xff") } };
+    var user_msg: ai.ChatMessage = .{ .user = .{ .content = blocks } };
+    defer user_msg.deinit(gpa);
+    const views = [_]ai.MessageView{.{ .borrowed = &user_msg }};
+
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "summarizer", "", &views, "[]", null, null, .minimal, false);
+    const body = payload.written();
+    // The text must be a JSON string, not an array of integers.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":[") == null);
+    // "ok" + U+FFFD (EF BF BD) as a JSON string.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":\"ok\xef\xbf\xbd\"") != null);
 }
 
 test "writeRequestPayload rejects an empty model id with EmptyModelId" {
