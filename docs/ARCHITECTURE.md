@@ -1,5 +1,7 @@
 # Nova Architecture
 
+High-level architecture of Nova. For implementation patterns, engineering gotchas, and the type-system discipline, see [Patterns](PATTERNS.md). For configuration details, see [Configuration](CONFIG.md). For MCP internals, see [MCP](MCP.md). For plugin development, see [Plugins](plugins/README.md).
+
 ## LLM Gateway
 
 Nova accepts any OpenAI-compatible endpoint (either `/completions` or `/responses`).
@@ -13,7 +15,7 @@ Nova exposes the following tools:
 - `bash`
 - `lane`
 
-`bash` has some middleware written for it that makes it friendlier for agent use. For example, large outputs from a `cat` command are written to a temp file and the agent is told the full is in that file if needed.
+`bash` has some middleware written for it that makes it friendlier for agent use. For example, large outputs from a `cat` command are written to a temp file and the agent is told the full is in that file if needed. See [Bash auto-review](#bash-auto-review) below.
 
 `lane` gives the model first-class access to Nova's parallel-lane substrate: isolated git worktrees the TUI tiles side-by-side. It is a *bridge* tool — the tool runs on the lane's worker thread, so every action is posted across a `LaneBridge` (`src/tools/lane_bridge.zig`) and resolved by the UI on its tick. Two modes:
 
@@ -22,16 +24,18 @@ Nova exposes the following tools:
 
 Only the driver lane may `spawn`/`enter`/`merge` — a worker gets `list`/`read` only. The 4-lane cap applies; `validateCwd`'s containment guarantees are unchanged (lane roots are valid only because Nova owns them).
 
+See [Parallel](#parallel) for the user-facing lane model.
+
 ### Tool schema strict mode
 
-Builtin and MCP tool schemas are serialized with OpenAI strict-mode semantics:
+Builtin and MCP tool schemas are serialized with OpenAI strict-mode semantics (opt-in via `ai.Config.strict`):
 
 - `strict: true`
 - Top-level `parameters` uses `additionalProperties: false`
 - Optional fields carry `nullable: true` and emit `["<type>", "null"]` union arrays
 - Nested free-form objects like `env` keep `additionalProperties: true`
 
-The registry accessor `tools.registry()` is runtime-extensible; both the executor and the AI client adapters consume it to build the `tools` JSON payload sent on every request.
+The full strict-mode design, its gateway-incompatibility caveats, and its persistence rules live in the [Tool schema strict-mode pattern](PATTERNS.md#tool-schema-strict-mode-pattern) in Patterns.
 
 ## Steering
 
@@ -43,37 +47,7 @@ User's can branch off at any point in their conversation to pursue different pat
 
 ## Session Persistence
 
-The session store (`sessions.sqlite`) records the active `model_provider`, `model_id`, **and `reasoning_effort`** (schema v5, nullable — NULL means "use config/default") on every turn, **and on every mid-session model switch**. The picker (`tui.applySelectedModel`) calls `session_writer.updateModel(provider_name, model_id, effort.label())` after attaching the new client, mirroring what `runtime.applyFromConfig` writes at session start (it resolves `model().reasoning.resolve().label()`). Without the picker write, `initResume` restored the stale creation-time model on restart instead of the last-used one. The write is best-effort (logged, never rolls back the applied switch) and gated by `AgentRuntime.session_writer_started` so TUI test harnesses that build a partial runtime with `session_writer = undefined` can still exercise the picker. On resume, `initResume` restores the stored effort too — `ai.ReasoningEffort.fromString` parses the label, and an invalid DB value degrades to "no override" rather than failing. On resume, Nova resolves the provider through two paths:
-
-1. **Builtin providers**: resolved by enum label (`openai`, `openrouter`, etc.)
-2. **Custom providers**: resolved by name from the `providers[]` config map, with `baseURL` pulled from the same entry
-
-This means custom providers (e.g., `"qwen-cloud"` pointing to a DashScope endpoint) round-trip correctly across restarts: `defaultModel: "<provider-name>/<model-id>"` carries the user-chosen provider name as its prefix (there is no separate `provider` field in `config.json`), and the `providers[]` map supplies the `baseURL` for that name.
-
-### Empty `base_url` resolution
-
-When `model_selection` is synthesized from session metadata or legacy fields, its `base_url` may be an empty string. Two guards prevent this from crashing the model catalogue loader:
-
-1. `collectConfiguredProviders` resolves an empty `base_url` through `provider.defaultBaseUrl()` before appending to the catalog job.
-2. `loadConfigured` falls back to `provider.defaultBaseUrl()` if `configured.base_url` is empty, skipping the provider entirely if no default exists.
-
-This ensures `listModels` never receives an empty URL, avoiding the `assert(base_url.len > 0)` panic on startup.
-
-### Dynamic provider auth key resolution
-
-Dynamic providers selected from models.dev store their API key in `auth.json` under the provider ID (e.g., `"stepfun-ai"`), not the enum label (`"openai_compatible"`). Two fields track the identity at runtime:
-
-- `dynamic_provider_name`: human-readable display name (e.g., `"StepFun AI"`), used by the status bar
-- `dynamic_provider_id`: the auth.json key (e.g., `"stepfun-ai"`), used for session resume and API key lookup
-
-`updateCachedModelSelection` rebuilds `model_selection` as the `.custom` variant with `provider_name` set to `dynamic_provider_id` on selection, so `tryAttachOpenAiCompatibleFromConfig` looks up the correct auth.json entry on resume. `compatibleApiKey` also uses `dynamic_provider_id` directly for the lookup, avoiding the fragile stash fallback.
-
-### Restart catalog restore
-
-Because `api_key` is never serialized (it lives in `auth.json`), the runtime stash is null after every restart. Two gates were relaxed so the dynamic provider's disk cache restores on the next `/models` open:
-
-1. **`hasOpenAICompatibleCredentials`** treats a typed `model_selection` carrying a non-empty `baseUrl()` as a sufficient credential signal (the real key is resolved from `auth.json` at fetch time). The legacy `base_url`+`api_key` stash path stays as a fallback for catalogue providers that have no `model_selection` yet.
-2. **`shouldLoadConfiguredCompatibleCatalog`** resolves `base_url` from `model_selection.baseUrl()` when the legacy stash is null.
+The session store (`sessions.sqlite`) records the active `model_provider`, `model_id`, and `reasoning_effort` on every turn and on every mid-session model switch, and resumes correctly across restarts — including cross-project resumes. The full lifecycle (schema, resume paths, custom-provider round-tripping, dynamic-provider auth resolution, restart catalog restore) is documented in the [Mid-session model persistence pattern](PATTERNS.md#mid-session-model-persistence-pattern), the [Cross-project session resume pattern](PATTERNS.md#cross-project-session-resume-pattern), and the related provider patterns in Patterns.
 
 ## Parallel
 
@@ -105,31 +79,14 @@ The `cwd` parameter in bash tool calls is validated against the project root in 
 
 Temporary log files use hex-only filenames (`nova-bash-<hex>.log` via `bytesToHex`), making path traversal impossible. The `namedTempPath` public API asserts that the provided name contains no path separators.
 
-## Type System Discipline
-
-Nova uses `union(enum)` instead of flat structs with optional fields wherever a value can be in one of several mutually-exclusive states. This makes illegal combinations unrepresentable at compile time — the compiler tells the next developer where to add a case when a new variant is introduced.
-
-Key types following this pattern:
-
-- `ai.ChatMessage` — `union(enum) { system, user, assistant, tool }` (tool carries non-optional `call_id`)
-- `transcript.Message` — `union(enum)` with 10 variants + `Basic`/`ToolView` payload structs
-- `config.McpServerConfig.transport` — `union(enum) { stdio, sse }`
-- `mcp.McpClient` — `transport` + `lifecycle` unions for static config and runtime state
-- `config.Config.model_selection: ?ModelSelection` — `union(enum) { builtin, custom }` typed view replacing 9 loose optional fields; builtin carries `Provider` enum, custom carries `provider_name`/`base_url`/`api_key`
-- `agent.Listener(Ctx)` / `executor.ToolCallObserver(Ctx)` — generic typed callbacks replacing `*anyopaque` vtables
-
-See `AGENTS.md` "Type System Discipline pattern" for the full list and construction patterns.
-
 ## Lua Plugin System
 
-Nova supports extending its capabilities through Lua 5.4 plugins. The plugin system lives in `src/lua/` and provides:
+Nova supports extending its capabilities through Lua 5.4 plugins. The plugin system lives in `src/lua/` and provides a sandboxed runtime, plugin lifecycle, event bus, tool registration, config integration, bytecode caching, and TUI integration.
 
-- **Sandboxed runtime**: Each plugin runs in a restricted Lua environment with configurable permissions (file access, network, os.execute, etc.) and resource limits (instruction count, memory, timeout).
-- **Plugin lifecycle**: Plugins are discovered from `~/.config/nova/plugins/` (global) and `.nova/plugins/` (project). Each plugin has a `plugin.lua` manifest and an `init.lua` entry point.
-- **Event bus**: Plugins can subscribe to lifecycle events (`turn_started`, `tool_call_started`, etc.) via `nova.on()`.
-- **Tool registration**: Plugins register tools via `nova.register_tool()` that appear alongside builtin and MCP tools.
-- **Config integration**: Plugin settings are stored in `config.json` under the `plugins` key, following the same layered merge pattern as MCP servers.
-- **Bytecode caching**: `State.dump()` and `State.loadBuffer()` enable caching compiled Lua bytecode to avoid re-parsing on reload.
-- **TUI integration**: The `/plugins` command opens an overlay listing loaded plugins with their active/inactive status.
+The full plugin development guide, API reference, and example walkthroughs live in [Plugins](plugins/README.md). The internal wiring patterns (tool dispatch, event wiring, bridge functions, two-store state) live in [Patterns](PATTERNS.md).
 
-See `docs/plugins/` for the full plugin development guide, API reference, and example plugins.
+## Type System Discipline
+
+Nova uses `union(enum)` instead of flat structs with optional fields wherever a value can be in one of several mutually-exclusive states. This makes illegal combinations unrepresentable at compile time.
+
+The complete, current list of `union(enum)` types and the construction patterns live in the [Type System Discipline pattern](PATTERNS.md#type-system-discipline-pattern) in Patterns.
