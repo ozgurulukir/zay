@@ -18,6 +18,17 @@ fn isSearchFooter(line: []const u8) bool {
 }
 
 pub fn updateAtSearch(app: *App) !void {
+    // The indexing -> open transition is driven from here: this runs every
+    // frame while the popup is still indexing (see root_layout). The backend
+    // only leaves `.loading` (isIndexing -> false) when the loading future is
+    // drained, so we must do that here — refreshFileResults returns early
+    // while `.indexing` and never reaches queryAsync, which would leave the
+    // backend stuck in `.loading` and the popup stuck on the spinner.
+    if (app.at_search == .indexing) {
+        if (search_mod.drainIndexing(app.io)) {
+            try onSearchBackendReady(app);
+        }
+    }
     const before = app.inputs.input.buf.firstHalf();
     if (at_mention.activeQuery(before)) |active| {
         try setMentionSearch(app, .file, active.query);
@@ -33,6 +44,8 @@ pub fn updateAtSearch(app: *App) !void {
 fn setMentionSearch(app: *App, kind: MentionSearchKind, query: []const u8) !void {
     if (kind == .file) startAtSearchBackend(app);
 
+    const was_closed = app.at_search == .closed;
+
     const same_query = if (app.at_search == .open)
         app.at_search.open.kind == kind and std.mem.eql(u8, query, app.at_search.open.query)
     else
@@ -43,9 +56,14 @@ fn setMentionSearch(app: *App, kind: MentionSearchKind, query: []const u8) !void
     const owned: []u8 = if (query.len > 0) try app.gpa.dupe(u8, query) else "";
     app.at_search = .{ .open = .{ .kind = kind, .query = owned } };
 
-    // Debounce: don't start the async search immediately; the render loop
-    // will fire it once the deadline expires. This coalesces rapid typing.
-    app.at_search.refreshDebounce(app.io, 80);
+    // Schedule the first search via the debounce window — the render loop
+    // will fire it once the deadline expires. We only arm the debounce when
+    // the popup transitions from closed to open; rapid query changes inside
+    // an already-open popup must NOT keep resetting the deadline or the
+    // async search never fires (because every keystroke restarts the timer).
+    if (was_closed) {
+        app.at_search.refreshDebounce(app.io, 80);
+    }
     try refreshAtResults(app);
 }
 
@@ -206,7 +224,10 @@ pub fn onSearchBackendReady(app: *App) !void {
     // Recover the query from the input buffer — the indexing variant
     // doesn't carry it.
     const before = app.inputs.input.buf.firstHalf();
-    const active = blk: {
+    // The two branches below return distinct anonymous struct types; pin
+    // `active` to an explicit type so both break values coerce to it.
+    const Active = struct { kind: MentionSearchKind, query: []const u8 };
+    const active: Active = blk: {
         if (at_mention.activeQuery(before)) |q| break :blk .{ .kind = .file, .query = q.query };
         if (skill_mod.activeQuery(before)) |q| break :blk .{ .kind = .skill, .query = q.query };
         closeAtSearch(app);

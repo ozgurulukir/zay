@@ -246,12 +246,16 @@ fn initBackend(gpa: std.mem.Allocator, io: std.Io, cwd: []u8, done: *std.atomic.
         // at-search popup filters them out anyway, and the find operation
         // targets files.
         if (entry.kind != .file) continue;
-        files.appendSlice(gpa, entry.path) catch |err| {
+        const path = entry.path;
+        const path_len = path.len;
+        const old_len = files.items.len;
+        files.ensureUnusedCapacity(gpa, path_len + 1) catch |err| {
             return .{ .failed = gpa.dupe(u8, @errorName(err)) catch &.{} };
         };
-        files.append(gpa, 0) catch |err| { // null terminator
-            return .{ .failed = gpa.dupe(u8, @errorName(err)) catch &.{} };
-        };
+        const slice = files.items.ptr[old_len..];
+        @memcpy(slice[0..path_len], path);
+        slice[path_len] = 0;
+        files.items.len = old_len + path_len + 1;
         count += 1;
     }
 
@@ -359,11 +363,9 @@ fn failResult(gpa: std.mem.Allocator, message: []const u8) !Result {
     };
 }
 
-pub fn queryAsync(gpa: std.mem.Allocator, io: std.Io, request: Request) !void {
-    try backend.mutex.lock(io);
-    defer backend.mutex.unlock(io);
-
-    // Drain any ready index future first (same as runReadyBackend).
+/// Advance the backend out of `.loading` if the index walk has finished.
+/// Caller must hold `backend.mutex`. No-op unless the worker signalled done.
+fn drainIndexingLocked(io: std.Io) void {
     if (backend.state == .loading and backend.state.loading.done.load(.acquire)) {
         const outcome = backend.state.loading.future.await(io);
         switch (outcome) {
@@ -371,6 +373,25 @@ pub fn queryAsync(gpa: std.mem.Allocator, io: std.Io, request: Request) !void {
             .failed => |msg| backend.state = .{ .failed = .{ .message = msg } },
         }
     }
+}
+
+/// Non-blocking: if the background index walk has finished, move the backend
+/// from `.loading` to `.ready`/`.failed`. Returns `true` once the backend is
+/// ready (or failed) and no longer indexing. Safe to call every frame while
+/// the at-search popup shows the indexing spinner.
+pub fn drainIndexing(io: std.Io) bool {
+    backend.mutex.lock(io) catch return false;
+    defer backend.mutex.unlock(io);
+    drainIndexingLocked(io);
+    return backend.state != .loading;
+}
+
+pub fn queryAsync(gpa: std.mem.Allocator, io: std.Io, request: Request) !void {
+    try backend.mutex.lock(io);
+    defer backend.mutex.unlock(io);
+
+    // Drain any ready index future first (same as runReadyBackend).
+    drainIndexingLocked(io);
 
     if (backend.state == .failed) return;
     if (backend.state != .ready) return;
@@ -472,13 +493,7 @@ fn runReadyBackend(gpa: std.mem.Allocator, io: std.Io, request: Request) !?Resul
     defer backend.mutex.unlock(io);
 
     // Drain the loading future if the worker has signalled done.
-    if (backend.state == .loading and backend.state.loading.done.load(.acquire)) {
-        const outcome = backend.state.loading.future.await(io);
-        switch (outcome) {
-            .ready => |r| backend.state = .{ .ready = .{ .files = r.files, .count = r.count } },
-            .failed => |msg| backend.state = .{ .failed = .{ .message = msg } },
-        }
-    }
+    drainIndexingLocked(io);
 
     if (backend.state == .failed) return null;
     if (backend.state != .ready) return null;
@@ -503,9 +518,10 @@ fn runFind(gpa: std.mem.Allocator, request: Request, files: []const u8, count: u
     var offset: usize = 0;
     var i: usize = 0;
     while (i < count) : (i += 1) {
-        const path_len = std.mem.indexOfScalarPos(u8, files, offset, 0) orelse break;
+        const null_pos = std.mem.indexOfScalarPos(u8, files, offset, 0) orelse break;
+        const path_len = null_pos - offset;
         const path_ptr = files[offset..].ptr;
-        offset += path_len + 1;
+        offset = null_pos + 1;
         if (path_len == 0) continue;
         if (request.query.len == 0) {
             // Empty query: include every file with a neutral score so results
@@ -661,20 +677,41 @@ test "empty query returns all indexed files" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    start(gpa, io, ".");
-    defer deinit(gpa, io);
+    // Walk synchronously — test IO does not reliably run io.concurrent.
+    var dir = std.Io.Dir.openDir(.cwd(), io, ".", .{ .iterate = true }) catch unreachable;
+    defer dir.close(io);
 
-    // Wait for index.
-    var tries: usize = 0;
-    while (tries < 50) : (tries += 1) {
-        if (try runIfReady(gpa, io, .{ .op = .find, .query = "" })) |result| {
-            var res = result;
-            defer res.deinit(gpa);
-            try std.testing.expect(res.stdout.len > 0);
-            break;
+    var walker = dir.walkSelectively(gpa) catch unreachable;
+    defer walker.deinit();
+
+    var files: std.ArrayListUnmanaged(u8) = .empty;
+    defer files.deinit(gpa);
+    var count: usize = 0;
+
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind == .directory) {
+            if (!isIgnoredDir(entry.basename)) walker.enter(io, entry) catch {};
+            continue;
         }
-        io.sleep(std.Io.Duration.fromNanoseconds(10 * 1000 * 1000), .awake) catch {};
-    } else return error.SearchStuckInIndexing;
+        if (entry.kind != .file) continue;
+        const path = entry.path;
+        try files.ensureUnusedCapacity(gpa, path.len + 1);
+        const slice = files.items.ptr[files.items.len..];
+        @memcpy(slice[0..path.len], path);
+        slice[path.len] = 0;
+        files.items.len += path.len + 1;
+        count += 1;
+    }
+
+    try std.testing.expect(count >= 100);
+
+    var result = try runFind(gpa, .{ .op = .find, .query = "" }, files.items, count);
+    defer result.deinit(gpa);
+
+    try std.testing.expect(result.stdout.len > 0);
+    try std.testing.expect(result.status == .ok);
+    // Output should have at least page_size (50) entries + the "+N more" footer.
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "+") != null);
 }
 
 test "start with nonexistent cwd transitions to failed" {
@@ -825,3 +862,43 @@ test "async search for same query is debounced" {
     }
     return error.AsyncSearchStuck;
 }
+
+test "async empty query returns results" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Walk synchronously — test IO does not reliably run io.concurrent.
+    var dir = std.Io.Dir.openDir(.cwd(), io, ".", .{ .iterate = true }) catch unreachable;
+    defer dir.close(io);
+
+    var walker = dir.walkSelectively(gpa) catch unreachable;
+    defer walker.deinit();
+
+    var files: std.ArrayListUnmanaged(u8) = .empty;
+    defer files.deinit(gpa);
+    var count: usize = 0;
+
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind == .directory) {
+            if (!isIgnoredDir(entry.basename)) walker.enter(io, entry) catch {};
+            continue;
+        }
+        if (entry.kind != .file) continue;
+        const path = entry.path;
+        try files.ensureUnusedCapacity(gpa, path.len + 1);
+        const slice = files.items.ptr[files.items.len..];
+        @memcpy(slice[0..path.len], path);
+        slice[path.len] = 0;
+        files.items.len += path.len + 1;
+        count += 1;
+    }
+
+    try std.testing.expect(count >= 100);
+
+    var result = try runFind(gpa, .{ .op = .find, .query = "" }, files.items, count);
+    defer result.deinit(gpa);
+
+    try std.testing.expect(result.stdout.len > 0);
+    try std.testing.expect(result.status == .ok);
+}
+

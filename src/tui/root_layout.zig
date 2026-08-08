@@ -170,14 +170,19 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         // updateAtSearch resets the deadline on every keystroke, so rapid
         // typing coalesces into a single query.
         const deadline_expired = app.at_search.debounceExpired(app.io);
+        const pending_results = switch (app.at_search) {
+            .open => |o| o.searching,
+            else => false,
+        };
 
-        if (deadline_expired) {
+        if (deadline_expired or pending_results) {
             // Poll async search results before drawing, so the popup updates
             // as soon as a background fuzzy search completes.
             at_search_mod.pollAtSearch(app) catch |err| {
                 // Surface the failure in the popup footer so the user isn't
                 // staring at stale/empty results with no hint.
                 log.warn("at-search poll failed: {s}", .{@errorName(err)});
+
                 at_search_mod.setSearchNotice(app, @errorName(err));
             };
             // Display any backend failure message when the index is in the failed
