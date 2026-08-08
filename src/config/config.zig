@@ -120,7 +120,9 @@ pub const CompactionSettings = struct {
     /// (see `context/assembly.zig`). Minimum 1.
     keep_recent_tool_turns: u32 = context_assembly.default_keep_recent_tool_turns,
     /// Byte cap applied to tool results older than `keep_recent_tool_turns` —
-    /// the head is kept with a "[... compacted to save context ...]" notice.
+    /// a head+tail sandwich (first half + last half, joined by
+    /// `common.elideMiddle`) keeps both the start and the conclusion, with a
+    /// "[... N of M bytes elided to save context ...]" notice.
     /// Defaults match the previous hardcoded constant in context/assembly.zig.
     historical_tool_cap_bytes: u32 = context_assembly.default_historical_tool_cap_bytes,
 };

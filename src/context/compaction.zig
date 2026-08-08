@@ -10,6 +10,7 @@
 
 const std = @import("std");
 
+const tools_common = @import("../tools/common.zig");
 const ai = @import("../ai.zig");
 /// Runtime models.dev registry — provides `ModelInfo` for capability lookups.
 const modelsdev = @import("../models/registry.zig");
@@ -299,15 +300,20 @@ pub fn serializePrefix(gpa: std.mem.Allocator, messages: []const ai.ChatMessage)
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     for (messages) |message| {
-        try writeMessage(&out.writer, message);
+        try writeMessage(gpa, &out.writer, message);
     }
     return out.toOwnedSlice();
 }
 
-fn writeMessage(out: *std.Io.Writer, message: ai.ChatMessage) !void {
+fn writeMessage(gpa: std.mem.Allocator, out: *std.Io.Writer, message: ai.ChatMessage) !void {
     switch (message) {
         .tool => |t| {
-            try out.print("[tool result]: {s}\n", .{cappedText(firstText(t.content))});
+            // Sandwich the tool result so the summarizer sees the conclusion
+            // (tail), not just the start — head-only truncation dropped errors
+            // and results, so a compacted summary lost them.
+            const rendered = try cappedToolResult(gpa, firstText(t.content));
+            defer gpa.free(rendered);
+            try out.print("[tool result]: {s}\n", .{rendered});
         },
         inline .system, .user, .assistant => |m| {
             const label: []const u8 = switch (message) {
@@ -340,9 +346,20 @@ fn firstText(content: []const ai.ContentBlock) []const u8 {
     return "";
 }
 
+/// Head-only cap for tool-call ARGUMENTS in the summarizer render. Unlike
+/// tool RESULTS (which get a head+tail sandwich via `cappedToolResult` because
+/// their load-bearing conclusion lives at the tail), arguments are the model's
+/// INPUT to a tool — their start carries the intent and they rarely have a
+/// meaningful tail, so head-only is correct here.
 fn cappedText(text: []const u8) []const u8 {
     if (text.len <= tool_output_render_cap_bytes) return text;
     return text[0..tool_output_render_cap_bytes];
+}
+
+/// Render a tool result for the summarizer as a head+tail sandwich. Thin
+/// wrapper over the shared `common.pruneToolText` at this module's render cap.
+fn cappedToolResult(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
+    return tools_common.pruneToolText(gpa, text, tool_output_render_cap_bytes);
 }
 
 /// Build the summarizer's user content: the compaction instruction followed by
@@ -599,6 +616,27 @@ test "serialize prefix marks omitted images" {
     const text = try serializePrefix(gpa, &.{message});
     defer gpa.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "[user image omitted]") != null);
+}
+
+test "cappedToolResult keeps the conclusion tail for the summarizer" {
+    const gpa = std.testing.allocator;
+
+    // A tool result whose load-bearing conclusion lives at the tail (e.g. a
+    // build/test run ending in "error: failed"). Head-only truncation dropped
+    // the tail, so a compacted summary lost the failure; the sandwich must
+    // keep both the start and the conclusion.
+    const head_marker = "HEAD";
+    const tail_marker = "TAIL: error: failed to compile store.go";
+    const big = "x" ** (tool_output_render_cap_bytes + 1000);
+    const obs = try std.fmt.allocPrint(gpa, "{s}{s}\n{s}", .{ head_marker, big, tail_marker });
+    defer gpa.free(obs);
+
+    const rendered = try cappedToolResult(gpa, obs);
+    defer gpa.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, tail_marker) != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, head_marker) != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "elided to save context") != null);
 }
 
 test "serializePrefix caps tool call arguments like tool results" {

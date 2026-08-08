@@ -272,13 +272,13 @@
           "type": "integer",
           "minimum": 1,
           "default": 4,
-          "description": "Number of most recent tool-result turns kept in full when assembling each prompt. Older tool results are pruned to historicalToolCapBytes with a '[... compacted to save context ...]' notice. Raise this when an agentic turn needs earlier tool outputs in full (e.g. multi-phase skills). Minimum 1 — a value of 0 would prune every tool result and break tool-calling."
+          "description": "Number of most recent tool-result turns kept in full when assembling each prompt. Older tool results are pruned to historicalToolCapBytes with a '[... N of M bytes elided to save context ...]' notice. Raise this when an agentic turn needs earlier tool outputs in full (e.g. multi-phase skills). Minimum 1 — a value of 0 would prune every tool result and break tool-calling."
         },
         "historicalToolCapBytes": {
           "type": "integer",
           "minimum": 1,
           "default": 1024,
-          "description": "Byte cap applied to tool results older than keepRecentToolTurns — the head is kept followed by a '[... compacted to save context (was N bytes) ...]' notice. Raise for large command outputs the model must re-read later in the same turn."
+          "description": "Byte cap applied to tool results older than keepRecentToolTurns — a head+tail sandwich (first half + last half, joined by common.elideMiddle) keeps both the start and the load-bearing conclusion (errors, results, status) of a command output, with a '[... N of M bytes elided to save context ...]' notice. Raise for large command outputs the model must re-read later in the same turn."
         }
       },
       "additionalProperties": false

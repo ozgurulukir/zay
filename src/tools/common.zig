@@ -74,6 +74,90 @@ pub const Error = error{
     OutOfMemory,
 } || std.Io.Cancelable || std.Io.UnexpectedError;
 
+/// The single shared implementation of tool-result truncation: a head+tail
+/// sandwich. Keeps the start of the output (head — file-read preamble,
+/// command banner) and the conclusion (tail — errors, results, status) with
+/// an elision marker, so neither compaction nor historical pruning discards
+/// the load-bearing part of a command result. Head-only truncation dropped
+/// the tail, forcing the model to re-run commands to rediscover their
+/// conclusions. The bash spill `Full output:` footer sits at the very end
+/// and survives naturally inside the tail. Caller owns the result; always
+/// allocates a fresh buffer (never returns an input slice).
+pub fn pruneToolText(gpa: std.mem.Allocator, text: []const u8, cap_bytes: u32) ![]u8 {
+    if (text.len <= cap_bytes) return gpa.dupe(u8, text);
+    const half = cap_bytes / 2;
+    // Head = first half of the budget; tail = last half. They are disjoint,
+    // leaving a middle gap the elision marker reports. head_kept guards tiny
+    // caps (cap < 2) so head and tail never overlap.
+    const head_kept = @min(half, text.len);
+    const tail_start = text.len - (cap_bytes - half);
+    return elideMiddle(gpa, text[0..head_kept], text[tail_start..], text.len);
+}
+
+/// Join a head and tail slice with an elision marker reporting the skipped
+/// middle. The single source of truth for the elision format, shared by
+/// in-memory tool-result truncation (`pruneToolText`) and file mention
+/// ingestion (`at_mention`), so both keep the load-bearing conclusion (tail)
+/// alongside the start (head). Caller owns the result.
+pub fn elideMiddle(gpa: std.mem.Allocator, head: []const u8, tail: []const u8, total_size: usize) ![]u8 {
+    const elided = total_size - head.len - tail.len;
+    return std.fmt.allocPrint(
+        gpa,
+        "{s}\n\n[... {d} of {d} bytes elided to save context ...]\n\n{s}",
+        .{ head, elided, total_size, tail },
+    );
+}
+
+test "pruneToolText returns a fresh dupe when text fits the cap" {
+    const gpa = std.testing.allocator;
+    const text = "hello world";
+    const pruned = try pruneToolText(gpa, text, 100);
+    defer gpa.free(pruned);
+    try std.testing.expectEqualStrings(text, pruned);
+    // Must be a fresh allocation, not the input slice.
+    try std.testing.expect(pruned.ptr != text.ptr);
+}
+
+test "pruneToolText sandwiches head and tail when text exceeds cap" {
+    const gpa = std.testing.allocator;
+    const text = "HEAD_BODY" ++ ("x" ** 200) ++ "TAIL_BODY";
+    const pruned = try pruneToolText(gpa, text, 20);
+    defer gpa.free(pruned);
+    try std.testing.expect(std.mem.indexOf(u8, pruned, "HEAD_BODY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pruned, "TAIL_BODY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pruned, "elided to save context") != null);
+}
+
+test "pruneToolText handles empty text" {
+    const gpa = std.testing.allocator;
+    const pruned = try pruneToolText(gpa, "", 10);
+    defer gpa.free(pruned);
+    try std.testing.expectEqualStrings("", pruned);
+}
+
+test "pruneToolText with cap of 1 keeps only the last byte" {
+    const gpa = std.testing.allocator;
+    // 'X'/'Y'/'Z' don't appear in the elision marker, so we can assert
+    // head bytes vanish and the tail byte survives.
+    const pruned = try pruneToolText(gpa, "XYZ", 1);
+    defer gpa.free(pruned);
+    // half = 0 → empty head, 1-byte tail (the last char 'Z').
+    try std.testing.expect(std.mem.indexOf(u8, pruned, "Z") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pruned, "elided to save context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pruned, "X") == null);
+    try std.testing.expect(std.mem.indexOf(u8, pruned, "Y") == null);
+}
+
+test "elideMiddle reports the elided byte count" {
+    const gpa = std.testing.allocator;
+    const joined = try elideMiddle(gpa, "AAAA", "ZZZZ", 100);
+    defer gpa.free(joined);
+    // 100 - 4 - 4 = 92 bytes elided.
+    try std.testing.expect(std.mem.indexOf(u8, joined, "92 of 100 bytes elided") != null);
+    try std.testing.expect(std.mem.startsWith(u8, joined, "AAAA"));
+    try std.testing.expect(std.mem.endsWith(u8, joined, "ZZZZ"));
+}
+
 pub const ToolDisplay = struct {
     /// Human-facing summary shown while the tool is collapsed.
     label: []u8,

@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const ai = @import("../ai.zig");
+const tools_common = @import("../tools/common.zig");
 const compaction = @import("compaction.zig");
 const os = @import("../os.zig");
 const plugin_prompt = @import("../plugin_prompt.zig");
@@ -337,41 +338,65 @@ pub fn readProjectRuleFile(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, 
         log.warn("skipping project rule file {s}: {s}", .{ path, @errorName(err) });
         return null;
     };
-    const head_len: usize = @intCast(@min(stat.size, max_project_rule_file_bytes));
-    const bytes = try gpa.alloc(u8, head_len);
-    errdefer gpa.free(bytes);
-    var reader = file.reader(io, &.{});
-    // readSliceShort returns the actual count (never error.EndOfStream), so a
-    // file truncated between stat and read yields its partial content instead
-    // of failing assembly (TOCTOU).
-    const n = reader.interface.readSliceShort(bytes) catch |err| {
-        gpa.free(bytes);
+    const size: usize = @intCast(stat.size);
+    if (size <= max_project_rule_file_bytes) {
+        // Small rule file: read it whole. readSliceShort returns the actual
+        // count (never error.EndOfStream), so a file truncated between stat
+        // and read yields its partial content instead of failing (TOCTOU).
+        const bytes = try gpa.alloc(u8, size);
+        errdefer gpa.free(bytes);
+        var reader = file.reader(io, &.{});
+        const n = reader.interface.readSliceShort(bytes) catch |err| {
+            gpa.free(bytes);
+            log.warn("skipping project rule file {s}: {s}", .{ path, @errorName(err) });
+            return null;
+        };
+        if (n < size) {
+            const exact = try gpa.alloc(u8, n);
+            @memcpy(exact, bytes[0..n]);
+            gpa.free(bytes);
+            return exact;
+        }
+        return bytes;
+    }
+    // Oversized rule file: read its REAL head+tail (first half + last half of
+    // the budget) and join with an elision marker, so the file's conclusion
+    // survives alongside its start — head-only truncation dropped the tail.
+    const half = max_project_rule_file_bytes / 2;
+    const head_len = half;
+    const tail_len = max_project_rule_file_bytes - half;
+    const head = try gpa.alloc(u8, head_len);
+    defer gpa.free(head);
+    const tail = try gpa.alloc(u8, tail_len);
+    defer gpa.free(tail);
+    const head_n = file.readPositionalAll(io, head, 0) catch |err| {
         log.warn("skipping project rule file {s}: {s}", .{ path, @errorName(err) });
         return null;
     };
-    if (stat.size > max_project_rule_file_bytes) {
-        const notice = try std.fmt.allocPrint(
-            gpa,
-            "\n\n[project rule file truncated: {s} is {d} bytes, only the first {d} ingested]",
-            .{ filename, stat.size, max_project_rule_file_bytes },
-        );
-        defer gpa.free(notice);
-        const joined = try gpa.alloc(u8, head_len + notice.len);
-        @memcpy(joined[0..head_len], bytes);
-        @memcpy(joined[head_len..], notice);
-        gpa.free(bytes);
-        return joined;
-    }
-    // When the file shrank below the stat-based buffer, copy the actual bytes
-    // into an exact-size slice so no padding is exposed.
-    if (n < head_len) {
-        const exact = try gpa.alloc(u8, n);
-        @memcpy(exact, bytes[0..n]);
-        gpa.free(bytes);
-        return exact;
-    }
-    return bytes;
+    const tail_offset: u64 = @intCast(size - tail_len);
+    const tail_n = file.readPositionalAll(io, tail, tail_offset) catch |err| {
+        log.warn("skipping project rule file {s}: {s}", .{ path, @errorName(err) });
+        return null;
+    };
+    const joined = try tools_common.elideMiddle(gpa, head[0..head_n], tail[0..tail_n], size);
+    defer gpa.free(joined);
+    const notice = try std.fmt.allocPrint(
+        gpa,
+        "\n\n[project rule file truncated: {s} is {d} bytes]",
+        .{ filename, size },
+    );
+    defer gpa.free(notice);
+    const out = try gpa.alloc(u8, joined.len + notice.len);
+    @memcpy(out[0..joined.len], joined);
+    @memcpy(out[joined.len..], notice);
+    return out;
 }
+
+// Head+tail sandwich for tool-result truncation lives in `tools/common.zig`
+// (`pruneToolText`) — the single source of truth shared by compaction,
+// historical pruning, and LLM observation formatting. It keeps the
+// load-bearing conclusion (tail) alongside the start (head), so an old
+// command result doesn't lose its answer.
 
 fn pruneSingleToolMessage(gpa: std.mem.Allocator, msg: ai.ChatMessage, cap_bytes: u32) !ai.ChatMessage {
     assert(msg == .tool);
@@ -385,14 +410,13 @@ fn pruneSingleToolMessage(gpa: std.mem.Allocator, msg: ai.ChatMessage, cap_bytes
 
     for (content, 0..) |block, b_idx| {
         if (block == .text and block.text.text.len > cap_bytes) {
-            const original_len = block.text.text.len;
-            const head = block.text.text[0..cap_bytes];
-            const notice = try std.fmt.allocPrint(
-                gpa,
-                "{s}\n\n[... earlier tool result compacted to save context (was {d} bytes) ...]",
-                .{ head, original_len },
-            );
-            pruned_blocks[b_idx] = .{ .text = .{ .text = notice } };
+            // Head+tail sandwich: keep the START of the output (file-read
+            // preamble, command banner) AND the CONCLUSION (errors, test
+            // results, rg hits, git status — the load-bearing tail). Head-only
+            // truncation discarded the tail, so an old command output lost its
+            // answer and the model re-ran it to rediscover it.
+            const pruned = try tools_common.pruneToolText(gpa, block.text.text, cap_bytes);
+            pruned_blocks[b_idx] = .{ .text = .{ .text = pruned } };
         } else {
             pruned_blocks[b_idx] = try cloneContentBlock(gpa, block);
         }
@@ -583,20 +607,25 @@ test "readProjectRuleFile truncates an oversized rule file with a notice instead
     defer file.close(io);
     var buf: [4096]u8 = undefined;
     var writer = file.writer(io, &buf);
+    // Distinct head and tail markers so the test proves the sandwich keeps
+    // BOTH the start and the conclusion of an oversized rule file.
+    try writer.interface.writeAll("HEAD_MARKER");
     const filler = "x" ** 100; // 100-byte chunk
     var written: usize = 0;
-    while (written < max_project_rule_file_bytes + 100) {
+    while (written < max_project_rule_file_bytes) {
         try writer.interface.writeAll(filler);
         written += filler.len;
     }
+    try writer.interface.writeAll("TAIL_MARKER");
     try writer.interface.flush();
 
     const content = (try readProjectRuleFile(gpa, io, cwd, filename)).?;
     defer gpa.free(content);
-    try std.testing.expect(content.len > max_project_rule_file_bytes); // head + notice
+    try std.testing.expect(content.len > max_project_rule_file_bytes); // sandwich + notice
     try std.testing.expect(std.mem.indexOf(u8, content, "truncated") != null);
-    // Head bytes are preserved verbatim.
-    try std.testing.expect(std.mem.startsWith(u8, content, "xxxxxxxxxx"));
+    // The sandwich keeps the head AND the conclusion tail.
+    try std.testing.expect(std.mem.indexOf(u8, content, "HEAD_MARKER") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "TAIL_MARKER") != null);
 }
 
 test "pruneHistoricalToolResultsViews caps old tool outputs while preserving recent ones" {
@@ -624,13 +653,46 @@ test "pruneHistoricalToolResultsViews caps old tool outputs while preserving rec
     // Historical tool 1 (index 1) should be owned and truncated
     try std.testing.expect(pruned[1] == .owned);
     const t1_text = pruned[1].owned.tool.content[0].text.text;
-    try std.testing.expect(std.mem.indexOf(u8, t1_text, "compacted to save context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t1_text, "elided to save context") != null);
     try std.testing.expect(t1_text.len < 300);
 
     // Recent tool 1 (index 5) should be borrowed and kept in full
     try std.testing.expect(pruned[5] == .borrowed);
     const t3_text = pruned[5].borrowed.tool.content[0].text.text;
     try std.testing.expectEqual(@as(usize, 2000), t3_text.len);
+}
+
+test "pruneHistoricalToolResultsViews preserves the bash spill recovery footer" {
+    const gpa = std.testing.allocator;
+
+    // A truncated bash observation whose tail carries the spill footer. The
+    // footer is the model's only handle to re-read the full spill on disk, so
+    // the head+tail sandwich must keep it (it sits inside the preserved tail).
+    const spill_path = "/tmp/nova-bash-0123456789abcdef.log";
+    const body = "a" ** 4000;
+    const obs = try std.fmt.allocPrint(
+        gpa,
+        "{s}\n\n[Showing last 12 of 300 lines (50 KB of 200 KB). Full output: {s}]",
+        .{ body, spill_path },
+    );
+    defer gpa.free(obs);
+
+    var messages: [3]ai.ChatMessage = undefined;
+    messages[0] = try makeToolMessage(gpa, "c1", obs);
+    messages[1] = try makeTextMessage(gpa, .assistant, "done");
+    messages[2] = try makeTextMessage(gpa, .user, "next");
+    defer for (&messages) |*m| m.deinit(gpa);
+
+    const pruned = try pruneHistoricalToolResultsViews(gpa, &messages, 0, 100);
+    defer freePrunedViews(gpa, pruned);
+
+    try std.testing.expect(pruned[0] == .owned);
+    const text = pruned[0].owned.tool.content[0].text.text;
+    // The recovery handle survives the head-truncation.
+    try std.testing.expect(std.mem.indexOf(u8, text, spill_path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "elided to save context") != null);
+    // The head is still bounded.
+    try std.testing.expect(text.len < 400);
 }
 
 test "computeCutoff counts a contiguous tool batch as one turn" {
@@ -671,7 +733,7 @@ test "pruneHistoricalToolResultsViews borrows unchanged messages without copying
     // Historical tool message → owned, pruned.
     try std.testing.expect(views[0] == .owned);
     const pruned_text = views[0].owned.tool.content[0].text.text;
-    try std.testing.expect(std.mem.indexOf(u8, pruned_text, "compacted to save context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pruned_text, "elided to save context") != null);
 
     // Image user message → borrowed with pointer identity: no copy was made.
     try std.testing.expect(views[1] == .borrowed);

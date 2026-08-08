@@ -20,7 +20,9 @@ const skill_mod = @import("skill.zig");
 const assert = std.debug.assert;
 
 /// Max bytes embedded for ONE @-mentioned text file. Larger files are
-/// head-truncated with a visible notice, mirroring project-rule ingestion.
+/// inlined as a head+tail sandwich (first half + last half, joined by
+/// `common.elideMiddle`) with a visible notice, so the file's conclusion
+/// survives alongside its start.
 pub const per_file_mention_max_bytes: usize = 64 * 1024;
 /// Max aggregate bytes of inlined mention text per user message. Once
 /// exhausted, further mentions become error markers instead of content.
@@ -201,35 +203,68 @@ fn appendFileTag(
     };
     defer file.close(io);
 
-    // Read up to per_file_mention_max_bytes + 1 so we can detect an oversized
-    // file (n == cap + 1) and inline its head with a notice, rather than
-    // refusing it entirely as the old 256 KB limit did.
-    const buf = try gpa.alloc(u8, per_file_mention_max_bytes + 1);
-    defer gpa.free(buf);
-    var reader = file.reader(io, &.{});
-    const n = reader.interface.readSliceShort(buf) catch |err| {
+    const cap: usize = per_file_mention_max_bytes;
+    const stat = file.stat(io) catch |err| {
         try writer.print("\n\n<file src=\"", .{});
         try skill_mod.writeXmlEscaped(writer, path);
         try writer.print("\" error=\"{s}\"></file>", .{@errorName(err)});
         return;
     };
+    const size: usize = @intCast(stat.size);
 
-    const inlined = buf[0..n];
-    const cap: usize = per_file_mention_max_bytes;
+    // Read the file's REAL head+tail, not just its head. A plan's load-bearing
+    // steps/decisions often live at the tail; reading only the first `cap`
+    // bytes (as before) silently dropped them even though the sandwich then
+    // preserved the tail of that truncated window. For oversized files we read
+    // the first half and the last half of the budget and join them with an
+    // elision marker (shared `common.elideMiddle` SSOT).
     try writer.print("\n\n<file src=\"", .{});
     try skill_mod.writeXmlEscaped(writer, path);
-    if (n > cap) {
-        const head = inlined[0..cap];
+    if (size <= cap) {
+        const buf = try gpa.alloc(u8, size);
+        defer gpa.free(buf);
+        var reader = file.reader(io, &.{});
+        // readSliceShort returns the actual count (never error.EndOfStream),
+        // so a file truncated between stat and read yields its partial content
+        // instead of an error marker (TOCTOU) — matching assembly.zig.
+        const n = reader.interface.readSliceShort(buf) catch |err| {
+            try writer.print("\" error=\"{s}\"></file>", .{@errorName(err)});
+            return;
+        };
         try writer.print("\">\n", .{});
-        try skill_mod.writeXmlEscaped(writer, head);
-        try writer.print("\n[file truncated: {d} bytes, first {d} inlined]\n</file>", .{ n, cap });
-        remaining.* -= cap;
-    } else {
-        try writer.print("\">\n", .{});
-        try skill_mod.writeXmlEscaped(writer, inlined);
+        try skill_mod.writeXmlEscaped(writer, buf[0..n]);
         try writer.print("\n</file>", .{});
-        remaining.* -= n;
+        remaining.* -= @min(n, remaining.*);
+        return;
     }
+
+    const half = cap / 2;
+    const head_len = half;
+    const tail_len = cap - half;
+    const head = try gpa.alloc(u8, head_len);
+    defer gpa.free(head);
+    const tail = try gpa.alloc(u8, tail_len);
+    defer gpa.free(tail);
+    // readPositionalAll returns a short count on TOCTOU shrinkage (same as
+    // readSliceShort), not an error — head_n/tail_n carry the actual bytes
+    // read, so the slices stay correctly bounded even if the file shrank
+    // between stat and read. The elision marker's total_size may be stale
+    // in that edge case, but the content slices are safe.
+    const head_n = file.readPositionalAll(io, head, 0) catch |err| {
+        try writer.print("\" error=\"{s}\"></file>", .{@errorName(err)});
+        return;
+    };
+    const tail_offset: u64 = @intCast(size - tail_len);
+    const tail_n = file.readPositionalAll(io, tail, tail_offset) catch |err| {
+        try writer.print("\" error=\"{s}\"></file>", .{@errorName(err)});
+        return;
+    };
+    const pruned = try common.elideMiddle(gpa, head[0..head_n], tail[0..tail_n], size);
+    defer gpa.free(pruned);
+    try writer.print("\">\n", .{});
+    try skill_mod.writeXmlEscaped(writer, pruned);
+    try writer.print("\n[file truncated: {d} bytes — re-read with read_file if you need the rest]\n</file>", .{size});
+    remaining.* -= @min(cap, remaining.*);
 }
 
 fn encodeBase64(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
@@ -391,12 +426,16 @@ test "mention inlining truncates a per-file oversized file with a notice" {
     defer file.close(io);
     var buf: [4096]u8 = undefined;
     var writer = file.writer(io, &buf);
+    // Distinct head and tail markers so the test can prove the sandwich keeps
+    // BOTH the start and the conclusion of an oversized mention.
+    try writer.interface.writeAll("HEAD_MARKER");
     const filler = "y" ** 100;
     var written: usize = 0;
-    while (written < per_file_mention_max_bytes + 100) {
+    while (written < per_file_mention_max_bytes) {
         try writer.interface.writeAll(filler);
         written += filler.len;
     }
+    try writer.interface.writeAll("TAIL_MARKER");
     try writer.interface.flush();
 
     const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
@@ -404,9 +443,12 @@ test "mention inlining truncates a per-file oversized file with a notice" {
 
     const text = try buildAugmentedText(gpa, io, cwd, "see @big.txt");
     defer gpa.free(text);
+    // The truncation notice and the recovery hint are present.
     try std.testing.expect(std.mem.indexOf(u8, text, "file truncated") != null);
-    // Head bytes are preserved verbatim.
-    try std.testing.expect(std.mem.indexOf(u8, text, "yyyyyyyyyy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "re-read with read_file") != null);
+    // The sandwich keeps the head AND the conclusion tail.
+    try std.testing.expect(std.mem.indexOf(u8, text, "HEAD_MARKER") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "TAIL_MARKER") != null);
 }
 
 test "mention inlining refuses files once the turn aggregate budget is exhausted" {
