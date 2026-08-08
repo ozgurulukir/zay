@@ -32,13 +32,20 @@ pub fn updateAtSearch(app: *App) !void {
 
 fn setMentionSearch(app: *App, kind: MentionSearchKind, query: []const u8) !void {
     if (kind == .file) startAtSearchBackend(app);
-    // Already open with the same kind+query: nothing to do.
-    if (app.at_search == .open and app.at_search.open.kind == kind and
-        std.mem.eql(u8, query, app.at_search.open.query)) return;
-    // Otherwise: close whatever's there and start fresh in .open.
+
+    const same_query = if (app.at_search == .open)
+        app.at_search.open.kind == kind and std.mem.eql(u8, query, app.at_search.open.query)
+    else
+        false;
+    if (same_query) return;
+
     app.at_search.close(app.gpa);
     const owned: []u8 = if (query.len > 0) try app.gpa.dupe(u8, query) else "";
     app.at_search = .{ .open = .{ .kind = kind, .query = owned } };
+
+    // Debounce: don't start the async search immediately; the render loop
+    // will fire it once the deadline expires. This coalesces rapid typing.
+    app.at_search.refreshDebounce(app.io, 80);
     try refreshAtResults(app);
 }
 
@@ -50,43 +57,68 @@ fn startAtSearchBackend(app: *App) void {
 fn refreshAtResults(app: *App) !void {
     // Caller ensures we're in .open (or transitioning to .indexing).
     if (app.at_search != .open) return;
-    clearAtResults(app);
     switch (app.at_search.open.kind) {
         .file => try refreshFileResults(app),
         .skill => try refreshSkillResults(app),
     }
 }
 
+/// Poll the async search backend and update the popup's results when a
+/// search completes. Also handles the still-indexing -> open transition.
+/// Poll any in-flight async search result and update the popup's file list.
+/// Safe to call every frame; no-op when no search is running.
+pub fn pollAtSearch(app: *App) !void {
+    if (app.at_search == .closed) return;
+    try pollFileResults(app);
+}
+
+fn pollFileResults(app: *App) !void {
+    if (app.at_search != .open) return;
+    const o = &app.at_search.open;
+    if (o.kind != .file) return;
+
+    // If a search completed, parse its stdout into the result list.
+    if (try search_mod.pollSearchResult(app.gpa, app.io)) |result| {
+        var res = result;
+        defer res.deinit(app.gpa);
+        o.searching = false;
+        clearAtResults(app);
+        if (res.status == .err) {
+            setSearchNotice(app, res.stdout);
+            return;
+        }
+        setSearchNotice(app, "");
+        try parseAtResults(app, res.stdout);
+    }
+}
+
 fn refreshFileResults(app: *App) !void {
     if (app.at_search != .open) return;
     const o = &app.at_search.open;
-    const search_query = if (o.query.len == 0) " " else o.query;
-    var result = (try search_mod.runIfReady(app.gpa, app.io, .{
-        .op = .find,
-        .query = search_query,
-    })) orelse {
-        // Backend still indexing — transition open -> indexing,
-        // preserving the query+results+selection.
+
+    // If the backend is still indexing, transition open -> indexing so the
+    // UI shows the indexing spinner.
+    if (search_mod.isIndexing()) {
         const kind = o.kind;
         const query = o.query;
         const results_list = o.results;
         const selection = o.selection;
         app.at_search = .{ .indexing = .{ .kind = kind, .results = results_list } };
-        // The query and selection aren't valid in .indexing — we'd
-        // lose them. Stash by carrying the query into the indexing
-        // payload's result-list header... actually the plan's union
-        // doesn't carry query in indexing. So when indexing completes,
-        // refreshAtResults is re-called and the open state is rebuilt
-        // from the cached query in the input buffer. For now we leak
-        // the query string here; closeAtSearch frees it. But we just
-        // moved results_list out, so the original .open payload is
-        // gone. To keep the query alive, free it explicitly here.
         app.gpa.free(query);
         _ = selection;
         return;
-    };
-    defer result.deinit(app.gpa);
-    try parseAtResults(app, result.stdout);
+    }
+
+    // Don't start a new search while the debounce window is open.
+    if (!app.at_search.debounceExpired(app.io)) return;
+
+    // Start an async search if we don't have one in flight for the current query.
+    if (!o.searching) {
+        try search_mod.queryAsync(app.gpa, app.io, .{ .op = .find, .query = o.query });
+        o.searching = true;
+    }
+
+    try pollFileResults(app);
 }
 
 fn refreshSkillResults(app: *App) !void {
@@ -156,6 +188,17 @@ pub fn closeAtSearch(app: *App) void {
     app.at_search.close(app.gpa);
 }
 
+/// Set a transient inline notice on the open at-search popup. The notice
+/// is freed when the popup closes or a new notice replaces it.
+pub fn setSearchNotice(app: *App, text: []const u8) void {
+    if (app.at_search != .open) return;
+    const o = &app.at_search.open;
+    if (o.notice) |n| app.gpa.free(n);
+    o.notice = null;
+    if (text.len == 0) return;
+    o.notice = app.gpa.dupe(u8, text) catch null;
+}
+
 /// Promote an indexing state back to open when the backend completes.
 /// Re-runs refreshAtResults against the current input-buffer query.
 pub fn onSearchBackendReady(app: *App) !void {
@@ -176,5 +219,8 @@ pub fn onSearchBackendReady(app: *App) !void {
     const owned: []u8 = if (active.query.len > 0) try app.gpa.dupe(u8, active.query) else "";
     app.at_search.close(app.gpa);
     app.at_search = .{ .open = .{ .kind = kind_mention, .query = owned } };
+    // The backend just became ready: refresh results immediately, but still
+    // debounce a fresh query if the user is still typing.
+    app.at_search.refreshDebounce(app.io, 40);
     try refreshAtResults(app);
 }

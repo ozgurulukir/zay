@@ -1,27 +1,99 @@
+//! File search backend for the `@` at-search autocomplete: fuzzy filepath
+//! search over a background-walked index of the project tree. Matching is
+//! done by the vendored fzy C library (`vendor/fzy`), which scores
+//! candidates with a subsequence matcher.
+//!
+//! The index is built asynchronously with `io.concurrent` so the TUI render
+//! loop never stutters: `runIfReady` returns `null` while the walk is still
+//! in progress, and the caller (the `@` at-search popup) shows an
+//! "indexing…" state instead of blocking.
+
 const std = @import("std");
 const c = @import("c");
-const dynlib = @import("dynlib");
-const bash = @import("tools/bash_exec.zig");
 
 const assert = std.debug.assert;
 
 const page_size: u32 = 50;
-const grep_max_file_size: u64 = 10 * 1024 * 1024;
+
+/// Directory basenames that are always skipped while indexing. These are the
+/// usual build output / dependency cache / version-control directories across
+/// ecosystems, and they are ignored even when a project has no .gitignore.
+const always_ignored_dirs: []const []const u8 = &.{
+    ".git",
+    ".zig-cache",
+    "zig-out",
+    "node_modules",
+    "vendor", // vendored deps are typically not user-edited source
+    "dist",
+    "build",
+    "out",
+    "target", // Rust
+    ".cargo",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".venv",
+    "venv",
+    ".tox",
+    "*.egg-info", // actual dirs end without the star; literal match below
+    ".gradle",
+    ".idea",
+    ".vscode",
+    ".vs",
+    "obj", // C/C# build dirs
+    "bin",
+    "Debug",
+    "Release",
+    "x64",
+    "x86",
+    "CMakeFiles",
+    "CMakeCache.txt",
+    ".stack-work", // Haskell
+    ".cabal-sandbox",
+    "_build", // Elixir / Erlang
+    "deps", // Elixir deps
+    "priv",
+    ".elixir-tools",
+    "Pods", // CocoaPods
+    ".bundle",
+    "DerivedData",
+    ".next", // Next.js
+    ".nuxt",
+    ".output",
+    ".svelte-kit",
+    "storybook-static",
+    ".parcel-cache",
+    ".cache",
+    ".turbo",
+    ".vercel",
+    "coverage",
+    "site-packages",
+    "dist-packages",
+    "target-assert",
+    "target-release",
+    ".gitkeep",
+};
+
+/// True when `name` is one of the directory basenames we never recurse into.
+fn isIgnoredDir(name: []const u8) bool {
+    for (always_ignored_dirs) |ignored| {
+        if (std.mem.eql(u8, name, ignored)) return true;
+    }
+    return false;
+}
 
 pub const Op = enum {
     find,
-    grep,
 
     pub fn name(self: Op) []const u8 {
         return ops_names[@intFromEnum(self)];
     }
 };
 
-const ops_names = [_][]const u8{ "find", "grep" };
+const ops_names = [_][]const u8{"find"};
 
 pub const ops_by_name = std.StaticStringMap(Op).initComptime(.{
     .{ "find", .find },
-    .{ "grep", .grep },
 });
 
 pub const Request = struct {
@@ -30,10 +102,13 @@ pub const Request = struct {
     cursor: ?[]const u8 = null,
 };
 
+pub const ResultStatus = enum { ok, err };
+
 pub const Result = struct {
     stdout: []u8,
     stderr: []u8,
     code: u8,
+    status: ResultStatus = .ok,
 
     pub fn deinit(self: *Result, gpa: std.mem.Allocator) void {
         gpa.free(self.stdout);
@@ -48,42 +123,24 @@ const Cursor = struct {
     query_hash: u64,
 };
 
-const CreateInstanceFn = *const fn ([*:0]const u8, ?[*:0]const u8, ?[*:0]const u8, bool, bool, bool, bool, bool, ?[*:0]const u8, ?[*:0]const u8, u64, u64, u64) callconv(.c) *c.FffResult;
-const DestroyFn = *const fn (?*anyopaque) callconv(.c) void;
-const FreeResultFn = *const fn (*c.FffResult) callconv(.c) void;
-const FreeGrepResultFn = *const fn (*c.FffGrepResult) callconv(.c) void;
-const FreeMixedSearchResultFn = *const fn (*c.FffMixedSearchResult) callconv(.c) void;
-const LiveGrepFn = *const fn (?*anyopaque, [*:0]const u8, u8, u64, u32, bool, u32, u32, u64, u32, u32, bool) callconv(.c) *c.FffResult;
-const SearchMixedFn = *const fn (?*anyopaque, [*:0]const u8, ?[*:0]const u8, u32, u32, u32, i32, u32) callconv(.c) *c.FffResult;
-const IsScanningFn = *const fn (?*anyopaque) callconv(.c) bool;
-
-const Api = struct {
-    lib: dynlib,
-    create_instance2: CreateInstanceFn,
-    destroy: DestroyFn,
-    free_result: FreeResultFn,
-    free_grep_result: FreeGrepResultFn,
-    free_mixed_search_result: FreeMixedSearchResultFn,
-    live_grep: LiveGrepFn,
-    search_mixed: SearchMixedFn,
-    is_scanning: IsScanningFn,
-
-    fn close(self: *Api) void {
-        self.lib.close();
-        self.* = undefined;
-    }
+/// A single indexed filepath. `path` points into the backend's slab
+/// (`Backend.ready.files`), so it is only valid while the backend is ready.
+const FileEntry = struct {
+    path: []const u8,
+    is_dir: bool,
 };
 
 const InitOutcome = union(enum) {
-    ready: struct { api: Api, handle: *anyopaque },
+    ready: struct {
+        /// Slab of null-terminated filepaths, one per `count` entry.
+        files: []u8,
+        count: usize,
+    },
     failed: []u8, // gpa-owned
 
     fn deinit(self: *InitOutcome, gpa: std.mem.Allocator) void {
         switch (self.*) {
-            .ready => |*r| {
-                r.api.destroy(r.handle);
-                r.api.close();
-            },
+            .ready => |r| gpa.free(r.files),
             .failed => |msg| if (msg.len > 0) gpa.free(msg),
         }
         self.* = undefined;
@@ -96,9 +153,15 @@ const Backend = struct {
     /// (future/done/api/handle/failed/failure_message) allowed illegal
     /// combinations like future=null with api set, or failed=true with
     /// future still pending. The union makes those unrepresentable.
-    /// `handle: *anyopaque` stays opaque because it's the C library's
-    /// owned instance pointer (fff FFI standard).
     state: State = .idle,
+    /// Current interactive search (if any). Separate from `state` so an
+    /// in-progress search can run while the index is ready, and so a new
+    /// keystroke can cancel/replace a previous search without waiting for it.
+    search: SearchState = .idle,
+    /// Monotonic counter incremented every time the index is rebuilt
+    /// (`start` / `restart`). Search results carry the generation they were
+    /// computed against; stale results are discarded after a `restart`.
+    index_generation: u64 = 0,
 
     pub const State = union(enum) {
         idle,
@@ -109,93 +172,104 @@ const Backend = struct {
             done: std.atomic.Value(bool),
         },
         ready: struct {
-            api: Api,
-            /// fff C library handle — opaque by design (FFI boundary).
-            handle: *anyopaque,
+            /// Slab of null-terminated filepaths, one per `count` entry.
+            files: []u8,
+            count: usize,
         },
         failed: struct {
             message: []u8,
         },
     };
 
-    /// Backward-compat: future != null.
-    fn future(self: *const Backend) ?std.Io.Future(InitOutcome) {
+    pub const SearchState = union(enum) {
+        idle,
+        running: struct {
+            future: std.Io.Future(?Result),
+            done: *std.atomic.Value(bool),
+            query_hash: u64,
+            /// The index generation this search was started against.
+            generation: u64,
+            /// A copy of the ready index slab at the moment the search was
+            /// started. The task borrows this copy so that deinit/restart can
+            /// free the Backend's slab without racing the background worker.
+            files_copy: []u8,
+            count: usize,
+        },
+    };
+
+    /// Caller-owned copy of the current failure message, or null when the
+    /// backend is not in the failed state. The caller must free with `gpa`.
+    pub fn lastFailure(self: *const Backend, gpa: std.mem.Allocator) ?[]u8 {
         return switch (self.state) {
-            .loading => |l| l.future,
+            .failed => |f| gpa.dupe(u8, f.message) catch null,
             else => null,
-        };
-    }
-    /// Backward-compat: done flag (default false when not loading).
-    fn doneFlag(self: *const Backend) ?*std.atomic.Value(bool) {
-        return switch (self.*) {
-            .loading => |*l| &l.done,
-            else => null,
-        };
-    }
-    /// Backward-compat: api (null when not ready).
-    fn apiOpt(self: *Backend) ?*Api {
-        return switch (self.state) {
-            .ready => |*r| &r.api,
-            else => null,
-        };
-    }
-    /// Backward-compat: handle (null when not ready).
-    fn handleOpt(self: *const Backend) ?*anyopaque {
-        return switch (self.state) {
-            .ready => |r| r.handle,
-            else => null,
-        };
-    }
-    /// Backward-compat: failed flag.
-    fn isFailed(self: *const Backend) bool {
-        return self.state == .failed;
-    }
-    /// Backward-compat: failure message (empty when not failed).
-    fn failureMessage(self: *const Backend) []u8 {
-        return switch (self.state) {
-            .failed => |f| f.message,
-            else => &.{},
         };
     }
 };
 
-var backend: Backend = .{};
+pub var backend: Backend = .{};
 
-fn initBackend(gpa: std.mem.Allocator, cwd: []u8, done: *std.atomic.Value(bool)) InitOutcome {
+fn initBackend(gpa: std.mem.Allocator, io: std.Io, cwd: []u8, done: *std.atomic.Value(bool)) InitOutcome {
     defer {
         gpa.free(cwd);
         done.store(true, .release);
     }
 
-    var api = loadApi(gpa) catch |err| {
+    var files: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer files.deinit(gpa);
+    var count: usize = 0;
+
+    var dir = std.Io.Dir.openDir(.cwd(), io, cwd, .{ .iterate = true }) catch |err| {
         return .{ .failed = gpa.dupe(u8, @errorName(err)) catch &.{} };
     };
-    errdefer api.close();
+    defer dir.close(io);
 
-    const cwd_c = toCString(gpa, cwd) catch {
-        return .{ .failed = gpa.dupe(u8, "out of memory") catch &.{} };
+    var walker = dir.walkSelectively(gpa) catch |err| {
+        return .{ .failed = gpa.dupe(u8, @errorName(err)) catch &.{} };
     };
-    defer gpa.free(cwd_c);
+    defer walker.deinit();
 
-    const create_result = api.create_instance2(cwd_c.ptr, null, null, false, true, true, true, true, null, null, 0, 0, 0);
-    if (!create_result.success) {
-        const message: []u8 = gpa.dupe(u8, resultErrorMessage(create_result)) catch &.{};
-        api.free_result(create_result);
-        return .{ .failed = message };
+    while (walker.next(io) catch |err| {
+        return .{ .failed = gpa.dupe(u8, @errorName(err)) catch &.{} };
+    }) |entry| {
+        // Skip directories that are typically build output / caches / version
+        // control internals across ecosystems. We only check the basename
+        // (not the full path) for O(1) lookup; this covers the common cases
+        // like .git, node_modules, .zig-cache, target, etc.
+        if (entry.kind == .directory) {
+            if (isIgnoredDir(entry.basename)) continue;
+            walker.enter(io, entry) catch |err| {
+                return .{ .failed = gpa.dupe(u8, @errorName(err)) catch &.{} };
+            };
+        }
+        // Index regular files only. Directories are skipped — the `@`
+        // at-search popup filters them out anyway, and the find operation
+        // targets files.
+        if (entry.kind != .file) continue;
+        files.appendSlice(gpa, entry.path) catch |err| {
+            return .{ .failed = gpa.dupe(u8, @errorName(err)) catch &.{} };
+        };
+        files.append(gpa, 0) catch |err| { // null terminator
+            return .{ .failed = gpa.dupe(u8, @errorName(err)) catch &.{} };
+        };
+        count += 1;
     }
-    const handle = create_result.handle orelse {
-        api.free_result(create_result);
-        return .{ .failed = gpa.dupe(u8, "fff returned no handle") catch &.{} };
-    };
-    api.free_result(create_result);
 
-    return .{ .ready = .{ .api = api, .handle = handle } };
+    return .{ .ready = .{ .files = files.toOwnedSlice(gpa) catch |err| {
+        return .{ .failed = gpa.dupe(u8, @errorName(err)) catch &.{} };
+    }, .count = count } };
 }
 
 pub fn start(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) void {
     assert(cwd.len > 0);
+
+    backend.mutex.lock(io) catch return;
+    defer backend.mutex.unlock(io);
+
     // Already loading, ready, or failed — nothing to do.
     if (backend.state != .idle) return;
+
+    backend.index_generation += 1;
 
     const cwd_owned = gpa.dupe(u8, cwd) catch {
         backend.state = .{ .failed = .{ .message = gpa.dupe(u8, "out of memory") catch &.{} } };
@@ -209,7 +283,7 @@ pub fn start(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) void {
         },
     };
     const done_ptr = &backend.state.loading.done;
-    backend.state.loading.future = io.concurrent(initBackend, .{ gpa, cwd_owned, done_ptr }) catch |err| {
+    backend.state.loading.future = io.concurrent(initBackend, .{ gpa, io, cwd_owned, done_ptr }) catch |err| {
         gpa.free(cwd_owned);
         backend.state = .{ .failed = .{ .message = gpa.dupe(u8, @errorName(err)) catch &.{} } };
         return;
@@ -217,52 +291,183 @@ pub fn start(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) void {
 }
 
 pub fn deinit(gpa: std.mem.Allocator, io: std.Io) void {
+    backend.mutex.lock(io) catch return;
+    defer backend.mutex.unlock(io);
+
     if (backend.state == .loading) {
         var future = backend.state.loading.future;
         var outcome = future.cancel(io);
         outcome.deinit(gpa);
     }
     if (backend.state == .ready) {
-        // destroy + close via the api pointer.
-        backend.state.ready.api.destroy(backend.state.ready.handle);
-        backend.state.ready.api.close();
+        gpa.free(backend.state.ready.files);
     }
     if (backend.state == .failed and backend.state.failed.message.len > 0) {
         gpa.free(backend.state.failed.message);
     }
-    backend = .{};
+    if (backend.search == .running) {
+        const old = backend.search.running;
+        var future = old.future;
+        var result = future.cancel(io);
+        if (result) |*r| r.deinit(gpa);
+        gpa.destroy(old.done);
+    }
+    backend.state = .idle;
+    backend.search = .idle;
+    backend.index_generation = 0;
 }
 
-/// Release the current fff index (if any) and start indexing `cwd`.
+/// Release the current index (if any) and start indexing `cwd`.
 /// Called on session switch / cross-project resume so the old directory's
-/// index and its rayon worker threads are torn down before the new one
-/// starts. No-op when the backend is already indexing the same cwd.
+/// index is torn down before the new one starts. No-op when the backend is
+/// already indexing the same cwd.
 pub fn restart(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) void {
     assert(cwd.len > 0);
     deinit(gpa, io);
     start(gpa, io, cwd);
 }
 
-pub fn run(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, request: Request) !Result {
-    assert(cwd.len > 0);
-    assert(request.query.len > 0);
+fn searchTask(gpa: std.mem.Allocator, files: []u8, count: usize, query: []u8, done: *std.atomic.Value(bool)) ?Result {
+    // `files` is task-owned: a copy of the ready slab made in queryAsync.
+    // This lets deinit/restart free the Backend's slab without racing the
+    // background worker.
+    // `done` is owned by the caller (queryAsync/poll/cancel); the task only
+    // writes to it and never frees it. `query` is task-owned.
+    defer {
+        gpa.free(files);
+        gpa.free(query);
+    }
+    const query_c = gpa.dupeZ(u8, query) catch return null;
+    defer gpa.free(query_c);
 
-    if (try runReadyBackend(gpa, io, request)) |result| return result;
-    return runFallback(gpa, io, cwd, request);
+    const request: Request = .{ .op = .find, .query = query };
+    const result = runFind(gpa, request, files, count) catch |err| {
+        done.store(true, .release);
+        return failResult(gpa, @errorName(err)) catch null;
+    };
+    done.store(true, .release);
+    return result;
 }
 
-/// Non-blocking variant for interactive callers (e.g. the `@` file-search
-/// autocomplete). Queries the in-memory `fff` index only and returns `null`
-/// when it is still scanning or hasn't finished initializing — never falls
-/// back to the shell, so it won't stutter the render loop.
+fn failResult(gpa: std.mem.Allocator, message: []const u8) !Result {
+    assert(message.len > 0);
+    return .{
+        .stdout = try gpa.dupe(u8, message),
+        .stderr = try gpa.alloc(u8, 0),
+        .code = 2,
+        .status = .err,
+    };
+}
+
+pub fn queryAsync(gpa: std.mem.Allocator, io: std.Io, request: Request) !void {
+    try backend.mutex.lock(io);
+    defer backend.mutex.unlock(io);
+
+    // Drain any ready index future first (same as runReadyBackend).
+    if (backend.state == .loading and backend.state.loading.done.load(.acquire)) {
+        const outcome = backend.state.loading.future.await(io);
+        switch (outcome) {
+            .ready => |r| backend.state = .{ .ready = .{ .files = r.files, .count = r.count } },
+            .failed => |msg| backend.state = .{ .failed = .{ .message = msg } },
+        }
+    }
+
+    if (backend.state == .failed) return;
+    if (backend.state != .ready) return;
+
+    // Cancel an in-progress search for a different query. The task owns
+    // and frees its own slab copy, so we only clean up the done flag.
+    if (backend.search == .running) {
+        if (backend.search.running.query_hash == hashQuery(request.query)) return;
+        const old = backend.search.running;
+        var future = old.future;
+        var result = future.cancel(io);
+        if (result) |*r| r.deinit(gpa);
+        gpa.destroy(old.done);
+    }
+
+    const query_hash = hashQuery(request.query);
+    const owned_query = try gpa.dupe(u8, request.query);
+    errdefer gpa.free(owned_query);
+    const done_ptr = try gpa.create(std.atomic.Value(bool));
+    done_ptr.* = .init(false);
+
+    // Copy the ready slab so the task owns its data. This lets deinit/restart
+    // free the Backend's slab while the task is still running.
+    const files = backend.state.ready.files;
+    const count = backend.state.ready.count;
+    const files_copy = try gpa.dupe(u8, files);
+    errdefer gpa.free(files_copy);
+
+    const future = io.concurrent(searchTask, .{ gpa, files_copy, count, owned_query, done_ptr }) catch |err| {
+        gpa.destroy(done_ptr);
+        gpa.free(owned_query);
+        gpa.free(files_copy);
+        return err;
+    };
+    backend.search = .{ .running = .{
+        .future = future,
+        .done = done_ptr,
+        .query_hash = query_hash,
+        .generation = backend.index_generation,
+        .files_copy = files_copy,
+        .count = count,
+    } };
+}
+
+/// Non-blocking poll for an async search result. Returns `null` while the
+/// search is still running; returns the completed `Result` (caller owns)
+/// once it finishes. Returns `null` and clears state if the backend is not
+/// ready or has failed, or if the result belongs to an index generation that
+/// has been superseded by a restart.
+pub fn pollSearchResult(gpa: std.mem.Allocator, io: std.Io) !?Result {
+    try backend.mutex.lock(io);
+    defer backend.mutex.unlock(io);
+
+    if (backend.search != .running) return null;
+    if (!backend.search.running.done.load(.acquire)) return null;
+
+    const running = backend.search.running;
+    var future = running.future;
+    const result = future.await(io);
+    const done_ptr = running.done;
+    const search_generation = running.generation;
+    backend.search = .idle;
+    gpa.destroy(done_ptr);
+
+    // If the index was restarted while this search was in flight, the
+    // result belongs to a stale slab. Discard it silently; the UI will
+    // re-issue the current query once the new index is ready.
+    if (search_generation != backend.index_generation) {
+        var stale = result;
+        if (stale) |*r| r.deinit(gpa);
+        return null;
+    }
+
+    // Result is task-owned; caller takes ownership.
+    return result;
+}
+
+pub fn cancelSearch(gpa: std.mem.Allocator, io: std.Io) void {
+    if (backend.search == .running) {
+        const old = backend.search.running;
+        var future = old.future;
+        var result = future.cancel(io);
+        if (result) |*r| r.deinit(gpa);
+        gpa.destroy(old.done);
+        backend.search = .idle;
+    }
+}
+
+pub fn isIndexing() bool {
+    return backend.state == .loading;
+}
+
 pub fn runIfReady(gpa: std.mem.Allocator, io: std.Io, request: Request) !?Result {
-    assert(request.query.len > 0);
     return runReadyBackend(gpa, io, request);
 }
 
 fn runReadyBackend(gpa: std.mem.Allocator, io: std.Io, request: Request) !?Result {
-    assert(request.query.len > 0);
-
     try backend.mutex.lock(io);
     defer backend.mutex.unlock(io);
 
@@ -270,121 +475,75 @@ fn runReadyBackend(gpa: std.mem.Allocator, io: std.Io, request: Request) !?Resul
     if (backend.state == .loading and backend.state.loading.done.load(.acquire)) {
         const outcome = backend.state.loading.future.await(io);
         switch (outcome) {
-            .ready => |r| backend.state = .{ .ready = .{ .api = r.api, .handle = r.handle } },
+            .ready => |r| backend.state = .{ .ready = .{ .files = r.files, .count = r.count } },
             .failed => |msg| backend.state = .{ .failed = .{ .message = msg } },
         }
     }
 
-    if (backend.isFailed()) return null;
-    const api = backend.apiOpt() orelse return null;
-    const handle = backend.handleOpt() orelse return null;
-    if (request.op == .grep and api.is_scanning(handle)) return null;
-    return runFff(gpa, request, api, handle) catch |err| switch (err) {
-        error.OutOfMemory, error.InvalidCursor => err,
-        else => {
-            if (backend.failureMessage().len > 0) gpa.free(backend.failureMessage());
-            backend.state = .{ .failed = .{ .message = gpa.dupe(u8, @errorName(err)) catch &.{} } };
-            return null;
-        },
-    };
+    if (backend.state == .failed) return null;
+    if (backend.state != .ready) return null;
+    const files = backend.state.ready.files;
+    const count = backend.state.ready.count;
+
+    return try runFind(gpa, request, files, count);
 }
 
-fn loadApi(gpa: std.mem.Allocator) !Api {
-    const search_dirs: []const []const u8 = &.{
-        "vendor/fff",
-        "third_party/fff/target/release",
-        "", // falls back to the OS library search path.
-    };
-    for (search_dirs) |dir| {
-        var lib = dynlib.open(gpa, dir, "fff_c") catch continue;
-        errdefer lib.close();
-        return .{
-            .lib = lib,
-            .create_instance2 = lib.lookup(CreateInstanceFn, "fff_create_instance2") orelse return error.MissingSymbol,
-            .destroy = lib.lookup(DestroyFn, "fff_destroy") orelse return error.MissingSymbol,
-            .free_result = lib.lookup(FreeResultFn, "fff_free_result") orelse return error.MissingSymbol,
-            .free_grep_result = lib.lookup(FreeGrepResultFn, "fff_free_grep_result") orelse return error.MissingSymbol,
-            .free_mixed_search_result = lib.lookup(FreeMixedSearchResultFn, "fff_free_mixed_search_result") orelse return error.MissingSymbol,
-            .live_grep = lib.lookup(LiveGrepFn, "fff_live_grep") orelse return error.MissingSymbol,
-            .search_mixed = lib.lookup(SearchMixedFn, "fff_search_mixed") orelse return error.MissingSymbol,
-            .is_scanning = lib.lookup(IsScanningFn, "fff_is_scanning") orelse return error.MissingSymbol,
-        };
-    }
-    return error.LibraryNotFound;
-}
-
-fn runFff(gpa: std.mem.Allocator, request: Request, api: *Api, handle: *anyopaque) !Result {
-    assert(request.query.len > 0);
-    return switch (request.op) {
-        .find => runFffFind(gpa, request, api, handle),
-        .grep => runFffGrep(gpa, request, api, handle),
-    };
-}
-
-fn runFffGrep(gpa: std.mem.Allocator, request: Request, api: *Api, handle: *anyopaque) !Result {
+/// Score every indexed path against the query with fzy and return the top
+/// `page_size` matches, honoring the cursor for pagination.
+fn runFind(gpa: std.mem.Allocator, request: Request, files: []const u8, count: usize) !Result {
     const cursor = try parseCursorForRequest(request);
-    const query_c = try toCString(gpa, request.query);
-    defer gpa.free(query_c);
+    const query_c = if (request.query.len > 0) try gpa.dupeZ(u8, request.query) else "";
+    defer if (request.query.len > 0) gpa.free(query_c);
 
-    const ffi_result = api.live_grep(handle, query_c.ptr, 1, grep_max_file_size, 0, true, cursor.offset, page_size, 0, 0, 0, true);
-    const grep_result = try unwrapHandle(c.FffGrepResult, api, ffi_result);
-    defer api.free_grep_result(grep_result);
+    // Collect (score, index) pairs for every matching path.
+    const Scored = struct { score: c.score_t, index: usize };
+    var scored: std.ArrayListUnmanaged(Scored) = .empty;
+    defer scored.deinit(gpa);
 
-    if (grep_result.regex_fallback_error) |message| {
-        return fail(gpa, std.mem.span(message));
+    var offset: usize = 0;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const path_len = std.mem.indexOfScalarPos(u8, files, offset, 0) orelse break;
+        const path_ptr = files[offset..].ptr;
+        offset += path_len + 1;
+        if (path_len == 0) continue;
+        if (request.query.len == 0) {
+            // Empty query: include every file with a neutral score so results
+            // stay in walk order (the sort below is stable for equal scores).
+            try scored.append(gpa, .{ .score = 0, .index = i });
+        } else if (c.has_match(query_c.ptr, path_ptr) != 0) {
+            try scored.append(gpa, .{ .score = c.match(query_c.ptr, path_ptr), .index = i });
+        }
     }
-    if (grep_result.count == 0) return okText(gpa, "0 matches.\n");
-    return formatGrep(gpa, request, grep_result);
-}
 
-fn runFffFind(gpa: std.mem.Allocator, request: Request, api: *Api, handle: *anyopaque) !Result {
-    const cursor = try parseCursorForRequest(request);
-    const query_c = try toCString(gpa, request.query);
-    defer gpa.free(query_c);
+    // Sort descending by score (stable — ties keep walk order).
+    std.mem.sort(Scored, scored.items, {}, struct {
+        fn lessThan(_: void, a: Scored, b: Scored) bool {
+            return a.score > b.score;
+        }
+    }.lessThan);
 
-    const ffi_result = api.search_mixed(handle, query_c.ptr, null, 0, cursor.offset, page_size, 100, 3);
-    const mixed_result = try unwrapHandle(c.FffMixedSearchResult, api, ffi_result);
-    defer api.free_mixed_search_result(mixed_result);
-    return formatFind(gpa, request, mixed_result);
-}
+    const total = scored.items.len;
+    const start_idx = @min(cursor.offset, @as(u32, @intCast(total)));
+    const end = @min(start_idx + page_size, @as(u32, @intCast(total)));
 
-fn formatGrep(gpa: std.mem.Allocator, request: Request, result: *c.FffGrepResult) !Result {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     const writer = &out.writer;
 
-    var index: u32 = 0;
-    while (index < result.count) : (index += 1) {
-        const item = &result.items[index];
-        try writer.print("{s}:{}:{s}\n", .{
-            spanOrEmpty(item.relative_path),
-            item.line_number,
-            spanOrEmpty(item.line_content),
-        });
+    if (total == 0) {
+        try writer.writeAll("0 results.\n");
+    } else {
+        var k: u32 = start_idx;
+        while (k < end) : (k += 1) {
+            const entry = scored.items[k];
+            const path = entryPath(files, count, entry.index);
+            try writer.print("{s}\n", .{path});
+        }
     }
-    if (result.next_file_offset > 0) {
-        const cursor = try encodeCursor(gpa, .{ .op = .grep, .offset = result.next_file_offset, .query_hash = hashQuery(request.query) });
-        defer gpa.free(cursor);
-        try writer.print("\nMore results available. Pass cursor=\"{s}\" to continue.\n", .{cursor});
-    }
-    return okOwned(gpa, try out.toOwnedSlice());
-}
 
-fn formatFind(gpa: std.mem.Allocator, request: Request, result: *c.FffMixedSearchResult) !Result {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    const writer = &out.writer;
-    if (result.count == 0) try writer.writeAll("0 results.\n");
-    var index: u32 = 0;
-    while (index < result.count) : (index += 1) {
-        const item = &result.items[index];
-        const suffix: []const u8 = if (item.item_type == 1) "/" else "";
-        try writer.print("{s}{s}\n", .{ spanOrEmpty(item.relative_path), suffix });
-    }
-    const total = result.total_matched;
-    const cursor = try parseCursorForRequest(request);
-    const next_offset = cursor.offset + result.count;
-    if (result.count > 0 and next_offset < total) {
+    const next_offset = end;
+    if (end > start_idx and next_offset < total) {
         const more_count = total - next_offset;
         const next_cursor = try encodeCursor(gpa, .{ .op = .find, .offset = next_offset, .query_hash = hashQuery(request.query) });
         defer gpa.free(next_cursor);
@@ -393,51 +552,19 @@ fn formatFind(gpa: std.mem.Allocator, request: Request, result: *c.FffMixedSearc
     return okOwned(gpa, try out.toOwnedSlice());
 }
 
-fn runFallback(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, request: Request) !Result {
-    assert(cwd.len > 0);
-    assert(request.query.len > 0);
-    const command = try fallbackCommand(gpa, request.op, request.query);
-    defer gpa.free(command);
-
-    var result = bash.run(gpa, io, cwd, command) catch |err| return fail(gpa, @errorName(err));
-    defer result.deinit(gpa);
-    if (result.code == 0) return formatFallbackSuccess(gpa, result.stdout);
-    if (result.code == 1) return formatFallbackSuccess(gpa, result.stdout);
-    return .{
-        .stdout = try gpa.alloc(u8, 0),
-        .stderr = try std.fmt.allocPrint(gpa, "search fallback failed:\n{s}", .{result.stderr}),
-        .code = result.code,
-    };
-}
-
-fn fallbackCommand(gpa: std.mem.Allocator, op: Op, query: []const u8) ![]u8 {
-    const quoted = try quoteShell(gpa, query);
-    defer gpa.free(quoted);
-    return switch (op) {
-        .grep => std.fmt.allocPrint(gpa,
-            \\set -o pipefail; if command -v rg >/dev/null 2>&1; then rg --line-number --color never --no-heading -- {s} . | head -n 50; else grep -RInE --exclude-dir=.git -- {s} . | head -n 50; fi
-        , .{ quoted, quoted }),
-        .find => std.fmt.allocPrint(gpa,
-            \\set -o pipefail; {{ find . -mindepth 1 -type f -not -path './.git/*' 2>/dev/null; find . -mindepth 1 -type d -not -path './.git/*' 2>/dev/null | sed 's|$|/|'; }} | grep -F -- {s} | head -n 50
-        , .{quoted}),
-    };
-}
-
-fn formatFallbackSuccess(gpa: std.mem.Allocator, stdout: []const u8) !Result {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try out.writer.writeAll("Search index is unavailable or still starting; used shell fallback. Pagination unavailable.\n\n");
-    if (stdout.len == 0) {
-        try out.writer.writeAll("0 results.\n");
-    } else {
-        try out.writer.writeAll(stdout);
-        if (stdout[stdout.len - 1] != '\n') try out.writer.writeByte('\n');
+/// Return the `index`-th path from the slab.
+fn entryPath(files: []const u8, count: usize, index: usize) []const u8 {
+    assert(index < count);
+    var offset: usize = 0;
+    var i: usize = 0;
+    while (i < index) : (i += 1) {
+        const path = std.mem.sliceTo(files[offset..], 0);
+        offset += path.len + 1;
     }
-    return okOwned(gpa, try out.toOwnedSlice());
+    return std.mem.sliceTo(files[offset..], 0);
 }
 
 fn parseCursorForRequest(request: Request) !Cursor {
-    assert(request.query.len > 0);
     if (request.cursor) |raw| {
         const cursor = decodeCursor(raw) orelse return error.InvalidCursor;
         if (cursor.op != request.op) return error.InvalidCursor;
@@ -470,84 +597,106 @@ fn decodeCursor(raw: []const u8) ?Cursor {
 }
 
 fn hashQuery(query: []const u8) u64 {
-    assert(query.len > 0);
     return std.hash.Wyhash.hash(0x6e6f76615f736561, query);
-}
-
-fn quoteShell(gpa: std.mem.Allocator, value: []const u8) ![]u8 {
-    assert(value.len > 0);
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try out.writer.writeByte('\'');
-    for (value) |byte| {
-        if (byte == '\'') {
-            try out.writer.writeAll("'\\''");
-        } else {
-            try out.writer.writeByte(byte);
-        }
-    }
-    try out.writer.writeByte('\'');
-    return out.toOwnedSlice();
-}
-
-fn toCString(gpa: std.mem.Allocator, value: []const u8) ![:0]u8 {
-    assert(value.len > 0);
-    return gpa.dupeZ(u8, value);
-}
-
-fn unwrapHandle(comptime T: type, api: *Api, result: *c.FffResult) !*T {
-    if (!result.success) {
-        api.free_result(result);
-        return error.FffFailed;
-    }
-    const handle = result.handle orelse {
-        api.free_result(result);
-        return error.FffFailed;
-    };
-    api.free_result(result);
-    return @ptrCast(@alignCast(handle));
-}
-
-fn resultErrorMessage(result: *c.FffResult) []const u8 {
-    if (@field(result, "error")) |ptr| return std.mem.span(ptr);
-    return "fff failed";
-}
-
-fn spanOrEmpty(ptr: ?[*:0]u8) []const u8 {
-    return if (ptr) |value| std.mem.span(value) else "";
-}
-
-fn okText(gpa: std.mem.Allocator, text: []const u8) !Result {
-    return okOwned(gpa, try gpa.dupe(u8, text));
 }
 
 fn okOwned(gpa: std.mem.Allocator, stdout: []u8) !Result {
     return .{ .stdout = stdout, .stderr = try gpa.alloc(u8, 0), .code = 0 };
 }
 
-fn fail(gpa: std.mem.Allocator, message: []const u8) !Result {
-    assert(message.len > 0);
-    return .{ .stdout = try gpa.alloc(u8, 0), .stderr = try gpa.dupe(u8, message), .code = 2 };
-}
-
 test "cursor validates op and query" {
     const gpa = std.testing.allocator;
-    const cursor = try encodeCursor(gpa, .{ .op = .grep, .offset = 50, .query_hash = hashQuery("abc") });
+    const cursor = try encodeCursor(gpa, .{ .op = .find, .offset = 50, .query_hash = hashQuery("abc") });
     defer gpa.free(cursor);
     const parsed = decodeCursor(cursor) orelse return error.TestFailed;
-    try std.testing.expectEqual(Op.grep, parsed.op);
+    try std.testing.expectEqual(Op.find, parsed.op);
     try std.testing.expectEqual(@as(u32, 50), parsed.offset);
     try std.testing.expectEqual(hashQuery("abc"), parsed.query_hash);
 }
 
-test "shell quoting handles single quotes" {
+test "fzy match scores a subsequence" {
     const gpa = std.testing.allocator;
-    const quoted = try quoteShell(gpa, "can't");
-    defer gpa.free(quoted);
-    try std.testing.expectEqualStrings("'can'\\''t'", quoted);
+    const needle = try gpa.dupeZ(u8, "main");
+    defer gpa.free(needle);
+    const hay = try gpa.dupeZ(u8, "src/main.zig");
+    defer gpa.free(hay);
+    try std.testing.expect(c.has_match(needle.ptr, hay.ptr) != 0);
+    try std.testing.expect(c.match(needle.ptr, hay.ptr) > 0);
 }
 
-test "fff search initializes and finds files" {
+test "async query returns results" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    start(gpa, io, ".");
+    defer deinit(gpa, io);
+
+    // Wait for index.
+    var tries: usize = 0;
+    while (tries < 50) : (tries += 1) {
+        if (try runIfReady(gpa, io, .{ .op = .find, .query = "main" })) |result| {
+            var res = result;
+            defer res.deinit(gpa);
+            break;
+        }
+        io.sleep(std.Io.Duration.fromNanoseconds(10 * 1000 * 1000), .awake) catch {};
+    } else return error.SearchStuckInIndexing;
+
+    // Start async search and poll until it completes.
+    try queryAsync(gpa, io, .{ .op = .find, .query = "main" });
+    var polls: usize = 0;
+    while (polls < 50) : (polls += 1) {
+        if (try pollSearchResult(gpa, io)) |result| {
+            var res = result;
+            defer res.deinit(gpa);
+            try std.testing.expect(res.stdout.len > 0);
+            return;
+        }
+        io.sleep(std.Io.Duration.fromNanoseconds(10 * 1000 * 1000), .awake) catch {};
+    }
+    return error.AsyncSearchStuck;
+}
+
+test "empty query returns all indexed files" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    start(gpa, io, ".");
+    defer deinit(gpa, io);
+
+    // Wait for index.
+    var tries: usize = 0;
+    while (tries < 50) : (tries += 1) {
+        if (try runIfReady(gpa, io, .{ .op = .find, .query = "" })) |result| {
+            var res = result;
+            defer res.deinit(gpa);
+            try std.testing.expect(res.stdout.len > 0);
+            break;
+        }
+        io.sleep(std.Io.Duration.fromNanoseconds(10 * 1000 * 1000), .awake) catch {};
+    } else return error.SearchStuckInIndexing;
+}
+
+test "start with nonexistent cwd transitions to failed" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    start(gpa, io, "/does-not-exist-nova-test");
+    defer deinit(gpa, io);
+
+    var tries: usize = 0;
+    while (tries < 50) : (tries += 1) {
+        _ = try runIfReady(gpa, io, .{ .op = .find, .query = "main" });
+        if (backend.lastFailure(gpa)) |msg| {
+            defer gpa.free(msg);
+            try std.testing.expect(msg.len > 0);
+            return;
+        }
+        io.sleep(std.Io.Duration.fromNanoseconds(10 * 1000 * 1000), .awake) catch {};
+    } else return error.SearchStuckInIndexing;
+}
+
+test "rapid queryAsync with different queries cancels cleanly" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -556,13 +705,123 @@ test "fff search initializes and finds files" {
 
     var tries: usize = 0;
     while (tries < 50) : (tries += 1) {
-        if (try runIfReady(gpa, io, .{ .op = .find, .query = "main" })) |result| {
+        if (try runIfReady(gpa, io, .{ .op = .find, .query = "a" })) |result| {
             var res = result;
             defer res.deinit(gpa);
+            break;
+        }
+        io.sleep(std.Io.Duration.fromNanoseconds(10 * 1000 * 1000), .awake) catch {};
+    } else return error.SearchStuckInIndexing;
+
+    // Fire a sequence of different queries; only one should win. Each
+    // different query implicitly cancels the previous one via queryAsync.
+    for ([_][]const u8{ "a", "ab", "abc", "abcd", "main" }) |q| {
+        try queryAsync(gpa, io, .{ .op = .find, .query = q });
+    }
+
+    var polls: usize = 0;
+    while (polls < 50) : (polls += 1) {
+        if (try pollSearchResult(gpa, io)) |result| {
+            var res = result;
+            defer res.deinit(gpa);
+            try std.testing.expect(res.status == .ok);
             try std.testing.expect(res.stdout.len > 0);
             return;
         }
         io.sleep(std.Io.Duration.fromNanoseconds(10 * 1000 * 1000), .awake) catch {};
     }
-    return error.SearchStuckInIndexing;
+    return error.AsyncSearchStuck;
+}
+
+test "restart discards stale in-flight result" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    start(gpa, io, ".");
+    defer deinit(gpa, io);
+
+    // Wait for the first index.
+    var tries: usize = 0;
+    while (tries < 50) : (tries += 1) {
+        if (try runIfReady(gpa, io, .{ .op = .find, .query = "main" })) |result| {
+            var res = result;
+            defer res.deinit(gpa);
+            break;
+        }
+        io.sleep(std.Io.Duration.fromNanoseconds(10 * 1000 * 1000), .awake) catch {};
+    } else return error.SearchStuckInIndexing;
+
+    // Start a long-running broad query and restart before it finishes.
+    try queryAsync(gpa, io, .{ .op = .find, .query = "a" });
+    restart(gpa, io, ".");
+
+    // The old search result must be discarded because the generation changed.
+    var polls: usize = 0;
+    while (polls < 5) : (polls += 1) {
+        if (try pollSearchResult(gpa, io)) |result| {
+            var res = result;
+            defer res.deinit(gpa);
+            return error.StaleResultNotDiscarded;
+        }
+        io.sleep(std.Io.Duration.fromNanoseconds(10 * 1000 * 1000), .awake) catch {};
+    }
+
+    // After the new index is ready, a fresh query must succeed.
+    tries = 0;
+    while (tries < 50) : (tries += 1) {
+        if (try runIfReady(gpa, io, .{ .op = .find, .query = "main" })) |result| {
+            var res = result;
+            defer res.deinit(gpa);
+            break;
+        }
+        io.sleep(std.Io.Duration.fromNanoseconds(10 * 1000 * 1000), .awake) catch {};
+    } else return error.SearchStuckInIndexing;
+
+    try queryAsync(gpa, io, .{ .op = .find, .query = "main" });
+
+    polls = 0;
+    while (polls < 50) : (polls += 1) {
+        if (try pollSearchResult(gpa, io)) |result| {
+            var res = result;
+            defer res.deinit(gpa);
+            try std.testing.expect(res.status == .ok);
+            try std.testing.expect(res.stdout.len > 0);
+            return;
+        }
+        io.sleep(std.Io.Duration.fromNanoseconds(10 * 1000 * 1000), .awake) catch {};
+    }
+    return error.AsyncSearchStuck;
+}
+
+test "async search for same query is debounced" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    start(gpa, io, ".");
+    defer deinit(gpa, io);
+
+    // Wait for index.
+    var tries: usize = 0;
+    while (tries < 50) : (tries += 1) {
+        if (try runIfReady(gpa, io, .{ .op = .find, .query = "main" })) |result| {
+            var res = result;
+            defer res.deinit(gpa);
+            break;
+        }
+        io.sleep(std.Io.Duration.fromNanoseconds(10 * 1000 * 1000), .awake) catch {};
+    } else return error.SearchStuckInIndexing;
+
+    try queryAsync(gpa, io, .{ .op = .find, .query = "main" });
+    try queryAsync(gpa, io, .{ .op = .find, .query = "main" }); // same query should be a no-op
+
+    var polls: usize = 0;
+    while (polls < 50) : (polls += 1) {
+        if (try pollSearchResult(gpa, io)) |result| {
+            var res = result;
+            defer res.deinit(gpa);
+            return;
+        }
+        io.sleep(std.Io.Duration.fromNanoseconds(10 * 1000 * 1000), .awake) catch {};
+    }
+    return error.AsyncSearchStuck;
 }

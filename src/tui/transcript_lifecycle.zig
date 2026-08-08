@@ -40,10 +40,10 @@ pub fn installRuntime(app: *App, runtime: *runtime_mod.AgentRuntime) !void {
         old.deinit();
         app.gpa.destroy(old);
     }
-    // Tear down the stale fff index and re-index the new project directory.
-    // The old index's rayon worker threads keep scanning the previous cwd
-    // until destroyed; releasing here prevents stale search results and
-    // frees the embedding memory before the new index allocates.
+    // Tear down the stale search index and re-index the new project directory.
+    // The old walk's worker thread keeps scanning the previous cwd until
+    // destroyed; releasing here prevents stale search results and frees the
+    // index memory before the new walk allocates.
     if (cwd_changed) search_mod.restart(app.gpa, app.io, runtime.cwd);
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = true } };
     app.thread.agent = &runtime.agent;

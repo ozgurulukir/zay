@@ -40,11 +40,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "bounded_queue", .module = bounded_queue_mod },
         },
     });
-    const dynlib_mod = b.createModule(.{
-        .root_source_file = b.path("lib/dynlib.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
     const counting_allocator_mod = b.createModule(.{
         .root_source_file = b.path("lib/counting_allocator.zig"),
         .target = target,
@@ -64,9 +59,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    translate_c.addIncludePath(b.path("vendor/fff"));
     translate_c.addIncludePath(b.path("vendor/sqlite"));
     translate_c.addIncludePath(b.path("vendor/lua"));
+    translate_c.addIncludePath(b.path("vendor/fzy"));
+    translate_c.addIncludePath(b.path("vendor/fzy/src"));
     const c_mod = translate_c.createModule();
 
     const mod = b.addModule("nova", .{
@@ -78,7 +74,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
             .{ .name = "websocket", .module = websocket_mod },
             .{ .name = "logger", .module = logger_mod },
-            .{ .name = "dynlib", .module = dynlib_mod },
             .{ .name = "terminal_markdown", .module = terminal_markdown_mod },
             .{ .name = "counting_allocator", .module = counting_allocator_mod },
             .{ .name = "c", .module = c_mod },
@@ -91,6 +86,8 @@ pub fn build(b: *std.Build) void {
     // for gdb without needing the UBSan runtime library.
     if (optimize == .Debug) mod.sanitize_c = .trap;
     mod.addIncludePath(b.path("vendor/lua"));
+    mod.addIncludePath(b.path("vendor/fzy"));
+    mod.addIncludePath(b.path("vendor/fzy/src"));
     // Native keychain backends (src/keyring.zig): Windows Credential Manager
     // lives in advapi32; macOS Keychain Services needs Security (+ CoreFoundation
     // for CFRelease). Other targets use the plaintext file fallback.
@@ -246,6 +243,10 @@ pub fn build(b: *std.Build) void {
         .file = b.path("vendor/lua/lzio.c"),
         .flags = &.{"-std=c99"},
     });
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/fzy/src/match.c"),
+        .flags = &.{"-std=c99"},
+    });
 
     // If neither case applies to you, feel free to delete the declaration you
     // don't need and to put everything under a single module.
@@ -274,7 +275,6 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
                 .{ .name = "websocket", .module = websocket_mod },
                 .{ .name = "logger", .module = logger_mod },
-                .{ .name = "dynlib", .module = dynlib_mod },
                 .{ .name = "terminal_markdown", .module = terminal_markdown_mod },
             },
         }),

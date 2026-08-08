@@ -57,6 +57,16 @@ pub const AtSearchState = union(enum) {
         query: []const u8 = "",
         results: std.ArrayList([]const u8) = .empty,
         selection: u32 = 0,
+        /// True when an async fuzzy search for the current `query` is still
+        /// in progress. The UI may keep showing stale results until it
+        /// completes.
+        searching: bool = false,
+        /// Optional inline error / status notice shown below the result list.
+        /// Owned by the state; freed on `close`.
+        notice: ?[]u8 = null,
+        /// Debounce deadline for the next async search. The render loop
+        /// waits until `now >= deadline` before starting/polling a search.
+        debounce_deadline: ?std.Io.Timestamp = null,
     };
 
     /// Convenience: the kind of mention being searched, regardless of
@@ -101,11 +111,33 @@ pub const AtSearchState = union(enum) {
             },
             .open => |*o| {
                 if (o.query.len > 0) gpa.free(o.query);
+                if (o.notice) |n| gpa.free(n);
                 for (o.results.items) |path| gpa.free(path);
                 o.results.deinit(gpa);
             },
         }
         self.* = .closed;
+    }
+
+    /// Return true when no debounce deadline is set or it has already
+    /// expired. The render loop uses this to coalesce rapid query changes.
+    pub fn debounceExpired(self: *const AtSearchState, io: std.Io) bool {
+        const deadline = switch (self.*) {
+            .open => |o| o.debounce_deadline,
+            .indexing => null,
+            .closed => null,
+        } orelse return true;
+
+        const now = std.Io.Timestamp.now(io, .awake);
+        return now.nanoseconds >= deadline.nanoseconds;
+    }
+
+    /// Push the debounce deadline forward by `ms` from now.
+    /// No-op when the popup is not open.
+    pub fn refreshDebounce(self: *AtSearchState, io: std.Io, ms: u64) void {
+        if (self.* != .open) return;
+        const now = std.Io.Timestamp.now(io, .awake);
+        self.open.debounce_deadline = .{ .nanoseconds = now.nanoseconds + @as(i96, ms) * std.time.ns_per_ms };
     }
 };
 

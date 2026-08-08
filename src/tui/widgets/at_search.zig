@@ -35,6 +35,10 @@ pub const AtSearchWidget = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *AtSearchWidget = @ptrCast(@alignCast(ptr));
+        const notice: []const u8 = if (self.app.at_search == .open)
+            self.app.at_search.open.notice orelse ""
+        else
+            "";
         var content: Content = .{
             .results = self.app.at_search.results.items,
             .selection = self.app.at_search.selection,
@@ -42,6 +46,7 @@ pub const AtSearchWidget = struct {
             .indexing = self.app.at_search.indexing,
             .sigil = if (self.app.at_search.kind == .file) '@' else '$',
             .title = if (self.app.at_search.kind == .file) "Files" else "Skills",
+            .notice = notice,
         };
         return content.widget().draw(ctx);
     }
@@ -63,6 +68,8 @@ pub const Content = struct {
     indexing: bool = false,
     sigil: u8 = '@',
     title: []const u8 = "Files",
+    /// Optional inline notice shown below results (e.g. a search error).
+    notice: []const u8 = "",
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -105,6 +112,10 @@ const Body = struct {
         const content = self.content;
         if (content.results.len == 0) {
             try panel.lineAt(&surface, 0, content.emptyMessage(), ctx, false, 0);
+            if (content.notice.len > 0 and surface.size.height > 1) {
+                const notice_text = try std.fmt.allocPrint(ctx.arena, "! {s}", .{content.notice});
+                try panel.lineAt(&surface, 1, notice_text, ctx, false, 0);
+            }
             return surface;
         }
 
@@ -119,6 +130,10 @@ const Body = struct {
             const prefix = "  ";
             const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, content.results[index] });
             try panel.lineAt(&surface, row, text, ctx, selected, 0);
+        }
+        if (content.notice.len > 0 and row < surface.size.height) {
+            const notice_text = try std.fmt.allocPrint(ctx.arena, "! {s}", .{content.notice});
+            try panel.lineAt(&surface, row, notice_text, ctx, false, 0);
         }
         return surface;
     }

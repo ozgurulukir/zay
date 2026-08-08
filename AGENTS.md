@@ -4,7 +4,8 @@ This project uses Zig 0.16. Consult the tigerstyle skill before writing code.
 
 ## Setup
 
-- Vendor `fff` (build into `vendor/fff/libfff_c.so`) and the ModernBERT ONNX model (`vendor/local-models/ModernBERT-bash-classifier`) after cloning. Both are gitignored.
+- The ModernBERT ONNX model (`vendor/local-models/ModernBERT-bash-classifier`) is vendored after cloning and gitignored.
+- `vendor/fzy/` is a vendored copy of the fzy fuzzy matcher (MIT) — it ships with the repo under `vendor/fzy/` and is compiled directly into the binary via `build.zig`; no separate build step is required.
 - Set `OMP_WAIT_POLICY=passive` at runtime to avoid MKL/CPU spin in the embedding worker.
 - `zig build install -Doptimize=ReleaseFast --prefix $HOME/.local` installs to `~/.local/bin/`.
 

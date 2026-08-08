@@ -88,9 +88,7 @@ Slash commands: `/connect` (providers & keys), `/model` (model & reasoning effor
 git clone https://github.com/ozgurulukir/nova-agent.git
 cd nova-agent
 
-# Vendor dependencies (fff + ModernBERT classifier)
-git clone --depth 1 https://github.com/dmtrKovalenko/fff third_party/fff
-make -C third_party/fff build-c-lib
+# Vendor dependency (ModernBERT classifier only; fzy ships in-tree)
 hf download P0u4a/ModernBERT-bash-classifier --local-dir vendor/local-models/ModernBERT-bash-classifier
 uv run --project vendor/local-models python vendor/local-models/export_onnx.py \
   --model-dir vendor/local-models/ModernBERT-bash-classifier \
@@ -107,7 +105,7 @@ zig build install -Doptimize=ReleaseFast --prefix $HOME/.local
 nova
 ```
 
-> `fff` (fuzzy file search) and the ModernBERT bash-safety classifier are optional at runtime — search falls back to a grep backend and bash safety to a local pattern matcher when they're absent.
+> The ModernBERT bash-safety classifier is optional at runtime — bash safety falls back to a local pattern matcher when it's absent.
 
 ## How It Works
 
@@ -185,4 +183,4 @@ zig build test
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). Third-party libraries are listed in [attribution.md](attribution.md).
