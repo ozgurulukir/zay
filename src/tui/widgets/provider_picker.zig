@@ -8,7 +8,6 @@ const tui_style = @import("../style.zig");
 const auth = @import("../../auth/store.zig");
 const config_mod = @import("../../config/config.zig");
 const modelsdev = @import("../../models/registry.zig");
-const codex = @import("../../auth/codex.zig");
 
 const StylePalette = tui_style.Palette;
 const assert = std.debug.assert;

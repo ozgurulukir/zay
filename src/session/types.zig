@@ -5,7 +5,6 @@
 
 const std = @import("std");
 const bounded_queue = @import("bounded_queue");
-const ai = @import("../ai.zig");
 const db = @import("../db.zig");
 
 const assert = std.debug.assert;

@@ -2,12 +2,10 @@
 //! Free functions taking `*App` — extracted from `tui.zig`.
 
 const std = @import("std");
-const vaxis = @import("vaxis");
 const tui = @import("../tui.zig");
 const agent_mod = @import("../agent.zig");
 const agent_worker = @import("agent_worker.zig");
 const lanes_util = @import("lanes.zig");
-const transcript_mod = @import("../transcript.zig");
 const runtime_mod = @import("../runtime.zig");
 
 const App = tui.App;

@@ -1,7 +1,6 @@
 //! Input buffer and vertical cursor movement logic.
 //! Free functions taking `*App` — extracted from `tui.zig`.
 
-const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const tui = @import("../tui.zig");

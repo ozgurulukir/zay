@@ -6,6 +6,7 @@ it from the model-facing observation. The sentinels use ``\\x1e`` (ASCII
 record separator) so real command output cannot collide with them.
 """
 
+import contextlib
 import sys
 
 _BEGIN = "\x1enova:diff"
@@ -14,13 +15,15 @@ _END = "\x1enova:end"
 
 def _raw_stdout():
     """stdout with newline translation off, so Windows never turns the
-    sentinel protocol's ``\\n`` into ``\\r\\n``."""
-    try:
+    sentinel protocol's ``\\n`` into ``\\r\\n``.
+
+    ``reconfigure`` is unavailable when stdout is redirected to pipe/file;
+    ``contextlib.suppress`` is the canonical idiom for an intentional,
+    narrowly-scoped swallow. Default newline handling is acceptable in that
+    case.
+    """
+    with contextlib.suppress(AttributeError, ValueError):
         sys.stdout.reconfigure(newline="\n")
-    except (AttributeError, ValueError):
-        # reconfigure() unavailable when stdout is redirected to pipe/file;
-        # safe to continue with default newline handling.
-        pass
     return sys.stdout
 
 

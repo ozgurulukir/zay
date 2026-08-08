@@ -1,11 +1,8 @@
 //! Git checkpoint and save command logic.
 //! Free functions taking `*App` — extracted from `tui.zig`.
 
-const std = @import("std");
-const vaxis = @import("vaxis");
 const tui = @import("../tui.zig");
 const vcs = @import("../vcs.zig");
-const session_mod = @import("../session.zig");
 
 const App = tui.App;
 

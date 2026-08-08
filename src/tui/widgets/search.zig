@@ -9,7 +9,6 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
-const command_panel = @import("command_panel.zig");
 const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
 const transcript_mod = @import("../../transcript.zig");

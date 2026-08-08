@@ -1,8 +1,6 @@
 //! Transcript navigation: scrolling, auto-scroll, long-message paging.
 //! Free functions taking `*App` — extracted from `tui.zig`.
 
-const std = @import("std");
-
 const tui = @import("../tui.zig");
 const tui_message = @import("widgets/message.zig");
 const tui_metrics = @import("metrics.zig");

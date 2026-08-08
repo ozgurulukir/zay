@@ -5,23 +5,17 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const tui = @import("../tui.zig");
-const lua_c = @import("c");
 const ai = @import("../ai.zig");
 const auth = @import("../auth/store.zig");
-const bash_mod = @import("../tools/bash_exec.zig");
 const codex = @import("../auth/codex.zig");
 const config_mod = @import("../config/config.zig");
 const model_catalogue = @import("model_catalogue.zig");
-const model_cache = @import("model_cache.zig");
 const model_loader = @import("model_loader.zig");
 const model_picker = @import("widgets/model_picker.zig");
 const openai_compatible_mod = @import("../ai/openai_compatible.zig");
 const provider_picker = @import("widgets/provider_picker.zig");
-const runtime_mod = @import("../runtime.zig");
-const session_mod = @import("../session.zig");
 const tui_provider = @import("provider_controller.zig");
 const tui_status = @import("status.zig");
-const tools_common = @import("../tools/common.zig");
 const modelsdev = @import("../models/registry.zig");
 
 const App = tui.App;

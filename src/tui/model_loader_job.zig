@@ -6,7 +6,6 @@ const config_mod = @import("../config/config.zig");
 const model_cache = @import("model_cache.zig");
 const model_loader = @import("model_loader.zig");
 const provider_model = @import("provider_model.zig");
-const tui_provider = @import("provider_controller.zig");
 const tui = @import("../tui.zig");
 
 const App = tui.App;

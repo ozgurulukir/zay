@@ -3,7 +3,6 @@
 //! Bridges TUI modes, inputs, and selection state with `clipboard.zig`.
 
 const std = @import("std");
-const vaxis = @import("vaxis");
 const tui = @import("../tui.zig");
 const clipboard_mod = @import("../clipboard.zig");
 

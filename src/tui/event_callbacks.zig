@@ -1,7 +1,6 @@
 //! Event callbacks for vxfw text input change notifications. Free functions
 //! that receive `?*anyopaque` (the `App` pointer) from the framework.
 
-const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 

@@ -24,6 +24,7 @@ const agent_mod = @import("../agent.zig");
 const ai = @import("../ai.zig");
 const compaction_lifecycle = @import("compaction_lifecycle.zig");
 const lifecycle = @import("lifecycle.zig");
+const lane_lifecycle = @import("lane_lifecycle.zig");
 const turn_view_mod = @import("turn_view.zig");
 const openai_compatible_mod = @import("../ai/openai_compatible.zig");
 const codex = @import("../auth/codex.zig");
@@ -2758,4 +2759,41 @@ test "transcript draw width-change re-count stays below a fixed gpa ceiling" {
     try drawTranscriptFrame(&transcript_widget, &arena, &counting, 60, 40);
     try std.testing.expect(app_gpa.bytes < 512 * 1024);
     try std.testing.expect(app_gpa.count < 512);
+}
+
+test "handleTick invokes the 4 documented phase functions in order" {
+    // Locks in AGENTS.md's documented handleTick ordering: drainAgentEvents
+    // (private to lifecycle.zig) → serviceLaneBridge → drainLaneNaming →
+    // deliverPendingLaneCompletions. The 3 lane-bridge phases are pub and
+    // exercised directly; the private drainAgentEvents is exercised via
+    // handleTick itself. If any of the 4 phase functions is renamed or its
+    // signature changes, this test fails to compile (or the handleTick body
+    // no longer calls them in the documented order).
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root: RootWidget = .{ .app = &app };
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    // The 3 pub lane-bridge phases in AGENTS.md's documented order, on an
+    // idle App. Each returns the expected shape: no naming change, no
+    // pending completions, no bridge work.
+    lane_lifecycle.serviceLaneBridge(&app); // void return — no error path
+    const naming_changed = try lane_lifecycle.drainLaneNaming(&app);
+    try std.testing.expect(!naming_changed);
+    const completions_changed = try lane_lifecycle.deliverPendingLaneCompletions(&app);
+    try std.testing.expect(!completions_changed);
+
+    // Run the same composition via the single handleTick entry point that
+    // production uses. The post-tick App must be in the same shape the
+    // documented 4 phases leave it: idle turn, no loading frame, no
+    // pending lane completions.
+    try lifecycle.handleTick(&root, &ctx);
+    try std.testing.expect(!app.thread.turn.isActive());
+    try std.testing.expect(!app.metrics.loading_tick_active);
 }

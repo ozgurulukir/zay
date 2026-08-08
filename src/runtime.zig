@@ -9,7 +9,6 @@ const compaction = @import("context/compaction.zig");
 const config_mod = @import("config/config.zig");
 const context_assembly = @import("context/assembly.zig");
 const modelsdev = @import("models/registry.zig");
-const os = @import("os.zig");
 const plugin_prompt = @import("plugin_prompt.zig");
 const session_mod = @import("session.zig");
 const skill_mod = @import("skill.zig");

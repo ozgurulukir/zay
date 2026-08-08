@@ -13,13 +13,11 @@ const tui = @import("../tui.zig");
 const agent_mod = @import("../agent.zig");
 const auth = @import("../auth/store.zig");
 const blackhole = @import("../tui/blackhole.zig");
-const codex = @import("../auth/codex.zig");
 const provider_model = @import("provider_model.zig");
 const diff_lifecycle = @import("diff_lifecycle.zig");
 const compaction_lifecycle = @import("compaction_lifecycle.zig");
 const lane_lifecycle = @import("lane_lifecycle.zig");
 const toast = @import("toast.zig");
-const runtime_mod = @import("../runtime.zig");
 const vcs = @import("../vcs.zig");
 
 const App = tui.App;
