@@ -573,6 +573,61 @@ test "git shadow: snapshot ignores artifacts, restore adds/deletes, HEAD stays c
     try std.testing.expectEqualStrings("1", std.mem.trim(u8, count, " \t\r\n"));
 }
 
+test "workingTreeDirty: false on clean tree, true after edits" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!isAvailable(gpa, io)) return error.SkipZigTest;
+
+    var rand: [8]u8 = undefined;
+    io.random(&rand);
+    const hex = std.fmt.bytesToHex(rand, .lower);
+    const name = try std.fmt.allocPrint(gpa, "nova-dirtytest-{s}", .{hex[0..]});
+    defer gpa.free(name);
+
+    try std.Io.Dir.cwd().createDirPath(io, name);
+    defer std.Io.Dir.cwd().deleteTree(io, name) catch {};
+
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const repo = try std.fs.path.join(gpa, &.{ cwd, name });
+    defer gpa.free(repo);
+
+    // init + a baseline commit so HEAD is attached to a branch.
+    try expectOk(gpa, io, repo, &.{ "init", "-q" });
+    try expectOk(gpa, io, repo, &.{ "config", "core.autocrlf", "false" });
+    try expectOk(gpa, io, repo, &.{ "config", "user.name", "t" });
+    try expectOk(gpa, io, repo, &.{ "config", "user.email", "t@t" });
+    try expectOk(gpa, io, repo, &.{ "commit", "--allow-empty", "-qm", "baseline" });
+
+    // clean initially
+    try std.testing.expectEqual(false, try workingTreeDirty(gpa, io, repo));
+
+    // adding a file makes it dirty
+    try writeFileRel(io, name, "a.txt", "A\n");
+    try std.testing.expectEqual(true, try workingTreeDirty(gpa, io, repo));
+
+    // committing makes it clean
+    try expectOk(gpa, io, repo, &.{ "add", "-A" });
+    try expectOk(gpa, io, repo, &.{ "commit", "-qm", "add a" });
+    try std.testing.expectEqual(false, try workingTreeDirty(gpa, io, repo));
+
+    // modifying tracked file makes it dirty
+    try writeFileRel(io, name, "a.txt", "B\n");
+    try std.testing.expectEqual(true, try workingTreeDirty(gpa, io, repo));
+    try expectOk(gpa, io, repo, &.{ "add", "-A" });
+    try expectOk(gpa, io, repo, &.{ "commit", "-qm", "mod a" });
+    try std.testing.expectEqual(false, try workingTreeDirty(gpa, io, repo));
+
+    // ignoring a file makes it clean (after committing the gitignore)
+    try writeFileRel(io, name, ".gitignore", "build/\n");
+    try expectOk(gpa, io, repo, &.{ "add", "-A" });
+    try expectOk(gpa, io, repo, &.{ "commit", "-qm", "add gitignore" });
+    try std.testing.expectEqual(false, try workingTreeDirty(gpa, io, repo));
+
+    try writeFileRel(io, name, "build/ignored.txt", "ignored\n");
+    try std.testing.expectEqual(false, try workingTreeDirty(gpa, io, repo));
+}
+
 test "worktree lanes: list finds lane branches, merge folds one in, conflict rolls back" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
