@@ -162,7 +162,7 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     }
 
     var visible_change = try drainAgentEvents(root, ctx);
-    visible_change = try drainToasts(root) or visible_change;
+    visible_change = try drainToasts() or visible_change;
     visible_change = try drainModelsAndMcp(root) or visible_change;
     visible_change = try drainDiffAndCompactions(root) or visible_change;
     visible_change = try drainBackgroundAndLanes(root) or visible_change;
@@ -185,8 +185,7 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
 }
 
 /// Drain the toast bus (UI thread only). Returns true if any toast appeared or expired.
-fn drainToasts(root: *RootWidget) !bool {
-    _ = root;
+fn drainToasts() !bool {
     var toast_items: [toast.max_items]toast.Item = undefined;
     return toast.global.drain(&toast_items) > 0;
 }
@@ -342,7 +341,7 @@ fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
 pub fn createParallelLane(self: *App) !void {
     std.debug.assert(self.threads.len() > 0);
     std.debug.assert(self.threads.len() <= max_threads);
-    if (self.threads.len() >= 4) return error.TooManyLanes; // driver + 3 lanes, not 4 extra
+    if (self.threads.len() >= max_threads) return error.TooManyLanes; // driver + 3 lanes, not 4 extra
     const repo = self.repoRoot() orelse return error.NoActiveRuntime;
     const home = (self.liveRuntime() orelse return error.NoActiveRuntime).home_dir;
     if (!vcs.isRepo(self.gpa, self.io, repo)) return error.NotAGitRepo;

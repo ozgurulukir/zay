@@ -795,9 +795,9 @@ fn createLane(app: *App, req: *const lane_bridge.Request) ?Resp {
     const home = (app.templateRuntime() orelse return failResp(app.gpa, "lane: no active runtime\n", .{})).home_dir;
     if (!vcs.isRepo(app.gpa, app.io, repo)) return failResp(app.gpa, "lane: not a git repo — lanes need one\n", .{});
     // The cap counts the DRIVER's main lane too: threads.len starts at 1
-    // (the primary), so >= 4 means "driver + 3 lanes" — a 4th lane would need
-    // a 5th pane in the 2×2 grid.
-    if (app.threads.len() >= 4) return failResp(app.gpa, "lane: too many lanes open (max 4 total: driver + 3)\n", .{});
+    // (the primary), so >= max_threads means "driver + 3 lanes" — a 4th lane
+    // would need a 5th pane in the 2×2 grid.
+    if (app.threads.len() >= max_threads) return failResp(app.gpa, "lane: too many lanes open (max 4 total: driver + 3)\n", .{});
 
     const wt = createLaneWorktree(app, repo, home) catch |err| return failResp(app.gpa, "lane: worktree create failed: {s}\n", .{@errorName(err)});
     // Every failure path below returns a `Resp` (never an error), so cleanup
@@ -993,9 +993,9 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
 
     // --- fresh-worktree path (current behavior, unchanged) ---
     // The cap counts the DRIVER's main lane too: threads.len starts at 1
-    // (the primary), so >= 4 means "driver + 3 lanes" — a 4th lane would need
-    // a 5th pane in the 2×2 grid.
-    if (app.threads.len() >= 4) {
+    // (the primary), so >= max_threads means "driver + 3 lanes" — a 4th lane
+    // would need a 5th pane in the 2×2 grid.
+    if (app.threads.len() >= max_threads) {
         freeLaneContext(app.gpa, context);
         return failResp(app.gpa, "lane: too many lanes open (max 4 total: driver + 3)\n", .{});
     }

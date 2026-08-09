@@ -41,6 +41,11 @@ pub const EventQueue = struct {
     /// Bounded variant: drains into inline storage; if the buffer fills,
     /// the remaining events stay in the queue and will be drained on the next
     /// tick. This keeps the hot-path UI tick allocation-free.
+    ///
+    /// Capacity is checked *before* popping so an overflow event is never
+    /// removed from the queue and pushed back — doing so would reorder it
+    /// behind the events that were never popped (the queue is FIFO), which
+    /// could project a `turn_finished` before an earlier `text_delta`.
     pub fn drainIntoBounded(
         self: *EventQueue,
         io: std.Io,
@@ -48,14 +53,9 @@ pub const EventQueue = struct {
     ) !void {
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
-        while (self.event_queue.pop(&self.storage)) |event| {
-            sink.append(event) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    // Push the overflowed event back so the next tick can drain it.
-                    _ = self.event_queue.push(&self.storage, event);
-                    return;
-                },
-            };
+        while (!sink.isFull()) {
+            const event = self.event_queue.pop(&self.storage) orelse break;
+            sink.append(event) catch unreachable; // capacity checked above
         }
     }
 
@@ -285,4 +285,50 @@ fn postAgentEvent(worker_context: *Context, event: agent_mod.Agent.Event) anyerr
         };
         return;
     }
+}
+
+test "drainIntoBounded preserves FIFO order across the batch boundary" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Arena backs the event allocations so the test is leak-free even when an
+    // assertion fails partway (the arena frees everything via defer; the queue
+    // owns no heap memory of its own).
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var queue: EventQueue = .{};
+    defer queue.deinit(io, alloc);
+
+    // Push more events than one batch can hold so the drain overflows.
+    const total: usize = event_batch_max + 5;
+    for (0..total) |i| {
+        const event = try alloc.create(agent_mod.Agent.Event);
+        event.* = .{ .queued_messages_flushed = @intCast(i) };
+        try queue.push(io, alloc, event);
+    }
+
+    // First drain fills the bounded sink; the rest stay queued.
+    var first: BoundedList(*agent_mod.Agent.Event, event_batch_max) = .{};
+    try queue.drainIntoBounded(io, &first);
+    try std.testing.expectEqual(@as(usize, event_batch_max), first.len());
+
+    // Second drain pulls the remainder.
+    var second: BoundedList(*agent_mod.Agent.Event, event_batch_max) = .{};
+    try queue.drainIntoBounded(io, &second);
+    try std.testing.expectEqual(total - event_batch_max, second.len());
+
+    // The concatenation must be in original order — the overflow event must
+    // NOT be reordered behind the events that stayed queued.
+    var idx: usize = 0;
+    for (first.slice()) |event| {
+        try std.testing.expectEqual(@as(u32, @intCast(idx)), event.queued_messages_flushed);
+        idx += 1;
+    }
+    for (second.slice()) |event| {
+        try std.testing.expectEqual(@as(u32, @intCast(idx)), event.queued_messages_flushed);
+        idx += 1;
+    }
+    try std.testing.expectEqual(total, idx);
 }
