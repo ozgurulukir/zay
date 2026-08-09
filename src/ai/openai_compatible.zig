@@ -875,14 +875,38 @@ fn writeRequestPayload(
     }
 
     // OpenAI-native and minimal dialects: flat `reasoning_effort` field. The
-    // `default` level means "don't override" — emit nothing.
-    if (effort == null or effort.? == .default) {
+    // `default` level means "don't override" — emit nothing. Values that the
+    // target rejects are clipped by `wireEffortLabel` (see comment there).
+    const wire_label = wireEffortLabel(dialect, effort orelse .default);
+    if (wire_label) |label| {
+        try out.writeAll(",\"reasoning_effort\":\"");
+        try out.writeAll(label);
+        try out.writeAll("\"}");
+    } else {
         try out.writeByte('}');
-        return;
     }
-    try out.writeAll(",\"reasoning_effort\":\"");
-    try out.writeAll(effort.?.label());
-    try out.writeAll("\"}");
+}
+
+/// Resolve a reasoning effort to the wire label for the given dialect, or
+/// `null` when the parameter should be omitted entirely (the `default`
+/// level means "don't override the model's behaviour").
+///
+/// Ollama's `/v1/chat/completions` validates `reasoning_effort` strictly:
+/// only `high`/`medium`/`low`/`max`/`none` are accepted. Sending `xhigh`
+/// or `minimal` returns HTTP 400 (`"invalid reasoning value"`). Both
+/// values are reachable on Ollama Cloud because the builtin registry entry
+/// declares no per-model `reasoning_options`, so the global picker list
+/// (which includes `xhigh` and `minimal`) is offered. The minimal dialect
+/// — used by Ollama Cloud, local Ollama, Groq, vLLM, etc. — clips them to
+/// the nearest valid level. The OpenAI-native dialect keeps the raw label
+/// (gpt-5 honours `xhigh`/`max`; `minimal` is valid there).
+pub fn wireEffortLabel(dialect: ai.WireDialect, effort: ai.ReasoningEffort) ?[]const u8 {
+    return switch (effort) {
+        .default => null, // omit the parameter entirely
+        .xhigh => if (dialect == .minimal) "max" else effort.label(),
+        .minimal => if (dialect == .minimal) "low" else effort.label(),
+        else => effort.label(),
+    };
 }
 
 test "buildToolsJson produces a valid JSON array for the registry" {
@@ -1248,6 +1272,57 @@ test "writeRequestPayload uses reasoning_effort none for minimal dialect" {
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"none\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "enable_thinking") == null);
+}
+
+test "minimal dialect clips xhigh reasoning_effort to max" {
+    // Ollama's /v1/chat/completions validates reasoning_effort strictly:
+    // only high/medium/low/max/none are accepted. The minimal dialect
+    // (Ollama Cloud, Groq, vLLM) must clip xhigh → max to avoid HTTP 400.
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "ollama-model", "", &.{}, "[]", .{ .effort = .xhigh }, null, .minimal, false, false);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"max\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "xhigh") == null);
+}
+
+test "minimal dialect clips minimal reasoning_effort to low" {
+    // `minimal` is not in Ollama's accepted set; clip to the nearest valid
+    // level (low) for the minimal dialect.
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "ollama-model", "", &.{}, "[]", .{ .effort = .minimal }, null, .minimal, false, false);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"low\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "minimal") == null);
+}
+
+test "openai dialect preserves xhigh and minimal reasoning_effort" {
+    // The OpenAI-native dialect must NOT clip — gpt-5 honours xhigh/max and
+    // minimal is a valid level there. Only the minimal dialect clips.
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "gpt-5", "", &.{}, "[]", .{ .effort = .xhigh }, null, .openai, false, true);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"xhigh\"") != null);
+
+    var payload2: std.Io.Writer.Allocating = .init(gpa);
+    defer payload2.deinit();
+    try writeRequestPayload(gpa, &payload2.writer, "gpt-5", "", &.{}, "[]", .{ .effort = .minimal }, null, .openai, false, true);
+    try std.testing.expect(std.mem.indexOf(u8, payload2.written(), "\"reasoning_effort\":\"minimal\"") != null);
+}
+
+test "minimal dialect omits reasoning_effort for default effort" {
+    // `default` means "don't override" — the parameter must be absent.
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "ollama-model", "", &.{}, "[]", .{ .effort = .default }, null, .minimal, false, false);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_effort") == null);
 }
 
 test "writeRequestPayload uses reasoning object for openrouter dialect" {

@@ -230,8 +230,15 @@ pub fn writeRequestPayload(out: *std.Io.Writer, config: ai.Config, responses_con
         try out.writeAll(",\"reasoning\":{");
         var wrote = false;
         if (value.effort) |effort| {
+            // Clip Ollama-incompatible effort values for the minimal dialect,
+            // mirroring the chat-completions path (openai_compatible.wireEffortLabel).
+            // The Responses-API site is not dialect-gated for cache fields (C1/C2
+            // in AGENTS.md), but effort clipping is cheap and keeps the two wire
+            // clients consistent so a provider switch never changes the effort
+            // semantics unexpectedly.
+            const wire_label = openai_compatible.wireEffortLabel(config.wire_dialect, effort);
             try out.writeAll("\"effort\":");
-            try std.json.Stringify.value(effort.label(), .{}, out);
+            try std.json.Stringify.value(wire_label orelse effort.label(), .{}, out);
             wrote = true;
         }
         if (value.summary) |summary| {
@@ -962,6 +969,45 @@ test "writeRequestPayload serializes tool call ids as strings, not objects" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"call_id\":\"call_xyz789\"") != null);
     // Negative: must NOT serialize CallId as an object
     try std.testing.expect(std.mem.indexOf(u8, body, "\"call_id\":{\"value\":") == null);
+}
+
+test "writeRequestPayload clips xhigh reasoning effort for minimal dialect (Responses API)" {
+    // Mirrors the chat-completions clipping: Ollama's /v1/chat/completions
+    // rejects xhigh/minimal with HTTP 400. The /v1/responses endpoint
+    // silently ignores unknown reasoning fields (Go decoder), but clipping
+    // keeps the two wire clients consistent and is forward-safe if Ollama
+    // adds validation later.
+    const gpa = std.testing.allocator;
+    const config: ai.Config = .{
+        .base_url = "",
+        .api_key = "",
+        .model = "ollama-model",
+        .reasoning = .{ .effort = .xhigh },
+        .wire_dialect = .minimal,
+    };
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(&payload.writer, config, .{}, &.{}, "[]");
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\":\"max\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "xhigh") == null);
+}
+
+test "writeRequestPayload preserves xhigh reasoning effort for openai dialect (Responses API)" {
+    // The openai dialect must NOT clip — gpt-5 honours xhigh/max.
+    const gpa = std.testing.allocator;
+    const config: ai.Config = .{
+        .base_url = "",
+        .api_key = "",
+        .model = "gpt-5",
+        .reasoning = .{ .effort = .xhigh },
+        .wire_dialect = .openai,
+    };
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(&payload.writer, config, .{}, &.{}, "[]");
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\":\"xhigh\"") != null);
 }
 
 test "openresponses tools json is an array" {

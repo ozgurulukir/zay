@@ -380,7 +380,16 @@ fn parseDeltaObject(
             if (appended) {
                 if (content.items.len > before) change.content_start = before;
             }
-        } else if (std.mem.eql(u8, key, "reasoning") or std.mem.eql(u8, key, "reasoning_content")) {
+        } else if (std.mem.eql(u8, key, "reasoning") or
+            std.mem.eql(u8, key, "reasoning_content") or
+            std.mem.eql(u8, key, "thinking"))
+        {
+            // `reasoning`/`reasoning_content` are the OpenAI-compatible field
+            // names (Ollama's /v1/chat/completions uses `reasoning` in the
+            // delta; DeepSeek and others use `reasoning_content`). `thinking`
+            // is Ollama's native /api/chat name — never on the /v1 path we
+            // use, but some OpenAI-compatible proxies forward it verbatim, so
+            // recognise it as a fallback to avoid silently dropping reasoning.
             const before: u32 = @intCast(reasoning.items.len);
             const appended = try appendStringValue(scanner, gpa, reasoning, .allow_null);
             if (appended) {
@@ -586,6 +595,44 @@ fn appendStringValue(
             else => return error.UnexpectedToken,
         }
     }
+}
+
+test "parseStreamChunk handles thinking field in delta" {
+    // Ollama's /v1/chat/completions surfaces reasoning in `delta.reasoning`,
+    // but its native /api/chat uses `delta.thinking`. Some OpenAI-compatible
+    // proxies forward `thinking` verbatim — recognise it so reasoning content
+    // is not silently dropped.
+    const gpa = std.testing.allocator;
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
+
+    const change = try parseStreamChunk(gpa,
+        \\{"choices":[{"delta":{"thinking":"let me reason about this"}}]}
+    , &content, &reasoning, &stream);
+    try std.testing.expect(change.reasoning_start != null);
+    try std.testing.expectEqualStrings("let me reason about this", reasoning.items);
+    try std.testing.expectEqualStrings("", content.items);
+}
+
+test "parseStreamChunk handles reasoning field in delta" {
+    // Ollama /v1/chat/completions canonical field name for thinking content.
+    const gpa = std.testing.allocator;
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
+
+    const change = try parseStreamChunk(gpa,
+        \\{"choices":[{"delta":{"reasoning":"step by step"}}]}
+    , &content, &reasoning, &stream);
+    try std.testing.expect(change.reasoning_start != null);
+    try std.testing.expectEqualStrings("step by step", reasoning.items);
 }
 
 test "parse streaming tool call with no index appends to the end" {
