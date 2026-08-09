@@ -839,13 +839,12 @@ test "assembleSystemPrompt includes the unconditional Lanes section from system.
     const prompt = try assembleSystemPrompt(gpa, io, template, root, &.{}, &.{});
     defer gpa.free(prompt);
 
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "## Lanes") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Workspace mode") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Fan out when the work decomposes") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Sequence what depends") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Discipline (hard)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Dispatch, don't block") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Parallelism via Lanes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "The Decomposition Rule") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Decision Matrix for Lanes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Core Discipline") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "lane spawn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "lane merge") != null);
 }
 
 test "substituteBaseTemplate replaces CWD OS and DATE in one pass" {
