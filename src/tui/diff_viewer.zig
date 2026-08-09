@@ -588,10 +588,10 @@ const HunkSpan = struct { old_start: u32, new_start: u32 };
 /// Parse `@@ -old,len +new,len @@` for the starting line numbers.
 fn parseHunk(line: []const u8) HunkSpan {
     var span: HunkSpan = .{ .old_start = 0, .new_start = 0 };
-    if (std.mem.indexOfScalar(u8, line, '-')) |minus| {
+    if (std.mem.indexOf(u8, line, "-")) |minus| {
         span.old_start = parseLeadingInt(line[minus + 1 ..]);
     }
-    if (std.mem.indexOfScalar(u8, line, '+')) |plus| {
+    if (std.mem.indexOf(u8, line, "+")) |plus| {
         span.new_start = parseLeadingInt(line[plus + 1 ..]);
     }
     return span;
