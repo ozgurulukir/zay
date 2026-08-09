@@ -379,7 +379,6 @@ pub fn toggleLaneFullscreen(app: *App) void {
 pub fn closeActiveLane(app: *App) !void {
     if (app.thread.turn.isActive()) return error.InFlightTurn;
     const index: u32 = activeIndex(app);
-    std.debug.assert(index > 0);
     std.debug.assert(index < app.threads.len());
     if (index == 0) return error.CannotClosePrimaryLane;
 

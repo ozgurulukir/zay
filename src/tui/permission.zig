@@ -92,7 +92,7 @@ fn addLaneWithWorker(gpa: std.mem.Allocator, app: *App, io: std.Io, id: []const 
         .engine = .{ .idle = .{ .working = .{ .branch = branch, .path = path } } },
         .worker_context = .{ .io = io, .gpa = gpa },
     };
-    try app.threads.append( lane);
+    try app.threads.append(lane);
     return lane;
 }
 

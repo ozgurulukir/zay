@@ -153,7 +153,6 @@ fn deinitOwnedState(self: *App) void {
 pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     std.debug.assert(root.app.threads.len() > 0);
     std.debug.assert(root.app.threads.len() <= max_threads);
-    std.debug.assert(root.app.thread.agent != null);
 
     // Lazy MCP connect: trigger once after the UI is responsive so startup
     // doesn't block on subprocess spawn / handshake / tool discovery.
@@ -342,7 +341,7 @@ fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
 /// (command palette dispatch).
 pub fn createParallelLane(self: *App) !void {
     std.debug.assert(self.threads.len() > 0);
-    std.debug.assert(self.threads.len() < max_threads);
+    std.debug.assert(self.threads.len() <= max_threads);
     if (self.threads.len() >= 4) return error.TooManyLanes; // driver + 3 lanes, not 4 extra
     const repo = self.repoRoot() orelse return error.NoActiveRuntime;
     const home = (self.liveRuntime() orelse return error.NoActiveRuntime).home_dir;
