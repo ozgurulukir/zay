@@ -42,3 +42,33 @@ Example — spawn a worker: `{"command":"spawn","task":"Review the diff in PR #5
 - **Max 4 lanes total — the driver's main lane plus 3 workers** (the split grid is 2×2). Fan out deliberately — one lane per independent unit, not a scattergun.
 - **`lane merge` refuses while you are entered** in the target lane — `lane leave` first (the tool batch's working directory is still rooted there).
 - `lane list` and the workspace ops (`create`/`enter`/`leave`/`merge`) state your current workspace root, so a context that pruned an earlier response cannot lose the fact — run `lane list` whenever unsure.
+
+
+## Strategic Workflows (Golden Paths)
+
+Use these patterns to ensure high-quality, low-context-bloat results:
+
+### Scenario A: The "Discovery & Synthesis" (Broad Analysis)
+*Goal: Understand a new subsystem without choking your context.*
+1. `lane list` $ightarrow$ Check available slots.
+2. `lane spawn` $ightarrow$ Worker 1: "Analyze module X and list key functions/types."
+3. `lane spawn` $ightarrow$ Worker 2: "Analyze module Y and identify dependencies on X."
+4. `lane read` $ightarrow$ Monitor progress.
+5. `lane await` $ightarrow$ Collect both summaries.
+6. **Synthesis:** Combine reports in your main context to form a plan.
+7. `lane merge` $ightarrow$ Clean up.
+
+### Scenario B: The "Safe Iteration" (Critical Change)
+*Goal: Implement a feature that requires multiple build/test cycles without dirtying the main branch.*
+1. `lane create` (purpose: "feature-x-impl") $ightarrow$ `lane enter`.
+2. **Iterative Loop:** Edit $ightarrow$ `bash { run_in_background: true }` $ightarrow$ Read Log $ightarrow$ Fix.
+3. `lane leave` $ightarrow$ Verify root is clean.
+4. `lane merge` $ightarrow$ Fold verified changes into main.
+
+### Scenario C: The "Review Pipeline" (High Assurance)
+*Goal: Ensure code quality before merging.*
+1. `lane spawn` $ightarrow$ Worker 1: "Implement the fix for issue #123 in this branch."
+2. `lane await` $ightarrow$ Get implementation.
+3. `lane spawn` $ightarrow$ Worker 2: "Review the changes made by Worker 1 for edge cases and style."
+4. `lane await` $ightarrow$ Get review.
+5. **Final Polish:** Apply review feedback in the isolated lane before the final `lane merge`.
