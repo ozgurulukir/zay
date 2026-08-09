@@ -772,7 +772,6 @@ test "processStreamChunk handles content and reasoning correctly" {
     try std.testing.expectEqual(@as(usize, 1), observer_ctx.delta_ends);
 }
 
-
 test "processStreamChunk calls observer for tool deltas" {
     const gpa = std.testing.allocator;
     var content: std.ArrayList(u8) = .empty;
