@@ -692,3 +692,162 @@ test "readStream rejects index-less tool calls beyond max_calls" {
         readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 1, "ling-3.0-flash"),
     );
 }
+
+const TestObserverCtx = struct {
+    allocator: std.mem.Allocator,
+    content: std.ArrayList(u8),
+    reasoning: std.ArrayList(u8),
+    tool_calls: std.ArrayList(ai.ToolDelta),
+    delta_ends: usize = 0,
+};
+
+const TestObserver = struct {
+    fn onContent(ctx: *TestObserverCtx, bytes: []const u8) !void {
+        try ctx.content.appendSlice(ctx.allocator, bytes);
+    }
+
+    fn onReasoning(ctx: *TestObserverCtx, bytes: []const u8) !void {
+        try ctx.reasoning.appendSlice(ctx.allocator, bytes);
+    }
+
+    fn onToolDelta(ctx: *TestObserverCtx, delta: ai.ToolDelta) !void {
+        // We have to dupe since the delta strings belong to the stream builder
+        const name_duped = try ctx.allocator.dupe(u8, delta.name);
+        const args_duped = try ctx.allocator.dupe(u8, delta.arguments);
+        try ctx.tool_calls.append(ctx.allocator, .{
+            .index = delta.index,
+            .name = name_duped,
+            .arguments = args_duped,
+        });
+    }
+
+    fn onDeltaEnd(ctx: *TestObserverCtx) !void {
+        ctx.delta_ends += 1;
+    }
+};
+
+fn createTestObserver(ctx: *TestObserverCtx) ai.StreamObserver(TestObserverCtx) {
+    return .{
+        .ctx = ctx,
+        .on_content = TestObserver.onContent,
+        .on_reasoning = TestObserver.onReasoning,
+        .on_tool_delta = TestObserver.onToolDelta,
+        .on_delta_end = TestObserver.onDeltaEnd,
+    };
+}
+
+test "processStreamChunk handles content and reasoning correctly" {
+    const gpa = std.testing.allocator;
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
+
+    var observer_ctx = TestObserverCtx{
+        .content = .empty,
+        .reasoning = .empty,
+        .tool_calls = .empty,
+        .allocator = gpa,
+    };
+    defer {
+        observer_ctx.content.deinit(gpa);
+        observer_ctx.reasoning.deinit(gpa);
+        for (observer_ctx.tool_calls.items) |delta| {
+            gpa.free(delta.name);
+            gpa.free(delta.arguments);
+        }
+        observer_ctx.tool_calls.deinit(gpa);
+    }
+    const observer = createTestObserver(&observer_ctx);
+
+    const chunk = "{\"choices\":[{\"delta\":{\"content\":\"hello\", \"reasoning\":\"thinking\"}}]}";
+
+    try processStreamChunk(gpa, chunk, &content, &reasoning, &stream, observer);
+
+    try std.testing.expectEqualStrings("hello", observer_ctx.content.items);
+    try std.testing.expectEqualStrings("thinking", observer_ctx.reasoning.items);
+    try std.testing.expectEqual(@as(usize, 0), observer_ctx.tool_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), observer_ctx.delta_ends);
+}
+
+
+test "processStreamChunk calls observer for tool deltas" {
+    const gpa = std.testing.allocator;
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
+
+    var observer_ctx = TestObserverCtx{
+        .allocator = gpa,
+        .content = .empty,
+        .reasoning = .empty,
+        .tool_calls = .empty,
+    };
+    defer {
+        observer_ctx.content.deinit(gpa);
+        observer_ctx.reasoning.deinit(gpa);
+        for (observer_ctx.tool_calls.items) |delta| {
+            gpa.free(delta.name);
+            gpa.free(delta.arguments);
+        }
+        observer_ctx.tool_calls.deinit(gpa);
+    }
+    const observer = createTestObserver(&observer_ctx);
+
+    const chunk1 = "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}";
+    const chunk2 = "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]}}]}";
+
+    try processStreamChunk(gpa, chunk1, &content, &reasoning, &stream, observer);
+    try processStreamChunk(gpa, chunk2, &content, &reasoning, &stream, observer);
+
+    try std.testing.expectEqualStrings("", observer_ctx.content.items);
+    try std.testing.expectEqualStrings("", observer_ctx.reasoning.items);
+    try std.testing.expectEqual(@as(usize, 2), observer_ctx.tool_calls.items.len);
+    try std.testing.expectEqualStrings("bash", observer_ctx.tool_calls.items[0].name);
+    try std.testing.expectEqualStrings("", observer_ctx.tool_calls.items[0].arguments);
+    try std.testing.expectEqualStrings("bash", observer_ctx.tool_calls.items[1].name);
+    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", observer_ctx.tool_calls.items[1].arguments);
+    try std.testing.expectEqual(@as(usize, 2), observer_ctx.delta_ends);
+}
+
+test "processStreamChunk does not call on_delta_end for empty chunks" {
+    const gpa = std.testing.allocator;
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
+
+    var observer_ctx = TestObserverCtx{
+        .allocator = gpa,
+        .content = .empty,
+        .reasoning = .empty,
+        .tool_calls = .empty,
+    };
+    defer {
+        observer_ctx.content.deinit(gpa);
+        observer_ctx.reasoning.deinit(gpa);
+        for (observer_ctx.tool_calls.items) |delta| {
+            gpa.free(delta.name);
+            gpa.free(delta.arguments);
+        }
+        observer_ctx.tool_calls.deinit(gpa);
+    }
+    const observer = createTestObserver(&observer_ctx);
+
+    // Empty payload (keep-alive)
+    const chunk = "";
+
+    try processStreamChunk(gpa, chunk, &content, &reasoning, &stream, observer);
+
+    try std.testing.expectEqualStrings("", observer_ctx.content.items);
+    try std.testing.expectEqualStrings("", observer_ctx.reasoning.items);
+    try std.testing.expectEqual(@as(usize, 0), observer_ctx.tool_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 0), observer_ctx.delta_ends);
+}
