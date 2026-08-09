@@ -95,9 +95,10 @@
             "none",
             "medium",
             "high",
-            "xhigh"
+            "xhigh",
+            "max"
           ],
-          "description": "Reasoning effort level for this model. 'default' sends no reasoning parameter (model decides); 'none' disables thinking explicitly."
+          "description": "Reasoning effort level for this model. 'default' sends no reasoning parameter (model decides); 'none' disables thinking explicitly. 'max' is OpenRouter-specific (highest, above xhigh)."
         },
         "contextWindow": {
           "type": "integer",
@@ -120,10 +121,11 @@
               "none",
               "medium",
               "high",
-              "xhigh"
+              "xhigh",
+              "max"
             ]
           },
-          "description": "Reasoning efforts this model supports. The TUI model picker filters its reasoning cycle to this list. Empty or absent means all efforts are available."
+          "description": "Reasoning efforts this model supports. The TUI model picker filters its reasoning cycle to this list. Empty or absent means all efforts are available. 'max' is OpenRouter-specific (highest, above xhigh)."
         }
       },
       "additionalProperties": false
@@ -240,7 +242,7 @@
         "disablePromptCache": {
           "type": "boolean",
           "default": false,
-          "description": "Disable provider prompt-caching fields (message-level cache_control and top-level prompt_cache_key) entirely, in both the chat-completions and Responses API clients. Use for OpenRouter models that reject these fields with HTTP 400 (some :free / gateway-fronted models)."
+          "description": "Disable provider prompt-caching fields entirely, in both the chat-completions and Responses API clients. For OpenRouter this suppresses top-level cache_control (auto breakpoint) and native session_id (sticky routing); for OpenAI it suppresses prompt_cache_key. Use for providers/models that reject these fields with HTTP 400 (some OpenRouter :free / gateway-fronted models)."
         },
         "compaction": { "$ref": "#/$defs/CompactionSettings" }
       },

@@ -92,12 +92,12 @@ pub const ContextSettings = struct {
     /// Null = `default_max_concurrent_requests`. 1 serializes requests.
     max_concurrent_requests: ?u32 = null,
     /// Disable provider prompt-caching fields entirely. When true, neither
-    /// message-level `cache_control` (OpenRouter) nor top-level
-    /// `prompt_cache_key` (OpenAI/OpenRouter, emitted by BOTH the
-    /// chat-completions client and the Responses API client) is emitted,
-    /// regardless of the resolved wire dialect. Use for providers/models
-    /// that reject these fields with HTTP 400 (some OpenRouter `:free` /
-    /// gateway-fronted models — kimi, inclusionai/ling).
+    /// top-level `cache_control` nor native `session_id` (OpenRouter) nor
+    /// `prompt_cache_key` (OpenAI) is emitted, regardless of the resolved
+    /// wire dialect — in both the chat-completions client and the Responses
+    /// API client. Use for providers/models that reject these fields with
+    /// HTTP 400 (some OpenRouter `:free` / gateway-fronted models — kimi,
+    /// inclusionai/ling).
     disable_prompt_cache: ?bool = null,
     compaction: CompactionSettings = .{},
 };

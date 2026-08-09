@@ -179,11 +179,11 @@ pub const Config = struct {
     /// `max_completion_tokens` instead. Default `false` — the safe direction.
     is_reasoning_model: bool = false,
     /// Disable provider prompt-caching fields entirely (C1). When true,
-    /// neither message-level `cache_control` (OpenRouter) nor top-level
-    /// `prompt_cache_key` (OpenAI/OpenRouter) is emitted, in BOTH wire
-    /// clients (chat-completions and Responses API), regardless of dialect.
-    /// Use for OpenRouter models that reject these fields with HTTP 400
-    /// (some `:free` / gateway-fronted models). The flag is the durable
+    /// neither top-level `cache_control` nor native `session_id` (OpenRouter)
+    /// nor `prompt_cache_key` (OpenAI) is emitted, in BOTH wire clients
+    /// (chat-completions and Responses API), regardless of dialect. Use for
+    /// OpenRouter models that reject these fields with HTTP 400 (some `:free`
+    /// / gateway-fronted models). The flag is the durable
     /// escape hatch; C2's downgrade retry auto-recovers for users who
     /// haven't set it.
     disable_prompt_cache: bool = false,
