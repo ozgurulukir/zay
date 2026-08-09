@@ -264,7 +264,7 @@ pub const ProviderState = struct {
     /// Per-model reasoning options from config, cached for the model picker.
     /// Rebuilt when the picker opens or the active model changes. Empty
     /// means "fall back to the global hardcoded list".
-    reasoning_opts_cache: [7]model_picker.ReasoningOption = undefined,
+    reasoning_opts_cache: [8]model_picker.ReasoningOption = undefined,
     reasoning_opts_len: u32 = 0,
     /// Live connectivity per catalogue provider, indexed by `catalogueProviders()`
     /// order. Derived from the model load's per-provider outcome.

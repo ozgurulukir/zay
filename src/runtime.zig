@@ -748,6 +748,11 @@ pub const AgentRuntime = struct {
             .session_id = self.session_writer.session.id.slice(),
         });
         errdefer client.deinit();
+        // OpenRouter app-attribution: identify Nova on the marketplace for
+        // ranking/discoverability and rate-limit priority. Owned by the client.
+        if (self.wire_dialect == .openrouter) {
+            client.app_title = try self.gpa.dupe(u8, "Nova");
+        }
         self.replaceClient(.{ .openai_compatible = client });
         self.agent.context_window_tokens = compaction.contextWindowTokens(model_info, self.context_settings.override_context_window);
         self.agent.resetContextUsage();
@@ -771,6 +776,9 @@ pub const AgentRuntime = struct {
                 self.gpa.destroy(compaction_client);
                 break :attach_compaction;
             };
+            if (self.wire_dialect == .openrouter) {
+                compaction_client.app_title = self.gpa.dupe(u8, "Nova") catch null;
+            }
             self.setCompactionClient(.{ .openai_compatible = compaction_client });
         }
         attach_naming: {

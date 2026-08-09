@@ -36,6 +36,12 @@ pub const Client = struct {
     /// gateways (OpenRouter/Ollama/vLLM).
     strict: bool = false,
     http_client: std.http.Client,
+    /// Optional OpenRouter app-attribution headers. Sent verbatim as
+    /// `X-Title` / `HTTP-Referer` when non-null — both are OpenRouter
+    /// conventions (ranking/discoverability + rate-limit priority). Owned;
+    /// freed in `deinit`. Null for non-OpenRouter dialects.
+    app_title: ?[]u8 = null,
+    app_referer: ?[]u8 = null,
     /// Monotonic counter for synthesised tool_call ids when the inference
     /// server omits them. OpenAI's protocol requires stable ids linking
     /// assistant tool_calls to their `tool` result messages, so we mint
@@ -85,6 +91,8 @@ pub const Client = struct {
             .tools_json = tools_json,
             .strict = config.strict,
             .http_client = .{ .allocator = gpa, .io = io },
+            .app_title = null,
+            .app_referer = null,
         };
     }
 
@@ -95,6 +103,8 @@ pub const Client = struct {
         self.gpa.free(self.tools_json);
         if (self.authorization) |a| self.gpa.free(a);
         self.gpa.free(self.url);
+        if (self.app_title) |t| self.gpa.free(t);
+        if (self.app_referer) |r| self.gpa.free(r);
         if (self.last_error_detail) |d| self.gpa.free(d);
         self.* = undefined;
     }
@@ -273,11 +283,25 @@ pub const Client = struct {
         // may retry the same payload verbatim. Connection/read drops here
         // are mapped to `error.ConnectionFailed` (retryable); protocol-level
         // rejects pass through unchanged (permanent).
+        // OpenRouter app-attribution headers (X-Title / HTTP-Referer). These
+        // live on this frame's stack and must outlive the request — `req` is
+        // fully consumed (`receiveHead` + stream) before this function returns.
+        var extra_headers: [2]std.http.Header = undefined;
+        var extra_count: usize = 0;
+        if (self.app_title) |title| {
+            extra_headers[extra_count] = .{ .name = "X-Title", .value = title };
+            extra_count += 1;
+        }
+        if (self.app_referer) |referer| {
+            extra_headers[extra_count] = .{ .name = "HTTP-Referer", .value = referer };
+            extra_count += 1;
+        }
         var req = self.http_client.request(.POST, try std.Uri.parse(self.url), .{
             .headers = .{
                 .authorization = if (self.authorization) |a| .{ .override = a } else .omit,
                 .content_type = .{ .override = "application/json" },
             },
+            .extra_headers = extra_headers[0..extra_count],
         }) catch |err| return self.headPhaseFailure(err);
         defer req.deinit();
 
@@ -594,7 +618,7 @@ test "errorDetailMentionsCache is case-insensitive and handles null" {
     client.last_error_detail = null;
 }
 
-fn writeMessage(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMessage, dialect: ai.WireDialect, disable_prompt_cache: bool) !void {
+fn writeMessage(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMessage) !void {
     try out.writeAll("{\"role\":");
     const role_label: []const u8 = switch (message) {
         .system => "system",
@@ -603,12 +627,9 @@ fn writeMessage(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMes
         .tool => "tool",
     };
     try std.json.Stringify.value(role_label, .{}, out);
-    if (dialect.allowsCacheControl() and !disable_prompt_cache) {
-        switch (message) {
-            .system => try out.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}"),
-            else => {},
-        }
-    }
+    // Cache control is now emitted at the top level (writeRequestPayload),
+    // not per-message. OpenRouter's top-level `cache_control` auto-marks the
+    // last cacheable block, superseding the old system-message-only approach.
     try out.writeAll(",\"content\":");
     switch (message) {
         .user => try writeUserContent(out, gpa, message.user.content),
@@ -751,13 +772,18 @@ fn writeRequestPayload(
     try out.writeAll(",\"messages\":[");
     for (messages, 0..) |*view, index| {
         if (index > 0) try out.writeByte(',');
-        try writeMessage(out, gpa, view.message().*, dialect, disable_prompt_cache);
+        try writeMessage(out, gpa, view.message().*);
     }
     // `stream_options.include_usage` makes the server emit a final usage-only
     // chunk (empty `choices`) before `[DONE]`. Without it, streaming responses
     // carry no token counts. Some OpenAI-compatible servers ignore it, so the
-    // parser treats usage as optional.
-    try out.writeAll("],\"stream\":true,\"stream_options\":{\"include_usage\":true}");
+    // parser treats usage as optional. OpenRouter marks `include_usage` as
+    // deprecated ("Full usage details are always included"), so it is omitted
+    // for that dialect to avoid noise.
+    try out.writeAll("],\"stream\":true");
+    if (dialect != .openrouter) {
+        try out.writeAll(",\"stream_options\":{\"include_usage\":true}");
+    }
     // OpenAI reasoning models (o-series, gpt-5) ignore the legacy `max_tokens`
     // field; the openai-compatible provider maps it to `max_completion_tokens`
     // for them. Emit `max_completion_tokens` only for the OpenAI-native dialect
@@ -778,50 +804,85 @@ fn writeRequestPayload(
     } else {
         log.warn("openai_compatible: sending request with NO tools (tools_json is empty) model={s}", .{model});
     }
-    // Standard OpenAI cache-routing hint: steers requests sharing this session's
-    // prefix to the same backend, raising prefix-cache hit rates (used by
-    // gateways like OpenCode Zen; servers that don't support it, e.g. Ollama,
-    // reject the unknown field with 400).
-    if (session_id.len > 0 and dialect.allowsPromptCacheKey() and !disable_prompt_cache) {
-        try out.writeAll(",\"prompt_cache_key\":");
-        try std.json.Stringify.value(session_id, .{}, out);
-    }
-    const effort = if (reasoning) |value| value.effort else null;
-    const value = effort orelse {
-        try out.writeByte('}');
-        return;
-    };
-
-    switch (value) {
-        .default => {
-            // Model's own default — don't send any reasoning parameter.
-            try out.writeByte('}');
-            return;
-        },
-        .none => {
-            if (dialect.usesEnableThinking()) {
-                try out.writeAll(",\"enable_thinking\":false}");
-            } else if (dialect == .openrouter) {
-                // OpenRouter controls reasoning via the `reasoning` object,
-                // not the OpenAI-native `reasoning_effort` field. `none` is a
-                // valid effort level (see openrouter.ai/docs/guides/best-practices/reasoning-tokens).
-                try out.writeAll(",\"reasoning\":{\"effort\":\"none\"}}");
-            } else {
-                try out.writeAll(",\"reasoning_effort\":\"none\"}");
+    // Cache + routing directives (all suppressed when `disable_prompt_cache`).
+    // OpenRouter uses two dedicated top-level fields: `cache_control` (auto
+    // breakpoint on the last cacheable block) and `session_id` (sticky provider
+    // routing + cache grouping + observability). OpenAI-native dialects use the
+    // classic `prompt_cache_key` hint. Minimal/dashscope send neither.
+    if (!disable_prompt_cache) {
+        if (dialect.allowsTopLevelCacheControl()) {
+            try out.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}");
+        }
+        if (session_id.len > 0) {
+            if (dialect.usesNativeSessionId()) {
+                try out.writeAll(",\"session_id\":");
+                try std.json.Stringify.value(session_id, .{}, out);
+            } else if (dialect.allowsPromptCacheKey()) {
+                try out.writeAll(",\"prompt_cache_key\":");
+                try std.json.Stringify.value(session_id, .{}, out);
             }
-        },
-        else => {
-            if (dialect == .openrouter) {
-                try out.writeAll(",\"reasoning\":{\"effort\":\"");
-                try out.writeAll(value.label());
-                try out.writeAll("\"}}");
+        }
+    }
+    // Reasoning control. Effort levels: default/minimal/low/none/medium/high/
+    // xhigh/max (the last two are OpenRouter extensions). Summary verbosity
+    // (auto/concise/detailed) is OpenRouter-only in the chat-completions body.
+    const effort = if (reasoning) |value| value.effort else null;
+    const summary = if (reasoning) |value| value.summary else null;
+
+    // DashScope controls thinking via a top-level boolean, independent of effort.
+    if (dialect.usesEnableThinking()) {
+        if (effort) |value| {
+            if (value == .none) {
+                try out.writeAll(",\"enable_thinking\":false}");
             } else {
                 try out.writeAll(",\"reasoning_effort\":\"");
                 try out.writeAll(value.label());
                 try out.writeAll("\"}");
             }
-        },
+        } else {
+            try out.writeByte('}');
+        }
+        return;
     }
+
+    // OpenRouter uses the `reasoning` object with both `effort` and `summary`.
+    // When neither is set (null/default effort + null/auto summary), emit
+    // nothing so we don't override the model's own reasoning behaviour. `auto`
+    // summary = model default, treated like `default` effort — not sent.
+    if (dialect == .openrouter) {
+        const has_effort = effort != null and effort.? != .default;
+        const has_summary = summary != null and summary.? != .auto;
+        if (!has_effort and !has_summary) {
+            try out.writeByte('}');
+            return;
+        }
+        try out.writeAll(",\"reasoning\":{");
+        var wrote = false;
+        if (has_effort) {
+            try out.writeAll("\"effort\":\"");
+            try out.writeAll(effort.?.label());
+            try out.writeByte('"');
+            wrote = true;
+        }
+        if (has_summary) {
+            if (wrote) try out.writeByte(',');
+            try out.writeAll("\"summary\":\"");
+            try out.writeAll(summary.?.label());
+            try out.writeByte('"');
+        }
+        try out.writeAll("}}");
+        return;
+    }
+
+    // OpenAI-native and minimal dialects: flat `reasoning_effort` field. The
+    // `default` level means "don't override" — emit nothing.
+    if (effort == null or effort.? == .default) {
+        try out.writeByte('}');
+        return;
+    }
+    try out.writeAll(",\"reasoning_effort\":\"");
+    try out.writeAll(effort.?.label());
+    try out.writeAll("\"}");
 }
 
 test "buildToolsJson produces a valid JSON array for the registry" {
@@ -1221,6 +1282,61 @@ test "writeRequestPayload omits reasoning object for openrouter default effort" 
     try std.testing.expect(std.mem.indexOf(u8, body, "reasoning") == null);
 }
 
+test "writeRequestPayload emits reasoning summary for openrouter dialect" {
+    // OpenRouter's `reasoning` object accepts both `effort` and `summary`.
+    // The chat-completions client must serialize `summary` alongside `effort`.
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "anthropic/claude-opus-5", "", &.{}, "[]", .{ .effort = .high, .summary = .concise }, null, .openrouter, false, false);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"high\",\"summary\":\"concise\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_effort") == null);
+}
+
+test "writeRequestPayload emits reasoning summary even with default effort" {
+    // `default` effort = model's own behaviour, but a non-null summary still
+    // produces a reasoning object with just the summary field.
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "anthropic/claude-opus-5", "", &.{}, "[]", .{ .effort = .default, .summary = .detailed }, null, .openrouter, false, false);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"summary\":\"detailed\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "effort") == null);
+}
+
+test "writeRequestPayload emits max effort for openrouter dialect" {
+    // `max` is the highest reasoning level (OpenRouter extension, above xhigh).
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "anthropic/claude-opus-5", "", &.{}, "[]", .{ .effort = .max }, null, .openrouter, false, false);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"max\"}") != null);
+}
+
+test "writeRequestPayload omits stream_options for openrouter dialect" {
+    // OpenRouter marks `stream_options.include_usage` as deprecated — omit it.
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "anthropic/claude-opus-5", "", &.{}, "[]", null, null, .openrouter, false, false);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "stream_options") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+}
+
+test "writeRequestPayload keeps stream_options for non-openrouter dialects" {
+    // Other dialects still need `stream_options.include_usage`.
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "gpt-4o", "", &.{}, "[]", null, null, .openai, false, false);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"stream_options\":{\"include_usage\":true}") != null);
+}
+
 test "writeRequestPayload emits max_completion_tokens for openai reasoning models" {
     // OpenAI reasoning models (o-series, gpt-5) ignore the legacy `max_tokens`
     // field; the openai-compatible provider maps it to `max_completion_tokens`.
@@ -1287,7 +1403,7 @@ test "writeRequestPayload omits prompt_cache_key when no session id is set" {
 
 test "writeRequestPayload suppresses cache_control when disable_prompt_cache is true" {
     // C1: an OpenRouter model that rejects cache_control must have BOTH the
-    // per-message cache_control AND the top-level prompt_cache_key suppressed.
+    // top-level cache_control AND the native session_id suppressed.
     const gpa = std.testing.allocator;
     const system_blocks = try gpa.alloc(ai.ContentBlock, 1);
     system_blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "You are a helpful agent.") } };
@@ -1300,12 +1416,13 @@ test "writeRequestPayload suppresses cache_control when disable_prompt_cache is 
     try writeRequestPayload(gpa, &payload.writer, "inclusionai/ling-3.0-flash:free", "sess-abc", &views, "[]", null, null, .openrouter, true, false);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "cache_control") == null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_key") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "session_id") == null);
 }
 
 test "writeRequestPayload emits cache_control when disable_prompt_cache is false" {
     // Regression guard: the flag defaults off, so the existing OpenRouter
-    // cache behaviour is preserved.
+    // cache behaviour is preserved. Top-level cache_control (auto breakpoint)
+    // + native session_id (sticky routing).
     const gpa = std.testing.allocator;
     const system_blocks = try gpa.alloc(ai.ContentBlock, 1);
     system_blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "You are a helpful agent.") } };
@@ -1318,7 +1435,7 @@ test "writeRequestPayload emits cache_control when disable_prompt_cache is false
     try writeRequestPayload(gpa, &payload.writer, "inclusionai/ling-3.0-flash:free", "sess-abc", &views, "[]", null, null, .openrouter, false, false);
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"sess-abc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"session_id\":\"sess-abc\"") != null);
 }
 
 test "writeRequestPayload omits tools and tool_choice when there are none" {
@@ -1461,7 +1578,7 @@ test "writeRequestPayload ships the full tools array for OpenRouter byte-for-byt
     defer gpa.free(tools_json);
 
     // Full wire payload — writeRequestPayload applies no truncation. Include a
-    // system message so OpenRouter's per-message cache_control is emitted.
+    // system message so OpenRouter's top-level cache_control is emitted.
     const system_blocks = try gpa.alloc(ai.ContentBlock, 1);
     system_blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "You are a helpful agent.") } };
     var system_msg: ai.ChatMessage = .{ .system = .{ .content = system_blocks } };
@@ -1478,9 +1595,9 @@ test "writeRequestPayload ships the full tools array for OpenRouter byte-for-byt
     defer parsed.deinit();
     try std.testing.expect(parsed.value == .object);
 
-    // 1. OpenRouter dialect'i: system mesajı cache_control + prompt_cache_key.
+    // 1. OpenRouter dialect'i: top-level cache_control + native session_id.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"session-abc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"session_id\":\"session-abc\"") != null);
 
     // 2. tools array'i tam ve kırpılmamış — üretilen byte'larla birebir aynı.
     const tools_str = try std.fmt.allocPrint(gpa, "\"tools\":{s}", .{tools_json});
@@ -1556,12 +1673,13 @@ test "ollama_cloud(minimal) vs openrouter dialect: identical tools array, only c
     try std.testing.expect(std.mem.indexOf(u8, body_min, "\"tool_choice\":\"auto\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body_or, "\"tool_choice\":\"auto\"") != null);
 
-    // 3. TEK fark: openrouter, system mesajına cache_control + prompt_cache_key
+    // 3. TEK fark: openrouter, top-level cache_control + native session_id
     //    ekler; minimal bunları hiç üretmez.
     try std.testing.expect(std.mem.indexOf(u8, body_min, "cache_control") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body_min, "session_id") == null);
     try std.testing.expect(std.mem.indexOf(u8, body_min, "prompt_cache_key") == null);
     try std.testing.expect(std.mem.indexOf(u8, body_or, "\"cache_control\":{\"type\":\"ephemeral\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body_or, "\"prompt_cache_key\":\"sess\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body_or, "\"session_id\":\"sess\"") != null);
 }
 
 test "readStream accepts an SSE line larger than the transfer buffer" {

@@ -1398,6 +1398,7 @@ const reasoning_options = [_]model_picker.ReasoningOption{
     .{ .label = "medium", .effort = .medium },
     .{ .label = "high", .effort = .high },
     .{ .label = "xhigh", .effort = .xhigh },
+    .{ .label = "max", .effort = .max },
     .{ .label = "low", .effort = .low },
     .{ .label = "nothink", .effort = .none },
 };

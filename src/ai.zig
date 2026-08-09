@@ -30,6 +30,10 @@ pub const ReasoningEffort = enum {
     medium,
     high,
     xhigh,
+    /// Highest reasoning effort (OpenRouter extension). The official OpenAPI
+    /// enum is `["max","xhigh","high","medium","low","minimal","none"]`; `max`
+    /// is the top level, above `xhigh`. OpenAI-native dialects ignore it.
+    max,
 
     pub fn label(self: ReasoningEffort) []const u8 {
         return @tagName(self);
@@ -67,8 +71,9 @@ pub const Reasoning = struct {
 pub const WireDialect = enum {
     /// OpenAI native: `prompt_cache_key` ✓, `reasoning_effort` ✓.
     openai,
-    /// OpenRouter: `cache_control` (message + top-level) ✓,
-    /// `prompt_cache_key` ✓, `reasoning_effort` ✓.
+    /// OpenRouter: top-level `cache_control` (auto breakpoint) ✓,
+    /// native `session_id` (sticky routing) ✓, `reasoning` object with
+    /// `effort`+`summary` ✓, `reasoning_effort` shorthand ✓.
     openrouter,
     /// Qwen / DashScope: top-level `enable_thinking` ✓,
     /// `reasoning_effort` ✓.
@@ -109,14 +114,26 @@ pub const WireDialect = enum {
         return .minimal;
     }
 
-    /// Whether message-level `cache_control` should be emitted.
-    pub fn allowsCacheControl(self: WireDialect) bool {
+    /// Whether top-level `cache_control` (automatic breakpoint) should be
+    /// emitted. OpenRouter applies the cache directive at the request level,
+    /// auto-marking the last cacheable block; this supersedes the old
+    /// message-level (system-only) approach.
+    pub fn allowsTopLevelCacheControl(self: WireDialect) bool {
         return self == .openrouter;
     }
 
-    /// Whether top-level `prompt_cache_key` should be emitted.
+    /// Whether the native top-level `session_id` (sticky provider routing +
+    /// cache grouping) should be emitted instead of OpenAI's
+    /// `prompt_cache_key`. OpenRouter's `session_id` doubles as a cache key
+    /// and an observability/routing key.
+    pub fn usesNativeSessionId(self: WireDialect) bool {
+        return self == .openrouter;
+    }
+
+    /// Whether top-level `prompt_cache_key` should be emitted. Used by the
+    /// OpenAI-native dialect only — OpenRouter uses `session_id` instead.
     pub fn allowsPromptCacheKey(self: WireDialect) bool {
-        return self == .openai or self == .openrouter;
+        return self == .openai;
     }
 
     /// Whether top-level `enable_thinking` (DashScope-style) should be
@@ -705,6 +722,8 @@ test "ReasoningEffort.fromString round-trips labels and rejects unknowns" {
     try std.testing.expectEqual(ReasoningEffort.default, try ReasoningEffort.fromString("default"));
     try std.testing.expectEqual(ReasoningEffort.high, try ReasoningEffort.fromString("high"));
     try std.testing.expectEqual(ReasoningEffort.none, try ReasoningEffort.fromString("none"));
+    try std.testing.expectEqual(ReasoningEffort.max, try ReasoningEffort.fromString("max"));
+    try std.testing.expectEqualStrings("max", ReasoningEffort.max.label());
     try std.testing.expectError(error.InvalidReasoningEffort, ReasoningEffort.fromString("turbo"));
     try std.testing.expectError(error.InvalidReasoningEffort, ReasoningEffort.fromString(""));
 }
@@ -743,14 +762,19 @@ test "WireDialect.resolve falls back to base URL heuristic" {
 }
 
 test "WireDialect capability gates" {
-    // cache_control: only openrouter
-    try std.testing.expect(WireDialect.openrouter.allowsCacheControl());
-    try std.testing.expect(!WireDialect.openai.allowsCacheControl());
-    try std.testing.expect(!WireDialect.dashscope.allowsCacheControl());
-    try std.testing.expect(!WireDialect.minimal.allowsCacheControl());
-    // prompt_cache_key: openai + openrouter
+    // top-level cache_control: only openrouter
+    try std.testing.expect(WireDialect.openrouter.allowsTopLevelCacheControl());
+    try std.testing.expect(!WireDialect.openai.allowsTopLevelCacheControl());
+    try std.testing.expect(!WireDialect.dashscope.allowsTopLevelCacheControl());
+    try std.testing.expect(!WireDialect.minimal.allowsTopLevelCacheControl());
+    // native session_id: only openrouter
+    try std.testing.expect(WireDialect.openrouter.usesNativeSessionId());
+    try std.testing.expect(!WireDialect.openai.usesNativeSessionId());
+    try std.testing.expect(!WireDialect.dashscope.usesNativeSessionId());
+    try std.testing.expect(!WireDialect.minimal.usesNativeSessionId());
+    // prompt_cache_key: openai only (openrouter uses native session_id)
     try std.testing.expect(WireDialect.openai.allowsPromptCacheKey());
-    try std.testing.expect(WireDialect.openrouter.allowsPromptCacheKey());
+    try std.testing.expect(!WireDialect.openrouter.allowsPromptCacheKey());
     try std.testing.expect(!WireDialect.dashscope.allowsPromptCacheKey());
     try std.testing.expect(!WireDialect.minimal.allowsPromptCacheKey());
     // enable_thinking: only dashscope
