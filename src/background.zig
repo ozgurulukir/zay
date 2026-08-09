@@ -489,16 +489,19 @@ fn terminateTree(io: std.Io, gpa: std.mem.Allocator, pid: i64) void {
         const pid_arg = std.fmt.allocPrint(gpa, "{d}", .{pid}) catch return;
         defer gpa.free(pid_arg);
 
-        var taskkill_path: []const u8 = "taskkill.exe";
+        var taskkill_path: []const u8 = "C:\\Windows\\System32\\taskkill.exe";
         var is_allocated = false;
 
-        if (std.process.getEnvVarOwned(gpa, "SystemRoot")) |root| {
-            if (std.fmt.allocPrint(gpa, "{s}\\System32\\taskkill.exe", .{root})) |path| {
-                taskkill_path = path;
-                is_allocated = true;
-            } else |_| {}
-            gpa.free(root);
-        } else |_| {}
+        var env_map = std.process.Environ.createMap(.{ .block = .global }, gpa) catch null;
+        if (env_map != null) {
+            if (env_map.?.get("SystemRoot")) |root| {
+                if (std.fmt.allocPrint(gpa, "{s}\\System32\\taskkill.exe", .{root})) |path| {
+                    taskkill_path = path;
+                    is_allocated = true;
+                } else |_| {}
+            }
+        }
+        defer if (env_map != null) env_map.?.deinit();
 
         defer if (is_allocated) gpa.free(taskkill_path);
 
