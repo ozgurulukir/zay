@@ -787,7 +787,7 @@ test "spinner frame advances while a background lane is active and visible lane 
     const lane2 = try gpa.create(Thread);
     lane2.* = .{};
     lane2.turn.submit();
-    try app.threads.append(gpa, lane2);
+    try app.threads.append(lane2);
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -1644,7 +1644,7 @@ test "lane commands stay hidden until a second lane exists" {
     // A second lane unhides the multi-lane commands.
     const lane2 = try gpa.create(Thread);
     lane2.* = .{};
-    try app.threads.append(gpa, lane2);
+    try app.threads.append(lane2);
     try std.testing.expect(resolveCommand(&app, "Merge") == .merge);
     try std.testing.expect(resolveCommand(&app, "Close") == .close);
 }
@@ -1665,10 +1665,10 @@ test "cycleLane wraps the active lane in both directions" {
 
     const lane2 = try gpa.create(Thread);
     lane2.* = .{};
-    try app.threads.append(gpa, lane2);
+    try app.threads.append(lane2);
     const lane3 = try gpa.create(Thread);
     lane3.* = .{};
-    try app.threads.append(gpa, lane3);
+    try app.threads.append(lane3);
 
     try std.testing.expectEqual(@as(usize, 0), app.activeIndex());
     app.cycleLane(1);
@@ -1700,7 +1700,7 @@ test "toggleLaneFullscreen flips split only when multiple lanes exist" {
 
     const lane2 = try gpa.create(Thread);
     lane2.* = .{};
-    try app.threads.append(gpa, lane2);
+    try app.threads.append(lane2);
     app.split = true; // parallel lanes open tiled
     app.toggleLaneFullscreen();
     try std.testing.expect(!app.split); // now fullscreened
@@ -2598,7 +2598,7 @@ test "switching lanes is a no-op with a single lane" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), app.threads.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.threads.len());
     const before = app.thread;
     app.switchToNextLane();
     try std.testing.expectEqual(before, app.thread);

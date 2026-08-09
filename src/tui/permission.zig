@@ -17,7 +17,7 @@ const Thread = tui.Thread;
 /// returned lane, not blindly to `app.thread`.
 pub fn approvalLane(app: *App) ?*Thread {
     if (pendingOn(app.thread)) return app.thread;
-    for (app.threads.items) |lane| {
+    for (app.threads.slice()) |lane| {
         if (lane == app.thread) continue;
         if (pendingOn(lane)) return lane;
     }
@@ -92,7 +92,7 @@ fn addLaneWithWorker(gpa: std.mem.Allocator, app: *App, io: std.Io, id: []const 
         .engine = .{ .idle = .{ .working = .{ .branch = branch, .path = path } } },
         .worker_context = .{ .io = io, .gpa = gpa },
     };
-    try app.threads.append(gpa, lane);
+    try app.threads.append( lane);
     return lane;
 }
 

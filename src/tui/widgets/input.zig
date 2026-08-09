@@ -411,7 +411,7 @@ pub const InputWidget = struct {
         const show_badge = show_hint and self.app.runningBackgroundCount() > 0;
         // The pink lanes chip only makes sense while fullscreened (not tiled)
         // with other lanes hidden behind the active one.
-        const show_lanes = show_hint and !self.app.split and self.app.threads.items.len > 1;
+        const show_lanes = show_hint and !self.app.split and self.app.threads.len() > 1;
         const children_count: usize = 1 +
             @as(usize, if (show_hint) 1 else 0) +
             @as(usize, if (show_diff) 1 else 0) +
@@ -579,7 +579,7 @@ pub const InputWidget = struct {
     /// lane is fullscreened. Black-on-pink so it reads as a control affordance;
     /// clicking it (mouse) or pressing Ctrl+L restores the split view.
     fn drawLanesBadge(self: *InputWidget, ctx: vxfw.DrawContext, max_width: u16) std.mem.Allocator.Error!vxfw.Surface {
-        const text = try std.fmt.allocPrint(ctx.arena, " {d} Lanes ", .{self.app.threads.items.len});
+        const text = try std.fmt.allocPrint(ctx.arena, " {d} Lanes ", .{self.app.threads.len()});
         const text_width: u16 = @intCast(@min(ctx.stringWidth(text), max_width));
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = text_width, .height = 1 });
         if (text_width == 0) return surface;

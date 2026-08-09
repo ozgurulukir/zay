@@ -497,7 +497,7 @@ fn addIdleFocusedLane(gpa: std.mem.Allocator, app: *App, id: []const u8) !void {
     const path = try std.fmt.allocPrint(gpa, "/tmp/nova-lanes/{s}", .{id});
     errdefer gpa.free(path);
     lane.* = .{ .engine = .{ .idle = .{ .working = .{ .branch = branch, .path = path } } } };
-    try app.threads.append(gpa, lane);
+    try app.threads.append( lane);
     app.thread = lane; // focus the idle lane
 }
 

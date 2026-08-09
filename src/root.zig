@@ -250,6 +250,7 @@ test {
     // only referenced lazily — e.g. `pub const tests` on `tui.zig` — is never
     // analyzed, and its tests silently never run).
     _ = @import("tui/tests.zig");
+    _ = @import("tui/bounded_list.zig");
     _ = @import("lua/root.zig");
     _ = @import("lua/state.zig");
     _ = @import("lua/bridge.zig");

@@ -2,8 +2,10 @@ const std = @import("std");
 
 const bounded_queue = @import("bounded_queue");
 const agent_mod = @import("../agent.zig");
+const BoundedList = @import("bounded_list.zig").BoundedList;
 
 const event_queue_capacity: u32 = 4096;
+pub const event_batch_max: u32 = 32;
 const EventQueueStorage = bounded_queue.BoundedQueue(*agent_mod.Agent.Event);
 
 pub const EventQueue = struct {
@@ -33,6 +35,27 @@ pub const EventQueue = struct {
         defer self.mutex.unlock(io);
         while (self.event_queue.pop(&self.storage)) |event| {
             try sink.append(gpa, event);
+        }
+    }
+
+    /// Bounded variant: drains into inline storage; if the buffer fills,
+    /// the remaining events stay in the queue and will be drained on the next
+    /// tick. This keeps the hot-path UI tick allocation-free.
+    pub fn drainIntoBounded(
+        self: *EventQueue,
+        io: std.Io,
+        sink: *BoundedList(*agent_mod.Agent.Event, event_batch_max),
+    ) !void {
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        while (self.event_queue.pop(&self.storage)) |event| {
+            sink.append(event) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    // Push the overflowed event back so the next tick can drain it.
+                    _ = self.event_queue.push(&self.storage, event);
+                    return;
+                },
+            };
         }
     }
 

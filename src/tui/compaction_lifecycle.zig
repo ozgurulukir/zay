@@ -39,7 +39,7 @@ pub fn compactErrorText(err: anyerror) []const u8 {
 /// tick gets scheduled) while a compact is pending, and an orphaned row is
 /// dropped on the next tick after a disconnect.
 pub fn manualCompactActive(app: *const App) bool {
-    for (app.threads.items) |lane| {
+    for (app.threads.slice()) |lane| {
         if (lane.manual_compact_waiting_row != null) return true;
         if (lane.agent) |agent| {
             if (agent.manual_compact_pending) return true;
@@ -82,7 +82,7 @@ pub fn requestManualCompact(app: *App) !bool {
 pub fn drainManualCompactions(app: *App) !bool {
     var visible_change = false;
     const active = app.thread;
-    for (app.threads.items) |lane| {
+    for (app.threads.slice()) |lane| {
         const pending = if (lane.agent) |a| a.manual_compact_pending else false;
         if (!pending and lane.manual_compact_waiting_row == null) continue;
 

@@ -42,7 +42,7 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
     const max_width = ctx.max.width orelse ctx.min.width;
     const max_height = ctx.max.height orelse ctx.min.height;
     const loading_visible = app.thread.turn_view.awaitingOutput();
-    const split = app.split and app.threads.items.len > 1;
+    const split = app.split and app.threads.len() > 1;
     // In split view always reserve the loading row so each column keeps a
     // fixed height across turns — the spinner appearing must not reflow.
     const layout = root_layout.rootLayout(max_height, false, try app.inputTextRows(ctx, max_width -| 4), loading_visible or split, app.thread.queued.items.len > 0);
@@ -69,7 +69,7 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
     const at_visible = (app.at_search != .closed) and !overlay_visible and !permission_visible and !background_visible;
     const toast_visible = toast.global.hasToasts();
 
-    var child_count: usize = (if (split) app.threads.items.len else 1) + 1;
+    var child_count: usize = (if (split) app.threads.len() else 1) + 1;
     if (loading_visible) child_count += 1;
     if (overlay_visible) child_count += 1;
     if (permission_visible) child_count += 1;
@@ -82,10 +82,10 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         // Tile the transcript area as a 2-wide grid: rows of two lanes, a
         // trailing odd lane spanning its row. The active lane is marked in
         // its border label; input + spinner stay shared below, routing to it.
-        const n = app.threads.items.len;
+        const n = app.threads.len();
         const rows: u16 = @intCast((n + 1) / 2);
         const cell_h: u16 = layout.transcript_height / rows;
-        for (app.threads.items, 0..) |lane, i| {
+        for (app.threads.slice(), 0..) |lane, i| {
             const row: u16 = @intCast(i / 2);
             const col: u16 = @intCast(i % 2);
             const last_row = row == rows - 1;

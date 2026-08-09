@@ -11,6 +11,8 @@ const vxfw = vaxis.vxfw;
 
 const tui = @import("../tui.zig");
 const agent_mod = @import("../agent.zig");
+const BoundedList = @import("bounded_list.zig").BoundedList;
+const agent_worker = @import("agent_worker.zig");
 const auth = @import("../auth/store.zig");
 const blackhole = @import("../tui/blackhole.zig");
 const provider_model = @import("provider_model.zig");
@@ -23,13 +25,33 @@ const vcs = @import("../vcs.zig");
 const App = tui.App;
 const RootWidget = tui.RootWidget;
 const Thread = tui.Thread;
+const max_threads = tui.max_threads;
 
 /// Tear down every lane, background job, picker, cache, and input buffer.
 /// Called once at clean exit (or when switching to a new `initRuntime` session).
 pub fn deinitApp(self: *App) void {
-    // Cancel every lane's in-flight turn (background lanes may still be
-    // running) so no worker thread outlives the App.
-    for (self.threads.items) |lane| {
+    std.debug.assert(self.threads.len() > 0);
+    std.debug.assert(self.threads.len() <= max_threads);
+
+    // Stop all worker threads first; nothing below may dereference a live
+    // worker while it is still running.
+    deinitWorkersTop(self);
+
+    // Shared services that other teardown steps may reference during cleanup.
+    deinitSharedServices(self);
+
+    // Heap-owned UI and lane state. Order mirrors init: search/inputs last,
+    // lanes second-to-last, bridge/limiter absolute last.
+    deinitOwnedState(self);
+
+    self.* = undefined;
+}
+
+/// Cancel every lane's in-flight turn and naming operation.  Background lanes
+/// may still be running, so cancelling their futures joins them before the App
+/// goes away.
+fn deinitWorkersTop(self: *App) void {
+    for (self.threads.slice()) |lane| {
         if (lane.turn_future) |*future| {
             if (lane.worker_context) |*worker| worker.requestCancel();
             _ = future.cancel(self.io);
@@ -37,10 +59,14 @@ pub fn deinitApp(self: *App) void {
         }
         self.cancelLaneNaming(lane);
     }
-    // Now that no worker can still be inside `manager.start`, terminate and
-    // join every background job (kills the whole process tree on Windows via
-    // the per-job Job Object). Jobs hold an opaque owner token that is never
-    // dereferenced, so this is independent of lane/agent teardown order.
+}
+
+/// Tear down background jobs, pickers, providers, managers, and the lane
+/// bridge / request limiter.  Workers are already joined, so nothing here can
+/// be blocked on a permit or a bridge response.
+fn deinitSharedServices(self: *App) void {
+    // Jobs hold an opaque owner token that is never dereferenced, so this is
+    // independent of lane/agent teardown order.
     if (self.background) |manager| {
         manager.deinit();
         self.gpa.destroy(manager);
@@ -48,22 +74,13 @@ pub fn deinitApp(self: *App) void {
     }
     for (self.background_modal_state.pending.items) |*delivery| self.freeDelivery(delivery);
     self.background_modal_state.pending.deinit(self.gpa);
-    // Cancel the in-flight load first (it needs `io`), then free the
-    // catalogue's owned lists + error in one pass.
+
     provider_model.cancelModelLoad(self);
-    for (self.retired_transcripts.items) |*transcript| transcript.deinit(self.gpa);
-    self.retired_transcripts.deinit(self.gpa);
-    self.resumeClear();
-    self.resumeClearFolds();
-    self.resume_folded_projects.deinit(self.gpa);
     self.pickers.tree.deinit();
     self.pickers.search.deinit(self.gpa);
-    self.cancelDiffRefresh();
-    // Non-empty labels are always heap-allocated by `loadGitLabel`; the
-    // empty default is a literal, so guard on length before freeing.
-    if (self.metrics.git_label.len > 0) self.gpa.free(self.metrics.git_label);
-    if (self.metrics.diff_cache()) |raw| self.gpa.free(raw);
     self.pickers.models.deinit(self.gpa);
+    self.cancelDiffRefresh();
+
     auth.freeApiKeyMap(self.gpa, &self.provider_state.api_keys);
     if (self.provider_state.modelsdev_registry) |*r| {
         r.deinit(self.gpa);
@@ -73,10 +90,7 @@ pub fn deinitApp(self: *App) void {
         self.gpa.free(slice);
         self.provider_state.entries_slice = null;
     }
-    self.input_buffers.provider_key.deinit(self.gpa);
-    self.input_buffers.settings_text.deinit(self.gpa);
-    self.input_buffers.mcp_url.deinit(self.gpa);
-    self.input_buffers.session_rename_text.deinit(self.gpa);
+
     self.mcp_manager.deinit(self.io);
     self.plugin_manager.deinit();
     self.tool_registry.deinit(self.gpa);
@@ -85,134 +99,80 @@ pub fn deinitApp(self: *App) void {
         self.cached_config.deinit(self.gpa);
         self.cached_config_owned = false;
     }
-    self.closeAtSearch();
-    // at_search was closed above; its payload (if any) is freed.
-    self.clearLanesState();
-    for (self.threads.items) |lane| {
-        lane.deinit(self.gpa);
-        self.gpa.destroy(lane);
-    }
-    self.threads.deinit(self.gpa);
-    self.diff.deinit(self.gpa);
-    self.inputs.input.deinit();
-    self.inputs.palette.deinit();
-    self.inputs.comment.deinit();
-    // Every lane's turn future was cancelled at the top of deinitApp, so no
-    // worker is still blocked on the bridge — safe to destroy it now.
+
+    // No worker is blocked on the bridge or holds a permit now.
     if (self.lane_bridge) |bridge| {
         self.gpa.destroy(bridge);
         self.lane_bridge = null;
     }
-    // Same: every worker was joined above, so none can still hold a permit —
-    // safe to destroy the shared limiter.
     if (self.request_limiter) |limiter| {
         self.gpa.destroy(limiter);
         self.request_limiter = null;
     }
-    self.* = undefined;
+}
+
+/// Tear down per-lane owned data and UI input buffers.  Lanes are destroyed
+/// after their dependent state (retired transcripts, resume lists, search
+/// state) is freed.
+fn deinitOwnedState(self: *App) void {
+    self.closeAtSearch();
+    self.clearLanesState();
+
+    for (self.retired_transcripts.items) |*transcript| transcript.deinit(self.gpa);
+    self.retired_transcripts.deinit(self.gpa);
+    self.resumeClear();
+    self.resumeClearFolds();
+    self.resume_folded_projects.deinit(self.gpa);
+
+    // Non-empty labels are always heap-allocated by `loadGitLabel`; the
+    // empty default is a literal, so guard on length before freeing.
+    if (self.metrics.git_label.len > 0) self.gpa.free(self.metrics.git_label);
+    if (self.metrics.diff_cache()) |raw| self.gpa.free(raw);
+
+    for (self.threads.slice()) |lane| {
+        lane.deinit(self.gpa);
+        self.gpa.destroy(lane);
+    }
+    std.debug.assert(self.threads.len() <= max_threads);
+    self.threads.deinit();
+
+    self.diff.deinit(self.gpa);
+    self.inputs.input.deinit();
+    self.inputs.palette.deinit();
+    self.inputs.comment.deinit();
+
+    self.input_buffers.provider_key.deinit(self.gpa);
+    self.input_buffers.settings_text.deinit(self.gpa);
+    self.input_buffers.mcp_url.deinit(self.gpa);
+    self.input_buffers.session_rename_text.deinit(self.gpa);
 }
 
 /// Periodic frame-level tick: drain agent events, model loads, diff refreshes,
 /// lanes naming, background completion, spinner animation, and the black-hole
 /// intro. Re-schedules itself when work is still pending.
 pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
+    std.debug.assert(root.app.threads.len() > 0);
+    std.debug.assert(root.app.threads.len() <= max_threads);
+    std.debug.assert(root.app.thread.agent != null);
+
     // Lazy MCP connect: trigger once after the UI is responsive so startup
     // doesn't block on subprocess spawn / handshake / tool discovery.
     if (root.mcp_connect_pending) {
         root.mcp_connect_pending = false;
         provider_model.refreshMcpTools(root.app);
     }
+
     var visible_change = try drainAgentEvents(root, ctx);
-    // Drain the toast bus (UI thread only) so new toasts appear and expired
-    // ones are dropped. The widget re-draws on the next frame.
-    {
-        var toast_items: [toast.max_items]toast.Item = undefined;
-        if (toast.global.drain(&toast_items) > 0) visible_change = true;
-    }
-    // Service any in-flight `lane` tool request (a worker lane is blocked on
-    // the bridge while it waits). Runs every tick — a blocked worker posts no
-    // agent events, so this is the only thing that makes it progress.
-    lane_lifecycle.serviceLaneBridge(root.app);
-    if (try provider_model.drainModelLoad(root.app)) visible_change = true;
-    // Re-discover MCP tools when a server pushed `notifications/tools/list_changed`
-    // mid-request — the client buffered the flag and we poll it here.
-    if (provider_model.drainMcpNotifications(root.app)) visible_change = true;
-    if (provider_model.drainMcpConnects(root.app)) visible_change = true;
-    if (try root.app.drainDiffRefresh()) visible_change = true;
-    // Lanes whose branch name landed get renamed in place.
-    if (try root.app.drainLaneNaming()) visible_change = true;
-    // A manual `/compact` is being polled to completion on its summarizer
-    // thread; install the result here so the UI thread never blocks on it.
-    if (try compaction_lifecycle.drainManualCompactions(root.app)) visible_change = true;
-    // Collect any finished background jobs, then deliver buffered completions
-    // to idle lanes (notice + a turn to answer them).
-    if (try root.app.pollBackgroundJobs()) visible_change = true;
-    if (try root.app.deliverPendingBackground()) visible_change = true;
-    // Rest finished spawned workers and deliver their completions to the
-    // spawner (notice + answer turn); acknowledged/gone spawners drop it.
-    if (try lane_lifecycle.deliverPendingLaneCompletions(root.app)) visible_change = true;
+    visible_change = try drainToasts(root) or visible_change;
+    visible_change = try drainModelsAndMcp(root) or visible_change;
+    visible_change = try drainDiffAndCompactions(root) or visible_change;
+    visible_change = try drainBackgroundAndLanes(root) or visible_change;
 
-    // The loading frame animates any time a spinner is visible: a running turn
-    // on any lane (border glyph + transcript strip + tool title), or an
-    // in-flight manual /compact (its "waiting" status row spins). `anyTurnActive`
-    // covers all lanes' `.active` and `.interrupting` states; a running tool
-    // implies an active turn, so `hasRunningTool()` is subsumed.
-    if (root.app.anyTurnActive() or compaction_lifecycle.manualCompactActive(root.app)) {
-        root.spinner_tick_accum += RootWidget.drain_tick_ms;
-        if (root.spinner_tick_accum >= RootWidget.spinner_tick_threshold_ms) {
-            root.spinner_tick_accum = 0;
-            root.app.advanceLoadingFrame();
-            visible_change = true;
-        }
-    } else {
-        root.spinner_tick_accum = 0;
-    }
+    try advanceAnimations(root, &visible_change);
+    try scheduleDiffRefreshIfPending(root, ctx);
+    advanceBlackholeIfVisible(root, &visible_change);
 
-    if (root.diff_refresh_pending) {
-        root.diff_tick_accum += RootWidget.drain_tick_ms;
-        if (root.diff_tick_accum >= RootWidget.diff_tick_threshold_ms) {
-            root.diff_tick_accum = 0;
-            root.diff_refresh_pending = false;
-            try root.app.scheduleDiffRefresh();
-        }
-    } else {
-        root.diff_tick_accum = 0;
-    }
-
-    if (root.app.metrics.blackhole_visible) {
-        // Carry the remainder so the average interval tracks ~24 fps even
-        // though the host tick (30 ms) is coarser than the frame interval.
-        root.blackhole_tick_accum += RootWidget.drain_tick_ms;
-        while (root.blackhole_tick_accum >= blackhole.frame_interval_ms) {
-            root.blackhole_tick_accum -= blackhole.frame_interval_ms;
-            root.app.advanceBlackholeFrame();
-            visible_change = true;
-        }
-    } else {
-        root.blackhole_tick_accum = 0;
-    }
-
-    const model_loading = root.app.pickers.models.load == .loading;
-    const diff_loading = root.app.metrics.diff_loading();
-    // Keep ticking while a turn is active OR interrupting, so the worker's
-    // remaining events (and its terminal `turn_finished`) get drained.
-    const should_tick = root.app.anyTurnActive() or
-        model_loading or
-        diff_loading or
-        root.app.metrics.blackhole_visible or
-        root.diff_refresh_pending or
-        root.app.backgroundActive() or
-        root.app.namingActive() or
-        // Keep polling while an async MCP connect is in flight so
-        // drainMcpConnects keeps installing completed handshakes.
-        root.app.mcp_manager.hasPendingConnects() or
-        // Keep polling while a manual /compact summarizer is running so
-        // drainManualCompactions installs the result without blocking.
-        compaction_lifecycle.manualCompactActive(root.app) or
-        // Keep polling while a toast is on screen so its auto-dismiss deadline
-        // is evaluated and the widget re-draws when it expires.
-        toast.global.hasToasts();
-    if (should_tick) {
+    if (decideShouldTick(root)) {
         try ctx.tick(RootWidget.drain_tick_ms, root.widget());
     } else {
         root.app.metrics.loading_tick_active = false;
@@ -225,6 +185,116 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     }
 }
 
+/// Drain the toast bus (UI thread only). Returns true if any toast appeared or expired.
+fn drainToasts(root: *RootWidget) !bool {
+    _ = root;
+    var toast_items: [toast.max_items]toast.Item = undefined;
+    return toast.global.drain(&toast_items) > 0;
+}
+
+/// Service the lane bridge and drain model / MCP notification state.
+fn drainModelsAndMcp(root: *RootWidget) !bool {
+    // A blocked worker posts no agent events, so the bridge must be serviced
+    // every tick to make it progress.
+    lane_lifecycle.serviceLaneBridge(root.app);
+    var visible_change = false;
+    if (try provider_model.drainModelLoad(root.app)) visible_change = true;
+    if (provider_model.drainMcpNotifications(root.app)) visible_change = true;
+    if (provider_model.drainMcpConnects(root.app)) visible_change = true;
+    return visible_change;
+}
+
+/// Drain diff refresh, lane naming, and manual compaction state.
+fn drainDiffAndCompactions(root: *RootWidget) !bool {
+    var visible_change = false;
+    if (try root.app.drainDiffRefresh()) visible_change = true;
+    if (try root.app.drainLaneNaming()) visible_change = true;
+    if (try compaction_lifecycle.drainManualCompactions(root.app)) visible_change = true;
+    return visible_change;
+}
+
+/// Poll background jobs and deliver buffered completions to lanes / spawners.
+fn drainBackgroundAndLanes(root: *RootWidget) !bool {
+    var visible_change = false;
+    if (try root.app.pollBackgroundJobs()) visible_change = true;
+    if (try root.app.deliverPendingBackground()) visible_change = true;
+    if (try lane_lifecycle.deliverPendingLaneCompletions(root.app)) visible_change = true;
+    return visible_change;
+}
+
+/// Advance spinner frames when a turn or manual compaction is active.
+fn advanceAnimations(root: *RootWidget, visible_change: *bool) !void {
+    const spinner_active = root.app.anyTurnActive() or
+        compaction_lifecycle.manualCompactActive(root.app);
+    if (spinner_active) {
+        root.spinner_tick_accum += RootWidget.drain_tick_ms;
+        if (root.spinner_tick_accum >= RootWidget.spinner_tick_threshold_ms) {
+            root.spinner_tick_accum = 0;
+            root.app.advanceLoadingFrame();
+            visible_change.* = true;
+        }
+    } else {
+        root.spinner_tick_accum = 0;
+    }
+}
+
+/// If a diff refresh was requested, schedule it once the debounce threshold passes.
+fn scheduleDiffRefreshIfPending(root: *RootWidget, ctx: *vxfw.EventContext) !void {
+    if (root.diff_refresh_pending) {
+        root.diff_tick_accum += RootWidget.drain_tick_ms;
+        if (root.diff_tick_accum >= RootWidget.diff_tick_threshold_ms) {
+            root.diff_tick_accum = 0;
+            root.diff_refresh_pending = false;
+            try root.app.scheduleDiffRefresh();
+            try ensureTick(root, ctx);
+        }
+    } else {
+        root.diff_tick_accum = 0;
+    }
+}
+
+/// Advance the black-hole intro animation when it is visible.
+fn advanceBlackholeIfVisible(root: *RootWidget, visible_change: *bool) void {
+    if (root.app.metrics.blackhole_visible) {
+        // Carry the remainder so the average interval tracks ~24 fps even
+        // though the host tick (30 ms) is coarser than the frame interval.
+        root.blackhole_tick_accum += RootWidget.drain_tick_ms;
+        while (root.blackhole_tick_accum >= blackhole.frame_interval_ms) {
+            root.blackhole_tick_accum -= blackhole.frame_interval_ms;
+            root.app.advanceBlackholeFrame();
+            visible_change.* = true;
+        }
+    } else {
+        root.blackhole_tick_accum = 0;
+    }
+}
+
+/// Decide whether another tick should be scheduled.  Each named variable
+/// corresponds to one logical reason for continued polling.
+fn decideShouldTick(root: *RootWidget) bool {
+    const turn_active = root.app.anyTurnActive();
+    const model_loading = root.app.pickers.models.load == .loading;
+    const diff_loading = root.app.metrics.diff_loading();
+    const blackhole_visible = root.app.metrics.blackhole_visible;
+    const diff_refresh_pending = root.diff_refresh_pending;
+    const background_active = root.app.backgroundActive();
+    const naming_active = root.app.namingActive();
+    const mcp_connect_pending = root.app.mcp_manager.hasPendingConnects();
+    const manual_compact_active = compaction_lifecycle.manualCompactActive(root.app);
+    const toasts_visible = toast.global.hasToasts();
+
+    return turn_active or
+        model_loading or
+        diff_loading or
+        blackhole_visible or
+        diff_refresh_pending or
+        background_active or
+        naming_active or
+        mcp_connect_pending or
+        manual_compact_active or
+        toasts_visible;
+}
+
 /// Drain all agent events queued on every lane's worker and project them onto
 /// the relevant lane's thread state. Returns true when any visible state changed.
 fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
@@ -235,16 +305,16 @@ fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
     // events to *that* lane. The Turn machine operates on `self.thread`, so
     // scope-swap it to the lane being processed (UI-thread only) and restore
     // the visible lane afterward.
-    for (root.app.threads.items) |lane| {
+    for (root.app.threads.slice()) |lane| {
         const worker = if (lane.worker_context) |*wc| wc else continue;
-        var batch: std.ArrayList(*agent_mod.Agent.Event) = .empty;
-        defer batch.deinit(worker.gpa);
-        try worker.queue.drainInto(worker.io, worker.gpa, &batch);
-        if (batch.items.len == 0) continue;
+        std.debug.assert(lane.agent != null);
+        var batch: BoundedList(*agent_mod.Agent.Event, agent_worker.event_batch_max) = .{};
+        try worker.queue.drainIntoBounded(worker.io, &batch);
+        if (batch.len() == 0) continue;
 
         root.app.thread = lane;
         defer root.app.thread = active;
-        for (batch.items) |event_ptr| {
+        for (batch.slice()) |event_ptr| {
             defer worker.gpa.destroy(event_ptr);
             defer event_ptr.deinit(worker.gpa);
 
@@ -271,7 +341,9 @@ fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
 /// Called from the command palette (/parallel) and from `App.submitMode`
 /// (command palette dispatch).
 pub fn createParallelLane(self: *App) !void {
-    if (self.threads.items.len >= 4) return error.TooManyLanes; // driver + 3 lanes, not 4 extra
+    std.debug.assert(self.threads.len() > 0);
+    std.debug.assert(self.threads.len() < max_threads);
+    if (self.threads.len() >= 4) return error.TooManyLanes; // driver + 3 lanes, not 4 extra
     const repo = self.repoRoot() orelse return error.NoActiveRuntime;
     const home = (self.liveRuntime() orelse return error.NoActiveRuntime).home_dir;
     if (!vcs.isRepo(self.gpa, self.io, repo)) return error.NotAGitRepo;
@@ -328,7 +400,8 @@ pub fn createParallelLane(self: *App) !void {
         runtime,
     );
     lane.generation = self.nextLaneGeneration();
-    try self.threads.append(self.gpa, lane);
+    try self.threads.append(lane);
+    std.debug.assert(self.threads.len() <= max_threads);
 
     // Committed: `threads` owns `lane`, which owns `runtime`/`branch`/`dest`.
     self.thread = lane;
@@ -343,6 +416,7 @@ pub fn createParallelLane(self: *App) !void {
 /// (their own routers handle those).
 pub fn handleDiffBrowseKey(root: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
     const app = root.app;
+    std.debug.assert(app.mode == .diff_viewer);
     // Esc / Ctrl+C exit cleanly (comments discarded); Ctrl+S exits and sends.
     if (key.matches(vaxis.Key.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
         try closeDiff(root, ctx, false);

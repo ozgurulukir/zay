@@ -4,6 +4,7 @@
 const std = @import("std");
 const tui = @import("../tui.zig");
 const agent_mod = @import("../agent.zig");
+const BoundedList = @import("bounded_list.zig").BoundedList;
 const agent_worker = @import("agent_worker.zig");
 const lanes_util = @import("lanes.zig");
 const runtime_mod = @import("../runtime.zig");

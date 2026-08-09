@@ -21,8 +21,8 @@ const Thread = tui.Thread;
 /// driver (threads[0]) entered. Only the driver enters lanes, so its agent is
 /// the only one that can hold a workspace.
 fn driverWorkspacePath(app: *const App) ?[]const u8 {
-    if (app.threads.items.len == 0) return null;
-    const agent = app.threads.items[0].agent orelse return null;
+    if (app.threads.len() == 0) return null;
+    const agent = app.threads.at(0).agent orelse return null;
     return agent.workspaceBorrow();
 }
 
