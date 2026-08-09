@@ -160,6 +160,10 @@ and re-injects the serialized tools whenever the MCP tool set changes:
 - **On startup** (`run()`), after configured servers connect.
 - **On `/mcp` open** and after **toggle / reconnect / disconnect** in the overlay.
 - **On provider connect** (the interactive `/connect` flow).
+- **On session switch / resume / lane spawn** (`createRuntime`): after wiring the
+  App's `tool_registry` onto the new runtime, `provider_model.injectToolsInto`
+  pushes the merged builtin + plugin + MCP list so the new session's first turn
+  carries every tool definition.
 
 `buildMcpToolSchemas()` collects all discovered tools from `.connected` servers and
 `updateMcpTools()` rebuilds the client's serialized tool list in place, alongside the
