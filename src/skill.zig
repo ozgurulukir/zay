@@ -126,17 +126,20 @@ pub fn formatForPrompt(gpa: std.mem.Allocator, skills: []const Skill) ![]u8 {
     }
     if (visible == 0) return out.toOwnedSlice();
 
+    // Markdown (not XML) — keeps the model from echoing literal <skill> tags back as text.
+    // No `location` path is published: the model must invoke a skill via `$name` (handled by
+    // `promptPrefix`/`appendSkillBlock`) rather than `cat`-ing the file. Skill bodies can still
+    // reference each other through their own `$name` syntax once injected.
     try out.writer.writeAll("\n\nThe following skills provide specialized instructions for specific tasks.\n");
-    try out.writer.writeAll("Use bash to load a skill's file when the task matches its description.\n");
-    try out.writer.writeAll("When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\n\n");
+    try out.writer.writeAll("When a task matches a skill's description, refer to it by `$name` in your reply — its full instructions will be injected into your context automatically.\n\n");
     try out.writer.writeAll("<available_skills>\n");
     for (skills) |skill| {
         if (skill.disable_model_invocation) continue;
-        try out.writer.writeAll("  <skill>\n");
-        try writeXmlTag(&out.writer, "name", skill.name, 4);
-        try writeXmlTag(&out.writer, "description", skill.description, 4);
-        try writeXmlTag(&out.writer, "location", skill.path, 4);
-        try out.writer.writeAll("  </skill>\n");
+        try out.writer.writeAll("- **");
+        try writeXmlEscaped(&out.writer, skill.name);
+        try out.writer.writeAll("** — ");
+        try writeXmlEscaped(&out.writer, skill.description);
+        try out.writer.writeAll("\n");
     }
     try out.writer.writeAll("</available_skills>");
     return out.toOwnedSlice();
@@ -457,14 +460,6 @@ test "frontmatter parses LF line endings" {
     try std.testing.expectEqualStrings("demo", frontmatterValue(frontmatter, "name").?);
     try std.testing.expectEqualStrings("d", frontmatterValue(frontmatter, "description").?);
     try std.testing.expectEqualStrings("body\n", stripFrontmatter(raw));
-}
-
-fn writeXmlTag(writer: *std.Io.Writer, tag: []const u8, value: []const u8, spaces: u8) !void {
-    var count: u8 = 0;
-    while (count < spaces) : (count += 1) try writer.writeByte(' ');
-    try writer.print("<{s}>", .{tag});
-    try writeXmlEscaped(writer, value);
-    try writer.print("</{s}>\n", .{tag});
 }
 
 /// Public so `plugin_prompt.zig` can reuse XML escaping for the
@@ -860,6 +855,70 @@ test "formatSkillsList empty slice reports no skills" {
     const list = try formatSkillsList(gpa, &.{});
     defer gpa.free(list);
     try std.testing.expectEqualStrings("no skills loaded", list);
+}
+
+test "formatForPrompt renders markdown bullets with name and description" {
+    const gpa = std.testing.allocator;
+    const skills = [_]Skill{
+        .{ .name = @constCast("tigerstyle"), .description = @constCast("Use when writing any code."), .path = @constCast("/secret/tigerstyle/SKILL.md"), .base_dir = @constCast("/secret/tigerstyle") },
+        .{ .name = @constCast("how"), .description = @constCast("Use for how does X work."), .path = @constCast("/secret/how/SKILL.md"), .base_dir = @constCast("/secret/how") },
+    };
+    const text = try formatForPrompt(gpa, &skills);
+    defer gpa.free(text);
+
+    // Markdown form, not XML — no literal `<skill>` tags so weak models don't echo them back.
+    try std.testing.expect(std.mem.indexOf(u8, text, "<available_skills>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "</available_skills>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "**tigerstyle**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "**how**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Use when writing any code.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Use for how does X work.") != null);
+
+    // The model is taught `$name` invocation, not bash — and the path is never published.
+    try std.testing.expect(std.mem.indexOf(u8, text, "refer to it by `$name`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Use bash") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "/secret/tigerstyle/SKILL.md") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "/secret/how/SKILL.md") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "<location>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "  <skill>") == null);
+}
+
+test "formatForPrompt escapes XML-special chars in skill names and descriptions" {
+    const gpa = std.testing.allocator;
+    const skills = [_]Skill{
+        .{ .name = @constCast("a&b"), .description = @constCast("1 < 2 > 0"), .path = @constCast("/x"), .base_dir = @constCast("/x") },
+    };
+    const text = try formatForPrompt(gpa, &skills);
+    defer gpa.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "**a&amp;b**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "1 &lt; 2 &gt; 0") != null);
+    // Raw chars must not leak into the rendered prompt.
+    try std.testing.expect(std.mem.indexOf(u8, text, "**a&b**") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "1 < 2 > 0") == null);
+}
+
+test "formatForPrompt hides disable_model_invocation skills" {
+    const gpa = std.testing.allocator;
+    const skills = [_]Skill{
+        .{ .name = @constCast("public"), .description = @constCast("shown"), .path = @constCast("/p"), .base_dir = @constCast("/p") },
+        .{ .name = @constCast("secret"), .description = @constCast("hidden"), .path = @constCast("/s"), .base_dir = @constCast("/s"), .disable_model_invocation = true },
+    };
+    const text = try formatForPrompt(gpa, &skills);
+    defer gpa.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "**public**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "**secret**") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "hidden") == null);
+}
+
+test "formatForPrompt returns empty when every skill disables model invocation" {
+    const gpa = std.testing.allocator;
+    const skills = [_]Skill{
+        .{ .name = @constCast("a"), .description = @constCast("x"), .path = @constCast("/a"), .base_dir = @constCast("/a"), .disable_model_invocation = true },
+        .{ .name = @constCast("b"), .description = @constCast("y"), .path = @constCast("/b"), .base_dir = @constCast("/b"), .disable_model_invocation = true },
+    };
+    const text = try formatForPrompt(gpa, &skills);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("", text);
 }
 
 test "collectInjectedSkillNames parses injected markers" {

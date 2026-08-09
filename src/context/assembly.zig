@@ -563,7 +563,7 @@ test "assembleSystemPrompt injects every skill and plugin prompt without truncat
     defer gpa.free(prompt);
 
     for (skill_names) |name| {
-        const needle = try std.fmt.allocPrint(gpa, "<name>{s}</name>", .{name});
+        const needle = try std.fmt.allocPrint(gpa, "**{s}**", .{name});
         defer gpa.free(needle);
         try std.testing.expect(std.mem.indexOf(u8, prompt, needle) != null);
     }
@@ -575,8 +575,8 @@ test "assembleSystemPrompt injects every skill and plugin prompt without truncat
         defer gpa.free(body_needle);
         try std.testing.expect(std.mem.indexOf(u8, prompt, body_needle) != null);
     }
-    // Hiçbir skill düşmedi: 8 ayrı <skill> bloğu olmalı.
-    try std.testing.expectEqual(@as(usize, skill_names.len), countStr(prompt, "<skill>\n"));
+    // Hiçbir skill düşmedi: 8 ayrı markdown bullet olmalı (`- **name** — …`).
+    try std.testing.expectEqual(@as(usize, skill_names.len), countStr(prompt, "- **"));
 }
 
 fn countStr(haystack: []const u8, needle: []const u8) usize {
