@@ -884,9 +884,20 @@ pub const AgentRuntime = struct {
         // (`lua__<plugin>__<tool>`) are visible to the model on the next
         // prompt. Best-effort: a failure leaves the builtin-only set and is
         // logged — the attach itself already succeeded.
-        next.updateMcpTools(self.mcp_tools, self.agent.tool_registry, &.{}) catch |err| {
-            log.warn("replaceClient: updateMcpTools failed: {s}", .{@errorName(err)});
-        };
+        //
+        // Guard: during `initSession` (applyFromConfig — every /new,
+        // /resume, lane spawn) the App has not wired `agent.tool_registry`
+        // yet — it lands after `createRuntime` returns. Rebuilding with a
+        // null registry and the empty builtin override serializes `"[]"`,
+        // wiping the bash/lane definitions `init` just built and leaving
+        // the whole session tool-less (the "sending request with NO tools"
+        // turn-loop warning). When unwired, keep the init-time set; the App
+        // pushes the merged list once the registry is wired.
+        if (self.agent.tool_registry != null) {
+            next.updateMcpTools(self.mcp_tools, self.agent.tool_registry, &.{}) catch |err| {
+                log.warn("replaceClient: updateMcpTools failed: {s}", .{@errorName(err)});
+            };
+        }
     }
 
     /// Install the dedicated background-summarizer client, replacing any
@@ -979,6 +990,101 @@ test "OwnedClient.updateMcpTools pushes plugin tools into a freshly-attached cli
     try owned.updateMcpTools(&.{}, reg, &.{});
 
     try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "lua__p__t") != null);
+}
+
+test "attach during initSession keeps builtin tools when registry is unwired" {
+    // Regression for the user-reported "sending request with NO tools
+    // (tools_json is empty)" turn loop: `replaceClient` unconditionally
+    // rebuilt `tools_json` from the live registry, but during `initSession`
+    // (applyFromConfig — every /new, /resume, lane spawn) the App has not
+    // wired `agent.tool_registry` yet. The rebuild with a null registry and
+    // the empty builtin override serialized "[]", wiping the bash/lane
+    // definitions `init` had just built, and nothing re-injected tools until
+    // an unrelated MCP event. The unwired rebuild must be skipped so the
+    // client keeps its init-time builtin set.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_abs = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_abs);
+
+    var runtime: AgentRuntime = undefined;
+    try runtime.initNew(gpa, std.testing.io, home_abs, home_abs, home_abs, "test system prompt", .{
+        .model_selection = .{
+            .builtin = .{
+                .provider = .ollama,
+                .provider_name = @constCast("ollama"),
+                .model = .{ .id = @constCast("test-model") },
+            },
+        },
+    }, &.{}, null);
+    defer runtime.deinit();
+
+    // No registry wired yet — exactly the state `createRuntime` leaves the
+    // runtime in before the App finishes wiring. The builtin tools must
+    // have survived the attach.
+    try std.testing.expect(runtime.agent.tool_registry == null);
+    const client = switch (runtime.client) {
+        .openai_compatible => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "\"name\":\"bash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "\"name\":\"lane\"") != null);
+}
+
+test "attach rebuilds tools from the registry once it is wired" {
+    // Complement to the unwired-guard test: once the App has wired
+    // `agent.tool_registry`, an attach MUST rebuild `tools_json` from it so
+    // plugin tools reach the model (the original `replaceClient` purpose).
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_abs = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_abs);
+
+    var runtime: AgentRuntime = undefined;
+    try runtime.initNew(gpa, std.testing.io, home_abs, home_abs, home_abs, "test system prompt", .{
+        .model_selection = .{
+            .builtin = .{
+                .provider = .ollama,
+                .provider_name = @constCast("ollama"),
+                .model = .{ .id = @constCast("test-model") },
+            },
+        },
+    }, &.{}, null);
+    defer runtime.deinit();
+
+    const reg = try gpa.create(tools_mod.ToolRegistry);
+    defer {
+        reg.deinit(gpa);
+        gpa.destroy(reg);
+    }
+    reg.* = tools_mod.ToolRegistry.init(tools_mod.builtinRegistry());
+    const owned_name = try gpa.dupe(u8, "lua__p__t");
+    const owned_desc = try gpa.dupe(u8, "test");
+    try reg.addPluginTool(gpa, .{
+        .name = owned_name,
+        .description = owned_desc,
+        .schema = .{ .properties = &.{} },
+        .run = undefined,
+        .display = undefined,
+    });
+    runtime.agent.tool_registry = reg;
+
+    // A model switch re-attaches; with the registry wired the rebuild runs.
+    try runtime.attachOpenAiCompatibleClient("http://localhost:11434", "", "test-model", .medium);
+    const client = switch (runtime.client) {
+        .openai_compatible => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "lua__p__t") != null);
+    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "\"name\":\"bash\"") != null);
 }
 
 test "codex refresh starts before token expiry" {

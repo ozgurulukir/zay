@@ -1299,6 +1299,79 @@ test "codex sign-in survives selecting local compatible provider" {
     try std.testing.expectEqual(config_mod.Provider.ollama, app.cached_config.model_selection.?.provider());
 }
 
+test "createRuntime wires the full tool set into the freshly-attached client" {
+    // Regression for the user-reported "sending request with NO tools
+    // (tools_json is empty)" turn loop after a session switch: createRuntime
+    // attaches the client via applyFromConfig before the App's ToolRegistry
+    // is reachable from the runtime, and nothing re-injected tools after the
+    // wiring landed — the new session's main client ran with an empty
+    // tools_json until an unrelated MCP event happened to re-inject them.
+    // createRuntime must push builtin + plugin + MCP tools once wired.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_abs = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_abs);
+
+    // Minimal template runtime standing in for the primary lane.
+    var runtime: runtime_mod.AgentRuntime = undefined;
+    runtime.gpa = gpa;
+    runtime.io = std.testing.io;
+    runtime.cwd = home_abs;
+    runtime.home_dir = home_abs;
+    runtime.client = .none;
+    runtime.base_system_prompt = "test";
+    runtime.system_prompt = "test";
+    runtime.skills = &.{};
+    runtime.plugin_prompts = &.{};
+    runtime.session_writer = undefined;
+    runtime.agent = agent_mod.Agent.init(gpa, std.testing.io, home_abs, .none);
+    defer runtime.agent.deinit();
+    runtime.diagnostics = &.{};
+    runtime.owned_client = null;
+    runtime.owned_compaction_client = null;
+    runtime.owned_naming_client = null;
+    runtime.modelsdev_registry = null;
+    runtime.naming_client = .none;
+
+    var app = try App.init(std.testing.io, gpa, &runtime.agent);
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
+    defer app.deinit();
+
+    // A plugin tool in the App's registry must reach the new client.
+    try app.tool_registry.addPluginTool(gpa, .{
+        .name = try gpa.dupe(u8, "lua__p__t"),
+        .description = try gpa.dupe(u8, "test"),
+        .schema = .{ .properties = &.{} },
+        .run = undefined,
+        .display = undefined,
+    });
+    app.cached_config.model_selection = .{
+        .builtin = .{
+            .provider = .ollama,
+            .provider_name = @constCast("ollama"),
+            .model = .{ .id = @constCast("test-model") },
+        },
+    };
+
+    const new_runtime = try session_switcher.createRuntime(&app, home_abs, home_abs, null);
+    defer {
+        new_runtime.deinit();
+        gpa.destroy(new_runtime);
+    }
+
+    const client = switch (new_runtime.client) {
+        .openai_compatible => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "\"name\":\"bash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "\"name\":\"lane\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "lua__p__t") != null);
+}
+
 test "switching from codex to catalogue provider resets cached connection" {
     const gpa = std.testing.allocator;
     var runtime: runtime_mod.AgentRuntime = undefined;

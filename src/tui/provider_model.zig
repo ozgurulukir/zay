@@ -14,6 +14,7 @@ const model_loader = @import("model_loader.zig");
 const model_picker = @import("widgets/model_picker.zig");
 const openai_compatible_mod = @import("../ai/openai_compatible.zig");
 const provider_picker = @import("widgets/provider_picker.zig");
+const runtime_mod = @import("../runtime.zig");
 const tui_provider = @import("provider_controller.zig");
 const tui_status = @import("status.zig");
 const modelsdev = @import("../models/registry.zig");
@@ -1493,18 +1494,30 @@ fn injectAllTools(self: *App) void {
         log.warn("injectAllTools: no live runtime, skipping tool injection", .{});
         return;
     };
+    injectToolsInto(self, runtime);
+}
+
+/// Push the merged tool list (registry builtin + plugin tools + connected
+/// MCP schemas) into `runtime`'s attached client. `updateMcpTools` replaces
+/// the entire `tools_json`, so one call covers every source. Besides the
+/// live-runtime callers (`injectAllTools`), `createRuntime` uses this for
+/// freshly-created runtimes (session switch, resume, lane spawn): those
+/// attach their client via `applyFromConfig` before the App can inject
+/// anything, so they need one explicit push once their `tool_registry` is
+/// wired — otherwise the session runs tool-less.
+pub fn injectToolsInto(self: *App, runtime: *runtime_mod.AgentRuntime) void {
     const mcp_schemas = self.mcp_manager.buildMcpToolSchemas(self.gpa) catch |err| {
-        log.warn("injectAllTools: buildMcpToolSchemas failed: {s}", .{@errorName(err)});
+        log.warn("injectToolsInto: buildMcpToolSchemas failed: {s}", .{@errorName(err)});
         return;
     };
     defer self.gpa.free(mcp_schemas);
-    log.debug("injectAllTools: mcp={} (plugin tools come from ToolRegistry)", .{mcp_schemas.len});
+    log.debug("injectToolsInto: mcp={} (plugin tools come from ToolRegistry)", .{mcp_schemas.len});
     // Pass an empty builtin_override so we don't double-emit bash: the
     // registry's builtin already contains it, and most OpenAI-compatible
     // APIs reject duplicate tool names with HTTP 400, dropping the
     // entire tool list (including the plugin tools we want exposed).
     runtime.client.updateMcpTools(mcp_schemas, self.tool_registry, &.{}) catch |err| {
-        log.warn("injectAllTools: updateMcpTools failed: {s}", .{@errorName(err)});
+        log.warn("injectToolsInto: updateMcpTools failed: {s}", .{@errorName(err)});
     };
 }
 

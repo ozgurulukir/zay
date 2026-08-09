@@ -9,6 +9,7 @@ const vxfw = vaxis.vxfw;
 
 const tui = @import("../tui.zig");
 const config_mod = @import("../config/config.zig");
+const provider_model = @import("provider_model.zig");
 const resume_picker = @import("widgets/resume_picker.zig");
 const runtime_mod = @import("../runtime.zig");
 const session_mod = @import("../session.zig");
@@ -399,5 +400,12 @@ pub fn createRuntime(app: *App, cwd: []const u8, session_dir: []const u8, sessio
     // Every lane's requests gate on the App's shared limiter, so the provider
     // sees at most `maxConcurrentRequests` in flight across all lanes.
     runtime.agent.request_limiter = app.request_limiter;
+    // The client attached during `initResume`/`initNew` serialized its
+    // `tools_json` before this wiring existed (registry null → the rebuild
+    // is skipped there and the init-time builtin set survives). Push the
+    // merged list now — the same push the model-picker attach path does —
+    // so the new session's first turn carries builtin + plugin + MCP
+    // definitions instead of running tool-less until an unrelated MCP event.
+    provider_model.injectToolsInto(app, runtime);
     return runtime;
 }
