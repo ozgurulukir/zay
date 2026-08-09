@@ -37,6 +37,9 @@ const mode_lifecycle = @import("tui/mode_lifecycle.zig");
 const input_lifecycle = @import("tui/input_lifecycle.zig");
 const transcript_lifecycle = @import("tui/transcript_lifecycle.zig");
 pub const Thread = @import("tui/thread.zig");
+const BoundedList = @import("tui/bounded_list.zig").BoundedList;
+/// Maximum concurrent lanes (driver + 3 parallel workers).
+pub const max_threads: u32 = 4;
 const tui_metrics = @import("tui/metrics.zig");
 const provider_model = @import("tui/provider_model.zig");
 const diff_lifecycle = @import("tui/diff_lifecycle.zig");
@@ -109,7 +112,7 @@ pub const App = struct {
     /// All lanes the developer has open, heap-allocated so their addresses stay
     /// stable while live runtimes and (later) worker threads hold references.
     /// Owns the `Thread`s; freed in `deinit`.
-    threads: std.ArrayList(*Thread) = .empty,
+    threads: BoundedList(*Thread, max_threads) = .{},
     /// Monotonic lane-generation counter, assigned to every Thread at its
     /// creation site (UI thread only). Spawned-worker completion routing uses
     /// it instead of a raw `*Agent` pointer so a session switch (which frees
@@ -222,9 +225,8 @@ pub const App = struct {
         const primary = try gpa.create(Thread);
         errdefer gpa.destroy(primary);
         primary.* = .{ .agent = agent, .worker_context = .{ .io = io, .gpa = agent.gpa } };
-        var threads: std.ArrayList(*Thread) = .empty;
-        errdefer threads.deinit(gpa);
-        try threads.append(gpa, primary);
+        var threads = BoundedList(*Thread, max_threads){};
+        try threads.append(primary);
         const registry = try gpa.create(tools_mod.ToolRegistry);
         errdefer gpa.destroy(registry);
         registry.* = tools_mod.ToolRegistry.init(tools_mod.builtinRegistry());
@@ -328,7 +330,7 @@ pub const App = struct {
     /// new lanes: the first live lane (the primary, in practice). Null only in
     /// headless/test setups.
     pub fn templateRuntime(self: *const App) ?*runtime_mod.AgentRuntime {
-        for (self.threads.items) |lane| {
+        for (self.threads.slice()) |lane| {
             switch (lane.engine) {
                 .live => |live| return live.runtime,
                 else => {},
@@ -511,7 +513,7 @@ pub const App = struct {
     }
 
     pub fn threadsCount(self: *const App) usize {
-        return self.threads.items.len;
+        return self.threads.len();
     }
 
     pub fn toggleSelectedTranscriptBlock(self: *App) void {
@@ -613,7 +615,7 @@ pub const App = struct {
     }
 
     pub fn laneForAgent(self: *App, agent_ptr: *agent_mod.Agent) ?*Thread {
-        for (self.threads.items) |lane| {
+        for (self.threads.slice()) |lane| {
             if (lane.agent) |a| {
                 if (a == agent_ptr) return lane;
             }
@@ -629,7 +631,7 @@ pub const App = struct {
     /// The open lane whose `generation` matches `g`, or null. Used to route a
     /// spawned worker's completion to its spawner across session switches.
     pub fn laneByGeneration(self: *App, g: u64) ?*Thread {
-        for (self.threads.items) |lane| {
+        for (self.threads.slice()) |lane| {
             if (lane.generation == g) return lane;
         }
         return null;
@@ -893,7 +895,7 @@ pub const App = struct {
     /// Repo root = the primary lane's working directory (it was launched there).
     /// Null only if the primary somehow has no runtime (headless/test).
     pub fn repoRoot(self: *const App) ?[]const u8 {
-        return switch (self.threads.items[0].engine) {
+        return switch (self.threads.at(0).engine) {
             .live => |live| live.runtime.cwd,
             .idle => null,
         };
@@ -961,7 +963,7 @@ pub const App = struct {
         return lane_lifecycle.anyTurnActive(self);
     }
 
-    pub fn activeIndex(self: *const App) usize {
+    pub fn activeIndex(self: *const App) u32 {
         return lane_lifecycle.activeIndex(self);
     }
 
@@ -1339,7 +1341,7 @@ pub fn closePlugins(app: *App) void {
 
 /// Whether `entry` should appear in the palette given the current lane count.
 pub fn commandVisible(app: *const App, entry: CommandEntry) bool {
-    if (entry.multi_lane and app.threads.items.len < 2) return false;
+    if (entry.multi_lane and app.threads.len() < 2) return false;
     return true;
 }
 

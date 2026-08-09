@@ -8,6 +8,7 @@ const vxfw = vaxis.vxfw;
 
 const tui = @import("../tui.zig");
 const agent_mod = @import("../agent.zig");
+const BoundedList = @import("bounded_list.zig").BoundedList;
 const agent_worker = @import("agent_worker.zig");
 const lane_bridge = tui.lane_bridge_mod;
 const lanes_util = @import("lanes.zig");
@@ -21,14 +22,17 @@ const vcs = @import("../vcs.zig");
 
 const App = tui.App;
 const Thread = tui.Thread;
+const max_threads = tui.max_threads;
 
 // ---------------------------------------------------------------------------
 // Internal helpers (no delegate — called only within this module)
 // ---------------------------------------------------------------------------
 
-pub fn activeIndex(app: *const App) usize {
-    for (app.threads.items, 0..) |lane, index| {
-        if (lane == app.thread) return index;
+pub fn activeIndex(app: *const App) u32 {
+    std.debug.assert(app.threads.len() > 0);
+    std.debug.assert(app.threads.len() <= max_threads);
+    for (app.threads.slice(), 0..) |lane, index| {
+        if (lane == app.thread) return @intCast(index);
     }
     return 0;
 }
@@ -44,7 +48,7 @@ fn laneMergeDir(app: *App, lane: *Thread) ?[]const u8 {
 /// segment (the unique lane id) so it survives git reporting forward slashes
 /// where the stored path uses the platform separator.
 fn laneOpenAtPath(app: *App, path: []const u8) bool {
-    for (app.threads.items) |lane| {
+    for (app.threads.slice()) |lane| {
         if (lanes_util.workingLaneOf(lane)) |w| {
             if (std.mem.eql(u8, lanes_util.lastPathSegment(w.path), lanes_util.lastPathSegment(path))) return true;
         }
@@ -90,8 +94,11 @@ fn renameLaneBranch(app: *App, lane: *Thread, slug: []const u8) !bool {
 /// unlike `/close`, which parks. Caller must ensure `index != 0` (never the
 /// primary) and, if `index` is the active lane, point `app.thread` at a
 /// survivor first.
-fn abandonLane(app: *App, index: usize) !void {
-    const lane = app.threads.items[index];
+fn abandonLane(app: *App, index: u32) !void {
+    std.debug.assert(index > 0);
+    std.debug.assert(index < app.threads.len());
+    std.debug.assert(app.threads.len() <= max_threads);
+    const lane = app.threads.slice()[index];
     var branch: ?[]u8 = null;
     var dir: ?[]u8 = null;
     if (lanes_util.workingLaneOf(lane)) |w| {
@@ -160,7 +167,9 @@ fn reloadParkedLanes(app: *App) !void {
 /// lane worktree checks this — open lanes and parked lanes alike (parked
 /// lanes can't be entered, so the parked check is defense in depth).
 fn clearWorkspaceBorrowForPath(app: *App, path: []const u8) !void {
-    for (app.threads.items) |other| {
+    std.debug.assert(app.threads.len() <= max_threads);
+    std.debug.assert(path.len > 0);
+    for (app.threads.slice()) |other| {
         const agent = other.agent orelse continue;
         const ws = agent.workspaceBorrow() orelse continue;
         if (!std.mem.eql(u8, ws, path)) continue;
@@ -180,9 +189,10 @@ fn clearWorkspaceBorrows(app: *App, lane: *Thread) !void {
 /// success `dest` becomes the active lane. Leaves `mode`/picker state to the
 /// caller so `/lanes` can stay open while `/merge` closes.
 fn mergeLane(app: *App, source: lanes_util.MergeSource, dest: *Thread) !void {
+    std.debug.assert(app.threads.len() <= max_threads);
     if (dest.turn.isActive()) return error.InFlightTurn;
     if (source.active_index) |si| {
-        if (app.threads.items[si].turn.isActive()) return error.InFlightTurn;
+        if (app.threads.slice()[si].turn.isActive()) return error.InFlightTurn;
     }
     // S17: the source path may be the driver's workspace borrow — checked for
     // open and parked sources alike (see `clearWorkspaceBorrowForPath`).
@@ -200,13 +210,13 @@ fn mergeLane(app: *App, source: lanes_util.MergeSource, dest: *Thread) !void {
 
     app.thread = dest;
     if (source.active_index) |si| {
-        try abandonLane(app, si);
+        try abandonLane(app, @intCast(si));
     } else if (app.repoRoot()) |repo| {
         vcs.worktreeRemove(app.gpa, app.io, repo, source.path) catch {};
         vcs.deleteBranch(app.gpa, app.io, repo, source.branch) catch {};
     }
 
-    if (app.threads.items.len < 2) app.split = false;
+    if (app.threads.len() < 2) app.split = false;
     app.nav.block_nav = false;
 }
 
@@ -284,7 +294,7 @@ pub fn scheduleLaneNaming(app: *App, lane: *Thread, first_message: []const u8) !
 /// leaves the hex branch.
 pub fn drainLaneNaming(app: *App) !bool {
     var changed = false;
-    for (app.threads.items) |lane| {
+    for (app.threads.slice()) |lane| {
         if (lane.naming_future == null) continue;
         if (!lane.naming_done.load(.acquire)) continue;
         var outcome = lane.naming_future.?.await(app.io);
@@ -311,7 +321,9 @@ pub fn cancelLaneNaming(app: *App, lane: *Thread) void {
 /// Whether any lane has an async branch-naming job in flight — the tick
 /// must stay alive for the result to be drained.
 pub fn namingActive(app: *const App) bool {
-    for (app.threads.items) |lane| {
+    std.debug.assert(app.threads.len() > 0);
+    std.debug.assert(app.threads.len() <= max_threads);
+    for (app.threads.slice()) |lane| {
         if (lane.naming_future != null) return true;
     }
     return false;
@@ -331,7 +343,9 @@ pub fn reportLaneError(app: *App, err: anyerror) !void {
 /// alive so background lanes' events (and their terminal `turn_finished`)
 /// keep draining even when the visible lane is idle.
 pub fn anyTurnActive(app: *const App) bool {
-    for (app.threads.items) |lane| {
+    std.debug.assert(app.threads.len() > 0);
+    std.debug.assert(app.threads.len() <= max_threads);
+    for (app.threads.slice()) |lane| {
         if (lane.turn.state != .idle) return true;
     }
     return false;
@@ -340,18 +354,20 @@ pub fn anyTurnActive(app: *const App) bool {
 /// Cycle the active lane by `delta` (+1 next, -1 previous), wrapping at both
 /// ends. No-op with a single lane.
 pub fn cycleLane(app: *App, delta: i32) void {
-    const n = app.threads.items.len;
+    const n = app.threads.len();
+    std.debug.assert(n >= 1);
+    std.debug.assert(n <= max_threads);
     if (n < 2) return;
     const cur: i32 = @intCast(activeIndex(app));
     const next: usize = @intCast(@mod(cur + delta, @as(i32, @intCast(n))));
-    app.thread = app.threads.items[next];
+    app.thread = app.threads.slice()[next];
     app.nav.block_nav = false;
     app.clearInput();
 }
 
 /// Toggle between the tiled split view and fullscreening the active lane.
 pub fn toggleLaneFullscreen(app: *App) void {
-    if (app.threads.items.len < 2) return;
+    if (app.threads.len() < 2) return;
     app.split = !app.split;
 }
 
@@ -362,15 +378,16 @@ pub fn toggleLaneFullscreen(app: *App) void {
 /// Refused mid-turn.
 pub fn closeActiveLane(app: *App) !void {
     if (app.thread.turn.isActive()) return error.InFlightTurn;
-    const index = activeIndex(app);
+    const index: u32 = activeIndex(app);
+    std.debug.assert(index < app.threads.len());
     if (index == 0) return error.CannotClosePrimaryLane;
 
-    const lane = app.threads.items[index];
+    const lane = app.threads.slice()[index];
     // S17: the driver's workspace may borrow this lane's path — refuse while
     // the owner's turn is active, drop the borrow once it is idle.
     try clearWorkspaceBorrows(app, lane);
     cancelLaneNaming(app, lane);
-    app.thread = app.threads.items[index - 1];
+    app.thread = app.threads.slice()[index - 1];
     _ = app.threads.orderedRemove(index);
     lane.deinit(app.gpa);
     app.gpa.destroy(lane);
@@ -383,16 +400,18 @@ pub fn closeActiveLane(app: *App) !void {
 /// from the primary lane. With exactly one other lane, merge immediately;
 /// otherwise open the destination picker (`Mode.lanes`, `.merge_dest`).
 pub fn createMergePicker(app: *App) !void {
+    std.debug.assert(app.threads.len() >= 2);
+    std.debug.assert(app.threads.len() <= max_threads);
     if (app.thread.turn.isActive()) return error.InFlightTurn;
     const src_index = activeIndex(app);
     if (src_index == 0) return error.CannotMergePrimaryLane;
     const src = lanes_util.workingLaneOf(app.thread) orelse return error.CannotMergePrimaryLane;
-    if (app.threads.items.len < 2) return error.NoMergeDestination;
+    if (app.threads.len() < 2) return error.NoMergeDestination;
 
     const source: lanes_util.MergeSource = .{ .branch = src.branch, .path = src.path, .active_index = src_index };
 
-    if (app.threads.items.len == 2) {
-        const dest = app.threads.items[if (src_index == 0) 1 else 0];
+    if (app.threads.len() == 2) {
+        const dest = app.threads.slice()[if (src_index == 0) 1 else 0];
         defer {
             app.clearPaletteInput();
             clearLanesState(app);
@@ -405,7 +424,7 @@ pub fn createMergePicker(app: *App) !void {
 
     var dests: std.ArrayList(usize) = .empty;
     errdefer dests.deinit(app.gpa);
-    for (app.threads.items, 0..) |_, i| {
+    for (app.threads.slice(), 0..) |_, i| {
         if (i != src_index) try dests.append(app.gpa, i);
     }
     clearLanesState(app);
@@ -430,8 +449,8 @@ pub fn confirmMergeDest(app: *App) !void {
         app.clearInput();
         return;
     }
-    const dest = app.threads.items[app.merge_dest_indices[app.nav.lanes_selection]];
-    const src = lanes_util.workingLaneOf(app.threads.items[app.merge_source_index]) orelse {
+    const dest = app.threads.slice()[app.merge_dest_indices[app.nav.lanes_selection]];
+    const src = lanes_util.workingLaneOf(app.threads.slice()[app.merge_source_index]) orelse {
         app.mode = .normal;
         app.clearInput();
         return;
@@ -517,7 +536,7 @@ pub fn buildLaneEntries(app: *App, arena: std.mem.Allocator) ![]lanes_picker.Ent
         .merge_dest => {
             const out = try arena.alloc(lanes_picker.Entry, app.merge_dest_indices.len);
             for (app.merge_dest_indices, 0..) |ti, i| {
-                const lane = app.threads.items[ti];
+                const lane = app.threads.slice()[ti];
                 out[i] = .{
                     .title = lane.title orelse (if (ti == 0) "primary" else "lane"),
                     .subtitle = if (lanes_util.workingLaneOf(lane)) |w| w.branch else "(primary working copy)",
@@ -658,14 +677,14 @@ fn dispatchLaneOp(app: *App, req: *const lane_bridge.Request, requester_lane: ?*
 /// role change, so the driver keeps full capability while entered.
 fn requesterIsPrimary(app: *App, requester_lane: ?*Thread) bool {
     const lane = requester_lane orelse return false;
-    return app.threads.items.len > 0 and lane == app.threads.items[0];
+    return app.threads.len() > 0 and lane == app.threads.slice()[0];
 }
 
 /// Resolve a lane id (the worktree's last path segment — the hex id, durable
 /// across the async `nova/<slug>` branch rename) to an open lane.
 fn resolveLane(app: *App, id_in: []const u8) ?*Thread {
     const id = std.mem.trim(u8, id_in, " \t\r\n");
-    for (app.threads.items) |lane| {
+    for (app.threads.slice()) |lane| {
         if (lanes_util.workingLaneOf(lane)) |w| {
             if (std.mem.eql(u8, lanes_util.lastPathSegment(w.path), id)) return lane;
         }
@@ -674,7 +693,7 @@ fn resolveLane(app: *App, id_in: []const u8) ?*Thread {
 }
 
 fn indexOfLane(app: *App, target: *Thread) ?usize {
-    for (app.threads.items, 0..) |lane, i| {
+    for (app.threads.slice(), 0..) |lane, i| {
         if (lane == target) return i;
     }
     return null;
@@ -690,8 +709,8 @@ fn laneIdOf(lane: *Thread) ?[]const u8 {
 /// The driver's workspace borrow, if any. Only the driver (threads[0]) enters
 /// lanes, so its agent is the only one that can hold a workspace.
 fn driverWorkspace(app: *const App) ?[]const u8 {
-    if (app.threads.items.len == 0) return null;
-    const agent = app.threads.items[0].agent orelse return null;
+    if (app.threads.len() == 0) return null;
+    const agent = app.threads.slice()[0].agent orelse return null;
     return agent.workspaceBorrow();
 }
 
@@ -705,7 +724,7 @@ fn listLanes(app: *App) ?Resp {
     out.writer.writeAll("open lanes:\n") catch return failResp(gpa, "lane: out of memory\n", .{});
     const driver_ws = driverWorkspace(app);
     const active_idx = activeIndex(app);
-    for (app.threads.items, 0..) |lane, i| {
+    for (app.threads.slice(), 0..) |lane, i| {
         const id = laneIdOf(lane) orelse "0";
         const title = lane.title orelse "";
         const branch = if (lanes_util.workingLaneOf(lane)) |wl| wl.branch else "(primary)";
@@ -776,9 +795,9 @@ fn createLane(app: *App, req: *const lane_bridge.Request) ?Resp {
     const home = (app.templateRuntime() orelse return failResp(app.gpa, "lane: no active runtime\n", .{})).home_dir;
     if (!vcs.isRepo(app.gpa, app.io, repo)) return failResp(app.gpa, "lane: not a git repo — lanes need one\n", .{});
     // The cap counts the DRIVER's main lane too: threads.len starts at 1
-    // (the primary), so >= 4 means "driver + 3 lanes" — a 4th lane would need
-    // a 5th pane in the 2×2 grid.
-    if (app.threads.items.len >= 4) return failResp(app.gpa, "lane: too many lanes open (max 4 total: driver + 3)\n", .{});
+    // (the primary), so >= max_threads means "driver + 3 lanes" — a 4th lane
+    // would need a 5th pane in the 2×2 grid.
+    if (app.threads.len() >= max_threads) return failResp(app.gpa, "lane: too many lanes open (max 4 total: driver + 3)\n", .{});
 
     const wt = createLaneWorktree(app, repo, home) catch |err| return failResp(app.gpa, "lane: worktree create failed: {s}\n", .{@errorName(err)});
     // Every failure path below returns a `Resp` (never an error), so cleanup
@@ -797,7 +816,7 @@ fn createLane(app: *App, req: *const lane_bridge.Request) ?Resp {
         const trimmed = std.mem.trim(u8, purpose, " \t\r\n");
         if (trimmed.len > 0) lane.title = app.gpa.dupe(u8, trimmed) catch null;
     }
-    app.threads.append(app.gpa, lane) catch {
+    app.threads.append(lane) catch {
         lane.deinit(app.gpa); // frees the adopted branch + path (+ title)
         app.gpa.destroy(lane);
         return failResp(app.gpa, "lane: out of memory\n", .{});
@@ -876,8 +895,8 @@ fn mergeLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
         .conflict => return failResp(app.gpa, "lane: merge conflict — rolled back, nothing lost. Lane {s} is still open; resolve and retry.\n", .{id}),
         .ok => {},
     }
-    abandonLane(app, index) catch {};
-    if (app.threads.items.len < 2) app.split = false;
+    abandonLane(app, @intCast(index)) catch {};
+    if (app.threads.len() < 2) app.split = false;
     // Report the driver's REAL workspace root: it may hold a borrow in another
     // lane (H5b only refuses merging the lane the driver is currently entered
     // in), so claiming the repo root would lie to the model.
@@ -974,9 +993,9 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
 
     // --- fresh-worktree path (current behavior, unchanged) ---
     // The cap counts the DRIVER's main lane too: threads.len starts at 1
-    // (the primary), so >= 4 means "driver + 3 lanes" — a 4th lane would need
-    // a 5th pane in the 2×2 grid.
-    if (app.threads.items.len >= 4) {
+    // (the primary), so >= max_threads means "driver + 3 lanes" — a 4th lane
+    // would need a 5th pane in the 2×2 grid.
+    if (app.threads.len() >= max_threads) {
         freeLaneContext(app.gpa, context);
         return failResp(app.gpa, "lane: too many lanes open (max 4 total: driver + 3)\n", .{});
     }
@@ -1027,7 +1046,7 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
     );
     lane.generation = app.nextLaneGeneration();
     lane.spawned_by_generation = spawner.generation;
-    app.threads.append(app.gpa, lane) catch {
+    app.threads.append(lane) catch {
         lane.deinit(app.gpa); // frees the adopted runtime, context, branch, path
         app.gpa.destroy(lane);
         return failResp(app.gpa, "lane: out of memory\n", .{});
@@ -1072,8 +1091,8 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
 /// deletion.
 fn removeFailedSpawn(app: *App, lane: *Thread) void {
     const index = indexOfLane(app, lane) orelse return;
-    abandonLane(app, index) catch {};
-    if (app.threads.items.len < 2) app.split = false;
+    abandonLane(app, @intCast(index)) catch {};
+    if (app.threads.len() < 2) app.split = false;
 }
 
 /// Attach a runtime to an existing idle `Thread`, turning it live. Reuses
@@ -1244,11 +1263,10 @@ fn discardAbandonedTurnOnLane(app: *App, lane: *Thread) void {
         _ = future.cancel(app.io);
         lane.turn_future = null;
     }
-    var batch: std.ArrayList(*agent_mod.Agent.Event) = .empty;
-    defer batch.deinit(app.gpa);
+    var batch: BoundedList(*agent_mod.Agent.Event, agent_worker.event_batch_max) = .{};
     if (lane.worker_context) |*worker| {
-        worker.queue.drainInto(worker.io, worker.gpa, &batch) catch {};
-        for (batch.items) |event_ptr| {
+        worker.queue.drainIntoBounded(worker.io, &batch) catch {};
+        for (batch.slice()) |event_ptr| {
             event_ptr.deinit(worker.gpa);
             worker.gpa.destroy(event_ptr);
         }
@@ -1344,7 +1362,7 @@ pub fn deliverPendingLaneCompletions(app: *App) !bool {
     defer app.thread = active;
 
     // 1. Rest finished spawned workers.
-    for (app.threads.items) |lane| {
+    for (app.threads.slice()) |lane| {
         if (lane.spawned_by_generation == null) continue;
         if (lane.completion_delivered) continue;
         if (lane.engine == .live and lane.turn.state == .idle and lane.transcript.messages.items.len > 0) {
@@ -1354,7 +1372,7 @@ pub fn deliverPendingLaneCompletions(app: *App) !bool {
     }
 
     // 2. Deliver parked completions to idle spawners.
-    for (app.threads.items) |lane| {
+    for (app.threads.slice()) |lane| {
         if (lane.spawned_by_generation == null) continue;
         if (lane.completion_delivered) continue;
         if (lane.engine != .idle) continue; // still running / not yet parked
@@ -1541,8 +1559,8 @@ test "lane workspace ops create → enter → merge(refused) → leave → merge
     const create_resp = postAndService(io, &app, &create_req);
     defer app.gpa.free(create_resp.text);
     try std.testing.expectEqual(@as(u8, 0), create_resp.code);
-    try std.testing.expectEqual(@as(usize, 2), app.threads.items.len);
-    const lane = app.threads.items[1];
+    try std.testing.expectEqual(@as(usize, 2), app.threads.len());
+    const lane = app.threads.slice()[1];
     const working = lanes_util.workingLaneOf(lane).?;
     const id = lanes_util.lastPathSegment(working.path);
     try std.testing.expect(std.mem.startsWith(u8, working.branch, "nova/"));
@@ -1571,7 +1589,7 @@ test "lane workspace ops create → enter → merge(refused) → leave → merge
     defer app.gpa.free(merge_entered_resp.text);
     try std.testing.expect(merge_entered_resp.code != 0);
     try std.testing.expect(std.mem.indexOf(u8, merge_entered_resp.text, "lane leave") != null);
-    try std.testing.expectEqual(@as(usize, 2), app.threads.items.len); // lane intact
+    try std.testing.expectEqual(@as(usize, 2), app.threads.len()); // lane intact
 
     // ── lane leave: the tool clears the borrow; the response confirms.
     var leave_req = lane_bridge.Request{ .op = .leave, .requester = &runtime.agent };
@@ -1589,7 +1607,7 @@ test "lane workspace ops create → enter → merge(refused) → leave → merge
     const merge_resp = postAndService(io, &app, &merge_req);
     defer app.gpa.free(merge_resp.text);
     try std.testing.expectEqual(@as(u8, 0), merge_resp.code);
-    try std.testing.expectEqual(@as(usize, 1), app.threads.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.threads.len());
 
     // ── F3: the 4-lane cap is enforced against model-driven create too.
     _ = try addFakeWorkingLane(gpa, &app, "cap1");
@@ -1601,7 +1619,7 @@ test "lane workspace ops create → enter → merge(refused) → leave → merge
     defer app.gpa.free(cap_resp.text);
     try std.testing.expect(cap_resp.code != 0);
     try std.testing.expect(std.mem.indexOf(u8, cap_resp.text, "too many lanes") != null);
-    try std.testing.expectEqual(@as(usize, 4), app.threads.items.len); // refused, not added
+    try std.testing.expectEqual(@as(usize, 4), app.threads.len()); // refused, not added
 }
 
 test "M3: merge reports the driver's real workspace, not the repo root" {
@@ -1618,7 +1636,7 @@ test "M3: merge reports the driver's real workspace, not the repo root" {
     const resp_a = postAndService(io, app, &create_a);
     defer app.gpa.free(resp_a.text);
     try std.testing.expectEqual(@as(u8, 0), resp_a.code);
-    const lane_a = app.threads.items[1];
+    const lane_a = app.threads.slice()[1];
     const path_a = try gpa.dupe(u8, lanes_util.workingLaneOf(lane_a).?.path);
     defer gpa.free(path_a);
     const id_a = try gpa.dupe(u8, resp_a.lane_id.?);
@@ -1648,7 +1666,7 @@ test "M3: merge reports the driver's real workspace, not the repo root" {
     const merge_resp = postAndService(io, app, &merge_b);
     defer app.gpa.free(merge_resp.text);
     try std.testing.expectEqual(@as(u8, 0), merge_resp.code);
-    try std.testing.expectEqual(@as(usize, 2), app.threads.items.len); // B removed
+    try std.testing.expectEqual(@as(usize, 2), app.threads.len()); // B removed
     try std.testing.expect(std.mem.indexOf(u8, merge_resp.text, path_a) != null);
     try std.testing.expect(std.mem.indexOf(u8, merge_resp.text, "repo root") == null);
 }
@@ -1673,7 +1691,7 @@ test "I1: a freshly spawned lane resets turn bookkeeping via resetTurnState" {
     lane.spawned_by_generation = 1; // the primary is the spawner
     // Simulate a prior failure record that a fresh turn must clear.
     lane.turn_failed = try gpa.dupe(u8, "stale failure");
-    try app.threads.append(gpa, lane);
+    try app.threads.append(lane);
 
     try startTurnForLane(app, lane, "do the work", "do the work");
     defer {
@@ -1698,17 +1716,17 @@ test "S17: teardown of a lane the workspace borrows is refused while the owner's
         .branch = try gpa.dupe(u8, "nova/x"),
         .path = try gpa.dupe(u8, "/tmp/lane-x"),
     } } } };
-    try app.threads.append(gpa, lane2);
+    try app.threads.append(lane2);
     app.thread = lane2; // the driver's view is on this lane
     agent.setWorkspace("/tmp/lane-x"); // simulate `lane enter`
 
     // Owner's turn active → teardown refused (H5a), the borrow stays.
-    app.threads.items[0].turn.submit();
+    app.threads.slice()[0].turn.submit();
     try std.testing.expectError(error.InFlightTurn, clearWorkspaceBorrows(&app, lane2));
     try std.testing.expect(agent.workspaceBorrow() != null);
 
     // Owner idle → the borrow is dropped first, then teardown proceeds.
-    app.threads.items[0].turn.reset();
+    app.threads.slice()[0].turn.reset();
     try clearWorkspaceBorrows(&app, lane2);
     try std.testing.expect(agent.workspaceBorrow() == null);
 }
@@ -1761,7 +1779,7 @@ fn addFakeWorkingLane(gpa: std.mem.Allocator, app: *App, id: []const u8) !*Threa
     const path = try std.fmt.allocPrint(gpa, "/tmp/nova-lanes/{s}", .{id});
     errdefer gpa.free(path);
     lane.* = .{ .engine = .{ .idle = .{ .working = .{ .branch = branch, .path = path } } } };
-    try app.threads.append(gpa, lane);
+    try app.threads.append(lane);
     return lane;
 }
 
@@ -1791,7 +1809,7 @@ test "serviceLaneBridge refuses a driver spawn without a task" {
     defer app.gpa.free(result.text);
     try std.testing.expect(result.code != 0);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "needs a `task`") != null);
-    try std.testing.expectEqual(@as(usize, 1), app.threads.items.len); // no lane created
+    try std.testing.expectEqual(@as(usize, 1), app.threads.len()); // no lane created
 }
 
 test "lane create uses purpose as the idle lane's title" {
@@ -1846,7 +1864,7 @@ test "lane create uses purpose as the idle lane's title" {
     const result = postAndService(io, &app, &req);
     defer app.gpa.free(result.text);
     try std.testing.expectEqual(@as(u8, 0), result.code);
-    const lane = app.threads.items[1];
+    const lane = app.threads.slice()[1];
     try std.testing.expectEqualStrings("evaluate PR #82", lane.title.?);
 }
 
@@ -1887,7 +1905,7 @@ test "beginSubmit refuses on an idle lane with a guiding notice, not a crash" {
 
     // An idle lane (the `lane create` shape): engine idle, no worker_context.
     _ = try addFakeWorkingLane(gpa, &app, "idle1");
-    app.thread = app.threads.items[1]; // focus the idle lane (cycleLane shape)
+    app.thread = app.threads.slice()[1]; // focus the idle lane (cycleLane shape)
     try std.testing.expect(app.thread.worker_context == null);
 
     // Seed the input so we can assert it is preserved (TD-2).
@@ -1924,8 +1942,8 @@ test "lane spawn reuses an existing idle lane and wakes it as a worker" {
     const create_resp = postAndService(io, app, &create_req);
     defer app.gpa.free(create_resp.text);
     try std.testing.expectEqual(@as(u8, 0), create_resp.code);
-    try std.testing.expectEqual(@as(usize, 2), app.threads.items.len);
-    const idle_lane = app.threads.items[1];
+    try std.testing.expectEqual(@as(usize, 2), app.threads.len());
+    const idle_lane = app.threads.slice()[1];
     try std.testing.expect(idle_lane.engine == .idle);
     try std.testing.expect(idle_lane.worker_context == null);
     const idle_id = laneIdOf(idle_lane).?;
@@ -1943,14 +1961,14 @@ test "lane spawn reuses an existing idle lane and wakes it as a worker" {
     defer app.gpa.free(spawn_resp.text);
     try std.testing.expectEqual(@as(u8, 0), spawn_resp.code);
     // No new lane was created — the idle one was woken in place.
-    try std.testing.expectEqual(@as(usize, 2), app.threads.items.len);
-    const woken = app.threads.items[1];
+    try std.testing.expectEqual(@as(usize, 2), app.threads.len());
+    const woken = app.threads.slice()[1];
     try std.testing.expect(woken == idle_lane); // same Thread pointer
     try std.testing.expect(woken.engine == .live);
     try std.testing.expect(woken.worker_context != null);
     try std.testing.expect(woken.agent != null);
     try std.testing.expectEqual(idle_gen, woken.generation); // generation stable
-    try std.testing.expect(woken.spawned_by_generation == app.threads.items[0].generation);
+    try std.testing.expect(woken.spawned_by_generation == app.threads.slice()[0].generation);
     // The worktree path is the same one `lane create` made.
     try std.testing.expectEqualStrings(idle_id, laneIdOf(woken).?);
     // Parent context was copied in, not left empty.
@@ -2031,7 +2049,7 @@ test "lane spawn into a rested worker preserves the transcript and appends" {
     const lane = try gpa.create(Thread);
     lane.* = Thread.initLive(rt.session_writer.session.id, &rt.agent, io, rt.gpa, &.{}, wt.branch, wt.dest, rt);
     lane.spawned_by_generation = 1;
-    try app.threads.append(gpa, lane);
+    try app.threads.append(lane);
     _ = try lane.transcript.append(gpa, .user, "you", "first task");
     _ = try lane.transcript.append(gpa, .agent, "agent", "first result");
     _ = try deliverPendingLaneCompletions(app); // rests the lane
@@ -2293,7 +2311,7 @@ test "S11: a gone spawner drops the completion without crashing" {
     const changed = try deliverPendingLaneCompletions(&app);
     try std.testing.expect(!changed);
     try std.testing.expect(lane.completion_delivered); // dropped, not delivered
-    try std.testing.expect(!transcriptContains(app.threads.items[0], "late result"));
+    try std.testing.expect(!transcriptContains(app.threads.slice()[0], "late result"));
 }
 
 test "M1: completion routes to the spawner by generation, not by agent pointer" {
@@ -2319,7 +2337,7 @@ test "M1: completion routes to the spawner by generation, not by agent pointer" 
     try std.testing.expect(worker.completion_delivered);
     // The notice landed on the spawner lane (generation 7), not the primary.
     try std.testing.expect(transcriptContains(spawner, "result consumed"));
-    try std.testing.expect(!transcriptContains(app.threads.items[0], "result consumed"));
+    try std.testing.expect(!transcriptContains(app.threads.slice()[0], "result consumed"));
 }
 
 test "S11: an acknowledged worker delivers a notice only — no answer turn" {
@@ -2335,14 +2353,14 @@ test "S11: an acknowledged worker delivers a notice only — no answer turn" {
     const lane = try addFakeWorkingLane(gpa, &app, "acked");
     lane.spawned_by_generation = 1; // the primary is the spawner
     lane.acknowledged = true;
-    const before = app.threads.items[0].transcript.messages.items.len;
+    const before = app.threads.slice()[0].transcript.messages.items.len;
 
     const changed = try deliverPendingLaneCompletions(&app);
     try std.testing.expect(changed);
     try std.testing.expect(lane.completion_delivered);
-    try std.testing.expectEqual(before + 1, app.threads.items[0].transcript.messages.items.len);
-    try std.testing.expect(transcriptContains(app.threads.items[0], "result consumed"));
-    try std.testing.expect(app.threads.items[0].turn.state == .idle); // no answer turn
+    try std.testing.expectEqual(before + 1, app.threads.slice()[0].transcript.messages.items.len);
+    try std.testing.expect(transcriptContains(app.threads.slice()[0], "result consumed"));
+    try std.testing.expect(app.threads.slice()[0].turn.state == .idle); // no answer turn
 }
 
 /// Write a file at an absolute path (test helper for the git fixtures).
@@ -2438,7 +2456,7 @@ test "S11: a finished spawned worker rests — runtime freed, transcript + workt
     const lane = try gpa.create(Thread);
     lane.* = Thread.initLive(rt.session_writer.session.id, &rt.agent, io, rt.gpa, &.{}, wt.branch, wt.dest, rt);
     lane.spawned_by_generation = 1; // the primary is the spawner
-    try app.threads.append(gpa, lane);
+    try app.threads.append(lane);
     _ = try lane.transcript.append(gpa, .user, "you", "worker task");
     _ = try lane.transcript.append(gpa, .agent, "agent", "worker result");
     const lane_path = try gpa.dupe(u8, wt.dest);
@@ -2458,7 +2476,7 @@ test "S11: a finished spawned worker rests — runtime freed, transcript + workt
     try std.testing.expect(vcs.isRepo(gpa, io, lane_path));
     try std.testing.expect(lane.completion_delivered);
     // The spawner got the completion notice.
-    try std.testing.expect(transcriptContains(app.threads.items[0], "finished"));
+    try std.testing.expect(transcriptContains(app.threads.slice()[0], "finished"));
 }
 
 test "S11: a failed spawned worker is reported honestly, not as done" {
@@ -2482,14 +2500,14 @@ test "S11: a failed spawned worker is reported honestly, not as done" {
     lane.* = Thread.initLive(rt.session_writer.session.id, &rt.agent, io, rt.gpa, &.{}, wt.branch, wt.dest, rt);
     lane.spawned_by_generation = 1; // the primary is the spawner
     lane.turn_failed = try gpa.dupe(u8, "agent turn failed: ConnectionLost");
-    try app.threads.append(gpa, lane);
+    try app.threads.append(lane);
     _ = try lane.transcript.append(gpa, .user, "you", "worker task");
 
     const changed = try deliverPendingLaneCompletions(app);
     try std.testing.expect(changed);
     try std.testing.expect(lane.completion_delivered);
     // The spawner is told the truth: FAILED + the reason, never "done".
-    const spawner = app.threads.items[0];
+    const spawner = app.threads.slice()[0];
     try std.testing.expect(transcriptContains(spawner, "FAILED"));
     try std.testing.expect(transcriptContains(spawner, "ConnectionLost"));
     try std.testing.expect(!transcriptContains(spawner, "final state: done"));
@@ -2516,7 +2534,7 @@ test "S11: a cancelled spawned worker is delivered as FAILED, not done" {
     lane.* = Thread.initLive(rt.session_writer.session.id, &rt.agent, io, rt.gpa, &.{}, wt.branch, wt.dest, rt);
     lane.spawned_by_generation = 1; // the primary is the spawner
     lane.turn.state = .active;
-    try app.threads.append(gpa, lane);
+    try app.threads.append(lane);
     _ = try lane.transcript.append(gpa, .user, "you", "worker task");
 
     cancelLaneTurn(app, lane);
@@ -2526,7 +2544,7 @@ test "S11: a cancelled spawned worker is delivered as FAILED, not done" {
     const changed = try deliverPendingLaneCompletions(app);
     try std.testing.expect(changed);
     try std.testing.expect(lane.completion_delivered);
-    const spawner = app.threads.items[0];
+    const spawner = app.threads.slice()[0];
     try std.testing.expect(transcriptContains(spawner, "FAILED"));
     try std.testing.expect(transcriptContains(spawner, "Interrupted."));
     try std.testing.expect(!transcriptContains(spawner, "final state: done"));
@@ -2545,7 +2563,7 @@ test "lane merge: dirty primary refused (M3), conflict rolls back, dirty source 
     const create_resp = postAndService(io, app, &create_req);
     defer app.gpa.free(create_resp.text);
     try std.testing.expectEqual(@as(u8, 0), create_resp.code);
-    const lane = app.threads.items[1];
+    const lane = app.threads.slice()[1];
     const lane_path = try gpa.dupe(u8, lanes_util.workingLaneOf(lane).?.path);
     defer gpa.free(lane_path);
     const id = try gpa.dupe(u8, create_resp.lane_id.?);
@@ -2562,7 +2580,7 @@ test "lane merge: dirty primary refused (M3), conflict rolls back, dirty source 
     defer app.gpa.free(dirty_resp.text);
     try std.testing.expect(dirty_resp.code != 0);
     try std.testing.expect(std.mem.indexOf(u8, dirty_resp.text, "uncommitted changes") != null);
-    try std.testing.expectEqual(@as(usize, 2), app.threads.items.len); // lane intact
+    try std.testing.expectEqual(@as(usize, 2), app.threads.len()); // lane intact
     std.Io.Dir.cwd().deleteFile(io, dirty_path) catch {};
 
     // ── Conflict: both sides change the same file → rolled back, lane kept.
@@ -2583,7 +2601,7 @@ test "lane merge: dirty primary refused (M3), conflict rolls back, dirty source 
     defer app.gpa.free(conflict_resp.text);
     try std.testing.expect(conflict_resp.code != 0);
     try std.testing.expect(std.mem.indexOf(u8, conflict_resp.text, "rolled back") != null);
-    try std.testing.expectEqual(@as(usize, 2), app.threads.items.len); // lane intact
+    try std.testing.expectEqual(@as(usize, 2), app.threads.len()); // lane intact
     // The primary tree is untouched — its own version still on disk.
     var buf: [64]u8 = undefined;
     const primary_content = std.Io.Dir.cwd().readFile(io, primary_conflict, &buf) catch unreachable;
@@ -2600,7 +2618,7 @@ test "lane merge: dirty primary refused (M3), conflict rolls back, dirty source 
     const final_resp = postAndService(io, app, &final_req);
     defer app.gpa.free(final_resp.text);
     try std.testing.expectEqual(@as(u8, 0), final_resp.code);
-    try std.testing.expectEqual(@as(usize, 1), app.threads.items.len); // lane removed
+    try std.testing.expectEqual(@as(usize, 1), app.threads.len()); // lane removed
     // The auto-committed lane work landed in the primary tree.
     const primary_extra = try std.fs.path.join(gpa, &.{ fx.repo, "extra.txt" });
     defer gpa.free(primary_extra);
