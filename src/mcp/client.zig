@@ -4,6 +4,7 @@
 const std = @import("std");
 const log = std.log.scoped(.mcp);
 const config_mod = @import("../config/config.zig");
+const os = @import("../os.zig");
 const tools_common = @import("../tools/common.zig");
 const transport = @import("transport.zig");
 const schema_mod = @import("schema.zig");
@@ -16,6 +17,23 @@ const http_redirect_buffer_bytes = 16 * 1024;
 const http_transfer_buffer_bytes = 64 * 1024;
 const http_response_bytes_max = 64 * 1024 * 1024;
 
+/// A zeroed `std.process.Child` placeholder. On Windows the `thread_handle`
+/// field is a non-nullable HANDLE, so `std.mem.zeroes` cannot be used; a
+/// non-null sentinel pointer is substituted instead. The placeholder is only
+/// ever overwritten by a real `spawn` before use.
+pub fn zeroedChild() std.process.Child {
+    if (os.is_windows) {
+        return .{
+            .id = null,
+            .thread_handle = @ptrFromInt(1),
+            .stdin = null,
+            .stdout = null,
+            .stderr = null,
+            .request_resource_usage_statistics = false,
+        };
+    }
+    return std.mem.zeroes(std.process.Child);
+}
 pub const ServerStatus = enum {
     connecting,
     connected,
@@ -221,7 +239,7 @@ pub const McpClient = struct {
             .disabled => {
                 self.lifecycle = switch (self.transport) {
                     .stdio => .{ .stdio = .{
-                        .process = std.mem.zeroes(std.process.Child),
+                        .process = zeroedChild(),
                         .status = .connecting,
                     } },
                     .sse => .{ .sse = .{ .status = .connecting } },
@@ -231,7 +249,7 @@ pub const McpClient = struct {
                 self.gpa.free(self.lifecycle.failed.reason);
                 self.lifecycle = switch (self.transport) {
                     .stdio => .{ .stdio = .{
-                        .process = std.mem.zeroes(std.process.Child),
+                        .process = zeroedChild(),
                         .status = .connecting,
                     } },
                     .sse => .{ .sse = .{ .status = .connecting } },
@@ -352,7 +370,9 @@ pub const McpClient = struct {
             // SIGTERM first — gives well-behaved servers a chance to clean up.
             // kill() below sends SIGKILL and reaps the zombie regardless.
             if (child.id) |pid| {
-                std.posix.kill(@intCast(pid), std.posix.SIG.TERM) catch {};
+                if (!os.is_windows) {
+                    std.posix.kill(@intCast(pid), std.posix.SIG.TERM) catch {};
+                }
             }
             child.kill(io);
         }
@@ -440,11 +460,14 @@ pub const McpClient = struct {
             // HUP alone is not treated as a crash — a server that has written
             // its response and exited still has buffered data in the pipe we
             // need to drain. Only a read failure after poll is a true crash.
-            var poll_fds: [1]std.posix.pollfd = .{
-                .{ .fd = stdout_file.handle, .events = std.posix.POLL.IN, .revents = 0 },
-            };
-            const ready = std.posix.poll(&poll_fds, @intCast(self.read_timeout_ms)) catch return error.ReadFailed;
-            if (ready == 0) return error.Timeout;
+            if (!os.is_windows) {
+                var poll_fds: [1]std.posix.pollfd = .{
+                    .{ .fd = stdout_file.handle, .events = std.posix.POLL.IN, .revents = 0 },
+                };
+                const ready = std.posix.poll(&poll_fds, @intCast(self.read_timeout_ms)) catch return error.ReadFailed;
+                if (ready == 0) return error.Timeout;
+            }
+            // Windows: skip poll, proceed to read (kernel defaults apply)
 
             // Read one line from stdout (newline-delimited JSON-RPC).
             var line_writer: std.Io.Writer.Allocating = .init(self.gpa);
@@ -504,22 +527,24 @@ pub const McpClient = struct {
     /// run on a worker thread (`McpManager.launchConnect`), so a connect hang
     /// can never freeze the UI; this bounds everything after connect.
     fn applyHttpTimeout(self: *McpClient, conn: *std.http.Client.Connection) void {
-        const tv: std.posix.timeval = .{
-            .sec = @intCast(self.read_timeout_ms / 1000),
-            .usec = @intCast((self.read_timeout_ms % 1000) * 1000),
-        };
-        std.posix.setsockopt(
-            conn.stream_reader.stream.socket.handle,
-            std.posix.SOL.SOCKET,
-            std.posix.SO.RCVTIMEO,
-            std.mem.asBytes(&tv),
-        ) catch {};
-        std.posix.setsockopt(
-            conn.stream_reader.stream.socket.handle,
-            std.posix.SOL.SOCKET,
-            std.posix.SO.SNDTIMEO,
-            std.mem.asBytes(&tv),
-        ) catch {};
+        if (!os.is_windows) {
+            const tv: std.posix.timeval = .{
+                .sec = @intCast(self.read_timeout_ms / 1000),
+                .usec = @intCast((self.read_timeout_ms % 1000) * 1000),
+            };
+            std.posix.setsockopt(
+                conn.stream_reader.stream.socket.handle,
+                std.posix.SOL.SOCKET,
+                std.posix.SO.RCVTIMEO,
+                std.mem.asBytes(&tv),
+            ) catch {};
+            std.posix.setsockopt(
+                conn.stream_reader.stream.socket.handle,
+                std.posix.SOL.SOCKET,
+                std.posix.SO.SNDTIMEO,
+                std.mem.asBytes(&tv),
+            ) catch {};
+        }
     }
 
     /// POST a JSON-RPC request to the remote endpoint and return the matching
@@ -908,7 +933,7 @@ test "McpClient initializes and formats namespaced tool names" {
 
     client.lifecycle = .{
         .stdio = .{
-            .process = std.mem.zeroes(std.process.Child),
+            .process = zeroedChild(),
             .status = .ready,
         },
     };

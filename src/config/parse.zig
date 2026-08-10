@@ -10,8 +10,8 @@
 //! live in config.zig; provider/model types in provider.zig; MCP types in mcp.zig.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const ai = @import("../ai.zig");
+const platform = @import("platform");
 
 const config_mod = @import("config.zig");
 const provider_types = @import("provider.zig");
@@ -2179,8 +2179,7 @@ test "expandMcpServer resolves a SET {env:VAR} from the real environment" {
     // Read PATH through the same raw-environ path loadEnvMap uses, so the
     // expected value matches what expandMcpServer sees. Exercises the SET-var
     // path the unset-only test above never covers.
-    const env_slice = std.mem.span(std.c.environ);
-    var env_map = try std.process.Environ.createMap(.{ .block = .{ .slice = env_slice } }, gpa);
+    var env_map = try platform.getEnvMap(gpa);
     defer env_map.deinit();
     const path = env_map.get("PATH") orelse return error.SkipZigTest;
 

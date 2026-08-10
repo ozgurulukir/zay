@@ -31,6 +31,12 @@ pub fn build(b: *std.Build) void {
             .{ .name = "websocket_vendor", .module = websocket_vendor_mod },
         },
     });
+    const platform_mod = b.createModule(.{
+        .root_source_file = b.path("lib/platform.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
     const logger_mod = b.createModule(.{
         .root_source_file = b.path("lib/logger.zig"),
         .target = target,
@@ -38,6 +44,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = &.{
             .{ .name = "bounded_queue", .module = bounded_queue_mod },
+            .{ .name = "platform", .module = platform_mod },
         },
     });
     const counting_allocator_mod = b.createModule(.{
@@ -77,6 +84,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "terminal_markdown", .module = terminal_markdown_mod },
             .{ .name = "counting_allocator", .module = counting_allocator_mod },
             .{ .name = "c", .module = c_mod },
+            .{ .name = "platform", .module = platform_mod },
         },
     });
 
@@ -357,6 +365,7 @@ pub fn build(b: *std.Build) void {
         bounded_queue_mod,
         logger_mod,
         websocket_mod,
+        platform_mod,
     }) |lib_mod| {
         const lib_tests = b.addTest(.{ .root_module = lib_mod, .filters = test_filters });
         test_step.dependOn(&b.addRunArtifact(lib_tests).step);

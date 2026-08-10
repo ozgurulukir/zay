@@ -3,6 +3,7 @@ const background = @import("../background.zig");
 const bash = @import("bash_exec.zig");
 const common = @import("common.zig");
 const os = @import("../os.zig");
+const platform = @import("platform");
 
 pub const tool: common.Tool = .{
     .name = "bash",
@@ -424,11 +425,7 @@ fn parseError(gpa: std.mem.Allocator, err: ParseError) common.Error!common.Outpu
 }
 
 pub fn currentEnvMap(gpa: std.mem.Allocator, io: std.Io) (std.mem.Allocator.Error || std.Io.UnexpectedError)!std.process.Environ.Map {
-    if (os.is_windows) {
-        return std.process.Environ.createMap(.{ .block = .global }, gpa);
-    }
-    const env_slice = std.mem.span(std.c.environ);
-    var map = try std.process.Environ.createMap(.{ .block = .{ .slice = env_slice } }, gpa);
+    var map = try platform.getEnvMap(gpa);
     errdefer map.deinit();
 
     // Overlay the login shell's environment (PATH etc.) over the inherited

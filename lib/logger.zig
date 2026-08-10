@@ -13,6 +13,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const bounded_queue = @import("bounded_queue");
+const platform = @import("platform");
 
 const assert = std.debug.assert;
 
@@ -117,8 +118,8 @@ pub fn dispatch(level: std.log.Level, scope_name: []const u8, comptime fmt: []co
     if (!state.stderr_ready) {
         var buf: [4096]u8 = undefined;
         if (std.fmt.bufPrint(&buf, fmt, args)) |line| {
-            _ = std.c.write(2, line.ptr, line.len);
-            _ = std.c.write(2, "\n", 1);
+            platform.writeToFd(2, line);
+            platform.writeToFd(2, "\n");
         } else |_| {}
         return;
     }
@@ -315,11 +316,10 @@ fn writeLine(writer: *std.Io.File.Writer, bytes: []const u8) void {
 /// hook). Fills `out` and returns the written slice (never dangles — the
 /// slice is bounded by the caller-owned `out`).
 fn formatTimestamp(out: []u8) []const u8 {
-    var ts: std.c.timespec = undefined;
-    const ok = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts) == 0;
-    if (!ok) return std.fmt.bufPrint(out, "ts_err", .{}) catch "ts_err";
+    const now_ns = platform.realtimeNowNs();
+    if (now_ns == 0) return std.fmt.bufPrint(out, "ts_err", .{}) catch "ts_err";
 
-    const total_ms: u64 = @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
+    const total_ms: u64 = @as(u64, @intCast(@divTrunc(now_ns, std.time.ns_per_ms)));
     const secs = total_ms / std.time.ms_per_s;
     const ms = total_ms % std.time.ms_per_s;
 

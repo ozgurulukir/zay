@@ -26,7 +26,9 @@
 //! - `nova.on(event, callback)` — subscribe to a lifecycle event
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("c");
+const os = @import("../os.zig");
 const State = @import("state.zig").State;
 const bridge = @import("bridge.zig");
 const bash_exec = @import("../tools/bash_exec.zig");
@@ -1908,19 +1910,22 @@ fn sanitizePath(io: std.Io, path: []const u8) ![]u8 {
     // Best-effort realpath re-check to catch a symlink escaping the root.
     // std.c.realpath returns null on failure (including ENOENT for a new file
     // being written), in which case we fall back to the lexical verdict.
-    const resolved_z = std.heap.page_allocator.dupeZ(u8, resolved) catch return resolved;
-    defer std.heap.page_allocator.free(resolved_z);
-    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const real_ptr = std.c.realpath(resolved_z.ptr, &real_buf);
-    if (real_ptr) |rp| {
-        const real = std.mem.span(rp);
-        const cwd_z = std.heap.page_allocator.dupeZ(u8, cwd) catch return resolved;
-        defer std.heap.page_allocator.free(cwd_z);
-        var real_cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const rcwd_ptr = std.c.realpath(cwd_z.ptr, &real_cwd_buf);
-        const real_cwd = if (rcwd_ptr) |rcp| std.mem.span(rcp) else cwd;
-        if (!std.mem.startsWith(u8, real, real_cwd)) return error.PathTraversal;
-        if (real.len > real_cwd.len and real[real_cwd.len] != std.fs.path.sep) return error.PathTraversal;
+    // Skipped on Windows (no realpath in ucrt; lexical check is sufficient).
+    if (!os.is_windows) {
+        const resolved_z = std.heap.page_allocator.dupeZ(u8, resolved) catch return resolved;
+        defer std.heap.page_allocator.free(resolved_z);
+        var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const real_ptr = std.c.realpath(resolved_z.ptr, &real_buf);
+        if (real_ptr) |rp| {
+            const real = std.mem.span(rp);
+            const cwd_z = std.heap.page_allocator.dupeZ(u8, cwd) catch return resolved;
+            defer std.heap.page_allocator.free(cwd_z);
+            var real_cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const rcwd_ptr = std.c.realpath(cwd_z.ptr, &real_cwd_buf);
+            const real_cwd = if (rcwd_ptr) |rcp| std.mem.span(rcp) else cwd;
+            if (!std.mem.startsWith(u8, real, real_cwd)) return error.PathTraversal;
+            if (real.len > real_cwd.len and real[real_cwd.len] != std.fs.path.sep) return error.PathTraversal;
+        }
     }
 
     return resolved;
@@ -3075,6 +3080,7 @@ test "runBash clamps a negative timeout without panicking" {
 // ── M-symlink: sanitizePath realpath re-check ────────────────────────
 
 test "sanitizePath rejects a symlink escaping the project root" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

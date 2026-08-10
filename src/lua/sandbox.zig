@@ -8,6 +8,7 @@ const std = @import("std");
 const c = @import("c");
 const State = @import("state.zig").State;
 const plugin_api = @import("plugin_api.zig");
+const platform = @import("platform");
 
 /// Permissions granted to a plugin.
 pub const Permissions = struct {
@@ -59,9 +60,7 @@ const HookData = struct {
 /// The instruction hook has no `Io` handle, so it reads the OS clock directly.
 /// Falls back to 0 (no timeout) if the clock is unavailable.
 fn monotonicNowNs() i128 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) != 0) return 0;
-    return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
+    return platform.monotonicNowNs();
 }
 
 /// Instruction count hook function.

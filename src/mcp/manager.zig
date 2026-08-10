@@ -544,7 +544,7 @@ test "McpManager does not reconnect already connected clients" {
     try std.testing.expectEqual(client_mod.ServerStatus.connecting, manager.clients.items[0].status());
 
     // Simulate a successful connection
-    manager.clients.items[0].lifecycle = .{ .stdio = .{ .process = std.mem.zeroes(std.process.Child), .status = .ready } };
+    manager.clients.items[0].lifecycle = .{ .stdio = .{ .process = client_mod.zeroedChild(), .status = .ready } };
 
     // Second sync: should NOT change status of already-connected client
     try manager.syncFromConfig(std.testing.io, &cfg);

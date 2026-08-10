@@ -5,8 +5,8 @@
 //! surface) and directly by the MCP manager/client.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const log = std.log.scoped(.mcp);
+const platform = @import("platform");
 
 /// An extra HTTP header sent with every remote MCP request (e.g. an API key).
 /// Both fields are owned. Values support `{env:VAR}` expansion at parse time so
@@ -189,11 +189,7 @@ pub fn expandMcpServer(gpa: std.mem.Allocator, server: McpServerConfig) !McpServ
 /// multi-threaded contexts); Windows uses the global block. Mirrors the
 /// established pattern in `tools/bash.zig:currentEnvMap`.
 fn loadEnvMap(gpa: std.mem.Allocator) !std.process.Environ.Map {
-    if (builtin.os.tag == .windows) {
-        return std.process.Environ.createMap(.{ .block = .global }, gpa);
-    }
-    const env_slice = std.mem.span(std.c.environ);
-    return std.process.Environ.createMap(.{ .block = .{ .slice = env_slice } }, gpa);
+    return platform.getEnvMap(gpa);
 }
 
 /// Expand `{env:VAR}` placeholders in `input`, looking each name up in

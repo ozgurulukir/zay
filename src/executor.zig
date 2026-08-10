@@ -860,7 +860,7 @@ fn addTestMcpSearchTool(gpa: std.mem.Allocator, manager: *mcp_mod.McpManager) !v
     var client = try mcp_client_mod.McpClient.init(gpa, "test", "echo", &.{}, null);
     client.lifecycle = .{
         .stdio = .{
-            .process = std.mem.zeroes(std.process.Child),
+            .process = mcp_client_mod.zeroedChild(),
             .status = .ready,
         },
     };

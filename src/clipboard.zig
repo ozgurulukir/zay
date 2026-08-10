@@ -11,6 +11,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const bash = @import("tools/bash_exec.zig");
+const platform = @import("platform");
 
 const assert = std.debug.assert;
 
@@ -58,7 +59,7 @@ fn sendOsc52(gpa: std.mem.Allocator, text: []const u8) void {
     _ = Encoder.encode(buf["\x1b]52;c;".len .. "\x1b]52;c;".len + b64_len], text);
     buf[buf.len - 1] = 0x07; // BEL terminator
 
-    _ = std.c.write(1, buf.ptr, buf.len);
+    platform.writeToFd(1, buf);
 }
 
 // ---------------------------------------------------------------------------
@@ -72,8 +73,8 @@ fn isWayland() bool {
 
 fn copyToOsClipboard(gpa: std.mem.Allocator, io: std.Io, text: []const u8) void {
     switch (builtin.os.tag) {
-        .macos => execWithStdin(gpa, io, "pbcopy", text),
-        .windows => execWithStdin(gpa, io, "powershell.exe -NoProfile -Command Set-Clipboard -Value $input", text),
+        .macos => _ = execWithStdin(gpa, io, "pbcopy", text),
+        .windows => _ = execWithStdin(gpa, io, "powershell.exe -NoProfile -Command Set-Clipboard -Value $input", text),
         else => {
             // Linux / BSD / POSIX — check Wayland (wl-copy) then X11 (xclip / xsel).
             if (isWayland()) {

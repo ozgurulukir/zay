@@ -18,7 +18,7 @@
 //! rewrite-stable change-ids.
 
 const std = @import("std");
-const builtin = @import("builtin");
+const platform = @import("platform");
 const os = @import("os.zig");
 
 const assert = std.debug.assert;
@@ -243,11 +243,7 @@ fn indexEnv(gpa: std.mem.Allocator, io: std.Io, index_path: []const u8) CmdError
 
 fn currentEnv(gpa: std.mem.Allocator, io: std.Io) CmdError!std.process.Environ.Map {
     _ = io;
-    if (builtin.os.tag == .windows) {
-        return std.process.Environ.createMap(.{ .block = .global }, gpa) catch error.OutOfMemory;
-    }
-    const env_slice = std.mem.span(std.c.environ);
-    return std.process.Environ.createMap(.{ .block = .{ .slice = env_slice } }, gpa) catch error.OutOfMemory;
+    return platform.getEnvMap(gpa) catch error.OutOfMemory;
 }
 
 /// Resolve the path of Nova's dedicated snapshot index for `dir`. Uses

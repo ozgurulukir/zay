@@ -2,6 +2,7 @@ const std = @import("std");
 const log = std.log.scoped(.ai);
 
 const ai = @import("../ai.zig");
+const os = @import("../os.zig");
 const model_catalog = @import("openai_compatible_models.zig");
 const openai_endpoint = @import("openai_endpoint.zig");
 const stream_parser = @import("stream_parser.zig");
@@ -351,18 +352,20 @@ pub const Client = struct {
         // server stops mid-stream. Applied after the head is received so
         // the (fast) head exchange is not affected.
         if (req.connection) |conn| {
-            const tv: std.posix.timeval = .{
-                .sec = @intCast(self.config.request_timeout_seconds),
-                .usec = 0,
-            };
-            std.posix.setsockopt(
-                conn.stream_reader.stream.socket.handle,
-                std.posix.SOL.SOCKET,
-                std.posix.SO.RCVTIMEO,
-                std.mem.asBytes(&tv),
-            ) catch |err| {
-                log.warn("openai_compatible.setsockopt.RCVTIMEO failed: {}", .{err});
-            };
+            if (!os.is_windows) {
+                const tv: std.posix.timeval = .{
+                    .sec = @intCast(self.config.request_timeout_seconds),
+                    .usec = 0,
+                };
+                std.posix.setsockopt(
+                    conn.stream_reader.stream.socket.handle,
+                    std.posix.SOL.SOCKET,
+                    std.posix.SO.RCVTIMEO,
+                    std.mem.asBytes(&tv),
+                ) catch |err| {
+                    log.warn("openai_compatible.setsockopt.RCVTIMEO failed: {}", .{err});
+                };
+            }
         }
 
         var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;

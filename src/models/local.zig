@@ -4,6 +4,7 @@
 const std = @import("std");
 
 const os = @import("../os.zig");
+const platform = @import("platform");
 
 const assert = std.debug.assert;
 
@@ -80,8 +81,7 @@ fn spawn(gpa: std.mem.Allocator, io: std.Io, classifier_dir: []const u8, python_
     // Inherit parent process environment, then force ONNX Runtime to sleep
     // threads when idle instead of spinning (default busy-wait wastes ~10%
     // CPU per core).
-    const env_slice = std.mem.span(std.c.environ);
-    var env_map = try std.process.Environ.createMap(.{ .block = .{ .slice = env_slice } }, gpa);
+    var env_map = try platform.getEnvMap(gpa);
     defer env_map.deinit();
     try env_map.put("OMP_WAIT_POLICY", "PASSIVE");
 

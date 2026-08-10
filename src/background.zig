@@ -20,6 +20,7 @@ const std = @import("std");
 
 const bash = @import("tools/bash_exec.zig");
 const os = @import("os.zig");
+const platform = @import("platform");
 
 const assert = std.debug.assert;
 
@@ -515,7 +516,9 @@ fn terminateTree(io: std.Io, gpa: std.mem.Allocator, pid: i64) void {
         gpa.free(result.stderr);
         return;
     }
-    std.posix.kill(@intCast(pid), std.posix.SIG.KILL) catch {};
+    if (!os.is_windows) {
+        std.posix.kill(@intCast(pid), std.posix.SIG.KILL) catch {};
+    }
 }
 
 fn processId(child: std.process.Child) i64 {
@@ -578,8 +581,7 @@ test "BackgroundManager.start returns and the job completes" {
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
 
-    const env_slice = std.mem.span(std.c.environ);
-    var env_map = try std.process.Environ.createMap(.{ .block = .{ .slice = env_slice } }, gpa);
+    var env_map = try platform.getEnvMap(gpa);
     defer env_map.deinit();
 
     var manager = BackgroundManager.init(std.testing.io, gpa);
