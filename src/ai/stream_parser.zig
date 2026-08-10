@@ -94,8 +94,14 @@ pub const ToolCallStream = struct {
     is_remapped: [tool_call_array_cap]bool = @splat(false),
     /// Runtime-configurable upper bound on parallel tool calls (from
     /// ai.Config.max_parallel_tool_calls). Indices at or above this
-    /// are rejected with a logged error.
+    /// are dropped rather than executed so the remaining calls can still
+    /// complete the turn. The hard `tool_call_array_cap` still aborts if it
+    /// would overflow the fixed remap arrays.
     max_calls: u32 = 16,
+    /// Number of tool-call deltas dropped because their logical index was
+    /// at or above `max_calls`. Surfaced at the end of the stream so the
+    /// caller can decide whether to inform the model.
+    dropped: u32 = 0,
     /// Model id, borrowed and used only so the over-cap reject log can name
     /// which model tripped the cap. Empty in tests / when the caller has no
     /// model id; never affects parsing behaviour.
@@ -156,6 +162,9 @@ pub fn readStream(
             .{ i, builder.name.items, builder.id.items.len, builder.arguments.items.len },
         );
         try blocks.append(gpa, .{ .tool_call = try builder.toToolCall(gpa, tool_call_seq) });
+    }
+    if (stream.dropped > 0) {
+        log.warn("readStream.dropped dropped={d} max_calls={d} model={s}", .{ stream.dropped, stream.max_calls, stream.model });
     }
     log.info("readStream.done content_len={d} reasoning_len={d} blocks={d}", .{ content.items.len, reasoning.items.len, blocks.items.len });
     return .{ .assistant = .{ .assistant = .{ .content = try blocks.toOwnedSlice(gpa) } }, .usage = usage };
@@ -433,6 +442,7 @@ fn parseToolCallObject(
     var has_pending_name = false;
     var has_pending_arguments = false;
     var resolved_index: ?u32 = null;
+    var accept = true;
 
     while (try nextObjectKey(scanner)) |key| {
         if (std.mem.eql(u8, key, "index")) {
@@ -441,7 +451,9 @@ fn parseToolCallObject(
             if (index >= tool_call_array_cap) return error.TooManyToolCalls;
             if (index >= stream.max_calls) {
                 log.warn("parseToolCall.reject index={d} exceeds max_parallel_tool_calls={d} model={s}", .{ index, stream.max_calls, stream.model });
-                return error.TooManyToolCalls;
+                stream.dropped += 1;
+                accept = false;
+                continue;
             }
             resolved_index = @intCast(index);
         } else if (std.mem.eql(u8, key, "id")) {
@@ -454,6 +466,8 @@ fn parseToolCallObject(
         }
     }
 
+    if (!accept) return;
+
     // Some OpenAI-compatible providers (e.g. Google Gemini via the OpenAI
     // compatibility layer) omit the `index` field entirely. Append such calls
     // to the end so a missing index never silently drops the tool call. The
@@ -465,10 +479,14 @@ fn parseToolCallObject(
         if (next >= tool_call_array_cap) return error.TooManyToolCalls;
         if (next >= stream.max_calls) {
             log.warn("parseToolCall.reject index={d} exceeds max_parallel_tool_calls={d} model={s}", .{ next, stream.max_calls, stream.model });
-            return error.TooManyToolCalls;
+            stream.dropped += 1;
+            accept = false;
+            break :blk 0;
         }
         break :blk next;
     };
+
+    if (!accept) return;
     while (stream.builders.items.len <= logical) try stream.builders.append(gpa, .{});
 
     // Detect ID collision: same logical index but a different tool-call ID.
@@ -657,40 +675,43 @@ test "parse streaming tool call with no index appends to the end" {
     try std.testing.expectEqualStrings("{\"command\":\"ls\"}", stream.builders.items[0].arguments.items);
 }
 
-test "readStream rejects tool calls whose index exceeds max_calls" {
+test "readStream drops tool calls whose index exceeds max_calls" {
     // Regression guard for the L3 model-attribution change: the new `model`
-    // param is accepted and never changes the over-cap rejection behaviour.
+    // param is accepted and never changes the over-cap drop behaviour.
     // (The logger line itself isn't captured by tests; this asserts the
-    // observable contract — error.TooManyToolCalls at the right threshold.)
+    // observable contract — the call at index 1 is dropped and the turn
+    // returns successfully with zero accepted builders.)
     const gpa = std.testing.allocator;
-    // max_calls = 1, but the delta claims index 1 → reject.
+    // max_calls = 1, but the delta claims index 1 → drop.
     const stream =
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_x\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}}]}\n" ++
         "data: [DONE]\n";
     var reader: std.Io.Reader = .fixed(stream);
     var tool_call_seq: u64 = 0;
-    try std.testing.expectError(
-        error.TooManyToolCalls,
-        readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 1, "ling-3.0-flash"),
-    );
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 1, "ling-3.0-flash");
+    defer turn.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), turn.assistant.assistant.content.len);
 }
 
-test "readStream rejects index-less tool calls beyond max_calls" {
+test "readStream drops index-less tool calls beyond max_calls" {
     // The index-less fallback appends to the end; it must respect the same
     // max_parallel_tool_calls cap so the remap arrays can't overflow.
     const gpa = std.testing.allocator;
     // max_calls = 1, but two index-less tool calls arrive → the second append
-    // would land at index 1, which exceeds the cap → reject.
+    // would land at index 1, which exceeds the cap → drop. The first call
+    // survives and becomes a content block.
     const stream =
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}}]}\n" ++
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_2\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}}]}\n" ++
         "data: [DONE]\n";
     var reader: std.Io.Reader = .fixed(stream);
     var tool_call_seq: u64 = 0;
-    try std.testing.expectError(
-        error.TooManyToolCalls,
-        readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 1, "ling-3.0-flash"),
-    );
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 1, "ling-3.0-flash");
+    defer turn.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), turn.assistant.assistant.content.len);
+    try std.testing.expect(turn.assistant.assistant.content[0] == .tool_call);
+    try std.testing.expectEqualStrings("bash", turn.assistant.assistant.content[0].tool_call.name);
+    try std.testing.expectEqualStrings("call_1", turn.assistant.assistant.content[0].tool_call.call_id.slice());
 }
 
 const TestObserverCtx = struct {
