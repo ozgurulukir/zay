@@ -259,3 +259,9 @@ or **Esc** to cancel. The server name is derived from the URL host.
   separator. Server names containing `_` will be incorrectly parsed. Use hyphens instead.
 - **OAuth 2.1**: Remote servers requiring OAuth (`401` + `WWW-Authenticate`) are not yet
   supported. Use a server that accepts an API key in the URL or headers via `{env:VAR}`.
+- **JSON Schema composition in tool `inputSchema`**: `oneOf`/`anyOf` collapse to a single
+  property kind only when every branch is the same primitive
+  (`integer`/`number`/`boolean`/`string`); a nullable `{"type":"null"}` branch is ignored,
+  so `anyOf:[{integer},{null}]` resolves to `integer`. Mixed-type or object/array unions,
+  `$ref`, and the array-of-types nullable form (`"type":["string","null"]`) are not resolved
+  and fall back to `string`.

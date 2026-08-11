@@ -130,16 +130,25 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
         if (prop_val != .object) continue;
         const prop_obj = prop_val.object;
 
-        // Determine kind — handle unsupported composition keywords gracefully
+        // Determine kind — handle unsupported composition keywords gracefully,
+        // with limited oneOf/anyOf support for simple primitive/type branches.
         const kind = blk: {
             if (prop_obj.get("$ref") != null) {
                 log.warn("MCP schema: $ref unsupported for '{s}', using string", .{prop_name});
                 break :blk tools_common.Schema.Kind.string;
             }
-            if (prop_obj.get("oneOf") != null or prop_obj.get("anyOf") != null) {
+
+            // Limited oneOf/anyOf support: collapse to a shared kind when every
+            // branch is the same primitive (nullable "null" branches are
+            // ignored). Mixed/complex unions fall back to string below.
+            if (prop_obj.get("oneOf") orelse prop_obj.get("anyOf")) |branches| {
+                if (branches == .array and branches.array.items.len > 0) {
+                    if (resolveUnionKind(branches.array.items)) |k| break :blk k;
+                }
                 log.warn("MCP schema: oneOf/anyOf unsupported for '{s}', using string", .{prop_name});
                 break :blk tools_common.Schema.Kind.string;
             }
+
             const type_str = if (prop_obj.get("type")) |t|
                 (if (t == .string) t.string else "string")
             else
@@ -242,6 +251,36 @@ fn kindFromString(kind: []const u8) tools_common.Schema.Kind {
     return .string;
 }
 
+/// Resolve a simple oneOf/anyOf array to a shared kind if every branch maps to
+/// the same primitive/type. Returns null when the branches are mixed, contain
+/// an unsupported object/array kind, or are otherwise complex, so the caller
+/// can fall back to string. A `{"type":"null"}` branch is treated as a nullable
+/// marker and skipped.
+fn resolveUnionKind(items: []const std.json.Value) ?tools_common.Schema.Kind {
+    var resolved: ?tools_common.Schema.Kind = null;
+    for (items) |branch| {
+        if (branch != .object) return null;
+        const branch_type = branch.object.get("type") orelse return null;
+        if (branch_type != .string) return null;
+
+        // {"type":"null"} marks a nullable variant (OpenAPI 3.1 / JSON Schema
+        // 2020-12). Skip it so a nullable primitive resolves to its own kind
+        // instead of colliding with the string fallback.
+        if (std.mem.eql(u8, branch_type.string, "null")) continue;
+
+        const kind = kindFromString(branch_type.string);
+        if (kind == .object) return null;
+        if (kind == .array) return null;
+
+        if (resolved) |*r| {
+            if (r.* != kind) return null;
+        } else {
+            resolved = kind;
+        }
+    }
+    return resolved;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -321,12 +360,43 @@ test "schemaFromJsonSchema extracts default value" {
     try std.testing.expectEqualStrings("3", count_default);
 }
 
-test "schemaFromJsonSchema falls back to string for $ref and oneOf" {
+test "schemaFromJsonSchema resolves simple homogeneous oneOf/anyOf to shared kind" {
     const gpa = std.testing.allocator;
+    // Non-string primitives prove the resolver actually ran: the fallback is
+    // also .string, so a string/string union would be indistinguishable from it.
     const schema_json =
         \\{"type":"object","properties":{
-        \\  "ref_item":{"$ref":"#/definitions/Item","description":"Referenced"},
-        \\  "union":{"oneOf":[{"type":"string"},{"type":"integer"}],"description":"Union type"}
+        \\  "limit":{"anyOf":[{"type":"integer"},{"type":"integer"}],"description":"Max results"},
+        \\  "ratio":{"oneOf":[{"type":"number"},{"type":"number"}],"description":"Ratio"},
+        \\  "enabled":{"anyOf":[{"type":"boolean"},{"type":"boolean"}],"description":"Flag"}
+        \\}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
+    defer parsed.deinit();
+
+    var schema = try schemaFromJsonSchema(gpa, parsed.value);
+    defer schema.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 3), schema.properties.len);
+    for (schema.properties) |prop| {
+        if (std.mem.eql(u8, prop.name, "limit"))
+            try std.testing.expectEqual(tools_common.Schema.Kind.integer, prop.kind);
+        if (std.mem.eql(u8, prop.name, "ratio"))
+            try std.testing.expectEqual(tools_common.Schema.Kind.number, prop.kind);
+        if (std.mem.eql(u8, prop.name, "enabled"))
+            try std.testing.expectEqual(tools_common.Schema.Kind.boolean, prop.kind);
+    }
+}
+
+test "schemaFromJsonSchema resolves nullable primitive unions (type:null branch ignored)" {
+    const gpa = std.testing.allocator;
+    // count is the load-bearing case: without skipping "null", integer != the
+    // .string that kindFromString("null") yields, so resolution would fail and
+    // fall back to .string. Asserting .integer proves the skip works.
+    const schema_json =
+        \\{"type":"object","properties":{
+        \\  "count":{"anyOf":[{"type":"integer"},{"type":"null"}],"description":"Optional count"},
+        \\  "name":{"oneOf":[{"type":"string"},{"type":"null"}],"description":"Optional name"}
         \\}}
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
@@ -336,6 +406,47 @@ test "schemaFromJsonSchema falls back to string for $ref and oneOf" {
     defer schema.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 2), schema.properties.len);
+    for (schema.properties) |prop| {
+        if (std.mem.eql(u8, prop.name, "count"))
+            try std.testing.expectEqual(tools_common.Schema.Kind.integer, prop.kind);
+        if (std.mem.eql(u8, prop.name, "name"))
+            try std.testing.expectEqual(tools_common.Schema.Kind.string, prop.kind);
+    }
+}
+
+test "schemaFromJsonSchema falls back to string for $ref properties" {
+    const gpa = std.testing.allocator;
+    const schema_json =
+        \\{"type":"object","properties":{
+        \\  "ref_item":{"$ref":"#/definitions/Item","description":"Referenced"}
+        \\}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
+    defer parsed.deinit();
+
+    var schema = try schemaFromJsonSchema(gpa, parsed.value);
+    defer schema.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), schema.properties.len);
+    try std.testing.expectEqual(tools_common.Schema.Kind.string, schema.properties[0].kind);
+}
+
+test "schemaFromJsonSchema falls back to string for mixed or complex oneOf/anyOf" {
+    const gpa = std.testing.allocator;
+    const schema_json =
+        \\{"type":"object","properties":{
+        \\  "mixed":{"oneOf":[{"type":"string"},{"type":"integer"}]},
+        \\  "complex":{"anyOf":[{"type":"object"},{"type":"array"}]},
+        \\  "empty":{"oneOf":[]}
+        \\}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
+    defer parsed.deinit();
+
+    var schema = try schemaFromJsonSchema(gpa, parsed.value);
+    defer schema.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 3), schema.properties.len);
     for (schema.properties) |prop| {
         try std.testing.expectEqual(tools_common.Schema.Kind.string, prop.kind);
     }
