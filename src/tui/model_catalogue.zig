@@ -96,6 +96,20 @@ pub const ModelCatalogue = struct {
 
     /// Free every owned model + snapshot. The in-flight future must be
     /// cancelled first by the caller (it needs `io`); see `App.cancelModelLoad`.
+    pub fn selectByActiveModelId(self: *ModelCatalogue, active_id: ?[]const u8) void {
+        const id = active_id orelse return;
+        const count = self.len();
+        var d: u32 = 0;
+        while (d < count) : (d += 1) {
+            const storage_idx = model_picker.displayToStorage(self.activeStorageIdx(id), d);
+            if (storage_idx >= count) continue;
+            if (std.mem.eql(u8, self.entries.items[storage_idx].model.id, id)) {
+                self.model_selection = d;
+                return;
+            }
+        }
+    }
+
     pub fn deinit(self: *ModelCatalogue, gpa: std.mem.Allocator) void {
         switch (self.load) {
             .failed => |*f| gpa.free(f.message),

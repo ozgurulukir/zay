@@ -176,16 +176,10 @@ pub fn openModelPicker(self: *App) !void {
     // yoksa dynamic provider kolu atlanır, katalog provider'ları yine gelir).
     ensureModelsDevRegistry(self) catch {};
 
-    if (self.pickers.models.models_cached and self.pickers.models.len() > 0) {
-        try finishModelCatalogReload(
-            self,
-        );
-        try snapshotModelPickerState(
-            self,
-        );
-        return;
-    }
-
+    // Always refresh connected-provider catalogue so all configured providers
+    // appear, not just whatever was cached last. Cache/configured changes (new
+    // provider added, key removed) otherwise leave stale state visible until
+    // something else triggers a reload.
     if (try restoreModelCache(
         self,
     )) {
@@ -196,6 +190,7 @@ pub fn openModelPicker(self: *App) !void {
         // Refresh connected providers in the background and MERGE: present
         // providers update in place, newly-reachable ones appear, and any
         // that fail keep their cached entries.
+        try snapshotModelPickerState(self);
         startModelLoad(self, .connected_provider, true) catch {};
         return;
     }
@@ -204,9 +199,10 @@ pub fn openModelPicker(self: *App) !void {
     codexModelsClear(
         self,
     );
+    self.pickers.models.entries.clearRetainingCapacity();
     self.pickers.models.reasoning_snapshot.clearRetainingCapacity();
     self.pickers.models.model_selection_snapshot = 0;
-    try startModelLoad(self, .connected_provider, false);
+    try startModelLoad(self, .connected_provider, true);
 }
 
 pub fn snapshotModelPickerState(self: *App) !void {
