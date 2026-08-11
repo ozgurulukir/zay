@@ -111,10 +111,10 @@ nova
 
 Nova **compiles** on Windows — `zig build` produces `zig-out/bin/nova.exe`. Full **runtime** support on Windows is still in progress; the binary builds but does not yet run end-to-end. The remaining runtime work is tracked in the follow-up issues:
 
-- [#24](https://github.com/ozgurulukir/nova-agent/issues/24) — runtime config paths (`~/.config/nova` → `%APPDATA%\nova`)
-- [#25](https://github.com/ozgurulukir/nova-agent/issues/25) — bash tool spawns `cmd.exe`/`pwsh.exe` instead of `/bin/sh`
-- [#26](https://github.com/ozgurulukir/nova-agent/issues/26) — 43 failing tests (bash/git/path-separator runtime differences)
-- [#27](https://github.com/ozgurulukir/nova-agent/issues/27) — ModernBERT Python worker and lane/worktree subsystems
+- [#26](https://github.com/ozgurulukir/nova-agent/issues/26) — runtime config paths (`~/.config/nova` → `%APPDATA%\nova`)
+- [#27](https://github.com/ozgurulukir/nova-agent/issues/27) — bash tool spawns `cmd.exe`/`pwsh.exe` instead of `/bin/sh`
+- [#28](https://github.com/ozgurulukir/nova-agent/issues/28) — 43 failing tests (bash/git/path-separator runtime differences)
+- [#29](https://github.com/ozgurulukir/nova-agent/issues/29) — ModernBERT Python worker and lane/worktree subsystems
 
 Linux behavior is unchanged.
 
