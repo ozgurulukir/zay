@@ -620,20 +620,20 @@ fn boolFieldCompat(value: std.json.Value, camel: []const u8, snake: []const u8) 
 /// allocation (all fields are scalars).
 fn parseContext(value: std.json.Value) ContextSettings {
     var ctx: ContextSettings = .{};
-    if (intField(value, "overrideContextWindow")) |v| {
-        if (v >= 1024) ctx.override_context_window = @intCast(v);
+    if (u32field(value, "overrideContextWindow")) |v| {
+        if (v >= 1024) ctx.override_context_window = v;
     }
-    if (intField(value, "maxOutputTokens")) |v| {
-        if (v >= 1) ctx.max_output_tokens = @intCast(v);
+    if (u32field(value, "maxOutputTokens")) |v| {
+        if (v >= 1) ctx.max_output_tokens = v;
     }
-    if (intField(value, "maxParallelToolCalls")) |v| {
-        if (v >= 1 and v <= 64) ctx.max_parallel_tool_calls = @intCast(v);
+    if (u32field(value, "maxParallelToolCalls")) |v| {
+        if (v >= 1 and v <= 64) ctx.max_parallel_tool_calls = v;
     }
-    if (intField(value, "requestTimeoutSeconds")) |v| {
-        if (v >= 1) ctx.request_timeout_seconds = @intCast(v);
+    if (u32field(value, "requestTimeoutSeconds")) |v| {
+        if (v >= 1) ctx.request_timeout_seconds = v;
     }
-    if (intField(value, "maxConcurrentRequests")) |v| {
-        if (v >= 1) ctx.max_concurrent_requests = @intCast(v);
+    if (u32field(value, "maxConcurrentRequests")) |v| {
+        if (v >= 1) ctx.max_concurrent_requests = v;
     }
     if (boolFieldCompat(value, "disablePromptCache", "disable_prompt_cache")) |b| {
         ctx.disable_prompt_cache = b;
@@ -656,17 +656,17 @@ fn parseCompaction(value: std.json.Value) CompactionSettings {
     if (floatField(value, "threshold")) |f| {
         if (f >= 0.1 and f <= 1.0) comp.threshold = @min(f, compaction_threshold_max);
     }
-    if (intField(value, "keepRecentTokens")) |v| {
-        if (v >= 0) comp.keep_recent_tokens = @intCast(v);
+    if (u32field(value, "keepRecentTokens")) |v| {
+        comp.keep_recent_tokens = v;
     }
-    if (intField(value, "keepRecentToolTurns")) |v| {
+    if (u32field(value, "keepRecentToolTurns")) |v| {
         // Minimum 1: 0 would prune every tool result immediately and break
         // tool-calling (the model would never see a result in full).
-        if (v >= 1) comp.keep_recent_tool_turns = @intCast(v);
+        if (v >= 1) comp.keep_recent_tool_turns = v;
     }
-    if (intField(value, "historicalToolCapBytes")) |v| {
+    if (u32field(value, "historicalToolCapBytes")) |v| {
         // Minimum 1: a 0 cap would render every pruned result empty.
-        if (v >= 1) comp.historical_tool_cap_bytes = @intCast(v);
+        if (v >= 1) comp.historical_tool_cap_bytes = v;
     }
     return comp;
 }
@@ -850,11 +850,11 @@ fn parseProviderModels(gpa: std.mem.Allocator, value: std.json.Value) ![]Provide
             else
                 .unset,
         };
-        if (intField(val, "contextWindow")) |v| {
-            if (v >= 1024) model.context_window = @intCast(v);
+        if (u32field(val, "contextWindow")) |v| {
+            if (v >= 1024) model.context_window = v;
         }
-        if (intField(val, "maxOutputTokens")) |v| {
-            if (v >= 1) model.max_output_tokens = @intCast(v);
+        if (u32field(val, "maxOutputTokens")) |v| {
+            if (v >= 1) model.max_output_tokens = v;
         }
         if (val.object.get("reasoningOptions")) |opts| {
             if (opts == .array) {
@@ -964,6 +964,18 @@ fn intField(value: std.json.Value, name: []const u8) ?i64 {
     const field = value.object.get(name) orelse return null;
     if (field != .integer) return null;
     return field.integer;
+}
+
+/// Same as `intField` but narrowed to `u32`. `intField` returns the raw JSON
+/// integer as `i64`, so a too-large value (e.g. a config typo like
+/// `"maxOutputTokens": 9999999999`) is out of `u32` range. Narrowing with
+/// `@intCast` would panic in Debug / silently truncate in ReleaseFast; instead
+/// an out-of-range value yields null and is treated as an absent field, the
+/// same as a non-integer or below-minimum value. The lower-bound check stays
+/// at each call site so per-field minimums are explicit.
+fn u32field(value: std.json.Value, name: []const u8) ?u32 {
+    const v = intField(value, name) orelse return null;
+    return std.math.cast(u32, v);
 }
 
 fn stringField(value: std.json.Value, name: []const u8) ?[]const u8 {
@@ -1555,6 +1567,33 @@ test "Provider.adapter returns null for unimplemented anthropic" {
     try std.testing.expectEqual(AdapterKind.codex_responses, Provider.openai.adapter().?);
     try std.testing.expectEqual(AdapterKind.openai_compatible, Provider.ollama.adapter().?);
     try std.testing.expectEqual(@as(?AdapterKind, null), Provider.anthropic.adapter());
+}
+
+test "parseContext drops integer fields outside u32 range instead of truncating" {
+    // A config typo like `"maxOutputTokens": 9999999999` is a valid i64 but
+    // overflows u32. It must be dropped (left null) rather than panicking on
+    // @intCast (Debug) or silently truncating to 1410065407 (ReleaseFast).
+    const json =
+        \\{"maxOutputTokens":9999999999,"requestTimeoutSeconds":5000000000,"maxParallelToolCalls":8}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const ctx = parseContext(parsed.value);
+    try std.testing.expectEqual(@as(?u32, null), ctx.max_output_tokens);
+    try std.testing.expectEqual(@as(?u32, null), ctx.request_timeout_seconds);
+    // An in-range value is still applied.
+    try std.testing.expectEqual(@as(?u32, 8), ctx.max_parallel_tool_calls);
+}
+
+test "parseCompaction drops integer fields outside u32 range instead of truncating" {
+    const json = "{\"keepRecentTokens\":4294967296,\"keepRecentToolTurns\":3}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const comp = parseCompaction(parsed.value);
+    // 4294967296 > u32 max → dropped, so the field keeps its 8_000 default
+    // (not 0, and not a truncated value).
+    try std.testing.expectEqual(@as(u32, 8_000), comp.keep_recent_tokens);
+    try std.testing.expectEqual(@as(u32, 3), comp.keep_recent_tool_turns); // in-range kept
 }
 
 test "parseModelSelection: valid <provider>/<model>" {

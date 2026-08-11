@@ -162,36 +162,67 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
         else
             "";
 
-        // Extract enum values into the dedicated field.
-        var enum_values: ?[]const []const u8 = null;
+        // Per-property owned fields. All are transferred to `props` on a
+        // successful append; this errdefer cleans them up on any error exit
+        // before that point (a partial enum extraction, a later failed dupe,
+        // or the append itself). On success each optional is nulled so the
+        // errdefer is inert. Without it, a `try` after the enum block (the
+        // name dupe, the desc writer, or `props.append`) would leak the enum
+        // list + its already-duped strings, since the outer `props` errdefer
+        // only covers already-appended items.
+        var p_name: ?[]u8 = null;
+        var p_desc: ?[]const u8 = null;
+        var p_enum: ?[]const []const u8 = null;
+        var p_enum_count: usize = 0; // populated entries in p_enum (for partial-free)
+        var p_default: ?[]const u8 = null;
+        errdefer {
+            if (p_name) |n| gpa.free(n);
+            if (p_desc) |d| gpa.free(d);
+            if (p_enum) |ev| {
+                for (ev[0..p_enum_count]) |v| gpa.free(v);
+                gpa.free(ev);
+            }
+            if (p_default) |dv| gpa.free(dv);
+        }
+
+        // Extract enum values into the dedicated field. Assign the list to
+        // `p_enum` immediately so the errdefer owns it (and every partial
+        // string) even when a mid-loop dupe fails — a bare `ev_list` local
+        // would be unreachable from the errdefer and leak on partial failure.
         if (prop_obj.get("enum")) |enum_val| {
             if (enum_val == .array and enum_val.array.items.len > 0) {
-                var ev_list = try gpa.alloc([]const u8, enum_val.array.items.len);
-                var ev_idx: usize = 0;
+                const ev_list = try gpa.alloc([]const u8, enum_val.array.items.len);
+                p_enum = ev_list;
                 for (enum_val.array.items) |ev| {
                     switch (ev) {
-                        .string => |s| ev_list[ev_idx] = try gpa.dupe(u8, s),
-                        .integer => |n| ev_list[ev_idx] = try std.fmt.allocPrint(gpa, "{d}", .{n}),
+                        .string => |s| {
+                            ev_list[p_enum_count] = try gpa.dupe(u8, s);
+                            p_enum_count += 1;
+                        },
+                        .integer => |n| {
+                            ev_list[p_enum_count] = try std.fmt.allocPrint(gpa, "{d}", .{n});
+                            p_enum_count += 1;
+                        },
                         else => continue,
                     }
-                    ev_idx += 1;
                 }
-                if (ev_idx == 0) {
+                if (p_enum_count == 0) {
                     gpa.free(ev_list);
-                } else {
-                    enum_values = try gpa.realloc(ev_list, ev_idx);
+                    p_enum = null;
+                } else if (p_enum_count != ev_list.len) {
+                    p_enum = try gpa.realloc(ev_list, p_enum_count);
                 }
             }
         }
 
-        const desc_owned = if (enum_values != null) blk: {
+        p_desc = if (p_enum != null) blk: {
             // Append [enum: ...] to description when enum values exist
             var dw: std.Io.Writer.Allocating = .init(gpa);
             errdefer dw.deinit();
             try dw.writer.writeAll(base_desc);
             if (base_desc.len > 0) try dw.writer.writeAll(" ");
             try dw.writer.writeAll("[enum: ");
-            if (enum_values) |ev| {
+            if (p_enum) |ev| {
                 for (ev, 0..) |v, ei| {
                     if (ei > 0) try dw.writer.writeAll(", ");
                     try dw.writer.writeAll(v);
@@ -202,19 +233,26 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
         } else try gpa.dupe(u8, base_desc);
 
         // Extract default value as a raw JSON string fragment.
-        var default_value: ?[]const u8 = null;
         if (prop_obj.get("default")) |def_val| {
-            default_value = try jsonValueToRawFragment(gpa, def_val);
+            p_default = try jsonValueToRawFragment(gpa, def_val);
         }
 
+        p_name = try gpa.dupe(u8, prop_name);
+
         try props.append(gpa, .{
-            .name = try gpa.dupe(u8, prop_name),
+            .name = p_name.?,
             .kind = kind,
-            .description = desc_owned,
+            .description = p_desc.?,
             .required = required_set.contains(prop_name),
-            .enum_values = enum_values,
-            .default_value = default_value,
+            .enum_values = p_enum,
+            .default_value = p_default,
         });
+        // Ownership transferred to `props`; null the locals so a later
+        // iteration's error doesn't double-free them via this errdefer.
+        p_name = null;
+        p_desc = null;
+        p_enum = null;
+        p_default = null;
     }
 
     return .{ .properties = try props.toOwnedSlice(gpa) };
@@ -429,6 +467,46 @@ test "schemaFromJsonSchema falls back to string for $ref properties" {
 
     try std.testing.expectEqual(@as(usize, 1), schema.properties.len);
     try std.testing.expectEqual(tools_common.Schema.Kind.string, schema.properties[0].kind);
+}
+
+test "schemaFromJsonSchema leaks no per-property fields on a mid-iteration OOM" {
+    // Regression for the per-iteration errdefer: when an allocation fails
+    // AFTER the per-property owned fields are built (enum list + duped
+    // strings, desc, default, name) but BEFORE ownership transfers to
+    // `props`, those fields must be freed, not leaked. Iterate every
+    // allocation index so every failure point is covered (including the
+    // append itself); the FailingAllocator wraps the testing allocator, so
+    // any leak surfaces as a testing-allocator leak at process end.
+    const gpa = std.testing.allocator;
+    const schema_json =
+        \\{"type":"object","properties":{
+        \\  "mode":{"type":"string","description":"Run mode","enum":["a","b"],"default":"x"}
+        \\}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
+    defer parsed.deinit();
+
+    var succeeded = false;
+    var i: usize = 0;
+    while (i < 256) : (i += 1) {
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = i });
+        if (schemaFromJsonSchema(failing.allocator(), parsed.value)) |schema| {
+            var s = schema;
+            s.deinit(failing.allocator());
+            succeeded = true;
+            break;
+        } else |err| {
+            // The FailingAllocator surfaces direct allocs as OutOfMemory, but
+            // the Allocating writer maps an OOM inside a write to WriteFailed
+            // — both are valid OOM-class failures. The load-bearing assertion
+            // is leak-freedom (checked by the testing allocator at process end),
+            // not the exact error code.
+            try std.testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
+        }
+    }
+    // Sanity: the function must reach a successful iteration within the bound,
+    // otherwise the loop tested nothing but OOMs.
+    try std.testing.expect(succeeded);
 }
 
 test "schemaFromJsonSchema falls back to string for mixed or complex oneOf/anyOf" {

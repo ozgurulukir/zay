@@ -781,6 +781,21 @@ fn createLaneWorktree(app: *App, repo: []const u8, home: []const u8) !struct { b
     return .{ .branch = branch, .dest = dest };
 }
 
+/// Roll back a worktree whose lane was never registered with `app.threads`
+/// (a creation-failure path in `createLane`/`spawnLane`). Removes the on-disk
+/// worktree and deletes the `nova/<id>` branch; the caller still owns and
+/// frees the `branch`/`dest` strings. `AgentRuntime.deinit` does not touch the
+/// worktree filesystem — the session DB lives at `session_dir` (the repo root),
+/// and the worktree is only the runtime's `cwd` string — so removing the
+/// worktree is independent of runtime teardown. Mirrors the scoped errdefer
+/// `createParallelLane` registers right after `worktreeAdd`. Without this, a
+/// failed `Thread` alloc / `createRuntime` / `threads.append` would free the
+/// identity strings but orphan the worktree + branch on disk permanently.
+fn rollbackLaneWorktree(app: *App, repo: []const u8, dest: []const u8, branch: []const u8) void {
+    vcs.worktreeRemove(app.gpa, app.io, repo, dest) catch {};
+    vcs.deleteBranch(app.gpa, app.io, repo, branch) catch {};
+}
+
 /// Free a captured parent-context list (the `captureLaneContext` shape).
 fn freeLaneContext(gpa: std.mem.Allocator, context: [][]u8) void {
     for (context) |message| gpa.free(message);
@@ -803,6 +818,7 @@ fn createLane(app: *App, req: *const lane_bridge.Request) ?Resp {
     // Every failure path below returns a `Resp` (never an error), so cleanup
     // is explicit at each site — an `errdefer` would never fire here.
     const lane = app.gpa.create(Thread) catch {
+        rollbackLaneWorktree(app, repo, wt.dest, wt.branch);
         app.gpa.free(wt.branch);
         app.gpa.free(wt.dest);
         return failResp(app.gpa, "lane: out of memory\n", .{});
@@ -817,6 +833,7 @@ fn createLane(app: *App, req: *const lane_bridge.Request) ?Resp {
         if (trimmed.len > 0) lane.title = app.gpa.dupe(u8, trimmed) catch null;
     }
     app.threads.append(lane) catch {
+        rollbackLaneWorktree(app, repo, wt.dest, wt.branch);
         lane.deinit(app.gpa); // frees the adopted branch + path (+ title)
         app.gpa.destroy(lane);
         return failResp(app.gpa, "lane: out of memory\n", .{});
@@ -1012,6 +1029,7 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
     };
     const runtime = app.createRuntime(wt.dest, repo, null) catch |err| {
         freeLaneContext(app.gpa, context);
+        rollbackLaneWorktree(app, repo, wt.dest, wt.branch);
         app.gpa.free(wt.branch);
         app.gpa.free(wt.dest);
         return failResp(app.gpa, "lane: runtime create failed: {s}\n", .{@errorName(err)});
@@ -1028,10 +1046,11 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
 
     const lane = app.gpa.create(Thread) catch {
         freeLaneContext(app.gpa, context);
-        app.gpa.free(wt.branch);
-        app.gpa.free(wt.dest);
         runtime.deinit();
         app.gpa.destroy(runtime);
+        rollbackLaneWorktree(app, repo, wt.dest, wt.branch);
+        app.gpa.free(wt.branch);
+        app.gpa.free(wt.dest);
         return failResp(app.gpa, "lane: out of memory\n", .{});
     };
     lane.* = Thread.initLive(
@@ -1047,6 +1066,11 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
     lane.generation = app.nextLaneGeneration();
     lane.spawned_by_generation = spawner.generation;
     app.threads.append(lane) catch {
+        // The lane adopted wt.branch/wt.dest via initLive. Remove the worktree
+        // while those strings are still valid, before lane.deinit frees them
+        // (and tears down the runtime). Safe to do first because runtime.deinit
+        // never touches the worktree filesystem (DB lives at the repo root).
+        rollbackLaneWorktree(app, repo, wt.dest, wt.branch);
         lane.deinit(app.gpa); // frees the adopted runtime, context, branch, path
         app.gpa.destroy(lane);
         return failResp(app.gpa, "lane: out of memory\n", .{});

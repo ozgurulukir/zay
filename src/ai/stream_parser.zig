@@ -516,6 +516,17 @@ fn parseToolCallObject(
         const existing = &stream.builders.items[@as(usize, current)];
         if (existing.id.items.len > 0 and !std.mem.eql(u8, existing.id.items, pending.id.items)) {
             const new_slot: u32 = @intCast(stream.builders.items.len);
+            // The fork creates a builder just like the explicit-index and
+            // index-less paths above, so it honours the same cap — otherwise a
+            // provider reusing `index: 0` for many parallel calls would fork
+            // past max_parallel_tool_calls while `dropped` stays 0 (the literal
+            // index is always 0, so the line-`index` guard never trips) and
+            // every forked builder would be emitted by the final assembly loop.
+            if (new_slot >= stream.max_calls) {
+                log.warn("parseToolCall.fork.reject new_slot={d} exceeds max_parallel_tool_calls={d} model={s}", .{ new_slot, stream.max_calls, stream.model });
+                stream.dropped += 1;
+                return; // `pending` freed by the defer above; do not append or remap.
+            }
             log.info("parseToolCall.fork logical={d} → new_slot={d} old_id={s} new_id={s}", .{ logical, new_slot, existing.id.items, pending.id.items });
             try stream.builders.append(gpa, .{});
             stream.remapped_slot[logical] = new_slot;
@@ -712,6 +723,29 @@ test "readStream drops index-less tool calls beyond max_calls" {
     try std.testing.expect(turn.assistant.assistant.content[0] == .tool_call);
     try std.testing.expectEqualStrings("bash", turn.assistant.assistant.content[0].tool_call.name);
     try std.testing.expectEqualStrings("call_1", turn.assistant.assistant.content[0].tool_call.call_id.slice());
+}
+
+test "readStream drops forked tool calls beyond max_calls (provider reuses index 0)" {
+    // A provider that reuses `index: 0` for parallel calls forks each new ID
+    // into a fresh physical slot. The fork path must honour
+    // max_parallel_tool_calls just like the explicit-index and index-less
+    // paths — otherwise the literal index (always 0) never trips the per-index
+    // guard and the cap is silently bypassed. max_calls = 1: the first call
+    // survives; the second (different ID, same index 0) would fork to slot 1
+    // and is dropped.
+    const gpa = std.testing.allocator;
+    const stream =
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_b\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]}}]}\n" ++
+        "data: [DONE]\n";
+    var reader: std.Io.Reader = .fixed(stream);
+    var tool_call_seq: u64 = 0;
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 1, "ling-3.0-flash");
+    defer turn.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), turn.assistant.assistant.content.len);
+    try std.testing.expect(turn.assistant.assistant.content[0] == .tool_call);
+    try std.testing.expectEqualStrings("bash", turn.assistant.assistant.content[0].tool_call.name);
+    try std.testing.expectEqualStrings("call_a", turn.assistant.assistant.content[0].tool_call.call_id.slice());
 }
 
 const TestObserverCtx = struct {
