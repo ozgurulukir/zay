@@ -63,3 +63,28 @@ pub fn getEnvMap(gpa: std.mem.Allocator) !std.process.Environ.Map {
     const env_slice = std.mem.span(std.c.environ);
     return std.process.Environ.createMap(.{ .block = .{ .slice = env_slice } }, gpa);
 }
+
+// --- Tests ----------------------------------------------------------------
+
+test "realtimeNowNs returns positive non-zero value" {
+    const ns = realtimeNowNs();
+    try std.testing.expect(ns > 0);
+}
+
+test "monotonicNowNs is non-decreasing across consecutive calls" {
+    const a = monotonicNowNs();
+    const b = monotonicNowNs();
+    try std.testing.expect(b >= a);
+}
+
+test "getEnvMap contains PATH" {
+    const allocator = std.testing.allocator;
+    var map = try getEnvMap(allocator);
+    defer map.deinit();
+    try std.testing.expect(map.get("PATH") != null);
+}
+
+test "writeToFd does not crash writing to stderr" {
+    const msg = "platform_test_ok\n";
+    writeToFd(2, msg);
+}

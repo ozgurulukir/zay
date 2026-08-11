@@ -312,8 +312,8 @@ fn writeLine(writer: *std.Io.File.Writer, bytes: []const u8) void {
 
 /// P1: ISO-8601 UTC timestamp prefix. The logger has no `Io` handle on the
 /// stderr pre-init path and the writer thread's hot path, so read the OS
-/// clock directly via `clock_gettime(REALTIME)` (mirrors the Lua instruction
-/// hook). Fills `out` and returns the written slice (never dangles — the
+/// clock via `platform.realtimeNowNs()` (mirrors the Lua instruction hook).
+/// Fills `out` and returns the written slice (never dangles — the
 /// slice is bounded by the caller-owned `out`).
 fn formatTimestamp(out: []u8) []const u8 {
     const now_ns = platform.realtimeNowNs();
