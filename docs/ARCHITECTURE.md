@@ -2,6 +2,18 @@
 
 High-level architecture of Nova. For implementation patterns, engineering gotchas, and the type-system discipline, see [Patterns](PATTERNS.md). For configuration details, see [Configuration](CONFIG.md). For MCP internals, see [MCP](MCP.md). For plugin development, see [Plugins](plugins/README.md).
 
+## Platform Abstraction
+
+`lib/platform.zig` centralizes OS-adaptive behavior so the rest of the codebase stays clean of `builtin.os.tag` switches. It provides portable helpers for the operations that differ between POSIX and Windows:
+
+- `writeToFd` — raw file-descriptor writes (replaces `std.c.write`)
+- `realtimeNowNs` / `monotonicNowNs` — clock reads (replace `std.c.clock_gettime`)
+- `getEnvMap` — environment access (replaces raw `std.c.environ` reads)
+
+POSIX-only syscalls (`std.posix.kill`, `std.posix.poll`, `setsockopt`, `std.c.realpath`) are guarded behind `if (!os.is_windows)` at their call sites. This is what lets the app compile on Windows while leaving Linux behavior unchanged.
+
+This is distinct from `src/os.zig`, which is pure comptime OS identification (`builtin.os.tag`); `lib/platform.zig` is the runtime behavior layer built on top of that identification.
+
 ## LLM Gateway
 
 Nova accepts any OpenAI-compatible endpoint (either `/completions` or `/responses`).

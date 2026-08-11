@@ -237,3 +237,17 @@ Chat-completions `stream_parser.zig` carries a **hard** cap (`tool_call_array_ca
 ### Lane driver-enter visibility rule
 
 The driver must **not** use `lane enter` as a work surface. `drawLaneColumn` (`src/tui/lane_column.zig`) renders activity purely from the lane's own turn state — the spinner only spins when a **worker** runs a turn in that lane. When the driver enters a lane and edits its worktree via `bash`/`file-tools`, the driver's tool-call activity flows to the driver's thread and pane, never to the lane's thread, so the lane pane stays visually idle (`·`) while real work happens inside it. The user sees an empty lane pane in the split grid. Isolated work should therefore go through `lane spawn` (a real worker, which makes the lane pane live) or directly in the main tree; `lane enter` is only for inspecting a lane's files, not as a work surface. See issue #23 for the full analysis and follow-up options.
+
+### Windows portability pattern
+
+The app compiles on Windows (Zig 0.16) without breaking Linux. `lib/platform.zig` centralizes the OS-adaptive helpers so the rest of the codebase stays clean of `builtin.os.tag` switches:
+
+- Use `platform.getEnvMap` instead of raw `std.c.environ` reads.
+- Use `platform.writeToFd` instead of `std.c.write`.
+- Use `platform.realtimeNowNs` / `platform.monotonicNowNs` instead of `std.c.clock_gettime`.
+
+Guard POSIX-only syscalls behind `if (!os.is_windows)` at their call sites: `std.posix.kill`, `std.posix.poll`, `setsockopt`, `std.c.realpath`.
+
+**`zeroedChild()` helper (`src/mcp/client.zig`):** `std.mem.zeroes(std.process.Child)` is a compile error on Windows because `Child.thread_handle` is a non-nullable `HANDLE`. Use the `zeroedChild()` helper to construct a zeroed `Child` portably instead of calling `std.mem.zeroes` directly.
+
+Note: this covers **compilation** only. Full runtime support on Windows is still in progress — see the follow-up issues (#24 config paths, #25 bash shell, #26 failing tests, #27 ModernBERT worker / lanes).
