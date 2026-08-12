@@ -89,6 +89,42 @@ fn renameLaneBranch(app: *App, lane: *Thread, slug: []const u8) !bool {
     return true;
 }
 
+/// Before removing a spawned worker that has not yet had its completion
+/// delivered, tell its spawner the result is being discarded — otherwise the
+/// close/merge silently drops the worker's outcome (B2). Mirrors the phase-2
+/// spawner resolution (`deliverPendingLaneCompletions`) and the M7 gone-spawner
+/// drop. No-op for non-spawned lanes and for lanes whose completion already
+/// reached the spawner.
+fn discardUndeliveredCompletion(app: *App, lane: *Thread) void {
+    if (lane.spawned_by_generation == null) return;
+    if (lane.completion_delivered) return;
+    // Only a worker that actually FINISHED has a completion to discard.
+    // `removeFailedSpawn` reaches abandonLane for a worker whose first turn
+    // never ran — no result to discard (the spawn failure is already reported
+    // via the tool response). Without this guard B2 would mislabel a
+    // non-existent result as "discarded".
+    const finished = (lane.engine == .idle) or
+        (lane.engine == .live and lane.turn.state == .idle and
+            lane.transcript.messages.items.len > 0);
+    if (!finished) return;
+    const spawner = app.laneByGeneration(lane.spawned_by_generation.?) orelse {
+        lane.completion_delivered = true; // spawner gone — drop (M7)
+        return;
+    };
+    const id = laneIdOf(lane) orelse {
+        lane.completion_delivered = true;
+        return;
+    };
+    const title = lane.title orelse id;
+    const note = std.fmt.allocPrint(app.gpa, "Lane {s} ({s}) was closed before its completion was delivered — result discarded.", .{ title, id }) catch {
+        lane.completion_delivered = true;
+        return;
+    };
+    defer app.gpa.free(note);
+    _ = spawner.transcript.append(app.gpa, .notice, "lane", note) catch {};
+    lane.completion_delivered = true;
+}
+
 /// Tear down the working lane at `index` and DELETE its git worktree +
 /// branch. Used for a merged source (its work now lives in the destination) —
 /// unlike `/close`, which parks. Caller must ensure `index != 0` (never the
@@ -109,6 +145,13 @@ fn abandonLane(app: *App, index: u32) !void {
     defer if (dir) |d| app.gpa.free(d);
 
     cancelLaneNaming(app, lane);
+    // B2: a finished spawned worker removed here would otherwise never reach
+    // its spawner — tell the spawner the result is discarded. This runs AFTER
+    // every refusal point (the callers' InFlightTurn/MergeConflict checks, plus
+    // the dupe OOMs above) so an aborted removal does not prematurely suppress
+    // the completion. laneByGeneration still resolves — the lane is in
+    // app.threads until the orderedRemove below.
+    discardUndeliveredCompletion(app, lane);
     _ = app.threads.orderedRemove(index);
     lane.deinit(app.gpa);
     app.gpa.destroy(lane);
@@ -388,6 +431,12 @@ pub fn closeActiveLane(app: *App) !void {
     try clearWorkspaceBorrows(app, lane);
     cancelLaneNaming(app, lane);
     app.thread = app.threads.slice()[index - 1];
+    // B2: a finished spawned worker closed here would otherwise never reach its
+    // spawner — tell the spawner the result is discarded. This runs AFTER every
+    // refusal point (turn-active at entry, workspace-borrow above) so a refused
+    // close does not prematurely suppress the completion. laneByGeneration still
+    // resolves — the lane stays in app.threads until the orderedRemove below.
+    discardUndeliveredCompletion(app, lane);
     _ = app.threads.orderedRemove(index);
     lane.deinit(app.gpa);
     app.gpa.destroy(lane);
@@ -991,11 +1040,19 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
             // attached). `context` is owned by `lane.parent_context` now;
             // `parkFinishedWorker` leaves the lane idle and does not touch
             // parent_context, so it survives.
+            // B2 (TD-2b): the re-spawn never took — revert spawned state so a
+            // later close/merge does not mislabel the PREVIOUS task's result as
+            // "discarded" (parkFinishedWorker preserves the prior transcript, so
+            // the discard helper's `finished` guard alone cannot tell the two
+            // apart). The clear is failure-only — parkFinishedWorker is also
+            // reached on the successful completion-delivery path.
+            target.spawned_by_generation = null;
             parkFinishedWorker(app, target);
             return failResp(app.gpa, "lane: out of memory\n", .{});
         };
         defer app.gpa.free(framed);
         startTurnForLane(app, target, framed, task) catch |err| {
+            target.spawned_by_generation = null; // re-spawn never took — revert (B2 TD-2b)
             parkFinishedWorker(app, target);
             return failResp(app.gpa, "lane: worker start failed: {s}\n", .{@errorName(err)});
         };
@@ -1149,6 +1206,15 @@ fn wakeIdleLane(app: *App, lane: *Thread, repo: []const u8, context: [][]u8) !vo
     // Adopt the spawner's naming context so the first turn can rename the
     // `nova/<hex>` branch, just like the fresh-worktree path. The caller
     // already captured it from the spawner; we take ownership here.
+    //
+    // parkFinishedWorker deliberately leaves parent_context alive (the naming
+    // job reads it post-park — see the rollback comment in spawnLane's
+    // idle-reuse catch). So on a re-task the field may still hold the PREVIOUS
+    // task's context; overwriting without freeing leaks it (N re-spawns ×
+    // lane_naming_context_max × body size per cycle). B1.
+    if (lane.parent_context.len > 0) {
+        freeLaneContext(app.gpa, lane.parent_context);
+    }
     lane.parent_context = context;
 
     lane.agent = &runtime.agent;
@@ -2671,4 +2737,221 @@ test "laneStatus reports waiting-for-approval before stall" {
     defer app.gpa.free(status);
     try std.testing.expect(std.mem.indexOf(u8, status, "waiting for approval") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "STALLED") == null);
+}
+
+// ---------------------------------------------------------------------------
+// B1 / B2 — lane-lifecycle review fixes
+// ---------------------------------------------------------------------------
+
+/// Build an owned parent-context list (the `captureLaneContext` shape) for
+/// tests. Each message is duped; the outer slice is owned. Caller frees via
+/// `freeLaneContext` (or transfers ownership to a lane's `parent_context`).
+fn allocParentContext(gpa: std.mem.Allocator, msgs: []const []const u8) ![][]u8 {
+    const out = try gpa.alloc([]u8, msgs.len);
+    for (msgs, 0..) |m, i| out[i] = try gpa.dupe(u8, m);
+    return out;
+}
+
+test "B1: wakeIdleLane frees the prior parent_context before overwriting it" {
+    // A re-tasked idle lane reaches wakeIdleLane more than once. parkFinishedWorker
+    // leaves parent_context alive (the naming job reads it post-park), so on the
+    // second wake the field still holds the PREVIOUS context; overwriting without
+    // freeing leaks it. std.testing.allocator catches the leak at deinit.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
+    var fx = try GitFixture.init(gpa, io);
+    defer fx.deinit(gpa);
+    const app = &fx.app;
+    const repo = fx.repo;
+
+    // An idle lane with a real worktree (the production `lane create` shape).
+    const wt = try createLaneWorktree(app, repo, fx.home_dir);
+    const lane = try gpa.create(Thread);
+    lane.* = .{ .engine = .{ .idle = .{ .working = .{ .branch = wt.branch, .path = wt.dest } } } };
+    lane.generation = app.nextLaneGeneration();
+    try app.threads.append(lane);
+
+    // First re-task: adopt a non-empty parent_context, then park back to idle
+    // (park leaves parent_context alive — no turn is ever started here, so this
+    // is safe: parkFinishedWorker only deinit's the runtime/queue/approval).
+    const ctx_a = try allocParentContext(gpa, &.{"first task context"});
+    try wakeIdleLane(app, lane, repo, ctx_a);
+    try std.testing.expect(lane.engine == .live);
+    parkFinishedWorker(app, lane);
+    try std.testing.expect(lane.engine == .idle);
+
+    // Second re-task: a NEW context. The fix frees ctx_a here; without it, the
+    // ctx_a pointer is overwritten and lost (Thread.deinit frees only the
+    // current value, ctx_b).
+    const ctx_b = try allocParentContext(gpa, &.{"second task context"});
+    try wakeIdleLane(app, lane, repo, ctx_b);
+    parkFinishedWorker(app, lane);
+    // fx.deinit frees ctx_b via Thread.deinit; ctx_a is freed by the fix above.
+    // testing.allocator aborts if ctx_a leaked.
+}
+
+test "B2: discardUndeliveredCompletion notifies the spawner for a finished spawned worker" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    const spawner = app.threads.slice()[0]; // generation 1
+    // A parked (idle) spawned worker with a result — the B2 target shape.
+    const worker = try addFakeWorkingLane(gpa, &app, "worker1");
+    worker.spawned_by_generation = spawner.generation;
+    _ = try worker.transcript.append(gpa, .agent, "agent", "worker result");
+
+    discardUndeliveredCompletion(&app, worker);
+
+    try std.testing.expect(worker.completion_delivered);
+    try std.testing.expect(transcriptContains(spawner, "result discarded"));
+}
+
+test "B2: discardUndeliveredCompletion is a no-op for a non-spawned lane" {
+    // Also covers the TD-2b revert: an idle-reuse re-spawn that failed cleared
+    // spawned_by_generation back to null, so a later close must not notify.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    const spawner = app.threads.slice()[0];
+    const lane = try addFakeWorkingLane(gpa, &app, "nonspawn");
+    lane.spawned_by_generation = null; // not a spawned worker (the default)
+    const before = spawner.transcript.messages.items.len;
+
+    discardUndeliveredCompletion(&app, lane);
+
+    try std.testing.expect(!lane.completion_delivered);
+    try std.testing.expectEqual(before, spawner.transcript.messages.items.len);
+}
+
+test "B2: discardUndeliveredCompletion skips an already-delivered worker" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    const spawner = app.threads.slice()[0];
+    const worker = try addFakeWorkingLane(gpa, &app, "delivered");
+    worker.spawned_by_generation = spawner.generation;
+    worker.completion_delivered = true; // completion already reached the spawner
+    const before = spawner.transcript.messages.items.len;
+
+    discardUndeliveredCompletion(&app, worker);
+
+    try std.testing.expectEqual(before, spawner.transcript.messages.items.len);
+}
+
+test "B2: discardUndeliveredCompletion drops silently when the spawner is gone" {
+    // Mirrors the M7 gone-spawner path in deliverPendingLaneCompletions: mark
+    // delivered, drop, no crash, no notice anywhere.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    const worker = try addFakeWorkingLane(gpa, &app, "orphan");
+    worker.spawned_by_generation = 999; // no live lane has this generation
+    _ = try worker.transcript.append(gpa, .agent, "agent", "late result");
+
+    discardUndeliveredCompletion(&app, worker);
+
+    try std.testing.expect(worker.completion_delivered); // dropped, not delivered
+    for (app.threads.slice()) |l| {
+        try std.testing.expect(!transcriptContains(l, "result discarded"));
+    }
+}
+
+test "B2: discardUndeliveredCompletion skips a worker that never finished" {
+    // removeFailedSpawn reaches abandonLane for a fresh worker whose first turn
+    // never produced a result. The `finished` guard must exclude both live
+    // non-finished shapes so B2 does not mislabel a non-existent result.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
+    var fx = try GitFixture.init(gpa, io);
+    defer fx.deinit(gpa);
+    const app = &fx.app;
+    const spawner = app.threads.slice()[0];
+
+    // A live worker lane (real runtime) — the production spawn shape, before
+    // any turn completes.
+    const wt = try createLaneWorktree(app, fx.repo, fx.home_dir);
+    const rt = app.createRuntime(wt.dest, fx.repo, null) catch |err| {
+        app.gpa.free(wt.branch);
+        app.gpa.free(wt.dest);
+        return err;
+    };
+    const worker = try gpa.create(Thread);
+    worker.* = Thread.initLive(rt.session_writer.session.id, &rt.agent, io, rt.gpa, &.{}, wt.branch, wt.dest, rt);
+    worker.spawned_by_generation = spawner.generation;
+    try app.threads.append(worker);
+    const before = spawner.transcript.messages.items.len;
+
+    // Sub-shape 1: live, turn idle, EMPTY transcript (right after initLive, no
+    // turn appended yet) — not finished.
+    try std.testing.expect(worker.engine == .live);
+    try std.testing.expect(worker.turn.state == .idle);
+    try std.testing.expectEqual(@as(usize, 0), worker.transcript.messages.items.len);
+    discardUndeliveredCompletion(app, worker);
+    try std.testing.expect(!worker.completion_delivered);
+    try std.testing.expectEqual(before, spawner.transcript.messages.items.len);
+
+    // Sub-shape 2: live, turn ACTIVE (startTurnForLane's submit ran, then a
+    // later step failed — the removeFailedSpawn shape) — not finished.
+    worker.turn.state = .active;
+    _ = try worker.transcript.append(gpa, .user, "you", "task prompt");
+    discardUndeliveredCompletion(app, worker);
+    try std.testing.expect(!worker.completion_delivered);
+    try std.testing.expectEqual(before, spawner.transcript.messages.items.len);
+}
+
+test "B2: a refused close does not prematurely suppress the completion" {
+    // closeActiveLane can refuse (InFlightTurn) when the driver holds a workspace
+    // borrow on the lane's path and is mid-turn. The discard must run AFTER that
+    // refusal point — otherwise a refused close flips completion_delivered and
+    // notifies the spawner for a lane that was never actually removed, permanently
+    // suppressing the worker's completion.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    const spawner = app.threads.slice()[0]; // generation 1
+    const worker = try addFakeWorkingLane(gpa, &app, "worker");
+    worker.spawned_by_generation = spawner.generation;
+    _ = try worker.transcript.append(gpa, .agent, "agent", "worker result");
+    const worker_path = lanes_util.workingLaneOf(worker).?.path;
+
+    // The driver holds a workspace borrow on the worker's path AND is mid-turn —
+    // clearWorkspaceBorrows will refuse with InFlightTurn.
+    spawner.agent.?.setWorkspace(worker_path);
+    spawner.turn.state = .active;
+    defer {
+        spawner.agent.?.setWorkspace(null); // drop the borrow before teardown
+        spawner.turn.state = .idle;
+    }
+
+    // Focus the worker (its own turn is idle, so the entry check passes) and
+    // attempt to close it.
+    app.thread = worker;
+    try std.testing.expectError(error.InFlightTurn, closeActiveLane(&app));
+
+    // The discard did NOT fire: the worker is still pending delivery, and the
+    // spawner got no notice.
+    try std.testing.expect(!worker.completion_delivered);
+    try std.testing.expect(!transcriptContains(spawner, "discarded"));
 }

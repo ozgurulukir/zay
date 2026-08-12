@@ -23,6 +23,8 @@ const os = @import("os.zig");
 
 const assert = std.debug.assert;
 
+const log = std.log.scoped(.vcs);
+
 pub const Error = error{BadObjectId};
 
 /// A git object id (commit or tree), validated as lowercase hex of a git hash
@@ -320,7 +322,18 @@ pub fn restore(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, index_path: 
     defer gpa.free(tree_spec);
     var out = try run(gpa, io, dir, &.{ "read-tree", "-u", "--reset", tree_spec }, &env);
     defer out.deinit(gpa);
-    if (out.code != 0) return error.GitCommandFailed;
+    if (out.code != 0) {
+        // B4: a restore failure leaves the working tree on the wrong node —
+        // surface it in the operator log so it is not silent. The caller
+        // (session_switcher.restoreCheckpointForBranch) swallows the error and
+        // leaves the tree as-is; this log is the only visibility. Use `warn`
+        // not `err` — `log.err` trips the test-runner success gate (AGENTS.md
+        // §Logging). The `warn` sink is active in all builds incl. ReleaseFast.
+        log.warn("vcs.restore failed dir={s} rev={s} code={d} stderr={s}", .{
+            dir, rev.slice(), out.code, std.mem.trim(u8, out.stderr, " \t\r\n"),
+        });
+        return error.GitCommandFailed;
+    }
 }
 
 /// Read the contents of `path` as it exists at `rev` (a branch name, commit, or
