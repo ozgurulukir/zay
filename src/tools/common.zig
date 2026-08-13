@@ -108,6 +108,39 @@ pub fn elideMiddle(gpa: std.mem.Allocator, head: []const u8, tail: []const u8, t
     );
 }
 
+/// Strip ANSI/VT escape sequences from captured tool output (SSOT for the
+/// bash and pwsh shells). PowerShell and git-bash both colorize their error
+/// and table formatting with CSI sequences (`\x1b[31;1m` etc.); the model
+/// reads those as noise, so every observation is cleaned before it is shaped.
+/// Only CSI sequences (ESC `[` … final byte) are handled, which covers every
+/// code seen in practice. A lone ESC is dropped; an unterminated CSI (no final
+/// byte before the end) drops the rest of the input rather than panic. The
+/// caller owns the result; always returns a fresh buffer (never an input slice),
+/// mirroring the `pruneToolText` contract.
+pub fn stripAnsi(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == 0x1b) {
+            if (i + 1 < text.len and text[i + 1] == '[') {
+                // CSI: consume params (0x30..0x3f) + intermediates (0x20..0x2f)
+                // until a final byte (0x40..0x7e). Unterminated → drop the rest.
+                var j = i + 2;
+                while (j < text.len and !(text[j] >= 0x40 and text[j] <= 0x7e)) j += 1;
+                i = if (j < text.len) j + 1 else text.len;
+            } else {
+                i += 1; // lone ESC: drop.
+            }
+            continue;
+        }
+        try out.append(gpa, text[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 test "pruneToolText returns a fresh dupe when text fits the cap" {
     const gpa = std.testing.allocator;
     const text = "hello world";
@@ -156,6 +189,51 @@ test "elideMiddle reports the elided byte count" {
     try std.testing.expect(std.mem.indexOf(u8, joined, "92 of 100 bytes elided") != null);
     try std.testing.expect(std.mem.startsWith(u8, joined, "AAAA"));
     try std.testing.expect(std.mem.endsWith(u8, joined, "ZZZZ"));
+}
+
+test "stripAnsi removes the exact bug-report blob" {
+    const gpa = std.testing.allocator;
+    // `\x1b[31;1mGet-ChildItem: \x1b[0m` followed by `\x1b[36;1mLine |\x1b[0m`.
+    const input = "\x1b[31;1mGet-ChildItem: \x1b[0m" ++ "\x1b[36;1mLine |\x1b[0m";
+    const stripped = try stripAnsi(gpa, input);
+    defer gpa.free(stripped);
+    try std.testing.expectEqualStrings("Get-ChildItem: " ++ "Line |", stripped);
+}
+
+test "stripAnsi passes through plain text unchanged as a fresh alloc" {
+    const gpa = std.testing.allocator;
+    const text = "plain output\nsecond line\n";
+    const pruned = try stripAnsi(gpa, text);
+    defer gpa.free(pruned);
+    // No `\x1b`, so the text is byte-identical; must be a fresh allocation,
+    // not the input slice (mirrors the `pruneToolText` contract).
+    try std.testing.expectEqualStrings(text, pruned);
+    try std.testing.expect(pruned.ptr != text.ptr);
+}
+
+test "stripAnsi handles multi-param CSI and resets" {
+    const gpa = std.testing.allocator;
+    // `\x1b[31;1m` (multi-param SGR), `\x1b[0m` (reset), `\x1b[36;1m`.
+    const input = "\x1b[31;1mred\x1b[0m and \x1b[36;1mcyan\x1b[0m";
+    const stripped = try stripAnsi(gpa, input);
+    defer gpa.free(stripped);
+    try std.testing.expectEqualStrings("red and cyan", stripped);
+}
+
+test "stripAnsi tolerates an unterminated CSI without panic" {
+    const gpa = std.testing.allocator;
+    // Trailing `\x1b[31` has no final byte → drop the rest, no OOB/index panic.
+    const input = "ok\x1b[31";
+    const stripped = try stripAnsi(gpa, input);
+    defer gpa.free(stripped);
+    try std.testing.expectEqualStrings("ok", stripped);
+}
+
+test "stripAnsi empty input returns empty output without a slice panic" {
+    const gpa = std.testing.allocator;
+    const stripped = try stripAnsi(gpa, "");
+    defer gpa.free(stripped);
+    try std.testing.expectEqualStrings("", stripped);
 }
 
 pub const ToolDisplay = struct {

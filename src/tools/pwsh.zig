@@ -469,7 +469,15 @@ fn finishPwshOutput(
     status: FinishStatus,
     command: []const u8,
 ) common.Error!common.Output {
-    var extraction = extractDisplayBlocks(gpa, captured.tail) catch return error.OutOfMemory;
+    // Strip ANSI before shaping the observation: PowerShell's error/table
+    // formatting can emit raw VT codes into the capture even with PSStyle
+    // PlainText set (a child program can print its own ANSI regardless). The
+    // model reads the escape noise as corruption, so clean it here. `total_lines`/
+    // `total_bytes` still reflect the original capture (accurate truncation footer).
+    const stripped = common.stripAnsi(gpa, captured.tail) catch return error.OutOfMemory;
+    defer gpa.free(stripped);
+
+    var extraction = extractDisplayBlocks(gpa, stripped) catch return error.OutOfMemory;
     defer extraction.deinit(gpa);
 
     var snapshot = truncateTailBuffer(gpa, extraction.remainder, captured.total_lines, captured.total_bytes) catch return error.OutOfMemory;
@@ -989,6 +997,25 @@ test "pwsh tool applies env object" {
 fn testObservationText(gpa: std.mem.Allocator, output: common.Output) ![]u8 {
     const observation = output.observation orelse return error.MissingObservation;
     return observation.render(gpa);
+}
+
+test "pwsh observation strips ANSI codes" {
+    if (!os.is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+
+    // Override the spawn-time PlainText back to Ansi, then emit a colored error,
+    // so we are exercising the downstream strip, not the upstream PSStyle fix.
+    var output = try runToolForTest(gpa, std.testing.io, cwd, "{\"command\":\"$PSStyle.OutputRendering='Ansi'; Write-Error \\\"boom\\\"\",\"description\":\"err\"}");
+    defer output.deinit(gpa);
+    const observation = try testObservationText(gpa, output);
+    defer gpa.free(observation);
+
+    // Whatever the capture actually contains, the final observation the model
+    // sees must be ANSI-free while still carrying the payload.
+    try std.testing.expect(std.mem.indexOfScalar(u8, observation, 0x1b) == null);
+    try std.testing.expect(std.mem.indexOf(u8, observation, "boom") != null);
 }
 
 test "pwsh tool accepts null for optional fields under strict schema" {

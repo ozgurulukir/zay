@@ -506,7 +506,14 @@ fn finishBashOutput(
     status: FinishStatus,
     command: []const u8,
 ) common.Error!common.Output {
-    var extraction = extractDisplayBlocks(gpa, captured.tail) catch return error.OutOfMemory;
+    // Strip ANSI before shaping the observation (identical to the pwsh tool):
+    // git-bash and child programs can emit VT codes into the capture, which the
+    // model reads as noise. `total_lines`/`total_bytes` still reflect the
+    // original capture (accurate truncation footer).
+    const stripped = common.stripAnsi(gpa, captured.tail) catch return error.OutOfMemory;
+    defer gpa.free(stripped);
+
+    var extraction = extractDisplayBlocks(gpa, stripped) catch return error.OutOfMemory;
     defer extraction.deinit(gpa);
 
     var snapshot = truncateTailBuffer(gpa, extraction.remainder, captured.total_lines, captured.total_bytes) catch return error.OutOfMemory;
@@ -933,6 +940,28 @@ test "bash timeout observation echoes the command and retry guidance" {
 fn testObservationText(gpa: std.mem.Allocator, output: common.Output) ![]u8 {
     const observation = output.observation orelse return error.MissingObservation;
     return observation.render(gpa);
+}
+
+test "bash observation strips ANSI codes" {
+    // `\x1b[31;1m` (red error) + `\x1b[0m` (reset) wraps a genuine payload to
+    // prove the downstream strip cleans the observation. Mirror of the pwsh
+    // ANSI-strip test; the whole point of the shared `stripAnsi` SSOT is that
+    // both shells run the identical strip path. Skipped on Windows, where the
+    // bash tool's runtime is broken (see issues #27; all bash *spawn* tests
+    // fail there) — on POSIX, where bash runs, the test is mandatory.
+    if (os.is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+
+    var output = try runToolForTest(gpa, std.testing.io, cwd, "{\"command\":\"printf '\\x1b[31;1mboom\\x1b[0m'\",\"description\":\"ANSI error\"}");
+    defer output.deinit(gpa);
+    const observation = try testObservationText(gpa, output);
+    defer gpa.free(observation);
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    try std.testing.expect(std.mem.indexOfScalar(u8, observation, 0x1b) == null);
+    try std.testing.expect(std.mem.indexOf(u8, observation, "boom") != null);
 }
 
 test "bash tool reports exit code in observation" {

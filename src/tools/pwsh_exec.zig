@@ -177,8 +177,19 @@ fn writeStdinAndClose(io: std.Io, stdin_file: std.Io.File, data: []const u8) voi
 ///
 /// Stderr is NOT merged here — it stays on its own stream and is combined with
 /// stdout in the reader (see `capture`), matching the plan's Buffer(2) design.
+///
+/// `color_disable` is prepended to suppress ANSI colorization at the source:
+/// PowerShell 7.2+ (`pwsh`) only formats in color when `$PSStyle.OutputRendering`
+/// allows it, and native colorizers honor `NO_COLOR`. The `if ($null -ne $PSStyle)`
+/// guard keeps it safe on Windows PowerShell 5.1 (`powershell.exe`), where
+/// `$PSStyle` is `$null` and assigning a property to it would throw.
+const color_disable =
+    \\$env:NO_COLOR = '1'
+    \\if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'PlainText' }
+    \\
+;
 fn exitCheckedScript(gpa: std.mem.Allocator, command: []const u8) ![]u8 {
-    return std.fmt.allocPrint(gpa, "{s}\nif (-not $?) {{ exit 1 }} else {{ exit $LASTEXITCODE }}", .{command});
+    return std.fmt.allocPrint(gpa, "{s}{s}\nif (-not $?) {{ exit 1 }} else {{ exit $LASTEXITCODE }}", .{ color_disable, command });
 }
 
 fn drainChild(gpa: std.mem.Allocator, io: std.Io, child: *std.process.Child, timeout: std.Io.Timeout) !Result {
@@ -554,8 +565,19 @@ test "exitCheckedScript wraps command and normalizes exit" {
     defer gpa.free(script);
 
     try std.testing.expect(std.mem.indexOf(u8, script, "Write-Output hi") != null);
+    // The color-disable preamble precedes the user command.
+    try std.testing.expect(std.mem.startsWith(u8, script, "$env:NO_COLOR = '1'"));
+    try std.testing.expect(std.mem.indexOf(u8, script, "$env:NO_COLOR = '1'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "$PSStyle.OutputRendering = 'PlainText'") != null);
+    // The `$null` guard keeps PSStyle assignment 5.1-safe.
+    try std.testing.expect(std.mem.indexOf(u8, script, "if ($null -ne $PSStyle)") != null);
+    // The user command and the trailing exit-normalization check still follow.
     try std.testing.expect(std.mem.indexOf(u8, script, "if (-not $?)") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "exit $LASTEXITCODE") != null);
+    // The preamble precedes the user command (ordering).
+    const command_pos = std.mem.indexOf(u8, script, "Write-Output hi").?;
+    const preamble_pos = std.mem.indexOf(u8, script, "$PSStyle.OutputRendering").?;
+    try std.testing.expect(preamble_pos < command_pos);
     // No `& {` block wrapper (see comment above).
     try std.testing.expect(std.mem.indexOf(u8, script, "& {") == null);
 }

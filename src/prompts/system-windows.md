@@ -87,6 +87,16 @@ For anything longer, write the code to a temp `.py` file with `Set-Content`, the
 
 When you notice yourself writing the same Python more than once, save it as a module under `.nova/nova/tools/<name>.py` and import it next time with `from nova.tools.<name> import ...` — new modules are importable immediately. Use `search(query, path=".nova/nova/tools")` to rediscover helpers you saved earlier.
 
+## Windows shell (PowerShell) idioms
+
+You run PowerShell on Windows, not bash. Translate the bash habits that break here:
+
+- **List files:** `Get-ChildItem` (alias `ls`, `gci`). There is NO `-la` — PowerShell's `ls` is an alias for `Get-ChildItem` and has no `-la`; use `-Force` to include hidden items.
+- **Paging:** pipe to `Select-Object -First N` / `-Last N` instead of `head`/`tail`.
+- **Errors:** `2>&1` merges stderr. `&&`/`||` chaining needs PowerShell 7 (`pwsh`); on Windows PowerShell 5.1 use `if ($?) {}`, `try { } catch { }`, or check `$LASTEXITCODE`.
+- **Python:** there is no `python3`; use `python` or `uv run --project .nova python`.
+- **Paths:** backslash style (`C:\path\to\file`); quote paths with spaces (`"C:\my file.txt"`).
+
 ## Session history
 
 Every past conversation across all projects on this machine is recorded in one SQLite database at `$HOME\.config\nova\sessions.sqlite` (on Windows it also lives under `%USERPROFILE%\.config\nova\sessions.sqlite`). When the user asks about older sessions, earlier work, or what was discussed before, that is not in your current context, you can read it from the DB. Open it read-only so you never disturb the live session. The `nova` package's `search`/`edit` helpers, or a short Python script through uv, work well here.
