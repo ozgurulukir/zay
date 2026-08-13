@@ -231,12 +231,15 @@ fn runBackgroundImpl(
     owner: *anyopaque,
     env_map: *const std.process.Environ.Map,
 ) common.Error!common.Output {
-    _ = io;
     var started = manager.start(.{
         .command = command,
         .cwd = cwd,
         .env_map = env_map,
         .owner = owner,
+        .shell_path = bash.shellPath(io),
+        .command_mode = .argv_dash_c,
+        .stderr_merge_prefix = "exec 2>&1\n",
+        .stderr_merge_suffix = "",
     }) catch |err| return mapBackgroundError(gpa, err);
     defer started.deinit(gpa);
 

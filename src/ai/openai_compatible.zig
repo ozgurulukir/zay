@@ -920,7 +920,12 @@ test "buildToolsJson produces a valid JSON array for the registry" {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value == .array);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"bash\"") != null);
+    // The builtin shell tool is `pwsh` on Windows and `bash` elsewhere; build the
+    // expected "name" dynamically from the canonical `shellToolName` so the
+    // assertion holds on both hosts.
+    const shell_name = try std.fmt.allocPrint(gpa, "\"name\":\"{s}\"", .{tools.shellToolName});
+    defer gpa.free(shell_name);
+    try std.testing.expect(std.mem.indexOf(u8, json, shell_name) != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"strict\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"additionalProperties\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "Shell command to run.") != null);
@@ -971,16 +976,22 @@ test "buildAllToolsJson includes MCP tools alongside builtin tools" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"mcp__server__greet\"") != null);
 }
 
-test "buildAllToolsJson via updateMcpTools: registry builtin suppresses duplicate bash" {
+test "buildAllToolsJson via updateMcpTools: registry builtin suppresses duplicate shell" {
     // Regression: the tick-driven `injectAllTools` path used to call
     // `updateMcpTools(mcp_tools, registry)` without an override, so
-    // `buildAllToolsJson` would emit bash twice — once from
+    // `buildAllToolsJson` would emit the shell tool twice — once from
     // `self.config.tools` and again from `r.all.builtin`. Most
     // OpenAI-compatible APIs reject duplicate tool names with HTTP 400,
     // dropping the entire tool list including the plugin tools.
     const gpa = std.testing.allocator;
 
-    // Build a minimal Client with just a bash builtin in `config.tools`.
+    // The builtin shell name is `pwsh` on Windows and `bash` elsewhere — build
+    // the occurrence scan off the canonical `shellToolName` so the "exactly one,
+    // no duplicate" invariant holds on both hosts.
+    const shell_name = try std.fmt.allocPrint(gpa, "\"name\":\"{s}\"", .{tools_mod.shellToolName});
+    defer gpa.free(shell_name);
+
+    // Build a minimal Client with just a shell builtin in `config.tools`.
     var client: Client = undefined;
     try client.init(gpa, std.testing.io, .{
         .base_url = "https://example.invalid",
@@ -993,7 +1004,7 @@ test "buildAllToolsJson via updateMcpTools: registry builtin suppresses duplicat
     });
     defer client.deinit();
 
-    // Build a registry with a plugin tool; its builtin is bash too.
+    // Build a registry with a plugin tool; its builtin is the shell tool too.
     const reg = try gpa.create(tools_mod.ToolRegistry);
     defer {
         reg.deinit(gpa);
@@ -1020,7 +1031,7 @@ test "buildAllToolsJson via updateMcpTools: registry builtin suppresses duplicat
     var first: ?usize = null;
     var count: usize = 0;
     var idx: usize = 0;
-    while (std.mem.indexOfPos(u8, json, idx, "\"name\":\"bash\"")) |pos| {
+    while (std.mem.indexOfPos(u8, json, idx, shell_name)) |pos| {
         if (first == null) first = pos;
         count += 1;
         idx = pos + 1;
@@ -1075,7 +1086,9 @@ test "updateMcpTools propagates plugin tools into tools_json end-to-end" {
     try client.updateMcpTools(&.{}, reg, &.{});
 
     const json = client.tools_json;
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"bash\"") != null);
+    const shell_name = try std.fmt.allocPrint(gpa, "\"name\":\"{s}\"", .{tools_mod.shellToolName});
+    defer gpa.free(shell_name);
+    try std.testing.expect(std.mem.indexOf(u8, json, shell_name) != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"lane\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"lua__hello-world__greet\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"lua__hello-world__current_time\"") != null);
@@ -1247,13 +1260,15 @@ test "updateMcpTools rebuilds the serialized tool list in place" {
         .{ .name = "mcp__tavily__search", .description = "Search the web", .schema = .{ .properties = &.{} } },
     };
     try client.updateMcpTools(&mcp_tools, null, tools_mod.builtinRegistry());
-    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "\"name\":\"bash\"") != null);
+    const shell_name = try std.fmt.allocPrint(gpa, "\"name\":\"{s}\"", .{tools_mod.shellToolName});
+    defer gpa.free(shell_name);
+    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, shell_name) != null);
     try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "\"name\":\"mcp__tavily__search\"") != null);
 
     // Replacing with an empty set removes the MCP tool but keeps the builtin.
     try client.updateMcpTools(&.{}, null, tools_mod.builtinRegistry());
     try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "mcp__tavily__search") == null);
-    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "\"name\":\"bash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, shell_name) != null);
 }
 
 test "writeRequestPayload disables thinking for reasoning effort none" {

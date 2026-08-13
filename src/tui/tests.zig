@@ -32,6 +32,7 @@ const config_mod = @import("../config/config.zig");
 const runtime_mod = @import("../runtime.zig");
 const session_mod = @import("../session.zig");
 const transcript_mod = @import("../transcript.zig");
+const tools_mod = @import("../tools.zig");
 const CountingAllocator = @import("counting_allocator").CountingAllocator;
 
 const App = tui.App;
@@ -1367,7 +1368,9 @@ test "createRuntime wires the full tool set into the freshly-attached client" {
         .openai_compatible => |c| c,
         else => return error.TestUnexpectedResult,
     };
-    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "\"name\":\"bash\"") != null);
+    const shell_needle = try std.fmt.allocPrint(gpa, "\"name\":\"{s}\"", .{tools_mod.shellToolName});
+    defer gpa.free(shell_needle);
+    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, shell_needle) != null);
     try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "\"name\":\"lane\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "lua__p__t") != null);
 }

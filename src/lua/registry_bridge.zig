@@ -459,8 +459,9 @@ test "PluginManager: heap-allocated tool registry round-trip" {
         gpa.free(descs);
     }
     // all() should not crash and the slice should include the builtin
-    // (bash) plus any plugin tools (none in this case).
+    // shell tool (pwsh on Windows, bash elsewhere) plus any plugin tools
+    // (none in this case).
     const all = try reg.all(gpa);
     try std.testing.expect(all.len >= 1);
-    try std.testing.expectEqualStrings("bash", all[0].name);
+    try std.testing.expectEqualStrings(tools_mod.shellToolName, all[0].name);
 }

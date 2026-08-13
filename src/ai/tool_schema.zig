@@ -239,7 +239,7 @@ test "buildAllToolsJson emits every plugin+builtin+MCP tool at production scale"
     for (plugin_names) |name| {
         try std.testing.expectEqual(@as(usize, 1), countSubstr(json, name));
     }
-    for ([_][]const u8{ "bash", "lane" }) |builtin| {
+    for ([_][]const u8{ tools_mod.shellToolName, "lane" }) |builtin| {
         const needle = try std.fmt.allocPrint(gpa, "\"name\":\"{s}\"", .{builtin});
         defer gpa.free(needle);
         try std.testing.expectEqual(@as(usize, 1), countSubstr(json, needle));

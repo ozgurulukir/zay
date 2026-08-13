@@ -9,7 +9,13 @@ pub const Policy = struct {
 };
 
 const entries = [_]struct { name: []const u8, policy: Policy }{
-    .{ .name = "bash", .policy = .{ .expand_by_default = false, .render = .plain } },
+    // Exactly ONE shell-tool entry, keyed off the canonical comptime shell
+    // name (`pwsh` on Windows, `bash` elsewhere). The bidirectional comptime
+    // validation below demands every builtin have an entry and every entry
+    // have a builtin — so a hardcoded `"bash"` here would leave an orphan on
+    // Windows and a hardcoded `"pwsh"` an orphan on POSIX. One entry matching
+    // the one selected shell is the only correct form.
+    .{ .name = tools_mod.shell_tool.name, .policy = .{ .expand_by_default = false, .render = .plain } },
     .{ .name = "lane", .policy = .{ .expand_by_default = false, .render = .plain } },
 };
 

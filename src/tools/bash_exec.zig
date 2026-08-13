@@ -386,7 +386,9 @@ fn tempSpillPath(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
 /// a literal `/tmp/...` resolves against the current drive root (`C:\tmp\...`),
 /// not where the shell actually wrote. Using the real `%TEMP%` keeps the write
 /// and the read pointing at the same file. POSIX shares one `/tmp` already.
-fn tempDir(gpa: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+/// `pub` so `pwsh_exec` (which mirrors the spill-to-disk capture path) reuses
+/// the one temp dir both shells and Nova agree on.
+pub fn tempDir(gpa: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
     if (!os.is_windows) return gpa.dupe(u8, "/tmp");
     for ([_][]const u8{ "TEMP", "TMP" }) |key| {
         const value = std.process.Environ.getAlloc(.{ .block = .global }, gpa, key) catch continue;
@@ -505,9 +507,9 @@ pub fn pruneStaleTempFiles(io: std.Io, gpa: std.mem.Allocator, max_age_ns: u64) 
 
 /// The dir-parameterized core of `pruneStaleTempFiles`, separated so tests can
 /// target a scratch dir instead of the shared temp dir. Prefix-scoped (matches
-/// only `nova-bash-`/`nova-bg_`, not bare `nova-`) so unrelated temp files are
-/// untouched; mtime is compared against the wall clock (`.real`); every
-/// operation is `catch`-tolerant so cleanup can never break startup.
+/// only `nova-bash-`/`nova-pwsh-`/`nova-bg_`, not bare `nova-`) so unrelated
+/// temp files are untouched; mtime is compared against the wall clock (`.real`);
+/// every operation is `catch`-tolerant so cleanup can never break startup.
 fn pruneTempDir(io: std.Io, dir_path: []const u8, max_age_ns: u64) void {
     var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return;
     defer dir.close(io);
@@ -518,7 +520,9 @@ fn pruneTempDir(io: std.Io, dir_path: []const u8, max_age_ns: u64) void {
     while (iter.next(io) catch null) |entry| {
         if (entry.kind != .file and entry.kind != .unknown) continue;
         const name = entry.name;
-        const match = std.mem.startsWith(u8, name, "nova-bash-") or std.mem.startsWith(u8, name, "nova-bg_");
+        const match = std.mem.startsWith(u8, name, "nova-bash-") or
+            std.mem.startsWith(u8, name, "nova-pwsh-") or
+            std.mem.startsWith(u8, name, "nova-bg_");
         if (!match) continue;
         const st = dir.statFile(io, name, .{}) catch continue;
         const age_ns = st.mtime.durationTo(now).nanoseconds;
@@ -648,6 +652,7 @@ test "pruneTempDir removes only matching stale files" {
     defer gpa.free(dir_path);
 
     (try tmp.dir.createFile(std.testing.io, "nova-bash-abcdef.log", .{})).close(std.testing.io);
+    (try tmp.dir.createFile(std.testing.io, "nova-pwsh-123456.log", .{})).close(std.testing.io);
     (try tmp.dir.createFile(std.testing.io, "nova-bg_1.log", .{})).close(std.testing.io);
     (try tmp.dir.createFile(std.testing.io, "keep.txt", .{})).close(std.testing.io);
 
@@ -660,6 +665,7 @@ test "pruneTempDir removes only matching stale files" {
     // Fresh files are younger than the retention window: nothing is removed.
     pruneTempDir(std.testing.io, dir_path, temp_retention_ns);
     try std.testing.expect(tmp_has(std.testing.io, tmp.dir, "nova-bash-abcdef.log"));
+    try std.testing.expect(tmp_has(std.testing.io, tmp.dir, "nova-pwsh-123456.log"));
     try std.testing.expect(tmp_has(std.testing.io, tmp.dir, "nova-bg_1.log"));
     try std.testing.expect(tmp_has(std.testing.io, tmp.dir, "keep.txt"));
 
@@ -667,6 +673,7 @@ test "pruneTempDir removes only matching stale files" {
     // (a different prefix) survives — prefix-scoping is the property under test.
     pruneTempDir(std.testing.io, dir_path, 1);
     try std.testing.expect(!tmp_has(std.testing.io, tmp.dir, "nova-bash-abcdef.log"));
+    try std.testing.expect(!tmp_has(std.testing.io, tmp.dir, "nova-pwsh-123456.log"));
     try std.testing.expect(!tmp_has(std.testing.io, tmp.dir, "nova-bg_1.log"));
     try std.testing.expect(tmp_has(std.testing.io, tmp.dir, "keep.txt"));
 }

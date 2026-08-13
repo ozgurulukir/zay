@@ -1,6 +1,10 @@
 const std = @import("std");
 
+const bash_tool = @import("bash.zig");
 const common = @import("common.zig");
+const lane_tool = @import("lane.zig");
+const os = @import("../os.zig");
+const pwsh_tool = @import("pwsh.zig");
 const Tool = common.Tool;
 
 /// Runtime-mutable tool registry. The App owns one; builtin tools live in
@@ -13,7 +17,8 @@ const Tool = common.Tool;
 /// storage. It is invalidated by any `addPluginTool` / `removePluginToolsOf`
 /// call — callers must consume the slice before mutating.
 pub const ToolRegistry = struct {
-    /// Immutable builtin tools (bash today). Same backing as `builtinRegistry()`.
+    /// Immutable builtin tools (bash or pwsh, per `shell_tool`). Same backing as
+    /// `builtinRegistry()`.
     builtin: []const Tool,
     /// Plugin tools appended at runtime. Each owns its `userdata` allocation
     /// through `Tool.userdata_free`; `deinit` calls them.
@@ -23,8 +28,8 @@ pub const ToolRegistry = struct {
     /// that don't add or remove tools.
     scratch: std.ArrayList(Tool) = .empty,
 
-    pub fn init(builtin: []const Tool) ToolRegistry {
-        return .{ .builtin = builtin };
+    pub fn init(builtin_slice: []const Tool) ToolRegistry {
+        return .{ .builtin = builtin_slice };
     }
 
     pub fn deinit(self: *ToolRegistry, gpa: std.mem.Allocator) void {
@@ -96,6 +101,18 @@ pub const ToolRegistry = struct {
     }
 };
 
+/// The model-facing shell tool selected at comptime: `pwsh` on Windows,
+/// `bash` elsewhere. THE single source of truth for the bash↔pwsh switch —
+/// every consumer (the builtin list below, the executor's dispatch, the TUI
+/// display policy) reads the selected name from here.
+pub const shell_tool: Tool = if (os.is_windows) pwsh_tool.tool else bash_tool.tool;
+
+/// Canonical builtin tool list. Consumed by `ToolRegistry.init` and by
+/// `src/tools.zig`'s re-export (all single-registry call sites).
+pub fn builtin() []const Tool {
+    return &.{ shell_tool, lane_tool.tool };
+}
+
 const tools_common = @import("common.zig");
 
 // Sentinel tool for testing — has a valid name/description/schema so the
@@ -152,10 +169,10 @@ test "ToolRegistry: lookup finds builtin tools" {
     var reg: ToolRegistry = .init(@import("../tools.zig").builtinRegistry());
     defer reg.deinit(gpa);
 
-    const maybe_tool = try reg.lookup(gpa, "bash");
+    const maybe_tool = try reg.lookup(gpa, shell_tool.name);
     try std.testing.expect(maybe_tool != null);
     const tool = maybe_tool.?;
-    try std.testing.expectEqualStrings("bash", tool.name);
+    try std.testing.expectEqualStrings(shell_tool.name, tool.name);
 }
 
 test "ToolRegistry: lookup returns null for unknown tool" {
@@ -193,8 +210,8 @@ test "ToolRegistry: addPluginTool makes plugin tool discoverable" {
     try std.testing.expectEqualStrings("plugin tool", tool.description);
 
     const all = try reg.all(gpa);
-    try std.testing.expectEqual(@as(usize, 3), all.len); // bash + lane + plugin
-    try std.testing.expectEqualStrings("bash", all[0].name);
+    try std.testing.expectEqual(@as(usize, 3), all.len); // shell + lane + plugin
+    try std.testing.expectEqualStrings(shell_tool.name, all[0].name);
     try std.testing.expectEqualStrings("lane", all[1].name);
     try std.testing.expectEqualStrings("lua__p__t", all[2].name);
 }
@@ -229,7 +246,7 @@ test "ToolRegistry: removePluginToolsWithPrefix strips matching tools" {
     try std.testing.expect((try reg.lookup(gpa, "lua__p__a")) == null);
     try std.testing.expect((try reg.lookup(gpa, "lua__p__b")) == null);
     try std.testing.expect((try reg.lookup(gpa, "mcp__x__c")) != null);
-    try std.testing.expect((try reg.lookup(gpa, "bash")) != null);
+    try std.testing.expect((try reg.lookup(gpa, shell_tool.name)) != null);
 }
 
 test "ToolRegistry: all() returns valid slices after multiple calls" {
@@ -263,7 +280,7 @@ test "ToolRegistry: all() returns valid slices after multiple calls" {
     // First all(): tools are still allocated.
     {
         const all = try reg.all(gpa);
-        try std.testing.expect(all.len == 4); // bash + lane + 2 plugin
+        try std.testing.expect(all.len == 4); // shell + lane + 2 plugin
         for (all) |t| {
             try std.testing.expect(t.name.len > 0);
             try std.testing.expect(t.description.len > 0);
@@ -279,4 +296,16 @@ test "ToolRegistry: all() returns valid slices after multiple calls" {
             try std.testing.expect(t.description.len > 0);
         }
     }
+}
+
+test "registry builtin carries exactly one shell tool" {
+    // SSOT vector (Phase 3): the builtin list must expose exactly one shell
+    // tool (`pwsh` on Windows, `bash` elsewhere) plus `lane`. This pins the
+    // comptime bash↔pwsh switch in place so a future drift that exposes both —
+    // or neither — is caught at the canonical source.
+    const tools = builtin();
+    try std.testing.expectEqual(@as(usize, 2), tools.len);
+    try std.testing.expect(std.mem.eql(u8, tools[0].name, shell_tool.name));
+    try std.testing.expectEqualStrings("lane", tools[1].name);
+    try std.testing.expect(shell_tool.name.len == 4 or std.mem.eql(u8, shell_tool.name, "pwsh"));
 }

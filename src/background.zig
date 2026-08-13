@@ -46,6 +46,28 @@ pub const BackgroundManager = struct {
         /// Opaque token (the owning `*Agent`) handed back at completion so the UI
         /// routes the delivery to the right lane. The manager never derefs it.
         owner: *anyopaque,
+        /// The resolved shell executable (bash path on POSIX, pwsh.exe/powershell.exe
+        /// on Windows). Spawned with the argv shape implied by `command_mode`.
+        shell_path: []const u8,
+        /// How to pass `command` to the shell: `bash -c <merged>` vs
+        /// `pwsh -NoLogo -NonInteractive -Command -` (script fed on stdin).
+        command_mode: CommandMode,
+        /// Prefix/suffix wrapped around `command` to merge stderr into stdout and
+        /// normalize the exit code, so the reader can stay a `Buffer(1)` (stderr is
+        /// part of the command text, not a separate pipe) in every mode.
+        ///
+        /// - bash: prefix `"exec 2>&1\n"`, suffix `""`.
+        /// - pwsh: prefix `"& {\n"`, suffix `"\n} 2>&1\nif (-not $?) { exit 1 } else { exit $LASTEXITCODE }"`.
+        stderr_merge_prefix: []const u8,
+        stderr_merge_suffix: []const u8,
+    };
+
+    /// How a background job passes its `command` to the shell.
+    pub const CommandMode = enum {
+        /// `bash -c <merged>` (single argv string; the classic bash shape).
+        argv_dash_c,
+        /// `pwsh -NoLogo -NonInteractive -Command -` with `merged` fed on stdin.
+        stdin_dash_command,
     };
 
     /// What the bash tool needs to tell the model after a launch. Owned by the
@@ -106,6 +128,9 @@ pub const BackgroundManager = struct {
         started: std.Io.Timestamp,
         child: std.process.Child,
         log_file: std.Io.File,
+        /// Temp `.ps1` script file for a pwsh background job (null for bash
+        /// `-c` jobs). Owned by the job; deleted in `destroyJob`.
+        script_path: ?[]u8 = null,
         tail: std.ArrayList(u8) = .empty,
         thread: ?std.Thread = null,
         state: std.atomic.Value(State) = .init(.running),
@@ -146,18 +171,49 @@ pub const BackgroundManager = struct {
         errdefer log_file.close(io);
 
         // Merge stderr into stdout so the log preserves chronological order, like
-        // the foreground capture path. The shell is non-login (see bash.zig).
-        const merged = try std.fmt.allocPrint(gpa, "exec 2>&1\n{s}", .{opts.command});
+        // the foreground capture path. The prefix/suffix come from the shell tool
+        // (bash: `exec 2>&1\n`, which merges stderr; pwsh: `""` + the trailing
+        // `$?`/`$LASTEXITCODE` exit-check — stderr stays on its own stream and
+        // the reader merges it, so `Buffer(2)` below). The shell is non-login.
+        const merged = try std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ opts.stderr_merge_prefix, opts.command, opts.stderr_merge_suffix });
         defer gpa.free(merged);
 
-        var child = try std.process.spawn(io, .{
-            .argv = &.{ bash.shellPath(io), "-c", merged },
-            .cwd = .{ .path = opts.cwd },
-            .environ_map = opts.env_map,
-            .stdin = .ignore,
-            .stdout = .pipe,
-            .stderr = .ignore,
-        });
+        // The `.stdin_dash_command` mode writes the merged script to a temp
+        // `.ps1` file and runs `pwsh -File` — stdin `-Command -` drops multi-line
+        // PowerShell constructs (blocks, function definitions), and argv
+        // `-Command "<script>"` rounds the quotes away and hits the 32K cap. The
+        // Job owns and deletes the file once its reader is done.
+        var script_path: ?[]u8 = null;
+        // Owns the script file + path until it is transferred into the Job
+        // (below). After transfer the local is nulled, so this runs only on the
+        // pre-transfer error path (e.g. a failed spawn) — not on success.
+        defer if (script_path) |p| {
+            std.Io.Dir.deleteFile(.cwd(), io, p) catch {};
+            gpa.free(p);
+        };
+
+        var child = switch (opts.command_mode) {
+            .argv_dash_c => try std.process.spawn(io, .{
+                .argv = &.{ opts.shell_path, "-c", merged },
+                .cwd = .{ .path = opts.cwd },
+                .environ_map = opts.env_map,
+                .stdin = .ignore,
+                .stdout = .pipe,
+                .stderr = .pipe,
+            }),
+            .stdin_dash_command => blk: {
+                const path = try writeBackgroundScript(gpa, io, merged);
+                script_path = path;
+                break :blk try std.process.spawn(io, .{
+                    .argv = &.{ opts.shell_path, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", path },
+                    .cwd = .{ .path = opts.cwd },
+                    .environ_map = opts.env_map,
+                    .stdin = .ignore,
+                    .stdout = .pipe,
+                    .stderr = .pipe,
+                });
+            },
+        };
         // From here a failure must also tear down the spawned child.
         errdefer child.kill(io);
 
@@ -182,6 +238,17 @@ pub const BackgroundManager = struct {
             .started = std.Io.Timestamp.now(io, .awake),
             .child = child,
             .log_file = log_file,
+            .script_path = script_path,
+        };
+        // Ownership of the script file + path has moved into the Job; the local
+        // defer above must not free it anymore (it only ran on the pre-transfer
+        // error path). If a LATER step fails (result dupes, jobs.append, reader
+        // spawn) the job never reaches `jobs[]`, so `takeFinished`/`destroyJob`
+        // never run for it — clean up its owned script file + path here instead.
+        script_path = null;
+        errdefer if (job.script_path) |p| {
+            std.Io.Dir.deleteFile(.cwd(), io, p) catch {};
+            gpa.free(p);
         };
 
         const result: StartResult = .{
@@ -224,18 +291,30 @@ pub const BackgroundManager = struct {
         const io = job.manager.io;
         const gpa = job.manager.gpa;
 
-        var multi_reader_buffer: std.Io.File.MultiReader.Buffer(1) = undefined;
+        var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
         var multi_reader: std.Io.File.MultiReader = undefined;
-        multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &.{job.child.stdout.?});
+        multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &.{ job.child.stdout.?, job.child.stderr.? });
         defer multi_reader.deinit();
         const reader = multi_reader.reader(0);
+        const stderr_reader = multi_reader.reader(1);
 
         while (multi_reader.fill(read_reserve, .none)) |_| {
-            const chunk = reader.buffered();
-            if (chunk.len == 0) continue;
-            job.log_file.writeStreamingAll(io, chunk) catch {};
-            appendTail(job, gpa, chunk);
-            reader.tossBuffered();
+            // Both stdout and stderr are piped; append each stream's buffered
+            // bytes to the log + tail, in the order the MultiReader surfaces
+            // them, so a PowerShell background job's error text (which stays on
+            // its own stream — pwsh has no `exec 2>&1`) still lands in the log.
+            if (reader.buffered().len > 0) {
+                const chunk = reader.buffered();
+                job.log_file.writeStreamingAll(io, chunk) catch {};
+                appendTail(job, gpa, chunk);
+                reader.tossBuffered();
+            }
+            if (stderr_reader.buffered().len > 0) {
+                const chunk = stderr_reader.buffered();
+                job.log_file.writeStreamingAll(io, chunk) catch {};
+                appendTail(job, gpa, chunk);
+                stderr_reader.tossBuffered();
+            }
         } else |_| {}
 
         const term = job.child.wait(io) catch std.process.Child.Term{ .unknown = 0 };
@@ -451,11 +530,14 @@ pub const BackgroundManager = struct {
     }
 
     fn destroyJob(gpa: std.mem.Allocator, io: std.Io, job: *Job) void {
-        _ = io;
         gpa.free(job.label);
         gpa.free(job.command);
         gpa.free(job.cwd);
         gpa.free(job.log_path);
+        if (job.script_path) |path| {
+            std.Io.Dir.deleteFile(.cwd(), io, path) catch {};
+            gpa.free(path);
+        }
         job.tail.deinit(gpa);
         if (job.completion_message) |m| gpa.free(m);
         gpa.destroy(job);
@@ -481,6 +563,34 @@ fn formatElapsed(buf: []u8, total_seconds: u64) []const u8 {
     const hours = minutes / 60;
     const rem_minutes = minutes % 60;
     return std.fmt.bufPrint(buf, "{d}h {d:0>2}m", .{ hours, rem_minutes }) catch "?";
+}
+
+/// Write the merged pwsh background script to a fresh `nova-pwsh-bg-<hex>.ps1`
+/// temp file under the shared temp dir, so the `.stdin_dash_command` mode can
+/// run it with `pwsh -File`. The `nova-pwsh-` prefix is deliberate: the startup
+/// temp-prune (`bash_exec.pruneTempDir`, matching `nova-pwsh-*`) reaps any file
+/// stranded by a crash, so a failed spawn can never leak one permanently. On a
+/// write failure the (already-created) file is deleted here; the caller owns the
+/// path string and the file on success (the Job stores it, `destroyJob` removes
+/// it), so no cleanup is needed on the error path beyond what's here.
+fn writeBackgroundScript(gpa: std.mem.Allocator, io: std.Io, script: []const u8) ![]u8 {
+    var random: [16]u8 = undefined;
+    io.random(&random);
+    const hex = std.fmt.bytesToHex(random, .lower);
+    const name = try std.fmt.allocPrint(gpa, "nova-pwsh-bg-{s}.ps1", .{hex[0..]});
+    defer gpa.free(name);
+    const path = try bash.namedTempPath(gpa, name);
+    errdefer gpa.free(path);
+    var file = try std.Io.Dir.createFileAbsolute(io, path, .{});
+    // On a write failure, remove the now-created (possibly partial) file so a
+    // stranding doesn't accumulate on every failed background launch. Register
+    // the delete BEFORE the close so, on the error path, LIFO runs close first —
+    // Windows cannot delete a file that is still open and would otherwise fail
+    // this cleanup silently.
+    errdefer std.Io.Dir.deleteFile(.cwd(), io, path) catch {};
+    defer file.close(io);
+    try file.writeStreamingAll(io, script);
+    return path;
 }
 
 /// Kill a job's whole process tree by pid. Best-effort and side-effect free on
@@ -592,6 +702,13 @@ test "BackgroundManager.start returns and the job completes" {
         .cwd = cwd,
         .env_map = &env_map,
         .owner = @as(*anyopaque, @ptrFromInt(1)),
+        // Explicit bash options regardless of host, so this stays a pure
+        // BackgroundManager test (shell-agnostic spawn plumbing is exercised
+        // separately by the pwsh path guarded to Windows).
+        .shell_path = bash.shellPath(std.testing.io),
+        .command_mode = .argv_dash_c,
+        .stderr_merge_prefix = "exec 2>&1\n",
+        .stderr_merge_suffix = "",
     });
     defer started.deinit(gpa);
     try std.testing.expect(started.pid > 0);

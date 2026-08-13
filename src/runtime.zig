@@ -1039,7 +1039,9 @@ test "attach during initSession keeps builtin tools when registry is unwired" {
         .openai_compatible => |c| c,
         else => return error.TestUnexpectedResult,
     };
-    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "\"name\":\"bash\"") != null);
+    const shell_needle = try std.fmt.allocPrint(gpa, "\"name\":\"{s}\"", .{tools_mod.shellToolName});
+    defer gpa.free(shell_needle);
+    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, shell_needle) != null);
     try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "\"name\":\"lane\"") != null);
 }
 
@@ -1092,7 +1094,9 @@ test "attach rebuilds tools from the registry once it is wired" {
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "lua__p__t") != null);
-    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "\"name\":\"bash\"") != null);
+    const shell_needle = try std.fmt.allocPrint(gpa, "\"name\":\"{s}\"", .{tools_mod.shellToolName});
+    defer gpa.free(shell_needle);
+    try std.testing.expect(std.mem.indexOf(u8, client.tools_json, shell_needle) != null);
 }
 
 test "codex refresh starts before token expiry" {

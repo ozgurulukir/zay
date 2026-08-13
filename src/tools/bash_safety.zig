@@ -1,4 +1,10 @@
-//! Local bash command safety classifier client.
+//! Local shell command safety classifier.
+//!
+//! Covers BOTH the bash and PowerShell (`pwsh`) shells — the model-facing
+//! shell tool on Windows is `pwsh`, and this local matcher backs the
+//! destructive-command backstop for whichever shell is host-selected. The
+//! bash patterns are kept unchanged (defense-in-depth is not exhaustive), and
+//! additive PowerShell patterns are layered on.
 //!
 //! When the remote classifier is unavailable, a simple local pattern matcher
 //! provides defense-in-depth against obviously destructive commands.
@@ -60,19 +66,122 @@ fn localClassify(command: []const u8) Verdict {
     const trimmed = std.mem.trim(u8, command, &std.ascii.whitespace);
     if (trimmed.len == 0) return .safe;
 
-    // Fork bombs and infinite-recursion shell constructs.
+    // Fork bombs and infinite-recursion shell constructs (bash).
     if (std.mem.indexOf(u8, trimmed, ":(){") != null) return .unsafe;
     if (std.mem.indexOf(u8, trimmed, ":()") != null) return .unsafe;
+    // PowerShell fork-bomb equivalents.
+    if (isPwshForkBomb(trimmed)) return .unsafe;
 
     // Destructive disk operations on system paths.
     if (isDangerousRm(trimmed)) return .unsafe;
     if (isDangerousDd(trimmed)) return .unsafe;
     if (isDangerousMkfs(trimmed)) return .unsafe;
+    if (isDangerousPwshRemove(trimmed)) return .unsafe;
+    if (isDangerousClearRecycleBin(trimmed)) return .unsafe;
 
     // Overwriting critical system files.
     if (isDangerousRedirect(trimmed)) return .unsafe;
 
     return .safe;
+}
+
+/// PowerShell fork-bomb equivalents: recursive `while($true){Start-Job ...}`
+/// loops and `ForEach-Object -Parallel`/`Start-ThreadJob` constructs that fan
+/// out unbounded worker processes.
+fn isPwshForkBomb(command: []const u8) bool {
+    if (containsIgnoreCase(command, "while($true)") or containsIgnoreCase(command, "while ($true)")) {
+        if (containsIgnoreCase(command, "Start-Job")) return true;
+    }
+    if (containsIgnoreCase(command, "-Parallel") and containsIgnoreCase(command, "Start-ThreadJob")) {
+        return true;
+    }
+    return false;
+}
+
+/// `Remove-Item -Recurse -Force` on system/drive roots — mirrors `isDangerousRm`
+/// for the PowerShell spelling. This is a conservative matcher; the remote
+/// classifier covers the full surface. Targets are flagged only when they are a
+/// drive ROOT (`C:\` bare), `$env:SystemRoot`, or a well-known system dir —
+/// never a project path that merely sits on the C: drive.
+fn isDangerousPwshRemove(command: []const u8) bool {
+    var idx: usize = 0;
+    while (findIgnoreCaseFrom(command, "Remove-Item", idx)) |pos| {
+        const rest_view = command[pos..];
+        if (!containsIgnoreCase(rest_view, "-Recurse") and !containsIgnoreCase(rest_view, "-Force")) {
+            idx = pos + 1;
+            continue;
+        }
+        // $env:SystemRoot / $env:WINDIR resolves to a system root.
+        if (containsIgnoreCase(command, "$env:systemroot") or containsIgnoreCase(command, "$env:windir")) return true;
+        // A well-known system dir.
+        if (containsIgnoreCase(command, "windows\\system32") or
+            containsIgnoreCase(command, "program files") or
+            containsIgnoreCase(command, "\\windows\\")) return true;
+        // A bare drive root: `C:\` followed by end-of-string, whitespace, a
+        // regular quote, or a path separator continuation that is still the root
+        // (e.g. `C:\*` or `C:\Windows` is caught above; here only bare `C:\`).
+        if (hasDriveRootTarget(command)) return true;
+        idx = pos + 1;
+    }
+    return false;
+}
+
+/// True when `command` contains a bare drive root target (`C:\` followed by
+/// end-of-string, whitespace, a quote, `*`, or nothing) — the `Remove-Item C:\`
+/// / `Remove-Item C:\*` case that nukes the whole drive.
+fn hasDriveRootTarget(command: []const u8) bool {
+    var idx: usize = 0;
+    while (idx < command.len) {
+        // A drive letter somewhere, then `:\` right after is the drive root.
+        if (idx + 2 < command.len and
+            std.ascii.isAlphabetic(command[idx]) and
+            command[idx + 1] == ':' and
+            command[idx + 2] == '\\')
+        {
+            const after = idx + 3;
+            if (after >= command.len) return true; // trailing `C:\`
+            const c = command[after];
+            if (std.ascii.isWhitespace(c) or c == '\'' or c == '"' or c == '*') return true;
+        }
+        idx += 1;
+    }
+    return false;
+}
+
+/// `Clear-RecycleBin -Force` empties the recycle bin without confirmation —
+/// destructive, irreversible recovery.
+fn isDangerousClearRecycleBin(command: []const u8) bool {
+    return containsIgnoreCase(command, "clear-recyclebin") and containsIgnoreCase(command, "-force");
+}
+
+/// Case-insensitive substring search over ASCII (command text is shell code,
+/// which never needs Unicode folding).
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (eqlIgnoreCaseAscii(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+/// Case-insensitive search returning the first match position, or null.
+fn findIgnoreCaseFrom(haystack: []const u8, needle: []const u8, from: usize) ?usize {
+    if (from >= haystack.len) return null;
+    var i = from;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (eqlIgnoreCaseAscii(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
+}
+
+fn eqlIgnoreCaseAscii(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
+    }
+    return true;
 }
 
 /// Check for `rm -rf /`, `rm -rf /*`, `rm -rf --no-preserve-root /` etc.
@@ -168,7 +277,59 @@ fn isDangerousRedirect(command: []const u8) bool {
     for (dangerous_paths) |path| {
         if (std.mem.indexOf(u8, command, path) != null) return true;
     }
+    // PowerShell redirects into system roots: `> C:\Windows\`,
+    // `> 'C:\Program Files\'`, etc. Drive-letter roots and the well-known
+    // system dirs are the only Windows targets worth flagging from the local
+    // matcher (defense-in-depth; the remote classifier covers the full surface).
+    if (isDangerousPwshRedirect(command)) return true;
     return false;
+}
+
+/// PowerShell redirect (`>`) into a Windows system root. Case-insensitive on the
+/// ASCII text. Flags well-known system dirs and a bare drive root; a project path
+/// on the C: drive (`> C:\repo\out.txt`) is NOT flagged.
+fn isDangerousPwshRedirect(command: []const u8) bool {
+    if (std.mem.indexOf(u8, command, ">") == null) return false;
+    if (containsIgnoreCase(command, "windows\\system32") or
+        containsIgnoreCase(command, "program files") or
+        containsIgnoreCase(command, "windows\\") or
+        containsIgnoreCase(command, "$env:systemroot"))
+    {
+        return true;
+    }
+    // A bare drive root redirect (`> C:\`, `> 'D:\'`): the target is the drive
+    // root with nothing after it but whitespace / quote / end-of-string / `*`.
+    if (hasBareDriveRootRedirect(command)) return true;
+    return false;
+}
+
+/// True when `command` contains a `>` redirect to a drive root with nothing but
+/// whitespace/quote/`*`/end after the `C:\` — i.e. writing to the root of a
+/// drive itself, not into a subdirectory.
+fn hasBareDriveRootRedirect(command: []const u8) bool {
+    var idx: usize = 0;
+    while (indexOfScalarPos(command, idx, '>')) |gt| {
+        var after = gt + 1;
+        while (after < command.len and std.ascii.isWhitespace(command[after])) after += 1;
+        if (after < command.len and (command[after] == '\'' or command[after] == '"')) after += 1;
+        if (after + 2 <= command.len and
+            std.ascii.isAlphabetic(command[after]) and
+            command[after + 1] == ':' and
+            command[after + 2] == '\\')
+        {
+            const tail = after + 3;
+            if (tail >= command.len) return true;
+            const c = command[tail];
+            if (std.ascii.isWhitespace(c) or c == '\'' or c == '"' or c == '*' or c == ';') return true;
+        }
+        idx = gt + 1;
+    }
+    return false;
+}
+
+fn indexOfScalarPos(haystack: []const u8, from: usize, needle: u8) ?usize {
+    if (from >= haystack.len) return null;
+    return std.mem.indexOfScalarPos(u8, haystack, from, needle);
 }
 
 fn classifyFallible(
@@ -305,4 +466,34 @@ test "local classifier allows safe commands" {
     try std.testing.expectEqual(Verdict.safe, localClassify("git status"));
     try std.testing.expectEqual(Verdict.safe, localClassify("npm run build"));
     try std.testing.expectEqual(Verdict.safe, localClassify("cat src/main.zig"));
+}
+
+test "local classifier flags pwsh Remove-Item on a drive root" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Remove-Item -Recurse -Force C:\\"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Remove-Item -Recurse -Force C:\\*"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Remove-Item -Recurse -Force $env:SystemRoot"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Remove-Item -Recurse -Force C:\\Windows\\*"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Remove-Item -Recurse -Force 'C:\\Program Files\\*'"));
+}
+
+test "local classifier allows pwsh Remove-Item on a project path" {
+    try std.testing.expectEqual(Verdict.safe, localClassify("Remove-Item -Recurse -Force .\\build"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("Remove-Item -Recurse -Force C:\\repo\\dist"));
+}
+
+test "local classifier flags Clear-RecycleBin -Force" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Clear-RecycleBin -Force"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("Clear-RecycleBin -WhatIf"));
+}
+
+test "local classifier flags pwsh fork-bomb equivalents" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("while($true){Start-Job { Start-Job { Start-Job {} } }}"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("1..100 | ForEach-Object -Parallel { Start-ThreadJob { } }"));
+}
+
+test "local classifier flags pwsh dangerous redirect" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Write-Output 'x' > C:\\Windows\\x.txt"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Something > 'C:\\Program Files\\x.txt'"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("Write-Output 'x' > .\\out.txt"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("Write-Output 'x' > C:\\repo\\out.txt"));
 }

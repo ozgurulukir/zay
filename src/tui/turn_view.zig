@@ -8,6 +8,7 @@ const std = @import("std");
 
 const agent_mod = @import("../agent.zig");
 const ai = @import("../ai.zig");
+const os = @import("../os.zig");
 const transcript_mod = @import("../transcript.zig");
 const tools_mod = @import("../tools.zig");
 const tool_policy = @import("tool_policy.zig");
@@ -271,7 +272,16 @@ pub const TurnView = struct {
         // Streaming deltas can arrive with an empty name before the provider
         // sends the tool-call name chunk. Skip until the name is populated.
         if (tool.name.len == 0) return false;
-        if (std.mem.eql(u8, tool.name, "bash")) {
+        // Known limitation (Phase 9): this skill-preview branch is keyed off
+        // the canonical shell name (`.bash` on POSIX, `.pwsh` on Windows) so
+        // the render rules fire for the host shell, but `skillNameFromBashRead`
+        // parses BASH command syntax — it recognizes `cat` of skill files, not
+        // PowerShell's `Get-Content`. The branch is therefore gated on
+        // `!os.is_windows` (bash hosts); on Windows the skill preview for
+        // `<tool>/<skill>` read commands will NOT fire, and the call falls
+        // through to the generic display path below. Accepted and documented;
+        // a pwsh-aware parser is a follow-up, not part of this change.
+        if (std.mem.eql(u8, tool.name, tools_mod.shell_tool.name) and !os.is_windows) {
             const command = agent_mod.parseCommand(gpa, tool.arguments) catch return false;
             gpa.free(command);
             if (try skillNameFromBashRead(gpa, tool.arguments)) |skill_name| {
@@ -285,7 +295,7 @@ pub const TurnView = struct {
             tool.arguments,
         );
         defer display.deinit(gpa);
-        if (std.mem.eql(u8, tool.name, "bash") and display.expanded_label == null) return false;
+        if (std.mem.eql(u8, tool.name, tools_mod.shell_tool.name) and display.expanded_label == null) return false;
 
         // Reached only once arguments parse — partial tool args return above,
         // keeping the spinner up. Clearing it here counts as a visible change.

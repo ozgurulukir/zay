@@ -5,17 +5,27 @@ const std = @import("std");
 const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
 const background = @import("background.zig");
-const bash_safety = @import("tools/bash_safety.zig");
 const bash_tool = @import("tools/bash.zig");
 const lane_bridge = @import("tools/lane_bridge.zig");
 const lua_mod = @import("lua/root.zig");
 const mcp_client_mod = @import("mcp/client.zig");
 const mcp_mod = @import("mcp/manager.zig");
+const os = @import("os.zig");
+const pwsh_tool = @import("tools/pwsh.zig");
 const schema_mod = @import("tools/schema.zig");
+const shell_safety = @import("tools/bash_safety.zig");
 const tools = @import("tools.zig");
 const tool_display = @import("tools/display.zig");
 
 const assert = std.debug.assert;
+
+/// The implementation module for the host shell. MUST stay in lockstep with
+/// `registry.zig::shell_tool`: this selects the module whose `runContained` /
+/// `wantsBackground` / `runBackground` surface is invoked, while the executor
+/// routes calls on the canonical `registry.shell_tool.name` (the model-facing
+/// name, not this alias). The two `if (os.is_windows)` selections are the ONLY
+/// shell-selection points, and they mirror each other by construction.
+const shell_tool = if (os.is_windows) pwsh_tool else bash_tool;
 
 /// Wiring for the background-bash path: the shared manager plus an opaque token
 /// identifying the agent the job belongs to (the manager hands it back at
@@ -148,10 +158,10 @@ pub const ExecutorService = struct {
     io: std.Io,
     cwd: []const u8,
     /// Root-containment for lane workers (see `Agent.contained`): when set, a
-    /// bash call is dispatched through `bash_tool.runContained`, which prepends
-    /// a `cd` guard refusing to leave `cwd`. The guard is scoped here, not in
-    /// the tool registry, so the driver's own bash (which legitimately `cd`s to
-    /// lane worktrees) is unaffected.
+    /// shell call is dispatched through `shell_tool.runContained`, which prepends
+    /// a shell containment guard refusing to leave `cwd`. The guard is scoped
+    /// here, not in the tool registry, so the driver's own shell (which
+    /// legitimately changes into lane worktrees) is unaffected.
     contained: bool = false,
     bash_classifier_url: ?[]const u8 = null,
     background: ?BackgroundStart = null,
@@ -227,7 +237,7 @@ pub const ExecutorService = struct {
         }
         for (calls, 0..) |call, i| {
             try observer.on_started(observer.ctx, call);
-            if (try self.shouldRejectUnsafeBash(call, observer)) {
+            if (try self.shouldRejectUnsafeShell(call, observer)) {
                 results[i] = try self.runRejected(call);
             } else {
                 results[i] = try self.runOne(call);
@@ -253,14 +263,14 @@ pub const ExecutorService = struct {
         self.cwd = agent.effectiveCwd();
     }
 
-    fn shouldRejectUnsafeBash(self: *ExecutorService, call: ai.ToolCall, observer: anytype) !bool {
-        if (!std.mem.eql(u8, call.name, "bash")) return false;
-        const command = bash_safety.commandFromArguments(self.gpa, call.arguments) catch return false;
+    fn shouldRejectUnsafeShell(self: *ExecutorService, call: ai.ToolCall, observer: anytype) !bool {
+        if (!std.mem.eql(u8, call.name, tools.shell_tool.name)) return false;
+        const command = shell_safety.commandFromArguments(self.gpa, call.arguments) catch return false;
         defer self.gpa.free(command);
         // The optional URL is threaded straight through: with a classifier set it
         // does the remote+local-fallback dance; with none the local destructive-
         // command matcher runs directly, so `rm -rf /` is always caught.
-        const verdict = bash_safety.classify(self.gpa, self.io, self.bash_classifier_url, self.cwd, command);
+        const verdict = shell_safety.classify(self.gpa, self.io, self.bash_classifier_url, self.cwd, command);
         if (verdict != .unsafe) return false;
         const approved = try observer.approve_unsafe_bash(observer.ctx, call, command);
         return !approved;
@@ -451,21 +461,21 @@ pub const ExecutorService = struct {
         lane_bridge.lane_bridge_slot = .{ .bridge = self.lane_bridge, .requester = self.lane_requester };
         defer lane_bridge.lane_bridge_slot = prev_lane;
         if (self.contained) {
-            // Lane worker: route through `runContained`, which prepends the `cd`
-            // containment guard before running (background or foreground). This
-            // bypasses the registry so the fixed `Tool.run` signature — shared
-            // with plugins — stays untouched.
-            if (std.mem.eql(u8, call.name, "bash")) {
-                const background_ctx: ?bash_tool.BackgroundCtx = if (self.background) |bg|
+            // Lane worker: route through `runContained`, which prepends the
+            // shell containment guard before running (background or foreground).
+            // This bypasses the registry so the fixed `Tool.run` signature —
+            // shared with plugins — stays untouched.
+            if (std.mem.eql(u8, call.name, tools.shell_tool.name)) {
+                const background_ctx: ?shell_tool.BackgroundCtx = if (self.background) |bg|
                     .{ .manager = bg.manager, .owner = bg.owner }
                 else
                     null;
-                return bash_tool.runContained(self.gpa, self.io, self.cwd, call.arguments, background_ctx);
+                return shell_tool.runContained(self.gpa, self.io, self.cwd, call.arguments, background_ctx);
             }
         }
         if (self.background) |bg| {
-            if (std.mem.eql(u8, call.name, "bash") and bash_tool.wantsBackground(self.gpa, call.arguments)) {
-                return bash_tool.runBackground(self.gpa, self.io, self.cwd, call.arguments, bg.manager, bg.owner);
+            if (std.mem.eql(u8, call.name, tools.shell_tool.name) and shell_tool.wantsBackground(self.gpa, call.arguments)) {
+                return shell_tool.runBackground(self.gpa, self.io, self.cwd, call.arguments, bg.manager, bg.owner);
             }
         }
         if (self.tool_registry) |r| {
@@ -550,6 +560,10 @@ pub const ExecutorService = struct {
 };
 
 test "ExecutorService runs bash and returns both channels" {
+    // Bash-syntax spawn test — runs only on bash hosts (POSIX). On Windows the
+    // model-facing shell is pwsh; `printf hello` is not valid PowerShell, and the
+    // mirror test "executor runs pwsh and returns both channels" covers that host.
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
@@ -558,7 +572,7 @@ test "ExecutorService runs bash and returns both channels" {
     const calls = [_]ai.ToolCall{
         .{
             .call_id = .{ .value = try gpa.dupe(u8, "call_0") },
-            .name = try gpa.dupe(u8, "bash"),
+            .name = try gpa.dupe(u8, shell_tool.tool.name),
             .arguments = try gpa.dupe(u8, "{\"command\":\"printf hello\",\"description\":\"Print hello\"}"),
         },
     };
@@ -582,13 +596,47 @@ test "ExecutorService runs bash and returns both channels" {
     try std.testing.expect(!results[0].failed);
 }
 
+test "executor runs pwsh and returns both channels" {
+    // PowerShell-syntax spawn test — runs only on Windows (pwsh host).
+    if (!os.is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = cwd });
+
+    const calls = [_]ai.ToolCall{
+        .{
+            .call_id = .{ .value = try gpa.dupe(u8, "call_0") },
+            .name = try gpa.dupe(u8, shell_tool.tool.name),
+            .arguments = try gpa.dupe(u8, "{\"command\":\"Write-Output hello\",\"description\":\"Print hello\"}"),
+        },
+    };
+    defer for (calls) |c| {
+        gpa.free(c.call_id.value);
+        gpa.free(c.name);
+        gpa.free(c.arguments);
+    };
+
+    const results = try executor.runAll(&calls, noopObserver(u8));
+    defer {
+        for (results) |*r| r.deinit(gpa);
+        gpa.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("call_0", results[0].call_id.slice());
+    try std.testing.expect(std.mem.indexOf(u8, results[0].content, "hello") != null);
+    try std.testing.expectEqualStrings("Print hello", results[0].display_label);
+    try std.testing.expectEqualStrings("Write-Output hello", results[0].display_expanded_label.?);
+    try std.testing.expect(!results[0].failed);
+}
+
 test "executor converts a tool execution error into a failed result" {
     const gpa = std.testing.allocator;
     var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp" });
     const call: ai.ToolCall = .{
         .call_id = .{ .value = try gpa.dupe(u8, "call_x") },
-        .name = try gpa.dupe(u8, "bash"),
-        .arguments = try gpa.dupe(u8, "{\"command\":\"rg foo\",\"description\":\"search\"}"),
+        .name = try gpa.dupe(u8, shell_tool.tool.name),
+        .arguments = try gpa.dupe(u8, "{\"command\":\"search\",\"description\":\"search\"}"),
     };
     defer {
         gpa.free(call.call_id.value);
@@ -605,12 +653,12 @@ test "executor converts a tool execution error into a failed result" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "Unexpected") != null);
 }
 
-test "executor rejected bash result is failed and model-facing" {
+test "executor rejected shell result is failed and model-facing" {
     const gpa = std.testing.allocator;
     var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp" });
     const call: ai.ToolCall = .{
         .call_id = .{ .value = try gpa.dupe(u8, "call_reject") },
-        .name = try gpa.dupe(u8, "bash"),
+        .name = try gpa.dupe(u8, shell_tool.tool.name),
         .arguments = try gpa.dupe(u8, "{\"command\":\"rm -rf /\",\"description\":\"clean\"}"),
     };
     defer {
@@ -649,9 +697,10 @@ test "executor converts errorDescription accurately" {
     try std.testing.expectEqualStrings("OutOfMemory", errorDescription(error.OutOfMemory));
 }
 
-test "ExecutorService shouldRejectUnsafeBash consults the approval hook" {
+test "ExecutorService shouldRejectUnsafeShell consults the approval hook" {
     // No classifier URL configured (the default) routes straight through the
-    // local destructive-command matcher — no network in this test.
+    // local destructive-command matcher — no network, and no spawn (the call
+    // is rejected before dispatch), so this runs identically on both hosts.
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
@@ -676,7 +725,7 @@ test "ExecutorService shouldRejectUnsafeBash consults the approval hook" {
         .approve_unsafe_bash = MockObserver.approve,
     };
 
-    // 1. Not a bash tool call => never rejected, approval hook not consulted.
+    // 1. Not a shell tool call => never rejected, approval hook not consulted.
     const non_bash_call = ai.ToolCall{
         .call_id = .{ .value = try gpa.dupe(u8, "call_1") },
         .name = try gpa.dupe(u8, "not_bash"),
@@ -687,13 +736,13 @@ test "ExecutorService shouldRejectUnsafeBash consults the approval hook" {
         gpa.free(non_bash_call.name);
         gpa.free(non_bash_call.arguments);
     }
-    try std.testing.expect(!(try executor.shouldRejectUnsafeBash(non_bash_call, observer)));
+    try std.testing.expect(!(try executor.shouldRejectUnsafeShell(non_bash_call, observer)));
 
     // 2. The local matcher flags `rm -rf /` unsafe and the observer declines
     //    => the call is rejected.
     const unsafe_call = ai.ToolCall{
         .call_id = .{ .value = try gpa.dupe(u8, "call_2") },
-        .name = try gpa.dupe(u8, "bash"),
+        .name = try gpa.dupe(u8, shell_tool.tool.name),
         .arguments = try gpa.dupe(u8, "{\"command\":\"rm -rf /\",\"description\":\"clean\"}"),
     };
     defer {
@@ -702,11 +751,11 @@ test "ExecutorService shouldRejectUnsafeBash consults the approval hook" {
         gpa.free(unsafe_call.arguments);
     }
     ctx.should_approve = false;
-    try std.testing.expect(try executor.shouldRejectUnsafeBash(unsafe_call, observer));
+    try std.testing.expect(try executor.shouldRejectUnsafeShell(unsafe_call, observer));
 
     // 3. Same unsafe call, but the observer approves => allowed.
     ctx.should_approve = true;
-    try std.testing.expect(!(try executor.shouldRejectUnsafeBash(unsafe_call, observer)));
+    try std.testing.expect(!(try executor.shouldRejectUnsafeShell(unsafe_call, observer)));
 }
 
 test "ExecutorService.runAll errdefer cleanup exists" {
@@ -725,12 +774,12 @@ test "ExecutorService.runAll errdefer cleanup exists" {
     const calls = [_]ai.ToolCall{
         .{
             .call_id = .{ .value = try gpa.dupe(u8, "call_0") },
-            .name = try gpa.dupe(u8, "bash"),
+            .name = try gpa.dupe(u8, shell_tool.tool.name),
             .arguments = try gpa.dupe(u8, "{\"command\":\"printf test\",\"description\":\"Test\"}"),
         },
         .{
             .call_id = .{ .value = try gpa.dupe(u8, "call_1") },
-            .name = try gpa.dupe(u8, "bash"),
+            .name = try gpa.dupe(u8, shell_tool.tool.name),
             .arguments = try gpa.dupe(u8, "{\"command\":\"printf fail\",\"description\":\"Fail\"}"),
         },
     };
@@ -877,14 +926,15 @@ fn makeCall(gpa: std.mem.Allocator, id: []const u8, name: []const u8, args: []co
 }
 
 test "valid bash call still dispatches after schema validation" {
-    // Positive control: the runAll happy path. Asserted on runOne directly so
-    // a regression that rejects everything is caught here, not only downstream.
+    // Positive control: the runAll happy path (bash host). On Windows the model
+    // faces pwsh; the mirror "valid pwsh call still dispatches" covers that host.
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
     var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = cwd });
 
-    const call = try makeCall(gpa, "call_ok", "bash", "{\"command\":\"printf ok\",\"description\":\"Print ok\"}");
+    const call = try makeCall(gpa, "call_ok", shell_tool.tool.name, "{\"command\":\"printf ok\",\"description\":\"Print ok\"}");
     defer {
         gpa.free(call.call_id.value);
         gpa.free(call.name);
@@ -898,11 +948,32 @@ test "valid bash call still dispatches after schema validation" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "ok") != null);
 }
 
+test "valid pwsh call still dispatches after schema validation" {
+    // Windows-only mirror of the positive-control above (pwsh host).
+    if (!os.is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = cwd });
+
+    const call = try makeCall(gpa, "call_ok", shell_tool.tool.name, "{\"command\":\"Write-Output pwsh-ok\",\"description\":\"Print ok\"}");
+    defer {
+        gpa.free(call.call_id.value);
+        gpa.free(call.name);
+        gpa.free(call.arguments);
+    }
+
+    var result = try executor.runOne(call);
+    defer result.deinit(gpa);
+    try std.testing.expect(!result.failed);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "pwsh-ok") != null);
+}
+
 test "executor rejects bash call with missing required argument" {
     const gpa = std.testing.allocator;
     var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp" });
 
-    const call = try makeCall(gpa, "call_v", "bash", "{}");
+    const call = try makeCall(gpa, "call_v", shell_tool.tool.name, "{}");
     defer {
         gpa.free(call.call_id.value);
         gpa.free(call.name);
@@ -912,7 +983,9 @@ test "executor rejects bash call with missing required argument" {
     var result = try executor.runOne(call);
     defer result.deinit(gpa);
     try std.testing.expect(result.failed);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "Invalid arguments for tool 'bash'") != null);
+    const prefix = try std.fmt.allocPrint(gpa, "Invalid arguments for tool '{s}'", .{shell_tool.tool.name});
+    defer gpa.free(prefix);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, prefix) != null);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "`command` is required") != null);
 }
 
@@ -920,7 +993,7 @@ test "executor rejects bash call with wrong type" {
     const gpa = std.testing.allocator;
     var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp" });
 
-    const call = try makeCall(gpa, "call_t", "bash", "{\"command\":42}");
+    const call = try makeCall(gpa, "call_t", shell_tool.tool.name, "{\"command\":42}");
     defer {
         gpa.free(call.call_id.value);
         gpa.free(call.name);
@@ -938,7 +1011,7 @@ test "executor rejects bash call with invalid JSON" {
     const gpa = std.testing.allocator;
     var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp" });
 
-    const call = try makeCall(gpa, "call_j", "bash", "{bad");
+    const call = try makeCall(gpa, "call_j", shell_tool.tool.name, "{bad");
     defer {
         gpa.free(call.call_id.value);
         gpa.free(call.name);
@@ -1150,7 +1223,7 @@ test "executor re-roots mid-batch after lane enter" {
 
     const calls = [_]ai.ToolCall{
         try makeCall(gpa, "call_enter", "lane", "{\"command\":\"enter\",\"lane\":\"abc\"}"),
-        try makeCall(gpa, "call_pwd", "bash", "{\"command\":\"pwd\",\"description\":\"Show cwd\"}"),
+        try makeCall(gpa, "call_pwd", shell_tool.tool.name, "{\"command\":\"pwd\",\"description\":\"Show cwd\"}"),
     };
     defer for (calls) |c| {
         gpa.free(c.call_id.value);
@@ -1223,7 +1296,7 @@ test "executor re-roots back on lane leave" {
     const calls = [_]ai.ToolCall{
         try makeCall(gpa, "call_enter", "lane", "{\"command\":\"enter\",\"lane\":\"abc\"}"),
         try makeCall(gpa, "call_leave", "lane", "{\"command\":\"leave\",\"lane\":\"abc\"}"),
-        try makeCall(gpa, "call_pwd", "bash", "{\"command\":\"pwd\",\"description\":\"Show cwd\"}"),
+        try makeCall(gpa, "call_pwd", shell_tool.tool.name, "{\"command\":\"pwd\",\"description\":\"Show cwd\"}"),
     };
     defer for (calls) |c| {
         gpa.free(c.call_id.value);

@@ -3,6 +3,7 @@ const std = @import("std");
 const bash_tool = @import("tools/bash.zig");
 const common = @import("tools/common.zig");
 const lane_tool = @import("tools/lane.zig");
+const pwsh_tool = @import("tools/pwsh.zig");
 const registry_mod = @import("tools/registry.zig");
 
 const assert = std.debug.assert;
@@ -22,13 +23,16 @@ pub const ToolDisplay = common.ToolDisplay;
 pub const ToolRegistry = registry_mod.ToolRegistry;
 
 /// Static builtin slice — the only thing the runtime cannot synthesize.
-/// Consumed by `ToolRegistry.init` and by tests.
-pub fn builtinRegistry() []const Tool {
-    return &.{
-        bash_tool.tool,
-        lane_tool.tool,
-    };
-}
+/// Consumed by `ToolRegistry.init` and by tests. The canonical list lives in
+/// `src/tools/registry.zig::builtin`; this is a stable re-export alias so the
+/// ~30 single-registry call sites stay source-compatible.
+pub const builtinRegistry = registry_mod.builtin;
+
+/// The comptime-resolved shell tool (`pwsh` on Windows, `bash` elsewhere) and
+/// its model-facing name — the canonical bash↔pwsh switch lives in
+/// `registry.zig::shell_tool`. Re-exported so consumers never re-derive it.
+pub const shell_tool = registry_mod.shell_tool;
+pub const shellToolName = registry_mod.shell_tool.name;
 
 pub fn run(
     gpa: std.mem.Allocator,
@@ -76,12 +80,13 @@ test "registry contains every tool exactly once" {
         const gop = try seen.getOrPut(std.testing.allocator, tool.name);
         try std.testing.expect(!gop.found_existing);
     }
+    // Always exactly one shell tool (bash-xor-pwsh) + lane, on both hosts.
     try std.testing.expectEqual(@as(usize, 2), builtinRegistry().len);
 }
 
 test "lookup finds a registered tool" {
-    const tool = lookupIn(builtinRegistry(), "bash") orelse return error.TestFailed;
-    try std.testing.expectEqualStrings("bash", tool.name);
+    const tool = lookupIn(builtinRegistry(), shellToolName) orelse return error.TestFailed;
+    try std.testing.expectEqualStrings(shellToolName, tool.name);
 }
 
 test "lookup returns null for unknown tool" {
@@ -91,5 +96,6 @@ test "lookup returns null for unknown tool" {
 test {
     _ = bash_tool;
     _ = lane_tool;
+    _ = pwsh_tool;
     _ = common;
 }

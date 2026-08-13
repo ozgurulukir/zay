@@ -110,9 +110,9 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     defer search.deinit(runtime_gpa, init.io);
 
     const system_prompt = if (load_result.config.model_selection) |ms|
-        (ms.systemPrompt() orelse @embedFile("prompts/system.md"))
+        (ms.systemPrompt() orelse defaultSystemPrompt())
     else
-        @embedFile("prompts/system.md");
+        defaultSystemPrompt();
     const agent_runtime = try tui_gpa.create(runtime.AgentRuntime);
     errdefer tui_gpa.destroy(agent_runtime);
 
@@ -241,6 +241,16 @@ fn resolveHomeDir(gpa: std.mem.Allocator, env: anytype) std.mem.Allocator.Error!
     if (env.get("HOME")) |home| return gpa.dupe(u8, home);
     if (env.get("USERPROFILE")) |home| return gpa.dupe(u8, home);
     return gpa.dupe(u8, "");
+}
+
+/// The default system prompt, selected at comptime for the host shell: the
+/// `pwsh` variant on Windows, the `bash` variant elsewhere. `system.md` on
+/// POSIX is byte-identical to before this change.
+fn defaultSystemPrompt() []const u8 {
+    return comptime if (os.is_windows)
+        @embedFile("prompts/system-windows.md")
+    else
+        @embedFile("prompts/system.md");
 }
 
 test {
