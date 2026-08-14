@@ -52,7 +52,10 @@ jobs:
           printf '%s\n' "$ZIG_DIR" >> "$GITHUB_PATH"
 
       - name: Build (ReleaseFast)
-        run: zig build install -Doptimize=ReleaseFast -Dversion=${{ github.ref_name }} --prefix dist
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: zig build install -Doptimize=ReleaseFast -Dversion="$VERSION" --prefix dist
 
       - name: Rename binary
         shell: bash
