@@ -18,9 +18,15 @@ jobs:
           - os: ubuntu-latest
             artifact: nova-linux-x86_64
             bin: nova
+            zig_url: https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+            zig_ext: .tar.xz
+            zig_dir: zig-x86_64-linux-0.16.0
           - os: windows-latest
             artifact: nova-windows-x86_64.exe
             bin: nova.exe
+            zig_url: https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip
+            zig_ext: .zip
+            zig_dir: zig-x86_64-windows-0.16.0
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -29,9 +35,21 @@ jobs:
           fetch-depth: 0 # fetch tags so the git-describe fallback works
 
       - name: Install Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.16.0
+        shell: bash
+        run: |
+          curl -fsSL "${{ matrix.zig_url }}" -o "zig${{ matrix.zig_ext }}"
+          if [ "${{ matrix.zig_ext }}" = ".zip" ]; then
+            7z x -y "zig${{ matrix.zig_ext }}"
+          else
+            tar -xJf "zig${{ matrix.zig_ext }}"
+          fi
+          ZIG_DIR="$PWD/${{ matrix.zig_dir }}"
+          # Git Bash on Windows reports MSYS paths (/c/...); convert to a
+          # Windows path (C:\...) so the PATH entry is usable by the runner.
+          if command -v cygpath >/dev/null 2>&1; then
+            ZIG_DIR="$(cygpath -w "$ZIG_DIR")"
+          fi
+          printf '%s\n' "$ZIG_DIR" >> "$GITHUB_PATH"
 
       - name: Build (ReleaseFast)
         run: zig build install -Doptimize=ReleaseFast -Dversion=${{ github.ref_name }} --prefix dist
