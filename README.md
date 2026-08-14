@@ -5,7 +5,7 @@
 **The terminal AI agent for shipping code.**
 
 [![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?style=flat-square&logo=zig&logoColor=white)](https://ziglang.org)
-[![Version](https://img.shields.io/badge/version-0.2.0--beta.1-blue?style=flat-square)](https://github.com/ozgurulukir/nova-agent/releases)
+[![Version](https://img.shields.io/github/v/release/ozgurulukir/nova-agent?style=flat-square)](https://github.com/ozgurulukir/nova-agent/releases)
 [![License](https://img.shields.io/github/license/ozgurulukir/nova-agent?style=flat-square)](LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/ozgurulukir/nova-agent?style=flat-square)](https://github.com/ozgurulukir/nova-agent/stargazers)
 
@@ -103,6 +103,7 @@ Or install to `~/.local/bin/`:
 ```bash
 zig build install -Doptimize=ReleaseFast --prefix $HOME/.local
 nova
+nova --version   # prints the embedded version (git tag / git describe / dev)
 ```
 
 > The ModernBERT bash-safety classifier is optional at runtime — bash safety falls back to a local pattern matcher when it's absent.
@@ -191,6 +192,8 @@ git clone https://github.com/ozgurulukir/nova-agent.git
 cd nova-agent
 zig build test
 ```
+
+Cutting a release? See [docs/RELEASING.md](docs/RELEASING.md) — tag `vX.Y.Z`, push, and GitHub Actions builds and attaches the binaries.
 
 ## License
 

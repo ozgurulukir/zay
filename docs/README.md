@@ -14,6 +14,7 @@ This documentation is organized as a **wiki**: each topic lives in exactly **one
 | [MCP](MCP.md) | MCP integration | Model Context Protocol — transports, protocol versions, `{env:VAR}` security, async connects, tool injection. |
 | [Patterns](PATTERNS.md) | Engineering reference | Hard-won implementation patterns for developers — TUI, type system, models.dev, config layering, reasoning, compaction, session resume, plugin internals. |
 | [Plugins](plugins/README.md) | Lua plugin development | Writing Lua plugins — quick start, permissions, API reference, examples. |
+| [Releasing](RELEASING.md) | Release process | Cutting a release — tag & push, what the GitHub Actions workflow builds and attaches, `nova --version`. |
 
 ## Where does X live?
 
@@ -26,3 +27,4 @@ This documentation is organized as a **wiki**: each topic lives in exactly **one
 | The `union(enum)` type-system discipline | [Patterns](PATTERNS.md) |
 | Session persistence / reasoning-effort lifecycle | [Patterns](PATTERNS.md) |
 | Parallel lanes, timeline, bash safety | [Architecture](ARCHITECTURE.md) |
+| How to cut a release / how `nova --version` works | [Releasing](RELEASING.md) |
