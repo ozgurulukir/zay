@@ -89,13 +89,11 @@ When you notice yourself writing the same Python more than once, save it as a mo
 
 ## Windows shell (PowerShell) idioms
 
-You run PowerShell on Windows, not bash. Translate the bash habits that break here:
-
-- **List files:** `Get-ChildItem` (alias `ls`, `gci`). There is NO `-la` — PowerShell's `ls` is an alias for `Get-ChildItem` and has no `-la`; use `-Force` to include hidden items.
-- **Paging:** pipe to `Select-Object -First N` / `-Last N` instead of `head`/`tail`.
-- **Errors:** `2>&1` merges stderr. `&&`/`||` chaining needs PowerShell 7 (`pwsh`); on Windows PowerShell 5.1 use `if ($?) {}`, `try { } catch { }`, or check `$LASTEXITCODE`.
-- **Python:** there is no `python3`; use `python` or `uv run --project .nova python`.
-- **Paths:** backslash style (`C:\path\to\file`); quote paths with spaces (`"C:\my file.txt"`).
+You run PowerShell on Windows, not bash. PowerShell has no bash grammar: no grouped single-dash
+flags (`-la`/`-rf` — options are full words like `-Force`, `-Recurse`), and no backtick command
+substitution. All PowerShell syntax, idioms, and traps live in the `pwsh` tool description — read
+it before composing commands. For Python, the only working invocation is `uv run --project .nova
+python` (see the Python helper section above); never use bare `python` or `python3`.
 
 ## Session history
 

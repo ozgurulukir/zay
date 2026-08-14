@@ -56,11 +56,28 @@ git diff --stat; if ($?) { git status --short }
 @'
 const users = getUsers();
 console.log(users);
-'@ | Set-Content -Path main.ts
+'@ | Set-Content -Encoding utf8 -Path main.ts
 
 # Edit a file or run any Python — always through uv.
 uv run --project .nova python -c "from nova import edit; edit('src/main.ts', 'old', 'new')"
 ```
+
+## bash-to-PowerShell translation
+
+PowerShell has no bash grammar — translate these habits:
+
+- **No grouped single-dash flags.** Options are full words with a single dash: `-Force`,
+  `-Recurse`. There is no `-la`/`-rf` shorthand. Use `Get-ChildItem -Force` for hidden items,
+  `Get-ChildItem -Recurse` to walk a tree.
+- **Substitution uses `$(cmd)`, not backticks.** The backtick `` ` `` is the escape character.
+  Use `$(cmd)` or `"$(cmd)"`.
+- **Quotes:** `'literal'` is verbatim; `"expands $vars and $(subs)"`. Choose deliberately.
+- **`Set-Content` encoding:** on Windows PowerShell 5.1 it defaults to the system ANSI codepage
+  (e.g. cp1254), and Nova reads files as UTF-8. Always pass `-Encoding utf8` when writing text.
+- **Aliases that shadow real commands on 5.1:** `curl`/`wget` are aliases of `Invoke-WebRequest`
+  (no `-H`), and `where` is `Where-Object`. Use `Get-Command <name>` to locate an actual binary.
+- **Shell version:** the shell is `pwsh.exe` when available, else `powershell.exe` (5.1). If
+  behavior depends on the version, check once with `$PSVersionTable.PSVersion`.
 
 ## Pitfalls
 
