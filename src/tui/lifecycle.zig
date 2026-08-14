@@ -293,6 +293,12 @@ fn decideShouldTick(root: *RootWidget) bool {
         toasts_visible;
 }
 
+/// Per-lane byte budget for drain-to-empty: events applied beyond this budget
+/// wait for the next tick. Only `response_delta`/`thinking_delta` payload lengths
+/// count toward this budget (they are the hot path); `tool_call_finished`,
+/// `delta_end`, and `tool_delta` are infrequent and small and do not count.
+const drain_byte_budget: usize = 64 * 1024;
+
 /// Drain all agent events queued on every lane's worker and project them onto
 /// the relevant lane's thread state. Returns true when any visible state changed.
 fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
@@ -306,26 +312,43 @@ fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
     for (root.app.threads.slice()) |lane| {
         const worker = if (lane.worker_context) |*wc| wc else continue;
         std.debug.assert(lane.agent != null);
-        var batch: BoundedList(*agent_mod.Agent.Event, agent_worker.event_batch_max) = .{};
-        try worker.queue.drainIntoBounded(worker.io, &batch);
-        if (batch.len() == 0) continue;
 
+        // Per-lane drain-to-empty loop: drain a bounded batch, process it,
+        // then re-drain until the queue is empty or the byte budget is hit.
+        // This lets a fast burst catch up in one tick rather than trickling
+        // across frames.
         root.app.thread = lane;
         defer root.app.thread = active;
-        for (batch.slice()) |event_ptr| {
-            defer worker.gpa.destroy(event_ptr);
-            defer event_ptr.deinit(worker.gpa);
+        var lane_bytes: usize = 0;
+        while (true) {
+            var batch: BoundedList(*agent_mod.Agent.Event, agent_worker.event_batch_max) = .{};
+            try worker.queue.drainIntoBounded(worker.io, &batch);
+            if (batch.len() == 0) break;
 
-            // A discarded (interrupted) turn's events are swallowed inside
-            // applyAgentEvent — the Turn machine refuses to project them.
-            const changed = try root.app.applyAgentEvent(event_ptr.*);
-            if (lane != active) continue; // a background lane never touches the view
-            if (changed) visible_change = true;
-            switch (event_ptr.*) {
-                .tool_call_finished => refresh_diff = true,
-                else => {},
+            for (batch.slice()) |event_ptr| {
+                defer worker.gpa.destroy(event_ptr);
+                defer event_ptr.deinit(worker.gpa);
+
+                // Count applied content bytes toward this lane's budget before
+                // the visibility gate so background lanes also respect it.
+                switch (event_ptr.*) {
+                    .response_delta, .thinking_delta => |text| lane_bytes += text.len,
+                    else => {},
+                }
+
+                // A discarded (interrupted) turn's events are swallowed inside
+                // applyAgentEvent — the Turn machine refuses to project them.
+                const changed = try root.app.applyAgentEvent(event_ptr.*);
+                if (lane != active) continue; // a background lane never touches the view
+                if (changed) visible_change = true;
+                switch (event_ptr.*) {
+                    .tool_call_finished => refresh_diff = true,
+                    else => {},
+                }
+                if (lane.turn_view.awaitingOutput()) try ensureTick(root, ctx);
             }
-            if (lane.turn_view.awaitingOutput()) try ensureTick(root, ctx);
+
+            if (lane_bytes >= drain_byte_budget) break;
         }
     }
     if (refresh_diff) {

@@ -15,6 +15,7 @@ const lua_mod = @import("lua/root.zig");
 const mcp_mod = @import("mcp/manager.zig");
 const session_mod = @import("session.zig");
 const skill_mod = @import("skill.zig");
+const stream_parser = @import("ai/stream_parser.zig");
 const text_tool_call = @import("ai/text_tool_call.zig");
 const tools = @import("tools.zig");
 const vcs = @import("vcs.zig");
@@ -505,6 +506,13 @@ pub const Agent = struct {
                 defer if (limiter) |lim| lim.release(self.io);
                 break :blk try self.client.prompt(prompt_messages, stream_context.observer());
             };
+            // End-of-stream flush: emit any trailing coalesced bytes as their
+            // respective events BEFORE the assistant message is finalized (line
+            // 543) / tool batch is dispatched (line 564). This must preserve
+            // wire order: a trailing content delta after a tool delta would
+            // otherwise be flushed by `deinit` (line 489) AFTER
+            // `tool_call_finished`, reordering the event queue.
+            try stream_context.flushPending();
             const usage = turn.usage;
             var turn_owned = true;
             defer if (turn_owned) turn.deinit(self.gpa);
@@ -719,8 +727,8 @@ pub const Agent = struct {
     }
 
     /// Per-stream context shared between the agent and the ai client's
-    /// stream observer callbacks. Holds the typed listener plus the
-    /// delta-tracking list. The `observer()` method builds a
+    /// stream observer callbacks. Holds the typed listener plus once-per-tool
+    /// delta tracking. The `observer()` method builds a
     /// `StreamObserver(*Self)` whose callbacks are comptime-baked wrappers
     /// around this `StreamContext` and its typed listener — no
     /// `@ptrCast` at the seam.
@@ -728,24 +736,64 @@ pub const Agent = struct {
         return struct {
             agent: *Agent,
             listener: L,
-            tool_delta_seen: std.ArrayList(bool) = .empty,
+            /// Fixed per-tool-slot "first delta seen" flags for the executor
+            /// bridge, replacing the old grown `ArrayList(bool)` scan with an
+            /// O(1) index. Sized by the SSOT `tool_call_array_cap`
+            /// (stream_parser.zig), which already bounds the tool slots.
+            tool_delta_seen: [stream_parser.tool_call_array_cap]bool = @splat(false),
+            /// Coalesced content bytes awaiting a flush. Multiple consecutive
+            /// `on_content` deltas accumulate here and are emitted as a single
+            /// `response_delta`, cutting per-token allocs/locks on the dominant
+            /// content path.
+            pending_content: std.ArrayList(u8) = .empty,
+            /// Coalesced reasoning bytes, flushed as a single `thinking_delta`.
+            pending_reasoning: std.ArrayList(u8) = .empty,
+            /// One-shot pre-sizing flags for the pending buffers (step #7); the
+            /// ArrayList grows on first append, so these — not `capacity == 0` —
+            /// are the reliable signal for the first-delta sizing hint.
+            content_sized: bool = false,
+            reasoning_sized: bool = false,
 
             const Self = @This();
+            /// Byte threshold at which a pending buffer flushes mid-stream.
+            /// ~2s of text at 100 tok/s, ~0.4s at 500 tok/s. A config knob adds
+            /// surface area for little gain; a comptime constant is simpler.
+            const coalesce_threshold_bytes: usize = 1024;
 
             fn deinit(self: *Self) void {
-                self.tool_delta_seen.deinit(self.agent.gpa);
+                // Belt-and-suspenders flush: frees + flushes any bytes stranded
+                // on an early-return/error path that skipped the explicit
+                // end-of-stream flush. A no-op when that flush already cleared
+                // the buffers. `deinit` returns void, so the error is swallowed;
+                // the buffers are freed regardless (OOM is fatal to the turn).
+                self.flushPending() catch {};
+                self.pending_content.deinit(self.agent.gpa);
+                self.pending_reasoning.deinit(self.agent.gpa);
             }
 
             fn toolDeltaSeen(self: *const Self, tool_index: u32) bool {
-                if (tool_index >= self.tool_delta_seen.items.len) return false;
-                return self.tool_delta_seen.items[tool_index];
+                if (tool_index >= self.tool_delta_seen.len) return false;
+                return self.tool_delta_seen[tool_index];
             }
 
-            fn markToolDeltaSeen(self: *Self, tool_index: u32) !void {
-                while (self.tool_delta_seen.items.len <= tool_index) {
-                    try self.tool_delta_seen.append(self.agent.gpa, false);
+            fn markToolDeltaSeen(self: *Self, tool_index: u32) void {
+                if (tool_index >= self.tool_delta_seen.len) return;
+                self.tool_delta_seen[tool_index] = true;
+            }
+
+            /// Emit any pending content/reasoning as a single event each and
+            /// reset the buffers, retaining capacity for the next batch.
+            fn flushPending(self: *Self) !void {
+                if (self.pending_reasoning.items.len > 0) {
+                    const owned = try self.agent.gpa.dupe(u8, self.pending_reasoning.items);
+                    try self.listener.emit(.{ .thinking_delta = owned });
+                    self.pending_reasoning.clearRetainingCapacity();
                 }
-                self.tool_delta_seen.items[tool_index] = true;
+                if (self.pending_content.items.len > 0) {
+                    const owned = try self.agent.gpa.dupe(u8, self.pending_content.items);
+                    try self.listener.emit(.{ .response_delta = owned });
+                    self.pending_content.clearRetainingCapacity();
+                }
             }
 
             fn observer(self: *Self) ai.StreamObserver(Self) {
@@ -757,14 +805,32 @@ pub const Agent = struct {
                     .on_delta_end = onDeltaEndImpl(L),
                 };
             }
+
+            fn maybeSizeContent(self: *Self, delta: []const u8) !void {
+                if (self.content_sized) return;
+                try self.pending_content.ensureTotalCapacity(self.agent.gpa, delta.len * 4);
+                self.content_sized = true;
+            }
+
+            fn maybeSizeReasoning(self: *Self, delta: []const u8) !void {
+                if (self.reasoning_sized) return;
+                try self.pending_reasoning.ensureTotalCapacity(self.agent.gpa, delta.len * 4);
+                self.reasoning_sized = true;
+            }
         };
     }
 
     fn onContentDeltaImpl(comptime L: type) *const fn (*StreamContext(L), []const u8) anyerror!void {
         const F = struct {
             fn call(ctx: *StreamContext(L), delta: []const u8) anyerror!void {
-                const owned = try ctx.agent.gpa.dupe(u8, delta);
-                try ctx.listener.emit(.{ .response_delta = owned });
+                // Preserve wire order: flush reasoning before buffering content
+                // when a cross-type sequence fires reason-before-content.
+                if (ctx.pending_reasoning.items.len > 0) try ctx.flushPending();
+                try ctx.maybeSizeContent(delta);
+                try ctx.pending_content.appendSlice(ctx.agent.gpa, delta);
+                if (ctx.pending_content.items.len >= StreamContext(L).coalesce_threshold_bytes) {
+                    try ctx.flushPending();
+                }
             }
         };
         return &F.call;
@@ -773,8 +839,13 @@ pub const Agent = struct {
     fn onReasoningDeltaImpl(comptime L: type) *const fn (*StreamContext(L), []const u8) anyerror!void {
         const F = struct {
             fn call(ctx: *StreamContext(L), delta: []const u8) anyerror!void {
-                const owned = try ctx.agent.gpa.dupe(u8, delta);
-                try ctx.listener.emit(.{ .thinking_delta = owned });
+                // Preserve wire order: flush content before buffering reasoning.
+                if (ctx.pending_content.items.len > 0) try ctx.flushPending();
+                try ctx.maybeSizeReasoning(delta);
+                try ctx.pending_reasoning.appendSlice(ctx.agent.gpa, delta);
+                if (ctx.pending_reasoning.items.len >= StreamContext(L).coalesce_threshold_bytes) {
+                    try ctx.flushPending();
+                }
             }
         };
         return &F.call;
@@ -783,7 +854,10 @@ pub const Agent = struct {
     fn onToolDeltaImpl(comptime L: type) *const fn (*StreamContext(L), ai.ToolDelta) anyerror!void {
         const F = struct {
             fn call(ctx: *StreamContext(L), delta: ai.ToolDelta) anyerror!void {
-                try ctx.markToolDeltaSeen(delta.index);
+                // Preserve wire order: flush any pending content/reasoning before
+                // the tool preview so the transcript sees text first.
+                try ctx.flushPending();
+                ctx.markToolDeltaSeen(delta.index);
                 try Agent.emitToolDelta(L, ctx.agent, ctx.listener, delta.index, delta.name, delta.arguments);
             }
         };
@@ -793,6 +867,9 @@ pub const Agent = struct {
     fn onDeltaEndImpl(comptime L: type) *const fn (*StreamContext(L)) anyerror!void {
         const F = struct {
             fn call(ctx: *StreamContext(L)) anyerror!void {
+                // delta_end stays a pure no-op for coalescing: flushing here is
+                // handled by the byte threshold, the cross-type flush, the tool
+                // delta pre-flush, and the explicit post-prompt flush.
                 try ctx.listener.emit(.delta_end);
             }
         };
@@ -1479,6 +1556,151 @@ test "streaming callbacks emit owned events" {
     try std.testing.expect(!context.toolDeltaSeen(0));
 }
 
+test "StreamContext coalesces small content deltas into one response_delta" {
+    const gpa = std.testing.allocator;
+    const openai_compatible = @import("ai/openai_compatible.zig");
+    var openai_compatible_client: openai_compatible.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+
+    const Seen = struct {
+        events: std.ArrayList(Agent.Event) = .empty,
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            for (self.events.items) |*event| event.deinit(allocator);
+            self.events.deinit(allocator);
+        }
+        fn onEvent(ctx: *@This(), event: Agent.Event) !void {
+            try ctx.events.append(std.testing.allocator, event);
+        }
+    };
+    var seen: Seen = .{};
+    defer seen.deinit(gpa);
+    const Listener = Agent.Listener(Seen);
+    var context: Agent.StreamContext(Listener) = .{
+        .agent = &agent,
+        .listener = .{ .ctx = &seen, .on_event = Seen.onEvent },
+    };
+    defer context.deinit();
+
+    // Several small content deltas followed by a delta_end. None individually
+    // reach the 1024-byte threshold, and onDeltaEnd does NOT flush — so only
+    // the final explicit flush emits a single concatenated response_delta.
+    const deltas = [_][]const u8{ "Hello ", "world ", "from ", "the ", "stream." };
+    for (deltas) |d| try Agent.onContentDeltaImpl(Listener)(&context, d);
+    try Agent.onDeltaEndImpl(Listener)(&context);
+    try std.testing.expectEqual(@as(usize, 1), seen.events.items.len);
+    try std.testing.expectEqual(.delta_end, seen.events.items[0]);
+
+    try context.flushPending();
+    try std.testing.expectEqual(@as(usize, 2), seen.events.items.len);
+    try std.testing.expectEqualStrings("Hello world from the stream.", seen.events.items[1].response_delta);
+}
+
+test "StreamContext coalescing preserves wire order across types" {
+    const gpa = std.testing.allocator;
+    const openai_compatible = @import("ai/openai_compatible.zig");
+    var openai_compatible_client: openai_compatible.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+
+    const Seen = struct {
+        events: std.ArrayList(Agent.Event) = .empty,
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            for (self.events.items) |*event| event.deinit(allocator);
+            self.events.deinit(allocator);
+        }
+        fn onEvent(ctx: *@This(), event: Agent.Event) !void {
+            try ctx.events.append(std.testing.allocator, event);
+        }
+    };
+    var seen: Seen = .{};
+    defer seen.deinit(gpa);
+    const Listener = Agent.Listener(Seen);
+    var context: Agent.StreamContext(Listener) = .{
+        .agent = &agent,
+        .listener = .{ .ctx = &seen, .on_event = Seen.onEvent },
+    };
+    defer context.deinit();
+
+    // A reasoning chunk followed by a content chunk. The cross-type flush must
+    // emit the reasoning thinking_delta first, then the content response_delta.
+    try Agent.onReasoningDeltaImpl(Listener)(&context, "thinking hard");
+    try Agent.onContentDeltaImpl(Listener)(&context, "and answering");
+    // Tool deltas flush any pending content first, then emit the tool delta.
+    try Agent.onToolDeltaImpl(Listener)(&context, .{
+        .index = 0,
+        .name = "bash",
+        .arguments = "{}",
+    });
+
+    try std.testing.expectEqual(@as(usize, 3), seen.events.items.len);
+    try std.testing.expectEqualStrings("thinking hard", seen.events.items[0].thinking_delta);
+    try std.testing.expectEqualStrings("and answering", seen.events.items[1].response_delta);
+    try std.testing.expectEqual(@as(u32, 0), seen.events.items[2].tool_delta.index);
+}
+
+test "StreamContext coalesces the real per-chunk cadence" {
+    const gpa = std.testing.allocator;
+    const openai_compatible = @import("ai/openai_compatible.zig");
+    var openai_compatible_client: openai_compatible.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+
+    const Seen = struct {
+        events: std.ArrayList(Agent.Event) = .empty,
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            for (self.events.items) |*event| event.deinit(allocator);
+            self.events.deinit(allocator);
+        }
+        fn onEvent(ctx: *@This(), event: Agent.Event) !void {
+            try ctx.events.append(std.testing.allocator, event);
+        }
+    };
+    var seen: Seen = .{};
+    defer seen.deinit(gpa);
+    const Listener = Agent.Listener(Seen);
+    var context: Agent.StreamContext(Listener) = .{
+        .agent = &agent,
+        .listener = .{ .ctx = &seen, .on_event = Seen.onEvent },
+    };
+    defer context.deinit();
+
+    // Mimic the real cadence: every small content chunk is followed by
+    // delta_end. Coalescing must yield FEWER response_delta events than chunks,
+    // flushing only at the threshold or at the explicit flush/deinit.
+    const chunks = 40;
+    for (0..chunks) |_| {
+        try Agent.onContentDeltaImpl(Listener)(&context, "word ");
+        try Agent.onDeltaEndImpl(Listener)(&context);
+    }
+    // No threshold crossed (5 bytes × 40 = 200 < 1024), so no response_delta yet.
+    const before_flush = seen.events.items.len;
+    for (seen.events.items[0..before_flush]) |ev| {
+        if (std.mem.eql(u8, @tagName(ev), "response_delta")) return error.TestFailed;
+    }
+
+    try context.flushPending();
+    const response_delta_count = blk: {
+        var count: usize = 0;
+        for (seen.events.items[before_flush..]) |ev| {
+            switch (ev) {
+                .response_delta => count += 1,
+                else => {},
+            }
+        }
+        break :blk count;
+    };
+    // Exactly one response_delta for the whole run — fewer than the 40 chunks.
+    try std.testing.expectEqual(@as(usize, 1), response_delta_count);
+    try std.testing.expectEqualStrings("word " ** chunks, seen.events.items[seen.events.items.len - 1].response_delta);
+}
+
 test "stream callbacks do not double-free when the listener returns an error" {
     const gpa = std.testing.allocator;
     const openai_compatible = @import("ai/openai_compatible.zig");
@@ -1507,12 +1729,21 @@ test "stream callbacks do not double-free when the listener returns an error" {
     };
     defer context.deinit();
 
-    // Each callback must propagate the listener's error without double-freeing
-    // the owned slice it passed into `emit`. Before the fix, the `errdefer
-    // gpa.free(owned)` in the callback raced with `postAgentEvent`'s own
-    // `errdefer event.deinit`, crashing with SIGABRT.
-    try std.testing.expectError(error.TestFailure, Agent.onContentDeltaImpl(Listener)(&context, "delta"));
+    // Content deltas are coalesced — they don't emit until flushed. Build up
+    // some pending content, then trigger a cross-type flush via reasoning
+    // delta, which must propagate the listener's error without double-freeing.
+    try Agent.onContentDeltaImpl(Listener)(&context, "delta");
+    // The cross-type flush (pending_content -> response_delta) hits the
+    // failing listener, which frees the owned slice and returns an error.
+    // The callback must propagate the error without a double-free. The
+    // buffer is left intact (flushPending clears only on success), so a
+    // subsequent flush also fails — which is correct: the caller should
+    // either handle the error or abort the stream.
     try std.testing.expectError(error.TestFailure, Agent.onReasoningDeltaImpl(Listener)(&context, "reasoning"));
+    try std.testing.expectError(error.TestFailure, context.flushPending());
+
+    // emitToolDelta emits directly (no coalescing), so it propagates the
+    // listener's error without double-freeing the owned name/arguments.
     try std.testing.expectError(error.TestFailure, Agent.emitToolDelta(Listener, &agent, context.listener, 0, "name", "args"));
     try std.testing.expectError(error.TestFailure, Agent.emitToolCallFinished(Listener, &agent, context.listener, 0, "id", "name", "label", null, "body", .text, null, false));
 }

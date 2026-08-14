@@ -12,7 +12,12 @@ const CountingAllocator = @import("counting_allocator").CountingAllocator;
 /// into a long-lived cache. Shared with the message widget so the row-counting
 /// path gates on exactly the same threshold the render path uses — they must
 /// stay consistent or ListView rows desync from rendered content.
-pub const render_cache_max_bytes: usize = 64 * 1024;
+///
+/// Raised 64→256 KiB (4×) so long streaming answers keep their stable-prefix
+/// cache instead of re-parsing the whole body every redraw frame. The
+/// Incremental cache holds owned stabilized segments which scale fine to this
+/// size for a single active message.
+pub const render_cache_max_bytes: usize = 256 * 1024;
 
 pub fn messageRowsCached(message: *transcript_mod.Message, width: u16) u16 {
     const cache = message.rowCachePtr();

@@ -16,7 +16,7 @@ const Scanner = std.json.Scanner;
 /// Hard upper bound for fixed-size remap/index arrays in ToolCallStream
 /// and ChunkChange. The runtime-configurable gate is `max_parallel_tool_calls`
 /// in ai.Config (default 16); this cap just sizes the stack arrays.
-const tool_call_array_cap: u32 = 64;
+pub const tool_call_array_cap: u32 = 64;
 
 pub fn sanitizeToolArguments(raw: []const u8) []const u8 {
     var trimmed = std.mem.trim(u8, raw, " \t\r\n");
@@ -129,6 +129,12 @@ pub fn readStream(
     defer content.deinit(gpa);
     var reasoning: std.ArrayList(u8) = .empty;
     defer reasoning.deinit(gpa);
+    // Pre-size the body buffers from the first delta as a sizing hint, so long
+    // generations (100s of KB) don't realloc repeatedly during the stream.
+    // `appendStringValue` grew the ArrayList on that first delta, so the flags
+    // (not `capacity == 0`) are the reliable one-shot signal.
+    var content_sized: bool = false;
+    var reasoning_sized: bool = false;
     var stream: ToolCallStream = .{ .max_calls = max_calls, .model = model };
     defer stream.deinit(gpa);
 
@@ -141,6 +147,14 @@ pub fn readStream(
         defer gpa.free(data);
         const change = try parseStreamChunk(gpa, data, &content, &reasoning, &stream);
         if (change.usage) |chunk_usage| usage = chunk_usage;
+        if (!content_sized and content.items.len > 0) {
+            try content.ensureTotalCapacity(gpa, content.items.len * 4);
+            content_sized = true;
+        }
+        if (!reasoning_sized and reasoning.items.len > 0) {
+            try reasoning.ensureTotalCapacity(gpa, reasoning.items.len * 4);
+            reasoning_sized = true;
+        }
         try applyChunkCallbacks(change, content.items, reasoning.items, stream.builders.items, observer);
     }
 
