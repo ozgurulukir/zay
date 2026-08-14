@@ -237,15 +237,20 @@ pub fn writeRequestPayload(out: *std.Io.Writer, config: ai.Config, responses_con
             // clients consistent so a provider switch never changes the effort
             // semantics unexpectedly.
             const wire_label = openai_compatible.wireEffortLabel(config.wire_dialect, effort);
-            try out.writeAll("\"effort\":");
-            try std.json.Stringify.value(wire_label orelse effort.label(), .{}, out);
-            wrote = true;
+            if (wire_label) |label| {
+                try out.writeAll("\"effort\":");
+                try std.json.Stringify.value(label, .{}, out);
+                wrote = true;
+            }
         }
         if (value.summary) |summary| {
             if (wrote) try out.writeByte(',');
             try out.writeAll("\"summary\":");
             try std.json.Stringify.value(summary.label(), .{}, out);
         }
+        // When effort is `.default` and summary is null, this object is empty
+        // ("reasoning":{}). That is expected: the include array below is the
+        // only reason the reasoning block is emitted at all.
         try out.writeAll("},\"include\":[\"reasoning.encrypted_content\"]");
     }
     try out.writeByte('}');
@@ -884,6 +889,41 @@ test "writeRequestPayload emits reasoning effort none" {
     try writeRequestPayload(&payload.writer, config, .{}, &.{}, "[]");
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"none\"}") != null);
+}
+
+test "writeRequestPayload omits reasoning effort when set to default" {
+    const gpa = std.testing.allocator;
+    const config: ai.Config = .{
+        .base_url = "",
+        .api_key = "",
+        .model = "gpt-test",
+        .session_id = "",
+        .system_prompt = "",
+        .reasoning = .{ .effort = .default, .summary = null },
+    };
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(&payload.writer, config, .{}, &.{}, "[]");
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\"") == null);
+}
+
+test "writeRequestPayload emits reasoning summary even with default effort (Responses API)" {
+    const gpa = std.testing.allocator;
+    const config: ai.Config = .{
+        .base_url = "",
+        .api_key = "",
+        .model = "gpt-test",
+        .session_id = "",
+        .system_prompt = "",
+        .reasoning = .{ .effort = .default, .summary = .detailed },
+    };
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(&payload.writer, config, .{}, &.{}, "[]");
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"summary\":\"detailed\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "effort") == null);
 }
 
 test "writeRequestPayload omits prompt_cache_key when no session id is set" {

@@ -26,6 +26,7 @@ pub const Op = enum {
     cancel,
     await,
     steer,
+    delete,
 };
 
 /// A lane operation posted by a worker. String fields are owned by the

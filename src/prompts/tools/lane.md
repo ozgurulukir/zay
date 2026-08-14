@@ -16,6 +16,7 @@ Every call takes `command` (always required) naming the operation. Which other a
 | `cancel` | `lane` | stop a running worker lane immediately |
 | `await` | `lane` | block until the worker lane is done (or resolves once if it stalls — no output for 3+ min), then return its transcript |
 | `steer` | `lane`, `steer` | inject a short message into a running worker mid-turn |
+| `delete` | `lane` | delete an idle or parked lane entirely (worktree + branch) without merging |
 
 The lane id always goes in the `lane` field — `lane list` prints the hex id (e.g. `e1e94861c257`) for each open lane. This tool has no `id` parameter.
 
@@ -33,11 +34,12 @@ Example — spawn a worker: `{"command":"spawn","task":"Review the diff in PR #5
 - `lane await` — block until the worker lane is done, then return its transcript. Use it when your next step depends on the worker's result. If the worker produces nothing for 3+ minutes the wait resolves once with a stall notice so you can `lane cancel` or `lane steer` instead of hanging.
 - `lane cancel` — stop a running worker lane immediately.
 - `lane steer` — inject a short message into a running worker mid-turn (e.g. "keep it small", "use the existing tests").
+- `lane delete` — completely discard an idle or parked lane and its worktree without merging it. Use this when a spawned worker failed and you do not want to keep its work.
 
 ## Rules
 
-- **Only the driver lane may `spawn`/`enter`/`merge`/`create`/`cancel`/`await`/`steer`.** If you are a spawned worker, you get `list`/`read` only — do your task and hand back a summary; never open lanes yourself.
-- **Clean up every lane you spawn.** When a worker finishes — or fails — `lane read` its result, then fold it back with `lane merge`. A completion message that says **FAILED** means the worker did not finish: read the reason and salvage what's useful, but never leave the lane parked — parked lanes still count toward the 4-lane grid.
+- **Only the driver lane may `spawn`/`enter`/`merge`/`create`/`cancel`/`await`/`steer`/`delete`.** If you are a spawned worker, you get `list`/`read` only — do your task and hand back a summary; never open lanes yourself.
+- **Clean up every lane you spawn.** When a worker finishes — or fails — `lane read` its result, then fold it back with `lane merge`. A completion message that says **FAILED** means the worker did not finish: read the reason and salvage what's useful, then fold it back with `lane merge` if safe, or discard it entirely with `lane delete`. Never leave the lane parked — parked lanes still count toward the 4-lane grid.
 - **Never run `git worktree add`.** Lanes exist only via `lane create`/`lane spawn`; a worktree Nova does not track is invisible to merge and cleanup.
 - **Max 4 lanes total — the driver's main lane plus 3 workers** (the split grid is 2×2). Fan out deliberately — one lane per independent unit, not a scattergun.
 - **`lane merge` refuses while you are entered** in the target lane — `lane leave` first (the tool batch's working directory is still rooted there).

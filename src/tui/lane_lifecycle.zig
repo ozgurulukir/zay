@@ -721,6 +721,7 @@ fn dispatchLaneOp(app: *App, req: *const lane_bridge.Request, requester_lane: ?*
         .cancel => cancelLaneOp(app, req),
         .await => awaitLaneOp(app, req),
         .steer => steerLaneOp(app, req),
+        .delete => deleteLaneOp(app, req),
     };
 }
 
@@ -1418,6 +1419,63 @@ fn steerLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     const owned = app.gpa.dupe(u8, text) catch return failResp(app.gpa, "lane: out of memory\n", .{});
     target.queued.append(app.gpa, .{ .text = owned, .steer = true }) catch app.gpa.free(owned);
     return resp(app.gpa, "Steered lane {s}: {s}\n", .{ id, text }, id, null);
+}
+
+/// `lane delete {lane}`: delete an idle or parked lane entirely (worktree + branch).
+/// Cannot delete the primary lane or a running lane.
+fn deleteLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
+    const id = req.lane orelse return failResp(app.gpa, "lane: delete needs a `lane` field — the hex id shown by `lane list`\n", .{});
+
+    if (resolveLane(app, id)) |target| {
+        // H5b: the leave-first check runs BEFORE the running check, matching
+        // mergeLaneOp. Deleting (like merging) frees the lane's worktree, and
+        // the current tool batch's executor is still rooted in it.
+        if (driverWorkspace(app)) |ws| {
+            if (lanes_util.workingLaneOf(target)) |tw| {
+                if (std.mem.eql(u8, ws, tw.path)) {
+                    return failResp(app.gpa, "lane: call `lane leave` first — deleting frees lane {s}'s worktree, and the current tool batch is still rooted in it.\n", .{id});
+                }
+            }
+        }
+        if (target.turn.isActive()) return failResp(app.gpa, "lane: lane {s} is still running — cancel or wait before deleting\n", .{id});
+        const index = indexOfLane(app, target) orelse return failResp(app.gpa, "lane: lane {s} vanished\n", .{id});
+        const working = lanes_util.workingLaneOf(target) orelse return failResp(app.gpa, "lane: cannot delete the primary lane\n", .{});
+        // The primary refusal below is unreachable via a normal request:
+        // `resolveLane` matches only working lanes (the primary has no
+        // worktree, so `laneIdOf`/`resolveLane` return null for it), so a
+        // delete posted with the primary's id falls through to the parked-lane
+        // path and reports "no open or parked lane". Kept as defense in depth.
+        clearWorkspaceBorrowForPath(app, working.path) catch |err| {
+            return failResp(app.gpa, "lane delete failed: {s}\n", .{lanes_util.laneErrorText(err)});
+        };
+        abandonLane(app, @intCast(index)) catch |err| {
+            return failResp(app.gpa, "lane delete failed: {s}\n", .{lanes_util.laneErrorText(err)});
+        };
+        if (app.threads.len() < 2) app.split = false;
+        return resp(app.gpa, "Deleted open lane {s}.\n", .{id}, null, null);
+    }
+
+    const repo = app.repoRoot() orelse return failResp(app.gpa, "lane: no active runtime\n", .{});
+    const parked = collectParkedLanes(app, repo) catch return failResp(app.gpa, "lane: failed to list parked lanes\n", .{});
+    defer vcs.freeWorktreeList(app.gpa, parked);
+
+    for (parked) |entry| {
+        if (std.mem.eql(u8, lanes_util.lastPathSegment(entry.path), id)) {
+            if (driverWorkspace(app)) |ws| {
+                if (std.mem.eql(u8, ws, entry.path)) {
+                    return failResp(app.gpa, "lane: call `lane leave` first — deleting frees lane {s}'s worktree, and the current tool batch is still rooted in it.\n", .{id});
+                }
+            }
+            clearWorkspaceBorrowForPath(app, entry.path) catch |err| {
+                return failResp(app.gpa, "lane delete failed: {s}\n", .{lanes_util.laneErrorText(err)});
+            };
+            vcs.worktreeRemove(app.gpa, app.io, repo, entry.path) catch {};
+            vcs.deleteBranch(app.gpa, app.io, repo, entry.branch) catch {};
+            return resp(app.gpa, "Deleted parked lane {s}.\n", .{id}, null, null);
+        }
+    }
+
+    return failResp(app.gpa, "lane: no open or parked lane with id '{s}' found\n", .{id});
 }
 
 // ---------------------------------------------------------------------------
@@ -2971,4 +3029,167 @@ test "B2: a refused close does not prematurely suppress the completion" {
     // spawner got no notice.
     try std.testing.expect(!worker.completion_delivered);
     try std.testing.expect(!transcriptContains(spawner, "discarded"));
+}
+
+test "deleteLaneOp deletes open idle lane" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    _ = try addFakeWorkingLane(gpa, &app, "deleteme");
+    try std.testing.expectEqual(@as(usize, 2), app.threads.len());
+
+    var req = lane_bridge.Request{ .op = .delete, .lane = try gpa.dupe(u8, "deleteme"), .requester = &agent };
+    defer req.deinit(gpa);
+    const result = postAndService(io, &app, &req);
+    defer app.gpa.free(result.text);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "Deleted open lane deleteme") != null);
+    try std.testing.expectEqual(@as(usize, 1), app.threads.len());
+}
+
+test "deleteLaneOp refuses deleting a running lane" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    // A live lane with an active turn — the "still running" refusal shape.
+    const lane = try addFakeWorkingLane(gpa, &app, "busy");
+    const branch = lane.engine.idle.working.branch;
+    const path = lane.engine.idle.working.path;
+    lane.engine = .{ .live = .{ .lane = .{ .working = .{ .branch = branch, .path = path } }, .runtime = undefined, .owns = false } };
+    lane.turn.submit(); // mark active
+    try std.testing.expectEqual(@as(usize, 2), app.threads.len());
+
+    var req = lane_bridge.Request{ .op = .delete, .lane = try gpa.dupe(u8, "busy"), .requester = &agent };
+    defer req.deinit(gpa);
+    const result = postAndService(io, &app, &req);
+    defer app.gpa.free(result.text);
+    try std.testing.expect(result.code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "still running") != null);
+    try std.testing.expectEqual(@as(usize, 2), app.threads.len()); // unchanged
+}
+
+test "deleteLaneOp cannot delete the primary lane (funnels to not-found)" {
+    // The primary-lane refusal in deleteLaneOp is unreachable via a normal
+    // request: `resolveLane` matches only working lanes (the primary has no
+    // worktree, so `laneIdOf`/`resolveLane` return null for it) and the
+    // request falls through to the parked-lane not-found path. This needs a
+    // live primary runtime (repoRoot non-null) to reach that message, hence the
+    // git fixture. The upshot is asserted: the primary is undeletable.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
+    var fx = try GitFixture.init(gpa, io);
+    defer fx.deinit(gpa);
+    const app = &fx.app;
+    const primary_id: []const u8 = "0"; // the id `lane list` shows for a worktree-less primary
+
+    var req = lane_bridge.Request{ .op = .delete, .lane = try gpa.dupe(u8, primary_id), .requester = &fx.runtime.agent };
+    defer req.deinit(gpa);
+    const result = postAndService(io, app, &req);
+    defer app.gpa.free(result.text);
+    try std.testing.expect(result.code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "no open or parked lane with id") != null);
+    try std.testing.expectEqual(@as(usize, 1), app.threads.len()); // primary intact
+}
+
+test "deleteLaneOp refuses a delete while the driver is entered in the target" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    const lane = try addFakeWorkingLane(gpa, &app, "entered");
+    const path = lanes_util.workingLaneOf(lane).?.path;
+    app.threads.slice()[0].agent.?.setWorkspace(path); // simulate `lane enter`
+    defer app.threads.slice()[0].agent.?.setWorkspace(null); // drop the borrow
+
+    var req = lane_bridge.Request{ .op = .delete, .lane = try gpa.dupe(u8, "entered"), .requester = &agent };
+    defer req.deinit(gpa);
+    const result = postAndService(io, &app, &req);
+    defer app.gpa.free(result.text);
+    try std.testing.expect(result.code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "lane leave") != null);
+    try std.testing.expectEqual(@as(usize, 2), app.threads.len()); // unchanged
+}
+
+test "deleteLaneOp deletes a parked lane" {
+    // A nova/* worktree on disk with no open lane is a parked lane; delete
+    // must remove its worktree + branch and report success. Needs a live
+    // primary runtime (repoRoot) to reach the parked-lane path.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
+    var fx = try GitFixture.init(gpa, io);
+    defer fx.deinit(gpa);
+    const app = &fx.app;
+
+    const test_cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(test_cwd);
+    const parked_path = try std.fs.path.join(gpa, &.{ test_cwd, ".zig-cache", "tmp", "delete-parked-lane" });
+    defer gpa.free(parked_path);
+    std.Io.Dir.cwd().deleteTree(io, parked_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, parked_path) catch {};
+    try gitOk(gpa, io, fx.repo, &.{ "worktree", "add", "-b", "nova/parked", parked_path });
+
+    var req = lane_bridge.Request{ .op = .delete, .lane = try gpa.dupe(u8, "delete-parked-lane"), .requester = &fx.runtime.agent };
+    defer req.deinit(gpa);
+    const result = postAndService(io, app, &req);
+    defer app.gpa.free(result.text);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "Deleted parked lane") != null);
+}
+
+test "deleteLaneOp reports not-found for a non-existent id" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
+    var fx = try GitFixture.init(gpa, io);
+    defer fx.deinit(gpa);
+    const app = &fx.app;
+
+    var req = lane_bridge.Request{ .op = .delete, .lane = try gpa.dupe(u8, "nope"), .requester = &fx.runtime.agent };
+    defer req.deinit(gpa);
+    const result = postAndService(io, app, &req);
+    defer app.gpa.free(result.text);
+    try std.testing.expect(result.code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "no open or parked lane with id") != null);
+    try std.testing.expectEqual(@as(usize, 1), app.threads.len()); // nothing removed
+}
+
+test "deleteLaneOp discards a live worker's idle-turn completion (B2)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    const spawner = app.threads.slice()[0]; // generation 1
+    // A live worker with an IDLE turn (never submitted) and a transcript
+    // message — the guard at discardUndeliveredCompletion's `finished` treats
+    // this as finished, so the delete path must notify the spawner.
+    const worker = try addFakeWorkingLane(gpa, &app, "worker");
+    const branch = worker.engine.idle.working.branch;
+    const path = worker.engine.idle.working.path;
+    worker.engine = .{ .live = .{ .lane = .{ .working = .{ .branch = branch, .path = path } }, .runtime = undefined, .owns = false } };
+    worker.spawned_by_generation = spawner.generation;
+    _ = try worker.transcript.append(gpa, .agent, "agent", "worker result");
+
+    var req = lane_bridge.Request{ .op = .delete, .lane = try gpa.dupe(u8, "worker"), .requester = &agent };
+    defer req.deinit(gpa);
+    const result = postAndService(io, &app, &req);
+    defer app.gpa.free(result.text);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+    try std.testing.expect(transcriptContains(spawner, "result discarded"));
+    try std.testing.expectEqual(@as(usize, 1), app.threads.len()); // lane removed
 }

@@ -137,16 +137,16 @@ fn todayUtc(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
 /// assistant batch, which `takeToolResults` appends contiguously. The count
 /// increments only at the end of a run, so a parallel batch is never split:
 /// the `(keep+1)`-th run is pruned whole.
-fn computeCutoff(messages: []const ai.ChatMessage, keep_recent_tool_turns: u32) usize {
+fn computeCutoff(messages: []const ai.ChatMessage, keep_recent_tool_turns: u32) ?usize {
     var tool_turns_seen: u32 = 0;
-    var cutoff_index: usize = messages.len;
+    var cutoff_index: ?usize = null;
     var i: usize = messages.len;
     while (i > 0) {
         i -= 1;
         if (messages[i] == .tool) {
             const run_end = i + 1 >= messages.len or messages[i + 1] != .tool;
             if (run_end) tool_turns_seen += 1;
-            if (tool_turns_seen > keep_recent_tool_turns and cutoff_index == messages.len) {
+            if (tool_turns_seen > keep_recent_tool_turns and cutoff_index == null) {
                 cutoff_index = i + 1; // Everything before cutoff_index is historical
             }
         }
@@ -169,7 +169,7 @@ pub fn pruneHistoricalToolResultsViews(
     historical_tool_cap_bytes: u32,
 ) ![]ai.MessageView {
     const views = try gpa.alloc(ai.MessageView, messages.len);
-    const cutoff_index = computeCutoff(messages, keep_recent_tool_turns);
+    const maybe_cutoff = computeCutoff(messages, keep_recent_tool_turns);
     var built: usize = 0;
     errdefer {
         for (views[0..built]) |*view| switch (view.*) {
@@ -178,9 +178,10 @@ pub fn pruneHistoricalToolResultsViews(
         };
         gpa.free(views);
     }
-    // When `cutoff_index == messages.len` no tool turn is historical, so every
+    // When `maybe_cutoff == null` no tool turn is historical, so every
     // message is borrowed in full — pruning only applies below a real cutoff.
-    const pruning_active = cutoff_index < messages.len;
+    const pruning_active = maybe_cutoff != null;
+    const cutoff_index = maybe_cutoff orelse 0;
     for (messages, 0..) |*msg, idx| {
         if (pruning_active and idx < cutoff_index and msg.* == .tool) {
             views[idx] = .{ .owned = try pruneSingleToolMessage(gpa, msg.*, historical_tool_cap_bytes) };
@@ -216,8 +217,9 @@ pub fn estimatePrunedTokensRange(
     historical_tool_cap_bytes: u32,
 ) u32 {
     assert(from_index <= messages.len);
-    const cutoff_index = computeCutoff(messages, keep_recent_tool_turns);
-    const pruning_active = cutoff_index < messages.len;
+    const maybe_cutoff = computeCutoff(messages, keep_recent_tool_turns);
+    const pruning_active = maybe_cutoff != null;
+    const cutoff_index = maybe_cutoff orelse 0;
     var total: u32 = 0;
     var index: usize = from_index;
     while (index < messages.len) : (index += 1) {
@@ -710,6 +712,21 @@ test "computeCutoff counts a contiguous tool batch as one turn" {
     defer freePrunedViews(gpa, pruned);
     // The whole batch counts as one turn, so nothing is pruned.
     for (1..9) |k| try std.testing.expect(pruned[k] == .borrowed);
+}
+
+test "computeCutoff with keep=0 prunes trailing tool message" {
+    const gpa = std.testing.allocator;
+
+    var messages: [2]ai.ChatMessage = undefined;
+    messages[0] = try makeTextMessage(gpa, .user, "hello");
+    messages[1] = try makeToolMessage(gpa, "c", "x" ** 2000);
+    defer for (&messages) |*m| m.deinit(gpa);
+
+    const pruned = try pruneHistoricalToolResultsViews(gpa, &messages, 0, 100);
+    defer freePrunedViews(gpa, pruned);
+
+    try std.testing.expect(pruned[0] == .borrowed);
+    try std.testing.expect(pruned[1] == .owned);
 }
 
 test "pruneHistoricalToolResultsViews borrows unchanged messages without copying" {

@@ -30,9 +30,9 @@ pub const tool: common.Tool = .{
             .{
                 .name = "command",
                 .kind = .string,
-                .description = "The lane operation to perform. Always required — one of: list, create, enter, leave, merge, spawn, read, cancel, await, steer.",
+                .description = "The lane operation to perform. Always required — one of: list, create, enter, leave, merge, spawn, read, cancel, await, steer, delete.",
                 .required = true,
-                .enum_values = &.{ "list", "create", "enter", "leave", "merge", "spawn", "read", "cancel", "await", "steer" },
+                .enum_values = &.{ "list", "create", "enter", "leave", "merge", "spawn", "read", "cancel", "await", "steer", "delete" },
             },
             .{
                 .name = "purpose",
@@ -51,7 +51,7 @@ pub const tool: common.Tool = .{
             .{
                 .name = "lane",
                 .kind = .string,
-                .description = "Lane id (the hex id shown by `lane list`). Required for `enter`, `leave`, `merge`, `read`, `cancel`, `await`, `steer`; optional for `spawn` (targets an existing idle lane to reuse its worktree — omit to create a fresh one). Unused for `list`/`create`.",
+                .description = "Lane id (the hex id shown by `lane list`). Required for `enter`, `leave`, `merge`, `read`, `cancel`, `await`, `steer`, `delete`; optional for `spawn` (targets an existing idle lane to reuse its worktree — omit to create a fresh one). Unused for `list`/`create`.",
                 .required = false,
                 .nullable = true,
             },
@@ -137,7 +137,7 @@ fn parseError(gpa: std.mem.Allocator, err: ParseError) common.Error!common.Outpu
         error.InvalidAction => common.failFmt(
             gpa,
             1,
-            "lane: invalid arguments — `command` must be one of: list, create, enter, leave, merge, spawn, read, cancel, await, steer\n",
+            "lane: invalid arguments — `command` must be one of: list, create, enter, leave, merge, spawn, read, cancel, await, steer, delete\n",
             .{},
         ),
         // Models learn the field name from output + schema; a misspelled `id`
