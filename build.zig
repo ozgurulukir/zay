@@ -88,6 +88,20 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Version string embedded into the binary, surfaced by `nova --version` and
+    // the settings panel. SSOT is the git tag: CI passes `-Dversion` explicitly on
+    // release builds; local builds fall back to `git describe --tags --always`
+    // (or "dev" when git is unavailable / not a repo). Exposed to every file in
+    // the `nova` module as `@import("build").version`.
+    const version = b.option([]const u8, "version", "Version string to embed (default: git describe or 'dev')") orelse blk: {
+        var code: u8 = undefined;
+        const raw = b.runAllowFail(&.{ "git", "describe", "--tags", "--always", "--dirty" }, &code, .ignore) catch break :blk "dev";
+        break :blk std.mem.trim(u8, raw, " \n\r\t");
+    };
+    const version_options = b.addOptions();
+    version_options.addOption([]const u8, "version", version);
+    mod.addOptions("build", version_options);
+
     mod.link_libc = true;
     // C UB sanitizer for Debug builds: traps at the exact instruction on
     // undefined behavior in sqlite3.c / lua, giving a precise crash site

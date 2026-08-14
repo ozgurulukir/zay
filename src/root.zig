@@ -39,6 +39,12 @@ pub const tui = @import("tui.zig");
 pub const thread = @import("tui/thread.zig");
 pub const toast = @import("tui/toast.zig");
 
+/// Build-time version, embedded from the git tag via `-Dversion` in build.zig
+/// (fallback: `git describe` / `dev`). Convenience alias for the `--version`
+/// handler; the settings panel reads `@import("build").version` directly. Both
+/// resolve to the same single build option, so they can never diverge.
+pub const build_version = @import("build").version;
+
 /// Logger → toast-bus adapter. Installed as the logger's `toast_sink` so warn+
 /// messages surface as TUI toasts instead of tearing the frame on stderr. The
 /// bus's `initialized` guard makes this a no-op before `tui.run` inits it.
@@ -52,6 +58,7 @@ fn toastSink(level: std.log.Level, msg: []const u8) void {
 }
 
 pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
+    if (try handleVersionFlag(init, gpa)) return;
     @import("tools/bash_exec.zig").disablePseudoConsole();
 
     if (resolveLogPath(gpa, init.environ_map)) |log_path| {
@@ -251,6 +258,27 @@ fn defaultSystemPrompt() []const u8 {
         @embedFile("prompts/system-windows.md")
     else
         @embedFile("prompts/system.md");
+}
+
+/// Handle `nova --version`. Returns true when the flag was present and the
+/// version was printed (the caller returns immediately). Iterates args via the
+/// cross-platform `iterateAllocator` wrapper on `Args` (WTF-8 on Windows,
+/// UTF-8 elsewhere). `--version` is matched on ANY arg, so `nova some-cmd
+/// --version` also prints the version — a deliberate deviation from
+/// first-arg-only conventions (see plan note).
+fn handleVersionFlag(init: std.process.Init, gpa: std.mem.Allocator) !bool {
+    var args = try init.minimal.args.iterateAllocator(gpa);
+    defer args.deinit();
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--version")) {
+            var buf: [256]u8 = undefined;
+            var writer = std.Io.File.stdout().writer(init.io, &buf);
+            defer writer.interface.flush() catch {};
+            try writer.interface.print("nova {s}\n", .{build_version});
+            return true;
+        }
+    }
+    return false;
 }
 
 test {

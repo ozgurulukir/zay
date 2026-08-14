@@ -156,7 +156,7 @@ pub const Content = struct {
     cwd: []const u8,
     system_prompt_input: []const u8 = "",
     bash_classifier_input: []const u8 = "",
-    version_string: []const u8 = "nova",
+    version_string: []const u8 = @import("build").version,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
