@@ -107,7 +107,6 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
         // Canonical form: model_selection is the single source of truth.
         // Mirror all fields onto the target's legacy fields so the merge
         // result is self-consistent regardless of which path serialize uses.
-        target.provider = ms.provider();
         // Propagate provider_name so serialize's legacy fallback writes the
         // correct config key (e.g. "stepfun-ai-step-plan") instead of the
         // enum label ("openai_compatible").
@@ -126,7 +125,7 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
         if (ms.bashClassifierUrl()) |s| try replaceOptionalSlice(gpa, &target.bash_classifier_url, s);
     } else {
         // Legacy fields: apply individual field overrides.
-        if (updates.provider) |v| target.provider = v;
+        if (updates.provider_name) |s| try replaceOptionalSlice(gpa, &target.provider_name, s);
         if (updates.use_responses_endpoint) |v| target.use_responses_endpoint = v;
         if (updates.strict_outputs) |v| target.strict_outputs = v;
         if (updates.base_url) |s| try replaceOptionalSlice(gpa, &target.base_url, s);
@@ -185,9 +184,9 @@ pub fn syncModelSelectionFromLegacy(gpa: std.mem.Allocator, target: *Config) !vo
         // Sync fields from legacy into the typed selection. If the provider
         // enum changed, rebuild the selection with the correct variant so
         // illegal state combinations are impossible.
-        const provider = target.provider orelse return;
+        const provider = target.providerFromName() orelse return;
         const model = target.model orelse return;
-        const provider_name = if (target.provider_name) |s| s else provider.label();
+        const provider_name = target.provider_name.?;
         const base_url = if (target.base_url) |s| s else "";
         const api_key = if (target.api_key) |s| s else "";
         const new_selection: ModelSelection = if (provider == .openai_compatible) .{
@@ -219,6 +218,7 @@ fn applyMcpServerOverlay(gpa: std.mem.Allocator, target: *Config, updates: McpSe
     for (target.mcp_servers, 0..) |*server, index| {
         if (!std.mem.eql(u8, server.name, updates.name)) continue;
         server.enabled = updates.enabled;
+        server.request_timeout_ms = updates.request_timeout_ms;
         server.transport = switch (updates.transport) {
             .stdio => |t| blk: {
                 var args = try gpa.alloc([]u8, t.args.len);
@@ -340,9 +340,9 @@ fn hydrateActiveModel(gpa: std.mem.Allocator, config: *Config) !void {
         }
         return;
     }
-    const provider = config.provider orelse return;
+    const provider = config.providerFromName() orelse return;
     if (config.model == null) return;
-    const name = config.provider_name orelse provider.label();
+    const name = config.provider_name.?;
     for (config.providers) |entry| {
         if (!std.mem.eql(u8, entry.name, name)) continue;
         try hydrateFromProviderEntry(gpa, config, entry);
@@ -503,7 +503,6 @@ fn parseObject(
     const model_str = stringFieldCompat(value, "defaultModel", "model");
     if (model_str) |s| {
         if (parseModelSelection(gpa, s)) |selection| {
-            out.provider = selection.provider;
             out.provider_name = selection.provider_name;
             out.model = selection.model;
         } else |err| {
@@ -555,10 +554,10 @@ fn parseObject(
     // are present. Missing any of them leaves it null — the legacy
     // optional fields stay so existing callers keep working until
     // they migrate to `model_selection`.
-    if (out.provider != null and out.model != null and
+    if (out.provider_name != null and out.model != null and
         out.base_url != null and out.api_key != null)
     {
-        const provider = out.provider.?;
+        const provider = providers_by_name.get(out.provider_name.?) orelse .openai_compatible;
         const model = out.model.?; // ownership moves; clear the legacy field
         if (provider == .openai_compatible) {
             out.model_selection = .{
@@ -584,7 +583,6 @@ fn parseObject(
                 },
             };
         }
-        out.provider = null;
         out.provider_name = null;
         out.model = null;
         out.base_url = null;
@@ -737,6 +735,7 @@ fn parseMcpServers(gpa: std.mem.Allocator, value: std.json.Value) ![]McpServerCo
         var server: McpServerConfig = undefined;
         server.name = try gpa.dupe(u8, entry.key_ptr.*);
         server.enabled = boolField(val, "enabled") orelse true;
+        server.request_timeout_ms = u32field(val, "requestTimeoutMs");
         errdefer server.deinit(gpa);
 
         if (cmd) |c| {
@@ -897,7 +896,6 @@ fn loadEnv(
     }
     if (env.get("OPENAI_MODEL")) |raw| {
         if (parseModelSelection(gpa, raw)) |parsed| {
-            out.provider = parsed.provider;
             out.provider_name = parsed.provider_name;
             out.model = parsed.model;
         } else |_| {
@@ -1176,9 +1174,8 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
             try writer.writeAll(if (b) "true" else "false");
         }
         if (config.model) |m| {
-            if (config.provider) |provider| {
+            if (config.provider_name) |name| {
                 try writeKey(writer, "defaultModel", &wrote_any);
-                const name = config.provider_name orelse provider.label();
                 try writeModelSelection(gpa, writer, name, m.id);
             }
         }
@@ -1457,6 +1454,10 @@ fn writeMcpServer(writer: *std.Io.Writer, server: McpServerConfig) !void {
         try writeKeyNoIndent(writer, "enabled", &wrote_any);
         try writer.writeAll("false");
     }
+    if (server.request_timeout_ms) |ms| {
+        try writeKeyNoIndent(writer, "requestTimeoutMs", &wrote_any);
+        try writer.print("{d}", .{ms});
+    }
     try writer.writeByte('}');
 }
 
@@ -1653,7 +1654,7 @@ test "parseObject: minimal config" {
     defer sink.deinit(gpa);
     var cfg = try parseFile(gpa, "<test>", "{\"model\":\"ollama/llama3.1:8b\"}", &sink);
     defer cfg.deinit(gpa);
-    try std.testing.expectEqual(Provider.ollama, cfg.provider.?);
+    try std.testing.expectEqual(Provider.ollama, cfg.providerFromName().?);
     try std.testing.expectEqualStrings("llama3.1:8b", cfg.model.?.id);
     try std.testing.expectEqual(@as(usize, 0), sink.items.len);
 }
@@ -1681,7 +1682,7 @@ test "parseObject: unknown provider resolves to openai_compatible custom" {
     }
     var cfg = try parseFile(gpa, "<test>", "{\"defaultModel\":\"qwen-cloud/qwen-plus\"}", &sink);
     defer cfg.deinit(gpa);
-    try std.testing.expectEqual(Provider.openai_compatible, cfg.provider.?);
+    try std.testing.expectEqual(Provider.openai_compatible, cfg.providerFromName().?);
     try std.testing.expectEqualStrings("qwen-cloud", cfg.provider_name.?);
     try std.testing.expectEqualStrings("qwen-plus", cfg.model.?.id);
     try std.testing.expectEqual(@as(usize, 0), sink.items.len);
@@ -1696,7 +1697,7 @@ test "parseObject: invalid JSON records diagnostic" {
     }
     var cfg = try parseFile(gpa, "<test>", "not json", &sink);
     defer cfg.deinit(gpa);
-    try std.testing.expectEqual(@as(?Provider, null), cfg.provider);
+    try std.testing.expectEqual(@as(?Provider, null), cfg.providerFromName());
     try std.testing.expectEqual(@as(usize, 1), sink.items.len);
 }
 
@@ -1726,7 +1727,7 @@ test "parseMcpServers rejects a server config missing a transport" {
 test "mergeLayers: later layer overrides earlier" {
     const gpa = std.testing.allocator;
     var layer1: Config = .{
-        .provider = .openai,
+        .provider_name = try gpa.dupe(u8, "openai"),
         .base_url = try gpa.dupe(u8, "http://layer1"),
         .model = .{ .id = try gpa.dupe(u8, "m1"), .reasoning = .{ .effort = .low } },
     };
@@ -1739,7 +1740,7 @@ test "mergeLayers: later layer overrides earlier" {
     var merged = try mergeLayers(gpa, &.{ layer1, layer2 });
     defer merged.deinit(gpa);
 
-    try std.testing.expectEqual(Provider.openai, merged.provider.?);
+    try std.testing.expectEqual(Provider.openai, merged.providerFromName().?);
     try std.testing.expectEqualStrings("http://layer2", merged.base_url.?);
     try std.testing.expectEqualStrings("m1", merged.model.?.id);
     try std.testing.expectEqual(ai.ReasoningEffort.low, merged.model.?.reasoning.effort);
@@ -1774,7 +1775,7 @@ test "loadEnv: OPENAI_MODEL sets both provider and model" {
     } };
     var cfg = try loadEnv(gpa, env, &sink);
     defer cfg.deinit(gpa);
-    try std.testing.expectEqual(Provider.openai, cfg.provider.?);
+    try std.testing.expectEqual(Provider.openai, cfg.providerFromName().?);
     try std.testing.expectEqualStrings("gpt-5.5", cfg.model.?.id);
 }
 
@@ -1790,7 +1791,7 @@ test "loadEnv: malformed OPENAI_MODEL records diagnostic, does not set fields" {
     } };
     var cfg = try loadEnv(gpa, env, &sink);
     defer cfg.deinit(gpa);
-    try std.testing.expectEqual(@as(?Provider, null), cfg.provider);
+    try std.testing.expectEqual(@as(?Provider, null), cfg.providerFromName());
     try std.testing.expectEqual(@as(?Model, null), cfg.model);
     try std.testing.expectEqual(@as(usize, 1), sink.items.len);
     try std.testing.expect(sink.items[0] == .bad_env_model);
@@ -1816,7 +1817,7 @@ test "serialize: skips api_key even if present" {
     var providers = try gpa.alloc(ProviderConfig, 1);
     providers[0] = .{ .name = try gpa.dupe(u8, "openai"), .provider = .openai, .models = provider_models };
     var cfg: Config = .{
-        .provider = .openai,
+        .provider_name = try gpa.dupe(u8, "openai"),
         .api_key = try gpa.dupe(u8, "sk-should-never-appear"),
         .model = .{ .id = try gpa.dupe(u8, "gpt-5.5"), .reasoning = .{ .effort = .medium } },
         .providers = providers,
@@ -1836,7 +1837,7 @@ test "serialize: skips api_key even if present" {
 
 test "mergeLayers: later layers win for scalar fields" {
     const gpa = std.testing.allocator;
-    var global: Config = .{ .provider = .openai, .base_url = try gpa.dupe(u8, "https://global") };
+    var global: Config = .{ .provider_name = try gpa.dupe(u8, "openai"), .base_url = try gpa.dupe(u8, "https://global") };
     defer global.deinit(gpa);
     var project: Config = .{ .base_url = try gpa.dupe(u8, "https://project") };
     defer project.deinit(gpa);
@@ -1848,7 +1849,7 @@ test "mergeLayers: later layers win for scalar fields" {
     var merged = try mergeLayers(gpa, &.{ global, project, env });
     defer merged.deinit(gpa);
 
-    try std.testing.expectEqual(Provider.openai, merged.provider.?);
+    try std.testing.expectEqual(Provider.openai, merged.providerFromName().?);
     try std.testing.expectEqualStrings("https://env", merged.base_url.?);
 }
 
@@ -1862,7 +1863,7 @@ test "mergeLayers: active model is hydrated from the merged provider list" {
     var global: Config = .{ .providers = providers };
     defer global.deinit(gpa);
     // ...the active model selection comes from another, carrying no reasoning.
-    var project: Config = .{ .provider = .openai, .model = .{ .id = try gpa.dupe(u8, "gpt-5.5") } };
+    var project: Config = .{ .provider_name = try gpa.dupe(u8, "openai"), .model = .{ .id = try gpa.dupe(u8, "gpt-5.5") } };
     defer project.deinit(gpa);
 
     var merged = try mergeLayers(gpa, &.{ global, project });
@@ -1886,7 +1887,7 @@ test "serialize then parse roundtrips" {
         .models = provider_models,
     };
     var original: Config = .{
-        .provider = .ollama,
+        .provider_name = try gpa.dupe(u8, "ollama"),
         .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
         .use_responses_endpoint = false,
         .strict_outputs = true,
@@ -1908,7 +1909,7 @@ test "serialize then parse roundtrips" {
     var roundtrip = try mergeLayers(gpa, &.{parsed});
     defer roundtrip.deinit(gpa);
 
-    try std.testing.expectEqual(Provider.ollama, roundtrip.provider.?);
+    try std.testing.expectEqual(Provider.ollama, roundtrip.providerFromName().?);
     try std.testing.expectEqualStrings("http://localhost:11434/v1", roundtrip.base_url.?);
     try std.testing.expectEqual(false, roundtrip.use_responses_endpoint.?);
     try std.testing.expectEqual(true, roundtrip.strict_outputs.?);
@@ -1981,14 +1982,14 @@ test "config.load with missing files returns default config with version 1 and z
     defer res.deinit(gpa);
 
     try std.testing.expectEqual(@as(?[]u8, null), res.config.version);
-    try std.testing.expectEqual(@as(?Provider, null), res.config.provider);
+    try std.testing.expectEqual(@as(?Provider, null), res.config.providerFromName());
     try std.testing.expectEqual(@as(usize, 0), res.diagnostics.len);
 }
 
 test "serialize outputs semver version and camelCase 2-space indented JSON" {
     const gpa = std.testing.allocator;
     var cfg: Config = .{
-        .provider = .openai,
+        .provider_name = try gpa.dupe(u8, "openai"),
         .use_responses_endpoint = true,
     };
     defer cfg.deinit(gpa);
@@ -2083,6 +2084,47 @@ test "parseFile parses mcpServers (Claude Desktop format)" {
             try std.testing.expectEqual(@as(usize, 0), t.args.len);
         },
         .sse => return error.Unexpected,
+    }
+}
+
+test "mcpServers requestTimeoutMs parses, serializes, and round-trips" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    const json = "{\"mcpServers\":{\"timed\":{\"command\":\"mcp-server\",\"requestTimeoutMs\":5000},\"default\":{\"command\":\"mcp-server\"}}}";
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.mcp_servers.len);
+    var timed: ?*McpServerConfig = null;
+    var default: ?*McpServerConfig = null;
+    for (cfg.mcp_servers) |*s| {
+        if (std.mem.eql(u8, s.name, "timed")) {
+            timed = s;
+        } else if (std.mem.eql(u8, s.name, "default")) {
+            default = s;
+        }
+    }
+    try std.testing.expect(timed != null);
+    try std.testing.expect(default != null);
+    // The knob is parsed for the server that sets it...
+    try std.testing.expectEqual(@as(?u32, 5000), timed.?.request_timeout_ms);
+    // ...and stays null for a server that omits it.
+    try std.testing.expectEqual(@as(?u32, null), default.?.request_timeout_ms);
+
+    // Serialize back out, then re-parse to confirm the round-trip survives.
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, cfg);
+
+    var sink2: std.ArrayList(Diagnostic) = .empty;
+    defer sink2.deinit(gpa);
+    var parsed = try parseFile(gpa, "<test>", buf.written(), &sink2);
+    defer parsed.deinit(gpa);
+    for (parsed.mcp_servers) |s| {
+        if (std.mem.eql(u8, s.name, "timed")) {
+            try std.testing.expectEqual(@as(?u32, 5000), s.request_timeout_ms);
+        }
     }
 }
 
@@ -2271,7 +2313,7 @@ test "mergeLayers merges mcp_servers across config layers" {
 test "applyConfigOverlay: model_selection present uses canonical form" {
     const gpa = std.testing.allocator;
     var target: Config = .{
-        .provider = .ollama,
+        .provider_name = try gpa.dupe(u8, "ollama"),
         .model = .{ .id = try gpa.dupe(u8, "llama3.1:8b") },
     };
     defer target.deinit(gpa);
@@ -2279,7 +2321,7 @@ test "applyConfigOverlay: model_selection present uses canonical form" {
     // Updates carry model_selection (canonical) — legacy fields should be
     // ignored in favour of model_selection.
     var updates: Config = .{
-        .provider = .openai, // legacy — should be ignored
+        .provider_name = try gpa.dupe(u8, "openai"), // legacy — should be ignored
         .model_selection = .{
             .builtin = .{
                 .provider = .anthropic,
@@ -2292,7 +2334,7 @@ test "applyConfigOverlay: model_selection present uses canonical form" {
 
     try applyConfigOverlay(gpa, &target, updates);
 
-    try std.testing.expectEqual(Provider.anthropic, target.provider.?);
+    try std.testing.expectEqual(Provider.anthropic, target.providerFromName().?);
     try std.testing.expectEqualStrings("claude-3.7-sonnet", target.model.?.id);
     // builtin providers don't carry base_url/api_key in model_selection;
     // they resolve from the provider catalogue at connection time.
@@ -2306,7 +2348,7 @@ test "applyConfigOverlay: legacy fields sync to model_selection" {
     // Target starts with model_selection populated.
     var target: Config = .{};
     defer target.deinit(gpa);
-    target.provider = .openai;
+    target.provider_name = try gpa.dupe(u8, "openai");
     target.model = .{ .id = try gpa.dupe(u8, "gpt-5.5") };
     target.base_url = try gpa.dupe(u8, "https://api.openai.com");
     target.api_key = try gpa.dupe(u8, "sk-test");
@@ -2335,7 +2377,7 @@ test "applyConfigOverlay: legacy fields sync to model_selection" {
     try std.testing.expectEqualStrings("You are a helpful assistant.", target.model_selection.?.systemPrompt().?);
 
     // Provider/model should be unchanged.
-    try std.testing.expectEqual(Provider.openai, target.provider.?);
+    try std.testing.expectEqual(Provider.openai, target.providerFromName().?);
     try std.testing.expectEqualStrings("gpt-5.5", target.model.?.id);
 }
 
@@ -2344,14 +2386,14 @@ test "mergeLayers: settings-only overlay does not overwrite provider/model" {
 
     // Simulate a global config with provider/model set.
     var global: Config = .{
-        .provider = .openai,
+        .provider_name = try gpa.dupe(u8, "openai"),
         .model = .{ .id = try gpa.dupe(u8, "gpt-5.5") },
     };
     defer global.deinit(gpa);
 
     // Simulate a project config with a different provider/model.
     var project: Config = .{
-        .provider = .ollama,
+        .provider_name = try gpa.dupe(u8, "ollama"),
         .model = .{ .id = try gpa.dupe(u8, "llama3.1:8b") },
     };
     defer project.deinit(gpa);
@@ -2367,7 +2409,7 @@ test "mergeLayers: settings-only overlay does not overwrite provider/model" {
     defer merged.deinit(gpa);
 
     // Provider/model should come from project (last layer that set them).
-    try std.testing.expectEqual(Provider.ollama, merged.provider.?);
+    try std.testing.expectEqual(Provider.ollama, merged.providerFromName().?);
     try std.testing.expectEqualStrings("llama3.1:8b", merged.model.?.id);
     // use_responses_endpoint should come from settings.
     try std.testing.expectEqual(true, merged.use_responses_endpoint.?);
@@ -2386,7 +2428,7 @@ test "parseObject accepts camelCase keys (schema v2)" {
     ;
     var cfg = try parseFile(gpa, "<test>", json, &sink);
     defer cfg.deinit(gpa);
-    try std.testing.expectEqual(Provider.ollama, cfg.provider.?);
+    try std.testing.expectEqual(Provider.ollama, cfg.providerFromName().?);
     try std.testing.expectEqualStrings("llama3.1:8b", cfg.model.?.id);
     try std.testing.expectEqualStrings("http://localhost:11434", cfg.base_url.?);
     try std.testing.expectEqual(true, cfg.use_responses_endpoint.?);
@@ -2405,7 +2447,7 @@ test "parseObject accepts legacy snake_case keys (backward compat)" {
     ;
     var cfg = try parseFile(gpa, "<test>", json, &sink);
     defer cfg.deinit(gpa);
-    try std.testing.expectEqual(Provider.openai, cfg.provider.?);
+    try std.testing.expectEqual(Provider.openai, cfg.providerFromName().?);
     try std.testing.expectEqualStrings("gpt-5.5", cfg.model.?.id);
     try std.testing.expectEqualStrings("https://api.openai.com", cfg.base_url.?);
     try std.testing.expectEqual(false, cfg.use_responses_endpoint.?);
@@ -2423,7 +2465,7 @@ test "parseObject: camelCase wins over snake_case when both present" {
     ;
     var cfg = try parseFile(gpa, "<test>", json, &sink);
     defer cfg.deinit(gpa);
-    try std.testing.expectEqual(Provider.ollama, cfg.provider.?);
+    try std.testing.expectEqual(Provider.ollama, cfg.providerFromName().?);
     try std.testing.expectEqualStrings("http://camel", cfg.base_url.?);
 }
 
@@ -2554,7 +2596,7 @@ test "parseCompaction clamps threshold to the 0.90 ceiling" {
 test "serialize writes camelCase keys and context section" {
     const gpa = std.testing.allocator;
     var cfg: Config = .{
-        .provider = .ollama,
+        .provider_name = try gpa.dupe(u8, "ollama"),
         .model = .{ .id = try gpa.dupe(u8, "llama3.1:8b") },
         .use_responses_endpoint = true,
         .system_prompt = try gpa.dupe(u8, "Be helpful."),
@@ -2580,7 +2622,7 @@ test "serialize writes camelCase keys and context section" {
 
 test "serialize omits context section when all defaults" {
     const gpa = std.testing.allocator;
-    var cfg: Config = .{ .provider = .openai };
+    var cfg: Config = .{ .provider_name = try gpa.dupe(u8, "openai") };
     defer cfg.deinit(gpa);
 
     var buf: std.Io.Writer.Allocating = .init(gpa);
@@ -2593,7 +2635,7 @@ test "serialize omits context section when all defaults" {
 test "serialize then parse roundtrips with camelCase and context" {
     const gpa = std.testing.allocator;
     var original: Config = .{
-        .provider = .ollama,
+        .provider_name = try gpa.dupe(u8, "ollama"),
         .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
         .use_responses_endpoint = false,
         .model = .{ .id = try gpa.dupe(u8, "llama3.1:8b") },
@@ -2616,7 +2658,7 @@ test "serialize then parse roundtrips with camelCase and context" {
     var roundtrip = try mergeLayers(gpa, &.{parsed});
     defer roundtrip.deinit(gpa);
 
-    try std.testing.expectEqual(Provider.ollama, roundtrip.provider.?);
+    try std.testing.expectEqual(Provider.ollama, roundtrip.providerFromName().?);
     try std.testing.expectEqualStrings("llama3.1:8b", roundtrip.model.?.id);
     try std.testing.expectEqual(false, roundtrip.use_responses_endpoint.?);
     try std.testing.expectEqual(@as(u32, 16_000), roundtrip.context.override_context_window.?);
@@ -2642,7 +2684,7 @@ test "serialize then parse roundtrips disablePromptCache" {
     // round-trip test for max_concurrent_requests.
     const gpa = std.testing.allocator;
     var original: Config = .{
-        .provider = .ollama,
+        .provider_name = try gpa.dupe(u8, "ollama"),
         .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
         .model = .{ .id = try gpa.dupe(u8, "llama3.1:8b") },
         .context = .{ .disable_prompt_cache = true },

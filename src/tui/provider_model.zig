@@ -23,6 +23,15 @@ const App = tui.App;
 const ModelCatalog = tui.App.ModelCatalog;
 const ModelScope = model_catalogue.ModelScope;
 const ModelSource = model_loader.ModelSource;
+
+/// Derive the cached provider enum from `cached_config.provider_name`
+/// (the durable field) now that `Config.provider` is gone. Dynamic/config
+/// providers never set `provider_name` (they are OpenAI-compatible), so a
+/// null name yields null and callers fall back to `.openai_compatible`.
+fn cachedProvider(self: *const App) ?config_mod.Provider {
+    return self.cached_config.providerFromName();
+}
+
 pub fn openProviderPicker(self: *App) !void {
     self.mode = .provider_picker;
     self.pickers.provider.reset();
@@ -487,7 +496,8 @@ pub fn submitProviderSetup(self: *App, provider: config_mod.Provider) !void {
         self.cached_config.base_url = null;
         if (self.cached_config.api_key) |prev| self.gpa.free(prev);
         self.cached_config.api_key = null;
-        self.cached_config.provider = provider;
+        if (self.cached_config.provider_name) |prev| self.gpa.free(prev);
+        self.cached_config.provider_name = try self.gpa.dupe(u8, provider.label());
     }
 
     // With no key, connect via the provider's anonymous sentinel (e.g.
@@ -547,7 +557,8 @@ pub fn submitDynamicProviderSetup(self: *App, provider: modelsdev.Provider) !voi
         if (self.cached_config.api_key) |prev| self.gpa.free(prev);
         self.cached_config.api_key = owned_key;
 
-        self.cached_config.provider = .openai_compatible;
+        if (self.cached_config.provider_name) |prev| self.gpa.free(prev);
+        self.cached_config.provider_name = null;
 
         // Stash the human-readable provider name for the status bar.
         if (self.cached_config.dynamic_provider_name) |prev| self.gpa.free(prev);
@@ -611,7 +622,8 @@ pub fn submitConfigProviderSetup(self: *App, provider: config_mod.ProviderConfig
         if (self.cached_config.api_key) |prev| self.gpa.free(prev);
         self.cached_config.api_key = owned_key;
 
-        self.cached_config.provider = .openai_compatible;
+        if (self.cached_config.provider_name) |prev| self.gpa.free(prev);
+        self.cached_config.provider_name = null;
 
         if (self.cached_config.dynamic_provider_name) |prev| self.gpa.free(prev);
         self.cached_config.dynamic_provider_name = try self.gpa.dupe(u8, provider.name);
@@ -1088,7 +1100,7 @@ pub fn modelSelectionUpdates(
     };
 
     return .{
-        .provider = provider,
+        .provider_name = try self.gpa.dupe(u8, resolved.auth_key_id),
         .base_url = base_url_slice,
         .model = .{ .id = model_id_copy, .reasoning = .{ .effort = effort } },
         .providers = providers,
@@ -1199,7 +1211,7 @@ pub fn fetchCompatibleCatalog(self: *App) !void {
     std.debug.assert(!self.pickers.models.compatible_models_fetched);
     const base_url = self.cached_config.base_url.?;
     const api_key = self.cached_config.api_key.?;
-    const provider = self.cached_config.provider orelse tui_provider.compatibleProviderFromBaseUrl(base_url);
+    const provider = cachedProvider(self) orelse .openai_compatible;
     const fetched = try openai_compatible_mod.listModels(self.gpa, self.io, base_url, api_key);
     defer {
         for (fetched) |*entry| entry.deinit(self.gpa);
@@ -1233,16 +1245,7 @@ pub fn shouldLoadConfiguredCompatibleCatalog(self: *const App) bool {
     if (!hasOpenAICompatibleCredentials(
         self,
     )) return false;
-    // base_url may be null after restart when the legacy stash wasn't hydrated
-    // (it is normally repopulated by hydrateActiveModel from the providers[]
-    // map, but the typed model_selection.baseUrl() is the durable signal).
-    const base_url = self.cached_config.base_url orelse blk: {
-        if (self.cached_config.model_selection) |ms| {
-            if (ms.baseUrl()) |url| break :blk url;
-        }
-        return false;
-    };
-    const provider = self.cached_config.provider orelse tui_provider.compatibleProviderFromBaseUrl(base_url);
+    const provider = cachedProvider(self) orelse .openai_compatible;
     if (provider == .ollama) return false;
     if (provider == .llama_cpp) return false;
     return true;
@@ -1446,7 +1449,7 @@ pub fn attachOpenAiCompatibleClient(
     runtime.mcp_tools = mcp_schemas;
     runtime.strict_outputs = self.cached_config.strict_outputs orelse false;
     runtime.wire_dialect = ai.WireDialect.resolve(
-        self.cached_config.provider,
+        cachedProvider(self) orelse .openai_compatible,
         self.cached_config.provider_name orelse "",
         base_url,
     );

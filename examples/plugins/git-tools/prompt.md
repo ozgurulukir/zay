@@ -20,6 +20,7 @@ Use the `git-tools` plugin to inspect repository state and create commits.
 
 - **Only commit, amend, push, or create PRs when the user explicitly requests
   it.** Do not commit proactively.
+- **Exception — lane work.** When you are working inside a Nova lane and need to `lane merge`, commit the lane's changes yourself with a real message first. This is the one case where committing without an explicit user request is expected and required — the merge refuses a dirty lane and will not fabricate a placeholder commit.
 - **Inspect before committing.** Call `git_status` and `git_diff` first so your
   commit reflects what actually changed. Stage only the intended files and
   never commit secrets (API keys, credentials, `.env` files).

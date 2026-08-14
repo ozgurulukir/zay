@@ -108,7 +108,7 @@ nova.register_tool({
 
 nova.register_tool({
   name = "git_commit",
-  description = "Stage all changes and create a commit with the given message. IMPORTANT: only commit when the user explicitly asks. Before committing, inspect git_status and git_diff, stage only intended files, and never commit secrets. If a commit fails (e.g. hooks reject it), fix the issue and create a new commit — do not amend the failed commit.",
+  description = "Stage all changes and create a commit with the given message. IMPORTANT: only commit when the user explicitly asks, except lane work — when working in a Nova lane, commit your lane changes with a real message before `lane merge`. Before committing, inspect git_status and git_diff, stage only intended files, and never commit secrets. If a commit fails (e.g. hooks reject it), fix the issue and create a new commit — do not amend the failed commit.",
   parameters = {
     message = {
       type = "string",

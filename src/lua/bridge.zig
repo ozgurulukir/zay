@@ -7,6 +7,14 @@ const std = @import("std");
 const c = @import("c");
 const State = @import("state.zig").State;
 
+/// Thread-local override for the working directory a plugin tool runs in.
+/// `executor.produceOutput` sets it to the executor's re-rooted cwd (e.g. a
+/// lane worktree) before dispatching so cwd-sensitive plugins like
+/// `nova.git_commit` operate in the same workspace as the rest of the tool
+/// batch. Lives here (not `registry_bridge.zig`) because `plugin_api.zig`
+/// imports this leaf module — placing it here avoids an import cycle.
+pub threadlocal var plugin_cwd_slot: ?[]const u8 = null;
+
 /// Returns true if T is an array of u8 (e.g. [5:0]u8).
 fn isArrayOfU8(comptime T: type) bool {
     const info = @typeInfo(T);

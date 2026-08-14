@@ -51,6 +51,11 @@ pub fn freeHeaders(gpa: std.mem.Allocator, headers: []McpHeader) void {
 pub const McpServerConfig = struct {
     name: []u8,
     enabled: bool = true,
+    /// Per-server request timeout in milliseconds (post-connect I/O only —
+    /// the connect phase is not bounded). `null` → the client's default (30s).
+    /// Applied as SO_RCVTIMEO/SO_SNDTIMEO for the Streamable HTTP transport
+    /// and as the stdio poll timeout.
+    request_timeout_ms: ?u32 = null,
     /// How the server is reached. Variants make illegal combinations
     /// unrepresentable: a stdio server must have command+args, an sse
     /// server must have a url.
@@ -86,6 +91,7 @@ pub const McpServerConfig = struct {
         return .{
             .name = try gpa.dupe(u8, self.name),
             .enabled = self.enabled,
+            .request_timeout_ms = self.request_timeout_ms,
             .transport = switch (self.transport) {
                 .stdio => |t| blk: {
                     var args = try gpa.alloc([]u8, t.args.len);
@@ -130,6 +136,7 @@ pub fn expandMcpServer(gpa: std.mem.Allocator, server: McpServerConfig) !McpServ
     var out: McpServerConfig = .{
         .name = try gpa.dupe(u8, server.name),
         .enabled = server.enabled,
+        .request_timeout_ms = server.request_timeout_ms,
         .transport = undefined,
     };
     errdefer out.deinit(gpa);

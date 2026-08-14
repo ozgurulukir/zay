@@ -518,6 +518,17 @@ pub const McpClient = struct {
 
     // ── Streamable HTTP transport ──
 
+    /// Split a request timeout in milliseconds into the `(sec, usec)` components
+    /// of a POSIX `timeval` as used by `applyHttpTimeout`. Kept as a pure helper
+    /// so the rounding math is unit-testable cross-platform (`std.posix.timeval`
+    /// is not available on Windows, where the socket-timeout path is skipped).
+    fn httpTimeoutParts(read_timeout_ms: u32) struct { sec: i64, usec: i64 } {
+        return .{
+            .sec = @intCast(read_timeout_ms / 1000),
+            .usec = @intCast((read_timeout_ms % 1000) * 1000),
+        };
+    }
+
     /// Apply a socket-level send/recv timeout so a server that accepts the
     /// connection but then stalls — no response head, or a mid-body stop —
     /// fails the handshake instead of blocking the worker forever.
@@ -528,9 +539,10 @@ pub const McpClient = struct {
     /// can never freeze the UI; this bounds everything after connect.
     fn applyHttpTimeout(self: *McpClient, conn: *std.http.Client.Connection) void {
         if (!os.is_windows) {
+            const parts = httpTimeoutParts(self.read_timeout_ms);
             const tv: std.posix.timeval = .{
-                .sec = @intCast(self.read_timeout_ms / 1000),
-                .usec = @intCast((self.read_timeout_ms % 1000) * 1000),
+                .sec = parts.sec,
+                .usec = parts.usec,
             };
             std.posix.setsockopt(
                 conn.stream_reader.stream.socket.handle,
@@ -1202,4 +1214,22 @@ test "sendRequestStdio routes interleaved notifications to handleNotification" {
     // The interleaved notification was buffered — poll drains it.
     try std.testing.expect(client.pollToolsRefresh());
     try std.testing.expectEqual(false, client.pollToolsRefresh());
+}
+
+test "httpTimeoutParts derives timeval sec/usec from read_timeout_ms" {
+    // The per-server `requestTimeoutMs` knob flows into `read_timeout_ms` and
+    // feeds `applyHttpTimeout`'s socket timeval. Exact multiples land on zero
+    // usec; non-multiples carry the sub-second remainder.
+    const whole = McpClient.httpTimeoutParts(5000);
+    try std.testing.expectEqual(@as(i64, 5), whole.sec);
+    try std.testing.expectEqual(@as(i64, 0), whole.usec);
+
+    const partial = McpClient.httpTimeoutParts(1500);
+    try std.testing.expectEqual(@as(i64, 1), partial.sec);
+    try std.testing.expectEqual(@as(i64, 500_000), partial.usec);
+
+    // Sub-second values produce zero sec and the sub-second remainder in usec.
+    const sub_second = McpClient.httpTimeoutParts(250);
+    try std.testing.expectEqual(@as(i64, 0), sub_second.sec);
+    try std.testing.expectEqual(@as(i64, 250_000), sub_second.usec);
 }

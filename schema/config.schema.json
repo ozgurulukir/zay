@@ -159,6 +159,11 @@
           "type": "boolean",
           "default": true,
           "description": "Whether this server is active."
+        },
+        "requestTimeoutMs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Per-server request timeout in milliseconds. Defaults to 30000 (30s). Applied to Streamable HTTP socket timeouts and the stdio read poll. Values below 1 are clamped to 1."
         }
       },
       "required": ["command"],
@@ -186,6 +191,11 @@
           "type": "boolean",
           "default": true,
           "description": "Whether this server is active."
+        },
+        "requestTimeoutMs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Per-server request timeout in milliseconds. Defaults to 30000 (30s). Applied to Streamable HTTP socket timeouts and the stdio read poll. Values below 1 are clamped to 1."
         }
       },
       "required": ["url"],

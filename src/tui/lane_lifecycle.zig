@@ -242,8 +242,11 @@ fn mergeLane(app: *App, source: lanes_util.MergeSource, dest: *Thread) !void {
     try clearWorkspaceBorrowForPath(app, source.path);
     const dest_dir = laneMergeDir(app, dest) orelse return error.NoActiveRuntime;
 
+    // M3b: refuse to fold a dirty source lane; the merge must not fabricate a
+    // placeholder commit. The user should commit the lane's work first (via
+    // the model or `/save`).
     if (try vcs.workingTreeDirty(app.gpa, app.io, source.path)) {
-        try vcs.commitAll(app.gpa, app.io, source.path, "nova: merge lane");
+        return error.DirtySourceLane;
     }
 
     switch (try vcs.merge(app.gpa, app.io, dest_dir, source.branch)) {
@@ -953,9 +956,11 @@ fn mergeLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     if (vcs.workingTreeDirty(app.gpa, app.io, repo) catch false) {
         return failResp(app.gpa, "lane: the primary tree has uncommitted changes — commit or stash first; this is not a merge conflict.\n", .{});
     }
-    // Commit the source if dirty.
+    // M3b: a dirty SOURCE lane would be folded into the primary tree as a
+    // fabricated placeholder commit. Refuse and let the model commit its own
+    // lane work with a real message (git_commit / bash git commit) first.
     if (vcs.workingTreeDirty(app.gpa, app.io, working.path) catch false) {
-        vcs.commitAll(app.gpa, app.io, working.path, "nova: merge lane") catch {};
+        return failResp(app.gpa, "lane: lane {s} has uncommitted changes — commit them with a real message (git_commit or `bash git commit`) before merging; the merge will not fabricate a placeholder commit.\n", .{id});
     }
     switch (vcs.merge(app.gpa, app.io, repo, working.branch) catch |err| return failResp(app.gpa, "lane: merge failed: {s}\n", .{@errorName(err)})) {
         .conflict => return failResp(app.gpa, "lane: merge conflict — rolled back, nothing lost. Lane {s} is still open; resolve and retry.\n", .{id}),
@@ -2640,7 +2645,7 @@ test "S11: a cancelled spawned worker is delivered as FAILED, not done" {
     try std.testing.expect(!transcriptContains(spawner, "final state: done"));
 }
 
-test "lane merge: dirty primary refused (M3), conflict rolls back, dirty source auto-commits" {
+test "lane merge: dirty primary refused (M3), conflict rolls back, dirty source refused (M3b) until committed" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
@@ -2698,18 +2703,30 @@ test "lane merge: dirty primary refused (M3), conflict rolls back, dirty source 
     try std.testing.expectEqualStrings("primary side\n", primary_content);
 
     // ── Resolve + dirty source: the lane adopts primary's content and adds
-    // UNCOMMITTED work — the merge auto-commits the source and folds back.
+    // UNCOMMITTED work — the merge refuses (M3b) rather than fabricating a
+    // placeholder commit; the lane's work survives to be committed by hand.
     try writeAbs(io, lane_conflict, "primary side\n");
     const lane_extra = try std.fs.path.join(gpa, &.{ lane_path, "extra.txt" });
     defer gpa.free(lane_extra);
     try writeAbs(io, lane_extra, "new work\n");
+    var refuse_req = lane_bridge.Request{ .op = .merge, .lane = try gpa.dupe(u8, id), .requester = &fx.runtime.agent };
+    defer refuse_req.deinit(gpa);
+    const refuse_resp = postAndService(io, app, &refuse_req);
+    defer app.gpa.free(refuse_resp.text);
+    try std.testing.expect(refuse_resp.code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, refuse_resp.text, "uncommitted changes") != null);
+    try std.testing.expectEqual(@as(usize, 2), app.threads.len()); // lane intact, nothing folded/auto-committed
+
+    // ── Commit the lane work with a real message, then merge folds it in.
+    try gitOk(gpa, io, lane_path, &.{ "add", "-A" });
+    try gitOk(gpa, io, lane_path, &.{ "commit", "-qm", "resolve + lane work" });
     var final_req = lane_bridge.Request{ .op = .merge, .lane = try gpa.dupe(u8, id), .requester = &fx.runtime.agent };
     defer final_req.deinit(gpa);
     const final_resp = postAndService(io, app, &final_req);
     defer app.gpa.free(final_resp.text);
     try std.testing.expectEqual(@as(u8, 0), final_resp.code);
     try std.testing.expectEqual(@as(usize, 1), app.threads.len()); // lane removed
-    // The auto-committed lane work landed in the primary tree.
+    // The lane's committed work landed in the primary tree.
     const primary_extra = try std.fs.path.join(gpa, &.{ fx.repo, "extra.txt" });
     defer gpa.free(primary_extra);
     const extra_content = std.Io.Dir.cwd().readFile(io, primary_extra, &buf) catch unreachable;

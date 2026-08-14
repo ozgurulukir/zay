@@ -121,7 +121,7 @@ fn providerLabel(config: config_mod.Config) ?[]const u8 {
     if (config.model_selection) |ms| return ms.provider().label();
     // After restart model_selection is null (api_key is never serialized);
     // fall back to the legacy provider field populated by parseObject.
-    if (config.provider) |p| return p.label();
+    if (config.providerFromName()) |p| return p.label();
     return null;
 }
 
@@ -139,7 +139,7 @@ fn providerDisplayName(config: config_mod.Config) ?[]const u8 {
     // After restart model_selection is null; the legacy provider_name
     // IS populated from the "defaultModel" config field (e.g. "stepfun-ai").
     if (config.provider_name) |name| {
-        if (config.provider == .openai_compatible and name.len > 0) return name;
+        if ((config.providerFromName() orelse .openai_compatible) == .openai_compatible and name.len > 0) return name;
     }
     return providerLabel(config);
 }

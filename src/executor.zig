@@ -488,7 +488,12 @@ pub const ExecutorService = struct {
             // call.
             const prev = lua_mod.registry_bridge.plugin_manager_slot;
             lua_mod.registry_bridge.plugin_manager_slot = self.plugin_manager;
-            defer lua_mod.registry_bridge.plugin_manager_slot = prev;
+            const prev_cwd = lua_mod.bridge.plugin_cwd_slot;
+            lua_mod.bridge.plugin_cwd_slot = self.cwd;
+            defer {
+                lua_mod.registry_bridge.plugin_manager_slot = prev;
+                lua_mod.bridge.plugin_cwd_slot = prev_cwd;
+            }
             const slice = try r.all(self.gpa);
             return tools.runWith(slice, self.gpa, self.io, self.cwd, call.name, call.arguments);
         }

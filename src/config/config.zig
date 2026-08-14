@@ -36,6 +36,7 @@ pub const ModelSelectionRef = provider_types.ModelSelectionRef;
 pub const ModelSelection = provider_types.ModelSelection;
 pub const catalogueProviders = provider_types.catalogueProviders;
 pub const allBuiltinLabels = provider_types.allBuiltinLabels;
+pub const providers_by_name = provider_types.providers_by_name;
 
 // --- MCP re-exports ---
 
@@ -145,7 +146,6 @@ pub const Config = struct {
     /// Null means the default ("2.0.0"). Stored as an owned slice
     /// when parsed from disk; the default points to static memory.
     version: ?[]u8 = null,
-    provider: ?Provider = null,
     /// The provider name as written in config (defaultModel prefix or
     /// providers map key). For builtins equals `provider.label()`; for
     /// custom providers it's the user-chosen name. Used for display,
@@ -195,6 +195,13 @@ pub const Config = struct {
     /// `version` is null.
     pub const default_version = "2.0.0";
 
+    /// Resolve the provider enum from the loose `provider_name` field, the same
+    /// way `parseModelSelection` does. Returns null when no name is set.
+    pub fn providerFromName(self: *const Config) ?Provider {
+        const name = self.provider_name orelse return null;
+        return providers_by_name.get(name) orelse .openai_compatible;
+    }
+
     pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
         if (self.version) |s| gpa.free(s);
         if (self.provider_name) |s| gpa.free(s);
@@ -218,7 +225,6 @@ pub const Config = struct {
 
     pub fn clone(self: Config, gpa: std.mem.Allocator) !Config {
         var out: Config = .{
-            .provider = self.provider,
             .use_responses_endpoint = self.use_responses_endpoint,
             .strict_outputs = self.strict_outputs,
             .context = self.context,
@@ -296,9 +302,10 @@ pub const Config = struct {
                 .custom => |*c| ModelSelectionRef{ .custom = .{ .provider_name = c.provider_name, .base_url = c.base_url, .api_key = c.api_key, .model = &c.model } },
             };
         }
-        const provider = self.provider orelse return null;
+        const provider = self.providerFromName() orelse return null;
         const model_ptr = if (self.model) |*m| m else return null;
-        const name = self.provider_name orelse provider.label();
+        // providerFromName() non-null ⇒ provider_name non-null (see providerFromName).
+        const name = self.provider_name.?;
         if (provider == .openai_compatible) {
             return ModelSelectionRef{ .custom = .{ .provider_name = name, .base_url = self.base_url orelse "", .api_key = self.api_key orelse "", .model = model_ptr } };
         }
@@ -315,7 +322,6 @@ pub fn assertModelSelection(config: *const Config) void {
     if (config.model_selection) |_| return;
     // When model_selection is null but the legacy fields are partially
     // set, that's a programming error. Catch it loudly.
-    assert(config.provider == null);
     assert(config.model == null);
     assert(config.base_url == null);
     assert(config.api_key == null);
@@ -364,3 +370,21 @@ pub const LoadResult = struct {
         return out;
     }
 };
+
+test "provider identity derives from provider_name" {
+    const gpa = std.testing.allocator;
+    // A builtin name resolves to its enum.
+    var builtin: Config = .{ .provider_name = try gpa.dupe(u8, "ollama") };
+    defer builtin.deinit(gpa);
+    try std.testing.expectEqual(Provider.ollama, builtin.providerFromName().?);
+
+    // A custom name (not in the builtin map) resolves to openai_compatible.
+    var custom: Config = .{ .provider_name = try gpa.dupe(u8, "qwen-cloud") };
+    defer custom.deinit(gpa);
+    try std.testing.expectEqual(Provider.openai_compatible, custom.providerFromName().?);
+
+    // No name set yields null.
+    var empty: Config = .{};
+    defer empty.deinit(gpa);
+    try std.testing.expectEqual(@as(?Provider, null), empty.providerFromName());
+}

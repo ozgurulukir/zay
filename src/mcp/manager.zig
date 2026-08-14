@@ -93,6 +93,7 @@ pub const McpManager = struct {
                     url,
                 );
                 errdefer c.deinit(io);
+                if (server_cfg.request_timeout_ms) |ms| c.read_timeout_ms = @max(ms, 1);
                 if (c.transport == .sse) {
                     c.transport.sse.headers = try config_mod.cloneHeaders(self.gpa, expanded.transport.sse.headers);
                 }

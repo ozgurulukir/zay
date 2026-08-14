@@ -1222,12 +1222,15 @@ pub fn gitCommit(L: ?*c.lua_State) callconv(.c) c_int {
         return 2;
     };
 
-    const cwd = std.process.currentPathAlloc(io, std.heap.page_allocator) catch {
-        state.pushNil();
-        state.pushString("could not resolve cwd");
-        return 2;
+    const cwd: []const u8 = if (bridge.plugin_cwd_slot) |slot_cwd| slot_cwd else blk: {
+        const p = std.process.currentPathAlloc(io, std.heap.page_allocator) catch {
+            state.pushNil();
+            state.pushString("could not resolve cwd");
+            return 2;
+        };
+        defer std.heap.page_allocator.free(p);
+        break :blk p;
     };
-    defer std.heap.page_allocator.free(cwd);
 
     // Stage all and commit. The message is piped via stdin to `git commit -F -`
     // so shell metacharacters in `msg` are never interpreted — embedding it in
