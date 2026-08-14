@@ -1,0 +1,7 @@
+# Normalize all text files to LF in the repo.
+* text=auto
+
+# Zig's formatter always emits LF — pin the working-tree EOL to LF so
+# `zig fmt` runs never produce false "modified" states.
+*.zig  text eol=lf
+*.zon  text eol=lf
