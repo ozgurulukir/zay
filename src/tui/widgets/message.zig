@@ -77,6 +77,7 @@ pub const MessageWidget = struct {
             .width = width,
             .height = height,
         });
+        MessageWidget.fillCardBackground(&surface);
         try self.drawBody(&surface, ctx);
         return surface;
     }
@@ -331,14 +332,18 @@ pub const MessageWidget = struct {
     // are skipped entirely, leaving the terminal background as empty space.
     fn writeBlackholeLine(surface: *vxfw.Surface, line: []const u8, row: u16) void {
         if (row >= surface.size.height) return;
+        const p = tui_style.activePalette();
         var col = ConversationLayout.left + intro_x_padding;
         const col_limit = surface.size.width -| ConversationLayout.right;
         for (line, 0..) |byte, i| {
             if (col >= col_limit) return;
-            if (blackhole.colorAt(byte)) |rgb| {
-                surface.writeCell(col, row, .{
+            // The hot `*` accent follows the theme; the rest of the brightness
+            // ramp stays artistically fixed so the accretion-disk shape is kept.
+            const rgb: ?blackhole.Rgb = if (byte == '*') p.intro_accent.fg.rgb else blackhole.colorAt(byte);
+            if (rgb) |rgb_val| {
+                MessageWidget.writeCellOnCard(surface, col, row, .{
                     .char = .{ .grapheme = line[i .. i + 1], .width = 1 },
-                    .style = .{ .fg = .{ .rgb = rgb } },
+                    .style = .{ .fg = .{ .rgb = rgb_val } },
                 });
             }
             col += 1;
@@ -347,6 +352,7 @@ pub const MessageWidget = struct {
 
     fn writeLogoLine(surface: *vxfw.Surface, line: []const u8, row: u16, col_start: u16, ctx: vxfw.DrawContext) void {
         if (row >= surface.size.height) return;
+        const p = tui_style.activePalette();
         var col = col_start;
         const col_limit = surface.size.width -| ConversationLayout.right;
         var iter = ctx.graphemeIterator(line);
@@ -356,9 +362,9 @@ pub const MessageWidget = struct {
             const width: u16 = @intCast(ctx.stringWidth(bytes));
             if (width == 0) continue;
             if (col + width > col_limit) return;
-            surface.writeCell(col, row, .{
+            MessageWidget.writeCellOnCard(surface, col, row, .{
                 .char = .{ .grapheme = bytes, .width = @intCast(width) },
-                .style = .{ .fg = .{ .rgb = blackhole.orange } },
+                .style = .{ .fg = .{ .rgb = p.intro_accent.fg.rgb } },
             });
             col += width;
         }
@@ -447,12 +453,39 @@ pub const MessageWidget = struct {
             const width: u16 = @intCast(ctx.stringWidth(bytes));
             if (width == 0) continue;
             if (col + width > col_limit) return;
-            surface.writeCell(col, row, .{
+            writeCellOnCard(surface, col, row, .{
                 .char = .{ .grapheme = bytes, .width = @intCast(width) },
                 .style = mergedSelectedStyle(style, selected),
             });
             col += width;
         }
+    }
+
+    /// Pre-fill the message surface so cells no text path writes (ConversationLayout
+    /// margins, blank lines, black-hole void) carry the themed card background. An
+    /// explicit (non-`.default`) cell is required — `.default` composites as
+    /// terminal-default. `writeCellOnCard` then preserves this on text cells.
+    pub fn fillCardBackground(surface: *vxfw.Surface) void {
+        const bg: vaxis.Style = tui_style.activePalette().background;
+        const fill_cell = vaxis.Cell{
+            .char = .{}, // default space grapheme
+            .style = .{ .bg = bg.bg },
+        };
+        for (surface.buffer) |*cell| cell.* = fill_cell; // buffer.len == w*h (from Surface.init)
+    }
+
+    /// Write a cell onto the card surface, preserving the pre-filled themed bg when
+    /// `cell.style.bg` is `.default`. This is the C1 fix: text styles are bg-less by
+    /// design (shared styles must not carry a bg — MA-1), so full-cell-replacement
+    /// `Surface.writeCell` would otherwise reset text cells to terminal-default.
+    fn writeCellOnCard(surface: *vxfw.Surface, col: u16, row: u16, cell: vaxis.Cell) void {
+        var written = cell;
+        if (written.style.bg == .default) {
+            const idx = (@as(usize, row) * surface.size.width) + col;
+            const prev_bg = surface.buffer[idx].style.bg; // the fillCardBackground bg
+            written.style.bg = prev_bg;
+        }
+        surface.writeCell(col, row, written);
     }
 };
 
@@ -463,6 +496,7 @@ fn drawMarkdown(
     row: *u16,
     ctx: vxfw.DrawContext,
 ) void {
+    const p = tui_style.activePalette();
     const text = self.message.agent.body;
     const content_width = @max(ConversationLayout.contentWidth(surface.size.width), 1);
 
@@ -471,13 +505,13 @@ fn drawMarkdown(
             self.message.renderIncPtr().deinit(self.gpa);
             self.message.renderIncPtr().* = .{};
             break :rows (terminal_markdown.renderLimited(ctx.arena, text, content_width, surface.size.height) catch {
-                MessageWidget.drawWrapped(surface, text, .{}, selected, row, ctx, 0, null);
+                MessageWidget.drawWrapped(surface, text, p.body, selected, row, ctx, 0, null);
                 return;
             }).rows;
         }
 
         break :rows self.message.renderIncPtr().rows(self.gpa, ctx.arena, text, content_width) catch {
-            MessageWidget.drawWrapped(surface, text, .{}, selected, row, ctx, 0, null);
+            MessageWidget.drawWrapped(surface, text, p.body, selected, row, ctx, 0, null);
             return;
         };
     };
@@ -496,14 +530,18 @@ fn drawMarkdown(
 fn markdownStyle(style: terminal_markdown.Style) vaxis.Style {
     const p = tui_style.activePalette();
     return switch (style) {
-        .normal => .{},
+        .normal => p.body,
         .heading => p.markdown_heading,
         .quote => p.thinking_body,
-        .list_marker => .{},
+        .list_marker => p.body,
         .table_border => p.thinking_body,
         .code => p.markdown_code,
-        .strong => .{ .bold = true },
-        .emphasis => .{ .italic = true },
+        // Copy body fg, keep the attribute. No `.bg` is set: like every palette
+        // style it stays bg-less, and `writeCellOnCard` supplies the card bg at
+        // write time. A bare `.bold`/`.italic` would otherwise drop
+        // `.normal ==> p.body`'s fg and read as terminal-default.
+        .strong => .{ .bold = true, .fg = p.body.fg },
+        .emphasis => .{ .italic = true, .fg = p.body.fg },
     };
 }
 
@@ -678,7 +716,7 @@ fn drawStyledSegment(
         }
         if (col + width > col_limit) return;
         const style = styleAt(text_abs + byte_pos, text_abs + byte_pos + bytes.len, spans, default_style);
-        surface.writeCell(col, row.*, .{
+        MessageWidget.writeCellOnCard(surface, col, row.*, .{
             .char = .{ .grapheme = bytes, .width = @intCast(width) },
             .style = mergedSelectedStyle(style, selected),
         });
@@ -949,4 +987,195 @@ test "drawJson highlights a key with the accent style" {
     try std.testing.expectEqualStrings("\"", surface.readCell(ConversationLayout.left + 4, 3).char.grapheme);
     const key_style = surface.readCell(ConversationLayout.left + 4, 3).style;
     try std.testing.expectEqual(@as([3]u8, .{ 249, 115, 22 }), key_style.fg.rgb);
+}
+
+test "agent body renders Palette.body (not default)" {
+    tui_style.setActive(tui_style.nord);
+    defer tui_style.setActive(tui_style.default_theme);
+
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.append(gpa, .agent, "agent", "hello world");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var message_widget: MessageWidget = .{
+        .message = &transcript.messages.items[index],
+        .selected = false,
+        .loading_frame = 0,
+        .blackhole_frame = 0,
+        .gpa = gpa,
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 40, .height = 4 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try message_widget.widget().draw(ctx);
+
+    // A `.normal` body text cell carries the themed body fg, not terminal-default.
+    const text_style = surface.readCell(ConversationLayout.left, 1).style;
+    try std.testing.expectEqual(expectNordBody().body.fg.rgb, text_style.fg.rgb);
+}
+
+test "text cells carry the card background (C1 regression)" {
+    tui_style.setActive(tui_style.nord);
+    defer tui_style.setActive(tui_style.default_theme);
+
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.append(gpa, .agent, "agent", "hello world");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var message_widget: MessageWidget = .{
+        .message = &transcript.messages.items[index],
+        .selected = false,
+        .loading_frame = 0,
+        .blackhole_frame = 0,
+        .gpa = gpa,
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 40, .height = 4 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try message_widget.widget().draw(ctx);
+
+    // A written text cell must keep the card bg (its style `.bg` is `.default`,
+    // so a plain fill-only implementation would regress to terminal-default here).
+    const text_cell = surface.readCell(ConversationLayout.left, 1);
+    try std.testing.expect(text_cell.style.bg != .default);
+    try std.testing.expectEqual(tui_style.nord.background, text_cell.style.bg.rgb);
+}
+
+test "segment-rendered cells carry the card background (drawStyledSegment bypass)" {
+    tui_style.setActive(tui_style.nord);
+    defer tui_style.setActive(tui_style.default_theme);
+
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    // A formatted expanded tool title routes through drawStyledSegment (the 4th
+    // write path); an argument cell must still carry the card background.
+    const index = try transcript.startTool(gpa, "List files");
+    try transcript.updateToolExpanded(gpa, index, "List files", "List files --all");
+    transcript.messages.items[index].tool.expanded = true;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var message_widget: MessageWidget = .{
+        .message = &transcript.messages.items[index],
+        .selected = false,
+        .loading_frame = 0,
+        .blackhole_frame = 0,
+        .gpa = gpa,
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 40, .height = 4 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try message_widget.widget().draw(ctx);
+
+    // The dimmed-args cell on the title row (index 5+) comes from drawStyledSegment.
+    const arg_cell = surface.readCell(ConversationLayout.left + 3 + 5, 1);
+    try std.testing.expect(arg_cell.style.bg != .default);
+    try std.testing.expectEqual(tui_style.nord.background, arg_cell.style.bg.rgb);
+}
+
+test "padding/void cells are filled with the card background" {
+    tui_style.setActive(tui_style.nord);
+    defer tui_style.setActive(tui_style.default_theme);
+
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.append(gpa, .notice, "notice", "hi");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var message_widget: MessageWidget = .{
+        .message = &transcript.messages.items[index],
+        .selected = false,
+        .loading_frame = 0,
+        .blackhole_frame = 0,
+        .gpa = gpa,
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 40, .height = 4 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try message_widget.widget().draw(ctx);
+
+    // A trailing cell past the short "hi" text was never written by a text path,
+    // so it must already carry the pre-filled card background.
+    const pad_cell = surface.readCell(20, 1);
+    try std.testing.expect(pad_cell.style.bg != .default);
+    try std.testing.expectEqual(tui_style.nord.background, pad_cell.style.bg.rgb);
+}
+
+test "intro logo and * accent use intro_accent" {
+    tui_style.setActive(tui_style.dracula);
+    defer tui_style.setActive(tui_style.default_theme);
+
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.append(gpa, .logo, "logo", "");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var message_widget: MessageWidget = .{
+        .message = &transcript.messages.items[index],
+        .selected = false,
+        .loading_frame = 0,
+        .blackhole_frame = 0,
+        .gpa = gpa,
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 120, .height = 40 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try message_widget.widget().draw(ctx);
+
+    // The black-hole `*` accent cells follow the theme (intro_accent), while the
+    // hot-core `@` bytes keep their fixed table colour.
+    const accent_color = expectDraculaIntro().intro_accent.fg.rgb;
+    var found_star = false;
+    var r: u16 = 0;
+    while (r < surface.size.height) : (r += 1) {
+        var c: u16 = 0;
+        while (c < surface.size.width) : (c += 1) {
+            const cell = surface.readCell(c, r);
+            if (cell.style.fg == .rgb and std.mem.eql(u8, cell.char.grapheme, "*")) {
+                try std.testing.expectEqual(accent_color, cell.style.fg.rgb);
+                found_star = true;
+            }
+        }
+    }
+    try std.testing.expect(found_star);
+
+    // The logo text (N.O.V.A) carries the themed intro accent.
+    const logo_col = ConversationLayout.left + intro_x_padding + blackhole.cols + logo_gap;
+    const logo_cell = surface.readCell(logo_col, ConversationLayout.top + logo_row_offset);
+    try std.testing.expectEqual(accent_color, logo_cell.style.fg.rgb);
+}
+
+// Helpers so the render asserts don't reach into the active palette order.
+fn expectNordBody() tui_style.Palette {
+    return tui_style.buildPalette(tui_style.nord);
+}
+fn expectDraculaIntro() tui_style.Palette {
+    return tui_style.buildPalette(tui_style.dracula);
 }

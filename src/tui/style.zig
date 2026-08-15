@@ -25,6 +25,9 @@ pub const Theme = struct {
     code_blue: Rgb,
     faint_add_bg: Rgb,
     faint_del_bg: Rgb,
+    body: Rgb,
+    background: Rgb,
+    blackhole_orange: Rgb,
     markdown_heading: Rgb,
 };
 
@@ -46,6 +49,9 @@ pub const default_theme: Theme = .{
     .code_blue = .{ 147, 197, 253 },
     .faint_add_bg = .{ 22, 43, 30 },
     .faint_del_bg = .{ 52, 27, 27 },
+    .body = .{ 255, 255, 255 },
+    .background = .{ 17, 17, 20 },
+    .blackhole_orange = .{ 255, 106, 61 },
     .markdown_heading = .{ 252, 211, 77 },
 };
 
@@ -66,6 +72,9 @@ pub const cappuccino_theme: Theme = .{
     .code_blue = .{ 148, 226, 213 }, // teal
     .faint_add_bg = .{ 40, 59, 47 },
     .faint_del_bg = .{ 62, 46, 54 },
+    .body = .{ 205, 214, 244 }, // text
+    .background = .{ 17, 17, 27 }, // crust
+    .blackhole_orange = .{ 250, 179, 135 }, // peach
     .markdown_heading = .{ 249, 226, 175 }, // yellow
 };
 
@@ -86,6 +95,9 @@ pub const tokyo_night: Theme = .{
     .code_blue = .{ 137, 221, 255 }, // blue5
     .faint_add_bg = .{ 30, 44, 40 }, // derived: green-tinted bg
     .faint_del_bg = .{ 52, 34, 42 }, // derived: red-tinted bg
+    .body = .{ 192, 202, 245 }, // fg
+    .background = .{ 26, 27, 38 }, // bg
+    .blackhole_orange = .{ 255, 158, 100 }, // orange
     .markdown_heading = .{ 224, 175, 104 }, // yellow
 };
 
@@ -106,6 +118,9 @@ pub const dracula: Theme = .{
     .code_blue = .{ 139, 233, 253 }, // cyan
     .faint_add_bg = .{ 36, 52, 42 }, // derived: green-tinted bg
     .faint_del_bg = .{ 58, 40, 45 }, // derived: red-tinted bg
+    .body = .{ 248, 248, 242 }, // foreground
+    .background = .{ 40, 42, 54 }, // background
+    .blackhole_orange = .{ 255, 184, 108 }, // orange
     .markdown_heading = .{ 241, 250, 140 }, // yellow
 };
 
@@ -126,6 +141,9 @@ pub const nord: Theme = .{
     .code_blue = .{ 129, 161, 193 }, // nord9 frost blue
     .faint_add_bg = .{ 46, 55, 47 }, // derived: green-tinted bg
     .faint_del_bg = .{ 61, 47, 49 }, // derived: red-tinted bg
+    .body = .{ 236, 239, 244 }, // nord6 snow storm
+    .background = .{ 46, 52, 64 }, // nord0 polar night
+    .blackhole_orange = .{ 208, 135, 112 }, // nord12 aurora orange
     .markdown_heading = .{ 235, 203, 139 }, // nord13 aurora yellow
 };
 
@@ -146,6 +164,9 @@ pub const gruvbox_dark: Theme = .{
     .code_blue = .{ 131, 165, 152 }, // blue
     .faint_add_bg = .{ 46, 55, 35 }, // derived: green-tinted bg
     .faint_del_bg = .{ 66, 44, 38 }, // derived: red-tinted bg
+    .body = .{ 251, 241, 199 }, // fg0 warm cream
+    .background = .{ 29, 32, 33 }, // bg0
+    .blackhole_orange = .{ 214, 93, 14 }, // dark0+ burnt orange
     .markdown_heading = .{ 250, 189, 47 }, // yellow
 };
 
@@ -187,6 +208,9 @@ pub const Palette = struct {
     model_status: vaxis.Style,
     thinking_label: vaxis.Style,
     thinking_body: vaxis.Style,
+    body: vaxis.Style,
+    background: vaxis.Style,
+    intro_accent: vaxis.Style,
     checkpoint: vaxis.Style,
     checkpoint_mark: vaxis.Style,
     thinking_bar: vaxis.Style,
@@ -235,6 +259,9 @@ pub fn buildPalette(theme: Theme) Palette {
         .model_status = .{ .fg = .{ .rgb = theme.thinking_blue } },
         .thinking_label = .{ .fg = .{ .rgb = theme.thinking_blue } },
         .thinking_body = .{ .fg = .{ .rgb = theme.muted_gray } },
+        .body = .{ .fg = .{ .rgb = theme.body } },
+        .background = .{ .bg = .{ .rgb = theme.background } },
+        .intro_accent = .{ .fg = .{ .rgb = theme.blackhole_orange } },
         .checkpoint = .{ .fg = .{ .rgb = theme.thinking_blue } },
         .checkpoint_mark = .{ .fg = .{ .rgb = theme.code_blue } },
         .thinking_bar = .{ .fg = .{ .rgb = theme.thinking_blue } },
@@ -257,6 +284,16 @@ pub fn buildPalette(theme: Theme) Palette {
         .settings_active_tab = .{ .fg = .{ .rgb = theme.accent_orange }, .ul_style = .single, .bold = true },
         .permission_approve = .{ .fg = .{ .rgb = theme.success_green }, .bold = true },
     };
+}
+
+/// Cheap perceptual-contrast check: max-channel absolute delta between two RGBs.
+/// A floor here is a soft guard that theme data actually keeps readable
+/// foreground-on-background pairs, far below any real gap.
+fn contrastFloor(a: Rgb, b: Rgb) u16 {
+    const r: u16 = @intCast(@abs(@as(i16, a[0]) - @as(i16, b[0])));
+    const g: u16 = @intCast(@abs(@as(i16, a[1]) - @as(i16, b[1])));
+    const bl: u16 = @intCast(@abs(@as(i16, a[2]) - @as(i16, b[2])));
+    return @max(r, @max(g, bl));
 }
 
 /// The active runtime palette, installed once at startup by `tui.run`. Render
@@ -304,6 +341,29 @@ test "buildPalette(default_theme) preserves the original look" {
     try std.testing.expectEqual(@as(Rgb, .{ 96, 165, 250 }), p.thinking_label.fg.rgb);
     try std.testing.expectEqual(@as(Rgb, .{ 212, 175, 55 }), p.user.fg.rgb);
     try std.testing.expectEqual(@as(Rgb, .{ 252, 211, 77 }), p.markdown_heading.fg.rgb);
+    // The three new defaults: agent body = white, card = near-black,
+    // intro accent = unchanged orange.
+    try std.testing.expectEqual(@as(Rgb, .{ 255, 255, 255 }), p.body.fg.rgb);
+    try std.testing.expectEqual(@as(Rgb, .{ 17, 17, 20 }), p.background.bg.rgb);
+    try std.testing.expectEqual(@as(Rgb, .{ 255, 106, 61 }), p.intro_accent.fg.rgb);
+}
+
+test "palette body/background derive per-theme" {
+    // Pure derivation round-trip: each new palette style comes from its theme slot.
+    const p = buildPalette(nord);
+    try std.testing.expectEqual(nord.body, p.body.fg.rgb);
+    try std.testing.expectEqual(nord.background, p.background.bg.rgb);
+    try std.testing.expectEqual(nord.blackhole_orange, p.intro_accent.fg.rgb);
+}
+
+test "every theme's body/background stays readable (min channel contrast)" {
+    for (themes) |t| {
+        // body vs background: near-white on a dark card → far above any floor.
+        try std.testing.expect(contrastFloor(t.body, t.background) > 60);
+        // selection_bg vs background must differ so a selected picker row is
+        // visible against a coincident card.
+        try std.testing.expect(contrastFloor(t.selection_bg, t.background) > 8);
+    }
 }
 
 test "themes array has unique non-empty names" {
