@@ -109,7 +109,8 @@ JSON keys are **camelCase**. Legacy snake_case keys from schema v1 are still acc
 | `strictOutputs`        | `boolean` | `true` to send OpenAI strict structured-outputs mode (`"strict":true`, `additionalProperties:false`, all properties in `required`) in tool definitions. **Only works against the OpenAI API** — gateways (OpenRouter/Ollama/vLLM/Together) reject or silently break it, which disables function-calling (the model then emits tool calls as plain text). Defaults to `false` so tool-calling works everywhere. Enable only when talking directly to OpenAI. Legacy key `strict_outputs` is parsed for backward compatibility but is not schema-valid; new configs must use `strictOutputs`. |
 | `systemPrompt`         | `string`  | Base system prompt template (max 10 000 chars). Legacy key `system_prompt` is parsed for backward compatibility but is not schema-valid; new configs must use `systemPrompt`.                                                                                                                                                                                                                                                                                                                                                           |
 | `bashClassifierUrl`    | `string`  | ModernBERT classifier endpoint for shell command safety check. Legacy key `bash_classifier_url` is parsed for backward compatibility but is not schema-valid; new configs must use `bashClassifierUrl`.                                                                                                                                                                                                                                                                                                                                      |
-| `theme`                | `string`  | Name of the builtin color theme for the TUI. `default` preserves the classic look; the other builtin themes are `cappuccino` (Catppuccin Mocha), `tokyo_night` (Tokyo Night), `dracula` (Dracula), `nord` (Nord), and `gruvbox_dark` (Gruvbox Dark). Unknown or empty names fall back to `default` at resolve time; absent = `default`. The builtin themes are compiled in — a new theme is added to `src/tui/style.zig`. No legacy snake_case key or environment variable exists for this field. |
+| `theme`                | `string`  | Name of the color theme for the TUI. `default` preserves the classic look; the other builtin themes are `cappuccino` (Catppuccin Mocha), `tokyo_night` (Tokyo Night), `dracula` (Dracula), `nord` (Nord), and `gruvbox_dark` (Gruvbox Dark). Custom theme slugs loaded from the themes directory are also valid. Unknown or empty names fall back to `default` at resolve time; absent = `default`. The builtin themes are compiled in — a new builtin theme is added to `src/tui/style.zig`. No legacy snake_case key or environment variable exists for this field. |
+| `tui`                  | `object`  | TUI appearance, live preview, and picker settings. See [TUI Theme & Search Ergonomics](#tui-theme--search-ergonomics).                                                                                                                                                                                                                                                                                                                                  |
 | `toast`                | `object`  | Transient toast notifications (top-right TUI notices). See [Toast settings](#toast-settings).                                                                                                                                                                                                                                                                                                                                                          |
 | `context`              | `object`  | Context window management and compaction policy. See [Context settings](#context-settings).                                                                                                                                                                                                                                                                                                                                                            |
 | `mcpServers`           | `object`  | MCP server configurations (Claude Desktop format compatible). Legacy keys `mcp_servers` and `mcp` are parsed for backward compatibility but are not schema-valid; new configs must use `mcpServers`.                                                                                                                                                                                                                                                                                                                                   |
@@ -175,6 +176,49 @@ When changing themes dynamically in the TUI via `/theme <name>` or the interacti
 - If the active project configuration (`<cwd>/.nova/config.json`) defines a `theme`, the new choice persists to the project configuration via `mergeAndWriteProject`.
 - Otherwise, the theme persists to the user's global configuration (`~/.config/nova/config.json`) via `mergeAndWriteGlobal`.
 - Unknown, empty, or typoed theme names fall back to `default` and display a notice in the transcript (`Theme '<name>' not found; using default`). If writing configuration to disk fails, the live session still switches theme and a `(not saved)` notice is appended.
+
+### TUI Theme & Search Ergonomics
+
+The `tui` object controls live theme preview, custom-theme discovery, and fuzzy-match highlighting in the search pickers:
+
+| Field                     | Type      | Default    | Description                                                                                                                                                                                                                                                        |
+| ------------------------- | --------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `tui.themeLivePreview`    | `boolean` | `true`     | Recolor the UI live while browsing themes in the `/theme` picker. `Esc` reverts to the pre-open theme; `Enter` commits and persists.                                                                                                                               |
+| `tui.customThemesDir`     | `string`  | _(none)_   | Optional directory containing user theme JSON files. When set, it **replaces** the default scan of `~/.config/nova/themes/` and `.nova/themes/` — only this directory is scanned.                                                                                  |
+| `tui.fuzzyHighlight`      | `boolean` | `true`     | Highlight matching characters in the search pickers (`@` mention, `/model`, `/resume`, `/theme`, `/command`).                                                                                                                                                      |
+| `tui.fuzzyHighlightStyle` | `string`  | `accent`   | Style of matched runes: `accent` (the theme's accent orange), `bold`, or `underline`.                                                                                                                                                                              |
+| `theme`                   | `string`  | `default`  | Active theme name. Any custom theme slug loaded from the themes directory resolves at startup and in the `/theme` picker. See [TUI Theme](#tui-theme).                                                                                                              |
+
+**Custom theme JSON format.** Drop a `*.json` file into `~/.config/nova/themes/` (or `.nova/themes/`, or the directory named by `tui.customThemesDir`). Each file is a flat object with a `name` plus the 18 `Rgb` `[r,g,b]` arrays matching the builtin theme slots (`thinking_blue`, `user_yellow`, `success_green`, `failure_red`, `accent_orange`, `skill_purple`, `lane_pink`, `muted_gray`, `selection_bg`, `amber_yellow`, `white`, `code_blue`, `faint_add_bg`, `faint_del_bg`, `body`, `background`, `blackhole_orange`, `markdown_heading`):
+
+```json
+{
+  "name": "my_theme",
+  "thinking_blue": [96, 165, 250],
+  "user_yellow": [212, 175, 55],
+  "success_green": [34, 197, 94],
+  "failure_red": [239, 68, 68],
+  "accent_orange": [249, 115, 22],
+  "skill_purple": [168, 85, 247],
+  "lane_pink": [244, 114, 182],
+  "muted_gray": [138, 138, 138],
+  "selection_bg": [38, 38, 38],
+  "amber_yellow": [245, 158, 11],
+  "white": [255, 255, 255],
+  "code_blue": [147, 197, 253],
+  "faint_add_bg": [22, 43, 30],
+  "faint_del_bg": [52, 27, 27],
+  "body": [255, 255, 255],
+  "background": [17, 17, 20],
+  "blackhole_orange": [255, 106, 61],
+  "markdown_heading": [252, 211, 77]
+}
+```
+
+A theme is rejected (and skipped) if it fails validation parity with the builtin suite: body/background WCAG contrast below 4.5:1, or a `selection_bg`/`background` channel delta below 20 (a selected picker row must stay visible against a coincident card). Missing themes directories are a no-op, not an error.
+
+> [!NOTE]
+> **`tui.customThemesDir` replaces the default scan.** When set, only that directory is scanned for custom themes; `~/.config/nova/themes/` and `.nova/themes/` are ignored. An explicitly-set path means "use this location", not "also scan the defaults".
 
 
 ### Provider Configuration

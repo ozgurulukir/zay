@@ -7,6 +7,7 @@ const codex = @import("../../auth/codex.zig");
 const message = @import("message.zig");
 const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
+const config_mod = @import("../../config/config.zig");
 
 fn columnStyle(focused: bool, selected: bool) vaxis.Style {
     const p = tui_style.activePalette();
@@ -80,6 +81,8 @@ pub const Content = struct {
     footer: []const u8 = "",
     loading: bool = false,
     error_message: ?[]const u8 = null,
+    highlight_enabled: bool = true,
+    highlight_style: config_mod.FuzzyHighlightStyle = .accent,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -164,6 +167,9 @@ pub const Content = struct {
                 .column = self.column,
                 .active_model = self.active_model,
                 .reasoning_label = self.reasoningLabel(d),
+                .filter = self.filter,
+                .highlight_enabled = self.highlight_enabled,
+                .highlight_style = self.highlight_style,
             };
             widgets[vis + 1] = rows[vis].widget();
             if (self.selection == d) cursor = @intCast(vis + 1);
@@ -301,6 +307,9 @@ pub const Row = struct {
     column: Column,
     active_model: ?[]const u8,
     reasoning_label: []const u8,
+    filter: []const u8 = "",
+    highlight_enabled: bool = true,
+    highlight_style: config_mod.FuzzyHighlightStyle = .accent,
 
     pub fn widget(self: *Row) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -311,16 +320,30 @@ pub const Row = struct {
         const p = tui_style.activePalette();
         const width = ctx.max.width orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
-        if (self.selected) panel.fillRow(&surface, 0, p.selected);
 
         const model_focused = self.selected and self.column == .model;
         const prefix = "  ";
         const start_col = message.ConversationLayout.left -| 1;
-        const base = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.model.label });
-        try panel.lineStyledAt(&surface, 0, base, ctx, start_col, columnStyle(model_focused, self.selected));
+        // The model-label line migrates to drawFuzzyListRow (base_style
+        // preserves columnStyle's column-focus semantics, M6).
+        try panel.drawFuzzyListRow(&surface, 0, ctx, .{
+            .prefix = prefix,
+            .text = self.model.label,
+            .query = self.filter,
+            .selected = self.selected,
+            .base_style = columnStyle(model_focused, self.selected),
+            .start_col = start_col,
+            .highlight_enabled = self.highlight_enabled,
+            .highlight_style = self.highlight_style,
+        });
+        // Keep the inline ✓ badge (m3): trailing_mark would right-anchor at
+        // width-1, colliding with the reasoning column on selected rows.
         if (self.activeModel()) {
             const badge_col: u16 = start_col +
-                @as(u16, @intCast(@min(ctx.stringWidth(base), @as(usize, std.math.maxInt(u16)))));
+                @as(u16, @intCast(@min(
+                    ctx.stringWidth(prefix) + ctx.stringWidth(self.model.label),
+                    @as(usize, std.math.maxInt(u16)),
+                )));
             try panel.lineStyledAt(&surface, 0, " ✓", ctx, badge_col, tui_style.onSelectionBg(p.success, self.selected));
         }
         if (self.selected) try self.drawReasoning(&surface, ctx);

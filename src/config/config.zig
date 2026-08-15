@@ -141,6 +141,23 @@ pub const ToastSettings = struct {
     position: ?[]u8 = null,
 };
 
+/// How fuzzy-matched runes are styled in the search pickers.
+pub const FuzzyHighlightStyle = enum { accent, bold, underline };
+
+/// TUI appearance, live theme preview, and picker settings.
+pub const TuiSettings = struct {
+    /// Recolor the UI live while browsing themes in the /theme picker.
+    theme_live_preview: bool = true,
+    /// Optional directory containing user theme JSON files. When set, it
+    /// REPLACES the default scan of `~/.config/nova/themes/` and
+    /// `.nova/themes/`. Owned when parsed from disk.
+    custom_themes_dir: ?[]u8 = null,
+    /// Highlight matching characters in search pickers.
+    fuzzy_highlight: bool = true,
+    /// Style of matched runes: 'accent', 'bold', or 'underline'.
+    fuzzy_highlight_style: FuzzyHighlightStyle = .accent,
+};
+
 pub const Config = struct {
     /// Semantic version of the configuration schema instance.
     /// Null means the default ("2.0.0"). Stored as an owned slice
@@ -176,6 +193,8 @@ pub const Config = struct {
     context: ContextSettings = .{},
     /// Toast notification settings (the generic toast bus).
     toast: ToastSettings = .{},
+    /// TUI appearance, live preview, and picker settings.
+    tui: TuiSettings = .{},
     /// Typed view of the model selection. `null` when the required
     /// fields (provider, base_url, api_key, model) aren't all set.
     /// Equivalent to the old `assertModelSelection` check — but the
@@ -223,6 +242,7 @@ pub const Config = struct {
         if (self.dynamic_provider_name) |s| gpa.free(s);
         if (self.dynamic_provider_id) |s| gpa.free(s);
         if (self.toast.position) |s| gpa.free(s);
+        if (self.tui.custom_themes_dir) |s| gpa.free(s);
         if (self.model_selection) |*ms| ms.deinit(gpa);
         self.* = undefined;
     }
@@ -251,6 +271,8 @@ pub const Config = struct {
         if (self.dynamic_provider_name) |s| out.dynamic_provider_name = try gpa.dupe(u8, s);
         if (self.dynamic_provider_id) |s| out.dynamic_provider_id = try gpa.dupe(u8, s);
         if (self.toast.position) |s| out.toast.position = try gpa.dupe(u8, s);
+        out.tui = self.tui;
+        if (self.tui.custom_themes_dir) |s| out.tui.custom_themes_dir = try gpa.dupe(u8, s);
         if (self.model_selection) |ms| out.model_selection = try ms.clone(gpa);
         return out;
     }

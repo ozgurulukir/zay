@@ -34,7 +34,6 @@ const clipboard_helper = @import("clipboard_helper.zig");
 const help_picker = @import("widgets/help_picker.zig");
 const theme_lifecycle = @import("theme_lifecycle.zig");
 const theme_picker = @import("widgets/theme_picker.zig");
-const tui_style = @import("style.zig");
 const previousIndex = tui.previousIndex;
 const nextIndex = tui.nextIndex;
 
@@ -356,14 +355,27 @@ const ThemePicker = struct {
         if (key.matches(vaxis.Key.up, .{})) {
             const next = previousIndex(app.pickers.theme.selection, theme_pickerMatchingCount(app));
             app.pickers.theme.selection = next;
+            try previewSelected(app);
             return true;
         }
         if (key.matches(vaxis.Key.down, .{})) {
             const next = nextIndex(app.pickers.theme.selection, theme_pickerMatchingCount(app));
             app.pickers.theme.selection = next;
+            try previewSelected(app);
             return true;
         }
         return false;
+    }
+
+    /// Live-recolor to the newly selected theme when `tui.theme_live_preview`
+    /// is enabled. No-op otherwise (and when the selection doesn't resolve).
+    fn previewSelected(app: *App) !void {
+        if (!app.cached_config.tui.theme_live_preview) return;
+        const filter = app.peekPaletteInput() catch return;
+        defer app.gpa.free(filter);
+        if (theme_picker.selectedName(app.theme_registry.slice(), filter, app.pickers.theme.selection)) |name| {
+            theme_lifecycle.previewTheme(app, app.theme_registry.resolve(name));
+        }
     }
 
     /// The number of themes the current palette filter selects — zero-division
@@ -371,7 +383,7 @@ const ThemePicker = struct {
     fn theme_pickerMatchingCount(app: *App) u32 {
         const filter = app.peekPaletteInput() catch return 0;
         defer app.gpa.free(filter);
-        return theme_picker.countMatching(tui_style.allThemes(), filter);
+        return theme_picker.countMatching(app.theme_registry.slice(), filter);
     }
 };
 

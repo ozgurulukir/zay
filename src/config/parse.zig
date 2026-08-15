@@ -22,6 +22,8 @@ const Config = config_mod.Config;
 const ContextSettings = config_mod.ContextSettings;
 const CompactionSettings = config_mod.CompactionSettings;
 const ToastSettings = config_mod.ToastSettings;
+const TuiSettings = config_mod.TuiSettings;
+const FuzzyHighlightStyle = config_mod.FuzzyHighlightStyle;
 const Diagnostic = config_mod.Diagnostic;
 const LoadResult = config_mod.LoadResult;
 
@@ -145,6 +147,7 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
     for (updates.plugins) |plugin| try applyPluginOverlay(gpa, target, plugin);
     applyContextOverlay(&target.context, updates.context);
     try applyToastOverlay(gpa, target, updates.toast);
+    try applyTuiOverlay(gpa, target, updates.tui);
     // Theme is independent of model selection, so it merges unconditionally.
     if (updates.theme) |s| try replaceOptionalSlice(gpa, &target.theme, s);
 }
@@ -160,6 +163,22 @@ fn applyToastOverlay(gpa: std.mem.Allocator, target: *Config, updates: ToastSett
         if (target.toast.position) |old| gpa.free(old);
         target.toast.position = try gpa.dupe(u8, s);
     }
+}
+
+/// Merge TUI settings: non-default values in `updates` override `target`.
+/// `custom_themes_dir` is owned by `updates`; when it changes, the target's
+/// old value is freed and the new one is duped.
+fn applyTuiOverlay(gpa: std.mem.Allocator, target: *Config, updates: TuiSettings) !void {
+    // Only non-default values override — a default `updates` must leave the
+    // target's stored settings intact (unrelated partial config writes route
+    // through here with an all-default `tui`).
+    if (!updates.theme_live_preview) target.tui.theme_live_preview = false;
+    if (updates.custom_themes_dir) |s| {
+        if (target.tui.custom_themes_dir) |old| gpa.free(old);
+        target.tui.custom_themes_dir = try gpa.dupe(u8, s);
+    }
+    if (!updates.fuzzy_highlight) target.tui.fuzzy_highlight = false;
+    if (updates.fuzzy_highlight_style != .accent) target.tui.fuzzy_highlight_style = updates.fuzzy_highlight_style;
 }
 
 /// Merge context settings: non-default values in `updates` override `target`.
@@ -556,6 +575,11 @@ fn parseObject(
         if (toast_val == .object) out.toast = try parseToast(gpa, toast_val);
     }
 
+    // TUI appearance / live preview / picker settings.
+    if (value.object.get("tui")) |tui_val| {
+        if (tui_val == .object) out.tui = try parseTui(gpa, tui_val);
+    }
+
     // Populate the typed `model_selection` when all required fields
     // are present. Missing any of them leaves it null — the legacy
     // optional fields stay so existing callers keep working until
@@ -694,6 +718,17 @@ fn parseToast(gpa: std.mem.Allocator, value: std.json.Value) !ToastSettings {
     }
     if (stringField(value, "position")) |s| toast.position = try gpa.dupe(u8, s);
     return toast;
+}
+
+fn parseTui(gpa: std.mem.Allocator, value: std.json.Value) !TuiSettings {
+    var tui: TuiSettings = .{};
+    if (boolField(value, "themeLivePreview")) |b| tui.theme_live_preview = b;
+    if (stringField(value, "customThemesDir")) |s| tui.custom_themes_dir = try gpa.dupe(u8, s);
+    if (boolField(value, "fuzzyHighlight")) |b| tui.fuzzy_highlight = b;
+    if (stringField(value, "fuzzyHighlightStyle")) |s| {
+        tui.fuzzy_highlight_style = std.meta.stringToEnum(FuzzyHighlightStyle, s) orelse .accent;
+    }
+    return tui;
 }
 
 fn parseProviders(gpa: std.mem.Allocator, value: std.json.Value) ![]ProviderConfig {
@@ -1216,6 +1251,11 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
         try writeKey(writer, "toast", &wrote_any);
         try writeToast(writer, config.toast);
     }
+    // TUI: only written when at least one field differs from defaults.
+    if (hasNonDefaultTui(config.tui)) {
+        try writeKey(writer, "tui", &wrote_any);
+        try writeTui(writer, config.tui);
+    }
     // Theme: written when set and non-empty. Absent = default at resolve time.
     if (config.theme) |t| {
         if (t.len > 0) {
@@ -1252,6 +1292,36 @@ fn writeToast(writer: *std.Io.Writer, toast: ToastSettings) !void {
     if (toast.position) |s| {
         try writeKeyNoIndent(writer, "position", &wrote_any);
         try std.json.Stringify.value(s, .{}, writer);
+    }
+    try writer.writeByte('}');
+}
+
+fn hasNonDefaultTui(tui: TuiSettings) bool {
+    if (!tui.theme_live_preview) return true;
+    if (tui.custom_themes_dir != null) return true;
+    if (!tui.fuzzy_highlight) return true;
+    if (tui.fuzzy_highlight_style != .accent) return true;
+    return false;
+}
+
+fn writeTui(writer: *std.Io.Writer, tui: TuiSettings) !void {
+    try writer.writeByte('{');
+    var wrote_any = false;
+    if (!tui.theme_live_preview) {
+        try writeKeyNoIndent(writer, "themeLivePreview", &wrote_any);
+        try writer.writeAll("false");
+    }
+    if (tui.custom_themes_dir) |s| {
+        try writeKeyNoIndent(writer, "customThemesDir", &wrote_any);
+        try std.json.Stringify.value(s, .{}, writer);
+    }
+    if (!tui.fuzzy_highlight) {
+        try writeKeyNoIndent(writer, "fuzzyHighlight", &wrote_any);
+        try writer.writeAll("false");
+    }
+    if (tui.fuzzy_highlight_style != .accent) {
+        try writeKeyNoIndent(writer, "fuzzyHighlightStyle", &wrote_any);
+        try std.json.Stringify.value(@tagName(tui.fuzzy_highlight_style), .{}, writer);
     }
     try writer.writeByte('}');
 }
@@ -2881,4 +2951,116 @@ test "mergeLayers: later-layer theme wins" {
     var merged = try mergeLayers(gpa, &.{ global, project });
     defer merged.deinit(gpa);
     try std.testing.expectEqualStrings("cappuccino", merged.theme.?);
+}
+
+test "parseObject parses the tui object's four fields" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    const json =
+        \\{"tui":{"themeLivePreview":false,"customThemesDir":"/tmp/my-themes","fuzzyHighlight":false,"fuzzyHighlightStyle":"bold"}}
+    ;
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqual(false, cfg.tui.theme_live_preview);
+    try std.testing.expectEqualStrings("/tmp/my-themes", cfg.tui.custom_themes_dir.?);
+    try std.testing.expectEqual(false, cfg.tui.fuzzy_highlight);
+    try std.testing.expectEqual(FuzzyHighlightStyle.bold, cfg.tui.fuzzy_highlight_style);
+}
+
+test "parseTui falls back to .accent on an unknown fuzzyHighlightStyle" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    const json = "{\"tui\":{\"fuzzyHighlightStyle\":\"rainbow\"}}";
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqual(FuzzyHighlightStyle.accent, cfg.tui.fuzzy_highlight_style);
+}
+
+test "serialize omits tui when default and writes it when non-default" {
+    const gpa = std.testing.allocator;
+
+    // Default tui → section omitted.
+    var default_cfg: Config = .{};
+    defer default_cfg.deinit(gpa);
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, default_cfg);
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"tui\"") == null);
+
+    // Non-default tui → section written and round-trips.
+    var non_default: Config = .{
+        .tui = .{
+            .theme_live_preview = false,
+            .custom_themes_dir = try gpa.dupe(u8, "/tmp/my-themes"),
+            .fuzzy_highlight = false,
+            .fuzzy_highlight_style = .underline,
+        },
+    };
+    defer non_default.deinit(gpa);
+    var buf2: std.Io.Writer.Allocating = .init(gpa);
+    defer buf2.deinit();
+    try serialize(gpa, &buf2.writer, non_default);
+    const text = buf2.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"tui\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"themeLivePreview\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"customThemesDir\":\"/tmp/my-themes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"fuzzyHighlight\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"fuzzyHighlightStyle\":\"underline\"") != null);
+
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    var parsed = try parseFile(gpa, "<test>", text, &sink);
+    defer parsed.deinit(gpa);
+    try std.testing.expectEqual(false, parsed.tui.theme_live_preview);
+    try std.testing.expectEqualStrings("/tmp/my-themes", parsed.tui.custom_themes_dir.?);
+    try std.testing.expectEqual(false, parsed.tui.fuzzy_highlight);
+    try std.testing.expectEqual(FuzzyHighlightStyle.underline, parsed.tui.fuzzy_highlight_style);
+}
+
+test "applyTuiOverlay overrides non-default values and dupes customThemesDir" {
+    const gpa = std.testing.allocator;
+    var target: Config = .{};
+    defer target.deinit(gpa);
+
+    var updates: Config = .{
+        .tui = .{
+            .theme_live_preview = false,
+            .custom_themes_dir = try gpa.dupe(u8, "/tmp/custom"),
+            .fuzzy_highlight = false,
+            .fuzzy_highlight_style = .bold,
+        },
+    };
+    defer updates.deinit(gpa);
+
+    try applyConfigOverlay(gpa, &target, updates);
+    try std.testing.expectEqual(false, target.tui.theme_live_preview);
+    try std.testing.expectEqualStrings("/tmp/custom", target.tui.custom_themes_dir.?);
+    try std.testing.expectEqual(false, target.tui.fuzzy_highlight);
+    try std.testing.expectEqual(FuzzyHighlightStyle.bold, target.tui.fuzzy_highlight_style);
+}
+
+test "applyTuiOverlay with default updates preserves stored non-default settings" {
+    // Regression: unrelated partial config writes (theme apply, model save,
+    // settings save) route through applyConfigOverlay with an all-default
+    // `updates.tui`. It must NOT clobber stored themeLivePreview:false /
+    // fuzzyHighlight:false — otherwise serialize drops the whole "tui" section.
+    const gpa = std.testing.allocator;
+    var target: Config = .{
+        .tui = .{
+            .theme_live_preview = false,
+            .fuzzy_highlight = false,
+            .fuzzy_highlight_style = .underline,
+        },
+    };
+    defer target.deinit(gpa);
+
+    // updates.tui is entirely default.
+    const updates: Config = .{};
+    try applyConfigOverlay(gpa, &target, updates);
+
+    try std.testing.expectEqual(false, target.tui.theme_live_preview);
+    try std.testing.expectEqual(false, target.tui.fuzzy_highlight);
+    try std.testing.expectEqual(FuzzyHighlightStyle.underline, target.tui.fuzzy_highlight_style);
 }

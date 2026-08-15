@@ -64,10 +64,13 @@
       "$ref": "#/$defs/ToastSettings",
       "description": "Toast notification settings (transient top-right TUI notices)."
     },
+    "tui": {
+      "$ref": "#/$defs/TuiSettings",
+      "description": "TUI appearance, live preview, and picker settings."
+    },
     "theme": {
       "type": "string",
-      "enum": ["default", "cappuccino", "tokyo_night", "dracula", "nord", "gruvbox_dark"],
-      "description": "Name of the builtin color theme for the TUI. Unknown or empty names fall back to 'default' at resolve time. Absent = 'default'."
+      "description": "Active color theme name ('default', 'cappuccino', 'tokyo_night', 'dracula', 'nord', 'gruvbox_dark', or any custom theme slug loaded from the themes directory)."
     }
   },
   "additionalProperties": false,
@@ -327,6 +330,34 @@
           "type": "string",
           "default": "top-right",
           "description": "Corner position. Reserved for future use: only 'top-right' is rendered today; other values are parsed and persisted but have no effect yet."
+        }
+      },
+      "additionalProperties": false
+    },
+    "TuiSettings": {
+      "type": "object",
+      "description": "TUI appearance, live theme preview, and picker settings. All fields are optional and omitted from config.json when left at defaults.",
+      "properties": {
+        "themeLivePreview": {
+          "type": "boolean",
+          "default": true,
+          "description": "Recolor the UI live while browsing themes in the /theme picker."
+        },
+        "customThemesDir": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "Optional directory path containing user theme JSON files. When set, it REPLACES the default scan of ~/.config/nova/themes/ and .nova/themes/."
+        },
+        "fuzzyHighlight": {
+          "type": "boolean",
+          "default": true,
+          "description": "Highlight matching characters in search pickers."
+        },
+        "fuzzyHighlightStyle": {
+          "type": "string",
+          "enum": ["accent", "bold", "underline"],
+          "default": "accent",
+          "description": "Style of matched runes: 'accent', 'bold', or 'underline'."
         }
       },
       "additionalProperties": false

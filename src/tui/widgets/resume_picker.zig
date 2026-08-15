@@ -9,6 +9,7 @@ const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
 const tui_status = @import("../status.zig");
 const tree_art = @import("tree_art.zig");
+const config_mod = @import("../../config/config.zig");
 
 pub const Content = struct {
     io: std.Io,
@@ -26,6 +27,8 @@ pub const Content = struct {
     /// Rename text buffer (borrowed from `app.input_buffers.session_rename_text`).
     /// Only rendered while `action == .renaming`.
     rename_text: []const u8 = "",
+    highlight_enabled: bool = true,
+    highlight_style: config_mod.FuzzyHighlightStyle = .accent,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -118,6 +121,8 @@ pub const Content = struct {
             .rows = rows,
             .widgets = widgets,
             .selection = self.selection,
+            .highlight_enabled = self.highlight_enabled,
+            .highlight_style = self.highlight_style,
         };
         try builder.build();
         return widgets;
@@ -137,6 +142,8 @@ const RowBuilder = struct {
     rows: []Row,
     widgets: []vxfw.Widget,
     selection: u32,
+    highlight_enabled: bool,
+    highlight_style: config_mod.FuzzyHighlightStyle,
     index: u32 = 0,
 
     fn build(self: *RowBuilder) !void {
@@ -241,6 +248,9 @@ const RowBuilder = struct {
             .io = self.io,
             .kind = .{ .session = .{ .summary = summary, .prefix = prefix } },
             .selected = self.index == self.selection,
+            .filter = self.filter,
+            .highlight_enabled = self.highlight_enabled,
+            .highlight_style = self.highlight_style,
         };
         self.widgets[self.index] = self.rows[self.index].widget();
         self.index += 1;
@@ -267,6 +277,9 @@ const Row = struct {
     io: std.Io,
     kind: Kind,
     selected: bool,
+    filter: []const u8 = "",
+    highlight_enabled: bool = true,
+    highlight_style: config_mod.FuzzyHighlightStyle = .accent,
 
     const Kind = union(enum) {
         project: Project,
@@ -342,20 +355,31 @@ const Row = struct {
     fn drawSession(self: *Row, surface: *vxfw.Surface, ctx: vxfw.DrawContext, session: Session) !void {
         var buffer: [128]u8 = undefined;
         const modified = tui_status.modifiedTime(self.io, buffer[0..], session.summary.updated_at_ms);
-        const left = try sessionLeftText(ctx, surface.size.width, modified, session);
-        try panel.commandLine(surface, 0, left, ctx, self.selected);
-        try panel.right(surface, 0, modified, ctx, self.selected);
-    }
-
-    fn sessionLeftText(ctx: vxfw.DrawContext, width: u16, modified: []const u8, session: Session) ![]const u8 {
+        const left_width = resumeLeftWidth(ctx, surface.size.width, modified);
         const marker = "  ";
-        const available = resumeLeftWidth(ctx, width, modified);
         const prefix_width = ctx.stringWidth(marker) + ctx.stringWidth(session.prefix);
-        if (available <= prefix_width) return ctx.arena.dupe(u8, marker);
-
-        const name = session.summary.title orelse "Untitled";
-        const title = try truncateText(ctx, name, available - prefix_width);
-        return std.fmt.allocPrint(ctx.arena, "{s}{s}{s}", .{ marker, session.prefix, title });
+        // The title is pre-truncated to account for the right-aligned time
+        // column (m2); drawFuzzyListRow must not re-truncate it.
+        const title = if (left_width <= prefix_width)
+            ""
+        else
+            try truncateText(ctx, session.summary.title orelse "Untitled", left_width - prefix_width);
+        // At extreme narrow widths draw only the marker (the tree prefix is
+        // dropped entirely), matching the pre-migration behavior.
+        const prefix = if (left_width > prefix_width and session.prefix.len > 0)
+            try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ marker, session.prefix })
+        else
+            marker;
+        try panel.drawFuzzyListRow(surface, 0, ctx, .{
+            .prefix = prefix,
+            .text = title,
+            .query = self.filter,
+            .selected = self.selected,
+            .start_col = message.ConversationLayout.left -| 1,
+            .highlight_enabled = self.highlight_enabled,
+            .highlight_style = self.highlight_style,
+        });
+        try panel.right(surface, 0, modified, ctx, self.selected);
     }
 };
 

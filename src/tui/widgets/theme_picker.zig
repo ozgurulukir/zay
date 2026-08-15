@@ -15,6 +15,7 @@ const vxfw = vaxis.vxfw;
 const panel = @import("panel.zig");
 const command_panel = @import("command_panel.zig");
 const tui_style = @import("../style.zig");
+const config_mod = @import("../../config/config.zig");
 
 /// Selection state kept on `App` — mirrors `model_selection`/`command_selection`.
 pub const State = struct {
@@ -27,6 +28,8 @@ pub const Content = struct {
     selection: u32,
     active_name: []const u8,
     filter: []const u8,
+    highlight_enabled: bool = true,
+    highlight_style: config_mod.FuzzyHighlightStyle = .accent,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -71,16 +74,18 @@ pub const Content = struct {
             const selected = match_idx == self.selection;
             const screen_row = viewport.screenRow(match_idx);
 
-            const text = try std.fmt.allocPrint(ctx.arena, "  ./{s}", .{theme.name});
-            try panel.commandLine(surface, screen_row, text, ctx, selected);
-
-            // Mark the currently-active theme so the highlighted row is obvious
-            // even when the cursor still sits elsewhere.
-            if (std.mem.eql(u8, theme.name, self.active_name)) {
-                const mark = "  ✓ current";
-                const mark_style = if (selected) p.selected_item else p.thinking_body;
-                _ = panel.writeBorderTextEndingAt(surface, ctx, screen_row, surface.size.width -| 1, mark, mark_style);
-            }
+            try panel.drawFuzzyListRow(surface, screen_row, ctx, .{
+                .prefix = "  ./",
+                .text = theme.name,
+                .query = self.filter,
+                .selected = selected,
+                .start_col = 1,
+                // Mark the currently-active theme so the highlighted row is
+                // obvious even when the cursor still sits elsewhere.
+                .trailing_mark = if (std.mem.eql(u8, theme.name, self.active_name)) "  ✓ current" else null,
+                .highlight_enabled = self.highlight_enabled,
+                .highlight_style = self.highlight_style,
+            });
         }
     }
 };

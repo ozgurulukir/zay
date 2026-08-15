@@ -31,6 +31,9 @@ pub fn syncModeWithInput(app: *App, value: []const u8) !void {
     if (app.mode == .session_picker and app.nav.session_action != .browsing) return;
     if (app.mode == .session_picker or app.mode == .provider_picker or app.mode == .model_picker or app.mode == .tree_picker or app.mode == .theme_picker) {
         if (value.len > 0 and value[0] == command_prefix) {
+            // Leaving `.theme_picker` via a leading '/' is a non-commit exit —
+            // revert the live preview before entering the command menu (M2).
+            if (app.mode == .theme_picker) theme_lifecycle.closeThemePicker(app);
             app.mode = .command;
             app.nav.command_selection = 0;
             return;
@@ -39,7 +42,7 @@ pub fn syncModeWithInput(app: *App, value: []const u8) !void {
             // Keep the selection valid while filtering: a filter that removes
             // the selected row resets to the top instead of pointing past the
             // list. Stays in sync with the `.command` clamp in event_callbacks.
-            const count = theme_picker.countMatching(tui_style.allThemes(), value);
+            const count = theme_picker.countMatching(app.theme_registry.slice(), value);
             if (app.pickers.theme.selection >= count) app.pickers.theme.selection = 0;
         }
         if (app.mode == .session_picker) {
@@ -97,6 +100,13 @@ pub fn cancelMode(app: *App) !bool {
         app.mode = .normal;
         app.clearInput();
         app.clearPaletteInput();
+        return true;
+    }
+    // Theme picker: Esc reverts the live preview and resets mode. This must
+    // run before the generic fallthrough below, which would skip the revert
+    // (M2 — any non-commit exit from `.theme_picker` reverts).
+    if (app.mode == .theme_picker) {
+        theme_lifecycle.closeThemePicker(app);
         return true;
     }
     app.mode = .normal;
@@ -236,11 +246,16 @@ pub fn submitMode(app: *App) !bool {
         defer app.gpa.free(filter);
         app.clearPaletteInput();
         app.clearInput();
-        const count = theme_picker.countMatching(tui_style.allThemes(), filter);
+        const count = theme_picker.countMatching(app.theme_registry.slice(), filter);
         if (app.pickers.theme.selection < count) {
-            if (theme_picker.selectedName(tui_style.allThemes(), filter, app.pickers.theme.selection)) |name| {
+            if (theme_picker.selectedName(app.theme_registry.slice(), filter, app.pickers.theme.selection)) |name| {
                 theme_lifecycle.applyTheme(app, name) catch |err| try theme_lifecycle.reportThemeError(app, err);
             }
+        } else {
+            // Nothing to apply (a filter removed the selected row). This is a
+            // non-commit exit from `.theme_picker`, so revert any live preview
+            // (M2) instead of leaving it silently active.
+            theme_lifecycle.revertThemePreview(app);
         }
         app.mode = .normal;
         return true;
@@ -672,4 +687,64 @@ test "syncModeWithInput drops theme_picker to command on a leading slash" {
     app.mode = .theme_picker;
     try app.syncModeWithInput("/");
     try std.testing.expectEqual(App.Mode.command, app.mode);
+}
+
+test "cancelMode on theme_picker reverts the preview and resets mode" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    defer tui_style.setActive(tui_style.default_theme);
+
+    app.mode = .theme_picker;
+    app.theme_preview_original = tui_style.default_theme;
+    theme_lifecycle.previewTheme(&app, tui_style.dracula);
+    try std.testing.expectEqual(tui_style.dracula.body, tui_style.activePalette().body.fg.rgb);
+
+    try std.testing.expect(try app.cancelMode());
+    try std.testing.expectEqual(App.Mode.normal, app.mode);
+    try std.testing.expectEqual(tui_style.default_theme.body, tui_style.activePalette().body.fg.rgb);
+    try std.testing.expect(app.theme_preview_original == null);
+}
+
+test "syncModeWithInput leading slash from theme_picker reverts before entering command" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    defer tui_style.setActive(tui_style.default_theme);
+
+    app.mode = .theme_picker;
+    app.theme_preview_original = tui_style.default_theme;
+    theme_lifecycle.previewTheme(&app, tui_style.dracula);
+
+    try app.syncModeWithInput("/");
+    try std.testing.expectEqual(App.Mode.command, app.mode);
+    try std.testing.expectEqual(tui_style.default_theme.body, tui_style.activePalette().body.fg.rgb);
+    try std.testing.expect(app.theme_preview_original == null);
+}
+
+test "submitMode on theme_picker with no matching filter reverts the preview" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    defer tui_style.setActive(tui_style.default_theme);
+
+    app.mode = .theme_picker;
+    app.theme_preview_original = tui_style.default_theme;
+    theme_lifecycle.previewTheme(&app, tui_style.dracula);
+    try std.testing.expectEqual(tui_style.dracula.body, tui_style.activePalette().body.fg.rgb);
+    // A filter with no matches → selection (0) >= count (0), so nothing to apply.
+    try app.inputs.palette.buf.insertSliceAtCursor("zzzz");
+    app.pickers.theme.selection = 0;
+
+    try std.testing.expect(try app.submitMode());
+    try std.testing.expectEqual(App.Mode.normal, app.mode);
+    // The preview is reverted (M2): a non-commit exit must restore the look.
+    try std.testing.expectEqual(tui_style.default_theme.body, tui_style.activePalette().body.fg.rgb);
+    try std.testing.expect(app.theme_preview_original == null);
 }

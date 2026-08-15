@@ -250,12 +250,14 @@ const OverlayInner = struct {
 
     fn drawThemeContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const filter = try app.peekPaletteInputArena(ctx.arena);
-        const active_name = tui_style.resolveTheme(app.cached_config.theme).name;
+        const active_name = app.theme_registry.resolve(app.cached_config.theme).name;
         var content: theme_picker.Content = .{
-            .themes = tui_style.allThemes(),
+            .themes = app.theme_registry.slice(),
             .selection = app.pickers.theme.selection,
             .active_name = active_name,
             .filter = filter,
+            .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
+            .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
         };
         return content.widget().draw(ctx);
     }
@@ -353,6 +355,8 @@ const OverlayInner = struct {
             .entries = buf[0..n],
             .filter = filter,
             .selection = app.nav.command_selection,
+            .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
+            .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
         };
         return content.widget().draw(ctx);
     }
@@ -369,6 +373,8 @@ const OverlayInner = struct {
             .group_by = app.nav.resume_group_by,
             .action = app.nav.session_action,
             .rename_text = app.input_buffers.session_rename_text.items,
+            .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
+            .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
         };
         return content.widget().draw(ctx);
     }
@@ -411,6 +417,8 @@ const OverlayInner = struct {
             .filter = filter,
             .loading = app.pickers.models.load == .loading,
             .error_message = if (app.pickers.models.load == .failed) app.pickers.models.load.failed.message else null,
+            .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
+            .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
         };
         return content.widget().draw(ctx);
     }

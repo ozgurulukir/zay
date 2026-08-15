@@ -5,7 +5,6 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const tui = @import("../tui.zig");
-const tui_style = @import("style.zig");
 const provider_model = @import("provider_model.zig");
 const resume_picker = @import("widgets/resume_picker.zig");
 
@@ -62,7 +61,7 @@ pub fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value
         },
         .theme_picker => {
             const theme_picker = @import("widgets/theme_picker.zig");
-            const count = theme_picker.countMatching(tui_style.allThemes(), value);
+            const count = theme_picker.countMatching(app.theme_registry.slice(), value);
             if (app.pickers.theme.selection >= count) app.pickers.theme.selection = 0;
         },
         .provider_picker, .normal, .save_message, .lanes, .help, .settings, .mcp, .plugins => {},

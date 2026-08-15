@@ -4,6 +4,7 @@ const vxfw = vaxis.vxfw;
 
 const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
+const config_mod = @import("../../config/config.zig");
 
 /// Layout policy shared with the floating-panel host (see `tui.zig`). The body
 /// shows one row for the empty/status message or up to `max_visible_rows`
@@ -45,6 +46,8 @@ pub const AtSearchWidget = struct {
             .sigil = if (self.app.at_search.kind == .file) '@' else '$',
             .title = if (self.app.at_search.kind == .file) "Files" else "Skills",
             .notice = notice,
+            .highlight_enabled = self.app.cached_config.tui.fuzzy_highlight,
+            .highlight_style = self.app.cached_config.tui.fuzzy_highlight_style,
         };
         return content.widget().draw(ctx);
     }
@@ -68,6 +71,8 @@ pub const Content = struct {
     title: []const u8 = "Files",
     /// Optional inline notice shown below results (e.g. a search error).
     notice: []const u8 = "",
+    highlight_enabled: bool = true,
+    highlight_style: config_mod.FuzzyHighlightStyle = .accent,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -126,9 +131,15 @@ const Body = struct {
         while (row < surface.size.height and first + row < count) : (row += 1) {
             const index = first + row;
             const selected = index == content.selection;
-            const prefix = "  ";
-            const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, content.results[index] });
-            try panel.lineAt(&surface, row, text, ctx, selected, 0);
+            try panel.drawFuzzyListRow(&surface, row, ctx, .{
+                .prefix = "  ",
+                .text = content.results[index],
+                .query = content.query,
+                .selected = selected,
+                .start_col = 0,
+                .highlight_enabled = content.highlight_enabled,
+                .highlight_style = content.highlight_style,
+            });
         }
         if (content.notice.len > 0 and row < surface.size.height) {
             const notice_text = try std.fmt.allocPrint(ctx.arena, "! {s}", .{content.notice});

@@ -17,13 +17,17 @@ const App = tui.App;
 
 /// Open the interactive theme picker, seeding the selection at the row of the
 /// currently-active theme so the current look is the one highlighted on open.
+/// Snapshots the resolved current theme so `Esc` can restore the exact
+/// pre-open look (`revertThemePreview`).
 pub fn openThemePicker(app: *App) void {
     app.mode = .theme_picker;
     app.clearInput();
     app.clearPaletteInput();
-    const active_name = tui_style.resolveTheme(app.cached_config.theme).name;
+    const active = app.theme_registry.resolve(app.cached_config.theme);
+    app.theme_preview_original = active;
+    const active_name = active.name;
     app.pickers.theme.selection = 0;
-    for (tui_style.allThemes(), 0..) |theme, index| {
+    for (app.theme_registry.slice(), 0..) |theme, index| {
         if (std.mem.eql(u8, theme.name, active_name)) {
             app.pickers.theme.selection = @intCast(index);
             break;
@@ -31,10 +35,29 @@ pub fn openThemePicker(app: *App) void {
     }
 }
 
-/// Dismiss the theme picker. Esc fallthrough in `cancelMode` reaches the
-/// generic default (`mode = .normal`; clear inputs) even without this, but the
-/// explicit close keeps the symmetry with the other picker lifecycle fns.
+/// Recolor the live UI to `theme` without persisting or notifying. UI-thread
+/// only; the /theme picker calls this on every up/down navigation when
+/// `tui.theme_live_preview` is enabled.
+pub fn previewTheme(app: *App, theme: tui_style.Theme) void {
+    _ = app;
+    tui_style.setActive(theme);
+}
+
+/// Restore the pre-open theme captured in `openThemePicker`. Idempotent — safe
+/// to call when no snapshot is set (no-op). Called by `closeThemePicker` and
+/// any non-commit exit from `.theme_picker` (M2).
+pub fn revertThemePreview(app: *App) void {
+    if (app.theme_preview_original) |original| {
+        tui_style.setActive(original);
+        app.theme_preview_original = null;
+    }
+}
+
+/// Dismiss the theme picker. Reverts the live preview (restoring the pre-open
+/// look) before resetting mode — any exit from `.theme_picker` that is not
+/// `applyTheme` reverts (M2).
 pub fn closeThemePicker(app: *App) void {
+    revertThemePreview(app);
     app.mode = .normal;
     app.clearInput();
     app.clearPaletteInput();
@@ -71,7 +94,10 @@ pub fn parseThemeArg(filter: []const u8) ?[]const u8 {
 /// (never crash). The only error this can propagate is `error.OutOfMemory`
 /// from the dupes/allocPrint — a last-resort guard for callers.
 pub fn applyTheme(app: *App, raw_name: []const u8) !void {
-    const theme = tui_style.resolveTheme(raw_name);
+    // Registry-aware resolve so custom slugs resolve; unknown names fall back
+    // to default. Committing clears the preview snapshot (no revert).
+    const theme = app.theme_registry.resolve(raw_name);
+    app.theme_preview_original = null;
     tui_style.setActive(theme);
 
     var persist_err: ?anyerror = null;
@@ -197,7 +223,9 @@ test "openThemePicker clears inputs and selects active theme" {
     const pal_len = app.inputs.palette.buf.firstHalf().len + app.inputs.palette.buf.secondHalf().len;
     try std.testing.expectEqual(@as(usize, 0), pal_len);
 
-    // Dracula is at index 3 in themes array [default, cappuccino, tokyo_night, dracula, nord, gruvbox_dark]
+    // Dracula is at index 3 in app.theme_registry.slice() — the builtins are
+    // seeded in App.init in canonical order [default, cappuccino, tokyo_night,
+    // dracula, nord, gruvbox_dark], so dracula remains index 3.
     try std.testing.expectEqual(@as(u32, 3), app.pickers.theme.selection);
 }
 
@@ -403,4 +431,55 @@ test "applyTheme fallback notice behavior for default vs unknown themes" {
     try std.testing.expectEqual(.success, app.thread.transcript.messages.items[1].mirror().kind);
     try std.testing.expectEqualStrings("Theme 'nonexistent_theme' not found; using default", app.thread.transcript.messages.items[2].mirror().body);
     try std.testing.expectEqual(.notice, app.thread.transcript.messages.items[2].mirror().kind);
+}
+
+test "previewTheme recolors without persisting or notifying" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    defer tui_style.setActive(tui_style.default_theme);
+
+    previewTheme(&app, tui_style.dracula);
+    try std.testing.expectEqual(tui_style.dracula.body, tui_style.activePalette().body.fg.rgb);
+    // No transcript notice, no cached-config change.
+    try std.testing.expectEqual(@as(usize, 0), app.thread.transcript.messages.items.len);
+    try std.testing.expect(app.cached_config.theme == null);
+}
+
+test "revertThemePreview restores the snapshot and is idempotent" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    defer tui_style.setActive(tui_style.default_theme);
+
+    // Original = default; user previewed dracula.
+    app.theme_preview_original = tui_style.default_theme;
+    previewTheme(&app, tui_style.dracula);
+    try std.testing.expectEqual(tui_style.dracula.body, tui_style.activePalette().body.fg.rgb);
+
+    revertThemePreview(&app);
+    try std.testing.expectEqual(tui_style.default_theme.body, tui_style.activePalette().body.fg.rgb);
+    try std.testing.expect(app.theme_preview_original == null);
+
+    // Second call is a no-op (idempotent).
+    revertThemePreview(&app);
+    try std.testing.expectEqual(tui_style.default_theme.body, tui_style.activePalette().body.fg.rgb);
+}
+
+test "openThemePicker snapshots the active theme for revert" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.cached_config.theme = @constCast("dracula");
+    openThemePicker(&app);
+    try std.testing.expect(app.theme_preview_original != null);
+    try std.testing.expectEqualStrings("dracula", app.theme_preview_original.?.name);
+    try std.testing.expectEqual(App.Mode.theme_picker, app.mode);
 }

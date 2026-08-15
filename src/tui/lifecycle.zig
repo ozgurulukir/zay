@@ -95,6 +95,7 @@ fn deinitSharedServices(self: *App) void {
     self.plugin_manager.deinit();
     self.tool_registry.deinit(self.gpa);
     self.gpa.destroy(self.tool_registry);
+    self.theme_registry.deinit(self.gpa);
     if (self.cached_config_owned) {
         self.cached_config.deinit(self.gpa);
         self.cached_config_owned = false;

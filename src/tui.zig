@@ -167,6 +167,13 @@ pub const App = struct {
     input_buffers: app_state.InputBuffers = .{},
     cached_config: config_mod.Config = .{},
     cached_config_owned: bool = false,
+    /// Registry-aware theme catalogue (builtins seeded in `App.init`, custom
+    /// JSON themes loaded by `initRuntime`). Owned; freed in `deinitApp`.
+    theme_registry: tui_style.ThemeRegistry = .{},
+    /// Snapshot of the active theme taken when the /theme picker opens, so
+    /// `Esc` can restore the exact pre-open look. Set in `openThemePicker`,
+    /// cleared on commit (`applyTheme`) or cancel (`closeThemePicker`).
+    theme_preview_original: ?tui_style.Theme = null,
     /// Process environment map — stored once at startup so cross-project
     /// session resume can reload config (`.nova/config.json`) from the
     /// target project's cwd without re-reading the OS environment.
@@ -241,6 +248,11 @@ pub const App = struct {
         // The primary lane is generation 1; every later lane gets the next
         // counter value at its creation site.
         primary.generation = 1;
+        // Seed the theme registry's builtins (gpa only, no io/paths) so
+        // `app.theme_registry.slice()` is non-empty for every App — including
+        // the headless/test path. Custom themes load later in `initRuntime`.
+        var theme_registry = try tui_style.ThemeRegistry.init(gpa);
+        errdefer theme_registry.deinit(gpa);
         return .{
             .io = io,
             .gpa = gpa,
@@ -254,6 +266,7 @@ pub const App = struct {
             .tool_registry = registry,
             .lane_bridge = bridge,
             .request_limiter = limiter,
+            .theme_registry = theme_registry,
         };
     }
 
@@ -313,6 +326,13 @@ pub const App = struct {
         app.codex_signed_in = !runtime.codex_connection_expired and
             (runtime.hasCodexClient() or tui_provider.detectCodexSignIn(gpa, io, runtime.home_dir));
         app.cached_config_owned = true;
+        // Load custom themes and re-apply the theme registry-aware (M1). The
+        // earlier `setActive(resolveTheme(...))` at tui.zig:~1160 is
+        // builtin-only and runs before initRuntime; this second pass resolves
+        // custom slugs so a config with `"theme": "<custom>"` is applied at
+        // startup instead of silently falling back to `default`.
+        try app.theme_registry.loadCustom(gpa, io, runtime.home_dir, runtime.cwd, app.cached_config.tui.custom_themes_dir);
+        tui_style.setActive(app.theme_registry.resolve(app.cached_config.theme));
         return app;
     }
 

@@ -9,6 +9,7 @@ const vxfw = vaxis.vxfw;
 
 const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
+const config_mod = @import("../../config/config.zig");
 
 pub const Entry = struct {
     name: []const u8,
@@ -20,6 +21,8 @@ pub const Content = struct {
     entries: []const Entry,
     filter: []const u8,
     selection: u32,
+    highlight_enabled: bool = true,
+    highlight_style: config_mod.FuzzyHighlightStyle = .accent,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -67,12 +70,16 @@ pub const Content = struct {
             const selected = match_idx == self.selection;
             const screen_row = viewport.screenRow(match_idx);
 
-            const text = try std.fmt.allocPrint(ctx.arena, "  /{s}", .{entry.name});
-            try panel.commandLine(surface, screen_row, text, ctx, selected);
-            if (entry.description.len > 0 and surface.size.width > 24) {
-                const desc_style = if (selected) p.selected_item else p.thinking_body;
-                _ = panel.writeBorderTextEndingAt(surface, ctx, screen_row, surface.size.width -| 2, entry.description, desc_style);
-            }
+            try panel.drawFuzzyListRow(surface, screen_row, ctx, .{
+                .prefix = "  /",
+                .text = entry.name,
+                .query = self.filter,
+                .selected = selected,
+                .start_col = 1,
+                .trailing_mark = if (entry.description.len > 0 and surface.size.width > 24) entry.description else null,
+                .highlight_enabled = self.highlight_enabled,
+                .highlight_style = self.highlight_style,
+            });
         }
     }
 };
