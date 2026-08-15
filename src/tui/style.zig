@@ -184,7 +184,9 @@ pub fn allThemes() []const Theme {
 /// validation lives here (a UI concern), not in `config.validate`.
 pub fn resolveTheme(name: ?[]const u8) Theme {
     const n = name orelse return default_theme;
-    for (themes) |t| if (std.ascii.eqlIgnoreCase(n, t.name)) return t;
+    const trimmed = std.mem.trim(u8, n, " \t\r\n");
+    if (trimmed.len == 0) return default_theme;
+    for (themes) |t| if (std.ascii.eqlIgnoreCase(trimmed, t.name)) return t;
     return default_theme;
 }
 
@@ -286,21 +288,52 @@ pub fn buildPalette(theme: Theme) Palette {
     };
 }
 
-/// Cheap perceptual-contrast check: max-channel absolute delta between two RGBs.
-/// A floor here is a soft guard that theme data actually keeps readable
-/// foreground-on-background pairs, far below any real gap.
-fn contrastFloor(a: Rgb, b: Rgb) u16 {
+/// Absolute maximum single-channel delta between two RGB colors.
+pub fn maxChannelDelta(a: Rgb, b: Rgb) u16 {
     const r: u16 = @intCast(@abs(@as(i16, a[0]) - @as(i16, b[0])));
     const g: u16 = @intCast(@abs(@as(i16, a[1]) - @as(i16, b[1])));
     const bl: u16 = @intCast(@abs(@as(i16, a[2]) - @as(i16, b[2])));
     return @max(r, @max(g, bl));
 }
 
-/// The active runtime palette, installed once at startup by `tui.run`. Render
-/// is single-threaded on the UI thread; mutations happen only there.
+/// Convert an 8-bit sRGB channel (0..255) to linear light intensity (0.0..1.0).
+fn linearizeChannel(c: u8) f32 {
+    const s: f32 = @as(f32, @floatFromInt(c)) / 255.0;
+    if (s <= 0.04045) {
+        return s / 12.92;
+    } else {
+        return std.math.pow(f32, (s + 0.055) / 1.055, 2.4);
+    }
+}
+
+/// Calculate the WCAG 2.1 relative luminance of an sRGB color (0.0 = black, 1.0 = white).
+pub fn relativeLuminance(rgb: Rgb) f32 {
+    const r = linearizeChannel(rgb[0]);
+    const g = linearizeChannel(rgb[1]);
+    const b = linearizeChannel(rgb[2]);
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+/// Calculate the WCAG 2.1 contrast ratio between two colors (range: 1.0 to 21.0).
+pub fn contrastRatio(a: Rgb, b: Rgb) f32 {
+    const l1 = relativeLuminance(a);
+    const l2 = relativeLuminance(b);
+    const lighter = @max(l1, l2);
+    const darker = @min(l1, l2);
+    return (lighter + 0.05) / (darker + 0.05);
+}
+
+/// The active runtime palette, installed once at startup by `tui.run`.
+///
+/// Thread Safety Invariant:
+/// - `active` is a mutable global read and written EXCLUSIVELY on the main UI/event-loop thread.
+/// - Background workers, lanes, and HTTP streams MUST NOT read or mutate `active`.
+/// - Render passes are synchronous on the UI thread and consume `activePalette()`.
+/// - Unit tests modifying `active` via `setActive` MUST restore `default_theme` via `defer setActive(default_theme)`.
 pub var active: Palette = buildPalette(default_theme);
 
-/// Fetch a pointer to the active palette for reading during draw.
+/// Fetch a pointer to the active palette for reading during UI draw passes.
+/// Must only be called from the UI thread.
 pub fn activePalette() *const Palette {
     return &active;
 }
@@ -326,7 +359,14 @@ pub fn mergedSelectedStyle(style: vaxis.Style, selected: bool) vaxis.Style {
 test "resolveTheme falls back to default for null, empty, unknown" {
     try std.testing.expectEqual(default_theme, resolveTheme(null));
     try std.testing.expectEqual(default_theme, resolveTheme(""));
+    try std.testing.expectEqual(default_theme, resolveTheme("   "));
     try std.testing.expectEqual(default_theme, resolveTheme("bogus"));
+}
+
+test "resolveTheme trims whitespace" {
+    try std.testing.expectEqual(tokyo_night, resolveTheme("  tokyo_night  "));
+    try std.testing.expectEqual(dracula, resolveTheme("\t\nDRACULA\r "));
+    try std.testing.expectEqual(default_theme, resolveTheme("   \t\r\n  "));
 }
 
 test "resolveTheme matches case-insensitively" {
@@ -356,13 +396,72 @@ test "palette body/background derive per-theme" {
     try std.testing.expectEqual(nord.blackhole_orange, p.intro_accent.fg.rgb);
 }
 
-test "every theme's body/background stays readable (min channel contrast)" {
+test "WCAG relative luminance and contrast ratio calculations" {
+    // Black (0,0,0) luminance is 0.0
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), relativeLuminance(.{ 0, 0, 0 }), 0.0001);
+    // White (255,255,255) luminance is 1.0
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), relativeLuminance(.{ 255, 255, 255 }), 0.0001);
+    // Contrast ratio between pure white and pure black is 21.0:1
+    try std.testing.expectApproxEqAbs(@as(f32, 21.0), contrastRatio(.{ 0, 0, 0 }, .{ 255, 255, 255 }), 0.01);
+    // Same color contrast ratio is 1.0:1
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), contrastRatio(.{ 128, 128, 128 }, .{ 128, 128, 128 }), 0.0001);
+}
+
+test "every theme's body/background stays readable (WCAG contrast and channel delta)" {
     for (themes) |t| {
-        // body vs background: near-white on a dark card → far above any floor.
-        try std.testing.expect(contrastFloor(t.body, t.background) > 60);
-        // selection_bg vs background must differ so a selected picker row is
+        // body vs background: WCAG AA contrast ratio >= 4.5:1
+        try std.testing.expect(contrastRatio(t.body, t.background) >= 4.5);
+        // selection_bg vs background must differ significantly so a selected picker row is
         // visible against a coincident card.
-        try std.testing.expect(contrastFloor(t.selection_bg, t.background) > 8);
+        try std.testing.expect(maxChannelDelta(t.selection_bg, t.background) >= 20);
+    }
+}
+
+test "buildPalette exhaustively references every Theme color slot" {
+    const probe_theme: Theme = .{
+        .name = "probe",
+        .thinking_blue = .{ 1, 0, 0 },
+        .user_yellow = .{ 2, 0, 0 },
+        .success_green = .{ 3, 0, 0 },
+        .failure_red = .{ 4, 0, 0 },
+        .accent_orange = .{ 5, 0, 0 },
+        .skill_purple = .{ 6, 0, 0 },
+        .lane_pink = .{ 7, 0, 0 },
+        .muted_gray = .{ 8, 0, 0 },
+        .selection_bg = .{ 9, 0, 0 },
+        .amber_yellow = .{ 10, 0, 0 },
+        .white = .{ 11, 0, 0 },
+        .code_blue = .{ 12, 0, 0 },
+        .faint_add_bg = .{ 13, 0, 0 },
+        .faint_del_bg = .{ 14, 0, 0 },
+        .body = .{ 15, 0, 0 },
+        .background = .{ 16, 0, 0 },
+        .blackhole_orange = .{ 17, 0, 0 },
+        .markdown_heading = .{ 18, 0, 0 },
+    };
+
+    const palette = buildPalette(probe_theme);
+    const palette_fields = @typeInfo(Palette).@"struct".fields;
+
+    // Verify slots 1..18 are each referenced in at least one Palette style
+    inline for (1..19) |slot_tag| {
+        var found = false;
+        inline for (palette_fields) |field| {
+            const style: vaxis.Style = @field(palette, field.name);
+            switch (style.fg) {
+                .rgb => |rgb| if (rgb[0] == slot_tag) {
+                    found = true;
+                },
+                else => {},
+            }
+            switch (style.bg) {
+                .rgb => |rgb| if (rgb[0] == slot_tag) {
+                    found = true;
+                },
+                else => {},
+            }
+        }
+        try std.testing.expect(found);
     }
 }
 

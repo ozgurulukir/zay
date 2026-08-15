@@ -171,6 +171,12 @@ The `theme` field selects a runtime color theme for the TUI at startup. The buil
 | ------- | -------- | ----------------------------------------------------------------------------------------------------- |
 | `theme` | `string` | `default` (classic look), `cappuccino` (Catppuccin Mocha), `tokyo_night` (Tokyo Night), `dracula` (Dracula), `nord` (Nord), `gruvbox_dark` (Gruvbox Dark). Unknown or empty names fall back to `default` at resolve time; absent = `default`. |
 
+When changing themes dynamically in the TUI via `/theme <name>` or the interactive `/theme` picker:
+- If the active project configuration (`<cwd>/.nova/config.json`) defines a `theme`, the new choice persists to the project configuration via `mergeAndWriteProject`.
+- Otherwise, the theme persists to the user's global configuration (`~/.config/nova/config.json`) via `mergeAndWriteGlobal`.
+- Unknown, empty, or typoed theme names fall back to `default` and display a notice in the transcript (`Theme '<name>' not found; using default`). If writing configuration to disk fails, the live session still switches theme and a `(not saved)` notice is appended.
+
+
 ### Provider Configuration
 
 Each entry in `providers` is keyed by provider name. Builtin labels (`openai`, `ollama`, `openrouter`, `cerebras`, `huggingface`, `nvidia_nim`, `opencode_zen`, `ollama_cloud`, `llama.cpp`, `anthropic`) are recognized and mapped to their typed enum. Any other key is treated as a **custom provider** using the OpenAI-compatible adapter — it appears in the `/connect` picker alongside builtins and models.dev providers.
