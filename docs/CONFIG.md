@@ -56,6 +56,7 @@ JSON keys are **camelCase**. Legacy snake_case keys from schema v1 are still acc
   "strictOutputs": false,
   "systemPrompt": "Custom system prompt for this project...",
   "bashClassifierUrl": "http://localhost:8000/classify",
+  "theme": "cappuccino",
   "context": {
     "overrideContextWindow": 32000,
     "maxOutputTokens": 4096,
@@ -108,6 +109,7 @@ JSON keys are **camelCase**. Legacy snake_case keys from schema v1 are still acc
 | `strictOutputs`        | `boolean` | `true` to send OpenAI strict structured-outputs mode (`"strict":true`, `additionalProperties:false`, all properties in `required`) in tool definitions. **Only works against the OpenAI API** — gateways (OpenRouter/Ollama/vLLM/Together) reject or silently break it, which disables function-calling (the model then emits tool calls as plain text). Defaults to `false` so tool-calling works everywhere. Enable only when talking directly to OpenAI. Legacy key `strict_outputs` is parsed for backward compatibility but is not schema-valid; new configs must use `strictOutputs`. |
 | `systemPrompt`         | `string`  | Base system prompt template (max 10 000 chars). Legacy key `system_prompt` is parsed for backward compatibility but is not schema-valid; new configs must use `systemPrompt`.                                                                                                                                                                                                                                                                                                                                                           |
 | `bashClassifierUrl`    | `string`  | ModernBERT classifier endpoint for shell command safety check. Legacy key `bash_classifier_url` is parsed for backward compatibility but is not schema-valid; new configs must use `bashClassifierUrl`.                                                                                                                                                                                                                                                                                                                                      |
+| `theme`                | `string`  | Name of the builtin color theme for the TUI. `default` preserves the classic look; `cappuccino` is the Catppuccin Mocha variant. Unknown or empty names fall back to `default` at resolve time; absent = `default`. The builtin themes are compiled in — a new theme is added to `src/tui/style.zig`. No legacy snake_case key or environment variable exists for this field.                                                                              |
 | `toast`                | `object`  | Transient toast notifications (top-right TUI notices). See [Toast settings](#toast-settings).                                                                                                                                                                                                                                                                                                                                                          |
 | `context`              | `object`  | Context window management and compaction policy. See [Context settings](#context-settings).                                                                                                                                                                                                                                                                                                                                                            |
 | `mcpServers`           | `object`  | MCP server configurations (Claude Desktop format compatible). Legacy keys `mcp_servers` and `mcp` are parsed for backward compatibility but are not schema-valid; new configs must use `mcpServers`.                                                                                                                                                                                                                                                                                                                                   |
@@ -160,6 +162,14 @@ The `toast` object controls transient notifications shown stacked in the top-rig
 
 > [!NOTE]
 > **Restoring the stderr channel.** When the TUI is up, `warn`+ logs go to the toast, not stderr. To keep full stderr output (e.g. for `nova 2> err.log` diagnostics), set `NOVA_LOG_STDERR_LEVEL` explicitly (`err`/`warn`/`info`/`debug`) — an explicit value sends output to **both** stderr and the toast, while leaving it unset sends `warn`+ to the toast only. Headless/test runs have no toast sink installed and keep stderr as before.
+
+### TUI Theme
+
+The `theme` field selects a runtime color theme for the TUI at startup. The builtin themes are compiled into the binary (`src/tui/style.zig`):
+
+| Field   | Type     | Description                                                                                           |
+| ------- | -------- | ----------------------------------------------------------------------------------------------------- |
+| `theme` | `string` | `default` (classic look) or `cappuccino` (Catppuccin Mocha). Unknown or empty names fall back to `default` at resolve time; absent = `default`. |
 
 ### Provider Configuration
 
