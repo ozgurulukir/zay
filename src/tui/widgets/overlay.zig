@@ -29,6 +29,7 @@ const tree_selector = @import("tree_selector.zig");
 const tui_status = @import("../status.zig");
 const codex = @import("../../auth/codex.zig");
 const settings_widget = @import("settings.zig");
+const theme_picker = @import("theme_picker.zig");
 
 const App = tui.App;
 
@@ -49,6 +50,7 @@ fn overlaySize(mode: App.Mode) OverlaySize {
         .mcp => .{ .width = 90, .height = 20 },
         .plugins => .{ .width = 80, .height = 16 },
         .search => .{ .width = 90, .height = 20 },
+        .theme_picker => .{ .width = 64, .height = 16 },
         .diff_viewer => .{ .width = 0, .height = 0 },
     };
 }
@@ -72,6 +74,7 @@ fn overlayLabel(app: *const App) []const u8 {
         .mcp => "Model Context Protocol (MCP)",
         .plugins => "Lua Plugins",
         .search => "Search Transcript",
+        .theme_picker => "Select Theme",
         .lanes => switch (app.nav.lanes_purpose) {
             .manage => "Parallel Lanes",
             .merge_dest => "Merge Into",
@@ -233,6 +236,7 @@ const OverlayInner = struct {
             .mcp => drawMcpContent(app, ctx),
             .plugins => drawPluginsContent(app, ctx),
             .search => drawSearchContent(app, ctx),
+            .theme_picker => drawThemeContent(app, ctx),
             // The diff viewer is full-screen — `drawRoot` returns before the
             // overlay path, so this is never reached.
             .normal, .diff_viewer => unreachable,
@@ -241,6 +245,18 @@ const OverlayInner = struct {
 
     fn drawSearchContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         var content: search_widget.Content = .{ .state = &app.pickers.search };
+        return content.widget().draw(ctx);
+    }
+
+    fn drawThemeContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const filter = try app.peekPaletteInputArena(ctx.arena);
+        const active_name = tui_style.resolveTheme(app.cached_config.theme).name;
+        var content: theme_picker.Content = .{
+            .themes = tui_style.allThemes(),
+            .selection = app.pickers.theme.selection,
+            .active_name = active_name,
+            .filter = filter,
+        };
         return content.widget().draw(ctx);
     }
 

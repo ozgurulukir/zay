@@ -49,6 +49,7 @@ const diff_utils = @import("tui/diff_utils.zig");
 const lane_lifecycle = @import("tui/lane_lifecycle.zig");
 const lifecycle = @import("tui/lifecycle.zig");
 const settings_lifecycle = @import("tui/settings_lifecycle.zig");
+const theme_lifecycle = @import("tui/theme_lifecycle.zig");
 const search_lifecycle = @import("tui/search_lifecycle.zig");
 const overlay = @import("tui/widgets/overlay.zig");
 const root_layout_widget = @import("tui/root_layout.zig");
@@ -215,7 +216,7 @@ pub const App = struct {
     /// lane is idle — "auto-start if idle, queue if in-flight". Owned; freed in
     /// `deinit`.
     pub const ctrl_c_double_press_ms: u32 = 1500;
-    pub const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message, lanes, help, settings, mcp, plugins, search };
+    pub const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message, lanes, help, settings, mcp, plugins, search, theme_picker };
     pub const LanesPurpose = app_state.NavState.LanesPurpose;
     pub const ModelCatalog = enum { connected_provider, openai_codex };
     pub const ModelScope = model_catalogue.ModelScope;
@@ -1269,7 +1270,7 @@ pub fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
     return mode_lifecycle.shouldOpenCommandMenuForSlash(app, key);
 }
 
-pub const Command = enum { connect, model, mcp, new, resume_session, timeline, diff, parallel, save, close, merge, lanes, search, clear, compact, status, help, export_session, settings, copy, paste, exit_cmd, plugins, skills };
+pub const Command = enum { connect, model, mcp, new, resume_session, timeline, diff, parallel, save, close, merge, lanes, search, clear, compact, status, help, export_session, settings, copy, paste, exit_cmd, plugins, skills, theme };
 /// `multi_lane` commands act on another lane, so they're hidden from the palette
 /// (and unresolvable) until more than one lane exists.
 pub const CommandEntry = struct { name: []const u8, command: Command, description: []const u8 = "", category: []const u8 = "", multi_lane: bool = false };
@@ -1295,6 +1296,7 @@ pub const commands = [_]CommandEntry{
     .{ .name = "Merge", .command = .merge, .description = "Merge lane into target", .category = "GIT & WORKTREE", .multi_lane = true },
     .{ .name = "Close", .command = .close, .description = "Park and close active lane", .category = "GIT & WORKTREE", .multi_lane = true },
     .{ .name = "Lanes", .command = .lanes, .description = "Manage parked worktree lanes", .category = "GIT & WORKTREE" },
+    .{ .name = "Theme", .command = .theme, .description = "Switch color theme (highlight current)", .category = "SYSTEM" },
     .{ .name = "Status", .command = .status, .description = "Show agent runtime & git state", .category = "SYSTEM" },
     .{ .name = "Help", .command = .help, .description = "Show keyboard shortcuts & guide", .category = "SYSTEM" },
     .{ .name = "Exit", .command = .exit_cmd, .description = "Quit Nova agent", .category = "SYSTEM" },
@@ -1464,4 +1466,22 @@ pub fn clearSettingsField(app: *App) void {
 
 pub fn handleSettingsTextEditKey(app: *App, key: vaxis.Key) !bool {
     return settings_lifecycle.handleTextEditKey(app, key);
+}
+
+// --- Theme delegates (theme_lifecycle forwarding) --------------------------
+
+pub fn openThemePicker(app: *App) void {
+    theme_lifecycle.openThemePicker(app);
+}
+
+pub fn closeThemePicker(app: *App) void {
+    theme_lifecycle.closeThemePicker(app);
+}
+
+pub fn applyTheme(app: *App, raw_name: []const u8) !void {
+    try theme_lifecycle.applyTheme(app, raw_name);
+}
+
+pub fn reportThemeError(app: *App, err: anyerror) !void {
+    try theme_lifecycle.reportThemeError(app, err);
 }

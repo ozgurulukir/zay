@@ -23,6 +23,7 @@ const model_catalogue = @import("model_catalogue.zig");
 const provider_picker = @import("widgets/provider_picker.zig");
 const settings_widget = @import("widgets/settings.zig");
 const help_picker = @import("widgets/help_picker.zig");
+const theme_picker = @import("widgets/theme_picker.zig");
 const mcp_status = @import("widgets/mcp_status.zig");
 const plugins_status = @import("widgets/plugins_status.zig");
 const search_widget = @import("widgets/search.zig");
@@ -162,6 +163,7 @@ pub const PickerStates = struct {
     mcp: mcp_status.State = .{},
     plugins: plugins_status.State = .{},
     search: search_widget.State = .{},
+    theme: theme_picker.State = .{},
 };
 
 /// Navigation cursors and the cross-pane selection state. Owns the

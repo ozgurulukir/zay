@@ -626,7 +626,7 @@ pub fn syncFocus(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         return;
     }
     const target = switch (app.mode) {
-        .command, .provider_picker, .model_picker, .tree_picker, .save_message, .search => app.inputs.palette.widget(),
+        .command, .provider_picker, .model_picker, .tree_picker, .save_message, .search, .theme_picker => app.inputs.palette.widget(),
         // The session picker uses the palette input for filtering while
         // browsing, but sub-states (rename/delete) handle keys via the
         // command router — focus stays on root so the palette input

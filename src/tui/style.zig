@@ -151,6 +151,13 @@ pub const gruvbox_dark: Theme = .{
 
 const themes = [_]Theme{ default_theme, cappuccino_theme, tokyo_night, dracula, nord, gruvbox_dark };
 
+/// The authoritative builtin theme list, in canonical order. Exposed for the
+/// theme picker so it lists exactly the themes `resolveTheme` validates
+/// against — a single source of truth, never a duplicated literal.
+pub fn allThemes() []const Theme {
+    return themes[0..];
+}
+
 /// Resolve a user-supplied theme name to a `Theme`. Case-insensitive;
 /// unknown, empty, and `null` names fall back to `default_theme`. Theme-name
 /// validation lives here (a UI concern), not in `config.validate`.
@@ -331,4 +338,25 @@ test "resolveTheme matches each builtin theme case-insensitively" {
 test "spaced theme names do not match (underscore convention)" {
     try std.testing.expectEqual(default_theme, resolveTheme("Tokyo Night"));
     try std.testing.expectEqual(default_theme, resolveTheme("Gruvbox Dark"));
+}
+
+test "allThemes returns the exact builtin set with unique non-empty names" {
+    const list = allThemes();
+    try std.testing.expectEqual(@as(usize, 6), list.len);
+    const expected = [_][]const u8{ "default", "cappuccino", "tokyo_night", "dracula", "nord", "gruvbox_dark" };
+    for (list, expected) |theme, name| {
+        try std.testing.expectEqualStrings(name, theme.name);
+        try std.testing.expect(theme.name.len > 0);
+    }
+    // Names must be pairwise unique (an earlier duplicate would make the
+    // picker's current-theme highlight ambiguous).
+    var seen: [16][]const u8 = undefined;
+    var seen_count: usize = 0;
+    for (list) |t| {
+        for (seen[0..seen_count]) |prev| {
+            try std.testing.expect(!std.mem.eql(u8, prev, t.name));
+        }
+        seen[seen_count] = t.name;
+        seen_count += 1;
+    }
 }

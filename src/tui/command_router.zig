@@ -32,6 +32,9 @@ const Mode = App.Mode;
 const provider_model = @import("provider_model.zig");
 const clipboard_helper = @import("clipboard_helper.zig");
 const help_picker = @import("widgets/help_picker.zig");
+const theme_lifecycle = @import("theme_lifecycle.zig");
+const theme_picker = @import("widgets/theme_picker.zig");
+const tui_style = @import("style.zig");
 const previousIndex = tui.previousIndex;
 const nextIndex = tui.nextIndex;
 
@@ -50,6 +53,7 @@ pub fn handleCommandKey(app: *App, key: vaxis.Key) !bool {
         .mcp => try McpMode.handle(app, key),
         .plugins => try PluginsMode.handle(app, key),
         .search => try SearchMode.handle(app, key),
+        .theme_picker => try ThemePicker.handle(app, key),
         // The diff viewer owns its keys directly in `captureEvent`; nothing
         // reaches the generic dispatch.
         .diff_viewer => false,
@@ -338,6 +342,36 @@ const CommandMenu = struct {
             return true;
         }
         return false;
+    }
+};
+
+/// Theme picker mode.
+///
+/// Up/down move the cursor through the filtered theme list; Enter applies the
+/// selected theme (via `theme_lifecycle.applyTheme`) and is handled by
+/// `submitMode`, not here. Esc is handled by the `cancelMode` fallthrough.
+/// Other keys fall through to the focused palette input for filtering.
+const ThemePicker = struct {
+    pub fn handle(app: *App, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.up, .{})) {
+            const next = previousIndex(app.pickers.theme.selection, theme_pickerMatchingCount(app));
+            app.pickers.theme.selection = next;
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{})) {
+            const next = nextIndex(app.pickers.theme.selection, theme_pickerMatchingCount(app));
+            app.pickers.theme.selection = next;
+            return true;
+        }
+        return false;
+    }
+
+    /// The number of themes the current palette filter selects — zero-division
+    /// safe (previousIndex/nextIndex guard on count == 0).
+    fn theme_pickerMatchingCount(app: *App) u32 {
+        const filter = app.peekPaletteInput() catch return 0;
+        defer app.gpa.free(filter);
+        return theme_picker.countMatching(tui_style.allThemes(), filter);
     }
 };
 
