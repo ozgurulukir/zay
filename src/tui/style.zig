@@ -69,7 +69,87 @@ pub const cappuccino_theme: Theme = .{
     .markdown_heading = .{ 249, 226, 175 }, // yellow
 };
 
-const themes = [_]Theme{ default_theme, cappuccino_theme };
+/// Tokyo Night (dark) — https://github.com/enkia/tokyo-night-vscode-theme
+pub const tokyo_night: Theme = .{
+    .name = "tokyo_night",
+    .thinking_blue = .{ 122, 162, 247 }, // blue
+    .user_yellow = .{ 224, 175, 104 }, // yellow
+    .success_green = .{ 158, 206, 106 }, // green
+    .failure_red = .{ 247, 118, 142 }, // red
+    .accent_orange = .{ 255, 158, 100 }, // orange
+    .skill_purple = .{ 187, 154, 247 }, // magenta
+    .lane_pink = .{ 255, 0, 124 }, // magenta2
+    .muted_gray = .{ 86, 95, 137 }, // comment
+    .selection_bg = .{ 41, 46, 66 }, // bg_highlight
+    .amber_yellow = .{ 224, 175, 104 }, // yellow
+    .white = .{ 192, 202, 245 }, // fg
+    .code_blue = .{ 137, 221, 255 }, // blue5
+    .faint_add_bg = .{ 30, 44, 40 }, // derived: green-tinted bg
+    .faint_del_bg = .{ 52, 34, 42 }, // derived: red-tinted bg
+    .markdown_heading = .{ 224, 175, 104 }, // yellow
+};
+
+/// Dracula — https://draculatheme.com/contribute
+pub const dracula: Theme = .{
+    .name = "dracula",
+    .thinking_blue = .{ 139, 233, 253 }, // cyan
+    .user_yellow = .{ 241, 250, 140 }, // yellow
+    .success_green = .{ 80, 250, 123 }, // green
+    .failure_red = .{ 255, 85, 85 }, // red
+    .accent_orange = .{ 255, 184, 108 }, // orange
+    .skill_purple = .{ 189, 147, 249 }, // purple
+    .lane_pink = .{ 255, 121, 198 }, // pink
+    .muted_gray = .{ 98, 114, 164 }, // comment
+    .selection_bg = .{ 68, 71, 90 }, // currentLine
+    .amber_yellow = .{ 241, 250, 140 }, // yellow
+    .white = .{ 248, 248, 242 }, // foreground
+    .code_blue = .{ 139, 233, 253 }, // cyan
+    .faint_add_bg = .{ 36, 52, 42 }, // derived: green-tinted bg
+    .faint_del_bg = .{ 58, 40, 45 }, // derived: red-tinted bg
+    .markdown_heading = .{ 241, 250, 140 }, // yellow
+};
+
+/// Nord — https://www.nordtheme.com/docs/colors-and-palettes
+pub const nord: Theme = .{
+    .name = "nord",
+    .thinking_blue = .{ 136, 192, 208 }, // nord8 frost cyan
+    .user_yellow = .{ 235, 203, 139 }, // nord13 aurora yellow
+    .success_green = .{ 163, 190, 140 }, // nord14 aurora green
+    .failure_red = .{ 191, 97, 106 }, // nord11 aurora red
+    .accent_orange = .{ 208, 135, 112 }, // nord12 aurora orange
+    .skill_purple = .{ 180, 142, 173 }, // nord15 aurora purple
+    .lane_pink = .{ 207, 138, 155 }, // derived rose (no nord pink)
+    .muted_gray = .{ 76, 86, 106 }, // nord3
+    .selection_bg = .{ 67, 76, 94 }, // nord2
+    .amber_yellow = .{ 235, 203, 139 }, // nord13 aurora yellow
+    .white = .{ 236, 239, 244 }, // nord6 snow storm
+    .code_blue = .{ 129, 161, 193 }, // nord9 frost blue
+    .faint_add_bg = .{ 46, 55, 47 }, // derived: green-tinted bg
+    .faint_del_bg = .{ 61, 47, 49 }, // derived: red-tinted bg
+    .markdown_heading = .{ 235, 203, 139 }, // nord13 aurora yellow
+};
+
+/// Gruvbox Dark — https://github.com/morhetz/gruvbox (dark, bright accents)
+pub const gruvbox_dark: Theme = .{
+    .name = "gruvbox_dark",
+    .thinking_blue = .{ 131, 165, 152 }, // blue
+    .user_yellow = .{ 250, 189, 47 }, // yellow
+    .success_green = .{ 184, 187, 38 }, // bright green
+    .failure_red = .{ 251, 73, 52 }, // bright red
+    .accent_orange = .{ 254, 128, 25 }, // bright orange
+    .skill_purple = .{ 211, 134, 155 }, // purple
+    .lane_pink = .{ 219, 137, 150 }, // derived rose (no gruvbox pink)
+    .muted_gray = .{ 146, 131, 116 }, // gray
+    .selection_bg = .{ 60, 56, 54 }, // bg1
+    .amber_yellow = .{ 250, 189, 47 }, // yellow
+    .white = .{ 251, 241, 199 }, // fg0 warm cream
+    .code_blue = .{ 131, 165, 152 }, // blue
+    .faint_add_bg = .{ 46, 55, 35 }, // derived: green-tinted bg
+    .faint_del_bg = .{ 66, 44, 38 }, // derived: red-tinted bg
+    .markdown_heading = .{ 250, 189, 47 }, // yellow
+};
+
+const themes = [_]Theme{ default_theme, cappuccino_theme, tokyo_night, dracula, nord, gruvbox_dark };
 
 /// Resolve a user-supplied theme name to a `Theme`. Case-insensitive;
 /// unknown, empty, and `null` names fall back to `default_theme`. Theme-name
@@ -217,4 +297,38 @@ test "buildPalette(default_theme) preserves the original look" {
     try std.testing.expectEqual(@as(Rgb, .{ 96, 165, 250 }), p.thinking_label.fg.rgb);
     try std.testing.expectEqual(@as(Rgb, .{ 212, 175, 55 }), p.user.fg.rgb);
     try std.testing.expectEqual(@as(Rgb, .{ 252, 211, 77 }), p.markdown_heading.fg.rgb);
+}
+
+test "themes array has unique non-empty names" {
+    var seen: [16][]const u8 = undefined; // max themes (bounded by the array)
+    var seen_count: usize = 0;
+    for (themes) |t| {
+        try std.testing.expect(t.name.len > 0);
+        for (seen[0..seen_count]) |prev| {
+            try std.testing.expect(!std.mem.eql(u8, prev, t.name));
+        }
+        seen[seen_count] = t.name;
+        seen_count += 1;
+    }
+}
+
+test "resolveTheme matches each builtin theme case-insensitively" {
+    const cases = [_]struct { name: []const u8, theme: Theme }{
+        .{ .name = "default", .theme = default_theme },
+        .{ .name = "cappuccino", .theme = cappuccino_theme },
+        .{ .name = "Tokyo_Night", .theme = tokyo_night },
+        .{ .name = "TOKYO_NIGHT", .theme = tokyo_night },
+        .{ .name = "Dracula", .theme = dracula },
+        .{ .name = "DRACULA", .theme = dracula },
+        .{ .name = "nord", .theme = nord },
+        .{ .name = "NORD", .theme = nord },
+        .{ .name = "gruvbox_dark", .theme = gruvbox_dark },
+        .{ .name = "GRUVBOX_DARK", .theme = gruvbox_dark },
+    };
+    for (cases) |c| try std.testing.expectEqual(c.theme, resolveTheme(c.name));
+}
+
+test "spaced theme names do not match (underscore convention)" {
+    try std.testing.expectEqual(default_theme, resolveTheme("Tokyo Night"));
+    try std.testing.expectEqual(default_theme, resolveTheme("Gruvbox Dark"));
 }
