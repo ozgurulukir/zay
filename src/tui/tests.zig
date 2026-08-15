@@ -2547,7 +2547,7 @@ test "collapsed tool messages render no body text" {
     defer transcript.deinit(gpa);
 
     const index = try transcript.startTool(gpa, "printf hello");
-    try transcript.finishTool(gpa, index, "hello", null, false);
+    try transcript.finishTool(gpa, index, "hello", null, false, .plain);
 
     try std.testing.expect(!transcript.messages.items[index].mirror().expanded);
     try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&transcript.messages.items[index], 80));
@@ -2697,7 +2697,7 @@ test "search matches are case-insensitive substrings over user, agent, and tool 
     _ = try app.thread.transcript.append(gpa, .user, "you", "Fix the flaky SESSION resume");
     _ = try app.thread.transcript.append(gpa, .agent, "agent", "I will look at the session code");
     const tool = try app.thread.transcript.startTool(gpa, "grep session");
-    try app.thread.transcript.finishTool(gpa, tool, "output line\nmore output", null, false);
+    try app.thread.transcript.finishTool(gpa, tool, "output line\nmore output", null, false, .plain);
 
     // Empty query → hint state, no matches.
     try search_lifecycle.rebuildMatches(&app, "");

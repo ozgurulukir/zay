@@ -334,6 +334,9 @@ pub const TurnView = struct {
                 gpa.free(t.body);
                 if (t.stderr) |stderr| gpa.free(stderr);
                 if (t.expanded_title) |expanded_title| gpa.free(expanded_title);
+                if (t.expanded_title_formatted) |f| gpa.free(f);
+                for (t.parts) |*part| part.deinit(gpa);
+                if (t.parts.len > 0) gpa.free(t.parts);
             },
         }
         message.* = .{
@@ -397,12 +400,14 @@ pub const TurnView = struct {
         const visible_before = toolFinishVisibleChange(transcript, index, tool.display_label);
         const was_expanded = transcript.messages.items[index].mirror().expanded;
         const was_running = transcript.messages.items[index].mirror().tool_running;
-        try transcript.updateToolExpanded(gpa, index, tool.display_label, tool.display_expanded_label);
-        try transcript.finishTool(gpa, index, tool.display_body, tool.stderr, tool.failed);
+        // M4: compute the render before finishTool — it now consumes it. A diff
+        // body keeps diff rendering; a plain body gets JSON/text classification.
         const is_diff = tool.display_kind == .diff;
+        const render: transcript_mod.Render = if (is_diff) .diff else policy.render;
+        try transcript.updateToolExpanded(gpa, index, tool.display_label, tool.display_expanded_label);
+        try transcript.finishTool(gpa, index, tool.display_body, tool.stderr, tool.failed, render);
         const expand = policy.expand_by_default or is_diff;
         transcript.setExpanded(index, expand);
-        transcript.messages.items[index].tool.render = if (is_diff) .diff else policy.render;
         selectGeneratedMessage(transcript, index);
         self.tool_seen_in_response = true;
         self.agent_index = null;

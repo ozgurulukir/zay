@@ -30,6 +30,7 @@ pub const mcp = @import("mcp/manager.zig");
 pub const mcp_client = @import("mcp/client.zig");
 pub const mcp_transport = @import("mcp/transport.zig");
 pub const runtime = @import("runtime.zig");
+pub const parts = @import("tools/parts.zig");
 pub const vcs = @import("vcs.zig");
 pub const transcript = @import("transcript.zig");
 pub const tools = @import("tools.zig");

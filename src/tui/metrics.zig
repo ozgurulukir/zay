@@ -66,13 +66,20 @@ pub fn toolTitleRows(title: []const u8, width: u16) u16 {
 }
 
 fn toolMessageTitle(message: transcript_mod.ToolView) []const u8 {
-    if (message.expanded) return message.expanded_title orelse message.title;
+    if (message.expanded) return message.expanded_title_formatted orelse message.expanded_title orelse message.title;
     return message.title;
 }
 
 pub fn toolBodyRows(message: transcript_mod.ToolView, width: u16) u16 {
     var rows: u16 = 0;
-    if (message.body.len > 0) rows += textRows(message.body, width);
+    // Prefer the structured parts; fall back to the raw body when there are no
+    // parts (mirrors `drawToolBody`). `.diff` and `.json` count identically to
+    // `.text` — same wrapping.
+    if (message.parts.len > 0) {
+        for (message.parts) |part| rows += textRows(part.text, width);
+    } else if (message.body.len > 0) {
+        rows += textRows(message.body, width);
+    }
     if (message.stderr) |stderr| rows += textRows(stderr, width);
     return rows;
 }
@@ -145,6 +152,38 @@ test "textRows wraps at word boundaries" {
 
 test "textRows hard wraps words wider than the row" {
     try std.testing.expectEqual(@as(u16, 3), textRows("abcdefgh", 3));
+}
+
+test "toolBodyRows equals the sum over parts text rows" {
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.startTool(gpa, "curl");
+    try transcript.finishTool(gpa, index, "{\"a\":1}", null, false, .plain);
+    transcript.messages.items[index].tool.expanded = true;
+    const t = transcript.messages.items[index].tool;
+
+    var expected: u16 = 0;
+    for (t.parts) |part| expected += textRows(part.text, 30);
+    try std.testing.expectEqual(expected, toolBodyRows(t, 30));
+}
+
+test "formatted expanded title with newline counts its lines" {
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.startTool(gpa, "greet");
+    try transcript.updateToolExpanded(gpa, index, "greet", "greet {\"a\":1}");
+    transcript.messages.items[index].tool.expanded = true;
+    const t = transcript.messages.items[index].tool;
+    const title = toolMessageTitle(t);
+    // Pretty-printed JSON args span multiple lines.
+    try std.testing.expect(std.mem.indexOf(u8, title, "\n") != null);
+    // The title rows mirror the draw path (textRows over the command at the
+    // indented width), so metrics and rendering never diverge.
+    try std.testing.expectEqual(textRows(toolCommandTitle(title), 30 -| 3), toolTitleRows(title, 30));
 }
 
 test "markdown render allocations stay sub-linear in row count" {

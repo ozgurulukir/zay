@@ -4,6 +4,7 @@ const vxfw = vaxis.vxfw;
 
 const terminal_markdown = @import("terminal_markdown");
 const transcript_mod = @import("../../transcript.zig");
+const parts_mod = @import("../../tools/parts.zig");
 const tui_metrics = @import("../metrics.zig");
 const tui_style = @import("../style.zig");
 const blackhole = @import("../blackhole.zig");
@@ -140,19 +141,74 @@ pub const MessageWidget = struct {
         ctx: vxfw.DrawContext,
     ) !void {
         std.debug.assert(loading_frame < loading_frames.len);
-        const title = if (message.expanded) message.expanded_title orelse message.title else message.title;
-        const command = toolCommandTitle(title);
+        // m6: prefer the precomputed formatted expanded title; fall back to the
+        // raw expanded title, then the plain title, when it isn't set.
+        const chosen = if (message.expanded)
+            message.expanded_title_formatted orelse message.expanded_title orelse message.title
+        else
+            message.title;
+        const command = toolCommandTitle(chosen);
         const prefix = if (message.running) loading_frames[loading_frame % loading_frames.len] else toolIcon(command);
-        // Tool success vs failure is conveyed by foreground color alone (green →
-        // red). Prefix a ✗ on the command text so a failed tool is unmistakable
-        // without color (red-green CVD, non-RGB terminals) — because it rides on
-        // the text, it survives wrapping, selection styling, and future themes.
-        if (!message.running and message.failed) {
+        const failed = !message.running and message.failed;
+        const has_formatted = message.expanded and message.expanded_title_formatted != null;
+
+        if (has_formatted) {
+            const indent: u16 = 3;
+            // name = first whitespace-delimited word; the rest is dimmed args.
+            // A failed tool gets the "✗ " marker prepended (m5); its byte length
+            // shifts the name/args spans so the accent mapping stays aligned.
+            const marker_len: usize = if (failed) markerByteLen() else 0;
+            const display_text = if (failed)
+                try std.fmt.allocPrint(ctx.arena, "✗ {s}", .{command})
+            else
+                command;
+            try drawStyledCommandTitle(surface, command, display_text, marker_len, prefix, style, selected, row, ctx, indent);
+            return;
+        }
+
+        if (failed) {
             const marked = try std.fmt.allocPrint(ctx.arena, "✗ {s}", .{command});
             drawToolTitleWrapped(surface, prefix, marked, style, selected, row, ctx);
             return;
         }
         drawToolTitleWrapped(surface, prefix, command, style, selected, row, ctx);
+    }
+
+    /// Render a formatted command title with an accent name + dimmed args
+    /// (and an optional failed marker) through the shared styled wrapper.
+    fn drawStyledCommandTitle(
+        surface: *vxfw.Surface,
+        command: []const u8,
+        display_text: []const u8,
+        marker_len: usize,
+        prefix: []const u8,
+        style: vaxis.Style,
+        selected: bool,
+        row: *u16,
+        ctx: vxfw.DrawContext,
+        indent: u16,
+    ) !void {
+        const name_end = std.mem.indexOfScalar(u8, command, ' ') orelse command.len;
+        const base = marker_len;
+        var spans: [3]StyleSpan = undefined;
+        var n: usize = 0;
+        if (marker_len > 0) {
+            // The marker is byte `[0, marker_len)` in `display_text`.
+            spans[n] = .{ .start = 0, .end = marker_len, .style = StylePalette.tool_failed };
+            n += 1;
+        }
+        spans[n] = .{ .start = base, .end = base + name_end, .style = StylePalette.border_label };
+        n += 1;
+        if (name_end < command.len) {
+            spans[n] = .{ .start = base + name_end, .end = base + command.len, .style = StylePalette.thinking_body };
+            n += 1;
+        }
+        drawWrappedStyled(surface, display_text, spans[0..n], style, prefix, selected, row, ctx, indent);
+    }
+
+    /// Byte length of the `✗ ` failure marker ("✗" is 3 UTF-8 bytes + 1 space).
+    fn markerByteLen() usize {
+        return 4;
     }
 
     fn drawToolTitleWrapped(
@@ -454,7 +510,17 @@ fn drawToolBody(
     row: *u16,
     ctx: vxfw.DrawContext,
 ) !void {
-    if (message.body.len > 0) {
+    // Prefer the structured parts; fall back to body + render only when there
+    // are no parts (tests, direct ToolView construction).
+    if (message.parts.len > 0) {
+        for (message.parts) |part| {
+            switch (part.kind) {
+                .text => MessageWidget.drawWrapped(surface, part.text, StylePalette.thinking_body, selected, row, ctx, 0, null),
+                .diff => try drawWrappedDiff(surface, part.text, selected, row, ctx),
+                .json => drawJson(surface, part, selected, row, ctx),
+            }
+        }
+    } else if (message.body.len > 0) {
         switch (message.render) {
             .plain => MessageWidget.drawWrapped(surface, message.body, StylePalette.thinking_body, selected, row, ctx, 0, null),
             .diff => try drawWrappedDiff(surface, message.body, selected, row, ctx),
@@ -463,6 +529,166 @@ fn drawToolBody(
     if (message.stderr) |stderr| {
         MessageWidget.drawWrapped(surface, stderr, StylePalette.tool_failed, selected, row, ctx, 0, null);
     }
+}
+
+/// A byte-span into some text plus the vaxis style to draw those bytes with.
+/// Draw helpers map `parts_mod.JsonSpan` tokens to these before rendering.
+const StyleSpan = struct {
+    start: usize,
+    end: usize,
+    style: vaxis.Style,
+};
+
+/// Map a JSON token kind to a vaxis style using the existing palette.
+fn jsonTokenStyle(kind: parts_mod.JsonTokenKind) vaxis.Style {
+    return switch (kind) {
+        .key => StylePalette.border_label,
+        .string => StylePalette.markdown_code,
+        .number => StylePalette.user,
+        .boolean => StylePalette.skill,
+        .null => StylePalette.thinking_label,
+        .punctuation => StylePalette.thinking_body,
+    };
+}
+
+/// Render a `.json` part with per-token syntax highlighting through the shared
+/// styled wrapper. Non-token bytes (whitespace, indentation) read as the muted
+/// default body style.
+fn drawJson(
+    surface: *vxfw.Surface,
+    part: parts_mod.Part,
+    selected: bool,
+    row: *u16,
+    ctx: vxfw.DrawContext,
+) void {
+    const styles = ctx.arena.alloc(StyleSpan, part.spans.len) catch return;
+    for (part.spans, 0..) |span, i| {
+        styles[i] = .{ .start = span.start, .end = span.end, .style = jsonTokenStyle(span.kind) };
+    }
+    drawWrappedStyled(surface, part.text, styles, StylePalette.thinking_body, "", selected, row, ctx, 0);
+}
+
+/// Wrapped, styled rendering of `text`. Splits on `\n` into hard lines, wraps
+/// each with the grapheme-based `wrappedLineEnd`, and colours each grapheme by
+/// the `StyleSpan` covering its byte offset (falling back to `default_style`).
+/// `prefix` (a loading frame / tool icon) is written at column 0 on the first
+/// line only, mirroring `drawToolTitleWrapped`'s symmetry.
+fn drawWrappedStyled(
+    surface: *vxfw.Surface,
+    text: []const u8,
+    spans: []const StyleSpan,
+    default_style: vaxis.Style,
+    prefix: []const u8,
+    selected: bool,
+    row: *u16,
+    ctx: vxfw.DrawContext,
+    indent: u16,
+) void {
+    const content_width = ConversationLayout.contentWidth(surface.size.width);
+    const width = @max(content_width -| indent, 1);
+    if (text.len == 0) {
+        if (row.* >= surface.size.height) return;
+        if (prefix.len > 0) MessageWidget.writeText(surface, prefix, StylePalette.thinking_label, selected, row.*, ctx, 0);
+        row.* += 1;
+        return;
+    }
+
+    var line_start: usize = 0;
+    var first_line = true;
+    while (line_start <= text.len) {
+        const line_end = std.mem.findScalarPos(u8, text, line_start, '\n') orelse text.len;
+        const line_prefix = if (first_line) prefix else "";
+        drawStyledHardLine(surface, text[line_start..line_end], line_start, spans, default_style, line_prefix, selected, row, ctx, indent, width);
+        if (line_end == text.len) break;
+        line_start = line_end + 1;
+        first_line = false;
+    }
+}
+
+/// Word-wrap one hard line of `text` and render each wrapped segment with its
+/// per-grapheme style. `text_abs` is `line`'s byte offset within the full text,
+/// so segment spans stay aligned with `spans`.
+fn drawStyledHardLine(
+    surface: *vxfw.Surface,
+    line: []const u8,
+    text_abs: usize,
+    spans: []const StyleSpan,
+    default_style: vaxis.Style,
+    prefix: []const u8,
+    selected: bool,
+    row: *u16,
+    ctx: vxfw.DrawContext,
+    indent: u16,
+    width: u16,
+) void {
+    if (row.* >= surface.size.height) return;
+    if (line.len == 0) {
+        if (prefix.len > 0) MessageWidget.writeText(surface, prefix, StylePalette.thinking_label, selected, row.*, ctx, 0);
+        row.* += 1;
+        return;
+    }
+    var segment_offset: usize = 0;
+    var first_segment = true;
+    while (segment_offset < line.len) {
+        const line_end = wrappedLineEnd(line, segment_offset, width, ctx);
+        const segment_prefix = if (first_segment) prefix else "";
+        drawStyledSegment(surface, line[segment_offset..line_end], text_abs + segment_offset, spans, default_style, segment_prefix, selected, row, ctx, indent);
+        segment_offset = skipLinearWhitespace(line, line_end);
+        first_segment = false;
+    }
+}
+
+/// Draw one wrapped segment (a visual row) of a styled text. Each grapheme
+/// picks the `StyleSpan` covering its absolute byte offset.
+fn drawStyledSegment(
+    surface: *vxfw.Surface,
+    segment: []const u8,
+    text_abs: usize,
+    spans: []const StyleSpan,
+    default_style: vaxis.Style,
+    prefix: []const u8,
+    selected: bool,
+    row: *u16,
+    ctx: vxfw.DrawContext,
+    indent: u16,
+) void {
+    if (row.* >= surface.size.height) return;
+    if (prefix.len > 0) MessageWidget.writeText(surface, prefix, StylePalette.thinking_label, selected, row.*, ctx, 0);
+    var col = ConversationLayout.left + indent;
+    const col_limit = surface.size.width -| ConversationLayout.right;
+    var iter = ctx.graphemeIterator(segment);
+    var byte_pos: usize = 0;
+    while (iter.next()) |grapheme| {
+        if (col >= col_limit) return;
+        const bytes = grapheme.bytes(segment);
+        const width: u16 = @intCast(ctx.stringWidth(bytes));
+        if (width == 0) {
+            byte_pos += bytes.len;
+            continue;
+        }
+        if (col + width > col_limit) return;
+        const style = styleAt(text_abs + byte_pos, text_abs + byte_pos + bytes.len, spans, default_style);
+        surface.writeCell(col, row.*, .{
+            .char = .{ .grapheme = bytes, .width = @intCast(width) },
+            .style = mergedSelectedStyle(style, selected),
+        });
+        col += width;
+        byte_pos += bytes.len;
+    }
+    row.* += 1;
+}
+
+/// The style for a `[text_start, text_end)` byte range: the first `StyleSpan`
+/// that overlaps it, else `default_style`.
+fn styleAt(text_start: usize, text_end: usize, spans: []const StyleSpan, default_style: vaxis.Style) vaxis.Style {
+    var i: usize = 0;
+    while (i < spans.len) : (i += 1) {
+        const span = spans[i];
+        if (text_start >= span.end) continue;
+        if (text_end <= span.start) continue;
+        return span.style;
+    }
+    return default_style;
 }
 
 fn drawWrappedDiff(
@@ -540,7 +766,7 @@ test "failed tool title renders a non-color ✗ marker" {
     defer transcript.deinit(gpa);
 
     const index = try transcript.startTool(gpa, "pwd");
-    try transcript.finishTool(gpa, index, "", null, true);
+    try transcript.finishTool(gpa, index, "", null, true, .plain);
     transcript.messages.items[index].tool.expanded = false;
 
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -609,4 +835,106 @@ test "wrappedLineEnd wraps before overflowing word" {
     const text = "hello world";
     try std.testing.expectEqual(@as(usize, 5), wrappedLineEnd(text, 0, 8, ctx));
     try std.testing.expectEqual(@as(usize, 6), skipLinearWhitespace(text, 5));
+}
+
+test "expanded formatted tool title blends accent name with dimmed args" {
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.startTool(gpa, "List files");
+    try transcript.updateToolExpanded(gpa, index, "List files", "List files --all");
+    transcript.messages.items[index].tool.expanded = true;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var message_widget: MessageWidget = .{
+        .message = &transcript.messages.items[index],
+        .selected = false,
+        .loading_frame = 0,
+        .blackhole_frame = 0,
+        .gpa = gpa,
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 40, .height = 4 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try message_widget.widget().draw(ctx);
+
+    // "List" (offsets 0..4) carries the accent orange; "files --all" (offset 5+)
+    // carries the dimmed gray.
+    const name_style = surface.readCell(ConversationLayout.left + 3, 1).style;
+    const arg_style = surface.readCell(ConversationLayout.left + 3 + 5, 1).style;
+    try std.testing.expectEqual(@as([3]u8, .{ 249, 115, 22 }), name_style.fg.rgb);
+    try std.testing.expectEqual(@as([3]u8, .{ 138, 138, 138 }), arg_style.fg.rgb);
+}
+
+test "failed formatted tool title shifts name/args spans after the marker" {
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.startTool(gpa, "List files");
+    try transcript.updateToolExpanded(gpa, index, "List files", "List files --all");
+    try transcript.finishTool(gpa, index, "", null, true, .plain);
+    transcript.messages.items[index].tool.expanded = true;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var message_widget: MessageWidget = .{
+        .message = &transcript.messages.items[index],
+        .selected = true,
+        .loading_frame = 0,
+        .blackhole_frame = 0,
+        .gpa = gpa,
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 40, .height = 4 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try message_widget.widget().draw(ctx);
+
+    // Prefix "🛠" sits at column 2; the display text starts at column 5. The ✗
+    // marker is 3 bytes but 1 column wide, so the accent name ("List") starts
+    // at column 7 and the dimmed args' "f" lands at column 12.
+    try std.testing.expectEqualStrings("✗", surface.readCell(ConversationLayout.left + 3, 1).char.grapheme);
+    try std.testing.expectEqualStrings("L", surface.readCell(ConversationLayout.left + 5, 1).char.grapheme);
+    try std.testing.expectEqualStrings("f", surface.readCell(ConversationLayout.left + 10, 1).char.grapheme);
+}
+
+test "drawJson highlights a key with the accent style" {
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.startTool(gpa, "curl");
+    try transcript.finishTool(gpa, index, "{\"a\":1}", null, false, .plain);
+    transcript.messages.items[index].tool.expanded = true;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var message_widget: MessageWidget = .{
+        .message = &transcript.messages.items[index],
+        .selected = false,
+        .loading_frame = 0,
+        .blackhole_frame = 0,
+        .gpa = gpa,
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 40, .height = 8 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try message_widget.widget().draw(ctx);
+
+    // Pretty-printed JSON body starts on row 2 (`{`); row 3 is the indented
+    // key line `  "a": 1`, so the key's opening quote sits at column 4.
+    try std.testing.expectEqualStrings("\"", surface.readCell(ConversationLayout.left + 4, 3).char.grapheme);
+    const key_style = surface.readCell(ConversationLayout.left + 4, 3).style;
+    try std.testing.expectEqual(@as([3]u8, .{ 249, 115, 22 }), key_style.fg.rgb);
 }

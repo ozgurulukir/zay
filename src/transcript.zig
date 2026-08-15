@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const parts_mod = @import("tools/parts.zig");
 const terminal_markdown = @import("terminal_markdown");
 
 const assert = std.debug.assert;
@@ -77,6 +78,14 @@ pub const ToolView = struct {
     failed: bool = false,
     stderr: ?[]u8 = null,
     expanded_title: ?[]u8 = null,
+    /// Structured display parts derived at finish/append time (see AD-3). The
+    /// renderer and metrics path both consume this; empty means fall back to
+    /// `body` + `render`.
+    parts: []parts_mod.Part = &.{},
+    /// Beautified expanded title (name + pretty-printed JSON args). The raw
+    /// `expanded_title` is kept intact because `toolDisplayMatches` compares it,
+    /// so this is what draw/metrics display when expanded.
+    expanded_title_formatted: ?[]u8 = null,
     row_cache: RowCache = .{},
     render_inc: terminal_markdown.Incremental = .{},
 };
@@ -169,6 +178,9 @@ pub const Message = union(enum) {
                 gpa.free(t.body);
                 if (t.stderr) |stderr| gpa.free(stderr);
                 if (t.expanded_title) |title| gpa.free(title);
+                if (t.expanded_title_formatted) |f| gpa.free(f);
+                for (t.parts) |*part| part.deinit(gpa);
+                if (t.parts.len > 0) gpa.free(t.parts); // M5: guard the empty-slice free
                 t.render_inc.deinit(gpa);
             },
         }
@@ -307,6 +319,14 @@ pub const Transcript = struct {
         errdefer gpa.free(owned_title);
         const owned_body = try gpa.dupe(u8, body);
         errdefer gpa.free(owned_body);
+        // Resume bodies are the LLM observation; JSON detection still applies.
+        // Build before appending so an OOM here leaves nothing half-constructed,
+        // and the ownership errdefers stay scoped to the pre-append work.
+        const parts = try parts_mod.buildParts(gpa, owned_body, .text);
+        errdefer {
+            for (parts) |*part| part.deinit(gpa);
+            if (parts.len > 0) gpa.free(parts);
+        }
 
         const index: u32 = @intCast(self.messages.items.len);
         const following_tail = self.isFollowingTail();
@@ -317,6 +337,7 @@ pub const Transcript = struct {
                 .expanded = false,
                 .running = false,
                 .failed = failed,
+                .parts = parts,
             },
         });
         if (MessageKind.tool.selectable() and following_tail) self.selected = index;
@@ -429,11 +450,18 @@ pub const Transcript = struct {
         errdefer gpa.free(title);
         const expanded_title = if (expanded_command) |value| try toolTitle(gpa, value) else null;
         errdefer if (expanded_title) |value| gpa.free(value);
+        const expanded_title_formatted = if (expanded_command) |value|
+            try parts_mod.formatExpandedTitle(gpa, value)
+        else
+            null;
+        errdefer if (expanded_title_formatted) |value| gpa.free(value);
         const t = &message.tool;
         gpa.free(t.title);
         if (t.expanded_title) |value| gpa.free(value);
+        if (t.expanded_title_formatted) |value| gpa.free(value);
         t.title = title;
         t.expanded_title = expanded_title;
+        t.expanded_title_formatted = expanded_title_formatted;
         message.invalidateRowCache();
     }
 
@@ -455,6 +483,7 @@ pub const Transcript = struct {
         body: []const u8,
         stderr_body: ?[]const u8,
         failed: bool,
+        render: Render,
     ) !void {
         assert(index < self.messages.items.len);
         const message = &self.messages.items[index];
@@ -469,6 +498,13 @@ pub const Transcript = struct {
             t.stderr = owned;
         }
         t.failed = failed;
+        t.render = render;
+        // Rebuild parts from the finalized body. Free prior parts first (and
+        // reset to empty so a failing build can't leave a dangling pointer).
+        for (t.parts) |*part| part.deinit(gpa);
+        if (t.parts.len > 0) gpa.free(t.parts);
+        t.parts = &.{};
+        t.parts = try parts_mod.buildParts(gpa, t.body, if (render == .diff) .diff else .text);
         message.invalidateRowCache();
     }
 
@@ -652,7 +688,7 @@ test "consecutive tools remain separate messages" {
     defer transcript.deinit(gpa);
 
     const first = try transcript.startTool(gpa, "ls");
-    try transcript.finishTool(gpa, first, "ls\n", null, false);
+    try transcript.finishTool(gpa, first, "ls\n", null, false, .plain);
     const second = try transcript.startTool(gpa, "pwd");
     try std.testing.expect(first != second);
     try std.testing.expectEqual(@as(usize, 2), transcript.messages.items.len);
@@ -673,4 +709,58 @@ test "remove keeps selection in range" {
 
     try std.testing.expectEqual(@as(usize, 1), transcript.messages.items.len);
     try std.testing.expectEqual(@as(u32, 0), transcript.selected.?);
+}
+
+test "finishTool builds a json part and sets render" {
+    const gpa = std.testing.allocator;
+    var transcript: Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.startTool(gpa, "curl");
+    try transcript.finishTool(gpa, index, "{\"a\":1}", null, false, .plain);
+    const t = &transcript.messages.items[index].tool;
+    try std.testing.expectEqual(Render.plain, t.render);
+    try std.testing.expectEqual(@as(usize, 1), t.parts.len);
+    try std.testing.expect(parts_mod.PartKind.json == t.parts[0].kind);
+    // JSON body is pretty-printed into the part text.
+    try std.testing.expect(std.mem.indexOf(u8, t.parts[0].text, "\n") != null);
+}
+
+test "diff render yields a single diff part" {
+    const gpa = std.testing.allocator;
+    var transcript: Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.startTool(gpa, "git diff");
+    try transcript.finishTool(gpa, index, "+ added\n- removed", null, false, .diff);
+    const t = &transcript.messages.items[index].tool;
+    try std.testing.expectEqual(Render.diff, t.render);
+    try std.testing.expectEqual(@as(usize, 1), t.parts.len);
+    try std.testing.expect(parts_mod.PartKind.diff == t.parts[0].kind);
+}
+
+test "updateToolExpanded formats JSON args into expanded_title_formatted" {
+    const gpa = std.testing.allocator;
+    var transcript: Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.startTool(gpa, "greet");
+    try transcript.updateToolExpanded(gpa, index, "greet", "greet {\"name\":\"x\"}");
+    const t = &transcript.messages.items[index].tool;
+    try std.testing.expect(t.expanded_title_formatted != null);
+    try std.testing.expect(std.mem.startsWith(u8, t.expanded_title_formatted.?, "greet {"));
+    try std.testing.expect(std.mem.indexOf(u8, t.expanded_title_formatted.?, "\n") != null);
+    // The raw expanded_title is deliberately untouched (toolDisplayMatches reads it).
+    try std.testing.expectEqualStrings("🛠  greet {\"name\":\"x\"}", t.expanded_title.?);
+}
+
+test "appendTool builds a json part from a JSON resume body" {
+    const gpa = std.testing.allocator;
+    var transcript: Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.appendTool(gpa, "curl", "{\"ok\":true}", false);
+    const t = &transcript.messages.items[index].tool;
+    try std.testing.expectEqual(@as(usize, 1), t.parts.len);
+    try std.testing.expect(parts_mod.PartKind.json == t.parts[0].kind);
 }
