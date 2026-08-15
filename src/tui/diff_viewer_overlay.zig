@@ -21,12 +21,12 @@ const symbols = @import("../symbols.zig");
 const tui_status = @import("status.zig");
 
 const App = tui.App;
-const StylePalette = tui_style.Palette;
 
 pub const diff_hint_line1: []const u8 = "↑↓ Move" ++ symbols.separator_dot_padded ++ "⇧↑↓ Select lines" ++ symbols.separator_dot_padded ++ "^↑↓ Jump file" ++ symbols.separator_dot_padded ++ "^P Find file";
 pub const diff_hint_line2: []const u8 = "^W Comment" ++ symbols.separator_dot_padded ++ "^E Edit" ++ symbols.separator_dot_padded ++ "^D Delete" ++ symbols.separator_dot_padded ++ "^S Save & send" ++ symbols.separator_dot_padded ++ "Esc Exit";
 
 pub fn drawDiffViewer(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+    const p = tui_style.activePalette();
     const w = ctx.max.width orelse ctx.min.width;
     const h = ctx.max.height orelse ctx.min.height;
     var surface = try vxfw.Surface.init(ctx.arena, root_widget, .{ .width = w, .height = h });
@@ -43,7 +43,7 @@ pub fn drawDiffViewer(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext
 
     if (app.metrics.diff_loading()) {
         // Cold start: navigated in, diff still fetching in the background.
-        panel.lineStyledAt(&surface, body_top + body_h / 2, "Loading diff…", ctx, 2, StylePalette.model_status) catch {};
+        panel.lineStyledAt(&surface, body_top + body_h / 2, "Loading diff…", ctx, 2, p.model_status) catch {};
     } else {
         var body: diff.DiffBodyWidget = .{ .app = app };
         subs[n] = .{
@@ -69,15 +69,15 @@ pub fn drawDiffViewer(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext
         };
         n += 1;
     } else {
-        panel.lineStyledAt(&surface, h -| 2, diff_hint_line1, ctx, 1, StylePalette.thinking_body) catch {};
-        panel.lineStyledAt(&surface, h -| 1, diff_hint_line2, ctx, 1, StylePalette.thinking_body) catch {};
+        panel.lineStyledAt(&surface, h -| 2, diff_hint_line1, ctx, 1, p.thinking_body) catch {};
+        panel.lineStyledAt(&surface, h -| 1, diff_hint_line2, ctx, 1, p.thinking_body) catch {};
         const status_text = if (tui_status.modelStatus(app.liveRuntime(), app.cached_config)) |status|
             tui_status.formatModelStatus(ctx.arena, status) catch "no model"
         else
             "no model";
         if (status_text.len > 0 or app.metrics.git_label.len > 0) {
             const label = std.fmt.allocPrint(ctx.arena, " {s} · {s} ", .{ status_text, app.metrics.git_label }) catch "";
-            _ = panel.writeBorderTextEndingAt(&surface, ctx, h -| 1, w -| 1, label, StylePalette.model_status);
+            _ = panel.writeBorderTextEndingAt(&surface, ctx, h -| 1, w -| 1, label, p.model_status);
         }
     }
 

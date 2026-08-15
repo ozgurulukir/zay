@@ -22,7 +22,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const panel = @import("widgets/panel.zig");
-const StylePalette = @import("style.zig").Palette;
+const tui_style = @import("style.zig");
 
 /// Severity of a toast; drives its accent color.
 pub const Level = enum { info, success, warn, err };
@@ -191,12 +191,13 @@ pub const Widget = struct {
         );
 
         var row: u16 = 0;
+        const p = tui_style.activePalette();
         for (items[0..visible], 0..) |*item, i| {
             const style = switch (item.level) {
-                .info => StylePalette.info,
-                .success => StylePalette.success,
-                .warn => StylePalette.warning,
-                .err => StylePalette.error_style,
+                .info => p.info,
+                .success => p.success,
+                .warn => p.warning,
+                .err => p.error_style,
             };
             const rows = heights[i];
             // Border top.

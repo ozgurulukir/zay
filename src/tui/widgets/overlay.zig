@@ -31,7 +31,6 @@ const codex = @import("../../auth/codex.zig");
 const settings_widget = @import("settings.zig");
 
 const App = tui.App;
-const StylePalette = tui_style.Palette;
 
 const OverlaySize = struct { width: u16, height: u16 };
 
@@ -82,7 +81,8 @@ fn overlayLabel(app: *const App) []const u8 {
 }
 
 fn writeBorderLabel(surface: *vxfw.Surface, ctx: vxfw.DrawContext, text: []const u8) void {
-    writeBorderLabelLeft(surface, ctx, 0, text, StylePalette.border_label);
+    const p = tui_style.activePalette();
+    writeBorderLabelLeft(surface, ctx, 0, text, p.border_label);
 }
 
 fn writeBorderLabelLeft(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, text: []const u8, style: vaxis.Style) void {
@@ -111,6 +111,7 @@ pub const OverlayWidget = struct {
 
     fn drawOverlay(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *OverlayWidget = @ptrCast(@alignCast(ptr));
+        const p = tui_style.activePalette();
         const size = if (self.app.mode == .provider_picker and self.app.pickers.provider.stage == .form)
             OverlaySize{ .width = 72, .height = 12 }
         else
@@ -128,7 +129,7 @@ pub const OverlayWidget = struct {
         var border: vxfw.Border = .{
             .child = inner.widget(),
             .labels = border_labels,
-            .style = StylePalette.thinking_body,
+            .style = p.thinking_body,
         };
         return border.widget().draw(ctx.withConstraints(
             .{ .width = total_w, .height = total_h },
@@ -146,6 +147,7 @@ const OverlayInner = struct {
 
     fn drawInner(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *OverlayInner = @ptrCast(@alignCast(ptr));
+        const p = tui_style.activePalette();
         const iw: u16 = ctx.max.width orelse 0;
         const ih: u16 = ctx.max.height orelse 0;
 
@@ -175,7 +177,7 @@ const OverlayInner = struct {
         while (sep_col < iw) : (sep_col += 1) {
             surface.writeCell(sep_col, 1, .{
                 .char = .{ .grapheme = "─", .width = 1 },
-                .style = StylePalette.thinking_body,
+                .style = p.thinking_body,
             });
         }
 

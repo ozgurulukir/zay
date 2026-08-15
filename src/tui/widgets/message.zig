@@ -18,7 +18,6 @@ const intro_x_padding: u16 = 7;
 const logo_gap: u16 = 8;
 const logo_row_offset: u16 = 7;
 
-const StylePalette = tui_style.Palette;
 const mergedSelectedStyle = tui_style.mergedSelectedStyle;
 const messageRowsCached = tui_metrics.messageRowsCached;
 
@@ -89,29 +88,30 @@ pub const MessageWidget = struct {
     }
 
     fn drawBody(self: *MessageWidget, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
+        const p = tui_style.activePalette();
         const styled_as_selected = self.selected or !self.message.kind().dimmable();
         var row: u16 = ConversationLayout.top;
         switch (self.message.*) {
-            .user => |m| drawWrapped(surface, m.body, StylePalette.user, styled_as_selected, &row, ctx, 2, StylePalette.user),
+            .user => |m| drawWrapped(surface, m.body, p.user, styled_as_selected, &row, ctx, 2, p.user),
             .agent => drawMarkdown(self, surface, styled_as_selected, &row, ctx),
             .skill => |m| {
-                drawWrapped(surface, m.title, StylePalette.skill, styled_as_selected, &row, ctx, 2, StylePalette.skill);
+                drawWrapped(surface, m.title, p.skill, styled_as_selected, &row, ctx, 2, p.skill);
                 if (m.expanded and m.body.len > 0) {
-                    drawWrapped(surface, m.body, StylePalette.thinking_body, styled_as_selected, &row, ctx, 0, null);
+                    drawWrapped(surface, m.body, p.thinking_body, styled_as_selected, &row, ctx, 0, null);
                 }
             },
-            .notice => |m| drawWrapped(surface, m.body, StylePalette.notice, styled_as_selected, &row, ctx, 2, StylePalette.notice),
-            .success => |m| drawWrapped(surface, m.body, StylePalette.tool, styled_as_selected, &row, ctx, 2, StylePalette.tool),
-            .info => |m| drawWrapped(surface, m.body, StylePalette.info, styled_as_selected, &row, ctx, 2, StylePalette.info),
+            .notice => |m| drawWrapped(surface, m.body, p.notice, styled_as_selected, &row, ctx, 2, p.notice),
+            .success => |m| drawWrapped(surface, m.body, p.tool, styled_as_selected, &row, ctx, 2, p.tool),
+            .info => |m| drawWrapped(surface, m.body, p.info, styled_as_selected, &row, ctx, 2, p.info),
             .logo => self.drawIntro(surface, self.blackhole_frame, &row, ctx),
             .tool => |m| {
-                const title_style = if (m.failed) StylePalette.tool_failed else StylePalette.tool;
+                const title_style = if (m.failed) p.tool_failed else p.tool;
                 try drawToolTitle(surface, m, title_style, styled_as_selected, self.loading_frame, &row, ctx);
                 if (m.expanded) try drawToolBody(surface, m, styled_as_selected, &row, ctx);
             },
             .thinking => |m| {
-                drawLine(surface, m.title, StylePalette.thinking_label, styled_as_selected, &row, ctx, 2, StylePalette.thinking_bar);
-                if (m.expanded) drawWrapped(surface, m.body, StylePalette.thinking_body, styled_as_selected, &row, ctx, 2, StylePalette.thinking_bar);
+                drawLine(surface, m.title, p.thinking_label, styled_as_selected, &row, ctx, 2, p.thinking_bar);
+                if (m.expanded) drawWrapped(surface, m.body, p.thinking_body, styled_as_selected, &row, ctx, 2, p.thinking_bar);
             },
             .status => |m| drawLoading(surface, m.title, self.loading_frame, &row, ctx),
         }
@@ -126,8 +126,9 @@ pub const MessageWidget = struct {
     ) void {
         std.debug.assert(loading_frame < loading_frames.len);
         if (row.* >= surface.size.height) return;
-        writeText(surface, loading_frames[loading_frame % loading_frames.len], StylePalette.thinking_label, true, row.*, ctx, 0);
-        writeText(surface, text, StylePalette.thinking_body, true, row.*, ctx, 2);
+        const p = tui_style.activePalette();
+        writeText(surface, loading_frames[loading_frame % loading_frames.len], p.thinking_label, true, row.*, ctx, 0);
+        writeText(surface, text, p.thinking_body, true, row.*, ctx, 2);
         row.* += 1;
     }
 
@@ -188,19 +189,20 @@ pub const MessageWidget = struct {
         ctx: vxfw.DrawContext,
         indent: u16,
     ) !void {
+        const p = tui_style.activePalette();
         const name_end = std.mem.indexOfScalar(u8, command, ' ') orelse command.len;
         const base = marker_len;
         var spans: [3]StyleSpan = undefined;
         var n: usize = 0;
         if (marker_len > 0) {
             // The marker is byte `[0, marker_len)` in `display_text`.
-            spans[n] = .{ .start = 0, .end = marker_len, .style = StylePalette.tool_failed };
+            spans[n] = .{ .start = 0, .end = marker_len, .style = p.tool_failed };
             n += 1;
         }
-        spans[n] = .{ .start = base, .end = base + name_end, .style = StylePalette.border_label };
+        spans[n] = .{ .start = base, .end = base + name_end, .style = p.border_label };
         n += 1;
         if (name_end < command.len) {
-            spans[n] = .{ .start = base + name_end, .end = base + command.len, .style = StylePalette.thinking_body };
+            spans[n] = .{ .start = base + name_end, .end = base + command.len, .style = p.thinking_body };
             n += 1;
         }
         drawWrappedStyled(surface, display_text, spans[0..n], style, prefix, selected, row, ctx, indent);
@@ -248,7 +250,8 @@ pub const MessageWidget = struct {
         ctx: vxfw.DrawContext,
     ) void {
         if (row.* >= surface.size.height) return;
-        if (prefix.len > 0) writeText(surface, prefix, StylePalette.thinking_label, selected, row.*, ctx, 0);
+        const p = tui_style.activePalette();
+        if (prefix.len > 0) writeText(surface, prefix, p.thinking_label, selected, row.*, ctx, 0);
         writeText(surface, command, style, selected, row.*, ctx, 3);
         row.* += 1;
     }
@@ -491,13 +494,14 @@ fn drawMarkdown(
 }
 
 fn markdownStyle(style: terminal_markdown.Style) vaxis.Style {
+    const p = tui_style.activePalette();
     return switch (style) {
         .normal => .{},
-        .heading => .{ .bold = true, .fg = .{ .rgb = .{ 252, 211, 77 } } },
-        .quote => StylePalette.thinking_body,
+        .heading => p.markdown_heading,
+        .quote => p.thinking_body,
         .list_marker => .{},
-        .table_border => StylePalette.thinking_body,
-        .code => StylePalette.markdown_code,
+        .table_border => p.thinking_body,
+        .code => p.markdown_code,
         .strong => .{ .bold = true },
         .emphasis => .{ .italic = true },
     };
@@ -510,24 +514,25 @@ fn drawToolBody(
     row: *u16,
     ctx: vxfw.DrawContext,
 ) !void {
+    const p = tui_style.activePalette();
     // Prefer the structured parts; fall back to body + render only when there
     // are no parts (tests, direct ToolView construction).
     if (message.parts.len > 0) {
         for (message.parts) |part| {
             switch (part.kind) {
-                .text => MessageWidget.drawWrapped(surface, part.text, StylePalette.thinking_body, selected, row, ctx, 0, null),
+                .text => MessageWidget.drawWrapped(surface, part.text, p.thinking_body, selected, row, ctx, 0, null),
                 .diff => try drawWrappedDiff(surface, part.text, selected, row, ctx),
                 .json => drawJson(surface, part, selected, row, ctx),
             }
         }
     } else if (message.body.len > 0) {
         switch (message.render) {
-            .plain => MessageWidget.drawWrapped(surface, message.body, StylePalette.thinking_body, selected, row, ctx, 0, null),
+            .plain => MessageWidget.drawWrapped(surface, message.body, p.thinking_body, selected, row, ctx, 0, null),
             .diff => try drawWrappedDiff(surface, message.body, selected, row, ctx),
         }
     }
     if (message.stderr) |stderr| {
-        MessageWidget.drawWrapped(surface, stderr, StylePalette.tool_failed, selected, row, ctx, 0, null);
+        MessageWidget.drawWrapped(surface, stderr, p.tool_failed, selected, row, ctx, 0, null);
     }
 }
 
@@ -541,13 +546,14 @@ const StyleSpan = struct {
 
 /// Map a JSON token kind to a vaxis style using the existing palette.
 fn jsonTokenStyle(kind: parts_mod.JsonTokenKind) vaxis.Style {
+    const p = tui_style.activePalette();
     return switch (kind) {
-        .key => StylePalette.border_label,
-        .string => StylePalette.markdown_code,
-        .number => StylePalette.user,
-        .boolean => StylePalette.skill,
-        .null => StylePalette.thinking_label,
-        .punctuation => StylePalette.thinking_body,
+        .key => p.border_label,
+        .string => p.markdown_code,
+        .number => p.user,
+        .boolean => p.skill,
+        .null => p.thinking_label,
+        .punctuation => p.thinking_body,
     };
 }
 
@@ -561,11 +567,12 @@ fn drawJson(
     row: *u16,
     ctx: vxfw.DrawContext,
 ) void {
+    const p = tui_style.activePalette();
     const styles = ctx.arena.alloc(StyleSpan, part.spans.len) catch return;
     for (part.spans, 0..) |span, i| {
         styles[i] = .{ .start = span.start, .end = span.end, .style = jsonTokenStyle(span.kind) };
     }
-    drawWrappedStyled(surface, part.text, styles, StylePalette.thinking_body, "", selected, row, ctx, 0);
+    drawWrappedStyled(surface, part.text, styles, p.thinking_body, "", selected, row, ctx, 0);
 }
 
 /// Wrapped, styled rendering of `text`. Splits on `\n` into hard lines, wraps
@@ -588,7 +595,8 @@ fn drawWrappedStyled(
     const width = @max(content_width -| indent, 1);
     if (text.len == 0) {
         if (row.* >= surface.size.height) return;
-        if (prefix.len > 0) MessageWidget.writeText(surface, prefix, StylePalette.thinking_label, selected, row.*, ctx, 0);
+        const p = tui_style.activePalette();
+        if (prefix.len > 0) MessageWidget.writeText(surface, prefix, p.thinking_label, selected, row.*, ctx, 0);
         row.* += 1;
         return;
     }
@@ -623,7 +631,8 @@ fn drawStyledHardLine(
 ) void {
     if (row.* >= surface.size.height) return;
     if (line.len == 0) {
-        if (prefix.len > 0) MessageWidget.writeText(surface, prefix, StylePalette.thinking_label, selected, row.*, ctx, 0);
+        const p = tui_style.activePalette();
+        if (prefix.len > 0) MessageWidget.writeText(surface, prefix, p.thinking_label, selected, row.*, ctx, 0);
         row.* += 1;
         return;
     }
@@ -653,7 +662,8 @@ fn drawStyledSegment(
     indent: u16,
 ) void {
     if (row.* >= surface.size.height) return;
-    if (prefix.len > 0) MessageWidget.writeText(surface, prefix, StylePalette.thinking_label, selected, row.*, ctx, 0);
+    const p = tui_style.activePalette();
+    if (prefix.len > 0) MessageWidget.writeText(surface, prefix, p.thinking_label, selected, row.*, ctx, 0);
     var col = ConversationLayout.left + indent;
     const col_limit = surface.size.width -| ConversationLayout.right;
     var iter = ctx.graphemeIterator(segment);
@@ -701,7 +711,8 @@ fn drawWrappedDiff(
     const content_width = ConversationLayout.contentWidth(surface.size.width);
     const width = @max(content_width, 1);
     if (text.len == 0) {
-        MessageWidget.drawLine(surface, "", StylePalette.thinking_body, selected, row, ctx, 0, null);
+        const p = tui_style.activePalette();
+        MessageWidget.drawLine(surface, "", p.thinking_body, selected, row, ctx, 0, null);
         return;
     }
 
@@ -717,11 +728,12 @@ fn drawWrappedDiff(
 }
 
 fn diffLineStyle(line: []const u8) vaxis.Style {
-    if (line.len == 0) return StylePalette.thinking_body;
+    const p = tui_style.activePalette();
+    if (line.len == 0) return p.thinking_body;
     return switch (line[0]) {
-        '+' => StylePalette.tool,
-        '-' => StylePalette.tool_failed,
-        else => StylePalette.thinking_body,
+        '+' => p.tool,
+        '-' => p.tool_failed,
+        else => p.thinking_body,
     };
 }
 

@@ -10,8 +10,6 @@ const vxfw = vaxis.vxfw;
 const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
 
-const StylePalette = tui_style.Palette;
-
 pub const Entry = struct {
     name: []const u8,
     description: []const u8 = "",
@@ -39,6 +37,7 @@ pub const Content = struct {
     }
 
     fn drawEntries(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
+        const p = tui_style.activePalette();
         const height = surface.size.height;
         if (height == 0) return;
 
@@ -54,7 +53,7 @@ pub const Content = struct {
 
         const total_matches: u32 = @intCast(matching_indices.items.len);
         if (total_matches == 0) {
-            try panel.lineStyledAt(surface, 0, "  No matching commands", ctx, 1, StylePalette.thinking_body);
+            try panel.lineStyledAt(surface, 0, "  No matching commands", ctx, 1, p.thinking_body);
             return;
         }
 
@@ -71,7 +70,7 @@ pub const Content = struct {
             const text = try std.fmt.allocPrint(ctx.arena, "  /{s}", .{entry.name});
             try panel.commandLine(surface, screen_row, text, ctx, selected);
             if (entry.description.len > 0 and surface.size.width > 24) {
-                const desc_style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;
+                const desc_style = if (selected) p.selected_item else p.thinking_body;
                 _ = panel.writeBorderTextEndingAt(surface, ctx, screen_row, surface.size.width -| 2, entry.description, desc_style);
             }
         }

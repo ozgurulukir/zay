@@ -69,7 +69,6 @@ pub const modelsdev = @import("models/registry.zig");
 
 const ConversationLayout = tui_message.ConversationLayout;
 const MessageWidget = tui_message.MessageWidget;
-const StylePalette = tui_style.Palette;
 const mergedSelectedStyle = tui_style.mergedSelectedStyle;
 const messageRowsCached = tui_metrics.messageRowsCached;
 
@@ -1135,6 +1134,9 @@ pub fn run(
     if (config.toast.enabled) |enabled| toast.global.enabled = enabled;
     if (config.toast.duration_ms) |ms| toast.global.duration_ms = ms;
     if (config.toast.max_visible) |n| toast.global.max_visible = n;
+
+    // Install the active color theme before the first frame is drawn.
+    tui_style.setActive(tui_style.resolveTheme(config.theme));
 
     var app = try App.initRuntime(init.io, gpa, runtime, config, init.environ_map);
     // Set the manager pointers now that `app` is in its final stack frame.

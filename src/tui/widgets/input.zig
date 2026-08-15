@@ -25,10 +25,10 @@ const symbols = @import("../../symbols.zig");
 const panel = @import("panel.zig");
 
 const App = tui.App;
-const StylePalette = tui_style.Palette;
 const DiffCounts = tui.DiffCounts;
 
 pub fn writeDiffCounts(surface: *vxfw.Surface, ctx: vxfw.DrawContext, counts: DiffCounts) void {
+    const p = tui_style.activePalette();
     const additions = std.fmt.allocPrint(ctx.arena, "+{d}", .{@min(counts.additions, 99999)}) catch return;
     const deletions = std.fmt.allocPrint(ctx.arena, "-{d}", .{@min(counts.deletions, 99999)}) catch return;
     const total_width = additions.len + 1 + deletions.len;
@@ -36,8 +36,8 @@ pub fn writeDiffCounts(surface: *vxfw.Surface, ctx: vxfw.DrawContext, counts: Di
         0
     else
         @intCast(surface.size.width - total_width);
-    writeAscii(surface, additions, StylePalette.tool, start_col);
-    writeAscii(surface, deletions, StylePalette.tool_failed, start_col + @as(u16, @intCast(additions.len + 1)));
+    writeAscii(surface, additions, p.tool, start_col);
+    writeAscii(surface, deletions, p.tool_failed, start_col + @as(u16, @intCast(additions.len + 1)));
 }
 
 fn writeAscii(surface: *vxfw.Surface, text: []const u8, style: vaxis.Style, col_start: u16) void {
@@ -480,6 +480,7 @@ pub const InputWidget = struct {
     }
 
     fn drawInputBorder(self: *InputWidget, ctx: vxfw.DrawContext, max_width: u16, border_height: u16, text_rows: u16) std.mem.Allocator.Error!vxfw.Surface {
+        const p = tui_style.activePalette();
         const prompt_text: []const u8 = if (self.app.mode == .normal) ">" else " ";
         var prompt: vxfw.Text = .{ .text = prompt_text, .softwrap = false, .width_basis = .parent };
         var prompt_box: vxfw.SizedBox = .{ .child = prompt.widget(), .size = .{ .width = 2, .height = 1 } };
@@ -494,7 +495,7 @@ pub const InputWidget = struct {
         var row_box: vxfw.SizedBox = .{ .child = row.widget(), .size = .{ .width = max_width -| 2, .height = text_rows } };
         var border: vxfw.Border = .{
             .child = row_box.widget(),
-            .style = StylePalette.thinking_body,
+            .style = p.thinking_body,
         };
         var box: vxfw.SizedBox = .{ .child = border.widget(), .size = .{ .width = max_width, .height = border_height } };
         var surface = try box.widget().draw(ctx.withConstraints(.{ .width = max_width, .height = border_height }, .{ .width = max_width, .height = border_height }));
@@ -528,11 +529,11 @@ pub const InputWidget = struct {
             status_text
         else
             ctx_bar;
-        panel.writeBorderLabelRight(&surface, ctx, 0, label_text, StylePalette.model_status);
+        panel.writeBorderLabelRight(&surface, ctx, 0, label_text, p.model_status);
         // Bottom-right: git branch info at the edge.
         const bottom = border_height -| 1;
         const right_edge = max_width -| 3; // last interior cell before the corner margin
-        _ = panel.writeBorderTextEndingAt(&surface, ctx, bottom, right_edge, self.app.metrics.git_label, StylePalette.thinking_body);
+        _ = panel.writeBorderTextEndingAt(&surface, ctx, bottom, right_edge, self.app.metrics.git_label, p.thinking_body);
         return surface;
     }
 
@@ -548,6 +549,7 @@ pub const InputWidget = struct {
     }
 
     fn drawQueuedMessage(self: *InputWidget, ctx: vxfw.DrawContext, width: u16) std.mem.Allocator.Error!vxfw.Surface {
+        const p = tui_style.activePalette();
         const items = self.app.thread.queued.items;
         const sel = @min(self.app.nav.queued_selection, items.len - 1);
         const message = items[sel];
@@ -560,13 +562,14 @@ pub const InputWidget = struct {
             try std.fmt.allocPrint(ctx.arena, "↩ {s}{s}", .{ message.text, position })
         else
             try std.fmt.allocPrint(ctx.arena, "[...] {s} (CTRL → to steer){s}", .{ message.text, position });
-        var queued_text: vxfw.Text = .{ .text = text, .style = .{ .fg = StylePalette.thinking_body.fg, .dim = true }, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
+        var queued_text: vxfw.Text = .{ .text = text, .style = .{ .fg = p.thinking_body.fg, .dim = true }, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
         return queued_text.widget().draw(ctx.withConstraints(.{ .width = width, .height = 1 }, .{ .width = width, .height = 1 }));
     }
 
     fn drawInputHint(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, child_index: usize, row: u16, col: u16, width: u16) std.mem.Allocator.Error!void {
+        const p = tui_style.activePalette();
         const is_pending_quit = self.app.getPendingQuitAt() != null;
-        const style = if (is_pending_quit) StylePalette.warning else StylePalette.thinking_body;
+        const style = if (is_pending_quit) p.warning else p.thinking_body;
         var hint_text: vxfw.Text = .{ .text = inputHintText(self.app), .style = style, .text_align = .center, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
         children[child_index] = .{
             .origin = .{ .row = row, .col = col },
@@ -579,25 +582,27 @@ pub const InputWidget = struct {
     /// lane is fullscreened. Black-on-pink so it reads as a control affordance;
     /// clicking it (mouse) or pressing Ctrl+L restores the split view.
     fn drawLanesBadge(self: *InputWidget, ctx: vxfw.DrawContext, max_width: u16) std.mem.Allocator.Error!vxfw.Surface {
+        const p = tui_style.activePalette();
         const text = try std.fmt.allocPrint(ctx.arena, " {d} Lanes ", .{self.app.threads.len()});
         const text_width: u16 = @intCast(@min(ctx.stringWidth(text), max_width));
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = text_width, .height = 1 });
         if (text_width == 0) return surface;
-        panel.fillRow(&surface, 0, StylePalette.lanes_badge);
-        panel.lineStyledAt(&surface, 0, text, ctx, 0, StylePalette.lanes_badge) catch {};
+        panel.fillRow(&surface, 0, p.lanes_badge);
+        panel.lineStyledAt(&surface, 0, text, ctx, 0, p.lanes_badge) catch {};
         return surface;
     }
 
     /// Bottom-left status pill: live background-job count + the Ctrl+O hint, in
     /// black-on-blue so it reads as a control affordance.
     fn drawBackgroundBadge(self: *InputWidget, ctx: vxfw.DrawContext, max_width: u16) std.mem.Allocator.Error!vxfw.Surface {
+        const p = tui_style.activePalette();
         const count = self.app.runningBackgroundCount();
         const text = try std.fmt.allocPrint(ctx.arena, " {d} background job{s} · Ctrl+O ", .{ count, if (count == 1) "" else "s" });
         const text_width: u16 = @intCast(@min(ctx.stringWidth(text), max_width));
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = text_width, .height = 1 });
         if (text_width == 0) return surface;
-        panel.fillRow(&surface, 0, StylePalette.background_badge);
-        panel.lineStyledAt(&surface, 0, text, ctx, 0, StylePalette.background_badge) catch {};
+        panel.fillRow(&surface, 0, p.background_badge);
+        panel.lineStyledAt(&surface, 0, text, ctx, 0, p.background_badge) catch {};
         return surface;
     }
 

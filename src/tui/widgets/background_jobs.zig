@@ -12,7 +12,6 @@ const tui_style = @import("../style.zig");
 const panel = @import("panel.zig");
 
 const App = tui.App;
-const StylePalette = tui_style.Palette;
 
 /// Outer border widget. Shows a snapshot of running background jobs.
 pub const BackgroundJobsWidget = struct {
@@ -24,6 +23,7 @@ pub const BackgroundJobsWidget = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *BackgroundJobsWidget = @ptrCast(@alignCast(ptr));
+        const p = tui_style.activePalette();
         const app = self.app;
         const empty = vxfw.Surface.init(ctx.arena, self.widget(), .{
             .width = ctx.max.width orelse 0,
@@ -40,7 +40,7 @@ pub const BackgroundJobsWidget = struct {
         var border: vxfw.Border = .{
             .child = inner.widget(),
             .labels = &.{.{ .text = "Background Jobs", .alignment = .top_left }},
-            .style = StylePalette.border_label,
+            .style = p.border_label,
         };
         return border.widget().draw(ctx);
     }
@@ -60,17 +60,18 @@ const BackgroundJobsInner = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *BackgroundJobsInner = @ptrCast(@alignCast(ptr));
+        const p = tui_style.activePalette();
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = width, .height = height });
         if (width == 0 or height == 0) return surface;
 
         if (self.views.len == 0) {
-            panel.lineStyledAt(&surface, 0, "No background jobs running.", ctx, 1, StylePalette.thinking_body) catch {};
+            panel.lineStyledAt(&surface, 0, "No background jobs running.", ctx, 1, p.thinking_body) catch {};
             return surface;
         }
 
-        panel.lineStyledAt(&surface, 0, " ↑/↓ Navigate · → Cancel Job · Esc Close ", ctx, 1, StylePalette.panel_header) catch {};
+        panel.lineStyledAt(&surface, 0, " ↑/↓ Navigate · → Cancel Job · Esc Close ", ctx, 1, p.panel_header) catch {};
         const body_rows = height -| 1;
         var row: u16 = 0;
         while (row < self.views.len and row < body_rows) : (row += 1) {
@@ -87,7 +88,7 @@ const BackgroundJobsInner = struct {
             // selected row has cancel focus (right-arrow).
             const focused = selected and self.cancel_focus;
             const button = if (focused) " [CANCEL] " else " CANCEL ";
-            const style = if (focused) StylePalette.tool_failed else StylePalette.thinking_body;
+            const style = if (focused) p.tool_failed else p.thinking_body;
             panel.rightStyled(&surface, 1 + row, button, ctx, style) catch {};
         }
         return surface;

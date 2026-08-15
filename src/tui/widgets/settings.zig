@@ -21,7 +21,6 @@ const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
 const config_mod = @import("../../config/config.zig");
 
-const StylePalette = tui_style.Palette;
 const assert = std.debug.assert;
 
 // ---------------------------------------------------------------------------
@@ -197,6 +196,7 @@ pub const Content = struct {
     // -----------------------------------------------------------------------
 
     fn drawTabBar(surface: *vxfw.Surface, ctx: vxfw.DrawContext, active: Tab) !void {
+        const p = tui_style.activePalette();
         const start_col: u16 = 2;
         var col: u16 = start_col;
         inline for (@typeInfo(Tab).@"enum".fields) |field| {
@@ -204,9 +204,9 @@ pub const Content = struct {
             const label = tab.label();
             const is_active = tab == active;
             const style: vaxis.Style = if (is_active)
-                .{ .fg = .{ .rgb = .{ 249, 115, 22 } }, .ul_style = .single, .bold = true }
+                p.settings_active_tab
             else
-                StylePalette.thinking_body;
+                p.thinking_body;
             try panel.lineStyledAt(surface, 0, label, ctx, col, style);
             col += @intCast(ctx.stringWidth(label) + 2);
         }
@@ -217,19 +217,20 @@ pub const Content = struct {
     // -----------------------------------------------------------------------
 
     fn drawGeneral(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
+        const p = tui_style.activePalette();
         const sel = self.state.selection[@intFromEnum(Tab.general)];
 
         // Row 2: section header.
-        try panel.lineStyledAt(surface, 2, "GENERAL SETTINGS", ctx, left_col, StylePalette.panel_header);
+        try panel.lineStyledAt(surface, 2, "GENERAL SETTINGS", ctx, left_col, p.panel_header);
 
         // Row 4: use_responses_endpoint toggle.
         {
             const selected = sel == 0;
-            if (selected) panel.fillRow(surface, 4, StylePalette.selected);
+            if (selected) panel.fillRow(surface, 4, p.selected);
             const value = self.state.pending_use_responses_endpoint orelse
                 (if (self.config.model_selection) |ms| ms.useResponsesEndpoint() else false);
             const label = try std.fmt.allocPrint(ctx.arena, "  Use Responses Endpoint  {s}", .{boolBadge(value)});
-            const style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;
+            const style = if (selected) p.selected_item else p.thinking_body;
             try panel.lineStyledAt(surface, 4, label, ctx, left_col, style);
             const desc = "Route completions through the OpenAI Responses API instead of Chat Completions.";
             try self.drawDescription(surface, ctx, 5, desc, selected);
@@ -238,11 +239,11 @@ pub const Content = struct {
         // Row 7: toast notifications toggle.
         {
             const selected = sel == 1;
-            if (selected) panel.fillRow(surface, 7, StylePalette.selected);
+            if (selected) panel.fillRow(surface, 7, p.selected);
             const value = self.state.pending_toast_enabled orelse
                 (self.config.toast.enabled orelse true);
             const label = try std.fmt.allocPrint(ctx.arena, "  Toast Notifications  {s}", .{boolBadge(value)});
-            const style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;
+            const style = if (selected) p.selected_item else p.thinking_body;
             try panel.lineStyledAt(surface, 7, label, ctx, left_col, style);
             const desc = "Show transient notifications (e.g. warnings) in the top-right corner.";
             try self.drawDescription(surface, ctx, 8, desc, selected);
@@ -254,21 +255,22 @@ pub const Content = struct {
     // -----------------------------------------------------------------------
 
     fn drawPrompt(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
+        const p = tui_style.activePalette();
         const sel = self.state.selection[@intFromEnum(Tab.prompt)];
         const is_editing = self.state.edit_target == .system_prompt;
 
         // Row 2: section header.
-        try panel.lineStyledAt(surface, 2, "SYSTEM PROMPT", ctx, left_col, StylePalette.panel_header);
-        try panel.lineStyledAt(surface, 3, "Custom instructions prepended to every conversation.", ctx, left_col, StylePalette.thinking_body);
+        try panel.lineStyledAt(surface, 2, "SYSTEM PROMPT", ctx, left_col, p.panel_header);
+        try panel.lineStyledAt(surface, 3, "Custom instructions prepended to every conversation.", ctx, left_col, p.thinking_body);
 
         // Row 5: prompt editor area.
         const selected = sel == 0;
         const border_style: vaxis.Style = if (is_editing)
-            .{ .fg = .{ .rgb = .{ 249, 115, 22 } } }
+            p.border_label
         else if (selected)
-            StylePalette.selected_item
+            p.selected_item
         else
-            StylePalette.thinking_body;
+            p.thinking_body;
 
         // Draw a simple bordered box for the prompt.
         drawBox(surface, ctx, 5, left_col, surface.size.width -| left_col -| 2, 7, border_style);
@@ -283,14 +285,14 @@ pub const Content = struct {
                 else
                     "");
 
-        try drawWrappedText(surface, ctx, 6, left_col + 1, surface.size.width -| left_col -| 4, text, 5, StylePalette.info);
+        try drawWrappedText(surface, ctx, 6, left_col + 1, surface.size.width -| left_col -| 4, text, 5, p.info);
 
         // Edit hint row below the box.
         const hint_row: u16 = 13;
         if (is_editing) {
-            try panel.lineStyledAt(surface, hint_row, "  Ctrl+S  Save prompt · Esc  Cancel", ctx, left_col, StylePalette.thinking_body);
+            try panel.lineStyledAt(surface, hint_row, "  Ctrl+S  Save prompt · Esc  Cancel", ctx, left_col, p.thinking_body);
         } else {
-            try panel.lineStyledAt(surface, hint_row, "  Enter   Edit prompt · Del  Clear prompt", ctx, left_col, StylePalette.thinking_body);
+            try panel.lineStyledAt(surface, hint_row, "  Enter   Edit prompt · Del  Clear prompt", ctx, left_col, p.thinking_body);
         }
     }
 
@@ -299,15 +301,16 @@ pub const Content = struct {
     // -----------------------------------------------------------------------
 
     fn drawAdvanced(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
+        const p = tui_style.activePalette();
         const sel = self.state.selection[@intFromEnum(Tab.advanced)];
 
         // Row 2: section header.
-        try panel.lineStyledAt(surface, 2, "ADVANCED SETTINGS", ctx, left_col, StylePalette.panel_header);
+        try panel.lineStyledAt(surface, 2, "ADVANCED SETTINGS", ctx, left_col, p.panel_header);
 
         // Row 4: bash classifier URL.
         {
             const selected = sel == 0;
-            if (selected) panel.fillRow(surface, 4, StylePalette.selected);
+            if (selected) panel.fillRow(surface, 4, p.selected);
             const is_editing = self.state.edit_target == .bash_classifier_url;
             const url_text = if (is_editing)
                 self.bash_classifier_input
@@ -317,12 +320,12 @@ pub const Content = struct {
                         (ms.bashClassifierUrl() orelse "")
                     else
                         "");
-            const style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;
+            const style = if (selected) p.selected_item else p.thinking_body;
             const label = "  Bash Classifier URL";
             try panel.lineStyledAt(surface, 4, label, ctx, left_col, style);
             const url_col = left_col + @as(u16, @intCast(ctx.stringWidth(label))) + 2;
             const display_url = if (url_text.len > 0) url_text else "(not set)";
-            const url_style: vaxis.Style = if (selected) StylePalette.selected_item else StylePalette.model_status;
+            const url_style: vaxis.Style = if (selected) p.selected_item else p.model_status;
             try panel.lineStyledAt(surface, 4, display_url, ctx, url_col, url_style);
             const desc = "Override the remote bash-safety classifier endpoint (leave empty to use built-in).";
             try self.drawDescription(surface, ctx, 5, desc, selected);
@@ -334,27 +337,28 @@ pub const Content = struct {
     // -----------------------------------------------------------------------
 
     fn drawAbout(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
+        const p = tui_style.activePalette();
         _ = self.state;
-        try panel.lineStyledAt(surface, 2, "ABOUT NOVA", ctx, left_col, StylePalette.panel_header);
-        try panel.lineStyledAt(surface, 4, self.version_string, ctx, left_col, StylePalette.info);
+        try panel.lineStyledAt(surface, 2, "ABOUT NOVA", ctx, left_col, p.panel_header);
+        try panel.lineStyledAt(surface, 4, self.version_string, ctx, left_col, p.info);
 
         // Config file paths.
-        try panel.lineStyledAt(surface, 6, "Configuration Files", ctx, left_col, StylePalette.panel_header);
+        try panel.lineStyledAt(surface, 6, "Configuration Files", ctx, left_col, p.panel_header);
 
         const global_path = try std.fmt.allocPrint(ctx.arena, "  Global config : {s}/.config/nova/config.json", .{self.home_dir});
-        try panel.lineStyledAt(surface, 7, global_path, ctx, left_col, StylePalette.thinking_body);
+        try panel.lineStyledAt(surface, 7, global_path, ctx, left_col, p.thinking_body);
 
         const project_path = try std.fmt.allocPrint(ctx.arena, "  Project config: {s}/.nova/config.json", .{self.cwd});
-        try panel.lineStyledAt(surface, 8, project_path, ctx, left_col, StylePalette.thinking_body);
+        try panel.lineStyledAt(surface, 8, project_path, ctx, left_col, p.thinking_body);
 
         const auth_path = try std.fmt.allocPrint(ctx.arena, "  API keys      : {s}/.config/nova/auth.json", .{self.home_dir});
-        try panel.lineStyledAt(surface, 9, auth_path, ctx, left_col, StylePalette.thinking_body);
+        try panel.lineStyledAt(surface, 9, auth_path, ctx, left_col, p.thinking_body);
 
-        try panel.lineStyledAt(surface, 11, "Config Layer Priority  (later overrides earlier)", ctx, left_col, StylePalette.panel_header);
-        try panel.lineStyledAt(surface, 12, "  1. Built-in defaults", ctx, left_col, StylePalette.thinking_body);
-        try panel.lineStyledAt(surface, 13, "  2. Global config  (~/.config/nova/config.json)", ctx, left_col, StylePalette.thinking_body);
-        try panel.lineStyledAt(surface, 14, "  3. Project config (.nova/config.json)", ctx, left_col, StylePalette.thinking_body);
-        try panel.lineStyledAt(surface, 15, "  4. Environment variables (OPENAI_MODEL, OPENAI_API_KEY, …)", ctx, left_col, StylePalette.thinking_body);
+        try panel.lineStyledAt(surface, 11, "Config Layer Priority  (later overrides earlier)", ctx, left_col, p.panel_header);
+        try panel.lineStyledAt(surface, 12, "  1. Built-in defaults", ctx, left_col, p.thinking_body);
+        try panel.lineStyledAt(surface, 13, "  2. Global config  (~/.config/nova/config.json)", ctx, left_col, p.thinking_body);
+        try panel.lineStyledAt(surface, 14, "  3. Project config (.nova/config.json)", ctx, left_col, p.thinking_body);
+        try panel.lineStyledAt(surface, 15, "  4. Environment variables (OPENAI_MODEL, OPENAI_API_KEY, …)", ctx, left_col, p.thinking_body);
     }
 
     // -----------------------------------------------------------------------
@@ -370,7 +374,8 @@ pub const Content = struct {
         selected: bool,
     ) !void {
         _ = self;
-        const style = if (selected) StylePalette.thinking_body else StylePalette.thinking_body;
+        const p = tui_style.activePalette();
+        const style = if (selected) p.thinking_body else p.thinking_body;
         try panel.lineStyledAt(surface, row, text, ctx, left_col + 2, style);
     }
 };
@@ -380,10 +385,11 @@ pub const Content = struct {
 // ---------------------------------------------------------------------------
 
 fn drawBottomHint(surface: *vxfw.Surface, ctx: vxfw.DrawContext, state: *const State) !void {
+    const p = tui_style.activePalette();
     const row = surface.size.height -| 1;
     const dirty_marker: []const u8 = if (state.dirty) " ● unsaved" else "";
     const hint = try std.fmt.allocPrint(ctx.arena, "Tab next section · Up/Down navigate · Enter toggle/edit · Ctrl+S save{s}", .{dirty_marker});
-    const style: vaxis.Style = if (state.dirty) StylePalette.notice else StylePalette.thinking_body;
+    const style: vaxis.Style = if (state.dirty) p.notice else p.thinking_body;
     try panel.lineStyledAt(surface, row, hint, ctx, left_col, style);
 }
 
@@ -396,11 +402,12 @@ const left_col: u16 = 1;
 fn drawHorizontalRule(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16) void {
     _ = ctx;
     if (row >= surface.size.height) return;
+    const p = tui_style.activePalette();
     var col: u16 = 0;
     while (col < surface.size.width) : (col += 1) {
         surface.writeCell(col, row, .{
             .char = .{ .grapheme = "─", .width = 1 },
-            .style = StylePalette.thinking_body,
+            .style = p.thinking_body,
         });
     }
 }

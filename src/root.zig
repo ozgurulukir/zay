@@ -290,6 +290,7 @@ test {
     // analyzed, and its tests silently never run).
     _ = @import("tui/tests.zig");
     _ = @import("tui/bounded_list.zig");
+    _ = @import("tui/style.zig");
     _ = @import("lua/root.zig");
     _ = @import("lua/state.zig");
     _ = @import("lua/bridge.zig");

@@ -145,6 +145,8 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
     for (updates.plugins) |plugin| try applyPluginOverlay(gpa, target, plugin);
     applyContextOverlay(&target.context, updates.context);
     try applyToastOverlay(gpa, target, updates.toast);
+    // Theme is independent of model selection, so it merges unconditionally.
+    if (updates.theme) |s| try replaceOptionalSlice(gpa, &target.theme, s);
 }
 
 /// Merge toast settings: non-default values in `updates` override `target`.
@@ -538,6 +540,10 @@ fn parseObject(
     if (boolFieldCompat(value, "strictOutputs", "strict_outputs")) |b| out.strict_outputs = b;
     if (stringFieldCompat(value, "systemPrompt", "system_prompt")) |s| {
         out.system_prompt = try gpa.dupe(u8, s);
+    }
+    // Theme name (single snake_case key; empty means "default" at resolve time).
+    if (stringField(value, "theme")) |s| {
+        if (s.len > 0) out.theme = try gpa.dupe(u8, s);
     }
 
     // Context window and compaction settings.
@@ -1209,6 +1215,13 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
     if (hasNonDefaultToast(config.toast)) {
         try writeKey(writer, "toast", &wrote_any);
         try writeToast(writer, config.toast);
+    }
+    // Theme: written when set and non-empty. Absent = default at resolve time.
+    if (config.theme) |t| {
+        if (t.len > 0) {
+            try writeKey(writer, "theme", &wrote_any);
+            try std.json.Stringify.value(t, .{}, writer);
+        }
     }
     try writer.writeAll("\n}\n");
 }
@@ -2827,4 +2840,45 @@ test "default config omits toast section" {
     try serialize(gpa, &buf.writer, cfg);
     const text = buf.written();
     try std.testing.expect(std.mem.indexOf(u8, text, "\"toast\"") == null);
+}
+
+test "parseFile parses the theme field" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    var cfg = try parseFile(gpa, "<test>", "{\"theme\":\"cappuccino\"}", &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqualStrings("cappuccino", cfg.theme.?);
+}
+
+test "serialize then parse roundtrips the theme field" {
+    const gpa = std.testing.allocator;
+    var original: Config = .{ .theme = try gpa.dupe(u8, "cappuccino") };
+    defer original.deinit(gpa);
+
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, original);
+    // The theme is written only when set and non-empty.
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"theme\"") != null);
+
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    var parsed = try parseFile(gpa, "<test>", buf.written(), &sink);
+    defer parsed.deinit(gpa);
+    var roundtrip = try mergeLayers(gpa, &.{parsed});
+    defer roundtrip.deinit(gpa);
+    try std.testing.expectEqualStrings("cappuccino", roundtrip.theme.?);
+}
+
+test "mergeLayers: later-layer theme wins" {
+    const gpa = std.testing.allocator;
+    var global: Config = .{ .theme = try gpa.dupe(u8, "default") };
+    defer global.deinit(gpa);
+    var project: Config = .{ .theme = try gpa.dupe(u8, "cappuccino") };
+    defer project.deinit(gpa);
+
+    var merged = try mergeLayers(gpa, &.{ global, project });
+    defer merged.deinit(gpa);
+    try std.testing.expectEqualStrings("cappuccino", merged.theme.?);
 }

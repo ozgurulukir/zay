@@ -532,6 +532,7 @@ pub const Content = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Content = @ptrCast(@alignCast(ptr));
+        const p = tui_style.activePalette();
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
@@ -544,7 +545,7 @@ pub const Content = struct {
         // Row 0 is a white status header: filter mode on the left, position on
         // the right (justify-between). Row 1 is blank padding; the scrollable
         // list starts at row 2.
-        const white = tui_style.Palette.panel_header;
+        const white = p.panel_header;
         const start_col = message.ConversationLayout.left -| 1;
         const mode_label = try std.fmt.allocPrint(ctx.arena, "Filter: {s}", .{self.state.filter_mode.label()});
         try panel.lineStyledAt(&surface, 0, mode_label, ctx, start_col, white);
@@ -595,13 +596,14 @@ const Row = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Row = @ptrCast(@alignCast(ptr));
+        const p = tui_style.activePalette();
         const width = ctx.max.width orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
-        if (self.selected) panel.fillRow(&surface, 0, tui_style.Palette.selected);
+        if (self.selected) panel.fillRow(&surface, 0, p.selected);
 
         // Tree rows anchor at the same left column as the "Filter:" header.
         var col = message.ConversationLayout.left -| 1;
-        try panel.lineStyledAt(&surface, 0, self.node.prefix, ctx, col, tui_style.onSelectionBg(tui_style.Palette.thinking_body, self.selected));
+        try panel.lineStyledAt(&surface, 0, self.node.prefix, ctx, col, tui_style.onSelectionBg(p.thinking_body, self.selected));
         col += @intCast(ctx.stringWidth(self.node.prefix));
 
         const text = try self.displayText(ctx);
@@ -618,12 +620,13 @@ const Row = struct {
 
 fn rowStyle(kind: session_mod.EntryKind, tool_failed: bool, selected: bool) vaxis.Style {
     _ = tool_failed;
+    const p = tui_style.activePalette();
     const style = switch (kind) {
-        .user => tui_style.Palette.user,
-        .assistant, .assistant_empty => tui_style.Palette.thinking_label,
-        .tool => tui_style.Palette.thinking_body,
-        .checkpoint => tui_style.Palette.checkpoint,
-        .branch_summary, .session_info, .other => tui_style.Palette.thinking_body,
+        .user => p.user,
+        .assistant, .assistant_empty => p.thinking_label,
+        .tool => p.thinking_body,
+        .checkpoint => p.checkpoint,
+        .branch_summary, .session_info, .other => p.thinking_body,
     };
     return tui_style.onSelectionBg(style, selected);
 }

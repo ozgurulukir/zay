@@ -13,8 +13,6 @@ const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
 const transcript_mod = @import("../../transcript.zig");
 
-const StylePalette = tui_style.Palette;
-
 /// One transcript match. `snippet` is owned (duped at rebuild time): the
 /// overlay does NOT pause streaming — a turn keeps projecting deltas onto the
 /// transcript while search is open, and `appendOwned`'s realloc can move (and
@@ -85,6 +83,7 @@ pub const Content = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Content = @ptrCast(@alignCast(ptr));
+        const p = tui_style.activePalette();
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
@@ -99,7 +98,7 @@ pub const Content = struct {
                 "  Type to search this transcript · Enter jumps · Esc closes"
             else
                 "  No matching messages";
-            panel.lineStyledAt(&surface, 0, hint, ctx, 1, StylePalette.thinking_body) catch {};
+            panel.lineStyledAt(&surface, 0, hint, ctx, 1, p.thinking_body) catch {};
             return surface;
         }
 
@@ -114,7 +113,7 @@ pub const Content = struct {
             const label = try std.fmt.allocPrint(ctx.arena, "{d} {s}  ", .{ m.message_index, m.role });
             try panel.commandLine(&surface, screen_row, label, ctx, selected);
             if (m.snippet.len > 0 and width > 24) {
-                const desc_style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;
+                const desc_style = if (selected) p.selected_item else p.thinking_body;
                 _ = panel.writeBorderTextEndingAt(&surface, ctx, screen_row, width -| 2, m.snippet, desc_style);
             }
         }

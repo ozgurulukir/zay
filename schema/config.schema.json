@@ -63,6 +63,11 @@
     "toast": {
       "$ref": "#/$defs/ToastSettings",
       "description": "Toast notification settings (transient top-right TUI notices)."
+    },
+    "theme": {
+      "type": "string",
+      "enum": ["default", "cappuccino"],
+      "description": "Name of the builtin color theme for the TUI. Unknown or empty names fall back to 'default' at resolve time. Absent = 'default'."
     }
   },
   "additionalProperties": false,

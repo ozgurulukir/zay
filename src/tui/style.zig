@@ -1,77 +1,195 @@
+const std = @import("std");
 const vaxis = @import("vaxis");
 
-pub const Palette = struct {
-    const thinking_blue = .{ 96, 165, 250 };
-    const user_yellow = .{ 212, 175, 55 };
-    const success_green = .{ 34, 197, 94 };
-    const failure_red = .{ 239, 68, 68 };
-    const accent_orange = .{ 249, 115, 22 };
-    const skill_purple = .{ 168, 85, 247 };
-    const lane_pink = .{ 244, 114, 182 };
-    const muted_gray = .{ 138, 138, 138 };
-    const selection_bg = .{ 38, 38, 38 };
-    const amber_yellow = .{ 245, 158, 11 };
+/// A pure RGB color: one of the ~15 named base colors a theme author edits.
+/// `vaxis.Color` is a tagged union, so every theme color must be wrapped as
+/// `.{ .rgb = theme.X }` when it lands in a style — never used bare.
+pub const Rgb = [3]u8;
 
-    pub const selected: vaxis.Style = .{ .bg = .{ .rgb = selection_bg } };
-    pub const selected_item: vaxis.Style = .{ .fg = .{ .rgb = accent_orange }, .bg = .{ .rgb = selection_bg } };
-
-    pub const user: vaxis.Style = .{ .fg = .{ .rgb = user_yellow }, .italic = true };
-    pub const skill: vaxis.Style = .{ .fg = .{ .rgb = skill_purple }, .bold = true };
-    pub const tool: vaxis.Style = .{ .fg = .{ .rgb = success_green } };
-    pub const tool_failed: vaxis.Style = .{ .fg = .{ .rgb = failure_red } };
-    pub const success: vaxis.Style = .{ .fg = .{ .rgb = success_green } };
-    pub const notice: vaxis.Style = .{ .fg = .{ .rgb = amber_yellow } };
-    pub const warning: vaxis.Style = .{ .fg = .{ .rgb = amber_yellow }, .bold = true };
-    /// Toast error accent — the failure red, bold so it reads as an error.
-    pub const error_style: vaxis.Style = .{ .fg = .{ .rgb = failure_red }, .bold = true };
-    /// Neutral informational notice (e.g. context compaction) — plain white, so
-    /// it reads as status rather than an error (red) or a win (green).
-    pub const info: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } } };
-    pub const border_label: vaxis.Style = .{ .fg = .{ .rgb = accent_orange } };
-    /// Bottom-left background-jobs badge: black text on the thinking-blue fill,
-    /// so the live-job count reads as a status pill, not body text.
-    pub const background_badge: vaxis.Style = .{ .fg = .{ .rgb = .{ 0, 0, 0 } }, .bg = .{ .rgb = thinking_blue } };
-    pub const lanes_badge: vaxis.Style = .{ .fg = .{ .rgb = .{ 0, 0, 0 } }, .bg = .{ .rgb = lane_pink } };
-    pub const model_status: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
-    pub const thinking_label: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
-    pub const thinking_body: vaxis.Style = .{ .fg = .{ .rgb = muted_gray } };
-    /// Timeline code-state checkpoints — the light blue, marking branch points.
-    pub const checkpoint: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
-    /// The ✦ marker on a timeline message that has a checkpoint — the same blue
-    /// as diff-view file names (`code_blue`).
-    pub const checkpoint_mark: vaxis.Style = .{ .fg = .{ .rgb = code_blue } };
-    pub const thinking_bar: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
-    pub const markdown_code: vaxis.Style = .{ .fg = .{ .rgb = .{ 147, 197, 253 } } };
-    pub const panel_header: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } } };
-
-    // Diff viewer: light-blue file section headers, a dim gutter for line
-    // numbers, and white comment brackets/previews. Hunk markers stay dim gray
-    // (blue read too loud). Line bodies reuse tool/tool_failed/thinking_body.
-    const white = .{ 255, 255, 255 };
-    const code_blue = .{ 147, 197, 253 };
-    pub const diff_file_header: vaxis.Style = .{ .fg = .{ .rgb = code_blue }, .bold = true };
-    pub const diff_hunk: vaxis.Style = .{ .fg = .{ .rgb = muted_gray }, .dim = true };
-    pub const diff_gutter: vaxis.Style = .{ .fg = .{ .rgb = muted_gray }, .dim = true };
-    pub const diff_bracket: vaxis.Style = .{ .fg = .{ .rgb = white } };
-    pub const diff_comment: vaxis.Style = .{ .fg = .{ .rgb = white }, .italic = true };
-    // The cursor-selected ("active") comment: yellow gutter + preview, so it's
-    // obvious which comment Ctrl+E / Ctrl+D will act on.
-    pub const diff_bracket_active: vaxis.Style = .{ .fg = .{ .rgb = user_yellow }, .bold = true };
-    pub const diff_comment_active: vaxis.Style = .{ .fg = .{ .rgb = user_yellow }, .bold = true };
-    // Faint full-line backgrounds for additions / deletions, and the matching
-    // intra-line (word) highlight for the changed middles of a merged
-    // modification (green for inserted, red for deleted).
-    const faint_add_bg = .{ 22, 43, 30 };
-    const faint_del_bg = .{ 52, 27, 27 };
-    pub const diff_added_row: vaxis.Style = .{ .bg = .{ .rgb = faint_add_bg } };
-    pub const diff_removed_row: vaxis.Style = .{ .bg = .{ .rgb = faint_del_bg } };
-    pub const diff_inline_del: vaxis.Style = .{ .fg = .{ .rgb = failure_red }, .bg = .{ .rgb = faint_del_bg } };
-    pub const diff_inline_add: vaxis.Style = .{ .fg = .{ .rgb = success_green }, .bg = .{ .rgb = faint_add_bg } };
+/// A named theme: the SSOT a theme author edits. `buildPalette` derives the
+/// full runtime `Palette` from these ~15 slots, so the color→style mapping
+/// lives in one place and a theme is a short, readable color table.
+pub const Theme = struct {
+    name: []const u8,
+    thinking_blue: Rgb,
+    user_yellow: Rgb,
+    success_green: Rgb,
+    failure_red: Rgb,
+    accent_orange: Rgb,
+    skill_purple: Rgb,
+    lane_pink: Rgb,
+    muted_gray: Rgb,
+    selection_bg: Rgb,
+    amber_yellow: Rgb,
+    white: Rgb,
+    code_blue: Rgb,
+    faint_add_bg: Rgb,
+    faint_del_bg: Rgb,
+    markdown_heading: Rgb,
 };
 
+/// The current look, byte-identical to the pre-theme literals (plus the
+/// markdown heading's `.{252,211,77}` folded in from `message.zig`).
+pub const default_theme: Theme = .{
+    .name = "default",
+    .thinking_blue = .{ 96, 165, 250 },
+    .user_yellow = .{ 212, 175, 55 },
+    .success_green = .{ 34, 197, 94 },
+    .failure_red = .{ 239, 68, 68 },
+    .accent_orange = .{ 249, 115, 22 },
+    .skill_purple = .{ 168, 85, 247 },
+    .lane_pink = .{ 244, 114, 182 },
+    .muted_gray = .{ 138, 138, 138 },
+    .selection_bg = .{ 38, 38, 38 },
+    .amber_yellow = .{ 245, 158, 11 },
+    .white = .{ 255, 255, 255 },
+    .code_blue = .{ 147, 197, 253 },
+    .faint_add_bg = .{ 22, 43, 30 },
+    .faint_del_bg = .{ 52, 27, 27 },
+    .markdown_heading = .{ 252, 211, 77 },
+};
+
+/// A Catppuccin Mocha variant, user-facing name "cappuccino".
+pub const cappuccino_theme: Theme = .{
+    .name = "cappuccino",
+    .thinking_blue = .{ 137, 180, 250 }, // blue
+    .user_yellow = .{ 249, 226, 175 }, // yellow
+    .success_green = .{ 166, 227, 161 }, // green
+    .failure_red = .{ 243, 139, 168 }, // red
+    .accent_orange = .{ 250, 179, 135 }, // peach
+    .skill_purple = .{ 203, 166, 247 }, // mauve
+    .lane_pink = .{ 245, 194, 231 }, // pink
+    .muted_gray = .{ 147, 153, 178 }, // overlay2
+    .selection_bg = .{ 49, 50, 68 }, // surface0
+    .amber_yellow = .{ 249, 226, 175 }, // yellow
+    .white = .{ 205, 214, 244 }, // text
+    .code_blue = .{ 148, 226, 213 }, // teal
+    .faint_add_bg = .{ 40, 59, 47 },
+    .faint_del_bg = .{ 62, 46, 54 },
+    .markdown_heading = .{ 249, 226, 175 }, // yellow
+};
+
+const themes = [_]Theme{ default_theme, cappuccino_theme };
+
+/// Resolve a user-supplied theme name to a `Theme`. Case-insensitive;
+/// unknown, empty, and `null` names fall back to `default_theme`. Theme-name
+/// validation lives here (a UI concern), not in `config.validate`.
+pub fn resolveTheme(name: ?[]const u8) Theme {
+    const n = name orelse return default_theme;
+    for (themes) |t| if (std.ascii.eqlIgnoreCase(n, t.name)) return t;
+    return default_theme;
+}
+
+/// The runtime palette: every style the widgets draw with. Instance fields so
+/// the whole UI can be recolored by rebuilding it from a different `Theme`.
+pub const Palette = struct {
+    selected: vaxis.Style,
+    selected_item: vaxis.Style,
+    user: vaxis.Style,
+    skill: vaxis.Style,
+    tool: vaxis.Style,
+    tool_failed: vaxis.Style,
+    success: vaxis.Style,
+    notice: vaxis.Style,
+    warning: vaxis.Style,
+    error_style: vaxis.Style,
+    info: vaxis.Style,
+    border_label: vaxis.Style,
+    background_badge: vaxis.Style,
+    lanes_badge: vaxis.Style,
+    model_status: vaxis.Style,
+    thinking_label: vaxis.Style,
+    thinking_body: vaxis.Style,
+    checkpoint: vaxis.Style,
+    checkpoint_mark: vaxis.Style,
+    thinking_bar: vaxis.Style,
+    markdown_code: vaxis.Style,
+    panel_header: vaxis.Style,
+    diff_file_header: vaxis.Style,
+    diff_hunk: vaxis.Style,
+    diff_gutter: vaxis.Style,
+    diff_bracket: vaxis.Style,
+    diff_comment: vaxis.Style,
+    diff_bracket_active: vaxis.Style,
+    diff_comment_active: vaxis.Style,
+    diff_added_row: vaxis.Style,
+    diff_removed_row: vaxis.Style,
+    diff_inline_del: vaxis.Style,
+    diff_inline_add: vaxis.Style,
+    // Newly centralized stray literals:
+    markdown_heading: vaxis.Style,
+    settings_active_tab: vaxis.Style,
+    permission_approve: vaxis.Style,
+};
+
+/// Derive the full runtime palette from a theme. For `default_theme` this
+/// reproduces the exact pre-theme styles. Pure and comptime-evaluable, so it
+/// is valid as the global `active` initializer.
+pub fn buildPalette(theme: Theme) Palette {
+    return .{
+        .selected = .{ .bg = .{ .rgb = theme.selection_bg } },
+        .selected_item = .{ .fg = .{ .rgb = theme.accent_orange }, .bg = .{ .rgb = theme.selection_bg } },
+
+        .user = .{ .fg = .{ .rgb = theme.user_yellow }, .italic = true },
+        .skill = .{ .fg = .{ .rgb = theme.skill_purple }, .bold = true },
+        .tool = .{ .fg = .{ .rgb = theme.success_green } },
+        .tool_failed = .{ .fg = .{ .rgb = theme.failure_red } },
+        .success = .{ .fg = .{ .rgb = theme.success_green } },
+        .notice = .{ .fg = .{ .rgb = theme.amber_yellow } },
+        .warning = .{ .fg = .{ .rgb = theme.amber_yellow }, .bold = true },
+        // Toast error accent — the failure red, bold so it reads as an error.
+        .error_style = .{ .fg = .{ .rgb = theme.failure_red }, .bold = true },
+        .info = .{ .fg = .{ .rgb = theme.white } },
+        .border_label = .{ .fg = .{ .rgb = theme.accent_orange } },
+        // Bottom-left background-jobs badge: black text on the thinking-blue
+        // fill, so the live-job count reads as a status pill, not body text.
+        .background_badge = .{ .fg = .{ .rgb = .{ 0, 0, 0 } }, .bg = .{ .rgb = theme.thinking_blue } },
+        .lanes_badge = .{ .fg = .{ .rgb = .{ 0, 0, 0 } }, .bg = .{ .rgb = theme.lane_pink } },
+        .model_status = .{ .fg = .{ .rgb = theme.thinking_blue } },
+        .thinking_label = .{ .fg = .{ .rgb = theme.thinking_blue } },
+        .thinking_body = .{ .fg = .{ .rgb = theme.muted_gray } },
+        .checkpoint = .{ .fg = .{ .rgb = theme.thinking_blue } },
+        .checkpoint_mark = .{ .fg = .{ .rgb = theme.code_blue } },
+        .thinking_bar = .{ .fg = .{ .rgb = theme.thinking_blue } },
+        .markdown_code = .{ .fg = .{ .rgb = theme.code_blue } },
+        .panel_header = .{ .fg = .{ .rgb = theme.white } },
+
+        .diff_file_header = .{ .fg = .{ .rgb = theme.code_blue }, .bold = true },
+        .diff_hunk = .{ .fg = .{ .rgb = theme.muted_gray }, .dim = true },
+        .diff_gutter = .{ .fg = .{ .rgb = theme.muted_gray }, .dim = true },
+        .diff_bracket = .{ .fg = .{ .rgb = theme.white } },
+        .diff_comment = .{ .fg = .{ .rgb = theme.white }, .italic = true },
+        .diff_bracket_active = .{ .fg = .{ .rgb = theme.user_yellow }, .bold = true },
+        .diff_comment_active = .{ .fg = .{ .rgb = theme.user_yellow }, .bold = true },
+        .diff_added_row = .{ .bg = .{ .rgb = theme.faint_add_bg } },
+        .diff_removed_row = .{ .bg = .{ .rgb = theme.faint_del_bg } },
+        .diff_inline_del = .{ .fg = .{ .rgb = theme.failure_red }, .bg = .{ .rgb = theme.faint_del_bg } },
+        .diff_inline_add = .{ .fg = .{ .rgb = theme.success_green }, .bg = .{ .rgb = theme.faint_add_bg } },
+
+        .markdown_heading = .{ .bold = true, .fg = .{ .rgb = theme.markdown_heading } },
+        .settings_active_tab = .{ .fg = .{ .rgb = theme.accent_orange }, .ul_style = .single, .bold = true },
+        .permission_approve = .{ .fg = .{ .rgb = theme.success_green }, .bold = true },
+    };
+}
+
+/// The active runtime palette, installed once at startup by `tui.run`. Render
+/// is single-threaded on the UI thread; mutations happen only there.
+pub var active: Palette = buildPalette(default_theme);
+
+/// Fetch a pointer to the active palette for reading during draw.
+pub fn activePalette() *const Palette {
+    return &active;
+}
+
+/// Rebuild the active palette from a theme. Called on the UI thread only.
+pub fn setActive(theme: Theme) void {
+    active = buildPalette(theme);
+}
+
+/// Merge a selection background into a row style when the row is selected.
 pub fn onSelectionBg(style: vaxis.Style, selected: bool) vaxis.Style {
     var merged = style;
-    if (selected) merged.bg = Palette.selected.bg;
+    if (selected) merged.bg = active.selected.bg;
     return merged;
 }
 
@@ -79,4 +197,24 @@ pub fn mergedSelectedStyle(style: vaxis.Style, selected: bool) vaxis.Style {
     var merged = style;
     if (!selected) merged.dim = true;
     return merged;
+}
+
+test "resolveTheme falls back to default for null, empty, unknown" {
+    try std.testing.expectEqual(default_theme, resolveTheme(null));
+    try std.testing.expectEqual(default_theme, resolveTheme(""));
+    try std.testing.expectEqual(default_theme, resolveTheme("bogus"));
+}
+
+test "resolveTheme matches case-insensitively" {
+    try std.testing.expectEqual(cappuccino_theme, resolveTheme("Cappuccino"));
+    try std.testing.expectEqual(cappuccino_theme, resolveTheme("CAPPUCCINO"));
+}
+
+test "buildPalette(default_theme) preserves the original look" {
+    // Spot-check the pre-theme literals: thinking_blue on the thinking label,
+    // user_yellow on user rows, and the folded-in markdown heading yellow.
+    const p = buildPalette(default_theme);
+    try std.testing.expectEqual(@as(Rgb, .{ 96, 165, 250 }), p.thinking_label.fg.rgb);
+    try std.testing.expectEqual(@as(Rgb, .{ 212, 175, 55 }), p.user.fg.rgb);
+    try std.testing.expectEqual(@as(Rgb, .{ 252, 211, 77 }), p.markdown_heading.fg.rgb);
 }

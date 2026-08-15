@@ -5,8 +5,6 @@ const vxfw = vaxis.vxfw;
 const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
 
-const StylePalette = tui_style.Palette;
-
 /// Layout policy shared with the floating-panel host (see `tui.zig`). The body
 /// shows one row for the empty/status message or up to `max_visible_rows`
 /// results, wrapped in a single-cell border on top and bottom.
@@ -86,10 +84,11 @@ pub const Content = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Content = @ptrCast(@alignCast(ptr));
+        const p = tui_style.activePalette();
         var body: Body = .{ .content = self };
         var border: vxfw.Border = .{
             .child = body.widget(),
-            .style = StylePalette.thinking_body,
+            .style = p.thinking_body,
             .labels = &.{.{ .text = self.title, .alignment = .top_left }},
         };
         return border.widget().draw(ctx);

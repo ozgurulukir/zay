@@ -49,20 +49,21 @@ pub const Content = struct {
     /// "nothing matches the current search". Keeps the overlay informative
     /// instead of blank, with a concrete next step.
     fn drawEmpty(self: *Content, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const p = tui_style.activePalette();
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
         const col = message.ConversationLayout.left -| 1;
         if (self.summaries.len == 0) {
-            try panel.lineStyledAt(&surface, 0, "No sessions yet.", ctx, col, tui_style.Palette.panel_header);
-            try panel.lineStyledAt(&surface, 1, "Start a conversation and it will show up here.", ctx, col, tui_style.Palette.thinking_body);
+            try panel.lineStyledAt(&surface, 0, "No sessions yet.", ctx, col, p.panel_header);
+            try panel.lineStyledAt(&surface, 1, "Start a conversation and it will show up here.", ctx, col, p.thinking_body);
         } else if (self.filter.len > 0) {
             const text = try std.fmt.allocPrint(ctx.arena, "No sessions match \"{s}\".", .{self.filter});
-            try panel.lineStyledAt(&surface, 0, text, ctx, col, tui_style.Palette.panel_header);
-            try panel.lineStyledAt(&surface, 1, "Adjust the search text above.", ctx, col, tui_style.Palette.thinking_body);
+            try panel.lineStyledAt(&surface, 0, text, ctx, col, p.panel_header);
+            try panel.lineStyledAt(&surface, 1, "Adjust the search text above.", ctx, col, p.thinking_body);
         } else {
-            try panel.lineStyledAt(&surface, 0, "No sessions to show.", ctx, col, tui_style.Palette.panel_header);
-            try panel.lineStyledAt(&surface, 1, "Try a different grouping (Ctrl+A) or unfold a project (Tab).", ctx, col, tui_style.Palette.thinking_body);
+            try panel.lineStyledAt(&surface, 0, "No sessions to show.", ctx, col, p.panel_header);
+            try panel.lineStyledAt(&surface, 1, "Try a different grouping (Ctrl+A) or unfold a project (Tab).", ctx, col, p.thinking_body);
         }
         return surface;
     }
@@ -71,6 +72,7 @@ pub const Content = struct {
     /// of the session list. The list stays behind (not redrawn) but the
     /// overlay border label changes to indicate the active sub-state.
     fn drawSubState(self: *Content, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const p = tui_style.activePalette();
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(
@@ -82,20 +84,20 @@ pub const Content = struct {
 
         switch (self.action) {
             .renaming => {
-                try panel.lineStyledAt(&surface, 0, "Rename Session", ctx, 2, tui_style.Palette.panel_header);
+                try panel.lineStyledAt(&surface, 0, "Rename Session", ctx, 2, p.panel_header);
                 const prompt = try std.fmt.allocPrint(ctx.arena, "  > {s}_", .{self.rename_text});
-                try panel.lineStyledAt(&surface, 2, prompt, ctx, 2, tui_style.Palette.selected_item);
-                try panel.lineStyledAt(&surface, height -| 2, "[Enter] Save  |  [Esc] Cancel", ctx, 2, tui_style.Palette.thinking_body);
+                try panel.lineStyledAt(&surface, 2, prompt, ctx, 2, p.selected_item);
+                try panel.lineStyledAt(&surface, height -| 2, "[Enter] Save  |  [Esc] Cancel", ctx, 2, p.thinking_body);
             },
             .deleting => {
-                try panel.lineStyledAt(&surface, 0, "Delete Session", ctx, 2, tui_style.Palette.panel_header);
-                try panel.lineStyledAt(&surface, 2, "  Delete this session? This cannot be undone.", ctx, 2, tui_style.Palette.tool_failed);
-                try panel.lineStyledAt(&surface, height -| 2, "[Y] Delete  |  [N/Esc] Cancel", ctx, 2, tui_style.Palette.thinking_body);
+                try panel.lineStyledAt(&surface, 0, "Delete Session", ctx, 2, p.panel_header);
+                try panel.lineStyledAt(&surface, 2, "  Delete this session? This cannot be undone.", ctx, 2, p.tool_failed);
+                try panel.lineStyledAt(&surface, height -| 2, "[Y] Delete  |  [N/Esc] Cancel", ctx, 2, p.thinking_body);
             },
             .blocked => {
-                try panel.lineStyledAt(&surface, 0, "Cannot Delete Active Session", ctx, 2, tui_style.Palette.panel_header);
-                try panel.lineStyledAt(&surface, 2, "  Switch to another session first, then delete this one.", ctx, 2, tui_style.Palette.tool_failed);
-                try panel.lineStyledAt(&surface, height -| 2, "[Any key] Dismiss", ctx, 2, tui_style.Palette.thinking_body);
+                try panel.lineStyledAt(&surface, 0, "Cannot Delete Active Session", ctx, 2, p.panel_header);
+                try panel.lineStyledAt(&surface, 2, "  Switch to another session first, then delete this one.", ctx, 2, p.tool_failed);
+                try panel.lineStyledAt(&surface, height -| 2, "[Any key] Dismiss", ctx, 2, p.thinking_body);
             },
             .browsing => unreachable,
         }
@@ -307,28 +309,30 @@ const Row = struct {
 
     fn drawDateHeader(self: *Row, surface: *vxfw.Surface, ctx: vxfw.DrawContext, header: DateHeader) !void {
         _ = self;
+        const p = tui_style.activePalette();
         const text = try std.fmt.allocPrint(ctx.arena, "  {s} ({d})", .{ header.label, header.count });
-        try panel.lineStyledAt(surface, 0, text, ctx, 2, tui_style.Palette.panel_header);
+        try panel.lineStyledAt(surface, 0, text, ctx, 2, p.panel_header);
     }
 
     fn drawProject(self: *Row, surface: *vxfw.Surface, ctx: vxfw.DrawContext, project: Project) !void {
-        if (self.selected) panel.fillRow(surface, 0, tui_style.Palette.selected);
+        const p = tui_style.activePalette();
+        if (self.selected) panel.fillRow(surface, 0, p.selected);
 
         const marker = "  ";
         const start_col = message.ConversationLayout.left -| 1;
         const marker_style = if (self.selected)
-            tui_style.Palette.selected_item
+            p.selected_item
         else
-            tui_style.Palette.thinking_body;
+            p.thinking_body;
         try panel.lineStyledAt(surface, 0, marker, ctx, start_col, marker_style);
 
         var col: u16 = start_col + @as(u16, @intCast(ctx.stringWidth(marker)));
-        const prefix_style = tui_style.onSelectionBg(tui_style.Palette.thinking_body, self.selected);
+        const prefix_style = tui_style.onSelectionBg(p.thinking_body, self.selected);
         try panel.lineStyledAt(surface, 0, project.prefix, ctx, col, prefix_style);
         col += @intCast(ctx.stringWidth(project.prefix));
 
         const name = baseName(project.cwd);
-        try panel.lineStyledAt(surface, 0, name, ctx, col, tui_style.onSelectionBg(tui_style.Palette.markdown_code, self.selected));
+        try panel.lineStyledAt(surface, 0, name, ctx, col, tui_style.onSelectionBg(p.markdown_code, self.selected));
         col += @intCast(ctx.stringWidth(name));
 
         const count = try std.fmt.allocPrint(ctx.arena, " ({d})", .{project.session_count});

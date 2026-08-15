@@ -11,8 +11,6 @@ const vxfw = vaxis.vxfw;
 const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
 
-const StylePalette = tui_style.Palette;
-
 /// Which mode's keybindings a help line documents. Rendered as a dim `[tag]`
 /// prefix rather than used to filter — discoverability beats hiding — and
 /// asserted by the guard test below so a handler change that orphans a help
@@ -182,6 +180,7 @@ pub const Content = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Content = @ptrCast(@alignCast(ptr));
+        const p = tui_style.activePalette();
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
@@ -202,19 +201,19 @@ pub const Content = struct {
             if (item.is_header) {
                 if (row > 0) {
                     // Draw a subtle separator line before section headers.
-                    panel.fillRow(&surface, row, StylePalette.thinking_body);
+                    panel.fillRow(&surface, row, p.thinking_body);
                 }
-                panel.lineStyledAt(&surface, row, item.key, ctx, 1, StylePalette.border_label) catch {};
+                panel.lineStyledAt(&surface, row, item.key, ctx, 1, p.border_label) catch {};
             } else {
                 var key_col: u16 = 2;
                 if (item.scope != .global) {
                     const tag = try std.fmt.allocPrint(ctx.arena, "[{s}] ", .{scopeLabel(item.scope)});
-                    panel.lineStyledAt(&surface, row, tag, ctx, key_col, StylePalette.thinking_body) catch {};
+                    panel.lineStyledAt(&surface, row, tag, ctx, key_col, p.thinking_body) catch {};
                     key_col += @intCast(ctx.stringWidth(tag));
                 }
-                panel.lineStyledAt(&surface, row, item.key, ctx, key_col, StylePalette.user) catch {};
+                panel.lineStyledAt(&surface, row, item.key, ctx, key_col, p.user) catch {};
                 if (width > 30 and item.desc.len > 0) {
-                    _ = panel.writeBorderTextEndingAt(&surface, ctx, row, width -| 3, item.desc, StylePalette.thinking_body);
+                    _ = panel.writeBorderTextEndingAt(&surface, ctx, row, width -| 3, item.desc, p.thinking_body);
                 }
             }
             row += 1;
@@ -228,13 +227,14 @@ pub const Content = struct {
         // Draw bottom hint bar.
         const hint_row = height - 1;
         const hint_text = " ↑/↓ Scroll · PgUp/PgDn Page · Esc/Enter/q Close ";
-        panel.lineStyledAt(&surface, hint_row, hint_text, ctx, 1, StylePalette.thinking_body) catch {};
+        panel.lineStyledAt(&surface, hint_row, hint_text, ctx, 1, p.thinking_body) catch {};
 
         return surface;
     }
 };
 
 fn drawScrollbar(surface: *vxfw.Surface, height: u16, scroll: u16, total: u16) void {
+    const p = tui_style.activePalette();
     const col = surface.size.width -| 1;
     const max_s = total -| height;
     if (max_s == 0) return;
@@ -247,7 +247,7 @@ fn drawScrollbar(surface: *vxfw.Surface, height: u16, scroll: u16, total: u16) v
     while (r < height) : (r += 1) {
         const is_thumb = r >= top and r < top + bar_height;
         const grapheme: []const u8 = if (r == 0) "▲" else if (r == height - 1) "▼" else if (is_thumb) "█" else "│";
-        const style: vaxis.Style = if (is_thumb) StylePalette.border_label else StylePalette.thinking_body;
+        const style: vaxis.Style = if (is_thumb) p.border_label else p.thinking_body;
         surface.writeCell(col, r, .{
             .char = .{ .grapheme = grapheme, .width = 1 },
             .style = style,

@@ -14,7 +14,6 @@ const permission_mod = @import("../permission.zig");
 const lanes_util = @import("../lanes.zig");
 
 const App = tui.App;
-const StylePalette = tui_style.Palette;
 
 /// Outer border widget. Shows the current approval snapshot (the
 /// command the agent is about to run + Approve/Reject actions).
@@ -27,6 +26,7 @@ pub const PermissionWidget = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *PermissionWidget = @ptrCast(@alignCast(ptr));
+        const p = tui_style.activePalette();
         const app = self.app;
         // The gate may belong to a background lane — a worker blocked on a
         // destructive-bash approval is invisible without this scan.
@@ -66,7 +66,7 @@ pub const PermissionWidget = struct {
         var border: vxfw.Border = .{
             .child = inner.widget(),
             .labels = &.{.{ .text = label, .alignment = .top_left }},
-            .style = StylePalette.border_label,
+            .style = p.border_label,
         };
         return border.widget().draw(ctx);
     }
@@ -90,12 +90,13 @@ const PermissionInner = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *PermissionInner = @ptrCast(@alignCast(ptr));
+        const p = tui_style.activePalette();
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = width, .height = height });
         if (width == 0 or height == 0) return surface;
 
-        panel.lineStyledAt(&surface, 0, "Review before running:", ctx, 1, StylePalette.panel_header) catch {};
+        panel.lineStyledAt(&surface, 0, "Review before running:", ctx, 1, p.panel_header) catch {};
         const body_rows = height -| 3;
         drawPermissionCommand(&surface, ctx, self.snapshot.command, self.scroll, body_rows);
         // TUX03: tell the user when a long command is scrollable and where
@@ -108,6 +109,7 @@ const PermissionInner = struct {
 
 fn drawPermissionCommand(surface: *vxfw.Surface, ctx: vxfw.DrawContext, command: []const u8, scroll: u32, rows: u16) void {
     if (rows == 0) return;
+    const p = tui_style.activePalette();
     var line_index: u32 = 0;
     var drawn: u16 = 0;
     var iterator = std.mem.splitScalar(u8, command, '\n');
@@ -117,7 +119,7 @@ fn drawPermissionCommand(surface: *vxfw.Surface, ctx: vxfw.DrawContext, command:
             continue;
         }
         if (drawn >= rows) return;
-        panel.lineStyledAt(surface, 1 + drawn, line, ctx, 1, StylePalette.thinking_body) catch {};
+        panel.lineStyledAt(surface, 1 + drawn, line, ctx, 1, p.thinking_body) catch {};
         drawn += 1;
         line_index += 1;
     }
@@ -127,8 +129,9 @@ fn drawScrollHint(surface: *vxfw.Surface, ctx: vxfw.DrawContext, command: []cons
     if (body_rows == 0) return;
     const hint_row = height -| 2;
     if (hint_row == 0 or hint_row >= surface.size.height) return;
+    const p = tui_style.activePalette();
     const hint = scrollHintText(ctx.arena, command, scroll, body_rows) orelse return;
-    panel.lineStyledAt(surface, hint_row, hint, ctx, 1, StylePalette.thinking_body) catch {};
+    panel.lineStyledAt(surface, hint_row, hint, ctx, 1, p.thinking_body) catch {};
 }
 
 /// Pure: build the scroll-affordance text, or null when the command fits the
@@ -151,11 +154,12 @@ fn scrollHintText(arena: std.mem.Allocator, command: []const u8, scroll: u32, bo
 
 fn drawPermissionActions(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, selected: tui.agent_worker.ApprovalDecision) void {
     if (row >= surface.size.height) return;
+    const p = tui_style.activePalette();
     const approve_selected = selected == .approve;
     const reject_selected = selected == .reject;
 
-    const approve_style: vaxis.Style = if (approve_selected) .{ .fg = .{ .rgb = .{ 34, 197, 94 } }, .bold = true } else StylePalette.thinking_body;
-    const reject_style: vaxis.Style = if (reject_selected) .{ .fg = .{ .rgb = .{ 239, 68, 68 } }, .bold = true } else StylePalette.thinking_body;
+    const approve_style: vaxis.Style = if (approve_selected) p.permission_approve else p.thinking_body;
+    const reject_style: vaxis.Style = if (reject_selected) p.error_style else p.thinking_body;
 
     panel.lineStyledAt(surface, row, actionLabel(ctx, "Approve [Y]", approve_selected), ctx, 1, approve_style) catch {};
     panel.lineStyledAt(surface, row, actionLabel(ctx, "Reject [N]", reject_selected), ctx, 18, reject_style) catch {};

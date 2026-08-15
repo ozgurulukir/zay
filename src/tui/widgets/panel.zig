@@ -5,8 +5,6 @@ const vxfw = vaxis.vxfw;
 const message = @import("message.zig");
 const tui_style = @import("../style.zig");
 
-const StylePalette = tui_style.Palette;
-
 const secondary_column: u16 = 52;
 
 pub const Shell = struct {
@@ -18,7 +16,8 @@ pub const Shell = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Shell = @ptrCast(@alignCast(ptr));
-        var border: vxfw.Border = .{ .child = self.child, .style = StylePalette.tool };
+        const p = tui_style.activePalette();
+        var border: vxfw.Border = .{ .child = self.child, .style = p.tool };
         return border.widget().draw(ctx);
     }
 };
@@ -86,8 +85,9 @@ pub fn fillRow(surface: *vxfw.Surface, row: u16, style: vaxis.Style) void {
 }
 
 pub fn lineAt(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool, start_col: u16) !void {
-    if (selected) fillRow(surface, row, StylePalette.selected);
-    const active_style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;
+    const p = tui_style.activePalette();
+    if (selected) fillRow(surface, row, p.selected);
+    const active_style = if (selected) p.selected_item else p.thinking_body;
     try lineStyledAt(surface, row, text, ctx, start_col, active_style);
 }
 
@@ -124,7 +124,8 @@ pub fn lineStyledAt(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxf
 }
 
 pub fn right(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool) !void {
-    const active_style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;
+    const p = tui_style.activePalette();
+    const active_style = if (selected) p.selected_item else p.thinking_body;
     try rightStyled(surface, row, text, ctx, active_style);
 }
 

@@ -9,11 +9,8 @@ const auth = @import("../../auth/store.zig");
 const config_mod = @import("../../config/config.zig");
 const modelsdev = @import("../../models/registry.zig");
 
-const StylePalette = tui_style.Palette;
 const assert = std.debug.assert;
-
 pub const Status = enum { unknown, connected, failed };
-
 pub const Stage = enum { list, form };
 pub const Column = enum { provider, sign_out };
 
@@ -188,6 +185,7 @@ pub const Content = struct {
     }
 
     fn drawList(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
+        const p = tui_style.activePalette();
         const total_count = 1 + @as(u32, @intCast(self.state.entries.len));
         const viewport = panel.ViewportWindow.compute(self.state.selection, total_count, surface.size.height);
         if (viewport.visible_height == 0) return;
@@ -214,7 +212,7 @@ pub const Content = struct {
                 .unknown;
             try drawBadge(surface, ctx, row, base, status, focused);
 
-            const desc_style = if (focused) StylePalette.selected_item else StylePalette.thinking_body;
+            const desc_style = if (focused) p.selected_item else p.thinking_body;
             _ = panel.writeBorderTextEndingAt(surface, ctx, row, surface.size.width -| 2, entry.description(), desc_style);
         }
     }
@@ -227,14 +225,15 @@ pub const Content = struct {
         status: Status,
         focused: bool,
     ) !void {
+        const p = tui_style.activePalette();
         const text: []const u8 = switch (status) {
             .connected => " [CONNECTED]",
             .failed => " [DISCONNECTED]",
             .unknown => return,
         };
         const style: vaxis.Style = switch (status) {
-            .connected => StylePalette.success,
-            .failed => StylePalette.tool_failed,
+            .connected => p.success,
+            .failed => p.tool_failed,
             .unknown => unreachable,
         };
         const badge_col: u16 = (message.ConversationLayout.left -| 1) +
@@ -243,34 +242,37 @@ pub const Content = struct {
     }
 
     fn drawCodex(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16) !void {
+        const p = tui_style.activePalette();
         const row_selected = self.state.selection == 0;
         const provider_focused = row_selected and self.state.column == .provider;
-        if (row_selected) panel.fillRow(surface, row, StylePalette.selected);
+        if (row_selected) panel.fillRow(surface, row, p.selected);
 
         const prefix = "  ";
         const base = try std.fmt.allocPrint(ctx.arena, "{s}OpenAI Codex", .{prefix});
-        const base_style = if (provider_focused) StylePalette.selected_item else tui_style.onSelectionBg(StylePalette.thinking_body, row_selected);
+        const base_style = if (provider_focused) p.selected_item else tui_style.onSelectionBg(p.thinking_body, row_selected);
         try panel.lineStyledAt(surface, row, base, ctx, message.ConversationLayout.left -| 1, base_style);
         if (self.codex_signed_in) {
             const badge_col: u16 = (message.ConversationLayout.left -| 1) +
                 @as(u16, @intCast(@min(ctx.stringWidth(base), @as(usize, std.math.maxInt(u16)))));
-            try panel.lineStyledAt(surface, row, " [CONNECTED]", ctx, badge_col, tui_style.onSelectionBg(StylePalette.success, row_selected));
+            try panel.lineStyledAt(surface, row, " [CONNECTED]", ctx, badge_col, tui_style.onSelectionBg(p.success, row_selected));
             try self.drawSignOut(surface, ctx, row, row_selected);
         } else {
-            const desc_style = if (provider_focused) StylePalette.selected_item else StylePalette.thinking_body;
+            const desc_style = if (provider_focused) p.selected_item else p.thinking_body;
             _ = panel.writeBorderTextEndingAt(surface, ctx, row, surface.size.width -| 2, "OpenAI ChatGPT & Codex OAuth authentication", desc_style);
         }
     }
 
     fn drawSignOut(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, row_selected: bool) !void {
+        const p = tui_style.activePalette();
         const focused = row_selected and self.state.column == .sign_out;
         const prefix = "  ";
         const text = try std.fmt.allocPrint(ctx.arena, "{s}Sign Out", .{prefix});
-        const style = if (focused) StylePalette.selected_item else tui_style.onSelectionBg(StylePalette.thinking_body, row_selected);
+        const style = if (focused) p.selected_item else tui_style.onSelectionBg(p.thinking_body, row_selected);
         try panel.lineStyledAt(surface, row, text, ctx, panel.secondaryColumn(surface.size.width), style);
     }
 
     fn drawForm(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
+        const p = tui_style.activePalette();
         const handle = self.state.form_handle orelse return;
         const display_name = handle.displayName();
         const desc = handle.description();
@@ -278,18 +280,18 @@ pub const Content = struct {
         const requires_key = handle.requiresApiKey();
 
         const start_col = message.ConversationLayout.left -| 1;
-        try panel.lineStyledAt(surface, 1, display_name, ctx, start_col, StylePalette.model_status);
+        try panel.lineStyledAt(surface, 1, display_name, ctx, start_col, p.model_status);
 
-        try panel.lineStyledAt(surface, 2, desc, ctx, start_col, StylePalette.thinking_body);
+        try panel.lineStyledAt(surface, 2, desc, ctx, start_col, p.thinking_body);
 
         if (base_url) |url| {
             const url_text = try std.fmt.allocPrint(ctx.arena, "Endpoint: {s}", .{url});
-            try panel.lineStyledAt(surface, 3, url_text, ctx, start_col, StylePalette.thinking_body);
+            try panel.lineStyledAt(surface, 3, url_text, ctx, start_col, p.thinking_body);
         }
 
         const key_row: u16 = if (base_url != null) 5 else 4;
         const label = if (requires_key) "API Key: " else "API Key (optional): ";
-        try panel.lineStyledAt(surface, key_row, label, ctx, start_col, StylePalette.panel_header);
+        try panel.lineStyledAt(surface, key_row, label, ctx, start_col, p.panel_header);
         const key_col = start_col + @as(u16, @intCast(@min(ctx.stringWidth(label), @as(usize, std.math.maxInt(u16)))));
         // Show the live input in plaintext once the user is editing it, so a
         // pasted key is verifiable. A pre-filled existing key (form opened to
@@ -298,17 +300,17 @@ pub const Content = struct {
             try std.fmt.allocPrint(ctx.arena, "{s}\u{2588}", .{self.key_input})
         else
             try std.fmt.allocPrint(ctx.arena, "{s}\u{2588}", .{maskSecret(ctx.arena, self.key_input)});
-        try panel.lineStyledAt(surface, key_row, shown, ctx, key_col, StylePalette.panel_header);
+        try panel.lineStyledAt(surface, key_row, shown, ctx, key_col, p.panel_header);
 
         const hint_row = key_row + 2;
         if (self.state.form_error) |err_msg| {
-            try panel.lineStyledAt(surface, hint_row, err_msg, ctx, start_col, StylePalette.tool_failed);
+            try panel.lineStyledAt(surface, hint_row, err_msg, ctx, start_col, p.tool_failed);
         } else {
             const hint = if (requires_key and self.key_input.len == 0)
                 "Type or paste your API key, then press Enter to connect (Esc to cancel)"
             else
                 "Press Enter to submit and connect (Esc to cancel)";
-            try panel.lineStyledAt(surface, hint_row, hint, ctx, start_col, StylePalette.thinking_body);
+            try panel.lineStyledAt(surface, hint_row, hint, ctx, start_col, p.thinking_body);
         }
     }
 };
@@ -380,7 +382,7 @@ test "provider picker keeps codex text visible when sign out is focused" {
 
     try std.testing.expectEqualStrings("O", surface.readCell(message.ConversationLayout.left + 1, 0).char.grapheme);
     try std.testing.expectEqualStrings("S", surface.readCell(panel.secondaryColumn(surface.size.width) + 2, 0).char.grapheme);
-    try std.testing.expectEqual(StylePalette.selected.bg, surface.readCell(panel.secondaryColumn(surface.size.width) + 2, 0).style.bg);
+    try std.testing.expectEqual(tui_style.activePalette().selected.bg, surface.readCell(panel.secondaryColumn(surface.size.width) + 2, 0).style.bg);
 }
 
 test "provider picker keeps sign out on the selected row background" {
@@ -400,7 +402,7 @@ test "provider picker keeps sign out on the selected row background" {
     const surface = try content.widget().draw(ctx);
 
     try std.testing.expectEqualStrings("S", surface.readCell(panel.secondaryColumn(surface.size.width) + 2, 0).char.grapheme);
-    try std.testing.expectEqual(StylePalette.selected.bg, surface.readCell(panel.secondaryColumn(surface.size.width) + 2, 0).style.bg);
+    try std.testing.expectEqual(tui_style.activePalette().selected.bg, surface.readCell(panel.secondaryColumn(surface.size.width) + 2, 0).style.bg);
 }
 
 test "provider picker selecting a catalogue row opens its form" {

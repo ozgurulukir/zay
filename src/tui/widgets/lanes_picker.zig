@@ -86,9 +86,10 @@ const EmptyRow = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *EmptyRow = @ptrCast(@alignCast(ptr));
+        const p = tui_style.activePalette();
         const width = ctx.max.width orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
-        try panel.lineStyledAt(&surface, 0, self.text, ctx, message.ConversationLayout.left -| 1, tui_style.Palette.thinking_body);
+        try panel.lineStyledAt(&surface, 0, self.text, ctx, message.ConversationLayout.left -| 1, p.thinking_body);
         return surface;
     }
 };

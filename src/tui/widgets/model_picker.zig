@@ -8,11 +8,10 @@ const message = @import("message.zig");
 const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
 
-const StylePalette = tui_style.Palette;
-
 fn columnStyle(focused: bool, selected: bool) vaxis.Style {
-    if (focused) return StylePalette.selected_item;
-    return tui_style.onSelectionBg(StylePalette.thinking_body, selected);
+    const p = tui_style.activePalette();
+    if (focused) return p.selected_item;
+    return tui_style.onSelectionBg(p.thinking_body, selected);
 }
 
 pub const Column = enum {
@@ -88,11 +87,12 @@ pub const Content = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Content = @ptrCast(@alignCast(ptr));
-        if (self.loading) return self.drawStatus(ctx, "Loading models…", StylePalette.panel_header);
-        if (self.error_message) |msg| return self.drawStatus(ctx, msg, StylePalette.tool_failed);
+        const p = tui_style.activePalette();
+        if (self.loading) return self.drawStatus(ctx, "Loading models…", p.panel_header);
+        if (self.error_message) |msg| return self.drawStatus(ctx, msg, p.tool_failed);
         if (self.models.len == 0) return self.drawEmpty(ctx);
         const built = try self.modelWidgets(ctx);
-        if (built.widgets.len <= 1) return self.drawStatus(ctx, "No matching models", StylePalette.thinking_body);
+        if (built.widgets.len <= 1) return self.drawStatus(ctx, "No matching models", p.thinking_body);
         self.list.children = .{ .slice = built.widgets };
         self.list.item_count = @intCast(built.widgets.len);
         self.list.cursor = built.cursor;
@@ -114,7 +114,7 @@ pub const Content = struct {
         };
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, children);
         if (self.footer.len > 0 and height > 0) {
-            try panel.lineStyledAt(&surface, height -| 1, self.footer, ctx, 0, StylePalette.thinking_body);
+            try panel.lineStyledAt(&surface, height -| 1, self.footer, ctx, 0, p.thinking_body);
         }
         return surface;
     }
@@ -198,10 +198,11 @@ const Header = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Header = @ptrCast(@alignCast(ptr));
+        const p = tui_style.activePalette();
         const width = ctx.max.width orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
-        try panel.lineStyledAt(&surface, 0, "NAME", ctx, message.ConversationLayout.left + 1, StylePalette.panel_header);
-        try panel.lineStyledAt(&surface, 0, "REASONING EFFORT", ctx, panel.secondaryColumn(surface.size.width) + 2, StylePalette.panel_header);
+        try panel.lineStyledAt(&surface, 0, "NAME", ctx, message.ConversationLayout.left + 1, p.panel_header);
+        try panel.lineStyledAt(&surface, 0, "REASONING EFFORT", ctx, panel.secondaryColumn(surface.size.width) + 2, p.panel_header);
         return surface;
     }
 };
@@ -307,9 +308,10 @@ pub const Row = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Row = @ptrCast(@alignCast(ptr));
+        const p = tui_style.activePalette();
         const width = ctx.max.width orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
-        if (self.selected) panel.fillRow(&surface, 0, StylePalette.selected);
+        if (self.selected) panel.fillRow(&surface, 0, p.selected);
 
         const model_focused = self.selected and self.column == .model;
         const prefix = "  ";
@@ -319,7 +321,7 @@ pub const Row = struct {
         if (self.activeModel()) {
             const badge_col: u16 = start_col +
                 @as(u16, @intCast(@min(ctx.stringWidth(base), @as(usize, std.math.maxInt(u16)))));
-            try panel.lineStyledAt(&surface, 0, " ✓", ctx, badge_col, tui_style.onSelectionBg(StylePalette.success, self.selected));
+            try panel.lineStyledAt(&surface, 0, " ✓", ctx, badge_col, tui_style.onSelectionBg(p.success, self.selected));
         }
         if (self.selected) try self.drawReasoning(&surface, ctx);
         return surface;

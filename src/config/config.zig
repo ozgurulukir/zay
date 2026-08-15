@@ -163,6 +163,9 @@ pub const Config = struct {
     plugins: []PluginConfig = &.{},
     use_responses_endpoint: ?bool = null,
     system_prompt: ?[]u8 = null,
+    /// Name of the builtin color theme; unknown names fall back to the default
+    /// theme at resolve time in `tui/style.zig`.
+    theme: ?[]u8 = null,
     /// Whether to send OpenAI strict structured-outputs mode in tool
     /// definitions. Default `false` — strict mode is OpenAI-only and
     /// silently breaks function-calling on gateways (OpenRouter/Ollama/
@@ -216,6 +219,7 @@ pub const Config = struct {
         for (self.plugins) |*plugin| plugin.deinit(gpa);
         if (self.plugins.len > 0) gpa.free(self.plugins);
         if (self.system_prompt) |s| gpa.free(s);
+        if (self.theme) |s| gpa.free(s);
         if (self.dynamic_provider_name) |s| gpa.free(s);
         if (self.dynamic_provider_id) |s| gpa.free(s);
         if (self.toast.position) |s| gpa.free(s);
@@ -243,6 +247,7 @@ pub const Config = struct {
         out.plugins = try gpa.alloc(PluginConfig, self.plugins.len);
         for (self.plugins, 0..) |plugin, index| out.plugins[index] = try plugin.clone(gpa);
         if (self.system_prompt) |s| out.system_prompt = try gpa.dupe(u8, s);
+        if (self.theme) |s| out.theme = try gpa.dupe(u8, s);
         if (self.dynamic_provider_name) |s| out.dynamic_provider_name = try gpa.dupe(u8, s);
         if (self.dynamic_provider_id) |s| out.dynamic_provider_id = try gpa.dupe(u8, s);
         if (self.toast.position) |s| out.toast.position = try gpa.dupe(u8, s);
