@@ -389,7 +389,7 @@ pub fn stripSummaryFraming(text: []const u8) []const u8 {
     const open = std.mem.indexOf(u8, text, "<summary>") orelse return text;
     const close = std.mem.lastIndexOf(u8, text, "</summary>") orelse return text;
     if (close <= open) return text;
-    return std.mem.trim(u8, text[open + "<summary>".len .. close], " \n");
+    return std.mem.trim(u8, text[open + "<summary>".len .. close], " \n\r");
 }
 
 fn saturatingLen(slice: []const u8) u32 {

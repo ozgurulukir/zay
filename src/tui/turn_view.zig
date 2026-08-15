@@ -520,6 +520,11 @@ pub fn chooseLoadingWordIndex(io: std.Io) u8 {
 }
 
 test "bash read of skill renders skill row" {
+    // The skill-preview branch is deliberately gated to bash hosts
+    // (`applyToolPreview` fires it only when `!os.is_windows`); on Windows the
+    // host shell is pwsh and a `bash` skill read falls through to the generic
+    // tool display, so this rendering assertion is POSIX-only.
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var view: TurnView = .{};
     defer view.deinit(gpa);

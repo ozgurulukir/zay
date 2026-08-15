@@ -1912,13 +1912,13 @@ test "agent app events update transcript on the ui side" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .thinking_delta = "checking" }));
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"ls\",\"description\":\"List files\"}",
     } }));
     try std.testing.expect(!try app.applyAgentEvent(.{ .thinking_delta = " files" }));
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .display_label = "List files",
         .display_expanded_label = "ls",
         .display_body = "$ ls\nexit 0\nstdout:\n\nstderr:\n",
@@ -2047,12 +2047,12 @@ test "loading does not appear during final answer after tool batch" {
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"pwd\",\"description\":\"Print working directory\"}",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .display_label = "Print working directory",
         .display_expanded_label = "pwd",
         .display_body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
@@ -2109,7 +2109,7 @@ test "bash tool waits for complete arguments while streaming" {
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"printf hello",
     } }));
     try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
@@ -2117,7 +2117,7 @@ test "bash tool waits for complete arguments while streaming" {
 
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .display_label = "Print hello",
         .display_expanded_label = "printf hello",
         .display_body = "hello",
@@ -2143,7 +2143,7 @@ test "tool row persists through finish and turn completion" {
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"ls\",\"description\":\"List files\"}",
     } }));
     try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
@@ -2160,7 +2160,7 @@ test "tool row persists through finish and turn completion" {
 
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .display_label = "List files",
         .display_expanded_label = "ls",
         .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
@@ -2193,7 +2193,7 @@ test "partial tool arguments do not create visible tool rows" {
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"",
     } }));
     // Partial arguments render nothing, so no tool row appears and the spinner
@@ -2204,7 +2204,7 @@ test "partial tool arguments do not create visible tool rows" {
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"ls\",\"description\":\"List files\"}",
     } }));
     try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
@@ -2228,12 +2228,12 @@ test "tool finish creates row if no complete streamed arguments appeared" {
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .display_label = "List files",
         .display_expanded_label = "ls",
         .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
@@ -2260,12 +2260,12 @@ test "new tool response index creates a new transcript row" {
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"ls\",\"description\":\"List files\"}",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .display_label = "List files",
         .display_expanded_label = "ls",
         .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
@@ -2274,7 +2274,7 @@ test "new tool response index creates a new transcript row" {
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"pwd\",\"description\":\"Print working directory\"}",
     } }));
 
@@ -2301,12 +2301,12 @@ test "bash tool after batch creates a new tool row" {
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"ls\",\"description\":\"List files\"}",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .display_label = "List files",
         .display_expanded_label = "ls",
         .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
@@ -2318,7 +2318,7 @@ test "bash tool after batch creates a new tool row" {
 
     _ = try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"printf done\",\"description\":\"Print done\"}",
     } });
 
@@ -2344,21 +2344,21 @@ test "late tool finish does not move selection upward" {
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"ls\",\"description\":\"List files\"}",
     } }));
     try std.testing.expectEqual(@as(u32, 1), app.thread.transcript.selected.?);
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 1,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"pwd\",\"description\":\"Print working directory\"}",
     } }));
     try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);
 
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .display_label = "List files",
         .display_expanded_label = "ls",
         .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
@@ -2386,12 +2386,12 @@ test "loading does not resume after post-tool thinking delta" {
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"pwd\",\"description\":\"Print working directory\"}",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .display_label = "Print working directory",
         .display_expanded_label = "pwd",
         .display_body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
@@ -2425,12 +2425,12 @@ test "agent response after tool batch appears below tool rows" {
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "I will check." }));
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"pwd\",\"description\":\"Print working directory\"}",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .display_label = "Print working directory",
         .display_expanded_label = "pwd",
         .display_body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
@@ -2469,7 +2469,7 @@ test "content delta after tool preview does not move selection away from tool ro
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"pwd\",\"description\":\"Print working directory\"}",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
@@ -2481,7 +2481,7 @@ test "content delta after tool preview does not move selection away from tool ro
 
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .name = "bash",
+        .name = tools_mod.shellToolName,
         .display_label = "Print working directory",
         .display_expanded_label = "pwd",
         .display_body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",

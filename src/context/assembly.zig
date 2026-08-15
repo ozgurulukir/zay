@@ -924,6 +924,10 @@ test "readProjectRuleFile returns the partial content when the file shrinks befo
 }
 
 test "readProjectRuleFile skips an unreadable rule file instead of failing assembly" {
+    // The trick here — a directory named AGENTS.md — makes openFile fail with
+    // NotDir only on POSIX. On Windows opening a directory as a file succeeds,
+    // so the unreadable-weapon mechanism differs; gate to POSIX.
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const root = try std.process.currentPathAlloc(io, gpa);

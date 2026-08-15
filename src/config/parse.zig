@@ -1953,7 +1953,11 @@ test "globalConfigPath resolves XDG .config/nova/config.json" {
     const path = try globalConfigPath(gpa, io, "/home/testuser");
     defer gpa.free(path);
 
-    try std.testing.expect(std.mem.indexOf(u8, path, ".config/nova/config.json") != null);
+    // Build the expected suffix with path.join so the separator matches the
+    // host platform (`\` on Windows instead of the hardcoded `/`).
+    const expected = try std.fs.path.join(gpa, &.{ ".config", "nova", "config.json" });
+    defer gpa.free(expected);
+    try std.testing.expect(std.mem.endsWith(u8, path, expected));
 }
 
 test "Config.validate validates schema version and base_url scheme" {

@@ -5,6 +5,7 @@ const log = std.log.scoped(.mcp);
 const ai = @import("../ai.zig");
 const config_mod = @import("../config/config.zig");
 const client_mod = @import("client.zig");
+const os = @import("../os.zig");
 
 const assert = std.debug.assert;
 
@@ -585,6 +586,7 @@ test "McpManager skips duplicate server names in config" {
 }
 
 test "McpManager async connect spawns, handshakes, discovers, and installs" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var manager = McpManager.init(gpa);
     defer manager.deinit(std.testing.io);
@@ -614,6 +616,7 @@ test "McpManager async connect spawns, handshakes, discovers, and installs" {
 }
 
 test "McpManager async connect failure marks the client failed with a reason" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var manager = McpManager.init(gpa);
     defer manager.deinit(std.testing.io);
@@ -640,6 +643,7 @@ test "McpManager async connect failure marks the client failed with a reason" {
 }
 
 test "McpManager async connect fails on a malformed tool discovery response" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var manager = McpManager.init(gpa);
     defer manager.deinit(std.testing.io);

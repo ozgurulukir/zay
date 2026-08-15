@@ -379,6 +379,12 @@ pub const Client = struct {
     /// produced nothing and no tool has run, so the request is idempotent,
     /// exactly like a head-phase 429/5xx. Protocol-level rejects are returned
     /// unchanged; a retry will not fix them.
+    ///
+    /// `error.Unexpected` is deliberately included: in the head phase (before
+    /// any response bytes) it is almost always a connect/read drop, and Windows
+    /// surfaces connection-refused as NTSTATUS 0xc0000236 (`error.Unexpected`)
+    /// rather than `error.ConnectionRefused`. The breadth is accepted because no
+    /// other `error.Unexpected` source is expected before any response bytes.
     fn headPhaseFailure(self: *Client, err: anyerror) anyerror {
         _ = self;
         return switch (err) {
@@ -389,6 +395,7 @@ pub const Client = struct {
             error.ConnectionResetByPeer,
             error.ConnectionTimedOut,
             error.BrokenPipe,
+            error.Unexpected,
             => error.ConnectionFailed,
             else => err,
         };
@@ -2373,6 +2380,9 @@ test "headPhaseFailure maps transient connection drops to a retryable error" {
     try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.ConnectionResetByPeer));
     try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.ConnectionTimedOut));
     try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.BrokenPipe));
+    // Windows surfaces connection-refused as NTSTATUS 0xc0000236 (error.Unexpected),
+    // which is treated as a transient connect/read drop in the head phase.
+    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.Unexpected));
     // Permanent failures are returned unchanged.
     try std.testing.expectEqual(error.HttpClientError, client.headPhaseFailure(error.HttpClientError));
     try std.testing.expectEqual(error.HttpHeadersInvalid, client.headPhaseFailure(error.HttpHeadersInvalid));

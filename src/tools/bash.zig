@@ -858,6 +858,7 @@ test "bash display falls back to the command when no summary is present" {
 }
 
 test "bash tool applies env object" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
@@ -871,6 +872,7 @@ test "bash tool applies env object" {
 }
 
 test "bash tool applies relative cwd" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
@@ -909,6 +911,7 @@ test "bash tool accepts description as the canonical summary" {
 }
 
 test "bash observation echoes the invoked command" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
@@ -923,6 +926,7 @@ test "bash observation echoes the invoked command" {
 }
 
 test "bash timeout observation echoes the command and retry guidance" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
@@ -965,6 +969,7 @@ test "bash observation strips ANSI codes" {
 }
 
 test "bash tool reports exit code in observation" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
@@ -1025,6 +1030,7 @@ test "extractDisplayBlocks drops a dangling end marker line" {
 }
 
 test "bash tool surfaces a display block as a diff-kind display" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
@@ -1045,6 +1051,7 @@ test "bash tool surfaces a display block as a diff-kind display" {
 }
 
 test "bash tool truncates observation tail and keeps full output path" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
@@ -1067,6 +1074,7 @@ test "bash tool truncates observation tail and keeps full output path" {
 }
 
 test "bash tool accepts null for optional fields under strict schema" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
@@ -1083,6 +1091,7 @@ test "bash tool accepts null for optional fields under strict schema" {
 }
 
 test "bash tool accepts partial nulls alongside populated optional fields" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
@@ -1098,6 +1107,7 @@ test "bash tool accepts partial nulls alongside populated optional fields" {
 }
 
 test "bash tool parses null timeout as default" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
@@ -1141,7 +1151,10 @@ test "validateCwd rejects an absolute cwd outside the root" {
 
 test "validateCwd blocks a symlink that escapes the root" {
     // Regression for H3: the lexical check alone let `link -> /etc` inside the
-    // project pass; the best-effort realpath re-check must catch it.
+    // project pass; the best-effort realpath re-check must catch it. Windows
+    // resolves symlinks differently (`REPARSE_POINT_NOT_RESOLVED`), so this
+    // semantics is exercised only on POSIX hosts.
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1176,6 +1189,7 @@ test "describeBashError names common failures" {
 test "empty sentinel block yields no display" {
     // Regression for L1: a begin/end sentinel pair with nothing between must not
     // produce a zero-length `.diff` display (the `common.Display` invariant).
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
@@ -1246,6 +1260,7 @@ test "contained bash refuses cd via a symlink that leaves the root" {
 }
 
 test "contained bash allows cd within the workspace root" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

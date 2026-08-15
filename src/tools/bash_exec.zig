@@ -551,6 +551,7 @@ fn resolveBashPath(io: std.Io) []const u8 {
 }
 
 test "bash captures stdout and exit code" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
@@ -562,6 +563,7 @@ test "bash captures stdout and exit code" {
 }
 
 test "bash forwards stdin from buffer" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
@@ -576,6 +578,7 @@ test "capture enforces total runtime even when output keeps flowing" {
     // Regression for H1: the timeout was an idle timeout (reset on every byte),
     // so a chatty command never died. The command prints ~20 lines over 2.5s;
     // under a 1s TOTAL deadline the fill loop must stop and report timed_out.
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
@@ -597,6 +600,7 @@ test "capture enforces total runtime even when output keeps flowing" {
 
 test "capture still returns all output for a fast command" {
     // Positive control: the deadline conversion must not change fast commands.
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);

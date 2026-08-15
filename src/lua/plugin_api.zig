@@ -2592,6 +2592,8 @@ test "readFile exposes truncation on a file over 1 MB" {
         sandbox.freeHookData(L.handle);
         L.deinit();
     }
+    const lua_target = try forwardSlashDup(gpa, target);
+    defer gpa.free(lua_target);
     const chunk = try std.fmt.allocPrintSentinel(gpa,
         \\local r = nova.read_file("{s}", {{}})
         \\assert(type(r) == "table", "read_file returns a table")
@@ -2600,7 +2602,7 @@ test "readFile exposes truncation on a file over 1 MB" {
         \\assert(r.size <= {d}, "size is the bytes returned (capped)")
         \\assert(r.size == #r.content, "size matches content length")
         \\return "OK"
-    , .{ target, big.len, max_read_size }, 0);
+    , .{ lua_target, big.len, max_read_size }, 0);
     defer gpa.free(chunk);
     try expectLuaOk(&L, chunk);
 }
@@ -2625,11 +2627,13 @@ test "readFile clamps a negative max_size without panicking" {
         sandbox.freeHookData(L.handle);
         L.deinit();
     }
+    const lua_target = try forwardSlashDup(gpa, target);
+    defer gpa.free(lua_target);
     const chunk = try std.fmt.allocPrintSentinel(gpa,
         \\local r = nova.read_file("{s}", {{ max_size = -1 }})
         \\assert(type(r) == "table", "clamped read returns a table")
         \\return "OK"
-    , .{target}, 0);
+    , .{lua_target}, 0);
     defer gpa.free(chunk);
     try expectLuaOk(&L, chunk);
 }
@@ -2641,6 +2645,19 @@ test "readFile clamps a negative max_size without panicking" {
 // fragile manual stack inspection from Zig and exercises the exact path a
 // plugin takes. A failing assertion makes doString return false, surfacing
 // the Lua error message via getErrorMessage.
+
+/// Duplicate a filesystem path replacing every backslash with a forward slash,
+/// so it can be interpolated safely into a Lua string literal. A Windows path
+/// like `C:\work\nova` carries `\w`/`\n` sequences that Lua mangles (or rejects
+/// for invalid escapes like `\G`) when embedded verbatim. Windows accepts
+/// forward slashes, so the replacement is lossless for path resolution.
+fn forwardSlashDup(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    const out = try gpa.alloc(u8, path.len);
+    for (path, 0..) |byte, index| {
+        out[index] = if (byte == '\\') '/' else byte;
+    }
+    return out;
+}
 
 /// Helper: run a Lua chunk that must end by returning the literal "OK".
 /// On failure, prints the Lua error so the test failure is debuggable.
@@ -2955,6 +2972,9 @@ test "shellQuote: empty argument becomes two quotes" {
 }
 
 test "gitCommit: injection payload stays a literal commit message (stdin path)" {
+    // Gate on OS first (before gitAvailable): on Windows these tests spawn a
+    // real `bash`/git via bash_exec with /tmp paths, which is unsupported.
+    if (os.is_windows) return error.SkipZigTest;
     if (!gitAvailable()) return;
 
     const gpa = std.testing.allocator;
@@ -2984,6 +3004,8 @@ test "gitCommit: injection payload stays a literal commit message (stdin path)" 
 }
 
 test "gitDiff: injection payload stays a literal pathspec (shellQuote path)" {
+    // See gitCommit: OS-gate first so it's counted as skipped on Windows.
+    if (os.is_windows) return error.SkipZigTest;
     if (!gitAvailable()) return;
 
     const gpa = std.testing.allocator;
@@ -3020,6 +3042,7 @@ test "RunOptions.stdin bypasses shell interpretation" {
     // The stdin path passes the payload verbatim to the child, so shell
     // metacharacters in it are data, not syntax. Confirm `cat` echoes the
     // payload untouched (no command-substitution, no quoting collapse).
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
@@ -3066,6 +3089,7 @@ test "findFiles clamps a negative max_results without panicking" {
 }
 
 test "runBash clamps a negative timeout without panicking" {
+    if (os.is_windows) return error.SkipZigTest;
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
@@ -3146,6 +3170,8 @@ test "sanitizePath allows a nonexistent new-file path (realpath-failure fallback
 // the bridge) in a temp dir that is NOT a repo, and in a fresh repo.
 
 test "gitStatus returns nil + error outside a repo" {
+    // See gitCommit: OS-gate first so it's counted as skipped on Windows.
+    if (os.is_windows) return error.SkipZigTest;
     if (!gitAvailable()) return;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -3172,6 +3198,8 @@ test "gitErrorString prefers stderr over generic exit code" {
 }
 
 test "git bridges return strings inside a repo (S4 success path)" {
+    // See gitCommit: OS-gate first so it's counted as skipped on Windows.
+    if (os.is_windows) return error.SkipZigTest;
     if (!gitAvailable()) return;
     // The test process runs at the repo root, which IS a git repo, so all four
     // bridges must return strings here (the nil+error path is covered by the

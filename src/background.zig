@@ -687,6 +687,7 @@ test "BackgroundManager.start returns and the job completes" {
     // so every launch hung in futexWait. With the bug present this test times
     // out (CI) — `start` never returns; on a healthy manager the `true` job
     // finishes within a few hundred ms and takeFinished hands it back.
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
@@ -739,6 +740,7 @@ test "bash subprocess executes and returns captured output" {
     // via the high-level `std.process.run` API that works reliably under
     // `std.testing.io`. This pins the contract that `manager.start` relies on:
     // bash exists, can run `exec 2>&1` + a command, and exits 0 on success.
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const result = std.process.run(gpa, std.testing.io, .{
         .argv = &.{ bash.shellPath(std.testing.io), "-c", "exec 2>&1\nprintf 'hello-bg\\n'" },

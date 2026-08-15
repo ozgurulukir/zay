@@ -2758,7 +2758,9 @@ test "lane merge: dirty primary refused (M3), conflict rolls back, dirty source 
     // The primary tree is untouched — its own version still on disk.
     var buf: [64]u8 = undefined;
     const primary_content = std.Io.Dir.cwd().readFile(io, primary_conflict, &buf) catch unreachable;
-    try std.testing.expectEqualStrings("primary side\n", primary_content);
+    // git's core.autocrlf materializes committed files with `\r\n` on Windows,
+    // so compare against the content with any trailing CR/LF stripped.
+    try std.testing.expectEqualStrings("primary side", std.mem.trim(u8, primary_content, " \r\n"));
 
     // ── Resolve + dirty source: the lane adopts primary's content and adds
     // UNCOMMITTED work — the merge refuses (M3b) rather than fabricating a
@@ -2788,7 +2790,7 @@ test "lane merge: dirty primary refused (M3), conflict rolls back, dirty source 
     const primary_extra = try std.fs.path.join(gpa, &.{ fx.repo, "extra.txt" });
     defer gpa.free(primary_extra);
     const extra_content = std.Io.Dir.cwd().readFile(io, primary_extra, &buf) catch unreachable;
-    try std.testing.expectEqualStrings("new work\n", extra_content);
+    try std.testing.expectEqualStrings("new work", std.mem.trim(u8, extra_content, " \r\n"));
 }
 
 test "laneStatus reports waiting-for-approval before stall" {

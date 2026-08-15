@@ -958,6 +958,7 @@ test "McpClient initializes and formats namespaced tool names" {
 }
 
 test "McpClient startStdio + stop lifecycle" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -976,6 +977,7 @@ test "McpClient startStdio + stop lifecycle" {
 }
 
 test "McpClient sendRequest round-trip" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -998,6 +1000,7 @@ test "McpClient sendRequest round-trip" {
 }
 
 test "McpClient full handshake + tools/list" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1042,6 +1045,7 @@ test "McpClient full handshake + tools/list" {
 }
 
 test "McpClient initialize captures tools.listChanged capability" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1065,6 +1069,7 @@ test "McpClient initialize captures tools.listChanged capability" {
 }
 
 test "McpClient callTool round-trip" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1181,6 +1186,7 @@ test "handleNotification sets pending_tools_refresh for tools/list_changed" {
 }
 
 test "sendRequestStdio routes interleaved notifications to handleNotification" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 

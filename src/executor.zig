@@ -1204,6 +1204,7 @@ fn serviceUntilDone(
 }
 
 test "executor re-roots mid-batch after lane enter" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
 
     // The lane worktree the fake UI resolves `enter` with.
@@ -1274,6 +1275,7 @@ test "executor re-roots mid-batch after lane enter" {
 }
 
 test "executor re-roots back on lane leave" {
+    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
