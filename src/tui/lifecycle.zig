@@ -163,6 +163,20 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     }
 
     var visible_change = try drainAgentEvents(root, ctx);
+    // Update the velocity EMA + context meter on the UI tick (lockless: the UI
+    // thread is the sole writer; worker threads only append to the transcript
+    // via the already-synchronized event queue). `streamed_bytes / 4` is the
+    // chars/4 token estimate. `.awake` is CLOCK_MONOTONIC (`.monotonic` does
+    // not exist in Zig 0.16).
+    {
+        const now_ns = std.Io.Timestamp.now(root.app.getIo(), .awake).nanoseconds;
+        const alpha = root.app.cached_config.tui.velocity_smoothing_alpha;
+        root.app.metrics.telemetry.updateVelocity(now_ns, root.app.metrics.streamed_bytes / 4, alpha);
+        if (root.app.liveRuntime()) |rt| {
+            root.app.metrics.context_tokens_used = rt.agent.currentContextTokens();
+            root.app.metrics.context_tokens_max = rt.agent.context_window_tokens;
+        }
+    }
     visible_change = try drainToasts() or visible_change;
     visible_change = try drainModelsAndMcp(root) or visible_change;
     visible_change = try drainDiffAndCompactions(root) or visible_change;
@@ -337,6 +351,15 @@ fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
                     else => {},
                 }
 
+                // Accumulate the ACTIVE lane's response-delta bytes (only) for
+                // the velocity gauge. `thinking_delta` is excluded — reasoning
+                // tokens are not "response" velocity. The active lane is the
+                // one the user watches, so only it feeds the gauge. The gauge
+                // is fed `streamed_bytes / 4` (chars/4 estimate) on the tick.
+                if (lane == active and event_ptr.* == .response_delta) {
+                    root.app.metrics.streamed_bytes += event_ptr.response_delta.len;
+                }
+
                 // A discarded (interrupted) turn's events are swallowed inside
                 // applyAgentEvent — the Turn machine refuses to project them.
                 const changed = try root.app.applyAgentEvent(event_ptr.*);
@@ -351,6 +374,13 @@ fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
 
             if (lane_bytes >= drain_byte_budget) break;
         }
+    }
+    // Reset the velocity accumulator once the active lane's turn is no longer
+    // writing a response (turn end / new turn), so the next turn's delta is
+    // computed from a clean base and the `-|` underflow guard in updateVelocity
+    // sees a clean reset.
+    if (active.turn_view.activity != .writing_response) {
+        root.app.metrics.streamed_bytes = 0;
     }
     if (refresh_diff) {
         root.diff_refresh_pending = true;
@@ -426,8 +456,18 @@ pub fn createParallelLane(self: *App) !void {
     std.debug.assert(self.threads.len() <= max_threads);
 
     // Committed: `threads` owns `lane`, which owns `runtime`/`branch`/`dest`.
-    self.thread = lane;
-    self.split = true; // a new lane implies tiling so both are visible
+    // In `.dual` the driver (lane 0) is always the left pane and input routing
+    // stays with it — moving `app.thread` to the new worker would route input
+    // to a lane no pane displays. Instead, reveal the new lane in the right
+    // pane by pointing `focused_worker_index` at it. In `.grid`/`.tab` the new
+    // lane becomes the active one as before.
+    self.split_mode = self.cached_config.tui.split_mode;
+    if (self.split_mode == .dual) {
+        self.thread = self.threads.slice()[0];
+        self.focused_worker_index = self.threads.len() - 1; // the new lane's index
+    } else {
+        self.thread = lane;
+    }
     self.mode = .normal;
     self.clearInput();
     self.resetTurnState();

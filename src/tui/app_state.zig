@@ -28,6 +28,7 @@ const mcp_status = @import("widgets/mcp_status.zig");
 const plugins_status = @import("widgets/plugins_status.zig");
 const search_widget = @import("widgets/search.zig");
 const vxfw = vaxis.vxfw;
+const telemetry_mod = @import("telemetry.zig");
 
 const MentionSearchKind = tui.MentionSearchKind;
 
@@ -306,6 +307,15 @@ pub const MetricsState = struct {
     git_label: []const u8 = "",
     context_tokens_used: u32 = 0,
     context_tokens_max: u32 = 128000,
+    /// Accumulator for the active lane's `response_delta` text bytes, fed as
+    /// `streamed_bytes / 4` (the chars/4 token estimate) into `telemetry` on
+    /// the UI tick. UI-thread-only; reset when the lane's turn leaves
+    /// `.writing_response`. The `TelemetryTracker` itself is a pure value type
+    /// with no byte counter — the accumulation lives here.
+    streamed_bytes: usize = 0,
+    /// EMA token-velocity tracker + context-meter formatter. Updated on the UI
+    /// tick (`lifecycle.handleTick`); read by the status bar (`input.zig`).
+    telemetry: telemetry_mod.TelemetryTracker = .{},
     diff_counts: tui.DiffCounts = .{},
     /// Diff-cache state machine. The previous 5 flat fields
     /// (diff_refresh_future/done/again, diff_cache, diff_loading)

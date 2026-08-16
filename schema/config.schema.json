@@ -358,6 +358,55 @@
           "enum": ["accent", "bold", "underline"],
           "default": "accent",
           "description": "Style of matched runes: 'accent', 'bold', or 'underline'."
+        },
+        "splitMode": {
+          "type": "string",
+          "enum": ["dual", "grid", "tab"],
+          "default": "dual",
+          "description": "Multi-lane layout arrangement when multiple lanes are open."
+        },
+        "minSplitWidth": {
+          "type": "integer",
+          "minimum": 80,
+          "maximum": 500,
+          "default": 140,
+          "description": "Minimum terminal column width required to trigger split layout."
+        },
+        "highlightFocusedBorder": {
+          "type": "boolean",
+          "default": true,
+          "description": "Render a high-contrast accent border around the currently focused split column."
+        },
+        "showTokenVelocity": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show real-time streaming token velocity (⚡ tok/s) in the status bar."
+        },
+        "showContextMeter": {
+          "type": "boolean",
+          "default": true,
+          "description": "Display the visual context window capacity progress bar in the status bar."
+        },
+        "velocitySmoothingAlpha": {
+          "type": "number",
+          "minimum": 0.05,
+          "maximum": 1.0,
+          "default": 0.35,
+          "description": "EMA smoothing coefficient for token velocity."
+        },
+        "contextThresholdWarn": {
+          "type": "number",
+          "minimum": 0.1,
+          "maximum": 0.9,
+          "default": 0.70,
+          "description": "Context usage fraction that transitions the meter to amber warning."
+        },
+        "contextThresholdAlert": {
+          "type": "number",
+          "minimum": 0.2,
+          "maximum": 0.99,
+          "default": 0.85,
+          "description": "Context usage fraction that transitions the meter to red alert."
         }
       },
       "additionalProperties": false

@@ -262,7 +262,7 @@ fn mergeLane(app: *App, source: lanes_util.MergeSource, dest: *Thread) !void {
         vcs.deleteBranch(app.gpa, app.io, repo, source.branch) catch {};
     }
 
-    if (app.threads.len() < 2) app.split = false;
+    if (app.threads.len() < 2) app.split_mode = .tab;
     app.nav.block_nav = false;
 }
 
@@ -398,12 +398,20 @@ pub fn anyTurnActive(app: *const App) bool {
 }
 
 /// Cycle the active lane by `delta` (+1 next, -1 previous), wrapping at both
-/// ends. No-op with a single lane.
+/// ends. No-op with a single lane. In `.dual` the driver (lane 0) is always
+/// the left pane and the focused worker always the right, and `app.thread`
+/// must stay the driver (input routing) — so lane cycling becomes worker
+/// cycling (`shiftFocusedWorker`) instead of moving `app.thread` to a lane
+/// that no pane displays.
 pub fn cycleLane(app: *App, delta: i32) void {
     const n = app.threads.len();
     std.debug.assert(n >= 1);
     std.debug.assert(n <= max_threads);
     if (n < 2) return;
+    if (app.split_mode == .dual) {
+        shiftFocusedWorker(app, delta);
+        return;
+    }
     const cur: i32 = @intCast(activeIndex(app));
     const next: usize = @intCast(@mod(cur + delta, @as(i32, @intCast(n))));
     app.thread = app.threads.slice()[next];
@@ -411,10 +419,47 @@ pub fn cycleLane(app: *App, delta: i32) void {
     app.clearInput();
 }
 
-/// Toggle between the tiled split view and fullscreening the active lane.
-pub fn toggleLaneFullscreen(app: *App) void {
+/// Cycle the split layout through dual → grid → tab → dual. No-op with a
+/// single lane (there's nothing to split). Bound by the configured
+/// `tui.min_split_width` at render time, not here. Entering `.dual` re-roots
+/// `app.thread` to the driver so the invariant holds (see `enterDual`).
+pub fn cycleSplitMode(app: *App) void {
     if (app.threads.len() < 2) return;
-    app.split = !app.split;
+    switch (app.split_mode) {
+        .dual => app.split_mode = .grid,
+        .grid => app.split_mode = .tab,
+        .tab => enterDual(app),
+    }
+}
+
+/// Enter `.dual` split and enforce the invariant that `app.thread` is the
+/// driver (lane 0) — the only input-routing lane in dual (the right pane shows
+/// `focused_worker_index`, never `app.thread`). Re-rooting `app.thread` to
+/// lane 0 and clearing input mirrors `cycleLane`'s post-switch cleanup. No-op
+/// with a single lane (dual needs a worker to display).
+pub fn enterDual(app: *App) void {
+    if (app.threads.len() < 2) return;
+    app.split_mode = .dual;
+    app.thread = app.threads.slice()[0];
+    app.clearInput();
+}
+
+/// Advance to the next focused worker lane. Wraps within `[1, lane_count - 1]`.
+/// No-op with a single lane.
+pub fn cycleFocusedWorker(app: *App) void {
+    shiftFocusedWorker(app, 1);
+}
+
+/// Shift the focused worker lane (index >= 1) by `delta` (+1 next, -1
+/// previous), wrapping within `[1, lane_count - 1]`. No-op with a single lane.
+/// This is the only representable pane-focus bit under Resolved Decision 3
+/// (the driver is always the left pane, `app.thread` never moves in `.dual`).
+pub fn shiftFocusedWorker(app: *App, delta: i32) void {
+    const n = app.threads.len();
+    if (n < 2) return;
+    const max_worker: i32 = @intCast(n - 1);
+    const cur: i32 = @intCast(app.focused_worker_index);
+    app.focused_worker_index = @intCast(@mod(cur - 1 + delta, max_worker) + 1);
 }
 
 /// Close the active lane by *parking* it: tear down its runtime and drop it
@@ -891,7 +936,11 @@ fn createLane(app: *App, req: *const lane_bridge.Request) ?Resp {
         app.gpa.destroy(lane);
         return failResp(app.gpa, "lane: out of memory\n", .{});
     };
-    app.split = true;
+    // Defensive: if the configured mode is `.dual`, enter it through
+    // `enterDual` so `app.thread` is re-rooted to the driver (the new lane is
+    // created but not necessarily focused).
+    const configured = app.cached_config.tui.split_mode;
+    if (configured == .dual) enterDual(app) else app.split_mode = configured;
 
     const id = lanes_util.lastPathSegment(wt.dest);
     const path = wt.dest; // now owned by the lane
@@ -968,7 +1017,7 @@ fn mergeLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
         .ok => {},
     }
     abandonLane(app, @intCast(index)) catch {};
-    if (app.threads.len() < 2) app.split = false;
+    if (app.threads.len() < 2) app.split_mode = .tab;
     // Report the driver's REAL workspace root: it may hold a borrow in another
     // lane (H5b only refuses merging the lane the driver is currently entered
     // in), so claiming the repo root would lie to the model.
@@ -1138,7 +1187,10 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
         app.gpa.destroy(lane);
         return failResp(app.gpa, "lane: out of memory\n", .{});
     };
-    app.split = true;
+    // Defensive: if the configured mode is `.dual`, enter it through
+    // `enterDual` so `app.thread` is re-rooted to the driver.
+    const configured = app.cached_config.tui.split_mode;
+    if (configured == .dual) enterDual(app) else app.split_mode = configured;
 
     const id = lanes_util.lastPathSegment(wt.dest);
     const path = wt.dest; // now owned by the lane
@@ -1179,7 +1231,7 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
 fn removeFailedSpawn(app: *App, lane: *Thread) void {
     const index = indexOfLane(app, lane) orelse return;
     abandonLane(app, @intCast(index)) catch {};
-    if (app.threads.len() < 2) app.split = false;
+    if (app.threads.len() < 2) app.split_mode = .tab;
 }
 
 /// Attach a runtime to an existing idle `Thread`, turning it live. Reuses
@@ -1451,7 +1503,7 @@ fn deleteLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
         abandonLane(app, @intCast(index)) catch |err| {
             return failResp(app.gpa, "lane delete failed: {s}\n", .{lanes_util.laneErrorText(err)});
         };
-        if (app.threads.len() < 2) app.split = false;
+        if (app.threads.len() < 2) app.split_mode = .tab;
         return resp(app.gpa, "Deleted open lane {s}.\n", .{id}, null, null);
     }
 

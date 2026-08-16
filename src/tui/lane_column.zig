@@ -10,6 +10,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const tui = @import("../tui.zig");
+const tui_style = @import("style.zig");
 const lanes_util = @import("lanes.zig");
 const tx_widget = @import("widgets/transcript.zig");
 const tui_message = @import("widgets/message.zig");
@@ -26,7 +27,7 @@ fn driverWorkspacePath(app: *const App) ?[]const u8 {
     return agent.workspaceBorrow();
 }
 
-pub fn drawLaneColumn(app: *App, ctx: vxfw.DrawContext, lane: *Thread, width: u16, height: u16, active: bool) std.mem.Allocator.Error!vxfw.Surface {
+pub fn drawLaneColumn(app: *App, ctx: vxfw.DrawContext, lane: *Thread, width: u16, height: u16, active: bool, focused: bool) std.mem.Allocator.Error!vxfw.Surface {
     var transcript_view: tx_widget.TranscriptWidget = .{ .app = app, .thread = lane };
     const title = if (lane.title) |t| t else "untitled";
     // Active-view marker (●/○) + turn-state marker (S14): a spinner frame
@@ -60,6 +61,13 @@ pub fn drawLaneColumn(app: *App, ctx: vxfw.DrawContext, lane: *Thread, width: u1
         .labels = &.{.{ .text = label_text, .alignment = .top_left }},
         .style = if (active) .{} else .{ .dim = true },
     };
+    // The focused column — the right pane's worker in `.dual`, `app.thread` in
+    // `.grid` — gets a high-contrast accent border when the knob is enabled.
+    // `active` and `focused` are distinct: `active` marks the ●/dim state,
+    // `focused` is the single column whose border is highlighted.
+    if (focused and app.cached_config.tui.highlight_focused_border) {
+        border.style = tui_style.activePalette().border_label;
+    }
     return border.widget().draw(ctx.withConstraints(
         .{ .width = width, .height = height },
         .{ .width = width, .height = height },

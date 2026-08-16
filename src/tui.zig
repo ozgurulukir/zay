@@ -41,6 +41,7 @@ const BoundedList = @import("tui/bounded_list.zig").BoundedList;
 /// Maximum concurrent lanes (driver + 3 parallel workers).
 pub const max_threads: u32 = 4;
 const tui_metrics = @import("tui/metrics.zig");
+const tui_layout = @import("tui/layout.zig");
 const provider_model = @import("tui/provider_model.zig");
 const diff_lifecycle = @import("tui/diff_lifecycle.zig");
 pub const DiffCounts = diff_lifecycle.DiffCounts;
@@ -123,11 +124,23 @@ pub const App = struct {
     /// index) so every `self.thread.X` site reads/mutates the active lane through
     /// auto-deref, even from a `*const App`.
     thread: *Thread,
-    /// When true and there's more than one lane, the transcript area tiles all
-    /// lanes as columns; otherwise only the active lane shows full-width
-    /// ("fullscreen"). Set true on opening a parallel lane and toggled by
-    /// `toggleLaneFullscreen` (Ctrl+L) / clicking the pink lanes chip.
-    split: bool = false,
+    /// The multi-lane layout arrangement. `.tab` (single active-lane pane) is
+    /// the legacy fullscreen; `.dual` (1:1 driver + focused worker) and `.grid`
+    /// (2x2 tile) both show more than one lane. Set from the configured
+    /// `tui.split_mode` on opening a parallel lane and cycled by `Ctrl+W`.
+    split_mode: config_mod.SplitMode = .tab,
+    /// Which worker lane (index >= 1) occupies the right pane in `.dual` and
+    /// gets the focus highlight. A separate bit from `app.thread`: `app.thread`
+    /// stays the input-routing lane (always the driver in `.dual`), while this
+    /// selects the worker shown on the right. Cycled by `Ctrl+L` and set by
+    /// `Alt+Left`/`Alt+Right` / mouse click-to-focus.
+    focused_worker_index: usize = 1,
+    /// The split column geometry computed this frame by `drawRoot`, reused by
+    /// mouse click-to-focus routing so the render path and the mouse handler
+    /// share one source of truth (`layout.computeSplitLayout`). Populated only
+    /// in split modes; `split_rect_count` is 0 otherwise.
+    split_rects: [4]tui_layout.ColumnRect = undefined,
+    split_rect_count: usize = 0,
     /// Root-relative row where the input surface is drawn this frame; lets the
     /// input widget translate its local chip position into absolute coordinates
     /// for `lanes_chip_rect`.
@@ -563,12 +576,12 @@ pub const App = struct {
         if (self.nav.quit == .pending) self.nav.quit = .none;
     }
 
-    pub fn getSplit(self: *const App) bool {
-        return self.split;
+    pub fn setSplitMode(self: *App, mode: config_mod.SplitMode) void {
+        self.split_mode = mode;
     }
 
-    pub fn setSplit(self: *App, v: bool) void {
-        self.split = v;
+    pub fn enterDual(self: *App) void {
+        lane_lifecycle.enterDual(self);
     }
 
     pub fn getLanesChipRect(self: *const App) ?ChipRect {
@@ -995,8 +1008,16 @@ pub const App = struct {
         lane_lifecycle.switchToNextLane(self);
     }
 
-    pub fn toggleLaneFullscreen(self: *App) void {
-        lane_lifecycle.toggleLaneFullscreen(self);
+    pub fn cycleSplitMode(self: *App) void {
+        lane_lifecycle.cycleSplitMode(self);
+    }
+
+    pub fn cycleFocusedWorker(self: *App) void {
+        lane_lifecycle.cycleFocusedWorker(self);
+    }
+
+    pub fn shiftFocusedWorker(self: *App, delta: i32) void {
+        lane_lifecycle.shiftFocusedWorker(self, delta);
     }
 
     pub fn closeActiveLane(self: *App) !void {

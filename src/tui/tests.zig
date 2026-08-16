@@ -1686,7 +1686,7 @@ test "cycleLane wraps the active lane in both directions" {
     try std.testing.expectEqual(@as(usize, 2), app.activeIndex());
 }
 
-test "toggleLaneFullscreen flips split only when multiple lanes exist" {
+test "cycleSplitMode cycles dual → grid → tab → dual only with multiple lanes" {
     const gpa = std.testing.allocator;
     var openai_compatible_client: openai_compatible_mod.Client = undefined;
     try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
@@ -1696,19 +1696,190 @@ test "toggleLaneFullscreen flips split only when multiple lanes exist" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    // Single lane: nothing to tile, so the toggle leaves split untouched.
-    try std.testing.expect(!app.split);
-    app.toggleLaneFullscreen();
-    try std.testing.expect(!app.split);
+    // Single lane: nothing to split, so the cycle leaves the mode untouched.
+    try std.testing.expect(app.split_mode == .tab);
+    app.cycleSplitMode();
+    try std.testing.expect(app.split_mode == .tab);
 
     const lane2 = try gpa.create(Thread);
     lane2.* = .{};
     try app.threads.append(lane2);
-    app.split = true; // parallel lanes open tiled
-    app.toggleLaneFullscreen();
-    try std.testing.expect(!app.split); // now fullscreened
-    app.toggleLaneFullscreen();
-    try std.testing.expect(app.split); // back to split
+    // With two lanes, cycle through dual → grid → tab → dual.
+    app.split_mode = .dual;
+    app.cycleSplitMode();
+    try std.testing.expect(app.split_mode == .grid);
+    app.cycleSplitMode();
+    try std.testing.expect(app.split_mode == .tab);
+    app.cycleSplitMode();
+    try std.testing.expect(app.split_mode == .dual);
+}
+
+test "cycleFocusedWorker wraps within worker lane indices" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // Single lane: no-op.
+    app.focused_worker_index = 1;
+    app.cycleFocusedWorker();
+    try std.testing.expectEqual(@as(usize, 1), app.focused_worker_index);
+
+    // Two lanes: only worker index 1 is valid, so it wraps to itself.
+    const lane2 = try gpa.create(Thread);
+    lane2.* = .{};
+    try app.threads.append(lane2);
+    app.focused_worker_index = 1;
+    app.cycleFocusedWorker();
+    try std.testing.expectEqual(@as(usize, 1), app.focused_worker_index);
+
+    // Three lanes: cycle 1 → 2 → 1.
+    const lane3 = try gpa.create(Thread);
+    lane3.* = .{};
+    try app.threads.append(lane3);
+    app.focused_worker_index = 1;
+    app.cycleFocusedWorker();
+    try std.testing.expectEqual(@as(usize, 2), app.focused_worker_index);
+    app.cycleFocusedWorker();
+    try std.testing.expectEqual(@as(usize, 1), app.focused_worker_index);
+}
+
+test "shiftFocusedWorker moves the focused worker in both directions with wrap" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // Single lane: no-op.
+    app.focused_worker_index = 1;
+    app.shiftFocusedWorker(1);
+    try std.testing.expectEqual(@as(usize, 1), app.focused_worker_index);
+
+    // Four lanes → workers are [1, 3].
+    for (0..3) |_| {
+        const lane = try gpa.create(Thread);
+        lane.* = .{};
+        try app.threads.append(lane);
+    }
+    app.focused_worker_index = 1;
+    app.shiftFocusedWorker(1); // 1 → 2
+    try std.testing.expectEqual(@as(usize, 2), app.focused_worker_index);
+    app.shiftFocusedWorker(1); // 2 → 3
+    try std.testing.expectEqual(@as(usize, 3), app.focused_worker_index);
+    app.shiftFocusedWorker(1); // 3 → 1 (wrap forward)
+    try std.testing.expectEqual(@as(usize, 1), app.focused_worker_index);
+    app.shiftFocusedWorker(-1); // 1 → 3 (wrap backward)
+    try std.testing.expectEqual(@as(usize, 3), app.focused_worker_index);
+    app.shiftFocusedWorker(-1); // 3 → 2
+    try std.testing.expectEqual(@as(usize, 2), app.focused_worker_index);
+}
+
+test "cycleLane in dual cycles the focused worker, not app.thread" {
+    // Regression: Shift+Tab / Shift+Left / Shift+Right route through cycleLane.
+    // In `.dual` app.thread must stay the driver (lane 0, the left pane) or
+    // input would route to a lane no pane displays; lane cycling becomes worker
+    // cycling instead.
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    const lane2 = try gpa.create(Thread);
+    lane2.* = .{};
+    try app.threads.append(lane2);
+    const lane3 = try gpa.create(Thread);
+    lane3.* = .{};
+    try app.threads.append(lane3);
+
+    app.split_mode = .dual;
+    app.thread = app.threads.slice()[0];
+    app.focused_worker_index = 1;
+
+    // In `.dual`, cycling never moves app.thread off the driver.
+    app.cycleLane(1);
+    try std.testing.expectEqual(app.threads.slice()[0], app.thread);
+    try std.testing.expectEqual(@as(usize, 2), app.focused_worker_index);
+    app.cycleLane(1);
+    try std.testing.expectEqual(app.threads.slice()[0], app.thread);
+    try std.testing.expectEqual(@as(usize, 1), app.focused_worker_index);
+    app.cycleLane(-1);
+    try std.testing.expectEqual(app.threads.slice()[0], app.thread);
+    try std.testing.expectEqual(@as(usize, 2), app.focused_worker_index);
+}
+
+test "entering dual from tab re-roots thread to the driver" {
+    // Regression: cycling `.tab` → `.dual` (Ctrl+W) with `app.thread` on a
+    // worker must re-root it to the driver (lane 0) — otherwise input would
+    // route to a lane no pane displays.
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    const lane2 = try gpa.create(Thread);
+    lane2.* = .{};
+    try app.threads.append(lane2);
+    const lane3 = try gpa.create(Thread);
+    lane3.* = .{};
+    try app.threads.append(lane3);
+
+    // `.tab` fullscreens a worker (legitimately allowed in tab/grid).
+    app.split_mode = .tab;
+    app.thread = app.threads.slice()[2];
+    app.cycleSplitMode(); // tab → dual
+    try std.testing.expect(app.split_mode == .dual);
+    // Re-rooted to the driver; the previously-focused worker is preserved.
+    try std.testing.expectEqual(app.threads.slice()[0], app.thread);
+    try std.testing.expectEqual(@as(usize, 1), app.focused_worker_index);
+}
+
+test "createParallelLane-shaped dual branch reveals the new lane, not a thread swap" {
+    // Direct equivalent of `createParallelLane`'s `.dual` branch: the driver
+    // stays the input-routing lane and the freshly-appended worker is revealed
+    // in the right pane via `focused_worker_index` (never by moving `app.thread`
+    // to a lane no pane displays).
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // First parallel lane: driver + one worker → new lane is index 1.
+    const lane2 = try gpa.create(Thread);
+    lane2.* = .{};
+    try app.threads.append(lane2);
+    app.split_mode = .dual;
+    app.thread = app.threads.slice()[0];
+    app.focused_worker_index = app.threads.len() - 1;
+    try std.testing.expectEqual(app.threads.slice()[0], app.thread);
+    try std.testing.expectEqual(@as(usize, 1), app.focused_worker_index);
+
+    // Second parallel lane: new lane is index 2.
+    const lane3 = try gpa.create(Thread);
+    lane3.* = .{};
+    try app.threads.append(lane3);
+    app.focused_worker_index = app.threads.len() - 1;
+    try std.testing.expectEqual(app.threads.slice()[0], app.thread);
+    try std.testing.expectEqual(@as(usize, 2), app.focused_worker_index);
 }
 
 test "lanes chip rect hit test covers its row span only" {

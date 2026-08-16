@@ -291,6 +291,11 @@ test {
     _ = @import("tui/tests.zig");
     _ = @import("tui/bounded_list.zig");
     _ = @import("tui/style.zig");
+    // The telemetry engine (token velocity EMA + context meter) is a new
+    // module; reference it here so its inline tests compile into the run
+    // (AGENTS.md test-runner quirk: a file only referenced lazily is never
+    // analyzed and its tests silently never run).
+    _ = @import("tui/telemetry.zig");
     _ = @import("lua/root.zig");
     _ = @import("lua/state.zig");
     _ = @import("lua/bridge.zig");

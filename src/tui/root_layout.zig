@@ -37,15 +37,33 @@ const log = std.log.scoped(.root_layout);
 
 pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
     // The diff viewer replaces the whole screen (transcript + input + overlay),
-    // so it short-circuits the normal layout entirely.
-    if (app.mode == .diff_viewer) return diff_viewer_overlay.drawDiffViewer(app, root_widget, ctx);
+    // so it short-circuits the normal layout entirely. Zero the split-rect
+    // stash here too — the normal path that clears it is skipped, so otherwise
+    // `routeMouse` would keep hit-testing stale split geometry while the diff
+    // viewer is up.
+    if (app.mode == .diff_viewer) {
+        app.split_rect_count = 0;
+        return diff_viewer_overlay.drawDiffViewer(app, root_widget, ctx);
+    }
     const max_width = ctx.max.width orelse ctx.min.width;
     const max_height = ctx.max.height orelse ctx.min.height;
     const loading_visible = app.thread.turn_view.awaitingOutput();
-    const split = app.split and app.threads.len() > 1;
+    const split = app.split_mode != .tab and app.threads.len() > 1;
     // In split view always reserve the loading row so each column keeps a
     // fixed height across turns — the spinner appearing must not reflow.
     const layout = root_layout.rootLayout(max_height, false, try app.inputTextRows(ctx, max_width -| 4), loading_visible or split, app.thread.queued.items.len > 0);
+    // Compute the split geometry once and stash it for mouse click-to-focus
+    // routing (event_router.routeMouse), so the render path and the mouse
+    // handler share one source of truth. `split_rect_count` is set
+    // unconditionally so leaving split mode (or the diff viewer early-return)
+    // leaves it 0 and the mouse handler stops hit-testing stale geometry.
+    var split_cols: []const root_layout.ColumnRect = &.{};
+    var split_rects: [4]root_layout.ColumnRect = undefined;
+    if (split) {
+        split_cols = root_layout.computeSplitLayout(max_width, layout.transcript_height, app.split_mode, app.threads.len(), app.focused_worker_index, app.cached_config.tui.min_split_width, &split_rects);
+        app.split_rects = split_rects;
+    }
+    app.split_rect_count = split_cols.len;
     app.input_surface_row = layout.input_row;
     app.nav.lanes_chip_rect = null;
 
@@ -69,7 +87,7 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
     const at_visible = (app.at_search != .closed) and !overlay_visible and !permission_visible and !background_visible;
     const toast_visible = toast.global.hasToasts();
 
-    var child_count: usize = (if (split) app.threads.len() else 1) + 1;
+    var child_count: usize = (if (split) split_cols.len else 1) + 1;
     if (loading_visible) child_count += 1;
     if (overlay_visible) child_count += 1;
     if (permission_visible) child_count += 1;
@@ -79,23 +97,34 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
     const children = try ctx.arena.alloc(vxfw.SubSurface, child_count);
     var idx: usize = 0;
     if (split) {
-        // Tile the transcript area as a 2-wide grid: rows of two lanes, a
-        // trailing odd lane spanning its row. The active lane is marked in
-        // its border label; input + spinner stay shared below, routing to it.
-        const n = app.threads.len();
-        const rows: u16 = @intCast((n + 1) / 2);
-        const cell_h: u16 = layout.transcript_height / rows;
-        for (app.threads.slice(), 0..) |lane, i| {
-            const row: u16 = @intCast(i / 2);
-            const col: u16 = @intCast(i % 2);
-            const last_row = row == rows - 1;
-            const per_row: u16 = if (last_row and n % 2 == 1) 1 else 2;
-            const cell_w: u16 = max_width / per_row;
-            const w: u16 = if (col == per_row - 1) max_width - cell_w * (per_row - 1) else cell_w;
-            const h: u16 = if (last_row) layout.transcript_height - cell_h * (rows - 1) else cell_h;
+        // Render each split column from the shared geometry. `.dual` shows the
+        // driver (lane 0) on the left and the focused worker on the right;
+        // `.grid` tiles all lanes. The active flag derives from the focus state,
+        // not just `app.thread`: in `.dual` the left column is active (the
+        // driver is always the input-routing lane) and the right column is
+        // active when it projects the focused worker.
+        for (split_cols) |col| {
+            const lane = app.threads.slice()[col.lane_index];
+            // Clamp the focused worker so a momentarily out-of-range index
+            // (e.g. right after a lane deletion) still highlights the clamped
+            // right-pane column instead of leaving it dim/unhighlighted.
+            // `split` guarantees `threads.len() > 1`, so `lane_max >= 1`.
+            const worker_focus = @max(@min(app.focused_worker_index, app.threads.len() - 1), 1);
+            // `active` marks the ●/dim state; `focused` selects the single
+            // column whose border is highlighted. In `.dual` the driver (left)
+            // and focused worker (right) are both active, but only the right
+            // pane's worker is "focused"; in `.grid` the active lane is focused.
+            const active = if (app.split_mode == .dual)
+                (col.lane_index == 0) or (col.lane_index == worker_focus)
+            else
+                (col.lane_index == @as(usize, app.activeIndex()));
+            const focused = if (app.split_mode == .dual)
+                (col.lane_index == worker_focus)
+            else
+                (col.lane_index == @as(usize, app.activeIndex()));
             children[idx] = .{
-                .origin = .{ .row = row * cell_h, .col = col * cell_w },
-                .surface = try lane_column.drawLaneColumn(app, ctx, lane, w, h, lane == app.thread),
+                .origin = .{ .row = col.row, .col = col.col },
+                .surface = try lane_column.drawLaneColumn(app, ctx, lane, col.width, col.height, active, focused),
                 .z_index = 0,
             };
             idx += 1;

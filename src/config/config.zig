@@ -144,6 +144,16 @@ pub const ToastSettings = struct {
 /// How fuzzy-matched runes are styled in the search pickers.
 pub const FuzzyHighlightStyle = enum { accent, bold, underline };
 
+/// Multi-lane layout arrangement when more than one lane is open.
+pub const SplitMode = enum {
+    /// 1:1 full-height split: left = driver (lane 0), right = focused worker.
+    dual,
+    /// 2x2 tiled grid showing all open lanes simultaneously (legacy split).
+    grid,
+    /// Single active-lane pane (legacy fullscreen).
+    tab,
+};
+
 /// TUI appearance, live theme preview, and picker settings.
 pub const TuiSettings = struct {
     /// Recolor the UI live while browsing themes in the /theme picker.
@@ -156,6 +166,22 @@ pub const TuiSettings = struct {
     fuzzy_highlight: bool = true,
     /// Style of matched runes: 'accent', 'bold', or 'underline'.
     fuzzy_highlight_style: FuzzyHighlightStyle = .accent,
+    /// Multi-lane layout arrangement when multiple lanes are open.
+    split_mode: SplitMode = .dual,
+    /// Minimum terminal column width required to trigger split layout.
+    min_split_width: u16 = 140,
+    /// Render a high-contrast accent border around the focused split column.
+    highlight_focused_border: bool = true,
+    /// Show real-time streaming token velocity (⚡ tok/s) in the status bar.
+    show_token_velocity: bool = true,
+    /// Display the visual context window capacity progress bar in the status bar.
+    show_context_meter: bool = true,
+    /// EMA smoothing coefficient for token velocity.
+    velocity_smoothing_alpha: f64 = 0.35,
+    /// Context usage fraction that transitions the meter to amber warning.
+    context_threshold_warn: f64 = 0.70,
+    /// Context usage fraction that transitions the meter to red alert.
+    context_threshold_alert: f64 = 0.85,
 };
 
 pub const Config = struct {
@@ -414,4 +440,12 @@ test "provider identity derives from provider_name" {
     var empty: Config = .{};
     defer empty.deinit(gpa);
     try std.testing.expectEqual(@as(?Provider, null), empty.providerFromName());
+}
+
+test "SplitMode stringToEnum round-trips" {
+    try std.testing.expectEqual(SplitMode.dual, std.meta.stringToEnum(SplitMode, "dual").?);
+    try std.testing.expectEqual(SplitMode.grid, std.meta.stringToEnum(SplitMode, "grid").?);
+    try std.testing.expectEqual(SplitMode.tab, std.meta.stringToEnum(SplitMode, "tab").?);
+    // Unknown names resolve to null (the parser falls back to `.dual`).
+    try std.testing.expectEqual(@as(?SplitMode, null), std.meta.stringToEnum(SplitMode, "bogus"));
 }

@@ -21,6 +21,7 @@ const vxfw = vaxis.vxfw;
 const tui = @import("../../tui.zig");
 const tui_style = @import("../style.zig");
 const tui_status = @import("../status.zig");
+const telemetry = @import("../telemetry.zig");
 const symbols = @import("../../symbols.zig");
 const panel = @import("panel.zig");
 
@@ -410,9 +411,9 @@ pub const InputWidget = struct {
         const show_hint = height >= base_row + 1;
         const show_diff = show_hint and self.app.diffCountsVisible();
         const show_badge = show_hint and self.app.runningBackgroundCount() > 0;
-        // The pink lanes chip only makes sense while fullscreened (not tiled)
-        // with other lanes hidden behind the active one.
-        const show_lanes = show_hint and !self.app.split and self.app.threads.len() > 1;
+        // The pink lanes chip only makes sense while fullscreened (`.tab`,
+        // not split) with other lanes hidden behind the active one.
+        const show_lanes = show_hint and self.app.split_mode == .tab and self.app.threads.len() > 1;
         const children_count: usize = 1 +
             @as(usize, if (show_hint) 1 else 0) +
             @as(usize, if (show_diff) 1 else 0) +
@@ -519,34 +520,62 @@ pub const InputWidget = struct {
         else
             0;
 
-        const pct: u32 = if (live_context_max > 0 and live_context_used > 0)
-            @min(100, (live_context_used * 100) / live_context_max)
+        // Telemetry: the streaming velocity gauge (⚡ tok/s) and the 10-block
+        // context capacity meter. Both are gated by their config knobs; the
+        // meter is colored by its severity (green / amber / red), resolved
+        // here against the palette (the formatter stays pure data).
+        const tui_cfg = self.app.cached_config.tui;
+        var meter_buf: [64]u8 = undefined;
+        var meter_text: []const u8 = "";
+        var meter_style = p.model_status;
+        if (tui_cfg.show_context_meter) {
+            const meter = telemetry.TelemetryTracker.formatContextBar(
+                @intCast(live_context_used),
+                @intCast(live_context_max),
+                tui_cfg.context_threshold_warn,
+                tui_cfg.context_threshold_alert,
+                &meter_buf,
+            );
+            meter_text = meter.text;
+            meter_style = switch (meter.level) {
+                .normal => p.success,
+                .warn => p.notice,
+                .alert => p.error_style,
+            };
+        }
+        var velocity_buf: [32]u8 = undefined;
+        var velocity_text: []const u8 = "";
+        if (tui_cfg.show_token_velocity) {
+            const is_streaming = self.app.thread.turn_view.activity == .writing_response;
+            velocity_text = telemetry.TelemetryTracker.formatVelocity(self.app.metrics.telemetry.current_tokens_per_sec, is_streaming, &velocity_buf);
+        }
+
+        // Right-aligned label row: the meter is written first (rightmost) in
+        // its level color, then the velocity + model status sit to its left in
+        // the model-status color. `writeBorderTextEndingAt` returns the column
+        // where the text started — or 0 when it was truncated (too wide for the
+        // terminal), a sentinel that makes `left_end` 0 and skips the neighbors
+        // so the label never overlaps or overflows.
+        const right_edge = max_width -| 3;
+        const meter_start = if (meter_text.len > 0)
+            panel.writeBorderTextEndingAt(&surface, ctx, 0, right_edge, meter_text, meter_style)
         else
-            0;
-        const ctx_bar = formatContextBar(ctx.arena, pct) catch "";
-        const label_text = if (ctx_bar.len > 0 and status_text.len > 0)
-            std.fmt.allocPrint(ctx.arena, "{s}  {s}", .{ status_text, ctx_bar }) catch status_text
-        else if (status_text.len > 0)
-            status_text
-        else
-            ctx_bar;
-        panel.writeBorderLabelRight(&surface, ctx, 0, label_text, p.model_status);
+            right_edge;
+        const left_end = meter_start -| 2;
+        if (left_end > 0) {
+            if (velocity_text.len > 0 and status_text.len > 0) {
+                const label_text = std.fmt.allocPrint(ctx.arena, "{s}  {s}", .{ velocity_text, status_text }) catch status_text;
+                _ = panel.writeBorderTextEndingAt(&surface, ctx, 0, left_end, label_text, p.model_status);
+            } else if (velocity_text.len > 0) {
+                _ = panel.writeBorderTextEndingAt(&surface, ctx, 0, left_end, velocity_text, p.model_status);
+            } else if (status_text.len > 0) {
+                _ = panel.writeBorderTextEndingAt(&surface, ctx, 0, left_end, status_text, p.model_status);
+            }
+        }
         // Bottom-right: git branch info at the edge.
         const bottom = border_height -| 1;
-        const right_edge = max_width -| 3; // last interior cell before the corner margin
         _ = panel.writeBorderTextEndingAt(&surface, ctx, bottom, right_edge, self.app.metrics.git_label, p.thinking_body);
         return surface;
-    }
-
-    fn formatContextBar(arena: std.mem.Allocator, pct: u32) ![]const u8 {
-        if (pct == 0) return "";
-        const filled: usize = (pct * 5) / 100;
-        var bar_buf = [5][]const u8{ "░", "░", "░", "░", "░" };
-        var i: usize = 0;
-        while (i < filled and i < 5) : (i += 1) bar_buf[i] = "▓";
-        return std.fmt.allocPrint(arena, "[{s}{s}{s}{s}{s} {d}%]", .{
-            bar_buf[0], bar_buf[1], bar_buf[2], bar_buf[3], bar_buf[4], pct,
-        });
     }
 
     fn drawQueuedMessage(self: *InputWidget, ctx: vxfw.DrawContext, width: u16) std.mem.Allocator.Error!vxfw.Surface {
@@ -580,8 +609,9 @@ pub const InputWidget = struct {
     }
 
     /// Bottom-left pink pill: the count of open lanes, shown while the active
-    /// lane is fullscreened. Black-on-pink so it reads as a control affordance;
-    /// clicking it (mouse) or pressing Ctrl+L restores the split view.
+    /// lane is fullscreened (`.tab`). Black-on-pink so it reads as a control
+    /// affordance; clicking it (mouse) or pressing Ctrl+W restores the split
+    /// view.
     fn drawLanesBadge(self: *InputWidget, ctx: vxfw.DrawContext, max_width: u16) std.mem.Allocator.Error!vxfw.Surface {
         const p = tui_style.activePalette();
         const text = try std.fmt.allocPrint(ctx.arena, " {d} Lanes ", .{self.app.threads.len()});

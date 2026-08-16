@@ -35,8 +35,10 @@ pub const help_lines = [_]HelpLine{
     .{ .key = "Up / Down", .desc = "Scroll transcript messages / select blocks" },
     .{ .key = "Tab", .desc = "Expand / collapse active message" },
     .{ .key = "Ctrl+O", .desc = "Toggle background jobs modal" },
-    .{ .key = "Shift+Tab", .desc = "Cycle through open parallel lanes" },
-    .{ .key = "Ctrl+L", .desc = "Toggle lane fullscreen / split view", .scope = .lanes },
+    .{ .key = "Shift+Tab", .desc = "Cycle focused worker lane / next parallel lane" },
+    .{ .key = "Ctrl+L", .desc = "Cycle focused worker lane / split mode", .scope = .lanes },
+    .{ .key = "Ctrl+W", .desc = "Cycle split layout: dual / grid / tab", .scope = .lanes },
+    .{ .key = "Alt+Right / Alt+Left", .desc = "Cycle right-pane worker: next / previous (dual split)", .scope = .lanes },
     .{ .key = "Esc", .desc = "Cancel turn / unselect block / close modal" },
 
     .{ .key = "CONTEXT MENTIONS & SKILLS", .desc = "", .is_header = true },

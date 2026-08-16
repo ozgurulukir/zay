@@ -88,9 +88,33 @@ fn routeMouse(
     if (mouse.type == .press and mouse.button == .left) {
         if (app.getLanesChipRect()) |rect| {
             if (rect.contains(mouse.row, mouse.col)) {
-                app.setSplit(true);
+                // Leave the fullscreen (`tab`) view. `.grid` opens the 2x2
+                // tile; `.dual` (and the configured-`tab` fallback) enter dual
+                // through `enterDual`, which re-roots `app.thread` to the
+                // driver so the click always produces a coherent split.
+                const configured = app.cached_config.tui.split_mode;
+                if (configured == .grid) app.setSplitMode(.grid) else app.enterDual();
                 ctx.consumeAndRedraw();
                 return;
+            }
+        }
+        // Click-to-focus a split pane by mapping (row, col) through the same
+        // geometry the render path used this frame (`app.split_rects`, stored
+        // by drawRoot). Only `.dual` worker columns can change focus, so a
+        // click elsewhere (the driver pane, or any `.grid` column) is left
+        // unconsumed rather than swallowing it.
+        if (mouse.row >= 0 and mouse.col >= 0) {
+            const r: u16 = @intCast(mouse.row);
+            const c: u16 = @intCast(mouse.col);
+            const cols = app.split_rects[0..app.split_rect_count];
+            for (cols) |col| {
+                if (r >= col.row and r < col.row + col.height and c >= col.col and c < col.col + col.width) {
+                    if (app.split_mode == .dual and col.lane_index >= 1) {
+                        app.focused_worker_index = col.lane_index;
+                        ctx.consumeAndRedraw();
+                        return;
+                    }
+                }
             }
         }
     }
@@ -128,7 +152,22 @@ fn routeKey(
     }
     if (key.matches('l', .{ .ctrl = true }) or key.matches('l', .{ .super = true })) {
         app.clearPendingQuitAt();
-        app.toggleLaneFullscreen();
+        // Ctrl+L cycles the focused worker lane in `.dual`; in `.grid`/`.tab`
+        // it falls back to the mode cycle (the same cycle as Ctrl+W).
+        if (app.split_mode == .dual and app.threads.len() > 1) {
+            app.cycleFocusedWorker();
+        } else {
+            app.cycleSplitMode();
+        }
+        ctx.consumeAndRedraw();
+        return;
+    }
+    // Ctrl+W cycles the split layout (dual → grid → tab → dual). Free in
+    // normal mode — the diff viewer (which also binds Ctrl+W) short-circuits
+    // `routeKey` before reaching here.
+    if (key.matches('w', .{ .ctrl = true }) and app.isNormalMode()) {
+        app.clearPendingQuitAt();
+        app.cycleSplitMode();
         ctx.consumeAndRedraw();
         return;
     }
@@ -205,6 +244,22 @@ fn routeKey(
             return;
         } else if (key.matches(vaxis.Key.right, .{ .ctrl = true })) {
             app.steerSelectedQueued();
+            ctx.consumeAndRedraw();
+            return;
+        }
+    }
+    // In `.dual` split with no queued messages, Alt+Left/Alt+Right shift the
+    // focused worker lane (the right pane). Alt+Right = next worker, Alt+Left
+    // = previous worker, wrapping within `[1, lane_count - 1]` — the only
+    // representable pane-focus bit under Resolved Decision 3. This never swaps
+    // `app.thread`; input routing stays with the driver (lane 0, the left pane).
+    if (app.isNormalMode() and !app.isAtSearchActive() and app.queuedCount() == 0 and app.split_mode == .dual and app.threads.len() > 1) {
+        if (key.matches(vaxis.Key.right, .{ .alt = true })) {
+            app.shiftFocusedWorker(1);
+            ctx.consumeAndRedraw();
+            return;
+        } else if (key.matches(vaxis.Key.left, .{ .alt = true })) {
+            app.shiftFocusedWorker(-1);
             ctx.consumeAndRedraw();
             return;
         }
