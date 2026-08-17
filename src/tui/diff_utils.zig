@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const DiffCounts = @import("../tui.zig").DiffCounts;
-const bash_mod = @import("../tools/bash_exec.zig");
+const vcs = @import("../vcs.zig");
 
 /// Parse `git diff --stat` output into additions/deletions.
 /// `+N` / `-M` lines are summed; binary stanzas are skipped.
@@ -65,27 +65,47 @@ fn saturatingAdd(a: u32, b: u32) u32 {
     return @intCast(@min(sum, std.math.maxInt(u32)));
 }
 
-/// Load the git branch label from the repo at `cwd`. Shells out to
-/// a bash script that fetches repo name + branch/commit hash.
+/// Load the git branch label from the repo at `cwd`. Uses native `git` CLI
+/// execution (cross-platform, zero bash dependency) to fetch repo name + branch/commit hash.
 pub fn loadGitLabel(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) ![]const u8 {
-    const command =
-        \\root=$(git rev-parse --show-toplevel 2>/dev/null)
-        \\if [ -n "$root" ]; then repo=$(basename "$root"); else repo=$(basename "$PWD"); fi
-        \\branch=$(git branch --show-current 2>/dev/null)
-        \\if [ -z "$branch" ]; then branch=$(git rev-parse --short HEAD 2>/dev/null); fi
-        \\if [ -n "$branch" ]; then printf '%s\t%s' "$repo" "$branch"; else printf '%s' "$repo"; fi
-    ;
-    var result = try bash_mod.runWithOptions(gpa, io, .{
-        .cwd = cwd,
-        .command = command,
-        .timeout = bash_mod.timeoutFromSeconds(2),
-    });
-    defer result.deinit(gpa);
-    if (result.code != 0) return "";
-    const out = std.mem.trim(u8, result.stdout, " \t\r\n");
-    if (out.len == 0) return "";
-    if (std.mem.indexOfScalar(u8, out, '\t')) |tab| {
-        return std.fmt.allocPrint(gpa, "{s} ⌥ {s}", .{ out[0..tab], out[tab + 1 ..] });
+    if (!vcs.isRepo(gpa, io, cwd)) return "";
+
+    // 1. Get repo top-level directory name
+    const repo_root = vcs.runOut(gpa, io, cwd, &.{ "rev-parse", "--show-toplevel" }, null) catch null;
+    defer if (repo_root) |r| gpa.free(r);
+
+    const repo_name = if (repo_root) |r| blk: {
+        const trimmed = std.mem.trim(u8, r, " \t\r\n");
+        break :blk std.fs.path.basename(trimmed);
+    } else std.fs.path.basename(cwd);
+
+    // 2. Get current branch or short commit hash
+    var branch_buf: ?[]u8 = null;
+    defer if (branch_buf) |b| gpa.free(b);
+
+    const branch = if (vcs.currentBranch(gpa, io, cwd)) |b| blk: {
+        branch_buf = b;
+        break :blk b;
+    } else blk: {
+        const short_sha = vcs.runOut(gpa, io, cwd, &.{ "rev-parse", "--short", "HEAD" }, null) catch null;
+        if (short_sha) |s| {
+            branch_buf = s;
+            break :blk std.mem.trim(u8, s, " \t\r\n");
+        }
+        break :blk null;
+    };
+
+    if (branch) |b| {
+        if (b.len > 0) {
+            return std.fmt.allocPrint(gpa, "{s} ⌥ {s}", .{ repo_name, b });
+        }
     }
-    return gpa.dupe(u8, out);
+    return gpa.dupe(u8, repo_name);
+}
+
+test "loadGitLabel returns repo and branch for git repository" {
+    const label = try loadGitLabel(std.testing.allocator, std.testing.io, ".");
+    defer std.testing.allocator.free(label);
+    try std.testing.expect(label.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, label, "⌥") != null);
 }

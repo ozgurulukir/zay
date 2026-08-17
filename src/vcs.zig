@@ -167,7 +167,7 @@ fn run(
 
 /// Run a git subcommand, returning its trimmed stdout on success (code 0) or a
 /// typed error. The caller owns the returned slice.
-fn runOut(
+pub fn runOut(
     gpa: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,

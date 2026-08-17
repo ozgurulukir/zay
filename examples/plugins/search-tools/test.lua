@@ -82,7 +82,12 @@ test.describe("grep regex command construction", function()
     reset()
     bash_reply = { stdout = "", stderr = "", code = 1 }
     grep.handler({ pattern = "it's|that", regex = true })
-    local is_win = (package.config and package.config:sub(1,1) == "\\") or (nova.get_env and nova.get_env("OS") == "Windows_NT") or false
+    local is_win = false
+    if type(package) == "table" and type(package.config) == "string" then
+      is_win = (package.config:sub(1, 1) == "\\")
+    elseif type(nova) == "table" and type(nova.get_env) == "function" then
+      is_win = (nova.get_env("OS") == "Windows_NT")
+    end
     if is_win then
       test.assert.contains([['it''s|that']], last_bash.cmd)
     else

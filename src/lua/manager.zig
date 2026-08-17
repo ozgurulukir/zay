@@ -164,7 +164,6 @@ pub const PluginManager = struct {
             log.warn("plugin.loadOne.init_failed path={s}", .{init_path});
             sandbox.freeHookData(L.handle);
             L.deinit();
-            manifest.deinit(self.allocator);
             return error.PluginInitFailed;
         }
 

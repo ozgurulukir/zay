@@ -8,7 +8,12 @@
 -- the native walker skips dotfiles but scans gitignored dirs (vendor/,
 -- zig-cache/).
 
-local is_windows = (package.config and package.config:sub(1,1) == "\\") or (nova.get_env and nova.get_env("OS") == "Windows_NT") or false
+local is_windows = false
+if type(package) == "table" and type(package.config) == "string" then
+  is_windows = (package.config:sub(1, 1) == "\\")
+elseif type(nova) == "table" and type(nova.get_env) == "function" then
+  is_windows = (nova.get_env("OS") == "Windows_NT")
+end
 
 -- Shell single-quote escaping:
 -- On Windows (PowerShell): wrap in '...' and escape embedded ' as ''
