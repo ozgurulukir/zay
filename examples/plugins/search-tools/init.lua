@@ -8,19 +8,23 @@
 -- the native walker skips dotfiles but scans gitignored dirs (vendor/,
 -- zig-cache/).
 
--- POSIX shell single-quote escaping: wrap in '...' and turn each embedded '
--- into '\''. The shell then passes the bytes through verbatim as ONE argument
--- — no pipe, space, glob, or backslash interpretation. This is the fix for
--- patterns like "mcp__|lua__": interpolated bare into a `bash -c` string, the
--- `|` was parsed as a shell pipe (rg's output went to a nonexistent command
--- and the search silently returned 0). Quoted, rg receives the real pattern.
+local is_windows = (package.config and package.config:sub(1,1) == "\\") or (nova.get_env and nova.get_env("OS") == "Windows_NT") or false
+
+-- Shell single-quote escaping:
+-- On Windows (PowerShell): wrap in '...' and escape embedded ' as ''
+-- On POSIX (Bash): wrap in '...' and escape embedded ' as '\''
 local function shell_quote(s)
-  return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+  local str = tostring(s)
+  if is_windows then
+    return "'" .. str:gsub("'", "''") .. "'"
+  else
+    return "'" .. str:gsub("'", "'\\''") .. "'"
+  end
 end
 
 -- Build the rg invocation as a single shell command string with every dynamic
 -- value quoted (regex mode only). rg exit codes the handler relies on:
--- 0 = matches, 1 = no matches, 2 = error (e.g. bad regex); bash returns 127
+-- 0 = matches, 1 = no matches, 2 = error (e.g. bad regex); shell returns 127
 -- when rg itself is missing.
 local function build_rg_command(pattern, root, include, case_sensitive)
   local argv = { "rg", "--line-number", "--no-heading", "--color", "never" }
@@ -189,7 +193,8 @@ nova.register_tool({
     -- being parsed by the shell.
     local cmd = build_rg_command(params.pattern, root, params.include, case_sensitive)
     -- rg over large repos can exceed the 30 s default; give it a 60 s budget.
-    local bash_result = nova.run_bash(cmd, { cwd = root, timeout = 60 })
+    local shell_runner = nova.run_shell or nova.run_bash
+    local bash_result = shell_runner(cmd, { cwd = root, timeout = 60 })
 
     if bash_result == nil then
       return "Error: regex search failed"

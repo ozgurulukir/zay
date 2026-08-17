@@ -98,6 +98,8 @@ pub fn pullValue(L: *State, comptime T: type, index: c_int) ?T {
 }
 
 /// Read a string field from a table at `table_index`.
+/// Note: The returned slice points to Lua GC memory. Callers must dupe the
+/// string before performing subsequent Lua stack mutations or if the table is popped.
 pub fn getTableString(L: *State, table_index: c_int, key: [:0]const u8) ?[]const u8 {
     const t = c.lua_getfield(L.handle, table_index, key.ptr);
     defer L.pop(1);

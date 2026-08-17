@@ -70,7 +70,7 @@ descriptive names in `register_tool`.
 into a Lua table before the handler is called. You can access `params.param_name`
 directly — no manual JSON parsing needed.
 
-## Available Bridge Functions (25 total)
+## Available Bridge Functions (28 total)
 
 ### Filesystem (no permission needed)
 - `nova.read_file(path, opts?)` → `{path, content, size, lines, language, mime_type}`
@@ -95,8 +95,11 @@ Prefer these dedicated path ops over `nova.run_bash("rm -rf ...")`: they go
 through `sanitizePath` (cwd-confinement guard) and are strictly safer.
 
 ### Shell & Environment (no permission needed)
+- `nova.run_shell(cmd, opts?)` → `{stdout, stderr, code}`
+  - Platform-native shell execution: uses `pwsh.exe` on Windows and `/bin/bash` on POSIX.
+  - opts: `cwd` (default: cwd), `timeout` (default: 30s)
 - `nova.run_bash(cmd, opts?)` → `{stdout, stderr, code}`
-  - opts: `cwd` (default: cwd), `timeout` (default: 10s)
+  - opts: `cwd` (default: cwd), `timeout` (default: 30s)
   - Safe execution via Nova's bash_exec — no `os.execute` needed
 - `nova.get_env(name)` → `string` or `nil`
 - `nova.get_cwd()` → `string`
@@ -107,9 +110,14 @@ through `sanitizePath` (cwd-confinement guard) and are strictly safer.
 - `nova.git_diff(path?)` → `string`
 - `nova.git_log(n)` → `string` (default n=10)
 - `nova.git_branch()` → `string`
-- `nova.git_commit(msg)` → `{success, output}`
+- `nova.git_add(files)` → `{success, output}` (stage specific files or patterns)
+- `nova.git_commit(msg, opts?)` → `{success, output}`
+  - opts: `files` (selective staging), `staged_only` (only staged changes), `stage_all` (all changes)
 
-### Plugin System
+### Plugin System & Modular Code
+- `nova.require(mod_path)` → `any`
+  - Loads a relative Lua module within the plugin directory (e.g. `nova.require("./utils")` or `nova.require("helpers/math")`).
+  - Confined strictly to plugin directory; cached in `nova_loaded_modules`.
 - `nova.register_tool(spec)` → `true` — register a tool for the AI model
 - `nova.on(event, callback)` → `true` — subscribe to lifecycle event
   - Events: `turn_started`, `turn_ended`, `tool_call_started`, `tool_call_finished`, `response_received`, `plugin_loaded`, `plugin_unloaded`

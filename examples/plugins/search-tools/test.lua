@@ -26,6 +26,10 @@ nova = {
     last_bash = { cmd = cmd, opts = opts }
     return bash_reply
   end,
+  run_shell = function(cmd, opts)
+    last_bash = { cmd = cmd, opts = opts }
+    return bash_reply
+  end,
   search_files = function(root, pattern, opts)
     last_search = { root = root, pattern = pattern, opts = opts }
     return search_reply
@@ -78,8 +82,12 @@ test.describe("grep regex command construction", function()
     reset()
     bash_reply = { stdout = "", stderr = "", code = 1 }
     grep.handler({ pattern = "it's|that", regex = true })
-    -- embedded ' becomes '\'' : 'it'\''s|that'
-    test.assert.contains([['it'\''s|that']], last_bash.cmd)
+    local is_win = (package.config and package.config:sub(1,1) == "\\") or (nova.get_env and nova.get_env("OS") == "Windows_NT") or false
+    if is_win then
+      test.assert.contains([['it''s|that']], last_bash.cmd)
+    else
+      test.assert.contains([['it'\''s|that']], last_bash.cmd)
+    end
   end)
 
   test.it("quotes the include glob and a root with spaces", function()

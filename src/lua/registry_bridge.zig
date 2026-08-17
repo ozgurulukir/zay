@@ -114,10 +114,9 @@ pub fn runPluginTool(
             .{ key.plugin_name, key.tool_name, @errorName(err) },
         );
     };
-    defer gpa.free(result_text);
-    const stdout = try gpa.dupe(u8, result_text);
+    errdefer gpa.free(result_text);
     const stderr = try gpa.alloc(u8, 0);
-    return .{ .stdout = stdout, .stderr = stderr, .code = 0 };
+    return .{ .stdout = result_text, .stderr = stderr, .code = 0 };
 }
 
 /// Thread-local slot used by `runPluginTool` to reach the live

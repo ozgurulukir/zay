@@ -256,9 +256,11 @@ pub const State = struct {
 
     /// Format and raise a Lua error. Does not return.
     pub fn raiseError(self: *Self, comptime fmt: []const u8, args: anytype) noreturn {
-        const msg = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch "error";
-        defer std.heap.page_allocator.free(msg);
-        c.luaL_error(self.handle, "%s", @as(*const anyopaque, @ptrCast(msg.ptr)));
+        var buf: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, fmt, args) catch "Lua runtime error";
+        _ = c.lua_pushlstring(self.handle, msg.ptr, msg.len);
+        _ = c.lua_error(self.handle);
+        unreachable;
     }
 };
 
@@ -383,5 +385,25 @@ test "lua state: dump and loadBuffer round-trips" {
     const rc = L.pcall(0, 1);
     try std.testing.expectEqual(@as(c_int, c.LUA_OK), rc);
     try std.testing.expectEqualStrings("hello, bytecode!", L.toString(-1).?);
+    L.pop(1);
+}
+
+test "lua state: raiseError raises error caught by pcall" {
+    var L = try State.init();
+    defer L.deinit();
+
+    const CFunctionHelper = struct {
+        fn testCFunction(raw_L: ?*c.lua_State) callconv(.c) c_int {
+            var st = State{ .handle = raw_L.? };
+            st.raiseError("test error formatted {d}", .{42});
+        }
+    };
+
+    c.lua_pushcfunction(L.handle, CFunctionHelper.testCFunction);
+    const rc = L.pcall(0, 0);
+    try std.testing.expect(rc != c.LUA_OK);
+    const err_msg = L.getErrorMessage();
+    try std.testing.expect(err_msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_msg.?, "test error formatted 42") != null);
     L.pop(1);
 }

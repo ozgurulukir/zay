@@ -104,22 +104,67 @@ nova.register_tool({
   end,
 })
 
+-- ── git_add ─────────────────────────────────────────────────────────
+
+nova.register_tool({
+  name = "git_add",
+  description = "Stage specific file(s) for the next commit. Always stage only the intended modified files rather than staging untracked or scratch files.",
+  parameters = {
+    files = {
+      type = "string",
+      description = "File path or comma-separated list of file paths to stage (e.g. 'src/main.zig, src/tools/git.zig')",
+    },
+  },
+  handler = function(params)
+    if not params.files or params.files == "" then
+      return "Error: files parameter is required"
+    end
+    local result = nova.git_add(params.files)
+    if result == nil then
+      return "Error: git add failed"
+    end
+    if result.success then
+      return "Staged files: " .. params.files
+    end
+    return "Error: git add failed — " .. (result.output or "unknown error")
+  end,
+})
+
 -- ── git_commit ──────────────────────────────────────────────────────
 
 nova.register_tool({
   name = "git_commit",
-  description = "Stage all changes and create a commit with the given message. IMPORTANT: only commit when the user explicitly asks, except lane work — when working in a Nova lane, commit your lane changes with a real message before `lane merge`. Before committing, inspect git_status and git_diff, stage only intended files, and never commit secrets. If a commit fails (e.g. hooks reject it), fix the issue and create a new commit — do not amend the failed commit.",
+  description = "Create a git commit with the given message. Can commit specific files, only staged changes, or all changes (with stage_all). IMPORTANT: only commit when the user explicitly asks, except lane work — when working in a Nova lane, commit your lane changes with a real message before `lane merge`. Before committing, inspect git_status and git_diff, stage only intended files, and never commit secrets. If a commit fails (e.g. hooks reject it), fix the issue and create a new commit — do not amend the failed commit.",
   parameters = {
     message = {
       type = "string",
       description = "Commit message",
+    },
+    files = {
+      type = "string",
+      description = "Optional file path or comma-separated list of files to stage and commit (e.g. 'src/main.zig'). If omitted, commits files already staged via git_add.",
+      optional = true,
+    },
+    stage_all = {
+      type = "boolean",
+      description = "If true, stages all changes (git add -A) before committing. Default is false to prevent accidental commits of untracked or secret files.",
+      optional = true,
     },
   },
   handler = function(params)
     if not params.message or params.message == "" then
       return "Error: commit message is required"
     end
-    local result = nova.git_commit(params.message)
+    local opts = {}
+    if params.files and params.files ~= "" then
+      opts.files = params.files
+    elseif params.stage_all then
+      opts.stage_all = true
+    else
+      opts.staged_only = true
+    end
+
+    local result = nova.git_commit(params.message, opts)
     if result == nil then
       return "Error: git commit failed"
     end

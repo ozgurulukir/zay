@@ -15,7 +15,10 @@ local status_reply = ""
 local diff_reply = ""
 local log_reply = ""
 local commit_reply = nil
+local add_reply = nil
 local last_log_n = nil
+local last_commit_opts = nil
+local last_add_files = nil
 
 nova = {
   register_tool = function(tool)
@@ -28,7 +31,14 @@ nova = {
     last_log_n = n
     return log_reply
   end,
-  git_commit = function() return commit_reply end,
+  git_add = function(files)
+    last_add_files = files
+    return add_reply
+  end,
+  git_commit = function(msg, opts)
+    last_commit_opts = opts
+    return commit_reply
+  end,
 }
 
 local f = assert(io.open("examples/plugins/git-tools/init.lua", "r"))
@@ -40,6 +50,7 @@ local git_status = registered.git_status
 local git_diff = registered.git_diff
 local git_log = registered.git_log
 local git_branch = registered.git_branch
+local git_add = registered.git_add
 local git_commit = registered.git_commit
 
 -- ── S4: git_status not-a-repo handling ──────────────────────────────
@@ -108,6 +119,27 @@ test.describe("git_log integer validation", function()
   end)
 end)
 
+-- ── git_add staging ──────────────────────────────────────────────────
+test.describe("git_add staging", function()
+  test.it("requires files parameter", function()
+    local out = git_add.handler({})
+    test.assert.contains("files parameter is required", out)
+  end)
+
+  test.it("stages files and reports success", function()
+    add_reply = { success = true, output = "" }
+    local out = git_add.handler({ files = "src/main.zig, src/tools/git.zig" })
+    test.assert.equal("src/main.zig, src/tools/git.zig", last_add_files)
+    test.assert.contains("Staged files", out)
+  end)
+
+  test.it("surfaces error on add failure", function()
+    add_reply = { success = false, output = "pathspec 'foo.zig' did not match any files" }
+    local out = git_add.handler({ files = "foo.zig" })
+    test.assert.contains("pathspec 'foo.zig' did not match any files", out)
+  end)
+end)
+
 -- ── S4: git_commit failure surfacing ────────────────────────────────
 
 test.describe("git_commit failure surfacing", function()
@@ -122,9 +154,24 @@ test.describe("git_commit failure surfacing", function()
     test.assert.contains("pre-commit hook failed", out)
   end)
 
-  test.it("reports success when the commit succeeds", function()
+  test.it("defaults to staged_only when files and stage_all are omitted", function()
     commit_reply = { success = true, output = "[main abc123] wip" }
     local out = git_commit.handler({ message = "wip" })
+    test.assert.equal(true, last_commit_opts.staged_only)
+    test.assert.contains("Committed", out)
+  end)
+
+  test.it("passes selective files to commit", function()
+    commit_reply = { success = true, output = "[main abc123] wip" }
+    local out = git_commit.handler({ message = "wip", files = "src/main.zig" })
+    test.assert.equal("src/main.zig", last_commit_opts.files)
+    test.assert.contains("Committed", out)
+  end)
+
+  test.it("passes stage_all when requested", function()
+    commit_reply = { success = true, output = "[main abc123] wip" }
+    local out = git_commit.handler({ message = "wip", stage_all = true })
+    test.assert.equal(true, last_commit_opts.stage_all)
     test.assert.contains("Committed", out)
   end)
 end)

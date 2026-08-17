@@ -141,11 +141,16 @@ pub fn createSandboxedStateWithIo(permissions: Permissions, io: ?std.Io) error{ 
 /// These are safe C functions that plugins can call instead of blocked
 /// libraries like `io.*`.
 fn registerPluginApi(L: *c.lua_State) void {
+    // Initialize module cache in registry
+    c.lua_newtable(L);
+    c.lua_setfield(L, c.LUA_REGISTRYINDEX, "nova_loaded_modules");
+
     // Create the nova table
     c.lua_newtable(L);
 
     // Register each function
     const funcs = [_]struct { name: [:0]const u8, func: c.lua_CFunction }{
+        .{ .name = "require", .func = plugin_api.requireModule },
         .{ .name = "read_file", .func = plugin_api.readFile },
         .{ .name = "write_file", .func = plugin_api.writeFile },
         .{ .name = "edit_file", .func = plugin_api.editFile },
@@ -158,6 +163,7 @@ fn registerPluginApi(L: *c.lua_State) void {
         .{ .name = "move_path", .func = plugin_api.movePath },
         .{ .name = "delete_path", .func = plugin_api.deletePath },
         .{ .name = "run_bash", .func = plugin_api.runBash },
+        .{ .name = "run_shell", .func = plugin_api.runShell },
         .{ .name = "get_env", .func = plugin_api.getEnv },
         .{ .name = "get_cwd", .func = plugin_api.getCwd },
         .{ .name = "get_project_root", .func = plugin_api.getProjectRoot },
@@ -169,6 +175,7 @@ fn registerPluginApi(L: *c.lua_State) void {
         .{ .name = "git_diff", .func = plugin_api.gitDiff },
         .{ .name = "git_log", .func = plugin_api.gitLog },
         .{ .name = "git_branch", .func = plugin_api.gitBranch },
+        .{ .name = "git_add", .func = plugin_api.gitAdd },
         .{ .name = "git_commit", .func = plugin_api.gitCommit },
         .{ .name = "think", .func = plugin_api.think },
     };

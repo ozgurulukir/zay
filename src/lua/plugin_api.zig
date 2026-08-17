@@ -32,6 +32,7 @@ const os = @import("../os.zig");
 const State = @import("state.zig").State;
 const bridge = @import("bridge.zig");
 const bash_exec = @import("../tools/bash_exec.zig");
+const pwsh_exec = @import("../tools/pwsh_exec.zig");
 const sandbox_mod = @import("sandbox.zig");
 
 /// Maximum file size for read_file (1 MB).
@@ -95,6 +96,168 @@ fn getIo(L: *c.lua_State) std.Io {
     defer c.lua_pop(L, 1);
     const ptr = c.lua_touserdata(L, -1);
     return @as(*const std.Io, @ptrCast(@alignCast(ptr))).*;
+}
+
+/// ── nova.require(path) ───────────────────────────────────────────────
+///
+/// Loads a Lua module relative to the plugin's root directory.
+/// Modules are confined to the plugin directory (INV-REQ-1) and cached
+/// in `nova_loaded_modules` (INV-REQ-3).
+pub fn requireModule(L: ?*c.lua_State) callconv(.c) c_int {
+    const L_ptr = L orelse return 0;
+    var state = State{ .handle = L_ptr };
+    const io = getIo(L_ptr);
+
+    const mod_path = bridge.pullValue(&state, []const u8, 1) orelse {
+        state.pushNil();
+        state.pushString("module path argument is required");
+        return 2;
+    };
+
+    // Get plugin root directory from registry
+    _ = c.lua_getfield(L_ptr, c.LUA_REGISTRYINDEX, "nova_plugin_dir");
+    const plugin_dir_str = state.toString(-1);
+    if (plugin_dir_str == null or plugin_dir_str.?.len == 0) {
+        state.pop(1);
+        state.pushNil();
+        state.pushString("nova.require is only available within loaded plugins");
+        return 2;
+    }
+    const plugin_dir = plugin_dir_str.?;
+    const plugin_dir_owned = std.heap.page_allocator.dupe(u8, plugin_dir) catch {
+        state.pop(1);
+        state.pushNil();
+        state.pushString("out of memory");
+        return 2;
+    };
+    defer std.heap.page_allocator.free(plugin_dir_owned);
+    state.pop(1);
+
+    // Normalize module path: strip leading "./" or ".\\" if present
+    const clean_mod_path = if (std.mem.startsWith(u8, mod_path, "./") or std.mem.startsWith(u8, mod_path, ".\\"))
+        mod_path[2..]
+    else
+        mod_path;
+
+    // Resolve candidates:
+    // 1. If clean_mod_path ends with ".lua": try plugin_dir/clean_mod_path
+    // 2. Else: try plugin_dir/clean_mod_path.lua, plugin_dir/clean_mod_path/init.lua, plugin_dir/clean_mod_path
+    const CandidateType = enum { direct, lua_ext, init_lua };
+    const candidates: []const CandidateType = if (std.mem.endsWith(u8, clean_mod_path, ".lua"))
+        &.{.direct}
+    else
+        &.{ .lua_ext, .init_lua, .direct };
+
+    var found_path: ?[]u8 = null;
+    defer if (found_path) |p| std.heap.page_allocator.free(p);
+
+    for (candidates) |cand| {
+        const cand_rel: []u8 = switch (cand) {
+            .direct => std.heap.page_allocator.dupe(u8, clean_mod_path) catch continue,
+            .lua_ext => std.fmt.allocPrint(std.heap.page_allocator, "{s}.lua", .{clean_mod_path}) catch continue,
+            .init_lua => std.fmt.allocPrint(std.heap.page_allocator, "{s}/init.lua", .{clean_mod_path}) catch continue,
+        };
+        defer std.heap.page_allocator.free(cand_rel);
+
+        const resolved = std.fs.path.resolve(std.heap.page_allocator, &.{ plugin_dir_owned, cand_rel }) catch continue;
+        errdefer std.heap.page_allocator.free(resolved);
+
+        // Confinement check (INV-REQ-1):
+        if (!std.mem.startsWith(u8, resolved, plugin_dir_owned) or
+            (resolved.len > plugin_dir_owned.len and resolved[plugin_dir_owned.len] != std.fs.path.sep))
+        {
+            std.heap.page_allocator.free(resolved);
+            state.pushNil();
+            state.pushString("access denied: cannot require module outside plugin directory");
+            return 2;
+        }
+
+        // Check if file exists
+        if (std.Io.Dir.accessAbsolute(io, resolved, .{})) |_| {
+            found_path = resolved;
+            break;
+        } else |_| {
+            std.heap.page_allocator.free(resolved);
+        }
+    }
+
+    const resolved_path = found_path orelse {
+        state.pushNil();
+        state.pushString("module not found");
+        return 2;
+    };
+
+    // Check registry table nova_loaded_modules
+    _ = c.lua_getfield(L_ptr, c.LUA_REGISTRYINDEX, "nova_loaded_modules");
+    const reg_tbl_idx = c.lua_gettop(L_ptr);
+
+    const resolved_path_z = std.heap.page_allocator.dupeZ(u8, resolved_path) catch {
+        c.lua_pop(L_ptr, 1);
+        state.pushNil();
+        state.pushString("out of memory");
+        return 2;
+    };
+    defer std.heap.page_allocator.free(resolved_path_z);
+
+    _ = c.lua_getfield(L_ptr, reg_tbl_idx, resolved_path_z.ptr);
+    if (!c.lua_isnil(L_ptr, -1)) {
+        // Module is already loaded/cached. Remove the cache table from under the value.
+        c.lua_remove(L_ptr, reg_tbl_idx);
+        return 1;
+    }
+    // Pop the nil
+    c.lua_pop(L_ptr, 1);
+
+    // Read module file
+    const content = readFileBytes(io, resolved_path, max_read_size) catch |err| {
+        c.lua_pop(L_ptr, 1); // pop reg_tbl
+        state.pushNil();
+        state.pushString(@errorName(err));
+        return 2;
+    };
+    defer std.heap.page_allocator.free(content);
+
+    // Load chunk
+    const load_rc = c.luaL_loadbufferx(L_ptr, content.ptr, content.len, resolved_path_z.ptr, null);
+    if (load_rc != c.LUA_OK) {
+        c.lua_pop(L_ptr, 1); // pop reg_tbl
+        // Error message is on top of stack from loadbuffer
+        state.pushNil();
+        c.lua_insert(L_ptr, -2); // swap so nil is 1st and err msg is 2nd
+        return 2;
+    }
+
+    // Mark module as loading (boolean true sentinel to guard circular require)
+    c.lua_pushboolean(L_ptr, 1);
+    c.lua_setfield(L_ptr, reg_tbl_idx, resolved_path_z.ptr);
+
+    // Execute chunk under pcall(0, 1)
+    const run_rc = c.lua_pcallk(L_ptr, 0, 1, 0, 0, null);
+    if (run_rc != c.LUA_OK) {
+        // Clear cache on failure
+        c.lua_pushnil(L_ptr);
+        c.lua_setfield(L_ptr, reg_tbl_idx, resolved_path_z.ptr);
+        c.lua_remove(L_ptr, reg_tbl_idx); // remove reg table
+        // Error message is on top of stack
+        state.pushNil();
+        c.lua_insert(L_ptr, -2);
+        return 2;
+    }
+
+    // Successful execution:
+    // If the module returned nil, default to boolean true (standard Lua require convention)
+    if (state.isNil(-1)) {
+        c.lua_pop(L_ptr, 1);
+        c.lua_pushboolean(L_ptr, 1);
+    }
+
+    // Cache the return value
+    c.lua_pushvalue(L_ptr, -1);
+    c.lua_setfield(L_ptr, reg_tbl_idx, resolved_path_z.ptr);
+
+    // Remove the cache table, leaving the return value on top
+    c.lua_remove(L_ptr, reg_tbl_idx);
+    return 1;
 }
 
 /// ── nova.read_file(path, opts?) ──────────────────────────────────────
@@ -547,20 +710,37 @@ pub fn matchGlob(name: []const u8, pattern: []const u8) bool {
     return globMatchSegment(name, pattern);
 }
 
-/// Recursive segment-aware glob matcher. `*` and `?` stop at `/`; only `**`
+fn isPathSep(byte: u8) bool {
+    return byte == '/' or byte == '\\';
+}
+
+fn appendSegments(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), path: []const u8) !void {
+    var start: usize = 0;
+    for (path, 0..) |b, i| {
+        if (isPathSep(b)) {
+            if (i > start) try list.append(allocator, path[start..i]);
+            start = i + 1;
+        }
+    }
+    if (start < path.len) {
+        try list.append(allocator, path[start..]);
+    }
+}
+
+/// Recursive segment-aware glob matcher. `*` and `?` stop at `/` or `\`; only `**`
 /// spans separators. Implemented iteratively over pattern segments to keep the
 /// recursion bounded by pattern length (not input length).
 fn globMatchSegment(name: []const u8, pattern: []const u8) bool {
-    // Split the pattern and name into `/`-delimited segments and match segment
+    // Split the pattern and name into `/` and `\`-delimited segments and match segment
     // by segment. A `**` segment consumes zero or more name segments.
-    var n_it = std.mem.splitScalar(u8, name, '/');
-    var p_it = std.mem.splitScalar(u8, pattern, '/');
     var n_segs: std.ArrayList([]const u8) = .empty;
     defer n_segs.deinit(std.heap.page_allocator);
     var p_segs: std.ArrayList([]const u8) = .empty;
     defer p_segs.deinit(std.heap.page_allocator);
-    while (n_it.next()) |s| n_segs.append(std.heap.page_allocator, s) catch return false;
-    while (p_it.next()) |s| p_segs.append(std.heap.page_allocator, s) catch return false;
+
+    appendSegments(std.heap.page_allocator, &n_segs, name) catch return false;
+    appendSegments(std.heap.page_allocator, &p_segs, pattern) catch return false;
+
     return globMatchSegs(n_segs.items, p_segs.items);
 }
 
@@ -772,23 +952,26 @@ pub fn deletePath(L: ?*c.lua_State) callconv(.c) c_int {
     };
     defer std.heap.page_allocator.free(clean_path);
 
-    // Stat to decide file vs directory, then call the matching deleter. This
-    // avoids relying on error-kind discrimination from the delete call.
-    var dir = std.Io.Dir.openDirAbsolute(io, clean_path, .{}) catch |err| {
+    // Prevent deleting the workspace root itself
+    var cwd_buf: ?[]u8 = null;
+    defer if (cwd_buf) |b| std.heap.page_allocator.free(b);
+    const cwd: []const u8 = if (bridge.plugin_cwd_slot) |s| s else blk: {
+        cwd_buf = std.process.currentPathAlloc(io, std.heap.page_allocator) catch null;
+        break :blk if (cwd_buf) |b| b else "";
+    };
+    if (cwd.len > 0 and std.mem.eql(u8, clean_path, cwd)) {
         state.pushNil();
-        state.pushString(@errorName(err));
+        state.pushString("cannot delete project root directory");
         return 2;
-    };
-    const is_dir = blk: {
-        const dstat = dir.stat(io) catch {
-            dir.close(io);
-            state.pushNil();
-            state.pushString("stat failed");
-            return 2;
-        };
-        break :blk dstat.kind == .directory;
-    };
-    dir.close(io);
+    }
+
+    // Stat to decide file vs directory, then call the matching deleter.
+    // Try opening as directory first. If it succeeds, it's a directory; if not, treat as file.
+    var is_dir = false;
+    if (std.Io.Dir.openDirAbsolute(io, clean_path, .{})) |*dir| {
+        dir.close(io);
+        is_dir = true;
+    } else |_| {}
 
     if (is_dir) {
         if (recursive) {
@@ -897,7 +1080,7 @@ pub fn fileInfo(L: ?*c.lua_State) callconv(.c) c_int {
 ///   timeout (number) — timeout in seconds (default: 30)
 ///
 /// Returns nil + error message on failure.
-pub fn runBash(L: ?*c.lua_State) callconv(.c) c_int {
+fn runShellWithBackend(L: ?*c.lua_State, backend: enum { bash, pwsh }) c_int {
     const L_ptr = L orelse return 0;
     var state = State{ .handle = L_ptr };
     const io = getIo(L_ptr);
@@ -923,6 +1106,13 @@ pub fn runBash(L: ?*c.lua_State) callconv(.c) c_int {
             return 2;
         };
     } else blk: {
+        if (bridge.plugin_cwd_slot) |slot_cwd| {
+            break :blk std.heap.page_allocator.dupe(u8, slot_cwd) catch {
+                state.pushNil();
+                state.pushString("out of memory");
+                return 2;
+            };
+        }
         break :blk std.process.currentPathAlloc(io, std.heap.page_allocator) catch {
             state.pushNil();
             state.pushString("could not resolve cwd");
@@ -931,25 +1121,71 @@ pub fn runBash(L: ?*c.lua_State) callconv(.c) c_int {
     };
     defer std.heap.page_allocator.free(resolved_cwd);
 
-    var result = bash_exec.runWithOptions(std.heap.page_allocator, io, .{
-        .cwd = resolved_cwd,
-        .command = cmd,
-        .timeout = bash_exec.timeoutFromSeconds(timeout_seconds),
-    }) catch |err| {
-        state.pushNil();
-        state.pushString(@errorName(err));
-        return 2;
-    };
-    defer result.deinit(std.heap.page_allocator);
+    if (backend == .pwsh) {
+        var result = pwsh_exec.runWithOptions(std.heap.page_allocator, io, .{
+            .cwd = resolved_cwd,
+            .command = cmd,
+            .timeout = pwsh_exec.timeoutFromSeconds(timeout_seconds),
+        }) catch |err| {
+            state.pushNil();
+            state.pushString(@errorName(err));
+            return 2;
+        };
+        defer result.deinit(std.heap.page_allocator);
 
-    state.newTable();
-    state.pushString(result.stdout);
-    _ = c.lua_setfield(L_ptr, -2, "stdout");
-    state.pushString(result.stderr);
-    _ = c.lua_setfield(L_ptr, -2, "stderr");
-    state.pushInteger(@as(i64, @intCast(result.code)));
-    _ = c.lua_setfield(L_ptr, -2, "code");
-    return 1;
+        state.newTable();
+        state.pushString(result.stdout);
+        _ = c.lua_setfield(L_ptr, -2, "stdout");
+        state.pushString(result.stderr);
+        _ = c.lua_setfield(L_ptr, -2, "stderr");
+        state.pushInteger(@as(i64, @intCast(result.code)));
+        _ = c.lua_setfield(L_ptr, -2, "code");
+        return 1;
+    } else {
+        var result = bash_exec.runWithOptions(std.heap.page_allocator, io, .{
+            .cwd = resolved_cwd,
+            .command = cmd,
+            .timeout = bash_exec.timeoutFromSeconds(timeout_seconds),
+        }) catch |err| {
+            state.pushNil();
+            state.pushString(@errorName(err));
+            return 2;
+        };
+        defer result.deinit(std.heap.page_allocator);
+
+        state.newTable();
+        state.pushString(result.stdout);
+        _ = c.lua_setfield(L_ptr, -2, "stdout");
+        state.pushString(result.stderr);
+        _ = c.lua_setfield(L_ptr, -2, "stderr");
+        state.pushInteger(@as(i64, @intCast(result.code)));
+        _ = c.lua_setfield(L_ptr, -2, "code");
+        return 1;
+    }
+}
+
+/// ── nova.run_bash(cmd, opts?) ────────────────────────────────────────
+///
+/// Runs a bash command and returns a table with:
+///   { stdout, stderr, code }
+///
+/// Optional `opts` table fields:
+///   cwd     (string) — working directory (default: project root)
+///   timeout (number) — timeout in seconds (default: 30)
+///
+/// Returns nil + error message on failure.
+pub fn runBash(L: ?*c.lua_State) callconv(.c) c_int {
+    return runShellWithBackend(L, .bash);
+}
+
+/// ── nova.run_shell(cmd, opts?) ───────────────────────────────────────
+///
+/// Runs a shell command using the host platform's native shell:
+/// PowerShell (`pwsh.exe`) on Windows, bash on POSIX.
+/// Returns a table with:
+///   { stdout, stderr, code }
+pub fn runShell(L: ?*c.lua_State) callconv(.c) c_int {
+    return runShellWithBackend(L, if (os.is_windows) .pwsh else .bash);
 }
 
 /// ── nova.get_env(name) ───────────────────────────────────────────────
@@ -1207,10 +1443,132 @@ pub fn gitBranch(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// ── nova.git_commit(msg) ────────────────────────────────────────────
+/// Helper: shell-quote an argument using single quotes and append to ArrayList.
+fn appendQuotedArg(list: *std.ArrayList(u8), gpa: std.mem.Allocator, arg: []const u8) !void {
+    try list.append(gpa, '\'');
+    for (arg) |byte| {
+        if (byte == '\'') {
+            try list.appendSlice(gpa, "'\\''");
+        } else {
+            try list.append(gpa, byte);
+        }
+    }
+    try list.append(gpa, '\'');
+}
+
+/// ── nova.git_add(files) ─────────────────────────────────────────────
+///
+/// Stages specific files for git commit. Accepts a single file path string,
+/// or an array of file path strings. Returns { success, output }.
+pub fn gitAdd(L: ?*c.lua_State) callconv(.c) c_int {
+    const L_ptr = L orelse return 0;
+    var state = State{ .handle = L_ptr };
+    const io = getIo(L_ptr);
+
+    if (state.getTop() < 1 or state.isNil(1)) {
+        state.pushNil();
+        state.pushString("files argument is required");
+        return 2;
+    }
+
+    var cwd_buf: ?[]u8 = null;
+    defer if (cwd_buf) |b| std.heap.page_allocator.free(b);
+
+    const cwd: []const u8 = if (bridge.plugin_cwd_slot) |slot_cwd|
+        slot_cwd
+    else blk: {
+        cwd_buf = std.process.currentPathAlloc(io, std.heap.page_allocator) catch {
+            state.pushNil();
+            state.pushString("could not resolve cwd");
+            return 2;
+        };
+        break :blk cwd_buf.?;
+    };
+
+    var cmd_buf: std.ArrayList(u8) = .empty;
+    defer cmd_buf.deinit(std.heap.page_allocator);
+
+    cmd_buf.appendSlice(std.heap.page_allocator, "git add --") catch {
+        state.pushNil();
+        state.pushString("out of memory");
+        return 2;
+    };
+
+    if (state.isString(1)) {
+        const file_str = state.toString(1) orelse {
+            state.pushNil();
+            state.pushString("invalid files string");
+            return 2;
+        };
+        if (std.mem.eql(u8, file_str, ".") or std.mem.eql(u8, file_str, "-A")) {
+            cmd_buf.clearRetainingCapacity();
+            cmd_buf.appendSlice(std.heap.page_allocator, "git add -A") catch {
+                state.pushNil();
+                state.pushString("out of memory");
+                return 2;
+            };
+        } else {
+            var it = std.mem.tokenizeScalar(u8, file_str, ',');
+            while (it.next()) |item| {
+                const trimmed = std.mem.trim(u8, item, " \t\r\n");
+                if (trimmed.len == 0) continue;
+                cmd_buf.append(std.heap.page_allocator, ' ') catch continue;
+                appendQuotedArg(&cmd_buf, std.heap.page_allocator, trimmed) catch continue;
+            }
+        }
+    } else if (state.isTable(1)) {
+        const len = c.lua_rawlen(L_ptr, 1);
+        var i: usize = 1;
+        while (i <= len) : (i += 1) {
+            _ = c.lua_rawgeti(L_ptr, 1, @intCast(i));
+            if (state.isString(-1)) {
+                if (state.toString(-1)) |s| {
+                    cmd_buf.append(std.heap.page_allocator, ' ') catch continue;
+                    appendQuotedArg(&cmd_buf, std.heap.page_allocator, s) catch continue;
+                }
+            }
+            c.lua_pop(L_ptr, 1);
+        }
+    } else {
+        state.pushNil();
+        state.pushString("files argument must be a string or table of strings");
+        return 2;
+    }
+
+    const cmd = cmd_buf.toOwnedSlice(std.heap.page_allocator) catch {
+        state.pushNil();
+        state.pushString("out of memory");
+        return 2;
+    };
+    defer std.heap.page_allocator.free(cmd);
+
+    var result = bash_exec.runWithOptions(std.heap.page_allocator, io, .{
+        .cwd = cwd,
+        .command = cmd,
+    }) catch |err| {
+        state.pushNil();
+        state.pushString(@errorName(err));
+        return 2;
+    };
+    defer result.deinit(std.heap.page_allocator);
+
+    state.newTable();
+    state.pushBoolean(result.code == 0);
+    _ = c.lua_setfield(L_ptr, -2, "success");
+    state.pushString(if (result.code == 0) result.stdout else result.stderr);
+    _ = c.lua_setfield(L_ptr, -2, "output");
+    return 1;
+}
+
+/// ── nova.git_commit(msg, opts?) ────────────────────────────────────
 ///
 /// Creates a git commit with the given message. Returns { success, output }
 /// (output = git stderr on failure, or the commit summary on success).
+///
+/// Optional `opts` table fields:
+///   files       (string or array of strings) — stage specific files before commit
+///   staged_only (boolean) — only commit already-staged files (no git add)
+///   stage_all   (boolean) — stage all changes (git add -A) before commit
 pub fn gitCommit(L: ?*c.lua_State) callconv(.c) c_int {
     const L_ptr = L orelse return 0;
     var state = State{ .handle = L_ptr };
@@ -1222,22 +1580,91 @@ pub fn gitCommit(L: ?*c.lua_State) callconv(.c) c_int {
         return 2;
     };
 
-    const cwd: []const u8 = if (bridge.plugin_cwd_slot) |slot_cwd| slot_cwd else blk: {
-        const p = std.process.currentPathAlloc(io, std.heap.page_allocator) catch {
+    var cwd_buf: ?[]u8 = null;
+    defer if (cwd_buf) |b| std.heap.page_allocator.free(b);
+
+    const cwd: []const u8 = if (bridge.plugin_cwd_slot) |slot_cwd|
+        slot_cwd
+    else blk: {
+        cwd_buf = std.process.currentPathAlloc(io, std.heap.page_allocator) catch {
             state.pushNil();
             state.pushString("could not resolve cwd");
             return 2;
         };
-        defer std.heap.page_allocator.free(p);
-        break :blk p;
+        break :blk cwd_buf.?;
     };
 
-    // Stage all and commit. The message is piped via stdin to `git commit -F -`
-    // so shell metacharacters in `msg` are never interpreted — embedding it in
-    // `-m "{msg}"` would let `msg = 'x"; rm -rf ~; #'` break out of the quotes.
+    var cmd_buf: std.ArrayList(u8) = .empty;
+    defer cmd_buf.deinit(std.heap.page_allocator);
+
+    var has_custom_command = false;
+
+    if (state.getTop() >= 2 and state.isTable(2)) {
+        if (bridge.getTableBoolean(&state, 2, "staged_only")) |staged_only| {
+            if (staged_only) {
+                cmd_buf.appendSlice(std.heap.page_allocator, "git commit -F -") catch {};
+                has_custom_command = true;
+            }
+        }
+
+        if (!has_custom_command) {
+            _ = c.lua_getfield(L_ptr, 2, "files");
+            if (!state.isNil(-1)) {
+                if (state.isString(-1)) {
+                    if (state.toString(-1)) |f_str| {
+                        cmd_buf.appendSlice(std.heap.page_allocator, "git add --") catch {};
+                        var it = std.mem.tokenizeScalar(u8, f_str, ',');
+                        while (it.next()) |item| {
+                            const trimmed = std.mem.trim(u8, item, " \t\r\n");
+                            if (trimmed.len == 0) continue;
+                            cmd_buf.append(std.heap.page_allocator, ' ') catch continue;
+                            appendQuotedArg(&cmd_buf, std.heap.page_allocator, trimmed) catch continue;
+                        }
+                        cmd_buf.appendSlice(std.heap.page_allocator, " && git commit -F -") catch {};
+                        has_custom_command = true;
+                    }
+                } else if (state.isTable(-1)) {
+                    cmd_buf.appendSlice(std.heap.page_allocator, "git add --") catch {};
+                    const len = c.lua_rawlen(L_ptr, -1);
+                    var i: usize = 1;
+                    while (i <= len) : (i += 1) {
+                        _ = c.lua_rawgeti(L_ptr, -1, @intCast(i));
+                        if (state.isString(-1)) {
+                            if (state.toString(-1)) |s| {
+                                cmd_buf.append(std.heap.page_allocator, ' ') catch continue;
+                                appendQuotedArg(&cmd_buf, std.heap.page_allocator, s) catch continue;
+                            }
+                        }
+                        c.lua_pop(L_ptr, 1);
+                    }
+                    cmd_buf.appendSlice(std.heap.page_allocator, " && git commit -F -") catch {};
+                    has_custom_command = true;
+                }
+            }
+            c.lua_pop(L_ptr, 1); // pop "files"
+        }
+    }
+
+    if (!has_custom_command) {
+        cmd_buf.appendSlice(std.heap.page_allocator, "git add -A && git commit -F -") catch {
+            state.pushNil();
+            state.pushString("out of memory");
+            return 2;
+        };
+    }
+
+    const cmd = cmd_buf.toOwnedSlice(std.heap.page_allocator) catch {
+        state.pushNil();
+        state.pushString("out of memory");
+        return 2;
+    };
+    defer std.heap.page_allocator.free(cmd);
+
+    // Stage and commit. The message is piped via stdin to `git commit -F -`
+    // so shell metacharacters in `msg` are never interpreted.
     var result = bash_exec.runWithOptions(std.heap.page_allocator, io, .{
         .cwd = cwd,
-        .command = "git add -A && git commit -F -",
+        .command = cmd,
         .stdin = msg,
     }) catch |err| {
         state.pushNil();
@@ -1249,7 +1676,7 @@ pub fn gitCommit(L: ?*c.lua_State) callconv(.c) c_int {
     state.newTable();
     state.pushBoolean(result.code == 0);
     _ = c.lua_setfield(L_ptr, -2, "success");
-    state.pushString(result.stderr);
+    state.pushString(if (result.code == 0) result.stdout else result.stderr);
     _ = c.lua_setfield(L_ptr, -2, "output");
     return 1;
 }
@@ -1903,8 +2330,26 @@ pub fn callToolHandler(
 /// written), fall back to the lexical verdict.
 fn sanitizePath(io: std.Io, path: []const u8) ![]u8 {
     if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidPath;
-    const cwd = try std.process.currentPathAlloc(io, std.heap.page_allocator);
-    defer std.heap.page_allocator.free(cwd);
+
+    var cwd_buf: ?[]u8 = null;
+    defer if (cwd_buf) |b| std.heap.page_allocator.free(b);
+
+    const raw_cwd: []const u8 = if (bridge.plugin_cwd_slot) |slot_cwd|
+        slot_cwd
+    else blk: {
+        cwd_buf = try std.process.currentPathAlloc(io, std.heap.page_allocator);
+        break :blk cwd_buf.?;
+    };
+
+    var abs_cwd_buf: ?[]u8 = null;
+    defer if (abs_cwd_buf) |b| std.heap.page_allocator.free(b);
+    const cwd = if (std.fs.path.isAbsolute(raw_cwd))
+        raw_cwd
+    else blk: {
+        abs_cwd_buf = try std.fs.path.resolve(std.heap.page_allocator, &.{raw_cwd});
+        break :blk abs_cwd_buf.?;
+    };
+
     const resolved = try std.fs.path.resolve(std.heap.page_allocator, &.{ cwd, path });
     errdefer std.heap.page_allocator.free(resolved);
     if (!std.mem.startsWith(u8, resolved, cwd)) return error.PathTraversal;
@@ -2069,23 +2514,45 @@ fn getExtension(path: []const u8) []const u8 {
 
 /// Find git repository root by walking up from `cwd`.
 fn findGitRoot(io: std.Io, cwd: []const u8) ![]u8 {
-    var current = try std.heap.page_allocator.dupe(u8, cwd);
+    var abs_cwd_buf: ?[]u8 = null;
+    defer if (abs_cwd_buf) |b| std.heap.page_allocator.free(b);
+
+    const abs_cwd = if (std.fs.path.isAbsolute(cwd))
+        cwd
+    else blk: {
+        const proc_cwd = try std.process.currentPathAlloc(io, std.heap.page_allocator);
+        defer std.heap.page_allocator.free(proc_cwd);
+        abs_cwd_buf = try std.fs.path.resolve(std.heap.page_allocator, &.{ proc_cwd, cwd });
+        break :blk abs_cwd_buf.?;
+    };
+
+    var current = try std.heap.page_allocator.dupe(u8, abs_cwd);
     defer std.heap.page_allocator.free(current);
 
     while (current.len > 0) {
         const git_path = try std.fs.path.join(std.heap.page_allocator, &.{ current, ".git" });
         defer std.heap.page_allocator.free(git_path);
 
-        var file = std.Io.Dir.openFileAbsolute(io, git_path, .{}) catch {
-            // Go up one directory
-            const parent = std.fs.path.dirname(current) orelse break;
-            const new_current = try std.heap.page_allocator.dupe(u8, parent);
-            std.heap.page_allocator.free(current);
-            current = new_current;
-            continue;
-        };
-        file.close(io);
-        return try std.heap.page_allocator.dupe(u8, current);
+        var is_git = false;
+        if (std.Io.Dir.openDirAbsolute(io, git_path, .{})) |*d| {
+            d.close(io);
+            is_git = true;
+        } else |_| {
+            if (std.Io.Dir.openFileAbsolute(io, git_path, .{})) |*f| {
+                f.close(io);
+                is_git = true;
+            } else |_| {}
+        }
+
+        if (is_git) {
+            return try std.heap.page_allocator.dupe(u8, current);
+        }
+
+        const parent = std.fs.path.dirname(current) orelse break;
+        if (std.mem.eql(u8, parent, current)) break;
+        const new_current = try std.heap.page_allocator.dupe(u8, parent);
+        std.heap.page_allocator.free(current);
+        current = new_current;
     }
 
     return error.GitRootNotFound;
@@ -3219,6 +3686,258 @@ test "git bridges return strings inside a repo (S4 success path)" {
         \\assert(type(l) == "string", "git_log returns a string in a repo, got " .. type(l))
         \\local b = nova.git_branch()
         \\assert(type(b) == "string", "git_branch returns a string in a repo, got " .. type(b))
+        \\return "OK"
+    );
+}
+
+test "plugin_api: deletePath removes regular file, empty dir, and recursive tree" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const test_base = ".zig-cache/test_delete_path_fixture";
+    std.Io.Dir.cwd().deleteTree(io, test_base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, test_base);
+    defer std.Io.Dir.cwd().deleteTree(io, test_base) catch {};
+
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+
+    // 1. Create and delete regular file
+    const file_rel = test_base ++ "/sample.txt";
+    var file = try std.Io.Dir.cwd().createFile(io, file_rel, .{});
+    file.close(io);
+
+    try expectLuaOk(&L,
+        \\local ok, err = nova.delete_path(".zig-cache/test_delete_path_fixture/sample.txt")
+        \\assert(ok == true, "delete file failed: " .. tostring(err))
+        \\return "OK"
+    );
+
+    // 2. Create and delete empty directory
+    const dir_rel = test_base ++ "/empty_dir";
+    try std.Io.Dir.cwd().createDirPath(io, dir_rel);
+
+    try expectLuaOk(&L,
+        \\local ok, err = nova.delete_path(".zig-cache/test_delete_path_fixture/empty_dir")
+        \\assert(ok == true, "delete empty dir failed: " .. tostring(err))
+        \\return "OK"
+    );
+
+    // 3. Create and delete recursive tree
+    const tree_rel = test_base ++ "/tree_dir";
+    try std.Io.Dir.cwd().createDirPath(io, tree_rel ++ "/sub");
+    var subfile = try std.Io.Dir.cwd().createFile(io, tree_rel ++ "/sub/nested.txt", .{});
+    subfile.close(io);
+
+    try expectLuaOk(&L,
+        \\local ok, err = nova.delete_path(".zig-cache/test_delete_path_fixture/tree_dir", { recursive = true })
+        \\assert(ok == true, "delete tree failed: " .. tostring(err))
+        \\return "OK"
+    );
+}
+
+test "plugin_api: sanitizePath respects bridge.plugin_cwd_slot" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    const fake_worktree = ".zig-cache/test_fake_worktree";
+    std.Io.Dir.cwd().deleteTree(io, fake_worktree) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, fake_worktree);
+    defer std.Io.Dir.cwd().deleteTree(io, fake_worktree) catch {};
+
+    const abs_worktree = try std.fs.path.resolve(gpa, &.{fake_worktree});
+    defer gpa.free(abs_worktree);
+
+    bridge.plugin_cwd_slot = abs_worktree;
+    defer {
+        bridge.plugin_cwd_slot = null;
+    }
+
+    const sanitized = try sanitizePath(io, "file.txt");
+    defer std.heap.page_allocator.free(sanitized);
+
+    try std.testing.expect(std.mem.startsWith(u8, sanitized, abs_worktree));
+}
+
+test "plugin_api: findGitRoot finds directory .git and file .git worktree" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const test_dir = ".zig-cache/test_git_root_fixture";
+    std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, test_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
+
+    // 1. Directory .git
+    const dir_repo = test_dir ++ "/dir_repo";
+    try std.Io.Dir.cwd().createDirPath(io, dir_repo ++ "/.git");
+    try std.Io.Dir.cwd().createDirPath(io, dir_repo ++ "/src/nested");
+
+    const abs_dir_nested = try std.fs.path.resolve(gpa, &.{ root, dir_repo ++ "/src/nested" });
+    defer gpa.free(abs_dir_nested);
+
+    const root1 = try findGitRoot(io, abs_dir_nested);
+    defer std.heap.page_allocator.free(root1);
+
+    const abs_dir_repo = try std.fs.path.resolve(gpa, &.{ root, dir_repo });
+    defer gpa.free(abs_dir_repo);
+    try std.testing.expectEqualStrings(abs_dir_repo, root1);
+
+    // 2. File .git (worktree mock)
+    const file_repo = test_dir ++ "/file_repo";
+    try std.Io.Dir.cwd().createDirPath(io, file_repo ++ "/src/nested");
+    var gitfile = try std.Io.Dir.cwd().createFile(io, file_repo ++ "/.git", .{});
+    gitfile.close(io);
+
+    const abs_file_nested = try std.fs.path.resolve(gpa, &.{ root, file_repo ++ "/src/nested" });
+    defer gpa.free(abs_file_nested);
+
+    const root2 = try findGitRoot(io, abs_file_nested);
+    defer std.heap.page_allocator.free(root2);
+
+    const abs_file_repo = try std.fs.path.resolve(gpa, &.{ root, file_repo });
+    defer gpa.free(abs_file_repo);
+    try std.testing.expectEqualStrings(abs_file_repo, root2);
+}
+
+test "plugin_api: globMatchSegment handles Windows backslashes and forward slashes interchangeably" {
+    // 1. Windows path with forward-slash glob pattern
+    try std.testing.expect(globMatchSegment("src\\tools\\bash.zig", "src/**/*.zig"));
+    try std.testing.expect(globMatchSegment("src\\tools\\bash.zig", "src/*/*.zig"));
+    try std.testing.expect(globMatchSegment("src\\tools\\bash.zig", "**/*.zig"));
+    try std.testing.expect(globMatchSegment("src\\tools\\bash.zig", "src/tools/bash.zig"));
+
+    // 2. Windows path with backslash glob pattern
+    try std.testing.expect(globMatchSegment("src\\tools\\bash.zig", "src\\**\\*.zig"));
+    try std.testing.expect(globMatchSegment("src\\tools\\bash.zig", "src\\*\\*.zig"));
+
+    // 3. POSIX path with forward-slash pattern
+    try std.testing.expect(globMatchSegment("src/tools/bash.zig", "src/**/*.zig"));
+    try std.testing.expect(globMatchSegment("src/tools/bash.zig", "**/*.zig"));
+
+    // 4. Non-matching paths
+    try std.testing.expect(!globMatchSegment("src\\tools\\bash.zig", "src/*.zig"));
+    try std.testing.expect(!globMatchSegment("src\\tools\\bash.zig", "lib/**/*.zig"));
+}
+
+test "plugin_api: run_shell executes native shell on current OS" {
+    const io = std.testing.io;
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{ .allow_os_execute = true }, io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+
+    try expectLuaOk(&L,
+        \\local res, err = nova.run_shell("echo nova_shell_ok")
+        \\assert(res ~= nil, "run_shell failed: " .. tostring(err))
+        \\assert(res.code == 0, "run_shell exited with non-zero code: " .. tostring(res.code))
+        \\assert(string.find(res.stdout, "nova_shell_ok") ~= nil, "stdout did not contain expected message: " .. tostring(res.stdout))
+        \\return "OK"
+    );
+}
+
+test "plugin_api: nova.require loads modules, caches results, and rejects breakouts" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const test_plugin_dir = ".zig-cache/test_multi_file_plugin";
+    std.Io.Dir.cwd().deleteTree(io, test_plugin_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, test_plugin_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, test_plugin_dir) catch {};
+
+    // 1. Create helper.lua
+    var buf: [4096]u8 = undefined;
+    var helper_file = try std.Io.Dir.cwd().createFile(io, test_plugin_dir ++ "/helper.lua", .{});
+    var w1 = helper_file.writer(io, &buf);
+    try w1.interface.writeAll(
+        \\local M = { count = 1 }
+        \\function M.add(a, b) return a + b end
+        \\return M
+    );
+    try w1.interface.flush();
+    helper_file.close(io);
+
+    // 2. Create submod/init.lua
+    try std.Io.Dir.cwd().createDirPath(io, test_plugin_dir ++ "/submod");
+    var submod_file = try std.Io.Dir.cwd().createFile(io, test_plugin_dir ++ "/submod/init.lua", .{});
+    var w2 = submod_file.writer(io, &buf);
+    try w2.interface.writeAll(
+        \\return { name = "submodule" }
+    );
+    try w2.interface.flush();
+    submod_file.close(io);
+
+    const abs_plugin_dir = try std.fs.path.resolve(gpa, &.{ root, test_plugin_dir });
+    defer gpa.free(abs_plugin_dir);
+
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+
+    // Set plugin directory in registry
+    _ = c.lua_pushlstring(L.handle, abs_plugin_dir.ptr, abs_plugin_dir.len);
+    c.lua_setfield(L.handle, c.LUA_REGISTRYINDEX, "nova_plugin_dir");
+
+    // Test relative require and caching
+    try expectLuaOk(&L,
+        \\local helper1 = nova.require("./helper")
+        \\assert(type(helper1) == "table", "expected table, got " .. type(helper1))
+        \\assert(helper1.add(10, 20) == 30, "add failed")
+        \\
+        \\-- Modify table to verify caching
+        \\helper1.count = 42
+        \\local helper2 = nova.require("helper.lua")
+        \\assert(helper2.count == 42, "cache failed: did not get same instance")
+        \\
+        \\-- Require submod/init.lua
+        \\local submod = nova.require("submod")
+        \\assert(submod.name == "submodule", "submod require failed")
+        \\
+        \\-- Reject breakout attempt
+        \\local outside, err = nova.require("../outside")
+        \\assert(outside == nil, "breakout should have failed")
+        \\assert(string.find(err, "access denied") ~= nil, "unexpected error: " .. tostring(err))
+        \\
+        \\return "OK"
+    );
+}
+
+test "plugin_api: nova.git_add and selective nova.git_commit validate arguments" {
+    const io = std.testing.io;
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+
+    // git_add requires files argument
+    try expectLuaOk(&L,
+        \\local ok, err = nova.git_add()
+        \\assert(ok == nil, "git_add without args should fail")
+        \\assert(string.find(err, "files argument is required") ~= nil, "unexpected error: " .. tostring(err))
+        \\
+        \\local ok2, err2 = nova.git_commit()
+        \\assert(ok2 == nil, "git_commit without message should fail")
+        \\assert(string.find(err2, "commit message argument is required") ~= nil, "unexpected error: " .. tostring(err2))
+        \\
         \\return "OK"
     );
 }

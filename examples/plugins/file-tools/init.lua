@@ -22,7 +22,7 @@ local BINARY_EXTS = {
 -- dotfile (".gitignore") has no extension: `.+` requires at least one char
 -- before the final dot, while ".hidden.txt" still yields "txt".
 local function extension(path)
-  local name = path:match("[^/]+$") or path
+  local name = path:match("[^/\\]+$") or path
   local _, ext = name:match("^(.+)%.(%w+)$")
   if not ext then return "" end
   return ext:lower()

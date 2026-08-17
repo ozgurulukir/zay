@@ -28,7 +28,7 @@ fn runSingleTestFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool
     // Read the test file
     const content = try readFile(gpa, io, path);
     defer gpa.free(content);
-    return runTestSource(gpa, content);
+    return runTestSource(gpa, io, content);
 }
 
 /// Run a Lua test file's source in a fresh sandboxed state and report whether
@@ -36,9 +36,8 @@ fn runSingleTestFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool
 /// the file chunk is executed, then `test_runner.run()` is auto-invoked and its
 /// boolean result is the pass/fail verdict. A file passes iff the chunk runs
 /// cleanly AND run() returns true (which is false for zero tests).
-fn runTestSource(gpa: std.mem.Allocator, content: []const u8) !bool {
-    // Create a sandboxed state with full access (tests need io for output)
-    var L = try sandbox.createSandboxedState(.{ .full_access = true });
+fn runTestSource(gpa: std.mem.Allocator, io: std.Io, content: []const u8) !bool {
+    var L = try sandbox.createSandboxedStateWithIo(.{ .full_access = true }, io);
     defer {
         sandbox.freeHookData(L.handle);
         L.deinit();

@@ -38,18 +38,32 @@ pub const Manifest = struct {
     pub fn parse(allocator: std.mem.Allocator, L: *State) !Manifest {
         if (!L.isTable(-1)) return error.InvalidManifest;
 
-        const name = bridge.getTableString(L, -1, "name") orelse return error.MissingPluginName;
-        const version = bridge.getTableString(L, -1, "version") orelse return error.MissingPluginVersion;
+        const raw_name = bridge.getTableString(L, -1, "name") orelse return error.MissingPluginName;
+        const name = try allocator.dupe(u8, raw_name);
+        errdefer allocator.free(name);
+
+        const raw_version = bridge.getTableString(L, -1, "version") orelse return error.MissingPluginVersion;
+        const version = try allocator.dupe(u8, raw_version);
+        errdefer allocator.free(version);
+
+        const author = if (bridge.getTableString(L, -1, "author")) |s| try allocator.dupe(u8, s) else "";
+        errdefer if (author.len > 0) allocator.free(author);
+
+        const license = if (bridge.getTableString(L, -1, "license")) |s| try allocator.dupe(u8, s) else "";
+        errdefer if (license.len > 0) allocator.free(license);
+
+        const description = if (bridge.getTableString(L, -1, "description")) |s| try allocator.dupe(u8, s) else "";
+        errdefer if (description.len > 0) allocator.free(description);
 
         // Parse permissions sub-table
         const permissions = parsePermissions(L) catch sandbox.Permissions{};
 
         return Manifest{
-            .name = try allocator.dupe(u8, name),
-            .version = try allocator.dupe(u8, version),
-            .author = if (bridge.getTableString(L, -1, "author")) |s| try allocator.dupe(u8, s) else "",
-            .license = if (bridge.getTableString(L, -1, "license")) |s| try allocator.dupe(u8, s) else "",
-            .description = if (bridge.getTableString(L, -1, "description")) |s| try allocator.dupe(u8, s) else "",
+            .name = name,
+            .version = version,
+            .author = author,
+            .license = license,
+            .description = description,
             .dependencies = &.{},
             .is_embedded = false,
             .permissions = permissions,

@@ -8,6 +8,7 @@
 const std = @import("std");
 const log = std.log.scoped(.lua);
 const c = @import("c");
+const os = @import("../os.zig");
 const State = @import("state.zig").State;
 const sandbox = @import("sandbox.zig");
 const plugin_api = @import("plugin_api.zig");
@@ -54,10 +55,25 @@ pub const PluginManager = struct {
     /// `home_dir` is the user's home directory (for `~/.config/nova/plugins/`).
     /// `cwd` is the current working directory (for `.nova/plugins/`).
     pub fn init(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, cwd: []const u8) Self {
-        const global_dir = if (home_dir.len > 0)
-            std.fs.path.join(allocator, &.{ home_dir, ".config", "nova", "plugins" }) catch ""
-        else
-            "";
+        var global_dir: []const u8 = "";
+        if (home_dir.len > 0) {
+            if (os.is_windows) {
+                const appdata_dir = std.fs.path.join(allocator, &.{ home_dir, "AppData", "Roaming", "nova", "plugins" }) catch "";
+                if (appdata_dir.len > 0) {
+                    if (std.Io.Dir.openDirAbsolute(io, appdata_dir, .{})) |*d| {
+                        d.close(io);
+                        global_dir = appdata_dir;
+                    } else |_| {
+                        allocator.free(appdata_dir);
+                        global_dir = std.fs.path.join(allocator, &.{ home_dir, ".config", "nova", "plugins" }) catch "";
+                    }
+                } else {
+                    global_dir = std.fs.path.join(allocator, &.{ home_dir, ".config", "nova", "plugins" }) catch "";
+                }
+            } else {
+                global_dir = std.fs.path.join(allocator, &.{ home_dir, ".config", "nova", "plugins" }) catch "";
+            }
+        }
         const project_dir = if (cwd.len > 0)
             std.fs.path.join(allocator, &.{ cwd, ".nova", "plugins" }) catch ""
         else
@@ -133,6 +149,10 @@ pub const PluginManager = struct {
         // Create the plugin instance with Io so nova.* bridge functions
         // (register_tool, read_file, etc.) are available in the sandbox.
         var L = try sandbox.createSandboxedStateWithIo(permissions, self.io);
+
+        // Store the plugin root directory in the registry so nova.require knows its base path
+        _ = c.lua_pushlstring(L.handle, dir_path.ptr, dir_path.len);
+        c.lua_setfield(L.handle, c.LUA_REGISTRYINDEX, "nova_plugin_dir");
 
         // Load the plugin's init.lua
         const init_path = try std.fs.path.join(self.allocator, &.{ dir_path, "init.lua" });

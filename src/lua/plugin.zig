@@ -48,19 +48,21 @@ pub const Plugin = struct {
         return self.state.doString(chunk);
     }
 
-    /// Call a function registered in the plugin's global table.
+    /// Call a function registered in the plugin's global table without arguments.
     /// `function_name` is the global name of the function.
-    /// `args` are pushed onto the stack before the call.
-    /// Returns true if the call succeeded.
-    pub fn callFunction(self: *Self, function_name: [:0]const u8, args: anytype) bool {
-        _ = args;
+    /// Returns true if the call succeeded, leaving the stack clean.
+    pub fn callFunction(self: *Self, function_name: [:0]const u8) bool {
         _ = c.lua_getglobal(self.state.handle, function_name.ptr);
         if (!self.state.isFunction(-1)) {
             self.state.pop(1);
             return false;
         }
-        const rc = self.state.pcall(0, 1);
-        return rc == c.LUA_OK;
+        const rc = self.state.pcall(0, 0);
+        if (rc != c.LUA_OK) {
+            self.state.pop(1); // pop error message on failure
+            return false;
+        }
+        return true;
     }
 };
 
@@ -114,4 +116,23 @@ test "plugin: permissions are respected" {
     try std.testing.expect(p.loadChunk("return type(os.execute) == 'function'"));
     try std.testing.expect(p.state.toBoolean(-1));
     p.state.pop(1);
+}
+
+test "plugin: callFunction succeeds and keeps stack clean on success and error" {
+    var p = try Plugin.init("test_plugin", false, .{});
+    defer p.deinit();
+
+    try std.testing.expect(p.loadChunk(
+        \\function success_fn() _G.did_run = true end
+        \\function fail_fn() error("boom") end
+    ));
+
+    try std.testing.expect(p.callFunction("success_fn"));
+    try std.testing.expectEqual(@as(c_int, 0), p.state.getTop());
+
+    try std.testing.expect(!p.callFunction("fail_fn"));
+    try std.testing.expectEqual(@as(c_int, 0), p.state.getTop());
+
+    try std.testing.expect(!p.callFunction("nonexistent_fn"));
+    try std.testing.expectEqual(@as(c_int, 0), p.state.getTop());
 }

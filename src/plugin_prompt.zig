@@ -8,6 +8,7 @@
 //! before the full `PluginManager` exists.
 
 const std = @import("std");
+const os = @import("os.zig");
 
 const assert = std.debug.assert;
 
@@ -58,6 +59,10 @@ pub fn loadAll(
 
     const global_parts = [_][]const u8{ ".config", "nova", "plugins" };
     const project_parts = [_][]const u8{ ".nova", "plugins" };
+    if (os.is_windows and home_dir.len > 0) {
+        const appdata_parts = [_][]const u8{ "AppData", "Roaming", "nova", "plugins" };
+        try scanRoot(gpa, io, home_dir, &appdata_parts, &prompts);
+    }
     try scanRoot(gpa, io, home_dir, &global_parts, &prompts);
     try scanRoot(gpa, io, cwd, &project_parts, &prompts);
 

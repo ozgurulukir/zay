@@ -13,8 +13,8 @@ Use the `git-tools` plugin to inspect repository state and create commits.
 - `lua__git-tools__git_log` — Recent commit messages. Use this to match the
   project's commit-message style.
 - `lua__git-tools__git_branch` — Just the current branch name.
-- `lua__git-tools__git_commit` — Stage all changes and commit. Use this only
-  when the user explicitly asks to commit.
+- `lua__git-tools__git_add` — Stage specific files before committing. Always stage only the files you intentionally modified.
+- `lua__git-tools__git_commit` — Create a commit. By default, commits files already staged via `git_add`. You can also pass `files` to stage and commit in one step, or pass `stage_all: true` to stage everything.
 
 ## Guidelines — git discipline
 
@@ -22,7 +22,7 @@ Use the `git-tools` plugin to inspect repository state and create commits.
   it.** Do not commit proactively.
 - **Exception — lane work.** When you are working inside a Nova lane and need to `lane merge`, commit the lane's changes yourself with a real message first. This is the one case where committing without an explicit user request is expected and required — the merge refuses a dirty lane and will not fabricate a placeholder commit.
 - **Inspect before committing.** Call `git_status` and `git_diff` first so your
-  commit reflects what actually changed. Stage only the intended files and
+  commit reflects what actually changed. Stage only the intended files (`git_add` or `git_commit({ files = "..." })`) and
   never commit secrets (API keys, credentials, `.env` files).
 - **Match the commit style.** Call `git_log` before writing a commit message to
   match the project's existing style (imperative mood, conventional-commit
@@ -30,10 +30,6 @@ Use the `git-tools` plugin to inspect repository state and create commits.
   one.
 - **If a commit fails** (e.g. hooks reject it, or the message is wrong), fix
   the issue and create a **new** commit. Do not amend the failed commit.
-- **`git_commit` always stages all changes** (`git add -A && git commit`).
-  There is no selective-staging API — if you need to stage only specific files,
-  do the whole commit in bash (`git add <files> && git commit -m "..."`) and
-  do not mix the two approaches. Staging files with `git add` and then calling
-  `git_commit` will re-stage everything and void the selective staging.
+- **Selective staging vs Stage All:** Prefer staging specific files with `git_add` or `git_commit({ files = "..." })`. Only use `stage_all = true` when you explicitly intend to stage all untracked and modified files.
 - **Do not** update git config, skip hooks, use interactive `-i`, force-push,
   or create empty commits unless the user explicitly requests it.

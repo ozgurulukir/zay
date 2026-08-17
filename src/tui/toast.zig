@@ -516,5 +516,3 @@ test "Widget.draw truncates long toast with ellipsis and preserves borders" {
     try std.testing.expectEqualStrings("╰", surface.buffer[bottom_start].char.grapheme);
     try std.testing.expectEqualStrings("╯", surface.buffer[bottom_start + 14].char.grapheme);
 }
-
-

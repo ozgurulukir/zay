@@ -901,4 +901,3 @@ test "async empty query returns results" {
     try std.testing.expect(result.stdout.len > 0);
     try std.testing.expect(result.status == .ok);
 }
-

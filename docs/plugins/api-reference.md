@@ -172,17 +172,23 @@ Run all registered test suites. Returns `true` if all tests pass.
 | Function | Parameters | Returns | Description |
 |----------|-----------|---------|-------------|
 | `nova.read_file(path, opts?)` | `path`, `opts.start_line`, `opts.end_line`, `opts.max_size` | `{path, content, size, lines, language, mime_type}` | Read file with metadata |
-| `nova.write_file(path, content)` | `path`, `content` | `true` or `nil` | Atomic file write |
+| `nova.write_file(path, content)` | `path`, `content` | `true` or `nil` | Atomic file write (temp + rename) |
 | `nova.edit_file(path, old, new)` | `path`, `old_string`, `new_string` | `true` or `nil` | Find-and-replace |
-| `nova.search_files(root, pattern, opts?)` | `root`, `pattern`, `opts.file_pattern`, `opts.case_sensitive`, `opts.max_results` | `{query, total_matches, results, truncated}` | Recursive grep |
+| `nova.search_files(root, pattern, opts?)` | `root`, `pattern`, `opts.file_pattern`, `opts.case_sensitive`, `opts.max_results` | `{query, total_matches, results, truncated}` | Recursive content search (grep) |
+| `nova.find_files(root, pattern, opts?)` | `root`, `pattern`, `opts.max_results` | `{root, total_matches, truncated, results}` | Recursive filename glob (`**`, `*`, `?`) |
 | `nova.list_dir(path)` | `path` | `{path, files, directories, total_items}` | Directory listing |
 | `nova.file_info(path)` | `path` | `{size, type, extension, language, mime_type}` | File metadata |
+| `nova.mkdir(path)` | `path` | `true` or `nil` | Create directory recursively |
+| `nova.copy_path(src, dst)` | `src`, `dst` | `true` or `nil` | Copy a single file |
+| `nova.move_path(src, dst)` | `src`, `dst` | `true` or `nil` | Move/rename file or directory |
+| `nova.delete_path(path, opts?)` | `path`, `opts.recursive` | `true` or `nil` | Delete file or directory safely |
 
 ### Shell & Environment
 
 | Function | Parameters | Returns | Description |
 |----------|-----------|---------|-------------|
-| `nova.run_bash(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout` | `{stdout, stderr, code}` | Shell command execution |
+| `nova.run_shell(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout` | `{stdout, stderr, code}` | Platform-native shell (`pwsh.exe` on Windows, `bash` on POSIX) |
+| `nova.run_bash(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout` | `{stdout, stderr, code}` | Bash command execution |
 | `nova.get_env(name)` | `name` | `string` or `nil` | Environment variable |
 | `nova.get_cwd()` | — | `string` | Current working directory |
 | `nova.get_project_root()` | — | `string` | Git repo root or cwd |
@@ -195,12 +201,14 @@ Run all registered test suites. Returns `true` if all tests pass.
 | `nova.git_diff(path?)` | `path` (optional) | `string` | Git diff |
 | `nova.git_log(n)` | `n` (default 10) | `string` | Recent commits |
 | `nova.git_branch()` | — | `string` | Current branch name |
-| `nova.git_commit(msg)` | `msg` | `{success, output}` | Create commit |
+| `nova.git_add(files)` | `files` (string or array) | `{success, output}` | Stage specific files or patterns |
+| `nova.git_commit(msg, opts?)` | `msg`, `opts.files`, `opts.staged_only`, `opts.stage_all` | `{success, output}` | Create commit (selective or staged) |
 
-### Plugin System
+### Plugin System & Modular Code
 
 | Function | Parameters | Returns | Description |
 |----------|-----------|---------|-------------|
+| `nova.require(mod_path)` | `mod_path` | `any` | Load relative Lua module with caching and directory confinement |
 | `nova.register_tool(spec)` | `spec.name`, `spec.description`, `spec.parameters`, `spec.handler` | `true` | Register a tool |
 | `nova.on(event, callback)` | `event`, `callback` | `true` | Subscribe to event |
 | `nova.think(prompt)` | `prompt` | _(stub)_ | Recursive LLM call (not yet implemented) |
