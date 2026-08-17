@@ -19,6 +19,7 @@
 const std = @import("std");
 
 const bash = @import("tools/bash_exec.zig");
+const pws = @import("tools/pwsh_exec.zig");
 const os = @import("os.zig");
 const platform = @import("platform");
 
@@ -28,6 +29,9 @@ const assert = std.debug.assert;
 /// output always lives in the log file; this is only what the model sees inline.
 const tail_bytes_max: usize = 8 * 1024;
 const read_reserve: usize = 64 * 1024;
+
+/// Maximum log file size per background job before truncation kicks in (50 MB).
+pub const max_job_log_bytes: u64 = 50 * 1024 * 1024;
 
 pub const BackgroundManager = struct {
     io: std.Io,
@@ -73,6 +77,7 @@ pub const BackgroundManager = struct {
     /// What the bash tool needs to tell the model after a launch. Owned by the
     /// caller; free with `deinit`.
     pub const StartResult = struct {
+        id: u32,
         label: []u8,
         pid: i64,
         log_path: []u8,
@@ -90,6 +95,7 @@ pub const BackgroundManager = struct {
         id: u32,
         label: []u8,
         command: []u8,
+        log_path: []u8,
         elapsed_seconds: u64,
     };
 
@@ -138,6 +144,8 @@ pub const BackgroundManager = struct {
         exit_code: u8 = 0,
         completion_message: ?[]u8 = null,
         reported: bool = false,
+        bytes_written: u64 = 0,
+        truncated: bool = false,
     };
 
     pub fn init(io: std.Io, gpa: std.mem.Allocator) BackgroundManager {
@@ -152,23 +160,26 @@ pub const BackgroundManager = struct {
 
         // The mutex guards only `next_id` and the job list; the allocation and
         // spawn work below touches locals only, so drop the lock right after the
-        // increment. A function-scoped `defer` unlock here would re-lock the same
-        // non-recursive mutex at the :job-append and :reader-publish sites below
-        // and deadlock (std.Io.Mutex has no owner tracking).
+        // increment.
         try self.mutex.lock(io);
         const id = self.next_id;
         self.next_id += 1;
         self.mutex.unlock(io);
 
-        const label = try std.fmt.allocPrint(gpa, "bg_{d}", .{id});
-        errdefer gpa.free(label);
-        const log_name = try std.fmt.allocPrint(gpa, "nova-{s}.log", .{label});
-        defer gpa.free(log_name);
-        const log_path = try bash.namedTempPath(gpa, log_name);
-        errdefer gpa.free(log_path);
+        var label: ?[]u8 = null;
+        defer if (label) |p| gpa.free(p);
+        label = try std.fmt.allocPrint(gpa, "bg_{d}", .{id});
 
-        var log_file = try std.Io.Dir.createFile(.cwd(), io, log_path, .{});
-        errdefer log_file.close(io);
+        const log_name = try std.fmt.allocPrint(gpa, "nova-{s}.log", .{label.?});
+        defer gpa.free(log_name);
+
+        var log_path: ?[]u8 = null;
+        defer if (log_path) |p| gpa.free(p);
+        log_path = try bash.namedTempPath(gpa, log_name);
+
+        var log_file: ?std.Io.File = null;
+        defer if (log_file) |*f| f.close(io);
+        log_file = try std.Io.Dir.createFileAbsolute(io, log_path.?, .{});
 
         // Merge stderr into stdout so the log preserves chronological order, like
         // the foreground capture path. The prefix/suffix come from the shell tool
@@ -192,7 +203,13 @@ pub const BackgroundManager = struct {
             gpa.free(p);
         };
 
-        var child = switch (opts.command_mode) {
+        var child: ?std.process.Child = null;
+        defer if (child) |*c| {
+            c.kill(io);
+            _ = c.wait(io) catch {};
+        };
+
+        child = switch (opts.command_mode) {
             .argv_dash_c => try std.process.spawn(io, .{
                 .argv = &.{ opts.shell_path, "-c", merged },
                 .cwd = .{ .path = opts.cwd },
@@ -214,74 +231,85 @@ pub const BackgroundManager = struct {
                 });
             },
         };
-        // From here a failure must also tear down the spawned child.
-        errdefer child.kill(io);
 
-        const pid = processId(child);
+        const pid = processId(child.?);
 
-        const command_owned = try gpa.dupe(u8, opts.command);
-        errdefer gpa.free(command_owned);
-        const cwd_owned = try gpa.dupe(u8, opts.cwd);
-        errdefer gpa.free(cwd_owned);
+        var command_owned: ?[]u8 = null;
+        defer if (command_owned) |p| gpa.free(p);
+        command_owned = try gpa.dupe(u8, opts.command);
+
+        var cwd_owned: ?[]u8 = null;
+        defer if (cwd_owned) |p| gpa.free(p);
+        cwd_owned = try gpa.dupe(u8, opts.cwd);
+
+        var result_label: ?[]u8 = null;
+        defer if (result_label) |p| gpa.free(p);
+        result_label = try gpa.dupe(u8, label.?);
+
+        var result_log_path: ?[]u8 = null;
+        defer if (result_log_path) |p| gpa.free(p);
+        result_log_path = try gpa.dupe(u8, log_path.?);
 
         const job = try gpa.create(Job);
         errdefer gpa.destroy(job);
+
         job.* = .{
             .manager = self,
             .id = id,
-            .label = label,
-            .command = command_owned,
-            .cwd = cwd_owned,
-            .log_path = log_path,
+            .label = label.?,
+            .command = command_owned.?,
+            .cwd = cwd_owned.?,
+            .log_path = log_path.?,
             .pid = pid,
             .owner = opts.owner,
             .started = std.Io.Timestamp.now(io, .awake),
-            .child = child,
-            .log_file = log_file,
+            .child = child.?,
+            .log_file = log_file.?,
             .script_path = script_path,
         };
-        // Ownership of the script file + path has moved into the Job; the local
-        // defer above must not free it anymore (it only ran on the pre-transfer
-        // error path). If a LATER step fails (result dupes, jobs.append, reader
-        // spawn) the job never reaches `jobs[]`, so `takeFinished`/`destroyJob`
-        // never run for it — clean up its owned script file + path here instead.
+
+        // Ownership of fields transferred to Job; disarm individual defers.
+        label = null;
+        command_owned = null;
+        cwd_owned = null;
+        log_path = null;
+        child = null;
+        log_file = null;
         script_path = null;
-        errdefer if (job.script_path) |p| {
-            std.Io.Dir.deleteFile(.cwd(), io, p) catch {};
-            gpa.free(p);
+
+        // 1. Spawn reader thread first. On failure, cleanup child, files, and job.
+        const thread = std.Thread.spawn(.{}, runReader, .{job}) catch |err| {
+            cleanupFailedJob(gpa, io, job);
+            return err;
         };
+        job.thread = thread;
+
+        // 2. Lock mutex and publish atomically to self.jobs.
+        self.mutex.lock(io) catch |err| {
+            job.killed.store(true, .release);
+            terminateTree(io, gpa, pid);
+            thread.join();
+            destroyJob(gpa, io, job);
+            return err;
+        };
+        self.jobs.append(gpa, job) catch |err| {
+            self.mutex.unlock(io);
+            job.killed.store(true, .release);
+            terminateTree(io, gpa, pid);
+            thread.join();
+            destroyJob(gpa, io, job);
+            return err;
+        };
+        self.mutex.unlock(io);
 
         const result: StartResult = .{
-            .label = try gpa.dupe(u8, label),
+            .id = id,
+            .label = result_label.?,
             .pid = pid,
-            .log_path = try gpa.dupe(u8, log_path),
+            .log_path = result_log_path.?,
         };
-        errdefer {
-            var r = result;
-            r.deinit(gpa);
-        }
-
-        try self.mutex.lock(io);
-        try self.jobs.append(gpa, job);
-        self.mutex.unlock(self.io);
-        errdefer {
-            if (self.mutex.lock(io)) |_| {
-                _ = removeJobPtr(&self.jobs, job);
-                self.mutex.unlock(self.io);
-            } else |_| {
-                // Lock failed (canceled) — best-effort cleanup skipped.
-            }
-        }
-
-        // Spawn the reader last: once it owns the child/log it must run to
-        // completion, so nothing above may fail after this point. Publish the
-        // handle under the mutex so `takeFinished` (which reads `job.thread`
-        // under the same lock) never races this write; until it lands the job
-        // reads as running, and a job that finishes first is deferred a poll.
-        const thread = try std.Thread.spawn(.{}, runReader, .{job});
-        try self.mutex.lock(io);
-        job.thread = thread;
-        defer self.mutex.unlock(self.io);
+        result_label = null;
+        result_log_path = null;
         return result;
     }
 
@@ -299,23 +327,11 @@ pub const BackgroundManager = struct {
         const stderr_reader = multi_reader.reader(1);
 
         while (multi_reader.fill(read_reserve, .none)) |_| {
-            // Both stdout and stderr are piped; append each stream's buffered
-            // bytes to the log + tail, in the order the MultiReader surfaces
-            // them, so a PowerShell background job's error text (which stays on
-            // its own stream — pwsh has no `exec 2>&1`) still lands in the log.
-            if (reader.buffered().len > 0) {
-                const chunk = reader.buffered();
-                job.log_file.writeStreamingAll(io, chunk) catch {};
-                appendTail(job, gpa, chunk);
-                reader.tossBuffered();
-            }
-            if (stderr_reader.buffered().len > 0) {
-                const chunk = stderr_reader.buffered();
-                job.log_file.writeStreamingAll(io, chunk) catch {};
-                appendTail(job, gpa, chunk);
-                stderr_reader.tossBuffered();
-            }
+            drainBufferedChunks(job, io, gpa, reader, stderr_reader);
         } else |_| {}
+
+        // Trailing drain for any unread bytes buffered before EOF/error.
+        drainBufferedChunks(job, io, gpa, reader, stderr_reader);
 
         const term = job.child.wait(io) catch std.process.Child.Term{ .unknown = 0 };
         job.log_file.close(io);
@@ -327,6 +343,55 @@ pub const BackgroundManager = struct {
             job.completion_message = buildCompletionMessage(job, gpa) catch null;
         }
         job.state.store(.finished, .release);
+    }
+
+    /// Append a chunk to the job's log file respecting the 50 MB quota.
+    pub fn writeLogChunk(job: *Job, io: std.Io, chunk: []const u8) void {
+        if (job.truncated) return;
+        const remaining = max_job_log_bytes -| job.bytes_written;
+        if (remaining == 0) {
+            job.truncated = true;
+            const notice = "\n\n[... output truncated: exceeded 50MB limit ...]\n";
+            job.log_file.writeStreamingAll(io, notice) catch {};
+            return;
+        }
+        if (chunk.len <= remaining) {
+            job.log_file.writeStreamingAll(io, chunk) catch {};
+            job.bytes_written +|= chunk.len;
+        } else {
+            const fit = chunk[0..@intCast(remaining)];
+            job.log_file.writeStreamingAll(io, fit) catch {};
+            job.bytes_written +|= fit.len;
+            job.truncated = true;
+            const notice = "\n\n[... output truncated: exceeded 50MB limit ...]\n";
+            job.log_file.writeStreamingAll(io, notice) catch {};
+        }
+    }
+
+    /// Drain unconsumed buffered chunks from both streams to the log file and tail buffer.
+    fn drainBufferedChunks(
+        job: *Job,
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        reader: anytype,
+        stderr_reader: anytype,
+    ) void {
+        // Both stdout and stderr are piped; append each stream's buffered
+        // bytes to the log + tail, in the order the MultiReader surfaces
+        // them, so a PowerShell background job's error text (which stays on
+        // its own stream — pwsh has no `exec 2>&1`) still lands in the log.
+        if (reader.buffered().len > 0) {
+            const chunk = reader.buffered();
+            writeLogChunk(job, io, chunk);
+            appendTail(job, gpa, chunk);
+            reader.tossBuffered();
+        }
+        if (stderr_reader.buffered().len > 0) {
+            const chunk = stderr_reader.buffered();
+            writeLogChunk(job, io, chunk);
+            appendTail(job, gpa, chunk);
+            stderr_reader.tossBuffered();
+        }
     }
 
     /// Keep `job.tail` to the last `tail_bytes_max` bytes, trimming on a UTF-8
@@ -373,6 +438,7 @@ pub const BackgroundManager = struct {
                 .id = job.id,
                 .label = try gpa.dupe(u8, job.label),
                 .command = try gpa.dupe(u8, job.command),
+                .log_path = try gpa.dupe(u8, job.log_path),
                 .elapsed_seconds = @intCast(@max(elapsed_ns, 0) / std.time.ns_per_s),
             });
         }
@@ -383,6 +449,7 @@ pub const BackgroundManager = struct {
         for (views) |*view| {
             gpa.free(view.label);
             gpa.free(view.command);
+            gpa.free(view.log_path);
         }
         gpa.free(views);
     }
@@ -391,6 +458,7 @@ pub const BackgroundManager = struct {
         for (list.items) |*view| {
             gpa.free(view.label);
             gpa.free(view.command);
+            gpa.free(view.log_path);
         }
         list.deinit(gpa);
     }
@@ -424,8 +492,8 @@ pub const BackgroundManager = struct {
     /// reader then reaps it and marks it finished+killed. Returns true if a
     /// running job matched. The actual kill runs outside the lock so it never stalls the UI's draw/poll path.
     pub fn cancel(self: *BackgroundManager, id: u32) bool {
+        var pid: ?i64 = null;
         if (self.mutex.lock(self.io)) |_| {
-            var pid: ?i64 = null;
             for (self.jobs.items) |job| {
                 if (job.id != id) continue;
                 if (job.state.load(.acquire) == .running) {
@@ -434,15 +502,16 @@ pub const BackgroundManager = struct {
                 }
                 break;
             }
-            defer self.mutex.unlock(self.io);
-            if (pid) |p| {
-                terminateTree(self.io, self.gpa, p);
-                return true;
-            }
-            return false;
+            self.mutex.unlock(self.io);
         } else |_| {
             return false;
         }
+
+        if (pid) |p| {
+            terminateTree(self.io, self.gpa, p);
+            return true;
+        }
+        return false;
     }
 
     /// Take every finished-but-unreported job, transferring ownership to the
@@ -451,39 +520,34 @@ pub const BackgroundManager = struct {
     pub fn takeFinished(self: *BackgroundManager, gpa: std.mem.Allocator) ![]Finished {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
+
         var out: std.ArrayList(Finished) = .empty;
         errdefer {
             for (out.items) |*f| f.deinit(gpa);
             out.deinit(gpa);
         }
-        var i: usize = 0;
-        while (i < self.jobs.items.len) {
-            const job = self.jobs.items[i];
-            if (job.reported or job.state.load(.acquire) != .finished) {
-                i += 1;
-                continue;
+        try out.ensureTotalCapacity(gpa, self.jobs.items.len);
+
+        var write_idx: usize = 0;
+        for (self.jobs.items) |job| {
+            if (!job.reported and job.state.load(.acquire) == .finished) {
+                if (job.thread) |t| {
+                    t.join();
+                    job.thread = null;
+                }
+                if (buildFinished(job, gpa)) |finished| {
+                    out.appendAssumeCapacity(finished);
+                    destroyJob(self.gpa, self.io, job);
+                    continue;
+                } else |_| {
+                    // Leave the job in place to retry on next tick.
+                    job.reported = false;
+                }
             }
-            // A very fast command can reach `.finished` before `start` finished
-            // assigning `job.thread`. Defer to the next poll rather than free a
-            // job whose reader thread is not yet joinable.
-            if (job.thread == null) {
-                i += 1;
-                continue;
-            }
-            // The reader has stored `.finished`; join so the thread is fully
-            // settled before we free the job.
-            job.thread.?.join();
-            job.thread = null;
-            const finished = buildFinished(job, gpa) catch {
-                // Leave the job in place; retry on the next poll.
-                job.reported = false;
-                i += 1;
-                continue;
-            };
-            try out.append(gpa, finished);
-            _ = self.jobs.orderedRemove(i);
-            destroyJob(self.gpa, self.io, job);
+            self.jobs.items[write_idx] = job;
+            write_idx += 1;
         }
+        self.jobs.shrinkRetainingCapacity(write_idx);
         return out.toOwnedSlice(gpa);
     }
 
@@ -529,6 +593,13 @@ pub const BackgroundManager = struct {
         self.* = undefined;
     }
 
+    fn cleanupFailedJob(gpa: std.mem.Allocator, io: std.Io, job: *Job) void {
+        job.child.kill(io);
+        _ = job.child.wait(io) catch {};
+        job.log_file.close(io);
+        destroyJob(gpa, io, job);
+    }
+
     fn destroyJob(gpa: std.mem.Allocator, io: std.Io, job: *Job) void {
         gpa.free(job.label);
         gpa.free(job.command);
@@ -541,16 +612,6 @@ pub const BackgroundManager = struct {
         job.tail.deinit(gpa);
         if (job.completion_message) |m| gpa.free(m);
         gpa.destroy(job);
-    }
-
-    fn removeJobPtr(jobs: *std.ArrayList(*Job), job: *Job) bool {
-        for (jobs.items, 0..) |candidate, index| {
-            if (candidate == job) {
-                _ = jobs.orderedRemove(index);
-                return true;
-            }
-        }
-        return false;
     }
 };
 
@@ -593,42 +654,51 @@ fn writeBackgroundScript(gpa: std.mem.Allocator, io: std.Io, script: []const u8)
     return path;
 }
 
-/// Kill a job's whole process tree by pid. Best-effort and side-effect free on
-/// the caller's data — runs outside the manager lock.
-fn terminateTree(io: std.Io, gpa: std.mem.Allocator, pid: i64) void {
+/// Worker function to execute taskkill.exe synchronously.
+fn runTaskkillWorker(io: std.Io, pid: i64) void {
+    const alloc = std.heap.page_allocator;
+    var pid_buf: [32]u8 = undefined;
+    const pid_arg = std.fmt.bufPrint(&pid_buf, "{d}", .{pid}) catch return;
+
+    const result = std.process.run(alloc, io, .{
+        .argv = &.{ "taskkill.exe", "/F", "/T", "/PID", pid_arg },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+        .timeout = bash.timeoutFromSeconds(5),
+    }) catch return;
+    alloc.free(result.stdout);
+    alloc.free(result.stderr);
+}
+
+/// Synchronously kill a job's whole process tree by pid.
+pub fn terminateTreeSync(io: std.Io, gpa: std.mem.Allocator, pid: i64) void {
+    _ = gpa;
     if (os.is_windows) {
-        const pid_arg = std.fmt.allocPrint(gpa, "{d}", .{pid}) catch return;
-        defer gpa.free(pid_arg);
-
-        var taskkill_path: []const u8 = "C:\\Windows\\System32\\taskkill.exe";
-        var is_allocated = false;
-
-        var env_map = std.process.Environ.createMap(.{ .block = .global }, gpa) catch null;
-        if (env_map != null) {
-            if (env_map.?.get("SystemRoot")) |root| {
-                if (std.fmt.allocPrint(gpa, "{s}\\System32\\taskkill.exe", .{root})) |path| {
-                    taskkill_path = path;
-                    is_allocated = true;
-                } else |_| {}
-            }
-        }
-        defer if (env_map != null) env_map.?.deinit();
-
-        defer if (is_allocated) gpa.free(taskkill_path);
-
-        const result = std.process.run(gpa, io, .{
-            .argv = &.{ taskkill_path, "/F", "/T", "/PID", pid_arg },
-            .stdout_limit = .limited(64 * 1024),
-            .stderr_limit = .limited(64 * 1024),
-            .timeout = bash.timeoutFromSeconds(5),
-        }) catch return;
-        gpa.free(result.stdout);
-        gpa.free(result.stderr);
+        runTaskkillWorker(io, pid);
         return;
     }
     if (!os.is_windows) {
-        std.posix.kill(@intCast(pid), std.posix.SIG.KILL) catch {};
+        if (pid <= 1) return;
+        const p: std.posix.pid_t = @intCast(pid);
+        if (std.posix.kill(-p, std.posix.SIG.KILL)) |_| {} else |_| {
+            std.posix.kill(p, std.posix.SIG.KILL) catch {};
+        }
     }
+}
+
+/// Kill a job's whole process tree by pid. On Windows, offloads taskkill to a
+/// background worker thread so the TUI render loop is never blocked.
+/// Best-effort and side-effect free on the caller's data — runs outside the manager lock.
+fn terminateTree(io: std.Io, gpa: std.mem.Allocator, pid: i64) void {
+    if (os.is_windows) {
+        if (std.Thread.spawn(.{}, runTaskkillWorker, .{ io, pid })) |thread| {
+            thread.detach();
+        } else |_| {
+            runTaskkillWorker(io, pid);
+        }
+        return;
+    }
+    terminateTreeSync(io, gpa, pid);
 }
 
 fn processId(child: std.process.Child) i64 {
@@ -712,6 +782,7 @@ test "BackgroundManager.start returns and the job completes" {
         .stderr_merge_suffix = "",
     });
     defer started.deinit(gpa);
+    defer std.Io.Dir.deleteFile(.cwd(), std.testing.io, started.log_path) catch {};
     try std.testing.expect(started.pid > 0);
 
     var finished: []BackgroundManager.Finished = &.{};
@@ -733,6 +804,160 @@ test "BackgroundManager.start returns and the job completes" {
     try std.testing.expectEqual(@as(u8, 0), finished[0].exit_code);
     try std.testing.expect(!finished[0].killed);
     try std.testing.expectEqual(@as(u32, 1), finished[0].id);
+}
+
+test "BackgroundManager.start executes pwsh on Windows" {
+    if (!os.is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+
+    var env_map = try platform.getEnvMap(gpa);
+    defer env_map.deinit();
+
+    var manager = BackgroundManager.init(io, gpa);
+    defer manager.shutdownAll();
+
+    var started = try manager.start(.{
+        .command = "Write-Output 'pwsh-bg-ok'",
+        .cwd = cwd,
+        .env_map = &env_map,
+        .owner = @as(*anyopaque, @ptrFromInt(1)),
+        .shell_path = pws.shellPath(io),
+        .command_mode = .stdin_dash_command,
+        .stderr_merge_prefix = "",
+        .stderr_merge_suffix = "\nif (-not $?) { exit 1 } else { exit $LASTEXITCODE }",
+    });
+    defer started.deinit(gpa);
+    defer std.Io.Dir.deleteFile(.cwd(), io, started.log_path) catch {};
+    try std.testing.expect(started.pid > 0);
+
+    var finished: []BackgroundManager.Finished = &.{};
+    var attempts: u32 = 0;
+    while (attempts < 100) : (attempts += 1) {
+        const pending = try manager.takeFinished(gpa);
+        if (pending.len > 0) {
+            finished = pending;
+            break;
+        }
+        gpa.free(pending);
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    defer {
+        for (finished) |*f| f.deinit(gpa);
+        gpa.free(finished);
+    }
+    try std.testing.expectEqual(@as(usize, 1), finished.len);
+    try std.testing.expectEqual(@as(u8, 0), finished[0].exit_code);
+    try std.testing.expect(!finished[0].killed);
+    try std.testing.expectEqual(@as(u32, 1), finished[0].id);
+
+    // Verify log file output contains pwsh-bg-ok
+    var log_file = try std.Io.Dir.openFileAbsolute(io, started.log_path, .{});
+    defer log_file.close(io);
+    var buf: [256]u8 = undefined;
+    var reader_buf: [256]u8 = undefined;
+    var file_reader = log_file.reader(io, &reader_buf);
+    const read_len = file_reader.interface.readSliceShort(&buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..read_len], "pwsh-bg-ok") != null);
+}
+
+test "BackgroundManager.cancel terminates long-running job" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+
+    var env_map = try platform.getEnvMap(gpa);
+    defer env_map.deinit();
+
+    var manager = BackgroundManager.init(io, gpa);
+    defer manager.shutdownAll();
+
+    const is_win = os.is_windows;
+    var started = try manager.start(.{
+        .command = if (is_win) "Start-Sleep -Seconds 60" else "sleep 60",
+        .cwd = cwd,
+        .env_map = &env_map,
+        .owner = @as(*anyopaque, @ptrFromInt(1)),
+        .shell_path = if (is_win) pws.shellPath(io) else bash.shellPath(io),
+        .command_mode = if (is_win) .stdin_dash_command else .argv_dash_c,
+        .stderr_merge_prefix = if (is_win) "" else "exec 2>&1\n",
+        .stderr_merge_suffix = if (is_win) "\nif (-not $?) { exit 1 } else { exit $LASTEXITCODE }" else "",
+    });
+    defer started.deinit(gpa);
+    defer std.Io.Dir.deleteFile(.cwd(), io, started.log_path) catch {};
+    try std.testing.expect(started.pid > 0);
+
+    // Cancel the running job
+    const cancelled = manager.cancel(started.id);
+    try std.testing.expect(cancelled);
+
+    var finished: []BackgroundManager.Finished = &.{};
+    var attempts: u32 = 0;
+    while (attempts < 100) : (attempts += 1) {
+        const pending = try manager.takeFinished(gpa);
+        if (pending.len > 0) {
+            finished = pending;
+            break;
+        }
+        gpa.free(pending);
+        io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    defer {
+        for (finished) |*f| f.deinit(gpa);
+        gpa.free(finished);
+    }
+    try std.testing.expectEqual(@as(usize, 1), finished.len);
+    try std.testing.expect(finished[0].killed);
+}
+
+test "BackgroundManager handles instant command exit cleanly" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+
+    var env_map = try platform.getEnvMap(gpa);
+    defer env_map.deinit();
+
+    var manager = BackgroundManager.init(io, gpa);
+    defer manager.shutdownAll();
+
+    const is_win = os.is_windows;
+    var started = try manager.start(.{
+        .command = if (is_win) "exit 0" else "true",
+        .cwd = cwd,
+        .env_map = &env_map,
+        .owner = @as(*anyopaque, @ptrFromInt(1)),
+        .shell_path = if (is_win) pws.shellPath(io) else bash.shellPath(io),
+        .command_mode = if (is_win) .stdin_dash_command else .argv_dash_c,
+        .stderr_merge_prefix = if (is_win) "" else "exec 2>&1\n",
+        .stderr_merge_suffix = if (is_win) "\nif (-not $?) { exit 1 } else { exit $LASTEXITCODE }" else "",
+    });
+    defer started.deinit(gpa);
+    defer std.Io.Dir.deleteFile(.cwd(), io, started.log_path) catch {};
+    try std.testing.expect(started.pid > 0);
+
+    var finished: []BackgroundManager.Finished = &.{};
+    var attempts: u32 = 0;
+    while (attempts < 100) : (attempts += 1) {
+        const pending = try manager.takeFinished(gpa);
+        if (pending.len > 0) {
+            finished = pending;
+            break;
+        }
+        gpa.free(pending);
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    defer {
+        for (finished) |*f| f.deinit(gpa);
+        gpa.free(finished);
+    }
+    try std.testing.expectEqual(@as(usize, 1), finished.len);
+    try std.testing.expectEqual(@as(u8, 0), finished[0].exit_code);
+    try std.testing.expect(!finished[0].killed);
 }
 
 test "bash subprocess executes and returns captured output" {
@@ -760,4 +985,125 @@ test "formatElapsed renders compact durations" {
     try std.testing.expectEqualStrings("45s", formatElapsed(&buf, 45));
     try std.testing.expectEqualStrings("12m 03s", formatElapsed(&buf, 12 * 60 + 3));
     try std.testing.expectEqualStrings("2h 05m", formatElapsed(&buf, 2 * 3600 + 5 * 60 + 9));
+}
+
+test "takeFinished compacts jobs list in-place and preserves unready jobs" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = BackgroundManager.init(io, gpa);
+    defer manager.deinit();
+
+    const job1 = try gpa.create(BackgroundManager.Job);
+    job1.* = .{
+        .manager = &manager,
+        .id = 1,
+        .label = try gpa.dupe(u8, "bg_1"),
+        .command = try gpa.dupe(u8, "cmd1"),
+        .cwd = try gpa.dupe(u8, "."),
+        .log_path = try gpa.dupe(u8, "log1"),
+        .pid = 101,
+        .owner = @as(*anyopaque, @ptrFromInt(1)),
+        .started = std.Io.Timestamp.now(io, .awake),
+        .child = undefined,
+        .log_file = undefined,
+        .script_path = null,
+        .state = .init(.finished),
+    };
+
+    const job2 = try gpa.create(BackgroundManager.Job);
+    job2.* = .{
+        .manager = &manager,
+        .id = 2,
+        .label = try gpa.dupe(u8, "bg_2"),
+        .command = try gpa.dupe(u8, "cmd2"),
+        .cwd = try gpa.dupe(u8, "."),
+        .log_path = try gpa.dupe(u8, "log2"),
+        .pid = 102,
+        .owner = @as(*anyopaque, @ptrFromInt(1)),
+        .started = std.Io.Timestamp.now(io, .awake),
+        .child = undefined,
+        .log_file = undefined,
+        .script_path = null,
+        .state = .init(.running),
+    };
+
+    const job3 = try gpa.create(BackgroundManager.Job);
+    job3.* = .{
+        .manager = &manager,
+        .id = 3,
+        .label = try gpa.dupe(u8, "bg_3"),
+        .command = try gpa.dupe(u8, "cmd3"),
+        .cwd = try gpa.dupe(u8, "."),
+        .log_path = try gpa.dupe(u8, "log3"),
+        .pid = 103,
+        .owner = @as(*anyopaque, @ptrFromInt(1)),
+        .started = std.Io.Timestamp.now(io, .awake),
+        .child = undefined,
+        .log_file = undefined,
+        .script_path = null,
+        .state = .init(.finished),
+    };
+
+    try manager.jobs.append(gpa, job1);
+    try manager.jobs.append(gpa, job2);
+    try manager.jobs.append(gpa, job3);
+
+    const finished = try manager.takeFinished(gpa);
+    defer {
+        for (finished) |*f| f.deinit(gpa);
+        gpa.free(finished);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), finished.len);
+    try std.testing.expectEqual(@as(u32, 1), finished[0].id);
+    try std.testing.expectEqual(@as(u32, 3), finished[1].id);
+    try std.testing.expectEqual(@as(usize, 1), manager.jobs.items.len);
+    try std.testing.expectEqual(@as(u32, 2), manager.jobs.items[0].id);
+}
+
+test "terminateTreeSync safely handles invalid and guarded pids" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // Guarded PIDs (0, 1, negative) must be immediate no-ops and never panic or error.
+    terminateTreeSync(io, gpa, 0);
+    terminateTreeSync(io, gpa, 1);
+    terminateTreeSync(io, gpa, -1);
+}
+
+test "writeLogChunk caps at quota and writes truncation notice" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp_path = try bash.namedTempPath(gpa, "nova-test-quota.log");
+    defer gpa.free(tmp_path);
+    defer std.Io.Dir.deleteFile(.cwd(), io, tmp_path) catch {};
+
+    var file = try std.Io.Dir.createFileAbsolute(io, tmp_path, .{});
+    defer file.close(io);
+
+    var job: BackgroundManager.Job = .{
+        .manager = undefined,
+        .id = 1,
+        .label = undefined,
+        .command = undefined,
+        .cwd = undefined,
+        .log_path = undefined,
+        .pid = 0,
+        .owner = undefined,
+        .started = undefined,
+        .child = undefined,
+        .log_file = file,
+        .bytes_written = max_job_log_bytes - 10,
+        .truncated = false,
+    };
+
+    // Write a 20-byte chunk, which exceeds the remaining 10-byte quota
+    const chunk = "1234567890ABCDEFGHIJ";
+    BackgroundManager.writeLogChunk(&job, io, chunk);
+
+    try std.testing.expect(job.truncated);
+    try std.testing.expectEqual(max_job_log_bytes, job.bytes_written);
+
+    // Subsequent writeLogChunk calls must be no-ops
+    BackgroundManager.writeLogChunk(&job, io, "more data");
+    try std.testing.expectEqual(max_job_log_bytes, job.bytes_written);
 }
