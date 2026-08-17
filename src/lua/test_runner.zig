@@ -129,7 +129,7 @@ test "test runner: passing assertion reports true" {
         \\  test.it("passes", function() test.assert.equal(4, 2 + 2) end)
         \\end)
     ;
-    try std.testing.expect(try runTestSource(std.testing.allocator, src));
+    try std.testing.expect(try runTestSource(std.testing.allocator, std.testing.io, src));
 }
 
 test "test runner: failing assertion reports false (the regression)" {
@@ -139,7 +139,7 @@ test "test runner: failing assertion reports false (the regression)" {
         \\  test.it("fails", function() test.assert.equal(4, 5) end)
         \\end)
     ;
-    try std.testing.expect(!(try runTestSource(std.testing.allocator, src)));
+    try std.testing.expect(!(try runTestSource(std.testing.allocator, std.testing.io, src)));
 }
 
 test "test runner: file that never calls test.run() still reports correctly" {
@@ -150,7 +150,7 @@ test "test runner: file that never calls test.run() still reports correctly" {
         \\end)
         \\-- no explicit test.run() — the Zig runner auto-runs it
     ;
-    try std.testing.expect(try runTestSource(std.testing.allocator, src));
+    try std.testing.expect(try runTestSource(std.testing.allocator, std.testing.io, src));
 }
 
 test "test runner: empty file (zero it blocks) reports false" {
@@ -160,7 +160,7 @@ test "test runner: empty file (zero it blocks) reports false" {
         \\  -- no tests
         \\end)
     ;
-    try std.testing.expect(!(try runTestSource(std.testing.allocator, src)));
+    try std.testing.expect(!(try runTestSource(std.testing.allocator, std.testing.io, src)));
 }
 
 test "test runner: explicit test.run() then auto-run does not double-execute" {
@@ -171,10 +171,10 @@ test "test runner: explicit test.run() then auto-run does not double-execute" {
         \\end)
         \\test.run()
     ;
-    try std.testing.expect(try runTestSource(std.testing.allocator, src));
+    try std.testing.expect(try runTestSource(std.testing.allocator, std.testing.io, src));
 }
 
 test "test runner: syntax error in file reports false" {
     const src = "this is not lua @@@";
-    try std.testing.expect(!(try runTestSource(std.testing.allocator, src)));
+    try std.testing.expect(!(try runTestSource(std.testing.allocator, std.testing.io, src)));
 }
