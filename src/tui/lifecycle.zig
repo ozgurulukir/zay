@@ -351,13 +351,16 @@ fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
                     else => {},
                 }
 
-                // Accumulate the ACTIVE lane's response-delta bytes (only) for
-                // the velocity gauge. `thinking_delta` is excluded — reasoning
-                // tokens are not "response" velocity. The active lane is the
-                // one the user watches, so only it feeds the gauge. The gauge
-                // is fed `streamed_bytes / 4` (chars/4 estimate) on the tick.
-                if (lane == active and event_ptr.* == .response_delta) {
-                    root.app.metrics.streamed_bytes += event_ptr.response_delta.len;
+                // Accumulate the ACTIVE lane's response-delta and thinking-delta
+                // bytes for the velocity gauge. The active lane is the one the
+                // user watches, so only it feeds the gauge. The gauge is fed
+                // `streamed_bytes / 4` (chars/4 estimate) on the tick.
+                if (lane == active) {
+                    switch (event_ptr.*) {
+                        .response_delta => |text| root.app.metrics.streamed_bytes += text.len,
+                        .thinking_delta => |text| root.app.metrics.streamed_bytes += text.len,
+                        else => {},
+                    }
                 }
 
                 // A discarded (interrupted) turn's events are swallowed inside
@@ -376,10 +379,14 @@ fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
         }
     }
     // Reset the velocity accumulator once the active lane's turn is no longer
-    // writing a response (turn end / new turn), so the next turn's delta is
-    // computed from a clean base and the `-|` underflow guard in updateVelocity
-    // sees a clean reset.
-    if (active.turn_view.activity != .writing_response) {
+    // generating text or reasoning (turn end / new turn / tool call), so the
+    // next turn's delta is computed from a clean base and the `-|` underflow
+    // guard in updateVelocity sees a clean reset.
+    const is_generating = switch (active.turn_view.activity) {
+        .writing_response, .thinking => true,
+        else => false,
+    };
+    if (!is_generating) {
         root.app.metrics.streamed_bytes = 0;
     }
     if (refresh_diff) {

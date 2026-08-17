@@ -464,9 +464,9 @@ test "root overlay host does not paint outside panel" {
     };
 
     const surface = try root.widget().draw(ctx);
-    try std.testing.expectEqual(@as(usize, 3), surface.children.len);
+    try std.testing.expectEqual(@as(usize, 2), surface.children.len);
 
-    const overlay_host = surface.children[2].surface;
+    const overlay_host = surface.children[1].surface;
     try std.testing.expectEqual(@as(usize, 0), overlay_host.buffer.len);
     try std.testing.expectEqual(@as(usize, 1), overlay_host.children.len);
 
@@ -924,10 +924,12 @@ test "awaiting turn draws loading outside the transcript list" {
     };
     const surface = try root_widget.widget().draw(ctx);
 
-    try std.testing.expectEqual(@as(usize, 3), surface.children.len);
+    try std.testing.expectEqual(@as(usize, 1), surface.children.len);
+    const main_surface = surface.children[0].surface;
+    try std.testing.expectEqual(@as(usize, 3), main_surface.children.len);
     try std.testing.expectEqual(@as(?u32, 1), app.thread.transcript_list.item_count);
     try std.testing.expectEqual(@as(u32, 0), app.thread.transcript_list.cursor);
-    try std.testing.expectEqual(root_layout.rootLayout(10, false, 1, true, false).loading_row, surface.children[1].origin.row);
+    try std.testing.expectEqual(root_layout.rootLayout(10, false, 1, true, false).loading_row, main_surface.children[1].origin.row);
 }
 
 test "awaiting turn preserves selected long message inner scroll" {

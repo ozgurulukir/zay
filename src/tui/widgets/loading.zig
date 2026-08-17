@@ -34,7 +34,7 @@ pub const LoadingWidget = struct {
             .width = width,
             .height = height,
         });
-        if (height > 0) {
+        if (height > 0 and self.app.thread.turn_view.awaitingOutput()) {
             var row: u16 = if (height > 1) 1 else 0;
             const word = loading_spinners[self.app.thread.turn_view.loading_word_index];
             tui_message.MessageWidget.drawLoading(&surface, word, self.app.metrics.loading_frame, &row, ctx);

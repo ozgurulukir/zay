@@ -307,10 +307,10 @@ pub const MetricsState = struct {
     git_label: []const u8 = "",
     context_tokens_used: u32 = 0,
     context_tokens_max: u32 = 128000,
-    /// Accumulator for the active lane's `response_delta` text bytes, fed as
+    /// Accumulator for the active lane's `response_delta` and `thinking_delta` text bytes, fed as
     /// `streamed_bytes / 4` (the chars/4 token estimate) into `telemetry` on
     /// the UI tick. UI-thread-only; reset when the lane's turn leaves
-    /// `.writing_response`. The `TelemetryTracker` itself is a pure value type
+    /// `.writing_response` / `.thinking`. The `TelemetryTracker` itself is a pure value type
     /// with no byte counter — the accumulation lives here.
     streamed_bytes: usize = 0,
     /// EMA token-velocity tracker + context-meter formatter. Updated on the UI

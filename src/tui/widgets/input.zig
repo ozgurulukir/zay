@@ -20,13 +20,12 @@ const vxfw = vaxis.vxfw;
 
 const tui = @import("../../tui.zig");
 const tui_style = @import("../style.zig");
-const tui_status = @import("../status.zig");
-const telemetry = @import("../telemetry.zig");
+const status_bar = @import("status_bar.zig");
 const symbols = @import("../../symbols.zig");
-const panel = @import("panel.zig");
 
 const App = tui.App;
 const DiffCounts = tui.DiffCounts;
+const StatusBarWidget = status_bar.StatusBarWidget;
 
 pub fn writeDiffCounts(surface: *vxfw.Surface, ctx: vxfw.DrawContext, counts: DiffCounts) void {
     const p = tui_style.activePalette();
@@ -500,82 +499,57 @@ pub const InputWidget = struct {
             .style = p.thinking_body,
         };
         var box: vxfw.SizedBox = .{ .child = border.widget(), .size = .{ .width = max_width, .height = border_height } };
-        var surface = try box.widget().draw(ctx.withConstraints(.{ .width = max_width, .height = border_height }, .{ .width = max_width, .height = border_height }));
+        const border_surface = try box.widget().draw(ctx.withConstraints(.{ .width = max_width, .height = border_height }, .{ .width = max_width, .height = border_height }));
 
-        const status_text = if (tui_status.modelStatus(self.app.liveRuntime(), self.app.cached_config)) |status|
-            tui_status.formatModelStatus(ctx.arena, status) catch "no model"
-        else
-            "no model";
-        const live_context_max: u32 = if (self.app.liveRuntime()) |rt|
-            rt.agent.context_window_tokens
-        else if (self.app.metrics.context_tokens_max > 0)
-            self.app.metrics.context_tokens_max
-        else
-            128000;
+        var status_bar_w: StatusBarWidget = .{ .app = self.app };
+        var status_box: vxfw.SizedBox = .{ .child = status_bar_w.widget(), .size = .{ .width = max_width, .height = 1 } };
+        const status_surface = try status_box.widget().draw(ctx.withConstraints(.{ .width = max_width, .height = 1 }, .{ .width = max_width, .height = 1 }));
 
-        const live_context_used: u32 = if (self.app.liveRuntime()) |rt|
-            rt.agent.currentContextTokens()
-        else if (self.app.metrics.context_tokens_used > 0)
-            self.app.metrics.context_tokens_used
-        else
-            0;
-
-        // Telemetry: the streaming velocity gauge (⚡ tok/s) and the 10-block
-        // context capacity meter. Both are gated by their config knobs; the
-        // meter is colored by its severity (green / amber / red), resolved
-        // here against the palette (the formatter stays pure data).
-        const tui_cfg = self.app.cached_config.tui;
-        var meter_buf: [64]u8 = undefined;
-        var meter_text: []const u8 = "";
-        var meter_style = p.model_status;
-        if (tui_cfg.show_context_meter) {
-            const meter = telemetry.TelemetryTracker.formatContextBar(
-                @intCast(live_context_used),
-                @intCast(live_context_max),
-                tui_cfg.context_threshold_warn,
-                tui_cfg.context_threshold_alert,
-                &meter_buf,
-            );
-            meter_text = meter.text;
-            meter_style = switch (meter.level) {
-                .normal => p.success,
-                .warn => p.notice,
-                .alert => p.error_style,
+        const bottom = border_height -| 1;
+        const git_label = self.app.metrics.git_label;
+        var git_surface: ?vxfw.Surface = null;
+        var git_origin_col: u16 = 0;
+        if (git_label.len > 0) {
+            var git_text: vxfw.Text = .{
+                .text = git_label,
+                .softwrap = false,
+                .overflow = .ellipsis,
+                .width_basis = .longest_line,
+                .style = p.thinking_body,
             };
-        }
-        var velocity_buf: [32]u8 = undefined;
-        var velocity_text: []const u8 = "";
-        if (tui_cfg.show_token_velocity) {
-            const is_streaming = self.app.thread.turn_view.activity == .writing_response;
-            velocity_text = telemetry.TelemetryTracker.formatVelocity(self.app.metrics.telemetry.current_tokens_per_sec, is_streaming, &velocity_buf);
-        }
-
-        // Right-aligned label row: the meter is written first (rightmost) in
-        // its level color, then the velocity + model status sit to its left in
-        // the model-status color. `writeBorderTextEndingAt` returns the column
-        // where the text started — or 0 when it was truncated (too wide for the
-        // terminal), a sentinel that makes `left_end` 0 and skips the neighbors
-        // so the label never overlaps or overflows.
-        const right_edge = max_width -| 3;
-        const meter_start = if (meter_text.len > 0)
-            panel.writeBorderTextEndingAt(&surface, ctx, 0, right_edge, meter_text, meter_style)
-        else
-            right_edge;
-        const left_end = meter_start -| 2;
-        if (left_end > 0) {
-            if (velocity_text.len > 0 and status_text.len > 0) {
-                const label_text = std.fmt.allocPrint(ctx.arena, "{s}  {s}", .{ velocity_text, status_text }) catch status_text;
-                _ = panel.writeBorderTextEndingAt(&surface, ctx, 0, left_end, label_text, p.model_status);
-            } else if (velocity_text.len > 0) {
-                _ = panel.writeBorderTextEndingAt(&surface, ctx, 0, left_end, velocity_text, p.model_status);
-            } else if (status_text.len > 0) {
-                _ = panel.writeBorderTextEndingAt(&surface, ctx, 0, left_end, status_text, p.model_status);
+            const surf = try git_text.widget().draw(ctx.withConstraints(.{ .width = 0, .height = 1 }, .{ .width = max_width -| 2, .height = 1 }));
+            if (surf.size.width > 0) {
+                git_surface = surf;
+                git_origin_col = (max_width -| 2) -| surf.size.width;
             }
         }
-        // Bottom-right: git branch info at the edge.
-        const bottom = border_height -| 1;
-        _ = panel.writeBorderTextEndingAt(&surface, ctx, bottom, right_edge, self.app.metrics.git_label, p.thinking_body);
-        return surface;
+
+        const child_count: usize = if (git_surface != null) 3 else 2;
+        const children = try ctx.arena.alloc(vxfw.SubSurface, child_count);
+        children[0] = .{
+            .origin = .{ .row = 0, .col = 0 },
+            .surface = border_surface,
+            .z_index = 0,
+        };
+        children[1] = .{
+            .origin = .{ .row = 0, .col = 0 },
+            .surface = status_surface,
+            .z_index = 1,
+        };
+        if (git_surface) |surf| {
+            children[2] = .{
+                .origin = .{ .row = bottom, .col = git_origin_col },
+                .surface = surf,
+                .z_index = 1,
+            };
+        }
+
+        return vxfw.Surface{
+            .size = .{ .width = max_width, .height = border_height },
+            .widget = self.widget(),
+            .buffer = &.{},
+            .children = children,
+        };
     }
 
     fn drawQueuedMessage(self: *InputWidget, ctx: vxfw.DrawContext, width: u16) std.mem.Allocator.Error!vxfw.Surface {
@@ -615,12 +589,14 @@ pub const InputWidget = struct {
     fn drawLanesBadge(self: *InputWidget, ctx: vxfw.DrawContext, max_width: u16) std.mem.Allocator.Error!vxfw.Surface {
         const p = tui_style.activePalette();
         const text = try std.fmt.allocPrint(ctx.arena, " {d} Lanes ", .{self.app.threads.len()});
-        const text_width: u16 = @intCast(@min(ctx.stringWidth(text), max_width));
-        var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = text_width, .height = 1 });
-        if (text_width == 0) return surface;
-        panel.fillRow(&surface, 0, p.lanes_badge);
-        panel.lineStyledAt(&surface, 0, text, ctx, 0, p.lanes_badge) catch {};
-        return surface;
+        var pill_text: vxfw.Text = .{
+            .text = text,
+            .style = p.lanes_badge,
+            .softwrap = false,
+            .overflow = .ellipsis,
+            .width_basis = .longest_line,
+        };
+        return pill_text.widget().draw(ctx.withConstraints(.{ .width = 0, .height = 1 }, .{ .width = max_width, .height = 1 }));
     }
 
     /// Bottom-left status pill: live background-job count + the Ctrl+O hint, in
@@ -629,12 +605,14 @@ pub const InputWidget = struct {
         const p = tui_style.activePalette();
         const count = self.app.runningBackgroundCount();
         const text = try std.fmt.allocPrint(ctx.arena, " {d} background job{s} · Ctrl+O ", .{ count, if (count == 1) "" else "s" });
-        const text_width: u16 = @intCast(@min(ctx.stringWidth(text), max_width));
-        var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = text_width, .height = 1 });
-        if (text_width == 0) return surface;
-        panel.fillRow(&surface, 0, p.background_badge);
-        panel.lineStyledAt(&surface, 0, text, ctx, 0, p.background_badge) catch {};
-        return surface;
+        var pill_text: vxfw.Text = .{
+            .text = text,
+            .style = p.background_badge,
+            .softwrap = false,
+            .overflow = .ellipsis,
+            .width_basis = .longest_line,
+        };
+        return pill_text.widget().draw(ctx.withConstraints(.{ .width = 0, .height = 1 }, .{ .width = max_width, .height = 1 }));
     }
 
     fn drawDiffCounts(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, child_index: usize, row: u16, width: u16) std.mem.Allocator.Error!void {

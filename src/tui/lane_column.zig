@@ -73,3 +73,24 @@ pub fn drawLaneColumn(app: *App, ctx: vxfw.DrawContext, lane: *Thread, width: u1
         .{ .width = width, .height = height },
     ));
 }
+
+pub const LaneColumnWidget = struct {
+    app: *App,
+    lane: *Thread,
+    width: u16,
+    height: u16,
+    active: bool,
+    focused: bool,
+
+    pub fn widget(self: *LaneColumnWidget) vxfw.Widget {
+        return .{
+            .userdata = self,
+            .drawFn = draw,
+        };
+    }
+
+    fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *LaneColumnWidget = @ptrCast(@alignCast(ptr));
+        return drawLaneColumn(self.app, ctx, self.lane, self.width, self.height, self.active, self.focused);
+    }
+};

@@ -34,6 +34,11 @@ pub const Content = struct {
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
         if (width == 0 or height == 0) return surface;
+        const empty_cell = vaxis.Cell{
+            .char = .{ .grapheme = " ", .width = 1 },
+            .style = .{},
+        };
+        @memset(surface.buffer, empty_cell);
 
         try self.drawEntries(&surface, ctx);
         return surface;

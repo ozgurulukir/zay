@@ -261,16 +261,49 @@ pub const DiffCommentEditor = struct {
         const p = tui_style.activePalette();
         const app = self.app;
         const label = app.diff.rangeLabel(ctx.arena, app.diff.comment_anchor) catch "comment";
-        const inner_w: u16 = (ctx.max.width orelse 2) -| 2;
+        const max_w = ctx.max.width orelse ctx.min.width;
+        const inner_w: u16 = max_w -| 2;
         var input_box: vxfw.SizedBox = .{ .child = app.inputs.comment.widget(), .size = .{ .width = inner_w, .height = 1 } };
         var border: vxfw.Border = .{
             .child = input_box.widget(),
             .style = p.border_label,
             .labels = &.{.{ .text = label, .alignment = .top_left }},
         };
-        var surface = try border.widget().draw(ctx);
-        panel.writeBorderLabelRight(&surface, ctx, 0, "^S save · Esc cancel", p.thinking_body);
-        return surface;
+        const border_surface = try border.widget().draw(ctx);
+
+        const hint_text_str = "^S save · Esc cancel";
+        var hint_text: vxfw.Text = .{
+            .text = hint_text_str,
+            .softwrap = false,
+            .overflow = .ellipsis,
+            .width_basis = .longest_line,
+            .style = p.thinking_body,
+        };
+        const hint_surf = try hint_text.widget().draw(ctx.withConstraints(.{ .width = 0, .height = 1 }, .{ .width = max_w -| 2, .height = 1 }));
+
+        var child_count: usize = 1;
+        if (hint_surf.size.width > 0) child_count += 1;
+        const children = try ctx.arena.alloc(vxfw.SubSurface, child_count);
+        children[0] = .{
+            .origin = .{ .row = 0, .col = 0 },
+            .surface = border_surface,
+            .z_index = 0,
+        };
+        if (hint_surf.size.width > 0) {
+            const hint_origin_col = (max_w -| 2) -| hint_surf.size.width;
+            children[1] = .{
+                .origin = .{ .row = 0, .col = hint_origin_col },
+                .surface = hint_surf,
+                .z_index = 1,
+            };
+        }
+
+        return vxfw.Surface{
+            .size = border_surface.size,
+            .widget = self.widget(),
+            .buffer = &.{},
+            .children = children,
+        };
     }
 };
 

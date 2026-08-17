@@ -60,6 +60,7 @@ fn toastSink(level: std.log.Level, msg: []const u8) void {
 
 pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     if (try handleVersionFlag(init, gpa)) return;
+    os.initConsoleUtf8();
     @import("tools/bash_exec.zig").disablePseudoConsole();
 
     if (resolveLogPath(gpa, init.environ_map)) |log_path| {
@@ -291,6 +292,7 @@ test {
     _ = @import("tui/tests.zig");
     _ = @import("tui/bounded_list.zig");
     _ = @import("tui/style.zig");
+    _ = @import("tui/widgets/status_bar.zig");
     // The telemetry engine (token velocity EMA + context meter) is a new
     // module; reference it here so its inline tests compile into the run
     // (AGENTS.md test-runner quirk: a file only referenced lazily is never

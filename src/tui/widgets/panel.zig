@@ -201,6 +201,8 @@ fn tailStart(text: []const u8, ctx: vxfw.DrawContext, max_cols: u16) usize {
 /// Draw `text` on `row` so its last cell ends at `end_col` (inclusive), filling
 /// leftward. Returns the first column the text occupies — or `end_col + 1` when
 /// nothing was drawn — so a caller can place another label further left.
+///
+/// NOTE: Kept for list-row trailing text / marks (fuzzy list rows, pickers), NOT for widget layout.
 pub fn writeBorderTextEndingAt(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, end_col: u16, text: []const u8, style: vaxis.Style) u16 {
     if (text.len == 0 or row >= surface.size.height or end_col == 0) return end_col + 1;
     const text_w: u16 = @intCast(@min(ctx.stringWidth(text), std.math.maxInt(u16)));
@@ -233,13 +235,14 @@ pub fn writeBorderTextEndingAt(surface: *vxfw.Surface, ctx: vxfw.DrawContext, ro
         }
         return 0;
     }
-    const start: u16 = end_col + 1 - text_w;
+    const start = end_col + 1 - text_w;
     var col = start;
     var iter = ctx.graphemeIterator(text);
     while (iter.next()) |grapheme| {
         const bytes = grapheme.bytes(text);
         const width: u16 = @intCast(ctx.stringWidth(bytes));
         if (width == 0) continue;
+        if (col + width > end_col + 1) break;
         surface.writeCell(col, row, .{
             .char = .{ .grapheme = bytes, .width = @intCast(width) },
             .style = style,
@@ -247,30 +250,6 @@ pub fn writeBorderTextEndingAt(surface: *vxfw.Surface, ctx: vxfw.DrawContext, ro
         col += width;
     }
     return start;
-}
-
-pub fn writeBorderLabelRight(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, text: []const u8, style: vaxis.Style) void {
-    if (text.len == 0 or row >= surface.size.height) return;
-    const w = surface.size.width;
-    if (w < 4) return;
-    const max_w: u16 = w -| 3;
-    const text_w: u16 = @intCast(@min(ctx.stringWidth(text), @as(usize, max_w)));
-    if (text_w == 0) return;
-    var col: u16 = w -| 2 -| text_w;
-    var used: u16 = 0;
-    var iter = ctx.graphemeIterator(text);
-    while (iter.next()) |grapheme| {
-        const bytes = grapheme.bytes(text);
-        const width: u16 = @intCast(ctx.stringWidth(bytes));
-        if (width == 0) continue;
-        if (used + width > text_w) break;
-        surface.writeCell(col, row, .{
-            .char = .{ .grapheme = bytes, .width = @intCast(width) },
-            .style = style,
-        });
-        col += width;
-        used += width;
-    }
 }
 
 /// Greedy left-to-right subsequence match: for each query rune, find its first

@@ -64,7 +64,6 @@ const model_picker = @import("tui/widgets/model_picker.zig");
 const provider_picker = @import("tui/widgets/provider_picker.zig");
 const tree_selector = @import("tui/widgets/tree_selector.zig");
 const lanes_picker = @import("tui/widgets/lanes_picker.zig");
-const panel = @import("tui/widgets/panel.zig");
 const tui_provider = @import("tui/provider_controller.zig");
 const tui_style = @import("tui/style.zig");
 pub const modelsdev = @import("models/registry.zig");
@@ -1431,14 +1430,6 @@ pub const AtSearchWidget = struct {
         return content.widget().draw(ctx);
     }
 };
-
-pub fn writeBorderTextEndingAt(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, end_col: u16, text: []const u8, style: vaxis.Style) u16 {
-    return panel.writeBorderTextEndingAt(surface, ctx, row, end_col, text, style);
-}
-
-pub fn writeBorderLabelRight(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, text: []const u8, style: vaxis.Style) void {
-    panel.writeBorderLabelRight(surface, ctx, row, text, style);
-}
 
 const reasoning_options = [_]model_picker.ReasoningOption{
     .{ .label = "default", .effort = .default },

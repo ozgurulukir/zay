@@ -72,89 +72,148 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
     var input_view: input_mod.InputWidget = .{ .app = app };
     var overlay_view: overlay.OverlayWidget = .{ .app = app };
 
-    const transcript_ctx = ctx.withConstraints(
-        .{ .width = max_width, .height = layout.transcript_height },
-        .{ .width = max_width, .height = layout.transcript_height },
-    );
-    const input_ctx = ctx.withConstraints(
-        .{ .width = max_width, .height = layout.input_height },
-        .{ .width = max_width, .height = layout.input_height },
-    );
-
     const overlay_visible = app.mode != .normal;
     const permission_visible = app.permissionPending() and !overlay_visible;
     const background_visible = app.background_modal_state.modal and !overlay_visible and !permission_visible;
     const at_visible = (app.at_search != .closed) and !overlay_visible and !permission_visible and !background_visible;
     const toast_visible = toast.global.hasToasts();
 
-    var child_count: usize = (if (split) split_cols.len else 1) + 1;
-    if (loading_visible) child_count += 1;
+    // Top area: single transcript or split grid/dual columns.
+    var transcript_box: vxfw.SizedBox = undefined;
+    var dual_lane_widgets: [2]lane_column.LaneColumnWidget = undefined;
+    var dual_lane_boxes: [2]vxfw.SizedBox = undefined;
+    var dual_flex_items: [2]vxfw.FlexItem = undefined;
+    var dual_row: vxfw.FlexRow = undefined;
+    var grid_lane_widgets: [4]lane_column.LaneColumnWidget = undefined;
+    var grid_lane_boxes: [4]vxfw.SizedBox = undefined;
+    var grid_row0_buf: [2]vxfw.FlexItem = undefined;
+    var grid_row1_buf: [2]vxfw.FlexItem = undefined;
+    var grid_row0_flex: vxfw.FlexRow = undefined;
+    var grid_row1_flex: vxfw.FlexRow = undefined;
+    var grid_rows_buf: [2]vxfw.FlexItem = undefined;
+    var grid_col: vxfw.FlexColumn = undefined;
+    var split_box: vxfw.SizedBox = undefined;
+
+    const top_widget = if (split) blk: {
+        if (app.split_mode == .dual) {
+            for (split_cols, 0..) |col, i| {
+                const lane = app.threads.slice()[col.lane_index];
+                const worker_focus = @max(@min(app.focused_worker_index, app.threads.len() - 1), 1);
+                const active = (col.lane_index == 0) or (col.lane_index == worker_focus);
+                const focused = (col.lane_index == worker_focus);
+                dual_lane_widgets[i] = .{
+                    .app = app,
+                    .lane = lane,
+                    .width = col.width,
+                    .height = col.height,
+                    .active = active,
+                    .focused = focused,
+                };
+                dual_lane_boxes[i] = .{
+                    .child = dual_lane_widgets[i].widget(),
+                    .size = .{ .width = col.width, .height = col.height },
+                };
+                dual_flex_items[i] = .{ .widget = dual_lane_boxes[i].widget(), .flex = 0 };
+            }
+            dual_row = .{ .children = dual_flex_items[0..split_cols.len] };
+            split_box = .{
+                .child = dual_row.widget(),
+                .size = .{ .width = max_width, .height = layout.transcript_height },
+            };
+            break :blk split_box.widget();
+        } else {
+            var row0_count: usize = 0;
+            var row1_count: usize = 0;
+            for (split_cols, 0..) |col, i| {
+                const lane = app.threads.slice()[col.lane_index];
+                const active = (col.lane_index == @as(usize, app.activeIndex()));
+                const focused = (col.lane_index == @as(usize, app.activeIndex()));
+                grid_lane_widgets[i] = .{
+                    .app = app,
+                    .lane = lane,
+                    .width = col.width,
+                    .height = col.height,
+                    .active = active,
+                    .focused = focused,
+                };
+                grid_lane_boxes[i] = .{
+                    .child = grid_lane_widgets[i].widget(),
+                    .size = .{ .width = col.width, .height = col.height },
+                };
+                if (col.row == 0) {
+                    grid_row0_buf[row0_count] = .{ .widget = grid_lane_boxes[i].widget(), .flex = 0 };
+                    row0_count += 1;
+                } else {
+                    grid_row1_buf[row1_count] = .{ .widget = grid_lane_boxes[i].widget(), .flex = 0 };
+                    row1_count += 1;
+                }
+            }
+            grid_row0_flex = .{ .children = grid_row0_buf[0..row0_count] };
+            grid_rows_buf[0] = .{ .widget = grid_row0_flex.widget(), .flex = 0 };
+            var grid_rows_count: usize = 1;
+            if (row1_count > 0) {
+                grid_row1_flex = .{ .children = grid_row1_buf[0..row1_count] };
+                grid_rows_buf[1] = .{ .widget = grid_row1_flex.widget(), .flex = 0 };
+                grid_rows_count = 2;
+            }
+            grid_col = .{ .children = grid_rows_buf[0..grid_rows_count] };
+            split_box = .{
+                .child = grid_col.widget(),
+                .size = .{ .width = max_width, .height = layout.transcript_height },
+            };
+            break :blk split_box.widget();
+        }
+    } else blk: {
+        transcript_box = .{
+            .child = transcript_view.widget(),
+            .size = .{ .width = max_width, .height = layout.transcript_height },
+        };
+        break :blk transcript_box.widget();
+    };
+
+    var main_flex_buf: [3]vxfw.FlexItem = undefined;
+    var main_flex_count: usize = 0;
+
+    main_flex_buf[main_flex_count] = .{ .widget = top_widget, .flex = 1 };
+    main_flex_count += 1;
+
+    const include_loading = split or loading_visible;
+    var loading_box: vxfw.SizedBox = undefined;
+    if (include_loading) {
+        loading_box = .{
+            .child = loading_view.widget(),
+            .size = .{ .width = max_width, .height = layout.loading_height },
+        };
+        main_flex_buf[main_flex_count] = .{ .widget = loading_box.widget(), .flex = 0 };
+        main_flex_count += 1;
+    }
+
+    var input_box: vxfw.SizedBox = .{
+        .child = input_view.widget(),
+        .size = .{ .width = max_width, .height = layout.input_height },
+    };
+    main_flex_buf[main_flex_count] = .{ .widget = input_box.widget(), .flex = 0 };
+    main_flex_count += 1;
+
+    var main_col: vxfw.FlexColumn = .{ .children = main_flex_buf[0..main_flex_count] };
+    const main_surface = try main_col.widget().draw(ctx.withConstraints(
+        .{ .width = max_width, .height = max_height },
+        .{ .width = max_width, .height = max_height },
+    ));
+
+    var child_count: usize = 1;
     if (overlay_visible) child_count += 1;
     if (permission_visible) child_count += 1;
     if (background_visible) child_count += 1;
     if (at_visible) child_count += 1;
     if (toast_visible) child_count += 1;
     const children = try ctx.arena.alloc(vxfw.SubSurface, child_count);
-    var idx: usize = 0;
-    if (split) {
-        // Render each split column from the shared geometry. `.dual` shows the
-        // driver (lane 0) on the left and the focused worker on the right;
-        // `.grid` tiles all lanes. The active flag derives from the focus state,
-        // not just `app.thread`: in `.dual` the left column is active (the
-        // driver is always the input-routing lane) and the right column is
-        // active when it projects the focused worker.
-        for (split_cols) |col| {
-            const lane = app.threads.slice()[col.lane_index];
-            // Clamp the focused worker so a momentarily out-of-range index
-            // (e.g. right after a lane deletion) still highlights the clamped
-            // right-pane column instead of leaving it dim/unhighlighted.
-            // `split` guarantees `threads.len() > 1`, so `lane_max >= 1`.
-            const worker_focus = @max(@min(app.focused_worker_index, app.threads.len() - 1), 1);
-            // `active` marks the ●/dim state; `focused` selects the single
-            // column whose border is highlighted. In `.dual` the driver (left)
-            // and focused worker (right) are both active, but only the right
-            // pane's worker is "focused"; in `.grid` the active lane is focused.
-            const active = if (app.split_mode == .dual)
-                (col.lane_index == 0) or (col.lane_index == worker_focus)
-            else
-                (col.lane_index == @as(usize, app.activeIndex()));
-            const focused = if (app.split_mode == .dual)
-                (col.lane_index == worker_focus)
-            else
-                (col.lane_index == @as(usize, app.activeIndex()));
-            children[idx] = .{
-                .origin = .{ .row = col.row, .col = col.col },
-                .surface = try lane_column.drawLaneColumn(app, ctx, lane, col.width, col.height, active, focused),
-                .z_index = 0,
-            };
-            idx += 1;
-        }
-    } else {
-        children[idx] = .{
-            .origin = .{ .row = 0, .col = 0 },
-            .surface = try transcript_view.widget().draw(transcript_ctx),
-            .z_index = 0,
-        };
-        idx += 1;
-    }
-    if (loading_visible) {
-        const loading_ctx = ctx.withConstraints(
-            .{ .width = max_width, .height = layout.loading_height },
-            .{ .width = max_width, .height = layout.loading_height },
-        );
-        children[idx] = .{
-            .origin = .{ .row = layout.loading_row, .col = 0 },
-            .surface = try loading_view.widget().draw(loading_ctx),
-            .z_index = 0,
-        };
-        idx += 1;
-    }
-    children[idx] = .{
-        .origin = .{ .row = layout.input_row, .col = 0 },
-        .surface = try input_view.widget().draw(input_ctx),
+    children[0] = .{
+        .origin = .{ .row = 0, .col = 0 },
+        .surface = main_surface,
         .z_index = 0,
     };
-    idx += 1;
+    var idx: usize = 1;
     if (overlay_visible) {
         var centered_overlay: vxfw.Center = .{ .child = overlay_view.widget() };
         children[idx] = .{

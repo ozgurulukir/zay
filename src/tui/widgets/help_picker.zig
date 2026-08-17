@@ -187,6 +187,11 @@ pub const Content = struct {
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
         if (width == 0 or height == 0) return surface;
+        const empty_cell = vaxis.Cell{
+            .char = .{ .grapheme = " ", .width = 1 },
+            .style = .{},
+        };
+        @memset(surface.buffer, empty_cell);
 
         // Reserve last row for bottom hint bar. The border consumed 2 rows
         // upstream, so `height` is the inner panel and `height -| 1` equals

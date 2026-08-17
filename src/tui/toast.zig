@@ -183,12 +183,21 @@ pub const Widget = struct {
             total_height +|= 2 + rows;
         }
 
+        if (box_width < 2 or total_height == 0) return vxfw.Surface.empty(self.widget());
+
         var surface = try vxfw.Surface.initWithChildren(
             ctx.arena,
             self.widget(),
             .{ .width = box_width, .height = total_height },
             &.{},
         );
+
+        // Pre-fill surface with empty space cells to ensure no uninitialized memory.
+        const empty_cell = vaxis.Cell{
+            .char = .{ .grapheme = " ", .width = 1 },
+            .style = .{},
+        };
+        @memset(surface.buffer, empty_cell);
 
         var row: u16 = 0;
         const p = tui_style.activePalette();
@@ -200,12 +209,35 @@ pub const Widget = struct {
                 .err => p.error_style,
             };
             const rows = heights[i];
+            const top_row = row;
+            const bottom_row = row + 1 + rows;
+
             // Border top.
-            try panel.lineStyledAt(&surface, row, "", ctx, 0, style);
+            surface.writeCell(0, top_row, .{ .char = .{ .grapheme = "╭", .width = 1 }, .style = style });
+            surface.writeCell(box_width - 1, top_row, .{ .char = .{ .grapheme = "╮", .width = 1 }, .style = style });
+            var c: u16 = 1;
+            while (c < box_width - 1) : (c += 1) {
+                surface.writeCell(c, top_row, .{ .char = .{ .grapheme = "─", .width = 1 }, .style = style });
+            }
+
+            // Side borders.
+            var r: u16 = top_row + 1;
+            while (r < bottom_row) : (r += 1) {
+                surface.writeCell(0, r, .{ .char = .{ .grapheme = "│", .width = 1 }, .style = style });
+                surface.writeCell(box_width - 1, r, .{ .char = .{ .grapheme = "│", .width = 1 }, .style = style });
+            }
+
             // Content rows: soft-wrap the message, truncating past `max_wrap_rows`.
-            drawWrapped(&surface, item.message(), style, ctx, row + 1, content_width);
+            drawWrapped(&surface, item.message(), style, ctx, top_row + 1, content_width);
+
             // Border bottom.
-            try panel.lineStyledAt(&surface, row + 1 + rows, "", ctx, 0, style);
+            surface.writeCell(0, bottom_row, .{ .char = .{ .grapheme = "╰", .width = 1 }, .style = style });
+            surface.writeCell(box_width - 1, bottom_row, .{ .char = .{ .grapheme = "╯", .width = 1 }, .style = style });
+            c = 1;
+            while (c < box_width - 1) : (c += 1) {
+                surface.writeCell(c, bottom_row, .{ .char = .{ .grapheme = "─", .width = 1 }, .style = style });
+            }
+
             row += 2 + rows;
         }
         return surface;
@@ -245,38 +277,49 @@ fn wrappedRows(text: []const u8, width: u16, ctx: vxfw.DrawContext) u16 {
 fn drawWrapped(surface: *vxfw.Surface, text: []const u8, style: vaxis.Style, ctx: vxfw.DrawContext, row: u16, width: u16) void {
     if (text.len == 0 or width == 0) return;
     var r: u16 = row;
-    var col: u16 = 0;
+    var col: u16 = 1;
+    var last_row_col: u16 = 1;
+    var truncated = false;
     var iter = ctx.graphemeIterator(text);
     while (iter.next()) |grapheme| {
-        if (r >= row + max_wrap_rows) break;
-        if (r >= surface.size.height) break;
         const bytes = grapheme.bytes(text);
         if (std.mem.eql(u8, bytes, "\n")) {
+            if (r + 1 >= row + max_wrap_rows) {
+                truncated = true;
+                break;
+            }
             r += 1;
-            col = 0;
+            col = 1;
             continue;
         }
         const w: u16 = @intCast(ctx.stringWidth(bytes));
         if (w == 0) continue;
-        if (col + w > width) {
+        if (col + w > width + 1) {
+            if (r + 1 >= row + max_wrap_rows) {
+                truncated = true;
+                break;
+            }
             r += 1;
-            col = 0;
-            if (r >= row + max_wrap_rows) break;
+            col = 1;
         }
-        if (col < surface.size.width) {
+        if (col < surface.size.width -| 1) {
             surface.writeCell(col, r, .{
                 .char = .{ .grapheme = bytes, .width = @intCast(w) },
                 .style = style,
             });
+            last_row_col = col + w;
         }
         col += w;
     }
-    // If the message was truncated by the row cap, mark the tail with `…`.
-    if (r >= row + max_wrap_rows and col > 0 and col < surface.size.width) {
-        surface.writeCell(col, r, .{
-            .char = .{ .grapheme = "…", .width = 1 },
-            .style = style,
-        });
+    // If the message was truncated by the row cap, mark the tail on the last valid row with `…`.
+    if (truncated and r < surface.size.height) {
+        const ellipsis_col = if (last_row_col < surface.size.width -| 1) last_row_col else surface.size.width -| 2;
+        if (ellipsis_col >= 1 and ellipsis_col < surface.size.width -| 1) {
+            surface.writeCell(ellipsis_col, r, .{
+                .char = .{ .grapheme = "…", .width = 1 },
+                .style = style,
+            });
+        }
     }
 }
 
@@ -412,3 +455,66 @@ test "wrappedRows caps at max_wrap_rows" {
     // A long run of words at width 5 would exceed the cap; it clamps.
     try std.testing.expectEqual(max_wrap_rows, wrappedRows("one two three four five six", 5, ctx));
 }
+
+test "Widget.draw renders initialized bordered surface" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var bus: ToastBus = .{};
+    bus.init(std.testing.io);
+    bus.push(.info, "test message");
+
+    var widget_instance: Widget = .{ .bus = &bus };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 30, .height = 10 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const surface = try widget_instance.widget().draw(ctx);
+    try std.testing.expect(surface.size.width == 30);
+    try std.testing.expect(surface.size.height == 3); // 1 top border + 1 content row + 1 bottom border
+    try std.testing.expect(surface.buffer.len == 30 * 3);
+
+    // Verify top border corners
+    try std.testing.expectEqualStrings("╭", surface.buffer[0].char.grapheme);
+    try std.testing.expectEqualStrings("╮", surface.buffer[29].char.grapheme);
+    try std.testing.expectEqualStrings("─", surface.buffer[1].char.grapheme);
+
+    // Verify content row side borders
+    try std.testing.expectEqualStrings("│", surface.buffer[30].char.grapheme);
+    try std.testing.expectEqualStrings("│", surface.buffer[59].char.grapheme);
+
+    // Verify bottom border corners
+    try std.testing.expectEqualStrings("╰", surface.buffer[60].char.grapheme);
+    try std.testing.expectEqualStrings("╯", surface.buffer[89].char.grapheme);
+    try std.testing.expectEqualStrings("─", surface.buffer[61].char.grapheme);
+}
+
+test "Widget.draw truncates long toast with ellipsis and preserves borders" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var bus: ToastBus = .{};
+    bus.init(std.testing.io);
+    bus.push(.info, "word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12");
+
+    var widget_instance: Widget = .{ .bus = &bus };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 15, .height = 10 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const surface = try widget_instance.widget().draw(ctx);
+    // 1 top + max_wrap_rows (4) + 1 bottom = 6 rows
+    try std.testing.expectEqual(2 + max_wrap_rows, surface.size.height);
+    try std.testing.expectEqual(@as(u16, 15), surface.size.width);
+
+    // Verify bottom border corners on row 5
+    const bottom_start = 15 * (2 + max_wrap_rows - 1);
+    try std.testing.expectEqualStrings("╰", surface.buffer[bottom_start].char.grapheme);
+    try std.testing.expectEqualStrings("╯", surface.buffer[bottom_start + 14].char.grapheme);
+}
+
+
