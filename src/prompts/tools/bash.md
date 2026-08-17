@@ -23,7 +23,7 @@ Bounded reads keep the transcript small and leave more context for reasoning.
 
 - For commands that take a long time or never return on their own — builds, dev servers, watchers, `tail -f` — set `run_in_background: true`. The call returns immediately with a job id, pid, and a log file path instead of blocking.
 - The command keeps running after the call returns. Its eventual exit is delivered to you as a message; do not poll in a busy loop waiting for it.
-- To check on a background job meanwhile, read its log file (e.g. `tail -n 50 <path>`) or use `ps`/`taskkill` with the reported pid. The log path stays valid for the life of the job.
+- To check on or cancel a background job meanwhile, use the `background` tool (`background { command: "status", id: <id> }`, `background { command: "tail", id: <id> }`, or `background { command: "cancel", id: <id> }`). The log path stays valid for the life of the job.
 - `timeout` is ignored for background commands. Use a normal (foreground) call for anything you need the output of right away.
 
 ## Error handling

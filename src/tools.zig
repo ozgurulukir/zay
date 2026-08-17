@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const background_tool = @import("tools/background.zig");
 const bash_tool = @import("tools/bash.zig");
 const common = @import("tools/common.zig");
 const lane_tool = @import("tools/lane.zig");
@@ -80,8 +81,8 @@ test "registry contains every tool exactly once" {
         const gop = try seen.getOrPut(std.testing.allocator, tool.name);
         try std.testing.expect(!gop.found_existing);
     }
-    // Always exactly one shell tool (bash-xor-pwsh) + lane, on both hosts.
-    try std.testing.expectEqual(@as(usize, 2), builtinRegistry().len);
+    // Always exactly one shell tool (bash-xor-pwsh) + lane + background, on both hosts.
+    try std.testing.expectEqual(@as(usize, 3), builtinRegistry().len);
 }
 
 test "lookup finds a registered tool" {
@@ -94,6 +95,7 @@ test "lookup returns null for unknown tool" {
 }
 
 test {
+    _ = background_tool;
     _ = bash_tool;
     _ = lane_tool;
     _ = pwsh_tool;

@@ -5,6 +5,7 @@ const std = @import("std");
 const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
 const background = @import("background.zig");
+const background_tool = @import("tools/background.zig");
 const bash_tool = @import("tools/bash.zig");
 const lane_bridge = @import("tools/lane_bridge.zig");
 const lua_mod = @import("lua/root.zig");
@@ -460,6 +461,13 @@ pub const ExecutorService = struct {
         const prev_lane = lane_bridge.lane_bridge_slot;
         lane_bridge.lane_bridge_slot = .{ .bridge = self.lane_bridge, .requester = self.lane_requester };
         defer lane_bridge.lane_bridge_slot = prev_lane;
+
+        const prev_bg = background_tool.background_slot;
+        background_tool.background_slot = if (self.background) |bg|
+            .{ .manager = bg.manager, .owner = bg.owner }
+        else
+            .{};
+        defer background_tool.background_slot = prev_bg;
         if (self.contained) {
             // Lane worker: route through `runContained`, which prepends the
             // shell containment guard before running (background or foreground).

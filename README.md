@@ -56,7 +56,7 @@ Nova is a native terminal AI agent for working with code. It runs in your termin
 | **Lua plugins** | Extend Nova with sandboxed Lua plugins — filesystem, git, JSON bridge, custom tools, event hooks, prompt injection |
 | **Session persistence** | Full conversation history in SQLite. Resume any session, browse the timeline tree, rename or delete past sessions. |
 | **Context compaction** | Non-blocking context compaction with calibrated retention budgets — keeps long sessions under the model's context window without losing your place |
-| **Background jobs** | Run shell commands in the background; results land as messages when the owning lane is idle |
+| **Background jobs** | Run shell commands asynchronously (`run_in_background: true`); inspect, tail logs, and cancel via the native `background` tool (`list`/`status`/`tail`/`cancel`) or view via `Ctrl+O` |
 
 ## Getting around
 

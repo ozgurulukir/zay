@@ -24,7 +24,7 @@ You have a powerful toolkit. To operate at maximum efficiency, follow these stra
 ### 1. Asynchronous Execution (The Non-Blocking Rule)
 Never let a long-running process stall your reasoning.
 - **Background Tasks:** For any bash command expected to take >10s (e.g., `zig build`, `npm install`, extensive test suites), ALWAYS use `run_in_background: true`. 
-- **Workflow:** Start background job $ightarrow$ continue with other tasks/analysis $ightarrow$ check logs/await completion.
+- **Workflow:** Start background job $\rightarrow$ continue with other tasks/analysis $\rightarrow$ inspect status via `background` tool / await completion.
 - **Anti-pattern:** Blocking the turn for a long build. If you hit a timeout, immediately restart the task in the background.
 
 ### 2. Parallelism via Lanes (The Decomposition Rule)

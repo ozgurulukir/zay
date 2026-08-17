@@ -36,7 +36,7 @@ pub const tool: common.Tool = .{
         }, .{ .name = "timeout", .kind = .integer, .description = "Timeout in seconds (default 30).", .required = false, .nullable = true }, .{
             .name = "run_in_background",
             .kind = .boolean,
-            .description = "Run the command in the background and return immediately. Use for long-running commands (builds, dev servers, watchers) so you are not blocked. The command's exit will be delivered to you as a message; meanwhile read its log file or use ps to check on it. The `timeout` field is ignored for background commands.",
+            .description = "Run the command in the background and return immediately. Use for long-running commands (builds, dev servers, watchers) so you are not blocked. The command's exit will be delivered to you as a message; meanwhile use the `background` tool to inspect status/logs or cancel it. The `timeout` field is ignored for background commands.",
             .required = false,
             .nullable = true,
         } },
@@ -245,10 +245,11 @@ fn runBackgroundImpl(
 
     const text = try std.fmt.allocPrint(
         gpa,
-        "Started in the background as {s} (pid {d}).\n" ++
-            "Output is streaming to {s} — read that file (e.g. tail) or use ps to check on it.\n" ++
+        "Started in the background as {s} (id {d}, pid {d}).\n" ++
+            "Output is streaming to {s}.\n" ++
+            "To inspect status/logs or cancel, use the `background` tool (`command`: \"status\"/\"tail\"/\"cancel\", `id`: {d}).\n" ++
             "Do not wait on it: its exit will be delivered to you as a message when it finishes.",
-        .{ started.label, started.pid, started.log_path },
+        .{ started.label, started.id, started.pid, started.log_path, started.id },
     );
     return common.ok(gpa, text);
 }

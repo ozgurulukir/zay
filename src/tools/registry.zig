@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const background_tool = @import("background.zig");
 const bash_tool = @import("bash.zig");
 const common = @import("common.zig");
 const lane_tool = @import("lane.zig");
@@ -110,7 +111,7 @@ pub const shell_tool: Tool = if (os.is_windows) pwsh_tool.tool else bash_tool.to
 /// Canonical builtin tool list. Consumed by `ToolRegistry.init` and by
 /// `src/tools.zig`'s re-export (all single-registry call sites).
 pub fn builtin() []const Tool {
-    return &.{ shell_tool, lane_tool.tool };
+    return &.{ shell_tool, lane_tool.tool, background_tool.tool };
 }
 
 const tools_common = @import("common.zig");
@@ -210,10 +211,11 @@ test "ToolRegistry: addPluginTool makes plugin tool discoverable" {
     try std.testing.expectEqualStrings("plugin tool", tool.description);
 
     const all = try reg.all(gpa);
-    try std.testing.expectEqual(@as(usize, 3), all.len); // shell + lane + plugin
+    try std.testing.expectEqual(@as(usize, 4), all.len); // shell + lane + background + plugin
     try std.testing.expectEqualStrings(shell_tool.name, all[0].name);
     try std.testing.expectEqualStrings("lane", all[1].name);
-    try std.testing.expectEqualStrings("lua__p__t", all[2].name);
+    try std.testing.expectEqualStrings("background", all[2].name);
+    try std.testing.expectEqualStrings("lua__p__t", all[3].name);
 }
 
 test "ToolRegistry: removePluginToolsWithPrefix strips matching tools" {
@@ -280,7 +282,7 @@ test "ToolRegistry: all() returns valid slices after multiple calls" {
     // First all(): tools are still allocated.
     {
         const all = try reg.all(gpa);
-        try std.testing.expect(all.len == 4); // shell + lane + 2 plugin
+        try std.testing.expect(all.len == 5); // shell + lane + background + 2 plugin
         for (all) |t| {
             try std.testing.expect(t.name.len > 0);
             try std.testing.expect(t.description.len > 0);
@@ -290,7 +292,7 @@ test "ToolRegistry: all() returns valid slices after multiple calls" {
     // Reuse the same registry; backing storage must still be intact.
     {
         const all = try reg.all(gpa);
-        try std.testing.expect(all.len == 4);
+        try std.testing.expect(all.len == 5);
         for (all) |t| {
             try std.testing.expect(t.name.len > 0);
             try std.testing.expect(t.description.len > 0);
@@ -300,12 +302,13 @@ test "ToolRegistry: all() returns valid slices after multiple calls" {
 
 test "registry builtin carries exactly one shell tool" {
     // SSOT vector (Phase 3): the builtin list must expose exactly one shell
-    // tool (`pwsh` on Windows, `bash` elsewhere) plus `lane`. This pins the
+    // tool (`pwsh` on Windows, `bash` elsewhere) plus `lane` and `background`. This pins the
     // comptime bash↔pwsh switch in place so a future drift that exposes both —
     // or neither — is caught at the canonical source.
     const tools = builtin();
-    try std.testing.expectEqual(@as(usize, 2), tools.len);
+    try std.testing.expectEqual(@as(usize, 3), tools.len);
     try std.testing.expect(std.mem.eql(u8, tools[0].name, shell_tool.name));
     try std.testing.expectEqualStrings("lane", tools[1].name);
+    try std.testing.expectEqualStrings("background", tools[2].name);
     try std.testing.expect(shell_tool.name.len == 4 or std.mem.eql(u8, shell_tool.name, "pwsh"));
 }
