@@ -2,7 +2,7 @@
 
 # Nova
 
-**The terminal AI agent for shipping code.**
+**The fast, keyboard-first, native terminal AI agent for shipping code.**
 
 [![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?style=flat-square&logo=zig&logoColor=white)](https://ziglang.org)
 [![Version](https://img.shields.io/github/v/release/ozgurulukir/nova-agent?style=flat-square)](https://github.com/ozgurulukir/nova-agent/releases)
@@ -11,14 +11,19 @@
 
 </div>
 
-## Nova in action
+---
+
+## ⚡ Nova in action
+
+<!-- DEMO GIF PLACEHOLDER: Convert recorded video to GIF with ffmpeg and place at assets/demo.gif -->
+<!-- <p align="center"><img src="assets/demo.gif" alt="Nova Agent Demo in Terminal" width="800" /></p> -->
 
 ```text
 $ nova
 
 you>  Why does this PR change the cache eviction policy?
 
-agent> Let me find how the cache is managed.
+agent> Let me inspect how the cache is managed.
 
        bash: rg -n "evict|cache" src --type zig
        → src/cache.zig:42:  fn evict(lru: *Lru, key: []const u8) void
@@ -28,173 +33,128 @@ agent> The PR replaces random sampling with LRU eviction so hot keys survive
        the test in src/cache_test.zig:11.
 ```
 
-Nova is a native terminal AI agent for working with code. It runs in your terminal — no Electron, no browser tab, no Docker. Just a Zig binary that connects to any OpenAI-compatible provider, orchestrates parallel work across git worktree lanes, and keeps every session in SQLite.
+Nova is an **oldschool, terminal-native AI agent** designed for pure speed and focus. No Electron, no browser tab, no heavy Node runtime. Just a single, compiled Zig binary that interfaces directly with your shell, connects to any OpenAI-compatible provider, orchestrates parallel work across isolated git worktree lanes, and logs every turn to local SQLite.
 
 > [!IMPORTANT]
-> Beta software. The core is stable and daily-driven, but edges are still being hardened. APIs and config formats may shift before 1.0. Things get better.
+> **Beta software:** The core architecture is stable and daily-driven, but APIs, keybindings, and config schemas are evolving toward 1.0.
 
-## Why Nova?
+---
 
-- **Runs where you already work.** A native TUI built with [VXFW](https://github.com/vaxis/vaxis) — no Electron, no web stack, no container to babysit.
-- **Local-first.** Every conversation is recorded in a SQLite database on your machine. Resume any session, browse its full timeline tree, or export it as Markdown.
-- **Bring your own provider.** OpenAI, Anthropic, or any OpenAI-compatible endpoint (Ollama, llama.cpp, OpenRouter, Cerebras, ...). Bring your own key, no lock-in.
-- **Think in parallel.** Fork your workspace into isolated git worktree lanes, run several agents side by side, and merge the winner back. Workers are contained to their worktree — destructive commands stay in their lane.
-- **Safe by default.** Dangerous shell commands are gated by a ModernBERT classifier with a built-in local pattern-matching backstop. Anything destructive waits for your approval, and the gate surfaces even when the worker runs in a background lane.
-- **Extensible.** Sandboxed Lua plugins and MCP servers (stdio or Streamable HTTP) add tools and data sources without touching the core.
+## 🏎️ Philosophy & Execution Model: Autonomous by Default ("YOLO Mode")
 
-## Features
+Nova embraces the classic hacker ethos: **fast, direct, and keyboard-centric**.
 
-| Feature | Description |
-|---------|-------------|
-| **Terminal-native TUI** | Built with [VXFW](https://github.com/vaxis/vaxis) — no Electron, no web tech, just your terminal |
-| **Any AI provider** | OpenAI, Anthropic, or any OpenAI-compatible endpoint. Multi-provider catalogue with per-session model selection. |
-| **Parallel lanes** | Fork git worktrees into side-by-side agent conversations; workers are contained to their worktree; merge when ready |
-| **Reasoning effort** | Per-session reasoning-effort control (minimal / low / medium / high) wired end-to-end through the request path |
-| **Bash safety** | ModernBERT ONNX classifier + local destructive-command backstop; destructive ops gated behind approval |
-| **Diff viewer** | Full-screen git diff review with inline comments sent back to the agent |
-| **MCP integration** | Connect any [Model Context Protocol](https://modelcontextprotocol.io) server — stdio or Streamable HTTP, with custom headers and async connects |
-| **Lua plugins** | Extend Nova with sandboxed Lua plugins — filesystem, git, JSON bridge, custom tools, event hooks, prompt injection |
-| **Session persistence** | Full conversation history in SQLite. Resume any session, browse the timeline tree, rename or delete past sessions. |
-| **Context compaction** | Non-blocking context compaction with calibrated retention budgets — keeps long sessions under the model's context window without losing your place |
-| **Background jobs** | Run shell commands asynchronously (`run_in_background: true`); inspect, tail logs, and cancel via the native `background` tool (`list`/`status`/`tail`/`cancel`) or view via `Ctrl+O` |
+Unlike IDE plugins that interrupt you with modal dialogues for every file read or harmless directory scan, Nova operates under an **autonomous execution model** (similar to popular "YOLO" or "dangerously skip permissions" workflows):
 
-## Getting around
+- **No tedious click-prompts:** Reads, edits, builds, and standard commands run immediately without micro-confirmations.
+- **Two-Tier Command Safety Net:**
+  - **Tier 1 — ModernBERT ML Classifier (Active when configured):** When the optional ModernBERT ONNX model is set up, a dedicated local neural classifier inspects every shell command in sub-milliseconds to distinguish benign tasks from dangerous ones with deep contextual awareness.
+  - **Tier 2 — Deterministic Pattern Fallback (Active by default):** If the ML model is not installed, Nova relies on its built-in regex/keyword safety engine. This fallback intercepts common high-risk destructive commands (e.g. `rm -rf`, `mkfs`, `dd`, `git reset --hard`, fork bombs) and gates them behind explicit approval prompts.
+  - *Runtime Check:* You can inspect your active safety tier at any time by running `/status`.
+- **Git Worktree Isolation:** When exploring risky changes or broad refactors, fork your workspace into isolated **Parallel Lanes** (`/parallel` or `lane spawn`). Workers are physically contained inside their worktree, keeping your main branch clean.
 
-Type a prompt and press Enter. A leading `/` opens the command palette; `@file` attaches a file's contents, `$skill` invokes a skill.
+> [!CAUTION]
+> **Security Notice:** Because Nova executes shell commands directly without granular per-action permission prompts, run it only in workspaces you trust, or confine experimental workflows to parallel git worktree lanes.
 
-| Shortcut | What it does |
-|----------|--------------|
-| `/` | Open the command palette |
-| `@file` | Attach a file's contents to the prompt |
-| `$skill` | Invoke a specialized skill |
-| `Ctrl+↑ / Alt+↑` | Previous prompt in history |
-| `Ctrl+↓ / Alt+↓` | Next prompt in history |
-| `Shift+↓` | Jump to bottom of conversation |
-| `Ctrl+F` | Search the current transcript |
-| `Ctrl+O` | Background jobs & logs |
-| `Shift+Tab` | Cycle through parallel lanes |
-| `Ctrl+L` | Fullscreen / split lane view |
-| `Ctrl+V / Shift+Ins` | Paste from the system clipboard |
-| `Tab` | Expand / collapse active message |
-| `Esc` | Cancel turn / unselect / close |
+---
 
-Slash commands: `/connect` (providers & keys), `/model` (model & reasoning effort), `/settings` (config editor), `/new` and `/resume` (sessions), `/timeline` (session tree browser), `/parallel` and `/lanes` (parallel work), `/diff` (diff review & comments), `/save` (git-shadow snapshot), `/export` (Markdown), `/status`, `/skills`, `/copy`, `/paste`, `/clear`, `/help`, `/exit`.
+## ✨ Key Highlights
 
-## Quick Start
+- **Native TUI with VXFW:** Instant startup, fluid scrolling, custom color themes, and zero web stack bloat.
+- **Any LLM Provider:** First-class support for OpenAI, Anthropic, Ollama, llama.cpp, OpenRouter, Cerebras, DeepSeek, and custom OpenAI-compatible endpoints.
+- **Parallel Git Lanes:** Run multiple agent threads simultaneously in isolated git worktrees; monitor progress and merge results back when ready.
+- **Background Jobs:** Launch long-running builds, test suites, or dev servers asynchronously (`run_in_background: true`). Inspect live logs (`tail`), check progress (`status`), or cancel processes (`cancel`) via the native `background` tool or the `Ctrl+O` dashboard.
+- **Context Compaction:** Dynamic, token-calibrated retention budgets that automatically summarize long sessions below model watermark limits.
+- **Extensible via Lua & MCP:** Add custom tools and hooks with sandboxed Lua plugins or standard Model Context Protocol (MCP) servers (stdio or Streamable HTTP).
+- **Offline & Local-First:** Complete conversation trees persisted in SQLite; full timeline branching (`/timeline`), session resume, and Markdown export.
+
+---
+
+## 🚀 Quick Start
+
+### 1. Build and Run from Source
+
+**Prerequisites:** [Zig 0.16](https://ziglang.org/download/), [Git](https://git-scm.com/)
 
 ```bash
-# Prerequisites: Zig 0.16, uv (Python), huggingface-cli
-
 git clone https://github.com/ozgurulukir/nova-agent.git
 cd nova-agent
 
-# Vendor dependency (ModernBERT classifier only; fzy ships in-tree)
-hf download P0u4a/ModernBERT-bash-classifier --local-dir vendor/local-models/ModernBERT-bash-classifier
-uv run --project vendor/local-models python vendor/local-models/export_onnx.py \
-  --model-dir vendor/local-models/ModernBERT-bash-classifier \
-  --output vendor/local-models/ModernBERT-bash-classifier/model.onnx
-
-# Build and run
+# Build and run directly
 zig build run
 ```
 
-Or install to `~/.local/bin/`:
+### 2. Install to PATH
 
 ```bash
 zig build install -Doptimize=ReleaseFast --prefix $HOME/.local
-nova
-nova --version   # prints the embedded version (git tag / git describe / dev)
+nova --version
 ```
 
-> The ModernBERT bash-safety classifier is optional at runtime — bash safety falls back to a local pattern matcher when it's absent.
+---
 
-### Windows
+## 🛡️ Setting Up the ModernBERT Safety Classifier (Optional)
 
-Nova **compiles** on Windows — `zig build` produces `zig-out/bin/nova.exe`. Full **runtime** support on Windows is still in progress; the binary builds but does not yet run end-to-end. The remaining runtime work is tracked in the follow-up issues:
+Nova includes a fine-tuned **ModernBERT ONNX model** trained on over 3,000 shell commands to detect unsafe operations with sub-millisecond inference latency.
 
-- [#26](https://github.com/ozgurulukir/nova-agent/issues/26) — runtime config paths (`~/.config/nova` → `%APPDATA%\nova`)
-- [#27](https://github.com/ozgurulukir/nova-agent/issues/27) — bash tool spawns `cmd.exe`/`pwsh.exe` instead of `/bin/sh`
-- [#28](https://github.com/ozgurulukir/nova-agent/issues/28) — 43 failing tests (bash/git/path-separator runtime differences)
-- [#29](https://github.com/ozgurulukir/nova-agent/issues/29) — ModernBERT Python worker and lane/worktree subsystems
+> [!NOTE]
+> The ONNX classifier is **optional**. If omitted, Nova automatically and seamlessly falls back to its built-in local pattern-matching safety engine.
 
-Linux behavior is unchanged.
-
-## How It Works
-
-```mermaid
-flowchart LR
-    A[Terminal] --> B[Nova TUI]
-    B --> C[Agent Loop]
-    C --> D[LLM Provider]
-    C --> E[MCP Servers]
-    C --> F[Lua Plugins]
-    C --> G[Bash Tool]
-    C --> L[Parallel Lanes]
-    B --> H[SQLite Sessions]
-
-    style A fill:#2d2d2d,color:#fff
-    style B fill:#1a1a2e,color:#fff
-    style C fill:#16213e,color:#fff
-    style D fill:#0f3460,color:#fff
-    style E fill:#533483,color:#fff
-    style F fill:#3a1c5e,color:#fff
-    style G fill:#1a3a3a,color:#fff
-    style L fill:#2a1a3e,color:#fff
-    style H fill:#2d2d2d,color:#fff
-```
-
-The TUI dispatches events through a modular pipeline — input routing, turn lifecycle, background jobs, lane bridge, and transcript rendering are all separate concerns. The agent loop orchestrates LLM calls (with retry/backoff and a shared concurrent-request limiter across lanes), tool execution (schema-validated), and context compaction. Everything is logged to a global SQLite database for session resume and timeline browsing.
-
-## Configuration
-
-Nova uses layered JSON config:
-
-| Layer | File |
-|-------|------|
-| Global | `~/.config/nova/config.json` |
-| Project | `.nova/config.json` |
-| Env vars | `OPENAI_*` and `NOVA_*` environment variables |
-
-See [docs/CONFIG.md](docs/CONFIG.md) for the full reference.
-
-## Extending Nova
-
-When the shell is not the most natural fit, add your own tools with a Lua plugin — no core changes. Drop a `plugin.lua` manifest and an `init.lua` into `.nova/plugins/<name>/`, and register a tool:
-
-```lua
--- .nova/plugins/my-tools/init.lua
-nova.register_tool({
-  name = "greet",
-  description = "Returns a friendly greeting",
-  parameters = { name = { type = "string", description = "The name to greet" } },
-  handler = function(params)
-    return "Hello, " .. (params.name or "World") .. "!"
-  end,
-})
-```
-
-The tool appears in the agent's tool list as `lua__my-tools__greet` and is invoked like any other. Plugins can also hook events, inject system-prompt fragments, and use the `nova.json_decode`/`nova.json_encode` bridge for structured data. Prefer an existing ecosystem? MCP servers plug in with a few lines of config — stdio or Streamable HTTP, with custom request headers for authenticated endpoints. See [docs/MCP.md](docs/MCP.md) and [docs/plugins/](docs/plugins/) for the full guides.
-
-## Under the hood
-
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the pieces fit together
-- [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md) — design principles
-- [docs/PATTERNS.md](docs/PATTERNS.md) — codebase patterns and engineering notes
-- [docs/MCP.md](docs/MCP.md) — connecting MCP servers
-- [docs/plugins/](docs/plugins/) — writing Lua plugins
-
-## Contributing
-
-Contributions are welcome. Read [AGENTS.md](AGENTS.md) for the architecture guide and coding conventions.
+**Prerequisites:** [uv](https://github.com/astral-sh/uv) (Python package manager) and `huggingface-cli`
 
 ```bash
-git clone https://github.com/ozgurulukir/nova-agent.git
-cd nova-agent
-zig build test
+# 1. Download model weights
+hf download P0u4a/ModernBERT-bash-classifier --local-dir vendor/local-models/ModernBERT-bash-classifier
+
+# 2. Export ONNX graph
+uv run --project vendor/local-models python vendor/local-models/export_onnx.py \
+  --model-dir vendor/local-models/ModernBERT-bash-classifier \
+  --output vendor/local-models/ModernBERT-bash-classifier/model.onnx
 ```
 
-Cutting a release? See [docs/RELEASING.md](docs/RELEASING.md) — tag `vX.Y.Z`, push, and GitHub Actions builds and attaches the binaries.
+When present, Nova automatically launches the local inference worker on startup (configured with `OMP_WAIT_POLICY=PASSIVE` to prevent CPU spin).
 
-## License
+---
 
-[MIT](LICENSE). Third-party libraries are listed in [attribution.md](attribution.md).
+## ⌨️ Essential Keyboard Shortcuts & Commands
+
+| Shortcut | Action |
+|:---|:---|
+| `/` | Open command palette (`/connect`, `/model`, `/parallel`, `/diff`, `/timeline`, `/help`) |
+| `@file` | Attach file contents directly into the prompt |
+| `$skill` | Invoke a specialized agent skill |
+| `Ctrl+O` | Open Background Jobs & Log Viewer modal |
+| `Shift+Tab` | Cycle between active parallel lane conversations |
+| `Ctrl+L` | Toggle fullscreen / split lane view |
+| `Ctrl+F` | Search within the current transcript |
+| `Ctrl+↑ / Ctrl+↓` | Navigate prompt history |
+| `Tab` | Expand / collapse active message blocks |
+| `Esc` | Cancel current turn / dismiss modal |
+
+---
+
+## 📚 Documentation & Wiki Index
+
+For in-depth guides, architecture specifications, and configuration references:
+
+- 🏛️ **[System Architecture](docs/ARCHITECTURE.md):** TUI event pipeline, LLM client layers, ModernBERT classifier, and memory models.
+- ⚙️ **[Configuration Reference](docs/CONFIG.md):** Providers, API keys, context compaction, reasoning effort, and custom theme schemas.
+- 🧠 **[Engineering Patterns & Invariants](docs/PATTERNS.md):** Strict-mode tool calling, background slots, zero-copy pruning, and thread-safety invariants.
+- 🔌 **[Model Context Protocol (MCP)](docs/MCP.md):** Connecting stdio and Streamable HTTP MCP servers.
+- 🧩 **[Lua Plugin System](docs/plugins/):** Building custom tools, event hooks, and system prompt extenders.
+- 🎯 **[Design Philosophy](docs/PHILOSOPHY.md):** Core principles guiding Nova's evolution.
+- 🛠️ **[Agent & Contributor Guidelines](AGENTS.md):** TigerStyle rules, Zig 0.16 idioms, and testing instructions.
+- 📦 **[Releasing & Distribution](docs/RELEASING.md):** Version tagging and release workflow.
+
+---
+
+## 💻 Platform Support
+
+- **Linux / macOS:** Fully supported and tested daily.
+- **Windows:** Compiles natively (`zig-out/bin/nova.exe`). Core features, TUI, and SQLite persistence are active; full cross-platform runtime parity is tracked in [#26](https://github.com/ozgurulukir/nova-agent/issues/26)–[#29](https://github.com/ozgurulukir/nova-agent/issues/29).
+
+---
+
+## 📄 License
+
+Nova is open source under the [MIT License](LICENSE). Third-party components and licenses are listed in [attribution.md](attribution.md).

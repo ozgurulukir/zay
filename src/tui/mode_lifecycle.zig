@@ -345,6 +345,10 @@ pub fn submitMode(app: *App) !bool {
                     const ms = tui_status.modelStatus(app.liveRuntime(), app.cached_config);
                     const provider_name = if (ms) |m| m.provider else "none";
                     const model_name = if (ms) |m| m.model else "none";
+                    const classifier_status: []const u8 = if (app.liveRuntime()) |rt|
+                        (if (rt.agent.bash_classifier_url != null) "ModernBERT ONNX (Active)" else "Pattern Matcher (Fallback)")
+                    else
+                        "none";
                     const git_branch = app.metrics.git_label;
                     const bg_count = app.runningBackgroundCount();
                     const active_lane = app.activeIndex() + 1;
@@ -355,11 +359,12 @@ pub fn submitMode(app: *App) !bool {
                         "System Status:\n" ++
                             "  • Provider: {s}\n" ++
                             "  • Model: {s}\n" ++
+                            "  • Command Safety: {s}\n" ++
                             "  • Git Branch: {s}\n" ++
                             "  • Active Lane: {d}/{d}\n" ++
                             "  • Background Tasks: {d} running\n" ++
                             "  • Session ID: {s}",
-                        .{ provider_name, model_name, git_branch, active_lane, total_lanes, bg_count, sid[0..@min(8, sid.len)] },
+                        .{ provider_name, model_name, classifier_status, git_branch, active_lane, total_lanes, bg_count, sid[0..@min(8, sid.len)] },
                     );
                     _ = try app.thread.transcript.append(app.gpa, .notice, "system", status_text);
                 },
