@@ -15,8 +15,13 @@
 
 ## ⚡ Nova in action
 
-<!-- DEMO GIF PLACEHOLDER: Convert recorded video to GIF with ffmpeg and place at assets/demo.gif -->
-<!-- <p align="center"><img src="assets/demo.gif" alt="Nova Agent Demo in Terminal" width="800" /></p> -->
+<p align="center">
+  <a href="assets/demo.gif">
+    <img src="assets/demo-teaser.gif" alt="Nova Agent Demo in Terminal" width="800" />
+  </a>
+  <br />
+  <sub>⚡ <em>Preview snippet. <a href="assets/demo.gif">Click to watch the full demo (18 MB)</a></em></sub>
+</p>
 
 ```text
 $ nova
