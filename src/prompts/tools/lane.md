@@ -18,16 +18,34 @@ Every call takes `command` (always required) naming the operation. Which other a
 | `steer` | `lane`, `steer` | inject a short message into a running worker mid-turn |
 | `delete` | `lane` | delete an idle or parked lane entirely (worktree + branch) without merging |
 
-The lane id always goes in the `lane` field — `lane list` prints the hex id (e.g. `e1e94861c257`) for each open lane. This tool has no `id` parameter.
+The lane id always goes in the `lane` field — `lane list` prints the hex id (e.g. `e1e94861c257`) for each open worker lane. This tool has no `id` parameter. `[0]` is the primary driver lane (repo root) and cannot be passed to worker operations (`enter`, `merge`, `delete`, `await`, `cancel`, `steer`, `spawn`, `read`).
 
 Example — spawn a worker: `{"command":"spawn","task":"Review the diff in PR #57 and report findings."}`
+
+## Two Fundamental Workflows: Do Not Mix Them!
+
+Nova provides two distinct patterns of lane operations. Understand which one you are using and do not mix their steps:
+
+### Pattern A: Delegated Background Worker (`spawn` -> `read`/`await` -> `merge`/`delete`)
+- You spawn an independent background worker agent in an isolated worktree.
+- The worker runs on its own thread; you continue working at the repo root.
+- **You NEVER enter the worker's lane.**
+- **WARNING: Never call `lane leave` after `lane spawn` or `lane await`** — the driver was never entered in the worker lane. Calling `lane leave` here is an error in understanding.
+- Lifecycle: `lane spawn` -> `lane read` / `lane await` -> `lane merge` (to integrate work) or `lane delete` (to discard).
+
+### Pattern B: Driver Isolated Workspace (`create` -> `enter` -> work -> `leave` -> `merge`/`delete`)
+- You create an empty idle lane for yourself to work in isolation without dirtying the main repo root.
+- You call `lane enter` to re-root your tools (bash, file ops) into the lane's worktree.
+- You do your edits, tests, and commits inside the lane worktree.
+- When done, you **MUST** call `lane leave` to return your tools to the repo root before calling `lane merge` or `lane delete`.
+- Lifecycle: `lane create` -> `lane enter` -> [edits & commits] -> `lane leave` -> `lane merge` (or `lane delete`).
 
 ## When to use which command
 
 - `lane list` — always a good first step: shows every open lane (lane id, title, branch, status), your current workspace root, and any parked lanes on disk. `read` reports a running worker's activity (tool-call count, time since last output) so you can tell busy from stalled.
 - `lane create` — open a NEW idle lane for you to work in. Use it when you need to edit/test/build in isolation without dirtying the main tree: create, `lane enter`, work, `lane leave`, then `lane merge` when done.
 - `lane enter` — re-root your tools into that lane's worktree. After entering, bash/file calls run against the lane checkout and the `@file` mention reads files from the lane. `git` inside is on the lane's branch. The re-root applies from your next tool call — including calls later in the same batch as the `enter`.
-- `lane leave` — return your tools to the repo root (workspace mode is tool scoping; your role is unchanged).
+- `lane leave` — return your tools to the repo root (workspace mode is tool scoping; your role is unchanged). Only use this when you previously entered a lane with `lane enter`.
 - `lane merge` — fold a finished lane's branch into the main tree and delete the lane. Merge refuses while you are still entered in it (`lane leave` first) and refuses if the main tree has uncommitted changes (commit or stash first — not a conflict). It also refuses if the lane's own working tree is dirty: commit the lane's work with a real message (`git_commit` or `bash git commit`) before merging. Nova will not fabricate a placeholder commit for you. A merge conflict rolls back cleanly; the lane stays open so you can resolve.
 - `lane spawn` — start an independent worker agent in a fresh lane with the given task. The worker runs on its own thread, concurrently with you; its result arrives as a message. Use it two ways: **fan out** (one lane per independent unit — PRs, candidates, scans) or **staged pipelines** (spawn stage 1, await its result, then spawn stage 2 with that result embedded in the task). If `lane` is given, the worker reuses that idle lane's worktree+branch instead of creating a new one — use it to re-task a lane you created with `lane create` or a worker that finished and rested. The lane keeps its transcript; the new turn appends. Every task must be self-contained — exact paths/branches, what to do, what to report — because the worker starts fresh and can't see your reasoning. After spawning, keep working: results arrive as messages, and `lane read` shows progress; only `lane await` when your next step actually needs that worker's result. Never redo a delegated task yourself — your work after spawning is orchestration: other independent units, integration, review. If nothing else remains, `lane await` the worker instead of duplicating its task in the main tree. Collect with `lane read` and `lane await` passing the lane id, then `lane merge` with that id.
 - `lane read` — snapshot the tail of a worker lane's conversation (works on running, done, and rested lanes). The status line shows how far a running worker has gotten and flags one silent for 3+ minutes as possibly stalled — cancel it or steer it rather than poll forever.
@@ -59,7 +77,7 @@ Use these patterns to ensure high-quality, low-context-bloat results:
 4. `lane read` $\rightarrow$ Monitor progress.
 5. `lane await` $\rightarrow$ Collect both summaries.
 6. **Synthesis:** Combine reports in your main context to form a plan.
-7. `lane merge` $\rightarrow$ Clean up.
+7. `lane merge` or `lane delete` $\rightarrow$ Clean up.
 
 ### Scenario B: The "Safe Iteration" (Critical Change)
 *Goal: Implement a feature that requires multiple build/test cycles without dirtying the main branch.*
@@ -74,4 +92,4 @@ Use these patterns to ensure high-quality, low-context-bloat results:
 2. `lane await` $\rightarrow$ Get implementation.
 3. `lane spawn` $\rightarrow$ Worker 2: "Review the changes made by Worker 1 for edge cases and style."
 4. `lane await` $\rightarrow$ Get review.
-5. **Final Polish:** Apply review feedback in the isolated lane before the final `lane merge`.
+5. **Final Polish:** Merge Worker 1 and Worker 2, or apply review feedback.

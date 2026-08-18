@@ -794,13 +794,64 @@ fn requesterIsPrimary(app: *App, requester_lane: ?*Thread) bool {
     return app.threads.len() > 0 and lane == app.threads.slice()[0];
 }
 
+/// Test if an ID refers to the primary / driver lane (e.g. "0", "[0]", "(0)", "primary", "driver").
+fn isPrimaryId(id_in: []const u8) bool {
+    const trimmed = std.mem.trim(u8, id_in, " \t\r\n[]()");
+    if (std.ascii.eqlIgnoreCase(trimmed, "0")) return true;
+    if (std.ascii.eqlIgnoreCase(trimmed, "primary")) return true;
+    if (std.ascii.eqlIgnoreCase(trimmed, "driver")) return true;
+    return false;
+}
+
+/// Format open worker lane hex IDs as a comma-separated list into `out_buf`.
+/// Zero dynamic allocations, bounded copy. Returns "none" if empty.
+fn formatOpenWorkerIds(app: *App, out_buf: []u8) []const u8 {
+    var count: usize = 0;
+    var offset: usize = 0;
+    for (app.threads.slice()) |lane| {
+        if (laneIdOf(lane)) |id| {
+            if (count > 0) {
+                if (offset + 2 <= out_buf.len) {
+                    @memcpy(out_buf[offset .. offset + 2], ", ");
+                    offset += 2;
+                }
+            }
+            if (offset + id.len <= out_buf.len) {
+                @memcpy(out_buf[offset .. offset + id.len], id);
+                offset += id.len;
+                count += 1;
+            }
+        }
+    }
+    if (count == 0) {
+        const none_str = "none";
+        if (out_buf.len >= none_str.len) {
+            @memcpy(out_buf[0..none_str.len], none_str);
+            return out_buf[0..none_str.len];
+        }
+        return "none";
+    }
+    return out_buf[0..offset];
+}
+
+/// Emit an informative error when a worker lane ID cannot be resolved.
+fn failUnknownWorkerLane(app: *App, id: []const u8) ?Resp {
+    var ids_buf: [128]u8 = undefined;
+    const worker_ids = formatOpenWorkerIds(app, &ids_buf);
+    return failResp(
+        app.gpa,
+        "lane: no open lane with id '{s}'. Open worker lanes: [{s}]. (Note: [0] is the driver lane, not a worker).\n",
+        .{ id, worker_ids },
+    );
+}
+
 /// Resolve a lane id (the worktree's last path segment — the hex id, durable
 /// across the async `nova/<slug>` branch rename) to an open lane.
 fn resolveLane(app: *App, id_in: []const u8) ?*Thread {
     const id = std.mem.trim(u8, id_in, " \t\r\n");
     for (app.threads.slice()) |lane| {
         if (lanes_util.workingLaneOf(lane)) |w| {
-            if (std.mem.eql(u8, lanes_util.lastPathSegment(w.path), id)) return lane;
+            if (std.ascii.eqlIgnoreCase(lanes_util.lastPathSegment(w.path), id)) return lane;
         }
     }
     return null;
@@ -839,9 +890,7 @@ fn listLanes(app: *App) ?Resp {
     const driver_ws = driverWorkspace(app);
     const active_idx = activeIndex(app);
     for (app.threads.slice(), 0..) |lane, i| {
-        const id = laneIdOf(lane) orelse "0";
         const title = lane.title orelse "";
-        const branch = if (lanes_util.workingLaneOf(lane)) |wl| wl.branch else "(primary)";
         const status = laneStatus(app, lane);
         defer app.gpa.free(status);
         const ws_marker: []const u8 = if (driver_ws) |ws| blk: {
@@ -851,7 +900,13 @@ fn listLanes(app: *App) ?Resp {
             break :blk "";
         } else "";
         const active_marker = if (i == active_idx) "  <- active" else "";
-        out.writer.print("  [{d}] {s} {s} ({s}) {s}{s}{s}\n", .{ i, id, title, branch, status, active_marker, ws_marker }) catch return failResp(gpa, "lane: out of memory\n", .{});
+        if (i == 0) {
+            out.writer.print("  [0] primary (driver / repo root) {s}{s}{s}\n", .{ status, active_marker, ws_marker }) catch return failResp(gpa, "lane: out of memory\n", .{});
+        } else {
+            const id = laneIdOf(lane) orelse "";
+            const branch = if (lanes_util.workingLaneOf(lane)) |wl| wl.branch else "(primary)";
+            out.writer.print("  [{d}] {s} {s} ({s}) {s}{s}{s}\n", .{ i, id, title, branch, status, active_marker, ws_marker }) catch return failResp(gpa, "lane: out of memory\n", .{});
+        }
     }
     if (driver_ws) |ws| {
         out.writer.print("workspace root: {s}\n", .{ws}) catch return failResp(gpa, "lane: out of memory\n", .{});
@@ -1028,11 +1083,12 @@ fn createLane(app: *App, req: *const lane_bridge.Request) ?Resp {
 /// tool batch's executor re-roots at the lane (S5).
 fn enterLane(app: *App, req: *const lane_bridge.Request) ?Resp {
     const id = req.lane orelse return failResp(app.gpa, "lane: enter needs a `lane` field — the hex id shown by `lane list`\n", .{});
-    const target = resolveLane(app, id) orelse return failResp(app.gpa, "lane: no open lane with id '{s}'\n", .{id});
+    if (isPrimaryId(id)) return failResp(app.gpa, "lane: [0] is the primary driver lane (repo root) — enter is for isolated worker lanes.\n", .{});
+    const target = resolveLane(app, id) orelse return failUnknownWorkerLane(app, id);
     // M5: entering a running lane would put two agents writing the same
     // worktree concurrently.
     if (target.turn.isActive()) return failResp(app.gpa, "lane: lane {s} is running — enter an idle lane\n", .{id});
-    const working = lanes_util.workingLaneOf(target) orelse return failResp(app.gpa, "lane: lane {s} is the primary — nothing to enter\n", .{id});
+    const working = lanes_util.workingLaneOf(target) orelse return failResp(app.gpa, "lane: [0] is the primary driver lane (repo root) — enter is for isolated worker lanes.\n", .{});
     const root = app.repoRoot() orelse ".";
     return resp(
         app.gpa,
@@ -1056,7 +1112,8 @@ fn leaveLane(app: *App) ?Resp {
 /// definition, so the git fold is safe at the lane level.
 fn mergeLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     const id = req.lane orelse return failResp(app.gpa, "lane: merge needs a `lane` field — the hex id shown by `lane list`\n", .{});
-    const target = resolveLane(app, id) orelse return failResp(app.gpa, "lane: no open lane with id '{s}'\n", .{id});
+    if (isPrimaryId(id)) return failResp(app.gpa, "lane: [0] is the primary driver lane — cannot merge the primary tree into itself.\n", .{});
+    const target = resolveLane(app, id) orelse return failUnknownWorkerLane(app, id);
     // H5b: leave-before-merge. Merging frees the lane's worktree, and the
     // current tool batch's executor is still rooted in it.
     if (driverWorkspace(app)) |ws| {
@@ -1068,18 +1125,18 @@ fn mergeLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     }
     if (target.turn.isActive()) return failResp(app.gpa, "lane: lane {s} is still running — cancel or wait before merging\n", .{id});
     const index = indexOfLane(app, target) orelse return failResp(app.gpa, "lane: lane {s} vanished\n", .{id});
-    const working = lanes_util.workingLaneOf(target) orelse return failResp(app.gpa, "lane: can't merge the primary lane\n", .{});
+    const working = lanes_util.workingLaneOf(target) orelse return failResp(app.gpa, "lane: [0] is the primary driver lane — cannot merge the primary tree into itself.\n", .{});
     const repo = app.repoRoot() orelse return failResp(app.gpa, "lane: no repo\n", .{});
     // M3: a dirty destination would be misread by vcs.merge as a content
     // conflict. Refuse with a distinct message instead.
     if (vcs.workingTreeDirty(app.gpa, app.io, repo) catch false) {
-        return failResp(app.gpa, "lane: the primary tree has uncommitted changes — commit or stash first; this is not a merge conflict.\n", .{});
+        return failResp(app.gpa, "lane: the primary tree has uncommitted changes — commit or stash first with 'git commit' or 'git stash'; this is not a merge conflict.\n", .{});
     }
     // M3b: a dirty SOURCE lane would be folded into the primary tree as a
     // fabricated placeholder commit. Refuse and let the model commit its own
     // lane work with a real message (git_commit / bash git commit) first.
     if (vcs.workingTreeDirty(app.gpa, app.io, working.path) catch false) {
-        return failResp(app.gpa, "lane: lane {s} has uncommitted changes — commit them with a real message (git_commit or `bash git commit`) before merging; the merge will not fabricate a placeholder commit.\n", .{id});
+        return failResp(app.gpa, "lane: lane {s} has uncommitted changes — commit them (e.g. via git_commit or 'bash git commit') before merging; the merge will not fabricate a placeholder commit.\n", .{id});
     }
     switch (vcs.merge(app.gpa, app.io, repo, working.branch) catch |err| return failResp(app.gpa, "lane: merge failed: {s}\n", .{@errorName(err)})) {
         .conflict => return failResp(app.gpa, "lane: merge conflict — rolled back, nothing lost. Lane {s} is still open; resolve and retry.\n", .{id}),
@@ -1120,14 +1177,18 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
     // branch and wake it as a worker (TD-3/TD-4). Null or unresolvable
     // req.lane falls through to the fresh-worktree path (current behavior).
     if (req.lane) |target_id| {
+        if (isPrimaryId(target_id)) {
+            freeLaneContext(app.gpa, context);
+            return failResp(app.gpa, "lane: [0] is the primary driver lane — spawn creates a worker in an isolated worktree.\n", .{});
+        }
         const target = resolveLane(app, target_id) orelse {
             freeLaneContext(app.gpa, context);
-            return failResp(app.gpa, "lane: no open lane with id '{s}' — `lane list` shows open lanes\n", .{target_id});
+            return failUnknownWorkerLane(app, target_id);
         };
         // TD-6: refuse on the primary (no worktree to reuse).
         if (lanes_util.workingLaneOf(target) == null) {
             freeLaneContext(app.gpa, context);
-            return failResp(app.gpa, "lane: can't spawn into the primary lane — spawn creates a worker in an isolated worktree\n", .{});
+            return failResp(app.gpa, "lane: [0] is the primary driver lane — spawn creates a worker in an isolated worktree.\n", .{});
         }
         // TD-6: refuse on a running/live lane (would race on the worktree).
         if (target.engine != .idle) {
@@ -1455,7 +1516,8 @@ fn startTurnForLane(app: *App, lane: *Thread, prompt: []const u8, title_source: 
 /// Works on live, rested, and (in-memory) parked-by-rest lanes alike.
 fn readLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     const id = req.lane orelse return failResp(app.gpa, "lane: read needs a `lane` field — the hex id shown by `lane list`\n", .{});
-    const target = resolveLane(app, id) orelse return failResp(app.gpa, "lane: no open lane with id '{s}'\n", .{id});
+    if (isPrimaryId(id)) return failResp(app.gpa, "lane: [0] is the primary driver lane — read is for inspecting worker lane transcripts.\n", .{});
+    const target = resolveLane(app, id) orelse return failUnknownWorkerLane(app, id);
     const status = laneStatus(app, target);
     defer app.gpa.free(status);
     const tail = transcriptTail(app, target, 8);
@@ -1507,7 +1569,8 @@ fn transcriptTail(app: *App, lane: *Thread, max: usize) []u8 {
 /// `lane cancel {lane}`: two-phase interrupt of the target lane's turn (S10).
 fn cancelLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     const id = req.lane orelse return failResp(app.gpa, "lane: cancel needs a `lane` field — the hex id shown by `lane list`\n", .{});
-    const target = resolveLane(app, id) orelse return failResp(app.gpa, "lane: no open lane with id '{s}'\n", .{id});
+    if (isPrimaryId(id)) return failResp(app.gpa, "lane: [0] is the primary driver lane — cancel is for spawned background worker lanes.\n", .{});
+    const target = resolveLane(app, id) orelse return failUnknownWorkerLane(app, id);
     cancelLaneTurn(app, target);
     target.acknowledged = true; // the orchestrator knows it was cancelled
     return resp(app.gpa, "Cancelled lane {s}.\n", .{id}, id, null);
@@ -1563,7 +1626,8 @@ fn discardAbandonedTurnOnLane(app: *App, lane: *Thread) void {
 /// cancel/steer instead of blocking here forever.
 fn awaitLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     const id = req.lane orelse return failResp(app.gpa, "lane: await needs a `lane` field — the hex id shown by `lane list`\n", .{});
-    const target = resolveLane(app, id) orelse return failResp(app.gpa, "lane: no open lane with id '{s}'\n", .{id});
+    if (isPrimaryId(id)) return failResp(app.gpa, "lane: [0] is the primary driver lane — await is for spawned background worker lanes.\n", .{});
+    const target = resolveLane(app, id) orelse return failUnknownWorkerLane(app, id);
     const now_ms = std.Io.Clock.now(.awake, app.io).toMilliseconds();
     if (target.turn.state == .active and laneStalled(target, now_ms) and !target.stall_warned) {
         target.stall_warned = true;
@@ -1593,7 +1657,8 @@ fn awaitLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
 fn steerLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     const id = req.lane orelse return failResp(app.gpa, "lane: steer needs a `lane` field — the hex id shown by `lane list`\n", .{});
     const text = req.steer orelse return failResp(app.gpa, "lane: steer needs a `steer` message\n", .{});
-    const target = resolveLane(app, id) orelse return failResp(app.gpa, "lane: no open lane with id '{s}'\n", .{id});
+    if (isPrimaryId(id)) return failResp(app.gpa, "lane: [0] is the primary driver lane — steer is for running background worker agents.\n", .{});
+    const target = resolveLane(app, id) orelse return failUnknownWorkerLane(app, id);
     const agent = target.agent orelse return failResp(app.gpa, "lane: lane {s} is not running — nothing to steer\n", .{id});
     if (target.turn.state != .active) return failResp(app.gpa, "lane: lane {s} is not mid-turn\n", .{id});
     agent.enqueueSteer(text) catch |err| switch (err) {
@@ -1610,6 +1675,7 @@ fn steerLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
 /// Cannot delete the primary lane or a running lane.
 fn deleteLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     const id = req.lane orelse return failResp(app.gpa, "lane: delete needs a `lane` field — the hex id shown by `lane list`\n", .{});
+    if (isPrimaryId(id)) return failResp(app.gpa, "lane: [0] is the primary driver lane — only worker lanes (created via spawn/create) can be deleted.\n", .{});
 
     if (resolveLane(app, id)) |target| {
         // H5b: the leave-first check runs BEFORE the running check, matching
@@ -1624,12 +1690,7 @@ fn deleteLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
         }
         if (target.turn.isActive()) return failResp(app.gpa, "lane: lane {s} is still running — cancel or wait before deleting\n", .{id});
         const index = indexOfLane(app, target) orelse return failResp(app.gpa, "lane: lane {s} vanished\n", .{id});
-        const working = lanes_util.workingLaneOf(target) orelse return failResp(app.gpa, "lane: cannot delete the primary lane\n", .{});
-        // The primary refusal below is unreachable via a normal request:
-        // `resolveLane` matches only working lanes (the primary has no
-        // worktree, so `laneIdOf`/`resolveLane` return null for it), so a
-        // delete posted with the primary's id falls through to the parked-lane
-        // path and reports "no open or parked lane". Kept as defense in depth.
+        const working = lanes_util.workingLaneOf(target) orelse return failResp(app.gpa, "lane: [0] is the primary driver lane — only worker lanes (created via spawn/create) can be deleted.\n", .{});
         clearWorkspaceBorrowForPath(app, working.path) catch |err| {
             return failResp(app.gpa, "lane delete failed: {s}\n", .{lanes_util.laneErrorText(err)});
         };
@@ -1645,7 +1706,7 @@ fn deleteLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     defer vcs.freeWorktreeList(app.gpa, parked);
 
     for (parked) |entry| {
-        if (std.mem.eql(u8, lanes_util.lastPathSegment(entry.path), id)) {
+        if (std.ascii.eqlIgnoreCase(lanes_util.lastPathSegment(entry.path), id)) {
             if (driverWorkspace(app)) |ws| {
                 if (lanes_util.pathsEqual(ws, entry.path)) {
                     return failResp(app.gpa, "lane: call `lane leave` first — deleting frees lane {s}'s worktree, and the current tool batch is still rooted in it.\n", .{id});
@@ -1659,7 +1720,7 @@ fn deleteLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
         }
     }
 
-    return failResp(app.gpa, "lane: no open or parked lane with id '{s}' found\n", .{id});
+    return failUnknownWorkerLane(app, id);
 }
 
 // ---------------------------------------------------------------------------
@@ -1779,7 +1840,7 @@ test "serviceLaneBridge resolves a list request against a test App" {
     defer app.gpa.free(result.text);
     try std.testing.expectEqual(@as(u8, 0), result.code);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "open lanes:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.text, "(primary)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "primary (driver / repo root)") != null);
 }
 
 test "serviceLaneBridge refuses a non-primary spawn with the crisp F2 message" {
@@ -2354,18 +2415,18 @@ test "lane spawn with req.lane refuses on the primary lane" {
     var fx = try GitFixture.init(gpa, io);
     defer fx.deinit(gpa);
     const app = &fx.app;
-    // An unresolvable id exercises the "no open lane" refuse path.
+    // Primary id "0" exercises the primary guard refusal.
     var req = lane_bridge.Request{
         .op = .spawn,
         .task = try gpa.dupe(u8, "x"),
-        .lane = try gpa.dupe(u8, "nonexistent"),
+        .lane = try gpa.dupe(u8, "0"),
         .requester = &fx.runtime.agent,
     };
     defer req.deinit(gpa);
     const result = postAndService(io, app, &req);
     defer app.gpa.free(result.text);
     try std.testing.expect(result.code != 0);
-    try std.testing.expect(std.mem.indexOf(u8, result.text, "no open lane") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "is the primary driver lane — spawn creates a worker in an isolated worktree") != null);
 }
 
 test "lane spawn into a rested worker preserves the transcript and appends" {
@@ -3262,27 +3323,21 @@ test "deleteLaneOp refuses deleting a running lane" {
     try std.testing.expectEqual(@as(usize, 2), app.threads.len()); // unchanged
 }
 
-test "deleteLaneOp cannot delete the primary lane (funnels to not-found)" {
-    // The primary-lane refusal in deleteLaneOp is unreachable via a normal
-    // request: `resolveLane` matches only working lanes (the primary has no
-    // worktree, so `laneIdOf`/`resolveLane` return null for it) and the
-    // request falls through to the parked-lane not-found path. This needs a
-    // live primary runtime (repoRoot non-null) to reach that message, hence the
-    // git fixture. The upshot is asserted: the primary is undeletable.
+test "deleteLaneOp cannot delete the primary lane (refused by primary guard)" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
     var fx = try GitFixture.init(gpa, io);
     defer fx.deinit(gpa);
     const app = &fx.app;
-    const primary_id: []const u8 = "0"; // the id `lane list` shows for a worktree-less primary
+    const primary_id: []const u8 = "0";
 
     var req = lane_bridge.Request{ .op = .delete, .lane = try gpa.dupe(u8, primary_id), .requester = &fx.runtime.agent };
     defer req.deinit(gpa);
     const result = postAndService(io, app, &req);
     defer app.gpa.free(result.text);
     try std.testing.expect(result.code != 0);
-    try std.testing.expect(std.mem.indexOf(u8, result.text, "no open or parked lane with id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "only worker lanes (created via spawn/create) can be deleted") != null);
     try std.testing.expectEqual(@as(usize, 1), app.threads.len()); // primary intact
 }
 
@@ -3348,7 +3403,7 @@ test "deleteLaneOp reports not-found for a non-existent id" {
     const result = postAndService(io, app, &req);
     defer app.gpa.free(result.text);
     try std.testing.expect(result.code != 0);
-    try std.testing.expect(std.mem.indexOf(u8, result.text, "no open or parked lane with id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "no open lane with id 'nope'") != null);
     try std.testing.expectEqual(@as(usize, 1), app.threads.len()); // nothing removed
 }
 
@@ -3423,6 +3478,7 @@ test "cleanupLaneWorktreeAndBranch terminates background processes and removes w
     var bg = background_mod.BackgroundManager.init(io, gpa);
     defer bg.deinit();
     app.background = &bg;
+    defer app.background = null;
 
     // cleanupLaneWorktreeAndBranch runs safely with background manager attached
     cleanupLaneWorktreeAndBranch(&app, ".", "nonexistent/worktree/path", "nova/fake-branch");
@@ -3450,4 +3506,143 @@ test "WorktreeJob start and completion lifecycle" {
     try std.testing.expect(!anyAsyncWorktreeActive(&app));
     job.deinit();
     app.async_worktree_job = null;
+}
+
+test "listLanes formats primary driver lane and worker lanes correctly" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    // 1. Initial state with only primary driver lane.
+    const res1 = listLanes(&app).?;
+    defer gpa.free(res1.text);
+    try std.testing.expect(std.mem.indexOf(u8, res1.text, "[0] primary (driver / repo root)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res1.text, "[0] 0") == null);
+
+    // 2. Add a worker lane.
+    const worker = try addFakeWorkingLane(gpa, &app, "c8882753bb24");
+    worker.title = try gpa.dupe(u8, "feature-x");
+    const res2 = listLanes(&app).?;
+    defer gpa.free(res2.text);
+    try std.testing.expect(std.mem.indexOf(u8, res2.text, "[0] primary (driver / repo root)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res2.text, "[1] c8882753bb24 feature-x (nova/c8882753bb24)") != null);
+}
+
+test "primary guard intercepts worker operations on primary IDs" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    const primary_aliases = [_][]const u8{ "0", "[0]", "(0)", "primary", "PRIMARY", "driver", "DRIVER" };
+
+    // Test enterLane on all aliases
+    for (primary_aliases) |alias| {
+        var req = lane_bridge.Request{ .op = .enter, .lane = try gpa.dupe(u8, alias), .requester = &agent };
+        defer req.deinit(gpa);
+        const result = postAndService(io, &app, &req);
+        defer gpa.free(result.text);
+        try std.testing.expect(result.code != 0);
+        try std.testing.expectEqualStrings("lane: [0] is the primary driver lane (repo root) — enter is for isolated worker lanes.\n", result.text);
+    }
+
+    // Test mergeLaneOp on all aliases
+    for (primary_aliases) |alias| {
+        var req = lane_bridge.Request{ .op = .merge, .lane = try gpa.dupe(u8, alias), .requester = &agent };
+        defer req.deinit(gpa);
+        const result = postAndService(io, &app, &req);
+        defer gpa.free(result.text);
+        try std.testing.expect(result.code != 0);
+        try std.testing.expectEqualStrings("lane: [0] is the primary driver lane — cannot merge the primary tree into itself.\n", result.text);
+    }
+
+    // Test deleteLaneOp on all aliases
+    for (primary_aliases) |alias| {
+        var req = lane_bridge.Request{ .op = .delete, .lane = try gpa.dupe(u8, alias), .requester = &agent };
+        defer req.deinit(gpa);
+        const result = postAndService(io, &app, &req);
+        defer gpa.free(result.text);
+        try std.testing.expect(result.code != 0);
+        try std.testing.expectEqualStrings("lane: [0] is the primary driver lane — only worker lanes (created via spawn/create) can be deleted.\n", result.text);
+    }
+
+    // Test awaitLaneOp on all aliases
+    for (primary_aliases) |alias| {
+        var req = lane_bridge.Request{ .op = .await, .lane = try gpa.dupe(u8, alias), .requester = &agent };
+        defer req.deinit(gpa);
+        const result = postAndService(io, &app, &req);
+        defer gpa.free(result.text);
+        try std.testing.expect(result.code != 0);
+        try std.testing.expectEqualStrings("lane: [0] is the primary driver lane — await is for spawned background worker lanes.\n", result.text);
+    }
+
+    // Test cancelLaneOp on all aliases
+    for (primary_aliases) |alias| {
+        var req = lane_bridge.Request{ .op = .cancel, .lane = try gpa.dupe(u8, alias), .requester = &agent };
+        defer req.deinit(gpa);
+        const result = postAndService(io, &app, &req);
+        defer gpa.free(result.text);
+        try std.testing.expect(result.code != 0);
+        try std.testing.expectEqualStrings("lane: [0] is the primary driver lane — cancel is for spawned background worker lanes.\n", result.text);
+    }
+
+    // Test steerLaneOp on all aliases
+    for (primary_aliases) |alias| {
+        var req = lane_bridge.Request{ .op = .steer, .lane = try gpa.dupe(u8, alias), .steer = try gpa.dupe(u8, "msg"), .requester = &agent };
+        defer req.deinit(gpa);
+        const result = postAndService(io, &app, &req);
+        defer gpa.free(result.text);
+        try std.testing.expect(result.code != 0);
+        try std.testing.expectEqualStrings("lane: [0] is the primary driver lane — steer is for running background worker agents.\n", result.text);
+    }
+
+    // Test readLaneOp on all aliases
+    for (primary_aliases) |alias| {
+        var req = lane_bridge.Request{ .op = .read, .lane = try gpa.dupe(u8, alias), .requester = &agent };
+        defer req.deinit(gpa);
+        const result = postAndService(io, &app, &req);
+        defer gpa.free(result.text);
+        try std.testing.expect(result.code != 0);
+        try std.testing.expectEqualStrings("lane: [0] is the primary driver lane — read is for inspecting worker lane transcripts.\n", result.text);
+    }
+}
+
+test "resolveLane handles case-insensitivity and suggests open worker IDs on failure" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    // When no worker lanes exist:
+    var req1 = lane_bridge.Request{ .op = .enter, .lane = try gpa.dupe(u8, "nonexistent"), .requester = &agent };
+    defer req1.deinit(gpa);
+    const res1 = postAndService(io, &app, &req1);
+    defer gpa.free(res1.text);
+    try std.testing.expect(res1.code != 0);
+    try std.testing.expectEqualStrings("lane: no open lane with id 'nonexistent'. Open worker lanes: [none]. (Note: [0] is the driver lane, not a worker).\n", res1.text);
+
+    // Add a worker lane:
+    const worker = try addFakeWorkingLane(gpa, &app, "a1b2c3d4e5f6");
+    _ = worker;
+
+    // Case-insensitive resolution:
+    const found_upper = resolveLane(&app, "A1B2C3D4E5F6");
+    try std.testing.expect(found_upper != null);
+    const found_mixed = resolveLane(&app, "a1B2c3D4e5F6");
+    try std.testing.expect(found_mixed != null);
+
+    // Unknown ID error with open workers listed:
+    var req2 = lane_bridge.Request{ .op = .read, .lane = try gpa.dupe(u8, "badhex123"), .requester = &agent };
+    defer req2.deinit(gpa);
+    const res2 = postAndService(io, &app, &req2);
+    defer gpa.free(res2.text);
+    try std.testing.expect(res2.code != 0);
+    try std.testing.expectEqualStrings("lane: no open lane with id 'badhex123'. Open worker lanes: [a1b2c3d4e5f6]. (Note: [0] is the driver lane, not a worker).\n", res2.text);
 }
