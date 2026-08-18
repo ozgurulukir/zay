@@ -4,6 +4,7 @@ const common = @import("common.zig");
 const os = @import("../os.zig");
 const platform = @import("platform");
 const pws = @import("pwsh_exec.zig");
+const lanes_util = @import("../tui/lanes.zig");
 
 pub const tool: common.Tool = .{
     .name = "pwsh",
@@ -265,53 +266,62 @@ const cd_guard_functions =
     \\    $target = if ($Path.Count -eq 0) { (Get-Location).Path } else { $Path[0] }
     \\    $abs = if ([System.IO.Path]::IsPathRooted($target)) { $target } else { Join-Path (Get-Location) $target }
     \\    $abs = [System.IO.Path]::GetFullPath($abs)
-    \\    if ($abs -ne $_nova_root -and $abs -notlike "$_nova_root\*") { throw "cd: $abs escapes the workspace root" }
+    \\    $root = $_nova_root.TrimEnd('\', '/')
+    \\    if ($abs -ne $_nova_root -and $abs -ne $root -and $abs -notlike "$root\*") { throw "cd: $abs escapes the workspace root" }
     \\    Microsoft.PowerShell.Core\Set-Location @Path }
     \\function Push-Location { throw "pushd: not allowed in this workspace" }
     \\function Pop-Location  { throw "popd: not allowed in this workspace" }
     \\
 ;
 
-/// Prefix `command` with `_nova_root` (the literal project root, escaped for a
-/// single-quoted PowerShell string — backslashes need no escaping there; single
-/// quotes are doubled) and the `Set-Location`/`Push-Location`/`Pop-Location`
-/// guard functions. `_nova_root` anchors on the project root — not the shell's
-/// start cwd — so a `cwd` subdir argument does not tighten containment to that
-/// subdir.
+/// Prefix `command` with `_nova_root` (the canonicalized project root via
+/// `[System.IO.Path]::GetFullPath`, single-quoted and quote-doubled for PowerShell)
+/// and the `Set-Location`/`Push-Location`/`Pop-Location` guard functions.
+/// `_nova_root` anchors on the project root — not the shell's start cwd — so
+/// a `cwd` subdir argument does not tighten containment to that subdir.
 fn prependCdGuard(gpa: std.mem.Allocator, project_root: []const u8, command: []const u8) std.mem.Allocator.Error![]u8 {
+    const normalized_root = std.fs.path.resolve(gpa, &.{project_root}) catch return error.OutOfMemory;
+    defer gpa.free(normalized_root);
+
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
-    try out.appendSlice(gpa, "$_nova_root = '");
-    for (project_root) |c| {
+    try out.appendSlice(gpa, "$_nova_root = [System.IO.Path]::GetFullPath('");
+    for (normalized_root) |c| {
         if (c == '\'') {
             try out.appendSlice(gpa, "''");
         } else {
             try out.append(gpa, c);
         }
     }
-    try out.appendSlice(gpa, "';\n");
+    try out.appendSlice(gpa, "');\n");
     try out.appendSlice(gpa, cd_guard_functions);
     try out.appendSlice(gpa, command);
     return out.toOwnedSlice(gpa);
 }
 
-/// Validate that `resolved_cwd` stays within the project root. Identical
-/// contract to the bash tool's `validateCwd` (shell-agnostic).
+/// Validate that `resolved_cwd` stays within the project root. Tolerant of
+/// mixed slash conventions and Windows case-insensitivity.
 fn validateCwd(gpa: std.mem.Allocator, io: std.Io, project_root: []const u8, resolved_cwd: []const u8) bool {
     const normalized = std.fs.path.resolve(gpa, &.{ project_root, resolved_cwd }) catch return false;
     defer gpa.free(normalized);
     const normalized_root = std.fs.path.resolve(gpa, &.{project_root}) catch return false;
     defer gpa.free(normalized_root);
 
-    if (!std.mem.startsWith(u8, normalized, normalized_root)) return false;
-    if (normalized.len > normalized_root.len and normalized[normalized_root.len] != std.fs.path.sep) return false;
+    if (!lanes_util.pathsEqual(normalized[0..@min(normalized.len, normalized_root.len)], normalized_root)) return false;
+    const root_has_sep = normalized_root.len > 0 and (normalized_root[normalized_root.len - 1] == '/' or normalized_root[normalized_root.len - 1] == '\\');
+    if (normalized.len > normalized_root.len and !root_has_sep and normalized[normalized_root.len] != std.fs.path.sep and normalized[normalized_root.len] != '/') return false;
 
+    // Best-effort symlink resolution (TD-4): canonicalize the resolved cwd and
+    // the root and re-check containment.
     const real_cwd = std.Io.Dir.realPathFileAbsoluteAlloc(io, normalized, gpa) catch return true;
     defer gpa.free(real_cwd);
     const real_root = std.Io.Dir.realPathFileAbsoluteAlloc(io, normalized_root, gpa) catch return true;
     defer gpa.free(real_root);
-    if (!std.mem.startsWith(u8, real_cwd, real_root)) return false;
-    if (real_cwd.len > real_root.len and real_cwd[real_root.len] != std.fs.path.sep) return false;
+
+    if (!lanes_util.pathsEqual(real_cwd[0..@min(real_cwd.len, real_root.len)], real_root)) return false;
+    const real_root_has_sep = real_root.len > 0 and (real_root[real_root.len - 1] == '/' or real_root[real_root.len - 1] == '\\');
+    if (real_cwd.len > real_root.len and !real_root_has_sep and real_cwd[real_root.len] != std.fs.path.sep and real_cwd[real_root.len] != '/') return false;
+
     return true;
 }
 
@@ -888,7 +898,7 @@ test "prependCdGuard anchors on the project root and defines the guard" {
     const guarded = try prependCdGuard(gpa, "C:\\Users\\u\\repo", "Write-Output hi");
     defer gpa.free(guarded);
 
-    try std.testing.expect(std.mem.startsWith(u8, guarded, "$_nova_root = 'C:\\Users\\u\\repo';\n"));
+    try std.testing.expect(std.mem.startsWith(u8, guarded, "$_nova_root = [System.IO.Path]::GetFullPath('C:\\Users\\u\\repo');\n"));
     try std.testing.expect(std.mem.indexOf(u8, guarded, "function Set-Location") != null);
     try std.testing.expect(std.mem.indexOf(u8, guarded, "function Push-Location") != null);
     try std.testing.expect(std.mem.endsWith(u8, guarded, "Write-Output hi"));
@@ -899,7 +909,25 @@ test "prependCdGuard doubles single quotes in the root path" {
     const guarded = try prependCdGuard(gpa, "C:\\Repo O'Brien", "true");
     defer gpa.free(guarded);
 
-    try std.testing.expect(std.mem.indexOf(u8, guarded, "$_nova_root = 'C:\\Repo O''Brien';") != null);
+    try std.testing.expect(std.mem.indexOf(u8, guarded, "$_nova_root = [System.IO.Path]::GetFullPath('C:\\Repo O''Brien');") != null);
+}
+
+test "prependCdGuard canonicalizes forward slashes in project root" {
+    const gpa = std.testing.allocator;
+    const guarded = try prependCdGuard(gpa, "C:/Users/u/repo", "Write-Output hi");
+    defer gpa.free(guarded);
+
+    try std.testing.expect(std.mem.indexOf(u8, guarded, "$_nova_root = [System.IO.Path]::GetFullPath('") != null);
+}
+
+test "validateCwd handles case-folding, slash differences, and rejects prefix collisions" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    try std.testing.expect(validateCwd(gpa, io, "C:\\repo", "C:/repo/sub"));
+    try std.testing.expect(validateCwd(gpa, io, "C:/repo", "sub"));
+    try std.testing.expect(!validateCwd(gpa, io, "C:\\repo", "C:\\repo-other"));
+    try std.testing.expect(!validateCwd(gpa, io, "C:\\repo", "C:\\other"));
 }
 
 test "contained pwsh refuses Set-Location to a directory outside the workspace root" {

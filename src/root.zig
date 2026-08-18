@@ -152,6 +152,13 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     // moment no session can be mid-read of a previous process's output.
     bash.pruneStaleTempFiles(init.io, gpa, bash.temp_retention_ns);
 
+    // Worktree hygiene: drop orphaned worktree checkouts (> 7 days) and
+    // sync git metadata in the current workspace.
+    vcs.gcOrphanedWorktrees(gpa, init.io, home_dir, vcs.worktree_retention_ns);
+    if (vcs.isRepo(gpa, init.io, cwd)) {
+        vcs.worktreePrune(gpa, init.io, cwd) catch {};
+    }
+
     // Auto-resume: find the most recently updated session for this cwd.
     const resume_session_id = blk: {
         var manager = session.SessionManager.initDefault(runtime_gpa, init.io, home_dir) catch break :blk null;

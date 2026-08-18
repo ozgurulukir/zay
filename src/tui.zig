@@ -219,6 +219,8 @@ pub const App = struct {
     /// destroyed in `deinitApp` (after every lane's turn future is cancelled,
     /// which wakes any worker blocked on the bridge). See `tools/lane_bridge.zig`.
     lane_bridge: ?*lane_bridge_mod.LaneBridge = null,
+    /// In-flight asynchronous worktree creation job.
+    async_worktree_job: ?*lane_lifecycle.WorktreeJob = null,
     /// App-wide cap on concurrent LLM requests to the provider, shared by every
     /// lane's agent (turn, naming, and compaction requests all gate on it).
     /// Heap-allocated so its address stays stable while worker threads block

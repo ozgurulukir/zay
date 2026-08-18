@@ -22,6 +22,7 @@ const bash = @import("tools/bash_exec.zig");
 const pws = @import("tools/pwsh_exec.zig");
 const os = @import("os.zig");
 const platform = @import("platform");
+const lanes_util = @import("tui/lanes.zig");
 
 const assert = std.debug.assert;
 
@@ -514,6 +515,29 @@ pub const BackgroundManager = struct {
         return false;
     }
 
+    /// Terminate all running background jobs whose CWD is within `target_cwd`.
+    /// Synchronously kills child processes to release file locks before directory deletion.
+    pub fn terminateJobsInCwd(self: *BackgroundManager, target_cwd: []const u8) void {
+        var pids_to_kill: std.ArrayList(i64) = .empty;
+        defer pids_to_kill.deinit(self.gpa);
+
+        if (self.mutex.lock(self.io)) |_| {
+            for (self.jobs.items) |job| {
+                if (job.state.load(.acquire) == .running) {
+                    if (isSubpathOrEqual(job.cwd, target_cwd)) {
+                        job.killed.store(true, .release);
+                        pids_to_kill.append(self.gpa, job.pid) catch {};
+                    }
+                }
+            }
+            self.mutex.unlock(self.io);
+        } else |_| return;
+
+        for (pids_to_kill.items) |pid| {
+            terminateTreeSync(self.io, self.gpa, pid);
+        }
+    }
+
     /// Take every finished-but-unreported job, transferring ownership to the
     /// caller (the UI), which shows the notice and — for non-killed jobs —
     /// delivers `completion_message` to the owning agent. Free each with `deinit`.
@@ -714,6 +738,24 @@ const windows = struct {
     const DWORD = std.os.windows.DWORD;
     extern "kernel32" fn GetProcessId(Process: HANDLE) callconv(.winapi) DWORD;
 };
+
+pub fn isSubpathOrEqual(child: []const u8, parent: []const u8) bool {
+    if (lanes_util.pathsEqual(child, parent)) return true;
+    if (child.len <= parent.len) return false;
+    const prefix = child[0..parent.len];
+    if (lanes_util.pathsEqual(prefix, parent)) {
+        const sep = child[parent.len];
+        return sep == '/' or sep == '\\';
+    }
+    return false;
+}
+
+test "isSubpathOrEqual handles exact match, subpaths, and rejects prefix collisions" {
+    try std.testing.expect(isSubpathOrEqual("C:\\Users\\nova\\worktrees\\1", "C:/Users/nova/worktrees/1"));
+    try std.testing.expect(isSubpathOrEqual("C:\\Users\\nova\\worktrees\\1\\sub", "C:/Users/nova/worktrees/1"));
+    try std.testing.expect(!isSubpathOrEqual("C:\\Users\\nova\\worktrees\\1-other", "C:/Users/nova/worktrees/1"));
+    try std.testing.expect(!isSubpathOrEqual("C:\\Users\\nova\\worktrees", "C:/Users/nova/worktrees/1"));
+}
 
 test "BackgroundManager init/deinit cycle is clean" {
     // A manager with no jobs must deinit without leaks or hangs.

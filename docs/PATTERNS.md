@@ -255,3 +255,26 @@ Guard POSIX-only syscalls behind `if (!os.is_windows)` at their call sites: `std
 **`zeroedChild()` helper (`src/mcp/client.zig`):** `std.mem.zeroes(std.process.Child)` is a compile error on Windows because `Child.thread_handle` is a non-nullable `HANDLE`. Use the `zeroedChild()` helper to construct a zeroed `Child` portably instead of calling `std.mem.zeroes` directly.
 
 Note: this covers **compilation** only. Full runtime support on Windows is still in progress — see the follow-up issues (#26 config paths, #27 bash shell, #28 failing tests, #29 ModernBERT worker / lanes).
+
+### Worktree Hardening & Lifecycle Architecture
+
+Worktrees isolate parallel worker agents and user lanes from the primary repository tree. Five architectural pillars ensure robust, cross-platform stability:
+
+1. **Path Normalization (`lanes_util.pathsEqual`):**
+   Path equality checks for workspace borrows, worktree directories, and lane commands use `lanes_util.pathsEqual` in `src/tui/lanes.zig`. This helper operates with zero dynamic allocations, collapses redundant and trailing slashes (`/` vs `\`), and applies ASCII case-folding on Windows (`C:\foo` == `c:/foo/`). Never compare file or worktree paths with byte-level `std.mem.eql`.
+
+2. **Shell Containment Parity:**
+   Worker agents are strictly root-contained. On POSIX, `bash.zig` validates directory navigation. On Windows, `src/tools/pwsh.zig` injects pre-command function overrides (`cd`, `Set-Location`, `chdir`, `sl`) that resolve target paths with `[System.IO.Path]::GetFullPath`, check boundaries with `$root.TrimEnd('\', '/')`, and reject directory-stack escapes (`Push-Location`, `Pop-Location`).
+
+3. **Windows File Locking & Teardown Protocol:**
+   Deleting worktrees on Windows is subject to asynchronous file lock retention by child processes or Windows Defender. All teardown paths (`abandonLane`, `mergeLane`, `deleteSelectedParked`, `rollbackLaneWorktree`, `deleteLaneOp`) call `lane_lifecycle.cleanupLaneWorktreeAndBranch`:
+   - Synchronously terminates all child background processes running in or below the worktree (`background.terminateJobsInCwd` via `terminateTreeSync`).
+   - Executes `vcs.worktreeRemove` with a 4-attempt retry loop and exponential backoff (50ms, 150ms, 300ms).
+   - Runs `vcs.worktreePrune` (`git worktree prune --expire now`) to purge administrative metadata in `.git/worktrees`.
+
+4. **Startup Orphan Garbage Collection:**
+   Global worktree checkouts reside at `<home>/.config/nova/worktrees/<id>` (resolved portably via `vcs.globalWorktreesDir`). During startup hygiene in `src/root.zig:run()`, `vcs.gcOrphanedWorktrees` scans this directory and removes abandoned checkouts older than 7 days (`vcs.worktree_retention_ns = 7d`). When launched in a Git repository, `vcs.worktreePrune` synchronizes `.git/worktrees` metadata before any session or lane initializes.
+
+5. **Asynchronous Non-Blocking Worktree Provisioning:**
+   In large repositories, `git worktree add` can block the host process for 2–5 seconds. `spawnLane` offloads worktree creation to a background worker thread (`WorktreeJob`) and returns `null` on the first tick, keeping the request queued in `LaneBridge.pending`. The TUI event loop continues ticking at 30ms, while `advanceAnimations` and `decideShouldTick` query `lane_lifecycle.anyAsyncWorktreeActive` to drive loading spinners smoothly until provisioning completes.
+

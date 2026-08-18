@@ -101,6 +101,11 @@ fn deinitSharedServices(self: *App) void {
         self.cached_config_owned = false;
     }
 
+    if (self.async_worktree_job) |job| {
+        job.deinit();
+        self.async_worktree_job = null;
+    }
+
     // No worker is blocked on the bridge or holds a permit now.
     if (self.lane_bridge) |bridge| {
         self.gpa.destroy(bridge);
@@ -238,7 +243,8 @@ fn drainBackgroundAndLanes(root: *RootWidget) !bool {
 /// Advance spinner frames when a turn or manual compaction is active.
 fn advanceAnimations(root: *RootWidget, visible_change: *bool) !void {
     const spinner_active = root.app.anyTurnActive() or
-        compaction_lifecycle.manualCompactActive(root.app);
+        compaction_lifecycle.manualCompactActive(root.app) or
+        lane_lifecycle.anyAsyncWorktreeActive(root.app);
     if (spinner_active) {
         root.spinner_tick_accum += RootWidget.drain_tick_ms;
         if (root.spinner_tick_accum >= RootWidget.spinner_tick_threshold_ms) {
@@ -295,6 +301,7 @@ fn decideShouldTick(root: *RootWidget) bool {
     const mcp_connect_pending = root.app.mcp_manager.hasPendingConnects();
     const manual_compact_active = compaction_lifecycle.manualCompactActive(root.app);
     const toasts_visible = toast.global.hasToasts();
+    const worktree_async_active = lane_lifecycle.anyAsyncWorktreeActive(root.app);
 
     return turn_active or
         model_loading or
@@ -305,7 +312,8 @@ fn decideShouldTick(root: *RootWidget) bool {
         naming_active or
         mcp_connect_pending or
         manual_compact_active or
-        toasts_visible;
+        toasts_visible or
+        worktree_async_active;
 }
 
 /// Per-lane byte budget for drain-to-empty: events applied beyond this budget
@@ -424,7 +432,7 @@ pub fn createParallelLane(self: *App) !void {
 
     // Worktrees live under the global `<home>/.config/nova/worktrees`, OUTSIDE the
     // repo, so `git add -A`/snapshots/`/save` never see them.
-    const parent = try std.fs.path.join(self.gpa, &.{ home, ".config", "nova", "worktrees" });
+    const parent = try vcs.globalWorktreesDir(self.gpa, home);
     defer self.gpa.free(parent);
     std.Io.Dir.cwd().createDirPath(self.io, parent) catch {};
     const dest = try std.fs.path.join(self.gpa, &.{ parent, id[0..] });

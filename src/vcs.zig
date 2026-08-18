@@ -357,9 +357,74 @@ pub fn worktreeAdd(gpa: std.mem.Allocator, io: std.Io, repo_dir: []const u8, pat
 
 /// Remove a lane's worktree (and its working directory). `--force` because the
 /// lane's uncommitted snapshots live off-branch, so a "dirty" worktree is normal
-/// and shouldn't block teardown.
+/// and shouldn't block teardown. Retries up to 4 times on Windows with backoff
+/// (50ms, 150ms, 300ms) to accommodate transient file locks.
 pub fn worktreeRemove(gpa: std.mem.Allocator, io: std.Io, repo_dir: []const u8, path: []const u8) CmdError!void {
-    var out = try run(gpa, io, repo_dir, &.{ "worktree", "remove", "--force", path }, null);
+    const max_attempts: u32 = if (os.is_windows) 4 else 1;
+    var attempt: u32 = 1;
+
+    while (attempt <= max_attempts) : (attempt += 1) {
+        var out = try run(gpa, io, repo_dir, &.{ "worktree", "remove", "--force", path }, null);
+        defer out.deinit(gpa);
+        if (out.code == 0) return;
+
+        if (attempt < max_attempts and os.is_windows) {
+            const delay_ms: i64 = switch (attempt) {
+                1 => 50,
+                2 => 150,
+                else => 300,
+            };
+            io.sleep(.fromMilliseconds(delay_ms), .awake) catch {};
+            continue;
+        }
+
+        log.warn("vcs.worktreeRemove failed repo={s} path={s} code={d} stderr={s}", .{
+            repo_dir, path, out.code, std.mem.trim(u8, out.stderr, " \t\r\n"),
+        });
+        return error.GitCommandFailed;
+    }
+}
+
+pub const worktree_retention_days: u64 = 7;
+pub const worktree_retention_ns: u64 = worktree_retention_days * 24 * 60 * 60 * std.time.ns_per_s;
+
+/// Resolve the global worktree directory path (<home>/.config/nova/worktrees).
+pub fn globalWorktreesDir(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
+    return std.fs.path.join(gpa, &.{ home_dir, ".config", "nova", "worktrees" });
+}
+
+/// Scans the global worktrees directory and deletes abandoned worktree checkouts
+/// older than `max_age_ns`. Runs during startup hygiene before the TUI initializes.
+pub fn gcOrphanedWorktrees(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, max_age_ns: u64) void {
+    if (home_dir.len == 0) return;
+    const parent = globalWorktreesDir(gpa, home_dir) catch return;
+    defer gpa.free(parent);
+    gcWorktreesDir(io, parent, max_age_ns);
+}
+
+/// Directory-parameterized core of `gcOrphanedWorktrees` so unit tests can
+/// target a scratch directory.
+pub fn gcWorktreesDir(io: std.Io, dir_path: []const u8, max_age_ns: u64) void {
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+
+    const now = std.Io.Timestamp.now(io, .real);
+    var iter = dir.iterate();
+    while (iter.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        const st = dir.statFile(io, entry.name, .{}) catch continue;
+        const age_ns = st.mtime.durationTo(now).nanoseconds;
+        if (age_ns > 0 and @as(u128, @intCast(age_ns)) > max_age_ns) {
+            dir.deleteTree(io, entry.name) catch continue;
+            log.info("vcs.gc: pruned orphaned worktree {s}", .{entry.name});
+        }
+    }
+}
+
+/// Prune working tree metadata in `.git/worktrees`. Uses `--expire now` so
+/// newly-orphaned worktree metadata is cleaned up immediately.
+pub fn worktreePrune(gpa: std.mem.Allocator, io: std.Io, repo_dir: []const u8) CmdError!void {
+    var out = try run(gpa, io, repo_dir, &.{ "worktree", "prune", "--expire", "now" }, null);
     defer out.deinit(gpa);
     if (out.code != 0) return error.GitCommandFailed;
 }
@@ -711,6 +776,67 @@ test "worktree lanes: list finds lane branches, merge folds one in, conflict rol
     const restored = try showFile(gpa, io, dest, "HEAD", "base.txt");
     defer gpa.free(restored);
     try std.testing.expectEqualStrings("dest-change\n", restored);
+}
+
+test "worktreePrune executes cleanly on empty or populated repo" {
+    if (!isAvailable(std.testing.allocator, std.testing.io)) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var rand: [8]u8 = undefined;
+    io.random(&rand);
+    const hex = std.fmt.bytesToHex(rand, .lower);
+    const name = try std.fmt.allocPrint(gpa, "nova-vcsprune-{s}", .{hex[0..]});
+    defer gpa.free(name);
+
+    try std.Io.Dir.cwd().createDirPath(io, name);
+    defer std.Io.Dir.cwd().deleteTree(io, name) catch {};
+
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const repo = try std.fs.path.join(gpa, &.{ cwd, name });
+    defer gpa.free(repo);
+
+    try expectOk(gpa, io, repo, &.{ "init", "-q" });
+    try worktreePrune(gpa, io, repo);
+}
+
+test "gcWorktreesDir prunes old directories and leaves recent directories untouched" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var rand: [8]u8 = undefined;
+    io.random(&rand);
+    const hex = std.fmt.bytesToHex(rand, .lower);
+    const name = try std.fmt.allocPrint(gpa, "nova-vcsgc-{s}", .{hex[0..]});
+    defer gpa.free(name);
+
+    try std.Io.Dir.cwd().createDirPath(io, name);
+    defer std.Io.Dir.cwd().deleteTree(io, name) catch {};
+
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const parent_dir = try std.fs.path.join(gpa, &.{ cwd, name });
+    defer gpa.free(parent_dir);
+
+    // Create two mock worktrees
+    const recent = try std.fs.path.join(gpa, &.{ parent_dir, "recent-wt" });
+    defer gpa.free(recent);
+    try std.Io.Dir.cwd().createDirPath(io, recent);
+
+    const stale = try std.fs.path.join(gpa, &.{ parent_dir, "stale-wt" });
+    defer gpa.free(stale);
+    try std.Io.Dir.cwd().createDirPath(io, stale);
+
+    // Running GC with a huge retention window (7 days) leaves both untouched
+    gcWorktreesDir(io, parent_dir, worktree_retention_ns);
+    try std.Io.Dir.accessAbsolute(io, recent, .{});
+    try std.Io.Dir.accessAbsolute(io, stale, .{});
+
+    // Running GC with 0 max_age prunes both
+    gcWorktreesDir(io, parent_dir, 0);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, recent, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, stale, .{}));
 }
 
 fn expectOk(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, args: []const []const u8) !void {

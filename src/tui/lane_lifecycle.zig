@@ -19,6 +19,7 @@ const queue_mod = @import("queue.zig");
 const runtime_mod = @import("../runtime.zig");
 const command_router = @import("command_router.zig");
 const vcs = @import("../vcs.zig");
+const background_mod = @import("../background.zig");
 
 const App = tui.App;
 const Thread = tui.Thread;
@@ -44,13 +45,12 @@ fn laneMergeDir(app: *App, lane: *Thread) ?[]const u8 {
     return app.repoRoot();
 }
 
-/// Whether an open lane's worktree lives at `path`. Compares the final path
-/// segment (the unique lane id) so it survives git reporting forward slashes
-/// where the stored path uses the platform separator.
+/// Whether an open lane's worktree lives at `path`. Tolerant of platform
+/// separator differences and trailing slashes.
 fn laneOpenAtPath(app: *App, path: []const u8) bool {
     for (app.threads.slice()) |lane| {
         if (lanes_util.workingLaneOf(lane)) |w| {
-            if (std.mem.eql(u8, lanes_util.lastPathSegment(w.path), lanes_util.lastPathSegment(path))) return true;
+            if (lanes_util.pathsEqual(w.path, path)) return true;
         }
     }
     return false;
@@ -125,6 +125,25 @@ fn discardUndeliveredCompletion(app: *App, lane: *Thread) void {
     lane.completion_delivered = true;
 }
 
+fn terminateLaneProcesses(app: *App, worktree_path: []const u8) void {
+    if (app.background) |bg| {
+        bg.terminateJobsInCwd(worktree_path);
+    }
+}
+
+fn cleanupLaneWorktreeAndBranch(app: *App, repo: []const u8, path: ?[]const u8, branch: ?[]const u8) void {
+    if (path) |p| {
+        terminateLaneProcesses(app, p);
+        if (vcs.worktreeRemove(app.gpa, app.io, repo, p)) |_| {} else |_| {
+            // Fallback: prune git worktree metadata if file removal was partially blocked
+            vcs.worktreePrune(app.gpa, app.io, repo) catch {};
+        }
+    }
+    if (branch) |b| {
+        vcs.deleteBranch(app.gpa, app.io, repo, b) catch {};
+    }
+}
+
 /// Tear down the working lane at `index` and DELETE its git worktree +
 /// branch. Used for a merged source (its work now lives in the destination) —
 /// unlike `/close`, which parks. Caller must ensure `index != 0` (never the
@@ -157,8 +176,7 @@ fn abandonLane(app: *App, index: u32) !void {
     app.gpa.destroy(lane);
 
     if (app.repoRoot()) |repo| {
-        if (dir) |d| vcs.worktreeRemove(app.gpa, app.io, repo, d) catch {};
-        if (branch) |b| vcs.deleteBranch(app.gpa, app.io, repo, b) catch {};
+        cleanupLaneWorktreeAndBranch(app, repo, dir, branch);
     }
 }
 
@@ -215,7 +233,7 @@ fn clearWorkspaceBorrowForPath(app: *App, path: []const u8) !void {
     for (app.threads.slice()) |other| {
         const agent = other.agent orelse continue;
         const ws = agent.workspaceBorrow() orelse continue;
-        if (!std.mem.eql(u8, ws, path)) continue;
+        if (!lanes_util.pathsEqual(ws, path)) continue;
         if (other.turn.isActive()) return error.InFlightTurn;
         agent.setWorkspace(null);
     }
@@ -258,8 +276,7 @@ fn mergeLane(app: *App, source: lanes_util.MergeSource, dest: *Thread) !void {
     if (source.active_index) |si| {
         try abandonLane(app, @intCast(si));
     } else if (app.repoRoot()) |repo| {
-        vcs.worktreeRemove(app.gpa, app.io, repo, source.path) catch {};
-        vcs.deleteBranch(app.gpa, app.io, repo, source.branch) catch {};
+        cleanupLaneWorktreeAndBranch(app, repo, source.path, source.branch);
     }
 
     if (app.threads.len() < 2) app.split_mode = .tab;
@@ -592,8 +609,7 @@ pub fn deleteSelectedParked(app: *App) !void {
     // borrow in practice — but every path that frees a lane path checks.
     try clearWorkspaceBorrowForPath(app, entry.path);
     if (app.repoRoot()) |repo| {
-        vcs.worktreeRemove(app.gpa, app.io, repo, entry.path) catch {};
-        vcs.deleteBranch(app.gpa, app.io, repo, entry.branch) catch {};
+        cleanupLaneWorktreeAndBranch(app, repo, entry.path, entry.branch);
     }
     try reloadParkedLanes(app);
 }
@@ -830,7 +846,7 @@ fn listLanes(app: *App) ?Resp {
         defer app.gpa.free(status);
         const ws_marker: []const u8 = if (driver_ws) |ws| blk: {
             if (lanes_util.workingLaneOf(lane)) |wl| {
-                if (std.mem.eql(u8, ws, wl.path)) break :blk "  <- workspace";
+                if (lanes_util.pathsEqual(ws, wl.path)) break :blk "  <- workspace";
             }
             break :blk "";
         } else "";
@@ -859,6 +875,60 @@ fn listLanes(app: *App) ?Resp {
     return .{ .text = out.toOwnedSlice() catch return failResp(gpa, "lane: out of memory\n", .{}) };
 }
 
+/// Asynchronous background worker for heavy `git worktree add` operations.
+/// Prevents freezing the TUI event loop during lane provisioning in large repositories.
+pub const WorktreeJob = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    repo: []u8,
+    dest: []u8,
+    branch: []u8,
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    err: ?anyerror = null,
+
+    pub fn start(gpa: std.mem.Allocator, io: std.Io, repo: []const u8, dest: []const u8, branch: []const u8) !*WorktreeJob {
+        const job = try gpa.create(WorktreeJob);
+        errdefer gpa.destroy(job);
+        job.* = .{
+            .gpa = gpa,
+            .io = io,
+            .repo = try gpa.dupe(u8, repo),
+            .dest = try gpa.dupe(u8, dest),
+            .branch = try gpa.dupe(u8, branch),
+        };
+        errdefer {
+            gpa.free(job.repo);
+            gpa.free(job.dest);
+            gpa.free(job.branch);
+        }
+        job.thread = try std.Thread.spawn(.{}, runWorker, .{job});
+        return job;
+    }
+
+    fn runWorker(job: *WorktreeJob) void {
+        vcs.worktreeAdd(job.gpa, job.io, job.repo, job.dest, job.branch) catch |err| {
+            job.err = err;
+        };
+        job.done.store(true, .release);
+    }
+
+    pub fn deinit(self: *WorktreeJob) void {
+        if (self.thread) |t| t.join();
+        self.gpa.free(self.repo);
+        self.gpa.free(self.dest);
+        self.gpa.free(self.branch);
+        self.gpa.destroy(self);
+    }
+};
+
+pub fn anyAsyncWorktreeActive(app: *const App) bool {
+    if (app.async_worktree_job) |job| {
+        return !job.done.load(.acquire);
+    }
+    return false;
+}
+
 /// The git side of opening a lane — shared by `createParallelLane`-style user
 /// flow (which additionally attaches a runtime) and the model-driven `create`
 /// / `spawn` (which build their own engines). Returns the owned branch + dest.
@@ -869,7 +939,7 @@ fn createLaneWorktree(app: *App, repo: []const u8, home: []const u8) !struct { b
 
     const branch = try std.fmt.allocPrint(app.gpa, "nova/{s}", .{id[0..]});
     errdefer app.gpa.free(branch);
-    const parent = try std.fs.path.join(app.gpa, &.{ home, ".config", "nova", "worktrees" });
+    const parent = try vcs.globalWorktreesDir(app.gpa, home);
     defer app.gpa.free(parent);
     std.Io.Dir.cwd().createDirPath(app.io, parent) catch {};
     const dest = try std.fs.path.join(app.gpa, &.{ parent, id[0..] });
@@ -890,8 +960,7 @@ fn createLaneWorktree(app: *App, repo: []const u8, home: []const u8) !struct { b
 /// failed `Thread` alloc / `createRuntime` / `threads.append` would free the
 /// identity strings but orphan the worktree + branch on disk permanently.
 fn rollbackLaneWorktree(app: *App, repo: []const u8, dest: []const u8, branch: []const u8) void {
-    vcs.worktreeRemove(app.gpa, app.io, repo, dest) catch {};
-    vcs.deleteBranch(app.gpa, app.io, repo, branch) catch {};
+    cleanupLaneWorktreeAndBranch(app, repo, dest, branch);
 }
 
 /// Free a captured parent-context list (the `captureLaneContext` shape).
@@ -992,7 +1061,7 @@ fn mergeLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     // current tool batch's executor is still rooted in it.
     if (driverWorkspace(app)) |ws| {
         if (lanes_util.workingLaneOf(target)) |tw| {
-            if (std.mem.eql(u8, ws, tw.path)) {
+            if (lanes_util.pathsEqual(ws, tw.path)) {
                 return failResp(app.gpa, "lane: call `lane leave` first — merging frees lane {s}'s worktree, and the current tool batch is still rooted in it.\n", .{id});
             }
         }
@@ -1129,21 +1198,85 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
         return failResp(app.gpa, "lane: too many lanes open (max 4 total: driver + 3)\n", .{});
     }
 
-    // `home` is only needed for creating a new worktree; compute it here.
-    const home = (app.templateRuntime() orelse {
-        freeLaneContext(app.gpa, context);
-        return failResp(app.gpa, "lane: no active runtime\n", .{});
-    }).home_dir;
+    var wt_dest_owned: ?[]u8 = null;
+    var wt_branch_owned: ?[]u8 = null;
+    defer if (wt_dest_owned) |d| app.gpa.free(d);
+    defer if (wt_branch_owned) |b| app.gpa.free(b);
 
-    const wt = createLaneWorktree(app, repo, home) catch |err| {
+    if (app.async_worktree_job) |job| {
+        if (!job.done.load(.acquire)) {
+            freeLaneContext(app.gpa, context);
+            return null; // Keep request in pending, UI thread continues ticking smoothly
+        }
+        defer {
+            job.deinit();
+            app.async_worktree_job = null;
+        }
+        if (job.err) |err| {
+            freeLaneContext(app.gpa, context);
+            return failResp(app.gpa, "lane: worktree create failed: {s}\n", .{@errorName(err)});
+        }
+        wt_dest_owned = app.gpa.dupe(u8, job.dest) catch {
+            freeLaneContext(app.gpa, context);
+            return failResp(app.gpa, "lane: out of memory\n", .{});
+        };
+        wt_branch_owned = app.gpa.dupe(u8, job.branch) catch {
+            freeLaneContext(app.gpa, context);
+            return failResp(app.gpa, "lane: out of memory\n", .{});
+        };
+    } else {
+        // `home` is only needed for creating a new worktree; compute it here.
+        const home = (app.templateRuntime() orelse {
+            freeLaneContext(app.gpa, context);
+            return failResp(app.gpa, "lane: no active runtime\n", .{});
+        }).home_dir;
+
+        var raw: [6]u8 = undefined;
+        app.io.random(&raw);
+        const id = std.fmt.bytesToHex(raw, .lower);
+
+        const branch = std.fmt.allocPrint(app.gpa, "nova/{s}", .{id[0..]}) catch {
+            freeLaneContext(app.gpa, context);
+            return failResp(app.gpa, "lane: out of memory\n", .{});
+        };
+        errdefer app.gpa.free(branch);
+        const parent = vcs.globalWorktreesDir(app.gpa, home) catch {
+            app.gpa.free(branch);
+            freeLaneContext(app.gpa, context);
+            return failResp(app.gpa, "lane: out of memory\n", .{});
+        };
+        defer app.gpa.free(parent);
+        std.Io.Dir.cwd().createDirPath(app.io, parent) catch {};
+        const dest = std.fs.path.join(app.gpa, &.{ parent, id[0..] }) catch {
+            app.gpa.free(branch);
+            freeLaneContext(app.gpa, context);
+            return failResp(app.gpa, "lane: out of memory\n", .{});
+        };
+        errdefer app.gpa.free(dest);
+
+        const job = WorktreeJob.start(app.gpa, app.io, repo, dest, branch) catch |err| {
+            app.gpa.free(branch);
+            app.gpa.free(dest);
+            freeLaneContext(app.gpa, context);
+            return failResp(app.gpa, "lane: worktree create failed: {s}\n", .{@errorName(err)});
+        };
+        app.gpa.free(branch);
+        app.gpa.free(dest);
+        app.async_worktree_job = job;
         freeLaneContext(app.gpa, context);
-        return failResp(app.gpa, "lane: worktree create failed: {s}\n", .{@errorName(err)});
-    };
-    const runtime = app.createRuntime(wt.dest, repo, null) catch |err| {
+        return null; // Return null so request stays in pending list and UI tick runs without blocking!
+    }
+
+    const wt_dest = wt_dest_owned.?;
+    const wt_branch = wt_branch_owned.?;
+    wt_dest_owned = null;
+    wt_branch_owned = null;
+
+    const runtime = app.createRuntime(wt_dest, repo, null) catch |err| {
         freeLaneContext(app.gpa, context);
-        rollbackLaneWorktree(app, repo, wt.dest, wt.branch);
-        app.gpa.free(wt.branch);
-        app.gpa.free(wt.dest);
+        rollbackLaneWorktree(app, repo, wt_dest, wt_branch);
+        app.gpa.free(wt_branch);
+        app.gpa.free(wt_dest);
         return failResp(app.gpa, "lane: runtime create failed: {s}\n", .{@errorName(err)});
     };
     runtime.agent.background_manager = app.background;
@@ -1160,9 +1293,9 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
         freeLaneContext(app.gpa, context);
         runtime.deinit();
         app.gpa.destroy(runtime);
-        rollbackLaneWorktree(app, repo, wt.dest, wt.branch);
-        app.gpa.free(wt.branch);
-        app.gpa.free(wt.dest);
+        rollbackLaneWorktree(app, repo, wt_dest, wt_branch);
+        app.gpa.free(wt_branch);
+        app.gpa.free(wt_dest);
         return failResp(app.gpa, "lane: out of memory\n", .{});
     };
     lane.* = Thread.initLive(
@@ -1171,18 +1304,18 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
         app.io,
         runtime.gpa,
         context, // adopted by the lane
-        wt.branch, // adopted by the lane
-        wt.dest, // adopted by the lane
+        wt_branch, // adopted by the lane
+        wt_dest, // adopted by the lane
         runtime,
     );
     lane.generation = app.nextLaneGeneration();
     lane.spawned_by_generation = spawner.generation;
     app.threads.append(lane) catch {
-        // The lane adopted wt.branch/wt.dest via initLive. Remove the worktree
+        // The lane adopted wt_branch/wt_dest via initLive. Remove the worktree
         // while those strings are still valid, before lane.deinit frees them
         // (and tears down the runtime). Safe to do first because runtime.deinit
         // never touches the worktree filesystem (DB lives at the repo root).
-        rollbackLaneWorktree(app, repo, wt.dest, wt.branch);
+        rollbackLaneWorktree(app, repo, wt_dest, wt_branch);
         lane.deinit(app.gpa); // frees the adopted runtime, context, branch, path
         app.gpa.destroy(lane);
         return failResp(app.gpa, "lane: out of memory\n", .{});
@@ -1192,8 +1325,8 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
     const configured = app.cached_config.tui.split_mode;
     if (configured == .dual) enterDual(app) else app.split_mode = configured;
 
-    const id = lanes_util.lastPathSegment(wt.dest);
-    const path = wt.dest; // now owned by the lane
+    const id = lanes_util.lastPathSegment(wt_dest);
+    const path = wt_dest; // now owned by the lane
     // F2: worker-role framing makes the role unambiguous from turn one. It
     // also names the worker's ACTUAL working directory (its isolated worktree)
     // so a task that mentions the main tree's absolute path — e.g. the driver's
@@ -1202,7 +1335,7 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
     const framed = std.fmt.allocPrint(
         app.gpa,
         "You are a worker agent in lane {s} on branch {s}. Your working directory is {s} — an isolated git worktree of the repo at {s}; work ONLY with relative paths inside it. The main tree is off-limits. Complete this task and report the result concisely. You cannot create lanes or worktrees.\n\n{s}",
-        .{ id, wt.branch, wt.dest, repo, task },
+        .{ id, wt_branch, wt_dest, repo, task },
     ) catch {
         removeFailedSpawn(app, lane);
         return failResp(app.gpa, "lane: out of memory\n", .{});
@@ -1216,7 +1349,7 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
     return resp(
         app.gpa,
         "Spawned worker lane {s} (branch {s}, path {s}) — running in the background; results arrive as a message. Read with `lane read {s}`, wait with `lane await {s}`, fold back with `lane merge {s}`.\n",
-        .{ id, wt.branch, path, id, id, id },
+        .{ id, wt_branch, path, id, id, id },
         id,
         path,
     );
@@ -1484,7 +1617,7 @@ fn deleteLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
         // the current tool batch's executor is still rooted in it.
         if (driverWorkspace(app)) |ws| {
             if (lanes_util.workingLaneOf(target)) |tw| {
-                if (std.mem.eql(u8, ws, tw.path)) {
+                if (lanes_util.pathsEqual(ws, tw.path)) {
                     return failResp(app.gpa, "lane: call `lane leave` first — deleting frees lane {s}'s worktree, and the current tool batch is still rooted in it.\n", .{id});
                 }
             }
@@ -1514,15 +1647,14 @@ fn deleteLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     for (parked) |entry| {
         if (std.mem.eql(u8, lanes_util.lastPathSegment(entry.path), id)) {
             if (driverWorkspace(app)) |ws| {
-                if (std.mem.eql(u8, ws, entry.path)) {
+                if (lanes_util.pathsEqual(ws, entry.path)) {
                     return failResp(app.gpa, "lane: call `lane leave` first — deleting frees lane {s}'s worktree, and the current tool batch is still rooted in it.\n", .{id});
                 }
             }
             clearWorkspaceBorrowForPath(app, entry.path) catch |err| {
                 return failResp(app.gpa, "lane delete failed: {s}\n", .{lanes_util.laneErrorText(err)});
             };
-            vcs.worktreeRemove(app.gpa, app.io, repo, entry.path) catch {};
-            vcs.deleteBranch(app.gpa, app.io, repo, entry.branch) catch {};
+            cleanupLaneWorktreeAndBranch(app, repo, entry.path, entry.branch);
             return resp(app.gpa, "Deleted parked lane {s}.\n", .{id}, null, null);
         }
     }
@@ -3246,4 +3378,76 @@ test "deleteLaneOp discards a live worker's idle-turn completion (B2)" {
     try std.testing.expectEqual(@as(u8, 0), result.code);
     try std.testing.expect(transcriptContains(spawner, "result discarded"));
     try std.testing.expectEqual(@as(usize, 1), app.threads.len()); // lane removed
+}
+
+test "clearWorkspaceBorrowForPath & deleteLaneOp tolerate slash format differences across platforms" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    // 1. Driver borrows a path with backslashes
+    const backslash_path = "C:\\Users\\nova\\.config\\nova\\worktrees\\test1";
+    agent.setWorkspace(backslash_path);
+
+    // 2. clearWorkspaceBorrowForPath called with forward slashes (from Git CLI)
+    const forward_slash_path = "C:/Users/nova/.config/nova/worktrees/test1/";
+    try clearWorkspaceBorrowForPath(&app, forward_slash_path);
+
+    // Assert workspace was successfully cleared despite slash differences
+    try std.testing.expect(agent.workspaceBorrow() == null);
+
+    // 3. Test delete refusal with slash mismatch
+    const lane = try addFakeWorkingLane(gpa, &app, "mismatch");
+    const lane_path = lane.engine.idle.working.path; // e.g. "/fake/mismatch" or "C:\\fake\\mismatch"
+    agent.setWorkspace(lane_path);
+
+    var req = lane_bridge.Request{ .op = .delete, .lane = try gpa.dupe(u8, "mismatch"), .requester = &agent };
+    defer req.deinit(gpa);
+    const result = postAndService(io, &app, &req);
+    defer app.gpa.free(result.text);
+    try std.testing.expectEqual(@as(u8, 1), result.code);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "lane leave") != null);
+}
+
+test "cleanupLaneWorktreeAndBranch terminates background processes and removes worktree" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    var bg = background_mod.BackgroundManager.init(io, gpa);
+    defer bg.deinit();
+    app.background = &bg;
+
+    // cleanupLaneWorktreeAndBranch runs safely with background manager attached
+    cleanupLaneWorktreeAndBranch(&app, ".", "nonexistent/worktree/path", "nova/fake-branch");
+}
+
+test "WorktreeJob start and completion lifecycle" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    try std.testing.expect(!anyAsyncWorktreeActive(&app));
+
+    // Start a dummy job with an invalid/mock path (will complete quickly with error or done)
+    const job = try WorktreeJob.start(gpa, io, ".", "nonexistent_dest_dir", "nova/test-branch");
+    app.async_worktree_job = job;
+
+    // Wait for worker completion
+    while (!job.done.load(.acquire)) {
+        std.Thread.yield() catch {};
+    }
+
+    try std.testing.expect(!anyAsyncWorktreeActive(&app));
+    job.deinit();
+    app.async_worktree_job = null;
 }

@@ -46,7 +46,7 @@ pub fn drawLaneColumn(app: *App, ctx: vxfw.DrawContext, lane: *Thread, width: u1
     // the "active lane tracking" the model needs to see at a glance.
     const ws_marker: []const u8 = if (driverWorkspacePath(app)) |ws| blk: {
         if (lanes_util.workingLaneOf(lane)) |w| {
-            if (std.mem.eql(u8, ws, w.path)) break :blk " ⇄";
+            if (lanes_util.pathsEqual(ws, w.path)) break :blk " ⇄";
         }
         break :blk "";
     } else "";
