@@ -3494,8 +3494,12 @@ test "WorktreeJob start and completion lifecycle" {
 
     try std.testing.expect(!anyAsyncWorktreeActive(&app));
 
-    // Start a dummy job with an invalid/mock path (will complete quickly with error or done)
-    const job = try WorktreeJob.start(gpa, io, ".", "nonexistent_dest_dir", "nova/test-branch");
+    const dest = "test_async_wt_tmp";
+    const branch = "nova/test-async-wt-branch";
+    defer cleanupLaneWorktreeAndBranch(&app, ".", dest, branch);
+
+    // Start an async job
+    const job = try WorktreeJob.start(gpa, io, ".", dest, branch);
     app.async_worktree_job = job;
 
     // Wait for worker completion
