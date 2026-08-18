@@ -32,8 +32,6 @@ Nova is an **oldschool, terminal-native AI agent** designed for pure speed and f
 
 ## 🏎️ Philosophy & Execution Model: Autonomous by Default ("YOLO Mode")
 
-Nova embraces the classic hacker ethos: **fast, direct, and keyboard-centric**.
-
 Unlike IDE plugins that interrupt you with modal dialogues for every file read or harmless directory scan, Nova operates under an **autonomous execution model** (similar to popular "YOLO" or "dangerously skip permissions" workflows):
 
 - **No tedious click-prompts:** Reads, edits, builds, and standard commands run immediately without micro-confirmations.
