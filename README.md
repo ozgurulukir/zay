@@ -23,21 +23,6 @@
   <sub>⚡ <em>Preview snippet. <a href="assets/demo.gif">Click to watch the full demo (18 MB)</a></em></sub>
 </p>
 
-```text
-$ nova
-
-you>  Why does this PR change the cache eviction policy?
-
-agent> Let me inspect how the cache is managed.
-
-       bash: rg -n "evict|cache" src --type zig
-       → src/cache.zig:42:  fn evict(lru: *Lru, key: []const u8) void
-
-agent> The PR replaces random sampling with LRU eviction so hot keys survive
-       compaction. The change is isolated to src/cache.zig:42 and covered by
-       the test in src/cache_test.zig:11.
-```
-
 Nova is an **oldschool, terminal-native AI agent** designed for pure speed and focus. No Electron, no browser tab, no heavy Node runtime. Just a single, compiled Zig binary that interfaces directly with your shell, connects to any OpenAI-compatible provider, orchestrates parallel work across isolated git worktree lanes, and logs every turn to local SQLite.
 
 > [!IMPORTANT]
