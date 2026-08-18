@@ -155,6 +155,7 @@ For in-depth guides, architecture specifications, and configuration references:
 - 🧠 **[Engineering Patterns & Invariants](docs/PATTERNS.md):** Strict-mode tool calling, background slots, zero-copy pruning, and thread-safety invariants.
 - 🔌 **[Model Context Protocol (MCP)](docs/MCP.md):** Connecting stdio and Streamable HTTP MCP servers.
 - 🧩 **[Lua Plugin System](docs/plugins/):** Building custom tools, event hooks, and system prompt extenders.
+- 🔒 **[Security Policy](SECURITY.md):** Vulnerability disclosure procedures and safety architecture.
 - 🎯 **[Design Philosophy](docs/PHILOSOPHY.md):** Core principles guiding Nova's evolution.
 - 🛠️ **[Agent & Contributor Guidelines](AGENTS.md):** TigerStyle rules, Zig 0.16 idioms, and testing instructions.
 - 📦 **[Releasing & Distribution](docs/RELEASING.md):** Version tagging and release workflow.
@@ -165,6 +166,19 @@ For in-depth guides, architecture specifications, and configuration references:
 
 - **Linux / macOS:** Fully supported and tested daily.
 - **Windows:** Compiles natively (`zig-out/bin/nova.exe`). Core features, TUI, and SQLite persistence are active; full cross-platform runtime parity is tracked in [#26](https://github.com/ozgurulukir/nova-agent/issues/26)–[#29](https://github.com/ozgurulukir/nova-agent/issues/29).
+
+---
+
+## ⚠️ Disclaimer & Safety Guidelines
+
+> **IMPORTANT:** Nova Agent is an autonomous AI coding assistant capable of executing shell commands (`bash` / `pwsh`) and modifying files directly on your operating system.
+
+### Recommended Safety Practices:
+1. **Always Use Version Control (Git):** Run Nova inside Git-tracked repositories. This ensures all modifications can be reviewed via `git diff` and reverted via `git restore` if needed.
+2. **Avoid Elevated Privileges:** Do not run Nova as `root` (Linux/macOS) or `Administrator` (Windows) unless strictly necessary.
+3. **Isolate Risky Workflows with Parallel Lanes:** Use Nova's built-in `/parallel` (Git worktree lanes) to run experimental refactors in an isolated worktree without affecting your main working tree.
+4. **Enable Safety Classifier for Sensitive Environments:** When working in critical environments, consider connecting the standalone safety classifier (`tools/classifier/`) to inspect and intercept commands before execution.
+5. **No Warranty:** As stated in the [MIT License](LICENSE), Nova is provided "AS IS", without warranty of any kind. You are solely responsible for reviewing and verifying changes made to your machine and codebase.
 
 ---
 
