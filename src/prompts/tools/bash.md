@@ -56,11 +56,12 @@ const users = getUsers();
 console.log(users);
 EOF
 
-# Edit a file or run any Python — always through uv, always a quoted heredoc.
-uv run --project .nova python - <<'PY'
-from nova import edit
-edit("src/main.ts", "const users = getUsers();", "const users = await getUsers();")
-PY
+# Scripting / file modifications via Python or Node.js when available
+python3 -c '
+with open("src/main.ts", "r") as f: content = f.read()
+new_content = content.replace("const users = getUsers();", "const users = await getUsers();")
+with open("src/main.ts", "w") as f: f.write(new_content)
+'
 ```
 
 ## Pitfalls

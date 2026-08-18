@@ -19,7 +19,6 @@ pub const context_assembly = @import("context/assembly.zig");
 pub const db = @import("db.zig");
 pub const executor = @import("executor.zig");
 pub const os = @import("os.zig");
-pub const pytools = @import("pytools.zig");
 pub const search = @import("search.zig");
 pub const session = @import("session.zig");
 pub const skill = @import("skill.zig");

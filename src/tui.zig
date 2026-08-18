@@ -9,7 +9,6 @@ pub const background_mod = @import("background.zig");
 pub const BackgroundDelivery = app_state.BackgroundModalState.BackgroundDelivery;
 pub const Agent = agent_mod.Agent;
 pub const lane_bridge_mod = @import("tools/lane_bridge.zig");
-const pytools = @import("pytools.zig");
 const request_limiter_mod = @import("request_limiter.zig");
 const search_mod = @import("search.zig");
 const auth = @import("auth/store.zig");
@@ -331,10 +330,6 @@ pub const App = struct {
         // mcp_manager pointer is set by the caller after `app` settles in its
         // final stack frame — setting it here would dangle when `app` is
         // returned by value.
-        // Materialize the project-scoped Python helper package (`.nova/`) so the
-        // model's `uv run --project .nova` invocations find it. Best-effort —
-        // a failure only degrades the python workflow, never blocks startup.
-        pytools.ensureInstalled(gpa, io, runtime.agent.cwd) catch {};
         app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = true } };
         app.thread.id = runtime.session_writer.session.id;
         app.codex_signed_in = !runtime.codex_connection_expired and

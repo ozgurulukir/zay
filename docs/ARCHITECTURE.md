@@ -24,7 +24,7 @@ We try to normalise the request to a shape that is most compatible with the targ
 
 Nova exposes the following tools:
 
-- `bash`
+- `bash` (on Linux/macOS) / `pwsh` (on Windows)
 - `lane`
 
 `bash` has some middleware written for it that makes it friendlier for agent use. For example, large outputs from a `cat` command are written to a temp file and the agent is told the full is in that file if needed. See [Bash auto-review](#bash-auto-review) below.

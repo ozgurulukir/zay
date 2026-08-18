@@ -487,11 +487,11 @@ const TailSnapshot = struct {
     last_line_partial: bool,
 };
 
-/// Sentinel lines the `nova` Python helpers (`.nova/nova/`) wrap display
-/// content in. Anything between a begin/end pair is routed to the human
-/// display channel (`Output.display`, rendered as a diff) and stripped from
-/// the model-facing observation. `\x1e` (ASCII record separator) makes an
-/// accidental collision with real command output practically impossible.
+/// Sentinel lines that tools and scripts wrap visual diff output in. Anything
+/// between a begin/end pair is routed to the human display channel (`Output.display`,
+/// rendered as a visual diff widget in the TUI) and stripped from the model-facing
+/// observation. `\x1e` (ASCII record separator) makes an accidental collision with
+/// real command output practically impossible.
 pub const display_diff_begin = "\x1enova:diff";
 pub const display_diff_end = "\x1enova:end";
 

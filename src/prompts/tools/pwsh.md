@@ -58,8 +58,8 @@ const users = getUsers();
 console.log(users);
 '@ | Set-Content -Encoding utf8 -Path main.ts
 
-# Edit a file or run any Python — always through uv.
-uv run --project .nova python -c "from nova import edit; edit('src/main.ts', 'old', 'new')"
+# Exact string replacement in a file
+(Get-Content -Raw src\main.ts) -replace [regex]::Escape('const users = getUsers();'), 'const users = await getUsers();' | Set-Content -NoNewline -Encoding utf8 src\main.ts
 ```
 
 ## bash-to-PowerShell translation
