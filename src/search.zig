@@ -852,15 +852,23 @@ test "async search for same query is debounced" {
     try queryAsync(gpa, io, .{ .op = .find, .query = "main" }); // same query should be a no-op
 
     var polls: usize = 0;
+    var received_results: usize = 0;
+    var grace_polls_remaining: ?usize = null;
     while (polls < 50) : (polls += 1) {
         if (try pollSearchResult(gpa, io)) |result| {
             var res = result;
             defer res.deinit(gpa);
-            return;
+            received_results += 1;
+            if (grace_polls_remaining == null) grace_polls_remaining = 5;
         }
         io.sleep(std.Io.Duration.fromNanoseconds(10 * 1000 * 1000), .awake) catch {};
+        if (grace_polls_remaining) |*rem| {
+            if (rem.* == 0) break;
+            rem.* -= 1;
+        }
     }
-    return error.AsyncSearchStuck;
+    if (received_results == 0) return error.AsyncSearchStuck;
+    try std.testing.expectEqual(@as(usize, 1), received_results);
 }
 
 test "async empty query returns results" {
