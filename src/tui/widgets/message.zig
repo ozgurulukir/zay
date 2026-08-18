@@ -9,9 +9,6 @@ const tui_metrics = @import("../metrics.zig");
 const tui_style = @import("../style.zig");
 const blackhole = @import("../blackhole.zig");
 
-const tui_status = @import("../status.zig");
-const App = @import("../../tui.zig").App;
-
 const logo_text = "N.O.V.A";
 const logo_connect_text = "/connect to begin building";
 const intro_x_padding: u16 = 7;
@@ -59,7 +56,7 @@ pub const MessageWidget = struct {
     /// frame arena (`ctx.arena`) is reset every draw, so the cache that must
     /// survive between frames is allocated from here instead.
     gpa: std.mem.Allocator,
-    app: ?*const App = null,
+    has_model_configured: bool = false,
 
     pub fn widget(self: *MessageWidget) vxfw.Widget {
         return .{
@@ -320,9 +317,7 @@ pub const MessageWidget = struct {
             line_start = line_end + 1;
         }
 
-        if (self.app) |app| {
-            if (tui_status.modelStatus(app.liveRuntime(), app.cached_config) != null) return;
-        }
+        if (self.has_model_configured) return;
         writeLogoLine(surface, logo_connect_text, row + 1, col_start, ctx);
     }
 
@@ -1178,4 +1173,62 @@ fn expectNordBody() tui_style.Palette {
 }
 fn expectDraculaIntro() tui_style.Palette {
     return tui_style.buildPalette(tui_style.dracula);
+}
+
+test "drawLogo renders connect hint when has_model_configured is false" {
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.append(gpa, .logo, "logo", "");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var message_widget: MessageWidget = .{
+        .message = &transcript.messages.items[index],
+        .selected = false,
+        .loading_frame = 0,
+        .blackhole_frame = 0,
+        .gpa = gpa,
+        .has_model_configured = false,
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 120, .height = 40 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try message_widget.widget().draw(ctx);
+
+    const logo_col = ConversationLayout.left + intro_x_padding + blackhole.cols + logo_gap;
+    const connect_cell = surface.readCell(logo_col, ConversationLayout.top + logo_row_offset + 2);
+    try std.testing.expectEqualStrings("/", connect_cell.char.grapheme);
+}
+
+test "drawLogo omits connect hint when has_model_configured is true" {
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.append(gpa, .logo, "logo", "");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var message_widget: MessageWidget = .{
+        .message = &transcript.messages.items[index],
+        .selected = false,
+        .loading_frame = 0,
+        .blackhole_frame = 0,
+        .gpa = gpa,
+        .has_model_configured = true,
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 120, .height = 40 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try message_widget.widget().draw(ctx);
+
+    const logo_col = ConversationLayout.left + intro_x_padding + blackhole.cols + logo_gap;
+    const connect_cell = surface.readCell(logo_col, ConversationLayout.top + logo_row_offset + 2);
+    try std.testing.expectEqualStrings(" ", connect_cell.char.grapheme);
 }

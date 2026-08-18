@@ -300,6 +300,8 @@ test {
     _ = @import("tui/bounded_list.zig");
     _ = @import("tui/style.zig");
     _ = @import("tui/widgets/status_bar.zig");
+    _ = @import("tui/widgets/message.zig");
+    _ = @import("tui/widgets/transcript.zig");
     // The telemetry engine (token velocity EMA + context meter) is a new
     // module; reference it here so its inline tests compile into the run
     // (AGENTS.md test-runner quirk: a file only referenced lazily is never
@@ -317,4 +319,9 @@ test {
     // the agent at call sites — reference it explicitly so its exhaustive
     // unit tests run (silent-drop guard per AGENTS.md §Test runner quirks).
     _ = @import("ai/text_tool_call.zig");
+    _ = @import("ai/responses_request.zig");
+    _ = @import("ai/responses_events.zig");
+    _ = @import("ai/stream_part.zig");
+    _ = @import("tools/executor_safety.zig");
+    _ = @import("tools/executor_validation.zig");
 }

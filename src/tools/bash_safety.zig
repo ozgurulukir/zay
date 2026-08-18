@@ -206,9 +206,9 @@ fn isDangerousRm(command: []const u8) bool {
             const after = pos + 2;
             if (after >= rest.len) break :blk true; // trailing ` /`
             const c = rest[after];
-            if (c == ' ' or c == '\t') break :blk true; // ` / ` (next arg)
+            if (c == ' ' or c == '\t' or c == ';' or c == '&' or c == '|' or c == '\r' or c == '\n') break :blk true; // ` / ` or ` /; ` (next arg / command)
             if (c == '*') {
-                if (after + 1 >= rest.len or rest[after + 1] == ' ' or rest[after + 1] == '\t') break :blk true; // ` /*` or `/* `
+                if (after + 1 >= rest.len or rest[after + 1] == ' ' or rest[after + 1] == '\t' or rest[after + 1] == ';' or rest[after + 1] == '&' or rest[after + 1] == '|') break :blk true; // ` /*` or `/* `
             }
             idx = after;
         }

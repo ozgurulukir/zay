@@ -2,6 +2,25 @@
 
 Hard-won implementation knowledge for developing Nova, extracted from AGENTS.md so the system-prompt rules stay lean. This file is NOT ingested into the system prompt — read the relevant section on demand when working on a subsystem (TUI, MCP, Lua plugins, AI tool schema, type system, models.dev, config layering, reasoning, compaction, session resume).
 
+## Architectural Layering & Invariants
+
+### Subsystem Layering & Leaf Module Rules (`INV-LEAF-1`)
+
+The codebase enforces strict hierarchical module layering:
+
+1. **`lib/` (Leaf Utility Layer):**
+   - Contains pure leaf modules (`bounded_queue.zig`, `counting_allocator.zig`, `logger.zig`, `platform.zig`, `terminal_markdown.zig`, `websocket.zig`).
+   - **`INV-LEAF-1` Invariant:** Modules in `lib/` must **NEVER** import anything from `src/` (0 reverse dependencies).
+   - Must be independently compilable and testable as standalone packages.
+2. **`src/tools/` & `src/ai/` (Adapters & Execution Primitives):**
+   - Protocol clients (`responses_core.zig`, `openai_compatible.zig`), SSE parsers (`stream_part.zig`, `responses_events.zig`), wire serializers (`responses_request.zig`), and tool safety/validation (`executor_safety.zig`, `executor_validation.zig`).
+   - Zero presentation/TUI dependencies.
+3. **`src/agent/` (Cognitive & Lifecycle Orchestration):**
+   - Turn execution loops, conversation tree management, context compaction, and subagent session coordination.
+4. **`src/tui/` (Presentation & View Layer):**
+   - User interface, terminal rendering via libvaxis/vxfw, and keyboard/mouse event dispatch.
+   - **`INV-WIDGET-1` Invariant:** Leaf widgets under `src/tui/widgets/` must never hold pointers to `App`; they receive pure view models or scalar state (`has_model_configured: bool`).
+
 ## Patterns
 
 TUI built with libvaxis vxfw (source in zig-pkg). Prefer framework primitives.

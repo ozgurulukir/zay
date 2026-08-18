@@ -12,6 +12,7 @@ const vxfw = vaxis.vxfw;
 const tui = @import("../../tui.zig");
 const tui_message = @import("message.zig");
 const tui_metrics = @import("../metrics.zig");
+const tui_status = @import("../status.zig");
 
 const App = tui.App;
 const Thread = tui.Thread;
@@ -35,6 +36,8 @@ pub const TranscriptWidget = struct {
         const self: *TranscriptWidget = @ptrCast(@alignCast(ptr));
         self.syncViewport(ctx);
 
+        const has_model = tui_status.modelStatus(self.app.liveRuntime(), self.app.cached_config) != null;
+
         var builder: MessageListBuilder = .{
             .arena = ctx.arena,
             .messages = self.thread.transcript.messages.items,
@@ -42,7 +45,7 @@ pub const TranscriptWidget = struct {
             .loading_frame = self.app.metrics.loading_frame,
             .blackhole_frame = self.app.metrics.blackhole_frame,
             .gpa = self.app.gpa,
-            .app = self.app,
+            .has_model_configured = has_model,
         };
         self.thread.transcript_list.children = .{ .builder = .{ .userdata = &builder, .buildFn = MessageListBuilder.build } };
         self.thread.transcript_list.item_count = @intCast(self.thread.transcript.messages.items.len);
@@ -108,16 +111,16 @@ pub const TranscriptWidget = struct {
     }
 };
 
-const MessageListBuilder = struct {
+pub const MessageListBuilder = struct {
     arena: std.mem.Allocator,
     messages: []tui.transcript_mod.Message,
-    selected: ?u32,
-    loading_frame: u8,
-    blackhole_frame: u16,
+    selected: ?u32 = null,
+    loading_frame: u8 = 0,
+    blackhole_frame: u16 = 0,
     gpa: std.mem.Allocator,
-    app: ?*const tui.App = null,
+    has_model_configured: bool = false,
 
-    fn build(ptr: *const anyopaque, idx: usize, cursor: usize) ?vxfw.Widget {
+    pub fn build(ptr: *const anyopaque, idx: usize, cursor: usize) ?vxfw.Widget {
         _ = cursor;
         const self: *const MessageListBuilder = @ptrCast(@alignCast(ptr));
         if (idx >= self.messages.len) return null;
@@ -128,8 +131,114 @@ const MessageListBuilder = struct {
             .loading_frame = self.loading_frame,
             .blackhole_frame = self.blackhole_frame,
             .gpa = self.gpa,
-            .app = self.app,
+            .has_model_configured = self.has_model_configured,
         };
         return body.widget();
     }
 };
+
+test "MessageListBuilder.build returns null for out-of-bounds index" {
+    const gpa = std.testing.allocator;
+    var transcript: tui.transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    _ = try transcript.append(gpa, .user, "user", "hello");
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const builder: MessageListBuilder = .{
+        .arena = arena.allocator(),
+        .messages = transcript.messages.items,
+        .selected = null,
+        .gpa = gpa,
+        .has_model_configured = true,
+    };
+
+    try std.testing.expect(MessageListBuilder.build(&builder, 0, 0) != null);
+    try std.testing.expect(MessageListBuilder.build(&builder, 1, 0) == null);
+    try std.testing.expect(MessageListBuilder.build(&builder, 999, 0) == null);
+}
+
+test "MessageListBuilder.build constructs widget with correct message and selection state" {
+    const gpa = std.testing.allocator;
+    var transcript: tui.transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    _ = try transcript.append(gpa, .user, "user", "first");
+    _ = try transcript.append(gpa, .agent, "agent", "second");
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const builder: MessageListBuilder = .{
+        .arena = arena.allocator(),
+        .messages = transcript.messages.items,
+        .selected = 1,
+        .loading_frame = 3,
+        .blackhole_frame = 7,
+        .gpa = gpa,
+        .has_model_configured = true,
+    };
+
+    const widget0 = MessageListBuilder.build(&builder, 0, 0);
+    try std.testing.expect(widget0 != null);
+    const msg0: *const MessageWidget = @ptrCast(@alignCast(widget0.?.userdata));
+    try std.testing.expectEqual(false, msg0.selected);
+    try std.testing.expectEqual(true, msg0.has_model_configured);
+    try std.testing.expectEqual(@as(u8, 3), msg0.loading_frame);
+    try std.testing.expectEqual(@as(u16, 7), msg0.blackhole_frame);
+
+    const widget1 = MessageListBuilder.build(&builder, 1, 0);
+    try std.testing.expect(widget1 != null);
+    const msg1: *const MessageWidget = @ptrCast(@alignCast(widget1.?.userdata));
+    try std.testing.expectEqual(true, msg1.selected);
+    try std.testing.expectEqualStrings("second", msg1.message.bodyPtr().*);
+}
+
+test "MessageListBuilder.build handles empty transcript cleanly" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const builder: MessageListBuilder = .{
+        .arena = arena.allocator(),
+        .messages = &.{},
+        .selected = null,
+        .gpa = gpa,
+        .has_model_configured = true,
+    };
+
+    try std.testing.expect(MessageListBuilder.build(&builder, 0, 0) == null);
+    try std.testing.expect(MessageListBuilder.build(&builder, 1, 0) == null);
+}
+
+test "MessageListBuilder.build handles out-of-range selection index" {
+    const gpa = std.testing.allocator;
+    var transcript: tui.transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    _ = try transcript.append(gpa, .user, "user", "msg1");
+    _ = try transcript.append(gpa, .agent, "agent", "msg2");
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const builder: MessageListBuilder = .{
+        .arena = arena.allocator(),
+        .messages = transcript.messages.items,
+        .selected = 100, // Deliberately out of bounds
+        .gpa = gpa,
+        .has_model_configured = true,
+    };
+
+    const w0 = MessageListBuilder.build(&builder, 0, 0);
+    try std.testing.expect(w0 != null);
+    const m0: *const MessageWidget = @ptrCast(@alignCast(w0.?.userdata));
+    try std.testing.expectEqual(false, m0.selected);
+
+    const w1 = MessageListBuilder.build(&builder, 1, 0);
+    try std.testing.expect(w1 != null);
+    const m1: *const MessageWidget = @ptrCast(@alignCast(w1.?.userdata));
+    try std.testing.expectEqual(false, m1.selected);
+}

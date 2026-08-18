@@ -17,6 +17,8 @@ const schema_mod = @import("tools/schema.zig");
 const shell_safety = @import("tools/bash_safety.zig");
 const tools = @import("tools.zig");
 const tool_display = @import("tools/display.zig");
+const executor_safety = @import("tools/executor_safety.zig");
+const executor_validation = @import("tools/executor_validation.zig");
 
 const assert = std.debug.assert;
 
@@ -265,16 +267,7 @@ pub const ExecutorService = struct {
     }
 
     fn shouldRejectUnsafeShell(self: *ExecutorService, call: ai.ToolCall, observer: anytype) !bool {
-        if (!std.mem.eql(u8, call.name, tools.shell_tool.name)) return false;
-        const command = shell_safety.commandFromArguments(self.gpa, call.arguments) catch return false;
-        defer self.gpa.free(command);
-        // The optional URL is threaded straight through: with a classifier set it
-        // does the remote+local-fallback dance; with none the local destructive-
-        // command matcher runs directly, so `rm -rf /` is always caught.
-        const verdict = shell_safety.classify(self.gpa, self.io, self.bash_classifier_url, self.cwd, command);
-        if (verdict != .unsafe) return false;
-        const approved = try observer.approve_unsafe_bash(observer.ctx, call, command);
-        return !approved;
+        return executor_safety.shouldRejectUnsafeShell(self.gpa, self.io, self.bash_classifier_url, self.cwd, call, observer);
     }
 
     /// Run one ToolCall. Tool arguments are validated against the tool's
@@ -285,32 +278,18 @@ pub const ExecutorService = struct {
     /// already fail in `produceOutput`.
     fn runOne(self: *ExecutorService, call: ai.ToolCall) !ToolResult {
         if (self.resolveSchema(call)) |schema| {
-            // Some models emit numbers as strings despite the schema (e.g.
-            // `offset:"130"`). Coerce those to real JSON numbers so the call
-            // passes validation AND dispatch reaches the tool with proper
-            // numeric args — otherwise a weak model loops retrying the same
-            // quoted value. `coerceNumericStrings` returns null when nothing
-            // changed (or the args aren't a parseable object), so validation
-            // still reports genuine type errors clearly.
-            const coerced = schema_mod.coerceNumericStrings(self.gpa, schema, call.arguments) catch return error.OutOfMemory;
-            defer if (coerced) |c| self.gpa.free(c);
+            var validation_info = try executor_validation.validateAndCoerceCallArgs(self.gpa, schema, call);
+            defer validation_info.deinit(self.gpa);
 
-            // `validateArgs` turns every non-allocation failure (parse errors,
-            // type mismatches, missing fields) into a violation internally, so
-            // the only error that propagates is OutOfMemory — propagate it; the
-            // tool does not run unvalidated under memory pressure.
-            const args = coerced orelse call.arguments;
-            var validation = schema_mod.validateArgs(self.gpa, schema, args) catch return error.OutOfMemory;
-            defer validation.deinit(self.gpa);
-            if (!validation.isValid()) {
-                return self.runValidationError(call, &validation);
+            if (!validation_info.validation.isValid()) {
+                return self.runValidationError(call, &validation_info.validation);
             }
             // Dispatch the (possibly coerced) args so the tool receives real
             // numbers, not quoted strings. A shallow copy swaps only the
             // arguments slice; the rest of `call` is untouched and the coerced
             // buffer stays alive for the duration of dispatch.
             var effective = call;
-            effective.arguments = args;
+            effective.arguments = validation_info.args;
             return self.dispatchCall(effective);
         }
         return self.dispatchCall(call);
@@ -319,36 +298,7 @@ pub const ExecutorService = struct {
     /// Resolve the `tools.Schema` for a call across all three channels.
     /// Returns null when the tool is unknown — validation is then skipped.
     fn resolveSchema(self: *ExecutorService, call: ai.ToolCall) ?tools.Schema {
-        // MCP: `mcp__<server>__<tool>` → the connected client's tool schema.
-        // Same parse as `runMcpTool`, then match the tool's `full_name`.
-        if (std.mem.startsWith(u8, call.name, "mcp__")) {
-            const manager = self.mcp_manager orelse return null;
-            const rest = call.name["mcp__".len..];
-            const sep = std.mem.indexOfScalar(u8, rest, '_') orelse return null;
-            const after_server = rest[sep + 1 ..];
-            if (after_server.len == 0 or after_server[0] != '_') return null;
-            const server_name = rest[0..sep];
-            for (manager.clients.items) |*client| {
-                if (client.status() != .connected) continue;
-                if (!std.mem.eql(u8, client.name, server_name)) continue;
-                for (client.tools.items) |*tool| {
-                    if (std.mem.eql(u8, tool.full_name, call.name)) return tool.schema;
-                }
-            }
-            return null;
-        }
-        // Builtin + plugin: one registry lookup.
-        if (self.tool_registry) |registry| {
-            const slice = registry.all(self.gpa) catch return null;
-            for (slice) |tool| {
-                if (std.mem.eql(u8, tool.name, call.name)) return tool.schema;
-            }
-            return null;
-        }
-        for (tools.builtinRegistry()) |tool| {
-            if (std.mem.eql(u8, tool.name, call.name)) return tool.schema;
-        }
-        return null;
+        return executor_validation.resolveSchema(self.tool_registry, self.mcp_manager, self.gpa, call);
     }
 
     /// Dispatch a call that passed validation. MCP calls route through the

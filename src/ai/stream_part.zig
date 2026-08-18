@@ -104,3 +104,69 @@ test "classify distinguishes data, done, and skip lines" {
         else => try std.testing.expect(false),
     }
 }
+
+test "Source.next extracts data lines skipping comments, IDs, and empty lines" {
+    const gpa = std.testing.allocator;
+    const sse_input =
+        \\: ping keepalive
+        \\event: message
+        \\id: 101
+        \\data: {"chunk": 1}
+        \\
+        \\: another comment
+        \\data: {"chunk": 2}
+        \\data: [DONE]
+        \\data: {"ignored": 3}
+    ;
+
+    var reader = std.Io.Reader.fixed(sse_input);
+    var source: Source = .{ .reader = &reader };
+
+    const first = try source.next(gpa);
+    defer if (first) |f| gpa.free(f);
+    try std.testing.expect(first != null);
+    try std.testing.expectEqualStrings("{\"chunk\": 1}", first.?);
+
+    const second = try source.next(gpa);
+    defer if (second) |s| gpa.free(s);
+    try std.testing.expect(second != null);
+    try std.testing.expectEqualStrings("{\"chunk\": 2}", second.?);
+
+    // [DONE] encountered -> yields null
+    const done = try source.next(gpa);
+    try std.testing.expect(done == null);
+}
+
+test "Source.next handles final line at EOF without trailing newline" {
+    const gpa = std.testing.allocator;
+    const sse_input = "data: {\"final\": true}";
+
+    var reader = std.Io.Reader.fixed(sse_input);
+    var source: Source = .{ .reader = &reader };
+
+    const payload = try source.next(gpa);
+    defer if (payload) |p| gpa.free(p);
+    try std.testing.expect(payload != null);
+    try std.testing.expectEqualStrings("{\"final\": true}", payload.?);
+
+    const at_end = try source.next(gpa);
+    try std.testing.expect(at_end == null);
+}
+
+test "Source.next enforces bytes_max limit with StreamTooLarge error" {
+    const gpa = std.testing.allocator;
+    var reader = std.Io.Reader.fixed("data: hello\n");
+    var source: Source = .{ .reader = &reader, .bytes_read = bytes_max + 1 };
+
+    const result = source.next(gpa);
+    try std.testing.expectError(error.StreamTooLarge, result);
+}
+
+test "Source.next enforces chunk_count_max with StreamTooManyChunks error" {
+    const gpa = std.testing.allocator;
+    var reader = std.Io.Reader.fixed("data: hello\n");
+    var source: Source = .{ .reader = &reader, .chunk_count = chunk_count_max + 1 };
+
+    const result = source.next(gpa);
+    try std.testing.expectError(error.StreamTooManyChunks, result);
+}

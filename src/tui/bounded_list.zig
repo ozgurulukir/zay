@@ -124,3 +124,69 @@ test "BoundedList basic operations" {
     try std.testing.expectEqual(@as(u32, 50), last);
     try std.testing.expectEqual(@as(usize, 3), list.len());
 }
+
+test "BoundedList zero capacity boundary" {
+    var list = BoundedList(u32, 0){};
+    try std.testing.expectEqual(@as(usize, 0), list.len());
+    try std.testing.expect(list.isFull());
+    try std.testing.expectError(error.OutOfMemory, list.append(10));
+}
+
+test "BoundedList single capacity fill and pop" {
+    var list = BoundedList(u32, 1){};
+    try std.testing.expect(!list.isFull());
+    try list.append(42);
+    try std.testing.expect(list.isFull());
+    try std.testing.expectError(error.OutOfMemory, list.append(99));
+    try std.testing.expectEqual(@as(u32, 42), list.pop());
+    try std.testing.expectEqual(@as(usize, 0), list.len());
+    try std.testing.expect(!list.isFull());
+}
+
+test "BoundedList orderedRemove shift ordering across boundaries" {
+    var list = BoundedList(u32, 5){};
+    try list.append(10);
+    try list.append(20);
+    try list.append(30);
+    try list.append(40);
+
+    // Remove head (index 0)
+    const head = list.orderedRemove(0);
+    try std.testing.expectEqual(@as(u32, 10), head);
+    try std.testing.expectEqualSlices(u32, &.{ 20, 30, 40 }, list.slice());
+
+    // Remove tail (index 2)
+    const tail = list.orderedRemove(2);
+    try std.testing.expectEqual(@as(u32, 40), tail);
+    try std.testing.expectEqualSlices(u32, &.{ 20, 30 }, list.slice());
+}
+
+test "BoundedList clearRetainingCapacity resets count for reuse" {
+    var list = BoundedList(u32, 3){};
+    try list.append(1);
+    try list.append(2);
+    try list.append(3);
+    try std.testing.expect(list.isFull());
+
+    list.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 0), list.len());
+    try std.testing.expect(!list.isFull());
+
+    try list.append(100);
+    try list.append(200);
+    try std.testing.expectEqualSlices(u32, &.{ 100, 200 }, list.slice());
+}
+
+test "BoundedList sliceMut and ptrAt in-place modification" {
+    var list = BoundedList(u32, 3){};
+    try list.append(1);
+    try list.append(2);
+    try list.append(3);
+
+    list.ptrAt(1).* = 99;
+    try std.testing.expectEqual(@as(u32, 99), list.at(1));
+
+    const mut_slice = list.sliceMut();
+    mut_slice[0] = 77;
+    try std.testing.expectEqualSlices(u32, &.{ 77, 99, 3 }, list.slice());
+}
