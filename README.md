@@ -79,7 +79,21 @@ Unlike IDE plugins that interrupt you with modal dialogues for every file read o
 
 ## 🚀 Quick Start
 
-### 1. Build and Run from Source
+### 1. One-Line Install (Recommended)
+
+**Linux / macOS:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/ozgurulukir/nova-agent/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/ozgurulukir/nova-agent/main/install.ps1 | iex
+```
+
+---
+
+### 2. Build and Run from Source (Zig 0.16)
 
 ```bash
 git clone https://github.com/ozgurulukir/nova-agent.git
@@ -87,11 +101,8 @@ cd nova-agent
 
 # Build and run directly
 zig build run
-```
 
-### 2. Install to PATH
-
-```bash
+# Or install to PATH
 zig build install -Doptimize=ReleaseFast --prefix $HOME/.local
 nova --version
 ```

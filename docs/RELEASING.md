@@ -54,6 +54,15 @@ sha256sum -c nova-linux-x86_64.sha256
 ./nova-linux-x86_64 --version   # prints the tag
 ```
 
+## One-Line Installers
+
+Users can install the latest release directly via the root installer scripts:
+
+- **Linux / macOS:** `curl -fsSL https://raw.githubusercontent.com/ozgurulukir/nova-agent/main/install.sh | bash`
+- **Windows (PowerShell):** `irm https://raw.githubusercontent.com/ozgurulukir/nova-agent/main/install.ps1 | iex`
+
+The scripts automatically download the platform binary, verify the SHA256 checksum, place it in the user's PATH, and make it executable.
+
 ## Notes
 
 - The workflow downloads Zig 0.16.0 directly from
