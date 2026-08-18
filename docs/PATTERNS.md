@@ -273,7 +273,7 @@ Guard POSIX-only syscalls behind `if (!os.is_windows)` at their call sites: `std
 
 **`zeroedChild()` helper (`src/mcp/client.zig`):** `std.mem.zeroes(std.process.Child)` is a compile error on Windows because `Child.thread_handle` is a non-nullable `HANDLE`. Use the `zeroedChild()` helper to construct a zeroed `Child` portably instead of calling `std.mem.zeroes` directly.
 
-Note: this covers **compilation** only. Full runtime support on Windows is still in progress — see the follow-up issues (#26 config paths, #27 bash shell, #28 failing tests, #29 ModernBERT worker / lanes).
+Note: this covers **compilation** only. Full runtime support on Windows is still in progress — see the follow-up issues (#26 config paths, #27 bash shell, #28 failing tests, #29 lanes).
 
 ### Worktree Hardening & Lifecycle Architecture
 

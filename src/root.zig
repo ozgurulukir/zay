@@ -9,7 +9,6 @@ pub const at_mention = @import("at_mention.zig");
 pub const auth = @import("auth/store.zig");
 pub const background = @import("background.zig");
 pub const bash = @import("tools/bash_exec.zig");
-pub const local_models = @import("models/local.zig");
 pub const bash_safety = @import("tools/bash_safety.zig");
 pub const clipboard = @import("clipboard.zig");
 pub const codex = @import("auth/codex.zig");
@@ -87,26 +86,6 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     defer gpa.free(home_dir);
 
     var load_result = try config.load(gpa, init.io, cwd, home_dir, init.environ_map);
-    var local_models_handle: ?local_models.Server = null;
-    {
-        const classifier_set = if (load_result.config.model_selection) |*ms|
-            (ms.bashClassifierUrl() != null)
-        else
-            true;
-        if (!classifier_set) {
-            local_models_handle = try local_models.ensure(gpa, init.io, cwd);
-            errdefer if (local_models_handle) |*server| server.deinit(gpa, init.io);
-            if (local_models_handle) |server| {
-                if (load_result.config.model_selection) |*ms| {
-                    switch (ms.*) {
-                        .builtin => |*b| b.bash_classifier_url = try gpa.dupe(u8, server.url),
-                        .custom => |*c| c.bash_classifier_url = try gpa.dupe(u8, server.url),
-                    }
-                }
-            }
-        }
-    }
-    defer if (local_models_handle) |*server| server.deinit(gpa, init.io);
 
     // The TUI is long-running and streams unbounded content. `SmpAllocator`
     // (Zig 0.16) has a known multi-threaded free-list corruption bug that

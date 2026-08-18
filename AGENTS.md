@@ -2,13 +2,10 @@
 
 This project uses Zig 0.16. Consult the tigerstyle skill before writing code.
 
-## Setup
-
-- The ModernBERT ONNX model (`vendor/local-models/ModernBERT-bash-classifier`) is vendored after cloning and gitignored.
 - `vendor/fzy/` is a vendored copy of the fzy fuzzy matcher (MIT) — it ships with the repo under `vendor/fzy/` and is compiled directly into the binary via `build.zig`; no separate build step is required.
-- Set `OMP_WAIT_POLICY=passive` at runtime to avoid MKL/CPU spin in the embedding worker.
+- Standalone command safety classifier lives in `tools/classifier/` (FastAPI / ModernBERT / MiniLM) and communicates with Nova via HTTP REST (`POST /classify`).
 - `zig build install -Doptimize=ReleaseFast --prefix $HOME/.local` installs to `~/.local/bin/`.
-- The app **compiles** on Windows (`zig build` → `zig-out/bin/nova.exe`); full runtime support is still in progress and tracked in issues #26–#29 (config paths, bash shell, failing tests, ModernBERT worker / lanes). Linux behavior is unchanged.
+- The app **compiles** on Windows (`zig build` → `zig-out/bin/nova.exe`); full runtime support is still in progress and tracked in issues #26–#29 (config paths, bash shell, failing tests, lanes). Linux behavior is unchanged.
 
 ## Patterns & Engineering Notes
 

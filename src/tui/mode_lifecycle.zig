@@ -341,12 +341,12 @@ pub fn submitMode(app: *App) !bool {
                 },
                 .status => {
                     app.mode = .normal;
-                    var status_buf: [512]u8 = undefined;
+                    var status_buf: [1024]u8 = undefined;
                     const ms = tui_status.modelStatus(app.liveRuntime(), app.cached_config);
                     const provider_name = if (ms) |m| m.provider else "none";
                     const model_name = if (ms) |m| m.model else "none";
                     const classifier_status: []const u8 = if (app.liveRuntime()) |rt|
-                        (if (rt.agent.bash_classifier_url != null) "ModernBERT ONNX (Active)" else "Pattern Matcher (Fallback)")
+                        (if (rt.agent.bash_classifier_url != null) "External Endpoint (Active)" else "Built-in Pattern Matcher (Active)")
                     else
                         "none";
                     const git_branch = app.metrics.git_label;

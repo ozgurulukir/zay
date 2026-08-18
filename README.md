@@ -98,26 +98,22 @@ nova --version
 
 ---
 
-## 🛡️ Setting Up the ModernBERT Safety Classifier (Optional)
+## 🛡️ Command Safety & External Classifier (Optional)
 
-Nova includes a fine-tuned **ModernBERT ONNX model** trained on over 3,000 shell commands to detect unsafe operations with sub-millisecond inference latency.
+Nova provides multi-tier safety guards for shell command execution (`bash` on Linux/macOS, `pwsh` on Windows):
 
-> [!NOTE]
-> The ONNX classifier is **optional**. If omitted, Nova automatically and seamlessly falls back to its built-in local pattern-matching safety engine.
-
-**Prerequisites:** [uv](https://github.com/astral-sh/uv) (Python package manager) and `huggingface-cli`
+1. **Built-in Deterministic Safety Matcher (Default):** Zero-dependency AST and pattern analysis built directly into the native Zig binary. Intercepts destructive commands (`rm -rf /`, drive root wipes, fork bombs, critical system redirects) with zero latency.
+2. **AI-Powered Safety Classifier (Optional):** Plug in a standalone REST safety service powered by fine-tuned Transformer models (ModernBERT, MiniLM) or an LLM safety proxy:
 
 ```bash
-# 1. Download model weights
-hf download P0u4a/ModernBERT-bash-classifier --local-dir vendor/local-models/ModernBERT-bash-classifier
+# Run standalone safety classifier via uv (port 8765):
+uv run tools/classifier/server.py --model modernbert --port 8765
 
-# 2. Export ONNX graph
-uv run --project vendor/local-models python vendor/local-models/export_onnx.py \
-  --model-dir vendor/local-models/ModernBERT-bash-classifier \
-  --output vendor/local-models/ModernBERT-bash-classifier/model.onnx
+# Configure in Nova (via env or ~/.config/nova/config.json):
+export NOVA_BASH_CLASSIFIER_URL="http://127.0.0.1:8765/classify"
 ```
 
-When present, Nova automatically launches the local inference worker on startup (configured with `OMP_WAIT_POLICY=PASSIVE` to prevent CPU spin).
+👉 **[Read the Full Command Safety & Classifier Guide](docs/wiki/SAFETY_CLASSIFIER.md)** for Docker deployment, custom model presets, and REST API specifications.
 
 ---
 
@@ -142,7 +138,8 @@ When present, Nova automatically launches the local inference worker on startup 
 
 For in-depth guides, architecture specifications, and configuration references:
 
-- 🏛️ **[System Architecture](docs/ARCHITECTURE.md):** TUI event pipeline, LLM client layers, ModernBERT classifier, and memory models.
+- 🏛️ **[System Architecture](docs/ARCHITECTURE.md):** TUI event pipeline, LLM client layers, safety architecture, and memory models.
+- 🛡️ **[Safety & Classifier Guide](docs/wiki/SAFETY_CLASSIFIER.md):** Defense-in-depth safety, external classifier REST setup, and model presets.
 - ⚙️ **[Configuration Reference](docs/CONFIG.md):** Providers, API keys, context compaction, reasoning effort, and custom theme schemas.
 - 🧠 **[Engineering Patterns & Invariants](docs/PATTERNS.md):** Strict-mode tool calling, background slots, zero-copy pruning, and thread-safety invariants.
 - 🔌 **[Model Context Protocol (MCP)](docs/MCP.md):** Connecting stdio and Streamable HTTP MCP servers.

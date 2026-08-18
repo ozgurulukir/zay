@@ -39,7 +39,7 @@
     "bashClassifierUrl": {
       "type": "string",
       "format": "uri",
-      "description": "URL of the local bash command safety classifier endpoint. Legacy key 'bash_classifier_url' is parsed for backward compatibility but is not schema-valid; new configs must use 'bashClassifierUrl'."
+      "description": "URL of the external command safety classifier endpoint (e.g. 'http://127.0.0.1:8765/classify'). When omitted or null, Nova uses its built-in safety rules. Legacy key 'bash_classifier_url' is parsed for backward compatibility but is not schema-valid; new configs must use 'bashClassifierUrl'."
     },
     "providers": {
       "type": "object",

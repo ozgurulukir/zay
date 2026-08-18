@@ -67,21 +67,23 @@ Subagent workflows are achieved by the `/parallel` command which creates a separ
 
 A lane starts on a random `nova/<hex>` branch. On its first prompt, the session's own model is asked (in parallel with the turn) for a descriptive branch name based on that prompt and the last few messages of the parent lane. When the answer lands, the branch is renamed in place (`nova/<name>`) and becomes the lane's label. If the request fails or the name is unusable, the hex branch simply stays.
 
-## Bash auto-review
+## Shell Safety & Auto-Review
 
-We have fine-tuned a ModernBERT base model on a corpus of over 3000 bash commands and classified each command as either safe or unsafe. We run this model on every bash tool call the agent makes, and if it's marked unsafe, we show a permission prompt to either approve or reject the call. Thanks to the efficient architecture of ModernBERT (i.e. Alternating Attention) and its small size the performance overhead of making these inference calls is negligible.
+Nova employs a two-tier defense-in-depth safety architecture to evaluate shell tool invocations (`bash` on Linux/macOS, `pwsh` on Windows) before execution:
 
-### Local safety fallback
+1. **Tier 1: Built-in Deterministic Safety Matcher (Always Active):**
+   A zero-dependency pattern and AST analyzer in `src/tools/bash_safety.zig` intercepts destructive operations with microsecond latency:
+   - `rm -rf /`, `rm -rf /*`, `rm -rf --no-preserve-root /`
+   - Fork bombs (`:(){ :|:& };:` and PowerShell unbounded job loops)
+   - Destructive `dd` to block devices (`of=/dev/sda`, `of=/boot/`, etc.)
+   - `mkfs` targeting `/dev/`
+   - PowerShell drive root wipes (`Remove-Item -Recurse -Force C:\`, `Clear-RecycleBin -Force`)
+   - Redirects into critical system paths (`/etc/`, `/boot/`, `C:\Windows\`, etc.)
 
-When the remote classifier is unavailable (network error, service down), a local pattern matcher in `src/tools/bash_safety.zig` provides defense-in-depth. It flags obviously destructive commands:
+2. **Tier 2: External AI Safety Classifier (Optional & Pluggable):**
+   Nova can query a standalone REST safety service (`POST /classify`) powered by a fine-tuned Transformer model (ModernBERT, MiniLM) or an LLM safety proxy located in `tools/classifier/`. When marked unsafe, an interactive approval prompt is presented to the user.
 
-- `rm -rf /`, `rm -rf /*`, `rm -rf --no-preserve-root /`
-- Fork bombs (`:(){ :|:& };:`)
-- Destructive `dd` to block devices (`of=/dev/sda`, `of=/boot/`, etc.)
-- `mkfs` targeting `/dev/`
-- Redirects into critical system paths (`/etc/`, `/boot/`, `/sys/`, `/proc/`, `/dev/sd*`)
-
-The local matcher is intentionally conservative — it only catches clearly destructive patterns. The remote model is the primary classifier.
+For setup details, see [Wiki: Command Safety & Classifier Guide](wiki/SAFETY_CLASSIFIER.md).
 
 ### Working directory validation
 
