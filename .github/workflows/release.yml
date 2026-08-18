@@ -18,12 +18,14 @@ jobs:
           - os: ubuntu-latest
             artifact: nova-linux-x86_64
             bin: nova
+            target: x86_64-linux-musl
             zig_url: https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
             zig_ext: .tar.xz
             zig_dir: zig-x86_64-linux-0.16.0
           - os: windows-latest
             artifact: nova-windows-x86_64.exe
             bin: nova.exe
+            target: x86_64-windows
             zig_url: https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip
             zig_ext: .zip
             zig_dir: zig-x86_64-windows-0.16.0
@@ -55,7 +57,7 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ github.ref_name }}
-        run: zig build install -Doptimize=ReleaseFast -Dversion="$VERSION" --prefix dist
+        run: zig build install -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dversion="$VERSION" --prefix dist
 
       - name: Rename binary
         shell: bash
