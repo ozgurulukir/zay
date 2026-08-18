@@ -25,8 +25,8 @@
 
 Nova is an **oldschool, terminal-native AI agent** designed for pure speed and focus. No Electron, no browser tab, no heavy Node runtime. Just a single, compiled Zig binary that interfaces directly with your shell, connects to any OpenAI-compatible provider, orchestrates parallel work across isolated git worktree lanes, and logs every turn to local SQLite.
 
-> [!IMPORTANT]
-> **Beta software:** The core architecture is stable and daily-driven, but APIs, keybindings, and config schemas are evolving toward 1.0.
+> [!NOTE]
+> **Fast, Stable, & Daily-Driven:** Nova is built for production workflows with native performance, zero-friction execution, and strict safety guardrails.
 
 ---
 
@@ -36,8 +36,8 @@ Unlike IDE plugins that interrupt you with modal dialogues for every file read o
 
 - **No tedious click-prompts:** Reads, edits, builds, and standard commands run immediately without micro-confirmations.
 - **Two-Tier Command Safety Net:**
-  - **Tier 1 — ModernBERT ML Classifier (Active when configured):** When the optional ModernBERT ONNX model is set up, a dedicated local neural classifier inspects every shell command in sub-milliseconds to distinguish benign tasks from dangerous ones with deep contextual awareness.
-  - **Tier 2 — Deterministic Pattern Fallback (Active by default):** If the ML model is not installed, Nova relies on its built-in regex/keyword safety engine. This fallback intercepts common high-risk destructive commands (e.g. `rm -rf`, `mkfs`, `dd`, `git reset --hard`, fork bombs) and gates them behind explicit approval prompts.
+  - **Tier 1 — Built-in Deterministic Safety Matcher (Active by default):** Zero-dependency, sub-microsecond pattern engine in Zig (`bash_safety.zig`). Automatically intercepts high-risk destructive commands (e.g. `rm -rf /`, drive root wipes, `mkfs`, `dd`, fork bombs) and gates them behind explicit approval prompts.
+  - **Tier 2 — External AI Safety Classifier (Optional):** Plug in the standalone REST safety service (`tools/classifier/`) powered by Transformer models (ModernBERT, MiniLM) or an LLM safety proxy for deep contextual risk evaluation.
   - *Runtime Check:* You can inspect your active safety tier at any time by running `/status`.
 - **Git Worktree Isolation:** When exploring risky changes or broad refactors, fork your workspace into isolated **Parallel Lanes** (`/parallel` or `lane spawn`). Workers are physically contained inside their worktree, keeping your main branch clean.
 - **Plugin Sandboxing & Execution Layer:**

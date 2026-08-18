@@ -12,7 +12,7 @@ panel's About tab.
 - **Release builds** (`.github/workflows/release.yml`) pass `-Dversion=<tag>`
   explicitly, so the binary reports exactly the tag.
 - **Local builds** fall back to `git describe --tags --always --dirty`
-  (e.g. `v0.2.0-beta.2-55-g338b78c-dirty`), or `dev` when git is unavailable or
+  (e.g. `v0.3.0-5-g338b78c-dirty`), or `dev` when git is unavailable or
   the directory is not a repo.
 
 `nova --version` prints `nova <version>` and exits.
