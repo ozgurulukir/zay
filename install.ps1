@@ -83,7 +83,7 @@ try {
 
     Write-Host ""
     Write-Host "Nova Agent is ready to use!" -ForegroundColor Cyan
-    Write-Host "Run 'nova --help' to get started." -ForegroundColor White
+    Write-Host "Run 'nova' to get started." -ForegroundColor White
 } finally {
     if (Test-Path $TempDir) {
         Remove-Item -Path $TempDir -Recurse -Force -ErrorAction SilentlyContinue

@@ -99,4 +99,4 @@ case ":$PATH:" in
 esac
 
 echo ""
-echo -e "Run ${BOLD}nova --help${RESET} to get started."
+echo -e "Run ${BOLD}nova${RESET} to get started."
