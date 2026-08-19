@@ -15,6 +15,8 @@ const os = @import("os.zig");
 const pwsh_tool = @import("tools/pwsh.zig");
 const schema_mod = @import("tools/schema.zig");
 const shell_safety = @import("tools/bash_safety.zig");
+const skill_mod = @import("skill.zig");
+const skill_tool = @import("tools/skill.zig");
 const tools = @import("tools.zig");
 const tool_display = @import("tools/display.zig");
 const executor_safety = @import("tools/executor_safety.zig");
@@ -187,6 +189,7 @@ pub const ExecutorService = struct {
     /// the slot in `produceOutput`; null disables the lane tool (headless).
     lane_bridge: ?*lane_bridge.LaneBridge = null,
     lane_requester: ?*anyopaque = null,
+    skills: []const skill_mod.Skill = &.{},
 
     pub const InitOptions = struct {
         gpa: std.mem.Allocator,
@@ -200,6 +203,7 @@ pub const ExecutorService = struct {
         plugin_manager: ?*lua_mod.PluginManager = null,
         lane_bridge: ?*lane_bridge.LaneBridge = null,
         lane_requester: ?*anyopaque = null,
+        skills: []const skill_mod.Skill = &.{},
     };
 
     pub fn init(options: InitOptions) ExecutorService {
@@ -217,6 +221,7 @@ pub const ExecutorService = struct {
             .plugin_manager = options.plugin_manager,
             .lane_bridge = options.lane_bridge,
             .lane_requester = options.lane_requester,
+            .skills = options.skills,
         };
     }
 
@@ -418,6 +423,10 @@ pub const ExecutorService = struct {
         else
             .{};
         defer background_tool.background_slot = prev_bg;
+
+        const prev_skills = skill_tool.skills_slot;
+        skill_tool.skills_slot = self.skills;
+        defer skill_tool.skills_slot = prev_skills;
         if (self.contained) {
             // Lane worker: route through `runContained`, which prepends the
             // shell containment guard before running (background or foreground).

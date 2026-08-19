@@ -272,6 +272,20 @@ pub const TurnView = struct {
         // Streaming deltas can arrive with an empty name before the provider
         // sends the tool-call name chunk. Skip until the name is populated.
         if (tool.name.len == 0) return false;
+        if (std.mem.eql(u8, tool.name, "skill")) {
+            const JsonArgs = struct {
+                name: ?[]const u8 = null,
+                skill: ?[]const u8 = null,
+                command: ?[]const u8 = null,
+            };
+            const parsed = std.json.parseFromSlice(JsonArgs, gpa, tool.arguments, .{ .ignore_unknown_fields = true }) catch return false;
+            defer parsed.deinit();
+            const raw_name = parsed.value.name orelse parsed.value.skill orelse parsed.value.command orelse return false;
+            const skill_name = std.mem.trim(u8, raw_name, " \t\r\n$");
+            if (skill_name.len > 0) {
+                return try self.applySkillPreview(gpa, transcript, tool.index, skill_name);
+            }
+        }
         // Known limitation (Phase 9): this skill-preview branch is keyed off
         // the canonical shell name (`.bash` on POSIX, `.pwsh` on Windows) so
         // the render rules fire for the host shell, but `skillNameFromBashRead`
@@ -382,6 +396,40 @@ pub const TurnView = struct {
     ) !bool {
         const policy = tool_policy.forName(tool.name);
         const existing_index = self.toolTranscriptIndex(tool.index);
+        if (std.mem.eql(u8, tool.name, "skill")) {
+            const target_index = if (existing_index) |idx| idx: {
+                if (idx < transcript.messages.items.len and transcript.messages.items[idx] != .skill) {
+                    const skill_name = if (tool.display_expanded_label) |exp|
+                        (if (std.mem.startsWith(u8, exp, "skill: ")) exp[7..] else exp)
+                    else
+                        (if (std.mem.startsWith(u8, tool.display_label, "Read ") and std.mem.endsWith(u8, tool.display_label, " skill"))
+                            tool.display_label[5 .. tool.display_label.len - 6]
+                        else
+                            tool.display_label);
+                    const title = try std.fmt.allocPrint(gpa, "[SKILL] {s}", .{skill_name});
+                    defer gpa.free(title);
+                    try setSkillMessage(gpa, transcript, idx, title);
+                }
+                break :idx idx;
+            } else idx: {
+                const skill_name = if (tool.display_expanded_label) |exp|
+                    (if (std.mem.startsWith(u8, exp, "skill: ")) exp[7..] else exp)
+                else
+                    (if (std.mem.startsWith(u8, tool.display_label, "Read ") and std.mem.endsWith(u8, tool.display_label, " skill"))
+                        tool.display_label[5 .. tool.display_label.len - 6]
+                    else
+                        tool.display_label);
+                const title = try std.fmt.allocPrint(gpa, "[SKILL] {s}", .{skill_name});
+                defer gpa.free(title);
+                const created = try transcript.append(gpa, .skill, title, "");
+                try self.putToolTranscriptIndex(gpa, tool.index, created);
+                break :idx created;
+            };
+            try transcript.finishSkill(gpa, target_index, tool.display_body, tool.failed);
+            self.tool_seen_in_response = true;
+            self.agent_index = null;
+            return true;
+        }
         if (existing_index) |index| {
             if (index < transcript.messages.items.len and transcript.messages.items[index].mirror().kind == .skill) {
                 try transcript.finishSkill(gpa, index, tool.display_body, tool.failed);
@@ -522,6 +570,63 @@ pub fn chooseLoadingWordIndex(io: std.Io) u8 {
     const timestamp: std.Io.Timestamp = .now(io, .awake);
     const index = @mod(timestamp.nanoseconds, loading_spinners.len);
     return @intCast(index);
+}
+
+test "skill tool invocation renders skill row on both Windows and POSIX" {
+    const gpa = std.testing.allocator;
+    var view: TurnView = .{};
+    defer view.deinit(gpa);
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const changed = try view.applyToolPreview(gpa, &transcript, .{
+        .index = 0,
+        .name = "skill",
+        .arguments = "{\"name\":\"tigerstyle\"}",
+    });
+
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(@as(usize, 1), transcript.messages.items.len);
+    try std.testing.expectEqual(transcript_mod.MessageKind.skill, transcript.messages.items[0].mirror().kind);
+    try std.testing.expectEqualStrings("[SKILL] tigerstyle", transcript.messages.items[0].mirror().title);
+
+    const finished = try view.applyToolFinished(gpa, &transcript, .{
+        .index = 0,
+        .name = "skill",
+        .display_label = "Read tigerstyle skill",
+        .display_expanded_label = "skill: tigerstyle",
+        .display_body = "# Tigerstyle Guidelines",
+    });
+    try std.testing.expect(finished);
+    try std.testing.expectEqualStrings("# Tigerstyle Guidelines", transcript.messages.items[0].mirror().body);
+    try std.testing.expect(!transcript.messages.items[0].mirror().expanded);
+    transcript.toggleSelected();
+    try std.testing.expect(transcript.messages.items[0].mirror().expanded);
+}
+
+test "skill tool finished converts existing generic tool row into skill card" {
+    const gpa = std.testing.allocator;
+    var view: TurnView = .{};
+    defer view.deinit(gpa);
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    // Simulate preview as a generic tool before full JSON parsed
+    const idx = try transcript.startTool(gpa, "skill");
+    try view.putToolTranscriptIndex(gpa, 0, idx);
+
+    const finished = try view.applyToolFinished(gpa, &transcript, .{
+        .index = 0,
+        .name = "skill",
+        .display_label = "Read tigerstyle skill",
+        .display_expanded_label = "skill: tigerstyle",
+        .display_body = "# Tigerstyle Guidelines",
+    });
+    try std.testing.expect(finished);
+    try std.testing.expectEqual(@as(usize, 1), transcript.messages.items.len);
+    try std.testing.expectEqual(transcript_mod.MessageKind.skill, transcript.messages.items[0].mirror().kind);
+    try std.testing.expectEqualStrings("[SKILL] tigerstyle", transcript.messages.items[0].mirror().title);
+    try std.testing.expectEqualStrings("# Tigerstyle Guidelines", transcript.messages.items[0].mirror().body);
 }
 
 test "bash read of skill renders skill row" {

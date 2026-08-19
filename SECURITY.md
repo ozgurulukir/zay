@@ -6,6 +6,7 @@ Security updates and patches are actively provided for the following releases:
 
 | Version | Supported          |
 | ------- | ------------------ |
+| 0.4.x   | :white_check_mark: |
 | 0.3.x   | :white_check_mark: |
 | < 0.3.0 | :x:                |
 

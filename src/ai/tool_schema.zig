@@ -239,7 +239,7 @@ test "buildAllToolsJson emits every plugin+builtin+MCP tool at production scale"
     for (plugin_names) |name| {
         try std.testing.expectEqual(@as(usize, 1), countSubstr(json, name));
     }
-    for ([_][]const u8{ tools_mod.shellToolName, "lane", "background" }) |builtin| {
+    for ([_][]const u8{ tools_mod.shellToolName, "lane", "background", "skill" }) |builtin| {
         const needle = try std.fmt.allocPrint(gpa, "\"name\":\"{s}\"", .{builtin});
         defer gpa.free(needle);
         try std.testing.expectEqual(@as(usize, 1), countSubstr(json, needle));
@@ -247,7 +247,7 @@ test "buildAllToolsJson emits every plugin+builtin+MCP tool at production scale"
     for ([_][]const u8{ "mcp__tavily__search", "mcp__tavily__extract", "mcp__chrome-devtools__click" }) |mcp| {
         try std.testing.expectEqual(@as(usize, 1), countSubstr(json, mcp));
     }
-    try std.testing.expectEqual(@as(usize, plugin_names.len + 3 + mcp_tools.len), countSubstr(json, "\"type\":\"function\""));
+    try std.testing.expectEqual(@as(usize, plugin_names.len + 4 + mcp_tools.len), countSubstr(json, "\"type\":\"function\""));
 }
 
 fn countSubstr(haystack: []const u8, needle: []const u8) usize {

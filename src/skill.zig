@@ -136,11 +136,10 @@ pub fn formatForPrompt(gpa: std.mem.Allocator, skills: []const Skill) ![]u8 {
     if (visible == 0) return out.toOwnedSlice();
 
     // Markdown (not XML) — keeps the model from echoing literal <skill> tags back as text.
-    // No `location` path is published: the model must invoke a skill via `$name` (handled by
-    // `promptPrefix`/`appendSkillBlock`) rather than `cat`-ing the file. Skill bodies can still
-    // reference each other through their own `$name` syntax once injected.
+    // No `location` path is published: the model must invoke a skill via the `skill` tool
+    // rather than `cat`-ing the file. Skill bodies can still reference each other once injected.
     try out.writer.writeAll("\n\nThe following skills provide specialized instructions for specific tasks.\n");
-    try out.writer.writeAll("When a task matches a skill's description, refer to it by `$name` in your reply — its full instructions will be injected into your context automatically.\n\n");
+    try out.writer.writeAll("When a task matches a skill's description, use the `skill` tool with its name (e.g. `{\"name\": \"<skill-name>\"}`) to load its full instructions into context.\n\n");
     try out.writer.writeAll("<available_skills>\n");
     for (skills) |skill| {
         if (skill.disable_model_invocation) continue;
@@ -898,8 +897,8 @@ test "formatForPrompt renders markdown bullets with name and description" {
     try std.testing.expect(std.mem.indexOf(u8, text, "Use when writing any code.") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Use for how does X work.") != null);
 
-    // The model is taught `$name` invocation, not bash — and the path is never published.
-    try std.testing.expect(std.mem.indexOf(u8, text, "refer to it by `$name`") != null);
+    // The model is taught `skill` tool invocation, not bash — and the path is never published.
+    try std.testing.expect(std.mem.indexOf(u8, text, "use the `skill` tool") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Use bash") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "/secret/tigerstyle/SKILL.md") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "/secret/how/SKILL.md") == null);

@@ -58,8 +58,8 @@ in your tool list with the prefix `lua__<plugin>__<tool>` and can be called
 like any other tool. Inside a plugin's Lua sandbox, `nova.*` bridge functions
 (filesystem, shell, git, json) are available for the plugin's own code.
 
-When the user asks you to write a plugin, read the `write-lua-plugin` skill
-file (its location is listed in the skills section) and follow its instructions
+When the user asks you to write a plugin, load the `write-lua-plugin` skill
+using the `skill` tool (`{"name": "write-lua-plugin"}`) and follow its instructions
 to create `plugin.lua` and `init.lua` in the appropriate plugin directory.
 Test with `zig build test-plugin`.
 

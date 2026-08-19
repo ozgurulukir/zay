@@ -6,6 +6,7 @@ const common = @import("common.zig");
 const lane_tool = @import("lane.zig");
 const os = @import("../os.zig");
 const pwsh_tool = @import("pwsh.zig");
+const skill_tool = @import("skill.zig");
 const Tool = common.Tool;
 
 /// Runtime-mutable tool registry. The App owns one; builtin tools live in
@@ -111,7 +112,7 @@ pub const shell_tool: Tool = if (os.is_windows) pwsh_tool.tool else bash_tool.to
 /// Canonical builtin tool list. Consumed by `ToolRegistry.init` and by
 /// `src/tools.zig`'s re-export (all single-registry call sites).
 pub fn builtin() []const Tool {
-    return &.{ shell_tool, lane_tool.tool, background_tool.tool };
+    return &.{ shell_tool, lane_tool.tool, background_tool.tool, skill_tool.tool };
 }
 
 const tools_common = @import("common.zig");
@@ -211,11 +212,12 @@ test "ToolRegistry: addPluginTool makes plugin tool discoverable" {
     try std.testing.expectEqualStrings("plugin tool", tool.description);
 
     const all = try reg.all(gpa);
-    try std.testing.expectEqual(@as(usize, 4), all.len); // shell + lane + background + plugin
+    try std.testing.expectEqual(@as(usize, 5), all.len); // shell + lane + background + skill + plugin
     try std.testing.expectEqualStrings(shell_tool.name, all[0].name);
     try std.testing.expectEqualStrings("lane", all[1].name);
     try std.testing.expectEqualStrings("background", all[2].name);
-    try std.testing.expectEqualStrings("lua__p__t", all[3].name);
+    try std.testing.expectEqualStrings("skill", all[3].name);
+    try std.testing.expectEqualStrings("lua__p__t", all[4].name);
 }
 
 test "ToolRegistry: removePluginToolsWithPrefix strips matching tools" {
@@ -249,6 +251,7 @@ test "ToolRegistry: removePluginToolsWithPrefix strips matching tools" {
     try std.testing.expect((try reg.lookup(gpa, "lua__p__b")) == null);
     try std.testing.expect((try reg.lookup(gpa, "mcp__x__c")) != null);
     try std.testing.expect((try reg.lookup(gpa, shell_tool.name)) != null);
+    try std.testing.expect((try reg.lookup(gpa, "skill")) != null);
 }
 
 test "ToolRegistry: all() returns valid slices after multiple calls" {
@@ -282,7 +285,7 @@ test "ToolRegistry: all() returns valid slices after multiple calls" {
     // First all(): tools are still allocated.
     {
         const all = try reg.all(gpa);
-        try std.testing.expect(all.len == 5); // shell + lane + background + 2 plugin
+        try std.testing.expect(all.len == 6); // shell + lane + background + skill + 2 plugin
         for (all) |t| {
             try std.testing.expect(t.name.len > 0);
             try std.testing.expect(t.description.len > 0);
@@ -292,7 +295,7 @@ test "ToolRegistry: all() returns valid slices after multiple calls" {
     // Reuse the same registry; backing storage must still be intact.
     {
         const all = try reg.all(gpa);
-        try std.testing.expect(all.len == 5);
+        try std.testing.expect(all.len == 6);
         for (all) |t| {
             try std.testing.expect(t.name.len > 0);
             try std.testing.expect(t.description.len > 0);
@@ -302,13 +305,12 @@ test "ToolRegistry: all() returns valid slices after multiple calls" {
 
 test "registry builtin carries exactly one shell tool" {
     // SSOT vector (Phase 3): the builtin list must expose exactly one shell
-    // tool (`pwsh` on Windows, `bash` elsewhere) plus `lane` and `background`. This pins the
-    // comptime bash↔pwsh switch in place so a future drift that exposes both —
-    // or neither — is caught at the canonical source.
+    // tool (`pwsh` on Windows, `bash` elsewhere) plus `lane`, `background`, and `skill`.
     const tools = builtin();
-    try std.testing.expectEqual(@as(usize, 3), tools.len);
+    try std.testing.expectEqual(@as(usize, 4), tools.len);
     try std.testing.expect(std.mem.eql(u8, tools[0].name, shell_tool.name));
     try std.testing.expectEqualStrings("lane", tools[1].name);
     try std.testing.expectEqualStrings("background", tools[2].name);
+    try std.testing.expectEqualStrings("skill", tools[3].name);
     try std.testing.expect(shell_tool.name.len == 4 or std.mem.eql(u8, shell_tool.name, "pwsh"));
 }

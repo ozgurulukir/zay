@@ -18,6 +18,7 @@ const entries = [_]struct { name: []const u8, policy: Policy }{
     .{ .name = tools_mod.shell_tool.name, .policy = .{ .expand_by_default = false, .render = .plain } },
     .{ .name = "lane", .policy = .{ .expand_by_default = false, .render = .plain } },
     .{ .name = "background", .policy = .{ .expand_by_default = false, .render = .plain } },
+    .{ .name = "skill", .policy = .{ .expand_by_default = false, .render = .plain } },
 };
 
 comptime {

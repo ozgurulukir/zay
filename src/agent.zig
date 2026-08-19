@@ -610,6 +610,7 @@ pub const Agent = struct {
             .plugin_manager = self.plugin_manager,
             .lane_bridge = self.lane_bridge,
             .lane_requester = self,
+            .skills = self.skills,
         });
         const results = try executor.runAll(tool_batch.calls, bridge.observer());
         defer self.gpa.free(results);
