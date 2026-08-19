@@ -9,6 +9,10 @@ pub const Skill = struct {
     description: []u8,
     path: []u8,
     base_dir: []u8,
+    /// Frontmatter-stripped body, loaded once in `loadOne`. Cached here so
+    /// `appendSkillBlock` (called every turn via `promptPrefix`) never re-reads
+    /// the file from disk — `path` is kept only for diagnostics / listing.
+    body: []u8,
     disable_model_invocation: bool = false,
 
     pub fn deinit(self: *Skill, gpa: std.mem.Allocator) void {
@@ -16,6 +20,7 @@ pub const Skill = struct {
         gpa.free(self.description);
         gpa.free(self.path);
         gpa.free(self.base_dir);
+        gpa.free(self.body);
         self.* = undefined;
     }
 };
@@ -104,11 +109,15 @@ pub fn cloneAll(gpa: std.mem.Allocator, skills: []const Skill) ![]Skill {
         const path = try gpa.dupe(u8, skill.path);
         errdefer gpa.free(path);
         const base_dir = try gpa.dupe(u8, skill.base_dir);
+        errdefer gpa.free(base_dir);
+        const body = try gpa.dupe(u8, skill.body);
+        errdefer gpa.free(body);
         out[i] = .{
             .name = name,
             .description = description,
             .path = path,
             .base_dir = base_dir,
+            .body = body,
             .disable_model_invocation = skill.disable_model_invocation,
         };
         done = i + 1;
@@ -190,7 +199,7 @@ pub fn filterNames(gpa: std.mem.Allocator, skills: []const Skill, query: []const
     return results.toOwnedSlice(gpa);
 }
 
-pub fn promptPrefix(gpa: std.mem.Allocator, io: std.Io, skills: []const Skill, prompt: []const u8) ![]u8 {
+pub fn promptPrefix(gpa: std.mem.Allocator, skills: []const Skill, prompt: []const u8) ![]u8 {
     const names = try collectInvocations(gpa, skills, prompt);
     defer gpa.free(names);
     if (names.len == 0) return gpa.dupe(u8, "");
@@ -200,7 +209,7 @@ pub fn promptPrefix(gpa: std.mem.Allocator, io: std.Io, skills: []const Skill, p
     var remaining: usize = max_total_invocation_bytes;
     for (names) |name| {
         const skill = find(skills, name) orelse continue;
-        appendSkillBlock(gpa, io, &out.writer, skill, &remaining) catch |err| {
+        appendSkillBlock(&out.writer, skill, &remaining) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             try out.writer.print("[skill '{s}' could not be loaded: {s}]\n\n", .{ name, @errorName(err) });
             if (err == error.SkillBudgetExhausted) break;
@@ -340,11 +349,16 @@ fn loadOne(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Skill {
     const name_value = frontmatterValue(frontmatter, "name") orelse fallback;
     if (!isValidSkillName(name_value)) return error.InvalidSkillName;
     const base_dir = std.fs.path.dirname(path) orelse ".";
+    // `stripFrontmatter` returns a sub-slice of `raw`, which is freed in this
+    // function's defer — so the body must be duped into owned storage on the Skill.
+    const body = try gpa.dupe(u8, stripFrontmatter(raw));
+    errdefer gpa.free(body);
     return .{
         .name = try gpa.dupe(u8, name_value),
         .description = try gpa.dupe(u8, description),
         .path = try gpa.dupe(u8, path),
         .base_dir = try gpa.dupe(u8, base_dir),
+        .body = body,
         .disable_model_invocation = frontmatterBool(frontmatter, "disable-model-invocation"),
     };
 }
@@ -411,18 +425,13 @@ fn stripQuotes(value: []const u8) []const u8 {
     return value;
 }
 
-fn appendSkillBlock(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, skill: *const Skill, remaining: *usize) !void {
-    const file = try std.Io.Dir.openFile(.cwd(), io, skill.path, .{});
-    defer file.close(io);
-    const stat = try file.stat(io);
-    if (stat.size > 256 * 1024) return error.FileTooBig;
-    if (stat.size > remaining.*) return error.SkillBudgetExhausted; // checked BEFORE alloc
-    remaining.* -= stat.size;
-    const raw = try gpa.alloc(u8, @intCast(stat.size));
-    defer gpa.free(raw); // success and error paths both free (TD-2)
-    var reader = file.reader(io, &.{});
-    try reader.interface.readSliceAll(raw);
-    const body = stripFrontmatter(raw);
+fn appendSkillBlock(writer: *std.Io.Writer, skill: *const Skill, remaining: *usize) !void {
+    // Body is cached on the Skill since `loadOne` — no per-turn disk read.
+    // `max_total_invocation_bytes` is shared by `formatForPrompt`, so guard on it too.
+    if (skill.body.len > max_total_invocation_bytes) return error.FileTooBig;
+    const body = skill.body;
+    if (body.len > remaining.*) return error.SkillBudgetExhausted; // checked BEFORE write
+    remaining.* -= body.len;
     try writer.writeAll("<skill name=\"");
     try writeXmlEscaped(writer, skill.name);
     try writer.writeAll("\" location=\"");
@@ -460,6 +469,15 @@ test "frontmatter parses LF line endings" {
     try std.testing.expectEqualStrings("demo", frontmatterValue(frontmatter, "name").?);
     try std.testing.expectEqualStrings("d", frontmatterValue(frontmatter, "description").?);
     try std.testing.expectEqualStrings("body\n", stripFrontmatter(raw));
+}
+
+// Regression: a value containing a colon must keep everything after the FIRST
+// colon (frontmatterValue splits on indexOfScalar(':'); only the key is split,
+// not the value). `description: rule: a and b` -> "rule: a and b".
+test "frontmatter preserves colons inside a value" {
+    const raw = "---\nname: demo\ndescription: rule: a and b\n---\nbody\n";
+    const frontmatter = parseFrontmatter(raw);
+    try std.testing.expectEqualStrings("rule: a and b", frontmatterValue(frontmatter, "description").?);
 }
 
 /// Public so `plugin_prompt.zig` can reuse XML escaping for the
@@ -507,7 +525,7 @@ test "activeQuery detects dollar skill token" {
 
 test "collectInvocations finds known skills only" {
     const gpa = std.testing.allocator;
-    const skills = [_]Skill{.{ .name = @constCast("how"), .description = @constCast("d"), .path = @constCast("p"), .base_dir = @constCast(".") }};
+    const skills = [_]Skill{.{ .name = @constCast("how"), .description = @constCast("d"), .path = @constCast("p"), .base_dir = @constCast("."), .body = @constCast("") }};
     const names = try collectInvocations(gpa, &skills, "$how and $missing");
     defer gpa.free(names);
     try std.testing.expectEqual(@as(usize, 1), names.len);
@@ -516,7 +534,7 @@ test "collectInvocations finds known skills only" {
 
 test "collectInvocations matches skill names case-insensitively" {
     const gpa = std.testing.allocator;
-    const skills = [_]Skill{.{ .name = @constCast("tiger"), .description = @constCast("d"), .path = @constCast("p"), .base_dir = @constCast(".") }};
+    const skills = [_]Skill{.{ .name = @constCast("tiger"), .description = @constCast("d"), .path = @constCast("p"), .base_dir = @constCast("."), .body = @constCast("") }};
     const names = try collectInvocations(gpa, &skills, "$Tiger");
     defer gpa.free(names);
     try std.testing.expectEqual(@as(usize, 1), names.len);
@@ -793,11 +811,17 @@ test "global-only skills load" {
     try std.testing.expectEqualStrings("globalonly", skills[0].name);
 }
 
-test "promptPrefix skips unreadable skills with a notice" {
+// promptPrefix surfaces any appendSkillBlock failure as a "[skill 'x' could not
+// be loaded]" notice rather than aborting the whole prefix. With bodies cached
+// at load time, the realistic in-prompt failure is budget exhaustion for a skill
+// whose body exceeds the remaining per-turn cap.
+test "promptPrefix reports a skill that exceeds the budget as a notice" {
     const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    const skills = [_]Skill{.{ .name = @constCast("missing"), .description = @constCast("d"), .path = @constCast("/nonexistent/path/SKILL.md"), .base_dir = @constCast(".") }};
-    const prefix = try promptPrefix(gpa, io, &skills, "use $missing");
+    const big = try gpa.alloc(u8, max_total_invocation_bytes + 1);
+    defer gpa.free(big);
+    @memset(big, 'x');
+    const skills = [_]Skill{.{ .name = @constCast("huge"), .description = @constCast("d"), .path = @constCast("/p"), .base_dir = @constCast("."), .body = big }};
+    const prefix = try promptPrefix(gpa, &skills, "use $huge");
     defer gpa.free(prefix);
     try std.testing.expect(std.mem.indexOf(u8, prefix, "could not be loaded") != null);
 }
@@ -829,7 +853,7 @@ test "appendSkillBlock refuses to exceed the remaining budget" {
     var remaining: usize = 1;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    const err = appendSkillBlock(gpa, io, &out.writer, &skills[0], &remaining);
+    const err = appendSkillBlock(&out.writer, &skills[0], &remaining);
     try std.testing.expectError(error.SkillBudgetExhausted, err);
     try std.testing.expectEqual(@as(usize, 1), remaining);
 }
@@ -837,8 +861,8 @@ test "appendSkillBlock refuses to exceed the remaining budget" {
 test "formatSkillsList lists every loaded skill" {
     const gpa = std.testing.allocator;
     const skills = [_]Skill{
-        .{ .name = @constCast("one"), .description = @constCast("first"), .path = @constCast("/a/one"), .base_dir = @constCast("/a") },
-        .{ .name = @constCast("two"), .description = @constCast("second"), .path = @constCast("/b/two"), .base_dir = @constCast("/b") },
+        .{ .name = @constCast("one"), .description = @constCast("first"), .path = @constCast("/a/one"), .base_dir = @constCast("/a"), .body = @constCast("") },
+        .{ .name = @constCast("two"), .description = @constCast("second"), .path = @constCast("/b/two"), .base_dir = @constCast("/b"), .body = @constCast("") },
     };
     const list = try formatSkillsList(gpa, &skills);
     defer gpa.free(list);
@@ -860,8 +884,8 @@ test "formatSkillsList empty slice reports no skills" {
 test "formatForPrompt renders markdown bullets with name and description" {
     const gpa = std.testing.allocator;
     const skills = [_]Skill{
-        .{ .name = @constCast("tigerstyle"), .description = @constCast("Use when writing any code."), .path = @constCast("/secret/tigerstyle/SKILL.md"), .base_dir = @constCast("/secret/tigerstyle") },
-        .{ .name = @constCast("how"), .description = @constCast("Use for how does X work."), .path = @constCast("/secret/how/SKILL.md"), .base_dir = @constCast("/secret/how") },
+        .{ .name = @constCast("tigerstyle"), .description = @constCast("Use when writing any code."), .path = @constCast("/secret/tigerstyle/SKILL.md"), .base_dir = @constCast("/secret/tigerstyle"), .body = @constCast("") },
+        .{ .name = @constCast("how"), .description = @constCast("Use for how does X work."), .path = @constCast("/secret/how/SKILL.md"), .base_dir = @constCast("/secret/how"), .body = @constCast("") },
     };
     const text = try formatForPrompt(gpa, &skills);
     defer gpa.free(text);
@@ -886,7 +910,7 @@ test "formatForPrompt renders markdown bullets with name and description" {
 test "formatForPrompt escapes XML-special chars in skill names and descriptions" {
     const gpa = std.testing.allocator;
     const skills = [_]Skill{
-        .{ .name = @constCast("a&b"), .description = @constCast("1 < 2 > 0"), .path = @constCast("/x"), .base_dir = @constCast("/x") },
+        .{ .name = @constCast("a&b"), .description = @constCast("1 < 2 > 0"), .path = @constCast("/x"), .base_dir = @constCast("/x"), .body = @constCast("") },
     };
     const text = try formatForPrompt(gpa, &skills);
     defer gpa.free(text);
@@ -900,8 +924,8 @@ test "formatForPrompt escapes XML-special chars in skill names and descriptions"
 test "formatForPrompt hides disable_model_invocation skills" {
     const gpa = std.testing.allocator;
     const skills = [_]Skill{
-        .{ .name = @constCast("public"), .description = @constCast("shown"), .path = @constCast("/p"), .base_dir = @constCast("/p") },
-        .{ .name = @constCast("secret"), .description = @constCast("hidden"), .path = @constCast("/s"), .base_dir = @constCast("/s"), .disable_model_invocation = true },
+        .{ .name = @constCast("public"), .description = @constCast("shown"), .path = @constCast("/p"), .base_dir = @constCast("/p"), .body = @constCast("") },
+        .{ .name = @constCast("secret"), .description = @constCast("hidden"), .path = @constCast("/s"), .base_dir = @constCast("/s"), .body = @constCast(""), .disable_model_invocation = true },
     };
     const text = try formatForPrompt(gpa, &skills);
     defer gpa.free(text);
@@ -913,8 +937,8 @@ test "formatForPrompt hides disable_model_invocation skills" {
 test "formatForPrompt returns empty when every skill disables model invocation" {
     const gpa = std.testing.allocator;
     const skills = [_]Skill{
-        .{ .name = @constCast("a"), .description = @constCast("x"), .path = @constCast("/a"), .base_dir = @constCast("/a"), .disable_model_invocation = true },
-        .{ .name = @constCast("b"), .description = @constCast("y"), .path = @constCast("/b"), .base_dir = @constCast("/b"), .disable_model_invocation = true },
+        .{ .name = @constCast("a"), .description = @constCast("x"), .path = @constCast("/a"), .base_dir = @constCast("/a"), .body = @constCast(""), .disable_model_invocation = true },
+        .{ .name = @constCast("b"), .description = @constCast("y"), .path = @constCast("/b"), .base_dir = @constCast("/b"), .body = @constCast(""), .disable_model_invocation = true },
     };
     const text = try formatForPrompt(gpa, &skills);
     defer gpa.free(text);
@@ -943,7 +967,7 @@ test "collectInjectedSkillNames no markers returns empty" {
 
 test "cloneAll produces independent copies" {
     const gpa = std.testing.allocator;
-    const skills = [_]Skill{.{ .name = @constCast("how"), .description = @constCast("d"), .path = @constCast("p"), .base_dir = @constCast(".") }};
+    const skills = [_]Skill{.{ .name = @constCast("how"), .description = @constCast("d"), .path = @constCast("p"), .base_dir = @constCast("."), .body = @constCast("") }};
     const copies = try cloneAll(gpa, &skills);
     defer deinitAll(gpa, copies);
     try std.testing.expect(copies[0].name.ptr != skills[0].name.ptr);
@@ -952,7 +976,7 @@ test "cloneAll produces independent copies" {
 
 test "collectInvocations deduplicates case-insensitively" {
     const gpa = std.testing.allocator;
-    const skills = [_]Skill{.{ .name = @constCast("tiger"), .description = @constCast("d"), .path = @constCast("p"), .base_dir = @constCast(".") }};
+    const skills = [_]Skill{.{ .name = @constCast("tiger"), .description = @constCast("d"), .path = @constCast("p"), .base_dir = @constCast("."), .body = @constCast("") }};
     // $Tiger and $tiger both resolve to skill "tiger" via case-insensitive find.
     // contains must also be case-insensitive, otherwise the body is injected twice.
     const names = try collectInvocations(gpa, &skills, "$Tiger and $tiger");
@@ -994,12 +1018,13 @@ test "appendSkillBlock escapes XML special characters in attributes" {
         .description = @constCast("d"),
         .path = md_path,
         .base_dir = full_dir,
+        .body = @constCast("body\n"),
     };
 
     var remaining: usize = max_total_invocation_bytes;
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
-    try appendSkillBlock(gpa, io, &out.writer, &skill, &remaining);
+    try appendSkillBlock(&out.writer, &skill, &remaining);
     const result = try out.toOwnedSlice();
     defer gpa.free(result);
 

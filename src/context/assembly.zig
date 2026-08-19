@@ -546,6 +546,7 @@ test "assembleSystemPrompt injects every skill and plugin prompt without truncat
             .description = try std.fmt.allocPrint(gpa, "Skill {s} description {{hsep}} with a long tail to exceed any naive cap.", .{name}),
             .path = try std.fmt.allocPrint(gpa, "/skills/{s}/SKILL.md", .{name}),
             .base_dir = try std.fmt.allocPrint(gpa, "/skills/{s}", .{name}),
+            .body = try std.fmt.allocPrint(gpa, "Skill {s} body " ++ ("x" ** 200), .{name}),
         };
     }
 

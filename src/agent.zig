@@ -345,7 +345,7 @@ pub const Agent = struct {
     fn prependSkillBlocks(self: *Agent, prompt: []const u8, blocks: []ai.ContentBlock) !void {
         assert(blocks.len > 0);
         assert(blocks[0] == .text);
-        const prefix = try skill_mod.promptPrefix(self.gpa, self.io, self.skills, prompt);
+        const prefix = try skill_mod.promptPrefix(self.gpa, self.skills, prompt);
         defer self.gpa.free(prefix);
         if (prefix.len == 0) return;
 
