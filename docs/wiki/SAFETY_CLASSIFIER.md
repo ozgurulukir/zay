@@ -24,10 +24,10 @@ flowchart TD
 
 The system operates across two complementary tiers:
 1. **Tier 1: Built-in Deterministic Safety Matcher (Always Active)**
-   - Zero-dependency, microsecond-latency AST and token pattern matcher built directly into the native Zig binary.
+   - Zero-dependency, microsecond-latency token pattern matcher built directly into the native Zig binary.
    - Intercepts known destructive commands: `rm -rf /`, `mkfs.*`, `dd of=/dev/sd*`, PowerShell `Remove-Item -Recurse -Force` on system roots, `Clear-RecycleBin -Force`, fork bombs (`:(){ :|:& };:`), and critical system redirects (`> /etc/passwd`).
 2. **Tier 2: External AI Safety Classifier (Optional & Pluggable)**
-   - External REST endpoint powered by a fine-tuned Transformer model (such as ModernBERT or MiniLM) or an LLM proxy.
+   - External REST endpoint powered by a fine-tuned Transformer model (such as ModernBERT) or an LLM proxy.
    - Evaluates natural language shell commands semantically for dangerous side effects beyond simple regex matching.
 
 ---
@@ -40,13 +40,11 @@ We provide a standalone Python/FastAPI service in `tools/classifier/` with built
 
 ```bash
 # Run with fine-tuned ModernBERT ONNX model (Default):
-uv run tools/classifier/server.py --port 8765
-
-# Run with lightweight MiniLM (CPU-friendly, ~80MB):
-uv run tools/classifier/server.py --model minilm --port 8765
+# From the repo root (the module uses package-relative imports):
+uv run -m tools.classifier.server --port 8765
 
 # Run zero-ML fast rule mock engine:
-uv run tools/classifier/server.py --model rules --port 8765
+uv run -m tools.classifier.server --model rules --port 8765
 ```
 
 ### Option B: Using Docker
@@ -131,6 +129,5 @@ You can implement your own safety classifier in any programming language (Go, Ru
 | Preset Name | Model Architecture | Memory / Disk | Inference Latency (CPU) | Best For |
 | :--- | :--- | :--- | :--- | :--- |
 | **`modernbert`** | ModernBERT-bash-classifier | ~450 MB | ~15–30 ms | High accuracy fine-tuned semantic classification. |
-| **`minilm`** | all-MiniLM-L6-v2 ONNX | ~80 MB | ~5–10 ms | Constrained memory, CI/CD runners, fast local CPU. |
 | **`llm-proxy`** | OpenAI / Ollama / OpenRouter | 0 MB (Remote) | ~300–800 ms | Zero-shot evaluation using existing LLM keys. |
-| **`rules`** | Heuristic AST / Pattern Engine | <1 MB | <1 ms | Zero-ML testing and local mock environments. |
+| **`rules`** | Heuristic Regex / Pattern Engine | <1 MB | <1 ms | Zero-ML testing and local mock environments. |

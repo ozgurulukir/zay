@@ -8,13 +8,10 @@ A standalone, high-performance REST safety classifier service for Nova Agent she
 
 ```bash
 # Run with default ModernBERT ONNX model:
-uv run tools/classifier/server.py --port 8765
-
-# Or run with lightweight MiniLM model:
-uv run tools/classifier/server.py --model minilm --port 8765
+uv run -m tools.classifier.server --port 8765
 
 # Or run zero-ML rules mock engine:
-uv run tools/classifier/server.py --model rules --port 8765
+uv run -m tools.classifier.server --model rules --port 8765
 ```
 
 ### 2. Configure Nova Agent

@@ -47,7 +47,7 @@ Tool executions and filesystem modifications enforce strict lexical and realpath
 Lua plugin execution is confined to a protected runtime environment with strict per-dispatch instruction budgets (`resetInstructionBudget`) and memory limits.
 
 ### D. Optional External AI Safety Classifier
-For sensitive or high-risk development environments, users can enable a standalone REST safety classifier service (`tools/classifier/`) powered by Transformer models (ModernBERT, MiniLM) to perform deep semantic risk evaluation on generated shell commands.
+For sensitive or high-risk development environments, users can enable a standalone REST safety classifier service (`tools/classifier/`) powered by Transformer models (ModernBERT) to perform deep semantic risk evaluation on generated shell commands.
 
 ---
 

@@ -81,7 +81,7 @@ Nova employs a two-tier defense-in-depth safety architecture to evaluate shell t
    - Redirects into critical system paths (`/etc/`, `/boot/`, `C:\Windows\`, etc.)
 
 2. **Tier 2: External AI Safety Classifier (Optional & Pluggable):**
-   Nova can query a standalone REST safety service (`POST /classify`) powered by a fine-tuned Transformer model (ModernBERT, MiniLM) or an LLM safety proxy located in `tools/classifier/`. When marked unsafe, an interactive approval prompt is presented to the user.
+   Nova can query a standalone REST safety service (`POST /classify`) powered by a fine-tuned Transformer model (ModernBERT) or an LLM safety proxy located in `tools/classifier/`. When marked unsafe, an interactive approval prompt is presented to the user.
 
 For setup details, see [Wiki: Command Safety & Classifier Guide](wiki/SAFETY_CLASSIFIER.md).
 

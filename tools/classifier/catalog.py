@@ -39,13 +39,6 @@ CATALOG: dict[str, ModelSpec] = {
         onnx_file="model.onnx",
         factory=build_onnx_factory("model.onnx", 512),
     ),
-    "minilm": ModelSpec(
-        name="minilm",
-        description="MiniLM-L6-v2-bash-safety (~80MB) - Lightweight & fast CPU inference",
-        repo_id="nova-agent/MiniLM-L6-bash-safety",
-        onnx_file="model.onnx",
-        factory=build_onnx_factory("model.onnx", 256),
-    ),
     "rules": ModelSpec(
         name="rules",
         description="Built-in regex & token heuristic mock engine (<1MB, zero-ML)",

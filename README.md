@@ -37,7 +37,7 @@ Unlike IDE plugins that interrupt you with modal dialogues for every file read o
 - **No tedious click-prompts:** Reads, edits, builds, and standard commands run immediately without micro-confirmations.
 - **Two-Tier Command Safety Net:**
   - **Tier 1 — Built-in Deterministic Safety Matcher (Active by default):** Zero-dependency, sub-microsecond pattern engine in Zig (`bash_safety.zig`). Automatically intercepts high-risk destructive commands (e.g. `rm -rf /`, drive root wipes, `mkfs`, `dd`, fork bombs) and gates them behind explicit approval prompts.
-  - **Tier 2 — External AI Safety Classifier (Optional):** Plug in the standalone REST safety service (`tools/classifier/`) powered by Transformer models (ModernBERT, MiniLM) or an LLM safety proxy for deep contextual risk evaluation.
+  - **Tier 2 — External AI Safety Classifier (Optional):** Plug in the standalone REST safety service (`tools/classifier/`) powered by Transformer models (ModernBERT) or an LLM safety proxy for deep contextual risk evaluation.
   - *Runtime Check:* You can inspect your active safety tier at any time by running `/status`.
 - **Git Worktree Isolation:** When exploring risky changes or broad refactors, fork your workspace into isolated **Parallel Lanes** (`/parallel` or `lane spawn`). Workers are physically contained inside their worktree, keeping your main branch clean.
 - **Plugin Sandboxing & Execution Layer:**
@@ -114,7 +114,7 @@ nova --version
 Nova provides multi-tier safety guards for shell command execution (`bash` on Linux/macOS, `pwsh` on Windows):
 
 1. **Built-in Deterministic Safety Matcher (Default):** Zero-dependency AST and pattern analysis built directly into the native Zig binary. Intercepts destructive commands (`rm -rf /`, drive root wipes, fork bombs, critical system redirects) with zero latency.
-2. **AI-Powered Safety Classifier (Optional):** Plug in a standalone REST safety service powered by fine-tuned Transformer models (ModernBERT, MiniLM) or an LLM safety proxy:
+2. **AI-Powered Safety Classifier (Optional):** Plug in a standalone REST safety service powered by fine-tuned Transformer models (ModernBERT) or an LLM safety proxy:
 
 ```bash
 # Run standalone safety classifier via uv (port 8765):
