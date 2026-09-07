@@ -1259,11 +1259,7 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
         const path = working.path;
         const branch = working.branch;
 
-        const framed = std.fmt.allocPrint(
-            app.gpa,
-            "You are a worker agent in lane {s} on branch {s}. Your working directory is {s} — an isolated git worktree of the repo at {s}; work ONLY with relative paths inside it. The main tree is off-limits. Complete this task and report the result concisely. You cannot create lanes or worktrees.\n\n{s}",
-            .{ id, branch, path, repo, task },
-        ) catch {
+        const framed = workerPrompt(app.gpa, id, branch, path, repo, task) catch {
             // Rollback: re-park the lane to idle (frees the runtime we just
             // attached). `context` is owned by `lane.parent_context` now;
             // `parkFinishedWorker` leaves the lane idle and does not touch
@@ -1385,15 +1381,7 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
         app.gpa.free(wt_dest);
         return failResp(app.gpa, "lane: runtime create failed: {s}\n", .{@errorName(err)});
     };
-    runtime.agent.background_manager = app.background;
-    runtime.agent.mcp_manager = &app.mcp_manager;
-    runtime.agent.tool_registry = app.tool_registry;
-    runtime.agent.plugin_manager = &app.plugin_manager;
-    runtime.agent.lane_bridge = app.lane_bridge;
-    // A spawned worker is root-contained: its bash tool refuses `cd` out of the
-    // worktree, so a task prompt leaking the main-tree path can't drift the
-    // worker's writes into the main tree (L2).
-    runtime.agent.contained = true;
+    wireSpawnedAgent(app, runtime);
 
     const lane = app.gpa.create(Thread) catch {
         freeLaneContext(app.gpa, context);
@@ -1438,11 +1426,7 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
     // so a task that mentions the main tree's absolute path — e.g. the driver's
     // own cwd — doesn't steer the worker into `cd`-ing there. The bash
     // containment guard is the mechanical backstop (L2).
-    const framed = std.fmt.allocPrint(
-        app.gpa,
-        "You are a worker agent in lane {s} on branch {s}. Your working directory is {s} — an isolated git worktree of the repo at {s}; work ONLY with relative paths inside it. The main tree is off-limits. Complete this task and report the result concisely. You cannot create lanes or worktrees.\n\n{s}",
-        .{ id, wt_branch, wt_dest, repo, task },
-    ) catch {
+    const framed = workerPrompt(app.gpa, id, wt_branch, wt_dest, repo, task) catch {
         removeFailedSpawn(app, lane);
         return failResp(app.gpa, "lane: out of memory\n", .{});
     };
@@ -1458,6 +1442,41 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
         .{ id, wt_branch, path, id, id, id },
         id,
         path,
+    );
+}
+
+/// Wire a freshly-created `AgentRuntime`'s agent with the app's shared
+/// subsystems and mark it root-contained. Both spawn paths (a new worktree
+/// lane and waking a parked idle lane) wire identically, so the block lives
+/// here once.
+fn wireSpawnedAgent(app: *App, runtime: *runtime_mod.AgentRuntime) void {
+    runtime.agent.background_manager = app.background;
+    runtime.agent.mcp_manager = &app.mcp_manager;
+    runtime.agent.tool_registry = app.tool_registry;
+    runtime.agent.plugin_manager = &app.plugin_manager;
+    runtime.agent.lane_bridge = app.lane_bridge;
+    // A spawned worker is root-contained: its bash tool refuses `cd` out of the
+    // worktree, so a task prompt leaking the main-tree path can't drift the
+    // worker's writes into the main tree (L2).
+    runtime.agent.contained = true;
+}
+
+/// The shared worker-agent system framing for a lane: the task prompt with the
+/// worktree/branch containment rules prepended. Used both when resuming a
+/// parked lane for a new task (spawn) and when waking an idle lane — the two
+/// sites used to each embed this 4-line template verbatim.
+fn workerPrompt(
+    gpa: std.mem.Allocator,
+    id: []const u8,
+    branch: []const u8,
+    path: []const u8,
+    repo: []const u8,
+    task: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        gpa,
+        "You are a worker agent in lane {s} on branch {s}. Your working directory is {s} — an isolated git worktree of the repo at {s}; work ONLY with relative paths inside it. The main tree is off-limits. Complete this task and report the result concisely. You cannot create lanes or worktrees.\n\n{s}",
+        .{ id, branch, path, repo, task },
     );
 }
 
@@ -1490,15 +1509,7 @@ fn wakeIdleLane(app: *App, lane: *Thread, repo: []const u8, context: [][]u8) !vo
         runtime.deinit();
         app.gpa.destroy(runtime);
     }
-    runtime.agent.background_manager = app.background;
-    runtime.agent.mcp_manager = &app.mcp_manager;
-    runtime.agent.tool_registry = app.tool_registry;
-    runtime.agent.plugin_manager = &app.plugin_manager;
-    runtime.agent.lane_bridge = app.lane_bridge;
-    // A spawned worker is root-contained: its bash tool refuses `cd` out
-    // of the worktree (L2), so a task prompt leaking the main-tree path
-    // can't drift the worker's writes into the main tree.
-    runtime.agent.contained = true;
+    wireSpawnedAgent(app, runtime);
 
     // Adopt the spawner's naming context so the first turn can rename the
     // `nova/<hex>` branch, just like the fresh-worktree path. The caller
