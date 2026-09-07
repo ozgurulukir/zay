@@ -157,11 +157,7 @@ fn refuseOnIdleLane(app: *App) bool {
 /// menu, mcp, plugins, lanes, diff viewer) stay open. Returns true when a
 /// mode was closed.
 pub fn closeRuntimeBoundOverlays(app: *App, lane_id: []const u8) bool {
-    const runtime_bound = switch (app.mode) {
-        .session_picker, .provider_picker, .model_picker, .tree_picker, .save_message => true,
-        else => false,
-    };
-    if (!runtime_bound) return false;
+    if (!App.isRuntimeBound(app.mode)) return false;
 
     // Sub-state cleanup mirrors cancelMode: a pending model load must not
     // install into a picker that is about to close, session sub-states and
@@ -198,281 +194,295 @@ pub fn closeRuntimeBoundOverlays(app: *App, lane_id: []const u8) bool {
 }
 
 pub fn submitMode(app: *App) !bool {
-    // Transcript search: Enter jumps to the selected match (and closes search).
-    if (app.mode == .search) {
-        try app.acceptSearchSelection();
-        return true;
-    }
-    // Settings: Enter toggles the selected item.
-    if (app.mode == .settings) {
-        try tui.submitSettings(app);
-        return true;
-    }
-    if (app.mode == .provider_picker) {
-        // The provider-picker submit handlers (form submit, connect/sign-out
-        // codex) all deref `app.liveRuntime().?`; on a focused idle lane that
-        // is null → SIGABRT. Refuse with the idle-lane notice before any of
-        // them run. Opening a fresh entry form on an idle lane is blocked too
-        // — its submit would crash, so blocking at entry is consistent.
-        if (refuseOnIdleLane(app)) return true;
-        if (app.pickers.provider.stage == .form) {
-            if (app.pickers.provider.form_handle) |handle| {
-                switch (handle) {
-                    .builtin => |provider| provider_model.submitProviderSetup(app, provider) catch |err| try app.reportConnectionError(err),
-                    .dynamic => |provider| provider_model.submitDynamicProviderSetup(app, provider) catch |err| try app.reportConnectionError(err),
-                    .config => |provider| provider_model.submitConfigProviderSetup(app, provider) catch |err| try app.reportConnectionError(err),
+    // One arm per Mode: this switch is the single wiring site for Enter
+    // submit, and it is exhaustive — adding a Mode without an arm here is a
+    // compile error (the old if-chain silently fell through to `return false`
+    // for any mode it didn't list, so a forgotten mode was a no-op, not a
+    // build failure). The runtime-bound modes that would SIGABRT on a focused
+    // idle lane (session, provider, model) call `refuseOnIdleLane` first;
+    // `.command` is partially runtime-bound — only its
+    // .new/.resume_session/.timeline/.undo/.connect sub-commands deref the
+    // live runtime (`.command`'s crash set is sub-states, so it can't be
+    // expressed by `isRuntimeBound`).
+    switch (app.mode) {
+        // Transcript search: Enter jumps to the selected match (and closes search).
+        .search => {
+            try app.acceptSearchSelection();
+            return true;
+        },
+        // Settings: Enter toggles the selected item.
+        .settings => {
+            try tui.submitSettings(app);
+            return true;
+        },
+        .provider_picker => {
+            // The provider-picker submit handlers (form submit, connect/sign-out
+            // codex) all deref `app.liveRuntime().?`; on a focused idle lane that
+            // is null → SIGABRT. Refuse with the idle-lane notice before any of
+            // them run. Opening a fresh entry form on an idle lane is blocked too
+            // — its submit would crash, so blocking at entry is consistent.
+            if (refuseOnIdleLane(app)) return true;
+            if (app.pickers.provider.stage == .form) {
+                if (app.pickers.provider.form_handle) |handle| {
+                    switch (handle) {
+                        .builtin => |provider| provider_model.submitProviderSetup(app, provider) catch |err| try app.reportConnectionError(err),
+                        .dynamic => |provider| provider_model.submitDynamicProviderSetup(app, provider) catch |err| try app.reportConnectionError(err),
+                        .config => |provider| provider_model.submitConfigProviderSetup(app, provider) catch |err| try app.reportConnectionError(err),
+                    }
+                    return true;
                 }
                 return true;
             }
-            return true;
-        }
-        const filter = try app.peekPaletteInput();
-        defer app.gpa.free(filter);
-        if (app.pickers.provider.selectedAction(filter)) |action| {
-            switch (action) {
-                .connect_codex => provider_model.connectCodex(app) catch |err| try app.reportConnectionError(err),
-                .sign_out_codex => {
-                    if (app.isCodexSignedIn()) {
-                        provider_model.signOutCodex(app) catch |err| try app.reportConnectionError(err);
-                    } else {
-                        provider_model.connectCodex(app) catch |err| try app.reportConnectionError(err);
-                    }
-                },
-                .open_entry => |handle| provider_model.openProviderEntryForm(app, handle),
+            const filter = try app.peekPaletteInput();
+            defer app.gpa.free(filter);
+            if (app.pickers.provider.selectedAction(filter)) |action| {
+                switch (action) {
+                    .connect_codex => provider_model.connectCodex(app) catch |err| try app.reportConnectionError(err),
+                    .sign_out_codex => {
+                        if (app.isCodexSignedIn()) {
+                            provider_model.signOutCodex(app) catch |err| try app.reportConnectionError(err);
+                        } else {
+                            provider_model.connectCodex(app) catch |err| try app.reportConnectionError(err);
+                        }
+                    },
+                    .open_entry => |handle| provider_model.openProviderEntryForm(app, handle),
+                }
             }
-        }
-        return true;
-    }
-    if (app.mode == .model_picker) {
-        // `applySelectedModel` derefs `app.liveRuntime().?` (codex/config
-        // paths) — refuse on a focused idle lane instead of crashing.
-        if (refuseOnIdleLane(app)) return true;
-        provider_model.applySelectedModel(app) catch |err| try app.reportConnectionError(err);
-        return true;
-    }
-    if (app.mode == .session_picker) {
-        // Renaming and resume both route through `session_switcher`, which
-        // derefs `app.liveRuntime().?` (`home_dir`/`cwd`/`session_writer`).
-        // Refuse on a focused idle lane before the switch runs. The `.deleting`
-        // /`.blocked` dismiss-actions land here too; blocking them with the
-        // notice is strictly more informative than the silent no-op.
-        if (refuseOnIdleLane(app)) return true;
-        // Sub-states route their Enter submit here (routeKey intercepts
-        // Enter before it reaches handleCommandKey). Browsing falls
-        // through to the normal resume flow below.
-        switch (app.nav.session_action) {
-            .renaming => {
-                try app.confirmRenameSelectedSession();
-                return true;
-            },
-            // Delete requires 'y' (handled in handleCommandKey); Enter is
-            // a no-op so accidental Enter doesn't delete.
-            .deleting => return true,
-            // Blocked popup: Enter dismisses (handled in handleCommandKey).
-            .blocked => {
-                app.cancelSessionAction();
-                return true;
-            },
-            .browsing => {},
-        }
-        const summary = try app.selectedResumeSummary() orelse return true;
-        app.switchToSession(summary.id, summary.cwd) catch |err| {
-            // A lane delivery turn may have started from the tick while the
-            // picker was open. Report it but KEEP the picker (and selection)
-            // open so the user can retry once it finishes — the generic
-            // reporter resets the mode and would silently discard the
-            // user's open picker.
-            if (err == error.InFlightTurn) {
-                _ = app.thread.transcript.append(app.gpa, .notice, "agent", "A lane result is being delivered on this lane — press Enter again once it finishes to switch.") catch {};
-                return true;
-            }
-            try app.reportSessionSwitchError(err);
             return true;
-        };
-        return true;
-    }
-    if (app.mode == .tree_picker) {
-        if (app.pickers.tree.selectedNavigationId()) |id| {
-            // Switching to the current leaf is a no-op; just close.
-            if (!app.pickers.tree.selectedIsLeaf()) {
-                var buffer: [session_mod.entry_id_len]u8 = undefined;
-                @memcpy(buffer[0..], id);
-                app.navigateToEntry(buffer[0..]) catch |err| {
-                    try app.reportSessionSwitchError(err);
+        },
+        .model_picker => {
+            // `applySelectedModel` derefs `app.liveRuntime().?` (codex/config
+            // paths) — refuse on a focused idle lane instead of crashing.
+            if (refuseOnIdleLane(app)) return true;
+            provider_model.applySelectedModel(app) catch |err| try app.reportConnectionError(err);
+            return true;
+        },
+        .session_picker => {
+            // Renaming and resume both route through `session_switcher`, which
+            // derefs `app.liveRuntime().?` (`home_dir`/`cwd`/`session_writer`).
+            // Refuse on a focused idle lane before the switch runs. The `.deleting`
+            // /`.blocked` dismiss-actions land here too; blocking them with the
+            // notice is strictly more informative than the silent no-op.
+            if (refuseOnIdleLane(app)) return true;
+            // Sub-states route their Enter submit here (routeKey intercepts
+            // Enter before it reaches handleCommandKey). Browsing falls
+            // through to the normal resume flow below.
+            switch (app.nav.session_action) {
+                .renaming => {
+                    try app.confirmRenameSelectedSession();
                     return true;
-                };
+                },
+                // Delete requires 'y' (handled in handleCommandKey); Enter is
+                // a no-op so accidental Enter doesn't delete.
+                .deleting => return true,
+                // Blocked popup: Enter dismisses (handled in handleCommandKey).
+                .blocked => {
+                    app.cancelSessionAction();
+                    return true;
+                },
+                .browsing => {},
             }
-        }
-        app.mode = .normal;
-        app.clearInput();
-        app.clearPaletteInput();
-        return true;
-    }
-    // Theme picker: Enter applies the selected (filtered) theme.
-    if (app.mode == .theme_picker) {
-        const filter = try app.peekPaletteInput();
-        defer app.gpa.free(filter);
-        app.clearPaletteInput();
-        app.clearInput();
-        const count = theme_picker.countMatching(app.theme_registry.slice(), filter);
-        if (app.pickers.theme.selection < count) {
-            if (theme_picker.selectedName(app.theme_registry.slice(), filter, app.pickers.theme.selection)) |name| {
-                theme_lifecycle.applyTheme(app, name) catch |err| try theme_lifecycle.reportThemeError(app, err);
-            }
-        } else {
-            // Nothing to apply (a filter removed the selected row). This is a
-            // non-commit exit from `.theme_picker`, so revert any live preview
-            // (M2) instead of leaving it silently active.
-            theme_lifecycle.revertThemePreview(app);
-        }
-        app.mode = .normal;
-        return true;
-    }
-    if (app.mode == .save_message) {
-        const raw = try app.peekPaletteInput();
-        defer app.gpa.free(raw);
-        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-        // Require a non-empty message — Enter on a blank prompt is a no-op so
-        // the user can't accidentally save with no commit message.
-        if (trimmed.len == 0) return true;
-        const message = try app.gpa.dupe(u8, trimmed);
-        defer app.gpa.free(message);
-        app.mode = .normal;
-        app.clearInput();
-        app.clearPaletteInput();
-        app.saveActiveLane(message) catch |err| try app.reportLaneError(err);
-        return true;
-    }
-    if (app.mode == .lanes) {
-        // Manage mode acts on M/X (handled in handleLanesKey); Enter only
-        // confirms a merge-destination choice.
-        if (app.nav.lanes_purpose == .merge_dest) try app.confirmMergeDest();
-        return true;
-    }
-    if (app.mode == .command) {
-        const filter = try app.peekPaletteInput();
-        defer app.gpa.free(filter);
-        // Argument fast-path: `/theme <name>` (or `theme <name>` after the
-        // palette strips the slash) applies immediately, bypassing the fuzzy
-        // `resolveCommand`. The trailing name does not fuzzy-match the `Theme`
-        // row (the filter is longer than the name), so without this the arg
-        // would be dropped. Must precede `resolveCommand`.
-        if (theme_lifecycle.parseThemeArg(filter)) |arg| {
-            app.mode = .normal;
-            app.clearPaletteInput();
-            app.clearInput();
-            theme_lifecycle.applyTheme(app, arg) catch |err| try theme_lifecycle.reportThemeError(app, err);
-            return true;
-        }
-        if (resolveCommand(app, filter)) |command| {
-            // These deref `app.liveRuntime().?` down their call chains
-            // (session_switcher / provider_model.refreshProviderApiKeys);
-            // refuse on a focused idle lane BEFORE clearing the command bar,
-            // so the user's typed `/resume` survives the refuse (matches the
-            // picker guards above and beginSubmit's TD-2 preserve-input rule).
-            // The other commands are idle-lane-safe (self-guarded or
-            // runtime-free) and don't reach this guard.
-            const crashes_on_idle = switch (command) {
-                .new, .resume_session, .timeline, .undo, .connect => true,
-                else => false,
+            const summary = try app.selectedResumeSummary() orelse return true;
+            app.switchToSession(summary.id, summary.cwd) catch |err| {
+                // A lane delivery turn may have started from the tick while the
+                // picker was open. Report it but KEEP the picker (and selection)
+                // open so the user can retry once it finishes — the generic
+                // reporter resets the mode and would silently discard the
+                // user's open picker.
+                if (err == error.InFlightTurn) {
+                    _ = app.thread.transcript.append(app.gpa, .notice, "agent", "A lane result is being delivered on this lane — press Enter again once it finishes to switch.") catch {};
+                    return true;
+                }
+                try app.reportSessionSwitchError(err);
+                return true;
             };
-            if (crashes_on_idle and refuseOnIdleLane(app)) return true;
+            return true;
+        },
+        .tree_picker => {
+            if (app.pickers.tree.selectedNavigationId()) |id| {
+                // Switching to the current leaf is a no-op; just close.
+                if (!app.pickers.tree.selectedIsLeaf()) {
+                    var buffer: [session_mod.entry_id_len]u8 = undefined;
+                    @memcpy(buffer[0..], id);
+                    app.navigateToEntry(buffer[0..]) catch |err| {
+                        try app.reportSessionSwitchError(err);
+                        return true;
+                    };
+                }
+            }
+            app.mode = .normal;
+            app.clearInput();
+            app.clearPaletteInput();
+            return true;
+        },
+        // Theme picker: Enter applies the selected (filtered) theme.
+        .theme_picker => {
+            const filter = try app.peekPaletteInput();
+            defer app.gpa.free(filter);
             app.clearPaletteInput();
             app.clearInput();
-            switch (command) {
-                .new => app.switchToNewSession() catch |err| try app.reportSessionSwitchError(err),
-                .resume_session => app.openResumePicker() catch |err| try app.reportSessionSwitchError(err),
-                .timeline => diff_lifecycle.openTimelineSelector(app) catch |err| try app.reportSessionSwitchError(err),
-                .undo => {
-                    app.mode = .normal;
-                    app.undoLastTurn() catch |err| try app.reportSessionSwitchError(err);
-                },
-                .connect => provider_model.openProviderPicker(app) catch |err| try app.reportConnectionError(err),
-                .model => provider_model.openModelPicker(app) catch |err| try app.reportConnectionError(err),
-                .mcp => tui.openMcp(app),
-                .plugins => tui.openPlugins(app),
-                .settings => tui.openSettings(app),
-                .theme => tui.openThemePicker(app),
-                .diff => diff_lifecycle.openDiffViewer(app) catch |err| try diff_lifecycle.reportDiffError(app, err),
-                .parallel => app.createParallelLane() catch |err| try app.reportLaneError(err),
-                .save => app.beginSave() catch |err| try app.reportLaneError(err),
-                .search => try app.openSearch(),
-                .close => app.closeActiveLane() catch |err| try app.reportLaneError(err),
-                .merge => app.createMergePicker() catch |err| try app.reportLaneError(err),
-                .lanes => app.openLanesPicker() catch |err| try app.reportLaneError(err),
-                .clear => {
-                    app.mode = .normal;
-                    try app.clearConversation();
-                },
-                .compact => {
-                    app.mode = .normal;
-                    // Non-blocking: the summarizer runs on the agent's own
-                    // thread and the tick loop polls it to completion, so the
-                    // UI never freezes on the request.
-                    _ = try compaction_lifecycle.requestManualCompact(app);
-                },
-                .status => {
-                    app.mode = .normal;
-                    var status_buf: [1024]u8 = undefined;
-                    const ms = tui_status.modelStatus(app.liveRuntime(), app.cached_config);
-                    const provider_name = if (ms) |m| m.provider else "none";
-                    const model_name = if (ms) |m| m.model else "none";
-                    const classifier_status: []const u8 = if (app.liveRuntime()) |rt|
-                        (if (rt.agent.bash_classifier_url != null) "External Endpoint (Active)" else "Built-in Pattern Matcher (Active)")
-                    else
-                        "none";
-                    const git_branch = app.metrics.git_label;
-                    const bg_count = app.runningBackgroundCount();
-                    const active_lane = app.activeIndex() + 1;
-                    const total_lanes = app.threadsCount();
-                    const sid: []const u8 = if (app.thread.id) |id| id.slice()[0..@min(8, id.bytes.len)] else "none";
-                    const status_text = try std.fmt.bufPrint(
-                        &status_buf,
-                        "System Status:\n" ++
-                            "  • Provider: {s}\n" ++
-                            "  • Model: {s}\n" ++
-                            "  • Command Safety: {s}\n" ++
-                            "  • Git Branch: {s}\n" ++
-                            "  • Active Lane: {d}/{d}\n" ++
-                            "  • Background Tasks: {d} running\n" ++
-                            "  • Session ID: {s}",
-                        .{ provider_name, model_name, classifier_status, git_branch, active_lane, total_lanes, bg_count, sid[0..@min(8, sid.len)] },
-                    );
-                    _ = try app.thread.transcript.append(app.gpa, .notice, "system", status_text);
-                },
-                .skills => {
-                    app.mode = .normal;
-                    const runtime = app.liveRuntime();
-                    const list = if (runtime) |rt| try skill_mod.formatSkillsList(app.gpa, rt.skills) else try app.gpa.dupe(u8, "No active runtime.");
-                    defer app.gpa.free(list);
-                    _ = try app.thread.transcript.append(app.gpa, .notice, "skills", list);
-                },
-                .help => {
-                    app.mode = .help;
-                },
-                .export_session => {
-                    app.mode = .normal;
-                    const sid: []const u8 = if (app.thread.id) |id| id.slice()[0..@min(8, id.bytes.len)] else "session";
-                    var export_buf: [256]u8 = undefined;
-                    const notice_text = try std.fmt.bufPrint(&export_buf, "Exported session conversation transcript ({s}) to Markdown format.", .{sid});
-                    _ = try app.thread.transcript.append(app.gpa, .notice, "export", notice_text);
-                },
-                .copy => {
-                    app.mode = .normal;
-                    _ = try clipboard_helper.copySelectedTranscriptBlock(app);
-                },
-                .paste => {
-                    app.mode = .normal;
-                    _ = try clipboard_helper.pasteFromSystemClipboard(app);
-                },
-                .exit_cmd => {
-                    app.nav.quit = .confirmed;
-                },
+            const count = theme_picker.countMatching(app.theme_registry.slice(), filter);
+            if (app.pickers.theme.selection < count) {
+                if (theme_picker.selectedName(app.theme_registry.slice(), filter, app.pickers.theme.selection)) |name| {
+                    theme_lifecycle.applyTheme(app, name) catch |err| try theme_lifecycle.reportThemeError(app, err);
+                }
+            } else {
+                // Nothing to apply (a filter removed the selected row). This is a
+                // non-commit exit from `.theme_picker`, so revert any live preview
+                // (M2) instead of leaving it silently active.
+                theme_lifecycle.revertThemePreview(app);
             }
-        }
-        return true;
+            app.mode = .normal;
+            return true;
+        },
+        .save_message => {
+            const raw = try app.peekPaletteInput();
+            defer app.gpa.free(raw);
+            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+            // Require a non-empty message — Enter on a blank prompt is a no-op so
+            // the user can't accidentally save with no commit message.
+            if (trimmed.len == 0) return true;
+            const message = try app.gpa.dupe(u8, trimmed);
+            defer app.gpa.free(message);
+            app.mode = .normal;
+            app.clearInput();
+            app.clearPaletteInput();
+            app.saveActiveLane(message) catch |err| try app.reportLaneError(err);
+            return true;
+        },
+        .lanes => {
+            // Manage mode acts on M/X (handled in handleLanesKey); Enter only
+            // confirms a merge-destination choice.
+            if (app.nav.lanes_purpose == .merge_dest) try app.confirmMergeDest();
+            return true;
+        },
+        .command => {
+            const filter = try app.peekPaletteInput();
+            defer app.gpa.free(filter);
+            // Argument fast-path: `/theme <name>` (or `theme <name>` after the
+            // palette strips the slash) applies immediately, bypassing the fuzzy
+            // `resolveCommand`. The trailing name does not fuzzy-match the `Theme`
+            // row (the filter is longer than the name), so without this the arg
+            // would be dropped. Must precede `resolveCommand`.
+            if (theme_lifecycle.parseThemeArg(filter)) |arg| {
+                app.mode = .normal;
+                app.clearPaletteInput();
+                app.clearInput();
+                theme_lifecycle.applyTheme(app, arg) catch |err| try theme_lifecycle.reportThemeError(app, err);
+                return true;
+            }
+            if (resolveCommand(app, filter)) |command| {
+                // These deref `app.liveRuntime().?` down their call chains
+                // (session_switcher / provider_model.refreshProviderApiKeys);
+                // refuse on a focused idle lane BEFORE clearing the command bar,
+                // so the user's typed `/resume` survives the refuse (matches the
+                // picker guards above and beginSubmit's TD-2 preserve-input rule).
+                // The other commands are idle-lane-safe (self-guarded or
+                // runtime-free) and don't reach this guard.
+                const crashes_on_idle = switch (command) {
+                    .new, .resume_session, .timeline, .undo, .connect => true,
+                    else => false,
+                };
+                if (crashes_on_idle and refuseOnIdleLane(app)) return true;
+                app.clearPaletteInput();
+                app.clearInput();
+                switch (command) {
+                    .new => app.switchToNewSession() catch |err| try app.reportSessionSwitchError(err),
+                    .resume_session => app.openResumePicker() catch |err| try app.reportSessionSwitchError(err),
+                    .timeline => diff_lifecycle.openTimelineSelector(app) catch |err| try app.reportSessionSwitchError(err),
+                    .undo => {
+                        app.mode = .normal;
+                        app.undoLastTurn() catch |err| try app.reportSessionSwitchError(err);
+                    },
+                    .connect => provider_model.openProviderPicker(app) catch |err| try app.reportConnectionError(err),
+                    .model => provider_model.openModelPicker(app) catch |err| try app.reportConnectionError(err),
+                    .mcp => tui.openMcp(app),
+                    .plugins => tui.openPlugins(app),
+                    .settings => tui.openSettings(app),
+                    .theme => tui.openThemePicker(app),
+                    .diff => diff_lifecycle.openDiffViewer(app) catch |err| try diff_lifecycle.reportDiffError(app, err),
+                    .parallel => app.createParallelLane() catch |err| try app.reportLaneError(err),
+                    .save => app.beginSave() catch |err| try app.reportLaneError(err),
+                    .search => try app.openSearch(),
+                    .close => app.closeActiveLane() catch |err| try app.reportLaneError(err),
+                    .merge => app.createMergePicker() catch |err| try app.reportLaneError(err),
+                    .lanes => app.openLanesPicker() catch |err| try app.reportLaneError(err),
+                    .clear => {
+                        app.mode = .normal;
+                        try app.clearConversation();
+                    },
+                    .compact => {
+                        app.mode = .normal;
+                        // Non-blocking: the summarizer runs on the agent's own
+                        // thread and the tick loop polls it to completion, so the
+                        // UI never freezes on the request.
+                        _ = try compaction_lifecycle.requestManualCompact(app);
+                    },
+                    .status => {
+                        app.mode = .normal;
+                        var status_buf: [1024]u8 = undefined;
+                        const ms = tui_status.modelStatus(app.liveRuntime(), app.cached_config);
+                        const provider_name = if (ms) |m| m.provider else "none";
+                        const model_name = if (ms) |m| m.model else "none";
+                        const classifier_status: []const u8 = if (app.liveRuntime()) |rt|
+                            (if (rt.agent.bash_classifier_url != null) "External Endpoint (Active)" else "Built-in Pattern Matcher (Active)")
+                        else
+                            "none";
+                        const git_branch = app.metrics.git_label;
+                        const bg_count = app.runningBackgroundCount();
+                        const active_lane = app.activeIndex() + 1;
+                        const total_lanes = app.threadsCount();
+                        const sid: []const u8 = if (app.thread.id) |id| id.slice()[0..@min(8, id.bytes.len)] else "none";
+                        const status_text = try std.fmt.bufPrint(
+                            &status_buf,
+                            "System Status:\n" ++
+                                "  • Provider: {s}\n" ++
+                                "  • Model: {s}\n" ++
+                                "  • Command Safety: {s}\n" ++
+                                "  • Git Branch: {s}\n" ++
+                                "  • Active Lane: {d}/{d}\n" ++
+                                "  • Background Tasks: {d} running\n" ++
+                                "  • Session ID: {s}",
+                            .{ provider_name, model_name, classifier_status, git_branch, active_lane, total_lanes, bg_count, sid[0..@min(8, sid.len)] },
+                        );
+                        _ = try app.thread.transcript.append(app.gpa, .notice, "system", status_text);
+                    },
+                    .skills => {
+                        app.mode = .normal;
+                        const runtime = app.liveRuntime();
+                        const list = if (runtime) |rt| try skill_mod.formatSkillsList(app.gpa, rt.skills) else try app.gpa.dupe(u8, "No active runtime.");
+                        defer app.gpa.free(list);
+                        _ = try app.thread.transcript.append(app.gpa, .notice, "skills", list);
+                    },
+                    .help => {
+                        app.mode = .help;
+                    },
+                    .export_session => {
+                        app.mode = .normal;
+                        const sid: []const u8 = if (app.thread.id) |id| id.slice()[0..@min(8, id.bytes.len)] else "session";
+                        var export_buf: [256]u8 = undefined;
+                        const notice_text = try std.fmt.bufPrint(&export_buf, "Exported session conversation transcript ({s}) to Markdown format.", .{sid});
+                        _ = try app.thread.transcript.append(app.gpa, .notice, "export", notice_text);
+                    },
+                    .copy => {
+                        app.mode = .normal;
+                        _ = try clipboard_helper.copySelectedTranscriptBlock(app);
+                    },
+                    .paste => {
+                        app.mode = .normal;
+                        _ = try clipboard_helper.pasteFromSystemClipboard(app);
+                    },
+                    .exit_cmd => {
+                        app.nav.quit = .confirmed;
+                    },
+                }
+            }
+            return true;
+        },
+        // Modes with no Enter action: the switch is exhaustive, so these must
+        // be listed to compile. (This is the old fall-through `return false`.)
+        .normal, .diff_viewer, .help, .mcp, .plugins => return false,
     }
-    return false;
 }
 
 pub fn openCommandMenu(app: *App) !void {
@@ -872,6 +882,30 @@ test "closeRuntimeBoundOverlays leaves runtime-free modes open" {
         try std.testing.expect(!closeRuntimeBoundOverlays(&app, "w1"));
         try std.testing.expectEqual(m, app.mode);
     }
+}
+test "runtime-bound mode set is exhaustive and stable" {
+    // Drives `App.isRuntimeBound` over every Mode value and pins the exact
+    // classification. The helper is the single source of truth for
+    // `closeRuntimeBoundOverlays`, so this test fails if a mode is silently
+    // added to or removed from the runtime-bound set (e.g. a new
+    // runtime-deref picker that isn't force-closed on park, or a
+    // runtime-free mode that gets wrongly force-closed). Add the new mode
+    // here when you change the set.
+    inline for (std.enums.values(App.Mode)) |m| {
+        const expected = switch (m) {
+            .session_picker, .provider_picker, .model_picker, .tree_picker, .save_message => true,
+            .normal, .command, .diff_viewer, .lanes, .help, .settings, .mcp, .plugins, .search, .theme_picker => false,
+        };
+        try std.testing.expectEqual(expected, App.isRuntimeBound(m));
+    }
+    // Set sizes: 5 runtime-bound, 10 runtime-free.
+    var bound: u32 = 0;
+    var free: u32 = 0;
+    inline for (std.enums.values(App.Mode)) |m| {
+        if (App.isRuntimeBound(m)) bound += 1 else free += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 5), bound);
+    try std.testing.expectEqual(@as(u32, 10), free);
 }
 
 test "submitMode keeps the session picker open on InFlightTurn" {
