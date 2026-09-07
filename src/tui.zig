@@ -251,6 +251,28 @@ pub const App = struct {
     pub const ctrl_c_double_press_ms: u32 = 1500;
     pub const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message, lanes, help, settings, mcp, plugins, search, theme_picker };
     pub const LanesPurpose = app_state.NavState.LanesPurpose;
+
+    /// True when the mode's key/submit handlers need a live agent (they deref
+    /// `app.liveRuntime()` — either `?.`, which crashes on a focused idle lane,
+    /// or `orelse`, which fails cleanly). Single source of truth for the
+    /// runtime-bound set. `closeRuntimeBoundOverlays` (park) consults it to
+    /// decide which open panels to force-close when the focused lane loses its
+    /// runtime. The submit-time `refuseOnIdleLane` refusals overlap this set but
+    /// are expressed per-branch in `submitMode` (a few runtime-bound modes —
+    /// `tree_picker`, `save_message` — use `orelse`, so they don't crash and
+    /// aren't refused; and `.command`'s crash-prone paths are sub-states, not a
+    /// mode). A mode is runtime-free when it needs no live agent: the
+    /// pure-display modes (help, mcp, plugins) plus the modes that act on
+    /// in-process state only (settings, search, theme, command menu, lanes list,
+    /// diff viewer) and `.normal`. Wiring a new runtime-deref mode? List it here
+    /// — the regression test `runtime-bound mode set is exhaustive and stable`
+    /// keeps this in lockstep with `closeRuntimeBoundOverlays`.
+    pub fn isRuntimeBound(mode: Mode) bool {
+        return switch (mode) {
+            .session_picker, .provider_picker, .model_picker, .tree_picker, .save_message => true,
+            .normal, .command, .diff_viewer, .lanes, .help, .settings, .mcp, .plugins, .search, .theme_picker => false,
+        };
+    }
     pub const ModelCatalog = enum { connected_provider, openai_codex };
     pub const ModelScope = model_catalogue.ModelScope;
 
