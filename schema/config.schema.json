@@ -279,6 +279,11 @@
           "default": true,
           "description": "When true, reaching toolCallLimitPerTurn does not fail the turn: the loop exits cleanly, queued user messages are delivered, a continuation hint is left in history, and the TUI renders a resumable notice. When false, the turn ends with a ToolCallLimit failure as in previous releases."
         },
+        "autoContinueOnLengthCut": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true, a chat-completions response terminated by the provider output token cap (finish_reason=length) with no tool calls is continued once automatically: a continuation hint is appended and the model re-requested inside the same turn. Guards against providers whose default completion budget severs the tool_call section after the prose (half-finished tool calls). When false, the cut only surfaces as a transcript notice. The legacy snake_case spelling auto_continue_on_length_cut is parsed for compat but not schema-valid."
+        },
         "compaction": { "$ref": "#/$defs/CompactionSettings" }
       },
       "additionalProperties": false

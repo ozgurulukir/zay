@@ -120,6 +120,15 @@ pub const ContextSettings = struct {
     /// TUI render a resumable notice. When false, the turn ends with
     /// `error.ToolCallLimit` as in previous releases.
     soft_stop_on_tool_call_limit: ?bool = null,
+    /// When true (default), a chat-completions response terminated by the
+    /// provider's output token cap (`finish_reason=length`) with no tool
+    /// calls is continued ONCE automatically: a continuation hint is
+    /// appended and the model re-requested inside the same turn. Providers
+    /// whose default completion budget severs the tool_call section after
+    /// the prose (half-finished tool calls) otherwise end the turn silently
+    /// as a text-only message. When false, the cut only surfaces as a
+    /// transcript notice.
+    auto_continue_on_length_cut: ?bool = null,
     compaction: CompactionSettings = .{},
 };
 

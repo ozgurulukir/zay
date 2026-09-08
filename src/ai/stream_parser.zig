@@ -142,11 +142,14 @@ pub fn readStream(
     // so the final usage-only chunk's `change.usage` reaches the Turn. The
     // server emits at most one usage chunk; the last one observed wins.
     var usage: ?ai.Usage = null;
+    // Same last-wins accumulation for the terminal `finish_reason`.
+    var finish_reason: ?ai.FinishReason = null;
     var source: stream_part.Source = .{ .reader = reader };
     while (try source.next(gpa)) |data| {
         defer gpa.free(data);
         const change = try parseStreamChunk(gpa, data, &content, &reasoning, &stream);
         if (change.usage) |chunk_usage| usage = chunk_usage;
+        if (change.finish_reason) |chunk_finish| finish_reason = chunk_finish;
         if (!content_sized and content.items.len > 0) {
             try content.ensureTotalCapacity(gpa, content.items.len * 4);
             content_sized = true;
@@ -170,7 +173,19 @@ pub fn readStream(
         try blocks.append(gpa, .{ .text = .{ .text = try content.toOwnedSlice(gpa) } });
     }
     for (stream.builders.items, 0..) |*builder, i| {
-        if (builder.name.items.len == 0) continue;
+        if (builder.name.items.len == 0) {
+            // A builder that streamed an id or arguments but never a name is
+            // a provider truncation/shape bug (the tool_call section was
+            // severed mid-flight). Skipping it silently turned the turn into
+            // a text-only message that looked complete — make it visible.
+            if (builder.id.items.len > 0 or builder.arguments.items.len > 0) {
+                log.warn(
+                    "readStream.nameless_tool_call_dropped builder[{d}] id_len={d} args_len={d} model={s} — tool_call section likely truncated by the provider",
+                    .{ i, builder.id.items.len, builder.arguments.items.len, stream.model },
+                );
+            }
+            continue;
+        }
         log.info(
             "readStream.builder[{d}] name={s} id_len={d} args_len={d}",
             .{ i, builder.name.items, builder.id.items.len, builder.arguments.items.len },
@@ -180,8 +195,8 @@ pub fn readStream(
     if (stream.dropped > 0) {
         log.warn("readStream.dropped dropped={d} max_calls={d} model={s}", .{ stream.dropped, stream.max_calls, stream.model });
     }
-    log.info("readStream.done content_len={d} reasoning_len={d} blocks={d}", .{ content.items.len, reasoning.items.len, blocks.items.len });
-    return .{ .assistant = .{ .assistant = .{ .content = try blocks.toOwnedSlice(gpa) } }, .usage = usage };
+    log.info("readStream.done content_len={d} reasoning_len={d} blocks={d} finish_reason={s}", .{ content.items.len, reasoning.items.len, blocks.items.len, if (finish_reason) |f| @tagName(f) else "none" });
+    return .{ .assistant = .{ .assistant = .{ .content = try blocks.toOwnedSlice(gpa) } }, .usage = usage, .finish_reason = finish_reason };
 }
 
 pub const ChunkChange = struct {
@@ -192,6 +207,10 @@ pub const ChunkChange = struct {
     /// Token usage when this chunk was the final usage-only chunk; otherwise
     /// null. Does not affect `empty()` — a usage chunk emits no callbacks.
     usage: ?ai.Usage = null,
+    /// Terminal `finish_reason` when this chunk carried one (non-final
+    /// chunks stream `"finish_reason": null`). Does not affect `empty()`,
+    /// mirroring `usage`: terminal metadata emits no callbacks.
+    finish_reason: ?ai.FinishReason = null,
 
     pub fn empty(self: *const ChunkChange) bool {
         if (self.content_start != null) return false;
@@ -381,10 +400,38 @@ fn parseChoiceObject(
     while (try nextObjectKey(scanner)) |key| {
         if (std.mem.eql(u8, key, "delta")) {
             try parseDeltaObject(gpa, scanner, content, reasoning, stream, change);
+        } else if (std.mem.eql(u8, key, "finish_reason")) {
+            try parseFinishReasonValue(gpa, scanner, change);
         } else {
             try scanner.skipValue();
         }
     }
+}
+
+/// Parse a choice's `finish_reason`: `null` on every non-final chunk, a
+/// short enum-like string on the last one. Garbage from a broken proxy (a
+/// number/bool/object where the reason should be) is skipped wholesale — an
+/// unknown or malformed reason must never kill a turn whose content already
+/// streamed. Unmapped strings collapse to `.other` for the same reason.
+fn parseFinishReasonValue(gpa: std.mem.Allocator, scanner: *Scanner, change: *ChunkChange) !void {
+    const peeked = try scanner.peekNextTokenType();
+    if (peeked != .string and peeked != .null) {
+        try scanner.skipValue();
+        return;
+    }
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    if (try appendStringValue(scanner, gpa, &buf, .allow_null)) {
+        change.finish_reason = parseFinishReason(buf.items);
+    }
+}
+
+fn parseFinishReason(raw: []const u8) ai.FinishReason {
+    if (std.mem.eql(u8, raw, "stop")) return .stop;
+    if (std.mem.eql(u8, raw, "length")) return .length;
+    if (std.mem.eql(u8, raw, "tool_calls")) return .tool_calls;
+    if (std.mem.eql(u8, raw, "content_filter")) return .content_filter;
+    return .other;
 }
 
 fn parseDeltaObject(
@@ -784,6 +831,90 @@ test "readStream drops forked tool calls beyond max_calls (provider reuses index
     try std.testing.expect(turn.assistant.assistant.content[0] == .tool_call);
     try std.testing.expectEqualStrings("bash", turn.assistant.assistant.content[0].tool_call.name);
     try std.testing.expectEqualStrings("call_a", turn.assistant.assistant.content[0].tool_call.call_id.slice());
+}
+
+test "readStream surfaces finish_reason from the final chunk" {
+    // Non-final chunks stream `"finish_reason": null`; the terminal chunk
+    // carries the reason. It must reach the Turn so the agent can react to a
+    // `length` cut (output token cap severing the tool_call section).
+    const gpa = std.testing.allocator;
+    const stream =
+        "data: {\"choices\":[{\"finish_reason\":null,\"delta\":{\"role\":\"assistant\",\"content\":\"Plan 85'e ekliyorum:\"}}]}\n" ++
+        "data: {\"choices\":[{\"finish_reason\":\"length\",\"delta\":{}}]}\n" ++
+        "data: [DONE]\n";
+    var reader: std.Io.Reader = .fixed(stream);
+    var tool_call_seq: u64 = 0;
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 16, "deepseek-v4-flash");
+    defer turn.deinit(gpa);
+    try std.testing.expectEqual(ai.FinishReason.length, turn.finish_reason.?);
+    try std.testing.expectEqual(@as(usize, 1), turn.assistant.assistant.content.len);
+    try std.testing.expect(turn.assistant.assistant.content[0] == .text);
+}
+
+test "readStream finish_reason accumulates last-wins across chunks" {
+    // Later non-null values win (mirroring usage); nulls after a value don't
+    // clobber it. Unknown strings collapse to `.other` instead of erroring.
+    const gpa = std.testing.allocator;
+    const stream =
+        "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{\"content\":\"a\"}}]}\n" ++
+        "data: {\"choices\":[{\"finish_reason\":\"length\",\"delta\":{\"content\":\"b\"}}]}\n" ++
+        "data: {\"choices\":[{\"finish_reason\":null,\"delta\":{}}]}\n" ++
+        "data: [DONE]\n";
+    var reader: std.Io.Reader = .fixed(stream);
+    var tool_call_seq: u64 = 0;
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 16, "test-model");
+    defer turn.deinit(gpa);
+    try std.testing.expectEqual(ai.FinishReason.length, turn.finish_reason.?);
+
+    const unknown =
+        "data: {\"choices\":[{\"finish_reason\":\"server_overloaded\",\"delta\":{}}]}\n" ++
+        "data: [DONE]\n";
+    var unknown_reader: std.Io.Reader = .fixed(unknown);
+    var unknown_turn = try readStream(gpa, &unknown_reader, ai.streamNoop(), &tool_call_seq, 16, "test-model");
+    defer unknown_turn.deinit(gpa);
+    try std.testing.expectEqual(ai.FinishReason.other, unknown_turn.finish_reason.?);
+
+    const none =
+        "data: {\"choices\":[{\"finish_reason\":null,\"delta\":{\"content\":\"x\"}}]}\n" ++
+        "data: [DONE]\n";
+    var none_reader: std.Io.Reader = .fixed(none);
+    var none_turn = try readStream(gpa, &none_reader, ai.streamNoop(), &tool_call_seq, 16, "test-model");
+    defer none_turn.deinit(gpa);
+    try std.testing.expectEqual(@as(?ai.FinishReason, null), none_turn.finish_reason);
+}
+
+test "readStream drops a nameless tool call that streamed arguments" {
+    // H3 signature: the tool_call section was severed after the arguments
+    // started but before the name arrived. The call must not surface as a
+    // block (the warn log is the visibility channel); the turn still
+    // completes, now carrying finish_reason so the agent can flag it.
+    const gpa = std.testing.allocator;
+    const stream =
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_x\",\"function\":{\"name\":null,\"arguments\":\"{\\\"command\\\"\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n" ++
+        "data: [DONE]\n";
+    var reader: std.Io.Reader = .fixed(stream);
+    var tool_call_seq: u64 = 0;
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 16, "test-model");
+    defer turn.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), turn.assistant.assistant.content.len);
+    try std.testing.expectEqual(ai.FinishReason.tool_calls, turn.finish_reason.?);
+}
+
+test "readStream tolerates non-string finish_reason garbage from a proxy" {
+    // A number/bool/object where the reason should be must be skipped, not
+    // abort the stream — the prose already streamed would otherwise be lost.
+    const gpa = std.testing.allocator;
+    const stream =
+        "data: {\"choices\":[{\"finish_reason\":7,\"delta\":{\"content\":\"partial\"}}]}\n" ++
+        "data: {\"choices\":[{\"finish_reason\":{},\"delta\":{}}]}\n" ++
+        "data: [DONE]\n";
+    var reader: std.Io.Reader = .fixed(stream);
+    var tool_call_seq: u64 = 0;
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 16, "test-model");
+    defer turn.deinit(gpa);
+    try std.testing.expectEqual(@as(?ai.FinishReason, null), turn.finish_reason);
+    try std.testing.expectEqualStrings("partial", turn.assistant.assistant.content[0].text.text);
 }
 
 const TestObserverCtx = struct {
