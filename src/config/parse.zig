@@ -225,6 +225,7 @@ fn applyContextOverlay(target: *ContextSettings, updates: ContextSettings) void 
     if (updates.disable_prompt_cache != null) target.disable_prompt_cache = updates.disable_prompt_cache;
     if (updates.tool_call_limit_per_turn != null) target.tool_call_limit_per_turn = updates.tool_call_limit_per_turn;
     if (updates.soft_stop_on_tool_call_limit != null) target.soft_stop_on_tool_call_limit = updates.soft_stop_on_tool_call_limit;
+    if (updates.auto_continue_on_length_cut != null) target.auto_continue_on_length_cut = updates.auto_continue_on_length_cut;
     const d: CompactionSettings = .{};
     if (updates.compaction.auto != d.auto) target.compaction.auto = updates.compaction.auto;
     if (updates.compaction.threshold != d.threshold) target.compaction.threshold = updates.compaction.threshold;
@@ -727,6 +728,9 @@ fn parseContext(value: std.json.Value) ContextSettings {
     }
     if (boolFieldCompat(value, "softStopOnToolCallLimit", "soft_stop_on_tool_call_limit")) |b| {
         ctx.soft_stop_on_tool_call_limit = b;
+    }
+    if (boolFieldCompat(value, "autoContinueOnLengthCut", "auto_continue_on_length_cut")) |b| {
+        ctx.auto_continue_on_length_cut = b;
     }
     if (value.object.get("compaction")) |comp_val| {
         if (comp_val == .object) ctx.compaction = parseCompaction(comp_val);
@@ -1553,6 +1557,7 @@ fn hasNonDefaultContext(ctx: ContextSettings) bool {
     if (ctx.disable_prompt_cache != null) return true;
     if (ctx.tool_call_limit_per_turn != null) return true;
     if (ctx.soft_stop_on_tool_call_limit != null) return true;
+    if (ctx.auto_continue_on_length_cut != null) return true;
     if (ctx.compaction.auto != d.compaction.auto) return true;
     if (ctx.compaction.threshold != d.compaction.threshold) return true;
     if (ctx.compaction.keep_recent_tokens != d.compaction.keep_recent_tokens) return true;
@@ -1594,6 +1599,10 @@ fn writeContext(writer: *std.Io.Writer, ctx: ContextSettings) !void {
     }
     if (ctx.soft_stop_on_tool_call_limit) |b| {
         try writeKeyNoIndent(writer, "softStopOnToolCallLimit", &wrote_any);
+        try writer.writeAll(if (b) "true" else "false");
+    }
+    if (ctx.auto_continue_on_length_cut) |b| {
+        try writeKeyNoIndent(writer, "autoContinueOnLengthCut", &wrote_any);
         try writer.writeAll(if (b) "true" else "false");
     }
     // Compaction: always written when context is present.
@@ -1903,23 +1912,25 @@ test "parseContext drops integer fields outside u32 range instead of truncating"
 
 test "parseContext accepts tool budget keys in both cases, drops out-of-range" {
     const json =
-        \\{"toolCallLimitPerTurn":250,"softStopOnToolCallLimit":false}
+        \\{"toolCallLimitPerTurn":250,"softStopOnToolCallLimit":false,"autoContinueOnLengthCut":false}
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
     const ctx = parseContext(parsed.value);
     try std.testing.expectEqual(@as(?u32, 250), ctx.tool_call_limit_per_turn);
     try std.testing.expectEqual(@as(?bool, false), ctx.soft_stop_on_tool_call_limit);
+    try std.testing.expectEqual(@as(?bool, false), ctx.auto_continue_on_length_cut);
 
     // snake_case aliases parse to the same fields.
     const snake_json =
-        \\{"tool_call_limit_per_turn":40,"soft_stop_on_tool_call_limit":true}
+        \\{"tool_call_limit_per_turn":40,"soft_stop_on_tool_call_limit":true,"auto_continue_on_length_cut":true}
     ;
     const snake_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, snake_json, .{});
     defer snake_parsed.deinit();
     const snake_ctx = parseContext(snake_parsed.value);
     try std.testing.expectEqual(@as(?u32, 40), snake_ctx.tool_call_limit_per_turn);
     try std.testing.expectEqual(@as(?bool, true), snake_ctx.soft_stop_on_tool_call_limit);
+    try std.testing.expectEqual(@as(?bool, true), snake_ctx.auto_continue_on_length_cut);
 
     // Out-of-band values are dropped (stay null → defaults), never clamped.
     const bad_json =
@@ -3094,7 +3105,7 @@ test "serialize then parse roundtrips tool budget keys" {
         .provider_name = try gpa.dupe(u8, "ollama"),
         .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
         .model = .{ .id = try gpa.dupe(u8, "llama3.1:8b") },
-        .context = .{ .tool_call_limit_per_turn = 40, .soft_stop_on_tool_call_limit = false },
+        .context = .{ .tool_call_limit_per_turn = 40, .soft_stop_on_tool_call_limit = false, .auto_continue_on_length_cut = false },
     };
     defer original.deinit(gpa);
 
@@ -3106,6 +3117,7 @@ test "serialize then parse roundtrips tool budget keys" {
     // after the colon).
     try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"toolCallLimitPerTurn\":40") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"softStopOnToolCallLimit\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"autoContinueOnLengthCut\":false") != null);
 
     var sink: std.ArrayList(Diagnostic) = .empty;
     defer sink.deinit(gpa);
@@ -3116,12 +3128,13 @@ test "serialize then parse roundtrips tool budget keys" {
 
     try std.testing.expectEqual(@as(?u32, 40), roundtrip.context.tool_call_limit_per_turn);
     try std.testing.expectEqual(@as(?bool, false), roundtrip.context.soft_stop_on_tool_call_limit);
+    try std.testing.expectEqual(@as(?bool, false), roundtrip.context.auto_continue_on_length_cut);
 
     // snake_case form parses to the same values (compat reader).
     const snake_json =
         \\{"version":"2.0.0","provider":"ollama","baseUrl":"http://localhost:11434/v1",
         \\ "model":{"id":"llama3.1:8b"},
-        \\ "context":{"tool_call_limit_per_turn":40,"soft_stop_on_tool_call_limit":false}}
+        \\ "context":{"tool_call_limit_per_turn":40,"soft_stop_on_tool_call_limit":false,"auto_continue_on_length_cut":false}}
     ;
     var snake_parsed = try parseFile(gpa, "<snake>", snake_json, &sink);
     defer snake_parsed.deinit(gpa);
@@ -3129,6 +3142,7 @@ test "serialize then parse roundtrips tool budget keys" {
     defer snake_rt.deinit(gpa);
     try std.testing.expectEqual(@as(?u32, 40), snake_rt.context.tool_call_limit_per_turn);
     try std.testing.expectEqual(@as(?bool, false), snake_rt.context.soft_stop_on_tool_call_limit);
+    try std.testing.expectEqual(@as(?bool, false), snake_rt.context.auto_continue_on_length_cut);
 }
 
 test "parseProviderConfig accepts baseURL (camelCase)" {

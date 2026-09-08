@@ -45,6 +45,14 @@ const tool_budget_continuation_hint =
     "[nova] This turn stopped early because the per-turn tool-call budget was reached. " ++
     "Work done so far is intact. When the user asks to continue, briefly summarize " ++
     "completed steps, then pick up exactly where the work left off.";
+/// Trailing machine-authored continuation hint appended when a response was
+/// severed by the provider's output token cap (`finish_reason=length`) with
+/// no tool calls: the prose landed, the tool_call section did not. Same
+/// `.user`-role reasoning as `tool_budget_continuation_hint` (survives
+/// resume/compaction; Qwen normalization never touches it).
+const length_cut_continuation_hint =
+    "[nova] Your previous response was cut off by the output token limit before it finished. " ++
+    "Continue from exactly where it stopped; if you were about to call a tool, emit that tool call now.";
 /// Byte threshold at which a pending buffer flushes mid-stream. ~2s of text
 /// at 100 tok/s, ~0.4s at 500 tok/s. A config knob adds surface area for
 /// little gain; a comptime constant is simpler.
@@ -149,6 +157,14 @@ pub const Agent = struct {
     /// `error.ToolCallLimit`. Default true; `false` restores the historical
     /// hard-failure contract byte-for-byte.
     soft_stop_on_tool_call_limit: bool = true,
+    /// When true (default), a response severed by the provider's output
+    /// token cap (`finish_reason=length`, no tool calls) gets ONE automatic
+    /// continuation inside the same turn: a hint is appended and the model
+    /// re-requested. Guards against providers whose default completion
+    /// budget cuts the tool_call section off after the prose — the turn
+    /// otherwise ends as a text-only message that looks complete. Set from
+    /// `config.context.auto_continue_on_length_cut`.
+    auto_continue_on_length_cut: bool = true,
     /// Process-wide cap on concurrent LLM requests to the provider, shared by
     /// every lane's agent. Borrowed from the App (never freed here); null in
     /// headless/tests = no gate. Acquired around each `client.prompt` so at
@@ -428,6 +444,13 @@ pub const Agent = struct {
         /// `queued_messages_flushed` so the event is allocation-free — the
         /// renderer owns the human-facing text.
         tool_budget_exhausted: u32,
+        /// The provider severed the response at the output token cap
+        /// (`finish_reason=length`) with no tool calls. `.auto_continued`:
+        /// a continuation hint was appended and the model re-requested
+        /// (one-shot per run). `.stopped`: the turn ended cut short (knob
+        /// off, or the one-shot was already used) — user action is expected.
+        /// Bare enum payload: allocation-free, renderer owns the text.
+        length_cut: LengthCut,
 
         /// The fixed notice kinds `maybeCompact` can emit while it degrades
         /// gracefully instead of looping into provider overflow errors.
@@ -439,6 +462,12 @@ pub const Agent = struct {
             stuck,
             /// A synchronous overflow wait is about to join the summarizer.
             waiting,
+        };
+
+        /// See the `length_cut` event.
+        pub const LengthCut = enum {
+            auto_continued,
+            stopped,
         };
 
         /// Emitted after the agent replaces summarized history with a compaction
@@ -475,7 +504,7 @@ pub const Agent = struct {
                     gpa.free(tool.display_body);
                     if (tool.stderr) |stderr| gpa.free(stderr);
                 },
-                .turn_started, .delta_end, .tool_batch_finished, .queued_messages_flushed, .turn_finished, .history_compacted, .compaction_notice, .tool_budget_exhausted => {},
+                .turn_started, .delta_end, .tool_batch_finished, .queued_messages_flushed, .turn_finished, .history_compacted, .compaction_notice, .tool_budget_exhausted, .length_cut => {},
             }
             self.* = undefined;
         }
@@ -517,6 +546,10 @@ pub const Agent = struct {
         const l: L = listener;
         try l.emit(.turn_started);
         var calls: u32 = 0;
+        // One-shot guard: a single automatic length-cut continuation per run,
+        // so a pathologically capping endpoint cannot loop extra billed
+        // requests (the C2 `downgrade_done` idiom from the wire client).
+        var length_continued = false;
         while (calls < self.tool_call_limit_per_turn) : (calls += 1) {
             self.maybeCompact(l);
             var stream_context: StreamContext(L) = .{
@@ -549,6 +582,12 @@ pub const Agent = struct {
             // otherwise be flushed by `deinit` (line 489) AFTER
             // `tool_call_finished`, reordering the event queue.
             try stream_context.flushPending();
+            // Hoisted before the ownership branch: `Turn.deinit` sets
+            // `self.* = undefined`, and the no-wire-content branch (a
+            // reasoning-only response cut before any prose) deinits the turn
+            // — the length branch below must read the scalar, not the
+            // undefined struct.
+            const finish_reason = turn.finish_reason;
             const usage = turn.usage;
             var turn_owned = true;
             defer if (turn_owned) turn.deinit(self.gpa);
@@ -582,6 +621,14 @@ pub const Agent = struct {
             // that, and runToolBatch copies the ToolCall values into the
             // executor before returning, so neither slice is read post-free.
             const tool_calls: []const ai.ToolCall = if (recovered.len > 0) recovered else tool_calls_initial;
+            // The provider signalled "ended with tool calls" but none parsed
+            // or was recovered from text — the tool_call section was severed
+            // mid-flight. Without this the failure hides behind a
+            // text-only assistant message (the "half-finished tool call"
+            // incident signature).
+            if (finish_reason == .tool_calls and tool_calls.len == 0) {
+                log.warn("finish_reason=tool_calls but no tool call parsed or recovered — tool_call section likely truncated by the provider", .{});
+            }
 
             if (turn.assistant == .assistant and hasWireContent(turn.assistant)) {
                 try self.takeAssistantMessage(&turn.assistant);
@@ -597,11 +644,23 @@ pub const Agent = struct {
             if (tool_calls.len == 0) {
                 // Turn would otherwise go idle: drain the front queued message
                 // (steer or not) and continue, so anything still waiting is
-                // handled at the natural turn end.
+                // handled at the natural turn end. The user's queued message
+                // takes precedence over the automatic continuation below.
                 const drained_count = try self.drainQueuedUserMessage(false);
                 if (drained_count > 0) {
                     try l.emit(.{ .queued_messages_flushed = drained_count });
                     continue;
+                }
+                // A provider output-token cap severed the response before the
+                // tool_call section (observed: prose announcing an action,
+                // then a clean close). The partial prose is already in
+                // history (`takeAssistantMessage` ran above), so the wire
+                // shape for the continuation stays [.., assistant, user-hint].
+                if (finish_reason == .length) {
+                    if (try self.handleLengthCut(l, length_continued)) {
+                        length_continued = true;
+                        continue;
+                    }
                 }
                 return;
             }
@@ -631,6 +690,25 @@ pub const Agent = struct {
         if (drained > 0) try listener.emit(.{ .queued_messages_flushed = drained });
         try self.addUser(tool_budget_continuation_hint);
         try listener.emit(.{ .tool_budget_exhausted = self.tool_call_limit_per_turn });
+    }
+
+    /// React to a response severed by the provider's output token cap
+    /// (`finish_reason=length`, no tool calls). Returns true when the caller
+    /// must continue the run (the one-shot auto-continue fired: a hint was
+    /// appended, the model gets re-requested); false when the turn should
+    /// end (knob off, or the one-shot was already used this run) — the event
+    /// still fires so the TUI renders a resumable notice instead of the cut
+    /// passing as a complete answer.
+    fn handleLengthCut(self: *Agent, listener: anytype, already_continued: bool) !bool {
+        if (!self.auto_continue_on_length_cut or already_continued) {
+            log.warn("turn ended on finish_reason=length with no tool calls — output token cap severed the response; not auto-continuing", .{});
+            try listener.emit(.{ .length_cut = .stopped });
+            return false;
+        }
+        log.warn("response cut by the output token cap (finish_reason=length, no tool calls) — auto-continuing once", .{});
+        try listener.emit(.{ .length_cut = .auto_continued });
+        try self.addUser(length_cut_continuation_hint);
+        return true;
     }
 
     /// Hand the batch of tool_calls to the ExecutorService, bridge its
@@ -2090,6 +2168,49 @@ test "softStopOnBudget with empty queue emits only the budget event" {
     try std.testing.expect(std.mem.startsWith(u8, agent.messages()[0].text(), "[nova] This turn stopped"));
     try std.testing.expectEqual(@as(usize, 1), seen.events.items.len);
     try std.testing.expectEqual(@as(u32, 100), seen.events.items[0].tool_budget_exhausted);
+}
+
+test "handleLengthCut auto-continues once then stops" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    var seen: BudgetSeen = .{};
+    defer seen.deinit(gpa);
+    const listener = Agent.Listener(BudgetSeen){ .ctx = &seen, .on_event = BudgetSeen.onEvent };
+
+    // First cut: the one-shot auto-continue fires — a `.user` continuation
+    // hint (persistable, like the budget hint) lands in history and the
+    // continuing event is emitted so the TUI keeps the turn open.
+    try std.testing.expect(try agent.handleLengthCut(listener, false));
+    try std.testing.expectEqual(@as(usize, 1), seen.events.items.len);
+    try std.testing.expectEqual(Agent.Event.LengthCut.auto_continued, seen.events.items[0].length_cut);
+    try std.testing.expectEqual(@as(usize, 1), agent.messages().len);
+    try std.testing.expect(agent.messages()[0].role() == .user);
+    try std.testing.expect(std.mem.startsWith(u8, agent.messages()[0].text(), "[nova] Your previous response was cut off"));
+
+    // Second cut in the same run: the one-shot is exhausted — the turn ends
+    // with the stopped event and no extra hint message.
+    try std.testing.expect(!try agent.handleLengthCut(listener, true));
+    try std.testing.expectEqual(@as(usize, 2), seen.events.items.len);
+    try std.testing.expectEqual(Agent.Event.LengthCut.stopped, seen.events.items[1].length_cut);
+    try std.testing.expectEqual(@as(usize, 1), agent.messages().len);
+}
+
+test "handleLengthCut with the knob off only emits the stopped event" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    agent.auto_continue_on_length_cut = false;
+
+    var seen: BudgetSeen = .{};
+    defer seen.deinit(gpa);
+    const listener = Agent.Listener(BudgetSeen){ .ctx = &seen, .on_event = BudgetSeen.onEvent };
+
+    try std.testing.expect(!try agent.handleLengthCut(listener, false));
+    try std.testing.expectEqual(@as(usize, 1), seen.events.items.len);
+    try std.testing.expectEqual(Agent.Event.LengthCut.stopped, seen.events.items[0].length_cut);
+    try std.testing.expectEqual(@as(usize, 0), agent.messages().len);
 }
 
 test "raw enqueued messages are delivered verbatim without @-mention expansion" {

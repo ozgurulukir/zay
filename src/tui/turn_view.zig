@@ -71,6 +71,7 @@ pub const TurnView = struct {
             .history_compacted => |info| return try self.applyHistoryCompacted(gpa, transcript, info),
             .compaction_notice => |notice| return try self.applyCompactionNotice(gpa, transcript, notice),
             .tool_budget_exhausted => |limit| return try self.applyToolBudgetExhausted(gpa, transcript, limit),
+            .length_cut => |cut| return try self.applyLengthCut(gpa, transcript, cut),
         }
     }
 
@@ -223,6 +224,25 @@ pub const TurnView = struct {
             .{limit},
         ) catch "tool-call budget reached — turn stopped early; send a message to continue";
         _ = try transcript.append(gpa, .notice, "budget", text);
+        return true;
+    }
+
+    /// Amber rows for a provider output-token-cap cut. `.auto_continued`
+    /// keeps the user informed that the turn is still running (and that one
+    /// extra model request is being spent); `.stopped` needs user action,
+    /// like the budget notice above.
+    fn applyLengthCut(
+        self: *TurnView,
+        gpa: std.mem.Allocator,
+        transcript: *transcript_mod.Transcript,
+        cut: agent_mod.Agent.Event.LengthCut,
+    ) !bool {
+        _ = self;
+        const text = switch (cut) {
+            .auto_continued => "model output hit the token limit — continuing automatically",
+            .stopped => "model output hit the token limit — turn ended early; send a message to continue",
+        };
+        _ = try transcript.append(gpa, .notice, "output", text);
         return true;
     }
 
@@ -757,4 +777,25 @@ test "tool budget exhausted appends a budget notice row carrying the limit" {
         "tool-call budget reached (40 calls) — turn stopped early; send a message to continue",
         transcript.messages.items[0].mirror().body,
     );
+}
+
+test "length cut appends an output notice row for both variants" {
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+    var turn_view: TurnView = .{};
+    defer turn_view.deinit(gpa);
+
+    try std.testing.expect(try turn_view.apply(gpa, &transcript, .{ .length_cut = .auto_continued }));
+    try std.testing.expect(try turn_view.apply(gpa, &transcript, .{ .length_cut = .stopped }));
+    try std.testing.expectEqual(@as(usize, 2), transcript.messages.items.len);
+    // Amber attention rows (`.notice`) like the budget notice — the stopped
+    // variant needs user action; the auto-continuing one keeps the user
+    // informed that the turn is still running on an extra request.
+    try std.testing.expectEqual(transcript_mod.MessageKind.notice, transcript.messages.items[0].mirror().kind);
+    try std.testing.expectEqualStrings("output", transcript.messages.items[0].mirror().title);
+    try std.testing.expectEqualStrings("model output hit the token limit — continuing automatically", transcript.messages.items[0].mirror().body);
+    try std.testing.expectEqual(transcript_mod.MessageKind.notice, transcript.messages.items[1].mirror().kind);
+    try std.testing.expectEqualStrings("output", transcript.messages.items[1].mirror().title);
+    try std.testing.expectEqualStrings("model output hit the token limit — turn ended early; send a message to continue", transcript.messages.items[1].mirror().body);
 }

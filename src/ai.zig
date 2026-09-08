@@ -621,6 +621,15 @@ pub fn clampTokenCount(value: i64) u32 {
     return @intCast(value);
 }
 
+/// Terminal `finish_reason` from a chat-completions choice (the last
+/// non-null value in the stream wins). `null` means the provider never sent
+/// one (older gateways, keep-alive-only streams). `.length` — the response
+/// was severed by the output token cap — is the actionable one: for
+/// tool-calling models the cut usually lands after the prose and before the
+/// tool_call section, ending the turn as a text-only message that looks
+/// complete. `.tool_calls` is the normal end for a tool-calling response.
+pub const FinishReason = enum { stop, length, tool_calls, content_filter, other };
+
 pub const Turn = struct {
     assistant: ChatMessage,
     /// Token usage for this turn, when the provider reported it. `null` means
@@ -628,6 +637,11 @@ pub const Turn = struct {
     /// without `stream_options.include_usage`); the budget falls back to a
     /// size estimate in that case.
     usage: ?Usage = null,
+    /// Terminal reason reported by the provider, when any. Rides the Turn
+    /// (like `usage`) rather than the stream observer: it arrives on the
+    /// final chunk and has no per-delta semantics. The Responses-API client
+    /// leaves it null today.
+    finish_reason: ?FinishReason = null,
 
     pub fn deinit(self: *Turn, gpa: std.mem.Allocator) void {
         self.assistant.deinit(gpa);
