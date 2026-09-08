@@ -7,6 +7,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // Vendored-vaxis integrity gate: the two `NOVA-LOCAL-PATCH` FocusHandler
+    // guards (empty `path_to_focused` → SIGSEGV in ReleaseFast on session
+    // switch) live in the gitignored vendor copy and silently vanish on every
+    // `zig build --fetch` / vaxis bump. This runs at configure time on every
+    // build invocation so a fresh fetch can never compile unpatched. See
+    // AGENTS.md "vxfw FocusHandler crash" and
+    // tools/vendor-patches/vaxis-focus-handler.patch.
+    checkVaxisFocusPatch(b, vaxis_dep);
     const websocket_vendor_mod = b.createModule(.{
         .root_source_file = b.path("vendor/websocket.zig/src/websocket.zig"),
         .target = target,
@@ -449,4 +457,38 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+}
+
+/// Fails the build when the vendored vaxis `src/vxfw/App.zig` is missing the
+/// two `NOVA-LOCAL-PATCH` FocusHandler guards. Upstream `assert(path.len > 0)`
+/// is stripped in ReleaseFast, and an empty focus path (left behind when
+/// `installRuntime` deinits the runtime that owned the focused widget) then
+/// SIGSEGVs on the next key event. The markers are counted rather than
+/// presence-tested so losing either one of the two guards still fails.
+fn checkVaxisFocusPatch(b: *std.Build, vaxis_dep: *std.Build.Dependency) void {
+    const marker = "NOVA-LOCAL-PATCH";
+    const app_file = vaxis_dep.path("src/vxfw/App.zig").getPath(b);
+    const contents = std.Io.Dir.cwd().readFileAlloc(b.graph.io, app_file, b.allocator, .limited(1 << 20)) catch |err| {
+        std.process.fatal("vaxis vendor check: cannot read {s}: {s}", .{ app_file, @errorName(err) });
+    };
+    defer b.allocator.free(contents);
+
+    var markers: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, contents, idx, marker)) |at| {
+        markers += 1;
+        idx = at + marker.len;
+    }
+    if (markers >= 2) return;
+
+    std.process.fatal(
+        \\Vendored vaxis is missing the NOVA-LOCAL-PATCH FocusHandler guards:
+        \\  {s}
+        \\found {d} of 2 markers; without them a session switch can SIGSEGV in
+        \\ReleaseFast. Re-apply after every `zig build --fetch` / vaxis bump:
+        \\  patch -p1 -d <vaxis vendor dir> < tools/vendor-patches/vaxis-focus-handler.patch
+        \\See AGENTS.md "vxfw FocusHandler crash".
+    ,
+        .{ app_file, markers },
+    );
 }

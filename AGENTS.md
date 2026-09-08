@@ -200,11 +200,15 @@ The authoritative signal for a test run is `zig build test`'s **exit code**, not
 
 - **Session config copy semantics.** `session_config` is a value-copy of `config`; union fields are shallow-copied, so mutating a union field on the copy doesn't affect the original.
 
-- **vxfw FocusHandler crash on empty `path_to_focused` (LOCAL VENDOR PATCH REQUIRED).** Resume/session-switch crashes (SIGSEGV in ReleaseFast, assert in Debug) at `vxfw/App.zig:590`. Cause: `installRuntime` (transcript_lifecycle.zig) deinits the old runtime while vxfw's `focused_widget` still points at a TextField in that destroyed runtime; the next frame leaves the focus path empty and the next key event dereferences it. Upstream bug (HEAD `cca454be`), so a vaxis bump does NOT fix it. **Two guards applied manually** to `zig-pkg/vaxis-<hash>/src/vxfw/App.zig` (search `NOVA-LOCAL-PATCH`): (1) `update()` falls back to `self.root`; (2) `handleEvent()` returns early instead of `assert(path.len > 0)`. **Re-apply after every `zig build --fetch` / vaxis bump** (vendor dir is gitignored). Remove both once the upstream PR lands past the pinned commit.
+- **vxfw FocusHandler crash on empty `path_to_focused` (LOCAL VENDOR PATCH REQUIRED).** Resume/session-switch crashes (SIGSEGV in ReleaseFast, assert in Debug) at `vxfw/App.zig:590`. Cause: `installRuntime` (transcript_lifecycle.zig) deinits the old runtime while vxfw's `focused_widget` still points at a TextField in that destroyed runtime; the next frame leaves the focus path empty and the next key event dereferences it. Upstream bug (HEAD `cca454be`), so a vaxis bump does NOT fix it. **Two guards applied manually** to the vendored `src/vxfw/App.zig` (search `NOVA-LOCAL-PATCH`): (1) `update()` falls back to `self.root`; (2) `handleEvent()` returns early instead of `assert(path.len > 0)`. Remove both once the upstream PR lands past the pinned commit.
 
-  To re-apply on a freshly-fetched vendor:
-  1. In `FocusHandler.update`, guard `if (self.path_to_focused.items.len == 0)` → append `self.root`, else fall through to the original `else if`.
-  2. In `FocusHandler.handleEvent`, replace `assert(path.len > 0);` with `if (path.len == 0) return;`.
+  **Enforcement:** `checkVaxisFocusPatch` (build.zig) runs at configure time on EVERY `zig build` invocation — it reads `vaxis_dep.path("src/vxfw/App.zig")`, requires both `NOVA-LOCAL-PATCH` markers, and fails the build with the repair command when either is missing, so a fresh `zig build --fetch` / vaxis bump can never compile unpatched (the vendor dir is gitignored; this exact regression happened once — the 2026-09-06 fetch landed unpatched and shipped the crash). The checked-in patch file `tools/vendor-patches/vaxis-focus-handler.patch` reproduces both guards on a pristine vendor copy:
+
+  ```sh
+  patch -p1 -d <vaxis vendor dir printed by the build failure> < tools/vendor-patches/vaxis-focus-handler.patch
+  ```
+
+  On machines without `zig-pkg/` vendoring the dependency resolves from the global package cache — patch that printed path (the guards are additive, so other projects sharing the cached copy are unaffected). Manual recipe, if patch(1) is unavailable: 1. In `FocusHandler.update`, guard `if (self.path_to_focused.items.len == 0)` → append `self.root`, else fall through to the original `else if`. 2. In `FocusHandler.handleEvent`, replace `assert(path.len > 0);` with `if (path.len == 0) return;`.
   Verify: build ReleaseFast, run the PTY repro (open `/resume`, select a session, type a prompt, press keys) — must NOT signal 11.
 
 - **`installRuntime` (session switch) checks only the active lane's turn — by design.** Other lanes keep running against their own runtimes; each lane owns its runtime, so a switch must not tear down lanes still in use. Completion routing is generation-safe across the switch (M1). Documented in `transcript_lifecycle.zig` and `_plan/plan-lane-worker-hardening-2026-08-05.md`.
