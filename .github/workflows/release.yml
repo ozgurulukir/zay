@@ -53,6 +53,21 @@ jobs:
           fi
           printf '%s\n' "$ZIG_DIR" >> "$GITHUB_PATH"
 
+      - name: Apply vaxis NOVA-LOCAL-PATCH (focus-handler guards)
+        shell: bash
+        run: |
+          # Fresh CI checkouts fetch a PRISTINE vaxis into zig-pkg/; the
+          # configure-time guard in build.zig then fails the first invocation
+          # on purpose (an unpatched binary SIGSEGVs on session switch — see
+          # AGENTS.md "vxfw FocusHandler crash"). Tolerate that first
+          # failure, apply the checked-in patch, and let the build step run
+          # against the guarded copy.
+          zig build --fetch -Dtarget=${{ matrix.target }} || true
+          for d in zig-pkg/vaxis-0.6.0-*/; do
+            patch -p1 -d "$d" < tools/vendor-patches/vaxis-focus-handler.patch
+            test "$(grep -c NOVA-LOCAL-PATCH "$d/src/vxfw/App.zig")" -eq 2
+          done
+
       - name: Build (ReleaseFast)
         shell: bash
         env:
