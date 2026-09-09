@@ -29,6 +29,13 @@ jobs:
             zig_url: https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip
             zig_ext: .zip
             zig_dir: zig-x86_64-windows-0.16.0
+          - os: macos-latest
+            artifact: zay-macos-aarch64
+            bin: zay
+            target: aarch64-macos
+            zig_url: https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz
+            zig_ext: .tar.xz
+            zig_dir: zig-aarch64-macos-0.16.0
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -73,6 +80,13 @@ jobs:
         env:
           VERSION: ${{ github.ref_name }}
         run: zig build install -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dversion="$VERSION" --prefix dist
+
+      # Real runtime validation on the target OS (the Windows binary is not
+      # runnable from the bash shell, so it is build-only).
+      - name: Runtime smoke
+        if: runner.os != 'Windows'
+        shell: bash
+        run: dist/bin/${{ matrix.bin }} --version
 
       - name: Rename binary
         shell: bash

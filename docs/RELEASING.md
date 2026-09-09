@@ -46,6 +46,7 @@ git push origin v0.3.1-beta.1
 
 - `zay-linux-x86_64` + `zay-linux-x86_64.sha256`
 - `zay-windows-x86_64.exe` + `zay-windows-x86_64.exe.sha256`
+- `zay-macos-aarch64` + `zay-macos-aarch64.sha256` (Apple Silicon; built on `macos-latest`)
 
 Verify a downloaded asset with:
 
