@@ -11,11 +11,22 @@
 
 const std = @import("std");
 const http = @import("../http.zig");
+const os = @import("../os.zig");
 
 const assert = std.debug.assert;
 
 const response_bytes_max: u32 = 4096;
 const redirect_buffer_bytes = http.redirect_buffer_bytes;
+/// Per-call budget for the remote classifier exchange: the response
+/// receive phase must finish inside it or the call fails to the local
+/// matcher. The classifier is a localhost sidecar; one that stalls this
+/// long is broken, and fail-open beats wedging the turn indefinitely.
+/// POSIX http only — Windows and https URLs keep the plain `fetch`
+/// exchange without a deadline (see `classifyOverClient`).
+const classifier_timeout_seconds: u32 = 5;
+/// Fixed receive buffer for the classifier response (head + body). A
+/// larger response fails to the local matcher instead of growing.
+const classifier_response_buffer_bytes: usize = 16 * 1024;
 
 pub const Verdict = enum {
     safe,
@@ -53,7 +64,7 @@ pub fn classify(
     const u = url orelse return localClassify(command);
     if (u.len == 0) return localClassify(command);
 
-    const remote = classifyFallible(gpa, io, u, cwd, command) catch {
+    const remote = classifyFallible(gpa, io, u, cwd, command, classifier_timeout_seconds) catch {
         // Remote classifier unavailable — fall back to local pattern matching.
         return localClassify(command);
     };
@@ -92,10 +103,6 @@ fn localClassify(command: []const u8) Verdict {
     return .safe;
 }
 
-/// True when `command` escalates privileges (`sudo`/`doas`/`runas`) or invokes a
-/// system package manager (`apt`, `apt-get`, `dpkg`, `dnf`, `yum`, `pacman`,
-/// `apk`, `brew`, `pip install`). The match is prefix/case-insensitive on the
-/// first token so `--option sudo apt` noise is not required to trigger it.
 /// True when `command` escalates privileges (`sudo`/`doas`/`runas`) or invokes a
 /// system package manager (`apt`, `dnf`, `brew`, `cargo`, `pip install`, ...).
 /// These mutate system-wide install state and must surface for approval rather
@@ -455,11 +462,40 @@ fn classifyFallible(
     url: []const u8,
     cwd: []const u8,
     command: []const u8,
+    timeout_seconds: u32,
 ) !Verdict {
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
     try writeRequest(&payload.writer, cwd, command);
 
+    // Windows keeps the plain `fetch` exchange: the deadline path is
+    // POSIX-only (raw poll rounds on the socket fd). Branch-scoped so the
+    // comptime-known-Windows build never analyzes `std.posix.poll`/`read`
+    // (both are compile errors there).
+    if (os.is_windows) {
+        return classifyOverClient(gpa, io, url, payload.written());
+    } else {
+        const uri = std.Uri.parse(url) catch return error.InvalidUrl;
+        // https keeps the plain `fetch` exchange too: std's TLS client
+        // offers no deadline hook, and the classifier sidecar is plain
+        // http in every shipped configuration.
+        if (std.mem.eql(u8, uri.scheme, "https")) return classifyOverClient(gpa, io, url, payload.written());
+        if (!std.mem.eql(u8, uri.scheme, "http")) return error.UnsupportedScheme;
+        return classifyOverSocket(gpa, io, uri, payload.written(), timeout_seconds);
+    }
+}
+
+/// Plain `std.http.Client.fetch` exchange, kept for https classifier URLs
+/// and Windows. This path carries no deadline: std's HTTP client cannot
+/// bound its reads here (a socket read timeout surfaces as EAGAIN, which
+/// the `Io.Threaded` read path treats as a programmer bug — panic in
+/// Debug), so the deadline-carrying http path is `classifyOverSocket`.
+fn classifyOverClient(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    url: []const u8,
+    payload: []const u8,
+) !Verdict {
     var response_body: std.Io.Writer.Allocating = .init(gpa);
     defer response_body.deinit();
     var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
@@ -470,7 +506,7 @@ fn classifyFallible(
     const status = try client.fetch(.{
         .method = .POST,
         .location = .{ .url = url },
-        .payload = payload.written(),
+        .payload = payload,
         .response_writer = &response_body.writer,
         .redirect_buffer = &redirect_buffer,
         .keep_alive = true,
@@ -482,6 +518,128 @@ fn classifyFallible(
     const status_code: u16 = @intFromEnum(status.status);
     if (!http.isSuccess(status_code)) return error.HttpUnexpectedStatus;
     return parseResponse(gpa, response_body.written());
+}
+
+/// Deadline-bounded HTTP/1.1 exchange over a raw socket, POSIX http only.
+///
+/// The response receive phase polls the socket with the remaining budget
+/// instead of blocking in recv: `Io.Threaded`'s read path treats the EAGAIN
+/// a socket read timeout produces as a programmer bug (panic in Debug), so
+/// the deadline lives in explicit poll rounds. Framing is EOF-delimited —
+/// the request advertises `Connection: close`, which the uvicorn sidecar
+/// honours, so the response ends when the server closes. A server that
+/// keeps the connection open simply runs into the deadline. The send phase
+/// goes through the blocking stream writer and the connect is
+/// kernel-default (instant for the localhost sidecar); both match the
+/// pre-deadline behavior and are bounded in practice by the sidecar being
+/// a local process that reads what we send.
+fn classifyOverSocket(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    uri: std.Uri,
+    payload: []const u8,
+    timeout_seconds: u32,
+) !Verdict {
+    const host_component = uri.host orelse return error.UriMissingHost;
+    const host = componentText(host_component);
+    const port: u16 = uri.port orelse 80;
+    // Forward the query string: the previous `fetch` path sent the full
+    // URL, so `…/classify?x=1` must keep reaching the same handler.
+    var request_target: std.Io.Writer.Allocating = .init(gpa);
+    defer request_target.deinit();
+    const raw_path = componentText(uri.path);
+    try request_target.writer.writeAll(if (raw_path.len > 0) raw_path else "/");
+    if (uri.query) |q| try request_target.writer.print("?{s}", .{componentText(q)});
+
+    const deadline_ns = std.Io.Timestamp.now(io, .awake).nanoseconds +
+        @as(i96, timeout_seconds) * std.time.ns_per_s;
+
+    const address = try std.Io.net.IpAddress.resolve(io, host, port);
+    const stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var request: std.Io.Writer.Allocating = .init(gpa);
+    defer request.deinit();
+    try request.writer.print("POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ request_target.written(), host, port, payload.len });
+    try request.writer.writeAll(payload);
+
+    // Small fixed-shape request through the blocking stream writer; the
+    // deadline is enforced on the receive phase below.
+    var write_buffer: [http.body_buffer_bytes]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    try writer.interface.writeAll(request.written());
+    try writer.interface.flush();
+
+    var response_buffer: [classifier_response_buffer_bytes]u8 = undefined;
+    const response = try receiveResponseBounded(io, stream.socket.handle, &response_buffer, deadline_ns);
+    return parseSocketResponse(gpa, response);
+}
+
+/// Nanoseconds left until `deadline_ns`; negative once the budget is spent.
+fn classifierRemainingNs(io: std.Io, deadline_ns: i96) i96 {
+    return deadline_ns - std.Io.Timestamp.now(io, .awake).nanoseconds;
+}
+
+/// Poll-round timeout in milliseconds, clamped to what `poll` accepts.
+fn pollTimeoutMs(remaining_ns: i96) i32 {
+    const ms = @divTrunc(remaining_ns, std.time.ns_per_ms);
+    return @intCast(@min(ms, @as(i96, std.math.maxInt(i32))));
+}
+
+/// Read the full response into `buffer`, one deadline-bounded poll round at
+/// a time, until the server closes the connection. Returns a slice of
+/// `buffer`.
+fn receiveResponseBounded(
+    io: std.Io,
+    fd: std.posix.socket_t,
+    buffer: []u8,
+    deadline_ns: i96,
+) ![]const u8 {
+    var received: usize = 0;
+    while (true) {
+        const remaining_ns = classifierRemainingNs(io, deadline_ns);
+        if (remaining_ns <= 0) return error.ClassifierTimeout;
+        var fds = [_]std.posix.pollfd{.{
+            .fd = fd,
+            .events = std.posix.POLL.IN | std.posix.POLL.ERR,
+            .revents = 0,
+        }};
+        if (try std.posix.poll(&fds, pollTimeoutMs(remaining_ns)) == 0) return error.ClassifierTimeout;
+        const n = try std.posix.read(fd, buffer[received..]);
+        if (n == 0) return buffer[0..received]; // Server closed: response complete.
+        received += n;
+        if (received == buffer.len) return error.ResponseTooLarge;
+    }
+}
+
+/// Split the EOF-delimited response into head and body. The status line
+/// must carry a 2xx code and the body must fit the cap — anything else
+/// fails to the local matcher.
+fn parseSocketResponse(gpa: std.mem.Allocator, response: []const u8) !Verdict {
+    const separator = "\r\n\r\n";
+    const sep = std.mem.indexOf(u8, response, separator) orelse return error.InvalidClassifierResponse;
+    const head = response[0..sep];
+    const body = response[sep + separator.len ..];
+    if (body.len > response_bytes_max) return error.ResponseTooLarge;
+
+    const line_end = std.mem.indexOf(u8, head, "\r\n") orelse head.len;
+    const status_line = head[0..line_end];
+    const code_start = std.mem.indexOfScalar(u8, status_line, ' ') orelse return error.InvalidClassifierResponse;
+    const rest = status_line[code_start + 1 ..];
+    const code_end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+    const status_code = std.fmt.parseInt(u16, rest[0..code_end], 10) catch return error.InvalidClassifierResponse;
+    if (!http.isSuccess(status_code)) return error.HttpUnexpectedStatus;
+    return parseResponse(gpa, body);
+}
+
+/// Bytes of a URI component as-is. Classifier hosts/paths are plain
+/// literals (IP or hostname, `/classify`); percent-encoded hosts are used
+/// undecoded, which matches how they resolve in practice.
+fn componentText(component: std.Uri.Component) []const u8 {
+    return switch (component) {
+        .raw => |text| text,
+        .percent_encoded => |text| text,
+    };
 }
 
 fn writeRequest(writer: *std.Io.Writer, cwd: []const u8, command: []const u8) !void {
@@ -684,4 +842,74 @@ test "privileged pm: no false positives on safe reads" {
     try std.testing.expectEqual(Verdict.safe, localClassify("pip show requests"));
     try std.testing.expectEqual(Verdict.safe, localClassify("cat adapter.log"));
     try std.testing.expectEqual(Verdict.safe, localClassify("equip installation kit"));
+}
+
+/// Accepts one connection, consumes the request head, then holds the
+/// connection open WITHOUT ever responding — the client-side socket timeout
+/// is the only way the classify call completes. Mirrors the shape of
+/// `MockScriptedServer` (agent.zig), which is file-private to its module.
+const StallServer = struct {
+    io: std.Io,
+    server: std.Io.net.Server,
+
+    fn init(io: std.Io) !StallServer {
+        const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        const server = try addr.listen(io, .{ .reuse_address = true });
+        return .{ .io = io, .server = server };
+    }
+
+    fn deinit(self: *StallServer) void {
+        self.server.deinit(self.io);
+    }
+
+    fn port(self: *const StallServer) u16 {
+        return self.server.socket.address.ip4.port;
+    }
+
+    fn stall(self: *StallServer) void {
+        // Hoisted: the test returns at ~1 s (client deadline) and its frame
+        // — where `self` lives — is popped; the detached worker must touch
+        // nothing on it when it wakes up ~30 s later.
+        const io = self.io;
+        const stream = self.server.accept(io) catch return;
+        defer stream.close(io);
+        var read_buf: [8192]u8 = undefined;
+        var reader = stream.reader(io, &read_buf);
+        var write_buf: [8192]u8 = undefined;
+        var writer = stream.writer(io, &write_buf);
+        var http_server = std.http.Server.init(&reader.interface, &writer.interface);
+        // Consume the head so the client's send phase completes, then stall
+        // well past any client timeout instead of answering.
+        _ = http_server.receiveHead() catch return;
+        io.sleep(std.Io.Duration.fromSeconds(30), .awake) catch return;
+    }
+};
+
+test "classifyFallible times out a stalled classifier and falls back to the local matcher" {
+    // The deadline lives in poll rounds (`classifyOverSocket`), POSIX-only;
+    // on Windows this test would block for the full server stall.
+    if (os.is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server = try StallServer.init(io);
+    defer server.deinit();
+    const worker = try std.Thread.spawn(.{}, StallServer.stall, .{&server});
+    worker.detach(); // never joins: the client timeout ends the test first
+
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/classify", .{server.port()});
+    defer gpa.free(url);
+
+    const started_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    // Destructive on purpose and expecting the timeout error: the stall
+    // server never answers, so the deadline (1 s) is the only way out. The
+    // catch → localClassify fallback one level up is covered by the
+    // dead-port test in plugin_api.zig.
+    const outcome = classifyFallible(gpa, io, url, "/tmp", "rm -rf /", 1);
+    try std.testing.expectError(error.ClassifierTimeout, outcome);
+    // Without the deadline the call only returns when the server's 30 s
+    // stall ends — the bound turns that regression into a failure instead
+    // of a slow test.
+    const elapsed_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started_ms;
+    try std.testing.expect(elapsed_ms < 10_000);
 }
