@@ -7,7 +7,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    // Vendored-vaxis integrity gate: the two `NOVA-LOCAL-PATCH` FocusHandler
+    // Vendored-vaxis integrity gate: the two `ZAY-LOCAL-PATCH` FocusHandler
     // guards (empty `path_to_focused` → SIGSEGV in ReleaseFast on session
     // switch) live in the gitignored vendor copy and silently vanish on every
     // `zig build --fetch` / vaxis bump. This runs at configure time on every
@@ -80,7 +80,7 @@ pub fn build(b: *std.Build) void {
     translate_c.addIncludePath(b.path("vendor/fzy/src"));
     const c_mod = translate_c.createModule();
 
-    const mod = b.addModule("nova", .{
+    const mod = b.addModule("zay", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -96,11 +96,11 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Version string embedded into the binary, surfaced by `nova --version` and
+    // Version string embedded into the binary, surfaced by `zay --version` and
     // the settings panel. SSOT is the git tag: CI passes `-Dversion` explicitly on
     // release builds; local builds fall back to `git describe --tags --always`
     // (or "dev" when git is unavailable / not a repo). Exposed to every file in
-    // the `nova` module as `@import("build").version`.
+    // the `zay` module as `@import("build").version`.
     const version = b.option([]const u8, "version", "Version string to embed (default: git describe or 'dev')") orelse blk: {
         var code: u8 = undefined;
         const raw = b.runAllowFail(&.{ "git", "describe", "--tags", "--always", "--dirty" }, &code, .ignore) catch break :blk "dev";
@@ -281,7 +281,7 @@ pub fn build(b: *std.Build) void {
     // If neither case applies to you, feel free to delete the declaration you
     // don't need and to put everything under a single module.
     const exe = b.addExecutable(.{
-        .name = "nova",
+        .name = "zay",
         .root_module = b.createModule(.{
             // b.createModule defines a new module just like b.addModule but,
             // unlike b.addModule, it does not expose the module to consumers of
@@ -296,12 +296,12 @@ pub fn build(b: *std.Build) void {
             // List of modules available for import in source files part of the
             // root module.
             .imports = &.{
-                // Here "nova" is the name you will use in your source code to
-                // import this module (e.g. `@import("nova")`). The name is
+                // Here "zay" is the name you will use in your source code to
+                // import this module (e.g. `@import("zay")`). The name is
                 // repeated because you are allowed to rename your imports, which
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
-                .{ .name = "nova", .module = mod },
+                .{ .name = "zay", .module = mod },
                 .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
                 .{ .name = "websocket", .module = websocket_mod },
                 .{ .name = "logger", .module = logger_mod },
@@ -318,8 +318,8 @@ pub fn build(b: *std.Build) void {
 
     // Install the vendored models.dev snapshot alongside the binary so
     // loadOrFetchRegistry can seed the cache from it when the network is
-    // unavailable. Installed to <prefix>/share/nova/api.json.
-    const install_vendor = b.addInstallFile(b.path("vendor/models.dev/api.json"), "share/nova/api.json");
+    // unavailable. Installed to <prefix>/share/zay/api.json.
+    const install_vendor = b.addInstallFile(b.path("vendor/models.dev/api.json"), "share/zay/api.json");
     b.getInstallStep().dependOn(&install_vendor.step);
 
     // This creates a top level step. Top level steps have a name and can be
@@ -417,7 +417,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // Lua plugin test runner: `zig build test-plugin` runs Lua test files
-    // through the Nova Lua sandbox. Tests are standalone .lua files under
+    // through the Zay Lua sandbox. Tests are standalone .lua files under
     // examples/plugins/ that use the test_runner module.
     const lua_test_step = b.step("test-plugin", "Run Lua plugin tests");
     {
@@ -428,7 +428,7 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
                 .imports = &.{
-                    .{ .name = "nova", .module = mod },
+                    .{ .name = "zay", .module = mod },
                 },
             }),
         });
@@ -460,13 +460,13 @@ pub fn build(b: *std.Build) void {
 }
 
 /// Fails the build when the vendored vaxis `src/vxfw/App.zig` is missing the
-/// two `NOVA-LOCAL-PATCH` FocusHandler guards. Upstream `assert(path.len > 0)`
+/// two `ZAY-LOCAL-PATCH` FocusHandler guards. Upstream `assert(path.len > 0)`
 /// is stripped in ReleaseFast, and an empty focus path (left behind when
 /// `installRuntime` deinits the runtime that owned the focused widget) then
 /// SIGSEGVs on the next key event. The markers are counted rather than
 /// presence-tested so losing either one of the two guards still fails.
 fn checkVaxisFocusPatch(b: *std.Build, vaxis_dep: *std.Build.Dependency) void {
-    const marker = "NOVA-LOCAL-PATCH";
+    const marker = "ZAY-LOCAL-PATCH";
     const app_file = vaxis_dep.path("src/vxfw/App.zig").getPath(b);
     const contents = std.Io.Dir.cwd().readFileAlloc(b.graph.io, app_file, b.allocator, .limited(1 << 20)) catch |err| {
         std.process.fatal("vaxis vendor check: cannot read {s}: {s}", .{ app_file, @errorName(err) });
@@ -482,7 +482,7 @@ fn checkVaxisFocusPatch(b: *std.Build, vaxis_dep: *std.Build.Dependency) void {
     if (markers >= 2) return;
 
     std.process.fatal(
-        \\Vendored vaxis is missing the NOVA-LOCAL-PATCH FocusHandler guards:
+        \\Vendored vaxis is missing the ZAY-LOCAL-PATCH FocusHandler guards:
         \\  {s}
         \\found {d} of 2 markers; without them a session switch can SIGSEGV in
         \\ReleaseFast. Re-apply after every `zig build --fetch` / vaxis bump:

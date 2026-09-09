@@ -86,7 +86,7 @@ engine: Engine = .{ .idle = .primary },
 /// `/parallel` (oldest first) — context for the branch-naming request fired
 /// on the lane's first submit. Owned; consumed by the naming job.
 parent_context: [][]u8 = &.{},
-/// The async branch-naming request (the lane starts on a `nova/<hex>` branch
+/// The async branch-naming request (the lane starts on a `zay/<hex>` branch
 /// and is renamed in place when the model's name lands). The future needs
 /// `io` to cancel, so the App (not `deinit` here) is responsible for it.
 naming_future: ?std.Io.Future(naming.BranchOutcome) = null,
@@ -299,12 +299,12 @@ test "lane frees its captured parent context" {
 test "idle working lane frees its worktree branch and path" {
     const gpa = std.testing.allocator;
     var thread: Thread = .{ .engine = .{ .idle = .{ .working = .{
-        .branch = try gpa.dupe(u8, "nova/x"),
-        .path = try gpa.dupe(u8, "/home/user/.config/nova/worktrees/x"),
+        .branch = try gpa.dupe(u8, "zay/x"),
+        .path = try gpa.dupe(u8, "/home/user/.config/zay/worktrees/x"),
     } } } };
 
-    try std.testing.expectEqualStrings("nova/x", thread.engine.idle.working.branch);
-    try std.testing.expectEqualStrings("/home/user/.config/nova/worktrees/x", thread.engine.idle.working.path);
+    try std.testing.expectEqualStrings("zay/x", thread.engine.idle.working.branch);
+    try std.testing.expectEqualStrings("/home/user/.config/zay/worktrees/x", thread.engine.idle.working.path);
 
     thread.deinit(gpa);
 }

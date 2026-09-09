@@ -1,10 +1,10 @@
-//! Nova's resolved preferences record and its layered loader.
+//! Zay's resolved preferences record and its layered loader.
 //! Four sources, field-merged, later overrides earlier:
 //!   1. built-in defaults
-//!   2. global  `<home>/.config/nova/config.json`
-//!   3. project `<cwd>/.nova/config.json`
+//!   2. global  `<home>/.config/zay/config.json`
+//!   3. project `<cwd>/.zay/config.json`
 //!   4. env vars: OPENAI_BASE_URL, OPENAI_API_KEY, OPENAI_MODEL,
-//!                NOVA_USE_RESPONSES_ENDPOINT, NOVA_BASH_CLASSIFIER_URL
+//!                ZAY_USE_RESPONSES_ENDPOINT, ZAY_BASH_CLASSIFIER_URL
 //!
 //! `model` is a `<provider>/<model-id>` selection string. Model-specific
 //! fields such as `reasoningEffort` live under `providers.<provider>.models`.
@@ -195,8 +195,8 @@ pub const TuiSettings = struct {
     /// Recolor the UI live while browsing themes in the /theme picker.
     theme_live_preview: bool = true,
     /// Optional directory containing user theme JSON files. When set, it
-    /// REPLACES the default scan of `~/.config/nova/themes/` and
-    /// `.nova/themes/`. Owned when parsed from disk.
+    /// REPLACES the default scan of `~/.config/zay/themes/` and
+    /// `.zay/themes/`. Owned when parsed from disk.
     custom_themes_dir: ?[]u8 = null,
     /// Highlight matching characters in search pickers.
     fuzzy_highlight: bool = true,
@@ -372,7 +372,7 @@ pub const Config = struct {
         return try list.toOwnedSlice(gpa);
     }
 
-    /// Alias for `clone`, used by `nova.run` to hand the TUI an owned
+    /// Alias for `clone`, used by `zay.run` to hand the TUI an owned
     /// copy of the merged config that outlives `load_result`.
     pub fn cloneForTui(self: Config, gpa: std.mem.Allocator) !Config {
         return self.clone(gpa);

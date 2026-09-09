@@ -3,7 +3,7 @@
 //! Keychain Services; every other OS reports `error.Unsupported` so callers can
 //! fall back to plaintext storage.
 //!
-//! The secret is an opaque byte blob (Nova hands it the serialized `auth.json`).
+//! The secret is an opaque byte blob (Zay hands it the serialized `auth.json`).
 //! `load` returns gpa-owned bytes (or null when the entry is absent); `save`
 //! upserts; `delete` removes and reports whether anything was there.
 
@@ -282,7 +282,7 @@ test "windowsBackend_rejectsOversizedSecret_withBackendError" {
     if (os.tag != .windows) return error.SkipZigTest;
 
     const gpa = std.testing.allocator;
-    const service = "NovaTest";
+    const service = "ZayTest";
     const account = "account";
 
     // CRED_MAX_CREDENTIAL_BLOB_SIZE (Vista+) is 5 * 512 bytes; the OS rejects
@@ -296,7 +296,7 @@ test "save_upsertsSecret_whenCalledTwiceForSameServiceAndAccount" {
     // Exercises the public dispatch so the upsert path stays reachable from
     // production call sites; skips cleanly on platforms without a keychain.
     const gpa = std.testing.allocator;
-    const service = "Nova Test";
+    const service = "Zay Test";
     const account = "cli|keyringtest_overwrite";
     _ = delete(gpa, service, account) catch {};
 
@@ -315,7 +315,7 @@ test "save_upsertsSecret_whenCalledTwiceForSameServiceAndAccount" {
 
 test "save_acceptsEmptySecret_whenEmptyStringProvided" {
     const gpa = std.testing.allocator;
-    const service = "Nova Test";
+    const service = "Zay Test";
     const account = "cli|keyringtest_empty";
     _ = delete(gpa, service, account) catch {};
 
@@ -335,7 +335,7 @@ test "save_acceptsEmptySecret_whenEmptyStringProvided" {
 
 test "keyring round-trips a secret on supported platforms" {
     const gpa = std.testing.allocator;
-    const service = "Nova Test";
+    const service = "Zay Test";
     const account = "cli|keyringtest0";
 
     // Clean any leftover from a previous aborted run.
@@ -432,9 +432,9 @@ test "returnsErrorUnsupported_whenBackendIsUnsupported" {
     const gpa = std.testing.allocator;
 
     // Act & Assert
-    try std.testing.expectError(error.Unsupported, loadImpl(Unsupported, gpa, "Nova", "user1"));
-    try std.testing.expectError(error.Unsupported, saveImpl(Unsupported, gpa, "Nova", "user1", "secret"));
-    try std.testing.expectError(error.Unsupported, deleteImpl(Unsupported, gpa, "Nova", "user1"));
+    try std.testing.expectError(error.Unsupported, loadImpl(Unsupported, gpa, "Zay", "user1"));
+    try std.testing.expectError(error.Unsupported, saveImpl(Unsupported, gpa, "Zay", "user1", "secret"));
+    try std.testing.expectError(error.Unsupported, deleteImpl(Unsupported, gpa, "Zay", "user1"));
 }
 
 test "returnsNull_whenNoSecretExists" {
@@ -444,7 +444,7 @@ test "returnsNull_whenNoSecretExists" {
     defer MockBackend.reset(gpa);
 
     // Act
-    const result = try loadImpl(MockBackend, gpa, "Nova", "nonexistent");
+    const result = try loadImpl(MockBackend, gpa, "Zay", "nonexistent");
 
     // Assert
     try std.testing.expectEqual(@as(?[]u8, null), result);
@@ -455,10 +455,10 @@ test "returnsSecret_whenEntryExists" {
     const gpa = std.testing.allocator;
     MockBackend.reset(gpa);
     defer MockBackend.reset(gpa);
-    try saveImpl(MockBackend, gpa, "Nova", "user1", "secret123");
+    try saveImpl(MockBackend, gpa, "Zay", "user1", "secret123");
 
     // Act
-    const loaded = try loadImpl(MockBackend, gpa, "Nova", "user1");
+    const loaded = try loadImpl(MockBackend, gpa, "Zay", "user1");
 
     // Assert
     try std.testing.expect(loaded != null);
@@ -471,11 +471,11 @@ test "overwritesSecret_whenEntryAlreadyExists" {
     const gpa = std.testing.allocator;
     MockBackend.reset(gpa);
     defer MockBackend.reset(gpa);
-    try saveImpl(MockBackend, gpa, "Nova", "user1", "initial_secret");
+    try saveImpl(MockBackend, gpa, "Zay", "user1", "initial_secret");
 
     // Act
-    try saveImpl(MockBackend, gpa, "Nova", "user1", "updated_secret");
-    const loaded = try loadImpl(MockBackend, gpa, "Nova", "user1");
+    try saveImpl(MockBackend, gpa, "Zay", "user1", "updated_secret");
+    const loaded = try loadImpl(MockBackend, gpa, "Zay", "user1");
 
     // Assert
     try std.testing.expect(loaded != null);
@@ -488,18 +488,18 @@ test "deletesEntry_andReturnsNullOnSubsequentLoad" {
     const gpa = std.testing.allocator;
     MockBackend.reset(gpa);
     defer MockBackend.reset(gpa);
-    try saveImpl(MockBackend, gpa, "Nova", "user1", "secret_to_delete");
+    try saveImpl(MockBackend, gpa, "Zay", "user1", "secret_to_delete");
 
     // Act
-    const deleted = try deleteImpl(MockBackend, gpa, "Nova", "user1");
-    const loaded = try loadImpl(MockBackend, gpa, "Nova", "user1");
+    const deleted = try deleteImpl(MockBackend, gpa, "Zay", "user1");
+    const loaded = try loadImpl(MockBackend, gpa, "Zay", "user1");
 
     // Assert
     try std.testing.expect(deleted);
     try std.testing.expectEqual(@as(?[]u8, null), loaded);
 
     // Deleting again returns false
-    const delete_again = try deleteImpl(MockBackend, gpa, "Nova", "user1");
+    const delete_again = try deleteImpl(MockBackend, gpa, "Zay", "user1");
     try std.testing.expect(!delete_again);
 }
 
@@ -508,9 +508,9 @@ test "returnsError_whenBackendFails" {
     const gpa = std.testing.allocator;
 
     // Act & Assert
-    try std.testing.expectError(error.Backend, loadImpl(FailureMockBackend, gpa, "Nova", "user1"));
-    try std.testing.expectError(error.Backend, saveImpl(FailureMockBackend, gpa, "Nova", "user1", "secret"));
-    try std.testing.expectError(error.Backend, deleteImpl(FailureMockBackend, gpa, "Nova", "user1"));
+    try std.testing.expectError(error.Backend, loadImpl(FailureMockBackend, gpa, "Zay", "user1"));
+    try std.testing.expectError(error.Backend, saveImpl(FailureMockBackend, gpa, "Zay", "user1", "secret"));
+    try std.testing.expectError(error.Backend, deleteImpl(FailureMockBackend, gpa, "Zay", "user1"));
 }
 
 test "formatsWindowsTargetName_asUtf16LeWithColon" {
@@ -518,11 +518,11 @@ test "formatsWindowsTargetName_asUtf16LeWithColon" {
     const gpa = std.testing.allocator;
 
     // Act
-    const target = try Windows.targetName(gpa, "Nova", "account1");
+    const target = try Windows.targetName(gpa, "Zay", "account1");
     defer gpa.free(target);
 
-    // Assert: UTF-16 representation of "Nova:account1"
-    const expected_utf8 = "Nova:account1";
+    // Assert: UTF-16 representation of "Zay:account1"
+    const expected_utf8 = "Zay:account1";
     const expected_utf16 = try std.unicode.utf8ToUtf16LeAllocZ(gpa, expected_utf8);
     defer gpa.free(expected_utf16);
 
@@ -538,7 +538,7 @@ test "rejectsOversizedSecret_onWindowsSave" {
     @memset(oversized_secret, 'x');
 
     // Act & Assert
-    try std.testing.expectError(error.Backend, saveImpl(Windows, gpa, "Nova", "account1", oversized_secret));
+    try std.testing.expectError(error.Backend, saveImpl(Windows, gpa, "Zay", "account1", oversized_secret));
 }
 
 test "unsupportedBackend_returnsUnsupported_forLoadSaveDelete" {
@@ -550,7 +550,7 @@ test "unsupportedBackend_returnsUnsupported_forLoadSaveDelete" {
 
 test "delete_returnsFalse_whenEntryDoesNotExist" {
     const gpa = std.testing.allocator;
-    const service = "Nova Test Nonexistent Service";
+    const service = "Zay Test Nonexistent Service";
     const account = "cli|nonexistent_account_12345";
 
     const result = delete(gpa, service, account) catch |err| switch (err) {
@@ -562,7 +562,7 @@ test "delete_returnsFalse_whenEntryDoesNotExist" {
 
 test "delete_returnsTrue_whenEntryExistsAndIsDeleted" {
     const gpa = std.testing.allocator;
-    const service = "Nova Test Delete";
+    const service = "Zay Test Delete";
     const account = "cli|keyringtest_delete";
 
     _ = delete(gpa, service, account) catch {};

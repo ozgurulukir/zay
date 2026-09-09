@@ -1,6 +1,6 @@
 //! Bridge between the Lua plugin system and the agent's `ToolRegistry`.
 //!
-//! Plugin tools (registered through `nova.register_tool` from inside
+//! Plugin tools (registered through `zay.register_tool` from inside
 //! `init.lua`) are materialized as `tools.Tool` records and inserted into
 //! the registry. Each `Tool` carries a `PluginToolKey` in its `userdata`
 //! field; the shared `runPluginTool` / `displayPluginTool` dispatchers
@@ -207,7 +207,7 @@ pub fn buildPluginToolDescriptors(
         if (!plugin.active) continue;
         const L = plugin.state.handle;
 
-        _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "nova_tools");
+        _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "zay_tools");
         if (c.lua_isnil(L, -1)) {
             c.lua_pop(L, 1);
             continue;
@@ -260,7 +260,7 @@ pub fn buildPluginToolDescriptors(
 
             c.lua_pop(L, 3); // pop desc, name, entry
         }
-        c.lua_pop(L, 1); // pop nova_tools
+        c.lua_pop(L, 1); // pop zay_tools
     }
     return out.toOwnedSlice(gpa);
 }

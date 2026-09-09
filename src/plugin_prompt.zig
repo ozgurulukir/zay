@@ -25,7 +25,7 @@ pub const max_aggregate_prompt_bytes: usize = 64 * 1024;
 /// One plugin's prompt text, ready to render into the system prompt.
 ///
 /// `name` is the plugin directory name (the key the user sees in
-/// `~/.config/nova/plugins/<name>`). `body` is the markdown with any
+/// `~/.config/zay/plugins/<name>`). `body` is the markdown with any
 /// frontmatter fence stripped. All fields are owned by the caller's `gpa`
 /// and freed via `deinit`.
 pub const PluginPrompt = struct {
@@ -45,8 +45,8 @@ pub const PluginPrompt = struct {
 
 /// Discover and load every plugin's `prompt.md` across both plugin roots.
 ///
-/// Scans `<home_dir>/.config/nova/plugins/<plugin>/prompt.md` first, then
-/// `<cwd>/.nova/plugins/<plugin>/prompt.md`. A project entry with the same
+/// Scans `<home_dir>/.config/zay/plugins/<plugin>/prompt.md` first, then
+/// `<cwd>/.zay/plugins/<plugin>/prompt.md`. A project entry with the same
 /// directory name overrides the global one (matching `PluginManager`'s
 /// load order). Plugins without a `prompt.md`, or whose body is empty after
 /// frontmatter stripping, are silently skipped — a missing or blank prompt
@@ -60,10 +60,10 @@ pub fn loadAll(
     var prompts: std.ArrayList(PluginPrompt) = .empty;
     errdefer deinitAll(gpa, prompts.items);
 
-    const global_parts = [_][]const u8{ ".config", "nova", "plugins" };
-    const project_parts = [_][]const u8{ ".nova", "plugins" };
+    const global_parts = [_][]const u8{ ".config", "zay", "plugins" };
+    const project_parts = [_][]const u8{ ".zay", "plugins" };
     if (os.is_windows and home_dir.len > 0) {
-        const appdata_parts = [_][]const u8{ "AppData", "Roaming", "nova", "plugins" };
+        const appdata_parts = [_][]const u8{ "AppData", "Roaming", "zay", "plugins" };
         try scanRoot(gpa, io, home_dir, &appdata_parts, &prompts);
     }
     try scanRoot(gpa, io, home_dir, &global_parts, &prompts);
@@ -251,7 +251,7 @@ test "loadAll finds prompt.md and strips frontmatter" {
     defer gpa.free(root);
 
     const rel_dir = ".zig-cache/plugin-prompt-test";
-    const plugins_dir = rel_dir ++ "/.nova/plugins/write-tool";
+    const plugins_dir = rel_dir ++ "/.zay/plugins/write-tool";
     try std.Io.Dir.createDirPath(.cwd(), io, plugins_dir);
 
     var file = try std.Io.Dir.createFile(.cwd(), io, plugins_dir ++ "/prompt.md", .{ .truncate = true });
@@ -281,7 +281,7 @@ test "loadAll skips plugins without prompt.md" {
     defer gpa.free(root);
 
     const rel_dir = ".zig-cache/plugin-prompt-noop-test";
-    try std.Io.Dir.createDirPath(.cwd(), io, rel_dir ++ "/.nova/plugins/no-prompt");
+    try std.Io.Dir.createDirPath(.cwd(), io, rel_dir ++ "/.zay/plugins/no-prompt");
 
     const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
     defer gpa.free(cwd);
@@ -299,7 +299,7 @@ test "loadAll: project overrides global with same plugin name" {
 
     const rel_dir = ".zig-cache/plugin-prompt-override-test";
     // Global plugin dir.
-    const global_plugins = rel_dir ++ "/global/.config/nova/plugins/shared";
+    const global_plugins = rel_dir ++ "/global/.config/zay/plugins/shared";
     try std.Io.Dir.createDirPath(.cwd(), io, global_plugins);
     var gfile = try std.Io.Dir.createFile(.cwd(), io, global_plugins ++ "/prompt.md", .{ .truncate = true });
     defer gfile.close(io);
@@ -309,7 +309,7 @@ test "loadAll: project overrides global with same plugin name" {
     try gw.interface.flush();
 
     // Project plugin dir with the same name.
-    const proj_plugins = rel_dir ++ "/project/.nova/plugins/shared";
+    const proj_plugins = rel_dir ++ "/project/.zay/plugins/shared";
     try std.Io.Dir.createDirPath(.cwd(), io, proj_plugins);
     var pfile = try std.Io.Dir.createFile(.cwd(), io, proj_plugins ++ "/prompt.md", .{ .truncate = true });
     defer pfile.close(io);
@@ -401,7 +401,7 @@ test "loadOne rejects prompt.md exceeding max_body_bytes (32 KB)" {
     defer gpa.free(root);
 
     const rel_dir = ".zig-cache/plugin-prompt-oversized-test";
-    const plugins_dir = rel_dir ++ "/.nova/plugins/big-plugin";
+    const plugins_dir = rel_dir ++ "/.zay/plugins/big-plugin";
     try std.Io.Dir.createDirPath(.cwd(), io, plugins_dir);
 
     const prompt_path = plugins_dir ++ "/prompt.md";

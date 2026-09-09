@@ -172,23 +172,23 @@ pub fn capture(gpa: std.mem.Allocator, io: std.Io, options: CaptureOptions) !Cap
 }
 
 /// Per-shell `capture_sink.Sink` instantiation: the spill log carries the
-/// bash prunable prefix (`nova-bash-`, pinned by temp_files tests) and spills
-/// into the one temp dir both bash and Nova agree on.
+/// bash prunable prefix (`zay-bash-`, pinned by temp_files tests) and spills
+/// into the one temp dir both bash and Zay agree on.
 const BashSinkConfig = struct {
     pub const spill_prefix = temp_files.bash_spill_prefix;
     pub const spillDir = tempDir;
 };
 const Sink = capture_sink.Sink(BashSinkConfig);
 
-/// Resolve a temp directory that both the shell and Nova agree on.
+/// Resolve a temp directory that both the shell and Zay agree on.
 ///
 /// On Windows the bash tool runs under git bash, which maps `/tmp` to `%TEMP%`,
-/// but Nova reads the spilled output back through the Windows file API — there
+/// but Zay reads the spilled output back through the Windows file API — there
 /// a literal `/tmp/...` resolves against the current drive root (`C:\tmp\...`),
 /// not where the shell actually wrote. Using the real `%TEMP%` keeps the write
 /// and the read pointing at the same file. POSIX shares one `/tmp` already.
 /// `pub` so `pwsh_exec` (which mirrors the spill-to-disk capture path) reuses
-/// the one temp dir both shells and Nova agree on.
+/// the one temp dir both shells and Zay agree on.
 pub fn tempDir(gpa: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
     if (!os.is_windows) return gpa.dupe(u8, "/tmp");
     for ([_][]const u8{ "TEMP", "TMP" }) |key| {
@@ -214,9 +214,9 @@ pub fn tempDir(gpa: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
 // chatter (which precedes the marker) is discarded. `compgen -e` lists exported
 // names; `${!k}` reads each value; `PWD`/`OLDPWD` are skipped so a stale cwd is
 // not carried. Values are emitted NUL-terminated so newlines/`=` survive intact.
-const login_env_marker = "\x00__NOVA_LOGIN_ENV__\x00";
+const login_env_marker = "\x00__ZAY_LOGIN_ENV__\x00";
 const login_env_dump =
-    "printf '\\0__NOVA_LOGIN_ENV__\\0'; " ++
+    "printf '\\0__ZAY_LOGIN_ENV__\\0'; " ++
     "for k in $(compgen -e); do case \"$k\" in PWD|OLDPWD) continue ;; esac; printf '%s=%s\\0' \"$k\" \"${!k}\"; done";
 const login_env_bytes_limit: usize = 1024 * 1024;
 const login_env_stderr_limit: usize = 64 * 1024;
@@ -285,7 +285,7 @@ pub fn shellPath(io: std.Io) []const u8 {
     return bashPath(io);
 }
 
-/// Join `name` under the temp directory both the shell and Nova agree on (see
+/// Join `name` under the temp directory both the shell and Zay agree on (see
 /// `tempDir`). Used for background-job log files so the model can `tail` a stable
 /// path. Caller owns the result.
 /// Asserts that `name` contains no path separators (to prevent path traversal).
@@ -298,8 +298,8 @@ pub fn namedTempPath(gpa: std.mem.Allocator, name: []const u8) std.mem.Allocator
 
 pub const temp_retention_ns: u64 = 24 * std.time.ns_per_hour;
 
-/// Best-effort cleanup of stale spill (`nova-bash-*`) and background-log
-/// (`nova-bg_*`) files older than `max_age_ns`. Called once at startup, when no
+/// Best-effort cleanup of stale spill (`zay-bash-*`) and background-log
+/// (`zay-bg_*`) files older than `max_age_ns`. Called once at startup, when no
 /// session can still be reading a previous process's output (TD-6).
 pub fn pruneStaleTempFiles(io: std.Io, gpa: std.mem.Allocator, max_age_ns: u64) void {
     const dir_path = tempDir(gpa) catch return;
@@ -309,7 +309,7 @@ pub fn pruneStaleTempFiles(io: std.Io, gpa: std.mem.Allocator, max_age_ns: u64) 
 
 /// The dir-parameterized core of `pruneStaleTempFiles`, separated so tests can
 /// target a scratch dir instead of the shared temp dir. Prefix-scoped via
-/// `temp_files.isPrunable` (the writers' prefixes, never bare `nova-`) so
+/// `temp_files.isPrunable` (the writers' prefixes, never bare `zay-`) so
 /// unrelated temp files are untouched; mtime is compared against the wall clock
 /// (`.real`); every operation is `catch`-tolerant so cleanup can never break
 /// startup.
@@ -465,9 +465,9 @@ test "pruneTempDir removes only matching stale files" {
     const dir_path = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
     defer gpa.free(dir_path);
 
-    (try tmp.dir.createFile(std.testing.io, "nova-bash-abcdef.log", .{})).close(std.testing.io);
-    (try tmp.dir.createFile(std.testing.io, "nova-pwsh-123456.log", .{})).close(std.testing.io);
-    (try tmp.dir.createFile(std.testing.io, "nova-bg_1.log", .{})).close(std.testing.io);
+    (try tmp.dir.createFile(std.testing.io, "zay-bash-abcdef.log", .{})).close(std.testing.io);
+    (try tmp.dir.createFile(std.testing.io, "zay-pwsh-123456.log", .{})).close(std.testing.io);
+    (try tmp.dir.createFile(std.testing.io, "zay-bg_1.log", .{})).close(std.testing.io);
     (try tmp.dir.createFile(std.testing.io, "keep.txt", .{})).close(std.testing.io);
 
     const tmp_has = struct {
@@ -478,17 +478,17 @@ test "pruneTempDir removes only matching stale files" {
 
     // Fresh files are younger than the retention window: nothing is removed.
     pruneTempDir(std.testing.io, dir_path, temp_retention_ns);
-    try std.testing.expect(tmp_has(std.testing.io, tmp.dir, "nova-bash-abcdef.log"));
-    try std.testing.expect(tmp_has(std.testing.io, tmp.dir, "nova-pwsh-123456.log"));
-    try std.testing.expect(tmp_has(std.testing.io, tmp.dir, "nova-bg_1.log"));
+    try std.testing.expect(tmp_has(std.testing.io, tmp.dir, "zay-bash-abcdef.log"));
+    try std.testing.expect(tmp_has(std.testing.io, tmp.dir, "zay-pwsh-123456.log"));
+    try std.testing.expect(tmp_has(std.testing.io, tmp.dir, "zay-bg_1.log"));
     try std.testing.expect(tmp_has(std.testing.io, tmp.dir, "keep.txt"));
 
-    // With a ~1ns window the nova files are stale and removed, while keep.txt
+    // With a ~1ns window the zay files are stale and removed, while keep.txt
     // (a different prefix) survives — prefix-scoping is the property under test.
     pruneTempDir(std.testing.io, dir_path, 1);
-    try std.testing.expect(!tmp_has(std.testing.io, tmp.dir, "nova-bash-abcdef.log"));
-    try std.testing.expect(!tmp_has(std.testing.io, tmp.dir, "nova-pwsh-123456.log"));
-    try std.testing.expect(!tmp_has(std.testing.io, tmp.dir, "nova-bg_1.log"));
+    try std.testing.expect(!tmp_has(std.testing.io, tmp.dir, "zay-bash-abcdef.log"));
+    try std.testing.expect(!tmp_has(std.testing.io, tmp.dir, "zay-pwsh-123456.log"));
+    try std.testing.expect(!tmp_has(std.testing.io, tmp.dir, "zay-bg_1.log"));
     try std.testing.expect(tmp_has(std.testing.io, tmp.dir, "keep.txt"));
 }
 

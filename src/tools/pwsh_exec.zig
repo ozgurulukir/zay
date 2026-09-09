@@ -26,10 +26,10 @@
 //!   `exec 2>&1` redirect.
 //! - The capture machinery (`Sink`, spill files, `drainChild`, result types)
 //!   is SHARED with `bash_exec.zig` via `capture_sink.zig` — the spill-file
-//!   prefix is the only per-shell bit (`nova-pwsh-`).
+//!   prefix is the only per-shell bit (`zay-pwsh-`).
 //! - `tempDir()`/`namedTempPath()` are REUSED from `bash_exec` (no second
 //!   temp-walk; `pruneTempDir` matches both prefixes). Script temp files use the
-//!   `nova-pwsh-script-<hex>.ps1` prefix so a crash-stranded file is also pruned.
+//!   `zay-pwsh-script-<hex>.ps1` prefix so a crash-stranded file is also pruned.
 //! - POSIX-only no-op stubs: `loginEnvBlock()` returns null, and
 //!   `disablePseudoConsole()` does nothing (no MSYS2/Cygwin in PowerShell).
 
@@ -128,7 +128,7 @@ fn runUnderPwsh(gpa: std.mem.Allocator, io: std.Io, options: RunOptions) !Result
     return capture_sink.drainChild(gpa, io, &child, options.timeout);
 }
 
-/// Write `script` to a fresh `nova-pwsh-script-<hex>.ps1` temp file under the
+/// Write `script` to a fresh `zay-pwsh-script-<hex>.ps1` temp file under the
 /// shared temp dir (reusing `bash_exec.namedTempPath`'s containment checks).
 /// Caller owns the returned path and must `cleanupScriptTemp` it.
 fn writeScriptTemp(gpa: std.mem.Allocator, io: std.Io, script: []const u8) ![]u8 {
@@ -265,7 +265,7 @@ pub fn capture(gpa: std.mem.Allocator, io: std.Io, options: CaptureOptions) !Cap
 }
 
 /// Per-shell `capture_sink.Sink` instantiation: the spill log carries the pwsh
-/// prunable prefix (`nova-pwsh-`, pinned by temp_files tests) and spills into
+/// prunable prefix (`zay-pwsh-`, pinned by temp_files tests) and spills into
 /// the same shared temp dir bash uses (`bash_exec.tempDir`).
 const PwshSinkConfig = struct {
     pub const spill_prefix = temp_files.pwsh_prefix;

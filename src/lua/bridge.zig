@@ -18,7 +18,7 @@ const State = @import("state.zig").State;
 pub threadlocal var plugin_cwd_slot: ?[]const u8 = null;
 
 /// Thread-local carrying the remote shell-safety classifier URL to the Lua C
-/// boundary, so `nova.run_bash`/`nova.run_shell` gate plugin shell execution
+/// boundary, so `zay.run_bash`/`zay.run_shell` gate plugin shell execution
 /// through the same classifier as the builtin tool (`bash_safety.classify`).
 /// Set by the executor around the whole `runAll` (covers observer-driven
 /// plugin event callbacks) and re-asserted around each plugin dispatch. Lives

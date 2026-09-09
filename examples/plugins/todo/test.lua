@@ -1,6 +1,6 @@
 -- test.lua — Todo plugin tests
 --
--- Loads the real plugin source with a mocked `nova` bridge and exercises the
+-- Loads the real plugin source with a mocked `zay` bridge and exercises the
 -- handlers. Covers the data-integrity fixes:
 --   B1  parse_line off-by-one: round-trip keeps a single space and `created`.
 --   B4  todo_add must not rewrite mid-sentence `id:N` mentions.
@@ -9,23 +9,23 @@
 --   B5  a failing write_file makes mutating tools return an error string.
 local test = test_runner
 
--- ── Mock the nova bridge, then load the plugin ──────────────────────
+-- ── Mock the zay bridge, then load the plugin ──────────────────────
 local registered = {}
 local todos_content = ""
 local plans_content = nil
 local write_reply = true
 local last_write = nil
 
-nova = {
+zay = {
   register_tool = function(tool)
     registered[tool.name] = tool
   end,
   on = function() return true end,
   read_file = function(path, opts)
-    if path == ".nova/todos.txt" then
+    if path == ".zay/todos.txt" then
       return { content = todos_content, path = path }
     end
-    if path == ".nova/todos/plans.json" then
+    if path == ".zay/todos/plans.json" then
       if plans_content == nil then return nil end
       return { content = plans_content, path = path }
     end

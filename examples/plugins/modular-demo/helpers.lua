@@ -1,4 +1,4 @@
--- helpers.lua — Submodule loaded via nova.require("./helpers")
+-- helpers.lua — Submodule loaded via zay.require("./helpers")
 local Helpers = {}
 
 function Helpers.calculate_stats(numbers)

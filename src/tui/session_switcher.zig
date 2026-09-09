@@ -411,7 +411,7 @@ pub fn createRuntime(app: *App, cwd: []const u8, session_dir: []const u8, sessio
     const template: ?*const runtime_mod.AgentRuntime = if (cross_project) null else current;
 
     // Cross-project resume: reload config from the target project's
-    // `.nova/config.json` so MCP servers, model selection, and project-scoped
+    // `.zay/config.json` so MCP servers, model selection, and project-scoped
     // settings match the session's own project. The env layer is constant
     // (process env vars don't change between projects), so we reuse the
     // environ_map captured at startup.

@@ -1,8 +1,8 @@
 -- init.lua — Main plugin entrypoint requiring submodules
-local helpers = nova.require("./helpers")
-local formatter = nova.require("formatter")
+local helpers = zay.require("./helpers")
+local formatter = zay.require("formatter")
 
-nova.register_tool({
+zay.register_tool({
   name = "calculate_stats",
   description = "Calculate and format statistics for a list of comma-separated numbers",
   parameters = {

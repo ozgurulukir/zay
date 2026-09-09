@@ -305,7 +305,7 @@ pub const McpClient = struct {
     /// Only `notifications/tools/list_changed` is consumed (sets
     /// `pending_tools_refresh`); other notifications (progress, logging,
     /// resources/list_changed, prompts/list_changed) are accepted but ignored
-    /// — Nova doesn't expose those primitives yet. `payload` is unused for
+    /// — Zay doesn't expose those primitives yet. `payload` is unused for
     /// the list_changed path (the spec carries no params), but kept on the
     /// signature for future notifications that do carry params.
     fn handleNotification(self: *McpClient, method: []const u8, payload: []const u8) void {
@@ -708,7 +708,7 @@ pub const McpClient = struct {
     /// On success, sets status to .connected, records latency, and captures
     /// the server's reported protocol version, serverInfo, and the
     /// `tools.listChanged` capability flag (for `notifications/tools/list_changed`
-    /// subscription). Nova is a client only — it advertises no client
+    /// subscription). Zay is a client only — it advertises no client
     /// capabilities (no sampling, no roots, no elicitation server-side).
     pub fn initialize(self: *McpClient, io: std.Io) !void {
         const start = std.Io.Timestamp.now(io, .awake);
@@ -720,7 +720,7 @@ pub const McpClient = struct {
             .sse => protocol_version_streamable_http,
         };
         const params = try std.fmt.allocPrint(self.gpa,
-            \\{{"protocolVersion":"{s}","capabilities":{{}},"clientInfo":{{"name":"nova","version":"1.0"}}}}
+            \\{{"protocolVersion":"{s}","capabilities":{{}},"clientInfo":{{"name":"zay","version":"1.0"}}}}
         , .{protocol_version});
         defer self.gpa.free(params);
 

@@ -1,4 +1,4 @@
-//! Async branch naming for parallel lanes. A lane starts on a `nova/<hex>`
+//! Async branch naming for parallel lanes. A lane starts on a `zay/<hex>`
 //! branch; on its first submit a job asks the session's own model (via the
 //! runtime's dedicated naming client, never the connection driving the live
 //! turn) for a descriptive name, and the branch is renamed in place when it
@@ -45,7 +45,7 @@ pub const BranchJob = struct {
 };
 
 pub const BranchOutcome = struct {
-    /// Sanitized branch slug (without the `nova/` prefix), or null when the
+    /// Sanitized branch slug (without the `zay/` prefix), or null when the
     /// model produced nothing usable. Owned.
     slug: ?[]u8,
 
@@ -114,7 +114,7 @@ fn excerpt(message: []const u8) []const u8 {
 }
 
 /// The model's raw output shaped into a valid, readable git branch slug:
-/// first line only, an echoed label ("branch name: …") / quotes / `nova/`
+/// first line only, an echoed label ("branch name: …") / quotes / `zay/`
 /// prefix stripped, lowercased, non-alphanumerics collapsed into single
 /// dashes, capped at `branch_slug_max`. Null when nothing survives.
 pub fn sanitizeBranchSlug(gpa: std.mem.Allocator, raw: []const u8) !?[]u8 {
@@ -126,7 +126,7 @@ pub fn sanitizeBranchSlug(gpa: std.mem.Allocator, raw: []const u8) !?[]u8 {
         if (rest.len > 0) line = rest;
     }
     line = std.mem.trim(u8, line, " \t\"'`");
-    if (std.mem.startsWith(u8, line, "nova/")) line = line["nova/".len..];
+    if (std.mem.startsWith(u8, line, "zay/")) line = line["zay/".len..];
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -143,7 +143,7 @@ pub fn sanitizeBranchSlug(gpa: std.mem.Allocator, raw: []const u8) !?[]u8 {
     if (out.items.len == 0) return null;
     // Generic or collision-prone names; keeping the hex id beats a lane that
     // reads like the repo's actual main branch.
-    const rejected = [_][]const u8{ "main", "master", "branch", "branch-name", "name", "git", "nova" };
+    const rejected = [_][]const u8{ "main", "master", "branch", "branch-name", "name", "git", "zay" };
     for (rejected) |bad| {
         if (std.mem.eql(u8, out.items, bad)) return null;
     }
@@ -163,7 +163,7 @@ test "sanitizeBranchSlug shapes model output into a git slug" {
     defer gpa.free(plain);
     try std.testing.expectEqualStrings("fix-login-race", plain);
 
-    const messy = (try sanitizeBranchSlug(gpa, "  `nova/Fix_Login  Race!`\nExtra explanation line")).?;
+    const messy = (try sanitizeBranchSlug(gpa, "  `zay/Fix_Login  Race!`\nExtra explanation line")).?;
     defer gpa.free(messy);
     try std.testing.expectEqualStrings("fix-login-race", messy);
 

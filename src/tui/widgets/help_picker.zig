@@ -65,7 +65,7 @@ pub const help_lines = [_]HelpLine{
     .{ .key = "/skills", .desc = "List loaded skills & invocation names" },
     .{ .key = "/clear", .desc = "Clear current transcript view" },
     .{ .key = "/help", .desc = "Open this quick reference guide" },
-    .{ .key = "/exit", .desc = "Quit Nova agent" },
+    .{ .key = "/exit", .desc = "Quit Zay agent" },
 
     .{ .key = "DIFF VIEWER", .desc = "", .is_header = true },
     .{ .key = "Ctrl+W", .desc = "Add comment on selected range", .scope = .diff_viewer },

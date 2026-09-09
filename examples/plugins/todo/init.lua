@@ -1,7 +1,7 @@
 -- init.lua — Todo plugin
 -- A todo.txt-format task tracker. The authoritative task list lives in
--- `.nova/todos.txt` (todo.txt standard, editable in any text editor, survives
--- restarts). Detailed per-task plans live in a sidecar `.nova/todos/plans.json`,
+-- `.zay/todos.txt` (todo.txt standard, editable in any text editor, survives
+-- restarts). Detailed per-task plans live in a sidecar `.zay/todos/plans.json`,
 -- keyed by a stable `id:N` tag, so `todo_list` can stay compact while plans are
 -- loaded lazily via `todo_get_plan`.
 --
@@ -17,9 +17,9 @@
 -- Tools: todo_list, todo_add, todo_done, todo_delete, todo_prioritize,
 --        todo_write, todo_get_plan, todo_set_plan, todo_check_step
 
-local TODOS_FILE = ".nova/todos.txt"
-local PLANS_FILE = ".nova/todos/plans.json"
-local PLANS_DIR = ".nova/todos"
+local TODOS_FILE = ".zay/todos.txt"
+local PLANS_FILE = ".zay/todos/plans.json"
+local PLANS_DIR = ".zay/todos"
 
 -- ── date helpers ────────────────────────────────────────────────────
 
@@ -206,7 +206,7 @@ end
 local function load_todos()
   _G.todos = {}
 
-  local result = nova.read_file(TODOS_FILE, {})
+  local result = zay.read_file(TODOS_FILE, {})
   if result == nil then
     return true -- file doesn't exist yet; start with empty list
   end
@@ -229,7 +229,7 @@ local function save_todos()
     local line = render_line(t)
     if line ~= "" then table.insert(lines, line) end
   end
-  return nova.write_file(TODOS_FILE, table.concat(lines, "\n") .. "\n")
+  return zay.write_file(TODOS_FILE, table.concat(lines, "\n") .. "\n")
 end
 
 -- ── plans.json file I/O ─────────────────────────────────────────────
@@ -238,11 +238,11 @@ end
 -- corrupt file yields an empty table (plans are best-effort; we never let a
 -- bad sidecar block the task list).
 local function load_plans()
-  local result = nova.read_file(PLANS_FILE, {})
+  local result = zay.read_file(PLANS_FILE, {})
   if result == nil then
     return {}
   end
-  local decoded = nova.json_decode(result.content)
+  local decoded = zay.json_decode(result.content)
   if decoded == nil then
     -- Corrupt JSON: start fresh rather than failing the whole plugin.
     return {}
@@ -259,12 +259,12 @@ end
 -- Persist plans back to the sidecar with pretty indentation so a human can read
 -- or hand-edit it in a text editor. Returns true on success, or nil + err.
 local function save_plans(plans)
-  nova.mkdir(PLANS_DIR)
-  local json = nova.json_encode(plans, { pretty = true })
+  zay.mkdir(PLANS_DIR)
+  local json = zay.json_encode(plans, { pretty = true })
   if json == nil then
     return nil, "could not encode plans"
   end
-  return nova.write_file(PLANS_FILE, json)
+  return zay.write_file(PLANS_FILE, json)
 end
 
 -- Surface a failed save as a clean error string (B5). Returns the error string
@@ -346,7 +346,7 @@ end
 -- ── tools: core list operations ─────────────────────────────────────
 
 -- todo_list: show the current todo list.
-nova.register_tool({
+zay.register_tool({
   name = "todo_list",
   description = "Show the current todo list. Returns open tasks sorted by priority (A first) then date, with overdue items flagged and a compact [plan:N steps] marker when a plan exists. Pass include_done=true to also show completed tasks. Plan bodies are NOT included here — call todo_get_plan for details. Use this to check progress before starting the next step.",
   parameters = {
@@ -362,7 +362,7 @@ nova.register_tool({
 })
 
 -- todo_add: add a new task.
-nova.register_tool({
+zay.register_tool({
   name = "todo_add",
   description = "Add a new task to the todo list. The task text follows todo.txt format: use +Project for projects, @context for contexts, due:YYYY-MM-DD for due dates, and optionally set a priority (A=high through Z=low). A stable id:N tag is assigned automatically for plan lookups. The creation date is set automatically. Returns the updated list.",
   parameters = {
@@ -422,7 +422,7 @@ nova.register_tool({
 })
 
 -- todo_done: mark a task complete.
-nova.register_tool({
+zay.register_tool({
   name = "todo_done",
   description = "Mark a task as done (completed). Sets the completion date automatically. Only mark a task done AFTER the required work is actually done and verified — never based on intent. Returns the updated list.",
   parameters = {
@@ -449,7 +449,7 @@ nova.register_tool({
 })
 
 -- todo_delete: remove a task permanently.
-nova.register_tool({
+zay.register_tool({
   name = "todo_delete",
   description = "Delete a task permanently from the todo list. Use this for tasks that were added by mistake or are no longer relevant (not for completed work — use todo_done for that). Returns the updated list.",
   parameters = {
@@ -471,7 +471,7 @@ nova.register_tool({
 })
 
 -- todo_prioritize: set or change a task's priority.
-nova.register_tool({
+zay.register_tool({
   name = "todo_prioritize",
   description = "Set or change a task's priority (A=high through Z=low). Pass priority as a single uppercase letter. Pass empty string or nil to remove priority. Returns the updated list.",
   parameters = {
@@ -511,7 +511,7 @@ nova.register_tool({
 })
 
 -- todo_write: replace the entire list in one shot (for bulk reordering).
-nova.register_tool({
+zay.register_tool({
   name = "todo_write",
   description = "Replace the ENTIRE todo list with the provided tasks. Each task is a todo.txt line. Use this when you need to reorder or rewrite the whole list; for single-task changes prefer todo_add/done/delete. Each line follows todo.txt format: '(A) text +project @context due:YYYY-MM-DD'. Existing id:N tags are preserved; tasks without one are assigned fresh ids. Returns the new list.",
   parameters = {
@@ -553,7 +553,7 @@ nova.register_tool({
 -- ── tools: detailed plans (lazy-loaded sidecar) ─────────────────────
 
 -- todo_get_plan: fetch the full plan for one task.
-nova.register_tool({
+zay.register_tool({
   name = "todo_get_plan",
   description = "Get the detailed plan for a task (summary, checklist steps with done state, and notes). Call this BEFORE starting work on a task whose todo_list line showed [plan:N steps] — it shows how the work was decomposed. Returns 'No plan for task #N' if none exists; use todo_set_plan to create one.",
   parameters = {
@@ -605,7 +605,7 @@ nova.register_tool({
 })
 
 -- todo_set_plan: create or replace a task's plan.
-nova.register_tool({
+zay.register_tool({
   name = "todo_set_plan",
   description = "Create or replace a task's detailed plan before doing multi-step work. Write a one-line summary, break the work into checklist steps (newline-separated), and optionally add free-form notes. The plan is stored separately in plans.json so todo_list stays compact — plan bodies are fetched on demand via todo_get_plan. Returns the saved plan.",
   parameters = {
@@ -666,7 +666,7 @@ nova.register_tool({
 })
 
 -- todo_check_step: toggle a step's completion in a plan.
-nova.register_tool({
+zay.register_tool({
   name = "todo_check_step",
   description = "Toggle a step's completion (done <-> not done) in a task's plan checklist. Use this right after finishing a planned step to track granular progress. Returns the updated plan. Requires a plan to exist (create one with todo_set_plan first).",
   parameters = {

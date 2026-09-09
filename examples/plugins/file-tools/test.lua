@@ -1,6 +1,6 @@
 -- test.lua — File Tools plugin tests
 --
--- Loads the real plugin source with a mocked `nova` bridge and exercises the
+-- Loads the real plugin source with a mocked `zay` bridge and exercises the
 -- handlers. Covers:
 --   B6  line splitter edge cases (empty, trailing newline, blank lines).
 --   B6  extension() basename fix (src.d/file, .gitignore, archive.tar.gz).
@@ -8,7 +8,7 @@
 --   B6  edit rejects new_string == old_string.
 local test = test_runner
 
--- ── Mock the nova bridge, then load the plugin ──────────────────────
+-- ── Mock the zay bridge, then load the plugin ──────────────────────
 local registered = {}
 local file_content = ""
 local read_result = nil
@@ -16,7 +16,7 @@ local write_reply = true
 local edit_reply = true
 local last_write = nil
 
-nova = {
+zay = {
   register_tool = function(tool)
     registered[tool.name] = tool
   end,

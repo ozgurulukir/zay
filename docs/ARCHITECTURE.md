@@ -1,6 +1,6 @@
-# Nova Architecture
+# Zay Architecture
 
-High-level architecture of Nova. For implementation patterns, engineering gotchas, and the type-system discipline, see [Patterns](PATTERNS.md). For configuration details, see [Configuration](CONFIG.md). For MCP internals, see [MCP](MCP.md). For plugin development, see [Plugins](plugins/README.md).
+High-level architecture of Zay. For implementation patterns, engineering gotchas, and the type-system discipline, see [Patterns](PATTERNS.md). For configuration details, see [Configuration](CONFIG.md). For MCP internals, see [MCP](MCP.md). For plugin development, see [Plugins](plugins/README.md).
 
 ## Platform Abstraction
 
@@ -16,20 +16,20 @@ This is distinct from `src/os.zig`, which is pure comptime OS identification (`b
 
 ## LLM Gateway
 
-Nova accepts any OpenAI-compatible endpoint (either `/completions` or `/responses`).
+Zay accepts any OpenAI-compatible endpoint (either `/completions` or `/responses`).
 
 We try to normalise the request to a shape that is most compatible with the target provider.
 
 ## Agent Tools
 
-Nova exposes the following tools:
+Zay exposes the following tools:
 
 - `bash` (on Linux/macOS) / `pwsh` (on Windows)
 - `lane`
 
 `bash` has some middleware written for it that makes it friendlier for agent use. For example, large outputs from a `cat` command are written to a temp file and the agent is told the full is in that file if needed. See [Shell Safety & Auto-Review](#shell-safety--auto-review) below.
 
-`lane` gives the model first-class access to Nova's parallel-lane substrate: isolated git worktrees the TUI tiles side-by-side. It is a *bridge* tool — the tool runs on the lane's worker thread, so every action is posted across a `LaneBridge` (`src/tools/lane_bridge.zig`) and resolved by the UI on its tick. The model-facing surface is orchestration-only: `list`, `spawn`, `read`, `await`, `steer`, `cancel`, `merge`, and `delete`.
+`lane` gives the model first-class access to Zay's parallel-lane substrate: isolated git worktrees the TUI tiles side-by-side. It is a *bridge* tool — the tool runs on the lane's worker thread, so every action is posted across a `LaneBridge` (`src/tools/lane_bridge.zig`) and resolved by the UI on its tick. The model-facing surface is orchestration-only: `list`, `spawn`, `read`, `await`, `steer`, `cancel`, `merge`, and `delete`.
 
 The primary driver remains rooted in the repository and supervises independent
 worker agents. Workers run concurrently on their own threads; completion is
@@ -40,7 +40,7 @@ compatibility with lifecycle code and tests, but model commands cannot reach it.
 
 Only the primary driver may supervise workers or integrate their branches; a
 worker gets `list`/`read` only. The 4-lane cap applies; `validateCwd`'s
-containment guarantees are unchanged (lane roots are valid only because Nova
+containment guarantees are unchanged (lane roots are valid only because Zay
 owns them).
 
 See [Parallel](#parallel) for the user-facing lane model.
@@ -80,11 +80,11 @@ the primary driver can merge/delete it by lane id. The maximum number of lanes
 that can be active is currently 4, because that is the empirical limit for the
 mental load required to manage all agents effectively.
 
-A lane starts on a random `nova/<hex>` branch. On its first prompt, the session's own model is asked (in parallel with the turn) for a descriptive branch name based on that prompt and the last few messages of the parent lane. When the answer lands, the branch is renamed in place (`nova/<name>`) and becomes the lane's label. If the request fails or the name is unusable, the hex branch simply stays.
+A lane starts on a random `zay/<hex>` branch. On its first prompt, the session's own model is asked (in parallel with the turn) for a descriptive branch name based on that prompt and the last few messages of the parent lane. When the answer lands, the branch is renamed in place (`zay/<name>`) and becomes the lane's label. If the request fails or the name is unusable, the hex branch simply stays.
 
 ## Shell Safety & Auto-Review
 
-Nova employs a two-tier defense-in-depth safety architecture to evaluate shell tool invocations (`bash` on Linux/macOS, `pwsh` on Windows) before execution:
+Zay employs a two-tier defense-in-depth safety architecture to evaluate shell tool invocations (`bash` on Linux/macOS, `pwsh` on Windows) before execution:
 
 1. **Tier 1: Built-in Deterministic Safety Matcher (Always Active):**
    A zero-dependency pattern and AST analyzer in `src/tools/bash_safety.zig` intercepts destructive operations with microsecond latency:
@@ -96,7 +96,7 @@ Nova employs a two-tier defense-in-depth safety architecture to evaluate shell t
    - Redirects into critical system paths (`/etc/`, `/boot/`, `C:\Windows\`, etc.)
 
 2. **Tier 2: External AI Safety Classifier (Optional & Pluggable):**
-   Nova can query a standalone REST safety service (`POST /classify`) powered by a fine-tuned Transformer model (ModernBERT) or an LLM safety proxy located in `tools/classifier/`. When marked unsafe, an interactive approval prompt is presented to the user.
+   Zay can query a standalone REST safety service (`POST /classify`) powered by a fine-tuned Transformer model (ModernBERT) or an LLM safety proxy located in `tools/classifier/`. When marked unsafe, an interactive approval prompt is presented to the user.
 
 For setup details, see [Wiki: Command Safety & Classifier Guide](wiki/SAFETY_CLASSIFIER.md).
 
@@ -106,16 +106,16 @@ The `cwd` parameter in bash tool calls is validated against the project root in 
 
 ### Temp file safety
 
-Temporary log files use hex-only filenames (`nova-bash-<hex>.log` via `bytesToHex`), making path traversal impossible. The `namedTempPath` public API asserts that the provided name contains no path separators.
+Temporary log files use hex-only filenames (`zay-bash-<hex>.log` via `bytesToHex`), making path traversal impossible. The `namedTempPath` public API asserts that the provided name contains no path separators.
 
 ## Lua Plugin System
 
-Nova supports extending its capabilities through Lua 5.4 plugins. The plugin system lives in `src/lua/` and provides a sandboxed runtime, plugin lifecycle, event bus, tool registration, config integration, and TUI integration.
+Zay supports extending its capabilities through Lua 5.4 plugins. The plugin system lives in `src/lua/` and provides a sandboxed runtime, plugin lifecycle, event bus, tool registration, config integration, and TUI integration.
 
 The full plugin development guide, API reference, and example walkthroughs live in [Plugins](plugins/README.md). The internal wiring patterns (tool dispatch, event wiring, bridge functions, two-store state) live in [Patterns](PATTERNS.md).
 
 ## Type System Discipline
 
-Nova uses `union(enum)` instead of flat structs with optional fields wherever a value can be in one of several mutually-exclusive states. This makes illegal combinations unrepresentable at compile time.
+Zay uses `union(enum)` instead of flat structs with optional fields wherever a value can be in one of several mutually-exclusive states. This makes illegal combinations unrepresentable at compile time.
 
 The complete, current list of `union(enum)` types and the construction patterns live in the [Type System Discipline pattern](PATTERNS.md#type-system-discipline-pattern) in Patterns.

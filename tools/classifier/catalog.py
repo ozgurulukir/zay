@@ -21,7 +21,7 @@ class ModelSpec:
     factory: Callable[[Path], BaseClassifier]
 
 
-CACHE_DIR = Path(os.environ.get("NOVA_CLASSIFIER_CACHE_DIR", Path.home() / ".cache" / "nova-classifier"))
+CACHE_DIR = Path(os.environ.get("ZAY_CLASSIFIER_CACHE_DIR", Path.home() / ".cache" / "zay-classifier"))
 
 
 def build_onnx_factory(onnx_file: str, max_length: int = 512) -> Callable[[Path], BaseClassifier]:

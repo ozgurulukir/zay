@@ -18,7 +18,7 @@ pub const IsolatedHome = struct {
 };
 
 /// Disposable absolute home directory under `.zig-cache/tmp`, so runtime
-/// fixtures never write the real `~/.config/nova` or the repository tree.
+/// fixtures never write the real `~/.config/zay` or the repository tree.
 pub fn isolatedHome(gpa: std.mem.Allocator, io: std.Io) !IsolatedHome {
     var tmp = std.testing.tmpDir(.{});
     errdefer tmp.cleanup();

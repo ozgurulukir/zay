@@ -1,4 +1,4 @@
-Drive Nova's background worker lanes: isolated git worktrees that the TUI
+Drive Zay's background worker lanes: isolated git worktrees that the TUI
 tiles side-by-side. A worker lane has its own branch and runtime; the primary
 driver stays in the repository root and supervises workers through this tool.
 
@@ -38,9 +38,9 @@ passed to worker operations.
 
 - Only the primary driver may spawn, supervise, merge, or delete workers.
 - A worker lane must be idle before it is merged or deleted.
-- Commit lane work before merging. Nova never fabricates a placeholder commit.
+- Commit lane work before merging. Zay never fabricates a placeholder commit.
 - The primary tree and source lane must be clean before a merge.
 - Clean up every spawned lane with `merge` or `delete`; do not leave finished
   lanes parked unnecessarily.
 - There are at most four lanes total: the primary plus three workers.
-- Never run `git worktree add`; Nova owns worktree provisioning and lane cleanup.
+- Never run `git worktree add`; Zay owns worktree provisioning and lane cleanup.

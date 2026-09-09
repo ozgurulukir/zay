@@ -175,7 +175,7 @@ fn createAuthorizationFlow(gpa: std.mem.Allocator, io: std.Io) !AuthorizationFlo
     try writeUrlEncoded(&url.writer, challenge);
     try url.writer.writeAll("&code_challenge_method=S256&state=");
     try writeUrlEncoded(&url.writer, state);
-    try url.writer.writeAll("&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=nova");
+    try url.writer.writeAll("&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=zay");
 
     return .{ .verifier = verifier, .state = state, .url = try url.toOwnedSlice() };
 }
@@ -556,9 +556,9 @@ test "loadStaticModels handles allocation failures gracefully" {
 test "sign out removes missing auth file without error" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const home_dir = "/tmp/nova-missing-home-for-signout-test";
+    const home_dir = "/tmp/zay-missing-home-for-signout-test";
 
-    const auth_file = try std.fs.path.join(gpa, &.{ home_dir, ".config", "nova", "auth.json" });
+    const auth_file = try std.fs.path.join(gpa, &.{ home_dir, ".config", "zay", "auth.json" });
     defer gpa.free(auth_file);
 
     // Precondition: ensure the auth file is absent (idempotent cleanup of any
@@ -718,7 +718,7 @@ test "waitForAuthorizationCode rejects state mismatch and invalid path" {
 test "login handles callback state mismatch and cleans up resources" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const home_dir = "/tmp/nova-login-test-home";
+    const home_dir = "/tmp/zay-login-test-home";
 
     const client = MockCallbackClient{ .io = io, .path = "/auth/callback?code=some_code&state=unmatched_state" };
     const thread = try std.Thread.spawn(.{}, MockCallbackClient.run, .{client});

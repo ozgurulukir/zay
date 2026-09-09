@@ -1,4 +1,4 @@
-//! JSON parse/serialize, file I/O, and layer-merge logic for Nova config.
+//! JSON parse/serialize, file I/O, and layer-merge logic for Zay config.
 //!
 //! Extracted from config.zig to keep the facade small. This file owns:
 //!   - Layered load (global → project → env) and merge algebra
@@ -514,7 +514,7 @@ fn loadProjectFile(
     cwd: []const u8,
     diagnostics: *std.ArrayList(Diagnostic),
 ) !Config {
-    const path = try std.fs.path.join(gpa, &.{ cwd, ".nova", "config.json" });
+    const path = try std.fs.path.join(gpa, &.{ cwd, ".zay", "config.json" });
     defer gpa.free(path);
     return loadFile(gpa, io, path, diagnostics);
 }
@@ -1142,13 +1142,13 @@ fn loadEnv(
 
     if (env.get("OPENAI_BASE_URL")) |s| out.base_url = try gpa.dupe(u8, s);
     if (env.get("OPENAI_API_KEY")) |s| out.api_key = try gpa.dupe(u8, s);
-    if (env.get("NOVA_BASH_CLASSIFIER_URL")) |s| {
+    if (env.get("ZAY_BASH_CLASSIFIER_URL")) |s| {
         if (s.len > 0) out.bash_classifier_url = try gpa.dupe(u8, s);
     }
-    if (env.get("NOVA_USE_RESPONSES_ENDPOINT")) |s| {
+    if (env.get("ZAY_USE_RESPONSES_ENDPOINT")) |s| {
         out.use_responses_endpoint = parseBool(s);
     }
-    if (env.get("NOVA_STRICT_OUTPUTS")) |s| {
+    if (env.get("ZAY_STRICT_OUTPUTS")) |s| {
         out.strict_outputs = parseBool(s);
     }
     if (env.get("OPENAI_MODEL")) |raw| {
@@ -1885,10 +1885,10 @@ fn writeKey(writer: *std.Io.Writer, name: []const u8, wrote_any: *bool) !void {
 pub fn globalConfigPath(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) ![]u8 {
     if (home_dir.len == 0) return error.HomeNotSet;
 
-    // Platform-correct base: Windows -> %APPDATA%\nova, POSIX -> ~/.config/nova.
+    // Platform-correct base: Windows -> %APPDATA%\zay, POSIX -> ~/.config/zay.
     // (See paths.platformConfigDir; matches the plugin-discovery probe.)
     // No separate XDG fallback: on POSIX platformConfigDir already returns
-    // ~/.config/nova, so a legacy ~/.config/nova/config.json IS the returned
+    // ~/.config/zay, so a legacy ~/.config/zay/config.json IS the returned
     // path. Linux installs are unaffected.
     const base = try paths.platformConfigDir(gpa, home_dir);
     errdefer gpa.free(base);
@@ -1907,7 +1907,7 @@ pub fn globalConfigPath(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8
 
 fn projectConfigPath(gpa: std.mem.Allocator, cwd: []const u8) ![]u8 {
     if (cwd.len == 0) return error.InvalidPath;
-    return std.fs.path.join(gpa, &.{ cwd, ".nova", "config.json" });
+    return std.fs.path.join(gpa, &.{ cwd, ".zay", "config.json" });
 }
 
 const TestEnv = struct {
@@ -2233,12 +2233,12 @@ test "loadEnv: malformed OPENAI_MODEL records diagnostic, does not set fields" {
     try std.testing.expectEqualStrings("gpt-5.5", sink.items[0].bad_env_model);
 }
 
-test "loadEnv: NOVA_USE_RESPONSES_ENDPOINT parses bools" {
+test "loadEnv: ZAY_USE_RESPONSES_ENDPOINT parses bools" {
     const gpa = std.testing.allocator;
     var sink: std.ArrayList(Diagnostic) = .empty;
     defer sink.deinit(gpa);
     const env: TestEnv = .{ .entries = &.{
-        .{ .key = "NOVA_USE_RESPONSES_ENDPOINT", .value = "1" },
+        .{ .key = "ZAY_USE_RESPONSES_ENDPOINT", .value = "1" },
     } };
     var cfg = try loadEnv(gpa, env, &sink);
     defer cfg.deinit(gpa);
@@ -2389,9 +2389,9 @@ test "globalConfigPath resolves the platform-correct config.json path" {
     defer gpa.free(path);
 
     // The returned path must end in the platform-correct config file location.
-    // On POSIX that is ~/.config/nova/config.json; on Windows %APPDATA%\nova\config.json.
+    // On POSIX that is ~/.config/zay/config.json; on Windows %APPDATA%\zay\config.json.
     // Build the expected suffix with path.join so the separator matches the host.
-    const expected = try std.fs.path.join(gpa, &.{ "nova", "config.json" });
+    const expected = try std.fs.path.join(gpa, &.{ "zay", "config.json" });
     defer gpa.free(expected);
     try std.testing.expect(std.mem.endsWith(u8, path, expected));
 }
@@ -2604,7 +2604,7 @@ test "parseFile parses remote mcp server headers (kept raw)" {
     const gpa = std.testing.allocator;
     var sink: std.ArrayList(Diagnostic) = .empty;
     defer sink.deinit(gpa);
-    const json = "{\"mcp_servers\":{\"context7\":{\"url\":\"https://mcp.context7.com/mcp\",\"headers\":{\"CONTEXT7_API_KEY\":\"{env:NOVA_TEST_UNSET_MCP_VAR}\"}}}}";
+    const json = "{\"mcp_servers\":{\"context7\":{\"url\":\"https://mcp.context7.com/mcp\",\"headers\":{\"CONTEXT7_API_KEY\":\"{env:ZAY_TEST_UNSET_MCP_VAR}\"}}}}";
     var cfg = try parseFile(gpa, "<test>", json, &sink);
     defer cfg.deinit(gpa);
 
@@ -2615,7 +2615,7 @@ test "parseFile parses remote mcp server headers (kept raw)" {
             try std.testing.expectEqual(@as(usize, 1), t.headers.len);
             try std.testing.expectEqualStrings("CONTEXT7_API_KEY", t.headers[0].name);
             // Header values keep their placeholder until expandMcpServer runs.
-            try std.testing.expectEqualStrings("{env:NOVA_TEST_UNSET_MCP_VAR}", t.headers[0].value);
+            try std.testing.expectEqualStrings("{env:ZAY_TEST_UNSET_MCP_VAR}", t.headers[0].value);
         },
         .stdio => return error.Unexpected,
     }
@@ -2652,13 +2652,13 @@ test "parseFile keeps {env:VAR} placeholders raw in mcp url" {
     // Placeholders are stored verbatim at parse time so serialize() can write
     // them back unchanged; expansion happens later, at connect time
     // (expandMcpServer). This keeps resolved secrets out of config.json.
-    const json = "{\"mcp_servers\":{\"tavily\":{\"url\":\"https://mcp.tavily.com/mcp/?key={env:NOVA_TEST_UNSET_MCP_VAR}\"}}}";
+    const json = "{\"mcp_servers\":{\"tavily\":{\"url\":\"https://mcp.tavily.com/mcp/?key={env:ZAY_TEST_UNSET_MCP_VAR}\"}}}";
     var cfg = try parseFile(gpa, "<test>", json, &sink);
     defer cfg.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers.len);
     switch (cfg.mcp_servers[0].transport) {
-        .sse => |t| try std.testing.expectEqualStrings("https://mcp.tavily.com/mcp/?key={env:NOVA_TEST_UNSET_MCP_VAR}", t.url),
+        .sse => |t| try std.testing.expectEqualStrings("https://mcp.tavily.com/mcp/?key={env:ZAY_TEST_UNSET_MCP_VAR}", t.url),
         .stdio => return error.Unexpected,
     }
 }
@@ -2666,12 +2666,12 @@ test "parseFile keeps {env:VAR} placeholders raw in mcp url" {
 test "expandMcpServer resolves {env:VAR} in url and headers, leaving the source raw" {
     const gpa = std.testing.allocator;
     // A raw server as the parser produces it: placeholders in url + header value.
-    var raw = try mcpServerFromUrl(gpa, "ctx", "https://mcp.context7.com/mcp?key={env:NOVA_TEST_UNSET_MCP_VAR}");
+    var raw = try mcpServerFromUrl(gpa, "ctx", "https://mcp.context7.com/mcp?key={env:ZAY_TEST_UNSET_MCP_VAR}");
     defer raw.deinit(gpa);
     const headers = try gpa.alloc(McpHeader, 1);
     headers[0] = .{
         .name = try gpa.dupe(u8, "CONTEXT7_API_KEY"),
-        .value = try gpa.dupe(u8, "{env:NOVA_TEST_UNSET_MCP_VAR}"),
+        .value = try gpa.dupe(u8, "{env:ZAY_TEST_UNSET_MCP_VAR}"),
     };
     raw.transport.sse.headers = headers;
 
@@ -2690,7 +2690,7 @@ test "expandMcpServer resolves {env:VAR} in url and headers, leaving the source 
     }
     // The source keeps its placeholders (still safe to serialize).
     switch (raw.transport) {
-        .sse => |t| try std.testing.expectEqualStrings("https://mcp.context7.com/mcp?key={env:NOVA_TEST_UNSET_MCP_VAR}", t.url),
+        .sse => |t| try std.testing.expectEqualStrings("https://mcp.context7.com/mcp?key={env:ZAY_TEST_UNSET_MCP_VAR}", t.url),
         .stdio => return error.Unexpected,
     }
 }
@@ -2902,7 +2902,7 @@ test "parseObject accepts camelCase keys (schema v2)" {
     var sink: std.ArrayList(Diagnostic) = .empty;
     defer sink.deinit(gpa);
     const json =
-        \\{"defaultModel":"ollama/llama3.1:8b","baseURL":"http://localhost:11434","useResponsesEndpoint":true,"enableThinking":true,"systemPrompt":"You are Nova.","bashClassifierUrl":"http://localhost:9999"}
+        \\{"defaultModel":"ollama/llama3.1:8b","baseURL":"http://localhost:11434","useResponsesEndpoint":true,"enableThinking":true,"systemPrompt":"You are Zay.","bashClassifierUrl":"http://localhost:9999"}
     ;
     var cfg = try parseFile(gpa, "<test>", json, &sink);
     defer cfg.deinit(gpa);
@@ -2910,7 +2910,7 @@ test "parseObject accepts camelCase keys (schema v2)" {
     try std.testing.expectEqualStrings("llama3.1:8b", cfg.model.?.id);
     try std.testing.expectEqualStrings("http://localhost:11434", cfg.base_url.?);
     try std.testing.expectEqual(true, cfg.use_responses_endpoint.?);
-    try std.testing.expectEqualStrings("You are Nova.", cfg.system_prompt.?);
+    try std.testing.expectEqualStrings("You are Zay.", cfg.system_prompt.?);
     try std.testing.expectEqualStrings("http://localhost:9999", cfg.bash_classifier_url.?);
     // The legacy `enableThinking` key is accepted and discarded — no diagnostics.
     try std.testing.expectEqual(@as(usize, 0), sink.items.len);

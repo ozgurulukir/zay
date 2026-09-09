@@ -133,7 +133,7 @@ pub fn drainChild(gpa: std.mem.Allocator, io: std.Io, child: *std.process.Child,
 ///
 /// Instantiated once per shell with a config namespace of two decls:
 /// `spill_prefix` (`temp_files.zig` prunable prefix for the log name) and
-/// `spillDir` (the temp dir both the shell and Nova agree on).
+/// `spillDir` (the temp dir both the shell and Zay agree on).
 pub fn Sink(comptime config: type) type {
     return struct {
         const Spill = struct {

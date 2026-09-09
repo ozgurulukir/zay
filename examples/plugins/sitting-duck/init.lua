@@ -5,16 +5,16 @@
 -- post-repair SDK surface:
 --   * plugin.get_config() — binary resolution, called per tool call (nil
 --     when unconfigured; never raises — see docs/plugins/api-reference.md).
---   * nova.shell_quote() — POSIX dialect (the default) for every run_bash
+--   * zay.shell_quote() — POSIX dialect (the default) for every run_bash
 --     command line; quoting is what keeps the classified command equal to
 --     the executed command.
 --
 -- Architecture: SQL travels in a FILE, never on the shell command line —
--- `.nova/sitting-duck/query.sql` is staged via nova.write_file (atomic) and
+-- `.zay/sitting-duck/query.sql` is staged via zay.write_file (atomic) and
 -- fed to duckdb with `<` redirection. The file doubles as a debug artifact:
 -- every query error message points at it. The extension bootstraps lazily
 -- on the first tool call (INSTALL before LOAD — a cold machine has nothing
--- to LOAD yet); success is cached in `.nova/sitting-duck/state.json` and
+-- to LOAD yet); success is cached in `.zay/sitting-duck/state.json` and
 -- re-verified against `duckdb --version` once per session so a duckdb
 -- upgrade triggers a re-install. Zero I/O happens at load time: any
 -- init.lua error disables the whole plugin.
@@ -24,11 +24,11 @@
 
 -- ── constants ───────────────────────────────────────────────────────
 
-local WORK_DIR    = ".nova/sitting-duck"
+local WORK_DIR    = ".zay/sitting-duck"
 local QUERY_PATH  = WORK_DIR .. "/query.sql"
 local MARKER_PATH = WORK_DIR .. "/state.json"
 local DEFAULT_BIN = "duckdb"
-local ENV_BIN     = "NOVA_SITTING_DUCK_BIN"
+local ENV_BIN     = "ZAY_SITTING_DUCK_BIN"
 local DEFAULT_LIMIT = 50
 local MAX_LIMIT   = 200
 local VERSION_TIMEOUT_S   = 10
@@ -51,7 +51,7 @@ local sd_ready = false
 -- ── small helpers ───────────────────────────────────────────────────
 
 local function q(s)
-  return nova.shell_quote(s)
+  return zay.shell_quote(s)
 end
 
 -- SQL single-quoted literal. DuckDB standard literals do not process
@@ -220,7 +220,7 @@ local function resolve_bin()
     local p = trim(cfg.duckdb_path)
     if p ~= "" then return p end
   end
-  local env = nova.get_env(ENV_BIN)
+  local env = zay.get_env(ENV_BIN)
   if type(env) == "string" and trim(env) ~= "" then
     return trim(env)
   end
@@ -230,29 +230,29 @@ end
 -- todo-plugin sidecar pattern: missing or corrupt marker → nil, never a
 -- crash; the plugin just re-bootstraps.
 local function read_marker()
-  local result = nova.read_file(MARKER_PATH, {})
+  local result = zay.read_file(MARKER_PATH, {})
   if result == nil then return nil end
-  local decoded = nova.json_decode(result.content)
+  local decoded = zay.json_decode(result.content)
   if type(decoded) ~= "table" then return nil end
   return decoded
 end
 
 local function write_marker(version)
-  nova.mkdir(WORK_DIR)
-  local json = nova.json_encode({
+  zay.mkdir(WORK_DIR)
+  local json = zay.json_encode({
     bootstrapped = true,
     duckdb_version = version,
     verified_at = os.time(),
   }, { pretty = true })
   if json == nil then return nil, "could not encode marker" end
-  if nova.write_file(MARKER_PATH, json) == nil then
+  if zay.write_file(MARKER_PATH, json) == nil then
     return nil, "could not write marker"
   end
   return true
 end
 
 local function clear_marker()
-  nova.delete_path(MARKER_PATH)
+  zay.delete_path(MARKER_PATH)
 end
 
 -- ── error messages (E1 split: bash missing ≠ duckdb missing) ─────────
@@ -342,7 +342,7 @@ local function pattern_sql(pattern, glob, language, limit)
 end
 
 -- Resolve one node's line span; the source text itself comes from
--- nova.read_file, not from SQL — one fewer extension surface to trust.
+-- zay.read_file, not from SQL — one fewer extension surface to trust.
 local function span_sql(file, node_id)
   return PRELUDE
     .. "SELECT node_id, type, name, start_line, end_line\n"
@@ -358,13 +358,13 @@ end
 -- the shell — glob metacharacters and model-supplied SQL stay inert inside
 -- the file duckdb itself parses.
 local function run_script(bin, sql, timeout_s)
-  nova.mkdir(WORK_DIR)
-  local ok, werr = nova.write_file(QUERY_PATH, sql)
+  zay.mkdir(WORK_DIR)
+  local ok, werr = zay.write_file(QUERY_PATH, sql)
   if ok == nil then
     return nil, "could not stage query.sql: " .. tostring(werr or "?")
   end
   local cmd = q(bin) .. " -json -init /dev/null < " .. q(QUERY_PATH)
-  return nova.run_bash(cmd, { timeout = timeout_s })
+  return zay.run_bash(cmd, { timeout = timeout_s })
 end
 
 -- Cold → checking → ready. Returns nil when ready, else an error string.
@@ -375,7 +375,7 @@ local function ensure_ready()
 
   -- One cheap dispatch per session: detect missing duckdb/bash early and
   -- capture the version string for the drift check.
-  local res, rerr = nova.run_bash(q(bin) .. " --version", { timeout = VERSION_TIMEOUT_S })
+  local res, rerr = zay.run_bash(q(bin) .. " --version", { timeout = VERSION_TIMEOUT_S })
   if res == nil then
     local e = tostring(rerr)
     if e:find("ShellUnavailable", 1, true) then return e1_bash() end
@@ -420,7 +420,7 @@ local function ensure_ready()
       .. " — the one-time INSTALL downloads from"
       .. " community-extensions.duckdb.org; check network access and retry."
   end
-  local row = first_row(nova.json_decode(bres.stdout or ""))
+  local row = first_row(zay.json_decode(bres.stdout or ""))
   if row == nil or row.status ~= "ready" then
     return "Error: bootstrap completed but did not report ready."
       .. " stdout: " .. truncate_cell(bres.stdout, 200)
@@ -474,7 +474,7 @@ local function run_query(sql)
     return nil, "Error: duckdb query failed: " .. stderr_tail(res.stderr, 3)
       .. " — the exact script sent is at " .. QUERY_PATH
   end
-  local rows = nova.json_decode(res.stdout or "")
+  local rows = zay.json_decode(res.stdout or "")
   if type(rows) ~= "table" then
     return nil, "Error: could not parse duckdb output — the exact script"
       .. " sent is at " .. QUERY_PATH
@@ -604,7 +604,7 @@ local function shape_rows(rows, header)
       local v = r[k]
       if v ~= nil then
         if type(v) == "table" then
-          local j = nova.json_encode(v)
+          local j = zay.json_encode(v)
           v = (j ~= nil) and j or "?"
         end
         table.insert(cells, k .. "=" .. truncate_cell(v, 120))
@@ -617,14 +617,14 @@ end
 
 -- ── tool: ast_outline ───────────────────────────────────────────────
 
-nova.register_tool({
+zay.register_tool({
   name = "ast_outline",
   description = "List code structure (functions, classes, methods) from"
     .. " tree-sitter ASTs queried with SQL. Pass a glob like 'src/**/*.zig'"
     .. " or a single file path. Returns one line per symbol: kind, name,"
     .. " line range, and a node_id handle. Requires the duckdb CLI —"
     .. " configure plugins.sitting-duck.settings.duckdb_path in config.json,"
-    .. " or set NOVA_SITTING_DUCK_BIN, or have 'duckdb' on PATH; the"
+    .. " or set ZAY_SITTING_DUCK_BIN, or have 'duckdb' on PATH; the"
     .. " sitting_duck extension auto-installs on first call (may take"
     .. " minutes). Output is bounded: LIMIT defaults to 50 (max 200) and"
     .. " tool output is hard-capped at 512KB. Use node_id with"
@@ -663,7 +663,7 @@ nova.register_tool({
 
 -- ── tool: ast_find_pattern ──────────────────────────────────────────
 
-nova.register_tool({
+zay.register_tool({
   name = "ast_find_pattern",
   description = "Structural code search with sitting_duck's text patterns:"
     .. " write a minimal code skeleton in the target language and mark the"
@@ -676,7 +676,7 @@ nova.register_tool({
     .. " or passed explicitly. Returns one"
     .. " row per match: file, line span, captures, and the matched root's"
     .. " node_id — usable with ast_get_source. Requires the duckdb CLI"
-    .. " (plugins.sitting-duck.settings.duckdb_path / NOVA_SITTING_DUCK_BIN"
+    .. " (plugins.sitting-duck.settings.duckdb_path / ZAY_SITTING_DUCK_BIN"
     .. " / PATH). LIMIT defaults to 50 (max 200); output hard-capped at"
     .. " 512KB.",
   parameters = {
@@ -731,7 +731,7 @@ nova.register_tool({
 
 -- ── tool: ast_get_source ────────────────────────────────────────────
 
-nova.register_tool({
+zay.register_tool({
   name = "ast_get_source",
   description = "Fetch the source text of one AST node: pass a file plus"
     .. " the node_id reported by ast_outline or ast_find_pattern. Returns"
@@ -739,7 +739,7 @@ nova.register_tool({
     .. " context lines (0-20, default 0). node_ids are stable only while"
     .. " the file is unchanged — after edits, re-run ast_outline. Requires"
     .. " the duckdb CLI (plugins.sitting-duck.settings.duckdb_path /"
-    .. " NOVA_SITTING_DUCK_BIN / PATH).",
+    .. " ZAY_SITTING_DUCK_BIN / PATH).",
   parameters = {
     file = {
       type = "string",
@@ -776,12 +776,12 @@ nova.register_tool({
     end
 
     -- Two-step drill-down: the row resolves the line span; the source is
-    -- sliced by nova.read_file's own line options.
+    -- sliced by zay.read_file's own line options.
     local sl = tonumber(node.start_line) or 1
     local el = tonumber(node.end_line) or sl
     local first = math.max(1, sl - ctx)
     local last = el + ctx
-    local read = nova.read_file(file, { start_line = first, end_line = last })
+    local read = zay.read_file(file, { start_line = first, end_line = last })
     if read == nil then
       return "Error: could not read " .. file
     end
@@ -797,7 +797,7 @@ local function wrap_query(user_sql)
   return PRELUDE .. user_sql
 end
 
-nova.register_tool({
+zay.register_tool({
   name = "ast_query",
   description = "Escape hatch: run raw DuckDB SQL against the sitting_duck"
     .. " read_ast() table — aggregates, joins, and counts the dedicated"
@@ -814,9 +814,9 @@ nova.register_tool({
     .. " outside the project) — prefer the dedicated tools' path"
     .. " parameters. Include a LIMIT (recommended <= 200); output above"
     .. " 512KB fails with StreamTooLong. On errors the exact script is"
-    .. " kept at .nova/sitting-duck/query.sql for inspection. Requires the"
+    .. " kept at .zay/sitting-duck/query.sql for inspection. Requires the"
     .. " duckdb CLI (plugins.sitting-duck.settings.duckdb_path /"
-    .. " NOVA_SITTING_DUCK_BIN / PATH).",
+    .. " ZAY_SITTING_DUCK_BIN / PATH).",
   parameters = {
     sql = {
       type = "string",
@@ -856,7 +856,7 @@ nova.register_tool({
     -- model forgot the LIMIT the hard backstop would otherwise enforce.
     if not sql:lower():find("limit", 1, true) then
       out = out .. "\n\n[note: no LIMIT clause in the SQL — output is"
-        .. " capped at 512KB by Nova's stream cap]"
+        .. " capped at 512KB by Zay's stream cap]"
     end
     return out
   end,

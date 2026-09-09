@@ -1,7 +1,7 @@
 //! RequestLimiter — a process-wide cap on concurrent LLM requests to the
 //! provider, shared by every lane's agent.
 //!
-//! Nova runs each lane on its own worker thread with its own HTTP client, so
+//! Zay runs each lane on its own worker thread with its own HTTP client, so
 //! without a limiter N active lanes fire N independent requests at the
 //! provider at once. Providers (notably cloud flash models) degrade or
 //! rate-limit that burst and every lane slows down together. The limiter lets

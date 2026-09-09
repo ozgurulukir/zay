@@ -1,4 +1,4 @@
-# Nova local patch: vxfw FocusHandler empty-path guards (SIGSEGV in ReleaseFast).
+# Zay local patch: vxfw FocusHandler empty-path guards (SIGSEGV in ReleaseFast).
 # See AGENTS.md 'vxfw FocusHandler crash' and build.zig checkVaxisFocusPatch.
 # Re-apply after every `zig build --fetch` / vaxis bump; build.zig enforces this.
 diff -u a/src/vxfw/App.zig b/src/vxfw/App.zig
@@ -9,7 +9,7 @@ diff -u a/src/vxfw/App.zig b/src/vxfw/App.zig
          _ = try self.childHasFocus(allocator, surface);
  
 -        if (!self.root.eql(surface.widget)) {
-+        // NOVA-LOCAL-PATCH: when the focused widget isn't in the surface tree
++        // ZAY-LOCAL-PATCH: when the focused widget isn't in the surface tree
 +        // (e.g. destroyed by an external runtime swap), childHasFocus leaves
 +        // the path empty and the next handleEvent would dereference it. Fall
 +        // back to the root widget, which is always present. The original guard
@@ -27,7 +27,7 @@ diff -u a/src/vxfw/App.zig b/src/vxfw/App.zig
      fn handleEvent(self: *FocusHandler, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
          const path = self.path_to_focused.items;
 -        assert(path.len > 0);
-+        // NOVA-LOCAL-PATCH: assert(path.len > 0) is stripped in ReleaseFast and
++        // ZAY-LOCAL-PATCH: assert(path.len > 0) is stripped in ReleaseFast and
 +        // became a SIGSEGV when the path was empty. Guard explicitly instead.
 +        if (path.len == 0) return;
  

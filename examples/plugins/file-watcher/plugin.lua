@@ -2,7 +2,7 @@
 return {
   name = "file-watcher",
   version = "1.0.0",
-  author = "Nova",
+  author = "Zay",
   description = "Listens for file changes and notifies the agent",
   license = "MIT",
   -- require_others is advisory pending enforcement (T3); file_access is

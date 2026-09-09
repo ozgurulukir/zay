@@ -1,22 +1,22 @@
 -- test.lua — sitting-duck plugin tests
 --
--- Hermetic: duckdb never runs. The mock `nova` intercepts run_bash and
+-- Hermetic: duckdb never runs. The mock `zay` intercepts run_bash and
 -- dispatches on the command shape / staged SQL content, so every error
 -- path (E1-E6, UnsafeShellBlocked, StreamTooLong) is scripted. The real
 -- bridge functions for quoting and JSON are captured BEFORE the mock
--- replaces `nova` (hello-world test pattern) — the opening suite also
+-- replaces `zay` (hello-world test pattern) — the opening suite also
 -- doubles as an SDK canary: this plugin is the first production consumer
--- of plugin.get_config() and nova.shell_quote.
+-- of plugin.get_config() and zay.shell_quote.
 local test = test_runner
 
-local QUERY_PATH  = ".nova/sitting-duck/query.sql"
-local MARKER_PATH = ".nova/sitting-duck/state.json"
-local ENV_BIN     = "NOVA_SITTING_DUCK_BIN"
+local QUERY_PATH  = ".zay/sitting-duck/query.sql"
+local MARKER_PATH = ".zay/sitting-duck/state.json"
+local ENV_BIN     = "ZAY_SITTING_DUCK_BIN"
 
--- ── Bridge surface (must stay ABOVE the nova/plugin mocks) ──────────
-local real_shell_quote = nova and nova.shell_quote
-local real_json_decode = nova and nova.json_decode
-local real_json_encode = nova and nova.json_encode
+-- ── Bridge surface (must stay ABOVE the zay/plugin mocks) ──────────
+local real_shell_quote = zay and zay.shell_quote
+local real_json_decode = zay and zay.json_decode
+local real_json_encode = zay and zay.json_encode
 
 test.describe("bridge surface (SDK canary)", function()
   test.it("exposes the plugin table with get_config", function()
@@ -28,13 +28,13 @@ test.describe("bridge surface (SDK canary)", function()
     test.assert.is_true(plugin.get_config() == nil)
   end)
 
-  test.it("nova.shell_quote quotes for posix by default", function()
+  test.it("zay.shell_quote quotes for posix by default", function()
     test.assert.is_true(real_shell_quote ~= nil)
     test.assert.equal("'a'\\''b'", real_shell_quote("a'b"))
     test.assert.equal("''", real_shell_quote(""))
   end)
 
-  test.it("nova.json round-trips row fixtures", function()
+  test.it("zay.json round-trips row fixtures", function()
     local t = real_json_decode('[{"node_id":1,"name":"alpha"}]')
     test.assert.is_true(type(t) == "table" and t[1].node_id == 1)
   end)
@@ -57,7 +57,7 @@ local function next_response(q)
   return entry
 end
 
-nova = {
+zay = {
   register_tool = function(spec)
     registered[spec.name] = spec
   end,
@@ -245,7 +245,7 @@ test.describe("bootstrap", function()
     test.assert.is_true(out:find("AST outline", 1, true) ~= nil)
     test.assert.equal(3, #run_log)
     test.assert.equal("'duckdb' --version", run_log[1].cmd)
-    test.assert.equal("'duckdb' -json -init /dev/null < '.nova/sitting-duck/query.sql'", run_log[2].cmd)
+    test.assert.equal("'duckdb' -json -init /dev/null < '.zay/sitting-duck/query.sql'", run_log[2].cmd)
     test.assert.is_true(sql_log[1]:find("INSTALL sitting_duck FROM community;", 1, true) ~= nil)
     test.assert.is_true(sql_log[1]:find("LOAD sitting_duck;", 1, true) ~= nil)
     test.assert.is_true(sql_log[2]:find("FROM read_ast('src/**/*.zig')", 1, true) ~= nil)
@@ -306,7 +306,7 @@ test.describe("error taxonomy", function()
 
   test.it("UnsafeShellBlocked passes through verbatim", function()
     fresh()
-    table.insert(version_q, { nil_err = "UnsafeShellBlocked: command rejected by Nova's shell safety classifier; use the built-in bash tool for destructive commands" })
+    table.insert(version_q, { nil_err = "UnsafeShellBlocked: command rejected by Zay's shell safety classifier; use the built-in bash tool for destructive commands" })
     local out = outline({ glob = "src/**/*.zig" })
     test.assert.is_true(out:find("UnsafeShellBlocked", 1, true) ~= nil)
     test.assert.is_true(out:find("built-in bash tool", 1, true) ~= nil)

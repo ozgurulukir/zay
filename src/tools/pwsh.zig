@@ -34,7 +34,7 @@ pub const Backend = struct {
     /// PowerShell function overrides prepended to a contained command. `Set-Location`
     /// shadows the built-in for every alias (`cd`, `sl`, `chdir`, `l`), computes the
     /// absolute target via `GetFullPath`, and refuses anything outside
-    /// `_nova_root` (set to the project root by `prependCdGuard`). `Push-Location`/
+    /// `_zay_root` (set to the project root by `prependCdGuard`). `Push-Location`/
     /// `Pop-Location` are rejected outright (they'd bypass the guard's state).
     /// The `cd:` message writes to stderr so it is captured but the guard still
     /// fails the command.
@@ -43,18 +43,18 @@ pub const Backend = struct {
         \\    $target = if ($Path.Count -eq 0) { (Get-Location).Path } else { $Path[0] }
         \\    $abs = if ([System.IO.Path]::IsPathRooted($target)) { $target } else { Join-Path (Get-Location) $target }
         \\    $abs = [System.IO.Path]::GetFullPath($abs)
-        \\    $root = $_nova_root.TrimEnd('\', '/')
-        \\    if ($abs -ne $_nova_root -and $abs -ne $root -and $abs -notlike "$root\*") { throw "cd: $abs escapes the workspace root" }
+        \\    $root = $_zay_root.TrimEnd('\', '/')
+        \\    if ($abs -ne $_zay_root -and $abs -ne $root -and $abs -notlike "$root\*") { throw "cd: $abs escapes the workspace root" }
         \\    Microsoft.PowerShell.Core\Set-Location @Path }
         \\function Push-Location { throw "pushd: not allowed in this workspace" }
         \\function Pop-Location  { throw "popd: not allowed in this workspace" }
         \\
     ;
 
-    /// Prefix `command` with `_nova_root` (the canonicalized project root via
+    /// Prefix `command` with `_zay_root` (the canonicalized project root via
     /// `[System.IO.Path]::GetFullPath`, single-quoted and quote-doubled for PowerShell)
     /// and the `Set-Location`/`Push-Location`/`Pop-Location` guard functions.
-    /// `_nova_root` anchors on the project root — not the shell's start cwd — so
+    /// `_zay_root` anchors on the project root — not the shell's start cwd — so
     /// a `cwd` subdir argument does not tighten containment to that subdir.
     pub fn prependCdGuard(gpa: std.mem.Allocator, project_root: []const u8, command: []const u8) std.mem.Allocator.Error![]u8 {
         const normalized_root = std.fs.path.resolve(gpa, &.{project_root}) catch return error.OutOfMemory;
@@ -62,7 +62,7 @@ pub const Backend = struct {
 
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(gpa);
-        try out.appendSlice(gpa, "$_nova_root = [System.IO.Path]::GetFullPath('");
+        try out.appendSlice(gpa, "$_zay_root = [System.IO.Path]::GetFullPath('");
         for (normalized_root) |c| {
             if (c == '\'') {
                 try out.appendSlice(gpa, "''");
@@ -145,7 +145,7 @@ test "prependCdGuard anchors on the project root and defines the guard" {
     const guarded = try Backend.prependCdGuard(gpa, "C:\\Users\\u\\repo", "Write-Output hi");
     defer gpa.free(guarded);
 
-    try std.testing.expect(std.mem.startsWith(u8, guarded, "$_nova_root = [System.IO.Path]::GetFullPath('C:\\Users\\u\\repo');\n"));
+    try std.testing.expect(std.mem.startsWith(u8, guarded, "$_zay_root = [System.IO.Path]::GetFullPath('C:\\Users\\u\\repo');\n"));
     try std.testing.expect(std.mem.indexOf(u8, guarded, "function Set-Location") != null);
     try std.testing.expect(std.mem.indexOf(u8, guarded, "function Push-Location") != null);
     try std.testing.expect(std.mem.endsWith(u8, guarded, "Write-Output hi"));
@@ -156,7 +156,7 @@ test "prependCdGuard doubles single quotes in the root path" {
     const guarded = try Backend.prependCdGuard(gpa, "C:\\Repo O'Brien", "true");
     defer gpa.free(guarded);
 
-    try std.testing.expect(std.mem.indexOf(u8, guarded, "$_nova_root = [System.IO.Path]::GetFullPath('C:\\Repo O''Brien');") != null);
+    try std.testing.expect(std.mem.indexOf(u8, guarded, "$_zay_root = [System.IO.Path]::GetFullPath('C:\\Repo O''Brien');") != null);
 }
 
 test "prependCdGuard canonicalizes forward slashes in project root" {
@@ -164,7 +164,7 @@ test "prependCdGuard canonicalizes forward slashes in project root" {
     const guarded = try Backend.prependCdGuard(gpa, "C:/Users/u/repo", "Write-Output hi");
     defer gpa.free(guarded);
 
-    try std.testing.expect(std.mem.indexOf(u8, guarded, "$_nova_root = [System.IO.Path]::GetFullPath('") != null);
+    try std.testing.expect(std.mem.indexOf(u8, guarded, "$_zay_root = [System.IO.Path]::GetFullPath('") != null);
 }
 
 test "validateCwd handles case-folding, slash differences, and rejects prefix collisions" {

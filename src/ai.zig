@@ -322,10 +322,10 @@ pub const ContentBlock = union(enum) {
         self.* = undefined;
     }
 
-    /// Error set for decoding a block from Nova's persistence JSON.
+    /// Error set for decoding a block from Zay's persistence JSON.
     pub const DecodeError = error{CorruptPayload} || std.mem.Allocator.Error;
 
-    /// Encode and decode for Nova's canonical *persistence* JSON — the form the
+    /// Encode and decode for Zay's canonical *persistence* JSON — the form the
     /// session store keeps on disk. This is NOT a provider's wire format;
     /// adapters in `ai/` own those. The two directions live together so a new
     /// variant cannot be added to one without the other (a round-trip test in

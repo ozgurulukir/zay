@@ -61,7 +61,7 @@ pub fn runWith(
 
 /// Locate a tool by name in an arbitrary slice. Returns null when no
 /// tool with that name exists. Linear scan — fine for the handful of
-/// tools Nova exposes.
+/// tools Zay exposes.
 pub fn lookupIn(slice: []const Tool, name: []const u8) ?Tool {
     assert(name.len > 0);
     for (slice) |tool| {

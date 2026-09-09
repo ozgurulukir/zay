@@ -1,6 +1,6 @@
 -- test.lua — Git Tools plugin tests
 --
--- Loads the real plugin source with a mocked `nova` bridge and exercises the
+-- Loads the real plugin source with a mocked `zay` bridge and exercises the
 -- handlers. Covers:
 --   S4  git_status reports the not-a-repo error when the bridge returns nil
 --       (and when it returns "" — the empty-string case that used to lie).
@@ -8,7 +8,7 @@
 --   S4  git_commit surfaces result.output on failure.
 local test = test_runner
 
--- ── Mock the nova bridge, then load the plugin ──────────────────────
+-- ── Mock the zay bridge, then load the plugin ──────────────────────
 local registered = {}
 local branch_reply = "main"
 local status_reply = ""
@@ -20,7 +20,7 @@ local last_log_n = nil
 local last_commit_opts = nil
 local last_add_files = nil
 
-nova = {
+zay = {
   register_tool = function(tool)
     registered[tool.name] = tool
   end,

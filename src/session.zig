@@ -899,7 +899,7 @@ fn freeToolCalls(gpa: std.mem.Allocator, calls: []const ai.ToolCall) void {
 test "session persists and loads messages" {
     var manager = try SessionManager.init(std.testing.allocator, std.testing.io, ":memory:");
     defer manager.deinit();
-    var session = try manager.create("/tmp/nova", .{ .id = "0123456789abcdef0123456789abcdef", .title = "Test" });
+    var session = try manager.create("/tmp/zay", .{ .id = "0123456789abcdef0123456789abcdef", .title = "Test" });
 
     var id: [entry_id_len]u8 = undefined;
     const blocks = try std.testing.allocator.alloc(ai.ContentBlock, 1);
@@ -920,7 +920,7 @@ test "session persists and loads messages" {
 test "session persists tool display labels and failures" {
     var manager = try SessionManager.init(std.testing.allocator, std.testing.io, ":memory:");
     defer manager.deinit();
-    var session = try manager.create("/tmp/nova", .{ .id = "11111111111111111111111111111111", .title = "Tools" });
+    var session = try manager.create("/tmp/zay", .{ .id = "11111111111111111111111111111111", .title = "Tools" });
 
     var id: [entry_id_len]u8 = undefined;
     const blocks = try std.testing.allocator.alloc(ai.ContentBlock, 1);
@@ -948,7 +948,7 @@ test "session persists tool display labels and failures" {
 test "session branch with summary changes context" {
     var manager = try SessionManager.init(std.testing.allocator, std.testing.io, ":memory:");
     defer manager.deinit();
-    var session = try manager.create("/tmp/nova", .{ .id = "fedcba9876543210fedcba9876543210" });
+    var session = try manager.create("/tmp/zay", .{ .id = "fedcba9876543210fedcba9876543210" });
 
     var first: [entry_id_len]u8 = undefined;
     var second: [entry_id_len]u8 = undefined;
@@ -995,7 +995,7 @@ test "session compaction boundary replaces summarized prefix" {
     const gpa = std.testing.allocator;
     var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
     defer manager.deinit();
-    var session = try manager.create("/tmp/nova", .{ .id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
+    var session = try manager.create("/tmp/zay", .{ .id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
 
     var id_old_user: [entry_id_len]u8 = undefined;
     var id_old_agent: [entry_id_len]u8 = undefined;
@@ -1021,7 +1021,7 @@ test "session compaction boundary keeps entries appended after it" {
     const gpa = std.testing.allocator;
     var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
     defer manager.deinit();
-    var session = try manager.create("/tmp/nova", .{ .id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" });
+    var session = try manager.create("/tmp/zay", .{ .id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" });
 
     var id_old: [entry_id_len]u8 = undefined;
     var id_kept: [entry_id_len]u8 = undefined;
@@ -1047,7 +1047,7 @@ test "compaction cut splits the branch at the keep-recent budget" {
     const gpa = std.testing.allocator;
     var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
     defer manager.deinit();
-    var session = try manager.create("/tmp/nova", .{ .id = "cccccccccccccccccccccccccccccccc" });
+    var session = try manager.create("/tmp/zay", .{ .id = "cccccccccccccccccccccccccccccccc" });
 
     var id_first: [entry_id_len]u8 = undefined;
     var id_second: [entry_id_len]u8 = undefined;
@@ -1069,7 +1069,7 @@ test "compaction cut returns null when the budget covers the branch" {
     const gpa = std.testing.allocator;
     var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
     defer manager.deinit();
-    var session = try manager.create("/tmp/nova", .{ .id = "dddddddddddddddddddddddddddddddd" });
+    var session = try manager.create("/tmp/zay", .{ .id = "dddddddddddddddddddddddddddddddd" });
 
     var id_only: [entry_id_len]u8 = undefined;
     try appendTextEntry(&session, gpa, .user, "small", &id_only);
@@ -1081,7 +1081,7 @@ test "snapshotAt reads the nearest ancestor-or-self snapshot, branch-aware" {
     const gpa = std.testing.allocator;
     var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
     defer manager.deinit();
-    var session = try manager.create("/tmp/nova", .{ .id = "5" ** session_id_len });
+    var session = try manager.create("/tmp/zay", .{ .id = "5" ** session_id_len });
 
     const sha_a = "a" ** 40;
     const sha_b = "b" ** 40;
@@ -1125,7 +1125,7 @@ test "lastUserEntry walks the active path to the newest user message" {
     const gpa = std.testing.allocator;
     var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
     defer manager.deinit();
-    var session = try manager.create("/tmp/nova", .{ .id = "e" ** session_id_len });
+    var session = try manager.create("/tmp/zay", .{ .id = "e" ** session_id_len });
 
     var user1: [entry_id_len]u8 = undefined;
     var asst1: [entry_id_len]u8 = undefined;
@@ -1171,7 +1171,7 @@ test "deleteNewestPromptHistory removes exactly the newest row" {
     const gpa = std.testing.allocator;
     var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
     defer manager.deinit();
-    var session = try manager.create("/tmp/nova", .{ .id = "f" ** session_id_len });
+    var session = try manager.create("/tmp/zay", .{ .id = "f" ** session_id_len });
 
     try session.savePromptHistory("first");
     try session.savePromptHistory("second");
@@ -1216,7 +1216,7 @@ test "prompt history newest-first order is insertion-stable under millisecond ti
     const gpa = std.testing.allocator;
     var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
     defer manager.deinit();
-    var session = try manager.create("/tmp/nova", .{ .id = "6" ** session_id_len });
+    var session = try manager.create("/tmp/zay", .{ .id = "6" ** session_id_len });
 
     // Two rows sharing created_at_ms: the order must fall back to insertion
     // order (autoincrement id) — the agreement point between
@@ -1261,7 +1261,7 @@ test "initDefault creates directory and initializes database" {
     defer manager.deinit();
 
     // Verify the file was actually created in the right spot — under the
-    // platform config dir (Windows: AppData/Roaming/nova, POSIX: .config/nova),
+    // platform config dir (Windows: AppData/Roaming/zay, POSIX: .config/zay),
     // relative to the tmp home_dir. Resolve the expected path against cwd so the
     // access check is absolute and host-separator agnostic (no fragile strip).
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
@@ -1283,7 +1283,7 @@ test "initDefault creates directory and initializes database" {
 test "create rejects session id with wrong length" {
     var manager = try SessionManager.init(std.testing.allocator, std.testing.io, ":memory:");
     defer manager.deinit();
-    try std.testing.expectError(error.BadSessionId, manager.create("/tmp/nova", .{ .id = "short" }));
+    try std.testing.expectError(error.BadSessionId, manager.create("/tmp/zay", .{ .id = "short" }));
 }
 
 test "list treats corrupt leaf_entry_id as null instead of crashing" {
@@ -1292,7 +1292,7 @@ test "list treats corrupt leaf_entry_id as null instead of crashing" {
     defer manager.deinit();
 
     // Valid session: create + append an entry so it has a proper 8-char leaf.
-    var session = try manager.create("/tmp/nova", .{ .id = "a" ** session_id_len });
+    var session = try manager.create("/tmp/zay", .{ .id = "a" ** session_id_len });
     var id: [entry_id_len]u8 = undefined;
     try appendTextEntry(&session, gpa, .user, "hello", &id);
 
@@ -1306,7 +1306,7 @@ test "list treats corrupt leaf_entry_id as null instead of crashing" {
     );
     defer sess_stmt.finalize();
     try sess_stmt.bindText(1, "b" ** session_id_len);
-    try sess_stmt.bindText(2, "/tmp/nova");
+    try sess_stmt.bindText(2, "/tmp/zay");
     try expectDone(&sess_stmt);
 
     var entry_stmt = try manager.connection.prepare(
@@ -1342,7 +1342,7 @@ test "deleteSession removes a session and its entries" {
     var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
     defer manager.deinit();
 
-    var session = try manager.create("/tmp/nova", .{ .id = "a" ** session_id_len });
+    var session = try manager.create("/tmp/zay", .{ .id = "a" ** session_id_len });
     var id: [entry_id_len]u8 = undefined;
     try appendTextEntry(&session, gpa, .user, "hello", &id);
 
@@ -1374,7 +1374,7 @@ test "updateModel persists reasoning effort and summary reads it back" {
     const gpa = std.testing.allocator;
     var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
     defer manager.deinit();
-    var session = try manager.create("/tmp/nova", .{ .id = "e" ** session_id_len });
+    var session = try manager.create("/tmp/zay", .{ .id = "e" ** session_id_len });
 
     // Direct session-row update (no writer thread in this harness).
     try session.updateModel("ollama", "llama3.1:8b", "high");
@@ -1399,7 +1399,7 @@ test "renameSession updates the title" {
     var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
     defer manager.deinit();
 
-    _ = try manager.create("/tmp/nova", .{ .id = "b" ** session_id_len });
+    _ = try manager.create("/tmp/zay", .{ .id = "b" ** session_id_len });
 
     // No title initially.
     {
@@ -1418,7 +1418,7 @@ test "renameSession updates the title" {
     );
     defer sess_stmt.finalize();
     try sess_stmt.bindText(1, "c" ** session_id_len);
-    try sess_stmt.bindText(2, "/tmp/nova");
+    try sess_stmt.bindText(2, "/tmp/zay");
     try expectDone(&sess_stmt);
 
     var entry_stmt = try manager.connection.prepare(

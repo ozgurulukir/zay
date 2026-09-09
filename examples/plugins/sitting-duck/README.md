@@ -1,6 +1,6 @@
 # sitting-duck
 
-Query tree-sitter ASTs with SQL, straight from Nova. The plugin wraps the
+Query tree-sitter ASTs with SQL, straight from Zay. The plugin wraps the
 `duckdb` CLI and its `sitting_duck` community extension, which exposes parsed
 syntax trees as SQL tables — so structural questions ("where are all the
 `defer` calls?", "which functions exceed 200 lines?") become plain `SELECT`s.
@@ -18,7 +18,7 @@ They are exposed to the model as `lua__sitting-duck__<tool>`.
 
 ## Requirements
 
-- **Nova 0.5.0+** — uses the `plugin.get_config()` / `nova.shell_quote()`
+- **Zay 0.5.0+** — uses the `plugin.get_config()` / `zay.shell_quote()`
   bridge surface.
 - **duckdb CLI** — the plugin never installs this itself; pick one:
 
@@ -29,31 +29,31 @@ They are exposed to the model as `lua__sitting-duck__<tool>`.
 
   or download the single binary from <https://duckdb.org/install/>. The
   plugin finds it via `plugins.sitting-duck.settings.duckdb_path` →
-  `NOVA_SITTING_DUCK_BIN` env var → `duckdb` on `PATH`, in that order.
+  `ZAY_SITTING_DUCK_BIN` env var → `duckdb` on `PATH`, in that order.
 - **Internet on first use** — the `sitting_duck` community extension is
   `INSTALL`ed automatically by the plugin on the first tool call, through
   duckdb's own community-extension mechanism — no manual step (and no reason
   to pre-install: `INSTALL` is idempotent, so doing it yourself only skips
   the one-time download). Success is cached in
-  `.nova/sitting-duck/state.json` and re-verified once per session, so a
+  `.zay/sitting-duck/state.json` and re-verified once per session, so a
   duckdb upgrade triggers a re-install (the extension is built per DuckDB
   release).
 - **Linux-first.** Windows runs the plugin through git-bash and is untested.
 
 ## Install
 
-1. Copy the plugin into Nova's plugin directory (from your Nova checkout):
+1. Copy the plugin into Zay's plugin directory (from your Zay checkout):
 
    ```bash
-   cp -r examples/plugins/sitting-duck ~/.config/nova/plugins/
+   cp -r examples/plugins/sitting-duck ~/.config/zay/plugins/
    ```
 
-   Project-local alternative: `.nova/plugins/sitting-duck/` inside a repo
+   Project-local alternative: `.zay/plugins/sitting-duck/` inside a repo
    (overrides a global plugin with the same name). On Windows the global
-   directory is `%APPDATA%\nova\plugins\`.
+   directory is `%APPDATA%\zay\plugins\`.
 
-2. Make sure duckdb is reachable. If it is not on `PATH`, point Nova at it —
-   either in `~/.config/nova/config.json`:
+2. Make sure duckdb is reachable. If it is not on `PATH`, point Zay at it —
+   either in `~/.config/zay/config.json`:
 
    ```json
    {
@@ -69,20 +69,20 @@ They are exposed to the model as `lua__sitting-duck__<tool>`.
    `docs/CONFIG.md`), or via the environment:
 
    ```bash
-   export NOVA_SITTING_DUCK_BIN=/usr/local/bin/duckdb
+   export ZAY_SITTING_DUCK_BIN=/usr/local/bin/duckdb
    ```
 
-3. Restart Nova — plugins and their settings are read once at startup.
+3. Restart Zay — plugins and their settings are read once at startup.
 
 ## Verify
 
-Run `/plugins` in Nova and check that `sitting-duck` is enabled, then ask the
+Run `/plugins` in Zay and check that `sitting-duck` is enabled, then ask the
 model something like *"outline the symbols in `src/**/*.zig` with
 ast_outline"*. The first call bootstraps the extension; later calls are fast.
 
 ## Notes
 
-- All plugin state lives under `.nova/sitting-duck/` in the project: the
+- All plugin state lives under `.zay/sitting-duck/` in the project: the
   bootstrap marker (`state.json`) and the `query.sql` debug artifact (every
   query error message points at it). Deleting the directory is safe — the
   plugin re-bootstraps on the next call.

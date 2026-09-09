@@ -199,7 +199,7 @@ pub const App = struct {
     /// cleared on commit (`applyTheme`) or cancel (`closeThemePicker`).
     theme_preview_original: ?tui_style.Theme = null,
     /// Process environment map — stored once at startup so cross-project
-    /// session resume can reload config (`.nova/config.json`) from the
+    /// session resume can reload config (`.zay/config.json`) from the
     /// target project's cwd without re-reading the OS environment.
     environ_map: ?*std.process.Environ.Map = null,
     retired_transcripts: std.ArrayList(transcript_mod.Transcript) = .empty,
@@ -1404,8 +1404,8 @@ pub const commands = [_]CommandEntry{
     .{ .name = "Theme", .command = .theme, .description = "Switch color theme (highlight current)", .category = "SYSTEM" },
     .{ .name = "Status", .command = .status, .description = "Show agent runtime & git state", .category = "SYSTEM" },
     .{ .name = "Help", .command = .help, .description = "Show keyboard shortcuts & guide", .category = "SYSTEM" },
-    .{ .name = "Exit", .command = .exit_cmd, .description = "Quit Nova agent", .category = "SYSTEM" },
-    .{ .name = "Quit", .command = .exit_cmd, .description = "Quit Nova agent", .category = "SYSTEM" },
+    .{ .name = "Exit", .command = .exit_cmd, .description = "Quit Zay agent", .category = "SYSTEM" },
+    .{ .name = "Quit", .command = .exit_cmd, .description = "Quit Zay agent", .category = "SYSTEM" },
 };
 
 pub fn openMcp(app: *App) void {

@@ -118,7 +118,7 @@ test "appendPersisted leaves the cache empty when persistence fails" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, ".config/nova");
+    try tmp.dir.createDirPath(std.testing.io, ".config/zay");
     const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer gpa.free(home_dir);
 
@@ -148,7 +148,7 @@ test "appendPersisted persists before caching" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, ".config/nova");
+    try tmp.dir.createDirPath(std.testing.io, ".config/zay");
     const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer gpa.free(home_dir);
 

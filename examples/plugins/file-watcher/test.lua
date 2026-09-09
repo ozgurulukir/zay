@@ -1,6 +1,6 @@
 -- test.lua — File Watcher plugin tests
 --
--- Loads the real plugin source with a mocked `nova` bridge and exercises the
+-- Loads the real plugin source with a mocked `zay` bridge and exercises the
 -- event-driven counting (T4). Covers:
 --   T4  tool_call_finished events are classified by tool name into per-kind
 --       counters (write/edit/delete/rename/copy).
@@ -8,11 +8,11 @@
 --   T4  manual track_file_op records stay separate from event counts.
 local test = test_runner
 
--- ── Mock the nova bridge, then load the plugin ──────────────────────
+-- ── Mock the zay bridge, then load the plugin ──────────────────────
 local registered = {}
 local on_handlers = {}
 
-nova = {
+zay = {
   register_tool = function(tool)
     registered[tool.name] = tool
   end,
