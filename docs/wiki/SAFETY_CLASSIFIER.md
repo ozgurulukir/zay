@@ -31,11 +31,14 @@ The system operates across two complementary tiers:
    - Evaluates natural language shell commands semantically for dangerous side effects beyond simple regex matching.
 
 > [!NOTE]
-> **Fallback semantics:** a connection or network error on the classify call
-> falls back to the Tier 1 matcher. There is currently **no application-level
-> timeout** on the classify request — a classifier that accepts the connection
-> but never responds will block the turn — so run the service somewhere with
-> reliable latency (it defaults to `127.0.0.1:8765`).
+> **Fallback semantics:** any failure on the classify call — connection
+> error, non-2xx status, malformed body, or a stalled server — falls back
+> to the Tier 1 matcher. On POSIX, plain-`http` classifier URLs carry a
+> **5-second deadline** covering the response exchange: a classifier that
+> accepts the connection but never responds fails to the local matcher
+> instead of blocking the turn. Windows and `https://` URLs keep the plain
+> HTTP-client exchange without a deadline, so run the service somewhere
+> with reliable latency (it defaults to `127.0.0.1:8765`).
 
 ---
 
@@ -94,6 +97,13 @@ $env:NOVA_BASH_CLASSIFIER_URL = "http://127.0.0.1:8765/classify"
 ## 4. REST API Specification (Custom Classifiers)
 
 You can implement your own safety classifier in any programming language (Go, Rust, Node.js, Python, etc.) by implementing this HTTP REST contract:
+
+> [!IMPORTANT]
+> **Response deadline:** Nova enforces a **5-second deadline** on the
+> response exchange for POSIX plain-`http` classifier URLs. A response that
+> has not fully arrived within the budget is abandoned and the command
+> falls back to the Tier 1 matcher, so a custom classifier must answer
+> within that window.
 
 ### Endpoint: `POST /classify`
 

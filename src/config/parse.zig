@@ -29,6 +29,7 @@ const TuiSettings = config_mod.TuiSettings;
 const FuzzyHighlightStyle = config_mod.FuzzyHighlightStyle;
 const SplitMode = config_mod.SplitMode;
 const Diagnostic = config_mod.Diagnostic;
+const appendConfigError = config_mod.appendConfigError;
 const LoadResult = config_mod.LoadResult;
 
 /// Default `TuiSettings` — the single source for the "still at its default?"
@@ -52,8 +53,9 @@ const min_split_width_min: u16 = 80;
 const min_split_width_max: u16 = 500;
 /// Max length for `systemPrompt` (schema `maxLength: 10000`). Longer values
 /// are dropped with a diagnostic — a silently-truncated prompt would change
-/// semantics, so the field never clamps.
-const max_system_prompt_chars: usize = 10_000;
+/// semantics, so the field never clamps. Public: the settings editor's
+/// write-time check must count the same unit (code points, not bytes).
+pub const max_system_prompt_chars: usize = 10_000;
 /// Max byte length for `plugins.<name>.settings`, applied to both the
 /// escaped-string form and the canonical serialized inline-object form.
 /// Oversized settings are dropped with a diagnostic; the plugin still loads
@@ -157,8 +159,8 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
         if (ms.baseUrl()) |base_url| try replaceOptionalSlice(gpa, &target.base_url, base_url);
         if (ms.apiKey()) |api_key| try replaceOptionalSlice(gpa, &target.api_key, api_key);
         target.use_responses_endpoint = ms.useResponsesEndpoint();
-        if (ms.systemPrompt()) |s| try replaceOptionalSlice(gpa, &target.system_prompt, s);
-        if (ms.bashClassifierUrl()) |s| try replaceOptionalSlice(gpa, &target.bash_classifier_url, s);
+        try applyTextOverlay(gpa, &target.system_prompt, ms.systemPrompt());
+        try applyTextOverlay(gpa, &target.bash_classifier_url, ms.bashClassifierUrl());
     } else {
         // Legacy fields: apply individual field overrides.
         if (updates.provider_name) |s| try replaceOptionalSlice(gpa, &target.provider_name, s);
@@ -166,8 +168,8 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
         if (updates.strict_outputs) |v| target.strict_outputs = v;
         if (updates.base_url) |s| try replaceOptionalSlice(gpa, &target.base_url, s);
         if (updates.api_key) |s| try replaceOptionalSlice(gpa, &target.api_key, s);
-        if (updates.bash_classifier_url) |s| try replaceOptionalSlice(gpa, &target.bash_classifier_url, s);
-        if (updates.system_prompt) |s| try replaceOptionalSlice(gpa, &target.system_prompt, s);
+        try applyTextOverlay(gpa, &target.bash_classifier_url, updates.bash_classifier_url);
+        try applyTextOverlay(gpa, &target.system_prompt, updates.system_prompt);
         if (updates.model) |m| {
             if (target.model) |*old| old.deinit(gpa);
             target.model = try m.clone(gpa);
@@ -184,6 +186,22 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
     try applyTuiOverlay(gpa, target, updates.tui);
     // Theme is independent of model selection, so it merges unconditionally.
     if (updates.theme) |s| try replaceOptionalSlice(gpa, &target.theme, s);
+}
+
+/// Overlay semantics for user-clearable text fields (`system_prompt`,
+/// `bash_classifier_url`): a non-null update replaces the target and an
+/// EMPTY update ("") clears it. The settings editor encodes "field
+/// cleared" as the empty string because a null update means "not touched"
+/// — partial-config writes (model picker, theme) carry null for every
+/// field they do not manage.
+fn applyTextOverlay(gpa: std.mem.Allocator, target: *?[]u8, update: ?[]const u8) !void {
+    const s = update orelse return;
+    if (s.len == 0) {
+        if (target.*) |old| gpa.free(old);
+        target.* = null;
+        return;
+    }
+    try replaceOptionalSlice(gpa, target, s);
 }
 
 /// Merge toast settings: non-default values in `updates` override `target`.
@@ -510,20 +528,14 @@ fn loadFile(
     const file = std.Io.Dir.openFile(.cwd(), io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return .{},
         else => {
-            try diagnostics.append(gpa, .{ .config_parse_error = .{
-                .path = try gpa.dupe(u8, path),
-                .reason = try gpa.dupe(u8, @errorName(err)),
-            } });
+            try appendConfigError(gpa, diagnostics, path, "{s}", .{@errorName(err)});
             return .{};
         },
     };
     defer file.close(io);
     const stat = try file.stat(io);
     if (stat.size > 32 * 1024) {
-        try diagnostics.append(gpa, .{ .config_parse_error = .{
-            .path = try gpa.dupe(u8, path),
-            .reason = try gpa.dupe(u8, "FileTooBig"),
-        } });
+        try appendConfigError(gpa, diagnostics, path, "FileTooBig", .{});
         return .{};
     }
     const bytes = try gpa.alloc(u8, @intCast(stat.size));
@@ -540,19 +552,13 @@ fn parseFile(
     diagnostics: *std.ArrayList(Diagnostic),
 ) !Config {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, bytes, .{}) catch |err| {
-        try diagnostics.append(gpa, .{ .config_parse_error = .{
-            .path = try gpa.dupe(u8, path),
-            .reason = try std.fmt.allocPrint(gpa, "invalid JSON: {s}", .{@errorName(err)}),
-        } });
+        try appendConfigError(gpa, diagnostics, path, "invalid JSON: {s}", .{@errorName(err)});
         return .{};
     };
     defer parsed.deinit();
 
     if (parsed.value != .object) {
-        try diagnostics.append(gpa, .{ .config_parse_error = .{
-            .path = try gpa.dupe(u8, path),
-            .reason = try gpa.dupe(u8, "top-level value must be an object"),
-        } });
+        try appendConfigError(gpa, diagnostics, path, "top-level value must be an object", .{});
         return .{};
     }
     return parseObject(gpa, path, parsed.value, diagnostics);
@@ -583,10 +589,7 @@ fn parseObject(
             out.provider_name = selection.provider_name;
             out.model = selection.model;
         } else |err| {
-            try diagnostics.append(gpa, .{ .config_parse_error = .{
-                .path = try gpa.dupe(u8, path),
-                .reason = try std.fmt.allocPrint(gpa, "invalid model selection: {s}", .{@errorName(err)}),
-            } });
+            try appendConfigError(gpa, diagnostics, path, "invalid model selection: {s}", .{@errorName(err)});
         }
     }
     if (value.object.get("providers")) |providers_value| {
@@ -614,17 +617,18 @@ fn parseObject(
     // that still carry the key parse without error; the next save drops it.
     if (boolFieldCompat(value, "strictOutputs", "strict_outputs")) |b| out.strict_outputs = b;
     if (stringFieldCompat(value, "systemPrompt", "system_prompt")) |s| {
-        // Char (UTF-8 code point) semantics to match the schema's `maxLength`;
-        // invalid UTF-8 falls back to the byte length. The field is never
-        // truncated — an over-limit prompt is dropped with a diagnostic.
-        const len_chars = std.unicode.utf8CountCodepoints(s) catch s.len;
-        if (len_chars <= max_system_prompt_chars) {
-            out.system_prompt = try gpa.dupe(u8, s);
-        } else {
-            try diagnostics.append(gpa, .{ .config_parse_error = .{
-                .path = try gpa.dupe(u8, path),
-                .reason = try std.fmt.allocPrint(gpa, "systemPrompt exceeds the {d}-char limit ({d} chars); dropped", .{ max_system_prompt_chars, len_chars }),
-            } });
+        // Empty string means "no override" — mirrors bashClassifierUrl
+        // below and the settings editor's cleared-field encoding.
+        if (s.len > 0) {
+            // Char (UTF-8 code point) semantics to match the schema's `maxLength`;
+            // invalid UTF-8 falls back to the byte length. The field is never
+            // truncated — an over-limit prompt is dropped with a diagnostic.
+            const len_chars = std.unicode.utf8CountCodepoints(s) catch s.len;
+            if (len_chars <= max_system_prompt_chars) {
+                out.system_prompt = try gpa.dupe(u8, s);
+            } else {
+                try appendConfigError(gpa, diagnostics, path, "systemPrompt exceeds the {d}-char limit ({d} chars); dropped", .{ max_system_prompt_chars, len_chars });
+            }
         }
     }
     // Theme name (single snake_case key; empty means "default" at resolve time).
@@ -977,10 +981,7 @@ fn parsePlugins(
         }
 
         if (plugin.settings.len > max_plugin_settings_bytes) {
-            try diagnostics.append(gpa, .{ .config_parse_error = .{
-                .path = try gpa.dupe(u8, path),
-                .reason = try std.fmt.allocPrint(gpa, "plugin '{s}' settings exceed the {d}-byte limit ({d} bytes); dropped", .{ plugin.name, max_plugin_settings_bytes, plugin.settings.len }),
-            } });
+            try appendConfigError(gpa, diagnostics, path, "plugin '{s}' settings exceed the {d}-byte limit ({d} bytes); dropped", .{ plugin.name, max_plugin_settings_bytes, plugin.settings.len });
             gpa.free(plugin.settings);
             plugin.settings = "";
         }
@@ -1294,14 +1295,12 @@ pub fn writeGlobal(
 }
 
 pub fn readGlobal(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !Config {
-    const path = try globalConfigPath(gpa, io, home_dir);
-    defer gpa.free(path);
     var sink: std.ArrayList(Diagnostic) = .empty;
     defer {
         for (sink.items) |*d| d.deinit(gpa);
         sink.deinit(gpa);
     }
-    return loadFile(gpa, io, path, &sink);
+    return loadGlobalFile(gpa, io, home_dir, &sink);
 }
 
 pub fn mergeAndWriteGlobal(
@@ -1310,21 +1309,30 @@ pub fn mergeAndWriteGlobal(
     home_dir: []const u8,
     updates: Config,
 ) !void {
-    var current = try readGlobal(gpa, io, home_dir);
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*d| d.deinit(gpa);
+        diagnostics.deinit(gpa);
+    }
+    var current = try loadGlobalFile(gpa, io, home_dir, &diagnostics);
     defer current.deinit(gpa);
+    // The merge rewrites the whole file. If the on-disk config produced
+    // diagnostics (invalid JSON, over-limit fields, ...), the re-read has
+    // already dropped those values — writing would erase them from disk
+    // with no user-visible signal. Refuse and leave the file untouched;
+    // the user fixes the file and retries.
+    if (diagnostics.items.len > 0) return error.ConfigRoundTripLoss;
     try applyConfigOverlay(gpa, &current, updates);
     try writeGlobal(gpa, io, home_dir, current);
 }
 
 pub fn readProject(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) !Config {
-    const path = try projectConfigPath(gpa, cwd);
-    defer gpa.free(path);
     var sink: std.ArrayList(Diagnostic) = .empty;
     defer {
         for (sink.items) |*d| d.deinit(gpa);
         sink.deinit(gpa);
     }
-    return loadFile(gpa, io, path, &sink);
+    return loadProjectFile(gpa, io, cwd, &sink);
 }
 
 pub fn writeProject(
@@ -1364,8 +1372,15 @@ pub fn mergeAndWriteProject(
     cwd: []const u8,
     updates: Config,
 ) !void {
-    var current = try readProject(gpa, io, cwd);
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*d| d.deinit(gpa);
+        diagnostics.deinit(gpa);
+    }
+    var current = try loadProjectFile(gpa, io, cwd, &diagnostics);
     defer current.deinit(gpa);
+    // Same round-trip invariant as `mergeAndWriteGlobal`.
+    if (diagnostics.items.len > 0) return error.ConfigRoundTripLoss;
     try applyConfigOverlay(gpa, &current, updates);
     try writeProject(gpa, io, cwd, current);
 }
@@ -1403,13 +1418,20 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
             try writeKey(writer, "useResponsesEndpoint", &wrote_any);
             try writer.writeAll("true");
         }
+        // An empty string never serializes: a cleared field is null by the
+        // time it reaches here, and the `s.len` guard keeps a hand-built
+        // Config from writing `"systemPrompt": ""` to disk.
         if (ms.systemPrompt()) |s| {
-            try writeKey(writer, "systemPrompt", &wrote_any);
-            try std.json.Stringify.value(s, .{}, writer);
+            if (s.len > 0) {
+                try writeKey(writer, "systemPrompt", &wrote_any);
+                try std.json.Stringify.value(s, .{}, writer);
+            }
         }
         if (ms.bashClassifierUrl()) |url| {
-            try writeKey(writer, "bashClassifierUrl", &wrote_any);
-            try std.json.Stringify.value(url, .{}, writer);
+            if (url.len > 0) {
+                try writeKey(writer, "bashClassifierUrl", &wrote_any);
+                try std.json.Stringify.value(url, .{}, writer);
+            }
         }
         // `strict_outputs` is a global setting (re-synced from cached_config at
         // every client attach), not a model-selection-specific one like the
@@ -1439,12 +1461,16 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
             }
         }
         if (config.system_prompt) |s| {
-            try writeKey(writer, "systemPrompt", &wrote_any);
-            try std.json.Stringify.value(s, .{}, writer);
+            if (s.len > 0) {
+                try writeKey(writer, "systemPrompt", &wrote_any);
+                try std.json.Stringify.value(s, .{}, writer);
+            }
         }
         if (config.bash_classifier_url) |url| {
-            try writeKey(writer, "bashClassifierUrl", &wrote_any);
-            try std.json.Stringify.value(url, .{}, writer);
+            if (url.len > 0) {
+                try writeKey(writer, "bashClassifierUrl", &wrote_any);
+                try std.json.Stringify.value(url, .{}, writer);
+            }
         }
     }
     if (config.providers.len > 0) {
@@ -2724,6 +2750,44 @@ test "mergeLayers merges mcp_servers across config layers" {
     try std.testing.expectEqualStrings("proj-server", merged.mcp_servers[1].name);
 }
 
+test "applyConfigOverlay: empty update clears an optional text field" {
+    const gpa = std.testing.allocator;
+    var target: Config = .{
+        .system_prompt = try gpa.dupe(u8, "custom prompt"),
+        .bash_classifier_url = try gpa.dupe(u8, "http://127.0.0.1:8765/classify"),
+    };
+    defer target.deinit(gpa);
+    var updates: Config = .{
+        .system_prompt = try gpa.dupe(u8, ""),
+        .bash_classifier_url = try gpa.dupe(u8, ""),
+    };
+    defer updates.deinit(gpa);
+
+    try applyConfigOverlay(gpa, &target, updates);
+    try std.testing.expect(target.system_prompt == null);
+    try std.testing.expect(target.bash_classifier_url == null);
+
+    // Cleared fields never serialize — the keys vanish from the file.
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, target);
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "systemPrompt") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "bashClassifierUrl") == null);
+}
+
+test "parseObject treats an empty systemPrompt as absent" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    var cfg = try parseFile(gpa, "<test>", "{\"systemPrompt\":\"\"}", &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expect(cfg.system_prompt == null);
+    try std.testing.expectEqual(@as(usize, 0), sink.items.len);
+}
+
 test "applyConfigOverlay: model_selection present uses canonical form" {
     const gpa = std.testing.allocator;
     var target: Config = .{
@@ -3566,6 +3630,90 @@ test "parsePlugins keeps settings at the 64KiB boundary" {
     try std.testing.expectEqual(@as(usize, 1), plugins.len);
     try std.testing.expectEqual(@as(usize, 65_536), plugins[0].settings.len);
     try std.testing.expectEqual(@as(usize, 0), sink.items.len);
+}
+
+test "config diagnostics append is OOM-safe at every allocation index" {
+    const gpa = std.testing.allocator;
+    const payload = "a" ** 10_001;
+    const json = try std.fmt.allocPrint(gpa, "{{\"systemPrompt\":\"{s}\"}}", .{payload});
+    defer gpa.free(json);
+    // Sweep the single failure point across the first 64 allocations: every
+    // iteration must either finish or return OutOfMemory. A leaked partial
+    // diagnostic (path without reason) fails the test via the testing
+    // allocator's leak check.
+    for (0..64) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index });
+        const fa = failing.allocator();
+        var sink: std.ArrayList(Diagnostic) = .empty;
+        defer {
+            for (sink.items) |*d| d.deinit(fa);
+            sink.deinit(fa);
+        }
+        var cfg = parseFile(fa, "<test>", json, &sink) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            continue;
+        };
+        defer cfg.deinit(fa);
+    }
+}
+
+test "mergeAndWriteGlobal refuses to rewrite a config that would lose fields" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "home" });
+    defer gpa.free(home_dir);
+
+    // Hand-written on-disk config whose systemPrompt is over the limit: the
+    // merge re-read drops the field, so an unchecked rewrite would erase it.
+    const dirty_path = try globalConfigPath(gpa, io, home_dir);
+    defer gpa.free(dirty_path);
+    const dirname = std.fs.path.dirname(dirty_path).?;
+    try std.Io.Dir.createDirPath(.cwd(), io, dirname);
+    const payload = "a" ** 10_001;
+    const dirty = try std.fmt.allocPrint(gpa, "{{\"systemPrompt\":\"{s}\"}}", .{payload});
+    defer gpa.free(dirty);
+    {
+        var file = try std.Io.Dir.createFile(.cwd(), io, dirty_path, .{ .truncate = true });
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try writer.interface.writeAll(dirty);
+        try writer.interface.flush();
+    }
+
+    var updates: Config = .{};
+    defer updates.deinit(gpa);
+    updates.system_prompt = try gpa.dupe(u8, "fresh");
+
+    try std.testing.expectError(error.ConfigRoundTripLoss, mergeAndWriteGlobal(gpa, io, home_dir, updates));
+
+    // The dirty file is untouched: the loader still reports the same
+    // dropped-field diagnostic it reported before the refused merge.
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    var still_dirty = try loadFile(gpa, io, dirty_path, &sink);
+    defer still_dirty.deinit(gpa);
+    try std.testing.expect(still_dirty.system_prompt == null);
+    try std.testing.expectEqual(@as(usize, 1), sink.items.len);
+
+    // Control: once the on-disk file is load-clean, the merge goes through.
+    var clean: Config = .{};
+    defer clean.deinit(gpa);
+    clean.theme = try gpa.dupe(u8, "default");
+    try writeGlobal(gpa, io, home_dir, clean);
+    try mergeAndWriteGlobal(gpa, io, home_dir, updates);
+    var merged = try readGlobal(gpa, io, home_dir);
+    defer merged.deinit(gpa);
+    try std.testing.expectEqualStrings("fresh", merged.system_prompt.?);
+    try std.testing.expectEqualStrings("default", merged.theme.?);
 }
 
 test "parseObject drops oversized systemPrompt with a diagnostic" {

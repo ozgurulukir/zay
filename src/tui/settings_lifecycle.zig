@@ -21,7 +21,9 @@ const EditTarget = settings_widget.EditTarget;
 // Helper functions
 // ---------------------------------------------------------------------------
 
-/// Check if pending values differ from current config values.
+/// Check if pending values differ from current config values. A null
+/// pending means "not touched"; an empty-string pending means "cleared"
+/// and compares as a change against any non-empty current value.
 fn hasActualChanges(state: *const State, config: *const config_mod.Config) bool {
     if (state.pending_use_responses_endpoint) |v| {
         const current_value = if (config.model_selection) |ms| ms.useResponsesEndpoint() else config.use_responses_endpoint orelse false;
@@ -37,6 +39,9 @@ fn hasActualChanges(state: *const State, config: *const config_mod.Config) bool 
         const current_url = current_value orelse "";
         if (!std.mem.eql(u8, s, current_url)) return true;
     }
+    if (state.pending_toast_enabled) |v| {
+        if (v != (config.toast.enabled orelse true)) return true;
+    }
     return false;
 }
 
@@ -44,8 +49,11 @@ fn hasActualChanges(state: *const State, config: *const config_mod.Config) bool 
 // Validation
 // ---------------------------------------------------------------------------
 
-const MAX_SYSTEM_PROMPT_LENGTH = 10000;
-const MAX_SYSTEM_PROMPT_LENGTH_STR = "10000";
+/// User-facing validation messages, shared by the commit-time (Enter) and
+/// save-time (Ctrl+S) checks so both surfaces say exactly the same thing.
+const url_invalid_msg = "URL must start with http:// or https://";
+const url_too_long_msg = "URL is too long (max 2048 characters)";
+const prompt_too_long_msg = std.fmt.comptimePrint("System prompt is too long (max {d} characters)", .{config_mod.max_system_prompt_chars});
 
 /// Validate bash classifier URL format.
 fn validateBashClassifierUrl(url: []const u8) !void {
@@ -58,9 +66,12 @@ fn validateBashClassifierUrl(url: []const u8) !void {
     if (url.len > 2048) return error.UrlTooLong;
 }
 
-/// Validate system prompt content.
+/// Validate system prompt content. Counts UTF-8 code points to match the
+/// parser's drop rule (`parse.max_system_prompt_chars`): a byte-length check
+/// would falsely reject a CJK prompt three bytes per char.
 fn validateSystemPrompt(prompt: []const u8) !void {
-    if (prompt.len > MAX_SYSTEM_PROMPT_LENGTH) {
+    const len_chars = std.unicode.utf8CountCodepoints(prompt) catch prompt.len;
+    if (len_chars > config_mod.max_system_prompt_chars) {
         return error.PromptTooLong;
     }
 }
@@ -70,6 +81,11 @@ fn validateSystemPrompt(prompt: []const u8) !void {
 // ---------------------------------------------------------------------------
 
 pub fn openSettings(app: *App) void {
+    // Free any unsaved pendings from a previous visit: the widget's
+    // reset() clears state without an allocator, so this is the only
+    // place the owned strings can be released.
+    if (app.pickers.settings.pending_system_prompt) |old| app.gpa.free(old);
+    if (app.pickers.settings.pending_bash_classifier_url) |old| app.gpa.free(old);
     app.mode = .settings;
     app.pickers.settings.reset();
     app.clearInput();
@@ -161,21 +177,18 @@ pub fn clearCurrentField(app: *App) void {
     const state = &app.pickers.settings;
     switch (state.tab) {
         .prompt => {
-            // Free pending value if any was set.
-            if (state.pending_system_prompt) |old| {
-                app.gpa.free(old);
-                state.pending_system_prompt = null;
-            }
-            if (app.cached_config.model_selection != null and
-                app.cached_config.model_selection.?.systemPrompt() != null) state.dirty = true;
+            // "Cleared" is the empty string, NOT null: a null pending means
+            // "not touched" and never reaches the save path.
+            const cleared = app.gpa.dupe(u8, "") catch return;
+            if (state.pending_system_prompt) |old| app.gpa.free(old);
+            state.pending_system_prompt = cleared;
+            state.dirty = hasActualChanges(state, &app.cached_config);
         },
         .advanced => {
-            if (state.pending_bash_classifier_url) |old| {
-                app.gpa.free(old);
-                state.pending_bash_classifier_url = null;
-            }
-            if (app.cached_config.model_selection != null and
-                app.cached_config.model_selection.?.bashClassifierUrl() != null) state.dirty = true;
+            const cleared = app.gpa.dupe(u8, "") catch return;
+            if (state.pending_bash_classifier_url) |old| app.gpa.free(old);
+            state.pending_bash_classifier_url = cleared;
+            state.dirty = hasActualChanges(state, &app.cached_config);
         },
         .general, .about => {},
     }
@@ -203,11 +216,15 @@ pub fn saveSettings(app: *App) !bool {
 
     // Check if there are actual changes vs just toggling back.
     if (!hasActualChanges(state, &app.cached_config)) {
-        // No real changes, just reset pending state.
+        // No real changes, just reset pending state (freeing what the
+        // pendings own — the success path below frees them the same way).
         state.dirty = false;
         state.pending_use_responses_endpoint = null;
+        if (state.pending_system_prompt) |old| app.gpa.free(old);
         state.pending_system_prompt = null;
+        if (state.pending_bash_classifier_url) |old| app.gpa.free(old);
         state.pending_bash_classifier_url = null;
+        state.pending_toast_enabled = null;
         _ = try app.thread.transcript.append(app.gpa, .info, "Settings", "No changes to save");
         return false;
     }
@@ -217,8 +234,8 @@ pub fn saveSettings(app: *App) !bool {
         validateBashClassifierUrl(url) catch |err| {
             log.warn("settings.validation.url_failed err={s}", .{@errorName(err)});
             const msg = switch (err) {
-                error.InvalidUrl => "URL must start with http:// or https://",
-                error.UrlTooLong => "URL is too long (max 2048 characters)",
+                error.InvalidUrl => url_invalid_msg,
+                error.UrlTooLong => url_too_long_msg,
             };
             _ = try app.thread.transcript.append(app.gpa, .notice, "Settings", msg);
             return false;
@@ -228,7 +245,7 @@ pub fn saveSettings(app: *App) !bool {
         validateSystemPrompt(prompt) catch |err| {
             log.warn("settings.validation.prompt_failed err={s}", .{@errorName(err)});
             const msg = switch (err) {
-                error.PromptTooLong => "System prompt is too long (max " ++ MAX_SYSTEM_PROMPT_LENGTH_STR ++ " characters)",
+                error.PromptTooLong => prompt_too_long_msg,
             };
             _ = try app.thread.transcript.append(app.gpa, .notice, "Settings", msg);
             return false;
@@ -244,10 +261,13 @@ pub fn saveSettings(app: *App) !bool {
         updates.use_responses_endpoint = v;
     }
     if (state.pending_system_prompt) |s| {
+        // "" flows through as the clear marker (see applyTextOverlay in
+        // parse.zig); mapping it to null would silently skip the clear.
         updates.system_prompt = try app.gpa.dupe(u8, s);
     }
     if (state.pending_bash_classifier_url) |s| {
-        updates.bash_classifier_url = if (s.len > 0) try app.gpa.dupe(u8, s) else null;
+        // Same clear-marker contract as the prompt above.
+        updates.bash_classifier_url = try app.gpa.dupe(u8, s);
     }
     if (state.pending_toast_enabled) |v| {
         updates.toast.enabled = v;
@@ -262,7 +282,13 @@ pub fn saveSettings(app: *App) !bool {
     config_mod.mergeAndWriteGlobal(app.gpa, app.io, runtime.home_dir, updates) catch |err| {
         log.warn("settings.save.failed err={s}", .{@errorName(err)});
         var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "Failed to save settings: {s}", .{@errorName(err)}) catch "Failed to save settings";
+        // The merge refuses to rewrite a config whose on-disk values would
+        // be dropped by the loader (error.ConfigRoundTripLoss) — say that
+        // instead of the raw error name.
+        const msg = if (err == error.ConfigRoundTripLoss)
+            "config.json contains values that would be dropped on load — fix the file and save again"
+        else
+            std.fmt.bufPrint(&buf, "Failed to save settings: {s}", .{@errorName(err)}) catch "Failed to save settings";
         _ = try app.thread.transcript.append(app.gpa, .notice, "Settings", msg);
         return false;
     };
@@ -296,35 +322,54 @@ fn commitTextEdit(app: *App) !void {
     const text = app.input_buffers.settings_text.items;
     switch (state.edit_target) {
         .system_prompt => {
-            // Validate before committing
+            // Validate before committing; the editor stays open with the
+            // text intact, so surface why nothing was committed instead of
+            // refusing silently.
             validateSystemPrompt(text) catch |err| {
                 log.warn("settings.validation.prompt_failed err={s}", .{@errorName(err)});
-                // Don't commit invalid prompt
+                _ = try app.thread.transcript.append(app.gpa, .notice, "Settings", prompt_too_long_msg);
                 return;
             };
+            // Allocate BEFORE freeing the old value: on OOM the pending
+            // field must keep pointing at memory the reset paths can free.
+            // An empty buffer commits as "" — the "cleared" marker.
+            const next_prompt: []u8 = try app.gpa.dupe(u8, text);
             if (state.pending_system_prompt) |old| app.gpa.free(old);
-            if (text.len > 0) {
-                state.pending_system_prompt = try app.gpa.dupe(u8, text);
-            } else {
-                state.pending_system_prompt = null;
-            }
+            state.pending_system_prompt = next_prompt;
             state.dirty = true;
         },
         .bash_classifier_url => {
-            // Validate before committing
+            // Validate before committing; same surfacing rule as above.
             validateBashClassifierUrl(text) catch |err| {
                 log.warn("settings.validation.url_failed err={s}", .{@errorName(err)});
-                // Don't commit invalid URL
+                const msg = switch (err) {
+                    error.InvalidUrl => url_invalid_msg,
+                    error.UrlTooLong => url_too_long_msg,
+                };
+                _ = try app.thread.transcript.append(app.gpa, .notice, "Settings", msg);
                 return;
             };
+            // Same alloc-before-free order as above.
+            const next_url: ?[]u8 = try app.gpa.dupe(u8, text);
             if (state.pending_bash_classifier_url) |old| app.gpa.free(old);
-            state.pending_bash_classifier_url = try app.gpa.dupe(u8, text);
+            state.pending_bash_classifier_url = next_url;
             state.dirty = true;
         },
         .none => {},
     }
     state.edit_target = .none;
     app.input_buffers.settings_text.clearRetainingCapacity();
+}
+
+/// Mirror of `applyTextOverlay`'s contract (parse.zig) for the in-memory
+/// cached config: a null pending means "not touched", an empty pending
+/// clears the field, anything else replaces it. Inlined per field here
+/// because the cached config lives outside parse.zig's overlay path.
+fn applyPendingText(gpa: std.mem.Allocator, target: *?[]u8, pending: ?[]const u8) !void {
+    const s = pending orelse return;
+    const next: ?[]u8 = if (s.len > 0) try gpa.dupe(u8, s) else null;
+    if (target.*) |old| gpa.free(old);
+    target.* = next;
 }
 
 fn applyToCachedConfig(app: *App, state: *const State) !void {
@@ -334,38 +379,20 @@ fn applyToCachedConfig(app: *App, state: *const State) !void {
         switch (ms.*) {
             .builtin => |*b| {
                 if (state.pending_use_responses_endpoint) |v| b.use_responses_endpoint = v;
-                if (state.pending_system_prompt) |s| {
-                    if (b.system_prompt) |old| app.gpa.free(old);
-                    b.system_prompt = try app.gpa.dupe(u8, s);
-                }
-                if (state.pending_bash_classifier_url) |s| {
-                    if (b.bash_classifier_url) |old| app.gpa.free(old);
-                    b.bash_classifier_url = if (s.len > 0) try app.gpa.dupe(u8, s) else null;
-                }
+                try applyPendingText(app.gpa, &b.system_prompt, state.pending_system_prompt);
+                try applyPendingText(app.gpa, &b.bash_classifier_url, state.pending_bash_classifier_url);
             },
             .custom => |*c| {
                 if (state.pending_use_responses_endpoint) |v| c.use_responses_endpoint = v;
-                if (state.pending_system_prompt) |s| {
-                    if (c.system_prompt) |old| app.gpa.free(old);
-                    c.system_prompt = try app.gpa.dupe(u8, s);
-                }
-                if (state.pending_bash_classifier_url) |s| {
-                    if (c.bash_classifier_url) |old| app.gpa.free(old);
-                    c.bash_classifier_url = if (s.len > 0) try app.gpa.dupe(u8, s) else null;
-                }
+                try applyPendingText(app.gpa, &c.system_prompt, state.pending_system_prompt);
+                try applyPendingText(app.gpa, &c.bash_classifier_url, state.pending_bash_classifier_url);
             },
         }
     } else {
         // Legacy config: update legacy fields directly
         if (state.pending_use_responses_endpoint) |v| app.cached_config.use_responses_endpoint = v;
-        if (state.pending_system_prompt) |s| {
-            if (app.cached_config.system_prompt) |old| app.gpa.free(old);
-            app.cached_config.system_prompt = try app.gpa.dupe(u8, s);
-        }
-        if (state.pending_bash_classifier_url) |s| {
-            if (app.cached_config.bash_classifier_url) |old| app.gpa.free(old);
-            app.cached_config.bash_classifier_url = if (s.len > 0) try app.gpa.dupe(u8, s) else null;
-        }
+        try applyPendingText(app.gpa, &app.cached_config.system_prompt, state.pending_system_prompt);
+        try applyPendingText(app.gpa, &app.cached_config.bash_classifier_url, state.pending_bash_classifier_url);
         // Sync legacy field updates to model_selection for consistency
         try config_mod.syncModelSelectionFromLegacy(app.gpa, &app.cached_config);
     }
@@ -404,9 +431,12 @@ pub fn handleTextEditKey(app: *App, key: vaxis.Key) !bool {
         return true;
     }
     if (key.matches('s', .{ .ctrl = true })) {
-        // Ctrl+S while editing: commit + save.
+        // Ctrl+S while editing: commit, and only save when the commit
+        // landed — a failed validation keeps the editor open and must not
+        // run saveSettings' re-validation (it would append the same notice
+        // a second time).
         try commitTextEdit(app);
-        _ = try saveSettings(app);
+        if (state.edit_target == .none) _ = try saveSettings(app);
         return true;
     }
     if (key.matches(vaxis.Key.enter, .{})) {
@@ -498,4 +528,77 @@ test "handleTextEditKey Enter commits for bash_classifier_url" {
 
     // Free the committed allocated memory since we don't save to disk in this test
     gpa.free(app.pickers.settings.pending_bash_classifier_url.?);
+}
+
+test "validateSystemPrompt counts UTF-8 code points like the parser" {
+    // 6 000 CJK chars = 18 000 bytes: under the 10 000-char limit although
+    // over the byte count the old check compared against.
+    const cjk = "界" ** 6_000;
+    try validateSystemPrompt(cjk);
+    const ascii_edge = "a" ** config_mod.max_system_prompt_chars;
+    try validateSystemPrompt(ascii_edge);
+    const ascii_over = "a" ** (config_mod.max_system_prompt_chars + 1);
+    try std.testing.expectError(error.PromptTooLong, validateSystemPrompt(ascii_over));
+}
+
+test "clearCurrentField marks a set field cleared and dirty" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // Non-owned cached config with duplicated values the test frees itself.
+    app.cached_config_owned = false;
+    app.cached_config.system_prompt = try gpa.dupe(u8, "custom prompt");
+    app.cached_config.bash_classifier_url = try gpa.dupe(u8, "http://127.0.0.1:8765/classify");
+    app.mode = .settings;
+
+    app.pickers.settings.tab = .prompt;
+    clearCurrentField(&app);
+    // "Cleared" is the empty string, not null — null would mean "untouched"
+    // and the save path would report "No changes to save".
+    try std.testing.expectEqualStrings("", app.pickers.settings.pending_system_prompt.?);
+    try std.testing.expect(app.pickers.settings.dirty);
+
+    app.pickers.settings.tab = .advanced;
+    clearCurrentField(&app);
+    try std.testing.expectEqualStrings("", app.pickers.settings.pending_bash_classifier_url.?);
+    try std.testing.expect(app.pickers.settings.dirty);
+
+    // Clearing an already-empty field is not a change.
+    if (app.cached_config.system_prompt) |s| gpa.free(s);
+    app.cached_config.system_prompt = null;
+    if (app.cached_config.bash_classifier_url) |s| gpa.free(s);
+    app.cached_config.bash_classifier_url = null;
+    app.pickers.settings.dirty = false;
+    app.pickers.settings.tab = .prompt;
+    clearCurrentField(&app);
+    try std.testing.expect(!app.pickers.settings.dirty);
+
+    // clearCurrentField's pendings are owned by the save-reset path — free
+    // the last ones here the same way.
+    gpa.free(app.pickers.settings.pending_system_prompt.?);
+    gpa.free(app.pickers.settings.pending_bash_classifier_url.?);
+}
+
+test "hasActualChanges includes the toast toggle" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.cached_config_owned = false;
+    app.mode = .settings;
+    const state = &app.pickers.settings;
+
+    // A toggled toast must pass the gate — without this check a toast-only
+    // change always reported "No changes to save".
+    state.pending_toast_enabled = true;
+    app.cached_config.toast.enabled = false;
+    try std.testing.expect(hasActualChanges(state, &app.cached_config));
+
+    state.pending_toast_enabled = false;
+    try std.testing.expect(!hasActualChanges(state, &app.cached_config));
 }

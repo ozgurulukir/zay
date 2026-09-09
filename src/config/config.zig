@@ -67,6 +67,9 @@ pub const writeProject = parse_mod.writeProject;
 pub const mergeAndWriteProject = parse_mod.mergeAndWriteProject;
 pub const projectConfigExists = parse_mod.projectConfigExists;
 pub const globalConfigPath = parse_mod.globalConfigPath;
+/// Shared with the settings editor's write-time check so both sides count
+/// the same unit (UTF-8 code points) against the same limit.
+pub const max_system_prompt_chars = parse_mod.max_system_prompt_chars;
 
 // --- Types owned by this file ---
 
@@ -354,37 +357,19 @@ pub const Config = struct {
         }
         if (self.version) |v| {
             const major = parse_mod.parseSemverMajor(v) orelse {
-                try list.append(gpa, .{ .config_parse_error = .{
-                    .path = try gpa.dupe(u8, "version"),
-                    .reason = try formatReason(gpa, "invalid semver '{s}'", .{v}),
-                } });
+                try appendConfigError(gpa, &list, "version", "invalid semver '{s}'", .{v});
                 return try list.toOwnedSlice(gpa);
             };
             if (major > 2) {
-                try list.append(gpa, .{ .config_parse_error = .{
-                    .path = try gpa.dupe(u8, "version"),
-                    .reason = try formatReason(gpa, "unsupported schema version {s}", .{v}),
-                } });
+                try appendConfigError(gpa, &list, "version", "unsupported schema version {s}", .{v});
             }
         }
         if (self.base_url) |url| {
             if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) {
-                try list.append(gpa, .{ .config_parse_error = .{
-                    .path = try gpa.dupe(u8, "base_url"),
-                    .reason = try formatReason(gpa, "invalid URL scheme in '{s}'", .{url}),
-                } });
+                try appendConfigError(gpa, &list, "base_url", "invalid URL scheme in '{s}'", .{url});
             }
         }
         return try list.toOwnedSlice(gpa);
-    }
-
-    fn formatReason(gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![]u8 {
-        var buf: [256]u8 = undefined;
-        if (std.fmt.bufPrint(&buf, fmt, args)) |formatted| {
-            return gpa.dupe(u8, formatted);
-        } else |_| {
-            return std.fmt.allocPrint(gpa, fmt, args);
-        }
     }
 
     /// Alias for `clone`, used by `nova.run` to hand the TUI an owned
@@ -455,6 +440,28 @@ pub const Diagnostic = union(enum) {
         self.* = undefined;
     }
 };
+
+/// Append a `config_parse_error` diagnostic, taking ownership of both
+/// strings only on success. Each allocation carries its own `errdefer`, so
+/// an OOM partway through the pair frees what was already allocated — the
+/// inline two-`try` struct literal this replaces leaked `path` whenever the
+/// `reason` allocation failed. Shared by `parse.zig` and `Config.validate`.
+pub fn appendConfigError(
+    gpa: std.mem.Allocator,
+    diagnostics: *std.ArrayList(Diagnostic),
+    path: []const u8,
+    comptime reason_fmt: []const u8,
+    reason_args: anytype,
+) !void {
+    const path_copy = try gpa.dupe(u8, path);
+    errdefer gpa.free(path_copy);
+    const reason = try std.fmt.allocPrint(gpa, reason_fmt, reason_args);
+    errdefer gpa.free(reason);
+    try diagnostics.append(gpa, .{ .config_parse_error = .{
+        .path = path_copy,
+        .reason = reason,
+    } });
+}
 
 pub const LoadResult = struct {
     config: Config,
