@@ -57,6 +57,16 @@ uv run -m tools.classifier.server --port 8765
 uv run -m tools.classifier.server --model rules --port 8765
 ```
 
+> [!NOTE]
+> **Model weights source:** the `modernbert` preset downloads weights from the
+> upstream repo `nova-agent/ModernBERT-bash-classifier`, which is currently
+> **private** — anonymous downloads fail, and the loader falls back to the
+> legacy `vendor/local-models/ModernBERT-bash-classifier/` snapshot (if
+> present) or the rules engine. Point it at any accessible mirror (the model
+> is Apache-2.0, so re-hosting with notices is permitted) via
+> `ZAY_CLASSIFIER_REPO_ID`, and pin a commit hash with
+> `ZAY_CLASSIFIER_REVISION`.
+
 ### Option B: Using Docker
 
 ```bash
