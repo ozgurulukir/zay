@@ -138,7 +138,8 @@ See the **[Safety & Classifier Guide](docs/wiki/SAFETY_CLASSIFIER.md)** for Dock
 
 ## 💻 Platform Support
 
-- **Linux / macOS:** Fully supported and tested daily.
+- **Linux:** Fully supported and tested daily.
+- **macOS (Apple Silicon):** Binaries shipped for every release (`zay-macos-aarch64`) with a CI runtime smoke; beta until exercised on real hardware. Unsigned — see the installer's Gatekeeper note.
 - **Windows:** Compiles natively (`zig-out/bin/zay.exe`). Core features, TUI, and SQLite persistence are active; cross-platform runtime parity is tracked in [#26](https://github.com/ozgurulukir/zay/issues/26)–[#29](https://github.com/ozgurulukir/zay/issues/29).
 
 ---

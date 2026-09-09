@@ -35,8 +35,19 @@ case "$OS" in
         ;;
     esac
     ;;
+  Darwin)
+    case "$ARCH" in
+      arm64)
+        ARTIFACT="zay-macos-aarch64"
+        ;;
+      *)
+        echo -e "${RED}Error: Unsupported architecture: $ARCH on macOS. Currently arm64 (Apple Silicon) is supported.${RESET}" >&2
+        exit 1
+        ;;
+    esac
+    ;;
   *)
-    echo -e "${RED}Error: Unsupported operating system: $OS. Linux x86_64 and Windows x86_64 are currently supported.${RESET}" >&2
+    echo -e "${RED}Error: Unsupported operating system: $OS. Linux x86_64, macOS arm64 and Windows x86_64 are currently supported.${RESET}" >&2
     exit 1
     ;;
 esac
@@ -85,6 +96,13 @@ mv "$TEMP_DIR/$ARTIFACT" "$INSTALL_DIR/$BIN_NAME"
 chmod +x "$INSTALL_DIR/$BIN_NAME"
 
 echo -e "${GREEN}${BOLD}==> Zay Agent installed successfully to ${INSTALL_DIR}/${BIN_NAME}!${RESET}"
+
+# macOS Gatekeeper flags unsigned binaries downloaded from the internet.
+if [ "$OS" = "Darwin" ]; then
+  echo ""
+  echo -e "${YELLOW}Note: if macOS reports the binary cannot be verified, run:${RESET}"
+  echo -e "  ${BOLD}xattr -d com.apple.quarantine \"${INSTALL_DIR}/${BIN_NAME}\"${RESET}"
+fi
 
 # Check PATH
 case ":$PATH:" in
