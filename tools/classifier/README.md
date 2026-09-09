@@ -31,7 +31,22 @@ Or in `~/.config/zay/config.json`:
 }
 ```
 
-### 3. Docker Deployment
+### 3. Model source & overrides
+
+The `modernbert` preset downloads weights from the upstream HuggingFace repo
+`nova-agent/ModernBERT-bash-classifier`, which is currently **private** —
+anonymous downloads fail, and the loader falls back to the legacy
+`vendor/local-models/ModernBERT-bash-classifier/` snapshot (if present) or
+to the rules engine. Both the source and the revision are overridable so an
+install can target a public mirror without code changes (the model is
+Apache-2.0, so re-hosting with notices is permitted):
+
+```bash
+export ZAY_CLASSIFIER_REPO_ID="ozgurulukir/zay-bash-classifier"  # any accessible mirror
+export ZAY_CLASSIFIER_REVISION="main"                            # pin a commit hash in production
+```
+
+### 4. Docker Deployment
 
 ```bash
 docker build -t zay-classifier -f tools/classifier/Dockerfile tools/classifier
