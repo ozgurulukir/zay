@@ -26,11 +26,32 @@ pub const ToolBuilder = struct {
     }
 };
 
+/// Terminal-event accumulators shared by `StreamState` and direct
+/// `processEvent` callers. `completed` and `incomplete` are distinct on
+/// purpose: a stream that ends with NEITHER is truncated
+/// (`error.ResponseIncomplete`), while `response.incomplete` is a
+/// deliberate provider termination that must surface as a normal Turn —
+/// the partial output, usage, and `finish_reason` all belong to the caller
+/// (the agent auto-continues `.length` cuts, mirroring chat-completions).
+pub const Terminal = struct {
+    completed: bool = false,
+    incomplete: bool = false,
+    usage: ?ai.Usage = null,
+    finish_reason: ?ai.FinishReason = null,
+
+    /// The one "stream reached a deliberate end" predicate. `finish()`'s
+    /// gate and the codex websocket loop must stay in lockstep — both go
+    /// through here so a future terminal condition can't update one site
+    /// and not the other.
+    pub fn isTerminal(self: Terminal) bool {
+        return self.completed or self.incomplete;
+    }
+};
+
 pub const StreamState = struct {
     blocks: std.ArrayList(ai.ContentBlock) = .empty,
     tools: std.ArrayList(ToolBuilder) = .empty,
-    completed: bool = false,
-    usage: ?ai.Usage = null,
+    terminal: Terminal = .{},
 
     pub fn deinit(self: *StreamState, gpa: std.mem.Allocator) void {
         for (self.tools.items) |*tool| tool.deinit(gpa);
@@ -43,15 +64,15 @@ pub const StreamState = struct {
     }
 
     pub fn processJson(self: *StreamState, gpa: std.mem.Allocator, data: []const u8, observer: anytype, call_seq: *u64) !void {
-        try processEvent(gpa, data, &self.blocks, &self.tools, observer, call_seq, &self.completed, &self.usage);
+        try processEvent(gpa, data, &self.blocks, &self.tools, observer, call_seq, &self.terminal);
     }
 
     pub fn finish(self: *StreamState, gpa: std.mem.Allocator, call_seq: *u64) !ai.Turn {
-        if (!self.completed) return error.ResponseIncomplete;
+        if (!self.terminal.isTerminal()) return error.ResponseIncomplete;
         try syncToolBlocks(gpa, &self.blocks, self.tools.items, call_seq);
         const content = try self.blocks.toOwnedSlice(gpa);
         self.blocks = .empty;
-        return .{ .assistant = .{ .assistant = .{ .content = content } }, .usage = self.usage };
+        return .{ .assistant = .{ .assistant = .{ .content = content } }, .usage = self.terminal.usage, .finish_reason = self.terminal.finish_reason };
     }
 };
 
@@ -62,8 +83,7 @@ pub fn processEvent(
     tools: *std.ArrayList(ToolBuilder),
     observer: anytype,
     call_seq: *u64,
-    completed: *bool,
-    usage: *?ai.Usage,
+    terminal: *Terminal,
 ) !void {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, data, .{}) catch return;
     defer parsed.deinit();
@@ -77,8 +97,14 @@ pub fn processEvent(
     switch (event_type) {
         .provider_error => return error.ProviderError,
         .completed => {
-            completed.* = true;
-            usage.* = parseResponseUsage(parsed.value);
+            terminal.completed = true;
+            terminal.usage = parseResponseUsage(parsed.value);
+            return;
+        },
+        .incomplete => {
+            terminal.incomplete = true;
+            terminal.usage = parseResponseUsage(parsed.value);
+            terminal.finish_reason = parseIncompleteReason(parsed.value);
             return;
         },
         .lifecycle => return,
@@ -113,6 +139,22 @@ pub fn parseResponseUsage(event: std.json.Value) ?ai.Usage {
     };
 }
 
+/// Map `response.incomplete_details.reason` onto `ai.FinishReason`,
+/// mirroring the chat-completions string mapping: `max_output_tokens` is the
+/// actionable one (the agent auto-continues it); every other or absent
+/// reason is carried for observability only.
+fn parseIncompleteReason(event: std.json.Value) ai.FinishReason {
+    const response = event.object.get("response") orelse return .other;
+    if (response != .object) return .other;
+    const details = response.object.get("incomplete_details") orelse return .other;
+    if (details != .object) return .other;
+    const reason = details.object.get("reason") orelse return .other;
+    if (reason != .string) return .other;
+    if (std.mem.eql(u8, reason.string, "max_output_tokens")) return .length;
+    if (std.mem.eql(u8, reason.string, "content_filter")) return .content_filter;
+    return .other;
+}
+
 fn usageInteger(usage: std.json.Value, name: []const u8) u32 {
     const field = usage.object.get(name) orelse return 0;
     if (field != .integer) return 0;
@@ -130,6 +172,7 @@ fn usageNestedInteger(usage: std.json.Value, object_name: []const u8, field_name
 pub const ResponseEvent = enum {
     provider_error,
     completed,
+    incomplete,
     lifecycle,
     output_item_added,
     content_part_added,
@@ -152,6 +195,10 @@ pub const response_event_specs = [_]ResponseEventSpec{
     .{ .name = "error", .event = .provider_error },
     .{ .name = "response.failed", .event = .provider_error },
     .{ .name = "response.completed", .event = .completed },
+    // A deliberate provider termination carrying partial output + usage —
+    // NOT a failure (response.failed stays ProviderError). The Turn must own
+    // what streamed so the agent can auto-continue `max_output_tokens` cuts.
+    .{ .name = "response.incomplete", .event = .incomplete },
     // Lifecycle/telemetry events carry no assistant content. Recognize them so
     // Codex does not turn normal WebSocket protocol traffic into warnings.
     .{ .name = "response.created", .event = .lifecycle },
@@ -573,6 +620,52 @@ test "openresponses completed event without usage leaves null" {
     try std.testing.expect(turn.usage == null);
 }
 
+test "openresponses incomplete event yields a Turn carrying the length reason" {
+    // `response.incomplete` is a deliberate termination, not a failure: the
+    // partial output + usage must land in a normal Turn with
+    // finish_reason == .length so the agent's auto-continue applies
+    // (mirroring chat-completions finish_reason handling).
+    const gpa = std.testing.allocator;
+    var state: StreamState = .{};
+    defer state.deinit(gpa);
+    defer state.deinitBlocks(gpa);
+
+    var call_seq: u64 = 0;
+    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.output_text.delta\",\"delta\":\"halfway plan...\"}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":1200,\"output_tokens\":4096,\"total_tokens\":5296}}}", ai.streamNoop(), &call_seq);
+
+    var turn = try state.finish(gpa, &call_seq);
+    defer turn.deinit(gpa);
+    try std.testing.expectEqual(ai.FinishReason.length, turn.finish_reason.?);
+    try std.testing.expectEqual(@as(u32, 1200), turn.usage.?.input_tokens);
+    try std.testing.expectEqual(@as(u32, 4096), turn.usage.?.output_tokens);
+    try std.testing.expectEqual(@as(usize, 1), turn.assistant.assistant.content.len);
+    try std.testing.expect(turn.assistant.assistant.content[0] == .text);
+    try std.testing.expectEqualStrings("halfway plan...", turn.assistant.assistant.content[0].text.text);
+}
+
+test "openresponses incomplete maps content_filter and absent reasons" {
+    const gpa = std.testing.allocator;
+    var call_seq: u64 = 0;
+
+    var filtered: StreamState = .{};
+    defer filtered.deinit(gpa);
+    defer filtered.deinitBlocks(gpa);
+    try filtered.processJson(gpa, "{\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"content_filter\"}}}", ai.streamNoop(), &call_seq);
+    var filtered_turn = try filtered.finish(gpa, &call_seq);
+    defer filtered_turn.deinit(gpa);
+    try std.testing.expectEqual(ai.FinishReason.content_filter, filtered_turn.finish_reason.?);
+
+    var bare: StreamState = .{};
+    defer bare.deinit(gpa);
+    defer bare.deinitBlocks(gpa);
+    try bare.processJson(gpa, "{\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}", ai.streamNoop(), &call_seq);
+    var bare_turn = try bare.finish(gpa, &call_seq);
+    defer bare_turn.deinit(gpa);
+    try std.testing.expectEqual(ai.FinishReason.other, bare_turn.finish_reason.?);
+}
+
 test "openresponses routes parallel argument deltas by output index" {
     const gpa = std.testing.allocator;
     var state: StreamState = .{};
@@ -602,14 +695,13 @@ test "processEvent ignores malformed JSON payloads gracefully" {
     defer blocks.deinit(gpa);
     var tools: std.ArrayList(ToolBuilder) = .empty;
     defer tools.deinit(gpa);
-    var completed = false;
-    var usage: ?ai.Usage = null;
+    var terminal: Terminal = .{};
     var call_seq: u64 = 0;
 
     // Truncated / broken JSON should not error or crash
-    try processEvent(gpa, "{\"type\": \"response.output_text.delta\", \"delta\":", &blocks, &tools, ai.streamNoop(), &call_seq, &completed, &usage);
+    try processEvent(gpa, "{\"type\": \"response.output_text.delta\", \"delta\":", &blocks, &tools, ai.streamNoop(), &call_seq, &terminal);
     try std.testing.expectEqual(@as(usize, 0), blocks.items.len);
-    try std.testing.expectEqual(false, completed);
+    try std.testing.expectEqual(false, terminal.completed);
 }
 
 test "processEvent ignores unknown event types without error" {
@@ -618,12 +710,11 @@ test "processEvent ignores unknown event types without error" {
     defer blocks.deinit(gpa);
     var tools: std.ArrayList(ToolBuilder) = .empty;
     defer tools.deinit(gpa);
-    var completed = false;
-    var usage: ?ai.Usage = null;
+    var terminal: Terminal = .{};
     var call_seq: u64 = 0;
 
-    try processEvent(gpa, "{\"type\": \"custom_vendor.telemetry_heartbeat\"}", &blocks, &tools, ai.streamNoop(), &call_seq, &completed, &usage);
-    try std.testing.expectEqual(false, completed);
+    try processEvent(gpa, "{\"type\": \"custom_vendor.telemetry_heartbeat\"}", &blocks, &tools, ai.streamNoop(), &call_seq, &terminal);
+    try std.testing.expectEqual(false, terminal.completed);
     try std.testing.expectEqual(@as(usize, 0), blocks.items.len);
 }
 
@@ -633,8 +724,7 @@ test "processEvent treats Codex lifecycle events as recognized no-ops" {
     defer blocks.deinit(gpa);
     var tools: std.ArrayList(ToolBuilder) = .empty;
     defer tools.deinit(gpa);
-    var completed = false;
-    var usage: ?ai.Usage = null;
+    var terminal: Terminal = .{};
     var call_seq: u64 = 0;
 
     const events = [_][]const u8{
@@ -652,9 +742,9 @@ test "processEvent treats Codex lifecycle events as recognized no-ops" {
         const type_start = std.mem.indexOf(u8, event, "\"type\":\"").? + "\"type\":\"".len;
         const type_end = std.mem.indexOfPos(u8, event, type_start, "\"").?;
         try std.testing.expectEqual(ResponseEvent.lifecycle, responseEventFromString(event[type_start..type_end]).?);
-        try processEvent(gpa, event, &blocks, &tools, ai.streamNoop(), &call_seq, &completed, &usage);
+        try processEvent(gpa, event, &blocks, &tools, ai.streamNoop(), &call_seq, &terminal);
     }
-    try std.testing.expect(!completed);
+    try std.testing.expect(!terminal.completed);
     try std.testing.expectEqual(@as(usize, 0), blocks.items.len);
 }
 
@@ -664,11 +754,10 @@ test "processEvent returns ProviderError on error event" {
     defer blocks.deinit(gpa);
     var tools: std.ArrayList(ToolBuilder) = .empty;
     defer tools.deinit(gpa);
-    var completed = false;
-    var usage: ?ai.Usage = null;
+    var terminal: Terminal = .{};
     var call_seq: u64 = 0;
 
-    const result = processEvent(gpa, "{\"type\": \"error\", \"error\": {\"message\": \"Rate limit exceeded\"}}", &blocks, &tools, ai.streamNoop(), &call_seq, &completed, &usage);
+    const result = processEvent(gpa, "{\"type\": \"error\", \"error\": {\"message\": \"Rate limit exceeded\"}}", &blocks, &tools, ai.streamNoop(), &call_seq, &terminal);
     try std.testing.expectError(error.ProviderError, result);
 }
 
@@ -757,10 +846,9 @@ test "processEvent handles response.failed as ProviderError" {
     defer blocks.deinit(gpa);
     var tools: std.ArrayList(ToolBuilder) = .empty;
     defer tools.deinit(gpa);
-    var completed = false;
-    var usage: ?ai.Usage = null;
+    var terminal: Terminal = .{};
     var call_seq: u64 = 0;
 
-    const result = processEvent(gpa, "{\"type\":\"response.failed\",\"response\":{\"status_details\":{\"error\":{\"message\":\"Server overload\"}}}}", &blocks, &tools, ai.streamNoop(), &call_seq, &completed, &usage);
+    const result = processEvent(gpa, "{\"type\":\"response.failed\",\"response\":{\"status_details\":{\"error\":{\"message\":\"Server overload\"}}}}", &blocks, &tools, ai.streamNoop(), &call_seq, &terminal);
     try std.testing.expectError(error.ProviderError, result);
 }

@@ -2213,6 +2213,132 @@ test "handleLengthCut with the knob off only emits the stopped event" {
     try std.testing.expectEqual(@as(usize, 0), agent.messages().len);
 }
 
+/// Minimal blocking HTTP server scripted with one canned response per
+/// accepted connection (each `Connection: close`), mirroring
+/// `MockRetryServer` in openai_compatible.zig (that struct is file-private
+/// to its module's tests). The ephemeral port comes from
+/// `server.socket.address` — no readiness wait is needed because `listen`
+/// completes inside `init` before the client can connect.
+const MockScriptedServer = struct {
+    const Response = struct {
+        status: std.http.Status,
+        body: []const u8 = "",
+    };
+
+    io: std.Io,
+    server: std.Io.net.Server,
+    responses: []const Response,
+    connection_count: std.atomic.Value(u32) = .init(0),
+
+    fn init(io: std.Io, responses: []const Response) !MockScriptedServer {
+        const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        const server = try addr.listen(io, .{ .reuse_address = true });
+        return .{ .io = io, .server = server, .responses = responses };
+    }
+
+    fn deinit(self: *MockScriptedServer) void {
+        self.server.deinit(self.io);
+    }
+
+    fn port(self: *const MockScriptedServer) u16 {
+        return self.server.socket.address.ip4.port;
+    }
+
+    fn serve(self: *MockScriptedServer) void {
+        var read_buf: [8192]u8 = undefined;
+        var write_buf: [8192]u8 = undefined;
+        for (self.responses) |resp| {
+            var stream = self.server.accept(self.io) catch return;
+            defer stream.close(self.io);
+            _ = self.connection_count.fetchAdd(1, .monotonic);
+            var reader = stream.reader(self.io, &read_buf);
+            var writer = stream.writer(self.io, &write_buf);
+            var http_server = std.http.Server.init(&reader.interface, &writer.interface);
+            var request = http_server.receiveHead() catch return;
+            request.respond(resp.body, .{
+                .status = resp.status,
+                .keep_alive = false,
+            }) catch return;
+        }
+    }
+};
+
+test "run auto-continues once after a length-cut stream" {
+    // Integration test over a real socket: the first response is a
+    // chat-completions stream severed at the output token cap (text-only,
+    // finish_reason=length); the second is a normal stop. `Agent.run` must
+    // emit the continuing notice, append the hint, re-request exactly once,
+    // and end with both assistant messages in history.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server = try MockScriptedServer.init(io, &.{
+        .{ .status = .ok, .body = "data: {\"choices\":[{\"finish_reason\":null,\"delta\":{\"role\":\"assistant\",\"content\":\"partial plan\"}}]}\n" ++
+            "data: {\"choices\":[{\"finish_reason\":\"length\",\"delta\":{}}]}\n" ++
+            "data: [DONE]\n" },
+        .{ .status = .ok, .body = "data: {\"choices\":[{\"finish_reason\":null,\"delta\":{\"content\":\"continued\"}}]}\n" ++
+            "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n" ++
+            "data: [DONE]\n" },
+    });
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, MockScriptedServer.serve, .{&server});
+    defer thread.join();
+
+    const openai_compatible = @import("ai/openai_compatible.zig");
+    const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/v1", .{server.port()});
+    var client: openai_compatible.Client = undefined;
+    try client.init(gpa, io, .{
+        .base_url = base_url,
+        .api_key = "test-key",
+        .model = "test-model",
+        .tools = &.{},
+        .mcp_tools = &.{},
+        // No sleeping between retries in tests.
+        .retry_base_delay_ms = 0,
+    });
+    // `init` deep-copies the config (including the request URL) — the
+    // temporary base_url is not retained, so free it.
+    gpa.free(base_url);
+    defer client.deinit();
+
+    var agent = Agent.init(gpa, io, ".", .{ .openai_compatible = &client });
+    defer agent.deinit();
+    try agent.addUser("write a long plan");
+
+    var seen: BudgetSeen = .{};
+    defer seen.deinit(gpa);
+
+    try agent.run(Agent.Listener(BudgetSeen){ .ctx = &seen, .on_event = BudgetSeen.onEvent });
+
+    // Exactly two requests hit the scripted server (the cut + the
+    // continuation); a third would hang on script exhaustion, so this
+    // assertion is the loop-guard's observable.
+    try std.testing.expectEqual(@as(u32, 2), server.connection_count.load(.monotonic));
+
+    // One continuing notice, never a stopped one (the one-shot fired).
+    var length_cut_events: usize = 0;
+    for (seen.events.items) |event| {
+        if (event == .length_cut) {
+            length_cut_events += 1;
+            try std.testing.expectEqual(Agent.Event.LengthCut.auto_continued, event.length_cut);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), length_cut_events);
+
+    // History: user, assistant("partial plan"), user continuation hint,
+    // assistant("continued") — the hint lands AFTER the persisted partial
+    // prose so the wire shape stays [.., assistant, user-hint].
+    const messages = agent.messages();
+    try std.testing.expectEqual(@as(usize, 4), messages.len);
+    try std.testing.expectEqualStrings("write a long plan", messages[0].text());
+    try std.testing.expect(messages[1].role() == .assistant);
+    try std.testing.expectEqualStrings("partial plan", messages[1].text());
+    try std.testing.expect(messages[2].role() == .user);
+    try std.testing.expect(std.mem.startsWith(u8, messages[2].text(), "[nova] Your previous response was cut off"));
+    try std.testing.expect(messages[3].role() == .assistant);
+    try std.testing.expectEqualStrings("continued", messages[3].text());
+}
+
 test "raw enqueued messages are delivered verbatim without @-mention expansion" {
     const gpa = std.testing.allocator;
     var agent = Agent.init(gpa, std.testing.io, ".", .none);
