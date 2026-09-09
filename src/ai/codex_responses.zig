@@ -152,9 +152,11 @@ pub const Client = struct {
                 .ping => try client.writePong(message.data),
                 .pong => {},
             }
-            if (state.completed) break;
+            // Either terminal event ends the loop; an incomplete frame that
+            // kept looping would stall here until the idle watchdog fired.
+            if (state.terminal.isTerminal()) break;
         }
-        if (!state.completed) return error.WebSocketEventLimitExceeded;
+        if (!state.terminal.isTerminal()) return error.WebSocketEventLimitExceeded;
         return try state.finish(gpa, &self.core_client.call_seq);
     }
 };

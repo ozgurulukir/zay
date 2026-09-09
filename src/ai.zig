@@ -639,8 +639,10 @@ pub const Turn = struct {
     usage: ?Usage = null,
     /// Terminal reason reported by the provider, when any. Rides the Turn
     /// (like `usage`) rather than the stream observer: it arrives on the
-    /// final chunk and has no per-delta semantics. The Responses-API client
-    /// leaves it null today.
+    /// final chunk and has no per-delta semantics. Both wire clients
+    /// populate it: chat-completions parses `finish_reason`; the Responses
+    /// API maps `response.incomplete`'s `incomplete_details.reason`
+    /// (`max_output_tokens` → `.length`).
     finish_reason: ?FinishReason = null,
 
     pub fn deinit(self: *Turn, gpa: std.mem.Allocator) void {
