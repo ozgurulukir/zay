@@ -126,10 +126,11 @@ pub const Content = struct {
     }
 
     fn drawEmpty(self: *Content, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const p = tui_style.activePalette();
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
-        try panel.lineAt(&surface, 0, "No provider models available. Run /connect first.", ctx, false, message.ConversationLayout.left -| 1);
+        try panel.lineStyledAt(&surface, 0, "No provider models available. Run /connect first.", ctx, message.ConversationLayout.left -| 1, p.notice);
         return surface;
     }
 

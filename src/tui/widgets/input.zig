@@ -483,7 +483,7 @@ pub const InputWidget = struct {
     fn drawInputBorder(self: *InputWidget, ctx: vxfw.DrawContext, max_width: u16, border_height: u16, text_rows: u16) std.mem.Allocator.Error!vxfw.Surface {
         const p = tui_style.activePalette();
         const prompt_text: []const u8 = if (self.app.mode == .normal) ">" else " ";
-        var prompt: vxfw.Text = .{ .text = prompt_text, .softwrap = false, .width_basis = .parent };
+        var prompt: vxfw.Text = .{ .text = prompt_text, .style = p.user, .softwrap = false, .width_basis = .parent };
         var prompt_box: vxfw.SizedBox = .{ .child = prompt.widget(), .size = .{ .width = 2, .height = 1 } };
         var command_input: CommandInputText = .{ .app = self.app };
         var input_box: vxfw.SizedBox = .{ .child = command_input.widget(), .size = .{ .width = max_width -| 2, .height = text_rows } };
