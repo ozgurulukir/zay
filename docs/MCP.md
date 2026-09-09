@@ -28,7 +28,9 @@ remote. Providing both (or neither) is rejected at parse time.
 
 MCP servers are configured inside global `~/.config/nova/config.json` or project-local
 `<cwd>/.nova/config.json` under the `"mcpServers"` (Claude Desktop / Cursor format) or
-`"mcp_servers"` key.
+`"mcp_servers"` key; the legacy top-level `"mcp"` alias is also parsed for backward
+compatibility. `camelCase` wins when several spellings are present, and the next save
+rewrites the config as `"mcpServers"`.
 
 ### Example Configuration
 
@@ -243,19 +245,22 @@ or **Esc** to cancel. The server name is derived from the URL host.
 ## 6. Crash Isolation & Security
 
 > [!IMPORTANT]
-> **Fault Isolation**: If a local stdio MCP child process crashes or terminates
-> unexpectedly, Nova Agent catches the signal, flags the server as `[FAILED]`, and
-> isolates the fault. The Nova Agent TUI and agent reasoning loop continue running
-> without interruption. A remote server that errors or drops its session is likewise
-> flagged `[FAILED]` (a `404` is treated as an expired session) without affecting the
-> rest of the app.
+> **Fault Isolation**: A server that fails to connect (or is explicitly disconnected) is
+> flagged `[FAILED]` in the `/mcp` overlay. If a local stdio MCP child process crashes
+> or terminates unexpectedly **after** a successful connect, or a remote server errors
+> or drops its session (a `404` is treated as an expired session), the failure surfaces
+> as an error on the individual tool call while the overlay badge keeps its last
+> lifecycle state — the agent loop and the rest of the app continue without
+> interruption. Use the overlay's reconnect key (`Ctrl+R`/`r`) to relaunch a crashed
+> server.
 
 ---
 
 ## 7. Known Limitations
 
 - **`notifications/tools/list_changed`**: Handled via `drainMcpNotifications` (see §4);
-  the catalog refreshes automatically for servers that advertise `listChanged`.
+  the catalog refreshes automatically on the notification (the advertised
+  `listChanged` capability is recorded but the refresh is not gated on it).
 - **Server-push requests**: Nova does not act on server-initiated Streamable HTTP GET
   streams (sampling/roots). The POST path (tool discovery + tool calls) is fully
   supported, which covers normal tool use.

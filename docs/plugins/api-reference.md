@@ -15,17 +15,20 @@ Register a tool that the AI model can invoke.
 |-------|------|----------|-------------|
 | `name` | string | yes | Tool identifier (lowercase, underscores). Must be unique within the plugin. Exposed to the AI model as `lua__<plugin>__<name>`. |
 | `description` | string | yes | Natural language description of what the tool does. The model uses this to decide when to call the tool. |
-| `parameters` | table | yes | JSON Schema-like parameter definitions. Each key is a parameter name, each value is a table with `type`, `description`, and optional `optional` fields. |
+| `parameters` | table | no | JSON Schema-like parameter definitions. Each key is a parameter name, each value is a parameter-schema table (below). Omitted or empty → the tool takes no parameters. |
 | `handler` | function | yes | Called with `(params)` when the model invokes the tool. `params` is a Lua table — JSON arguments from the model are automatically parsed. Must return a string. |
 
 **Parameter schema:**
 
 ```lua
 {
-  name = {
-    type = "string",       -- "string", "number", "boolean"
+  count = {
+    type = "number",       -- "string", "number", "integer", "boolean", "object", "array"
     description = "...",   -- Description for the model
     optional = true,       -- If true, the model may omit this parameter
+    nullable = true,       -- If true, the model may pass JSON null (strict mode emits ["<type>","null"])
+    enum = { "low", "high" },        -- Allowed values, surfaced to the model
+    default = "10",        -- JSON fragment recorded in the schema (informational)
   },
 }
 ```
@@ -156,11 +159,11 @@ Run all registered test suites. Returns `true` if all tests pass.
 
 | Function | Parameters | Returns | Description |
 |----------|-----------|---------|-------------|
-| `nova.read_file(path, opts?)` | `path`, `opts.start_line`, `opts.end_line`, `opts.max_size` | `{path, content, size, lines, language, mime_type}` | Read file with metadata |
+| `nova.read_file(path, opts?)` | `path`, `opts.start_line`, `opts.end_line`, `opts.max_size` | `{path, content, size, lines, truncated, full_size, language, mime_type}` | Read file with metadata (`truncated`/`full_size` are set when the read cap clipped the body) |
 | `nova.write_file(path, content)` | `path`, `content` | `true` or `nil` | Atomic file write (temp + rename) |
-| `nova.edit_file(path, old, new)` | `path`, `old_string`, `new_string` | `true` or `nil` | Find-and-replace |
-| `nova.search_files(root, pattern, opts?)` | `root`, `pattern`, `opts.file_pattern`, `opts.case_sensitive`, `opts.max_results` | `{query, total_matches, results, truncated}` | Recursive content search (grep) |
-| `nova.find_files(root, pattern, opts?)` | `root`, `pattern`, `opts.max_results` | `{root, total_matches, truncated, results}` | Recursive filename glob (`**`, `*`, `?`) |
+| `nova.edit_file(path, old, new)` | `path`, `old_string`, `new_string` | `true` or `nil` | Find-and-replace (first occurrence); refuses files over the 1 MB read cap (`nil, "…FileTooLarge…"`-class error) |
+| `nova.search_files(root, pattern, opts?)` | `root`, `pattern`, `opts.file_pattern`, `opts.case_sensitive`, `opts.max_results` | `{query, total_matches, results, truncated}` | Recursive content search (grep); `max_results` default 50, hard cap 200 |
+| `nova.find_files(root, pattern, opts?)` | `root`, `pattern`, `opts.max_results` | `{root, total_matches, truncated, results}` | Recursive filename glob (`**`, `*`, `?`); `max_results` default 100, hard cap 200; dotfile entries are skipped |
 | `nova.list_dir(path)` | `path` | `{path, files, directories, total_items}` | Directory listing |
 | `nova.file_info(path)` | `path` | `{size, type, extension, language, mime_type}` | File metadata |
 | `nova.mkdir(path)` | `path` | `true` or `nil` | Create directory recursively |
@@ -182,6 +185,8 @@ Run all registered test suites. Returns `true` if all tests pass.
 **`opts.stdin`** (string): bytes written to the child's stdin, then closed —
 e.g. `nova.run_bash("cat", { stdin = "hello" })` returns
 `{ stdout = "hello", code = 0 }`.
+
+**`opts.timeout`** is in seconds: default 30, maximum 3600.
 
 **Shell safety gate.** Every `run_bash`/`run_shell` command is classified by
 the same shell-safety checker as the built-in `bash` tool *before* it runs.
@@ -230,10 +235,13 @@ local r = nova.run_bash("grep -c " .. q .. " src/*.zig")
 
 ### Lane & session awareness
 
-All git, filesystem, and shell bridges (`nova.git_status`, `nova.git_diff`,
-`nova.git_log`, `nova.git_branch`, `nova.git_add`, `nova.git_commit`,
-`nova.get_cwd`, `nova.get_project_root`, `nova.run_shell`, `nova.run_bash`,
-`nova.delete_path`) operate on the **effective cwd** automatically — no
+All filesystem bridges (`read_file`, `write_file`, `edit_file`, `search_files`,
+`find_files`, `list_dir`, `file_info`, `mkdir`, `copy_path`, `move_path`,
+`delete_path` — path confinement resolves against the effective cwd via
+`sanitizePath`) plus the git and shell bridges (`nova.git_status`,
+`nova.git_diff`, `nova.git_log`, `nova.git_branch`, `nova.git_add`,
+`nova.git_commit`, `nova.get_cwd`, `nova.get_project_root`, `nova.run_shell`,
+`nova.run_bash`) operate on the **effective cwd** automatically — no
 `git -C <path>` workarounds needed. The effective cwd is:
 
 - A **lane worktree root** when the call is made from a lane worker agent.

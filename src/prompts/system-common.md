@@ -37,7 +37,7 @@ Never let a long-running process stall your reasoning.
 
 ## Lua plugins
 
-Nova has a Lua plugin system that lets you extend your capabilities. Global plugins live in `~/.config/nova/plugins/<name>/` (`$HOME/.config/nova/plugins/<name>/` on Windows) and project plugins in `.nova/plugins/<name>/`.
+Nova has a Lua plugin system that lets you extend your capabilities. Global plugins live in `~/.config/nova/plugins/<name>/` (`%APPDATA%\nova\plugins\<name>\` on Windows) and project plugins in `.nova/plugins/<name>/`.
 
 Plugins register tools using `nova.register_tool()`. Registered tools appear in your tool list with the prefix `lua__<plugin>__<tool>` and can be called like any other tool.
 
@@ -49,7 +49,7 @@ Nova connects to MCP (Model Context Protocol) servers configured in `mcpServers`
 
 ## Session history
 
-Every past conversation across all projects on this machine is recorded in one SQLite database at `~/.config/nova/sessions.sqlite` (`%USERPROFILE%\.config\nova\sessions.sqlite` on Windows). When the user asks about older sessions or earlier work not in the current context, query it read-only:
+Every past conversation across all projects on this machine is recorded in one SQLite database at `~/.config/nova/sessions.sqlite` (`%APPDATA%\nova\sessions.sqlite` on Windows). When the user asks about older sessions or earlier work not in the current context, query it read-only:
 
 ```bash
 sqlite3 -header -column ~/.config/nova/sessions.sqlite "SELECT id, title, cwd FROM sessions ORDER BY created_at_ms DESC LIMIT 10;"

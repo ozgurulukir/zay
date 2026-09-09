@@ -1,7 +1,10 @@
 # Example Plugins Walkthrough
 
-This guide walks through the three example plugins included with Nova.
-Each demonstrates a different aspect of the plugin API.
+This guide walks through selected example plugins included with Nova (the
+full set — `hello-world`, `file-tools`, `search-tools`, `path-tools`,
+`git-tools`, `todo`, `file-watcher`, `modular-demo`, `sitting-duck` — lives
+in `examples/plugins/`). Each demonstrates a different aspect of the plugin
+API.
 
 ## 1. Hello World — Minimal Tool Plugin
 
@@ -77,31 +80,49 @@ Demonstrates subscribing to lifecycle events using `nova.on()`.
 ### plugin.lua
 
 ```lua
+-- require_others is advisory pending enforcement (T3); file_access is
+-- omitted because this plugin does no file I/O of its own.
 permissions = {
-  file_access = true,
   require_others = false,
 }
 ```
 
-This plugin requests `file_access` because it tracks file operations.
+This plugin tracks file operations **by tool name** from the event stream, so
+it needs no `file_access` — there is no I/O of its own.
 
 ### init.lua
 
 ```lua
-local file_ops = {}
+-- Per-kind counters derived from tool_call_finished events.
+local event_counts = {
+  write = 0, edit = 0, delete = 0, rename = 0, copy = 0,
+}
 
-nova.on("tool_call_started", function(data)
-  if data.name == "bash" then
-    -- A bash command started — we'll check the result when it finishes
-  end
-end)
+-- Classify a fully-qualified tool name (`lua__<plugin>__<tool>`) into a
+-- file-operation kind, or nil if it isn't a file operation we track.
+local function classify(name)
+  if name == "lua__file-tools__write" then return "write" end
+  if name == "lua__file-tools__edit" then return "edit" end
+  if name == "lua__path-tools__delete_path" then return "delete" end
+  if name == "lua__path-tools__move_path" then return "rename" end
+  if name == "lua__path-tools__copy_path" then return "copy" end
+  return nil
+end
 
+-- Count successful file-operation tool calls by kind.
 nova.on("tool_call_finished", function(data)
-  if data.name == "bash" and data.success then
-    -- A bash command completed successfully
+  if not data.success then return end
+  local kind = classify(data.name)
+  if kind then
+    event_counts[kind] = event_counts[kind] + 1
   end
 end)
 ```
+
+The plugin also registers two tools: `file_stats` (reports the counters) and
+`track_file_op` (records a manual entry). Because the `tool_call_finished`
+payload carries only `name`/`call_id`/`success` — no args, no paths —
+event-driven tracking can only classify by the fully-qualified tool name.
 
 Key points:
 - `nova.on()` subscribes to lifecycle events
@@ -130,12 +151,9 @@ how a plugin reads its configuration and applies defaults at runtime.
 
 ### plugin.lua
 
-```lua
-permissions = {
-  file_access = true,
-  require_others = false,
-}
-```
+The manifest can be minimal — permissions are advisory metadata (only the
+`allow_*` keys gate runtime behavior; see the
+[development guide](README.md#permissions)), and this pattern needs none.
 
 ### init.lua
 
@@ -174,186 +192,121 @@ shown; the escaped-string form also works):
 Plugin configuration stays opaque to the config system — the plugin's Lua
 code is responsible for validating its own settings and applying defaults.
 
-## 4. Read Tool — File Reading with Git Integration
+## 4. File Tools — the model's read/write/edit surface
 
-**Location:** `examples/plugins/read-tool/`
+**Location:** `examples/plugins/file-tools/`
 
-Demonstrates file reading with line range support, language detection, and
-git status integration.
+The largest example: registers `read`, `write`, `edit`, and `list_directory`,
+mirroring the tool shapes models already know (numbered lines, continuation
+hints, grouped directory listings) so the model needs no re-training.
 
-### init.lua
+### init.lua (excerpt — `read`)
 
 ```lua
 nova.register_tool({
   name = "read",
-  description = "Read file contents with optional line range and language detection",
+  description = "Read a file's contents with line numbers. Returns each line as `N: <content>` (1-indexed). Supports offset/limit for paging large files. Refuses binary files. Use this before editing any file and to answer 'what is in this file?'",
   parameters = {
-    path = { type = "string", description = "File path to read" },
-    start_line = { type = "number", description = "Starting line", optional = true },
-    end_line = { type = "number", description = "Ending line", optional = true },
+    path = {
+      type = "string",
+      description = "File path to read (relative to project root or absolute)",
+    },
+    offset = { type = "integer", description = "Line number to start reading from (1-indexed, optional)", optional = true },
+    limit = { type = "integer", description = "Maximum number of lines to read (default 2000)", optional = true },
   },
   handler = function(params)
-    local result = nova.read_file(params.path, {
-      start_line = params.start_line,
-      end_line = params.end_line,
-    })
+    ...
+    local result = nova.read_file(params.path, {})
     if result == nil then
       return "Error: could not read " .. params.path
     end
-    return string.format("File: %s\nSize: %d bytes\nLines: %d\nLanguage: %s\n\n%s",
-      result.path, result.size, result.lines, result.language, result.content)
-  end,
-})
 
-nova.register_tool({
-  name = "git_status",
-  description = "Get git status for the current repository",
-  parameters = {},
-  handler = function()
-    local status = nova.git_status()
-    local branch = nova.git_branch()
-    return string.format("Branch: %s\n\n%s", branch or "unknown", status)
+    -- Binary guard: extension blacklist + null-byte sniff on a sample.
+    local ext = extension(result.path)
+    if is_binary(ext, result.content:sub(1, 1024)) then
+      return "Error: cannot read binary file: " .. result.path
+    end
+
+    -- Split into numbered lines, applying offset/limit.
+    ...
   end,
 })
 ```
 
 Key points:
-- `nova.read_file()` returns rich metadata (size, lines, language, mime_type)
-- `nova.git_status()` and `nova.git_branch()` use Nova's safe bash execution
-- No `file_access` permission needed — bridge functions are always available
+- `read` paginates (`offset`/`limit`, default 2000 lines), renders `N: <line>`
+  output, and guards against binary files (extension blacklist + null-byte
+  sniff) before reading
+- `write` wraps the atomic `nova.write_file` (temp + rename); its description
+  encodes commit discipline ("ALWAYS prefer editing existing files … Read the
+  file first before overwriting")
+- `edit` counts non-overlapping occurrences of the search string and supports
+  `replace_all`
+- `list_directory` returns grouped folders/files output
 
-## 5. Write Tool — File Writing with Git-Aware Operations
+## 5. Path Tools — sandboxed file operations
 
-**Location:** `examples/plugins/write-tool/`
+**Location:** `examples/plugins/path-tools/`
 
-Demonstrates atomic file writing, find-and-replace editing, and git-aware
-write+stage workflow.
-
-### init.lua
-
-```lua
-nova.register_tool({
-  name = "write",
-  description = "Write content to a file (atomic write, path traversal protected)",
-  parameters = {
-    path = { type = "string", description = "File path to write" },
-    content = { type = "string", description = "Content to write" },
-  },
-  handler = function(params)
-    local ok = nova.write_file(params.path, params.content)
-    if ok then
-      return string.format("Wrote %d bytes to %s", #params.content, params.path)
-    end
-    return "Error: could not write to " .. params.path
-  end,
-})
-
-nova.register_tool({
-  name = "edit",
-  description = "Replace first occurrence of a string in a file",
-  parameters = {
-    path = { type = "string", description = "File path to edit" },
-    old_string = { type = "string", description = "Text to replace" },
-    new_string = { type = "string", description = "Replacement text" },
-  },
-  handler = function(params)
-    local ok = nova.edit_file(params.path, params.old_string, params.new_string)
-    if ok then return "Edited " .. params.path
-    else return "Error: could not edit " .. params.path end
-  end,
-})
-
-nova.register_tool({
-  name = "write_and_stage",
-  description = "Write content to a file and stage it with git",
-  parameters = {
-    path = { type = "string", description = "File path to write" },
-    content = { type = "string", description = "Content to write" },
-  },
-  handler = function(params)
-    local ok = nova.write_file(params.path, params.content)
-    if not ok then return "Error: could not write to " .. params.path end
-    local result = nova.run_bash("git add " .. params.path, {})
-    if result.code == 0 then
-      return string.format("Wrote and staged %s", params.path)
-    end
-    return string.format("Wrote %s but git add failed: %s", params.path, result.stderr)
-  end,
-})
-```
+Registers `create_directory`, `copy_path`, `move_path`, and `delete_path` —
+sandboxed alternatives to bash `cp`/`mv`/`rm`/`mkdir`. Every operation goes
+through Nova's path validator (`sanitizePath`), so traversal outside the
+project root is rejected. That is the point of the example: `nova.run_bash`
+commands do pass the shell-safety classifier, but that gate only blocks
+destructive patterns — it does not confine paths, so a plain `cp` could still
+write outside the project root. The dedicated bridges carry no shell-quoting
+or classification burden at all.
 
 Key points:
-- `nova.write_file()` uses atomic write (temp file + rename) — no partial writes
-- `nova.edit_file()` does safe find-and-replace with atomic write
-- `nova.run_bash()` enables git integration without `os.execute()`
+- Prefer dedicated path bridges over shell-outs for file operations
+- Confinement is the project root of the **effective cwd** (lane-aware —
+  see the [API reference](api-reference.md))
+- `delete_path` is recursive only via explicit `opts.recursive`
 
-## 6. Search Tool — Recursive Grep with Ripgrep Fallback
+## 6. Search Tools — grep with a ripgrep backend
 
-**Location:** `examples/plugins/search-tool/`
+**Location:** `examples/plugins/search-tools/`
 
-Demonstrates recursive file content search with pattern matching and
-ripgrep fallback via `nova.run_bash()`.
+Registers `grep` (content search) and `glob` (filename search via
+`nova.find_files`). `grep` has two backends: literal substring search through
+Nova's built-in `nova.search_files` — self-contained, no external binary —
+and, with `regex = true`, ripgrep via `nova.run_bash`, because
+`search_files` is substring-only and Lua patterns are not PCRE.
 
-### init.lua
+### init.lua (excerpt — `grep`)
 
 ```lua
 nova.register_tool({
-  name = "search",
-  description = "Search file contents recursively with pattern matching",
+  name = "grep",
+  description = "Search file contents recursively. Returns matches grouped by file as `path:` headers with indented `Line N: <content>` entries. By default does a literal substring search with Nova's built-in search (no external tools; skips dotfiles but scans gitignored dirs like vendor/). Set regex=true for full regular expressions (alternation `a|b`, `.*`, character classes) via ripgrep, which respects .gitignore and requires `rg` installed. Supports an `include` glob filter (e.g. '*.zig'). ...",
   parameters = {
-    root = { type = "string", description = "Root directory to search" },
     pattern = { type = "string", description = "Text pattern to search for" },
-    file_pattern = { type = "string", description = "File glob filter", optional = true },
-    case_sensitive = { type = "boolean", description = "Case-sensitive", optional = true },
-    max_results = { type = "number", description = "Maximum results", optional = true },
+    path = { type = "string", description = "Root directory to search in (default: project root)", optional = true },
+    include = { type = "string", description = "File glob filter (e.g. '*.zig', '*.lua')", optional = true },
+    regex = { type = "boolean", description = "Treat pattern as a regex via ripgrep (default false = literal substring via built-in search)", optional = true },
+    case_sensitive = { type = "boolean", description = "Case-sensitive search (default false)", optional = true },
+    max_results = { type = "integer", description = "Maximum matches to return (default 50, max 200)", optional = true },
   },
-  handler = function(params)
-    local result = nova.search_files(params.root, params.pattern, {
-      file_pattern = params.file_pattern,
-      case_sensitive = params.case_sensitive,
-      max_results = params.max_results,
-    })
-    if result == nil then return "Error: could not search " .. params.root end
-    local lines = {}
-    table.insert(lines, string.format("Query: %s", result.query))
-    table.insert(lines, string.format("Total matches: %d", result.total_matches))
-    if result.truncated then table.insert(lines, "(results truncated)") end
-    table.insert(lines, "")
-    for _, r in ipairs(result.results or {}) do
-      table.insert(lines, string.format("%s:%d: %s", r.file, r.line, r.content))
-    end
-    return table.concat(lines, "\n")
-  end,
-})
-
-nova.register_tool({
-  name = "rg_search",
-  description = "Fast search using ripgrep (falls back to grep if rg not available)",
-  parameters = {
-    pattern = { type = "string", description = "Pattern to search for" },
-    path = { type = "string", description = "Directory to search in", optional = true },
-  },
-  handler = function(params)
-    local root = params.path or nova.get_project_root()
-    local cmd = string.format("rg --line-number --no-heading %s %s 2>/dev/null || grep -rn %s %s",
-      params.pattern, root, params.pattern, root)
-    local result = nova.run_bash(cmd, { cwd = root })
-    if result.code == 0 then return result.stdout end
-    return "No matches or search failed: " .. result.stderr
-  end,
+  ...
 })
 ```
 
 Key points:
-- `nova.search_files()` is a pure Zig implementation — no shell needed
-- `nova.run_bash()` enables ripgrep fallback for faster searches
-- `nova.get_project_root()` resolves the project root automatically
+- The default backend is pure Zig (`nova.search_files`) — no shell needed
+- Regex mode shells out to `rg`, with every dynamic value on the command line
+  quoted through `nova.shell_quote` (dialect matched to the runner) — the
+  injection defense
+- Scope differs by backend: ripgrep honors `.gitignore`; the native walker
+  skips dotfiles but scans gitignored dirs (`vendor/`, `zig-cache/`)
 
 ## Testing Your Plugin
 
 1. Create a `test.lua` file in your plugin directory
 2. Use the `test_runner` global (pre-loaded by the test runner)
-3. Run with: `zig build test-plugin -- path/to/your/test.lua`
+3. Run with: `zig build test-plugin` — the build step runs every shipped
+   example's `test.lua` (add a new plugin's file to the arg list in
+   `build.zig`). Appending a path after `--` runs your file *in addition to*
+   the shipped suite, not instead of it.
 
 ```lua
 local test = test_runner

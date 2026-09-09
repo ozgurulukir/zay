@@ -13,7 +13,7 @@ flowchart TD
     
     C -->|Yes: HTTP POST| D[External Safety Classifier]
     D -->|200 OK: safe / unsafe| E{Verdict}
-    D -->|Timeout / Network Error| F[Built-in Deterministic Pattern Matcher]
+    D -->|Network Error| F[Built-in Deterministic Pattern Matcher]
     
     C -->|No: null| F
     F -->|safe / unsafe| E
@@ -29,6 +29,13 @@ The system operates across two complementary tiers:
 2. **Tier 2: External AI Safety Classifier (Optional & Pluggable)**
    - External REST endpoint powered by a fine-tuned Transformer model (such as ModernBERT) or an LLM proxy.
    - Evaluates natural language shell commands semantically for dangerous side effects beyond simple regex matching.
+
+> [!NOTE]
+> **Fallback semantics:** a connection or network error on the classify call
+> falls back to the Tier 1 matcher. There is currently **no application-level
+> timeout** on the classify request — a classifier that accepts the connection
+> but never responds will block the turn — so run the service somewhere with
+> reliable latency (it defaults to `127.0.0.1:8765`).
 
 ---
 
