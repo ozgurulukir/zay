@@ -18,21 +18,24 @@ jobs:
           - os: ubuntu-latest
             artifact: zay-linux-x86_64
             bin: zay
-            target: x86_64-linux-musl
+            target_arg: -Dtarget=x86_64-linux-musl
             zig_url: https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
             zig_ext: .tar.xz
             zig_dir: zig-x86_64-linux-0.16.0
           - os: windows-latest
             artifact: zay-windows-x86_64.exe
             bin: zay.exe
-            target: x86_64-windows
+            target_arg: -Dtarget=x86_64-windows
             zig_url: https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip
             zig_ext: .zip
             zig_dir: zig-x86_64-windows-0.16.0
+          # No -Dtarget: the runner IS aarch64-macos, and an explicit target
+          # flag makes Zig treat the build as a cross-compile and skip native
+          # SDK detection ("unable to find framework 'Security'").
           - os: macos-latest
             artifact: zay-macos-aarch64
             bin: zay
-            target: aarch64-macos
+            target_arg: ""
             zig_url: https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz
             zig_ext: .tar.xz
             zig_dir: zig-aarch64-macos-0.16.0
@@ -69,7 +72,7 @@ jobs:
           # AGENTS.md "vxfw FocusHandler crash"). Tolerate that first
           # failure, apply the checked-in patch, and let the build step run
           # against the guarded copy.
-          zig build --fetch -Dtarget=${{ matrix.target }} || true
+          zig build --fetch ${{ matrix.target_arg }} || true
           for d in zig-pkg/vaxis-0.6.0-*/; do
             patch -p1 -d "$d" < tools/vendor-patches/vaxis-focus-handler.patch
             test "$(grep -c ZAY-LOCAL-PATCH "$d/src/vxfw/App.zig")" -eq 2
@@ -79,7 +82,7 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ github.ref_name }}
-        run: zig build install -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dversion="$VERSION" --prefix dist
+        run: zig build install ${{ matrix.target_arg }} -Doptimize=ReleaseFast -Dversion="$VERSION" --prefix dist
 
       # Real runtime validation on the target OS (the Windows binary is not
       # runnable from the bash shell, so it is build-only).
