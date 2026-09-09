@@ -552,7 +552,9 @@ pub const McpClient = struct {
             const parts = httpTimeoutParts(self.read_timeout_ms);
             const tv: std.posix.timeval = .{
                 .sec = parts.sec,
-                .usec = parts.usec,
+                // macOS suseconds_t is 32-bit c_int; usec is bounded to
+                // [0, 999_000] by the modulo in httpTimeoutParts.
+                .usec = @intCast(parts.usec),
             };
             std.posix.setsockopt(
                 conn.stream_reader.stream.socket.handle,
