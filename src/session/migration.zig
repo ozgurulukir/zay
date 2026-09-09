@@ -10,7 +10,7 @@ const assert = std.debug.assert;
 pub const schema_version: u32 = 5;
 
 /// Resolve the default sessions database path under `home_dir`.
-/// Platform-correct base: Windows -> %APPDATA%\nova, POSIX -> ~/.config/nova.
+/// Platform-correct base: Windows -> %APPDATA%\zay, POSIX -> ~/.config/zay.
 /// Caller must pass a non-empty home_dir (the `assert` guards the contract;
 /// `initDefault` validates upstream).
 pub fn defaultPath(gpa: std.mem.Allocator, home_dir: []const u8) Error![]u8 {
@@ -28,7 +28,7 @@ test "defaultPath: resolves to sessions.sqlite under the platform config dir" {
     const path = try defaultPath(gpa, "PREFIX");
     defer gpa.free(path);
     // Must end in sessions.sqlite and live under the platform config base
-    // (Windows: PREFIX/AppData/Roaming/nova, POSIX: PREFIX/.config/nova).
+    // (Windows: PREFIX/AppData/Roaming/zay, POSIX: PREFIX/.config/zay).
     try std.testing.expect(std.mem.endsWith(u8, path, "sessions.sqlite"));
     const base = try paths.platformConfigDir(gpa, "PREFIX");
     defer gpa.free(base);

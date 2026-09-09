@@ -2,15 +2,15 @@
 --
 -- Wraps the duckdb CLI + the sitting_duck community extension (tree-sitter
 -- ASTs as SQL tables). First example plugin consuming plugin.get_config()
--- and nova.shell_quote.
+-- and zay.shell_quote.
 return {
   name = "sitting-duck",
   version = "1.0.1",
-  author = "Nova",
+  author = "Zay",
   description = "Query tree-sitter ASTs with SQL via the duckdb CLI and the sitting_duck extension",
   license = "MIT",
   permissions = {
-    -- No nova.require of other plugins.
+    -- No zay.require of other plugins.
     require_others = false,
     -- Wall-clock per-dispatch deadline, checked by the instruction hook when
     -- Lua resumes after run_bash returns: one dispatch can chain

@@ -1,6 +1,6 @@
 # Example Plugins Walkthrough
 
-This guide walks through selected example plugins included with Nova (the
+This guide walks through selected example plugins included with Zay (the
 full set — `hello-world`, `file-tools`, `search-tools`, `path-tools`,
 `git-tools`, `todo`, `file-watcher`, `modular-demo`, `sitting-duck` — lives
 in `examples/plugins/`). Each demonstrates a different aspect of the plugin
@@ -18,7 +18,7 @@ The simplest possible plugin. Registers two tools that the AI model can call.
 return {
   name = "hello-world",
   version = "1.0.0",
-  author = "Nova",
+  author = "Zay",
   description = "A minimal example plugin that registers a greeting tool",
   license = "MIT",
   permissions = {
@@ -33,7 +33,7 @@ doesn't access the filesystem or network, all permissions are at their defaults.
 ### init.lua
 
 ```lua
-nova.register_tool({
+zay.register_tool({
   name = "greet",
   description = "Returns a friendly greeting",
   parameters = {
@@ -50,7 +50,7 @@ nova.register_tool({
 ```
 
 Key points:
-- `nova.register_tool()` is the primary API for exposing functionality to the AI model
+- `zay.register_tool()` is the primary API for exposing functionality to the AI model
 - The `name` must be unique within the plugin (the system prefixes it as `lua__<plugin>__<name>`)
 - `parameters` follows JSON Schema conventions — each key is a parameter name
 - The `handler` receives a Lua table of parameter values (JSON parsed automatically) and returns a string
@@ -75,7 +75,7 @@ Run with: `zig build test-plugin`
 
 **Location:** `examples/plugins/file-watcher/`
 
-Demonstrates subscribing to lifecycle events using `nova.on()`.
+Demonstrates subscribing to lifecycle events using `zay.on()`.
 
 ### plugin.lua
 
@@ -110,7 +110,7 @@ local function classify(name)
 end
 
 -- Count successful file-operation tool calls by kind.
-nova.on("tool_call_finished", function(data)
+zay.on("tool_call_finished", function(data)
   if not data.success then return end
   local kind = classify(data.name)
   if kind then
@@ -125,7 +125,7 @@ payload carries only `name`/`call_id`/`success` — no args, no paths —
 event-driven tracking can only classify by the fully-qualified tool name.
 
 Key points:
-- `nova.on()` subscribes to lifecycle events
+- `zay.on()` subscribes to lifecycle events
 - The callback receives a `data` table with event-specific fields
 - Multiple callbacks can subscribe to the same event
 - Events are dispatched synchronously — keep handlers fast
@@ -175,7 +175,7 @@ Key points:
 
 ### Configuring the plugin
 
-In `~/.config/nova/config.json` or `.nova/config.json` (inline-object form
+In `~/.config/zay/config.json` or `.zay/config.json` (inline-object form
 shown; the escaped-string form also works):
 
 ```json
@@ -203,7 +203,7 @@ hints, grouped directory listings) so the model needs no re-training.
 ### init.lua (excerpt — `read`)
 
 ```lua
-nova.register_tool({
+zay.register_tool({
   name = "read",
   description = "Read a file's contents with line numbers. Returns each line as `N: <content>` (1-indexed). Supports offset/limit for paging large files. Refuses binary files. Use this before editing any file and to answer 'what is in this file?'",
   parameters = {
@@ -216,7 +216,7 @@ nova.register_tool({
   },
   handler = function(params)
     ...
-    local result = nova.read_file(params.path, {})
+    local result = zay.read_file(params.path, {})
     if result == nil then
       return "Error: could not read " .. params.path
     end
@@ -237,7 +237,7 @@ Key points:
 - `read` paginates (`offset`/`limit`, default 2000 lines), renders `N: <line>`
   output, and guards against binary files (extension blacklist + null-byte
   sniff) before reading
-- `write` wraps the atomic `nova.write_file` (temp + rename); its description
+- `write` wraps the atomic `zay.write_file` (temp + rename); its description
   encodes commit discipline ("ALWAYS prefer editing existing files … Read the
   file first before overwriting")
 - `edit` counts non-overlapping occurrences of the search string and supports
@@ -250,8 +250,8 @@ Key points:
 
 Registers `create_directory`, `copy_path`, `move_path`, and `delete_path` —
 sandboxed alternatives to bash `cp`/`mv`/`rm`/`mkdir`. Every operation goes
-through Nova's path validator (`sanitizePath`), so traversal outside the
-project root is rejected. That is the point of the example: `nova.run_bash`
+through Zay's path validator (`sanitizePath`), so traversal outside the
+project root is rejected. That is the point of the example: `zay.run_bash`
 commands do pass the shell-safety classifier, but that gate only blocks
 destructive patterns — it does not confine paths, so a plain `cp` could still
 write outside the project root. The dedicated bridges carry no shell-quoting
@@ -268,17 +268,17 @@ Key points:
 **Location:** `examples/plugins/search-tools/`
 
 Registers `grep` (content search) and `glob` (filename search via
-`nova.find_files`). `grep` has two backends: literal substring search through
-Nova's built-in `nova.search_files` — self-contained, no external binary —
-and, with `regex = true`, ripgrep via `nova.run_bash`, because
+`zay.find_files`). `grep` has two backends: literal substring search through
+Zay's built-in `zay.search_files` — self-contained, no external binary —
+and, with `regex = true`, ripgrep via `zay.run_bash`, because
 `search_files` is substring-only and Lua patterns are not PCRE.
 
 ### init.lua (excerpt — `grep`)
 
 ```lua
-nova.register_tool({
+zay.register_tool({
   name = "grep",
-  description = "Search file contents recursively. Returns matches grouped by file as `path:` headers with indented `Line N: <content>` entries. By default does a literal substring search with Nova's built-in search (no external tools; skips dotfiles but scans gitignored dirs like vendor/). Set regex=true for full regular expressions (alternation `a|b`, `.*`, character classes) via ripgrep, which respects .gitignore and requires `rg` installed. Supports an `include` glob filter (e.g. '*.zig'). ...",
+  description = "Search file contents recursively. Returns matches grouped by file as `path:` headers with indented `Line N: <content>` entries. By default does a literal substring search with Zay's built-in search (no external tools; skips dotfiles but scans gitignored dirs like vendor/). Set regex=true for full regular expressions (alternation `a|b`, `.*`, character classes) via ripgrep, which respects .gitignore and requires `rg` installed. Supports an `include` glob filter (e.g. '*.zig'). ...",
   parameters = {
     pattern = { type = "string", description = "Text pattern to search for" },
     path = { type = "string", description = "Root directory to search in (default: project root)", optional = true },
@@ -292,9 +292,9 @@ nova.register_tool({
 ```
 
 Key points:
-- The default backend is pure Zig (`nova.search_files`) — no shell needed
+- The default backend is pure Zig (`zay.search_files`) — no shell needed
 - Regex mode shells out to `rg`, with every dynamic value on the command line
-  quoted through `nova.shell_quote` (dialect matched to the runner) — the
+  quoted through `zay.shell_quote` (dialect matched to the runner) — the
   injection defense
 - Scope differs by backend: ripgrep honors `.gitignore`; the native walker
   skips dotfiles but scans gitignored dirs (`vendor/`, `zig-cache/`)

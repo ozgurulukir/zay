@@ -1,13 +1,13 @@
 const std = @import("std");
-const nova = @import("nova");
+const zay = @import("zay");
 const logger = @import("logger");
 
 pub const std_options: std.Options = .{
     .unexpected_error_tracing = false,
-    .logFn = novaLog,
+    .logFn = zayLog,
 };
 
-fn novaLog(
+fn zayLog(
     comptime level: std.log.Level,
     comptime scope: @TypeOf(.enum_literal),
     comptime format: []const u8,
@@ -17,9 +17,9 @@ fn novaLog(
     logger.dispatch(level, @tagName(scope), prefix ++ format, args);
 }
 
-pub const panic = std.debug.FullPanic(novaPanic);
+pub const panic = std.debug.FullPanic(zayPanic);
 
-fn novaPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
+fn zayPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
     std.debug.print("\x1b[?1049l\x1b[?1003l\x1b[?1000l\x1b[?25h\x1b[0m\r\n", .{});
     std.debug.defaultPanic(msg, first_trace_addr);
 }
@@ -27,5 +27,5 @@ fn novaPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
 pub fn main(init: std.process.Init) !void {
     var page_allocator = std.heap.PageAllocator{};
     const gpa = std.mem.Allocator{ .ptr = &page_allocator, .vtable = &std.heap.PageAllocator.vtable };
-    try nova.run(init, gpa);
+    try zay.run(init, gpa);
 }

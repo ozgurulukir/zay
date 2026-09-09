@@ -352,25 +352,25 @@ pub const Content = struct {
     fn drawAbout(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
         const p = tui_style.activePalette();
         _ = self.state;
-        try panel.lineStyledAt(surface, 2, "ABOUT NOVA", ctx, left_col, p.panel_header);
+        try panel.lineStyledAt(surface, 2, "ABOUT ZAY", ctx, left_col, p.panel_header);
         try panel.lineStyledAt(surface, 4, self.version_string, ctx, left_col, p.info);
 
         // Config file paths.
         try panel.lineStyledAt(surface, 6, "Configuration Files", ctx, left_col, p.panel_header);
 
-        const global_path = try std.fmt.allocPrint(ctx.arena, "  Global config : {s}/.config/nova/config.json", .{self.home_dir});
+        const global_path = try std.fmt.allocPrint(ctx.arena, "  Global config : {s}/.config/zay/config.json", .{self.home_dir});
         try panel.lineStyledAt(surface, 7, global_path, ctx, left_col, p.thinking_body);
 
-        const project_path = try std.fmt.allocPrint(ctx.arena, "  Project config: {s}/.nova/config.json", .{self.cwd});
+        const project_path = try std.fmt.allocPrint(ctx.arena, "  Project config: {s}/.zay/config.json", .{self.cwd});
         try panel.lineStyledAt(surface, 8, project_path, ctx, left_col, p.thinking_body);
 
-        const auth_path = try std.fmt.allocPrint(ctx.arena, "  API keys      : {s}/.config/nova/auth.json", .{self.home_dir});
+        const auth_path = try std.fmt.allocPrint(ctx.arena, "  API keys      : {s}/.config/zay/auth.json", .{self.home_dir});
         try panel.lineStyledAt(surface, 9, auth_path, ctx, left_col, p.thinking_body);
 
         try panel.lineStyledAt(surface, 11, "Config Layer Priority  (later overrides earlier)", ctx, left_col, p.panel_header);
         try panel.lineStyledAt(surface, 12, "  1. Built-in defaults", ctx, left_col, p.thinking_body);
-        try panel.lineStyledAt(surface, 13, "  2. Global config  (~/.config/nova/config.json)", ctx, left_col, p.thinking_body);
-        try panel.lineStyledAt(surface, 14, "  3. Project config (.nova/config.json)", ctx, left_col, p.thinking_body);
+        try panel.lineStyledAt(surface, 13, "  2. Global config  (~/.config/zay/config.json)", ctx, left_col, p.thinking_body);
+        try panel.lineStyledAt(surface, 14, "  3. Project config (.zay/config.json)", ctx, left_col, p.thinking_body);
         try panel.lineStyledAt(surface, 15, "  4. Environment variables (OPENAI_MODEL, OPENAI_API_KEY, …)", ctx, left_col, p.thinking_body);
     }
 

@@ -486,8 +486,8 @@ pub fn Impl(comptime B: type) type {
         /// rendered as a visual diff widget in the TUI) and stripped from the model-facing
         /// observation. `\x1e` (ASCII record separator) makes an accidental collision with
         /// real command output practically impossible. Shared by both shell tools.
-        pub const display_diff_begin = "\x1enova:diff";
-        pub const display_diff_end = "\x1enova:end";
+        pub const display_diff_begin = "\x1ezay:diff";
+        pub const display_diff_end = "\x1ezay:end";
 
         /// Turn a `Capture` into the tool's observation: strip ANSI (git-bash and
         /// PowerShell both leak VT codes into the capture), split out any

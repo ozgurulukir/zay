@@ -1,7 +1,7 @@
 """Erisim-log'lu classifier launcher (access_log=True).
 
 Repo'daki server.py'yi DEGISTIRMEZ; sadece build_app + ModelHost'u
-import edip uvicorn'u access_log=True ile calistirir. Amac: Nova'nin
+import edip uvicorn'u access_log=True ile calistirir. Amac: Zay'nin
 her POST /classify cagrisini log'a dusurerek classifier'in kullanildigini
 zararsiz sekilde dogrulamak.
 """
@@ -16,7 +16,7 @@ from .server import ModelHost, build_app
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Nova Safety Classifier (access_log ON)")
+    parser = argparse.ArgumentParser(description="Zay Safety Classifier (access_log ON)")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--path", default=None)
     parser.add_argument("--host", default=DEFAULT_BIND_HOST)

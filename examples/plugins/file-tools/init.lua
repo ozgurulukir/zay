@@ -89,7 +89,7 @@ end
 
 -- ── read ────────────────────────────────────────────────────────────
 
-nova.register_tool({
+zay.register_tool({
   name = "read",
   description = "Read a file's contents with line numbers. Returns each line as `N: <content>` (1-indexed). Supports offset/limit for paging large files. Refuses binary files. Use this before editing any file and to answer 'what is in this file?'",
   parameters = {
@@ -112,7 +112,7 @@ nova.register_tool({
     local limit = math.max(1, math.floor(params.limit or 2000))
     local offset = math.max(1, math.floor(params.offset or 1))
 
-    local result = nova.read_file(params.path, {})
+    local result = zay.read_file(params.path, {})
     if result == nil then
       return "Error: could not read " .. params.path
     end
@@ -158,7 +158,7 @@ nova.register_tool({
 
 -- ── write ───────────────────────────────────────────────────────────
 
-nova.register_tool({
+zay.register_tool({
   name = "write",
   description = "Write content to a file, creating it if it does not exist or overwriting it entirely if it does. ALWAYS prefer editing existing files; NEVER write new files unless explicitly required. NEVER proactively create documentation (.md/README) files unless asked. Read the file first before overwriting.",
   parameters = {
@@ -172,7 +172,7 @@ nova.register_tool({
     },
   },
   handler = function(params)
-    local ok = nova.write_file(params.path, params.content)
+    local ok = zay.write_file(params.path, params.content)
     if ok then
       return string.format("Wrote %d bytes to %s", #params.content, params.path)
     end
@@ -214,7 +214,7 @@ local function replace_all(text, old, new)
   return table.concat(result), count
 end
 
-nova.register_tool({
+zay.register_tool({
   name = "edit",
   description = "Replace occurrences of a string in an existing file. By default replaces only the first occurrence; set replace_all=true to replace every occurrence. The edit FAILS if old_string is not found, and (unless replace_all) FAILS if old_string appears multiple times — provide more surrounding context to make it unique. Preserve the exact indentation from the file (everything after the `N: ` line-number prefix in read output is the real content).",
   parameters = {
@@ -245,7 +245,7 @@ nova.register_tool({
     end
 
     -- Read current content to validate before mutating.
-    local result = nova.read_file(params.path, {})
+    local result = zay.read_file(params.path, {})
     if result == nil then
       return "Error: could not read " .. params.path .. " (read the file before editing)"
     end
@@ -266,8 +266,8 @@ nova.register_tool({
     if replace_all_flag then
       new_content, n = replace_all(content, params.old_string, params.new_string)
     else
-      -- Nova's edit_file replaces the first occurrence only.
-      local ok = nova.edit_file(params.path, params.old_string, params.new_string)
+      -- Zay's edit_file replaces the first occurrence only.
+      local ok = zay.edit_file(params.path, params.old_string, params.new_string)
       if not ok then
         return "Error: edit failed on " .. params.path
       end
@@ -278,7 +278,7 @@ nova.register_tool({
     if n == 0 then
       return "Error: old_string not found in " .. params.path
     end
-    local ok = nova.write_file(params.path, new_content)
+    local ok = zay.write_file(params.path, new_content)
     if not ok then
       return "Error: could not write edited content to " .. params.path
     end
@@ -288,7 +288,7 @@ nova.register_tool({
 
 -- ── list_directory ──────────────────────────────────────────────────
 
-nova.register_tool({
+zay.register_tool({
   name = "list_directory",
   description = "List the contents of a directory. Returns folders and files in separate, alphabetically sorted sections so the structure is easy to scan. Use this to explore an unfamiliar directory; for recursive filename search use glob instead.",
   parameters = {
@@ -300,7 +300,7 @@ nova.register_tool({
   },
   handler = function(params)
     local dir = params.path or "."
-    local result = nova.list_dir(dir)
+    local result = zay.list_dir(dir)
     if result == nil then
       return "Error: could not list " .. dir
     end

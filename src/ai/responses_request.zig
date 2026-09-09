@@ -273,14 +273,14 @@ test "writeRequestPayload puts system prompt in instructions for standard mode" 
         .api_key = "",
         .model = "gpt-test",
         .session_id = "session-abc",
-        .system_prompt = "You are Nova.",
+        .system_prompt = "You are Zay.",
         .reasoning = null,
     };
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
     try writeRequestPayload(&payload.writer, gpa, config, .{}, &.{.{ .borrowed = &system_message }}, "[]");
     const body = payload.written();
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"You are Nova.\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"You are Zay.\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"session-abc\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"input\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "verbosity") == null);
@@ -294,14 +294,14 @@ test "writeRequestPayload keeps configured verbosity hint" {
         .api_key = "",
         .model = "gpt-5.5",
         .session_id = "session-xyz",
-        .system_prompt = "You are Nova.",
+        .system_prompt = "You are Zay.",
         .reasoning = null,
     };
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
     try writeRequestPayload(&payload.writer, gpa, config, .{ .text_verbosity = "low", .parallel_tool_calls = true }, &.{}, "[]");
     const body = payload.written();
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"You are Nova.\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"You are Zay.\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"session-xyz\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"verbosity\":\"low\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"parallel_tool_calls\":true") != null);
@@ -366,7 +366,7 @@ test "writeRequestPayload omits prompt_cache_key when no session id is set" {
         .api_key = "",
         .model = "gpt-test",
         .session_id = "",
-        .system_prompt = "You are Nova.",
+        .system_prompt = "You are Zay.",
         .reasoning = null,
     };
     var payload: std.Io.Writer.Allocating = .init(gpa);
@@ -374,7 +374,7 @@ test "writeRequestPayload omits prompt_cache_key when no session id is set" {
     try writeRequestPayload(&payload.writer, gpa, config, .{}, &.{}, "[]");
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_key") == null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"You are Nova.\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"You are Zay.\"") != null);
 }
 
 test "writeRequestPayload omits prompt_cache_key when disable_prompt_cache is true" {
@@ -387,7 +387,7 @@ test "writeRequestPayload omits prompt_cache_key when disable_prompt_cache is tr
         .api_key = "",
         .model = "gpt-test",
         .session_id = "session-abc",
-        .system_prompt = "You are Nova.",
+        .system_prompt = "You are Zay.",
         .reasoning = null,
         .disable_prompt_cache = true,
     };

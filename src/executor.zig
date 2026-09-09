@@ -242,7 +242,7 @@ pub const ExecutorService = struct {
         calls: []const ai.ToolCall,
         observer: anytype,
     ) ![]ToolResult {
-        // Shell-safety classifier URL for plugin `nova.run_bash`/`run_shell`
+        // Shell-safety classifier URL for plugin `zay.run_bash`/`run_shell`
         // calls: set for the WHOLE batch, not just `produceOutput` — the
         // observers below fire plugin event callbacks (emitEvent → Lua) after
         // produceOutput's slots are unwound, and a handler shelling out there

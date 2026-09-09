@@ -1,9 +1,9 @@
 -- init.lua — Hello World plugin initialization
--- This is the entry point loaded by Nova when the plugin starts.
+-- This is the entry point loaded by Zay when the plugin starts.
 -- It registers a simple greeting tool.
 
 -- Register a tool that returns a greeting
-nova.register_tool({
+zay.register_tool({
   name = "greet",
   description = "Returns a friendly greeting",
   parameters = {
@@ -19,7 +19,7 @@ nova.register_tool({
 })
 
 -- Register a tool that returns the current time
-nova.register_tool({
+zay.register_tool({
   name = "current_time",
   description = "Returns the current time",
   parameters = {},

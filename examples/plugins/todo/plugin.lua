@@ -2,7 +2,7 @@
 return {
   name = "todo",
   version = "1.0.0",
-  author = "Nova",
+  author = "Zay",
   description = "todo.txt-format task tracking with priorities, projects, and dates",
   license = "MIT",
   permissions = {

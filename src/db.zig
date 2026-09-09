@@ -277,7 +277,7 @@ test "open in-memory database and query row" {
     try connection.exec("create table test(id integer primary key, name text not null)");
     var insert = try connection.prepare("insert into test(name) values (?)");
     defer insert.finalize();
-    try insert.bindText(1, "nova");
+    try insert.bindText(1, "zay");
     try std.testing.expect(try insert.step() == null);
     try std.testing.expectEqual(@as(i32, 1), connection.changes());
 
@@ -285,6 +285,6 @@ test "open in-memory database and query row" {
     defer query.finalize();
     const row = (try query.step()) orelse return error.TestFailed;
     try std.testing.expectEqual(@as(i64, 1), row.int(0));
-    try std.testing.expectEqualStrings("nova", row.text(1));
+    try std.testing.expectEqualStrings("zay", row.text(1));
     try std.testing.expect(try query.step() == null);
 }

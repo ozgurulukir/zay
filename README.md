@@ -1,35 +1,37 @@
 <div align="center">
 
-# Nova
+# Zay
 
-**The fast, single-binary, native terminal AI agent for shipping code.**
+**A fast, single-binary coding agent for your terminal.**
+
+<sub>Z(ig) + *ay* (Turkish for "moon") — a nod to Lua, Portuguese for moon.</sub>
 
 [![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?style=flat-square&logo=zig&logoColor=white)](https://ziglang.org)
-[![Version](https://img.shields.io/github/v/release/ozgurulukir/nova-agent?style=flat-square)](https://github.com/ozgurulukir/nova-agent/releases)
-[![License](https://img.shields.io/github/license/ozgurulukir/nova-agent?style=flat-square)](LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/ozgurulukir/nova-agent?style=flat-square)](https://github.com/ozgurulukir/nova-agent/stargazers)
+[![Version](https://img.shields.io/github/v/release/ozgurulukir/zay?style=flat-square)](https://github.com/ozgurulukir/zay/releases)
+[![License](https://img.shields.io/github/license/ozgurulukir/zay?style=flat-square)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/ozgurulukir/zay?style=flat-square)](https://github.com/ozgurulukir/zay/stargazers)
 
 </div>
 
 ---
 
-## ⚡ Nova in action
+## ⚡ Zay in action
 
 <p align="center">
   <a href="assets/demo.gif">
-    <img src="assets/demo-teaser.gif" alt="Nova Agent Demo in Terminal" width="800" />
+    <img src="assets/demo-teaser.gif" alt="Zay Agent Demo in Terminal" width="800" />
   </a>
   <br />
   <sub>⚡ <em>Preview snippet. <a href="assets/demo.gif">Click to watch the full demo (18 MB)</a></em></sub>
 </p>
 
-Nova is a **terminal-native AI agent** designed for speed, focus, and low latency. No Electron, no browser tabs, no Node runtime. Just a single, compiled Zig binary that connects to OpenAI Codex (via ChatGPT OAuth) or any OpenAI-compatible provider, orchestrates parallel work across isolated git worktree lanes, and logs every turn to local SQLite.
+Zay is a **terminal-native coding agent** designed for speed, focus, and low latency. No Electron, no browser tabs, no Node runtime. Just a single, compiled Zig binary that connects to OpenAI Codex (via ChatGPT OAuth) or any OpenAI-compatible provider, orchestrates parallel work across isolated git worktree lanes, and logs every turn to local SQLite.
 
 ---
 
 ## 🛡️ Execution & Safety Model
 
-Nova operates without granular per-action permission prompts (YOLO mode), relying instead on layered safety guardrails:
+Zay operates without granular per-action permission prompts (YOLO mode), relying instead on layered safety guardrails:
 
 - **Built-in Deterministic Safety Matcher (Default):** Zero-dependency lexical token analysis in Zig (`bash_safety.zig`) that automatically intercepts high-risk destructive commands (`rm -rf /`, drive wipes, `mkfs`, fork bombs) and gates them behind confirmation prompts.
 - **Git Worktree Isolation:** Risky or wide refactors can be spawned into isolated **Parallel Lanes** (`/parallel` or `lane spawn`), physically contained in dedicated worktrees to keep your main branch clean.
@@ -37,7 +39,7 @@ Nova operates without granular per-action permission prompts (YOLO mode), relyin
 - **Optional AI Safety Classifier:** Deep contextual command evaluation via a local ModernBERT service (`tools/classifier/`).
 
 > [!CAUTION]
-> Because Nova executes commands directly in your workspace without per-action confirmation prompts, run it in repositories you trust or confine broad changes to parallel git lanes.
+> Because Zay executes commands directly in your workspace without per-action confirmation prompts, run it in repositories you trust or confine broad changes to parallel git lanes.
 
 ---
 
@@ -71,21 +73,21 @@ Nova operates without granular per-action permission prompts (YOLO mode), relyin
 
 **Linux / macOS:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ozgurulukir/nova-agent/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ozgurulukir/zay/main/install.sh | bash
 ```
 
 **Windows (PowerShell):**
 ```powershell
-irm https://raw.githubusercontent.com/ozgurulukir/nova-agent/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/ozgurulukir/zay/main/install.ps1 | iex
 ```
 
 ### 2. Build from Source
 
 ```bash
-git clone https://github.com/ozgurulukir/nova-agent.git
-cd nova-agent
+git clone https://github.com/ozgurulukir/zay.git
+cd zay
 zig build install -Doptimize=ReleaseFast --prefix $HOME/.local
-nova --version
+zay --version
 ```
 
 ---
@@ -98,8 +100,8 @@ To enable Tier 2 contextual risk analysis with the ModernBERT classifier:
 # Run standalone safety classifier service (port 8765):
 uv run -m tools.classifier.server --model modernbert --port 8765
 
-# Configure in Nova (via ~/.config/nova/config.json or env):
-export NOVA_BASH_CLASSIFIER_URL="http://127.0.0.1:8765/classify"
+# Configure in Zay (via ~/.config/zay/config.json or env):
+export ZAY_BASH_CLASSIFIER_URL="http://127.0.0.1:8765/classify"
 ```
 
 See the **[Safety & Classifier Guide](docs/wiki/SAFETY_CLASSIFIER.md)** for Docker deployment and API details.
@@ -137,16 +139,16 @@ See the **[Safety & Classifier Guide](docs/wiki/SAFETY_CLASSIFIER.md)** for Dock
 ## 💻 Platform Support
 
 - **Linux / macOS:** Fully supported and tested daily.
-- **Windows:** Compiles natively (`zig-out/bin/nova.exe`). Core features, TUI, and SQLite persistence are active; cross-platform runtime parity is tracked in [#26](https://github.com/ozgurulukir/nova-agent/issues/26)–[#29](https://github.com/ozgurulukir/nova-agent/issues/29).
+- **Windows:** Compiles natively (`zig-out/bin/zay.exe`). Core features, TUI, and SQLite persistence are active; cross-platform runtime parity is tracked in [#26](https://github.com/ozgurulukir/zay/issues/26)–[#29](https://github.com/ozgurulukir/zay/issues/29).
 
 ---
 
 ## ⚠️ Disclaimer
 
-Nova executes shell commands and modifies files directly in your environment. Always run Nova within Git-tracked repositories so changes can be inspected (`git diff`) and reverted (`git restore`). Distributed under the [MIT License](LICENSE) "AS IS", without warranty of any kind.
+Zay executes shell commands and modifies files directly in your environment. Always run Zay within Git-tracked repositories so changes can be inspected (`git diff`) and reverted (`git restore`). Distributed under the [MIT License](LICENSE) "AS IS", without warranty of any kind.
 
 ---
 
 ## 📄 License
 
-Nova is open source under the [MIT License](LICENSE). Third-party components and licenses are listed in [attribution.md](attribution.md).
+Zay is open source under the [MIT License](LICENSE). Third-party components and licenses are listed in [attribution.md](attribution.md).

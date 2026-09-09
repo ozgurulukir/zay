@@ -366,10 +366,10 @@ fn cappedToolResult(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
 /// the rendered conversation, wrapped so the model treats it as data to
 /// summarize rather than a conversation to continue. Caller owns the result.
 pub fn buildSummaryRequest(gpa: std.mem.Allocator, prefix_text: []const u8) ![]u8 {
-    // `<nova_transcript>` framing rather than `<conversation>`: a literal
+    // `<zay_transcript>` framing rather than `<conversation>`: a literal
     // `</conversation>` inside tool output (common) would break the wrapper;
-    // `nova_transcript` is far rarer in user text (M6).
-    return std.fmt.allocPrint(gpa, "{s}\n\n<nova_transcript>\n{s}\n</nova_transcript>", .{ compaction_prompt, prefix_text });
+    // `zay_transcript` is far rarer in user text (M6).
+    return std.fmt.allocPrint(gpa, "{s}\n\n<zay_transcript>\n{s}\n</zay_transcript>", .{ compaction_prompt, prefix_text });
 }
 
 /// Inject a produced summary into the handover template's `${SUMMARY}`

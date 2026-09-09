@@ -25,7 +25,7 @@ pub const Manifest = struct {
     description: []const u8 = "",
     /// Plugin dependencies (e.g. "lpeg >= 1.0")
     dependencies: []const []const u8 = &.{},
-    /// Whether this is an embedded plugin (shipped with Nova)
+    /// Whether this is an embedded plugin (shipped with Zay)
     is_embedded: bool = false,
     /// Permissions requested by the plugin
     permissions: sandbox.Permissions = .{},

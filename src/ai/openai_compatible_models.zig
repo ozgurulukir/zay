@@ -23,7 +23,7 @@ pub const ModelEntry = struct {
 pub const Options = struct {
     /// Session id for zen sticky routing; when empty the session header is
     /// omitted (an empty-valued header is itself often a 400) but
-    /// `x-opencode-client` still identifies Nova.
+    /// `x-opencode-client` still identifies Zay.
     session_id: []const u8 = "",
     /// User-configured headers for this provider, `{env:VAR}` already
     /// expanded by the caller. Borrowed for the call.

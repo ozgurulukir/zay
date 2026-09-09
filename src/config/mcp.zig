@@ -282,7 +282,7 @@ test "expandEnvVars replaces an unset variable with an empty string" {
     var env_map = std.process.Environ.Map.init(gpa);
     defer env_map.deinit();
 
-    const out = try expandEnvVars(gpa, "https://x.com/?key={env:NOVA_TEST_UNSET_VAR}", &env_map);
+    const out = try expandEnvVars(gpa, "https://x.com/?key={env:ZAY_TEST_UNSET_VAR}", &env_map);
     defer gpa.free(out);
     try std.testing.expectEqualStrings("https://x.com/?key=", out);
 }

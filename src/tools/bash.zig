@@ -27,25 +27,25 @@ pub const Backend = struct {
 
     /// Shell function definitions prepended to a contained command. The `cd`
     /// override runs `builtin cd`, then compares the shell's PHYSICAL cwd (`pwd -P`)
-    /// against `_nova_root` (set to the project root by `prependCdGuard`): a target
+    /// against `_zay_root` (set to the project root by `prependCdGuard`): a target
     /// that resolves outside the root is refused and the shell restored, so a model
     /// that `cd`s to the main tree's absolute path stays put. `pushd`/`popd` are
     /// rejected outright (they'd bypass the guard).
     pub const cd_guard_functions =
-        \\cd() { while [ $# -gt 0 ] && { [ "$1" = -P ] || [ "$1" = -L ] || [ "$1" = -- ]; }; do shift; done; local _prev="$PWD"; builtin cd "$@" || return 1; local _phys="$(pwd -P)"; if [ "$_phys" != "$_nova_root" ] && [ "${_phys#$_nova_root}" = "$_phys" ]; then printf 'cd: %s escapes the workspace root\n' "$_phys" >&2; builtin cd "$_prev" 2>/dev/null || builtin cd "$_nova_root"; return 1; fi; return 0; };
+        \\cd() { while [ $# -gt 0 ] && { [ "$1" = -P ] || [ "$1" = -L ] || [ "$1" = -- ]; }; do shift; done; local _prev="$PWD"; builtin cd "$@" || return 1; local _phys="$(pwd -P)"; if [ "$_phys" != "$_zay_root" ] && [ "${_phys#$_zay_root}" = "$_phys" ]; then printf 'cd: %s escapes the workspace root\n' "$_phys" >&2; builtin cd "$_prev" 2>/dev/null || builtin cd "$_zay_root"; return 1; fi; return 0; };
         \\pushd() { printf 'pushd: not allowed in this workspace\n' >&2; return 1; };
         \\popd() { printf 'popd: not allowed in this workspace\n' >&2; return 1; };
         \\
     ;
 
-    /// Prefix `command` with `_nova_root` (the literal, shell-escaped project root)
-    /// and the `cd`/`pushd`/`popd` guard functions. `_nova_root` anchors on the
+    /// Prefix `command` with `_zay_root` (the literal, shell-escaped project root)
+    /// and the `cd`/`pushd`/`popd` guard functions. `_zay_root` anchors on the
     /// project root — not the shell's start cwd — so a `cwd` subdir argument does
     /// not tighten containment to that subdir.
     pub fn prependCdGuard(gpa: std.mem.Allocator, project_root: []const u8, command: []const u8) std.mem.Allocator.Error![]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(gpa);
-        try out.appendSlice(gpa, "_nova_root=\"");
+        try out.appendSlice(gpa, "_zay_root=\"");
         for (project_root) |c| switch (c) {
             '\\' => try out.appendSlice(gpa, "\\\\"),
             '"' => try out.appendSlice(gpa, "\\\""),
@@ -232,7 +232,7 @@ test "bash tool surfaces a display block as a diff-kind display" {
 
     // The JSON-escaped RS byte (backslash-u-001e) is the sentinel; the shell
     // receives it literally and printf echoes it back out.
-    const args = "{\"command\":\"printf 'edited ok\\n\\u001enova:diff\\n-old\\n+new\\n\\u001enova:end\\n'\",\"description\":\"edit\"}";
+    const args = "{\"command\":\"printf 'edited ok\\n\\u001ezay:diff\\n-old\\n+new\\n\\u001ezay:end\\n'\",\"description\":\"edit\"}";
     var output = try runToolForTest(gpa, std.testing.io, cwd, args);
     defer output.deinit(gpa);
 
@@ -375,7 +375,7 @@ test "empty sentinel block yields no display" {
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
-    const args = "{\"command\":\"printf '\\u001enova:diff\\n\\u001enova:end\\n'\",\"description\":\"edit\"}";
+    const args = "{\"command\":\"printf '\\u001ezay:diff\\n\\u001ezay:end\\n'\",\"description\":\"edit\"}";
     var output = try runToolForTest(gpa, std.testing.io, cwd, args);
     defer output.deinit(gpa);
 
@@ -388,7 +388,7 @@ test "prependCdGuard anchors on the project root and defines the guard" {
     const guarded = try Backend.prependCdGuard(gpa, "/home/u/repo", "printf hi");
     defer gpa.free(guarded);
 
-    try std.testing.expect(std.mem.startsWith(u8, guarded, "_nova_root=\"/home/u/repo\";\n"));
+    try std.testing.expect(std.mem.startsWith(u8, guarded, "_zay_root=\"/home/u/repo\";\n"));
     try std.testing.expect(std.mem.indexOf(u8, guarded, "cd() {") != null);
     try std.testing.expect(std.mem.indexOf(u8, guarded, "pushd()") != null);
     try std.testing.expect(std.mem.endsWith(u8, guarded, "printf hi"));
@@ -399,7 +399,7 @@ test "prependCdGuard escapes shell metacharacters in the root path" {
     const guarded = try Backend.prependCdGuard(gpa, "/tmp/a b\"c$d`e", "true");
     defer gpa.free(guarded);
 
-    try std.testing.expect(std.mem.indexOf(u8, guarded, "_nova_root=\"/tmp/a b\\\"c\\$d\\`e\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, guarded, "_zay_root=\"/tmp/a b\\\"c\\$d\\`e\";") != null);
 }
 
 test "contained bash refuses cd to a directory outside the workspace root" {

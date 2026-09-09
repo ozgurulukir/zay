@@ -1,5 +1,5 @@
 --[[
-test_runner.lua — Minimal Lua test framework for Nova plugins.
+test_runner.lua — Minimal Lua test framework for Zay plugins.
 
 Provides describe/it/assert API similar to Busted or LuaUnit.
 

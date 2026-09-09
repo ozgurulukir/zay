@@ -16,15 +16,15 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact: nova-linux-x86_64
-            bin: nova
+            artifact: zay-linux-x86_64
+            bin: zay
             target: x86_64-linux-musl
             zig_url: https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
             zig_ext: .tar.xz
             zig_dir: zig-x86_64-linux-0.16.0
           - os: windows-latest
-            artifact: nova-windows-x86_64.exe
-            bin: nova.exe
+            artifact: zay-windows-x86_64.exe
+            bin: zay.exe
             target: x86_64-windows
             zig_url: https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip
             zig_ext: .zip
@@ -53,7 +53,7 @@ jobs:
           fi
           printf '%s\n' "$ZIG_DIR" >> "$GITHUB_PATH"
 
-      - name: Apply vaxis NOVA-LOCAL-PATCH (focus-handler guards)
+      - name: Apply vaxis ZAY-LOCAL-PATCH (focus-handler guards)
         shell: bash
         run: |
           # Fresh CI checkouts fetch a PRISTINE vaxis into zig-pkg/; the
@@ -65,7 +65,7 @@ jobs:
           zig build --fetch -Dtarget=${{ matrix.target }} || true
           for d in zig-pkg/vaxis-0.6.0-*/; do
             patch -p1 -d "$d" < tools/vendor-patches/vaxis-focus-handler.patch
-            test "$(grep -c NOVA-LOCAL-PATCH "$d/src/vxfw/App.zig")" -eq 2
+            test "$(grep -c ZAY-LOCAL-PATCH "$d/src/vxfw/App.zig")" -eq 2
           done
 
       - name: Build (ReleaseFast)

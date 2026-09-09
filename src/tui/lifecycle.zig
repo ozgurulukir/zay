@@ -488,12 +488,12 @@ pub fn createParallelLane(self: *App) !void {
     self.io.random(&raw);
     const id = std.fmt.bytesToHex(raw, .lower);
 
-    const branch = try self.gpa.alloc(u8, "nova/".len + id.len);
+    const branch = try self.gpa.alloc(u8, "zay/".len + id.len);
     errdefer self.gpa.free(branch);
-    @memcpy(branch[0.."nova/".len], "nova/");
-    @memcpy(branch["nova/".len..], &id);
+    @memcpy(branch[0.."zay/".len], "zay/");
+    @memcpy(branch["zay/".len..], &id);
 
-    // Worktrees live under the global `<home>/.config/nova/worktrees`, OUTSIDE the
+    // Worktrees live under the global `<home>/.config/zay/worktrees`, OUTSIDE the
     // repo, so `git add -A`/snapshots/`/save` never see them.
     const parent = try vcs.globalWorktreesDir(self.gpa, home);
     defer self.gpa.free(parent);
@@ -735,7 +735,7 @@ pub fn handleDiffCommentKey(root: *RootWidget, ctx: *vxfw.EventContext, key: vax
 /// TextField's userdata can point into the dying runtime's memory; once it is
 /// deinit'd, FocusHandler.update can no longer find it in the surface tree,
 /// leaves the focus path empty, and the next key event crashes (vendored
-/// App.zig:594, locally patched as NOVA-LOCAL-PATCH). Root is always drawn and
+/// App.zig:594, locally patched as ZAY-LOCAL-PATCH). Root is always drawn and
 /// runtime-independent, so pinning here is safe. Best-effort: tests have no
 /// framework handle wired.
 pub fn pinFocusToRoot(app: *App) void {

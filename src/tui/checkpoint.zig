@@ -14,7 +14,7 @@ pub const SealOutcome = enum { sealed, nothing, unavailable, failed };
 /// Snapshot the working tree (git-shadow) and bind the resulting commit id to
 /// the active conversation leaf, so navigating back here restores this code
 /// state. HEAD stays attached to the branch; the snapshot is an off-branch
-/// commit kept alive by a `refs/nova/*` ref. A git or persistence error
+/// commit kept alive by a `refs/zay/*` ref. A git or persistence error
 /// returns `.failed` — never swallowed silently, since a missing binding is
 /// exactly what broke timeline navigation before.
 pub fn sealCheckpoint(app: *App) SealOutcome {

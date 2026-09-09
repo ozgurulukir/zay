@@ -11,7 +11,7 @@ This skill provides robust Python-based file editing and search routines. When P
 
 ## 1. Exact-Match File Editor (`edit`)
 
-The `edit` routine reads the target file, verifies that `old_text` exists uniquely (or validates multiple sequential replacements), applies the changes, outputs a unified visual diff using Nova's display sentinels (`\x1enova:diff`), and writes atomically.
+The `edit` routine reads the target file, verifies that `old_text` exists uniquely (or validates multiple sequential replacements), applies the changes, outputs a unified visual diff using Zay's display sentinels (`\x1ezay:diff`), and writes atomically.
 
 ### Python Function Definition:
 
@@ -26,8 +26,8 @@ def emit_diff(path: str, old: str, new: str) -> None:
     diff = difflib.unified_diff(lines_old, lines_new, fromfile=f"a/{path}", tofile=f"b/{path}")
     diff_text = "".join(diff)
     if diff_text:
-        # Nova visual diff sentinel (routed to TUI diff panel)
-        sys.stdout.write(f"\x1enova:diff\n{diff_text}\x1enova:end\n")
+        # Zay visual diff sentinel (routed to TUI diff panel)
+        sys.stdout.write(f"\x1ezay:diff\n{diff_text}\x1ezay:end\n")
         sys.stdout.flush()
 
 def edit(path: str, old_text: str = None, new_text: str = None, edits: list = None) -> None:

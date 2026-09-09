@@ -696,10 +696,10 @@ fn formatElapsed(buf: []u8, total_seconds: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d}h {d:0>2}m", .{ hours, rem_minutes }) catch "?";
 }
 
-/// Write the merged pwsh background script to a fresh `nova-pwsh-bg-<hex>.ps1`
+/// Write the merged pwsh background script to a fresh `zay-pwsh-bg-<hex>.ps1`
 /// temp file under the shared temp dir, so the `.stdin_dash_command` mode can
-/// run it with `pwsh -File`. The `nova-pwsh-` prefix is deliberate: the startup
-/// temp-prune (`bash_exec.pruneTempDir`, matching `nova-pwsh-*`) reaps any file
+/// run it with `pwsh -File`. The `zay-pwsh-` prefix is deliberate: the startup
+/// temp-prune (`bash_exec.pruneTempDir`, matching `zay-pwsh-*`) reaps any file
 /// stranded by a crash, so a failed spawn can never leak one permanently. On a
 /// write failure the (already-created) file is deleted here; the caller owns the
 /// path string and the file on success (the Job stores it, `destroyJob` removes
@@ -933,10 +933,10 @@ pub fn isSubpathOrEqual(child: []const u8, parent: []const u8) bool {
 }
 
 test "isSubpathOrEqual handles exact match, subpaths, and rejects prefix collisions" {
-    try std.testing.expect(isSubpathOrEqual("C:\\Users\\nova\\worktrees\\1", "C:/Users/nova/worktrees/1"));
-    try std.testing.expect(isSubpathOrEqual("C:\\Users\\nova\\worktrees\\1\\sub", "C:/Users/nova/worktrees/1"));
-    try std.testing.expect(!isSubpathOrEqual("C:\\Users\\nova\\worktrees\\1-other", "C:/Users/nova/worktrees/1"));
-    try std.testing.expect(!isSubpathOrEqual("C:\\Users\\nova\\worktrees", "C:/Users/nova/worktrees/1"));
+    try std.testing.expect(isSubpathOrEqual("C:\\Users\\zay\\worktrees\\1", "C:/Users/zay/worktrees/1"));
+    try std.testing.expect(isSubpathOrEqual("C:\\Users\\zay\\worktrees\\1\\sub", "C:/Users/zay/worktrees/1"));
+    try std.testing.expect(!isSubpathOrEqual("C:\\Users\\zay\\worktrees\\1-other", "C:/Users/zay/worktrees/1"));
+    try std.testing.expect(!isSubpathOrEqual("C:\\Users\\zay\\worktrees", "C:/Users/zay/worktrees/1"));
 }
 
 test "BackgroundManager init/deinit cycle is clean" {
@@ -1317,7 +1317,7 @@ test "writeBackgroundScript writes UTF-8 BOM" {
 test "writeLogChunk caps at quota and writes truncation notice" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const tmp_path = try bash.namedTempPath(gpa, "nova-test-quota.log");
+    const tmp_path = try bash.namedTempPath(gpa, "zay-test-quota.log");
     defer gpa.free(tmp_path);
     defer std.Io.Dir.deleteFile(.cwd(), io, tmp_path) catch {};
 

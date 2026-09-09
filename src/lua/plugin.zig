@@ -1,7 +1,7 @@
 //! Plugin lifecycle management.
 //!
 //! A plugin is a Lua script that registers tools, hooks, and commands
-//! with the Nova runtime. Each plugin has its own sandboxed Lua state
+//! with the Zay runtime. Each plugin has its own sandboxed Lua state
 //! with configurable permissions and resource limits.
 
 const std = @import("std");

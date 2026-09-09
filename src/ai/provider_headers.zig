@@ -30,12 +30,12 @@ const ai = @import("../ai.zig");
 pub const zen_url_marker = "opencode.ai/zen";
 pub const zen_session_header = "x-opencode-session";
 pub const zen_client_header = "x-opencode-client";
-pub const zen_client_value = "nova";
+pub const zen_client_value = "zay";
 
 /// OpenRouter app attribution (marketplace ranking + rate-limit priority),
 /// migrated from the chat client's `app_title` special case.
 pub const openrouter_title_header = "X-Title";
-pub const openrouter_title_value = "Nova";
+pub const openrouter_title_value = "Zay";
 
 /// Hard cap on a `ResponsesConfig.headers` profile table. The codex profile
 /// uses 7 of these 8 slots.

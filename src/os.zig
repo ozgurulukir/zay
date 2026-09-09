@@ -9,7 +9,7 @@ const builtin = @import("builtin");
 /// Host OS tag. Prefer this over `builtin.os.tag` so every OS check shares one source.
 pub const tag = builtin.os.tag;
 
-/// Whether the host is Windows — Nova's most common OS branch.
+/// Whether the host is Windows — Zay's most common OS branch.
 pub const is_windows = tag == .windows;
 
 /// Human-facing OS name, e.g. for the system prompt's `${OS}` placeholder.
