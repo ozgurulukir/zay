@@ -141,12 +141,12 @@ pub const Statement = struct {
     pub fn bindText(self: *Statement, index: i32, value: []const u8) Error!void {
         assert(index > 0);
         const len = std.math.cast(c_int, value.len) orelse return error.Misuse;
-        try self.check(c.sqlite3_bind_text(self.handle, index, value.ptr, len, sqlite_transient));
+        try self.check(c.sqlite3_bind_text(self.handle, index, value.ptr, len, sqliteTransient()));
     }
 
     pub fn bindBlob(self: *Statement, index: i32, value: []const u8) Error!void {
         assert(index > 0);
-        try self.check(c.sqlite3_bind_blob(self.handle, index, value.ptr, @intCast(value.len), sqlite_transient));
+        try self.check(c.sqlite3_bind_blob(self.handle, index, value.ptr, @intCast(value.len), sqliteTransient()));
     }
 
     pub fn bindValue(self: *Statement, index: i32, value: Value) Error!void {
@@ -268,13 +268,17 @@ pub const ColumnType = enum {
 /// SQLITE_TRANSIENT ((sqlite3_destructor_type)-1): SQLite copies the bound
 /// content immediately. Eliminates the entire class of dangling-pointer bugs
 /// where the caller's buffer is freed or reallocated between bind and step.
-/// The bit pattern is the required all-ones (-1); @ptrFromInt straight into
-/// a function-pointer type is a compile error on aarch64 (non-trivial fn
-/// alignment), and @ptrCast alone cannot grow alignment either — hence the
-/// intermediate align-1 `*const anyopaque` plus an explicit @alignCast.
-/// The sentinel is only ever compared, never dereferenced.
-const sqlite_transient: ?*const fn (?*anyopaque) callconv(.c) void =
-    @ptrCast(@alignCast(@as(*const anyopaque, @ptrFromInt(std.math.maxInt(usize)))));
+/// A function, not a const: on aarch64 function pointers carry 4-byte
+/// alignment, so @ptrFromInt rejects a *comptime-known* all-ones address
+/// (x86_64 tolerates it — this only surfaced when the macOS build landed).
+/// The undefined-init var keeps the value out of comptime; LLVM still folds
+/// it to the constant. The sentinel is only ever compared by SQLite, never
+/// dereferenced.
+fn sqliteTransient() ?*const fn (?*anyopaque) callconv(.c) void {
+    var address: usize = undefined;
+    address = std.math.maxInt(usize);
+    return @ptrFromInt(address);
+}
 
 test "open in-memory database and query row" {
     var connection = try Connection.open(":memory:", .{});
