@@ -268,12 +268,13 @@ pub const ColumnType = enum {
 /// SQLITE_TRANSIENT ((sqlite3_destructor_type)-1): SQLite copies the bound
 /// content immediately. Eliminates the entire class of dangling-pointer bugs
 /// where the caller's buffer is freed or reallocated between bind and step.
-/// The bit pattern is the required all-ones (-1); routed through an
-/// align-1 `*const anyopaque` because @ptrFromInt straight into a function
-/// pointer type is a compile error on aarch64, where fn pointers carry
-/// non-trivial alignment.
+/// The bit pattern is the required all-ones (-1); @ptrFromInt straight into
+/// a function-pointer type is a compile error on aarch64 (non-trivial fn
+/// alignment), and @ptrCast alone cannot grow alignment either — hence the
+/// intermediate align-1 `*const anyopaque` plus an explicit @alignCast.
+/// The sentinel is only ever compared, never dereferenced.
 const sqlite_transient: ?*const fn (?*anyopaque) callconv(.c) void =
-    @ptrCast(@as(*const anyopaque, @ptrFromInt(std.math.maxInt(usize))));
+    @ptrCast(@alignCast(@as(*const anyopaque, @ptrFromInt(std.math.maxInt(usize)))));
 
 test "open in-memory database and query row" {
     var connection = try Connection.open(":memory:", .{});
