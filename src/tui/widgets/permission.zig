@@ -119,7 +119,7 @@ fn drawPermissionCommand(surface: *vxfw.Surface, ctx: vxfw.DrawContext, command:
             continue;
         }
         if (drawn >= rows) return;
-        panel.lineStyledAt(surface, 1 + drawn, line, ctx, 1, p.thinking_body) catch {};
+        panel.lineStyledAt(surface, 1 + drawn, line, ctx, 1, p.markdown_code) catch {};
         drawn += 1;
         line_index += 1;
     }
@@ -131,7 +131,7 @@ fn drawScrollHint(surface: *vxfw.Surface, ctx: vxfw.DrawContext, command: []cons
     if (hint_row == 0 or hint_row >= surface.size.height) return;
     const p = tui_style.activePalette();
     const hint = scrollHintText(ctx.arena, command, scroll, body_rows) orelse return;
-    panel.lineStyledAt(surface, hint_row, hint, ctx, 1, p.thinking_body) catch {};
+    panel.lineStyledAt(surface, hint_row, hint, ctx, 1, p.info) catch {};
 }
 
 /// Pure: build the scroll-affordance text, or null when the command fits the

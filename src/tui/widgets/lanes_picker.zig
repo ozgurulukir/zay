@@ -89,7 +89,7 @@ const EmptyRow = struct {
         const p = tui_style.activePalette();
         const width = ctx.max.width orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
-        try panel.lineStyledAt(&surface, 0, self.text, ctx, message.ConversationLayout.left -| 1, p.thinking_body);
+        try panel.lineStyledAt(&surface, 0, self.text, ctx, message.ConversationLayout.left -| 1, p.notice);
         return surface;
     }
 };
