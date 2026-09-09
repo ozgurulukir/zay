@@ -59,9 +59,9 @@ Nova operates without granular per-action permission prompts (YOLO mode), relyin
 |:---|:---|:---|
 | **[Zig](https://ziglang.org/download/)** | `0.16.0` | Native compilation and build toolchain |
 | **[Git](https://git-scm.com/)** | 2.20+ | Version control & parallel worktree lanes |
-| **Shell** | Bash / PowerShell 7+ | Command execution (`/bin/bash` on Linux/macOS, `pwsh` on Windows) |
+| **Shell** | Bash / PowerShell 7+ | Command execution (`bash` resolved via PATH on Linux/macOS, `pwsh` on Windows) |
 | **[ripgrep](https://github.com/BurntSushi/ripgrep)** *(Optional)* | Any recent | High-speed regex code search for plugins (substring search is built-in) |
-| **[uv](https://github.com/astral-sh/uv)** *(Optional)* | Python 3.10+ | Needed only when running the optional ModernBERT safety classifier |
+| **[uv](https://github.com/astral-sh/uv)** *(Optional)* | Python 3.11+ | Needed only when running the optional ModernBERT safety classifier |
 
 ---
 

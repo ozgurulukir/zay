@@ -98,8 +98,11 @@ Notes:
 - A plugin with no `prompt.md` contributes nothing — only tools registered via
   `nova.register_tool` are visible to the model.
 - A plugin with `prompt.md` but no `plugin.lua` still contributes prompt text.
-- A project plugin overrides a global plugin with the same directory name
-  (including its `prompt.md`).
+- A project plugin overrides a global plugin with the same manifest `name`
+  field. (The `prompt.md` scan is a pure text pass keyed by directory name, so
+  its override follows the directory name.)
+- Each plugin's `prompt.md` contributes at most 32 KB, with a 64 KB aggregate
+  cap across all plugins; oversized bodies are skipped.
 - Changes to `prompt.md` take effect on the next session or lane.
 
 ## Plugin Discovery
@@ -108,8 +111,8 @@ Nova discovers plugins from two directories:
 
 | Directory | Scope |
 |-----------|-------|
-| `~/.config/nova/plugins/` | Global — available in all projects |
-| `.nova/plugins/` | Project — overrides global plugins with the same name |
+| `~/.config/nova/plugins/` | Global — available in all projects (on Windows, `%APPDATA%\nova\plugins` is probed first, falling back to `.config\nova\plugins`) |
+| `.nova/plugins/` | Project — overrides global plugins with the same manifest `name` |
 
 Each subdirectory containing a `plugin.lua` file is treated as a plugin.
 
@@ -119,7 +122,7 @@ Each subdirectory containing a `plugin.lua` file is treated as a plugin.
 
 | Function | Parameters | Returns | Description |
 |----------|-----------|---------|-------------|
-| `nova.read_file(path, opts?)` | `path`, `opts.start_line`, `opts.end_line`, `opts.max_size` | `{path, content, size, lines, language, mime_type}` | Read file with metadata |
+| `nova.read_file(path, opts?)` | `path`, `opts.start_line`, `opts.end_line`, `opts.max_size` | `{path, content, size, lines, truncated, full_size, language, mime_type}` | Read file with metadata (`truncated`/`full_size` are set when the read cap clipped the body) |
 | `nova.write_file(path, content)` | `path`, `content` | `true` or `nil` | Atomic file write |
 | `nova.edit_file(path, old, new)` | `path`, `old_string`, `new_string` | `true` or `nil` | Find-and-replace (first occurrence) |
 | `nova.search_files(root, pattern, opts?)` | `root`, `pattern`, `opts.file_pattern`, `opts.case_sensitive`, `opts.max_results` | `{query, total_matches, results, truncated}` | Recursive content grep (substring) |
@@ -163,6 +166,7 @@ matches every `.zig` file at any depth. gitignore is NOT honored.
 | `nova.git_diff(path?)` | `path` (optional) | `string` | Git diff |
 | `nova.git_log(n)` | `n` (default 10) | `string` | Recent commits |
 | `nova.git_branch()` | — | `string` | Current branch name |
+| `nova.git_add(files)` | one path `string` or array of paths | `{success, output}` | Stage files for commit |
 | `nova.git_commit(msg)` | `msg` | `{success, output}` | Create commit |
 
 ### Plugin System
@@ -171,6 +175,7 @@ matches every `.zig` file at any depth. gitignore is NOT honored.
 |----------|-----------|---------|-------------|
 | `nova.register_tool(spec)` | `spec.name`, `spec.description`, `spec.parameters`, `spec.handler` | `true` | Register a tool |
 | `nova.on(event, callback)` | `event`, `callback` | `true` | Subscribe to a lifecycle event |
+| `nova.require(mod_path)` | module path relative to the plugin dir | module table | Load another Lua module from the plugin directory (cached; circular requires safe) |
 | `nova.think(prompt)` | `prompt` | _(stub)_ | Recursive LLM call (not yet implemented) |
 
 ### JSON
@@ -249,16 +254,19 @@ forms (escaped JSON string or inline object).
 
 ## Permissions
 
-Plugins declare required permissions in their manifest. Permissions are granted
-at load time and cannot be changed at runtime.
+Plugins declare permissions in their manifest. Permissions are granted at load
+time and cannot be changed at runtime. Only the two `allow_*` keys actually
+gate runtime behavior; the first three are **advisory metadata** — declared
+intent for readers and review — because the sandbox never exposes `io.*` or
+sockets to any plugin regardless of what it declares.
 
-| Permission | Description | Default |
-|------------|-------------|---------|
-| `file_access` | Allow file read/write via `io.*` | `false` |
-| `network_access` | Allow network access | `false` |
-| `require_others` | Allow requiring other plugins | `true` |
-| `allow_os_execute` | Allow `os.execute` | `false` |
-| `allow_os_remove` | Allow `os.remove`/`os.rename` | `false` |
+| Permission | Description | Default | Enforced |
+|------------|-------------|---------|----------|
+| `file_access` | Declares the plugin reads/writes files (via `nova.*` bridges) | `false` | advisory only — `io.*` is never exposed |
+| `network_access` | Declares the plugin needs network access | `false` | advisory only — no network API exists in the sandbox |
+| `require_others` | Declares the plugin may `require()` modules | `true` | advisory only — `nova.require` is always scoped to the plugin's own directory |
+| `allow_os_execute` | Allow `os.execute` | `false` | yes |
+| `allow_os_remove` | Allow `os.remove`/`os.rename` (routed to sandboxed `deletePath`/`movePath`) | `false` | yes |
 
 Embedded plugins (shipped with Nova) always get full access.
 
@@ -338,7 +346,7 @@ shapes models already know from Claude Code / OpenCode / Zed agents:
 - **path-tools** — `create_directory`, `copy_path`, `move_path`, `delete_path`
   (sandboxed alternatives to bash cp/mv/rm/mkdir)
 - **git-tools** — `git_status`, `git_diff`, `git_log`, `git_branch`,
-  `git_commit` (with commit-discipline guidance in `prompt.md`)
+  `git_add`, `git_commit` (with commit-discipline guidance in `prompt.md`)
 - **todo** — todo.txt-format task tracker with detailed plans. List tools:
   `todo_list`, `todo_add`, `todo_done`, `todo_delete`, `todo_prioritize`,
   `todo_write`. Plan tools (lazy-loaded so the list stays compact):
@@ -346,10 +354,13 @@ shapes models already know from Claude Code / OpenCode / Zed agents:
   `.nova/todos.txt` (todo.txt standard, editable in any editor); detailed
   per-task plans live in a sidecar `.nova/todos/plans.json` keyed by a stable
   `id:N` tag. `todo_list` shows only a `[plan:N steps]` marker — plan bodies are
-  fetched on demand via `todo_get_plan` to keep context small. Refreshes on
-  `turn_started` events.
+  fetched on demand via `todo_get_plan` to keep context small. The list store is
+  re-read from disk at the start of every tool call, so external edits to
+  `todos.txt` are reflected immediately (no event subscription).
 - **file-watcher** — Event-driven plugin using `nova.on("tool_call_finished", ...)`
 - **hello-world** — Minimal tool registration (demo)
+- **modular-demo** — Multi-module plugin: `init.lua` pulls helper modules in via
+  `nova.require` to demonstrate the plugin-scoped module loader
 - **sitting-duck** — tree-sitter ASTs as SQL over the `duckdb` CLI + the
   `sitting_duck` community extension (auto-installed on first use): `ast_outline`
   (glob → symbol list with `node_id` handles), `ast_find_pattern` (structural

@@ -110,7 +110,7 @@ Temporary log files use hex-only filenames (`nova-bash-<hex>.log` via `bytesToHe
 
 ## Lua Plugin System
 
-Nova supports extending its capabilities through Lua 5.4 plugins. The plugin system lives in `src/lua/` and provides a sandboxed runtime, plugin lifecycle, event bus, tool registration, config integration, bytecode caching, and TUI integration.
+Nova supports extending its capabilities through Lua 5.4 plugins. The plugin system lives in `src/lua/` and provides a sandboxed runtime, plugin lifecycle, event bus, tool registration, config integration, and TUI integration.
 
 The full plugin development guide, API reference, and example walkthroughs live in [Plugins](plugins/README.md). The internal wiring patterns (tool dispatch, event wiring, bridge functions, two-store state) live in [Patterns](PATTERNS.md).
 

@@ -179,8 +179,9 @@ lands past the pinned commit.
 ### uucode (Unicode tables)
 
 - **Source:** <https://github.com/jacobsandlund/uucode>
-- **Version:** 0.2.0 @ `0620982` (transitive dependency of vaxis, pulled in
-  via its `src/unicode.zig`)
+- **Version:** 0.2.0 @ `2826a37` (transitive dependency of vaxis, pulled in
+  via vaxis's own dependency pin — the root build.zig.zon's lazy `0620982`
+  entry is never fetched)
 - **License:** MIT — Copyright (c) 2026 Jacob Sandlund
 - **Used for:** Unicode-aware string handling inside vaxis (grapheme/width
   tables). No local modifications.
