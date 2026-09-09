@@ -50,6 +50,15 @@ const tool_call_limit_max: u32 = 1000;
 /// field keeps its default), matching the toast-setting convention.
 const min_split_width_min: u16 = 80;
 const min_split_width_max: u16 = 500;
+/// Max length for `systemPrompt` (schema `maxLength: 10000`). Longer values
+/// are dropped with a diagnostic — a silently-truncated prompt would change
+/// semantics, so the field never clamps.
+const max_system_prompt_chars: usize = 10_000;
+/// Max byte length for `plugins.<name>.settings`, applied to both the
+/// escaped-string form and the canonical serialized inline-object form.
+/// Oversized settings are dropped with a diagnostic; the plugin still loads
+/// unconfigured (schema `maxLength: 65536` on the string branch).
+const max_plugin_settings_bytes: usize = 65_536;
 
 const Provider = provider_types.Provider;
 const AdapterKind = provider_types.AdapterKind;
@@ -588,7 +597,7 @@ fn parseObject(
         if (val == .object) out.mcp_servers = try parseMcpServers(gpa, val);
     }
     if (value.object.get("plugins")) |plugins_val| {
-        if (plugins_val == .object) out.plugins = try parsePlugins(gpa, plugins_val);
+        if (plugins_val == .object) out.plugins = try parsePlugins(gpa, path, plugins_val, diagnostics);
     }
 
     // Scalar fields: camelCase primary, snake_case fallback.
@@ -605,7 +614,18 @@ fn parseObject(
     // that still carry the key parse without error; the next save drops it.
     if (boolFieldCompat(value, "strictOutputs", "strict_outputs")) |b| out.strict_outputs = b;
     if (stringFieldCompat(value, "systemPrompt", "system_prompt")) |s| {
-        out.system_prompt = try gpa.dupe(u8, s);
+        // Char (UTF-8 code point) semantics to match the schema's `maxLength`;
+        // invalid UTF-8 falls back to the byte length. The field is never
+        // truncated — an over-limit prompt is dropped with a diagnostic.
+        const len_chars = std.unicode.utf8CountCodepoints(s) catch s.len;
+        if (len_chars <= max_system_prompt_chars) {
+            out.system_prompt = try gpa.dupe(u8, s);
+        } else {
+            try diagnostics.append(gpa, .{ .config_parse_error = .{
+                .path = try gpa.dupe(u8, path),
+                .reason = try std.fmt.allocPrint(gpa, "systemPrompt exceeds the {d}-char limit ({d} chars); dropped", .{ max_system_prompt_chars, len_chars }),
+            } });
+        }
     }
     // Theme name (single snake_case key; empty means "default" at resolve time).
     if (stringField(value, "theme")) |s| {
@@ -918,7 +938,12 @@ fn parseMcpServers(gpa: std.mem.Allocator, value: std.json.Value) ![]McpServerCo
     return try servers.toOwnedSlice(gpa);
 }
 
-fn parsePlugins(gpa: std.mem.Allocator, value: std.json.Value) ![]PluginConfig {
+fn parsePlugins(
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    value: std.json.Value,
+    diagnostics: *std.ArrayList(Diagnostic),
+) ![]PluginConfig {
     var plugins: std.ArrayList(PluginConfig) = .empty;
     errdefer {
         for (plugins.items) |*plugin| plugin.deinit(gpa);
@@ -949,6 +974,15 @@ fn parsePlugins(gpa: std.mem.Allocator, value: std.json.Value) ![]PluginConfig {
                 try std.json.Stringify.value(sv, .{}, &buf.writer);
                 plugin.settings = try buf.toOwnedSlice();
             }
+        }
+
+        if (plugin.settings.len > max_plugin_settings_bytes) {
+            try diagnostics.append(gpa, .{ .config_parse_error = .{
+                .path = try gpa.dupe(u8, path),
+                .reason = try std.fmt.allocPrint(gpa, "plugin '{s}' settings exceed the {d}-byte limit ({d} bytes); dropped", .{ plugin.name, max_plugin_settings_bytes, plugin.settings.len }),
+            } });
+            gpa.free(plugin.settings);
+            plugin.settings = "";
         }
 
         try plugins.append(gpa, plugin);
@@ -1178,6 +1212,9 @@ const reasoning_efforts_by_name = std.StaticStringMap(ai.ReasoningEffort).initCo
     .{ "medium", .medium },
     .{ "high", .high },
     .{ "xhigh", .xhigh },
+    // OpenRouter-specific top level (above `xhigh`); mirrors `ai.ReasoningEffort.max`
+    // so config can express every level the enum and the session DB already carry.
+    .{ "max", .max },
 });
 
 fn intField(value: std.json.Value, name: []const u8) ?i64 {
@@ -3440,7 +3477,12 @@ test "parsePlugins normalizes inline-object settings to canonical JSON" {
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
     defer parsed.deinit();
-    const plugins = try parsePlugins(gpa, parsed.value);
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    const plugins = try parsePlugins(gpa, "<test>", parsed.value, &sink);
     defer {
         for (plugins) |*p| p.deinit(gpa);
         gpa.free(plugins);
@@ -3459,7 +3501,12 @@ test "parsePlugins keeps string settings and ignores non-object forms" {
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
     defer parsed.deinit();
-    const plugins = try parsePlugins(gpa, parsed.value);
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    const plugins = try parsePlugins(gpa, "<test>", parsed.value, &sink);
     defer {
         for (plugins) |*p| p.deinit(gpa);
         gpa.free(plugins);
@@ -3473,6 +3520,121 @@ test "parsePlugins keeps string settings and ignores non-object forms" {
             try std.testing.expectEqual(@as(usize, 0), p.settings.len);
         }
     }
+}
+
+test "parsePlugins drops oversized settings with a diagnostic" {
+    const gpa = std.testing.allocator;
+    const payload = "x" ** 70_000;
+    const json = try std.fmt.allocPrint(gpa, "{{\"big\":{{\"settings\":\"{s}\"}}}}", .{payload});
+    defer gpa.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+    defer parsed.deinit();
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    const plugins = try parsePlugins(gpa, "<test>", parsed.value, &sink);
+    defer {
+        for (plugins) |*p| p.deinit(gpa);
+        gpa.free(plugins);
+    }
+    try std.testing.expectEqual(@as(usize, 1), plugins.len);
+    // Dropped, not truncated: the plugin loads unconfigured.
+    try std.testing.expectEqual(@as(usize, 0), plugins[0].settings.len);
+    try std.testing.expectEqual(@as(usize, 1), sink.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, sink.items[0].config_parse_error.reason, "settings exceed") != null);
+}
+
+test "parsePlugins keeps settings at the 64KiB boundary" {
+    const gpa = std.testing.allocator;
+    const payload = "x" ** 65_536;
+    const json = try std.fmt.allocPrint(gpa, "{{\"edge\":{{\"settings\":\"{s}\"}}}}", .{payload});
+    defer gpa.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+    defer parsed.deinit();
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    const plugins = try parsePlugins(gpa, "<test>", parsed.value, &sink);
+    defer {
+        for (plugins) |*p| p.deinit(gpa);
+        gpa.free(plugins);
+    }
+    try std.testing.expectEqual(@as(usize, 1), plugins.len);
+    try std.testing.expectEqual(@as(usize, 65_536), plugins[0].settings.len);
+    try std.testing.expectEqual(@as(usize, 0), sink.items.len);
+}
+
+test "parseObject drops oversized systemPrompt with a diagnostic" {
+    const gpa = std.testing.allocator;
+    const payload = "a" ** 10_001;
+    const json = try std.fmt.allocPrint(gpa, "{{\"systemPrompt\":\"{s}\"}}", .{payload});
+    defer gpa.free(json);
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+    // Dropped, not truncated.
+    try std.testing.expect(cfg.system_prompt == null);
+    try std.testing.expectEqual(@as(usize, 1), sink.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, sink.items[0].config_parse_error.reason, "systemPrompt exceeds") != null);
+}
+
+test "parseObject keeps systemPrompt at the 10 000-char boundary" {
+    const gpa = std.testing.allocator;
+    const payload = "a" ** 10_000;
+    const json = try std.fmt.allocPrint(gpa, "{{\"systemPrompt\":\"{s}\"}}", .{payload});
+    defer gpa.free(json);
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 10_000), cfg.system_prompt.?.len);
+    try std.testing.expectEqual(@as(usize, 0), sink.items.len);
+}
+
+test "parseObject systemPrompt counts chars, not bytes" {
+    const gpa = std.testing.allocator;
+    // 5 000 three-byte code points: 15 000 bytes but only 5 000 chars — the
+    // char-semantics cap must accept what a byte check would drop (and what
+    // the schema's `maxLength: 10000` would also accept).
+    const payload = "界" ** 5_000;
+    const json = try std.fmt.allocPrint(gpa, "{{\"systemPrompt\":\"{s}\"}}", .{payload});
+    defer gpa.free(json);
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expect(cfg.system_prompt != null);
+    try std.testing.expectEqual(@as(usize, 0), sink.items.len);
+}
+
+test "reasoningEffort max parses and survives reasoningOptions" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    var cfg = try parseFile(gpa, "<test>", "{\"providers\":{\"openrouter\":{\"models\":{\"deepseek-r1\":{\"reasoningEffort\":\"max\",\"reasoningOptions\":[\"max\",\"low\"]}}}}}", &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), sink.items.len);
+    const model = cfg.providers[0].models[0];
+    try std.testing.expectEqual(ai.ReasoningEffort.max, model.reasoning.effort);
+    try std.testing.expectEqual(@as(usize, 2), model.reasoning_options.len);
+    try std.testing.expectEqual(ai.ReasoningEffort.max, model.reasoning_options[0]);
 }
 
 test "provider headers parse with validation and round-trip raw placeholders" {

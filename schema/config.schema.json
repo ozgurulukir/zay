@@ -7,14 +7,14 @@
   "properties": {
     "version": {
       "type": "string",
-      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "pattern": "^\\d+(\\.\\d+)*$",
       "default": "2.0.0",
-      "description": "Semantic version of the configuration schema instance."
+      "description": "Semantic version of the configuration schema instance. Digits separated by dots; a bare major ('2') is accepted. A major version above 2 produces an 'unsupported schema version' diagnostic at load."
     },
     "defaultModel": {
       "type": "string",
-      "pattern": "^[a-zA-Z0-9._:+-]+/.+$",
-      "description": "Primary model selection as '<provider>/<model-id>' (e.g., 'openai/gpt-5.5', 'ollama/llama3.1:8b', 'qwen-cloud/qwen3.7-plus'). The provider part is split on the first '/'; model ids may contain further slashes (e.g., 'huggingface/meta-llama/Llama-3.1-8B'). Both parts may contain ':', '+', '.', '_' and '-'. This is the single source of truth for provider + model. Legacy key 'model' is parsed for backward compatibility but is not schema-valid; new configs must use 'defaultModel'."
+      "pattern": "^[^/]+/.+$",
+      "description": "Primary model selection as '<provider>/<model-id>' (e.g., 'openai/gpt-5.5', 'ollama/llama3.1:8b', 'qwen-cloud/qwen3.7-plus'). The provider part is split on the first '/'; model ids may contain further slashes (e.g., 'huggingface/meta-llama/Llama-3.1-8B'). Both parts must be non-empty. This is the single source of truth for provider + model. Legacy key 'model' is parsed for backward compatibility but is not schema-valid; new configs must use 'defaultModel'."
     },
     "baseURL": {
       "type": "string",
@@ -34,7 +34,7 @@
     "systemPrompt": {
       "type": "string",
       "maxLength": 10000,
-      "description": "Custom system prompt override. Legacy key 'system_prompt' is parsed for backward compatibility but is not schema-valid; new configs must use 'systemPrompt'."
+      "description": "Custom system prompt override. Values longer than 10000 chars are dropped at parse with a diagnostic — the field is never silently truncated. Legacy key 'system_prompt' is parsed for backward compatibility but is not schema-valid; new configs must use 'systemPrompt'."
     },
     "bashClassifierUrl": {
       "type": "string",
@@ -111,7 +111,7 @@
             "xhigh",
             "max"
           ],
-          "description": "Reasoning effort level for this model. 'default' sends no reasoning parameter (model decides); 'none' disables thinking explicitly. 'max' is OpenRouter-specific (highest, above xhigh)."
+          "description": "Reasoning effort level for this model. 'default' sends no reasoning parameter (model decides); 'none' disables thinking explicitly. 'max' is the OpenRouter-specific top level above 'xhigh' (OpenAI-native dialects ignore it; Qwen/DashScope models clip it to 'medium')."
         },
         "contextWindow": {
           "type": "integer",
@@ -138,7 +138,7 @@
               "max"
             ]
           },
-          "description": "Reasoning efforts this model supports. The TUI model picker filters its reasoning cycle to this list. Empty or absent means all efforts are available. 'max' is OpenRouter-specific (highest, above xhigh)."
+          "description": "Reasoning efforts this model supports. The TUI model picker filters its reasoning cycle to this list. Empty or absent means all efforts are available. Entries outside the enum are filtered out at parse time."
         }
       },
       "additionalProperties": false
@@ -223,9 +223,11 @@
           "description": "Whether this plugin is active."
         },
         "settings": {
-          "type": "string",
-          "maxLength": 65536,
-          "description": "Plugin-specific settings as a JSON object string (e.g. '{\"theme\":\"dark\"}'). The plugin's Lua code parses this via plugin.get_config()."
+          "description": "Plugin-specific settings consumed via plugin.get_config(). Either a JSON object string (e.g. '{\"theme\":\"dark\"}') or an inline JSON object — inline objects are normalized to a canonical compact JSON string at parse time. Arrays and numbers are ignored. The serialized settings are capped at 65536 bytes; oversized settings are dropped at parse with a diagnostic and the plugin loads unconfigured.",
+          "oneOf": [
+            { "type": "string", "maxLength": 65536 },
+            { "type": "object" }
+          ]
         }
       },
       "additionalProperties": false
@@ -282,7 +284,7 @@
         "autoContinueOnLengthCut": {
           "type": "boolean",
           "default": true,
-          "description": "When true, a chat-completions response terminated by the provider output token cap (finish_reason=length) with no tool calls is continued once automatically: a continuation hint is appended and the model re-requested inside the same turn. Guards against providers whose default completion budget severs the tool_call section after the prose (half-finished tool calls). When false, the cut only surfaces as a transcript notice. The legacy snake_case spelling auto_continue_on_length_cut is parsed for compat but not schema-valid."
+          "description": "When true, a response terminated by the provider output token cap (chat-completions finish_reason=length, or the Responses API response.incomplete with incomplete_details.reason=max_output_tokens) with no tool calls is continued once automatically: a continuation hint is appended and the model re-requested inside the same turn. Guards against providers whose default completion budget severs the tool_call section after the prose (half-finished tool calls). When false, the cut only surfaces as a transcript notice. The legacy snake_case spelling auto_continue_on_length_cut is parsed for compat but not schema-valid."
         },
         "compaction": { "$ref": "#/$defs/CompactionSettings" }
       },

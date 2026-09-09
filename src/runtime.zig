@@ -237,6 +237,16 @@ pub const AgentRuntime = struct {
             .strict_outputs = config.strict_outputs orelse false,
             .context_settings = config.context,
         };
+        // The only other reader of diagnostics is the no-provider submit
+        // error, so a dropped config field (oversized systemPrompt / plugin
+        // settings, invalid model selection) would otherwise be invisible.
+        // Log each one: with the TUI up, warn routes to the toast bus.
+        for (diagnostics) |d| {
+            switch (d) {
+                .config_parse_error => |e| log.warn("config.diagnostic file={s} reason={s}", .{ e.path, e.reason }),
+                .bad_env_model => |raw| log.warn("config.diagnostic invalid OPENAI_MODEL={s}", .{raw}),
+            }
+        }
 
         // Load the models.dev registry (cache-only, no network) for model
         // capability lookups (reasoning, context window). The TUI's lazy
