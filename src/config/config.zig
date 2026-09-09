@@ -120,14 +120,15 @@ pub const ContextSettings = struct {
     /// TUI render a resumable notice. When false, the turn ends with
     /// `error.ToolCallLimit` as in previous releases.
     soft_stop_on_tool_call_limit: ?bool = null,
-    /// When true (default), a chat-completions response terminated by the
-    /// provider's output token cap (`finish_reason=length`) with no tool
-    /// calls is continued ONCE automatically: a continuation hint is
-    /// appended and the model re-requested inside the same turn. Providers
-    /// whose default completion budget severs the tool_call section after
-    /// the prose (half-finished tool calls) otherwise end the turn silently
-    /// as a text-only message. When false, the cut only surfaces as a
-    /// transcript notice.
+    /// When true (default), a response terminated by the provider's output
+    /// token cap (chat-completions `finish_reason=length`, or the Responses
+    /// API's `response.incomplete` with `incomplete_details.reason =
+    /// max_output_tokens`) with no tool calls is continued ONCE
+    /// automatically: a continuation hint is appended and the model
+    /// re-requested inside the same turn. Providers whose default completion
+    /// budget severs the tool_call section after the prose (half-finished
+    /// tool calls) otherwise end the turn silently as a text-only message.
+    /// When false, the cut only surfaces as a transcript notice.
     auto_continue_on_length_cut: ?bool = null,
     compaction: CompactionSettings = .{},
 };
@@ -162,9 +163,12 @@ pub const CompactionSettings = struct {
 pub const ToastSettings = struct {
     /// Master switch. When false, no toasts are shown.
     enabled: ?bool = null,
-    /// Auto-dismiss delay in milliseconds. Clamped to [500, 30000] at parse.
+    /// Auto-dismiss delay in milliseconds. Out-of-range values are dropped
+    /// (left null) at parse, not clamped — a typo can't produce a
+    /// never-dismissing toast. Valid band: [500, 30000].
     duration_ms: ?u32 = null,
-    /// Max toasts stacked at once. Clamped to [1, 5] at parse.
+    /// Max toasts stacked at once. Out-of-range values are dropped (left
+    /// null) at parse, not clamped. Valid band: [1, 5].
     max_visible: ?u8 = null,
     /// Corner position. Only "top-right" is supported today.
     position: ?[]u8 = null,
