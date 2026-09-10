@@ -75,6 +75,21 @@ pub fn clearConversation(app: *App) !void {
     app.thread.transcript_list.scroll = .{};
 }
 
+/// Append the intro splash logo — the ONLY production site. The splash is
+/// created exactly once per process, at startup: session switches
+/// deliberately leave a bare transcript (`/new` clears the conversation,
+/// `/resume` rebuilds from persisted agent messages — neither re-adds the
+/// logo), so the black-hole intro never returns after the first prompt.
+/// Do not call this from a session-switch path.
+///
+/// The logo message is a marker: the black-hole animation renders its frames
+/// directly (see tui/blackhole.zig), so the body is intentionally empty.
+pub fn appendStartupIntroLogo(app: *App) !void {
+    if (app.thread.transcript.messages.items.len == 0) {
+        _ = try app.thread.transcript.append(app.gpa, .logo, "logo", "");
+    }
+}
+
 pub fn rebuildTranscriptFromAgent(app: *App) !void {
     try clearConversation(app);
     for (app.thread.agent.?.messages()) |message| {

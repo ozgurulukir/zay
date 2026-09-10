@@ -33,6 +33,9 @@ pub const TranscriptWidget = struct {
     /// Write-back into `App.metrics.blackhole_visible` — see
     /// `updateBlackholeVisibility`.
     blackhole_visible: *bool,
+    /// The active input has text — the splash yields its rows while typing.
+    /// Computed at the construction site (INV-WIDGET-1 scalar).
+    splash_suppressed: bool = false,
 
     pub fn widget(self: *TranscriptWidget) vxfw.Widget {
         return .{
@@ -45,17 +48,25 @@ pub const TranscriptWidget = struct {
         const self: *TranscriptWidget = @ptrCast(@alignCast(ptr));
         self.syncViewport(ctx);
 
+        const messages = self.thread.transcript.messages.items;
+        // Splash-only state: the logo is the sole message and the user hasn't
+        // started typing, so the intro block centers in the viewport.
+        const splash_fills = messages.len == 1 and messages[0] == .logo and !self.splash_suppressed;
+
         var builder: MessageListBuilder = .{
             .arena = ctx.arena,
-            .messages = self.thread.transcript.messages.items,
+            .messages = messages,
             .selected = self.thread.transcript.selected,
             .loading_frame = self.loading_frame,
             .blackhole_frame = self.blackhole_frame,
             .gpa = self.gpa,
             .has_model_configured = self.has_model_configured,
+            .splash_fills_viewport = splash_fills,
+            .splash_viewport_height = self.thread.transcript_view_height,
+            .splash_suppressed = self.splash_suppressed,
         };
         self.thread.transcript_list.children = .{ .builder = .{ .userdata = &builder, .buildFn = MessageListBuilder.build } };
-        self.thread.transcript_list.item_count = @intCast(self.thread.transcript.messages.items.len);
+        self.thread.transcript_list.item_count = @intCast(messages.len);
         self.syncCursor(ctx);
 
         var list_padding: vxfw.Padding = .{
@@ -68,13 +79,15 @@ pub const TranscriptWidget = struct {
     }
 
     // The intro animation only runs while the startup logo (message 0) is the
-    // first item the list view is rendering. Once a turn pushes it off the top,
-    // `scroll.top` advances and the animation tick is allowed to stop.
+    // first item the list view is rendering and the user isn't typing. Once a
+    // turn pushes it off the top, `scroll.top` advances and the animation tick
+    // is allowed to stop.
     fn updateBlackholeVisibility(self: *TranscriptWidget) void {
         const messages = self.thread.transcript.messages.items;
         self.blackhole_visible.* = messages.len > 0 and
             messages[0] == .logo and
-            self.thread.transcript_list.scroll.top == 0;
+            self.thread.transcript_list.scroll.top == 0 and
+            !self.splash_suppressed;
     }
 
     fn syncViewport(self: *TranscriptWidget, ctx: vxfw.DrawContext) void {
@@ -126,6 +139,9 @@ pub const MessageListBuilder = struct {
     blackhole_frame: u16 = 0,
     gpa: std.mem.Allocator,
     has_model_configured: bool = false,
+    splash_fills_viewport: bool = false,
+    splash_viewport_height: u16 = 0,
+    splash_suppressed: bool = false,
 
     pub fn build(ptr: *const anyopaque, idx: usize, cursor: usize) ?vxfw.Widget {
         _ = cursor;
@@ -139,6 +155,9 @@ pub const MessageListBuilder = struct {
             .blackhole_frame = self.blackhole_frame,
             .gpa = self.gpa,
             .has_model_configured = self.has_model_configured,
+            .splash_fills_viewport = self.splash_fills_viewport,
+            .splash_viewport_height = self.splash_viewport_height,
+            .splash_suppressed = self.splash_suppressed,
         };
         return body.widget();
     }

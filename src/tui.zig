@@ -1131,6 +1131,10 @@ pub const App = struct {
         return transcript_lifecycle.clearConversation(self);
     }
 
+    pub fn appendStartupIntroLogo(self: *App) !void {
+        return transcript_lifecycle.appendStartupIntroLogo(self);
+    }
+
     pub fn rebuildTranscriptFromAgent(self: *App) !void {
         return transcript_lifecycle.rebuildTranscriptFromAgent(self);
     }
@@ -1263,14 +1267,9 @@ pub fn run(
     // Rebuild transcript from agent when resuming a session (the agent was
     // rehydrated with messages in runtime.zig initSession). For a new session
     // the rebuild is a no-op — agent only has system messages, which are
-    // skipped — so we fall through to the logo.
+    // skipped — so we fall through to the startup splash.
     try app.rebuildTranscriptFromAgent();
-    if (app.thread.transcript.messages.items.len == 0) {
-        // The logo message is a marker: the black-hole animation renders its
-        // frames directly (see tui/blackhole.zig), so the body is intentionally
-        // empty.
-        _ = try app.thread.transcript.append(gpa, .logo, "logo", "");
-    }
+    try app.appendStartupIntroLogo();
 
     app.metrics.git_label = diff_utils.loadGitLabel(gpa, init.io, runtime.cwd) catch "";
     _ = app.refreshDiffCounts() catch false;
