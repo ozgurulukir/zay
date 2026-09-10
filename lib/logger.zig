@@ -1,4 +1,4 @@
-//! Nova logger. Decouples the *sink* from the build mode.
+//! Zay logger. Decouples the *sink* from the build mode.
 //!
 //! Two sinks, gated independently:
 //!   - File sink: persistent trail, the background writer thread. **Debug only**
@@ -23,7 +23,7 @@ pub const enabled_file = builtin.mode == .Debug;
 const entry_count_max: u32 = 256;
 const entry_bytes_max: u32 = 16 * 1024;
 
-/// Default log-file rotation cap (10 MB), overridable via `NOVA_LOG_MAX_BYTES`.
+/// Default log-file rotation cap (10 MB), overridable via `ZAY_LOG_MAX_BYTES`.
 /// `pub` so the env fallback in `root.resolveMaxBytes` references the same
 /// value instead of re-typing it.
 pub const default_max_bytes: u64 = 10 * 1024 * 1024;
@@ -42,7 +42,7 @@ const State = struct {
     enabled_file: bool = false,
     stderr_ready: bool = false,
     stderr_level: std.log.Level = .warn,
-    /// True when `NOVA_LOG_STDERR_LEVEL` was explicitly set. When false and a
+    /// True when `ZAY_LOG_STDERR_LEVEL` was explicitly set. When false and a
     /// `toast_sink` is installed, warn+ routes to the toast instead of stderr
     /// (the TUI frame-tearing fix); when false and no sink, stderr keeps the
     /// default `warn` gate (headless/tests).
@@ -71,7 +71,7 @@ pub const Options = struct {
     log_path: []const u8,
     /// Min level emitted to the stderr sink. Defaults to `warn`.
     stderr_level: std.log.Level = .warn,
-    /// True when `stderr_level` came from `NOVA_LOG_STDERR_LEVEL` (an explicit
+    /// True when `stderr_level` came from `ZAY_LOG_STDERR_LEVEL` (an explicit
     /// user choice). When false and `toast_sink` is set, warn+ routes to the
     /// toast instead of stderr.
     stderr_explicit: bool = false,
@@ -108,10 +108,10 @@ pub fn init(options: Options) error{PathTooLong}!void {
     }
 }
 
-/// Single entry point for the `std.log` path (via `novaLog` in `main.zig`).
+/// Single entry point for the `std.log` path (via `zayLog` in `main.zig`).
 /// `level`/`scope_name` gate the stderr sink and travel into the file entry.
 pub fn dispatch(level: std.log.Level, scope_name: []const u8, comptime fmt: []const u8, args: anytype) void {
-    _ = scope_name; // scope already baked into `fmt` by novaLog's prefix
+    _ = scope_name; // scope already baked into `fmt` by zayLog's prefix
 
     // G-C1: pre-init / init-failed escape hatch. No io, no lock — direct raw
     // stderr so early failures (config load before init) are still visible.
@@ -138,7 +138,7 @@ pub fn dispatch(level: std.log.Level, scope_name: []const u8, comptime fmt: []co
         defer state.mutex.unlock(state.io);
 
         // Routing: warn+ goes to the toast sink when one is installed and the
-        // user did NOT explicitly set `NOVA_LOG_STDERR_LEVEL`. Otherwise it
+        // user did NOT explicitly set `ZAY_LOG_STDERR_LEVEL`. Otherwise it
         // goes to stderr (the operational channel). `std.log.Level` orders by
         // severity — err=0 < warn=1 < info=2 < debug=3 — so "warn and more
         // severe" is `<= .warn`, and "stderr_level and more severe" is `<=`.
@@ -240,7 +240,7 @@ fn writerThread() void {
 
     // P2: size-based rotation. Stat before opening; if the existing file
     // exceeds `max_bytes`, rename it to `<path>.1` — a SIBLING of the live
-    // log (a bare "nova.log.1" would resolve against the process cwd and
+    // log (a bare "zay.log.1" would resolve against the process cwd and
     // either fail EXDEV or dump the rotated file into the project dir) —
     // and start fresh. Done once at startup; rotation is a launch-time
     // decision.
@@ -370,7 +370,7 @@ test "dispatch before init does not crash and drops no queue entries" {
 
 test "stderr sink is level-gated and deinit flushes the dropped count" {
     const io = std.testing.io;
-    const capture_path = "nova_logger_stderr_capture.log";
+    const capture_path = "zay_logger_stderr_capture.log";
 
     // Point the swappable stderr writer at a temp file so the sink is
     // observable without touching the real fd 2.
@@ -417,7 +417,7 @@ test "stderr sink is level-gated and deinit flushes the dropped count" {
 
 test "toast sink receives warn+ when stderr is not explicit" {
     const io = std.testing.io;
-    const capture_path = "nova_logger_toast_capture.log";
+    const capture_path = "zay_logger_toast_capture.log";
     var capture = try std.Io.Dir.createFile(.cwd(), io, capture_path, .{});
     var capture_buf: [4096]u8 = undefined;
 
@@ -474,7 +474,7 @@ test "toast sink receives warn+ when stderr is not explicit" {
 
 test "explicit stderr level restores stderr alongside the toast sink" {
     const io = std.testing.io;
-    const capture_path = "nova_logger_toast_explicit_capture.log";
+    const capture_path = "zay_logger_toast_explicit_capture.log";
     var capture = try std.Io.Dir.createFile(.cwd(), io, capture_path, .{});
     var capture_buf: [4096]u8 = undefined;
 

@@ -121,10 +121,10 @@ Step risks:
 ## 9. Source Read Verification
 
 All claims verified by direct source reads (not graph-only):
-- `drawRoot` L39-L339 (339 lines) [verified]: `/home/aristo/Projects/nova-agent/src/tui/root_layout.zig`.
-- `submitMode` L200-L476 (276 lines) [verified]: `/home/aristo/Projects/nova-agent/src/tui/mode_lifecycle.zig`.
-- `spawnLane` L1190-L1380+ [verified]: `/home/aristo/Projects/nova-agent/src/tui/lane_lifecycle.zig`.
-- Inline tests L549-L915 [verified]: `/home/aristo/Projects/nova-agent/src/tui/mode_lifecycle.zig`.
+- `drawRoot` L39-L339 (339 lines) [verified]: `/home/aristo/Projects/zay/src/tui/root_layout.zig`.
+- `submitMode` L200-L476 (276 lines) [verified]: `/home/aristo/Projects/zay/src/tui/mode_lifecycle.zig`.
+- `spawnLane` L1190-L1380+ [verified]: `/home/aristo/Projects/zay/src/tui/lane_lifecycle.zig`.
+- Inline tests L549-L915 [verified]: `/home/aristo/Projects/zay/src/tui/mode_lifecycle.zig`.
 - `refuseOnIdleLane` L134 [verified], `closeRuntimeBoundOverlays` L159 [verified].
 - `root_layout.zig` imports and INV-WIDGET-1 comment [verified]: L1-L38.
 

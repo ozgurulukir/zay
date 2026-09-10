@@ -2,7 +2,7 @@
 //!
 //! Events are emitted by the agent loop (`Agent.ExecutorBridge`) at tool-call
 //! boundaries and dispatched to every plugin by `PluginManager.emitEvent`,
-//! which drains each plugin's `"nova_events"` Lua registry table.
+//! which drains each plugin's `"zay_events"` Lua registry table.
 
 const std = @import("std");
 const c = @import("c");

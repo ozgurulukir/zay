@@ -5,8 +5,8 @@
 //!      matching workspace/worktree paths across git's forward-slash reporting
 //!      and platform-native storage.
 //!   2. The platform-aware global config directory (`platformConfigDir`) —
-//!      the single base every global Nova path (config, worktrees, logs,
-//!      session DB) is derived from, so Windows maps to `%APPDATA%\nova`
+//!      the single base every global Zay path (config, worktrees, logs,
+//!      session DB) is derived from, so Windows maps to `%APPDATA%\zay`
 //!      consistently with the plugin-discovery probe.
 //!
 //! Extracted from `tui/lanes.zig` so the execution layer (`tools/pwsh.zig`,
@@ -20,7 +20,7 @@ const os = @import("os.zig");
 
 /// Final path segment, tolerant of both `/` and `\` separators and trailing
 /// slashes. Used to match worktree paths across git's forward-slash reporting
-/// and the platform-native paths Nova stores.
+/// and the platform-native paths Zay stores.
 pub fn lastPathSegment(path: []const u8) []const u8 {
     var end = path.len;
     while (end > 0 and (path[end - 1] == '/' or path[end - 1] == '\\')) end -= 1;
@@ -70,17 +70,17 @@ test "lastPathSegment: empty, trailing slashes, mixed separators, root" {
     try std.testing.expectEqualStrings("bar", lastPathSegment("/foo/bar"));
     try std.testing.expectEqualStrings("bar", lastPathSegment("/foo/bar/"));
     try std.testing.expectEqualStrings("bar", lastPathSegment("/foo\\bar\\"));
-    try std.testing.expectEqualStrings("worktrees", lastPathSegment("/home/nova/.config/nova/worktrees/"));
+    try std.testing.expectEqualStrings("worktrees", lastPathSegment("/home/zay/.config/zay/worktrees/"));
     try std.testing.expectEqualStrings("", lastPathSegment("/"));
     try std.testing.expectEqualStrings("", lastPathSegment("\\"));
-    try std.testing.expectEqualStrings("wt-1", lastPathSegment("C:\\Users\\nova\\worktrees\\wt-1"));
+    try std.testing.expectEqualStrings("wt-1", lastPathSegment("C:\\Users\\zay\\worktrees\\wt-1"));
     try std.testing.expectEqualStrings("repo", lastPathSegment("repo"));
 }
 
 test "pathsEqual: identical paths and separator permutations" {
     try std.testing.expect(pathsEqual("/foo/bar", "/foo/bar"));
-    try std.testing.expect(pathsEqual("C:/Users/nova/worktrees/1", "C:\\Users\\nova\\worktrees\\1"));
-    try std.testing.expect(pathsEqual("C:/Users//nova///worktrees/1", "C:\\Users\\nova\\worktrees\\1"));
+    try std.testing.expect(pathsEqual("C:/Users/zay/worktrees/1", "C:\\Users\\zay\\worktrees\\1"));
+    try std.testing.expect(pathsEqual("C:/Users//zay///worktrees/1", "C:\\Users\\zay\\worktrees\\1"));
     try std.testing.expect(pathsEqual("/foo/bar/", "/foo/bar"));
     try std.testing.expect(pathsEqual("C:\\repo\\", "C:/repo"));
     try std.testing.expect(pathsEqual("", ""));
@@ -103,14 +103,14 @@ test "pathsEqualInternal: Windows case-insensitivity control" {
 }
 
 /// Platform-aware global config directory — the single base from which every
-/// global Nova path (config.json, worktrees, nova.log, sessions.sqlite) is
+/// global Zay path (config.json, worktrees, zay.log, sessions.sqlite) is
 /// derived.
 ///
 /// Mirrors the plugin-discovery probe in `plugin_prompt.zig` (which already
-/// checks `%APPDATA%\Roaming\nova\plugins` first on Windows) so the whole
+/// checks `%APPDATA%\Roaming\zay\plugins` first on Windows) so the whole
 /// global tree stays inside one platform-correct root:
-///   - Windows: <USERPROFILE>/AppData/Roaming/nova   (== %APPDATA%\nova)
-///   - POSIX:   <home>/.config/nova                  (XDG base directory)
+///   - Windows: <USERPROFILE>/AppData/Roaming/zay   (== %APPDATA%\zay)
+///   - POSIX:   <home>/.config/zay                  (XDG base directory)
 ///
 /// Callers must pass a non-empty `home_dir`: the production caller
 /// (`root.zig`'s `resolveHome`) validates the env-derived value before it
@@ -120,9 +120,9 @@ test "pathsEqualInternal: Windows case-insensitivity control" {
 /// slice.
 pub fn platformConfigDir(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
     if (os.is_windows) {
-        return std.fs.path.join(gpa, &.{ home_dir, "AppData", "Roaming", "nova" });
+        return std.fs.path.join(gpa, &.{ home_dir, "AppData", "Roaming", "zay" });
     }
-    return std.fs.path.join(gpa, &.{ home_dir, ".config", "nova" });
+    return std.fs.path.join(gpa, &.{ home_dir, ".config", "zay" });
 }
 
 test "platformConfigDir: XDG under POSIX, APPDATA under Windows" {
@@ -132,23 +132,23 @@ test "platformConfigDir: XDG under POSIX, APPDATA under Windows" {
     const dir = try platformConfigDir(gpa, "HOME");
     defer gpa.free(dir);
 
-    // POSIX host: HOME/.config/nova ; Windows host: HOME/AppData/Roaming/nova.
+    // POSIX host: HOME/.config/zay ; Windows host: HOME/AppData/Roaming/zay.
     // Compare with pathsEqual (slash-agnostic) so the asserted suffix is stable
     // regardless of the host separator.
-    const want_suffix = if (os.is_windows) "AppData/Roaming/nova" else ".config/nova";
+    const want_suffix = if (os.is_windows) "AppData/Roaming/zay" else ".config/zay";
     const expected = try std.fmt.allocPrint(gpa, "HOME/{s}", .{want_suffix});
     defer gpa.free(expected);
     try std.testing.expect(pathsEqual(dir, expected));
 }
 
-test "platformConfigDir: appends the nova segment under the platform base" {
+test "platformConfigDir: appends the zay segment under the platform base" {
     const gpa = std.testing.allocator;
     const dir = try platformConfigDir(gpa, "PREFIX");
     defer gpa.free(dir);
-    // The trailing segment must always be `nova`, never a double separator.
-    try std.testing.expect(std.mem.endsWith(u8, dir, "nova"));
-    try std.testing.expect(!std.mem.endsWith(u8, dir, "nova/"));
-    try std.testing.expect(!std.mem.endsWith(u8, dir, "nova\\"));
+    // The trailing segment must always be `zay`, never a double separator.
+    try std.testing.expect(std.mem.endsWith(u8, dir, "zay"));
+    try std.testing.expect(!std.mem.endsWith(u8, dir, "zay/"));
+    try std.testing.expect(!std.mem.endsWith(u8, dir, "zay\\"));
 }
 
 test "platformConfigDir: rejects a path that drifts from the platform layout" {
@@ -159,14 +159,14 @@ test "platformConfigDir: rejects a path that drifts from the platform layout" {
     // (AppData/Roaming on Windows, .config on POSIX), never a typo'd variant.
     // pathsEqual is separator-agnostic, so assert the canonical suffix shape.
     const want_base = if (os.is_windows) "AppData/Roaming" else ".config";
-    const expected = try std.fmt.allocPrint(gpa, "HOME/{s}/nova", .{want_base});
+    const expected = try std.fmt.allocPrint(gpa, "HOME/{s}/zay", .{want_base});
     defer gpa.free(expected);
     try std.testing.expect(pathsEqual(dir, expected));
-    // The literal 'nova' must appear exactly once, as the final segment.
+    // The literal 'zay' must appear exactly once, as the final segment.
     var count: u32 = 0;
     var it = std.mem.splitScalar(u8, dir, if (os.is_windows) '\\' else '/');
     while (it.next()) |seg| {
-        if (std.mem.eql(u8, seg, "nova")) count += 1;
+        if (std.mem.eql(u8, seg, "zay")) count += 1;
     }
     try std.testing.expectEqual(count, 1);
 }

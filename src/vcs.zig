@@ -1,4 +1,4 @@
-//! Typed seam over git for Nova's "shadow history" — the automation layer that
+//! Typed seam over git for Zay's "shadow history" — the automation layer that
 //! lets a developer branch and rewind an agent's work without polluting the
 //! repo. Unlike the old jj-colocated approach, git HEAD stays *attached* to the
 //! user's branch and no automation commit ever lands on it:
@@ -6,7 +6,7 @@
 //!   - A snapshot stages the whole working tree into a **dedicated index**
 //!     (never the user's `.git/index`), writes a tree, and wraps it in a
 //!     **parentless commit**. `git log`, `git status`, and `git branch` are
-//!     untouched — the snapshot is reachable only through `refs/nova/*`.
+//!     untouched — the snapshot is reachable only through `refs/zay/*`.
 //!   - Restoring a snapshot rewrites the working tree to that tree (adds,
 //!     modifies, AND deletes tracked files), again without moving HEAD.
 //!   - `git add -A` honors `.gitignore`, so build artifacts stay out of
@@ -59,7 +59,7 @@ pub const ObjectId = struct {
 };
 
 /// A lane's relationship to the working tree. `.primary` is the repo's own
-/// working copy (the branch Nova launched on); `.working` is a parallel lane in
+/// working copy (the branch Zay launched on); `.working` is a parallel lane in
 /// its own `git worktree` on a dedicated branch. Lanes run in isolation, but a
 /// `.working` lane can be folded back into another lane with `merge` (`/merge`
 /// and `/lanes`): the source's branch is merged into the destination's worktree
@@ -69,7 +69,7 @@ pub const Lane = union(enum) {
     working: Working,
 
     pub const Working = struct {
-        /// The lane's branch, e.g. `nova/<id>`. Owned.
+        /// The lane's branch, e.g. `zay/<id>`. Owned.
         branch: []u8,
         /// Absolute path to the worktree directory. Owned.
         path: []u8,
@@ -270,11 +270,11 @@ fn currentEnv(gpa: std.mem.Allocator, io: std.Io) CmdError!std.process.Environ.M
     return platform.getEnvMap(gpa) catch error.OutOfMemory;
 }
 
-/// Resolve the path of Nova's dedicated snapshot index for `dir`. Uses
+/// Resolve the path of Zay's dedicated snapshot index for `dir`. Uses
 /// `git rev-parse --git-path` so the location is correct for both the main
 /// working copy and linked worktrees (each gets its own). Caller owns the slice.
 pub fn indexPath(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) CmdError![]u8 {
-    const raw = try runOut(gpa, io, dir, &.{ "rev-parse", "--git-path", "nova-index" }, null);
+    const raw = try runOut(gpa, io, dir, &.{ "rev-parse", "--git-path", "zay-index" }, null);
     defer gpa.free(raw);
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return error.GitBadOutput;
@@ -312,13 +312,13 @@ pub fn workingTreeId(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, index_
 
 /// Wrap `tree` in a parentless commit and return its id. `-c user.*` avoids
 /// depending on the user having a git identity configured (snapshots are
-/// Nova's, not the user's — unlike `/save`'s real commit).
+/// Zay's, not the user's — unlike `/save`'s real commit).
 pub fn commitTree(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, tree: ObjectId) CmdError!ObjectId {
     const commit_raw = try runOut(gpa, io, dir, &.{
-        "-c",          "user.name=nova",
-        "-c",          "user.email=nova@local",
+        "-c",          "user.name=zay",
+        "-c",          "user.email=zay@local",
         "commit-tree", tree.slice(),
-        "-m",          "nova snapshot",
+        "-m",          "zay snapshot",
     }, null);
     defer gpa.free(commit_raw);
     return ObjectId.parse(commit_raw);
@@ -411,7 +411,7 @@ pub const worktree_retention_days: u64 = 7;
 pub const worktree_retention_ns: u64 = worktree_retention_days * 24 * 60 * 60 * std.time.ns_per_s;
 
 /// Resolve the global worktree directory path.
-/// Platform-correct base: Windows -> %APPDATA%\nova/worktrees, POSIX -> ~/.config/nova/worktrees.
+/// Platform-correct base: Windows -> %APPDATA%\zay/worktrees, POSIX -> ~/.config/zay/worktrees.
 pub fn globalWorktreesDir(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
     const base = try paths.platformConfigDir(gpa, home_dir);
     errdefer gpa.free(base);
@@ -505,7 +505,7 @@ pub fn merge(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, branch: []cons
 }
 
 /// One entry from `git worktree list` — an absolute worktree `path` and the
-/// `branch` checked out there (short name, e.g. `nova/<id>`). Both owned.
+/// `branch` checked out there (short name, e.g. `zay/<id>`). Both owned.
 pub const WorktreeEntry = struct {
     path: []u8,
     branch: []u8,
@@ -521,7 +521,7 @@ pub const WorktreeEntry = struct {
 /// Parses `git worktree list --porcelain` (records separated by blank lines,
 /// `worktree <path>` + `branch refs/heads/<name>` lines). Detached or
 /// branchless worktrees are skipped. Backs `/lanes`, which filters to parked
-/// `nova/*` lanes. Caller owns the slice — free with `freeWorktreeList`.
+/// `zay/*` lanes. Caller owns the slice — free with `freeWorktreeList`.
 pub fn worktreeList(gpa: std.mem.Allocator, io: std.Io, repo_dir: []const u8) CmdError![]WorktreeEntry {
     const raw = try runOut(gpa, io, repo_dir, &.{ "worktree", "list", "--porcelain" }, null);
     defer gpa.free(raw);
@@ -558,21 +558,21 @@ pub fn freeWorktreeList(gpa: std.mem.Allocator, entries: []WorktreeEntry) void {
     gpa.free(entries);
 }
 
-/// Point a `refs/nova/<name>` ref at `sha` so the snapshot survives `git gc`.
+/// Point a `refs/zay/<name>` ref at `sha` so the snapshot survives `git gc`.
 /// `name` must be a ref-safe path segment (the caller passes a session/entry id).
 pub fn keepRef(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8, sha: ObjectId) CmdError!void {
-    const ref = std.fmt.allocPrint(gpa, "refs/nova/{s}", .{name}) catch return error.OutOfMemory;
+    const ref = std.fmt.allocPrint(gpa, "refs/zay/{s}", .{name}) catch return error.OutOfMemory;
     defer gpa.free(ref);
     var out = try run(gpa, io, dir, &.{ "update-ref", ref, sha.slice() }, null);
     defer out.deinit(gpa);
     if (out.code != 0) return error.GitCommandFailed;
 }
 
-/// Drop a `refs/nova/<name>` ref (e.g. when pruning an abandoned timeline
+/// Drop a `refs/zay/<name>` ref (e.g. when pruning an abandoned timeline
 /// branch). The underlying objects become unreachable and are collected by a
 /// later `git gc`. Missing ref is not an error.
 pub fn dropRef(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8) CmdError!void {
-    const ref = std.fmt.allocPrint(gpa, "refs/nova/{s}", .{name}) catch return error.OutOfMemory;
+    const ref = std.fmt.allocPrint(gpa, "refs/zay/{s}", .{name}) catch return error.OutOfMemory;
     defer gpa.free(ref);
     var out = try run(gpa, io, dir, &.{ "update-ref", "-d", ref }, null);
     defer out.deinit(gpa);
@@ -608,7 +608,7 @@ test "git shadow: snapshot ignores artifacts, restore adds/deletes, HEAD stays c
     var rand: [8]u8 = undefined;
     io.random(&rand);
     const hex = std.fmt.bytesToHex(rand, .lower);
-    const name = try std.fmt.allocPrint(gpa, "nova-vcstest-{s}", .{hex[0..]});
+    const name = try std.fmt.allocPrint(gpa, "zay-vcstest-{s}", .{hex[0..]});
     defer gpa.free(name);
 
     try std.Io.Dir.cwd().createDirPath(io, name);
@@ -694,7 +694,7 @@ test "workingTreeDirty: false on clean tree, true after edits" {
     var rand: [8]u8 = undefined;
     io.random(&rand);
     const hex = std.fmt.bytesToHex(rand, .lower);
-    const name = try std.fmt.allocPrint(gpa, "nova-dirtytest-{s}", .{hex[0..]});
+    const name = try std.fmt.allocPrint(gpa, "zay-dirtytest-{s}", .{hex[0..]});
     defer gpa.free(name);
 
     try std.Io.Dir.cwd().createDirPath(io, name);
@@ -749,7 +749,7 @@ test "worktree lanes: list finds lane branches, merge folds one in, conflict rol
     var rand: [8]u8 = undefined;
     io.random(&rand);
     const hex = std.fmt.bytesToHex(rand, .lower);
-    const name = try std.fmt.allocPrint(gpa, "nova-mergetest-{s}", .{hex[0..]});
+    const name = try std.fmt.allocPrint(gpa, "zay-mergetest-{s}", .{hex[0..]});
     defer gpa.free(name);
 
     try std.Io.Dir.cwd().createDirPath(io, name);
@@ -775,8 +775,8 @@ test "worktree lanes: list finds lane branches, merge folds one in, conflict rol
     defer gpa.free(dest);
     const src = try std.fs.path.join(gpa, &.{ repo, "wt-src" });
     defer gpa.free(src);
-    try worktreeAdd(gpa, io, repo, dest, "nova/dest");
-    try worktreeAdd(gpa, io, repo, src, "nova/src");
+    try worktreeAdd(gpa, io, repo, dest, "zay/dest");
+    try worktreeAdd(gpa, io, repo, src, "zay/src");
 
     // worktreeList reports both lane branches.
     {
@@ -785,19 +785,19 @@ test "worktree lanes: list finds lane branches, merge folds one in, conflict rol
         var saw_src = false;
         var saw_dest = false;
         for (list) |entry| {
-            if (std.mem.eql(u8, entry.branch, "nova/src")) saw_src = true;
-            if (std.mem.eql(u8, entry.branch, "nova/dest")) saw_dest = true;
+            if (std.mem.eql(u8, entry.branch, "zay/src")) saw_src = true;
+            if (std.mem.eql(u8, entry.branch, "zay/dest")) saw_dest = true;
         }
         try std.testing.expect(saw_src and saw_dest);
     }
 
-    // Non-conflicting work on the source lane; commit it onto nova/src.
+    // Non-conflicting work on the source lane; commit it onto zay/src.
     try writeFileRel(io, name, "wt-src/feature.txt", "feature\n");
     try expectOk(gpa, io, src, &.{ "add", "-A" });
     try expectOk(gpa, io, src, &.{ "commit", "-qm", "feat" });
 
     // Merge folds the source lane's file into the destination worktree.
-    try std.testing.expectEqual(MergeOutcome.ok, try merge(gpa, io, dest, "nova/src"));
+    try std.testing.expectEqual(MergeOutcome.ok, try merge(gpa, io, dest, "zay/src"));
     {
         const merged = try showFile(gpa, io, dest, "HEAD", "feature.txt");
         defer gpa.free(merged);
@@ -809,7 +809,7 @@ test "worktree lanes: list finds lane branches, merge folds one in, conflict rol
     try expectOk(gpa, io, src, &.{ "commit", "-aqm", "src edit" });
     try writeFileRel(io, name, "wt-dest/base.txt", "dest-change\n");
     try expectOk(gpa, io, dest, &.{ "commit", "-aqm", "dest edit" });
-    try std.testing.expectEqual(MergeOutcome.conflict, try merge(gpa, io, dest, "nova/src"));
+    try std.testing.expectEqual(MergeOutcome.conflict, try merge(gpa, io, dest, "zay/src"));
 
     // The abort left the destination exactly as it was — no half-merge.
     const restored = try showFile(gpa, io, dest, "HEAD", "base.txt");
@@ -825,7 +825,7 @@ test "worktreePrune executes cleanly on empty or populated repo" {
     var rand: [8]u8 = undefined;
     io.random(&rand);
     const hex = std.fmt.bytesToHex(rand, .lower);
-    const name = try std.fmt.allocPrint(gpa, "nova-vcsprune-{s}", .{hex[0..]});
+    const name = try std.fmt.allocPrint(gpa, "zay-vcsprune-{s}", .{hex[0..]});
     defer gpa.free(name);
 
     try std.Io.Dir.cwd().createDirPath(io, name);
@@ -846,7 +846,7 @@ test "worktreePrune executes cleanly on empty or populated repo" {
     const wt_dir = try std.fs.path.join(gpa, &.{ cwd, wt_name });
     defer gpa.free(wt_dir);
 
-    try worktreeAdd(gpa, io, repo, wt_dir, "nova/orphaned");
+    try worktreeAdd(gpa, io, repo, wt_dir, "zay/orphaned");
     try std.Io.Dir.cwd().deleteTree(io, wt_name);
 
     try worktreePrune(gpa, io, repo);
@@ -854,7 +854,7 @@ test "worktreePrune executes cleanly on empty or populated repo" {
     const wts = try worktreeList(gpa, io, repo);
     defer freeWorktreeList(gpa, wts);
     for (wts) |wt| {
-        try std.testing.expect(!std.mem.eql(u8, wt.branch, "nova/orphaned"));
+        try std.testing.expect(!std.mem.eql(u8, wt.branch, "zay/orphaned"));
     }
 }
 
@@ -865,7 +865,7 @@ test "gcWorktreesDir prunes old directories and leaves recent directories untouc
     var rand: [8]u8 = undefined;
     io.random(&rand);
     const hex = std.fmt.bytesToHex(rand, .lower);
-    const name = try std.fmt.allocPrint(gpa, "nova-vcsgc-{s}", .{hex[0..]});
+    const name = try std.fmt.allocPrint(gpa, "zay-vcsgc-{s}", .{hex[0..]});
     defer gpa.free(name);
 
     try std.Io.Dir.cwd().createDirPath(io, name);

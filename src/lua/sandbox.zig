@@ -12,7 +12,7 @@ const platform = @import("platform");
 
 /// Permissions granted to a plugin.
 pub const Permissions = struct {
-    /// Advisory: the `nova.*` bridge is always sandboxed and `io.*`/`socket.*`
+    /// Advisory: the `zay.*` bridge is always sandboxed and `io.*`/`socket.*`
     /// are never exposed, so this field gates nothing today. Kept for forward
     /// compatibility; do not rely on it to grant or deny access.
     file_access: bool = false,
@@ -99,7 +99,7 @@ pub fn resetInstructionBudget(L: *c.lua_State) void {
 
 /// Create a new sandboxed Lua state with restricted permissions.
 /// `io` is optional — when provided, plugin API functions (read_file, etc.)
-/// are registered in the `nova` table. When undefined, only the sandboxed
+/// are registered in the `zay` table. When undefined, only the sandboxed
 /// environment is created (for test runners that don't have a real Io).
 /// Caller owns the returned State and must call `deinit`.
 pub fn createSandboxedState(permissions: Permissions) !State {
@@ -121,7 +121,7 @@ pub fn createSandboxedStateWithIo(permissions: Permissions, io: ?std.Io) error{ 
     if (io != null) {
         const io_storage = @as(*std.Io, @ptrCast(@alignCast(c.lua_newuserdata(L, @sizeOf(std.Io)))));
         io_storage.* = io.?;
-        c.lua_setfield(L, c.LUA_REGISTRYINDEX, "nova_io");
+        c.lua_setfield(L, c.LUA_REGISTRYINDEX, "zay_io");
         registerPluginApi(L);
     }
 
@@ -143,9 +143,9 @@ pub fn createSandboxedStateWithIo(permissions: Permissions, io: ?std.Io) error{ 
 /// the Lua GC, so the manager keeps no ownership of the stored value; the
 /// string is re-parsed per `plugin.get_config()` call, yielding a fresh table
 /// whose mutation cannot corrupt the stored settings.
-pub const settings_registry_key = "nova_plugin_settings";
+pub const settings_registry_key = "zay_plugin_settings";
 
-/// Register the `plugin` global table (`plugin.get_config`). Like `nova`, it is
+/// Register the `plugin` global table (`plugin.get_config`). Like `zay`, it is
 /// set on the real _G AND copied into the restricted environment — full-access
 /// states never swap _G, so a copy-only registration would hide the table from
 /// embedded plugins and the Lua test runner.
@@ -156,15 +156,15 @@ fn registerPluginTable(L: *c.lua_State) void {
     c.lua_setglobal(L, "plugin");
 }
 
-/// Register Nova plugin API functions into the `nova` global table.
+/// Register Zay plugin API functions into the `zay` global table.
 /// These are safe C functions that plugins can call instead of blocked
 /// libraries like `io.*`.
 fn registerPluginApi(L: *c.lua_State) void {
     // Initialize module cache in registry
     c.lua_newtable(L);
-    c.lua_setfield(L, c.LUA_REGISTRYINDEX, "nova_loaded_modules");
+    c.lua_setfield(L, c.LUA_REGISTRYINDEX, "zay_loaded_modules");
 
-    // Create the nova table
+    // Create the zay table
     c.lua_newtable(L);
 
     // Register each function
@@ -205,8 +205,8 @@ fn registerPluginApi(L: *c.lua_State) void {
         c.lua_setfield(L, -2, f.name.ptr);
     }
 
-    // Set nova as a global
-    c.lua_setglobal(L, "nova");
+    // Set zay as a global
+    c.lua_setglobal(L, "zay");
 }
 
 /// Create a restricted global environment by replacing _G with a new table
@@ -241,8 +241,8 @@ fn createRestrictedEnvironment(L: *c.lua_State, permissions: Permissions) void {
     copyGlobal(L, env_index, "coroutine");
     copyGlobal(L, env_index, "utf8");
 
-    // Copy the Nova plugin API table so plugins can call nova.register_tool, etc.
-    copyGlobal(L, env_index, "nova");
+    // Copy the Zay plugin API table so plugins can call zay.register_tool, etc.
+    copyGlobal(L, env_index, "zay");
     // And the plugin table (plugin.get_config) beside it.
     copyGlobal(L, env_index, "plugin");
 

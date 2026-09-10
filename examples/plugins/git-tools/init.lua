@@ -1,17 +1,17 @@
 -- init.lua — Git Tools
 -- Registers git_status / git_diff / git_log / git_branch / git_commit. These
--- wrap Nova's git bridge functions. The behavioral guidance (when to commit,
+-- wrap Zay's git bridge functions. The behavioral guidance (when to commit,
 -- what to inspect first) lives in prompt.md, not in code.
 
 -- ── git_status ──────────────────────────────────────────────────────
 
-nova.register_tool({
+zay.register_tool({
   name = "git_status",
   description = "Show the current branch and working tree status (porcelain format). Use this before proposing changes or a commit to see what is modified, staged, or untracked.",
   parameters = {},
   handler = function()
-    local branch = nova.git_branch()
-    local status = nova.git_status()
+    local branch = zay.git_branch()
+    local status = zay.git_status()
     if status == nil then
       return "Error: not a git repository (or git failed)"
     end
@@ -33,7 +33,7 @@ nova.register_tool({
 
 -- ── git_diff ────────────────────────────────────────────────────────
 
-nova.register_tool({
+zay.register_tool({
   name = "git_diff",
   description = "Show uncommitted changes (git diff). Pass a path to diff a specific file; omit for all changes. Use this to review what changed before committing.",
   parameters = {
@@ -44,7 +44,7 @@ nova.register_tool({
     },
   },
   handler = function(params)
-    local diff = nova.git_diff(params.path)
+    local diff = zay.git_diff(params.path)
     if diff == nil then
       return "Error: git diff failed"
     end
@@ -57,7 +57,7 @@ nova.register_tool({
 
 -- ── git_log ─────────────────────────────────────────────────────────
 
-nova.register_tool({
+zay.register_tool({
   name = "git_log",
   description = "Show recent commit history. Use this to understand recent work and to match the project's existing commit message style before writing a new commit.",
   parameters = {
@@ -74,7 +74,7 @@ nova.register_tool({
     if type(n) ~= "number" or n < 1 or n > 1000 or math.floor(n) ~= n then
       n = 10
     end
-    local log = nova.git_log(n)
+    local log = zay.git_log(n)
     if log == nil then
       return "Error: git log failed"
     end
@@ -91,12 +91,12 @@ nova.register_tool({
 
 -- ── git_branch ──────────────────────────────────────────────────────
 
-nova.register_tool({
+zay.register_tool({
   name = "git_branch",
   description = "Show the current branch name. Lightweight; use this when you only need the branch, not the full status.",
   parameters = {},
   handler = function()
-    local branch = nova.git_branch()
+    local branch = zay.git_branch()
     if branch == nil then
       return "Error: could not determine branch (not a git repository?)"
     end
@@ -106,7 +106,7 @@ nova.register_tool({
 
 -- ── git_add ─────────────────────────────────────────────────────────
 
-nova.register_tool({
+zay.register_tool({
   name = "git_add",
   description = "Stage specific file(s) for the next commit. Always stage only the intended modified files rather than staging untracked or scratch files.",
   parameters = {
@@ -119,7 +119,7 @@ nova.register_tool({
     if not params.files or params.files == "" then
       return "Error: files parameter is required"
     end
-    local result = nova.git_add(params.files)
+    local result = zay.git_add(params.files)
     if result == nil then
       return "Error: git add failed"
     end
@@ -132,9 +132,9 @@ nova.register_tool({
 
 -- ── git_commit ──────────────────────────────────────────────────────
 
-nova.register_tool({
+zay.register_tool({
   name = "git_commit",
-  description = "Create a git commit with the given message. Can commit specific files, only staged changes, or all changes (with stage_all). IMPORTANT: only commit when the user explicitly asks, except lane work — when working in a Nova lane, commit your lane changes with a real message before `lane merge`. Before committing, inspect git_status and git_diff, stage only intended files, and never commit secrets. If a commit fails (e.g. hooks reject it), fix the issue and create a new commit — do not amend the failed commit.",
+  description = "Create a git commit with the given message. Can commit specific files, only staged changes, or all changes (with stage_all). IMPORTANT: only commit when the user explicitly asks, except lane work — when working in a Zay lane, commit your lane changes with a real message before `lane merge`. Before committing, inspect git_status and git_diff, stage only intended files, and never commit secrets. If a commit fails (e.g. hooks reject it), fix the issue and create a new commit — do not amend the failed commit.",
   parameters = {
     message = {
       type = "string",
@@ -164,7 +164,7 @@ nova.register_tool({
       opts.staged_only = true
     end
 
-    local result = nova.git_commit(params.message, opts)
+    local result = zay.git_commit(params.message, opts)
     if result == nil then
       return "Error: git commit failed"
     end

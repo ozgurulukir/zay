@@ -16,9 +16,9 @@ const App = tui.App;
 pub fn addIdleFocusedLane(gpa: std.mem.Allocator, app: *App, id: []const u8) !void {
     const lane = try gpa.create(tui.Thread);
     errdefer gpa.destroy(lane);
-    const branch = try std.fmt.allocPrint(gpa, "nova/{s}", .{id});
+    const branch = try std.fmt.allocPrint(gpa, "zay/{s}", .{id});
     errdefer gpa.free(branch);
-    const path = try std.fmt.allocPrint(gpa, "/tmp/nova-lanes/{s}", .{id});
+    const path = try std.fmt.allocPrint(gpa, "/tmp/zay-lanes/{s}", .{id});
     errdefer gpa.free(path);
     lane.* = .{ .engine = .{ .idle = .{ .working = .{ .branch = branch, .path = path } } } };
     try app.threads.append(lane);

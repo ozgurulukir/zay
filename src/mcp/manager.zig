@@ -1,4 +1,4 @@
-//! McpManager — Multi-server MCP supervisor and tool aggregator for Nova Agent.
+//! McpManager — Multi-server MCP supervisor and tool aggregator for Zay Agent.
 
 const std = @import("std");
 const log = std.log.scoped(.mcp);

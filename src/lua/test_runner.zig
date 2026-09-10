@@ -1,4 +1,4 @@
-//! Lua test runner for Nova plugins.
+//! Lua test runner for Zay plugins.
 //!
 //! Loads the test_runner.lua library, then loads and runs Lua test files.
 //! Each test file is executed in a sandboxed Lua state with the test_runner

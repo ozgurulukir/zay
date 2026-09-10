@@ -5,13 +5,13 @@
 --      interpolated BARE into a `bash -c` string, so a `|` was parsed as a
 --      shell pipe (rg's output went to a nonexistent command and the search
 --      silently returned 0). The fix quotes every dynamic value.
---   2. Backend routing. Substring (default) must use Nova's built-in
+--   2. Backend routing. Substring (default) must use Zay's built-in
 --      search_files (self-contained, no rg); only regex=true shells out to rg.
 --
--- The `nova` bridge is mocked so the handler runs without a live Nova runtime.
+-- The `zay` bridge is mocked so the handler runs without a live Zay runtime.
 local test = test_runner
 
--- ── Mock the nova bridge, then load the plugin ──────────────────────
+-- ── Mock the zay bridge, then load the plugin ──────────────────────
 local registered = {}
 local last_bash = nil
 local bash_reply = nil
@@ -22,7 +22,7 @@ local search_reply = nil
 -- it defaults to "directory" (the common case).
 local file_info_types = {}
 
-nova = {
+zay = {
   register_tool = function(tool)
     registered[tool.name] = tool
   end,
@@ -108,8 +108,8 @@ test.describe("grep regex command construction", function()
     local is_win = false
     if type(package) == "table" and type(package.config) == "string" then
       is_win = (package.config:sub(1, 1) == "\\")
-    elseif type(nova) == "table" and type(nova.get_env) == "function" then
-      is_win = (nova.get_env("OS") == "Windows_NT")
+    elseif type(zay) == "table" and type(zay.get_env) == "function" then
+      is_win = (zay.get_env("OS") == "Windows_NT")
     end
     if is_win then
       test.assert.contains([['it''s|that']], last_bash.cmd)
@@ -305,7 +305,7 @@ test.describe("glob file-path gating", function()
     file_info_types["src/skill.zig"] = "file"
     -- Mock find_files to return two candidates; the handler must keep only the
     -- one whose basename matches the restriction.
-    nova.find_files = function(root, pattern, opts)
+    zay.find_files = function(root, pattern, opts)
       return {
         root = root,
         total_matches = 2,
@@ -322,7 +322,7 @@ test.describe("glob file-path gating", function()
   end)
 
   test.it("keeps directory-path `path` behavior unchanged (regression)", function()
-    nova.find_files = function(root, pattern, opts)
+    zay.find_files = function(root, pattern, opts)
       return {
         root = root,
         total_matches = 1,
@@ -369,14 +369,14 @@ test.describe("resolve_search_root gating", function()
 
   test.it("falls back to the path unchanged when file_info errors", function()
     reset()
-    local orig = nova.file_info
-    nova.file_info = function() error("boom") end
+    local orig = zay.file_info
+    zay.file_info = function() error("boom") end
     -- With file_info throwing, the pcall guard keeps the file path as root and
     -- does NOT add a restriction (handler must still not crash).
     local ok, _ = pcall(function()
       grep.handler({ pattern = "x", path = "src/skill.zig" })
     end)
-    nova.file_info = orig
+    zay.file_info = orig
     test.assert.is_true(ok)
   end)
 end)

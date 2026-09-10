@@ -1,12 +1,12 @@
-# Releasing Nova
+# Releasing Zay
 
-Nova ships as a single Zig binary. Cutting a release is a one-command operation:
+Zay ships as a single Zig binary. Cutting a release is a one-command operation:
 tag the commit and push the tag — GitHub Actions does the rest.
 
 ## Versioning
 
 The version is the **git tag** (the single source of truth). It is embedded into
-the binary at build time and surfaced by `nova --version` and the settings
+the binary at build time and surfaced by `zay --version` and the settings
 panel's About tab.
 
 - **Release builds** (`.github/workflows/release.yml`) pass `-Dversion=<tag>`
@@ -15,7 +15,7 @@ panel's About tab.
   (e.g. `v0.3.0-5-g338b78c-dirty`), or `dev` when git is unavailable or
   the directory is not a repo.
 
-`nova --version` prints `nova <version>` and exits.
+`zay --version` prints `zay <version>` and exits.
 
 ## Cutting a release
 
@@ -44,22 +44,23 @@ git push origin v0.3.1-beta.1
 
 ## What the workflow produces
 
-- `nova-linux-x86_64` + `nova-linux-x86_64.sha256`
-- `nova-windows-x86_64.exe` + `nova-windows-x86_64.exe.sha256`
+- `zay-linux-x86_64` + `zay-linux-x86_64.sha256`
+- `zay-windows-x86_64.exe` + `zay-windows-x86_64.exe.sha256`
+- `zay-macos-aarch64` + `zay-macos-aarch64.sha256` (Apple Silicon; built on `macos-latest`)
 
 Verify a downloaded asset with:
 
 ```bash
-sha256sum -c nova-linux-x86_64.sha256
-./nova-linux-x86_64 --version   # prints the tag
+sha256sum -c zay-linux-x86_64.sha256
+./zay-linux-x86_64 --version   # prints the tag
 ```
 
 ## One-Line Installers
 
 Users can install the latest release directly via the root installer scripts:
 
-- **Linux / macOS:** `curl -fsSL https://raw.githubusercontent.com/ozgurulukir/nova-agent/main/install.sh | bash`
-- **Windows (PowerShell):** `irm https://raw.githubusercontent.com/ozgurulukir/nova-agent/main/install.ps1 | iex`
+- **Linux / macOS:** `curl -fsSL https://raw.githubusercontent.com/ozgurulukir/zay/main/install.sh | bash`
+- **Windows (PowerShell):** `irm https://raw.githubusercontent.com/ozgurulukir/zay/main/install.ps1 | iex`
 
 The scripts automatically download the platform binary, verify the SHA256 checksum, place it in the user's PATH, and make it executable.
 

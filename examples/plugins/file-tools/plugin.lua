@@ -4,7 +4,7 @@
 return {
   name = "file-tools",
   version = "1.0.0",
-  author = "Nova",
+  author = "Zay",
   description = "Read, write, edit, and list files safely",
   license = "MIT",
   permissions = {

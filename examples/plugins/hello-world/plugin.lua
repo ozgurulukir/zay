@@ -2,7 +2,7 @@
 return {
   name = "hello-world",
   version = "1.0.0",
-  author = "Nova",
+  author = "Zay",
   description = "A minimal example plugin that registers a greeting tool",
   license = "MIT",
   permissions = {

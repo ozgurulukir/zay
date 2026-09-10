@@ -4,13 +4,13 @@
 //!   1. Builtin providers (OpenAI Codex OAuth, OpenRouter, Cerebras, etc.)
 //!      defined as a comptime constant in this file.
 //!   2. `https://models.dev/api.json` — fetched on demand, cached to
-//!      `~/.config/nova/cache/models.dev/api.json` with a 24-hour TTL.
+//!      `~/.config/zay/cache/models.dev/api.json` with a 24-hour TTL.
 //!
 //! Builtin providers always take precedence: when a models.dev provider
 //! shares an id with a builtin, the builtin wins (its base_url, adapter,
 //! and metadata are authoritative). The models.dev registry fills in
 //! every other provider that exposes an `api` base URL — this is the
-//! ground-truth signal that the endpoint can be driven by Nova's
+//! ground-truth signal that the endpoint can be driven by Zay's
 //! `openai_compatible` adapter, regardless of npm package.
 //!
 //! Callers get a flat `[]Provider` slice. The first entry is always the
@@ -224,7 +224,7 @@ fn loadRegistryImpl(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, al
     }
 
     // All network and cache sources failed — try the vendored snapshot
-    // installed alongside the binary at <prefix>/share/nova/api.json.
+    // installed alongside the binary at <prefix>/share/zay/api.json.
     // Skip when home_dir is empty (test environments without a real io).
     if (home_dir.len > 0) {
         if (loadVendored(gpa, io)) |vendored| {
@@ -408,7 +408,7 @@ fn lookupBuiltin(builtins: []const Provider, id: []const u8) ?Provider {
 
 // ── HTTP fetch ──
 
-const fetch_user_agent = "nova-agent/1.0 (models.dev registry fetcher)";
+const fetch_user_agent = "zay/1.0 (models.dev registry fetcher)";
 
 fn fetchApiJson(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
@@ -473,7 +473,7 @@ fn cacheApiJson(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, bytes:
 }
 
 fn cacheDir(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
-    return std.fs.path.join(gpa, &.{ home_dir, ".config", "nova", "cache", cache_subdir });
+    return std.fs.path.join(gpa, &.{ home_dir, ".config", "zay", "cache", cache_subdir });
 }
 
 fn cachePath(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
@@ -495,7 +495,7 @@ const VendoredResult = struct {
 };
 
 /// Load the vendored api.json installed alongside the binary at
-/// `<prefix_dir>/share/nova/api.json` (where prefix_dir is the parent of exe_dir). Returns an error when the file is
+/// `<prefix_dir>/share/zay/api.json` (where prefix_dir is the parent of exe_dir). Returns an error when the file is
 /// missing or the executable path cannot be resolved.
 fn loadVendored(gpa: std.mem.Allocator, io: std.Io) !VendoredResult {
     const exe_path = std.process.executablePathAlloc(io, gpa) catch
@@ -503,7 +503,7 @@ fn loadVendored(gpa: std.mem.Allocator, io: std.Io) !VendoredResult {
     defer gpa.free(exe_path);
     const exe_dir = std.fs.path.dirname(exe_path) orelse return error.FileNotFound;
     const prefix_dir = std.fs.path.dirname(exe_dir) orelse return error.FileNotFound;
-    const vendored_path = try std.fs.path.join(gpa, &.{ prefix_dir, "share", "nova", "api.json" });
+    const vendored_path = try std.fs.path.join(gpa, &.{ prefix_dir, "share", "zay", "api.json" });
     defer gpa.free(vendored_path);
 
     const file = std.Io.Dir.openFile(.cwd(), io, vendored_path, .{}) catch |err| switch (err) {
@@ -542,7 +542,7 @@ fn parseModelsDevJson(gpa: std.mem.Allocator, bytes: []const u8) !Registry {
 
         // Include any provider that exposes an api base URL and at least
         // one model. The `api` field is the ground-truth signal that the
-        // endpoint can be driven by Nova's openai_compatible adapter;
+        // endpoint can be driven by Zay's openai_compatible adapter;
         // npm package identity is irrelevant for connectivity.
         const api_field = kv.value_ptr.object.get("api") orelse continue;
         if (api_field != .string) continue;

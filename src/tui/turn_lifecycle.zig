@@ -175,7 +175,7 @@ pub fn formatNoProviderMessage(app: *App) ![]u8 {
         if (p.adapter() == null) {
             return std.fmt.allocPrint(
                 app.gpa,
-                "Provider '{s}' is not yet supported in Nova.",
+                "Provider '{s}' is not yet supported in Zay.",
                 .{p.label()},
             );
         }

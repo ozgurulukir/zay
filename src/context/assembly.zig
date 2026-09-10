@@ -1,6 +1,6 @@
 //! context_assembly.zig — Professional Coding Agent Context Assembly Engine
 //!
-//! Provides state-of-the-art context assembly for Nova Agent:
+//! Provides state-of-the-art context assembly for Zay Agent:
 //!   1. Dynamic Environment & Repository Context Injection (CWD, OS, Git Branch/Status, Date).
 //!   2. Multi-convention Project Rule Ingestion (AGENTS.md, .cursorrules, CLAUDE.md, CONVENTIONS.md).
 //!   3. Historical Tool Result Pruning (Context Compression for Active Turns): Keeps recent tool outputs
@@ -748,7 +748,7 @@ test "pruneHistoricalToolResultsViews preserves the bash spill recovery footer" 
     // A truncated bash observation whose tail carries the spill footer. The
     // footer is the model's only handle to re-read the full spill on disk, so
     // the head+tail sandwich must keep it (it sits inside the preserved tail).
-    const spill_path = "/tmp/nova-bash-0123456789abcdef.log";
+    const spill_path = "/tmp/zay-bash-0123456789abcdef.log";
     const body = "a" ** 4000;
     const obs = try std.fmt.allocPrint(
         gpa,
@@ -1005,9 +1005,9 @@ test "prompt contract: handover prompt includes summary placeholder and provenan
 
 test "substituteBaseTemplate replaces CWD OS and DATE in one pass" {
     const gpa = std.testing.allocator;
-    const rendered = try substituteBaseTemplate(gpa, "cwd=${CWD} os=${OS} date=${DATE}", "/home/nova", "2026-08-04");
+    const rendered = try substituteBaseTemplate(gpa, "cwd=${CWD} os=${OS} date=${DATE}", "/home/zay", "2026-08-04");
     defer gpa.free(rendered);
-    try std.testing.expectEqualStrings("cwd=/home/nova os=" ++ os.label ++ " date=2026-08-04", rendered);
+    try std.testing.expectEqualStrings("cwd=/home/zay os=" ++ os.label ++ " date=2026-08-04", rendered);
 }
 
 test "substituteBaseTemplate preserves a cwd containing a literal placeholder" {

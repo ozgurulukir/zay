@@ -2,7 +2,7 @@
 return {
   name = "search-tools",
   version = "1.0.0",
-  author = "Nova",
+  author = "Zay",
   description = "Grep file contents and glob for files by name",
   license = "MIT",
   permissions = {

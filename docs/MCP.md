@@ -1,6 +1,6 @@
 # Model Context Protocol (MCP) Integration Guide
 
-Nova Agent features production-grade support for the **Model Context Protocol (MCP)**,
+Zay Agent features production-grade support for the **Model Context Protocol (MCP)**,
 allowing your LLM models to dynamically discover and invoke external tools, databases,
 APIs, and file services.
 
@@ -8,9 +8,9 @@ APIs, and file services.
 
 ## 1. Overview & Transports
 
-Nova Agent supports two standard MCP transports:
+Zay Agent supports two standard MCP transports:
 
-1. **Stdio (`stdio`)**: Child processes launched locally by Nova Agent (e.g. via `npx`,
+1. **Stdio (`stdio`)**: Child processes launched locally by Zay Agent (e.g. via `npx`,
    `python`, `uv`, or precompiled binaries).
 2. **Streamable HTTP (`sse`)**: Remote MCP servers reached over HTTP. Each JSON-RPC
    request is a `POST` with `Accept: application/json, text/event-stream`; the response
@@ -26,8 +26,8 @@ remote. Providing both (or neither) is rejected at parse time.
 
 ## 2. Configuration (`config.json` / `mcpServers` or `mcp_servers`)
 
-MCP servers are configured inside global `~/.config/nova/config.json` or project-local
-`<cwd>/.nova/config.json` under the `"mcpServers"` (Claude Desktop / Cursor format) or
+MCP servers are configured inside global `~/.config/zay/config.json` or project-local
+`<cwd>/.zay/config.json` under the `"mcpServers"` (Claude Desktop / Cursor format) or
 `"mcp_servers"` key; the legacy top-level `"mcp"` alias is also parsed for backward
 compatibility. `camelCase` wins when several spellings are present, and the next save
 rewrites the config as `"mcpServers"`.
@@ -77,7 +77,7 @@ than silently producing a broken command or URL.
 > [!IMPORTANT]
 > **Secrets stay out of config.json.** Placeholders are stored verbatim in the parsed
 > config and expanded only at connect time, into an in-memory copy held by the MCP
-> client. When Nova rewrites `config.json` (e.g. on a settings save) it writes the
+> client. When Zay rewrites `config.json` (e.g. on a settings save) it writes the
 > `{env:VAR}` placeholder back — never the resolved value — so a secret is never
 > persisted to disk.
 
@@ -161,7 +161,7 @@ client), and the single-pending-job launch guard.
 ### Phase C — Tool injection (startup and on every MCP change)
 
 The AI client serializes its tool list (`tools_json`) once, at attach time. Because the
-client is attached during session init — before the MCP manager exists — Nova rebuilds
+client is attached during session init — before the MCP manager exists — Zay rebuilds
 and re-injects the serialized tools whenever the MCP tool set changes:
 
 - **On startup** (`run()`), after configured servers connect.
@@ -196,7 +196,7 @@ When the model calls an MCP tool:
 - Exposed MCP tools are automatically namespaced as:
   `mcp__<server_name>__<tool_name>`
   _(Example: `mcp__tavily__tavily_search`)_
-- Tool schemas (`inputSchema`) are parsed from JSON Schema into Nova's internal
+- Tool schemas (`inputSchema`) are parsed from JSON Schema into Zay's internal
   `tools_common.Schema` format, preserving property types, descriptions, and required
   fields.
 - Discovered tools are injected into the AI provider's `tools` array alongside built-in
@@ -211,7 +211,7 @@ When the model calls an MCP tool:
 
 ## 5. Real-Time TUI Monitoring (`/mcp` Command)
 
-Nova Agent includes a dedicated TUI monitoring screen:
+Zay Agent includes a dedicated TUI monitoring screen:
 
 - Run `/mcp` in chat to bring up the MCP Status Overlay.
 - View connection badges: `[CONNECTED]`, `[CONNECTING]`, `[FAILED]`, `[DISABLED]`.
@@ -237,8 +237,8 @@ or **Esc** to cancel. The server name is derived from the URL host.
 > [!NOTE]
 > **Runtime-only**: servers added through the overlay live in the running session's
 > config only — they are **not** written to `config.json` and disappear on restart. To
-> make a server permanent, add it to `mcpServers` in `~/.config/nova/config.json` (or the
-> project `.nova/config.json`) by hand.
+> make a server permanent, add it to `mcpServers` in `~/.config/zay/config.json` (or the
+> project `.zay/config.json`) by hand.
 
 ---
 
@@ -261,7 +261,7 @@ or **Esc** to cancel. The server name is derived from the URL host.
 - **`notifications/tools/list_changed`**: Handled via `drainMcpNotifications` (see §4);
   the catalog refreshes automatically on the notification (the advertised
   `listChanged` capability is recorded but the refresh is not gated on it).
-- **Server-push requests**: Nova does not act on server-initiated Streamable HTTP GET
+- **Server-push requests**: Zay does not act on server-initiated Streamable HTTP GET
   streams (sampling/roots). The POST path (tool discovery + tool calls) is fully
   supported, which covers normal tool use.
 - **Overlay-added servers are runtime-only**: not persisted to `config.json` (see §5).

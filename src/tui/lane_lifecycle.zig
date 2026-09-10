@@ -62,7 +62,7 @@ fn laneOpenAtPath(app: *App, path: []const u8) bool {
     return false;
 }
 
-/// Point `lane`'s working branch at `nova/<slug>` — the git rename plus the
+/// Point `lane`'s working branch at `zay/<slug>` — the git rename plus the
 /// lane's own records (branch string, label). False when the lane has no
 /// working branch or the new name is taken.
 fn renameLaneBranch(app: *App, lane: *Thread, slug: []const u8) !bool {
@@ -75,10 +75,10 @@ fn renameLaneBranch(app: *App, lane: *Thread, slug: []const u8) !bool {
         .primary => return false,
     };
 
-    const branch = try app.gpa.alloc(u8, "nova/".len + slug.len);
+    const branch = try app.gpa.alloc(u8, "zay/".len + slug.len);
     errdefer app.gpa.free(branch);
-    @memcpy(branch[0.."nova/".len], "nova/");
-    @memcpy(branch["nova/".len..], slug);
+    @memcpy(branch[0.."zay/".len], "zay/");
+    @memcpy(branch["zay/".len..], slug);
     const title = try app.gpa.dupe(u8, branch);
     errdefer app.gpa.free(title);
 
@@ -188,7 +188,7 @@ fn abandonLane(app: *App, index: u32) !void {
     }
 }
 
-/// On-disk `nova/*` worktrees that are NOT currently open as lanes — the
+/// On-disk `zay/*` worktrees that are NOT currently open as lanes — the
 /// parked lanes. Caller owns the result (free via `vcs.freeWorktreeList`).
 /// Pub: the lane-bridge `list` op surfaces them to the model (L1).
 pub fn collectParkedLanes(app: *App, repo: []const u8) ![]vcs.WorktreeEntry {
@@ -201,7 +201,7 @@ pub fn collectParkedLanes(app: *App, repo: []const u8) ![]vcs.WorktreeEntry {
         out.deinit(app.gpa);
     }
     for (all) |entry| {
-        if (!std.mem.startsWith(u8, entry.branch, "nova/")) continue;
+        if (!std.mem.startsWith(u8, entry.branch, "zay/")) continue;
         if (laneOpenAtPath(app, entry.path)) continue;
         const path_dup = try app.gpa.dupe(u8, entry.path);
         errdefer app.gpa.free(path_dup);
@@ -360,7 +360,7 @@ pub fn scheduleLaneNaming(app: *App, lane: *Thread, first_message: []const u8) !
 }
 
 /// Called from the tick handler: rename any lane whose branch name landed —
-/// `nova/<hex>` becomes `nova/<slug>` in place (worktree HEADs follow), and
+/// `zay/<hex>` becomes `zay/<slug>` in place (worktree HEADs follow), and
 /// the branch becomes the lane's label. A rejected or colliding name simply
 /// leaves the hex branch.
 pub fn drainLaneNaming(app: *App) !bool {
@@ -616,7 +616,7 @@ pub fn confirmMergeDest(app: *App) !void {
     app.clearInput();
 }
 
-/// `/lanes`: list parked `nova/*` worktrees (closed lanes still on disk) for
+/// `/lanes`: list parked `zay/*` worktrees (closed lanes still on disk) for
 /// merge (M) or deletion (X).
 pub fn openLanesPicker(app: *App) !void {
     const repo = app.repoRoot() orelse return error.NoActiveRuntime;
@@ -884,7 +884,7 @@ fn failUnknownWorkerLane(app: *App, id: []const u8) ?Resp {
 }
 
 /// Resolve a lane id (the worktree's last path segment — the hex id, durable
-/// across the async `nova/<slug>` branch rename) to an open lane.
+/// across the async `zay/<slug>` branch rename) to an open lane.
 fn resolveLane(app: *App, id_in: []const u8) ?*Thread {
     const id = std.mem.trim(u8, id_in, " \t\r\n");
     for (app.threads.slice()) |lane| {
@@ -1033,10 +1033,10 @@ fn createLaneWorktree(app: *App, repo: []const u8, home: []const u8) !struct { b
     app.io.random(&raw);
     const id = std.fmt.bytesToHex(raw, .lower);
 
-    const branch = try app.gpa.alloc(u8, "nova/".len + id.len);
+    const branch = try app.gpa.alloc(u8, "zay/".len + id.len);
     errdefer app.gpa.free(branch);
-    @memcpy(branch[0.."nova/".len], "nova/");
-    @memcpy(branch["nova/".len..], &id);
+    @memcpy(branch[0.."zay/".len], "zay/");
+    @memcpy(branch["zay/".len..], &id);
     const parent = try vcs.globalWorktreesDir(app.gpa, home);
     defer app.gpa.free(parent);
     std.Io.Dir.cwd().createDirPath(app.io, parent) catch {};
@@ -1049,7 +1049,7 @@ fn createLaneWorktree(app: *App, repo: []const u8, home: []const u8) !struct { b
 
 /// Roll back a worktree whose lane was never registered with `app.threads`
 /// (a creation-failure path in `createLane`/`spawnLane`). Removes the on-disk
-/// worktree and deletes the `nova/<id>` branch; the caller still owns and
+/// worktree and deletes the `zay/<id>` branch; the caller still owns and
 /// frees the `branch`/`dest` strings. `AgentRuntime.deinit` does not touch the
 /// worktree filesystem — the session DB lives at `session_dir` (the repo root),
 /// and the worktree is only the runtime's `cwd` string — so removing the
@@ -1335,13 +1335,13 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
         app.io.random(&raw);
         const id = std.fmt.bytesToHex(raw, .lower);
 
-        const branch = app.gpa.alloc(u8, "nova/".len + id.len) catch {
+        const branch = app.gpa.alloc(u8, "zay/".len + id.len) catch {
             freeLaneContext(app.gpa, context);
             return failResp(app.gpa, "lane: out of memory\n", .{});
         };
         errdefer app.gpa.free(branch);
-        @memcpy(branch[0.."nova/".len], "nova/");
-        @memcpy(branch["nova/".len..], &id);
+        @memcpy(branch[0.."zay/".len], "zay/");
+        @memcpy(branch["zay/".len..], &id);
         const parent = vcs.globalWorktreesDir(app.gpa, home) catch {
             app.gpa.free(branch);
             freeLaneContext(app.gpa, context);
@@ -1512,7 +1512,7 @@ fn wakeIdleLane(app: *App, lane: *Thread, repo: []const u8, context: [][]u8) !vo
     wireSpawnedAgent(app, runtime);
 
     // Adopt the spawner's naming context so the first turn can rename the
-    // `nova/<hex>` branch, just like the fresh-worktree path. The caller
+    // `zay/<hex>` branch, just like the fresh-worktree path. The caller
     // already captured it from the spawner; we take ownership here.
     //
     // parkFinishedWorker deliberately leaves parent_context alive (the naming
@@ -2051,7 +2051,7 @@ test "lane workspace ops create → enter → merge(refused) → leave → merge
     const lane = app.threads.slice()[1];
     const working = lanes_util.workingLaneOf(lane).?;
     const id = lanes_util.lastPathSegment(working.path);
-    try std.testing.expect(std.mem.startsWith(u8, working.branch, "nova/"));
+    try std.testing.expect(std.mem.startsWith(u8, working.branch, "zay/"));
     try std.testing.expect(vcs.isRepo(gpa, io, working.path)); // worktree on disk
     // F1: the create response announces the workspace.
     try std.testing.expect(std.mem.indexOf(u8, create_resp.text, "repo root") != null);
@@ -2201,7 +2201,7 @@ test "S17: teardown of a lane the workspace borrows is refused while the owner's
     // A second "working" lane whose path the driver (threads[0]) borrows.
     const lane2 = try gpa.create(Thread);
     lane2.* = .{ .engine = .{ .idle = .{ .working = .{
-        .branch = try gpa.dupe(u8, "nova/x"),
+        .branch = try gpa.dupe(u8, "zay/x"),
         .path = try gpa.dupe(u8, "/tmp/lane-x"),
     } } } };
     try app.threads.append(lane2);
@@ -2219,7 +2219,7 @@ test "S17: teardown of a lane the workspace borrows is refused while the owner's
     try std.testing.expect(agent.workspaceBorrow() == null);
 }
 
-test "S17: collectParkedLanes surfaces a nova/* worktree not open as a lane" {
+test "S17: collectParkedLanes surfaces a zay/* worktree not open as a lane" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
@@ -2235,12 +2235,12 @@ test "S17: collectParkedLanes surfaces a nova/* worktree not open as a lane" {
     try gitOk(gpa, io, repo, &.{ "config", "user.email", "t@t" });
     try gitOk(gpa, io, repo, &.{ "commit", "--allow-empty", "-qm", "baseline" });
 
-    // A crash-simulated orphan: a nova/* worktree on disk, not open as a lane.
+    // A crash-simulated orphan: a zay/* worktree on disk, not open as a lane.
     const orphan_path = try std.fs.path.join(gpa, &.{ test_cwd, ".zig-cache", "tmp", "orphan-wt" });
     defer gpa.free(orphan_path);
     std.Io.Dir.cwd().deleteTree(io, orphan_path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io, orphan_path) catch {};
-    try gitOk(gpa, io, repo, &.{ "worktree", "add", "-b", "nova/orphan", orphan_path });
+    try gitOk(gpa, io, repo, &.{ "worktree", "add", "-b", "zay/orphan", orphan_path });
 
     var agent = agent_mod.Agent.init(gpa, io, ".", .none);
     defer agent.deinit();
@@ -2250,7 +2250,7 @@ test "S17: collectParkedLanes surfaces a nova/* worktree not open as a lane" {
     const parked = try collectParkedLanes(&app, repo);
     defer vcs.freeWorktreeList(app.gpa, parked);
     try std.testing.expectEqual(@as(usize, 1), parked.len);
-    try std.testing.expect(std.mem.eql(u8, "nova/orphan", parked[0].branch));
+    try std.testing.expect(std.mem.eql(u8, "zay/orphan", parked[0].branch));
 }
 
 // ---------------------------------------------------------------------------
@@ -2262,9 +2262,9 @@ test "S17: collectParkedLanes surfaces a nova/* worktree not open as a lane" {
 fn addFakeWorkingLane(gpa: std.mem.Allocator, app: *App, id: []const u8) !*Thread {
     const lane = try gpa.create(Thread);
     errdefer gpa.destroy(lane);
-    const branch = try std.fmt.allocPrint(gpa, "nova/{s}", .{id});
+    const branch = try std.fmt.allocPrint(gpa, "zay/{s}", .{id});
     errdefer gpa.free(branch);
-    const path = try std.fmt.allocPrint(gpa, "/tmp/nova-lanes/{s}", .{id});
+    const path = try std.fmt.allocPrint(gpa, "/tmp/zay-lanes/{s}", .{id});
     errdefer gpa.free(path);
     lane.* = .{ .engine = .{ .idle = .{ .working = .{ .branch = branch, .path = path } } } };
     try app.threads.append(lane);
@@ -3441,7 +3441,7 @@ test "deleteLaneOp refuses a delete while the driver is entered in the target" {
 }
 
 test "deleteLaneOp deletes a parked lane" {
-    // A nova/* worktree on disk with no open lane is a parked lane; delete
+    // A zay/* worktree on disk with no open lane is a parked lane; delete
     // must remove its worktree + branch and report success. Needs a live
     // primary runtime (repoRoot) to reach the parked-lane path.
     const gpa = std.testing.allocator;
@@ -3457,7 +3457,7 @@ test "deleteLaneOp deletes a parked lane" {
     defer gpa.free(parked_path);
     std.Io.Dir.cwd().deleteTree(io, parked_path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io, parked_path) catch {};
-    try gitOk(gpa, io, fx.repo, &.{ "worktree", "add", "-b", "nova/parked", parked_path });
+    try gitOk(gpa, io, fx.repo, &.{ "worktree", "add", "-b", "zay/parked", parked_path });
 
     var req = lane_bridge.Request{ .op = .delete, .lane = try gpa.dupe(u8, "delete-parked-lane"), .requester = &fx.runtime.agent };
     defer req.deinit(gpa);
@@ -3521,11 +3521,11 @@ test "clearWorkspaceBorrowForPath & deleteLaneOp tolerate slash format differenc
     defer app.deinit();
 
     // 1. Driver borrows a path with backslashes
-    const backslash_path = "C:\\Users\\nova\\.config\\nova\\worktrees\\test1";
+    const backslash_path = "C:\\Users\\zay\\.config\\zay\\worktrees\\test1";
     agent.setWorkspace(backslash_path);
 
     // 2. clearWorkspaceBorrowForPath called with forward slashes (from Git CLI)
-    const forward_slash_path = "C:/Users/nova/.config/nova/worktrees/test1/";
+    const forward_slash_path = "C:/Users/zay/.config/zay/worktrees/test1/";
     try clearWorkspaceBorrowForPath(&app, forward_slash_path);
 
     // Assert workspace was successfully cleared despite slash differences
@@ -3583,7 +3583,7 @@ test "cleanupLaneWorktreeAndBranch terminates background processes and removes w
     defer std.Io.Dir.deleteFile(.cwd(), io, started.log_path) catch {};
     try std.testing.expect(started.pid > 0);
 
-    cleanupLaneWorktreeAndBranch(&app, ".", wt_path, "nova/fake-branch");
+    cleanupLaneWorktreeAndBranch(&app, ".", wt_path, "zay/fake-branch");
 
     // terminateJobsInCwd flags the job killed and kills its process tree
     // synchronously; the job's watcher thread then finalizes it, and
@@ -3619,7 +3619,7 @@ test "WorktreeJob start and completion lifecycle" {
     try std.testing.expect(!anyAsyncWorktreeActive(&app));
 
     const dest = "test_async_wt_tmp";
-    const branch = "nova/test-async-wt-branch";
+    const branch = "zay/test-async-wt-branch";
     defer cleanupLaneWorktreeAndBranch(&app, ".", dest, branch);
 
     // Start an async job
@@ -3656,7 +3656,7 @@ test "listLanes formats primary driver lane and worker lanes correctly" {
     const res2 = listLanes(&app).?;
     defer gpa.free(res2.text);
     try std.testing.expect(std.mem.indexOf(u8, res2.text, "[0] primary (driver / repo root)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res2.text, "worker lane=c8882753bb24 title=feature-x branch=nova/c8882753bb24") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res2.text, "worker lane=c8882753bb24 title=feature-x branch=zay/c8882753bb24") != null);
     try std.testing.expect(std.mem.indexOf(u8, res2.text, "[1] c8882753bb24") == null);
 }
 
@@ -3840,8 +3840,8 @@ test "parkFinishedWorker closes runtime-bound overlays on the focused lane" {
     // sub-state — exactly the R1 window: the picker was opened while the
     // lane was live, and the park invalidates its runtime derefs.
     const lane = try gpa.create(tui.Thread);
-    const branch = try std.fmt.allocPrint(gpa, "nova/parktest", .{});
-    const path = try std.fmt.allocPrint(gpa, "/tmp/nova-lanes/parktest", .{});
+    const branch = try std.fmt.allocPrint(gpa, "zay/parktest", .{});
+    const path = try std.fmt.allocPrint(gpa, "/tmp/zay-lanes/parktest", .{});
     lane.* = .{ .engine = .{ .live = .{
         .lane = .{ .working = .{ .branch = branch, .path = path } },
         .runtime = try test_helpers.makeParkTestRuntime(gpa, home_abs),
@@ -3867,8 +3867,8 @@ test "parkFinishedWorker closes runtime-bound overlays on the focused lane" {
     // open overlay: re-focus the (now idle) lane, open a picker again, and
     // park a second live worker that nobody focuses.
     const lane2 = try gpa.create(tui.Thread);
-    const branch2 = try std.fmt.allocPrint(gpa, "nova/parktest2", .{});
-    const path2 = try std.fmt.allocPrint(gpa, "/tmp/nova-lanes/parktest2", .{});
+    const branch2 = try std.fmt.allocPrint(gpa, "zay/parktest2", .{});
+    const path2 = try std.fmt.allocPrint(gpa, "/tmp/zay-lanes/parktest2", .{});
     lane2.* = .{ .engine = .{ .live = .{
         .lane = .{ .working = .{ .branch = branch2, .path = path2 } },
         .runtime = try test_helpers.makeParkTestRuntime(gpa, home_abs),

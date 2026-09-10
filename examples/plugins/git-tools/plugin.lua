@@ -2,7 +2,7 @@
 return {
   name = "git-tools",
   version = "1.0.0",
-  author = "Nova",
+  author = "Zay",
   description = "Inspect git status, diff, log, branch, and create commits",
   license = "MIT",
   permissions = {

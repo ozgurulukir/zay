@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://nova-agent.dev/v2/config.schema.json",
-  "title": "Nova Agent Configuration",
-  "description": "Configuration schema for Nova coding agent (v2). Supports layered merging: global (~/.config/nova/config.json) → project (.nova/config.json) → environment variables. JSON keys are camelCase; legacy snake_case keys are accepted for backward compatibility. Reasoning effort is controlled per-model via providers.<name>.models.<id>.reasoningEffort; the legacy top-level 'enableThinking' boolean was removed — Nova still parses and discards it for backward compatibility.",
+  "$id": "https://zay.dev/v2/config.schema.json",
+  "title": "Zay Agent Configuration",
+  "description": "Configuration schema for Zay coding agent (v2). Supports layered merging: global (~/.config/zay/config.json) → project (.zay/config.json) → environment variables. JSON keys are camelCase; legacy snake_case keys are accepted for backward compatibility. Reasoning effort is controlled per-model via providers.<name>.models.<id>.reasoningEffort; the legacy top-level 'enableThinking' boolean was removed — Zay still parses and discards it for backward compatibility.",
   "type": "object",
   "properties": {
     "version": {
@@ -39,7 +39,7 @@
     "bashClassifierUrl": {
       "type": "string",
       "format": "uri",
-      "description": "URL of the external command safety classifier endpoint (e.g. 'http://127.0.0.1:8765/classify'). When omitted, null, or empty, Nova uses its built-in safety rules. Legacy key 'bash_classifier_url' is parsed for backward compatibility but is not schema-valid; new configs must use 'bashClassifierUrl'."
+      "description": "URL of the external command safety classifier endpoint (e.g. 'http://127.0.0.1:8765/classify'). When omitted, null, or empty, Zay uses its built-in safety rules. Legacy key 'bash_classifier_url' is parsed for backward compatibility but is not schema-valid; new configs must use 'bashClassifierUrl'."
     },
     "providers": {
       "type": "object",
@@ -156,7 +156,7 @@
       "properties": {
         "type": {
           "type": "string",
-          "description": "Optional transport discriminator (e.g. 'stdio') for compatibility with other MCP clients. Nova infers the transport from 'command'/'url' and ignores this field."
+          "description": "Optional transport discriminator (e.g. 'stdio') for compatibility with other MCP clients. Zay infers the transport from 'command'/'url' and ignores this field."
         },
         "command": {
           "type": "string",
@@ -187,7 +187,7 @@
       "properties": {
         "type": {
           "type": "string",
-          "description": "Optional transport discriminator (e.g. 'remote' or 'http') for compatibility with other MCP clients. Nova infers the transport from 'command'/'url' and ignores this field."
+          "description": "Optional transport discriminator (e.g. 'remote' or 'http') for compatibility with other MCP clients. Zay infers the transport from 'command'/'url' and ignores this field."
         },
         "url": {
           "type": "string",
@@ -329,12 +329,12 @@
     },
     "ToastSettings": {
       "type": "object",
-      "description": "Transient toast notifications shown in the top-right corner of the TUI. With the TUI running, warn+ log output routes to the toast bus instead of stderr (which would tear the frame); setting NOVA_LOG_STDERR_LEVEL restores the stderr channel. All fields are optional and omitted from config.json when left at defaults.",
+      "description": "Transient toast notifications shown in the top-right corner of the TUI. With the TUI running, warn+ log output routes to the toast bus instead of stderr (which would tear the frame); setting ZAY_LOG_STDERR_LEVEL restores the stderr channel. All fields are optional and omitted from config.json when left at defaults.",
       "properties": {
         "enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Master switch. When false, no toasts are shown (warn+ output is dropped from the TUI; set NOVA_LOG_STDERR_LEVEL to route it back to stderr). Toggled live from the /settings General tab."
+          "description": "Master switch. When false, no toasts are shown (warn+ output is dropped from the TUI; set ZAY_LOG_STDERR_LEVEL to route it back to stderr). Toggled live from the /settings General tab."
         },
         "durationMs": {
           "type": "integer",
@@ -370,7 +370,7 @@
         "customThemesDir": {
           "type": ["string", "null"],
           "default": null,
-          "description": "Optional directory path containing user theme JSON files. When set, it REPLACES the default scan of ~/.config/nova/themes/ and .nova/themes/."
+          "description": "Optional directory path containing user theme JSON files. When set, it REPLACES the default scan of ~/.config/zay/themes/ and .zay/themes/."
         },
         "fuzzyHighlight": {
           "type": "boolean",
