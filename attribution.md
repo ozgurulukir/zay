@@ -168,14 +168,6 @@ The vendor directory is gitignored, so the patch must be re-applied after
 every `zig build --fetch` / vaxis bump. Remove both once the upstream fix
 lands past the pinned commit.
 
-### zigimg (image rendering)
-
-- **Source:** <https://github.com/zigimg/zigimg>
-- **Version:** 0.1.0 @ `a7440df`
-- **License:** MIT — Copyright (c) 2019-2021 zigimg developers
-- **Used for:** terminal image rendering (transcript images). No local
-  modifications.
-
 ### uucode (Unicode tables)
 
 - **Source:** <https://github.com/jacobsandlund/uucode>
