@@ -9,7 +9,6 @@ const tui_metrics = @import("../metrics.zig");
 const tui_style = @import("../style.zig");
 const blackhole = @import("../blackhole.zig");
 
-const logo_text = "N.O.V.A";
 const logo_connect_text = "/connect to begin building";
 const intro_x_padding: u16 = 7;
 const logo_gap: u16 = 8;
@@ -286,7 +285,7 @@ pub const MessageWidget = struct {
     fn drawIntro(self: *MessageWidget, surface: *vxfw.Surface, frame_index: u16, row: *u16, ctx: vxfw.DrawContext) void {
         const row_start = row.*;
         drawBlackhole(surface, frame_index, row_start);
-        self.drawLogo(surface, row_start + logo_row_offset, ctx);
+        self.drawConnectHint(surface, row_start + logo_row_offset, ctx);
         row.* = row_start + blackhole.rows;
     }
 
@@ -303,22 +302,14 @@ pub const MessageWidget = struct {
         }
     }
 
-    fn drawLogo(self: *MessageWidget, surface: *vxfw.Surface, row_start: u16, ctx: vxfw.DrawContext) void {
+    fn drawConnectHint(self: *MessageWidget, surface: *vxfw.Surface, row_start: u16, ctx: vxfw.DrawContext) void {
         const col_start = ConversationLayout.left + intro_x_padding + blackhole.cols + logo_gap;
         if (col_start >= surface.size.width -| ConversationLayout.right) return;
 
-        var row = row_start;
-        var line_start: usize = 0;
-        while (line_start <= logo_text.len) {
-            const line_end = std.mem.findScalarPos(u8, logo_text, line_start, '\n') orelse logo_text.len;
-            writeLogoLine(surface, logo_text[line_start..line_end], row, col_start, ctx);
-            row += 1;
-            if (line_end == logo_text.len) break;
-            line_start = line_end + 1;
-        }
-
         if (self.has_model_configured) return;
-        writeLogoLine(surface, logo_connect_text, row + 1, col_start, ctx);
+        // Two rows down keeps the hint where it sat while the logo text
+        // (dropped in the rebrand) occupied the row above it.
+        writeLogoLine(surface, logo_connect_text, row_start + 2, col_start, ctx);
     }
 
     // Frames are single-width ASCII, so we walk bytes directly (no grapheme
@@ -1118,7 +1109,7 @@ test "padding/void cells are filled with the card background" {
     try std.testing.expectEqual(tui_style.nord.background, pad_cell.style.bg.rgb);
 }
 
-test "intro logo and * accent use intro_accent" {
+test "intro * accent uses intro_accent" {
     tui_style.setActive(tui_style.dracula);
     defer tui_style.setActive(tui_style.default_theme);
 
@@ -1161,10 +1152,11 @@ test "intro logo and * accent use intro_accent" {
     }
     try std.testing.expect(found_star);
 
-    // The logo text (N.O.V.A) carries the themed intro accent.
+    // The old N.O.V.A logo cell is blank after the rebrand; the intro text
+    // column now carries only the connect hint.
     const logo_col = ConversationLayout.left + intro_x_padding + blackhole.cols + logo_gap;
     const logo_cell = surface.readCell(logo_col, ConversationLayout.top + logo_row_offset);
-    try std.testing.expectEqual(accent_color, logo_cell.style.fg.rgb);
+    try std.testing.expectEqualStrings(" ", logo_cell.char.grapheme);
 }
 
 // Helpers so the render asserts don't reach into the active palette order.
@@ -1175,7 +1167,7 @@ fn expectDraculaIntro() tui_style.Palette {
     return tui_style.buildPalette(tui_style.dracula);
 }
 
-test "drawLogo renders connect hint when has_model_configured is false" {
+test "drawConnectHint renders connect hint when has_model_configured is false" {
     const gpa = std.testing.allocator;
     var transcript: transcript_mod.Transcript = .{};
     defer transcript.deinit(gpa);
@@ -1204,7 +1196,7 @@ test "drawLogo renders connect hint when has_model_configured is false" {
     try std.testing.expectEqualStrings("/", connect_cell.char.grapheme);
 }
 
-test "drawLogo omits connect hint when has_model_configured is true" {
+test "drawConnectHint omits connect hint when has_model_configured is true" {
     const gpa = std.testing.allocator;
     var transcript: transcript_mod.Transcript = .{};
     defer transcript.deinit(gpa);
