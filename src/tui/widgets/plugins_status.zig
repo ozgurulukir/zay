@@ -51,7 +51,7 @@ pub const Content = struct {
         try panel.lineStyledAt(&surface, 2, summary, ctx, 2, p.info);
 
         if (self.plugins.len == 0) {
-            try panel.lineStyledAt(&surface, 4, "No plugins loaded. Add plugins to ~/.config/zay/plugins/ or .zay/plugins/.", ctx, 2, p.thinking_body);
+            try panel.lineStyledAt(&surface, 4, "No plugins loaded. Add plugins to ~/.config/zay/plugins/ or .zay/plugins/.", ctx, 2, p.notice);
             try panel.lineStyledAt(&surface, height - 2, "[Esc] Close", ctx, 2, p.thinking_body);
             return surface;
         }

@@ -59,14 +59,14 @@ pub const Content = struct {
         const col = message.ConversationLayout.left -| 1;
         if (self.summaries.len == 0) {
             try panel.lineStyledAt(&surface, 0, "No sessions yet.", ctx, col, p.panel_header);
-            try panel.lineStyledAt(&surface, 1, "Start a conversation and it will show up here.", ctx, col, p.thinking_body);
+            try panel.lineStyledAt(&surface, 1, "Start a conversation and it will show up here.", ctx, col, p.notice);
         } else if (self.filter.len > 0) {
             const text = try std.fmt.allocPrint(ctx.arena, "No sessions match \"{s}\".", .{self.filter});
             try panel.lineStyledAt(&surface, 0, text, ctx, col, p.panel_header);
-            try panel.lineStyledAt(&surface, 1, "Adjust the search text above.", ctx, col, p.thinking_body);
+            try panel.lineStyledAt(&surface, 1, "Adjust the search text above.", ctx, col, p.notice);
         } else {
             try panel.lineStyledAt(&surface, 0, "No sessions to show.", ctx, col, p.panel_header);
-            try panel.lineStyledAt(&surface, 1, "Try a different grouping (Ctrl+A) or unfold a project (Tab).", ctx, col, p.thinking_body);
+            try panel.lineStyledAt(&surface, 1, "Try a different grouping (Ctrl+A) or unfold a project (Tab).", ctx, col, p.notice);
         }
         return surface;
     }
