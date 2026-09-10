@@ -140,7 +140,12 @@ See the **[Safety & Classifier Guide](docs/wiki/SAFETY_CLASSIFIER.md)** for Dock
 
 - **Linux:** Fully supported and tested daily.
 - **macOS (Apple Silicon):** Binaries shipped for every release (`zay-macos-aarch64`) with a CI runtime smoke; beta until exercised on real hardware. Unsigned — see the installer's Gatekeeper note.
-- **Windows:** Compiles natively (`zig-out/bin/zay.exe`). Core features, TUI, and SQLite persistence are active; cross-platform runtime parity is tracked in [#26](https://github.com/ozgurulukir/zay/issues/26)–[#29](https://github.com/ozgurulukir/zay/issues/29).
+- **Windows:** Daily-driver ready. Release CI builds `zay-windows-x86_64.exe` natively on Windows
+  runners; PowerShell 7 (`pwsh`) is the shell tool, and the TUI, parallel worktree lanes,
+  background jobs (Win32 Job Objects), and SQLite persistence all run natively. Remaining
+  hardening is tracked in [#25](https://github.com/ozgurulukir/zay/issues/25) (MCP read
+  timeouts) and [#32](https://github.com/ozgurulukir/zay/issues/32) (deferred Windows test
+  variants).
 
 ---
 

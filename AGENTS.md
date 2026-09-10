@@ -5,7 +5,7 @@ This project uses Zig 0.16. Consult the tigerstyle skill before writing code.
 - `vendor/fzy/` is a vendored copy of the fzy fuzzy matcher (MIT) — compiled directly into the binary via `build.zig`; no separate build step required.
 - Standalone command safety classifier lives in `tools/classifier/` (FastAPI / ModernBERT) and communicates with Zay via HTTP REST (`POST /classify`).
 - `zig build install -Doptimize=ReleaseFast --prefix $HOME/.local` installs to `~/.local/bin/`.
-- The app **compiles** on Windows (`zig build` → `zig-out/bin/zay.exe`); full runtime support is in progress and tracked in issues #26–#29 (config paths, bash shell, failing tests, lanes). Linux behavior is unchanged.
+- The app is **daily-driver ready on Windows**: release CI ships a native `zay-windows-x86_64.exe`, the shell tool is `pwsh` (compile-time pick in `registry.zig`), and lanes/worktrees/background jobs run natively (background children are bound to Win32 Job Objects). Remaining hardening: #25 (MCP read timeouts on Windows), #32 (deferred Windows test variants), #80 (test-harness hang). Linux behavior is unchanged.
 
 ## Patterns & Engineering Notes
 
