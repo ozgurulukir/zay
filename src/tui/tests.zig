@@ -877,7 +877,7 @@ test "compact request appends an animated status row while the summary is produc
 
     var home = try isolatedHome(gpa, std.testing.io);
     defer home.deinit(gpa);
-    try home.tmp.dir.createDirPath(std.testing.io, ".config/nova");
+    try home.tmp.dir.createDirPath(std.testing.io, ".config/zay");
 
     var writer: session_mod.SessionWriter = undefined;
     try session_mod.SessionWriter.initDefault(&writer, gpa, std.testing.io, home.path, "/tmp");

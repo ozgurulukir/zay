@@ -6,17 +6,17 @@ Security updates and patches are actively provided for the following releases:
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.8.x   | :white_check_mark: |
-| < 0.8   | :x:                |
+| 0.9.x   | :white_check_mark: |
+| < 0.9   | :x:                |
 
 ---
 
 ## 2. Reporting a Vulnerability
 
-We take the security of Nova Agent seriously. If you discover a security vulnerability (such as a path-traversal vulnerability, sandbox escape in Lua, prompt injection vector that bypasses safety filters, or remote code execution), please **do not open a public issue**.
+We take the security of Zay Agent seriously. If you discover a security vulnerability (such as a path-traversal vulnerability, sandbox escape in Lua, prompt injection vector that bypasses safety filters, or remote code execution), please **do not open a public issue**.
 
 Instead, report vulnerabilities responsibly via:
-- **GitHub Security Advisory:** [Report a vulnerability](https://github.com/ozgurulukir/nova-agent/security/advisories/new)
+- **GitHub Security Advisory:** [Report a vulnerability](https://github.com/ozgurulukir/zay/security/advisories/new)
 - **Direct Contact:** Contact the repository maintainers through GitHub profiles.
 
 Please include:
@@ -28,12 +28,12 @@ We will acknowledge receipt within 48 hours and work with you on a coordinated d
 
 ---
 
-## 3. Nova Agent Security & Safety Model
+## 3. Zay Agent Security & Safety Model
 
-Nova Agent operates as an autonomous coding assistant with direct shell access (`pwsh` on Windows, `bash` on Linux/macOS). To mitigate risks, Nova incorporates multiple layers of defense:
+Zay Agent operates as an autonomous coding assistant with direct shell access (`pwsh` on Windows, `bash` on Linux/macOS). To mitigate risks, Zay incorporates multiple layers of defense:
 
 ### A. Deterministic Command Safety Matcher
-Nova includes a zero-dependency, hardcoded command safety classifier (`src/tools/bash_safety.zig`) that inspects shell commands before execution with `<1µs` latency. It automatically intercepts:
+Zay includes a zero-dependency, hardcoded command safety classifier (`src/tools/bash_safety.zig`) that inspects shell commands before execution with `<1µs` latency. It automatically intercepts:
 - Recursive deletions targeting root or home filesystems (`rm -rf /`, `rm -rf ~`, `Remove-Item C:\ -Recurse`).
 - Raw disk wipes, partition table overwrites (`dd if=/dev/zero of=/dev/sd*`, `mkfs`).
 - Fork bombs and runaway shell loops (`:(){ :|:& };:`).
@@ -52,7 +52,7 @@ For sensitive or high-risk development environments, users can enable a standalo
 
 ## 4. User Responsibilities & Operational Best Practices
 
-- **Use Version Control:** Always run Nova inside Git-tracked repositories so changes can be audited and rolled back (`git diff`, `git restore`).
-- **Least Privilege:** Avoid running Nova with elevated privileges (`root` / `Administrator`).
-- **Isolated Environments:** For untrusted repositories or risky tasks, run Nova inside Docker containers or dedicated VMs, or isolate changes using Nova's `/parallel` Git worktree lanes.
+- **Use Version Control:** Always run Zay inside Git-tracked repositories so changes can be audited and rolled back (`git diff`, `git restore`).
+- **Least Privilege:** Avoid running Zay with elevated privileges (`root` / `Administrator`).
+- **Isolated Environments:** For untrusted repositories or risky tasks, run Zay inside Docker containers or dedicated VMs, or isolate changes using Zay's `/parallel` Git worktree lanes.
 - **Review Critical Operations:** Review model actions when interacting with databases, remote infrastructure, or sensitive configuration files.

@@ -1,29 +1,29 @@
-//! Plugin API bridge — exposes Nova's filesystem to Lua plugins.
+//! Plugin API bridge — exposes Zay's filesystem to Lua plugins.
 //!
-//! Each function is a C-callable `lua_CFunction` registered in the `nova`
+//! Each function is a C-callable `lua_CFunction` registered in the `zay`
 //! table before the sandbox is created. Plugins call these instead of `io.*`,
 //! which is blocked by the sandbox. All file operations go through
 //! path validation (traversal guard) and size limits.
 //!
 //! ## Registered functions
 //!
-//! - `nova.read_file(path, opts?)` — read file with line range + metadata
-//! - `nova.write_file(path, content)` — atomic file write
-//! - `nova.edit_file(path, old_string, new_string)` — safe find-and-replace
-//! - `nova.search_files(root, pattern, opts?)` — recursive grep
-//! - `nova.find_files(root, pattern, opts?)` — recursive filename glob match
-//! - `nova.list_dir(path)` — list directory contents
-//! - `nova.file_info(path)` — file metadata
-//! - `nova.mkdir(path)` — create a directory (recursive)
-//! - `nova.copy_path(src, dst)` — copy a file
-//! - `nova.move_path(src, dst)` — move/rename a file or directory
-//! - `nova.delete_path(path, opts?)` — delete a file or directory
-//! - `nova.run_bash(cmd, opts?)` — shell command execution
-//! - `nova.get_env(name)` — environment variable reading
-//! - `nova.get_cwd()` — current working directory
-//! - `nova.get_project_root()` — project root
-//! - `nova.register_tool(spec)` — register a tool for the AI model
-//! - `nova.on(event, callback)` — subscribe to a lifecycle event
+//! - `zay.read_file(path, opts?)` — read file with line range + metadata
+//! - `zay.write_file(path, content)` — atomic file write
+//! - `zay.edit_file(path, old_string, new_string)` — safe find-and-replace
+//! - `zay.search_files(root, pattern, opts?)` — recursive grep
+//! - `zay.find_files(root, pattern, opts?)` — recursive filename glob match
+//! - `zay.list_dir(path)` — list directory contents
+//! - `zay.file_info(path)` — file metadata
+//! - `zay.mkdir(path)` — create a directory (recursive)
+//! - `zay.copy_path(src, dst)` — copy a file
+//! - `zay.move_path(src, dst)` — move/rename a file or directory
+//! - `zay.delete_path(path, opts?)` — delete a file or directory
+//! - `zay.run_bash(cmd, opts?)` — shell command execution
+//! - `zay.get_env(name)` — environment variable reading
+//! - `zay.get_cwd()` — current working directory
+//! - `zay.get_project_root()` — project root
+//! - `zay.register_tool(spec)` — register a tool for the AI model
+//! - `zay.on(event, callback)` — subscribe to a lifecycle event
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -98,17 +98,17 @@ const mime_map = std.StaticStringMap([]const u8).initComptime(.{
 
 /// Retrieve the Io instance stored in the Lua registry.
 fn getIo(L: *c.lua_State) std.Io {
-    _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "nova_io");
+    _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "zay_io");
     defer c.lua_pop(L, 1);
     const ptr = c.lua_touserdata(L, -1);
     return @as(*const std.Io, @ptrCast(@alignCast(ptr))).*;
 }
 
-/// ── nova.require(path) ───────────────────────────────────────────────
+/// ── zay.require(path) ───────────────────────────────────────────────
 ///
 /// Loads a Lua module relative to the plugin's root directory.
 /// Modules are confined to the plugin directory (INV-REQ-1) and cached
-/// in `nova_loaded_modules` (INV-REQ-3).
+/// in `zay_loaded_modules` (INV-REQ-3).
 pub fn requireModule(L: ?*c.lua_State) callconv(.c) c_int {
     const L_ptr = L orelse return 0;
     var state = State{ .handle = L_ptr };
@@ -121,12 +121,12 @@ pub fn requireModule(L: ?*c.lua_State) callconv(.c) c_int {
     };
 
     // Get plugin root directory from registry
-    _ = c.lua_getfield(L_ptr, c.LUA_REGISTRYINDEX, "nova_plugin_dir");
+    _ = c.lua_getfield(L_ptr, c.LUA_REGISTRYINDEX, "zay_plugin_dir");
     const plugin_dir_str = state.toString(-1);
     if (plugin_dir_str == null or plugin_dir_str.?.len == 0) {
         state.pop(1);
         state.pushNil();
-        state.pushString("nova.require is only available within loaded plugins");
+        state.pushString("zay.require is only available within loaded plugins");
         return 2;
     }
     const plugin_dir = plugin_dir_str.?;
@@ -193,8 +193,8 @@ pub fn requireModule(L: ?*c.lua_State) callconv(.c) c_int {
         return 2;
     };
 
-    // Check registry table nova_loaded_modules
-    _ = c.lua_getfield(L_ptr, c.LUA_REGISTRYINDEX, "nova_loaded_modules");
+    // Check registry table zay_loaded_modules
+    _ = c.lua_getfield(L_ptr, c.LUA_REGISTRYINDEX, "zay_loaded_modules");
     const reg_tbl_idx = c.lua_gettop(L_ptr);
 
     const resolved_path_z = std.heap.page_allocator.dupeZ(u8, resolved_path) catch {
@@ -266,7 +266,7 @@ pub fn requireModule(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// ── nova.read_file(path, opts?) ──────────────────────────────────────
+/// ── zay.read_file(path, opts?) ──────────────────────────────────────
 ///
 /// Reads a file and returns a table with:
 ///   { content, size, lines, language, mime_type, path }
@@ -344,7 +344,7 @@ pub fn readFile(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// ── nova.write_file(path, content) ──────────────────────────────────
+/// ── zay.write_file(path, content) ──────────────────────────────────
 ///
 /// Writes content to a file atomically. Returns true on success.
 /// Returns nil + error message on failure.
@@ -381,7 +381,7 @@ pub fn writeFile(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// ── nova.edit_file(path, old_string, new_string) ─────────────────────
+/// ── zay.edit_file(path, old_string, new_string) ─────────────────────
 ///
 /// Replaces first occurrence of old_string with new_string in a file.
 /// Returns true on success, or nil + error on failure.
@@ -423,7 +423,7 @@ pub fn editFile(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// Core of `nova.edit_file`: stat the file, refuse anything over the read cap
+/// Core of `zay.edit_file`: stat the file, refuse anything over the read cap
 /// (a partial read would be written back and destroy data), then splice the
 /// replacement and write atomically. Extracted so it is unit-testable without
 /// a Lua state.
@@ -450,7 +450,7 @@ fn editFileSplice(io: std.Io, clean_path: []const u8, old_string: []const u8, ne
     writeFileAtomic(io, clean_path, new_content) catch return error.WriteFailed;
 }
 
-/// ── nova.search_files(root, pattern, opts?) ──────────────────────────
+/// ── zay.search_files(root, pattern, opts?) ──────────────────────────
 ///
 /// Recursively searches files matching pattern. Returns a table with:
 ///   { query, total_matches, results: [{file, line, content, match}], truncated }
@@ -517,7 +517,7 @@ pub fn searchFiles(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// ── nova.list_dir(path) ─────────────────────────────────────────────
+/// ── zay.list_dir(path) ─────────────────────────────────────────────
 ///
 /// Lists directory contents. Returns a table with:
 ///   { path, files: [{name}], directories: [{name}], total_items }
@@ -582,7 +582,7 @@ pub fn listDir(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// ── nova.find_files(root, pattern, opts?) ───────────────────────────
+/// ── zay.find_files(root, pattern, opts?) ───────────────────────────
 ///
 /// Recursively walk `root` and return every file whose **path relative to
 /// root** matches a glob `pattern`. The match covers the path relative to
@@ -809,7 +809,7 @@ fn segMatch(seg: []const u8, pat: []const u8) bool {
     return pi == pat.len;
 }
 
-/// ── nova.mkdir(path) ─────────────────────────────────────────────────
+/// ── zay.mkdir(path) ─────────────────────────────────────────────────
 ///
 /// Create a directory, including parents (recursive). Returns `true` or
 /// `nil, err`. The path is sanitized — traversal outside the project root is
@@ -842,7 +842,7 @@ pub fn mkdir(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// ── nova.copy_path(src, dst) ─────────────────────────────────────────
+/// ── zay.copy_path(src, dst) ─────────────────────────────────────────
 ///
 /// Copy a file from `src` to `dst`. Both paths are sanitized. Returns `true`
 /// or `nil, err`. Directories are not supported (use `run_bash` for tree
@@ -885,7 +885,7 @@ pub fn copyPath(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// ── nova.move_path(src, dst) ─────────────────────────────────────────
+/// ── zay.move_path(src, dst) ─────────────────────────────────────────
 ///
 /// Move (rename) a file or directory from `src` to `dst`. Both paths are
 /// sanitized; works across directory boundaries on the same filesystem.
@@ -928,7 +928,7 @@ pub fn movePath(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// ── nova.delete_path(path, opts?) ───────────────────────────────────
+/// ── zay.delete_path(path, opts?) ───────────────────────────────────
 ///
 /// Delete a file or directory. Optional `opts.recursive` (boolean, default
 /// `false`) controls whether a non-empty directory is removed with its
@@ -1015,7 +1015,7 @@ pub fn deletePath(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// ── nova.file_info(path) ─────────────────────────────────────────────
+/// ── zay.file_info(path) ─────────────────────────────────────────────
 ///
 /// Returns file metadata: { size, type, extension, language, mime_type }
 /// Returns nil + error on failure.
@@ -1077,7 +1077,7 @@ pub fn fileInfo(L: ?*c.lua_State) callconv(.c) c_int {
 /// Lua state carries no plugin (bridge unit tests). Borrowed from the Lua GC —
 /// consumed synchronously by the log call before returning.
 fn pluginDirBestEffort(L: *c.lua_State) []const u8 {
-    _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "nova_plugin_dir");
+    _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "zay_plugin_dir");
     if (c.lua_isnil(L, -1)) {
         c.lua_pop(L, 1);
         return "";
@@ -1101,7 +1101,7 @@ const ShellBackend = enum { bash, pwsh };
 fn shellBackendErrorMessage(err: anyerror, backend: ShellBackend) []const u8 {
     if (err == error.FileNotFound) {
         return switch (backend) {
-            .bash => "ShellUnavailable: bash not found (install Git Bash on Windows, or ensure bash is on PATH); consider nova.run_shell",
+            .bash => "ShellUnavailable: bash not found (install Git Bash on Windows, or ensure bash is on PATH); consider zay.run_shell",
             .pwsh => "ShellUnavailable: pwsh not found (install PowerShell 7, or ensure powershell.exe is on PATH)",
         };
     }
@@ -1144,7 +1144,7 @@ fn quoteShellArg(gpa: std.mem.Allocator, s: []const u8, pwsh_rules: bool) std.me
     return out;
 }
 
-/// ── nova.shell_quote(s, dialect?) ────────────────────────────────────
+/// ── zay.shell_quote(s, dialect?) ────────────────────────────────────
 ///
 /// Quote one argument for a shell command line. Dialects:
 ///   "posix"  (default) — for run_bash on every platform (git-bash on
@@ -1194,7 +1194,7 @@ pub fn shellQuote(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// ── nova.run_bash(cmd, opts?) ────────────────────────────────────────
+/// ── zay.run_bash(cmd, opts?) ────────────────────────────────────────
 ///
 /// Runs a shell command and returns a table with:
 ///   { stdout, stderr, code }
@@ -1275,7 +1275,7 @@ fn runShellWithBackend(L: ?*c.lua_State, backend: ShellBackend) c_int {
             cmd[0..@min(cmd.len, 80)],
         });
         state.pushNil();
-        state.pushString("UnsafeShellBlocked: command rejected by Nova's shell safety classifier; use the built-in bash tool for destructive commands");
+        state.pushString("UnsafeShellBlocked: command rejected by Zay's shell safety classifier; use the built-in bash tool for destructive commands");
         return 2;
     }
 
@@ -1324,7 +1324,7 @@ fn runShellWithBackend(L: ?*c.lua_State, backend: ShellBackend) c_int {
     }
 }
 
-/// ── nova.run_bash(cmd, opts?) ────────────────────────────────────────
+/// ── zay.run_bash(cmd, opts?) ────────────────────────────────────────
 ///
 /// Runs a bash command and returns a table with:
 ///   { stdout, stderr, code }
@@ -1339,7 +1339,7 @@ pub fn runBash(L: ?*c.lua_State) callconv(.c) c_int {
     return runShellWithBackend(L, .bash);
 }
 
-/// ── nova.run_shell(cmd, opts?) ───────────────────────────────────────
+/// ── zay.run_shell(cmd, opts?) ───────────────────────────────────────
 ///
 /// Runs a shell command using the host platform's native shell:
 /// PowerShell (`pwsh.exe`) on Windows, bash on POSIX. Accepts the same
@@ -1350,7 +1350,7 @@ pub fn runShell(L: ?*c.lua_State) callconv(.c) c_int {
     return runShellWithBackend(L, if (os.is_windows) .pwsh else .bash);
 }
 
-/// ── nova.get_env(name) ───────────────────────────────────────────────
+/// ── zay.get_env(name) ───────────────────────────────────────────────
 ///
 /// Returns the value of an environment variable, or nil if not set.
 pub fn getEnv(L: ?*c.lua_State) callconv(.c) c_int {
@@ -1383,7 +1383,7 @@ pub fn getEnv(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// ── nova.get_cwd() ──────────────────────────────────────────────────
+/// ── zay.get_cwd() ──────────────────────────────────────────────────
 ///
 /// Returns the current working directory as a string.
 pub fn getCwd(L: ?*c.lua_State) callconv(.c) c_int {
@@ -1402,7 +1402,7 @@ pub fn getCwd(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// ── nova.get_project_root() ─────────────────────────────────────────
+/// ── zay.get_project_root() ─────────────────────────────────────────
 ///
 /// Returns the project root directory (git repo root, or cwd if not a repo).
 pub fn getProjectRoot(L: ?*c.lua_State) callconv(.c) c_int {
@@ -1424,7 +1424,7 @@ pub fn getProjectRoot(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// ── nova.git_status() ───────────────────────────────────────────────
+/// ── zay.git_status() ───────────────────────────────────────────────
 ///
 /// Returns git status as a string (porcelain format).
 pub fn gitStatus(L: ?*c.lua_State) callconv(.c) c_int {
@@ -1468,7 +1468,7 @@ fn gitErrorString(stderr: []const u8, code: u32) []const u8 {
 
 var git_err_buf: [64]u8 = undefined;
 
-/// ── nova.git_diff(path?) ─────────────────────────────────────────────
+/// ── zay.git_diff(path?) ─────────────────────────────────────────────
 ///
 /// Returns git diff as a string. Optional path limits diff to a file.
 pub fn gitDiff(L: ?*c.lua_State) callconv(.c) c_int {
@@ -1527,7 +1527,7 @@ pub fn gitDiff(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// ── nova.git_log(n) ─────────────────────────────────────────────────
+/// ── zay.git_log(n) ─────────────────────────────────────────────────
 ///
 /// Returns recent git log entries as a string. n = number of commits (default 10).
 pub fn gitLog(L: ?*c.lua_State) callconv(.c) c_int {
@@ -1571,7 +1571,7 @@ pub fn gitLog(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// ── nova.git_branch() ───────────────────────────────────────────────
+/// ── zay.git_branch() ───────────────────────────────────────────────
 ///
 /// Returns the current git branch name.
 pub fn gitBranch(L: ?*c.lua_State) callconv(.c) c_int {
@@ -1618,7 +1618,7 @@ fn appendQuotedArg(list: *std.ArrayList(u8), gpa: std.mem.Allocator, arg: []cons
     try list.append(gpa, '\'');
 }
 
-/// ── nova.git_add(files) ─────────────────────────────────────────────
+/// ── zay.git_add(files) ─────────────────────────────────────────────
 ///
 /// Stages specific files for git commit. Accepts a single file path string,
 /// or an array of file path strings. Returns { success, output }.
@@ -1716,7 +1716,7 @@ pub fn gitAdd(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// ── nova.git_commit(msg, opts?) ────────────────────────────────────
+/// ── zay.git_commit(msg, opts?) ────────────────────────────────────
 ///
 /// Creates a git commit with the given message. Returns { success, output }
 /// (output = git stderr on failure, or the commit summary on success).
@@ -1831,7 +1831,7 @@ pub fn gitCommit(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// ── nova.think(prompt) ──────────────────────────────────────────────
+/// ── zay.think(prompt) ──────────────────────────────────────────────
 ///
 /// Sends a prompt to the LLM and returns the response.
 /// This is a stub implementation — full integration requires access to
@@ -1853,11 +1853,11 @@ pub fn think(L: ?*c.lua_State) callconv(.c) c_int {
     // For now, return an informative message.
     _ = prompt;
     state.pushNil();
-    state.pushString("nova.think() is not yet implemented — requires AI client integration");
+    state.pushString("zay.think() is not yet implemented — requires AI client integration");
     return 2;
 }
 
-/// ── nova.register_tool(spec) ─────────────────────────────────────────
+/// ── zay.register_tool(spec) ─────────────────────────────────────────
 ///
 /// Registers a tool that the AI model can call. The spec table must have:
 ///   name (string) — tool name (lowercase, underscores)
@@ -1865,11 +1865,11 @@ pub fn think(L: ?*c.lua_State) callconv(.c) c_int {
 ///   parameters (table) — parameter definitions
 ///   handler (function) — called with params when the model invokes the tool
 ///
-/// Stores the spec in the Lua registry under "nova_tools" as a table of
+/// Stores the spec in the Lua registry under "zay_tools" as a table of
 /// { name, description, parameters, handler_ref } entries. The handler is
 /// stored as a registry reference (luaL_ref) so it survives garbage collection.
 /// Returns true on success.
-/// Validate a tool name against Nova's convention: lowercase letter first,
+/// Validate a tool name against Zay's convention: lowercase letter first,
 /// then lowercase letters, digits, and underscores, max 64 chars. Provider
 /// tool names must match `^[a-zA-Z0-9_-]+$`; this stricter rule keeps names
 /// provider-safe and consistent.
@@ -1920,7 +1920,7 @@ pub fn registerTool(L: ?*c.lua_State) callconv(.c) c_int {
         return 2;
     };
     // Fail fast on invalid tool names: provider tool names must match
-    // `^[a-zA-Z0-9_-]+$`, and Nova's convention is lowercase + underscores.
+    // `^[a-zA-Z0-9_-]+$`, and Zay's convention is lowercase + underscores.
     if (name.len == 0 or name.len > 64 or !isValidToolName(name)) {
         const msg = std.fmt.allocPrint(std.heap.page_allocator, "invalid tool name '{s}' (must be lowercase letters, digits, and underscores, starting with a letter, max 64 chars)", .{name}) catch {
             state.pushNil();
@@ -1948,13 +1948,13 @@ pub fn registerTool(L: ?*c.lua_State) callconv(.c) c_int {
     }
     const handler_ref = c.luaL_ref(L_ptr, c.LUA_REGISTRYINDEX);
 
-    // Get or create the nova_tools table in the registry
-    _ = c.lua_getfield(L_ptr, c.LUA_REGISTRYINDEX, "nova_tools");
+    // Get or create the zay_tools table in the registry
+    _ = c.lua_getfield(L_ptr, c.LUA_REGISTRYINDEX, "zay_tools");
     if (state.isNil(-1)) {
         state.pop(1);
         state.newTable();
         _ = c.lua_pushvalue(L_ptr, -1);
-        _ = c.lua_setfield(L_ptr, c.LUA_REGISTRYINDEX, "nova_tools");
+        _ = c.lua_setfield(L_ptr, c.LUA_REGISTRYINDEX, "zay_tools");
     }
     const tools_table = c.lua_gettop(L_ptr);
 
@@ -1993,10 +1993,10 @@ pub fn registerTool(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// ── nova.on(event, callback) ────────────────────────────────────────
+/// ── zay.on(event, callback) ────────────────────────────────────────
 ///
 /// Subscribes to a lifecycle event. Stores the callback as a registry
-/// reference in the "nova_events" table keyed by event name.
+/// reference in the "zay_events" table keyed by event name.
 /// Returns true on success.
 pub fn onEvent(L: ?*c.lua_State) callconv(.c) c_int {
     const L_ptr = L orelse return 0;
@@ -2031,13 +2031,13 @@ pub fn onEvent(L: ?*c.lua_State) callconv(.c) c_int {
     // Store callback as registry reference
     const callback_ref = c.luaL_ref(L_ptr, c.LUA_REGISTRYINDEX);
 
-    // Get or create nova_events table in registry
-    _ = c.lua_getfield(L_ptr, c.LUA_REGISTRYINDEX, "nova_events");
+    // Get or create zay_events table in registry
+    _ = c.lua_getfield(L_ptr, c.LUA_REGISTRYINDEX, "zay_events");
     if (state.isNil(-1)) {
         state.pop(1);
         state.newTable();
         _ = c.lua_pushvalue(L_ptr, -1);
-        _ = c.lua_setfield(L_ptr, c.LUA_REGISTRYINDEX, "nova_events");
+        _ = c.lua_setfield(L_ptr, c.LUA_REGISTRYINDEX, "zay_events");
     }
     const events_table = c.lua_gettop(L_ptr);
 
@@ -2062,9 +2062,9 @@ pub fn onEvent(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// Count registered tools in a Lua state by reading "nova_tools" from registry.
+/// Count registered tools in a Lua state by reading "zay_tools" from registry.
 pub fn countTools(L: *c.lua_State) u32 {
-    _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "nova_tools");
+    _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "zay_tools");
     defer c.lua_pop(L, 1);
     if (c.lua_isnil(L, -1)) return 0;
     return @intCast(c.lua_rawlen(L, -1));
@@ -2073,7 +2073,7 @@ pub fn countTools(L: *c.lua_State) u32 {
 /// Find the index of a registered tool by name in the Lua registry.
 /// Returns the 1-based index used by `callToolHandler`, or null if not found.
 pub fn findToolIndex(L: *c.lua_State, tool_name: []const u8) ?c_int {
-    _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "nova_tools");
+    _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "zay_tools");
     defer c.lua_pop(L, 1);
     if (c.lua_isnil(L, -1)) return null;
 
@@ -2147,7 +2147,7 @@ pub fn pluginGetConfig(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-// ── nova.json_decode / nova.json_encode ──────────────────────────────
+// ── zay.json_decode / zay.json_encode ──────────────────────────────
 //
 // Plugins had no way to parse or emit JSON: incoming tool params are
 // auto-parsed by `callToolHandler` (pushJsonToLua), but a plugin reading a
@@ -2155,14 +2155,14 @@ pub fn pluginGetConfig(L: ?*c.lua_State) callconv(.c) c_int {
 // out to `jq`. These two bridges close that gap by reusing the existing
 // std.json ↔ Lua value conversion.
 //
-// - `nova.json_decode(str)` reuses `pushJsonValue` (Zig JSON Value → Lua).
-// - `nova.json_encode(value, opts?)` traverses the Lua value with lua_next and
+// - `zay.json_decode(str)` reuses `pushJsonValue` (Zig JSON Value → Lua).
+// - `zay.json_encode(value, opts?)` traverses the Lua value with lua_next and
 //   writes JSON to an allocating writer. Tables with contiguous 1..N integer
 //   keys serialize as arrays; everything else (mixed/non-int keys) is an
 //   object. This mirrors how Lua itself treats tables: there is no array/map
 //   distinction, so the encoder infers it from the key shape.
 
-/// ── nova.json_decode(string) ─────────────────────────────────────────
+/// ── zay.json_decode(string) ─────────────────────────────────────────
 ///
 /// Parses a JSON string into a native Lua value (table/string/number/boolean/
 /// nil). Returns the value on success, or nil + error message on failure.
@@ -2194,7 +2194,7 @@ pub fn jsonDecode(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// ── nova.json_encode(value, opts?) ───────────────────────────────────
+/// ── zay.json_encode(value, opts?) ───────────────────────────────────
 ///
 /// Converts a Lua value to a JSON string. `opts` is an optional table with:
 ///   pretty (bool) — emit indented (indent_2) output for human editing.
@@ -2421,7 +2421,7 @@ fn writeIndent(writer: *std.Io.Writer, depth: usize) JsonWriteError!void {
 
 /// Recursively push a `std.json.Value` onto the Lua stack.
 ///
-/// Public because `nova.json_decode` reuses this same conversion (Zig JSON
+/// Public because `zay.json_decode` reuses this same conversion (Zig JSON
 /// Value → Lua value) rather than re-implementing it.
 pub fn pushJsonValue(L: *c.lua_State, gpa: std.mem.Allocator, value: std.json.Value) !void {
     switch (value) {
@@ -2469,8 +2469,8 @@ pub fn callToolHandler(
     tool_index: c_int,
     params_json: []const u8,
 ) ![]u8 {
-    // Get nova_tools[index].handler_ref
-    _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "nova_tools");
+    // Get zay_tools[index].handler_ref
+    _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "zay_tools");
     if (c.lua_isnil(L, -1)) {
         c.lua_pop(L, 1);
         return error.NoToolsRegistered;
@@ -2519,7 +2519,7 @@ pub fn callToolHandler(
 /// Sanitize a path: resolve `..` and `.` segments, reject traversal.
 ///
 /// The lexical check (resolve + prefix) is necessary but not sufficient: a
-/// symlink inside the project pointing outside (`ln -s /etc .nova/link`)
+/// symlink inside the project pointing outside (`ln -s /etc .zay/link`)
 /// resolves lexically inside cwd and would be served. Mirror the documented
 /// `validateCwd` pattern — after the lexical check passes, best-effort
 /// `realpathAlloc` on the resolved path; if realpath succeeds, re-check the
@@ -2965,7 +2965,7 @@ test "registerTool + countTools: sandboxed state" {
 
     // Register a tool via Lua code (same as what init.lua does).
     const ok = L.doString(
-        \\nova.register_tool({
+        \\zay.register_tool({
         \\  name = "test_tool",
         \\  description = "A test tool",
         \\  parameters = {
@@ -2996,7 +2996,7 @@ test "registerTool rejects invalid tool names (T6)" {
     // Uppercase, space, colon, empty, and over-long names are all rejected.
     try expectLuaOk(&L,
         \\local function try(name)
-        \\  local ok, err = nova.register_tool({
+        \\  local ok, err = zay.register_tool({
         \\    name = name, description = "d",
         \\    handler = function() return "x" end,
         \\  })
@@ -3013,7 +3013,7 @@ test "registerTool rejects invalid tool names (T6)" {
 
     // A valid lowercase/underscore name still registers.
     try expectLuaOk(&L,
-        \\local ok, err = nova.register_tool({
+        \\local ok, err = zay.register_tool({
         \\  name = "valid_tool_2", description = "d",
         \\  handler = function() return "x" end,
         \\})
@@ -3033,7 +3033,7 @@ test "onEvent rejects unknown event names (T6)" {
 
     // A typo'd event name must fail fast, not silently never fire.
     try expectLuaOk(&L,
-        \\local ok, err = nova.on("turn_strated", function() end)
+        \\local ok, err = zay.on("turn_strated", function() end)
         \\assert(ok == nil, "unknown event should fail")
         \\assert(err ~= nil and err:find("unknown event") ~= nil, tostring(err))
         \\return "OK"
@@ -3047,17 +3047,17 @@ test "onEvent rejects unknown event names (T6)" {
         \\  "plugin_loaded", "plugin_unloaded",
         \\}
         \\for _, n in ipairs(names) do
-        \\  local ok, err = nova.on(n, function() end)
+        \\  local ok, err = zay.on(n, function() end)
         \\  assert(ok == true, n .. ": " .. tostring(err))
         \\end
         \\return "OK"
     );
 }
 
-// ── nova.write_file / writeFileAtomic tests ──────────────────────────
+// ── zay.write_file / writeFileAtomic tests ──────────────────────────
 //
-// writeFileAtomic is the shared write+rename core behind both nova.write_file
-// and nova.edit_file; the Lua-level tests exercise the binding surface
+// writeFileAtomic is the shared write+rename core behind both zay.write_file
+// and zay.edit_file; the Lua-level tests exercise the binding surface
 // (argument validation, path sanitization, and a real write under cwd).
 
 test "writeFileAtomic writes, overwrites, and leaves no temp file" {
@@ -3101,7 +3101,7 @@ test "writeFileAtomic writes, overwrites, and leaves no temp file" {
     }
 }
 
-test "nova.write_file validates its arguments" {
+test "zay.write_file validates its arguments" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
@@ -3110,17 +3110,17 @@ test "nova.write_file validates its arguments" {
     }
 
     try expectLuaOk(&L,
-        \\local ok, err = nova.write_file()
+        \\local ok, err = zay.write_file()
         \\assert(ok == nil, "missing path should fail")
         \\assert(err == "path argument is required", tostring(err))
-        \\local ok2, err2 = nova.write_file("x.txt")
+        \\local ok2, err2 = zay.write_file("x.txt")
         \\assert(ok2 == nil, "missing content should fail")
         \\assert(err2 == "content argument is required", tostring(err2))
         \\return "OK"
     );
 }
 
-test "nova.write_file rejects traversal and invalid paths without writing" {
+test "zay.write_file rejects traversal and invalid paths without writing" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
@@ -3129,18 +3129,18 @@ test "nova.write_file rejects traversal and invalid paths without writing" {
     }
 
     try expectLuaOk(&L,
-        \\local ok, err = nova.write_file("../escape.txt", "x")
+        \\local ok, err = zay.write_file("../escape.txt", "x")
         \\assert(ok == nil, "path traversal should fail")
         \\assert(err == "PathTraversal", tostring(err))
         \\local p = "bad" .. string.char(0) .. "path.txt"
-        \\local ok2, err2 = nova.write_file(p, "x")
+        \\local ok2, err2 = zay.write_file(p, "x")
         \\assert(ok2 == nil, "nul byte should fail")
         \\assert(err2 == "InvalidPath", tostring(err2))
         \\return "OK"
     );
 }
 
-test "nova.write_file writes content to a path under cwd" {
+test "zay.write_file writes content to a path under cwd" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3156,7 +3156,7 @@ test "nova.write_file writes content to a path under cwd" {
     const target = try std.fs.path.join(gpa, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "lua-write.txt" });
     defer gpa.free(target);
 
-    const chunk = try std.fmt.allocPrintSentinel(gpa, "local ok, err = nova.write_file(\"{s}\", \"hello from lua\")\nassert(ok == true, tostring(err))\nreturn \"OK\"", .{rel}, 0);
+    const chunk = try std.fmt.allocPrintSentinel(gpa, "local ok, err = zay.write_file(\"{s}\", \"hello from lua\")\nassert(ok == true, tostring(err))\nreturn \"OK\"", .{rel}, 0);
     defer gpa.free(chunk);
 
     const sandbox = @import("sandbox.zig");
@@ -3233,7 +3233,7 @@ test "readFile exposes truncation on a file over 1 MB" {
     const lua_target = try forwardSlashDup(gpa, target);
     defer gpa.free(lua_target);
     const chunk = try std.fmt.allocPrintSentinel(gpa,
-        \\local r = nova.read_file("{s}", {{}})
+        \\local r = zay.read_file("{s}", {{}})
         \\assert(type(r) == "table", "read_file returns a table")
         \\assert(r.truncated == true, "truncated flag set for >1MB file")
         \\assert(r.full_size == {d}, "full_size is the on-disk size, got " .. tostring(r.full_size))
@@ -3268,7 +3268,7 @@ test "readFile clamps a negative max_size without panicking" {
     const lua_target = try forwardSlashDup(gpa, target);
     defer gpa.free(lua_target);
     const chunk = try std.fmt.allocPrintSentinel(gpa,
-        \\local r = nova.read_file("{s}", {{ max_size = -1 }})
+        \\local r = zay.read_file("{s}", {{ max_size = -1 }})
         \\assert(type(r) == "table", "clamped read returns a table")
         \\return "OK"
     , .{lua_target}, 0);
@@ -3276,7 +3276,7 @@ test "readFile clamps a negative max_size without panicking" {
     try expectLuaOk(&L, chunk);
 }
 
-// ── nova.json_decode / nova.json_encode tests ────────────────────────
+// ── zay.json_decode / zay.json_encode tests ────────────────────────
 //
 // Each test drives the bridge through real Lua code (doString) and asserts
 // inside Lua, returning a sentinel string ("OK") on success. This avoids
@@ -3286,7 +3286,7 @@ test "readFile clamps a negative max_size without panicking" {
 
 /// Duplicate a filesystem path replacing every backslash with a forward slash,
 /// so it can be interpolated safely into a Lua string literal. A Windows path
-/// like `C:\work\nova` carries `\w`/`\n` sequences that Lua mangles (or rejects
+/// like `C:\work\zay` carries `\w`/`\n` sequences that Lua mangles (or rejects
 /// for invalid escapes like `\G`) when embedded verbatim. Windows accepts
 /// forward slashes, so the replacement is lossless for path resolution.
 fn forwardSlashDup(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -3323,7 +3323,7 @@ test "json_decode: object becomes Lua table" {
         L.deinit();
     }
     try expectLuaOk(&L,
-        \\local t = nova.json_decode('{"a": 1, "b": "hi"}')
+        \\local t = zay.json_decode('{"a": 1, "b": "hi"}')
         \\assert(type(t) == "table", "expected table")
         \\assert(t.a == 1, "a should be 1")
         \\assert(t.b == "hi", "b should be hi")
@@ -3339,7 +3339,7 @@ test "json_decode: array becomes 1-indexed table" {
         L.deinit();
     }
     try expectLuaOk(&L,
-        \\local arr = nova.json_decode('[10, 20, 30]')
+        \\local arr = zay.json_decode('[10, 20, 30]')
         \\assert(arr[1] == 10, "arr[1] should be 10")
         \\assert(arr[2] == 20, "arr[2] should be 20")
         \\assert(arr[3] == 30, "arr[3] should be 30")
@@ -3355,12 +3355,12 @@ test "json_decode: primitives (null/bool/number/string)" {
         L.deinit();
     }
     try expectLuaOk(&L,
-        \\assert(nova.json_decode('null') == nil, "null -> nil")
-        \\assert(nova.json_decode('true') == true, "true -> true")
-        \\assert(nova.json_decode('false') == false, "false -> false")
-        \\assert(nova.json_decode('42') == 42, "int -> number")
-        \\assert(nova.json_decode('3.5') == 3.5, "float -> number")
-        \\assert(nova.json_decode('"word"') == "word", "string -> string")
+        \\assert(zay.json_decode('null') == nil, "null -> nil")
+        \\assert(zay.json_decode('true') == true, "true -> true")
+        \\assert(zay.json_decode('false') == false, "false -> false")
+        \\assert(zay.json_decode('42') == 42, "int -> number")
+        \\assert(zay.json_decode('3.5') == 3.5, "float -> number")
+        \\assert(zay.json_decode('"word"') == "word", "string -> string")
         \\return "OK"
     );
 }
@@ -3373,7 +3373,7 @@ test "json_decode: malformed input returns nil + error" {
         L.deinit();
     }
     try expectLuaOk(&L,
-        \\local v, err = nova.json_decode('{bad json')
+        \\local v, err = zay.json_decode('{bad json')
         \\assert(v == nil, "malformed should yield nil")
         \\assert(type(err) == "string" and #err > 0, "error string expected")
         \\return "OK"
@@ -3388,10 +3388,10 @@ test "json_encode: object table to JSON" {
         L.deinit();
     }
     try expectLuaOk(&L,
-        \\local s = nova.json_encode({ a = 1, b = "hi" })
+        \\local s = zay.json_encode({ a = 1, b = "hi" })
         \\assert(type(s) == "string", "encode returns string")
         \\-- object key order is not guaranteed; check both pairs round-trip
-        \\local back = nova.json_decode(s)
+        \\local back = zay.json_decode(s)
         \\assert(back.a == 1 and back.b == "hi", "round-trip preserves values")
         \\return "OK"
     );
@@ -3405,10 +3405,10 @@ test "json_encode: array table to JSON bracket" {
         L.deinit();
     }
     try expectLuaOk(&L,
-        \\local s = nova.json_encode({ 10, 20, 30 })
+        \\local s = zay.json_encode({ 10, 20, 30 })
         \\assert(s:sub(1, 1) == "[", "array starts with [")
         \\assert(s:sub(-1) == "]", "array ends with ]")
-        \\local back = nova.json_decode(s)
+        \\local back = zay.json_decode(s)
         \\assert(back[1] == 10 and back[2] == 20 and back[3] == 30, "round-trip")
         \\return "OK"
     );
@@ -3422,8 +3422,8 @@ test "json_encode: pretty option indents output" {
         L.deinit();
     }
     try expectLuaOk(&L,
-        \\local compact = nova.json_encode({ a = 1 })
-        \\local pretty = nova.json_encode({ a = 1 }, { pretty = true })
+        \\local compact = zay.json_encode({ a = 1 })
+        \\local pretty = zay.json_encode({ a = 1 }, { pretty = true })
         \\assert(not compact:find("\n", 1, true), "compact has no newline")
         \\assert(pretty:find("\n", 1, true) ~= nil, "pretty has newlines")
         \\assert(pretty:find("  ", 1, true) ~= nil, "pretty has indent")
@@ -3439,11 +3439,11 @@ test "json_encode: escapes quotes and special chars in strings" {
         L.deinit();
     }
     try expectLuaOk(&L,
-        \\local s = nova.json_encode({ msg = 'he said "hi"\nbye' })
+        \\local s = zay.json_encode({ msg = 'he said "hi"\nbye' })
         \\assert(s:find('\\"', 1, true), "quotes escaped")
         \\assert(s:find('\\n', 1, true), "newline escaped")
         \\-- round-trip must recover the original string
-        \\local back = nova.json_decode(s)
+        \\local back = zay.json_decode(s)
         \\assert(back.msg == 'he said "hi"\nbye', "round-trip preserves escapes")
         \\return "OK"
     );
@@ -3457,8 +3457,8 @@ test "json_encode: nested table (object with array value)" {
         L.deinit();
     }
     try expectLuaOk(&L,
-        \\local s = nova.json_encode({ name = "x", items = { 1, 2 } })
-        \\local back = nova.json_decode(s)
+        \\local s = zay.json_encode({ name = "x", items = { 1, 2 } })
+        \\local back = zay.json_decode(s)
         \\assert(back.name == "x", "scalar field preserved")
         \\assert(type(back.items) == "table", "nested table preserved")
         \\assert(back.items[1] == 1 and back.items[2] == 2, "array preserved")
@@ -3475,9 +3475,9 @@ test "json round-trip: decode then encode preserves structure" {
     }
     try expectLuaOk(&L,
         \\local original = '{"id": 7, "steps": [{"text": "a", "done": true}]}'
-        \\local decoded = nova.json_decode(original)
-        \\local encoded = nova.json_encode(decoded)
-        \\local redecoded = nova.json_decode(encoded)
+        \\local decoded = zay.json_decode(original)
+        \\local encoded = zay.json_encode(decoded)
+        \\local redecoded = zay.json_decode(encoded)
         \\assert(redecoded.id == 7, "top-level scalar preserved")
         \\assert(redecoded.steps[1].text == "a", "nested object.text preserved")
         \\assert(redecoded.steps[1].done == true, "nested object.done preserved")
@@ -3559,20 +3559,20 @@ fn gitAvailable() bool {
     } else |_| return false;
 }
 
-/// Create an empty git repo under `/tmp/nova-inject-test`, returning the path.
+/// Create an empty git repo under `/tmp/zay-inject-test`, returning the path.
 /// Caller frees the path; the dir is removed via the shell. Sets a deterministic
 /// identity so `git commit` does not refuse to run.
 fn makeInjectionTestRepo(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
-    const dir = try std.fs.path.join(gpa, &.{ "/tmp", "nova-inject-test" });
+    const dir = try std.fs.path.join(gpa, &.{ "/tmp", "zay-inject-test" });
     errdefer gpa.free(dir);
-    ignoreRun(gpa, io, "/tmp", "rm -rf nova-inject-test");
+    ignoreRun(gpa, io, "/tmp", "rm -rf zay-inject-test");
     var result = try bash_exec.run(
         gpa,
         io,
         "/tmp",
-        "mkdir -p nova-inject-test && git -C nova-inject-test init -q && " ++
-            "git -C nova-inject-test config user.email t@t && " ++
-            "git -C nova-inject-test config user.name t",
+        "mkdir -p zay-inject-test && git -C zay-inject-test init -q && " ++
+            "git -C zay-inject-test config user.email t@t && " ++
+            "git -C zay-inject-test config user.name t",
     );
     result.deinit(gpa);
     return dir;
@@ -3619,15 +3619,15 @@ test "gitCommit: injection payload stays a literal commit message (stdin path)" 
     const io = std.testing.io;
     const dir = try makeInjectionTestRepo(gpa, io);
     defer {
-        ignoreRun(gpa, io, "/tmp", "rm -rf nova-inject-test");
+        ignoreRun(gpa, io, "/tmp", "rm -rf zay-inject-test");
         gpa.free(dir);
     }
 
     // The injection vector from the plan: a quote-break-out attempt. With the
-    // old `-m "{msg}"` it would run `touch /tmp/pwned_nova`; with `-F -` +
+    // old `-m "{msg}"` it would run `touch /tmp/pwned_zay`; with `-F -` +
     // stdin it must become the literal commit subject.
-    const marker = "/tmp/pwned_nova_commit";
-    ignoreRun(gpa, io, "/tmp", "rm -f pwned_nova_commit");
+    const marker = "/tmp/pwned_zay_commit";
+    ignoreRun(gpa, io, "/tmp", "rm -f pwned_zay_commit");
     const payload = "x\"; touch " ++ marker ++ "; #";
     var result = try bash_exec.runWithOptions(gpa, io, .{
         .cwd = dir,
@@ -3638,7 +3638,7 @@ test "gitCommit: injection payload stays a literal commit message (stdin path)" 
 
     // The marker file must NOT exist: the payload never reached the shell.
     try std.testing.expect(!fileExists(gpa, io, marker));
-    ignoreRun(gpa, io, "/tmp", "rm -f pwned_nova_commit");
+    ignoreRun(gpa, io, "/tmp", "rm -f pwned_zay_commit");
 }
 
 test "gitDiff: injection payload stays a literal pathspec (shellQuote path)" {
@@ -3650,7 +3650,7 @@ test "gitDiff: injection payload stays a literal pathspec (shellQuote path)" {
     const io = std.testing.io;
     const dir = try makeInjectionTestRepo(gpa, io);
     defer {
-        ignoreRun(gpa, io, "/tmp", "rm -rf nova-inject-test");
+        ignoreRun(gpa, io, "/tmp", "rm -rf zay-inject-test");
         gpa.free(dir);
     }
 
@@ -3658,8 +3658,8 @@ test "gitDiff: injection payload stays a literal pathspec (shellQuote path)" {
     var setup = try bash_exec.run(gpa, io, dir, "echo a > f && git add -A && git commit -q -m init");
     setup.deinit(gpa);
 
-    const marker = "/tmp/pwned_nova_diff";
-    ignoreRun(gpa, io, "/tmp", "rm -f pwned_nova_diff");
+    const marker = "/tmp/pwned_zay_diff";
+    ignoreRun(gpa, io, "/tmp", "rm -f pwned_zay_diff");
     // The quote-break-out payload, funneled through `shellQuote` exactly as
     // `gitDiff` does, must become one inert pathspec.
     const quoted = try quoteShellArg(gpa, "x'; touch " ++ marker ++ "; #", false);
@@ -3673,7 +3673,7 @@ test "gitDiff: injection payload stays a literal pathspec (shellQuote path)" {
     result.deinit(gpa);
 
     try std.testing.expect(!fileExists(gpa, io, marker));
-    ignoreRun(gpa, io, "/tmp", "rm -f pwned_nova_diff");
+    ignoreRun(gpa, io, "/tmp", "rm -f pwned_zay_diff");
 }
 
 test "RunOptions.stdin bypasses shell interpretation" {
@@ -3687,11 +3687,11 @@ test "RunOptions.stdin bypasses shell interpretation" {
     var result = try bash_exec.runWithOptions(gpa, std.testing.io, .{
         .cwd = cwd,
         .command = "cat",
-        .stdin = "a$(touch /tmp/pwned_nova_stdin)b",
+        .stdin = "a$(touch /tmp/pwned_zay_stdin)b",
     });
     defer result.deinit(gpa);
-    try std.testing.expectEqualStrings("a$(touch /tmp/pwned_nova_stdin)b", result.stdout);
-    ignoreRun(gpa, std.testing.io, "/tmp", "rm -f pwned_nova_stdin");
+    try std.testing.expectEqualStrings("a$(touch /tmp/pwned_zay_stdin)b", result.stdout);
+    ignoreRun(gpa, std.testing.io, "/tmp", "rm -f pwned_zay_stdin");
 }
 
 // ── B2-Zig: negative table integers clamp before the u32 cast ───────
@@ -3706,7 +3706,7 @@ test "searchFiles clamps a negative max_results without panicking" {
     // A negative max_results used to be `@intCast(v)` on the raw i64 — a cast
     // panic in safe builds. It must now clamp to 1 and return a normal result.
     try expectLuaOk(&L,
-        \\local r = nova.search_files(".", "no-such-pattern-xyz", { max_results = -1 })
+        \\local r = zay.search_files(".", "no-such-pattern-xyz", { max_results = -1 })
         \\assert(type(r) == "table", "clamped search returns a table")
         \\return "OK"
     );
@@ -3720,7 +3720,7 @@ test "findFiles clamps a negative max_results without panicking" {
         L.deinit();
     }
     try expectLuaOk(&L,
-        \\local r = nova.find_files(".", "no-such-glob-xyz", { max_results = -1 })
+        \\local r = zay.find_files(".", "no-such-glob-xyz", { max_results = -1 })
         \\assert(type(r) == "table", "clamped find returns a table")
         \\return "OK"
     );
@@ -3735,7 +3735,7 @@ test "runBash clamps a negative timeout without panicking" {
         L.deinit();
     }
     try expectLuaOk(&L,
-        \\local r = nova.run_bash("true", { timeout = -1 })
+        \\local r = zay.run_bash("true", { timeout = -1 })
         \\assert(type(r) == "table", "clamped run_bash returns a table")
         \\assert(r.code == 0, "true exits 0")
         \\return "OK"
@@ -3751,13 +3751,13 @@ test "runBash pipes opts.stdin to the child (P4)" {
         L.deinit();
     }
     try expectLuaOk(&L,
-        \\local r = nova.run_bash("cat", { stdin = "hello stdin" })
+        \\local r = zay.run_bash("cat", { stdin = "hello stdin" })
         \\assert(type(r) == "table", "stdin run returns a table")
         \\assert(r.stdout == "hello stdin", "stdout echoes stdin: " .. tostring(r.stdout))
         \\assert(r.code == 0, "cat exits 0")
         \\
         \\-- No stdin: the child's stdin is simply absent/closed.
-        \\local r2 = nova.run_bash("printf ok")
+        \\local r2 = zay.run_bash("printf ok")
         \\assert(r2.stdout == "ok", "plain run unaffected")
         \\return "OK"
     );
@@ -3776,7 +3776,7 @@ test "runBash blocks unsafe commands via the local matcher (P5)" {
     }
     bridge.bash_classifier_url_slot = null;
     try expectLuaOk(&L,
-        \\local r, err = nova.run_bash("rm -rf /")
+        \\local r, err = zay.run_bash("rm -rf /")
         \\assert(r == nil, "unsafe command returns nil")
         \\assert(string.find(err, "UnsafeShellBlocked", 1, true) ~= nil, "error carries UnsafeShellBlocked: " .. tostring(err))
         \\return "OK"
@@ -3801,10 +3801,10 @@ test "runBash safety gate holds with a configured-but-unreachable classifier (P5
     if (os.is_windows) return error.SkipZigTest;
 
     try expectLuaOk(&L,
-        \\local r, err = nova.run_bash("rm -rf /")
+        \\local r, err = zay.run_bash("rm -rf /")
         \\assert(r == nil, "locally-matched unsafe command still blocked with a down classifier")
         \\assert(string.find(err, "UnsafeShellBlocked", 1, true) ~= nil, "got: " .. tostring(err))
-        \\local ok = nova.run_bash("printf fine")
+        \\local ok = zay.run_bash("printf fine")
         \\assert(type(ok) == "table" and ok.stdout == "fine", "safe command passes")
         \\return "OK"
     );
@@ -3820,10 +3820,10 @@ test "runBash and run_shell reject an empty command before any spawn (P5)" {
         L.deinit();
     }
     try expectLuaOk(&L,
-        \\local r1, e1 = nova.run_bash("")
+        \\local r1, e1 = zay.run_bash("")
         \\assert(r1 == nil, "empty command returns nil")
         \\assert(e1 == "command argument must not be empty", "got: " .. tostring(e1))
-        \\local r2, e2 = nova.run_shell("")
+        \\local r2, e2 = zay.run_shell("")
         \\assert(r2 == nil and e2 == "command argument must not be empty", "run_shell guards too")
         \\return "OK"
     );
@@ -3886,7 +3886,7 @@ test "shellBackendErrorMessage maps only FileNotFound" {
     try std.testing.expectEqualStrings("StreamTooLong", shellBackendErrorMessage(error.StreamTooLong, .pwsh));
 }
 
-test "nova.shell_quote dialects and error contract (P7)" {
+test "zay.shell_quote dialects and error contract (P7)" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
@@ -3894,24 +3894,24 @@ test "nova.shell_quote dialects and error contract (P7)" {
         L.deinit();
     }
     try expectLuaOk(&L,
-        \\assert(nova.shell_quote("a'b") == "'a'\\''b'", "default is posix")
-        \\assert(nova.shell_quote("a'b", "posix") == "'a'\\''b'")
-        \\assert(nova.shell_quote("") == "''", "empty string quotes to ''")
-        \\assert(nova.shell_quote(nil, "posix") == nil, "missing string arg: nil+err")
+        \\assert(zay.shell_quote("a'b") == "'a'\\''b'", "default is posix")
+        \\assert(zay.shell_quote("a'b", "posix") == "'a'\\''b'")
+        \\assert(zay.shell_quote("") == "''", "empty string quotes to ''")
+        \\assert(zay.shell_quote(nil, "posix") == nil, "missing string arg: nil+err")
         \\
         \\-- On POSIX, native == posix; the pwsh doubling rule is only
         \\-- observable on Windows (covered by a Windows-gated test).
-        \\local native = nova.shell_quote("x y", "native")
+        \\local native = zay.shell_quote("x y", "native")
         \\assert(native == "'x y'", "native == posix on POSIX")
         \\
-        \\local v, err = nova.shell_quote("x", "bogus")
+        \\local v, err = zay.shell_quote("x", "bogus")
         \\assert(v == nil, "unknown dialect yields nil")
         \\assert(err == "shell_quote: dialect must be \"posix\" or \"native\"", "got: " .. tostring(err))
         \\return "OK"
     );
 }
 
-test "nova.shell_quote native dispatches to pwsh rules on Windows (P7)" {
+test "zay.shell_quote native dispatches to pwsh rules on Windows (P7)" {
     if (!os.is_windows) return error.SkipZigTest;
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
@@ -3920,7 +3920,7 @@ test "nova.shell_quote native dispatches to pwsh rules on Windows (P7)" {
         L.deinit();
     }
     try expectLuaOk(&L,
-        \\assert(nova.shell_quote("a'b", "native") == "'a''b'", "pwsh doubles quotes")
+        \\assert(zay.shell_quote("a'b", "native") == "'a''b'", "pwsh doubles quotes")
         \\return "OK"
     );
 }
@@ -3950,14 +3950,14 @@ test "sanitizePath rejects a symlink escaping the project root" {
     _ = std.c.symlink(target_z, link_z); // skip if symlink unsupported
 
     // Create a real file in /tmp so realpath resolves the final component.
-    const marker = try std.fmt.allocPrintSentinel(gpa, "{s}", .{"/tmp/nova_symlink_marker"}, 0);
+    const marker = try std.fmt.allocPrintSentinel(gpa, "{s}", .{"/tmp/zay_symlink_marker"}, 0);
     defer gpa.free(marker);
-    var mf = std.Io.Dir.createFileAbsolute(io, "/tmp/nova_symlink_marker", .{}) catch return;
+    var mf = std.Io.Dir.createFileAbsolute(io, "/tmp/zay_symlink_marker", .{}) catch return;
     mf.close(io);
-    defer std.Io.Dir.deleteFileAbsolute(io, "/tmp/nova_symlink_marker") catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, "/tmp/zay_symlink_marker") catch {};
 
     // Reading through the symlink must be rejected.
-    const target = try std.fs.path.join(gpa, &.{ link_path, "nova_symlink_marker" });
+    const target = try std.fs.path.join(gpa, &.{ link_path, "zay_symlink_marker" });
     defer gpa.free(target);
     try std.testing.expectError(error.PathTraversal, sanitizePath(io, target));
 }
@@ -3996,9 +3996,9 @@ test "gitStatus returns nil + error outside a repo" {
     if (!gitAvailable()) return;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir = try std.fs.path.join(gpa, &.{ "/tmp", "nova-git-notrepo" });
+    const dir = try std.fs.path.join(gpa, &.{ "/tmp", "zay-git-notrepo" });
     defer gpa.free(dir);
-    ignoreRun(gpa, io, "/tmp", "rm -rf nova-git-notrepo && mkdir -p nova-git-notrepo");
+    ignoreRun(gpa, io, "/tmp", "rm -rf zay-git-notrepo && mkdir -p zay-git-notrepo");
 
     const cwd = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(cwd);
@@ -4010,7 +4010,7 @@ test "gitStatus returns nil + error outside a repo" {
     try std.testing.expect(result.stdout.len == 0);
     const err = gitErrorString(result.stderr, result.code);
     try std.testing.expect(err.len > 0);
-    ignoreRun(gpa, io, "/tmp", "rm -rf nova-git-notrepo");
+    ignoreRun(gpa, io, "/tmp", "rm -rf zay-git-notrepo");
 }
 
 test "gitErrorString prefers stderr over generic exit code" {
@@ -4022,23 +4022,47 @@ test "git bridges return strings inside a repo (S4 success path)" {
     // See gitCommit: OS-gate first so it's counted as skipped on Windows.
     if (os.is_windows) return error.SkipZigTest;
     if (!gitAvailable()) return;
-    // The test process runs at the repo root, which IS a git repo, so all four
-    // bridges must return strings here (the nil+error path is covered by the
-    // non-repo test above).
+
+    // A dedicated fixture repo keeps the bridges hermetic: the live repo
+    // root's `git diff` grows with the working tree's uncommitted state and
+    // overflows the bounded capture (StreamTooLong) after a big change.
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    const test_dir = ".zig-cache/test_git_bridges_repo";
+    std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, test_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
+
+    var init = bash_exec.run(gpa, io, test_dir, "git init -q -b zay-bridges-test && git config user.email t@t && git config user.name t") catch return;
+    defer init.deinit(gpa);
+    if (init.code != 0) return error.SkipZigTest;
+
+    var commit = bash_exec.run(gpa, io, test_dir, "git commit --allow-empty -m initial") catch return;
+    defer commit.deinit(gpa);
+    if (commit.code != 0) return error.SkipZigTest;
+
+    const abs_test_dir = try std.fs.path.resolve(gpa, &.{test_dir});
+    defer gpa.free(abs_test_dir);
+
     const sandbox = @import("sandbox.zig");
-    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
     defer {
         sandbox.freeHookData(L.handle);
         L.deinit();
     }
+
+    bridge.plugin_cwd_slot = abs_test_dir;
+    defer bridge.plugin_cwd_slot = null;
+
     try expectLuaOk(&L,
-        \\local s = nova.git_status()
+        \\local s = zay.git_status()
         \\assert(type(s) == "string", "git_status returns a string in a repo, got " .. type(s))
-        \\local d = nova.git_diff()
-        \\assert(type(d) == "string", "git_diff returns a string in a repo, got " .. type(d))
-        \\local l = nova.git_log(1)
+        \\local d, derr = zay.git_diff()
+        \\assert(type(d) == "string", "git_diff returns a string in a repo, got " .. type(d) .. " err: " .. tostring(derr))
+        \\local l = zay.git_log(1)
         \\assert(type(l) == "string", "git_log returns a string in a repo, got " .. type(l))
-        \\local b = nova.git_branch()
+        \\local b = zay.git_branch()
         \\assert(type(b) == "string", "git_branch returns a string in a repo, got " .. type(b))
         \\return "OK"
     );
@@ -4068,7 +4092,7 @@ test "plugin_api: deletePath removes regular file, empty dir, and recursive tree
     file.close(io);
 
     try expectLuaOk(&L,
-        \\local ok, err = nova.delete_path(".zig-cache/test_delete_path_fixture/sample.txt")
+        \\local ok, err = zay.delete_path(".zig-cache/test_delete_path_fixture/sample.txt")
         \\assert(ok == true, "delete file failed: " .. tostring(err))
         \\return "OK"
     );
@@ -4078,7 +4102,7 @@ test "plugin_api: deletePath removes regular file, empty dir, and recursive tree
     try std.Io.Dir.cwd().createDirPath(io, dir_rel);
 
     try expectLuaOk(&L,
-        \\local ok, err = nova.delete_path(".zig-cache/test_delete_path_fixture/empty_dir")
+        \\local ok, err = zay.delete_path(".zig-cache/test_delete_path_fixture/empty_dir")
         \\assert(ok == true, "delete empty dir failed: " .. tostring(err))
         \\return "OK"
     );
@@ -4090,7 +4114,7 @@ test "plugin_api: deletePath removes regular file, empty dir, and recursive tree
     subfile.close(io);
 
     try expectLuaOk(&L,
-        \\local ok, err = nova.delete_path(".zig-cache/test_delete_path_fixture/tree_dir", { recursive = true })
+        \\local ok, err = zay.delete_path(".zig-cache/test_delete_path_fixture/tree_dir", { recursive = true })
         \\assert(ok == true, "delete tree failed: " .. tostring(err))
         \\return "OK"
     );
@@ -4196,9 +4220,9 @@ test "plugin_api: get_cwd and get_project_root respect bridge.plugin_cwd_slot" {
     defer bridge.plugin_cwd_slot = null;
 
     try expectLuaOk(&L,
-        \\local cwd = nova.get_cwd()
+        \\local cwd = zay.get_cwd()
         \\assert(type(cwd) == "string", "get_cwd failed")
-        \\local root = nova.get_project_root()
+        \\local root = zay.get_project_root()
         \\assert(type(root) == "string", "get_project_root failed")
         \\return "OK"
     );
@@ -4220,7 +4244,7 @@ test "plugin_api: git read bridges run in bridge.plugin_cwd_slot cwd" {
     defer std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
 
     // Init a git repo with a dedicated branch name.
-    var init = bash_exec.run(gpa, io, test_dir, "git init -b nova-slot-test") catch return;
+    var init = bash_exec.run(gpa, io, test_dir, "git init -q -b zay-slot-test && git config user.email t@t && git config user.name t") catch return;
     defer init.deinit(gpa);
     if (init.code != 0) return error.SkipZigTest;
 
@@ -4242,13 +4266,13 @@ test "plugin_api: git read bridges run in bridge.plugin_cwd_slot cwd" {
     defer bridge.plugin_cwd_slot = null;
 
     try expectLuaOk(&L,
-        \\local branch = nova.git_branch()
-        \\assert(branch == "nova-slot-test", "expected nova-slot-test, got " .. tostring(branch))
-        \\local status = nova.git_status()
+        \\local branch = zay.git_branch()
+        \\assert(branch == "zay-slot-test", "expected zay-slot-test, got " .. tostring(branch))
+        \\local status = zay.git_status()
         \\assert(type(status) == "string", "git_status failed")
-        \\local log = nova.git_log(1)
+        \\local log = zay.git_log(1)
         \\assert(type(log) == "string", "git_log failed")
-        \\local diff = nova.git_diff()
+        \\local diff = zay.git_diff()
         \\assert(type(diff) == "string", "git_diff failed")
         \\return "OK"
     );
@@ -4284,15 +4308,15 @@ test "plugin_api: run_shell executes native shell on current OS" {
     }
 
     try expectLuaOk(&L,
-        \\local res, err = nova.run_shell("echo nova_shell_ok")
+        \\local res, err = zay.run_shell("echo zay_shell_ok")
         \\assert(res ~= nil, "run_shell failed: " .. tostring(err))
         \\assert(res.code == 0, "run_shell exited with non-zero code: " .. tostring(res.code))
-        \\assert(string.find(res.stdout, "nova_shell_ok") ~= nil, "stdout did not contain expected message: " .. tostring(res.stdout))
+        \\assert(string.find(res.stdout, "zay_shell_ok") ~= nil, "stdout did not contain expected message: " .. tostring(res.stdout))
         \\return "OK"
     );
 }
 
-test "plugin_api: nova.require loads modules, caches results, and rejects breakouts" {
+test "plugin_api: zay.require loads modules, caches results, and rejects breakouts" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
 
@@ -4338,25 +4362,25 @@ test "plugin_api: nova.require loads modules, caches results, and rejects breako
 
     // Set plugin directory in registry
     _ = c.lua_pushlstring(L.handle, abs_plugin_dir.ptr, abs_plugin_dir.len);
-    c.lua_setfield(L.handle, c.LUA_REGISTRYINDEX, "nova_plugin_dir");
+    c.lua_setfield(L.handle, c.LUA_REGISTRYINDEX, "zay_plugin_dir");
 
     // Test relative require and caching
     try expectLuaOk(&L,
-        \\local helper1 = nova.require("./helper")
+        \\local helper1 = zay.require("./helper")
         \\assert(type(helper1) == "table", "expected table, got " .. type(helper1))
         \\assert(helper1.add(10, 20) == 30, "add failed")
         \\
         \\-- Modify table to verify caching
         \\helper1.count = 42
-        \\local helper2 = nova.require("helper.lua")
+        \\local helper2 = zay.require("helper.lua")
         \\assert(helper2.count == 42, "cache failed: did not get same instance")
         \\
         \\-- Require submod/init.lua
-        \\local submod = nova.require("submod")
+        \\local submod = zay.require("submod")
         \\assert(submod.name == "submodule", "submod require failed")
         \\
         \\-- Reject breakout attempt
-        \\local outside, err = nova.require("../outside")
+        \\local outside, err = zay.require("../outside")
         \\assert(outside == nil, "breakout should have failed")
         \\assert(string.find(err, "access denied") ~= nil, "unexpected error: " .. tostring(err))
         \\
@@ -4364,7 +4388,7 @@ test "plugin_api: nova.require loads modules, caches results, and rejects breako
     );
 }
 
-test "plugin_api: nova.git_add and selective nova.git_commit validate arguments" {
+test "plugin_api: zay.git_add and selective zay.git_commit validate arguments" {
     const io = std.testing.io;
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, io);
@@ -4375,11 +4399,11 @@ test "plugin_api: nova.git_add and selective nova.git_commit validate arguments"
 
     // git_add requires files argument
     try expectLuaOk(&L,
-        \\local ok, err = nova.git_add()
+        \\local ok, err = zay.git_add()
         \\assert(ok == nil, "git_add without args should fail")
         \\assert(string.find(err, "files argument is required") ~= nil, "unexpected error: " .. tostring(err))
         \\
-        \\local ok2, err2 = nova.git_commit()
+        \\local ok2, err2 = zay.git_commit()
         \\assert(ok2 == nil, "git_commit without message should fail")
         \\assert(string.find(err2, "commit message argument is required") ~= nil, "unexpected error: " .. tostring(err2))
         \\

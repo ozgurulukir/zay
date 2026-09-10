@@ -3,9 +3,9 @@ description: todo.txt-format task tracker with detailed plans — plan, track, a
 ---
 
 Use the `todo` plugin to track multi-step work. The todo list lives in
-`.nova/todos.txt` (todo.txt format) so it survives restarts and you can edit it
+`.zay/todos.txt` (todo.txt format) so it survives restarts and you can edit it
 in any text editor. Detailed per-task plans live in a sidecar
-`.nova/todos/plans.json`, keyed by a stable `id:N` tag, and are loaded lazily so
+`.zay/todos/plans.json`, keyed by a stable `id:N` tag, and are loaded lazily so
 they never bloat the task list.
 
 ## When to use the todo tools

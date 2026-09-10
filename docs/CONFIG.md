@@ -1,6 +1,6 @@
-# Nova Agent Configuration Architecture & Guide
+# Zay Agent Configuration Architecture & Guide
 
-Nova Agent employs a layered, type-safe configuration system written in Zig 0.16. Configuration is stored as human-readable JSON files and supports field-level merging across four priority layers. (The global directory follows the XDG default location convention, but the `XDG_CONFIG_HOME` override is not honored — the root below is fixed.)
+Zay Agent employs a layered, type-safe configuration system written in Zig 0.16. Configuration is stored as human-readable JSON files and supports field-level merging across four priority layers. (The global directory follows the XDG default location convention, but the `XDG_CONFIG_HOME` override is not honored — the root below is fixed.)
 
 ---
 
@@ -16,13 +16,13 @@ Configuration values are resolved by merging four layers in order of increasing 
                                 ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 2. Global Configuration                                     │
-│    • ~/.config/nova/config.json  (XDG Standard)            │
+│    • ~/.config/zay/config.json  (XDG Standard)            │
 └──────────────────────────────┬──────────────────────────────┘
                                 │
                                 ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 3. Project-Local Configuration                              │
-│    • <cwd>/.nova/config.json                                │
+│    • <cwd>/.zay/config.json                                │
 └──────────────────────────────┬──────────────────────────────┘
                                 │
                                 ▼
@@ -33,8 +33,8 @@ Configuration values are resolved by merging four layers in order of increasing 
 ```
 
 1. **Built-in Defaults**: Fallback defaults compiled into the binary.
-2. **Global Config**: User-wide preferences at `~/.config/nova/config.json`.
-3. **Project Config**: `<cwd>/.nova/config.json` for repository-specific overrides (e.g. project system prompt or local Ollama endpoints).
+2. **Global Config**: User-wide preferences at `~/.config/zay/config.json`.
+3. **Project Config**: `<cwd>/.zay/config.json` for repository-specific overrides (e.g. project system prompt or local Ollama endpoints).
 4. **Environment Variables**: Runtime overrides (e.g. `OPENAI_MODEL`, `OPENAI_API_KEY`).
 
 ---
@@ -108,7 +108,7 @@ JSON keys are **camelCase**. Legacy snake_case keys from schema v1 are still acc
 | ~~`enableThinking`~~   | ~~`boolean`~~ | **Removed.** Reasoning is controlled per-model via `providers.<name>.models.<id>.reasoningEffort` (see [Per-model settings](#per-model-settings)). The legacy key (`enableThinking` / `enable_thinking`) is still accepted at parse time but silently ignored, and dropped on the next save.                                                                                                                                                                                                                                   |
 | `strictOutputs`        | `boolean` | `true` to send OpenAI strict structured-outputs mode (`"strict":true`, `additionalProperties:false`, all properties in `required`) in tool definitions. **Only works against the OpenAI API** — gateways (OpenRouter/Ollama/vLLM/Together) reject or silently break it, which disables function-calling (the model then emits tool calls as plain text). Defaults to `false` so tool-calling works everywhere. Enable only when talking directly to OpenAI. Legacy key `strict_outputs` is parsed for backward compatibility but is not schema-valid; new configs must use `strictOutputs`. |
 | `systemPrompt`         | `string`  | Base system prompt template. Values over **10 000 chars** are dropped at parse with a `config_parse_error` diagnostic — the field is never silently truncated. An **empty string** is treated as absent (dropped at parse) — clear the field via `/settings` (Del) or by removing the key. Legacy key `system_prompt` is parsed for backward compatibility but is not schema-valid; new configs must use `systemPrompt`.                                                                                                                                                                                                                                                                                                                                                           |
-| `bashClassifierUrl`    | `string`  | External classifier endpoint for shell command safety check (e.g. `http://127.0.0.1:8765/classify`). When omitted, null, or empty, Nova uses its built-in safety rules. Legacy key `bash_classifier_url` is parsed for backward compatibility but is not schema-valid; new configs must use `bashClassifierUrl`. |
+| `bashClassifierUrl`    | `string`  | External classifier endpoint for shell command safety check (e.g. `http://127.0.0.1:8765/classify`). When omitted, null, or empty, Zay uses its built-in safety rules. Legacy key `bash_classifier_url` is parsed for backward compatibility but is not schema-valid; new configs must use `bashClassifierUrl`. |
 | `theme`                | `string`  | Name of the color theme for the TUI. `default` preserves the classic look; the other builtin themes are `cappuccino` (Catppuccin Mocha), `tokyo_night` (Tokyo Night), `dracula` (Dracula), `nord` (Nord), and `gruvbox_dark` (Gruvbox Dark). Custom theme slugs loaded from the themes directory are also valid. Unknown or empty names fall back to `default` at resolve time; absent = `default`. The builtin themes are compiled in — a new builtin theme is added to `src/tui/style.zig`. No legacy snake_case key or environment variable exists for this field. |
 | `tui`                  | `object`  | TUI appearance, live preview, picker, multi-lane split layout, and status-bar telemetry settings. See [TUI Theme & Search Ergonomics](#tui-theme--search-ergonomics) and [TUI Layout & Telemetry](#tui-layout--telemetry).                                                                                                                                                                                                        |
 | `toast`                | `object`  | Transient toast notifications (top-right TUI notices). See [Toast settings](#toast-settings).                                                                                                                                                                                                                                                                                                                                                          |
@@ -128,10 +128,10 @@ The `context` object controls context window management and automatic summarizat
 | `context.maxConcurrentRequests`       | `integer` | `2`      | Cap on LLM requests in flight across ALL lanes at once. Each lane runs its own worker + HTTP client, so without this cap N active lanes fire N independent requests at the provider, which degrades or rate-limits the burst (every lane slows down together). Minimum 1 — a value of 0 would deadlock every request. Set `1` to serialize requests; raise it only if your provider handles more concurrent streams without degrading. |
 | `context.maxParallelToolCalls`        | `integer` | `16`     | Upper bound on parallel tool calls accepted from the model in one assistant batch. Providers exceeding this cap get a logged error and the excess calls are dropped. Accepted range 1–64; out-of-range values are dropped and the default is used. |
 | `context.requestTimeoutSeconds`       | `integer` | `300`    | Socket read timeout in seconds for streaming responses. Prevents indefinite hangs when the server stops mid-stream. Minimum 1. |
-| `context.disablePromptCache`          | `boolean` | `false`  | Disable provider prompt-caching fields entirely. When `true`, for OpenRouter neither the top-level `cache_control` (auto breakpoint) nor the native `session_id` (sticky routing) is emitted; for OpenAI, `prompt_cache_key` is suppressed — in BOTH the chat-completions and Responses API clients, regardless of the resolved wire dialect. Use this for OpenRouter `:free` / gateway-fronted models (kimi, inclusionai/ling) that reject these fields with HTTP 400 — a 400 there kills the whole turn and surfaces as "the model can't call any tools." Nova also auto-recovers once via a cache-stripped retry (C2) when the 400 body mentions "cache", so setting this flag is the durable fix for a known-bad model. |
+| `context.disablePromptCache`          | `boolean` | `false`  | Disable provider prompt-caching fields entirely. When `true`, for OpenRouter neither the top-level `cache_control` (auto breakpoint) nor the native `session_id` (sticky routing) is emitted; for OpenAI, `prompt_cache_key` is suppressed — in BOTH the chat-completions and Responses API clients, regardless of the resolved wire dialect. Use this for OpenRouter `:free` / gateway-fronted models (kimi, inclusionai/ling) that reject these fields with HTTP 400 — a 400 there kills the whole turn and surfaces as "the model can't call any tools." Zay also auto-recovers once via a cache-stripped retry (C2) when the 400 body mentions "cache", so setting this flag is the durable fix for a known-bad model. |
 | `context.toolCallLimitPerTurn`        | `integer` | `100`    | Upper bound on LLM→tool iterations (one assistant batch of tool calls = one iteration) within a single turn — the runaway-loop guard. Accepted range 1–1000; out-of-range values are dropped and the default is used. Raise for deep refactors or long migration loops that legitimately need more batches. The legacy snake_case spelling `tool_call_limit_per_turn` is parsed for compat but not schema-valid. |
-| `context.softStopOnToolCallLimit`     | `boolean` | `true`   | When `true`, reaching `toolCallLimitPerTurn` does NOT fail the turn: the loop exits cleanly, queued user messages are delivered into history (a queued "continue" is never swallowed), a `[nova]` continuation hint is left as a trailing user message so the next prompt resumes seamlessly, and the TUI renders a budget notice row. When `false`, behavior matches previous releases: the turn ends with a `ToolCallLimit` failure. Scripted/headless users who grep for that failure should pin `false`. |
-| `context.autoContinueOnLengthCut`     | `boolean` | `true`   | When `true`, a response severed by the provider's output token cap (`finish_reason=length`, or the Responses API's `response.incomplete` with `incomplete_details.reason = max_output_tokens`) with no tool calls is continued ONCE automatically inside the same turn: a `[nova]` continuation hint is appended and the model re-requested. Guards against providers whose default completion budget cuts the tool_call section off after the prose (half-finished tool calls — the turn otherwise ends silently as a text-only message that looks complete). The cut always renders an amber "output" notice row; set `false` to only notify and never spend the extra request. The legacy snake_case spelling `auto_continue_on_length_cut` is parsed for compat but not schema-valid. |
+| `context.softStopOnToolCallLimit`     | `boolean` | `true`   | When `true`, reaching `toolCallLimitPerTurn` does NOT fail the turn: the loop exits cleanly, queued user messages are delivered into history (a queued "continue" is never swallowed), a `[zay]` continuation hint is left as a trailing user message so the next prompt resumes seamlessly, and the TUI renders a budget notice row. When `false`, behavior matches previous releases: the turn ends with a `ToolCallLimit` failure. Scripted/headless users who grep for that failure should pin `false`. |
+| `context.autoContinueOnLengthCut`     | `boolean` | `true`   | When `true`, a response severed by the provider's output token cap (`finish_reason=length`, or the Responses API's `response.incomplete` with `incomplete_details.reason = max_output_tokens`) with no tool calls is continued ONCE automatically inside the same turn: a `[zay]` continuation hint is appended and the model re-requested. Guards against providers whose default completion budget cuts the tool_call section off after the prose (half-finished tool calls — the turn otherwise ends silently as a text-only message that looks complete). The cut always renders an amber "output" notice row; set `false` to only notify and never spend the extra request. The legacy snake_case spelling `auto_continue_on_length_cut` is parsed for compat but not schema-valid. |
 | `context.compaction.auto`             | `boolean` | `true`   | Enable automatic context compaction before reaching limits.                                                                                                  |
 | `context.compaction.threshold`        | `number`  | `0.75`   | Fraction of context window (0.1–0.9) that triggers background summarization. The swap watermark is derived as `threshold + 0.20` (capped at 0.95); values above 0.9 are clamped at parse time so the swap watermark never falls below the start watermark. |
 | `context.compaction.keepRecentTokens` | `integer` | `8000`   | Recent conversation tokens retained verbatim alongside the generated summary. Scaled down proportionally for small-context models (35% of window, min 1000). When real provider usage outruns the chars/4 estimate (CJK text), the budget is shrunk by the measured ratio so compaction still lands below the swap watermark. |
@@ -161,13 +161,13 @@ The `toast` object controls transient notifications shown stacked in the top-rig
 
 | Field                | Type      | Default     | Description                                                                                                                                                                                                                  |
 | -------------------- | --------- | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `toast.enabled`      | `boolean` | `true`      | Master switch. When `false`, no toasts are shown — `warn`+ output is dropped from the TUI. Set `NOVA_LOG_STDERR_LEVEL` to route it back to stderr. Also toggled live from the `/settings` General tab.                       |
+| `toast.enabled`      | `boolean` | `true`      | Master switch. When `false`, no toasts are shown — `warn`+ output is dropped from the TUI. Set `ZAY_LOG_STDERR_LEVEL` to route it back to stderr. Also toggled live from the `/settings` General tab.                       |
 | `toast.durationMs`   | `integer` | `4000`      | Auto-dismiss delay in milliseconds. Out-of-range values are **dropped** (left null) at parse time, not clamped — a typo can't produce a toast that never dismisses. Config-file only.                                         |
 | `toast.maxVisible`   | `integer` | `3`         | Maximum toasts stacked at once. Out-of-range values are dropped at parse time. Config-file only.                                                                                                                             |
 | `toast.position`     | `string`  | `top-right` | Corner position. **Reserved for future use** — only `top-right` is rendered today; other values are parsed and persisted but have no effect yet.                                                                            |
 
 > [!NOTE]
-> **Restoring the stderr channel.** When the TUI is up, `warn`+ logs go to the toast, not stderr. To keep full stderr output (e.g. for `nova 2> err.log` diagnostics), set `NOVA_LOG_STDERR_LEVEL` explicitly (`err`/`warn`/`info`/`debug`) — an explicit value sends output to **both** stderr and the toast, while leaving it unset sends `warn`+ to the toast only. Headless/test runs have no toast sink installed and keep stderr as before.
+> **Restoring the stderr channel.** When the TUI is up, `warn`+ logs go to the toast, not stderr. To keep full stderr output (e.g. for `zay 2> err.log` diagnostics), set `ZAY_LOG_STDERR_LEVEL` explicitly (`err`/`warn`/`info`/`debug`) — an explicit value sends output to **both** stderr and the toast, while leaving it unset sends `warn`+ to the toast only. Headless/test runs have no toast sink installed and keep stderr as before.
 
 ### TUI Theme
 
@@ -178,8 +178,8 @@ The `theme` field selects a runtime color theme for the TUI at startup. The buil
 | `theme` | `string` | `default` (classic look), `cappuccino` (Catppuccin Mocha), `tokyo_night` (Tokyo Night), `dracula` (Dracula), `nord` (Nord), `gruvbox_dark` (Gruvbox Dark). Unknown or empty names fall back to `default` at resolve time; absent = `default`. |
 
 When changing themes dynamically in the TUI via `/theme <name>` or the interactive `/theme` picker:
-- If the active project configuration (`<cwd>/.nova/config.json`) defines a `theme`, the new choice persists to the project configuration via `mergeAndWriteProject`.
-- Otherwise, the theme persists to the user's global configuration (`~/.config/nova/config.json`) via `mergeAndWriteGlobal`.
+- If the active project configuration (`<cwd>/.zay/config.json`) defines a `theme`, the new choice persists to the project configuration via `mergeAndWriteProject`.
+- Otherwise, the theme persists to the user's global configuration (`~/.config/zay/config.json`) via `mergeAndWriteGlobal`.
 - Unknown, empty, or typoed theme names fall back to `default` and display a notice in the transcript (`Theme '<name>' not found; using default`). If writing configuration to disk fails, the live session still switches theme and a `(not saved)` notice is appended.
 
 ### TUI Theme & Search Ergonomics
@@ -189,7 +189,7 @@ The `tui` object controls live theme preview, custom-theme discovery, and fuzzy-
 | Field                     | Type      | Default    | Description                                                                                                                                                                                                                                                        |
 | ------------------------- | --------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `tui.themeLivePreview`    | `boolean` | `true`     | Recolor the UI live while browsing themes in the `/theme` picker. `Esc` reverts to the pre-open theme; `Enter` commits and persists.                                                                                                                               |
-| `tui.customThemesDir`     | `string`  | _(none)_   | Optional directory containing user theme JSON files. When set, it **replaces** the default scan of `~/.config/nova/themes/` and `.nova/themes/` — only this directory is scanned.                                                                                  |
+| `tui.customThemesDir`     | `string`  | _(none)_   | Optional directory containing user theme JSON files. When set, it **replaces** the default scan of `~/.config/zay/themes/` and `.zay/themes/` — only this directory is scanned.                                                                                  |
 | `tui.fuzzyHighlight`      | `boolean` | `true`     | Highlight matching characters in the search pickers (`@` mention, `/model`, `/resume`, `/theme`, `/command`).                                                                                                                                                      |
 | `tui.fuzzyHighlightStyle` | `string`  | `accent`   | Style of matched runes: `accent` (the theme's accent orange), `bold`, or `underline`.                                                                                                                                                                              |
 | `theme`                   | `string`  | `default`  | Active theme name. Any custom theme slug loaded from the themes directory resolves at startup and in the `/theme` picker. See [TUI Theme](#tui-theme).                                                                                                              |
@@ -219,9 +219,9 @@ The `tui` object also controls the multi-lane split layout and the status-bar to
 | Mouse click on a pane | Split Mode (`dual`) | Focus the clicked worker column (sets the focused worker in `dual`).                                        |
 
 > [!NOTE]
-> `Alt+Tab` is **not** a Nova binding — terminals never deliver the OS-level window-switch key. Per-pane `PageUp`/`PageDown` transcript scrolling is **deferred** (per-lane scroll state does not exist yet). The velocity gauge is a `chars/4` **estimate** (the compaction SSOT heuristic), not an exact token count.
+> `Alt+Tab` is **not** a Zay binding — terminals never deliver the OS-level window-switch key. Per-pane `PageUp`/`PageDown` transcript scrolling is **deferred** (per-lane scroll state does not exist yet). The velocity gauge is a `chars/4` **estimate** (the compaction SSOT heuristic), not an exact token count.
 
-**Custom theme JSON format.** Drop a `*.json` file into `~/.config/nova/themes/` (or `.nova/themes/`, or the directory named by `tui.customThemesDir`). Each file is a flat object with a `name` plus the 18 `Rgb` `[r,g,b]` arrays matching the builtin theme slots (`thinking_blue`, `user_yellow`, `success_green`, `failure_red`, `accent_orange`, `skill_purple`, `lane_pink`, `muted_gray`, `selection_bg`, `amber_yellow`, `white`, `code_blue`, `faint_add_bg`, `faint_del_bg`, `body`, `background`, `blackhole_orange`, `markdown_heading`):
+**Custom theme JSON format.** Drop a `*.json` file into `~/.config/zay/themes/` (or `.zay/themes/`, or the directory named by `tui.customThemesDir`). Each file is a flat object with a `name` plus the 18 `Rgb` `[r,g,b]` arrays matching the builtin theme slots (`thinking_blue`, `user_yellow`, `success_green`, `failure_red`, `accent_orange`, `skill_purple`, `lane_pink`, `muted_gray`, `selection_bg`, `amber_yellow`, `white`, `code_blue`, `faint_add_bg`, `faint_del_bg`, `body`, `background`, `blackhole_orange`, `markdown_heading`):
 
 ```json
 {
@@ -250,7 +250,7 @@ The `tui` object also controls the multi-lane split layout and the status-bar to
 A theme is rejected (and skipped) if it fails validation parity with the builtin suite: body/background WCAG contrast below 4.5:1, or a `selection_bg`/`background` channel delta below 20 (a selected picker row must stay visible against a coincident card). Missing themes directories are a no-op, not an error.
 
 > [!NOTE]
-> **`tui.customThemesDir` replaces the default scan.** When set, only that directory is scanned for custom themes; `~/.config/nova/themes/` and `.nova/themes/` are ignored. An explicitly-set path means "use this location", not "also scan the defaults".
+> **`tui.customThemesDir` replaces the default scan.** When set, only that directory is scanned for custom themes; `~/.config/zay/themes/` and `.zay/themes/` are ignored. An explicitly-set path means "use this location", not "also scan the defaults".
 
 
 ### Provider Configuration
@@ -289,7 +289,7 @@ Each entry in `providers` is keyed by provider name. Builtin labels (`openai`, `
 **Provider merge order in `/connect`:** builtin catalogue → models.dev registry (overrides builtins with same id) → config providers (overrides everything with same name, **except** entries already covered by the models.dev registry). All three sources share the same display surface.
 
 > [!NOTE]
-> **Custom provider session persistence**: Custom provider names (e.g., `"qwen-cloud"`) are preserved in `config.json` via the `defaultModel` field (e.g., `"qwen-cloud/qwen3.7-plus"`) and the `providers` map. On restart, Nova resolves the provider from `defaultModel`, hydrates `baseURL` from the `providers` map via `hydrateActiveModel`, and looks up the API key in `auth.json` using the provider name.
+> **Custom provider session persistence**: Custom provider names (e.g., `"qwen-cloud"`) are preserved in `config.json` via the `defaultModel` field (e.g., `"qwen-cloud/qwen3.7-plus"`) and the `providers` map. On restart, Zay resolves the provider from `defaultModel`, hydrates `baseURL` from the `providers` map via `hydrateActiveModel`, and looks up the API key in `auth.json` using the provider name.
 >
 > **Dynamic providers (models.dev)** persist their identity through `defaultModel: "provider-id/model-id"` (e.g., `"stepfun-ai/step-3.7-flash"`). The `providers` map stores the `baseURL` and per-model metadata. Runtime-only fields (`dynamic_provider_id`, `dynamic_provider_name`) are never serialized; after restart, all rehydration paths fall back to the serialized `provider_name` from `defaultModel` and the `providers` map. `hydrateActiveModel` includes a recovery fallback for configs written before the `provider_name` serialization fix (where `provider_name` was the generic `"openai_compatible"` label).
 
@@ -312,10 +312,10 @@ Each entry in `providers` is keyed by provider name. Builtin labels (`openai`, `
 
 Header values keep their `{env:VAR}` placeholders on disk (a settings save never writes a resolved secret back); expansion happens once per client attach, with the same mechanics and secrets invariant as MCP server values — see the [MCP Integration Guide](MCP.md#environment-variable-expansion-envvar). An unset variable expands to an empty string (with a warning), and a header whose expanded value is empty is skipped rather than sent empty-valued.
 
-**Auto-attached provider headers.** Some providers require routing/identity headers that Nova attaches automatically — no configuration needed:
+**Auto-attached provider headers.** Some providers require routing/identity headers that Zay attaches automatically — no configuration needed:
 
-- **OpenCode Zen** (any base URL under `opencode.ai/zen`, e.g. the builtin `opencode_zen` provider and the models.dev `opencode` / `opencode-go` entries): `x-opencode-session` (the stable per-conversation session id — improves token-cache locality and is required by the provider since 2026-09-05) and `x-opencode-client: nova`, on every outbound request including the model picker's `/v1/models` probe. These are routing identity, not cache hints: `context.disablePromptCache` does **not** suppress them.
-- **OpenRouter**: the `X-Title: Nova` app-attribution header.
+- **OpenCode Zen** (any base URL under `opencode.ai/zen`, e.g. the builtin `opencode_zen` provider and the models.dev `opencode` / `opencode-go` entries): `x-opencode-session` (the stable per-conversation session id — improves token-cache locality and is required by the provider since 2026-09-05) and `x-opencode-client: zay`, on every outbound request including the model picker's `/v1/models` probe. These are routing identity, not cache hints: `context.disablePromptCache` does **not** suppress them.
+- **OpenRouter**: the `X-Title: Zay` app-attribution header.
 
 A user-configured header with the same (case-insensitive) name replaces the auto-attached value — e.g. pinning `x-opencode-session` to a fixed value, or overriding `x-opencode-client` for a gateway front. The merge policy lives in one place (`src/ai/provider_headers.zig`); see [Patterns — Outbound provider headers pattern](PATTERNS.md) for the full data flow.
 
@@ -329,7 +329,7 @@ Each entry in `mcpServers` is keyed by server name:
 | `args`    | `string[]` | Command arguments for stdio transport.                                                                             |
 | `url`     | `string`   | Endpoint URL for remote Streamable HTTP transport.                                                                 |
 | `headers` | `object`   | Extra HTTP headers for remote servers (string values), e.g. API keys for header-auth servers like Context7.        |
-| `type`    | `string`   | Optional transport discriminator (`"stdio"`/`"remote"`) for compatibility with other MCP clients; Nova ignores it. |
+| `type`    | `string`   | Optional transport discriminator (`"stdio"`/`"remote"`) for compatibility with other MCP clients; Zay ignores it. |
 | `enabled` | `boolean`  | Whether this server is active (default `true`).                                                                    |
 | `requestTimeoutMs` | `integer` | Per-server request timeout in milliseconds (default `30000`). Applied to the stdio read poll and the remote HTTP socket timeouts; values below 1 are clamped to 1 at use. |
 
@@ -341,7 +341,7 @@ A server is either stdio (`command` + `args`) or remote (`url`), never both. Mis
 > **Adding servers from the TUI**: the `/mcp` overlay's `a` (add) key connects a remote server by URL for the current session only. Such servers are **runtime-only** — they are not written to `config.json` and do not survive a restart. Add them here by hand to make them permanent. See [MCP Integration](MCP.md) for details.
 
 > [!IMPORTANT]
-> **API Keys Security Invariant**: API keys (`api_key`) are **NEVER** serialized into `config.json`. API keys are stored separately in `~/.config/nova/auth.json` with strict file permissions (`0o600`).
+> **API Keys Security Invariant**: API keys (`api_key`) are **NEVER** serialized into `config.json`. API keys are stored separately in `~/.config/zay/auth.json` with strict file permissions (`0o600`).
 
 ### Plugin Configuration
 
@@ -349,7 +349,7 @@ Each entry in `plugins` is keyed by plugin name (matching the plugin's manifest 
 
 | Field      | Type                | Description                                                                                              |
 | ---------- | ------------------- | -------------------------------------------------------------------------------------------------------- |
-| `enabled`  | `boolean`           | Whether this plugin is loaded (default `true`). Applied at App start — restart Nova to change it.        |
+| `enabled`  | `boolean`           | Whether this plugin is loaded (default `true`). Applied at App start — restart Zay to change it.        |
 | `settings` | `string` or `object`| Plugin-specific settings as a JSON object — either an escaped JSON string or an inline JSON object (normalized to its canonical compact JSON string at parse). Serialized settings are capped at **65 536 bytes**; oversized settings are dropped with a `config_parse_error` diagnostic and the plugin loads unconfigured. The plugin's Lua code reads it via `plugin.get_config()`. |
 
 **Example — inline-object form (preferred for readability):**
@@ -383,7 +383,7 @@ system — the plugin's Lua code is responsible for validating its own settings
 via `plugin.get_config()`, which returns a fresh table per call (or `nil`
 when unconfigured). `enabled: false` skips loading the plugin entirely.
 Plugin config is read once at App start; there is no hot reload — restart
-Nova to apply changes. See `docs/plugins/` for the full plugin development guide.
+Zay to apply changes. See `docs/plugins/` for the full plugin development guide.
 
 > [!NOTE]
 > **Typed Model Selection**: The in-memory `Config` struct carries a `model_selection: ?ModelSelection` typed view. `ModelSelection` is `union(enum) { builtin, custom }` — builtin providers carry `provider: Provider` + `provider_name`; custom providers carry `provider_name`, `base_url`, `api_key`. Optional settings (`use_responses_endpoint`, `system_prompt`, `bash_classifier_url`) live on both variants. Callers use typed accessors (`provider()`, `providerName()`, `model()`, `baseUrl()`, `apiKey()`, `useResponsesEndpoint()`, `systemPrompt()`, `bashClassifierUrl()`) so builtin/custom differences are hidden. Reasoning effort is **not** a selection-level boolean — it lives on the model (`Model.reasoning: ReasoningSetting`), populated from `providers.<name>.models.<id>.reasoningEffort`. The `strict_outputs` setting is **not** model-scoped — it stays on `Config` (API-level) and is read directly where the client is attached. `parseObject` only populates `model_selection` when all required fields are present — since `api_key` is never serialized to config.json (it lives in `auth.json`), disk-loaded configs **never** have `model_selection`. All rehydration paths fall back to the legacy fields (`provider`, `model`, `base_url`, `provider_name`), which ARE populated from `defaultModel` and `hydrateActiveModel`.
@@ -392,7 +392,7 @@ Nova to apply changes. See `docs/plugins/` for the full plugin development guide
 
 ## Backward Compatibility (Schema v1 → v2)
 
-Configs written by older Nova versions (schema v1, snake_case keys, integer version) are fully readable:
+Configs written by older Zay versions (schema v1, snake_case keys, integer version) are fully readable:
 
 | v1 key                     | v2 key                   | Status                                                                                                                     |
 | -------------------------- | ------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
@@ -411,7 +411,7 @@ Configs written by older Nova versions (schema v1, snake_case keys, integer vers
 
 When both camelCase and snake_case keys are present, **camelCase wins**.
 
-> **Schema validity vs parse acceptance:** Nova parses these v1 snake_case keys for backward compatibility (the table above), but they are **not schema-valid** against [`schema/config.schema.json`](../schema/config.schema.json) (`additionalProperties: false`). A strict schema validator rejects them; Nova's own parser accepts them and rewrites them as camelCase on the next save. Write new configs in camelCase.
+> **Schema validity vs parse acceptance:** Zay parses these v1 snake_case keys for backward compatibility (the table above), but they are **not schema-valid** against [`schema/config.schema.json`](../schema/config.schema.json) (`additionalProperties: false`). A strict schema validator rejects them; Zay's own parser accepts them and rewrites them as camelCase on the next save. Write new configs in camelCase.
 
 ---
 
@@ -422,26 +422,26 @@ When both camelCase and snake_case keys are present, **camelCase wins**.
 | `OPENAI_MODEL`                | Sets provider and model selection     | `openrouter/anthropic/claude-3.7-sonnet` |
 | `OPENAI_BASE_URL`             | Overrides active provider base URL    | `https://openrouter.ai/api`              |
 | `OPENAI_API_KEY`              | Sets runtime API key                  | `sk-or-v1-...`                           |
-| `NOVA_USE_RESPONSES_ENDPOINT` | Sets Responses endpoint routing       | `true` or `1`                            |
-| `NOVA_STRICT_OUTPUTS`         | Sets OpenAI strict structured-outputs mode (gateway-incompatible) | `true` or `1`                            |
-| `NOVA_BASH_CLASSIFIER_URL`    | Sets external safety classifier URL   | `http://localhost:8765/classify`         |
-| `NOVA_LOG_FILE`               | Path to the log file (path max 1024 bytes); defaults to `~/.config/nova/nova.log` | `/tmp/nova.log` |
-| `NOVA_LOG_STDERR_LEVEL`       | Min level for the stderr sink (`err`\|`warn`\|`info`\|`debug`, case-insensitive). Default `warn` in release, `err` in debug. When the TUI is up, setting this **also** restores `warn`+ output to stderr (otherwise it goes to the toast). | `debug` |
-| `NOVA_LOG_MAX_BYTES`          | Max log file size before rotation (default 10 MB). On launch, if the existing log exceeds this, `nova.log` is renamed to `nova.log.1` and a fresh file starts. | `5242880` |
+| `ZAY_USE_RESPONSES_ENDPOINT` | Sets Responses endpoint routing       | `true` or `1`                            |
+| `ZAY_STRICT_OUTPUTS`         | Sets OpenAI strict structured-outputs mode (gateway-incompatible) | `true` or `1`                            |
+| `ZAY_BASH_CLASSIFIER_URL`    | Sets external safety classifier URL   | `http://localhost:8765/classify`         |
+| `ZAY_LOG_FILE`               | Path to the log file (path max 1024 bytes); defaults to `~/.config/zay/zay.log` | `/tmp/zay.log` |
+| `ZAY_LOG_STDERR_LEVEL`       | Min level for the stderr sink (`err`\|`warn`\|`info`\|`debug`, case-insensitive). Default `warn` in release, `err` in debug. When the TUI is up, setting this **also** restores `warn`+ output to stderr (otherwise it goes to the toast). | `debug` |
+| `ZAY_LOG_MAX_BYTES`          | Max log file size before rotation (default 10 MB). On launch, if the existing log exceeds this, `zay.log` is renamed to `zay.log.1` and a fresh file starts. | `5242880` |
 
 ---
 
 ## Persistence & Atomic Writes
 
 1. **Atomic File Writes**: Config updates are written to a temporary file (`config.json.tmp`) before atomic renaming (`rename`), preventing corrupt configurations if process termination occurs mid-write.
-2. **Directory Auto-Creation**: Parent directories (`~/.config/nova` or `.nova`) are created automatically if missing.
+2. **Directory Auto-Creation**: Parent directories (`~/.config/zay` or `.zay`) are created automatically if missing.
 
 ---
 
 ## Managing Configuration in TUI
 
-You can view and edit settings directly inside Nova TUI:
+You can view and edit settings directly inside Zay TUI:
 
 - Press **Ctrl+S** or run `/settings` to open the settings interface.
 - Navigate tabs using `Left`/`Right` arrows.
-- Save changes using **Ctrl+S** to persist to `~/.config/nova/config.json`.
+- Save changes using **Ctrl+S** to persist to `~/.config/zay/config.json`.

@@ -132,8 +132,8 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
         }
     }
 
-    // Temp hygiene: drop stale spill (`nova-bash-*`) and background-log
-    // (`nova-bg_*`) files older than the retention window. Startup is the one
+    // Temp hygiene: drop stale spill (`zay-bash-*`) and background-log
+    // (`zay-bg_*`) files older than the retention window. Startup is the one
     // moment no session can be mid-read of a previous process's output.
     bash.pruneStaleTempFiles(init.io, gpa, bash.temp_retention_ns);
 
@@ -197,26 +197,26 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
 }
 
 fn resolveLogPath(gpa: std.mem.Allocator, env: anytype) ![]u8 {
-    if (env.get("NOVA_LOG_FILE")) |path| return gpa.dupe(u8, path);
+    if (env.get("ZAY_LOG_FILE")) |path| return gpa.dupe(u8, path);
     const home = try resolveHome(gpa, env) orelse return error.HomeNotSet;
-    // Platform-correct base: Windows -> %APPDATA%\nova, POSIX -> ~/.config/nova.
+    // Platform-correct base: Windows -> %APPDATA%\zay, POSIX -> ~/.config/zay.
     const base = try paths.platformConfigDir(gpa, home);
     errdefer gpa.free(base);
-    const log_path = try std.fs.path.join(gpa, &.{ base, "nova.log" });
+    const log_path = try std.fs.path.join(gpa, &.{ base, "zay.log" });
     gpa.free(base);
     return log_path;
 }
 
-/// G1a: parse `NOVA_LOG_STDERR_LEVEL` (err|warn|info|debug). Defaults to
+/// G1a: parse `ZAY_LOG_STDERR_LEVEL` (err|warn|info|debug). Defaults to
 /// `warn` in release, `err` in debug — stderr is the TUI-adjacent stream, so
-/// G1a: parse `NOVA_LOG_STDERR_LEVEL` (err|warn|info|debug). Returns null when
+/// G1a: parse `ZAY_LOG_STDERR_LEVEL` (err|warn|info|debug). Returns null when
 /// the env var is absent — the caller distinguishes "explicitly set" (which
 /// restores full stderr output even when a toast sink is installed) from the
 /// default. The default level is `warn` in release, `err` in debug — stderr is
 /// the TUI-adjacent stream, so `warn` is the highest default that won't
 /// routinely tear a frame.
 fn resolveStderrLevel(env: anytype) ?std.log.Level {
-    if (env.get("NOVA_LOG_STDERR_LEVEL")) |raw| {
+    if (env.get("ZAY_LOG_STDERR_LEVEL")) |raw| {
         const LevelMap = struct { name: []const u8, level: std.log.Level };
         const map = [_]LevelMap{
             .{ .name = "debug", .level = .debug },
@@ -231,12 +231,12 @@ fn resolveStderrLevel(env: anytype) ?std.log.Level {
     return null;
 }
 
-/// P2: parse `NOVA_LOG_MAX_BYTES` (decimal). Defaults to the logger's built-in
+/// P2: parse `ZAY_LOG_MAX_BYTES` (decimal). Defaults to the logger's built-in
 /// cap (`logger.default_max_bytes`) so the env fallback and the API default can
 /// never diverge. Bad input falls back to the default rather than disabling
 /// rotation silently.
 fn resolveMaxBytes(env: anytype) u64 {
-    if (env.get("NOVA_LOG_MAX_BYTES")) |raw| {
+    if (env.get("ZAY_LOG_MAX_BYTES")) |raw| {
         if (std.fmt.parseInt(u64, raw, 10)) |n| {
             if (n > 0) return n;
         } else |_| {}
@@ -244,7 +244,7 @@ fn resolveMaxBytes(env: anytype) u64 {
     return logger.default_max_bytes;
 }
 
-/// Resolve the home directory that anchors Nova's global tree (config,
+/// Resolve the home directory that anchors Zay's global tree (config,
 /// sessions DB, worktrees, logs). Returns null when no usable home exists —
 /// `run` then fails fast with `error.HomeNotSet` instead of letting a bogus
 /// home plant the global tree inside the user's project.
@@ -253,7 +253,7 @@ fn resolveMaxBytes(env: anytype) u64 {
 ///   - Windows: USERPROFILE first (the canonical home; %APPDATA% is derived
 ///     from it). HOME is a foreign variable — it only appears in git-bash /
 ///     MSYS2 / CI-style environments, and an override pointing at the project
-///     root used to plant `AppData/Roaming/nova/` inside the user's repo.
+///     root used to plant `AppData/Roaming/zay/` inside the user's repo.
 ///   - POSIX: HOME first, as is conventional.
 /// A set-but-relative value is rejected: it would resolve against the launch
 /// directory and anchor the global tree inside the user's project.
@@ -284,11 +284,11 @@ test "resolveHome: platform-canonical var wins, relative rejected" {
     // only the active host's branch runs; both are still type-checked.
     if (os.is_windows) {
         // USERPROFILE (canonical) beats a foreign, project-root HOME override —
-        // the exact scenario that planted AppData/Roaming/nova in a repo.
+        // the exact scenario that planted AppData/Roaming/zay in a repo.
         var map = std.process.Environ.Map.init(gpa);
         defer map.deinit();
         try map.put("USERPROFILE", "C:/Users/tester");
-        try map.put("HOME", "C:/Github/nova-agent");
+        try map.put("HOME", "C:/Github/zay");
         const home = try resolveHome(gpa, map);
         defer if (home) |h| gpa.free(h);
         try std.testing.expect(home != null);
@@ -337,10 +337,10 @@ pub fn defaultSystemPrompt() []const u8 {
             @embedFile("prompts/system-bash.md"));
 }
 
-/// Handle `nova --version`. Returns true when the flag was present and the
+/// Handle `zay --version`. Returns true when the flag was present and the
 /// version was printed (the caller returns immediately). Iterates args via the
 /// cross-platform `iterateAllocator` wrapper on `Args` (WTF-8 on Windows,
-/// UTF-8 elsewhere). `--version` is matched on ANY arg, so `nova some-cmd
+/// UTF-8 elsewhere). `--version` is matched on ANY arg, so `zay some-cmd
 /// --version` also prints the version — a deliberate deviation from
 /// first-arg-only conventions (see plan note).
 fn handleVersionFlag(init: std.process.Init, gpa: std.mem.Allocator) !bool {
@@ -351,7 +351,7 @@ fn handleVersionFlag(init: std.process.Init, gpa: std.mem.Allocator) !bool {
             var buf: [256]u8 = undefined;
             var writer = std.Io.File.stdout().writer(init.io, &buf);
             defer writer.interface.flush() catch {};
-            try writer.interface.print("nova {s}\n", .{build_version});
+            try writer.interface.print("zay {s}\n", .{build_version});
             return true;
         }
     }

@@ -254,17 +254,17 @@ pub const ThemeRegistry = struct {
     }
 
     /// Scan custom theme JSON files. When `custom_themes_dir` is set it
-    /// REPLACES the default scan (m5); otherwise scan `~/.config/nova/themes/`
-    /// and `<cwd>/.nova/themes/`. Missing directories are a no-op.
+    /// REPLACES the default scan (m5); otherwise scan `~/.config/zay/themes/`
+    /// and `<cwd>/.zay/themes/`. Missing directories are a no-op.
     pub fn loadCustom(self: *ThemeRegistry, gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, cwd: []const u8, custom_themes_dir: ?[]const u8) !void {
         if (custom_themes_dir) |dir| {
             try self.loadThemesFromDir(gpa, io, dir);
             return;
         }
-        const home_path = try std.fs.path.join(gpa, &.{ home_dir, ".config", "nova", "themes" });
+        const home_path = try std.fs.path.join(gpa, &.{ home_dir, ".config", "zay", "themes" });
         defer gpa.free(home_path);
         try self.loadThemesFromDir(gpa, io, home_path);
-        const cwd_path = try std.fs.path.join(gpa, &.{ cwd, ".nova", "themes" });
+        const cwd_path = try std.fs.path.join(gpa, &.{ cwd, ".zay", "themes" });
         defer gpa.free(cwd_path);
         try self.loadThemesFromDir(gpa, io, cwd_path);
     }
@@ -793,7 +793,7 @@ test "ThemeRegistry.loadCustom loads a custom theme and resolve finds it case-in
 
     const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer gpa.free(home_dir);
-    const themes_path = try std.fs.path.join(gpa, &.{ home_dir, ".config", "nova", "themes" });
+    const themes_path = try std.fs.path.join(gpa, &.{ home_dir, ".config", "zay", "themes" });
     defer gpa.free(themes_path);
     try std.Io.Dir.createDirPath(.cwd(), io, themes_path);
     const file_path = try std.fs.path.join(gpa, &.{ themes_path, "my_theme.json" });
@@ -824,10 +824,10 @@ test "ThemeRegistry.loadCustom customThemesDir replaces the default scan (m5)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A theme in the default location (home/.config/nova/themes)…
+    // A theme in the default location (home/.config/zay/themes)…
     const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer gpa.free(home_dir);
-    const default_themes = try std.fs.path.join(gpa, &.{ home_dir, ".config", "nova", "themes" });
+    const default_themes = try std.fs.path.join(gpa, &.{ home_dir, ".config", "zay", "themes" });
     defer gpa.free(default_themes);
     try std.Io.Dir.createDirPath(.cwd(), io, default_themes);
     const default_file = try std.fs.path.join(gpa, &.{ default_themes, "from_default.json" });

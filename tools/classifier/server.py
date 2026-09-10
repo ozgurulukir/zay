@@ -29,8 +29,8 @@ class ModelHost:
 
 def build_app(host: ModelHost, model_name: str) -> FastAPI:
     app = FastAPI(
-        title="Nova Safety Classifier",
-        description="External command safety classification REST endpoint for Nova Agent.",
+        title="Zay Safety Classifier",
+        description="External command safety classification REST endpoint for Zay Agent.",
         version="0.1.0",
     )
 
@@ -56,7 +56,7 @@ def build_app(host: ModelHost, model_name: str) -> FastAPI:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Nova Standalone Safety Classifier Service")
+    parser = argparse.ArgumentParser(description="Zay Standalone Safety Classifier Service")
     subparsers = parser.add_subparsers(dest="command", help="Subcommand to execute")
 
     # Serve subcommand (default)
@@ -118,9 +118,9 @@ def main() -> None:
         daemon=True,
     ).start()
 
-    print(f"[*] Starting Nova Safety Classifier ({args.model}) on http://{args.host}:{args.port}...")
-    print(f"[*] Nova Endpoint: http://{args.host}:{args.port}/classify")
-    print(f"[*] Set in your environment: export NOVA_BASH_CLASSIFIER_URL=http://{args.host}:{args.port}/classify\n")
+    print(f"[*] Starting Zay Safety Classifier ({args.model}) on http://{args.host}:{args.port}...")
+    print(f"[*] Zay Endpoint: http://{args.host}:{args.port}/classify")
+    print(f"[*] Set in your environment: export ZAY_BASH_CLASSIFIER_URL=http://{args.host}:{args.port}/classify\n")
 
     uvicorn.run(
         build_app(host, args.model),

@@ -2,8 +2,8 @@
 //!
 //! Discovers, loads, reloads, and unloads Lua plugins.
 //! Plugins are discovered from two directories:
-//!   - `~/.config/nova/plugins/` — global plugins
-//!   - `.nova/plugins/` — project plugins (override globals with same name)
+//!   - `~/.config/zay/plugins/` — global plugins
+//!   - `.zay/plugins/` — project plugins (override globals with same name)
 
 const std = @import("std");
 const log = std.log.scoped(.lua);
@@ -73,9 +73,9 @@ pub const PluginInstance = struct {
 pub const PluginManager = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    /// Global plugin directory (~/.config/nova/plugins/)
+    /// Global plugin directory (~/.config/zay/plugins/)
     global_dir: []const u8,
-    /// Project plugin directory (.nova/plugins/)
+    /// Project plugin directory (.zay/plugins/)
     project_dir: []const u8,
     /// Loaded plugins, indexed by name
     plugins: std.StringHashMapUnmanaged(*PluginInstance),
@@ -90,30 +90,30 @@ pub const PluginManager = struct {
     const Self = @This();
 
     /// Initialize the plugin manager.
-    /// `home_dir` is the user's home directory (for `~/.config/nova/plugins/`).
-    /// `cwd` is the current working directory (for `.nova/plugins/`).
+    /// `home_dir` is the user's home directory (for `~/.config/zay/plugins/`).
+    /// `cwd` is the current working directory (for `.zay/plugins/`).
     pub fn init(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, cwd: []const u8) Self {
         var global_dir: []const u8 = "";
         if (home_dir.len > 0) {
             if (os.is_windows) {
-                const appdata_dir = std.fs.path.join(allocator, &.{ home_dir, "AppData", "Roaming", "nova", "plugins" }) catch "";
+                const appdata_dir = std.fs.path.join(allocator, &.{ home_dir, "AppData", "Roaming", "zay", "plugins" }) catch "";
                 if (appdata_dir.len > 0) {
                     if (std.Io.Dir.openDirAbsolute(io, appdata_dir, .{})) |*d| {
                         d.close(io);
                         global_dir = appdata_dir;
                     } else |_| {
                         allocator.free(appdata_dir);
-                        global_dir = std.fs.path.join(allocator, &.{ home_dir, ".config", "nova", "plugins" }) catch "";
+                        global_dir = std.fs.path.join(allocator, &.{ home_dir, ".config", "zay", "plugins" }) catch "";
                     }
                 } else {
-                    global_dir = std.fs.path.join(allocator, &.{ home_dir, ".config", "nova", "plugins" }) catch "";
+                    global_dir = std.fs.path.join(allocator, &.{ home_dir, ".config", "zay", "plugins" }) catch "";
                 }
             } else {
-                global_dir = std.fs.path.join(allocator, &.{ home_dir, ".config", "nova", "plugins" }) catch "";
+                global_dir = std.fs.path.join(allocator, &.{ home_dir, ".config", "zay", "plugins" }) catch "";
             }
         }
         const project_dir = if (cwd.len > 0)
-            std.fs.path.join(allocator, &.{ cwd, ".nova", "plugins" }) catch ""
+            std.fs.path.join(allocator, &.{ cwd, ".zay", "plugins" }) catch ""
         else
             "";
         return Self{
@@ -234,13 +234,13 @@ pub const PluginManager = struct {
         else
             manifest.permissions;
 
-        // Create the plugin instance with Io so nova.* bridge functions
+        // Create the plugin instance with Io so zay.* bridge functions
         // (register_tool, read_file, etc.) are available in the sandbox.
         var L = try sandbox.createSandboxedStateWithIo(permissions, self.io);
 
-        // Store the plugin root directory in the registry so nova.require knows its base path
+        // Store the plugin root directory in the registry so zay.require knows its base path
         _ = c.lua_pushlstring(L.handle, dir_path.ptr, dir_path.len);
-        c.lua_setfield(L.handle, c.LUA_REGISTRYINDEX, "nova_plugin_dir");
+        c.lua_setfield(L.handle, c.LUA_REGISTRYINDEX, "zay_plugin_dir");
 
         // Store the plugin's settings JSON (if any) before init.lua runs so
         // load-time code can already call plugin.get_config(). lua_pushlstring
@@ -341,8 +341,8 @@ pub const PluginManager = struct {
     }
 
     /// Emit a lifecycle event to every active plugin. Each plugin's sandboxed
-    /// Lua state holds a `"nova_events"` registry table (populated by
-    /// `nova.on`); this drains the sub-table for `event.name()`, pcalling
+    /// Lua state holds a `"zay_events"` registry table (populated by
+    /// `zay.on`); this drains the sub-table for `event.name()`, pcalling
     /// every stored callback ref with the event payload as a Lua table.
     ///
     /// Errors in individual callbacks are logged and do not stop delivery to
@@ -378,7 +378,7 @@ pub const PluginManager = struct {
         // `try`, not `catch ""`: an OOM here must fail the repoint, not
         // silently empty discovery after old plugins were unloaded.
         var new_project_dir: []u8 = if (new_cwd.len > 0)
-            try std.fs.path.join(self.allocator, &.{ new_cwd, ".nova", "plugins" })
+            try std.fs.path.join(self.allocator, &.{ new_cwd, ".zay", "plugins" })
         else
             "";
         // Ownership transfers to self.project_dir at step 4; the assignment
@@ -477,17 +477,17 @@ pub const PluginManager = struct {
 
     // ── private helpers ─────────────────────────────────────────────
 
-    /// Read the `"nova_events"` registry table on `L`, find the sub-table for
+    /// Read the `"zay_events"` registry table on `L`, find the sub-table for
     /// `event_name`, and pcall every stored callback ref with `event`'s payload
     /// pushed as a Lua table. Each callback error is logged with `plugin_name`
     /// but does not stop the remaining callbacks. Stack-neutral.
     fn drainEventCallbacks(L: *c.lua_State, plugin_name: []const u8, event_name: []const u8, event: events.Event) void {
-        _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "nova_events");
+        _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "zay_events");
         if (c.lua_isnil(L, -1)) {
             c.lua_pop(L, 1);
             return;
         }
-        defer c.lua_pop(L, 1); // pop nova_events table
+        defer c.lua_pop(L, 1); // pop zay_events table
 
         _ = c.lua_getfield(L, -1, event_name.ptr);
         if (c.lua_isnil(L, -1)) {
@@ -704,14 +704,14 @@ test "plugin manager: loadAll with no plugins" {
 test "plugin manager: end-to-end loadOne with register_tool" {
     const testing = std.testing;
 
-    const dir_path = try std.fs.path.join(testing.allocator, &.{ "/tmp", "nova_test_plugin_disk" });
+    const dir_path = try std.fs.path.join(testing.allocator, &.{ "/tmp", "zay_test_plugin_disk" });
     defer testing.allocator.free(dir_path);
 
     var io_dir = try std.Io.Dir.openDir(.cwd(), testing.io, "/tmp", .{});
     defer io_dir.close(testing.io);
 
-    std.Io.Dir.cwd().createDirPath(testing.io, "/tmp/nova_test_plugin_disk") catch {};
-    defer std.Io.Dir.cwd().deleteTree(testing.io, "/tmp/nova_test_plugin_disk") catch {};
+    std.Io.Dir.cwd().createDirPath(testing.io, "/tmp/zay_test_plugin_disk") catch {};
+    defer std.Io.Dir.cwd().deleteTree(testing.io, "/tmp/zay_test_plugin_disk") catch {};
 
     var plugin_dir = try std.Io.Dir.openDir(.cwd(), testing.io, dir_path, .{});
     defer plugin_dir.close(testing.io);
@@ -732,7 +732,7 @@ test "plugin manager: end-to-end loadOne with register_tool" {
     try plugin_dir.writeFile(testing.io, .{
         .sub_path = "init.lua",
         .data =
-        \\nova.register_tool({
+        \\zay.register_tool({
         \\  name = "disk_tool",
         \\  description = "Tool from disk plugin",
         \\  parameters = {},
@@ -777,15 +777,15 @@ test "plugin manager: syncPluginConfig skips disabled plugins (P2)" {
     const testing = std.testing;
     const gpa = testing.allocator;
 
-    // The fixture mirrors the production layout: <home>/.config/nova/plugins,
+    // The fixture mirrors the production layout: <home>/.config/zay/plugins,
     // because PluginManager.init derives global_dir from home_dir.
-    const root = "/tmp/nova_test_plugin_cfg/.config/nova/plugins";
+    const root = "/tmp/zay_test_plugin_cfg/.config/zay/plugins";
     std.Io.Dir.cwd().createDirPath(testing.io, root) catch {};
-    defer std.Io.Dir.cwd().deleteTree(testing.io, "/tmp/nova_test_plugin_cfg") catch {};
+    defer std.Io.Dir.cwd().deleteTree(testing.io, "/tmp/zay_test_plugin_cfg") catch {};
 
     try writeFixturePlugin(root, "on_plugin",
         \\unconfigured = (plugin.get_config() == nil)
-        \\nova.register_tool({
+        \\zay.register_tool({
         \\  name = "t",
         \\  description = "t",
         \\  parameters = {},
@@ -793,7 +793,7 @@ test "plugin manager: syncPluginConfig skips disabled plugins (P2)" {
         \\})
     );
     try writeFixturePlugin(root, "off_plugin",
-        \\nova.register_tool({
+        \\zay.register_tool({
         \\  name = "t",
         \\  description = "t",
         \\  parameters = {},
@@ -801,7 +801,7 @@ test "plugin manager: syncPluginConfig skips disabled plugins (P2)" {
         \\})
     );
 
-    var manager = PluginManager.init(gpa, testing.io, "/tmp/nova_test_plugin_cfg", "");
+    var manager = PluginManager.init(gpa, testing.io, "/tmp/zay_test_plugin_cfg", "");
     defer manager.deinit();
 
     // Owned input entry, freed right after sync to prove the manager holds
@@ -834,14 +834,14 @@ test "plugin manager: settings reach init.lua and tool handlers via get_config (
     const testing = std.testing;
     const gpa = testing.allocator;
 
-    const root = "/tmp/nova_test_plugin_settings";
+    const root = "/tmp/zay_test_plugin_settings";
     std.Io.Dir.cwd().createDirPath(testing.io, root) catch {};
     defer std.Io.Dir.cwd().deleteTree(testing.io, root) catch {};
 
     try writeFixturePlugin(root, "cfg_plugin",
         \\local cfg = plugin.get_config()
         \\load_time_theme = cfg and cfg.theme or "unset"
-        \\nova.register_tool({
+        \\zay.register_tool({
         \\  name = "theme_tool",
         \\  description = "returns configured theme",
         \\  parameters = {},
@@ -927,9 +927,9 @@ test "plugin manager: loads all shipped example plugins" {
 }
 
 // End-to-end exercise of the todo plugin's plan round-trip via the json bridges
-// is intentionally NOT a unit test here: the plugin reads ".nova/todos.txt" and
-// ".nova/todos/plans.json" as paths relative to cwd, and Zig 0.16 has no
-// process.chdir API to isolate the test's file ops from the repo's real .nova/.
+// is intentionally NOT a unit test here: the plugin reads ".zay/todos.txt" and
+// ".zay/todos/plans.json" as paths relative to cwd, and Zig 0.16 has no
+// process.chdir API to isolate the test's file ops from the repo's real .zay/.
 // Coverage instead comes from two layers:
 //   1. The 9 json_decode/json_encode unit tests in plugin_api.zig prove each
 //      bridge works (decode of objects/arrays/primitives, encode with array-vs-
@@ -939,19 +939,19 @@ test "plugin manager: loads all shipped example plugins" {
 //      (json_encode in save_plans, json_decode in load_plans) resolve at load,
 //      and all 9 tools register. Handler bodies are pure Lua, so once the
 //      bridges and registration are proven, the set_plan/get_plan/check_step
-//      loop follows. Verify the live flow by running the plugin in Nova.
+//      loop follows. Verify the live flow by running the plugin in Zay.
 
 // Verify that a plugin's registered event callback fires when emitEvent is
 // called. This is the integration test for the event wiring (agent.zig emits
-// -> PluginManager.emitEvent -> drains nova_events -> pcalls callback).
+// -> PluginManager.emitEvent -> drains zay_events -> pcalls callback).
 test "plugin manager: emitEvent delivers to plugin callbacks" {
     const testing = std.testing;
 
-    const dir_path = try std.fs.path.join(testing.allocator, &.{ "/tmp", "nova_test_plugin_events" });
+    const dir_path = try std.fs.path.join(testing.allocator, &.{ "/tmp", "zay_test_plugin_events" });
     defer testing.allocator.free(dir_path);
 
-    std.Io.Dir.cwd().createDirPath(testing.io, "/tmp/nova_test_plugin_events") catch {};
-    defer std.Io.Dir.cwd().deleteTree(testing.io, "/tmp/nova_test_plugin_events") catch {};
+    std.Io.Dir.cwd().createDirPath(testing.io, "/tmp/zay_test_plugin_events") catch {};
+    defer std.Io.Dir.cwd().deleteTree(testing.io, "/tmp/zay_test_plugin_events") catch {};
 
     var plugin_dir = try std.Io.Dir.openDir(.cwd(), testing.io, dir_path, .{});
     defer plugin_dir.close(testing.io);
@@ -970,10 +970,10 @@ test "plugin manager: emitEvent delivers to plugin callbacks" {
         .sub_path = "init.lua",
         .data =
         \\-- Register a callback that records the tool name in a global.
-        \\nova.on("tool_call_started", function(data)
+        \\zay.on("tool_call_started", function(data)
         \\  _G.received_tool = data.name
         \\end)
-        \\nova.register_tool({
+        \\zay.register_tool({
         \\  name = "noop",
         \\  description = "noop",
         \\  parameters = {},
@@ -1010,27 +1010,27 @@ test "repointProjectDir swaps project plugins, keeps globals" {
     const testing = std.testing;
     const gpa = testing.allocator;
 
-    const root_tmp = "/tmp/nova_test_repoint_swap";
+    const root_tmp = "/tmp/zay_test_repoint_swap";
     defer std.Io.Dir.cwd().deleteTree(testing.io, root_tmp) catch {};
 
-    // Create: <home>/.config/nova/plugins/
-    const home_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "home", ".config", "nova", "plugins" });
+    // Create: <home>/.config/zay/plugins/
+    const home_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "home", ".config", "zay", "plugins" });
     defer gpa.free(home_plugins);
     std.Io.Dir.cwd().createDirPath(testing.io, home_plugins) catch {};
 
-    // Create: <old_project>/.nova/plugins/
-    const old_proj_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "old_project", ".nova", "plugins" });
+    // Create: <old_project>/.zay/plugins/
+    const old_proj_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "old_project", ".zay", "plugins" });
     defer gpa.free(old_proj_plugins);
     std.Io.Dir.cwd().createDirPath(testing.io, old_proj_plugins) catch {};
 
-    // Create: <new_project>/.nova/plugins/
-    const new_proj_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "new_project", ".nova", "plugins" });
+    // Create: <new_project>/.zay/plugins/
+    const new_proj_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "new_project", ".zay", "plugins" });
     defer gpa.free(new_proj_plugins);
     std.Io.Dir.cwd().createDirPath(testing.io, new_proj_plugins) catch {};
 
-    try writeFixturePlugin(home_plugins, "global_plugin", "nova.register_tool({name='t',description='t',parameters={},handler=function() return 'global' end})");
-    try writeFixturePlugin(old_proj_plugins, "old_proj_plugin", "nova.register_tool({name='t',description='t',parameters={},handler=function() return 'old' end})");
-    try writeFixturePlugin(new_proj_plugins, "new_proj_plugin", "nova.register_tool({name='t',description='t',parameters={},handler=function() return 'new' end})");
+    try writeFixturePlugin(home_plugins, "global_plugin", "zay.register_tool({name='t',description='t',parameters={},handler=function() return 'global' end})");
+    try writeFixturePlugin(old_proj_plugins, "old_proj_plugin", "zay.register_tool({name='t',description='t',parameters={},handler=function() return 'old' end})");
+    try writeFixturePlugin(new_proj_plugins, "new_proj_plugin", "zay.register_tool({name='t',description='t',parameters={},handler=function() return 'new' end})");
 
     const home_dir = try std.fs.path.join(gpa, &.{ root_tmp, "home" });
     defer gpa.free(home_dir);
@@ -1058,8 +1058,8 @@ test "repointProjectDir swaps project plugins, keeps globals" {
     try testing.expect(manager.get("old_proj_plugin") == null);
     try testing.expect(manager.get("new_proj_plugin") != null);
 
-    // Verify project_dir updated to new_project's .nova/plugins
-    const expected_new_dir = try std.fs.path.join(gpa, &.{ new_cwd, ".nova", "plugins" });
+    // Verify project_dir updated to new_project's .zay/plugins
+    const expected_new_dir = try std.fs.path.join(gpa, &.{ new_cwd, ".zay", "plugins" });
     defer gpa.free(expected_new_dir);
     try testing.expectEqualStrings(expected_new_dir, manager.project_dir);
 }
@@ -1068,19 +1068,19 @@ test "repointProjectDir to a project without plugins is a no-op" {
     const testing = std.testing;
     const gpa = testing.allocator;
 
-    const root_tmp = "/tmp/nova_test_repoint_noop";
+    const root_tmp = "/tmp/zay_test_repoint_noop";
     defer std.Io.Dir.cwd().deleteTree(testing.io, root_tmp) catch {};
 
-    const home_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "home", ".config", "nova", "plugins" });
+    const home_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "home", ".config", "zay", "plugins" });
     defer gpa.free(home_plugins);
     std.Io.Dir.cwd().createDirPath(testing.io, home_plugins) catch {};
 
-    const old_proj_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "old_project", ".nova", "plugins" });
+    const old_proj_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "old_project", ".zay", "plugins" });
     defer gpa.free(old_proj_plugins);
     std.Io.Dir.cwd().createDirPath(testing.io, old_proj_plugins) catch {};
 
-    try writeFixturePlugin(home_plugins, "global_plugin", "nova.register_tool({name='t',description='t',parameters={},handler=function() return 'global' end})");
-    try writeFixturePlugin(old_proj_plugins, "old_proj_plugin", "nova.register_tool({name='t',description='t',parameters={},handler=function() return 'old' end})");
+    try writeFixturePlugin(home_plugins, "global_plugin", "zay.register_tool({name='t',description='t',parameters={},handler=function() return 'global' end})");
+    try writeFixturePlugin(old_proj_plugins, "old_proj_plugin", "zay.register_tool({name='t',description='t',parameters={},handler=function() return 'old' end})");
 
     const home_dir = try std.fs.path.join(gpa, &.{ root_tmp, "home" });
     defer gpa.free(home_dir);
@@ -1096,10 +1096,10 @@ test "repointProjectDir to a project without plugins is a no-op" {
     try testing.expect(manager.get("global_plugin") != null);
     try testing.expect(manager.get("old_proj_plugin") != null);
 
-    // Repoint to a directory with no .nova/plugins
+    // Repoint to a directory with no .zay/plugins
     const no_project_cwd = try std.fs.path.join(gpa, &.{ root_tmp, "no_project" });
     defer gpa.free(no_project_cwd);
-    // Ensure the target directory exists (but no .nova/plugins subdir)
+    // Ensure the target directory exists (but no .zay/plugins subdir)
     std.Io.Dir.cwd().createDirPath(testing.io, no_project_cwd) catch {};
     try manager.repointProjectDir(no_project_cwd);
 
@@ -1109,7 +1109,7 @@ test "repointProjectDir to a project without plugins is a no-op" {
     try testing.expectEqual(@as(usize, 1), manager.count());
 
     // Verify project_dir updated
-    const expected_new_dir = try std.fs.path.join(gpa, &.{ no_project_cwd, ".nova", "plugins" });
+    const expected_new_dir = try std.fs.path.join(gpa, &.{ no_project_cwd, ".zay", "plugins" });
     defer gpa.free(expected_new_dir);
     try testing.expectEqualStrings(expected_new_dir, manager.project_dir);
 }
@@ -1118,24 +1118,24 @@ test "repointProjectDir unloads by dir, not by name" {
     const testing = std.testing;
     const gpa = testing.allocator;
 
-    const root_tmp = "/tmp/nova_test_repoint_samename";
+    const root_tmp = "/tmp/zay_test_repoint_samename";
     defer std.Io.Dir.cwd().deleteTree(testing.io, root_tmp) catch {};
 
-    const home_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "home", ".config", "nova", "plugins" });
+    const home_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "home", ".config", "zay", "plugins" });
     defer gpa.free(home_plugins);
     std.Io.Dir.cwd().createDirPath(testing.io, home_plugins) catch {};
 
-    const old_proj_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "old_project", ".nova", "plugins" });
+    const old_proj_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "old_project", ".zay", "plugins" });
     defer gpa.free(old_proj_plugins);
     std.Io.Dir.cwd().createDirPath(testing.io, old_proj_plugins) catch {};
 
-    const new_proj_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "new_project", ".nova", "plugins" });
+    const new_proj_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "new_project", ".zay", "plugins" });
     defer gpa.free(new_proj_plugins);
     std.Io.Dir.cwd().createDirPath(testing.io, new_proj_plugins) catch {};
 
     // Same plugin name in both old and new project dirs
-    try writeFixturePlugin(old_proj_plugins, "foo", "nova.register_tool({name='t',description='t',parameters={},handler=function() return 'old_foo' end})");
-    try writeFixturePlugin(new_proj_plugins, "foo", "nova.register_tool({name='t',description='t',parameters={},handler=function() return 'new_foo' end})");
+    try writeFixturePlugin(old_proj_plugins, "foo", "zay.register_tool({name='t',description='t',parameters={},handler=function() return 'old_foo' end})");
+    try writeFixturePlugin(new_proj_plugins, "foo", "zay.register_tool({name='t',description='t',parameters={},handler=function() return 'new_foo' end})");
 
     const home_dir = try std.fs.path.join(gpa, &.{ root_tmp, "home" });
     defer gpa.free(home_dir);
@@ -1171,25 +1171,25 @@ test "repointProjectDir restores globals shadowed by old project plugins" {
     const testing = std.testing;
     const gpa = testing.allocator;
 
-    const root_tmp = "/tmp/nova_test_repoint_shadow";
+    const root_tmp = "/tmp/zay_test_repoint_shadow";
     defer std.Io.Dir.cwd().deleteTree(testing.io, root_tmp) catch {};
 
-    const home_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "home", ".config", "nova", "plugins" });
+    const home_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "home", ".config", "zay", "plugins" });
     defer gpa.free(home_plugins);
     std.Io.Dir.cwd().createDirPath(testing.io, home_plugins) catch {};
 
-    const old_proj_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "old_project", ".nova", "plugins" });
+    const old_proj_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "old_project", ".zay", "plugins" });
     defer gpa.free(old_proj_plugins);
     std.Io.Dir.cwd().createDirPath(testing.io, old_proj_plugins) catch {};
 
-    const new_proj_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "new_project", ".nova", "plugins" });
+    const new_proj_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "new_project", ".zay", "plugins" });
     defer gpa.free(new_proj_plugins);
     std.Io.Dir.cwd().createDirPath(testing.io, new_proj_plugins) catch {};
 
     // Global dir has "foo", old project dir also has "foo" (shadows global),
     // new project dir has no "foo".
-    try writeFixturePlugin(home_plugins, "foo", "nova.register_tool({name='t',description='t',parameters={},handler=function() return 'global_foo' end})");
-    try writeFixturePlugin(old_proj_plugins, "foo", "nova.register_tool({name='t',description='t',parameters={},handler=function() return 'old_foo' end})");
+    try writeFixturePlugin(home_plugins, "foo", "zay.register_tool({name='t',description='t',parameters={},handler=function() return 'global_foo' end})");
+    try writeFixturePlugin(old_proj_plugins, "foo", "zay.register_tool({name='t',description='t',parameters={},handler=function() return 'old_foo' end})");
 
     const home_dir = try std.fs.path.join(gpa, &.{ root_tmp, "home" });
     defer gpa.free(home_dir);

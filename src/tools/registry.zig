@@ -448,7 +448,7 @@ test "ToolRegistry: benchmark lookup performance" {
     var env_map = platform.getEnvMap(gpa) catch null;
     if (env_map) |*m| {
         defer m.deinit();
-        if (m.get("NOVA_BENCHMARK") != null) {
+        if (m.get("ZAY_BENCHMARK") != null) {
             std.debug.print("\n[BENCHMARK] ToolRegistry lookup: {d} ops in {d} ns ({d} ns/op)\n", .{
                 iterations_done,
                 elapsed_ns,

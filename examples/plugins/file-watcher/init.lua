@@ -1,5 +1,5 @@
 -- init.lua — File Watcher plugin initialization
--- Demonstrates event-driven plugin using the Nova event bus.
+-- Demonstrates event-driven plugin using the Zay event bus.
 -- Counts file-related tool calls by kind (write/edit/delete/rename/copy).
 --
 -- The `tool_call_finished` payload carries only `name`/`call_id`/`success`
@@ -30,7 +30,7 @@ local function classify(name)
 end
 
 -- Count successful file-operation tool calls by kind.
-nova.on("tool_call_finished", function(data)
+zay.on("tool_call_finished", function(data)
   if not data.success then return end
   local kind = classify(data.name)
   if kind then
@@ -39,7 +39,7 @@ nova.on("tool_call_finished", function(data)
 end)
 
 -- Register a tool that reports file operation statistics
-nova.register_tool({
+zay.register_tool({
   name = "file_stats",
   description = "Returns statistics about file operations in this session",
   parameters = {},
@@ -61,7 +61,7 @@ nova.register_tool({
 })
 
 -- Register a tool that records a file operation manually
-nova.register_tool({
+zay.register_tool({
   name = "track_file_op",
   description = "Records a file operation for tracking",
   parameters = {

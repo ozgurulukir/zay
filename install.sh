@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Nova Agent Installer (Linux & macOS)
+# Zay Agent Installer (Linux & macOS)
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/ozgurulukir/nova-agent/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/ozgurulukir/zay/main/install.sh | bash
 
 set -euo pipefail
 
-REPO="ozgurulukir/nova-agent"
-INSTALL_DIR="${NOVA_INSTALL_DIR:-$HOME/.local/bin}"
-BIN_NAME="nova"
+REPO="ozgurulukir/zay"
+INSTALL_DIR="${ZAY_INSTALL_DIR:-$HOME/.local/bin}"
+BIN_NAME="zay"
 
 # Colors
 BOLD="\033[1m"
@@ -17,7 +17,7 @@ RED="\033[31m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-echo -e "${BOLD}${BLUE}==> Installing Nova Agent...${RESET}"
+echo -e "${BOLD}${BLUE}==> Installing Zay Agent...${RESET}"
 
 # Detect OS & Architecture
 OS="$(uname -s)"
@@ -27,7 +27,7 @@ case "$OS" in
   Linux)
     case "$ARCH" in
       x86_64)
-        ARTIFACT="nova-linux-x86_64"
+        ARTIFACT="zay-linux-x86_64"
         ;;
       *)
         echo -e "${RED}Error: Unsupported architecture: $ARCH on Linux. Currently x86_64 is supported.${RESET}" >&2
@@ -35,8 +35,19 @@ case "$OS" in
         ;;
     esac
     ;;
+  Darwin)
+    case "$ARCH" in
+      arm64)
+        ARTIFACT="zay-macos-aarch64"
+        ;;
+      *)
+        echo -e "${RED}Error: Unsupported architecture: $ARCH on macOS. Currently arm64 (Apple Silicon) is supported.${RESET}" >&2
+        exit 1
+        ;;
+    esac
+    ;;
   *)
-    echo -e "${RED}Error: Unsupported operating system: $OS. Linux x86_64 and Windows x86_64 are currently supported.${RESET}" >&2
+    echo -e "${RED}Error: Unsupported operating system: $OS. Linux x86_64, macOS arm64 and Windows x86_64 are currently supported.${RESET}" >&2
     exit 1
     ;;
 esac
@@ -50,10 +61,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Get release URL (allow NOVA_VERSION override e.g. NOVA_VERSION=v0.3.0)
-if [ -n "${NOVA_VERSION:-}" ]; then
-  BASE_URL="https://github.com/${REPO}/releases/download/${NOVA_VERSION}"
-  echo -e "Targeting version: ${BOLD}${NOVA_VERSION}${RESET}"
+# Get release URL (allow ZAY_VERSION override e.g. ZAY_VERSION=v0.3.0)
+if [ -n "${ZAY_VERSION:-}" ]; then
+  BASE_URL="https://github.com/${REPO}/releases/download/${ZAY_VERSION}"
+  echo -e "Targeting version: ${BOLD}${ZAY_VERSION}${RESET}"
 else
   BASE_URL="https://github.com/${REPO}/releases/latest/download"
   echo -e "Targeting version: ${BOLD}latest${RESET}"
@@ -84,7 +95,14 @@ fi
 mv "$TEMP_DIR/$ARTIFACT" "$INSTALL_DIR/$BIN_NAME"
 chmod +x "$INSTALL_DIR/$BIN_NAME"
 
-echo -e "${GREEN}${BOLD}==> Nova Agent installed successfully to ${INSTALL_DIR}/${BIN_NAME}!${RESET}"
+echo -e "${GREEN}${BOLD}==> Zay Agent installed successfully to ${INSTALL_DIR}/${BIN_NAME}!${RESET}"
+
+# macOS Gatekeeper flags unsigned binaries downloaded from the internet.
+if [ "$OS" = "Darwin" ]; then
+  echo ""
+  echo -e "${YELLOW}Note: if macOS reports the binary cannot be verified, run:${RESET}"
+  echo -e "  ${BOLD}xattr -d com.apple.quarantine \"${INSTALL_DIR}/${BIN_NAME}\"${RESET}"
+fi
 
 # Check PATH
 case ":$PATH:" in
@@ -99,4 +117,4 @@ case ":$PATH:" in
 esac
 
 echo ""
-echo -e "Run ${BOLD}nova${RESET} to get started."
+echo -e "Run ${BOLD}zay${RESET} to get started."

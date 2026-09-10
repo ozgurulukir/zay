@@ -14,7 +14,7 @@ pub const default_codex_endpoint = "https://chatgpt.com/backend-api";
 /// Client name sent as the HTTP `User-Agent` (`codex_responses_config`) and
 /// the websocket handshake headers. The `originator` header below carries the
 /// same name as a separate literal — change them together.
-const codex_user_agent = "nova";
+const codex_user_agent = "zay";
 
 /// Upstream Codex CLI identifies itself with a `version` request/handshake
 /// header alongside `originator`; send ours too so a future server-side
@@ -37,7 +37,7 @@ const codex_responses_config: core.ResponsesConfig = .{
     .headers = &.{
         .{ .name = "accept", .value = .{ .literal = http.media_type_event_stream } },
         .{ .name = "chatgpt-account-id", .value = .account_id },
-        .{ .name = "originator", .value = .{ .literal = "nova" } },
+        .{ .name = "originator", .value = .{ .literal = "zay" } },
         .{ .name = "version", .value = .{ .literal = codex_version } },
         .{ .name = "OpenAI-Beta", .value = .{ .literal = "responses=experimental" } },
         .{ .name = "session_id", .value = .session_id },
@@ -343,7 +343,7 @@ fn buildHandshakeHeaders(
 ) ![]u8 {
     return try std.fmt.allocPrint(
         gpa,
-        "Host: {s}\r\nAuthorization: {s}\r\nUser-Agent: " ++ codex_user_agent ++ "\r\nchatgpt-account-id: {s}\r\noriginator: nova\r\nversion: " ++ codex_version ++ "\r\nOpenAI-Beta: responses_websockets=2026-02-06\r\nsession_id: {s}\r\nx-client-request-id: {s}\r\n",
+        "Host: {s}\r\nAuthorization: {s}\r\nUser-Agent: " ++ codex_user_agent ++ "\r\nchatgpt-account-id: {s}\r\noriginator: zay\r\nversion: " ++ codex_version ++ "\r\nOpenAI-Beta: responses_websockets=2026-02-06\r\nsession_id: {s}\r\nx-client-request-id: {s}\r\n",
         .{
             host_header,
             authorization,

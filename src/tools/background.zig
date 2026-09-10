@@ -424,7 +424,7 @@ test "readLogTailBounded reads trailing lines accurately" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    const log_path = try @import("bash_exec.zig").namedTempPath(gpa, "nova-test-tail.log");
+    const log_path = try @import("bash_exec.zig").namedTempPath(gpa, "zay-test-tail.log");
     defer gpa.free(log_path);
     defer std.Io.Dir.deleteFile(.cwd(), io, log_path) catch {};
 

@@ -1,7 +1,7 @@
 [project]
-name = "nova-classifier"
+name = "zay-classifier"
 version = "0.1.0"
-description = "Standalone command safety classifier service for Nova Agent"
+description = "Standalone command safety classifier service for Zay Agent"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
-nova-classifier = "server:main"
+zay-classifier = "server:main"
 
 [build-system]
 requires = ["hatchling"]

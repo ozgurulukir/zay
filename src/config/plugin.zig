@@ -1,4 +1,4 @@
-//! Plugin configuration types for Nova's layered config system.
+//! Plugin configuration types for Zay's layered config system.
 //!
 //! Mirrors the MCP server config pattern: a `PluginConfig` struct with
 //! name, enabled flag, and plugin-specific settings stored as a JSON

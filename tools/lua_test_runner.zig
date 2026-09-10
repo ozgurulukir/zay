@@ -1,11 +1,11 @@
 //! Lua plugin test runner entry point.
 //!
 //! Built by `zig build test-plugin`. Takes Lua test file paths as
-//! command-line arguments and runs them through the Nova Lua sandbox.
+//! command-line arguments and runs them through the Zay Lua sandbox.
 //! Each test file uses the test_runner module (describe/it/assert).
 
 const std = @import("std");
-const lua_test_runner = @import("nova").lua_test_runner;
+const lua_test_runner = @import("zay").lua_test_runner;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;

@@ -1,4 +1,4 @@
--- formatter/init.lua — Directory submodule loaded via nova.require("formatter")
+-- formatter/init.lua — Directory submodule loaded via zay.require("formatter")
 local Formatter = {}
 
 function Formatter.format_stats(stats)

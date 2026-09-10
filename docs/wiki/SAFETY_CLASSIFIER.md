@@ -1,6 +1,6 @@
 # Command Safety & External Classifier Guide
 
-Nova Agent uses a defense-in-depth safety architecture to evaluate shell tool invocations (`bash` on Linux/macOS, `pwsh` on Windows) before execution.
+Zay Agent uses a defense-in-depth safety architecture to evaluate shell tool invocations (`bash` on Linux/macOS, `pwsh` on Windows) before execution.
 
 ---
 
@@ -57,30 +57,40 @@ uv run -m tools.classifier.server --port 8765
 uv run -m tools.classifier.server --model rules --port 8765
 ```
 
+> [!NOTE]
+> **Model weights source:** the `modernbert` preset downloads weights from the
+> upstream repo `nova-agent/ModernBERT-bash-classifier`, which is currently
+> **private** — anonymous downloads fail, and the loader falls back to the
+> legacy `vendor/local-models/ModernBERT-bash-classifier/` snapshot (if
+> present) or the rules engine. Point it at any accessible mirror (the model
+> is Apache-2.0, so re-hosting with notices is permitted) via
+> `ZAY_CLASSIFIER_REPO_ID`, and pin a commit hash with
+> `ZAY_CLASSIFIER_REVISION`.
+
 ### Option B: Using Docker
 
 ```bash
 # Build and run the container:
-docker build -t nova-classifier -f tools/classifier/Dockerfile tools/classifier
-docker run -d -p 8765:8765 --name nova-classifier nova-classifier
+docker build -t zay-classifier -f tools/classifier/Dockerfile tools/classifier
+docker run -d -p 8765:8765 --name zay-classifier zay-classifier
 ```
 
 ---
 
-## 3. Configuring Nova Agent
+## 3. Configuring Zay Agent
 
-Once your classifier service is running, connect Nova Agent using any of the following methods:
+Once your classifier service is running, connect Zay Agent using any of the following methods:
 
 ### Method 1: Environment Variable
 ```bash
 # Linux / macOS
-export NOVA_BASH_CLASSIFIER_URL="http://127.0.0.1:8765/classify"
+export ZAY_BASH_CLASSIFIER_URL="http://127.0.0.1:8765/classify"
 
 # PowerShell (Windows)
-$env:NOVA_BASH_CLASSIFIER_URL = "http://127.0.0.1:8765/classify"
+$env:ZAY_BASH_CLASSIFIER_URL = "http://127.0.0.1:8765/classify"
 ```
 
-### Method 2: Configuration File (`~/.config/nova/config.json`)
+### Method 2: Configuration File (`~/.config/zay/config.json`)
 ```json
 {
   "bashClassifierUrl": "http://127.0.0.1:8765/classify"
@@ -88,7 +98,7 @@ $env:NOVA_BASH_CLASSIFIER_URL = "http://127.0.0.1:8765/classify"
 ```
 
 ### Method 3: In-App TUI Settings
-1. Open Nova and press `/settings` (or navigate to the Settings tab).
+1. Open Zay and press `/settings` (or navigate to the Settings tab).
 2. Go to the **Advanced** section.
 3. Enter your classifier URL in the `bashClassifierUrl` field and press Enter.
 
@@ -99,7 +109,7 @@ $env:NOVA_BASH_CLASSIFIER_URL = "http://127.0.0.1:8765/classify"
 You can implement your own safety classifier in any programming language (Go, Rust, Node.js, Python, etc.) by implementing this HTTP REST contract:
 
 > [!IMPORTANT]
-> **Response deadline:** Nova enforces a **5-second deadline** on the
+> **Response deadline:** Zay enforces a **5-second deadline** on the
 > response exchange for POSIX plain-`http` classifier URLs. A response that
 > has not fully arrived within the budget is abandoned and the command
 > falls back to the Tier 1 matcher, so a custom classifier must answer

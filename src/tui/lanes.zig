@@ -18,7 +18,7 @@ const Thread = @import("../tui.zig").Thread;
 pub const pathsEqual = paths.pathsEqual;
 pub const lastPathSegment = paths.lastPathSegment;
 
-/// A lane being merged away. `branch`/`path` identify its `nova/<id>` worktree;
+/// A lane being merged away. `branch`/`path` identify its `zay/<id>` worktree;
 /// `active_index` is its `threads` slot when it's an open lane (torn down via
 /// `abandonLane` after a successful merge), or null for a parked worktree
 /// (removed directly). Strings are borrowed for the duration of the merge.
@@ -28,7 +28,7 @@ pub const MergeSource = struct {
     active_index: ?usize,
 };
 
-/// The `nova/<id>` worktree of `lane` if it's a working lane, else null (the
+/// The `zay/<id>` worktree of `lane` if it's a working lane, else null (the
 /// primary lane carries no dedicated branch/worktree).
 pub fn workingLaneOf(lane: *Thread) ?vcs.Lane.Working {
     const lane_ref: *const vcs.Lane = switch (lane.engine) {

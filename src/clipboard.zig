@@ -1,4 +1,4 @@
-//! System clipboard integration for Nova.
+//! System clipboard integration for Zay.
 //!
 //! Provides cross-platform copy and paste functionality:
 //!   - Copying uses OSC 52 terminal escape sequences as the primary mechanism
@@ -120,7 +120,7 @@ fn runCaptureStdout(gpa: std.mem.Allocator, io: std.Io, cmd: []const u8) ?[]u8 {
 
 test "base64 encoding for OSC 52 helper" {
     const gpa = std.testing.allocator;
-    const sample = "Hello Nova Clipboard!";
+    const sample = "Hello Zay Clipboard!";
     const Encoder = std.base64.standard.Encoder;
     const b64_len = Encoder.calcSize(sample.len);
     const buf = try gpa.alloc(u8, b64_len);

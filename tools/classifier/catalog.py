@@ -19,9 +19,21 @@ class ModelSpec:
     repo_id: str | None
     onnx_file: str
     factory: Callable[[Path], BaseClassifier]
+    revision: str = "main"
 
 
-CACHE_DIR = Path(os.environ.get("NOVA_CLASSIFIER_CACHE_DIR", Path.home() / ".cache" / "nova-classifier"))
+CACHE_DIR = Path(os.environ.get("ZAY_CLASSIFIER_CACHE_DIR", Path.home() / ".cache" / "zay-classifier"))
+
+# The upstream weights live in a third-party HuggingFace repo that is
+# currently private, so anonymous `snapshot_download` calls fail and the
+# loader falls back to the legacy `vendor/local-models/` snapshot or the
+# rules engine. Both knobs exist so an install can point at a public
+# mirror (the model is Apache-2.0, so re-hosting with notices is allowed)
+# without code changes; pin ZAY_CLASSIFIER_REVISION once a mirror exists
+# so upstream pushes can never swap the weights silently.
+DEFAULT_REPO_ID = "nova-agent/ModernBERT-bash-classifier"
+CLASSIFIER_REPO_ID = os.environ.get("ZAY_CLASSIFIER_REPO_ID", DEFAULT_REPO_ID)
+CLASSIFIER_REVISION = os.environ.get("ZAY_CLASSIFIER_REVISION", "main")
 
 
 def build_onnx_factory(onnx_file: str, max_length: int = 512) -> Callable[[Path], BaseClassifier]:
@@ -35,9 +47,10 @@ CATALOG: dict[str, ModelSpec] = {
     "modernbert": ModelSpec(
         name="modernbert",
         description="ModernBERT-bash-classifier (~450MB) - High accuracy fine-tuned ONNX model",
-        repo_id="nova-agent/ModernBERT-bash-classifier",
+        repo_id=CLASSIFIER_REPO_ID,
         onnx_file="model.onnx",
         factory=build_onnx_factory("model.onnx", 512),
+        revision=CLASSIFIER_REVISION,
     ),
     "rules": ModelSpec(
         name="rules",
@@ -68,9 +81,10 @@ def download_model(model_name: str) -> Path:
     target_dir = CACHE_DIR / model_name
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[*] Downloading '{model_name}' weights from {spec.repo_id} to {target_dir}...")
+    print(f"[*] Downloading '{model_name}' weights from {spec.repo_id}@{spec.revision} to {target_dir}...")
     snapshot_download(
         repo_id=spec.repo_id,
+        revision=spec.revision,
         local_dir=str(target_dir),
         local_dir_use_symlinks=False,
     )

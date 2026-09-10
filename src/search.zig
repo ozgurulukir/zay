@@ -681,7 +681,7 @@ fn parseCursorForRequest(request: Request) !Cursor {
 
 fn encodeCursor(gpa: std.mem.Allocator, cursor: Cursor) ![]u8 {
     assert(cursor.offset > 0);
-    return std.fmt.allocPrint(gpa, "nova-search-v2:{s}:{}:{x}", .{
+    return std.fmt.allocPrint(gpa, "zay-search-v2:{s}:{}:{x}", .{
         cursor.op.name(),
         cursor.offset,
         cursor.query_hash,
@@ -692,7 +692,7 @@ fn decodeCursor(raw: []const u8) ?Cursor {
     if (raw.len == 0) return null;
     var iter = std.mem.splitScalar(u8, raw, ':');
     const prefix = iter.next() orelse return null;
-    if (!std.mem.eql(u8, prefix, "nova-search-v2")) return null;
+    if (!std.mem.eql(u8, prefix, "zay-search-v2")) return null;
     const op = ops_by_name.get(iter.next() orelse return null) orelse return null;
     const offset = std.fmt.parseInt(u32, iter.next() orelse return null, 10) catch return null;
     const query_hash = std.fmt.parseInt(u64, iter.next() orelse return null, 16) catch return null;
@@ -794,7 +794,7 @@ test "start with nonexistent cwd transitions to failed" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    start(gpa, io, "/does-not-exist-nova-test");
+    start(gpa, io, "/does-not-exist-zay-test");
     defer deinit(gpa, io);
 
     var tries: usize = 0;

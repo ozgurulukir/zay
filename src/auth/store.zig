@@ -1,6 +1,6 @@
 //! Generic provider credential storage service.
 //!
-//! Owns the `auth.json` file format (`~/.config/nova/auth.json`) and the
+//! Owns the `auth.json` file format (`~/.config/zay/auth.json`) and the
 //! OS keychain fallback. All providers — builtin, models.dev dynamic, and
 //! user-defined config — use this module for API key storage.
 //!
@@ -14,7 +14,7 @@ const log = std.log.scoped(.auth);
 
 const keyring = @import("keyring.zig");
 
-const keyring_service = "Nova";
+const keyring_service = "Zay";
 
 // ---------------------------------------------------------------------------
 // Credentials (openaiCodex section of auth.json)
@@ -190,7 +190,7 @@ pub fn pruneOrphanKeys(
 
 pub fn authPath(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
     if (home_dir.len == 0) return error.HomeNotSet;
-    return std.fs.path.join(gpa, &.{ home_dir, ".config", "nova", "auth.json" });
+    return std.fs.path.join(gpa, &.{ home_dir, ".config", "zay", "auth.json" });
 }
 
 /// Read the serialized auth blob, preferring the keychain and falling back
@@ -461,7 +461,7 @@ test "writeApiKeys serializes non-empty entries as a json object" {
 
 test "saveProviderApiKey and removeProviderApiKey round-trip" {
     const gpa = std.testing.allocator;
-    const home_dir = "/tmp/nova-auth-test";
+    const home_dir = "/tmp/zay-auth-test";
     defer deleteBlob(gpa, std.testing.io, home_dir) catch {};
 
     try saveProviderApiKey(gpa, std.testing.io, home_dir, "cerebras", "csk-123");
@@ -501,7 +501,7 @@ test "loadCredentials returns null when auth blob is absent" {
     // Arrange
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const home_dir = "/tmp/nova-load-credentials-absent-test";
+    const home_dir = "/tmp/zay-load-credentials-absent-test";
     defer deleteBlob(gpa, io, home_dir) catch {};
 
     try deleteBlob(gpa, io, home_dir);
@@ -517,7 +517,7 @@ test "loadCredentials parses valid credentials from saved file" {
     // Arrange
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const home_dir = "/tmp/nova-load-credentials-valid-test";
+    const home_dir = "/tmp/zay-load-credentials-valid-test";
     defer deleteBlob(gpa, io, home_dir) catch {};
 
     var creds_to_save: Credentials = .{
@@ -548,7 +548,7 @@ test "loadCredentials returns null when auth blob contains no openaiCodex sectio
     // Arrange
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const home_dir = "/tmp/nova-load-credentials-no-codex-test";
+    const home_dir = "/tmp/zay-load-credentials-no-codex-test";
     defer deleteBlob(gpa, io, home_dir) catch {};
 
     try saveProviderApiKey(gpa, io, home_dir, "cerebras", "csk-123");
@@ -564,7 +564,7 @@ test "loadCredentials propagates InvalidCredentials error on malformed JSON" {
     // Arrange
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const home_dir = "/tmp/nova-load-credentials-malformed-test";
+    const home_dir = "/tmp/zay-load-credentials-malformed-test";
     defer deleteBlob(gpa, io, home_dir) catch {};
 
     try writeBlob(gpa, io, home_dir, "{invalid json content");
@@ -577,7 +577,7 @@ test "writeBlob falls back to auth.json when keyring save fails or is unsupporte
     // Arrange
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const home_dir = "/tmp/nova-writeblob-fallback-test";
+    const home_dir = "/tmp/zay-writeblob-fallback-test";
     defer deleteBlob(gpa, io, home_dir) catch {};
 
     const secret_payload = "{\"apiKeys\":{\"openrouter\":\"or-key-12345\"}}";
@@ -600,7 +600,7 @@ test "writeBlob handles large payload triggering keyring error and falls back to
     // Arrange
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const home_dir = "/tmp/nova-writeblob-large-payload-test";
+    const home_dir = "/tmp/zay-writeblob-large-payload-test";
     defer deleteBlob(gpa, io, home_dir) catch {};
 
     // Generate a payload exceeding 2560 bytes (Windows keyring max blob size limit)
@@ -621,7 +621,7 @@ test "deleteBlob handles keyring delete failure and removes auth.json file" {
     // Arrange
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const home_dir = "/tmp/nova-deleteblob-test";
+    const home_dir = "/tmp/zay-deleteblob-test";
     defer deleteBlob(gpa, io, home_dir) catch {};
 
     const payload = "{\"apiKeys\":{\"test\":\"key\"}}";
@@ -643,7 +643,7 @@ test "pruneOrphanKeys removes unknown provider keys while keeping valid ones and
     // Arrange
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const home_dir = "/tmp/nova-auth-prune-test-1";
+    const home_dir = "/tmp/zay-auth-prune-test-1";
     defer deleteBlob(gpa, io, home_dir) catch {};
 
     const creds = Credentials{
@@ -695,7 +695,7 @@ test "pruneOrphanKeys returns zero when no orphan keys exist" {
     // Arrange
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const home_dir = "/tmp/nova-auth-prune-test-2";
+    const home_dir = "/tmp/zay-auth-prune-test-2";
     defer deleteBlob(gpa, io, home_dir) catch {};
 
     try saveProviderApiKey(gpa, io, home_dir, "cerebras", "csk-1");
@@ -722,7 +722,7 @@ test "pruneOrphanKeys returns zero when no provider keys are stored" {
     // Arrange
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const home_dir = "/tmp/nova-auth-prune-test-3";
+    const home_dir = "/tmp/zay-auth-prune-test-3";
     defer deleteBlob(gpa, io, home_dir) catch {};
 
     const valid_names = [_][]const u8{"cerebras"};
@@ -738,7 +738,7 @@ test "pruneOrphanKeys is idempotent" {
     // Arrange
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const home_dir = "/tmp/nova-auth-prune-test-4";
+    const home_dir = "/tmp/zay-auth-prune-test-4";
     defer deleteBlob(gpa, io, home_dir) catch {};
 
     try saveProviderApiKey(gpa, io, home_dir, "cerebras", "csk-valid");

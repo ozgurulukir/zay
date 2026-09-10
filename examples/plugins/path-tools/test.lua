@@ -5,7 +5,7 @@ local test = test_runner
 local registered = {}
 local mock_calls = {}
 
-nova = {
+zay = {
   register_tool = function(tool)
     registered[tool.name] = tool
   end,
@@ -40,7 +40,7 @@ test.describe("path-tools plugin", function()
     test.assert.is_true(registered["delete_path"] ~= nil)
   end)
 
-  test.it("create_directory handler calls nova.mkdir", function()
+  test.it("create_directory handler calls zay.mkdir", function()
     local res = registered["create_directory"].handler({ path = "src/nested/dir" })
     test.assert.contains("Created directory: src/nested/dir", res)
 
@@ -48,7 +48,7 @@ test.describe("path-tools plugin", function()
     test.assert.contains("Error: could not create", err)
   end)
 
-  test.it("copy_path handler calls nova.copy_path", function()
+  test.it("copy_path handler calls zay.copy_path", function()
     local res = registered["copy_path"].handler({ source_path = "a.txt", destination_path = "b.txt" })
     test.assert.contains("Copied a.txt to b.txt", res)
 
@@ -56,7 +56,7 @@ test.describe("path-tools plugin", function()
     test.assert.contains("Error: could not copy", err)
   end)
 
-  test.it("move_path handler calls nova.move_path", function()
+  test.it("move_path handler calls zay.move_path", function()
     local res = registered["move_path"].handler({ source_path = "a.txt", destination_path = "b.txt" })
     test.assert.contains("Moved a.txt to b.txt", res)
 

@@ -1,28 +1,28 @@
-# Nova Agent Installer (Windows PowerShell)
+# Zay Agent Installer (Windows PowerShell)
 # Usage:
-#   irm https://raw.githubusercontent.com/ozgurulukir/nova-agent/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/ozgurulukir/zay/main/install.ps1 | iex
 #   or:
-#   curl.exe -fsSL https://raw.githubusercontent.com/ozgurulukir/nova-agent/main/install.ps1 | iex
+#   curl.exe -fsSL https://raw.githubusercontent.com/ozgurulukir/zay/main/install.ps1 | iex
 
 $ErrorActionPreference = 'Stop'
 
-$Repo = "ozgurulukir/nova-agent"
-$InstallDir = if ($env:NOVA_INSTALL_DIR) { $env:NOVA_INSTALL_DIR } else { "$env:LOCALAPPDATA\Programs\nova" }
-$BinName = "nova.exe"
-$Artifact = "nova-windows-x86_64.exe"
+$Repo = "ozgurulukir/zay"
+$InstallDir = if ($env:ZAY_INSTALL_DIR) { $env:ZAY_INSTALL_DIR } else { "$env:LOCALAPPDATA\Programs\zay" }
+$BinName = "zay.exe"
+$Artifact = "zay-windows-x86_64.exe"
 
-Write-Host "==> Installing Nova Agent for Windows..." -ForegroundColor Cyan
+Write-Host "==> Installing Zay Agent for Windows..." -ForegroundColor Cyan
 
 # Check 64-bit architecture
 if (-not [Environment]::Is64BitOperatingSystem) {
-    Write-Error "Nova Agent currently supports 64-bit (x86_64) Windows only."
+    Write-Error "Zay Agent currently supports 64-bit (x86_64) Windows only."
     exit 1
 }
 
 # Determine download version
-if ($env:NOVA_VERSION) {
-    $BaseUrl = "https://github.com/$Repo/releases/download/$env:NOVA_VERSION"
-    Write-Host "Targeting version: $env:NOVA_VERSION"
+if ($env:ZAY_VERSION) {
+    $BaseUrl = "https://github.com/$Repo/releases/download/$env:ZAY_VERSION"
+    Write-Host "Targeting version: $env:ZAY_VERSION"
 } else {
     $BaseUrl = "https://github.com/$Repo/releases/latest/download"
     Write-Host "Targeting version: latest"
@@ -64,7 +64,7 @@ try {
     $TargetBinary = Join-Path $InstallDir $BinName
     # Replace if exists
     Copy-Item -Path $TempArtifactPath -Destination $TargetBinary -Force
-    Write-Host "==> Nova Agent installed successfully to $TargetBinary!" -ForegroundColor Green
+    Write-Host "==> Zay Agent installed successfully to $TargetBinary!" -ForegroundColor Green
 
     # Ensure target directory is in user PATH
     $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -82,8 +82,8 @@ try {
     }
 
     Write-Host ""
-    Write-Host "Nova Agent is ready to use!" -ForegroundColor Cyan
-    Write-Host "Run 'nova' to get started." -ForegroundColor White
+    Write-Host "Zay Agent is ready to use!" -ForegroundColor Cyan
+    Write-Host "Run 'zay' to get started." -ForegroundColor White
 } finally {
     if (Test-Path $TempDir) {
         Remove-Item -Path $TempDir -Recurse -Force -ErrorAction SilentlyContinue

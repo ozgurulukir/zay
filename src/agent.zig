@@ -42,7 +42,7 @@ pub const compaction_failure_limit: u32 = 3;
 /// never touches it. Static text: the event carries the limit for the human;
 /// the model does not need the number.
 const tool_budget_continuation_hint =
-    "[nova] This turn stopped early because the per-turn tool-call budget was reached. " ++
+    "[zay] This turn stopped early because the per-turn tool-call budget was reached. " ++
     "Work done so far is intact. When the user asks to continue, briefly summarize " ++
     "completed steps, then pick up exactly where the work left off.";
 /// Trailing machine-authored continuation hint appended when a response was
@@ -51,7 +51,7 @@ const tool_budget_continuation_hint =
 /// `.user`-role reasoning as `tool_budget_continuation_hint` (survives
 /// resume/compaction; Qwen normalization never touches it).
 const length_cut_continuation_hint =
-    "[nova] Your previous response was cut off by the output token limit before it finished. " ++
+    "[zay] Your previous response was cut off by the output token limit before it finished. " ++
     "Continue from exactly where it stopped; if you were about to call a tool, emit that tool call now.";
 /// Byte threshold at which a pending buffer flushes mid-stream. ~2s of text
 /// at 100 tok/s, ~0.4s at 500 tok/s. A config knob adds surface area for
@@ -2142,7 +2142,7 @@ test "softStopOnBudget drains queue, appends hint, emits events" {
     try std.testing.expectEqual(@as(usize, 3), agent.messages().len);
     try std.testing.expectEqualStrings("first", agent.messages()[0].text());
     try std.testing.expectEqualStrings("second", agent.messages()[1].text());
-    try std.testing.expect(std.mem.startsWith(u8, agent.messages()[2].text(), "[nova] This turn stopped"));
+    try std.testing.expect(std.mem.startsWith(u8, agent.messages()[2].text(), "[zay] This turn stopped"));
     try std.testing.expect(agent.messages()[2].role() == .user);
     try std.testing.expect(!agent.hasQueuedMessages());
 
@@ -2165,7 +2165,7 @@ test "softStopOnBudget with empty queue emits only the budget event" {
     try agent.softStopOnBudget(listener, agent.tool_call_limit_per_turn);
 
     try std.testing.expectEqual(@as(usize, 1), agent.messages().len);
-    try std.testing.expect(std.mem.startsWith(u8, agent.messages()[0].text(), "[nova] This turn stopped"));
+    try std.testing.expect(std.mem.startsWith(u8, agent.messages()[0].text(), "[zay] This turn stopped"));
     try std.testing.expectEqual(@as(usize, 1), seen.events.items.len);
     try std.testing.expectEqual(@as(u32, 100), seen.events.items[0].tool_budget_exhausted);
 }
@@ -2187,7 +2187,7 @@ test "handleLengthCut auto-continues once then stops" {
     try std.testing.expectEqual(Agent.Event.LengthCut.auto_continued, seen.events.items[0].length_cut);
     try std.testing.expectEqual(@as(usize, 1), agent.messages().len);
     try std.testing.expect(agent.messages()[0].role() == .user);
-    try std.testing.expect(std.mem.startsWith(u8, agent.messages()[0].text(), "[nova] Your previous response was cut off"));
+    try std.testing.expect(std.mem.startsWith(u8, agent.messages()[0].text(), "[zay] Your previous response was cut off"));
 
     // Second cut in the same run: the one-shot is exhausted — the turn ends
     // with the stopped event and no extra hint message.
@@ -2334,7 +2334,7 @@ test "run auto-continues once after a length-cut stream" {
     try std.testing.expect(messages[1].role() == .assistant);
     try std.testing.expectEqualStrings("partial plan", messages[1].text());
     try std.testing.expect(messages[2].role() == .user);
-    try std.testing.expect(std.mem.startsWith(u8, messages[2].text(), "[nova] Your previous response was cut off"));
+    try std.testing.expect(std.mem.startsWith(u8, messages[2].text(), "[zay] Your previous response was cut off"));
     try std.testing.expect(messages[3].role() == .assistant);
     try std.testing.expectEqualStrings("continued", messages[3].text());
 }
@@ -2501,7 +2501,7 @@ test "requestManualCompact: defers to a stale run instead of starting a second" 
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, ".config/nova");
+    try tmp.dir.createDirPath(std.testing.io, ".config/zay");
     const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer gpa.free(home_dir);
 
@@ -2537,7 +2537,7 @@ test "requestManualCompact starts a run; poll fails it against a dead server" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, ".config/nova");
+    try tmp.dir.createDirPath(std.testing.io, ".config/zay");
     const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer gpa.free(home_dir);
 
@@ -2650,7 +2650,7 @@ test "pollManualCompact: discards a stale background result before the manual ru
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, ".config/nova");
+    try tmp.dir.createDirPath(std.testing.io, ".config/zay");
     const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer gpa.free(home_dir);
 
@@ -2776,7 +2776,7 @@ test "compaction breaker trips after repeated failures and backs off automatical
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, ".config/nova");
+    try tmp.dir.createDirPath(std.testing.io, ".config/zay");
     const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer gpa.free(home_dir);
 
@@ -2833,7 +2833,7 @@ test "applyReadyCompaction resets the breaker on a successful swap" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, ".config/nova");
+    try tmp.dir.createDirPath(std.testing.io, ".config/zay");
     const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer gpa.free(home_dir);
 
@@ -2930,9 +2930,9 @@ test "I3: setWorkspace/effectiveCwd round-trip under the test allocator" {
     try std.testing.expect(agent.workspaceBorrow() == null);
 
     // Set a borrow (a lane worktree path, borrowed — never freed here).
-    agent.setWorkspace("/tmp/nova-lanes/abc123");
-    try std.testing.expectEqualStrings("/tmp/nova-lanes/abc123", agent.effectiveCwd());
-    try std.testing.expectEqualStrings("/tmp/nova-lanes/abc123", agent.workspaceBorrow().?);
+    agent.setWorkspace("/tmp/zay-lanes/abc123");
+    try std.testing.expectEqualStrings("/tmp/zay-lanes/abc123", agent.effectiveCwd());
+    try std.testing.expectEqualStrings("/tmp/zay-lanes/abc123", agent.workspaceBorrow().?);
 
     // Clear it back.
     agent.setWorkspace(null);

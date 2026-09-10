@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Static Code Quality & Architecture Invariant Audit for Nova Agent.
+    Static Code Quality & Architecture Invariant Audit for Zay Agent.
 .DESCRIPTION
     Audits adherence to:
     - INV-LEAF-1: Pure leaf module isolation (lib/ has 0 imports from src/).
@@ -19,7 +19,7 @@ $srcPath = Join-Path $resolvedRoot "src"
 $libPath = Join-Path $resolvedRoot "lib"
 
 Write-Host "==================================================" -ForegroundColor Cyan
-Write-Host " 🛡️  Nova Agent Code Quality & Invariant Auditor" -ForegroundColor Cyan
+Write-Host " 🛡️  Zay Agent Code Quality & Invariant Auditor" -ForegroundColor Cyan
 Write-Host "==================================================" -ForegroundColor Cyan
 Write-Host "Root Path: $resolvedRoot`n"
 
@@ -36,7 +36,7 @@ $leafViolations = @()
 foreach ($file in $libFiles) {
     $content = Get-Content $file.FullName -Raw
     if ($content -match '@import\s*\(\s*["''].*src/.*["'']\s*\)' -or 
-        $content -match '@import\s*\(\s*["'']nova["'']\s*\)') {
+        $content -match '@import\s*\(\s*["'']zay["'']\s*\)') {
         $leafViolations += $file.FullName
     }
 }

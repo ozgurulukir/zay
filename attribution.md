@@ -1,6 +1,6 @@
 # Third-party attributions
 
-Nova vendors a small number of third-party libraries and compiles a few
+Zay vendors a small number of third-party libraries and compiles a few
 build-time dependencies into the binary. Each entry lists the source,
 license, and any local modifications.
 
@@ -20,7 +20,7 @@ license, and any local modifications.
    helper, which uses `strpbrk` from `<string.h>`). `strings.h` does not exist
    on Windows, so this keeps the vendored source cross-platform.
 2. **`src/match.h`** — added `#include <stddef.h>` so `size_t` is declared
-   when the header is included standalone (as Nova does via `src/c.h`).
+   when the header is included standalone (as Zay does via `src/c.h`).
 
 The MIT license text follows:
 
@@ -119,7 +119,7 @@ No local modifications — vendored unmodified from the 3.53.4 amalgamation
 
 - **`src/websocket.zig`** — the server-side exports (`server` namespace,
   `Conn`/`Config`/`Server`/`blockingMode`/`Handshake` re-exports) and the
-  `frame*` test helpers were removed from the public entry point. Nova only
+  `frame*` test helpers were removed from the public entry point. Zay only
   uses the client; all other vendored files (`buffer.zig`, `posix.zig`,
   `proto.zig`, `windows.zig`, `client/client.zig`) are byte-identical to
   upstream.
@@ -155,7 +155,7 @@ compiled into the shipped binary, so their licenses are listed here.
 
 #### Local modifications
 
-Two guards (marked `NOVA-LOCAL-PATCH`) in `zig-pkg/vaxis-<hash>/src/vxfw/App.zig`
+Two guards (marked `ZAY-LOCAL-PATCH`) in `zig-pkg/vaxis-<hash>/src/vxfw/App.zig`
 fix an upstream focus-handler crash (SIGSEGV in ReleaseFast) when
 `path_to_focused` is empty during session switch:
 
@@ -193,7 +193,7 @@ lands past the pinned commit.
   `models.json`)
 - **License:** MIT — Copyright (c) 2025 models.dev
 - **Used for:** the offline model/provider catalog. Installed next to the
-  binary as `share/nova/api.json` (`build.zig`) and refreshed on demand via
+  binary as `share/zay/api.json` (`build.zig`) and refreshed on demand via
   the `/v1/models` probe.
 
 ## Safety classifier service (`tools/classifier/`)

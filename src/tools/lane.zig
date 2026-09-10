@@ -1,4 +1,4 @@
-//! The `lane` builtin tool — the model's handle on Nova's parallel-lane
+//! The `lane` builtin tool — the model's handle on Zay's parallel-lane
 //! machinery. Runs on the worker thread, so it cannot touch App-owned state
 //! (threads, split, parked lanes) directly; every action is posted across the
 //! `LaneBridge` and resolved by the UI on its tick (see `lane_bridge.zig`).

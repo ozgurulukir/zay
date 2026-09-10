@@ -11,7 +11,7 @@ return one row per AST node.
 ## Prerequisites & configuration
 
 - The `duckdb` CLI must be installed. Resolution order: `plugins.sitting-duck.settings.duckdb_path`
-  in config.json → `NOVA_SITTING_DUCK_BIN` env var → `duckdb` on PATH.
+  in config.json → `ZAY_SITTING_DUCK_BIN` env var → `duckdb` on PATH.
 - The `sitting_duck` extension auto-installs on the first tool call
   (`INSTALL sitting_duck FROM community`) — this is one-time, needs network,
   and may take minutes; subsequent calls are fast.
@@ -57,7 +57,7 @@ re-run `ast_outline` before another `ast_get_source`.
   outside it.
 - Empty results are normal ("No AST symbols found…"), not errors — try a
   broader `kinds` filter or a wider glob.
-- On a query error the exact SQL sent stays at `.nova/sitting-duck/query.sql`
+- On a query error the exact SQL sent stays at `.zay/sitting-duck/query.sql`
   for inspection; the error message says so.
 - A "column not found / Candidate bindings" error means the extension schema
   drifted (a duckdb upgrade can do this) — introspect and adapt:

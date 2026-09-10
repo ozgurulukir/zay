@@ -174,7 +174,7 @@ pub fn catalogueIndexById(id: []const u8) ?usize {
     return null;
 }
 
-/// Reload the cached provider API keys from `~/.config/nova/auth.json`. Drives the
+/// Reload the cached provider API keys from `~/.config/zay/auth.json`. Drives the
 /// picker badges and the multi-provider model catalogue.
 pub fn refreshProviderApiKeys(self: *App) !void {
     // Real early return, never an unwrap — this path is reachable with a

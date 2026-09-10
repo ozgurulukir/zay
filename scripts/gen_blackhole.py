@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Seamless-loop ASCII black-hole frame generator for Nova's startup animation.
+Seamless-loop ASCII black-hole frame generator for Zay's startup animation.
 
 Regenerate the frames consumed by `src/tui/blackhole.zig` with:
 
