@@ -36,7 +36,7 @@ Zay operates without granular per-action permission prompts (YOLO mode), relying
 - **Built-in Deterministic Safety Matcher (Default):** Zero-dependency lexical token analysis in Zig (`bash_safety.zig`) that automatically intercepts high-risk destructive commands (`rm -rf /`, drive wipes, `mkfs`, fork bombs) and gates them behind confirmation prompts.
 - **Git Worktree Isolation:** Risky or wide refactors can be spawned into isolated **Parallel Lanes** (`/parallel` or `lane spawn`), physically contained in dedicated worktrees to keep your main branch clean.
 - **Sandboxed Lua Plugins:** Embedded runtime with stripped unsafe libraries (`io`, `os.execute`), strict workspace path confinement, and instruction budgets.
-- **Optional AI Safety Classifier:** Deep contextual command evaluation via a local ModernBERT service (`tools/classifier/`).
+- **Optional AI Safety Classifier:** Deep contextual command evaluation via a local ModernBERT service or an LLM-as-classifier proxy (OpenAI / Ollama / OpenRouter) (`tools/classifier/`).
 
 > [!CAUTION]
 > Because Zay executes commands directly in your workspace without per-action confirmation prompts, run it in repositories you trust or confine broad changes to parallel git lanes.
