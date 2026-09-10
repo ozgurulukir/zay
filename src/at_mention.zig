@@ -7,7 +7,10 @@
 //!   2. Assembling the message actually sent to the model — text files are
 //!      embedded inline as `<file src="…">…</file>`, images are attached as
 //!      real `ai.ContentBlock.image` blocks so vision models receive them via
-//!      the API's image field.
+//!      the API's image field. Image mentions are magic-byte sniffed (the
+//!      sniffed MIME wins over the extension) and every non-attached image
+//!      gets a visible `<image … error="…" />` marker — the model is never
+//!      told an image exists without it actually being attached.
 //!
 //! The thread still shows the raw text the user typed; only the outgoing
 //! message is augmented here.
@@ -17,6 +20,8 @@ const ai = @import("ai.zig");
 const common = @import("tools/common.zig");
 const sigil_query = @import("sigil_query.zig");
 const skill_mod = @import("skill.zig");
+
+const log = std.log.scoped(.at_mention);
 
 const assert = std.debug.assert;
 
@@ -75,89 +80,228 @@ pub fn collectMentions(gpa: std.mem.Allocator, prompt: []const u8) ![][]const u8
     return list.toOwnedSlice(gpa);
 }
 
-/// `image/png` / `image/jpeg` for recognised image extensions, else null.
+/// `image/png`, `image/jpeg`, `image/gif`, `image/webp` for recognised image
+/// extensions, else null. This is the EXTENSION guess only — the magic-byte
+/// sniff (`sniffImageKind`) wins at attach time.
 pub fn mimeForPath(path: []const u8) ?[]const u8 {
     if (endsWithIgnoreCase(path, ".png")) return "image/png";
     if (endsWithIgnoreCase(path, ".jpg") or endsWithIgnoreCase(path, ".jpeg")) return "image/jpeg";
+    if (endsWithIgnoreCase(path, ".gif")) return "image/gif";
+    if (endsWithIgnoreCase(path, ".webp")) return "image/webp";
     return null;
 }
 
+/// Image containers zay recognises but never attaches — no major provider
+/// accepts them (Claude/OpenAI take JPEG/PNG/GIF/WebP only). Mentioned files
+/// route down the image path so they get a visible error marker instead of
+/// being embedded as binary text.
+const unsupported_image_extensions = [_][]const u8{ ".heic", ".heif", ".bmp", ".tif", ".tiff", ".avif" };
+
+fn isUnsupportedImagePath(path: []const u8) bool {
+    for (unsupported_image_extensions) |ext| {
+        if (endsWithIgnoreCase(path, ext)) return true;
+    }
+    return false;
+}
+
 pub fn isImagePath(path: []const u8) bool {
-    return mimeForPath(path) != null;
+    return mimeForPath(path) != null or isUnsupportedImagePath(path);
+}
+
+pub const ImageKind = enum { png, jpeg, gif, webp, heic, unknown };
+
+/// Magic-byte sniff of an image container — the first 12 bytes identify every
+/// supported family. `.heic` covers the whole ISO-BMFF image family
+/// (`heic`/`heix`/`hevc`/…/`mif1`/`msf1` brands); none of them are attachable.
+pub fn sniffImageKind(bytes: []const u8) ImageKind {
+    if (std.mem.startsWith(u8, bytes, "\x89PNG\r\n\x1a\n")) return .png;
+    if (std.mem.startsWith(u8, bytes, "\xff\xd8\xff")) return .jpeg;
+    if (std.mem.startsWith(u8, bytes, "GIF87a") or std.mem.startsWith(u8, bytes, "GIF89a")) return .gif;
+    if (bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and
+        std.mem.eql(u8, bytes[8..12], "WEBP")) return .webp;
+    if (bytes.len >= 12 and std.mem.eql(u8, bytes[4..8], "ftyp")) {
+        const brands = [_][]const u8{ "heic", "heix", "hevc", "hevx", "heim", "heis", "hevm", "hevs", "mif1", "msf1" };
+        for (brands) |brand| {
+            if (std.mem.eql(u8, bytes[8..12], brand)) return .heic;
+        }
+    }
+    return .unknown;
+}
+
+fn kindMime(kind: ImageKind) ?[]const u8 {
+    return switch (kind) {
+        .png => "image/png",
+        .jpeg => "image/jpeg",
+        .gif => "image/gif",
+        .webp => "image/webp",
+        .heic, .unknown => null,
+    };
 }
 
 /// `prompt` followed by an embedded `<file>` block per text mention and an
 /// `<image>` marker per image mention. This is the text half of
 /// `buildUserMessage`: the outgoing message's first content block. Caller owns
 /// the result. When there are no mentions this is just a copy of `prompt`.
+///
+/// Image mentions are read and magic-byte-sniffed HERE so the marker carries
+/// the real outcome: sniff-confirmed images print `<image src="…" />`, and
+/// everything else (missing, oversized, corrupt, unsupported container)
+/// prints `<image src="…" error="…" />` — the model is never told an image
+/// exists without it actually being attached.
 pub fn buildAugmentedText(
     gpa: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
     prompt: []const u8,
 ) ![]u8 {
+    return assemble(gpa, io, cwd, prompt, null);
+}
+
+fn writeImageMarker(writer: *std.Io.Writer, path: []const u8, err_reason: ?[]const u8) !void {
+    try writer.print("\n\n<image src=\"", .{});
+    try skill_mod.writeXmlEscaped(writer, path);
+    if (err_reason) |reason| {
+        try writer.print("\" error=\"{s}\" />", .{reason});
+    } else {
+        try writer.print("\" />", .{});
+    }
+}
+
+/// Read + magic-byte-sniff one image mention and either attach it (when
+/// `blocks_out` is non-null) with the SNIFFED mime — extension mismatches log
+/// a warning; the sniff wins — or emit a visible `<image … error="…" />`
+/// marker. Never attaches silently-truncated bytes.
+fn attachOrMarkImage(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    path: []const u8,
+    blocks_out: ?*std.ArrayList(ai.ContentBlock),
+    writer: *std.Io.Writer,
+) !void {
+    const absolute = common.joinPath(gpa, cwd, path) catch {
+        try writeImageMarker(writer, path, "out of memory");
+        return;
+    };
+    defer gpa.free(absolute);
+
+    var file = std.Io.Dir.openFileAbsolute(io, absolute, .{}) catch |err| {
+        const reason = if (err == error.FileNotFound) "not found" else @errorName(err);
+        try writeImageMarker(writer, path, reason);
+        return;
+    };
+    defer file.close(io);
+
+    const stat = file.stat(io) catch |err| {
+        try writeImageMarker(writer, path, @errorName(err));
+        return;
+    };
+    const size: usize = @intCast(stat.size);
+    if (size > max_image_bytes) {
+        var reason_buf: [64]u8 = undefined;
+        const mb = size / (1024 * 1024) + @intFromBool(size % (1024 * 1024) != 0);
+        const reason = std.fmt.bufPrint(
+            &reason_buf,
+            "too large ({d} MB > {d} MB max)",
+            .{ mb, max_image_bytes / (1024 * 1024) },
+        ) catch "too large";
+        try writeImageMarker(writer, path, reason);
+        return;
+    }
+
+    const bytes = common.readFileBytes(gpa, io, absolute, max_image_bytes) catch |err| {
+        // A file grown past the cap between stat and read lands here.
+        try writeImageMarker(writer, path, if (err == error.StreamTooLong) "too large" else @errorName(err));
+        return;
+    };
+    defer gpa.free(bytes);
+
+    const kind = sniffImageKind(bytes);
+    switch (kind) {
+        .unknown => {
+            const reason: []const u8 = if (mimeForPath(path) != null)
+                // Attachable extension but no known image magic → corrupt or
+                // exotic encoding; either way the provider would reject it.
+                "unreadable or unsupported image format"
+            else
+                "unsupported format (convert to JPEG or PNG)";
+            try writeImageMarker(writer, path, reason);
+        },
+        .heic => try writeImageMarker(writer, path, "unsupported format (HEIC/HEIF; convert to JPEG or PNG)"),
+        .png, .jpeg, .gif, .webp => {
+            const sniffed = kindMime(kind).?;
+            if (mimeForPath(path)) |ext_mime| {
+                if (!std.mem.eql(u8, ext_mime, sniffed)) {
+                    log.warn("image {s}: extension says {s}, magic bytes say {s}; sending the sniffed format", .{ path, ext_mime, sniffed });
+                }
+            }
+            // Else: an unsupported extension (.bmp, …) holding an attachable
+            // payload — rescued by the sniff, nothing to report.
+            try writeImageMarker(writer, path, null);
+            if (blocks_out) |blocks| {
+                const encoded = try encodeBase64(gpa, bytes);
+                errdefer gpa.free(encoded);
+                const mime_owned = try gpa.dupe(u8, sniffed);
+                errdefer gpa.free(mime_owned);
+                try blocks.append(gpa, .{ .image = .{ .mime_type = mime_owned, .data_base64 = encoded } });
+            }
+        },
+    }
+}
+
+/// Single pass over the mentions: text mentions become `<file>` embeds,
+/// image mentions become markers + (when `blocks_out` is non-null) attached
+/// image blocks. Shared by both public entry points so the marker text and
+/// the attached blocks can never drift apart.
+fn assemble(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    prompt: []const u8,
+    blocks_out: ?*std.ArrayList(ai.ContentBlock),
+) ![]u8 {
     const mentions = try collectMentions(gpa, prompt);
     defer gpa.free(mentions);
-    if (mentions.len == 0) return gpa.dupe(u8, prompt);
 
-    var remaining: usize = turn_mention_aggregate_max_bytes;
-    var image_count: u32 = 0;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     try out.writer.writeAll(prompt);
+
+    var remaining: usize = turn_mention_aggregate_max_bytes;
+    var image_count: u32 = 0;
     for (mentions) |path| {
-        if (isImagePath(path)) {
-            image_count += 1;
-            if (image_count > max_images_per_message) {
-                try out.writer.print("\n\n<image src=\"{s}\" error=\"too many images\" />", .{path});
-            } else {
-                try out.writer.print("\n\n<image src=\"{s}\" />", .{path});
-            }
+        if (!isImagePath(path)) {
+            try appendFileTag(gpa, io, cwd, &out.writer, path, &remaining);
             continue;
         }
-        try appendFileTag(gpa, io, cwd, &out.writer, path, &remaining);
+        image_count += 1;
+        if (image_count > max_images_per_message) {
+            try writeImageMarker(&out.writer, path, "too many images");
+            continue;
+        }
+        try attachOrMarkImage(gpa, io, cwd, path, blocks_out, &out.writer);
     }
     return out.toOwnedSlice();
 }
 
 /// The content blocks for the outgoing user message: one text block (the
-/// augmented text above) followed by one image block per readable image
-/// mention. Caller owns the returned slice and every block in it.
+/// augmented text above) followed by one image block per sniff-confirmed
+/// image mention. Caller owns the returned slice and every block in it.
 pub fn buildUserMessage(
     gpa: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
     prompt: []const u8,
 ) ![]ai.ContentBlock {
-    const text = try buildAugmentedText(gpa, io, cwd, prompt);
-
     var blocks: std.ArrayList(ai.ContentBlock) = .empty;
     errdefer {
         for (blocks.items) |*block| block.deinit(gpa);
         blocks.deinit(gpa);
     }
+    const text = try assemble(gpa, io, cwd, prompt, &blocks);
     {
         errdefer gpa.free(text);
-        try blocks.append(gpa, .{ .text = .{ .text = text } });
-    }
-
-    const mentions = try collectMentions(gpa, prompt);
-    defer gpa.free(mentions);
-    var image_count: u32 = 0;
-    for (mentions) |path| {
-        const mime = mimeForPath(path) orelse continue;
-        image_count += 1;
-        if (image_count > max_images_per_message) continue;
-        const absolute = common.joinPath(gpa, cwd, path) catch continue;
-        defer gpa.free(absolute);
-        const bytes = common.readFileBytes(gpa, io, absolute, max_image_bytes) catch continue;
-        defer gpa.free(bytes);
-
-        const encoded = try encodeBase64(gpa, bytes);
-        errdefer gpa.free(encoded);
-        const mime_owned = try gpa.dupe(u8, mime);
-        errdefer gpa.free(mime_owned);
-        try blocks.append(gpa, .{ .image = .{ .mime_type = mime_owned, .data_base64 = encoded } });
+        try blocks.insert(gpa, 0, .{ .text = .{ .text = text } });
     }
     return blocks.toOwnedSlice(gpa);
 }
@@ -309,7 +453,31 @@ test "mimeForPath maps image extensions case-insensitively" {
     try std.testing.expectEqualStrings("image/png", mimeForPath("x.PNG").?);
     try std.testing.expectEqualStrings("image/jpeg", mimeForPath("a/b.jpeg").?);
     try std.testing.expectEqualStrings("image/jpeg", mimeForPath("a/b.jpg").?);
+    try std.testing.expectEqualStrings("image/gif", mimeForPath("x.GIF").?);
+    try std.testing.expectEqualStrings("image/webp", mimeForPath("x.webp").?);
+    // Known image containers zay never attaches are not wire mimes, but they
+    // must still route down the image path (error marker), never the
+    // binary-text-embed path.
+    try std.testing.expect(mimeForPath("IMG_0001.heic") == null);
+    try std.testing.expect(isImagePath("IMG_0001.HEIC"));
+    try std.testing.expect(isImagePath("shot.bmp"));
     try std.testing.expect(mimeForPath("a/b.zig") == null);
+    try std.testing.expect(!isImagePath("a/b.zig"));
+}
+
+test "sniffImageKind identifies attachable and rejected containers" {
+    try std.testing.expectEqual(ImageKind.png, sniffImageKind("\x89PNG\r\n\x1a\n" ++ "payload"));
+    try std.testing.expectEqual(ImageKind.jpeg, sniffImageKind("\xff\xd8\xff\xe0junk"));
+    try std.testing.expectEqual(ImageKind.gif, sniffImageKind("GIF89a" ++ "...."));
+    try std.testing.expectEqual(ImageKind.gif, sniffImageKind("GIF87a" ++ "...."));
+    try std.testing.expectEqual(ImageKind.webp, sniffImageKind("RIFF\x24\x00\x00\x00WEBPVP8 "));
+    try std.testing.expectEqual(ImageKind.heic, sniffImageKind("\x00\x00\x00\x18ftypheic\x00\x00\x00\x00"));
+    try std.testing.expectEqual(ImageKind.heic, sniffImageKind("\x00\x00\x00\x20ftypmif1\x00\x00\x00\x00"));
+    // Too-short / non-image bytes never sniff as a known format.
+    try std.testing.expectEqual(ImageKind.unknown, sniffImageKind(""));
+    try std.testing.expectEqual(ImageKind.unknown, sniffImageKind("RIFF"));
+    try std.testing.expectEqual(ImageKind.unknown, sniffImageKind("BM\x36\x00"));
+    try std.testing.expectEqual(ImageKind.unknown, sniffImageKind("plain text"));
 }
 
 fn writeTestFile(io: std.Io, rel_path: []const u8, data: []const u8) !void {
@@ -329,7 +497,9 @@ test "buildAugmentedText notes unreadable files and marks images" {
     const text = try buildAugmentedText(gpa, io, cwd, "look @nope-xyz.txt and @pic-xyz.png");
     defer gpa.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "<file src=\"nope-xyz.txt\" error=") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "<image src=\"pic-xyz.png\" />") != null);
+    // A missing image is a visible ERROR marker now, never a bare marker
+    // that claims an image was attached.
+    try std.testing.expect(std.mem.indexOf(u8, text, "<image src=\"pic-xyz.png\" error=\"not found\" />") != null);
 }
 
 test "buildUserMessage skips unreadable images" {
@@ -511,4 +681,145 @@ test "mentioned file content and path cannot break out of the file block" {
     // closing tag may appear.
     const content_breakout = std.mem.indexOf(u8, text, "before </file> after");
     try std.testing.expect(content_breakout == null);
+}
+
+test "misnamed image attaches with the sniffed mime, not the extension's" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const rel_dir = ".zig-cache/at-mention-sniff-test";
+    try std.Io.Dir.createDirPath(.cwd(), io, rel_dir);
+    // A JPEG wearing a .png name: the sniff must win over the extension.
+    try writeTestFile(io, rel_dir ++ "/actually-jpeg.png", "\xff\xd8\xff\xe0" ++ "\x00" ** 8);
+
+    const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
+    defer gpa.free(cwd);
+
+    const blocks = try buildUserMessage(gpa, io, cwd, "see @actually-jpeg.png");
+    defer {
+        for (blocks) |*block| block.deinit(gpa);
+        gpa.free(blocks);
+    }
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expect(blocks[1] == .image);
+    try std.testing.expectEqualStrings("image/jpeg", blocks[1].image.mime_type);
+    // The marker stays bare: the image WAS attached.
+    try std.testing.expect(std.mem.indexOf(u8, blocks[0].text.text, "<image src=\"actually-jpeg.png\" />") != null);
+}
+
+test "webp mention attaches as image/webp" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const rel_dir = ".zig-cache/at-mention-webp-test";
+    try std.Io.Dir.createDirPath(.cwd(), io, rel_dir);
+    try writeTestFile(io, rel_dir ++ "/pic.webp", "RIFF\x24\x00\x00\x00WEBPVP8 X");
+
+    const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
+    defer gpa.free(cwd);
+
+    const blocks = try buildUserMessage(gpa, io, cwd, "see @pic.webp");
+    defer {
+        for (blocks) |*block| block.deinit(gpa);
+        gpa.free(blocks);
+    }
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expect(blocks[1] == .image);
+    try std.testing.expectEqualStrings("image/webp", blocks[1].image.mime_type);
+}
+
+test "corrupt image mention gets a visible error marker and no image block" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const rel_dir = ".zig-cache/at-mention-corrupt-test";
+    try std.Io.Dir.createDirPath(.cwd(), io, rel_dir);
+    try writeTestFile(io, rel_dir ++ "/broken.png", "definitely not an image");
+
+    const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
+    defer gpa.free(cwd);
+
+    const blocks = try buildUserMessage(gpa, io, cwd, "see @broken.png");
+    defer {
+        for (blocks) |*block| block.deinit(gpa);
+        gpa.free(blocks);
+    }
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expect(std.mem.indexOf(u8, blocks[0].text.text, "error=\"unreadable or unsupported image format\"") != null);
+}
+
+test "heic mention gets an unsupported marker instead of a binary text embed" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const rel_dir = ".zig-cache/at-mention-heic-test";
+    try std.Io.Dir.createDirPath(.cwd(), io, rel_dir);
+    try writeTestFile(io, rel_dir ++ "/IMG_0001.heic", "\x00\x00\x00\x18ftypheic\x00\x00\x00\x00" ++ "\xff" ** 64);
+
+    const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
+    defer gpa.free(cwd);
+
+    const blocks = try buildUserMessage(gpa, io, cwd, "look at @IMG_0001.heic");
+    defer {
+        for (blocks) |*block| block.deinit(gpa);
+        gpa.free(blocks);
+    }
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    const text = blocks[0].text.text;
+    try std.testing.expect(std.mem.indexOf(u8, text, "error=\"unsupported format (HEIC/HEIF; convert to JPEG or PNG)\"") != null);
+    // The binary payload must NOT be embedded as a <file> text block.
+    try std.testing.expect(std.mem.indexOf(u8, text, "<file src=\"IMG_0001.heic\">") == null);
+}
+
+test "oversized image mention gets a too-large marker and no image block" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const rel_dir = ".zig-cache/at-mention-oversize-test";
+    try std.Io.Dir.createDirPath(.cwd(), io, rel_dir);
+    var file = try std.Io.Dir.createFile(.cwd(), io, rel_dir ++ "/huge.png", .{ .truncate = true });
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    // Sniffable 1 KB chunks pushed past the 5 MB attach cap.
+    const filler = "\x89PNG\r\n\x1a\n" ++ "y" ** 1017;
+    var written: usize = 0;
+    while (written <= max_image_bytes) : (written += filler.len) {
+        try writer.interface.writeAll(filler);
+    }
+    try writer.interface.flush();
+
+    const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
+    defer gpa.free(cwd);
+
+    const blocks = try buildUserMessage(gpa, io, cwd, "see @huge.png");
+    defer {
+        for (blocks) |*block| block.deinit(gpa);
+        gpa.free(blocks);
+    }
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expect(std.mem.indexOf(u8, blocks[0].text.text, "error=\"too large (6 MB > 5 MB max)\"") != null);
+}
+
+test "image marker escapes XML-special characters in the path" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    // Whitespace is the only mention boundary, so a quote survives inside
+    // the token; the marker must escape it like <file> tags do.
+    const text = try buildAugmentedText(gpa, io, cwd, "see @we\"ird.png");
+    defer gpa.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "src=\"we&quot;ird.png\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "<image src=\"we\"ird.png\"") == null);
 }
