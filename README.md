@@ -25,7 +25,7 @@
   <sub>⚡ <em>Preview snippet. <a href="assets/demo.gif">Click to watch the full demo (18 MB)</a></em></sub>
 </p>
 
-Zay is a **terminal-native coding agent** designed for speed, focus, and low latency. No Electron, no browser tabs, no Node runtime. Just a single, compiled Zig binary that connects to OpenAI Codex (via ChatGPT OAuth) or any OpenAI-compatible provider, orchestrates parallel work across isolated git worktree lanes, and logs every turn to local SQLite.
+Zay is a **terminal-native coding agent** designed for speed, focus, and low latency. A single, compiled Zig binary that connects to OpenAI Codex (via ChatGPT OAuth) or any OpenAI-compatible provider, orchestrates parallel work across isolated git worktree lanes, logs every turn to local SQLite — and is extensible with sandboxed Lua plugins.
 
 ---
 
