@@ -528,6 +528,13 @@ test "frontmatter ignores indented nested keys" {
     try std.testing.expectEqualStrings("real description", frontmatterValue(frontmatter, "description").?);
 }
 
+/// Fixture dirs live under .zig-cache and survive across runs; a repo-dir
+/// rename leaves absolute-path symlinks dangling while the tests silently
+/// reuse the stale state. deleteTree is a no-op when the path is absent.
+fn resetTestFixture(io: std.Io, full_dir: []const u8) !void {
+    try std.Io.Dir.deleteTree(.cwd(), io, full_dir);
+}
+
 test "loose root skill falls back to its file stem name" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -536,6 +543,7 @@ test "loose root skill falls back to its file stem name" {
     const rel_dir = ".zig-cache/skill-stem-test";
     const full_dir = try std.fs.path.join(gpa, &.{ root, rel_dir });
     defer gpa.free(full_dir);
+    try resetTestFixture(io, full_dir);
     const agents_dir = try std.fs.path.join(gpa, &.{ full_dir, ".agents", "skills" });
     defer gpa.free(agents_dir);
     try std.Io.Dir.createDirPath(.cwd(), io, agents_dir);
@@ -560,6 +568,7 @@ test "block scalar description skips the skill" {
     const rel_dir = ".zig-cache/skill-block-scalar-test";
     const full_dir = try std.fs.path.join(gpa, &.{ root, rel_dir });
     defer gpa.free(full_dir);
+    try resetTestFixture(io, full_dir);
     const agents_dir = try std.fs.path.join(gpa, &.{ full_dir, ".agents", "skills" });
     defer gpa.free(agents_dir);
     try std.Io.Dir.createDirPath(.cwd(), io, agents_dir);
@@ -598,6 +607,7 @@ test "loadProject skips skills with invalid names" {
     const rel_dir = ".zig-cache/skill-invalid-name-test";
     const full_dir = try std.fs.path.join(gpa, &.{ root, rel_dir });
     defer gpa.free(full_dir);
+    try resetTestFixture(io, full_dir);
     const agents_dir = try std.fs.path.join(gpa, &.{ full_dir, ".agents", "skills" });
     defer gpa.free(agents_dir);
     try std.Io.Dir.createDirPath(.cwd(), io, agents_dir);
@@ -656,6 +666,7 @@ test "duplicate skill names keep the first occurrence" {
     const rel_dir = ".zig-cache/skill-dupe-test";
     const full_dir = try std.fs.path.join(gpa, &.{ root, rel_dir });
     defer gpa.free(full_dir);
+    try resetTestFixture(io, full_dir);
     const agents_dir = try std.fs.path.join(gpa, &.{ full_dir, ".agents", "skills" });
     defer gpa.free(agents_dir);
     try std.Io.Dir.createDirPath(.cwd(), io, agents_dir);
@@ -693,6 +704,7 @@ test "loadProject follows symlinked skill directories" {
     const rel_dir = ".zig-cache/skill-symlink-test";
     const full_dir = try std.fs.path.join(gpa, &.{ root, rel_dir });
     defer gpa.free(full_dir);
+    try resetTestFixture(io, full_dir);
     const agents_dir = try std.fs.path.join(gpa, &.{ full_dir, ".agents", "skills" });
     defer gpa.free(agents_dir);
     try std.Io.Dir.createDirPath(.cwd(), io, agents_dir);
@@ -727,6 +739,7 @@ test "project skill shadows same-name global skill" {
     const rel_dir = ".zig-cache/skill-shadow-test";
     const full_dir = try std.fs.path.join(gpa, &.{ root, rel_dir });
     defer gpa.free(full_dir);
+    try resetTestFixture(io, full_dir);
 
     const home_dir = try std.fs.path.join(gpa, &.{ full_dir, "home" });
     defer gpa.free(home_dir);
@@ -770,6 +783,7 @@ test "global-only skills load" {
     const rel_dir = ".zig-cache/skill-global-only-test";
     const full_dir = try std.fs.path.join(gpa, &.{ root, rel_dir });
     defer gpa.free(full_dir);
+    try resetTestFixture(io, full_dir);
 
     const home_dir = try std.fs.path.join(gpa, &.{ full_dir, "home" });
     defer gpa.free(home_dir);
@@ -815,6 +829,7 @@ test "appendSkillBlock refuses to exceed the remaining budget" {
     const rel_dir = ".zig-cache/skill-budget-test";
     const full_dir = try std.fs.path.join(gpa, &.{ root, rel_dir });
     defer gpa.free(full_dir);
+    try resetTestFixture(io, full_dir);
     const agents_dir = try std.fs.path.join(gpa, &.{ full_dir, ".agents", "skills" });
     defer gpa.free(agents_dir);
     try std.Io.Dir.createDirPath(.cwd(), io, agents_dir);
@@ -984,6 +999,7 @@ test "appendSkillBlock escapes XML special characters in attributes" {
     const rel_dir = ".zig-cache/skill-escape-test";
     const full_dir = try std.fs.path.join(gpa, &.{ root, rel_dir });
     defer gpa.free(full_dir);
+    try resetTestFixture(io, full_dir);
     try std.Io.Dir.createDirPath(.cwd(), io, full_dir);
 
     const md_path = try std.fs.path.join(gpa, &.{ full_dir, "SKILL.md" });
