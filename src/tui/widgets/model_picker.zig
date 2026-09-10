@@ -90,7 +90,7 @@ pub const Content = struct {
         if (self.error_message) |msg| return self.drawStatus(ctx, msg, p.tool_failed);
         if (self.models.len == 0) return self.drawEmpty(ctx);
         const built = try self.modelWidgets(ctx);
-        if (built.widgets.len <= 1) return self.drawStatus(ctx, "No matching models", p.thinking_body);
+        if (built.widgets.len <= 1) return self.drawStatus(ctx, "No matching models", p.notice);
         self.list.children = .{ .slice = built.widgets };
         self.list.item_count = @intCast(built.widgets.len);
         self.list.cursor = built.cursor;
