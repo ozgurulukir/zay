@@ -45,7 +45,7 @@ Zay operates without granular per-action permission prompts (YOLO mode), relying
 
 ## ✨ Key Highlights
 
-- **Native TUI with VXFW:** Instant startup, fluid scrolling, custom color themes, and zero web stack overhead.
+- **Native TUI with VXFW:** Instant startup, fluid scrolling, and custom color themes.
 - **Any LLM Provider:** Native ChatGPT & Codex OAuth (login without API keys), plus OpenRouter, Ollama, DeepSeek, Gemini, Mistral, Cerebras, and custom OpenAI-compatible endpoints.
 - **Parallel Git Lanes:** Run multiple agent threads concurrently in isolated git worktrees; inspect progress and merge back cleanly.
 - **Background Jobs:** Asynchronous test runs, builds, or dev servers with real-time log tailing (`Ctrl+O`).
