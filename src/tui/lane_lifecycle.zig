@@ -1544,6 +1544,7 @@ fn wakeIdleLane(app: *App, lane: *Thread, repo: []const u8, context: [][]u8) !vo
 fn startTurnForLane(app: *App, lane: *Thread, prompt: []const u8, title_source: []const u8) !void {
     const owned = try lane.worker_context.?.gpa.dupe(u8, prompt);
     errdefer lane.worker_context.?.gpa.free(owned);
+    lane.transcript.dropIntroLogo(app.gpa);
     _ = try lane.transcript.append(app.gpa, .user, "you", prompt);
     // Title + naming helpers read `app.thread`; scope-swap for the call.
     const prev = app.thread;

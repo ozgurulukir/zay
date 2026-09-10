@@ -96,6 +96,7 @@ pub fn flushQueuedUserMessagesToTranscript(app: *App, count: u32) !void {
             app.gpa.free(message.text);
             continue;
         }
+        app.thread.transcript.dropIntroLogo(app.gpa);
         _ = try app.thread.transcript.append(app.gpa, .user, "you", message.text);
         try appendSkillInvocationsToTranscript(app, message.text);
         app.gpa.free(message.text);

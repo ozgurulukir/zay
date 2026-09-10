@@ -77,6 +77,7 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         .loading_frame = app.metrics.loading_frame,
         .blackhole_frame = app.metrics.blackhole_frame,
         .blackhole_visible = &app.metrics.blackhole_visible,
+        .splash_suppressed = app.inputs.input.buf.realLength() > 0,
     };
     var loading_view: loading.LoadingWidget = .{
         .awaiting_output = app.thread.turn_view.awaitingOutput(),

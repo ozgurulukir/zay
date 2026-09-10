@@ -413,6 +413,16 @@ pub const Transcript = struct {
         self.selected = null;
     }
 
+    /// Drop the startup intro logo (ephemeral UI state, never persisted) once
+    /// a real message is about to land. If it stayed, the ListView's upward
+    /// back-fill would keep re-showing it — a blank card after suppression —
+    /// above the tail until streaming content pushed it off the top.
+    pub fn dropIntroLogo(self: *Transcript, gpa: std.mem.Allocator) void {
+        if (self.messages.items.len > 0 and self.messages.items[0] == .logo) {
+            self.remove(gpa, 0);
+        }
+    }
+
     pub fn remove(self: *Transcript, gpa: std.mem.Allocator, index: u32) void {
         assert(index < self.messages.items.len);
         self.messages.items[index].deinit(gpa);
@@ -802,6 +812,27 @@ test "updateToolExpanded formats JSON args into expanded_title_formatted" {
     try std.testing.expect(std.mem.indexOf(u8, t.expanded_title_formatted.?, "\n") != null);
     // The raw expanded_title is deliberately untouched (toolDisplayMatches reads it).
     try std.testing.expectEqualStrings("🛠  greet {\"name\":\"x\"}", t.expanded_title.?);
+}
+
+test "dropIntroLogo removes only a leading logo and keeps later messages stable" {
+    const gpa = std.testing.allocator;
+    var transcript: Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    _ = try transcript.append(gpa, .logo, "logo", "");
+    _ = try transcript.append(gpa, .user, "you", "hello");
+    _ = try transcript.append(gpa, .agent, "agent", "hi");
+
+    transcript.dropIntroLogo(gpa);
+    try std.testing.expectEqual(@as(usize, 2), transcript.messages.items.len);
+    try std.testing.expect(transcript.messages.items[0] == .user);
+    try std.testing.expectEqualStrings("hello", transcript.messages.items[0].user.body);
+    try std.testing.expect(transcript.messages.items[1] == .agent);
+
+    // A transcript without a leading logo is a no-op, however many times called.
+    transcript.dropIntroLogo(gpa);
+    transcript.dropIntroLogo(gpa);
+    try std.testing.expectEqual(@as(usize, 2), transcript.messages.items.len);
 }
 
 test "appendTool builds a json part from a JSON resume body" {

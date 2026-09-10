@@ -10,9 +10,6 @@ const tui_style = @import("../style.zig");
 const blackhole = @import("../blackhole.zig");
 
 const logo_connect_text = "/connect to begin building";
-const intro_x_padding: u16 = 7;
-const logo_gap: u16 = 8;
-const logo_row_offset: u16 = 7;
 
 const mergedSelectedStyle = tui_style.mergedSelectedStyle;
 const messageRowsCached = tui_metrics.messageRowsCached;
@@ -56,6 +53,16 @@ pub const MessageWidget = struct {
     /// survive between frames is allocated from here instead.
     gpa: std.mem.Allocator,
     has_model_configured: bool = false,
+    /// Splash-only state (the logo is the sole transcript message): the intro
+    /// block centers vertically in the viewport instead of hugging the top.
+    splash_fills_viewport: bool = false,
+    /// Viewport height for the fills mode. vxfw's ListView draws children with
+    /// `max.height = null`, so the real viewport height must be passed in
+    /// (TranscriptWidget.syncViewport already stores it on the Thread).
+    splash_viewport_height: u16 = 0,
+    /// The user started typing — the splash yields its rows as a blank card.
+    /// Same height, so ListView scroll math never shifts mid-typing.
+    splash_suppressed: bool = false,
 
     pub fn widget(self: *MessageWidget) vxfw.Widget {
         return .{
@@ -68,7 +75,12 @@ pub const MessageWidget = struct {
         const self: *MessageWidget = @ptrCast(@alignCast(ptr));
         const width = ctx.max.width orelse ctx.min.width;
         const requested_height = messageRowsCached(self.message, ConversationLayout.contentWidth(width));
-        const height = clippedSurfaceHeight(width, requested_height);
+        var height = clippedSurfaceHeight(width, requested_height);
+        if (self.message.* == .logo and self.splash_fills_viewport and self.splash_viewport_height > 0) {
+            // Splash-only state: fill the viewport so the intro block can
+            // center vertically (see drawIntro).
+            height = @max(height, self.splash_viewport_height);
+        }
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{
             .width = width,
             .height = height,
@@ -284,9 +296,24 @@ pub const MessageWidget = struct {
 
     fn drawIntro(self: *MessageWidget, surface: *vxfw.Surface, frame_index: u16, row: *u16, ctx: vxfw.DrawContext) void {
         const row_start = row.*;
-        drawBlackhole(surface, frame_index, row_start);
-        self.drawConnectHint(surface, row_start + logo_row_offset, ctx);
-        row.* = row_start + blackhole.rows;
+        if (self.splash_suppressed) {
+            // Typing yields the splash: same row budget, blank card.
+            row.* = row_start + introBlockRows();
+            return;
+        }
+        // Splash-only state centers the block in the viewport; otherwise it
+        // hugs the top like every other message.
+        const block_row = if (self.splash_fills_viewport)
+            (surface.size.height -| introBlockRows()) / 2
+        else
+            row_start;
+        drawBlackhole(surface, frame_index, block_row);
+        self.drawConnectHint(surface, block_row + blackhole.rows, ctx);
+        row.* = row_start + introBlockRows();
+    }
+
+    fn introBlockRows() u16 {
+        return blackhole.rows + 1; // art + the connect-hint row below it
     }
 
     fn drawBlackhole(surface: *vxfw.Surface, frame_index: u16, row_start: u16) void {
@@ -302,14 +329,13 @@ pub const MessageWidget = struct {
         }
     }
 
-    fn drawConnectHint(self: *MessageWidget, surface: *vxfw.Surface, row_start: u16, ctx: vxfw.DrawContext) void {
-        const col_start = ConversationLayout.left + intro_x_padding + blackhole.cols + logo_gap;
-        if (col_start >= surface.size.width -| ConversationLayout.right) return;
-
+    fn drawConnectHint(self: *MessageWidget, surface: *vxfw.Surface, row: u16, ctx: vxfw.DrawContext) void {
         if (self.has_model_configured) return;
-        // Two rows down keeps the hint where it sat while the logo text
-        // (dropped in the rebrand) occupied the row above it.
-        writeLogoLine(surface, logo_connect_text, row_start + 2, col_start, ctx);
+        const hint_width: u16 = @intCast(ctx.stringWidth(logo_connect_text));
+        const content_width = ConversationLayout.contentWidth(surface.size.width);
+        const col_start = ConversationLayout.left + (content_width -| hint_width) / 2;
+        if (col_start >= surface.size.width -| ConversationLayout.right) return;
+        writeLogoLine(surface, logo_connect_text, row, col_start, ctx);
     }
 
     // Frames are single-width ASCII, so we walk bytes directly (no grapheme
@@ -319,7 +345,7 @@ pub const MessageWidget = struct {
     fn writeBlackholeLine(surface: *vxfw.Surface, line: []const u8, row: u16) void {
         if (row >= surface.size.height) return;
         const p = tui_style.activePalette();
-        var col = ConversationLayout.left + intro_x_padding;
+        var col = ConversationLayout.left + (ConversationLayout.contentWidth(surface.size.width) -| blackhole.cols) / 2;
         const col_limit = surface.size.width -| ConversationLayout.right;
         for (line, 0..) |byte, i| {
             if (col >= col_limit) return;
@@ -1151,12 +1177,6 @@ test "intro * accent uses intro_accent" {
         }
     }
     try std.testing.expect(found_star);
-
-    // The old N.O.V.A logo cell is blank after the rebrand; the intro text
-    // column now carries only the connect hint.
-    const logo_col = ConversationLayout.left + intro_x_padding + blackhole.cols + logo_gap;
-    const logo_cell = surface.readCell(logo_col, ConversationLayout.top + logo_row_offset);
-    try std.testing.expectEqualStrings(" ", logo_cell.char.grapheme);
 }
 
 // Helpers so the render asserts don't reach into the active palette order.
@@ -1191,8 +1211,11 @@ test "drawConnectHint renders connect hint when has_model_configured is false" {
     };
     const surface = try message_widget.widget().draw(ctx);
 
-    const logo_col = ConversationLayout.left + intro_x_padding + blackhole.cols + logo_gap;
-    const connect_cell = surface.readCell(logo_col, ConversationLayout.top + logo_row_offset + 2);
+    // Centered under the art: col = left + (content - hint_w)/2, row =
+    // art_top + blackhole.rows (the block hugs the top when the splash
+    // shares the transcript with other messages).
+    const hint_col = hintCol(120);
+    const connect_cell = surface.readCell(hint_col, ConversationLayout.top + blackhole.rows);
     try std.testing.expectEqualStrings("/", connect_cell.char.grapheme);
 }
 
@@ -1220,7 +1243,92 @@ test "drawConnectHint omits connect hint when has_model_configured is true" {
     };
     const surface = try message_widget.widget().draw(ctx);
 
-    const logo_col = ConversationLayout.left + intro_x_padding + blackhole.cols + logo_gap;
-    const connect_cell = surface.readCell(logo_col, ConversationLayout.top + logo_row_offset + 2);
+    const hint_col = hintCol(120);
+    const connect_cell = surface.readCell(hint_col, ConversationLayout.top + blackhole.rows);
     try std.testing.expectEqualStrings(" ", connect_cell.char.grapheme);
+}
+
+/// Hint column for a 120-col draw: centered in the content area. Mirrors
+/// `drawConnectHint`'s math so the assert stays readable.
+fn hintCol(width: u16) u16 {
+    const hint_w: u16 = @intCast(logo_connect_text.len);
+    return ConversationLayout.left + (ConversationLayout.contentWidth(width) -| hint_w) / 2;
+}
+
+test "splash fills and centers in the viewport when it is the sole message" {
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.append(gpa, .logo, "logo", "");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var message_widget: MessageWidget = .{
+        .message = &transcript.messages.items[index],
+        .selected = false,
+        .loading_frame = 0,
+        .blackhole_frame = 0,
+        .gpa = gpa,
+        .has_model_configured = false,
+        .splash_fills_viewport = true,
+        .splash_viewport_height = 40,
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 120, .height = 40 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try message_widget.widget().draw(ctx);
+
+    // The 25-row intro block centers vertically in the 40-row viewport.
+    try std.testing.expectEqual(@as(u16, 40), surface.size.height);
+    const block_row = (surface.size.height - MessageWidget.introBlockRows()) / 2;
+    const connect_cell = surface.readCell(hintCol(120), block_row + blackhole.rows);
+    try std.testing.expectEqualStrings("/", connect_cell.char.grapheme);
+    // The row above the block is card-blank: centered, not top-hugging.
+    const above = surface.readCell(hintCol(120), block_row - 1);
+    try std.testing.expectEqualStrings(" ", above.char.grapheme);
+}
+
+test "splash suppression yields a blank card while typing" {
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.append(gpa, .logo, "logo", "");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var message_widget: MessageWidget = .{
+        .message = &transcript.messages.items[index],
+        .selected = false,
+        .loading_frame = 0,
+        .blackhole_frame = 0,
+        .gpa = gpa,
+        .has_model_configured = false,
+        .splash_suppressed = true,
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 120, .height = 40 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try message_widget.widget().draw(ctx);
+
+    // No art, no hint — but the row budget is untouched so ListView scroll
+    // math never shifts mid-typing.
+    try std.testing.expectEqual(@as(u16, 26), surface.size.height);
+    var found_star = false;
+    var r: u16 = 0;
+    while (r < surface.size.height) : (r += 1) {
+        var c: u16 = 0;
+        while (c < surface.size.width) : (c += 1) {
+            const cell = surface.readCell(c, r);
+            if (cell.style.fg == .rgb and std.mem.eql(u8, cell.char.grapheme, "*")) found_star = true;
+        }
+    }
+    try std.testing.expect(!found_star);
+    const hint_cell = surface.readCell(hintCol(120), ConversationLayout.top + blackhole.rows);
+    try std.testing.expectEqualStrings(" ", hint_cell.char.grapheme);
 }

@@ -107,6 +107,7 @@ pub fn beginSubmit(app: *App) !bool {
     if (app.liveRuntime()) |rt| rt.session_writer.savePromptHistory(prompt) catch {};
 
     if (app.liveRuntime() != null and app.liveRuntime().?.client == .none) {
+        app.thread.transcript.dropIntroLogo(app.gpa);
         _ = try app.thread.transcript.append(app.gpa, .user, "you", prompt);
         const message = try formatNoProviderMessage(app);
         defer app.gpa.free(message);
@@ -116,6 +117,7 @@ pub fn beginSubmit(app: *App) !bool {
 
     resetTurnState(app);
     app.thread.worker_context.?.resetCancel();
+    app.thread.transcript.dropIntroLogo(app.gpa);
     _ = try app.thread.transcript.append(app.gpa, .user, "you", prompt);
     // A worktree lane's first prompt also names its branch: ask the model
     // in parallel, and rename the hex branch when the answer lands.

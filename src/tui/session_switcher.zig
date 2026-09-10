@@ -381,6 +381,8 @@ pub fn switchToNewSession(app: *App) !void {
         app.gpa.destroy(runtime);
     }
     try app.installRuntime(runtime);
+    // Bare transcript by design: the intro splash is startup-only
+    // (appendStartupIntroLogo) and must not return on /new.
     try app.clearConversation();
 }
 
@@ -392,6 +394,8 @@ pub fn switchToSession(app: *App, session_id: []const u8, cwd: []const u8) !void
         app.gpa.destroy(runtime);
     }
     try app.installRuntime(runtime);
+    // Rebuilds from persisted agent messages, which never include the intro
+    // logo — a resumed session starts bare, like /new.
     try app.rebuildTranscriptFromAgent();
 }
 

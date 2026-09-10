@@ -34,7 +34,8 @@ pub fn messageContentRows(message: *transcript_mod.Message, width: u16) u16 {
         .user, .notice, .success, .info => |m| textRows(m.body, width -| 2),
         .agent => |m| agentContentRows(message, m, width),
         .skill => |m| textRows(m.title, width -| 2) + if (m.expanded and m.body.len > 0) textRows(m.body, width) else 0,
-        .logo => blackhole.rows,
+        // Art (24 rows) + the connect-hint row the intro block draws below it.
+        .logo => blackhole.rows + 1,
         .thinking => |m| if (m.expanded)
             1 + textRows(m.body, width -| 2)
         else
