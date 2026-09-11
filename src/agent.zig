@@ -183,6 +183,9 @@ pub const Agent = struct {
     message_queue: MessageQueue = .{},
     message_queue_storage: [agent_queue.capacity]QueuedUserMessage = undefined,
     message_queue_mutex: std.Io.Mutex = .init,
+    /// Cache of pruned historical tool messages across run-loop iterations (TD-13).
+    /// Prevents repeated allocations and string truncation during multi-step turns.
+    tool_view_cache: context_assembly.PrunedToolCache = .{},
     /// git-shadow snapshot state (see `snapshotAfterBatch`). The dedicated index
     /// path is resolved once and cached; `last_snapshot_tree` dedups unchanged
     /// batches; `snapshots_disabled` latches off when git/the repo is absent.
@@ -248,6 +251,7 @@ pub const Agent = struct {
     }
 
     pub fn deinit(self: *Agent) void {
+        self.tool_view_cache.deinit(self.gpa);
         // Wait for any background summarizer before tearing down the state it
         // reads (the client), then release its result.
         self.drainBackgroundCompaction();
@@ -412,6 +416,7 @@ pub const Agent = struct {
     /// `AgentRuntime.reloadMessages`). Only safe at a turn boundary, never while
     /// a response is streaming.
     pub fn clearNonSystemMessages(self: *Agent) void {
+        self.tool_view_cache.clear(self.gpa);
         self.context_manager.clearNonSystem();
     }
 
@@ -557,8 +562,9 @@ pub const Agent = struct {
                 .listener = l,
             };
             defer stream_context.deinit();
-            const prompt_messages = try context_assembly.pruneHistoricalToolResultsViews(
+            const prompt_messages = try context_assembly.pruneHistoricalToolResultsViewsCached(
                 self.gpa,
+                &self.tool_view_cache,
                 self.messages(),
                 self.compaction_settings.keep_recent_tool_turns,
                 self.compaction_settings.historical_tool_cap_bytes,
@@ -1562,7 +1568,7 @@ pub const Agent = struct {
         // cache intact instead of stranded with only the system prompt (TD-5).
         const projected = try session_writer.messages(self.gpa);
         errdefer self.gpa.free(projected);
-        self.context_manager.clearNonSystem();
+        self.clearNonSystemMessages();
         for (projected) |message| try self.context_manager.appendUnpersisted(message);
         self.gpa.free(projected);
     }

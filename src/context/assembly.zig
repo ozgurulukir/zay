@@ -165,10 +165,40 @@ fn computeCutoff(messages: []const ai.ChatMessage, keep_recent_tool_turns: u32) 
     return cutoff_index;
 }
 
+/// Cache of pruned historical tool messages across run-loop iterations (TD-13).
+///
+/// Keys are message indices in ContextManager. Stored values are heap-allocated
+/// `*ai.ChatMessage` pointers, guaranteeing pointer stability even when the
+/// hash map resizes. Unchanged historical tool results are served directly from
+/// this cache without re-running `pruneSingleToolMessage` or re-allocating
+/// strings.
+///
+/// Invalidated on `clearNonSystemMessages` (compaction swap, branch switch,
+/// session reload) or when `historical_tool_cap_bytes` changes.
+pub const PrunedToolCache = struct {
+    entries: std.AutoHashMapUnmanaged(usize, *ai.ChatMessage) = .empty,
+    cached_cap_bytes: u32 = 0,
+
+    pub fn deinit(self: *PrunedToolCache, gpa: std.mem.Allocator) void {
+        self.clear(gpa);
+        self.entries.deinit(gpa);
+    }
+
+    pub fn clear(self: *PrunedToolCache, gpa: std.mem.Allocator) void {
+        var it = self.entries.valueIterator();
+        while (it.next()) |ptr| {
+            ptr.*.deinit(gpa);
+            gpa.destroy(ptr.*);
+        }
+        self.entries.clearRetainingCapacity();
+    }
+};
+
 /// Borrow-based view of the pruned history. Unchanged messages BORROW from
 /// `messages` — no byte copy, so base64 images are never duplicated per turn —
 /// and only historical tool messages older than the cutoff become owned pruned
-/// copies. Caller owns the returned slice and must free with `freePrunedViews`.
+/// copies (or borrowed from `cache` if provided). Caller owns the returned slice
+/// and must free with `freePrunedViews`.
 ///
 /// Safe while `messages` is stable: the caller (`Agent.run`) holds the
 /// ContextManager list and does not append between building the views and the
@@ -179,8 +209,34 @@ pub fn pruneHistoricalToolResultsViews(
     keep_recent_tool_turns: u32,
     historical_tool_cap_bytes: u32,
 ) ![]ai.MessageView {
+    return pruneHistoricalToolResultsViewsCached(
+        gpa,
+        null,
+        messages,
+        keep_recent_tool_turns,
+        historical_tool_cap_bytes,
+    );
+}
+
+/// Cached variant of `pruneHistoricalToolResultsViews` (TD-13). When `cache` is
+/// non-null, owned pruned copies are stored in the cache and returned as
+/// `.borrowed = ptr`, eliminating repetitive pruning allocations across run-loop
+/// iterations. When `cache` is null, operates identically to the uncached path.
+pub fn pruneHistoricalToolResultsViewsCached(
+    gpa: std.mem.Allocator,
+    cache: ?*PrunedToolCache,
+    messages: []const ai.ChatMessage,
+    keep_recent_tool_turns: u32,
+    historical_tool_cap_bytes: u32,
+) ![]ai.MessageView {
+    if (cache) |c| {
+        if (c.cached_cap_bytes != historical_tool_cap_bytes) {
+            c.clear(gpa);
+            c.cached_cap_bytes = historical_tool_cap_bytes;
+        }
+    }
+
     const views = try gpa.alloc(ai.MessageView, messages.len);
-    const maybe_cutoff = computeCutoff(messages, keep_recent_tool_turns);
     var built: usize = 0;
     errdefer {
         for (views[0..built]) |*view| switch (view.*) {
@@ -189,13 +245,35 @@ pub fn pruneHistoricalToolResultsViews(
         };
         gpa.free(views);
     }
-    // When `maybe_cutoff == null` no tool turn is historical, so every
-    // message is borrowed in full — pruning only applies below a real cutoff.
+
+    const maybe_cutoff = computeCutoff(messages, keep_recent_tool_turns);
     const pruning_active = maybe_cutoff != null;
     const cutoff_index = maybe_cutoff orelse 0;
+
     for (messages, 0..) |*msg, idx| {
         if (pruning_active and idx < cutoff_index and msg.* == .tool) {
-            views[idx] = .{ .owned = try pruneSingleToolMessage(gpa, msg.*, historical_tool_cap_bytes) };
+            if (cache) |c| {
+                if (c.entries.get(idx)) |cached_ptr| {
+                    views[idx] = .{ .borrowed = cached_ptr };
+                } else {
+                    const pruned = try pruneSingleToolMessage(gpa, msg.*, historical_tool_cap_bytes);
+                    var pruned_owned = pruned;
+                    errdefer pruned_owned.deinit(gpa);
+
+                    const msg_ptr = try gpa.create(ai.ChatMessage);
+                    errdefer gpa.destroy(msg_ptr);
+                    msg_ptr.* = pruned_owned;
+
+                    c.entries.put(gpa, idx, msg_ptr) catch |err| {
+                        msg_ptr.deinit(gpa);
+                        gpa.destroy(msg_ptr);
+                        return err;
+                    };
+                    views[idx] = .{ .borrowed = msg_ptr };
+                }
+            } else {
+                views[idx] = .{ .owned = try pruneSingleToolMessage(gpa, msg.*, historical_tool_cap_bytes) };
+            }
         } else {
             views[idx] = .{ .borrowed = msg };
         }
@@ -839,6 +917,48 @@ test "pruneHistoricalToolResultsViews borrows unchanged messages without copying
     // Recent tool message → borrowed, kept in full.
     try std.testing.expect(views[2] == .borrowed);
     try std.testing.expectEqual(@as(usize, 2000), views[2].borrowed.tool.content[0].text.text.len);
+}
+
+test "PrunedToolCache caches owned messages across iterations with pointer stability" {
+    const gpa = std.testing.allocator;
+
+    var messages: [4]ai.ChatMessage = undefined;
+    messages[0] = try makeTextMessage(gpa, .user, "hello");
+    messages[1] = try makeToolMessage(gpa, "c1", "a" ** 2000); // historical
+    messages[2] = try makeTextMessage(gpa, .assistant, "step 1");
+    messages[3] = try makeToolMessage(gpa, "c2", "b" ** 2000); // recent
+    defer for (&messages) |*m| m.deinit(gpa);
+
+    var cache: PrunedToolCache = .{};
+    defer cache.deinit(gpa);
+
+    // Iteration 1: keep=1 keeps c2 in full, prunes c1.
+    const views1 = try pruneHistoricalToolResultsViewsCached(gpa, &cache, &messages, 1, 100);
+    defer freePrunedViews(gpa, views1);
+
+    try std.testing.expect(views1[1] == .borrowed);
+    const ptr1 = views1[1].borrowed;
+    const pruned_text1 = ptr1.tool.content[0].text.text;
+    try std.testing.expect(std.mem.indexOf(u8, pruned_text1, "elided to save context") != null);
+    try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
+
+    // Iteration 2: same messages, same cache -> must return the EXACT same pointer (0 new message allocations)
+    const views2 = try pruneHistoricalToolResultsViewsCached(gpa, &cache, &messages, 1, 100);
+    defer freePrunedViews(gpa, views2);
+
+    try std.testing.expect(views2[1] == .borrowed);
+    const ptr2 = views2[1].borrowed;
+    try std.testing.expectEqual(ptr1, ptr2);
+    try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
+
+    // Cap change auto-clears and re-prunes
+    const views3 = try pruneHistoricalToolResultsViewsCached(gpa, &cache, &messages, 1, 150);
+    defer freePrunedViews(gpa, views3);
+
+    try std.testing.expect(views3[1] == .borrowed);
+    const ptr3 = views3[1].borrowed;
+    try std.testing.expect(ptr1 != ptr3); // new pruned copy at new cap
+    try std.testing.expectEqual(@as(u32, 150), cache.cached_cap_bytes);
 }
 
 fn makeTextMessage(gpa: std.mem.Allocator, role: ai.Role, text: []const u8) !ai.ChatMessage {
