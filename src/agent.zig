@@ -555,7 +555,13 @@ pub const Agent = struct {
         // so a pathologically capping endpoint cannot loop extra billed
         // requests (the C2 `downgrade_done` idiom from the wire client).
         var length_continued = false;
+        var turn_arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer turn_arena.deinit();
+
         while (calls < self.tool_call_limit_per_turn) : (calls += 1) {
+            _ = turn_arena.reset(.retain_capacity);
+            const turn_allocator = turn_arena.allocator();
+
             self.maybeCompact(l);
             var stream_context: StreamContext(L) = .{
                 .agent = self,
@@ -598,8 +604,8 @@ pub const Agent = struct {
             var turn_owned = true;
             defer if (turn_owned) turn.deinit(self.gpa);
 
-            const tool_calls_initial = try self.collectToolCalls(turn.assistant);
-            defer self.gpa.free(tool_calls_initial);
+            const tool_calls_initial = try self.collectToolCallsAlloc(turn_allocator, turn.assistant);
+            defer turn_allocator.free(tool_calls_initial);
 
             // T3: recover tool calls the model emitted as literal text (weak
             // function-calling models do this). Only when there were zero
@@ -670,7 +676,7 @@ pub const Agent = struct {
                 }
                 return;
             }
-            try Agent.runToolBatch(L, self, ToolBatch.init(tool_calls), &stream_context, l);
+            try Agent.runToolBatch(L, self, ToolBatch.init(tool_calls), &stream_context, l, turn_allocator);
             // Mid-turn we only inject messages explicitly marked to steer, and
             // only from the front so FIFO order holds — a default-queued
             // message ahead of a steer one keeps it waiting for turn end.
@@ -726,6 +732,7 @@ pub const Agent = struct {
         tool_batch: ToolBatch,
         stream_context: *const StreamContext(L),
         listener: L,
+        turn_allocator: std.mem.Allocator,
     ) !void {
         var bridge: ExecutorBridge(L) = .{
             .agent = self,
@@ -734,6 +741,7 @@ pub const Agent = struct {
         };
         var executor = executor_mod.ExecutorService.init(.{
             .gpa = self.gpa,
+            .scratch_allocator = turn_allocator,
             .io = self.io,
             .cwd = self.effectiveCwd(),
             .contained = self.contained,
@@ -1182,14 +1190,15 @@ pub const Agent = struct {
         assistant.* = undefined;
     }
 
-    fn collectToolCalls(self: *Agent, assistant: ai.ChatMessage) ![]ai.ToolCall {
+    fn collectToolCallsAlloc(self: *Agent, allocator: std.mem.Allocator, assistant: ai.ChatMessage) ![]ai.ToolCall {
+        _ = self;
         assert(assistant == .assistant);
         const content = assistant.assistant.content;
         var count: usize = 0;
         for (content) |block| {
             if (block == .tool_call) count += 1;
         }
-        const calls = try self.gpa.alloc(ai.ToolCall, count);
+        const calls = try allocator.alloc(ai.ToolCall, count);
         var index: usize = 0;
         for (content) |block| {
             if (block != .tool_call) continue;
@@ -1197,6 +1206,10 @@ pub const Agent = struct {
             index += 1;
         }
         return calls;
+    }
+
+    fn collectToolCalls(self: *Agent, assistant: ai.ChatMessage) ![]ai.ToolCall {
+        return self.collectToolCallsAlloc(self.gpa, assistant);
     }
 
     /// T3: scan the assistant message's text blocks for tool calls a model

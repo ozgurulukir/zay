@@ -44,6 +44,95 @@ pub fn zeroedChild() std.process.Child {
     }
     return std.mem.zeroes(std.process.Child);
 }
+
+const windows = if (os.is_windows) struct {
+    pub const DWORD = std.os.windows.DWORD;
+    pub const HANDLE = std.os.windows.HANDLE;
+    pub const BOOL = i32;
+    pub const LPVOID = ?*anyopaque;
+    pub const LPCWSTR = [*:0]const u16;
+    pub const SIZE_T = usize;
+    pub const ULONG_PTR = usize;
+
+    pub const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: DWORD = 0x00002000;
+    pub const JobObjectExtendedLimitInformation: DWORD = 9;
+
+    pub const IO_COUNTERS = extern struct {
+        ReadOperationCount: u64,
+        WriteOperationCount: u64,
+        OtherOperationCount: u64,
+        ReadTransferCount: u64,
+        WriteTransferCount: u64,
+        OtherTransferCount: u64,
+    };
+
+    pub const JOBOBJECT_BASIC_LIMIT_INFORMATION = extern struct {
+        PerProcessUserTimeLimit: i64,
+        PerJobUserTimeLimit: i64,
+        LimitFlags: DWORD,
+        MinimumWorkingSetSize: SIZE_T,
+        MaximumWorkingSetSize: SIZE_T,
+        ActiveProcessLimit: DWORD,
+        Affinity: ULONG_PTR,
+        PriorityClass: DWORD,
+        SchedulingClass: DWORD,
+    };
+
+    pub const JOBOBJECT_EXTENDED_LIMIT_INFORMATION = extern struct {
+        BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        IoInfo: IO_COUNTERS,
+        ProcessMemoryLimit: SIZE_T,
+        JobMemoryLimit: SIZE_T,
+        PeakProcessMemoryLimit: SIZE_T,
+        PeakJobMemoryLimit: SIZE_T,
+    };
+
+    pub extern "kernel32" fn CreateJobObjectW(lpJobAttributes: ?*anyopaque, lpName: ?LPCWSTR) callconv(.winapi) ?HANDLE;
+    pub extern "kernel32" fn SetInformationJobObject(
+        hJob: HANDLE,
+        JobObjectInformationClass: DWORD,
+        lpJobObjectInformation: LPVOID,
+        cbJobObjectInformationLength: DWORD,
+    ) callconv(.winapi) BOOL;
+    pub extern "kernel32" fn AssignProcessToJobObject(hJob: HANDLE, hProcess: HANDLE) callconv(.winapi) BOOL;
+    pub extern "kernel32" fn TerminateJobObject(hJob: HANDLE, uExitCode: DWORD) callconv(.winapi) BOOL;
+    pub extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) BOOL;
+    pub extern "kernel32" fn PeekNamedPipe(
+        hNamedPipe: HANDLE,
+        lpBuffer: LPVOID,
+        nBufferSize: DWORD,
+        lpBytesRead: ?*DWORD,
+        lpTotalBytesAvail: ?*DWORD,
+        lpBytesLeftThisMessage: ?*DWORD,
+    ) callconv(.winapi) BOOL;
+} else struct {
+    pub const HANDLE = std.os.windows.HANDLE;
+    pub const DWORD = std.os.windows.DWORD;
+    pub const BOOL = i32;
+    pub const LPVOID = ?*anyopaque;
+};
+
+fn createWin32JobObject(process_handle: windows.HANDLE) ?windows.HANDLE {
+    if (!os.is_windows) return null;
+    const h = windows.CreateJobObjectW(null, null) orelse return null;
+    var info: windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std.mem.zeroes(windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
+    info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (windows.SetInformationJobObject(
+        h,
+        windows.JobObjectExtendedLimitInformation,
+        &info,
+        @sizeOf(windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION),
+    ) == 0) {
+        _ = windows.CloseHandle(h);
+        return null;
+    }
+    if (windows.AssignProcessToJobObject(h, process_handle) == 0) {
+        _ = windows.CloseHandle(h);
+        return null;
+    }
+    return h;
+}
+
 pub const ServerStatus = enum {
     connecting,
     connected,
@@ -121,6 +210,7 @@ pub const McpClient = struct {
         stdio: struct {
             process: std.process.Child,
             status: enum { connecting, ready },
+            win32_job_obj: if (os.is_windows) ?windows.HANDLE else void = if (os.is_windows) null else {},
         },
         sse: struct {
             status: enum { connecting, ready },
@@ -353,10 +443,26 @@ pub const McpClient = struct {
         });
         errdefer child.kill(io);
 
+        var win32_job_obj: if (os.is_windows) ?windows.HANDLE else void = if (os.is_windows) null else {};
+        if (os.is_windows) {
+            if (child.id) |proc_handle| {
+                win32_job_obj = createWin32JobObject(proc_handle);
+            }
+        }
+        errdefer {
+            if (os.is_windows) {
+                if (win32_job_obj) |h| {
+                    _ = windows.TerminateJobObject(h, 1);
+                    _ = windows.CloseHandle(h);
+                }
+            }
+        }
+
         self.lifecycle = .{
             .stdio = .{
                 .process = child,
                 .status = .connecting,
+                .win32_job_obj = win32_job_obj,
             },
         };
     }
@@ -368,6 +474,7 @@ pub const McpClient = struct {
     pub fn stop(self: *McpClient, io: std.Io) void {
         if (self.lifecycle == .stdio) {
             var child = self.lifecycle.stdio.process;
+            const job_obj = if (os.is_windows) self.lifecycle.stdio.win32_job_obj else null;
             // Close stdin so the child sees EOF and can exit gracefully.
             if (child.stdin) |*stdin_file| {
                 stdin_file.close(io);
@@ -382,6 +489,12 @@ pub const McpClient = struct {
             if (child.id) |pid| {
                 if (!os.is_windows) {
                     std.posix.kill(@intCast(pid), std.posix.SIG.TERM) catch {};
+                }
+            }
+            if (os.is_windows) {
+                if (job_obj) |h| {
+                    _ = windows.TerminateJobObject(h, 1);
+                    _ = windows.CloseHandle(h);
                 }
             }
             child.kill(io);
@@ -470,14 +583,28 @@ pub const McpClient = struct {
             // HUP alone is not treated as a crash — a server that has written
             // its response and exited still has buffered data in the pipe we
             // need to drain. Only a read failure after poll is a true crash.
-            if (!os.is_windows) {
+            if (os.is_windows) {
+                const timeout_ns: i96 = @as(i96, self.read_timeout_ms) * std.time.ns_per_ms;
+                const start_time = std.Io.Timestamp.now(io, .awake);
+                while (true) {
+                    var bytes_avail: windows.DWORD = 0;
+                    if (windows.PeekNamedPipe(stdout_file.handle, null, 0, null, &bytes_avail, null) == 0) {
+                        return error.McpServerCrashed;
+                    }
+                    if (bytes_avail > 0) break;
+                    const now = std.Io.Timestamp.now(io, .awake);
+                    if (start_time.durationTo(now).nanoseconds >= timeout_ns) {
+                        return error.Timeout;
+                    }
+                    io.sleep(.fromMilliseconds(10), .awake) catch {};
+                }
+            } else {
                 var poll_fds: [1]std.posix.pollfd = .{
                     .{ .fd = stdout_file.handle, .events = std.posix.POLL.IN, .revents = 0 },
                 };
                 const ready = std.posix.poll(&poll_fds, @intCast(self.read_timeout_ms)) catch return error.ReadFailed;
                 if (ready == 0) return error.Timeout;
             }
-            // Windows: skip poll, proceed to read (kernel defaults apply)
 
             // Read one line from stdout (newline-delimited JSON-RPC).
             var line_writer: std.Io.Writer.Allocating = .init(self.gpa);
@@ -1250,4 +1377,24 @@ test "httpTimeoutParts derives timeval sec/usec from read_timeout_ms" {
     const sub_second = McpClient.httpTimeoutParts(250);
     try std.testing.expectEqual(@as(i64, 0), sub_second.sec);
     try std.testing.expectEqual(@as(i64, 250_000), sub_second.usec);
+}
+
+test "McpClient sendRequest timeout produces error.Timeout" {
+    if (os.is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Server that sleeps longer than the configured read_timeout_ms
+    var client = try McpClient.init(gpa, "slow-server", "bash", &.{
+        "-c",
+        "sleep 1; echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'",
+    }, null);
+    defer client.deinit(io);
+    client.read_timeout_ms = 50;
+
+    try client.startStdio(io);
+    defer client.stop(io);
+
+    const result = client.sendRequest(io, "initialize", null);
+    try std.testing.expectError(error.Timeout, result);
 }
