@@ -195,9 +195,13 @@ pub const ExecutorService = struct {
     lane_bridge: ?*lane_bridge.LaneBridge = null,
     lane_requester: ?*anyopaque = null,
     skills: []const skill_mod.Skill = &.{},
+    /// Per-turn or per-batch scratch allocator (e.g. TurnArena) for temporary JSON
+    /// parsing, schema validation, and argument coercion. Defaults to gpa when unspecified.
+    scratch_allocator: std.mem.Allocator,
 
     pub const InitOptions = struct {
         gpa: std.mem.Allocator,
+        scratch_allocator: ?std.mem.Allocator = null,
         io: std.Io,
         cwd: []const u8,
         contained: bool = false,
@@ -216,6 +220,7 @@ pub const ExecutorService = struct {
         if (options.bash_classifier_url) |url| assert(url.len > 0);
         return .{
             .gpa = options.gpa,
+            .scratch_allocator = options.scratch_allocator orelse options.gpa,
             .io = options.io,
             .cwd = options.cwd,
             .contained = options.contained,
@@ -311,8 +316,8 @@ pub const ExecutorService = struct {
     /// already fail in `produceOutput`.
     fn runOne(self: *ExecutorService, call: ai.ToolCall) !ToolResult {
         if (self.resolveSchema(call)) |schema| {
-            var validation_info = try executor_validation.validateAndCoerceCallArgs(self.gpa, schema, call);
-            defer validation_info.deinit(self.gpa);
+            var validation_info = try executor_validation.validateAndCoerceCallArgs(self.scratch_allocator, schema, call);
+            defer validation_info.deinit(self.scratch_allocator);
 
             if (!validation_info.validation.isValid()) {
                 return self.runValidationError(call, &validation_info.validation);
@@ -506,8 +511,8 @@ pub const ExecutorService = struct {
         call: ai.ToolCall,
         validation: *const schema_mod.ValidationResult,
     ) !ToolResult {
-        const detail = try validation.formatMessage(self.gpa);
-        defer self.gpa.free(detail);
+        const detail = try validation.formatMessage(self.scratch_allocator);
+        defer self.scratch_allocator.free(detail);
         const content = try std.fmt.allocPrint(self.gpa, "Invalid arguments for tool '{s}': {s}", .{ call.name, detail });
         errdefer self.gpa.free(content);
 
