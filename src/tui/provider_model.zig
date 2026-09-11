@@ -856,6 +856,11 @@ pub fn startProviderModelLoad(self: *App, provider: config_mod.Provider, key: []
 }
 
 pub fn applySelectedModel(self: *App) !void {
+    // An async interrupt teardown in flight owns the turn future and its
+    // worker is not joined yet — refuse until `drainTurnCancels` converges
+    // (the picker can reopen, nothing is lost). A jobless `.interrupting`
+    // lane (synchronously cancelled — `lane cancel`, tests) still discards.
+    if (self.thread.cancel_job != null) return error.InFlightTurn;
     if (self.thread.turn.state == .interrupting) self.discardAbandonedTurn();
     if (self.thread.turn.isActive()) return error.InFlightTurn;
     const model = selectedCodexModel(

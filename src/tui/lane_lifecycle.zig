@@ -966,6 +966,9 @@ fn cancelLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
 /// tool) the worker is blocked in a read and emits nothing — so the future is
 /// force-cancelled and the turn reset UI-side.
 fn cancelLaneTurn(app: *App, lane: *Thread) void {
+    // An ESC interrupt's async teardown is already unwinding this worker;
+    // its `drainTurnCancels` convergence covers everything below.
+    if (lane.cancel_job != null) return;
     if (lane.turn.state != .active and lane.turn.state != .interrupting) return;
     if (lane.worker_context) |*worker| worker.requestCancel();
     // Project the cancel notice onto the lane's transcript and mark it
@@ -990,14 +993,7 @@ fn discardAbandonedTurnOnLane(app: *App, lane: *Thread) void {
         _ = future.cancel(app.io);
         lane.turn_future = null;
     }
-    var batch: BoundedList(*agent_mod.Agent.Event, agent_worker.event_batch_max) = .{};
-    if (lane.worker_context) |*worker| {
-        worker.queue.drainIntoBounded(worker.io, &batch) catch {};
-        for (batch.slice()) |event_ptr| {
-            event_ptr.deinit(worker.gpa);
-            worker.gpa.destroy(event_ptr);
-        }
-    }
+    if (lane.worker_context) |*worker| worker.queue.discardAll(worker.io, worker.gpa);
     if (lane.turn.state == .interrupting) lane.turn.reset();
 }
 
@@ -1163,6 +1159,10 @@ pub fn deliverPendingLaneCompletions(app: *App) !bool {
     for (app.threads.slice()) |lane| {
         if (lane.spawned_by_generation == null) continue;
         if (lane.completion_delivered) continue;
+        // An in-flight interrupt teardown still owns the worker: `turn.state`
+        // may read idle (terminal event drained) while the worker unwinds —
+        // parking now would free the runtime under it.
+        if (lane.cancel_job != null) continue;
         if (lane.engine == .live and lane.turn.state == .idle and lane.transcript.messages.items.len > 0) {
             parkFinishedWorker(app, lane);
             changed = true;

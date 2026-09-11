@@ -59,13 +59,21 @@ pub const EventQueue = struct {
         }
     }
 
-    pub fn deinit(self: *EventQueue, io: std.Io, gpa: std.mem.Allocator) void {
+    /// Free every event still queued. The shared discard primitive for a dead
+    /// worker's stranded output (interrupt convergence, teardown): unlike the
+    /// bounded drain it can never leave stragglers behind, which would
+    /// otherwise be projected onto the lane's NEXT turn.
+    pub fn discardAll(self: *EventQueue, io: std.Io, gpa: std.mem.Allocator) void {
         self.mutex.lock(io) catch return;
         defer self.mutex.unlock(io);
         while (self.event_queue.pop(&self.storage)) |event_ptr| {
             event_ptr.deinit(gpa);
             gpa.destroy(event_ptr);
         }
+    }
+
+    pub fn deinit(self: *EventQueue, io: std.Io, gpa: std.mem.Allocator) void {
+        self.discardAll(io, gpa);
     }
 };
 
@@ -270,11 +278,13 @@ fn postAgentEvent(worker_context: *Context, event: agent_mod.Agent.Event) anyerr
     while (true) {
         worker_context.queue.push(worker_context.io, worker_context.gpa, event_ptr) catch |err| switch (err) {
             error.QueueFull => {
-                // Back off and retry — but a cancelled sleep means the task is
-                // being torn down (`future.cancel` from interrupt/quit). The UI
-                // thread is then blocked *in* that cancel and isn't draining, so
-                // retrying forever would deadlock the teardown. Drop the event
-                // and bail; the canceller discards the queue anyway.
+                // Back off and retry — but a cancelled sleep means the
+                // canceller is being torn down (`Future.cancel` from the
+                // async turn-cancel job on ESC, from the UI thread on quit)
+                // and is blocked *in* that cancel instead of draining, so
+                // retrying forever would deadlock the teardown. Drop the
+                // event and bail; the canceller's convergence discards the
+                // queue anyway.
                 worker_context.io.sleep(.fromMilliseconds(queue_full_backoff_ms), .awake) catch {
                     // errdefers handle event_ptr deinit and destroy automatically.
                     return error.TurnCancelled;

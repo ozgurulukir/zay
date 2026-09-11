@@ -83,12 +83,19 @@ fn runUnderBash(gpa: std.mem.Allocator, io: std.Io, options: RunOptions) !Result
         .stdin = if (options.stdin != null) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
+        .pgid = if (os.is_windows) null else 0,
     });
     // Join registered FIRST so it runs LAST (LIFO): the kill must land before we
     // wait on the writer, or a blocked writer deadlocks the join.
     var writer: ?std.Thread = null;
     defer if (writer) |*t| t.join();
-    defer child.kill(io);
+    defer {
+        // Bounded group teardown, then the single reap: a child that ignores
+        // SIGTERM (trap, graceful shutdown) would otherwise park the deferred
+        // kill — and the whole unwind — until it exits on its own.
+        os.terminateChildBounded(&child, io, os.child_term_grace_ms);
+        child.kill(io);
+    }
 
     if (options.stdin) |stdin_bytes| {
         if (child.stdin) |stdin_file| {
@@ -137,8 +144,15 @@ pub fn capture(gpa: std.mem.Allocator, io: std.Io, options: CaptureOptions) !Cap
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .ignore,
+        .pgid = if (os.is_windows) null else 0,
     });
-    defer child.kill(io);
+    defer {
+        // Bounded group teardown, then the single reap (see `runUnderBash`):
+        // on the cancel/timeout unwind this is what keeps a TERM-immune child
+        // from parking the worker for its remaining runtime.
+        os.terminateChildBounded(&child, io, os.child_term_grace_ms);
+        child.kill(io);
+    }
 
     var sink: Sink = .{ .limits = options.limits };
     errdefer sink.deinit(gpa, io);
@@ -406,6 +420,50 @@ test "capture enforces total runtime even when output keeps flowing" {
     defer captured.deinit(gpa);
     try std.testing.expect(captured.timed_out);
     try std.testing.expectEqual(@as(u8, 124), captured.code);
+}
+
+const CaptureOutcome = struct {
+    err: ?anyerror = null,
+};
+
+fn captureTrappingTermTask(gpa: std.mem.Allocator, io: std.Io) CaptureOutcome {
+    var out: CaptureOutcome = .{};
+    _ = capture(gpa, io, .{
+        .cwd = "/",
+        .command = "trap '' TERM; sleep 60",
+        .timeout = timeoutFromSeconds(120),
+        .limits = .{
+            .bytes_max = 1024,
+            .lines_max = 32,
+            .tail_bytes_max = 4096,
+            .spill_bytes_max = 8192,
+        },
+    }) catch |err| {
+        out.err = err;
+    };
+    return out;
+}
+
+test "capture unwinds promptly on cancel even when the child traps TERM" {
+    // Regression for the ESC freeze: cancelling mid-capture used to leave the
+    // unwind parked in `Child.kill`'s uncancelable reap until a TERM-immune
+    // child exited on its own (here: up to 60s). The bounded group teardown
+    // must return within the SIGTERM grace + SIGKILL escalation instead.
+    if (os.is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var future: std.Io.Future(CaptureOutcome) = try io.concurrent(captureTrappingTermTask, .{ gpa, io });
+    io.sleep(.fromMilliseconds(200), .awake) catch {};
+
+    const start_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    const outcome = future.cancel(io);
+    const elapsed_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds() - start_ms;
+
+    try std.testing.expect(elapsed_ms < 15_000);
+    // The capture unwound with an error (the cancel aborted the drain), never
+    // a success value for a 60s command.
+    try std.testing.expect(outcome.err != null);
 }
 
 test "capture still returns all output for a fast command" {

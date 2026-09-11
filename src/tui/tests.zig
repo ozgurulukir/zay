@@ -34,6 +34,7 @@ const runtime_mod = @import("../runtime.zig");
 const search_mod = @import("../search.zig");
 const session_mod = @import("../session.zig");
 const transcript_mod = @import("../transcript.zig");
+const turn_lifecycle = @import("turn_lifecycle.zig");
 const tools_mod = @import("../tools.zig");
 const CountingAllocator = @import("counting_allocator").CountingAllocator;
 
@@ -1788,11 +1789,95 @@ test "interrupt drops the turn straight back to idle" {
     try std.testing.expectEqual(Turn.State.active, app.thread.turn.state);
 
     // Interrupt must not leave the lane lingering in `interrupting` waiting for
-    // a (possibly blocked) worker to reach its next cancellation point — the UI
-    // would read as in-flight. The worker is torn down and the turn is idle.
+    // a (possibly blocked) worker to reach its cancellation point. With no
+    // worker future in flight there is nothing to join: the synchronous
+    // convergence path drops the turn straight back to idle.
     try app.handleInterrupt();
     try std.testing.expectEqual(Turn.State.idle, app.thread.turn.state);
     try std.testing.expect(!app.thread.turn.isActive());
+}
+
+fn noopTurnTask() void {}
+
+/// Pump the interrupt-teardown drain until the cancel job lands (bounded —
+/// the joined worker here is a no-op, so the job finishes in milliseconds).
+fn pumpUntilTurnConverged(app: *App) !void {
+    var spins: u32 = 0;
+    while (app.thread.cancel_job != null) : (spins += 1) {
+        try std.testing.expect(spins < 10_000); // no-op worker: never unbounded
+        app.getIo().sleep(.fromMilliseconds(1), .awake) catch {};
+        _ = try turn_lifecycle.drainTurnCancels(app);
+    }
+}
+
+test "interrupt with an in-flight worker converges asynchronously" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try app.inputs.input.insertSliceAtCursor("first");
+    try std.testing.expect(try app.beginSubmit());
+    if (app.thread.pending_prompt) |prompt| app.thread.worker_context.?.gpa.free(prompt);
+    app.thread.pending_prompt = null;
+    // A real (already-finished) worker future so the interrupt takes the
+    // async path: the UI thread must not block on the join, the machine
+    // stays `.interrupting` until the drain converges.
+    app.thread.turn_future = try app.getIo().concurrent(noopTurnTask, .{});
+
+    try app.handleInterrupt();
+    try std.testing.expectEqual(Turn.State.interrupting, app.thread.turn.state);
+    try std.testing.expect(app.thread.cancel_job != null);
+    try std.testing.expect(app.thread.turn_future == null);
+    // The tick stays alive across the teardown window even though this
+    // ordering leaves the machine non-idle.
+    try std.testing.expect(app.anyTurnActive());
+
+    try pumpUntilTurnConverged(&app);
+    try std.testing.expectEqual(Turn.State.idle, app.thread.turn.state);
+    try std.testing.expect(!app.thread.turn.isActive());
+    try std.testing.expect(!turn_lifecycle.turnCancelActive(&app));
+}
+
+test "submit during the interrupt teardown queues and restarts after convergence" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try app.inputs.input.insertSliceAtCursor("first");
+    try std.testing.expect(try app.beginSubmit());
+    if (app.thread.pending_prompt) |prompt| app.thread.worker_context.?.gpa.free(prompt);
+    app.thread.pending_prompt = null;
+    app.thread.turn_future = try app.getIo().concurrent(noopTurnTask, .{});
+    try app.handleInterrupt();
+
+    // The worker is not joined yet: a submit must queue, not start a second
+    // worker on the shared history.
+    try app.inputs.input.insertSliceAtCursor("second");
+    try std.testing.expect(!try app.beginSubmit());
+    try std.testing.expectEqual(@as(usize, 1), app.thread.queued.items.len);
+    try std.testing.expectEqual(Turn.State.interrupting, app.thread.turn.state);
+
+    try pumpUntilTurnConverged(&app);
+    // Convergence restarted the turn with the queued message.
+    try std.testing.expectEqual(Turn.State.active, app.thread.turn.state);
+    try std.testing.expect(app.thread.turn_future != null);
+    // Join the restarted worker first: `drainAllQueuedToHistory` runs on it
+    // (connection refused fails the run right after). The UI mirror clears
+    // when `drainAgentEvents` applies the flushed event, which this test
+    // does not pump — the mirror entry is freed by `app.deinit`.
+    if (app.thread.turn_future) |*future| future.await(app.getIo());
+    app.thread.turn_future = null;
+    try std.testing.expectEqual(@as(u32, 0), app.thread.agent.?.message_queue.len());
 }
 
 test "lane commands stay hidden until a second lane exists" {

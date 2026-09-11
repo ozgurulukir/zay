@@ -114,10 +114,17 @@ fn runUnderPwsh(gpa: std.mem.Allocator, io: std.Io, options: RunOptions) !Result
         .stdin = if (options.stdin != null) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
+        .pgid = if (os.is_windows) null else 0,
     });
     var writer: ?std.Thread = null;
     defer if (writer) |*t| t.join();
-    defer child.kill(io);
+    defer {
+        // Bounded group teardown, then the single reap (mirrors
+        // `bash_exec.runUnderBash`): keeps a TERM-immune child from parking
+        // the unwind. No-op on Windows, where `child.kill` is kernel-forced.
+        os.terminateChildBounded(&child, io, os.child_term_grace_ms);
+        child.kill(io);
+    }
 
     if (options.stdin) |stdin_bytes| {
         if (child.stdin) |stdin_file| {
@@ -219,8 +226,13 @@ pub fn capture(gpa: std.mem.Allocator, io: std.Io, options: CaptureOptions) !Cap
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
+        .pgid = if (os.is_windows) null else 0,
     });
-    defer child.kill(io);
+    defer {
+        // Bounded group teardown, then the single reap (see `runUnderPwsh`).
+        os.terminateChildBounded(&child, io, os.child_term_grace_ms);
+        child.kill(io);
+    }
 
     var sink: Sink = .{ .limits = options.limits };
     errdefer sink.deinit(gpa, io);

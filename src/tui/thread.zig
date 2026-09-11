@@ -33,6 +33,7 @@ const transcript_mod = @import("../transcript.zig");
 const Turn = @import("turn.zig");
 const turn_view_mod = @import("turn_view.zig");
 const agent_worker = @import("agent_worker.zig");
+const turn_cancel = @import("turn_cancel.zig");
 const naming = @import("naming.zig");
 
 const Thread = @This();
@@ -72,6 +73,11 @@ transcript_view_height: u16 = 1,
 /// others.
 worker_context: ?agent_worker.Context = null,
 turn_future: ?std.Io.Future(void) = null,
+/// In-flight async interrupt teardown: owns the turn future (moved out of
+/// `turn_future`) until the worker has fully unwound. Set by
+/// `turn_lifecycle.beginTurnCancel`; joined and freed by `drainTurnCancels`
+/// (or `deinitWorkersTop` at teardown), so it is always null in `deinit`.
+cancel_job: ?*turn_cancel.TurnCancelJob = null,
 pending_prompt: ?[]u8 = null,
 permission_selection: agent_worker.ApprovalDecision = .approve,
 permission_scroll: u32 = 0,

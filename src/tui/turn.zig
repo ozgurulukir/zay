@@ -66,8 +66,10 @@ pub fn interrupt(self: *Turn) void {
     self.state = .interrupting;
 }
 
-/// Force the machine back to idle after the App has cancelled and drained an
-/// abandoned worker out-of-band (see `App.discardAbandonedTurn`).
+/// Force the machine back to idle when the terminal `turn_finished` never
+/// arrived (the cancel gate dropped it) — the convergence fallback used by
+/// `turn_lifecycle`'s synchronous discard and `drainTurnCancels`. The primary
+/// idle transition is `apply`'s terminal-event path.
 pub fn reset(self: *Turn) void {
     assert(self.state != .idle);
     self.state = .idle;
