@@ -23,7 +23,9 @@ pub fn installRuntime(app: *App, runtime: *runtime_mod.AgentRuntime) !void {
     // the switch (M1: `laneByGeneration`, not a raw `*Agent` pointer), so a
     // worker finishing after the switch still reaches its spawner. See
     // `_plan/plan-lane-worker-hardening-2026-08-05.md` (I4).
-    if (app.thread.turn.isActive()) return error.InFlightTurn;
+    // `cancel_job` covers the post-idle window where an interrupted worker is
+    // still unwinding against the runtime about to be destroyed here.
+    if (app.thread.turn.isActive() or app.thread.cancel_job != null) return error.InFlightTurn;
     app.cancelLaneNaming(app.thread);
     // Compare before destroying: the old cwd is freed by deinit.
     const cwd_changed = if (app.liveRuntime()) |old| !std.mem.eql(u8, old.cwd, runtime.cwd) else true;

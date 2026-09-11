@@ -88,7 +88,9 @@ pub fn anyTurnActive(app: *const App) bool {
 }
 
 pub fn closeActiveLane(app: *App) !void {
-    if (app.thread.turn.isActive()) return error.InFlightTurn;
+    // `cancel_job` covers the post-idle window where an interrupted worker is
+    // still unwinding — its runtime must not be torn down under it.
+    if (app.thread.turn.isActive() or app.thread.cancel_job != null) return error.InFlightTurn;
     const index: u32 = activeIndex(app);
     std.debug.assert(index < app.threads.len());
     if (index == 0) return error.CannotClosePrimaryLane;

@@ -21,6 +21,7 @@ const diff_lifecycle = @import("diff_lifecycle.zig");
 const diff_utils = @import("diff_utils.zig");
 const compaction_lifecycle = @import("compaction_lifecycle.zig");
 const lane_lifecycle = @import("lane_lifecycle.zig");
+const turn_lifecycle = @import("turn_lifecycle.zig");
 const toast = @import("toast.zig");
 const vcs = @import("../vcs.zig");
 const at_search_mod = @import("at_search.zig");
@@ -56,8 +57,15 @@ pub fn deinitApp(self: *App) void {
 /// goes away.
 fn deinitWorkersTop(self: *App) void {
     for (self.threads.slice()) |lane| {
-        if (lane.turn_future) |*future| {
-            if (lane.worker_context) |*worker| worker.requestCancel();
+        if (lane.worker_context) |*worker| worker.requestCancel();
+        if (lane.cancel_job) |job| {
+            // The job owns the turn future; cancelling the job task joins the
+            // worker unwind (bounded by the capture teardown's SIGKILL
+            // escalation) and releases both frames.
+            _ = job.task.cancel(self.io);
+            self.gpa.destroy(job);
+            lane.cancel_job = null;
+        } else if (lane.turn_future) |*future| {
             _ = future.cancel(self.io);
             lane.turn_future = null;
         }
@@ -195,6 +203,10 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     }
 
     var visible_change = try drainAgentEvents(root, ctx);
+    // Converge interrupted turns whose async teardown finished (after events,
+    // so the worker's terminal event drives the machine's own transition when
+    // it wins the race; the drain then only checkpoints and restarts).
+    visible_change = try turn_lifecycle.drainTurnCancels(root.app) or visible_change;
     // Update the velocity EMA + context meter on the UI tick (lockless: the UI
     // thread is the sole writer; worker threads only append to the transcript
     // via the already-synchronized event queue). `streamed_bytes / 4` is the
@@ -327,6 +339,7 @@ fn advanceBlackholeIfVisible(root: *RootWidget, visible_change: *bool) void {
 /// corresponds to one logical reason for continued polling.
 fn decideShouldTick(root: *RootWidget) bool {
     const turn_active = root.app.anyTurnActive();
+    const turn_cancel_pending = turn_lifecycle.turnCancelActive(root.app);
     const model_loading = root.app.pickers.models.load == .loading;
     const diff_loading = root.app.metrics.diff_loading();
     const blackhole_visible = root.app.metrics.blackhole_visible;
@@ -342,6 +355,7 @@ fn decideShouldTick(root: *RootWidget) bool {
     const at_search_active = atSearchActive(root.app);
 
     return turn_active or
+        turn_cancel_pending or
         model_loading or
         diff_loading or
         blackhole_visible or

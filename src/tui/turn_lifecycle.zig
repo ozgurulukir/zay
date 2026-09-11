@@ -5,14 +5,18 @@ const std = @import("std");
 const tui = @import("../tui.zig");
 const agent_mod = @import("../agent.zig");
 const agent_worker = @import("agent_worker.zig");
+const turn_cancel = @import("turn_cancel.zig");
 const lanes_util = @import("lanes.zig");
 const runtime_mod = @import("../runtime.zig");
 
 const App = tui.App;
 const Thread = tui.Thread;
 
+const log = std.log.scoped(.turn_lifecycle);
+
 pub fn handleInterrupt(app: *App) !void {
     if (app.thread.turn.state != .active) return;
+    if (app.thread.cancel_job != null) return; // a reap is already in flight
     app.thread.worker_context.?.requestCancel();
     // Show the cancellation notice immediately.
     const message = try app.gpa.dupe(u8, agent_worker.cancel_message);
@@ -28,40 +32,121 @@ pub fn handleInterrupt(app: *App) !void {
     if (app.thread.turn_failed) |old| app.gpa.free(old);
     app.thread.turn_failed = app.gpa.dupe(u8, agent_worker.cancel_message) catch null;
     app.thread.turn.interrupt();
-    // Tear the worker down now rather than waiting for it to reach its next
-    // cooperative cancellation point. `requestCancel` only takes effect on
-    // the worker's next `emit`, but between stream chunks (and for the whole
-    // duration of a running tool) the worker is blocked in a read and emits
-    // nothing — so a purely cooperative cancel would leave the lane stuck
-    // `interrupting`, i.e. reading as still in-flight long after Esc.
-    // `cancel` aborts that read and joins the worker; we then drop back to
-    // idle and deliver anything the user queued behind the cancelled turn.
+    // Tear the worker down without blocking the UI: the future moves into a
+    // background cancel job (see `beginTurnCancel`) whose `Future.cancel`
+    // aborts the worker's blocking read and joins it. `.interrupting` keeps
+    // the tick alive, and `drainTurnCancels` converges the turn (checkpoint +
+    // queued-message restart) once the job reports the worker fully unwound —
+    // starting a turn here would race the still-unwinding worker on the
+    // shared agent history. When nothing is in flight (or the job could not
+    // spawn) converge synchronously instead; the legacy path blocks the UI
+    // once but can never strand the machine in `.interrupting`.
+    if (beginTurnCancel(app)) return;
     discardAbandonedTurn(app);
     _ = try restartTurnForQueuedMessages(app);
 }
 
+/// Move the lane's turn future into a background `TurnCancelJob` and start it.
+/// Returns false when the caller must converge synchronously: nothing was in
+/// flight (a turn can be `.interrupting` with no worker — the test/headless
+/// path), or the job could not be created (OOM / no task slots — the future is
+/// restored first). The machine is left `.interrupting` on true.
+fn beginTurnCancel(app: *App) bool {
+    const thread = app.thread;
+    const future = thread.turn_future orelse return false;
+    std.debug.assert(thread.turn.state == .interrupting);
+    std.debug.assert(thread.cancel_job == null);
+    thread.turn_future = null;
+
+    const job = app.gpa.create(turn_cancel.TurnCancelJob) catch {
+        thread.turn_future = future;
+        // The fallback blocks the UI for the unwind — the very freeze this
+        // job exists to avoid. Rare (OOM), but it must leave a trail.
+        log.warn("interrupt: async cancel job unavailable (OOM); converging synchronously", .{});
+        return false;
+    };
+    job.* = .{ .io = app.getIo(), .future = future };
+    thread.cancel_job = job;
+    if (app.io.concurrent(turn_cancel.TurnCancelJob.run, .{job})) |task| {
+        job.task = task;
+        log.info("interrupt: async cancel job started", .{});
+        return true;
+    } else |_| {
+        thread.cancel_job = null;
+        app.gpa.destroy(job);
+        thread.turn_future = future;
+        log.warn("interrupt: async cancel task could not spawn; converging synchronously", .{});
+        return false;
+    }
+}
+
 pub fn discardAbandonedTurn(app: *App) void {
+    if (app.thread.cancel_job != null) return; // the job owns the future
     if (app.thread.turn.state != .interrupting and app.thread.turn_future == null) return;
     if (app.thread.turn_future) |*future| {
         // `cancel` blocks until the task hits its next cancellation point
         // (typically the network read) and unwinds. On a healthy stream
         // this is near-instant; on a hung connection it forces the OS
-        // read to abort.
+        // read to abort. Only reached from synchronous callers (spawn
+        // fallback, `lane cancel`, model switch) — ESC uses the async job.
         _ = future.cancel(app.getIo());
         app.thread.turn_future = null;
     }
-    var batch: std.ArrayList(*agent_mod.Agent.Event) = .empty;
-    defer batch.deinit(app.thread.worker_context.?.gpa);
-    app.thread.worker_context.?.queue.drainInto(
-        app.thread.worker_context.?.io,
-        app.thread.worker_context.?.gpa,
-        &batch,
-    ) catch {};
-    for (batch.items) |event_ptr| {
-        event_ptr.deinit(app.thread.worker_context.?.gpa);
-        app.thread.worker_context.?.gpa.destroy(event_ptr);
-    }
+    discardStrandedEvents(app);
     if (app.thread.turn.state == .interrupting) app.thread.turn.reset();
+}
+
+/// Free everything still sitting in a joined worker's event queue. The worker
+/// keeps pushing until the cancel lands, so this must only run after the
+/// worker is joined (cancel job done, or a synchronous `future.cancel`).
+fn discardStrandedEvents(app: *App) void {
+    const thread = app.thread;
+    if (thread.worker_context) |*worker| worker.queue.discardAll(worker.io, worker.gpa);
+}
+
+/// Tick drain: converge every lane whose async interrupt teardown finished.
+/// Returns true when visible state changed. Safe against both convergence
+/// orderings — the worker's terminal `turn_finished` may land through
+/// `applyAgentEvent` while the job is still unwinding (machine goes idle and
+/// `reset` here is skipped), or be dropped by the cancel gate (machine stays
+/// `.interrupting` and `reset` closes the window).
+pub fn drainTurnCancels(app: *App) !bool {
+    var changed = false;
+    for (app.threads.slice()) |lane| {
+        const job = lane.cancel_job orelse continue;
+        if (!job.done.load(.acquire)) continue;
+        lane.cancel_job = null;
+        std.debug.assert(lane.turn_future == null); // the job owns the moved future
+        // `done` is stored last, so the task is finished here and the await
+        // only releases its frame.
+        job.task.await(app.io);
+        app.gpa.destroy(job);
+        changed = true;
+
+        const active = app.thread;
+        app.thread = lane;
+        defer app.thread = active;
+        discardStrandedEvents(app);
+        if (lane.turn.state == .interrupting) {
+            // The cancel gate dropped the worker's terminal event (the
+            // machine never saw `turn_finished`) — close the window here.
+            log.info("interrupt: cancel gate dropped the terminal event; resetting machine", .{});
+            lane.turn.reset();
+        }
+        app.checkpointFinishedTurn();
+        if (try restartTurnForQueuedMessages(app)) changed = true;
+    }
+    return changed;
+}
+
+/// Whether any lane has an interrupt teardown still in flight — a tick reason,
+/// so the loop survives the window where the machine already went idle (the
+/// worker's terminal event drained) but the job has not been joined yet.
+pub fn turnCancelActive(app: *App) bool {
+    for (app.threads.slice()) |lane| {
+        if (lane.cancel_job != null) return true;
+    }
+    return false;
 }
 
 /// Start a turn from the current input. Returns true when a turn was
@@ -70,11 +155,12 @@ pub fn discardAbandonedTurn(app: *App) void {
 pub fn beginSubmit(app: *App) !bool {
     app.closeAtSearch();
     app.nav.block_nav = false;
-    // If a previous turn was Esc-interrupted, force-cancel its worker
-    // before starting a new one. Two concurrent workers would race on
-    // the shared agent message history.
-    if (app.thread.turn.state == .interrupting) discardAbandonedTurn(app);
-    if (app.thread.turn.isActive()) return try app.enqueueSubmit();
+    // An in-flight turn — including `.interrupting` and the post-idle window
+    // where the async teardown is still unwinding the worker — refuses a new
+    // worker: two concurrent workers would race the shared agent message
+    // history. Queue behind it; `drainTurnCancels` restarts the turn with
+    // the queue once the worker is joined.
+    if (app.thread.turn.isActive() or app.thread.cancel_job != null) return try app.enqueueSubmit();
     // A manual `/compact` is mid-flight on this lane: the summarizer will swap
     // the context on the UI thread, so starting a turn now would race that
     // reload. Keep the input — the user can submit once the notice lands.
@@ -312,10 +398,14 @@ pub fn applyAgentEvent(app: *App, event: agent_mod.Agent.Event) !bool {
     }
     if (!outcome.project) {
         // Interrupting: a discarded turn's output must not mutate the
-        // transcript. Join the worker once it posts its terminal event, then
-        // deliver any messages the user queued behind the cancelled turn as
-        // a fresh turn.
+        // transcript. The terminal event moved the machine to idle; the join,
+        // checkpoint, and queued-message restart happen in `drainTurnCancels`
+        // once the async cancel job reports the worker fully unwound — the
+        // future is owned by the job, so the UI thread must not await it here.
+        // The fallback (no job) is a synchronously-interrupted lane: converge
+        // immediately, as `handleInterrupt`'s legacy path does.
         if (outcome.finished) {
+            if (app.thread.cancel_job != null) return false;
             app.awaitTurn();
             // The worker is joined, so any files the cut-short turn wrote are
             // settled on disk. Snapshot them now — otherwise they sit
