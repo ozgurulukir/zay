@@ -37,6 +37,14 @@ pub const ResolvedCwd = struct {
     }
 };
 
+/// Retrieve the Io instance stored in the Lua registry.
+pub fn getIo(L: *c.lua_State) std.Io {
+    _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "zay_io");
+    defer c.lua_pop(L, 1);
+    const ptr = c.lua_touserdata(L, -1);
+    return @as(*const std.Io, @ptrCast(@alignCast(ptr))).*;
+}
+
 /// Resolve the effective working directory for a plugin bridge.
 /// When `plugin_cwd_slot` is set (from Agent.effectiveCwd() — a lane worktree
 /// or a resumed session's cwd), borrows its path. Otherwise falls back to
