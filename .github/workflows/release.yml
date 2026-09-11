@@ -95,6 +95,21 @@ jobs:
         shell: bash
         run: mv dist/bin/${{ matrix.bin }} dist/${{ matrix.artifact }}
 
+      # The Linux ELF embeds ~24 MB of DWARF (PE ships debug in a sidecar
+      # .pdb; this MachO build omits it entirely) — split it out so the
+      # released binary matches the other platforms in size and stays
+      # symbol-izable: the .debug sidecar rides along as a release asset
+      # and is found via the .gnu_debuglink CRC stored in the stripped
+      # binary (distro-style keep-debug + strip + debuglink).
+      - name: Split debug info (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          objcopy --only-keep-debug dist/${{ matrix.artifact }} dist/${{ matrix.artifact }}.debug
+          strip --strip-debug dist/${{ matrix.artifact }}
+          objcopy --add-gnu-debuglink=dist/${{ matrix.artifact }}.debug dist/${{ matrix.artifact }}
+          sha256sum dist/${{ matrix.artifact }}.debug > dist/${{ matrix.artifact }}.debug.sha256
+
       - name: Checksum
         shell: bash
         run: |
