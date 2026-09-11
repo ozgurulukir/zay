@@ -298,22 +298,18 @@ pub const MessageWidget = struct {
         const row_start = row.*;
         if (self.splash_suppressed) {
             // Typing yields the splash: same row budget, blank card.
-            row.* = row_start + introBlockRows();
+            row.* = row_start + blackhole.intro_block_rows;
             return;
         }
         // Splash-only state centers the block in the viewport; otherwise it
         // hugs the top like every other message.
         const block_row = if (self.splash_fills_viewport)
-            (surface.size.height -| introBlockRows()) / 2
+            (surface.size.height -| blackhole.intro_block_rows) / 2
         else
             row_start;
         drawBlackhole(surface, frame_index, block_row);
         self.drawConnectHint(surface, block_row + blackhole.rows, ctx);
-        row.* = row_start + introBlockRows();
-    }
-
-    fn introBlockRows() u16 {
-        return blackhole.rows + 1; // art + the connect-hint row below it
+        row.* = row_start + blackhole.intro_block_rows;
     }
 
     fn drawBlackhole(surface: *vxfw.Surface, frame_index: u16, row_start: u16) void {
@@ -1283,7 +1279,7 @@ test "splash fills and centers in the viewport when it is the sole message" {
 
     // The 25-row intro block centers vertically in the 40-row viewport.
     try std.testing.expectEqual(@as(u16, 40), surface.size.height);
-    const block_row = (surface.size.height - MessageWidget.introBlockRows()) / 2;
+    const block_row = (surface.size.height - blackhole.intro_block_rows) / 2;
     const connect_cell = surface.readCell(hintCol(120), block_row + blackhole.rows);
     try std.testing.expectEqualStrings("/", connect_cell.char.grapheme);
     // The row above the block is card-blank: centered, not top-hugging.
