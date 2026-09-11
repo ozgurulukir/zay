@@ -7,18 +7,19 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
-const tui = @import("../../tui.zig");
 const tui_style = @import("../style.zig");
 const panel = @import("panel.zig");
-const permission_mod = @import("../permission.zig");
-const lanes_util = @import("../lanes.zig");
+const agent_worker = @import("../agent_worker.zig");
 
-const App = tui.App;
+pub const ApprovalSnapshot = agent_worker.ApprovalSnapshot;
+pub const ApprovalDecision = agent_worker.ApprovalDecision;
 
 /// Outer border widget. Shows the current approval snapshot (the
 /// command the agent is about to run + Approve/Reject actions).
 pub const PermissionWidget = struct {
-    app: *App,
+    snapshot: ?ApprovalSnapshot = null,
+    scroll: u32 = 0,
+    label: []const u8 = "Tool Approval Request",
 
     pub fn widget(self: *PermissionWidget) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -27,22 +28,7 @@ pub const PermissionWidget = struct {
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *PermissionWidget = @ptrCast(@alignCast(ptr));
         const p = tui_style.activePalette();
-        const app = self.app;
-        // The gate may belong to a background lane — a worker blocked on a
-        // destructive-bash approval is invisible without this scan.
-        const lane = permission_mod.approvalLane(app) orelse {
-            return vxfw.Surface.init(ctx.arena, self.widget(), .{
-                .width = ctx.max.width orelse 0,
-                .height = ctx.max.height orelse 0,
-            });
-        };
-        const worker = if (lane.worker_context) |*context| context else {
-            return vxfw.Surface.init(ctx.arena, self.widget(), .{
-                .width = ctx.max.width orelse 0,
-                .height = ctx.max.height orelse 0,
-            });
-        };
-        const snapshot = try worker.approval.snapshot(worker.io, ctx.arena, app.thread.permission_selection) orelse {
+        const snapshot = self.snapshot orelse {
             return vxfw.Surface.init(ctx.arena, self.widget(), .{
                 .width = ctx.max.width orelse 0,
                 .height = ctx.max.height orelse 0,
@@ -54,34 +40,20 @@ pub const PermissionWidget = struct {
         const surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = width, .height = height });
         if (width == 0 or height == 0) return surface;
 
-        // When the gate's owner is not the lane on screen, name it so the
-        // user knows which pane is asking.
-        const label: []const u8 = if (lane != app.thread)
-            std.fmt.allocPrint(ctx.arena, "Lane {s} requests approval", .{laneLabel(lane) orelse "?"}) catch "Tool Approval Request"
-        else
-            "Tool Approval Request";
-
         const inner = try ctx.arena.create(PermissionInner);
-        inner.* = .{ .snapshot = snapshot, .scroll = app.thread.permission_scroll };
+        inner.* = .{ .snapshot = snapshot, .scroll = self.scroll };
         var border: vxfw.Border = .{
             .child = inner.widget(),
-            .labels = &.{.{ .text = label, .alignment = .top_left }},
+            .labels = &.{.{ .text = self.label, .alignment = .top_left }},
             .style = p.border_label,
         };
         return border.widget().draw(ctx);
-    }
-
-    /// The hex id of a working lane (its worktree's last path segment), or
-    /// null for the primary lane.
-    fn laneLabel(lane: *tui.Thread) ?[]const u8 {
-        const working = lanes_util.workingLaneOf(lane) orelse return null;
-        return lanes_util.lastPathSegment(working.path);
     }
 };
 
 /// Inner command + actions layout for the permission overlay.
 const PermissionInner = struct {
-    snapshot: tui.agent_worker.ApprovalSnapshot,
+    snapshot: ApprovalSnapshot,
     scroll: u32,
 
     pub fn widget(self: *PermissionInner) vxfw.Widget {
@@ -152,7 +124,7 @@ fn scrollHintText(arena: std.mem.Allocator, command: []const u8, scroll: u32, bo
     }) catch null;
 }
 
-fn drawPermissionActions(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, selected: tui.agent_worker.ApprovalDecision) void {
+fn drawPermissionActions(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, selected: ApprovalDecision) void {
     if (row >= surface.size.height) return;
     const p = tui_style.activePalette();
     const approve_selected = selected == .approve;
@@ -178,4 +150,37 @@ test "permission scroll hint reports the visible window of a long command" {
     defer gpa.free(top);
     try std.testing.expect(std.mem.indexOf(u8, top, "of 5") != null);
     try std.testing.expect(std.mem.indexOf(u8, top, "↓") != null);
+}
+
+test "PermissionWidget renders cleanly with null and non-null snapshot" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 10 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    // 1. Null snapshot renders empty surface
+    var empty_view: PermissionWidget = .{};
+    const empty_surface = try empty_view.widget().draw(ctx);
+    try std.testing.expectEqual(@as(u16, 80), empty_surface.size.width);
+    try std.testing.expectEqual(@as(u16, 10), empty_surface.size.height);
+
+    // 2. Active snapshot renders border with command and actions
+    var cmd_buf = [_]u8{ 'g', 'i', 't', ' ', 's', 't', 'a', 't', 'u', 's' };
+    var active_view: PermissionWidget = .{
+        .snapshot = .{
+            .command = &cmd_buf,
+            .selected = .approve,
+        },
+        .scroll = 0,
+        .label = "Lane 1 requests approval",
+    };
+    const active_surface = try active_view.widget().draw(ctx);
+    try std.testing.expectEqual(@as(u16, 80), active_surface.size.width);
+    try std.testing.expectEqual(@as(u16, 10), active_surface.size.height);
 }

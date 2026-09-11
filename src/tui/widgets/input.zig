@@ -20,6 +20,8 @@ const vxfw = vaxis.vxfw;
 
 const tui = @import("../../tui.zig");
 const tui_style = @import("../style.zig");
+const tui_status = @import("../status.zig");
+const telemetry = @import("../telemetry.zig");
 const status_bar = @import("status_bar.zig");
 const symbols = @import("../../symbols.zig");
 
@@ -501,7 +503,63 @@ pub const InputWidget = struct {
         var box: vxfw.SizedBox = .{ .child = border.widget(), .size = .{ .width = max_width, .height = border_height } };
         const border_surface = try box.widget().draw(ctx.withConstraints(.{ .width = max_width, .height = border_height }, .{ .width = max_width, .height = border_height }));
 
-        var status_bar_w: StatusBarWidget = .{ .app = self.app };
+        const status_text = if (tui_status.modelStatus(self.app.liveRuntime(), self.app.cached_config)) |status|
+            tui_status.formatModelStatus(ctx.arena, status) catch "no model"
+        else
+            "no model";
+
+        const live_context_max: u32 = if (self.app.liveRuntime()) |rt|
+            rt.agent.context_window_tokens
+        else if (self.app.metrics.context_tokens_max > 0)
+            self.app.metrics.context_tokens_max
+        else
+            128000;
+
+        const live_context_used: u32 = if (self.app.liveRuntime()) |rt|
+            rt.agent.currentContextTokens()
+        else if (self.app.metrics.context_tokens_used > 0)
+            self.app.metrics.context_tokens_used
+        else
+            0;
+
+        const tui_cfg = self.app.cached_config.tui;
+        var meter_buf: [64]u8 = undefined;
+        var meter_text: []const u8 = "";
+        var meter_style = p.model_status;
+        if (tui_cfg.show_context_meter) {
+            const meter = telemetry.TelemetryTracker.formatContextBar(
+                @intCast(live_context_used),
+                @intCast(live_context_max),
+                tui_cfg.context_threshold_warn,
+                tui_cfg.context_threshold_alert,
+                &meter_buf,
+            );
+            meter_text = ctx.arena.dupe(u8, meter.text) catch "";
+            meter_style = switch (meter.level) {
+                .normal => p.success,
+                .warn => p.notice,
+                .alert => p.error_style,
+            };
+        }
+        var velocity_buf: [32]u8 = undefined;
+        var velocity_text: []const u8 = "";
+        if (tui_cfg.show_token_velocity) {
+            const is_streaming = switch (self.app.thread.turn_view.activity) {
+                .writing_response, .thinking => true,
+                else => false,
+            };
+            const vel = telemetry.TelemetryTracker.formatVelocity(self.app.metrics.telemetry.current_tokens_per_sec, is_streaming, &velocity_buf);
+            if (vel.len > 0) {
+                velocity_text = ctx.arena.dupe(u8, vel) catch "";
+            }
+        }
+
+        var status_bar_w: StatusBarWidget = .{
+            .status_text = status_text,
+            .meter_text = meter_text,
+            .meter_style = meter_style,
+            .velocity_text = velocity_text,
+        };
         var status_box: vxfw.SizedBox = .{ .child = status_bar_w.widget(), .size = .{ .width = max_width, .height = 1 } };
         const status_surface = try status_box.widget().draw(ctx.withConstraints(.{ .width = max_width, .height = 1 }, .{ .width = max_width, .height = 1 }));
 
