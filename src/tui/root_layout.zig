@@ -31,6 +31,8 @@ const overlay = @import("widgets/overlay.zig");
 const toast = @import("toast.zig");
 const at_search_mod = @import("at_search.zig");
 const search_mod = @import("../search.zig");
+const permission_mod = @import("permission.zig");
+const lanes_util = @import("lanes.zig");
 
 const App = tui.App;
 
@@ -242,7 +244,23 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         idx += 1;
     }
     if (permission_visible) {
-        var permission_view: permission.PermissionWidget = .{ .app = app };
+        const lane = permission_mod.approvalLane(app);
+        const worker = if (lane) |l| if (l.worker_context) |*wc| wc else null else null;
+        const snapshot = if (worker) |w| try w.approval.snapshot(w.io, ctx.arena, app.thread.permission_selection) else null;
+        const label: []const u8 = if (lane) |l| blk: {
+            if (l != app.thread) {
+                const hex_id = if (lanes_util.workingLaneOf(l)) |w| lanes_util.lastPathSegment(w.path) else null;
+                break :blk std.fmt.allocPrint(ctx.arena, "Lane {s} requests approval", .{hex_id orelse "?"}) catch "Tool Approval Request";
+            } else {
+                break :blk "Tool Approval Request";
+            }
+        } else "Tool Approval Request";
+
+        var permission_view: permission.PermissionWidget = .{
+            .snapshot = snapshot,
+            .scroll = app.thread.permission_scroll,
+            .label = label,
+        };
         const panel_height: u16 = @min(@as(u16, 12), @max(@as(u16, 5), layout.input_row));
         children[idx] = .{
             .origin = .{ .row = layout.input_row -| panel_height, .col = 0 },

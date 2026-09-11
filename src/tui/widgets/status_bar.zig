@@ -10,12 +10,8 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
-const tui = @import("../../tui.zig");
 const tui_style = @import("../style.zig");
-const tui_status = @import("../status.zig");
-const telemetry = @import("../telemetry.zig");
 
-const App = tui.App;
 const Palette = tui_style.Palette;
 
 /// A single status bar segment descriptor.
@@ -159,7 +155,10 @@ pub fn layoutStatusBar(
 }
 
 pub const StatusBarWidget = struct {
-    app: *App,
+    status_text: []const u8 = "no model",
+    meter_text: []const u8 = "",
+    meter_style: ?vaxis.Style = null,
+    velocity_text: []const u8 = "",
 
     pub fn widget(self: *StatusBarWidget) vxfw.Widget {
         return .{
@@ -173,66 +172,14 @@ pub const StatusBarWidget = struct {
         const max_width = ctx.max.width orelse ctx.min.width;
         const p = tui_style.activePalette();
 
-        // Resolve segment texts and styles exactly as drawInputBorder did.
-        const status_text = if (tui_status.modelStatus(self.app.liveRuntime(), self.app.cached_config)) |status|
-            tui_status.formatModelStatus(ctx.arena, status) catch "no model"
-        else
-            "no model";
-
-        const live_context_max: u32 = if (self.app.liveRuntime()) |rt|
-            rt.agent.context_window_tokens
-        else if (self.app.metrics.context_tokens_max > 0)
-            self.app.metrics.context_tokens_max
-        else
-            128000;
-
-        const live_context_used: u32 = if (self.app.liveRuntime()) |rt|
-            rt.agent.currentContextTokens()
-        else if (self.app.metrics.context_tokens_used > 0)
-            self.app.metrics.context_tokens_used
-        else
-            0;
-
-        const tui_cfg = self.app.cached_config.tui;
-        var meter_buf: [64]u8 = undefined;
-        var meter_text: []const u8 = "";
-        var meter_style = p.model_status;
-        if (tui_cfg.show_context_meter) {
-            const meter = telemetry.TelemetryTracker.formatContextBar(
-                @intCast(live_context_used),
-                @intCast(live_context_max),
-                tui_cfg.context_threshold_warn,
-                tui_cfg.context_threshold_alert,
-                &meter_buf,
-            );
-            meter_text = try ctx.arena.dupe(u8, meter.text);
-            meter_style = switch (meter.level) {
-                .normal => p.success,
-                .warn => p.notice,
-                .alert => p.error_style,
-            };
-        }
-        var velocity_buf: [32]u8 = undefined;
-        var velocity_text: []const u8 = "";
-        if (tui_cfg.show_token_velocity) {
-            const is_streaming = switch (self.app.thread.turn_view.activity) {
-                .writing_response, .thinking => true,
-                else => false,
-            };
-            const vel = telemetry.TelemetryTracker.formatVelocity(self.app.metrics.telemetry.current_tokens_per_sec, is_streaming, &velocity_buf);
-            if (vel.len > 0) {
-                velocity_text = try ctx.arena.dupe(u8, vel);
-            }
-        }
-
         const available_width = max_width -| 2;
         const layout = layoutStatusBar(
             ctx.arena,
             available_width,
-            velocity_text,
-            meter_text,
-            meter_style,
-            status_text,
+            self.velocity_text,
+            self.meter_text,
+            self.meter_style orelse p.model_status,
+            self.status_text,
             p.model_status,
         );
 
@@ -439,24 +386,12 @@ test "layoutStatusBar skips empty velocity and meter" {
 
 test "status bar rightmost segment lands at max_width - 3" {
     const gpa = std.testing.allocator;
-    const agent_mod = @import("../../agent.zig");
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
-    var app = try App.init(std.testing.io, gpa, &agent);
-    defer app.deinit();
 
-    app.cached_config = .{
-        .tui = .{
-            .show_token_velocity = true,
-            .show_context_meter = true,
-            .context_threshold_warn = 0.70,
-            .context_threshold_alert = 0.85,
-        },
+    var widget: StatusBarWidget = .{
+        .status_text = "openai · gpt-4o",
+        .meter_text = "50k / 128k [39%]",
+        .velocity_text = "10.0 tok/s",
     };
-    app.metrics.git_label = try gpa.dupe(u8, "main");
-    app.metrics.telemetry.current_tokens_per_sec = 10.0;
-    app.thread.turn_view.activity = .{ .writing_response = 0 };
-
-    var widget: StatusBarWidget = .{ .app = &app };
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
@@ -484,23 +419,11 @@ test "status bar rightmost segment lands at max_width - 3" {
 
 test "StatusBarWidget renders velocity during thinking activity" {
     const gpa = std.testing.allocator;
-    const agent_mod = @import("../../agent.zig");
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
-    var app = try App.init(std.testing.io, gpa, &agent);
-    defer app.deinit();
 
-    app.cached_config = .{
-        .tui = .{
-            .show_token_velocity = true,
-            .show_context_meter = true,
-            .context_threshold_warn = 0.70,
-            .context_threshold_alert = 0.85,
-        },
+    var widget: StatusBarWidget = .{
+        .status_text = "openai · gpt-4o",
+        .velocity_text = "25.0 tok/s",
     };
-    app.metrics.telemetry.current_tokens_per_sec = 25.0;
-    app.thread.turn_view.activity = .{ .thinking = 0 };
-
-    var widget: StatusBarWidget = .{ .app = &app };
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
