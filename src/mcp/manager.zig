@@ -282,8 +282,20 @@ pub const McpManager = struct {
         if (client.tools.items.len > 0) return;
 
         const job = self.gpa.create(ConnectJob) catch return;
-        job.gpa = self.gpa;
-        job.io = io;
+        // Full-struct init: `create` hands back undefined memory, and the
+        // fields without explicit assignments below (`failed_message`, `done`)
+        // must come from the struct defaults. An uninitialized `failed_message`
+        // reads as a non-null garbage slice, so teardown (`cancelAllConnects`,
+        // `installConnectResult`) frees a wild pointer and crashes; an
+        // uninitialized `done` reads as true, so `drainConnects` awaits a
+        // future whose worker never ran.
+        job.* = .{
+            .gpa = self.gpa,
+            .io = io,
+            .client_name = undefined,
+            .clone = undefined,
+            .future = undefined,
+        };
         job.client_name = self.gpa.dupe(u8, name) catch {
             self.gpa.destroy(job);
             return;
@@ -332,6 +344,9 @@ pub const McpManager = struct {
                 const msg = job.failed_message orelse (self.gpa.dupe(u8, "connect failed") catch return);
                 if (target.status() != .connecting) {
                     self.gpa.free(msg);
+                    // Don't leave a dangling pointer behind — `msg` may alias
+                    // `job.failed_message` when the worker allocated one.
+                    job.failed_message = null;
                     job.clone.deinit(io);
                     return;
                 }
@@ -713,4 +728,54 @@ test "McpManager does not launch a second connect while one is pending" {
     manager.syncFromConfigEx(std.testing.io, &cfg);
     manager.syncFromConfigEx(std.testing.io, &cfg);
     try std.testing.expectEqual(@as(usize, 1), manager.pending_connects.items.len);
+}
+
+test "launchConnect initializes every ConnectJob field" {
+    if (os.is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(io);
+
+    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(gpa, "lazy", "sleep 5");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+    defer cfg.deinit(gpa);
+
+    try manager.syncFromConfig(io, &cfg);
+    manager.launchConnect(io, "lazy");
+    try std.testing.expect(manager.hasPendingConnects());
+
+    // Read the job before its worker has had any chance to run: an
+    // uninitialized `failed_message` reads as a non-null garbage slice
+    // (0xAA fill in Debug) and teardown frees a wild pointer — the
+    // shutdown crash when quitting with connects still in flight.
+    const job = manager.pending_connects.items[0];
+    try std.testing.expect(job.failed_message == null);
+    try std.testing.expect(!job.done.load(.acquire));
+}
+
+test "McpManager deinit while a connect is in flight joins and tears down" {
+    if (os.is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = McpManager.init(gpa);
+    // `deinit` is the code under test — no defer.
+
+    // A server that never speaks JSON-RPC keeps the handshake in flight;
+    // a short read timeout makes the worker give up quickly once the
+    // cancel's implicit join waits for it.
+    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(gpa, "hang", "sleep 30");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+    defer cfg.deinit(gpa);
+
+    try manager.syncFromConfig(io, &cfg);
+    manager.clients.items[0].read_timeout_ms = 250;
+    manager.launchConnect(io, "hang");
+    try std.testing.expect(manager.hasPendingConnects());
+
+    // Quit while the connect is in flight: `deinit` must join the worker,
+    // reap the spawned subprocess, and free the job without crashing.
+    manager.deinit(io);
 }
