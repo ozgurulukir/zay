@@ -20,6 +20,12 @@ pub const frame_count: u16 = 120;
 /// average frame interval matches this even when the host tick is coarser.
 pub const frame_interval_ms: u32 = 42;
 
+/// Total rows the intro block occupies in the transcript: the `rows`-tall
+/// animation plus the connect-hint row the widget draws beneath it.
+/// `metrics.messageContentRows` and the widget's draw path must agree on
+/// this or ListView rows desync from rendered content.
+pub const intro_block_rows: u16 = rows + 1;
+
 const frames = blk: {
     var arr: [frame_count][]const u8 = undefined;
     for (0..frame_count) |i| {

@@ -40,7 +40,9 @@ pub fn drawLaneColumn(app: *App, ctx: vxfw.DrawContext, lane: *Thread, width: u1
         .loading_frame = app.metrics.loading_frame,
         .blackhole_frame = app.metrics.blackhole_frame,
         .blackhole_visible = &app.metrics.blackhole_visible,
-        .splash_suppressed = app.inputs.input.buf.realLength() > 0,
+        // Only the pane whose lane owns the shared input yields its splash;
+        // sibling lanes keep theirs until their own first prompt.
+        .splash_suppressed = (lane == app.thread) and app.inputs.input.buf.realLength() > 0,
     };
     const title = if (lane.title) |t| t else "untitled";
     // Active-view marker (●/○) + turn-state marker (S14): a spinner frame
