@@ -436,8 +436,7 @@ pub const BackgroundManager = struct {
 
     fn buildCompletionMessage(job: *Job, gpa: std.mem.Allocator) ![]u8 {
         const now = std.Io.Timestamp.now(job.manager.io, .awake);
-        const elapsed_ns: i128 = job.started.durationTo(now).nanoseconds;
-        const secs: u64 = @intCast(@max(elapsed_ns, 0) / std.time.ns_per_s);
+        const secs = elapsedSeconds(job.started, now);
         var elapsed_buf: [32]u8 = undefined;
         const elapsed = formatElapsed(&elapsed_buf, secs);
 
@@ -464,7 +463,7 @@ pub const BackgroundManager = struct {
         for (self.jobs.items) |job| {
             const state = job.state.load(.acquire);
             if (state != .running and state != .termination_requested) continue;
-            const elapsed = @as(u64, @intCast(@max(0, now.durationTo(job.started).toSeconds())));
+            const elapsed = elapsedSeconds(job.started, now);
             const label = try gpa.dupe(u8, job.label);
             errdefer gpa.free(label);
             const command = try gpa.dupe(u8, job.command);
@@ -686,6 +685,11 @@ pub const BackgroundManager = struct {
 };
 
 /// Render an elapsed duration compactly: `45s`, `12m 03s`, `2h 05m`.
+fn elapsedSeconds(started: std.Io.Timestamp, now: std.Io.Timestamp) u64 {
+    const elapsed_ns: i128 = started.durationTo(now).nanoseconds;
+    return @intCast(@max(elapsed_ns, 0) / std.time.ns_per_s);
+}
+
 fn formatElapsed(buf: []u8, total_seconds: u64) []const u8 {
     if (total_seconds < 60) return std.fmt.bufPrint(buf, "{d}s", .{total_seconds}) catch "?";
     const minutes = total_seconds / 60;
@@ -694,6 +698,14 @@ fn formatElapsed(buf: []u8, total_seconds: u64) []const u8 {
     const hours = minutes / 60;
     const rem_minutes = minutes % 60;
     return std.fmt.bufPrint(buf, "{d}h {d:0>2}m", .{ hours, rem_minutes }) catch "?";
+}
+
+test "elapsedSeconds measures forward time and clamps backwards time" {
+    const started = std.Io.Timestamp.fromNanoseconds(1_000_000_000);
+    const now = std.Io.Timestamp.fromNanoseconds(3_750_000_000);
+
+    try std.testing.expectEqual(@as(u64, 2), elapsedSeconds(started, now));
+    try std.testing.expectEqual(@as(u64, 0), elapsedSeconds(now, started));
 }
 
 /// Write the merged pwsh background script to a fresh `zay-pwsh-bg-<hex>.ps1`
