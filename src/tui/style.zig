@@ -56,6 +56,7 @@ pub const default_theme: Theme = .{
     .markdown_heading = .{ 252, 211, 77 },
 };
 
+// Upstream palette sources, licenses, and local adaptations are listed in attribution.md.
 /// A Catppuccin Mocha variant, user-facing name "cappuccino".
 pub const cappuccino_theme: Theme = .{
     .name = "cappuccino",
@@ -171,7 +172,29 @@ pub const gruvbox_dark: Theme = .{
     .markdown_heading = .{ 250, 189, 47 }, // yellow
 };
 
-const themes = [_]Theme{ default_theme, cappuccino_theme, tokyo_night, dracula, nord, gruvbox_dark };
+pub const okabe_ito: Theme = .{
+    .name = "okabe_ito",
+    .thinking_blue = .{ 86, 180, 233 }, // sky blue
+    .user_yellow = .{ 240, 228, 66 }, // yellow
+    .success_green = .{ 0, 158, 115 }, // bluish green
+    .failure_red = .{ 213, 94, 0 }, // vermillion
+    .accent_orange = .{ 230, 159, 0 }, // orange
+    .skill_purple = .{ 204, 121, 167 }, // reddish purple
+    .lane_pink = .{ 204, 121, 167 }, // reddish purple
+    .muted_gray = .{ 160, 160, 160 },
+    .selection_bg = .{ 37, 55, 70 },
+    .amber_yellow = .{ 240, 228, 66 }, // yellow
+    .white = .{ 245, 245, 245 },
+    .code_blue = .{ 86, 180, 233 }, // sky blue
+    .faint_add_bg = .{ 20, 48, 40 },
+    .faint_del_bg = .{ 54, 38, 25 },
+    .body = .{ 229, 229, 229 },
+    .background = .{ 18, 21, 26 },
+    .blackhole_orange = .{ 230, 159, 0 }, // orange
+    .markdown_heading = .{ 240, 228, 66 }, // yellow
+};
+
+const themes = [_]Theme{ default_theme, cappuccino_theme, tokyo_night, dracula, nord, gruvbox_dark, okabe_ito };
 
 /// The authoritative builtin theme list, in canonical order. Exposed for the
 /// theme picker so it lists exactly the themes `resolveTheme` validates
@@ -233,7 +256,7 @@ pub fn parseThemeJson(gpa: std.mem.Allocator, value: std.json.Value) !Theme {
     return theme;
 }
 
-/// The registry-aware theme catalogue: the 6 builtins seeded by `init` (gpa
+/// The registry-aware theme catalogue: the 7 builtins seeded by `init` (gpa
 /// only), then user JSON themes loaded by `loadCustom` from the standard
 /// directories (or an explicit `customThemesDir`, which replaces the default
 /// scan — m5). `slice()`/`resolve()` are the registry-aware views; the pure
@@ -243,7 +266,7 @@ pub const ThemeRegistry = struct {
     all_themes: std.ArrayList(Theme) = .empty,
     custom_names: std.ArrayList([]const u8) = .empty,
 
-    /// Seed the 6 builtins. Needs only `gpa` (no `io`/paths), so `App.init`
+    /// Seed the 7 builtins. Needs only `gpa` (no `io`/paths), so `App.init`
     /// and tests can build a non-empty registry without a runtime. A missing
     /// themes dir is a no-op, never a startup failure.
     pub fn init(gpa: std.mem.Allocator) !ThemeRegistry {
@@ -666,8 +689,8 @@ test "spaced theme names do not match (underscore convention)" {
 
 test "allThemes returns the exact builtin set with unique non-empty names" {
     const list = allThemes();
-    try std.testing.expectEqual(@as(usize, 6), list.len);
-    const expected = [_][]const u8{ "default", "cappuccino", "tokyo_night", "dracula", "nord", "gruvbox_dark" };
+    try std.testing.expectEqual(@as(usize, 7), list.len);
+    const expected = [_][]const u8{ "default", "cappuccino", "tokyo_night", "dracula", "nord", "gruvbox_dark", "okabe_ito" };
     for (list, expected) |theme, name| {
         try std.testing.expectEqualStrings(name, theme.name);
         try std.testing.expect(theme.name.len > 0);
@@ -766,13 +789,13 @@ test "parseThemeJson rejects low selection_bg/background channel delta (m6)" {
     try std.testing.expectError(error.InsufficientContrast, parseThemeJson(gpa, parsed.value));
 }
 
-test "ThemeRegistry.init seeds the 6 builtins (gpa only)" {
+test "ThemeRegistry.init seeds the 7 builtins (gpa only)" {
     const gpa = std.testing.allocator;
     var registry = try ThemeRegistry.init(gpa);
     defer registry.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, 6), registry.slice().len);
+    try std.testing.expectEqual(@as(usize, 7), registry.slice().len);
     try std.testing.expectEqualStrings("default", registry.slice()[0].name);
-    try std.testing.expectEqualStrings("gruvbox_dark", registry.slice()[5].name);
+    try std.testing.expectEqualStrings("okabe_ito", registry.slice()[6].name);
 }
 
 test "ThemeRegistry.loadCustom with missing dirs is a no-op (n2)" {
@@ -782,7 +805,7 @@ test "ThemeRegistry.loadCustom with missing dirs is a no-op (n2)" {
     var registry = try ThemeRegistry.init(gpa);
     defer registry.deinit(gpa);
     try registry.loadCustom(gpa, std.testing.io, "/nonexistent/home", "/nonexistent/cwd", null);
-    try std.testing.expectEqual(@as(usize, 6), registry.slice().len);
+    try std.testing.expectEqual(@as(usize, 7), registry.slice().len);
 }
 
 test "ThemeRegistry.loadCustom loads a custom theme and resolve finds it case-insensitively" {
@@ -812,7 +835,7 @@ test "ThemeRegistry.loadCustom loads a custom theme and resolve finds it case-in
     var registry = try ThemeRegistry.init(gpa);
     defer registry.deinit(gpa);
     try registry.loadCustom(gpa, io, home_dir, "/nonexistent/cwd", null);
-    try std.testing.expectEqual(@as(usize, 7), registry.slice().len);
+    try std.testing.expectEqual(@as(usize, 8), registry.slice().len);
     // Case-insensitive resolve finds the custom slug.
     const resolved = registry.resolve("MY_THEME");
     try std.testing.expectEqualStrings("my_theme", resolved.name);
@@ -865,7 +888,7 @@ test "ThemeRegistry.loadCustom customThemesDir replaces the default scan (m5)" {
     // Setting customThemesDir scans ONLY that dir — the default-location theme
     // is ignored.
     try registry.loadCustom(gpa, io, home_dir, "/nonexistent/cwd", custom_dir);
-    try std.testing.expectEqual(@as(usize, 7), registry.slice().len);
+    try std.testing.expectEqual(@as(usize, 8), registry.slice().len);
     try std.testing.expect(registry.resolve("from_custom").name.len > 0);
     try std.testing.expectEqual(default_theme, registry.resolve("from_default"));
 }

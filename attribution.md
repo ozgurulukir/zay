@@ -1,8 +1,61 @@
 # Third-party attributions
 
-Zay vendors a small number of third-party libraries and compiles a few
-build-time dependencies into the binary. Each entry lists the source,
-license, and any local modifications.
+Zay vendors a small number of third-party libraries, compiles a few
+build-time dependencies into the binary, and adapts a third-party color
+palette. Each entry lists the source, license or attribution terms, and any
+local modifications.
+
+## Okabe–Ito color palette
+
+- **Source:** <https://jfly.uni-koeln.de/color/> (Color Universal Design by
+  Masataka Okabe and Kei Ito)
+- **Reference:** Okabe, M. and Ito, K. (2008), *Color Universal Design (CUD):
+  How to make figures and presentations that are friendly to colorblind
+  people*.
+- **Used for:** the builtin `okabe_ito` TUI theme in `src/tui/style.zig`.
+- **Local adaptation:** the palette colors are assigned to Zay's semantic
+  theme slots and paired with a dark background.
+- **Attribution:** the source page asks users to mention Masataka Okabe and
+  Kei Ito as a reference. It does not state a software license for the palette.
+
+## Built-in themes based on third-party palettes
+
+Only palette colors and names are adapted; no upstream theme implementation
+is copied. Zay maps the source colors to its semantic theme slots and adds
+colors for UI-specific roles.
+
+### Catppuccin Mocha (`cappuccino`)
+
+- **Source:** <https://github.com/catppuccin/catppuccin>
+- **License:** MIT — Copyright (c) 2021 Catppuccin.
+- **Used for:** the builtin `cappuccino` TUI theme in `src/tui/style.zig`.
+
+### Tokyo Night (`tokyo_night`)
+
+- **Source:** <https://github.com/enkia/tokyo-night-vscode-theme>
+- **License:** MIT (declared in the upstream package metadata); published by
+  Enkia.
+- **Used for:** the builtin dark `tokyo_night` TUI theme in
+  `src/tui/style.zig`.
+
+### Dracula (`dracula`)
+
+- **Source:** <https://github.com/dracula/dracula-theme>
+- **License:** MIT — Copyright (c) 2023 Dracula Theme.
+- **Used for:** the builtin `dracula` TUI theme in `src/tui/style.zig`.
+
+### Nord (`nord`)
+
+- **Source:** <https://github.com/nordtheme/nord>
+- **License:** MIT — Copyright (c) 2016-present Sven Greb.
+- **Used for:** the builtin `nord` TUI theme in `src/tui/style.zig`.
+
+### Gruvbox Dark (`gruvbox_dark`)
+
+- **Source:** <https://github.com/morhetz/gruvbox>
+- **License:** MIT/X11 — Copyright (c) 2017 Pavel Pertsev.
+- **Used for:** the builtin dark `gruvbox_dark` TUI theme in
+  `src/tui/style.zig`.
 
 ## fzy (fuzzy file matching)
 
