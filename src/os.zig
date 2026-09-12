@@ -78,6 +78,14 @@ fn signalTree(pid: std.posix.pid_t, sig: std.posix.SIG) void {
 }
 
 fn awaitExit(io: std.Io, pid: std.posix.pid_t, grace_ms: u64) bool {
+    if (comptime tag != .linux) {
+        // No portable zombie-aware liveness probe: the signal-0 trick does not
+        // typecheck against libc's translated SIG enum (comptime_int is not a
+        // SIG), and getpgid cannot distinguish exit either. Assume alive for
+        // the full grace — the SIGKILL then settles it. Correct, just slower.
+        io.sleep(.fromMilliseconds(@intCast(grace_ms)), .awake) catch {};
+        return false;
+    }
     var waited_ms: u64 = 0;
     while (true) {
         if (processExited(pid)) return true;
@@ -91,29 +99,25 @@ fn awaitExit(io: std.Io, pid: std.posix.pid_t, grace_ms: u64) bool {
     }
 }
 
-/// Exit check that leaves the reap to the caller. On Linux the kernel fills
-/// `siginfo` only when the child is in a waitable state, so the pid field is
-/// pre-zeroed to make the "no status" answer distinguishable; any waitid error
-/// (ECHILD among them) is reported as exited — nothing is left to signal.
+/// Exit check that leaves the reap to the caller. The kernel fills `siginfo`
+/// only when the child is in a waitable state, so the pid field is pre-zeroed
+/// to make the "no status" answer distinguishable; any waitid error (ECHILD
+/// among them) is reported as exited — nothing is left to signal.
+/// Linux only: `awaitExit` never probes on the other POSIX targets.
 fn processExited(pid: std.posix.pid_t) bool {
-    if (comptime tag == .linux) {
-        var info: std.os.linux.siginfo_t = std.mem.zeroes(std.os.linux.siginfo_t);
-        const rc = std.os.linux.waitid(
-            .PID,
-            pid,
-            &info,
-            std.os.linux.W.EXITED | std.os.linux.W.NOHANG | std.os.linux.W.NOWAIT,
-            null,
-        );
-        if (std.os.linux.errno(rc) != .SUCCESS) return true;
-        // The kernel fills `siginfo` (with the child's pid) only when the
-        // child is in a waitable state — a zombie counts as exited here.
-        return info.fields.common.first.piduid.pid != 0;
-    }
-    // Non-Linux POSIX fallback: zombie-blind — correct escalation, but it pays
-    // the full grace when SIGTERM lands instantly.
-    std.posix.kill(pid, 0) catch return true;
-    return false;
+    comptime assert(tag == .linux);
+    var info: std.os.linux.siginfo_t = std.mem.zeroes(std.os.linux.siginfo_t);
+    const rc = std.os.linux.waitid(
+        .PID,
+        pid,
+        &info,
+        std.os.linux.W.EXITED | std.os.linux.W.NOHANG | std.os.linux.W.NOWAIT,
+        null,
+    );
+    if (std.os.linux.errno(rc) != .SUCCESS) return true;
+    // The kernel fills `siginfo` (with the child's pid) only when the
+    // child is in a waitable state — a zombie counts as exited here.
+    return info.fields.common.first.piduid.pid != 0;
 }
 
 /// Spawn `bash -c <command>` in its own process group — the shape the shell
