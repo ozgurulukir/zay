@@ -264,6 +264,48 @@ test "M2: a no-provider delivery clears the mirror in lockstep with the agent qu
     try std.testing.expect(!app.thread.transcript.containsText("job result"));
 }
 
+test "no-provider delivery gates on the target lane, not the focused lane" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var home = try isolatedHome(gpa, io);
+    defer home.deinit(gpa);
+    const runtime = try createNoProviderRuntime(gpa, io, home.path);
+    defer gpa.destroy(runtime);
+    defer runtime.agent.deinit();
+    var app = try tui.App.init(io, gpa, &runtime.agent);
+    defer app.deinit();
+    // Target lane (primary) is live but has no provider.
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = false } };
+
+    // Focus an idle second lane so `app.thread` is NOT the delivery target.
+    // The gate must read the target lane's runtime: keyed off `app.thread`
+    // it drops the target's queued message (focused lane no-provider) or
+    // starts a doomed turn (focused lane has a provider, target doesn't).
+    const focused = try gpa.create(tui.Thread);
+    focused.* = .{};
+    try app.threads.append(focused);
+    app.thread = focused;
+
+    try app.background_modal_state.pending.append(app.gpa, .{
+        .owner_generation = 1,
+        .notice = try gpa.dupe(u8, "job (cmd) finished — exit 0"),
+        .message = try gpa.dupe(u8, "job result"),
+    });
+
+    _ = try deliverPendingBackground(&app);
+
+    // The target lane took the no-provider branch (queue flushed + cleared,
+    // no doomed turn); the focused lane stayed untouched.
+    const target = app.threads.slice()[0];
+    try std.testing.expectEqual(@as(u32, 0), runtime.agent.message_queue.len());
+    try std.testing.expectEqual(@as(usize, 0), target.queued.items.len);
+    try std.testing.expect(!target.turn.isActive());
+    try std.testing.expect(!focused.turn.isActive());
+    try std.testing.expectEqual(@as(usize, 0), app.background_modal_state.pending.items.len);
+    try std.testing.expect(target.transcript.containsText("finished — exit 0"));
+    try std.testing.expect(!target.transcript.containsText("job result"));
+}
+
 test "INV-BG-OWNER-1: late background completion drops cleanly when owning lane is deleted" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

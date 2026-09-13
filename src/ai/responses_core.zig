@@ -138,6 +138,10 @@ pub const Client = struct {
         target.transport.authorization = target.authorization;
         target.transport.profile_headers = responses_config.headers;
         target.transport.provider_headers = target.provider_headers_owned;
+        // Borrowed like the profile table: ResponsesConfig.user_agent must
+        // reference permanent storage, and the codex profile's "zay" identity
+        // is load-bearing (chatgpt.com backend 403s unknown clients).
+        target.transport.user_agent = responses_config.user_agent;
         target.transport.header_context = .{
             .session_id = target.config.session_id,
             .account_id = target.config.account_id,
@@ -629,4 +633,22 @@ test "extraHeaders materializes provider headers with zen routing and user prece
     try std.testing.expectEqualStrings("sess-32", headers[0].value);
     try std.testing.expectEqualStrings(provider_headers.zen_client_header, headers[1].name);
     try std.testing.expectEqualStrings("custom-client", headers[1].value);
+}
+
+test "init wires the profile User-Agent into the shared transport" {
+    const gpa = std.testing.allocator;
+    var client: Client = undefined;
+    try client.init(gpa, std.testing.io, .{
+        .base_url = "http://127.0.0.1:1",
+        .api_key = "test-key",
+        .model = "test-model",
+        .system_prompt = "",
+    }, .{ .log_name = "test", .user_agent = "test-agent" });
+    defer client.deinit();
+
+    // A null here silently downgrades every Responses request (including the
+    // codex path, whose chatgpt.com backend checks client identity) to the
+    // stdlib default User-Agent.
+    try std.testing.expect(client.transport.user_agent != null);
+    try std.testing.expectEqualStrings("test-agent", client.transport.user_agent.?);
 }
