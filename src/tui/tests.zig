@@ -183,17 +183,25 @@ test "input text rows track the line count" {
         .cell_size = .{ .width = 10, .height = 20 },
     };
 
-    try std.testing.expectEqual(@as(u16, 1), try app.inputTextRows(ctx, 80));
+    const text = try app.peekInput();
+    defer app.gpa.free(text);
+    try std.testing.expectEqual(@as(u16, 1), input_mod.wrappedTextRows(ctx, text, 80));
 
     try app.inputs.input.insertSliceAtCursor("a\nb\nc");
-    try std.testing.expectEqual(@as(u16, 3), try app.inputTextRows(ctx, 80));
+    const text_3 = try app.peekInput();
+    defer app.gpa.free(text_3);
+    try std.testing.expectEqual(@as(u16, 3), input_mod.wrappedTextRows(ctx, text_3, 80));
 
     try app.inputs.input.insertSliceAtCursor("defgh");
-    try std.testing.expectEqual(@as(u16, 4), try app.inputTextRows(ctx, 4));
+    const text_4 = try app.peekInput();
+    defer app.gpa.free(text_4);
+    try std.testing.expectEqual(@as(u16, 4), input_mod.wrappedTextRows(ctx, text_4, 4));
 
     // The input keeps growing with the line count (no fixed cap).
     try app.inputs.input.insertSliceAtCursor("\n\n\n\n\n\n\n\n");
-    try std.testing.expectEqual(@as(u16, 12), try app.inputTextRows(ctx, 4));
+    const text_12 = try app.peekInput();
+    defer app.gpa.free(text_12);
+    try std.testing.expectEqual(@as(u16, 12), input_mod.wrappedTextRows(ctx, text_12, 4));
 }
 
 test "file picker selection replaces the active mention without corrupting input buffer" {
@@ -843,8 +851,8 @@ test "begin submit defers while a manual compact is pending and keeps the input"
 
     // A manual /compact is mid-flight: the summarizer will swap the context on
     // the UI thread, so a new turn must not race that reload.
-    agent.manual_compact_pending = true;
-    agent.manual_compact_started = true;
+    agent.compactor.manual_pending = true;
+    agent.compactor.manual_started = true;
 
     try app.inputs.input.insertSliceAtCursor("hello");
     try std.testing.expect(!try app.beginSubmit());
@@ -911,10 +919,10 @@ test "compact request appends an animated status row while the summary is produc
     // waiting row and appends the error notice — no lingering spinner that
     // could re-animate with a later turn.
     var spins: u32 = 0;
-    while (!agent.compactor.stateIs(.failed) and spins < 10_000) : (spins += 1) {
+    while (!agent.compactor.core.stateIs(.failed) and spins < 10_000) : (spins += 1) {
         std.testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
-    try std.testing.expect(agent.compactor.stateIs(.failed));
+    try std.testing.expect(agent.compactor.core.stateIs(.failed));
     try std.testing.expect(try compaction_lifecycle.drainManualCompactions(&app));
 
     messages = app.thread.transcript.messages.items;
@@ -1002,7 +1010,7 @@ test "spinner frame advances during manual compact with no active turn" {
     // waiting row and lane glyph. (A `.none` compaction client would make
     // `pollManualCompact` treat this as a torn-down client and abort it.)
     agent.compaction_client = .{ .openai_compatible = &client };
-    agent.manual_compact_pending = true;
+    agent.compactor.manual_pending = true;
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -1172,7 +1180,14 @@ test "queued prompt draws above input at minimum input height" {
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    var input_widget: input_mod.InputWidget = .{ .app = &app };
+    var input_widget: input_mod.InputWidget = .{ .props = .{
+        .input_field = &app.inputs.input,
+        .input_text = try std.mem.concat(arena.allocator(), u8, &.{ app.inputs.input.buf.firstHalf(), app.inputs.input.buf.secondHalf() }),
+        .input_cursor = app.inputs.input.buf.firstHalf().len,
+        .input_wrap_width = &app.input_wrap_width,
+        .queued = app.thread.queued.items,
+        .queued_selection = app.nav.queued_selection,
+    } };
     const ctx: vxfw.DrawContext = .{
         .arena = arena.allocator(),
         .min = .{},
@@ -1218,7 +1233,14 @@ test "alt navigation and ctrl-steer drive the queued message line" {
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    var input_widget: input_mod.InputWidget = .{ .app = &app };
+    var input_widget: input_mod.InputWidget = .{ .props = .{
+        .input_field = &app.inputs.input,
+        .input_text = try std.mem.concat(arena.allocator(), u8, &.{ app.inputs.input.buf.firstHalf(), app.inputs.input.buf.secondHalf() }),
+        .input_cursor = app.inputs.input.buf.firstHalf().len,
+        .input_wrap_width = &app.input_wrap_width,
+        .queued = app.thread.queued.items,
+        .queued_selection = app.nav.queued_selection,
+    } };
     const ctx: vxfw.DrawContext = .{
         .arena = arena.allocator(),
         .min = .{},

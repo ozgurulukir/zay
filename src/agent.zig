@@ -30,6 +30,7 @@ const MessageQueue = agent_queue.MessageQueue;
 const ToolBatch = tool_batch_mod.ToolBatch;
 
 const agent_compactor = @import("agent/compactor.zig");
+const auto_compactor_mod = @import("context/auto_compactor.zig");
 const snapshotter_mod = @import("agent/snapshotter.zig");
 const Compactor = agent_compactor.Compactor;
 
@@ -100,15 +101,6 @@ pub const Agent = struct {
     /// Context window of the connected model, in tokens. Set by the runtime
     /// when a client is attached. 0 means unknown — compaction is disabled.
     context_window_tokens: u32 = 0,
-    /// Token usage reported by the most recent turn, the anchor for the
-    /// compaction watermark estimate. Null until the first turn completes or
-    /// after a compaction / branch switch (forcing a full re-estimate).
-    last_usage: ?ai.Usage = null,
-    /// Message count when `last_usage` was captured (just after the assistant
-    /// reply landed). Messages beyond this index are estimated and added to
-    /// `last_usage`, so tool results not yet reflected in provider usage still
-    /// count toward the watermark.
-    last_usage_anchor_count: u32 = 0,
     /// Dedicated client for background summarization, distinct from `client` so
     /// the two never share a connection. `.none` disables compaction.
     compaction_client: ai.LanguageModel = .none,
@@ -133,17 +125,10 @@ pub const Agent = struct {
     /// manager is read at every `runToolBatch` to route plugin tool
     /// calls through the shared dispatcher.
     plugin_manager: ?*lua_mod.PluginManager = null,
-    /// Background summarizer state machine.
-    compactor: Compactor = .{},
-    /// A manual `/compact` was requested and is mid-flight. The TUI drives it
-    /// by polling `pollManualCompact` from its tick loop instead of blocking
-    /// on `joinCompactor`, so the UI stays live while the summarizer runs.
-    manual_compact_pending: bool = false,
-    /// Whether the manual compact's own summarizer run has been started, as
-    /// opposed to still waiting on a stale auto-run to land first. When false
-    /// and the compactor reaches a terminal state, that state belongs to the
-    /// stale run and must be discarded before starting the manual one.
-    manual_compact_started: bool = false,
+    /// The auto-compaction state machine (watermark, breaker, manual-compact
+    /// phases, summarizer thread) — see `context/auto_compactor.zig`. The
+    /// Agent keeps only the sequencer calls and the narrow Env callbacks.
+    compactor: auto_compactor_mod.AutoCompactor = .{},
     /// Config-driven compaction policy. Set by the runtime from
     /// `config.context.compaction`; defaults match the old hardcoded
     /// constants so agents created without a config still compact.
@@ -172,16 +157,6 @@ pub const Agent = struct {
     /// headless/tests = no gate. Acquired around each `client.prompt` so at
     /// most `permits` requests are in flight at once (see `request_limiter.zig`).
     request_limiter: ?*request_limiter_mod.RequestLimiter = null,
-    /// Consecutive background-compaction failures. The automatic path
-    /// disables itself (emitting one notice) once this reaches
-    /// `compaction_failure_limit`; `/compact` stays available (TD-6).
-    compaction_failures: u32 = 0,
-    /// Whether the one-shot "automatic compaction disabled" notice was
-    /// already emitted for this trip. Reset on a successful apply.
-    compaction_breaker_notified: bool = false,
-    /// Whether the one-shot "context full but nothing to cut" notice was
-    /// already emitted. Reset on a successful apply.
-    compaction_stuck_notified: bool = false,
     message_queue: MessageQueue = .{},
     message_queue_storage: [agent_queue.capacity]QueuedUserMessage = undefined,
     message_queue_mutex: std.Io.Mutex = .init,
@@ -458,15 +433,7 @@ pub const Agent = struct {
 
         /// The fixed notice kinds `maybeCompact` can emit while it degrades
         /// gracefully instead of looping into provider overflow errors.
-        pub const CompactionNotice = enum {
-            /// Automatic compaction disabled after 3 consecutive failures.
-            breaker_tripped,
-            /// Past the swap watermark but nothing can be cut — the recent
-            /// history already fits the retention budget.
-            stuck,
-            /// A synchronous overflow wait is about to join the summarizer.
-            waiting,
-        };
+        pub const CompactionNotice = auto_compactor_mod.CompactionNotice;
 
         /// See the `length_cut` event.
         pub const LengthCut = enum {
@@ -476,10 +443,7 @@ pub const Agent = struct {
 
         /// Emitted after the agent replaces summarized history with a compaction
         /// summary. Token counts are estimates for display only.
-        pub const HistoryCompacted = struct {
-            tokens_before: u32,
-            tokens_after: u32,
-        };
+        pub const HistoryCompacted = auto_compactor_mod.HistoryCompacted;
 
         pub const ToolCallFinished = struct {
             index: u32,
@@ -1269,281 +1233,117 @@ pub const Agent = struct {
     /// boundary references a tree entry id and the projection emits from it to
     /// the leaf. Best-effort: every failure is logged and swallowed so
     /// compaction never aborts the turn.
-    fn maybeCompact(self: *Agent, listener: anytype) void {
-        if (!self.compaction_settings.auto) return;
-        if (self.compaction_client == .none) return;
-        if (self.context_window_tokens == 0) return;
-        if (self.context_manager.session_writer == null) return;
-
-        // Circuit breaker (TD-6): after `compaction_failure_limit` consecutive
-        // failures the automatic path backs off so it stops respawning a doomed
-        // summarizer every turn. One notice is emitted; `/compact` is not gated.
-        if (self.compactionBreakerTripped()) {
-            if (!self.compaction_breaker_notified) {
-                self.compaction_breaker_notified = true;
-                emitCompactionNotice(listener, .breaker_tripped);
-            }
-            return;
-        }
-
-        const used = self.currentContextTokens();
-        const threshold = self.compaction_settings.threshold;
-
-        // Past the swap watermark: install the ready background summary.
-        if (compaction.shouldSwap(used, self.context_window_tokens, threshold)) {
-            Agent.applyReadyCompaction(@TypeOf(listener), self, listener) catch |err| log.warn("compaction apply failed: {s}", .{@errorName(err)});
-        }
-
-        // Past the start watermark: kick off the summary so it is ready by the
-        // time the footprint reaches the swap watermark.
-        if (compaction.shouldStartSummary(used, self.context_window_tokens, threshold) and
-            self.compactor.stateIs(.idle))
-        {
-            self.startCompaction() catch |err| switch (err) {
-                // Nothing worth cutting while already past the swap watermark:
-                // emit a one-shot notice instead of looping silently into
-                // provider overflow errors (TD-6).
-                error.NothingToCompact => if (compaction.shouldSwap(used, self.context_window_tokens, threshold)) {
-                    if (!self.compaction_stuck_notified) {
-                        self.compaction_stuck_notified = true;
-                        emitCompactionNotice(listener, .stuck);
-                    }
-                },
-                else => log.warn("compaction start failed: {s}", .{@errorName(err)}),
-            };
-        }
-
-        // If used tokens still exceed the swap watermark and compaction is running,
-        // wait synchronously so prompt sent to LLM fits within window. The wait
-        // can take up to the (user-configurable) request timeout, so make it
-        // visible before blocking (H2).
-        if (compaction.shouldSwap(self.currentContextTokens(), self.context_window_tokens, threshold) and
-            self.compactor.stateIs(.running))
-        {
-            emitCompactionNotice(listener, .waiting);
-            self.joinCompactor();
-            Agent.applyReadyCompaction(@TypeOf(listener), self, listener) catch |err| log.warn("compaction apply failed: {s}", .{@errorName(err)});
-        }
-    }
-
-    /// Manually trigger a full compaction cycle: snapshot, summarize, swap.
-    /// Synchronous wrapper over `requestManualCompact` + `pollManualCompact`,
-    /// kept for the headless/test path. The TUI does NOT use this — it drives
-    /// the two phases from its tick loop so the UI never blocks on the
-    /// summarizer request. Returns the token counts before and after on
-    /// success, or an error describing what went wrong.
-    pub fn forceCompact(self: *Agent) !Event.HistoryCompacted {
-        try self.requestManualCompact();
-        // A deferred start (a stale auto-run was still producing) resolves on
-        // the first poll; loop until the manual run lands. The poll returns
-        // non-null or an error once the state resolves, so this always
-        // terminates. The yield bound is a defensive guard against a state
-        // that never resolves (e.g. a torn-down client the poll failed to
-        // clear).
-        var spins: u32 = 0;
-        while (spins < manual_compact_poll_spins_max) : (spins += 1) {
-            if (try self.pollManualCompact()) |info| return info;
-            std.Thread.yield() catch {};
-        }
-        return error.CompactionNotReady;
-    }
-
-    /// Non-blocking phase 1 of the manual compact: snapshot the prefix and
-    /// hand it to the summarizer thread, then return. The UI polls
-    /// `pollManualCompact` to learn when the summary lands. A stale
-    /// auto-compaction still in flight is not joined here — the poll discards
-    /// it when it lands and starts the manual run then, so this never blocks
-    /// on the summarizer's request.
-    pub fn requestManualCompact(self: *Agent) !void {
-        if (self.compaction_client == .none) return error.NoCompactionClient;
-        if (self.context_window_tokens == 0) return error.UnknownContextWindow;
-        if (self.context_manager.session_writer == null) return error.NoSessionWriter;
-        if (self.manual_compact_pending) return error.CompactionInProgress;
-
-        if (self.compactor.stateIs(.running)) {
-            // A stale auto-run is still producing. Wait for it to land; the
-            // poll discards it and starts the manual run (TD-1).
-            self.manual_compact_pending = true;
-            self.manual_compact_started = false;
-            return;
-        }
-
-        // Instant when no thread is alive: a `.ready`/`.failed` residue is
-        // drained, then the manual run starts.
-        self.drainBackgroundCompaction();
-        try self.startCompaction();
-        self.manual_compact_pending = true;
-        self.manual_compact_started = true;
-    }
-
-    /// Non-blocking phase 2 of the manual compact: polled by the UI each tick
-    /// while `manual_compact_pending`. Returns null while the summarizer is
-    /// still producing, the token-count event once the manual summary is
-    /// installed, or an error describing what went wrong. Never blocks —
-    /// `joinCompactor` is only reached once the thread has already finished.
-    pub fn pollManualCompact(self: *Agent) !?Event.HistoryCompacted {
-        if (!self.manual_compact_pending) return null;
-
-        // Client torn down mid-flight (disconnect/reconnect): the summarizer
-        // was drained, so abort the manual compact rather than strand the
-        // submit gate forever.
-        if (self.compaction_client == .none) {
-            self.manual_compact_pending = false;
-            self.manual_compact_started = false;
-            return error.CompactionFailed;
-        }
-
-        const state = self.compactor.state.load(.acquire);
-        if (state == .running or state == .idle) return null;
-
-        if (!self.manual_compact_started) {
-            // The run that just landed is the stale auto one — discard it,
-            // then start the manual run (TD-1).
-            self.joinCompactor();
-            self.finishCompactor();
-            self.startCompaction() catch |err| {
-                self.manual_compact_pending = false;
-                self.manual_compact_started = false;
-                return err;
-            };
-            self.manual_compact_started = true;
-            return null;
-        }
-
-        // The manual run landed.
-        self.joinCompactor();
-        defer self.finishCompactor();
-        self.manual_compact_pending = false;
-        self.manual_compact_started = false;
-        if (state == .failed) return error.CompactionFailed;
-
-        const result = self.compactor.result.?;
-        const session_writer = self.context_manager.session_writer.?;
-        const tokens_before = self.estimateContextTokens();
-        try session_writer.appendCompaction(result.first_kept_id.slice(), result.stored_summary);
-        try self.reloadFromSession();
-        self.resetContextUsage();
-        // A successful manual compact proves the pipeline works: reset the
-        // breaker so automatic compaction resumes.
-        self.compaction_failures = 0;
-        self.compaction_breaker_notified = false;
-        self.compaction_stuck_notified = false;
+    /// Build the per-call environment for the auto-compactor from the live
+    /// fields. Rebuilt on every call, so nothing borrows stale state across
+    /// a client swap or session re-attach.
+    fn compactionEnv(self: *Agent) auto_compactor_mod.Env {
         return .{
-            .tokens_before = tokens_before,
-            .tokens_after = self.estimateContextTokens(),
-        };
-    }
-
-    /// Snapshot the frozen prefix and hand it to the summarizer thread. The
-    /// snapshot (rendered text + first-kept entry id) is self-contained, so the
-    /// thread never touches live history.
-    fn startCompaction(self: *Agent) !void {
-        const session_writer = self.context_manager.session_writer orelse return;
-        // Scale the keep-recent budget by the ratio of the provider's real
-        // token count to this estimator's, so languages where chars/4
-        // undercounts (CJK ≈ 1.5 chars/token) keep fewer messages and still
-        // compact below the swap watermark (TD-6). Falls back to the base
-        // budget when there is no usage anchor yet.
-        const base_keep = compaction.keepRecentTokens(self.context_window_tokens, self.compaction_settings.keep_recent_tokens);
-        const recent_tokens = compaction.calibrateKeepBudget(base_keep, self.currentContextTokens(), self.estimateContextTokens());
-        const cut = (try session_writer.compactionCut(self.gpa, recent_tokens)) orelse return error.NothingToCompact;
-        self.compactor.result = null;
-        self.compactor.job = .{
+            .ctx = self,
             .gpa = self.gpa,
             .io = self.io,
             .client = self.compaction_client,
             .limiter = self.request_limiter,
-            .first_kept_id = cut.first_kept_id,
-            .prefix_text = cut.prefix_text,
-        };
-        self.compactor.state.store(.running, .release);
-        self.compactor.thread = std.Thread.spawn(.{}, agent_compactor.Compactor.runThread, .{&self.compactor}) catch |err| {
-            self.gpa.free(cut.prefix_text);
-            self.compactor.job = null;
-            self.compactor.state.store(.idle, .release);
-            return err;
+            .session = self.context_manager.session_writer,
+            .context_window_tokens = self.context_window_tokens,
+            .settings = self.compaction_settings,
+            .historyCount = historyCount,
+            .estimateTrailing = estimateTrailingTokensCb,
+            .estimateAll = estimateAllTokensCb,
+            .swap = swapHistory,
         };
     }
 
-    /// Install a finished background summary: write the boundary, reproject, and
-    /// emit the notice — instant, because the summary already exists. A failed
-    /// run is logged and discarded. No-op while idle or still running.
-    fn applyReadyCompaction(comptime L: type, self: *Agent, listener: L) !void {
-        const state = self.compactor.state.load(.acquire);
-        if (state == .idle or state == .running) return;
-        self.joinCompactor();
-        defer self.finishCompactor();
-        if (state == .failed) {
-            self.compaction_failures +|= 1;
-            log.warn("background compaction failed ({d}/{d})", .{ self.compaction_failures, compaction_failure_limit });
-            return;
-        }
-        const result = self.compactor.result.?;
-        const session_writer = self.context_manager.session_writer orelse return;
-        const tokens_before = self.estimateContextTokens();
-        try session_writer.appendCompaction(result.first_kept_id.slice(), result.stored_summary);
+    fn historyCount(ctx: *anyopaque) u32 {
+        const self: *Agent = @ptrCast(@alignCast(ctx));
+        return self.context_manager.count();
+    }
+
+    fn estimateTrailingTokensCb(ctx: *anyopaque, anchor_count: u32) u32 {
+        const self: *Agent = @ptrCast(@alignCast(ctx));
+        return context_assembly.estimatePrunedTokensRange(
+            self.context_manager.items(),
+            anchor_count,
+            self.compaction_settings.keep_recent_tool_turns,
+            self.compaction_settings.historical_tool_cap_bytes,
+        );
+    }
+
+    fn estimateAllTokensCb(ctx: *anyopaque) u32 {
+        const self: *Agent = @ptrCast(@alignCast(ctx));
+        return context_assembly.estimatePrunedTokensRange(
+            self.context_manager.items(),
+            0,
+            self.compaction_settings.keep_recent_tool_turns,
+            self.compaction_settings.historical_tool_cap_bytes,
+        );
+    }
+
+    /// Persist the compaction boundary, then reproject the cache — the
+    /// swap. Order is the persist-before-cache invariant: the session tree
+    /// is the source of truth, so a failed reprojection leaves the live
+    /// cache intact instead of stranded with only the system prompt (TD-5).
+    fn swapHistory(ctx: *anyopaque, first_kept_id: []const u8, stored_summary: []const u8) anyerror!void {
+        const self: *Agent = @ptrCast(@alignCast(ctx));
+        const session_writer = self.context_manager.session_writer orelse return error.NoSessionWriter;
+        try session_writer.appendCompaction(first_kept_id, stored_summary);
         try self.reloadFromSession();
-        self.resetContextUsage();
-        // A successful apply proves the pipeline works: clear the breaker and
-        // re-arm the one-shot stuck notice for a future episode.
-        self.compaction_failures = 0;
-        self.compaction_breaker_notified = false;
-        self.compaction_stuck_notified = false;
-        try listener.emit(.{ .history_compacted = .{
-            .tokens_before = tokens_before,
-            .tokens_after = self.estimateContextTokens(),
-        } });
     }
 
-    /// Join the summarizer thread if one is alive. Blocks until it finishes —
-    /// used both for the overflow wait and at teardown.
-    fn joinCompactor(self: *Agent) void {
-        if (self.compactor.thread) |thread| {
-            thread.join();
-            self.compactor.thread = null;
-        }
+    /// Per-turn-iteration hook — delegates to the extracted state machine.
+    pub fn maybeCompact(self: *Agent, listener: anytype) void {
+        self.compactor.maybeCompact(self.compactionEnv(), listener);
     }
 
-    /// Release the finished job/result and return the compactor to idle.
-    fn finishCompactor(self: *Agent) void {
-        if (self.compactor.result) |*result| self.gpa.free(result.stored_summary);
-        self.compactor.result = null;
-        self.compactor.job = null;
-        self.compactor.state.store(.idle, .release);
+    /// Synchronous full compaction (headless/test path). See
+    /// `AutoCompactor.forceCompact`.
+    pub fn forceCompact(self: *Agent) !auto_compactor_mod.HistoryCompacted {
+        return self.compactor.forceCompact(self.compactionEnv());
+    }
+
+    /// Non-blocking phase 1 of the manual `/compact`.
+    pub fn requestManualCompact(self: *Agent) !void {
+        return self.compactor.requestManualCompact(self.compactionEnv());
+    }
+
+    /// Non-blocking phase 2 of the manual `/compact`, polled by the TUI tick.
+    pub fn pollManualCompact(self: *Agent) !?auto_compactor_mod.HistoryCompacted {
+        return self.compactor.pollManualCompact(self.compactionEnv());
+    }
+
+    /// Whether a manual `/compact` is mid-flight (drives the TUI's submit
+    /// gate and waiting row).
+    pub fn manualCompactPending(self: *const Agent) bool {
+        return self.compactor.manual_pending;
     }
 
     /// Wait for any in-flight background summary and discard it. Call before
-    /// freeing or replacing `compaction_client` so the summarizer thread is
-    /// never left running against a client that is about to be torn down.
-    /// Also aborts any in-flight manual compact: the run (if any) is gone, so
-    /// the pending flags are reset to keep the TUI's submit gate from
-    /// dangling on a summary that can never land.
+    /// freeing or replacing `compaction_client` (teardown, reconnect).
     pub fn drainBackgroundCompaction(self: *Agent) void {
-        self.joinCompactor();
-        self.finishCompactor();
-        self.manual_compact_pending = false;
-        self.manual_compact_started = false;
+        self.compactor.drain(self.compactionEnv());
     }
 
-    /// Whether the automatic path should back off after repeated failures.
-    fn compactionBreakerTripped(self: *const Agent) bool {
-        return self.compaction_failures >= compaction_failure_limit;
+    /// Best estimate of the footprint the *next* request will carry: the
+    /// last turn's real reported usage as an anchor plus trailing estimates
+    /// (see `AutoCompactor.currentContextTokens`).
+    pub fn currentContextTokens(self: *Agent) u32 {
+        return self.compactor.currentContextTokens(self.compactionEnv());
     }
 
-    /// Emit a one-shot compaction notice through the agent's event stream. The
-    /// notice is a bare enum — no allocation — so the renderer owns the text
-    /// and a dropped event (noop listener, full queue) leaks nothing.
-    fn emitCompactionNotice(listener: anytype, notice: Event.CompactionNotice) void {
-        const Ctx = @typeInfo(@TypeOf(listener.ctx)).pointer.child;
-        const L = Listener(Ctx);
-        const l: L = listener;
-        l.emit(.{ .compaction_notice = notice }) catch {};
+    /// Record a completed turn's usage as the watermark anchor.
+    pub fn recordUsage(self: *Agent, usage: ?ai.Usage) void {
+        self.compactor.recordUsage(self.compactionEnv(), usage);
+    }
+
+    /// Drop the usage anchor, forcing a full re-estimate next turn. Used
+    /// after the history is rebuilt (compaction, branch switch).
+    pub fn resetContextUsage(self: *Agent) void {
+        self.compactor.resetUsage();
     }
 
     /// Rehydrate the cached message list from the session projection after a
     /// compaction boundary was written — the swap. Keeps the system prompt.
-    /// Called between turn iterations, where every message is already persisted
-    /// and no stream is active; never mid-stream.
+    /// Called between turn iterations, where every message is already
+    /// persisted and no stream is active; never mid-stream.
     fn reloadFromSession(self: *Agent) !void {
         const session_writer = self.context_manager.session_writer orelse return;
         // Project first, swap second: a failed reprojection leaves the live
@@ -1553,54 +1353,6 @@ pub const Agent = struct {
         self.clearNonSystemMessages();
         for (projected) |message| try self.context_manager.appendUnpersisted(message);
         self.gpa.free(projected);
-    }
-
-    /// Best estimate of the footprint the *next* request will carry: the last
-    /// turn's real reported usage (prompt + completion) as an anchor, plus a
-    /// size estimate of every message appended since (tool results, queued user
-    /// turns) — the part the provider has not accounted for yet. Falls back to
-    /// a full estimate when no usage has been reported.
-    pub fn currentContextTokens(self: *Agent) u32 {
-        const usage = self.last_usage orelse return self.estimateContextTokens();
-        const anchored = usage.input_tokens +| usage.output_tokens;
-        return anchored +| self.estimateTrailingTokens(self.last_usage_anchor_count);
-    }
-
-    /// Sum the estimated tokens of cached messages from `anchor_count` onward —
-    /// the messages appended after `last_usage` was captured — counting
-    /// historical tool output as the pruned request would send it.
-    fn estimateTrailingTokens(self: *Agent, anchor_count: u32) u32 {
-        const items = self.context_manager.items();
-        return context_assembly.estimatePrunedTokensRange(
-            items,
-            anchor_count,
-            self.compaction_settings.keep_recent_tool_turns,
-            self.compaction_settings.historical_tool_cap_bytes,
-        );
-    }
-
-    /// Record a completed turn's usage as the watermark anchor. The anchor is
-    /// the message count *after* the assistant reply landed, so everything
-    /// appended later counts as trailing tokens.
-    fn recordUsage(self: *Agent, usage: ?ai.Usage) void {
-        self.last_usage = usage;
-        self.last_usage_anchor_count = self.context_manager.count();
-    }
-
-    /// Drop the usage anchor, forcing a full re-estimate next turn. Used after
-    /// the history is rebuilt (compaction, branch switch).
-    pub fn resetContextUsage(self: *Agent) void {
-        self.last_usage = null;
-        self.last_usage_anchor_count = 0;
-    }
-
-    fn estimateContextTokens(self: *Agent) u32 {
-        return context_assembly.estimatePrunedTokensRange(
-            self.context_manager.items(),
-            0,
-            self.compaction_settings.keep_recent_tool_turns,
-            self.compaction_settings.historical_tool_cap_bytes,
-        );
     }
 };
 
@@ -2428,7 +2180,7 @@ test "maybeCompact: disabled auto stays a no-op below the watermark" {
 
     // Compactor never left idle, no event emitted (noop listener would error
     // otherwise — there is nothing to assert beyond not panicking).
-    try std.testing.expect(agent.compactor.stateIs(.idle));
+    try std.testing.expect(agent.compactor.core.stateIs(.idle));
 }
 
 test "forceCompact: no compaction client returns NoCompactionClient without swapping" {
@@ -2438,7 +2190,7 @@ test "forceCompact: no compaction client returns NoCompactionClient without swap
 
     // The very first guard: compaction_client == .none.
     try std.testing.expectError(error.NoCompactionClient, agent.forceCompact());
-    try std.testing.expect(agent.compactor.stateIs(.idle));
+    try std.testing.expect(agent.compactor.core.stateIs(.idle));
 }
 
 test "forceCompact: window guard fires before the writer guard" {
@@ -2452,7 +2204,7 @@ test "forceCompact: window guard fires before the writer guard" {
     // the writer check — confirming the order matches the source.
     agent.context_window_tokens = 4096; // would pass the window guard
     try std.testing.expectError(error.NoCompactionClient, agent.forceCompact());
-    try std.testing.expect(agent.compactor.stateIs(.idle));
+    try std.testing.expect(agent.compactor.core.stateIs(.idle));
 }
 
 /// Add `count` long persisted user messages so a compaction cut exists under
@@ -2478,13 +2230,13 @@ test "requestManualCompact: guard order matches forceCompact" {
 
     // The very first guard: compaction_client == .none.
     try std.testing.expectError(error.NoCompactionClient, agent.requestManualCompact());
-    try std.testing.expect(!agent.manual_compact_pending);
-    try std.testing.expect(agent.compactor.stateIs(.idle));
+    try std.testing.expect(!agent.compactor.manual_pending);
+    try std.testing.expect(agent.compactor.core.stateIs(.idle));
 
     // Window guard fires before the writer guard (same order as forceCompact).
     agent.context_window_tokens = 4096;
     try std.testing.expectError(error.NoCompactionClient, agent.requestManualCompact());
-    try std.testing.expect(!agent.manual_compact_pending);
+    try std.testing.expect(!agent.compactor.manual_pending);
 }
 
 test "requestManualCompact: defers to a stale run instead of starting a second" {
@@ -2513,11 +2265,11 @@ test "requestManualCompact: defers to a stale run instead of starting a second" 
 
     // A stale auto-run is in flight: request must defer, not spawn a second
     // thread or disturb the running state.
-    agent.compactor.state.store(.running, .release);
+    agent.compactor.core.state.store(.running, .release);
     try agent.requestManualCompact();
-    try std.testing.expect(agent.manual_compact_pending);
-    try std.testing.expect(!agent.manual_compact_started);
-    try std.testing.expect(agent.compactor.stateIs(.running));
+    try std.testing.expect(agent.compactor.manual_pending);
+    try std.testing.expect(!agent.compactor.manual_started);
+    try std.testing.expect(agent.compactor.core.stateIs(.running));
 
     // A second request while pending is refused.
     try std.testing.expectError(error.CompactionInProgress, agent.requestManualCompact());
@@ -2549,21 +2301,21 @@ test "requestManualCompact starts a run; poll fails it against a dead server" {
     try fillSessionForCompaction(&agent, 10);
 
     try agent.requestManualCompact();
-    try std.testing.expect(agent.manual_compact_pending);
-    try std.testing.expect(agent.manual_compact_started);
-    try std.testing.expect(agent.compactor.stateIs(.running));
+    try std.testing.expect(agent.compactor.manual_pending);
+    try std.testing.expect(agent.compactor.manual_started);
+    try std.testing.expect(agent.compactor.core.stateIs(.running));
 
     // The summarizer fails against the dead server; the poll surfaces it and
     // clears the pending flags.
     var spins: u32 = 0;
-    while (!agent.compactor.stateIs(.failed) and spins < 10_000) : (spins += 1) {
+    while (!agent.compactor.core.stateIs(.failed) and spins < 10_000) : (spins += 1) {
         std.testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
-    try std.testing.expect(agent.compactor.stateIs(.failed));
+    try std.testing.expect(agent.compactor.core.stateIs(.failed));
     try std.testing.expectError(error.CompactionFailed, agent.pollManualCompact());
-    try std.testing.expect(!agent.manual_compact_pending);
-    try std.testing.expect(!agent.manual_compact_started);
-    try std.testing.expect(agent.compactor.stateIs(.idle));
+    try std.testing.expect(!agent.compactor.manual_pending);
+    try std.testing.expect(!agent.compactor.manual_started);
+    try std.testing.expect(agent.compactor.core.stateIs(.idle));
 }
 
 test "pollManualCompact: returns null while the summarizer is running" {
@@ -2576,25 +2328,25 @@ test "pollManualCompact: returns null while the summarizer is running" {
     var agent = Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
     agent.compaction_client = .{ .openai_compatible = &client };
-    agent.manual_compact_pending = true;
-    agent.manual_compact_started = true;
-    agent.compactor.state.store(.running, .release);
+    agent.compactor.manual_pending = true;
+    agent.compactor.manual_started = true;
+    agent.compactor.core.state.store(.running, .release);
 
     try std.testing.expect((try agent.pollManualCompact()) == null);
-    try std.testing.expect(agent.manual_compact_pending);
+    try std.testing.expect(agent.compactor.manual_pending);
 }
 
 test "pollManualCompact: torn-down client aborts and clears the pending flags" {
     const gpa = std.testing.allocator;
     var agent = Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    agent.manual_compact_pending = true;
-    agent.manual_compact_started = true;
+    agent.compactor.manual_pending = true;
+    agent.compactor.manual_started = true;
 
     // compaction_client stays .none — simulates a disconnect mid-compact.
     try std.testing.expectError(error.CompactionFailed, agent.pollManualCompact());
-    try std.testing.expect(!agent.manual_compact_pending);
-    try std.testing.expect(!agent.manual_compact_started);
+    try std.testing.expect(!agent.compactor.manual_pending);
+    try std.testing.expect(!agent.compactor.manual_started);
 }
 
 test "pollManualCompact: a failed summarizer surfaces CompactionFailed and clears the flags" {
@@ -2611,7 +2363,7 @@ test "pollManualCompact: a failed summarizer surfaces CompactionFailed and clear
     // Fake an in-flight manual run: the summarizer thread fails (dead server →
     // connection refused) and flips to `.failed`; poll must surface it and
     // return the compactor to idle without leaking the result slot.
-    agent.compactor.job = .{
+    agent.compactor.core.job = .{
         .gpa = gpa,
         .io = std.testing.io,
         .client = .{ .openai_compatible = &client },
@@ -2619,21 +2371,21 @@ test "pollManualCompact: a failed summarizer surfaces CompactionFailed and clear
         .first_kept_id = undefined, // never read on the failure path
         .prefix_text = try gpa.dupe(u8, "some prefix"),
     };
-    agent.compactor.state.store(.running, .release);
-    agent.compactor.thread = try std.Thread.spawn(.{}, agent_compactor.Compactor.runThread, .{&agent.compactor});
-    agent.manual_compact_pending = true;
-    agent.manual_compact_started = true;
+    agent.compactor.core.state.store(.running, .release);
+    agent.compactor.core.thread = try std.Thread.spawn(.{}, agent_compactor.Compactor.runThread, .{&agent.compactor.core});
+    agent.compactor.manual_pending = true;
+    agent.compactor.manual_started = true;
 
     var spins: u32 = 0;
-    while (!agent.compactor.stateIs(.failed) and spins < 10_000) : (spins += 1) {
+    while (!agent.compactor.core.stateIs(.failed) and spins < 10_000) : (spins += 1) {
         std.testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
-    try std.testing.expect(agent.compactor.stateIs(.failed));
+    try std.testing.expect(agent.compactor.core.stateIs(.failed));
 
     try std.testing.expectError(error.CompactionFailed, agent.pollManualCompact());
-    try std.testing.expect(!agent.manual_compact_pending);
-    try std.testing.expect(!agent.manual_compact_started);
-    try std.testing.expect(agent.compactor.stateIs(.idle));
+    try std.testing.expect(!agent.compactor.manual_pending);
+    try std.testing.expect(!agent.compactor.manual_started);
+    try std.testing.expect(agent.compactor.core.stateIs(.idle));
 }
 
 test "pollManualCompact: discards a stale background result before the manual run" {
@@ -2663,29 +2415,29 @@ test "pollManualCompact: discards a stale background result before the manual ru
 
     // A stale auto summary is ready (no thread) and the manual run has not
     // started yet: the request deferred on an in-flight auto-run.
-    agent.manual_compact_pending = true;
-    agent.manual_compact_started = false;
-    agent.compactor.result = .{
+    agent.compactor.manual_pending = true;
+    agent.compactor.manual_started = false;
+    agent.compactor.core.result = .{
         .first_kept_id = undefined,
         .stored_summary = try gpa.dupe(u8, "stale summary"),
     };
-    agent.compactor.state.store(.ready, .release);
+    agent.compactor.core.state.store(.ready, .release);
 
     // First poll: the stale result is discarded (TD-1) and the manual run
     // starts. Returns null — the manual run is now in flight.
     try std.testing.expect((try agent.pollManualCompact()) == null);
-    try std.testing.expect(agent.manual_compact_started);
+    try std.testing.expect(agent.compactor.manual_started);
 
     // The manual run fails against the dead server; the poll surfaces it.
     var spins: u32 = 0;
-    while (!agent.compactor.stateIs(.failed) and spins < 10_000) : (spins += 1) {
+    while (!agent.compactor.core.stateIs(.failed) and spins < 10_000) : (spins += 1) {
         std.testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
-    try std.testing.expect(agent.compactor.stateIs(.failed));
+    try std.testing.expect(agent.compactor.core.stateIs(.failed));
     try std.testing.expectError(error.CompactionFailed, agent.pollManualCompact());
-    try std.testing.expect(!agent.manual_compact_pending);
-    try std.testing.expect(!agent.manual_compact_started);
-    try std.testing.expect(agent.compactor.stateIs(.idle));
+    try std.testing.expect(!agent.compactor.manual_pending);
+    try std.testing.expect(!agent.compactor.manual_started);
+    try std.testing.expect(agent.compactor.core.stateIs(.idle));
 }
 
 test "compaction watermarks: shouldStartSummary fires before shouldSwap" {
@@ -2714,17 +2466,17 @@ test "drain discards a ready summary and returns the compactor to idle" {
 
     // A finished background summary sitting in `.ready` — no thread. Drain
     // must free the stored summary (leak-checked) and return to idle (TD-1).
-    agent.compactor.result = .{
+    agent.compactor.core.result = .{
         .first_kept_id = undefined,
         .stored_summary = try gpa.dupe(u8, "stale summary"),
     };
-    agent.compactor.state.store(.ready, .release);
+    agent.compactor.core.state.store(.ready, .release);
 
     agent.drainBackgroundCompaction();
 
-    try std.testing.expect(agent.compactor.stateIs(.idle));
-    try std.testing.expect(agent.compactor.result == null);
-    try std.testing.expect(agent.compactor.thread == null);
+    try std.testing.expect(agent.compactor.core.stateIs(.idle));
+    try std.testing.expect(agent.compactor.core.result == null);
+    try std.testing.expect(agent.compactor.core.thread == null);
 }
 
 test "drain joins a running summarizer that fails against a dead server" {
@@ -2739,7 +2491,7 @@ test "drain joins a running summarizer that fails against a dead server" {
     // Fake an in-flight job: the summarizer thread will fail (dead server →
     // connection refused) and flip to `.failed`; drain must join it and return
     // the compactor to idle without leaking the result slot (TD-1).
-    agent.compactor.job = .{
+    agent.compactor.core.job = .{
         .gpa = gpa,
         .io = std.testing.io,
         .client = .{ .openai_compatible = &client },
@@ -2747,19 +2499,19 @@ test "drain joins a running summarizer that fails against a dead server" {
         .first_kept_id = undefined, // never read on the failure path
         .prefix_text = try gpa.dupe(u8, "some prefix"),
     };
-    agent.compactor.state.store(.running, .release);
-    agent.compactor.thread = try std.Thread.spawn(.{}, agent_compactor.Compactor.runThread, .{&agent.compactor});
+    agent.compactor.core.state.store(.running, .release);
+    agent.compactor.core.thread = try std.Thread.spawn(.{}, agent_compactor.Compactor.runThread, .{&agent.compactor.core});
 
     // Wait for the summarizer to fail (connection refused, so this is fast).
     var spins: u32 = 0;
-    while (!agent.compactor.stateIs(.failed) and spins < 10_000) : (spins += 1) {
+    while (!agent.compactor.core.stateIs(.failed) and spins < 10_000) : (spins += 1) {
         std.testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
-    try std.testing.expect(agent.compactor.stateIs(.failed));
+    try std.testing.expect(agent.compactor.core.stateIs(.failed));
 
     agent.drainBackgroundCompaction();
-    try std.testing.expect(agent.compactor.stateIs(.idle));
-    try std.testing.expect(agent.compactor.thread == null);
+    try std.testing.expect(agent.compactor.core.stateIs(.idle));
+    try std.testing.expect(agent.compactor.core.thread == null);
 }
 
 test "compaction breaker trips after repeated failures and backs off automatically" {
@@ -2785,8 +2537,8 @@ test "compaction breaker trips after repeated failures and backs off automatical
     agent.attachSessionWriter(&writer);
     agent.compaction_client = .{ .openai_compatible = &client };
     agent.context_window_tokens = 4096;
-    agent.compaction_failures = compaction_failure_limit;
-    agent.compaction_breaker_notified = false;
+    agent.compactor.failures = compaction_failure_limit;
+    agent.compactor.breaker_notified = false;
 
     const Seen = struct {
         notices: std.ArrayList(Agent.Event.CompactionNotice) = .empty,
@@ -2807,17 +2559,17 @@ test "compaction breaker trips after repeated failures and backs off automatical
     agent.maybeCompact(listener);
     try std.testing.expectEqual(@as(usize, 1), seen.notices.items.len);
     try std.testing.expectEqual(Agent.Event.CompactionNotice.breaker_tripped, seen.notices.items[0]);
-    try std.testing.expect(agent.compactor.stateIs(.idle));
+    try std.testing.expect(agent.compactor.core.stateIs(.idle));
 
     // The notice is one-shot: a second call emits nothing new.
     agent.maybeCompact(listener);
     try std.testing.expectEqual(@as(usize, 1), seen.notices.items.len);
 
     // Failure bookkeeping: each failed apply increments toward the limit.
-    agent.compaction_failures = compaction_failure_limit - 1;
-    agent.compactor.state.store(.failed, .release);
-    try Agent.applyReadyCompaction(Listener, &agent, listener);
-    try std.testing.expectEqual(compaction_failure_limit, agent.compaction_failures);
+    agent.compactor.failures = compaction_failure_limit - 1;
+    agent.compactor.core.state.store(.failed, .release);
+    try agent.compactor.applyReadyCompaction(agent.compactionEnv(), listener);
+    try std.testing.expectEqual(compaction_failure_limit, agent.compactor.failures);
 }
 
 test "applyReadyCompaction resets the breaker on a successful swap" {
@@ -2844,14 +2596,14 @@ test "applyReadyCompaction resets the breaker on a successful swap" {
     defer gpa.free(cut.prefix_text);
 
     // Simulate a ready background summary while the breaker was tripped.
-    agent.compactor.result = .{
+    agent.compactor.core.result = .{
         .first_kept_id = cut.first_kept_id,
         .stored_summary = try gpa.dupe(u8, "SUMMARY"),
     };
-    agent.compactor.state.store(.ready, .release);
-    agent.compaction_failures = compaction_failure_limit;
-    agent.compaction_breaker_notified = true;
-    agent.compaction_stuck_notified = true;
+    agent.compactor.core.state.store(.ready, .release);
+    agent.compactor.failures = compaction_failure_limit;
+    agent.compactor.breaker_notified = true;
+    agent.compactor.stuck_notified = true;
 
     const Seen = struct {
         fn onEvent(_: *@This(), _: Agent.Event) !void {}
@@ -2860,13 +2612,13 @@ test "applyReadyCompaction resets the breaker on a successful swap" {
     const Listener = Agent.Listener(Seen);
     const listener: Listener = .{ .ctx = &seen, .on_event = Seen.onEvent };
 
-    try Agent.applyReadyCompaction(Listener, &agent, listener);
+    try agent.compactor.applyReadyCompaction(agent.compactionEnv(), listener);
 
     // A successful swap proves the pipeline works: breaker cleared, notices
     // re-armed for a future episode.
-    try std.testing.expectEqual(@as(u32, 0), agent.compaction_failures);
-    try std.testing.expect(!agent.compaction_breaker_notified);
-    try std.testing.expect(!agent.compaction_stuck_notified);
+    try std.testing.expectEqual(@as(u32, 0), agent.compactor.failures);
+    try std.testing.expect(!agent.compactor.breaker_notified);
+    try std.testing.expect(!agent.compactor.stuck_notified);
 }
 
 test "assistant message with only reasoning is dropped from history" {

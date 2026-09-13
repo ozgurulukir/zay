@@ -10,6 +10,7 @@ const tui = @import("../tui.zig");
 const bash_mod = @import("../tools/bash_exec.zig");
 const diff_utils = @import("diff_utils.zig");
 const diff_viewer = @import("diff_viewer.zig");
+const app_state = @import("app_state.zig");
 
 const App = tui.App;
 
@@ -17,10 +18,7 @@ const App = tui.App;
 // Types
 // ---------------------------------------------------------------------------
 
-pub const DiffCounts = struct {
-    additions: u32 = 0,
-    deletions: u32 = 0,
-};
+pub const DiffCounts = app_state.DiffCounts;
 
 const DiffRefreshJob = struct {
     gpa: std.mem.Allocator,
@@ -80,11 +78,6 @@ fn runDiffRefresh(job: *DiffRefreshJob) DiffRefreshOutcome {
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
-
-pub fn diffCountsVisible(app: *const App) bool {
-    if (app.metrics.diff_counts.additions > 0) return true;
-    return app.metrics.diff_counts.deletions > 0;
-}
 
 pub fn refreshDiffCounts(app: *App) !bool {
     const cwd = if (app.liveRuntime()) |runtime| runtime.cwd else ".";

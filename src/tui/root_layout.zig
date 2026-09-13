@@ -14,6 +14,8 @@
 
 const std = @import("std");
 const vaxis = @import("vaxis");
+const tui_style = @import("style.zig");
+const telemetry = @import("telemetry.zig");
 const vxfw = vaxis.vxfw;
 
 const tui = @import("../tui.zig");
@@ -38,6 +40,92 @@ const App = tui.App;
 
 const log = std.log.scoped(.root_layout);
 
+/// Build the input widget's per-frame view model (INV-WIDGET-1): every fact
+/// the widget renders, computed HERE from the App, so the widget stays a pure
+/// function of its props. `combined_text` is the frame-arena concatenation of
+/// the input buffer halves (also reused for the layout row count).
+fn buildInputProps(app: *App, arena: std.mem.Allocator, combined_text: []const u8) input_mod.InputProps {
+    const rt = app.liveRuntime();
+    const status_text: []const u8 = if (tui_status.modelStatus(rt, app.cached_config)) |status|
+        tui_status.formatModelStatus(arena, status) catch "no model"
+    else
+        "no model";
+
+    const tui_cfg = app.cached_config.tui;
+    const p = tui_style.activePalette();
+    var meter_text: []const u8 = "";
+    var meter_style: vaxis.Style = p.model_status;
+    if (tui_cfg.show_context_meter) {
+        const live_max: u32 = if (rt) |r|
+            r.agent.context_window_tokens
+        else if (app.metrics.context_tokens_max > 0)
+            app.metrics.context_tokens_max
+        else
+            128000;
+        const live_used: u32 = if (rt) |r|
+            r.agent.currentContextTokens()
+        else if (app.metrics.context_tokens_used > 0)
+            app.metrics.context_tokens_used
+        else
+            0;
+        var meter_buf: [64]u8 = undefined;
+        const meter = telemetry.TelemetryTracker.formatContextBar(
+            @intCast(live_used),
+            @intCast(live_max),
+            tui_cfg.context_threshold_warn,
+            tui_cfg.context_threshold_alert,
+            &meter_buf,
+        );
+        meter_text = arena.dupe(u8, meter.text) catch "";
+        meter_style = switch (meter.level) {
+            .normal => p.success,
+            .warn => p.notice,
+            .alert => p.error_style,
+        };
+    }
+
+    var velocity_text: []const u8 = "";
+    if (tui_cfg.show_token_velocity) {
+        const is_streaming = switch (app.thread.turn_view.activity) {
+            .writing_response, .thinking => true,
+            else => false,
+        };
+        var velocity_buf: [32]u8 = undefined;
+        const vel = telemetry.TelemetryTracker.formatVelocity(app.metrics.telemetry.current_tokens_per_sec, is_streaming, &velocity_buf);
+        if (vel.len > 0) velocity_text = arena.dupe(u8, vel) catch "";
+    }
+
+    const counts = app.metrics.diff_counts;
+    return .{
+        .input_field = &app.inputs.input,
+        .input_text = combined_text,
+        .input_cursor = app.inputs.input.buf.firstHalf().len,
+        .input_wrap_width = &app.input_wrap_width,
+        .input_surface_row = app.input_surface_row,
+        .chip_rect_out = &app.nav.lanes_chip_rect,
+        .queued = app.thread.queued.items,
+        .queued_selection = app.nav.queued_selection,
+        .prompt_text = if (app.mode == .normal) ">" else " ",
+        .hint_text = input_mod.hintText(.{
+            .pending_quit = app.getPendingQuitAt() != null,
+            .mode = app.mode,
+            .session_action = app.nav.session_action,
+            .provider_stage = app.pickers.provider.stage,
+            .lanes_purpose = app.nav.lanes_purpose,
+        }),
+        .pending_quit = app.getPendingQuitAt() != null,
+        .diff_counts = if (counts.additions > 0 or counts.deletions > 0) counts else null,
+        .background_jobs = app.runningBackgroundCount(),
+        .show_lanes_chip = app.split_mode == .tab and app.threads.len() > 1,
+        .lanes_count = app.threads.len(),
+        .status_text = status_text,
+        .meter_text = meter_text,
+        .meter_style = meter_style,
+        .velocity_text = velocity_text,
+        .git_label = app.metrics.git_label,
+    };
+}
+
 pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
     // The diff viewer replaces the whole screen (transcript + input + overlay),
     // so it short-circuits the normal layout entirely. Zero the split-rect
@@ -54,7 +142,10 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
     const split = app.split_mode != .tab and app.threads.len() > 1;
     // In split view always reserve the loading row so each column keeps a
     // fixed height across turns — the spinner appearing must not reflow.
-    const layout = root_layout.rootLayout(max_height, false, try app.inputTextRows(ctx, max_width -| 4), loading_visible or split, app.thread.queued.items.len > 0);
+    // One arena concat feeds BOTH the layout row count and the input widget's
+    // props (was: two gpa peek allocations per frame).
+    const input_combined = try std.mem.concat(ctx.arena, u8, &.{ app.inputs.input.buf.firstHalf(), app.inputs.input.buf.secondHalf() });
+    const layout = root_layout.rootLayout(max_height, false, input_mod.wrappedTextRows(ctx, input_combined, max_width -| 4), loading_visible or split, app.thread.queued.items.len > 0);
     // Compute the split geometry once and stash it for mouse click-to-focus
     // routing (event_router.routeMouse), so the render path and the mouse
     // handler share one source of truth. `split_rect_count` is set
@@ -86,7 +177,7 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         .word_index = app.thread.turn_view.loading_word_index,
         .loading_frame = app.metrics.loading_frame,
     };
-    var input_view: input_mod.InputWidget = .{ .app = app };
+    var input_view: input_mod.InputWidget = .{ .props = buildInputProps(app, ctx.arena, input_combined) };
     var overlay_view: overlay.OverlayWidget = .{ .app = app };
 
     const overlay_visible = app.mode != .normal;

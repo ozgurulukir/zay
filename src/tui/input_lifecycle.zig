@@ -34,12 +34,6 @@ pub fn peekCommentInput(app: *App) ![]u8 {
     return out;
 }
 
-pub fn inputTextRows(app: *App, ctx: vxfw.DrawContext, width: u16) !u16 {
-    const text = try peekInput(app);
-    defer app.gpa.free(text);
-    return input_mod.wrappedTextRows(ctx, text, width);
-}
-
 pub fn insertInputNewline(app: *App) !void {
     try app.inputs.input.insertSliceAtCursor("\n");
     try app.updateAtSearch();

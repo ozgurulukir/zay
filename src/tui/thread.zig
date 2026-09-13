@@ -36,7 +36,7 @@ const agent_worker = @import("agent_worker.zig");
 const turn_cancel = @import("turn_cancel.zig");
 const naming = @import("naming.zig");
 
-const Thread = @This();
+pub const Thread = @This();
 
 /// Identity: the conversation tree this lane talks to. Null until the lane has a
 /// persisted session (fresh startup before the first turn, or a headless/test

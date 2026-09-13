@@ -43,7 +43,7 @@ const tui_metrics = @import("tui/metrics.zig");
 const tui_layout = @import("tui/layout.zig");
 const provider_model = @import("tui/provider_model.zig");
 const diff_lifecycle = @import("tui/diff_lifecycle.zig");
-pub const DiffCounts = diff_lifecycle.DiffCounts;
+pub const DiffCounts = app_state.DiffCounts;
 pub const DiffRefreshOutcome = diff_lifecycle.DiffRefreshOutcome;
 const diff_utils = @import("tui/diff_utils.zig");
 const lane_lifecycle = @import("tui/lane_lifecycle.zig");
@@ -89,18 +89,7 @@ pub const MentionSearchKind = at_search_mod.MentionSearchKind;
 
 /// A single-row clickable region on screen (absolute coordinates). Used to
 /// hit-test mouse clicks against the pink lanes chip.
-pub const ChipRect = struct {
-    row: u16,
-    col: u16,
-    width: u16,
-
-    pub fn contains(self: ChipRect, row: i16, col: i16) bool {
-        if (row < 0 or col < 0) return false;
-        const r: u16 = @intCast(row);
-        const c: u16 = @intCast(col);
-        return r == self.row and c >= self.col and c < self.col + self.width;
-    }
-};
+pub const ChipRect = app_state.ChipRect;
 
 const CheckpointState = enum { unknown, ready, unavailable };
 pub const catalogue_provider_count = config_mod.catalogueProviders().len;
@@ -249,7 +238,7 @@ pub const App = struct {
     /// lane is idle — "auto-start if idle, queue if in-flight". Owned; freed in
     /// `deinit`.
     pub const ctrl_c_double_press_ms: u32 = 1500;
-    pub const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message, lanes, help, settings, mcp, plugins, search, theme_picker };
+    pub const Mode = app_state.Mode;
     pub const LanesPurpose = app_state.NavState.LanesPurpose;
 
     /// True when the mode's key/submit handlers need a live agent (they deref
@@ -1153,10 +1142,6 @@ pub const App = struct {
         return input_lifecycle.peekInput(self);
     }
 
-    pub fn inputTextRows(self: *App, ctx: vxfw.DrawContext, width: u16) !u16 {
-        return input_lifecycle.inputTextRows(self, ctx, width);
-    }
-
     pub fn insertInputNewline(self: *App) !void {
         return input_lifecycle.insertInputNewline(self);
     }
@@ -1173,10 +1158,6 @@ pub const App = struct {
 
     pub fn selectionIsLastMessage(self: *const App) bool {
         return transcript_nav.selectionIsLastMessage(self);
-    }
-
-    pub fn diffCountsVisible(self: *const App) bool {
-        return diff_lifecycle.diffCountsVisible(self);
     }
 
     pub fn refreshDiffCounts(self: *App) !bool {

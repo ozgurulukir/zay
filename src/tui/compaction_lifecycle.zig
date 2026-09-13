@@ -42,7 +42,7 @@ pub fn manualCompactActive(app: *const App) bool {
     for (app.threads.slice()) |lane| {
         if (lane.manual_compact_waiting_row != null) return true;
         if (lane.agent) |agent| {
-            if (agent.manual_compact_pending) return true;
+            if (agent.manualCompactPending()) return true;
         }
     }
     return false;
@@ -82,7 +82,7 @@ pub fn requestManualCompact(app: *App) !bool {
 pub fn drainManualCompactions(app: *App) !bool {
     var visible_change = false;
     for (app.threads.slice()) |lane| {
-        const pending = if (lane.agent) |a| a.manual_compact_pending else false;
+        const pending = if (lane.agent) |a| a.manualCompactPending() else false;
         if (!pending and lane.manual_compact_waiting_row == null) continue;
 
         // The compact was aborted out-of-band (disconnect drained the compactor
