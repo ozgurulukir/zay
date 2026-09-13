@@ -1146,14 +1146,19 @@ test "PrunedToolCache caches owned messages across iterations with pointer stabi
     try std.testing.expectEqual(ptr1, ptr2);
     try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
 
-    // Cap change auto-clears and re-prunes
+    // Cap change auto-clears and re-prunes. Re-pruning is proven by CONTENT
+    // (the head+tail sandwich scales with the cap), not by pointer identity:
+    // the fresh copy may legally land on the just-freed address, so an
+    // allocator-address comparison is meaningless here.
     const views3 = try pruneHistoricalToolResultsViewsCached(gpa, &cache, &messages, 1, 150);
     defer freePrunedViews(gpa, views3);
 
     try std.testing.expect(views3[1] == .borrowed);
     const ptr3 = views3[1].borrowed;
-    try std.testing.expect(ptr1 != ptr3); // new pruned copy at new cap
+    const pruned_text3 = ptr3.tool.content[0].text.text;
+    try std.testing.expect(pruned_text3.len > pruned_text1.len); // re-pruned at the larger cap
     try std.testing.expectEqual(@as(u32, 150), cache.cached_cap_bytes);
+    try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
 }
 
 fn makeTextMessage(gpa: std.mem.Allocator, role: ai.Role, text: []const u8) !ai.ChatMessage {
