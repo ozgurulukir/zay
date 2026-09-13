@@ -659,9 +659,15 @@ pub const App = struct {
     }
 
     pub fn awaitTurn(self: *App) void {
-        if (self.thread.turn_future) |*future| {
+        self.awaitTurnFor(self.thread);
+    }
+
+    /// Await the given lane's turn future — the lane-targeted variant used
+    /// by the drain paths, which no longer scope-swap `app.thread`.
+    pub fn awaitTurnFor(self: *App, lane: *Thread) void {
+        if (lane.turn_future) |*future| {
             future.await(self.io);
-            self.thread.turn_future = null;
+            lane.turn_future = null;
         }
     }
 
@@ -678,7 +684,7 @@ pub const App = struct {
     }
 
     pub fn setLaneTitleIfUnset(self: *App, prompt: []const u8) !void {
-        return turn_lifecycle.setLaneTitleIfUnset(self, prompt);
+        return turn_lifecycle.setLaneTitleIfUnset(self, self.thread, prompt);
     }
 
     pub fn formatNoProviderMessage(self: *App) ![]u8 {
@@ -686,7 +692,7 @@ pub const App = struct {
     }
 
     pub fn resetTurnState(self: *App) void {
-        turn_lifecycle.resetTurnState(self);
+        turn_lifecycle.resetTurnState(self, self.thread);
     }
 
     pub fn startTurn(self: *App) !void {
@@ -694,7 +700,7 @@ pub const App = struct {
     }
 
     pub fn restartTurnForQueuedMessages(self: *App) !bool {
-        return turn_lifecycle.restartTurnForQueuedMessages(self);
+        return turn_lifecycle.restartTurnForQueuedMessages(self, self.thread);
     }
 
     pub fn laneForAgent(self: *App, agent_ptr: *agent_mod.Agent) ?*Thread {
@@ -749,8 +755,8 @@ pub const App = struct {
         return background_delivery.deliverPendingBackground(self);
     }
 
-    pub fn startDeliveryTurnOnCurrentThread(self: *App) !void {
-        return turn_lifecycle.startDeliveryTurnOnCurrentThread(self);
+    pub fn startDeliveryTurn(self: *App, lane: *Thread) !void {
+        return turn_lifecycle.startDeliveryTurn(self, lane);
     }
 
     pub fn runningBackgroundCount(self: *App) usize {
@@ -792,8 +798,8 @@ pub const App = struct {
         return permission_mod.resolvePermission(self, decision);
     }
 
-    pub fn applyAgentEvent(self: *App, event: agent_mod.Agent.Event) !bool {
-        return turn_lifecycle.applyAgentEvent(self, event);
+    pub fn applyAgentEvent(self: *App, lane: *Thread, event: agent_mod.Agent.Event) !bool {
+        return turn_lifecycle.applyAgentEvent(self, lane, event);
     }
 
     pub fn sealCheckpoint(self: *App) checkpoint_mod.SealOutcome {
@@ -809,11 +815,11 @@ pub const App = struct {
     }
 
     pub fn checkpointBoundary(self: *App) void {
-        checkpoint_mod.checkpointBoundary(self);
+        checkpoint_mod.checkpointBoundary(self, self.thread);
     }
 
     pub fn checkpointFinishedTurn(self: *App) void {
-        checkpoint_mod.checkpointFinishedTurn(self);
+        checkpoint_mod.checkpointFinishedTurn(self, self.thread);
     }
 
     pub fn beginSave(self: *App) !void {
@@ -1015,24 +1021,24 @@ pub const App = struct {
         queue_mod.steerSelectedQueued(self);
     }
 
-    pub fn flushQueuedUserMessagesToTranscript(self: *App, count: u32) !void {
-        return queue_mod.flushQueuedUserMessagesToTranscript(self, count);
+    pub fn flushQueuedUserMessagesToTranscript(self: *App, lane: *Thread, count: u32) !void {
+        return queue_mod.flushQueuedUserMessagesToTranscript(self, lane, count);
     }
 
-    pub fn appendSkillInvocationsToTranscript(self: *App, prompt: []const u8) !void {
-        return queue_mod.appendSkillInvocationsToTranscript(self, prompt);
+    pub fn appendSkillInvocationsToTranscript(self: *App, lane: *Thread, prompt: []const u8) !void {
+        return queue_mod.appendSkillInvocationsToTranscript(self, lane, prompt);
     }
 
-    pub fn clearQueuedUserMessages(self: *App) void {
-        queue_mod.clearQueuedUserMessages(self);
+    pub fn clearQueuedUserMessages(self: *App, lane: *Thread) void {
+        queue_mod.clearQueuedUserMessages(self, lane);
     }
 
     pub fn createParallelLane(self: *App) !void {
         try lifecycle.createParallelLane(self);
     }
 
-    pub fn captureLaneContext(self: *App, max: usize) ![][]u8 {
-        return lane_lifecycle.captureLaneContext(self, max);
+    pub fn captureLaneContext(self: *App, lane: *Thread, max: usize) ![][]u8 {
+        return lane_lifecycle.captureLaneContext(self, lane, max);
     }
 
     pub fn scheduleLaneNaming(self: *App, lane: *Thread, first_message: []const u8) !void {

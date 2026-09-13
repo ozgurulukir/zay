@@ -13,14 +13,16 @@ fn appendMessageQueueFullNotice(app: *App) !void {
     _ = try app.thread.transcript.append(app.gpa, .notice, "notice", "MessageQueueFull");
 }
 
-pub fn appendSkillInvocationsToTranscript(app: *App, prompt: []const u8) !void {
-    const runtime = app.liveRuntime() orelse return;
+pub fn appendSkillInvocationsToTranscript(app: *App, lane: *Thread, prompt: []const u8) !void {
+    // The LANE's runtime, not the focused one — a background lane's queued
+    // flush must mirror the skills of the runtime that will answer it.
+    const runtime = lane.liveRuntime() orelse return;
     const names = try skill_mod.collectInvocations(app.gpa, runtime.skills, prompt);
     defer app.gpa.free(names);
     var title_buf: [128]u8 = undefined;
     for (names) |name| {
         const title = try std.fmt.bufPrint(&title_buf, "[SKILL] {s}", .{name});
-        _ = try app.thread.transcript.append(app.gpa, .skill, title, "");
+        _ = try lane.transcript.append(app.gpa, .skill, title, "");
     }
 }
 
@@ -86,9 +88,9 @@ pub fn enqueueRawMirrored(app: *App, lane: *Thread, message: []const u8) bool {
     return true;
 }
 
-pub fn flushQueuedUserMessagesToTranscript(app: *App, count: u32) !void {
-    const flush_count: usize = @min(count, app.thread.queued.items.len);
-    for (app.thread.queued.items[0..flush_count]) |message| {
+pub fn flushQueuedUserMessagesToTranscript(app: *App, lane: *Thread, count: u32) !void {
+    const flush_count: usize = @min(count, lane.queued.items.len);
+    for (lane.queued.items[0..flush_count]) |message| {
         if (message.raw) {
             // A raw entry is a mirror of a machine-generated message whose
             // notice the delivery path already wrote — never render it as a
@@ -96,19 +98,19 @@ pub fn flushQueuedUserMessagesToTranscript(app: *App, count: u32) !void {
             app.gpa.free(message.text);
             continue;
         }
-        app.thread.transcript.dropIntroLogo(app.gpa);
-        _ = try app.thread.transcript.append(app.gpa, .user, "you", message.text);
-        try appendSkillInvocationsToTranscript(app, message.text);
+        lane.transcript.dropIntroLogo(app.gpa);
+        _ = try lane.transcript.append(app.gpa, .user, "you", message.text);
+        try appendSkillInvocationsToTranscript(app, lane, message.text);
         app.gpa.free(message.text);
     }
-    std.mem.copyForwards(Thread.QueuedMessage, app.thread.queued.items[0 .. app.thread.queued.items.len - flush_count], app.thread.queued.items[flush_count..]);
-    app.thread.queued.shrinkRetainingCapacity(app.thread.queued.items.len - flush_count);
+    std.mem.copyForwards(Thread.QueuedMessage, lane.queued.items[0 .. lane.queued.items.len - flush_count], lane.queued.items[flush_count..]);
+    lane.queued.shrinkRetainingCapacity(lane.queued.items.len - flush_count);
     app.nav.queued_selection -|= flush_count;
 }
 
-pub fn clearQueuedUserMessages(app: *App) void {
-    for (app.thread.queued.items) |message| app.gpa.free(message.text);
-    app.thread.queued.clearRetainingCapacity();
+pub fn clearQueuedUserMessages(app: *App, lane: *Thread) void {
+    for (lane.queued.items) |message| app.gpa.free(message.text);
+    lane.queued.clearRetainingCapacity();
     app.nav.queued_selection = 0;
 }
 
@@ -176,7 +178,7 @@ test "M2: flush renders user entries only, dropping raw mirrors" {
     try app.thread.queued.append(gpa, .{ .text = try gpa.dupe(u8, "lane finished"), .raw = true });
     const before = app.thread.transcript.messages.items.len;
 
-    try flushQueuedUserMessagesToTranscript(&app, 2);
+    try flushQueuedUserMessagesToTranscript(&app, app.thread, 2);
     try std.testing.expectEqual(before + 1, app.thread.transcript.messages.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
     try std.testing.expect(transcriptHasUser(&app, "user prompt"));
@@ -243,7 +245,7 @@ test "appendSkillInvocationsToTranscript appends formatted skill title to transc
     skill_mod.deinitAll(gpa, runtime.skills);
     runtime.skills = skills;
 
-    try appendSkillInvocationsToTranscript(&app, "Run $skill1 and $skill2 now");
+    try appendSkillInvocationsToTranscript(&app, app.thread, "Run $skill1 and $skill2 now");
 
     try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
     try std.testing.expectEqualStrings("[SKILL] skill1", app.thread.transcript.messages.items[0].skill.title);

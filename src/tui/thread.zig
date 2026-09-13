@@ -169,6 +169,17 @@ pub const Engine = union(enum) {
     live: Live,
 };
 
+/// This lane's live runtime, or null when the lane is idle. The per-lane
+/// truth for "which runtime drives this lane" — `App.liveRuntime()` is this
+/// for the focused lane. Lane-targeted helpers take a `*Thread` and read
+/// the runtime here instead of relying on the focused lane.
+pub fn liveRuntime(self: *const Thread) ?*runtime.AgentRuntime {
+    return switch (self.engine) {
+        .live => |live| live.runtime,
+        .idle => null,
+    };
+}
+
 /// Free everything this thread owns. For `.live`, that includes tearing down and
 /// destroying the owned `AgentRuntime` — the lane is the runtime's owner.
 pub fn deinit(self: *Thread, gpa: std.mem.Allocator) void {
