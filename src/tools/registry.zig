@@ -4,6 +4,8 @@ const background_tool = @import("background.zig");
 const bash_tool = @import("bash.zig");
 const common = @import("common.zig");
 const lane_tool = @import("lane.zig");
+const mcp_bridge = @import("../mcp/registry_bridge.zig");
+const mcp_mod = @import("../mcp/manager.zig");
 const os = @import("../os.zig");
 const pwsh_tool = @import("pwsh.zig");
 const skill_tool = @import("skill.zig");
@@ -127,13 +129,39 @@ pub const ToolRegistry = struct {
             }
         }
     }
+
+    /// Replace every `mcp__`-namespaced record with one `Tool` per tool
+    /// discovered on the manager's connected clients (see
+    /// `mcp/registry_bridge.zig`). A client that dropped since the last sync
+    /// simply stops contributing records; a stale record therefore degrades
+    /// to "MCP server not found" at dispatch until the next sync. Idempotent.
+    /// Caller must hold the registry mutation gate (no lane turn active) —
+    /// same contract as plugin re-registration.
+    pub fn syncMcpTools(self: *ToolRegistry, gpa: std.mem.Allocator, manager: *mcp_mod.McpManager) !void {
+        self.removePluginToolsWithPrefix(gpa, "mcp__");
+        for (manager.clients.items) |*client| {
+            if (client.status() != .connected) continue;
+            for (client.tools.items) |*tool| {
+                const record = mcp_bridge.buildMcpTool(gpa, client.name, tool.name, tool.description, tool.schema) catch |err| {
+                    log.warn("syncMcpTools: buildMcpTool '{s}' failed: {s}", .{ tool.full_name, @errorName(err) });
+                    continue;
+                };
+                try self.addPluginTool(gpa, record);
+            }
+        }
+    }
 };
 
+/// The implementation module for the host shell — THE single shell-selection
+/// point. `shell_tool` below is its model-facing `Tool` record, and the
+/// executor routes special cases (containment guard, background routing)
+/// through `shell_impl`'s namespace, so name and behavior can never drift.
+pub const shell_impl = if (os.is_windows) pwsh_tool else bash_tool;
+
 /// The model-facing shell tool selected at comptime: `pwsh` on Windows,
-/// `bash` elsewhere. THE single source of truth for the bash↔pwsh switch —
-/// every consumer (the builtin list below, the executor's dispatch, the TUI
-/// display policy) reads the selected name from here.
-pub const shell_tool: Tool = if (os.is_windows) pwsh_tool.tool else bash_tool.tool;
+/// `bash` elsewhere. Every consumer (the builtin list below, the executor's
+/// dispatch, the TUI display policy) reads the selected name from here.
+pub const shell_tool: Tool = shell_impl.tool;
 
 /// Canonical builtin tool list. Consumed by `ToolRegistry.init` and by
 /// `src/tools.zig`'s re-export (all single-registry call sites).
@@ -157,19 +185,19 @@ const dummy_run: *const fn (
     io: std.Io,
     cwd: []const u8,
     args: []const u8,
-    userdata: *anyopaque,
+    env: tools_common.Env,
 ) tools_common.Error!tools_common.Output = struct {
     fn run(
         gpa: std.mem.Allocator,
         io: std.Io,
         cwd: []const u8,
         args: []const u8,
-        userdata: *anyopaque,
+        env: tools_common.Env,
     ) tools_common.Error!tools_common.Output {
         _ = io;
         _ = cwd;
         _ = args;
-        _ = userdata;
+        _ = env;
         const stdout = try gpa.dupe(u8, "ok");
         const stderr = try gpa.alloc(u8, 0);
         return .{ .stdout = stdout, .stderr = stderr, .code = 0 };
@@ -179,15 +207,15 @@ const dummy_run: *const fn (
 const dummy_display: *const fn (
     gpa: std.mem.Allocator,
     args: []const u8,
-    userdata: *anyopaque,
+    env: tools_common.Env,
 ) std.mem.Allocator.Error!tools_common.ToolDisplay = struct {
     fn display(
         gpa: std.mem.Allocator,
         args: []const u8,
-        userdata: *anyopaque,
+        env: tools_common.Env,
     ) std.mem.Allocator.Error!tools_common.ToolDisplay {
         _ = args;
-        _ = userdata;
+        _ = env;
         return .{ .label = try gpa.dupe(u8, "dummy") };
     }
 }.display;

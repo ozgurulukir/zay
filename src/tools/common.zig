@@ -1,6 +1,9 @@
 const std = @import("std");
 
+const context_mod = @import("context.zig");
 const assert = std.debug.assert;
+
+pub const ToolContext = context_mod.ToolContext;
 
 pub const DisplayKind = enum(u8) { text, diff };
 
@@ -249,15 +252,24 @@ pub const ToolDisplay = struct {
     }
 };
 
+/// Per-call environment passed to every `Tool.run` / `Tool.display` callback.
+/// `ctx` is the executor-owned runtime context (background manager, lane
+/// bridge, skills, plugin manager — see `tools/context.zig`); `userdata` the
+/// per-tool state (plugin tools carry a `*PluginToolKey`; builtins leave it
+/// `undefined`). Together they replace the former per-tool thread-local slots.
+pub const Env = struct {
+    ctx: *const ToolContext,
+    userdata: *anyopaque = undefined,
+};
+
 /// A typed record describing one tool. The Tool registry in `tools.zig`
 /// is a slice of these; it is the single source of truth for what tools
 /// exist. Display policy (Expand-by-default, render mode) is NOT carried
 /// here — that lives TUI-side.
 ///
-/// `userdata` is passed as the last argument to every callback so the
-/// same shared `*const fn` signature can route through per-tool state
-/// without resorting to a global mutable slot. Builtin tools pass
-/// `undefined` (it is never read); plugin tools pass a `*PluginToolKey`.
+/// `env` is passed as the last argument to every callback so the same shared
+/// `*const fn` signature can reach both the runtime context and per-tool
+/// state without ambient globals.
 pub const Tool = struct {
     name: []const u8,
     /// Raw description template. May contain `{{hsep}}` placeholders that
@@ -269,7 +281,7 @@ pub const Tool = struct {
         io: std.Io,
         cwd: []const u8,
         args: []const u8,
-        userdata: *anyopaque,
+        env: Env,
     ) Error!Output,
     /// Produce the human display metadata shown in the TUI's tool row.
     /// `label` is the collapsed summary; `expanded_label`, when present,
@@ -277,11 +289,12 @@ pub const Tool = struct {
     display: *const fn (
         gpa: std.mem.Allocator,
         args: []const u8,
-        userdata: *anyopaque,
+        env: Env,
     ) std.mem.Allocator.Error!ToolDisplay,
-    /// Optional per-tool context. Plugin tools use this to carry their
-    /// `(plugin_name, tool_name, manager)` key; builtin tools leave it
-    /// `undefined`. Borrowed; freed via `userdata_free` on registry teardown.
+    /// Optional per-tool state routed through `Env.userdata`. Plugin tools
+    /// use this to carry their `(plugin_name, tool_name)` key; builtin tools
+    /// leave it `undefined`. Borrowed; freed via `userdata_free` on registry
+    /// teardown.
     userdata: *anyopaque = undefined,
     /// Frees the heap allocation behind `userdata`. Null when the tool
     /// has no per-tool state (e.g. all builtins). The allocator matches

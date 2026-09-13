@@ -3,9 +3,10 @@ const tools_common = @import("tools/common.zig");
 const tools_mod = @import("tools.zig");
 
 pub const codex_responses = @import("ai/codex_responses.zig");
+pub const responses_core = @import("ai/responses_core.zig");
+pub const tool_schema = @import("ai/tool_schema.zig");
 pub const websocket = @import("websocket");
 pub const openai_compatible = @import("ai/openai_compatible.zig");
-pub const openai_responses = @import("ai/openai_responses.zig");
 pub const provider_headers = @import("ai/provider_headers.zig");
 pub const text_tool_call = @import("ai/text_tool_call.zig");
 
@@ -703,13 +704,15 @@ pub fn noopObserver(comptime Ctx: type, ctx: *Ctx) StreamObserver(Ctx) {
 pub fn streamNoop() StreamObserver(NoopCtx) {
     return noopObserver(NoopCtx, &noop_ctx);
 }
-
 pub const LanguageModel = union(enum) {
     none,
     codex_responses: *codex_responses.Client,
     openai_compatible: *openai_compatible.Client,
-    openai_responses: *openai_responses.Client,
+    responses: *responses_core.Client,
 
+    /// The uniform three-method client contract: `prompt`, `errorDetail`,
+    /// `updateTools`. `inline else` makes the contract structural — a new tag
+    /// without the methods fails to compile here instead of at runtime.
     pub fn prompt(
         self: LanguageModel,
         messages: []const MessageView,
@@ -717,45 +720,26 @@ pub const LanguageModel = union(enum) {
     ) !Turn {
         return switch (self) {
             .none => error.NoProviderConnected,
-            .codex_responses => |c| c.prompt(messages, observer),
-            .openai_compatible => |c| c.prompt(messages, observer),
-            .openai_responses => |c| c.prompt(messages, observer),
+            inline else => |c| c.prompt(messages, observer),
         };
     }
 
     pub fn lastErrorDetail(self: LanguageModel) ?[]const u8 {
         return switch (self) {
             .none => null,
-            .openai_compatible => |c| c.last_error_detail,
-            .codex_responses => |c| c.core_client.last_error_detail,
-            .openai_responses => |c| c.core_client.last_error_detail,
+            inline else => |c| c.errorDetail(),
         };
     }
 
-    /// Rebuild the active client's serialized tool definitions after the MCP
-    /// tool set changes. No-op when no client is connected. `mcp_tools` is
-    /// borrowed only for the duration of the call. `registry`, when
-    /// non-null, contributes its builtin + plugin tools so the model sees
-    /// them as first-class definitions. `builtin_override` lets the caller
-    /// choose what `self.config.tools` contains at call time: most callers
-    /// pass `&.{}` because the registry's builtin already covers bash,
-    /// and emitting both would create a duplicate name that most APIs
-    /// reject (HTTP 400), dropping the entire tool list.
-    pub fn updateMcpTools(
-        self: LanguageModel,
-        mcp_tools: []const McpToolSchema,
-        registry: ?*tools_mod.ToolRegistry,
-        builtin_override: []const tools_common.Tool,
-    ) !void {
-        switch (self) {
+    /// Push the final, already-deduped tool list into the client. No-op when
+    /// no client is connected.
+    pub fn updateTools(self: LanguageModel, specs: []const tool_schema.ToolSpec) !void {
+        return switch (self) {
             .none => {},
-            .codex_responses => |c| try c.updateMcpTools(mcp_tools, registry, builtin_override),
-            .openai_compatible => |c| try c.updateMcpTools(mcp_tools, registry, builtin_override),
-            .openai_responses => |c| try c.updateMcpTools(mcp_tools, registry, builtin_override),
-        }
+            inline else => |c| c.updateTools(specs),
+        };
     }
 };
-
 test "clampTokenCount clamps negative values to zero" {
     try std.testing.expectEqual(@as(u32, 0), clampTokenCount(-1));
     try std.testing.expectEqual(@as(u32, 0), clampTokenCount(-100));

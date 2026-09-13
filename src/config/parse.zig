@@ -17,6 +17,7 @@ const paths = @import("../paths.zig");
 const log = std.log.scoped(.config);
 
 const config_mod = @import("config.zig");
+const mcp_naming = @import("../mcp/naming.zig");
 const provider_types = @import("provider.zig");
 const mcp_types = @import("mcp.zig");
 const plugin_types = @import("plugin.zig");
@@ -880,6 +881,15 @@ fn parseMcpServers(gpa: std.mem.Allocator, value: std.json.Value) ![]McpServerCo
         // transport is still undefined.
         if (cmd != null and url != null) return error.InvalidMcpServerConfig;
         if (cmd == null and url == null) return error.InvalidMcpServerConfig;
+
+        // The name becomes part of the `mcp__<server>__<tool>` wire tool name
+        // (see mcp/naming.zig); a `__` inside it would make that name
+        // ambiguous to parse back. Skip the server with a diagnostic instead
+        // of failing the whole config load.
+        if (!mcp_naming.validServerName(entry.key_ptr.*)) {
+            log.warn("MCP server '{s}': name must not contain '{s}' (it is used in tool names), skipping", .{ entry.key_ptr.*, mcp_naming.separator });
+            continue;
+        }
 
         var server: McpServerConfig = undefined;
         server.name = try gpa.dupe(u8, entry.key_ptr.*);

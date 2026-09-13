@@ -172,18 +172,11 @@ pub fn beginSubmit(app: *App) !bool {
     }
     // C1: an idle lane (from `lane create` or a rested worker) has no
     // worker_context — submitting here would deref null at the
-    // `resetCancel`/`dupe` sites below. Refuse with a guiding notice
-    // instead of crashing. The guard is before `toOwnedSlice` so the
-    // user's typed input is preserved (TD-2).
+    // `resetCancel`/`dupe` sites below. Refuse through the shared gate with
+    // a guiding notice instead of crashing. The guard is before
+    // `toOwnedSlice` so the user's typed input is preserved (TD-2).
     if (app.thread.worker_context == null) {
-        const id = lanes_util.idleLaneId(app.thread);
-        const notice = std.fmt.allocPrint(
-            app.gpa,
-            lanes_util.idle_lane_notice_template,
-            .{ id, id },
-        ) catch return false;
-        defer app.gpa.free(notice);
-        _ = app.thread.transcript.append(app.gpa, .notice, "lane", notice) catch {};
+        lanes_util.appendIdleLaneNotice(app);
         return false;
     }
     const prompt = try app.inputs.input.toOwnedSlice();

@@ -1,19 +1,12 @@
 //! The `background` builtin tool — enables the agent to query and manage
 //! long-running background jobs started with `run_in_background: true`.
-//! Reaches `BackgroundManager` through a scoped thread-local slot (`background_slot`)
-//! bound in `ExecutorService.produceOutput`.
+//! Reaches `BackgroundManager` through `Tool.Env.ctx` (the executor-owned
+//! runtime context).
 
 const std = @import("std");
 
 const background = @import("../background.zig");
 const common = @import("common.zig");
-
-pub const BackgroundSlot = struct {
-    manager: ?*background.BackgroundManager = null,
-    owner_generation: u64 = 1,
-};
-
-pub threadlocal var background_slot: BackgroundSlot = .{};
 
 pub const tool: common.Tool = .{
     .name = "background",
@@ -293,12 +286,11 @@ pub fn runTool(
     io: std.Io,
     cwd: []const u8,
     arguments: []const u8,
-    userdata: *anyopaque,
+    env: common.Env,
 ) common.Error!common.Output {
     _ = cwd;
-    _ = userdata;
-    const slot = background_slot;
-    const mgr = slot.manager orelse return common.failFmt(gpa, 1, "background: background execution is unavailable in this context\n", .{});
+    _ = env.userdata;
+    const mgr = env.ctx.background_manager orelse return common.failFmt(gpa, 1, "background: background execution is unavailable in this context\n", .{});
 
     const parsed = parseArgs(gpa, arguments) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -333,9 +325,9 @@ pub fn runTool(
 pub fn display(
     gpa: std.mem.Allocator,
     args: []const u8,
-    userdata: *anyopaque,
+    env: common.Env,
 ) std.mem.Allocator.Error!common.ToolDisplay {
-    _ = userdata;
+    _ = env;
     const Probe = struct { command: ?[]const u8 = null, id: ?u32 = null };
     const parsed = std.json.parseFromSlice(Probe, gpa, args, .{ .ignore_unknown_fields = true }) catch {
         return .{ .label = try gpa.dupe(u8, "bg") };
@@ -402,19 +394,19 @@ test "background display formats labels correctly" {
     const gpa = std.testing.allocator;
 
     {
-        var d = try display(gpa, "{\"command\":\"list\"}", undefined);
+        var d = try display(gpa, "{\"command\":\"list\"}", .{ .ctx = &common.ToolContext.headless });
         defer d.deinit(gpa);
         try std.testing.expectEqualStrings("bg list", d.label);
     }
 
     {
-        var d = try display(gpa, "{\"command\":\"cancel\",\"id\":1}", undefined);
+        var d = try display(gpa, "{\"command\":\"cancel\",\"id\":1}", .{ .ctx = &common.ToolContext.headless });
         defer d.deinit(gpa);
         try std.testing.expectEqualStrings("bg cancel 1", d.label);
     }
 
     {
-        var d = try display(gpa, "{}", undefined);
+        var d = try display(gpa, "{}", .{ .ctx = &common.ToolContext.headless });
         defer d.deinit(gpa);
         try std.testing.expectEqualStrings("bg", d.label);
     }
@@ -441,13 +433,10 @@ test "readLogTailBounded reads trailing lines accurately" {
     try std.testing.expectEqualStrings("line 1\nline 2\nline 3\nline 4\nline 5\n", tail_10);
 }
 
-test "background tool reports unavailable when slot is null" {
+test "background tool reports unavailable without a manager in context" {
     const gpa = std.testing.allocator;
-    const prev = background_slot;
-    defer background_slot = prev;
-    background_slot = .{};
 
-    var output = try runTool(gpa, std.testing.io, ".", "{\"command\":\"list\"}", undefined);
+    var output = try runTool(gpa, std.testing.io, ".", "{\"command\":\"list\"}", .{ .ctx = &common.ToolContext.headless });
     defer output.deinit(gpa);
     try std.testing.expectEqual(@as(u8, 1), output.code);
     try std.testing.expect(std.mem.indexOf(u8, output.stderr, "background execution is unavailable") != null);
@@ -458,14 +447,11 @@ test "background tool executes list, status, cancel, and tail with active manage
     const io = std.testing.io;
     var manager = background.BackgroundManager.init(io, gpa);
     defer manager.deinit();
-
-    const prev = background_slot;
-    defer background_slot = prev;
-    background_slot = .{ .manager = &manager, .owner_generation = 1 };
+    var ctx: common.ToolContext = .{ .background_manager = &manager, .owner_generation = 1 };
 
     // 1. List with no jobs
     {
-        var output = try runTool(gpa, io, ".", "{\"command\":\"list\"}", undefined);
+        var output = try runTool(gpa, io, ".", "{\"command\":\"list\"}", .{ .ctx = &ctx });
         defer output.deinit(gpa);
         try std.testing.expectEqual(@as(u8, 0), output.code);
         try std.testing.expectEqualStrings("No active background jobs running.\n", output.stdout);
@@ -473,7 +459,7 @@ test "background tool executes list, status, cancel, and tail with active manage
 
     // 2. Status for non-existent job
     {
-        var output = try runTool(gpa, io, ".", "{\"command\":\"status\",\"id\":99}", undefined);
+        var output = try runTool(gpa, io, ".", "{\"command\":\"status\",\"id\":99}", .{ .ctx = &ctx });
         defer output.deinit(gpa);
         try std.testing.expectEqual(@as(u8, 1), output.code);
         try std.testing.expect(std.mem.indexOf(u8, output.stderr, "no running job found with id 99") != null);
@@ -481,7 +467,7 @@ test "background tool executes list, status, cancel, and tail with active manage
 
     // 3. Status missing id
     {
-        var output = try runTool(gpa, io, ".", "{\"command\":\"status\"}", undefined);
+        var output = try runTool(gpa, io, ".", "{\"command\":\"status\"}", .{ .ctx = &ctx });
         defer output.deinit(gpa);
         try std.testing.expectEqual(@as(u8, 1), output.code);
         try std.testing.expect(std.mem.indexOf(u8, output.stderr, "`id` is required") != null);
@@ -489,7 +475,7 @@ test "background tool executes list, status, cancel, and tail with active manage
 
     // 4. Cancel non-existent job
     {
-        var output = try runTool(gpa, io, ".", "{\"command\":\"cancel\",\"id\":99}", undefined);
+        var output = try runTool(gpa, io, ".", "{\"command\":\"cancel\",\"id\":99}", .{ .ctx = &ctx });
         defer output.deinit(gpa);
         try std.testing.expectEqual(@as(u8, 1), output.code);
         try std.testing.expect(std.mem.indexOf(u8, output.stderr, "no running job found with id 99") != null);
@@ -497,7 +483,7 @@ test "background tool executes list, status, cancel, and tail with active manage
 
     // 5. Tail non-existent job
     {
-        var output = try runTool(gpa, io, ".", "{\"command\":\"tail\",\"id\":99}", undefined);
+        var output = try runTool(gpa, io, ".", "{\"command\":\"tail\",\"id\":99}", .{ .ctx = &ctx });
         defer output.deinit(gpa);
         try std.testing.expectEqual(@as(u8, 1), output.code);
         try std.testing.expect(std.mem.indexOf(u8, output.stderr, "no running job found with id 99") != null);

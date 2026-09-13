@@ -38,19 +38,28 @@ fn deleteImpl(comptime Backend: type, gpa: std.mem.Allocator, service: []const u
     return Backend.delete(gpa, service, account);
 }
 
+/// Test seam: when set, every backend operation fails with this error so
+/// callers exercise their `auth.json` file-fallback paths on any OS — a real
+/// Credential Manager would otherwise make "keyring save failed" unreachable
+/// in tests. Reset to null in a `defer` after use.
+pub var forced_error: ?Error = null;
+
 /// Read the secret for `service`/`account`. Returns gpa-owned bytes, or null
 /// when no such entry exists.
 pub fn load(gpa: std.mem.Allocator, service: []const u8, account: []const u8) Error!?[]u8 {
+    if (forced_error) |err| return err;
     return loadImpl(impl, gpa, service, account);
 }
 
 /// Create or replace the secret for `service`/`account`.
 pub fn save(gpa: std.mem.Allocator, service: []const u8, account: []const u8, secret: []const u8) Error!void {
+    if (forced_error) |err| return err;
     return saveImpl(impl, gpa, service, account, secret);
 }
 
 /// Remove the secret. Returns true when an entry was actually deleted.
 pub fn delete(gpa: std.mem.Allocator, service: []const u8, account: []const u8) Error!bool {
+    if (forced_error) |err| return err;
     return deleteImpl(impl, gpa, service, account);
 }
 

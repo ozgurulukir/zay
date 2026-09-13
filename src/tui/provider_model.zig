@@ -9,6 +9,7 @@ const ai = @import("../ai.zig");
 const auth = @import("../auth/store.zig");
 const codex = @import("../auth/codex.zig");
 const config_mod = @import("../config/config.zig");
+const lane_state_mod = @import("lanes/lane_state.zig");
 const model_catalogue = @import("model_catalogue.zig");
 const model_loader = @import("model_loader.zig");
 const model_picker = @import("widgets/model_picker.zig");
@@ -1607,6 +1608,16 @@ fn injectAllTools(self: *App) void {
         log.warn("injectAllTools: no live runtime, skipping tool injection", .{});
         return;
     };
+    // Sync the registry's `mcp__` records from the connected clients so
+    // dispatch and schema resolution read the same registry path as builtins
+    // and plugin tools. Refused while any lane turn is in flight (registry
+    // mutation is a use-after-free hazard for a mid-dispatch worker); the
+    // connect-pending tick re-triggers on a later tick instead.
+    if (!lane_state_mod.anyLaneTurnActive(self)) {
+        self.tool_registry.syncMcpTools(self.gpa, &self.mcp_manager) catch |err| {
+            log.warn("injectAllTools: syncMcpTools failed: {s}", .{@errorName(err)});
+        };
+    }
     injectToolsInto(self, runtime);
 }
 
@@ -1618,19 +1629,17 @@ fn injectAllTools(self: *App) void {
 /// attach their client via `applyFromConfig` before the App can inject
 /// anything, so they need one explicit push once their `tool_registry` is
 /// wired — otherwise the session runs tool-less.
+/// Push the merged tool list (registry builtin + plugin + MCP records) into
+/// `runtime`'s attached client via `AgentRuntime.syncToolJson`. Besides the
+/// live-runtime callers (`injectAllTools`), `createRuntime` uses this for
+/// freshly-created runtimes (session switch, resume, lane spawn): those
+/// attach their client via `applyFromConfig` before the App can inject
+/// anything, so they need one explicit push once their `tool_registry` is
+/// wired — otherwise the session runs tool-less.
 pub fn injectToolsInto(self: *App, runtime: *runtime_mod.AgentRuntime) void {
-    const mcp_schemas = self.mcp_manager.buildMcpToolSchemas(self.gpa) catch |err| {
-        log.warn("injectToolsInto: buildMcpToolSchemas failed: {s}", .{@errorName(err)});
-        return;
-    };
-    defer self.gpa.free(mcp_schemas);
-    log.debug("injectToolsInto: mcp={} (plugin tools come from ToolRegistry)", .{mcp_schemas.len});
-    // Pass an empty builtin_override so we don't double-emit bash: the
-    // registry's builtin already contains it, and most OpenAI-compatible
-    // APIs reject duplicate tool names with HTTP 400, dropping the
-    // entire tool list (including the plugin tools we want exposed).
-    runtime.client.updateMcpTools(mcp_schemas, self.tool_registry, &.{}) catch |err| {
-        log.warn("injectToolsInto: updateMcpTools failed: {s}", .{@errorName(err)});
+    _ = self;
+    runtime.syncToolJson() catch |err| {
+        log.warn("injectToolsInto: syncToolJson failed: {s}", .{@errorName(err)});
     };
 }
 

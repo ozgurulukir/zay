@@ -69,10 +69,7 @@ pub fn writeRequestPayload(
             // in AGENTS.md), but effort clipping is cheap and keeps the two wire
             // clients consistent so a provider switch never changes the effort
             // semantics unexpectedly.
-            const wire_label = model_compat.clipEffortForModel(
-                config.model,
-                model_compat.wireEffortLabel(config.wire_dialect, effort),
-            );
+            const wire_label = model_compat.resolveEffortLabel(config.model, config.wire_dialect, effort);
             if (wire_label) |label| {
                 try out.writeAll("\"effort\":");
                 try std.json.Stringify.value(label, .{}, out);

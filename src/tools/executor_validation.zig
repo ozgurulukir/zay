@@ -11,39 +11,25 @@ const mcp_mod = @import("../mcp/manager.zig");
 const schema_mod = @import("schema.zig");
 const tools = @import("../tools.zig");
 
-/// Resolve the `tools.Schema` for a call across all three channels (MCP, Plugin, Builtin).
-/// Returns null when the tool is unknown — validation is then skipped.
+/// Resolve the `tools.Schema` for a call through the registry's O(1) index —
+/// builtin, plugin, AND MCP records all live there (MCP via
+/// `mcp/registry_bridge.zig` + `ToolRegistry.syncMcpTools`). Returns null
+/// when the tool is unknown — validation is then skipped.
 pub fn resolveSchema(
     tool_registry: ?*tools.ToolRegistry,
     mcp_manager: ?*mcp_mod.McpManager,
     gpa: std.mem.Allocator,
     call: ai.ToolCall,
 ) ?tools.Schema {
-    // MCP: `mcp__<server>__<tool>` → the connected client's tool schema.
-    if (std.mem.startsWith(u8, call.name, "mcp__")) {
-        const manager = mcp_manager orelse return null;
-        const rest = call.name["mcp__".len..];
-        const sep = std.mem.indexOfScalar(u8, rest, '_') orelse return null;
-        const after_server = rest[sep + 1 ..];
-        if (after_server.len == 0 or after_server[0] != '_') return null;
-        const server_name = rest[0..sep];
-        for (manager.clients.items) |*client| {
-            if (client.status() != .connected) continue;
-            if (!std.mem.eql(u8, client.name, server_name)) continue;
-            for (client.tools.items) |*tool| {
-                if (std.mem.eql(u8, tool.full_name, call.name)) return tool.schema;
-            }
-        }
-        return null;
-    }
-    // Builtin + plugin: one registry lookup.
+    // The manager parameter is kept for signature stability with the
+    // executor's dispatch context; schema resolution no longer walks it.
+    _ = mcp_manager;
+    _ = gpa;
     if (tool_registry) |registry| {
-        const slice = registry.all(gpa) catch return null;
-        for (slice) |tool| {
-            if (std.mem.eql(u8, tool.name, call.name)) return tool.schema;
-        }
+        if (registry.lookup(call.name)) |tool| return tool.schema;
         return null;
     }
+    // No live registry (tests / headless): static builtin fallback.
     for (tools.builtinRegistry()) |tool| {
         if (std.mem.eql(u8, tool.name, call.name)) return tool.schema;
     }

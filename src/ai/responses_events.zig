@@ -5,6 +5,8 @@
 //! message block state.
 
 const std = @import("std");
+const stream_part = @import("stream_part.zig");
+const http = @import("../http.zig");
 const log = std.log.scoped(.ai);
 
 const ai = @import("../ai.zig");
@@ -47,11 +49,39 @@ pub const Terminal = struct {
         return self.completed or self.incomplete;
     }
 };
+/// Uniform stream-adapter entry (the Responses counterpart of
+/// `stream_parser.readStream`): drain the SSE source into a `StreamState`,
+/// then finalise the turn. The transport calls this and never touches the
+/// adapter's internal state, so event ownership stays here — the `errdefer`
+/// below must not move out.
+pub fn run(gpa: std.mem.Allocator, reader: *std.Io.Reader, observer: anytype, env: stream_part.StreamEnv) !ai.Turn {
+    var state: StreamState = .{ .limits = env.limits };
+    defer state.deinit(gpa);
+    errdefer state.deinitBlocks(gpa);
+    var call_seq = env.id_seq.*;
+    var source: stream_part.Source = .{ .reader = reader };
+    while (try source.next(gpa)) |data| {
+        defer gpa.free(data);
+        log.info("responses.response.sse data={s}", .{http.logBytesHead(data)});
+        try state.processJson(gpa, data, observer, &call_seq);
+    }
+    const turn = try state.finish(gpa, &call_seq);
+    env.id_seq.* = call_seq;
+    return turn;
+}
 
 pub const StreamState = struct {
     blocks: std.ArrayList(ai.ContentBlock) = .empty,
     tools: std.ArrayList(ToolBuilder) = .empty,
     terminal: Terminal = .{},
+    /// Shared stream policy (parallel-call cap + reject-log label) — the same
+    /// struct the chat-completions parser takes, so the cap is no longer
+    /// chat-only. Defaults keep existing tests and the codex websocket loop
+    /// at the historical behaviour.
+    limits: stream_part.StreamLimits = .{},
+    /// Tool calls dropped because the parallel-call cap was hit; surfaced at
+    /// `finish` so the caller can inform the model, mirroring the chat side.
+    dropped: u32 = 0,
 
     pub fn deinit(self: *StreamState, gpa: std.mem.Allocator) void {
         for (self.tools.items) |*tool| tool.deinit(gpa);
@@ -64,10 +94,13 @@ pub const StreamState = struct {
     }
 
     pub fn processJson(self: *StreamState, gpa: std.mem.Allocator, data: []const u8, observer: anytype, call_seq: *u64) !void {
-        try processEvent(gpa, data, &self.blocks, &self.tools, observer, call_seq, &self.terminal);
+        try processEvent(gpa, data, &self.blocks, &self.tools, observer, call_seq, &self.terminal, self.limits, &self.dropped);
     }
 
     pub fn finish(self: *StreamState, gpa: std.mem.Allocator, call_seq: *u64) !ai.Turn {
+        if (self.dropped > 0) {
+            log.warn("readStream.dropped dropped={d} max_calls={d} model={s}", .{ self.dropped, self.limits.max_parallel_calls, self.limits.model_label });
+        }
         if (!self.terminal.isTerminal()) return error.ResponseIncomplete;
         try syncToolBlocks(gpa, &self.blocks, self.tools.items, call_seq);
         const content = try self.blocks.toOwnedSlice(gpa);
@@ -84,6 +117,8 @@ pub fn processEvent(
     observer: anytype,
     call_seq: *u64,
     terminal: *Terminal,
+    limits: stream_part.StreamLimits,
+    dropped: *u32,
 ) !void {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, data, .{}) catch return;
     defer parsed.deinit();
@@ -108,7 +143,7 @@ pub fn processEvent(
             return;
         },
         .lifecycle => return,
-        .output_item_added => return onItemAdded(gpa, parsed.value, blocks, tools, call_seq),
+        .output_item_added => return onItemAdded(gpa, parsed.value, blocks, tools, call_seq, limits, dropped),
         .content_part_added => return onContentPartAdded(gpa, parsed.value, blocks),
         .output_text_delta => return onTextDelta(gpa, parsed.value, blocks, observer),
         .refusal_delta => return onTextDelta(gpa, parsed.value, blocks, observer),
@@ -229,7 +264,7 @@ pub fn responseEventFromString(name: []const u8) ?ResponseEvent {
     return null;
 }
 
-fn onItemAdded(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), tools: *std.ArrayList(ToolBuilder), call_seq: *u64) !void {
+fn onItemAdded(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), tools: *std.ArrayList(ToolBuilder), call_seq: *u64, limits: stream_part.StreamLimits, dropped: *u32) !void {
     const item = value.object.get("item") orelse return;
     if (item != .object) return;
     const kind = item.object.get("type") orelse return;
@@ -240,6 +275,14 @@ fn onItemAdded(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.Array
         const raw = try std.json.Stringify.valueAlloc(gpa, item, .{});
         try blocks.append(gpa, .{ .reasoning = .{ .text = try gpa.alloc(u8, 0), .responses_item_json = raw } });
     } else if (std.mem.eql(u8, kind.string, "function_call")) {
+        // Same parallel-call cap as the chat-completions parser: a call at or
+        // above the cap is dropped (counted) so the remaining calls can still
+        // complete the turn.
+        if (tools.items.len >= limits.max_parallel_calls) {
+            dropped.* += 1;
+            log.warn("parseToolCall.reject index={d} exceeds max_parallel_tool_calls={d} model={s}", .{ tools.items.len, limits.max_parallel_calls, limits.model_label });
+            return;
+        }
         var builder: ToolBuilder = .{};
         errdefer builder.deinit(gpa);
         builder.output_index = optionalU32(value, "output_index");
@@ -554,6 +597,8 @@ test "openresponses emits final item text when no delta arrived" {
     observer.on_content = Seen.onContent;
 
     var call_seq: u64 = 0;
+    var dropped: u32 = 0;
+    _ = &dropped;
     try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}", observer, &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}}", observer, &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.completed\"}", observer, &call_seq);
@@ -571,6 +616,8 @@ test "openresponses preserves text tool text block order" {
     defer state.deinitBlocks(gpa);
 
     var call_seq: u64 = 0;
+    var dropped: u32 = 0;
+    _ = &dropped;
     try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}", ai.streamNoop(), &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.output_text.delta\",\"delta\":\"before\"}", ai.streamNoop(), &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"id\":\"item_a\",\"name\":\"bash\"}}", ai.streamNoop(), &call_seq);
@@ -594,6 +641,8 @@ test "openresponses parses usage from completed event" {
     defer state.deinitBlocks(gpa);
 
     var call_seq: u64 = 0;
+    var dropped: u32 = 0;
+    _ = &dropped;
     try state.processJson(gpa, "{\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":2000,\"input_tokens_details\":{\"cached_tokens\":1500},\"output_tokens\":420,\"output_tokens_details\":{\"reasoning_tokens\":256},\"total_tokens\":2420}}}", ai.streamNoop(), &call_seq);
 
     var turn = try state.finish(gpa, &call_seq);
@@ -613,6 +662,8 @@ test "openresponses completed event without usage leaves null" {
     defer state.deinitBlocks(gpa);
 
     var call_seq: u64 = 0;
+    var dropped: u32 = 0;
+    _ = &dropped;
     try state.processJson(gpa, "{\"type\":\"response.completed\"}", ai.streamNoop(), &call_seq);
 
     var turn = try state.finish(gpa, &call_seq);
@@ -631,6 +682,8 @@ test "openresponses incomplete event yields a Turn carrying the length reason" {
     defer state.deinitBlocks(gpa);
 
     var call_seq: u64 = 0;
+    var dropped: u32 = 0;
+    _ = &dropped;
     try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}", ai.streamNoop(), &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.output_text.delta\",\"delta\":\"halfway plan...\"}", ai.streamNoop(), &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":1200,\"output_tokens\":4096,\"total_tokens\":5296}}}", ai.streamNoop(), &call_seq);
@@ -648,6 +701,8 @@ test "openresponses incomplete event yields a Turn carrying the length reason" {
 test "openresponses incomplete maps content_filter and absent reasons" {
     const gpa = std.testing.allocator;
     var call_seq: u64 = 0;
+    var dropped: u32 = 0;
+    _ = &dropped;
 
     var filtered: StreamState = .{};
     defer filtered.deinit(gpa);
@@ -673,6 +728,8 @@ test "openresponses routes parallel argument deltas by output index" {
     defer state.deinitBlocks(gpa);
 
     var call_seq: u64 = 0;
+    var dropped: u32 = 0;
+    _ = &dropped;
     try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"id\":\"item_a\",\"name\":\"bash\"}}", ai.streamNoop(), &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_b\",\"id\":\"item_b\",\"name\":\"bash\"}}", ai.streamNoop(), &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"command\\\":\"}", ai.streamNoop(), &call_seq);
@@ -697,9 +754,11 @@ test "processEvent ignores malformed JSON payloads gracefully" {
     defer tools.deinit(gpa);
     var terminal: Terminal = .{};
     var call_seq: u64 = 0;
+    var dropped: u32 = 0;
+    _ = &dropped;
 
     // Truncated / broken JSON should not error or crash
-    try processEvent(gpa, "{\"type\": \"response.output_text.delta\", \"delta\":", &blocks, &tools, ai.streamNoop(), &call_seq, &terminal);
+    try processEvent(gpa, "{\"type\": \"response.output_text.delta\", \"delta\":", &blocks, &tools, ai.streamNoop(), &call_seq, &terminal, .{}, &dropped);
     try std.testing.expectEqual(@as(usize, 0), blocks.items.len);
     try std.testing.expectEqual(false, terminal.completed);
 }
@@ -712,8 +771,10 @@ test "processEvent ignores unknown event types without error" {
     defer tools.deinit(gpa);
     var terminal: Terminal = .{};
     var call_seq: u64 = 0;
+    var dropped: u32 = 0;
+    _ = &dropped;
 
-    try processEvent(gpa, "{\"type\": \"custom_vendor.telemetry_heartbeat\"}", &blocks, &tools, ai.streamNoop(), &call_seq, &terminal);
+    try processEvent(gpa, "{\"type\": \"custom_vendor.telemetry_heartbeat\"}", &blocks, &tools, ai.streamNoop(), &call_seq, &terminal, .{}, &dropped);
     try std.testing.expectEqual(false, terminal.completed);
     try std.testing.expectEqual(@as(usize, 0), blocks.items.len);
 }
@@ -726,6 +787,8 @@ test "processEvent treats Codex lifecycle events as recognized no-ops" {
     defer tools.deinit(gpa);
     var terminal: Terminal = .{};
     var call_seq: u64 = 0;
+    var dropped: u32 = 0;
+    _ = &dropped;
 
     const events = [_][]const u8{
         "{\"type\":\"response.created\"}",
@@ -742,7 +805,7 @@ test "processEvent treats Codex lifecycle events as recognized no-ops" {
         const type_start = std.mem.indexOf(u8, event, "\"type\":\"").? + "\"type\":\"".len;
         const type_end = std.mem.indexOfPos(u8, event, type_start, "\"").?;
         try std.testing.expectEqual(ResponseEvent.lifecycle, responseEventFromString(event[type_start..type_end]).?);
-        try processEvent(gpa, event, &blocks, &tools, ai.streamNoop(), &call_seq, &terminal);
+        try processEvent(gpa, event, &blocks, &tools, ai.streamNoop(), &call_seq, &terminal, .{}, &dropped);
     }
     try std.testing.expect(!terminal.completed);
     try std.testing.expectEqual(@as(usize, 0), blocks.items.len);
@@ -756,8 +819,10 @@ test "processEvent returns ProviderError on error event" {
     defer tools.deinit(gpa);
     var terminal: Terminal = .{};
     var call_seq: u64 = 0;
+    var dropped: u32 = 0;
+    _ = &dropped;
 
-    const result = processEvent(gpa, "{\"type\": \"error\", \"error\": {\"message\": \"Rate limit exceeded\"}}", &blocks, &tools, ai.streamNoop(), &call_seq, &terminal);
+    const result = processEvent(gpa, "{\"type\": \"error\", \"error\": {\"message\": \"Rate limit exceeded\"}}", &blocks, &tools, ai.streamNoop(), &call_seq, &terminal, .{}, &dropped);
     try std.testing.expectError(error.ProviderError, result);
 }
 
@@ -768,6 +833,8 @@ test "processEvent reassembles split multi-byte UTF-8 deltas" {
     defer state.deinitBlocks(gpa);
 
     var call_seq: u64 = 0;
+    var dropped: u32 = 0;
+    _ = &dropped;
     try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_utf8\"}}", ai.streamNoop(), &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.output_text.delta\",\"delta\":\"Hello 🚀 \"}", ai.streamNoop(), &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.output_text.delta\",\"delta\":\"World! ✨\"}", ai.streamNoop(), &call_seq);
@@ -832,6 +899,8 @@ test "finish returns ResponseIncomplete error when stream ends before completed 
     defer state.deinitBlocks(gpa);
 
     var call_seq: u64 = 0;
+    var dropped: u32 = 0;
+    _ = &dropped;
     try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}", ai.streamNoop(), &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.output_text.delta\",\"delta\":\"halfway content...\"}", ai.streamNoop(), &call_seq);
 
@@ -848,7 +917,9 @@ test "processEvent handles response.failed as ProviderError" {
     defer tools.deinit(gpa);
     var terminal: Terminal = .{};
     var call_seq: u64 = 0;
+    var dropped: u32 = 0;
+    _ = &dropped;
 
-    const result = processEvent(gpa, "{\"type\":\"response.failed\",\"response\":{\"status_details\":{\"error\":{\"message\":\"Server overload\"}}}}", &blocks, &tools, ai.streamNoop(), &call_seq, &terminal);
+    const result = processEvent(gpa, "{\"type\":\"response.failed\",\"response\":{\"status_details\":{\"error\":{\"message\":\"Server overload\"}}}}", &blocks, &tools, ai.streamNoop(), &call_seq, &terminal, .{}, &dropped);
     try std.testing.expectError(error.ProviderError, result);
 }

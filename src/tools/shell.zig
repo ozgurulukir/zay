@@ -134,22 +134,20 @@ pub fn Impl(comptime B: type) type {
             io: std.Io,
             cwd: []const u8,
             arguments: []const u8,
-            userdata: *anyopaque,
+            env: common.Env,
         ) common.Error!common.Output {
-            _ = userdata;
+            _ = env;
             return runToolImpl(gpa, io, cwd, arguments, .{});
         }
 
-        /// Test convenience wrapper — forwards to `runTool` with a null
-        /// `userdata` pointer. Production code uses the 5-argument form so
-        /// `Tool.run` callbacks can route through per-tool context.
+        /// Test convenience wrapper: runs against the shared headless context.
         pub fn runToolForTest(
             gpa: std.mem.Allocator,
             io: std.Io,
             cwd: []const u8,
             arguments: []const u8,
         ) common.Error!common.Output {
-            return runToolImpl(gpa, io, cwd, arguments, .{});
+            return runTool(gpa, io, cwd, arguments, .{ .ctx = &common.ToolContext.headless });
         }
 
         /// Root-contained shell run for lane workers (see `Agent.contained`).
@@ -790,8 +788,8 @@ pub fn Impl(comptime B: type) type {
         /// title is the executable command, so users can inspect exactly what ran.
         /// When no summary is present the command itself becomes the collapsed title,
         /// so the invoked command is never invisible.
-        fn display(gpa: std.mem.Allocator, args: []const u8, userdata: *anyopaque) std.mem.Allocator.Error!common.ToolDisplay {
-            _ = userdata;
+        fn display(gpa: std.mem.Allocator, args: []const u8, env: common.Env) std.mem.Allocator.Error!common.ToolDisplay {
+            _ = env;
             const parsed = std.json.parseFromSlice(JsonArgs, gpa, args, .{ .ignore_unknown_fields = true }) catch {
                 return .{ .label = try gpa.dupe(u8, B.name) };
             };

@@ -55,6 +55,35 @@ pub fn idleLaneId(lane: *Thread) []const u8 {
     return "this lane";
 }
 
+const App = @import("../tui.zig").App;
+
+/// THE idle-lane refusal gate: append the pinned notice to the focused
+/// lane's transcript. Stack-buffer formatting — a refusal must never itself
+/// fail (a former allocPrint version silently refused without a notice on
+/// OOM), so fall back to the static literal when the id does not fit.
+/// The exact bytes are pinned by the test below.
+pub fn appendIdleLaneNotice(app: *App) void {
+    const id = idleLaneId(app.thread);
+    var buffer: [192]u8 = undefined;
+    const notice = std.fmt.bufPrint(
+        &buffer,
+        idle_lane_notice_template,
+        .{ id, id },
+    ) catch idle_lane_notice_fallback;
+    _ = app.thread.transcript.append(app.gpa, .notice, "lane", notice) catch {};
+}
+
+/// Resolve the focused lane's live runtime through the single refusal gate.
+/// Returns the runtime when the lane is live; appends the idle notice and
+/// returns null otherwise. All idle refusals go through this — callers must
+/// not re-derive liveness.
+pub fn requireLiveRuntime(app: *App) ?*@import("../runtime.zig").AgentRuntime {
+    return app.liveRuntime() orelse {
+        appendIdleLaneNotice(app);
+        return null;
+    };
+}
+
 test "idle-lane notice template bytes are pinned" {
     var buffer: [256]u8 = undefined;
     const notice = try std.fmt.bufPrint(

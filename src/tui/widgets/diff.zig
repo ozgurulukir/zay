@@ -10,12 +10,10 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
-const tui = @import("../../tui.zig");
 const tui_style = @import("../style.zig");
 const panel = @import("panel.zig");
 const diff_viewer = @import("../diff_viewer.zig");
 
-const App = tui.App;
 
 // Left-margin columns: [0..3] line number, [4] diff sign, [5] comment bracket,
 // [6..] content.
@@ -23,7 +21,7 @@ const diff_content_col: u16 = 6;
 const diff_bracket_col: u16 = 5;
 
 pub const DiffBodyWidget = struct {
-    app: *App,
+    state: *diff_viewer.State,
 
     pub fn widget(self: *DiffBodyWidget) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -31,25 +29,25 @@ pub const DiffBodyWidget = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *DiffBodyWidget = @ptrCast(@alignCast(ptr));
-        const app = self.app;
+        const state = self.state;
         const w = ctx.max.width orelse 0;
         const h = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = w, .height = h });
         if (w == 0 or h == 0) return surface;
 
-        const lines = app.diff.lines.items;
-        const comments = app.diff.comments.items;
+        const lines = state.lines.items;
+        const comments = state.comments.items;
 
         // Display rows = diff lines interleaved with one preview row per comment
         // (inserted after the comment's last line). We never materialize the full
         // list: only on-screen rows allocate, so a huge diff stays bounded.
         const total = lines.len + comments.len;
-        var cursor_display = app.diff.cursor;
+        var cursor_display = state.cursor;
         for (comments) |comment| {
-            if (comment.row_end < app.diff.cursor) cursor_display += 1;
+            if (comment.row_end < state.cursor) cursor_display += 1;
         }
 
-        var scroll = app.diff.scroll;
+        var scroll = state.scroll;
         if (cursor_display < scroll) scroll = cursor_display;
         if (cursor_display >= scroll + h) scroll = cursor_display + 1 - h;
         if (total > h) {
@@ -57,23 +55,23 @@ pub const DiffBodyWidget = struct {
         } else {
             scroll = 0;
         }
-        app.diff.scroll = scroll;
+        state.scroll = scroll;
 
-        const sel = app.diff.selection();
-        const active = app.diff.activeComment();
+        const sel = state.selection();
+        const active = state.activeComment();
 
         // Walk display rows, drawing only those inside [scroll, scroll + h).
         var display: usize = 0;
         var li: usize = 0;
         while (li < lines.len and display < scroll + h) : (li += 1) {
             if (display >= scroll) {
-                drawDiffRow(&surface, ctx, app, li, @intCast(display - scroll), li >= sel.start and li <= sel.end, active);
+                drawDiffRow(&surface, ctx, state, li, @intCast(display - scroll), li >= sel.start and li <= sel.end, active);
             }
             display += 1;
             for (comments, 0..) |comment, ci| {
                 if (comment.row_end != li) continue;
                 if (display >= scroll and display < scroll + h) {
-                    drawCommentPreview(&surface, ctx, app, ci, @intCast(display - scroll), ci == active);
+                    drawCommentPreview(&surface, ctx, state, ci, @intCast(display - scroll), ci == active);
                 }
                 display += 1;
             }
@@ -82,9 +80,9 @@ pub const DiffBodyWidget = struct {
     }
 };
 
-fn drawDiffRow(surface: *vxfw.Surface, ctx: vxfw.DrawContext, app: *App, idx: usize, row: u16, highlighted: bool, active: ?usize) void {
+fn drawDiffRow(surface: *vxfw.Surface, ctx: vxfw.DrawContext, state: *diff_viewer.State, idx: usize, row: u16, highlighted: bool, active: ?usize) void {
     const p = tui_style.activePalette();
-    const line = app.diff.lines.items[idx];
+    const line = state.lines.items[idx];
     switch (line.kind) {
         .file_header => {
             if (highlighted) panel.fillRow(surface, row, p.selected);
@@ -136,10 +134,10 @@ fn drawDiffRow(surface: *vxfw.Surface, ctx: vxfw.DrawContext, app: *App, idx: us
     };
     panel.lineStyledAt(surface, row, sign, ctx, 4, style) catch {};
 
-    if (app.diff.bracketChar(idx)) |glyph| {
+    if (state.bracketChar(idx)) |glyph| {
         // Yellow when the active (cursor-selected) comment covers this line, so
         // the user can see what Ctrl+E / Ctrl+D will act on; orange otherwise.
-        const base_bracket = if (activeCovers(app, active, idx)) p.diff_bracket_active else p.diff_bracket;
+        const base_bracket = if (activeCovers(state, active, idx)) p.diff_bracket_active else p.diff_bracket;
         panel.lineStyledAt(surface, row, glyph, ctx, diff_bracket_col, bgMerged(base_bracket, row_bg)) catch {};
     }
 
@@ -211,17 +209,17 @@ fn writeDiffSegment(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, col
 }
 
 /// True when the active comment exists and covers `idx`.
-fn activeCovers(app: *App, active: ?usize, idx: usize) bool {
+fn activeCovers(state: *diff_viewer.State, active: ?usize, idx: usize) bool {
     const active_index = active orelse return false;
-    const comment = app.diff.comments.items[active_index];
+    const comment = state.comments.items[active_index];
     return idx >= comment.row_start and idx <= comment.row_end;
 }
 
 /// Inline preview row beneath a commented range: the bracket's `└` foot plus a
 /// 💬 and the comment text. The active comment renders yellow with a 💬 marker.
-fn drawCommentPreview(surface: *vxfw.Surface, ctx: vxfw.DrawContext, app: *App, comment_index: usize, row: u16, active: bool) void {
+fn drawCommentPreview(surface: *vxfw.Surface, ctx: vxfw.DrawContext, state: *diff_viewer.State, comment_index: usize, row: u16, active: bool) void {
     const p = tui_style.activePalette();
-    const comment = app.diff.comments.items[comment_index];
+    const comment = state.comments.items[comment_index];
     const bracket_style = if (active) p.diff_bracket_active else p.diff_bracket;
     panel.lineStyledAt(surface, row, "└", ctx, diff_bracket_col, bracket_style) catch {};
     const marker: []const u8 = if (active) "  💬 " else "💬 ";
@@ -250,7 +248,8 @@ fn expandTabs(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
 }
 
 pub const DiffCommentEditor = struct {
-    app: *App,
+    state: *diff_viewer.State,
+    comment_input: *vxfw.TextField,
 
     pub fn widget(self: *DiffCommentEditor) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -259,11 +258,12 @@ pub const DiffCommentEditor = struct {
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *DiffCommentEditor = @ptrCast(@alignCast(ptr));
         const p = tui_style.activePalette();
-        const app = self.app;
-        const label = app.diff.rangeLabel(ctx.arena, app.diff.comment_anchor) catch "comment";
+        const state = self.state;
+        const comment_input = self.comment_input;
+        const label = state.rangeLabel(ctx.arena, state.comment_anchor) catch "comment";
         const max_w = ctx.max.width orelse ctx.min.width;
         const inner_w: u16 = max_w -| 2;
-        var input_box: vxfw.SizedBox = .{ .child = app.inputs.comment.widget(), .size = .{ .width = inner_w, .height = 1 } };
+        var input_box: vxfw.SizedBox = .{ .child = comment_input.widget(), .size = .{ .width = inner_w, .height = 1 } };
         var border: vxfw.Border = .{
             .child = input_box.widget(),
             .style = p.border_label,
@@ -311,7 +311,8 @@ pub const DiffCommentEditor = struct {
 /// (`palette_input`) on top and the filtered file list below — same shape as the
 /// resume/command pickers, rather than stuffing the query into the border label.
 pub const DiffSearchWidget = struct {
-    app: *App,
+    state: *diff_viewer.State,
+    palette_input: *vxfw.TextField,
 
     pub fn widget(self: *DiffSearchWidget) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -320,7 +321,7 @@ pub const DiffSearchWidget = struct {
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *DiffSearchWidget = @ptrCast(@alignCast(ptr));
         const p = tui_style.activePalette();
-        var inner: DiffSearchInner = .{ .app = self.app };
+        var inner: DiffSearchInner = .{ .state = self.state, .palette_input = self.palette_input };
         var border: vxfw.Border = .{
             .child = inner.widget(),
             .style = p.thinking_body,
@@ -331,7 +332,8 @@ pub const DiffSearchWidget = struct {
 };
 
 const DiffSearchInner = struct {
-    app: *App,
+    state: *diff_viewer.State,
+    palette_input: *vxfw.TextField,
 
     fn widget(self: *DiffSearchInner) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -340,7 +342,8 @@ const DiffSearchInner = struct {
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *DiffSearchInner = @ptrCast(@alignCast(ptr));
         const p = tui_style.activePalette();
-        const app = self.app;
+        const state = self.state;
+        const palette_input = self.palette_input;
         const iw: u16 = ctx.max.width orelse 0;
         const ih: u16 = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = iw, .height = ih });
@@ -356,7 +359,7 @@ const DiffSearchInner = struct {
         const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
         var prompt_text: vxfw.Text = .{ .text = ">", .softwrap = false, .width_basis = .parent };
         var prompt_box: vxfw.SizedBox = .{ .child = prompt_text.widget(), .size = .{ .width = 2, .height = 1 } };
-        var input_box: vxfw.SizedBox = .{ .child = app.inputs.palette.widget(), .size = .{ .width = iw -| 2, .height = 1 } };
+        var input_box: vxfw.SizedBox = .{ .child = palette_input.widget(), .size = .{ .width = iw -| 2, .height = 1 } };
         var search_row: vxfw.FlexRow = .{ .children = &.{
             .{ .widget = prompt_box.widget(), .flex = 0 },
             .{ .widget = input_box.widget(), .flex = 1 },
@@ -372,19 +375,19 @@ const DiffSearchInner = struct {
         surface.children = children;
 
         // Rows 2..: filtered file list (drawn straight onto the base buffer).
-        const matches = app.diff.search_matches.items;
-        const files = app.diff.files.items;
+        const matches = state.search_matches.items;
+        const files = state.files.items;
         const visible: u16 = ih -| 2;
         if (matches.len == 0) {
             panel.lineAt(&surface, 2, "No matching files", ctx, false, 0) catch {};
             return surface;
         }
         const count: u32 = @intCast(matches.len);
-        const first = firstVisibleWindow(app.diff.search_sel, count, visible);
+        const first = firstVisibleWindow(state.search_sel, count, visible);
         var r: u16 = 0;
         while (r < visible and first + r < count) : (r += 1) {
             const index = first + r;
-            const selected = index == app.diff.search_sel;
+            const selected = index == state.search_sel;
             const prefix = if (selected) "  " else "  ";
             const text = std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, files[matches[index]].path }) catch files[matches[index]].path;
             panel.lineAt(&surface, 2 + r, text, ctx, selected, 0) catch {};
