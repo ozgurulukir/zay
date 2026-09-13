@@ -334,14 +334,12 @@ pub fn restartTurnForQueuedMessages(app: *App, lane: *Thread) !bool {
     return true;
 }
 
-/// Start a turn on `app.thread` that drains its agent's queued (background)
-/// messages into history and answers them. Mirrors
-/// `restartTurnForQueuedMessages` but is gated on the agent queue, not the
-/// UI's display queue. Caller must have set `app.thread` to the target lane.
 /// Start a delivery turn on `lane` (answers the lane agent's queued
 /// background messages). Gated on the agent queue, not the UI display queue.
+/// The runtime gate reads `lane`, not `app.thread`: delivery targets are
+/// resolved by owner generation and need not be the focused lane.
 pub fn startDeliveryTurn(app: *App, lane: *Thread) !void {
-    if (app.liveRuntime() != null and app.liveRuntime().?.client == .none) {
+    if (lane.liveRuntime() != null and lane.liveRuntime().?.client == .none) {
         // No provider to run a turn — drop the queued notice rather than spin
         // up a doomed worker. Flush the mirror first so it stays 1:1 with the
         // cleared agent queue (raw entries are dropped unrendered; a stray
