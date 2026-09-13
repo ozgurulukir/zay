@@ -8,6 +8,7 @@ const os = @import("../os.zig");
 const http = @import("../http.zig");
 const tools_common = @import("../tools/common.zig");
 const transport = @import("transport.zig");
+const naming = @import("naming.zig");
 const schema_mod = @import("schema.zig");
 
 const assert = std.debug.assert;
@@ -1016,7 +1017,7 @@ pub const McpClient = struct {
         description: []const u8,
         schema: tools_common.Schema,
     ) !void {
-        const full_name = try std.fmt.allocPrint(self.gpa, "mcp__{s}__{s}", .{ self.name, tool_name });
+        const full_name = try naming.toolFullName(self.gpa, self.name, tool_name);
         errdefer self.gpa.free(full_name);
 
         try self.tools.append(self.gpa, .{

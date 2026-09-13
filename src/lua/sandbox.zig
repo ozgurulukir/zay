@@ -642,9 +642,13 @@ test "sandbox: allows path-sanitized os.remove and os.rename when permitted" {
     try std.Io.Dir.cwd().createDirPath(io, test_dir);
     defer std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
 
-    const file_a = try std.fs.path.join(gpa, &.{ test_dir, "a.txt" });
+    // Lua string literals treat `\a` / `\b` as escape sequences, so the paths
+    // embedded in the scripts below must never contain a backslash — join with
+    // forward slashes (legal for NT and for the path helpers) instead of
+    // `std.fs.path.join`, which inserts the native separator on Windows.
+    const file_a = try std.fmt.allocPrint(gpa, "{s}/a.txt", .{test_dir});
     defer gpa.free(file_a);
-    const file_b = try std.fs.path.join(gpa, &.{ test_dir, "b.txt" });
+    const file_b = try std.fmt.allocPrint(gpa, "{s}/b.txt", .{test_dir});
     defer gpa.free(file_b);
 
     var f = try std.Io.Dir.cwd().createFile(io, file_a, .{});

@@ -150,15 +150,6 @@ pub const LaneBridge = struct {
     }
 };
 
-/// Thread-local slot the executor sets around tool dispatch so the `lane`
-/// tool can reach the live bridge and the `*Agent` that posted. Null bridge
-/// = headless/tests — the tool reports "lanes unavailable".
-pub const Slot = struct {
-    bridge: ?*LaneBridge = null,
-    requester: ?*anyopaque = null,
-};
-pub var lane_bridge_slot: Slot = .{};
-
 /// Build a response with an owned text allocated from `gpa`. `lane_id` and
 /// `path` are borrowed (see `Response`).
 pub fn response(

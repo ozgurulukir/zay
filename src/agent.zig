@@ -2,6 +2,7 @@ const std = @import("std");
 const log = std.log.scoped(.agent);
 
 const ai = @import("ai.zig");
+const os = @import("os.zig");
 const at_mention = @import("at_mention.zig");
 const background_mod = @import("background.zig");
 const compaction = @import("context/compaction.zig");
@@ -29,6 +30,7 @@ const MessageQueue = agent_queue.MessageQueue;
 const ToolBatch = tool_batch_mod.ToolBatch;
 
 const agent_compactor = @import("agent/compactor.zig");
+const snapshotter_mod = @import("agent/snapshotter.zig");
 const Compactor = agent_compactor.Compactor;
 
 /// After this many consecutive background-compaction failures the automatic
@@ -186,12 +188,9 @@ pub const Agent = struct {
     /// Cache of pruned historical tool messages across run-loop iterations (TD-13).
     /// Prevents repeated allocations and string truncation during multi-step turns.
     tool_view_cache: context_assembly.PrunedToolCache = .{},
-    /// git-shadow snapshot state (see `snapshotAfterBatch`). The dedicated index
-    /// path is resolved once and cached; `last_snapshot_tree` dedups unchanged
-    /// batches; `snapshots_disabled` latches off when git/the repo is absent.
-    snapshot_index: ?[]u8 = null,
-    last_snapshot_tree: ?vcs.ObjectId = null,
-    snapshots_disabled: bool = false,
+    /// Git-shadow snapshot state (see `agent/snapshotter.zig`): index-path
+    /// caching, unchanged-tree dedup, and the disable latch live in the module.
+    snapshotter: ?snapshotter_mod.Snapshotter = null,
     /// Monotonic counter minting `textcall_<n>` ids for tool calls recovered
     /// from text (T3). Kept on the agent (not the stream parser) because
     /// recovery runs on the finished turn, post-stream, so the stream's own
@@ -264,7 +263,7 @@ pub const Agent = struct {
         } else |_| {
             // Lock failed (canceled) — skip critical section, continue cleanup.
         }
-        if (self.snapshot_index) |path| self.gpa.free(path);
+        if (self.snapshotter) |*s| s.deinit();
         if (self.bash_classifier_url) |url| self.gpa.free(url);
         self.* = undefined;
     }
@@ -765,40 +764,10 @@ pub const Agent = struct {
         try listener.emit(.tool_batch_finished);
     }
 
-    /// After a tool batch, snapshot the working tree (git-shadow) and bind it to
-    /// the batch's last conversation entry, giving per-tool-batch timeline
-    /// granularity. Runs on the worker thread — the only thread that writes
-    /// session entries during a turn — so binding via `setLeafSnapshot` (which
-    /// flushes the writer) can't race a concurrent append.
-    ///
-    /// Authoritative change-detection without trusting tool output: the
-    /// content-addressed tree id is compared to the last snapshot's; an unchanged
-    /// tree (a read-only batch, or a build that only touched gitignored files) is
-    /// skipped, creating no object and no binding. Best-effort — any failure
-    /// latches snapshots off for the session rather than failing the turn.
+    /// Delegate to the extracted git-shadow snapshotter (agent/snapshotter.zig).
     fn snapshotAfterBatch(self: *Agent) void {
-        if (self.snapshots_disabled) return;
-        const session_writer = self.context_manager.session_writer orelse return;
-        const index = self.snapshot_index orelse blk: {
-            if (!vcs.isAvailable(self.gpa, self.io) or !vcs.isRepo(self.gpa, self.io, self.cwd)) {
-                self.snapshots_disabled = true;
-                return;
-            }
-            const path = vcs.indexPath(self.gpa, self.io, self.cwd) catch {
-                self.snapshots_disabled = true;
-                return;
-            };
-            self.snapshot_index = path;
-            break :blk path;
-        };
-        const tree = vcs.workingTreeId(self.gpa, self.io, self.cwd, index) catch return;
-        if (self.last_snapshot_tree) |last| {
-            if (tree.eql(last)) return; // batch changed nothing tracked — no node
-        }
-        const commit = vcs.commitTree(self.gpa, self.io, self.cwd, tree) catch return;
-        session_writer.setLeafSnapshot(commit.slice()) catch return;
-        if (session_writer.leaf()) |leaf_id| vcs.keepRef(self.gpa, self.io, self.cwd, leaf_id, commit) catch {};
-        self.last_snapshot_tree = tree;
+        if (self.snapshotter == null) self.snapshotter = .{ .gpa = self.gpa, .io = self.io };
+        self.snapshotter.?.afterBatch(self.cwd, self.context_manager.session_writer);
     }
 
     /// Bridges ExecutorService's `ToolCallObserver` callbacks into the
@@ -2283,6 +2252,10 @@ const MockScriptedServer = struct {
 };
 
 test "run auto-continues once after a length-cut stream" {
+    if (os.is_windows) {
+        // Truncation-class socket gate — see openai_compatible.zig (#32).
+        return error.SkipZigTest;
+    }
     // Integration test over a real socket: the first response is a
     // chat-completions stream severed at the output token cap (text-only,
     // finish_reason=length); the second is a normal stop. `Agent.run` must
@@ -2407,18 +2380,18 @@ const NoopListener = struct {
 };
 
 test "snapshotAfterBatch: disabled snapshots return without touching git" {
-    // `snapshots_disabled = true` is the early return before any vcs call, so
-    // this exercises the no-git-available branch without needing a repo.
+    // The `disabled` latch is the early return before any vcs call, so this
+    // exercises the no-git-available branch without needing a repo.
     const gpa = std.testing.allocator;
     var agent = Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
 
-    agent.snapshots_disabled = true;
+    agent.snapshotter = .{ .gpa = gpa, .io = std.testing.io, .disabled = true };
     agent.snapshotAfterBatch(); // must not error or allocate
 
-    try std.testing.expect(agent.snapshots_disabled);
-    try std.testing.expect(agent.snapshot_index == null);
-    try std.testing.expect(agent.last_snapshot_tree == null);
+    try std.testing.expect(agent.snapshotter.?.disabled);
+    try std.testing.expect(agent.snapshotter.?.index_path == null);
+    try std.testing.expect(agent.snapshotter.?.last_tree == null);
 }
 
 test "snapshotAfterBatch: no session writer short-circuits silently" {
@@ -2429,12 +2402,12 @@ test "snapshotAfterBatch: no session writer short-circuits silently" {
     var agent = Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
 
-    // snapshots_disabled stays false, but no session_writer is attached.
+    // The latch stays false, but no session_writer is attached.
     agent.snapshotAfterBatch();
 
-    // No panic, no error; the guard left the disabled flag untouched because
-    // it never reached the git-availability probe.
-    try std.testing.expect(!agent.snapshots_disabled);
+    // No panic, no error; the latch was untouched because the short-circuit
+    // never reached the git-availability probe.
+    try std.testing.expect(!agent.snapshotter.?.disabled);
 }
 
 test "maybeCompact: disabled auto stays a no-op below the watermark" {

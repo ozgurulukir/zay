@@ -203,9 +203,9 @@ pub fn runTool(
     io: std.Io,
     cwd: []const u8,
     arguments: []const u8,
-    userdata: *anyopaque,
+    env: common.Env,
 ) common.Error!common.Output {
-    return runToolWithMode(gpa, io, cwd, arguments, userdata, false);
+    return runToolWithMode(gpa, io, cwd, arguments, env, false);
 }
 
 pub fn runInternalTool(
@@ -213,9 +213,9 @@ pub fn runInternalTool(
     io: std.Io,
     cwd: []const u8,
     arguments: []const u8,
-    userdata: *anyopaque,
+    env: common.Env,
 ) common.Error!common.Output {
-    return runToolWithMode(gpa, io, cwd, arguments, userdata, true);
+    return runToolWithMode(gpa, io, cwd, arguments, env, true);
 }
 
 fn runToolWithMode(
@@ -223,15 +223,14 @@ fn runToolWithMode(
     io: std.Io,
     cwd: []const u8,
     arguments: []const u8,
-    userdata: *anyopaque,
+    env: common.Env,
     allow_workspace_ops: bool,
 ) common.Error!common.Output {
     _ = cwd;
-    _ = userdata;
-    // Null slot is defined behavior: headless/tests have no bridge.
-    const slot = lane_bridge.lane_bridge_slot;
-    const bridge = slot.bridge orelse return common.failFmt(gpa, 1, "lane: lanes are unavailable in this context\n", .{});
-    const requester = slot.requester orelse return common.failFmt(gpa, 1, "lane: no lane requester attached\n", .{});
+    _ = env.userdata;
+    // Null bridge/requester is defined behavior: headless/tests have no lane.
+    const bridge = env.ctx.lane_bridge orelse return common.failFmt(gpa, 1, "lane: lanes are unavailable in this context\n", .{});
+    const requester = env.ctx.lane_requester orelse return common.failFmt(gpa, 1, "lane: no lane requester attached\n", .{});
 
     var parsed = parseArgsWithMode(gpa, arguments, allow_workspace_ops) catch |err| return parseError(gpa, err);
     defer parsed.deinit(gpa);
@@ -284,8 +283,8 @@ fn runToolWithMode(
     return .{ .stdout = stdout, .stderr = stderr, .code = resp.code };
 }
 
-fn display(gpa: std.mem.Allocator, args: []const u8, userdata: *anyopaque) std.mem.Allocator.Error!common.ToolDisplay {
-    _ = userdata;
+fn display(gpa: std.mem.Allocator, args: []const u8, env: common.Env) std.mem.Allocator.Error!common.ToolDisplay {
+    _ = env;
     const Probe = struct { command: ?[]const u8 = null, lane: ?[]const u8 = null };
     const parsed = std.json.parseFromSlice(Probe, gpa, args, .{ .ignore_unknown_fields = true }) catch {
         return .{ .label = try gpa.dupe(u8, "lane") };
@@ -340,12 +339,9 @@ test "lane reports driver-only commands without posting a bridge request" {
     var bridge: lane_bridge.LaneBridge = .{};
     const AgentAligned = struct { _: u8 align(@alignOf(agent_mod.Agent)) };
     var dummy: AgentAligned = .{ ._ = 0 };
+    var ctx: common.ToolContext = .{ .lane_bridge = &bridge, .lane_requester = &dummy };
 
-    const prev = lane_bridge.lane_bridge_slot;
-    defer lane_bridge.lane_bridge_slot = prev;
-    lane_bridge.lane_bridge_slot = .{ .bridge = &bridge, .requester = &dummy };
-
-    var output = try runTool(gpa, std.testing.io, ".", "{\"command\":\"enter\"}", undefined);
+    var output = try runTool(gpa, std.testing.io, ".", "{\"command\":\"enter\"}", .{ .ctx = &ctx });
     defer output.deinit(gpa);
     try std.testing.expectEqual(@as(u8, 1), output.code);
     try std.testing.expect(std.mem.indexOf(u8, output.stderr, "unavailable to the model") != null);
@@ -386,10 +382,7 @@ test "lane opFromString still resolves internal operations" {
 
 test "lane run without a bridge slot reports lanes unavailable" {
     const gpa = std.testing.allocator;
-    const prev = lane_bridge.lane_bridge_slot;
-    defer lane_bridge.lane_bridge_slot = prev;
-    lane_bridge.lane_bridge_slot = .{};
-    var output = try runTool(gpa, std.testing.io, ".", "{\"command\":\"list\"}", undefined);
+    var output = try runTool(gpa, std.testing.io, ".", "{\"command\":\"list\"}", .{ .ctx = &common.ToolContext.headless });
     defer output.deinit(gpa);
     try std.testing.expectEqual(@as(u8, 1), output.code);
     try std.testing.expect(std.mem.indexOf(u8, output.stderr, "lanes are unavailable") != null);
@@ -410,21 +403,18 @@ test "lane run against a stub bridge resolves a request end-to-end" {
         }
     };
 
-    const prev = lane_bridge.lane_bridge_slot;
-    defer lane_bridge.lane_bridge_slot = prev;
-    lane_bridge.lane_bridge_slot = .{ .bridge = &bridge, .requester = &dummy };
+    var ctx: common.ToolContext = .{ .lane_bridge = &bridge, .lane_requester = &dummy };
 
     const Worker = struct {
-        fn run(b: *lane_bridge.LaneBridge, allocator: std.mem.Allocator, out: *common.Output) void {
-            _ = b;
-            out.* = runTool(allocator, std.testing.io, ".", "{\"command\":\"list\"}", undefined) catch |err| {
+        fn run(c: *const common.ToolContext, allocator: std.mem.Allocator, out: *common.Output) void {
+            out.* = runTool(allocator, std.testing.io, ".", "{\"command\":\"list\"}", .{ .ctx = c }) catch |err| {
                 std.debug.print("runTool failed: {s}\n", .{@errorName(err)});
                 return;
             };
         }
     };
     var result: common.Output = undefined;
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{ &bridge, gpa, &result });
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{ &ctx, gpa, &result });
     var spins: u32 = 0;
     while (spins < 10_000) : (spins += 1) {
         std.testing.io.sleep(.fromMilliseconds(2), .awake) catch {};
@@ -459,22 +449,19 @@ test "lane run with string fields (spawn-style) does not double-free the args" {
         }
     };
 
-    const prev = lane_bridge.lane_bridge_slot;
-    defer lane_bridge.lane_bridge_slot = prev;
-    lane_bridge.lane_bridge_slot = .{ .bridge = &bridge, .requester = &dummy };
+    var ctx: common.ToolContext = .{ .lane_bridge = &bridge, .lane_requester = &dummy };
 
     const Worker = struct {
-        fn run(b: *lane_bridge.LaneBridge, allocator: std.mem.Allocator, out: *common.Output) void {
-            _ = b;
+        fn run(c: *const common.ToolContext, allocator: std.mem.Allocator, out: *common.Output) void {
             const args = "{\"command\":\"spawn\",\"task\":\"do work\",\"purpose\":\"eval\",\"lane\":\"abc\",\"steer\":\"x\"}";
-            out.* = runTool(allocator, std.testing.io, ".", args, undefined) catch |err| {
+            out.* = runTool(allocator, std.testing.io, ".", args, .{ .ctx = c }) catch |err| {
                 std.debug.print("runTool failed: {s}\n", .{@errorName(err)});
                 return;
             };
         }
     };
     var result: common.Output = undefined;
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{ &bridge, gpa, &result });
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{ &ctx, gpa, &result });
     var spins: u32 = 0;
     while (spins < 10_000) : (spins += 1) {
         std.testing.io.sleep(.fromMilliseconds(2), .awake) catch {};
@@ -506,25 +493,22 @@ test "lane enter/leave write the agent workspace via the bridge" {
     };
 
     const Worker = struct {
-        fn run(b: *lane_bridge.LaneBridge, a: *agent_mod.Agent, action: []const u8) void {
+        fn run(c: *const common.ToolContext, a: *agent_mod.Agent, action: []const u8) void {
             const args = std.fmt.allocPrint(std.testing.allocator, "{{\"command\":\"{s}\"}}", .{action}) catch unreachable;
             defer std.testing.allocator.free(args);
-            var output = runInternalTool(std.testing.allocator, std.testing.io, ".", args, undefined) catch |err| {
+            var output = runInternalTool(std.testing.allocator, std.testing.io, ".", args, .{ .ctx = c }) catch |err| {
                 std.debug.print("runTool failed: {s}\n", .{@errorName(err)});
                 return;
             };
             output.deinit(std.testing.allocator);
-            _ = b;
             _ = a;
         }
     };
 
-    const prev = lane_bridge.lane_bridge_slot;
-    defer lane_bridge.lane_bridge_slot = prev;
-    lane_bridge.lane_bridge_slot = .{ .bridge = &bridge, .requester = &agent };
+    var ctx: common.ToolContext = .{ .lane_bridge = &bridge, .lane_requester = &agent };
 
     // ── enter: the tool borrows the returned path as the workspace.
-    const thread1 = try std.Thread.spawn(.{}, Worker.run, .{ &bridge, &agent, "enter" });
+    const thread1 = try std.Thread.spawn(.{}, Worker.run, .{ &ctx, &agent, "enter" });
     var spins: u32 = 0;
     while (spins < 10_000) : (spins += 1) {
         std.testing.io.sleep(.fromMilliseconds(2), .awake) catch {};
@@ -540,7 +524,7 @@ test "lane enter/leave write the agent workspace via the bridge" {
     try std.testing.expectEqualStrings(Handler.path, agent.effectiveCwd());
 
     // ── leave: the tool clears the borrow.
-    const thread2 = try std.Thread.spawn(.{}, Worker.run, .{ &bridge, &agent, "leave" });
+    const thread2 = try std.Thread.spawn(.{}, Worker.run, .{ &ctx, &agent, "leave" });
     spins = 0;
     while (spins < 10_000) : (spins += 1) {
         std.testing.io.sleep(.fromMilliseconds(2), .awake) catch {};

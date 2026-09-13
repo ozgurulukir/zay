@@ -49,7 +49,6 @@ pub const search_line_truncate_bytes = search_bridge.search_line_truncate_bytes;
 pub const lang_map = fs_bridge.lang_map;
 pub const mime_map = fs_bridge.mime_map;
 
-
 /// Retrieve the Io instance stored in the Lua registry.
 pub const getIo = bridge.getIo;
 
@@ -243,7 +242,6 @@ pub const FindCtx = search_bridge.FindCtx;
 pub const walkAndMatch = search_bridge.walkAndMatch;
 pub const walkAndSearch = search_bridge.walkAndSearch;
 pub const fileNameMatches = search_bridge.fileNameMatches;
-
 
 /// Best-effort plugin directory for the shell-block audit log; empty when the
 /// Lua state carries no plugin (bridge unit tests). Borrowed from the Lua GC —

@@ -2,11 +2,14 @@ const std = @import("std");
 const log = std.log.scoped(.ai);
 
 const ai = @import("../ai.zig");
+const os = @import("../os.zig");
 const http = @import("../http.zig");
 const model_catalog = @import("openai_compatible_models.zig");
 const openai_endpoint = @import("openai_endpoint.zig");
 const provider_headers = @import("provider_headers.zig");
 const stream_parser = @import("stream_parser.zig");
+const stream_part = @import("stream_part.zig");
+const transport_mod = @import("transport.zig");
 const tool_schema = @import("tool_schema.zig");
 const tools_common = @import("../tools/common.zig");
 const tools_mod = @import("../tools.zig");
@@ -52,19 +55,20 @@ pub const Client = struct {
     /// strict mode is OpenAI-only and silently breaks function-calling on
     /// gateways (OpenRouter/Ollama/vLLM).
     strict: bool = false,
-    http_client: std.http.Client,
+    /// The shared send pipeline: request construction, retry budget, C2
+    /// downgrade, head/error classification, error-detail recording.
+    transport: transport_mod.Transport = undefined,
     /// Owned copy of `ai.Config.headers` (auto provider headers — OpenCode
     /// Zen routing, OpenRouter attribution — merged with the user's
     /// `providers.<name>.headers`, precedence already resolved at attach
-    /// time by `provider_headers.build`). Materialized per request in
-    /// `sendOnce`. Freed in `deinit`.
+    /// time by `provider_headers.build`). Materialized per request by the
+    /// transport. Freed in `deinit`.
     provider_headers_owned: []provider_headers.Header = &.{},
     /// Monotonic counter for synthesised tool_call ids when the inference
     /// server omits them. OpenAI's protocol requires stable ids linking
     /// assistant tool_calls to their `tool` result messages, so we mint
     /// one here rather than letting the agent see an empty id.
     tool_call_seq: u64 = 0,
-    last_error_detail: ?[]u8 = null,
 
     pub fn init(
         target: *Client,
@@ -113,20 +117,32 @@ pub const Client = struct {
             .authorization = authorization,
             .tools_json = tools_json,
             .strict = config.strict,
-            .http_client = .{ .allocator = gpa, .io = io },
             .provider_headers_owned = provider_headers_owned,
         };
+        target.transport = undefined;
+        target.transport.init(gpa, io);
+        // Borrowed identity: every slice here is owned by this Client, so it
+        // outlives the transport and every request it sends.
+        target.transport.url = target.url;
+        target.transport.authorization = target.authorization;
+        target.transport.provider_headers = target.provider_headers_owned;
+        target.transport.header_context = .{ .session_id = target.config.session_id };
+        target.transport.log_tag = "openai_compatible";
+        target.transport.log_context = target.config.model;
+        target.transport.request_timeout_seconds = config.request_timeout_seconds;
+        target.transport.retry_base_delay_ms = config.retry_base_delay_ms;
+        target.transport.max_retries = config.max_retries;
+        target.transport.disable_cache_seed = config.disable_prompt_cache;
     }
 
     pub fn deinit(self: *Client) void {
-        self.http_client.deinit();
+        self.transport.deinit();
         self.gpa.free(self.config.model);
         self.gpa.free(self.config.session_id);
         self.gpa.free(self.tools_json);
         if (self.authorization) |a| self.gpa.free(a);
         self.gpa.free(self.url);
         provider_headers.freeHeaders(self.gpa, self.provider_headers_owned);
-        if (self.last_error_detail) |d| self.gpa.free(d);
         self.* = undefined;
     }
 
@@ -139,440 +155,64 @@ pub const Client = struct {
     /// typically `&.{}` because the registry's builtin already covers
     /// bash, and emitting both creates a duplicate name that most APIs
     /// reject outright.
-    pub fn updateMcpTools(
-        self: *Client,
-        mcp_tools: []const ai.McpToolSchema,
-        registry: ?*tools_mod.ToolRegistry,
-        builtin_override: []const tools_common.Tool,
-    ) !void {
-        const new_json = try tool_schema.buildAllToolsJson(self.gpa, builtin_override, mcp_tools, registry, self.strict, .completions);
+    // Rebuild the serialized tool definitions from the final, already-deduped
+    // spec list assembled by the runtime layer (builtin + registry plugin +
+    // registry MCP). Call between turns, never mid-turn.
+    pub fn updateTools(self: *Client, specs: []const tool_schema.ToolSpec) !void {
+        const new_json = try tool_schema.buildToolsJson(self.gpa, specs, self.strict, .completions);
         self.gpa.free(self.tools_json);
         self.tools_json = new_json;
     }
 
-    fn clearErrorDetail(self: *Client) void {
-        if (self.last_error_detail) |d| self.gpa.free(d);
-        self.last_error_detail = null;
+    pub fn errorDetail(self: *const Client) ?[]const u8 {
+        return self.transport.errorDetail();
     }
 
-    /// Conservative check: does the last recorded error detail mention "cache"?
-    /// Used (C2) to decide whether a 400 might be a `cache_control` /
-    /// `prompt_cache_key` rejection worth a single cache-stripped retry.
-    /// Case-insensitive. False positives (a 400 mentioning "cache" for an
-    /// unrelated reason) cost one extra request and then fail normally — the
-    /// retry is bounded and idempotent (a 400 means the model produced nothing).
-    fn errorDetailMentionsCache(self: *Client) bool {
-        const detail = self.last_error_detail orelse return false;
-        return std.ascii.indexOfIgnoreCase(detail, "cache") != null;
-    }
-
-    /// Record `HTTP <status>: <message>` from a failed response body for the UI.
-    /// Best-effort: a failure to build the string just leaves the detail unset.
-    fn recordErrorDetail(self: *Client, status_code: u16, body: []const u8) void {
-        const message = http.extractErrorMessage(self.gpa, body) catch return;
-        defer self.gpa.free(message);
-        log.warn("openai_compatible.recordErrorDetail status={d} body={s}", .{ status_code, message });
-        const detail = std.fmt.allocPrint(self.gpa, "HTTP {d}: {s}", .{ status_code, message }) catch return;
-        self.clearErrorDetail();
-        self.last_error_detail = detail;
-    }
-
+    /// Run one prompt through the shared transport. The payload writer is a
+    /// stack struct over the owned config so the C2 downgrade is "flip one
+    /// field, re-serialize"; the stream adapter is `stream_parser`.
     pub fn prompt(
         self: *Client,
         messages: []const ai.MessageView,
         observer: anytype,
     ) !ai.Turn {
-        std.debug.assert(self.url.len > 0);
-        self.clearErrorDetail();
-
-        // The payload is serialized ONCE per cache mode; every retry attempt
-        // re-sends the same bytes. This is safe because retries only happen on
-        // head-phase 429/5xx — the model has not produced anything and no tool
-        // has run, so the request is idempotent. Stream-mid errors are never
-        // retried (partial deltas may already be visible to the observer).
-        var payload: std.Io.Writer.Allocating = .init(self.gpa);
-        defer payload.deinit();
-        // C1/C2: `disable_cache` starts from the user's config flag. C2 may
-        // flip it to `true` after a cache-related 400 and re-send the same
-        // payload with cache fields stripped — exactly once, independently of
-        // the 429/5xx retry budget (different failure mode).
-        var disable_cache = self.config.disable_prompt_cache;
-        try writeRequestPayload(
-            self.gpa,
-            &payload.writer,
-            self.config.model,
-            self.config.session_id,
-            messages,
-            self.tools_json,
-            self.config.reasoning,
-            self.config.max_output_tokens,
-            self.config.wire_dialect,
-            disable_cache,
-            self.config.is_reasoning_model,
-        );
-        const req_body_log = try logBytes(self.gpa, payload.written());
-        defer if (req_body_log.ptr != payload.written().ptr) self.gpa.free(req_body_log);
-        log.info("openai_compatible.request POST {s} body={s}", .{ self.url, req_body_log });
-        // L2: when this client carries no tools, say so next to the request log
-        // with the client identity. `writeRequestPayload` is a free function
-        // (no `self.url`), so the URL disambiguation lives here — it tells the
-        // main agent apart from the summarizer/naming clients (which are
-        // correctly tool-less) when several clients are alive.
-        if (std.mem.eql(u8, self.tools_json, "[]")) {
-            log.info("openai_compatible.no_tools client model={s} url={s}", .{ self.config.model, self.url });
-        }
-
-        // C2: a cache-related 400 earns exactly ONE cache-stripped re-send,
-        // independent of the 429/5xx retry budget (different failure mode).
-        // `downgrade_done` gates it to a single rebuild; the outer loop runs at
-        // most twice (original payload, then stripped). Note Zig's
-        // `while … : (step) { continue }` runs the step expr, so a downgrade
-        // cannot ride the `attempt` counter — it is a separate state bit.
-        var downgrade_done = false;
-        while (true) {
-            var attempt: u32 = 0;
-            while (attempt <= self.config.max_retries) : (attempt += 1) {
-                var retry_after_secs: ?u64 = null;
-                const turn = self.sendOnce(payload.written(), observer, &retry_after_secs) catch |err| {
-                    // Only head-phase transient failures are retried: 429/5xx
-                    // statuses and connection drops before any response bytes.
-                    // The model has produced nothing and no tool has run, so the
-                    // request is idempotent. Every other 4xx is permanent — a
-                    // schema/auth/model error won't fix itself — and stream-mid
-                    // errors never surface as these codes, so they propagate
-                    // immediately too.
-                    if (attempt >= self.config.max_retries) {
-                        // C2: before giving up on a 400, try the cache-stripped
-                        // variant once — some OpenRouter `:free` / gateway-
-                        // fronted models reject `cache_control` /
-                        // `prompt_cache_key` with 400. Conservative: only when
-                        // the error body mentions "cache" AND we haven't
-                        // downgraded yet AND the user didn't already disable
-                        // caching (no fields to strip).
-                        if (err == error.HttpClientError and !downgrade_done and !disable_cache and self.errorDetailMentionsCache()) {
-                            downgrade_done = true;
-                            disable_cache = true;
-                            payload.deinit();
-                            payload = .init(self.gpa);
-                            try writeRequestPayload(
-                                self.gpa,
-                                &payload.writer,
-                                self.config.model,
-                                self.config.session_id,
-                                messages,
-                                self.tools_json,
-                                self.config.reasoning,
-                                self.config.max_output_tokens,
-                                self.config.wire_dialect,
-                                disable_cache,
-                                self.config.is_reasoning_model,
-                            );
-                            log.warn("openai_compatible.cache_downgrade retrying without cache_control/prompt_cache_key after HTTP 400", .{});
-                            break; // break inner loop → outer loop re-runs the full retry budget on the stripped payload
-                        }
-                        return err;
-                    }
-                    switch (err) {
-                        error.HttpServerError, error.HttpRateLimited, error.ConnectionFailed => {},
-                        else => return err,
-                    }
-                    const delay_ms = self.retryDelayMs(attempt, retry_after_secs);
-                    log.warn("openai_compatible.retry attempt={d} err={s} delay_ms={d}", .{ attempt + 1, @errorName(err), delay_ms });
-                    self.sleepMs(delay_ms);
-                    continue;
-                };
-                return turn;
-            }
-            // Inner loop exhausted its retry budget without returning a turn.
-            // This only happens after a downgrade (the break above) — the
-            // original-payload path always returns err or a turn. Surface the
-            // persistent 400 rather than looping forever.
-            if (downgrade_done) return error.HttpClientError;
-            unreachable; // guarded by the return paths above
-        }
-    }
-
-    /// Perform one HTTP round-trip with the already-serialized payload.
-    /// Transient head-phase statuses (429, 5xx) surface as
-    /// `error.HttpRateLimited` / `error.HttpServerError` so `prompt` can
-    /// decide whether to retry; every other failure propagates unchanged.
-    /// When a retryable status is hit, `retry_after_secs` receives the
-    /// server's `Retry-After` value (integer seconds) if one was sent.
-    fn sendOnce(self: *Client, payload: []const u8, observer: anytype, retry_after_secs: *?u64) !ai.Turn {
-        // Everything up to and including the response head is "head phase":
-        // the model has produced nothing and no tool has run, so `prompt`
-        // may retry the same payload verbatim. Connection/read drops here
-        // are mapped to `error.ConnectionFailed` (retryable); protocol-level
-        // rejects pass through unchanged (permanent).
-        // Provider headers (user + auto, merged at attach time). The buffer
-        // lives on this frame's stack and must outlive the request — `req`
-        // is fully consumed (`receiveHead` + stream) before this function
-        // returns.
-        var extra_headers: [provider_headers.max_outbound_headers]std.http.Header = undefined;
-        const extra = blk: {
-            var set = provider_headers.HeaderSet.init(&extra_headers);
-            set.append(self.provider_headers_owned, .{ .session_id = self.config.session_id });
-            break :blk set.slice();
-        };
-        var req = self.http_client.request(.POST, try std.Uri.parse(self.url), .{
-            .headers = .{
-                .authorization = if (self.authorization) |a| .{ .override = a } else .omit,
-                .content_type = .{ .override = http.content_type_json },
+        var payload = ChatPayload{
+            .gpa = self.gpa,
+            .opts = .{
+                .model = self.config.model,
+                .session_id = self.config.session_id,
+                .reasoning = self.config.reasoning,
+                .max_output_tokens = self.config.max_output_tokens,
+                .dialect = self.config.wire_dialect,
+                .disable_prompt_cache = self.config.disable_prompt_cache,
+                .is_reasoning_model = self.config.is_reasoning_model,
             },
-            .extra_headers = extra,
-        }) catch |err| return self.headPhaseFailure(err);
-        defer req.deinit();
-
-        req.transfer_encoding = .chunked;
-        var body_buffer: [body_buffer_bytes]u8 = undefined;
-        var body_writer = req.sendBodyUnflushed(&body_buffer) catch |err| return self.headPhaseFailure(err);
-        body_writer.writer.writeAll(payload) catch |err| return self.headPhaseFailure(err);
-        body_writer.end() catch |err| return self.headPhaseFailure(err);
-        req.connection.?.flush() catch |err| return self.headPhaseFailure(err);
-
-        var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
-        var http_response = req.receiveHead(&redirect_buffer) catch |err| {
-            // `receiveHead` fails with `error.ReadFailed`/`error.WriteFailed`
-            // when the connection drops; capture the underlying socket error
-            // so the UI shows what actually went wrong instead of the opaque
-            // error name. Read the stream error fields directly —
-            // `Connection.getReadError` unwraps `.?` internally and panics
-            // when std synthesized the ReadFailed without a socket error.
-            if (err == error.ReadFailed or err == error.WriteFailed) {
-                if (req.connection) |conn| {
-                    const reason: anyerror = if (conn.stream_reader.err) |e| e else if (conn.stream_writer.err) |e| e else err;
-                    self.recordReadFailure(reason);
-                }
-            }
-            return self.headPhaseFailure(err);
+            .messages = messages,
+            .tools_json = self.tools_json,
         };
-        const status_code: u16 = @intFromEnum(http_response.head.status);
-        log.info("openai_compatible.response.head status={d}", .{status_code});
-        if (status_code >= 400) {
-            // Read `Retry-After` before initializing the body reader — the
-            // head pointers are invalidated once the body stream starts.
-            if (http.isRetryableHeadStatus(status_code)) {
-                retry_after_secs.* = http.parseRetryAfterSeconds(http_response.head.bytes);
-            }
-            // The error body (e.g. a 403 from a Cloudflare-fronted host) may be
-            // gzip/deflate-compressed (the only encodings this client
-            // advertises) — use the decompressing reader so the toaster logs
-            // real text instead of raw compressed bytes.
-            var error_buffer: [transfer_buffer_bytes]u8 = undefined;
-            var decompress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
-            var decompress: std.http.Decompress = undefined;
-            const error_reader = http_response.readerDecompressing(&error_buffer, &decompress, &decompress_buffer);
-            const error_body = error_reader.allocRemaining(self.gpa, .limited(response_bytes_max)) catch |err| switch (err) {
-                error.StreamTooLong => return error.ResponseTooLarge,
-                else => |e| return e,
-            };
-            const err_body_log = try logBytes(self.gpa, error_body);
-            defer if (err_body_log.ptr != error_body.ptr) self.gpa.free(err_body_log);
-            defer self.gpa.free(error_body);
-            log.warn("openai_compatible.response.error status={d} body={s}", .{ status_code, err_body_log });
-            self.recordErrorDetail(status_code, error_body);
-            if (status_code == 429) return error.HttpRateLimited;
-            if (status_code >= 500) return error.HttpServerError;
-            return error.HttpClientError;
-        }
-        if (!http.isSuccess(status_code)) return error.HttpUnexpectedStatus;
-
-        // Socket-level read timeout: prevents indefinite hangs when the
-        // server stops mid-stream. Applied after the head is received so
-        // the (fast) head exchange is not affected.
-        // Windows: `Io.Threaded` opens sockets through the AFD driver, so
-        // socket handles are not ws2_32 SOCKETs and setsockopt always fails
-        // (WSAENOTSOCK) — skip it rather than warn on every request.
-        if (req.connection) |conn| http.setSocketTimeout(conn, self.config.request_timeout_seconds);
-
-        var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
-        var decompress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
-        var decompress: std.http.Decompress = undefined;
-        const reader = http_response.readerDecompressing(&transfer_buffer, &decompress, &decompress_buffer);
-        return stream_parser.readStream(self.gpa, reader, observer, &self.tool_call_seq, self.config.max_parallel_tool_calls, self.config.model) catch |err| {
-            if (err == error.ReadFailed) {
-                if (req.connection) |conn| {
-                    // Prefer the socket error; std also synthesizes
-                    // `error.ReadFailed` for a truncated or invalid chunked
-                    // body (recorded as `body_err`), and
-                    // `Connection.getReadError` would panic on `.?` there —
-                    // see the head-phase note above.
-                    const reason: anyerror = if (conn.stream_reader.err) |e| e else if (http_response.bodyErr()) |e| e else err;
-                    self.recordReadFailure(reason);
-                }
-            }
-            return err;
+        const env: stream_part.StreamEnv = .{
+            .limits = .{ .max_parallel_calls = self.config.max_parallel_tool_calls, .model_label = self.config.model },
+            .id_seq = &self.tool_call_seq,
         };
+        return self.transport.prompt(transport_mod.payloadSource(ChatPayload, &payload), observer, stream_parser, env);
     }
 
-    /// Map a failure that occurred before any response bytes (connect, body
-    /// send, or head read) to `error.ConnectionFailed` when it is a transient
-    /// connection/read drop. `prompt` retries those verbatim — the model has
-    /// produced nothing and no tool has run, so the request is idempotent,
-    /// exactly like a head-phase 429/5xx. Protocol-level rejects are returned
-    /// unchanged; a retry will not fix them.
-    ///
-    /// `error.Unexpected` is deliberately included: in the head phase (before
-    /// any response bytes) it is almost always a connect/read drop, and Windows
-    /// surfaces connection-refused as NTSTATUS 0xc0000236 (`error.Unexpected`)
-    /// rather than `error.ConnectionRefused`. The breadth is accepted because no
-    /// other `error.Unexpected` source is expected before any response bytes.
-    ///
-    /// `error.HttpConnectionClosing` is std.http's report for reusing an idle
-    /// keep-alive connection the server already closed (0-byte head read): the
-    /// retry loop reconnects and re-sends, so the user sees nothing.
-    fn headPhaseFailure(self: *Client, err: anyerror) anyerror {
-        _ = self;
-        return http.headPhaseFailure(err);
-    }
+    const ChatPayload = struct {
+        gpa: std.mem.Allocator,
+        opts: openai_request.PayloadOptions,
+        messages: []const ai.MessageView,
+        tools_json: []const u8,
 
-    /// Record the underlying socket error from a dropped response read for
-    /// the UI, so a connection failure shows something actionable instead of
-    /// the opaque `ReadFailed`. Best-effort: a failure to build the string
-    /// just leaves the detail unset.
-    fn recordReadFailure(self: *Client, read_err: anyerror) void {
-        const detail = std.fmt.allocPrint(
-            self.gpa,
-            "Connection to the model provider was lost: {s}",
-            .{@errorName(read_err)},
-        ) catch return;
-        self.clearErrorDetail();
-        self.last_error_detail = detail;
-    }
-
-    /// Delay before a retry — the shared backoff policy in `http.zig` so the
-    /// chat-completions and Responses clients stay in lockstep.
-    fn retryDelayMs(self: *const Client, attempt: u32, retry_after_secs: ?u64) u64 {
-        return http.retryDelayMs(self.config.retry_base_delay_ms, attempt, retry_after_secs);
-    }
-
-    /// Block the worker for the backoff delay. Best-effort — a cancel error
-    /// just falls through (the turn is being torn down anyway).
-    fn sleepMs(self: *const Client, ms: u64) void {
-        if (ms == 0) return;
-        const clamped: i64 = @intCast(@min(ms, std.math.maxInt(i64)));
-        self.io.sleep(std.Io.Duration.fromMilliseconds(clamped), .awake) catch {};
-    }
-};
-
-/// Truncate a request/response body for logging. When the body exceeds
-/// `limit`, keep the head AND append a tail slice so the `tools` array
-/// (which serializes after `messages` and is usually past the head) is
-/// still visible. The tail is found by locating `"tools":` in the full
-/// body; if absent (or already inside the head), a plain
-/// `[...{n} more bytes]` ellipsis is used.
-///
-/// Returns either `bytes` verbatim (short body, or long body without a
-/// tools array past the head — caller frees nothing) or a freshly
-/// allocated slice (caller frees via `gpa` when `result.ptr != bytes.ptr`).
-fn logBytes(gpa: std.mem.Allocator, bytes: []const u8) ![]const u8 {
-    const limit = http.log_head_bytes_max;
-    if (bytes.len <= limit) return bytes;
-    // Look for the tools array past the head — the common debug target when
-    // triaging "the model can't call tools" reports. The tools array is
-    // serialised after messages, so a realistic system prompt + a few turns
-    // already pushes it past the head.
-    if (std.mem.indexOf(u8, bytes, "\"tools\":")) |pos| {
-        if (pos >= limit) {
-            const tail_max: usize = http.log_tail_bytes_max;
-            const tail_end = @min(bytes.len, pos + tail_max);
-            return std.fmt.allocPrint(gpa, "{s}\n   [...{d} bytes truncated...]\n   {s}", .{
-                bytes[0..limit],
-                bytes.len - limit,
-                bytes[pos..tail_end],
-            });
+        pub fn writePayload(self: *ChatPayload, out: *std.Io.Writer, disable_prompt_cache: bool) !void {
+            self.opts.disable_prompt_cache = disable_prompt_cache;
+            return openai_request.writeRequestPayload(self.gpa, out, self.opts.model, self.opts.session_id, self.messages, self.tools_json, self.opts.reasoning, self.opts.max_output_tokens, self.opts.dialect, self.opts.disable_prompt_cache, self.opts.is_reasoning_model);
         }
-    }
-    return std.fmt.allocPrint(gpa, "{s}\n   [...{d} more bytes]", .{ bytes[0..limit], bytes.len - limit });
-}
 
-test "logBytes passes short bodies through untouched (no allocation)" {
-    const gpa = std.testing.allocator;
-    const short = "hello world";
-    const out = try logBytes(gpa, short);
-    // Pointer equality proves no allocation happened — the slice is aliased.
-    try std.testing.expect(out.ptr == short.ptr);
-    try std.testing.expectEqualStrings(short, out);
-}
-
-test "logBytes truncation surfaces the tools array past the head" {
-    const gpa = std.testing.allocator;
-
-    // Build a ~20KB body: ~13KB of message filler, then the `tools` array the
-    // old head-only truncation would have hidden. JSON key order is
-    // model → messages → … → tools, so this mirrors a real payload.
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(gpa);
-    try body.appendSlice(gpa, "{\"model\":\"m\",\"messages\":[{\"role\":\"system\",\"content\":\"");
-    var filler: usize = 0;
-    while (filler < 13 * 1024) : (filler += 1) try body.append(gpa, 'x');
-    try body.appendSlice(gpa, "\"}],\"stream\":true,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"bash\"}}]}");
-
-    const out = try logBytes(gpa, body.items);
-    defer if (out.ptr != body.items.ptr) gpa.free(out);
-
-    // The tools array is now visible despite living past the 12KB head.
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"tools\":") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"name\":\"bash\"") != null);
-    // The truncation marker is present.
-    try std.testing.expect(std.mem.indexOf(u8, out, "bytes truncated") != null);
-    // And it was allocated (not aliased).
-    try std.testing.expect(out.ptr != body.items.ptr);
-}
-
-test "logBytes truncation falls back to an ellipsis when there is no tools array" {
-    const gpa = std.testing.allocator;
-
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(gpa);
-    try body.appendSlice(gpa, "{\"model\":\"m\",\"content\":\"");
-    var filler: usize = 0;
-    while (filler < 13 * 1024) : (filler += 1) try body.append(gpa, 'x');
-    try body.appendSlice(gpa, "\"}");
-
-    const out = try logBytes(gpa, body.items);
-    defer gpa.free(out);
-    try std.testing.expect(out.ptr != body.items.ptr);
-    try std.testing.expect(std.mem.indexOf(u8, out, "more bytes") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"tools\":") == null);
-}
-
-test "errorDetailMentionsCache is case-insensitive and handles null" {
-    // C2: the downgrade decision is driven by this predicate. Verify the
-    // conservative "cache" substring match in both cases and the null path.
-    const gpa = std.testing.allocator;
-    const tools = [_]tools_common.Tool{
-        .{ .name = "bash", .description = "x", .schema = .{ .properties = &.{} }, .run = undefined, .display = undefined },
+        pub fn isToolLess(self: *ChatPayload) bool {
+            return std.mem.eql(u8, self.tools_json, "[]");
+        }
     };
-    var client: Client = undefined;
-    try client.init(gpa, std.testing.io, .{
-        .base_url = "http://localhost:8080/v1",
-        .api_key = "test-key",
-        .model = "test-model",
-        .tools = &tools,
-        .mcp_tools = &.{},
-    });
-    defer client.deinit();
-
-    // No detail recorded yet → no mention.
-    try std.testing.expect(!client.errorDetailMentionsCache());
-
-    // Lowercase "cache".
-    client.last_error_detail = try gpa.dupe(u8, "HTTP 400: unknown field cache_control");
-    try std.testing.expect(client.errorDetailMentionsCache());
-    gpa.free(client.last_error_detail.?);
-
-    // Mixed-case "Cache".
-    client.last_error_detail = try gpa.dupe(u8, "Cache-Control header rejected");
-    try std.testing.expect(client.errorDetailMentionsCache());
-    gpa.free(client.last_error_detail.?);
-
-    // Unrelated error → no mention (downgrade must not fire).
-    client.last_error_detail = try gpa.dupe(u8, "HTTP 400: invalid model id");
-    try std.testing.expect(!client.errorDetailMentionsCache());
-    gpa.free(client.last_error_detail.?);
-    client.last_error_detail = null;
-}
+};
 
 test "Client.init rejects an empty base_url with EmptyBaseUrl" {
     // A missing base_url is a config error, not a programming precondition —
@@ -712,9 +352,13 @@ test "buildAllToolsJson via updateMcpTools: registry builtin suppresses duplicat
         .display = undefined,
     });
 
-    // The fix: pass &.{} as builtin_override so config.tools isn't
-    // emitted alongside the registry's builtin (which already has it).
-    try client.updateMcpTools(&.{}, reg, &.{});
+    // Mirror the runtime's assembleToolSpecs: registry records only (the
+    // registry's builtin slice already covers the shell tool).
+    var specs: std.ArrayList(tool_schema.ToolSpec) = .empty;
+    defer specs.deinit(gpa);
+    const reg_slice = try reg.all(gpa);
+    for (reg_slice) |t| try specs.append(gpa, tool_schema.specFromTool(t));
+    try client.updateTools(specs.items);
 
     const json = client.tools_json;
     var first: ?usize = null;
@@ -771,8 +415,12 @@ test "updateMcpTools propagates plugin tools into tools_json end-to-end" {
         });
     }
 
-    // The exact call shape from injectAllTools.
-    try client.updateMcpTools(&.{}, reg, &.{});
+    // The exact call shape from injectAllTools (specs = registry records).
+    var specs: std.ArrayList(tool_schema.ToolSpec) = .empty;
+    defer specs.deinit(gpa);
+    const reg_slice = try reg.all(gpa);
+    for (reg_slice) |t| try specs.append(gpa, tool_schema.specFromTool(t));
+    try client.updateTools(specs.items);
 
     const json = client.tools_json;
     const shell_name = try std.fmt.allocPrint(gpa, "\"name\":\"{s}\"", .{tools_mod.shellToolName});
@@ -946,17 +594,24 @@ test "updateMcpTools rebuilds the serialized tool list in place" {
     try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "mcp__tavily__search") == null);
 
     // Injecting an MCP tool set must add it alongside the builtin tool.
-    const mcp_tools = [_]ai.McpToolSchema{
+    const mcp_tools = [_]tool_schema.ToolSpec{
         .{ .name = "mcp__tavily__search", .description = "Search the web", .schema = .{ .properties = &.{} } },
     };
-    try client.updateMcpTools(&mcp_tools, null, tools_mod.builtinRegistry());
+    var with_mcp: std.ArrayList(tool_schema.ToolSpec) = .empty;
+    defer with_mcp.deinit(gpa);
+    for (tools_mod.builtinRegistry()) |t| try with_mcp.append(gpa, tool_schema.specFromTool(t));
+    try with_mcp.appendSlice(gpa, &mcp_tools);
+    try client.updateTools(with_mcp.items);
     const shell_name = try std.fmt.allocPrint(gpa, "\"name\":\"{s}\"", .{tools_mod.shellToolName});
     defer gpa.free(shell_name);
     try std.testing.expect(std.mem.indexOf(u8, client.tools_json, shell_name) != null);
     try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "\"name\":\"mcp__tavily__search\"") != null);
 
     // Replacing with an empty set removes the MCP tool but keeps the builtin.
-    try client.updateMcpTools(&.{}, null, tools_mod.builtinRegistry());
+    var builtin_only: std.ArrayList(tool_schema.ToolSpec) = .empty;
+    defer builtin_only.deinit(gpa);
+    for (tools_mod.builtinRegistry()) |t| try builtin_only.append(gpa, tool_schema.specFromTool(t));
+    try client.updateTools(builtin_only.items);
     try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "mcp__tavily__search") == null);
     try std.testing.expect(std.mem.indexOf(u8, client.tools_json, shell_name) != null);
 }
@@ -1202,7 +857,7 @@ test "readStream accepts an SSE line larger than the transfer buffer" {
 
     var reader: std.Io.Reader = .fixed(stream.items);
     var tool_call_seq: u64 = 0;
-    var response = try stream_parser.readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 16, "test-model");
+    var response = try stream_parser.readStream(gpa, &reader, ai.streamNoop(), .{ .limits = .{ .max_parallel_calls = 16, .model_label = "test-model" }, .id_seq = &tool_call_seq });
     defer response.deinit(gpa);
     try std.testing.expectEqual(@as(usize, transfer_buffer_bytes + 512), response.assistant.assistant.content[0].text.text.len);
 }
@@ -1218,7 +873,7 @@ test "readStream skips empty data lines without crashing" {
         "data: [DONE]\n";
     var reader: std.Io.Reader = .fixed(stream);
     var tool_call_seq: u64 = 0;
-    var response = try stream_parser.readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 16, "test-model");
+    var response = try stream_parser.readStream(gpa, &reader, ai.streamNoop(), .{ .limits = .{ .max_parallel_calls = 16, .model_label = "test-model" }, .id_seq = &tool_call_seq });
     defer response.deinit(gpa);
     try std.testing.expectEqualStrings("hi", response.assistant.assistant.content[0].text.text);
 }
@@ -1594,15 +1249,15 @@ test "retryDelayMs honors Retry-After over backoff and caps exponential growth" 
     defer client.deinit();
 
     // Retry-After wins regardless of the attempt count.
-    try std.testing.expectEqual(@as(u64, 3000), client.retryDelayMs(0, 3));
-    try std.testing.expectEqual(@as(u64, 3000), client.retryDelayMs(5, 3));
+    try std.testing.expectEqual(@as(u64, 3000), http.retryDelayMs(500, 0, 3));
+    try std.testing.expectEqual(@as(u64, 3000), http.retryDelayMs(500, 5, 3));
     // Without the header: base * 2^attempt, capped at 8000ms.
-    try std.testing.expectEqual(@as(u64, 500), client.retryDelayMs(0, null));
-    try std.testing.expectEqual(@as(u64, 1000), client.retryDelayMs(1, null));
-    try std.testing.expectEqual(@as(u64, 2000), client.retryDelayMs(2, null));
-    try std.testing.expectEqual(@as(u64, 4000), client.retryDelayMs(3, null));
-    try std.testing.expectEqual(@as(u64, 8000), client.retryDelayMs(4, null)); // capped
-    try std.testing.expectEqual(@as(u64, 8000), client.retryDelayMs(10, null)); // stays capped
+    try std.testing.expectEqual(@as(u64, 500), http.retryDelayMs(500, 0, null));
+    try std.testing.expectEqual(@as(u64, 1000), http.retryDelayMs(500, 1, null));
+    try std.testing.expectEqual(@as(u64, 2000), http.retryDelayMs(500, 2, null));
+    try std.testing.expectEqual(@as(u64, 4000), http.retryDelayMs(500, 3, null));
+    try std.testing.expectEqual(@as(u64, 8000), http.retryDelayMs(500, 4, null)); // capped
+    try std.testing.expectEqual(@as(u64, 8000), http.retryDelayMs(500, 10, null)); // stays capped
 }
 
 /// Minimal blocking HTTP server for retry tests. Serves exactly one canned
@@ -1830,7 +1485,7 @@ test "prompt decompresses a Content-Encoding: gzip error body into the UI detail
     defer client.deinit();
 
     try std.testing.expectError(error.HttpClientError, client.prompt(&.{}, ai.streamNoop()));
-    const detail = client.last_error_detail orelse @panic("expected a recorded error detail");
+    const detail = client.errorDetail() orelse @panic("expected a recorded error detail");
     try std.testing.expectEqualStrings("HTTP 403: invalid api key", detail);
 }
 
@@ -1904,6 +1559,14 @@ const MockAbortServer = struct {
 };
 
 test "prompt records last_error_detail on stream-phase ReadFailed" {
+    if (os.is_windows) {
+        // Windows loopback close semantics: a server close after a partial
+        // write does not surface as a client read error here, so the client
+        // blocks (tests configure no socket timeout). Deferred with the
+        // other host-gated variants (#32); the retry/C2/gzip socket suites
+        // still run on Windows — only truncation semantics are gated out.
+        return error.SkipZigTest;
+    }
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1916,6 +1579,6 @@ test "prompt records last_error_detail on stream-phase ReadFailed" {
     defer client.deinit();
 
     try std.testing.expectError(error.ReadFailed, client.prompt(&.{}, ai.streamNoop()));
-    const detail = client.last_error_detail orelse @panic("expected a recorded error detail on stream ReadFailed");
+    const detail = client.errorDetail() orelse @panic("expected a recorded error detail on stream ReadFailed");
     try std.testing.expect(std.mem.startsWith(u8, detail, "Connection to the model provider was lost:"));
 }

@@ -19,8 +19,6 @@ const stream_parser = @import("stream_parser.zig");
 const isQwenModel = model_compat.isQwenModel;
 const normalizeMessagesForQwen = model_compat.normalizeMessagesForQwen;
 const deinitNormalizedMessages = model_compat.deinitNormalizedMessages;
-const wireEffortLabel = model_compat.wireEffortLabel;
-const clipEffortForModel = model_compat.clipEffortForModel;
 
 fn writeMessage(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMessage) !void {
     try out.writeAll("{\"role\":");
@@ -144,6 +142,44 @@ fn writeToolCall(out: *std.Io.Writer, tool_call: ai.ToolCall) !void {
     const args = stream_parser.sanitizeToolArguments(tool_call.arguments);
     try std.json.Stringify.value(args, .{}, out);
     try out.writeAll("}}");
+}
+
+/// Options for the chat-completions request body — what a caller must know
+/// to serialize one. This is the client-facing interface; the wire clients
+/// build one `PayloadOptions` per Client so the C2 cache downgrade is
+/// "flip `.disable_prompt_cache`, re-serialize" without repeating a
+/// positional argument list.
+pub const PayloadOptions = struct {
+    model: []const u8,
+    session_id: []const u8 = "",
+    reasoning: ?ai.Reasoning = null,
+    max_output_tokens: ?u32 = null,
+    dialect: ai.WireDialect = .minimal,
+    disable_prompt_cache: bool = false,
+    is_reasoning_model: bool = false,
+};
+
+/// Config-struct entry point; see `PayloadOptions`.
+pub fn writePayload(
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    opts: PayloadOptions,
+    messages: []const ai.MessageView,
+    tools_json: []const u8,
+) !void {
+    return writeRequestPayload(
+        gpa,
+        out,
+        opts.model,
+        opts.session_id,
+        messages,
+        tools_json,
+        opts.reasoning,
+        opts.max_output_tokens,
+        opts.dialect,
+        opts.disable_prompt_cache,
+        opts.is_reasoning_model,
+    );
 }
 
 pub fn writeRequestPayload(
@@ -276,7 +312,7 @@ pub fn writeRequestPayload(
                 // Clip unsupported effort levels (high/max/minimal → medium/low)
                 // to avoid HTTP 400 — DashScope rejects them. See wireEffortLabel.
                 try out.writeAll(",\"enable_thinking\":true,\"reasoning_effort\":\"");
-                try out.writeAll(clipEffortForModel(model, wireEffortLabel(dialect, value)) orelse value.label());
+                try out.writeAll(model_compat.resolveEffortLabel(model, dialect, value) orelse value.label());
                 try out.writeAll("\"}");
             }
         } else {
@@ -317,7 +353,7 @@ pub fn writeRequestPayload(
     // OpenAI-native and minimal dialects: flat `reasoning_effort` field. The
     // `default` level means "don't override" — emit nothing. Values that the
     // target rejects are clipped by `wireEffortLabel` (see comment there).
-    const wire_label = clipEffortForModel(model, wireEffortLabel(dialect, effort orelse .default));
+    const wire_label = model_compat.resolveEffortLabel(model, dialect, effort orelse .default);
     if (wire_label) |label| {
         try out.writeAll(",\"reasoning_effort\":\"");
         try out.writeAll(label);

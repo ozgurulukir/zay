@@ -132,19 +132,37 @@ pub fn cancelMode(app: *App) !bool {
 /// worker carries a runtime, so `liveRuntime() == null` only on a focused
 /// idle lane (`lane create` / a rested worker).
 fn refuseOnIdleLane(app: *App) bool {
-    if (app.liveRuntime() != null) return false;
-    const id = lanes_util.idleLaneId(app.thread);
-    // Stack-buffer formatting: a refusal must never itself fail (the previous
-    // allocPrint-based version silently refused without a notice on OOM), so
-    // fall back to a static literal when the id doesn't fit.
-    var buffer: [192]u8 = undefined;
-    const notice = std.fmt.bufPrint(
-        &buffer,
-        lanes_util.idle_lane_notice_template,
-        .{ id, id },
-    ) catch lanes_util.idle_lane_notice_fallback;
-    _ = app.thread.transcript.append(app.gpa, .notice, "lane", notice) catch {};
-    return true;
+    return lanes_util.requireLiveRuntime(app) == null;
+}
+
+/// Exhaustive needs-runtime classifier for the `.command` submit arm. `true`
+/// means the command's call chain derefs `liveRuntime().?` (session_switcher /
+/// provider_model / session writer undo) and must refuse on a focused idle
+/// lane BEFORE `clearPaletteInput` so the typed text survives (TD-2).
+/// Exhaustiveness is the point: the compiler forces a decision for every new
+/// Command, replacing the old hand-written `crashes_on_idle` list.
+pub fn commandNeedsRuntime(command: Command) bool {
+    return switch (command) {
+        .new, .resume_session, .timeline, .undo, .connect => true,
+        .model, .mcp, .plugins, .settings, .theme, .diff, .parallel, .save, .search, .close, .merge, .lanes, .clear, .compact, .status, .skills, .help, .export_session, .copy, .paste, .exit_cmd => false,
+    };
+}
+
+test "commandNeedsRuntime covers every command exactly once" {
+    // Enumeration pin: add the new Command here AND decide its needs-runtime
+    // bit in the switch above — the compiler only forces the switch.
+    const all = [_]Command{ .connect, .model, .mcp, .new, .resume_session, .timeline, .undo, .diff, .parallel, .save, .close, .merge, .lanes, .search, .clear, .compact, .status, .help, .export_session, .settings, .copy, .paste, .exit_cmd, .plugins, .skills, .theme };
+    var seen = std.EnumSet(Command).initEmpty();
+    var needs_runtime_count: usize = 0;
+    for (all) |command| {
+        try std.testing.expect(!seen.contains(command));
+        seen.insert(command);
+        if (commandNeedsRuntime(command)) needs_runtime_count += 1;
+    }
+    // The needs-runtime set is exactly the one the submitMode guard refuses:
+    // new, resume_session, timeline, undo, connect.
+    try std.testing.expectEqual(@as(usize, 5), needs_runtime_count);
+    try std.testing.expectEqual(all.len, seen.count());
 }
 
 /// Close any open overlay whose key/submit handlers deref the live runtime.
@@ -379,11 +397,7 @@ pub fn submitMode(app: *App) !bool {
                 // picker guards above and beginSubmit's TD-2 preserve-input rule).
                 // The other commands are idle-lane-safe (self-guarded or
                 // runtime-free) and don't reach this guard.
-                const crashes_on_idle = switch (command) {
-                    .new, .resume_session, .timeline, .undo, .connect => true,
-                    else => false,
-                };
-                if (crashes_on_idle and refuseOnIdleLane(app)) return true;
+                if (commandNeedsRuntime(command) and refuseOnIdleLane(app)) return true;
                 app.clearPaletteInput();
                 app.clearInput();
                 switch (command) {

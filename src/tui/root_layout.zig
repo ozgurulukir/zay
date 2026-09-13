@@ -273,7 +273,11 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         idx += 1;
     }
     if (background_visible) {
-        var jobs_view: background_jobs.BackgroundJobsWidget = .{ .app = app };
+        var jobs_view: background_jobs.BackgroundJobsWidget = .{ .props = .{
+            .manager = app.background,
+            .selection = app.background_modal_state.selection,
+            .cancel_focus = app.background_modal_state.cancel_focus,
+        } };
         const rows: u16 = @intCast(@min(@as(usize, 8), app.runningBackgroundCount()));
         const panel_height: u16 = @min(layout.input_row, rows + 4);
         children[idx] = .{

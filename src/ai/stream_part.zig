@@ -26,6 +26,27 @@ const std = @import("std");
 pub const chunk_count_max: u32 = 100_000;
 pub const bytes_max: u32 = 8 * 1024 * 1024;
 
+/// Shared stream-parsing policy: both wire adapters (chat-completions and
+/// Responses) accept this so the parallel-call cap and reject logging behave
+/// identically regardless of protocol.
+pub const StreamLimits = struct {
+    /// Upper bound on parallel tool calls per turn. Deltas at or above the
+    /// cap are dropped (counted in `dropped`) so the remaining calls can
+    /// still complete the turn.
+    max_parallel_calls: u32 = 16,
+    /// Borrowed; used only so the over-cap reject log can name which model
+    /// tripped the cap. Never affects parsing behaviour.
+    model_label: []const u8 = "",
+};
+
+/// Per-stream environment shared by both adapters: the policy above plus the
+/// client-owned monotonic counter for minting synthetic tool-call ids when
+/// the server omits them (client lifetime preserves cross-turn uniqueness).
+pub const StreamEnv = struct {
+    limits: StreamLimits = .{},
+    id_seq: *u64,
+};
+
 /// The classification of one raw SSE line. Pure: the returned `data` slice
 /// borrows from the input line.
 pub const Line = union(enum) {

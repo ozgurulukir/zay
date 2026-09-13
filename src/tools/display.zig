@@ -34,7 +34,7 @@ pub fn formatToolDisplay(
 ) !tools.ToolDisplay {
     const t = tool orelse
         return .{ .label = try std.fmt.allocPrint(gpa, "<unknown> {s}", .{arguments}) };
-    return t.display(gpa, arguments, t.userdata);
+    return t.display(gpa, arguments, .{ .ctx = &tools.ToolContext.headless, .userdata = t.userdata });
 }
 
 /// Look up a display label for a tool. Falls back to the tool name when
@@ -48,7 +48,9 @@ pub fn lookupDisplay(
     args: []const u8,
 ) !tools.ToolDisplay {
     const t = tool orelse return .{ .label = try gpa.dupe(u8, name) };
-    return t.display(gpa, args, t.userdata);
+    // Display formatters never read the runtime context (they render the
+    // call arguments), so the shared headless context is the right adapter.
+    return t.display(gpa, args, .{ .ctx = &tools.ToolContext.headless, .userdata = t.userdata });
 }
 
 /// The human-facing body. Each tool owns its own display: when it sets a
