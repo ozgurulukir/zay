@@ -81,13 +81,9 @@ pub fn requestManualCompact(app: *App) !bool {
 /// `threads.items`, so the notice lands on the right transcript.
 pub fn drainManualCompactions(app: *App) !bool {
     var visible_change = false;
-    const active = app.thread;
     for (app.threads.slice()) |lane| {
         const pending = if (lane.agent) |a| a.manual_compact_pending else false;
         if (!pending and lane.manual_compact_waiting_row == null) continue;
-
-        app.thread = lane;
-        defer app.thread = active;
 
         // The compact was aborted out-of-band (disconnect drained the compactor
         // and reset the pending flag) but its waiting row is still up — drop
@@ -101,7 +97,7 @@ pub fn drainManualCompactions(app: *App) !bool {
         const agent = lane.agent.?;
         const result = agent.pollManualCompact() catch |err| {
             removeWaitingRow(lane, app.gpa);
-            _ = try app.thread.transcript.append(app.gpa, .notice, "compaction", compactErrorText(err));
+            _ = try lane.transcript.append(app.gpa, .notice, "compaction", compactErrorText(err));
             visible_change = true;
             continue;
         };
@@ -113,7 +109,7 @@ pub fn drainManualCompactions(app: *App) !bool {
                 "compacted context ~{d} -> ~{d} tokens",
                 .{ info.tokens_before, info.tokens_after },
             ) catch "compacted context";
-            _ = try app.thread.transcript.append(app.gpa, .info, "notice", text);
+            _ = try lane.transcript.append(app.gpa, .info, "notice", text);
             visible_change = true;
         }
         // Null while the summarizer is still producing — the tick loop keeps

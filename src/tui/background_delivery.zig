@@ -80,8 +80,9 @@ pub fn formatBackgroundNotice(app: *App, job: *const tui.background_mod.Backgrou
 /// mid-compose.
 pub fn deliverPendingBackground(app: *App) !bool {
     var changed = false;
+    // The focused lane — used only to decide visibility ("don't yank the
+    // lane the user is typing into"); never reassigned.
     const active = app.thread;
-    defer app.thread = active;
     var i: usize = 0;
     while (i < app.background_modal_state.pending.items.len) {
         const delivery = &app.background_modal_state.pending.items[i];
@@ -107,8 +108,7 @@ pub fn deliverPendingBackground(app: *App) !bool {
         freeDelivery(app, delivery);
         _ = app.background_modal_state.pending.orderedRemove(i);
         if (start_turn) {
-            app.thread = lane;
-            app.startDeliveryTurnOnCurrentThread() catch {};
+            app.startDeliveryTurn(lane) catch {};
             return true;
         }
         changed = true;
@@ -175,7 +175,7 @@ const runtime_mod = @import("../runtime.zig");
 const isolatedHome = @import("test_fixture.zig").isolatedHome;
 
 /// A live primary runtime with no provider: delivery takes the
-/// `startDeliveryTurnOnCurrentThread` flush+clearQueue branch instead of
+/// `startDeliveryTurn` flush+clearQueue branch instead of
 /// starting a real worker turn. Same field shape as GitFixture's runtime
 /// (lane_lifecycle.zig), minus the git scaffolding.
 fn createNoProviderRuntime(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !*runtime_mod.AgentRuntime {

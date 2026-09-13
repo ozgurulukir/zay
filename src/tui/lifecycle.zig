@@ -445,7 +445,7 @@ fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
 
                 // A discarded (interrupted) turn's events are swallowed inside
                 // applyAgentEvent — the Turn machine refuses to project them.
-                const changed = try root.app.applyAgentEvent(event_ptr.*);
+                const changed = try root.app.applyAgentEvent(lane, event_ptr.*);
                 if (lane != active) continue; // a background lane never touches the view
                 if (changed) visible_change = true;
                 switch (event_ptr.*) {
@@ -492,7 +492,7 @@ pub fn createParallelLane(self: *App) !void {
 
     // Recent parent-lane messages give the branch-naming request context
     // for vague first prompts ("try the other approach").
-    const context = try self.captureLaneContext(tui.lane_naming_context_max);
+    const context = try self.captureLaneContext(self.thread, tui.lane_naming_context_max);
     errdefer {
         for (context) |message| self.gpa.free(message);
         if (context.len > 0) self.gpa.free(context);

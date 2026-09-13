@@ -7,6 +7,8 @@ const agent_mod = @import("../agent.zig");
 const agent_worker = @import("agent_worker.zig");
 const turn_cancel = @import("turn_cancel.zig");
 const lanes_util = @import("lanes.zig");
+const queue_mod = @import("queue.zig");
+const checkpoint_mod = @import("checkpoint.zig");
 const runtime_mod = @import("../runtime.zig");
 
 const App = tui.App;
@@ -43,7 +45,7 @@ pub fn handleInterrupt(app: *App) !void {
     // once but can never strand the machine in `.interrupting`.
     if (beginTurnCancel(app)) return;
     discardAbandonedTurn(app);
-    _ = try restartTurnForQueuedMessages(app);
+    _ = try restartTurnForQueuedMessages(app, app.thread);
 }
 
 /// Move the lane's turn future into a background `TurnCancelJob` and start it.
@@ -92,16 +94,15 @@ pub fn discardAbandonedTurn(app: *App) void {
         _ = future.cancel(app.getIo());
         app.thread.turn_future = null;
     }
-    discardStrandedEvents(app);
+    discardStrandedEvents(app.thread);
     if (app.thread.turn.state == .interrupting) app.thread.turn.reset();
 }
 
 /// Free everything still sitting in a joined worker's event queue. The worker
 /// keeps pushing until the cancel lands, so this must only run after the
 /// worker is joined (cancel job done, or a synchronous `future.cancel`).
-fn discardStrandedEvents(app: *App) void {
-    const thread = app.thread;
-    if (thread.worker_context) |*worker| worker.queue.discardAll(worker.io, worker.gpa);
+fn discardStrandedEvents(lane: *Thread) void {
+    if (lane.worker_context) |*worker| worker.queue.discardAll(worker.io, worker.gpa);
 }
 
 /// Tick drain: converge every lane whose async interrupt teardown finished.
@@ -123,18 +124,15 @@ pub fn drainTurnCancels(app: *App) !bool {
         app.gpa.destroy(job);
         changed = true;
 
-        const active = app.thread;
-        app.thread = lane;
-        defer app.thread = active;
-        discardStrandedEvents(app);
+        discardStrandedEvents(lane);
         if (lane.turn.state == .interrupting) {
             // The cancel gate dropped the worker's terminal event (the
             // machine never saw `turn_finished`) — close the window here.
             log.info("interrupt: cancel gate dropped the terminal event; resetting machine", .{});
             lane.turn.reset();
         }
-        app.checkpointFinishedTurn();
-        if (try restartTurnForQueuedMessages(app)) changed = true;
+        checkpoint_mod.checkpointFinishedTurn(app, lane);
+        if (try restartTurnForQueuedMessages(app, lane)) changed = true;
     }
     return changed;
 }
@@ -194,7 +192,7 @@ pub fn beginSubmit(app: *App) !bool {
         return false;
     }
 
-    resetTurnState(app);
+    resetTurnState(app, app.thread);
     app.thread.worker_context.?.resetCancel();
     app.thread.transcript.dropIntroLogo(app.gpa);
     _ = try app.thread.transcript.append(app.gpa, .user, "you", prompt);
@@ -203,8 +201,8 @@ pub fn beginSubmit(app: *App) !bool {
     if (app.thread.title == null and lanes_util.workingLaneOf(app.thread) != null) {
         app.scheduleLaneNaming(app.thread, prompt) catch {};
     }
-    try setLaneTitleIfUnset(app, prompt);
-    try app.appendSkillInvocationsToTranscript(prompt);
+    try setLaneTitleIfUnset(app, app.thread, prompt);
+    try queue_mod.appendSkillInvocationsToTranscript(app, app.thread, prompt);
     app.thread.turn_view.awaitModel();
     // The worker expands `@`-mentions (reading files / images) off the UI
     // thread; stash the raw text for `startTurn` to hand over. The worker
@@ -217,8 +215,8 @@ pub fn beginSubmit(app: *App) !bool {
 
 /// Label the lane by its first user prompt (one line, truncated) so split
 /// tiles read as the session, not a generic "lane". Owned; freed in deinit.
-pub fn setLaneTitleIfUnset(app: *App, prompt: []const u8) !void {
-    if (app.thread.title != null) return;
+pub fn setLaneTitleIfUnset(app: *App, lane: *Thread, prompt: []const u8) !void {
+    if (lane.title != null) return;
     const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
     if (trimmed.len == 0) return;
     const line_end = std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len;
@@ -226,12 +224,12 @@ pub fn setLaneTitleIfUnset(app: *App, prompt: []const u8) !void {
     if (line.len == 0) return;
     const max: usize = 40;
     if (line.len <= max) {
-        app.thread.title = try app.gpa.dupe(u8, line);
+        lane.title = try app.gpa.dupe(u8, line);
         return;
     }
     var cut: usize = max;
     while (cut > 0 and (line[cut] & 0xC0) == 0x80) cut -= 1;
-    app.thread.title = try std.fmt.allocPrint(app.gpa, "{s}…", .{line[0..cut]});
+    lane.title = try std.fmt.allocPrint(app.gpa, "{s}…", .{line[0..cut]});
 }
 
 pub fn formatNoProviderMessage(app: *App) ![]u8 {
@@ -273,21 +271,21 @@ pub fn formatNoProviderMessage(app: *App) ![]u8 {
     );
 }
 
-pub fn resetTurnState(app: *App) void {
-    app.thread.turn_view.reset(app.getIo());
+pub fn resetTurnState(app: *App, lane: *Thread) void {
+    lane.turn_view.reset(app.getIo());
     app.metrics.loading_frame = 0;
     // A fresh turn invalidates the previous turn's failure record.
-    if (app.thread.turn_failed) |old| {
+    if (lane.turn_failed) |old| {
         app.gpa.free(old);
-        app.thread.turn_failed = null;
+        lane.turn_failed = null;
     }
     // Turn-start bookkeeping for the model-driven `lane` ops: a fresh turn
     // has made no progress yet, so anchor the activity clock now (a worker
     // is legitimately silent while its first model request is in flight)
     // and reset the tool-call tally + stall-warning latch.
-    app.thread.last_activity_ms = std.Io.Clock.now(.awake, app.getIo()).toMilliseconds();
-    app.thread.turn_tool_calls = 0;
-    app.thread.stall_warned = false;
+    lane.last_activity_ms = std.Io.Clock.now(.awake, app.getIo()).toMilliseconds();
+    lane.turn_tool_calls = 0;
+    lane.stall_warned = false;
 }
 
 pub fn startTurn(app: *App) !void {
@@ -306,30 +304,30 @@ pub fn startTurn(app: *App) !void {
 /// deliver any queued messages as a fresh turn: the worker drains the whole
 /// queue into history (leading messages as context, the last as the latest
 /// user message the model answers). Returns true if a turn was started.
-pub fn restartTurnForQueuedMessages(app: *App) !bool {
-    if (app.thread.queued.items.len == 0) return false;
+pub fn restartTurnForQueuedMessages(app: *App, lane: *Thread) !bool {
+    if (lane.queued.items.len == 0) return false;
     // No connected provider to run a turn: surface the queued text in the
     // transcript and drop the queue rather than spin up a doomed worker.
-    if (app.liveRuntime() != null and app.liveRuntime().?.client == .none) {
-        try app.flushQueuedUserMessagesToTranscript(@intCast(app.thread.queued.items.len));
-        app.thread.agent.?.clearQueue();
+    if (lane.liveRuntime() != null and lane.liveRuntime().?.client == .none) {
+        try queue_mod.flushQueuedUserMessagesToTranscript(app, lane, @intCast(lane.queued.items.len));
+        lane.agent.?.clearQueue();
         return true;
     }
-    resetTurnState(app);
-    app.thread.worker_context.?.resetCancel();
-    app.thread.turn_view.awaitModel();
+    resetTurnState(app, lane);
+    lane.worker_context.?.resetCancel();
+    lane.turn_view.awaitModel();
     // Free any prompt left over from a failed `startTurn` (the window is
     // theoretical — beginSubmit→startTurn are contiguous — but the cleanup
     // costs nothing). Messages travel via `drain_queue_first`, so no prompt
     // is handed over here.
-    if (app.thread.pending_prompt) |p| {
-        app.thread.worker_context.?.gpa.free(p);
-        app.thread.pending_prompt = null;
+    if (lane.pending_prompt) |p| {
+        lane.worker_context.?.gpa.free(p);
+        lane.pending_prompt = null;
     }
-    app.thread.turn.submit();
-    app.thread.turn_future = try app.getIo().concurrent(agent_worker.runAgentTurn, .{
-        app.thread.agent.?,
-        &app.thread.worker_context.?,
+    lane.turn.submit();
+    lane.turn_future = try app.getIo().concurrent(agent_worker.runAgentTurn, .{
+        lane.agent.?,
+        &lane.worker_context.?,
         @as(?[]u8, null),
         true,
     });
@@ -340,52 +338,54 @@ pub fn restartTurnForQueuedMessages(app: *App) !bool {
 /// messages into history and answers them. Mirrors
 /// `restartTurnForQueuedMessages` but is gated on the agent queue, not the
 /// UI's display queue. Caller must have set `app.thread` to the target lane.
-pub fn startDeliveryTurnOnCurrentThread(app: *App) !void {
+/// Start a delivery turn on `lane` (answers the lane agent's queued
+/// background messages). Gated on the agent queue, not the UI display queue.
+pub fn startDeliveryTurn(app: *App, lane: *Thread) !void {
     if (app.liveRuntime() != null and app.liveRuntime().?.client == .none) {
         // No provider to run a turn — drop the queued notice rather than spin
         // up a doomed worker. Flush the mirror first so it stays 1:1 with the
         // cleared agent queue (raw entries are dropped unrendered; a stray
         // mirror entry would shift every `steerSelectedQueued` index).
-        try app.flushQueuedUserMessagesToTranscript(@intCast(app.thread.queued.items.len));
-        app.thread.agent.?.clearQueue();
+        try queue_mod.flushQueuedUserMessagesToTranscript(app, lane, @intCast(lane.queued.items.len));
+        lane.agent.?.clearQueue();
         return;
     }
-    resetTurnState(app);
-    app.thread.worker_context.?.resetCancel();
-    app.thread.turn_view.awaitModel();
+    resetTurnState(app, lane);
+    lane.worker_context.?.resetCancel();
+    lane.turn_view.awaitModel();
     // Free any prompt left over from a failed `startTurn`; messages travel via
     // `drain_queue_first`, so no prompt is handed over here.
-    if (app.thread.pending_prompt) |p| {
-        app.thread.worker_context.?.gpa.free(p);
-        app.thread.pending_prompt = null;
+    if (lane.pending_prompt) |p| {
+        lane.worker_context.?.gpa.free(p);
+        lane.pending_prompt = null;
     }
-    app.thread.turn.submit();
-    app.thread.turn_future = try app.getIo().concurrent(agent_worker.runAgentTurn, .{
-        app.thread.agent.?,
-        &app.thread.worker_context.?,
+    lane.turn.submit();
+    lane.turn_future = try app.getIo().concurrent(agent_worker.runAgentTurn, .{
+        lane.agent.?,
+        &lane.worker_context.?,
         @as(?[]u8, null),
         true,
     });
 }
 
-pub fn applyAgentEvent(app: *App, event: agent_mod.Agent.Event) !bool {
-    const outcome = app.thread.turn.apply(event);
+pub fn applyAgentEvent(app: *App, lane: *Thread, event: agent_mod.Agent.Event) !bool {
+    const outcome = lane.turn.apply(event);
     // Any event the worker emitted means it is alive — stamp the activity
     // clock `lane read`/`await`/`list` use to detect a stalled worker (one
     // blocked in a hung read emits nothing), clear the stall-warning latch
     // (progress resumed), and tally tool calls.
-    app.thread.last_activity_ms = std.Io.Clock.now(.awake, app.getIo()).toMilliseconds();
-    app.thread.stall_warned = false;
+    lane.last_activity_ms = std.Io.Clock.now(.awake, app.getIo()).toMilliseconds();
+    lane.stall_warned = false;
     switch (event) {
-        .tool_call_finished => app.thread.turn_tool_calls += 1,
-        .turn_started => app.thread.turn_tool_calls = 0,
+        .tool_call_finished => lane.turn_tool_calls += 1,
+        .turn_started => lane.turn_tool_calls = 0,
         .turn_failed => |message| {
             // Record why the turn failed (the same text lands in the
             // transcript as a notice). Spawned-worker completion delivery
             // reads this so a failed worker isn't reported as "done"; a new
             // turn on the lane resets it.
-            if (app.thread.turn_failed) |old| app.gpa.free(old);
-            app.thread.turn_failed = try app.gpa.dupe(u8, message);
+            if (lane.turn_failed) |old| app.gpa.free(old);
+            lane.turn_failed = try app.gpa.dupe(u8, message);
         },
         else => {},
     }
@@ -398,31 +398,31 @@ pub fn applyAgentEvent(app: *App, event: agent_mod.Agent.Event) !bool {
         // The fallback (no job) is a synchronously-interrupted lane: converge
         // immediately, as `handleInterrupt`'s legacy path does.
         if (outcome.finished) {
-            if (app.thread.cancel_job != null) return false;
-            app.awaitTurn();
+            if (lane.cancel_job != null) return false;
+            app.awaitTurnFor(lane);
             // The worker is joined, so any files the cut-short turn wrote are
             // settled on disk. Snapshot them now — otherwise they sit
             // unbound and a later timeline restore can't bring them back.
-            app.checkpointFinishedTurn();
-            return try restartTurnForQueuedMessages(app);
+            checkpoint_mod.checkpointFinishedTurn(app, lane);
+            return try restartTurnForQueuedMessages(app, lane);
         }
         return false;
     }
-    var visible_change = try app.thread.turn_view.apply(app.gpa, &app.thread.transcript, event);
+    var visible_change = try lane.turn_view.apply(app.gpa, &lane.transcript, event);
     switch (event) {
         .queued_messages_flushed => |count| {
-            if (count > 0 and app.thread.queued.items.len > 0) {
-                try app.flushQueuedUserMessagesToTranscript(count);
+            if (count > 0 and lane.queued.items.len > 0) {
+                try queue_mod.flushQueuedUserMessagesToTranscript(app, lane, count);
                 visible_change = true;
             }
         },
         else => {},
     }
     if (outcome.finished) {
-        app.awaitTurn();
-        app.checkpointFinishedTurn();
-        if (app.thread.queued.items.len > 0) {
-            app.clearQueuedUserMessages();
+        app.awaitTurnFor(lane);
+        checkpoint_mod.checkpointFinishedTurn(app, lane);
+        if (lane.queued.items.len > 0) {
+            queue_mod.clearQueuedUserMessages(app, lane);
             visible_change = true;
         }
     }

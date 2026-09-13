@@ -5,6 +5,7 @@ const tui = @import("../tui.zig");
 const vcs = @import("../vcs.zig");
 
 const App = tui.App;
+const Thread = tui.Thread;
 
 /// What a `sealCheckpoint` attempt did — so callers can tell a genuine
 /// failure apart from the benign "nothing to bind" and "git unavailable"
@@ -17,8 +18,10 @@ pub const SealOutcome = enum { sealed, nothing, unavailable, failed };
 /// commit kept alive by a `refs/zay/*` ref. A git or persistence error
 /// returns `.failed` — never swallowed silently, since a missing binding is
 /// exactly what broke timeline navigation before.
-pub fn sealCheckpoint(app: *App) SealOutcome {
-    const rt = app.liveRuntime() orelse return .unavailable;
+pub fn sealCheckpoint(app: *App, lane: *Thread) SealOutcome {
+    // The LANE's runtime — during a background lane's turn-end the focused
+    // lane may be a different one entirely.
+    const rt = lane.liveRuntime() orelse return .unavailable;
     if (!ensureCheckpointReady(app)) return .unavailable;
     const index = vcs.indexPath(app.gpa, app.getIo(), rt.cwd) catch return .failed;
     defer app.gpa.free(index);
@@ -36,10 +39,10 @@ pub fn sealCheckpoint(app: *App) SealOutcome {
 /// Tell the user a snapshot couldn't be taken — once. A persistently broken
 /// git would otherwise append this every turn; the flag clears the next time
 /// a snapshot succeeds (see `noteCheckpointSucceeded`).
-pub fn noteCheckpointFailure(app: *App) void {
+pub fn noteCheckpointFailure(app: *App, lane: *Thread) void {
     if (app.checkpoint_warned) return;
     app.checkpoint_warned = true;
-    _ = app.thread.transcript.append(app.gpa, .notice, "notice", "Couldn't snapshot the working tree — timeline navigation may not restore this point's files. Check that `git` works in this repo.") catch {};
+    _ = lane.transcript.append(app.gpa, .notice, "notice", "Couldn't snapshot the working tree — timeline navigation may not restore this point's files. Check that `git` works in this repo.") catch {};
 }
 
 pub fn noteCheckpointSucceeded(app: *App) void {
@@ -49,18 +52,18 @@ pub fn noteCheckpointSucceeded(app: *App) void {
 /// Snapshot at a turn boundary and surface a genuine failure to the user
 /// (deduped). Every place that must bind the current code state to the
 /// conversation goes through here, so a broken snapshot is never silent.
-pub fn checkpointBoundary(app: *App) void {
-    switch (sealCheckpoint(app)) {
+pub fn checkpointBoundary(app: *App, lane: *Thread) void {
+    switch (sealCheckpoint(app, lane)) {
         .sealed => noteCheckpointSucceeded(app),
-        .failed => noteCheckpointFailure(app),
+        .failed => noteCheckpointFailure(app, lane),
         .nothing, .unavailable => {},
     }
 }
 
 /// Seal at the end of a turn (clean or interrupted, so a turn that wrote
 /// files before being cut still binds them to a snapshot).
-pub fn checkpointFinishedTurn(app: *App) void {
-    checkpointBoundary(app);
+pub fn checkpointFinishedTurn(app: *App, lane: *Thread) void {
+    checkpointBoundary(app, lane);
 }
 
 /// `/save` entry point: reject when the working tree has nothing to commit,

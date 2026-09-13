@@ -14,7 +14,6 @@ const tui_style = @import("../style.zig");
 const panel = @import("panel.zig");
 const diff_viewer = @import("../diff_viewer.zig");
 
-
 // Left-margin columns: [0..3] line number, [4] diff sign, [5] comment bracket,
 // [6..] content.
 const diff_content_col: u16 = 6;
