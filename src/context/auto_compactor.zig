@@ -27,7 +27,8 @@ const session_mod = @import("../session.zig");
 const config_mod = @import("../config/config.zig");
 
 /// Automatic compaction backs off after this many consecutive failures;
-/// `/compact` stays available (TD-6).
+/// `/compact` stays available (TD-6). `Agent.compaction_failure_limit`
+/// aliases this — keep the SSOT here.
 pub const failure_limit: u32 = 3;
 /// Defensive bound for `forceCompact`'s yield loop against a state that
 /// never resolves.

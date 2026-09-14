@@ -36,8 +36,8 @@ const Compactor = agent_compactor.Compactor;
 
 /// After this many consecutive background-compaction failures the automatic
 /// path backs off (emitting one notice); the manual `/compact` command is
-/// never gated (TD-6).
-pub const compaction_failure_limit: u32 = 3;
+/// never gated (TD-6). Alias of the AutoCompactor's own limit — one SSOT.
+pub const compaction_failure_limit: u32 = auto_compactor_mod.failure_limit;
 /// Trailing machine-authored continuation hint left in history after a soft
 /// budget stop. Role `.user` (not `.system`) because `SessionWriter.append`
 /// skips system messages — `.user` survives `/resume`, branch switches, and

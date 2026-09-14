@@ -214,6 +214,11 @@ pub const App = struct {
     /// Mirrors the permission overlay's lightweight, mode-less state.
     background_modal_state: app_state.BackgroundModalState = .{},
     mcp_manager: mcp_mod.McpManager = undefined,
+    /// Set when an MCP registry sync was refused because a lane turn was in
+    /// flight (connect/disconnect landed mid-turn). The tick retries the sync
+    /// on the first quiet tick — without it the server's tools stay missing
+    /// from registry + tools_json until an unrelated injection event.
+    mcp_sync_pending: bool = false,
     plugin_manager: lua_mod.PluginManager = undefined,
     /// The `lane` tool's request/response bridge. Heap-allocated so its
     /// address stays stable while worker threads block on it; owned here,

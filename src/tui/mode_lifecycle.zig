@@ -137,10 +137,11 @@ fn refuseOnIdleLane(app: *App) bool {
 
 /// Exhaustive needs-runtime classifier for the `.command` submit arm. `true`
 /// means the command's call chain derefs `liveRuntime().?` (session_switcher /
-/// provider_model / session writer undo) and must refuse on a focused idle
+/// session writer undo) and must refuse on a focused idle
 /// lane BEFORE `clearPaletteInput` so the typed text survives (TD-2).
 /// Exhaustiveness is the point: the compiler forces a decision for every new
-/// Command, replacing the old hand-written `crashes_on_idle` list.
+/// Command, and the `commandNeedsRuntime covers every command exactly once`
+/// test in this file pins the resulting SET, not just its size.
 pub fn commandNeedsRuntime(command: Command) bool {
     return switch (command) {
         .new, .resume_session, .timeline, .undo, .connect => true,
@@ -152,16 +153,25 @@ test "commandNeedsRuntime covers every command exactly once" {
     // Enumeration pin: add the new Command here AND decide its needs-runtime
     // bit in the switch above — the compiler only forces the switch.
     const all = [_]Command{ .connect, .model, .mcp, .new, .resume_session, .timeline, .undo, .diff, .parallel, .save, .close, .merge, .lanes, .search, .clear, .compact, .status, .help, .export_session, .settings, .copy, .paste, .exit_cmd, .plugins, .skills, .theme };
+    const needs_runtime = [_]Command{ .new, .resume_session, .timeline, .undo, .connect };
     var seen = std.EnumSet(Command).initEmpty();
-    var needs_runtime_count: usize = 0;
+    var needs_runtime_seen: usize = 0;
     for (all) |command| {
         try std.testing.expect(!seen.contains(command));
         seen.insert(command);
-        if (commandNeedsRuntime(command)) needs_runtime_count += 1;
+        // Membership, not just the count: a swap between the sets must fail.
+        const expected = blk: {
+            for (needs_runtime) |rt| {
+                if (rt == command) break :blk true;
+            }
+            break :blk false;
+        };
+        try std.testing.expectEqual(expected, commandNeedsRuntime(command));
+        if (expected) needs_runtime_seen += 1;
     }
-    // The needs-runtime set is exactly the one the submitMode guard refuses:
-    // new, resume_session, timeline, undo, connect.
-    try std.testing.expectEqual(@as(usize, 5), needs_runtime_count);
+    // The needs-runtime set is exactly the one the submitMode guard refuses,
+    // and every needs-runtime command appeared in `all`.
+    try std.testing.expectEqual(needs_runtime.len, needs_runtime_seen);
     try std.testing.expectEqual(all.len, seen.count());
 }
 

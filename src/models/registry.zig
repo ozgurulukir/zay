@@ -3,8 +3,8 @@
 //! Merges two sources into a single provider list:
 //!   1. Builtin providers (OpenAI Codex OAuth, OpenRouter, Cerebras, etc.)
 //!      defined as a comptime constant in this file.
-//!   2. `https://models.dev/api.json` — fetched on demand, cached to
-//!      `~/.config/zay/cache/models.dev/api.json` with a 24-hour TTL.
+//!   2. `https://models.dev/api.json` — fetched on demand, cached under the
+//!      platform config dir's `cache/models.dev/api.json` with a 24-hour TTL.
 //!
 //! Builtin providers always take precedence: when a models.dev provider
 //! shares an id with a builtin, the builtin wins (its base_url, adapter,
@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const http = @import("../http.zig");
+const paths = @import("../paths.zig");
 const log = std.log.scoped(.models);
 const config_provider = @import("../config/provider.zig");
 
@@ -473,7 +474,12 @@ fn cacheApiJson(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, bytes:
 }
 
 fn cacheDir(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
-    return std.fs.path.join(gpa, &.{ home_dir, ".config", "zay", "cache", cache_subdir });
+    // Derive from the global-config SSOT: identical to `~/.config/zay` on
+    // POSIX, but on Windows this follows the config.json location instead of
+    // stranding the cache in a directory nothing else uses.
+    const base = try paths.platformConfigDir(gpa, home_dir);
+    defer gpa.free(base);
+    return std.fs.path.join(gpa, &.{ base, "cache", cache_subdir });
 }
 
 fn cachePath(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {

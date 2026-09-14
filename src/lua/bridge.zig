@@ -8,8 +8,8 @@ const c = @import("c");
 const State = @import("state.zig").State;
 
 /// Thread-local override for the working directory a plugin tool runs in.
-/// A DERIVED binding of `ToolContext.plugin_cwd` (= `ExecutorService.cwd` =
-/// `Agent.effectiveCwd()`, lane worktree OR `/resume` session cwd): written
+/// A DERIVED binding of `ExecutorService.cwd` (= `Agent.effectiveCwd()`,
+/// lane worktree OR `/resume` session cwd): written
 /// only by `ExecutorService.runAll` entry (covers observer-driven plugin
 /// event callbacks, which fire outside the dispatch window) and refreshed by
 /// `rerootFromRequester` on mid-batch lane ops. Outside these windows (e.g.

@@ -32,9 +32,6 @@ pub const ResponseEventSpec = responses_events.ResponseEventSpec;
 pub const response_event_specs = responses_events.response_event_specs;
 pub const responseEventFromString = responses_events.responseEventFromString;
 
-const redirect_buffer_bytes = http.redirect_buffer_bytes;
-const transfer_buffer_bytes = http.transfer_buffer_bytes;
-const body_buffer_bytes = http.body_buffer_bytes;
 /// Upper bound on an error body we will decompress + log (matches the
 /// chat-completions client's cap). Prevents a hostile/garbage body from
 /// allocating unboundedly.
@@ -443,7 +440,9 @@ const ok_responses_sse_body =
 
 /// Mock that serves one canned response per accepted connection (like the
 /// chat-completions client's retry tests). Each connection is `close`d after
-/// the response so the client reconnects for the next attempt.
+/// the response so the client reconnects for the next attempt. Captures each
+/// connection's request body so tests can assert on the re-serialized payload
+/// (the C2 cache downgrade re-sends a stripped body).
 const MockResponsesRetryServer = struct {
     const Response = struct {
         status: std.http.Status,
@@ -451,18 +450,24 @@ const MockResponsesRetryServer = struct {
         body: []const u8 = "",
     };
 
+    gpa: std.mem.Allocator,
     io: std.Io,
     server: std.Io.net.Server,
     responses: []const Response,
     connection_count: std.atomic.Value(u32) = .init(0),
+    /// Request body per captured connection (index = connection number).
+    captured: [8]?[]u8 = .{null} ** 8,
 
-    fn init(io: std.Io, responses: []const Response) !@This() {
+    fn init(gpa: std.mem.Allocator, io: std.Io, responses: []const Response) !@This() {
         const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
         const server = try addr.listen(io, .{ .reuse_address = true });
-        return .{ .io = io, .server = server, .responses = responses };
+        return .{ .gpa = gpa, .io = io, .server = server, .responses = responses };
     }
 
     fn deinit(self: *@This()) void {
+        for (self.captured) |maybe_body| {
+            if (maybe_body) |body| self.gpa.free(body);
+        }
         self.server.deinit(self.io);
     }
 
@@ -476,7 +481,7 @@ const MockResponsesRetryServer = struct {
         for (self.responses) |resp| {
             var stream = self.server.accept(self.io) catch return;
             defer stream.close(self.io);
-            _ = self.connection_count.fetchAdd(1, .monotonic);
+            const conn_index = self.connection_count.fetchAdd(1, .monotonic);
             var reader = stream.reader(self.io, &read_buf);
             var writer = stream.writer(self.io, &write_buf);
             var http_server = std.http.Server.init(&reader.interface, &writer.interface);
@@ -484,6 +489,14 @@ const MockResponsesRetryServer = struct {
             // the client blocks reading the response after sending, so nothing
             // follows the terminal `0\r\n\r\n`.
             var request = http_server.receiveHead() catch return;
+            // Capture the body BEFORE responding (respond drains what's left).
+            if (conn_index < self.captured.len) {
+                var body_buf: [16384]u8 = undefined;
+                var body_reader = request.readerExpectNone(&body_buf);
+                if (body_reader.allocRemaining(self.gpa, .limited(1024 * 1024))) |body| {
+                    self.captured[conn_index] = body;
+                } else |_| {}
+            }
             var extra: [2]std.http.Header = undefined;
             var extra_count: usize = 0;
             if (resp.retry_after) |ra| {
@@ -503,7 +516,7 @@ test "prompt retries a transient 503 and succeeds (Responses API)" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var server = try MockResponsesRetryServer.init(io, &.{
+    var server = try MockResponsesRetryServer.init(gpa, io, &.{
         .{ .status = .service_unavailable },
         .{ .status = .ok, .body = ok_responses_sse_body },
     });
@@ -537,7 +550,7 @@ test "prompt does not retry a permanent 4xx (Responses API)" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var server = try MockResponsesRetryServer.init(io, &.{
+    var server = try MockResponsesRetryServer.init(gpa, io, &.{
         .{ .status = .bad_request },
     });
     defer server.deinit();
@@ -564,13 +577,54 @@ test "prompt does not retry a permanent 4xx (Responses API)" {
     try std.testing.expectEqual(@as(u32, 1), server.connection_count.load(.monotonic));
 }
 
+test "prompt downgrades to a cache-stripped payload on a cache-mentioning 400 (C2)" {
+    // Regression: the C2 branch used to sit behind the retry-budget gate, but
+    // `HttpClientError` is not retryable — a 400 on the FIRST attempt returned
+    // immediately and the stripped re-send never happened.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server = try MockResponsesRetryServer.init(gpa, io, &.{
+        .{ .status = .bad_request, .body = "{\"error\":{\"message\":\"prompt_cache_key is not accepted\"}}" },
+        .{ .status = .ok, .body = ok_responses_sse_body },
+    });
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, MockResponsesRetryServer.serve, .{&server});
+    defer thread.join();
+
+    const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port()});
+    defer gpa.free(base_url);
+    var client: Client = undefined;
+    try Client.init(&client, gpa, io, .{
+        .base_url = base_url,
+        .api_key = "test-key",
+        .model = "test-model",
+        .tools = &.{},
+        .mcp_tools = &.{},
+        .session_id = "test",
+        .system_prompt = "",
+        .retry_base_delay_ms = 0,
+    }, .{});
+    defer client.deinit();
+
+    // The downgrade is invisible to the caller: the 400 becomes a turn.
+    var turn = try client.prompt(&.{}, ai.streamNoop());
+    defer turn.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 2), server.connection_count.load(.monotonic));
+    // The re-serialized payload dropped the cache field the server rejected.
+    const first = server.captured[0].?;
+    const second = server.captured[1].?;
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"prompt_cache_key\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"prompt_cache_key\"") == null);
+}
+
 test "prompt records last_error_detail on an HTTP error (Responses API)" {
     // Regression: the Responses client previously dropped the error body and
     // never populated `last_error_detail`, so the UI saw no provider message.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var server = try MockResponsesRetryServer.init(io, &.{
+    var server = try MockResponsesRetryServer.init(gpa, io, &.{
         .{ .status = .forbidden, .body = "{\"error\":{\"message\":\"invalid api key\"}}" },
     });
     defer server.deinit();

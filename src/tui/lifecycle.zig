@@ -265,6 +265,9 @@ fn drainModelsAndMcp(root: *RootWidget) !bool {
     if (try registry_job.drain(root.app)) visible_change = true;
     if (provider_model.drainMcpNotifications(root.app)) visible_change = true;
     if (provider_model.drainMcpConnects(root.app)) visible_change = true;
+    // A registry sync refused mid-turn (connect/disconnect landing while a
+    // lane turn was in flight) retries on the first quiet tick.
+    if (provider_model.retryPendingMcpSync(root.app)) visible_change = true;
     return visible_change;
 }
 
@@ -400,10 +403,10 @@ fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
     var visible_change = false;
     var refresh_diff = false;
     const active = root.app.thread;
-    // Each lane runs its own turn, so drain every lane's queue and apply its
-    // events to *that* lane. The Turn machine operates on `self.thread`, so
-    // scope-swap it to the lane being processed (UI-thread only) and restore
-    // the visible lane afterward.
+    // Each lane runs its own turn: every callee below is lane-targeted
+    // (applyAgentEvent, lane.turn_view), so nothing here may scope-swap
+    // `app.thread` — the de-swap invariant. `active` is only the event
+    // source for the visibility gate and the velocity gauge.
     for (root.app.threads.slice()) |lane| {
         const worker = if (lane.worker_context) |*wc| wc else continue;
         std.debug.assert(lane.agent != null);
@@ -412,8 +415,6 @@ fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
         // then re-drain until the queue is empty or the byte budget is hit.
         // This lets a fast burst catch up in one tick rather than trickling
         // across frames.
-        root.app.thread = lane;
-        defer root.app.thread = active;
         var lane_bytes: usize = 0;
         while (true) {
             var batch: BoundedList(*agent_mod.Agent.Event, agent_worker.event_batch_max) = .{};

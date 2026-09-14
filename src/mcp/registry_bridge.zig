@@ -5,8 +5,9 @@
 //! schema resolution, display, and `tools_json` assembly all read the same
 //! registry path as builtins and plugin tools.
 //!
-//! The `Tool.userdata` carries an owned `McpToolKey` of NAMES, not a client
-//! pointer: connections drop and reconnect asynchronously, so the record
+//! The `Tool.userdata` carries an owned `McpToolKey` of NAMES plus a deep
+//! copy of the tool's schema — not a client pointer: connections drop and
+//! reconnect asynchronously, so the record
 //! must stay valid across churn. At run time the key is resolved back to the
 //! live client through `Env.ctx.mcp_manager`; a stale record (server
 //! disconnected) degrades to a failed result instead of a dangling call.
@@ -19,11 +20,16 @@ const tools_common = @import("../tools/common.zig");
 const McpManager = manager_mod.McpManager;
 
 /// Per-tool context owned by the registry; freed by `freeMcpToolKey` when
-/// the record is removed. Holds copies of the server and tool names so the
-/// record never borrows from a client that may disconnect.
+/// the record is removed. Holds copies of the server and tool names plus a
+/// DEEP COPY of the tool's parameter schema, so the record never borrows
+/// from a client that may disconnect: `McpTool.deinit` frees the client-side
+/// schema (disconnect/reconnect keep the client in the list), and a record
+/// borrowing it would dangle through every registry read and `tools_json`
+/// rebuild until the (turn-gated) next sync.
 pub const McpToolKey = struct {
     server_name: []u8,
     tool_name: []u8,
+    schema: tools_common.Schema,
 };
 
 /// Free callback for `Tool.userdata_free`.
@@ -31,6 +37,7 @@ pub fn freeMcpToolKey(gpa: std.mem.Allocator, ud: *anyopaque) void {
     const key: *McpToolKey = @ptrCast(@alignCast(ud));
     gpa.free(key.server_name);
     gpa.free(key.tool_name);
+    key.schema.deinit(gpa);
     gpa.destroy(key);
 }
 
@@ -60,9 +67,10 @@ pub fn runMcpTool(
         return tools_common.fail(gpa, "MCP server not found", 1);
     };
 
-    errdefer gpa.free(result_text);
-    // Empty output surfaces as a placeholder observation, matching the
-    // executor's MCP path.
+    // Single ownership: `stdout` owns the final text from here on — the
+    // empty case frees `result_text` inline before substituting the
+    // placeholder, so a second errdefer on `result_text` would double-free
+    // on the `stdout` allocation failure.
     const stdout = if (result_text.len > 0)
         result_text
     else blk2: {
@@ -91,8 +99,10 @@ pub fn displayMcpTool(
 
 /// Build one `Tool` record for a discovered MCP tool. The returned
 /// `Tool.userdata` is a heap-allocated `*McpToolKey`; ownership transfers to
-/// the registry (`userdata_free`). `name` and `description` are owned and
-/// freed by the registry when the record is removed.
+/// the registry (`userdata_free`). `name`, `description`, and the deep-copied
+/// `schema` are owned and freed when the record is removed. `schema` is
+/// cloned: the client may free its `McpTool.schema` on a mid-turn
+/// disconnect/reconnect while this record is still alive.
 pub fn buildMcpTool(
     gpa: std.mem.Allocator,
     server_name: []const u8,
@@ -106,18 +116,20 @@ pub fn buildMcpTool(
     errdefer gpa.free(desc_owned);
     const key = try gpa.create(McpToolKey);
     errdefer gpa.destroy(key);
-    key.* = .{
-        .server_name = try gpa.dupe(u8, server_name),
-        .tool_name = try gpa.dupe(u8, tool_name),
-    };
     errdefer {
         gpa.free(key.server_name);
         gpa.free(key.tool_name);
     }
+    key.* = .{
+        .server_name = try gpa.dupe(u8, server_name),
+        .tool_name = try gpa.dupe(u8, tool_name),
+        .schema = undefined,
+    };
+    key.schema = try schema.clone(gpa);
     return .{
         .name = full_name,
         .description = desc_owned,
-        .schema = schema,
+        .schema = key.schema,
         .run = runMcpTool,
         .display = displayMcpTool,
         .userdata = @ptrCast(key),
@@ -137,4 +149,40 @@ test "buildMcpTool produces a record that parses back through the naming SSOT" {
     const parsed = naming.parse(tool.name).?;
     try std.testing.expectEqualStrings("mock_server", parsed.server);
     try std.testing.expectEqualStrings("search", parsed.tool);
+}
+
+test "buildMcpTool deep-copies the schema so a client deinit cannot dangle it" {
+    const gpa = std.testing.allocator;
+    // Client-owned schema: allocated exactly like `McpTool` builds it, so
+    // `source.deinit` below reproduces the disconnect-time free (it owns the
+    // properties array too — do not free `props` separately).
+    const props = try gpa.alloc(tools_common.Schema.Property, 1);
+    const enum_values = try gpa.alloc([]const u8, 2);
+    enum_values[0] = try gpa.dupe(u8, "all");
+    enum_values[1] = try gpa.dupe(u8, "recent");
+    props[0] = .{
+        .name = try gpa.dupe(u8, "query"),
+        .kind = .string,
+        .description = try gpa.dupe(u8, "Search query"),
+        .required = true,
+        .enum_values = enum_values,
+        .default_value = try gpa.dupe(u8, "\"all\""),
+    };
+    var source: tools_common.Schema = .{ .properties = props };
+    defer source.deinit(gpa);
+
+    const tool = try buildMcpTool(gpa, "mock_server", "search", "Search the index", source);
+    defer {
+        gpa.free(tool.name);
+        gpa.free(tool.description);
+        freeMcpToolKey(gpa, tool.userdata);
+    }
+
+    // The client's schema going away (disconnect) must leave the record's
+    // copy fully readable — the strings differ in address, not content.
+    try std.testing.expect(tool.schema.properties.ptr != source.properties.ptr);
+    try std.testing.expectEqualStrings("query", tool.schema.properties[0].name);
+    try std.testing.expectEqualStrings("Search query", tool.schema.properties[0].description);
+    try std.testing.expectEqual(@as(usize, 2), tool.schema.properties[0].enum_values.?.len);
+    try std.testing.expectEqualStrings("recent", tool.schema.properties[0].enum_values.?[1]);
 }

@@ -1612,13 +1612,27 @@ fn injectAllTools(self: *App) void {
     // dispatch and schema resolution read the same registry path as builtins
     // and plugin tools. Refused while any lane turn is in flight (registry
     // mutation is a use-after-free hazard for a mid-dispatch worker); the
-    // connect-pending tick re-triggers on a later tick instead.
+    // pending flag pins a tick-driven retry so the deferred sync actually
+    // runs on the first quiet tick instead of being lost.
     if (!lane_state_mod.anyLaneTurnActive(self)) {
         self.tool_registry.syncMcpTools(self.gpa, &self.mcp_manager) catch |err| {
             log.warn("injectAllTools: syncMcpTools failed: {s}", .{@errorName(err)});
         };
+        self.mcp_sync_pending = false;
+    } else {
+        self.mcp_sync_pending = true;
     }
     injectToolsInto(self, runtime);
+}
+
+/// Run an MCP registry sync that was refused mid-turn. Called every tick; a
+/// no-op until the pending flag is set and no lane is mid-turn. Returns true
+/// when the deferred sync ran (caller may redraw).
+pub fn retryPendingMcpSync(self: *App) bool {
+    if (!self.mcp_sync_pending) return false;
+    if (lane_state_mod.anyLaneTurnActive(self)) return false;
+    injectMcpTools(self);
+    return true;
 }
 
 /// Push the merged tool list (registry builtin + plugin tools + connected
