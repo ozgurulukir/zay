@@ -746,6 +746,29 @@ test "openresponses routes parallel argument deltas by output index" {
     try std.testing.expectEqualStrings("bash", turn.assistant.assistant.content[1].tool_call.name);
 }
 
+test "openresponses drops function calls above the parallel-call cap" {
+    const gpa = std.testing.allocator;
+    var state: StreamState = .{ .limits = .{ .max_parallel_calls = 2, .model_label = "cap-test" } };
+    defer state.deinit(gpa);
+    defer state.deinitBlocks(gpa);
+
+    var call_seq: u64 = 0;
+    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"id\":\"item_a\",\"name\":\"bash\"}}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_b\",\"id\":\"item_b\",\"name\":\"bash\"}}", ai.streamNoop(), &call_seq);
+    // At the cap: this call is dropped (counted, warn-logged at finish) so
+    // the already-accepted calls still complete the turn — same policy as
+    // the chat-completions parser.
+    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_c\",\"id\":\"item_c\",\"name\":\"bash\"}}", ai.streamNoop(), &call_seq);
+    try std.testing.expectEqual(@as(u32, 1), state.dropped);
+    try state.processJson(gpa, "{\"type\":\"response.completed\"}", ai.streamNoop(), &call_seq);
+
+    var turn = try state.finish(gpa, &call_seq);
+    defer turn.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), turn.assistant.assistant.content.len);
+    try std.testing.expectEqualStrings("call_a", turn.assistant.assistant.content[0].tool_call.call_id.slice());
+    try std.testing.expectEqualStrings("call_b", turn.assistant.assistant.content[1].tool_call.call_id.slice());
+}
+
 test "processEvent ignores malformed JSON payloads gracefully" {
     const gpa = std.testing.allocator;
     var blocks: std.ArrayList(ai.ContentBlock) = .empty;

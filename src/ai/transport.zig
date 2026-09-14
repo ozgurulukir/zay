@@ -214,8 +214,13 @@ pub const Transport = struct {
         defer payload.deinit();
         var disable_cache = self.disable_cache_seed;
         try source.writePayload(source.context, &payload.writer, disable_cache);
-        const req_body_log = try http.logBytesToolsTail(self.gpa, payload.written());
-        defer if (req_body_log.ptr != payload.written().ptr) self.gpa.free(req_body_log);
+        // Snapshot the original buffer's base pointer BEFORE any C2 rebuild:
+        // `logBytesToolsTail` returns `written` verbatim for short bodies, and
+        // the C2 path swaps `payload` for a fresh buffer — comparing against
+        // the new buffer at exit would free the (already-freed) old one.
+        const written = payload.written();
+        const req_body_log = try http.logBytesToolsTail(self.gpa, written);
+        defer if (req_body_log.ptr != written.ptr) self.gpa.free(req_body_log);
         log.info("{s}.request POST {s} {s} body={s}", .{ self.log_tag, self.url, self.log_context, req_body_log });
         // L2: when this client carries no tools, say so next to the request
         // log — it tells the main agent apart from the summarizer/naming
@@ -237,30 +242,32 @@ pub const Transport = struct {
             while (attempt <= self.max_retries) : (attempt += 1) {
                 var retry_after_secs: ?u64 = null;
                 const turn = self.sendOnce(payload.written(), observer, stream_adapter, env, &retry_after_secs) catch |err| {
+                    // C2: before giving up on a 400, try the cache-stripped
+                    // variant once. Conservative: only when the error body
+                    // mentions "cache" AND we haven't downgraded yet AND the
+                    // user didn't already disable caching (no fields to
+                    // strip). Checked BEFORE the retry classifier and on every
+                    // attempt: `HttpClientError` is not retryable, so gating
+                    // this on the attempt budget would make the downgrade
+                    // unreachable for the primary case (400 on the first
+                    // attempt returns immediately).
+                    if (err == error.HttpClientError and !downgrade_done and !disable_cache and self.errorDetailMentionsCache()) {
+                        downgrade_done = true;
+                        disable_cache = true;
+                        payload.deinit();
+                        payload = .init(self.gpa);
+                        try source.writePayload(source.context, &payload.writer, disable_cache);
+                        log.warn("{s}.cache_downgrade retrying without cache fields after HTTP 400", .{self.log_tag});
+                        continue :outer; // full retry budget on the stripped payload
+                    }
                     // Only head-phase transient failures are retried; every
                     // other 4xx is permanent and stream-mid errors never
                     // surface as retryable statuses.
-                    if (attempt >= self.max_retries) {
-                        // C2: before giving up on a 400, try the
-                        // cache-stripped variant once. Conservative: only
-                        // when the error body mentions "cache" AND we
-                        // haven't downgraded yet AND the user didn't already
-                        // disable caching (no fields to strip).
-                        if (err == error.HttpClientError and !downgrade_done and !disable_cache and self.errorDetailMentionsCache()) {
-                            downgrade_done = true;
-                            disable_cache = true;
-                            payload.deinit();
-                            payload = .init(self.gpa);
-                            try source.writePayload(source.context, &payload.writer, disable_cache);
-                            log.warn("{s}.cache_downgrade retrying without cache fields after HTTP 400", .{self.log_tag});
-                            continue :outer; // full retry budget on the stripped payload
-                        }
-                        return err;
-                    }
                     switch (err) {
                         error.HttpServerError, error.HttpRateLimited, error.ConnectionFailed => {},
                         else => return err,
                     }
+                    if (attempt >= self.max_retries) return err;
                     const delay_ms = http.retryDelayMs(self.retry_base_delay_ms, attempt, retry_after_secs);
                     log.warn("{s}.retry attempt={d} err={s} delay_ms={d}", .{ self.log_tag, attempt + 1, @errorName(err), delay_ms });
                     self.sleepMs(delay_ms);
@@ -349,7 +356,11 @@ pub const Transport = struct {
                 else => |e| return e,
             };
             defer self.gpa.free(error_body);
-            log.warn("{s}.response.error status={d} body={s}", .{ self.log_tag, status_code, http.logBytesHead(error_body) });
+            // Tail-aware log truncation (same variant as the request body):
+            // keeps the byte-count annotation and any tail the body carries.
+            const error_body_log = try http.logBytesToolsTail(self.gpa, error_body);
+            defer if (error_body_log.ptr != error_body.ptr) self.gpa.free(error_body_log);
+            log.warn("{s}.response.error status={d} body={s}", .{ self.log_tag, status_code, error_body_log });
             self.recordErrorDetail(status_code, error_body);
             if (status_code == 429) return error.HttpRateLimited;
             if (status_code >= 500) return error.HttpServerError;

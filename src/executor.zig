@@ -5,18 +5,14 @@ const std = @import("std");
 const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
 const background = @import("background.zig");
-const background_tool = @import("tools/background.zig");
 const lane_bridge = @import("tools/lane_bridge.zig");
 const lane_tool = @import("tools/lane.zig");
 const lua_mod = @import("lua/root.zig");
 const mcp_client_mod = @import("mcp/client.zig");
 const mcp_mod = @import("mcp/manager.zig");
-const mcp_naming = @import("mcp/naming.zig");
 const os = @import("os.zig");
 const schema_mod = @import("tools/schema.zig");
-const shell_safety = @import("tools/bash_safety.zig");
 const skill_mod = @import("skill.zig");
-const skill_tool = @import("tools/skill.zig");
 const tools = @import("tools.zig");
 const tool_display = @import("tools/display.zig");
 const executor_safety = @import("tools/executor_safety.zig");
@@ -285,9 +281,8 @@ pub const ExecutorService = struct {
         const ptr = self.ctx.lane_requester orelse return;
         const agent: *agent_mod.Agent = @ptrCast(@alignCast(ptr));
         self.cwd = agent.effectiveCwd();
-        // Keep the context's plugin cwd in sync with the new root; the Lua
-        // bridge binding below is the derived per-batch window set by runAll.
-        self.ctx.plugin_cwd = self.cwd;
+        // The Lua bridge binding is the derived per-batch window set by
+        // runAll — refresh it along with the cwd.
         lua_mod.bridge.plugin_cwd_slot = self.cwd;
     }
 

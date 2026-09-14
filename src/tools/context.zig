@@ -33,10 +33,6 @@ pub const ToolContext = struct {
     /// Plugin tool dispatch (`registry_bridge.runPluginTool`). Null = plugin
     /// tools report that no live manager exists (never invoke a freed one).
     plugin_manager: ?*plugin_manager_mod.PluginManager = null,
-    /// Plugin cwd: the source of truth for the Lua bridge's derived
-    /// `plugin_cwd_slot` binding (same value as the executor `cwd` snapshot;
-    /// refreshed by `rerootFromRequester` on mid-batch lane ops).
-    plugin_cwd: ?[]const u8 = null,
     /// Shell-safety classifier URL for plugin `zay.run_bash` shells; also the
     /// source of the derived `bash_classifier_url_slot` binding. Null keeps
     /// the always-armed local matcher.
@@ -61,6 +57,5 @@ test "headless context degrades every dependency" {
     try std.testing.expectEqual(@as(usize, 0), ctx.skills.len);
     try std.testing.expect(ctx.plugin_manager == null);
     try std.testing.expect(ctx.mcp_manager == null);
-    try std.testing.expect(ctx.plugin_cwd == null);
     try std.testing.expect(ctx.bash_classifier_url == null);
 }

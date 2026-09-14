@@ -14,9 +14,7 @@ const tool_schema = @import("tool_schema.zig");
 const tools_common = @import("../tools/common.zig");
 const tools_mod = @import("../tools.zig");
 
-const redirect_buffer_bytes = http.redirect_buffer_bytes;
 const transfer_buffer_bytes = http.transfer_buffer_bytes;
-const body_buffer_bytes = http.body_buffer_bytes;
 /// Upper bound on an error body we will decompress + log (matches the models
 /// client's cap). Prevents a hostile/garbage body from allocating unboundedly.
 const response_bytes_max: u32 = 1 * 1024 * 1024;

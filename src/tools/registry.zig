@@ -146,7 +146,14 @@ pub const ToolRegistry = struct {
                     log.warn("syncMcpTools: buildMcpTool '{s}' failed: {s}", .{ tool.full_name, @errorName(err) });
                     continue;
                 };
-                try self.addPluginTool(gpa, record);
+                self.addPluginTool(gpa, record) catch |err| {
+                    // The record was fully built — free it before propagating
+                    // or its name/description/key leak on the error path.
+                    gpa.free(record.name);
+                    gpa.free(record.description);
+                    if (record.userdata_free) |free_fn| free_fn(gpa, record.userdata);
+                    return err;
+                };
             }
         }
     }

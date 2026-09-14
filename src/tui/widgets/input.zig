@@ -40,7 +40,8 @@ pub const HintInputs = struct {
 };
 
 /// The mode-dependent hint line under the input box. Pure: a function of
-/// `HintInputs` only, so tests pin every mode's text without an App.
+/// `HintInputs` only, so the `hintText pins every mode's text` test in this
+/// file pins every mode without an App.
 pub fn hintText(hint: HintInputs) []const u8 {
     if (hint.pending_quit) return "Press Ctrl+C or Ctrl+D again to exit";
     return switch (hint.mode) {
@@ -71,6 +72,32 @@ pub fn hintText(hint: HintInputs) []const u8 {
         .search => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Jump to message" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
         .normal => "Type prompt, @file, $skill or / for menu" ++ symbols.separator_dot_padded ++ "Ctrl+O Background" ++ symbols.separator_dot_padded ++ "Shift+Tab Lanes" ++ symbols.separator_dot_padded ++ "Ctrl+F Search",
     };
+}
+
+test "hintText pins every mode's text" {
+    const dot = symbols.separator_dot_padded;
+    // The pending-quit prompt wins over every mode.
+    try std.testing.expectEqualStrings("Press Ctrl+C or Ctrl+D again to exit", hintText(.{ .pending_quit = true, .mode = .normal }));
+    try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ENTER] Execute" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .command }));
+    try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ENTER] Resume" ++ dot ++ "[D] Delete" ++ dot ++ "[R] Rename" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .session_picker, .session_action = .browsing }));
+    try std.testing.expectEqualStrings("[ENTER] Save" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .session_picker, .session_action = .renaming }));
+    try std.testing.expectEqualStrings("[Y] Delete" ++ dot ++ "[N/ESC] Cancel", hintText(.{ .mode = .session_picker, .session_action = .deleting }));
+    try std.testing.expectEqualStrings("[Any key] Dismiss", hintText(.{ .mode = .session_picker, .session_action = .blocked }));
+    try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ENTER] Select" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .provider_picker, .provider_stage = .list }));
+    try std.testing.expectEqualStrings("[ENTER] Save API Key" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .provider_picker, .provider_stage = .form }));
+    try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "←/→ Effort" ++ dot ++ "[ENTER] Select" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .model_picker }));
+    try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ENTER] Select" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .theme_picker }));
+    try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ENTER] Jump to branch" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .tree_picker }));
+    try std.testing.expectEqualStrings("[ENTER] Save" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .save_message }));
+    try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[M] Merge into current" ++ dot ++ "[X] Delete" ++ dot ++ "[ESC] Back", hintText(.{ .mode = .lanes, .lanes_purpose = .manage }));
+    try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ENTER] Merge into" ++ dot ++ "[ESC] Back", hintText(.{ .mode = .lanes, .lanes_purpose = .merge_dest }));
+    try std.testing.expectEqualStrings("", hintText(.{ .mode = .diff_viewer }));
+    try std.testing.expectEqualStrings("[ESC] / [ENTER] Close Help", hintText(.{ .mode = .help }));
+    try std.testing.expectEqualStrings("Tab Section" ++ dot ++ "↑↓ Navigate" ++ dot ++ "[ENTER] Toggle/Edit" ++ dot ++ "Ctrl+S Save" ++ dot ++ "[ESC] Close", hintText(.{ .mode = .settings }));
+    try std.testing.expectEqualStrings("[Space] Toggle" ++ dot ++ "Ctrl+R Reconnect" ++ dot ++ "[ESC] Close", hintText(.{ .mode = .mcp }));
+    try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ESC] Close", hintText(.{ .mode = .plugins }));
+    try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ENTER] Jump to message" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .search }));
+    try std.testing.expectEqualStrings("Type prompt, @file, $skill or / for menu" ++ dot ++ "Ctrl+O Background" ++ dot ++ "Shift+Tab Lanes" ++ dot ++ "Ctrl+F Search", hintText(.{ .mode = .normal }));
 }
 
 pub fn writeDiffCounts(surface: *vxfw.Surface, ctx: vxfw.DrawContext, counts: DiffCounts) void {
