@@ -44,6 +44,13 @@ fn pluginDirBestEffort(L: *c.lua_State) []const u8 {
 /// Sanitize a path: resolve `..` and `.` segments, reject traversal.
 pub fn sanitizePath(io: std.Io, path: []const u8) ![]u8 {
     if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidPath;
+    // Reject C0 control bytes: NT returns OBJECT_NAME_INVALID for them and
+    // std's Io layer panics on that status in Debug, so a plugin-supplied
+    // path with an embedded control character (e.g. a `\t` that survived a
+    // Lua string literal) must be rejected here instead of crashing the host.
+    for (path) |byte| {
+        if (byte < 0x20) return error.InvalidPath;
+    }
 
     var resolved_cwd = bridge.resolvePluginCwd(io) orelse return error.OutOfMemory;
     defer resolved_cwd.deinit();
@@ -299,4 +306,13 @@ pub fn getProjectRoot(L: ?*c.lua_State) callconv(.c) c_int {
 
     state.pushString(root);
     return 1;
+}
+
+test "sanitizePath rejects control characters before any resolution" {
+    const io = std.testing.io;
+    try std.testing.expectError(error.InvalidPath, sanitizePath(io, "dir\tfile"));
+    try std.testing.expectError(error.InvalidPath, sanitizePath(io, "dir\nfile"));
+    try std.testing.expectError(error.InvalidPath, sanitizePath(io, "\x07bell"));
+    // A NUL byte keeps its dedicated check and must not reach the loop below.
+    try std.testing.expectError(error.InvalidPath, sanitizePath(io, "dir\x00file"));
 }

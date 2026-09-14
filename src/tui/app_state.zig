@@ -398,3 +398,29 @@ pub const MetricsState = struct {
         };
     }
 };
+
+/// Hit-test rectangle for the lanes chip in the input area, written by the
+/// frame build and consumed by the mouse router. Lives here so leaf widgets
+/// can name it without importing the App.
+pub const ChipRect = struct {
+    row: u16,
+    col: u16,
+    width: u16,
+
+    pub fn contains(self: ChipRect, row: i16, col: i16) bool {
+        if (row < 0 or col < 0) return false;
+        const r: u16 = @intCast(row);
+        const c: u16 = @intCast(col);
+        return r == self.row and c >= self.col and c < self.col + self.width;
+    }
+};
+
+/// UI interaction mode. Lives beside NavState so leaf widgets can switch on
+/// it without referencing the App.
+pub const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message, lanes, help, settings, mcp, plugins, search, theme_picker };
+
+/// Per-line diff +/- counts shown at the input's right edge.
+pub const DiffCounts = struct {
+    additions: u32 = 0,
+    deletions: u32 = 0,
+};

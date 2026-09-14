@@ -12,6 +12,7 @@ const BoundedList = @import("bounded_list.zig").BoundedList;
 const agent_worker = @import("agent_worker.zig");
 const lane_bridge = tui.lane_bridge_mod;
 const lanes_util = @import("lanes.zig");
+const turn_lifecycle = @import("turn_lifecycle.zig");
 const lanes_picker = @import("widgets/lanes_picker.zig");
 const lifecycle = @import("lifecycle.zig");
 const mode_lifecycle = @import("mode_lifecycle.zig");
@@ -536,10 +537,7 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
     // error), so cleanup is explicit at each site — an `errdefer` would never
     // fire here. `context` is freed by the caller on each pre-adoption failure.
     const spawner = requester_lane orelse return failResp(app.gpa, "lane: no spawner lane\n", .{});
-    const prev_thread = app.thread;
-    app.thread = spawner;
-    const context = app.captureLaneContext(tui.lane_naming_context_max) catch @as([][]u8, &.{});
-    app.thread = prev_thread;
+    const context = captureLaneContext(app, spawner, tui.lane_naming_context_max) catch @as([][]u8, &.{});
 
     // H1: if req.lane targets an existing idle lane, reuse its worktree+
     // branch and wake it as a worker (TD-3/TD-4). Null or unresolvable
@@ -871,21 +869,17 @@ fn startTurnForLane(app: *App, lane: *Thread, prompt: []const u8, title_source: 
     errdefer lane.worker_context.?.gpa.free(owned);
     lane.transcript.dropIntroLogo(app.gpa);
     _ = try lane.transcript.append(app.gpa, .user, "you", prompt);
-    // Title + naming helpers read `app.thread`; scope-swap for the call.
-    const prev = app.thread;
-    app.thread = lane;
-    defer app.thread = prev;
-    app.setLaneTitleIfUnset(title_source) catch {};
+    // Title + naming helpers take the lane explicitly — no scope-swap.
+    turn_lifecycle.setLaneTitleIfUnset(app, lane, title_source) catch {};
     if (lanes_util.workingLaneOf(lane) != null) {
         app.scheduleLaneNaming(lane, title_source) catch {};
     }
-    // `app.thread` is scope-swapped to `lane` above, so `resetTurnState`
-    // operates on the lane: it picks the spinner word, frees any prior
+    // Operates on the lane: it picks the spinner word, frees any prior
     // `turn_failed`, anchors the activity clock, and zeroes the tool-call
     // tally + stall latch — exactly the bookkeeping the spawn path used to
     // hand-roll. `awaitModel` follows, as in `beginSubmit`.
-    app.resetTurnState();
-    app.thread.turn_view.awaitModel();
+    turn_lifecycle.resetTurnState(app, lane);
+    lane.turn_view.awaitModel();
     lane.turn.submit();
     lane.turn_future = try app.getIo().concurrent(agent_worker.runAgentTurn, .{
         lane.agent.?,
@@ -1152,8 +1146,8 @@ fn parkFinishedWorker(app: *App, lane: *Thread) void {
 /// a gone spawner (M7) drops the model turn; a busy spawner waits.
 pub fn deliverPendingLaneCompletions(app: *App) !bool {
     var changed = false;
+    // The focused lane — visibility comparisons only; never reassigned.
     const active = app.thread;
-    defer app.thread = active;
 
     // 1. Rest finished spawned workers.
     for (app.threads.slice()) |lane| {
@@ -1228,8 +1222,7 @@ pub fn deliverPendingLaneCompletions(app: *App) !bool {
         _ = spawner.transcript.append(app.gpa, .notice, "lane", message) catch {};
         if (spawner == active) changed = true;
         lane.completion_delivered = true;
-        app.thread = spawner;
-        app.startDeliveryTurnOnCurrentThread() catch {};
+        app.startDeliveryTurn(spawner) catch {};
         return true;
     }
     return changed;

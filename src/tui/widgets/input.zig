@@ -11,23 +11,94 @@
 //! - `InputWidget` — instantiated by `drawRoot`.
 //! - `VerticalMove`, `wrappedPosition`, `visualRowStart`, `byteAtVisualColumn`,
 //!   `wrappedTextRows`, `WrappedTextPosition` — used by
-//!   `App.moveInputCursorVertical` and `App.inputTextRows`.
+//!   `App.moveInputCursorVertical`.
 //! - `writeDiffCounts`, `inputHintText` — used by inline tests in `tui.zig`.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
-const tui = @import("../../tui.zig");
 const tui_style = @import("../style.zig");
-const tui_status = @import("../status.zig");
 const telemetry = @import("../telemetry.zig");
 const status_bar = @import("status_bar.zig");
 const symbols = @import("../../symbols.zig");
+const app_state = @import("../app_state.zig");
+const thread_mod = @import("../thread.zig");
+const provider_picker = @import("provider_picker.zig");
 
-const App = tui.App;
-const DiffCounts = tui.DiffCounts;
+const DiffCounts = app_state.DiffCounts;
 const StatusBarWidget = status_bar.StatusBarWidget;
+
+/// Everything the hint line selects on, gathered by the frame build. Pure —
+/// the returned text depends only on these fields.
+pub const HintInputs = struct {
+    pending_quit: bool = false,
+    mode: app_state.Mode,
+    session_action: app_state.NavState.SessionAction = .browsing,
+    provider_stage: provider_picker.Stage = .list,
+    lanes_purpose: app_state.NavState.LanesPurpose = .manage,
+};
+
+/// The mode-dependent hint line under the input box. Pure: a function of
+/// `HintInputs` only, so the `hintText pins every mode's text` test in this
+/// file pins every mode without an App.
+pub fn hintText(hint: HintInputs) []const u8 {
+    if (hint.pending_quit) return "Press Ctrl+C or Ctrl+D again to exit";
+    return switch (hint.mode) {
+        .command => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Execute" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
+        .session_picker => switch (hint.session_action) {
+            .browsing => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Resume" ++ symbols.separator_dot_padded ++ "[D] Delete" ++ symbols.separator_dot_padded ++ "[R] Rename" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
+            .renaming => "[ENTER] Save" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
+            .deleting => "[Y] Delete" ++ symbols.separator_dot_padded ++ "[N/ESC] Cancel",
+            .blocked => "[Any key] Dismiss",
+        },
+        .provider_picker => switch (hint.provider_stage) {
+            .list => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
+            .form => "[ENTER] Save API Key" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
+        },
+        .model_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←/→ Effort" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
+        .theme_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
+        .tree_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Jump to branch" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
+        .save_message => "[ENTER] Save" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
+        .lanes => switch (hint.lanes_purpose) {
+            .manage => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[M] Merge into current" ++ symbols.separator_dot_padded ++ "[X] Delete" ++ symbols.separator_dot_padded ++ "[ESC] Back",
+            .merge_dest => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Merge into" ++ symbols.separator_dot_padded ++ "[ESC] Back",
+        },
+        .diff_viewer => "",
+        .help => "[ESC] / [ENTER] Close Help",
+        .settings => "Tab Section" ++ symbols.separator_dot_padded ++ "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Toggle/Edit" ++ symbols.separator_dot_padded ++ "Ctrl+S Save" ++ symbols.separator_dot_padded ++ "[ESC] Close",
+        .mcp => "[Space] Toggle" ++ symbols.separator_dot_padded ++ "Ctrl+R Reconnect" ++ symbols.separator_dot_padded ++ "[ESC] Close",
+        .plugins => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ESC] Close",
+        .search => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Jump to message" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
+        .normal => "Type prompt, @file, $skill or / for menu" ++ symbols.separator_dot_padded ++ "Ctrl+O Background" ++ symbols.separator_dot_padded ++ "Shift+Tab Lanes" ++ symbols.separator_dot_padded ++ "Ctrl+F Search",
+    };
+}
+
+test "hintText pins every mode's text" {
+    const dot = symbols.separator_dot_padded;
+    // The pending-quit prompt wins over every mode.
+    try std.testing.expectEqualStrings("Press Ctrl+C or Ctrl+D again to exit", hintText(.{ .pending_quit = true, .mode = .normal }));
+    try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ENTER] Execute" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .command }));
+    try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ENTER] Resume" ++ dot ++ "[D] Delete" ++ dot ++ "[R] Rename" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .session_picker, .session_action = .browsing }));
+    try std.testing.expectEqualStrings("[ENTER] Save" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .session_picker, .session_action = .renaming }));
+    try std.testing.expectEqualStrings("[Y] Delete" ++ dot ++ "[N/ESC] Cancel", hintText(.{ .mode = .session_picker, .session_action = .deleting }));
+    try std.testing.expectEqualStrings("[Any key] Dismiss", hintText(.{ .mode = .session_picker, .session_action = .blocked }));
+    try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ENTER] Select" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .provider_picker, .provider_stage = .list }));
+    try std.testing.expectEqualStrings("[ENTER] Save API Key" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .provider_picker, .provider_stage = .form }));
+    try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "←/→ Effort" ++ dot ++ "[ENTER] Select" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .model_picker }));
+    try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ENTER] Select" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .theme_picker }));
+    try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ENTER] Jump to branch" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .tree_picker }));
+    try std.testing.expectEqualStrings("[ENTER] Save" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .save_message }));
+    try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[M] Merge into current" ++ dot ++ "[X] Delete" ++ dot ++ "[ESC] Back", hintText(.{ .mode = .lanes, .lanes_purpose = .manage }));
+    try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ENTER] Merge into" ++ dot ++ "[ESC] Back", hintText(.{ .mode = .lanes, .lanes_purpose = .merge_dest }));
+    try std.testing.expectEqualStrings("", hintText(.{ .mode = .diff_viewer }));
+    try std.testing.expectEqualStrings("[ESC] / [ENTER] Close Help", hintText(.{ .mode = .help }));
+    try std.testing.expectEqualStrings("Tab Section" ++ dot ++ "↑↓ Navigate" ++ dot ++ "[ENTER] Toggle/Edit" ++ dot ++ "Ctrl+S Save" ++ dot ++ "[ESC] Close", hintText(.{ .mode = .settings }));
+    try std.testing.expectEqualStrings("[Space] Toggle" ++ dot ++ "Ctrl+R Reconnect" ++ dot ++ "[ESC] Close", hintText(.{ .mode = .mcp }));
+    try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ESC] Close", hintText(.{ .mode = .plugins }));
+    try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ENTER] Jump to message" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .search }));
+    try std.testing.expectEqualStrings("Type prompt, @file, $skill or / for menu" ++ dot ++ "Ctrl+O Background" ++ dot ++ "Shift+Tab Lanes" ++ dot ++ "Ctrl+F Search", hintText(.{ .mode = .normal }));
+}
 
 pub fn writeDiffCounts(surface: *vxfw.Surface, ctx: vxfw.DrawContext, counts: DiffCounts) void {
     const p = tui_style.activePalette();
@@ -54,40 +125,50 @@ fn writeAscii(surface: *vxfw.Surface, text: []const u8, style: vaxis.Style, col_
     }
 }
 
-fn inputHintText(app: *const App) []const u8 {
-    if (app.getPendingQuitAt() != null) return "Press Ctrl+C or Ctrl+D again to exit";
-    return switch (app.mode) {
-        .command => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Execute" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
-        .session_picker => switch (app.nav.session_action) {
-            .browsing => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Resume" ++ symbols.separator_dot_padded ++ "[D] Delete" ++ symbols.separator_dot_padded ++ "[R] Rename" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
-            .renaming => "[ENTER] Save" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
-            .deleting => "[Y] Delete" ++ symbols.separator_dot_padded ++ "[N/ESC] Cancel",
-            .blocked => "[Any key] Dismiss",
-        },
-        .provider_picker => switch (app.pickers.provider.stage) {
-            .list => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
-            .form => "[ENTER] Save API Key" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
-        },
-        .model_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←/→ Effort" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
-        .theme_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
-        .tree_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Jump to branch" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
-        .save_message => "[ENTER] Save" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
-        .lanes => switch (app.nav.lanes_purpose) {
-            .manage => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[M] Merge into current" ++ symbols.separator_dot_padded ++ "[X] Delete" ++ symbols.separator_dot_padded ++ "[ESC] Back",
-            .merge_dest => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Merge into" ++ symbols.separator_dot_padded ++ "[ESC] Back",
-        },
-        .diff_viewer => "",
-        .help => "[ESC] / [ENTER] Close Help",
-        .settings => "Tab Section" ++ symbols.separator_dot_padded ++ "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Toggle/Edit" ++ symbols.separator_dot_padded ++ "Ctrl+S Save" ++ symbols.separator_dot_padded ++ "[ESC] Close",
-        .mcp => "[Space] Toggle" ++ symbols.separator_dot_padded ++ "Ctrl+R Reconnect" ++ symbols.separator_dot_padded ++ "[ESC] Close",
-        .plugins => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ESC] Close",
-        .search => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Jump to message" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
-        .normal => "Type prompt, @file, $skill or / for menu" ++ symbols.separator_dot_padded ++ "Ctrl+O Background" ++ symbols.separator_dot_padded ++ "Shift+Tab Lanes" ++ symbols.separator_dot_padded ++ "Ctrl+F Search",
-    };
-}
+/// Per-frame view model for `InputWidget` (INV-WIDGET-1): render-ready facts
+/// computed by the frame build (`root_layout.buildInputProps`), so the widget
+/// is a pure function of its props and never references the App. Strings are
+/// arena-owned by the frame; the two pointer fields are write-backs whose
+/// targets (App fields) outlive the draw.
+pub const InputProps = struct {
+    /// The live text field — drawn directly in single-line mode.
+    input_field: *vxfw.TextField,
+    /// Combined buffer halves (arena-owned), plus the cursor's byte offset.
+    input_text: []const u8,
+    input_cursor: usize,
+    /// Write-back: the wrapped width the multi-line renderer used, consumed
+    /// by vertical cursor navigation (`App.moveInputCursorVertical`).
+    input_wrap_width: *u16,
+    /// Row where the input area starts (the lanes chip adds its base row).
+    input_surface_row: u16 = 0,
+    /// Write-back: hit-test geometry for the lanes chip, read by the mouse
+    /// router. Null = no write-back (tests).
+    chip_rect_out: ?*?app_state.ChipRect = null,
+    /// Queued (steer) messages and the selected index.
+    queued: []const thread_mod.Thread.QueuedMessage = &.{},
+    queued_selection: usize = 0,
+    /// Prompt glyph: `>` in normal mode, blank otherwise.
+    prompt_text: []const u8 = ">",
+    hint_text: []const u8 = "",
+    /// Arms the red "press again to exit" hint styling.
+    pending_quit: bool = false,
+    /// Non-null renders the +/- diff-count overlay.
+    diff_counts: ?DiffCounts = null,
+    /// Running background-job count (drives the blue badge).
+    background_jobs: usize = 0,
+    /// Pink lanes chip: fullscreen (`.tab`) with other lanes open.
+    show_lanes_chip: bool = false,
+    lanes_count: usize = 0,
+    // Render-ready status-line strings (precomputed by the frame build).
+    status_text: []const u8 = "no model",
+    meter_text: []const u8 = "",
+    meter_style: vaxis.Style = .{},
+    velocity_text: []const u8 = "",
+    git_label: []const u8 = "",
+};
 
 pub const CommandInputText = struct {
-    app: *App,
+    props: *const InputProps,
 
     fn widget(self: *CommandInputText) vxfw.Widget {
         return .{
@@ -99,26 +180,22 @@ pub const CommandInputText = struct {
     fn drawInputText(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *CommandInputText = @ptrCast(@alignCast(ptr));
         const width = ctx.max.width orelse 0;
-        self.app.input_wrap_width = width;
-        const rows = try self.app.inputTextRows(ctx, width);
-        if (rows <= 1) return self.app.inputs.input.draw(ctx);
+        // Write-back: vertical cursor navigation reads this via the App, same
+        // frame timing as before the props conversion.
+        self.props.input_wrap_width.* = width;
+        const rows = wrappedTextRows(ctx, self.props.input_text, width);
+        if (rows <= 1) return self.props.input_field.draw(ctx);
         return self.drawMultiline(ctx);
     }
 
     fn drawMultiline(self: *CommandInputText, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const width = ctx.max.width orelse 0;
         const height: u16 = @max(ctx.max.height orelse 1, 1);
-        var surface = try vxfw.Surface.init(ctx.arena, self.app.inputs.input.widget(), .{ .width = width, .height = height });
+        var surface = try vxfw.Surface.init(ctx.arena, self.props.input_field.widget(), .{ .width = width, .height = height });
         if (width == 0) return surface;
 
-        const first = self.app.inputs.input.buf.firstHalf();
-        const second = self.app.inputs.input.buf.secondHalf();
-
-        const combined = try ctx.arena.alloc(u8, first.len + second.len);
-        @memcpy(combined[0..first.len], first);
-        @memcpy(combined[first.len..], second);
-
-        const cursor_pos = wrappedTextPositionAt(ctx, combined, first.len, width);
+        const combined = self.props.input_text;
+        const cursor_pos = wrappedTextPositionAt(ctx, combined, self.props.input_cursor, width);
         const total_lines = wrappedTextRows(ctx, combined, width);
         const first_visible = firstVisibleLine(cursor_pos.row, total_lines, height);
 
@@ -383,7 +460,7 @@ fn wrapSpace(byte: u8) bool {
 }
 
 pub const InputWidget = struct {
-    app: *App,
+    props: InputProps,
 
     pub fn widget(self: *InputWidget) vxfw.Widget {
         return .{
@@ -397,11 +474,11 @@ pub const InputWidget = struct {
         const max_width = ctx.max.width orelse 0;
         const height: u16 = ctx.max.height orelse 4;
 
-        const queued_visible = self.app.thread.queued.items.len > 0;
+        const queued_visible = self.props.queued.len > 0;
         const input_row: u16 = if (queued_visible) 1 else 0;
         const avail: u16 = height -| input_row;
         const input_width = max_width -| 4;
-        const text_rows: u16 = @min(try self.app.inputTextRows(ctx, input_width), @max(@as(u16, 1), avail -| 2));
+        const text_rows: u16 = @min(wrappedTextRows(ctx, self.props.input_text, input_width), @max(@as(u16, 1), avail -| 2));
         const border_height: u16 = text_rows + 2;
 
         if (height < input_row + border_height) {
@@ -410,11 +487,11 @@ pub const InputWidget = struct {
 
         const base_row: u16 = input_row + border_height;
         const show_hint = height >= base_row + 1;
-        const show_diff = show_hint and self.app.diffCountsVisible();
-        const show_badge = show_hint and self.app.runningBackgroundCount() > 0;
+        const show_diff = show_hint and self.props.diff_counts != null;
+        const show_badge = show_hint and self.props.background_jobs > 0;
         // The pink lanes chip only makes sense while fullscreened (`.tab`,
         // not split) with other lanes hidden behind the active one.
-        const show_lanes = show_hint and self.app.split_mode == .tab and self.app.threads.len() > 1;
+        const show_lanes = show_hint and self.props.show_lanes_chip;
         const children_count: usize = 1 +
             @as(usize, if (show_hint) 1 else 0) +
             @as(usize, if (show_diff) 1 else 0) +
@@ -459,11 +536,13 @@ pub const InputWidget = struct {
                 .z_index = 2,
             };
             child_index += 1;
-            self.app.nav.lanes_chip_rect = .{
-                .row = self.app.input_surface_row + base_row,
-                .col = 1,
-                .width = lanes_width,
-            };
+            if (self.props.chip_rect_out) |out| {
+                out.* = .{
+                    .row = self.props.input_surface_row + base_row,
+                    .col = 1,
+                    .width = lanes_width,
+                };
+            }
         }
         if (show_badge) {
             const badge_col: u16 = if (show_lanes) 1 + lanes_width + 1 else 1;
@@ -484,10 +563,9 @@ pub const InputWidget = struct {
 
     fn drawInputBorder(self: *InputWidget, ctx: vxfw.DrawContext, max_width: u16, border_height: u16, text_rows: u16) std.mem.Allocator.Error!vxfw.Surface {
         const p = tui_style.activePalette();
-        const prompt_text: []const u8 = if (self.app.mode == .normal) ">" else " ";
-        var prompt: vxfw.Text = .{ .text = prompt_text, .style = p.user, .softwrap = false, .width_basis = .parent };
+        var prompt: vxfw.Text = .{ .text = self.props.prompt_text, .style = p.user, .softwrap = false, .width_basis = .parent };
         var prompt_box: vxfw.SizedBox = .{ .child = prompt.widget(), .size = .{ .width = 2, .height = 1 } };
-        var command_input: CommandInputText = .{ .app = self.app };
+        var command_input: CommandInputText = .{ .props = &self.props };
         var input_box: vxfw.SizedBox = .{ .child = command_input.widget(), .size = .{ .width = max_width -| 2, .height = text_rows } };
         var row: vxfw.FlexRow = .{
             .children = &.{
@@ -503,68 +581,17 @@ pub const InputWidget = struct {
         var box: vxfw.SizedBox = .{ .child = border.widget(), .size = .{ .width = max_width, .height = border_height } };
         const border_surface = try box.widget().draw(ctx.withConstraints(.{ .width = max_width, .height = border_height }, .{ .width = max_width, .height = border_height }));
 
-        const status_text = if (tui_status.modelStatus(self.app.liveRuntime(), self.app.cached_config)) |status|
-            tui_status.formatModelStatus(ctx.arena, status) catch "no model"
-        else
-            "no model";
-
-        const live_context_max: u32 = if (self.app.liveRuntime()) |rt|
-            rt.agent.context_window_tokens
-        else if (self.app.metrics.context_tokens_max > 0)
-            self.app.metrics.context_tokens_max
-        else
-            128000;
-
-        const live_context_used: u32 = if (self.app.liveRuntime()) |rt|
-            rt.agent.currentContextTokens()
-        else if (self.app.metrics.context_tokens_used > 0)
-            self.app.metrics.context_tokens_used
-        else
-            0;
-
-        const tui_cfg = self.app.cached_config.tui;
-        var meter_buf: [64]u8 = undefined;
-        var meter_text: []const u8 = "";
-        var meter_style = p.model_status;
-        if (tui_cfg.show_context_meter) {
-            const meter = telemetry.TelemetryTracker.formatContextBar(
-                @intCast(live_context_used),
-                @intCast(live_context_max),
-                tui_cfg.context_threshold_warn,
-                tui_cfg.context_threshold_alert,
-                &meter_buf,
-            );
-            meter_text = ctx.arena.dupe(u8, meter.text) catch "";
-            meter_style = switch (meter.level) {
-                .normal => p.success,
-                .warn => p.notice,
-                .alert => p.error_style,
-            };
-        }
-        var velocity_buf: [32]u8 = undefined;
-        var velocity_text: []const u8 = "";
-        if (tui_cfg.show_token_velocity) {
-            const is_streaming = switch (self.app.thread.turn_view.activity) {
-                .writing_response, .thinking => true,
-                else => false,
-            };
-            const vel = telemetry.TelemetryTracker.formatVelocity(self.app.metrics.telemetry.current_tokens_per_sec, is_streaming, &velocity_buf);
-            if (vel.len > 0) {
-                velocity_text = ctx.arena.dupe(u8, vel) catch "";
-            }
-        }
-
         var status_bar_w: StatusBarWidget = .{
-            .status_text = status_text,
-            .meter_text = meter_text,
-            .meter_style = meter_style,
-            .velocity_text = velocity_text,
+            .status_text = self.props.status_text,
+            .meter_text = self.props.meter_text,
+            .meter_style = self.props.meter_style,
+            .velocity_text = self.props.velocity_text,
         };
         var status_box: vxfw.SizedBox = .{ .child = status_bar_w.widget(), .size = .{ .width = max_width, .height = 1 } };
         const status_surface = try status_box.widget().draw(ctx.withConstraints(.{ .width = max_width, .height = 1 }, .{ .width = max_width, .height = 1 }));
 
         const bottom = border_height -| 1;
-        const git_label = self.app.metrics.git_label;
+        const git_label = self.props.git_label;
         var git_surface: ?vxfw.Surface = null;
         var git_origin_col: u16 = 0;
         if (git_label.len > 0) {
@@ -612,8 +639,8 @@ pub const InputWidget = struct {
 
     fn drawQueuedMessage(self: *InputWidget, ctx: vxfw.DrawContext, width: u16) std.mem.Allocator.Error!vxfw.Surface {
         const p = tui_style.activePalette();
-        const items = self.app.thread.queued.items;
-        const sel = @min(self.app.nav.queued_selection, items.len - 1);
+        const items = self.props.queued;
+        const sel = @min(self.props.queued_selection, items.len - 1);
         const message = items[sel];
         // Position suffix only when there's more than one to navigate.
         const position = if (items.len > 1)
@@ -630,9 +657,9 @@ pub const InputWidget = struct {
 
     fn drawInputHint(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, child_index: usize, row: u16, col: u16, width: u16) std.mem.Allocator.Error!void {
         const p = tui_style.activePalette();
-        const is_pending_quit = self.app.getPendingQuitAt() != null;
+        const is_pending_quit = self.props.pending_quit;
         const style = if (is_pending_quit) p.warning else p.thinking_body;
-        var hint_text: vxfw.Text = .{ .text = inputHintText(self.app), .style = style, .text_align = .center, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
+        var hint_text: vxfw.Text = .{ .text = self.props.hint_text, .style = style, .text_align = .center, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
         children[child_index] = .{
             .origin = .{ .row = row, .col = col },
             .surface = try hint_text.widget().draw(ctx.withConstraints(.{ .width = width, .height = 1 }, .{ .width = width, .height = 1 })),
@@ -646,7 +673,7 @@ pub const InputWidget = struct {
     /// view.
     fn drawLanesBadge(self: *InputWidget, ctx: vxfw.DrawContext, max_width: u16) std.mem.Allocator.Error!vxfw.Surface {
         const p = tui_style.activePalette();
-        const text = try std.fmt.allocPrint(ctx.arena, " {d} Lanes ", .{self.app.threads.len()});
+        const text = try std.fmt.allocPrint(ctx.arena, " {d} Lanes ", .{self.props.lanes_count});
         var pill_text: vxfw.Text = .{
             .text = text,
             .style = p.lanes_badge,
@@ -661,7 +688,7 @@ pub const InputWidget = struct {
     /// black-on-blue so it reads as a control affordance.
     fn drawBackgroundBadge(self: *InputWidget, ctx: vxfw.DrawContext, max_width: u16) std.mem.Allocator.Error!vxfw.Surface {
         const p = tui_style.activePalette();
-        const count = self.app.runningBackgroundCount();
+        const count = self.props.background_jobs;
         const text = try std.fmt.allocPrint(ctx.arena, " {d} background job{s} · Ctrl+O ", .{ count, if (count == 1) "" else "s" });
         var pill_text: vxfw.Text = .{
             .text = text,
@@ -677,7 +704,7 @@ pub const InputWidget = struct {
         const diff_width: u16 = 13;
         const surface_width = @min(diff_width, width);
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = surface_width, .height = 1 });
-        if (surface_width > 0) writeDiffCounts(&surface, ctx, self.app.metrics.diff_counts);
+        if (surface_width > 0) writeDiffCounts(&surface, ctx, self.props.diff_counts.?);
         children[child_index] = .{
             .origin = .{ .row = row, .col = width -| 2 -| surface_width },
             .surface = surface,

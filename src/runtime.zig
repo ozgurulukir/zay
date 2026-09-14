@@ -96,7 +96,7 @@ pub const AgentRuntime = struct {
     const OwnedClient = union(enum) {
         codex_responses: *ai.codex_responses.Client,
         openai_compatible: *ai.openai_compatible.Client,
-        openai_responses: *ai.openai_responses.Client,
+        responses: *ai.responses_core.Client,
 
         fn deinit(self: OwnedClient, gpa: std.mem.Allocator) void {
             switch (self) {
@@ -108,7 +108,7 @@ pub const AgentRuntime = struct {
                     client.deinit();
                     gpa.destroy(client);
                 },
-                .openai_responses => |client| {
+                .responses => |client| {
                     client.deinit();
                     gpa.destroy(client);
                 },
@@ -119,32 +119,23 @@ pub const AgentRuntime = struct {
             return switch (self) {
                 .codex_responses => |client| .{ .codex_responses = client },
                 .openai_compatible => |client| .{ .openai_compatible = client },
-                .openai_responses => |client| .{ .openai_responses = client },
+                .responses => |client| .{ .responses = client },
             };
         }
 
-        /// Rebuild the client's serialized tool list from the registry
-        /// (builtin + plugin tools) and the MCP schemas. Every concrete
-        /// client exposes `updateMcpTools` with the same signature; this
-        /// helper dispatches through the union so `replaceClient` can push
-        /// the current tool set into the freshly-attached client without
-        /// the attach functions each repeating the call.
+        /// Push the final, already-deduped tool list into the client. Every
+        /// concrete client exposes `updateTools(specs)`; this helper
+        /// dispatches through the union so `replaceClient` can push the
+        /// current tool set into the freshly-attached client without the
+        /// attach functions each repeating the call.
         ///
-        /// Without this, a newly-attached client keeps the `tools_json`
-        /// it built at `init` time (builtin only) and never learns about
-        /// `lua__<plugin>__<tool>` entries — so the model can't see plugin
-        /// tools and tries to invoke them as shell commands
-        /// (`bash: lua__write-tool__edit: command not found`).
-        fn updateMcpTools(
-            self: OwnedClient,
-            mcp_tools: []const ai.McpToolSchema,
-            registry: ?*tools_mod.ToolRegistry,
-            builtin_override: []const tools_mod.Tool,
-        ) !void {
+        /// Without this, a newly-attached client keeps the `tools_json` it
+        /// built at `init` time (builtin only) and never learns about
+        /// `lua__<plugin>__<tool>` or `mcp__<server>__<tool>` entries — the
+        /// model then tries to invoke them as shell commands.
+        fn updateTools(self: OwnedClient, specs: []const ai.tool_schema.ToolSpec) anyerror!void {
             switch (self) {
-                .codex_responses => |client| try client.updateMcpTools(mcp_tools, registry, builtin_override),
-                .openai_compatible => |client| try client.updateMcpTools(mcp_tools, registry, builtin_override),
-                .openai_responses => |client| try client.updateMcpTools(mcp_tools, registry, builtin_override),
+                inline else => |client| try client.updateTools(specs),
             }
         }
     };
@@ -217,7 +208,7 @@ pub const AgentRuntime = struct {
         errdefer skill_mod.deinitAll(gpa, skills);
         const plugin_prompts = if (template) |t| try plugin_prompt.cloneAll(gpa, t.plugin_prompts) else try plugin_prompt.loadAll(gpa, io, home_dir, cwd);
         errdefer plugin_prompt.deinitAll(gpa, plugin_prompts);
-        const owned_system_prompt = if (template) |t| try gpa.dupe(u8, t.system_prompt) else try context_assembly.assembleSystemPrompt(gpa, io, owned_base_system_prompt, cwd, skills, plugin_prompts);
+        const owned_system_prompt = if (template) |t| try gpa.dupe(u8, t.system_prompt) else try context_assembly.assembleSystemPrompt(gpa, io, owned_base_system_prompt, home_dir, cwd, skills, plugin_prompts);
         errdefer gpa.free(owned_system_prompt);
 
         target.* = .{
@@ -860,7 +851,7 @@ pub const AgentRuntime = struct {
         const model_info = self.lookupModelInfo(model_id);
         const provider_specs = try self.buildProviderHeaders(base_url, user_headers);
         defer ai.provider_headers.freeHeaders(self.gpa, provider_specs);
-        const client = try self.gpa.create(ai.openai_responses.Client);
+        const client = try self.gpa.create(ai.responses_core.Client);
         errdefer self.gpa.destroy(client);
         try client.init(self.gpa, self.io, .{
             .base_url = base_url,
@@ -874,14 +865,14 @@ pub const AgentRuntime = struct {
             .disable_prompt_cache = self.disable_prompt_cache,
             .headers = provider_specs,
             .system_prompt = self.system_prompt,
-        });
+        }, .{});
         errdefer client.deinit();
-        self.replaceClient(.{ .openai_responses = client });
+        self.replaceClient(.{ .responses = client });
         self.agent.context_window_tokens = compaction.contextWindowTokens(model_info, self.context_settings.override_context_window);
         self.agent.resetContextUsage();
 
         attach_compaction: {
-            const compaction_client = self.gpa.create(ai.openai_responses.Client) catch break :attach_compaction;
+            const compaction_client = self.gpa.create(ai.responses_core.Client) catch break :attach_compaction;
             compaction_client.init(self.gpa, self.io, .{
                 .base_url = base_url,
                 .api_key = api_key,
@@ -893,14 +884,14 @@ pub const AgentRuntime = struct {
                 .headers = provider_specs,
                 // Minimal carrier prompt, not the full agent system prompt (C4).
                 .system_prompt = compaction.summarizer_system_prompt,
-            }) catch {
+            }, .{}) catch {
                 self.gpa.destroy(compaction_client);
                 break :attach_compaction;
             };
-            self.setCompactionClient(.{ .openai_responses = compaction_client });
+            self.setCompactionClient(.{ .responses = compaction_client });
         }
         attach_naming: {
-            const naming_client = self.gpa.create(ai.openai_responses.Client) catch break :attach_naming;
+            const naming_client = self.gpa.create(ai.responses_core.Client) catch break :attach_naming;
             naming_client.init(self.gpa, self.io, .{
                 .base_url = base_url,
                 .api_key = api_key,
@@ -911,11 +902,11 @@ pub const AgentRuntime = struct {
                 .disable_prompt_cache = self.disable_prompt_cache,
                 .headers = provider_specs,
                 .system_prompt = self.system_prompt,
-            }) catch {
+            }, .{}) catch {
                 self.gpa.destroy(naming_client);
                 break :attach_naming;
             };
-            self.setNamingClient(.{ .openai_responses = naming_client });
+            self.setNamingClient(.{ .responses = naming_client });
         }
     }
 
@@ -924,7 +915,7 @@ pub const AgentRuntime = struct {
             .none => b == .none,
             .codex_responses => |client| b == .codex_responses and b.codex_responses == client,
             .openai_compatible => |client| b == .openai_compatible and b.openai_compatible == client,
-            .openai_responses => |client| b == .openai_responses and b.openai_responses == client,
+            .responses => |client| b == .responses and b.responses == client,
         };
     }
 
@@ -932,7 +923,7 @@ pub const AgentRuntime = struct {
         return switch (owned) {
             .codex_responses => |client| model == .codex_responses and model.codex_responses == client,
             .openai_compatible => |client| model == .openai_compatible and model.openai_compatible == client,
-            .openai_responses => |client| model == .openai_responses and model.openai_responses == client,
+            .responses => |client| model == .responses and model.responses == client,
         };
     }
 
@@ -958,10 +949,45 @@ pub const AgentRuntime = struct {
         // turn-loop warning). When unwired, keep the init-time set; the App
         // pushes the merged list once the registry is wired.
         if (self.agent.tool_registry != null) {
-            next.updateMcpTools(self.mcp_tools, self.agent.tool_registry, &.{}) catch |err| {
-                log.warn("replaceClient: updateMcpTools failed: {s}", .{@errorName(err)});
+            const specs = self.assembleToolSpecs(self.gpa) catch |err| {
+                log.warn("replaceClient: assembleToolSpecs failed: {s}", .{@errorName(err)});
+                return;
+            };
+            defer self.gpa.free(specs);
+            next.updateTools(specs) catch |err| {
+                log.warn("replaceClient: updateTools failed: {s}", .{@errorName(err)});
             };
         }
+    }
+
+    /// Assemble the final, deduped wire-tool spec list: the registry's
+    /// builtin + plugin + MCP records when wired, else the static builtin
+    /// registry (tests and the pre-wire init path). First-wins by name.
+    /// Caller frees the returned slice.
+    fn assembleToolSpecs(self: *AgentRuntime, gpa: std.mem.Allocator) anyerror![]ai.tool_schema.ToolSpec {
+        var specs: std.ArrayList(ai.tool_schema.ToolSpec) = .empty;
+        errdefer specs.deinit(gpa);
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(gpa);
+        const source: []const tools_mod.Tool = if (self.agent.tool_registry) |reg|
+            try reg.all(gpa)
+        else
+            tools_mod.builtinRegistry();
+        for (source) |t| {
+            const gop = try seen.getOrPut(gpa, t.name);
+            if (gop.found_existing) continue;
+            try specs.append(gpa, ai.tool_schema.specFromTool(t));
+        }
+        return specs.toOwnedSlice(gpa);
+    }
+
+    /// Serialize + push the current tool set into the attached client. Call
+    /// between turns or right after wiring the registry — never mid-turn.
+    pub fn syncToolJson(self: *AgentRuntime) !void {
+        const owned = self.owned_client orelse return;
+        const specs = try self.assembleToolSpecs(self.gpa);
+        defer self.gpa.free(specs);
+        try owned.updateTools(specs);
     }
 
     /// Install the dedicated background-summarizer client, replacing any
@@ -1051,7 +1077,11 @@ test "OwnedClient.updateMcpTools pushes plugin tools into a freshly-attached cli
 
     // The exact dispatch path `replaceClient` now uses.
     const owned: AgentRuntime.OwnedClient = .{ .openai_compatible = client };
-    try owned.updateMcpTools(&.{}, reg, &.{});
+    var specs: std.ArrayList(ai.tool_schema.ToolSpec) = .empty;
+    defer specs.deinit(gpa);
+    const reg_slice = try reg.all(gpa);
+    for (reg_slice) |t| try specs.append(gpa, ai.tool_schema.specFromTool(t));
+    try owned.updateTools(specs.items);
 
     try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "lua__p__t") != null);
 }

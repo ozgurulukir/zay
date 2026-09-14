@@ -45,7 +45,7 @@ pub fn drawDiffViewer(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext
         // Cold start: navigated in, diff still fetching in the background.
         panel.lineStyledAt(&surface, body_top + body_h / 2, "Loading diff…", ctx, 2, p.model_status) catch {};
     } else {
-        var body: diff.DiffBodyWidget = .{ .app = app };
+        var body: diff.DiffBodyWidget = .{ .state = &app.diff };
         subs[n] = .{
             .origin = .{ .row = body_top, .col = 0 },
             .z_index = 0,
@@ -58,7 +58,7 @@ pub fn drawDiffViewer(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext
     }
 
     if (editing) {
-        var editor: diff.DiffCommentEditor = .{ .app = app };
+        var editor: diff.DiffCommentEditor = .{ .state = &app.diff, .comment_input = &app.inputs.comment };
         subs[n] = .{
             .origin = .{ .row = h -| footer_h, .col = 0 },
             .z_index = 1,
@@ -87,7 +87,7 @@ pub fn drawDiffViewer(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext
         const result_rows: u16 = @intCast(@max(@as(usize, 1), @min(app.diff.search_matches.items.len, 10)));
         const ph: u16 = @min(h, result_rows + 4);
         // Center the search popup on screen.
-        var search: diff.DiffSearchWidget = .{ .app = app };
+        var search: diff.DiffSearchWidget = .{ .state = &app.diff, .palette_input = &app.inputs.palette };
         subs[n] = .{
             .origin = .{ .row = (h -| ph) / 2, .col = (w -| pw) / 2 },
             .z_index = 2,

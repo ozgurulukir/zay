@@ -28,10 +28,10 @@ pub fn modelStatus(runtime: ?*const runtime_mod.AgentRuntime, config: config_mod
                     .model = client.core_client.config.model,
                     .reasoning = effortLabel(if (client.core_client.config.reasoning) |r| r.effort else null),
                 },
-                .openai_responses => |client| return .{
+                .responses => |client| return .{
                     .provider = providerLabel(config) orelse "openai",
-                    .model = client.core_client.config.model,
-                    .reasoning = effortLabel(if (client.core_client.config.reasoning) |r| r.effort else null),
+                    .model = client.config.model,
+                    .reasoning = effortLabel(if (client.config.reasoning) |r| r.effort else null),
                 },
                 .openai_compatible => |client| return .{
                     .provider = providerDisplayName(config) orelse "openai_compatible",

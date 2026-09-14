@@ -3,6 +3,8 @@ const log = std.log.scoped(.ai);
 
 const ai = @import("../ai.zig");
 const core = @import("responses_core.zig");
+const provider_headers = @import("provider_headers.zig");
+const tool_schema = @import("tool_schema.zig");
 const http = @import("../http.zig");
 const websocket = @import("websocket");
 const tools_mod = @import("../tools.zig");
@@ -74,14 +76,13 @@ pub const Client = struct {
         self.* = undefined;
     }
 
+    pub fn errorDetail(self: *const Client) ?[]const u8 {
+        return self.core_client.errorDetail();
+    }
+
     /// Rebuild the serialized tool definitions after the MCP tool set changes.
-    pub fn updateMcpTools(
-        self: *Client,
-        mcp_tools: []const ai.McpToolSchema,
-        registry: ?*tools_mod.ToolRegistry,
-        builtin_override: []const tools_common.Tool,
-    ) !void {
-        try self.core_client.updateMcpTools(mcp_tools, registry, builtin_override);
+    pub fn updateTools(self: *Client, specs: []const tool_schema.ToolSpec) !void {
+        try self.core_client.updateTools(specs);
     }
 
     pub fn prompt(self: *Client, messages: []const ai.MessageView, observer: anytype) !ai.Turn {
@@ -335,23 +336,46 @@ fn hostHeader(gpa: std.mem.Allocator, host: []const u8, port: u16, tls: bool) ![
     return try std.fmt.allocPrint(gpa, "{s}:{d}", .{ host, port });
 }
 
+/// Handshake header deltas vs the SSE profile table, kept HERE next to the
+/// renderer so `codex_responses_config.headers` stays the single spec source
+/// for originator/version/session/account headers (this used to be a
+/// hand-copied `\r\n` string held in parity only by a test).
+const handshake_transport_prefix = "Host: {s}\r\nAuthorization: {s}\r\nUser-Agent: " ++ codex_user_agent ++ "\r\n";
+const handshake_skip = [_][]const u8{ "accept", "OpenAI-Beta" };
+const handshake_beta = "OpenAI-Beta: responses_websockets=2026-02-06\r\n";
+
+fn resolveSpecValue(value: provider_headers.HeaderValue, config: ai.Config) ?[]const u8 {
+    return switch (value) {
+        .literal => |v| v,
+        .session_id => config.session_id,
+        .account_id => config.account_id,
+    };
+}
+
 fn buildHandshakeHeaders(
     gpa: std.mem.Allocator,
     host_header: []const u8,
     authorization: []const u8,
     config: ai.Config,
 ) ![]u8 {
-    return try std.fmt.allocPrint(
-        gpa,
-        "Host: {s}\r\nAuthorization: {s}\r\nUser-Agent: " ++ codex_user_agent ++ "\r\nchatgpt-account-id: {s}\r\noriginator: zay\r\nversion: " ++ codex_version ++ "\r\nOpenAI-Beta: responses_websockets=2026-02-06\r\nsession_id: {s}\r\nx-client-request-id: {s}\r\n",
-        .{
-            host_header,
-            authorization,
-            config.account_id,
-            config.session_id,
-            config.session_id,
-        },
-    );
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    const w = &out.writer;
+    // Transport-mandated upgrade headers the profile table deliberately omits.
+    try w.print(handshake_transport_prefix, .{ host_header, authorization });
+    for (codex_responses_config.headers) |h| {
+        var skip = false;
+        for (handshake_skip) |name| {
+            if (std.ascii.eqlIgnoreCase(h.name, name)) skip = true;
+        }
+        if (skip) continue;
+        const v = resolveSpecValue(h.value, config) orelse continue;
+        if (v.len == 0) continue;
+        try w.print("{s}: {s}\r\n", .{ h.name, v });
+    }
+    // The websocket transport negotiates a different Beta mode than SSE.
+    try w.writeAll(handshake_beta);
+    return out.toOwnedSlice();
 }
 
 test "codex websocket endpoint parses https url" {

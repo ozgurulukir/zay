@@ -20,6 +20,44 @@ const tools_mod = @import("../tools.zig");
 /// definition inside a `"function"` object; the Responses API emits it flat.
 pub const Envelope = enum { completions, responses };
 
+/// Neutral wire-tool description — what a tool definition needs and nothing
+/// more. Builtins, registry plugin tools, and registry MCP records all
+/// convert cheaply; no dead run/display fn pointers are fabricated.
+pub const ToolSpec = struct {
+    name: []const u8,
+    description: []const u8,
+    schema: tools_common.Schema,
+};
+
+/// Convert a `tools.Tool` record. The description template still carries
+/// `{{hsep}}` placeholders — `writeToolDefinition` substitutes them.
+pub fn specFromTool(t: tools_common.Tool) ToolSpec {
+    return .{ .name = t.name, .description = t.description, .schema = t.schema };
+}
+
+/// Build the `tools` JSON array from one flat, already-deduped spec list.
+/// The runtime layer owns assembling + deduping the list (builtin + registry
+/// plugin + registry MCP); this module only serializes.
+pub fn buildToolsJson(
+    gpa: std.mem.Allocator,
+    specs: []const ToolSpec,
+    strict: bool,
+    envelope: Envelope,
+) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const writer = &aw.writer;
+    try writer.writeByte('[');
+    var first = true;
+    for (specs) |spec| {
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try writeToolDefinition(gpa, writer, spec.name, spec.description, spec.schema, strict, envelope);
+    }
+    try writer.writeByte(']');
+    return aw.toOwnedSlice();
+}
+
 /// Build the OpenAI `tools` JSON array from builtin tools, registry plugin
 /// tools, and MCP tool schemas, for the given wire-format envelope.
 /// Substitutes `{{hsep}}` → `~` in each tool's description template.

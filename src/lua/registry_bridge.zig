@@ -79,28 +79,21 @@ fn allocPluginToolKey(
     return key;
 }
 
-/// Shared dispatcher for every plugin tool. The `userdata` argument
-/// carries the `*PluginToolKey` set at registration time. The
-/// `*PluginManager` is supplied by the executor (not via the
-/// `*const fn` signature, which is fixed), so the dispatcher always
-/// dereferences the live `App.plugin_manager` field — even after
-/// `initRuntime` reassigns it.
+/// Shared dispatcher for every plugin tool. The `Env.userdata` argument
+/// carries the `*PluginToolKey` set at registration time; the live
+/// `*PluginManager` comes from `Env.ctx.plugin_manager` — the executor-owned
+/// runtime context, always the App's current field.
 pub fn runPluginTool(
     gpa: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
     args: []const u8,
-    userdata: *anyopaque,
+    env: tools_common.Env,
 ) tools_common.Error!tools_common.Output {
     _ = cwd;
     _ = io;
-    const key: *PluginToolKey = @ptrCast(@alignCast(userdata));
-    // The executor is supposed to stash its `*PluginManager` in a
-    // thread-local before calling, so the dispatcher can reach it
-    // without taking a `*ExecutorService` through the fixed
-    // `Tool.run` signature. Falling back to a static `null` ensures
-    // we never invoke a freed pointer.
-    const manager = plugin_manager_slot orelse
+    const key: *PluginToolKey = @ptrCast(@alignCast(env.userdata));
+    const manager = env.ctx.plugin_manager orelse
         return tools_common.fail(gpa, "plugin dispatcher: no live plugin manager"[0..], 1);
     const result_text = manager.callTool(
         key.plugin_name[0..],
@@ -119,20 +112,14 @@ pub fn runPluginTool(
     return .{ .stdout = result_text, .stderr = stderr, .code = 0 };
 }
 
-/// Thread-local slot used by `runPluginTool` to reach the live
-/// `*PluginManager` without widening the `Tool.run` signature. The
-/// executor sets it in `produceOutput` right before dispatching a
-/// plugin tool and clears it immediately after.
-pub threadlocal var plugin_manager_slot: ?*PluginManager = null;
-
-/// Human display metadata for a plugin tool. The `userdata` carries the
+/// Human display metadata for a plugin tool. The `Env.userdata` carries the
 /// `(plugin_name, tool_name)` key set at registration time.
 pub fn displayPluginTool(
     gpa: std.mem.Allocator,
     args: []const u8,
-    userdata: *anyopaque,
+    env: tools_common.Env,
 ) std.mem.Allocator.Error!tools_common.ToolDisplay {
-    const key: *PluginToolKey = @ptrCast(@alignCast(userdata));
+    const key: *PluginToolKey = @ptrCast(@alignCast(env.userdata));
     if (args.len == 0) return .{ .label = try gpa.dupe(u8, key.tool_name) };
     return .{
         .label = try gpa.dupe(u8, key.tool_name),

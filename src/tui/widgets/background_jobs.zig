@@ -1,21 +1,26 @@
 //! The Ctrl+O background-jobs modal widget and its inner row layout.
 //!
 //! Renders background job snapshots with vxfw.Border labels, elapsed timers,
-//! and focused cancel action buttons.
+//! and focused cancel action buttons. Scalarized per INV-WIDGET-1: the widget
+//! takes per-frame props built by `root_layout`, never an `App`.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
-const tui = @import("../../tui.zig");
 const tui_style = @import("../style.zig");
 const panel = @import("panel.zig");
-
-const App = tui.App;
+const background_mod = @import("../../background.zig");
 
 /// Outer border widget. Shows a snapshot of running background jobs.
 pub const BackgroundJobsWidget = struct {
-    app: *App,
+    props: Props = .{},
+
+    pub const Props = struct {
+        manager: ?*background_mod.BackgroundManager = null,
+        selection: usize = 0,
+        cancel_focus: bool = false,
+    };
 
     pub fn widget(self: *BackgroundJobsWidget) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -24,18 +29,17 @@ pub const BackgroundJobsWidget = struct {
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *BackgroundJobsWidget = @ptrCast(@alignCast(ptr));
         const p = tui_style.activePalette();
-        const app = self.app;
         const empty = vxfw.Surface.init(ctx.arena, self.widget(), .{
             .width = ctx.max.width orelse 0,
             .height = ctx.max.height orelse 0,
         });
-        const manager = app.background orelse return empty;
+        const manager = self.props.manager orelse return empty;
         const views = manager.snapshot(ctx.arena) catch return empty;
         const inner = try ctx.arena.create(BackgroundJobsInner);
         inner.* = .{
             .views = views,
-            .selection = if (views.len == 0) 0 else @min(app.background_modal_state.selection, views.len - 1),
-            .cancel_focus = app.background_modal_state.cancel_focus,
+            .selection = if (views.len == 0) 0 else @min(self.props.selection, views.len - 1),
+            .cancel_focus = self.props.cancel_focus,
         };
         var border: vxfw.Border = .{
             .child = inner.widget(),
@@ -50,7 +54,7 @@ pub const BackgroundJobsWidget = struct {
 /// snapshot of `JobView`s and the current selection/cancel-focus so the
 /// outer widget doesn't have to re-fetch state each draw.
 const BackgroundJobsInner = struct {
-    views: []tui.background_mod.BackgroundManager.JobView,
+    views: []background_mod.BackgroundManager.JobView,
     selection: usize,
     cancel_focus: bool,
 

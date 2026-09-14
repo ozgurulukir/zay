@@ -2,7 +2,10 @@
 //!
 //! Provides state-of-the-art context assembly for Zay Agent:
 //!   1. Dynamic Environment & Repository Context Injection (CWD, OS, Git Branch/Status, Date).
-//!   2. Multi-convention Project Rule Ingestion (AGENTS.md, .cursorrules, CLAUDE.md, CONVENTIONS.md).
+//!   2. Rule Ingestion — user-level AGENTS.md from the platform config dir
+//!      (`%APPDATA%\zay` / `~/.config/zay`) first, then the project
+//!      conventions (AGENTS.md, .cursorrules, CLAUDE.md, CONVENTIONS.md),
+//!      sharing one aggregate byte budget (user file counted first).
 //!   3. Historical Tool Result Pruning (Context Compression for Active Turns): Keeps recent tool outputs
 //!      in full, while capping/truncating ancient tool outputs in the prompt to prevent context bloat.
 //!   4. Attachment Budgeting: Per-file and aggregate byte limits for @-mention file inlining
@@ -13,6 +16,7 @@ const ai = @import("../ai.zig");
 const tools_common = @import("../tools/common.zig");
 const compaction = @import("compaction.zig");
 const os = @import("../os.zig");
+const paths = @import("../paths.zig");
 const plugin_prompt = @import("../plugin_prompt.zig");
 const skill_mod = @import("../skill.zig");
 const vcs = @import("../vcs.zig");
@@ -38,8 +42,9 @@ const project_rule_filenames = [_][]const u8{
 };
 
 /// Maximum bytes of a single project rule file ingested into the prompt. A file
-/// larger than this is truncated to the head with a visible notice rather than
-/// rejected, so an oversized AGENTS.md can never brick startup.
+/// larger than this is read as a head+tail sandwich (via `tools_common.elideMiddle`)
+/// with a visible notice rather than rejected, so an oversized AGENTS.md can
+/// never brick startup.
 pub const max_project_rule_file_bytes: usize = 64 * 1024;
 
 /// Maximum aggregate bytes of all project rule files ingested into the prompt.
@@ -48,10 +53,13 @@ pub const max_aggregate_project_rule_bytes: usize = 128 * 1024;
 
 /// Assembles the complete system prompt for a turn with dynamic environment,
 /// git metadata, ingested project rules, active skills, and plugin prompts.
+/// `home_dir` may be empty (test harnesses): the user-level AGENTS.md block is
+/// simply skipped.
 pub fn assembleSystemPrompt(
     gpa: std.mem.Allocator,
     io: std.Io,
     base_template: []const u8,
+    home_dir: []const u8,
     cwd: []const u8,
     skills: []const skill_mod.Skill,
     plugin_prompts: []const plugin_prompt.PluginPrompt,
@@ -87,20 +95,24 @@ pub fn assembleSystemPrompt(
         try out.writer.print("</git_environment>", .{});
     }
 
-    // 3. Multi-convention project rule ingestion with aggregate budget
+    // 3. Rule ingestion: the user-level AGENTS.md from the platform config
+    //    dir first, then the project conventions. Both share the aggregate
+    //    budget and the user file is counted FIRST, so an oversized global
+    //    file narrows what project rules may use (they degrade to omission
+    //    notices rather than failing).
     var total_rule_bytes: usize = 0;
-    for (project_rule_filenames) |rule_filename| {
-        if (try readProjectRuleFile(gpa, io, cwd, rule_filename)) |content| {
+    if (home_dir.len > 0) {
+        const config_dir = try paths.platformConfigDir(gpa, home_dir);
+        defer gpa.free(config_dir);
+        if (try readRuleFile(gpa, io, config_dir, "AGENTS.md", "user rule file")) |content| {
             defer gpa.free(content);
-            try out.writer.print("\n\n<project_instructions path=\"{s}\">\n", .{rule_filename});
-            if (total_rule_bytes + content.len <= max_aggregate_project_rule_bytes) {
-                try skill_mod.writeXmlEscaped(&out.writer, content);
-                total_rule_bytes += content.len;
-            } else {
-                try out.writer.print("[project rule file omitted: {s} exceeds aggregate rule budget (128 KB)]", .{rule_filename});
-                total_rule_bytes = max_aggregate_project_rule_bytes;
-            }
-            try out.writer.print("\n</project_instructions>", .{});
+            try appendRuleBlock(&out.writer, "user_instructions", "user rule file", "AGENTS.md", content, &total_rule_bytes);
+        }
+    }
+    for (project_rule_filenames) |rule_filename| {
+        if (try readRuleFile(gpa, io, cwd, rule_filename, "project rule file")) |content| {
+            defer gpa.free(content);
+            try appendRuleBlock(&out.writer, "project_instructions", "project rule file", rule_filename, content, &total_rule_bytes);
         }
     }
 
@@ -121,6 +133,32 @@ pub fn assembleSystemPrompt(
     }
 
     return out.toOwnedSlice();
+}
+
+/// Emits one `<{tag} path="{filename}">` rule block, enforcing the aggregate
+/// budget through `total_rule_bytes`: content that fits is XML-escaped and
+/// counted; content that would overflow is replaced by the omission notice and
+/// the counter is pinned so every later file is omitted too. The opening tag
+/// is emitted before the budget check so an omitted file still gets a visible
+/// block carrying the notice. `tag` and `label` come from literal call sites
+/// and are never XML-escaped content.
+fn appendRuleBlock(
+    writer: *std.Io.Writer,
+    tag: []const u8,
+    label: []const u8,
+    filename: []const u8,
+    content: []const u8,
+    total_rule_bytes: *usize,
+) !void {
+    try writer.print("\n\n<{s} path=\"{s}\">\n", .{ tag, filename });
+    if (total_rule_bytes.* + content.len <= max_aggregate_project_rule_bytes) {
+        try skill_mod.writeXmlEscaped(writer, content);
+        total_rule_bytes.* += content.len;
+    } else {
+        try writer.print("[{s} omitted: {s} exceeds aggregate rule budget (128 KB)]", .{ label, filename });
+        total_rule_bytes.* = max_aggregate_project_rule_bytes;
+    }
+    try writer.print("\n</{s}>", .{tag});
 }
 
 /// Today's date as `YYYY-MM-DD` in UTC, using the wall-clock real-time clock.
@@ -410,8 +448,20 @@ fn earliestPlaceholder(cwd_at: ?usize, os_at: ?usize, date_at: ?usize, cwd: []co
     return best;
 }
 
+/// Reads a project-scope rule file from `cwd`. Thin wrapper over `readRuleFile`
+/// with the "project rule file" label feeding its notices; kept pub because
+/// `runtime.zig`'s context-file test exercises it directly.
 pub fn readProjectRuleFile(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, filename: []const u8) !?[]u8 {
-    const path = try std.fs.path.join(gpa, &.{ cwd, filename });
+    return readRuleFile(gpa, io, cwd, filename, "project rule file");
+}
+
+/// Reads `dir/filename` as advisory rule context, tolerant of every failure:
+/// `dir` may be a workspace root or the platform config dir (user-level
+/// AGENTS.md); `label` ("user rule file" / "project rule file") feeds the log
+/// lines and the truncation notice so the two classes stay distinguishable in
+/// a prompt that can carry both. Caller owns the returned slice.
+fn readRuleFile(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, filename: []const u8, label: []const u8) !?[]u8 {
+    const path = try std.fs.path.join(gpa, &.{ dir, filename });
     defer gpa.free(path);
 
     // A rule file is advisory context, never load-bearing for session start:
@@ -420,13 +470,13 @@ pub fn readProjectRuleFile(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, 
     const file = std.Io.Dir.openFile(.cwd(), io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => |e| {
-            log.warn("skipping project rule file {s}: {s}", .{ path, @errorName(e) });
+            log.warn("skipping {s} {s}: {s}", .{ label, path, @errorName(e) });
             return null;
         },
     };
     defer file.close(io);
     const stat = file.stat(io) catch |err| {
-        log.warn("skipping project rule file {s}: {s}", .{ path, @errorName(err) });
+        log.warn("skipping {s} {s}: {s}", .{ label, path, @errorName(err) });
         return null;
     };
     const size: usize = @intCast(stat.size);
@@ -439,7 +489,7 @@ pub fn readProjectRuleFile(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, 
         var reader = file.reader(io, &.{});
         const n = reader.interface.readSliceShort(bytes) catch |err| {
             gpa.free(bytes);
-            log.warn("skipping project rule file {s}: {s}", .{ path, @errorName(err) });
+            log.warn("skipping {s} {s}: {s}", .{ label, path, @errorName(err) });
             return null;
         };
         if (n < size) {
@@ -461,20 +511,20 @@ pub fn readProjectRuleFile(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, 
     const tail = try gpa.alloc(u8, tail_len);
     defer gpa.free(tail);
     const head_n = file.readPositionalAll(io, head, 0) catch |err| {
-        log.warn("skipping project rule file {s}: {s}", .{ path, @errorName(err) });
+        log.warn("skipping {s} {s}: {s}", .{ label, path, @errorName(err) });
         return null;
     };
     const tail_offset: u64 = @intCast(size - tail_len);
     const tail_n = file.readPositionalAll(io, tail, tail_offset) catch |err| {
-        log.warn("skipping project rule file {s}: {s}", .{ path, @errorName(err) });
+        log.warn("skipping {s} {s}: {s}", .{ label, path, @errorName(err) });
         return null;
     };
     const joined = try tools_common.elideMiddle(gpa, head[0..head_n], tail[0..tail_n], size);
     defer gpa.free(joined);
     const notice = try std.fmt.allocPrint(
         gpa,
-        "\n\n[project rule file truncated: {s} is {d} bytes]",
-        .{ filename, size },
+        "\n\n[{s} truncated: {s} is {d} bytes]",
+        .{ label, filename, size },
     );
     defer gpa.free(notice);
     const out = try gpa.alloc(u8, joined.len + notice.len);
@@ -574,7 +624,7 @@ test "assembleSystemPrompt substitutes placeholders and ingests AGENTS.md" {
     defer gpa.free(cwd);
 
     const template = "System: ${CWD} on ${OS}";
-    const prompt = try assembleSystemPrompt(gpa, io, template, cwd, &.{}, &.{});
+    const prompt = try assembleSystemPrompt(gpa, io, template, "", cwd, &.{}, &.{});
     defer gpa.free(prompt);
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, cwd) != null);
@@ -602,7 +652,7 @@ test "assembleSystemPrompt appends plugin prompts block" {
     defer plugin_prompt.deinitAll(gpa, prompts);
 
     const template = "System: ${CWD} on ${OS}";
-    const prompt = try assembleSystemPrompt(gpa, io, template, cwd, &.{}, prompts);
+    const prompt = try assembleSystemPrompt(gpa, io, template, "", cwd, &.{}, prompts);
     defer gpa.free(prompt);
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<plugin_prompts>") != null);
@@ -647,7 +697,7 @@ test "assembleSystemPrompt injects skills and bounded plugin prompts" {
     defer plugin_prompt.deinitAll(gpa, prompts);
 
     const template = "System: ${CWD} on ${OS}";
-    const prompt = try assembleSystemPrompt(gpa, io, template, cwd, skills, prompts);
+    const prompt = try assembleSystemPrompt(gpa, io, template, "", cwd, skills, prompts);
     defer gpa.free(prompt);
 
     for (skill_names) |name| {
@@ -726,7 +776,7 @@ test "assembleSystemPrompt enforces aggregate project rule budget (128 KB)" {
     }
 
     const template = "System: ${CWD}";
-    const prompt = try assembleSystemPrompt(gpa, io, template, cwd, &.{}, &.{});
+    const prompt = try assembleSystemPrompt(gpa, io, template, "", cwd, &.{}, &.{});
     defer gpa.free(prompt);
 
     // AGENTS.md and .cursorrules are included
@@ -737,6 +787,107 @@ test "assembleSystemPrompt enforces aggregate project rule budget (128 KB)" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "[project rule file omitted: CLAUDE.md exceeds aggregate rule budget (128 KB)]") != null);
 }
 
+test "assembleSystemPrompt injects user AGENTS.md before project instructions" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    // Scratch home with a global AGENTS.md under the platform config dir.
+    const home = try std.fs.path.join(gpa, &.{ root, ".zig-cache/context-user-rules-home-test" });
+    defer gpa.free(home);
+    const config_dir = try paths.platformConfigDir(gpa, home);
+    defer gpa.free(config_dir);
+    try std.Io.Dir.createDirPath(.cwd(), io, config_dir);
+    try writeTestFile(gpa, io, config_dir, "AGENTS.md", "GLOBAL_MARKER rule.");
+
+    // Scratch project with its own AGENTS.md.
+    const cwd = try std.fs.path.join(gpa, &.{ root, ".zig-cache/context-user-rules-proj-test" });
+    defer gpa.free(cwd);
+    try std.Io.Dir.createDirPath(.cwd(), io, cwd);
+    try writeTestFile(gpa, io, cwd, "AGENTS.md", "PROJECT_MARKER rule.");
+
+    const prompt = try assembleSystemPrompt(gpa, io, "System", home, cwd, &.{}, &.{});
+    defer gpa.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<user_instructions path=\"AGENTS.md\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "GLOBAL_MARKER rule.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "PROJECT_MARKER rule.") != null);
+    // The user block must precede the project block.
+    const user_at = std.mem.indexOf(u8, prompt, "<user_instructions").?;
+    const project_at = std.mem.indexOf(u8, prompt, "<project_instructions").?;
+    try std.testing.expect(user_at < project_at);
+}
+
+test "assembleSystemPrompt skips user rules when home is empty or the file is missing" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    // Empty home (test-harness shape): no user block, assembly succeeds.
+    {
+        const prompt = try assembleSystemPrompt(gpa, io, "System", "", root, &.{}, &.{});
+        defer gpa.free(prompt);
+        try std.testing.expect(std.mem.indexOf(u8, prompt, "<user_instructions") == null);
+    }
+
+    // Home set but no config-dir AGENTS.md on disk: silent skip.
+    const home = try std.fs.path.join(gpa, &.{ root, ".zig-cache/context-user-rules-missing-home-test" });
+    defer gpa.free(home);
+    try std.Io.Dir.createDirPath(.cwd(), io, home);
+
+    const prompt = try assembleSystemPrompt(gpa, io, "System", home, root, &.{}, &.{});
+    defer gpa.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<user_instructions") == null);
+}
+
+test "user AGENTS.md consumes the shared aggregate budget before project rules" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    // Global AGENTS.md (60 KB): counted FIRST into the shared 128 KB pool.
+    const home = try std.fs.path.join(gpa, &.{ root, ".zig-cache/context-user-budget-home-test" });
+    defer gpa.free(home);
+    const config_dir = try paths.platformConfigDir(gpa, home);
+    defer gpa.free(config_dir);
+    try std.Io.Dir.createDirPath(.cwd(), io, config_dir);
+    {
+        const global = try gpa.alloc(u8, 60 * 1024);
+        defer gpa.free(global);
+        @memset(global, 'G');
+        try writeTestFile(gpa, io, config_dir, "AGENTS.md", global);
+    }
+
+    // Project: AGENTS.md (60 KB) fits at 120 KB total, but .cursorrules
+    // (20 KB) would push past 128 KB and must be omitted — proving the user
+    // file's bytes were counted first (without it, 80 KB would fit entirely).
+    const cwd = try std.fs.path.join(gpa, &.{ root, ".zig-cache/context-user-budget-proj-test" });
+    defer gpa.free(cwd);
+    try std.Io.Dir.createDirPath(.cwd(), io, cwd);
+    {
+        const project = try gpa.alloc(u8, 60 * 1024);
+        defer gpa.free(project);
+        @memset(project, 'P');
+        try writeTestFile(gpa, io, cwd, "AGENTS.md", project);
+    }
+    {
+        const extra = try gpa.alloc(u8, 20 * 1024);
+        defer gpa.free(extra);
+        @memset(extra, 'C');
+        try writeTestFile(gpa, io, cwd, ".cursorrules", extra);
+    }
+
+    const prompt = try assembleSystemPrompt(gpa, io, "System", home, cwd, &.{}, &.{});
+    defer gpa.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<user_instructions path=\"AGENTS.md\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<project_instructions path=\"AGENTS.md\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[project rule file omitted: .cursorrules exceeds aggregate rule budget (128 KB)]") != null);
+}
+
 fn countStr(haystack: []const u8, needle: []const u8) usize {
     var count: usize = 0;
     var idx: usize = 0;
@@ -745,6 +896,19 @@ fn countStr(haystack: []const u8, needle: []const u8) usize {
         idx = pos + 1;
     }
     return count;
+}
+
+/// Writes `content` to `dir/filename` (parent dirs must already exist).
+/// Test fixture for the rule-file tests.
+fn writeTestFile(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, filename: []const u8, content: []const u8) !void {
+    const path = try std.fs.path.join(gpa, &.{ dir, filename });
+    defer gpa.free(path);
+    var file = try std.Io.Dir.createFile(.cwd(), io, path, .{ .truncate = true });
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    try writer.interface.writeAll(content);
+    try writer.interface.flush();
 }
 
 test "readProjectRuleFile truncates an oversized rule file with a notice instead of failing" {
@@ -781,6 +945,37 @@ test "readProjectRuleFile truncates an oversized rule file with a notice instead
     defer gpa.free(content);
     try std.testing.expect(content.len > max_project_rule_file_bytes); // sandwich + notice
     try std.testing.expect(std.mem.indexOf(u8, content, "truncated") != null);
+    // The sandwich keeps the head AND the conclusion tail.
+    try std.testing.expect(std.mem.indexOf(u8, content, "HEAD_MARKER") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "TAIL_MARKER") != null);
+}
+
+test "readRuleFile truncation notice names the file class" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    // Oversized global AGENTS.md in a scratch platform config dir.
+    const home = try std.fs.path.join(gpa, &.{ root, ".zig-cache/context-user-truncate-home-test" });
+    defer gpa.free(home);
+    const config_dir = try paths.platformConfigDir(gpa, home);
+    defer gpa.free(config_dir);
+    try std.Io.Dir.createDirPath(.cwd(), io, config_dir);
+    {
+        const big = try gpa.alloc(u8, 70 * 1024);
+        defer gpa.free(big);
+        @memset(big, 'x');
+        @memcpy(big[0.."HEAD_MARKER".len], "HEAD_MARKER");
+        @memcpy(big[big.len - "TAIL_MARKER".len ..], "TAIL_MARKER");
+        try writeTestFile(gpa, io, config_dir, "AGENTS.md", big);
+    }
+
+    const content = (try readRuleFile(gpa, io, config_dir, "AGENTS.md", "user rule file")).?;
+    defer gpa.free(content);
+    // The notice names the USER class, so it stays distinguishable from a
+    // project AGENTS.md that may sit in the same prompt.
+    try std.testing.expect(std.mem.indexOf(u8, content, "[user rule file truncated: AGENTS.md is ") != null);
     // The sandwich keeps the head AND the conclusion tail.
     try std.testing.expect(std.mem.indexOf(u8, content, "HEAD_MARKER") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "TAIL_MARKER") != null);
@@ -951,14 +1146,19 @@ test "PrunedToolCache caches owned messages across iterations with pointer stabi
     try std.testing.expectEqual(ptr1, ptr2);
     try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
 
-    // Cap change auto-clears and re-prunes
+    // Cap change auto-clears and re-prunes. Re-pruning is proven by CONTENT
+    // (the head+tail sandwich scales with the cap), not by pointer identity:
+    // the fresh copy may legally land on the just-freed address, so an
+    // allocator-address comparison is meaningless here.
     const views3 = try pruneHistoricalToolResultsViewsCached(gpa, &cache, &messages, 1, 150);
     defer freePrunedViews(gpa, views3);
 
     try std.testing.expect(views3[1] == .borrowed);
     const ptr3 = views3[1].borrowed;
-    try std.testing.expect(ptr1 != ptr3); // new pruned copy at new cap
+    const pruned_text3 = ptr3.tool.content[0].text.text;
+    try std.testing.expect(pruned_text3.len > pruned_text1.len); // re-pruned at the larger cap
     try std.testing.expectEqual(@as(u32, 150), cache.cached_cap_bytes);
+    try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
 }
 
 fn makeTextMessage(gpa: std.mem.Allocator, role: ai.Role, text: []const u8) !ai.ChatMessage {
@@ -1057,7 +1257,7 @@ test "assembleSystemPrompt includes worker-only lane invariants from default sys
     const bash_template = @embedFile("../prompts/system-bash.md");
     const template = common_template ++ "\n\n" ++ bash_template;
 
-    const prompt = try assembleSystemPrompt(gpa, io, template, cwd, &.{}, &.{});
+    const prompt = try assembleSystemPrompt(gpa, io, template, "", cwd, &.{}, &.{});
     defer gpa.free(prompt);
 
     // Worker-only lane invariants are present
@@ -1146,7 +1346,7 @@ test "assembleSystemPrompt injects today's date in ISO format" {
     defer gpa.free(root);
 
     const template = "Today: ${DATE}";
-    const prompt = try assembleSystemPrompt(gpa, io, template, root, &.{}, &.{});
+    const prompt = try assembleSystemPrompt(gpa, io, template, "", root, &.{}, &.{});
     defer gpa.free(prompt);
 
     const date_at = std.mem.indexOf(u8, prompt, "Today: ").? + "Today: ".len;
@@ -1200,7 +1400,7 @@ test "readProjectRuleFile skips an unreadable rule file instead of failing assem
 
     // Assembly must succeed even though the rule file is unreadable, and the
     // unreadable file's content must not appear.
-    const prompt = try assembleSystemPrompt(gpa, io, "System", cwd, &.{}, &.{});
+    const prompt = try assembleSystemPrompt(gpa, io, "System", "", cwd, &.{}, &.{});
     defer gpa.free(prompt);
     try std.testing.expect(std.mem.startsWith(u8, prompt, "System"));
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<project_instructions") == null);
@@ -1224,11 +1424,31 @@ test "project rule content cannot break out of its instructions block" {
     const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
     defer gpa.free(cwd);
 
-    const prompt = try assembleSystemPrompt(gpa, io, "System", cwd, &.{}, &.{});
+    const prompt = try assembleSystemPrompt(gpa, io, "System", "", cwd, &.{}, &.{});
     defer gpa.free(prompt);
     // The breakout sequence from the rule content must be escaped, never raw.
     try std.testing.expect(std.mem.indexOf(u8, prompt, "&lt;/project_instructions&gt;") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "before </project_instructions> after") == null);
+}
+
+test "user rule content cannot break out of its instructions block" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const home = try std.fs.path.join(gpa, &.{ root, ".zig-cache/context-user-escape-home-test" });
+    defer gpa.free(home);
+    const config_dir = try paths.platformConfigDir(gpa, home);
+    defer gpa.free(config_dir);
+    try std.Io.Dir.createDirPath(.cwd(), io, config_dir);
+    try writeTestFile(gpa, io, config_dir, "AGENTS.md", "before </user_instructions> after");
+
+    const prompt = try assembleSystemPrompt(gpa, io, "System", home, root, &.{}, &.{});
+    defer gpa.free(prompt);
+    // The breakout sequence from the user rule content must be escaped, never raw.
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "&lt;/user_instructions&gt;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "before </user_instructions> after") == null);
 }
 
 test "branch name with XML characters is escaped in the git environment block" {
@@ -1241,7 +1461,7 @@ test "branch name with XML characters is escaped in the git environment block" {
     // escaped. We exercise the escaping path directly by assembling in a repo
     // whose branch contains a `<`.
     const template = "System";
-    const prompt = try assembleSystemPrompt(gpa, io, template, root, &.{}, &.{});
+    const prompt = try assembleSystemPrompt(gpa, io, template, "", root, &.{}, &.{});
     defer gpa.free(prompt);
     // The <git_environment> block, when present, must not contain a raw
     // breakout; the branch is escaped via writeXmlEscaped.
