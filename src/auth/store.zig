@@ -579,6 +579,10 @@ test "writeBlob falls back to auth.json when keyring save fails or is unsupporte
     const io = std.testing.io;
     const home_dir = "/tmp/zay-writeblob-fallback-test";
     defer deleteBlob(gpa, io, home_dir) catch {};
+    // A working Credential Manager would swallow the small payload and leave
+    // no auth.json behind — force the failure the test is about.
+    keyring.forced_error = error.Backend;
+    defer keyring.forced_error = null;
 
     const secret_payload = "{\"apiKeys\":{\"openrouter\":\"or-key-12345\"}}";
 
@@ -604,6 +608,10 @@ test "writeBlob handles large payload triggering keyring error and falls back to
     defer deleteBlob(gpa, io, home_dir) catch {};
 
     // Generate a payload exceeding 2560 bytes (Windows keyring max blob size limit)
+    // and force the backend error anyway so the fallback is deterministic on
+    // OSes whose keychain would accept 3000 bytes.
+    keyring.forced_error = error.Backend;
+    defer keyring.forced_error = null;
     const large_payload = try gpa.alloc(u8, 3000);
     defer gpa.free(large_payload);
     @memset(large_payload, 'a');

@@ -1,7 +1,7 @@
 //! The `skill` builtin tool — enables the model to read instructions for
 //! specialized skills loaded into the agent's runtime.
-//! Reaches the active skill set through a scoped thread-local slot (`skills_slot`)
-//! bound in `ExecutorService.produceOutput`.
+//! Reaches the active skill set through `Tool.Env.ctx` (the executor-owned
+//! runtime context).
 
 const std = @import("std");
 
@@ -10,8 +10,6 @@ const skill_mod = @import("../skill.zig");
 
 const assert = std.debug.assert;
 const log = std.log.scoped(.skill_tool);
-
-pub threadlocal var skills_slot: ?[]const skill_mod.Skill = null;
 
 pub const tool: common.Tool = .{
     .name = "skill",
@@ -67,13 +65,14 @@ pub fn runTool(
     io: std.Io,
     cwd: []const u8,
     arguments: []const u8,
-    userdata: *anyopaque,
+    env: common.Env,
 ) common.Error!common.Output {
     _ = io;
     _ = cwd;
-    _ = userdata;
+    _ = env.userdata;
 
-    const skills = skills_slot orelse return common.failFmt(gpa, 1, "No skills loaded in active runtime.\n", .{});
+    const skills = env.ctx.skills;
+    if (skills.len == 0) return common.failFmt(gpa, 1, "No skills loaded in active runtime.\n", .{});
 
     var args = parseArgs(gpa, arguments) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -113,9 +112,9 @@ pub fn runTool(
 pub fn display(
     gpa: std.mem.Allocator,
     arguments: []const u8,
-    userdata: *anyopaque,
+    env: common.Env,
 ) std.mem.Allocator.Error!common.ToolDisplay {
-    _ = userdata;
+    _ = env;
     const JsonArgsDisplay = struct {
         name: ?[]const u8 = null,
         skill: ?[]const u8 = null,
@@ -179,12 +178,9 @@ test "skill tool loads cached skill body when found" {
     defer {
         for (&skills) |*s| s.deinit(gpa);
     }
+    var ctx: common.ToolContext = .{ .skills = &skills };
 
-    const prev_slot = skills_slot;
-    skills_slot = &skills;
-    defer skills_slot = prev_slot;
-
-    var output = try runTool(gpa, undefined, ".", "{\"name\":\"tigerstyle\"}", undefined);
+    var output = try runTool(gpa, undefined, ".", "{\"name\":\"tigerstyle\"}", .{ .ctx = &ctx });
     defer output.deinit(gpa);
 
     try std.testing.expectEqual(@as(u8, 0), output.code);
@@ -207,12 +203,9 @@ test "skill tool returns diagnostic error when skill not found" {
     defer {
         for (&skills) |*s| s.deinit(gpa);
     }
+    var ctx: common.ToolContext = .{ .skills = &skills };
 
-    const prev_slot = skills_slot;
-    skills_slot = &skills;
-    defer skills_slot = prev_slot;
-
-    var output = try runTool(gpa, undefined, ".", "{\"name\":\"nonexistent\"}", undefined);
+    var output = try runTool(gpa, undefined, ".", "{\"name\":\"nonexistent\"}", .{ .ctx = &ctx });
     defer output.deinit(gpa);
 
     try std.testing.expectEqual(@as(u8, 1), output.code);

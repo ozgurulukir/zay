@@ -5,19 +5,14 @@ const std = @import("std");
 const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
 const background = @import("background.zig");
-const background_tool = @import("tools/background.zig");
-const bash_tool = @import("tools/bash.zig");
 const lane_bridge = @import("tools/lane_bridge.zig");
 const lane_tool = @import("tools/lane.zig");
 const lua_mod = @import("lua/root.zig");
 const mcp_client_mod = @import("mcp/client.zig");
 const mcp_mod = @import("mcp/manager.zig");
 const os = @import("os.zig");
-const pwsh_tool = @import("tools/pwsh.zig");
 const schema_mod = @import("tools/schema.zig");
-const shell_safety = @import("tools/bash_safety.zig");
 const skill_mod = @import("skill.zig");
-const skill_tool = @import("tools/skill.zig");
 const tools = @import("tools.zig");
 const tool_display = @import("tools/display.zig");
 const executor_safety = @import("tools/executor_safety.zig");
@@ -29,13 +24,10 @@ const internal_lane_test_tools = [_]tools.Tool{ lane_tool.internal_tool, tools.s
 
 const assert = std.debug.assert;
 
-/// The implementation module for the host shell. MUST stay in lockstep with
-/// `registry.zig::shell_tool`: this selects the module whose `runContained` /
-/// `wantsBackground` / `runBackground` surface is invoked, while the executor
-/// routes calls on the canonical `registry.shell_tool.name` (the model-facing
-/// name, not this alias). The two `if (os.is_windows)` selections are the ONLY
-/// shell-selection points, and they mirror each other by construction.
-const shell_tool = if (os.is_windows) pwsh_tool else bash_tool;
+/// The shell implementation namespace (`runContained` / `wantsBackground` /
+/// `runBackground`), derived from `registry.shell_impl` so the executor and
+/// the model-facing tool record can never select different shells.
+const shell_impl = tools.shell_impl;
 
 /// Wiring for the background-bash path: the shared manager plus a lane generation
 /// identifying the lane the job belongs to (the manager hands it back at
@@ -168,36 +160,23 @@ pub const ExecutorService = struct {
     io: std.Io,
     cwd: []const u8,
     /// Root-containment for lane workers (see `Agent.contained`): when set, a
-    /// shell call is dispatched through `shell_tool.runContained`, which prepends
+    /// shell call is dispatched through `shell_impl.runContained`, which prepends
     /// a shell containment guard refusing to leave `cwd`. The guard is scoped
     /// here, not in the tool registry, so the driver's own shell (which
     /// legitimately changes into lane worktrees) is unaffected.
     contained: bool = false,
-    bash_classifier_url: ?[]const u8 = null,
-    background: ?BackgroundStart = null,
-    /// MCP manager for dispatching `mcp__` tool calls. null disables MCP dispatch.
-    mcp_manager: ?*mcp_mod.McpManager = null,
-    /// Tool registry (builtin + plugin). null falls back to `builtinRegistry`
-    /// only, which is what tests use.
+    /// Tool registry (builtin + plugin + MCP). null falls back to
+    /// `builtinRegistry` only, which is what tests use.
     tool_registry: ?*tools.ToolRegistry = null,
-    /// Pointer to the App's `plugin_manager`. Set on every by-value copy
-    /// of the App so the dispatcher can reach the live field, no matter
-    /// how many times the App has been copied through the run call
-    /// chain (`init` → `initRuntime` → `run`). Without this, plugin
-    /// tool dispatch segfaults because the `PluginToolKey.manager`
-    /// indirection slot is written from `initRuntime`'s scope — which
-    /// is freed by the time `run` calls `executor.runOne`.
-    plugin_manager: ?*lua_mod.PluginManager = null,
-    /// The App-owned `LaneBridge` the `lane` tool posts its requests across,
-    /// plus the requesting `*Agent` (as `*anyopaque`) that identifies the lane
-    /// for the role guard and completion routing. Both are threaded through
-    /// the slot in `produceOutput`; null disables the lane tool (headless).
-    lane_bridge: ?*lane_bridge.LaneBridge = null,
-    lane_requester: ?*anyopaque = null,
-    skills: []const skill_mod.Skill = &.{},
     /// Per-turn or per-batch scratch allocator (e.g. TurnArena) for temporary JSON
     /// parsing, schema validation, and argument coercion. Defaults to gpa when unspecified.
     scratch_allocator: std.mem.Allocator,
+    /// Everything the tools reach at run time (background manager, lane
+    /// bridge + requester, skills, plugin manager, MCP manager, classifier
+    /// URL), built once in `init` and handed to every `Tool.run` through
+    /// `Env.ctx`. Owned pointers are borrowed from the caller and must
+    /// outlive the executor.
+    ctx: tools.ToolContext = .{},
 
     pub const InitOptions = struct {
         gpa: std.mem.Allocator,
@@ -224,14 +203,17 @@ pub const ExecutorService = struct {
             .io = options.io,
             .cwd = options.cwd,
             .contained = options.contained,
-            .bash_classifier_url = options.bash_classifier_url,
-            .background = options.background,
-            .mcp_manager = options.mcp_manager,
             .tool_registry = options.tool_registry,
-            .plugin_manager = options.plugin_manager,
-            .lane_bridge = options.lane_bridge,
-            .lane_requester = options.lane_requester,
-            .skills = options.skills,
+            .ctx = .{
+                .bash_classifier_url = options.bash_classifier_url,
+                .background_manager = if (options.background) |bg| bg.manager else null,
+                .owner_generation = if (options.background) |bg| bg.owner_generation else 1,
+                .mcp_manager = options.mcp_manager,
+                .plugin_manager = options.plugin_manager,
+                .lane_bridge = options.lane_bridge,
+                .lane_requester = options.lane_requester,
+                .skills = options.skills,
+            },
         };
     }
 
@@ -250,11 +232,11 @@ pub const ExecutorService = struct {
         // Shell-safety classifier URL for plugin `zay.run_bash`/`run_shell`
         // calls: set for the WHOLE batch, not just `produceOutput` — the
         // observers below fire plugin event callbacks (emitEvent → Lua) after
-        // produceOutput's slots are unwound, and a handler shelling out there
+        // produceOutput's dispatch window, and a handler shelling out there
         // must classify with the same remote classifier as the builtin tool.
         // Null (headless/tests) keeps the always-armed local matcher.
         const prev_classifier_url = lua_mod.bridge.bash_classifier_url_slot;
-        lua_mod.bridge.bash_classifier_url_slot = self.bash_classifier_url;
+        lua_mod.bridge.bash_classifier_url_slot = self.ctx.bash_classifier_url;
         defer lua_mod.bridge.bash_classifier_url_slot = prev_classifier_url;
 
         // Plugin cwd slot for the whole batch: observer-driven event callbacks
@@ -296,16 +278,16 @@ pub const ExecutorService = struct {
     /// root, not the batch-start snapshot. No-op when no requester is attached
     /// (headless/tests) or when the workspace didn't change.
     fn rerootFromRequester(self: *ExecutorService) void {
-        const ptr = self.lane_requester orelse return;
+        const ptr = self.ctx.lane_requester orelse return;
         const agent: *agent_mod.Agent = @ptrCast(@alignCast(ptr));
         self.cwd = agent.effectiveCwd();
-        // Keep plugin_cwd_slot in sync: private fn, single call site inside
-        // runAll's slot window by construction.
+        // The Lua bridge binding is the derived per-batch window set by
+        // runAll — refresh it along with the cwd.
         lua_mod.bridge.plugin_cwd_slot = self.cwd;
     }
 
     fn shouldRejectUnsafeShell(self: *ExecutorService, call: ai.ToolCall, observer: anytype) !bool {
-        return executor_safety.shouldRejectUnsafeShell(self.gpa, self.io, self.bash_classifier_url, self.cwd, call, observer);
+        return executor_safety.shouldRejectUnsafeShell(self.gpa, self.io, self.ctx.bash_classifier_url, self.cwd, call, observer);
     }
 
     /// Run one ToolCall. Tool arguments are validated against the tool's
@@ -336,16 +318,14 @@ pub const ExecutorService = struct {
     /// Resolve the `tools.Schema` for a call across all three channels.
     /// Returns null when the tool is unknown — validation is then skipped.
     fn resolveSchema(self: *ExecutorService, call: ai.ToolCall) ?tools.Schema {
-        return executor_validation.resolveSchema(self.tool_registry, self.mcp_manager, self.gpa, call);
+        return executor_validation.resolveSchema(self.tool_registry, self.ctx.mcp_manager, self.gpa, call);
     }
 
     /// Dispatch a call that passed validation. MCP calls route through the
-    /// manager; plugin and builtin calls share the registry-backed path.
+    /// manager; plugin, builtin, AND MCP calls all share the registry-backed
+    /// path (MCP tools are materialized as `Tool` records by
+    /// `mcp/registry_bridge.zig` and synced into the registry on connect).
     fn dispatchCall(self: *ExecutorService, call: ai.ToolCall) !ToolResult {
-        // MCP tool calls are dispatched through the MCP manager, not the tool registry.
-        if (std.mem.startsWith(u8, call.name, "mcp__")) {
-            return self.runMcpTool(call);
-        }
         // Plugin and builtin tool calls share one path: the registry's
         // `all` slice backs a single lookup, and the matched tool's `run`
         // callback routes through whatever `userdata` it carries (bash
@@ -385,122 +365,35 @@ pub const ExecutorService = struct {
         });
     }
 
-    /// Route an `mcp__` tool call to the MCP transport.
-    /// Tool name format: `mcp__<server_name>__<tool_name>`
-    fn runMcpTool(self: *ExecutorService, call: ai.ToolCall) !ToolResult {
-        const manager = self.mcp_manager orelse return self.runFailure(call, error.McpNotConfigured);
-
-        // Parse server name and tool name from `mcp__server__tool`
-        const prefix = "mcp__";
-        if (!std.mem.startsWith(u8, call.name, prefix)) return self.runFailure(call, error.InvalidMcpToolName);
-        const rest = call.name[prefix.len..];
-        const sep = std.mem.indexOfScalar(u8, rest, '_') orelse
-            return self.runFailure(call, error.InvalidMcpToolName);
-        // Skip the second underscore
-        const after_server = rest[sep + 1 ..];
-        if (after_server.len == 0 or after_server[0] != '_') return self.runFailure(call, error.InvalidMcpToolName);
-        const server_name = rest[0..sep];
-        const tool_name = after_server[1..];
-
-        // Find the client
-        const client = for (manager.clients.items) |*c| {
-            if (c.status() == .connected and std.mem.eql(u8, c.name, server_name)) break c;
-        } else return self.runFailure(call, error.McpServerNotFound);
-
-        // Call the tool
-        const result_text = client.callTool(self.io, tool_name, call.arguments) catch |err| {
-            return self.runFailure(call, err);
-        };
-
-        const content = if (result_text.len > 0) blk: {
-            break :blk result_text;
-        } else blk: {
-            self.gpa.free(result_text);
-            break :blk try self.gpa.dupe(u8, "(no output)");
-        };
-        errdefer self.gpa.free(content);
-        const display_label = try self.gpa.dupe(u8, tool_name);
-        errdefer self.gpa.free(display_label);
-        const display_body = try self.gpa.dupe(u8, content);
-        errdefer self.gpa.free(display_body);
-
-        // `ToolResult.init` dupes call_id/name (stderr stays null) and adopts
-        // the moved fields above on success.
-        return try ToolResult.init(self.gpa, .{
-            .call_id = call.call_id.slice(),
-            .name = call.name,
-            .content = content,
-            .display = .{ .label = display_label },
-            .display_body = display_body,
-        });
-    }
-
-    /// Source the tool's `Output`, routing a `run_in_background` bash call to the
-    /// `BackgroundManager` (which spawns the job and returns immediately) and
-    /// everything else through the tool registry (builtin + plugin, looked up
-    /// in one shot).
+    /// Source the tool's `Output`, routing a `run_in_background` bash call to
+    /// the `BackgroundManager` (which spawns the job and returns immediately)
+    /// and everything else through the tool registry (builtin + plugin, looked
+    /// up in one shot). Tool context (background manager, lane bridge, skills,
+    /// plugin manager) reaches the tool through `Env.ctx` — no ambient state.
     fn produceOutput(self: *ExecutorService, call: ai.ToolCall) tools.Error!tools.Output {
-        // The `lane` tool reaches the App-owned bridge + the requesting agent
-        // through a thread-local slot (the `Tool.run` signature is fixed and
-        // can't take a `*ExecutorService`). Set it around the WHOLE dispatch —
-        // both the registry branch below and the registry-less fallback — so a
-        // headless run never reads a stale slot, and restore in a defer so a
-        // panic doesn't leak a dangling pointer into the next call.
-        const prev_lane = lane_bridge.lane_bridge_slot;
-        lane_bridge.lane_bridge_slot = .{ .bridge = self.lane_bridge, .requester = self.lane_requester };
-        defer lane_bridge.lane_bridge_slot = prev_lane;
-
-        const prev_bg = background_tool.background_slot;
-        background_tool.background_slot = if (self.background) |bg|
-            .{ .manager = bg.manager, .owner_generation = bg.owner_generation }
-        else
-            .{};
-        defer background_tool.background_slot = prev_bg;
-
-        const prev_skills = skill_tool.skills_slot;
-        skill_tool.skills_slot = self.skills;
-        defer skill_tool.skills_slot = prev_skills;
         if (self.contained) {
             // Lane worker: route through `runContained`, which prepends the
             // shell containment guard before running (background or foreground).
             // This bypasses the registry so the fixed `Tool.run` signature —
             // shared with plugins — stays untouched.
             if (std.mem.eql(u8, call.name, tools.shell_tool.name)) {
-                const background_ctx: ?shell_tool.BackgroundCtx = if (self.background) |bg|
-                    .{ .manager = bg.manager, .owner_generation = bg.owner_generation }
+                const background_ctx: ?shell_impl.BackgroundCtx = if (self.ctx.background_manager) |manager|
+                    .{ .manager = manager, .owner_generation = self.ctx.owner_generation }
                 else
                     null;
-                return shell_tool.runContained(self.gpa, self.io, self.cwd, call.arguments, background_ctx);
+                return shell_impl.runContained(self.gpa, self.io, self.cwd, call.arguments, background_ctx);
             }
         }
-        if (self.background) |bg| {
-            if (std.mem.eql(u8, call.name, tools.shell_tool.name) and shell_tool.wantsBackground(self.gpa, call.arguments)) {
-                return shell_tool.runBackground(self.gpa, self.io, self.cwd, call.arguments, bg.manager, bg.owner_generation);
+        if (self.ctx.background_manager) |manager| {
+            if (std.mem.eql(u8, call.name, tools.shell_tool.name) and shell_impl.wantsBackground(self.gpa, call.arguments)) {
+                return shell_impl.runBackground(self.gpa, self.io, self.cwd, call.arguments, manager, self.ctx.owner_generation);
             }
         }
         if (self.tool_registry) |r| {
-            // Plugin tool dispatchers reach `*PluginManager` through a
-            // thread-local slot (the `Tool.run` signature is fixed and
-            // can't take a `*ExecutorService`). The slot must point at
-            // the live `self.plugin_manager` for the duration of the
-            // call — set it here, dispatch, then clear it in a defer
-            // so a panic doesn't leak a dangling pointer into the next
-            // call.
-            const prev = lua_mod.registry_bridge.plugin_manager_slot;
-            lua_mod.registry_bridge.plugin_manager_slot = self.plugin_manager;
-            const prev_cwd = lua_mod.bridge.plugin_cwd_slot;
-            lua_mod.bridge.plugin_cwd_slot = self.cwd;
-            const prev_classifier_url = lua_mod.bridge.bash_classifier_url_slot;
-            lua_mod.bridge.bash_classifier_url_slot = self.bash_classifier_url;
-            defer {
-                lua_mod.registry_bridge.plugin_manager_slot = prev;
-                lua_mod.bridge.plugin_cwd_slot = prev_cwd;
-                lua_mod.bridge.bash_classifier_url_slot = prev_classifier_url;
-            }
             const slice = try r.all(self.gpa);
-            return tools.runWith(slice, self.gpa, self.io, self.cwd, call.name, call.arguments);
+            return tools.runWith(slice, self.gpa, self.io, self.cwd, call.name, call.arguments, &self.ctx);
         }
-        return tools.run(self.gpa, self.io, self.cwd, call.name, call.arguments);
+        return tools.run(self.gpa, self.io, self.cwd, call.name, call.arguments, &self.ctx);
     }
 
     /// Validation error — the tool never ran; the model sent bad arguments.
@@ -580,7 +473,7 @@ test "ExecutorService runs bash and returns both channels" {
     const calls = [_]ai.ToolCall{
         .{
             .call_id = .{ .value = try gpa.dupe(u8, "call_0") },
-            .name = try gpa.dupe(u8, shell_tool.tool.name),
+            .name = try gpa.dupe(u8, tools.shell_tool.name),
             .arguments = try gpa.dupe(u8, "{\"command\":\"printf hello\",\"description\":\"Print hello\"}"),
         },
     };
@@ -615,7 +508,7 @@ test "executor runs pwsh and returns both channels" {
     const calls = [_]ai.ToolCall{
         .{
             .call_id = .{ .value = try gpa.dupe(u8, "call_0") },
-            .name = try gpa.dupe(u8, shell_tool.tool.name),
+            .name = try gpa.dupe(u8, tools.shell_tool.name),
             .arguments = try gpa.dupe(u8, "{\"command\":\"Write-Output hello\",\"description\":\"Print hello\"}"),
         },
     };
@@ -643,7 +536,7 @@ test "executor converts a tool execution error into a failed result" {
     var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp" });
     const call: ai.ToolCall = .{
         .call_id = .{ .value = try gpa.dupe(u8, "call_x") },
-        .name = try gpa.dupe(u8, shell_tool.tool.name),
+        .name = try gpa.dupe(u8, tools.shell_tool.name),
         .arguments = try gpa.dupe(u8, "{\"command\":\"search\",\"description\":\"search\"}"),
     };
     defer {
@@ -666,7 +559,7 @@ test "executor rejected shell result is failed and model-facing" {
     var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp" });
     const call: ai.ToolCall = .{
         .call_id = .{ .value = try gpa.dupe(u8, "call_reject") },
-        .name = try gpa.dupe(u8, shell_tool.tool.name),
+        .name = try gpa.dupe(u8, tools.shell_tool.name),
         .arguments = try gpa.dupe(u8, "{\"command\":\"rm -rf /\",\"description\":\"clean\"}"),
     };
     defer {
@@ -750,7 +643,7 @@ test "ExecutorService shouldRejectUnsafeShell consults the approval hook" {
     //    => the call is rejected.
     const unsafe_call = ai.ToolCall{
         .call_id = .{ .value = try gpa.dupe(u8, "call_2") },
-        .name = try gpa.dupe(u8, shell_tool.tool.name),
+        .name = try gpa.dupe(u8, tools.shell_tool.name),
         .arguments = try gpa.dupe(u8, "{\"command\":\"rm -rf /\",\"description\":\"clean\"}"),
     };
     defer {
@@ -782,12 +675,12 @@ test "ExecutorService.runAll errdefer cleanup exists" {
     const calls = [_]ai.ToolCall{
         .{
             .call_id = .{ .value = try gpa.dupe(u8, "call_0") },
-            .name = try gpa.dupe(u8, shell_tool.tool.name),
+            .name = try gpa.dupe(u8, tools.shell_tool.name),
             .arguments = try gpa.dupe(u8, "{\"command\":\"printf test\",\"description\":\"Test\"}"),
         },
         .{
             .call_id = .{ .value = try gpa.dupe(u8, "call_1") },
-            .name = try gpa.dupe(u8, shell_tool.tool.name),
+            .name = try gpa.dupe(u8, tools.shell_tool.name),
             .arguments = try gpa.dupe(u8, "{\"command\":\"printf fail\",\"description\":\"Fail\"}"),
         },
     };
@@ -836,19 +729,19 @@ const test_dummy_run: *const fn (
     io: std.Io,
     cwd: []const u8,
     args: []const u8,
-    userdata: *anyopaque,
+    env: tools.Env,
 ) tools.Error!tools.Output = struct {
     fn run(
         gpa: std.mem.Allocator,
         io: std.Io,
         cwd: []const u8,
         args: []const u8,
-        userdata: *anyopaque,
+        env: tools.Env,
     ) tools.Error!tools.Output {
         _ = io;
         _ = cwd;
         _ = args;
-        _ = userdata;
+        _ = env;
         const stdout = try gpa.dupe(u8, "ok");
         const stderr = try gpa.alloc(u8, 0);
         return .{ .stdout = stdout, .stderr = stderr, .code = 0 };
@@ -858,15 +751,15 @@ const test_dummy_run: *const fn (
 const test_dummy_display: *const fn (
     gpa: std.mem.Allocator,
     args: []const u8,
-    userdata: *anyopaque,
+    env: tools.Env,
 ) std.mem.Allocator.Error!tools.ToolDisplay = struct {
     fn display(
         gpa: std.mem.Allocator,
         args: []const u8,
-        userdata: *anyopaque,
+        env: tools.Env,
     ) std.mem.Allocator.Error!tools.ToolDisplay {
         _ = args;
-        _ = userdata;
+        _ = env;
         return .{ .label = try gpa.dupe(u8, "dummy") };
     }
 }.display;
@@ -942,7 +835,7 @@ test "valid bash call still dispatches after schema validation" {
     defer gpa.free(cwd);
     var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = cwd });
 
-    const call = try makeCall(gpa, "call_ok", shell_tool.tool.name, "{\"command\":\"printf ok\",\"description\":\"Print ok\"}");
+    const call = try makeCall(gpa, "call_ok", tools.shell_tool.name, "{\"command\":\"printf ok\",\"description\":\"Print ok\"}");
     defer {
         gpa.free(call.call_id.value);
         gpa.free(call.name);
@@ -964,7 +857,7 @@ test "valid pwsh call still dispatches after schema validation" {
     defer gpa.free(cwd);
     var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = cwd });
 
-    const call = try makeCall(gpa, "call_ok", shell_tool.tool.name, "{\"command\":\"Write-Output pwsh-ok\",\"description\":\"Print ok\"}");
+    const call = try makeCall(gpa, "call_ok", tools.shell_tool.name, "{\"command\":\"Write-Output pwsh-ok\",\"description\":\"Print ok\"}");
     defer {
         gpa.free(call.call_id.value);
         gpa.free(call.name);
@@ -981,7 +874,7 @@ test "executor rejects bash call with missing required argument" {
     const gpa = std.testing.allocator;
     var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp" });
 
-    const call = try makeCall(gpa, "call_v", shell_tool.tool.name, "{}");
+    const call = try makeCall(gpa, "call_v", tools.shell_tool.name, "{}");
     defer {
         gpa.free(call.call_id.value);
         gpa.free(call.name);
@@ -991,7 +884,7 @@ test "executor rejects bash call with missing required argument" {
     var result = try executor.runOne(call);
     defer result.deinit(gpa);
     try std.testing.expect(result.failed);
-    const prefix = try std.fmt.allocPrint(gpa, "Invalid arguments for tool '{s}'", .{shell_tool.tool.name});
+    const prefix = try std.fmt.allocPrint(gpa, "Invalid arguments for tool '{s}'", .{tools.shell_tool.name});
     defer gpa.free(prefix);
     try std.testing.expect(std.mem.indexOf(u8, result.content, prefix) != null);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "`command` is required") != null);
@@ -1001,7 +894,7 @@ test "executor rejects bash call with wrong type" {
     const gpa = std.testing.allocator;
     var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp" });
 
-    const call = try makeCall(gpa, "call_t", shell_tool.tool.name, "{\"command\":42}");
+    const call = try makeCall(gpa, "call_t", tools.shell_tool.name, "{\"command\":42}");
     defer {
         gpa.free(call.call_id.value);
         gpa.free(call.name);
@@ -1019,7 +912,7 @@ test "executor rejects bash call with invalid JSON" {
     const gpa = std.testing.allocator;
     var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp" });
 
-    const call = try makeCall(gpa, "call_j", shell_tool.tool.name, "{bad");
+    const call = try makeCall(gpa, "call_j", tools.shell_tool.name, "{bad");
     defer {
         gpa.free(call.call_id.value);
         gpa.free(call.name);
@@ -1124,7 +1017,12 @@ test "executor rejects MCP tool call with missing required field" {
     defer manager.deinit(std.testing.io);
     try addTestMcpSearchTool(gpa, &manager);
 
-    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp", .mcp_manager = &manager });
+    // MCP tools dispatch through the registry now — sync the records first.
+    var reg = try tools.ToolRegistry.init(gpa, tools.builtinRegistry());
+    defer reg.deinit(gpa);
+    try reg.syncMcpTools(gpa, &manager);
+
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp", .mcp_manager = &manager, .tool_registry = &reg });
 
     const call = try makeCall(gpa, "call_mcp", "mcp__test__search", "{}");
     defer {
@@ -1216,7 +1114,12 @@ test "executor rejects MCP tool call with wrong type" {
     defer manager.deinit(std.testing.io);
     try addTestMcpSearchTool(gpa, &manager);
 
-    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp", .mcp_manager = &manager });
+    // MCP tools dispatch through the registry now — sync the records first.
+    var reg = try tools.ToolRegistry.init(gpa, tools.builtinRegistry());
+    defer reg.deinit(gpa);
+    try reg.syncMcpTools(gpa, &manager);
+
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp", .mcp_manager = &manager, .tool_registry = &reg });
 
     const call = try makeCall(gpa, "call_mcp", "mcp__test__search", "{\"query\":42}");
     defer {
@@ -1237,7 +1140,12 @@ test "executor rejects MCP tool call with invalid JSON" {
     defer manager.deinit(std.testing.io);
     try addTestMcpSearchTool(gpa, &manager);
 
-    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp", .mcp_manager = &manager });
+    // MCP tools dispatch through the registry now — sync the records first.
+    var reg = try tools.ToolRegistry.init(gpa, tools.builtinRegistry());
+    defer reg.deinit(gpa);
+    try reg.syncMcpTools(gpa, &manager);
+
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp", .mcp_manager = &manager, .tool_registry = &reg });
 
     const call = try makeCall(gpa, "call_mcp", "mcp__test__search", "{bad");
     defer {
@@ -1317,7 +1225,7 @@ test "executor re-roots mid-batch after lane enter" {
 
     const calls = [_]ai.ToolCall{
         try makeCall(gpa, "call_enter", "lane", "{\"command\":\"enter\",\"lane\":\"abc\"}"),
-        try makeCall(gpa, "call_pwd", shell_tool.tool.name, "{\"command\":\"pwd\",\"description\":\"Show cwd\"}"),
+        try makeCall(gpa, "call_pwd", tools.shell_tool.name, "{\"command\":\"pwd\",\"description\":\"Show cwd\"}"),
     };
     defer for (calls) |c| {
         gpa.free(c.call_id.value);
@@ -1402,7 +1310,7 @@ test "executor re-roots back on lane leave" {
     const calls = [_]ai.ToolCall{
         try makeCall(gpa, "call_enter", "lane", "{\"command\":\"enter\",\"lane\":\"abc\"}"),
         try makeCall(gpa, "call_leave", "lane", "{\"command\":\"leave\",\"lane\":\"abc\"}"),
-        try makeCall(gpa, "call_pwd", shell_tool.tool.name, "{\"command\":\"pwd\",\"description\":\"Show cwd\"}"),
+        try makeCall(gpa, "call_pwd", tools.shell_tool.name, "{\"command\":\"pwd\",\"description\":\"Show cwd\"}"),
     };
     defer for (calls) |c| {
         gpa.free(c.call_id.value);

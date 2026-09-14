@@ -56,12 +56,12 @@ const ToolCallBuilder = struct {
     /// — the agent never sees an empty id.
     /// Arguments are sanitised (markdown fences stripped, empty → "{}")
     /// so downstream consumers (executor, display) always see valid JSON.
-    fn toToolCall(self: *ToolCallBuilder, gpa: std.mem.Allocator, tool_call_seq: *u64) !ai.ToolCall {
+    fn toToolCall(self: *ToolCallBuilder, gpa: std.mem.Allocator, id_seq: *u64) !ai.ToolCall {
         const id = if (self.id.items.len > 0)
             try self.id.toOwnedSlice(gpa)
         else id_blk: {
-            const minted = try std.fmt.allocPrint(gpa, "call_{d}", .{tool_call_seq.*});
-            tool_call_seq.* += 1;
+            const minted = try std.fmt.allocPrint(gpa, "call_{d}", .{id_seq.*});
+            id_seq.* += 1;
             break :id_blk minted;
         };
         const raw_args = try self.arguments.toOwnedSlice(gpa);
@@ -97,15 +97,11 @@ pub const ToolCallStream = struct {
     /// are dropped rather than executed so the remaining calls can still
     /// complete the turn. The hard `tool_call_array_cap` still aborts if it
     /// would overflow the fixed remap arrays.
-    max_calls: u32 = 16,
+    limits: stream_part.StreamLimits = .{},
     /// Number of tool-call deltas dropped because their logical index was
     /// at or above `max_calls`. Surfaced at the end of the stream so the
     /// caller can decide whether to inform the model.
     dropped: u32 = 0,
-    /// Model id, borrowed and used only so the over-cap reject log can name
-    /// which model tripped the cap. Empty in tests / when the caller has no
-    /// model id; never affects parsing behaviour.
-    model: []const u8 = "",
 
     fn physicalSlot(self: *const ToolCallStream, logical: u32) u32 {
         return if (self.is_remapped[logical]) self.remapped_slot[logical] else logical;
@@ -117,13 +113,13 @@ pub const ToolCallStream = struct {
     }
 };
 
+/// Uniform stream-adapter entry name for the transport (alias of `readStream`).
+pub const run = readStream;
 pub fn readStream(
     gpa: std.mem.Allocator,
     reader: *std.Io.Reader,
     observer: anytype,
-    tool_call_seq: *u64,
-    max_calls: u32,
-    model: []const u8,
+    env: stream_part.StreamEnv,
 ) !ai.Turn {
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(gpa);
@@ -135,7 +131,7 @@ pub fn readStream(
     // (not `capacity == 0`) are the reliable one-shot signal.
     var content_sized: bool = false;
     var reasoning_sized: bool = false;
-    var stream: ToolCallStream = .{ .max_calls = max_calls, .model = model };
+    var stream: ToolCallStream = .{ .limits = env.limits };
     defer stream.deinit(gpa);
 
     // Parse and apply each chunk inline (rather than via `processStreamChunk`)
@@ -181,7 +177,7 @@ pub fn readStream(
             if (builder.id.items.len > 0 or builder.arguments.items.len > 0) {
                 log.warn(
                     "readStream.nameless_tool_call_dropped builder[{d}] id_len={d} args_len={d} model={s} — tool_call section likely truncated by the provider",
-                    .{ i, builder.id.items.len, builder.arguments.items.len, stream.model },
+                    .{ i, builder.id.items.len, builder.arguments.items.len, stream.limits.model_label },
                 );
             }
             continue;
@@ -190,10 +186,10 @@ pub fn readStream(
             "readStream.builder[{d}] name={s} id_len={d} args_len={d}",
             .{ i, builder.name.items, builder.id.items.len, builder.arguments.items.len },
         );
-        try blocks.append(gpa, .{ .tool_call = try builder.toToolCall(gpa, tool_call_seq) });
+        try blocks.append(gpa, .{ .tool_call = try builder.toToolCall(gpa, env.id_seq) });
     }
     if (stream.dropped > 0) {
-        log.warn("readStream.dropped dropped={d} max_calls={d} model={s}", .{ stream.dropped, stream.max_calls, stream.model });
+        log.warn("readStream.dropped dropped={d} max_calls={d} model={s}", .{ stream.dropped, stream.limits.max_parallel_calls, stream.limits.model_label });
     }
     log.info("readStream.done content_len={d} reasoning_len={d} blocks={d} finish_reason={s}", .{ content.items.len, reasoning.items.len, blocks.items.len, if (finish_reason) |f| @tagName(f) else "none" });
     return .{ .assistant = .{ .assistant = .{ .content = try blocks.toOwnedSlice(gpa) } }, .usage = usage, .finish_reason = finish_reason };
@@ -516,8 +512,8 @@ fn parseToolCallObject(
             const index = try nextInteger(scanner);
             if (index < 0) return error.InvalidToolCallIndex;
             if (index >= tool_call_array_cap) return error.TooManyToolCalls;
-            if (index >= stream.max_calls) {
-                log.warn("parseToolCall.reject index={d} exceeds max_parallel_tool_calls={d} model={s}", .{ index, stream.max_calls, stream.model });
+            if (index >= stream.limits.max_parallel_calls) {
+                log.warn("parseToolCall.reject index={d} exceeds max_parallel_tool_calls={d} model={s}", .{ index, stream.limits.max_parallel_calls, stream.limits.model_label });
                 stream.dropped += 1;
                 accept = false;
                 continue;
@@ -554,8 +550,8 @@ fn parseToolCallObject(
     const logical = resolved_index orelse blk: {
         const next: u32 = @intCast(stream.builders.items.len);
         if (next >= tool_call_array_cap) return error.TooManyToolCalls;
-        if (next >= stream.max_calls) {
-            log.warn("parseToolCall.reject index={d} exceeds max_parallel_tool_calls={d} model={s}", .{ next, stream.max_calls, stream.model });
+        if (next >= stream.limits.max_parallel_calls) {
+            log.warn("parseToolCall.reject index={d} exceeds max_parallel_tool_calls={d} model={s}", .{ next, stream.limits.max_parallel_calls, stream.limits.model_label });
             stream.dropped += 1;
             accept = false;
             break :blk 0;
@@ -599,8 +595,8 @@ fn parseToolCallObject(
             // past max_parallel_tool_calls while `dropped` stays 0 (the literal
             // index is always 0, so the line-`index` guard never trips) and
             // every forked builder would be emitted by the final assembly loop.
-            if (new_slot >= stream.max_calls) {
-                log.warn("parseToolCall.fork.reject new_slot={d} exceeds max_parallel_tool_calls={d} model={s}", .{ new_slot, stream.max_calls, stream.model });
+            if (new_slot >= stream.limits.max_parallel_calls) {
+                log.warn("parseToolCall.fork.reject new_slot={d} exceeds max_parallel_tool_calls={d} model={s}", .{ new_slot, stream.limits.max_parallel_calls, stream.limits.model_label });
                 stream.dropped += 1;
                 return; // `pending` freed by the defer above; do not append or remap.
             }
@@ -784,7 +780,7 @@ test "readStream drops tool calls whose index exceeds max_calls" {
         "data: [DONE]\n";
     var reader: std.Io.Reader = .fixed(stream);
     var tool_call_seq: u64 = 0;
-    var turn = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 1, "ling-3.0-flash");
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), .{ .limits = .{ .max_parallel_calls = 1, .model_label = "ling-3.0-flash" }, .id_seq = &tool_call_seq });
     defer turn.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 0), turn.assistant.assistant.content.len);
 }
@@ -802,7 +798,7 @@ test "readStream drops index-less tool calls beyond max_calls" {
         "data: [DONE]\n";
     var reader: std.Io.Reader = .fixed(stream);
     var tool_call_seq: u64 = 0;
-    var turn = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 1, "ling-3.0-flash");
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), .{ .limits = .{ .max_parallel_calls = 1, .model_label = "ling-3.0-flash" }, .id_seq = &tool_call_seq });
     defer turn.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 1), turn.assistant.assistant.content.len);
     try std.testing.expect(turn.assistant.assistant.content[0] == .tool_call);
@@ -825,7 +821,7 @@ test "readStream drops forked tool calls beyond max_calls (provider reuses index
         "data: [DONE]\n";
     var reader: std.Io.Reader = .fixed(stream);
     var tool_call_seq: u64 = 0;
-    var turn = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 1, "ling-3.0-flash");
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), .{ .limits = .{ .max_parallel_calls = 1, .model_label = "ling-3.0-flash" }, .id_seq = &tool_call_seq });
     defer turn.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 1), turn.assistant.assistant.content.len);
     try std.testing.expect(turn.assistant.assistant.content[0] == .tool_call);
@@ -844,7 +840,7 @@ test "readStream surfaces finish_reason from the final chunk" {
         "data: [DONE]\n";
     var reader: std.Io.Reader = .fixed(stream);
     var tool_call_seq: u64 = 0;
-    var turn = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 16, "deepseek-v4-flash");
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), .{ .limits = .{ .max_parallel_calls = 16, .model_label = "deepseek-v4-flash" }, .id_seq = &tool_call_seq });
     defer turn.deinit(gpa);
     try std.testing.expectEqual(ai.FinishReason.length, turn.finish_reason.?);
     try std.testing.expectEqual(@as(usize, 1), turn.assistant.assistant.content.len);
@@ -862,7 +858,7 @@ test "readStream finish_reason accumulates last-wins across chunks" {
         "data: [DONE]\n";
     var reader: std.Io.Reader = .fixed(stream);
     var tool_call_seq: u64 = 0;
-    var turn = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 16, "test-model");
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), .{ .limits = .{ .max_parallel_calls = 16, .model_label = "test-model" }, .id_seq = &tool_call_seq });
     defer turn.deinit(gpa);
     try std.testing.expectEqual(ai.FinishReason.length, turn.finish_reason.?);
 
@@ -870,7 +866,7 @@ test "readStream finish_reason accumulates last-wins across chunks" {
         "data: {\"choices\":[{\"finish_reason\":\"server_overloaded\",\"delta\":{}}]}\n" ++
         "data: [DONE]\n";
     var unknown_reader: std.Io.Reader = .fixed(unknown);
-    var unknown_turn = try readStream(gpa, &unknown_reader, ai.streamNoop(), &tool_call_seq, 16, "test-model");
+    var unknown_turn = try readStream(gpa, &unknown_reader, ai.streamNoop(), .{ .limits = .{ .max_parallel_calls = 16, .model_label = "test-model" }, .id_seq = &tool_call_seq });
     defer unknown_turn.deinit(gpa);
     try std.testing.expectEqual(ai.FinishReason.other, unknown_turn.finish_reason.?);
 
@@ -878,7 +874,7 @@ test "readStream finish_reason accumulates last-wins across chunks" {
         "data: {\"choices\":[{\"finish_reason\":null,\"delta\":{\"content\":\"x\"}}]}\n" ++
         "data: [DONE]\n";
     var none_reader: std.Io.Reader = .fixed(none);
-    var none_turn = try readStream(gpa, &none_reader, ai.streamNoop(), &tool_call_seq, 16, "test-model");
+    var none_turn = try readStream(gpa, &none_reader, ai.streamNoop(), .{ .limits = .{ .max_parallel_calls = 16, .model_label = "test-model" }, .id_seq = &tool_call_seq });
     defer none_turn.deinit(gpa);
     try std.testing.expectEqual(@as(?ai.FinishReason, null), none_turn.finish_reason);
 }
@@ -895,7 +891,7 @@ test "readStream drops a nameless tool call that streamed arguments" {
         "data: [DONE]\n";
     var reader: std.Io.Reader = .fixed(stream);
     var tool_call_seq: u64 = 0;
-    var turn = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 16, "test-model");
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), .{ .limits = .{ .max_parallel_calls = 16, .model_label = "test-model" }, .id_seq = &tool_call_seq });
     defer turn.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 0), turn.assistant.assistant.content.len);
     try std.testing.expectEqual(ai.FinishReason.tool_calls, turn.finish_reason.?);
@@ -911,7 +907,7 @@ test "readStream tolerates non-string finish_reason garbage from a proxy" {
         "data: [DONE]\n";
     var reader: std.Io.Reader = .fixed(stream);
     var tool_call_seq: u64 = 0;
-    var turn = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 16, "test-model");
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), .{ .limits = .{ .max_parallel_calls = 16, .model_label = "test-model" }, .id_seq = &tool_call_seq });
     defer turn.deinit(gpa);
     try std.testing.expectEqual(@as(?ai.FinishReason, null), turn.finish_reason);
     try std.testing.expectEqualStrings("partial", turn.assistant.assistant.content[0].text.text);
@@ -1058,7 +1054,7 @@ test "readStream tolerates DashScope null id/name on tool-call continuation delt
         "data: [DONE]\n";
     var reader: std.Io.Reader = .fixed(stream);
     var tool_call_seq: u64 = 0;
-    var turn = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 16, "qwen3-8-27b");
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), .{ .limits = .{ .max_parallel_calls = 16, .model_label = "qwen3-8-27b" }, .id_seq = &tool_call_seq });
     defer turn.deinit(gpa);
 
     // Reasoning must have streamed into the turn.
@@ -1088,7 +1084,7 @@ test "readStream tolerates null tool_calls in keep-alive deltas alongside reason
         "data: [DONE]\n";
     var reader: std.Io.Reader = .fixed(stream);
     var tool_call_seq: u64 = 0;
-    var turn = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 16, "qwen3-8-27b");
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), .{ .limits = .{ .max_parallel_calls = 16, .model_label = "qwen3-8-27b" }, .id_seq = &tool_call_seq });
     defer turn.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 2), turn.assistant.assistant.content.len);

@@ -158,6 +158,27 @@ pub fn clipEffortForModel(model: []const u8, label: ?[]const u8) ?[]const u8 {
     return l; // low / medium / none / xhigh — already valid for Qwen
 }
 
+/// THE composition of the two clipping layers (dialect x model), in this
+/// order: the dialect rewrites labels its wire format rejects, then the model
+/// layer clips labels the specific model rejects. Both wire serializers call
+/// this — never re-compose `wireEffortLabel` + `clipEffortForModel` by hand,
+/// the order is the invariant that makes Ollama+Qwen both work.
+pub fn resolveEffortLabel(model: []const u8, dialect: ai.WireDialect, effort: ai.ReasoningEffort) ?[]const u8 {
+    return clipEffortForModel(model, wireEffortLabel(dialect, effort));
+}
+
+test "resolveEffortLabel composes dialect then model clipping in order" {
+    // Minimal dialect rewrites xhigh -> max; a Qwen model then clips max ->
+    // medium. Reversing the layers would produce a different answer, so this
+    // pin guards the order, not just the outcome.
+    try std.testing.expectEqualStrings("medium", resolveEffortLabel("Qwen/Qwen3-32B", .minimal, .xhigh).?);
+    // A non-Qwen model on the same dialect keeps the dialect-rewritten label.
+    try std.testing.expectEqualStrings("max", resolveEffortLabel("gpt-5", .minimal, .xhigh).?);
+    // OpenAI dialect passes `high` through; Qwen clips it to medium.
+    try std.testing.expectEqualStrings("medium", resolveEffortLabel("Qwen/Qwen3-32B", .openai, .high).?);
+    try std.testing.expectEqualStrings("high", resolveEffortLabel("gpt-5", .openai, .high).?);
+}
+
 // Dialect layer only: wireEffortLabel knows nothing about models. The `.dashscope`
 // dialect does NOT clip on its own (that constraint belongs to the model layer);
 // `.minimal` (Ollama) rewrites the two labels its strict validator rejects:

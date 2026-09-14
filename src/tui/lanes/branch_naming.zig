@@ -49,13 +49,13 @@ pub fn renameLaneBranch(app: *App, lane: *Thread, slug: []const u8) !bool {
 
 /// Copy the tail of the current lane's conversation (user + agent text,
 /// oldest first) as naming context for a lane forked from it.
-pub fn captureLaneContext(app: *App, max: usize) ![][]u8 {
+pub fn captureLaneContext(app: *App, lane: *Thread, max: usize) ![][]u8 {
     var out: std.ArrayList([]u8) = .empty;
     errdefer {
         for (out.items) |message| app.gpa.free(message);
         out.deinit(app.gpa);
     }
-    const messages = app.thread.transcript.messages.items;
+    const messages = lane.transcript.messages.items;
     var index = messages.len;
     while (index > 0 and out.items.len < max) {
         index -= 1;

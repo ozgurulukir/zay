@@ -496,4 +496,3 @@ pub fn fileInfo(L: ?*c.lua_State) callconv(.c) c_int {
     _ = c.lua_setfield(L_ptr, -2, "mime_type");
     return 1;
 }
-

@@ -8,21 +8,23 @@ const c = @import("c");
 const State = @import("state.zig").State;
 
 /// Thread-local override for the working directory a plugin tool runs in.
-/// Fed from `ExecutorService.cwd` = `Agent.effectiveCwd()` (lane worktree OR
-/// `/resume` session cwd), set in two windows: around each plugin dispatch in
-/// `produceOutput`, and around the whole `runAll` for event callbacks. Outside
-/// these windows (e.g. `init.lua` load) callers fall back to the process cwd
-/// via `resolvePluginCwd`. Lives here (not `registry_bridge.zig`) because
-/// `plugin_api.zig` imports this leaf module — placing it here avoids an import
-/// cycle.
+/// A DERIVED binding of `ExecutorService.cwd` (= `Agent.effectiveCwd()`,
+/// lane worktree OR `/resume` session cwd): written
+/// only by `ExecutorService.runAll` entry (covers observer-driven plugin
+/// event callbacks, which fire outside the dispatch window) and refreshed by
+/// `rerootFromRequester` on mid-batch lane ops. Outside these windows (e.g.
+/// `init.lua` load) callers fall back to the process cwd via
+/// `resolvePluginCwd`. Lives here (not `registry_bridge.zig`) because
+/// `plugin_api.zig` imports this leaf module — placing it here avoids an
+/// import cycle.
 pub threadlocal var plugin_cwd_slot: ?[]const u8 = null;
 
 /// Thread-local carrying the remote shell-safety classifier URL to the Lua C
 /// boundary, so `zay.run_bash`/`zay.run_shell` gate plugin shell execution
 /// through the same classifier as the builtin tool (`bash_safety.classify`).
-/// Set by the executor around the whole `runAll` (covers observer-driven
-/// plugin event callbacks) and re-asserted around each plugin dispatch. Lives
-/// here beside `plugin_cwd_slot` for the same import-cycle reason.
+/// A DERIVED binding of `ToolContext.bash_classifier_url`: written only by
+/// `ExecutorService.runAll` entry, for the same observer-window reason as
+/// `plugin_cwd_slot`. Lives here beside it for the same import-cycle reason.
 pub threadlocal var bash_classifier_url_slot: ?[]const u8 = null;
 
 /// Resolved working directory for a plugin bridge: either a borrow of

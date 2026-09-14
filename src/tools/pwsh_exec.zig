@@ -331,6 +331,10 @@ fn findOnPath(io: std.Io, exe: []const u8) ?[]const u8 {
     const path_value = map.get("PATH") orelse return null;
     var it = std.mem.tokenizeScalar(u8, path_value, ';');
     while (it.next()) |dir| {
+        // PATH is user-controlled and may contain relative entries; resolving
+        // those against the cwd would let a stray directory impersonate the
+        // shell, so only absolute entries are searched.
+        if (!std.fs.path.isAbsolute(dir)) continue;
         const candidate = std.fs.path.join(gpa, &.{ dir, exe }) catch continue;
         defer gpa.free(candidate);
         if (std.Io.Dir.accessAbsolute(io, candidate, .{})) |_| {

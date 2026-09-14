@@ -33,11 +33,38 @@ pub fn isSuccess(status: u16) bool {
 
 /// Pure head-cut for log lines: bodies at or under `log_head_bytes_max` pass
 /// through verbatim (no allocation, no marker); longer bodies are cut at the
-/// limit. The tail-aware variant in `openai_compatible.logBytes` handles the
-/// richer tools-recovery case and shares the same budgets.
+/// Pure head-cut for log lines: bodies at or under `log_head_bytes_max` pass
+/// through verbatim (no allocation, no marker); longer bodies are cut at the
+/// limit. See `logBytesToolsTail` for the richer tools-recovery variant.
 pub fn logBytesHead(bytes: []const u8) []const u8 {
     if (bytes.len <= log_head_bytes_max) return bytes;
     return bytes[0..log_head_bytes_max];
+}
+
+/// Tail-aware log truncation: when the body exceeds `log_head_bytes_max`,
+/// keep the head AND append a tail slice so the `tools` array (which
+/// serializes after `messages` and is usually past the head) stays visible
+/// when triaging "the model can't call tools" reports. The tail is located
+/// by finding `"tools":` in the full body; if absent (or already inside the
+/// head), a plain `[...{n} more bytes]` ellipsis is used.
+///
+/// Returns either `bytes` verbatim (short body, or long body without a
+/// tools array past the head — caller frees nothing) or a freshly
+/// allocated slice (caller frees via `gpa` when `result.ptr != bytes.ptr`).
+pub fn logBytesToolsTail(gpa: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    const limit = log_head_bytes_max;
+    if (bytes.len <= limit) return bytes;
+    if (std.mem.indexOf(u8, bytes, "\"tools\":")) |pos| {
+        if (pos >= limit) {
+            const tail_end = @min(bytes.len, pos + log_tail_bytes_max);
+            return std.fmt.allocPrint(gpa, "{s}\n   [...{d} bytes truncated...]\n   {s}", .{
+                bytes[0..limit],
+                bytes.len - limit,
+                bytes[pos..tail_end],
+            });
+        }
+    }
+    return std.fmt.allocPrint(gpa, "{s}\n   [...{d} more bytes]", .{ bytes[0..limit], bytes.len - limit });
 }
 
 test "isSuccess accepts exactly the 2xx band" {
@@ -55,6 +82,57 @@ test "logBytesHead passes short bodies and cuts at the shared limit" {
     const cut = logBytesHead(&long);
     try std.testing.expectEqual(log_head_bytes_max, cut.len);
     try std.testing.expect(cut.ptr == long[0..].ptr);
+}
+
+test "logBytesToolsTail passes short bodies through untouched (no allocation)" {
+    const gpa = std.testing.allocator;
+    const short = "hello world";
+    const out = try logBytesToolsTail(gpa, short);
+    // Pointer equality proves no allocation happened — the slice is aliased.
+    try std.testing.expect(out.ptr == short.ptr);
+    try std.testing.expectEqualStrings(short, out);
+}
+
+test "logBytesToolsTail truncation surfaces the tools array past the head" {
+    const gpa = std.testing.allocator;
+
+    // Build a ~20KB body: ~13KB of message filler, then the `tools` array the
+    // old head-only truncation would have hidden. JSON key order is
+    // model → messages → … → tools, so this mirrors a real payload.
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try body.appendSlice(gpa, "{\"model\":\"m\",\"messages\":[{\"role\":\"system\",\"content\":\"");
+    var filler: usize = 0;
+    while (filler < 13 * 1024) : (filler += 1) try body.append(gpa, 'x');
+    try body.appendSlice(gpa, "\"}],\"stream\":true,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"bash\"}}]}");
+
+    const out = try logBytesToolsTail(gpa, body.items);
+    defer if (out.ptr != body.items.ptr) gpa.free(out);
+
+    // The tools array is now visible despite living past the 12KB head.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"tools\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"name\":\"bash\"") != null);
+    // The truncation marker is present.
+    try std.testing.expect(std.mem.indexOf(u8, out, "bytes truncated") != null);
+    // And it was allocated (not aliased).
+    try std.testing.expect(out.ptr != body.items.ptr);
+}
+
+test "logBytesToolsTail truncation falls back to an ellipsis when there is no tools array" {
+    const gpa = std.testing.allocator;
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try body.appendSlice(gpa, "{\"model\":\"m\",\"content\":\"");
+    var filler: usize = 0;
+    while (filler < 13 * 1024) : (filler += 1) try body.append(gpa, 'x');
+    try body.appendSlice(gpa, "\"}");
+
+    const out = try logBytesToolsTail(gpa, body.items);
+    defer gpa.free(out);
+    try std.testing.expect(out.ptr != body.items.ptr);
+    try std.testing.expect(std.mem.indexOf(u8, out, "more bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"tools\":") == null);
 }
 
 // ── Retry / transient-failure helpers ────────────────────────────────────

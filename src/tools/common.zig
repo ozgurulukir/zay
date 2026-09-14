@@ -1,6 +1,9 @@
 const std = @import("std");
 
+const context_mod = @import("context.zig");
 const assert = std.debug.assert;
+
+pub const ToolContext = context_mod.ToolContext;
 
 pub const DisplayKind = enum(u8) { text, diff };
 
@@ -249,15 +252,24 @@ pub const ToolDisplay = struct {
     }
 };
 
+/// Per-call environment passed to every `Tool.run` / `Tool.display` callback.
+/// `ctx` is the executor-owned runtime context (background manager, lane
+/// bridge, skills, plugin manager — see `tools/context.zig`); `userdata` the
+/// per-tool state (plugin tools carry a `*PluginToolKey`; builtins leave it
+/// `undefined`). Together they replace the former per-tool thread-local slots.
+pub const Env = struct {
+    ctx: *const ToolContext,
+    userdata: *anyopaque = undefined,
+};
+
 /// A typed record describing one tool. The Tool registry in `tools.zig`
 /// is a slice of these; it is the single source of truth for what tools
 /// exist. Display policy (Expand-by-default, render mode) is NOT carried
 /// here — that lives TUI-side.
 ///
-/// `userdata` is passed as the last argument to every callback so the
-/// same shared `*const fn` signature can route through per-tool state
-/// without resorting to a global mutable slot. Builtin tools pass
-/// `undefined` (it is never read); plugin tools pass a `*PluginToolKey`.
+/// `env` is passed as the last argument to every callback so the same shared
+/// `*const fn` signature can reach both the runtime context and per-tool
+/// state without ambient globals.
 pub const Tool = struct {
     name: []const u8,
     /// Raw description template. May contain `{{hsep}}` placeholders that
@@ -269,7 +281,7 @@ pub const Tool = struct {
         io: std.Io,
         cwd: []const u8,
         args: []const u8,
-        userdata: *anyopaque,
+        env: Env,
     ) Error!Output,
     /// Produce the human display metadata shown in the TUI's tool row.
     /// `label` is the collapsed summary; `expanded_label`, when present,
@@ -277,11 +289,12 @@ pub const Tool = struct {
     display: *const fn (
         gpa: std.mem.Allocator,
         args: []const u8,
-        userdata: *anyopaque,
+        env: Env,
     ) std.mem.Allocator.Error!ToolDisplay,
-    /// Optional per-tool context. Plugin tools use this to carry their
-    /// `(plugin_name, tool_name, manager)` key; builtin tools leave it
-    /// `undefined`. Borrowed; freed via `userdata_free` on registry teardown.
+    /// Optional per-tool state routed through `Env.userdata`. Plugin tools
+    /// use this to carry their `(plugin_name, tool_name)` key; builtin tools
+    /// leave it `undefined`. Borrowed; freed via `userdata_free` on registry
+    /// teardown.
     userdata: *anyopaque = undefined,
     /// Frees the heap allocation behind `userdata`. Null when the tool
     /// has no per-tool state (e.g. all builtins). The allocator matches
@@ -310,6 +323,54 @@ pub const Schema = struct {
     };
 
     pub const Kind = enum { string, integer, number, object, array, boolean };
+
+    /// Deep-copy the schema: every property string, the enum-value lists, and
+    /// the properties array are duplicated into `gpa`. Registry records that
+    /// must outlive the schema's original owner (MCP client tools surviving a
+    /// disconnect/reconnect) use this so the borrowed strings can never dangle.
+    pub fn clone(self: Schema, gpa: std.mem.Allocator) !Schema {
+        const props = try gpa.alloc(Property, self.properties.len);
+        errdefer gpa.free(props);
+        var built: usize = 0;
+        errdefer {
+            for (props[0..built]) |*prop| {
+                gpa.free(prop.name);
+                gpa.free(prop.description);
+                if (prop.enum_values) |ev| {
+                    for (ev) |v| gpa.free(v);
+                    gpa.free(ev);
+                }
+                if (prop.default_value) |dv| gpa.free(dv);
+            }
+        }
+        for (self.properties, 0..) |prop, i| {
+            props[i] = .{
+                .name = try gpa.dupe(u8, prop.name),
+                .kind = prop.kind,
+                .description = try gpa.dupe(u8, prop.description),
+                .required = prop.required,
+                .nullable = prop.nullable,
+                .enum_values = if (prop.enum_values) |ev| try cloneEnumValues(gpa, ev) else null,
+                .default_value = if (prop.default_value) |dv| try gpa.dupe(u8, dv) else null,
+            };
+            built = i + 1;
+        }
+        return .{ .properties = props };
+    }
+
+    fn cloneEnumValues(gpa: std.mem.Allocator, ev: []const []const u8) ![]const []const u8 {
+        const copy = try gpa.alloc([]const u8, ev.len);
+        errdefer gpa.free(copy);
+        var built: usize = 0;
+        errdefer {
+            for (copy[0..built]) |v| gpa.free(v);
+        }
+        for (ev, 0..) |v, i| {
+            copy[i] = try gpa.dupe(u8, v);
+            built = i + 1;
+        }
+        return copy;
+    }
 
     /// Free all owned slices in the schema's properties.
     pub fn deinit(self: *Schema, gpa: std.mem.Allocator) void {

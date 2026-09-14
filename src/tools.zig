@@ -13,6 +13,8 @@ pub const Output = common.Output;
 pub const DisplayKind = common.DisplayKind;
 pub const Error = common.Error;
 pub const Tool = common.Tool;
+pub const Env = common.Env;
+pub const ToolContext = common.ToolContext;
 pub const Schema = common.Schema;
 pub const ToolDisplay = common.ToolDisplay;
 
@@ -31,7 +33,11 @@ pub const builtinRegistry = registry_mod.builtin;
 
 /// The comptime-resolved shell tool (`pwsh` on Windows, `bash` elsewhere) and
 /// its model-facing name — the canonical bash↔pwsh switch lives in
-/// `registry.zig::shell_tool`. Re-exported so consumers never re-derive it.
+/// `registry.zig::shell_impl` / `shell_tool`. Re-exported so consumers never
+/// re-derive it: `shell_impl` carries the executor's dispatch namespace
+/// (`runContained` / `wantsBackground` / `runBackground` / `BackgroundCtx`),
+/// `shell_tool` the `Tool` record the model sees.
+pub const shell_impl = registry_mod.shell_impl;
 pub const shell_tool = registry_mod.shell_tool;
 pub const shellToolName = registry_mod.shell_tool.name;
 
@@ -41,12 +47,14 @@ pub fn run(
     cwd: []const u8,
     name: []const u8,
     arguments: []const u8,
+    ctx: *const common.ToolContext,
 ) Error!Output {
-    return runWith(builtinRegistry(), gpa, io, cwd, name, arguments);
+    return runWith(builtinRegistry(), gpa, io, cwd, name, arguments, ctx);
 }
 
 /// Dispatch a tool by name through a registry slice. Used by the executor
-/// after it has resolved which registry owns the call.
+/// after it has resolved which registry owns the call. `ctx` flows to the
+/// tool through `Env` — the executor-owned runtime context.
 pub fn runWith(
     tools: []const Tool,
     gpa: std.mem.Allocator,
@@ -54,9 +62,10 @@ pub fn runWith(
     cwd: []const u8,
     name: []const u8,
     arguments: []const u8,
+    ctx: *const common.ToolContext,
 ) Error!Output {
     const tool = lookupIn(tools, name) orelse return failFmt(gpa, 2, "unknown tool: {s}\n", .{name});
-    return tool.run(gpa, io, cwd, arguments, tool.userdata);
+    return tool.run(gpa, io, cwd, arguments, .{ .ctx = ctx, .userdata = tool.userdata });
 }
 
 /// Locate a tool by name in an arbitrary slice. Returns null when no

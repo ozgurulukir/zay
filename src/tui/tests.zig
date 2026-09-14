@@ -183,17 +183,25 @@ test "input text rows track the line count" {
         .cell_size = .{ .width = 10, .height = 20 },
     };
 
-    try std.testing.expectEqual(@as(u16, 1), try app.inputTextRows(ctx, 80));
+    const text = try app.peekInput();
+    defer app.gpa.free(text);
+    try std.testing.expectEqual(@as(u16, 1), input_mod.wrappedTextRows(ctx, text, 80));
 
     try app.inputs.input.insertSliceAtCursor("a\nb\nc");
-    try std.testing.expectEqual(@as(u16, 3), try app.inputTextRows(ctx, 80));
+    const text_3 = try app.peekInput();
+    defer app.gpa.free(text_3);
+    try std.testing.expectEqual(@as(u16, 3), input_mod.wrappedTextRows(ctx, text_3, 80));
 
     try app.inputs.input.insertSliceAtCursor("defgh");
-    try std.testing.expectEqual(@as(u16, 4), try app.inputTextRows(ctx, 4));
+    const text_4 = try app.peekInput();
+    defer app.gpa.free(text_4);
+    try std.testing.expectEqual(@as(u16, 4), input_mod.wrappedTextRows(ctx, text_4, 4));
 
     // The input keeps growing with the line count (no fixed cap).
     try app.inputs.input.insertSliceAtCursor("\n\n\n\n\n\n\n\n");
-    try std.testing.expectEqual(@as(u16, 12), try app.inputTextRows(ctx, 4));
+    const text_12 = try app.peekInput();
+    defer app.gpa.free(text_12);
+    try std.testing.expectEqual(@as(u16, 12), input_mod.wrappedTextRows(ctx, text_12, 4));
 }
 
 test "file picker selection replaces the active mention without corrupting input buffer" {
@@ -843,8 +851,8 @@ test "begin submit defers while a manual compact is pending and keeps the input"
 
     // A manual /compact is mid-flight: the summarizer will swap the context on
     // the UI thread, so a new turn must not race that reload.
-    agent.manual_compact_pending = true;
-    agent.manual_compact_started = true;
+    agent.compactor.manual_pending = true;
+    agent.compactor.manual_started = true;
 
     try app.inputs.input.insertSliceAtCursor("hello");
     try std.testing.expect(!try app.beginSubmit());
@@ -911,10 +919,10 @@ test "compact request appends an animated status row while the summary is produc
     // waiting row and appends the error notice — no lingering spinner that
     // could re-animate with a later turn.
     var spins: u32 = 0;
-    while (!agent.compactor.stateIs(.failed) and spins < 10_000) : (spins += 1) {
+    while (!agent.compactor.core.stateIs(.failed) and spins < 10_000) : (spins += 1) {
         std.testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
-    try std.testing.expect(agent.compactor.stateIs(.failed));
+    try std.testing.expect(agent.compactor.core.stateIs(.failed));
     try std.testing.expect(try compaction_lifecycle.drainManualCompactions(&app));
 
     messages = app.thread.transcript.messages.items;
@@ -1002,7 +1010,7 @@ test "spinner frame advances during manual compact with no active turn" {
     // waiting row and lane glyph. (A `.none` compaction client would make
     // `pollManualCompact` treat this as a torn-down client and abort it.)
     agent.compaction_client = .{ .openai_compatible = &client };
-    agent.manual_compact_pending = true;
+    agent.compactor.manual_pending = true;
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -1148,7 +1156,7 @@ test "begin submit queues while turn is in flight" {
     try std.testing.expectEqualStrings("later", app.thread.queued.items[0].text);
     try std.testing.expectEqual(@as(u32, 1), agent.message_queue.len());
     try std.testing.expectEqual(@as(usize, 0), app.inputs.input.buf.firstHalf().len);
-    try std.testing.expect(try app.applyAgentEvent(.{ .queued_messages_flushed = 1 }));
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .{ .queued_messages_flushed = 1 }));
     try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
     // Just the flushed user message; the spinner stays derived UI.
     try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
@@ -1172,7 +1180,14 @@ test "queued prompt draws above input at minimum input height" {
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    var input_widget: input_mod.InputWidget = .{ .app = &app };
+    var input_widget: input_mod.InputWidget = .{ .props = .{
+        .input_field = &app.inputs.input,
+        .input_text = try std.mem.concat(arena.allocator(), u8, &.{ app.inputs.input.buf.firstHalf(), app.inputs.input.buf.secondHalf() }),
+        .input_cursor = app.inputs.input.buf.firstHalf().len,
+        .input_wrap_width = &app.input_wrap_width,
+        .queued = app.thread.queued.items,
+        .queued_selection = app.nav.queued_selection,
+    } };
     const ctx: vxfw.DrawContext = .{
         .arena = arena.allocator(),
         .min = .{},
@@ -1218,7 +1233,14 @@ test "alt navigation and ctrl-steer drive the queued message line" {
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    var input_widget: input_mod.InputWidget = .{ .app = &app };
+    var input_widget: input_mod.InputWidget = .{ .props = .{
+        .input_field = &app.inputs.input,
+        .input_text = try std.mem.concat(arena.allocator(), u8, &.{ app.inputs.input.buf.firstHalf(), app.inputs.input.buf.secondHalf() }),
+        .input_cursor = app.inputs.input.buf.firstHalf().len,
+        .input_wrap_width = &app.input_wrap_width,
+        .queued = app.thread.queued.items,
+        .queued_selection = app.nav.queued_selection,
+    } };
     const ctx: vxfw.DrawContext = .{
         .arena = arena.allocator(),
         .min = .{},
@@ -2319,11 +2341,11 @@ test "empty text deltas do not create selectable messages" {
     try app.inputs.input.insertSliceAtCursor("hello");
     _ = try app.beginSubmit();
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .response_delta = "" }));
+    try std.testing.expect(!try app.applyAgentEvent(app.thread, .{ .response_delta = "" }));
     try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].mirror().kind);
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .thinking_delta = "" }));
+    try std.testing.expect(!try app.applyAgentEvent(app.thread, .{ .thinking_delta = "" }));
     try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].mirror().kind);
 }
@@ -2342,14 +2364,14 @@ test "agent app events update transcript on the ui side" {
     try app.inputs.input.insertSliceAtCursor("hello");
     _ = try app.beginSubmit();
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .thinking_delta = "checking" }));
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
+    try std.testing.expect(!try app.applyAgentEvent(app.thread, .{ .thinking_delta = "checking" }));
+    try std.testing.expect(!try app.applyAgentEvent(app.thread, .{ .tool_delta = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"ls\",\"description\":\"List files\"}",
     } }));
-    try std.testing.expect(!try app.applyAgentEvent(.{ .thinking_delta = " files" }));
-    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
+    try std.testing.expect(!try app.applyAgentEvent(app.thread, .{ .thinking_delta = " files" }));
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .{ .tool_call_finished = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .display_label = "List files",
@@ -2380,13 +2402,13 @@ test "user can navigate away from a streaming thinking block" {
     try app.inputs.input.insertSliceAtCursor("hello");
     _ = try app.beginSubmit();
 
-    _ = try app.applyAgentEvent(.{ .thinking_delta = "first chunk" });
+    _ = try app.applyAgentEvent(app.thread, .{ .thinking_delta = "first chunk" });
     try std.testing.expectEqual(.thinking, app.thread.transcript.messages.items[app.thread.transcript.selected.?].mirror().kind);
 
     app.thread.transcript.moveSelection(.previous);
     try std.testing.expectEqual(.user, app.thread.transcript.messages.items[app.thread.transcript.selected.?].mirror().kind);
 
-    _ = try app.applyAgentEvent(.{ .thinking_delta = " more" });
+    _ = try app.applyAgentEvent(app.thread, .{ .thinking_delta = " more" });
     try std.testing.expectEqual(.user, app.thread.transcript.messages.items[app.thread.transcript.selected.?].mirror().kind);
 }
 
@@ -2404,13 +2426,13 @@ test "user can navigate away from a streaming agent message" {
     try app.inputs.input.insertSliceAtCursor("hello");
     _ = try app.beginSubmit();
 
-    _ = try app.applyAgentEvent(.{ .response_delta = "first chunk" });
+    _ = try app.applyAgentEvent(app.thread, .{ .response_delta = "first chunk" });
     try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[app.thread.transcript.selected.?].mirror().kind);
 
     app.thread.transcript.moveSelection(.previous);
     try std.testing.expectEqual(.user, app.thread.transcript.messages.items[app.thread.transcript.selected.?].mirror().kind);
 
-    _ = try app.applyAgentEvent(.{ .response_delta = " more" });
+    _ = try app.applyAgentEvent(app.thread, .{ .response_delta = " more" });
     try std.testing.expectEqual(.user, app.thread.transcript.messages.items[app.thread.transcript.selected.?].mirror().kind);
 }
 
@@ -2428,17 +2450,17 @@ test "empty content delta does not finalize thinking" {
     try app.inputs.input.insertSliceAtCursor("hello");
     _ = try app.beginSubmit();
 
-    _ = try app.applyAgentEvent(.{ .thinking_delta = "thinking" });
+    _ = try app.applyAgentEvent(app.thread, .{ .thinking_delta = "thinking" });
     const thinking_index = app.thread.turn_view.thinking_index.?;
     try std.testing.expectEqualStrings("Thinking...", app.thread.transcript.messages.items[thinking_index].mirror().title);
 
-    _ = try app.applyAgentEvent(.{ .response_delta = "" });
+    _ = try app.applyAgentEvent(app.thread, .{ .response_delta = "" });
     try std.testing.expectEqualStrings("Thinking...", app.thread.transcript.messages.items[thinking_index].mirror().title);
 
-    _ = try app.applyAgentEvent(.{ .thinking_delta = " more" });
+    _ = try app.applyAgentEvent(app.thread, .{ .thinking_delta = " more" });
     try std.testing.expectEqualStrings("Thinking...", app.thread.transcript.messages.items[thinking_index].mirror().title);
 
-    _ = try app.applyAgentEvent(.{ .response_delta = "answer" });
+    _ = try app.applyAgentEvent(app.thread, .{ .response_delta = "answer" });
     try std.testing.expectEqualStrings("Thoughts", app.thread.transcript.messages.items[thinking_index].mirror().title);
 }
 
@@ -2456,11 +2478,11 @@ test "content deltas do not override user scroll state" {
     try app.inputs.input.insertSliceAtCursor("hello");
     _ = try app.beginSubmit();
 
-    _ = try app.applyAgentEvent(.{ .response_delta = "first" });
+    _ = try app.applyAgentEvent(app.thread, .{ .response_delta = "first" });
     try std.testing.expect(app.thread.auto_scroll);
 
     app.thread.auto_scroll = false;
-    _ = try app.applyAgentEvent(.{ .response_delta = " second" });
+    _ = try app.applyAgentEvent(app.thread, .{ .response_delta = " second" });
     try std.testing.expect(!app.thread.auto_scroll);
 }
 
@@ -2478,26 +2500,26 @@ test "loading does not appear during final answer after tool batch" {
     try app.inputs.input.insertSliceAtCursor("inspect");
     _ = try app.beginSubmit();
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
+    try std.testing.expect(!try app.applyAgentEvent(app.thread, .{ .tool_delta = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"pwd\",\"description\":\"Print working directory\"}",
     } }));
-    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .{ .tool_call_finished = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .display_label = "Print working directory",
         .display_expanded_label = "pwd",
         .display_body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
     } }));
-    try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .tool_batch_finished));
     // No status message — the spinner is derived; the batch leaves us awaiting
     // the next response over the user + tool rows.
     try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
     try std.testing.expect(app.thread.turn_view.awaitingOutput());
 
-    try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "Final answer" }));
-    try std.testing.expect(try app.applyAgentEvent(.delta_end));
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .{ .response_delta = "Final answer" }));
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .delta_end));
     try std.testing.expectEqual(@as(usize, 3), app.thread.transcript.messages.items.len);
     try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[2].mirror().kind);
 }
@@ -2519,8 +2541,8 @@ test "loading does not reappear between content chunks" {
     // Once a content delta has arrived we are committed to streaming. The gap
     // between chunks must NOT bring the spinner back — the streaming text is
     // its own progress indicator.
-    try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "Here's the implementation plan:" }));
-    _ = try app.applyAgentEvent(.delta_end);
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .{ .response_delta = "Here's the implementation plan:" }));
+    _ = try app.applyAgentEvent(app.thread, .delta_end);
     try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].mirror().kind);
     try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[1].mirror().kind);
@@ -2540,7 +2562,7 @@ test "bash tool waits for complete arguments while streaming" {
     try app.inputs.input.insertSliceAtCursor("list files");
     _ = try app.beginSubmit();
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
+    try std.testing.expect(!try app.applyAgentEvent(app.thread, .{ .tool_delta = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"printf hello",
@@ -2548,7 +2570,7 @@ test "bash tool waits for complete arguments while streaming" {
     try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].mirror().kind);
 
-    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .{ .tool_call_finished = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .display_label = "Print hello",
@@ -2574,7 +2596,7 @@ test "tool row persists through finish and turn completion" {
     try app.inputs.input.insertSliceAtCursor("run ls");
     _ = try app.beginSubmit();
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
+    try std.testing.expect(!try app.applyAgentEvent(app.thread, .{ .tool_delta = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"ls\",\"description\":\"List files\"}",
@@ -2586,12 +2608,12 @@ test "tool row persists through finish and turn completion" {
     try std.testing.expect(app.thread.transcript.messages.items[1].mirror().tool_running);
     try std.testing.expect(app.thread.transcript.hasRunningTool());
 
-    try std.testing.expect(try app.applyAgentEvent(.delta_end));
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .delta_end));
     try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
     try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].mirror().kind);
     try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].mirror().title);
 
-    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .{ .tool_call_finished = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .display_label = "List files",
@@ -2604,7 +2626,7 @@ test "tool row persists through finish and turn completion" {
     try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].mirror().kind);
     try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].mirror().title);
 
-    try std.testing.expect(try app.applyAgentEvent(.turn_finished));
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .turn_finished));
     try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
     try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].mirror().kind);
     try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].mirror().title);
@@ -2624,7 +2646,7 @@ test "partial tool arguments do not create visible tool rows" {
     try app.inputs.input.insertSliceAtCursor("run ls");
     _ = try app.beginSubmit();
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
+    try std.testing.expect(!try app.applyAgentEvent(app.thread, .{ .tool_delta = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"",
@@ -2635,7 +2657,7 @@ test "partial tool arguments do not create visible tool rows" {
     try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].mirror().kind);
     try std.testing.expect(app.thread.turn_view.awaitingOutput());
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
+    try std.testing.expect(!try app.applyAgentEvent(app.thread, .{ .tool_delta = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"ls\",\"description\":\"List files\"}",
@@ -2659,12 +2681,12 @@ test "tool finish creates row if no complete streamed arguments appeared" {
     try app.inputs.input.insertSliceAtCursor("run ls");
     _ = try app.beginSubmit();
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
+    try std.testing.expect(!try app.applyAgentEvent(app.thread, .{ .tool_delta = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"",
     } }));
-    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .{ .tool_call_finished = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .display_label = "List files",
@@ -2691,21 +2713,21 @@ test "new tool response index creates a new transcript row" {
     try app.inputs.input.insertSliceAtCursor("run tools");
     _ = try app.beginSubmit();
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
+    try std.testing.expect(!try app.applyAgentEvent(app.thread, .{ .tool_delta = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"ls\",\"description\":\"List files\"}",
     } }));
-    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .{ .tool_call_finished = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .display_label = "List files",
         .display_expanded_label = "ls",
         .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
-    try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .tool_batch_finished));
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
+    try std.testing.expect(!try app.applyAgentEvent(app.thread, .{ .tool_delta = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"pwd\",\"description\":\"Print working directory\"}",
@@ -2732,24 +2754,24 @@ test "bash tool after batch creates a new tool row" {
     try app.inputs.input.insertSliceAtCursor("run tools");
     _ = try app.beginSubmit();
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
+    try std.testing.expect(!try app.applyAgentEvent(app.thread, .{ .tool_delta = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"ls\",\"description\":\"List files\"}",
     } }));
-    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .{ .tool_call_finished = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .display_label = "List files",
         .display_expanded_label = "ls",
         .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
-    try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .tool_batch_finished));
     // Awaiting the next segment over the user + tool rows; spinner is derived.
     try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
     try std.testing.expect(app.thread.turn_view.awaitingOutput());
 
-    _ = try app.applyAgentEvent(.{ .tool_delta = .{
+    _ = try app.applyAgentEvent(app.thread, .{ .tool_delta = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"printf done\",\"description\":\"Print done\"}",
@@ -2775,21 +2797,21 @@ test "late tool finish does not move selection upward" {
     try app.inputs.input.insertSliceAtCursor("run tools");
     _ = try app.beginSubmit();
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
+    try std.testing.expect(!try app.applyAgentEvent(app.thread, .{ .tool_delta = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"ls\",\"description\":\"List files\"}",
     } }));
     try std.testing.expectEqual(@as(u32, 1), app.thread.transcript.selected.?);
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
+    try std.testing.expect(!try app.applyAgentEvent(app.thread, .{ .tool_delta = .{
         .index = 1,
         .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"pwd\",\"description\":\"Print working directory\"}",
     } }));
     try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);
 
-    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .{ .tool_call_finished = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .display_label = "List files",
@@ -2798,8 +2820,8 @@ test "late tool finish does not move selection upward" {
     } }));
     try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);
 
-    try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
-    try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "done" }));
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .tool_batch_finished));
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .{ .response_delta = "done" }));
     try std.testing.expectEqual(@as(u32, 3), app.thread.transcript.selected.?);
 }
 
@@ -2817,22 +2839,22 @@ test "loading does not resume after post-tool thinking delta" {
     try app.inputs.input.insertSliceAtCursor("inspect");
     _ = try app.beginSubmit();
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
+    try std.testing.expect(!try app.applyAgentEvent(app.thread, .{ .tool_delta = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"pwd\",\"description\":\"Print working directory\"}",
     } }));
-    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .{ .tool_call_finished = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .display_label = "Print working directory",
         .display_expanded_label = "pwd",
         .display_body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
     } }));
-    try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .tool_batch_finished));
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .thinking_delta = "checking output" }));
-    try std.testing.expect(try app.applyAgentEvent(.delta_end));
+    try std.testing.expect(!try app.applyAgentEvent(app.thread, .{ .thinking_delta = "checking output" }));
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .delta_end));
 
     try std.testing.expectEqual(@as(usize, 3), app.thread.transcript.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].mirror().kind);
@@ -2855,21 +2877,21 @@ test "agent response after tool batch appears below tool rows" {
     try app.inputs.input.insertSliceAtCursor("inspect");
     _ = try app.beginSubmit();
 
-    try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "I will check." }));
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .{ .response_delta = "I will check." }));
+    try std.testing.expect(!try app.applyAgentEvent(app.thread, .{ .tool_delta = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"pwd\",\"description\":\"Print working directory\"}",
     } }));
-    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .{ .tool_call_finished = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .display_label = "Print working directory",
         .display_expanded_label = "pwd",
         .display_body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
     } }));
-    try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
-    try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "The repo is in /tmp." }));
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .tool_batch_finished));
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .{ .response_delta = "The repo is in /tmp." }));
 
     try std.testing.expectEqual(@as(usize, 4), app.thread.transcript.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].mirror().kind);
@@ -2896,23 +2918,23 @@ test "content delta after tool preview does not move selection away from tool ro
     try app.inputs.input.insertSliceAtCursor("inspect");
     _ = try app.beginSubmit();
 
-    try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "I will check." }));
-    try std.testing.expect(try app.applyAgentEvent(.delta_end));
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .{ .response_delta = "I will check." }));
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .delta_end));
     try std.testing.expectEqual(@as(u32, 1), app.thread.transcript.selected.?);
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
+    try std.testing.expect(!try app.applyAgentEvent(app.thread, .{ .tool_delta = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .arguments = "{\"command\":\"pwd\",\"description\":\"Print working directory\"}",
     } }));
-    try std.testing.expect(try app.applyAgentEvent(.delta_end));
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .delta_end));
     try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);
 
-    try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = " Still checking." }));
-    _ = try app.applyAgentEvent(.delta_end);
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .{ .response_delta = " Still checking." }));
+    _ = try app.applyAgentEvent(app.thread, .delta_end);
     try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);
 
-    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
+    try std.testing.expect(try app.applyAgentEvent(app.thread, .{ .tool_call_finished = .{
         .index = 0,
         .name = tools_mod.shellToolName,
         .display_label = "Print working directory",
