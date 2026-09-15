@@ -125,10 +125,14 @@ pub fn build(b: *std.Build) void {
     mod.addIncludePath(b.path("vendor/fzy"));
     mod.addIncludePath(b.path("vendor/fzy/src"));
     // Native keychain backends (src/keyring.zig): Windows Credential Manager
-    // lives in advapi32; macOS Keychain Services needs Security (+ CoreFoundation
-    // for CFRelease). Other targets use the plaintext file fallback.
+    // lives in advapi32; Windows browser URL dispatch uses shell32; macOS
+    // Keychain Services needs Security (+ CoreFoundation for CFRelease). Other
+    // targets use the plaintext file fallback.
     switch (target.result.os.tag) {
-        .windows => mod.linkSystemLibrary("advapi32", .{}),
+        .windows => {
+            mod.linkSystemLibrary("advapi32", .{});
+            mod.linkSystemLibrary("shell32", .{});
+        },
         .macos => {
             mod.linkFramework("Security", .{});
             mod.linkFramework("CoreFoundation", .{});
