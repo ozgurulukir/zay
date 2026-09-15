@@ -3346,33 +3346,57 @@ test "handleTick invokes the 4 documented phase functions in order" {
     try std.testing.expect(!app.metrics.loading_tick_active);
 }
 
-test "refreshGitLabel updates metrics.git_label on dirty flag and avoids duplicate allocation" {
+test "git label refresh runs asynchronously and avoids duplicate allocation" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try lifecycle.refreshGitLabel(&app);
-    const initial_label_len = app.metrics.git_label.len;
-    if (initial_label_len > 0) {
-        const ptr_before = app.metrics.git_label.ptr;
-        // Refreshing again when branch is unchanged skips realloc
-        try lifecycle.refreshGitLabel(&app);
-        try std.testing.expectEqual(ptr_before, app.metrics.git_label.ptr);
-    }
+    app.thread.engine = .{ .idle = .{ .working = .{
+        .branch = try gpa.dupe(u8, "test/git-label"),
+        .path = try gpa.dupe(u8, "."),
+    } } };
+    app.git_label_refresh_deadline = null;
+    try std.testing.expect(!try lifecycle.serviceGitLabelRefresh(&app));
+    try std.testing.expect(app.git_label_job != null);
 
-    app.git_label_dirty = false;
+    var spins: u32 = 0;
+    while (app.git_label_job != null and spins < 10_000) : (spins += 1) {
+        std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        _ = try lifecycle.serviceGitLabelRefresh(&app);
+    }
+    try std.testing.expect(app.git_label_job == null);
+    try std.testing.expect(!app.git_label_dirty);
+    const initial_label_len = app.metrics.git_label.len;
+    try std.testing.expect(initial_label_len > 0);
+    const ptr_before = app.metrics.git_label.ptr;
+
     app.armGitLabelRefresh();
-    try std.testing.expect(app.git_label_dirty);
+    try std.testing.expect(app.git_label_refresh_deadline != null);
+    try std.testing.expect(!try lifecycle.serviceGitLabelRefresh(&app));
+    try std.testing.expect(app.git_label_job == null);
+    app.git_label_refresh_deadline = null;
+    _ = try lifecycle.serviceGitLabelRefresh(&app);
+    spins = 0;
+    while (app.git_label_job != null and spins < 10_000) : (spins += 1) {
+        std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        _ = try lifecycle.serviceGitLabelRefresh(&app);
+    }
+    try std.testing.expectEqual(ptr_before, app.metrics.git_label.ptr);
 }
 
-test "handleTick refreshes git label when dirty and resets dirty flag" {
+test "handleTick keeps git label refresh active until the worker completes" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
+
+    app.thread.engine = .{ .idle = .{ .working = .{
+        .branch = try gpa.dupe(u8, "test/git-label"),
+        .path = try gpa.dupe(u8, "."),
+    } } };
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -3381,5 +3405,16 @@ test "handleTick refreshes git label when dirty and resets dirty flag" {
 
     app.git_label_dirty = true;
     try lifecycle.handleTick(&root, &ctx);
+    try std.testing.expect(lifecycle.gitLabelRefreshActive(&app));
+
+    // Skip the real-time debounce in this test and wait for the worker through
+    // the same service path that subsequent UI ticks use.
+    app.git_label_refresh_deadline = null;
+    var spins: u32 = 0;
+    while (lifecycle.gitLabelRefreshActive(&app) and spins < 10_000) : (spins += 1) {
+        std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        _ = try lifecycle.serviceGitLabelRefresh(&app);
+    }
     try std.testing.expect(!app.git_label_dirty);
+    try std.testing.expect(app.git_label_job == null);
 }

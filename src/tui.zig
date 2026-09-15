@@ -43,9 +43,9 @@ const tui_metrics = @import("tui/metrics.zig");
 const tui_layout = @import("tui/layout.zig");
 const provider_model = @import("tui/provider_model.zig");
 const diff_lifecycle = @import("tui/diff_lifecycle.zig");
+const git_label_job_mod = @import("tui/git_label_job.zig");
 pub const DiffCounts = app_state.DiffCounts;
 pub const DiffRefreshOutcome = diff_lifecycle.DiffRefreshOutcome;
-const diff_utils = @import("tui/diff_utils.zig");
 const lane_lifecycle = @import("tui/lane_lifecycle.zig");
 const lifecycle = @import("tui/lifecycle.zig");
 const settings_lifecycle = @import("tui/settings_lifecycle.zig");
@@ -112,13 +112,20 @@ pub const App = struct {
     /// auto-deref, even from a `*const App`.
     thread: *Thread,
     /// Set when the active branch may have changed (lane switch, or any tool
-    /// call that could have run `git`). `handleTick` refreshes `metrics.git_label`
-    /// once and clears it — never polls, so idle time costs zero `git` calls.
+    /// call that could have run `git`). The lifecycle starts one debounced
+    /// background refresh and clears this after the matching result lands.
     git_label_dirty: bool = true,
-    /// The lane whose branch was last shown. `handleTick` compares it against
-    /// `thread` to detect a lane switch (which changes the branch) without
-    /// polling — a switch arms `git_label_dirty`.
+    /// The lane whose branch was last requested. `handleTick` compares it
+    /// against `thread` to detect a lane switch without polling.
     git_label_thread: ?*Thread = null,
+    /// Coalesces refresh requests caused by a burst of tool completions or
+    /// session changes. The deadline uses the monotonic clock.
+    git_label_refresh_deadline: ?std.Io.Timestamp = null,
+    /// Invalidates a result from a lane/session that was replaced while Git
+    /// was running in the background.
+    git_label_generation: u64 = 0,
+    /// In-flight status-bar Git query. Owned by App and joined during teardown.
+    git_label_job: ?*git_label_job_mod.Job = null,
     /// The multi-lane layout arrangement. `.tab` (single active-lane pane) is
     /// the legacy fullscreen; `.dual` (1:1 driver + focused worker) and `.grid`
     /// (2x2 tile) both show more than one lane. Set from the configured
@@ -1263,7 +1270,6 @@ pub fn run(
     try app.rebuildTranscriptFromAgent();
     try app.appendStartupIntroLogo();
 
-    app.metrics.git_label = diff_utils.loadGitLabel(gpa, init.io, runtime.cwd) catch "";
     _ = app.refreshDiffCounts() catch false;
 
     var root: RootWidget = .{ .app = &app };
