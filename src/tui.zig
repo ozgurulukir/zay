@@ -44,6 +44,7 @@ const tui_layout = @import("tui/layout.zig");
 const provider_model = @import("tui/provider_model.zig");
 const diff_lifecycle = @import("tui/diff_lifecycle.zig");
 const git_label_job_mod = @import("tui/git_label_job.zig");
+const codex_login_job_mod = @import("tui/codex_login_job.zig");
 pub const DiffCounts = app_state.DiffCounts;
 pub const DiffRefreshOutcome = diff_lifecycle.DiffRefreshOutcome;
 const lane_lifecycle = @import("tui/lane_lifecycle.zig");
@@ -126,6 +127,9 @@ pub const App = struct {
     git_label_generation: u64 = 0,
     /// In-flight status-bar Git query. Owned by App and joined during teardown.
     git_label_job: ?*git_label_job_mod.Job = null,
+    /// In-flight OpenAI Codex browser login. Owned by App and joined during
+    /// teardown; the OAuth wait never runs on the vaxis event thread.
+    codex_login_job: ?*codex_login_job_mod.Job = null,
     /// The multi-lane layout arrangement. `.tab` (single active-lane pane) is
     /// the legacy fullscreen; `.dual` (1:1 driver + focused worker) and `.grid`
     /// (2x2 tile) both show more than one lane. Set from the configured
