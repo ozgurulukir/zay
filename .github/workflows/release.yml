@@ -63,19 +63,22 @@ jobs:
           fi
           printf '%s\n' "$ZIG_DIR" >> "$GITHUB_PATH"
 
-      - name: Apply vaxis ZAY-LOCAL-PATCH (focus-handler guards)
+      - name: Apply vaxis ZAY-LOCAL-PATCH (focus-handler + input-thread guards)
         shell: bash
         run: |
           # Fresh CI checkouts fetch a PRISTINE vaxis into zig-pkg/; the
-          # configure-time guard in build.zig then fails the first invocation
-          # on purpose (an unpatched binary SIGSEGVs on session switch — see
-          # AGENTS.md "vxfw FocusHandler crash"). Tolerate that first
-          # failure, apply the checked-in patch, and let the build step run
-          # against the guarded copy.
+          # configure-time guards in build.zig then fail the first invocation
+          # on purpose (an unpatched binary SIGSEGVs on session switch and
+          # silently kills all keyboard input on Windows — see AGENTS.md
+          # "vxfw FocusHandler crash" and "vxfw Windows input-thread
+          # death"). Tolerate that first failure, apply the checked-in
+          # patches, and let the build step run against the guarded copy.
           zig build --fetch ${{ matrix.target_arg }} || true
           for d in zig-pkg/vaxis-0.6.0-*/; do
             patch -p1 -d "$d" < tools/vendor-patches/vaxis-focus-handler.patch
             test "$(grep -c ZAY-LOCAL-PATCH "$d/src/vxfw/App.zig")" -eq 2
+            patch -p1 -d "$d" < tools/vendor-patches/vaxis-input-thread-retry.patch
+            test "$(grep -c ZAY-LOCAL-PATCH "$d/src/Loop.zig")" -eq 3
           done
 
       - name: Build (ReleaseFast)
