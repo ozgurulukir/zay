@@ -176,7 +176,11 @@ pub fn runOut(
     env: ?*const std.process.Environ.Map,
 ) CmdError![]u8 {
     var out = try run(gpa, io, cwd, args, env);
-    errdefer out.deinit(gpa);
+    // No errdefer here: the failure path deinits explicitly before the
+    // error return, and an errdefer would fire on top of it, deinit-ing the
+    // already-`undefined` struct (double free of garbage pointers → segfault
+    // on every non-zero git exit; repro: `rev-parse HEAD` in a commitless
+    // repo).
     if (out.code != 0) {
         out.deinit(gpa);
         return error.GitCommandFailed;
@@ -219,6 +223,22 @@ test "isRepo_returnsFalse_whenOutsideGitWorkingTree" {
     const io = std.testing.io;
     if (!isAvailable(gpa, io)) return error.SkipZigTest;
     try std.testing.expect(!isRepo(gpa, io, "/tmp"));
+}
+
+test "runOut on a failing git command errors without crashing" {
+    // Regression (2026-09-14): `runOut` had BOTH an explicit deinit on the
+    // non-zero-exit path AND an errdefer over the same struct — the error
+    // return fired the errdefer on the already-`undefined` struct and
+    // double-freed garbage pointers, segfaulting at BOOT in any directory
+    // where the git call exits non-zero (e.g. `rev-parse HEAD` in a fresh
+    // `git init` with no commits).
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!isAvailable(gpa, io)) return error.SkipZigTest;
+    try std.testing.expectError(
+        error.GitCommandFailed,
+        runOut(gpa, io, ".", &.{ "rev-parse", "--verify", "zay-definitely-not-a-ref" }, null),
+    );
 }
 
 /// Get the current git branch name of `dir`, or null if detached / not a repo.

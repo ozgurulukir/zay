@@ -1,0 +1,88 @@
+# Zay local patch: vxfw Loop.zig Windows input-thread resilience.
+# Upstream's ttyRun exits on the first console read error (swallowed by
+# 'catch {}') and postEvent blocks forever on a full queue; either way the
+# input thread dies/parks silently and ALL keyboard input stops while the
+# app keeps rendering. Bounded retry + drop-with-warn instead, plus exit
+# diagnostics in ttyRun.
+# See AGENTS.md 'vxfw Windows input-thread death' and build.zig checkVaxisLoopPatch.
+# Re-apply after every `zig build --fetch` / vaxis bump; build.zig enforces this.
+--- a/src/Loop.zig	2026-09-14 23:16:44.596907000 +0300
++++ b/src/Loop.zig	2026-09-14 23:16:52.006062100 +0300
+@@ -109,8 +109,20 @@
+ 
+         /// posts an event into the event queue. Will block if there is not
+         /// capacity for the event
++        /// ZAY-LOCAL-PATCH: upstream blocks the caller forever once the queue
++        /// is full. When the UI thread wedges mid-handler (it drains events
++        /// while holding the queue mutex), the input thread parks here
++        /// permanently — every key silently vanishes while the app keeps
++        /// showing its last frame. Bound the wait instead: retry tryPush for
++        /// ~2s, then drop the event with a visible warn. A TUI must lose one
++        /// input event, never its whole input thread.
+         pub fn postEvent(self: *Self, event: T) !void {
+-            try self.queue.push(event);
++            var attempts: usize = 0;
++            while (attempts < 200) : (attempts += 1) {
++                if (try self.queue.tryPush(event)) return;
++                self.io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch {};
++            }
++            log.warn("event queue saturated, dropping one event", .{});
+         }
+ 
+         pub fn tryPostEvent(self: *Self, event: T) !bool {
+@@ -155,7 +167,16 @@
+ 
+         /// read input from the tty. This is run in a separate thread
+         fn ttyRun(self: *Self, paste_allocator: ?std.mem.Allocator) void {
+-            self._ttyRun(paste_allocator) catch {};
++            // ZAY-LOCAL-PATCH (diagnostics): the input thread must never end
++            // before shutdown; upstream swallowed every exit silently. Log
++            // both the error and the clean-return path so a dead-input report
++            // in zay.log pinpoints which thread wedged.
++            self._ttyRun(paste_allocator) catch |err| {
++                log.warn("tty input thread exited err={s} should_quit={}", .{ @errorName(err), self.should_quit });
++            };
++            if (!self.should_quit) {
++                log.warn("tty input thread returned cleanly before shutdown", .{});
++            }
+         }
+ 
+         fn _ttyRun(
+@@ -171,9 +192,35 @@
+             switch (builtin.os.tag) {
+                 .windows => {
+                     var parser: Parser = .{};
++                    // ZAY-LOCAL-PATCH: upstream exits the input thread on the
++                    // first `nextEvent` error (`ttyRun` swallows it via
++                    // `catch {}`), permanently killing ALL keyboard input
++                    // while the app keeps rendering — no crash, no log.
++                    // Transient console errors (focus records racing a child
++                    // process, conhost hiccups, terminal detach/reattach)
++                    // must not end input forever. Retry with capped
++                    // exponential backoff and a visible warn (zay routes
++                    // warn+ to toasts); give up only after sustained failure.
++                    var retry_backoff_ms: u64 = 10;
++                    var retry_failures: usize = 0;
+                     while (!self.should_quit) {
+-                        const event = try self.tty.nextEvent(&parser, paste_allocator);
+-                        try handleEventGeneric(self, self.vaxis, &cache, Event, event, null);
++                        const event = self.tty.nextEvent(&parser, paste_allocator) catch |err| {
++                            retry_failures += 1;
++                            if (retry_failures > 64) return err;
++                            log.warn("tty input read failed, retrying err={s} failures={d}", .{ @errorName(err), retry_failures });
++                            self.io.sleep(std.Io.Duration.fromMilliseconds(@intCast(retry_backoff_ms)), .awake) catch {};
++                            retry_backoff_ms = @min(retry_backoff_ms * 2, 500);
++                            continue;
++                        };
++                        retry_backoff_ms = 10;
++                        retry_failures = 0;
++                        // Same resilience for the dispatch half: an error from
++                        // event handling (queue push failure etc.) must not
++                        // end the input thread either — drop that one event
++                        // and keep reading.
++                        handleEventGeneric(self, self.vaxis, &cache, Event, event, null) catch |err| {
++                            log.warn("tty input event dispatch failed err={s}", .{@errorName(err)});
++                        };
+                     }
+                 },
+                 else => {

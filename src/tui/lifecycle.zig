@@ -28,6 +28,11 @@ const at_search_mod = @import("at_search.zig");
 const search_mod = @import("../search.zig");
 
 const App = tui.App;
+
+const log = std.log.scoped(.tui);
+
+/// Heartbeat counter for `handleTick` — debug-level diagnostics only.
+var tick_heartbeat: u64 = 0;
 const RootWidget = tui.RootWidget;
 const Thread = tui.Thread;
 const max_threads = tui.max_threads;
@@ -176,6 +181,12 @@ fn deinitOwnedState(self: *App) void {
 pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     std.debug.assert(root.app.threads.len() > 0);
     std.debug.assert(root.app.threads.len() <= max_threads);
+
+    // UI-thread heartbeat (~1.5s cadence at the 30ms tick): proves the event
+    // loop is alive when reported alongside input breadcrumbs — see AGENTS.md
+    // "vxfw Windows input-thread death".
+    tick_heartbeat +%= 1;
+    if (tick_heartbeat % 50 == 0) log.debug("heartbeat tick #{d} mode={s}", .{ tick_heartbeat, @tagName(root.app.mode) });
 
     // A lane switch changes the active branch, so arm a refresh. `thread` is a
     // pointer, so this is a cheap identity compare — no polling.

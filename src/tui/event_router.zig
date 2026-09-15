@@ -138,8 +138,32 @@ fn routeKey(
     app: *App,
     root: *RootWidget,
     ctx: *vxfw.EventContext,
-    key: vaxis.Key,
+    raw: vaxis.Key,
 ) !void {
+    // Input-pipeline breadcrumb: this line proves a key event reached the
+    // app's router (reader thread -> queue -> focus dispatch all alive).
+    // When keys "stop working", its presence/absence in zay.log splits the
+    // search space in half — see AGENTS.md "vxfw Windows input-thread death".
+    log.debug("key cp=0x{x:0>4} mods={any} mode={s} inlen={d} pallen={d}", .{ raw.codepoint, raw.mods, @tagName(app.mode), app.inputs.input.buf.realLength(), app.inputs.palette.buf.realLength() });
+
+    // Some Windows Terminal input paths deliver control combos as BARE C0
+    // codepoints with an empty — or noise-decorated (stray alt) — modifier
+    // set. Observed in a user log (2026-09-15): Ctrl+C as `cp=0x03 mods={}`
+    // and Ctrl+D as `cp=0x04 mods={alt=true}`, repeatedly — `matches('c',
+    // .{ .ctrl = true })` can never hit those, so quit (and every other
+    // ctrl binding) silently dies. Normalize C0 codes 0x01..0x1a to
+    // ctrl+letter with a clean modifier set; backspace/tab/enter/newline
+    // keep their own meaning (isEnterKey also matches a bare '\n').
+    var key = raw;
+    if (key.codepoint >= 1 and key.codepoint <= 0x1a) {
+        switch (key.codepoint) {
+            0x08, 0x09, 0x0a, 0x0d => {},
+            else => {
+                key.mods = .{ .ctrl = true };
+                key.codepoint = @as(u21, 'a') + (key.codepoint - 1);
+            },
+        }
+    }
     try root.ensureTick(ctx);
     // The diff viewer is a self-contained full-screen mode: it owns every
     // key (including Esc) so it can manage its own sub-states.
@@ -154,7 +178,13 @@ fn routeKey(
             return;
         }
     }
-    if (key.matches(vaxis.Key.escape, .{})) {
+    // Escape must close overlays even when the terminal decorates it with a
+    // stray modifier. Windows Terminal's focus/decode paths have been
+    // observed delivering a bare ESC press as `cp=0x1b mods={alt=true}`
+    // (repro 2026-09-14); `matches` does exact-modifier comparison and would
+    // miss it, leaving the user with an unclosable overlay. Match on the
+    // codepoint, tolerating any modifiers.
+    if (key.codepoint == vaxis.Key.escape) {
         try handleEscapeSequence(app, root, ctx);
         return;
     }
@@ -425,6 +455,7 @@ fn handleQuitSequence(
 // `Thread` stays valid for the test's lifetime.
 
 const agent_mod = @import("../agent.zig");
+const log = std.log.scoped(.tui);
 
 test "single Ctrl-C with empty input arms pending quit" {
     const gpa = std.testing.allocator;
@@ -465,6 +496,44 @@ test "Ctrl-C pressed twice within the window confirms quit" {
 
     // Back-to-back presses land inside the double-press window.
     try std.testing.expect(ctx.quit);
+}
+
+test "bare C0 codepoints (mangled Ctrl+C/Ctrl+D) still drive quit" {
+    // Regression (2026-09-15 user log): Windows Terminal delivered Ctrl+C
+    // as `cp=0x03 mods={}` and Ctrl+D as `cp=0x04 mods={alt=true}` — with no
+    // ctrl modifier, `matches('c', .{ .ctrl = true })` never matched and
+    // quit was dead while the rest of the app kept working. routeKey now
+    // normalizes bare C0 codes to ctrl+letter.
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    // Bare cp=0x03, no modifiers at all — arms the pending prompt.
+    try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = 0x03, .mods = .{} } });
+    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(!ctx.quit);
+    app.clearPendingQuitAt();
+
+    // cp=0x04 with a stray alt bit (the exact mangled form from the log) —
+    // also arms.
+    try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = 0x04, .mods = .{ .alt = true } } });
+    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(!ctx.quit);
+
+    // Two bare cp=0x03 presses confirm quit, exactly like real Ctrl+C.
+    var ctx2: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+    const mangled: vxfw.Event = .{ .key_press = .{ .codepoint = 0x03, .mods = .{} } };
+    try captureEvent(&app, &root, &ctx2, mangled);
+    try captureEvent(&app, &root, &ctx2, mangled);
+    try std.testing.expect(ctx2.quit);
 }
 
 test "Ctrl-D with empty input arms pending quit like Ctrl-C" {

@@ -33,7 +33,15 @@ const cache_ttl_ms: i64 = 24 * 60 * 60 * 1000;
 /// registry gzip-compressed — the body must be decompressed before parsing.
 const redirect_buffer_bytes = http.redirect_buffer_bytes;
 const transfer_buffer_bytes = http.transfer_buffer_bytes;
-const response_bytes_max: u32 = 4 * 1024 * 1024;
+
+/// Upper bound for one `api.json` payload (DECOMPRESSED bytes), shared by
+/// the network fetch, the disk cache read, and the vendored snapshot read.
+/// The registry crossed 4 MiB in the wild (4.66 MB as of 2026-09), which
+/// turned the then-per-site 4 MiB literals into three simultaneous silent
+/// failures: fetch → `ResponseTooLarge`, vendored → `StreamTooLong`, and the
+/// picker fell back to builtins only. One constant keeps the three readers
+/// in lockstep; 16 MiB is years of headroom at the observed growth rate.
+const registry_payload_max_bytes: usize = 16 * 1024 * 1024;
 
 pub const Adapter = config_provider.AdapterKind;
 
@@ -144,7 +152,7 @@ pub fn loadCacheWithOptions(gpa: std.mem.Allocator, io: std.Io, home_dir: []cons
     }
 
     var reader = file.reader(io, &.{});
-    const bytes = try reader.interface.allocRemaining(gpa, .limited(4 * 1024 * 1024));
+    const bytes = try reader.interface.allocRemaining(gpa, .limited(registry_payload_max_bytes));
     defer gpa.free(bytes);
 
     return try parseModelsDevJson(gpa, bytes);
@@ -450,7 +458,7 @@ fn fetchApiJson(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-    return reader.allocRemaining(gpa, .limited(response_bytes_max)) catch |err| switch (err) {
+    return reader.allocRemaining(gpa, .limited(registry_payload_max_bytes)) catch |err| switch (err) {
         error.StreamTooLong => error.ResponseTooLarge,
         else => |e| e,
     };
@@ -519,7 +527,7 @@ fn loadVendored(gpa: std.mem.Allocator, io: std.Io) !VendoredResult {
     defer file.close(io);
 
     var reader = file.reader(io, &.{});
-    const bytes = try reader.interface.allocRemaining(gpa, .limited(4 * 1024 * 1024));
+    const bytes = try reader.interface.allocRemaining(gpa, .limited(registry_payload_max_bytes));
     errdefer gpa.free(bytes);
 
     const registry = try parseModelsDevJson(gpa, bytes);
@@ -843,6 +851,28 @@ test "parseModelsDevJson rejects malformed JSON" {
 test "parseModelsDevJson rejects non-object root" {
     const gpa = std.testing.allocator;
     try std.testing.expectError(error.InvalidApiJson, parseModelsDevJson(gpa, "[]"));
+}
+
+test "registry payload over the old 4 MiB cap parses" {
+    // Regression (2026-09-14): models.dev's api.json crossed 4 MiB in the
+    // wild (4.66 MB) and every per-site 4 MiB read limit rejected it at
+    // once — the picker silently fell back to builtins only. Pad a valid
+    // registry past the old cap with JSON whitespace (ignored by the
+    // scanner) and pin that the shared limit lets it through.
+    const gpa = std.testing.allocator;
+
+    const pad_len = 4 * 1024 * 1024 + 512 * 1024;
+    const body = try gpa.alloc(u8, pad_len + 128);
+    defer gpa.free(body);
+    @memcpy(body[0..2], "{\n");
+    @memset(body[2 .. 2 + pad_len], ' ');
+    const tail = "\"deepseek\": {\"api\": \"https://api.deepseek.com\", \"name\": \"DeepSeek\", \"models\": {\"deepseek-chat\": {}}}}";
+    @memcpy(body[2 + pad_len ..][0..tail.len], tail);
+
+    var registry = try parseModelsDevJson(gpa, body[0 .. 2 + pad_len + tail.len]);
+    defer registry.deinit(gpa);
+
+    try std.testing.expect(registry.lookup("deepseek") != null);
 }
 
 test "fetchAndCache returns error.HomeNotSet when home_dir is empty" {
