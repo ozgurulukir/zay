@@ -12,6 +12,38 @@ const http = @import("../http.zig");
 const symbols = @import("../symbols.zig");
 const auth = @import("store.zig");
 
+const windows = if (os.is_windows) struct {
+    const std_windows = std.os.windows;
+
+    extern "shell32" fn ShellExecuteW(
+        hwnd: ?std_windows.HWND,
+        operation: [*:0]const u16,
+        file: [*:0]const u16,
+        parameters: ?[*:0]const u16,
+        directory: ?[*:0]const u16,
+        show_command: i32,
+    ) callconv(.winapi) isize;
+} else struct {};
+
+const test_windows = if (os.is_windows) struct {
+    const std_windows = std.os.windows;
+
+    fn shellExecuteWithAmpersand(
+        _: ?std_windows.HWND,
+        _: [*:0]const u16,
+        file: [*:0]const u16,
+        _: ?[*:0]const u16,
+        _: ?[*:0]const u16,
+        _: i32,
+    ) callconv(.winapi) isize {
+        var index: usize = 0;
+        while (file[index] != 0) : (index += 1) {
+            if (file[index] == '&') return 33;
+        }
+        return 31;
+    }
+} else struct {};
+
 // Re-export so existing `codex.Credentials` / `codex.ApiKeyMap` callers
 // keep compiling during the migration window.
 pub const Credentials = auth.Credentials;
@@ -205,18 +237,40 @@ fn createAuthorizationFlow(gpa: std.mem.Allocator, io: std.Io) !AuthorizationFlo
 }
 
 fn openBrowser(gpa: std.mem.Allocator, io: std.Io, url: []const u8) !void {
+    std.debug.assert(url.len > 0);
+    std.debug.assert(std.mem.indexOfScalar(u8, url, 0) == null);
+
+    if (comptime os.is_windows) return openBrowserWindows(gpa, url);
+
     const argv = switch (os.tag) {
         .macos => &[_][]const u8{ "open", url },
-        .windows => &[_][]const u8{ "cmd", "/c", "start", "", url },
         else => &[_][]const u8{ "xdg-open", url },
     };
-    const result = std.process.run(gpa, io, .{
+    const result = try std.process.run(gpa, io, .{
         .argv = argv,
         .stdout_limit = .limited(4 * 1024),
         .stderr_limit = .limited(4 * 1024),
-    }) catch return;
+    });
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);
+}
+
+fn openBrowserWindows(gpa: std.mem.Allocator, url: []const u8) !void {
+    return openBrowserWindowsWith(gpa, url, windows.ShellExecuteW);
+}
+
+fn openBrowserWindowsWith(gpa: std.mem.Allocator, url: []const u8, shell_execute: anytype) !void {
+    // ShellExecuteW invokes the registered HTTPS handler directly. Passing the
+    // URL to cmd.exe would let query-string '&' characters become shell syntax.
+    const url_utf16 = try std.unicode.utf8ToUtf16LeAllocZ(gpa, url);
+    defer gpa.free(url_utf16);
+
+    const operation = std.unicode.utf8ToUtf16LeStringLiteral("open");
+    const result = shell_execute(null, operation, url_utf16.ptr, null, null, 1);
+    if (result <= 32) {
+        log.warn("codex.browser.open.failed code={d}", .{result});
+        return error.BrowserOpenFailed;
+    }
 }
 
 /// Upper bound on how long `waitForAuthorizationCode` blocks waiting for the
@@ -697,6 +751,15 @@ test "createAuthorizationFlow constructs valid PKCE authorization URL and state"
     try std.testing.expect(std.mem.indexOf(u8, flow.url, "client_id=") != null);
     try std.testing.expect(std.mem.indexOf(u8, flow.url, "code_challenge=") != null);
     try std.testing.expect(std.mem.indexOf(u8, flow.url, "state=") != null);
+}
+
+test "Windows browser opener passes OAuth query separators as URL data" {
+    if (comptime !os.is_windows) return error.SkipZigTest;
+    try openBrowserWindowsWith(
+        std.testing.allocator,
+        "https://auth.openai.com/oauth/authorize?code_challenge=abc&state=def",
+        test_windows.shellExecuteWithAmpersand,
+    );
 }
 
 const MockCallbackClient = struct {
