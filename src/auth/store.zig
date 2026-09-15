@@ -1,6 +1,7 @@
 //! Generic provider credential storage service.
 //!
-//! Owns the `auth.json` file format (`~/.config/zay/auth.json`) and the
+//! Owns the `auth.json` file format (platform config dir: `%APPDATA%\zay` on
+//! Windows, `~/.config/zay` on POSIX — see `paths.platformConfigDir`) and the
 //! OS keychain fallback. All providers — builtin, models.dev dynamic, and
 //! user-defined config — use this module for API key storage.
 //!
@@ -13,6 +14,7 @@ const std = @import("std");
 const log = std.log.scoped(.auth);
 
 const keyring = @import("keyring.zig");
+const paths = @import("../paths.zig");
 
 const keyring_service = "Zay";
 
@@ -190,7 +192,11 @@ pub fn pruneOrphanKeys(
 
 pub fn authPath(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
     if (home_dir.len == 0) return error.HomeNotSet;
-    return std.fs.path.join(gpa, &.{ home_dir, ".config", "zay", "auth.json" });
+    // Same platform-aware base as the global config (SSoT): Windows ->
+    // %APPDATA%\zay\auth.json, POSIX -> ~/.config/zay/auth.json.
+    const base = try paths.platformConfigDir(gpa, home_dir);
+    defer gpa.free(base);
+    return std.fs.path.join(gpa, &.{ base, "auth.json" });
 }
 
 /// Read the serialized auth blob, preferring the keychain and falling back
