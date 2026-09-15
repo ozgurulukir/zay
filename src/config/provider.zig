@@ -129,7 +129,7 @@ pub const builtin_providers = [_]ProviderDef{
     .{ .provider = .mistral, .id = "mistral", .name = "Mistral AI", .description = "Mistral AI models (Mistral Large, Codestral, Pixtral)", .base_url = "https://api.mistral.ai/v1", .adapter = .openai_compatible, .catalogue = true },
     .{ .provider = .xai, .id = "xai", .name = "xAI Grok", .description = "xAI Grok models (Grok-4, Grok-4.3)", .base_url = "https://api.x.ai/v1", .adapter = .openai_compatible, .catalogue = true },
     .{ .provider = .perplexity, .id = "perplexity", .name = "Perplexity", .description = "Perplexity AI models (Sonar, Sonar Pro)", .base_url = "https://api.perplexity.ai", .adapter = .openai_compatible, .catalogue = true },
-    .{ .provider = .cohere, .id = "cohere", .name = "Cohere", .description = "Cohere Command models (Command R+, Command R7B)", .base_url = "https://api.cohere.com/v1", .adapter = .openai_compatible, .catalogue = true },
+    .{ .provider = .cohere, .id = "cohere", .name = "Cohere", .description = "Cohere Command models (Command R+, Command R7B)", .base_url = "https://api.cohere.com/compatibility/v1", .adapter = .openai_compatible, .catalogue = true },
     .{ .provider = .alibaba, .id = "alibaba", .name = "Alibaba Qwen", .description = "Alibaba Cloud Qwen models (Qwen3, Qwen2.5)", .base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", .adapter = .openai_compatible, .catalogue = true },
     .{ .provider = .anthropic, .id = "anthropic", .name = "Anthropic", .description = "Direct Anthropic API (Claude 3.5 Sonnet)", .base_url = "", .adapter = null, .requires_api_key = true },
 };

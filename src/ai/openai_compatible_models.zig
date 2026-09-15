@@ -133,8 +133,11 @@ fn parseResponse(gpa: std.mem.Allocator, bytes: []const u8) ![]ModelEntry {
     }
     for (parsed.value.data) |item| {
         const id = item.id orelse continue;
-        if (id.len == 0) continue;
-        try out.append(gpa, .{ .id = try gpa.dupe(u8, id) });
+        // Google's compat layer prefixes ids with "models/" following its
+        // native API convention; the chat endpoint expects the bare id.
+        const bare = if (std.mem.startsWith(u8, id, "models/")) id["models/".len..] else id;
+        if (bare.len == 0) continue;
+        try out.append(gpa, .{ .id = try gpa.dupe(u8, bare) });
     }
     return out.toOwnedSlice(gpa);
 }
@@ -153,6 +156,17 @@ test "parseResponse keeps non-empty ids and skips blanks" {
     try std.testing.expectEqual(@as(usize, 2), models.len);
     try std.testing.expectEqualStrings("gpt-5", models[0].id);
     try std.testing.expectEqualStrings("gpt-5-mini", models[1].id);
+}
+
+test "parseResponse strips the google models/ id prefix" {
+    const gpa = std.testing.allocator;
+    const models = try parseResponse(gpa, "{\"data\":[{\"id\":\"models/gemini-2.5-flash\"},{\"id\":\"models/\"}]}");
+    defer {
+        for (models) |*m| m.deinit(gpa);
+        gpa.free(models);
+    }
+    try std.testing.expectEqual(@as(usize, 1), models.len);
+    try std.testing.expectEqualStrings("gemini-2.5-flash", models[0].id);
 }
 
 test "parseResponse returns an empty slice for an empty data array" {
