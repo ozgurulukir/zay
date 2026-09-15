@@ -12,6 +12,7 @@ const config_mod = @import("../config/config.zig");
 const lane_state_mod = @import("lanes/lane_state.zig");
 const model_catalogue = @import("model_catalogue.zig");
 const model_loader = @import("model_loader.zig");
+const codex_login_job = @import("codex_login_job.zig");
 const model_picker = @import("widgets/model_picker.zig");
 const openai_compatible_mod = @import("../ai/openai_compatible.zig");
 const provider_picker = @import("widgets/provider_picker.zig");
@@ -472,8 +473,74 @@ pub fn defaultModelScope(self: *App) ModelScope {
 
 pub fn connectCodex(self: *App) !void {
     if (self.thread.turn.isActive()) return error.InFlightTurn;
-    var credentials = try codex.login(self.gpa, self.io, self.liveRuntime().?.home_dir);
-    defer credentials.deinit(self.gpa);
+    if (self.codex_login_job != null) return error.LoginInProgress;
+    const runtime = self.liveRuntime() orelse return error.NoActiveRuntime;
+    if (runtime.home_dir.len == 0) return error.NoActiveRuntime;
+
+    const job = try codex_login_job.Job.start(
+        self.gpa,
+        self.io,
+        runtime.home_dir,
+        self.thread.generation,
+        activeSessionId(self),
+    );
+    self.codex_login_job = job;
+    self.mode = .normal;
+    self.clearInput();
+    _ = self.thread.transcript.append(
+        self.gpa,
+        .notice,
+        "agent",
+        "OpenAI authentication started in your browser. Complete sign-in there.",
+    ) catch {};
+}
+
+pub fn codexLoginActive(self: *const App) bool {
+    return self.codex_login_job != null;
+}
+
+pub fn cancelCodexLogin(self: *App) void {
+    if (self.codex_login_job) |job| {
+        self.codex_login_job = null;
+        job.deinit();
+    }
+}
+
+/// Apply a completed browser login on the UI thread. The worker result is
+/// ignored if the user switched lanes or sessions while the browser was open.
+pub fn drainCodexLogin(self: *App) !bool {
+    const job = self.codex_login_job orelse return false;
+    if (!job.isDone()) return false;
+    // Provider-picker opening starts a background model sweep. Let that result
+    // land before replacing the catalogue with Codex models; otherwise a late
+    // provider result could clear the freshly installed Codex entries.
+    if (self.pickers.models.load == .loading) return false;
+
+    const target_matches = codexLoginTargetMatches(self, job);
+    var outcome = job.takeOutcome();
+    self.codex_login_job = null;
+    job.deinit();
+    defer outcome.deinit(self.gpa);
+
+    if (!target_matches) return false;
+    switch (outcome) {
+        .ready => |credentials| {
+            finishCodexConnection(self, credentials) catch |err| {
+                try self.reportConnectionError(err);
+            };
+        },
+        .failed => |err| try self.reportConnectionError(err),
+    }
+    return true;
+}
+
+fn codexLoginTargetMatches(self: *const App, job: *const codex_login_job.Job) bool {
+    if (self.thread.generation != job.generation) return false;
+    if (job.session_id.len == 0) return true;
+    return std.mem.eql(u8, activeSessionId(self), job.session_id);
+}
+
+fn finishCodexConnection(self: *App, credentials: codex.Credentials) !void {
     self.pickers.models.models_cached = false;
     try reloadModelCatalog(self, .openai_codex);
     const model = selectedCodexModel(
@@ -484,7 +551,8 @@ pub fn connectCodex(self: *App) !void {
     );
     try connectCodexClient(self, credentials, model.id, effort);
     self.codex_signed_in = true;
-    self.liveRuntime().?.codex_connection_expired = false;
+    const runtime = self.liveRuntime() orelse return error.NoActiveRuntime;
+    runtime.codex_connection_expired = false;
     try persistModelSelection(self, .openai, null, model.id, effort, .global);
     self.mode = .normal;
     self.clearInput();

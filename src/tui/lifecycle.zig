@@ -92,6 +92,7 @@ fn deinitSharedServices(self: *App) void {
     for (self.background_modal_state.pending.items) |*delivery| self.freeDelivery(delivery);
     self.background_modal_state.pending.deinit(self.gpa);
 
+    provider_model.cancelCodexLogin(self);
     provider_model.cancelModelLoad(self);
     registry_job.cancel(self);
     cancelGitLabelJob(self);
@@ -264,6 +265,7 @@ fn drainModelsAndMcp(root: *RootWidget) !bool {
     lane_lifecycle.serviceLaneBridge(root.app);
     var visible_change = false;
     if (try provider_model.drainModelLoad(root.app)) visible_change = true;
+    if (try provider_model.drainCodexLogin(root.app)) visible_change = true;
     if (try registry_job.drain(root.app)) visible_change = true;
     if (provider_model.drainMcpNotifications(root.app)) visible_change = true;
     if (provider_model.drainMcpConnects(root.app)) visible_change = true;
@@ -346,6 +348,7 @@ fn decideShouldTick(root: *RootWidget) bool {
     const turn_active = root.app.anyTurnActive();
     const turn_cancel_pending = turn_lifecycle.turnCancelActive(root.app);
     const model_loading = root.app.pickers.models.load == .loading;
+    const codex_login_active = provider_model.codexLoginActive(root.app);
     const diff_loading = root.app.metrics.diff_loading();
     const blackhole_visible = root.app.metrics.blackhole_visible;
     const diff_refresh_pending = root.diff_refresh_pending;
@@ -363,6 +366,7 @@ fn decideShouldTick(root: *RootWidget) bool {
     return turn_active or
         turn_cancel_pending or
         model_loading or
+        codex_login_active or
         diff_loading or
         blackhole_visible or
         diff_refresh_pending or
