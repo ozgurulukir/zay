@@ -558,7 +558,9 @@ test "sign out removes missing auth file without error" {
     const io = std.testing.io;
     const home_dir = "/tmp/zay-missing-home-for-signout-test";
 
-    const auth_file = try std.fs.path.join(gpa, &.{ home_dir, ".config", "zay", "auth.json" });
+    // Resolve through authPath (SSoT) so this test stays in lockstep with
+    // what signOut actually deletes on every platform.
+    const auth_file = try auth.authPath(gpa, home_dir);
     defer gpa.free(auth_file);
 
     // Precondition: ensure the auth file is absent (idempotent cleanup of any

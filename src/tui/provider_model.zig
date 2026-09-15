@@ -175,8 +175,8 @@ pub fn catalogueIndexById(id: []const u8) ?usize {
     return null;
 }
 
-/// Reload the cached provider API keys from `~/.config/zay/auth.json`. Drives the
-/// picker badges and the multi-provider model catalogue.
+/// Reload the cached provider API keys from `auth.json` (platform config
+/// dir). Drives the picker badges and the multi-provider model catalogue.
 pub fn refreshProviderApiKeys(self: *App) !void {
     // Real early return, never an unwrap — this path is reachable with a
     // focused idle lane, and `.?` would be UB in ReleaseFast.

@@ -20,6 +20,7 @@ const vxfw = vaxis.vxfw;
 const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
 const config_mod = @import("../../config/config.zig");
+const paths = @import("../../paths.zig");
 const input = @import("input.zig");
 
 const assert = std.debug.assert;
@@ -355,21 +356,31 @@ pub const Content = struct {
         try panel.lineStyledAt(surface, 2, "ABOUT ZAY", ctx, left_col, p.panel_header);
         try panel.lineStyledAt(surface, 4, self.version_string, ctx, left_col, p.info);
 
-        // Config file paths.
+        // Config file paths. Global config resolves through the same
+        // platform-aware base as `parse.globalConfigPath` (Windows:
+        // %APPDATA%\zay, POSIX: ~/.config/zay), so what the panel shows is
+        // where the file is actually read/written.
         try panel.lineStyledAt(surface, 6, "Configuration Files", ctx, left_col, p.panel_header);
 
-        const global_path = try std.fmt.allocPrint(ctx.arena, "  Global config : {s}/.config/zay/config.json", .{self.home_dir});
+        const sep = std.fs.path.sep_str;
+        const global_base = if (self.home_dir.len > 0)
+            paths.platformConfigDir(ctx.arena, self.home_dir) catch "~"
+        else
+            "~";
+        const global_path = try std.fmt.allocPrint(ctx.arena, "  Global config : {s}" ++ sep ++ "config.json", .{global_base});
         try panel.lineStyledAt(surface, 7, global_path, ctx, left_col, p.thinking_body);
 
-        const project_path = try std.fmt.allocPrint(ctx.arena, "  Project config: {s}/.zay/config.json", .{self.cwd});
+        const project_path = try std.fmt.allocPrint(ctx.arena, "  Project config: {s}" ++ sep ++ ".zay" ++ sep ++ "config.json", .{self.cwd});
         try panel.lineStyledAt(surface, 8, project_path, ctx, left_col, p.thinking_body);
 
-        const auth_path = try std.fmt.allocPrint(ctx.arena, "  API keys      : {s}/.config/zay/auth.json", .{self.home_dir});
+        // auth.json lives in the same platform config dir as the global
+        // config (auth.store.authPath uses paths.platformConfigDir too).
+        const auth_path = try std.fmt.allocPrint(ctx.arena, "  API keys      : {s}" ++ sep ++ "auth.json", .{global_base});
         try panel.lineStyledAt(surface, 9, auth_path, ctx, left_col, p.thinking_body);
 
         try panel.lineStyledAt(surface, 11, "Config Layer Priority  (later overrides earlier)", ctx, left_col, p.panel_header);
         try panel.lineStyledAt(surface, 12, "  1. Built-in defaults", ctx, left_col, p.thinking_body);
-        try panel.lineStyledAt(surface, 13, "  2. Global config  (~/.config/zay/config.json)", ctx, left_col, p.thinking_body);
+        try panel.lineStyledAt(surface, 13, "  2. Global config  (path shown above)", ctx, left_col, p.thinking_body);
         try panel.lineStyledAt(surface, 14, "  3. Project config (.zay/config.json)", ctx, left_col, p.thinking_body);
         try panel.lineStyledAt(surface, 15, "  4. Environment variables (OPENAI_MODEL, OPENAI_API_KEY, …)", ctx, left_col, p.thinking_body);
     }
