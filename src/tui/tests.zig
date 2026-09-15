@@ -1254,6 +1254,9 @@ test "alt navigation and ctrl-steer drive the queued message line" {
     // ALT+→ moves to the newer, still-queued message: back to "[...]".
     app.selectNextQueued();
     try std.testing.expectEqual(@as(usize, 1), app.nav.queued_selection);
+    // Refresh the snapshot — queued_selection is a value copy (production
+    // re-reads it via buildInputProps every frame).
+    input_widget.props.queued_selection = app.nav.queued_selection;
     const surface2 = try input_widget.widget().draw(ctx);
     try std.testing.expectEqualStrings("[", surface2.children[0].surface.readCell(0, 0).char.grapheme);
 }
