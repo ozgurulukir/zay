@@ -15,6 +15,12 @@ const auth = @import("store.zig");
 const windows = if (os.is_windows) struct {
     const std_windows = std.os.windows;
 
+    const coinit_apartment_threaded: u32 = 0x2;
+    const coinit_disable_ole1_dde: u32 = 0x4;
+
+    extern "ole32" fn CoInitializeEx(reserved: ?*anyopaque, coinit: u32) callconv(.winapi) i32;
+    extern "ole32" fn CoUninitialize() callconv(.winapi) void;
+
     extern "shell32" fn ShellExecuteW(
         hwnd: ?std_windows.HWND,
         operation: [*:0]const u16,
@@ -28,6 +34,25 @@ const windows = if (os.is_windows) struct {
 const test_windows = if (os.is_windows) struct {
     const std_windows = std.os.windows;
 
+    threadlocal var com_initialized = false;
+    threadlocal var shell_execute_called = false;
+
+    fn reset() void {
+        com_initialized = false;
+        shell_execute_called = false;
+    }
+
+    fn coInitializeSuccess(_: ?*anyopaque, _: u32) callconv(.winapi) i32 {
+        std.debug.assert(!com_initialized);
+        com_initialized = true;
+        return 0;
+    }
+
+    fn coUninitialize() callconv(.winapi) void {
+        std.debug.assert(com_initialized);
+        com_initialized = false;
+    }
+
     fn shellExecuteWithAmpersand(
         _: ?std_windows.HWND,
         _: [*:0]const u16,
@@ -36,6 +61,9 @@ const test_windows = if (os.is_windows) struct {
         _: ?[*:0]const u16,
         _: i32,
     ) callconv(.winapi) isize {
+        shell_execute_called = true;
+        if (!com_initialized) return 31;
+
         var index: usize = 0;
         while (file[index] != 0) : (index += 1) {
             if (file[index] == '&') return 33;
@@ -256,12 +284,32 @@ fn openBrowser(gpa: std.mem.Allocator, io: std.Io, url: []const u8) !void {
 }
 
 fn openBrowserWindows(gpa: std.mem.Allocator, url: []const u8) !void {
-    return openBrowserWindowsWith(gpa, url, windows.ShellExecuteW);
+    return openBrowserWindowsWith(
+        gpa,
+        url,
+        windows.CoInitializeEx,
+        windows.CoUninitialize,
+        windows.ShellExecuteW,
+    );
 }
 
-fn openBrowserWindowsWith(gpa: std.mem.Allocator, url: []const u8, shell_execute: anytype) !void {
+fn openBrowserWindowsWith(
+    gpa: std.mem.Allocator,
+    url: []const u8,
+    co_initialize: anytype,
+    co_uninitialize: anytype,
+    shell_execute: anytype,
+) !void {
     // ShellExecuteW invokes the registered HTTPS handler directly. Passing the
     // URL to cmd.exe would let query-string '&' characters become shell syntax.
+    const coinit_flags = windows.coinit_apartment_threaded | windows.coinit_disable_ole1_dde;
+    const hresult = co_initialize(null, coinit_flags);
+    if (!hresultSucceeded(hresult)) {
+        log.warn("codex.browser.com_init.failed hresult=0x{x}", .{@as(u32, @bitCast(hresult))});
+        return error.BrowserOpenFailed;
+    }
+    defer co_uninitialize();
+
     const url_utf16 = try std.unicode.utf8ToUtf16LeAllocZ(gpa, url);
     defer gpa.free(url_utf16);
 
@@ -271,6 +319,10 @@ fn openBrowserWindowsWith(gpa: std.mem.Allocator, url: []const u8, shell_execute
         log.warn("codex.browser.open.failed code={d}", .{result});
         return error.BrowserOpenFailed;
     }
+}
+
+fn hresultSucceeded(hresult: i32) bool {
+    return hresult >= 0;
 }
 
 /// Upper bound on how long `waitForAuthorizationCode` blocks waiting for the
@@ -755,11 +807,23 @@ test "createAuthorizationFlow constructs valid PKCE authorization URL and state"
 
 test "Windows browser opener passes OAuth query separators as URL data" {
     if (comptime !os.is_windows) return error.SkipZigTest;
+    test_windows.reset();
+
     try openBrowserWindowsWith(
         std.testing.allocator,
         "https://auth.openai.com/oauth/authorize?code_challenge=abc&state=def",
+        test_windows.coInitializeSuccess,
+        test_windows.coUninitialize,
         test_windows.shellExecuteWithAmpersand,
     );
+    try std.testing.expect(!test_windows.com_initialized);
+    try std.testing.expect(test_windows.shell_execute_called);
+}
+
+test "COM HRESULT classification accepts success and rejects failure" {
+    try std.testing.expect(hresultSucceeded(0));
+    try std.testing.expect(hresultSucceeded(1));
+    try std.testing.expect(!hresultSucceeded(@bitCast(@as(u32, 0x80004005))));
 }
 
 const MockCallbackClient = struct {
