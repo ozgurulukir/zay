@@ -1453,6 +1453,39 @@ test "compatible base url falls back when cached local provider differs" {
     try std.testing.expectEqualStrings("http://localhost:11434", provider_model.compatibleBaseUrl(&app, .ollama).?);
 }
 
+test "compatible provider switch does not reuse previous provider api key" {
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.cached_config.api_key = @constCast("provider-a-key");
+    app.cached_config.model_selection = .{ .custom = .{
+        .provider_name = @constCast("provider-a"),
+        .base_url = @constCast("https://provider-a.example/v1"),
+        .api_key = @constCast(""),
+        .model = .{ .id = @constCast("model-a") },
+    } };
+
+    const provider_b: model_loader.Compatible = .{
+        .provider = .openai_compatible,
+        .base_url = "https://provider-b.example/v1",
+        .auth_key_id = "provider-b",
+    };
+    try std.testing.expectEqualStrings("", provider_model.compatibleApiKeyForConn(&app, provider_b));
+
+    const provider_a: model_loader.Compatible = .{
+        .provider = .openai_compatible,
+        .base_url = "https://provider-a.example/v1",
+        .auth_key_id = "provider-a",
+    };
+    try std.testing.expectEqualStrings("provider-a-key", provider_model.compatibleApiKeyForConn(&app, provider_a));
+}
+
 test "codex sign-in survives selecting local compatible provider" {
     const gpa = std.testing.allocator;
     var home = try isolatedHome(gpa, std.testing.io);
@@ -1602,6 +1635,8 @@ test "switching from codex to catalogue provider resets cached connection" {
     try app.pickers.models.append(gpa, .{ .id = try gpa.dupe(u8, "zen"), .label = try gpa.dupe(u8, "zen") }, .{ .openai_compatible = try model_loader.compatibleSource(gpa, .opencode_zen, "https://opencode.ai/zen/v1", "opencode_zen") });
     app.pickers.models.model_selection = 0;
     app.cached_config_owned = true;
+    app.cached_config.dynamic_provider_name = try gpa.dupe(u8, "provider-a");
+    app.cached_config.dynamic_provider_id = try gpa.dupe(u8, "provider-a");
     app.cached_config.model_selection = .{
         .builtin = .{
             .provider = .openai,
@@ -1616,6 +1651,8 @@ test "switching from codex to catalogue provider resets cached connection" {
     try std.testing.expectEqual(config_mod.Provider.opencode_zen, ms.provider());
     try std.testing.expectEqualStrings("https://opencode.ai/zen/v1", ms.provider().defaultBaseUrl().?);
     try std.testing.expect(ms.apiKey() == null);
+    try std.testing.expect(app.cached_config.dynamic_provider_name == null);
+    try std.testing.expect(app.cached_config.dynamic_provider_id == null);
     try std.testing.expectEqualStrings("https://opencode.ai/zen/v1/chat/completions", runtime.client.openai_compatible.url);
 }
 

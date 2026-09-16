@@ -1039,7 +1039,7 @@ pub fn applySelectedModel(self: *App) !void {
             // önler.
             const api_key = compatibleApiKeyForConn(self, conn);
             if (api_key.len == 0 and conn.provider.requiresApiKey()) return error.NotConnected;
-            try attachOpenAiCompatibleClient(self, conn.base_url, api_key, model.id, effort);
+            try attachOpenAiCompatibleClient(self, &conn, api_key, model.id, effort);
             try persistModelSelection(self, conn.provider, conn, model.id, effort, self.pickers.models.model_scope);
         },
     }
@@ -1179,6 +1179,10 @@ pub fn updateCachedProviderConnection(self: *App, provider: config_mod.Provider,
         }
         return;
     }
+    if (self.cached_config.dynamic_provider_name) |previous| self.gpa.free(previous);
+    self.cached_config.dynamic_provider_name = null;
+    if (self.cached_config.dynamic_provider_id) |previous| self.gpa.free(previous);
+    self.cached_config.dynamic_provider_id = null;
     if (provider.defaultBaseUrl()) |base_url| try replaceCachedBaseUrl(self, base_url);
     clearCachedApiKey(
         self,
@@ -1527,7 +1531,13 @@ pub fn compatibleApiKey(self: *const App, provider: config_mod.Provider) []const
 /// provider'ın anahtarını çözümlemeyi önler.
 pub fn compatibleApiKeyForConn(self: *const App, conn: model_loader.Compatible) []const u8 {
     if (self.provider_state.api_keys.get(conn.auth_key_id)) |key| return key;
-    if (self.cached_config.api_key) |key| return key;
+    if (self.cached_config.api_key) |key| {
+        const cached_name = if (self.cached_config.model_selection) |selection|
+            selection.providerName()
+        else
+            self.cached_config.provider_name orelse "";
+        if (std.mem.eql(u8, cached_name, conn.auth_key_id)) return key;
+    }
     if (conn.provider.anonymousApiKey()) |anon| return anon;
     return providerLocalApiKey(conn.provider);
 }
@@ -1672,7 +1682,7 @@ pub fn connectCodexClient(
 
 pub fn attachOpenAiCompatibleClient(
     self: *App,
-    base_url: []const u8,
+    conn: *const model_loader.Compatible,
     api_key: []const u8,
     model_id: []const u8,
     effort: ai.ReasoningEffort,
@@ -1687,18 +1697,15 @@ pub fn attachOpenAiCompatibleClient(
     runtime.mcp_tools = mcp_schemas;
     runtime.strict_outputs = self.cached_config.strict_outputs orelse false;
     runtime.wire_dialect = ai.WireDialect.resolve(
-        cachedProvider(self) orelse .openai_compatible,
-        self.cached_config.provider_name orelse "",
-        base_url,
+        conn.provider,
+        conn.auth_key_id,
+        conn.base_url,
     );
-    // Raw user headers, borrowed from cached_config for the synchronous
-    // attach — the runtime expands and merges them (user wins over the
-    // zen/OpenRouter auto headers) inside the attach.
-    const provider_label = if (cachedProvider(self)) |provider| provider.label() else "openai_compatible";
-    const user_headers = self.cached_config.providerHeadersByName(
-        self.cached_config.provider_name orelse provider_label,
-    );
-    try runtime.attachOpenAiCompatibleClient(base_url, api_key, model_id, effort, user_headers);
+    // The selected catalogue entry is the source of truth during a switch.
+    // cached_config still describes the previous live provider until the new
+    // client has attached successfully and the selection is persisted.
+    const user_headers = self.cached_config.providerHeadersByName(conn.auth_key_id);
+    try runtime.attachOpenAiCompatibleClient(conn.base_url, api_key, model_id, effort, user_headers);
     self.thread.agent.?.client = runtime.client;
     injectPluginTools(self);
     // See connectCodexClient — without this, plugin tools sit in the
