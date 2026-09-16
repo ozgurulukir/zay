@@ -8,7 +8,9 @@ pub const Message = proto.Message;
 pub const MessageType = Message.Type;
 pub const MessageTextType = Message.TextType;
 
-pub const Client = @import("client/client.zig").Client;
+const client = @import("client/client.zig");
+pub const Client = client.Client;
+pub const socket_write_timeout_supported = client.socket_write_timeout_supported;
 
 pub const Compression = struct {
     write_threshold: ?usize = null,
