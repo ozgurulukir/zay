@@ -132,10 +132,11 @@ fn providerLabel(config: config_mod.Config) ?[]const u8 {
 /// provider_name (populated from the "defaultModel" field), then the
 /// builtin label.
 fn providerDisplayName(config: config_mod.Config) ?[]const u8 {
-    if (config.dynamic_provider_name) |name| return name;
     if (config.model_selection) |ms| {
         if (ms.provider() == .openai_compatible and ms.providerName().len > 0) return ms.providerName();
+        return ms.provider().label();
     }
+    if (config.dynamic_provider_name) |name| return name;
     // After restart model_selection is null; the legacy provider_name
     // IS populated from the "defaultModel" config field (e.g. "stepfun-ai").
     if (config.provider_name) |name| {
@@ -156,6 +157,35 @@ test "model status renders a non-default reasoning effort" {
     const text = try formatModelStatus(gpa, .{ .provider = "ollama", .model = "llama3.1:8b", .reasoning = "high" });
     defer gpa.free(text);
     try std.testing.expectEqualStrings("ollama · llama3.1:8b [high]", text);
+}
+
+test "model status prefers selected provider over stale dynamic display name" {
+    const config: config_mod.Config = .{
+        .dynamic_provider_name = @constCast("provider-a"),
+        .model_selection = .{ .custom = .{
+            .provider_name = @constCast("provider-b"),
+            .base_url = @constCast("https://provider-b.example/v1"),
+            .api_key = @constCast(""),
+            .model = .{ .id = @constCast("model-x") },
+        } },
+    };
+    const status = modelStatus(null, config).?;
+    try std.testing.expectEqualStrings("provider-b", status.provider);
+    try std.testing.expectEqualStrings("model-x", status.model);
+}
+
+test "model status prefers selected builtin over stale dynamic display name" {
+    const config: config_mod.Config = .{
+        .dynamic_provider_name = @constCast("provider-a"),
+        .model_selection = .{ .builtin = .{
+            .provider = .ollama,
+            .provider_name = @constCast("ollama"),
+            .model = .{ .id = @constCast("model-x") },
+        } },
+    };
+    const status = modelStatus(null, config).?;
+    try std.testing.expectEqualStrings("ollama", status.provider);
+    try std.testing.expectEqualStrings("model-x", status.model);
 }
 
 test "effortLabel defaults unset to medium" {
