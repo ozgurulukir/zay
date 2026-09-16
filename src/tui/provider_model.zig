@@ -465,6 +465,68 @@ pub const restoreModelCache = model_loader_job.restoreModelCache;
 pub const saveModelCache = model_loader_job.saveModelCache;
 pub const collectModelCacheConfigured = model_loader_job.collectModelCacheConfigured;
 
+/// Append models.dev registry models for each freshly-fetched provider's
+/// auth_key_id that the /models fetch did not already return. Dedup by exact
+/// model id against the whole catalogue makes this a no-op for providers whose
+/// endpoint already lists everything. Runs on both merge and full-reload paths.
+/// Restricted to `.openai_compatible` conns (dynamic/config providers) — see
+/// Architecture Decisions §3.1. Only providers present in `sources` (i.e. whose
+/// `/models` fetch succeeded) are merged — the registry is a supplement to a
+/// successful fetch, never a fallback for a failed one (§3.5).
+pub fn mergeRegistryModels(
+    gpa: std.mem.Allocator,
+    catalogue: *model_catalogue.ModelCatalogue,
+    reg: *const modelsdev.Registry,
+    sources: []const model_loader.ModelSource,
+) !void {
+    // Dedup by exact model id against the whole catalogue, so freshly-fetched
+    // models already present are not duplicated.
+    var seen = std.StringHashMap(void).init(gpa);
+    defer seen.deinit();
+    for (catalogue.entries.items) |entry| {
+        try seen.put(entry.model.id, {});
+    }
+
+    // Dedup conns by auth_key_id: a provider fetched once must not be merged
+    // twice (e.g. the same dynamic provider appearing in multiple sources).
+    var seen_conns = std.StringHashMap(void).init(gpa);
+    defer seen_conns.deinit();
+
+    for (sources) |source| switch (source) {
+        .openai_codex => {},
+        .openai_compatible => |conn| {
+            // Builtin catalogue providers, local providers, and anonymous-tier
+            // providers are excluded — their /models filtering (e.g. `-free`
+            // only for the zen public sentinel, `-cloud` dropped for ollama)
+            // must not be bypassed by registry models (§3.1).
+            if (conn.provider != .openai_compatible) continue;
+            if (seen_conns.contains(conn.auth_key_id)) continue;
+            try seen_conns.put(conn.auth_key_id, {});
+
+            // Config providers not in the registry are skipped by the null lookup.
+            const dyn_p = reg.lookup(conn.auth_key_id) orelse continue;
+
+            var prefix_buf: [128]u8 = undefined;
+            const prefix = std.fmt.bufPrint(&prefix_buf, "{s}/", .{conn.auth_key_id}) catch continue;
+
+            for (reg.models) |m| {
+                if (!std.mem.startsWith(u8, m.id, prefix)) continue;
+                if (seen.contains(m.id)) continue;
+                try seen.put(m.id, {});
+                const id = try gpa.dupe(u8, m.id);
+                errdefer gpa.free(id);
+                const label = try model_loader.formatModelLabel(gpa, dyn_p.name, m.id);
+                errdefer gpa.free(label);
+                var merged_source: model_loader.ModelSource = .{
+                    .openai_compatible = try model_loader.compatibleSource(gpa, conn.provider, conn.base_url, conn.auth_key_id),
+                };
+                errdefer merged_source.deinit(gpa);
+                try catalogue.append(gpa, .{ .id = id, .label = label }, merged_source);
+            }
+        },
+    };
+}
+
 pub fn defaultModelScope(self: *App) ModelScope {
     const runtime = self.liveRuntime() orelse return .global;
     if (config_mod.projectConfigExists(self.gpa, self.io, runtime.cwd)) return .project;
@@ -1963,4 +2025,102 @@ test "rebuildProviderEntries merges registry providers and clamps selection" {
     try rebuildProviderEntries(&app);
     try std.testing.expect(app.pickers.provider.entries.len > 0);
     try std.testing.expectEqual(@as(u32, 0), app.pickers.provider.selection);
+}
+
+test "mergeRegistryModels appends registry models for fetched providers, deduped" {
+    const gpa = std.testing.allocator;
+
+    // Build a registry through the real parse path (test seam: parseModelsDevJson
+    // is pub). The cline-pass provider carries the two subscription models the
+    // /models endpoint omits.
+    const json =
+        \\{
+        \\  "cline-pass": {
+        \\    "api": "https://api.cline.bot/api/v1",
+        \\    "name": "ClinePass",
+        \\    "models": {
+        \\      "cline-pass/deepseek-v4-flash": {},
+        \\      "cline-pass/qwen3.7-max": {}
+        \\    }
+        \\  }
+        \\}
+    ;
+    var reg = try modelsdev.parseModelsDevJson(gpa, json);
+    defer reg.deinit(gpa);
+
+    // The catalogue already holds one fetched model (the /models endpoint
+    // returns it) — the merge must not duplicate it.
+    var catalogue: model_catalogue.ModelCatalogue = .{};
+    defer catalogue.deinit(gpa);
+    try catalogue.append(gpa, .{
+        .id = try gpa.dupe(u8, "cline-pass/deepseek-v4-flash"),
+        .label = try gpa.dupe(u8, "ClinePass · cline-pass/deepseek-v4-flash"),
+    }, .{ .openai_compatible = try model_loader.compatibleSource(gpa, .openai_compatible, "https://api.cline.bot/api/v1", "cline-pass") });
+
+    // The freshly-fetched provider's conn, including a configured proxy URL.
+    const configured_base_url = "https://proxy.example.com/cline/v1";
+    const sources = [_]model_loader.ModelSource{
+        .{ .openai_compatible = try model_loader.compatibleSource(gpa, .openai_compatible, configured_base_url, "cline-pass") },
+    };
+    defer for (sources) |s| s.deinit(gpa);
+
+    try mergeRegistryModels(gpa, &catalogue, &reg, &sources);
+
+    // The missing model was merged; the fetched one was not duplicated.
+    try std.testing.expectEqual(@as(u32, 2), catalogue.len());
+    try std.testing.expectEqualStrings("cline-pass/qwen3.7-max", catalogue.entries.items[1].model.id);
+    const expected_label = try model_loader.formatModelLabel(gpa, "ClinePass", "cline-pass/qwen3.7-max");
+    defer gpa.free(expected_label);
+    try std.testing.expectEqualStrings(expected_label, catalogue.entries.items[1].model.label);
+    // Merged entry's source is indistinguishable from a fetched one: provider,
+    // configured base_url, and auth_key_id all come from the successful conn.
+    const conn = catalogue.entries.items[1].source.openai_compatible;
+    try std.testing.expectEqual(config_mod.Provider.openai_compatible, conn.provider);
+    try std.testing.expectEqualStrings(configured_base_url, conn.base_url);
+    try std.testing.expectEqualStrings("cline-pass", conn.auth_key_id);
+}
+
+test "mergeRegistryModels skips unknown, codex, and non-compatible conns" {
+    const gpa = std.testing.allocator;
+
+    // The registry knows cline-pass AND opencode_zen — the guard must skip the
+    // zen conn anyway (its conn.provider is the anonymous-tier enum, not
+    // .openai_compatible), proving the guard fires before the lookup.
+    const json =
+        \\{
+        \\  "cline-pass": {
+        \\    "api": "https://api.cline.bot/api/v1",
+        \\    "name": "ClinePass",
+        \\    "models": { "cline-pass/qwen3.7-max": {} }
+        \\  },
+        \\  "opencode_zen": {
+        \\    "api": "https://opencode.ai/zen/v1",
+        \\    "name": "OpenCode Zen",
+        \\    "models": { "opencode_zen/zen-model": {} }
+        \\  }
+        \\}
+    ;
+    var reg = try modelsdev.parseModelsDevJson(gpa, json);
+    defer reg.deinit(gpa);
+
+    var catalogue: model_catalogue.ModelCatalogue = .{};
+    defer catalogue.deinit(gpa);
+
+    const sources = [_]model_loader.ModelSource{
+        // auth_key_id not in the registry → skipped by the null lookup.
+        .{ .openai_compatible = try model_loader.compatibleSource(gpa, .openai_compatible, "https://example.com/v1", "no-such-provider") },
+        // Codex sources are never merged.
+        .openai_codex,
+        // A local provider conn (same union tag, different provider field) is
+        // excluded by the `.openai_compatible` guard.
+        .{ .openai_compatible = try model_loader.compatibleSource(gpa, .ollama, "http://localhost:11434/v1", "ollama") },
+        // An anonymous-tier provider conn is excluded by the same guard even
+        // though the registry knows the id.
+        .{ .openai_compatible = try model_loader.compatibleSource(gpa, .opencode_zen, "https://opencode.ai/zen/v1", "opencode_zen") },
+    };
+    defer for (sources) |s| s.deinit(gpa);
+
+    try mergeRegistryModels(gpa, &catalogue, &reg, &sources);
+
+    try std.testing.expectEqual(@as(u32, 0), catalogue.len());
 }

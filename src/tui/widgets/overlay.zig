@@ -23,6 +23,7 @@ const help_picker = @import("help_picker.zig");
 const lanes_picker = @import("lanes_picker.zig");
 const search_widget = @import("search.zig");
 const model_picker = @import("model_picker.zig");
+const model_loader = @import("../model_loader.zig");
 const provider_picker = @import("provider_picker.zig");
 const resume_picker = @import("resume_picker.zig");
 const tree_selector = @import("tree_selector.zig");
@@ -412,13 +413,16 @@ const OverlayInner = struct {
         // keeps the picker decoupled from the catalogue's internal layout.
         const entries = app.pickers.models.entries.items;
         const picker_models = try ctx.arena.alloc(codex.Model, entries.len);
+        const picker_sources = try ctx.arena.alloc(model_loader.ModelSource, entries.len);
         const picker_reasoning = try ctx.arena.alloc(u32, entries.len);
         for (entries, 0..) |entry, i| {
             picker_models[i] = entry.model;
+            picker_sources[i] = entry.source;
             picker_reasoning[i] = entry.reasoning_index;
         }
         var content: model_picker.Content = .{
             .models = picker_models,
+            .sources = picker_sources,
             .list = &app.list_widgets.model_list,
             .selection = app.pickers.models.model_selection,
             .column = app.pickers.models.model_column,

@@ -9,6 +9,7 @@ const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
 const config_mod = @import("../../config/config.zig");
 const command_panel = @import("command_panel.zig");
+const model_loader = @import("../model_loader.zig");
 
 fn columnStyle(focused: bool, selected: bool) vaxis.Style {
     const p = tui_style.activePalette();
@@ -57,8 +58,26 @@ pub fn displayToStorage(active_storage_idx: ?u32, display_pos: u32) u32 {
     return if (offset < aidx) offset else offset + 1;
 }
 
+/// ClinePass subscription-tier convention: `~`-prefixed ids are Cline Pro/Max
+/// subscription models and `cline-pass/` ids are ClinePass subscription
+/// models. Other ClinePass models are pay-as-you-go.
+pub fn isSubscriptionModel(id: []const u8) bool {
+    return std.mem.startsWith(u8, id, "~") or std.mem.startsWith(u8, id, "cline-pass/");
+}
+
+/// Tier tags are meaningful only for the ClinePass catalogue.
+pub fn tierTag(source: model_loader.ModelSource, id: []const u8) ?[]const u8 {
+    const conn = switch (source) {
+        .openai_codex => return null,
+        .openai_compatible => |conn| conn,
+    };
+    if (!std.mem.eql(u8, conn.auth_key_id, "cline-pass")) return null;
+    return if (isSubscriptionModel(id)) "SUB" else "PAYG";
+}
+
 pub const Content = struct {
     models: []const codex.Model,
+    sources: []const model_loader.ModelSource,
     list: *vxfw.ListView,
     selection: u32,
     column: Column,
@@ -137,6 +156,7 @@ pub const Content = struct {
     const Built = struct { widgets: []vxfw.Widget, cursor: u32 };
 
     fn modelWidgets(self: *Content, ctx: vxfw.DrawContext) !Built {
+        std.debug.assert(self.models.len == self.sources.len);
         const active_storage_idx = findActiveStorageIdx(self.models, self.active_model);
 
         var match_count: usize = 0;
@@ -159,6 +179,7 @@ pub const Content = struct {
             if (!matches(self.models[storage_idx], self.filter)) continue;
             rows[vis] = .{
                 .model = &self.models[storage_idx],
+                .source = self.sources[storage_idx],
                 .selected = self.selection == d,
                 .column = self.column,
                 .active_model = self.active_model,
@@ -225,11 +246,13 @@ test "selection wrap to first row restores header" {
         .{ .id = @constCast("m8"), .label = @constCast("m8") },
         .{ .id = @constCast("m9"), .label = @constCast("m9") },
     };
+    const sources = [_]model_loader.ModelSource{.openai_codex} ** models.len;
     const reasoning = [_]u32{0} ** models.len;
     const options = [_]ReasoningOption{.{ .label = "medium (Default)", .effort = .medium }};
     var list: vxfw.ListView = .{ .children = .{ .slice = &.{} }, .draw_cursor = false };
     var content: Content = .{
         .models = &models,
+        .sources = &sources,
         .list = &list,
         .selection = @intCast(models.len - 1),
         .column = .model,
@@ -272,11 +295,13 @@ test "filter limits the visible model rows" {
         .{ .id = @constCast("o3-mini"), .label = @constCast("o3-mini") },
         .{ .id = @constCast("gpt-5-codex"), .label = @constCast("GPT-5 Codex") },
     };
+    const sources = [_]model_loader.ModelSource{.openai_codex} ** models.len;
     const reasoning = [_]u32{0} ** models.len;
     const options = [_]ReasoningOption{.{ .label = "medium (Default)", .effort = .medium }};
     var list: vxfw.ListView = .{ .children = .{ .slice = &.{} }, .draw_cursor = false };
     var content: Content = .{
         .models = &models,
+        .sources = &sources,
         .list = &list,
         .selection = 0,
         .column = .model,
@@ -297,8 +322,76 @@ test "filter limits the visible model rows" {
     try std.testing.expectEqual(@as(?u32, 3), list.item_count);
 }
 
+test "tierTag classifies only ClinePass models" {
+    const cline_source: model_loader.ModelSource = .{ .openai_compatible = .{
+        .provider = .openai_compatible,
+        .base_url = "https://proxy.example.com/cline/v1",
+        .auth_key_id = "cline-pass",
+    } };
+    const unrelated_source: model_loader.ModelSource = .{ .openai_compatible = .{
+        .provider = .ollama,
+        .base_url = "http://localhost:11434/v1",
+        .auth_key_id = "ollama",
+    } };
+    // Cline Pro/Max `~`-prefixed ids are subscription models.
+    try std.testing.expect(isSubscriptionModel("~sonnet"));
+    try std.testing.expectEqualStrings("SUB", tierTag(cline_source, "~sonnet").?);
+    // ClinePass ids are subscription models.
+    try std.testing.expect(isSubscriptionModel("cline-pass/qwen3.7-max"));
+    try std.testing.expectEqualStrings("SUB", tierTag(cline_source, "cline-pass/qwen3.7-max").?);
+    // Other ClinePass models are pay-as-you-go.
+    try std.testing.expect(!isSubscriptionModel("deepseek/deepseek-v4-flash"));
+    try std.testing.expectEqualStrings("PAYG", tierTag(cline_source, "deepseek/deepseek-v4-flash").?);
+    // Model ids alone cannot assign billing semantics to other providers.
+    try std.testing.expect(tierTag(unrelated_source, "cline-pass/qwen3.7-max") == null);
+    try std.testing.expect(tierTag(.openai_codex, "~sonnet") == null);
+    // Boundaries: exact "cline-pass" (no slash) is not subscription; the
+    // prefix forms are.
+    try std.testing.expect(!isSubscriptionModel("cline-pass"));
+    try std.testing.expect(isSubscriptionModel("cline-pass/"));
+    try std.testing.expect(isSubscriptionModel("~"));
+}
+
+test "Cline tier tag and unrelated row render through the full draw path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const models = [_]codex.Model{
+        .{ .id = @constCast("cline-pass/qwen3.7-max"), .label = @constCast("ClinePass · cline-pass/qwen3.7-max") },
+        .{ .id = @constCast("deepseek/deepseek-v4-flash"), .label = @constCast("DeepSeek · deepseek/deepseek-v4-flash") },
+    };
+    const sources = [_]model_loader.ModelSource{
+        .{ .openai_compatible = .{ .provider = .openai_compatible, .base_url = "https://api.cline.bot/api/v1", .auth_key_id = "cline-pass" } },
+        .{ .openai_compatible = .{ .provider = .ollama, .base_url = "http://localhost:11434/v1", .auth_key_id = "ollama" } },
+    };
+    const reasoning = [_]u32{0} ** models.len;
+    const options = [_]ReasoningOption{.{ .label = "medium (Default)", .effort = .medium }};
+    var list: vxfw.ListView = .{ .children = .{ .slice = &.{} }, .draw_cursor = false };
+    var content: Content = .{
+        .models = &models,
+        .sources = &sources,
+        .list = &list,
+        .selection = 0,
+        .column = .model,
+        .active_model = null,
+        .reasoning_options = &options,
+        .reasoning_indexes = &reasoning,
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 7 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    _ = try content.widget().draw(ctx);
+    // Header + 2 model rows — one tagged Cline row and one untagged Ollama row.
+    try std.testing.expectEqual(@as(?u32, 3), list.item_count);
+}
+
 pub const Row = struct {
     model: *const codex.Model,
+    source: model_loader.ModelSource,
     selected: bool,
     column: Column,
     active_model: ?[]const u8,
@@ -332,15 +425,24 @@ pub const Row = struct {
             .highlight_enabled = self.highlight_enabled,
             .highlight_style = self.highlight_style,
         });
-        // Keep the inline ✓ badge (m3): trailing_mark would right-anchor at
-        // width-1, colliding with the reasoning column on selected rows.
+        // Keep the inline ✓ badge (m3) and the SUB/PAYG tier tag from
+        // colliding with the reasoning column on selected rows.
+        const label_end = start_col +
+            @as(u16, @intCast(@min(
+                ctx.stringWidth(prefix) + ctx.stringWidth(self.model.label),
+                @as(usize, std.math.maxInt(u16)),
+            )));
         if (self.activeModel()) {
-            const badge_col: u16 = start_col +
-                @as(u16, @intCast(@min(
-                    ctx.stringWidth(prefix) + ctx.stringWidth(self.model.label),
-                    @as(usize, std.math.maxInt(u16)),
-                )));
-            try panel.lineStyledAt(&surface, 0, " ✓", ctx, badge_col, tui_style.onSelectionBg(p.success, self.selected));
+            try panel.lineStyledAt(&surface, 0, " ✓", ctx, label_end, tui_style.onSelectionBg(p.success, self.selected));
+        }
+        if (tierTag(self.source, self.model.id)) |tag| {
+            const tag_col = panel.secondaryColumn(surface.size.width) -| @as(u16, @intCast(tag.len)) -| 1;
+            const tag_style = if (isSubscriptionModel(self.model.id)) p.notice else p.thinking_body;
+            // Skip the tag when it would overwrite the label/✓ tail (narrow
+            // terminals, long labels) — cosmetic, same class as the ✓ badge.
+            if (tag_col > label_end + 1) {
+                try panel.lineStyledAt(&surface, 0, tag, ctx, tag_col, tui_style.onSelectionBg(tag_style, self.selected));
+            }
         }
         if (self.selected) try self.drawReasoning(&surface, ctx);
         return surface;
