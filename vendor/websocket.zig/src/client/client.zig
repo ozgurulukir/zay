@@ -15,6 +15,11 @@ const Reader = proto.Reader;
 const Allocator = std.mem.Allocator;
 const Bundle = std.crypto.Certificate.Bundle;
 
+/// Zig 0.16 `Io.net` sockets are asynchronous AFD handles on Windows. Raw
+/// SO_SNDTIMEO setup can return STATUS_PENDING there, so Windows callers must
+/// bound writes by shutting down the socket from an external watchdog.
+pub const socket_write_timeout_supported = @import("builtin").os.tag != .windows;
+
 fn ReadLoopHandler(comptime T: type) type {
     const info = @typeInfo(T);
 
@@ -724,7 +729,9 @@ pub const Stream = struct {
 
     const zero_timeout = std.mem.toBytes(posix.timeval{ .sec = 0, .usec = 0 });
     pub fn writeTimeout(self: *const Stream, ms: u32) !void {
-        return self.setTimeout(posix.SO.SNDTIMEO, ms);
+        if (comptime socket_write_timeout_supported) {
+            return self.setTimeout(posix.SO.SNDTIMEO, ms);
+        }
     }
 
     pub fn readTimeout(self: *Stream, ms: u32) !void {
