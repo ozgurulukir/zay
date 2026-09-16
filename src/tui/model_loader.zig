@@ -308,10 +308,24 @@ fn loadConfiguredCtx(
         configured.base_url
     else
         configured.provider.defaultBaseUrl() orelse return;
-    const fetched = try openai_compatible_mod.listModels(gpa, io, base_url, configured.api_key, .{
+    var error_status: ?u16 = null;
+    var error_detail: ?[]u8 = null;
+    defer if (error_detail) |detail| gpa.free(detail);
+    const fetched = openai_compatible_mod.listModels(gpa, io, base_url, configured.api_key, .{
         .session_id = session_id,
         .user_headers = configured.headers,
-    });
+        .error_status_out = &error_status,
+        .error_detail_out = &error_detail,
+    }) catch |err| {
+        if (error_status) |status| {
+            if (error_detail) |detail| {
+                log.warn("model load {s}: failed: HTTP {d} — {s}", .{ configured.provider.label(), status, detail });
+            } else {
+                log.warn("model load {s}: failed: HTTP {d}", .{ configured.provider.label(), status });
+            }
+        }
+        return err;
+    };
     defer {
         for (fetched) |*entry| entry.deinit(gpa);
         gpa.free(fetched);

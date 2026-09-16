@@ -28,6 +28,8 @@ pub const Options = struct {
     /// User-configured headers for this provider, `{env:VAR}` already
     /// expanded by the caller. Borrowed for the call.
     user_headers: []const provider_headers.Header = &.{},
+    error_status_out: ?*?u16 = null,
+    error_detail_out: ?*?[]u8 = null,
 };
 
 pub fn listModels(
@@ -75,6 +77,26 @@ pub fn listModels(
     const status: u16 = @intFromEnum(response.head.status);
     log.info("openai_compatible.models.response.head status={d}", .{status});
     if (!http.isSuccess(status)) {
+        // Consume the body before returning so provider-specific diagnostics
+        // (Google reports invalid keys and disabled APIs here) are not reduced
+        // to the opaque HttpClientError shown by the loader.
+        const error_body = readBody(gpa, &response) catch |err| {
+            log.warn("openai_compatible.models.error status={d} body_read_failed={s}", .{ status, @errorName(err) });
+            if (status < 200) return error.HttpUnexpectedStatus;
+            if (status >= 500) return error.HttpServerError;
+            return error.HttpClientError;
+        };
+        defer gpa.free(error_body);
+        const detail = http.extractErrorMessage(gpa, error_body) catch |err| {
+            log.warn("openai_compatible.models.error status={d} detail_unavailable={s}", .{ status, @errorName(err) });
+            if (status < 200) return error.HttpUnexpectedStatus;
+            if (status >= 500) return error.HttpServerError;
+            return error.HttpClientError;
+        };
+        defer gpa.free(detail);
+        if (options.error_status_out) |out| out.* = status;
+        if (options.error_detail_out) |out| out.* = gpa.dupe(u8, detail) catch null;
+        log.warn("openai_compatible.models.error status={d} detail={s}", .{ status, detail });
         if (status < 200) return error.HttpUnexpectedStatus;
         if (status >= 500) return error.HttpServerError;
         return error.HttpClientError;
