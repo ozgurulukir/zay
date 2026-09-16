@@ -94,6 +94,16 @@ pub fn installModelLoadResult(self: *App, result: *model_loader.Result) !void {
     for (result.models.items, result.sources.items) |*model, source| {
         try self.pickers.models.append(self.gpa, model.*, source);
     }
+    // Merge models.dev registry models for the freshly-fetched providers so
+    // subscription models the /models endpoint omits (e.g. cline-pass/*) still
+    // appear. No-op when the registry is absent (cold start) or the endpoint
+    // already listed everything (dedup by exact id). Best-effort supplement:
+    // a merge failure must never fail the whole model load.
+    if (self.provider_state.modelsdev_registry) |*reg| {
+        provider_model.mergeRegistryModels(self.gpa, &self.pickers.models, reg, result.sources.items) catch |err| {
+            log.warn("models.registry.merge.failed err={s}", .{@errorName(err)});
+        };
+    }
     result.models.clearRetainingCapacity();
     result.sources.clearRetainingCapacity();
     // load was set to .idle by drainModelLoad before calling us; nothing

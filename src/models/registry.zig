@@ -536,7 +536,12 @@ fn loadVendored(gpa: std.mem.Allocator, io: std.Io) !VendoredResult {
 
 // ── JSON parsing ──
 
-fn parseModelsDevJson(gpa: std.mem.Allocator, bytes: []const u8) !Registry {
+/// Parse the models.dev `api.json` payload into a `Registry`. `pub` for the
+/// test seam: `provider_model.mergeRegistryModels` tests build a `Registry`
+/// from inline JSON through the real parse path (no other pub JSON→`Registry`
+/// entry point exists — the loaders need `io` + `home_dir`, `buildRegistry`
+/// needs a remote registry, `fetchAndCache` needs the network).
+pub fn parseModelsDevJson(gpa: std.mem.Allocator, bytes: []const u8) !Registry {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidApiJson;
