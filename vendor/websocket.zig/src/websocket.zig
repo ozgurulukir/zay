@@ -10,6 +10,7 @@ pub const MessageTextType = Message.TextType;
 
 const client = @import("client/client.zig");
 pub const Client = client.Client;
+pub const socket_shutdown_uses_io = client.socket_shutdown_uses_io;
 pub const socket_write_timeout_supported = client.socket_write_timeout_supported;
 
 pub const Compression = struct {

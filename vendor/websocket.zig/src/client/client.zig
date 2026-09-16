@@ -19,6 +19,7 @@ const Bundle = std.crypto.Certificate.Bundle;
 /// SO_SNDTIMEO setup can return STATUS_PENDING there, so Windows callers must
 /// bound writes by shutting down the socket from an external watchdog.
 pub const socket_write_timeout_supported = @import("builtin").os.tag != .windows;
+pub const socket_shutdown_uses_io = @import("builtin").os.tag == .windows;
 
 fn ReadLoopHandler(comptime T: type) type {
     const info = @typeInfo(T);
@@ -616,7 +617,9 @@ pub const Stream = struct {
 
         if (self.tls_client) |tls_client| {
             // Shutdown the socket first, so readLoop() can exit, before tls_client's buffers are freed
-            if (native_os == .wasi and !builtin.link_libc) {
+            if (comptime socket_shutdown_uses_io) {
+                self.stream.shutdown(self.io, .both) catch {};
+            } else if (native_os == .wasi and !builtin.link_libc) {
                 _ = std.os.wasi.sock_shutdown(fd, .{ .WR = true, .RD = true });
             } else {
                 posix.shutdown(fd, .both) catch {};
@@ -630,8 +633,8 @@ pub const Stream = struct {
         //
         // we don't want to crash on double close
 
-        if (native_os == .windows) {
-            return std.os.windows.CloseHandle(fd);
+        if (comptime socket_shutdown_uses_io) {
+            return self.stream.close(self.io);
         }
         if (native_os == .wasi and !builtin.link_libc) {
             _ = std.os.wasi.fd_close(fd);

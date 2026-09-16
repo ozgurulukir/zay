@@ -110,7 +110,7 @@ pub const Client = struct {
         defer client.close(.{}) catch {};
 
         var watchdog: WebSocketWatchdog = undefined;
-        try watchdog.start(self.core_client.io, client.stream.stream.socket.handle);
+        try watchdog.start(self.core_client.io, &client.stream.stream);
         defer watchdog.stop();
 
         const headers = try buildHandshakeHeaders(gpa, endpoint.host_header, self.core_client.authorization, self.core_client.config);
@@ -163,15 +163,15 @@ pub const Client = struct {
 };
 
 const WebSocketWatchdog = struct {
-    fd: std.posix.socket_t,
+    stream: *const std.Io.net.Stream,
     io: std.Io,
     deadline_ns: std.atomic.Value(i64),
     timed_out: std.atomic.Value(bool),
     future: ?std.Io.Future(void),
 
-    fn start(self: *WebSocketWatchdog, io: std.Io, fd: std.posix.socket_t) !void {
+    fn start(self: *WebSocketWatchdog, io: std.Io, stream: *const std.Io.net.Stream) !void {
         self.* = .{
-            .fd = fd,
+            .stream = stream,
             .io = io,
             .deadline_ns = .init(0),
             .timed_out = .init(false),
@@ -229,8 +229,7 @@ const WebSocketWatchdog = struct {
     }
 
     fn shutdown(self: *WebSocketWatchdog) void {
-        const rc = std.c.shutdown(self.fd, std.c.SHUT.RDWR);
-        _ = rc;
+        self.stream.shutdown(self.io, .both) catch {};
     }
 };
 
@@ -432,6 +431,30 @@ test "codex version header present on websocket handshake and sse request header
     }
     try std.testing.expectEqual(@as(usize, 1), found);
     try std.testing.expect(codex_responses_config.headers.len <= 8);
+}
+
+test "codex websocket watchdog shuts down Windows Io sockets without Winsock" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    const host = try std.Io.net.HostName.init("127.0.0.1");
+    var stream = try host.connect(io, server.socket.address.ip4.port, .{ .mode = .stream });
+    var peer = try server.accept(io);
+    defer stream.close(io);
+    defer peer.close(io);
+
+    var watchdog: WebSocketWatchdog = .{
+        .stream = &stream,
+        .io = io,
+        .deadline_ns = .init(0),
+        .timed_out = .init(false),
+        .future = null,
+    };
+    watchdog.shutdown();
 }
 
 test {
