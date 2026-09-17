@@ -95,9 +95,19 @@ pub fn extractContentText(gpa: std.mem.Allocator, result: std.json.Value) ![]u8 
 pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tools_common.Schema {
     if (value != .object) return tools_common.Schema{ .properties = &.{} };
     const obj = value.object;
+    const allow_extra_properties = if (obj.get("additionalProperties")) |extra|
+        extra != .bool or extra.bool
+    else
+        true;
 
-    const properties_val = obj.get("properties") orelse return tools_common.Schema{ .properties = &.{} };
-    if (properties_val != .object) return tools_common.Schema{ .properties = &.{} };
+    const properties_val = obj.get("properties") orelse return tools_common.Schema{
+        .properties = &.{},
+        .allow_extra_properties = allow_extra_properties,
+    };
+    if (properties_val != .object) return tools_common.Schema{
+        .properties = &.{},
+        .allow_extra_properties = allow_extra_properties,
+    };
 
     var required_set: std.StringHashMapUnmanaged(void) = .empty;
     defer required_set.deinit(gpa);
@@ -255,7 +265,10 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
         p_default = null;
     }
 
-    return .{ .properties = try props.toOwnedSlice(gpa) };
+    return .{
+        .properties = try props.toOwnedSlice(gpa),
+        .allow_extra_properties = allow_extra_properties,
+    };
 }
 
 /// Convert a std.json.Value to a raw JSON fragment string suitable for
@@ -347,6 +360,28 @@ test "schemaFromJsonSchema handles array and number types" {
         if (std.mem.eql(u8, prop.name, "count"))
             try std.testing.expectEqual(tools_common.Schema.Kind.integer, prop.kind);
     }
+}
+
+test "tool contract: MCP additionalProperties policy survives conversion" {
+    const gpa = std.testing.allocator;
+    const closed_json =
+        \\{"type":"object","additionalProperties":false,"properties":{}}
+    ;
+    const open_json =
+        \\{"type":"object","properties":{}}
+    ;
+    const closed_parsed = try std.json.parseFromSlice(std.json.Value, gpa, closed_json, .{});
+    defer closed_parsed.deinit();
+    const open_parsed = try std.json.parseFromSlice(std.json.Value, gpa, open_json, .{});
+    defer open_parsed.deinit();
+
+    var closed_schema = try schemaFromJsonSchema(gpa, closed_parsed.value);
+    defer closed_schema.deinit(gpa);
+    var open_schema = try schemaFromJsonSchema(gpa, open_parsed.value);
+    defer open_schema.deinit(gpa);
+
+    try std.testing.expect(!closed_schema.allow_extra_properties);
+    try std.testing.expect(open_schema.allow_extra_properties);
 }
 
 test "schemaFromJsonSchema appends enum values to description and populates enum_values" {

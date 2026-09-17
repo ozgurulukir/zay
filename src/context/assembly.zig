@@ -73,7 +73,12 @@ pub fn assembleSystemPrompt(
     // 1. Substitute CWD, OS, and today's date (UTC) in the base prompt.
     const date = try todayUtc(gpa, io);
     defer gpa.free(date);
-    const base_substituted = try substituteBaseTemplate(gpa, base_template, cwd, date);
+    const config_dir = if (home_dir.len > 0)
+        try paths.platformConfigDir(gpa, home_dir)
+    else
+        try gpa.dupe(u8, "(unavailable)");
+    defer gpa.free(config_dir);
+    const base_substituted = try substituteBaseTemplate(gpa, base_template, cwd, date, config_dir);
     defer gpa.free(base_substituted);
     try out.writer.writeAll(base_substituted);
 
@@ -102,8 +107,6 @@ pub fn assembleSystemPrompt(
     //    notices rather than failing).
     var total_rule_bytes: usize = 0;
     if (home_dir.len > 0) {
-        const config_dir = try paths.platformConfigDir(gpa, home_dir);
-        defer gpa.free(config_dir);
         if (try readRuleFile(gpa, io, config_dir, "AGENTS.md", "user rule file")) |content| {
             defer gpa.free(content);
             try appendRuleBlock(&out.writer, "user_instructions", "user rule file", "AGENTS.md", content, &total_rule_bytes);
@@ -403,11 +406,17 @@ test "trailing estimate uses the full-history cutoff verdict" {
     try std.testing.expectEqual(full - compaction.estimateMessageTokensCapped(messages[0], cap), trailing);
 }
 
-/// Single-pass left-to-right substitution of `${CWD}`, `${OS}`, and `${DATE}`
+/// Single-pass substitution of `${CWD}`, `${OS}`, `${DATE}`, and `${CONFIG_DIR}`
 /// into `template`. The scan emits the earliest occurrence of any tag and
 /// continues after it, so substituted output is never re-scanned — a cwd
 /// containing a literal `${OS}` survives intact. Caller owns the result.
-pub fn substituteBaseTemplate(gpa: std.mem.Allocator, template: []const u8, cwd: []const u8, date: []const u8) ![]u8 {
+pub fn substituteBaseTemplate(
+    gpa: std.mem.Allocator,
+    template: []const u8,
+    cwd: []const u8,
+    date: []const u8,
+    config_dir: []const u8,
+) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
@@ -416,8 +425,9 @@ pub fn substituteBaseTemplate(gpa: std.mem.Allocator, template: []const u8, cwd:
         const cwd_at = std.mem.indexOfPos(u8, template, index, "${CWD}");
         const os_at = std.mem.indexOfPos(u8, template, index, "${OS}");
         const date_at = std.mem.indexOfPos(u8, template, index, "${DATE}");
+        const config_at = std.mem.indexOfPos(u8, template, index, "${CONFIG_DIR}");
 
-        const earliest = earliestPlaceholder(cwd_at, os_at, date_at, cwd, date) orelse {
+        const earliest = earliestPlaceholder(cwd_at, os_at, date_at, config_at, cwd, date, config_dir) orelse {
             try out.writer.writeAll(template[index..]);
             break;
         };
@@ -435,8 +445,16 @@ const Placeholder = struct {
     replacement: []const u8,
 };
 
-/// The earliest of the three placeholder positions, or null when none remain.
-fn earliestPlaceholder(cwd_at: ?usize, os_at: ?usize, date_at: ?usize, cwd: []const u8, date: []const u8) ?Placeholder {
+/// The earliest placeholder position, or null when none remain.
+fn earliestPlaceholder(
+    cwd_at: ?usize,
+    os_at: ?usize,
+    date_at: ?usize,
+    config_at: ?usize,
+    cwd: []const u8,
+    date: []const u8,
+    config_dir: []const u8,
+) ?Placeholder {
     var best: ?Placeholder = null;
     if (cwd_at) |i| best = .{ .index = i, .tag = "${CWD}", .replacement = cwd };
     if (os_at) |i| {
@@ -444,6 +462,9 @@ fn earliestPlaceholder(cwd_at: ?usize, os_at: ?usize, date_at: ?usize, cwd: []co
     }
     if (date_at) |i| {
         if (best == null or i < best.?.index) best = .{ .index = i, .tag = "${DATE}", .replacement = date };
+    }
+    if (config_at) |i| {
+        if (best == null or i < best.?.index) best = .{ .index = i, .tag = "${CONFIG_DIR}", .replacement = config_dir };
     }
     return best;
 }
@@ -1242,7 +1263,7 @@ test "cloneContentBlock frees the mime type when the image data dupe fails" {
     try std.testing.expectError(error.OutOfMemory, cloneContentBlock(failing.allocator(), block));
 }
 
-test "assembleSystemPrompt includes worker-only lane invariants from default system prompt" {
+test "assembleSystemPrompt keeps cross-tool lane policy without duplicating command contract" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const root = try std.process.currentPathAlloc(io, gpa);
@@ -1260,11 +1281,13 @@ test "assembleSystemPrompt includes worker-only lane invariants from default sys
     const prompt = try assembleSystemPrompt(gpa, io, template, "", cwd, &.{}, &.{});
     defer gpa.free(prompt);
 
-    // Worker-only lane invariants are present
+    // Cross-tool policy stays in the system prompt; command details belong to
+    // the lane tool description and are not duplicated here.
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Parallelism via Lanes") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "lane spawn") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "lane merge") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "lane delete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Only the primary driver manages workers") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "lane spawn") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "lane merge") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "lane delete") == null);
     // Deprecated / removed directives are absent
     try std.testing.expect(std.mem.indexOf(u8, prompt, "lane create") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "lane enter") == null);
@@ -1308,13 +1331,17 @@ test "prompt contract: POSIX and Windows system prompts satisfy core invariants"
     try std.testing.expect(std.mem.indexOf(u8, windows_prompt, "**`skill`**") != null);
     try std.testing.expect(std.mem.indexOf(u8, windows_prompt, "**`pwsh`**") != null);
 
-    // 5. Worker-only lane commands
-    try std.testing.expect(std.mem.indexOf(u8, posix_prompt, "lane spawn") != null);
-    try std.testing.expect(std.mem.indexOf(u8, posix_prompt, "lane merge") != null);
-    try std.testing.expect(std.mem.indexOf(u8, posix_prompt, "lane delete") != null);
+    // 5. Removed/over-broad directives stay absent.
+    try std.testing.expect(std.mem.indexOf(u8, posix_prompt, "Never write tool names") == null);
+    try std.testing.expect(std.mem.indexOf(u8, posix_prompt, "expected to take >10s") == null);
     try std.testing.expect(std.mem.indexOf(u8, posix_prompt, "lane create") == null);
     try std.testing.expect(std.mem.indexOf(u8, posix_prompt, "lane enter") == null);
     try std.testing.expect(std.mem.indexOf(u8, posix_prompt, "lane leave") == null);
+
+    // 6. Session history uses the platform-config placeholder, not a hardcoded
+    // POSIX path that is wrong on Windows.
+    try std.testing.expect(std.mem.indexOf(u8, common, "${CONFIG_DIR}/sessions.sqlite") != null);
+    try std.testing.expect(std.mem.indexOf(u8, common, "~/.config/zay/sessions.sqlite") == null);
 }
 
 test "prompt contract: handover prompt includes summary placeholder and provenance rule" {
@@ -1323,18 +1350,24 @@ test "prompt contract: handover prompt includes summary placeholder and provenan
     try std.testing.expect(std.mem.indexOf(u8, handover, "untrusted context to verify") != null);
 }
 
-test "substituteBaseTemplate replaces CWD OS and DATE in one pass" {
+test "substituteBaseTemplate replaces environment placeholders in one pass" {
     const gpa = std.testing.allocator;
-    const rendered = try substituteBaseTemplate(gpa, "cwd=${CWD} os=${OS} date=${DATE}", "/home/zay", "2026-08-04");
+    const rendered = try substituteBaseTemplate(
+        gpa,
+        "cwd=${CWD} os=${OS} date=${DATE} config=${CONFIG_DIR}",
+        "/home/zay",
+        "2026-08-04",
+        "/home/zay/.config/zay",
+    );
     defer gpa.free(rendered);
-    try std.testing.expectEqualStrings("cwd=/home/zay os=" ++ os.label ++ " date=2026-08-04", rendered);
+    try std.testing.expectEqualStrings("cwd=/home/zay os=" ++ os.label ++ " date=2026-08-04 config=/home/zay/.config/zay", rendered);
 }
 
 test "substituteBaseTemplate preserves a cwd containing a literal placeholder" {
     const gpa = std.testing.allocator;
     // A directory literally named `${OS}` (legal on Linux) must survive intact:
     // the single-pass scan never re-scans substituted output.
-    const rendered = try substituteBaseTemplate(gpa, "You are in ${CWD}", "${OS}", "2026-08-04");
+    const rendered = try substituteBaseTemplate(gpa, "You are in ${CWD}", "${OS}", "2026-08-04", "/config");
     defer gpa.free(rendered);
     try std.testing.expectEqualStrings("You are in ${OS}", rendered);
 }

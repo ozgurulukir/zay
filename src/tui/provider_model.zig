@@ -337,6 +337,7 @@ pub fn collectConfiguredProviders(self: *App, catalog: ModelCatalog) ![]model_lo
             self.gpa.free(c.base_url);
             self.gpa.free(c.api_key);
             if (c.display_name) |d| self.gpa.free(d);
+            if (c.auth_key_id) |a| self.gpa.free(a);
             ai.provider_headers.freeHeaders(self.gpa, c.headers);
         }
         list.deinit(self.gpa);
@@ -351,7 +352,7 @@ pub fn collectConfiguredProviders(self: *App, catalog: ModelCatalog) ![]model_lo
             };
             // Katalog provider'ları auth.json'a label'larıyla kaydolur; null
             // bırakmak compatibleSource'a label'a düşürür.
-            try appendConfigured(self, &list, provider, base_url, key, null);
+            try appendConfigured(self, &list, provider, base_url, key, null, null);
         }
         if (self.provider_state.modelsdev_registry) |*reg| {
             var it = self.provider_state.api_keys.iterator();
@@ -397,7 +398,8 @@ pub fn collectConfiguredProviders(self: *App, catalog: ModelCatalog) ![]model_lo
                     }
                     break :blk self.provider_state.api_keys.get(ms.providerName()) orelse "";
                 };
-                try appendConfigured(self, &list, provider, base_url, api_key, ms.providerName());
+                const provider_name = ms.providerName();
+                try appendConfigured(self, &list, provider, base_url, api_key, provider_name, provider_name);
             }
         }
     }
@@ -438,12 +440,15 @@ pub fn appendConfigured(
     provider: config_mod.Provider,
     base_url: []const u8,
     api_key: []const u8,
+    display_name: ?[]const u8,
     auth_key_id: ?[]const u8,
 ) !void {
     const url = try self.gpa.dupe(u8, base_url);
     errdefer self.gpa.free(url);
     const key = try self.gpa.dupe(u8, api_key);
     errdefer self.gpa.free(key);
+    const name: ?[]u8 = if (display_name) |value| try self.gpa.dupe(u8, value) else null;
+    errdefer if (name) |owned| self.gpa.free(owned);
     const id: ?[]u8 = if (auth_key_id) |k| try self.gpa.dupe(u8, k) else null;
     errdefer if (id) |owned| self.gpa.free(owned);
     const headers = try config_mod.expandProviderHeaders(
@@ -451,7 +456,14 @@ pub fn appendConfigured(
         self.cached_config.providerHeadersByName(auth_key_id orelse provider.label()),
     );
     errdefer ai.provider_headers.freeHeaders(self.gpa, headers);
-    try list.append(self.gpa, .{ .provider = provider, .base_url = url, .api_key = key, .auth_key_id = id, .headers = headers });
+    try list.append(self.gpa, .{
+        .provider = provider,
+        .base_url = url,
+        .api_key = key,
+        .display_name = name,
+        .auth_key_id = id,
+        .headers = headers,
+    });
 }
 
 pub const model_loader_job = @import("model_loader_job.zig");

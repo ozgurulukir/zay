@@ -39,20 +39,18 @@ pub const Args = struct {
 
 const JsonArgs = struct {
     name: ?[]const u8 = null,
-    skill: ?[]const u8 = null,
-    command: ?[]const u8 = null,
 };
 
 pub const ParseError = error{ InvalidArguments, OutOfMemory };
 
 pub fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args {
-    const parsed = std.json.parseFromSlice(JsonArgs, gpa, arguments, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+    const parsed = std.json.parseFromSlice(JsonArgs, gpa, arguments, .{ .ignore_unknown_fields = false }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidArguments,
     };
     defer parsed.deinit();
 
-    const raw_name = parsed.value.name orelse parsed.value.skill orelse parsed.value.command orelse return error.InvalidArguments;
+    const raw_name = parsed.value.name orelse return error.InvalidArguments;
     const trimmed = std.mem.trim(u8, raw_name, " \t\r\n$");
     if (trimmed.len == 0) return error.InvalidArguments;
 
@@ -117,15 +115,13 @@ pub fn display(
     _ = env;
     const JsonArgsDisplay = struct {
         name: ?[]const u8 = null,
-        skill: ?[]const u8 = null,
-        command: ?[]const u8 = null,
     };
-    const parsed = std.json.parseFromSlice(JsonArgsDisplay, gpa, arguments, .{ .ignore_unknown_fields = true }) catch return .{
+    const parsed = std.json.parseFromSlice(JsonArgsDisplay, gpa, arguments, .{ .ignore_unknown_fields = false }) catch return .{
         .label = try gpa.dupe(u8, "skill"),
     };
     defer parsed.deinit();
 
-    const target_name = parsed.value.name orelse parsed.value.skill orelse parsed.value.command orelse "skill";
+    const target_name = parsed.value.name orelse "skill";
     const trimmed = std.mem.trim(u8, target_name, " \t\r\n$");
     const display_name = if (trimmed.len > 0) trimmed else "skill";
 
@@ -146,15 +142,13 @@ test "skill tool parseArgs accepts standard name parameter" {
     try std.testing.expectEqualStrings("tigerstyle", args.name);
 }
 
-test "skill tool parseArgs accepts alias fields and strips leading dollar" {
+test "skill tool parseArgs strips leading dollar and rejects alias fields" {
     const gpa = std.testing.allocator;
-    var args1 = try parseArgs(gpa, "{\"skill\":\"$how\"}");
-    defer args1.deinit(gpa);
-    try std.testing.expectEqualStrings("how", args1.name);
-
-    var args2 = try parseArgs(gpa, "{\"command\":\"write-lua-plugin\"}");
-    defer args2.deinit(gpa);
-    try std.testing.expectEqualStrings("write-lua-plugin", args2.name);
+    var args = try parseArgs(gpa, "{\"name\":\"$how\"}");
+    defer args.deinit(gpa);
+    try std.testing.expectEqualStrings("how", args.name);
+    try std.testing.expectError(error.InvalidArguments, parseArgs(gpa, "{\"skill\":\"how\"}"));
+    try std.testing.expectError(error.InvalidArguments, parseArgs(gpa, "{\"command\":\"how\"}"));
 }
 
 test "skill tool parseArgs rejects empty or missing name" {

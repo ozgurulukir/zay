@@ -35,6 +35,11 @@ pub const tool: common.Tool = .{
                 .nullable = true,
             },
         },
+        .requirements = &.{
+            .{ .when_property = "command", .equals = "status", .required_properties = &.{"id"} },
+            .{ .when_property = "command", .equals = "cancel", .required_properties = &.{"id"} },
+            .{ .when_property = "command", .equals = "tail", .required_properties = &.{"id"} },
+        },
     },
     .run = runTool,
     .display = display,
@@ -62,7 +67,7 @@ const JsonArgs = struct {
 pub const ParseError = error{ InvalidAction, MissingJobId, OutOfMemory };
 
 pub fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args {
-    const parsed = std.json.parseFromSlice(JsonArgs, gpa, arguments, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+    const parsed = std.json.parseFromSlice(JsonArgs, gpa, arguments, .{ .ignore_unknown_fields = false }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidAction,
     };
