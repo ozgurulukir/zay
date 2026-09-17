@@ -18,6 +18,39 @@ const Scanner = std.json.Scanner;
 /// in ai.Config (default 16); this cap just sizes the stack arrays.
 pub const tool_call_array_cap: u32 = 64;
 
+/// A provider (intern-ai/internlm gateway) was observed splitting ONE tool call
+/// across two `tool_calls` array entries: the first streams name+id with NO
+/// arguments payload, the second carries a bare `arguments` string under a
+/// DIFFERENT index (e.g. `index:2` after `index:0`). Rejoining them at
+/// assembly time recovers the call.
+fn joinSeveredArguments(builders: *std.ArrayList(ToolCallBuilder), gpa: std.mem.Allocator) !void {
+    for (builders.items, 0..) |*call, i| {
+        // A call that never received executable arguments may have its payload
+        // living in a later bare-arguments builder.
+        if (argumentsAreExecutable(call.arguments.items)) continue;
+        for (builders.items[(i + 1)..], 0..) |*orphan, k| {
+            const j = i + 1 + k;
+            if (orphan.name.items.len > 0 or orphan.id.items.len > 0) continue;
+            if (orphan.arguments.items.len == 0) continue;
+            log.info("readStream.joinSeveredArguments call[{d}] <- args from orphan[{d}] ({d} bytes)", .{ i, j, orphan.arguments.items.len });
+            try call.arguments.appendSlice(gpa, orphan.arguments.items);
+            orphan.arguments.clearRetainingCapacity();
+            break;
+        }
+    }
+}
+/// True when `raw` will dispatch as a valid tool-call arguments JSON object.
+/// `sanitizeToolArguments` collapses empty/severed input to "{}"; this tells
+/// the two apart: a literal (trimmed) `{}` is an intentional no-argument call,
+/// anything else that sanitize cannot round-trip to a `{...}` object is a
+/// provider truncation (no args delivered, or the JSON cut mid-stream).
+pub fn argumentsAreExecutable(raw: []const u8) bool {
+    const sanitized = sanitizeToolArguments(raw);
+    if (!std.mem.eql(u8, sanitized, "{}")) return true;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    return trimmed.len == 2 and trimmed[0] == '{' and trimmed[1] == '}';
+}
+
 pub fn sanitizeToolArguments(raw: []const u8) []const u8 {
     var trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return "{}";
@@ -102,6 +135,11 @@ pub const ToolCallStream = struct {
     /// at or above `max_calls`. Surfaced at the end of the stream so the
     /// caller can decide whether to inform the model.
     dropped: u32 = 0,
+    /// Tool calls dropped because their arguments payload was severed by the
+    /// provider (name+id arrived, no argument bytes streamed). Surfaced to the
+    /// caller so the model can be told to retry — distinct from dropped,
+    /// which counts parallel-call-cap overflows.
+    truncated: u32 = 0,
 
     fn physicalSlot(self: *const ToolCallStream, logical: u32) u32 {
         return if (self.is_remapped[logical]) self.remapped_slot[logical] else logical;
@@ -157,6 +195,7 @@ pub fn readStream(
         try applyChunkCallbacks(change, content.items, reasoning.items, stream.builders.items, observer);
     }
 
+    try joinSeveredArguments(&stream.builders, gpa);
     var blocks: std.ArrayList(ai.ContentBlock) = .empty;
     errdefer {
         for (blocks.items) |*block| block.deinit(gpa);
@@ -182,6 +221,21 @@ pub fn readStream(
             }
             continue;
         }
+        // A named builder whose arguments never arrived as a complete JSON
+        // object is the provider-truncation signature (intern-ai/internlm
+        // gateway severs the tool_call section: name+id stream, the arguments
+        // payload either never arrives or is cut mid-JSON). Emitting it would
+        // dispatch a bare `{}` call and loop forever — drop it like the
+        // nameless path and surface the count to the caller so the model can
+        // be told its arguments were severed.
+        if (!argumentsAreExecutable(builder.arguments.items)) {
+            log.warn(
+                "readStream.truncated_tool_call_dropped builder[{d}] name={s} id_len={d} model={s} — tool_call section likely truncated by the provider (no arguments streamed)",
+                .{ i, builder.name.items, builder.id.items.len, stream.limits.model_label },
+            );
+            stream.truncated += 1;
+            continue;
+        }
         log.info(
             "readStream.builder[{d}] name={s} id_len={d} args_len={d}",
             .{ i, builder.name.items, builder.id.items.len, builder.arguments.items.len },
@@ -192,7 +246,7 @@ pub fn readStream(
         log.warn("readStream.dropped dropped={d} max_calls={d} model={s}", .{ stream.dropped, stream.limits.max_parallel_calls, stream.limits.model_label });
     }
     log.info("readStream.done content_len={d} reasoning_len={d} blocks={d} finish_reason={s}", .{ content.items.len, reasoning.items.len, blocks.items.len, if (finish_reason) |f| @tagName(f) else "none" });
-    return .{ .assistant = .{ .assistant = .{ .content = try blocks.toOwnedSlice(gpa) } }, .usage = usage, .finish_reason = finish_reason };
+    return .{ .assistant = .{ .assistant = .{ .content = try blocks.toOwnedSlice(gpa) } }, .usage = usage, .finish_reason = finish_reason, .tool_calls_truncated = stream.truncated };
 }
 
 pub const ChunkChange = struct {
@@ -547,7 +601,25 @@ fn parseToolCallObject(
     // same cap that guards explicit indices applies here — the remap arrays
     // are sized `tool_call_array_cap`, so an unbounded append would overflow
     // them.
+    //
+    // Continuation routing: a delta that carries NO index, NO id AND NO name
+    // is a pure arguments-continuation of the previous tool call (observed on
+    // the intern-ai/internlm gateway, which streams name+id in one chunk and
+    // the arguments payload in a SEPARATE index-less chunk). Appending it to a
+    // fresh builder would split one call across two builders — the arguments
+    // chunk then surfaces as a "nameless tool call with args" and is dropped.
+    // Route it to the last builder that already has an id or name instead.
     const logical = resolved_index orelse blk: {
+        if (!has_pending_id and !has_pending_name) {
+            var last_filled: ?u32 = null;
+            for (stream.builders.items, 0..) |*existing, i| {
+                if (existing.id.items.len > 0 or existing.name.items.len > 0) {
+                    const fill_idx: u32 = @intCast(i);
+                    last_filled = fill_idx;
+                }
+            }
+            if (last_filled) |idx| break :blk idx;
+        }
         const next: u32 = @intCast(stream.builders.items.len);
         if (next >= tool_call_array_cap) return error.TooManyToolCalls;
         if (next >= stream.limits.max_parallel_calls) {
@@ -897,6 +969,103 @@ test "readStream drops a nameless tool call that streamed arguments" {
     try std.testing.expectEqual(ai.FinishReason.tool_calls, turn.finish_reason.?);
 }
 
+test "readStream drops a name-only tool call whose arguments never streamed" {
+    // The intern-ai/internlm gateway signature: id + name arrive, the
+    // arguments payload is severed (output-token cap / gateway bug). The call
+    // must NOT surface as a block (executing {} would dispatch a bare
+    // no-arg call and loop forever); the truncated count rides the Turn so
+    // the agent can tell the model its arguments were dropped.
+    const gpa = std.testing.allocator;
+    const stream =
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"chatcmpl-tool-abc\",\"function\":{\"name\":\"pwsh\",\"arguments\":\"\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n" ++
+        "data: [DONE]\n";
+    var reader: std.Io.Reader = .fixed(stream);
+    var tool_call_seq: u64 = 0;
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), .{ .limits = .{ .max_parallel_calls = 16, .model_label = "test-model" }, .id_seq = &tool_call_seq });
+    defer turn.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), turn.assistant.assistant.content.len);
+    try std.testing.expectEqual(@as(u32, 1), turn.tool_calls_truncated);
+    try std.testing.expectEqual(ai.FinishReason.tool_calls, turn.finish_reason.?);
+}
+
+test "readStream keeps a deliberate empty-object arguments call" {
+    // {} streamed as two real bytes is an intentional no-argument call
+    // (e.g. `lane list`), NOT a truncation — it must dispatch.
+    const gpa = std.testing.allocator;
+    const stream =
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"lane\",\"arguments\":\"{}\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n" ++
+        "data: [DONE]\n";
+    var reader: std.Io.Reader = .fixed(stream);
+    var tool_call_seq: u64 = 0;
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), .{ .limits = .{ .max_parallel_calls = 16, .model_label = "test-model" }, .id_seq = &tool_call_seq });
+    defer turn.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), turn.assistant.assistant.content.len);
+    try std.testing.expectEqual(@as(u32, 0), turn.tool_calls_truncated);
+}
+test "readStream routes index-less continuation arguments to the last named call" {
+    // intern-ai/internlm gateway shape: the name+id chunk streams first, then
+    // the arguments payload arrives in a SEPARATE delta with NO index, NO id,
+    // NO name. Appending that to a fresh builder split one call across two
+    // builders (the args chunk surfaced as "nameless tool call with args" and
+    // was dropped). It must route to the last filled builder instead.
+    const gpa = std.testing.allocator;
+    const stream =
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"chatcmpl-tool-abc\",\"function\":{\"name\":\"pwsh\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n" ++
+        "data: [DONE]\n";
+    var reader: std.Io.Reader = .fixed(stream);
+    var tool_call_seq: u64 = 0;
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), .{ .limits = .{ .max_parallel_calls = 16, .model_label = "test-model" }, .id_seq = &tool_call_seq });
+    defer turn.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), turn.assistant.assistant.content.len);
+    try std.testing.expectEqual(@as(u32, 0), turn.tool_calls_truncated);
+    const call = &turn.assistant.assistant.content[0].tool_call;
+    try std.testing.expectEqualStrings("pwsh", call.name);
+    try std.testing.expectEqualStrings("{\"command\":\"echo hi\"}", call.arguments);
+}
+
+test "readStream drops a named call whose arguments JSON is cut mid-stream" {
+    // The provider streamed partial arguments (`{"comm`) then closed with
+    // finish_reason=tool_calls. sanitizeToolArguments would collapse this to
+    // `{}`; the call must be treated as truncated, not dispatched as a bare
+    // no-arg call.
+    const gpa = std.testing.allocator;
+    const stream =
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"chatcmpl-tool-abc\",\"function\":{\"name\":\"pwsh\",\"arguments\":\"{\\\"comm\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n" ++
+        "data: [DONE]\n";
+    var reader: std.Io.Reader = .fixed(stream);
+    var tool_call_seq: u64 = 0;
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), .{ .limits = .{ .max_parallel_calls = 16, .model_label = "test-model" }, .id_seq = &tool_call_seq });
+    defer turn.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), turn.assistant.assistant.content.len);
+    try std.testing.expectEqual(@as(u32, 1), turn.tool_calls_truncated);
+}
+test "readStream joins severed name+id and index-misaligned bare-arguments entries" {
+    // intern-ai/internlm gateway shape #2: name+id streams at `index:0` with
+    // NO arguments, then the full arguments payload arrives under a DIFFERENT
+    // index (`index:2`) in a bare entry (no name, no id). The parser must
+    // rejoin them at assembly time — the arguments belong to the named call,
+    // not to an unnamed builder that would be dropped.
+    const gpa = std.testing.allocator;
+    const stream =
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"chatcmpl-tool-abc\",\"function\":{\"name\":\"pwsh\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":2,\"function\":{\"arguments\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n" ++
+        "data: [DONE]\n";
+    var reader: std.Io.Reader = .fixed(stream);
+    var tool_call_seq: u64 = 0;
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), .{ .limits = .{ .max_parallel_calls = 16, .model_label = "test-model" }, .id_seq = &tool_call_seq });
+    defer turn.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), turn.assistant.assistant.content.len);
+    try std.testing.expectEqual(@as(u32, 0), turn.tool_calls_truncated);
+    const call = &turn.assistant.assistant.content[0].tool_call;
+    try std.testing.expectEqualStrings("pwsh", call.name);
+    try std.testing.expectEqualStrings("{\"command\":\"echo hi\"}", call.arguments);
+}
 test "readStream tolerates non-string finish_reason garbage from a proxy" {
     // A number/bool/object where the reason should be must be skipped, not
     // abort the stream — the prose already streamed would otherwise be lost.

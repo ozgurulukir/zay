@@ -645,6 +645,12 @@ pub const Turn = struct {
     /// API maps `response.incomplete`'s `incomplete_details.reason`
     /// (`max_output_tokens` → `.length`).
     finish_reason: ?FinishReason = null,
+    /// Number of tool calls the parser dropped because their arguments payload
+    /// was severed by the provider (name+id arrived, no argument bytes
+    /// streamed). Zero when the turn carried no truncation. The agent uses
+    /// this to break the dispatch-loop signature: the model keeps re-emitting
+    /// {} calls because it never learns its arguments were dropped.
+    tool_calls_truncated: u32 = 0,
 
     pub fn deinit(self: *Turn, gpa: std.mem.Allocator) void {
         self.assistant.deinit(gpa);

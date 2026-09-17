@@ -118,7 +118,14 @@ pub fn validateArgs(
         var iterator = obj.iterator();
         while (iterator.next()) |entry| {
             if (findProperty(schema, entry.key_ptr.*) == null) {
-                try appendViolationNoGot(gpa, &result, entry.key_ptr.*, "is not an allowed property");
+                // Tell the model WHICH keys are legal so a crossed-up call
+                // (e.g. `command` sent to the `skill` tool) self-corrects
+                // instead of guessing again from memory.
+                const allowed = try buildAllowedList(gpa, schema);
+                defer gpa.free(allowed);
+                const expected = try std.fmt.allocPrint(gpa, "is not an allowed property (allowed: {s})", .{allowed});
+                defer gpa.free(expected);
+                try appendViolationNoGot(gpa, &result, entry.key_ptr.*, expected);
             }
         }
     }
@@ -135,6 +142,20 @@ pub fn validateArgs(
     }
     try checkRequirements(gpa, &result, schema, obj);
     return result;
+}
+
+/// Backtick-quoted, comma-separated list of the schema's property names for a
+/// "not an allowed property" violation hint (e.g. `` `name` `` for skill).
+fn buildAllowedList(gpa: std.mem.Allocator, schema: tools_common.Schema) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (schema.properties, 0..) |prop, pi| {
+        if (pi > 0) try out.appendSlice(gpa, ", ");
+        try out.append(gpa, '`');
+        try out.appendSlice(gpa, prop.name);
+        try out.append(gpa, '`');
+    }
+    return out.toOwnedSlice(gpa);
 }
 
 fn findProperty(schema: tools_common.Schema, name: []const u8) ?tools_common.Schema.Property {
@@ -501,6 +522,22 @@ test "correct types are valid" {
         },
     };
     try expectValid(gpa, all_kinds, "{\"s\":\"x\",\"i\":42,\"n\":4.5,\"b\":true,\"o\":{},\"a\":[]}");
+}
+
+test "unknown property names the allowed set so the model self-corrects" {
+    const gpa = std.testing.allocator;
+    // The `skill` tool shape: only `name` is legal. A model that sends
+    // `command` (as intern-ai intern models did, crossing up pwsh and skill)
+    // must see the legal keys in the violation, not just "not allowed".
+    const name_only = tools_common.Schema{ .properties = &.{.{ .name = "name", .kind = .string, .description = "", .required = true }} };
+    var result = try validateArgs(gpa, name_only, "{\"command\":\"echo hi\"}");
+    defer result.deinit(gpa);
+    try std.testing.expect(!result.isValid());
+    try std.testing.expectEqualStrings("command", result.violations.items[0].path);
+    const msg = try result.formatMessage(gpa);
+    defer gpa.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "allowed: `name`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "command") != null);
 }
 
 test "wrong type is a violation naming the field" {

@@ -1324,6 +1324,7 @@ test "model picker hides model arrow when reasoning column is focused" {
 
     var row: model_picker.Row = .{
         .model = &app.pickers.models.entries.items[0].model,
+        .source = .openai_codex,
         .selected = true,
         .column = app.pickers.models.model_column,
         .active_model = null,
