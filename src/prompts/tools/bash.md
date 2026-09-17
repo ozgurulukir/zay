@@ -8,6 +8,9 @@ Run a shell command.
 - Prefer targeted commands (`rg`, `find`, `git diff --stat`, `head`, `tail`) over dumping large files or full build logs.
 - Command outputs exceeding 50 KB or 2000 lines are truncated with a `[Showing last N of M lines (X of Y bytes). Full output: /path]` footer. Inspect that path or use a narrower command; never re-run the entire command just to see the tail. When no truncation notice is present, the output is complete.
 
+The `arguments` object's required property is `command` — put the whole shell
+command string there. Do NOT use `name`; `name` is not a property of this tool
+(that key belongs to the `skill` tool).
 ## Reading files (sliding window)
 
 Never dump a whole file into the transcript. Locate, read a bounded window, then slide:
@@ -28,3 +31,4 @@ Never dump a whole file into the transcript. Locate, read a bounded window, then
 - Non-zero exit codes are returned in the result. For multi-step commands, chain with `&&` or start scripts with `set -euo pipefail`.
 - Use non-interactive flags (`-y`, `--no-input`, `< /dev/null`) so commands never hang waiting for input.
 - Commands that may legitimately fail should end with `|| true` if later steps should still run.
+

@@ -56,6 +56,16 @@ const tool_budget_continuation_hint =
 const length_cut_continuation_hint =
     "[zay] Your previous response was cut off by the output token limit before it finished. " ++
     "Continue from exactly where it stopped; if you were about to call a tool, emit that tool call now.";
+/// Injected when the provider severed the tool_call section (name+id arrived,
+/// arguments never streamed — intern-ai/internlm gateway truncation). The
+/// model's request is NOT executed, so the model must re-emit the call with
+/// its arguments intact. The consumer sees this as a normal user message.
+const tool_call_truncation_hint =
+    "[zay] Your tool call(s) arrived without their arguments — the provider " ++
+    "truncated the tool_call section before the arguments payload streamed. " ++
+    "The call was not executed. Re-emit the SAME tool call(s) with full arguments " ++
+    "in a single request; avoid sending many parallel tool calls at once if " ++
+    "truncation persists.";
 /// Byte threshold at which a pending buffer flushes mid-stream. ~2s of text
 /// at 100 tok/s, ~0.4s at 500 tok/s. A config knob adds surface area for
 /// little gain; a comptime constant is simpler.
@@ -518,6 +528,10 @@ pub const Agent = struct {
         // so a pathologically capping endpoint cannot loop extra billed
         // requests (the C2 `downgrade_done` idiom from the wire client).
         var length_continued = false;
+        // Same one-shot for provider-severed tool-call arguments: if the
+        // endpoint keeps truncating, retry exactly once then fail the turn
+        // instead of billing an unbounded retry loop.
+        var truncation_retried = false;
         var turn_arena = std.heap.ArenaAllocator.init(self.gpa);
         defer turn_arena.deinit();
 
@@ -625,6 +639,23 @@ pub const Agent = struct {
                 if (drained_count > 0) {
                     try l.emit(.{ .queued_messages_flushed = drained_count });
                     continue;
+                }
+                // Provider-severed tool_call arguments (name+id arrived, the
+                // arguments payload never streamed). The parser dropped the
+                // calls, so nothing dispatched. Tell the model its arguments
+                // were truncated and retry ONCE (bounded like the length-cut
+                // auto-continue) — a pathological endpoint cannot bill an
+                // unbounded retry loop.
+                if (turn.tool_calls_truncated > 0) {
+                    if (!truncation_retried) {
+                        log.warn("tool_call arguments truncated by provider ({d} calls dropped) — retrying once with hint", .{turn.tool_calls_truncated});
+                        truncation_retried = true;
+                        try self.addUser(tool_call_truncation_hint);
+                        continue;
+                    }
+                    log.warn("tool_call arguments truncated by provider on retry — ending turn", .{});
+                    try l.emit(.{ .length_cut = .stopped });
+                    return;
                 }
                 // A provider output-token cap severed the response before the
                 // tool_call section (observed: prose announcing an action,
@@ -2083,6 +2114,75 @@ test "run auto-continues once after a length-cut stream" {
     try std.testing.expectEqualStrings("continued", messages[3].text());
 }
 
+test "run retries once when the provider truncates tool-call arguments" {
+    if (os.is_windows) {
+        // Truncation-class socket gate — see openai_compatible.zig (#32).
+        return error.SkipZigTest;
+    }
+    // Integration test over a real socket mirroring the intern-ai/internlm
+    // gateway signature: the first response ends with finish_reason=tool_calls
+    // but the arguments payload never streamed (the parser drops the call and
+    // surfaces `tool_calls_truncated`=1). Agent.run must NOT dispatch a bare
+    // {} call; it injects the truncation hint and re-requests exactly once.
+    // The second response carries a complete tool call which then executes.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server = try MockScriptedServer.init(io, &.{
+        .{ .status = .ok, .body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"chatcmpl-tool-abc\",\"function\":{\"name\":\"pwsh\"}}]}}]}\n" ++
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n" ++
+            "data: [DONE]\n" },
+        .{ .status = .ok, .body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"chatcmpl-tool-def\",\"function\":{\"name\":\"pwsh\",\"arguments\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}}]}}]}\n" ++
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n" ++
+            "data: [DONE]\n" },
+    });
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, MockScriptedServer.serve, .{&server});
+    defer thread.join();
+
+    const openai_compatible = @import("ai/openai_compatible.zig");
+    const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/v1", .{server.port()});
+    var client: openai_compatible.Client = undefined;
+    try client.init(gpa, io, .{
+        .base_url = base_url,
+        .api_key = "test-key",
+        .model = "test-model",
+        .tools = &.{},
+        .mcp_tools = &.{},
+        .retry_base_delay_ms = 0,
+    });
+    gpa.free(base_url);
+    defer client.deinit();
+
+    var agent = Agent.init(gpa, io, ".", .{ .openai_compatible = &client });
+    defer agent.deinit();
+    try agent.addUser("list the directory");
+
+    var seen: BudgetSeen = .{};
+    defer seen.deinit(gpa);
+
+    try agent.run(Agent.Listener(BudgetSeen){ .ctx = &seen, .on_event = BudgetSeen.onEvent });
+
+    // Exactly two requests hit the scripted server (the truncated call + the
+    // retry with the hint). A third would hang on script exhaustion, so this
+    // assertion is the loop-guard's observable: the truncation hint is
+    // injected, the model retries once and succeeds — the run does NOT loop.
+    try std.testing.expectEqual(@as(u32, 2), server.connection_count.load(.monotonic));
+
+    // History: user, assistant (empty — the truncated call produced no
+    // content blocks, so takeAssistantMessage stored nothing), user hint,
+    // assistant + tool_call, tool result.
+    const messages = agent.messages();
+    try std.testing.expect(messages.len >= 3);
+    // The hint must be present, telling the model its arguments were severed.
+    var hint_found = false;
+    for (messages) |m| {
+        if (m.role() == .user and std.mem.startsWith(u8, m.text(), "[zay] Your tool call(s) arrived without their arguments")) {
+            hint_found = true;
+        }
+    }
+    try std.testing.expect(hint_found);
+}
 test "raw enqueued messages are delivered verbatim without @-mention expansion" {
     const gpa = std.testing.allocator;
     var agent = Agent.init(gpa, std.testing.io, ".", .none);

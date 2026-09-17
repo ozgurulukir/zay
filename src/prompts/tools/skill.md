@@ -8,6 +8,9 @@ Pass `name` naming the skill to load:
 {"name": "tigerstyle"}
 ```
 
+The `arguments` object must contain exactly one property: `name`. Do NOT use
+`command`, `description`, or any other key — the tool rejects them.
+
 ## Rules & Best Practices
 
 - **Load Early:** Call `skill` as soon as you identify that a task matches a specialized skill description.

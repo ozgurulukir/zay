@@ -5,23 +5,12 @@ Run a PowerShell command on Windows.
 - `description` is optional; provide it when a concise title adds useful context.
 - Quote every expansion: `"$env:var"`, `"$(cmd)"`. Bare `$env:var` splits on spaces and special characters.
 - Default timeout is 30 seconds. Raise with `timeout` when a command needs longer; a timed-out result explains how to retry.
-- Prefer targeted commands (`rg`, `Select-String`, `git diff --stat`, `Get-Content`) over dumping large files or full build logs.
+- Prefer targeted commands (`rg`, `Select-String`, `git diff --stat`) over dumping large files or full build logs.
 - Command outputs exceeding 50 KB or 2000 lines are truncated with a `[Showing last N of M lines (X of Y bytes). Full output: /path]` footer. Inspect that path with `Get-Content` or use a narrower command; never re-run the entire command just to see the tail. When no truncation notice is present, the output is complete.
 
-## Reading files (sliding window)
-
-Never dump a whole file into the transcript. Locate, read a bounded window, then slide:
-
-- Locate first: `Select-String -Path path -Pattern "pattern"` gives exact line numbers.
-- Read a bounded window: `Get-Content path | Select-Object -First 80` for the head, `Get-Content path | Select-Object -Last 80` for the tail.
-- Slide as needed: `Get-Content path | Select-Object -Skip 80 -First 80` continues below; use `-Skip` to look above.
-- Full read only when necessary: `Get-Content path`. Use `Select-Object -First`/`-Last` for boundary checks.
-
-## Long-running commands
-
-- For continuous processes or commands expected to outlast `timeout`, set `run_in_background: true`. The call returns immediately with a job id, pid, and log path.
-- Background process completion is delivered automatically as a message; do not poll in a busy loop.
-- Query status, read recent logs, or cancel running jobs using the `background` tool (`{"command":"status","id":<id>}`, `{"command":"tail","id":<id>}`, `{"command":"cancel","id":<id>}`).
+The `arguments` object's required property is `command` — put the whole
+PowerShell command string there. Do NOT use `name`; `name` is not a property of
+this tool (that key belongs to the `skill` tool).
 
 ## PowerShell idioms & error handling
 
