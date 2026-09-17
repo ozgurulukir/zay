@@ -116,12 +116,18 @@ fn runUnderPwsh(gpa: std.mem.Allocator, io: std.Io, options: RunOptions) !Result
         .stderr = .pipe,
         .pgid = if (os.is_windows) null else 0,
     });
+    // Windows: bind the whole process tree to a kill-on-close Job Object so an
+    // interrupt reap terminates the pwsh tree (grandchildren included) instead
+    // of only the pwsh process — a grandchild holding the stdout pipe open
+    // would otherwise park `drainChild` past EOF. POSIX: null (group signals).
+    const job_handle = os.attachJobObjectKillOnClose(&child);
     var writer: ?std.Thread = null;
     defer if (writer) |*t| t.join();
     defer {
-        // Bounded group teardown, then the single reap (mirrors
-        // `bash_exec.runUnderBash`): keeps a TERM-immune child from parking
-        // the unwind. No-op on Windows, where `child.kill` is kernel-forced.
+        // Tree kill (Windows: Job Object; POSIX: group TERM→KILL), then the
+        // single reap. Order matters: terminate the whole tree first so no
+        // pipe-holding grandchild can outlive the reap, then reap pwsh itself.
+        os.terminateChildTree(io, &child, job_handle);
         os.terminateChildBounded(&child, io, os.child_term_grace_ms);
         child.kill(io);
     }
@@ -228,8 +234,11 @@ pub fn capture(gpa: std.mem.Allocator, io: std.Io, options: CaptureOptions) !Cap
         .stderr = .pipe,
         .pgid = if (os.is_windows) null else 0,
     });
+    const job_handle = os.attachJobObjectKillOnClose(&child);
     defer {
-        // Bounded group teardown, then the single reap (see `runUnderPwsh`).
+        // Tree kill (Windows: Job Object; POSIX: group TERM→KILL), then the
+        // single reap — same ordering rationale as `runUnderPwsh`.
+        os.terminateChildTree(io, &child, job_handle);
         os.terminateChildBounded(&child, io, os.child_term_grace_ms);
         child.kill(io);
     }

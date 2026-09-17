@@ -120,6 +120,48 @@ fn processExited(pid: std.posix.pid_t) bool {
     return info.fields.common.first.piduid.pid != 0;
 }
 
+/// Windows Job Object configured with KILL_ON_JOB_CLOSE for a spawned child.
+/// Returns a handle the caller must `terminateChildTree` (or `CloseHandle`)
+/// later, or null when the kernel refused (child already exited, job limit
+/// reached). POSIX: always null — POSIX teardown already reaches
+/// grandchildren via process-group signals.
+pub fn attachJobObjectKillOnClose(child: *const std.process.Child) ?std.os.windows.HANDLE {
+    if (!is_windows) return null;
+    const process_handle = child.id orelse return null;
+    const h = windows.CreateJobObjectW(null, null) orelse return null;
+    var info: windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std.mem.zeroes(windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
+    info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (windows.SetInformationJobObject(
+        h,
+        windows.JobObjectExtendedLimitInformation,
+        &info,
+        @sizeOf(windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION),
+    ) == 0) {
+        _ = windows.CloseHandle(h);
+        return null;
+    }
+    if (windows.AssignProcessToJobObject(h, process_handle) == 0) {
+        _ = windows.CloseHandle(h);
+        return null;
+    }
+    return h;
+}
+
+/// Kill the whole process tree of a foreground capture child. On Windows,
+/// terminates the Job Object (if one was attached) — the kernel kills every
+/// process in the tree in one call, so a grandchild holding the stdout pipe
+/// open cannot park `MultiReader.fill` past EOF (the ESC-interrupt hang the
+/// POSIX group-signal path already avoids). POSIX: no-op — the caller's
+/// `terminateChildBounded` handles the group there.
+pub fn terminateChildTree(io: std.Io, child: *const std.process.Child, job_handle: ?std.os.windows.HANDLE) void {
+    _ = io;
+    if (!is_windows) return;
+    if (child.id == null) return; // already reaped by `child.kill`
+    if (job_handle) |h| {
+        _ = windows.TerminateJobObject(h, 1);
+        _ = windows.CloseHandle(h);
+    }
+}
 /// Spawn `bash -c <command>` in its own process group — the shape the shell
 /// capture paths use — so the group-signal teardown in
 /// `terminateChildBounded` reaches grandchildren. Caller reaps via
@@ -180,8 +222,69 @@ const windows = if (is_windows) struct {
     const UINT = u32;
     extern "kernel32" fn SetConsoleOutputCP(wCodePageID: UINT) callconv(.winapi) BOOL;
     extern "kernel32" fn SetConsoleCP(wCodePageID: UINT) callconv(.winapi) BOOL;
-} else struct {};
 
+    // Job Object surface (kill-on-close process trees). Byte-identical to the
+    // definitions in `background.zig` — foreground capture teardown and
+    // background-job teardown converge onto the same kernel handle shape.
+    const HANDLE = std.os.windows.HANDLE;
+    const DWORD = std.os.windows.DWORD;
+    const LPVOID = ?*anyopaque;
+    const LPCWSTR = [*:0]const u16;
+    const SIZE_T = usize;
+    const ULONG_PTR = usize;
+
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: DWORD = 0x00002000;
+    const JobObjectExtendedLimitInformation: DWORD = 9;
+
+    const IO_COUNTERS = extern struct {
+        ReadOperationCount: u64,
+        WriteOperationCount: u64,
+        OtherOperationCount: u64,
+        ReadTransferCount: u64,
+        WriteTransferCount: u64,
+        OtherTransferCount: u64,
+    };
+
+    const JOBOBJECT_BASIC_LIMIT_INFORMATION = extern struct {
+        PerProcessUserTimeLimit: i64,
+        PerJobUserTimeLimit: i64,
+        LimitFlags: DWORD,
+        MinimumWorkingSetSize: SIZE_T,
+        MaximumWorkingSetSize: SIZE_T,
+        ActiveProcessLimit: DWORD,
+        Affinity: ULONG_PTR,
+        PriorityClass: DWORD,
+        SchedulingClass: DWORD,
+    };
+
+    const JOBOBJECT_EXTENDED_LIMIT_INFORMATION = extern struct {
+        BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        IoInfo: IO_COUNTERS,
+        ProcessMemoryLimit: SIZE_T,
+        JobMemoryLimit: SIZE_T,
+        PeakProcessMemoryLimit: SIZE_T,
+        PeakJobMemoryLimit: SIZE_T,
+    };
+
+    extern "kernel32" fn CreateJobObjectW(lpJobAttributes: ?*anyopaque, lpName: ?LPCWSTR) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn SetInformationJobObject(
+        hJob: HANDLE,
+        JobObjectInformationClass: DWORD,
+        lpJobObjectInformation: LPVOID,
+        cbJobObjectInformationLength: DWORD,
+    ) callconv(.winapi) BOOL;
+    extern "kernel32" fn AssignProcessToJobObject(hJob: HANDLE, hProcess: HANDLE) callconv(.winapi) BOOL;
+    extern "kernel32" fn TerminateJobObject(hJob: HANDLE, uExitCode: DWORD) callconv(.winapi) BOOL;
+    extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) BOOL;
+} else struct {
+    pub const HANDLE = std.os.windows.HANDLE;
+    pub const DWORD = std.os.windows.DWORD;
+    pub const BOOL = i32;
+    pub const LPVOID = ?*anyopaque;
+    pub const LPCWSTR = [*:0]const u16;
+    pub const SIZE_T = usize;
+    pub const ULONG_PTR = usize;
+};
 /// Ensure Windows console input/output codepage is set to UTF-8 (65001)
 /// so Unicode characters render cleanly instead of falling back to legacy OEM codepages.
 pub fn initConsoleUtf8() void {
