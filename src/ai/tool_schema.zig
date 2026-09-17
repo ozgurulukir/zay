@@ -135,20 +135,15 @@ fn writeToolDefinition(
 }
 
 fn writeParameters(writer: *std.Io.Writer, schema: tools_common.Schema, strict: bool) !void {
-    try writer.writeAll("{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{");
+    try writer.writeAll("{\"type\":\"object\",\"additionalProperties\":");
+    try writer.writeAll(if (!strict and schema.allow_extra_properties) "true" else "false");
+    try writer.writeAll(",\"properties\":{");
     for (schema.properties, 0..) |prop, p| {
         if (p > 0) try writer.writeByte(',');
         try std.json.Stringify.value(prop.name, .{}, writer);
         try writer.writeAll(":{\"type\":");
-        const kind_str: []const u8 = switch (prop.kind) {
-            .string => "string",
-            .integer => "integer",
-            .number => "number",
-            .object => "object",
-            .array => "array",
-            .boolean => "boolean",
-        };
-        if (prop.nullable or !prop.required) {
+        const kind_str = kindName(prop.kind);
+        if (prop.acceptsNull()) {
             try std.json.Stringify.value(&[_][]const u8{ kind_str, "null" }, .{}, writer);
         } else {
             try std.json.Stringify.value(kind_str, .{}, writer);
@@ -163,6 +158,7 @@ fn writeParameters(writer: *std.Io.Writer, schema: tools_common.Schema, strict: 
                     if (ei > 0) try writer.writeByte(',');
                     try std.json.Stringify.value(v, .{}, writer);
                 }
+                if (prop.acceptsNull()) try writer.writeAll(",null");
                 try writer.writeByte(']');
             }
         }
@@ -172,7 +168,14 @@ fn writeParameters(writer: *std.Io.Writer, schema: tools_common.Schema, strict: 
             try writer.writeAll(dv);
         }
         if (prop.kind == .object) {
-            try writer.writeAll(",\"additionalProperties\":true");
+            try writer.writeAll(",\"additionalProperties\":");
+            if (prop.object_value_kind) |value_kind| {
+                try writer.writeAll("{\"type\":");
+                try std.json.Stringify.value(kindName(value_kind), .{}, writer);
+                try writer.writeByte('}');
+            } else {
+                try writer.writeAll("true");
+            }
         } else if (prop.kind == .array) {
             try writer.writeAll(",\"items\":{}");
         }
@@ -192,6 +195,17 @@ fn writeParameters(writer: *std.Io.Writer, schema: tools_common.Schema, strict: 
         try std.json.Stringify.value(prop.name, .{}, writer);
     }
     try writer.writeAll("]}");
+}
+
+fn kindName(kind: tools_common.Schema.Kind) []const u8 {
+    return switch (kind) {
+        .string => "string",
+        .integer => "integer",
+        .number => "number",
+        .object => "object",
+        .array => "array",
+        .boolean => "boolean",
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -335,4 +349,52 @@ test "tool_schema golden: byte-identical output for all envelope × strict combo
         defer gpa.free(json);
         try std.testing.expectEqualStrings(responses_non_strict, json);
     }
+}
+
+test "tool contract: serializer shares optional null and object-value semantics" {
+    const gpa = std.testing.allocator;
+    const specs = [_]ToolSpec{.{
+        .name = "contract",
+        .description = "Contract probe",
+        .schema = .{
+            .properties = &.{
+                .{
+                    .name = "mode",
+                    .kind = .string,
+                    .description = "Optional mode",
+                    .required = false,
+                    .enum_values = &.{ "fast", "slow" },
+                },
+                .{
+                    .name = "env",
+                    .kind = .object,
+                    .description = "String environment",
+                    .required = false,
+                    .object_value_kind = .string,
+                },
+            },
+        },
+    }};
+    const json = try buildToolsJson(gpa, &specs, true, .responses);
+    defer gpa.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"enum\":[\"fast\",\"slow\",null]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"additionalProperties\":{\"type\":\"string\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"mode\",\"env\"]") != null);
+}
+
+test "tool contract: strict schema closes provider arguments while non-strict honors open schemas" {
+    const gpa = std.testing.allocator;
+    const specs = [_]ToolSpec{.{
+        .name = "open",
+        .description = "Open arguments",
+        .schema = .{ .properties = &.{}, .allow_extra_properties = true },
+    }};
+    const strict_json = try buildToolsJson(gpa, &specs, true, .responses);
+    defer gpa.free(strict_json);
+    const loose_json = try buildToolsJson(gpa, &specs, false, .responses);
+    defer gpa.free(loose_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, strict_json, "\"additionalProperties\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loose_json, "\"additionalProperties\":true") != null);
 }

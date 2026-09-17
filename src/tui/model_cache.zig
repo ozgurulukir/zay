@@ -5,6 +5,7 @@ const std = @import("std");
 const codex = @import("../auth/codex.zig");
 const config_mod = @import("../config/config.zig");
 const model_loader = @import("model_loader.zig");
+const paths = @import("../paths.zig");
 
 const assert = std.debug.assert;
 const file_bytes_max: u32 = 2 * 1024 * 1024;
@@ -292,7 +293,20 @@ fn writeKey(writer: *std.Io.Writer, name: []const u8, wrote_any: *bool) !void {
 
 fn path(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
     if (home_dir.len == 0) return error.HomeNotSet;
-    return std.fs.path.join(gpa, &.{ home_dir, ".config", "zay", "models.json" });
+    const config_dir = try paths.platformConfigDir(gpa, home_dir);
+    defer gpa.free(config_dir);
+    return std.fs.path.join(gpa, &.{ config_dir, "models.json" });
+}
+
+test "model cache path follows the platform config directory" {
+    const gpa = std.testing.allocator;
+    const cache_path = try path(gpa, "HOME");
+    defer gpa.free(cache_path);
+    const config_dir = try paths.platformConfigDir(gpa, "HOME");
+    defer gpa.free(config_dir);
+    const expected = try std.fs.path.join(gpa, &.{ config_dir, "models.json" });
+    defer gpa.free(expected);
+    try std.testing.expect(paths.pathsEqual(cache_path, expected));
 }
 
 test "parse keeps only currently configured provider models" {

@@ -6,10 +6,9 @@
 //! a non-empty violation list becomes a structured error message back to the
 //! model instead of letting the tool run (and fail) on garbage input.
 //!
-//! v1 scope deliberately narrow: it validates declared properties (presence,
-//! type, nullable, enum) but NOT `additionalProperties` (the `Schema` type
-//! carries no `additional_properties` flag) and NOT nested object/array
-//! element schemas. See the strict-tool-schema plan for the v2 extensions.
+//! Validation covers declared properties, nullability, enums, unknown fields,
+//! conditional requirements, and homogeneous object values. Array element
+//! schemas remain intentionally open because `Schema` does not model them.
 
 const std = @import("std");
 const tools_common = @import("common.zig");
@@ -115,6 +114,14 @@ pub fn validateArgs(
     }
 
     const obj = parsed.value.object;
+    if (!schema.allow_extra_properties) {
+        var iterator = obj.iterator();
+        while (iterator.next()) |entry| {
+            if (findProperty(schema, entry.key_ptr.*) == null) {
+                try appendViolationNoGot(gpa, &result, entry.key_ptr.*, "is not an allowed property");
+            }
+        }
+    }
     for (schema.properties) |prop| {
         const value = obj.get(prop.name) orelse {
             if (prop.required) {
@@ -126,8 +133,40 @@ pub fn validateArgs(
         };
         try checkProperty(gpa, &result, prop, value);
     }
-    // Extra / unknown fields are NOT rejected in v1 (TD-3).
+    try checkRequirements(gpa, &result, schema, obj);
     return result;
+}
+
+fn findProperty(schema: tools_common.Schema, name: []const u8) ?tools_common.Schema.Property {
+    for (schema.properties) |prop| {
+        if (std.mem.eql(u8, prop.name, name)) return prop;
+    }
+    return null;
+}
+
+fn checkRequirements(
+    gpa: std.mem.Allocator,
+    result: *ValidationResult,
+    schema: tools_common.Schema,
+    object: std.json.ObjectMap,
+) !void {
+    for (schema.requirements) |requirement| {
+        const discriminator = object.get(requirement.when_property) orelse continue;
+        if (discriminator != .string) continue;
+        if (!std.mem.eql(u8, discriminator.string, requirement.equals)) continue;
+
+        for (requirement.required_properties) |required_name| {
+            const value = object.get(required_name);
+            if (value != null and value.? != .null) continue;
+            const expected = try std.fmt.allocPrint(
+                gpa,
+                "is required when `{s}` is `{s}`",
+                .{ requirement.when_property, requirement.equals },
+            );
+            defer gpa.free(expected);
+            try appendViolationNoGot(gpa, result, required_name, expected);
+        }
+    }
 }
 
 /// Coerce quoted numeric strings to real JSON numbers for `integer`/`number`
@@ -204,7 +243,7 @@ fn checkProperty(
     value: std.json.Value,
 ) !void {
     if (value == .null) {
-        if (!prop.nullable) {
+        if (!prop.acceptsNull()) {
             try appendViolation(gpa, result, prop.name, "must not be null", "null");
         }
         return;
@@ -230,6 +269,22 @@ fn checkProperty(
         defer gpa.free(got);
         try appendViolation(gpa, result, prop.name, expected, got);
         return;
+    }
+
+    if (value == .object) {
+        if (prop.object_value_kind) |value_kind| {
+            var iterator = value.object.iterator();
+            while (iterator.next()) |entry| {
+                if (valueMatchesKind(entry.value_ptr.*, value_kind)) continue;
+                const path = try std.fmt.allocPrint(gpa, "{s}.{s}", .{ prop.name, entry.key_ptr.* });
+                defer gpa.free(path);
+                const expected = try std.fmt.allocPrint(gpa, "must be {s}", .{@tagName(value_kind)});
+                defer gpa.free(expected);
+                const got = try valueShortRepr(gpa, entry.value_ptr.*);
+                defer gpa.free(got);
+                try appendViolation(gpa, result, path, expected, got);
+            }
+        }
     }
 
     // Enum constraint — string-based (TD-5 note): a non-string value already
@@ -260,10 +315,25 @@ fn checkProperty(
     }
 }
 
+fn valueMatchesKind(value: std.json.Value, kind: tools_common.Schema.Kind) bool {
+    return switch (value) {
+        .string => kind == .string,
+        .integer, .number_string => kind == .integer or kind == .number,
+        .float => kind == .number,
+        .bool => kind == .boolean,
+        .object => kind == .object,
+        .array => kind == .array,
+        .null => false,
+    };
+}
+
 fn requiredViolation(gpa: std.mem.Allocator, name: []const u8) !Violation {
+    const path = try gpa.dupe(u8, name);
+    errdefer gpa.free(path);
+    const expected = try gpa.dupe(u8, "is required");
     return .{
-        .path = try gpa.dupe(u8, name),
-        .expected = try gpa.dupe(u8, "is required"),
+        .path = path,
+        .expected = expected,
         .got = null,
     };
 }
@@ -275,10 +345,33 @@ fn appendViolation(
     expected: []const u8,
     got: []const u8,
 ) !void {
+    const path_owned = try gpa.dupe(u8, path);
+    errdefer gpa.free(path_owned);
+    const expected_owned = try gpa.dupe(u8, expected);
+    errdefer gpa.free(expected_owned);
+    const got_owned = try gpa.dupe(u8, got);
+    errdefer gpa.free(got_owned);
     try result.violations.append(gpa, .{
-        .path = try gpa.dupe(u8, path),
-        .expected = try gpa.dupe(u8, expected),
-        .got = try gpa.dupe(u8, got),
+        .path = path_owned,
+        .expected = expected_owned,
+        .got = got_owned,
+    });
+}
+
+fn appendViolationNoGot(
+    gpa: std.mem.Allocator,
+    result: *ValidationResult,
+    path: []const u8,
+    expected: []const u8,
+) !void {
+    const path_owned = try gpa.dupe(u8, path);
+    errdefer gpa.free(path_owned);
+    const expected_owned = try gpa.dupe(u8, expected);
+    errdefer gpa.free(expected_owned);
+    try result.violations.append(gpa, .{
+        .path = path_owned,
+        .expected = expected_owned,
+        .got = null,
     });
 }
 
@@ -449,15 +542,77 @@ test "nullable true accepts explicit null" {
     try expectValid(gpa, test_schema, "{\"command\":\"x\",\"timeout\":null}");
 }
 
-test "nullable false rejects explicit null" {
+test "tool contract: optional property accepts explicit null for strict wire parity" {
+    const gpa = std.testing.allocator;
+    const optional = tools_common.Schema{
+        .properties = &.{.{ .name = "v", .kind = .string, .description = "", .required = false, .nullable = false }},
+    };
+    try expectValid(gpa, optional, "{\"v\":null}");
+}
+
+test "tool contract: required non-null property rejects explicit null" {
     const gpa = std.testing.allocator;
     const non_null = tools_common.Schema{
-        .properties = &.{.{ .name = "v", .kind = .string, .description = "", .required = false, .nullable = false }},
+        .properties = &.{.{ .name = "v", .kind = .string, .description = "", .required = true, .nullable = false }},
     };
     var result = try validateArgs(gpa, non_null, "{\"v\":null}");
     defer result.deinit(gpa);
     try std.testing.expect(!result.isValid());
     try std.testing.expect(std.mem.indexOf(u8, result.violations.items[0].expected, "must not be null") != null);
+}
+
+test "tool contract: unknown fields follow additional-properties policy" {
+    const gpa = std.testing.allocator;
+    var closed = try validateArgs(gpa, .{ .properties = &.{} }, "{\"surprise\":true}");
+    defer closed.deinit(gpa);
+    try std.testing.expect(!closed.isValid());
+    try std.testing.expectEqualStrings("surprise", closed.violations.items[0].path);
+
+    try expectValid(gpa, .{ .properties = &.{}, .allow_extra_properties = true }, "{\"surprise\":true}");
+}
+
+test "tool contract: homogeneous object values reject the wrong nested type" {
+    const gpa = std.testing.allocator;
+    const schema = tools_common.Schema{
+        .properties = &.{.{
+            .name = "env",
+            .kind = .object,
+            .description = "",
+            .required = true,
+            .object_value_kind = .string,
+        }},
+    };
+    try expectValid(gpa, schema, "{\"env\":{\"NAME\":\"value\"}}");
+    var invalid = try validateArgs(gpa, schema, "{\"env\":{\"COUNT\":2}}");
+    defer invalid.deinit(gpa);
+    try std.testing.expect(!invalid.isValid());
+    try std.testing.expectEqualStrings("env.COUNT", invalid.violations.items[0].path);
+}
+
+test "tool contract: conditional requirements reject missing and null values" {
+    const gpa = std.testing.allocator;
+    const schema = tools_common.Schema{
+        .properties = &.{
+            .{ .name = "command", .kind = .string, .description = "", .required = true },
+            .{ .name = "task", .kind = .string, .description = "", .required = false },
+        },
+        .requirements = &.{.{
+            .when_property = "command",
+            .equals = "spawn",
+            .required_properties = &.{"task"},
+        }},
+    };
+    try expectValid(gpa, schema, "{\"command\":\"list\"}");
+    try expectValid(gpa, schema, "{\"command\":\"spawn\",\"task\":\"work\"}");
+
+    var missing = try validateArgs(gpa, schema, "{\"command\":\"spawn\"}");
+    defer missing.deinit(gpa);
+    try std.testing.expect(!missing.isValid());
+    try std.testing.expectEqualStrings("task", missing.violations.items[0].path);
+
+    var null_value = try validateArgs(gpa, schema, "{\"command\":\"spawn\",\"task\":null}");
+    defer null_value.deinit(gpa);
+    try std.testing.expect(!null_value.isValid());
 }
 
 test "optional missing field is valid" {

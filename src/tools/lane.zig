@@ -31,8 +31,8 @@ pub const tool: common.Tool = .{
             // on the sibling `bash` tool's first parameter and a miss here made
             // the first lane call fail ("Invalid arguments ... `action` is
             // required") on every model. Each command's required arguments are
-            // named in the per-property descriptions below (the flat schema
-            // can't express per-command requirements, so the prose must).
+            // named in the per-property descriptions below and enforced by
+            // the schema's conditional requirements.
             .{
                 .name = "command",
                 .kind = .string,
@@ -69,6 +69,15 @@ pub const tool: common.Tool = .{
                 .nullable = true,
             },
         },
+        .requirements = &.{
+            .{ .when_property = "command", .equals = "spawn", .required_properties = &.{"task"} },
+            .{ .when_property = "command", .equals = "read", .required_properties = &.{"lane"} },
+            .{ .when_property = "command", .equals = "await", .required_properties = &.{"lane"} },
+            .{ .when_property = "command", .equals = "steer", .required_properties = &.{ "lane", "steer" } },
+            .{ .when_property = "command", .equals = "cancel", .required_properties = &.{"lane"} },
+            .{ .when_property = "command", .equals = "merge", .required_properties = &.{"lane"} },
+            .{ .when_property = "command", .equals = "delete", .required_properties = &.{"lane"} },
+        },
     },
     .run = runTool,
     .display = display,
@@ -87,6 +96,7 @@ pub const internal_tool: common.Tool = .{
             .{ .name = "lane", .kind = .string, .description = "Lane id.", .required = false, .nullable = true },
             .{ .name = "steer", .kind = .string, .description = "Steering message.", .required = false, .nullable = true },
         },
+        .requirements = tool.schema.requirements,
     },
     .run = runInternalTool,
     .display = display,
@@ -131,7 +141,7 @@ fn parseInternalArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!A
 }
 
 fn parseArgsWithMode(gpa: std.mem.Allocator, arguments: []const u8, allow_workspace_ops: bool) ParseError!Args {
-    const parsed = std.json.parseFromSlice(JsonArgs, gpa, arguments, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+    const parsed = std.json.parseFromSlice(JsonArgs, gpa, arguments, .{ .ignore_unknown_fields = false }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidAction,
     };

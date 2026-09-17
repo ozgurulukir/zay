@@ -97,6 +97,7 @@ pub fn Impl(comptime B: type) type {
                     .description = "Extra environment variables, merged over the inherited env. String values only.",
                     .required = false,
                     .nullable = true,
+                    .object_value_kind = .string,
                 }, .{ .name = "timeout", .kind = .integer, .description = "Timeout in seconds (default 30).", .required = false, .nullable = true }, .{
                     .name = "run_in_background",
                     .kind = .boolean,
@@ -346,6 +347,7 @@ pub fn Impl(comptime B: type) type {
             cwd: ?[]const u8 = null,
             env: ?std.json.Value = null,
             timeout: ?u32 = null,
+            run_in_background: ?bool = null,
         };
 
         const ParseError = error{
@@ -360,15 +362,15 @@ pub fn Impl(comptime B: type) type {
         };
 
         fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args {
-            const parsed = std.json.parseFromSlice(JsonArgs, gpa, arguments, .{ .ignore_unknown_fields = true }) catch return error.InvalidJson;
+            const parsed = std.json.parseFromSlice(JsonArgs, gpa, arguments, .{ .ignore_unknown_fields = false }) catch return error.InvalidJson;
             errdefer parsed.deinit();
 
             const command = parsed.value.command orelse return error.MissingCommand;
             if (command.len == 0) return error.MissingCommand;
 
             // `description` is the summary field; null/empty → the generic fallback
-            // keeps the display honest. (`reason` was removed — the schema is the
-            // contract, and unknown fields are ignored like any other.)
+            // keeps the display honest. (`reason` was removed; the schema is
+            // the contract and execution rejects unknown fields.)
             const summary = if (parsed.value.description) |d|
                 (if (d.len > 0) d else "Executing command.")
             else
@@ -914,11 +916,11 @@ test "shell tool parses timeout" {
     try std.testing.expectEqual(@as(u32, 42), args.timeout_seconds);
 }
 
-test "shell tool ignores a legacy reason field" {
-    var args = try impl.parseArgs(std.testing.allocator, "{\"command\":\"printf ok\",\"reason\":\"Print ok\"}");
-    defer args.deinit();
-
-    try std.testing.expectEqualStrings("Executing command.", args.summary);
+test "shell tool rejects a legacy reason field" {
+    try std.testing.expectError(
+        error.InvalidJson,
+        impl.parseArgs(std.testing.allocator, "{\"command\":\"printf ok\",\"reason\":\"Print ok\"}"),
+    );
 }
 
 test "shell tool accepts description as the canonical summary" {

@@ -305,6 +305,8 @@ pub const Tool = struct {
 
 pub const Schema = struct {
     properties: []const Property,
+    allow_extra_properties: bool = false,
+    requirements: []const Requirement = &.{},
 
     pub const Property = struct {
         name: []const u8,
@@ -312,6 +314,9 @@ pub const Schema = struct {
         description: []const u8,
         required: bool,
         nullable: bool = false,
+        /// When `kind == .object`, constrain every value in the object to this
+        /// scalar kind. Null leaves the object open for arbitrary JSON values.
+        object_value_kind: ?Kind = null,
         /// Enum constraint values. When present, the property is restricted
         /// to one of these values. Serialized as `"enum": [...]` in the
         /// tool definition JSON so the model knows the valid options.
@@ -320,6 +325,22 @@ pub const Schema = struct {
         /// `"true"`, `"\"auto\""`). When present, serialized as
         /// `"default": <value>` in the tool definition JSON.
         default_value: ?[]const u8 = null,
+
+        /// Optional fields are represented as nullable on the wire in strict
+        /// mode, where providers require every property to be present. Accept
+        /// that same representation at execution time.
+        pub fn acceptsNull(self: Property) bool {
+            return self.nullable or !self.required;
+        }
+    };
+
+    /// Conditional requirements for flat command-style schemas. Keeping
+    /// these in the schema lets the shared executor reject incomplete calls
+    /// before a tool-specific parser or UI bridge sees them.
+    pub const Requirement = struct {
+        when_property: []const u8,
+        equals: []const u8,
+        required_properties: []const []const u8,
     };
 
     pub const Kind = enum { string, integer, number, object, array, boolean };
@@ -350,12 +371,18 @@ pub const Schema = struct {
                 .description = try gpa.dupe(u8, prop.description),
                 .required = prop.required,
                 .nullable = prop.nullable,
+                .object_value_kind = prop.object_value_kind,
                 .enum_values = if (prop.enum_values) |ev| try cloneEnumValues(gpa, ev) else null,
                 .default_value = if (prop.default_value) |dv| try gpa.dupe(u8, dv) else null,
             };
             built = i + 1;
         }
-        return .{ .properties = props };
+        const requirements = try cloneRequirements(gpa, self.requirements);
+        return .{
+            .properties = props,
+            .allow_extra_properties = self.allow_extra_properties,
+            .requirements = requirements,
+        };
     }
 
     fn cloneEnumValues(gpa: std.mem.Allocator, ev: []const []const u8) ![]const []const u8 {
@@ -372,6 +399,41 @@ pub const Schema = struct {
         return copy;
     }
 
+    fn cloneRequirements(gpa: std.mem.Allocator, requirements: []const Requirement) ![]const Requirement {
+        const copy = try gpa.alloc(Requirement, requirements.len);
+        errdefer gpa.free(copy);
+        var built: usize = 0;
+        errdefer {
+            for (copy[0..built]) |requirement| freeRequirement(gpa, requirement);
+        }
+        for (requirements, 0..) |requirement, index| {
+            const required_properties = try cloneEnumValues(gpa, requirement.required_properties);
+            errdefer freeStringList(gpa, required_properties);
+            const when_property = try gpa.dupe(u8, requirement.when_property);
+            errdefer gpa.free(when_property);
+            const equals = try gpa.dupe(u8, requirement.equals);
+            errdefer gpa.free(equals);
+            copy[index] = .{
+                .when_property = when_property,
+                .equals = equals,
+                .required_properties = required_properties,
+            };
+            built = index + 1;
+        }
+        return copy;
+    }
+
+    fn freeRequirement(gpa: std.mem.Allocator, requirement: Requirement) void {
+        gpa.free(requirement.when_property);
+        gpa.free(requirement.equals);
+        freeStringList(gpa, requirement.required_properties);
+    }
+
+    fn freeStringList(gpa: std.mem.Allocator, strings: []const []const u8) void {
+        for (strings) |string| gpa.free(string);
+        gpa.free(strings);
+    }
+
     /// Free all owned slices in the schema's properties.
     pub fn deinit(self: *Schema, gpa: std.mem.Allocator) void {
         for (self.properties) |*prop| {
@@ -384,9 +446,39 @@ pub const Schema = struct {
             if (prop.default_value) |dv| gpa.free(dv);
         }
         if (self.properties.len > 0) gpa.free(self.properties);
+        for (self.requirements) |requirement| freeRequirement(gpa, requirement);
+        if (self.requirements.len > 0) gpa.free(self.requirements);
         self.* = undefined;
     }
 };
+
+test "tool contract: Schema.clone preserves extended contract fields" {
+    const gpa = std.testing.allocator;
+    const source: Schema = .{
+        .properties = &.{.{
+            .name = "env",
+            .kind = .object,
+            .description = "Environment",
+            .required = false,
+            .object_value_kind = .string,
+        }},
+        .allow_extra_properties = true,
+        .requirements = &.{.{
+            .when_property = "command",
+            .equals = "run",
+            .required_properties = &.{"env"},
+        }},
+    };
+    var cloned = try source.clone(gpa);
+    defer cloned.deinit(gpa);
+
+    try std.testing.expect(cloned.properties.ptr != source.properties.ptr);
+    try std.testing.expect(cloned.requirements.ptr != source.requirements.ptr);
+    try std.testing.expect(cloned.allow_extra_properties);
+    try std.testing.expectEqual(Schema.Kind.string, cloned.properties[0].object_value_kind.?);
+    try std.testing.expectEqualStrings("command", cloned.requirements[0].when_property);
+    try std.testing.expectEqualStrings("env", cloned.requirements[0].required_properties[0]);
+}
 
 pub fn ok(gpa: std.mem.Allocator, stdout: []u8) Error!Output {
     const stderr = try gpa.alloc(u8, 0);

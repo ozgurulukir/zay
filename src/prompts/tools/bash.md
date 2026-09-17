@@ -2,7 +2,7 @@ Run a shell command.
 
 - Set the working directory with the `cwd` parameter (fresh shell per call). `cwd` must be within the project root.
 - Pass multiline or complex values via `env: { NAME: "..." }`. Reference them as `"$NAME"`.
-- Provide a `description` for every command explaining what it does.
+- `description` is optional; provide it when a concise title adds useful context.
 - Quote every expansion: `"$var"`, `"$(cmd)"`, `"${arr[@]}"`.
 - Default timeout is 30 seconds. Raise with `timeout` when a command needs longer; a timed-out result explains how to retry.
 - Prefer targeted commands (`rg`, `find`, `git diff --stat`, `head`, `tail`) over dumping large files or full build logs.
@@ -19,7 +19,7 @@ Never dump a whole file into the transcript. Locate, read a bounded window, then
 
 ## Long-running commands
 
-- For commands taking >10s or processes that run continuously (builds, dev servers, watchers), set `run_in_background: true`. The call returns immediately with a job id, pid, and log path.
+- For continuous processes or commands expected to outlast `timeout`, set `run_in_background: true`. The call returns immediately with a job id, pid, and log path.
 - Background process completion is delivered automatically as a message; do not poll in a busy loop.
 - Query status, read recent logs, or cancel running jobs using the `background` tool (`{"command":"status","id":<id>}`, `{"command":"tail","id":<id>}`, `{"command":"cancel","id":<id>}`).
 
