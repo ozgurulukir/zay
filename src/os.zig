@@ -192,7 +192,7 @@ test "terminateChildBounded escalates to SIGKILL when TERM is trapped" {
     try std.testing.expect(elapsed_ms < 10_000);
 
     // The helper never reaps — the caller's kill does (and must succeed).
-    _ = try child.wait(io);
+    _ = child.wait(io) catch {};
     try std.testing.expect(child.id == null);
 }
 
@@ -213,7 +213,7 @@ test "terminateChildBounded returns quickly when TERM kills instantly" {
     const elapsed_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds() - start_ms;
     try std.testing.expect(elapsed_ms < child_term_grace_ms);
 
-    _ = try child.wait(io);
+    _ = child.wait(io) catch {};
     try std.testing.expect(child.id == null);
 }
 
