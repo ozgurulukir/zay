@@ -156,10 +156,10 @@ pub fn attachJobObjectKillOnClose(child: *const std.process.Child) ?std.os.windo
 pub fn terminateChildTree(io: std.Io, child: *const std.process.Child, job_handle: ?std.os.windows.HANDLE) void {
     _ = io;
     if (!is_windows) return;
-    if (child.id == null) return; // already reaped by `child.kill`
     if (job_handle) |h| {
+        defer _ = windows.CloseHandle(h);
+        if (child.id == null) return; // already reaped by `child.kill`
         _ = windows.TerminateJobObject(h, 1);
-        _ = windows.CloseHandle(h);
     }
 }
 /// Spawn `bash -c <command>` in its own process group — the shape the shell
