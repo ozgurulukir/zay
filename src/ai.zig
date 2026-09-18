@@ -159,6 +159,11 @@ pub const WireDialect = enum {
 /// field defaults below.
 pub const default_request_timeout_seconds: u32 = 300;
 pub const default_max_parallel_tool_calls: u32 = 16;
+/// The wire-level system prompt when a caller supplies none. Chat clients
+/// leave this in place (the agent prompt lives in history); the runtime's
+/// attach plan overrides it for adapters that carry the agent prompt on the
+/// wire.
+pub const default_system_prompt: []const u8 = "You are a helpful assistant.";
 
 pub const Config = struct {
     base_url: []const u8,
@@ -223,7 +228,7 @@ pub const Config = struct {
     /// init: each client deep-dupes what it keeps via
     /// `provider_headers.cloneHeaders`.
     headers: []const provider_headers.Header = &.{},
-    system_prompt: []const u8 = "You are a helpful assistant.",
+    system_prompt: []const u8 = default_system_prompt,
 };
 
 pub const Role = enum {
