@@ -591,16 +591,7 @@ pub const AgentRuntime = struct {
             break :blk provider.defaultBaseUrl() orelse return;
         };
         const effort = ms.model().reasoning.resolve();
-        // Per-model context_window from providers map acts as a fallback
-        // when the global overrideContextWindow is not set.
-        if (self.context_settings.override_context_window == null) {
-            self.context_settings.override_context_window = ms.model().context_window;
-        }
-        // Per-model max_output_tokens from providers map acts as a fallback
-        // when the global context.maxOutputTokens is not set.
-        if (self.context_settings.max_output_tokens == null) {
-            self.context_settings.max_output_tokens = ms.model().max_output_tokens;
-        }
+        self.resolveModelContextFallbacks(ms);
         var loaded_key: ?[]u8 = null;
         defer if (loaded_key) |k| self.gpa.free(k);
         const api_key = blk: {
@@ -644,11 +635,26 @@ pub const AgentRuntime = struct {
         );
         self.disable_prompt_cache = config.context.disable_prompt_cache orelse false;
         const base_url = if (ms.baseUrl()) |url| if (url.len > 0) url else provider.defaultBaseUrl() orelse return else provider.defaultBaseUrl() orelse return;
+        self.resolveModelContextFallbacks(ms);
         const reasoning: ai.Reasoning = .{
             .effort = ms.model().reasoning.resolve(),
             .summary = .auto,
         };
         try self.attachOpenAiResponsesClient(base_url, ms.apiKey() orelse "", ms.model().id, reasoning, config.providerHeadersByName(ms.providerName()));
+    }
+
+    /// Per-model context_window and max_output_tokens from the providers map
+    /// act as fallbacks when the global overrides are not set. Capability
+    /// fallbacks are adapter-independent, so every attach path resolves them
+    /// (the responses path previously skipped them — the chat path's block,
+    /// deduplicated here).
+    fn resolveModelContextFallbacks(self: *AgentRuntime, ms: config_mod.ModelSelection) void {
+        if (self.context_settings.override_context_window == null) {
+            self.context_settings.override_context_window = ms.model().context_window;
+        }
+        if (self.context_settings.max_output_tokens == null) {
+            self.context_settings.max_output_tokens = ms.model().max_output_tokens;
+        }
     }
 
     /// Establish a Codex session — uses OAuth credentials to identify
@@ -660,67 +666,15 @@ pub const AgentRuntime = struct {
         model_id: []const u8,
         effort: ai.ReasoningEffort,
     ) !void {
-        const client = try self.gpa.create(ai.codex_responses.Client);
-        errdefer self.gpa.destroy(client);
-        try client.init(self.gpa, self.io, .{
+        return self.attachClients(.{
+            .adapter = .codex,
             .base_url = ai.codex_responses.default_codex_endpoint,
             .api_key = credentials.access,
-            .model = model_id,
-            .tools = tools_mod.builtinRegistry(),
-            .mcp_tools = self.mcp_tools,
+            .model_id = model_id,
             .reasoning = .{ .effort = effort, .summary = .auto },
-            .strict = self.strict_outputs,
             .account_id = credentials.account_id,
-            .session_id = self.session_writer.session.id.slice(),
-            .disable_prompt_cache = self.disable_prompt_cache,
-            .system_prompt = self.system_prompt,
+            .main_system_prompt = self.system_prompt,
         });
-        errdefer client.deinit();
-        self.replaceClient(.{ .codex_responses = client });
-        const model_info = self.lookupModelInfo(model_id);
-        self.agent.context_window_tokens = compaction.contextWindowTokens(model_info, self.context_settings.override_context_window);
-        self.agent.resetContextUsage();
-
-        attach_compaction: {
-            const compaction_client = self.gpa.create(ai.codex_responses.Client) catch break :attach_compaction;
-            compaction_client.init(self.gpa, self.io, .{
-                .base_url = ai.codex_responses.default_codex_endpoint,
-                .api_key = credentials.access,
-                .model = model_id,
-                .tools = &.{},
-                .reasoning = .{ .effort = effort, .summary = .auto },
-                .account_id = credentials.account_id,
-                .session_id = self.session_writer.session.id.slice(),
-                .disable_prompt_cache = self.disable_prompt_cache,
-                // The summarizer gets a minimal carrier prompt, NOT the full
-                // agent system prompt (AGENTS.md + skills + plugins) — that can
-                // push the summary request itself over a small window (C4).
-                .system_prompt = compaction.summarizer_system_prompt,
-            }) catch {
-                self.gpa.destroy(compaction_client);
-                break :attach_compaction;
-            };
-            self.setCompactionClient(.{ .codex_responses = compaction_client });
-        }
-        attach_naming: {
-            const naming_client = self.gpa.create(ai.codex_responses.Client) catch break :attach_naming;
-            naming_client.init(self.gpa, self.io, .{
-                .base_url = ai.codex_responses.default_codex_endpoint,
-                .api_key = credentials.access,
-                .model = model_id,
-                .tools = &.{},
-                .reasoning = .{ .effort = effort, .summary = .auto },
-                .account_id = credentials.account_id,
-                .session_id = self.session_writer.session.id.slice(),
-                .disable_prompt_cache = self.disable_prompt_cache,
-                .system_prompt = self.system_prompt,
-            }) catch {
-                self.gpa.destroy(naming_client);
-                break :attach_naming;
-            };
-            self.setNamingClient(.{ .codex_responses = naming_client });
-        }
-        self.codex_connection_expired = false;
     }
 
     pub fn disconnectCodexClient(self: *AgentRuntime) void {
@@ -767,6 +721,149 @@ pub const AgentRuntime = struct {
         return ai.provider_headers.build(self.gpa, base_url, self.wire_dialect, expanded);
     }
 
+    /// Which wire adapter the plan attaches. One arm per adapter in
+    /// `createAttachClient`; a fourth adapter earns an arm here and a
+    /// wrapper, nothing more.
+    const AttachAdapter = enum { chat, responses, codex };
+
+    /// Everything the unified attach path needs to build all three role
+    /// clients: one endpoint, one model, one plan. The per-role deltas
+    /// (tool surface cleared, prompt source) are derived in `attachClients`,
+    /// so a role can never drift from the plan again.
+    const AttachPlan = struct {
+        adapter: AttachAdapter,
+        base_url: []const u8,
+        api_key: []const u8,
+        model_id: []const u8,
+        reasoning: ai.Reasoning,
+        user_headers: []const config_mod.ProviderHeader = &.{},
+        /// Codex only: the OAuth account id the client's init asserts on.
+        account_id: []const u8 = "",
+        /// The main role's system prompt. Null = keep `ai.Config`'s default
+        /// (chat: the agent prompt lives in history, not on the wire).
+        main_system_prompt: ?[]const u8 = null,
+    };
+
+    /// The main role's `ai.Config` from the plan. Chat-only wire knobs
+    /// (dialect, timeout, caps) ride on the chat adapter; codex carries its
+    /// OAuth account id; responses consumes only the shared fields.
+    fn attachBaseConfig(
+        self: *AgentRuntime,
+        plan: AttachPlan,
+        model_info: ?modelsdev.ModelInfo,
+        provider_specs: []const ai.provider_headers.Header,
+    ) ai.Config {
+        var cfg: ai.Config = .{
+            .base_url = plan.base_url,
+            .api_key = plan.api_key,
+            .model = plan.model_id,
+            .tools = tools_mod.builtinRegistry(),
+            .mcp_tools = self.mcp_tools,
+            .reasoning = plan.reasoning,
+            .strict = self.strict_outputs,
+            .disable_prompt_cache = self.disable_prompt_cache,
+            .session_id = self.session_writer.session.id.slice(),
+            .system_prompt = plan.main_system_prompt orelse ai.default_system_prompt,
+            .headers = provider_specs,
+        };
+        switch (plan.adapter) {
+            .chat => {
+                cfg.wire_dialect = self.wire_dialect;
+                cfg.is_reasoning_model = compaction.isReasoningModel(model_info);
+                cfg.max_output_tokens = self.context_settings.max_output_tokens;
+                cfg.max_parallel_tool_calls = self.context_settings.max_parallel_tool_calls orelse ai.default_max_parallel_tool_calls;
+                cfg.request_timeout_seconds = self.context_settings.request_timeout_seconds orelse ai.default_request_timeout_seconds;
+            },
+            .codex => cfg.account_id = plan.account_id,
+            .responses => {},
+        }
+        return cfg;
+    }
+
+    /// A secondary role (compaction/naming) is the main config minus the
+    /// tool surface, plus its prompt — derived by copy so the field list
+    /// exists once and a role can never drift from the plan again.
+    /// `max_output_tokens` stays unset: it serializes as `max_tokens` on the
+    /// wire, and a small global cap must never truncate a persisted summary.
+    fn attachSecondaryConfig(main: ai.Config, system_prompt: []const u8) ai.Config {
+        var cfg = main;
+        cfg.tools = &.{};
+        cfg.mcp_tools = &.{};
+        cfg.strict = false;
+        cfg.max_output_tokens = null;
+        cfg.system_prompt = system_prompt;
+        return cfg;
+    }
+
+    /// Create + init the concrete client for the plan's adapter.
+    fn createAttachClient(self: *AgentRuntime, plan: AttachPlan, cfg: ai.Config) !OwnedClient {
+        switch (plan.adapter) {
+            .chat => {
+                const client = try self.gpa.create(ai.openai_compatible.Client);
+                errdefer self.gpa.destroy(client);
+                try client.init(self.gpa, self.io, cfg);
+                errdefer client.deinit();
+                return .{ .openai_compatible = client };
+            },
+            .responses => {
+                const client = try self.gpa.create(ai.responses_core.Client);
+                errdefer self.gpa.destroy(client);
+                try client.init(self.gpa, self.io, cfg, .{});
+                errdefer client.deinit();
+                return .{ .responses = client };
+            },
+            .codex => {
+                const client = try self.gpa.create(ai.codex_responses.Client);
+                errdefer self.gpa.destroy(client);
+                try client.init(self.gpa, self.io, cfg);
+                errdefer client.deinit();
+                return .{ .codex_responses = client };
+            },
+        }
+    }
+
+    /// Attach the three-role client trio for one endpoint plan: main (tools
+    /// on), compaction (summarizer carrier prompt, C4), naming (same prompt
+    /// as main). Main attach is fatal on failure; the secondaries are
+    /// best-effort — on failure the previous secondary (if any) stays
+    /// attached, matching the historical per-adapter attach behavior.
+    fn attachClients(self: *AgentRuntime, plan: AttachPlan) !void {
+        const model_info = self.lookupModelInfo(plan.model_id);
+        var provider_specs: []ai.provider_headers.Header = &.{};
+        if (plan.adapter != .codex) {
+            provider_specs = try self.buildProviderHeaders(plan.base_url, plan.user_headers);
+        }
+        // Every init deep-copies the header specs, so the single free at
+        // scope end spans all three roles — the one lifetime rule the plan
+        // exists to centralize.
+        defer if (plan.adapter != .codex) ai.provider_headers.freeHeaders(self.gpa, provider_specs);
+
+        const main_config = self.attachBaseConfig(plan, model_info, provider_specs);
+        const main_client = try self.createAttachClient(plan, main_config);
+        // Ownership hands off here: nothing after this line may fail before
+        // `replaceClient` runs, or `main_client` would leak.
+        self.replaceClient(main_client);
+        self.agent.context_window_tokens = compaction.contextWindowTokens(model_info, self.context_settings.override_context_window);
+        self.agent.resetContextUsage();
+
+        attach_compaction: {
+            const compaction_config = attachSecondaryConfig(main_config, compaction.summarizer_system_prompt);
+            const client = self.createAttachClient(plan, compaction_config) catch |err| {
+                log.warn("attach.secondary role=compaction adapter={s} err={s}", .{ @tagName(plan.adapter), @errorName(err) });
+                break :attach_compaction;
+            };
+            self.setCompactionClient(client);
+        }
+        attach_naming: {
+            const naming_config = attachSecondaryConfig(main_config, main_config.system_prompt);
+            const client = self.createAttachClient(plan, naming_config) catch |err| {
+                log.warn("attach.secondary role=naming adapter={s} err={s}", .{ @tagName(plan.adapter), @errorName(err) });
+                break :attach_naming;
+            };
+            self.setNamingClient(client);
+        }
+    }
+
     pub fn attachOpenAiCompatibleClient(
         self: *AgentRuntime,
         base_url: []const u8,
@@ -775,79 +872,21 @@ pub const AgentRuntime = struct {
         effort: ai.ReasoningEffort,
         user_headers: []const config_mod.ProviderHeader,
     ) !void {
-        const model_info = self.lookupModelInfo(model_id);
-        const provider_specs = try self.buildProviderHeaders(base_url, user_headers);
-        defer ai.provider_headers.freeHeaders(self.gpa, provider_specs);
-        const client = try self.gpa.create(ai.openai_compatible.Client);
-        errdefer self.gpa.destroy(client);
-        try client.init(self.gpa, self.io, .{
+        return self.attachClients(.{
+            .adapter = .chat,
             .base_url = base_url,
             .api_key = api_key,
-            .model = model_id,
-            .tools = tools_mod.builtinRegistry(),
-            .mcp_tools = self.mcp_tools,
+            .model_id = model_id,
             .reasoning = .{ .effort = effort },
-            .strict = self.strict_outputs,
-            .wire_dialect = self.wire_dialect,
-            .is_reasoning_model = compaction.isReasoningModel(model_info),
-            .max_output_tokens = self.context_settings.max_output_tokens,
-            .max_parallel_tool_calls = self.context_settings.max_parallel_tool_calls orelse ai.default_max_parallel_tool_calls,
-            .request_timeout_seconds = self.context_settings.request_timeout_seconds orelse ai.default_request_timeout_seconds,
-            .disable_prompt_cache = self.disable_prompt_cache,
-            .session_id = self.session_writer.session.id.slice(),
-            .headers = provider_specs,
+            .user_headers = user_headers,
+            // The chat agent prompt lives in history, not on the wire — the
+            // ai.Config default stays for main and naming.
+            .main_system_prompt = null,
         });
-        errdefer client.deinit();
-        self.replaceClient(.{ .openai_compatible = client });
-        self.agent.context_window_tokens = compaction.contextWindowTokens(model_info, self.context_settings.override_context_window);
-        self.agent.resetContextUsage();
-
-        attach_compaction: {
-            const compaction_client = self.gpa.create(ai.openai_compatible.Client) catch break :attach_compaction;
-            compaction_client.init(self.gpa, self.io, .{
-                .base_url = base_url,
-                .api_key = api_key,
-                .model = model_id,
-                .tools = &.{},
-                .reasoning = .{ .effort = effort },
-                // Parity with the main client: the summarizer must speak the
-                // same wire dialect (DashScope's top-level enable_thinking vs
-                // reasoning_effort) and honor the user's request timeout (H2).
-                .wire_dialect = self.wire_dialect,
-                .is_reasoning_model = compaction.isReasoningModel(model_info),
-                .request_timeout_seconds = self.context_settings.request_timeout_seconds orelse ai.default_request_timeout_seconds,
-                .disable_prompt_cache = self.disable_prompt_cache,
-                // The zen session header is mandatory routing, so the
-                // summarizer needs the same session id the main client has.
-                .session_id = self.session_writer.session.id.slice(),
-                .headers = provider_specs,
-            }) catch {
-                self.gpa.destroy(compaction_client);
-                break :attach_compaction;
-            };
-            self.setCompactionClient(.{ .openai_compatible = compaction_client });
-        }
-        attach_naming: {
-            const naming_client = self.gpa.create(ai.openai_compatible.Client) catch break :attach_naming;
-            naming_client.init(self.gpa, self.io, .{
-                .base_url = base_url,
-                .api_key = api_key,
-                .model = model_id,
-                .tools = &.{},
-                .reasoning = .{ .effort = effort },
-                .is_reasoning_model = compaction.isReasoningModel(model_info),
-                .disable_prompt_cache = self.disable_prompt_cache,
-                .session_id = self.session_writer.session.id.slice(),
-                .headers = provider_specs,
-            }) catch {
-                self.gpa.destroy(naming_client);
-                break :attach_naming;
-            };
-            self.setNamingClient(.{ .openai_compatible = naming_client });
-        }
     }
 
-    pub fn attachOpenAiResponsesClient(
+    /// Sole caller is `tryAttachOpenAiResponsesFromConfig` — private.
+    fn attachOpenAiResponsesClient(
         self: *AgentRuntime,
         base_url: []const u8,
         api_key: []const u8,
@@ -855,66 +894,15 @@ pub const AgentRuntime = struct {
         reasoning: ai.Reasoning,
         user_headers: []const config_mod.ProviderHeader,
     ) !void {
-        const model_info = self.lookupModelInfo(model_id);
-        const provider_specs = try self.buildProviderHeaders(base_url, user_headers);
-        defer ai.provider_headers.freeHeaders(self.gpa, provider_specs);
-        const client = try self.gpa.create(ai.responses_core.Client);
-        errdefer self.gpa.destroy(client);
-        try client.init(self.gpa, self.io, .{
+        return self.attachClients(.{
+            .adapter = .responses,
             .base_url = base_url,
             .api_key = api_key,
-            .model = model_id,
-            .tools = tools_mod.builtinRegistry(),
-            .mcp_tools = self.mcp_tools,
+            .model_id = model_id,
             .reasoning = reasoning,
-            .strict = self.strict_outputs,
-            .session_id = self.session_writer.session.id.slice(),
-            .disable_prompt_cache = self.disable_prompt_cache,
-            .headers = provider_specs,
-            .system_prompt = self.system_prompt,
-        }, .{});
-        errdefer client.deinit();
-        self.replaceClient(.{ .responses = client });
-        self.agent.context_window_tokens = compaction.contextWindowTokens(model_info, self.context_settings.override_context_window);
-        self.agent.resetContextUsage();
-
-        attach_compaction: {
-            const compaction_client = self.gpa.create(ai.responses_core.Client) catch break :attach_compaction;
-            compaction_client.init(self.gpa, self.io, .{
-                .base_url = base_url,
-                .api_key = api_key,
-                .model = model_id,
-                .tools = &.{},
-                .reasoning = reasoning,
-                .session_id = self.session_writer.session.id.slice(),
-                .disable_prompt_cache = self.disable_prompt_cache,
-                .headers = provider_specs,
-                // Minimal carrier prompt, not the full agent system prompt (C4).
-                .system_prompt = compaction.summarizer_system_prompt,
-            }, .{}) catch {
-                self.gpa.destroy(compaction_client);
-                break :attach_compaction;
-            };
-            self.setCompactionClient(.{ .responses = compaction_client });
-        }
-        attach_naming: {
-            const naming_client = self.gpa.create(ai.responses_core.Client) catch break :attach_naming;
-            naming_client.init(self.gpa, self.io, .{
-                .base_url = base_url,
-                .api_key = api_key,
-                .model = model_id,
-                .tools = &.{},
-                .reasoning = reasoning,
-                .session_id = self.session_writer.session.id.slice(),
-                .disable_prompt_cache = self.disable_prompt_cache,
-                .headers = provider_specs,
-                .system_prompt = self.system_prompt,
-            }, .{}) catch {
-                self.gpa.destroy(naming_client);
-                break :attach_naming;
-            };
-            self.setNamingClient(.{ .responses = naming_client });
-        }
+            .user_headers = user_headers,
+            .main_system_prompt = self.system_prompt,
+        });
     }
 
     fn languageModelMatches(a: ai.LanguageModel, b: ai.LanguageModel) bool {
@@ -1282,6 +1270,176 @@ test "zen attach wires routing headers and session id into all chat clients" {
     try std.testing.expect(naming_client.config.session_id.len > 0);
     try std.testing.expectEqualStrings(main_client.config.session_id, compaction_client.config.session_id);
     try std.testing.expectEqualStrings(main_client.config.session_id, naming_client.config.session_id);
+}
+
+test "attach parity: every role inherits plan fields across all adapters" {
+    // The unified attach path derives the compaction and naming clients from
+    // the main client's config by copy. This table pins the derivation per
+    // adapter so a role can never silently drift again — the chat naming
+    // client lost wire_dialect/request_timeout_seconds exactly this way, and
+    // the chat compaction prompt missed the C4 carrier intent.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_abs = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_abs);
+
+    // ── chat: dialect, timeout, and prompt roles reach every role ──
+    {
+        var runtime: AgentRuntime = undefined;
+        try runtime.initNew(.{
+            .gpa = gpa,
+            .io = std.testing.io,
+            .cwd = home_abs,
+            .session_dir = home_abs,
+            .home_dir = home_abs,
+            .base_system_prompt = "test system prompt",
+            .config = .{
+                .model_selection = .{
+                    .builtin = .{
+                        .provider = .alibaba,
+                        .provider_name = @constCast("dashscope"),
+                        .model = .{ .id = @constCast("qwen3-max") },
+                    },
+                },
+            },
+            .diagnostics = &.{},
+        });
+        defer runtime.deinit();
+
+        // Re-attach with a non-default timeout so the parity check reads a
+        // plan value no default could mask.
+        runtime.wire_dialect = .dashscope;
+        runtime.context_settings.request_timeout_seconds = 777;
+        try runtime.attachOpenAiCompatibleClient(
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "test-key",
+            "qwen3-max",
+            .medium,
+            &.{},
+        );
+
+        const main_client = runtime.owned_client.?.openai_compatible;
+        const comp_client = runtime.owned_compaction_client.?.openai_compatible;
+        const naming_client = runtime.owned_naming_client.?.openai_compatible;
+        const roles = [_]*const ai.openai_compatible.Client{ main_client, comp_client, naming_client };
+        for (roles) |client| {
+            try std.testing.expectEqual(ai.WireDialect.dashscope, client.config.wire_dialect);
+            try std.testing.expectEqual(@as(u32, 777), client.config.request_timeout_seconds);
+            try std.testing.expectEqualStrings(main_client.config.session_id, client.config.session_id);
+            try std.testing.expectEqual(runtime.disable_prompt_cache, client.config.disable_prompt_cache);
+        }
+        // Tool surface: main only.
+        try std.testing.expect(main_client.tools_json.len > 2);
+        try std.testing.expectEqualStrings("[]", comp_client.tools_json);
+        try std.testing.expectEqualStrings("[]", naming_client.tools_json);
+        try std.testing.expectEqual(runtime.strict_outputs, main_client.config.strict);
+        try std.testing.expect(!comp_client.config.strict);
+        try std.testing.expect(!naming_client.config.strict);
+        // Prompt roles: main/naming on the default carrier, compaction on
+        // the summarizer carrier (C4) — on every adapter.
+        try std.testing.expectEqualStrings(ai.default_system_prompt, main_client.config.system_prompt);
+        try std.testing.expectEqualStrings(ai.default_system_prompt, naming_client.config.system_prompt);
+        try std.testing.expectEqualStrings(compaction.summarizer_system_prompt, comp_client.config.system_prompt);
+    }
+
+    // ── responses: prompt roles + per-model context fallbacks on attach ──
+    {
+        var runtime: AgentRuntime = undefined;
+        try runtime.initNew(.{
+            .gpa = gpa,
+            .io = std.testing.io,
+            .cwd = home_abs,
+            .session_dir = home_abs,
+            .home_dir = home_abs,
+            .base_system_prompt = "test system prompt",
+            .config = .{
+                .model_selection = .{
+                    .builtin = .{
+                        // A chat-adapter provider flagged for the Responses
+                        // endpoint: `.openai` itself resolves to the codex
+                        // adapter, which would skip this path entirely.
+                        .provider = .ollama,
+                        .provider_name = @constCast("ollama"),
+                        .model = .{
+                            .id = @constCast("gpt-5"),
+                            .reasoning = .unset,
+                            .context_window = 12345,
+                            .max_output_tokens = 999,
+                        },
+                        .use_responses_endpoint = true,
+                        .bash_classifier_url = null,
+                    },
+                },
+            },
+            .diagnostics = &.{},
+        });
+        defer runtime.deinit();
+
+        // The per-model context fallbacks ride the responses path too —
+        // capability fallbacks are adapter-independent.
+        try std.testing.expectEqual(@as(?u32, 12345), runtime.context_settings.override_context_window);
+        try std.testing.expectEqual(@as(?u32, 999), runtime.context_settings.max_output_tokens);
+
+        const main_client = runtime.owned_client.?.responses;
+        const comp_client = runtime.owned_compaction_client.?.responses;
+        const naming_client = runtime.owned_naming_client.?.responses;
+        const roles = [_]*const ai.responses_core.Client{ main_client, comp_client, naming_client };
+        for (roles) |client| {
+            try std.testing.expectEqualStrings(main_client.config.session_id, client.config.session_id);
+        }
+        // Naming carries the main client's (assembled) system prompt; the
+        // runtime prompt is assembled, so assert the pairing, not a literal.
+        try std.testing.expect(naming_client.config.system_prompt.len > 0);
+        try std.testing.expectEqualStrings(main_client.config.system_prompt, naming_client.config.system_prompt);
+        try std.testing.expectEqualStrings(compaction.summarizer_system_prompt, comp_client.config.system_prompt);
+        try std.testing.expect(main_client.tools_json.len > 2);
+        try std.testing.expectEqualStrings("[]", comp_client.tools_json);
+        try std.testing.expectEqualStrings("[]", naming_client.tools_json);
+        try std.testing.expectEqual(runtime.strict_outputs, main_client.config.strict);
+        try std.testing.expect(!comp_client.config.strict);
+        try std.testing.expect(!naming_client.config.strict);
+    }
+
+    // ── codex: account id and prompt roles on every role ──
+    {
+        var runtime: AgentRuntime = undefined;
+        try runtime.initNew(.{
+            .gpa = gpa,
+            .io = std.testing.io,
+            .cwd = home_abs,
+            .session_dir = home_abs,
+            .home_dir = home_abs,
+            .base_system_prompt = "test system prompt",
+            .config = .{},
+            .diagnostics = &.{},
+        });
+        defer runtime.deinit();
+
+        try runtime.connectCodexClient(.{
+            .access = @constCast("test-access"),
+            .refresh = @constCast("test-refresh"),
+            .account_id = @constCast("acct_123"),
+            .expires = 0,
+        }, "gpt-5-codex", .medium);
+
+        const main_client = runtime.owned_client.?.codex_responses;
+        const comp_client = runtime.owned_compaction_client.?.codex_responses;
+        const naming_client = runtime.owned_naming_client.?.codex_responses;
+        const roles = [_]*const ai.codex_responses.Client{ main_client, comp_client, naming_client };
+        for (roles) |client| {
+            try std.testing.expectEqualStrings("acct_123", client.core_client.config.account_id);
+            try std.testing.expectEqualStrings(main_client.core_client.config.session_id, client.core_client.config.session_id);
+            try std.testing.expectEqual(ai.ReasoningSummary.auto, client.core_client.config.reasoning.?.summary.?);
+        }
+        try std.testing.expect(naming_client.core_client.config.system_prompt.len > 0);
+        try std.testing.expectEqualStrings(main_client.core_client.config.system_prompt, naming_client.core_client.config.system_prompt);
+        try std.testing.expectEqualStrings(compaction.summarizer_system_prompt, comp_client.core_client.config.system_prompt);
+        try std.testing.expectEqualStrings("[]", comp_client.core_client.tools_json);
+        try std.testing.expectEqualStrings("[]", naming_client.core_client.tools_json);
+    }
 }
 
 test "runtime selects responses adapter when requested" {
