@@ -578,6 +578,10 @@ pub const Agent = struct {
             // undefined struct.
             const finish_reason = turn.finish_reason;
             const usage = turn.usage;
+            // Hoisted for the same reason as the two above: the
+            // no-wire-content branch deinits the turn, and the
+            // truncation guard below reads this scalar after that.
+            const tool_calls_truncated = turn.tool_calls_truncated;
             var turn_owned = true;
             defer if (turn_owned) turn.deinit(self.gpa);
 
@@ -646,9 +650,9 @@ pub const Agent = struct {
                 // were truncated and retry ONCE (bounded like the length-cut
                 // auto-continue) — a pathological endpoint cannot bill an
                 // unbounded retry loop.
-                if (turn.tool_calls_truncated > 0) {
+                if (tool_calls_truncated > 0) {
                     if (!truncation_retried) {
-                        log.warn("tool_call arguments truncated by provider ({d} calls dropped) — retrying once with hint", .{turn.tool_calls_truncated});
+                        log.warn("tool_call arguments truncated by provider ({d} calls dropped) — retrying once with hint", .{tool_calls_truncated});
                         truncation_retried = true;
                         try self.addUser(tool_call_truncation_hint);
                         continue;
