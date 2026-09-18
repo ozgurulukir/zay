@@ -140,8 +140,11 @@ pub const AgentRuntime = struct {
         }
     };
 
-    pub fn initNew(
-        target: *AgentRuntime,
+    /// Birth parameters for a runtime session — one named struct instead of
+    /// a 10-positional-param contract where a transposition compiles
+    /// silently. `session_id == null` starts a new session; non-null
+    /// resumes that session.
+    pub const Genesis = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         cwd: []const u8,
@@ -150,44 +153,34 @@ pub const AgentRuntime = struct {
         base_system_prompt: []const u8,
         config: config_mod.Config,
         diagnostics: []config_mod.Diagnostic,
-        template: ?*const AgentRuntime,
-    ) !void {
-        try target.initSession(gpa, io, cwd, session_dir, home_dir, base_system_prompt, config, diagnostics, null, template);
+        session_id: ?[]const u8 = null,
+        template: ?*const AgentRuntime = null,
+    };
+
+    pub fn initNew(target: *AgentRuntime, genesis: Genesis) !void {
+        assert(genesis.session_id == null);
+        try target.initSession(genesis);
     }
 
-    pub fn initResume(
-        target: *AgentRuntime,
-        gpa: std.mem.Allocator,
-        io: std.Io,
-        cwd: []const u8,
-        session_dir: []const u8,
-        home_dir: []const u8,
-        base_system_prompt: []const u8,
-        config: config_mod.Config,
-        diagnostics: []config_mod.Diagnostic,
-        session_id: []const u8,
-        template: ?*const AgentRuntime,
-    ) !void {
-        assert(session_id.len > 0);
-        try target.initSession(gpa, io, cwd, session_dir, home_dir, base_system_prompt, config, diagnostics, session_id, template);
+    pub fn initResume(target: *AgentRuntime, genesis: Genesis) !void {
+        assert(genesis.session_id != null);
+        try target.initSession(genesis);
     }
 
     /// `cwd` is where the agent runs tools and loads skills (a lane's workspace);
     /// `session_dir` is where the session DB lives and what the session records
     /// as its cwd — the repo root, so all lanes share one DB and group together.
-    fn initSession(
-        target: *AgentRuntime,
-        gpa: std.mem.Allocator,
-        io: std.Io,
-        cwd: []const u8,
-        session_dir: []const u8,
-        home_dir: []const u8,
-        base_system_prompt: []const u8,
-        config: config_mod.Config,
-        diagnostics: []config_mod.Diagnostic,
-        session_id: ?[]const u8,
-        template: ?*const AgentRuntime,
-    ) !void {
+    fn initSession(target: *AgentRuntime, genesis: Genesis) !void {
+        const gpa = genesis.gpa;
+        const io = genesis.io;
+        const cwd = genesis.cwd;
+        const session_dir = genesis.session_dir;
+        const home_dir = genesis.home_dir;
+        const base_system_prompt = genesis.base_system_prompt;
+        const config = genesis.config;
+        const diagnostics = genesis.diagnostics;
+        const session_id = genesis.session_id;
+        const template = genesis.template;
         assert(cwd.len > 0);
         assert(base_system_prompt.len > 0);
         if (session_id) |id| assert(id.len > 0);
@@ -245,8 +238,12 @@ pub const AgentRuntime = struct {
         // test environments where home_dir is empty.
         if (home_dir.len > 0) {
             target.modelsdev_registry = modelsdev.loadRegistryCached(gpa, io, home_dir);
-            errdefer if (target.modelsdev_registry) |*reg| reg.deinit(gpa);
         }
+        // Hoisted out of the `if` above: errdefer is block-scoped, so an
+        // inside placement would leak the registry when a later init step
+        // fails. On the success path `deinit` frees it; on the error path
+        // `deinit` never runs, so exactly one of them applies.
+        errdefer if (target.modelsdev_registry) |*reg| reg.deinit(gpa);
 
         if (session_id) |id| {
             try target.session_writer.initResumeDefault(gpa, io, home_dir, id);
@@ -286,134 +283,144 @@ pub const AgentRuntime = struct {
             for (messages) |message| try target.agent.takeMessage(message);
         }
 
-        // When resuming a session, try to restore the model used in that session
-        if (session_id) |id| {
-            _ = id;
-            var summary = try target.session_writer.session.summary(gpa);
-            defer summary.deinit(gpa);
-            // Resolve the session's stored reasoning effort (if any) so resume
-            // restores the exact effort in use at save time. Invalid DB values
-            // (newer schema, hand-edited) degrade to "no override" — never fatal.
-            const resume_effort: ?ai.ReasoningEffort = if (summary.reasoning_effort) |label|
-                (ai.ReasoningEffort.fromString(label) catch null)
-            else
-                null;
-            if (summary.model_provider) |mp| {
-                // Resolve the provider: try builtin enum first, then the
-                // providers[] config map (custom providers like "qwen-cloud").
-                const provider_enum = std.meta.stringToEnum(config_mod.Provider, mp) orelse blk: {
-                    for (config.providers) |pc| {
-                        if (std.mem.eql(u8, pc.name, mp)) break :blk pc.provider;
-                    }
-                    log.warn("session.resume.unknown_provider: {s}, using config default", .{mp});
-                    try target.applyFromConfig(config);
-                    return;
-                };
-
-                // Resolve base_url from the providers[] map when the provider
-                // is custom (defaultBaseUrl() is null for .openai_compatible).
-                var resolved_base_url: []const u8 = provider_enum.defaultBaseUrl() orelse "";
-                for (config.providers) |pc| {
-                    if (!std.mem.eql(u8, pc.name, mp)) continue;
-                    switch (pc.base_url) {
-                        .custom => |url| resolved_base_url = url,
-                        .default => {},
-                    }
-                    break;
-                }
-
-                var session_config = config;
-                if (session_config.model_selection) |*ms| {
-                    switch (ms.*) {
-                        .builtin => |*b| {
-                            b.provider = provider_enum;
-                            b.provider_name = @constCast(mp);
-                            if (summary.model_id) |mid| {
-                                // mid is borrowed from summary — dupe into owned memory.
-                                b.model.id = try gpa.dupe(u8, mid);
-                            }
-                        },
-                        .custom => |*c| {
-                            c.provider_name = @constCast(mp);
-                            if (summary.model_id) |mid| {
-                                // mid is borrowed from summary — dupe into owned memory.
-                                c.model.id = try gpa.dupe(u8, mid);
-                            }
-                            if (c.base_url.len == 0 and resolved_base_url.len > 0) {
-                                c.base_url = @constCast(resolved_base_url);
-                            }
-                        },
-                    }
-                    // Restore the session's reasoning effort override (if any)
-                    // onto the selection before applying it to the client.
-                    if (resume_effort) |effort| {
-                        switch (ms.*) {
-                            .builtin => |*b| b.model.reasoning = .{ .effort = effort },
-                            .custom => |*c| c.model.reasoning = .{ .effort = effort },
-                        }
-                    }
-                    try target.applyFromConfig(session_config);
-                    // Free the dupe'd model_id — applyFromConfig dupe'd it again
-                    // into the client, so the session_config copy is no longer needed.
-                    if (summary.model_id) |_| {
-                        const mid_to_free = switch (ms.*) {
-                            .builtin => |b| b.model.id,
-                            .custom => |c| c.model.id,
-                        };
-                        gpa.free(mid_to_free);
-                    }
-                } else {
-                    const is_builtin = std.meta.stringToEnum(config_mod.Provider, mp) != null;
-                    if (summary.model_id) |mid| {
-                        // mid is borrowed from summary's internal allocation.
-                        // Dupe it into owned memory so it survives summary.deinit.
-                        const owned_mid = try gpa.dupe(u8, mid);
-                        errdefer gpa.free(owned_mid);
-                        if (is_builtin) {
-                            session_config.model_selection = .{
-                                .builtin = .{
-                                    .provider = provider_enum,
-                                    .provider_name = @constCast(mp),
-                                    .model = .{
-                                        .id = owned_mid,
-                                        .reasoning = if (resume_effort) |effort| .{ .effort = effort } else .unset,
-                                    },
-                                    .use_responses_endpoint = false,
-                                    .bash_classifier_url = null,
-                                },
-                            };
-                        } else {
-                            session_config.model_selection = .{
-                                .custom = .{
-                                    .provider_name = @constCast(mp),
-                                    .base_url = @constCast(resolved_base_url),
-                                    .api_key = "",
-                                    .model = .{
-                                        .id = owned_mid,
-                                        .reasoning = if (resume_effort) |effort| .{ .effort = effort } else .unset,
-                                    },
-                                    .use_responses_endpoint = false,
-                                    .bash_classifier_url = null,
-                                },
-                            };
-                        }
-                        try target.applyFromConfig(session_config);
-                        // Free the dupe'd model_id — applyFromConfig dupe'd it
-                        // again into the client.
-                        gpa.free(owned_mid);
-                    } else {
-                        // No model_id saved in session — fall back to config's
-                        // default model rather than synthesizing an empty one.
-                        try target.applyFromConfig(config);
-                    }
-                }
-            } else {
-                // No model saved in session, use config as-is
-                try target.applyFromConfig(config);
-            }
+        // When resuming a session, try to restore the model used in that
+        // session; a new session attaches straight from the config.
+        if (session_id != null) {
+            try target.restoreResumedModel(config);
         } else {
             // New session - will save model info after applyFromConfig
             try target.applyFromConfig(config);
+        }
+    }
+
+    /// Resolve the model recorded in the session summary onto the config and
+    /// attach from it: provider (builtin enum, then the providers[] map for
+    /// custom names), model id, custom base_url, and the session-scoped
+    /// reasoning effort. Unknown provider or missing model ids degrade to
+    /// attaching the config as-is — resume is never fatal for restore gaps.
+    fn restoreResumedModel(self: *AgentRuntime, config: config_mod.Config) !void {
+        const gpa = self.gpa;
+        var summary = try self.session_writer.session.summary(gpa);
+        defer summary.deinit(gpa);
+        // Resolve the session's stored reasoning effort (if any) so resume
+        // restores the exact effort in use at save time. Invalid DB values
+        // (newer schema, hand-edited) degrade to "no override" — never fatal.
+        const resume_effort: ?ai.ReasoningEffort = if (summary.reasoning_effort) |label|
+            (ai.ReasoningEffort.fromString(label) catch null)
+        else
+            null;
+        if (summary.model_provider) |mp| {
+            // Resolve the provider: try builtin enum first, then the
+            // providers[] config map (custom providers like "qwen-cloud").
+            const provider_enum = std.meta.stringToEnum(config_mod.Provider, mp) orelse blk: {
+                for (config.providers) |pc| {
+                    if (std.mem.eql(u8, pc.name, mp)) break :blk pc.provider;
+                }
+                log.warn("session.resume.unknown_provider: {s}, using config default", .{mp});
+                try self.applyFromConfig(config);
+                return;
+            };
+
+            // Resolve base_url from the providers[] map when the provider
+            // is custom (defaultBaseUrl() is null for .openai_compatible).
+            var resolved_base_url: []const u8 = provider_enum.defaultBaseUrl() orelse "";
+            for (config.providers) |pc| {
+                if (!std.mem.eql(u8, pc.name, mp)) continue;
+                switch (pc.base_url) {
+                    .custom => |url| resolved_base_url = url,
+                    .default => {},
+                }
+                break;
+            }
+
+            var session_config = config;
+            if (session_config.model_selection) |*ms| {
+                switch (ms.*) {
+                    .builtin => |*b| {
+                        b.provider = provider_enum;
+                        b.provider_name = @constCast(mp);
+                        if (summary.model_id) |mid| {
+                            // mid is borrowed from summary — dupe into owned memory.
+                            b.model.id = try gpa.dupe(u8, mid);
+                        }
+                    },
+                    .custom => |*c| {
+                        c.provider_name = @constCast(mp);
+                        if (summary.model_id) |mid| {
+                            // mid is borrowed from summary — dupe into owned memory.
+                            c.model.id = try gpa.dupe(u8, mid);
+                        }
+                        if (c.base_url.len == 0 and resolved_base_url.len > 0) {
+                            c.base_url = @constCast(resolved_base_url);
+                        }
+                    },
+                }
+                // Restore the session's reasoning effort override (if any)
+                // onto the selection before applying it to the client.
+                if (resume_effort) |effort| {
+                    switch (ms.*) {
+                        .builtin => |*b| b.model.reasoning = .{ .effort = effort },
+                        .custom => |*c| c.model.reasoning = .{ .effort = effort },
+                    }
+                }
+                try self.applyFromConfig(session_config);
+                // Free the dupe'd model_id — applyFromConfig dupe'd it again
+                // into the client, so the session_config copy is no longer needed.
+                if (summary.model_id) |_| {
+                    const mid_to_free = switch (ms.*) {
+                        .builtin => |b| b.model.id,
+                        .custom => |c| c.model.id,
+                    };
+                    gpa.free(mid_to_free);
+                }
+            } else {
+                const is_builtin = std.meta.stringToEnum(config_mod.Provider, mp) != null;
+                if (summary.model_id) |mid| {
+                    // mid is borrowed from summary's internal allocation.
+                    // Dupe it into owned memory so it survives summary.deinit.
+                    const owned_mid = try gpa.dupe(u8, mid);
+                    errdefer gpa.free(owned_mid);
+                    if (is_builtin) {
+                        session_config.model_selection = .{
+                            .builtin = .{
+                                .provider = provider_enum,
+                                .provider_name = @constCast(mp),
+                                .model = .{
+                                    .id = owned_mid,
+                                    .reasoning = if (resume_effort) |effort| .{ .effort = effort } else .unset,
+                                },
+                                .use_responses_endpoint = false,
+                                .bash_classifier_url = null,
+                            },
+                        };
+                    } else {
+                        session_config.model_selection = .{
+                            .custom = .{
+                                .provider_name = @constCast(mp),
+                                .base_url = @constCast(resolved_base_url),
+                                .api_key = "",
+                                .model = .{
+                                    .id = owned_mid,
+                                    .reasoning = if (resume_effort) |effort| .{ .effort = effort } else .unset,
+                                },
+                                .use_responses_endpoint = false,
+                                .bash_classifier_url = null,
+                            },
+                        };
+                    }
+                    try self.applyFromConfig(session_config);
+                    // Free the dupe'd model_id — applyFromConfig dupe'd it
+                    // again into the client.
+                    gpa.free(owned_mid);
+                } else {
+                    // No model_id saved in session — fall back to config's
+                    // default model rather than synthesizing an empty one.
+                    try self.applyFromConfig(config);
+                }
+            }
+        } else {
+            // No model saved in session, use config as-is
+            try self.applyFromConfig(config);
         }
     }
 
@@ -1107,15 +1114,24 @@ test "attach during initSession keeps builtin tools when registry is unwired" {
     defer gpa.free(home_abs);
 
     var runtime: AgentRuntime = undefined;
-    try runtime.initNew(gpa, std.testing.io, home_abs, home_abs, home_abs, "test system prompt", .{
-        .model_selection = .{
-            .builtin = .{
-                .provider = .ollama,
-                .provider_name = @constCast("ollama"),
-                .model = .{ .id = @constCast("test-model") },
+    try runtime.initNew(.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .cwd = home_abs,
+        .session_dir = home_abs,
+        .home_dir = home_abs,
+        .base_system_prompt = "test system prompt",
+        .config = .{
+            .model_selection = .{
+                .builtin = .{
+                    .provider = .ollama,
+                    .provider_name = @constCast("ollama"),
+                    .model = .{ .id = @constCast("test-model") },
+                },
             },
         },
-    }, &.{}, null);
+        .diagnostics = &.{},
+    });
     defer runtime.deinit();
 
     // No registry wired yet — exactly the state `createRuntime` leaves the
@@ -1146,15 +1162,24 @@ test "attach rebuilds tools from the registry once it is wired" {
     defer gpa.free(home_abs);
 
     var runtime: AgentRuntime = undefined;
-    try runtime.initNew(gpa, std.testing.io, home_abs, home_abs, home_abs, "test system prompt", .{
-        .model_selection = .{
-            .builtin = .{
-                .provider = .ollama,
-                .provider_name = @constCast("ollama"),
-                .model = .{ .id = @constCast("test-model") },
+    try runtime.initNew(.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .cwd = home_abs,
+        .session_dir = home_abs,
+        .home_dir = home_abs,
+        .base_system_prompt = "test system prompt",
+        .config = .{
+            .model_selection = .{
+                .builtin = .{
+                    .provider = .ollama,
+                    .provider_name = @constCast("ollama"),
+                    .model = .{ .id = @constCast("test-model") },
+                },
             },
         },
-    }, &.{}, null);
+        .diagnostics = &.{},
+    });
     defer runtime.deinit();
 
     const reg = try gpa.create(tools_mod.ToolRegistry);
@@ -1211,7 +1236,16 @@ test "zen attach wires routing headers and session id into all chat clients" {
     defer gpa.free(home_abs);
 
     var runtime: AgentRuntime = undefined;
-    try runtime.initNew(gpa, std.testing.io, home_abs, home_abs, home_abs, "test system prompt", .{}, &.{}, null);
+    try runtime.initNew(.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .cwd = home_abs,
+        .session_dir = home_abs,
+        .home_dir = home_abs,
+        .base_system_prompt = "test system prompt",
+        .config = .{},
+        .diagnostics = &.{},
+    });
     defer runtime.deinit();
 
     const user_headers = [_]config_mod.ProviderHeader{
@@ -1316,7 +1350,16 @@ test "runtime agent aliases the owned cwd, not the borrowed input" {
     defer gpa.free(home_abs);
 
     var runtime: AgentRuntime = undefined;
-    try runtime.initNew(gpa, std.testing.io, home_abs, home_abs, home_abs, "test system prompt", .{}, &.{}, null);
+    try runtime.initNew(.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .cwd = home_abs,
+        .session_dir = home_abs,
+        .home_dir = home_abs,
+        .base_system_prompt = "test system prompt",
+        .config = .{},
+        .diagnostics = &.{},
+    });
     defer runtime.deinit();
 
     try std.testing.expectEqualStrings(home_abs, runtime.cwd);

@@ -153,43 +153,40 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     };
     if (resume_session_id) |id| {
         defer runtime_gpa.free(id);
-        agent_runtime.initResume(
-            runtime_gpa,
-            init.io,
-            cwd,
-            cwd,
-            home_dir,
-            system_prompt,
-            load_result.config,
-            load_result.takeDiagnostics(),
-            id,
-            null,
-        ) catch |err| {
+        agent_runtime.initResume(.{
+            .gpa = runtime_gpa,
+            .io = init.io,
+            .cwd = cwd,
+            .session_dir = cwd,
+            .home_dir = home_dir,
+            .base_system_prompt = system_prompt,
+            .config = load_result.config,
+            .diagnostics = load_result.takeDiagnostics(),
+            .session_id = id,
+        }) catch |err| {
             log.warn("session.resume.failed err={s}, starting new session", .{@errorName(err)});
-            try agent_runtime.initNew(
-                runtime_gpa,
-                init.io,
-                cwd,
-                cwd,
-                home_dir,
-                system_prompt,
-                load_result.config,
-                load_result.takeDiagnostics(),
-                null,
-            );
+            try agent_runtime.initNew(.{
+                .gpa = runtime_gpa,
+                .io = init.io,
+                .cwd = cwd,
+                .session_dir = cwd,
+                .home_dir = home_dir,
+                .base_system_prompt = system_prompt,
+                .config = load_result.config,
+                .diagnostics = load_result.takeDiagnostics(),
+            });
         };
     } else {
-        try agent_runtime.initNew(
-            runtime_gpa,
-            init.io,
-            cwd,
-            cwd,
-            home_dir,
-            system_prompt,
-            load_result.config,
-            load_result.takeDiagnostics(),
-            null,
-        );
+        try agent_runtime.initNew(.{
+            .gpa = runtime_gpa,
+            .io = init.io,
+            .cwd = cwd,
+            .session_dir = cwd,
+            .home_dir = home_dir,
+            .base_system_prompt = system_prompt,
+            .config = load_result.config,
+            .diagnostics = load_result.takeDiagnostics(),
+        });
     }
     load_result.config.deinit(gpa);
 

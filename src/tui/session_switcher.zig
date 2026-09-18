@@ -442,30 +442,30 @@ pub fn createRuntime(app: *App, cwd: []const u8, session_dir: []const u8, sessio
     const diagnostics = try current.gpa.alloc(config_mod.Diagnostic, 0);
     errdefer current.gpa.free(diagnostics);
     if (session_id) |id| {
-        try runtime.initResume(
-            current.gpa,
-            app.io,
-            cwd,
-            session_dir,
-            current.home_dir,
-            current.base_system_prompt,
-            config.*,
-            diagnostics,
-            id,
-            template,
-        );
+        try runtime.initResume(.{
+            .gpa = current.gpa,
+            .io = app.io,
+            .cwd = cwd,
+            .session_dir = session_dir,
+            .home_dir = current.home_dir,
+            .base_system_prompt = current.base_system_prompt,
+            .config = config.*,
+            .diagnostics = diagnostics,
+            .session_id = id,
+            .template = template,
+        });
     } else {
-        try runtime.initNew(
-            current.gpa,
-            app.io,
-            cwd,
-            session_dir,
-            current.home_dir,
-            current.base_system_prompt,
-            config.*,
-            diagnostics,
-            template,
-        );
+        try runtime.initNew(.{
+            .gpa = current.gpa,
+            .io = app.io,
+            .cwd = cwd,
+            .session_dir = session_dir,
+            .home_dir = current.home_dir,
+            .base_system_prompt = current.base_system_prompt,
+            .config = config.*,
+            .diagnostics = diagnostics,
+            .template = template,
+        });
     }
 
     // If config was reloaded, replace the app's cached config and re-sync MCP.

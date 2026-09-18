@@ -235,7 +235,16 @@ test "appendSkillInvocationsToTranscript appends formatted skill title to transc
     defer app.deinit();
 
     var runtime: runtime_mod.AgentRuntime = undefined;
-    try runtime.initNew(gpa, io, ".", home.path, home.path, "test system prompt", .{}, &.{}, null);
+    try runtime.initNew(.{
+        .gpa = gpa,
+        .io = io,
+        .cwd = ".",
+        .session_dir = home.path,
+        .home_dir = home.path,
+        .base_system_prompt = "test system prompt",
+        .config = .{},
+        .diagnostics = &.{},
+    });
     defer runtime.deinit();
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
 
