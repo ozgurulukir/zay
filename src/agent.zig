@@ -2187,6 +2187,179 @@ test "run retries once when the provider truncates tool-call arguments" {
     }
     try std.testing.expect(hint_found);
 }
+
+// ── Scripted-adapter twins ───────────────────────────────────────────────
+//
+// The tests below drive `Agent.run` through `ai.scripted_client` — the
+// in-memory second adapter on the LanguageModel seam — so they run on every
+// platform, including Windows where the truncation-class socket suites above
+// are gated (#32). Wire-shape coverage stays with the socket suites; these
+// pin the run-loop behaviour itself.
+
+test "run completes a scripted text turn and streams deltas through the observer" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var client = try ai.scripted_client.Client.init(gpa, io, "scripted-model");
+    defer client.deinit();
+    try client.enqueue(.{ai.scripted_client.step.text("hello from the script", .stop)});
+
+    var agent = Agent.init(gpa, io, ".", .{ .scripted = &client });
+    defer agent.deinit();
+    try agent.addUser("say hi");
+
+    var seen: BudgetSeen = .{};
+    defer seen.deinit(gpa);
+
+    try agent.run(Agent.Listener(BudgetSeen){ .ctx = &seen, .on_event = BudgetSeen.onEvent });
+
+    try std.testing.expectEqual(@as(u32, 1), client.prompts_answered);
+
+    // The scripted chunks stream through the same observer a real client
+    // drives; the response_delta bytes must join to the scripted text.
+    var delta_text: std.ArrayList(u8) = .empty;
+    defer delta_text.deinit(gpa);
+    for (seen.events.items) |event| {
+        if (event == .response_delta) try delta_text.appendSlice(gpa, event.response_delta);
+    }
+    try std.testing.expectEqualStrings("hello from the script", delta_text.items);
+
+    // History: user prompt, assistant reply.
+    const messages = agent.messages();
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expectEqualStrings("say hi", messages[0].text());
+    try std.testing.expectEqualStrings("hello from the script", messages[1].text());
+}
+
+test "run retries once when the provider truncates tool-call arguments (scripted, socket-free)" {
+    // Windows-runnable twin of the socket suite above: the scripted adapter
+    // produces the `tool_calls_truncated` signature directly, so the run
+    // loop's severed-arguments guard (inject hint, re-request exactly once)
+    // is testable without a network stack.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var client = try ai.scripted_client.Client.init(gpa, io, "scripted-model");
+    defer client.deinit();
+    try client.enqueue(.{
+        ai.scripted_client.step.truncatedToolCalls(1),
+        ai.scripted_client.step.text("done after retry", .stop),
+    });
+
+    var agent = Agent.init(gpa, io, ".", .{ .scripted = &client });
+    defer agent.deinit();
+    try agent.addUser("list the directory");
+
+    var seen: BudgetSeen = .{};
+    defer seen.deinit(gpa);
+
+    try agent.run(Agent.Listener(BudgetSeen){ .ctx = &seen, .on_event = BudgetSeen.onEvent });
+
+    // Exactly two prompts: the truncated turn, then the hint retry. A third
+    // would exhaust the script.
+    try std.testing.expectEqual(@as(u32, 2), client.prompts_answered);
+    // The retry actually carried the hint to the model.
+    try std.testing.expect(client.last_user_text != null);
+    try std.testing.expect(std.mem.startsWith(u8, client.last_user_text.?, "[zay] Your tool call(s) arrived without their arguments"));
+
+    // The truncated turn's empty assistant stored nothing; the hint and the
+    // retried reply close out history.
+    const messages = agent.messages();
+    try std.testing.expect(messages.len >= 3);
+    var hint_found = false;
+    for (messages) |m| {
+        if (m.role() == .user and std.mem.startsWith(u8, m.text(), "[zay] Your tool call(s) arrived without their arguments")) {
+            hint_found = true;
+        }
+    }
+    try std.testing.expect(hint_found);
+    try std.testing.expectEqualStrings("done after retry", messages[messages.len - 1].text());
+}
+
+test "run ends the turn when tool-call arguments truncate on the retry too" {
+    // The stop arm of the truncation guard: the one-shot is spent, so a
+    // second severed response must END the turn (`.length_cut = .stopped`)
+    // instead of billing an unbounded retry loop. Socket-free via the
+    // scripted adapter.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var client = try ai.scripted_client.Client.init(gpa, io, "scripted-model");
+    defer client.deinit();
+    try client.enqueue(.{
+        ai.scripted_client.step.truncatedToolCalls(1),
+        ai.scripted_client.step.truncatedToolCalls(1),
+    });
+
+    var agent = Agent.init(gpa, io, ".", .{ .scripted = &client });
+    defer agent.deinit();
+    try agent.addUser("list the directory");
+
+    var seen: BudgetSeen = .{};
+    defer seen.deinit(gpa);
+
+    try agent.run(Agent.Listener(BudgetSeen){ .ctx = &seen, .on_event = BudgetSeen.onEvent });
+
+    // Two prompts exactly: the guard retried once, then stopped the turn.
+    try std.testing.expectEqual(@as(u32, 2), client.prompts_answered);
+    var stopped: usize = 0;
+    for (seen.events.items) |event| {
+        if (event == .length_cut and event.length_cut == .stopped) stopped += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), stopped);
+}
+
+test "run auto-continues once after a scripted length-cut (socket-free)" {
+    // Windows-runnable twin of the length-cut socket suite: the scripted
+    // adapter returns finish_reason=.length directly, pinning the one-shot
+    // auto-continue and the wire shape of the continuation without a socket.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var client = try ai.scripted_client.Client.init(gpa, io, "scripted-model");
+    defer client.deinit();
+    try client.enqueue(.{
+        ai.scripted_client.step.text("partial plan", .length),
+        ai.scripted_client.step.text("continued", .stop),
+    });
+
+    var agent = Agent.init(gpa, io, ".", .{ .scripted = &client });
+    defer agent.deinit();
+    try agent.addUser("write a long plan");
+
+    var seen: BudgetSeen = .{};
+    defer seen.deinit(gpa);
+
+    try agent.run(Agent.Listener(BudgetSeen){ .ctx = &seen, .on_event = BudgetSeen.onEvent });
+
+    try std.testing.expectEqual(@as(u32, 2), client.prompts_answered);
+
+    // One auto-continue, never a stopped notice — the one-shot fired.
+    var auto_continued: usize = 0;
+    var stopped: usize = 0;
+    for (seen.events.items) |event| {
+        if (event == .length_cut) {
+            if (event.length_cut == .auto_continued) {
+                auto_continued += 1;
+            } else {
+                stopped += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), auto_continued);
+    try std.testing.expectEqual(@as(usize, 0), stopped);
+
+    // History: user, assistant("partial plan"), continuation hint,
+    // assistant("continued") — the hint lands AFTER the persisted partial
+    // prose.
+    const messages = agent.messages();
+    try std.testing.expectEqual(@as(usize, 4), messages.len);
+    try std.testing.expectEqualStrings("write a long plan", messages[0].text());
+    try std.testing.expectEqualStrings("partial plan", messages[1].text());
+    try std.testing.expect(std.mem.startsWith(u8, messages[2].text(), "[zay] Your previous response was cut off"));
+    try std.testing.expectEqualStrings("continued", messages[3].text());
+}
+
 test "raw enqueued messages are delivered verbatim without @-mention expansion" {
     const gpa = std.testing.allocator;
     var agent = Agent.init(gpa, std.testing.io, ".", .none);

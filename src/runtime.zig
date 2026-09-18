@@ -916,6 +916,7 @@ pub const AgentRuntime = struct {
             .codex_responses => |client| b == .codex_responses and b.codex_responses == client,
             .openai_compatible => |client| b == .openai_compatible and b.openai_compatible == client,
             .responses => |client| b == .responses and b.responses == client,
+            .scripted => |client| b == .scripted and b.scripted == client,
         };
     }
 

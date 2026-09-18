@@ -38,6 +38,14 @@ pub fn modelStatus(runtime: ?*const runtime_mod.AgentRuntime, config: config_mod
                     .model = client.config.model,
                     .reasoning = effortLabel(if (client.config.reasoning) |r| r.effort else null),
                 },
+                // Only reachable from tests that wire the scripted adapter
+                // into a runtime; label it loudly so it can never pass for a
+                // wired provider.
+                .scripted => |client| return .{
+                    .provider = "scripted",
+                    .model = client.model_label,
+                    .reasoning = effortLabel(null),
+                },
                 .none => unreachable,
             },
         }
