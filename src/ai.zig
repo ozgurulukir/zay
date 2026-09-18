@@ -4,6 +4,7 @@ const tools_mod = @import("tools.zig");
 
 pub const codex_responses = @import("ai/codex_responses.zig");
 pub const responses_core = @import("ai/responses_core.zig");
+pub const scripted_client = @import("ai/scripted_client.zig");
 pub const tool_schema = @import("ai/tool_schema.zig");
 pub const websocket = @import("websocket");
 pub const openai_compatible = @import("ai/openai_compatible.zig");
@@ -715,6 +716,10 @@ pub const LanguageModel = union(enum) {
     codex_responses: *codex_responses.Client,
     openai_compatible: *openai_compatible.Client,
     responses: *responses_core.Client,
+    /// In-memory scripted adapter — the test seam (see `scripted_client`).
+    /// Never attached in production; agent-level tests use it instead of
+    /// real sockets.
+    scripted: *scripted_client.Client,
 
     /// The uniform three-method client contract: `prompt`, `errorDetail`,
     /// `updateTools`. `inline else` makes the contract structural — a new tag
