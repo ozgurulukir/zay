@@ -807,10 +807,6 @@ pub const App = struct {
         return turn_lifecycle.applyAgentEvent(self, lane, event);
     }
 
-    pub fn sealCheckpoint(self: *App) checkpoint_mod.SealOutcome {
-        return checkpoint_mod.sealCheckpoint(self);
-    }
-
     pub fn noteCheckpointFailure(self: *App) void {
         checkpoint_mod.noteCheckpointFailure(self);
     }
