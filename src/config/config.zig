@@ -49,7 +49,6 @@ pub const cloneHeaders = mcp_types.cloneHeaders;
 pub const freeHeaders = mcp_types.freeHeaders;
 pub const mcpServerFromUrl = mcp_types.mcpServerFromUrl;
 pub const expandMcpServer = mcp_types.expandMcpServer;
-pub const expandEnvValue = mcp_types.expandEnvValue;
 
 // --- Plugin config re-exports ---
 
@@ -258,9 +257,8 @@ pub const Config = struct {
     /// TUI appearance, live preview, and picker settings.
     tui: TuiSettings = .{},
     /// Typed view of the model selection. `null` when the required
-    /// fields (provider, base_url, api_key, model) aren't all set.
-    /// Equivalent to the old `assertModelSelection` check — but the
-    /// presence is now encoded in the type, not enforced at runtime.
+    /// fields (provider, base_url, api_key, model) aren't all set —
+    /// presence is encoded in the type, not enforced at runtime.
     model_selection: ?ModelSelection = null,
 
     /// Runtime-only: the human-readable provider name from models.dev
@@ -372,12 +370,6 @@ pub const Config = struct {
         return try list.toOwnedSlice(gpa);
     }
 
-    /// Alias for `clone`, used by `zay.run` to hand the TUI an owned
-    /// copy of the merged config that outlives `load_result`.
-    pub fn cloneForTui(self: Config, gpa: std.mem.Allocator) !Config {
-        return self.clone(gpa);
-    }
-
     pub fn activeModelSelection(self: *const Config) ?ModelSelectionRef {
         if (self.model_selection) |*ms| {
             // Pointer captures (`|*|`), NOT value captures: `&b.model` must
@@ -402,20 +394,6 @@ pub const Config = struct {
         return ModelSelectionRef{ .builtin = .{ .provider = provider, .provider_name = name, .model = model_ptr } };
     }
 };
-
-/// Legacy runtime check. With `model_selection: ?ModelSelection`, the
-/// invariant is encoded in the type: either the selection is fully
-/// populated or it's absent. Kept for callers that still pass a Config
-/// without going through parseObject (tests); it's a no-op when
-/// `model_selection` is set.
-pub fn assertModelSelection(config: *const Config) void {
-    if (config.model_selection) |_| return;
-    // When model_selection is null but the legacy fields are partially
-    // set, that's a programming error. Catch it loudly.
-    assert(config.model == null);
-    assert(config.base_url == null);
-    assert(config.api_key == null);
-}
 
 pub const Diagnostic = union(enum) {
     config_parse_error: ParseError,

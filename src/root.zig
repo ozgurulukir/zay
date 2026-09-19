@@ -98,7 +98,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     // panics with "incorrect alignment"; `PageAllocator` is the safe fallback:
     // thread-safe, actually frees memory, but each allocation maps a whole page.
     const tui_gpa = gpa;
-    const tui_config = try load_result.config.cloneForTui(tui_gpa);
+    const tui_config = try load_result.config.clone(tui_gpa);
     const runtime_gpa = gpa;
 
     defer search.deinit(runtime_gpa, init.io);

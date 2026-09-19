@@ -23,11 +23,9 @@ const vcs = @import("vcs.zig");
 
 const assert = std.debug.assert;
 const agent_queue = @import("agent/queue.zig");
-const tool_batch_mod = @import("agent/tool_batch.zig");
 
 const QueuedUserMessage = agent_queue.QueuedUserMessage;
 const MessageQueue = agent_queue.MessageQueue;
-const ToolBatch = tool_batch_mod.ToolBatch;
 
 const agent_compactor = @import("agent/compactor.zig");
 const auto_compactor_mod = @import("context/auto_compactor.zig");
@@ -674,7 +672,7 @@ pub const Agent = struct {
                 }
                 return;
             }
-            try Agent.runToolBatch(L, self, ToolBatch.init(tool_calls), &stream_context, l, turn_allocator);
+            try Agent.runToolBatch(L, self, tool_calls, &stream_context, l, turn_allocator);
             // Mid-turn we only inject messages explicitly marked to steer, and
             // only from the front so FIFO order holds — a default-queued
             // message ahead of a steer one keeps it waiting for turn end.
@@ -727,7 +725,7 @@ pub const Agent = struct {
     fn runToolBatch(
         comptime L: type,
         self: *Agent,
-        tool_batch: ToolBatch,
+        tool_calls: []const ai.ToolCall,
         stream_context: *const StreamContext(L),
         listener: L,
         turn_allocator: std.mem.Allocator,
@@ -755,7 +753,7 @@ pub const Agent = struct {
             .lane_requester = self,
             .skills = self.skills,
         });
-        const results = try executor.runAll(tool_batch.calls, bridge.observer());
+        const results = try executor.runAll(tool_calls, bridge.observer());
         defer self.gpa.free(results);
         errdefer for (results) |*r| r.deinit(self.gpa);
         try self.takeToolResults(results);

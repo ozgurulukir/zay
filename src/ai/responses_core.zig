@@ -76,7 +76,7 @@ pub const Client = struct {
     authorization: []u8,
     tools_json: []u8,
     /// Whether tool definitions carry OpenAI strict structured-outputs mode.
-    /// Captured at `init` so `updateMcpTools` can rebuild `tools_json`
+    /// Captured at `init` so `syncToolJson` can rebuild `tools_json`
     /// consistently. Default `false` — strict mode is OpenAI-only and breaks
     /// function-calling on gateways (OpenRouter/Ollama/vLLM).
     strict: bool = false,
@@ -164,22 +164,6 @@ pub const Client = struct {
         self.* = undefined;
     }
 
-    /// Rebuild the serialized tool definitions after the MCP tool set changes.
-    /// `mcp_tools` is borrowed only for the duration of the call; the result is
-    /// the owned `tools_json`. Call between turns, never mid-turn.
-    /// `registry`, when non-null, contributes its builtin + plugin tools so
-    /// the model sees them as first-class definitions. When null, only the
-    /// builtin slice (`config.tools`) is used — the legacy path used by
-    /// tests that don't construct a full registry.
-    ///
-    /// The caller is responsible for choosing what `self.config.tools`
-    /// contains at call time. `attachXxxClient` initializes it with
-    /// `builtinRegistry()` so bash is present; the tick-driven
-    /// `injectAllTools` path passes an empty slice because the registry's
-    /// `builtin` already covers the same tool — passing both would emit
-    /// duplicate definitions and most OpenAI-compatible APIs reject
-    /// duplicate tool names outright (HTTP 400), dropping the entire
-    /// tool list including the plugin tools the caller wants exposed.
     // Rebuild the serialized tool definitions from the final, already-deduped
     // spec list assembled by the runtime layer. Call between turns.
     pub fn updateTools(self: *Client, specs: []const tool_schema.ToolSpec) !void {

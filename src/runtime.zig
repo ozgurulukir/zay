@@ -1026,12 +1026,12 @@ fn codexRefreshNeeded(expires_ms: i64, now_ms: i64) bool {
     return expires_ms <= now_ms + codex_refresh_margin_ms;
 }
 
-test "OwnedClient.updateMcpTools pushes plugin tools into a freshly-attached client" {
+test "OwnedClient.updateTools pushes plugin tools into a freshly-attached client" {
     // Regression for the user-reported "lua__write-tool__edit: command not
     // found" bug: a newly-attached client built `tools_json` from builtin +
     // mcp_tools only, so plugin tools never reached the model and it tried
     // to invoke them as shell commands. `replaceClient` now calls
-    // `OwnedClient.updateMcpTools` with the live registry right after the
+    // `OwnedClient.updateTools` with the live registry right after the
     // client is attached — this test pins that dispatch in place by driving
     // the helper directly with an openai_compatible client + a registry
     // carrying one plugin tool.

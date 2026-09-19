@@ -31,10 +31,6 @@ pub const CompactionCut = session_type.CompactionCut;
 pub const EntryKind = session_type.EntryKind;
 pub const EntrySummary = session_type.EntrySummary;
 
-fn migrate(connection: *db.Connection, io: std.Io) !void {
-    try session_migration.migrate(connection, io);
-}
-
 pub const SessionManager = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -57,7 +53,7 @@ pub const SessionManager = struct {
         }
         var connection = try db.Connection.open(path, .{});
         errdefer connection.close();
-        try migrate(&connection, io);
+        try session_migration.migrate(&connection, io);
         return .{ .gpa = gpa, .io = io, .connection = connection };
     }
 
