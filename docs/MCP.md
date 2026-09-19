@@ -143,7 +143,10 @@ Then, for both transports:
 **Timeouts** — a server that doesn't respond in time is marked `[FAILED]` with an error
 message:
 
-- Stdio reads use a **30-second timeout** (`read_timeout_ms`) via `std.posix.poll`.
+- Stdio reads use a **30-second timeout** (`read_timeout_ms`) via `std.posix.poll`. This is
+  POSIX-only today — on Windows an abrupt server close does not surface as a client read
+  error, so stdio read timeouts are a known open limitation (issue #25; the root README
+  tracks it too).
 - Remote requests apply a socket-level send/recv timeout (`applyHttpTimeout`,
   SO_RCVTIMEO/SO_SNDTIMEO = `read_timeout_ms`) so a server that accepts the connection but
   stalls fails the handshake instead of hanging the worker. The connect phase itself is
@@ -173,7 +176,8 @@ and re-injects the serialized tools whenever the MCP tool set changes:
   carries every tool definition.
 
 `buildMcpToolSchemas()` collects all discovered tools from `.connected` servers and
-`updateMcpTools()` rebuilds the client's serialized tool list in place, alongside the
+`updateTools()` rebuilds the client's serialized tool list in place (driven by
+`AgentRuntime.syncToolJson` — see AGENTS.md), alongside the
 built-in tools. The model sees them as regular function-calling tools with namespaced
 names (`mcp__<server>__<tool>`).
 

@@ -68,11 +68,11 @@ colors for UI-specific roles.
 
 ### Local modifications
 
-1. **`src/match.c`** — removed `#include <strings.h>`. The file declares it
+1. **`vendor/fzy/src/match.c`** — removed `#include <strings.h>`. The file declares it
    but never uses `strcasecmp`/`strncasecmp` (only the local `strcasechr`
    helper, which uses `strpbrk` from `<string.h>`). `strings.h` does not exist
    on Windows, so this keeps the vendored source cross-platform.
-2. **`src/match.h`** — added `#include <stddef.h>` so `size_t` is declared
+2. **`vendor/fzy/src/match.h`** — added `#include <stddef.h>` so `size_t` is declared
    when the header is included standalone (as Zay does via `src/c.h`).
 
 The MIT license text follows:
@@ -170,7 +170,7 @@ No local modifications — vendored unmodified from the 3.53.4 amalgamation
 
 ### Local modifications
 
-- **`src/websocket.zig`** — the server-side exports (`server` namespace,
+- **`vendor/websocket.zig/src/websocket.zig`** — the server-side exports (`server` namespace,
   `Conn`/`Config`/`Server`/`blockingMode`/`Handshake` re-exports) and the
   `frame*` test helpers were removed from the public entry point. Zay only
   uses the client; all other vendored files (`buffer.zig`, `posix.zig`,

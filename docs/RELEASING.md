@@ -45,7 +45,11 @@ git push origin v0.3.1-beta.1
 ## What the workflow produces
 
 - `zay-linux-x86_64` + `zay-linux-x86_64.sha256`
-- `zay-windows-x86_64.exe` + `zay-windows-x86_64.exe.sha256`
+- `zay-linux-x86_64.debug` + `zay-linux-x86_64.debug.sha256` (Linux debug sidecar —
+  the workflow splits ~24 MB of DWARF out of the stripped ELF via `objcopy`, with a
+  `.gnu_debuglink` CRC pointing at the sidecar so crash traces stay symbolizable)
+- `zay-windows-x86_64.exe` + `zay-windows-x86_64.exe.sha256` (PE ships debug info in a
+  sidecar natively)
 - `zay-macos-aarch64` + `zay-macos-aarch64.sha256` (Apple Silicon; built on `macos-latest`)
 
 Verify a downloaded asset with:
@@ -70,5 +74,10 @@ The scripts automatically download the platform binary, verify the SHA256 checks
   `ziglang.org/download/0.16.0/` (the `mlugg/setup-zig` action 404s on 0.16.0)
   and builds with `shell: bash` + a `VERSION` env var (PowerShell mangles dotted
   versions).
+- Before building, the workflow applies the two checked-in vaxis vendor patches
+  (`tools/vendor-patches/vaxis-focus-handler.patch` +
+  `vaxis-input-thread-retry.patch`) to the pristine `zig-pkg/` checkout — the
+  same `ZAY-LOCAL-PATCH` guards `build.zig` enforces locally (see AGENTS.md
+  Known Issues). A local release reproduction must apply them too.
 - Release notes are auto-generated from merged PRs
   (`generate_release_notes: true`).
