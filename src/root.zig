@@ -137,12 +137,23 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     // moment no session can be mid-read of a previous process's output.
     bash.pruneStaleTempFiles(init.io, gpa, bash.temp_retention_ns);
 
-    // Worktree hygiene: drop orphaned worktree checkouts (> 7 days) and
-    // sync git metadata in the current workspace.
-    vcs.gcOrphanedWorktrees(gpa, init.io, home_dir, vcs.worktree_retention_ns);
-    if (vcs.isRepo(gpa, init.io, cwd)) {
-        vcs.worktreePrune(gpa, init.io, cwd) catch {};
-    }
+    // Worktree hygiene runs OFF the startup critical path: `git worktree
+    // prune` is a blocking subprocess (tens of ms on Windows, worse on a
+    // cold git), and the 7-day TTL tolerates deferral by design — nothing
+    // before the first frame reads its result. The thread borrows
+    // `home_dir`/`cwd`; the join defer is registered after their free
+    // defers, so it runs FIRST on return and the thread is always joined
+    // before its borrowed buffers die. On spawn failure run it inline —
+    // skipping hygiene entirely would let orphaned checkouts and stale git
+    // metadata accumulate for the whole session.
+    const hygiene_thread: ?std.Thread = blk: {
+        const t = std.Thread.spawn(.{}, runWorktreeHygiene, .{ gpa, init.io, home_dir, cwd }) catch {
+            runWorktreeHygiene(gpa, init.io, home_dir, cwd);
+            break :blk null;
+        };
+        break :blk t;
+    };
+    defer if (hygiene_thread) |t| t.join();
 
     // Auto-resume: find the most recently updated session for this cwd.
     const resume_session_id = blk: {
@@ -191,6 +202,19 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     load_result.config.deinit(gpa);
 
     try tui.run(init, agent_runtime, tui_config, tui_gpa);
+}
+
+/// Worktree hygiene: drop orphaned worktree checkouts (> 7 days) and sync
+/// git metadata in the current workspace. Fire-and-forget — every step is
+/// already best-effort, so the caller only decides WHERE it runs (background
+/// thread during startup, inline when the thread cannot spawn).
+fn runWorktreeHygiene(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, cwd: []const u8) void {
+    vcs.gcOrphanedWorktrees(gpa, io, home_dir, vcs.worktree_retention_ns);
+    if (vcs.isRepo(gpa, io, cwd)) {
+        vcs.worktreePrune(gpa, io, cwd) catch |err| {
+            log.warn("vcs.startup_prune.failed err={s}", .{@errorName(err)});
+        };
+    }
 }
 
 fn resolveLogPath(gpa: std.mem.Allocator, env: anytype) ![]u8 {
@@ -273,6 +297,15 @@ fn resolveHome(
         }
     }
     return null;
+}
+
+test "runWorktreeHygiene: empty home and missing cwd are safe no-ops" {
+    const gpa = std.testing.allocator;
+    // Empty home: gcOrphanedWorktrees returns before touching the FS. A
+    // missing cwd makes the `git rev-parse` probe fail closed (isRepo ->
+    // false), so worktreePrune never spawns — the startup thread body's idle
+    // path is fully hermetic here (crash + leak coverage, no git effects).
+    runWorktreeHygiene(gpa, std.testing.io, "", "zay-hygiene-nonexistent-dir");
 }
 
 test "resolveHome: platform-canonical var wins, relative rejected" {
