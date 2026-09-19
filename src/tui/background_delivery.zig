@@ -108,7 +108,7 @@ pub fn deliverPendingBackground(app: *App) !bool {
         freeDelivery(app, delivery);
         _ = app.background_modal_state.pending.orderedRemove(i);
         if (start_turn) {
-            app.startDeliveryTurn(lane) catch {};
+            _ = app.startQueuedTurnOn(lane) catch {};
             return true;
         }
         changed = true;
@@ -175,7 +175,7 @@ const runtime_mod = @import("../runtime.zig");
 const isolatedHome = @import("test_fixture.zig").isolatedHome;
 
 /// A live primary runtime with no provider: delivery takes the
-/// `startDeliveryTurn` flush+clearQueue branch instead of
+/// `startQueuedTurn` flush+clearQueue branch instead of
 /// starting a real worker turn. Same field shape as GitFixture's runtime
 /// (lane_lifecycle.zig), minus the git scaffolding.
 fn createNoProviderRuntime(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !*runtime_mod.AgentRuntime {

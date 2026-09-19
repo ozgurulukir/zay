@@ -407,7 +407,7 @@ const drain_byte_budget: usize = 64 * 1024;
 
 /// Drain all agent events queued on every lane's worker and project them onto
 /// the relevant lane's thread state. Returns true when any visible state changed.
-fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
+pub fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
     var visible_change = false;
     var refresh_diff = false;
     const active = root.app.thread;

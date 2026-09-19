@@ -33,6 +33,7 @@ const config_mod = @import("../config/config.zig");
 const runtime_mod = @import("../runtime.zig");
 const search_mod = @import("../search.zig");
 const session_mod = @import("../session.zig");
+const test_helpers = @import("test_helpers.zig");
 const transcript_mod = @import("../transcript.zig");
 const turn_lifecycle = @import("turn_lifecycle.zig");
 const tools_mod = @import("../tools.zig");
@@ -1943,6 +1944,105 @@ test "submit during the interrupt teardown queues and restarts after convergence
     try std.testing.expectEqual(@as(u32, 0), app.thread.agent.?.message_queue.len());
 }
 
+test "scripted turn runs the real worker end to end and converges to idle" {
+    // The first full begin → stream → converge pass in the suite: a real
+    // `runAgentTurn` future over the in-memory scripted adapter (no
+    // sockets), pumped through the same event drain the tick uses. The
+    // checkpoint boundary runs and degrades to `.unavailable` outside a
+    // git repo — exactly the production no-op path.
+    // The worker runs on its own thread, so the testing allocator is wrapped
+    // in a thread-safe facade shared by BOTH sides — the raw testing
+    // allocator is not thread-safe and the UI thread allocates while the
+    // worker streams.
+    const gpa = std.testing.allocator;
+    var safe_gpa = test_helpers.LockedAllocator{ .child = gpa, .io = std.testing.io };
+    const alg = safe_gpa.allocator();
+    var scripted = try ai.scripted_client.Client.init(alg, std.testing.io, "scripted-model");
+    defer scripted.deinit();
+    try scripted.enqueue(.{ai.scripted_client.step.text("first reply", .stop)});
+    var agent = agent_mod.Agent.init(alg, std.testing.io, ".", .{ .scripted = &scripted });
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, alg, &agent);
+    defer app.deinit();
+
+    try app.inputs.input.insertSliceAtCursor("first");
+    try std.testing.expect(try app.beginSubmit());
+    try app.startTurn();
+    try std.testing.expectEqual(Turn.State.active, app.thread.turn.state);
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var spins: u32 = 0;
+    while (app.thread.turn.state == .active or app.thread.turn_future != null) : (spins += 1) {
+        try std.testing.expect(spins < 10_000); // scripted reply: near-instant
+        var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+        _ = try lifecycle.drainAgentEvents(&root, &ctx);
+        app.getIo().sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expectEqual(Turn.State.idle, app.thread.turn.state);
+
+    // The transcript carries the user row and the scripted agent reply.
+    const messages = app.thread.transcript.messages.items;
+    try std.testing.expectEqual(.user, messages[0].mirror().kind);
+    try std.testing.expectEqualStrings("first", messages[0].mirror().body);
+    try std.testing.expectEqual(.agent, messages[1].mirror().kind);
+    try std.testing.expectEqualStrings("first reply", messages[1].mirror().body);
+    try std.testing.expect(app.thread.pending_prompt == null);
+}
+
+test "interrupted turn converges into a scripted queued restart" {
+    // The convergence ordering the interrupt suites fake with a no-op
+    // future, now followed through the REAL restart: `drainTurnCancels`
+    // hands the queue to a live scripted worker, whose reply streams back
+    // and closes the machine.
+    // Same thread-safe facade as the end-to-end test above: the restarted
+    // worker streams on its own thread while the UI drains.
+    const gpa = std.testing.allocator;
+    var safe_gpa = test_helpers.LockedAllocator{ .child = gpa, .io = std.testing.io };
+    const alg = safe_gpa.allocator();
+    var scripted = try ai.scripted_client.Client.init(alg, std.testing.io, "scripted-model");
+    defer scripted.deinit();
+    try scripted.enqueue(.{ai.scripted_client.step.text("second reply", .stop)});
+    var agent = agent_mod.Agent.init(alg, std.testing.io, ".", .{ .scripted = &scripted });
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, alg, &agent);
+    defer app.deinit();
+
+    try app.inputs.input.insertSliceAtCursor("first");
+    try std.testing.expect(try app.beginSubmit());
+    if (app.thread.pending_prompt) |prompt| app.thread.worker_context.?.gpa.free(prompt);
+    app.thread.pending_prompt = null;
+    // A finished no-op future so the interrupt takes the async path.
+    app.thread.turn_future = try app.getIo().concurrent(noopTurnTask, .{});
+    try app.handleInterrupt();
+    try std.testing.expectEqual(Turn.State.interrupting, app.thread.turn.state);
+
+    // Queue behind the teardown; convergence must restart with the queued
+    // message delivered to the real scripted worker.
+    try app.inputs.input.insertSliceAtCursor("second");
+    try std.testing.expect(!try app.beginSubmit());
+    try pumpUntilTurnConverged(&app);
+    try std.testing.expectEqual(Turn.State.active, app.thread.turn.state);
+    try std.testing.expect(app.thread.turn_future != null);
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var spins: u32 = 0;
+    while (app.thread.turn.state == .active or app.thread.turn_future != null) : (spins += 1) {
+        try std.testing.expect(spins < 10_000);
+        var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+        _ = try lifecycle.drainAgentEvents(&root, &ctx);
+        app.getIo().sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expectEqual(Turn.State.idle, app.thread.turn.state);
+    try std.testing.expect(app.thread.transcript.containsText("second"));
+    try std.testing.expect(app.thread.transcript.containsText("second reply"));
+    try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
+    try std.testing.expectEqual(@as(u32, 0), app.thread.agent.?.message_queue.len());
+}
+
 test "lane commands stay hidden until a second lane exists" {
     const gpa = std.testing.allocator;
     var openai_compatible_client: openai_compatible_mod.Client = undefined;
@@ -2295,7 +2395,7 @@ test "interrupt restart flushes queued messages to the transcript when no provid
 
     // With no provider, the restart surfaces the queued text and drops the queue
     // rather than spinning up a doomed worker.
-    try std.testing.expect(try app.restartTurnForQueuedMessages());
+    try std.testing.expect(try app.startQueuedTurnOn(app.thread));
     try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
     try std.testing.expectEqual(@as(u32, 0), runtime.agent.message_queue.len());
     try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
@@ -3349,11 +3449,12 @@ test "transcript draw width-change re-count stays below a fixed gpa ceiling" {
 
 test "handleTick invokes the 4 documented phase functions in order" {
     // Locks in AGENTS.md's documented handleTick ordering: drainAgentEvents
-    // (private to lifecycle.zig) → serviceLaneBridge → drainLaneNaming →
+    // → serviceLaneBridge → drainLaneNaming →
     // deliverPendingLaneCompletions. The 3 lane-bridge phases are pub and
-    // exercised directly; the private drainAgentEvents is exercised via
-    // handleTick itself. If any of the 4 phase functions is renamed or its
-    // signature changes, this test fails to compile (or the handleTick body
+    // exercised directly; drainAgentEvents is additionally exercised
+    // directly by the scripted-turn suites. If any of the 4 phase functions
+    // is renamed or its signature changes, this test fails to compile (or
+    // the handleTick body
     // no longer calls them in the documented order).
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);

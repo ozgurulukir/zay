@@ -8,7 +8,6 @@ const vxfw = vaxis.vxfw;
 
 const tui = @import("../tui.zig");
 const agent_mod = @import("../agent.zig");
-const BoundedList = @import("bounded_list.zig").BoundedList;
 const agent_worker = @import("agent_worker.zig");
 const lane_bridge = tui.lane_bridge_mod;
 const lanes_util = @import("lanes.zig");
@@ -859,35 +858,9 @@ fn wakeIdleLane(app: *App, lane: *Thread, repo: []const u8, context: [][]u8) !vo
 }
 
 /// Start a turn on `lane` with `prompt` (duped into the lane worker's
-/// allocator). Mirrors `turn_lifecycle.beginSubmit`/`startTurn` for the spawn
-/// path: the task is appended to the lane's transcript, the lane gets a title
-/// + branch naming, and the worker starts on its own thread. Title and naming
-/// derive from `title_source` (the raw task), not the framed prompt — the
-/// role framing would otherwise become the lane's visible label.
-fn startTurnForLane(app: *App, lane: *Thread, prompt: []const u8, title_source: []const u8) !void {
-    const owned = try lane.worker_context.?.gpa.dupe(u8, prompt);
-    errdefer lane.worker_context.?.gpa.free(owned);
-    lane.transcript.dropIntroLogo(app.gpa);
-    _ = try lane.transcript.append(app.gpa, .user, "you", prompt);
-    // Title + naming helpers take the lane explicitly — no scope-swap.
-    turn_lifecycle.setLaneTitleIfUnset(app, lane, title_source) catch {};
-    if (lanes_util.workingLaneOf(lane) != null) {
-        app.scheduleLaneNaming(lane, title_source) catch {};
-    }
-    // Operates on the lane: it picks the spinner word, frees any prior
-    // `turn_failed`, anchors the activity clock, and zeroes the tool-call
-    // tally + stall latch — exactly the bookkeeping the spawn path used to
-    // hand-roll. `awaitModel` follows, as in `beginSubmit`.
-    turn_lifecycle.resetTurnState(app, lane);
-    lane.turn_view.awaitModel();
-    lane.turn.submit();
-    lane.turn_future = try app.getIo().concurrent(agent_worker.runAgentTurn, .{
-        lane.agent.?,
-        &lane.worker_context.?,
-        owned,
-        false,
-    });
-}
+/// allocator): `turn_lifecycle.startTurnForLane` — the model-driven spawn
+/// twin of `beginSubmit`/`startTurn`.
+const startTurnForLane = turn_lifecycle.startTurnForLane;
 
 /// `lane read {lane}`: snapshot the tail of a worker lane's conversation.
 /// Works on live, rested, and (in-memory) parked-by-rest lanes alike.
@@ -953,43 +926,12 @@ fn cancelLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     return resp(app.gpa, "Cancelled lane {s}.\n", .{id}, id, null);
 }
 
-/// Two-phase interrupt of a target lane's turn, mirroring
-/// `turn_lifecycle.handleInterrupt`/`discardAbandonedTurn` parameterized to
-/// the lane. `requestCancel` alone only takes effect at the worker's next
-/// `emit`; between stream chunks (and for the whole duration of a running
-/// tool) the worker is blocked in a read and emits nothing — so the future is
-/// force-cancelled and the turn reset UI-side.
-fn cancelLaneTurn(app: *App, lane: *Thread) void {
-    // An ESC interrupt's async teardown is already unwinding this worker;
-    // its `drainTurnCancels` convergence covers everything below.
-    if (lane.cancel_job != null) return;
-    if (lane.turn.state != .active and lane.turn.state != .interrupting) return;
-    if (lane.worker_context) |*worker| worker.requestCancel();
-    // Project the cancel notice onto the lane's transcript and mark it
-    // interrupting (before the discard, whose reset only clears that state).
-    const message = app.gpa.dupe(u8, agent_worker.cancel_message) catch return;
-    var event: agent_mod.Agent.Event = .{ .turn_failed = message };
-    defer event.deinit(app.gpa);
-    _ = lane.turn_view.apply(app.gpa, &lane.transcript, event) catch {};
-    // Record the interrupt as a failure so completion delivery reports the
-    // worker honestly ("FAILED — Interrupted.") instead of "final state: done".
-    // The event's copy is freed by `event.deinit`; this is a second dupe owned
-    // by `lane.turn_failed` (reset by the next `resetTurnState`).
-    if (lane.turn_failed) |old| app.gpa.free(old);
-    lane.turn_failed = app.gpa.dupe(u8, agent_worker.cancel_message) catch null;
-    if (lane.turn.state == .active) lane.turn.interrupt();
-    discardAbandonedTurnOnLane(app, lane);
-}
-
-fn discardAbandonedTurnOnLane(app: *App, lane: *Thread) void {
-    if (lane.turn.state != .interrupting and lane.turn_future == null) return;
-    if (lane.turn_future) |*future| {
-        _ = future.cancel(app.io);
-        lane.turn_future = null;
-    }
-    if (lane.worker_context) |*worker| worker.queue.discardAll(worker.io, worker.gpa);
-    if (lane.turn.state == .interrupting) lane.turn.reset();
-}
+/// `lane cancel {lane}`: two-phase interrupt of the target lane's turn (S10)
+/// — `turn_lifecycle.cancelLaneTurn`, the synchronous twin of
+/// `handleInterrupt` (the bridge handler acknowledges only after the turn is
+/// torn down, so the ESC path's async cancel job would change the ack
+/// semantics).
+const cancelLaneTurn = turn_lifecycle.cancelLaneTurn;
 
 /// `lane await {lane}`: resolve once the target lane's turn is idle (or the
 /// lane is rested — S11's park is transparent). Returns null while the target
@@ -1222,7 +1164,7 @@ pub fn deliverPendingLaneCompletions(app: *App) !bool {
         _ = spawner.transcript.append(app.gpa, .notice, "lane", message) catch {};
         if (spawner == active) changed = true;
         lane.completion_delivered = true;
-        app.startDeliveryTurn(spawner) catch {};
+        _ = app.startQueuedTurnOn(spawner) catch {};
         return true;
     }
     return changed;
