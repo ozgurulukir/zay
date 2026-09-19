@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const stream_part = @import("stream_part.zig");
+const stream_parser = @import("stream_parser.zig");
 const http = @import("../http.zig");
 const log = std.log.scoped(.ai);
 
@@ -103,9 +104,10 @@ pub const StreamState = struct {
         }
         if (!self.terminal.isTerminal()) return error.ResponseIncomplete;
         try syncToolBlocks(gpa, &self.blocks, self.tools.items, call_seq);
+        const truncated = dropIncompleteToolBlocks(gpa, &self.blocks, self.tools.items, self.limits.model_label);
         const content = try self.blocks.toOwnedSlice(gpa);
         self.blocks = .empty;
-        return .{ .assistant = .{ .assistant = .{ .content = content } }, .usage = self.terminal.usage, .finish_reason = self.terminal.finish_reason };
+        return .{ .assistant = .{ .assistant = .{ .content = content } }, .usage = self.terminal.usage, .finish_reason = self.terminal.finish_reason, .tool_calls_truncated = truncated };
     }
 };
 
@@ -540,6 +542,67 @@ fn syncOneToolBlock(gpa: std.mem.Allocator, blocks: *std.ArrayList(ai.ContentBlo
     try replaceSlice(gpa, &block.arguments, tool.arguments.items);
 }
 
+/// Finish-time parity with the chat-completions parser: a named tool call
+/// whose arguments never became executable (never streamed, or the JSON cut
+/// mid-stream with no healing `done` event) is DROPPED — its eagerly
+/// appended block removed and one truncation unit surfaced on the Turn, so
+/// the agent's retry-once hint can fire (`tool_calls_truncated` fed the same
+/// `argumentsAreExecutable` verdict the chat side uses). Nameless builders
+/// (provider never sent a name) lose their orphan eager blocks too, but are
+/// not counted — mirroring chat, which warns and skips them without
+/// counting. On mask-allocation failure the count is still returned while
+/// the blocks are kept: the degraded turn matches the pre-parity Responses
+/// behaviour instead of fabricating a drop.
+fn dropIncompleteToolBlocks(gpa: std.mem.Allocator, blocks: *std.ArrayList(ai.ContentBlock), tools: []const ToolBuilder, model_label: []const u8) u32 {
+    var truncated: u32 = 0;
+    var nameless: u32 = 0;
+    for (tools) |*tool| {
+        if (tool.block_index >= blocks.items.len) continue;
+        if (blocks.items[tool.block_index] != .tool_call) continue;
+        if (tool.name.items.len == 0) {
+            nameless += 1;
+        } else if (!stream_parser.argumentsAreExecutable(tool.arguments.items)) {
+            truncated += 1;
+        }
+    }
+    if (truncated == 0 and nameless == 0) return 0;
+
+    const keep = gpa.alloc(bool, blocks.items.len) catch {
+        // Degrade: the count still surfaces, but with blocks kept the
+        // agent's retry-once hint is suppressed (it requires an empty tool
+        // surface) and the malformed call dispatches into a structured
+        // validation error — exactly the pre-parity Responses behaviour.
+        log.warn("responses_events.truncated_count_only truncated={d} nameless={d} model={s} (mask OOM — blocks kept, hint suppressed)", .{ truncated, nameless, model_label });
+        return truncated;
+    };
+    defer gpa.free(keep);
+    @memset(keep, true);
+    // Guards MUST mirror the counting loop above — the count and the drop
+    // set must never diverge.
+    for (tools) |*tool| {
+        if (tool.block_index >= blocks.items.len) continue;
+        if (blocks.items[tool.block_index] != .tool_call) continue;
+        if (tool.name.items.len == 0 or !stream_parser.argumentsAreExecutable(tool.arguments.items)) {
+            keep[tool.block_index] = false;
+        }
+    }
+
+    var write: usize = 0;
+    for (blocks.items, 0..) |*block, read| {
+        if (keep[read]) {
+            if (write != read) blocks.items[write] = block.*;
+            write += 1;
+        } else {
+            block.deinit(gpa);
+        }
+    }
+    blocks.shrinkRetainingCapacity(write);
+
+    if (truncated > 0) log.warn("responses_events.truncated_tool_call_dropped dropped={d} model={s}", .{ truncated, model_label });
+    if (nameless > 0) log.warn("responses_events.nameless_tool_call_dropped dropped={d} model={s}", .{ nameless, model_label });
+    return truncated;
+}
+
 fn replaceSlice(gpa: std.mem.Allocator, target: *[]u8, source: []const u8) !void {
     const next = try gpa.dupe(u8, source);
     gpa.free(target.*);
@@ -620,7 +683,7 @@ test "openresponses preserves text tool text block order" {
     _ = &dropped;
     try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}", ai.streamNoop(), &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.output_text.delta\",\"delta\":\"before\"}", ai.streamNoop(), &call_seq);
-    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"id\":\"item_a\",\"name\":\"bash\"}}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"id\":\"item_a\",\"name\":\"bash\",\"arguments\":\"{}\"}}", ai.streamNoop(), &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.done\",\"output_index\":1,\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}", ai.streamNoop(), &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}", ai.streamNoop(), &call_seq);
     try state.processJson(gpa, "{\"type\":\"response.output_text.delta\",\"delta\":\"after\"}", ai.streamNoop(), &call_seq);
@@ -753,12 +816,12 @@ test "openresponses drops function calls above the parallel-call cap" {
     defer state.deinitBlocks(gpa);
 
     var call_seq: u64 = 0;
-    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"id\":\"item_a\",\"name\":\"bash\"}}", ai.streamNoop(), &call_seq);
-    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_b\",\"id\":\"item_b\",\"name\":\"bash\"}}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"id\":\"item_a\",\"name\":\"bash\",\"arguments\":\"{}\"}}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_b\",\"id\":\"item_b\",\"name\":\"bash\",\"arguments\":\"{}\"}}", ai.streamNoop(), &call_seq);
     // At the cap: this call is dropped (counted, warn-logged at finish) so
     // the already-accepted calls still complete the turn — same policy as
     // the chat-completions parser.
-    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_c\",\"id\":\"item_c\",\"name\":\"bash\"}}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_c\",\"id\":\"item_c\",\"name\":\"bash\",\"arguments\":\"{}\"}}", ai.streamNoop(), &call_seq);
     try std.testing.expectEqual(@as(u32, 1), state.dropped);
     try state.processJson(gpa, "{\"type\":\"response.completed\"}", ai.streamNoop(), &call_seq);
 
@@ -945,4 +1008,136 @@ test "processEvent handles response.failed as ProviderError" {
 
     const result = processEvent(gpa, "{\"type\":\"response.failed\",\"response\":{\"status_details\":{\"error\":{\"message\":\"Server overload\"}}}}", &blocks, &tools, ai.streamNoop(), &call_seq, &terminal, .{}, &dropped);
     try std.testing.expectError(error.ProviderError, result);
+}
+
+test "finish drops a named responses tool call whose arguments never streamed" {
+    // Parity with the chat parser: name+id arrived, the arguments payload
+    // never did — the eager block is removed and the count surfaces so the
+    // agent's retry-once hint fires.
+    const gpa = std.testing.allocator;
+    var state: StreamState = .{};
+    defer state.deinit(gpa);
+    defer state.deinitBlocks(gpa);
+
+    var call_seq: u64 = 0;
+    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"id\":\"item_a\",\"name\":\"bash\"}}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.completed\"}", ai.streamNoop(), &call_seq);
+
+    var turn = try state.finish(gpa, &call_seq);
+    defer turn.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 1), turn.tool_calls_truncated);
+    try std.testing.expectEqual(@as(usize, 0), turn.assistant.assistant.content.len);
+}
+
+test "finish keeps a deliberate empty-object arguments call" {
+    const gpa = std.testing.allocator;
+    var state: StreamState = .{};
+    defer state.deinit(gpa);
+    defer state.deinitBlocks(gpa);
+
+    var call_seq: u64 = 0;
+    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"id\":\"item_a\",\"name\":\"bash\",\"arguments\":\"{}\"}}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.completed\"}", ai.streamNoop(), &call_seq);
+
+    var turn = try state.finish(gpa, &call_seq);
+    defer turn.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 0), turn.tool_calls_truncated);
+    try std.testing.expectEqual(@as(usize, 1), turn.assistant.assistant.content.len);
+    try std.testing.expectEqualStrings("{}", turn.assistant.assistant.content[0].tool_call.arguments);
+}
+
+test "finish drops a named call whose arguments JSON is cut mid-stream" {
+    const gpa = std.testing.allocator;
+    var state: StreamState = .{};
+    defer state.deinit(gpa);
+    defer state.deinitBlocks(gpa);
+
+    var call_seq: u64 = 0;
+    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"id\":\"item_a\",\"name\":\"bash\"}}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"comm\"}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.completed\"}", ai.streamNoop(), &call_seq);
+
+    var turn = try state.finish(gpa, &call_seq);
+    defer turn.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 1), turn.tool_calls_truncated);
+    try std.testing.expectEqual(@as(usize, 0), turn.assistant.assistant.content.len);
+}
+
+test "a full-arguments done event heals partial deltas before the truncation verdict" {
+    const gpa = std.testing.allocator;
+    var state: StreamState = .{};
+    defer state.deinit(gpa);
+    defer state.deinitBlocks(gpa);
+
+    var call_seq: u64 = 0;
+    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"id\":\"item_a\",\"name\":\"bash\"}}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"comm\"}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.completed\"}", ai.streamNoop(), &call_seq);
+
+    var turn = try state.finish(gpa, &call_seq);
+    defer turn.deinit(gpa);
+    // The done event replaced the partial args wholesale — the same intent
+    // as chat's joinSeveredArguments pre-pass.
+    try std.testing.expectEqual(@as(u32, 0), turn.tool_calls_truncated);
+    try std.testing.expectEqualStrings("{\"command\":\"pwd\"}", turn.assistant.assistant.content[0].tool_call.arguments);
+}
+
+test "finish drops a nameless builder's orphan block without counting it" {
+    // Chat parity: a provider that never sent the name is dropped silently
+    // (no truncation unit) — the Responses-side orphan eager block goes too.
+    const gpa = std.testing.allocator;
+    var state: StreamState = .{};
+    defer state.deinit(gpa);
+    defer state.deinitBlocks(gpa);
+
+    var call_seq: u64 = 0;
+    try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"id\":\"item_a\"}}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}", ai.streamNoop(), &call_seq);
+    try state.processJson(gpa, "{\"type\":\"response.completed\"}", ai.streamNoop(), &call_seq);
+
+    var turn = try state.finish(gpa, &call_seq);
+    defer turn.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 0), turn.tool_calls_truncated);
+    try std.testing.expectEqual(@as(usize, 0), turn.assistant.assistant.content.len);
+}
+
+test "dropIncompleteToolBlocks degrades to count-only when the mask allocation fails" {
+    // The keep-mask is dropIncompleteToolBlocks' first allocation, so a
+    // FailingAllocator with fail_index 0 lands exactly on it (the fixtures
+    // are built with the real allocator first): the count must still
+    // surface while the block is KEPT — the degraded turn dispatches the
+    // malformed call into a structured validation error, the pre-parity
+    // behaviour.
+    const gpa = std.testing.allocator;
+    var blocks: std.ArrayList(ai.ContentBlock) = .empty;
+    defer {
+        for (blocks.items) |*block| block.deinit(gpa);
+        blocks.deinit(gpa);
+    }
+    try blocks.append(gpa, .{ .tool_call = .{
+        .call_id = .{ .value = try gpa.dupe(u8, "call_a") },
+        .name = try gpa.dupe(u8, "bash"),
+        .arguments = try gpa.dupe(u8, ""),
+    } });
+
+    var tools: std.ArrayList(ToolBuilder) = .empty;
+    defer {
+        for (tools.items) |*tool| tool.deinit(gpa);
+        tools.deinit(gpa);
+    }
+    var builder: ToolBuilder = .{};
+    try builder.call_id.appendSlice(gpa, "call_a");
+    try builder.name.appendSlice(gpa, "bash");
+    // `arguments` stays empty — the severed signature.
+    try tools.append(gpa, builder);
+
+    // Degrade path: the mask allocation fails, blocks are kept.
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    try std.testing.expectEqual(@as(u32, 1), dropIncompleteToolBlocks(failing.allocator(), &blocks, tools.items, "oom-test"));
+    try std.testing.expectEqual(@as(usize, 1), blocks.items.len);
+
+    // Healthy path: the same call is dropped and the block removed.
+    try std.testing.expectEqual(@as(u32, 1), dropIncompleteToolBlocks(gpa, &blocks, tools.items, "parity-test"));
+    try std.testing.expectEqual(@as(usize, 0), blocks.items.len);
 }
