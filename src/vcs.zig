@@ -453,7 +453,8 @@ test "globalWorktreesDir: resolves under the platform config dir" {
 }
 
 /// Scans the global worktrees directory and deletes abandoned worktree checkouts
-/// older than `max_age_ns`. Runs during startup hygiene before the TUI initializes.
+/// older than `max_age_ns`. Startup hygiene — runs on a background thread while
+/// the TUI initializes (joined before `run` returns), never on the UI thread.
 pub fn gcOrphanedWorktrees(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, max_age_ns: u64) void {
     if (home_dir.len == 0) return;
     const parent = globalWorktreesDir(gpa, home_dir) catch return;
