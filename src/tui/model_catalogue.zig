@@ -17,6 +17,7 @@ const std = @import("std");
 const codex = @import("../auth/codex.zig");
 const config_mod = @import("../config/config.zig");
 const model_loader = @import("model_loader.zig");
+const job_mod = @import("job.zig");
 const model_picker = @import("widgets/model_picker.zig");
 
 /// Where a model-selection write should land.
@@ -56,8 +57,7 @@ pub const ModelCatalogue = struct {
     pub const LoadState = union(enum) {
         idle,
         loading: struct {
-            future: std.Io.Future(model_loader.Outcome),
-            done: std.atomic.Value(bool) = .init(false),
+            job: job_mod.Job(model_loader.Outcome),
             merge: bool = false,
         },
         failed: struct {
@@ -65,36 +65,7 @@ pub const ModelCatalogue = struct {
         },
     };
 
-    /// Backward-compatible view: `model_load_future != null`.
-    pub fn model_load_future(self: *const ModelCatalogue) ?std.Io.Future(model_loader.Outcome) {
-        return switch (self.load) {
-            .loading => |l| l.future,
-            else => null,
-        };
-    }
-    /// Backward-compatible view: `model_load_done`.
-    pub fn model_load_done(self: *const ModelCatalogue) std.atomic.Value(bool) {
-        return switch (self.load) {
-            .loading => |l| l.done,
-            else => .init(false),
-        };
-    }
-    /// Backward-compatible view: `model_load_error`.
-    pub fn model_load_error(self: *const ModelCatalogue) ?[]u8 {
-        return switch (self.load) {
-            .failed => |f| f.message,
-            else => null,
-        };
-    }
-    /// Backward-compatible view: `model_load_merge`.
-    pub fn model_load_merge(self: *const ModelCatalogue) bool {
-        return switch (self.load) {
-            .loading => |l| l.merge,
-            else => false,
-        };
-    }
-
-    /// Free every owned model + snapshot. The in-flight future must be
+    /// Free every owned model + snapshot. The in-flight job must be
     /// cancelled first by the caller (it needs `io`); see `App.cancelModelLoad`.
     pub fn selectByActiveModelId(self: *ModelCatalogue, active_id: ?[]const u8) void {
         const id = active_id orelse return;

@@ -8,33 +8,30 @@
 const std = @import("std");
 const log = std.log.scoped(.tui);
 const modelsdev = @import("../models/registry.zig");
+const job_mod = @import("job.zig");
 const provider_model = @import("provider_model.zig");
 const tui = @import("../tui.zig");
 
 const App = tui.App;
 
-pub const Job = struct {
+/// Worker context for the registry fetch. Heap-allocated; `run` owns it and
+/// frees it (and the home_dir copy) before returning.
+pub const Worker = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     /// Owned copy: the focused lane's runtime may park mid-fetch, and the
     /// registry load reads/writes the cache under home_dir.
     home_dir: []u8,
-    done: *std.atomic.Value(bool),
 };
 
-/// Worker entry point for `io.concurrent`. Owns `job` — frees it (and the
-/// home_dir copy) on exit. Flips `done` to `true` immediately before
-/// returning (through a captured pointer — the job is already freed) so the
-/// tick knows it can `await` without blocking. `loadOrFetchRegistry` never
-/// errors (it falls back to cache/vendored/builtins), so the future's Result
-/// is always a fully-initialized Registry.
-pub fn run(job: *Job) modelsdev.Registry {
-    const registry = modelsdev.loadOrFetchRegistry(job.gpa, job.io, job.home_dir);
-    const done = job.done;
-    const gpa = job.gpa;
-    gpa.free(job.home_dir);
-    gpa.destroy(job);
-    done.store(true, .release);
+/// Worker entry point for `Job(modelsdev.Registry).spawn`. `loadOrFetchRegistry`
+/// never errors (it falls back to cache/vendored/builtins), so the job's
+/// result is always a fully-initialized Registry.
+pub fn run(worker: *Worker) modelsdev.Registry {
+    const registry = modelsdev.loadOrFetchRegistry(worker.gpa, worker.io, worker.home_dir);
+    const gpa = worker.gpa;
+    gpa.free(worker.home_dir);
+    gpa.destroy(worker);
     return registry;
 }
 
@@ -45,44 +42,31 @@ pub fn start(app: *App) !void {
     const runtime = app.liveRuntime() orelse return;
     if (runtime.home_dir.len == 0) return;
 
-    const job = try app.gpa.create(Job);
-    errdefer app.gpa.destroy(job);
+    const worker = try app.gpa.create(Worker);
+    errdefer app.gpa.destroy(worker);
     const home = try app.gpa.dupe(u8, runtime.home_dir);
     errdefer app.gpa.free(home);
-    job.* = .{
-        .gpa = app.gpa,
-        .io = app.io,
-        .home_dir = home,
-        .done = undefined, // armed below
-    };
-    // Arm before the spawn: the job captures the address of the union's
-    // `done` field, so the union must stay `.loading` (untouched) until
-    // drain/cancel moves it out.
-    app.provider_state.registry_refresh = .{
-        .loading = .{
-            .future = undefined, // set below
-            .done = .init(false),
-        },
-    };
-    job.done = &app.provider_state.registry_refresh.loading.done;
-    app.provider_state.registry_refresh.loading.future = app.io.concurrent(run, .{job}) catch |err| {
-        // Never leave an armed `.loading` with an undefined future (the
-        // cancelModelLoad UB class): reset to `.idle` and re-raise. The
-        // errdefers free home + job — `run` never took ownership of them,
-        // so there is nothing to clean up by hand here (a manual free would
-        // double-free once the error return fires the errdefers).
+    worker.* = .{ .gpa = app.gpa, .io = app.io, .home_dir = home };
+
+    // Arm the union first (Job's spawn captures `&job.done` inside it), then
+    // spawn. On spawn failure the errdefers above free home + worker exactly
+    // once — no manual frees here (the AGENTS.md double-free rule) — and the
+    // union resets to `.idle` so no `.loading` state survives with a
+    // disarmed job (the cancelModelLoad UB class).
+    app.provider_state.registry_refresh = .{ .loading = .{ .job = .{} } };
+    app.provider_state.registry_refresh.loading.job.spawn(app.io, worker, run) catch |err| {
         app.provider_state.registry_refresh = .idle;
         return err;
     };
 }
 
-/// Poll the done flag; once the worker signals completion, await the fresh
-/// registry and adopt it. Returns true when a redraw is needed.
+/// Poll the job; once it signals completion, adopt the fresh registry.
+/// Returns true when a redraw is needed.
 pub fn drain(app: *App) !bool {
     if (app.provider_state.registry_refresh != .loading) return false;
-    if (!app.provider_state.registry_refresh.loading.done.load(.acquire)) return false;
+    if (!app.provider_state.registry_refresh.loading.job.isDone()) return false;
 
-    const registry = app.provider_state.registry_refresh.loading.future.await(app.io);
+    const registry = app.provider_state.registry_refresh.loading.job.adopt(app.io);
     app.provider_state.registry_refresh = .idle;
     adoptRefreshedRegistry(app, registry);
     return true;
@@ -141,8 +125,7 @@ fn rebindDynamicFormHandle(app: *App) void {
 /// will drain it, so free it wholesale.
 pub fn cancel(app: *App) void {
     if (app.provider_state.registry_refresh == .loading) {
-        var future = app.provider_state.registry_refresh.loading.future;
-        var registry = future.cancel(app.io);
+        var registry = app.provider_state.registry_refresh.loading.job.cancel(app.io);
         registry.deinit(app.gpa);
         app.provider_state.registry_refresh = .idle;
     }

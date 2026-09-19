@@ -92,14 +92,10 @@ fn deinitSharedServices(self: *App) void {
     for (self.background_modal_state.pending.items) |*delivery| self.freeDelivery(delivery);
     self.background_modal_state.pending.deinit(self.gpa);
 
-    provider_model.cancelCodexLogin(self);
-    provider_model.cancelModelLoad(self);
-    registry_job.cancel(self);
-    cancelGitLabelJob(self);
+    cancelAllJobs(self);
     self.pickers.tree.deinit();
     self.pickers.search.deinit(self.gpa);
     self.pickers.models.deinit(self.gpa);
-    self.cancelDiffRefresh();
 
     auth.freeApiKeyMap(self.gpa, &self.provider_state.api_keys);
     if (self.provider_state.modelsdev_registry) |*r| {
@@ -342,14 +338,52 @@ fn advanceBlackholeIfVisible(root: *RootWidget, visible_change: *bool) void {
     }
 }
 
+/// The App-level async-job families covered by the generic Job(T) module
+/// (src/tui/job.zig). Adding a family arm without wiring its checks into the
+/// switches below fails to compile — tick exhaustiveness is enforced, not
+/// remembered.
+pub const JobFamily = enum { diff_refresh, registry_refresh, model_load, codex_login, git_label };
+
+/// Any of the Job(T) families needs a tick to start or drain.
+pub fn anyJobActive(app: *const App) bool {
+    inline for (std.meta.fields(JobFamily)) |field| {
+        const family: JobFamily = @enumFromInt(field.value);
+        if (jobFamilyActive(app, family)) return true;
+    }
+    return false;
+}
+
+fn jobFamilyActive(app: *const App, comptime family: JobFamily) bool {
+    return switch (family) {
+        .diff_refresh => app.metrics.diff_loading(),
+        .registry_refresh => registry_job.active(app),
+        .model_load => app.pickers.models.load == .loading,
+        .codex_login => provider_model.codexLoginActive(app),
+        .git_label => gitLabelRefreshActive(app),
+    };
+}
+
+/// Join and dispose every Job(T) family (app teardown). The families are
+/// independent — each cancel joins only its own worker.
+pub fn cancelAllJobs(app: *App) void {
+    inline for (std.meta.fields(JobFamily)) |field| {
+        const family: JobFamily = @enumFromInt(field.value);
+        switch (family) {
+            .diff_refresh => diff_lifecycle.cancelDiffRefresh(app),
+            .registry_refresh => registry_job.cancel(app),
+            .model_load => provider_model.cancelModelLoad(app),
+            .codex_login => provider_model.cancelCodexLogin(app),
+            .git_label => cancelGitLabelJob(app),
+        }
+    }
+}
+
 /// Decide whether another tick should be scheduled.  Each named variable
 /// corresponds to one logical reason for continued polling.
 fn decideShouldTick(root: *RootWidget) bool {
     const turn_active = root.app.anyTurnActive();
     const turn_cancel_pending = turn_lifecycle.turnCancelActive(root.app);
-    const model_loading = root.app.pickers.models.load == .loading;
-    const codex_login_active = provider_model.codexLoginActive(root.app);
-    const diff_loading = root.app.metrics.diff_loading();
+    const any_job_active = anyJobActive(root.app);
     const blackhole_visible = root.app.metrics.blackhole_visible;
     const diff_refresh_pending = root.diff_refresh_pending;
     const background_active = root.app.backgroundActive();
@@ -358,16 +392,12 @@ fn decideShouldTick(root: *RootWidget) bool {
     const manual_compact_active = compaction_lifecycle.manualCompactActive(root.app);
     const toasts_visible = toast.global.hasToasts();
     const worktree_async_active = lane_lifecycle.anyAsyncWorktreeActive(root.app);
-    const registry_refresh_active = registry_job.active(root.app);
-    const git_label_refresh_active = gitLabelRefreshActive(root.app);
 
     const at_search_active = atSearchActive(root.app);
 
     return turn_active or
         turn_cancel_pending or
-        model_loading or
-        codex_login_active or
-        diff_loading or
+        any_job_active or
         blackhole_visible or
         diff_refresh_pending or
         background_active or
@@ -376,8 +406,6 @@ fn decideShouldTick(root: *RootWidget) bool {
         manual_compact_active or
         toasts_visible or
         worktree_async_active or
-        registry_refresh_active or
-        git_label_refresh_active or
         at_search_active;
 }
 
@@ -892,7 +920,31 @@ pub fn serviceGitLabelRefresh(app: *App) !bool {
         app.git_label_refresh_deadline = null;
         return visible_change;
     };
-    app.git_label_job = git_label_job.Job.start(app.gpa, app.io, cwd, app.git_label_generation) catch |err| {
+    const worker = app.gpa.create(git_label_job.Worker) catch |err| {
+        log.warn("git label refresh start failed err={s}", .{@errorName(err)});
+        app.git_label_dirty = false;
+        app.git_label_refresh_deadline = null;
+        return visible_change;
+    };
+    worker.* = .{
+        .gpa = app.gpa,
+        .io = app.io,
+        .cwd = app.gpa.dupe(u8, cwd) catch |err| {
+            app.gpa.destroy(worker);
+            log.warn("git label refresh start failed err={s}", .{@errorName(err)});
+            app.git_label_dirty = false;
+            app.git_label_refresh_deadline = null;
+            return visible_change;
+        },
+    };
+    // Arm the App field first — Job.spawn captures the arm's address — then
+    // spawn. On failure the arm is dropped and its two allocations freed by
+    // hand (no errdefers to fight).
+    app.git_label_job = .{ .job = .{}, .worker = worker, .generation = app.git_label_generation };
+    app.git_label_job.?.job.spawn(app.io, worker, git_label_job.run) catch |err| {
+        app.gpa.free(worker.cwd);
+        app.gpa.destroy(worker);
+        app.git_label_job = null;
         log.warn("git label refresh start failed err={s}", .{@errorName(err)});
         app.git_label_dirty = false;
         app.git_label_refresh_deadline = null;
@@ -905,9 +957,12 @@ pub fn serviceGitLabelRefresh(app: *App) !bool {
 
 /// Stop and join the label worker before App-owned state is released.
 fn cancelGitLabelJob(app: *App) void {
-    if (app.git_label_job) |job| {
+    if (app.git_label_job) |*arm| {
+        // Join the worker; the label it produced is discarded (freed).
+        if (arm.job.cancel(app.io)) |raw| app.gpa.free(raw);
+        app.gpa.free(arm.worker.cwd);
+        app.gpa.destroy(arm.worker);
         app.git_label_job = null;
-        job.deinit();
     }
     app.git_label_dirty = false;
     app.git_label_refresh_deadline = null;
@@ -916,13 +971,16 @@ fn cancelGitLabelJob(app: *App) void {
 /// Adopt a completed label only if it still belongs to the active lane.
 /// Results from a superseded lane are freed without touching the UI state.
 fn drainGitLabelJob(app: *App) bool {
-    const job = app.git_label_job orelse return false;
-    if (!job.isDone()) return false;
+    const arm = &(app.git_label_job orelse return false);
+    if (!arm.job.isDone()) return false;
 
-    const generation = job.generation;
-    const label = job.takeLabel();
+    const generation = arm.generation;
+    const label = arm.job.adopt(app.io);
+    // Free the worker (and its cwd copy) after adoption — the label was
+    // allocated with the same gpa and survives independently.
+    app.gpa.free(arm.worker.cwd);
+    app.gpa.destroy(arm.worker);
     app.git_label_job = null;
-    job.deinit();
 
     if (generation != app.git_label_generation) {
         if (label) |raw| app.gpa.free(raw);

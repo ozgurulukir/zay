@@ -12,22 +12,21 @@ const App = tui.App;
 
 pub fn cancelModelLoad(self: *App) void {
     if (self.pickers.models.load == .loading) {
-        var future = self.pickers.models.load.loading.future;
-        var outcome = future.cancel(self.io);
+        var outcome = self.pickers.models.load.loading.job.cancel(self.io);
         outcome.deinit(self.gpa);
         self.pickers.models.load = .idle;
     }
 }
 
-/// Install the concurrent future for a freshly-armed `.loading` state,
-/// guaranteeing the union never stays `.loading` with an `undefined` future
-/// when the spawn fails: the state first moves to `.failed` (picker error
-/// row) or `.idle` (message alloc failed), then the error re-raises so the
-/// caller's errdefers free the job + configured snapshot. Without this,
-/// `cancelModelLoad` would copy the undefined future (UB) and
-/// `drainModelLoad` would poll `done` forever, spinning the tick.
+/// Spawn the worker for a freshly-armed `.loading` state, guaranteeing the
+/// union never stays `.loading` with a disarmed job when the spawn fails:
+/// the state first moves to `.failed` (picker error row) or `.idle` (message
+/// alloc failed), then the error re-raises so the caller's errdefers free
+/// the job + configured snapshot. Without this, `cancelModelLoad` would join
+/// a never-spawned job (UB) and `drainModelLoad` would poll forever,
+/// spinning the tick.
 pub fn spawnLoadFuture(app: *App, job: *model_loader.Job) !void {
-    app.pickers.models.load.loading.future = app.io.concurrent(model_loader.run, .{job}) catch |err| {
+    app.pickers.models.load.loading.job.spawn(app.io, job, model_loader.run) catch |err| {
         markLoadSpawnFailed(app, err);
         return err;
     };
@@ -52,9 +51,9 @@ pub fn markLoadSpawnFailed(app: *App, err: anyerror) void {
 /// if a redraw is needed.
 pub fn drainModelLoad(self: *App) !bool {
     if (self.pickers.models.load != .loading) return false;
-    if (!self.pickers.models.load.loading.done.load(.acquire)) return false;
+    if (!self.pickers.models.load.loading.job.isDone()) return false;
 
-    var outcome = self.pickers.models.load.loading.future.await(self.io);
+    var outcome = self.pickers.models.load.loading.job.adopt(self.io);
     self.pickers.models.load = .idle;
     defer outcome.deinit(self.gpa);
 
@@ -272,11 +271,10 @@ test "markLoadSpawnFailed moves an armed loading state to failed and keeps cance
     var app = try tui.App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    // Arm exactly like startModelLoad does right before the spawn: future is
-    // undefined until io.concurrent succeeds.
+    // Arm exactly like startModelLoad does right before the spawn: the job
+    // is disarmed until Job.spawn succeeds.
     app.pickers.models.load = .{ .loading = .{
-        .future = undefined,
-        .done = .init(false),
+        .job = .{},
         .merge = true,
     } };
     markLoadSpawnFailed(&app, error.SystemResources);

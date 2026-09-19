@@ -17,6 +17,7 @@ const tui = @import("../tui.zig");
 const agent_mod = @import("../agent.zig");
 const auth = @import("../auth/store.zig");
 const modelsdev = @import("../models/registry.zig");
+const job_mod = @import("job.zig");
 const model_picker = @import("widgets/model_picker.zig");
 const tree_selector = @import("widgets/tree_selector.zig");
 const model_catalogue = @import("model_catalogue.zig");
@@ -281,12 +282,11 @@ pub const ProviderState = struct {
 
     /// Background refresh state machine for the models.dev registry. Mirrors
     /// `ModelCatalogue.LoadState`'s "illegal combinations unrepresentable"
-    /// rule: an armed `.loading` always carries a spawned future.
+    /// rule: an armed `.loading` always carries a spawned job.
     pub const RegistryRefreshState = union(enum) {
         idle,
         loading: struct {
-            future: std.Io.Future(modelsdev.Registry),
-            done: std.atomic.Value(bool) = .init(false),
+            job: job_mod.Job(modelsdev.Registry),
         },
     };
 };
@@ -341,10 +341,7 @@ pub const MetricsState = struct {
     pub const DiffState = union(enum) {
         idle,
         loading: struct {
-            future: std.Io.Future(tui.DiffRefreshOutcome),
-            /// Set by the worker before it returns; callers check this
-            /// non-blockingly before awaiting.
-            done: std.atomic.Value(bool) = .init(false),
+            job: job_mod.Job(tui.DiffRefreshOutcome),
         },
         /// A successful fetch has populated `cache`; subsequent renders
         /// read from it. A refresh transitions to `refreshing`, which
@@ -353,29 +350,12 @@ pub const MetricsState = struct {
             cache: []u8,
         },
         refreshing: struct {
-            future: std.Io.Future(tui.DiffRefreshOutcome),
-            done: std.atomic.Value(bool) = .init(false),
+            job: job_mod.Job(tui.DiffRefreshOutcome),
             cache: []u8,
         },
     };
 
-    /// Backward-compat: future != null.
-    pub fn diff_refresh_future(self: *const MetricsState) ?std.Io.Future(tui.DiffRefreshOutcome) {
-        return switch (self.diff) {
-            .loading => |l| l.future,
-            .refreshing => |r| r.future,
-            else => null,
-        };
-    }
-    /// Backward-compat: done flag.
-    pub fn diff_refresh_done(self: *const MetricsState) std.atomic.Value(bool) {
-        return switch (self.diff) {
-            .loading => |l| l.done,
-            .refreshing => |r| r.done,
-            else => .init(false),
-        };
-    }
-    /// Backward-compat: diff_loading flag (any future-bearing state).
+    /// True while a diff load or refresh is in flight.
     pub fn diff_loading(self: *const MetricsState) bool {
         return switch (self.diff) {
             .loading, .refreshing => true,

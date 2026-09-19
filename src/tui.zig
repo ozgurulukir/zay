@@ -126,10 +126,10 @@ pub const App = struct {
     /// was running in the background.
     git_label_generation: u64 = 0,
     /// In-flight status-bar Git query. Owned by App and joined during teardown.
-    git_label_job: ?*git_label_job_mod.Job = null,
+    git_label_job: ?git_label_job_mod.Arm = null,
     /// In-flight OpenAI Codex browser login. Owned by App and joined during
     /// teardown; the OAuth wait never runs on the vaxis event thread.
-    codex_login_job: ?*codex_login_job_mod.Job = null,
+    codex_login_job: ?codex_login_job_mod.CodexLoginJob = null,
     /// The multi-lane layout arrangement. `.tab` (single active-lane pane) is
     /// the legacy fullscreen; `.dual` (1:1 driver + focused worker) and `.grid`
     /// (2x2 tile) both show more than one lane. Set from the configured
