@@ -1743,15 +1743,15 @@ pub fn injectPluginTools(self: *App) void {
 }
 
 /// Merge MCP and plugin tool schemas into a single slice and inject them into
-/// the live AI client in one call. `updateMcpTools` replaces the entire
+/// the live AI client in one call. `syncToolJson` replaces the entire
 /// `tools_json`, so calling it separately for MCP and plugin tools would cause
 /// the second call to overwrite the first.
 ///
 /// As of the plugin-via-`ToolRegistry` refactor, plugin tools live in
 /// `self.tool_registry` and are surfaced through `registerPluginTools` →
-/// `updateMcpTools` via the registry's `all` slice. This function only
+/// `syncToolJson` via the registry's `all` slice. This function only
 /// handles the MCP transport — the rest of the tool list comes from
-/// `self.tool_registry.all(...)` on the next `updateMcpTools` call.
+/// `self.tool_registry.all(...)` on the next `syncToolJson` call.
 fn injectAllTools(self: *App) void {
     const runtime = self.liveRuntime() orelse {
         log.warn("injectAllTools: no live runtime, skipping tool injection", .{});
@@ -1785,7 +1785,7 @@ pub fn retryPendingMcpSync(self: *App) bool {
 }
 
 /// Push the merged tool list (registry builtin + plugin tools + connected
-/// MCP schemas) into `runtime`'s attached client. `updateMcpTools` replaces
+/// MCP schemas) into `runtime`'s attached client. `syncToolJson` replaces
 /// the entire `tools_json`, so one call covers every source. Besides the
 /// live-runtime callers (`injectAllTools`), `createRuntime` uses this for
 /// freshly-created runtimes (session switch, resume, lane spawn): those
@@ -1815,7 +1815,7 @@ pub fn injectToolsInto(self: *App, runtime: *runtime_mod.AgentRuntime) void {
 /// don't linger forever. The strip mutates the shared registry — only call
 /// this when no worker thread can be dispatching through it (startup, or a
 /// future quiescent reload point); `openPlugins` must NOT call it. The AI
-/// client picks the fresh set up on its next `updateMcpTools` call (driven
+/// client picks the fresh set up on its next `syncToolJson` call (driven
 /// by `attachXxxClient` or `refreshMcpTools`).
 pub fn registerPluginTools(self: *App) void {
     const lua_mod = @import("../lua/root.zig");

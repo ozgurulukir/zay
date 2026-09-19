@@ -48,7 +48,7 @@ pub const Client = struct {
     authorization: ?[]u8,
     tools_json: []u8,
     /// Whether tool definitions carry OpenAI strict structured-outputs mode.
-    /// Captured at `init` so `updateMcpTools` can rebuild `tools_json`
+    /// Captured at `init` so `syncToolJson` can rebuild `tools_json`
     /// consistently without the caller re-passing it. Default `false` —
     /// strict mode is OpenAI-only and silently breaks function-calling on
     /// gateways (OpenRouter/Ollama/vLLM).
@@ -144,15 +144,6 @@ pub const Client = struct {
         self.* = undefined;
     }
 
-    /// Rebuild the serialized tool definitions after the MCP tool set changes.
-    /// `mcp_tools` is borrowed only for the duration of the call; the result is
-    /// the owned `tools_json`. Call between turns, never mid-turn.
-    /// `registry`, when non-null, contributes its builtin + plugin tools so
-    /// the model sees them as first-class definitions. `builtin_override`
-    /// lets the caller pick what `config.tools` contributes at call time —
-    /// typically `&.{}` because the registry's builtin already covers
-    /// bash, and emitting both creates a duplicate name that most APIs
-    /// reject outright.
     // Rebuild the serialized tool definitions from the final, already-deduped
     // spec list assembled by the runtime layer (builtin + registry plugin +
     // registry MCP). Call between turns, never mid-turn.
@@ -203,7 +194,7 @@ pub const Client = struct {
 
         pub fn writePayload(self: *ChatPayload, out: *std.Io.Writer, disable_prompt_cache: bool) !void {
             self.opts.disable_prompt_cache = disable_prompt_cache;
-            return openai_request.writeRequestPayload(self.gpa, out, self.opts.model, self.opts.session_id, self.messages, self.tools_json, self.opts.reasoning, self.opts.max_output_tokens, self.opts.dialect, self.opts.disable_prompt_cache, self.opts.is_reasoning_model);
+            return openai_request.writePayload(self.gpa, out, self.opts, self.messages, self.tools_json);
         }
 
         pub fn isToolLess(self: *ChatPayload) bool {
@@ -303,9 +294,9 @@ test "buildAllToolsJson includes MCP tools alongside builtin tools" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"mcp__server__greet\"") != null);
 }
 
-test "buildAllToolsJson via updateMcpTools: registry builtin suppresses duplicate shell" {
-    // Regression: the tick-driven `injectAllTools` path used to call
-    // `updateMcpTools(mcp_tools, registry)` without an override, so
+test "buildAllToolsJson via updateTools: registry builtin suppresses duplicate shell" {
+    // Regression: the tick-driven `injectAllTools` path used to feed
+    // `updateTools` both `config.tools` and the registry's builtin, so
     // `buildAllToolsJson` would emit the shell tool twice — once from
     // `self.config.tools` and again from `r.all.builtin`. Most
     // OpenAI-compatible APIs reject duplicate tool names with HTTP 400,
@@ -371,11 +362,11 @@ test "buildAllToolsJson via updateMcpTools: registry builtin suppresses duplicat
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"lua__p__t\"") != null);
 }
 
-test "updateMcpTools propagates plugin tools into tools_json end-to-end" {
+test "updateTools propagates plugin tools into tools_json end-to-end" {
     // End-to-end regression for the user-reported "plugin tools not
     // visible to AI" bug. We simulate the exact call site:
     //   attachOpenAiCompatibleClient → injectPluginTools → injectAllTools →
-    //   runtime.client.updateMcpTools(mcp_schemas, registry, &.{}).
+    //   runtime.syncToolJson() → client.updateTools(specs).
     // After the call, `client.tools_json` must contain every plugin
     // tool's name so the next prompt includes them.
     const gpa = std.testing.allocator;
@@ -567,7 +558,7 @@ test "buildToolsJson preserves nested object additionalProperties for free-form 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"additionalProperties\":true") != null);
 }
 
-test "updateMcpTools rebuilds the serialized tool list in place" {
+test "updateTools rebuilds the serialized tool list in place" {
     const gpa = std.testing.allocator;
     const tools = [_]tools_common.Tool{
         .{
