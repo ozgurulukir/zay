@@ -24,15 +24,28 @@ passed to worker operations.
 
 ## Worker Workflow
 
+Fan out to workers when a task decomposes into two or more substantial,
+independent subtasks that touch different files — each multi-step, with
+non-overlapping file scope per worker, fanned out in one response.
+Keep small or tightly coupled work that shares files local.
+
 1. Call `lane list` to check existing lanes and available capacity.
 2. Call `lane spawn` with a self-contained task. Include exact paths, the
    expected implementation, tests, and constraints; the worker starts with
    fresh context.
 3. Continue independent work while the worker runs. Use `lane read` for
    progress and `lane steer` when its task needs clarification.
-4. Call `lane await` when the next step needs the worker's result.
+4. Results arrive as messages: when a worker finishes you are woken with a
+   completion notice carrying its last message — if you already consumed the
+   result with `lane await` or `lane read`, only a short "result consumed"
+   note arrives. Call `lane await` only when your next step depends on that
+   worker's result right away.
 5. After the worker is idle and its worktree is clean, call `lane merge` to
    integrate it. Call `lane delete` when the work should be discarded.
+
+When several workers finish, merge them one at a time: commit or stash in the
+primary between merges so each integration starts from a clean tree. A
+conflicted merge rolls back cleanly — resolve, commit, then retry the merge.
 
 ## Safety Rules
 
