@@ -56,3 +56,53 @@ pub fn makeParkTestRuntime(gpa: std.mem.Allocator, home_abs: []const u8) !*@impo
     try session_mod.SessionWriter.initDefault(&runtime.session_writer, gpa, std.testing.io, home_abs, ".");
     return runtime;
 }
+
+/// Mutex-wrapped facade over a child allocator, for tests that run a real
+/// worker thread (`runAgentTurn`) while the UI thread allocates: the raw
+/// testing allocator is not thread-safe, and both sides must share ONE
+/// facade (two facades would serialize on separate mutexes and still race).
+pub const LockedAllocator = struct {
+    child: std.mem.Allocator,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+
+    pub fn allocator(self: *LockedAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *LockedAllocator = @ptrCast(@alignCast(ctx));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *LockedAllocator = @ptrCast(@alignCast(ctx));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *LockedAllocator = @ptrCast(@alignCast(ctx));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *LockedAllocator = @ptrCast(@alignCast(ctx));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};

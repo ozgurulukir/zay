@@ -681,7 +681,7 @@ pub const App = struct {
     }
 
     pub fn discardAbandonedTurn(self: *App) void {
-        turn_lifecycle.discardAbandonedTurn(self);
+        turn_lifecycle.discardAbandonedTurn(self, self.thread);
     }
 
     pub fn beginSubmit(self: *App) !bool {
@@ -704,8 +704,8 @@ pub const App = struct {
         return turn_lifecycle.startTurn(self);
     }
 
-    pub fn restartTurnForQueuedMessages(self: *App) !bool {
-        return turn_lifecycle.restartTurnForQueuedMessages(self, self.thread);
+    pub fn startQueuedTurnOn(self: *App, lane: *Thread) !bool {
+        return turn_lifecycle.startQueuedTurn(self, lane);
     }
 
     pub fn laneForAgent(self: *App, agent_ptr: *agent_mod.Agent) ?*Thread {
@@ -758,10 +758,6 @@ pub const App = struct {
 
     pub fn deliverPendingBackground(self: *App) !bool {
         return background_delivery.deliverPendingBackground(self);
-    }
-
-    pub fn startDeliveryTurn(self: *App, lane: *Thread) !void {
-        return turn_lifecycle.startDeliveryTurn(self, lane);
     }
 
     pub fn runningBackgroundCount(self: *App) usize {
