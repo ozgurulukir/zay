@@ -945,37 +945,12 @@ test "readProjectRuleFile truncates an oversized rule file with a notice instead
     // The sandwich keeps the head AND the conclusion tail.
     try std.testing.expect(std.mem.indexOf(u8, content, "HEAD_MARKER") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "TAIL_MARKER") != null);
-}
 
-test "readRuleFile truncation notice names the file class" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    const root = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(root);
-
-    // Oversized global AGENTS.md in a scratch platform config dir.
-    const home = try std.fs.path.join(gpa, &.{ root, ".zig-cache/context-user-truncate-home-test" });
-    defer gpa.free(home);
-    const config_dir = try paths.platformConfigDir(gpa, home);
-    defer gpa.free(config_dir);
-    try std.Io.Dir.createDirPath(.cwd(), io, config_dir);
-    {
-        const big = try gpa.alloc(u8, 70 * 1024);
-        defer gpa.free(big);
-        @memset(big, 'x');
-        @memcpy(big[0.."HEAD_MARKER".len], "HEAD_MARKER");
-        @memcpy(big[big.len - "TAIL_MARKER".len ..], "TAIL_MARKER");
-        try writeTestFile(gpa, io, config_dir, "AGENTS.md", big);
-    }
-
-    const content = (try readRuleFile(gpa, io, config_dir, "AGENTS.md", "user rule file")).?;
-    defer gpa.free(content);
     // The notice names the USER class, so it stays distinguishable from a
     // project AGENTS.md that may sit in the same prompt.
-    try std.testing.expect(std.mem.indexOf(u8, content, "[user rule file truncated: AGENTS.md is ") != null);
-    // The sandwich keeps the head AND the conclusion tail.
-    try std.testing.expect(std.mem.indexOf(u8, content, "HEAD_MARKER") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "TAIL_MARKER") != null);
+    const user_content = (try readRuleFile(gpa, io, cwd, filename, "user rule file")).?;
+    defer gpa.free(user_content);
+    try std.testing.expect(std.mem.indexOf(u8, user_content, "[user rule file truncated: BIG.md is ") != null);
 }
 
 test "pruneHistoricalToolResultsViews caps old tool outputs while preserving recent ones" {
