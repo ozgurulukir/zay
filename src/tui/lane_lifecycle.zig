@@ -24,6 +24,7 @@ const vcs = @import("../vcs.zig");
 const background_mod = @import("../background.zig");
 const bash = @import("../tools/bash_exec.zig");
 const pws = @import("../tools/pwsh_exec.zig");
+const tools_common = @import("../tools/common.zig");
 const os = @import("../os.zig");
 const platform = @import("platform");
 
@@ -106,6 +107,11 @@ fn failResp(gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) Res
 /// timeout) is silent for its whole run; the stall signal is "zero events at
 /// all", which a blocked network read or hung tool produces indefinitely.
 const worker_stall_ms: i64 = 180 * std.time.ms_per_s;
+
+/// Cap (bytes) for the worker's last message attached to done/FAILED
+/// completion notices — bounded because it rides the spawner's queue and
+/// transcript. How it is capped lives in `workerLastMessageBlock`.
+const worker_last_message_cap_bytes: u32 = 2048;
 
 /// Whether `lane`'s active turn has produced no event for at least
 /// `worker_stall_ms` — the signal an orchestrator uses to stop polling and act
@@ -1082,6 +1088,37 @@ fn parkFinishedWorker(app: *App, lane: *Thread) void {
     if (refocus_input) lifecycle.focusPrimaryInput(app);
 }
 
+/// The body of the worker's last visible agent message — a transcript-owned
+/// borrow used to attach a bounded report to the completion notice. Thinking,
+/// tool, notice, and status rows never match; an empty body is skipped so the
+/// notice never carries a bare header. Safe because delivery is synchronous
+/// on the tick after the worker parked — nothing writes this transcript
+/// between the borrow and the copy.
+fn lastAgentBody(lane: *const Thread) ?[]const u8 {
+    const items = lane.transcript.messages.items;
+    var i = items.len;
+    while (i > 0) {
+        i -= 1;
+        switch (items[i]) {
+            .agent => |m| if (m.body.len > 0) return m.body,
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// The "Worker's last message:" block appended to done/FAILED completion
+/// notices: the worker's own final words, head+tail-capped via the shared
+/// truncation SSOT (`tools_common.pruneToolText`) so a long message keeps its
+/// conclusion. Null when the transcript holds no agent message — the notice
+/// then keeps its terse wording. Owned result; the caller frees it.
+fn workerLastMessageBlock(gpa: std.mem.Allocator, lane: *const Thread) !?[]u8 {
+    const body = lastAgentBody(lane) orelse return null;
+    const pruned = try tools_common.pruneToolText(gpa, body, worker_last_message_cap_bytes);
+    defer gpa.free(pruned); // freed on BOTH paths: copied on success, discarded on error
+    return try std.fmt.allocPrint(gpa, "\n\nWorker's last message:\n{s}", .{pruned});
+}
+
 /// Deliver finished spawned-worker completions to the spawner (S11): parked
 /// workers are rested, then a terse notice + raw message is enqueued into the
 /// spawner's agent and an answer turn starts. An acknowledged worker (M2) or
@@ -1135,10 +1172,16 @@ pub fn deliverPendingLaneCompletions(app: *App) !bool {
         // then has no reason to read the lane or clean it up. The reason also
         // sits in the lane's transcript as a notice, so `lane read` shows the
         // full detail.
+        // The worker's last message rides the notice — one string serves the
+        // model (raw enqueue) and the transcript row. Re-derived from the
+        // transcript on every attempt, so a QueueFull retry loses nothing.
+        const last_message = try workerLastMessageBlock(app.gpa, lane);
+        defer if (last_message) |s| app.gpa.free(s);
+        const last_message_part: []const u8 = last_message orelse "";
         const message = if (lane.turn_failed) |reason|
-            try std.fmt.allocPrint(app.gpa, "Lane {s} ({s}) FAILED after {d} tool calls: {s}. Read with `lane read {s}`; the worker did not complete — fold what's salvageable with `lane merge {s}` or /close it.", .{ title, id, tool_count, reason, id, id })
+            try std.fmt.allocPrint(app.gpa, "Lane {s} ({s}) FAILED after {d} tool calls: {s}. Read with `lane read {s}`; the worker did not complete — fold what's salvageable with `lane merge {s}` or /close it.{s}", .{ title, id, tool_count, reason, id, id, last_message_part })
         else
-            try std.fmt.allocPrint(app.gpa, "Lane {s} ({s}) finished — {d} tool calls, final state: done. Read with `lane read {s}`; fold back with `lane merge {s}`.", .{ title, id, tool_count, id, id });
+            try std.fmt.allocPrint(app.gpa, "Lane {s} ({s}) finished — {d} tool calls, final state: done. Read with `lane read {s}`; fold back with `lane merge {s}`.{s}", .{ title, id, tool_count, id, id, last_message_part });
         defer app.gpa.free(message);
         // Enqueue FIRST, then notice, then mark delivered: if the spawner's
         // queue is full, nothing has been written yet (agent queue and mirror
@@ -2195,7 +2238,8 @@ test "S11: a finished spawned worker rests — runtime freed, transcript + workt
     try std.testing.expectEqual(@as(usize, 2), lane.transcript.messages.items.len);
     try std.testing.expect(vcs.isRepo(gpa, io, lane_path));
     try std.testing.expect(lane.completion_delivered);
-    // The spawner got the completion notice.
+    // The spawner got the completion notice (its content, including the
+    // worker's last message, is owned by the dedicated notice tests below).
     try std.testing.expect(app.threads.slice()[0].transcript.containsText("finished"));
 }
 
@@ -2231,6 +2275,114 @@ test "S11: a failed spawned worker is reported honestly, not as done" {
     try std.testing.expect(spawner.transcript.containsText("FAILED"));
     try std.testing.expect(spawner.transcript.containsText("ConnectionLost"));
     try std.testing.expect(!spawner.transcript.containsText("final state: done"));
+    // The transcript holds no agent message → no summary block rides along.
+    try std.testing.expect(!spawner.transcript.containsText("Worker's last message:"));
+}
+
+test "S11: the done notice carries the worker's last message" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
+    var fx = try GitFixture.init(gpa, io);
+    defer fx.deinit(gpa);
+    const app = &fx.app;
+
+    const wt = try createLaneWorktree(app, fx.repo, fx.home_dir);
+    const rt = app.createRuntime(wt.dest, fx.repo, null) catch |err| {
+        app.gpa.free(wt.branch);
+        app.gpa.free(wt.dest);
+        return err;
+    };
+    const lane = try gpa.create(Thread);
+    lane.* = Thread.initLive(rt.session_writer.session.id, &rt.agent, io, rt.gpa, &.{}, wt.branch, wt.dest, rt);
+    lane.spawned_by_generation = 1; // the primary is the spawner
+    try app.threads.append(lane);
+    _ = try lane.transcript.append(gpa, .user, "you", "worker task");
+    _ = try lane.transcript.append(gpa, .agent, "agent", "parser rewritten, 12 tests passing");
+
+    const changed = try deliverPendingLaneCompletions(app);
+    try std.testing.expect(changed);
+    try std.testing.expect(lane.completion_delivered);
+    const spawner = app.threads.slice()[0];
+    // One string, two consumers: the base notice plus the worker's own words,
+    // so the spawner learns the result without a `lane read` round-trip.
+    try std.testing.expect(spawner.transcript.containsText("final state: done"));
+    try std.testing.expect(spawner.transcript.containsText("Worker's last message:"));
+    try std.testing.expect(spawner.transcript.containsText("parser rewritten, 12 tests passing"));
+}
+
+test "S11: a failed worker's notice carries its last message too" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
+    var fx = try GitFixture.init(gpa, io);
+    defer fx.deinit(gpa);
+    const app = &fx.app;
+
+    const wt = try createLaneWorktree(app, fx.repo, fx.home_dir);
+    const rt = app.createRuntime(wt.dest, fx.repo, null) catch |err| {
+        app.gpa.free(wt.branch);
+        app.gpa.free(wt.dest);
+        return err;
+    };
+    const lane = try gpa.create(Thread);
+    lane.* = Thread.initLive(rt.session_writer.session.id, &rt.agent, io, rt.gpa, &.{}, wt.branch, wt.dest, rt);
+    lane.spawned_by_generation = 1; // the primary is the spawner
+    lane.turn_failed = try gpa.dupe(u8, "agent turn failed: ConnectionLost");
+    try app.threads.append(lane);
+    _ = try lane.transcript.append(gpa, .user, "you", "worker task");
+    _ = try lane.transcript.append(gpa, .agent, "agent", "parser half-migrated, tests pending");
+
+    const changed = try deliverPendingLaneCompletions(app);
+    try std.testing.expect(changed);
+    try std.testing.expect(lane.completion_delivered);
+    const spawner = app.threads.slice()[0];
+    // Honest failure wording AND the partial work so the spawner can salvage.
+    try std.testing.expect(spawner.transcript.containsText("FAILED"));
+    try std.testing.expect(spawner.transcript.containsText("ConnectionLost"));
+    try std.testing.expect(!spawner.transcript.containsText("final state: done"));
+    try std.testing.expect(spawner.transcript.containsText("Worker's last message:"));
+    try std.testing.expect(spawner.transcript.containsText("parser half-migrated, tests pending"));
+}
+
+test "the worker's last-message block is capped with its tail preserved" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    const lane = try addFakeWorkingLane(gpa, &app, "capped");
+    const body = try std.fmt.allocPrint(gpa, "{s}FINAL-TAIL-MARKER", .{"x" ** 5000});
+    defer gpa.free(body);
+    _ = try lane.transcript.append(gpa, .agent, "agent", body);
+
+    const block = (try workerLastMessageBlock(gpa, lane)).?;
+    defer gpa.free(block);
+    // Head+tail sandwich: the conclusion (tail) survives the cap, and no 4 KiB
+    // run of the filler can survive it. The bound admits the elision marker.
+    try std.testing.expect(std.mem.endsWith(u8, block, "FINAL-TAIL-MARKER"));
+    try std.testing.expect(std.mem.indexOf(u8, block, "x" ** 4000) == null);
+    try std.testing.expect(block.len <= worker_last_message_cap_bytes + 128);
+}
+
+test "the completion block takes the worker's last agent message, skipping later rows" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    const lane = try addFakeWorkingLane(gpa, &app, "selected");
+    try std.testing.expect(lastAgentBody(lane) == null);
+
+    // Thinking and notice rows after the answer must not shadow it.
+    _ = try lane.transcript.append(gpa, .agent, "agent", "final answer");
+    _ = try lane.transcript.append(gpa, .thinking, "agent", "hmm");
+    _ = try lane.transcript.append(gpa, .notice, "lane", "stall warning");
+    try std.testing.expectEqualStrings("final answer", lastAgentBody(lane).?);
 }
 
 test "S11: a cancelled spawned worker is delivered as FAILED, not done" {

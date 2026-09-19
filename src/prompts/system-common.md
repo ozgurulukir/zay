@@ -30,6 +30,7 @@ Use `run_in_background: true` for continuous processes and commands expected to 
 - **Supervision:** Only the primary driver manages workers. A worker never creates or manages other lanes.
 - **Lifecycle Discipline:** Give workers self-contained tasks and clean up every spawned lane.
 - **Prohibition:** Never run `git worktree add` directly; Zay owns worktree provisioning and lane lifecycle.
+- **Default:** When a task decomposes into two or more substantial, independent subtasks that touch different files, fan them out to workers in one response — start every worker up front, keep making progress on your own part while they run, and fold finished workers back in one at a time. Keep work that is small, tightly coupled, or shares files in the local workspace instead.
 
 ## Lua plugins
 
