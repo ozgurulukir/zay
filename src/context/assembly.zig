@@ -748,52 +748,28 @@ test "assembleSystemPrompt enforces aggregate project rule budget (128 KB)" {
     const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
     defer gpa.free(cwd);
 
-    // Create AGENTS.md (60 KB)
+    // Create AGENTS.md (60 KB).
     {
-        const path = try std.fs.path.join(gpa, &.{ cwd, "AGENTS.md" });
-        defer gpa.free(path);
-        var file = try std.Io.Dir.createFile(.cwd(), io, path, .{ .truncate = true });
-        var buf: [4096]u8 = undefined;
-        var writer = file.writer(io, &buf);
-        const chunk = "A" ** 1024;
-        var written: usize = 0;
-        while (written < 60 * 1024) : (written += chunk.len) {
-            try writer.interface.writeAll(chunk);
-        }
-        try writer.interface.flush();
-        file.close(io);
+        const content = try gpa.alloc(u8, 60 * 1024);
+        defer gpa.free(content);
+        @memset(content, 'A');
+        try writeTestFile(gpa, io, cwd, "AGENTS.md", content);
     }
 
-    // Create .cursorrules (60 KB)
+    // Create .cursorrules (60 KB).
     {
-        const path = try std.fs.path.join(gpa, &.{ cwd, ".cursorrules" });
-        defer gpa.free(path);
-        var file = try std.Io.Dir.createFile(.cwd(), io, path, .{ .truncate = true });
-        var buf: [4096]u8 = undefined;
-        var writer = file.writer(io, &buf);
-        const chunk = "B" ** 1024;
-        var written: usize = 0;
-        while (written < 60 * 1024) : (written += chunk.len) {
-            try writer.interface.writeAll(chunk);
-        }
-        try writer.interface.flush();
-        file.close(io);
+        const content = try gpa.alloc(u8, 60 * 1024);
+        defer gpa.free(content);
+        @memset(content, 'B');
+        try writeTestFile(gpa, io, cwd, ".cursorrules", content);
     }
 
-    // Create CLAUDE.md (20 KB) -> total would be 60 + 60 + 20 = 140 KB > 128 KB
+    // Create CLAUDE.md (20 KB): total would be 140 KB, above the 128 KB cap.
     {
-        const path = try std.fs.path.join(gpa, &.{ cwd, "CLAUDE.md" });
-        defer gpa.free(path);
-        var file = try std.Io.Dir.createFile(.cwd(), io, path, .{ .truncate = true });
-        var buf: [4096]u8 = undefined;
-        var writer = file.writer(io, &buf);
-        const chunk = "C" ** 1024;
-        var written: usize = 0;
-        while (written < 20 * 1024) : (written += chunk.len) {
-            try writer.interface.writeAll(chunk);
-        }
-        try writer.interface.flush();
-        file.close(io);
+        const content = try gpa.alloc(u8, 20 * 1024);
+        defer gpa.free(content);
+        @memset(content, 'C');
+        try writeTestFile(gpa, io, cwd, "CLAUDE.md", content);
     }
 
     const template = "System: ${CWD}";
