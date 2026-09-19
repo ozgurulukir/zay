@@ -24,7 +24,6 @@ const DiffRefreshJob = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     cwd: []u8,
-    done: *std.atomic.Value(bool),
 
     fn deinit(self: *DiffRefreshJob) void {
         self.gpa.free(self.cwd);
@@ -57,11 +56,9 @@ const diffCountCommand =
 
 fn runDiffRefresh(job: *DiffRefreshJob) DiffRefreshOutcome {
     const gpa = job.gpa;
-    const done = job.done;
     defer {
         job.deinit();
         gpa.destroy(job);
-        done.store(true, .release);
     }
 
     var result = bash_mod.runWithOptions(gpa, job.io, .{
@@ -101,13 +98,18 @@ fn installDiffCounts(app: *App, next: DiffCounts) bool {
 }
 
 pub fn scheduleDiffRefresh(app: *App) !void {
+    // The cache a failed refresh must restore (null on a cold load).
+    const prior_cache: ?[]u8 = switch (app.metrics.diff) {
+        .ready => |r| r.cache,
+        .refreshing => |r| r.cache,
+        else => null,
+    };
     switch (app.metrics.diff) {
         .loading, .refreshing => return, // already in flight
         .ready => |r| {
             // Already cached — transition to refreshing, keeping the old cache.
             app.metrics.diff = .{ .refreshing = .{
-                .future = undefined,
-                .done = .init(false),
+                .job = .{},
                 .cache = r.cache,
             } };
         },
@@ -118,23 +120,23 @@ pub fn scheduleDiffRefresh(app: *App) !void {
 
             const job = try app.gpa.create(DiffRefreshJob);
             errdefer app.gpa.destroy(job);
-            app.metrics.diff = .{ .loading = .{
-                .future = undefined,
-                .done = .init(false),
-            } };
             job.* = .{
                 .gpa = app.gpa,
                 .io = app.io,
                 .cwd = cwd,
-                .done = &app.metrics.diff.loading.done,
             };
-            errdefer job.deinit();
-            app.metrics.diff.loading.future = try app.io.concurrent(runDiffRefresh, .{job});
+            app.metrics.diff = .{ .loading = .{ .job = .{} } };
+            // The errdefer chain frees cwd + job exactly once and disarms
+            // the union on spawn failure.
+            errdefer app.metrics.diff = .idle;
+            try app.metrics.diff.loading.job.spawn(app.io, job, runDiffRefresh);
             return;
         },
     }
 
-    // refreshing path — fire off the new future.
+    // refreshing path — fire off the new worker. On spawn failure the
+    // errdefer chain frees cwd + job exactly once and restores the prior
+    // cache state.
     const cwd_source = if (app.liveRuntime()) |runtime| runtime.cwd else ".";
     const cwd = try app.gpa.dupe(u8, cwd_source);
     errdefer app.gpa.free(cwd);
@@ -145,23 +147,24 @@ pub fn scheduleDiffRefresh(app: *App) !void {
         .gpa = app.gpa,
         .io = app.io,
         .cwd = cwd,
-        .done = &app.metrics.diff.refreshing.done,
     };
-    errdefer job.deinit();
-    app.metrics.diff.refreshing.future = try app.io.concurrent(runDiffRefresh, .{job});
+    app.metrics.diff = .{ .refreshing = .{ .job = .{}, .cache = prior_cache.? } };
+    errdefer app.metrics.diff = if (prior_cache) |cache|
+        .{ .ready = .{ .cache = cache } }
+    else
+        .idle;
+    try app.metrics.diff.refreshing.job.spawn(app.io, job, runDiffRefresh);
 }
 
 pub fn cancelDiffRefresh(app: *App) void {
     switch (app.metrics.diff) {
         .loading => |*l| {
-            var future = l.future;
-            var outcome = future.cancel(app.io);
+            var outcome = l.job.cancel(app.io);
             outcome.deinit(app.gpa);
             app.metrics.diff = .idle;
         },
         .refreshing => |*r| {
-            var future = r.future;
-            var outcome = future.cancel(app.io);
+            var outcome = r.job.cancel(app.io);
             outcome.deinit(app.gpa);
             // Keep the old cache — promote back to ready.
             app.metrics.diff = .{ .ready = .{ .cache = r.cache } };
@@ -173,14 +176,14 @@ pub fn cancelDiffRefresh(app: *App) void {
 pub fn drainDiffRefresh(app: *App) !bool {
     // Only loading/refreshing states can drain.
     switch (app.metrics.diff) {
-        .loading => |*l| if (!l.done.load(.acquire)) return false,
-        .refreshing => |*r| if (!r.done.load(.acquire)) return false,
+        .loading => |*l| if (!l.job.isDone()) return false,
+        .refreshing => |*r| if (!r.job.isDone()) return false,
         else => return false,
     }
 
     var outcome = switch (app.metrics.diff) {
-        .loading => |*l| l.future.await(app.io),
-        .refreshing => |*r| r.future.await(app.io),
+        .loading => |*l| l.job.adopt(app.io),
+        .refreshing => |*r| r.job.adopt(app.io),
         else => unreachable,
     };
     defer outcome.deinit(app.gpa);
@@ -271,7 +274,7 @@ pub fn openDiffViewer(app: *App) !void {
     // Cold start: show the loading state and kick (or ride) a refresh.
     app.diff.deinit(app.gpa);
     app.diff = .{};
-    if (app.metrics.diff_refresh_future() == null) try scheduleDiffRefresh(app);
+    if (!app.metrics.diff_loading()) try scheduleDiffRefresh(app);
 }
 
 pub fn enterDiffMode(app: *App) void {

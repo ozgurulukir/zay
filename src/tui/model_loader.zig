@@ -115,9 +115,6 @@ pub const Job = struct {
     /// worker probes, so borrows of session memory across the thread
     /// boundary are forbidden. Empty when no live session exists.
     session_id: []u8 = &.{},
-    /// Set to `true` immediately before the worker returns, so the main
-    /// thread can non-blockingly poll for completion without awaiting.
-    done: *std.atomic.Value(bool),
 
     fn deinit(self: *Job) void {
         for (self.configured) |c| {
@@ -133,16 +130,14 @@ pub const Job = struct {
     }
 };
 
-/// Worker entry point for `io.concurrent`. Owns `job` — frees it (and the
-/// strings it carries) on exit. Flips `job.done` to `true` immediately
-/// before returning so the main loop knows it can `await` without blocking.
+/// Worker entry point for `Job(Outcome).spawn`. Owns `job` — frees it (and
+/// the strings it carries) on exit. The completion flag is stored by the
+/// Job wrapper (done LAST) after this returns.
 pub fn run(job: *Job) Outcome {
     const gpa = job.gpa;
-    const done = job.done;
     defer {
         job.deinit();
         gpa.destroy(job);
-        done.store(true, .release);
     }
 
     var result: Result = .{ .gpa = gpa };

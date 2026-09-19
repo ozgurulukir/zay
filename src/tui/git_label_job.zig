@@ -1,67 +1,31 @@
-//! Background worker for the status-bar git repository/branch label.
+//! Worker for the status-bar git repository/branch label.
 //!
-//! Git is intentionally kept out of the UI tick. The worker owns its cwd copy
-//! and publishes the completed label through a release/acquire flag; the UI
-//! adopts or discards that result during a later tick.
+//! Git is intentionally kept out of the UI tick. The heap-allocated worker
+//! owns its cwd copy; `Job(?[]const u8).spawn` arms it through
+//! `lifecycle.zig`'s `GitLabelArm`, and the worker frees nothing — the
+//! adopting tick frees the returned label and the worker afterwards.
 
 const std = @import("std");
 const diff_utils = @import("diff_utils.zig");
+const job_mod = @import("job.zig");
 
-pub const Job = struct {
+/// Worker context, heap-allocated by the arming tick and freed by the
+/// draining tick (after the label it produced has been adopted).
+pub const Worker = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     cwd: []u8,
+};
+
+/// Git failures degrade to "no label" — the status bar shows the bare lane.
+pub fn run(worker: *Worker) ?[]const u8 {
+    return diff_utils.loadGitLabel(worker.gpa, worker.io, worker.cwd) catch null;
+}
+
+/// The armed label job as an App field: the Job plus the generation tag the
+/// drain checks so a result from a superseded lane/session is discarded.
+pub const Arm = struct {
+    job: job_mod.Job(?[]const u8),
+    worker: *Worker,
     generation: u64,
-    done: std.atomic.Value(bool) = .init(false),
-    label: ?[]const u8 = null,
-    thread: ?std.Thread = null,
-
-    pub fn start(
-        gpa: std.mem.Allocator,
-        io: std.Io,
-        cwd: []const u8,
-        generation: u64,
-    ) !*Job {
-        std.debug.assert(cwd.len > 0);
-
-        const job = try gpa.create(Job);
-        errdefer gpa.destroy(job);
-        const owned_cwd = try gpa.dupe(u8, cwd);
-        errdefer gpa.free(owned_cwd);
-
-        job.* = .{
-            .gpa = gpa,
-            .io = io,
-            .cwd = owned_cwd,
-            .generation = generation,
-        };
-        job.thread = try std.Thread.spawn(.{}, runWorker, .{job});
-        return job;
-    }
-
-    fn runWorker(job: *Job) void {
-        const label = diff_utils.loadGitLabel(job.gpa, job.io, job.cwd) catch "";
-        if (label.len > 0) {
-            job.label = label;
-        }
-        job.done.store(true, .release);
-    }
-
-    pub fn isDone(self: *const Job) bool {
-        return self.done.load(.acquire);
-    }
-
-    pub fn takeLabel(self: *Job) ?[]const u8 {
-        std.debug.assert(self.done.load(.acquire));
-        const label = self.label;
-        self.label = null;
-        return label;
-    }
-
-    pub fn deinit(self: *Job) void {
-        if (self.thread) |thread| thread.join();
-        if (self.label) |label| self.gpa.free(label);
-        self.gpa.free(self.cwd);
-        self.gpa.destroy(self);
-    }
 };

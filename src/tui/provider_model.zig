@@ -301,16 +301,6 @@ pub fn startModelLoad(self: *App, catalog: ModelCatalog, merge: bool) !void {
         if (configured.len > 0) self.gpa.free(configured);
     }
 
-    // Transition load to .loading. The job captures the address of the
-    // union's `done` field; the union must stay in .loading (no other
-    // writes to load) until drainModelLoad moves it out.
-    self.pickers.models.load = .{
-        .loading = .{
-            .future = undefined, // set below
-            .done = .init(false),
-            .merge = merge,
-        },
-    };
     job.* = .{
         .gpa = self.gpa,
         .io = self.io,
@@ -322,7 +312,16 @@ pub fn startModelLoad(self: *App, catalog: ModelCatalog, merge: bool) !void {
         .include_locals = catalog == .connected_provider,
         .codex_signed_in = self.isCodexSignedIn(),
         .session_id = try ownedSessionId(self),
-        .done = &self.pickers.models.load.loading.done,
+    };
+    // Arm LAST — after the last fallible step — so a failure never wedges a
+    // `.loading` state with a disarmed job (drainModelLoad would spin the
+    // tick and teardown would join an undefined future). Job.spawn captures
+    // the arm's address; the union stays in .loading until drainModelLoad.
+    self.pickers.models.load = .{
+        .loading = .{
+            .job = .{},
+            .merge = merge,
+        },
     };
     try model_loader_job.spawnLoadFuture(self, job);
 }
@@ -551,14 +550,27 @@ pub fn connectCodex(self: *App) !void {
     const runtime = self.liveRuntime() orelse return error.NoActiveRuntime;
     if (runtime.home_dir.len == 0) return error.NoActiveRuntime;
 
-    const job = try codex_login_job.Job.start(
-        self.gpa,
-        self.io,
-        runtime.home_dir,
-        self.thread.generation,
-        activeSessionId(self),
-    );
-    self.codex_login_job = job;
+    const home_dir = try self.gpa.dupe(u8, runtime.home_dir);
+    errdefer self.gpa.free(home_dir);
+    const session = activeSessionId(self);
+    const session_id: []u8 = if (session.len == 0) &.{} else try self.gpa.dupe(u8, session);
+    errdefer if (session_id.len > 0) self.gpa.free(session_id);
+
+    // Arm the App field first — Job.spawn captures the arm's address — then
+    // spawn. On spawn failure the two errdefers above free the arm's
+    // allocations exactly once (the field is simply dropped).
+    self.codex_login_job = .{
+        .job = .{},
+        .gpa = self.gpa,
+        .io = self.io,
+        .home_dir = home_dir,
+        .generation = self.thread.generation,
+        .session_id = session_id,
+    };
+    self.codex_login_job.?.job.spawn(self.io, &self.codex_login_job.?, codex_login_job.runLogin) catch |err| {
+        self.codex_login_job = null;
+        return err;
+    };
     self.mode = .normal;
     self.clearInput();
     _ = self.thread.transcript.append(
@@ -574,26 +586,31 @@ pub fn codexLoginActive(self: *const App) bool {
 }
 
 pub fn cancelCodexLogin(self: *App) void {
-    if (self.codex_login_job) |job| {
+    if (self.codex_login_job) |*login| {
+        // Ask the OAuth worker to unwind, then join it; the outcome (if any)
+        // is discarded — a cancelled login never connects.
+        login.cancel_requested.store(true, .release);
+        var outcome = login.job.cancel(self.io);
+        outcome.deinit(self.gpa);
+        codex_login_job.deinitArm(login);
         self.codex_login_job = null;
-        job.deinit();
     }
 }
 
 /// Apply a completed browser login on the UI thread. The worker result is
 /// ignored if the user switched lanes or sessions while the browser was open.
 pub fn drainCodexLogin(self: *App) !bool {
-    const job = self.codex_login_job orelse return false;
-    if (!job.isDone()) return false;
+    const login = &(self.codex_login_job orelse return false);
+    if (!login.job.isDone()) return false;
     // Provider-picker opening starts a background model sweep. Let that result
     // land before replacing the catalogue with Codex models; otherwise a late
     // provider result could clear the freshly installed Codex entries.
     if (self.pickers.models.load == .loading) return false;
 
-    const target_matches = codexLoginTargetMatches(self, job);
-    var outcome = job.takeOutcome();
+    const target_matches = codexLoginTargetMatches(self, login);
+    var outcome = login.job.adopt(self.io);
+    codex_login_job.deinitArm(login);
     self.codex_login_job = null;
-    job.deinit();
     defer outcome.deinit(self.gpa);
 
     if (!target_matches) return false;
@@ -608,10 +625,10 @@ pub fn drainCodexLogin(self: *App) !bool {
     return true;
 }
 
-fn codexLoginTargetMatches(self: *const App, job: *const codex_login_job.Job) bool {
-    if (self.thread.generation != job.generation) return false;
-    if (job.session_id.len == 0) return true;
-    return std.mem.eql(u8, activeSessionId(self), job.session_id);
+fn codexLoginTargetMatches(self: *const App, login: *const codex_login_job.CodexLoginJob) bool {
+    if (self.thread.generation != login.generation) return false;
+    if (login.session_id.len == 0) return true;
+    return std.mem.eql(u8, activeSessionId(self), login.session_id);
 }
 
 fn finishCodexConnection(self: *App, credentials: codex.Credentials) !void {
@@ -924,10 +941,19 @@ pub fn startOpenAiCompatibleModelLoad(
     const job = try self.gpa.create(model_loader.Job);
     errdefer self.gpa.destroy(job);
 
+    job.* = .{
+        .gpa = self.gpa,
+        .io = self.io,
+        .catalog = .single_provider,
+        .configured = configured,
+        .include_locals = false,
+        .codex_signed_in = false,
+        .session_id = try ownedSessionId(self),
+    };
+    // Arm LAST — see the connected-provider path above.
     self.pickers.models.load = .{
         .loading = .{
-            .future = undefined,
-            .done = .init(false),
+            .job = .{},
             // `merge = true`: mevcut kataloğu korur ve yeni provider'ın
             // modellerini ekler (sadece aynı conn'a ait eski entry'ler drop edilip
             // yenilenir — bkz. `installModelLoadResult`). Önceki `merge = false`
@@ -937,16 +963,6 @@ pub fn startOpenAiCompatibleModelLoad(
             // kullanır — bu onunla tutarlılık sağlar.
             .merge = true,
         },
-    };
-    job.* = .{
-        .gpa = self.gpa,
-        .io = self.io,
-        .catalog = .single_provider,
-        .configured = configured,
-        .include_locals = false,
-        .codex_signed_in = false,
-        .session_id = try ownedSessionId(self),
-        .done = &self.pickers.models.load.loading.done,
     };
     try model_loader_job.spawnLoadFuture(self, job);
 }
@@ -980,11 +996,6 @@ pub fn startProviderModelLoad(self: *App, provider: config_mod.Provider, key: []
     errdefer ai.provider_headers.freeHeaders(self.gpa, headers);
     configured[0] = .{ .provider = provider, .base_url = base_url, .api_key = api_key, .headers = headers };
 
-    self.pickers.models.load = .{ .loading = .{
-        .future = undefined,
-        .done = .init(false),
-        .merge = true,
-    } };
     job.* = .{
         .gpa = self.gpa,
         .io = self.io,
@@ -993,8 +1004,12 @@ pub fn startProviderModelLoad(self: *App, provider: config_mod.Provider, key: []
         .include_locals = false,
         .codex_signed_in = self.isCodexSignedIn(),
         .session_id = try ownedSessionId(self),
-        .done = &self.pickers.models.load.loading.done,
     };
+    // Arm LAST — see the connected-provider path above.
+    self.pickers.models.load = .{ .loading = .{
+        .job = .{},
+        .merge = true,
+    } };
     try model_loader_job.spawnLoadFuture(self, job);
 }
 
