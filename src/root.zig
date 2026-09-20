@@ -505,6 +505,9 @@ test {
     // Shared `@`/`$` sigil-token scanner leaf (extracted from at_mention.zig
     // and skill.zig); referenced explicitly so its inline tests run.
     _ = @import("sigil_query.zig");
+    // Mention parsing and message-assembly tests live outside the production
+    // module; reference them directly so their test declarations are analyzed.
+    _ = @import("at_mention_tests.zig");
     _ = @import("agent/compactor.zig");
     _ = @import("auth/keyring.zig");
     _ = @import("config/provider.zig");
