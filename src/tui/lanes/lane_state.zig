@@ -9,6 +9,8 @@ const tui = @import("../../tui.zig");
 const App = tui.App;
 const Thread = tui.Thread;
 const max_threads = tui.max_threads;
+const lanes_util = @import("../lanes.zig");
+const lane_recovery = @import("recovery.zig");
 const branch_naming = @import("branch_naming.zig");
 const merge_flow = @import("merge_flow.zig");
 
@@ -97,6 +99,14 @@ pub fn closeActiveLane(app: *App) !void {
 
     const lane = app.threads.slice()[index];
     try merge_flow.clearWorkspaceBorrows(app, lane);
+    // The worktree SURVIVES /close (the lane becomes a parked worktree), so
+    // the manifest row flips to parked rather than being deleted — a crash
+    // after /close must not resurrect the deliberately closed lane. Flip
+    // BEFORE teardown: the lane's strings are still alive here (a borrow
+    // past `lane.deinit` would dangle), and a crash in the teardown window
+    // then leaves row-parked + worktree-on-disk — the correct outcome for a
+    // lane that was being closed.
+    if (lanes_util.workingLaneOf(lane)) |w| lane_recovery.syncLaneParked(app, w.path);
     branch_naming.cancelLaneNaming(app, lane);
     app.thread = app.threads.slice()[index - 1];
     merge_flow.discardUndeliveredCompletion(app, lane);

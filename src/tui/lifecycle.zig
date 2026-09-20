@@ -20,6 +20,7 @@ const registry_job = @import("registry_job.zig");
 const diff_lifecycle = @import("diff_lifecycle.zig");
 const compaction_lifecycle = @import("compaction_lifecycle.zig");
 const lane_lifecycle = @import("lane_lifecycle.zig");
+const lane_recovery = @import("lanes/recovery.zig");
 const turn_lifecycle = @import("turn_lifecycle.zig");
 const toast = @import("toast.zig");
 const git_label_job = @import("git_label_job.zig");
@@ -583,6 +584,8 @@ pub fn createParallelLane(self: *App) !void {
     _ = self.assignLaneGeneration(lane);
     try self.threads.append(lane);
     std.debug.assert(self.threads.len() <= max_threads);
+    // Committed: record the lane for crash recovery (best-effort).
+    lane_recovery.syncLaneOpened(self, lane);
 
     // Committed: `threads` owns `lane`, which owns `runtime`/`branch`/`dest`.
     // In `.dual` the driver (lane 0) is always the left pane and input routing

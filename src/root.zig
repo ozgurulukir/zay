@@ -37,6 +37,7 @@ pub const lua = @import("lua/root.zig");
 pub const lua_test_runner = @import("lua/test_runner.zig");
 pub const tui = @import("tui.zig");
 pub const thread = @import("tui/thread.zig");
+pub const lane_recovery = @import("tui/lanes/recovery.zig");
 pub const toast = @import("tui/toast.zig");
 
 /// Build-time version, embedded from the git tag via `-Dversion` in build.zig
@@ -137,29 +138,67 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     // moment no session can be mid-read of a previous process's output.
     bash.pruneStaleTempFiles(init.io, gpa, bash.temp_retention_ns);
 
+    // Crash-recovery marker protocol: a marker with this repo's key already
+    // on disk means the previous run in THIS repo died hard (segfault, abort,
+    // kill — anything that skips defers). (Re)arm it for this run; the
+    // deferred delete below runs on any normal unwind, so a hard crash is
+    // exactly what leaves the marker behind. This defer is registered BEFORE
+    // the hygiene join defer, so the claimed lanes/keep-names it guards are
+    // freed only AFTER the hygiene thread is joined (LIFO discipline, same
+    // class as the borrowed `home_dir`/`cwd` buffers).
+    const crashed_before = lane_recovery.markStartup(runtime_gpa, init.io, home_dir, cwd);
+    defer lane_recovery.removeStartupMarker(runtime_gpa, init.io, home_dir, cwd);
+
+    // Claim crash-recovery targets BEFORE the hygiene thread spawns, so the
+    // claimed worktree directory names become the GC keep-set — the 7-day
+    // TTL must never delete a worktree this launch is about to restore.
+    // Crash-path-only cost: one sqlite read + one `git worktree list`. The
+    // keep names live in a FIXED buffer (claims are capped at the grid's
+    // worker capacity) and borrow `recovered`'s strings, so no allocation
+    // can fail here and the free below must stay ordered AFTER the hygiene
+    // join defer (LIFO).
+    var recovered: ?[]lane_recovery.RecoveredLane = null;
+    var gc_keep_names: [lane_recovery.restore_lane_cap][]const u8 = undefined;
+    var gc_keep_count: usize = 0;
+    if (crashed_before) {
+        recovered = lane_recovery.claimRecoveredLanes(runtime_gpa, init.io, home_dir, cwd);
+        if (recovered) |lanes| {
+            for (lanes) |lane| {
+                if (gc_keep_count == gc_keep_names.len) break;
+                gc_keep_names[gc_keep_count] = std.fs.path.basename(lane.path);
+                gc_keep_count += 1;
+            }
+        }
+    }
+    defer if (recovered) |lanes| lane_recovery.freeRecovered(runtime_gpa, lanes);
+    const gc_keep: []const []const u8 = gc_keep_names[0..gc_keep_count];
+
     // Worktree hygiene runs OFF the startup critical path: `git worktree
     // prune` is a blocking subprocess (tens of ms on Windows, worse on a
     // cold git), and the 7-day TTL tolerates deferral by design — nothing
     // before the first frame reads its result. The thread borrows
-    // `home_dir`/`cwd`; the join defer is registered after their free
-    // defers, so it runs FIRST on return and the thread is always joined
-    // before its borrowed buffers die. On spawn failure run it inline —
-    // skipping hygiene entirely would let orphaned checkouts and stale git
-    // metadata accumulate for the whole session.
+    // `home_dir`/`cwd`/`gc_keep`; the join defer is registered after their
+    // free defers, so it runs FIRST on return and the thread is always
+    // joined before its borrowed buffers die. On spawn failure run it
+    // inline — skipping hygiene entirely would let orphaned checkouts and
+    // stale git metadata accumulate for the whole session.
     const hygiene_thread: ?std.Thread = blk: {
-        const t = std.Thread.spawn(.{}, runWorktreeHygiene, .{ gpa, init.io, home_dir, cwd }) catch {
-            runWorktreeHygiene(gpa, init.io, home_dir, cwd);
+        const t = std.Thread.spawn(.{}, runWorktreeHygiene, .{ gpa, init.io, home_dir, cwd, gc_keep }) catch {
+            runWorktreeHygiene(gpa, init.io, home_dir, cwd, gc_keep);
             break :blk null;
         };
         break :blk t;
     };
     defer if (hygiene_thread) |t| t.join();
 
-    // Auto-resume: find the most recently updated session for this cwd.
+    // Auto-resume: the driver's pinned session when it still resolves, else
+    // the most recently updated session for this cwd. The pin exists because
+    // lane sessions share the driver's cwd — a lane that wrote entries after
+    // the driver's last message used to hijack auto-resume via findLatest.
     const resume_session_id = blk: {
         var manager = session.SessionManager.initDefault(runtime_gpa, init.io, home_dir) catch break :blk null;
         defer manager.deinit();
-        const id = manager.findLatest(runtime_gpa, cwd) catch null;
+        const id = lane_recovery.resolveStartupResumeId(runtime_gpa, &manager, cwd) catch null;
         break :blk id;
     };
     if (resume_session_id) |id| {
@@ -201,15 +240,28 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     }
     load_result.config.deinit(gpa);
 
-    try tui.run(init, agent_runtime, tui_config, tui_gpa);
+    // Record this run's driver session so the NEXT launch resumes it. The
+    // session row is already inserted synchronously by initSession; the pin
+    // is kept fresh mid-run by installRuntime (via recovery.syncDriverPin).
+    lane_recovery.recordStartupDriverPin(runtime_gpa, init.io, home_dir, cwd, &agent_runtime.session_writer);
+
+    try tui.run(init, agent_runtime, tui_config, tui_gpa, recovered);
+
+    // Clean exit: park every still-'open' manifest row, so `state='open'`
+    // later can only mean "open when the crash hit" — never a lane from an
+    // older, cleanly-finished run. Best-effort.
+    session.lane_manifest.parkAllOpenBestEffort(runtime_gpa, init.io, home_dir, cwd);
 }
 
-/// Worktree hygiene: drop orphaned worktree checkouts (> 7 days) and sync
-/// git metadata in the current workspace. Fire-and-forget — every step is
-/// already best-effort, so the caller only decides WHERE it runs (background
-/// thread during startup, inline when the thread cannot spawn).
-fn runWorktreeHygiene(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, cwd: []const u8) void {
-    vcs.gcOrphanedWorktrees(gpa, io, home_dir, vcs.worktree_retention_ns);
+/// Worktree hygiene: drop orphaned worktree checkouts (> 7 days, except the
+/// GC keep-list of claimed crash-recovery targets) and sync git metadata in
+/// the current workspace. Fire-and-forget — every step is already
+/// best-effort, so the caller only decides WHERE it runs (background thread
+/// during startup, inline when the thread cannot spawn). `keep` lists
+/// worktree DIRECTORY NAMES borrowed from `recovered` in `run` — the caller
+/// joins this thread before freeing them.
+fn runWorktreeHygiene(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, cwd: []const u8, keep: []const []const u8) void {
+    vcs.gcOrphanedWorktrees(gpa, io, home_dir, vcs.worktree_retention_ns, if (keep.len > 0) keep else null);
     if (vcs.isRepo(gpa, io, cwd)) {
         vcs.worktreePrune(gpa, io, cwd) catch |err| {
             log.warn("vcs.startup_prune.failed err={s}", .{@errorName(err)});
@@ -305,7 +357,7 @@ test "runWorktreeHygiene: empty home and missing cwd are safe no-ops" {
     // missing cwd makes the `git rev-parse` probe fail closed (isRepo ->
     // false), so worktreePrune never spawns — the startup thread body's idle
     // path is fully hermetic here (crash + leak coverage, no git effects).
-    runWorktreeHygiene(gpa, std.testing.io, "", "zay-hygiene-nonexistent-dir");
+    runWorktreeHygiene(gpa, std.testing.io, "", "zay-hygiene-nonexistent-dir", &.{});
 }
 
 test "resolveHome: platform-canonical var wins, relative rejected" {
@@ -396,6 +448,11 @@ test {
     // only referenced lazily — e.g. `pub const tests` on `tui.zig` — is never
     // analyzed, and its tests silently never run).
     _ = @import("tui/tests.zig");
+    // Lane crash recovery: the manifest storage leaf and the recovery
+    // orchestration own inline tests; referenced here per the
+    // silent-test-discovery rule.
+    _ = @import("session/lane_manifest.zig");
+    _ = @import("tui/lanes/recovery.zig");
     _ = @import("tui/bounded_list.zig");
     _ = @import("tui/style.zig");
     _ = @import("tui/widgets/status_bar.zig");

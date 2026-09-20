@@ -455,16 +455,25 @@ test "globalWorktreesDir: resolves under the platform config dir" {
 /// Scans the global worktrees directory and deletes abandoned worktree checkouts
 /// older than `max_age_ns`. Startup hygiene — runs on a background thread while
 /// the TUI initializes (joined before `run` returns), never on the UI thread.
-pub fn gcOrphanedWorktrees(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, max_age_ns: u64) void {
+pub fn gcOrphanedWorktrees(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    home_dir: []const u8,
+    max_age_ns: u64,
+    keep: ?[]const []const u8,
+) void {
     if (home_dir.len == 0) return;
     const parent = globalWorktreesDir(gpa, home_dir) catch return;
     defer gpa.free(parent);
-    gcWorktreesDir(io, parent, max_age_ns);
+    gcWorktreesDir(io, parent, max_age_ns, keep);
 }
 
 /// Directory-parameterized core of `gcOrphanedWorktrees` so unit tests can
-/// target a scratch directory.
-pub fn gcWorktreesDir(io: std.Io, dir_path: []const u8, max_age_ns: u64) void {
+/// target a scratch directory. `keep` lists worktree DIRECTORY NAMES that are
+/// claimed by live manifest rows (crash-recovery targets) — they are skipped
+/// regardless of age, so the 7-day TTL can never delete a worktree a
+/// recovery is about to restore.
+pub fn gcWorktreesDir(io: std.Io, dir_path: []const u8, max_age_ns: u64, keep: ?[]const []const u8) void {
     var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return;
     defer dir.close(io);
 
@@ -472,6 +481,7 @@ pub fn gcWorktreesDir(io: std.Io, dir_path: []const u8, max_age_ns: u64) void {
     var iter = dir.iterate();
     while (iter.next(io) catch null) |entry| {
         if (entry.kind != .directory) continue;
+        if (worktreeNameKept(keep, entry.name)) continue;
         const st = dir.statFile(io, entry.name, .{}) catch continue;
         const age_ns = st.mtime.durationTo(now).nanoseconds;
         if (age_ns > 0 and @as(u128, @intCast(age_ns)) > max_age_ns) {
@@ -479,6 +489,16 @@ pub fn gcWorktreesDir(io: std.Io, dir_path: []const u8, max_age_ns: u64) void {
             log.info("vcs.gc: pruned orphaned worktree {s}", .{entry.name});
         }
     }
+}
+
+/// True when `name` is in the GC skip-list. Case-insensitive: worktree ids
+/// are lowercase hex, but Windows directory reads can surface any case.
+fn worktreeNameKept(keep: ?[]const []const u8, name: []const u8) bool {
+    const names = keep orelse return false;
+    for (names) |kept| {
+        if (std.ascii.eqlIgnoreCase(kept, name)) return true;
+    }
+    return false;
 }
 
 /// Prune working tree metadata in `.git/worktrees`. Uses `--expire now` so
@@ -907,14 +927,49 @@ test "gcWorktreesDir prunes old directories and leaves recent directories untouc
     try std.Io.Dir.cwd().createDirPath(io, stale);
 
     // Running GC with a huge retention window (7 days) leaves both untouched
-    gcWorktreesDir(io, parent_dir, worktree_retention_ns);
+    gcWorktreesDir(io, parent_dir, worktree_retention_ns, null);
     try std.Io.Dir.accessAbsolute(io, recent, .{});
     try std.Io.Dir.accessAbsolute(io, stale, .{});
 
     // Running GC with 0 max_age prunes both
-    gcWorktreesDir(io, parent_dir, 0);
+    gcWorktreesDir(io, parent_dir, 0, null);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, recent, .{}));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, stale, .{}));
+}
+
+test "gcWorktreesDir skips the keep-list regardless of age" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var rand: [8]u8 = undefined;
+    io.random(&rand);
+    const hex = std.fmt.bytesToHex(rand, .lower);
+    const name = try std.fmt.allocPrint(gpa, "zay-vcsgck-{s}", .{hex[0..]});
+    defer gpa.free(name);
+
+    try std.Io.Dir.cwd().createDirPath(io, name);
+    defer std.Io.Dir.cwd().deleteTree(io, name) catch {};
+
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const parent_dir = try std.fs.path.join(gpa, &.{ cwd, name });
+    defer gpa.free(parent_dir);
+
+    // Two stale directories: one claimed (kept), one unclaimed (pruned).
+    const claimed = try std.fs.path.join(gpa, &.{ parent_dir, "claimed-wt" });
+    defer gpa.free(claimed);
+    try std.Io.Dir.cwd().createDirPath(io, claimed);
+
+    const unclaimed = try std.fs.path.join(gpa, &.{ parent_dir, "unclaimed-wt" });
+    defer gpa.free(unclaimed);
+    try std.Io.Dir.cwd().createDirPath(io, unclaimed);
+
+    // A keep-list hit must be case-insensitive (worktree ids are lowercase
+    // hex, but Windows directory entries can surface any case).
+    const keep = [_][]const u8{ "CLAIMED-WT", "other-wt" };
+    gcWorktreesDir(io, parent_dir, 0, &keep);
+    try std.Io.Dir.accessAbsolute(io, claimed, .{});
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, unclaimed, .{}));
 }
 
 fn expectOk(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, args: []const []const u8) !void {

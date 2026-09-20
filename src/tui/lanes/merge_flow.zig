@@ -12,6 +12,7 @@ const command_router = @import("../command_router.zig");
 const vaxis = @import("vaxis");
 const worktree_job = @import("worktree_job.zig");
 const branch_naming = @import("branch_naming.zig");
+const lane_recovery = @import("recovery.zig");
 
 const App = tui.App;
 const Thread = tui.Thread;
@@ -104,7 +105,9 @@ pub fn clearLanesState(app: *App) void {
 
 pub fn laneEntryCount(app: *const App) u32 {
     return switch (app.nav.lanes_purpose) {
-        .manage => @intCast(app.parked_lanes.len),
+        // Parked worktrees first, then open-but-idle working lanes (the
+        // `o` open action's targets) — must match buildLaneEntries' walk.
+        .manage => @intCast(app.parked_lanes.len + lane_recovery.countOpenIdleLanes(app)),
         .merge_dest => @intCast(app.merge_dest_indices.len),
     };
 }
@@ -112,9 +115,20 @@ pub fn laneEntryCount(app: *const App) u32 {
 pub fn buildLaneEntries(app: *App, arena: std.mem.Allocator) ![]lanes_picker.Entry {
     switch (app.nav.lanes_purpose) {
         .manage => {
-            const out = try arena.alloc(lanes_picker.Entry, app.parked_lanes.len);
+            // Parked worktrees first, then open-but-idle working lanes —
+            // crash-restored lanes and rested workers the user can re-open
+            // with `o`. Same walk as laneEntryCount/countOpenIdleLanes.
+            const out = try arena.alloc(lanes_picker.Entry, app.parked_lanes.len + lane_recovery.countOpenIdleLanes(app));
             for (app.parked_lanes, 0..) |entry, i| {
                 out[i] = .{ .title = entry.branch, .subtitle = entry.path };
+            }
+            var i: usize = app.parked_lanes.len;
+            for (app.threads.slice(), 0..) |lane, ti| {
+                if (ti == 0) continue; // driver
+                if (lane.engine != .idle) continue;
+                const w = lanes_util.workingLaneOf(lane) orelse continue;
+                out[i] = .{ .title = lane.title orelse w.branch, .subtitle = w.path };
+                i += 1;
             }
             return out;
         },
