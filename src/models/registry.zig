@@ -386,6 +386,8 @@ pub fn buildRegistry(gpa: std.mem.Allocator, builtins: []const Provider, remote_
     errdefer provider_map.deinit(gpa);
     try provider_map.ensureTotalCapacity(gpa, @intCast(unresolved.items.len));
 
+    // Map keys borrow from `strings`; do not append after this point.
+    const provider_key_storage = strings.items;
     for (unresolved.items, 0..) |item, i| {
         providers[i] = item.resolve(strings.items);
         provider_map.putAssumeCapacity(providers[i].id, providers[i]);
@@ -400,6 +402,8 @@ pub fn buildRegistry(gpa: std.mem.Allocator, builtins: []const Provider, remote_
         break :blk m;
     } else &.{};
 
+    std.debug.assert(strings.items.len == provider_key_storage.len);
+    std.debug.assert(strings.items.ptr == provider_key_storage.ptr);
     return .{
         .providers = providers,
         .provider_map = provider_map,
@@ -618,6 +622,8 @@ pub fn parseModelsDevJson(gpa: std.mem.Allocator, bytes: []const u8) !Registry {
     errdefer provider_map.deinit(gpa);
     try provider_map.ensureTotalCapacity(gpa, @intCast(unresolved.items.len));
 
+    // Map keys borrow from `strings`; do not append after this point.
+    const provider_key_storage = strings.items;
     for (unresolved.items, 0..) |item, i| {
         providers[i] = item.resolve(strings.items);
         provider_map.putAssumeCapacity(providers[i].id, providers[i]);
@@ -632,6 +638,8 @@ pub fn parseModelsDevJson(gpa: std.mem.Allocator, bytes: []const u8) !Registry {
         break :blk m;
     } else &.{};
 
+    std.debug.assert(strings.items.len == provider_key_storage.len);
+    std.debug.assert(strings.items.ptr == provider_key_storage.ptr);
     return .{
         .providers = providers,
         .provider_map = provider_map,
