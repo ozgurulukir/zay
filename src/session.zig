@@ -24,6 +24,7 @@ const EntryQueue = session_type.EntryQueue;
 pub const QueuedEntry = session_type.QueuedEntry;
 pub const CreateOptions = session_type.CreateOptions;
 pub const SessionSummary = session_type.SessionSummary;
+pub const lane_manifest = @import("session/lane_manifest.zig");
 pub const EntryRecord = session_type.EntryRecord;
 pub const UserEntryRef = session_type.UserEntryRef;
 pub const CompactionBoundary = session_type.CompactionBoundary;
@@ -1445,4 +1446,12 @@ test "renameSession updates the title" {
         try std.testing.expect(summaries[0].title != null);
         try std.testing.expectEqualStrings("My Renamed Session", summaries[0].title.?);
     }
+}
+
+test {
+    // Silent-drop guard (AGENTS.md §Test runner quirks): the `lane_manifest`
+    // re-export above is never analyzed by itself — root.zig's refAllDecls
+    // only reaches one level down — so without this reference the module's
+    // inline storage tests silently vanish from `zig build test`.
+    _ = lane_manifest;
 }

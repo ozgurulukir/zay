@@ -7,6 +7,7 @@ const std = @import("std");
 const tui = @import("../../tui.zig");
 const naming_mod = @import("../naming.zig");
 const vcs = @import("../../vcs.zig");
+const lane_recovery = @import("recovery.zig");
 
 const App = tui.App;
 const Thread = tui.Thread;
@@ -44,6 +45,9 @@ pub fn renameLaneBranch(app: *App, lane: *Thread, slug: []const u8) !bool {
     // The lane's label is its branch from here on.
     if (lane.title) |old| app.gpa.free(old);
     lane.title = title;
+    // Keep the manifest's title in step (best-effort) — it is what a
+    // crash-restored lane shows before anything re-derives a label.
+    lane_recovery.syncLaneUpdated(app, lane);
     return true;
 }
 

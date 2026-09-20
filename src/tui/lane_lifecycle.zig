@@ -11,6 +11,7 @@ const agent_mod = @import("../agent.zig");
 const agent_worker = @import("agent_worker.zig");
 const lane_bridge = tui.lane_bridge_mod;
 const lanes_util = @import("lanes.zig");
+const lane_recovery = @import("lanes/recovery.zig");
 const turn_lifecycle = @import("turn_lifecycle.zig");
 const lanes_picker = @import("widgets/lanes_picker.zig");
 const lifecycle = @import("lifecycle.zig");
@@ -434,6 +435,8 @@ fn createLane(app: *App, req: *const lane_bridge.Request) ?Resp {
         app.gpa.destroy(lane);
         return failResp(app.gpa, "lane: out of memory\n", .{});
     };
+    // Committed: record the lane for crash recovery (best-effort).
+    lane_recovery.syncLaneOpened(app, lane);
     // Defensive: if the configured mode is `.dual`, enter it through
     // `enterDual` so `app.thread` is re-rooted to the driver (the new lane is
     // created but not necessarily focused).
@@ -574,7 +577,7 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
         // add a new Thread, so the cap check is skipped here (the lane
         // is already in the grid).
 
-        wakeIdleLane(app, target, repo, context) catch |err| {
+        wakeIdleLane(app, target, repo, context, null) catch |err| {
             // `context` is still caller-owned on failure — `wakeIdleLane`
             // only adopts it on success.
             freeLaneContext(app.gpa, context);
@@ -742,6 +745,8 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
         app.gpa.destroy(lane);
         return failResp(app.gpa, "lane: out of memory\n", .{});
     };
+    // Committed: record the lane for crash recovery (best-effort).
+    lane_recovery.syncLaneOpened(app, lane);
     // Defensive: if the configured mode is `.dual`, enter it through
     // `enterDual` so `app.thread` is re-rooted to the driver.
     const configured = app.cached_config.tui.split_mode;
@@ -824,15 +829,19 @@ fn removeFailedSpawn(app: *App, lane: *Thread) void {
 /// the lane's worktree+branch (already owned via `engine.idle.working`) —
 /// no new worktree is created. Mirrors `spawnLane`'s runtime wiring (lines
 /// 916-930) but mutates the `Thread` in place instead of creating a new one
-/// (TD-3). The caller must `startTurnForLane` after this returns.
-fn wakeIdleLane(app: *App, lane: *Thread, repo: []const u8, context: [][]u8) !void {
+/// (TD-3). The caller must `startTurnForLane` after this returns. A
+/// non-null `session_id` resumes that session (the /lanes open action);
+/// null starts a fresh session (the spawn-into-idle path). The lane's
+/// `id` is always bound to the resulting session — it documents the
+/// session link the manifest and the open action rely on.
+pub fn wakeIdleLane(app: *App, lane: *Thread, repo: []const u8, context: [][]u8, session_id: ?[]const u8) !void {
     // Read the working out of the idle engine BEFORE overwriting it.
     // `vcs.Lane.Working` is two owned slices (branch, path); copying the
     // struct copies the pointers, not the backing memory. The lane owns
     // the backing memory for the lifetime of the Thread, so the move is
     // safe across the union overwrite.
     const working = lane.engine.idle.working;
-    const runtime = try app.createRuntime(working.path, repo, null);
+    const runtime = try app.createLaneRuntime(working.path, repo, session_id);
     errdefer {
         runtime.deinit();
         app.gpa.destroy(runtime);
@@ -856,11 +865,13 @@ fn wakeIdleLane(app: *App, lane: *Thread, repo: []const u8, context: [][]u8) !vo
     lane.agent = &runtime.agent;
     runtime.agent.lane_generation = lane.generation;
     lane.worker_context = .{ .io = app.io, .gpa = runtime.gpa };
+    lane.id = runtime.session_writer.session.id;
     lane.engine = .{ .live = .{
         .lane = .{ .working = working },
         .runtime = runtime,
         .owns = true,
     } };
+    lane_recovery.syncLaneUpdated(app, lane);
 }
 
 /// Start a turn on `lane` with `prompt` (duped into the lane worker's
@@ -2572,7 +2583,7 @@ test "B1: wakeIdleLane frees the prior parent_context before overwriting it" {
     // (park leaves parent_context alive — no turn is ever started here, so this
     // is safe: parkFinishedWorker only deinit's the runtime/queue/approval).
     const ctx_a = try allocParentContext(gpa, &.{"first task context"});
-    try wakeIdleLane(app, lane, repo, ctx_a);
+    try wakeIdleLane(app, lane, repo, ctx_a, null);
     try std.testing.expect(lane.engine == .live);
     parkFinishedWorker(app, lane);
     try std.testing.expect(lane.engine == .idle);
@@ -2581,7 +2592,7 @@ test "B1: wakeIdleLane frees the prior parent_context before overwriting it" {
     // ctx_a pointer is overwritten and lost (Thread.deinit frees only the
     // current value, ctx_b).
     const ctx_b = try allocParentContext(gpa, &.{"second task context"});
-    try wakeIdleLane(app, lane, repo, ctx_b);
+    try wakeIdleLane(app, lane, repo, ctx_b, null);
     parkFinishedWorker(app, lane);
     // fx.deinit frees ctx_b via Thread.deinit; ctx_a is freed by the fix above.
     // testing.allocator aborts if ctx_a leaked.

@@ -320,6 +320,12 @@ const Lanes = struct {
                 app.deleteSelectedParked() catch |err| try app.reportLaneError(err);
                 return true;
             }
+            if (key.matches('o', .{}) or key.matches('o', .{ .shift = true })) {
+                // Open the selected parked worktree (or idle lane) as a live
+                // lane, resuming its linked conversation when one exists.
+                app.openSelectedLane() catch |err| try app.reportLaneError(err);
+                return true;
+            }
         }
         return false;
     }

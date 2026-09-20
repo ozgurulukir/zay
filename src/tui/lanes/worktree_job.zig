@@ -4,6 +4,7 @@
 const std = @import("std");
 const vcs = @import("../../vcs.zig");
 const tui = @import("../../tui.zig");
+const lane_recovery = @import("recovery.zig");
 
 const App = tui.App;
 
@@ -15,6 +16,12 @@ pub fn terminateLaneProcesses(app: *App, worktree_path: []const u8) void {
 
 pub fn cleanupLaneWorktreeAndBranch(app: *App, repo: []const u8, path: ?[]const u8, branch: ?[]const u8) void {
     if (path) |p| {
+        // Drop the manifest row FIRST: a crash between the row delete and
+        // the git teardown leaves "row gone + worktree exists" — a parked
+        // lane, which is the correct outcome for a lane that was being
+        // closed. Best-effort; covers every removal path (abandon/merge/
+        // delete/failed-spawn rollback) through this single chokepoint.
+        lane_recovery.syncLaneDeletedByPath(app, p);
         terminateLaneProcesses(app, p);
         if (vcs.worktreeRemove(app.gpa, app.io, repo, p)) |_| {} else |_| {
             // Fallback: prune git worktree metadata if file removal was partially blocked

@@ -48,6 +48,7 @@ const codex_login_job_mod = @import("tui/codex_login_job.zig");
 pub const DiffCounts = app_state.DiffCounts;
 pub const DiffRefreshOutcome = diff_lifecycle.DiffRefreshOutcome;
 const lane_lifecycle = @import("tui/lane_lifecycle.zig");
+const lane_recovery = @import("tui/lanes/recovery.zig");
 const lifecycle = @import("tui/lifecycle.zig");
 const settings_lifecycle = @import("tui/settings_lifecycle.zig");
 const theme_lifecycle = @import("tui/theme_lifecycle.zig");
@@ -965,6 +966,10 @@ pub const App = struct {
         return session_switcher.createRuntime(self, cwd, session_dir, session_id);
     }
 
+    pub fn createLaneRuntime(self: *App, cwd: []const u8, session_dir: []const u8, session_id: ?[]const u8) !*runtime_mod.AgentRuntime {
+        return session_switcher.createLaneRuntime(self, cwd, session_dir, session_id);
+    }
+
     pub fn clearInput(self: *App) void {
         input_lifecycle.clearInput(self);
     }
@@ -1110,6 +1115,13 @@ pub const App = struct {
         return lane_lifecycle.deleteSelectedParked(self);
     }
 
+    /// The /lanes `o` action: attach a runtime to the selected parked
+    /// worktree or idle lane, resuming its linked conversation when one
+    /// exists (see `lanes/recovery.zig`).
+    pub fn openSelectedLane(self: *App) !void {
+        return lane_recovery.openSelectedLane(self);
+    }
+
     pub fn laneEntryCount(self: *const App) u32 {
         return lane_lifecycle.laneEntryCount(self);
     }
@@ -1222,6 +1234,7 @@ pub fn run(
     runtime: *runtime_mod.AgentRuntime,
     config: config_mod.Config,
     gpa: std.mem.Allocator,
+    recovery: ?[]lane_recovery.RecoveredLane,
 ) !void {
     // Allocator is provided by root.zig as `PageAllocator`. Thread-safe and
     // correct, but each allocation maps a whole page — traded off to avoid
@@ -1265,6 +1278,12 @@ pub fn run(
     // skipped — so we fall through to the startup splash.
     try app.rebuildTranscriptFromAgent();
     try app.appendStartupIntroLogo();
+    // Crash recovery: rebuild the previous run's open lanes as idle threads.
+    // Notices land after the intro logo / rebuilt history by construction;
+    // best-effort — a failed restore must never abort the launch.
+    lane_recovery.restoreIntoApp(&app, recovery orelse &.{});
+    // Ownership stays with the caller (root.run); restore duped everything
+    // it kept into the threads.
 
     _ = app.refreshDiffCounts() catch false;
 

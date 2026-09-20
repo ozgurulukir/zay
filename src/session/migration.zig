@@ -7,7 +7,7 @@ const paths = @import("../paths.zig");
 const assert = std.debug.assert;
 
 /// Current schema version for the sessions database.
-pub const schema_version: u32 = 5;
+pub const schema_version: u32 = 6;
 
 /// Resolve the default sessions database path under `home_dir`.
 /// Platform-correct base: Windows -> %APPDATA%\zay, POSIX -> ~/.config/zay.
@@ -65,6 +65,18 @@ pub fn migrate(connection: *db.Connection, io: std.Io) !void {
     try connection.exec("create index if not exists sessions_cwd_updated on sessions(cwd, updated_at_ms)");
     try connection.exec("create table if not exists prompt_history(id integer primary key autoincrement, session_id text not null, prompt_text text not null, created_at_ms integer not null, foreign key(session_id) references sessions(id) on delete cascade)");
     try connection.exec("create index if not exists prompt_history_session on prompt_history(session_id, created_at_ms)");
+
+    // Schema v6: lane crash-recovery manifest + driver session pin. Git
+    // (`git worktree list`) remains the authority for whether a worktree
+    // exists — these tables only enrich it (session link, title, open/parked
+    // state), so every write against them is best-effort. `worktree_path` is
+    // the primary key (unique by construction; the hex lane id is its last
+    // path segment). `branch` is deliberately NOT stored: branches rename
+    // asynchronously (`zay/<hex>` → `zay/<slug>`), and the worktree list
+    // always carries the current name.
+    try connection.exec("create table if not exists lanes(worktree_path text primary key, repo_key text not null, session_id text, title text, state text not null, created_at_ms integer not null, updated_at_ms integer not null, foreign key(session_id) references sessions(id) on delete set null)");
+    try connection.exec("create index if not exists lanes_repo_state on lanes(repo_key, state, updated_at_ms)");
+    try connection.exec("create table if not exists driver_pins(repo_key text primary key, session_id text, updated_at_ms integer not null, foreign key(session_id) references sessions(id) on delete set null)");
 
     var statement = try connection.prepare("insert or ignore into schema_migrations(version, applied_at_ms) values (?, ?)");
     defer statement.finalize();

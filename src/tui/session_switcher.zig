@@ -400,11 +400,27 @@ pub fn switchToSession(app: *App, session_id: []const u8, cwd: []const u8) !void
 }
 
 pub fn createRuntime(app: *App, cwd: []const u8, session_dir: []const u8, session_id: ?[]const u8) !*runtime_mod.AgentRuntime {
+    return createRuntimeImpl(app, cwd, session_dir, session_id, false);
+}
+
+/// Lane variant: resuming a session onto a worktree of THIS repo is not a
+/// cross-project switch — the worktree is a checkout of the same project, so
+/// keep the template clone and the current config instead of reloading from
+/// the worktree directory (and repointing plugins) and instead of letting the
+/// `anyLaneTurnActive` guard refuse while another lane runs a turn.
+pub fn createLaneRuntime(app: *App, cwd: []const u8, session_dir: []const u8, session_id: ?[]const u8) !*runtime_mod.AgentRuntime {
+    return createRuntimeImpl(app, cwd, session_dir, session_id, true);
+}
+
+fn createRuntimeImpl(app: *App, cwd: []const u8, session_dir: []const u8, session_id: ?[]const u8, lane_same_project: bool) !*runtime_mod.AgentRuntime {
     const current = app.templateRuntime() orelse return error.NoActiveRuntime;
     // When resuming a session from a different project, don't use the current
     // runtime as template — skills and plugin prompts must load from the
     // session's own cwd, not the current project's.
-    const cross_project = session_id != null and !std.mem.eql(u8, cwd, current.cwd);
+    const cross_project = if (lane_same_project)
+        false
+    else
+        (session_id != null and !std.mem.eql(u8, cwd, current.cwd));
     // Guard: before any App-state mutation — refuse if any lane has an
     // active turn. Unloading Lua states and stripping tool records from the
     // shared registry while a worker dispatches through them is a

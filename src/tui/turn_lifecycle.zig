@@ -7,6 +7,7 @@ const agent_mod = @import("../agent.zig");
 const agent_worker = @import("agent_worker.zig");
 const turn_cancel = @import("turn_cancel.zig");
 const lanes_util = @import("lanes.zig");
+const lane_recovery = @import("lanes/recovery.zig");
 const queue_mod = @import("queue.zig");
 const checkpoint_mod = @import("checkpoint.zig");
 const runtime_mod = @import("../runtime.zig");
@@ -227,11 +228,14 @@ pub fn setLaneTitleIfUnset(app: *App, lane: *Thread, prompt: []const u8) !void {
     const max: usize = 40;
     if (line.len <= max) {
         lane.title = try app.gpa.dupe(u8, line);
-        return;
+    } else {
+        var cut: usize = max;
+        while (cut > 0 and (line[cut] & 0xC0) == 0x80) cut -= 1;
+        lane.title = try std.fmt.allocPrint(app.gpa, "{s}…", .{line[0..cut]});
     }
-    var cut: usize = max;
-    while (cut > 0 and (line[cut] & 0xC0) == 0x80) cut -= 1;
-    lane.title = try std.fmt.allocPrint(app.gpa, "{s}…", .{line[0..cut]});
+    // Keep the manifest title in step (best-effort): a crash-restored lane
+    // shows this label until branch naming lands. No-op for the primary.
+    lane_recovery.syncLaneUpdated(app, lane);
 }
 
 pub fn formatNoProviderMessage(app: *App) ![]u8 {

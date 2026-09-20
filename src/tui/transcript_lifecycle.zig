@@ -11,8 +11,10 @@ const runtime_mod = @import("../runtime.zig");
 const search_mod = @import("../search.zig");
 const skill_mod = @import("../skill.zig");
 const lifecycle = @import("lifecycle.zig");
+const lane_recovery = @import("lanes/recovery.zig");
 
 const App = tui.App;
+const Thread = tui.Thread;
 
 pub fn installRuntime(app: *App, runtime: *runtime_mod.AgentRuntime) !void {
     // Session switch: only the ACTIVE lane's turn is checked and only the
@@ -46,6 +48,10 @@ pub fn installRuntime(app: *App, runtime: *runtime_mod.AgentRuntime) !void {
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = true } };
     app.thread.agent = &runtime.agent;
     app.thread.id = runtime.session_writer.session.id;
+    // Pin the driver's current session so a post-switch crash auto-resumes
+    // the session actually in use, not merely the most recently updated row
+    // (a busy lane's). No-op unless the installed lane is the driver.
+    lane_recovery.syncDriverPin(app);
     // The label belongs to the departed session; the next first prompt
     // re-derives it.
     if (app.thread.title) |title| app.gpa.free(title);
@@ -94,30 +100,7 @@ pub fn appendStartupIntroLogo(app: *App) !void {
 
 pub fn rebuildTranscriptFromAgent(app: *App) !void {
     try clearConversation(app);
-    for (app.thread.agent.?.messages()) |message| {
-        if (message.role() == .system) continue;
-        const text = message.text();
-        if (message.role() == .user) {
-            _ = try app.thread.transcript.append(app.gpa, .user, "you", text);
-            const injected = try skill_mod.collectInjectedSkillNames(app.gpa, text);
-            defer {
-                for (injected) |n| app.gpa.free(n);
-                app.gpa.free(injected);
-            }
-            for (injected) |name| {
-                const title = try std.fmt.allocPrint(app.gpa, "[SKILL] {s}", .{name});
-                defer app.gpa.free(title);
-                _ = try app.thread.transcript.append(app.gpa, .skill, title, "");
-            }
-        } else if (message.role() == .assistant) {
-            if (text.len > 0) _ = try app.thread.transcript.append(app.gpa, .agent, "agent", text);
-        } else if (message.role() == .tool) {
-            const title = try resumedToolTitle(app, message);
-            defer app.gpa.free(title);
-            _ = try app.thread.transcript.appendTool(app.gpa, title, text, message.tool.failed);
-        }
-    }
-    if (app.thread.transcript.messages.items.len > 0) app.thread.transcript.selected = @intCast(app.thread.transcript.messages.items.len - 1);
+    try rebuildTranscriptRows(app, app.thread);
     // A freshly installed (resumed) session left the label unset; re-derive
     // it from the conversation's first user message.
     if (app.thread.title == null) {
@@ -129,11 +112,56 @@ pub fn rebuildTranscriptFromAgent(app: *App) !void {
     }
 }
 
+/// Rebuild `lane`'s transcript mirror from the lane's own agent history —
+/// the lane-scoped core shared by the /resume rebuild and the /lanes open
+/// action (a restored lane's mirror is in-memory only and must come back
+/// from the persisted conversation). Prior rows are cleared in place without
+/// retiring them: only the focused /resume path retires.
+pub fn rebuildTranscriptRows(app: *App, lane: *Thread) !void {
+    const agent = lane.agent orelse return;
+    if (lane.transcript.messages.items.len > 0) {
+        lane.transcript.deinit(app.gpa);
+        lane.transcript = .{};
+        lane.transcript_list.scroll = .{};
+    }
+    for (agent.messages()) |message| {
+        if (message.role() == .system) continue;
+        const text = message.text();
+        if (message.role() == .user) {
+            _ = try lane.transcript.append(app.gpa, .user, "you", text);
+            const injected = try skill_mod.collectInjectedSkillNames(app.gpa, text);
+            defer {
+                for (injected) |n| app.gpa.free(n);
+                app.gpa.free(injected);
+            }
+            for (injected) |name| {
+                const title = try std.fmt.allocPrint(app.gpa, "[SKILL] {s}", .{name});
+                defer app.gpa.free(title);
+                _ = try lane.transcript.append(app.gpa, .skill, title, "");
+            }
+        } else if (message.role() == .assistant) {
+            if (text.len > 0) _ = try lane.transcript.append(app.gpa, .agent, "agent", text);
+        } else if (message.role() == .tool) {
+            const title = try resumedToolTitleFor(app, agent, message);
+            defer app.gpa.free(title);
+            _ = try lane.transcript.appendTool(app.gpa, title, text, message.tool.failed);
+        }
+    }
+    if (lane.transcript.messages.items.len > 0) lane.transcript.selected = @intCast(lane.transcript.messages.items.len - 1);
+}
+
 pub fn resumedToolTitle(app: *App, message: ai.ChatMessage) ![]u8 {
+    return resumedToolTitleFor(app, app.thread.agent.?, message);
+}
+
+/// Tool row title for a resumed message, re-matched against `agent`'s own
+/// tool calls when the payload carries no display label. Parameterized so a
+/// non-focused lane's rebuild matches against ITS agent, not `app.thread`'s.
+pub fn resumedToolTitleFor(app: *App, agent: *agent_mod.Agent, message: ai.ChatMessage) ![]u8 {
     if (message == .tool) {
         if (message.tool.display_label) |label| return transcript_mod.toolTitle(app.gpa, label);
         const id = message.tool.call_id.slice();
-        for (app.thread.agent.?.messages()) |candidate| {
+        for (agent.messages()) |candidate| {
             switch (candidate) {
                 .assistant => |a| {
                     for (a.content) |block| {
