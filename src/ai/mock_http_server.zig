@@ -87,15 +87,20 @@ pub const MockHttpServer = struct {
     }
 
     fn captureRequestBody(self: *MockHttpServer, connection_index: u32, request: *std.http.Server.Request) void {
-        const gpa = self.gpa orelse return;
-        if (connection_index >= self.captured.len) return;
-
-        // Capture before respond drains any remaining chunked request body.
         var body_buf: [16384]u8 = undefined;
         var body_reader = request.readerExpectNone(&body_buf);
-        if (body_reader.allocRemaining(gpa, .limited(1024 * 1024))) |body| {
-            self.captured[connection_index] = body;
-        } else |_| {}
+        if (self.gpa) |gpa| {
+            if (connection_index < self.captured.len) {
+                if (body_reader.allocRemaining(gpa, .limited(1024 * 1024))) |body| {
+                    self.captured[connection_index] = body;
+                } else |_| {}
+                return;
+            }
+        }
+
+        // A close with unread request bytes becomes a reset on Windows and can
+        // discard the response head before the client observes it.
+        _ = body_reader.discardRemaining() catch {};
     }
 };
 
