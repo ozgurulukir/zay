@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -373,7 +374,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // A run step that will run the test executable.
-    const run_mod_tests = b.addRunArtifact(mod_tests);
+    const run_mod_tests = addTestRun(b, mod_tests);
 
     // Creates an executable that will run `test` blocks from the executable's
     // root module. Note that test executables only test one module at a time,
@@ -384,11 +385,10 @@ pub fn build(b: *std.Build) void {
     });
 
     // A run step that will run the second test executable.
-    const run_exe_tests = b.addRunArtifact(exe_tests);
+    const run_exe_tests = addTestRun(b, exe_tests);
 
-    // A top level step for running all tests. dependOn can be called multiple
-    // times and since the two run steps do not depend on one another, this will
-    // make the two of them run in parallel.
+    // A top level step for running all tests. Independent dependencies let the
+    // build runner execute them in parallel where the host supports it.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
@@ -401,7 +401,7 @@ pub fn build(b: *std.Build) void {
         platform_mod,
     }) |lib_mod| {
         const lib_tests = b.addTest(.{ .root_module = lib_mod, .filters = test_filters });
-        test_step.dependOn(&b.addRunArtifact(lib_tests).step);
+        test_step.dependOn(&addTestRun(b, lib_tests).step);
     }
 
     // Benchmarks are standalone executables under bench/, always built
@@ -468,6 +468,18 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+}
+
+fn addTestRun(b: *std.Build, tests: *std.Build.Step.Compile) *std.Build.Step.Run {
+    if (builtin.os.tag != .windows) return b.addRunArtifact(tests);
+
+    // Zig 0.16's Windows test-server transport can wait forever after the test
+    // process exits. The simple runner reports the same failures by exit code.
+    const run = std.Build.Step.Run.create(b, b.fmt("run {s} directly", .{tests.name}));
+    run.producer = tests;
+    run.addArtifactArg(tests);
+    run.expectExitCode(0);
+    return run;
 }
 
 /// Fails the build when the vendored vaxis `src/vxfw/App.zig` is missing the
