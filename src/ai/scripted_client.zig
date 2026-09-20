@@ -4,7 +4,7 @@
 //! Agent-level tests should prefer this over real sockets: it runs on every
 //! platform, including Windows, where the truncation-class socket suites are
 //! gated off (#32). It is deliberately NOT an SSE fixture — wire-shape and
-//! truncation-encoding tests stay on the in-thread `MockScriptedServer`
+//! truncation-encoding tests stay on the in-thread `MockHttpServer`
 //! suites; this adapter is dialect-neutral and drives the same observer a
 //! real client drives.
 //!

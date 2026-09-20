@@ -846,8 +846,8 @@ test "privileged pm: no false positives on safe reads" {
 
 /// Accepts one connection, consumes the request head, then holds the
 /// connection open WITHOUT ever responding — the client-side socket timeout
-/// is the only way the classify call completes. Mirrors the shape of
-/// `MockScriptedServer` (agent.zig), which is file-private to its module.
+/// is the only way the classify call completes. It uses the same listener
+/// setup as `MockHttpServer` but deliberately never responds.
 const StallServer = struct {
     io: std.Io,
     server: std.Io.net.Server,
