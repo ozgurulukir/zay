@@ -125,7 +125,7 @@ pub const Transport = struct {
         self.* = .{
             .gpa = gpa,
             .io = io,
-            .http_client = .{ .allocator = gpa, .io = io },
+            .http_client = .{ .allocator = gpa, .io = http.timeoutAwareIo(io) },
             .url = "",
             .log_tag = "transport",
         };
@@ -390,6 +390,7 @@ pub const Transport = struct {
                     // see the head-phase note above.
                     const reason: anyerror = if (conn.stream_reader.err) |e| e else if (http_response.bodyErr()) |e| e else err;
                     self.recordReadFailure(reason);
+                    if (reason == error.Timeout) return error.Timeout;
                 }
             }
             return err;

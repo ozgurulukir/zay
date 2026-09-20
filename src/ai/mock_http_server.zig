@@ -6,6 +6,7 @@ pub const Response = struct {
     status: std.http.Status,
     extra_headers: []const std.http.Header = &.{},
     body: []const u8 = "",
+    body_delay_ms: u32 = 0,
 };
 
 pub const MockHttpServer = struct {
@@ -49,6 +50,7 @@ pub const MockHttpServer = struct {
     pub fn serve(self: *MockHttpServer) void {
         var read_buf: [8192]u8 = undefined;
         var write_buf: [8192]u8 = undefined;
+        var response_buf: [8192]u8 = undefined;
         for (self.responses) |response| {
             var stream = self.server.accept(self.io) catch return;
             defer stream.close(self.io);
@@ -58,6 +60,21 @@ pub const MockHttpServer = struct {
             var http_server = std.http.Server.init(&reader.interface, &writer.interface);
             var request = http_server.receiveHead() catch return;
             self.captureRequestBody(connection_index, &request);
+            if (response.body_delay_ms > 0) {
+                var body_writer = request.respondStreaming(&response_buf, .{
+                    .content_length = response.body.len,
+                    .respond_options = .{
+                        .status = response.status,
+                        .keep_alive = false,
+                        .extra_headers = response.extra_headers,
+                    },
+                }) catch return;
+                body_writer.flush() catch return;
+                self.io.sleep(.fromMilliseconds(response.body_delay_ms), .awake) catch return;
+                body_writer.writer.writeAll(response.body) catch return;
+                body_writer.end() catch return;
+                continue;
+            }
             request.respond(response.body, .{
                 .status = response.status,
                 .keep_alive = false,
