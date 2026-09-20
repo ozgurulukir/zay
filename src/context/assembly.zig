@@ -469,13 +469,6 @@ fn earliestPlaceholder(
     return best;
 }
 
-/// Reads a project-scope rule file from `cwd`. Thin wrapper over `readRuleFile`
-/// with the "project rule file" label feeding its notices; kept pub because
-/// `runtime.zig`'s context-file test exercises it directly.
-pub fn readProjectRuleFile(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, filename: []const u8) !?[]u8 {
-    return readRuleFile(gpa, io, cwd, filename, "project rule file");
-}
-
 /// Reads `dir/filename` as advisory rule context, tolerant of every failure:
 /// `dir` may be a workspace root or the platform config dir (user-level
 /// AGENTS.md); `label` ("user rule file" / "project rule file") feeds the log
@@ -908,7 +901,7 @@ fn writeTestFile(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, filename: 
     try writer.interface.flush();
 }
 
-test "readProjectRuleFile truncates an oversized rule file with a notice instead of failing" {
+test "readRuleFile truncates an oversized rule file with a notice instead of failing" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const root = try std.process.currentPathAlloc(io, gpa);
@@ -938,7 +931,7 @@ test "readProjectRuleFile truncates an oversized rule file with a notice instead
     try writer.interface.writeAll("TAIL_MARKER");
     try writer.interface.flush();
 
-    const content = (try readProjectRuleFile(gpa, io, cwd, filename)).?;
+    const content = (try readRuleFile(gpa, io, cwd, filename, "project rule file")).?;
     defer gpa.free(content);
     try std.testing.expect(content.len > max_project_rule_file_bytes); // sandwich + notice
     try std.testing.expect(std.mem.indexOf(u8, content, "truncated") != null);
@@ -951,6 +944,30 @@ test "readProjectRuleFile truncates an oversized rule file with a notice instead
     const user_content = (try readRuleFile(gpa, io, cwd, filename, "user rule file")).?;
     defer gpa.free(user_content);
     try std.testing.expect(std.mem.indexOf(u8, user_content, "[user rule file truncated: BIG.md is ") != null);
+}
+
+test "readRuleFile reads AGENTS.md when it exists" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var file = try tmp.dir.createFile(io, "AGENTS.md", .{ .truncate = true });
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try writer.interface.writeAll("# Guidelines\nThis is a test.");
+        try writer.interface.flush();
+    }
+
+    const cwd = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(cwd);
+
+    const agents_md = (try readRuleFile(gpa, io, cwd, "AGENTS.md", "project rule file")) orelse return error.MissingContextFile;
+    defer gpa.free(agents_md);
+    try std.testing.expectEqualStrings("# Guidelines\nThis is a test.", agents_md);
 }
 
 test "pruneHistoricalToolResultsViews caps old tool outputs while preserving recent ones" {
@@ -1340,7 +1357,7 @@ test "assembleSystemPrompt injects today's date in ISO format" {
     try std.testing.expect(std.ascii.isDigit(date[0]) and std.ascii.isDigit(date[9]));
 }
 
-test "readProjectRuleFile returns the partial content when the file shrinks before read" {
+test "readRuleFile returns the partial content when the file shrinks before read" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const root = try std.process.currentPathAlloc(io, gpa);
@@ -1361,12 +1378,12 @@ test "readProjectRuleFile returns the partial content when the file shrinks befo
     const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
     defer gpa.free(cwd);
 
-    const content = (try readProjectRuleFile(gpa, io, cwd, filename)).?;
+    const content = (try readRuleFile(gpa, io, cwd, filename, "project rule file")).?;
     defer gpa.free(content);
     try std.testing.expectEqualStrings("partial content", content);
 }
 
-test "readProjectRuleFile skips an unreadable rule file instead of failing assembly" {
+test "readRuleFile skips an unreadable rule file instead of failing assembly" {
     // The trick here — a directory named AGENTS.md — makes openFile fail with
     // NotDir only on POSIX. On Windows opening a directory as a file succeeds,
     // so the unreadable-weapon mechanism differs; gate to POSIX.

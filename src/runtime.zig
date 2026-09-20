@@ -1526,27 +1526,3 @@ test "runtime agent aliases the owned cwd, not the borrowed input" {
     // parameter the caller may free.
     try std.testing.expect(runtime.agent.cwd.ptr == runtime.cwd.ptr);
 }
-
-test "readContextFile reads AGENTS.md when it exists" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    {
-        var file = try tmp.dir.createFile(io, "AGENTS.md", .{ .truncate = true });
-        defer file.close(io);
-        var buffer: [4096]u8 = undefined;
-        var writer = file.writer(io, &buffer);
-        try writer.interface.writeAll("# Guidelines\nThis is a test.");
-        try writer.interface.flush();
-    }
-
-    const cwd = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
-    defer gpa.free(cwd);
-
-    const agents_md = (try context_assembly.readProjectRuleFile(gpa, io, cwd, "AGENTS.md")) orelse return error.MissingContextFile;
-    defer gpa.free(agents_md);
-    try std.testing.expectEqualStrings("# Guidelines\nThis is a test.", agents_md);
-}
