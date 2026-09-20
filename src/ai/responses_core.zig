@@ -422,90 +422,19 @@ const ok_responses_sse_body =
     "event: response.completed\n" ++
     "data: {\"type\":\"response.completed\"}\n\n";
 
-/// Mock that serves one canned response per accepted connection (like the
-/// chat-completions client's retry tests). Each connection is `close`d after
-/// the response so the client reconnects for the next attempt. Captures each
-/// connection's request body so tests can assert on the re-serialized payload
-/// (the C2 cache downgrade re-sends a stripped body).
-const MockResponsesRetryServer = struct {
-    const Response = struct {
-        status: std.http.Status,
-        retry_after: ?[]const u8 = null,
-        body: []const u8 = "",
-    };
-
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    server: std.Io.net.Server,
-    responses: []const Response,
-    connection_count: std.atomic.Value(u32) = .init(0),
-    /// Request body per captured connection (index = connection number).
-    captured: [8]?[]u8 = .{null} ** 8,
-
-    fn init(gpa: std.mem.Allocator, io: std.Io, responses: []const Response) !@This() {
-        const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
-        const server = try addr.listen(io, .{ .reuse_address = true });
-        return .{ .gpa = gpa, .io = io, .server = server, .responses = responses };
-    }
-
-    fn deinit(self: *@This()) void {
-        for (self.captured) |maybe_body| {
-            if (maybe_body) |body| self.gpa.free(body);
-        }
-        self.server.deinit(self.io);
-    }
-
-    fn port(self: *const @This()) u16 {
-        return self.server.socket.address.ip4.port;
-    }
-
-    fn serve(self: *@This()) void {
-        var read_buf: [8192]u8 = undefined;
-        var write_buf: [8192]u8 = undefined;
-        for (self.responses) |resp| {
-            var stream = self.server.accept(self.io) catch return;
-            defer stream.close(self.io);
-            const conn_index = self.connection_count.fetchAdd(1, .monotonic);
-            var reader = stream.reader(self.io, &read_buf);
-            var writer = stream.writer(self.io, &write_buf);
-            var http_server = std.http.Server.init(&reader.interface, &writer.interface);
-            // `request.respond` drains the (chunked) request body internally —
-            // the client blocks reading the response after sending, so nothing
-            // follows the terminal `0\r\n\r\n`.
-            var request = http_server.receiveHead() catch return;
-            // Capture the body BEFORE responding (respond drains what's left).
-            if (conn_index < self.captured.len) {
-                var body_buf: [16384]u8 = undefined;
-                var body_reader = request.readerExpectNone(&body_buf);
-                if (body_reader.allocRemaining(self.gpa, .limited(1024 * 1024))) |body| {
-                    self.captured[conn_index] = body;
-                } else |_| {}
-            }
-            var extra: [2]std.http.Header = undefined;
-            var extra_count: usize = 0;
-            if (resp.retry_after) |ra| {
-                extra[extra_count] = .{ .name = "Retry-After", .value = ra };
-                extra_count += 1;
-            }
-            request.respond(resp.body, .{
-                .status = resp.status,
-                .keep_alive = false,
-                .extra_headers = extra[0..extra_count],
-            }) catch return;
-        }
-    }
-};
+const mock_http_server = @import("mock_http_server.zig");
+const MockHttpServer = mock_http_server.MockHttpServer;
 
 test "prompt retries a transient 503 and succeeds (Responses API)" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var server = try MockResponsesRetryServer.init(gpa, io, &.{
+    var server = try MockHttpServer.init(io, &.{
         .{ .status = .service_unavailable },
         .{ .status = .ok, .body = ok_responses_sse_body },
     });
     defer server.deinit();
-    const thread = try std.Thread.spawn(.{}, MockResponsesRetryServer.serve, .{&server});
+    const thread = try std.Thread.spawn(.{}, MockHttpServer.serve, .{&server});
     defer thread.join();
 
     const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port()});
@@ -534,11 +463,11 @@ test "prompt does not retry a permanent 4xx (Responses API)" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var server = try MockResponsesRetryServer.init(gpa, io, &.{
+    var server = try MockHttpServer.init(io, &.{
         .{ .status = .bad_request },
     });
     defer server.deinit();
-    const thread = try std.Thread.spawn(.{}, MockResponsesRetryServer.serve, .{&server});
+    const thread = try std.Thread.spawn(.{}, MockHttpServer.serve, .{&server});
     defer thread.join();
 
     const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port()});
@@ -568,12 +497,12 @@ test "prompt downgrades to a cache-stripped payload on a cache-mentioning 400 (C
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var server = try MockResponsesRetryServer.init(gpa, io, &.{
+    var server = try MockHttpServer.initCapturing(gpa, io, &.{
         .{ .status = .bad_request, .body = "{\"error\":{\"message\":\"prompt_cache_key is not accepted\"}}" },
         .{ .status = .ok, .body = ok_responses_sse_body },
     });
     defer server.deinit();
-    const thread = try std.Thread.spawn(.{}, MockResponsesRetryServer.serve, .{&server});
+    const thread = try std.Thread.spawn(.{}, MockHttpServer.serve, .{&server});
     defer thread.join();
 
     const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port()});
@@ -608,11 +537,11 @@ test "prompt records last_error_detail on an HTTP error (Responses API)" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var server = try MockResponsesRetryServer.init(gpa, io, &.{
+    var server = try MockHttpServer.init(io, &.{
         .{ .status = .forbidden, .body = "{\"error\":{\"message\":\"invalid api key\"}}" },
     });
     defer server.deinit();
-    const thread = try std.Thread.spawn(.{}, MockResponsesRetryServer.serve, .{&server});
+    const thread = try std.Thread.spawn(.{}, MockHttpServer.serve, .{&server});
     defer thread.join();
 
     const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port()});

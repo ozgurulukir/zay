@@ -1249,105 +1249,26 @@ test "retryDelayMs honors Retry-After over backoff and caps exponential growth" 
     try std.testing.expectEqual(@as(u64, 8000), http.retryDelayMs(500, 10, null)); // stays capped
 }
 
-/// Minimal blocking HTTP server for retry tests. Serves exactly one canned
-/// response per accepted connection (each `Connection: close`), on a
-/// dedicated thread. The ephemeral port comes from `server.socket.address`.
-const MockRetryServer = struct {
-    const Response = struct {
-        status: std.http.Status,
-        retry_after: ?[]const u8 = null,
-        body: []const u8 = "",
-        // When true, `body` is gzip-compressed and served with
-        // `Content-Encoding: gzip` — exercises the decompressing reader.
-        gzip: bool = false,
-    };
-
-    io: std.Io,
-    server: std.Io.net.Server,
-    responses: []const Response,
-    connection_count: std.atomic.Value(u32) = .init(0),
-
-    fn init(io: std.Io, responses: []const Response) !MockRetryServer {
-        const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
-        const server = try addr.listen(io, .{ .reuse_address = true });
-        return .{ .io = io, .server = server, .responses = responses };
-    }
-
-    fn deinit(self: *MockRetryServer) void {
-        self.server.deinit(self.io);
-    }
-
-    fn port(self: *const MockRetryServer) u16 {
-        return self.server.socket.address.ip4.port;
-    }
-
-    fn serve(self: *MockRetryServer) void {
-        var read_buf: [8192]u8 = undefined;
-        var write_buf: [8192]u8 = undefined;
-        for (self.responses) |resp| {
-            var stream = self.server.accept(self.io) catch return;
-            defer stream.close(self.io);
-            _ = self.connection_count.fetchAdd(1, .monotonic);
-            var reader = stream.reader(self.io, &read_buf);
-            var writer = stream.writer(self.io, &write_buf);
-            var http_server = std.http.Server.init(&reader.interface, &writer.interface);
-            var request = http_server.receiveHead() catch return;
-            var extra: [2]std.http.Header = undefined;
-            var extra_count: usize = 0;
-            if (resp.retry_after) |ra| {
-                extra[extra_count] = .{ .name = "Retry-After", .value = ra };
-                extra_count += 1;
-            }
-            if (resp.gzip) {
-                extra[extra_count] = .{ .name = "Content-Encoding", .value = "gzip" };
-                extra_count += 1;
-            }
-            const headers = extra[0..extra_count];
-            request.respond(resp.body, .{
-                .status = resp.status,
-                .keep_alive = false,
-                .extra_headers = headers,
-            }) catch return;
-        }
-    }
-};
+const mock_http_server = @import("mock_http_server.zig");
+const MockHttpServer = mock_http_server.MockHttpServer;
 
 const ok_sse_body =
     "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n" ++
     "data: [DONE]\n";
 
-fn retryTestClient(gpa: std.mem.Allocator, io: std.Io, port: u16) !Client {
-    const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/v1", .{port});
-    errdefer gpa.free(base_url);
-    var client: Client = undefined;
-    try client.init(gpa, io, .{
-        .base_url = base_url,
-        .api_key = "test-key",
-        .model = "test-model",
-        .tools = &.{},
-        .mcp_tools = &.{},
-        // No sleeping between retries in tests.
-        .retry_base_delay_ms = 0,
-    });
-    // `init` deep-copies the config (including the request URL) — the
-    // temporary base_url is not retained, so free it.
-    gpa.free(base_url);
-    return client;
-}
-
 test "prompt retries a transient 503 and succeeds" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var server = try MockRetryServer.init(io, &.{
+    var server = try MockHttpServer.init(io, &.{
         .{ .status = .service_unavailable },
         .{ .status = .ok, .body = ok_sse_body },
     });
     defer server.deinit();
-    const thread = try std.Thread.spawn(.{}, MockRetryServer.serve, .{&server});
+    const thread = try std.Thread.spawn(.{}, MockHttpServer.serve, .{&server});
     defer thread.join();
 
-    var client = try retryTestClient(gpa, io, server.port());
+    var client = try mock_http_server.retryTestClient(Client, gpa, io, server.port());
     defer client.deinit();
 
     var turn = try client.prompt(&.{}, ai.streamNoop());
@@ -1361,15 +1282,15 @@ test "prompt retries a 429 and honors Retry-After" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var server = try MockRetryServer.init(io, &.{
-        .{ .status = .too_many_requests, .retry_after = "0" },
+    var server = try MockHttpServer.init(io, &.{
+        .{ .status = .too_many_requests, .extra_headers = &.{.{ .name = "Retry-After", .value = "0" }} },
         .{ .status = .ok, .body = ok_sse_body },
     });
     defer server.deinit();
-    const thread = try std.Thread.spawn(.{}, MockRetryServer.serve, .{&server});
+    const thread = try std.Thread.spawn(.{}, MockHttpServer.serve, .{&server});
     defer thread.join();
 
-    var client = try retryTestClient(gpa, io, server.port());
+    var client = try mock_http_server.retryTestClient(Client, gpa, io, server.port());
     defer client.deinit();
 
     var turn = try client.prompt(&.{}, ai.streamNoop());
@@ -1382,14 +1303,14 @@ test "prompt does not retry a permanent 4xx" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var server = try MockRetryServer.init(io, &.{
+    var server = try MockHttpServer.init(io, &.{
         .{ .status = .bad_request },
     });
     defer server.deinit();
-    const thread = try std.Thread.spawn(.{}, MockRetryServer.serve, .{&server});
+    const thread = try std.Thread.spawn(.{}, MockHttpServer.serve, .{&server});
     defer thread.join();
 
-    var client = try retryTestClient(gpa, io, server.port());
+    var client = try mock_http_server.retryTestClient(Client, gpa, io, server.port());
     defer client.deinit();
 
     try std.testing.expectError(error.HttpClientError, client.prompt(&.{}, ai.streamNoop()));
@@ -1403,11 +1324,11 @@ test "prompt with max_retries 0 makes a single attempt on a transient 5xx" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var server = try MockRetryServer.init(io, &.{
+    var server = try MockHttpServer.init(io, &.{
         .{ .status = .internal_server_error },
     });
     defer server.deinit();
-    const thread = try std.Thread.spawn(.{}, MockRetryServer.serve, .{&server});
+    const thread = try std.Thread.spawn(.{}, MockHttpServer.serve, .{&server});
     defer thread.join();
 
     const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/v1", .{server.port()});
@@ -1432,16 +1353,16 @@ test "prompt exhausts retries on a persistent 5xx" {
     const io = std.testing.io;
 
     // Default max_retries = 2 → three attempts total.
-    var server = try MockRetryServer.init(io, &.{
+    var server = try MockHttpServer.init(io, &.{
         .{ .status = .internal_server_error },
         .{ .status = .internal_server_error },
         .{ .status = .internal_server_error },
     });
     defer server.deinit();
-    const thread = try std.Thread.spawn(.{}, MockRetryServer.serve, .{&server});
+    const thread = try std.Thread.spawn(.{}, MockHttpServer.serve, .{&server});
     defer thread.join();
 
-    var client = try retryTestClient(gpa, io, server.port());
+    var client = try mock_http_server.retryTestClient(Client, gpa, io, server.port());
     defer client.deinit();
 
     try std.testing.expectError(error.HttpServerError, client.prompt(&.{}, ai.streamNoop()));
@@ -1463,14 +1384,14 @@ test "prompt decompresses a Content-Encoding: gzip error body into the UI detail
         0xad, 0x05, 0x00, 0xaf, 0xdd, 0xf6, 0x03, 0x27, 0x00, 0x00, 0x00,
     };
 
-    var server = try MockRetryServer.init(io, &.{
-        .{ .status = .forbidden, .body = &gzipped, .gzip = true },
+    var server = try MockHttpServer.init(io, &.{
+        .{ .status = .forbidden, .body = &gzipped, .extra_headers = &.{.{ .name = "Content-Encoding", .value = "gzip" }} },
     });
     defer server.deinit();
-    const thread = try std.Thread.spawn(.{}, MockRetryServer.serve, .{&server});
+    const thread = try std.Thread.spawn(.{}, MockHttpServer.serve, .{&server});
     defer thread.join();
 
-    var client = try retryTestClient(gpa, io, server.port());
+    var client = try mock_http_server.retryTestClient(Client, gpa, io, server.port());
     defer client.deinit();
 
     try std.testing.expectError(error.HttpClientError, client.prompt(&.{}, ai.streamNoop()));
@@ -1564,7 +1485,7 @@ test "prompt records last_error_detail on stream-phase ReadFailed" {
     const thread = try std.Thread.spawn(.{}, MockAbortServer.serve, .{&server});
     defer thread.join();
 
-    var client = try retryTestClient(gpa, io, server.port());
+    var client = try mock_http_server.retryTestClient(Client, gpa, io, server.port());
     defer client.deinit();
 
     try std.testing.expectError(error.ReadFailed, client.prompt(&.{}, ai.streamNoop()));

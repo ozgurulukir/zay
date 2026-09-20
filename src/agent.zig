@@ -1986,55 +1986,8 @@ test "handleLengthCut with the knob off only emits the stopped event" {
     try std.testing.expectEqual(@as(usize, 0), agent.messages().len);
 }
 
-/// Minimal blocking HTTP server scripted with one canned response per
-/// accepted connection (each `Connection: close`), mirroring
-/// `MockRetryServer` in openai_compatible.zig (that struct is file-private
-/// to its module's tests). The ephemeral port comes from
-/// `server.socket.address` — no readiness wait is needed because `listen`
-/// completes inside `init` before the client can connect.
-const MockScriptedServer = struct {
-    const Response = struct {
-        status: std.http.Status,
-        body: []const u8 = "",
-    };
-
-    io: std.Io,
-    server: std.Io.net.Server,
-    responses: []const Response,
-    connection_count: std.atomic.Value(u32) = .init(0),
-
-    fn init(io: std.Io, responses: []const Response) !MockScriptedServer {
-        const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
-        const server = try addr.listen(io, .{ .reuse_address = true });
-        return .{ .io = io, .server = server, .responses = responses };
-    }
-
-    fn deinit(self: *MockScriptedServer) void {
-        self.server.deinit(self.io);
-    }
-
-    fn port(self: *const MockScriptedServer) u16 {
-        return self.server.socket.address.ip4.port;
-    }
-
-    fn serve(self: *MockScriptedServer) void {
-        var read_buf: [8192]u8 = undefined;
-        var write_buf: [8192]u8 = undefined;
-        for (self.responses) |resp| {
-            var stream = self.server.accept(self.io) catch return;
-            defer stream.close(self.io);
-            _ = self.connection_count.fetchAdd(1, .monotonic);
-            var reader = stream.reader(self.io, &read_buf);
-            var writer = stream.writer(self.io, &write_buf);
-            var http_server = std.http.Server.init(&reader.interface, &writer.interface);
-            var request = http_server.receiveHead() catch return;
-            request.respond(resp.body, .{
-                .status = resp.status,
-                .keep_alive = false,
-            }) catch return;
-        }
-    }
-};
+const mock_http_server = @import("ai/mock_http_server.zig");
+const MockHttpServer = mock_http_server.MockHttpServer;
 
 test "run auto-continues once after a length-cut stream" {
     if (os.is_windows) {
@@ -2049,7 +2002,7 @@ test "run auto-continues once after a length-cut stream" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var server = try MockScriptedServer.init(io, &.{
+    var server = try MockHttpServer.init(io, &.{
         .{ .status = .ok, .body = "data: {\"choices\":[{\"finish_reason\":null,\"delta\":{\"role\":\"assistant\",\"content\":\"partial plan\"}}]}\n" ++
             "data: {\"choices\":[{\"finish_reason\":\"length\",\"delta\":{}}]}\n" ++
             "data: [DONE]\n" },
@@ -2058,7 +2011,7 @@ test "run auto-continues once after a length-cut stream" {
             "data: [DONE]\n" },
     });
     defer server.deinit();
-    const thread = try std.Thread.spawn(.{}, MockScriptedServer.serve, .{&server});
+    const thread = try std.Thread.spawn(.{}, MockHttpServer.serve, .{&server});
     defer thread.join();
 
     const openai_compatible = @import("ai/openai_compatible.zig");
@@ -2130,7 +2083,7 @@ test "run retries once when the provider truncates tool-call arguments" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var server = try MockScriptedServer.init(io, &.{
+    var server = try MockHttpServer.init(io, &.{
         .{ .status = .ok, .body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"chatcmpl-tool-abc\",\"function\":{\"name\":\"pwsh\"}}]}}]}\n" ++
             "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n" ++
             "data: [DONE]\n" },
@@ -2139,7 +2092,7 @@ test "run retries once when the provider truncates tool-call arguments" {
             "data: [DONE]\n" },
     });
     defer server.deinit();
-    const thread = try std.Thread.spawn(.{}, MockScriptedServer.serve, .{&server});
+    const thread = try std.Thread.spawn(.{}, MockHttpServer.serve, .{&server});
     defer thread.join();
 
     const openai_compatible = @import("ai/openai_compatible.zig");
