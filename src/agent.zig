@@ -232,6 +232,15 @@ pub const Agent = struct {
         try self.appendMessage(.system, content);
     }
 
+    /// Replace the one in-memory system prompt at a turn boundary. System
+    /// messages are reconstructed on resume and are never persisted.
+    pub fn replaceSystem(self: *Agent, content: []const u8) !void {
+        const blocks = try self.gpa.alloc(ai.ContentBlock, 1);
+        errdefer self.gpa.free(blocks);
+        blocks[0] = .{ .text = .{ .text = try self.gpa.dupe(u8, content) } };
+        self.context_manager.replaceSystem(.{ .system = .{ .content = blocks } });
+    }
+
     pub fn deinit(self: *Agent) void {
         self.tool_view_cache.deinit(self.gpa);
         // Wait for any background summarizer before tearing down the state it

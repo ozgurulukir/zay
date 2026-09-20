@@ -2,6 +2,7 @@ const std = @import("std");
 
 const bounded_queue = @import("bounded_queue");
 const agent_mod = @import("../agent.zig");
+const runtime_mod = @import("../runtime.zig");
 const BoundedList = @import("bounded_list.zig").BoundedList;
 
 const event_queue_capacity: u32 = 4096;
@@ -180,12 +181,19 @@ pub const cancel_message = "Interrupted.";
 /// `drain_queue_first` empties the agent's message queue into history before the
 /// turn's first prompt — used to deliver a queue stranded by a user interrupt as
 /// a fresh turn. The @-mention expansion lands here, off the UI thread.
-pub fn runAgentTurn(agent: *agent_mod.Agent, worker_context: *Context, pending_prompt: ?[]u8, drain_queue_first: bool) void {
+pub fn runAgentTurn(agent: *agent_mod.Agent, runtime: ?*runtime_mod.AgentRuntime, worker_context: *Context, pending_prompt: ?[]u8, drain_queue_first: bool) void {
     agent.bash_approval = .{
         .ptr = worker_context,
         .request = requestBashApproval,
     };
     defer agent.bash_approval = null;
+
+    if (runtime) |live| {
+        live.refreshSystemPrompt(agent.effectiveCwd()) catch |err| {
+            postTurnFailed(worker_context, err);
+            return;
+        };
+    }
 
     if (drain_queue_first) {
         const flushed = agent.drainAllQueuedToHistory() catch |err| {

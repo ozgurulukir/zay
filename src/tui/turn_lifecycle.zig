@@ -327,6 +327,7 @@ fn spawnTurn(app: *App, lane: *Thread, opts: SpawnOpts) !void {
     errdefer if (opts.prompt) |p| lane.worker_context.?.gpa.free(p);
     lane.turn_future = try app.getIo().concurrent(agent_worker.runAgentTurn, .{
         lane.agent.?,
+        lane.liveRuntime(),
         &lane.worker_context.?,
         opts.prompt,
         opts.drain_queue_first,
@@ -343,6 +344,7 @@ pub fn startTurn(app: *App) !void {
     errdefer if (prompt) |p| app.thread.worker_context.?.gpa.free(p);
     app.thread.turn_future = try app.getIo().concurrent(agent_worker.runAgentTurn, .{
         app.thread.agent.?,
+        app.thread.liveRuntime(),
         &app.thread.worker_context.?,
         prompt,
         false,

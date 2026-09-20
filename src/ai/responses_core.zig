@@ -172,6 +172,13 @@ pub const Client = struct {
         self.tools_json = new_json;
     }
 
+    /// Replace the owned Responses `instructions` value between requests.
+    pub fn updateSystemPrompt(self: *Client, prompt_text: []const u8) !void {
+        const new_prompt = try self.gpa.dupe(u8, prompt_text);
+        self.gpa.free(self.config.system_prompt);
+        self.config.system_prompt = new_prompt;
+    }
+
     pub fn errorDetail(self: *const Client) ?[]const u8 {
         return self.transport.errorDetail();
     }

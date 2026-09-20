@@ -51,6 +51,33 @@ pub const ContextManager = struct {
         try self.messages.append(self.gpa, message);
     }
 
+    /// Replace the cached system prompt without touching persisted history.
+    /// The replacement is already fully allocated, so this operation cannot
+    /// fail once it starts mutating the cache.
+    pub fn replaceSystem(self: *ContextManager, replacement: ai.ChatMessage) void {
+        assert(replacement == .system);
+        var inserted = false;
+        var kept: usize = 0;
+        for (self.messages.items) |*message| {
+            if (message.* == .system) {
+                if (!inserted) {
+                    message.deinit(self.gpa);
+                    message.* = replacement;
+                    self.messages.items[kept] = message.*;
+                    inserted = true;
+                    kept += 1;
+                } else {
+                    message.deinit(self.gpa);
+                }
+            } else {
+                if (kept != self.messages.items.len) self.messages.items[kept] = message.*;
+                kept += 1;
+            }
+        }
+        assert(inserted);
+        self.messages.shrinkRetainingCapacity(kept);
+    }
+
     /// Append to the cached list AND persist to the tree — the dual-write for
     /// a live conversation turn. Takes ownership of `message`.
     ///
@@ -95,6 +122,23 @@ test "context manager appends and clears keeping system" {
     context.clearNonSystem();
     try std.testing.expectEqual(@as(u32, 1), context.count());
     try std.testing.expectEqual(.system, context.items()[0].role());
+}
+
+test "replaceSystem keeps one current prompt and preserves conversation history" {
+    const gpa = std.testing.allocator;
+    var context: ContextManager = .{ .gpa = gpa };
+    defer context.deinit();
+
+    try context.appendUnpersisted(try textMessage(gpa, .system, "old"));
+    try context.appendUnpersisted(try textMessage(gpa, .user, "hello"));
+    try context.appendUnpersisted(try textMessage(gpa, .system, "duplicate"));
+    context.replaceSystem(try textMessage(gpa, .system, "new"));
+
+    try std.testing.expectEqual(@as(u32, 2), context.count());
+    try std.testing.expectEqual(.system, context.items()[0].role());
+    try std.testing.expectEqualStrings("new", context.items()[0].system.content[0].text.text);
+    try std.testing.expectEqual(.user, context.items()[1].role());
+    try std.testing.expectEqualStrings("hello", context.items()[1].user.content[0].text.text);
 }
 
 fn textMessage(gpa: std.mem.Allocator, role: ai.Role, text: []const u8) !ai.ChatMessage {
