@@ -7,6 +7,8 @@ pub const Response = struct {
     extra_headers: []const std.http.Header = &.{},
     body: []const u8 = "",
     body_delay_ms: u32 = 0,
+    /// Close after consuming the request without sending a response head.
+    drop_after_request: bool = false,
 };
 
 pub const MockHttpServer = struct {
@@ -60,6 +62,7 @@ pub const MockHttpServer = struct {
             var http_server = std.http.Server.init(&reader.interface, &writer.interface);
             var request = http_server.receiveHead() catch return;
             self.captureRequestBody(connection_index, &request);
+            if (response.drop_after_request) continue;
             if (response.body_delay_ms > 0) {
                 var body_writer = request.respondStreaming(&response_buf, .{
                     .content_length = response.body.len,
