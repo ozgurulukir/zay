@@ -1492,3 +1492,27 @@ test "prompt records last_error_detail on stream-phase ReadFailed" {
     const detail = client.errorDetail() orelse @panic("expected a recorded error detail on stream ReadFailed");
     try std.testing.expect(std.mem.startsWith(u8, detail, "Connection to the model provider was lost:"));
 }
+
+test "prompt reports a socket read timeout without panicking" {
+    if (os.is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const responses = [_]mock_http_server.Response{.{
+        .status = .ok,
+        .body = "{}",
+        .body_delay_ms = 1500,
+    }};
+
+    var server = try MockHttpServer.init(io, &responses);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, MockHttpServer.serve, .{&server});
+    defer thread.join();
+
+    var client = try mock_http_server.retryTestClient(Client, gpa, io, server.port());
+    defer client.deinit();
+    client.transport.request_timeout_seconds = 1;
+
+    try std.testing.expectError(error.Timeout, client.prompt(&.{}, ai.streamNoop()));
+    const detail = client.errorDetail() orelse @panic("expected a recorded socket-timeout detail");
+    try std.testing.expect(std.mem.endsWith(u8, detail, "Timeout"));
+}

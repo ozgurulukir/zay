@@ -244,6 +244,66 @@ pub fn setSocketTimeout(conn: *std.http.Client.Connection, seconds: u32) void {
     ) catch {};
 }
 
+/// Return an Io vtable that translates the POSIX EAGAIN produced by
+/// SO_RCVTIMEO into the network reader's supported timeout error. Zig 0.16.0's
+/// Threaded backend treats EAGAIN as a programmer bug; keep this scoped to
+/// Threaded HTTP clients so other Io backends retain their native behavior.
+// `Threaded.io` only embeds this pointer; it does not dereference it while
+// constructing the canonical vtable.
+const threaded_vtable = std.Io.Threaded.io(@ptrFromInt(0)).vtable;
+const timeout_aware_threaded_vtable: std.Io.VTable = vtable: {
+    var copy = threaded_vtable.*;
+    copy.netRead = netReadWithSocketTimeout;
+    break :vtable copy;
+};
+
+pub fn timeoutAwareIo(io: std.Io) std.Io {
+    if (os.is_windows or io.userdata == null) return io;
+    if (io.vtable != threaded_vtable) return io;
+    return .{ .userdata = io.userdata, .vtable = &timeout_aware_threaded_vtable };
+}
+
+fn netReadWithSocketTimeout(
+    userdata: ?*anyopaque,
+    fd: std.Io.net.Socket.Handle,
+    data: [][]u8,
+) std.Io.net.Stream.Reader.Error!usize {
+    var vectors: [std.Io.Threaded.max_iovecs_len]std.posix.iovec = undefined;
+    var vector_count: usize = 0;
+    for (data) |buffer| {
+        if (vector_count == vectors.len) break;
+        if (buffer.len == 0) continue;
+        vectors[vector_count] = .{ .base = buffer.ptr, .len = buffer.len };
+        vector_count += 1;
+    }
+    std.debug.assert(vector_count > 0);
+
+    while (true) {
+        try threaded_vtable.checkCancel(userdata);
+        const result = std.posix.system.readv(fd, &vectors, @intCast(vector_count));
+        switch (std.posix.errno(result)) {
+            .SUCCESS => return @intCast(result),
+            .INTR => continue,
+            .AGAIN, .TIMEDOUT => return error.Timeout,
+            .NOBUFS, .NOMEM => return error.SystemResources,
+            .NOTCONN, .PIPE => return error.SocketUnconnected,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .NETDOWN => return error.NetworkDown,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
+test "timeoutAwareIo wraps the Threaded backend only on POSIX" {
+    const io = std.testing.io;
+    const wrapped = timeoutAwareIo(io);
+    if (os.is_windows) {
+        try std.testing.expect(wrapped.vtable == io.vtable);
+    } else {
+        try std.testing.expect(wrapped.vtable == &timeout_aware_threaded_vtable);
+    }
+}
+
 /// Pull a human-readable message out of an error response body. Handles the
 /// common OpenAI-ish shapes — `{"error":{"message":...}}`, `{"error":"..."}`,
 /// `{"message":...}` — and falls back to the raw body (capped) when the body
