@@ -85,6 +85,10 @@ pub const Client = struct {
         try self.core_client.updateTools(specs);
     }
 
+    pub fn updateSystemPrompt(self: *Client, prompt_text: []const u8) !void {
+        try self.core_client.updateSystemPrompt(prompt_text);
+    }
+
     pub fn prompt(self: *Client, messages: []const ai.MessageView, observer: anytype) !ai.Turn {
         var bridge: ObserverBridge(@TypeOf(observer)) = .{ .observer = observer };
         return self.promptWebSocket(messages, bridge.streamObserver()) catch |err| {

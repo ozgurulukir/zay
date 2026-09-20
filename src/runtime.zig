@@ -201,7 +201,9 @@ pub const AgentRuntime = struct {
         errdefer skill_mod.deinitAll(gpa, skills);
         const plugin_prompts = if (template) |t| try plugin_prompt.cloneAll(gpa, t.plugin_prompts) else try plugin_prompt.loadAll(gpa, io, home_dir, cwd);
         errdefer plugin_prompt.deinitAll(gpa, plugin_prompts);
-        const owned_system_prompt = if (template) |t| try gpa.dupe(u8, t.system_prompt) else try context_assembly.assembleSystemPrompt(gpa, io, owned_base_system_prompt, home_dir, cwd, skills, plugin_prompts);
+        // A lane shares the parent's stable skills/plugin prompt inputs, but
+        // Git and project rules belong to its own worktree.
+        const owned_system_prompt = try context_assembly.assembleSystemPrompt(gpa, io, owned_base_system_prompt, home_dir, owned_cwd, skills, plugin_prompts);
         errdefer gpa.free(owned_system_prompt);
 
         target.* = .{
@@ -291,6 +293,33 @@ pub const AgentRuntime = struct {
             // New session - will save model info after applyFromConfig
             try target.applyFromConfig(config);
         }
+    }
+
+    /// Refresh turn-scoped context on the worker, before user messages enter
+    /// history. A failed assembly leaves the last-good prompt untouched.
+    pub fn refreshSystemPrompt(self: *AgentRuntime, cwd: []const u8) !void {
+        const next = try context_assembly.assembleSystemPrompt(
+            self.gpa,
+            self.io,
+            self.base_system_prompt,
+            self.home_dir,
+            cwd,
+            self.skills,
+            self.plugin_prompts,
+        );
+        if (std.mem.eql(u8, next, self.system_prompt)) {
+            self.gpa.free(next);
+            return;
+        }
+        errdefer self.gpa.free(next);
+
+        // The concrete Responses clients own a separate `instructions` copy.
+        // Allocate/update it before mutating the cached Agent history.
+        try self.client.updateSystemPrompt(next);
+        try self.agent.replaceSystem(next);
+
+        self.gpa.free(self.system_prompt);
+        self.system_prompt = next;
     }
 
     /// Resolve the model recorded in the session summary onto the config and

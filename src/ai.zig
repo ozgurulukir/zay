@@ -755,6 +755,16 @@ pub const LanguageModel = union(enum) {
             inline else => |c| c.updateTools(specs),
         };
     }
+
+    /// Refresh wire-level system instructions between requests. Chat history
+    /// carries its prompt as a system message; Responses clients own config.
+    pub fn updateSystemPrompt(self: LanguageModel, prompt_text: []const u8) !void {
+        return switch (self) {
+            .none, .openai_compatible, .scripted => {},
+            .codex_responses => |c| c.updateSystemPrompt(prompt_text),
+            .responses => |c| c.updateSystemPrompt(prompt_text),
+        };
+    }
 };
 test "clampTokenCount clamps negative values to zero" {
     try std.testing.expectEqual(@as(u32, 0), clampTokenCount(-1));
