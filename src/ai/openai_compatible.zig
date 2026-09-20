@@ -1278,6 +1278,34 @@ test "prompt retries a transient 503 and succeeds" {
     try std.testing.expectEqualStrings("hi", turn.assistant.assistant.content[0].text.text);
 }
 
+test "prompt retries after a dropped response head with the same payload" {
+    if (os.is_windows) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const responses = [_]mock_http_server.Response{
+        .{ .status = .ok, .drop_after_request = true },
+        .{ .status = .ok, .body = ok_sse_body },
+    };
+    var server = try MockHttpServer.initCapturing(gpa, io, &responses);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, MockHttpServer.serve, .{&server});
+    defer thread.join();
+
+    var client = try mock_http_server.retryTestClient(Client, gpa, io, server.port());
+    defer client.deinit();
+
+    var turn = try client.prompt(&.{}, ai.streamNoop());
+    defer turn.deinit(gpa);
+
+    try std.testing.expectEqual(@as(u32, 2), server.connection_count.load(.monotonic));
+    try std.testing.expectEqualStrings("hi", turn.assistant.assistant.content[0].text.text);
+    try std.testing.expect(server.captured[0] != null);
+    try std.testing.expect(server.captured[1] != null);
+    try std.testing.expectEqualStrings(server.captured[0].?, server.captured[1].?);
+}
+
 test "prompt retries a 429 and honors Retry-After" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
