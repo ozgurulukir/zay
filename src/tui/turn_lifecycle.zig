@@ -322,14 +322,16 @@ fn spawnTurn(app: *App, lane: *Thread, opts: SpawnOpts) !void {
     }
     lane.turn_view.awaitModel();
     lane.turn.submit();
-    // Single owner for the prompt on the failure path: once this errdefer is
-    // registered, callers must NOT also free `opts.prompt` on error.
-    errdefer if (opts.prompt) |p| lane.worker_context.?.gpa.free(p);
+    lane.pending_prompt = opts.prompt;
+    errdefer if (lane.pending_prompt) |prompt| {
+        lane.worker_context.?.gpa.free(prompt);
+        lane.pending_prompt = null;
+    };
     lane.turn_future = try app.getIo().concurrent(agent_worker.runAgentTurn, .{
         lane.agent.?,
         lane.liveRuntime(),
         &lane.worker_context.?,
-        opts.prompt,
+        &lane.pending_prompt,
         opts.drain_queue_first,
     });
 }
@@ -339,14 +341,11 @@ fn spawnTurn(app: *App, lane: *Thread, opts: SpawnOpts) !void {
 /// prompt. NOT routed through `spawnTurn` — the spine's reset/submit half
 /// would double-fire on the already-`.active` machine.
 pub fn startTurn(app: *App) !void {
-    const prompt = app.thread.pending_prompt;
-    app.thread.pending_prompt = null;
-    errdefer if (prompt) |p| app.thread.worker_context.?.gpa.free(p);
     app.thread.turn_future = try app.getIo().concurrent(agent_worker.runAgentTurn, .{
         app.thread.agent.?,
         app.thread.liveRuntime(),
         &app.thread.worker_context.?,
-        prompt,
+        &app.thread.pending_prompt,
         false,
     });
 }
