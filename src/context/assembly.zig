@@ -25,6 +25,54 @@ const assert = std.debug.assert;
 
 const log = std.log.scoped(.context_assembly);
 
+const windows_test = if (os.is_windows) struct {
+    pub const HANDLE = std.os.windows.HANDLE;
+    pub const DWORD = std.os.windows.DWORD;
+    pub const LPCWSTR = [*:0]const u16;
+    pub const invalid_handle: HANDLE = @ptrFromInt(std.math.maxInt(usize));
+
+    pub const GENERIC_READ: DWORD = 0x80000000;
+    pub const OPEN_EXISTING: DWORD = 3;
+    pub const FILE_ATTRIBUTE_NORMAL: DWORD = 0x80;
+
+    pub extern "kernel32" fn CreateFileW(
+        file_name: LPCWSTR,
+        desired_access: DWORD,
+        share_mode: DWORD,
+        security_attributes: ?*anyopaque,
+        creation_disposition: DWORD,
+        flags_and_attributes: DWORD,
+        template_file: ?HANDLE,
+    ) callconv(.winapi) HANDLE;
+    pub extern "kernel32" fn CloseHandle(handle: HANDLE) callconv(.winapi) i32;
+} else struct {
+    pub const HANDLE = std.os.windows.HANDLE;
+};
+
+fn lockRuleFileAgainstReads(gpa: std.mem.Allocator, path: []const u8) !windows_test.HANDLE {
+    if (os.is_windows) {
+        const wide_path = try std.unicode.utf8ToUtf16LeAllocZ(gpa, path);
+        defer gpa.free(wide_path);
+        const handle = windows_test.CreateFileW(
+            wide_path,
+            windows_test.GENERIC_READ,
+            0,
+            null,
+            windows_test.OPEN_EXISTING,
+            windows_test.FILE_ATTRIBUTE_NORMAL,
+            null,
+        );
+        if (handle == windows_test.invalid_handle) return error.UnableToLockRuleFile;
+        return handle;
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+fn unlockRuleFile(handle: windows_test.HANDLE) void {
+    if (os.is_windows) _ = windows_test.CloseHandle(handle);
+}
+
 /// Default byte limit per historical tool result when pruned. Mirrored as the
 /// `config.CompactionSettings.historical_tool_cap_bytes` default (`context.compaction.historicalToolCapBytes`).
 pub const default_historical_tool_cap_bytes: u32 = 1024;
@@ -1517,20 +1565,30 @@ test "readRuleFile returns the partial content when the file shrinks before read
 }
 
 test "readRuleFile skips an unreadable rule file instead of failing assembly" {
-    // The trick here — a directory named AGENTS.md — makes openFile fail with
-    // NotDir only on POSIX. On Windows opening a directory as a file succeeds,
-    // so the unreadable-weapon mechanism differs; gate to POSIX.
-    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const root = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(root);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    // A directory named AGENTS.md makes openFile fail with NotDir.
-    const rel_dir = ".zig-cache/context-rule-unreadable-test";
-    try std.Io.Dir.createDirPath(.cwd(), io, rel_dir ++ "/AGENTS.md");
-    const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
+    const cwd = try std.fs.path.join(gpa, &.{ root, ".zig-cache", "tmp", &tmp.sub_path });
     defer gpa.free(cwd);
+    try std.Io.Dir.createDirPath(.cwd(), io, cwd);
+    const rule_path = try std.fs.path.join(gpa, &.{ cwd, "AGENTS.md" });
+    defer gpa.free(rule_path);
+
+    var rule_file_lock: ?windows_test.HANDLE = null;
+    defer if (rule_file_lock) |handle| unlockRuleFile(handle);
+    if (os.is_windows) {
+        // A no-sharing Win32 handle makes the later open fail deterministically
+        // with a sharing violation, without changing ACLs or requiring admin.
+        try writeTestFile(gpa, io, cwd, "AGENTS.md", "must not be read");
+        rule_file_lock = try lockRuleFileAgainstReads(gpa, rule_path);
+    } else {
+        // A directory named AGENTS.md makes openFile fail with NotDir on POSIX.
+        try std.Io.Dir.createDirPath(.cwd(), io, rule_path);
+    }
 
     // Assembly must succeed even though the rule file is unreadable, and the
     // unreadable file's content must not appear.
@@ -1538,6 +1596,7 @@ test "readRuleFile skips an unreadable rule file instead of failing assembly" {
     defer gpa.free(prompt);
     try std.testing.expect(std.mem.startsWith(u8, prompt, "System"));
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<project_instructions") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "must not be read") == null);
 }
 
 test "refresh snapshot detects rule add change delete and ignores unchanged inputs" {
@@ -1586,24 +1645,40 @@ test "refresh snapshot detects branch and dirty-state changes" {
 }
 
 test "refresh assembly fails instead of installing a partial unreadable rule set" {
-    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const root = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(root);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    const rel_dir = ".zig-cache/context-refresh-unreadable-test";
-    try std.Io.Dir.createDirPath(.cwd(), io, rel_dir ++ "/AGENTS.md");
-    defer std.Io.Dir.cwd().deleteTree(io, rel_dir) catch {};
-    const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
+    const cwd = try std.fs.path.join(gpa, &.{ root, ".zig-cache", "tmp", &tmp.sub_path });
     defer gpa.free(cwd);
+    try std.Io.Dir.createDirPath(.cwd(), io, cwd);
+    const rule_path = try std.fs.path.join(gpa, &.{ cwd, "AGENTS.md" });
+    defer gpa.free(rule_path);
+
+    if (os.is_windows) {
+        try writeTestFile(gpa, io, cwd, "AGENTS.md", "must not be read");
+    } else {
+        try std.Io.Dir.createDirPath(.cwd(), io, rule_path);
+    }
 
     var snapshot = try captureRefreshSnapshot(gpa, io, "", cwd);
     defer snapshot.deinit(gpa);
-    try std.testing.expectError(
-        error.NotDir,
-        assembleSystemPromptForRefresh(gpa, io, "System", "", cwd, &.{}, &.{}, &snapshot),
-    );
+    var rule_file_lock: ?windows_test.HANDLE = null;
+    defer if (rule_file_lock) |handle| unlockRuleFile(handle);
+    if (os.is_windows) rule_file_lock = try lockRuleFileAgainstReads(gpa, rule_path);
+
+    const result = assembleSystemPromptForRefresh(gpa, io, "System", "", cwd, &.{}, &.{}, &snapshot);
+    if (os.is_windows) {
+        if (result) |prompt| {
+            gpa.free(prompt);
+            return error.ExpectedUnreadableRuleFailure;
+        } else |_| {}
+    } else {
+        try std.testing.expectError(error.NotDir, result);
+    }
 }
 
 test "project rule content cannot break out of its instructions block" {

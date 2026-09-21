@@ -11,6 +11,7 @@ const background = @import("../background.zig");
 const bash = @import("bash_exec.zig");
 const common = @import("common.zig");
 const os = @import("../os.zig");
+const pwsh_exec = @import("pwsh_exec.zig");
 const shell = @import("shell.zig");
 
 /// The bash-specific half of the `shell.Impl` Backend contract (see
@@ -344,28 +345,44 @@ test "validateCwd rejects an absolute cwd outside the root" {
     try std.testing.expect(!Backend.validateCwd(std.testing.allocator, std.testing.io, "/tmp/x", "/etc"));
 }
 
-test "validateCwd blocks a symlink that escapes the root" {
-    // Regression for H3: the lexical check alone let `link -> /etc` inside the
-    // project pass; the best-effort realpath re-check must catch it. Windows
-    // resolves symlinks differently (`REPARSE_POINT_NOT_RESOLVED`), so this
-    // semantics is exercised only on POSIX hosts.
-    if (os.is_windows) return error.SkipZigTest;
+test "validateCwd blocks a directory link that escapes the root" {
     const gpa = std.testing.allocator;
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(cwd_abs);
-    const root_abs = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    const fixture_root = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(fixture_root);
+    const root_abs = try std.fs.path.join(gpa, &.{ fixture_root, "root" });
     defer gpa.free(root_abs);
+    const outside_abs = try std.fs.path.join(gpa, &.{ fixture_root, "outside" });
+    defer gpa.free(outside_abs);
+    try std.Io.Dir.createDirPath(.cwd(), io, root_abs);
+    try std.Io.Dir.createDirPath(.cwd(), io, outside_abs);
 
-    // Create `<tmp>/link -> /etc`; skip the test if the sandbox forbids symlinks.
-    tmp.dir.symLink(std.testing.io, "/etc", "link", .{}) catch return error.SkipZigTest;
+    if (os.is_windows) {
+        // Junctions work on unprivileged Windows runners, unlike directory
+        // symlinks which may require Developer Mode or elevated privileges.
+        var junction = try pwsh_exec.run(
+            gpa,
+            io,
+            root_abs,
+            "New-Item -ItemType Junction -Path link -Target (Join-Path (Get-Location).Path '..\\outside') | Out-Null",
+        );
+        defer junction.deinit(gpa);
+        try std.testing.expectEqual(@as(u8, 0), junction.code);
+    } else {
+        // Keep both paths within the temp fixture while ensuring the target is
+        // outside the validated project root.
+        tmp.dir.symLink(io, outside_abs, "root/link", .{ .is_directory = true }) catch return error.SkipZigTest;
+    }
 
     const link_abs = try std.fs.path.join(gpa, &.{ root_abs, "link" });
     defer gpa.free(link_abs);
 
-    try std.testing.expect(!Backend.validateCwd(gpa, std.testing.io, root_abs, link_abs));
+    try std.testing.expect(!Backend.validateCwd(gpa, io, root_abs, link_abs));
 }
 
 test "empty sentinel block yields no display" {

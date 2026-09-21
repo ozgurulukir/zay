@@ -450,19 +450,17 @@ fn runConnect(job: *ConnectJob) ConnectResult {
     return .ok;
 }
 
-/// Build a stdio MCP server config that runs the given `bash -c` script —
-/// used by the async-connect tests to mock a JSON-RPC server over stdio.
+/// Build a stdio MCP server config for the deterministic Zig mock server.
 /// Caller owns the returned config (free via `McpServerConfig.deinit`).
-fn mockStdioConfig(gpa: std.mem.Allocator, name: []const u8, script: []const u8) !config_mod.McpServerConfig {
-    var args = try gpa.alloc([]u8, 2);
+fn mockStdioConfig(gpa: std.mem.Allocator, name: []const u8, mode: []const u8) !config_mod.McpServerConfig {
+    var args = try gpa.alloc([]u8, 1);
     errdefer gpa.free(args);
-    args[0] = try gpa.dupe(u8, "-c");
-    args[1] = try gpa.dupe(u8, script);
+    args[0] = try gpa.dupe(u8, mode);
     return .{
         .name = try gpa.dupe(u8, name),
         .enabled = true,
         .transport = .{ .stdio = .{
-            .command = try gpa.dupe(u8, "bash"),
+            .command = try gpa.dupe(u8, @import("mcp_mock_server").path),
             .args = args,
         } },
     };
@@ -601,20 +599,12 @@ test "McpManager skips duplicate server names in config" {
 }
 
 test "McpManager async connect spawns, handshakes, discovers, and installs" {
-    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var manager = McpManager.init(gpa);
     defer manager.deinit(std.testing.io);
 
-    // Mock stdio MCP server: initialize -> initialized -> tools/list.
     var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
-    servers[0] = try mockStdioConfig(gpa, "mock",
-        \\read line
-        \\echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"mock","version":"1.0"},"capabilities":{"tools":{}}}}'
-        \\read line
-        \\read line
-        \\echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"greet","description":"Say hello","inputSchema":{"type":"object","properties":{}}}]}}'
-    );
+    servers[0] = try mockStdioConfig(gpa, "mock", "default");
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
     defer cfg.deinit(gpa);
 
@@ -631,14 +621,12 @@ test "McpManager async connect spawns, handshakes, discovers, and installs" {
 }
 
 test "McpManager async connect failure marks the client failed with a reason" {
-    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var manager = McpManager.init(gpa);
     defer manager.deinit(std.testing.io);
 
-    // Mock server that exits immediately without speaking JSON-RPC.
     var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
-    servers[0] = try mockStdioConfig(gpa, "dead", "exit 1");
+    servers[0] = try mockStdioConfig(gpa, "dead", "fail");
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
     defer cfg.deinit(gpa);
 
@@ -658,20 +646,12 @@ test "McpManager async connect failure marks the client failed with a reason" {
 }
 
 test "McpManager async connect fails on a malformed tool discovery response" {
-    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var manager = McpManager.init(gpa);
     defer manager.deinit(std.testing.io);
 
-    // Handshake succeeds, but tools/list answers with non-JSON garbage.
     var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
-    servers[0] = try mockStdioConfig(gpa, "bad-tools",
-        \\read line
-        \\echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"m","version":"1"},"capabilities":{"tools":{}}}}'
-        \\read line
-        \\read line
-        \\echo 'this is not json'
-    );
+    servers[0] = try mockStdioConfig(gpa, "bad-tools", "malformed_tools");
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
     defer cfg.deinit(gpa);
 
@@ -691,13 +671,7 @@ test "McpManager discards a connect outcome when the client is disconnected mid-
     defer manager.deinit(std.testing.io);
 
     var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
-    servers[0] = try mockStdioConfig(gpa, "flaky",
-        \\read line
-        \\echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"m","version":"1"},"capabilities":{"tools":{}}}}'
-        \\read line
-        \\read line
-        \\echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"g","description":"x","inputSchema":{"type":"object","properties":{}}}]}}'
-    );
+    servers[0] = try mockStdioConfig(gpa, "flaky", "slow");
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
     defer cfg.deinit(gpa);
 
@@ -719,9 +693,9 @@ test "McpManager does not launch a second connect while one is pending" {
     var manager = McpManager.init(gpa);
     defer manager.deinit(std.testing.io);
 
-    // A slow server keeps the job pending long enough to double-sync.
+    // A silent server keeps the job pending long enough to double-sync.
     var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
-    servers[0] = try mockStdioConfig(gpa, "slow", "sleep 0.2");
+    servers[0] = try mockStdioConfig(gpa, "slow", "hang");
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
     defer cfg.deinit(gpa);
 
@@ -731,14 +705,13 @@ test "McpManager does not launch a second connect while one is pending" {
 }
 
 test "launchConnect initializes every ConnectJob field" {
-    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var manager = McpManager.init(gpa);
     defer manager.deinit(io);
 
     var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
-    servers[0] = try mockStdioConfig(gpa, "lazy", "sleep 5");
+    servers[0] = try mockStdioConfig(gpa, "lazy", "hang");
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
     defer cfg.deinit(gpa);
 
@@ -756,17 +729,15 @@ test "launchConnect initializes every ConnectJob field" {
 }
 
 test "McpManager deinit while a connect is in flight joins and tears down" {
-    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var manager = McpManager.init(gpa);
     // `deinit` is the code under test — no defer.
 
-    // A server that never speaks JSON-RPC keeps the handshake in flight;
-    // a short read timeout makes the worker give up quickly once the
-    // cancel's implicit join waits for it.
+    // A server that never speaks JSON-RPC keeps the handshake in flight until
+    // teardown terminates the child process.
     var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
-    servers[0] = try mockStdioConfig(gpa, "hang", "sleep 30");
+    servers[0] = try mockStdioConfig(gpa, "hang", "hang");
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
     defer cfg.deinit(gpa);
 

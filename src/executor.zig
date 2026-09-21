@@ -1188,7 +1188,6 @@ fn serviceUntilDone(
 }
 
 test "executor re-roots mid-batch after lane enter" {
-    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
 
     // The lane worktree the fake UI resolves `enter` with.
@@ -1225,7 +1224,10 @@ test "executor re-roots mid-batch after lane enter" {
 
     const calls = [_]ai.ToolCall{
         try makeCall(gpa, "call_enter", "lane", "{\"command\":\"enter\",\"lane\":\"abc\"}"),
-        try makeCall(gpa, "call_pwd", tools.shell_tool.name, "{\"command\":\"pwd\",\"description\":\"Show cwd\"}"),
+        try makeCall(gpa, "call_pwd", tools.shell_tool.name, if (os.is_windows)
+            "{\"command\":\"Get-Location | Select-Object -ExpandProperty Path\",\"description\":\"Show cwd\"}"
+        else
+            "{\"command\":\"pwd\",\"description\":\"Show cwd\"}"),
     };
     defer for (calls) |c| {
         gpa.free(c.call_id.value);
@@ -1273,14 +1275,13 @@ test "executor re-roots mid-batch after lane enter" {
     }
     try std.testing.expectEqual(@as(usize, 2), outcome.results.len);
     try std.testing.expect(!outcome.results[1].failed);
-    // The bash call after `enter` ran in the lane worktree, not the batch-start root.
+    // The native shell call after `enter` ran in the lane worktree, not the batch-start root.
     try std.testing.expect(std.mem.indexOf(u8, outcome.results[1].content, lane_path) != null);
     // Verify plugin_cwd_slot was refreshed to the lane path for the post-enter call.
     try std.testing.expectEqualStrings(lane_path, outcome.captured_slot orelse "");
 }
 
 test "executor re-roots back on lane leave" {
-    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1310,7 +1311,10 @@ test "executor re-roots back on lane leave" {
     const calls = [_]ai.ToolCall{
         try makeCall(gpa, "call_enter", "lane", "{\"command\":\"enter\",\"lane\":\"abc\"}"),
         try makeCall(gpa, "call_leave", "lane", "{\"command\":\"leave\",\"lane\":\"abc\"}"),
-        try makeCall(gpa, "call_pwd", tools.shell_tool.name, "{\"command\":\"pwd\",\"description\":\"Show cwd\"}"),
+        try makeCall(gpa, "call_pwd", tools.shell_tool.name, if (os.is_windows)
+            "{\"command\":\"Get-Location | Select-Object -ExpandProperty Path\",\"description\":\"Show cwd\"}"
+        else
+            "{\"command\":\"pwd\",\"description\":\"Show cwd\"}"),
     };
     defer for (calls) |c| {
         gpa.free(c.call_id.value);
