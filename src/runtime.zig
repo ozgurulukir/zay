@@ -29,6 +29,7 @@ pub const AgentRuntime = struct {
     client: ai.LanguageModel,
     base_system_prompt: []const u8,
     system_prompt: []const u8,
+    refresh_snapshot: ?context_assembly.RefreshSnapshot = null,
     skills: []skill_mod.Skill,
     /// Per-plugin `prompt.md` bodies, injected into the system prompt at
     /// assembly time so the model learns how to use each plugin's tools.
@@ -205,6 +206,11 @@ pub const AgentRuntime = struct {
         // Git and project rules belong to its own worktree.
         const owned_system_prompt = try context_assembly.assembleSystemPrompt(gpa, io, owned_base_system_prompt, home_dir, owned_cwd, skills, plugin_prompts);
         errdefer gpa.free(owned_system_prompt);
+        var refresh_snapshot = context_assembly.captureRefreshSnapshot(gpa, io, home_dir, owned_cwd) catch |err| snapshot: {
+            log.warn("context.refresh.initial_snapshot_failed err={s}", .{@errorName(err)});
+            break :snapshot null;
+        };
+        errdefer if (refresh_snapshot) |*snapshot| snapshot.deinit(gpa);
 
         target.* = .{
             .gpa = gpa,
@@ -214,6 +220,7 @@ pub const AgentRuntime = struct {
             .client = .none,
             .base_system_prompt = owned_base_system_prompt,
             .system_prompt = owned_system_prompt,
+            .refresh_snapshot = refresh_snapshot,
             .skills = skills,
             .plugin_prompts = plugin_prompts,
             .session_writer = undefined,
@@ -298,7 +305,16 @@ pub const AgentRuntime = struct {
     /// Refresh turn-scoped context on the worker, before user messages enter
     /// history. A failed assembly leaves the last-good prompt untouched.
     pub fn refreshSystemPrompt(self: *AgentRuntime, cwd: []const u8) !void {
-        const next = try context_assembly.assembleSystemPrompt(
+        var next_snapshot = try context_assembly.captureRefreshSnapshot(self.gpa, self.io, self.home_dir, cwd);
+        errdefer next_snapshot.deinit(self.gpa);
+        if (self.refresh_snapshot) |*current| {
+            if (current.eql(&next_snapshot)) {
+                next_snapshot.deinit(self.gpa);
+                return;
+            }
+        }
+
+        const next = try context_assembly.assembleSystemPromptForRefresh(
             self.gpa,
             self.io,
             self.base_system_prompt,
@@ -306,12 +322,20 @@ pub const AgentRuntime = struct {
             cwd,
             self.skills,
             self.plugin_prompts,
+            &next_snapshot,
         );
+        errdefer self.gpa.free(next);
+
+        var verified_snapshot = try context_assembly.captureRefreshSnapshot(self.gpa, self.io, self.home_dir, cwd);
+        defer verified_snapshot.deinit(self.gpa);
+        if (!next_snapshot.eql(&verified_snapshot)) return error.RefreshInputsChanged;
+
         if (std.mem.eql(u8, next, self.system_prompt)) {
             self.gpa.free(next);
+            if (self.refresh_snapshot) |*current| current.deinit(self.gpa);
+            self.refresh_snapshot = next_snapshot;
             return;
         }
-        errdefer self.gpa.free(next);
 
         // The concrete Responses clients own a separate `instructions` copy.
         // Allocate/update it before mutating the cached Agent history.
@@ -320,6 +344,8 @@ pub const AgentRuntime = struct {
 
         self.gpa.free(self.system_prompt);
         self.system_prompt = next;
+        if (self.refresh_snapshot) |*current| current.deinit(self.gpa);
+        self.refresh_snapshot = next_snapshot;
     }
 
     /// Resolve the model recorded in the session summary onto the config and
@@ -492,6 +518,7 @@ pub const AgentRuntime = struct {
         self.session_writer.deinit();
         self.gpa.free(self.base_system_prompt);
         self.gpa.free(self.system_prompt);
+        if (self.refresh_snapshot) |*snapshot| snapshot.deinit(self.gpa);
         // `cwd` is runtime-owned (duped in initSession); `home_dir` is borrowed
         // from the root config and lives until the app exits — not freed here.
         self.gpa.free(self.cwd);

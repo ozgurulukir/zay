@@ -44,6 +44,7 @@ pub fn makeParkTestRuntime(gpa: std.mem.Allocator, home_abs: []const u8) !*@impo
     errdefer gpa.free(runtime.base_system_prompt);
     runtime.system_prompt = try gpa.dupe(u8, "");
     errdefer gpa.free(runtime.system_prompt);
+    runtime.refresh_snapshot = null;
     runtime.skills = &.{};
     runtime.plugin_prompts = &.{};
     runtime.diagnostics = &.{};
