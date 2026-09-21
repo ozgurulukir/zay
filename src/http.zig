@@ -248,9 +248,11 @@ pub fn setSocketTimeout(conn: *std.http.Client.Connection, seconds: u32) void {
 /// SO_RCVTIMEO into the network reader's supported timeout error. Zig 0.16.0's
 /// Threaded backend treats EAGAIN as a programmer bug; keep this scoped to
 /// Threaded HTTP clients so other Io backends retain their native behavior.
-// `Threaded.io` only embeds this pointer; it does not dereference it while
-// constructing the canonical vtable.
-const threaded_vtable = std.Io.Threaded.io(@ptrFromInt(0)).vtable;
+// `Threaded.io` only embeds this pointer; it does not read the anchor while
+// constructing the canonical vtable. A real object keeps ReleaseFast builds
+// from relying on an invalid null pointer solely to recover that vtable.
+var threaded_vtable_anchor: std.Io.Threaded = undefined;
+const threaded_vtable = std.Io.Threaded.io(&threaded_vtable_anchor).vtable;
 const timeout_aware_threaded_vtable: std.Io.VTable = vtable: {
     var copy = threaded_vtable.*;
     copy.netRead = netReadWithSocketTimeout;
