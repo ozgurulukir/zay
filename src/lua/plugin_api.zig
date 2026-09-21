@@ -1383,33 +1383,63 @@ fn gitAvailable() bool {
     } else |_| return false;
 }
 
-/// Create an empty git repo under `/tmp/zay-inject-test`, returning the path.
-/// Caller frees the path; the dir is removed via the shell. Sets a deterministic
-/// identity so `git commit` does not refuse to run.
-fn makeInjectionTestRepo(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
-    const dir = try std.fs.path.join(gpa, &.{ "/tmp", "zay-inject-test" });
-    errdefer gpa.free(dir);
-    ignoreRun(gpa, io, "/tmp", "rm -rf zay-inject-test");
-    var result = try bash_exec.run(
-        gpa,
-        io,
-        "/tmp",
-        "mkdir -p zay-inject-test && git -C zay-inject-test init -q && " ++
-            "git -C zay-inject-test config user.email t@t && " ++
-            "git -C zay-inject-test config user.name t",
-    );
-    result.deinit(gpa);
-    return dir;
+fn runGitSetup(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, command: []const u8) !bash_exec.Result {
+    if (os.is_windows) return pwsh_exec.run(gpa, io, cwd, command);
+    return bash_exec.run(gpa, io, cwd, command);
 }
 
-/// True iff the file at `absolute_path` exists. Routed through the shell so the
-/// test does not depend on a specific Dir API name for absolute paths.
-fn fileExists(gpa: std.mem.Allocator, io: std.Io, absolute_path: []const u8) bool {
-    const cmd = std.fmt.allocPrint(gpa, "test -f {s}", .{absolute_path}) catch return false;
-    defer gpa.free(cmd);
-    var result = bash_exec.run(gpa, io, "/tmp", cmd) catch return false;
-    defer result.deinit(gpa);
-    return result.code == 0;
+fn runGitSetupWithOptions(gpa: std.mem.Allocator, io: std.Io, options: bash_exec.RunOptions) !bash_exec.Result {
+    if (os.is_windows) return pwsh_exec.runWithOptions(gpa, io, .{
+        .cwd = options.cwd,
+        .command = options.command,
+        .env_map = options.env_map,
+        .timeout = options.timeout,
+        .stdin = options.stdin,
+    });
+    return bash_exec.runWithOptions(gpa, io, options);
+}
+
+const GitTestRepo = struct {
+    tmp: std.testing.TmpDir,
+    path: []u8,
+
+    fn init(gpa: std.mem.Allocator, io: std.Io, branch: []const u8) !GitTestRepo {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const root = try std.process.currentPathAlloc(io, gpa);
+        defer gpa.free(root);
+        const path = try std.fs.path.join(gpa, &.{ root, ".zig-cache", "tmp", &tmp.sub_path, "repo" });
+        errdefer gpa.free(path);
+        try std.Io.Dir.createDirPath(.cwd(), io, path);
+        const command = try std.fmt.allocPrint(
+            gpa,
+            "git init -q -b {s} && git config user.email t@t && git config user.name t",
+            .{branch},
+        );
+        defer gpa.free(command);
+        var result = try runGitSetup(gpa, io, path, command);
+        defer result.deinit(gpa);
+        if (result.code != 0) return error.GitInitializationFailed;
+        return .{ .tmp = tmp, .path = path };
+    }
+
+    fn deinit(self: *GitTestRepo, gpa: std.mem.Allocator) void {
+        gpa.free(self.path);
+        self.tmp.cleanup();
+    }
+};
+
+fn toBashPath(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    const result = try gpa.dupe(u8, path);
+    for (result) |*byte| {
+        if (byte.* == '\\') byte.* = '/';
+    }
+    return result;
+}
+
+fn fileExists(io: std.Io, absolute_path: []const u8) bool {
+    std.Io.Dir.accessAbsolute(io, absolute_path, .{}) catch return false;
+    return true;
 }
 
 test "shellQuote: plain argument is wrapped in single quotes" {
@@ -1434,70 +1464,64 @@ test "shellQuote: empty argument becomes two quotes" {
 }
 
 test "gitCommit: injection payload stays a literal commit message (stdin path)" {
-    // Gate on OS first (before gitAvailable): on Windows these tests spawn a
-    // real `bash`/git via bash_exec with /tmp paths, which is unsupported.
-    if (os.is_windows) return error.SkipZigTest;
     if (!gitAvailable()) return;
 
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir = try makeInjectionTestRepo(gpa, io);
-    defer {
-        ignoreRun(gpa, io, "/tmp", "rm -rf zay-inject-test");
-        gpa.free(dir);
-    }
+    var repo = try GitTestRepo.init(gpa, io, "zay-injection-test");
+    defer repo.deinit(gpa);
 
     // The injection vector from the plan: a quote-break-out attempt. With the
-    // old `-m "{msg}"` it would run `touch /tmp/pwned_zay`; with `-F -` +
+    // old `-m "{msg}"` it would run `touch <marker>`; with `-F -` +
     // stdin it must become the literal commit subject.
-    const marker = "/tmp/pwned_zay_commit";
-    ignoreRun(gpa, io, "/tmp", "rm -f pwned_zay_commit");
-    const payload = "x\"; touch " ++ marker ++ "; #";
-    var result = try bash_exec.runWithOptions(gpa, io, .{
-        .cwd = dir,
+    const marker_native = try std.fs.path.join(gpa, &.{ repo.path, "pwned_zay_commit" });
+    defer gpa.free(marker_native);
+    const marker = try toBashPath(gpa, marker_native);
+    defer gpa.free(marker);
+    const payload = try std.fmt.allocPrint(gpa, "x\"; touch {s}; #", .{marker});
+    defer gpa.free(payload);
+    var result = try runGitSetupWithOptions(gpa, io, .{
+        .cwd = repo.path,
         .command = "git add -A && git commit -F -",
         .stdin = payload,
     });
     result.deinit(gpa);
 
     // The marker file must NOT exist: the payload never reached the shell.
-    try std.testing.expect(!fileExists(gpa, io, marker));
-    ignoreRun(gpa, io, "/tmp", "rm -f pwned_zay_commit");
+    try std.testing.expect(!fileExists(io, marker_native));
 }
 
 test "gitDiff: injection payload stays a literal pathspec (shellQuote path)" {
-    // See gitCommit: OS-gate first so it's counted as skipped on Windows.
-    if (os.is_windows) return error.SkipZigTest;
     if (!gitAvailable()) return;
 
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir = try makeInjectionTestRepo(gpa, io);
-    defer {
-        ignoreRun(gpa, io, "/tmp", "rm -rf zay-inject-test");
-        gpa.free(dir);
-    }
+    var repo = try GitTestRepo.init(gpa, io, "zay-diff-test");
 
     // A commit so `git diff` has something to diff against.
-    var setup = try bash_exec.run(gpa, io, dir, "echo a > f && git add -A && git commit -q -m init");
+    defer repo.deinit(gpa);
+    var setup = try runGitSetup(gpa, io, repo.path, "echo a > f && git add -A && git commit -q -m init");
     setup.deinit(gpa);
 
-    const marker = "/tmp/pwned_zay_diff";
-    ignoreRun(gpa, io, "/tmp", "rm -f pwned_zay_diff");
+    const marker_native = try std.fs.path.join(gpa, &.{ repo.path, "pwned_zay_diff" });
+    defer gpa.free(marker_native);
+    const marker = try toBashPath(gpa, marker_native);
+    defer gpa.free(marker);
     // The quote-break-out payload, funneled through `shellQuote` exactly as
     // `gitDiff` does, must become one inert pathspec.
-    const quoted = try quoteShellArg(gpa, "x'; touch " ++ marker ++ "; #", false);
+    const payload = try std.fmt.allocPrint(gpa, "x'; touch {s}; #", .{marker});
+    defer gpa.free(payload);
+    const quoted = try quoteShellArg(gpa, payload, false);
     defer gpa.free(quoted);
     const cmd = try std.fmt.allocPrint(gpa, "git diff -- {s}", .{quoted});
     defer gpa.free(cmd);
     var result = try bash_exec.runWithOptions(gpa, io, .{
-        .cwd = dir,
+        .cwd = repo.path,
         .command = cmd,
     });
     result.deinit(gpa);
 
-    try std.testing.expect(!fileExists(gpa, io, marker));
-    ignoreRun(gpa, io, "/tmp", "rm -f pwned_zay_diff");
+    try std.testing.expect(!fileExists(io, marker_native));
 }
 
 test "RunOptions.stdin bypasses shell interpretation" {
@@ -1815,26 +1839,26 @@ test "sanitizePath allows a nonexistent new-file path (realpath-failure fallback
 // the bridge) in a temp dir that is NOT a repo, and in a fresh repo.
 
 test "gitStatus returns nil + error outside a repo" {
-    // See gitCommit: OS-gate first so it's counted as skipped on Windows.
-    if (os.is_windows) return error.SkipZigTest;
     if (!gitAvailable()) return;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir = try std.fs.path.join(gpa, &.{ "/tmp", "zay-git-notrepo" });
-    defer gpa.free(dir);
-    ignoreRun(gpa, io, "/tmp", "rm -rf zay-git-notrepo && mkdir -p zay-git-notrepo");
-
-    const cwd = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(cwd);
-    // The bridge runs git in cwd (repo root), which IS a repo here. To test the
-    // non-repo path we invoke the underlying command in the temp dir directly.
-    var result = try bash_exec.run(gpa, io, dir, "git status --porcelain");
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+    var result = if (os.is_windows) blk: {
+        const command =
+            "$gitTemp = Join-Path $env:TEMP ('zay-git-notrepo-' + [guid]::NewGuid().ToString('N'))\n" ++
+            "New-Item -ItemType Directory -Path $gitTemp | Out-Null\n" ++
+            "$gitCode = 0\n" ++
+            "try { Push-Location $gitTemp; $null = git status --porcelain 2>$null; $gitCode = $LASTEXITCODE }\n" ++
+            "finally { Pop-Location; Remove-Item -LiteralPath $gitTemp -Recurse -Force }\n" ++
+            "exit $gitCode";
+        break :blk try pwsh_exec.run(gpa, io, root, command);
+    } else try bash_exec.run(gpa, io, root, "cd /tmp && git status --porcelain");
     defer result.deinit(gpa);
     try std.testing.expect(result.code != 0);
     try std.testing.expect(result.stdout.len == 0);
     const err = gitErrorString(result.stderr, result.code);
     try std.testing.expect(err.len > 0);
-    ignoreRun(gpa, io, "/tmp", "rm -rf zay-git-notrepo");
 }
 
 test "gitErrorString prefers stderr over generic exit code" {
@@ -1843,8 +1867,6 @@ test "gitErrorString prefers stderr over generic exit code" {
 }
 
 test "git bridges return strings inside a repo (S4 success path)" {
-    // See gitCommit: OS-gate first so it's counted as skipped on Windows.
-    if (os.is_windows) return error.SkipZigTest;
     if (!gitAvailable()) return;
 
     // A dedicated fixture repo keeps the bridges hermetic: the live repo
@@ -1853,20 +1875,14 @@ test "git bridges return strings inside a repo (S4 success path)" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
 
-    const test_dir = ".zig-cache/test_git_bridges_repo";
-    std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
-    try std.Io.Dir.cwd().createDirPath(io, test_dir);
-    defer std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
+    var repo = try GitTestRepo.init(gpa, io, "zay-bridges-test");
+    defer repo.deinit(gpa);
 
-    var init = bash_exec.run(gpa, io, test_dir, "git init -q -b zay-bridges-test && git config user.email t@t && git config user.name t") catch return;
-    defer init.deinit(gpa);
-    if (init.code != 0) return error.SkipZigTest;
-
-    var commit = bash_exec.run(gpa, io, test_dir, "git commit --allow-empty -m initial") catch return;
+    var commit = try runGitSetup(gpa, io, repo.path, "git commit --allow-empty -m initial");
     defer commit.deinit(gpa);
-    if (commit.code != 0) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u8, 0), commit.code);
 
-    const abs_test_dir = try std.fs.path.resolve(gpa, &.{test_dir});
+    const abs_test_dir = try gpa.dupe(u8, repo.path);
     defer gpa.free(abs_test_dir);
 
     const sandbox = @import("sandbox.zig");
@@ -2053,30 +2069,19 @@ test "plugin_api: get_cwd and get_project_root respect bridge.plugin_cwd_slot" {
 }
 
 test "plugin_api: git read bridges run in bridge.plugin_cwd_slot cwd" {
-    if (os.is_windows) return error.SkipZigTest;
     if (!gitAvailable()) return;
 
     const io = std.testing.io;
     const gpa = std.testing.allocator;
 
-    const root = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(root);
+    var repo = try GitTestRepo.init(gpa, io, "zay-slot-test");
+    defer repo.deinit(gpa);
 
-    const test_dir = ".zig-cache/test_git_slot_cwd";
-    std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
-    try std.Io.Dir.cwd().createDirPath(io, test_dir);
-    defer std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
-
-    // Init a git repo with a dedicated branch name.
-    var init = bash_exec.run(gpa, io, test_dir, "git init -q -b zay-slot-test && git config user.email t@t && git config user.name t") catch return;
-    defer init.deinit(gpa);
-    if (init.code != 0) return error.SkipZigTest;
-
-    var commit = bash_exec.run(gpa, io, test_dir, "git commit --allow-empty -m initial") catch return;
+    var commit = try runGitSetup(gpa, io, repo.path, "git commit --allow-empty -m initial");
     defer commit.deinit(gpa);
-    if (commit.code != 0) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u8, 0), commit.code);
 
-    const abs_test_dir = try std.fs.path.resolve(gpa, &.{test_dir});
+    const abs_test_dir = try gpa.dupe(u8, repo.path);
     defer gpa.free(abs_test_dir);
 
     const sandbox = @import("sandbox.zig");

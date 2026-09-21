@@ -580,31 +580,36 @@ pub const McpClient = struct {
         // arrives. Server-initiated notifications (method, no id) are
         // routed to handleNotification and we keep reading.
         while (true) {
-            // Wait for data on stdout with a timeout to prevent infinite hangs.
-            // HUP alone is not treated as a crash — a server that has written
-            // its response and exited still has buffered data in the pipe we
-            // need to drain. Only a read failure after poll is a true crash.
-            if (os.is_windows) {
-                const timeout_ns: i96 = @as(i96, self.read_timeout_ms) * std.time.ns_per_ms;
-                const start_time = std.Io.Timestamp.now(io, .awake);
-                while (true) {
-                    var bytes_avail: windows.DWORD = 0;
-                    if (windows.PeekNamedPipe(stdout_file.handle, null, 0, null, &bytes_avail, null) == 0) {
-                        return error.McpServerCrashed;
+            // A read can buffer both an interleaved notification and its
+            // response. Drain a complete buffered line before polling the OS
+            // handle, which may already have no bytes left to report.
+            const has_buffered_line = std.mem.indexOfScalar(u8, reader.interface.buffered(), '\n') != null;
+            if (!has_buffered_line) {
+                // Wait for data on stdout with a timeout to prevent infinite
+                // hangs. HUP alone is not a crash: buffered bytes still need
+                // draining after the child exits.
+                if (os.is_windows) {
+                    const timeout_ns: i96 = @as(i96, self.read_timeout_ms) * std.time.ns_per_ms;
+                    const start_time = std.Io.Timestamp.now(io, .awake);
+                    while (true) {
+                        var bytes_avail: windows.DWORD = 0;
+                        if (windows.PeekNamedPipe(stdout_file.handle, null, 0, null, &bytes_avail, null) == 0) {
+                            return error.McpServerCrashed;
+                        }
+                        if (bytes_avail > 0) break;
+                        const now = std.Io.Timestamp.now(io, .awake);
+                        if (start_time.durationTo(now).nanoseconds >= timeout_ns) {
+                            return error.Timeout;
+                        }
+                        io.sleep(.fromMilliseconds(10), .awake) catch {};
                     }
-                    if (bytes_avail > 0) break;
-                    const now = std.Io.Timestamp.now(io, .awake);
-                    if (start_time.durationTo(now).nanoseconds >= timeout_ns) {
-                        return error.Timeout;
-                    }
-                    io.sleep(.fromMilliseconds(10), .awake) catch {};
+                } else {
+                    var poll_fds: [1]std.posix.pollfd = .{
+                        .{ .fd = stdout_file.handle, .events = std.posix.POLL.IN, .revents = 0 },
+                    };
+                    const ready = std.posix.poll(&poll_fds, @intCast(self.read_timeout_ms)) catch return error.ReadFailed;
+                    if (ready == 0) return error.Timeout;
                 }
-            } else {
-                var poll_fds: [1]std.posix.pollfd = .{
-                    .{ .fd = stdout_file.handle, .events = std.posix.POLL.IN, .revents = 0 },
-                };
-                const ready = std.posix.poll(&poll_fds, @intCast(self.read_timeout_ms)) catch return error.ReadFailed;
-                if (ready == 0) return error.Timeout;
             }
 
             // Read one line from stdout (newline-delimited JSON-RPC).
@@ -1078,6 +1083,10 @@ fn readJsonBody(gpa: std.mem.Allocator, response: *std.http.Client.Response) ![]
     };
 }
 
+fn initMockClient(gpa: std.mem.Allocator, name: []const u8, mode: []const u8) !McpClient {
+    return McpClient.init(gpa, name, @import("mcp_mock_server").path, &.{mode}, null);
+}
+
 test "McpClient initializes and formats namespaced tool names" {
     const gpa = std.testing.allocator;
     var client = try McpClient.init(gpa, "memory", "npx", &.{}, null);
@@ -1098,15 +1107,11 @@ test "McpClient initializes and formats namespaced tool names" {
 }
 
 test "McpClient startStdio + stop lifecycle" {
-    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
     // Spawn a simple echo server that reads one line and echoes it back.
-    var client = try McpClient.init(gpa, "echo-test", "bash", &.{
-        "-c",
-        "read line; echo \"$line\"",
-    }, null);
+    var client = try initMockClient(gpa, "stdio-test", "hang");
     defer client.deinit(io);
 
     try client.startStdio(io);
@@ -1117,15 +1122,11 @@ test "McpClient startStdio + stop lifecycle" {
 }
 
 test "McpClient sendRequest round-trip" {
-    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
     // Bash one-liner: read one line from stdin, echo a fixed JSON-RPC response.
-    var client = try McpClient.init(gpa, "echo-test", "bash", &.{
-        "-c",
-        "read line; echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\"}}'",
-    }, null);
+    var client = try initMockClient(gpa, "echo-test", "default");
     defer client.deinit(io);
 
     try client.startStdio(io);
@@ -1140,20 +1141,10 @@ test "McpClient sendRequest round-trip" {
 }
 
 test "McpClient full handshake + tools/list" {
-    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    // Mock MCP server that handles initialize + initialized + tools/list.
-    // Protocol: read initialize → respond → read initialized (ignore) → read tools/list → respond.
-    var client = try McpClient.init(gpa, "mock-server", "bash", &.{
-        "-c",
-        \\read line
-        \\echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"mock","version":"1.0"},"capabilities":{"tools":{}}}}'
-        \\read line
-        \\read line
-        \\echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"greet","description":"Say hello","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Name to greet"}},"required":["name"]}}]}}'
-    }, null);
+    var client = try initMockClient(gpa, "mock-server", "default");
     defer client.deinit(io);
 
     try client.startStdio(io);
@@ -1185,17 +1176,10 @@ test "McpClient full handshake + tools/list" {
 }
 
 test "McpClient initialize captures tools.listChanged capability" {
-    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    // Mock server that advertises tools.listChanged: true.
-    var client = try McpClient.init(gpa, "changeful", "bash", &.{
-        "-c",
-        \\read line
-        \\echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"changeful","version":"2.0"},"capabilities":{"tools":{"listChanged":true}}}}'
-        \\read line
-    }, null);
+    var client = try initMockClient(gpa, "changeful", "list_changed");
     defer client.deinit(io);
 
     try client.startStdio(io);
@@ -1209,21 +1193,10 @@ test "McpClient initialize captures tools.listChanged capability" {
 }
 
 test "McpClient callTool round-trip" {
-    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    // Mock MCP server: initialize → tools/list → tools/call → respond with text content.
-    var client = try McpClient.init(gpa, "mock-server", "bash", &.{
-        "-c",
-        \\read line
-        \\echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"mock","version":"1.0"},"capabilities":{"tools":{}}}}'
-        \\read line
-        \\read line
-        \\echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"greet","description":"Say hello","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Name to greet"}},"required":["name"]}}]}}'
-        \\read line
-        \\echo '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"Hello, World!"}]}}'
-    }, null);
+    var client = try initMockClient(gpa, "mock-server", "default");
     defer client.deinit(io);
 
     try client.startStdio(io);
@@ -1326,22 +1299,10 @@ test "handleNotification sets pending_tools_refresh for tools/list_changed" {
 }
 
 test "sendRequestStdio routes interleaved notifications to handleNotification" {
-    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    // Mock MCP server that advertises tools.listChanged. For the tools/list
-    // request it emits a notification BEFORE the response — exercises the
-    // stdio read loop's notification routing.
-    var client = try McpClient.init(gpa, "notif-server", "bash", &.{
-        "-c",
-        \\read line
-        \\echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"mock","version":"1.0"},"capabilities":{"tools":{"listChanged":true}}}}'
-        \\read line
-        \\read line
-        \\echo '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}'
-        \\echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"greet","description":"Say hello","inputSchema":{"type":"object","properties":{}}}]}}'
-    }, null);
+    var client = try initMockClient(gpa, "notif-server", "interleaved");
     defer client.deinit(io);
 
     try client.startStdio(io);
@@ -1381,15 +1342,10 @@ test "httpTimeoutParts derives timeval sec/usec from read_timeout_ms" {
 }
 
 test "McpClient sendRequest timeout produces error.Timeout" {
-    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    // Server that sleeps longer than the configured read_timeout_ms
-    var client = try McpClient.init(gpa, "slow-server", "bash", &.{
-        "-c",
-        "sleep 1; echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'",
-    }, null);
+    var client = try initMockClient(gpa, "slow-server", "slow");
     defer client.deinit(io);
     client.read_timeout_ms = 50;
 

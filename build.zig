@@ -103,6 +103,18 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const mcp_mock_server = b.addExecutable(.{
+        .name = "zay-mcp-mock-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mcp/mock_server.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const mcp_mock_options = b.addOptions();
+    mcp_mock_options.addOptionPath("path", mcp_mock_server.getEmittedBin());
+    mod.addOptions("mcp_mock_server", mcp_mock_options);
+
     // Version string embedded into the binary, surfaced by `zay --version` and
     // the settings panel. SSOT is the git tag: CI passes `-Dversion` explicitly on
     // release builds; local builds fall back to `git describe --tags --always`
