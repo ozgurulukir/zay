@@ -41,6 +41,94 @@ const project_rule_filenames = [_][]const u8{
     "CONVENTIONS.md",
 };
 
+const rule_file_count = project_rule_filenames.len + 1;
+
+const RuleFileStamp = union(enum) {
+    missing,
+    present: struct {
+        size: u64,
+        mtime_ns: i96,
+        ctime_ns: i96,
+        kind: std.Io.File.Kind,
+    },
+};
+
+pub const RefreshSnapshot = struct {
+    is_repo: bool,
+    branch: ?[]u8,
+    is_dirty: bool,
+    rules: [rule_file_count]RuleFileStamp,
+
+    pub fn deinit(self: *RefreshSnapshot, gpa: std.mem.Allocator) void {
+        if (self.branch) |branch| gpa.free(branch);
+        self.* = undefined;
+    }
+
+    pub fn eql(a: *const RefreshSnapshot, b: *const RefreshSnapshot) bool {
+        if (a.is_repo != b.is_repo) return false;
+        if (a.is_dirty != b.is_dirty) return false;
+        if (!optionalStringEql(a.branch, b.branch)) return false;
+        return std.meta.eql(a.rules, b.rules);
+    }
+};
+
+const RuleReadPolicy = enum { best_effort, fail_on_error };
+
+pub fn captureRefreshSnapshot(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    home_dir: []const u8,
+    cwd: []const u8,
+) !RefreshSnapshot {
+    assert(cwd.len > 0);
+
+    const is_repo = vcs.isRepo(gpa, io, cwd);
+    const branch = if (is_repo) vcs.currentBranch(gpa, io, cwd) else null;
+    errdefer if (branch) |value| gpa.free(value);
+    const is_dirty = if (is_repo) try vcs.workingTreeDirty(gpa, io, cwd) else false;
+
+    var rules: [rule_file_count]RuleFileStamp = @splat(.missing);
+    if (home_dir.len > 0) {
+        const config_dir = try paths.platformConfigDir(gpa, home_dir);
+        defer gpa.free(config_dir);
+        rules[0] = try ruleFileStamp(gpa, io, config_dir, "AGENTS.md");
+    }
+    for (project_rule_filenames, 1..) |filename, index| {
+        rules[index] = try ruleFileStamp(gpa, io, cwd, filename);
+    }
+
+    return .{
+        .is_repo = is_repo,
+        .branch = branch,
+        .is_dirty = is_dirty,
+        .rules = rules,
+    };
+}
+
+fn ruleFileStamp(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, filename: []const u8) !RuleFileStamp {
+    const path = try std.fs.path.join(gpa, &.{ dir, filename });
+    defer gpa.free(path);
+
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return .missing,
+        else => |e| return e,
+    };
+    return .{ .present = .{
+        .size = stat.size,
+        .mtime_ns = stat.mtime.nanoseconds,
+        .ctime_ns = stat.ctime.nanoseconds,
+        .kind = stat.kind,
+    } };
+}
+
+fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a) |a_value| {
+        const b_value = b orelse return false;
+        return std.mem.eql(u8, a_value, b_value);
+    }
+    return b == null;
+}
+
 /// Maximum bytes of a single project rule file ingested into the prompt. A file
 /// larger than this is read as a head+tail sandwich (via `tools_common.elideMiddle`)
 /// with a visible notice rather than rejected, so an oversized AGENTS.md can
@@ -64,6 +152,33 @@ pub fn assembleSystemPrompt(
     skills: []const skill_mod.Skill,
     plugin_prompts: []const plugin_prompt.PluginPrompt,
 ) ![]u8 {
+    return assembleSystemPromptWithInputs(gpa, io, base_template, home_dir, cwd, skills, plugin_prompts, null, .best_effort);
+}
+
+pub fn assembleSystemPromptForRefresh(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    base_template: []const u8,
+    home_dir: []const u8,
+    cwd: []const u8,
+    skills: []const skill_mod.Skill,
+    plugin_prompts: []const plugin_prompt.PluginPrompt,
+    snapshot: *const RefreshSnapshot,
+) ![]u8 {
+    return assembleSystemPromptWithInputs(gpa, io, base_template, home_dir, cwd, skills, plugin_prompts, snapshot, .fail_on_error);
+}
+
+fn assembleSystemPromptWithInputs(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    base_template: []const u8,
+    home_dir: []const u8,
+    cwd: []const u8,
+    skills: []const skill_mod.Skill,
+    plugin_prompts: []const plugin_prompt.PluginPrompt,
+    refresh_snapshot: ?*const RefreshSnapshot,
+    rule_read_policy: RuleReadPolicy,
+) ![]u8 {
     assert(base_template.len > 0);
     assert(cwd.len > 0);
 
@@ -83,10 +198,12 @@ pub fn assembleSystemPrompt(
     try out.writer.writeAll(base_substituted);
 
     // 2. Append Git environment details if in a repo
-    if (vcs.isRepo(gpa, io, cwd)) {
-        const maybe_branch = vcs.currentBranch(gpa, io, cwd);
-        defer if (maybe_branch) |b| gpa.free(b);
-        const is_dirty = vcs.workingTreeDirty(gpa, io, cwd) catch false;
+    const is_repo = if (refresh_snapshot) |snapshot| snapshot.is_repo else vcs.isRepo(gpa, io, cwd);
+    if (is_repo) {
+        const queried_branch = if (refresh_snapshot == null) vcs.currentBranch(gpa, io, cwd) else null;
+        defer if (queried_branch) |branch| gpa.free(branch);
+        const maybe_branch: ?[]const u8 = if (refresh_snapshot) |snapshot| snapshot.branch else queried_branch;
+        const is_dirty = if (refresh_snapshot) |snapshot| snapshot.is_dirty else vcs.workingTreeDirty(gpa, io, cwd) catch false;
 
         try out.writer.print("\n\n<git_environment>\n", .{});
         if (maybe_branch) |branch| {
@@ -107,13 +224,13 @@ pub fn assembleSystemPrompt(
     //    notices rather than failing).
     var total_rule_bytes: usize = 0;
     if (home_dir.len > 0) {
-        if (try readRuleFile(gpa, io, config_dir, "AGENTS.md", "user rule file")) |content| {
+        if (try readRuleFileWithPolicy(gpa, io, config_dir, "AGENTS.md", "user rule file", rule_read_policy)) |content| {
             defer gpa.free(content);
             try appendRuleBlock(&out.writer, "user_instructions", "user rule file", "AGENTS.md", content, &total_rule_bytes);
         }
     }
     for (project_rule_filenames) |rule_filename| {
-        if (try readRuleFile(gpa, io, cwd, rule_filename, "project rule file")) |content| {
+        if (try readRuleFileWithPolicy(gpa, io, cwd, rule_filename, "project rule file", rule_read_policy)) |content| {
             defer gpa.free(content);
             try appendRuleBlock(&out.writer, "project_instructions", "project rule file", rule_filename, content, &total_rule_bytes);
         }
@@ -475,6 +592,17 @@ fn earliestPlaceholder(
 /// lines and the truncation notice so the two classes stay distinguishable in
 /// a prompt that can carry both. Caller owns the returned slice.
 fn readRuleFile(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, filename: []const u8, label: []const u8) !?[]u8 {
+    return readRuleFileWithPolicy(gpa, io, dir, filename, label, .best_effort);
+}
+
+fn readRuleFileWithPolicy(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+    filename: []const u8,
+    label: []const u8,
+    policy: RuleReadPolicy,
+) !?[]u8 {
     const path = try std.fs.path.join(gpa, &.{ dir, filename });
     defer gpa.free(path);
 
@@ -485,12 +613,14 @@ fn readRuleFile(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, filename: [
         error.FileNotFound => return null,
         else => |e| {
             log.warn("skipping {s} {s}: {s}", .{ label, path, @errorName(e) });
+            if (policy == .fail_on_error) return e;
             return null;
         },
     };
     defer file.close(io);
     const stat = file.stat(io) catch |err| {
         log.warn("skipping {s} {s}: {s}", .{ label, path, @errorName(err) });
+        if (policy == .fail_on_error) return err;
         return null;
     };
     const size: usize = @intCast(stat.size);
@@ -504,6 +634,7 @@ fn readRuleFile(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, filename: [
         const n = reader.interface.readSliceShort(bytes) catch |err| {
             gpa.free(bytes);
             log.warn("skipping {s} {s}: {s}", .{ label, path, @errorName(err) });
+            if (policy == .fail_on_error) return err;
             return null;
         };
         if (n < size) {
@@ -526,11 +657,13 @@ fn readRuleFile(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, filename: [
     defer gpa.free(tail);
     const head_n = file.readPositionalAll(io, head, 0) catch |err| {
         log.warn("skipping {s} {s}: {s}", .{ label, path, @errorName(err) });
+        if (policy == .fail_on_error) return err;
         return null;
     };
     const tail_offset: u64 = @intCast(size - tail_len);
     const tail_n = file.readPositionalAll(io, tail, tail_offset) catch |err| {
         log.warn("skipping {s} {s}: {s}", .{ label, path, @errorName(err) });
+        if (policy == .fail_on_error) return err;
         return null;
     };
     const joined = try tools_common.elideMiddle(gpa, head[0..head_n], tail[0..tail_n], size);
@@ -1405,6 +1538,72 @@ test "readRuleFile skips an unreadable rule file instead of failing assembly" {
     defer gpa.free(prompt);
     try std.testing.expect(std.mem.startsWith(u8, prompt, "System"));
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<project_instructions") == null);
+}
+
+test "refresh snapshot detects rule add change delete and ignores unchanged inputs" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+    const cwd = try std.fs.path.join(gpa, &.{ root, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(cwd);
+
+    var baseline = try captureRefreshSnapshot(gpa, io, "", cwd);
+    defer baseline.deinit(gpa);
+    var unchanged = try captureRefreshSnapshot(gpa, io, "", cwd);
+    defer unchanged.deinit(gpa);
+    try std.testing.expect(baseline.eql(&unchanged));
+
+    try writeTestFile(gpa, io, cwd, "AGENTS.md", "one");
+    var added = try captureRefreshSnapshot(gpa, io, "", cwd);
+    defer added.deinit(gpa);
+    try std.testing.expect(!baseline.eql(&added));
+
+    try writeTestFile(gpa, io, cwd, "AGENTS.md", "two-two");
+    var changed = try captureRefreshSnapshot(gpa, io, "", cwd);
+    defer changed.deinit(gpa);
+    try std.testing.expect(!added.eql(&changed));
+
+    const rule_path = try std.fs.path.join(gpa, &.{ cwd, "AGENTS.md" });
+    defer gpa.free(rule_path);
+    try std.Io.Dir.cwd().deleteFile(io, rule_path);
+    var deleted = try captureRefreshSnapshot(gpa, io, "", cwd);
+    defer deleted.deinit(gpa);
+    try std.testing.expect(changed.eql(&deleted) == false);
+    try std.testing.expect(baseline.eql(&deleted));
+}
+
+test "refresh snapshot detects branch and dirty-state changes" {
+    const rules: [rule_file_count]RuleFileStamp = @splat(.missing);
+    const clean: RefreshSnapshot = .{ .is_repo = true, .branch = @constCast("main"), .is_dirty = false, .rules = rules };
+    const dirty: RefreshSnapshot = .{ .is_repo = true, .branch = @constCast("main"), .is_dirty = true, .rules = rules };
+    const branch: RefreshSnapshot = .{ .is_repo = true, .branch = @constCast("feature"), .is_dirty = false, .rules = rules };
+    try std.testing.expect(!clean.eql(&dirty));
+    try std.testing.expect(!clean.eql(&branch));
+}
+
+test "refresh assembly fails instead of installing a partial unreadable rule set" {
+    if (os.is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const rel_dir = ".zig-cache/context-refresh-unreadable-test";
+    try std.Io.Dir.createDirPath(.cwd(), io, rel_dir ++ "/AGENTS.md");
+    defer std.Io.Dir.cwd().deleteTree(io, rel_dir) catch {};
+    const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
+    defer gpa.free(cwd);
+
+    var snapshot = try captureRefreshSnapshot(gpa, io, "", cwd);
+    defer snapshot.deinit(gpa);
+    try std.testing.expectError(
+        error.NotDir,
+        assembleSystemPromptForRefresh(gpa, io, "System", "", cwd, &.{}, &.{}, &snapshot),
+    );
 }
 
 test "project rule content cannot break out of its instructions block" {
