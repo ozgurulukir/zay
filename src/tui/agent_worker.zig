@@ -174,14 +174,20 @@ const ApprovalGate = struct {
 
 pub const cancel_message = "Interrupted.";
 
-/// `pending_prompt`, when present, is raw user text owned by `worker_context.gpa`.
-/// It is expanded (file embedding / image attachment) and appended to history
-/// here, on the worker thread, so the UI thread never blocks on that I/O.
+/// `pending_prompt_slot`, when populated, owns raw user text allocated by
+/// `worker_context.gpa`. The worker consumes the slot immediately on entry;
+/// if scheduling is cancelled before entry, the lane still owns the bytes.
+/// The prompt is expanded (file embedding / image attachment) and appended to
+/// history here, on the worker thread, so the UI thread never blocks on that I/O.
 ///
 /// `drain_queue_first` empties the agent's message queue into history before the
 /// turn's first prompt — used to deliver a queue stranded by a user interrupt as
 /// a fresh turn. The @-mention expansion lands here, off the UI thread.
-pub fn runAgentTurn(agent: *agent_mod.Agent, runtime: ?*runtime_mod.AgentRuntime, worker_context: *Context, pending_prompt: ?[]u8, drain_queue_first: bool) void {
+pub fn runAgentTurn(agent: *agent_mod.Agent, runtime: ?*runtime_mod.AgentRuntime, worker_context: *Context, pending_prompt_slot: *?[]u8, drain_queue_first: bool) void {
+    const pending_prompt = pending_prompt_slot.*;
+    pending_prompt_slot.* = null;
+    defer if (pending_prompt) |prompt| worker_context.gpa.free(prompt);
+
     agent.bash_approval = .{
         .ptr = worker_context,
         .request = requestBashApproval,
@@ -205,7 +211,6 @@ pub fn runAgentTurn(agent: *agent_mod.Agent, runtime: ?*runtime_mod.AgentRuntime
         }
     }
     if (pending_prompt) |prompt| {
-        defer worker_context.gpa.free(prompt);
         agent.addUserPrompt(prompt) catch |err| {
             postTurnFailed(worker_context, err);
             return;
