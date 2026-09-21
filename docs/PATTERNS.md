@@ -330,7 +330,7 @@ Guard POSIX-only syscalls behind `if (!os.is_windows)` at their call sites: `std
 
 **Foreground teardown kills the whole process tree (Windows):** an ESC interrupt during command execution must terminate the entire foreground tree, not just the pwsh process — surviving grandchildren hold the stdout/stderr pipe handles open and keep `drainChild`'s `MultiReader` blocked past its idle timeout (perceived as a ~30s freeze on every ESC). Every foreground capture child is attached at spawn to a Win32 Job Object with `KILL_ON_JOB_CLOSE`; interrupt teardown calls `TerminateJobObject` — one kernel call closes every handle and EOF arrives immediately (POSIX already signals the process group with SIGTERM→SIGKILL escalation). The Job handle is closed after the child is reaped (529098c). Never reintroduce a bare `child.kill` on the Windows interrupt path.
 
-Note: Windows is now **daily-driver ready** (lanes/worktrees/background jobs run natively, the shell tool is `pwsh`) — this section covers compilation + the remaining runtime hardening: #25 (MCP read timeouts), #32 (deferred Windows test variants), #80 (test-harness hang).
+Note: Windows is now **daily-driver ready** (lanes/worktrees/background jobs run natively, the shell tool is `pwsh`) — this section covers compilation + the remaining runtime hardening: #25 (MCP read timeouts) and #32 (deferred Windows test variants). The #80 Windows test-harness hang is resolved; see `AGENTS.md` § “Test runner quirks” for the direct-runner behavior and verification result.
 
 ### Worktree Hardening & Lifecycle Architecture
 
