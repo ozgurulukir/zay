@@ -15,6 +15,7 @@
 //! into proper sub-structs.
 
 const std = @import("std");
+const os = @import("../os.zig");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const tui = @import("../tui.zig");
@@ -23,6 +24,7 @@ const App = tui.App;
 const RootWidget = tui.RootWidget;
 const provider_model = @import("provider_model.zig");
 const clipboard_helper = @import("clipboard_helper.zig");
+const lifecycle = @import("lifecycle.zig");
 
 const command_router = @import("command_router.zig");
 const help_picker = @import("widgets/help_picker.zig");
@@ -40,6 +42,12 @@ pub fn captureEvent(
         .init => try routeInit(app, root, ctx),
         .mouse => |mouse| try routeMouse(app, root, ctx, mouse),
         .key_press => |key| try routeKey(app, root, ctx, key),
+        .key_release => |raw| {
+            const key = normalizeControlKey(raw);
+            if (key.matches('c', .{ .ctrl = true }) or key.matches('d', .{ .ctrl = true })) {
+                app.markPendingQuitKeyReleased();
+            }
+        },
         .paste => |text| {
             try clipboard_helper.pasteToFocusedInput(app, text);
             ctx.consumeAndRedraw();
@@ -134,6 +142,20 @@ fn routeMouse(
     }
 }
 
+fn normalizeControlKey(raw: vaxis.Key) vaxis.Key {
+    var key = raw;
+    if (key.codepoint >= 1 and key.codepoint <= 0x1a) {
+        switch (key.codepoint) {
+            0x08, 0x09, 0x0a, 0x0d => {},
+            else => {
+                key.mods = .{ .ctrl = true };
+                key.codepoint = @as(u21, 'a') + (key.codepoint - 1);
+            },
+        }
+    }
+    return key;
+}
+
 fn routeKey(
     app: *App,
     root: *RootWidget,
@@ -154,15 +176,15 @@ fn routeKey(
     // ctrl binding) silently dies. Normalize C0 codes 0x01..0x1a to
     // ctrl+letter with a clean modifier set; backspace/tab/enter/newline
     // keep their own meaning (isEnterKey also matches a bare '\n').
-    var key = raw;
-    if (key.codepoint >= 1 and key.codepoint <= 0x1a) {
-        switch (key.codepoint) {
-            0x08, 0x09, 0x0a, 0x0d => {},
-            else => {
-                key.mods = .{ .ctrl = true };
-                key.codepoint = @as(u21, 'a') + (key.codepoint - 1);
-            },
-        }
+    const key = normalizeControlKey(raw);
+    // Windows Console can report the modifier key as a separate event before
+    // the character it modifies (for example `left_control`, then `d`). It
+    // is not an action by itself. Swallowing it here keeps the quit prompt's
+    // double-press state intact so the modifier event cannot cancel the first
+    // Ctrl+D/Ctrl+C while the following character is still in flight.
+    if (key.isModifier()) {
+        ctx.consumeEvent();
+        return;
     }
     try root.ensureTick(ctx);
     // The diff viewer is a self-contained full-screen mode: it owns every
@@ -431,9 +453,24 @@ fn handleQuitSequence(
     }
     const now = std.Io.Timestamp.now(app.getIo(), .awake);
     if (app.getPendingQuitAt()) |first_press| {
-        const elapsed_ns = first_press.durationTo(now).nanoseconds;
+        const gap_ns: i128 = first_press.durationTo(now).nanoseconds;
+        const auto_repeat_ns: i128 =
+            @as(i128, App.ctrl_c_auto_repeat_gap_ms) * std.time.ns_per_ms;
+        // A second record faster than the auto-repeat threshold is the same
+        // chord held down (Windows auto-repeats a key as it is pressed) — a
+        // genuine second press is slower than that. Suppress the rapid repeat
+        // only when no release has been observed: a real key_release (delivered
+        // by some terminals) or a genuine press with a real time gap past the
+        // threshold both confirm exit without needing that release event.
+        const is_rapid_repeat = gap_ns >= 0 and gap_ns < auto_repeat_ns;
+        if (os.is_windows and !app.pendingQuitKeyReleased() and is_rapid_repeat) {
+            ctx.consumeEvent();
+            return true;
+        }
+        const elapsed_ns = gap_ns;
         const threshold_ns: i128 = @as(i128, App.ctrl_c_double_press_ms) * std.time.ns_per_ms;
         if (elapsed_ns >= 0 and elapsed_ns <= threshold_ns) {
+            log.info("shutdown.request source=keyboard", .{});
             ctx.quit = true;
             ctx.consume_event = true;
             return true;
@@ -492,6 +529,7 @@ test "Ctrl-C pressed twice within the window confirms quit" {
 
     const ctrl_c: vxfw.Event = .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } };
     try captureEvent(&app, &root, &ctx, ctrl_c);
+    try captureEvent(&app, &root, &ctx, .{ .key_release = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } });
     try captureEvent(&app, &root, &ctx, ctrl_c);
 
     // Back-to-back presses land inside the double-press window.
@@ -532,8 +570,36 @@ test "bare C0 codepoints (mangled Ctrl+C/Ctrl+D) still drive quit" {
     var ctx2: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
     const mangled: vxfw.Event = .{ .key_press = .{ .codepoint = 0x03, .mods = .{} } };
     try captureEvent(&app, &root, &ctx2, mangled);
+    try captureEvent(&app, &root, &ctx2, .{ .key_release = .{ .codepoint = 0x03, .mods = .{} } });
     try captureEvent(&app, &root, &ctx2, mangled);
     try std.testing.expect(ctx2.quit);
+}
+
+test "Windows Ctrl-D auto-repeat does not confirm quit before key release" {
+    if (!os.is_windows) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    const bare_ctrl_d: vxfw.Event = .{ .key_press = .{ .codepoint = 0x04, .mods = .{} } };
+    try captureEvent(&app, &root, &ctx, bare_ctrl_d);
+    try captureEvent(&app, &root, &ctx, bare_ctrl_d);
+
+    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(!ctx.quit);
+
+    try captureEvent(&app, &root, &ctx, .{ .key_release = .{ .codepoint = 0x04, .mods = .{} } });
+    try captureEvent(&app, &root, &ctx, bare_ctrl_d);
+    try std.testing.expect(ctx.quit);
 }
 
 test "Ctrl-D with empty input arms pending quit like Ctrl-C" {
@@ -553,6 +619,62 @@ test "Ctrl-D with empty input arms pending quit like Ctrl-C" {
 
     try std.testing.expect(app.nav.quit == .pending);
     try std.testing.expect(!ctx.quit);
+}
+
+test "Windows modifier-only Ctrl event preserves the pending quit" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    const ctrl_d: vxfw.Event = .{ .key_press = .{ .codepoint = 'd', .mods = .{ .ctrl = true } } };
+    const ctrl_modifier: vxfw.Event = .{ .key_press = .{ .codepoint = vaxis.Key.left_control, .mods = .{ .ctrl = true } } };
+
+    // The first Ctrl+D arms the prompt. Windows may put the modifier event
+    // between the two character events; it must not clear that pending state.
+    try captureEvent(&app, &root, &ctx, ctrl_d);
+    try std.testing.expect(app.nav.quit == .pending);
+    try captureEvent(&app, &root, &ctx, ctrl_modifier);
+    try std.testing.expect(app.nav.quit == .pending);
+    try captureEvent(&app, &root, &ctx, .{ .key_release = .{ .codepoint = 'd', .mods = .{ .ctrl = true } } });
+    try captureEvent(&app, &root, &ctx, ctrl_d);
+
+    try std.testing.expect(ctx.quit);
+}
+
+test "Windows Ctrl-C confirms quit without a key_release event" {
+    if (!os.is_windows) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    const ctrl_c: vxfw.Event = .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } };
+    try captureEvent(&app, &root, &ctx, ctrl_c);
+    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(!ctx.quit);
+
+    // A deliberate second press with a real time gap (simulating a genuine
+    // double-press rather than a held-key auto-repeat) must confirm exit even
+    // though Windows Terminal delivers no key_release event for the chord.
+    app.getIo().sleep(std.Io.Duration.fromMilliseconds(App.ctrl_c_auto_repeat_gap_ms + 50), .awake) catch {};
+    try captureEvent(&app, &root, &ctx, ctrl_c);
+    try std.testing.expect(ctx.quit);
 }
 
 test "a non-quit key cancels an armed pending quit" {
@@ -577,7 +699,7 @@ test "a non-quit key cancels an armed pending quit" {
     try std.testing.expect(app.nav.quit == .none);
 }
 
-test "confirmed quit state exits the TUI on the next key" {
+test "confirmed quit state exits the TUI on the next tick" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
@@ -593,7 +715,10 @@ test "confirmed quit state exits the TUI on the next key" {
     defer arena.deinit();
     var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
 
-    try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = 'a', .mods = .{} } });
+    // No keypress is delivered — the confirmed quit activates on the tick.
+    // This is what makes `/exit` exit reliably on pty backends (e.g. Windows
+    // Terminal) that don't send a trailing event after an exit command.
+    try lifecycle.handleTick(&root, &ctx);
 
     try std.testing.expect(ctx.quit);
 }

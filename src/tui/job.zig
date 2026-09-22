@@ -15,6 +15,9 @@ pub fn Job(comptime T: type) type {
         /// LAST, .release) so the UI thread can poll it non-blockingly
         /// (.acquire) before awaiting.
         done: std.atomic.Value(bool) = .init(false),
+        /// Set by cancel before joining a worker that opted into cooperative
+        /// cancellation. The worker owns the interpretation of the flag.
+        cancel_requested: std.atomic.Value(bool) = .init(false),
 
         const Self = @This();
 
@@ -40,6 +43,25 @@ pub fn Job(comptime T: type) type {
             }.run, .{ self, ctx });
         }
 
+        /// Arm a worker that must cooperatively interrupt blocking OS work.
+        pub fn spawnCancelable(
+            self: *Self,
+            io: std.Io,
+            ctx: anytype,
+            comptime worker: fn (@TypeOf(ctx), *const std.atomic.Value(bool)) T,
+        ) !void {
+            std.debug.assert(!self.done.load(.acquire));
+            self.* = .{};
+            const Ctx = @TypeOf(ctx);
+            self.future = try io.concurrent(struct {
+                fn run(job: *Self, worker_ctx: Ctx) T {
+                    const result = worker(worker_ctx, &job.cancel_requested);
+                    job.done.store(true, .release);
+                    return result;
+                }
+            }.run, .{ self, ctx });
+        }
+
         /// Non-blocking completion poll.
         pub fn isDone(self: *const Self) bool {
             return self.done.load(.acquire);
@@ -59,6 +81,7 @@ pub fn Job(comptime T: type) type {
         /// a cancelation request" — never call from the render path; this is
         /// for teardown and dedicated join threads.
         pub fn cancel(self: *Self, io: std.Io) T {
+            self.cancel_requested.store(true, .release);
             return self.future.cancel(io);
         }
     };

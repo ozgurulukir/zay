@@ -2,12 +2,43 @@
 # Upstream's ttyRun exits on the first console read error (swallowed by
 # 'catch {}') and postEvent blocks forever on a full queue; either way the
 # input thread dies/parks silently and ALL keyboard input stops while the
-# app keeps rendering. Bounded retry + drop-with-warn instead, plus exit
-# diagnostics in ttyRun.
+# app keeps rendering. Shutdown can also hang forever because a device-status
+# query does not reliably wake Windows ReadConsoleInput. Use a dedicated
+# cancellation event with WaitForMultipleObjects, use bounded retry +
+# drop-with-warn, and keep exit diagnostics in ttyRun.
 # See AGENTS.md 'vxfw Windows input-thread death' and build.zig checkVaxisLoopPatch.
 # Re-apply after every `zig build --fetch` / vaxis bump; build.zig enforces this.
 --- a/src/Loop.zig	2026-09-14 23:16:44.596907000 +0300
 +++ b/src/Loop.zig	2026-09-14 23:16:52.006062100 +0300
+@@ -71,6 +71,12 @@
+         pub fn start(self: *Self) !void {
+             if (self.thread) |_| return;
++            if (comptime builtin.os.tag == .windows and @hasDecl(@TypeOf(self.tty.*), "resetInputCancellation")) {
++                self.tty.resetInputCancellation() catch |err| {
++                    log.warn("loop.start.reset failed err={s}", .{@errorName(err)});
++                    return err;
++                };
++            }
+             self.thread = try self.io.concurrent(Self.ttyRun, .{
+                 self,
+                 self.vaxis.opts.system_clipboard_allocator,
+             });
+@@ -81,8 +88,13 @@
+             // If we don't have a thread, we have nothing to stop
+             if (self.thread == null) return;
+             self.should_quit = true;
+-            // trigger a read
+-            self.vaxis.deviceStatusReport(self.tty.writer()) catch {};
++            // ZAY-LOCAL-PATCH: Windows ReadConsoleInput is canceled through a
++            // dedicated event instead of relying on terminal query traffic.
++            if (comptime builtin.os.tag == .windows and @hasDecl(@TypeOf(self.tty.*), "cancelInput")) {
++                self.tty.cancelInput() catch |err| log.warn("loop.stop.cancel failed err={s}", .{@errorName(err)});
++            } else {
++                self.vaxis.deviceStatusReport(self.tty.writer()) catch {};
++            }
+ 
+             if (self.thread) |*thread| {
+                 thread.await(self.io);
 @@ -109,8 +109,20 @@
  
          /// posts an event into the event queue. Will block if there is not
@@ -48,7 +79,7 @@
          }
  
          fn _ttyRun(
-@@ -171,9 +192,35 @@
+@@ -171,9 +192,36 @@
              switch (builtin.os.tag) {
                  .windows => {
                      var parser: Parser = .{};
@@ -67,6 +98,7 @@
 -                        const event = try self.tty.nextEvent(&parser, paste_allocator);
 -                        try handleEventGeneric(self, self.vaxis, &cache, Event, event, null);
 +                        const event = self.tty.nextEvent(&parser, paste_allocator) catch |err| {
++                            if (self.should_quit) return;
 +                            retry_failures += 1;
 +                            if (retry_failures > 64) return err;
 +                            log.warn("tty input read failed, retrying err={s} failures={d}", .{ @errorName(err), retry_failures });
@@ -86,3 +118,105 @@
                      }
                  },
                  else => {
+@@ -301,1 +301,7 @@
+                .key_press => |key| {
++                    // ZAY-LOCAL-PATCH: Windows Console can repeat the
++                    // standalone Control key while a Ctrl+letter chord is
++                    // held. Those modifier-only records have no meaning to
++                    // vxfw (the chord event carries its modifiers) and can
++                    // otherwise keep the UI drain loop permanently busy.
++                    if (key.isModifier()) return;
+@@ -339,1 +339,5 @@
+                .key_release => |key| {
++                    // ZAY-LOCAL-PATCH: modifier releases are equally
++                    // unobservable by vxfw and must not reintroduce the
++                    // repeat flood on the release path.
++                    if (key.isModifier()) return;
+--- a/src/Tty.zig
++++ b/src/Tty.zig
+@@ -226,5 +226,6 @@
+ pub const WindowsTty = struct {
+     stdin: windows.HANDLE,
+     stdout: windows.HANDLE,
++    cancel_event: windows.HANDLE,
+ 
+     initial_codepage: c_uint,
+@@ -269,3 +269,7 @@
+         const initial_output_mode = try getConsoleMode(CONSOLE_MODE_OUTPUT, stdout.handle);
+ 
++        const cancel_event = CreateEventW(null, .TRUE, .FALSE, null) orelse
++            return windows.unexpectedError(windows.GetLastError());
++        errdefer windows.CloseHandle(cancel_event);
++
+         // set new modes
+@@ -281,4 +281,5 @@
+         const self: WindowsTty = .{
+             .stdin = stdin.handle,
+             .stdout = stdout.handle,
++            .cancel_event = cancel_event,
+             .initial_codepage = initial_output_codepage,
+@@ -301,3 +301,4 @@
+         windows.CloseHandle(self.stdin);
+         windows.CloseHandle(self.stdout);
++        windows.CloseHandle(self.cancel_event);
+     }
+@@ -329,8 +329,30 @@
+     pub fn writer(self: *WindowsTty) *std.Io.Writer {
+         return &self.tty_writer.interface;
+     }
+ 
++    /// Reset the cancellation event before starting a new input loop.
++    pub fn resetInputCancellation(self: *WindowsTty) !void {
++        if (ResetEvent(self.cancel_event) == .FALSE)
++            return windows.unexpectedError(windows.GetLastError());
++    }
++
++    /// Cancel a thread blocked waiting for console input.
++    pub fn cancelInput(self: *WindowsTty) !void {
++        if (SetEvent(self.cancel_event) == .FALSE)
++            return windows.unexpectedError(windows.GetLastError());
++    }
++
++    fn waitForInputOrCancellation(self: *WindowsTty) !bool {
++        const handles = [_]windows.HANDLE{ self.stdin, self.cancel_event };
++        const result = WaitForMultipleObjects(@intCast(handles.len), &handles, .FALSE, infinite_timeout);
++        return switch (result) {
++            wait_object_0 => true,
++            wait_object_0 + 1 => false,
++            wait_failed => windows.unexpectedError(windows.GetLastError()),
++            else => error.Unexpected,
++        };
++    }
+ 
+     pub fn read(self: *const WindowsTty, buf: []u8) !usize {
+         return posix.read(self.fd, buf);
+     }
+@@ -379,4 +379,6 @@
+         // We use a loop so we can ignore certain events
+         var state: EventState = .{};
+         while (true) {
++            if (!(try self.waitForInputOrCancellation())) return error.Canceled;
++
+             var event_count: u32 = 0;
+@@ -777,3 +777,21 @@
+     pub const PINPUT_RECORD = *INPUT_RECORD;
+ 
++    const wait_object_0: windows.DWORD = 0;
++    const wait_failed: windows.DWORD = 0xFFFFFFFF;
++    const infinite_timeout: windows.DWORD = 0xFFFFFFFF;
++
++    pub extern "kernel32" fn CreateEventW(
++        lpEventAttributes: ?*windows.SECURITY_ATTRIBUTES,
++        bManualReset: windows.BOOL,
++        bInitialState: windows.BOOL,
++        lpName: ?[*:0]const u16,
++    ) callconv(.winapi) ?windows.HANDLE;
++    pub extern "kernel32" fn SetEvent(hEvent: windows.HANDLE) callconv(.winapi) windows.BOOL;
++    pub extern "kernel32" fn ResetEvent(hEvent: windows.HANDLE) callconv(.winapi) windows.BOOL;
++    pub extern "kernel32" fn WaitForMultipleObjects(
++        nCount: windows.DWORD,
++        lpHandles: [*]const windows.HANDLE,
++        bWaitAll: windows.BOOL,
++        dwMilliseconds: windows.DWORD,
++    ) callconv(.winapi) windows.DWORD;
+     pub extern "kernel32" fn ReadConsoleInputW(hConsoleInput: windows.HANDLE, lpBuffer: PINPUT_RECORD, nLength: windows.DWORD, lpNumberOfEventsRead: *windows.DWORD) callconv(.winapi) windows.BOOL;

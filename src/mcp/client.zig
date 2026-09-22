@@ -18,6 +18,24 @@ const http_body_buffer_bytes = 8 * 1024;
 const http_redirect_buffer_bytes = 16 * 1024;
 const http_transfer_buffer_bytes = 64 * 1024;
 const http_response_bytes_max = 64 * 1024 * 1024;
+const windows_child_stop_wait_ms = 1_000;
+
+const HttpRequestOutcome = union(enum) {
+    response: []u8,
+    failure: anyerror,
+};
+
+const HttpVoidOutcome = union(enum) {
+    success,
+    failure: anyerror,
+};
+
+const HttpSelectEvent = union(enum) {
+    request: HttpRequestOutcome,
+    notification: HttpVoidOutcome,
+    termination: HttpVoidOutcome,
+    timeout: void,
+};
 
 // MCP protocol version strings (spec-mandated — the server echoes one back
 // during `initialize` negotiation, so these values can never change).
@@ -134,6 +152,34 @@ fn createWin32JobObject(process_handle: windows.HANDLE) ?windows.HANDLE {
     return h;
 }
 
+/// Zig's Windows Child.kill waits forever for the process handle to signal.
+/// MCP servers are external programs and must not be able to wedge TUI
+/// teardown, so terminate the process but bound the reap wait. Closing the job
+/// object immediately afterwards remains the descendant-process backstop.
+fn stopChildWindowsBounded(child: *std.process.Child) void {
+    if (!os.is_windows) unreachable;
+    const process_handle = child.id orelse return;
+
+    _ = std.os.windows.ntdll.RtlReportSilentProcessExit(process_handle, @enumFromInt(1));
+    _ = std.os.windows.ntdll.NtTerminateProcess(process_handle, @enumFromInt(1));
+
+    const timeout_100ns: std.os.windows.LARGE_INTEGER =
+        -(@as(std.os.windows.LARGE_INTEGER, windows_child_stop_wait_ms) * std.time.ns_per_ms / 100);
+    switch (std.os.windows.ntdll.NtWaitForSingleObject(process_handle, .FALSE, &timeout_100ns)) {
+        .WAIT_0 => {},
+        .TIMEOUT => log.warn("MCP child did not stop within {d}ms; releasing process handles", .{windows_child_stop_wait_ms}),
+        else => log.warn("MCP child wait failed during shutdown; releasing process handles", .{}),
+    }
+
+    _ = windows.CloseHandle(process_handle);
+    child.id = null;
+    _ = windows.CloseHandle(child.thread_handle);
+    child.thread_handle = undefined;
+    assert(child.stdin == null);
+    assert(child.stdout == null);
+    assert(child.stderr == null);
+}
+
 pub const ServerStatus = enum {
     connecting,
     connected,
@@ -226,7 +272,7 @@ pub const McpClient = struct {
     /// Serializes JSON-RPC requests — stdin/stdout pipes can't handle
     /// concurrent requests. Defensive for future parallel tool execution.
     request_mutex: std.Io.Mutex = .init,
-    /// Read timeout for sendRequest poll, in milliseconds.
+    /// Timeout for one stdio poll or complete HTTP request, in milliseconds.
     read_timeout_ms: u32 = 30_000,
     /// Server-assigned `Mcp-Session-Id` for the Streamable HTTP transport.
     /// null until the initialize response provides one. Owned; freed in deinit.
@@ -441,6 +487,10 @@ pub const McpClient = struct {
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .ignore,
+            // MCP servers are pipe-only helpers. Keep terminal control keys
+            // (Ctrl+C/Ctrl+D) in the TUI instead of broadcasting them to a
+            // console child while its handshake is being canceled.
+            .create_no_window = os.is_windows,
         });
         errdefer child.kill(io);
 
@@ -468,11 +518,14 @@ pub const McpClient = struct {
         };
     }
 
-    /// Stop the subprocess: SIGTERM first, then SIGKILL via kill().
-    /// Closes stdin/stdout pipes and reaps the child. For the Streamable HTTP
-    /// transport, terminates the remote session (best-effort) and drops the
-    /// session id.
+    /// Stop the subprocess and close its pipes. POSIX gets SIGTERM followed by
+    /// kill/reap; Windows terminates the Job Object and uses a bounded process
+    /// wait so an external MCP server cannot wedge TUI teardown. For the
+    /// Streamable HTTP transport, terminates the remote session (best-effort)
+    /// and drops the session id.
     pub fn stop(self: *McpClient, io: std.Io) void {
+        log.info("shutdown.mcp.client.begin name={s}", .{self.name});
+        defer log.info("shutdown.mcp.client.done name={s}", .{self.name});
         if (self.lifecycle == .stdio) {
             var child = self.lifecycle.stdio.process;
             const job_obj = if (os.is_windows) self.lifecycle.stdio.win32_job_obj else null;
@@ -495,10 +548,12 @@ pub const McpClient = struct {
             if (os.is_windows) {
                 if (job_obj) |h| {
                     _ = windows.TerminateJobObject(h, 1);
-                    _ = windows.CloseHandle(h);
                 }
+                stopChildWindowsBounded(&child);
+                if (job_obj) |h| _ = windows.CloseHandle(h);
+            } else {
+                child.kill(io);
             }
-            child.kill(io);
         }
         if (self.transport == .sse) self.terminateHttpSession(io);
         // A failed client may carry an owned reason (set via `setError`, e.g.
@@ -519,6 +574,19 @@ pub const McpClient = struct {
                 self.session_id = null;
             }
         }
+        if (self.session_id == null) return;
+
+        if (os.is_windows) {
+            self.runHttpVoidWithTimeout(io, .termination, httpTerminationTask, .{ self, io }) catch |err| {
+                log.warn("MCP HTTP session termination failed err={s}", .{@errorName(err)});
+            };
+            return;
+        }
+
+        self.terminateHttpSessionUnbounded(io);
+    }
+
+    fn terminateHttpSessionUnbounded(self: *McpClient, io: std.Io) void {
         if (self.session_id == null) return;
         const url = switch (self.transport) {
             .sse => |t| t.url,
@@ -586,29 +654,43 @@ pub const McpClient = struct {
             const has_buffered_line = std.mem.indexOfScalar(u8, reader.interface.buffered(), '\n') != null;
             if (!has_buffered_line) {
                 // Wait for data on stdout with a timeout to prevent infinite
-                // hangs. HUP alone is not a crash: buffered bytes still need
-                // draining after the child exits.
-                if (os.is_windows) {
-                    const timeout_ns: i96 = @as(i96, self.read_timeout_ms) * std.time.ns_per_ms;
-                    const start_time = std.Io.Timestamp.now(io, .awake);
-                    while (true) {
+                // hangs. Poll in short slices so cancellation can be observed
+                // while connecting or waiting for an MCP response. HUP alone
+                // is not a crash: buffered bytes still need draining after
+                // the child exits.
+                const timeout_ns: i96 = @as(i96, self.read_timeout_ms) * std.time.ns_per_ms;
+                const start_time = std.Io.Timestamp.now(io, .awake);
+                while (true) {
+                    if (os.is_windows) {
+                        var peek_buffer: [4 * 1024]u8 = undefined;
+                        var bytes_read: windows.DWORD = 0;
                         var bytes_avail: windows.DWORD = 0;
-                        if (windows.PeekNamedPipe(stdout_file.handle, null, 0, null, &bytes_avail, null) == 0) {
+                        if (windows.PeekNamedPipe(
+                            stdout_file.handle,
+                            &peek_buffer,
+                            @intCast(peek_buffer.len),
+                            &bytes_read,
+                            &bytes_avail,
+                            null,
+                        ) == 0) {
                             return error.McpServerCrashed;
                         }
-                        if (bytes_avail > 0) break;
-                        const now = std.Io.Timestamp.now(io, .awake);
-                        if (start_time.durationTo(now).nanoseconds >= timeout_ns) {
-                            return error.Timeout;
-                        }
-                        io.sleep(.fromMilliseconds(10), .awake) catch {};
+                        if (bytes_avail > 0 and
+                            (std.mem.indexOfScalar(u8, peek_buffer[0..bytes_read], '\n') != null or
+                                bytes_avail > peek_buffer.len)) break;
+                    } else {
+                        var poll_fds: [1]std.posix.pollfd = .{
+                            .{ .fd = stdout_file.handle, .events = std.posix.POLL.IN, .revents = 0 },
+                        };
+                        const ready = std.posix.poll(&poll_fds, 0) catch return error.ReadFailed;
+                        if (ready > 0) break;
                     }
-                } else {
-                    var poll_fds: [1]std.posix.pollfd = .{
-                        .{ .fd = stdout_file.handle, .events = std.posix.POLL.IN, .revents = 0 },
-                    };
-                    const ready = std.posix.poll(&poll_fds, @intCast(self.read_timeout_ms)) catch return error.ReadFailed;
-                    if (ready == 0) return error.Timeout;
+
+                    const now = std.Io.Timestamp.now(io, .awake);
+                    if (start_time.durationTo(now).nanoseconds >= timeout_ns) {
+                        return error.Timeout;
+                    }
+                    try io.sleep(.fromMilliseconds(10), .awake);
                 }
             }
 
@@ -704,11 +786,98 @@ pub const McpClient = struct {
         }
     }
 
+    /// Windows' std.Io socket backend does not expose a socket-level timeout
+    /// through `std.posix`, and the HTTP client has no request deadline of its
+    /// own. Race the whole HTTP operation — including DNS/connect, response
+    /// head, and an SSE body — against a timer so cancellation covers every
+    /// phase of the request.
+    fn runHttpRequestWithTimeout(
+        self: *McpClient,
+        io: std.Io,
+        method: []const u8,
+        params_json: ?[]const u8,
+    ) ![]u8 {
+        var events: [2]HttpSelectEvent = undefined;
+        var select = std.Io.Select(HttpSelectEvent).init(io, &events);
+        defer select.cancelDiscard();
+
+        try select.concurrent(.request, httpRequestTask, .{ self, io, method, params_json });
+        try select.concurrent(.timeout, httpTimeoutTask, .{ io, self.read_timeout_ms });
+
+        const event = select.await() catch |err| {
+            self.cancelHttpSelect(&select);
+            return err;
+        };
+        return switch (event) {
+            .request => |outcome| switch (outcome) {
+                .response => |response| response,
+                .failure => |err| err,
+            },
+            .timeout => {
+                self.cancelHttpSelect(&select);
+                return error.Timeout;
+            },
+            else => unreachable,
+        };
+    }
+
+    /// Run a void HTTP operation with the same deadline used for requests.
+    /// `field` is restricted by the call sites to `.notification` and
+    /// `.termination`; the union keeps the two operation families distinct so
+    /// a response allocation can never be mistaken for a void result.
+    fn runHttpVoidWithTimeout(
+        self: *McpClient,
+        io: std.Io,
+        comptime field: std.Io.Select(HttpSelectEvent).Field,
+        function: anytype,
+        args: std.meta.ArgsTuple(@TypeOf(function)),
+    ) !void {
+        var events: [2]HttpSelectEvent = undefined;
+        var select = std.Io.Select(HttpSelectEvent).init(io, &events);
+        defer select.cancelDiscard();
+
+        try select.concurrent(field, function, args);
+        try select.concurrent(.timeout, httpTimeoutTask, .{ io, self.read_timeout_ms });
+
+        const event = try select.await();
+        switch (event) {
+            .timeout => return error.Timeout,
+            .notification => |outcome| switch (outcome) {
+                .success => {},
+                .failure => |err| return err,
+            },
+            .termination => |outcome| switch (outcome) {
+                .success => {},
+                .failure => |err| return err,
+            },
+            .request => unreachable,
+        }
+    }
+
+    fn cancelHttpSelect(self: *McpClient, select: *std.Io.Select(HttpSelectEvent)) void {
+        while (select.cancel()) |event| {
+            switch (event) {
+                .request => |outcome| switch (outcome) {
+                    .response => |response| self.gpa.free(response),
+                    .failure => {},
+                },
+                .notification, .termination, .timeout => {},
+            }
+        }
+    }
+
     /// POST a JSON-RPC request to the remote endpoint and return the matching
     /// JSON-RPC response (owned). The response is either a single
     /// `application/json` body or a `text/event-stream` searched for the
     /// request `id`. Captures the server-assigned `Mcp-Session-Id`.
     fn sendRequestHttp(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) ![]u8 {
+        if (os.is_windows) {
+            return self.runHttpRequestWithTimeout(io, method, params_json);
+        }
+        return self.sendRequestHttpUnbounded(io, method, params_json);
+    }
+
+    fn sendRequestHttpUnbounded(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) ![]u8 {
         const url = switch (self.transport) {
             .sse => |t| t.url,
             .stdio => return error.NoHttpTransport,
@@ -769,6 +938,13 @@ pub const McpClient = struct {
     /// POST a JSON-RPC notification to the remote endpoint. Expects
     /// 202 Accepted (or 200); the response body is not consumed.
     fn sendNotificationHttp(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) !void {
+        if (os.is_windows) {
+            return self.runHttpVoidWithTimeout(io, .notification, httpNotificationTask, .{ self, io, method, params_json });
+        }
+        return self.sendNotificationHttpUnbounded(io, method, params_json);
+    }
+
+    fn sendNotificationHttpUnbounded(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) !void {
         const url = switch (self.transport) {
             .sse => |t| t.url,
             .stdio => return error.NoHttpTransport,
@@ -1034,6 +1210,46 @@ pub const McpClient = struct {
         });
     }
 };
+
+fn httpTimeoutTask(io: std.Io, timeout_ms: u32) void {
+    io.sleep(std.Io.Duration.fromMilliseconds(@intCast(timeout_ms)), .awake) catch {};
+}
+
+fn httpRequestTask(
+    self: *McpClient,
+    io: std.Io,
+    method: []const u8,
+    params_json: ?[]const u8,
+) HttpRequestOutcome {
+    const response = self.sendRequestHttpUnbounded(io, method, params_json) catch |err| {
+        return .{ .failure = err };
+    };
+    return .{ .response = response };
+}
+
+fn httpNotificationTask(
+    self: *McpClient,
+    io: std.Io,
+    method: []const u8,
+    params_json: ?[]const u8,
+) HttpVoidOutcome {
+    self.sendNotificationHttpUnbounded(io, method, params_json) catch |err| {
+        return .{ .failure = err };
+    };
+    return .success;
+}
+
+fn httpTerminationTask(self: *McpClient, io: std.Io) HttpVoidOutcome {
+    self.terminateHttpSessionUnbounded(io);
+    return .success;
+}
+
+fn stalledHttpOperation(io: std.Io) HttpVoidOutcome {
+    io.sleep(std.Io.Duration.fromSeconds(30), .awake) catch |err| {
+        return .{ .failure = err };
+    };
+    return .success;
+}
 
 /// Write the request `body` with an explicit content-length and flush it, so
 /// the server receives a complete request before we read the response head.
@@ -1354,4 +1570,18 @@ test "McpClient sendRequest timeout produces error.Timeout" {
 
     const result = client.sendRequest(io, "initialize", null);
     try std.testing.expectError(error.Timeout, result);
+}
+
+test "Windows HTTP timeout cancels a stalled operation" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var client = try McpClient.initSse(gpa, "timeout-test", "http://127.0.0.1/mcp");
+    defer client.deinit(io);
+    client.read_timeout_ms = 10;
+
+    try std.testing.expectError(
+        error.Timeout,
+        client.runHttpVoidWithTimeout(io, .notification, stalledHttpOperation, .{io}),
+    );
 }
