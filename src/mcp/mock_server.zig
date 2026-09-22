@@ -13,6 +13,7 @@ const Mode = enum {
     fail,
     slow,
     hang,
+    partial,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -46,6 +47,13 @@ pub fn main(init: std.process.Init) !void {
             while (true) init.io.sleep(.fromSeconds(1), .awake) catch {};
         }
         if (mode == .slow) init.io.sleep(.fromMilliseconds(500), .awake) catch {};
+        if (mode == .partial) {
+            // Exercise clients that can observe bytes on stdout without a
+            // complete newline-delimited JSON-RPC response.
+            try writer.interface.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+            try writer.interface.flush();
+            while (true) init.io.sleep(.fromSeconds(1), .awake) catch {};
+        }
 
         if (std.mem.eql(u8, method, "initialize")) {
             const list_changed = mode == .list_changed or mode == .interleaved;

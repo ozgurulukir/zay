@@ -30,6 +30,7 @@ pub const RunOptions = struct {
     /// keeps it out of shell interpretation, which is how the git bridge passes
     /// commit messages (`git commit -F -`) without injection risk.
     stdin: ?[]const u8 = null,
+    cancel_requested: ?*const std.atomic.Value(bool) = null,
 };
 
 pub fn timeoutFromSeconds(seconds: u32) std.Io.Timeout {
@@ -103,7 +104,7 @@ fn runUnderBash(gpa: std.mem.Allocator, io: std.Io, options: RunOptions) !Result
             child.stdin = null; // ownership moved to the writer
         }
     }
-    return capture_sink.drainChild(gpa, io, &child, options.timeout);
+    return capture_sink.drainChild(gpa, io, &child, options.timeout, options.cancel_requested);
 }
 
 /// Inline-vs-spill thresholds for `capture`.

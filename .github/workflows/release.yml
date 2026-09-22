@@ -78,7 +78,7 @@ jobs:
             patch -p1 -d "$d" < tools/vendor-patches/vaxis-focus-handler.patch
             test "$(grep -c ZAY-LOCAL-PATCH "$d/src/vxfw/App.zig")" -eq 2
             patch -p1 -d "$d" < tools/vendor-patches/vaxis-input-thread-retry.patch
-            test "$(grep -c ZAY-LOCAL-PATCH "$d/src/Loop.zig")" -eq 3
+            test "$(grep -c ZAY-LOCAL-PATCH "$d/src/Loop.zig")" -eq 4
           done
 
       - name: Build (ReleaseFast)

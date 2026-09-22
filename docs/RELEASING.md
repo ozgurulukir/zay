@@ -74,10 +74,10 @@ The scripts automatically download the platform binary, verify the SHA256 checks
   `ziglang.org/download/0.16.0/` (the `mlugg/setup-zig` action 404s on 0.16.0)
   and builds with `shell: bash` + a `VERSION` env var (PowerShell mangles dotted
   versions).
-- Before building, the workflow applies the two checked-in vaxis vendor patches
-  (`tools/vendor-patches/vaxis-focus-handler.patch` +
-  `vaxis-input-thread-retry.patch`) to the pristine `zig-pkg/` checkout — the
-  same `ZAY-LOCAL-PATCH` guards `build.zig` enforces locally (see AGENTS.md
-  Known Issues). A local release reproduction must apply them too.
+- Before building, the workflow follows the [source-build patch
+  procedure](BUILDING.md#apply-the-pinned-vaxis-patches): it applies the two
+  checked-in vaxis patches to the pristine dependency and verifies the
+  `ZAY-LOCAL-PATCH` guards before compiling. A local release reproduction must
+  follow the same procedure.
 - Release notes are auto-generated from merged PRs
   (`generate_release_notes: true`).

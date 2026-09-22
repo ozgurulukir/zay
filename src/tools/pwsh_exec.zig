@@ -60,6 +60,7 @@ pub const RunOptions = struct {
     /// Bytes piped to the child's stdin before it sees EOF. Null (default)
     /// inherits no stdin.
     stdin: ?[]const u8 = null,
+    cancel_requested: ?*const std.atomic.Value(bool) = null,
 };
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, command: []const u8) !Result {
@@ -138,7 +139,7 @@ fn runUnderPwsh(gpa: std.mem.Allocator, io: std.Io, options: RunOptions) !Result
             child.stdin = null; // ownership moved to the writer
         }
     }
-    return capture_sink.drainChild(gpa, io, &child, options.timeout);
+    return capture_sink.drainChild(gpa, io, &child, options.timeout, options.cancel_requested);
 }
 
 /// Write `script` to a fresh `zay-pwsh-script-<hex>.ps1` temp file under the
