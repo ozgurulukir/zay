@@ -132,8 +132,8 @@
 +                    // unobservable by vxfw and must not reintroduce the
 +                    // repeat flood on the release path.
 +                    if (key.isModifier()) return;
---- a/src/Tty.zig
-+++ b/src/Tty.zig
+--- a/src/tty.zig
++++ b/src/tty.zig
 @@ -226,5 +226,6 @@
  pub const WindowsTty = struct {
      stdin: windows.HANDLE,
