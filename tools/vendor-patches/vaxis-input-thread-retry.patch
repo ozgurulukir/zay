@@ -8,9 +8,12 @@
 # drop-with-warn, and keep exit diagnostics in ttyRun.
 # See AGENTS.md 'vxfw Windows input-thread death' and build.zig checkVaxisLoopPatch.
 # Re-apply after every `zig build --fetch` / vaxis bump; build.zig enforces this.
---- a/src/Loop.zig	2026-09-14 23:16:44.596907000 +0300
-+++ b/src/Loop.zig	2026-09-14 23:16:52.006062100 +0300
-@@ -71,6 +71,12 @@
+diff --git a/src/Loop.zig b/src/Loop.zig
+index c0c6985..20a7779 100644
+--- a/src/Loop.zig
++++ b/src/Loop.zig
+@@ -70,6 +70,12 @@ pub fn Loop(comptime T: type) type {
+         /// spawns the input thread to read input from the tty
          pub fn start(self: *Self) !void {
              if (self.thread) |_| return;
 +            if (comptime builtin.os.tag == .windows and @hasDecl(@TypeOf(self.tty.*), "resetInputCancellation")) {
@@ -22,8 +25,7 @@
              self.thread = try self.io.concurrent(Self.ttyRun, .{
                  self,
                  self.vaxis.opts.system_clipboard_allocator,
-             });
-@@ -81,8 +88,13 @@
+@@ -81,8 +87,13 @@ pub fn Loop(comptime T: type) type {
              // If we don't have a thread, we have nothing to stop
              if (self.thread == null) return;
              self.should_quit = true;
@@ -39,7 +41,7 @@
  
              if (self.thread) |*thread| {
                  thread.await(self.io);
-@@ -109,8 +109,20 @@
+@@ -109,8 +120,20 @@ pub fn Loop(comptime T: type) type {
  
          /// posts an event into the event queue. Will block if there is not
          /// capacity for the event
@@ -61,7 +63,7 @@
          }
  
          pub fn tryPostEvent(self: *Self, event: T) !bool {
-@@ -155,7 +167,16 @@
+@@ -155,7 +178,16 @@ pub fn Loop(comptime T: type) type {
  
          /// read input from the tty. This is run in a separate thread
          fn ttyRun(self: *Self, paste_allocator: ?std.mem.Allocator) void {
@@ -79,7 +81,7 @@
          }
  
          fn _ttyRun(
-@@ -171,9 +192,36 @@
+@@ -171,9 +203,36 @@ pub fn Loop(comptime T: type) type {
              switch (builtin.os.tag) {
                  .windows => {
                      var parser: Parser = .{};
@@ -118,30 +120,44 @@
                      }
                  },
                  else => {
-@@ -301,1 +301,7 @@
-                .key_press => |key| {
+@@ -244,6 +303,12 @@ pub fn handleEventGeneric(self: anytype, vx: *Vaxis, cache: *GraphemeCache, Even
+                     }
+                 },
+                 .key_press => |key| {
 +                    // ZAY-LOCAL-PATCH: Windows Console can repeat the
 +                    // standalone Control key while a Ctrl+letter chord is
 +                    // held. Those modifier-only records have no meaning to
 +                    // vxfw (the chord event carries its modifiers) and can
 +                    // otherwise keep the UI drain loop permanently busy.
 +                    if (key.isModifier()) return;
-@@ -339,1 +339,5 @@
-                .key_release => |key| {
+                     // Check for a cursor position response for our explicit width query. This will
+                     // always be an F3 key with shift = true, and we must be looking for queries
+                     if (key.codepoint == vaxis.Key.f3 and
+@@ -276,6 +341,10 @@ pub fn handleEventGeneric(self: anytype, vx: *Vaxis, cache: *GraphemeCache, Even
+                     }
+                 },
+                 .key_release => |key| {
 +                    // ZAY-LOCAL-PATCH: modifier releases are equally
 +                    // unobservable by vxfw and must not reintroduce the
 +                    // repeat flood on the release path.
 +                    if (key.isModifier()) return;
+                     if (@hasField(Event, "key_release")) {
+                         // HACK: yuck. there has to be a better way
+                         var mut_key = key;
+diff --git a/src/tty.zig b/src/tty.zig
+index 29d5a3b..f378930 100644
 --- a/src/tty.zig
 +++ b/src/tty.zig
-@@ -226,5 +226,6 @@
+@@ -225,6 +225,7 @@ pub const PosixTty = struct {
  pub const WindowsTty = struct {
      stdin: windows.HANDLE,
      stdout: windows.HANDLE,
 +    cancel_event: windows.HANDLE,
  
      initial_codepage: c_uint,
-@@ -269,3 +269,7 @@
+     initial_input_mode: CONSOLE_MODE_INPUT,
+@@ -271,6 +272,10 @@ pub const WindowsTty = struct {
+         const initial_input_mode = try getConsoleMode(CONSOLE_MODE_INPUT, stdin.handle);
          const initial_output_mode = try getConsoleMode(CONSOLE_MODE_OUTPUT, stdout.handle);
  
 +        const cancel_event = CreateEventW(null, .TRUE, .FALSE, null) orelse
@@ -149,19 +165,25 @@
 +        errdefer windows.CloseHandle(cancel_event);
 +
          // set new modes
-@@ -281,4 +281,5 @@
+         try setConsoleMode(stdin.handle, input_raw_mode);
+         try setConsoleMode(stdout.handle, output_raw_mode);
+@@ -280,6 +285,7 @@ pub const WindowsTty = struct {
          const self: WindowsTty = .{
              .stdin = stdin.handle,
              .stdout = stdout.handle,
 +            .cancel_event = cancel_event,
              .initial_codepage = initial_output_codepage,
-@@ -301,3 +301,4 @@
+             .initial_input_mode = initial_input_mode,
+             .initial_output_mode = initial_output_mode,
+@@ -298,6 +304,7 @@ pub const WindowsTty = struct {
+         setConsoleMode(self.stdout, self.initial_output_mode) catch {};
          windows.CloseHandle(self.stdin);
          windows.CloseHandle(self.stdout);
 +        windows.CloseHandle(self.cancel_event);
      }
-@@ -329,8 +329,30 @@
-     pub fn writer(self: *WindowsTty) *std.Io.Writer {
+ 
+     pub const CONSOLE_MODE_INPUT = packed struct(u32) {
+@@ -343,6 +350,29 @@ pub const WindowsTty = struct {
          return &self.tty_writer.interface;
      }
  
@@ -187,18 +209,21 @@
 +            else => error.Unexpected,
 +        };
 +    }
- 
++
      pub fn read(self: *const WindowsTty, buf: []u8) !usize {
          return posix.read(self.fd, buf);
      }
-@@ -379,4 +379,6 @@
+@@ -351,6 +381,8 @@ pub const WindowsTty = struct {
          // We use a loop so we can ignore certain events
          var state: EventState = .{};
          while (true) {
 +            if (!(try self.waitForInputOrCancellation())) return error.Canceled;
 +
              var event_count: u32 = 0;
-@@ -777,3 +777,21 @@
+             var input_record: INPUT_RECORD = undefined;
+             if (ReadConsoleInputW(self.stdin, &input_record, 1, &event_count) == .FALSE)
+@@ -776,6 +808,24 @@ pub const WindowsTty = struct {
+ 
      pub const PINPUT_RECORD = *INPUT_RECORD;
  
 +    const wait_object_0: windows.DWORD = 0;
@@ -220,3 +245,5 @@
 +        dwMilliseconds: windows.DWORD,
 +    ) callconv(.winapi) windows.DWORD;
      pub extern "kernel32" fn ReadConsoleInputW(hConsoleInput: windows.HANDLE, lpBuffer: PINPUT_RECORD, nLength: windows.DWORD, lpNumberOfEventsRead: *windows.DWORD) callconv(.winapi) windows.BOOL;
+     pub extern "kernel32" fn GetConsoleOutputCP() callconv(.winapi) windows.UINT;
+     pub extern "kernel32" fn GetConsoleMode(kConsoleHandle: windows.HANDLE, lpMode: *windows.DWORD) callconv(.winapi) windows.BOOL;
