@@ -22,10 +22,14 @@ We try to normalise the request to a shape that is most compatible with the targ
 
 ## Agent Tools
 
-Zay exposes the following tools:
+Zay exposes four builtin tools:
 
 - `bash` (on Linux/macOS) / `pwsh` (on Windows)
 - `lane`
+- `background`
+- `skill`
+
+When configured, Zay also exposes tools from Lua plugins as `lua__<plugin>__<tool>` and tools from connected MCP servers as `mcp__<server>__<tool>`. The canonical builtin registry lives in `src/tools/registry.zig`.
 
 `bash` has some middleware written for it that makes it friendlier for agent use. For example, large outputs from a `cat` command are written to a temp file and the agent is told the full is in that file if needed. See [Shell Safety & Auto-Review](#shell-safety--auto-review) below.
 
