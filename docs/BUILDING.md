@@ -73,7 +73,7 @@ You can verify the expected guards before rebuilding:
 
 ```bash
 test "$(grep -c ZAY-LOCAL-PATCH "$VAXIS_DIR/src/vxfw/App.zig")" -eq 2
-test "$(grep -c ZAY-LOCAL-PATCH "$VAXIS_DIR/src/Loop.zig")" -eq 4
+test "$(grep -c ZAY-LOCAL-PATCH "$VAXIS_DIR/src/Loop.zig")" -eq 6
 ```
 
 ## Build, test, and install
