@@ -358,8 +358,8 @@ pub const McpManager = struct {
     }
 
     /// Join and tear down every in-flight connect job. Used by `deinit` only —
-    /// on the hot path `drainConnects` cleans up lazily instead (cancel can
-    /// block the main thread on a hung handshake).
+    /// on the hot path `drainConnects` cleans up lazily instead (cancellation
+    /// joins each worker before its owned client can be torn down).
     fn cancelAllConnects(self: *McpManager, io: std.Io) void {
         for (self.pending_connects.items) |job| {
             _ = job.future.cancel(io);
@@ -742,11 +742,39 @@ test "McpManager deinit while a connect is in flight joins and tears down" {
     defer cfg.deinit(gpa);
 
     try manager.syncFromConfig(io, &cfg);
-    manager.clients.items[0].read_timeout_ms = 250;
+    manager.clients.items[0].read_timeout_ms = 60_000;
     manager.launchConnect(io, "hang");
     try std.testing.expect(manager.hasPendingConnects());
+    try io.sleep(.fromMilliseconds(100), .awake);
 
-    // Quit while the connect is in flight: `deinit` must join the worker,
-    // reap the spawned subprocess, and free the job without crashing.
+    // Quit while the connect is in flight: `deinit` must cancel the pending
+    // response wait instead of waiting out its 60-second timeout.
+    const started = std.Io.Timestamp.now(io, .awake);
     manager.deinit(io);
+    const elapsed_ns = started.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds;
+    try std.testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
+}
+
+test "McpManager deinit cancels a partial stdio response" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = McpManager.init(gpa);
+
+    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(gpa, "partial", "partial");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+    defer cfg.deinit(gpa);
+
+    try manager.syncFromConfig(io, &cfg);
+    manager.clients.items[0].read_timeout_ms = 60_000;
+    manager.launchConnect(io, "partial");
+    try std.testing.expect(manager.hasPendingConnects());
+    try io.sleep(.fromMilliseconds(100), .awake);
+
+    // A partial line must remain cancelable. Entering the blocking delimiter
+    // reader after PeekNamedPipe observes bytes would wedge this join.
+    const started = std.Io.Timestamp.now(io, .awake);
+    manager.deinit(io);
+    const elapsed_ns = started.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds;
+    try std.testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
 }

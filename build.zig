@@ -532,11 +532,11 @@ fn checkVaxisFocusPatch(b: *std.Build, vaxis_dep: *std.Build.Dependency) void {
 /// resilience patch: upstream's `ttyRun` exits on the first console read
 /// error (swallowed by `catch {}`) and `postEvent` blocks forever on a full
 /// queue — either silently kills all keyboard input while the app keeps
-/// rendering. The patch has three independent hunks; markers are counted so
-/// a partial re-apply after a vaxis bump still fails the build.
+/// rendering. The patch has five independent protections; markers are counted
+/// so a partial re-apply after a vaxis bump still fails the build.
 fn checkVaxisLoopPatch(b: *std.Build, vaxis_dep: *std.Build.Dependency) void {
     const marker = "ZAY-LOCAL-PATCH";
-    const required_markers = 3;
+    const required_markers = 6;
     const loop_file = vaxis_dep.path("src/Loop.zig").getPath(b);
     const contents = std.Io.Dir.cwd().readFileAlloc(b.graph.io, loop_file, b.allocator, .limited(1 << 20)) catch |err| {
         std.process.fatal("vaxis vendor check: cannot read {s}: {s}", .{ loop_file, @errorName(err) });
@@ -554,9 +554,10 @@ fn checkVaxisLoopPatch(b: *std.Build, vaxis_dep: *std.Build.Dependency) void {
     std.process.fatal(
         \\Vendored vaxis is missing ZAY-LOCAL-PATCH Loop.zig guards:
         \\  {s}
-        \\found {d} of {d} markers; without them a single console read error or a
-        \\saturated event queue permanently and silently kills all keyboard
-        \\input. Re-apply after every `zig build --fetch` / vaxis bump:
+        \\found {d} of {d} markers; without them a console read error, a
+        \\saturated event queue, or a repeated Windows modifier event can
+        \\permanently starve keyboard input and TUI redraws. Re-apply after
+        \\every `zig build --fetch` / vaxis bump:
         \\  patch -p1 -d <vaxis vendor dir> < tools/vendor-patches/vaxis-input-thread-retry.patch
         \\See AGENTS.md "vxfw Windows input-thread death".
     ,
