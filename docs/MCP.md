@@ -143,15 +143,14 @@ Then, for both transports:
 **Timeouts** — a server that doesn't respond in time is marked `[FAILED]` with an error
 message:
 
-- Stdio reads use a **30-second timeout** (`read_timeout_ms`) via `std.posix.poll`. This is
-  POSIX-only today — on Windows an abrupt server close does not surface as a client read
-  error, so stdio read timeouts are a known open limitation (issue #25; the root README
-  tracks it too).
-- Remote requests apply a socket-level send/recv timeout (`applyHttpTimeout`,
-  SO_RCVTIMEO/SO_SNDTIMEO = `read_timeout_ms`) so a server that accepts the connection but
-  stalls fails the handshake instead of hanging the worker. The connect phase itself is
-  bounded only by kernel TCP/DNS timeouts — `std.http.Client` exposes no connect timeout in
-  Zig 0.16 — but because connects run off-thread, that cannot block the UI either.
+- Stdio reads use a **30-second timeout** (`read_timeout_ms`). POSIX polls the pipe and
+  Windows uses `PeekNamedPipe` in short slices, so a stalled or abruptly closed server
+  cannot wedge the handshake worker.
+- Remote requests apply a socket-level send/recv timeout on POSIX
+  (`SO_RCVTIMEO`/`SO_SNDTIMEO`). Windows races the complete `std.http.Client` operation —
+  connect, response head, JSON body or SSE stream — against the same deadline using
+  `std.Io.Select`; session DELETE during teardown uses it too. A timeout cancels and joins
+  the in-flight operation before its owned buffers are released.
 
 **Testing the async path** — `src/mcp/manager.zig`'s async tests mock a stdio MCP server
 with a `bash -c` script that `read`s each request line and `echo`s a canned JSON-RPC

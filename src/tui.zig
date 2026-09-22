@@ -1,5 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.tui);
+const os = @import("os.zig");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
@@ -255,6 +256,11 @@ pub const App = struct {
     /// lane is idle — "auto-start if idle, queue if in-flight". Owned; freed in
     /// `deinit`.
     pub const ctrl_c_double_press_ms: u32 = 1500;
+    /// Sub-threshold gap (ms) between two Ctrl-C/Ctrl+D presses treated as
+    /// auto-repeat of a single held chord rather than a second physical press.
+    /// Kept below human double-press speed so a deliberately-repeated chord
+    /// still exits while a held key does not.
+    pub const ctrl_c_auto_repeat_gap_ms: u32 = 100;
     pub const Mode = app_state.Mode;
     pub const LanesPurpose = app_state.NavState.LanesPurpose;
 
@@ -615,13 +621,34 @@ pub const App = struct {
 
     pub fn getPendingQuitAt(self: *const App) ?std.Io.Timestamp {
         return switch (self.nav.quit) {
-            .pending => |ts| ts,
+            .pending => |pending| pending.at,
             else => null,
         };
     }
 
+    pub fn pendingQuitKeyReleased(self: *const App) bool {
+        return switch (self.nav.quit) {
+            .pending => |pending| pending.key_released,
+            else => false,
+        };
+    }
+
     pub fn setPendingQuitAt(self: *App, v: ?std.Io.Timestamp) void {
-        self.nav.quit = if (v) |ts| .{ .pending = ts } else .none;
+        self.nav.quit = if (v) |timestamp| .{
+            .pending = .{
+                .at = timestamp,
+                // POSIX terminals generally do not report key releases. Windows
+                // Console does, so require one there to distinguish a second
+                // physical press from the first press's auto-repeat records.
+                .key_released = !os.is_windows,
+            },
+        } else .none;
+    }
+
+    pub fn markPendingQuitKeyReleased(self: *App) void {
+        if (self.nav.quit == .pending) {
+            self.nav.quit.pending.key_released = true;
+        }
     }
 
     pub fn clearPendingQuitAt(self: *App) void {
@@ -1295,6 +1322,7 @@ pub fn run(
     app.fw_app = &fw_app;
     app.root_widget = root.widget();
     try fw_app.run(root.widget(), .{});
+    std.log.info("shutdown.event_loop.done", .{});
 }
 
 pub const RootWidget = struct {

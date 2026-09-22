@@ -91,10 +91,19 @@ pub fn writeStdinAndClose(io: std.Io, stdin_file: std.Io.File, data: []const u8)
 /// The timeout is converted to an absolute deadline once, so the cap is TOTAL
 /// runtime (TD-2): every fill below waits against the same timestamp, and a
 /// chatty command cannot push the deadline out. `error.Timeout` propagates to
-/// the caller exactly as the per-shell callers expect.
-pub fn drainChild(gpa: std.mem.Allocator, io: std.Io, child: *std.process.Child, timeout: std.Io.Timeout) !Result {
+/// the caller exactly as the per-shell callers expect. A cancellation flag
+/// adds short polling slices so teardown can interrupt the drain. Windows
+/// polls pipe availability to avoid pending-read cancellation during cleanup.
+pub fn drainChild(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    child: *std.process.Child,
+    timeout: std.Io.Timeout,
+    cancel_requested: ?*const std.atomic.Value(bool),
+) !Result {
     assert(child.stdout != null);
     assert(child.stderr != null);
+    if (os.is_windows) return drainChildWindows(gpa, io, child, timeout, cancel_requested);
     const deadline = timeout.toDeadline(io);
 
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
@@ -105,12 +114,20 @@ pub fn drainChild(gpa: std.mem.Allocator, io: std.Io, child: *std.process.Child,
     const stdout_reader = multi_reader.reader(0);
     const stderr_reader = multi_reader.reader(1);
 
-    while (multi_reader.fill(64, deadline)) |_| {
+    while (true) {
+        if (cancel_requested != null) {
+            if (isCanceled(cancel_requested)) return error.Canceled;
+            if (deadline.toDurationFromNow(io)) |remaining| {
+                if (remaining.raw.nanoseconds <= 0) return error.Timeout;
+            }
+        }
+        multi_reader.fill(64, fillTimeout(io, deadline, cancel_requested)) catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.Timeout => if (cancel_requested != null) continue else return err,
+            else => |e| return e,
+        };
         if (stdout_reader.buffered().len > stdout_bytes_limit) return error.StreamTooLong;
         if (stderr_reader.buffered().len > stderr_bytes_limit) return error.StreamTooLong;
-    } else |err| switch (err) {
-        error.EndOfStream => {},
-        else => |e| return e,
     }
 
     try multi_reader.checkAnyError();
@@ -126,6 +143,159 @@ pub fn drainChild(gpa: std.mem.Allocator, io: std.Io, child: *std.process.Child,
         .stderr = stderr_slice,
         .code = os.termCode(term),
     };
+}
+
+const cancel_poll_ms: i64 = 10;
+
+const windows = std.os.windows;
+extern "kernel32" fn PeekNamedPipe(
+    pipe: windows.HANDLE,
+    buffer: ?*anyopaque,
+    buffer_size: u32,
+    bytes_read: ?*u32,
+    bytes_available: ?*u32,
+    bytes_left: ?*u32,
+) callconv(.winapi) windows.BOOL;
+
+/// Never submit a read on an empty Windows pipe: canceling MultiReader's
+/// pending reads can wait for the child before the caller can terminate it.
+fn drainChildWindows(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    child: *std.process.Child,
+    timeout: std.Io.Timeout,
+    cancel_requested: ?*const std.atomic.Value(bool),
+) !Result {
+    const deadline = timeout.toDeadline(io);
+    var output: [2]std.ArrayList(u8) = .{ .empty, .empty };
+    defer for (&output) |*stream| stream.deinit(gpa);
+    const pipes = [_]std.Io.File{ child.stdout.?, child.stderr.? };
+    var ended = [_]bool{ false, false };
+    while (true) {
+        if (isCanceled(cancel_requested)) return error.Canceled;
+        var sleep_ms: i64 = cancel_poll_ms;
+        if (deadline.toDurationFromNow(io)) |remaining| {
+            if (remaining.raw.nanoseconds <= 0) return error.Timeout;
+            sleep_ms = @intCast(@min(sleep_ms, @divTrunc(remaining.raw.nanoseconds, std.time.ns_per_ms)));
+        }
+        for (pipes, 0..) |pipe, index| {
+            if (!ended[index]) ended[index] = try readWindowsPipe(gpa, io, pipe, &output[index]);
+        }
+        if (ended[0] and ended[1]) {
+            // EOF need not mean process exit. Keep the same deadline while
+            // waiting for a child that closed both streams but is still alive.
+            const zero: windows.LARGE_INTEGER = 0;
+            switch (windows.ntdll.NtWaitForSingleObject(child.id.?, .FALSE, &zero)) {
+                .SUCCESS => break,
+                .TIMEOUT => {},
+                else => return error.Unexpected,
+            }
+        }
+        try io.sleep(.fromMilliseconds(sleep_ms), .awake);
+    }
+    const term = try child.wait(io);
+    const stdout_slice = try output[0].toOwnedSlice(gpa);
+    errdefer gpa.free(stdout_slice);
+    const stderr_slice = try output[1].toOwnedSlice(gpa);
+    return .{ .stdout = stdout_slice, .stderr = stderr_slice, .code = os.termCode(term) };
+}
+
+fn readWindowsPipe(gpa: std.mem.Allocator, io: std.Io, pipe: std.Io.File, output: *std.ArrayList(u8)) !bool {
+    var available: u32 = 0;
+    if (PeekNamedPipe(pipe.handle, null, 0, null, &available, null) == .FALSE) {
+        return switch (windows.GetLastError()) {
+            .BROKEN_PIPE, .PIPE_NOT_CONNECTED => true,
+            else => error.ReadFailed,
+        };
+    }
+    if (available == 0) return false;
+    var buffer: [8192]u8 = undefined;
+    const count = try pipe.readStreaming(io, &.{buffer[0..@min(available, buffer.len)]});
+    if (count == 0) return true;
+    if (output.items.len + count > stdout_bytes_limit) return error.StreamTooLong;
+    try output.appendSlice(gpa, buffer[0..count]);
+    return false;
+}
+
+test "Windows drainChild timeout does not wait for a silent child" {
+    if (!os.is_windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "cmd.exe", "/d", "/c", "ping -n 4 127.0.0.1 >nul" },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    defer child.kill(io);
+    var canceled: std.atomic.Value(bool) = .init(false);
+    const start = std.Io.Timestamp.now(io, .awake);
+    try std.testing.expectError(error.Timeout, drainChild(std.testing.allocator, io, &child, .{
+        .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake },
+    }, &canceled));
+    const elapsed = start.durationTo(std.Io.Timestamp.now(io, .awake));
+    try std.testing.expect(elapsed.nanoseconds < 1500 * std.time.ns_per_ms);
+}
+
+test "Windows drainChild cancellation interrupts a silent child" {
+    if (!os.is_windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "cmd.exe", "/d", "/c", "ping -n 4 127.0.0.1 >nul" },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    defer child.kill(io);
+    var canceled: std.atomic.Value(bool) = .init(false);
+    var cancel_task = try io.concurrent(struct {
+        fn run(task_io: std.Io, flag: *std.atomic.Value(bool)) void {
+            task_io.sleep(.fromMilliseconds(100), .awake) catch return;
+            flag.store(true, .release);
+        }
+    }.run, .{ io, &canceled });
+    defer cancel_task.cancel(io);
+    const start = std.Io.Timestamp.now(io, .awake);
+    try std.testing.expectError(error.Canceled, drainChild(std.testing.allocator, io, &child, .none, &canceled));
+    try std.testing.expect(start.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds < 1500 * std.time.ns_per_ms);
+}
+
+test "Windows drainChild preserves stdout stderr and exit status" {
+    if (!os.is_windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "cmd.exe", "/d", "/c", "echo output& echo problem 1>&2& exit /b 7" },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    defer child.kill(io);
+    var result = try drainChild(std.testing.allocator, io, &child, .{
+        .duration = .{ .raw = .fromMilliseconds(3000), .clock = .awake },
+    }, null);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.startsWith(u8, result.stdout, "output"));
+    try std.testing.expect(std.mem.startsWith(u8, result.stderr, "problem"));
+    try std.testing.expectEqual(@as(u8, 7), result.code);
+}
+
+fn isCanceled(cancel_requested: ?*const std.atomic.Value(bool)) bool {
+    return if (cancel_requested) |flag| flag.load(.acquire) else false;
+}
+
+fn fillTimeout(
+    io: std.Io,
+    deadline: std.Io.Timeout,
+    cancel_requested: ?*const std.atomic.Value(bool),
+) std.Io.Timeout {
+    if (cancel_requested == null) return deadline;
+    if (isCanceled(cancel_requested)) return .{ .duration = .{ .raw = .zero, .clock = .awake } };
+
+    const remaining = deadline.toDurationFromNow(io) orelse return .none;
+    const poll_ns = @min(remaining.raw.nanoseconds, @as(i96, cancel_poll_ms) * std.time.ns_per_ms);
+    return .{ .duration = .{
+        .raw = .fromNanoseconds(@max(poll_ns, 0)),
+        .clock = remaining.clock,
+    } };
 }
 
 /// Streaming accumulator behind `capture`: keeps a bounded rolling tail and,

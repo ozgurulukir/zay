@@ -41,19 +41,23 @@ const max_threads = tui.max_threads;
 /// Tear down every lane, background job, picker, cache, and input buffer.
 /// Called once at clean exit (or when switching to a new `initRuntime` session).
 pub fn deinitApp(self: *App) void {
+    log.info("shutdown.app.begin", .{});
     std.debug.assert(self.threads.len() > 0);
     std.debug.assert(self.threads.len() <= max_threads);
 
     // Stop all worker threads first; nothing below may dereference a live
     // worker while it is still running.
     deinitWorkersTop(self);
+    log.info("shutdown.workers.done", .{});
 
     // Shared services that other teardown steps may reference during cleanup.
     deinitSharedServices(self);
+    log.info("shutdown.services.done", .{});
 
     // Heap-owned UI and lane state. Order mirrors init: search/inputs last,
     // lanes second-to-last, bridge/limiter absolute last.
     deinitOwnedState(self);
+    log.info("shutdown.app.done", .{});
 
     self.* = undefined;
 }
@@ -93,7 +97,9 @@ fn deinitSharedServices(self: *App) void {
     for (self.background_modal_state.pending.items) |*delivery| self.freeDelivery(delivery);
     self.background_modal_state.pending.deinit(self.gpa);
 
+    log.info("shutdown.jobs.begin", .{});
     cancelAllJobs(self);
+    log.info("shutdown.pickers.begin", .{});
     self.pickers.tree.deinit();
     self.pickers.search.deinit(self.gpa);
     self.pickers.models.deinit(self.gpa);
@@ -108,7 +114,9 @@ fn deinitSharedServices(self: *App) void {
         self.provider_state.entries_slice = null;
     }
 
+    log.info("shutdown.mcp.begin", .{});
     self.mcp_manager.deinit(self.io);
+    log.info("shutdown.mcp.done", .{});
     self.plugin_manager.deinit();
     self.tool_registry.deinit(self.gpa);
     self.gpa.destroy(self.tool_registry);
@@ -180,6 +188,18 @@ fn deinitOwnedState(self: *App) void {
 pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     std.debug.assert(root.app.threads.len() > 0);
     std.debug.assert(root.app.threads.len() <= max_threads);
+
+    // A `/exit` command (or any confirmed quit) activates on the next tick
+    // rather than waiting for a follow-up keypress. This is load-bearing on
+    // Windows: some pty backends (including Windows Terminal) do not deliver
+    // the trailing event after an exit command, so relying on it would leave
+    // the loop running forever. The next loop iteration is always processed.
+    if (root.app.nav.quit == .confirmed) {
+        log.info("shutdown.request source=command", .{});
+        ctx.quit = true;
+        ctx.consume_event = true;
+        return;
+    }
 
     // UI-thread heartbeat (~1.5s cadence at the 30ms tick): proves the event
     // loop is alive when reported alongside input breadcrumbs — see AGENTS.md
@@ -369,6 +389,7 @@ fn jobFamilyActive(app: *const App, comptime family: JobFamily) bool {
 pub fn cancelAllJobs(app: *App) void {
     inline for (std.meta.fields(JobFamily)) |field| {
         const family: JobFamily = @enumFromInt(field.value);
+        log.info("shutdown.job.begin family={s}", .{field.name});
         switch (family) {
             .diff_refresh => diff_lifecycle.cancelDiffRefresh(app),
             .registry_refresh => registry_job.cancel(app),
@@ -376,6 +397,7 @@ pub fn cancelAllJobs(app: *App) void {
             .codex_login => provider_model.cancelCodexLogin(app),
             .git_label => cancelGitLabelJob(app),
         }
+        log.info("shutdown.job.done family={s}", .{field.name});
     }
 }
 

@@ -54,7 +54,7 @@ const diffCountCommand =
     \\fi
 ;
 
-fn runDiffRefresh(job: *DiffRefreshJob) DiffRefreshOutcome {
+fn runDiffRefresh(job: *DiffRefreshJob, cancel_requested: *const std.atomic.Value(bool)) DiffRefreshOutcome {
     const gpa = job.gpa;
     defer {
         job.deinit();
@@ -65,6 +65,7 @@ fn runDiffRefresh(job: *DiffRefreshJob) DiffRefreshOutcome {
         .cwd = job.cwd,
         .command = diff_viewer.diff_command,
         .timeout = bash_mod.timeoutFromSeconds(5),
+        .cancel_requested = cancel_requested,
     }) catch return .failed;
     defer result.deinit(gpa);
 
@@ -129,7 +130,7 @@ pub fn scheduleDiffRefresh(app: *App) !void {
             // The errdefer chain frees cwd + job exactly once and disarms
             // the union on spawn failure.
             errdefer app.metrics.diff = .idle;
-            try app.metrics.diff.loading.job.spawn(app.io, job, runDiffRefresh);
+            try app.metrics.diff.loading.job.spawnCancelable(app.io, job, runDiffRefresh);
             return;
         },
     }
@@ -153,7 +154,7 @@ pub fn scheduleDiffRefresh(app: *App) !void {
         .{ .ready = .{ .cache = cache } }
     else
         .idle;
-    try app.metrics.diff.refreshing.job.spawn(app.io, job, runDiffRefresh);
+    try app.metrics.diff.refreshing.job.spawnCancelable(app.io, job, runDiffRefresh);
 }
 
 pub fn cancelDiffRefresh(app: *App) void {
