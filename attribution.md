@@ -197,16 +197,24 @@ The MIT license text follows (kept verbatim at `vendor/websocket.zig/LICENSE`).
 ## zigdown → `lib/terminal_markdown.zig` (transcript markdown rendering)
 
 - **Source:** <https://github.com/JacobCrabill/zigdown>
-- **Version:** vendored 2026-05; the originally recorded upstream commit SHA
-  (`f65f476`) no longer resolves upstream and the exact commit is unknown.
-  Upstream's current release is **v1.3.1** (2026-08-08); the vendored
-  renderer predates it.
+- **Version:** adapted from upstream zigdown; bugfixes are tracked by feature
+  through **v1.3.1** (`de6b642`, 2026-08-08). The upstream base revision of the
+  original adaptation was never recorded and is **unresolvable**: `f65f476` is
+  Zay's own vendoring commit (2026-05-28, "vendor zigdown for markdown
+  rendering"), not an upstream SHA, and the adapted file is a rewrite with Zay's
+  own inline parser and `Span`/`Row` model, so no upstream tag matches it
+  structurally. Ports are therefore feature-based, not revision-based.
 - **License:** MIT — Copyright 2024 Jacob Crabill <github.com/JacobCrabill>
 - **Used for:** rendering markdown in the transcript (`lib/terminal_markdown.zig`,
-  imported by `src/transcript.zig` and the message/status widgets). The
-  renderer was vendored from zigdown into `lib/terminal_markdown.zig`; the
-  source files were later pruned from `vendor/zigdown/`, leaving only
-  `LICENSE.txt`, which is kept for attribution.
+  imported by `src/transcript.zig` and the message/status widgets). Only
+  `LICENSE.txt` was ever vendored under `vendor/zigdown/`; the renderer was
+  adapted directly into `lib/terminal_markdown.zig`.
+- **Ported fixes:** a `|` inside an inline code span is no longer treated as a
+  table column separator (`9720b68`); multi-byte (CJK) table cells pad by display
+  width rather than byte length (`d93231d`, locked by regression tests). The
+  saturating-arithmetic hardening from `6a139f9` was audited against Zay's width
+  math and skipped: every table/width site already saturates (`-|`), and no
+  under/overflow case is reachable.
 
 The MIT license text follows (kept verbatim at `vendor/zigdown/LICENSE.txt`).
 

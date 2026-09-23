@@ -602,9 +602,32 @@ const TableCellIterator = struct {
     fn next(self: *TableCellIterator) ?[]const u8 {
         if (self.index >= self.end) return null;
         const start = self.index;
-        const pipe = std.mem.indexOfScalarPos(u8, self.line, self.index, '|') orelse self.end;
+        const pipe = self.cellEnd();
         self.index = @min(pipe + 1, self.end);
         return trim(self.line[start..@min(pipe, self.end)]);
+    }
+
+    /// Find the `|` terminating the cell starting at `self.index`, skipping pipes
+    /// that sit inside an inline code span: `` ` `` toggles `in_code` and a pipe
+    /// only ends a cell while no code span is open. If the scan reaches the row
+    /// end with a code span still open, the backtick is unterminated — fall back
+    /// to plain pipe splitting (treat the backtick literally) so a lone backtick
+    /// can never swallow the rest of the row.
+    fn cellEnd(self: *const TableCellIterator) usize {
+        var in_code = false;
+        var index = self.index;
+        while (index < self.end) : (index += 1) {
+            const byte = self.line[index];
+            if (byte == '`') {
+                in_code = !in_code;
+            } else if (byte == '|' and !in_code) {
+                return index;
+            }
+        }
+        if (in_code) {
+            return std.mem.indexOfScalarPos(u8, self.line, self.index, '|') orelse self.end;
+        }
+        return self.end;
     }
 };
 
@@ -1050,6 +1073,81 @@ test "table cells wrap within column width" {
 
     try std.testing.expect(out.rows.len > 5);
     try std.testing.expectEqual(@as(u16, @intCast(out.rows.len)), countRows(gpa, "| Name | Value |\n| --- | --- |\n| alpha beta gamma | delta |", 24));
+}
+
+// Ported intent of upstream zigdown `9720b68`: a `|` inside an inline code span
+// is literal, not a table column separator. The header fixes ncol at 2, so the
+// data row's code-span pipe must not split off a third cell. `containsStyledText`
+// proves the code span survived verbatim (row index 3 = top border, header,
+// middle border, data row).
+test "pipe inside inline code does not split table cells" {
+    const gpa = std.testing.allocator;
+    const table = "| a | b |\n| --- | --- |\n| `x|y` | z |";
+    var out = try render(gpa, table, 80);
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 5), out.rows.len);
+    try std.testing.expect(containsStyledText(out.rows[3].spans, .code, "x|y"));
+    try std.testing.expect(containsText(out.rows[3].spans, "z"));
+
+    // SSOT guard: countRows and render share `TableCellIterator`, so they must
+    // agree on the new column boundaries exactly.
+    try std.testing.expectEqual(@as(u16, @intCast(out.rows.len)), countRows(gpa, table, 80));
+}
+
+// Pins the unterminated-backtick fallback: when a row's code span never closes,
+// the backtick is treated literally and the row splits on the next pipe as
+// before, so a lone backtick can never swallow the rest of the row.
+test "unterminated backtick in a table row keeps pipe splitting" {
+    const gpa = std.testing.allocator;
+    const table = "| a | b |\n| --- | --- |\n| `x | y |";
+    var out = try render(gpa, table, 80);
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 5), out.rows.len);
+    try std.testing.expect(containsText(out.rows[3].spans, "`x"));
+    try std.testing.expect(containsText(out.rows[3].spans, "y"));
+    try std.testing.expectEqual(@as(u16, @intCast(out.rows.len)), countRows(gpa, table, 80));
+}
+
+// Verification-style port of upstream `d93231d`: table padding is display-width
+// based (vaxis gwidth), so multi-byte cells must not overflow the column. UTF-8
+// continuation bytes can never equal '|' (0x7C), so cell splitting is byte-safe.
+test "table cells with multi-byte content pad by display width" {
+    const gpa = std.testing.allocator;
+    const table = "| 名前 | 値 |\n| --- | --- |\n| 日本語 | データ |";
+    for ([_]u16{ 80, 24 }) |width| {
+        var out = try render(gpa, table, width);
+        defer out.deinit(gpa);
+
+        for (out.rows) |row| {
+            try std.testing.expect(spansWidth(row.spans) <= width);
+        }
+        try std.testing.expectEqual(@as(u16, @intCast(out.rows.len)), countRows(gpa, table, width));
+    }
+}
+
+// Zay's inline parser never had upstream's `*x*:` italic-terminator bug
+// (`af00b60`); this locks the correct literal rendering in place.
+test "italic followed by colon renders literally" {
+    const gpa = std.testing.allocator;
+    var out = try render(gpa, "*x*: y", 80);
+    defer out.deinit(gpa);
+
+    // One row, no crash, and the emphasis is exactly `x` — the colon must not be
+    // absorbed into the italic terminator.
+    try std.testing.expectEqual(@as(usize, 1), out.rows.len);
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .emphasis, "x"));
+
+    // Concatenate the row's spans: the colon and `y` survive as literal text and
+    // no emphasis/code marker leaks. (The wrap engine joins adjacent inline spans
+    // with a single space — pre-existing, unrelated to the terminator fix — so
+    // assert the colon's presence rather than a byte-exact join.)
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    for (out.rows[0].spans) |span| try text.appendSlice(gpa, span.text);
+    try std.testing.expect(std.mem.indexOf(u8, text.items, ": y") != null);
+    try std.testing.expect(std.mem.indexOfAny(u8, text.items, "*`") == null);
 }
 
 test "strong markers are removed" {
