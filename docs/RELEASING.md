@@ -20,14 +20,19 @@ panel's About tab.
 ## Cutting a release
 
 1. Make sure `main` is green (`zig build test`).
-2. Tag the commit you want to ship and push the tag:
+2. Bump `build.zig.zon`'s `.version` to the release version (e.g. `"0.9.11"`)
+   and commit it. The release workflow's `version-check` job fails fast when the
+   tag (minus its leading `v`) and `.version` disagree, so the package metadata
+   cannot drift from the release. A pre-release tag such as `v0.9.12-beta.1`
+   needs the matching `"0.9.12-beta.1"` in `.version`.
+3. Tag the commit you want to ship and push the tag:
 
    ```bash
    git tag v0.3.0
    git push origin v0.3.0
    ```
 
-3. The `release` workflow builds `ReleaseFast` binaries for **Windows** and
+4. The `release` workflow builds `ReleaseFast` binaries for **Windows** and
    **Linux** on native runners, embeds the tag as the version, computes SHA-256
    checksums, and creates a GitHub Release with both binaries and their
    `.sha256` files attached.

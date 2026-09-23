@@ -9,8 +9,35 @@ permissions:
   contents: write
 
 jobs:
+  version-check:
+    name: version-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The git tag is the release version, but build.zig.zon's .version is
+      # package metadata that has drifted before (it read 0.9.7 while tags were
+      # at v0.9.10). Fail fast so the two cannot disagree in a shipped release.
+      - name: Verify build.zig.zon version matches the tag
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          zon_version="$(sed -n 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' build.zig.zon | head -n1)"
+          if [ -z "$zon_version" ]; then
+            echo "::error::could not read .version from build.zig.zon"
+            exit 1
+          fi
+          expected="${tag#v}"
+          if [ "$zon_version" != "$expected" ]; then
+            echo "::error::build.zig.zon version ($zon_version) does not match release tag ($tag). Bump .version to \"$expected\" before tagging."
+            exit 1
+          fi
+          echo "build.zig.zon version ($zon_version) matches tag $tag"
+
   build:
     name: build-${{ matrix.os }}
+    needs: version-check
     strategy:
       fail-fast: false
       matrix:
