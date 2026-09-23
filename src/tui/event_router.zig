@@ -320,6 +320,19 @@ fn routeKey(
             ctx.consumeAndRedraw();
             return;
         }
+        // The MCP overlay owns Enter: it is the add-server form's submit while
+        // `adding`, or the selected-server toggle otherwise. `submitMode` has
+        // no `.mcp` arm (it is in the "no Enter action" list and returns
+        // false), so routing Enter through the generic chat `submit` would
+        // swallow the key and leave the add-form permanently unsubmitable.
+        if (app.getMode() == .mcp) {
+            if (try app.handleCommandKey(key)) {
+                ctx.consumeAndRedraw();
+            } else {
+                ctx.consumeEvent();
+            }
+            return;
+        }
         try root.submit(ctx);
         return;
     }
@@ -850,6 +863,41 @@ test "bracketed paste: stray paste_end clears the flag" {
     // flag must never stay armed.
     try captureEvent(&app, &root, &ctx, .paste_end);
     try std.testing.expect(!app.isPasting());
+}
+
+test "MCP add-server form: Enter reaches the handler instead of the chat submit" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    tui.openMcp(&app);
+    try std.testing.expectEqual(App.Mode.mcp, app.getMode());
+
+    // 'a' opens the add-server form.
+    try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = 'a' } });
+    try std.testing.expect(app.pickers.mcp.adding);
+
+    // Typed characters accumulate in the URL buffer via the form's own handler.
+    try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = 'x' } });
+    try std.testing.expectEqualStrings("x", app.input_buffers.mcp_url.items);
+
+    // Regression: Enter must be routed to the MCP overlay's handler (which
+    // clears `adding`), not swallowed by the generic chat `submit` — whose
+    // `submitMode` has no `.mcp` arm and returns false, leaving the form open
+    // forever. After the fix, Enter closes the form and clears the buffer.
+    try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = '\r' } });
+    try std.testing.expect(!app.pickers.mcp.adding);
+    try std.testing.expectEqual(@as(usize, 0), app.input_buffers.mcp_url.items.len);
+    // The overlay stays open — only the form closed.
+    try std.testing.expectEqual(App.Mode.mcp, app.getMode());
 }
 
 test "isClipboardPasteChord recognizes all three paste chords and rejects lookalikes" {
