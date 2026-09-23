@@ -30,7 +30,7 @@ pub const help_lines = [_]HelpLine{
     .{ .key = "Ctrl+Down / Alt+Down", .desc = "Navigate to next prompt in history" },
     .{ .key = "Shift+Down", .desc = "Jump to bottom of conversation" },
     .{ .key = "Shift + Mouse Drag", .desc = "Select text with mouse (terminal native)" },
-    .{ .key = "Ctrl+V / Shift+Ins", .desc = "Paste text from system clipboard" },
+    .{ .key = "Ctrl+V / Shift+Ins / Alt+V", .desc = "Paste text from system clipboard" },
     .{ .key = "c / y (in block nav)", .desc = "Copy selected message to clipboard" },
     .{ .key = "Up / Down", .desc = "Scroll transcript messages / select blocks" },
     .{ .key = "Tab", .desc = "Expand / collapse active message" },
