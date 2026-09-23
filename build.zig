@@ -8,20 +8,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    // Vendored-vaxis integrity gate: the two `ZAY-LOCAL-PATCH` FocusHandler
-    // guards (empty `path_to_focused` → SIGSEGV in ReleaseFast on session
-    // switch) live in the gitignored vendor copy and silently vanish on every
-    // `zig build --fetch` / vaxis bump. This runs at configure time on every
-    // build invocation so a fresh fetch can never compile unpatched. See
-    // AGENTS.md "vxfw FocusHandler crash" and
-    // tools/vendor-patches/vaxis-focus-handler.patch.
-    checkVaxisFocusPatch(b, vaxis_dep);
-    // Same integrity gate for the Loop.zig input-thread retry guard: without
-    // it, one transient Windows console read error permanently kills all
-    // keyboard input (silently — `ttyRun` swallows the error). See AGENTS.md
-    // "vxfw input thread death" and
-    // tools/vendor-patches/vaxis-input-thread-retry.patch.
-    checkVaxisLoopPatch(b, vaxis_dep);
+    // Vendored-vaxis integrity gate: the `ZAY-LOCAL-PATCH` guards (the
+    // FocusHandler empty-`path_to_focused` SIGSEGV in ReleaseFast on session
+    // switch, and the Windows input-thread resilience guards) live in the
+    // gitignored vendor copy and silently vanish on every `zig build --fetch` /
+    // vaxis bump. This runs at configure time on every build invocation so a
+    // fresh fetch can never compile unpatched. Manifest-driven: patch files,
+    // gated targets, apply order, and required marker counts live in
+    // tools/vendor-patches/manifest.txt (read by the appliers and the release
+    // workflow too). See AGENTS.md "vxfw FocusHandler crash" and
+    // "vxfw Windows input-thread death".
+    checkVaxisPatches(b, vaxis_dep);
     const websocket_vendor_mod = b.createModule(.{
         .root_source_file = b.path("vendor/websocket.zig/src/websocket.zig"),
         .target = target,
@@ -494,73 +491,148 @@ fn addTestRun(b: *std.Build, tests: *std.Build.Step.Compile) *std.Build.Step.Run
     return run;
 }
 
-/// Fails the build when the vendored vaxis `src/vxfw/App.zig` is missing the
-/// two `ZAY-LOCAL-PATCH` FocusHandler guards. Upstream `assert(path.len > 0)`
-/// is stripped in ReleaseFast, and an empty focus path (left behind when
-/// `installRuntime` deinits the runtime that owned the focused widget) then
-/// SIGSEGVs on the next key event. The markers are counted rather than
-/// presence-tested so losing either one of the two guards still fails.
-fn checkVaxisFocusPatch(b: *std.Build, vaxis_dep: *std.Build.Dependency) void {
+/// Vendored-dependency integrity gate. Reads
+/// `tools/vendor-patches/manifest.txt` — the single source of truth for patch
+/// files, gated targets, apply order, and required `ZAY-LOCAL-PATCH` marker
+/// counts — then fails the configure step if any gated target in the vendored
+/// vaxis copy holds fewer markers than required. Runs on EVERY `zig build`
+/// invocation so a pristine `zig build --fetch` / vaxis bump can never compile
+/// unpatched: without the FocusHandler guards a session switch can SIGSEGV in
+/// ReleaseFast, and without the input-thread guards one transient Windows
+/// console read error permanently kills all keyboard input. See AGENTS.md
+/// "vxfw FocusHandler crash" and "vxfw Windows input-thread death".
+fn checkVaxisPatches(b: *std.Build, vaxis_dep: *std.Build.Dependency) void {
     const marker = "ZAY-LOCAL-PATCH";
-    const app_file = vaxis_dep.path("src/vxfw/App.zig").getPath(b);
-    const contents = std.Io.Dir.cwd().readFileAlloc(b.graph.io, app_file, b.allocator, .limited(1 << 20)) catch |err| {
-        std.process.fatal("vaxis vendor check: cannot read {s}: {s}", .{ app_file, @errorName(err) });
+    const manifest_rel = "tools/vendor-patches/manifest.txt";
+    const manifest_path = b.path(manifest_rel).getPath(b);
+    const manifest = std.Io.Dir.cwd().readFileAlloc(
+        b.graph.io,
+        manifest_path,
+        b.allocator,
+        .limited(1 << 16),
+    ) catch |err| {
+        std.process.fatal("vaxis vendor check: cannot read {s}: {s}", .{ manifest_path, @errorName(err) });
     };
-    defer b.allocator.free(contents);
+    defer b.allocator.free(manifest);
 
-    var markers: usize = 0;
-    var idx: usize = 0;
-    while (std.mem.indexOfPos(u8, contents, idx, marker)) |at| {
-        markers += 1;
-        idx = at + marker.len;
+    const Shortfall = struct {
+        file: []const u8,
+        target_path: []const u8,
+        found: usize,
+        required: usize,
+        label: []const u8,
+    };
+    var shortfalls: std.ArrayList(Shortfall) = .empty;
+    defer shortfalls.deinit(b.allocator);
+
+    var lines = std.mem.splitScalar(u8, manifest, '\n');
+    var line_no: usize = 0;
+    while (lines.next()) |raw_line| {
+        line_no += 1;
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+
+        var fields = std.mem.splitScalar(u8, line, '|');
+        // Per-field trim is defense in depth against a hand-edited, cosmetically
+        // padded row; the format contract forbids padding but parsing tolerates it.
+        const patch_file = std.mem.trim(u8, fields.next() orelse "", " \t\r");
+        const targets_field = std.mem.trim(u8, fields.next() orelse "", " \t\r");
+        const label = std.mem.trim(u8, fields.next() orelse "", " \t\r");
+        if (fields.next() != null or patch_file.len == 0 or targets_field.len == 0 or label.len == 0) {
+            std.process.fatal(
+                "{s} line {d}: expected exactly 3 non-empty '|'-separated fields (patch|targets|label)",
+                .{ manifest_rel, line_no },
+            );
+        }
+
+        var pairs = std.mem.splitScalar(u8, targets_field, ',');
+        while (pairs.next()) |raw_pair| {
+            const pair = std.mem.trim(u8, raw_pair, " \t\r");
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse {
+                std.process.fatal("{s} line {d}: target '{s}' is not 'path=count'", .{ manifest_rel, line_no, pair });
+            };
+            const target_path = std.mem.trim(u8, pair[0..eq], " \t\r");
+            const count_text = std.mem.trim(u8, pair[eq + 1 ..], " \t\r");
+            if (target_path.len == 0 or count_text.len == 0) {
+                std.process.fatal("{s} line {d}: target '{s}' has an empty path or count", .{ manifest_rel, line_no, pair });
+            }
+            const required = std.fmt.parseInt(usize, count_text, 10) catch {
+                std.process.fatal("{s} line {d}: '{s}' is not a marker count", .{ manifest_rel, line_no, count_text });
+            };
+
+            const resolved = vaxis_dep.path(target_path).getPath(b);
+            const contents = std.Io.Dir.cwd().readFileAlloc(
+                b.graph.io,
+                resolved,
+                b.allocator,
+                .limited(1 << 20),
+            ) catch |err| {
+                std.process.fatal("vaxis vendor check: cannot read {s}: {s}", .{ resolved, @errorName(err) });
+            };
+            defer b.allocator.free(contents);
+
+            const found = countMarkers(contents, marker);
+            if (found < required) {
+                shortfalls.append(b.allocator, .{
+                    .file = resolved,
+                    .target_path = target_path,
+                    .found = found,
+                    .required = required,
+                    .label = label,
+                }) catch |err| {
+                    std.process.fatal("vaxis vendor check: cannot build report: {s}", .{@errorName(err)});
+                };
+            }
+        }
     }
-    if (markers >= 2) return;
 
-    std.process.fatal(
-        \\Vendored vaxis is missing the ZAY-LOCAL-PATCH FocusHandler guards:
-        \\  {s}
-        \\found {d} of 2 markers; without them a session switch can SIGSEGV in
-        \\ReleaseFast. Re-apply after every `zig build --fetch` / vaxis bump:
-        \\  patch -p1 -d <vaxis vendor dir> < tools/vendor-patches/vaxis-focus-handler.patch
-        \\See AGENTS.md "vxfw FocusHandler crash".
-    ,
-        .{ app_file, markers },
-    );
+    if (shortfalls.items.len == 0) return;
+
+    // Derive the vaxis root from the first failing target with a
+    // depth-independent suffix strip: the resolved file path ends with the
+    // manifest target path, so dropping that suffix leaves the root. The byte
+    // length is identical whether the separator is '/' or '\', so this works
+    // for multi-level paths (src/vxfw/App.zig), which `dirname` would not.
+    const first = shortfalls.items[0];
+    var root = first.file[0 .. first.file.len - first.target_path.len];
+    if (root.len > 0 and (root[root.len - 1] == '/' or root[root.len - 1] == '\\')) {
+        root = root[0 .. root.len - 1];
+    }
+
+    var report: std.Io.Writer.Allocating = .init(b.allocator);
+    defer report.deinit();
+    const w = &report.writer;
+    w.print(
+        \\Vendored vaxis is missing ZAY-LOCAL-PATCH guards (manifest: {s}):
+        \\
+    , .{manifest_rel}) catch |err| std.process.fatal("vaxis vendor check: {s}", .{@errorName(err)});
+    for (shortfalls.items) |shortfall| {
+        w.print("  {s}\n    found {d} of {d} required markers - {s}\n", .{
+            shortfall.file,
+            shortfall.found,
+            shortfall.required,
+            shortfall.label,
+        }) catch |err| std.process.fatal("vaxis vendor check: {s}", .{@errorName(err)});
+    }
+    w.print(
+        \\Re-apply after every `zig build --fetch` / vaxis bump (vaxis dir: {s}):
+        \\  PowerShell: .\tools\apply-vaxis-patches.ps1 -VaxisDir "{s}"
+        \\  POSIX:      bash tools/apply-vaxis-patches.sh "{s}"
+        \\Hunk failures after a vaxis bump -> regeneration recipe: docs/BUILDING.md "Bumping vaxis".
+        \\See AGENTS.md "vxfw FocusHandler crash" / "vxfw Windows input-thread death".
+        \\
+    , .{ root, root, root }) catch |err| std.process.fatal("vaxis vendor check: {s}", .{@errorName(err)});
+
+    std.process.fatal("{s}", .{report.written()});
 }
 
-/// Vendored-vaxis integrity gate for the Loop.zig Windows input-thread
-/// resilience patch: upstream's `ttyRun` exits on the first console read
-/// error (swallowed by `catch {}`) and `postEvent` blocks forever on a full
-/// queue — either silently kills all keyboard input while the app keeps
-/// rendering. The patch has five independent protections; markers are counted
-/// so a partial re-apply after a vaxis bump still fails the build.
-fn checkVaxisLoopPatch(b: *std.Build, vaxis_dep: *std.Build.Dependency) void {
-    const marker = "ZAY-LOCAL-PATCH";
-    const required_markers = 6;
-    const loop_file = vaxis_dep.path("src/Loop.zig").getPath(b);
-    const contents = std.Io.Dir.cwd().readFileAlloc(b.graph.io, loop_file, b.allocator, .limited(1 << 20)) catch |err| {
-        std.process.fatal("vaxis vendor check: cannot read {s}: {s}", .{ loop_file, @errorName(err) });
-    };
-    defer b.allocator.free(contents);
-
+/// Counts non-overlapping occurrences of `marker` in `contents`.
+fn countMarkers(contents: []const u8, marker: []const u8) usize {
     var markers: usize = 0;
     var idx: usize = 0;
     while (std.mem.indexOfPos(u8, contents, idx, marker)) |at| {
         markers += 1;
         idx = at + marker.len;
     }
-    if (markers >= required_markers) return;
-
-    std.process.fatal(
-        \\Vendored vaxis is missing ZAY-LOCAL-PATCH Loop.zig guards:
-        \\  {s}
-        \\found {d} of {d} markers; without them a console read error, a
-        \\saturated event queue, or a repeated Windows modifier event can
-        \\permanently starve keyboard input and TUI redraws. Re-apply after
-        \\every `zig build --fetch` / vaxis bump:
-        \\  patch -p1 -d <vaxis vendor dir> < tools/vendor-patches/vaxis-input-thread-retry.patch
-        \\See AGENTS.md "vxfw Windows input-thread death".
-    ,
-        .{ loop_file, markers, required_markers },
-    );
+    return markers;
 }
