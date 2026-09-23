@@ -140,6 +140,7 @@ See the **[Safety & Classifier Guide](docs/wiki/SAFETY_CLASSIFIER.md)** for Dock
 | `Ctrl+L` | Toggle fullscreen / split lane view |
 | `Ctrl+F` | Search transcript |
 | `Ctrl+↑ / Ctrl+↓` | Navigate prompt history |
+| `Alt+V` | Paste from clipboard (works in Windows Terminal) |
 | `Esc` | Cancel turn / dismiss modal |
 
 ---

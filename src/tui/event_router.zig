@@ -156,6 +156,23 @@ fn normalizeControlKey(raw: vaxis.Key) vaxis.Key {
     return key;
 }
 
+/// True when the key is one of the global clipboard-paste chords. Pure —
+/// no side effects, no clipboard access — so the chord set is unit-testable
+/// without an OS clipboard (mirrors the `fileNameMatches` extract-pure-helper
+/// pattern from AGENTS.md).
+fn isClipboardPasteChord(key: vaxis.Key) bool {
+    return key.matches('v', .{ .ctrl = true }) or
+        key.matches(vaxis.Key.insert, .{ .shift = true }) or
+        // Alt+V: Windows fallback — Windows Terminal intercepts Ctrl+V and
+        // Shift+Insert as its own paste bindings and re-injects the text as
+        // key records (each newline arrives as Enter → submit), and the
+        // console INPUT_RECORD path never sees bracketed-paste markers, so
+        // the paste-window guard can't save multiline pastes. Alt+V reaches
+        // zay untouched and routes through the OS clipboard read, whose
+        // newline-preserving insert works multiline on Windows.
+        key.matches('v', .{ .alt = true });
+}
+
 fn routeKey(
     app: *App,
     root: *RootWidget,
@@ -193,8 +210,8 @@ fn routeKey(
         try root.handleDiffViewerEvent(ctx, key);
         return;
     }
-    // Global Ctrl+V / Shift+Insert clipboard paste into active input.
-    if (key.matches('v', .{ .ctrl = true }) or key.matches(vaxis.Key.insert, .{ .shift = true })) {
+    // Global Ctrl+V / Shift+Insert / Alt+V clipboard paste into active input.
+    if (isClipboardPasteChord(key)) {
         if (try clipboard_helper.pasteFromSystemClipboard(app)) {
             ctx.consumeAndRedraw();
             return;
@@ -833,4 +850,21 @@ test "bracketed paste: stray paste_end clears the flag" {
     // flag must never stay armed.
     try captureEvent(&app, &root, &ctx, .paste_end);
     try std.testing.expect(!app.isPasting());
+}
+
+test "isClipboardPasteChord recognizes all three paste chords and rejects lookalikes" {
+    const Case = struct { key: vaxis.Key, expected: bool };
+    const cases = [_]Case{
+        // The three accepted paste routes (all call pasteFromSystemClipboard).
+        .{ .key = .{ .codepoint = 'v', .mods = .{ .alt = true } }, .expected = true },
+        .{ .key = .{ .codepoint = 'v', .mods = .{ .ctrl = true } }, .expected = true },
+        .{ .key = .{ .codepoint = vaxis.Key.insert, .mods = .{ .shift = true } }, .expected = true },
+        // Lookalikes that must fall through to normal key handling.
+        .{ .key = .{ .codepoint = 'v', .mods = .{} }, .expected = false },
+        .{ .key = .{ .codepoint = 'v', .mods = .{ .ctrl = true, .alt = true } }, .expected = false },
+        .{ .key = .{ .codepoint = vaxis.Key.right, .mods = .{ .alt = true } }, .expected = false },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, isClipboardPasteChord(case.key));
+    }
 }
