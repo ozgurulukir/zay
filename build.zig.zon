@@ -33,8 +33,8 @@
     // internet connectivity.
     .dependencies = .{
         .vaxis = .{
-            .url = "git+https://github.com/rockorager/libvaxis.git#c060d314930c5552b99a89278a6a695baf0352da",
-            .hash = "vaxis-0.6.0-BWNV_LC4CwBka_bJk8SOXqzCM-nyQH00jzdL0kUhGwRE",
+            .url = "git+https://github.com/rockorager/libvaxis.git#f37c42a3b324131c131d066767968e1f5b976453",
+            .hash = "vaxis-0.6.0-BWNV_AIQDADLTDo5jCn27pBWJBvi-sTrSkSKwITQWgUV",
         },
         .uucode = .{
             .url = "git+https://github.com/jacobsandlund/uucode#0620982aa8db310997b9e84305aaa102f60b4f30",

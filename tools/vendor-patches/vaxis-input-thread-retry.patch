@@ -10,7 +10,7 @@
 # (patch list and required marker counts: tools/vendor-patches/manifest.txt).
 # Re-apply after every `zig build --fetch` / vaxis bump; build.zig enforces this.
 diff --git a/src/Loop.zig b/src/Loop.zig
-index c0c6985..70aae11 100644
+index 6ff5f66..22474e7 100644
 --- a/src/Loop.zig
 +++ b/src/Loop.zig
 @@ -69,7 +69,14 @@ pub fn Loop(comptime T: type) type {
@@ -66,7 +66,7 @@ index c0c6985..70aae11 100644
          }
  
          pub fn tryPostEvent(self: *Self, event: T) !bool {
-@@ -155,7 +179,16 @@ pub fn Loop(comptime T: type) type {
+@@ -156,7 +180,16 @@ pub fn Loop(comptime T: type) type {
  
          /// read input from the tty. This is run in a separate thread
          fn ttyRun(self: *Self, paste_allocator: ?std.mem.Allocator) void {
@@ -84,10 +84,10 @@ index c0c6985..70aae11 100644
          }
  
          fn _ttyRun(
-@@ -171,9 +204,36 @@ pub fn Loop(comptime T: type) type {
+@@ -172,9 +205,36 @@ pub fn Loop(comptime T: type) type {
+ 
              switch (builtin.os.tag) {
                  .windows => {
-                     var parser: Parser = .{};
 +                    // ZAY-LOCAL-PATCH: upstream exits the input thread on the
 +                    // first `nextEvent` error (`ttyRun` swallows it via
 +                    // `catch {}`), permanently killing ALL keyboard input
@@ -123,7 +123,7 @@ index c0c6985..70aae11 100644
                      }
                  },
                  else => {
-@@ -244,6 +304,12 @@ pub fn handleEventGeneric(self: anytype, vx: *Vaxis, cache: *GraphemeCache, Even
+@@ -249,6 +309,12 @@ pub fn handleEventGeneric(self: anytype, vx: *Vaxis, cache: *GraphemeCache, Even
                      }
                  },
                  .key_press => |key| {
@@ -136,7 +136,7 @@ index c0c6985..70aae11 100644
                      // Check for a cursor position response for our explicit width query. This will
                      // always be an F3 key with shift = true, and we must be looking for queries
                      if (key.codepoint == vaxis.Key.f3 and
-@@ -276,6 +342,10 @@ pub fn handleEventGeneric(self: anytype, vx: *Vaxis, cache: *GraphemeCache, Even
+@@ -281,6 +347,10 @@ pub fn handleEventGeneric(self: anytype, vx: *Vaxis, cache: *GraphemeCache, Even
                      }
                  },
                  .key_release => |key| {
@@ -148,10 +148,10 @@ index c0c6985..70aae11 100644
                          // HACK: yuck. there has to be a better way
                          var mut_key = key;
 diff --git a/src/tty.zig b/src/tty.zig
-index 29d5a3b..a5fd56f 100644
+index e485336..fc28a1f 100644
 --- a/src/tty.zig
 +++ b/src/tty.zig
-@@ -222,9 +222,11 @@ pub const PosixTty = struct {
+@@ -304,9 +304,11 @@ pub const PosixTty = struct {
      }
  };
  
@@ -163,7 +163,7 @@ index 29d5a3b..a5fd56f 100644
  
      initial_codepage: c_uint,
      initial_input_mode: CONSOLE_MODE_INPUT,
-@@ -271,6 +273,11 @@ pub const WindowsTty = struct {
+@@ -353,6 +355,11 @@ pub const WindowsTty = struct {
          const initial_input_mode = try getConsoleMode(CONSOLE_MODE_INPUT, stdin.handle);
          const initial_output_mode = try getConsoleMode(CONSOLE_MODE_OUTPUT, stdout.handle);
  
@@ -175,7 +175,7 @@ index 29d5a3b..a5fd56f 100644
          // set new modes
          try setConsoleMode(stdin.handle, input_raw_mode);
          try setConsoleMode(stdout.handle, output_raw_mode);
-@@ -280,6 +287,8 @@ pub const WindowsTty = struct {
+@@ -362,6 +369,8 @@ pub const WindowsTty = struct {
          const self: WindowsTty = .{
              .stdin = stdin.handle,
              .stdout = stdout.handle,
@@ -184,7 +184,7 @@ index 29d5a3b..a5fd56f 100644
              .initial_codepage = initial_output_codepage,
              .initial_input_mode = initial_input_mode,
              .initial_output_mode = initial_output_mode,
-@@ -293,11 +302,13 @@ pub const WindowsTty = struct {
+@@ -375,11 +384,13 @@ pub const WindowsTty = struct {
      }
  
      pub fn deinit(self: WindowsTty) void {
@@ -198,7 +198,7 @@ index 29d5a3b..a5fd56f 100644
      }
  
      pub const CONSOLE_MODE_INPUT = packed struct(u32) {
-@@ -343,14 +354,41 @@ pub const WindowsTty = struct {
+@@ -425,14 +436,41 @@ pub const WindowsTty = struct {
          return &self.tty_writer.interface;
      }
  
@@ -240,7 +240,7 @@ index 29d5a3b..a5fd56f 100644
              var event_count: u32 = 0;
              var input_record: INPUT_RECORD = undefined;
              if (ReadConsoleInputW(self.stdin, &input_record, 1, &event_count) == .FALSE)
-@@ -776,6 +814,25 @@ pub const WindowsTty = struct {
+@@ -858,6 +896,25 @@ pub const WindowsTty = struct {
  
      pub const PINPUT_RECORD = *INPUT_RECORD;
  
