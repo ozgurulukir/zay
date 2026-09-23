@@ -201,7 +201,7 @@ compiled into the shipped binary, so their licenses are listed here.
 ### vaxis (TUI framework)
 
 - **Source:** <https://github.com/rockorager/libvaxis>
-- **Version:** 0.6.0 @ `c060d31`
+- **Version:** 0.6.0 @ `f37c42a`
 - **License:** MIT — Copyright (c) 2023 Tim Culverhouse
 - **Used for:** the terminal user interface (widget tree, event loop,
   drawing).
