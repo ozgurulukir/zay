@@ -253,11 +253,8 @@ lands past the pinned commit.
 ### models.dev snapshot (model catalog data)
 
 - **Source:** <https://models.dev> (<https://github.com/anomalyco/models.dev>)
-- **Version:** snapshot vendored at `vendor/models.dev/` (`api.json`,
-  `models.json`). `api.json` refreshed 2026-09-23 from
-  <https://models.dev/api.json> (≈4.9 MB); `models.json` kept as a
-  historical flat-map snapshot (upstream changed shape to `{data:[…]}` and is
-  no longer refreshable 1:1).
+- **Version:** snapshot vendored at `vendor/models.dev/` (`api.json`),
+  refreshed 2026-09-23 from <https://models.dev/api.json> (≈4.9 MB).
 - **License:** MIT — Copyright (c) 2025 models.dev
 - **Used for:** the offline model/provider catalog. Installed next to the
   binary as `share/zay/api.json` (`build.zig`) and refreshed on demand via
