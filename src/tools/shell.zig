@@ -128,6 +128,7 @@ pub fn Impl(comptime B: type) type {
             /// When set and the call requests `run_in_background`, launch the guarded
             /// command through the manager instead of capturing it synchronously.
             background: ?BackgroundCtx = null,
+            cancel_requested: ?*const std.atomic.Value(bool) = null,
         };
 
         pub fn runTool(
@@ -137,8 +138,7 @@ pub fn Impl(comptime B: type) type {
             arguments: []const u8,
             env: common.Env,
         ) common.Error!common.Output {
-            _ = env;
-            return runToolImpl(gpa, io, cwd, arguments, .{});
+            return runToolImpl(gpa, io, cwd, arguments, .{ .cancel_requested = env.ctx.cancel_requested });
         }
 
         /// Test convenience wrapper: runs against the shared headless context.
@@ -163,7 +163,18 @@ pub fn Impl(comptime B: type) type {
             arguments: []const u8,
             background_ctx: ?BackgroundCtx,
         ) common.Error!common.Output {
-            return runToolImpl(gpa, io, cwd, arguments, .{ .contained = true, .background = background_ctx });
+            return runContainedWithCancellation(gpa, io, cwd, arguments, background_ctx, null);
+        }
+
+        pub fn runContainedWithCancellation(
+            gpa: std.mem.Allocator,
+            io: std.Io,
+            cwd: []const u8,
+            arguments: []const u8,
+            background_ctx: ?BackgroundCtx,
+            cancel_requested: ?*const std.atomic.Value(bool),
+        ) common.Error!common.Output {
+            return runToolImpl(gpa, io, cwd, arguments, .{ .contained = true, .background = background_ctx, .cancel_requested = cancel_requested });
         }
 
         fn runToolImpl(
@@ -209,7 +220,7 @@ pub fn Impl(comptime B: type) type {
                 }
             }
 
-            return runCaptured(gpa, io, resolved_cwd, command, &env_map, args.timeout_seconds);
+            return runCapturedWithCancellation(gpa, io, resolved_cwd, command, &env_map, args.timeout_seconds, opts.cancel_requested);
         }
 
         /// Run `command` under the backend's shell with the tool's standard
@@ -224,12 +235,25 @@ pub fn Impl(comptime B: type) type {
             env_map: *const std.process.Environ.Map,
             timeout_seconds: u32,
         ) common.Error!common.Output {
+            return runCapturedWithCancellation(gpa, io, cwd, command, env_map, timeout_seconds, null);
+        }
+
+        fn runCapturedWithCancellation(
+            gpa: std.mem.Allocator,
+            io: std.Io,
+            cwd: []const u8,
+            command: []const u8,
+            env_map: *const std.process.Environ.Map,
+            timeout_seconds: u32,
+            cancel_requested: ?*const std.atomic.Value(bool),
+        ) common.Error!common.Output {
             var captured = B.exec.capture(gpa, io, .{
                 .cwd = cwd,
                 .command = command,
                 .env_map = env_map,
                 .timeout = B.exec.timeoutFromSeconds(timeout_seconds),
                 .limits = capture_limits,
+                .cancel_requested = cancel_requested,
             }) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 if (err == error.Canceled) return error.Canceled;

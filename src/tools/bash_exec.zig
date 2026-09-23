@@ -115,6 +115,7 @@ pub const CaptureOptions = struct {
     env_map: ?*const std.process.Environ.Map = null,
     timeout: std.Io.Timeout = timeoutFromSeconds(timeout_seconds_default),
     limits: CaptureLimits,
+    cancel_requested: ?*const std.atomic.Value(bool) = null,
 };
 
 /// Combined stdout+stderr capture of one command, streamed rather than
@@ -158,29 +159,41 @@ pub fn capture(gpa: std.mem.Allocator, io: std.Io, options: CaptureOptions) !Cap
     var sink: Sink = .{ .limits = options.limits };
     errdefer sink.deinit(gpa, io);
 
-    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(1) = undefined;
-    var multi_reader: std.Io.File.MultiReader = undefined;
-    multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &.{child.stdout.?});
-    defer multi_reader.deinit();
-    const reader = multi_reader.reader(0);
-
     // Total-runtime deadline, same as the run path (TD-2): the loop must stop at
     // `timeout` even when output keeps flowing.
     const deadline = options.timeout.toDeadline(io);
-
     var timed_out = false;
-    while (multi_reader.fill(capture_read_reserve, deadline)) |_| {
-        const chunk = reader.buffered();
-        if (chunk.len == 0) continue;
-        try sink.ingest(gpa, io, chunk);
-        reader.tossBuffered();
-    } else |err| switch (err) {
-        error.EndOfStream => {},
-        error.Timeout => timed_out = true,
-        else => |e| return e,
+    if (os.is_windows) {
+        timed_out = try capture_sink.captureWindows(Sink, gpa, io, &child, &.{child.stdout.?}, options.timeout, options.cancel_requested, &sink);
+    } else {
+        var multi_reader_buffer: std.Io.File.MultiReader.Buffer(1) = undefined;
+        var multi_reader: std.Io.File.MultiReader = undefined;
+        multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &.{child.stdout.?});
+        defer multi_reader.deinit();
+        const reader = multi_reader.reader(0);
+        while (true) {
+            if (options.cancel_requested) |flag| if (flag.load(.acquire)) return error.Canceled;
+            if (deadline.toDurationFromNow(io)) |remaining| {
+                if (remaining.raw.nanoseconds <= 0) {
+                    timed_out = true;
+                    break;
+                }
+            }
+            multi_reader.fill(capture_read_reserve, capture_sink.fillTimeout(io, deadline, options.cancel_requested)) catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.Timeout => if (options.cancel_requested != null) continue else {
+                    timed_out = true;
+                    break;
+                },
+                else => |e| return e,
+            };
+            const chunk = reader.buffered();
+            if (chunk.len == 0) continue;
+            try sink.ingest(gpa, io, chunk);
+            reader.tossBuffered();
+        }
+        if (!timed_out) try multi_reader.checkAnyError();
     }
-
-    if (!timed_out) try multi_reader.checkAnyError();
     const code = if (timed_out) 124 else os.termCode(try child.wait(io));
 
     return sink.finish(gpa, io, code, timed_out);

@@ -77,6 +77,8 @@ pub const Agent = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
+    /// Borrowed from the TUI worker for the duration of a turn.
+    cancel_requested: ?*const std.atomic.Value(bool) = null,
     /// Workspace-mode scoping (S5): when set (a borrowed lane worktree path),
     /// tools root at this path instead of `cwd`; `effectiveCwd()` is the
     /// single read. Written by the `lane` tool on this agent's worker thread
@@ -761,8 +763,16 @@ pub const Agent = struct {
             .lane_bridge = self.lane_bridge,
             .lane_requester = self,
             .skills = self.skills,
+            .cancel_requested = self.cancel_requested,
         });
-        const results = try executor.runAll(tool_calls, bridge.observer());
+        const results = executor.runAll(tool_calls, bridge.observer()) catch |err| {
+            if (err == error.Canceled) {
+                if (self.cancel_requested) |flag| {
+                    if (flag.load(.acquire)) return error.TurnCancelled;
+                }
+            }
+            return err;
+        };
         defer self.gpa.free(results);
         errdefer for (results) |*r| r.deinit(self.gpa);
         try self.takeToolResults(results);

@@ -192,6 +192,7 @@ pub const ExecutorService = struct {
         lane_bridge: ?*lane_bridge.LaneBridge = null,
         lane_requester: ?*anyopaque = null,
         skills: []const skill_mod.Skill = &.{},
+        cancel_requested: ?*const std.atomic.Value(bool) = null,
     };
 
     pub fn init(options: InitOptions) ExecutorService {
@@ -205,6 +206,7 @@ pub const ExecutorService = struct {
             .contained = options.contained,
             .tool_registry = options.tool_registry,
             .ctx = .{
+                .cancel_requested = options.cancel_requested,
                 .bash_classifier_url = options.bash_classifier_url,
                 .background_manager = if (options.background) |bg| bg.manager else null,
                 .owner_generation = if (options.background) |bg| bg.owner_generation else 1,
@@ -381,7 +383,7 @@ pub const ExecutorService = struct {
                     .{ .manager = manager, .owner_generation = self.ctx.owner_generation }
                 else
                     null;
-                return shell_impl.runContained(self.gpa, self.io, self.cwd, call.arguments, background_ctx);
+                return shell_impl.runContainedWithCancellation(self.gpa, self.io, self.cwd, call.arguments, background_ctx, self.ctx.cancel_requested);
             }
         }
         if (self.ctx.background_manager) |manager| {
