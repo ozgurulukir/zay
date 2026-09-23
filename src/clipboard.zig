@@ -4,16 +4,20 @@
 //!   - Copying uses OSC 52 terminal escape sequences as the primary mechanism
 //!     (works seamlessly over SSH, tmux, kitty, alacritty, wezterm, iTerm2,
 //!     foot, Windows Terminal) with native OS utility fallback (`wl-copy`,
-//!     `xclip`, `xsel`, `pbcopy`, `clip.exe`).
+//!     `xclip`, `xsel`, `pbcopy`, or the `pwsh` backend's `Set-Clipboard`
+//!     cmdlet on Windows).
 //!   - Pasting queries OS system clipboard tools (`wl-paste`, `xclip`, `xsel`,
-//!     `pbpaste`, `powershell`) and processes terminal bracketed paste events.
+//!     `pbpaste`, or the `pwsh` backend's `Get-Clipboard` cmdlet on Windows)
+//!     and processes terminal bracketed paste events.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const bash = @import("tools/bash_exec.zig");
+const pwsh_exec = @import("tools/pwsh_exec.zig");
 const platform = @import("platform");
 
 const assert = std.debug.assert;
+const log = std.log.scoped(.clipboard);
 
 // Maximum bytes allowed for clipboard copy/paste (10 MB sanity limit).
 pub const max_clipboard_bytes: usize = 10 * 1024 * 1024;
@@ -63,8 +67,50 @@ fn sendOsc52(gpa: std.mem.Allocator, text: []const u8) void {
 }
 
 // ---------------------------------------------------------------------------
-// Native OS Clipboard Execution via bash subsystem
+// Native OS Clipboard Execution via the platform shell executor
+// (pwsh cmdlets on Windows, bash elsewhere)
 // ---------------------------------------------------------------------------
+
+/// The exec layer that runs OS-clipboard commands on this platform.
+/// Windows uses the native PowerShell backend (`pwsh_exec`) — clipboard
+/// commands are PowerShell cmdlets, and `bash` may resolve to the WSL
+/// launcher stub on hosts where Git lives outside the standard install dir.
+/// POSIX/macOS keep the bash executor (pbpaste/wl-*/xclip/xsel are POSIX
+/// shell commands).
+const clipboard_exec = if (builtin.os.tag == .windows) pwsh_exec else bash;
+
+/// Windows has exactly one clipboard command per direction, so a non-zero
+/// exit is always a real failure worth a toast. POSIX/macOS chain
+/// intentional fallbacks (wl-* → xclip → xsel): a missing first-choice tool
+/// exits 127 — an expected miss, kept at `log.debug` to avoid toast spam.
+const warn_on_failure = builtin.os.tag == .windows;
+
+/// Exit-code failure where it is a real failure (Windows: single command, no
+/// fallback) vs an expected POSIX fallback miss.
+fn logClipboardFailure(kind: []const u8, code: u8, cmd: []const u8) void {
+    if (warn_on_failure) {
+        log.warn("clipboard: {s} command failed (exit {d}): {s}", .{ kind, code, cmd });
+    } else {
+        log.debug("clipboard: {s} fallback miss (exit {d}): {s}", .{ kind, code, cmd });
+    }
+}
+
+/// Windows clipboard commands, run INSIDE the pwsh exec process
+/// (`pwsh_exec`): no `powershell.exe -Command` wrapper (it would re-spawn a
+/// child pwsh) and no bash (may resolve to the WSL launcher stub). POSIX and
+/// macOS command strings stay inline in the callers — their fallback chains
+/// (wl → xclip → xsel) are load-bearing and must not be collapsed.
+fn windowsReadCommand() []const u8 {
+    return "Get-Clipboard";
+}
+
+fn windowsWriteCommand() []const u8 {
+    // Pipeline binding, NOT `-Value $input`: under `-File`, `$input` is an
+    // IEnumerator, and `Set-Clipboard -Value $input` binds it through
+    // `[string[]]$input`, coercing a multi-line copy to ONE space-joined string.
+    // The pipeline enumerates it element-by-element, preserving newlines.
+    return "$input | Set-Clipboard";
+}
 
 fn isWayland() bool {
     if (builtin.os.tag == .windows or builtin.os.tag == .macos) return false;
@@ -74,7 +120,7 @@ fn isWayland() bool {
 fn copyToOsClipboard(gpa: std.mem.Allocator, io: std.Io, text: []const u8) void {
     switch (builtin.os.tag) {
         .macos => _ = execWithStdin(gpa, io, "pbcopy", text),
-        .windows => _ = execWithStdin(gpa, io, "powershell.exe -NoProfile -Command Set-Clipboard -Value $input", text),
+        .windows => _ = execWithStdin(gpa, io, windowsWriteCommand(), text),
         else => {
             // Linux / BSD / POSIX — check Wayland (wl-copy) then X11 (xclip / xsel).
             if (isWayland()) {
@@ -89,7 +135,7 @@ fn copyToOsClipboard(gpa: std.mem.Allocator, io: std.Io, text: []const u8) void 
 fn readFromOsClipboard(gpa: std.mem.Allocator, io: std.Io) ?[]u8 {
     return switch (builtin.os.tag) {
         .macos => runCaptureStdout(gpa, io, "pbpaste"),
-        .windows => runCaptureStdout(gpa, io, "powershell.exe -NoProfile -Command Get-Clipboard"),
+        .windows => runCaptureStdout(gpa, io, windowsReadCommand()),
         else => blk: {
             if (isWayland()) {
                 if (runCaptureStdout(gpa, io, "wl-paste -n")) |res| break :blk res;
@@ -101,16 +147,29 @@ fn readFromOsClipboard(gpa: std.mem.Allocator, io: std.Io) ?[]u8 {
 }
 
 fn execWithStdin(gpa: std.mem.Allocator, io: std.Io, cmd: []const u8, stdin_data: []const u8) bool {
-    var result = bash.runWithStdin(gpa, io, ".", cmd, stdin_data) catch return false;
+    var result = clipboard_exec.runWithStdin(gpa, io, ".", cmd, stdin_data) catch |err| {
+        log.warn("clipboard: executor failed to spawn {s} ({s})", .{ cmd, @errorName(err) });
+        return false;
+    };
     defer result.deinit(gpa);
-    return result.code == 0;
+    if (result.code != 0) {
+        logClipboardFailure("write", result.code, cmd);
+        return false;
+    }
+    return true;
 }
 
 fn runCaptureStdout(gpa: std.mem.Allocator, io: std.Io, cmd: []const u8) ?[]u8 {
-    var result = bash.run(gpa, io, ".", cmd) catch return null;
+    var result = clipboard_exec.run(gpa, io, ".", cmd) catch |err| {
+        log.warn("clipboard: executor failed to spawn {s} ({s})", .{ cmd, @errorName(err) });
+        return null;
+    };
     defer result.deinit(gpa);
-
-    if (result.code != 0 or result.stdout.len == 0) return null;
+    if (result.code != 0) {
+        logClipboardFailure("read", result.code, cmd);
+        return null;
+    }
+    if (result.stdout.len == 0) return null; // benign: empty clipboard — no warn
     return gpa.dupe(u8, result.stdout) catch null;
 }
 
@@ -133,4 +192,46 @@ test "base64 encoding for OSC 52 helper" {
     try std.base64.standard.Decoder.decode(decoded_buf, buf);
 
     try std.testing.expectEqualStrings(sample, decoded_buf);
+}
+
+test "windows clipboard commands are bare PowerShell cmdlets" {
+    // Platform-independent: the helpers are constants, testable everywhere.
+    try std.testing.expectEqualStrings("Get-Clipboard", windowsReadCommand());
+    try std.testing.expectEqualStrings("$input | Set-Clipboard", windowsWriteCommand());
+    // No shell wrapper, no WSL-stub-exposed bash.
+    try std.testing.expect(std.mem.indexOf(u8, windowsReadCommand(), "bash") == null);
+    try std.testing.expect(std.mem.indexOf(u8, windowsWriteCommand(), "powershell.exe") == null);
+}
+
+test "windows clipboard executor is the pwsh exec layer" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try std.testing.expect(clipboard_exec == pwsh_exec);
+}
+
+test "posix/macOS clipboard executor stays bash" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try std.testing.expect(clipboard_exec == bash);
+}
+
+test "clipboard executors keep an identical exec contract" {
+    // Coercion-based pin. Do NOT use `@TypeOf(a) != @TypeOf(b)` here: both
+    // run/runWithStdin return INFERRED error sets (`!Result`), and Zig 0.16
+    // compares two distinct functions' inferred-error-set types as unequal
+    // regardless of structural identity — the check would be true on every
+    // platform and hard-break `zig build test`. Coercion to an explicit
+    // `anyerror!Result` fn pointer is the correct pin: it fails to compile
+    // if either signature (param order/types or error set) diverges.
+    // Parameter types verified against pwsh_exec.zig:66/76 and
+    // bash_exec.zig:41/56 (gpa, io, cwd, command[, stdin]).
+    const ExecFn = *const fn (std.mem.Allocator, std.Io, []const u8, []const u8) anyerror!bash.Result;
+    const ExecStdinFn = *const fn (std.mem.Allocator, std.Io, []const u8, []const u8, []const u8) anyerror!bash.Result;
+    comptime {
+        // Legitimately true today (both alias capture_sink.Result) — keep as
+        // a guard against a future per-module Result split.
+        if (bash.Result != pwsh_exec.Result) @compileError("clipboard exec Result types diverged — clipboard needs an adapter");
+        _ = @as(ExecFn, &pwsh_exec.run);
+        _ = @as(ExecFn, &bash.run);
+        _ = @as(ExecStdinFn, &pwsh_exec.runWithStdin);
+        _ = @as(ExecStdinFn, &bash.runWithStdin);
+    }
 }
