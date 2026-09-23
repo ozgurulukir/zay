@@ -104,19 +104,19 @@ THE SOFTWARE.
 ## Lua 5.4 (Lua plugin system)
 
 - **Source:** <https://www.lua.org> (Lua.org, PUC-Rio, Brazil)
-- **Version:** 5.4.7 (vendored at `vendor/lua/`)
-- **License:** MIT — Copyright (C) 1994-2024 Lua.org, PUC-Rio
+- **Version:** 5.4.9 (vendored at `vendor/lua/`)
+- **License:** MIT — Copyright (C) 1994-2026 Lua.org, PUC-Rio
 - **Used for:** the embedded Lua VM that runs user plugins (tool
   registration, event hooks, sandboxed API). Compiled directly into the
   binary via `build.zig`; the full standard library (`lbaselib.c`,
   `linit.c`, …) is vendored.
 
-No local modifications — vendored unmodified from the 5.4.7 release.
+No local modifications — vendored unmodified from the 5.4.9 release.
 
 The MIT license text follows:
 
 ```
-Copyright (C) 1994-2024 Lua.org, PUC-Rio, Brazil
+Copyright (C) 1994-2026 Lua.org, PUC-Rio, Brazil
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -162,8 +162,9 @@ No local modifications — vendored unmodified from the 3.53.4 amalgamation
 ## websocket.zig (MCP stdio/WebSocket transport)
 
 - **Source:** <https://github.com/karlseguin/websocket.zig>
-- **Version:** current master (files byte-identical to upstream at the time
-  of the last dep bump `eab9fed`; vendored at `vendor/websocket.zig/`)
+- **Version:** current master at the time of the last dep bump `eab9fed`
+  (vendored at `vendor/websocket.zig/`; carries the local modifications
+  documented below, so it is not byte-identical to upstream)
 - **License:** MIT — Copyright (c) 2024 Karl Seguin
 - **Used for:** the WebSocket client used by the MCP transport
   (`lib/websocket.zig` re-exports the vendored client).
@@ -173,16 +174,33 @@ No local modifications — vendored unmodified from the 3.53.4 amalgamation
 - **`vendor/websocket.zig/src/websocket.zig`** — the server-side exports (`server` namespace,
   `Conn`/`Config`/`Server`/`blockingMode`/`Handshake` re-exports) and the
   `frame*` test helpers were removed from the public entry point. Zay only
-  uses the client; all other vendored files (`buffer.zig`, `posix.zig`,
-  `proto.zig`, `windows.zig`, `client/client.zig`) are byte-identical to
-  upstream.
+  uses the client.
+- **`vendor/websocket.zig/src/client/client.zig`** — two Windows shims
+  (commits `b2d3f70` "Fix Codex WebSocket timeout on Windows" and `741788d`
+  "Fix Windows WebSocket teardown"):
+  - `socket_write_timeout_supported` (comptime, false on Windows) —
+    `Stream.writeTimeout` becomes a no-op on Windows because Zig 0.16
+    `Io.net` sockets are async AFD handles where the raw `SO_SNDTIMEO` setup
+    can return `STATUS_PENDING`; write timeouts are instead bounded by an
+    external watchdog that shuts the socket down.
+  - `socket_shutdown_uses_io` (comptime, true on Windows) — teardown routes
+    close/shutdown through `stream.shutdown(io, .both)` / `stream.close(io)`
+    instead of `posix.shutdown` / `CloseHandle` on the raw fd.
+  - **A future upstream bump MUST re-apply both shims** (they are not
+    upstream).
+
+The remaining vendored files (`buffer.zig`, `posix.zig`, `proto.zig`,
+`windows.zig`) are byte-identical to upstream.
 
 The MIT license text follows (kept verbatim at `vendor/websocket.zig/LICENSE`).
 
 ## zigdown → `lib/terminal_markdown.zig` (transcript markdown rendering)
 
 - **Source:** <https://github.com/JacobCrabill/zigdown>
-- **Version:** as vendored 2026-05 (`f65f476`)
+- **Version:** vendored 2026-05; the originally recorded upstream commit SHA
+  (`f65f476`) no longer resolves upstream and the exact commit is unknown.
+  Upstream's current release is **v1.3.1** (2026-08-08); the vendored
+  renderer predates it.
 - **License:** MIT — Copyright 2024 Jacob Crabill <github.com/JacobCrabill>
 - **Used for:** rendering markdown in the transcript (`lib/terminal_markdown.zig`,
   imported by `src/transcript.zig` and the message/status widgets). The
@@ -224,9 +242,10 @@ lands past the pinned commit.
 ### uucode (Unicode tables)
 
 - **Source:** <https://github.com/jacobsandlund/uucode>
-- **Version:** 0.2.0 @ `2826a37` (transitive dependency of vaxis, pulled in
-  via vaxis's own dependency pin — the root build.zig.zon's lazy `0620982`
-  entry is never fetched)
+- **Version:** 0.2.0 @ `2826a37` — the effective pin is vaxis's transitive
+  dependency pin; the root `build.zig.zon`'s lazy `0620982` entry is unused
+  (it is declared lazy and is shadowed by vaxis's own pin; do not rely on it
+  for version resolution).
 - **License:** MIT — Copyright (c) 2026 Jacob Sandlund
 - **Used for:** Unicode-aware string handling inside vaxis (grapheme/width
   tables). No local modifications.
@@ -235,7 +254,10 @@ lands past the pinned commit.
 
 - **Source:** <https://models.dev> (<https://github.com/anomalyco/models.dev>)
 - **Version:** snapshot vendored at `vendor/models.dev/` (`api.json`,
-  `models.json`)
+  `models.json`). `api.json` refreshed 2026-09-23 from
+  <https://models.dev/api.json> (≈4.9 MB); `models.json` kept as a
+  historical flat-map snapshot (upstream changed shape to `{data:[…]}` and is
+  no longer refreshable 1:1).
 - **License:** MIT — Copyright (c) 2025 models.dev
 - **Used for:** the offline model/provider catalog. Installed next to the
   binary as `share/zay/api.json` (`build.zig`) and refreshed on demand via
