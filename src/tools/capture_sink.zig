@@ -217,6 +217,70 @@ fn readWindowsPipe(gpa: std.mem.Allocator, io: std.Io, pipe: std.Io.File, output
     return false;
 }
 
+/// Stream Windows capture pipes directly into the bounded sink. Reads only
+/// bytes reported by PeekNamedPipe, so cancellation never strands a pending read.
+pub fn captureWindows(
+    comptime SinkType: type,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    child: *std.process.Child,
+    pipes: []const std.Io.File,
+    timeout: std.Io.Timeout,
+    cancel_requested: ?*const std.atomic.Value(bool),
+    sink: *SinkType,
+) !bool {
+    assert(os.is_windows);
+    assert(pipes.len > 0);
+    assert(pipes.len <= 2);
+    const deadline = timeout.toDeadline(io);
+    var ended = [_]bool{ false, false };
+    var first_pipe_index: usize = 0;
+    while (true) {
+        if (isCanceled(cancel_requested)) return error.Canceled;
+        if (deadline.toDurationFromNow(io)) |remaining| {
+            if (remaining.raw.nanoseconds <= 0) return true;
+        }
+        // Both pipes may become readable between polls. Alternate the tie-break
+        // order so a continuously readable stdout pipe cannot always jump ahead
+        // of stderr and rewrite their observed interleaving.
+        for (0..pipes.len) |offset| {
+            const index = (first_pipe_index + offset) % pipes.len;
+            const pipe = pipes[index];
+            if (!ended[index]) ended[index] = try readWindowsPipeToSink(gpa, io, pipe, sink);
+        }
+        first_pipe_index = (first_pipe_index + 1) % pipes.len;
+        var all_ended = true;
+        for (ended[0..pipes.len]) |is_ended| {
+            if (!is_ended) all_ended = false;
+        }
+        if (all_ended) {
+            const zero: windows.LARGE_INTEGER = 0;
+            switch (windows.ntdll.NtWaitForSingleObject(child.id.?, .FALSE, &zero)) {
+                .SUCCESS => return false,
+                .TIMEOUT => {},
+                else => return error.Unexpected,
+            }
+        }
+        try io.sleep(.fromMilliseconds(cancel_poll_ms), .awake);
+    }
+}
+
+fn readWindowsPipeToSink(gpa: std.mem.Allocator, io: std.Io, pipe: std.Io.File, sink: anytype) !bool {
+    var available: u32 = 0;
+    if (PeekNamedPipe(pipe.handle, null, 0, null, &available, null) == .FALSE) {
+        return switch (windows.GetLastError()) {
+            .BROKEN_PIPE, .PIPE_NOT_CONNECTED => true,
+            else => error.ReadFailed,
+        };
+    }
+    if (available == 0) return false;
+    var buffer: [8192]u8 = undefined;
+    const count = try pipe.readStreaming(io, &.{buffer[0..@min(available, buffer.len)]});
+    if (count == 0) return true;
+    try sink.ingest(gpa, io, buffer[0..count]);
+    return false;
+}
+
 test "Windows drainChild timeout does not wait for a silent child" {
     if (!os.is_windows) return error.SkipZigTest;
     const io = std.testing.io;
@@ -282,7 +346,7 @@ fn isCanceled(cancel_requested: ?*const std.atomic.Value(bool)) bool {
     return if (cancel_requested) |flag| flag.load(.acquire) else false;
 }
 
-fn fillTimeout(
+pub fn fillTimeout(
     io: std.Io,
     deadline: std.Io.Timeout,
     cancel_requested: ?*const std.atomic.Value(bool),

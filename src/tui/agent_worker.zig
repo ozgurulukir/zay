@@ -188,6 +188,9 @@ pub fn runAgentTurn(agent: *agent_mod.Agent, runtime: ?*runtime_mod.AgentRuntime
     pending_prompt_slot.* = null;
     defer if (pending_prompt) |prompt| worker_context.gpa.free(prompt);
 
+    agent.cancel_requested = &worker_context.cancel_requested;
+    defer agent.cancel_requested = null;
+
     agent.bash_approval = .{
         .ptr = worker_context,
         .request = requestBashApproval,

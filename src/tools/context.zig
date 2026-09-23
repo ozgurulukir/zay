@@ -17,6 +17,8 @@ const plugin_manager_mod = @import("../lua/manager.zig");
 const mcp_mod = @import("../mcp/manager.zig");
 
 pub const ToolContext = struct {
+    /// Borrowed from the TUI worker so foreground shell capture can observe turn cancellation.
+    cancel_requested: ?*const std.atomic.Value(bool) = null,
     /// `lane` tool: the App-owned bridge plus the requesting agent (as
     /// `*anyopaque`) that identifies the lane for the role guard and
     /// completion routing. Null both = headless/tests → the tool reports
@@ -51,6 +53,7 @@ pub const ToolContext = struct {
 test "headless context degrades every dependency" {
     const ctx = &ToolContext.headless;
     try std.testing.expect(ctx.lane_bridge == null);
+    try std.testing.expect(ctx.cancel_requested == null);
     try std.testing.expect(ctx.lane_requester == null);
     try std.testing.expect(ctx.background_manager == null);
     try std.testing.expectEqual(@as(u64, 1), ctx.owner_generation);

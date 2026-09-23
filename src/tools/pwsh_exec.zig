@@ -204,6 +204,7 @@ pub const CaptureOptions = struct {
     env_map: ?*const std.process.Environ.Map = null,
     timeout: std.Io.Timeout = bash_exec.timeoutFromSeconds(bash_exec.timeout_seconds_default),
     limits: CaptureLimits,
+    cancel_requested: ?*const std.atomic.Value(bool) = null,
 };
 
 const capture_read_reserve = capture_sink.capture_read_reserve;
@@ -247,37 +248,44 @@ pub fn capture(gpa: std.mem.Allocator, io: std.Io, options: CaptureOptions) !Cap
     var sink: Sink = .{ .limits = options.limits };
     errdefer sink.deinit(gpa, io);
 
-    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
-    var multi_reader: std.Io.File.MultiReader = undefined;
-    multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
-    defer multi_reader.deinit();
-
-    // Merge both streams in the reader, appending any buffered bytes from each
-    // stream in the order the MultiReader surfaces them, so stderr and stdout
-    // stay chronologically interleaved (stderr is NOT merged into the command
-    // for PowerShell, unlike bash's `exec 2>&1`).
-    const reader = multi_reader.reader(0);
-    const stderr_reader = multi_reader.reader(1);
-
     const deadline = options.timeout.toDeadline(io);
-
     var timed_out = false;
-    while (multi_reader.fill(capture_read_reserve, deadline)) |_| {
-        if (reader.buffered().len > 0) {
-            try sink.ingest(gpa, io, reader.buffered());
-            reader.tossBuffered();
+    if (os.is_windows) {
+        timed_out = try capture_sink.captureWindows(Sink, gpa, io, &child, &.{ child.stdout.?, child.stderr.? }, options.timeout, options.cancel_requested, &sink);
+    } else {
+        var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+        var multi_reader: std.Io.File.MultiReader = undefined;
+        multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+        defer multi_reader.deinit();
+        const reader = multi_reader.reader(0);
+        const stderr_reader = multi_reader.reader(1);
+        while (true) {
+            if (options.cancel_requested) |flag| if (flag.load(.acquire)) return error.Canceled;
+            if (deadline.toDurationFromNow(io)) |remaining| {
+                if (remaining.raw.nanoseconds <= 0) {
+                    timed_out = true;
+                    break;
+                }
+            }
+            multi_reader.fill(capture_read_reserve, capture_sink.fillTimeout(io, deadline, options.cancel_requested)) catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.Timeout => if (options.cancel_requested != null) continue else {
+                    timed_out = true;
+                    break;
+                },
+                else => |e| return e,
+            };
+            if (reader.buffered().len > 0) {
+                try sink.ingest(gpa, io, reader.buffered());
+                reader.tossBuffered();
+            }
+            if (stderr_reader.buffered().len > 0) {
+                try sink.ingest(gpa, io, stderr_reader.buffered());
+                stderr_reader.tossBuffered();
+            }
         }
-        if (stderr_reader.buffered().len > 0) {
-            try sink.ingest(gpa, io, stderr_reader.buffered());
-            stderr_reader.tossBuffered();
-        }
-    } else |err| switch (err) {
-        error.EndOfStream => {},
-        error.Timeout => timed_out = true,
-        else => |e| return e,
+        if (!timed_out) try multi_reader.checkAnyError();
     }
-
-    if (!timed_out) try multi_reader.checkAnyError();
     // `os.termCode`: the trailing exit-check normalizes in-shell failures to an
     // explicit `exit 1`/`exit $LASTEXITCODE` (see `exitCheckedScript`), so
     // `.exited` carries the real value; signal/unknown maps to 255.

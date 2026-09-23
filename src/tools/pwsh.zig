@@ -117,6 +117,7 @@ pub const BackgroundCtx = impl.BackgroundCtx;
 pub const runTool = impl.runTool;
 pub const runToolForTest = impl.runToolForTest;
 pub const runContained = impl.runContained;
+pub const runContainedWithCancellation = impl.runContainedWithCancellation;
 pub const runBackground = impl.runBackground;
 pub const runCaptured = impl.runCaptured;
 pub const wantsBackground = impl.wantsBackground;
