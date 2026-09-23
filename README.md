@@ -92,8 +92,8 @@ build can proceed.
 git clone https://github.com/ozgurulukir/zay.git
 cd zay
 zig build --fetch
-# Apply the patches described in docs/BUILDING.md when the build reports
-# missing ZAY-LOCAL-PATCH guards, then run:
+# Apply the pinned vaxis patches when the build reports missing guards:
+#   bash tools/apply-vaxis-patches.sh (see docs/BUILDING.md)
 zig build install -Doptimize=ReleaseFast --prefix $HOME/.local
 zay --version
 ```

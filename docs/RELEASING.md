@@ -75,9 +75,10 @@ The scripts automatically download the platform binary, verify the SHA256 checks
   and builds with `shell: bash` + a `VERSION` env var (PowerShell mangles dotted
   versions).
 - Before building, the workflow follows the [source-build patch
-  procedure](BUILDING.md#apply-the-pinned-vaxis-patches): it applies the two
-  checked-in vaxis patches to the pristine dependency and verifies the
-  `ZAY-LOCAL-PATCH` guards before compiling. A local release reproduction must
-  follow the same procedure.
+  procedure](BUILDING.md#apply-the-pinned-vaxis-patches): it runs
+  `bash tools/apply-vaxis-patches.sh`, which reads
+  `tools/vendor-patches/manifest.txt` and verifies every `ZAY-LOCAL-PATCH`
+  guard before compiling. A local release reproduction must follow the same
+  procedure.
 - Release notes are auto-generated from merged PRs
   (`generate_release_notes: true`).

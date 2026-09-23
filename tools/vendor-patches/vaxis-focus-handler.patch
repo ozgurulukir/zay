@@ -1,10 +1,12 @@
 # Zay local patch: vxfw FocusHandler empty-path guards (SIGSEGV in ReleaseFast).
-# See AGENTS.md 'vxfw FocusHandler crash' and build.zig checkVaxisFocusPatch.
+# See AGENTS.md 'vxfw FocusHandler crash' and build.zig checkVaxisPatches
+# (patch list and required marker counts: tools/vendor-patches/manifest.txt).
 # Re-apply after every `zig build --fetch` / vaxis bump; build.zig enforces this.
-diff -u a/src/vxfw/App.zig b/src/vxfw/App.zig
+diff --git a/src/vxfw/App.zig b/src/vxfw/App.zig
+index 5a02ae2..f92deb4 100644
 --- a/src/vxfw/App.zig
 +++ b/src/vxfw/App.zig
-@@ -544,7 +544,16 @@
+@@ -544,7 +544,16 @@ const FocusHandler = struct {
          // in this tree. If this is the case, we refocus to the root widget
          _ = try self.childHasFocus(allocator, surface);
  
@@ -22,7 +24,7 @@ diff -u a/src/vxfw/App.zig b/src/vxfw/App.zig
              // If the root of surface is not the initial widget, we append the initial widget
              try self.path_to_focused.append(allocator, self.root);
          }
-@@ -587,7 +596,9 @@
+@@ -587,7 +596,9 @@ const FocusHandler = struct {
  
      fn handleEvent(self: *FocusHandler, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
          const path = self.path_to_focused.items;

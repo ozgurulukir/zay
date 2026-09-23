@@ -6,15 +6,18 @@
 # query does not reliably wake Windows ReadConsoleInput. Use a dedicated
 # cancellation event with WaitForMultipleObjects, use bounded retry +
 # drop-with-warn, and keep exit diagnostics in ttyRun.
-# See AGENTS.md 'vxfw Windows input-thread death' and build.zig checkVaxisLoopPatch.
+# See AGENTS.md 'vxfw Windows input-thread death' and build.zig checkVaxisPatches
+# (patch list and required marker counts: tools/vendor-patches/manifest.txt).
 # Re-apply after every `zig build --fetch` / vaxis bump; build.zig enforces this.
 diff --git a/src/Loop.zig b/src/Loop.zig
-index c0c6985..20a7779 100644
+index c0c6985..70aae11 100644
 --- a/src/Loop.zig
 +++ b/src/Loop.zig
-@@ -70,6 +70,12 @@ pub fn Loop(comptime T: type) type {
+@@ -69,7 +69,14 @@ pub fn Loop(comptime T: type) type {
+ 
          /// spawns the input thread to read input from the tty
          pub fn start(self: *Self) !void {
++            // ZAY-LOCAL-PATCH: Windows input cancellation event wiring (counted by the vendor gate).
              if (self.thread) |_| return;
 +            if (comptime builtin.os.tag == .windows and @hasDecl(@TypeOf(self.tty.*), "resetInputCancellation")) {
 +                self.tty.resetInputCancellation() catch |err| {
@@ -25,7 +28,7 @@ index c0c6985..20a7779 100644
              self.thread = try self.io.concurrent(Self.ttyRun, .{
                  self,
                  self.vaxis.opts.system_clipboard_allocator,
-@@ -81,8 +87,13 @@ pub fn Loop(comptime T: type) type {
+@@ -81,8 +88,13 @@ pub fn Loop(comptime T: type) type {
              // If we don't have a thread, we have nothing to stop
              if (self.thread == null) return;
              self.should_quit = true;
@@ -41,7 +44,7 @@ index c0c6985..20a7779 100644
  
              if (self.thread) |*thread| {
                  thread.await(self.io);
-@@ -109,8 +120,20 @@ pub fn Loop(comptime T: type) type {
+@@ -109,8 +121,20 @@ pub fn Loop(comptime T: type) type {
  
          /// posts an event into the event queue. Will block if there is not
          /// capacity for the event
@@ -63,7 +66,7 @@ index c0c6985..20a7779 100644
          }
  
          pub fn tryPostEvent(self: *Self, event: T) !bool {
-@@ -155,7 +178,16 @@ pub fn Loop(comptime T: type) type {
+@@ -155,7 +179,16 @@ pub fn Loop(comptime T: type) type {
  
          /// read input from the tty. This is run in a separate thread
          fn ttyRun(self: *Self, paste_allocator: ?std.mem.Allocator) void {
@@ -81,7 +84,7 @@ index c0c6985..20a7779 100644
          }
  
          fn _ttyRun(
-@@ -171,9 +203,36 @@ pub fn Loop(comptime T: type) type {
+@@ -171,9 +204,36 @@ pub fn Loop(comptime T: type) type {
              switch (builtin.os.tag) {
                  .windows => {
                      var parser: Parser = .{};
@@ -120,7 +123,7 @@ index c0c6985..20a7779 100644
                      }
                  },
                  else => {
-@@ -244,6 +303,12 @@ pub fn handleEventGeneric(self: anytype, vx: *Vaxis, cache: *GraphemeCache, Even
+@@ -244,6 +304,12 @@ pub fn handleEventGeneric(self: anytype, vx: *Vaxis, cache: *GraphemeCache, Even
                      }
                  },
                  .key_press => |key| {
@@ -133,7 +136,7 @@ index c0c6985..20a7779 100644
                      // Check for a cursor position response for our explicit width query. This will
                      // always be an F3 key with shift = true, and we must be looking for queries
                      if (key.codepoint == vaxis.Key.f3 and
-@@ -276,6 +341,10 @@ pub fn handleEventGeneric(self: anytype, vx: *Vaxis, cache: *GraphemeCache, Even
+@@ -276,6 +342,10 @@ pub fn handleEventGeneric(self: anytype, vx: *Vaxis, cache: *GraphemeCache, Even
                      }
                  },
                  .key_release => |key| {
@@ -145,10 +148,14 @@ index c0c6985..20a7779 100644
                          // HACK: yuck. there has to be a better way
                          var mut_key = key;
 diff --git a/src/tty.zig b/src/tty.zig
-index 29d5a3b..f378930 100644
+index 29d5a3b..a5fd56f 100644
 --- a/src/tty.zig
 +++ b/src/tty.zig
-@@ -225,6 +225,7 @@ pub const PosixTty = struct {
+@@ -222,9 +222,11 @@ pub const PosixTty = struct {
+     }
+ };
+ 
++/// ZAY-LOCAL-PATCH: Windows input cancellation (counted by the vendor gate).
  pub const WindowsTty = struct {
      stdin: windows.HANDLE,
      stdout: windows.HANDLE,
@@ -156,10 +163,11 @@ index 29d5a3b..f378930 100644
  
      initial_codepage: c_uint,
      initial_input_mode: CONSOLE_MODE_INPUT,
-@@ -271,6 +272,10 @@ pub const WindowsTty = struct {
+@@ -271,6 +273,11 @@ pub const WindowsTty = struct {
          const initial_input_mode = try getConsoleMode(CONSOLE_MODE_INPUT, stdin.handle);
          const initial_output_mode = try getConsoleMode(CONSOLE_MODE_OUTPUT, stdout.handle);
  
++        // ZAY-LOCAL-PATCH: Windows input cancellation event creation (counted by the vendor gate).
 +        const cancel_event = CreateEventW(null, .TRUE, .FALSE, null) orelse
 +            return windows.unexpectedError(windows.GetLastError());
 +        errdefer windows.CloseHandle(cancel_event);
@@ -167,15 +175,22 @@ index 29d5a3b..f378930 100644
          // set new modes
          try setConsoleMode(stdin.handle, input_raw_mode);
          try setConsoleMode(stdout.handle, output_raw_mode);
-@@ -280,6 +285,7 @@ pub const WindowsTty = struct {
+@@ -280,6 +287,8 @@ pub const WindowsTty = struct {
          const self: WindowsTty = .{
              .stdin = stdin.handle,
              .stdout = stdout.handle,
++            // ZAY-LOCAL-PATCH: Windows input cancellation event init (counted by the vendor gate).
 +            .cancel_event = cancel_event,
              .initial_codepage = initial_output_codepage,
              .initial_input_mode = initial_input_mode,
              .initial_output_mode = initial_output_mode,
-@@ -298,6 +304,7 @@ pub const WindowsTty = struct {
+@@ -293,11 +302,13 @@ pub const WindowsTty = struct {
+     }
+ 
+     pub fn deinit(self: WindowsTty) void {
++        // ZAY-LOCAL-PATCH: Windows input cancellation event cleanup (counted by the vendor gate).
+         _ = SetConsoleOutputCP(self.initial_codepage);
+         setConsoleMode(self.stdin, self.initial_input_mode) catch {};
          setConsoleMode(self.stdout, self.initial_output_mode) catch {};
          windows.CloseHandle(self.stdin);
          windows.CloseHandle(self.stdout);
@@ -183,11 +198,12 @@ index 29d5a3b..f378930 100644
      }
  
      pub const CONSOLE_MODE_INPUT = packed struct(u32) {
-@@ -343,6 +350,29 @@ pub const WindowsTty = struct {
+@@ -343,14 +354,41 @@ pub const WindowsTty = struct {
          return &self.tty_writer.interface;
      }
  
 +    /// Reset the cancellation event before starting a new input loop.
++    // ZAY-LOCAL-PATCH: Windows input cancellation functions (counted by the vendor gate).
 +    pub fn resetInputCancellation(self: *WindowsTty) !void {
 +        if (ResetEvent(self.cancel_event) == .FALSE)
 +            return windows.unexpectedError(windows.GetLastError());
@@ -213,7 +229,9 @@ index 29d5a3b..f378930 100644
      pub fn read(self: *const WindowsTty, buf: []u8) !usize {
          return posix.read(self.fd, buf);
      }
-@@ -351,6 +381,8 @@ pub const WindowsTty = struct {
+ 
+     pub fn nextEvent(self: *WindowsTty, parser: *Parser, paste_allocator: ?std.mem.Allocator) !Event {
++        // ZAY-LOCAL-PATCH: Windows input cancellation call-site (counted by the vendor gate).
          // We use a loop so we can ignore certain events
          var state: EventState = .{};
          while (true) {
@@ -222,7 +240,7 @@ index 29d5a3b..f378930 100644
              var event_count: u32 = 0;
              var input_record: INPUT_RECORD = undefined;
              if (ReadConsoleInputW(self.stdin, &input_record, 1, &event_count) == .FALSE)
-@@ -776,6 +808,24 @@ pub const WindowsTty = struct {
+@@ -776,6 +814,25 @@ pub const WindowsTty = struct {
  
      pub const PINPUT_RECORD = *INPUT_RECORD;
  
@@ -230,6 +248,7 @@ index 29d5a3b..f378930 100644
 +    const wait_failed: windows.DWORD = 0xFFFFFFFF;
 +    const infinite_timeout: windows.DWORD = 0xFFFFFFFF;
 +
++    // ZAY-LOCAL-PATCH: Windows kernel32 extern declarations (counted by the vendor gate).
 +    pub extern "kernel32" fn CreateEventW(
 +        lpEventAttributes: ?*windows.SECURITY_ATTRIBUTES,
 +        bManualReset: windows.BOOL,
