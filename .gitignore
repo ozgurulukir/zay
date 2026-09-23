@@ -39,6 +39,7 @@ pr-68-review.md
 proposal-lua-plugin-sdk-bridge-2026-08-20.md
 redteam_test
 resolve_test
+zay-vcstest-*/
 
 ## Stray global-state planted by a run with a bogus HOME/USERPROFILE
 ## (issue #26: Windows config paths). Zay's global tree belongs under
