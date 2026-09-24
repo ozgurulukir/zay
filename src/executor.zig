@@ -1039,6 +1039,38 @@ test "executor rejects MCP tool call with missing required field" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "`query` is required") != null);
 }
 
+test "valid MCP tool call reaches the registry bridge, not unknown-tool" {
+    // The registry→bridge half of MCP dispatch (regression for the
+    // "workers can't use MCP" premise): a VALID call must get past registry
+    // lookup — "unknown tool" is exactly the failure this pins against — and
+    // schema validation, and reach runMcpTool. The fixture client's zeroed
+    // child makes the transport fail, so `MCP tool 'search' failed: ...` IS
+    // the success signal: dispatch reached the MCP bridge.
+    const gpa = std.testing.allocator;
+    var manager = mcp_mod.McpManager.init(gpa);
+    defer manager.deinit(std.testing.io);
+    try addTestMcpSearchTool(gpa, &manager);
+
+    var reg = try tools.ToolRegistry.init(gpa, tools.builtinRegistry());
+    defer reg.deinit(gpa);
+    try reg.syncMcpTools(gpa, &manager);
+
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "/tmp", .mcp_manager = &manager, .tool_registry = &reg });
+
+    const call = try makeCall(gpa, "call_mcp_ok", "mcp__test__search", "{\"query\":\"x\"}");
+    defer {
+        gpa.free(call.call_id.value);
+        gpa.free(call.name);
+        gpa.free(call.arguments);
+    }
+
+    var result = try executor.runOne(call);
+    defer result.deinit(gpa);
+    try std.testing.expect(result.failed); // transport failure on the fake child — expected
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "unknown tool") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "MCP tool 'search' failed") != null);
+}
+
 test "ExecutorService.runAll sets plugin_cwd_slot around observer callbacks" {
     // POSIX-gated: uses tmpDir for a temp dir whose path differs from the
     // process cwd, simulating the lane/resume differential.
