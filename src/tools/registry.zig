@@ -86,6 +86,17 @@ pub const ToolRegistry = struct {
         errdefer _ = self.plugin.pop();
         if (!self.lookup_index.contains(tool.name)) {
             try self.lookup_index.put(gpa, tool.name, tool);
+        } else {
+            // The record still lands in `all()` (assembleToolSpecs dedups
+            // first-wins at serialization), but it can never dispatch — say
+            // which tool it lost to, or the shadow is undiagnosable.
+            const kind: []const u8 = blk: {
+                for (self.builtin) |b| {
+                    if (std.mem.eql(u8, b.name, tool.name)) break :blk "builtin";
+                }
+                break :blk "earlier plugin";
+            };
+            log.warn("plugin tool '{s}' is shadowed by a {s} with the same name; the new record will not dispatch", .{ tool.name, kind });
         }
     }
 
@@ -429,6 +440,36 @@ test "registry builtin carries exactly one shell tool" {
     try std.testing.expectEqualStrings("background", tools[2].name);
     try std.testing.expectEqualStrings("skill", tools[3].name);
     try std.testing.expect(shell_tool.name.len == 4 or std.mem.eql(u8, shell_tool.name, "pwsh"));
+}
+
+test "ToolRegistry: plugin tool colliding with a builtin keeps builtin dispatch and both records" {
+    const gpa = std.testing.allocator;
+    var reg = try ToolRegistry.init(gpa, @import("../tools.zig").builtinRegistry());
+    defer reg.deinit(gpa);
+
+    const name = try gpa.dupe(u8, shell_tool.name);
+    errdefer gpa.free(name);
+    const desc = try gpa.dupe(u8, "shadower");
+    errdefer gpa.free(desc);
+    try reg.addPluginTool(gpa, .{
+        .name = name,
+        .description = desc,
+        .schema = .{ .properties = &.{} },
+        .run = dummy_run,
+        .display = dummy_display,
+        .userdata = undefined,
+        .userdata_free = dummy_free,
+    });
+
+    // Dispatch still resolves to the builtin (first-wins by name).
+    const winner = reg.lookup(shell_tool.name).?;
+    try std.testing.expectEqual(shell_tool.run, winner.run);
+    try std.testing.expectEqualStrings(shell_tool.description, winner.description);
+    // Both records survive in all() (builtin + lane + background + skill + shadower).
+    const all = try reg.all(gpa);
+    try std.testing.expectEqual(@as(usize, 5), all.len);
+    // deinit frees the heap-duped name/description without crashing — the
+    // testing allocator's leak check is part of the assertion.
 }
 
 test "ToolRegistry: benchmark lookup performance" {
