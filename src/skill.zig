@@ -28,10 +28,39 @@ pub const Skill = struct {
 };
 
 pub const skill_name_max_bytes: usize = 64;
+pub const description_max_bytes: usize = 1024;
 pub const max_skill_depth: u32 = 8;
 pub const max_total_invocation_bytes: usize = 256 * 1024;
 
+/// `--strict` conformance surface. When non-null, `loadFromDir` streams one
+/// line per skip / non-standard file into `writer` and counts it; the normal
+/// load path passes null, so it stays allocation- and output-free.
+pub const ScanReport = struct {
+    /// Buffered stdout writer owned by the CLI handler; lines stream as the
+    /// scan walks, so no paths are retained or freed here.
+    writer: *std.Io.Writer,
+    count: usize = 0,
+
+    /// Count FIRST, print best-effort: a dead stdout must never flip the
+    /// exit-code contract (count > 0 => exit 1). A failed print still leaves
+    /// a log trace — stdout is the scan's only violation channel, so its
+    /// death must be visible somewhere.
+    fn record(self: *ScanReport, path: []const u8, reason: []const u8) void {
+        self.count += 1;
+        self.writer.print("skill scan: {s}: {s}\n", .{ path, reason }) catch |err| {
+            log.warn("skill scan: print of violation for {s} failed: {s}", .{ path, @errorName(err) });
+        };
+    }
+};
+
 pub fn loadProject(gpa: std.mem.Allocator, io: std.Io, home_dir: ?[]const u8, cwd: []const u8) ![]Skill {
+    return loadProjectReported(gpa, io, home_dir, cwd, null);
+}
+
+/// `loadProject` with an optional conformance reporter — the `--strict`
+/// scan uses it to surface every skipped or non-standard file; the normal
+/// load path passes null.
+pub fn loadProjectReported(gpa: std.mem.Allocator, io: std.Io, home_dir: ?[]const u8, cwd: []const u8, report: ?*ScanReport) ![]Skill {
     assert(cwd.len > 0);
     var skills: std.ArrayList(Skill) = .empty;
     errdefer {
@@ -42,14 +71,14 @@ pub fn loadProject(gpa: std.mem.Allocator, io: std.Io, home_dir: ?[]const u8, cw
     if (home_dir) |home| if (home.len > 0) {
         const global_root = try std.fs.path.join(gpa, &.{ home, ".agents", "skills" });
         defer gpa.free(global_root);
-        try loadFromDir(gpa, io, global_root, true, &skills, 0);
+        try loadFromDir(gpa, io, global_root, true, &skills, 0, report);
     };
     // Boundary index: entries at [0, global_count) come from the global root,
     // entries at [global_count, …) from the project root.
     const global_count = skills.items.len;
     const project_root = try std.fs.path.join(gpa, &.{ cwd, ".agents", "skills" });
     defer gpa.free(project_root);
-    try loadFromDir(gpa, io, project_root, true, &skills, 0);
+    try loadFromDir(gpa, io, project_root, true, &skills, 0, report);
 
     shadowDuplicates(gpa, &skills, global_count);
     warnDuplicateNames(skills.items);
@@ -262,7 +291,14 @@ pub fn find(skills: []const Skill, name: []const u8) ?*const Skill {
     return null;
 }
 
-fn loadFromDir(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, include_root_files: bool, skills: *std.ArrayList(Skill), depth: u32) !void {
+/// Every skill the loader skips is a warn in all modes and a violation in
+/// strict mode — one helper so the two can never drift.
+fn skipSkill(report: ?*ScanReport, path: []const u8, err: anyerror) void {
+    log.warn("skipping skill {s}: {s}", .{ path, @errorName(err) });
+    if (report) |r| r.record(path, @errorName(err));
+}
+
+fn loadFromDir(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, include_root_files: bool, skills: *std.ArrayList(Skill), depth: u32, report: ?*ScanReport) !void {
     var dir = std.Io.Dir.openDir(.cwd(), io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         error.NotDir => return,
@@ -277,7 +313,7 @@ fn loadFromDir(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, include
         return;
     } else |err| switch (err) {
         error.FileNotFound => {},
-        else => log.warn("skipping skill {s}: {s}", .{ skill_path, @errorName(err) }),
+        else => skipSkill(report, skill_path, err),
     }
 
     var iter = dir.iterate();
@@ -288,35 +324,44 @@ fn loadFromDir(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, include
         const child = try std.fs.path.join(gpa, &.{ dir_path, entry.name });
         defer gpa.free(child);
         switch (entry.kind) {
-            .directory => try loadFromDir(gpa, io, child, false, skills, depth),
+            .directory => try loadFromDir(gpa, io, child, false, skills, depth, report),
             .file => if (include_root_files and std.mem.endsWith(u8, entry.name, ".md")) {
-                if (loadOne(gpa, io, child)) |skill| {
-                    try skills.append(gpa, skill);
-                } else |err| switch (err) {
-                    error.FileNotFound => {},
-                    else => log.warn("skipping skill {s}: {s}", .{ child, @errorName(err) }),
-                }
+                try loadLooseRootMd(gpa, io, child, entry.name, skills, report);
             },
             .sym_link => {
                 if (depth >= max_skill_depth) {
                     log.warn("skill symlink too deep, skipping: {s}", .{child});
+                    if (report) |r| r.record(child, "symlink depth exceeds max_skill_depth");
                     continue;
                 }
                 // stat follows the link; dispatch on the target's kind.
                 const st = dir.statFile(io, entry.name, .{}) catch continue;
                 if (st.kind == .directory) {
-                    try loadFromDir(gpa, io, child, false, skills, depth + 1);
+                    try loadFromDir(gpa, io, child, false, skills, depth + 1, report);
                 } else if (include_root_files and std.mem.endsWith(u8, entry.name, ".md")) {
-                    if (loadOne(gpa, io, child)) |skill| {
-                        try skills.append(gpa, skill);
-                    } else |err| switch (err) {
-                        error.FileNotFound => {},
-                        else => log.warn("skipping skill {s}: {s}", .{ child, @errorName(err) }),
-                    }
+                    try loadLooseRootMd(gpa, io, child, entry.name, skills, report);
                 }
             },
             else => {},
         }
+    }
+}
+
+/// One loose root `*.md` skill: load, append, and flag it. Shared by the
+/// `.file` and symlink-to-file arms of `loadFromDir` so the SKILL.md
+/// skip-guard and the strict-mode record stay in lockstep. The probe at the
+/// top of `loadFromDir` owns `SKILL.md` in this dir — retrying it here would
+/// warn (and in strict mode count) a failing root SKILL.md twice.
+fn loadLooseRootMd(gpa: std.mem.Allocator, io: std.Io, path: []const u8, entry_name: []const u8, skills: *std.ArrayList(Skill), report: ?*ScanReport) !void {
+    if (std.mem.eql(u8, entry_name, "SKILL.md")) return;
+    if (loadOne(gpa, io, path)) |skill| {
+        try skills.append(gpa, skill);
+        // Non-standard layout: other agents ignore loose files, so the
+        // strict scan flags them even though they load.
+        if (report) |r| r.record(path, "loose root markdown file (expected <name>/SKILL.md)");
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => skipSkill(report, path, err),
     }
 }
 
@@ -332,13 +377,28 @@ fn loadOne(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Skill {
     const frontmatter = parseFrontmatter(raw);
     const description = frontmatterValue(frontmatter, "description") orelse return error.MissingDescription;
     if (isBlockScalarIndicator(description)) return error.BlockScalarUnsupported;
+    if (isUnterminatedQuote(description)) return error.BlockScalarUnsupported;
+    if (description.len > description_max_bytes) return error.DescriptionTooLong;
     const basename = std.fs.path.basename(path);
     const fallback = if (std.mem.eql(u8, basename, "SKILL.md"))
         std.fs.path.basename(std.fs.path.dirname(path) orelse path) // dir-named skill
     else
         std.fs.path.stem(path); // loose .md file
-    const name_value = frontmatterValue(frontmatter, "name") orelse fallback;
+    const name_from_frontmatter = frontmatterValue(frontmatter, "name");
+    if (name_from_frontmatter) |nv| {
+        if (isUnterminatedQuote(nv)) return error.BlockScalarUnsupported;
+    }
+    const name_value = name_from_frontmatter orelse fallback;
     if (!isValidSkillName(name_value)) return error.InvalidSkillName;
+    // The SKILL.md convention is name == directory: a divergence loads fine
+    // (the frontmatter name is authoritative for invocation) but almost
+    // always means the author renamed one side and not the other — say so.
+    // After the charset gate, so a skipped skill never double-reports.
+    if (name_from_frontmatter != null and std.mem.eql(u8, basename, "SKILL.md")) {
+        if (!nameMatchesContainer(fallback, name_value)) {
+            log.warn("skill name '{s}' does not match its directory '{s}': {s}", .{ name_value, fallback, path });
+        }
+    }
     const base_dir = std.fs.path.dirname(path) orelse ".";
     // `stripFrontmatter` returns a sub-slice of `raw`, which is freed in this
     // function's defer — so the body must be duped into owned storage on the Skill.
@@ -356,14 +416,41 @@ fn loadOne(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Skill {
 
 fn isValidSkillName(name: []const u8) bool {
     if (name.len == 0 or name.len > skill_name_max_bytes) return false;
-    for (name) |byte| {
-        // Whitespace and $ break the $token invocation grammar.
-        // XML-special chars are rejected so appendSkillBlock's escaping stays
-        // belt-and-braces and collectInjectedSkillNames needs no unescaping (TD-14).
-        if (byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n' or byte == '$') return false;
-        if (byte == '"' or byte == '\'' or byte == '&' or byte == '<' or byte == '>') return false;
+    // Agent-skills spec charset: [a-z0-9]+(-[a-z0-9]+)* — lowercase letters
+    // and digits, single hyphens as separators, no leading/trailing hyphen.
+    // Stricter agents (Claude, Codex, Cursor) drop anything else, so loading
+    // a non-conforming name here only to have it rejected downstream wastes
+    // the author's time. The charset subsumes the old whitespace/$ and XML
+    // rejections; the XML property still holds by construction, keeping
+    // appendSkillBlock's escaping belt-and-braces and collectInjectedSkillNames
+    // unescaping-free (TD-14).
+    for (name, 0..) |byte, i| {
+        switch (byte) {
+            'a'...'z', '0'...'9' => {},
+            '-' => if (i == 0 or i == name.len - 1 or name[i - 1] == '-') return false,
+            else => return false,
+        }
     }
     return true;
+}
+
+/// `frontmatterValue` strips a MATCHED quote pair, so a value still opening
+/// with a quote here means the closing quote is missing on that physical
+/// line — YAML would continue the scalar onto following lines, which this
+/// line-oriented parser cannot represent. Same failure family as block
+/// scalars, hence the shared error. A lone quote character (len 1) counts
+/// as unterminated.
+fn isUnterminatedQuote(value: []const u8) bool {
+    if (value.len == 0) return false;
+    const first = value[0];
+    if (first != '"' and first != '\'') return false;
+    return value.len < 2 or value[value.len - 1] != first;
+}
+
+/// SKILL.md convention: a frontmatter `name` should match the parent
+/// directory basename. Pure so tests need no log capture.
+fn nameMatchesContainer(basename: []const u8, name_value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(basename, name_value);
 }
 
 fn isBlockScalarIndicator(value: []const u8) bool {
@@ -597,6 +684,186 @@ test "block scalar description skips the skill" {
     defer deinitAll(gpa, skills);
     try std.testing.expectEqual(@as(usize, 1), skills.len);
     try std.testing.expectEqualStrings("goodskill", skills[0].name);
+}
+
+/// Write `<agents_dir>/<dir_name>/SKILL.md` with `body`, creating the
+/// directory. Shared by the violation-fixture tests so each test reads as
+/// its scenario rather than the file plumbing.
+fn writeSkillMd(io: std.Io, gpa: std.mem.Allocator, agents_dir: []const u8, dir_name: []const u8, body: []const u8) !void {
+    const skill_dir = try std.fs.path.join(gpa, &.{ agents_dir, dir_name });
+    defer gpa.free(skill_dir);
+    try std.Io.Dir.createDirPath(.cwd(), io, skill_dir);
+    const md_path = try std.fs.path.join(gpa, &.{ skill_dir, "SKILL.md" });
+    defer gpa.free(md_path);
+    var file = try std.Io.Dir.createFile(.cwd(), io, md_path, .{ .truncate = true });
+    defer file.close(io);
+    try file.writeStreamingAll(io, body);
+}
+
+test "loadProject skips a skill with an oversized description" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+    const full_dir = try std.fs.path.join(gpa, &.{ root, ".zig-cache", "skill-desc-cap-test" });
+    defer gpa.free(full_dir);
+    try resetTestFixture(io, full_dir);
+    const agents_dir = try std.fs.path.join(gpa, &.{ full_dir, ".agents", "skills" });
+    defer gpa.free(agents_dir);
+    try std.Io.Dir.createDirPath(.cwd(), io, agents_dir);
+
+    // 1025 bytes: one over the spec cap.
+    const big = try gpa.alloc(u8, description_max_bytes + 1);
+    defer gpa.free(big);
+    @memset(big, 'x');
+    const big_body = try std.fmt.allocPrint(gpa, "---\nname: bigdesc\ndescription: {s}\n---\nbody\n", .{big});
+    defer gpa.free(big_body);
+    try writeSkillMd(io, gpa, agents_dir, "bigdesc", big_body);
+
+    // Exactly at the cap loads — pins the check as strictly-greater.
+    const edge = try gpa.alloc(u8, description_max_bytes);
+    defer gpa.free(edge);
+    @memset(edge, 'x');
+    const edge_body = try std.fmt.allocPrint(gpa, "---\nname: edge-ok\ndescription: {s}\n---\nbody\n", .{edge});
+    defer gpa.free(edge_body);
+    try writeSkillMd(io, gpa, agents_dir, "edge-ok", edge_body);
+
+    const skills = try loadProject(gpa, io, null, full_dir);
+    defer deinitAll(gpa, skills);
+    try std.testing.expectEqual(@as(usize, 1), skills.len);
+    try std.testing.expectEqualStrings("edge-ok", skills[0].name);
+}
+
+test "loadProject skips a quoted description that is not closed on its line" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+    const full_dir = try std.fs.path.join(gpa, &.{ root, ".zig-cache", "skill-multiline-desc-test" });
+    defer gpa.free(full_dir);
+    try resetTestFixture(io, full_dir);
+    const agents_dir = try std.fs.path.join(gpa, &.{ full_dir, ".agents", "skills" });
+    defer gpa.free(agents_dir);
+    try std.Io.Dir.createDirPath(.cwd(), io, agents_dir);
+
+    // The closing quote sits on the next physical line — YAML would join the
+    // lines; the line-oriented parser previously truncated to line one.
+    try writeSkillMd(io, gpa, agents_dir, "multiline", "---\nname: multiline\ndescription: \"uses the Foo widget\n  to bar the baz\"\n---\nbody\n");
+    try writeSkillMd(io, gpa, agents_dir, "goodskill", "---\nname: goodskill\ndescription: good skill\n---\nbody\n");
+
+    const skills = try loadProject(gpa, io, null, full_dir);
+    defer deinitAll(gpa, skills);
+    try std.testing.expectEqual(@as(usize, 1), skills.len);
+    try std.testing.expectEqualStrings("goodskill", skills[0].name);
+}
+
+test "loadOne rejects an unterminated quoted name" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+    const full_dir = try std.fs.path.join(gpa, &.{ root, ".zig-cache", "skill-multiline-name-test" });
+    defer gpa.free(full_dir);
+    try resetTestFixture(io, full_dir);
+    try std.Io.Dir.createDirPath(.cwd(), io, full_dir);
+
+    const md_path = try std.fs.path.join(gpa, &.{ full_dir, "SKILL.md" });
+    defer gpa.free(md_path);
+    var file = try std.Io.Dir.createFile(.cwd(), io, md_path, .{ .truncate = true });
+    defer file.close(io);
+    try file.writeStreamingAll(io, "---\nname: \"badname\ndescription: d\n---\nbody\n");
+
+    try std.testing.expectError(error.BlockScalarUnsupported, loadOne(gpa, io, md_path));
+}
+
+test "nameMatchesContainer compares case-insensitively" {
+    try std.testing.expect(nameMatchesContainer("tiger", "Tiger"));
+    try std.testing.expect(nameMatchesContainer("TigerStyle", "tigerstyle"));
+    try std.testing.expect(!nameMatchesContainer("tiger", "tigre"));
+}
+
+test "loadProject loads a skill whose name does not match its directory" {
+    // Mismatch warns (helper above pins the comparison) but still loads —
+    // the frontmatter name is authoritative for invocation.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+    const full_dir = try std.fs.path.join(gpa, &.{ root, ".zig-cache", "skill-dir-mismatch-test" });
+    defer gpa.free(full_dir);
+    try resetTestFixture(io, full_dir);
+    const agents_dir = try std.fs.path.join(gpa, &.{ full_dir, ".agents", "skills" });
+    defer gpa.free(agents_dir);
+    try std.Io.Dir.createDirPath(.cwd(), io, agents_dir);
+
+    try writeSkillMd(io, gpa, agents_dir, "mismatch-dir", "---\nname: other-name\ndescription: d\n---\nbody\n");
+
+    const skills = try loadProject(gpa, io, null, full_dir);
+    defer deinitAll(gpa, skills);
+    try std.testing.expectEqual(@as(usize, 1), skills.len);
+    try std.testing.expectEqualStrings("other-name", skills[0].name);
+}
+
+test "strict scan counts failed loads and loose markdown files" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+    const full_dir = try std.fs.path.join(gpa, &.{ root, ".zig-cache", "skill-strict-test" });
+    defer gpa.free(full_dir);
+    try resetTestFixture(io, full_dir);
+    const agents_dir = try std.fs.path.join(gpa, &.{ full_dir, ".agents", "skills" });
+    defer gpa.free(agents_dir);
+    try std.Io.Dir.createDirPath(.cwd(), io, agents_dir);
+
+    try writeSkillMd(io, gpa, agents_dir, "badskill", "---\nname: My Skill\ndescription: d\n---\nbody\n");
+    try writeSkillMd(io, gpa, agents_dir, "goodskill", "---\nname: goodskill\ndescription: d\n---\nbody\n");
+    // Loose root .md: loads fine, but is a strict-scan violation.
+    const loose_path = try std.fs.path.join(gpa, &.{ agents_dir, "tips.md" });
+    defer gpa.free(loose_path);
+    {
+        var file = try std.Io.Dir.createFile(.cwd(), io, loose_path, .{ .truncate = true });
+        defer file.close(io);
+        try file.writeStreamingAll(io, "---\ndescription: tips skill\n---\nbody\n");
+    }
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var report: ScanReport = .{ .writer = &out.writer };
+    const skills = try loadProjectReported(gpa, io, null, full_dir, &report);
+    defer deinitAll(gpa, skills);
+
+    try std.testing.expectEqual(@as(usize, 2), report.count);
+    // The loose file still LOADS (document, don't restrict) — so the loaded
+    // list carries goodskill + tips; the violation is report-only.
+    try std.testing.expectEqual(@as(usize, 2), skills.len);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "InvalidSkillName") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "tips.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "loose root markdown file") != null);
+}
+
+test "strict scan is quiet when every skill is standard" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+    const full_dir = try std.fs.path.join(gpa, &.{ root, ".zig-cache", "skill-strict-clean-test" });
+    defer gpa.free(full_dir);
+    try resetTestFixture(io, full_dir);
+    const agents_dir = try std.fs.path.join(gpa, &.{ full_dir, ".agents", "skills" });
+    defer gpa.free(agents_dir);
+    try std.Io.Dir.createDirPath(.cwd(), io, agents_dir);
+
+    try writeSkillMd(io, gpa, agents_dir, "goodskill", "---\nname: goodskill\ndescription: d\n---\nbody\n");
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var report: ScanReport = .{ .writer = &out.writer };
+    const skills = try loadProjectReported(gpa, io, null, full_dir, &report);
+    defer deinitAll(gpa, skills);
+
+    try std.testing.expectEqual(@as(usize, 0), report.count);
+    try std.testing.expectEqual(@as(usize, 1), skills.len);
 }
 
 test "loadProject skips skills with invalid names" {
@@ -980,15 +1247,31 @@ test "collectInvocations deduplicates case-insensitively" {
     try std.testing.expectEqual(@as(usize, 1), names.len);
 }
 
-test "isValidSkillName rejects XML-special characters" {
+test "isValidSkillName enforces the agent-skills charset" {
+    // XML-special chars stay rejected (TD-14: collectInjectedSkillNames
+    // needs no unescaping), now subsumed by the spec charset.
     try std.testing.expect(!isValidSkillName("a\"b"));
     try std.testing.expect(!isValidSkillName("a'b"));
     try std.testing.expect(!isValidSkillName("a&b"));
     try std.testing.expect(!isValidSkillName("a<b"));
     try std.testing.expect(!isValidSkillName("a>b"));
+    // Non-spec names stricter agents would drop.
+    try std.testing.expect(!isValidSkillName("c++"));
+    try std.testing.expect(!isValidSkillName("c#"));
+    try std.testing.expect(!isValidSkillName("--x--"));
+    try std.testing.expect(!isValidSkillName("My_Skill"));
+    try std.testing.expect(!isValidSkillName("Café"));
+    try std.testing.expect(!isValidSkillName("-lead"));
+    try std.testing.expect(!isValidSkillName("trail-"));
+    try std.testing.expect(!isValidSkillName("a--b"));
+    try std.testing.expect(!isValidSkillName("My Skill"));
+    try std.testing.expect(!isValidSkillName("a$b"));
+    try std.testing.expect(!isValidSkillName("x" ** 65));
     try std.testing.expect(isValidSkillName("abc"));
-    try std.testing.expect(isValidSkillName("c++"));
-    try std.testing.expect(isValidSkillName("c#"));
+    try std.testing.expect(isValidSkillName("c2"));
+    try std.testing.expect(isValidSkillName("my-skill"));
+    try std.testing.expect(isValidSkillName("skill-1"));
+    try std.testing.expect(isValidSkillName("x" ** 64));
 }
 
 test "appendSkillBlock escapes XML special characters in attributes" {

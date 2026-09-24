@@ -92,6 +92,11 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     };
     defer gpa.free(home_dir);
 
+    // `zay --strict`: skill-conformance scan for CI. Runs before config
+    // loading (a lint pass shouldn't pay for it); the logger is already
+    // live so the loader's warnings surface normally.
+    if (try handleStrictScanFlag(init, gpa, home_dir, cwd)) return;
+
     var load_result = try config.load(gpa, init.io, cwd, home_dir, init.environ_map);
 
     // The TUI is long-running and streams unbounded content. `SmpAllocator`
@@ -438,6 +443,38 @@ fn handleVersionFlag(init: std.process.Init, gpa: std.mem.Allocator) !bool {
         }
     }
     return false;
+}
+
+/// Handle `zay --strict`: scan both skill roots (global + project) with the
+/// production loader, print one line per violation plus a summary to stdout,
+/// and exit 1 when any violation was found (0 otherwise). The TUI never
+/// starts, so this doubles as a CI lint for a repo's `.agents/skills` tree.
+fn handleStrictScanFlag(init: std.process.Init, gpa: std.mem.Allocator, home_dir: []const u8, cwd: []const u8) !bool {
+    var args = try init.minimal.args.iterateAllocator(gpa);
+    defer args.deinit();
+    var found = false;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--strict")) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) return false;
+
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.File.stdout().writer(init.io, &buf);
+    defer writer.interface.flush() catch {};
+
+    var report: skill.ScanReport = .{ .writer = &writer.interface };
+    const skills = try skill.loadProjectReported(gpa, init.io, home_dir, cwd, &report);
+    defer skill.deinitAll(gpa, skills);
+
+    try writer.interface.print("skill scan: {d} violation(s)\n", .{report.count});
+    // `process.exit` is noreturn and skips defers — flush BEFORE exiting or
+    // the violation lines are lost exactly when they matter.
+    writer.interface.flush() catch {};
+    if (report.count > 0) std.process.exit(1);
+    return true;
 }
 
 test {
