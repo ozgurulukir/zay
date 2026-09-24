@@ -1953,7 +1953,7 @@ pub fn drainMcpNotifications(self: *App) bool {
 /// config unchanged; a persistence failure keeps the in-memory addition but
 /// logs a warning.
 pub fn addMcpServerByUrl(self: *App, raw_url: []const u8) !void {
-    _ = self.liveRuntime() orelse return;
+    const runtime = self.liveRuntime() orelse return;
     const name = try deriveMcpServerName(self.gpa, raw_url);
     defer self.gpa.free(name);
     const server = try config_mod.mcpServerFromUrl(self.gpa, name, raw_url);
@@ -1967,13 +1967,19 @@ pub fn addMcpServerByUrl(self: *App, raw_url: []const u8) !void {
     self.cached_config.mcp_servers = new_servers;
     refreshMcpTools(self);
 
-    // Persist the updated server list to disk so an added server survives a
-    // restart. mergeAndWriteGlobal re-reads and re-merges the on-disk config
-    // (via applyMcpServerOverlay, add-or-update by name), so passing the whole
-    // live list is idempotent. MCP servers are user-level configuration, so
-    // they go to global config, mirroring saveSettings.
-    const updates: config_mod.Config = .{ .mcp_servers = self.cached_config.mcp_servers };
-    config_mod.mergeAndWriteGlobal(self.gpa, self.io, self.liveRuntime().?.home_dir, updates) catch |err| {
+    // Persist the added server to global config so it survives a restart.
+    // mergeAndWriteGlobal re-reads the on-disk config and applies the overlay
+    // add-or-update by name, so this is idempotent. Scope the write to the
+    // ONE server added here: cached_config.mcp_servers is the MERGED runtime
+    // list (global + project + env layers), so passing the whole list would
+    // silently copy project- and environment-scoped MCP servers into the
+    // user's global config.json — mirror saveSettings, which builds updates
+    // field-by-field for exactly this reason. The appended entry's storage is
+    // owned by cached_config (moved in by the realloc above), so we borrow it.
+    const updates: config_mod.Config = .{
+        .mcp_servers = self.cached_config.mcp_servers[self.cached_config.mcp_servers.len - 1 ..],
+    };
+    config_mod.mergeAndWriteGlobal(self.gpa, self.io, runtime.home_dir, updates) catch |err| {
         log.warn("mcp.add.persist.failed err={s}", .{@errorName(err)});
     };
 }
@@ -2011,6 +2017,43 @@ test "deriveMcpServerName extracts the URL host" {
     }
 }
 
+test "mergeAndWriteGlobal scopes add-server persistence so project-scoped servers are not copied to global" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "home" });
+    defer gpa.free(home_dir);
+
+    // cached_config.mcp_servers is the MERGED runtime list (global + project
+    // + env layers). The just-added server is appended LAST, so the scoped
+    // persistence in addMcpServerByUrl passes only the last entry of the
+    // merged list, never the whole list — otherwise project- and
+    // environment-scoped servers would be silently copied into the user's
+    // global config.json. cached owns both appended servers here.
+    var list: std.ArrayList(config_mod.McpServerConfig) = .empty;
+    try list.append(gpa, try config_mod.mcpServerFromUrl(gpa, "regression-project-server", "https://project.invalid/mcp"));
+    try list.append(gpa, try config_mod.mcpServerFromUrl(gpa, "regression-global-server", "https://mcp.example.com/mcp"));
+    var cached: config_mod.Config = .{ .mcp_servers = try list.toOwnedSlice(gpa) };
+    defer cached.deinit(gpa);
+
+    // Mirror addMcpServerByUrl's scope: pass only the last entry of the
+    // merged list, never the whole merged list.
+    const updates: config_mod.Config = .{
+        .mcp_servers = cached.mcp_servers[cached.mcp_servers.len - 1 ..],
+    };
+    try config_mod.mergeAndWriteGlobal(gpa, io, home_dir, updates);
+
+    var merged = try config_mod.readGlobal(gpa, io, home_dir);
+    defer merged.deinit(gpa);
+    // Only the added/global server lands on disk; the project-scoped server
+    // must not leak into the global config.
+    try std.testing.expectEqual(@as(usize, 1), merged.mcp_servers.len);
+    try std.testing.expectEqualStrings("regression-global-server", merged.mcp_servers[0].name);
+}
 test "resolveProviderKey resolves typed, saved, and blank-required keys" {
     // A trimmed typed key wins.
     try std.testing.expectEqualStrings("sk-abc", resolveProviderKey("  sk-abc  ", null, true).?);
