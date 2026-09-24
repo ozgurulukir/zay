@@ -13,6 +13,13 @@ const agent_mod = @import("../agent.zig");
 const common = @import("common.zig");
 const lane_bridge = @import("lane_bridge.zig");
 
+/// The model only ever sees worker-orchestration commands. `create`/`enter`/
+/// `leave` are driver-only BY DESIGN, not an oversight: `enter`/`leave`
+/// re-root the executor's workspace mid-batch (rerootFromRequester) and touch
+/// App-owned thread state a worker thread must never reach, so exposing them
+/// to a worker would defeat the thread-safety the lane split exists for.
+/// `internal_commands` still lists them for the UI-side lifecycle
+/// (`lane_lifecycle`) and tests.
 const model_commands = [_][]const u8{ "list", "spawn", "read", "await", "steer", "cancel", "merge", "delete" };
 const internal_commands = [_][]const u8{ "list", "create", "enter", "leave", "merge", "spawn", "read", "cancel", "await", "steer", "delete" };
 

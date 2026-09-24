@@ -1027,7 +1027,10 @@ pub const AgentRuntime = struct {
             tools_mod.builtinRegistry();
         for (source) |t| {
             const gop = try seen.getOrPut(gpa, t.name);
-            if (gop.found_existing) continue;
+            if (gop.found_existing) {
+                log.warn("assembleToolSpecs: duplicate tool '{s}' dropped (first registration wins)", .{t.name});
+                continue;
+            }
             try specs.append(gpa, ai.tool_schema.specFromTool(t));
         }
         return specs.toOwnedSlice(gpa);
