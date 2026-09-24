@@ -1947,10 +1947,11 @@ pub fn drainMcpNotifications(self: *App) bool {
 }
 
 /// Add a remote (Streamable HTTP) MCP server from a URL typed in the overlay's
-/// add-form. The server is appended to the live `cached_config` and connected
-/// immediately via `refreshMcpTools`. Runtime-only: it is NOT written to
-/// config.json (persistence is a follow-up). Best-effort — a failure leaves the
-/// config unchanged.
+/// add-form. The server is appended to the live `cached_config`, connected
+/// immediately via `refreshMcpTools`, and persisted to config.json so it
+/// survives a restart. Best-effort — an append or connect failure leaves the
+/// config unchanged; a persistence failure keeps the in-memory addition but
+/// logs a warning.
 pub fn addMcpServerByUrl(self: *App, raw_url: []const u8) !void {
     _ = self.liveRuntime() orelse return;
     const name = try deriveMcpServerName(self.gpa, raw_url);
@@ -1965,6 +1966,16 @@ pub fn addMcpServerByUrl(self: *App, raw_url: []const u8) !void {
     new_servers[new_len - 1] = server;
     self.cached_config.mcp_servers = new_servers;
     refreshMcpTools(self);
+
+    // Persist the updated server list to disk so an added server survives a
+    // restart. mergeAndWriteGlobal re-reads and re-merges the on-disk config
+    // (via applyMcpServerOverlay, add-or-update by name), so passing the whole
+    // live list is idempotent. MCP servers are user-level configuration, so
+    // they go to global config, mirroring saveSettings.
+    const updates: config_mod.Config = .{ .mcp_servers = self.cached_config.mcp_servers };
+    config_mod.mergeAndWriteGlobal(self.gpa, self.io, self.liveRuntime().?.home_dir, updates) catch |err| {
+        log.warn("mcp.add.persist.failed err={s}", .{@errorName(err)});
+    };
 }
 
 /// Derive a server name from a URL's host (the part between "://" and the next
