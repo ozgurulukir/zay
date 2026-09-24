@@ -35,7 +35,7 @@ pub fn cycleLane(app: *App, delta: i32) void {
     const cur: i32 = @intCast(activeIndex(app));
     const next: usize = @intCast(@mod(cur + delta, @as(i32, @intCast(n))));
     app.thread = app.threads.slice()[next];
-    app.nav.block_nav = false;
+    app.clearBlockNav();
     app.clearInput();
 }
 
@@ -114,6 +114,6 @@ pub fn closeActiveLane(app: *App) !void {
     lane.deinit(app.gpa);
     app.gpa.destroy(lane);
 
-    app.nav.block_nav = false;
+    app.clearBlockNav();
     app.clearInput();
 }

@@ -243,7 +243,7 @@ pub fn mergeLane(app: *App, source: lanes_util.MergeSource, dest: *Thread) !void
     }
 
     if (app.threads.len() < 2) app.split_mode = .tab;
-    app.nav.block_nav = false;
+    app.clearBlockNav();
 }
 
 pub fn createMergePicker(app: *App) !void {

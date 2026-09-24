@@ -1820,17 +1820,18 @@ test "reprompt after interrupt starts a fresh turn" {
 
     try app.inputs.input.insertSliceAtCursor("first");
     try std.testing.expect(try app.beginSubmit());
-    if (app.thread.pending_prompt) |prompt| app.thread.worker_context.?.gpa.free(prompt);
-    app.thread.pending_prompt = null;
+    // The fold spawns a real (fast-failing) worker; join it so the interrupt
+    // below takes the synchronous path (no future in flight). Its terminal
+    // events stay stranded in the queue — discarded by the interrupt path.
+    app.awaitTurnFor(app.thread);
     try app.handleInterrupt();
 
     try app.inputs.input.insertSliceAtCursor("second");
     try std.testing.expect(try app.beginSubmit());
     defer app.thread.turn.reset();
-    defer {
-        if (app.thread.pending_prompt) |prompt| app.thread.worker_context.?.gpa.free(prompt);
-        app.thread.pending_prompt = null;
-    }
+    // Join the second worker before teardown assertions; `app.deinit` would
+    // join it too, but the machine must be quiescent for the checks below.
+    defer app.awaitTurnFor(app.thread);
 
     try std.testing.expectEqual(Turn.State.active, app.thread.turn.state);
     try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
@@ -1848,8 +1849,9 @@ test "interrupt drops the turn straight back to idle" {
 
     try app.inputs.input.insertSliceAtCursor("first");
     try std.testing.expect(try app.beginSubmit());
-    if (app.thread.pending_prompt) |prompt| app.thread.worker_context.?.gpa.free(prompt);
-    app.thread.pending_prompt = null;
+    // Join the fold's real (fast-failing) worker so the interrupt below
+    // finds no future and takes the synchronous path.
+    app.awaitTurnFor(app.thread);
     try std.testing.expectEqual(Turn.State.active, app.thread.turn.state);
 
     // Interrupt must not leave the lane lingering in `interrupting` waiting for
@@ -1886,8 +1888,9 @@ test "interrupt with an in-flight worker converges asynchronously" {
 
     try app.inputs.input.insertSliceAtCursor("first");
     try std.testing.expect(try app.beginSubmit());
-    if (app.thread.pending_prompt) |prompt| app.thread.worker_context.?.gpa.free(prompt);
-    app.thread.pending_prompt = null;
+    // Join the fold's real worker first so the noop-future overwrite below
+    // replaces a null, not a live future (an orphaned future would leak).
+    app.awaitTurnFor(app.thread);
     // A real (already-finished) worker future so the interrupt takes the
     // async path: the UI thread must not block on the join, the machine
     // stays `.interrupting` until the drain converges.
@@ -1907,6 +1910,36 @@ test "interrupt with an in-flight worker converges asynchronously" {
     try std.testing.expect(!turn_lifecycle.turnCancelActive(&app));
 }
 
+test "cancelLaneTurn synchronously converges an active turn to idle" {
+    // The sync twin of `handleInterrupt` (the model-driven `lane cancel`
+    // path, S10), pinned WITHOUT the git fixture its spawned-worker siblings
+    // need: with the fold's real worker in flight, `cancelLaneTurn`
+    // force-cancels the future, discards the stranded events, and lands the
+    // machine back on idle — the transition table the cancel paths must
+    // preserve (active → interrupting → idle in one synchronous step).
+    const gpa = std.testing.allocator;
+    var openai_compatible_client: openai_compatible_mod.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try app.inputs.input.insertSliceAtCursor("task");
+    try std.testing.expect(try app.beginSubmit());
+    try std.testing.expectEqual(Turn.State.active, app.thread.turn.state);
+
+    turn_lifecycle.cancelLaneTurn(&app, app.thread);
+    try std.testing.expectEqual(Turn.State.idle, app.thread.turn.state);
+    try std.testing.expect(!app.thread.turn.isActive());
+    try std.testing.expect(app.thread.turn_future == null);
+    // The cancel is projected honestly: the transcript notice and the
+    // `turn_failed` record the completion delivery would report.
+    try std.testing.expect(app.thread.transcript.containsText("Interrupted."));
+    try std.testing.expectEqualStrings("Interrupted.", app.thread.turn_failed.?);
+}
+
 test "submit during the interrupt teardown queues and restarts after convergence" {
     const gpa = std.testing.allocator;
     var openai_compatible_client: openai_compatible_mod.Client = undefined;
@@ -1919,8 +1952,9 @@ test "submit during the interrupt teardown queues and restarts after convergence
 
     try app.inputs.input.insertSliceAtCursor("first");
     try std.testing.expect(try app.beginSubmit());
-    if (app.thread.pending_prompt) |prompt| app.thread.worker_context.?.gpa.free(prompt);
-    app.thread.pending_prompt = null;
+    // Join the fold's real worker first so the noop-future overwrite below
+    // replaces a null, not a live future.
+    app.awaitTurnFor(app.thread);
     app.thread.turn_future = try app.getIo().concurrent(noopTurnTask, .{});
     try app.handleInterrupt();
 
@@ -1967,7 +2001,6 @@ test "scripted turn runs the real worker end to end and converges to idle" {
 
     try app.inputs.input.insertSliceAtCursor("first");
     try std.testing.expect(try app.beginSubmit());
-    try app.startTurn();
     try std.testing.expectEqual(Turn.State.active, app.thread.turn.state);
 
     var root: RootWidget = .{ .app = &app };
@@ -1988,7 +2021,7 @@ test "scripted turn runs the real worker end to end and converges to idle" {
     try std.testing.expectEqualStrings("first", messages[0].mirror().body);
     try std.testing.expectEqual(.agent, messages[1].mirror().kind);
     try std.testing.expectEqualStrings("first reply", messages[1].mirror().body);
-    try std.testing.expect(app.thread.pending_prompt == null);
+    try std.testing.expect(app.thread.worker_context.?.pending_prompt.slot == null);
 }
 
 test "interrupted turn converges into a scripted queued restart" {
@@ -2003,7 +2036,13 @@ test "interrupted turn converges into a scripted queued restart" {
     const alg = safe_gpa.allocator();
     var scripted = try ai.scripted_client.Client.init(alg, std.testing.io, "scripted-model");
     defer scripted.deinit();
-    try scripted.enqueue(.{ai.scripted_client.step.text("second reply", .stop)});
+    // Two steps: the fold's first worker consumes step 1 (its reply is never
+    // drained — the interrupt discards its stranded events), the queued
+    // restart's worker consumes step 2.
+    try scripted.enqueue(.{
+        ai.scripted_client.step.text("first reply", .stop),
+        ai.scripted_client.step.text("second reply", .stop),
+    });
     var agent = agent_mod.Agent.init(alg, std.testing.io, ".", .{ .scripted = &scripted });
     defer agent.deinit();
     var app = try App.init(std.testing.io, alg, &agent);
@@ -2011,8 +2050,9 @@ test "interrupted turn converges into a scripted queued restart" {
 
     try app.inputs.input.insertSliceAtCursor("first");
     try std.testing.expect(try app.beginSubmit());
-    if (app.thread.pending_prompt) |prompt| app.thread.worker_context.?.gpa.free(prompt);
-    app.thread.pending_prompt = null;
+    // Join the first real worker so the noop-future overwrite below replaces
+    // a null, not a live future.
+    app.awaitTurnFor(app.thread);
     // A finished no-op future so the interrupt takes the async path.
     app.thread.turn_future = try app.getIo().concurrent(noopTurnTask, .{});
     try app.handleInterrupt();
