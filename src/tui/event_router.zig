@@ -391,7 +391,7 @@ fn routeKey(
             if (app.getBlockNav()) {
                 if (!app.transcriptHasSelection()) {
                     if (try app.moveInputCursorVertical(.down)) {
-                        app.setBlockNav(false);
+                        app.clearBlockNav();
                         ctx.consumeAndRedraw();
                         return;
                     }
@@ -436,7 +436,7 @@ fn handleEscapeSequence(
         return;
     }
     if (app.getBlockNav() or app.thread.transcript.selected != null) {
-        app.setBlockNav(false);
+        app.clearBlockNav();
         app.thread.transcript.selected = null;
         app.setThreadAutoScroll(true);
         try root.syncFocus(ctx);
@@ -476,7 +476,7 @@ fn handleQuitSequence(
     if (is_ctrl_c and app.isNormalMode() and app.inputRealLength() > 0) {
         app.clearInput();
         app.closeAtSearch();
-        app.setBlockNav(false);
+        app.clearBlockNav();
         app.clearPendingQuitAt();
         ctx.consumeAndRedraw();
         return true;

@@ -744,7 +744,7 @@ pub fn closeDiff(root: *RootWidget, ctx: *vxfw.EventContext, send: bool) !void {
     const has_comments = try diff_lifecycle.closeDiffViewer(root.app, send);
     try syncFocus(root, ctx);
     if (has_comments) {
-        if (try root.app.beginSubmit()) try root.app.startTurn();
+        _ = try root.app.beginSubmit();
         try ensureTick(root, ctx);
     }
     ctx.consumeAndRedraw();
@@ -888,7 +888,6 @@ pub fn submit(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         return;
     }
     if (!try root.app.beginSubmit()) return;
-    try root.app.startTurn();
     try ensureTick(root, ctx);
     ctx.consumeAndRedraw();
 }

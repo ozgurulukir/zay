@@ -724,12 +724,15 @@ pub const App = struct {
         return turn_lifecycle.formatNoProviderMessage(self);
     }
 
-    pub fn resetTurnState(self: *App) void {
-        turn_lifecycle.resetTurnState(self, self.thread);
+    /// Any input mutation (typing, submit, mode change, lane switch) hands
+    /// the arrow keys back to the input — one named home for un-blocking
+    /// transcript navigation, so the reset sites read as intent.
+    pub fn clearBlockNav(self: *App) void {
+        self.nav.block_nav = false;
     }
 
-    pub fn startTurn(self: *App) !void {
-        return turn_lifecycle.startTurn(self);
+    pub fn resetTurnState(self: *App) void {
+        turn_lifecycle.resetTurnState(self, self.thread);
     }
 
     pub fn startQueuedTurnOn(self: *App, lane: *Thread) !bool {

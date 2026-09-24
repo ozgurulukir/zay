@@ -13,7 +13,7 @@ const App = tui.App;
 
 pub fn inputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8) anyerror!void {
     const app: *App = @ptrCast(@alignCast(userdata.?));
-    app.nav.block_nav = false;
+    app.clearBlockNav();
     const was_command = app.mode == .command;
     try app.syncModeWithInput(value);
     if (!was_command and app.mode == .command) {

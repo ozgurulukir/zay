@@ -469,7 +469,7 @@ pub const BlockNav = struct {
             // Stepping down past the last block (when it can't scroll further)
             // re-enters the input and traps the cursor there again.
             if (app.getBlockNav() and app.selectionIsLastMessage() and !app.selectedMessageCanScrollDown()) {
-                app.setBlockNav(false);
+                app.clearBlockNav();
                 app.setThreadAutoScroll(true);
                 _ = try app.moveInputCursorVertical(.down);
                 return true;

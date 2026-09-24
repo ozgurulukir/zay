@@ -78,7 +78,6 @@ turn_future: ?std.Io.Future(void) = null,
 /// `turn_lifecycle.beginTurnCancel`; joined and freed by `drainTurnCancels`
 /// (or `deinitWorkersTop` at teardown), so it is always null in `deinit`.
 cancel_job: ?*turn_cancel.TurnCancelJob = null,
-pending_prompt: ?[]u8 = null,
 permission_selection: agent_worker.ApprovalDecision = .approve,
 permission_scroll: u32 = 0,
 /// The turn-driving handle: enqueue user input, start turns, read messages.
@@ -193,8 +192,10 @@ pub fn deinit(self: *Thread, gpa: std.mem.Allocator) void {
     self.queued.deinit(gpa);
     for (self.prompt_history.items) |p| gpa.free(p);
     self.prompt_history.deinit(gpa);
-    if (self.pending_prompt) |prompt| gpa.free(prompt);
     if (self.worker_context) |*worker| {
+        // The prompt slot is freed through its own context so the bytes are
+        // released by the same allocator that allocated them.
+        worker.pending_prompt.freeStale(worker.gpa);
         worker.approval.deinit(worker.io, gpa);
         worker.queue.deinit(worker.io, gpa);
     }

@@ -150,12 +150,13 @@ pub fn turnCancelActive(app: *App) bool {
     return false;
 }
 
-/// Start a turn from the current input. Returns true when a turn was
-/// started (the caller should then call `startTurn`); false when the
-/// prompt was empty, had no provider, or was queued behind a running turn.
+/// Start a turn from the current input — the full submit+spawn front door.
+/// Returns true when a worker was spawned (the caller should keep the tick
+/// alive); false when the prompt was empty, had no provider, was refused
+/// (manual compact / idle lane), or was queued behind a running turn.
 pub fn beginSubmit(app: *App) !bool {
     app.closeAtSearch();
-    app.nav.block_nav = false;
+    app.clearBlockNav();
     // An in-flight turn — including `.interrupting` and the post-idle window
     // where the async teardown is still unwinding the worker — refuses a new
     // worker: two concurrent workers would race the shared agent message
@@ -195,24 +196,20 @@ pub fn beginSubmit(app: *App) !bool {
         return false;
     }
 
-    resetTurnState(app, app.thread);
-    app.thread.worker_context.?.resetCancel();
+    // THE one worker-allocator copy: every projection below borrows it, and
+    // it is handed to the spine (the caller frees it if the spawn fails).
+    const worker_prompt = try app.thread.worker_context.?.gpa.dupe(u8, prompt);
+    errdefer app.thread.worker_context.?.gpa.free(worker_prompt);
     app.thread.transcript.dropIntroLogo(app.gpa);
-    _ = try app.thread.transcript.append(app.gpa, .user, "you", prompt);
+    _ = try app.thread.transcript.append(app.gpa, .user, "you", worker_prompt);
     // A worktree lane's first prompt also names its branch: ask the model
     // in parallel, and rename the hex branch when the answer lands.
     if (app.thread.title == null and lanes_util.workingLaneOf(app.thread) != null) {
-        app.scheduleLaneNaming(app.thread, prompt) catch {};
+        app.scheduleLaneNaming(app.thread, worker_prompt) catch {};
     }
-    try setLaneTitleIfUnset(app, app.thread, prompt);
-    try queue_mod.appendSkillInvocationsToTranscript(app, app.thread, prompt);
-    app.thread.turn_view.awaitModel();
-    // The worker expands `@`-mentions (reading files / images) off the UI
-    // thread; stash the raw text for `startTurn` to hand over. The worker
-    // owns and frees it, so it must be allocated with the worker's
-    // allocator (`worker_context.gpa`), not `app.gpa`.
-    app.thread.pending_prompt = try app.thread.worker_context.?.gpa.dupe(u8, prompt);
-    app.thread.turn.submit();
+    try setLaneTitleIfUnset(app, app.thread, worker_prompt);
+    try queue_mod.appendSkillInvocationsToTranscript(app, app.thread, worker_prompt);
+    try spawnTurn(app, app.thread, .{ .prompt = worker_prompt });
     return true;
 }
 
@@ -298,12 +295,13 @@ pub fn resetTurnState(app: *App, lane: *Thread) void {
 /// bookkeeping (spinner word, `turn_failed`, activity clock, tool tally),
 /// clear any stale worker cancel flag, free a stranded prompt, flip the view
 /// to awaiting-model, submit the machine, and start the worker future.
-/// `opts.prompt` must be allocated on the lane worker's allocator; the spine
-/// frees it if the spawn fails.
+/// `opts.prompt` must be allocated on the lane worker's allocator; the CALLER
+/// owns it until the spawn succeeds — on failure the spine only clears the
+/// slot claim, and the caller's errdefer frees. After a successful spawn the
+/// worker consumes and frees it.
 const SpawnOpts = struct {
-    /// Owned by the lane worker's allocator and TRANSFERRED to the spine:
-    /// the spine frees it if the spawn fails, and the worker frees it after
-    /// the turn.
+    /// Allocated on the lane worker's allocator. Caller-owned until the
+    /// spawn succeeds; the spine never frees it.
     prompt: ?[]u8 = null,
     /// Deliver the agent's queued messages as context + the latest user turn
     /// instead of a fresh prompt.
@@ -316,37 +314,18 @@ fn spawnTurn(app: *App, lane: *Thread, opts: SpawnOpts) !void {
     // Free any prompt left over from a failed spawn (the window is
     // theoretical — the spawn is the last step — but the cleanup costs
     // nothing).
-    if (lane.pending_prompt) |stale| {
-        lane.worker_context.?.gpa.free(stale);
-        lane.pending_prompt = null;
-    }
+    lane.worker_context.?.pending_prompt.freeStale(lane.worker_context.?.gpa);
     lane.turn_view.awaitModel();
     lane.turn.submit();
-    lane.pending_prompt = opts.prompt;
-    errdefer if (lane.pending_prompt) |prompt| {
-        lane.worker_context.?.gpa.free(prompt);
-        lane.pending_prompt = null;
-    };
+    if (opts.prompt) |prompt| lane.worker_context.?.pending_prompt.set(prompt);
+    // Drop the slot's claim WITHOUT freeing on spawn failure: the bytes are
+    // still the caller's, and its errdefer frees them exactly once.
+    errdefer lane.worker_context.?.pending_prompt.slot = null;
     lane.turn_future = try app.getIo().concurrent(agent_worker.runAgentTurn, .{
         lane.agent.?,
         lane.liveRuntime(),
         &lane.worker_context.?,
-        &lane.pending_prompt,
         opts.drain_queue_first,
-    });
-}
-
-/// Spawn half of the focused-lane path: `beginSubmit` already did the
-/// projection and submitted the machine, so this only hands over the stashed
-/// prompt. NOT routed through `spawnTurn` — the spine's reset/submit half
-/// would double-fire on the already-`.active` machine.
-pub fn startTurn(app: *App) !void {
-    app.thread.turn_future = try app.getIo().concurrent(agent_worker.runAgentTurn, .{
-        app.thread.agent.?,
-        app.thread.liveRuntime(),
-        &app.thread.worker_context.?,
-        &app.thread.pending_prompt,
-        false,
     });
 }
 
@@ -393,8 +372,9 @@ pub fn convergeFinishedTurn(app: *App, lane: *Thread) !bool {
 /// become the lane's visible label.
 pub fn startTurnForLane(app: *App, lane: *Thread, prompt: []const u8, title_source: []const u8) !void {
     const owned = try lane.worker_context.?.gpa.dupe(u8, prompt);
-    // Ownership of `owned` moves into `spawnTurn` — its errdefer frees it if
-    // the spawn fails.
+    // The caller frees `owned` if `spawnTurn` fails; the worker consumes it
+    // on success.
+    errdefer lane.worker_context.?.gpa.free(owned);
     lane.transcript.dropIntroLogo(app.gpa);
     _ = try lane.transcript.append(app.gpa, .user, "you", prompt);
     // Title + naming helpers take the lane explicitly — no scope-swap.

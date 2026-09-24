@@ -25,7 +25,7 @@ pub fn selectionIsLastMessage(app: *const App) bool {
 }
 
 pub fn jumpTranscriptToBottom(app: *App) void {
-    app.nav.block_nav = false;
+    app.clearBlockNav();
     app.thread.transcript.selectLast();
     app.thread.auto_scroll = true;
     app.thread.transcript_list.scroll.pending_lines = 0;

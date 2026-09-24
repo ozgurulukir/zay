@@ -876,7 +876,7 @@ pub fn wakeIdleLane(app: *App, lane: *Thread, repo: []const u8, context: [][]u8,
 
 /// Start a turn on `lane` with `prompt` (duped into the lane worker's
 /// allocator): `turn_lifecycle.startTurnForLane` — the model-driven spawn
-/// twin of `beginSubmit`/`startTurn`.
+/// twin of `beginSubmit`.
 const startTurnForLane = turn_lifecycle.startTurnForLane;
 
 /// `lane read {lane}`: snapshot the tail of a worker lane's conversation.
@@ -1089,6 +1089,9 @@ fn parkFinishedWorker(app: *App, lane: *Thread) void {
     live.runtime.deinit();
     app.gpa.destroy(live.runtime);
     if (lane.worker_context) |*worker| {
+        // Defensive: a joined worker always consumed the slot, but freeing
+        // through the dying context is correct-by-construction.
+        worker.pending_prompt.freeStale(worker.gpa);
         worker.approval.deinit(worker.io, worker.gpa);
         worker.queue.deinit(worker.io, worker.gpa);
     }

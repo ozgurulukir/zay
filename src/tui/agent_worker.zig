@@ -85,6 +85,7 @@ pub const Context = struct {
     approval: ApprovalGate = .{},
     cancel_requested: std.atomic.Value(bool) = .init(false),
     cancel_signaled: std.atomic.Value(bool) = .init(false),
+    pending_prompt: PendingPrompt = .{},
 
     pub fn requestCancel(self: *Context) void {
         self.cancel_requested.store(true, .release);
@@ -93,6 +94,36 @@ pub const Context = struct {
     pub fn resetCancel(self: *Context) void {
         self.cancel_requested.store(false, .release);
         self.cancel_signaled.store(false, .release);
+    }
+};
+
+/// Owned slot for the raw user prompt handed from the UI thread to this
+/// lane's worker. Lives on `Context` so the slot and its allocator share a
+/// lifetime: a parked lane nulls `worker_context`, and teardown frees through
+/// the same `gpa` that allocated. (The old `Thread.pending_prompt` field was
+/// freed with the App allocator while the bytes came from the worker
+/// allocator — a latent mismatch that only worked while both wrap the same
+/// backing allocator.) Handoff is single-writer: `set` on the UI thread
+/// before the future spawns, `take` first thing on the worker; `freeStale`
+/// runs only on the UI thread while no worker is live.
+pub const PendingPrompt = struct {
+    slot: ?[]u8 = null,
+
+    /// The worker consumes the slot immediately on entry; if scheduling is
+    /// cancelled before entry, the lane still owns the bytes.
+    pub fn take(self: *PendingPrompt) ?[]u8 {
+        const prompt = self.slot;
+        self.slot = null;
+        return prompt;
+    }
+
+    pub fn set(self: *PendingPrompt, owned: []u8) void {
+        self.slot = owned;
+    }
+
+    pub fn freeStale(self: *PendingPrompt, gpa: std.mem.Allocator) void {
+        if (self.slot) |prompt| gpa.free(prompt);
+        self.slot = null;
     }
 };
 
@@ -174,18 +205,18 @@ const ApprovalGate = struct {
 
 pub const cancel_message = "Interrupted.";
 
-/// `pending_prompt_slot`, when populated, owns raw user text allocated by
-/// `worker_context.gpa`. The worker consumes the slot immediately on entry;
-/// if scheduling is cancelled before entry, the lane still owns the bytes.
-/// The prompt is expanded (file embedding / image attachment) and appended to
-/// history here, on the worker thread, so the UI thread never blocks on that I/O.
+/// `worker_context.pending_prompt`, when populated, owns raw user text
+/// allocated by `worker_context.gpa` (see `PendingPrompt`). The worker
+/// consumes the slot immediately on entry; if scheduling is cancelled before
+/// entry, the lane still owns the bytes. The prompt is expanded (file
+/// embedding / image attachment) and appended to history here, on the worker
+/// thread, so the UI thread never blocks on that I/O.
 ///
 /// `drain_queue_first` empties the agent's message queue into history before the
 /// turn's first prompt — used to deliver a queue stranded by a user interrupt as
 /// a fresh turn. The @-mention expansion lands here, off the UI thread.
-pub fn runAgentTurn(agent: *agent_mod.Agent, runtime: ?*runtime_mod.AgentRuntime, worker_context: *Context, pending_prompt_slot: *?[]u8, drain_queue_first: bool) void {
-    const pending_prompt = pending_prompt_slot.*;
-    pending_prompt_slot.* = null;
+pub fn runAgentTurn(agent: *agent_mod.Agent, runtime: ?*runtime_mod.AgentRuntime, worker_context: *Context, drain_queue_first: bool) void {
+    const pending_prompt = worker_context.pending_prompt.take();
     defer if (pending_prompt) |prompt| worker_context.gpa.free(prompt);
 
     agent.cancel_requested = &worker_context.cancel_requested;
@@ -311,6 +342,29 @@ fn postAgentEvent(worker_context: *Context, event: agent_mod.Agent.Event) anyerr
         };
         return;
     }
+}
+
+test "PendingPrompt hands off ownership and frees stale bytes through its allocator" {
+    const gpa = std.testing.allocator;
+    var slot: PendingPrompt = .{};
+    try std.testing.expect(slot.take() == null);
+
+    const first = try gpa.dupe(u8, "first prompt");
+    slot.set(first);
+    try std.testing.expectEqualStrings("first prompt", slot.slot.?);
+
+    // take() moves the bytes out; the consumer frees them (the worker path).
+    const taken = slot.take().?;
+    try std.testing.expect(slot.slot == null);
+    try std.testing.expectEqualStrings("first prompt", taken);
+    gpa.free(taken);
+
+    // freeStale releases whatever is left in the slot (the UI teardown path;
+    // the testing allocator's leak check is part of the assertion).
+    const second = try gpa.dupe(u8, "second prompt");
+    slot.set(second);
+    slot.freeStale(gpa);
+    try std.testing.expect(slot.slot == null);
 }
 
 test "drainIntoBounded preserves FIFO order across the batch boundary" {
