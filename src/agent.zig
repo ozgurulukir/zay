@@ -1900,6 +1900,132 @@ test "drain all queued moves the whole queue to history in FIFO order" {
     try std.testing.expectEqual(@as(u32, 0), agent.message_queue.len());
 }
 
+/// Mutex-wrapped allocator facade for the concurrency test below: the raw
+/// testing allocator is not thread-safe, and both the enqueuer and the
+/// drainer allocate through `agent.gpa`. (Same shape as tui/test_helpers'
+/// `LockedAllocator`, re-declared here so agent tests don't import the TUI.)
+const TestLockedAllocator = struct {
+    child: std.mem.Allocator,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+
+    pub fn allocator(self: *TestLockedAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *TestLockedAllocator = @ptrCast(@alignCast(ctx));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *TestLockedAllocator = @ptrCast(@alignCast(ctx));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *TestLockedAllocator = @ptrCast(@alignCast(ctx));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *TestLockedAllocator = @ptrCast(@alignCast(ctx));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "concurrent enqueue and drain never deadlock or lose messages" {
+    // Test-gap closure (PRIORITY_ACTIONS): the UI thread enqueues while a
+    // worker-shaped task drains — the queue mutex guards only push/pop, and
+    // the lock-failure-tolerant paths (`clearQueue`/`setQueuedSteer` treat
+    // lock failure as a no-op) must not drop or corrupt entries under
+    // contention. FIFO order and the exact count are the assertion; a
+    // deadlock surfaces as the test runner's timeout.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var safe_gpa = TestLockedAllocator{ .child = gpa, .io = io };
+    const alg = safe_gpa.allocator();
+
+    var agent = Agent.init(alg, io, ".", .none);
+    defer agent.deinit();
+
+    const Drainer = struct {
+        fn run(a: *Agent, done: *std.atomic.Value(bool)) void {
+            var spins: u32 = 0;
+            while (!done.load(.acquire)) : (spins += 1) {
+                if (spins > 100_000) return; // bounded: never spin forever
+                _ = a.drainAllQueuedToHistory() catch return;
+                std.testing.io.sleep(.fromMilliseconds(1), .awake) catch return;
+            }
+        }
+    };
+    var done = std.atomic.Value(bool).init(false);
+    var task = try io.concurrent(Drainer.run, .{ &agent, &done });
+
+    const total: usize = 200;
+    var buf: [32]u8 = undefined;
+    var i: usize = 0;
+    // Block-scoped errdefer: an enqueue-section failure still stops and joins
+    // the drainer before `agent.deinit` (the block exit guarantees it can
+    // never double-await the post-join section).
+    {
+        errdefer {
+            done.store(true, .release);
+            task.await(io);
+        }
+        while (i < total) : (i += 1) {
+            const text = try std.fmt.bufPrint(&buf, "m{d}", .{i});
+            // Retry on QueueFull: the drainer is consuming concurrently, so
+            // the 64-slot queue drains — the loop terminates.
+            var spins: u32 = 0;
+            while (true) : (spins += 1) {
+                try std.testing.expect(spins < 100_000);
+                agent.enqueueUser(text) catch |err| switch (err) {
+                    error.QueueFull => {
+                        io.sleep(.fromMilliseconds(1), .awake) catch {};
+                        continue;
+                    },
+                    else => return err,
+                };
+                break;
+            }
+            // Exercise the steer-marking path under contention too (mark the
+            // front entry; `drainAllQueuedToHistory` drains it regardless).
+            if (i % 50 == 0) agent.setQueuedSteer(0);
+        }
+    }
+    done.store(true, .release);
+    // Single await: the drainer exits within one 1 ms sleep of the flag.
+    task.await(io);
+    // Drain whatever the drainer hadn't reached when the flag flipped.
+    while (agent.message_queue.len() > 0) {
+        try std.testing.expect(try agent.drainAllQueuedToHistory() > 0);
+    }
+
+    // No loss, FIFO preserved, nothing left behind.
+    const messages = agent.messages();
+    try std.testing.expectEqual(total, messages.len);
+    try std.testing.expectEqualStrings("m0", messages[0].text());
+    try std.testing.expectEqualStrings("m199", messages[total - 1].text());
+    try std.testing.expectEqual(@as(u32, 0), agent.message_queue.len());
+}
+
 const BudgetSeen = struct {
     events: std.ArrayList(Agent.Event) = .empty,
 
@@ -2244,6 +2370,68 @@ test "run retries once when the provider truncates tool-call arguments (scripted
     }
     try std.testing.expect(hint_found);
     try std.testing.expectEqualStrings("done after retry", messages[messages.len - 1].text());
+}
+
+test "run executes a synced MCP tool through the registry (scripted, socket-free)" {
+    // Worker-MCP regression (PRIORITY_ACTIONS HIGH #2): a contained agent —
+    // the lane-worker shape — dispatches an MCP tool end-to-end through the
+    // shared registry. The fake client's zeroed child makes the transport
+    // fail, so the history tool result must be the MCP bridge's failure
+    // ("MCP tool 'search' failed") and NEVER "unknown tool" (the registry
+    // lookup miss this test guards against).
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const mcp_client_mod = @import("mcp/client.zig");
+
+    var manager = mcp_mod.McpManager.init(gpa);
+    defer manager.deinit(io);
+    {
+        // Heap-allocated (not &.{}): McpTool.deinit frees the property strings
+        // and reads the array when the manager is torn down.
+        const props = try gpa.alloc(tools.Schema.Property, 1);
+        props[0] = .{
+            .name = try gpa.dupe(u8, "query"),
+            .kind = .string,
+            .description = try gpa.dupe(u8, "Query text"),
+            .required = true,
+        };
+        var client = try mcp_client_mod.McpClient.init(gpa, "test", "echo", &.{}, null);
+        client.lifecycle = .{ .stdio = .{ .process = mcp_client_mod.zeroedChild(), .status = .ready } };
+        try client.addTool("search", "Search the index", .{ .properties = props });
+        try manager.clients.append(gpa, client);
+    }
+    var reg = try tools.ToolRegistry.init(gpa, tools.builtinRegistry());
+    defer reg.deinit(gpa);
+    try reg.syncMcpTools(gpa, &manager);
+
+    var client = try ai.scripted_client.Client.init(gpa, io, "scripted-model");
+    defer client.deinit();
+    try client.enqueue(.{
+        ai.scripted_client.step.toolCall("mcp__test__search", "{\"query\":\"x\"}"),
+        ai.scripted_client.step.text("done", .stop),
+    });
+
+    var agent = Agent.init(gpa, io, ".", .{ .scripted = &client });
+    defer agent.deinit();
+    agent.tool_registry = &reg;
+    agent.mcp_manager = &manager;
+    agent.contained = true;
+    try agent.addUser("search for x");
+
+    var seen: BudgetSeen = .{};
+    defer seen.deinit(gpa);
+    try agent.run(Agent.Listener(BudgetSeen){ .ctx = &seen, .on_event = BudgetSeen.onEvent });
+
+    // Two prompts: the tool-call turn and the closing text turn. A third
+    // would exhaust the script.
+    try std.testing.expectEqual(@as(u32, 2), client.prompts_answered);
+    var tool_result: ?[]const u8 = null;
+    for (agent.messages()) |m| {
+        if (m.role() == .tool) tool_result = m.text();
+    }
+    try std.testing.expect(tool_result != null);
+    try std.testing.expect(std.mem.indexOf(u8, tool_result.?, "unknown tool") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tool_result.?, "MCP tool 'search' failed") != null);
 }
 
 test "run ends the turn when tool-call arguments truncate on the retry too" {
