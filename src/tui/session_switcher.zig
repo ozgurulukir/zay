@@ -110,7 +110,7 @@ pub fn openResumePicker(app: *App) !void {
     defer if (filter.len > 0) app.gpa.free(filter);
     _ = resume_picker.visibleCount(app.io, summaries, filter, app.resume_folded_projects.items, app.nav.resume_group_by);
     app.nav.resume_selection = 0;
-    app.nav.block_nav = false;
+    app.clearBlockNav();
     app.mode = .session_picker;
     app.inputs.palette.clearRetainingCapacity();
     if (filter.len > 0) try app.inputs.palette.insertSliceAtCursor(filter);
@@ -506,6 +506,11 @@ fn createRuntimeImpl(app: *App, cwd: []const u8, session_dir: []const u8, sessio
             log.warn("session.plugin.repointProjectDir_failed err={s}", .{@errorName(err)});
         };
         provider_model.registerPluginTools(app);
+        // The registry (plugin + mcp__ records) now describes the NEW project;
+        // background lanes' clients still serialize the OLD project's tools.
+        // Push the merged list into every live, turn-free lane client (the
+        // anyLaneTurnActive refusal above guarantees none is mid-turn).
+        provider_model.refreshAllLaneTools(app);
     }
 
     runtime.agent.background_manager = app.background;
@@ -811,4 +816,125 @@ test "same-project createRuntime guard does not fire" {
     // Since cross_project is false, the guard (cross_project and anyLaneTurnActive)
     // is short-circuited to false regardless of the turn state.
     try std.testing.expect(!(cross_project and lane_lifecycle.anyLaneTurnActive(&app)));
+}
+
+test "refreshAllLaneTools pushes synced MCP and plugin tools into a non-viewed lane's tools_json" {
+    // Regression for the stale tools_json limitation (PRIORITY_ACTIONS HIGH
+    // #3): after a cross-project switch the registry describes the NEW
+    // project, and refreshAllLaneTools must push it into background lanes'
+    // clients — not just the focused one.
+    const mcp_client_mod = @import("../mcp/client.zig");
+    const tools_mod = @import("../tools.zig");
+
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_abs = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_abs);
+
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // A NON-viewed live lane with a REAL (fully-initialized) runtime: only a
+    // complete `initNew` runtime can attach a client — a partially-built
+    // fixture leaves `mcp_tools`/`context_settings` undefined and the
+    // client's tools serialization crashes. The App owns the heap Thread and
+    // (owns = true) the runtime — teardown is `app.deinit` alone.
+    const lane_runtime = try gpa.create(runtime_mod.AgentRuntime);
+    try lane_runtime.initNew(.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .cwd = home_abs,
+        .session_dir = home_abs,
+        .home_dir = home_abs,
+        .base_system_prompt = "test system prompt",
+        .config = .{
+            .model_selection = .{
+                .builtin = .{
+                    .provider = .ollama,
+                    .provider_name = @constCast("ollama"),
+                    .model = .{ .id = @constCast("test-model") },
+                },
+            },
+        },
+        .diagnostics = &.{},
+    });
+    const lane = try gpa.create(tui.Thread);
+    lane.* = .{
+        .agent = &lane_runtime.agent,
+        .worker_context = .{ .io = std.testing.io, .gpa = lane_runtime.gpa },
+        .engine = .{ .live = .{ .lane = .primary, .runtime = lane_runtime, .owns = true } },
+    };
+    try lane.engine.live.runtime.attachOpenAiCompatibleClient("https://example.invalid", "test-key", "test-model", .default, &.{});
+    // The shared-registry wiring createRuntimeImpl does before its
+    // `injectToolsInto` — without it `syncToolJson` falls back to the static
+    // builtin list and the merged push below would be a no-op.
+    lane.engine.live.runtime.agent.tool_registry = app.tool_registry;
+    lane.engine.live.runtime.agent.mcp_manager = &app.mcp_manager;
+    try app.threads.append(lane);
+
+    // Fake CONNECTED stdio MCP client (executor.zig's addTestMcpSearchTool
+    // shape) plus a plugin tool, so the merged-list assertion is meaningful.
+    const props = try gpa.alloc(tools_mod.Schema.Property, 1);
+    props[0] = .{
+        .name = try gpa.dupe(u8, "query"),
+        .kind = .string,
+        .description = try gpa.dupe(u8, "Query text"),
+        .required = true,
+    };
+    var mcp_client = try mcp_client_mod.McpClient.init(gpa, "test", "echo", &.{}, null);
+    mcp_client.lifecycle = .{ .stdio = .{ .process = mcp_client_mod.zeroedChild(), .status = .ready } };
+    try mcp_client.addTool("search", "Search the index", .{ .properties = props });
+    try app.mcp_manager.clients.append(gpa, mcp_client);
+
+    const plugin_name = try gpa.dupe(u8, "lua__p__t");
+    const plugin_desc = try gpa.dupe(u8, "plugin tool");
+    try app.tool_registry.addPluginTool(gpa, .{
+        .name = plugin_name,
+        .description = plugin_desc,
+        .schema = .{ .properties = &.{} },
+        .run = struct {
+            fn run(gpa_: std.mem.Allocator, io_: std.Io, cwd_: []const u8, args_: []const u8, env_: tools_mod.Env) tools_mod.Error!tools_mod.Output {
+                _ = io_;
+                _ = cwd_;
+                _ = args_;
+                _ = env_;
+                const stdout = try gpa_.dupe(u8, "ok");
+                const stderr = try gpa_.alloc(u8, 0);
+                return .{ .stdout = stdout, .stderr = stderr, .code = 0 };
+            }
+        }.run,
+        .display = struct {
+            fn display(gpa_: std.mem.Allocator, args_: []const u8, env_: tools_mod.Env) std.mem.Allocator.Error!tools_mod.ToolDisplay {
+                _ = args_;
+                _ = env_;
+                return .{ .label = try gpa_.dupe(u8, "dummy") };
+            }
+        }.display,
+        .userdata = undefined,
+        .userdata_free = struct {
+            fn free(gpa_: std.mem.Allocator, ud: *anyopaque) void {
+                _ = gpa_;
+                _ = ud;
+            }
+        }.free,
+    });
+
+    provider_model.refreshAllLaneTools(&app);
+
+    // The registry carries the MCP record and the lane's client — the
+    // non-viewed one — now serializes BOTH sources. `owned_client` is
+    // file-private in runtime.zig, so read it through an anonymous switch.
+    try std.testing.expect(app.tool_registry.lookup("mcp__test__search") != null);
+    switch (lane.engine.live.runtime.owned_client.?) {
+        .openai_compatible => |client| {
+            try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "mcp__test__search") != null);
+            try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "lua__p__t") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }

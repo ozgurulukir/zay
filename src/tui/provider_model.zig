@@ -1799,19 +1799,12 @@ pub fn retryPendingMcpSync(self: *App) bool {
     return true;
 }
 
-/// Push the merged tool list (registry builtin + plugin tools + connected
-/// MCP schemas) into `runtime`'s attached client. `syncToolJson` replaces
-/// the entire `tools_json`, so one call covers every source. Besides the
-/// live-runtime callers (`injectAllTools`), `createRuntime` uses this for
-/// freshly-created runtimes (session switch, resume, lane spawn): those
-/// attach their client via `applyFromConfig` before the App can inject
-/// anything, so they need one explicit push once their `tool_registry` is
-/// wired — otherwise the session runs tool-less.
 /// Push the merged tool list (registry builtin + plugin + MCP records) into
-/// `runtime`'s attached client via `AgentRuntime.syncToolJson`. Besides the
-/// live-runtime callers (`injectAllTools`), `createRuntime` uses this for
-/// freshly-created runtimes (session switch, resume, lane spawn): those
-/// attach their client via `applyFromConfig` before the App can inject
+/// `runtime`'s attached client via `AgentRuntime.syncToolJson`. `syncToolJson`
+/// replaces the entire `tools_json`, so one call covers every source.
+/// Besides the live-runtime callers (`injectAllTools`), `createRuntime` uses
+/// this for freshly-created runtimes (session switch, resume, lane spawn):
+/// those attach their client via `applyFromConfig` before the App can inject
 /// anything, so they need one explicit push once their `tool_registry` is
 /// wired — otherwise the session runs tool-less.
 pub fn injectToolsInto(self: *App, runtime: *runtime_mod.AgentRuntime) void {
@@ -1819,6 +1812,40 @@ pub fn injectToolsInto(self: *App, runtime: *runtime_mod.AgentRuntime) void {
     runtime.syncToolJson() catch |err| {
         log.warn("injectToolsInto: syncToolJson failed: {s}", .{@errorName(err)});
     };
+}
+
+/// Re-sync the shared registry's MCP records and push the merged tool list
+/// into every live lane client — not just the focused one. Today the only
+/// caller is the guarded cross-project `/resume` (`createRuntimeImpl`): the
+/// config reload swapped the MCP server set and `registerPluginTools` swapped
+/// the plugin set, but background lanes' clients still carry the PREVIOUS
+/// project's serialized `tools_json` until their next rebuild (which, without
+/// this, is never — the tick-driven paths all target the viewed runtime).
+/// The `anyLaneTurnActive` check is belt-and-braces (`createRuntimeImpl`
+/// already refuses under it), not the primary gate. Lanes mid-turn or mid-
+/// cancel are skipped per-lane: `updateTools` replaces the client's
+/// `tools_json` buffer and must not race a worker serializing a prompt.
+pub fn refreshAllLaneTools(self: *App) void {
+    if (lane_state_mod.anyLaneTurnActive(self)) {
+        log.warn("refreshAllLaneTools: skipped, a lane turn is active", .{});
+        return;
+    }
+    self.tool_registry.syncMcpTools(self.gpa, &self.mcp_manager) catch |err| {
+        log.warn("refreshAllLaneTools: syncMcpTools failed: {s}", .{@errorName(err)});
+    };
+    for (self.threads.slice(), 0..) |lane, lane_index| {
+        if (lane.turn.isActive() or lane.cancel_job != null) {
+            // Say so: a skipped lane keeps the previous project's tool set
+            // until the next rebuild, and the outer gate above does not
+            // cover `cancel_job` (anyLaneTurnActive only checks turn state).
+            log.warn("refreshAllLaneTools: lane {d} skipped (turn active or cancelling); its tools_json stays stale", .{lane_index});
+            continue;
+        }
+        const runtime = lane.liveRuntime() orelse continue;
+        runtime.syncToolJson() catch |err| {
+            log.warn("refreshAllLaneTools: lane {d} syncToolJson failed: {s}", .{ lane_index, @errorName(err) });
+        };
+    }
 }
 
 /// Walk every loaded Lua plugin, materialize a `Tool` for each registered
