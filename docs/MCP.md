@@ -173,6 +173,16 @@ and re-injects the serialized tools whenever the MCP tool set changes:
   App's `tool_registry` onto the new runtime, `provider_model.injectToolsInto`
   pushes the merged builtin + plugin + MCP list so the new session's first turn
   carries every tool definition.
+- **On a cross-project resume**, `provider_model.refreshAllLaneTools` additionally
+  re-syncs the registry's MCP records and pushes the merged list into EVERY live,
+  turn-free lane client — background lanes used to keep the previous project's
+  tool set until respawn (2026-09-24).
+
+Remaining timing limitation: these rebuilds are snapshots. Servers still connecting
+at switch time contribute tools only via the later MCP tick, and mid-session MCP/plugin
+changes reach only newly-created or live-viewed clients — a background lane's
+`tools_json` reflects the moment its client was last pushed. A stale-advertised tool
+degrades in-band (`MCP server not found` / a failed tool result), never dangles.
 
 `buildMcpToolSchemas()` collects all discovered tools from `.connected` servers and
 `updateTools()` rebuilds the client's serialized tool list in place (driven by
