@@ -1732,7 +1732,7 @@ pub fn attachOpenAiCompatibleClient(
     // cached_config still describes the previous live provider until the new
     // client has attached successfully and the selection is persisted.
     const user_headers = self.cached_config.providerHeadersByName(conn.auth_key_id);
-    try runtime.attachOpenAiCompatibleClient(conn.base_url, api_key, model_id, effort, user_headers);
+    try runtime.attachOpenAiCompatibleClient(conn.auth_key_id, conn.base_url, api_key, model_id, effort, user_headers);
     self.thread.agent.?.client = runtime.client;
     injectPluginTools(self);
     // See connectCodexClient — without this, plugin tools sit in the
