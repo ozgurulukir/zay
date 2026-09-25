@@ -29,12 +29,12 @@ pub fn modelStatus(runtime: ?*const runtime_mod.AgentRuntime, config: config_mod
                     .reasoning = effortLabel(if (client.core_client.config.reasoning) |r| r.effort else null),
                 },
                 .responses => |client| return .{
-                    .provider = connectedProviderName(client.config, config),
+                    .provider = connectedProviderName(client.config, config, "openai"),
                     .model = client.config.model,
                     .reasoning = effortLabel(if (client.config.reasoning) |r| r.effort else null),
                 },
                 .openai_compatible => |client| return .{
-                    .provider = connectedProviderName(client.config, config),
+                    .provider = connectedProviderName(client.config, config, "openai_compatible"),
                     .model = client.config.model,
                     .reasoning = effortLabel(if (client.config.reasoning) |r| r.effort else null),
                 },
@@ -130,9 +130,13 @@ pub fn modifiedTime(io: std.Io, buffer: []u8, updated_at_ms: i64) []const u8 {
 /// `cached_config`, which lags the live connection after a session resume
 /// (resume restores from the session DB, not cached_config). An empty key
 /// means attach recorded none, so fall back to the config-derived name.
-fn connectedProviderName(client_config: ai.Config, config: config_mod.Config) []const u8 {
+fn connectedProviderName(
+    client_config: ai.Config,
+    config: config_mod.Config,
+    fallback: []const u8,
+) []const u8 {
     if (client_config.provider_name.len > 0) return client_config.provider_name;
-    return providerDisplayName(config) orelse "openai_compatible";
+    return providerDisplayName(config) orelse fallback;
 }
 fn providerLabel(config: config_mod.Config) ?[]const u8 {
     if (config.model_selection) |ms| return ms.provider().label();
@@ -262,6 +266,19 @@ test "model status connected runtime reports its actual provider over stale cach
     try std.testing.expectEqualStrings("green-provider", status.provider);
     try std.testing.expectEqualStrings("green-model", status.model);
 }
+
+test "connected provider name preserves adapter fallback labels" {
+    const client_config: ai.Config = .{
+        .base_url = "",
+        .api_key = "",
+        .model = "model",
+    };
+    const config: config_mod.Config = .{};
+
+    try std.testing.expectEqualStrings("openai", connectedProviderName(client_config, config, "openai"));
+    try std.testing.expectEqualStrings("openai_compatible", connectedProviderName(client_config, config, "openai_compatible"));
+}
+
 test "effortLabel defaults unset to medium" {
     try std.testing.expectEqualStrings("medium", effortLabel(null));
     try std.testing.expectEqualStrings("high", effortLabel(.high));
