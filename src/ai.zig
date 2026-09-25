@@ -167,10 +167,10 @@ pub const default_system_prompt: []const u8 = "You are a helpful assistant.";
 
 pub const Config = struct {
     /// Provider key (auth-key id for openai_compatible, config key for a
-    /// builtin) of the connection this config describes. Borrowed into the
-    /// same lifetime as `base_url`/`model`; a display hint only, so the TUI
-    /// can show the ACTUAL provider of a live connection after a resume
-    /// (when cached_config lags). Empty means "derive from config".
+    /// builtin) of the connection this config describes. Borrowed through
+    /// client initialization; clients that retain the config copy it. This
+    /// display hint lets the TUI show the actual provider after resume, when
+    /// cached_config may lag. Empty means "derive from config".
     provider_name: []const u8 = "",
     base_url: []const u8,
     api_key: []const u8,

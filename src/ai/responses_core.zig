@@ -104,6 +104,8 @@ pub const Client = struct {
         // Blank it like base_url/api_key so no future read dangles after the
         // attach frame (which owns the specs) returns.
         owned_config.headers = &.{};
+        owned_config.provider_name = try gpa.dupe(u8, config.provider_name);
+        errdefer gpa.free(owned_config.provider_name);
         owned_config.model = try gpa.dupe(u8, config.model);
         errdefer gpa.free(owned_config.model);
         owned_config.account_id = try gpa.dupe(u8, config.account_id);
@@ -153,6 +155,7 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         self.transport.deinit();
+        self.gpa.free(self.config.provider_name);
         self.gpa.free(self.config.model);
         self.gpa.free(self.config.account_id);
         self.gpa.free(self.config.session_id);
