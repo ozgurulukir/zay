@@ -202,6 +202,7 @@ fn dispatchLaneOp(app: *App, req: *const lane_bridge.Request, requester_lane: ?*
         .leave => leaveLane(app),
         .merge => mergeLaneOp(app, req),
         .spawn => spawnLane(app, req, requester_lane),
+        .@"resume" => resumeLaneOp(app, req, requester_lane),
         .read => readLaneOp(app, req),
         .cancel => cancelLaneOp(app, req),
         .await => awaitLaneOp(app, req),
@@ -329,10 +330,11 @@ fn listLanes(app: *App) ?Resp {
         } else {
             const id = laneIdOf(lane) orelse "";
             const branch = if (lanes_util.workingLaneOf(lane)) |wl| wl.branch else "(primary)";
+            const session_state = if (lane.id != null) "linked" else "new";
             // Keep the model-facing identifier explicit. The old numeric
             // position (`[1]`) looked like a usable lane id, but resolution
             // accepts only the hex worktree id.
-            out.writer.print("  worker lane={s} title={s} branch={s} status={s}{s}{s}\n", .{ id, title, branch, status, active_marker, ws_marker }) catch return failResp(gpa, "lane: out of memory\n", .{});
+            out.writer.print("  worker lane={s} title={s} branch={s} session={s} status={s}{s}{s}\n", .{ id, title, branch, session_state, status, active_marker, ws_marker }) catch return failResp(gpa, "lane: out of memory\n", .{});
         }
     }
     if (driver_ws) |ws| {
@@ -894,6 +896,41 @@ fn readLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     // eventual completion delivery.
     if (target.turn.state == .idle) target.acknowledged = true;
     return resp(app.gpa, "Lane {s} ({s}): {s}\n", .{ id, status, tail }, id, null);
+}
+
+/// Resume an idle worker's linked session without loading its history into the driver.
+fn resumeLaneOp(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Thread) ?Resp {
+    const id = req.lane orelse return failResp(app.gpa, "lane: resume needs a `lane` field — the hex id shown by `lane list`\n", .{});
+    const task = req.task orelse return failResp(app.gpa, "lane: resume needs a `task` describing the continuation\n", .{});
+    if (isPrimaryId(id)) return failResp(app.gpa, "lane: [0] is the primary driver lane — resume is for worker lanes.\n", .{});
+    const target = resolveLane(app, id) orelse return failUnknownWorkerLane(app, id);
+    if (target.engine != .idle) return failResp(app.gpa, "lane: lane {s} is already running — resume requires an idle lane\n", .{id});
+    if (target.turn.isActive()) return failResp(app.gpa, "lane: lane {s} is still shutting down — wait before resuming\n", .{id});
+    const session_id = if (target.id) |*sid| sid.slice() else return failResp(app.gpa, "lane: lane {s} has no linked session to resume; use spawn for a fresh task\n", .{id});
+    const spawner = requester_lane orelse return failResp(app.gpa, "lane: no spawner lane\n", .{});
+    const context = captureLaneContext(app, spawner, tui.lane_naming_context_max) catch @as([][]u8, &.{});
+    const repo = app.repoRoot() orelse {
+        freeLaneContext(app.gpa, context);
+        return failResp(app.gpa, "lane: no active runtime\n", .{});
+    };
+    wakeIdleLane(app, target, repo, context, session_id) catch |err| {
+        freeLaneContext(app.gpa, context);
+        return failResp(app.gpa, "lane: resume failed: {s}\n", .{@errorName(err)});
+    };
+    target.spawned_by_generation = spawner.generation;
+    const working = lanes_util.workingLaneOf(target).?;
+    const framed = workerPrompt(app.gpa, id, working.branch, working.path, repo, task) catch {
+        target.spawned_by_generation = null;
+        parkFinishedWorker(app, target);
+        return failResp(app.gpa, "lane: out of memory\n", .{});
+    };
+    defer app.gpa.free(framed);
+    startTurnForLane(app, target, framed, task) catch |err| {
+        target.spawned_by_generation = null;
+        parkFinishedWorker(app, target);
+        return failResp(app.gpa, "lane: worker resume failed: {s}\n", .{@errorName(err)});
+    };
+    return resp(app.gpa, "Resumed worker lane {s} in its existing session (branch {s}, path {s}). Its history stays in the worker context; the driver receives only the completion result.\n", .{ id, working.branch, working.path }, id, working.path);
 }
 
 /// Tail of a lane's transcript (last `max` user/agent bodies, oldest first).
