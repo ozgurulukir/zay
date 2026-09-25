@@ -33,7 +33,7 @@ When configured, Zay also exposes tools from Lua plugins as `lua__<plugin>__<too
 
 `bash` has some middleware written for it that makes it friendlier for agent use. For example, large outputs from a `cat` command are written to a temp file and the agent is told the full is in that file if needed. See [Shell Safety & Auto-Review](#shell-safety--auto-review) below.
 
-`lane` gives the model first-class access to Zay's parallel-lane substrate: isolated git worktrees the TUI tiles side-by-side. It is a *bridge* tool — the tool runs on the lane's worker thread, so every action is posted across a `LaneBridge` (`src/tools/lane_bridge.zig`) and resolved by the UI on its tick. The model-facing surface is orchestration-only: `list`, `spawn`, `read`, `await`, `steer`, `cancel`, `merge`, and `delete`.
+`lane` gives the model first-class access to Zay's parallel-lane substrate: isolated git worktrees the TUI tiles side-by-side. It is a *bridge* tool — the tool runs on the lane's worker thread, so every action is posted across a `LaneBridge` (`src/tools/lane_bridge.zig`) and resolved by the UI on its tick. The model-facing surface is orchestration-only: `list`, `spawn`, `resume`, `read`, `await`, `steer`, `cancel`, `merge`, and `delete`.
 
 The primary driver remains rooted in the repository and supervises independent
 worker agents. Workers run concurrently on their own threads; completion is
