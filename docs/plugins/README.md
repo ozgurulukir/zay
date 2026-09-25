@@ -1,7 +1,7 @@
 # Zay Plugin Development Guide
 
 Zay supports extending its capabilities through Lua plugins. Plugins can register
-custom tools, subscribe to lifecycle events, access the filesystem, run shell commands,
+custom tools, subscribe to tool-call events, access the filesystem, run shell commands,
 interact with git, and store persistent state.
 
 ## Quick Start
@@ -174,7 +174,7 @@ matches every `.zig` file at any depth. gitignore is NOT honored.
 | Function | Parameters | Returns | Description |
 |----------|-----------|---------|-------------|
 | `zay.register_tool(spec)` | `spec.name`, `spec.description`, `spec.parameters`, `spec.handler` | `true` | Register a tool |
-| `zay.on(event, callback)` | `event`, `callback` | `true` | Subscribe to a lifecycle event |
+| `zay.on(event, callback)` | `event`, `callback` | `true` | Register a callback; only tool-call events currently fire |
 | `zay.require(mod_path)` | module path relative to the plugin dir | module table | Load another Lua module from the plugin directory (cached; circular requires safe) |
 | `zay.think(prompt)` | `prompt` | _(stub)_ | Recursive LLM call (not yet implemented) |
 
@@ -192,12 +192,11 @@ key shape — a table with non-integer or sparse keys serializes as an object.
 
 ### Events
 
-`zay.on(event_name, callback)` subscribes to a lifecycle event. The callback
+`zay.on(event_name, callback)` registers a callback for an event. The callback
 receives a `data` table whose shape depends on the event. Events are emitted by
 the agent loop at tool-call boundaries and delivered to every active plugin.
 Only `tool_call_started` and `tool_call_finished` are currently emitted in
-production; the other five are subscribable but not currently emitted (kept
-for forward compatibility).
+production; the other five accepted event names do not currently fire.
 
 | Event | `data` shape | When it fires |
 |-------|--------------|---------------|
