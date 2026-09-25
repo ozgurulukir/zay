@@ -160,8 +160,8 @@ See the **[Safety & Classifier Guide](docs/wiki/SAFETY_CLASSIFIER.md)** for Dock
 - **Windows:** Daily-driver ready. Release CI builds `zay-windows-x86_64.exe` natively on Windows
   runners; PowerShell 7 (`pwsh`) is the shell tool, and the TUI, parallel worktree lanes,
   background jobs (Win32 Job Objects), SQLite persistence, and bounded MCP stdio/HTTP/SSE
-  deadlines all run natively. Remaining hardening is tracked in [#32](https://github.com/ozgurulukir/zay/issues/32)
-  (deferred Windows test variants).
+  deadlines all run natively. The deferred Windows test variants tracked in [#32](https://github.com/ozgurulukir/zay/issues/32)
+  are now enabled and covered by the Windows test suite.
 
 ---
 
