@@ -227,25 +227,12 @@ compiled into the shipped binary, so their licenses are listed here.
 ### vaxis (TUI framework)
 
 - **Source:** <https://github.com/rockorager/libvaxis>
-- **Version:** 0.6.0 @ `f37c42a`
+- **Version:** 0.6.0 @ `173a890`
 - **License:** MIT — Copyright (c) 2023 Tim Culverhouse
 - **Used for:** the terminal user interface (widget tree, event loop,
   drawing).
 
-#### Local modifications
-
-Two guards (marked `ZAY-LOCAL-PATCH`) in `zig-pkg/vaxis-<hash>/src/vxfw/App.zig`
-fix an upstream focus-handler crash (SIGSEGV in ReleaseFast) when
-`path_to_focused` is empty during session switch:
-
-1. `FocusHandler.update` — falls back to `self.root` when the focus path is
-   empty.
-2. `FocusHandler.handleEvent` — returns early instead of asserting
-   `path.len > 0`.
-
-The vendor directory is gitignored, so the patch must be re-applied after
-every `zig build --fetch` / vaxis bump. Remove both once the upstream fix
-lands past the pinned commit.
+No local modifications.
 
 ### uucode (Unicode tables)
 

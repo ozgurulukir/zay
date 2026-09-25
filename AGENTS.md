@@ -1,5 +1,11 @@
 # Zay Guidelines
 
+## libvaxis upstream fixes
+
+The vaxis pin in `build.zig.zon` includes the upstream fixes for issues #366,
+#367, and #368. The former local vaxis patch helpers and patch files have been
+removed; do not recreate or apply them after `zig build --fetch`.
+
 This project uses Zig 0.16. Consult the tigerstyle skill before writing code.
 
 - `vendor/fzy/` is a vendored copy of the fzy fuzzy matcher (MIT) — compiled directly into the binary via `build.zig`; no separate build step required.

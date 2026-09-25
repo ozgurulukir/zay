@@ -79,11 +79,7 @@ The scripts automatically download the platform binary, verify the SHA256 checks
   `ziglang.org/download/0.16.0/` (the `mlugg/setup-zig` action 404s on 0.16.0)
   and builds with `shell: bash` + a `VERSION` env var (PowerShell mangles dotted
   versions).
-- Before building, the workflow follows the [source-build patch
-  procedure](BUILDING.md#apply-the-pinned-vaxis-patches): it runs
-  `bash tools/apply-vaxis-patches.sh`, which reads
-  `tools/vendor-patches/manifest.txt` and verifies every `ZAY-LOCAL-PATCH`
-  guard before compiling. A local release reproduction must follow the same
-  procedure.
+- Before building, the workflow fetches the pinned libvaxis revision, which
+  already contains the upstream fixes previously carried as local patches.
 - Release notes are auto-generated from merged PRs
   (`generate_release_notes: true`).

@@ -84,16 +84,13 @@ irm https://raw.githubusercontent.com/ozgurulukir/zay/main/install.ps1 | iex
 ### 2. Build from Source
 
 Follow the [Building from source guide](docs/BUILDING.md). It covers the
-first dependency fetch and the two pinned vaxis patches required before the
-build can proceed.
+first dependency fetch and the normal build/test/install commands.
 
 ```bash
 # Linux / macOS
 git clone https://github.com/ozgurulukir/zay.git
 cd zay
 zig build --fetch
-# Apply the pinned vaxis patches when the build reports missing guards:
-#   bash tools/apply-vaxis-patches.sh (see docs/BUILDING.md)
 zig build install -Doptimize=ReleaseFast --prefix $HOME/.local
 zay --version
 ```
@@ -105,7 +102,6 @@ commands:
 git clone https://github.com/ozgurulukir/zay.git
 Set-Location zay
 zig build --fetch
-.\tools\apply-vaxis-patches.ps1
 zig build install -Doptimize=ReleaseFast --prefix "$HOME/.local"
 zay --version
 ```

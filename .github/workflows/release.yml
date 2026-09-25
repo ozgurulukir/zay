@@ -90,18 +90,10 @@ jobs:
           fi
           printf '%s\n' "$ZIG_DIR" >> "$GITHUB_PATH"
 
-      - name: Apply vaxis ZAY-LOCAL-PATCH (manifest-driven)
+      - name: Fetch dependencies
         shell: bash
         run: |
-          # Fresh CI checkouts fetch a PRISTINE vaxis; the configure-time gate
-          # in build.zig fails the first invocation on purpose (an unpatched
-          # binary SIGSEGVs on session switch and silently kills all keyboard
-          # input on Windows — see AGENTS.md "vxfw FocusHandler crash" /
-          # "vxfw Windows input-thread death"). Tolerate that first failure,
-          # apply via the manifest-driven helper, and let the build step run
-          # against the guarded copy.
-          zig build --fetch ${{ matrix.target_arg }} || true
-          bash tools/apply-vaxis-patches.sh
+          zig build --fetch ${{ matrix.target_arg }}
 
       - name: Build (ReleaseFast)
         shell: bash
