@@ -22,6 +22,7 @@ pub const Op = enum {
     leave,
     merge,
     spawn,
+    @"resume",
     read,
     cancel,
     await,

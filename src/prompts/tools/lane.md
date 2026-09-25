@@ -9,8 +9,9 @@ needs:
 
 | command | required args | what it does |
 |---|---|---|
-| `list` | — | every open lane (lane id, title, branch, status, activity), your workspace root, and parked lanes |
+| `list` | — | every open lane (lane id, title, branch, session availability, status, activity), your workspace root, and parked lanes |
 | `spawn` | `task`, optionally `lane` | start an independent worker in a fresh lane, or reuse an existing idle lane |
+| `resume` | `lane`, `task` | continue an idle worker's existing session with a new instruction; the driver receives only the completion result |
 | `read` | `lane` | snapshot a worker lane's conversation tail and live activity |
 | `await` | `lane` | wait for a worker to finish or report a bounded stall |
 | `steer` | `lane`, `steer` | inject a short instruction into a running worker |
@@ -33,6 +34,9 @@ Keep small or tightly coupled work that shares files local.
 2. Call `lane spawn` with a self-contained task. Include exact paths, the
    expected implementation, tests, and constraints; the worker starts with
    fresh context.
+   To continue an idle worker's prior conversation, call `lane resume` with
+   its lane id and the next task. Its session history remains in that worker's
+   context; do not copy the full transcript into the driver prompt.
 3. Continue independent work while the worker runs. Use `lane read` for
    progress and `lane steer` when its task needs clarification.
 4. Results arrive as messages: when a worker finishes you are woken with a

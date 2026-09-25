@@ -20,8 +20,8 @@ const lane_bridge = @import("lane_bridge.zig");
 /// to a worker would defeat the thread-safety the lane split exists for.
 /// `internal_commands` still lists them for the UI-side lifecycle
 /// (`lane_lifecycle`) and tests.
-const model_commands = [_][]const u8{ "list", "spawn", "read", "await", "steer", "cancel", "merge", "delete" };
-const internal_commands = [_][]const u8{ "list", "create", "enter", "leave", "merge", "spawn", "read", "cancel", "await", "steer", "delete" };
+const model_commands = [_][]const u8{ "list", "spawn", "resume", "read", "await", "steer", "cancel", "merge", "delete" };
+const internal_commands = [_][]const u8{ "list", "create", "enter", "leave", "merge", "spawn", "resume", "read", "cancel", "await", "steer", "delete" };
 
 comptime {
     for (model_commands) |command| {
@@ -43,7 +43,7 @@ pub const tool: common.Tool = .{
             .{
                 .name = "command",
                 .kind = .string,
-                .description = "The worker-lane operation to perform. Always required — one of: list, spawn, read, await, steer, cancel, merge, delete.",
+                .description = "The worker-lane operation to perform. Always required — one of: list, spawn, resume, read, await, steer, cancel, merge, delete.",
                 .required = true,
                 .enum_values = &model_commands,
             },
@@ -57,14 +57,14 @@ pub const tool: common.Tool = .{
             .{
                 .name = "task",
                 .kind = .string,
-                .description = "The worker agent's first prompt. Required for `spawn`; unused otherwise. Make it self-contained — the worker starts with fresh context.",
+                .description = "Worker task prompt. Required for `spawn` and `resume`. `spawn` starts fresh context; `resume` continues the lane's existing session.",
                 .required = false,
                 .nullable = true,
             },
             .{
                 .name = "lane",
                 .kind = .string,
-                .description = "Lane id (the hex id shown by `lane list`). Required for `merge`, `read`, `cancel`, `await`, `steer`, and `delete`; optional for `spawn` (targets an existing idle lane to reuse its worktree — omit to create a fresh one). Unused for `list`.",
+                .description = "Lane id (the hex id shown by `lane list`). Required for `resume`, `merge`, `read`, `cancel`, `await`, `steer`, and `delete`; optional for `spawn` (targets an existing idle lane to reuse its worktree — omit to create a fresh one). Unused for `list`.",
                 .required = false,
                 .nullable = true,
             },
@@ -78,6 +78,7 @@ pub const tool: common.Tool = .{
         },
         .requirements = &.{
             .{ .when_property = "command", .equals = "spawn", .required_properties = &.{"task"} },
+            .{ .when_property = "command", .equals = "resume", .required_properties = &.{ "lane", "task" } },
             .{ .when_property = "command", .equals = "read", .required_properties = &.{"lane"} },
             .{ .when_property = "command", .equals = "await", .required_properties = &.{"lane"} },
             .{ .when_property = "command", .equals = "steer", .required_properties = &.{ "lane", "steer" } },

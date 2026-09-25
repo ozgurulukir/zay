@@ -317,6 +317,13 @@ fn spawnTurn(app: *App, lane: *Thread, opts: SpawnOpts) !void {
     lane.worker_context.?.pending_prompt.freeStale(lane.worker_context.?.gpa);
     lane.turn_view.awaitModel();
     lane.turn.submit();
+    // `concurrent` may fail after the UI turn has been submitted. Roll the
+    // state back so callers can safely park the lane instead of leaving an
+    // active turn with no worker future to converge it.
+    errdefer {
+        lane.turn.reset();
+        lane.turn_view.reset(app.getIo());
+    }
     if (opts.prompt) |prompt| lane.worker_context.?.pending_prompt.set(prompt);
     // Drop the slot's claim WITHOUT freeing on spawn failure: the bytes are
     // still the caller's, and its errdefer frees them exactly once.
