@@ -2054,6 +2054,7 @@ test "mergeAndWriteGlobal scopes add-server persistence so project-scoped server
     try std.testing.expectEqual(@as(usize, 1), merged.mcp_servers.len);
     try std.testing.expectEqualStrings("regression-global-server", merged.mcp_servers[0].name);
 }
+
 test "resolveProviderKey resolves typed, saved, and blank-required keys" {
     // A trimmed typed key wins.
     try std.testing.expectEqualStrings("sk-abc", resolveProviderKey("  sk-abc  ", null, true).?);
