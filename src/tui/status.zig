@@ -29,12 +29,12 @@ pub fn modelStatus(runtime: ?*const runtime_mod.AgentRuntime, config: config_mod
                     .reasoning = effortLabel(if (client.core_client.config.reasoning) |r| r.effort else null),
                 },
                 .responses => |client| return .{
-                    .provider = providerLabel(config) orelse "openai",
+                    .provider = connectedProviderName(client.config, config),
                     .model = client.config.model,
                     .reasoning = effortLabel(if (client.config.reasoning) |r| r.effort else null),
                 },
                 .openai_compatible => |client| return .{
-                    .provider = providerDisplayName(config) orelse "openai_compatible",
+                    .provider = connectedProviderName(client.config, config),
                     .model = client.config.model,
                     .reasoning = effortLabel(if (client.config.reasoning) |r| r.effort else null),
                 },
@@ -125,6 +125,15 @@ pub fn modifiedTime(io: std.Io, buffer: []u8, updated_at_ms: i64) []const u8 {
     return std.fmt.bufPrint(buffer, "{d}y ago", .{@divTrunc(days, 365)}) catch "unknown time";
 }
 
+/// Display name for a CONNECTED client. The client's recorded provider key
+/// (written into its `ai.Config` at attach time) is authoritative over
+/// `cached_config`, which lags the live connection after a session resume
+/// (resume restores from the session DB, not cached_config). An empty key
+/// means attach recorded none, so fall back to the config-derived name.
+fn connectedProviderName(client_config: ai.Config, config: config_mod.Config) []const u8 {
+    if (client_config.provider_name.len > 0) return client_config.provider_name;
+    return providerDisplayName(config) orelse "openai_compatible";
+}
 fn providerLabel(config: config_mod.Config) ?[]const u8 {
     if (config.model_selection) |ms| return ms.provider().label();
     // After restart model_selection is null (api_key is never serialized);
@@ -133,12 +142,12 @@ fn providerLabel(config: config_mod.Config) ?[]const u8 {
     return null;
 }
 
-/// Returns the display name for the status bar. Prefers the dynamic
-/// provider name (e.g. "StepFun") when set; falls back to the serialized
-/// model_selection.provider_name (survives session resume, where the
-/// runtime-only dynamic_provider_name is null), then the legacy
-/// provider_name (populated from the "defaultModel" field), then the
-/// builtin label.
+/// Returns the config-derived display name (used when no client is
+/// connected). Prefers the serialized model_selection.provider_name, falls
+/// back to the dynamic provider name, then the legacy provider_name
+/// (populated from the "defaultModel" field), then the builtin label. When a
+/// client IS connected, connectedProviderName uses the client's recorded
+/// provider key instead, authoritative over cached_config.
 fn providerDisplayName(config: config_mod.Config) ?[]const u8 {
     if (config.model_selection) |ms| {
         if (ms.provider() == .openai_compatible and ms.providerName().len > 0) return ms.providerName();
@@ -196,6 +205,63 @@ test "model status prefers selected builtin over stale dynamic display name" {
     try std.testing.expectEqualStrings("model-x", status.model);
 }
 
+test "model status connected runtime reports its actual provider over stale cached_config after resume" {
+    // Regression: after /resume the runtime's client is attached to the
+    // session's own provider (restored from the session DB), but cached_config
+    // still carries the pre-resume provider. The connected modelStatus must
+    // trust the client's recorded provider key, not the stale cached_config.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_abs = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_abs);
+
+    var runtime: runtime_mod.AgentRuntime = undefined;
+    try runtime.initNew(.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .cwd = home_abs,
+        .session_dir = home_abs,
+        .home_dir = home_abs,
+        .base_system_prompt = "test system prompt",
+        .config = .{
+            .model_selection = .{ .builtin = .{
+                .provider = .ollama,
+                .provider_name = @constCast("ollama"),
+                .model = .{ .id = @constCast("init-model") },
+            } },
+        },
+        .diagnostics = &.{},
+    });
+    defer runtime.deinit();
+
+    // Simulate resume restoring a session that had switched to a different
+    // provider: re-attach records "green-provider" on the live client while
+    // cached_config stays on the old one.
+    try runtime.attachOpenAiCompatibleClient(
+        "green-provider",
+        "https://green.example/v1",
+        "test-key",
+        "green-model",
+        .medium,
+        &.{},
+    );
+
+    const stale_config: config_mod.Config = .{
+        .model_selection = .{ .custom = .{
+            .provider_name = @constCast("old-provider"),
+            .base_url = @constCast("https://old.example/v1"),
+            .api_key = @constCast(""),
+            .model = .{ .id = @constCast("old-model") },
+        } },
+    };
+    const status = modelStatus(&runtime, stale_config).?;
+    // The live client's provider is authoritative over stale cached_config.
+    try std.testing.expectEqualStrings("green-provider", status.provider);
+    try std.testing.expectEqualStrings("green-model", status.model);
+}
 test "effortLabel defaults unset to medium" {
     try std.testing.expectEqualStrings("medium", effortLabel(null));
     try std.testing.expectEqualStrings("high", effortLabel(.high));

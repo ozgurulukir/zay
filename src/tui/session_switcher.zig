@@ -869,7 +869,7 @@ test "refreshAllLaneTools pushes synced MCP and plugin tools into a non-viewed l
         .worker_context = .{ .io = std.testing.io, .gpa = lane_runtime.gpa },
         .engine = .{ .live = .{ .lane = .primary, .runtime = lane_runtime, .owns = true } },
     };
-    try lane.engine.live.runtime.attachOpenAiCompatibleClient("https://example.invalid", "test-key", "test-model", .default, &.{});
+    try lane.engine.live.runtime.attachOpenAiCompatibleClient("ollama", "https://example.invalid", "test-key", "test-model", .default, &.{});
     // The shared-registry wiring createRuntimeImpl does before its
     // `injectToolsInto` — without it `syncToolJson` falls back to the static
     // builtin list and the merged push below would be a no-op.

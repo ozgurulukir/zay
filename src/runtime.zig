@@ -632,6 +632,7 @@ pub const AgentRuntime = struct {
                 break :blk provider.anonymousApiKey() orelse "";
             };
             try self.attachOpenAiCompatibleClient(
+                config.provider_name orelse provider.label(),
                 base_url,
                 api_key,
                 model_id,
@@ -672,7 +673,7 @@ pub const AgentRuntime = struct {
             .builtin => |b| b.model.id,
             .custom => |c| c.model.id,
         };
-        try self.attachOpenAiCompatibleClient(base_url, api_key, model_id_to_attach, effort, config.providerHeadersByName(ms.providerName()));
+        try self.attachOpenAiCompatibleClient(ms.providerName(), base_url, api_key, model_id_to_attach, effort, config.providerHeadersByName(ms.providerName()));
     }
 
     fn tryAttachOpenAiResponsesFromConfig(
@@ -696,7 +697,7 @@ pub const AgentRuntime = struct {
             .effort = ms.model().reasoning.resolve(),
             .summary = .auto,
         };
-        try self.attachOpenAiResponsesClient(base_url, ms.apiKey() orelse "", ms.model().id, reasoning, config.providerHeadersByName(ms.providerName()));
+        try self.attachOpenAiResponsesClient(ms.providerName(), base_url, ms.apiKey() orelse "", ms.model().id, reasoning, config.providerHeadersByName(ms.providerName()));
     }
 
     /// Per-model context_window and max_output_tokens from the providers map
@@ -729,6 +730,7 @@ pub const AgentRuntime = struct {
             .model_id = model_id,
             .reasoning = .{ .effort = effort, .summary = .auto },
             .account_id = credentials.account_id,
+            .provider_name = "openai",
             .main_system_prompt = self.system_prompt,
         });
     }
@@ -792,6 +794,12 @@ pub const AgentRuntime = struct {
         api_key: []const u8,
         model_id: []const u8,
         reasoning: ai.Reasoning,
+        /// Provider key of the connection (auth-key id for openai_compatible,
+        /// config key for a builtin, "openai" for codex). Borrowed; carried
+        /// into the client's ai.Config so the TUI can display the ACTUAL
+        /// provider of a live connection after a resume (when cached_config
+        /// lags). Empty = derive the display name from config.
+        provider_name: []const u8 = "",
         user_headers: []const config_mod.ProviderHeader = &.{},
         /// Codex only: the OAuth account id the client's init asserts on.
         account_id: []const u8 = "",
@@ -810,6 +818,7 @@ pub const AgentRuntime = struct {
         provider_specs: []const ai.provider_headers.Header,
     ) ai.Config {
         var cfg: ai.Config = .{
+            .provider_name = plan.provider_name,
             .base_url = plan.base_url,
             .api_key = plan.api_key,
             .model = plan.model_id,
@@ -922,6 +931,7 @@ pub const AgentRuntime = struct {
 
     pub fn attachOpenAiCompatibleClient(
         self: *AgentRuntime,
+        provider_name: []const u8,
         base_url: []const u8,
         api_key: []const u8,
         model_id: []const u8,
@@ -930,6 +940,7 @@ pub const AgentRuntime = struct {
     ) !void {
         return self.attachClients(.{
             .adapter = .chat,
+            .provider_name = provider_name,
             .base_url = base_url,
             .api_key = api_key,
             .model_id = model_id,
@@ -944,6 +955,7 @@ pub const AgentRuntime = struct {
     /// Sole caller is `tryAttachOpenAiResponsesFromConfig` — private.
     fn attachOpenAiResponsesClient(
         self: *AgentRuntime,
+        provider_name: []const u8,
         base_url: []const u8,
         api_key: []const u8,
         model_id: []const u8,
@@ -952,6 +964,7 @@ pub const AgentRuntime = struct {
     ) !void {
         return self.attachClients(.{
             .adapter = .responses,
+            .provider_name = provider_name,
             .base_url = base_url,
             .api_key = api_key,
             .model_id = model_id,
@@ -1247,7 +1260,7 @@ test "attach rebuilds tools from the registry once it is wired" {
     runtime.agent.tool_registry = reg;
 
     // A model switch re-attaches; with the registry wired the rebuild runs.
-    try runtime.attachOpenAiCompatibleClient("http://localhost:11434", "", "test-model", .medium, &.{});
+    try runtime.attachOpenAiCompatibleClient("ollama", "http://localhost:11434", "", "test-model", .medium, &.{});
     const client = switch (runtime.client) {
         .openai_compatible => |c| c,
         else => return error.TestUnexpectedResult,
@@ -1298,7 +1311,7 @@ test "zen attach wires routing headers and session id into all chat clients" {
     const user_headers = [_]config_mod.ProviderHeader{
         .{ .name = @constCast("x-opencode-session"), .value = @constCast("pinned-session") },
     };
-    try runtime.attachOpenAiCompatibleClient("https://opencode.ai/zen/v1", "public", "test-model", .medium, &user_headers);
+    try runtime.attachOpenAiCompatibleClient("opencode", "https://opencode.ai/zen/v1", "public", "test-model", .medium, &user_headers);
 
     const main_client = switch (runtime.owned_client.?) {
         .openai_compatible => |client| client,
@@ -1373,6 +1386,7 @@ test "attach parity: every role inherits plan fields across all adapters" {
         runtime.wire_dialect = .dashscope;
         runtime.context_settings.request_timeout_seconds = 777;
         try runtime.attachOpenAiCompatibleClient(
+            "dashscope",
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
             "test-key",
             "qwen3-max",
