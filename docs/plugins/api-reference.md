@@ -39,7 +39,9 @@ Register a tool that the AI model can invoke.
 
 ### `zay.on(event_name, callback)`
 
-Subscribe to a lifecycle event.
+Register a callback for an event. Only `tool_call_started` and
+`tool_call_finished` currently fire; the other accepted event names are
+reserved for future use.
 
 **Parameters:**
 

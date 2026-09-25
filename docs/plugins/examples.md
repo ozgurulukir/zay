@@ -75,7 +75,7 @@ Run with: `zig build test-plugin`
 
 **Location:** `examples/plugins/file-watcher/`
 
-Demonstrates subscribing to lifecycle events using `zay.on()`.
+Demonstrates receiving tool-call notifications using `zay.on()`.
 
 ### plugin.lua
 
@@ -125,7 +125,7 @@ payload carries only `name`/`call_id`/`success` — no args, no paths —
 event-driven tracking can only classify by the fully-qualified tool name.
 
 Key points:
-- `zay.on()` subscribes to lifecycle events
+- `zay.on()` registers callbacks for tool-call notifications
 - The callback receives a `data` table with event-specific fields
 - Multiple callbacks can subscribe to the same event
 - Events are dispatched synchronously — keep handlers fast

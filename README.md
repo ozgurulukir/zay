@@ -50,7 +50,7 @@ Zay operates without granular per-action permission prompts (YOLO mode), relying
 - **Parallel Git Lanes:** Run multiple agent threads concurrently in isolated git worktrees; inspect progress and merge back cleanly.
 - **Background Jobs:** Asynchronous test runs, builds, or dev servers with real-time log tailing (`Ctrl+O`).
 - **Context Compaction:** Dynamic, token-calibrated retention budgets that preserve critical history below model limits.
-- **Extensible via Lua & MCP:** Custom tools and event hooks via sandboxed Lua plugins or Model Context Protocol (MCP) servers.
+- **Extensible via Lua & MCP:** Lua plugins can register custom tools and receive tool-call notifications; MCP servers can provide additional tools.
 - **Offline & Local-First:** Full SQLite timeline persistence, branch switching (`/timeline`), and single-keystroke rewind (`/undo`).
 
 ---
@@ -148,7 +148,7 @@ See the **[Safety & Classifier Guide](docs/wiki/SAFETY_CLASSIFIER.md)** for Dock
 - ⚙️ **[Configuration Reference](docs/CONFIG.md):** Providers, API keys, compaction, and themes.
 - 🧠 **[Engineering Patterns](docs/PATTERNS.md):** Invariants, background slots, and thread safety.
 - 🔌 **[MCP Guide](docs/MCP.md):** stdio and Streamable HTTP MCP integration.
-- 🧩 **[Lua Plugins](docs/plugins/):** Building tools and hooks.
+- 🧩 **[Lua Plugins](docs/plugins/):** Building custom tools and receiving tool-call notifications.
 - 🛠️ **[Contributor Guidelines](AGENTS.md):** TigerStyle rules, Zig 0.16 idioms, and testing.
 
 ---
