@@ -96,9 +96,14 @@ pub fn renderLimited(gpa: std.mem.Allocator, text: []const u8, width: u16, max_r
     var builder: RowBuilder = .{};
     errdefer builder.deinit(gpa);
 
-    const est_rows = @min(@as(usize, countRows(gpa, text, width)), max_rows);
-    try builder.rows.ensureTotalCapacity(gpa, est_rows + 1);
-    try builder.pool.ensureTotalCapacity(gpa, est_rows * 3 + 8);
+    // Every rendered row consumes at least one input byte, except the single
+    // empty-body row. Bound reservation by the caller's row limit instead of
+    // scanning the entire body to discover a capacity the renderer may never
+    // use. This matters for large transcript messages whose surfaces are
+    // clipped to the terminal's representable height.
+    const est_rows = @min(text.len +| 1, max_rows);
+    try builder.rows.ensureTotalCapacity(gpa, est_rows);
+    try builder.pool.ensureTotalCapacity(gpa, est_rows *| 3 +| 8);
 
     var state: BlockState = .{};
     try renderInto(gpa, &builder, text, width, &state, max_rows, true);
