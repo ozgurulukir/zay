@@ -9,6 +9,8 @@ const tui_metrics = @import("../metrics.zig");
 const tui_style = @import("../style.zig");
 const blackhole = @import("../blackhole.zig");
 
+const log = std.log.scoped(.message_widget);
+
 const logo_connect_text = "/connect to begin building";
 
 const mergedSelectedStyle = tui_style.mergedSelectedStyle;
@@ -513,7 +515,7 @@ fn drawMarkdown(
             self.message.renderIncPtr().deinit(self.gpa);
             self.message.renderIncPtr().* = .{};
             break :rows (terminal_markdown.renderLimited(ctx.arena, text, content_width, surface.size.height) catch |err| {
-                std.log.debug("large markdown render failed; using plain text fallback error={s} body_bytes={d} width={d}", .{
+                log.debug("large markdown render failed; using plain text fallback error={s} body_bytes={d} width={d}", .{
                     @errorName(err),
                     text.len,
                     content_width,
@@ -524,7 +526,7 @@ fn drawMarkdown(
         }
 
         break :rows self.message.renderIncPtr().rows(self.gpa, ctx.arena, text, content_width) catch |err| {
-            std.log.debug("incremental markdown render failed; using plain text fallback error={s} body_bytes={d} width={d}", .{
+            log.debug("incremental markdown render failed; using plain text fallback error={s} body_bytes={d} width={d}", .{
                 @errorName(err),
                 text.len,
                 content_width,

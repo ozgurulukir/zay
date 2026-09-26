@@ -91,17 +91,27 @@ pub fn render(gpa: std.mem.Allocator, text: []const u8, width: u16) !Rendered {
     return renderLimited(gpa, text, width, std.math.maxInt(usize));
 }
 
+/// Capacity-hint ceiling for `renderLimited`'s upfront reservation. The old
+/// `countRows`-derived estimate was a u16 (≤ 65535 rows, +1 reserved) and the
+/// new cap keeps the no-row-limit `render` path's worst case within one row of
+/// that, without re-introducing the full-body scan. Under-reserving is safe —
+/// the lists grow on demand.
+const estimate_row_cap: usize = std.math.maxInt(u16);
+
 pub fn renderLimited(gpa: std.mem.Allocator, text: []const u8, width: u16, max_rows: usize) !Rendered {
     assert(width > 0);
     var builder: RowBuilder = .{};
     errdefer builder.deinit(gpa);
 
     // Every rendered row consumes at least one input byte, except the single
-    // empty-body row. Bound reservation by the caller's row limit instead of
-    // scanning the entire body to discover a capacity the renderer may never
-    // use. This matters for large transcript messages whose surfaces are
-    // clipped to the terminal's representable height.
-    const est_rows = @min(text.len +| 1, max_rows);
+    // empty-body row (table border rows are paid for by the >=3-byte table
+    // lines that produce them). Bound reservation by the caller's row limit
+    // instead of scanning the entire body to discover a capacity the renderer
+    // may never use. This matters for large transcript messages whose surfaces
+    // are clipped to the terminal's representable height. `estimate_row_cap`
+    // keeps the no-row-limit `render` path at the old countRows-derived worst
+    // case instead of reserving O(body) upfront.
+    const est_rows = @min(@min(text.len +| 1, max_rows), estimate_row_cap);
     try builder.rows.ensureTotalCapacity(gpa, est_rows);
     try builder.pool.ensureTotalCapacity(gpa, est_rows *| 3 +| 8);
 
@@ -1317,6 +1327,63 @@ test "countRows matches render across widths and content shapes" {
             try std.testing.expectEqual(counted, inc.countRows(c.text, w));
         }
     }
+}
+
+// Invariant behind `renderLimited`'s byte-bound capacity estimate: every
+// rendered row consumes at least one input byte, except the single empty-body
+// row (table border rows are paid for by the >=3-byte lines that produce them).
+// `"\n\n\n"` is the tight case — it renders exactly 4 = 3 + 1 rows, so the
+// `+| 1` may not be "simplified" away.
+test "rendered rows never exceed text length plus one" {
+    const gpa = std.testing.allocator;
+    const Case = struct { name: []const u8, text: []const u8, min_width: u16 };
+    const cases = [_]Case{
+        .{ .name = "empty", .text = "", .min_width = 1 },
+        .{ .name = "single_char", .text = "a", .min_width = 1 },
+        .{ .name = "single_line", .text = "a\n", .min_width = 1 },
+        .{ .name = "blank_lines", .text = "\n\n\n", .min_width = 1 },
+        .{ .name = "mixed_blank", .text = "a\n\n\nb\n", .min_width = 1 },
+        .{ .name = "whitespace_only", .text = "   \n\t\n", .min_width = 1 },
+        .{ .name = "heading", .text = "# A fairly long heading that should wrap at narrower widths", .min_width = 1 },
+        .{ .name = "list_longword", .text = "- short then aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa tail", .min_width = 3 },
+        .{ .name = "quote", .text = "> quoted text that is long enough to wrap across multiple terminal lines here now", .min_width = 3 },
+        .{ .name = "table_cjk", .text = "| Name | Value |\n| --- | --- |\n| 日本語のとても長い内容 | beta with words that wrap |\n", .min_width = 1 },
+        .{ .name = "code", .text = "```\ncode line one\n\ncode line two\n```\n", .min_width = 1 },
+    };
+    for (cases) |c| {
+        var w: u16 = c.min_width;
+        while (w <= 40) : (w += 1) {
+            var out = try render(gpa, c.text, w);
+            defer out.deinit(gpa);
+            try std.testing.expect(out.rows.len <= c.text.len + 1);
+        }
+    }
+}
+
+// The `estimate_row_cap` on the reservation is a hint, never a clip: a body
+// producing more rows than the cap must still render every row. Width 10 gives
+// one row per "x" line, plus the trailing-newline phantom row.
+test "render renders past the estimate cap without clipping" {
+    const gpa = std.testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try body.ensureTotalCapacity(gpa, 2 * (estimate_row_cap + 1));
+    var i: usize = 0;
+    while (i <= estimate_row_cap) : (i += 1) body.appendSliceAssumeCapacity("x\n");
+
+    var out = try render(gpa, body.items, 10);
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, estimate_row_cap + 2), out.rows.len);
+}
+
+// `max_rows` is a soft per-block budget: each blank line commits exactly one
+// row, so the loop guard can stop to the row here — a sound early-stop probe
+// without over-claiming a hard cap for multi-row blocks.
+test "renderLimited stops at the row budget on blank lines" {
+    const gpa = std.testing.allocator;
+    var out = try renderLimited(gpa, "\n\n\n\n", 10, 2);
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), out.rows.len);
 }
 
 // The `Incremental` count must also match on a *warm* cache — where it is
