@@ -7,7 +7,7 @@ const paths = @import("../paths.zig");
 const assert = std.debug.assert;
 
 /// Current schema version for the sessions database.
-pub const schema_version: u32 = 6;
+pub const schema_version: u32 = 7;
 
 /// Resolve the default sessions database path under `home_dir`.
 /// Platform-correct base: Windows -> %APPDATA%\zay, POSIX -> ~/.config/zay.
@@ -77,6 +77,10 @@ pub fn migrate(connection: *db.Connection, io: std.Io) !void {
     try connection.exec("create table if not exists lanes(worktree_path text primary key, repo_key text not null, session_id text, title text, state text not null, created_at_ms integer not null, updated_at_ms integer not null, foreign key(session_id) references sessions(id) on delete set null)");
     try connection.exec("create index if not exists lanes_repo_state on lanes(repo_key, state, updated_at_ms)");
     try connection.exec("create table if not exists driver_pins(repo_key text primary key, session_id text, updated_at_ms integer not null, foreign key(session_id) references sessions(id) on delete set null)");
+    // Schema v7: durable review runs are separate from the worktree-keyed
+    // lane manifest because one lane can accumulate many snapshot reviews.
+    try connection.exec("create table if not exists lane_reviews(id text primary key, lane_id text not null, repo_key text not null, worktree_path text not null, base_oid text not null, head_oid text not null, source_session_id text, reviewer_session_id text, status text not null, report_json text, error_text text, created_at_ms integer not null, updated_at_ms integer not null, foreign key(source_session_id) references sessions(id) on delete set null, foreign key(reviewer_session_id) references sessions(id) on delete set null)");
+    try connection.exec("create index if not exists lane_reviews_lane_created on lane_reviews(repo_key, lane_id, created_at_ms)");
 
     var statement = try connection.prepare("insert or ignore into schema_migrations(version, applied_at_ms) values (?, ?)");
     defer statement.finalize();

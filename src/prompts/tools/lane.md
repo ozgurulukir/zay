@@ -12,6 +12,8 @@ needs:
 | `list` | — | every open lane (lane id, title, branch, session availability, status, activity), your workspace root, and parked lanes |
 | `spawn` | `task`, optionally `lane` | start an independent worker in a fresh lane, or reuse an existing idle lane |
 | `resume` | `lane`, `task` | continue an idle worker's existing session with a new instruction; the driver receives only the completion result |
+| `review` | `lane`, `task` | review a clean, committed lane diff in a fresh session with no tools; the driver receives a validated JSON report |
+| `review_read` | `review_id` | retrieve a persisted review report by the id returned from `review` |
 | `read` | `lane` | snapshot a worker lane's conversation tail and live activity |
 | `await` | `lane` | wait for a worker to finish or report a bounded stall |
 | `steer` | `lane`, `steer` | inject a short instruction into a running worker |
@@ -37,6 +39,11 @@ Keep small or tightly coupled work that shares files local.
    To continue an idle worker's prior conversation, call `lane resume` with
    its lane id and the next task. Its session history remains in that worker's
    context; do not copy the full transcript into the driver prompt.
+   To review a finished lane, call `lane review` with its id and criteria.
+   Review requires a clean worktree, pins the merge-base/head commit range,
+   and starts an isolated session that cannot call tools. The report is saved
+   before delivery. Review does not fix or merge; after reviewing, use
+   `resume` to continue the original worker's session.
 3. Continue independent work while the worker runs. Use `lane read` for
    progress and `lane steer` when its task needs clarification.
 4. Results arrive as messages: when a worker finishes you are woken with a

@@ -220,6 +220,9 @@ pub fn claimRecoveredLanes(gpa: std.mem.Allocator, io: std.Io, home_dir: []const
         return null;
     };
     defer manager.deinit();
+    session_mod.review_runs.recoverRepo(&manager.connection, repo_key, nowMs(io)) catch |err| {
+        log.warn("lane.review.recovery_failed err={s}", .{@errorName(err)});
+    };
     const rows = lane_manifest.loadOpenRows(gpa, &manager.connection, repo_key) catch |err| {
         log.warn("lane.recovery.manifest_read_failed err={s}", .{@errorName(err)});
         return null;
