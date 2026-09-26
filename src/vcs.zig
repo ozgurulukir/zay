@@ -109,6 +109,8 @@ pub const CmdError = error{
     GitSpawnFailed,
     GitCommandFailed,
     GitBadOutput,
+    DirtyReviewSource,
+    ReviewDiffTooLarge,
     OutOfMemory,
 } || Error;
 
@@ -257,6 +259,48 @@ pub fn workingTreeDirty(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) Cmd
     const out = try runOut(gpa, io, dir, &.{ "status", "--porcelain" }, null);
     defer gpa.free(out);
     return std.mem.trim(u8, out, " \t\r\n").len != 0;
+}
+
+pub const ReviewSnapshot = struct {
+    base: ObjectId,
+    head: ObjectId,
+    diff: []u8,
+
+    pub fn deinit(self: *ReviewSnapshot, gpa: std.mem.Allocator) void {
+        gpa.free(self.diff);
+        self.* = undefined;
+    }
+};
+
+/// Capture a bounded, committed-only review snapshot. The selected primary
+/// HEAD and lane HEAD are resolved once; the merge base and diff use those
+/// immutable object IDs even if either branch advances later.
+pub fn reviewSnapshot(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    primary_dir: []const u8,
+    lane_dir: []const u8,
+    max_diff_bytes: u32,
+) CmdError!ReviewSnapshot {
+    assert(primary_dir.len > 0);
+    assert(lane_dir.len > 0);
+    assert(max_diff_bytes > 0);
+    if (try workingTreeDirty(gpa, io, lane_dir)) return error.DirtyReviewSource;
+
+    const primary_head_raw = try runOut(gpa, io, primary_dir, &.{ "rev-parse", "HEAD" }, null);
+    defer gpa.free(primary_head_raw);
+    const primary_head = try ObjectId.parse(primary_head_raw);
+    const head_raw = try runOut(gpa, io, lane_dir, &.{ "rev-parse", "HEAD" }, null);
+    defer gpa.free(head_raw);
+    const head = try ObjectId.parse(head_raw);
+
+    const base_raw = try runOut(gpa, io, lane_dir, &.{ "merge-base", primary_head.slice(), head.slice() }, null);
+    defer gpa.free(base_raw);
+    const base = try ObjectId.parse(base_raw);
+    const diff = try runOut(gpa, io, lane_dir, &.{ "diff", "--no-ext-diff", "--no-color", "--no-renames", base.slice(), head.slice(), "--" }, null);
+    errdefer gpa.free(diff);
+    if (diff.len > max_diff_bytes) return error.ReviewDiffTooLarge;
+    return .{ .base = base, .head = head, .diff = diff };
 }
 
 /// Stage every non-ignored path and commit it onto the current branch with the
