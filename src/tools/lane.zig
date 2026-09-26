@@ -20,8 +20,8 @@ const lane_bridge = @import("lane_bridge.zig");
 /// to a worker would defeat the thread-safety the lane split exists for.
 /// `internal_commands` still lists them for the UI-side lifecycle
 /// (`lane_lifecycle`) and tests.
-const model_commands = [_][]const u8{ "list", "spawn", "resume", "read", "await", "steer", "cancel", "merge", "delete" };
-const internal_commands = [_][]const u8{ "list", "create", "enter", "leave", "merge", "spawn", "resume", "read", "cancel", "await", "steer", "delete" };
+const model_commands = [_][]const u8{ "list", "spawn", "resume", "review", "review_read", "read", "await", "steer", "cancel", "merge", "delete" };
+const internal_commands = [_][]const u8{ "list", "create", "enter", "leave", "merge", "spawn", "resume", "review", "review_read", "read", "cancel", "await", "steer", "delete" };
 
 comptime {
     for (model_commands) |command| {
@@ -43,7 +43,7 @@ pub const tool: common.Tool = .{
             .{
                 .name = "command",
                 .kind = .string,
-                .description = "The worker-lane operation to perform. Always required — one of: list, spawn, resume, read, await, steer, cancel, merge, delete.",
+                .description = "The worker-lane operation to perform. Always required — one of: list, spawn, resume, review, review_read, read, await, steer, cancel, merge, delete.",
                 .required = true,
                 .enum_values = &model_commands,
             },
@@ -57,14 +57,21 @@ pub const tool: common.Tool = .{
             .{
                 .name = "task",
                 .kind = .string,
-                .description = "Worker task prompt. Required for `spawn` and `resume`. `spawn` starts fresh context; `resume` continues the lane's existing session.",
+                .description = "Worker task prompt. Required for `spawn`, `resume`, and `review`. `spawn` starts fresh context; `resume` continues the lane's existing session; `review` starts an isolated, read-only review session over the lane's committed diff.",
                 .required = false,
                 .nullable = true,
             },
             .{
                 .name = "lane",
                 .kind = .string,
-                .description = "Lane id (the hex id shown by `lane list`). Required for `resume`, `merge`, `read`, `cancel`, `await`, `steer`, and `delete`; optional for `spawn` (targets an existing idle lane to reuse its worktree — omit to create a fresh one). Unused for `list`.",
+                .description = "Lane id (the hex id shown by `lane list`). Required for `resume`, `review`, `merge`, `read`, `cancel`, `await`, `steer`, and `delete`; optional for `spawn` (targets an existing idle lane to reuse its worktree — omit to create a fresh one). Unused for `list`.",
+                .required = false,
+                .nullable = true,
+            },
+            .{
+                .name = "review_id",
+                .kind = .string,
+                .description = "The 12-character id returned by `review`. Required for `review_read`.",
                 .required = false,
                 .nullable = true,
             },
@@ -79,6 +86,8 @@ pub const tool: common.Tool = .{
         .requirements = &.{
             .{ .when_property = "command", .equals = "spawn", .required_properties = &.{"task"} },
             .{ .when_property = "command", .equals = "resume", .required_properties = &.{ "lane", "task" } },
+            .{ .when_property = "command", .equals = "review", .required_properties = &.{ "lane", "task" } },
+            .{ .when_property = "command", .equals = "review_read", .required_properties = &.{"review_id"} },
             .{ .when_property = "command", .equals = "read", .required_properties = &.{"lane"} },
             .{ .when_property = "command", .equals = "await", .required_properties = &.{"lane"} },
             .{ .when_property = "command", .equals = "steer", .required_properties = &.{ "lane", "steer" } },
@@ -102,6 +111,7 @@ pub const internal_tool: common.Tool = .{
             .{ .name = "purpose", .kind = .string, .description = "Lane purpose.", .required = false, .nullable = true },
             .{ .name = "task", .kind = .string, .description = "Worker task.", .required = false, .nullable = true },
             .{ .name = "lane", .kind = .string, .description = "Lane id.", .required = false, .nullable = true },
+            .{ .name = "review_id", .kind = .string, .description = "Review run id.", .required = false, .nullable = true },
             .{ .name = "steer", .kind = .string, .description = "Steering message.", .required = false, .nullable = true },
         },
         .requirements = tool.schema.requirements,
@@ -115,12 +125,14 @@ const Args = struct {
     purpose: ?[]const u8 = null,
     task: ?[]const u8 = null,
     lane: ?[]const u8 = null,
+    review_id: ?[]const u8 = null,
     steer: ?[]const u8 = null,
 
     fn deinit(self: *Args, gpa: std.mem.Allocator) void {
         if (self.purpose) |s| gpa.free(s);
         if (self.task) |s| gpa.free(s);
         if (self.lane) |s| gpa.free(s);
+        if (self.review_id) |s| gpa.free(s);
         if (self.steer) |s| gpa.free(s);
         self.* = undefined;
     }
@@ -131,6 +143,7 @@ const JsonArgs = struct {
     purpose: ?[]const u8 = null,
     task: ?[]const u8 = null,
     lane: ?[]const u8 = null,
+    review_id: ?[]const u8 = null,
     steer: ?[]const u8 = null,
     // Detector only — never read. `ignore_unknown_fields` would silently drop
     // an `id` the model sent instead of the canonical `lane`, leaving it stuck
@@ -170,6 +183,7 @@ fn parseArgsWithMode(gpa: std.mem.Allocator, arguments: []const u8, allow_worksp
     if (parsed.value.purpose) |s| out.purpose = try gpa.dupe(u8, s);
     if (parsed.value.task) |s| out.task = try gpa.dupe(u8, s);
     if (parsed.value.lane) |s| out.lane = try gpa.dupe(u8, s);
+    if (parsed.value.review_id) |s| out.review_id = try gpa.dupe(u8, s);
     if (parsed.value.steer) |s| out.steer = try gpa.dupe(u8, s);
     return out;
 }
@@ -201,7 +215,7 @@ fn parseError(gpa: std.mem.Allocator, err: ParseError) common.Error!common.Outpu
         error.InvalidAction => common.failFmt(
             gpa,
             1,
-            "lane: invalid arguments — `command` must be one of: list, spawn, read, await, steer, cancel, merge, delete; driver workspace commands are unavailable to the model\n",
+            "lane: invalid arguments — `command` must be one of: list, spawn, resume, review, review_read, read, await, steer, cancel, merge, delete; driver workspace commands are unavailable to the model\n",
             .{},
         ),
         // Models learn the field name from output + schema; a misspelled `id`
@@ -258,6 +272,7 @@ fn runToolWithMode(
         .purpose = parsed.purpose,
         .task = parsed.task,
         .lane = parsed.lane,
+        .review_id = parsed.review_id,
         .steer = parsed.steer,
         .requester = requester,
     };
@@ -269,6 +284,7 @@ fn runToolWithMode(
     parsed.purpose = null;
     parsed.task = null;
     parsed.lane = null;
+    parsed.review_id = null;
     parsed.steer = null;
 
     const resp = bridge.request(io, &req) catch |err| switch (err) {
@@ -303,12 +319,15 @@ fn runToolWithMode(
 
 fn display(gpa: std.mem.Allocator, args: []const u8, env: common.Env) std.mem.Allocator.Error!common.ToolDisplay {
     _ = env;
-    const Probe = struct { command: ?[]const u8 = null, lane: ?[]const u8 = null };
+    const Probe = struct { command: ?[]const u8 = null, lane: ?[]const u8 = null, review_id: ?[]const u8 = null };
     const parsed = std.json.parseFromSlice(Probe, gpa, args, .{ .ignore_unknown_fields = true }) catch {
         return .{ .label = try gpa.dupe(u8, "lane") };
     };
     defer parsed.deinit();
     const command = parsed.value.command orelse return .{ .label = try gpa.dupe(u8, "lane") };
+    if (parsed.value.review_id) |review_id| {
+        return .{ .label = try std.fmt.allocPrint(gpa, "lane {s} {s}", .{ command, review_id }) };
+    }
     if (parsed.value.lane) |lane_id| {
         return .{ .label = try std.fmt.allocPrint(gpa, "lane {s} {s}", .{ command, lane_id }) };
     }
@@ -370,7 +389,7 @@ test "lane invalid-action diagnostics advertise only worker commands" {
     const gpa = std.testing.allocator;
     var output = try parseError(gpa, error.InvalidAction);
     defer output.deinit(gpa);
-    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "list, spawn, read, await, steer, cancel, merge, delete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "list, spawn, resume, review, review_read, read, await, steer, cancel, merge, delete") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.stderr, "list, create") == null);
 }
 

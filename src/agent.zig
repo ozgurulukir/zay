@@ -106,6 +106,9 @@ pub const Agent = struct {
     /// (owned by the App); null disables the lane tool (headless/tests).
     lane_bridge: ?*lane_bridge.LaneBridge = null,
     client: ai.LanguageModel,
+    /// `none` is used by review agents that receive a pinned diff as input.
+    /// This is enforced at dispatch as well as by the client's tool schema.
+    tool_access: enum { full, none } = .full,
     context_manager: context_mod.ContextManager,
     skills: []const skill_mod.Skill = &.{},
     /// Context window of the connected model, in tokens. Set by the runtime
@@ -683,6 +686,7 @@ pub const Agent = struct {
                 }
                 return;
             }
+            if (self.tool_access == .none) return error.ToolAccessDenied;
             try Agent.runToolBatch(L, self, tool_calls, &stream_context, l, turn_allocator);
             // Mid-turn we only inject messages explicitly marked to steer, and
             // only from the front so FIFO order holds — a default-queued

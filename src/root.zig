@@ -490,6 +490,7 @@ test {
     // orchestration own inline tests; referenced here per the
     // silent-test-discovery rule.
     _ = @import("session/lane_manifest.zig");
+    _ = @import("session/review_runs.zig");
     _ = @import("tui/lanes/recovery.zig");
     _ = @import("tui/bounded_list.zig");
     _ = @import("tui/style.zig");
