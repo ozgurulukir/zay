@@ -104,6 +104,10 @@ naming_done: std.atomic.Value(bool) = .init(false),
 /// switches, where the spawner's agent is freed and allocator address
 /// reuse could otherwise misroute a completion.
 spawned_by_generation: ?u64 = null,
+/// Snapshot review lifecycle attached to this worker lane while its isolated
+/// reviewer session is active. The original session identity is restored on
+/// completion; the reviewer session remains linked from the durable run row.
+review_run: ?ReviewRun = null,
 /// Monotonic identity for this lane, assigned from the App's
 /// `lane_generation_counter` at every Thread creation site. Used to route
 /// spawned-worker completions across session switches (see
@@ -145,6 +149,13 @@ pub const QueuedMessage = struct {
     text: []const u8,
     steer: bool = false,
     raw: bool = false,
+};
+
+pub const ReviewRun = struct {
+    id: [12]u8,
+    base_oid: vcs.ObjectId,
+    head_oid: vcs.ObjectId,
+    source_session_id: ?session.SessionId,
 };
 
 /// A live lane: its git worktree identity plus the owned runtime driving it.

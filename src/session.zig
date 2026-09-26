@@ -25,6 +25,7 @@ pub const QueuedEntry = session_type.QueuedEntry;
 pub const CreateOptions = session_type.CreateOptions;
 pub const SessionSummary = session_type.SessionSummary;
 pub const lane_manifest = @import("session/lane_manifest.zig");
+pub const review_runs = @import("session/review_runs.zig");
 pub const EntryRecord = session_type.EntryRecord;
 pub const UserEntryRef = session_type.UserEntryRef;
 pub const CompactionBoundary = session_type.CompactionBoundary;

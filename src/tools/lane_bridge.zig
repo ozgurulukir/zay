@@ -22,6 +22,8 @@ pub const Op = enum {
     leave,
     merge,
     spawn,
+    review,
+    review_read,
     @"resume",
     read,
     cancel,
@@ -40,6 +42,7 @@ pub const Request = struct {
     purpose: ?[]const u8 = null,
     task: ?[]const u8 = null,
     lane: ?[]const u8 = null,
+    review_id: ?[]const u8 = null,
     steer: ?[]const u8 = null,
     requester: *anyopaque,
     /// Written by the UI's `service` when the handler resolves this request;
@@ -54,6 +57,7 @@ pub const Request = struct {
         if (self.purpose) |s| gpa.free(s);
         if (self.task) |s| gpa.free(s);
         if (self.lane) |s| gpa.free(s);
+        if (self.review_id) |s| gpa.free(s);
         if (self.steer) |s| gpa.free(s);
         self.* = undefined;
     }
