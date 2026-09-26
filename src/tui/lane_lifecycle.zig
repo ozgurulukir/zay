@@ -1409,19 +1409,25 @@ fn deliverReviewCompletion(app: *App, lane: *Thread, spawner: *Thread) bool {
     };
     lane.id = review.source_session_id;
     lane_recovery.syncLaneUpdated(app, lane);
+    if (spawner.turn.state != .idle) return false;
     const notice = std.fmt.allocPrint(
         app.gpa,
         "Review {s} for lane {s}{s}. Pinned head: {s}. Report: {s}",
         .{ review.id[0..], laneIdOf(lane) orelse "?", if (report_is_stale) " is STALE" else " completed", review.head_oid.slice(), body },
-    ) catch return false;
+    ) catch {
+        lane.review_run = null;
+        lane.spawned_by_generation = null;
+        lane.completion_delivered = true;
+        lane_recovery.syncLaneUpdated(app, lane);
+        return false;
+    };
     defer app.gpa.free(notice);
-    if (spawner.turn.state != .idle) return false;
-    if (!queue_mod.enqueueRawMirrored(app, spawner, notice)) return false;
-    _ = spawner.transcript.append(app.gpa, .notice, "lane review", notice) catch {};
     lane.review_run = null;
     lane.spawned_by_generation = null;
     lane.completion_delivered = true;
     lane_recovery.syncLaneUpdated(app, lane);
+    if (!queue_mod.enqueueRawMirrored(app, spawner, notice)) return false;
+    _ = spawner.transcript.append(app.gpa, .notice, "lane review", notice) catch {};
     _ = app.startQueuedTurnOn(spawner) catch {};
     return spawner == app.thread;
 }
