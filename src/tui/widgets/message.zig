@@ -512,13 +512,23 @@ fn drawMarkdown(
         if (text.len > render_cache_max_bytes) {
             self.message.renderIncPtr().deinit(self.gpa);
             self.message.renderIncPtr().* = .{};
-            break :rows (terminal_markdown.renderLimited(ctx.arena, text, content_width, surface.size.height) catch {
+            break :rows (terminal_markdown.renderLimited(ctx.arena, text, content_width, surface.size.height) catch |err| {
+                std.log.debug("large markdown render failed; using plain text fallback error={s} body_bytes={d} width={d}", .{
+                    @errorName(err),
+                    text.len,
+                    content_width,
+                });
                 MessageWidget.drawWrapped(surface, text, p.body, selected, row, ctx, 0, null);
                 return;
             }).rows;
         }
 
-        break :rows self.message.renderIncPtr().rows(self.gpa, ctx.arena, text, content_width) catch {
+        break :rows self.message.renderIncPtr().rows(self.gpa, ctx.arena, text, content_width) catch |err| {
+            std.log.debug("incremental markdown render failed; using plain text fallback error={s} body_bytes={d} width={d}", .{
+                @errorName(err),
+                text.len,
+                content_width,
+            });
             MessageWidget.drawWrapped(surface, text, p.body, selected, row, ctx, 0, null);
             return;
         };
