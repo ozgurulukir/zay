@@ -18,6 +18,8 @@
 const std = @import("std");
 const os = @import("os.zig");
 
+const log = std.log.scoped(.paths);
+
 /// Final path segment, tolerant of both `/` and `\` separators and trailing
 /// slashes. Used to match worktree paths across git's forward-slash reporting
 /// and the platform-native paths Zay stores.
@@ -169,4 +171,72 @@ test "platformConfigDir: rejects a path that drifts from the platform layout" {
         if (std.mem.eql(u8, seg, "zay")) count += 1;
     }
     try std.testing.expectEqual(count, 1);
+}
+
+/// Ensures that a directory exists, creating it and any parent directories if
+/// needed. Idempotent: returns without error if the directory already exists.
+pub fn ensureDir(dir_path: []const u8) !void {
+    std.fs.cwd().makePath(dir_path) catch |err| {
+        if (err != error.PathAlreadyExists) {
+            log.warn("Failed to create directory {s}: {}", .{ dir_path, err });
+            return err;
+        }
+    };
+}
+
+test "ensureDir: creates new directory and nested parents" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const gpa = std.testing.allocator;
+    const path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "nested", "dir", "sub" });
+    defer gpa.free(path);
+
+    // Verify directory does not exist yet
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().openDir(path, .{}));
+
+    // ensureDir creates the directory structure
+    try ensureDir(path);
+
+    // Verify directory now exists
+    var dir = try std.fs.cwd().openDir(path, .{});
+    dir.close();
+}
+
+test "ensureDir: succeeds idempotently when directory already exists" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const gpa = std.testing.allocator;
+    const path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "existing_dir" });
+    defer gpa.free(path);
+
+    // Create directory first time
+    try ensureDir(path);
+
+    // Second call on already existing directory must succeed without error
+    try ensureDir(path);
+
+    // Verify directory still exists
+    var dir = try std.fs.cwd().openDir(path, .{});
+    dir.close();
+}
+
+test "ensureDir: returns error when path component is a file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const gpa = std.testing.allocator;
+    const file_path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "file.txt" });
+    defer gpa.free(file_path);
+
+    // Create a file
+    const file = try std.fs.cwd().createFile(file_path, .{});
+    file.close();
+
+    // Attempting ensureDir on a subpath of a file should fail (NotDir or similar)
+    const invalid_subpath = try std.fs.path.join(gpa, &.{ file_path, "sub" });
+    defer gpa.free(invalid_subpath);
+
+    try std.testing.expectError(error.NotDir, ensureDir(invalid_subpath));
 }
