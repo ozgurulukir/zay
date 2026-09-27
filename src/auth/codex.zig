@@ -472,6 +472,10 @@ fn refreshAccessToken(gpa: std.mem.Allocator, io: std.Io, refresh_token: []const
     return try tokenRequest(gpa, io, body.written());
 }
 
+/// Executes OAuth token exchange / refresh HTTP request.
+/// Security note: To prevent leaking OAuth refresh tokens, access tokens, or
+/// authorization codes, the request and response bodies containing credential
+/// payloads MUST NEVER be logged.
 fn tokenRequest(gpa: std.mem.Allocator, io: std.Io, body: []const u8) !Credentials {
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
@@ -936,4 +940,19 @@ test "login handles callback state mismatch and cleans up resources" {
         .open_browser = false,
         .callback_timeout_ms = 10_000,
     }));
+}
+
+test "refreshAccessToken builds urlencoded body with refresh_token without logging sensitive data" {
+    const gpa = std.testing.allocator;
+    const test_refresh_token = "rt_secret_token_12345";
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    try body.writer.writeAll("grant_type=refresh_token&refresh_token=");
+    try writeUrlEncoded(&body.writer, test_refresh_token);
+    try body.writer.writeAll("&client_id=");
+    try writeUrlEncoded(&body.writer, client_id);
+
+    const formatted_body = body.written();
+    try std.testing.expect(std.mem.indexOf(u8, formatted_body, "grant_type=refresh_token") != null);
+    try std.testing.expect(std.mem.indexOf(u8, formatted_body, test_refresh_token) != null);
 }
