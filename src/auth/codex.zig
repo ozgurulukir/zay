@@ -546,9 +546,15 @@ fn parseTokenResponse(gpa: std.mem.Allocator, io: std.Io, bytes: []const u8) !Cr
     const account_id = try accountIdFromAccessToken(gpa, parsed.value.access_token);
     errdefer gpa.free(account_id);
     const access = try gpa.dupe(u8, parsed.value.access_token);
-    errdefer gpa.free(access);
+    errdefer {
+        @memset(access, 0);
+        gpa.free(access);
+    }
     const refresh_token_copy = try gpa.dupe(u8, parsed.value.refresh_token);
-    errdefer gpa.free(refresh_token_copy);
+    errdefer {
+        @memset(refresh_token_copy, 0);
+        gpa.free(refresh_token_copy);
+    }
     return .{
         .access = access,
         .refresh = refresh_token_copy,
