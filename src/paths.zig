@@ -5,7 +5,7 @@
 //!      matching workspace/worktree paths across git's forward-slash reporting
 //!      and platform-native storage.
 //!   2. The platform-aware global config directory (`platformConfigDir`) —
-//!      the single base every global Zay path (config, worktrees, logs,
+//!      the single base every global Zay path (config.json, worktrees, logs,
 //!      session DB) is derived from, so Windows maps to `%APPDATA%\zay`
 //!      consistently with the plugin-discovery probe.
 //!
@@ -169,4 +169,93 @@ test "platformConfigDir: rejects a path that drifts from the platform layout" {
         if (std.mem.eql(u8, seg, "zay")) count += 1;
     }
     try std.testing.expectEqual(count, 1);
+}
+
+/// Ensures that a directory exists at the specified path, creating parent
+/// directories if necessary.
+pub fn ensureDir(io: std.Io, path: []const u8) !void {
+    std.Io.Dir.createDirPath(.cwd(), io, path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+}
+
+/// Returns the base data directory for application data using the platform configuration base.
+/// Caller owns the returned slice and must free it with allocator.free().
+pub fn getBaseDataDir(allocator: std.mem.Allocator) ![]u8 {
+    var env_map = std.process.Environ.createMap(std.process.Environ.empty, allocator) catch return platformConfigDir(allocator, ".");
+    defer env_map.deinit();
+
+    const home = if (os.is_windows)
+        (env_map.get("USERPROFILE") orelse env_map.get("HOME") orelse ".")
+    else
+        (env_map.get("HOME") orelse env_map.get("USERPROFILE") orelse ".");
+
+    return platformConfigDir(allocator, home);
+}
+
+/// Returns the history directory path, ensuring the directory exists on disk.
+/// Caller owns the returned slice and must free it with allocator.free().
+pub fn getHistoryDir(allocator: std.mem.Allocator) ![]const u8 {
+    return getHistoryDirWithIo(std.testing.io, allocator);
+}
+
+pub fn getHistoryDirWithIo(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
+    const data_dir = try getBaseDataDir(allocator);
+    defer allocator.free(data_dir);
+    const history_dir = try std.fs.path.join(allocator, &.{ data_dir, "history" });
+    try ensureDir(io, history_dir);
+    return history_dir;
+}
+
+test "ensureDir: creates directory tree idempotently" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const gpa = std.testing.allocator;
+    const sub_path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/nested/sub/dir", .{tmp.sub_path});
+    defer gpa.free(sub_path);
+
+    // First call creates the directory tree
+    try ensureDir(std.testing.io, sub_path);
+
+    var created_dir = try std.Io.Dir.openDir(.cwd(), std.testing.io, sub_path, .{});
+    created_dir.close(std.testing.io);
+
+    // Second call is idempotent and succeeds
+    try ensureDir(std.testing.io, sub_path);
+}
+
+test "getBaseDataDir: returns valid platform-aware path" {
+    const gpa = std.testing.allocator;
+    const data_dir = try getBaseDataDir(gpa);
+    defer gpa.free(data_dir);
+
+    try std.testing.expect(data_dir.len > 0);
+    try std.testing.expectEqualStrings("zay", lastPathSegment(data_dir));
+}
+
+test "getHistoryDir: creates history directory and verifies joining logic" {
+    const gpa = std.testing.allocator;
+    const history_dir = try getHistoryDir(gpa);
+    defer gpa.free(history_dir);
+
+    // Joining logic check: last path segment must be 'history'
+    try std.testing.expectEqualStrings("history", lastPathSegment(history_dir));
+
+    // Verify directory exists on disk via ensureDir
+    var dir = try std.Io.Dir.openDir(.cwd(), std.testing.io, history_dir, .{});
+    dir.close(std.testing.io);
+}
+
+test "getHistoryDir: idempotent when history directory already exists" {
+    const gpa = std.testing.allocator;
+
+    const history_dir1 = try getHistoryDir(gpa);
+    defer gpa.free(history_dir1);
+
+    const history_dir2 = try getHistoryDir(gpa);
+    defer gpa.free(history_dir2);
+
+    try std.testing.expect(pathsEqual(history_dir1, history_dir2));
 }
