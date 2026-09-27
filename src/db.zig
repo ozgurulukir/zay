@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("c");
+const paths = @import("paths.zig");
 
 const assert = std.debug.assert;
 
@@ -280,6 +281,15 @@ fn sqliteTransient() ?*const fn (?*anyopaque) callconv(.c) void {
     return @ptrFromInt(address);
 }
 
+/// Resolve the default database path under `home_dir`.
+/// Platform-correct base: Windows -> %APPDATA%\zay, POSIX -> ~/.config/zay.
+pub fn getDbPath(allocator: std.mem.Allocator, home_dir: []const u8) ![]u8 {
+    assert(home_dir.len > 0);
+    const data_dir = try paths.getBaseDataDir(allocator, home_dir);
+    defer allocator.free(data_dir);
+    return std.fs.path.join(allocator, &.{ data_dir, "zay.db" });
+}
+
 test "open in-memory database and query row" {
     var connection = try Connection.open(":memory:", .{});
     defer connection.close();
@@ -297,4 +307,21 @@ test "open in-memory database and query row" {
     try std.testing.expectEqual(@as(i64, 1), row.int(0));
     try std.testing.expectEqualStrings("zay", row.text(1));
     try std.testing.expect(try query.step() == null);
+}
+
+test "getDbPath: resolves to zay.db under the platform config dir" {
+    const gpa = std.testing.allocator;
+    const db_path = try getDbPath(gpa, "PREFIX");
+    defer gpa.free(db_path);
+
+    // Must end in zay.db and live under the platform config base
+    try std.testing.expect(std.mem.endsWith(u8, db_path, "zay.db"));
+
+    const base = try paths.platformConfigDir(gpa, "PREFIX");
+    defer gpa.free(base);
+
+    const expected = try std.fs.path.join(gpa, &.{ base, "zay.db" });
+    defer gpa.free(expected);
+
+    try std.testing.expect(paths.pathsEqual(db_path, expected));
 }
