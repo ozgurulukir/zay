@@ -1482,6 +1482,30 @@ test "setTitle updates session title and persistence state" {
     }
 }
 
+test "hasTitle returns expected boolean based on title existence" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+
+    // 1. Session created without a title should return false for hasTitle().
+    var untitled_session = try manager.create("/tmp/zay", .{
+        .id = "1" ** session_id_len,
+        .title = null,
+    });
+    try std.testing.expect(!try untitled_session.hasTitle());
+
+    // 2. Session created with a title should return true for hasTitle().
+    var titled_session = try manager.create("/tmp/zay", .{
+        .id = "2" ** session_id_len,
+        .title = "Initial Title",
+    });
+    try std.testing.expect(try titled_session.hasTitle());
+
+    // 3. Updating the title via setTitle() on an untitled session should make hasTitle() return true.
+    try untitled_session.setTitle("Updated Title");
+    try std.testing.expect(try untitled_session.hasTitle());
+}
+
 test {
     // Silent-drop guard (AGENTS.md §Test runner quirks): the `lane_manifest`
     // re-export above is never analyzed by itself — root.zig's refAllDecls
