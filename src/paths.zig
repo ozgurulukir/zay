@@ -125,6 +125,17 @@ pub fn platformConfigDir(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
     return std.fs.path.join(gpa, &.{ home_dir, ".config", "zay" });
 }
 
+/// Base data directory given a home directory. Caller owns returned slice.
+pub fn getBaseDataDir(allocator: std.mem.Allocator, home_dir: []const u8) ![]u8 {
+    return platformConfigDir(allocator, home_dir);
+}
+
+/// Returns the path to the logs directory joined under the given base directory.
+/// Caller owns the returned slice and must free it with `allocator`.
+pub fn getLogsDir(allocator: std.mem.Allocator, base_dir: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ base_dir, "logs" });
+}
+
 test "platformConfigDir: XDG under POSIX, APPDATA under Windows" {
     const gpa = std.testing.allocator;
     // The platform branch is selected at compile time (os.is_windows), so this
@@ -169,4 +180,35 @@ test "platformConfigDir: rejects a path that drifts from the platform layout" {
         if (std.mem.eql(u8, seg, "zay")) count += 1;
     }
     try std.testing.expectEqual(count, 1);
+}
+
+test "getLogsDir: joins base directory with logs segment" {
+    const gpa = std.testing.allocator;
+
+    const base_dir = try getBaseDataDir(gpa, "HOME");
+    defer gpa.free(base_dir);
+
+    const logs_dir = try getLogsDir(gpa, base_dir);
+    defer gpa.free(logs_dir);
+
+    const expected = try std.fs.path.join(gpa, &.{ base_dir, "logs" });
+    defer gpa.free(expected);
+
+    try std.testing.expect(pathsEqual(logs_dir, expected));
+    try std.testing.expect(std.mem.endsWith(u8, logs_dir, "logs"));
+    try std.testing.expectEqualStrings("logs", lastPathSegment(logs_dir));
+}
+
+test "getLogsDir: handles relative and custom base directories" {
+    const gpa = std.testing.allocator;
+
+    const custom_base = "custom_dir";
+    const logs_dir = try getLogsDir(gpa, custom_base);
+    defer gpa.free(logs_dir);
+
+    const expected = try std.fs.path.join(gpa, &.{ custom_base, "logs" });
+    defer gpa.free(expected);
+
+    try std.testing.expect(pathsEqual(logs_dir, expected));
+    try std.testing.expectEqualStrings("logs", lastPathSegment(logs_dir));
 }
