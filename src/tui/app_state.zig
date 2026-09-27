@@ -14,7 +14,6 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const tui = @import("../tui.zig");
-const agent_mod = @import("../agent.zig");
 const auth = @import("../auth/store.zig");
 const modelsdev = @import("../models/registry.zig");
 const job_mod = @import("job.zig");
