@@ -29,7 +29,9 @@ pub const Credentials = struct {
     expires: i64,
 
     pub fn deinit(self: *Credentials, gpa: std.mem.Allocator) void {
+        @memset(self.access, 0);
         gpa.free(self.access);
+        @memset(self.refresh, 0);
         gpa.free(self.refresh);
         gpa.free(self.account_id);
         self.* = undefined;
@@ -53,6 +55,7 @@ pub fn freeApiKeyMap(gpa: std.mem.Allocator, map: *ApiKeyMap) void {
     var it = map.iterator();
     while (it.next()) |entry| {
         gpa.free(entry.key_ptr.*);
+        @memset(entry.value_ptr.*, 0);
         gpa.free(entry.value_ptr.*);
     }
     map.deinit(gpa);
@@ -114,6 +117,7 @@ pub fn saveProviderApiKey(gpa: std.mem.Allocator, io: std.Io, home_dir: []const 
     defer freeApiKeyMap(gpa, &keys);
     if (keys.fetchOrderedRemove(label)) |old| {
         gpa.free(old.key);
+        @memset(old.value, 0);
         gpa.free(old.value);
     }
     const owned_label = try gpa.dupe(u8, label);
@@ -133,6 +137,7 @@ pub fn removeProviderApiKey(gpa: std.mem.Allocator, io: std.Io, home_dir: []cons
     defer freeApiKeyMap(gpa, &keys);
     if (keys.fetchOrderedRemove(label)) |old| {
         gpa.free(old.key);
+        @memset(old.value, 0);
         gpa.free(old.value);
     }
     var creds = try loadCredentials(gpa, io, home_dir);
@@ -774,4 +779,23 @@ test "pruneOrphanKeys is idempotent" {
 
     const orphan = try loadProviderApiKey(gpa, io, home_dir, "orphan_key");
     try std.testing.expect(orphan == null);
+}
+
+test "Credentials.deinit zeros sensitive memory before freeing" {
+    const gpa = std.testing.allocator;
+    const access = try gpa.dupe(u8, "secret-access-token");
+    const refresh = try gpa.dupe(u8, "secret-refresh-token");
+    const account_id = try gpa.dupe(u8, "account-123");
+
+    var creds = Credentials{
+        .access = access,
+        .refresh = refresh,
+        .account_id = account_id,
+        .expires = 12345,
+    };
+
+    creds.deinit(gpa);
+
+    for (access) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    for (refresh) |b| try std.testing.expectEqual(@as(u8, 0), b);
 }
