@@ -173,6 +173,7 @@ test "platformConfigDir: rejects a path that drifts from the platform layout" {
     try std.testing.expectEqual(count, 1);
 }
 
+<<<<<<< HEAD
 /// Ensures that a directory exists, creating it and any parent directories if
 /// needed. Idempotent: returns without error if the directory already exists.
 pub fn ensureDir(dir_path: []const u8) !void {
@@ -281,4 +282,42 @@ test "ensureConfigDir_createsDirectoryStructureAndIsIdempotent_whenCalled" {
     const dir_path2 = try ensureConfigDir(gpa, home_dir);
     defer gpa.free(dir_path2);
     try std.testing.expect(pathsEqual(dir_path2, expected_dir));
+}
+
+/// Returns the global prompt/session history directory derived from the
+/// platform config root (`<platformConfigDir>/history`). Caller owns the
+/// returned slice.
+pub fn getHistoryDir(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
+    const config_dir = try platformConfigDir(gpa, home_dir);
+    defer gpa.free(config_dir);
+    return std.fs.path.join(gpa, &.{ config_dir, "history" });
+}
+
+test "getHistoryDir: appends history segment under platformConfigDir" {
+    const gpa = std.testing.allocator;
+    const dir = try getHistoryDir(gpa, "HOME");
+    defer gpa.free(dir);
+
+    const want_suffix = if (os.is_windows) "AppData/Roaming/zay/history" else ".config/zay/history";
+    const expected = try std.fmt.allocPrint(gpa, "HOME/{s}", .{want_suffix});
+    defer gpa.free(expected);
+
+    try std.testing.expect(pathsEqual(dir, expected));
+    try std.testing.expectEqualStrings("history", lastPathSegment(dir));
+    try std.testing.expect(!std.mem.endsWith(u8, dir, "history/"));
+    try std.testing.expect(!std.mem.endsWith(u8, dir, "history\\"));
+}
+
+test "getHistoryDir: maintains correct platform layout hierarchy" {
+    const gpa = std.testing.allocator;
+    const dir = try getHistoryDir(gpa, "MYHOME");
+    defer gpa.free(dir);
+
+    const config_dir = try platformConfigDir(gpa, "MYHOME");
+    defer gpa.free(config_dir);
+
+    const expected = try std.fs.path.join(gpa, &.{ config_dir, "history" });
+    defer gpa.free(expected);
+
+    try std.testing.expect(pathsEqual(dir, expected));
 }
