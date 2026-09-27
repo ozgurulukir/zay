@@ -120,6 +120,8 @@ test "pathsEqualInternal: Windows case-insensitivity control" {
 /// under a scratch directory. `defaultPath` asserts the resulting layout so
 /// a layout regression fails the suite immediately. Caller owns the returned
 /// slice.
+pub const getBaseDataDir = platformConfigDir;
+
 pub fn platformConfigDir(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
     if (os.is_windows) {
         return std.fs.path.join(gpa, &.{ home_dir, "AppData", "Roaming", "zay" });
@@ -173,7 +175,6 @@ test "platformConfigDir: rejects a path that drifts from the platform layout" {
     try std.testing.expectEqual(count, 1);
 }
 
-<<<<<<< HEAD
 /// Ensures that a directory exists, creating it and any parent directories if
 /// needed. Idempotent: returns without error if the directory already exists.
 pub fn ensureDir(dir_path: []const u8) !void {
