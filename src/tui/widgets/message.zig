@@ -317,13 +317,9 @@ pub const MessageWidget = struct {
     fn drawBlackhole(surface: *vxfw.Surface, frame_index: u16, row_start: u16) void {
         const data = blackhole.frame(frame_index);
         var row = row_start;
-        var line_start: usize = 0;
-        while (line_start <= data.len) {
-            const line_end = std.mem.findScalarPos(u8, data, line_start, '\n') orelse data.len;
-            writeBlackholeLine(surface, data[line_start..line_end], row);
-            row += 1;
-            if (line_end == data.len) break;
-            line_start = line_end + 1;
+        var iter = std.mem.splitScalar(u8, data, '\n');
+        while (iter.next()) |line| : (row += 1) {
+            writeBlackholeLine(surface, line, row);
         }
     }
 
