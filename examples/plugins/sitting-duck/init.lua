@@ -162,8 +162,10 @@ end
 
 -- Last few non-empty stderr lines, flattened for an error message.
 local function stderr_tail(stderr, n)
+  local s = tostring(stderr or "")
+  if s == "" then return "" end
   local lines = {}
-  for line in tostring(stderr or ""):gmatch("[^\r\n]+") do
+  for line in s:gmatch("[^\r\n]+") do
     table.insert(lines, line)
   end
   if #lines == 0 then return "" end
