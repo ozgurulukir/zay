@@ -781,7 +781,7 @@ test "pruneOrphanKeys is idempotent" {
     try std.testing.expect(orphan == null);
 }
 
-test "Credentials.deinit zeros sensitive memory before freeing" {
+test "Credentials.deinit frees all credential slices" {
     const gpa = std.testing.allocator;
     const access = try gpa.dupe(u8, "secret-access-token");
     const refresh = try gpa.dupe(u8, "secret-refresh-token");
@@ -796,6 +796,11 @@ test "Credentials.deinit zeros sensitive memory before freeing" {
 
     creds.deinit(gpa);
 
-    for (access) |b| try std.testing.expectEqual(@as(u8, 0), b);
-    for (refresh) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    // The testing allocator fails the suite if any of the three slices leak.
+    //
+    // The @memset zeroization in `deinit` is deliberately NOT asserted here:
+    // `Allocator.free` scribbles the buffer with `undefined` (0xAA in Debug)
+    // BEFORE the allocator hook runs, so no watch-allocator can observe the
+    // pre-free contents. The explicit zeroize still matters in ReleaseFast,
+    // where that scribble is compiled out and `deinit` is the only scrub.
 }
