@@ -8,7 +8,6 @@
 const std = @import("std");
 const log = std.log.scoped(.tui);
 const modelsdev = @import("../models/registry.zig");
-const job_mod = @import("job.zig");
 const provider_model = @import("provider_model.zig");
 const tui = @import("../tui.zig");
 

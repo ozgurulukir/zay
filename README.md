@@ -15,16 +15,6 @@
 
 ---
 
-## ⚡ Zay in action
-
-<p align="center">
-  <a href="assets/demo.gif">
-    <img src="assets/demo-teaser.gif" alt="Zay Agent Demo in Terminal" width="800" />
-  </a>
-  <br />
-  <sub>⚡ <em>Preview snippet. <a href="assets/demo.gif">Click to watch the full demo (18 MB)</a></em></sub>
-</p>
-
 Zay is a **terminal-native coding agent** designed for speed, focus, and low latency. A single, compiled Zig binary that connects to OpenAI Codex (via ChatGPT OAuth) or any OpenAI-compatible provider, orchestrates parallel work across isolated git worktree lanes, logs every turn to local SQLite — and is extensible with sandboxed Lua plugins.
 
 ---
