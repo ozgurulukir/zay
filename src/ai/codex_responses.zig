@@ -7,7 +7,6 @@ const provider_headers = @import("provider_headers.zig");
 const tool_schema = @import("tool_schema.zig");
 const http = @import("../http.zig");
 const websocket = @import("websocket");
-const tools_mod = @import("../tools.zig");
 const tools_common = @import("../tools/common.zig");
 
 /// `pub` so `runtime.zig`'s codex client attachments reference the one
