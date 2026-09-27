@@ -1449,6 +1449,39 @@ test "renameSession updates the title" {
     }
 }
 
+test "setTitle updates session title and persistence state" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+
+    var session = try manager.create("/tmp/zay", .{ .id = "d" ** session_id_len });
+
+    // Session has no title initially.
+    try std.testing.expect(!try session.hasTitle());
+
+    // Set title for the session.
+    try session.setTitle("Initial Session Title");
+    try std.testing.expect(try session.hasTitle());
+
+    {
+        var summary = try session.summary(gpa);
+        defer summary.deinit(gpa);
+        try std.testing.expect(summary.title != null);
+        try std.testing.expectEqualStrings("Initial Session Title", summary.title.?);
+    }
+
+    // Update title again.
+    try session.setTitle("Updated Session Title");
+    try std.testing.expect(try session.hasTitle());
+
+    {
+        var summary = try session.summary(gpa);
+        defer summary.deinit(gpa);
+        try std.testing.expect(summary.title != null);
+        try std.testing.expectEqualStrings("Updated Session Title", summary.title.?);
+    }
+}
+
 test {
     // Silent-drop guard (AGENTS.md §Test runner quirks): the `lane_manifest`
     // re-export above is never analyzed by itself — root.zig's refAllDecls
