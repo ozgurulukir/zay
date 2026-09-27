@@ -176,6 +176,17 @@ fn spawnGrouped(command: []const u8) !std.process.Child {
     });
 }
 
+test "termCode converts Child.Term to u8 code" {
+    try std.testing.expectEqual(@as(u8, 0), termCode(.{ .exited = 0 }));
+    try std.testing.expectEqual(@as(u8, 1), termCode(.{ .exited = 1 }));
+    try std.testing.expectEqual(@as(u8, 42), termCode(.{ .exited = 42 }));
+    try std.testing.expectEqual(@as(u8, 255), termCode(.{ .exited = 255 }));
+
+    try std.testing.expectEqual(@as(u8, 255), termCode(.{ .signal = @enumFromInt(9) }));
+    try std.testing.expectEqual(@as(u8, 255), termCode(.{ .stopped = @enumFromInt(19) }));
+    try std.testing.expectEqual(@as(u8, 255), termCode(.{ .unknown = 1 }));
+}
+
 test "terminateChildBounded escalates to SIGKILL when TERM is trapped" {
     if (is_windows) return error.SkipZigTest;
     const io = std.testing.io;
