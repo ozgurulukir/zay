@@ -240,3 +240,45 @@ test "ensureDir: returns error when path component is a file" {
 
     try std.testing.expectError(error.NotDir, ensureDir(invalid_subpath));
 }
+
+/// Ensures the platform config directory exists by creating it (and parent
+/// directories if needed) on disk. Returns the allocated path slice.
+/// Caller owns the returned slice.
+pub fn ensureConfigDir(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
+    const dir = try platformConfigDir(gpa, home_dir);
+    errdefer gpa.free(dir);
+    try std.fs.cwd().makePath(dir);
+    return dir;
+}
+
+test "ensureConfigDir_createsDirectoryStructureAndIsIdempotent_whenCalled" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+
+    const home_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "home" });
+    defer gpa.free(home_dir);
+
+    // Initial call: creates home_dir + config_dir structure on disk.
+    const dir_path = try ensureConfigDir(gpa, home_dir);
+    defer gpa.free(dir_path);
+
+    // Assert created path matches platformConfigDir layout
+    const expected_dir = try platformConfigDir(gpa, home_dir);
+    defer gpa.free(expected_dir);
+    try std.testing.expect(pathsEqual(dir_path, expected_dir));
+
+    // Verify directory exists on disk
+    var dir = try std.fs.cwd().openDir(dir_path, .{});
+    dir.close();
+
+    // Idempotency check: calling ensureConfigDir again when dir already exists succeeds without error
+    const dir_path2 = try ensureConfigDir(gpa, home_dir);
+    defer gpa.free(dir_path2);
+    try std.testing.expect(pathsEqual(dir_path2, expected_dir));
+}
