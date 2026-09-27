@@ -170,3 +170,17 @@ test "platformConfigDir: rejects a path that drifts from the platform layout" {
     }
     try std.testing.expectEqual(count, 1);
 }
+
+/// Resolves the base data directory under `home_dir`.
+pub fn getBaseDataDir(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
+    return platformConfigDir(gpa, home_dir);
+}
+
+test "getBaseDataDir: delegates to platformConfigDir" {
+    const gpa = std.testing.allocator;
+    const data_dir = try getBaseDataDir(gpa, "HOME");
+    defer gpa.free(data_dir);
+    const config_dir = try platformConfigDir(gpa, "HOME");
+    defer gpa.free(config_dir);
+    try std.testing.expect(pathsEqual(data_dir, config_dir));
+}

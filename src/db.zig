@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("c");
+const paths = @import("paths.zig");
 
 const assert = std.debug.assert;
 
@@ -297,4 +298,26 @@ test "open in-memory database and query row" {
     try std.testing.expectEqual(@as(i64, 1), row.int(0));
     try std.testing.expectEqualStrings("zay", row.text(1));
     try std.testing.expect(try query.step() == null);
+}
+
+pub fn getDbPath(allocator: std.mem.Allocator, home_dir: []const u8) ![]u8 {
+    const data_dir = try paths.getBaseDataDir(allocator, home_dir);
+    defer allocator.free(data_dir);
+    return std.fs.path.join(allocator, &.{ data_dir, "zay.db" });
+}
+
+test "getDbPath returnsCorrectPath_whenHomeDirProvided" {
+    const gpa = std.testing.allocator;
+    const home_dir = "/home/testuser";
+    const db_path = try getDbPath(gpa, home_dir);
+    defer gpa.free(db_path);
+
+    try std.testing.expect(std.mem.endsWith(u8, db_path, "zay.db"));
+
+    const data_dir = try paths.getBaseDataDir(gpa, home_dir);
+    defer gpa.free(data_dir);
+    const expected = try std.fs.path.join(gpa, &.{ data_dir, "zay.db" });
+    defer gpa.free(expected);
+
+    try std.testing.expect(paths.pathsEqual(db_path, expected));
 }
