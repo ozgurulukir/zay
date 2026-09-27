@@ -120,14 +120,16 @@ test "pathsEqualInternal: Windows case-insensitivity control" {
 /// under a scratch directory. `defaultPath` asserts the resulting layout so
 /// a layout regression fails the suite immediately. Caller owns the returned
 /// slice.
-pub const getBaseDataDir = platformConfigDir;
-
 pub fn platformConfigDir(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
     if (os.is_windows) {
         return std.fs.path.join(gpa, &.{ home_dir, "AppData", "Roaming", "zay" });
     }
     return std.fs.path.join(gpa, &.{ home_dir, ".config", "zay" });
 }
+
+/// Semantic alias for `platformConfigDir`: the platform config root doubles
+/// as the base for all application data (db path, history dir). See #158.
+pub const getBaseDataDir = platformConfigDir;
 
 test "platformConfigDir: XDG under POSIX, APPDATA under Windows" {
     const gpa = std.testing.allocator;
@@ -177,12 +179,10 @@ test "platformConfigDir: rejects a path that drifts from the platform layout" {
 
 /// Ensures that a directory exists, creating it and any parent directories if
 /// needed. Idempotent: returns without error if the directory already exists.
-pub fn ensureDir(dir_path: []const u8) !void {
-    std.fs.cwd().makePath(dir_path) catch |err| {
-        if (err != error.PathAlreadyExists) {
-            log.warn("Failed to create directory {s}: {}", .{ dir_path, err });
-            return err;
-        }
+pub fn ensureDir(io: std.Io, dir_path: []const u8) !void {
+    std.Io.Dir.createDirPath(.cwd(), io, dir_path) catch |err| {
+        log.warn("Failed to create directory {s}: {}", .{ dir_path, err });
+        return err;
     };
 }
 
@@ -191,18 +191,19 @@ test "ensureDir: creates new directory and nested parents" {
     defer tmp.cleanup();
 
     const gpa = std.testing.allocator;
+    const io = std.testing.io;
     const path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "nested", "dir", "sub" });
     defer gpa.free(path);
 
     // Verify directory does not exist yet
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().openDir(path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDir(.cwd(), io, path, .{}));
 
     // ensureDir creates the directory structure
-    try ensureDir(path);
+    try ensureDir(io, path);
 
     // Verify directory now exists
-    var dir = try std.fs.cwd().openDir(path, .{});
-    dir.close();
+    var dir = try std.Io.Dir.openDir(.cwd(), io, path, .{});
+    dir.close(io);
 }
 
 test "ensureDir: succeeds idempotently when directory already exists" {
@@ -210,18 +211,19 @@ test "ensureDir: succeeds idempotently when directory already exists" {
     defer tmp.cleanup();
 
     const gpa = std.testing.allocator;
+    const io = std.testing.io;
     const path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "existing_dir" });
     defer gpa.free(path);
 
     // Create directory first time
-    try ensureDir(path);
+    try ensureDir(io, path);
 
     // Second call on already existing directory must succeed without error
-    try ensureDir(path);
+    try ensureDir(io, path);
 
     // Verify directory still exists
-    var dir = try std.fs.cwd().openDir(path, .{});
-    dir.close();
+    var dir = try std.Io.Dir.openDir(.cwd(), io, path, .{});
+    dir.close(io);
 }
 
 test "ensureDir: returns error when path component is a file" {
@@ -229,27 +231,28 @@ test "ensureDir: returns error when path component is a file" {
     defer tmp.cleanup();
 
     const gpa = std.testing.allocator;
+    const io = std.testing.io;
     const file_path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "file.txt" });
     defer gpa.free(file_path);
 
     // Create a file
-    const file = try std.fs.cwd().createFile(file_path, .{});
-    file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, file_path, .{});
+    file.close(io);
 
     // Attempting ensureDir on a subpath of a file should fail (NotDir or similar)
     const invalid_subpath = try std.fs.path.join(gpa, &.{ file_path, "sub" });
     defer gpa.free(invalid_subpath);
 
-    try std.testing.expectError(error.NotDir, ensureDir(invalid_subpath));
+    try std.testing.expectError(error.NotDir, ensureDir(io, invalid_subpath));
 }
 
 /// Ensures the platform config directory exists by creating it (and parent
 /// directories if needed) on disk. Returns the allocated path slice.
 /// Caller owns the returned slice.
-pub fn ensureConfigDir(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
+pub fn ensureConfigDir(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) ![]u8 {
     const dir = try platformConfigDir(gpa, home_dir);
     errdefer gpa.free(dir);
-    try std.fs.cwd().makePath(dir);
+    try std.Io.Dir.createDirPath(.cwd(), io, dir);
     return dir;
 }
 
@@ -267,7 +270,7 @@ test "ensureConfigDir_createsDirectoryStructureAndIsIdempotent_whenCalled" {
     defer gpa.free(home_dir);
 
     // Initial call: creates home_dir + config_dir structure on disk.
-    const dir_path = try ensureConfigDir(gpa, home_dir);
+    const dir_path = try ensureConfigDir(gpa, io, home_dir);
     defer gpa.free(dir_path);
 
     // Assert created path matches platformConfigDir layout
@@ -276,11 +279,11 @@ test "ensureConfigDir_createsDirectoryStructureAndIsIdempotent_whenCalled" {
     try std.testing.expect(pathsEqual(dir_path, expected_dir));
 
     // Verify directory exists on disk
-    var dir = try std.fs.cwd().openDir(dir_path, .{});
-    dir.close();
+    var dir = try std.Io.Dir.openDir(.cwd(), io, dir_path, .{});
+    dir.close(io);
 
     // Idempotency check: calling ensureConfigDir again when dir already exists succeeds without error
-    const dir_path2 = try ensureConfigDir(gpa, home_dir);
+    const dir_path2 = try ensureConfigDir(gpa, io, home_dir);
     defer gpa.free(dir_path2);
     try std.testing.expect(pathsEqual(dir_path2, expected_dir));
 }
