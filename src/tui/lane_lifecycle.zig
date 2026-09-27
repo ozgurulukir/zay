@@ -16,7 +16,6 @@ const turn_lifecycle = @import("turn_lifecycle.zig");
 const lanes_picker = @import("widgets/lanes_picker.zig");
 const lifecycle = @import("lifecycle.zig");
 const mode_lifecycle = @import("mode_lifecycle.zig");
-const naming_mod = @import("naming.zig");
 const turn_view_mod = @import("turn_view.zig");
 const queue_mod = @import("queue.zig");
 const runtime_mod = @import("../runtime.zig");
