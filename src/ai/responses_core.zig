@@ -15,7 +15,6 @@ const openai_compatible = @import("openai_compatible.zig");
 const provider_headers = @import("provider_headers.zig");
 const stream_part = @import("stream_part.zig");
 const tool_schema = @import("tool_schema.zig");
-const tools_common = @import("../tools/common.zig");
 const tools_mod = @import("../tools.zig");
 
 pub const responses_request = @import("responses_request.zig");
