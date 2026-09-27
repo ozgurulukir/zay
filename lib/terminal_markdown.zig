@@ -873,13 +873,10 @@ fn wrapCore(
             if (word_width > width -| current_width) {
                 var hi: usize = 0;
                 while (hi < word.len) {
-                    const capacity = width -| current_width;
-                    if (capacity == 0) {
-                        try commitRow(gpa, sink, current, current_indent);
-                        current_indent = continuation_indent;
-                        current_width = try startRow(gpa, sink, current, &.{}, current_indent);
-                        continue;
-                    }
+                    // A too-wide prefix or continuation indent can leave no
+                    // room on the row. Still consume one grapheme to guarantee
+                    // forward progress at narrow widths.
+                    const capacity = @max(width -| current_width, 1);
                     const end = graphemeSliceEnd(word, hi, capacity);
                     const slice = word[hi..end];
                     try addSpan(sink, current, gpa, slice, span.style);
