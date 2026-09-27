@@ -35,6 +35,21 @@ pub fn termCode(term: std.process.Child.Term) u8 {
     };
 }
 
+test "returnsExitCode_whenChildTerminatedExited" {
+    // Arrange & Act & Assert
+    try std.testing.expectEqual(@as(u8, 0), termCode(.{ .exited = 0 }));
+    try std.testing.expectEqual(@as(u8, 1), termCode(.{ .exited = 1 }));
+    try std.testing.expectEqual(@as(u8, 42), termCode(.{ .exited = 42 }));
+    try std.testing.expectEqual(@as(u8, 255), termCode(.{ .exited = 255 }));
+}
+
+test "returns255_whenChildTerminatedNonExited" {
+    // Arrange & Act & Assert
+    try std.testing.expectEqual(@as(u8, 255), termCode(.{ .signal = 9 }));
+    try std.testing.expectEqual(@as(u8, 255), termCode(.{ .stopped = 19 }));
+    try std.testing.expectEqual(@as(u8, 255), termCode(.{ .unknown = 0 }));
+}
+
 /// Milliseconds `terminateChildBounded` waits after SIGTERM before escalating
 /// to SIGKILL: long enough for graceful-shutdown handlers, short enough that a
 /// stuck tool call feels interruptible.
