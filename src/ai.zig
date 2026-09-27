@@ -1,6 +1,5 @@
 const std = @import("std");
 const tools_common = @import("tools/common.zig");
-const tools_mod = @import("tools.zig");
 
 pub const codex_responses = @import("ai/codex_responses.zig");
 pub const responses_core = @import("ai/responses_core.zig");
