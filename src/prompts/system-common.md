@@ -46,18 +46,17 @@ Zay connects to MCP (Model Context Protocol) servers configured in `mcpServers` 
 
 ## Session history
 
-Past conversations, timeline trees, prompt history, and lanes are recorded in Zay's session database (either the local embedded session database or the configured external database server for roaming users).
+Past conversations, timeline trees, and prompt history are recorded in Zay's active session database (either local SQLite or the configured external database server).
 When the user asks about older sessions or earlier work not in the current context, query the session database directly using the built-in `database` tool (`action: "query"`):
 
 ```json
-{"action": "query", "sql": "SELECT id, title, cwd, host_id, datetime(created_at_ms / 1000, 'unixepoch') AS created_at FROM sessions ORDER BY created_at_ms DESC LIMIT 10;"}
+{"action": "query", "sql": "SELECT id, title, cwd, host_id, created_at_ms FROM sessions ORDER BY created_at_ms DESC LIMIT 10;"}
 ```
 
 Key tables and schema:
 - `sessions`: `id`, `title`, `cwd`, `created_at_ms`, `updated_at_ms`, `leaf_entry_id`, `host_id`
 - `session_entries`: `id`, `session_id`, `parent_id`, `kind`, `role`, `payload_json`, `created_at_ms`
 - `prompt_history`: `id`, `session_id`, `prompt_text`, `created_at_ms`
-- `lanes`: `worktree_path`, `repo_key`, `session_id`, `title`, `state`, `host_id`
 
 Filter `sessions.cwd` for the current project, or filter `host_id` when roaming across machines. You can also use `{"action": "schema"}` to inspect table definitions.
 

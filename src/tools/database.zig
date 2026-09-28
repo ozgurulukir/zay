@@ -105,6 +105,12 @@ pub fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args 
     };
 }
 
+fn isSelectQuery(sql: []const u8) bool {
+    var words = std.mem.tokenizeAny(u8, sql, " \t\r\n");
+    const first = words.next() orelse return false;
+    return std.ascii.eqlIgnoreCase(first, "select") or std.ascii.eqlIgnoreCase(first, "with");
+}
+
 fn writeFmt(out: *std.Io.Writer.Allocating, comptime fmt: []const u8, values: anytype) common.Error!void {
     out.writer.print(fmt, values) catch return error.OutOfMemory;
 }
@@ -170,8 +176,16 @@ pub fn runTool(
         ),
     };
     defer args.deinit(gpa);
+    if (args.action == .query) {
+        if (args.sql) |sql| {
+            if (!isSelectQuery(sql)) {
+                return common.failFmt(gpa, 2, "Database query must be a SELECT statement.\n", .{});
+            }
+        }
+    }
 
-    if (env.ctx.database_server_url) |endpoint| {
+    if (env.ctx.session_backend == null and env.ctx.database_server_url != null) {
+        const endpoint = env.ctx.database_server_url.?;
         const client = db.Service.init(gpa, endpoint, env.ctx.database_auth_token);
 
         switch (args.action) {
@@ -259,15 +273,41 @@ pub fn runTool(
             },
         }
     } else if (env.ctx.session_backend) |backend| {
+        var tool_backend = backend.*;
+        var tool_connection: ?db.Connection = null;
+        defer if (tool_connection) |*conn| conn.close();
+        if (backend.local_path) |path| {
+            if (!std.mem.eql(u8, path, ":memory:")) {
+                var conn = db.Connection.open(path, .{ .create = false, .full_mutex = true }) catch |err| {
+                    return common.failFmt(gpa, 1, "Database connection failed: {s}\n", .{@errorName(err)});
+                };
+                conn.exec("pragma busy_timeout = 5000") catch |err| {
+                    conn.close();
+                    return common.failFmt(gpa, 1, "Database connection setup failed: {s}\n", .{@errorName(err)});
+                };
+                conn.exec("pragma foreign_keys = on") catch |err| {
+                    conn.close();
+                    return common.failFmt(gpa, 1, "Database connection setup failed: {s}\n", .{@errorName(err)});
+                };
+                tool_connection = conn;
+                tool_backend.local = conn;
+            }
+        }
         switch (args.action) {
             .health => {
                 var out: std.Io.Writer.Allocating = .init(gpa);
                 defer out.deinit();
-                const engine = switch (backend.kind) {
-                    .local_sqlite => "sqlite (local embedded session database)",
-                    .remote_service => "remote_service",
-                };
-                try writeFmt(&out, "[Database Health]\nBackend: {s}\nStatus: ok\nVersion: embedded\nAuth required: false\n", .{engine});
+                switch (backend.kind) {
+                    .local_sqlite => try writeStr(&out, "[Database Health]\nBackend: sqlite (local embedded session database)\nStatus: ok\nVersion: embedded\nAuth required: false\n"),
+                    .remote_service => {
+                        const client = backend.remote orelse return common.failFmt(gpa, 1, "Database service is unavailable.\n", .{});
+                        var health = client.health(io) catch |err| {
+                            return common.failFmt(gpa, 1, "Database health check failed: {s}\n", .{@errorName(err)});
+                        };
+                        defer health.deinit();
+                        try writeFmt(&out, "[Database Health]\nBackend: {s}\nStatus: {s}\nVersion: {s}\nAuth required: {}\n", .{ health.backend, health.status, health.version, health.auth_required });
+                    },
+                }
                 const stdout = out.toOwnedSlice() catch return error.OutOfMemory;
                 return common.ok(gpa, stdout);
             },
@@ -276,7 +316,7 @@ pub fn runTool(
                     return common.failFmt(gpa, 2, "Invalid arguments: 'sql' query is required for 'query' action.\n", .{});
                 };
 
-                var res = backend.query(io, sql, &.{}) catch |err| {
+                var res = tool_backend.query(io, sql, &.{}) catch |err| {
                     return common.failFmt(gpa, 1, "Database query failed: {s}\n", .{@errorName(err)});
                 };
                 defer res.deinit();
@@ -289,7 +329,7 @@ pub fn runTool(
                     return common.failFmt(gpa, 2, "Invalid arguments: 'sql' statement is required for 'exec' action.\n", .{});
                 };
 
-                backend.exec(io, sql, &.{}) catch |err| {
+                tool_backend.exec(io, sql, &.{}) catch |err| {
                     return common.failFmt(gpa, 1, "Database execution failed: {s}\n", .{@errorName(err)});
                 };
                 const msg = try gpa.dupe(u8, "Statement executed successfully.\n");
@@ -302,11 +342,11 @@ pub fn runTool(
                 switch (backend.kind) {
                     .local_sqlite => {
                         var res = if (args.table) |tbl| blk: {
-                            break :blk backend.query(io, "SELECT name, sql FROM sqlite_master WHERE type='table' AND name = ? ORDER BY name", &.{.{ .text = tbl }}) catch |err| {
+                            break :blk tool_backend.query(io, "SELECT name, sql FROM sqlite_master WHERE type='table' AND name = ? ORDER BY name", &.{.{ .text = tbl }}) catch |err| {
                                 return common.failFmt(gpa, 1, "Database schema inspection failed: {s}\n", .{@errorName(err)});
                             };
                         } else blk: {
-                            break :blk backend.query(io, "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name", &.{}) catch |err| {
+                            break :blk tool_backend.query(io, "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name", &.{}) catch |err| {
                                 return common.failFmt(gpa, 1, "Database schema inspection failed: {s}\n", .{@errorName(err)});
                             };
                         };

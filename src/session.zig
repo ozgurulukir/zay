@@ -63,8 +63,9 @@ pub const SessionManager = struct {
                 else => return error.SystemResources,
             };
         }
-        var connection = try db.Connection.open(path, .{});
-        var b = SessionBackend.openLocal(gpa, connection, host_id) catch |err| {
+        // In-memory sessions can share this connection with the database tool.
+        var connection = try db.Connection.open(path, .{ .full_mutex = true });
+        var b = SessionBackend.openLocal(gpa, connection, host_id, path) catch |err| {
             connection.close();
             return err;
         };
