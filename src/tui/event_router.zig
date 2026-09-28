@@ -303,6 +303,15 @@ fn routeKey(
         }
         return;
     }
+    // Keep the slash entry point for existing command workflows. Ctrl+K is an
+    // additional binding; removing slash here would send `/connect` and other
+    // commands to the model because normal submit has no command parser.
+    if (tui.shouldOpenCommandMenuForSlash(app, key)) {
+        try app.openCommandMenu();
+        try root.syncFocus(ctx);
+        ctx.consumeAndRedraw();
+        return;
+    }
     if (app.isNormalMode() and key.matches('k', .{ .ctrl = true })) {
         try app.openCommandMenu();
         try root.syncFocus(ctx);

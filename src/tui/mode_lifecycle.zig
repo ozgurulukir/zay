@@ -24,11 +24,21 @@ const commands = tui.commands;
 const command_prefix: u8 = '/';
 
 pub fn syncModeWithInput(app: *App, value: []const u8) !void {
-    // While typing an API key in the provider form, the input is the key.
+    // While typing an API key in the provider form, the input is the key —
+    // never reinterpret a leading '/' as a command.
     if (app.mode == .provider_picker and app.pickers.provider.stage == .form) return;
-    // While renaming a session, the palette input is not the rename target.
+    // While renaming a session, the palette input is not the rename target —
+    // don't reinterpret a leading '/' as a command.
     if (app.mode == .session_picker and app.nav.session_action != .browsing) return;
     if (app.mode == .session_picker or app.mode == .provider_picker or app.mode == .model_picker or app.mode == .tree_picker or app.mode == .theme_picker) {
+        if (value.len > 0 and value[0] == command_prefix) {
+            // Leaving `.theme_picker` via a leading '/' is a non-commit exit —
+            // revert the live preview before entering the command menu (M2).
+            if (app.mode == .theme_picker) theme_lifecycle.closeThemePicker(app);
+            app.mode = .command;
+            app.nav.command_selection = 0;
+            return;
+        }
         if (app.mode == .theme_picker) {
             // Keep the selection valid while filtering: a filter that removes
             // the selected row resets to the top instead of pointing past the
@@ -45,6 +55,12 @@ pub fn syncModeWithInput(app: *App, value: []const u8) !void {
         }
         return;
     }
+    if (value.len > 0 and value[0] == command_prefix) {
+        app.mode = .command;
+        app.nav.command_selection = 0;
+        return;
+    }
+    app.mode = .normal;
     app.nav.command_selection = 0;
 }
 

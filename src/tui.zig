@@ -1417,7 +1417,7 @@ pub fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
     return mode_lifecycle.shouldOpenCommandMenuForSlash(app, key);
 }
 
-pub const Command = enum { connect, model, mcp, new, resume_session, timeline, undo, diff, parallel, save, close, merge, lanes, search, clear, compact, status, help, export_session, settings, copy, paste, exit_cmd, plugins, skills, theme };
+pub const Command = enum { connect, model, mcp, new, resume_session, timeline, undo, diff, parallel, save, close, merge, lanes, search, clear, compact, status, help, export_session, settings, copy, paste, exit_cmd, plugins, skills, theme, database };
 /// `multi_lane` commands act on another lane, so they're hidden from the palette
 /// (and unresolvable) until more than one lane exists.
 pub const CommandEntry = struct { name: []const u8, command: Command, description: []const u8 = "", category: []const u8 = "", multi_lane: bool = false };
@@ -1446,6 +1446,7 @@ pub const commands = [_]CommandEntry{
     .{ .name = "Lanes", .command = .lanes, .description = "Manage parked worktree lanes", .category = "GIT & WORKTREE" },
     .{ .name = "Theme", .command = .theme, .description = "Switch color theme (highlight current)", .category = "SYSTEM" },
     .{ .name = "Status", .command = .status, .description = "Show agent runtime & git state", .category = "SYSTEM" },
+    .{ .name = "Database", .command = .database, .description = "Show session database backend status & schema", .category = "SYSTEM" },
     .{ .name = "Help", .command = .help, .description = "Show keyboard shortcuts & guide", .category = "SYSTEM" },
     .{ .name = "Exit", .command = .exit_cmd, .description = "Quit Zay agent", .category = "SYSTEM" },
     .{ .name = "Quit", .command = .exit_cmd, .description = "Quit Zay agent", .category = "SYSTEM" },
