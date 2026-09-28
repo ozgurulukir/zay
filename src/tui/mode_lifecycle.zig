@@ -501,9 +501,8 @@ pub fn submitMode(app: *App) !bool {
                     },
                     .database => {
                         app.mode = .normal;
-                        const db_cfg = app.cached_config.database;
-                        const backend_str = if (db_cfg.backend) |b| b.asString() else "local";
-                        const url_str = db_cfg.url orelse "(none)";
+                        const backend_str = app.cached_config.effectiveDatabaseBackend().asString();
+                        const url_str = app.cached_config.effectiveDatabaseUrl() orelse "(none)";
                         var db_buf: [256]u8 = undefined;
                         const db_text = try std.fmt.bufPrint(
                             &db_buf,
