@@ -117,37 +117,76 @@ pub const SessionManager = struct {
         database_auth_token: ?[]const u8,
         env_map: ?*const std.process.Environ.Map,
     ) Error!SessionManager {
+        return initFromModularConfig(gpa, io, home_dir, null, database_server_url, database_auth_token, null, env_map);
+    }
+
+    pub fn initFromModularConfig(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        home_dir: []const u8,
+        backend_opt: ?backend_mod.BackendKind,
+        url_opt: ?[]const u8,
+        token_opt: ?[]const u8,
+        custom_path: ?[]const u8,
+        env_map: ?*const std.process.Environ.Map,
+    ) Error!SessionManager {
         const host_id = backend_mod.resolveHostId(gpa, env_map) catch null;
         defer if (host_id) |h| gpa.free(h);
         const host_slice = host_id orelse "default-host";
 
-        var url_opt = database_server_url;
-        if (url_opt == null or url_opt.?.len == 0) {
-            if (env_map) |em| {
-                if (em.get("ZAY_DATABASE_SERVER_URL")) |u| {
-                    if (u.len > 0) url_opt = u;
+        var resolved_backend = backend_opt;
+        var resolved_url = url_opt;
+        var resolved_token = token_opt;
+        var resolved_path = custom_path;
+
+        if (env_map) |em| {
+            if (em.get("ZAY_DATABASE_BACKEND")) |b_str| {
+                if (backend_mod.BackendKind.fromString(b_str)) |bk| {
+                    resolved_backend = bk;
                 }
+            }
+            if (em.get("ZAY_DATABASE_URL")) |u| {
+                if (u.len > 0) resolved_url = u;
+            } else if (em.get("ZAY_DATABASE_SERVER_URL")) |u| {
+                if (u.len > 0) resolved_url = u;
+            }
+            if (em.get("ZAY_DATABASE_AUTH_TOKEN")) |t| {
+                if (t.len > 0) resolved_token = t;
+            }
+            if (em.get("ZAY_DATABASE_PATH")) |p| {
+                if (p.len > 0) resolved_path = p;
             }
         }
 
-        if (url_opt) |url| {
-            if (url.len > 0) {
-                var token = database_auth_token;
-                if ((token == null or token.?.len == 0) and env_map != null) {
-                    if (env_map.?.get("ZAY_DATABASE_AUTH_TOKEN")) |t| {
-                        if (t.len > 0) token = t;
+        const fallback_kind: backend_mod.BackendKind = if (resolved_url != null and resolved_url.?.len > 0) .remote_service else .local_sqlite;
+        const kind = resolved_backend orelse fallback_kind;
+
+        switch (kind) {
+            .local_sqlite => {
+                if (resolved_path) |p| {
+                    if (p.len > 0) return initWithHost(gpa, io, p, host_slice);
+                }
+                return initDefaultWithHost(gpa, io, home_dir, host_slice);
+            },
+            .remote_service => {
+                if (resolved_url) |url| {
+                    if (url.len > 0) {
+                        if (initRemote(gpa, io, url, resolved_token, host_slice)) |remote_mgr| {
+                            return remote_mgr;
+                        } else |err| {
+                            const log = std.log.scoped(.session);
+                            log.warn("session.external_db_fallback url={s} err={s}", .{ url, @errorName(err) });
+                        }
                     }
                 }
-                if (initRemote(gpa, io, url, token, host_slice)) |remote_mgr| {
-                    return remote_mgr;
-                } else |err| {
-                    const log = std.log.scoped(.session);
-                    log.warn("session.external_db_fallback url={s} err={s}", .{ url, @errorName(err) });
-                }
-            }
+                return initDefaultWithHost(gpa, io, home_dir, host_slice);
+            },
+            .turso_http, .postgres_native => {
+                const log = std.log.scoped(.session);
+                log.warn("session.backend_not_implemented backend={s}; falling back to local storage", .{@tagName(kind)});
+                return initDefaultWithHost(gpa, io, home_dir, host_slice);
+            },
         }
-
-        return initDefaultWithHost(gpa, io, home_dir, host_slice);
     }
 
     pub fn deinit(self: *SessionManager) void {
@@ -1798,6 +1837,57 @@ test "initFromConfig gracefully falls back to local storage when external servic
     var summary = try session.summary(gpa);
     defer summary.deinit(gpa);
     try std.testing.expectEqualStrings("Fallback Session", summary.title.?);
+}
+
+test "initFromModularConfig with custom path initializes local sqlite at custom path" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_dir);
+    const custom_db = try std.fs.path.join(gpa, &.{ home_dir, "custom_sessions.db" });
+    defer gpa.free(custom_db);
+
+    var manager = try SessionManager.initFromModularConfig(
+        gpa,
+        std.testing.io,
+        home_dir,
+        .local_sqlite,
+        null,
+        null,
+        custom_db,
+        null,
+    );
+    defer manager.deinit();
+
+    try std.testing.expectEqual(BackendKind.local_sqlite, manager.backend.kind);
+    try std.testing.expect(manager.backend.local_path != null);
+    try std.testing.expectEqualStrings(custom_db, manager.backend.local_path.?);
+}
+
+test "initFromModularConfig with unimplemented backend gracefully falls back to local storage" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_dir);
+
+    // Pass .turso_http which is stubbed
+    var manager = try SessionManager.initFromModularConfig(
+        gpa,
+        std.testing.io,
+        home_dir,
+        .turso_http,
+        "https://example.turso.io",
+        "secret",
+        null,
+        null,
+    );
+    defer manager.deinit();
+
+    try std.testing.expectEqual(BackendKind.local_sqlite, manager.backend.kind);
 }
 
 test {

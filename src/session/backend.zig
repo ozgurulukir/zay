@@ -10,6 +10,28 @@ const session_type = @import("types.zig");
 pub const BackendKind = enum {
     local_sqlite,
     remote_service,
+    turso_http,
+    postgres_native,
+
+    pub const local = BackendKind.local_sqlite;
+    pub const zay_service = BackendKind.remote_service;
+
+    pub fn fromString(str: []const u8) ?BackendKind {
+        if (std.mem.eql(u8, str, "local") or std.mem.eql(u8, str, "local_sqlite") or std.mem.eql(u8, str, "sqlite")) return .local_sqlite;
+        if (std.mem.eql(u8, str, "zay_service") or std.mem.eql(u8, str, "remote_service") or std.mem.eql(u8, str, "service")) return .remote_service;
+        if (std.mem.eql(u8, str, "turso_http") or std.mem.eql(u8, str, "turso") or std.mem.eql(u8, str, "libsql")) return .turso_http;
+        if (std.mem.eql(u8, str, "postgres_native") or std.mem.eql(u8, str, "postgres") or std.mem.eql(u8, str, "postgresql")) return .postgres_native;
+        return null;
+    }
+
+    pub fn asString(self: BackendKind) []const u8 {
+        return switch (self) {
+            .local_sqlite => "local",
+            .remote_service => "zay_service",
+            .turso_http => "turso_http",
+            .postgres_native => "postgres_native",
+        };
+    }
 };
 
 pub const SqlParam = db.Value;
@@ -68,6 +90,7 @@ pub const SessionBackend = struct {
                 if (self.local) |*conn| conn.close();
             },
             .remote_service => {},
+            .turso_http, .postgres_native => {},
         }
         self.* = undefined;
     }
@@ -91,6 +114,7 @@ pub const SessionBackend = struct {
                 const result = try svc.exec(io, sql, params);
                 if (!result.success) return error.QueryFailed;
             },
+            .turso_http, .postgres_native => return error.BackendNotImplemented,
         }
     }
 
@@ -170,21 +194,22 @@ pub const SessionBackend = struct {
                 const svc = self.remote orelse return error.MissingConnection;
                 return try svc.query(io, sql, params);
             },
+            .turso_http, .postgres_native => return error.BackendNotImplemented,
         }
     }
 
     pub fn beginTransaction(self: *SessionBackend, io: std.Io) !void {
-        if (self.kind == .remote_service) return error.UnsupportedTransaction;
+        if (self.kind != .local_sqlite) return error.UnsupportedTransaction;
         try self.exec(io, "BEGIN", &.{});
     }
 
     pub fn commitTransaction(self: *SessionBackend, io: std.Io) !void {
-        if (self.kind == .remote_service) return error.UnsupportedTransaction;
+        if (self.kind != .local_sqlite) return error.UnsupportedTransaction;
         try self.exec(io, "COMMIT", &.{});
     }
 
     pub fn rollbackTransaction(self: *SessionBackend, io: std.Io) !void {
-        if (self.kind == .remote_service) return error.UnsupportedTransaction;
+        if (self.kind != .local_sqlite) return error.UnsupportedTransaction;
         try self.exec(io, "ROLLBACK", &.{});
     }
 };

@@ -254,10 +254,21 @@ pub const AgentRuntime = struct {
         // `deinit` never runs, so exactly one of them applies.
         errdefer if (target.modelsdev_registry) |*reg| reg.deinit(gpa);
 
+        const db_backend = config.effectiveDatabaseBackend();
+        const db_url = config.effectiveDatabaseUrl();
+        const db_token = config.effectiveDatabaseAuthToken();
+        const db_path = config.effectiveDatabasePath();
+        const session_backend_kind: ?session_mod.BackendKind = switch (db_backend) {
+            .local => .local_sqlite,
+            .zay_service => .remote_service,
+            .turso_http => .turso_http,
+            .postgres_native => .postgres_native,
+        };
+
         if (session_id) |id| {
-            try target.session_writer.initResumeFromConfig(gpa, io, home_dir, id, config.database_server_url, config.database_auth_token, null);
+            try target.session_writer.initResumeFromModularConfig(gpa, io, home_dir, id, session_backend_kind, db_url, db_token, db_path, null);
         } else {
-            try target.session_writer.initFromConfig(gpa, io, home_dir, session_dir, config.database_server_url, config.database_auth_token, null);
+            try target.session_writer.initFromModularConfig(gpa, io, home_dir, session_dir, session_backend_kind, db_url, db_token, db_path, null);
         }
         target.session_writer_started = true;
         errdefer target.session_writer.deinit();

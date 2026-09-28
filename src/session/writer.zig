@@ -79,7 +79,7 @@ pub const SessionWriter = struct {
         database_auth_token: ?[]const u8,
         env_map: ?*const std.process.Environ.Map,
     ) Error!void {
-        return initFromConfigWithCapacity(target, gpa, io, home_dir, cwd, database_server_url, database_auth_token, env_map, queue_capacity_default);
+        return initFromModularConfigWithCapacity(target, gpa, io, home_dir, cwd, null, database_server_url, database_auth_token, null, env_map, queue_capacity_default);
     }
 
     pub fn initResumeFromConfig(
@@ -92,7 +92,37 @@ pub const SessionWriter = struct {
         database_auth_token: ?[]const u8,
         env_map: ?*const std.process.Environ.Map,
     ) Error!void {
-        return initResumeFromConfigWithCapacity(target, gpa, io, home_dir, session_id, database_server_url, database_auth_token, env_map, queue_capacity_default);
+        return initResumeFromModularConfigWithCapacity(target, gpa, io, home_dir, session_id, null, database_server_url, database_auth_token, null, env_map, queue_capacity_default);
+    }
+
+    pub fn initFromModularConfig(
+        target: *SessionWriter,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        home_dir: []const u8,
+        cwd: []const u8,
+        backend: ?session_mod.BackendKind,
+        url: ?[]const u8,
+        token: ?[]const u8,
+        custom_path: ?[]const u8,
+        env_map: ?*const std.process.Environ.Map,
+    ) Error!void {
+        return initFromModularConfigWithCapacity(target, gpa, io, home_dir, cwd, backend, url, token, custom_path, env_map, queue_capacity_default);
+    }
+
+    pub fn initResumeFromModularConfig(
+        target: *SessionWriter,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        home_dir: []const u8,
+        session_id: []const u8,
+        backend: ?session_mod.BackendKind,
+        url: ?[]const u8,
+        token: ?[]const u8,
+        custom_path: ?[]const u8,
+        env_map: ?*const std.process.Environ.Map,
+    ) Error!void {
+        return initResumeFromModularConfigWithCapacity(target, gpa, io, home_dir, session_id, backend, url, token, custom_path, env_map, queue_capacity_default);
     }
 
     pub fn initFromConfigWithCapacity(
@@ -106,13 +136,7 @@ pub const SessionWriter = struct {
         env_map: ?*const std.process.Environ.Map,
         capacity: u32,
     ) Error!void {
-        assert(home_dir.len > 0);
-        assert(cwd.len > 0);
-        assert(capacity > 0);
-        var manager = try SessionManager.initFromConfig(gpa, io, home_dir, database_server_url, database_auth_token, env_map);
-        errdefer manager.deinit();
-        const session = try manager.create(cwd, .{});
-        try target.initWithSession(gpa, io, manager, session, capacity);
+        return initFromModularConfigWithCapacity(target, gpa, io, home_dir, cwd, null, database_server_url, database_auth_token, null, env_map, capacity);
     }
 
     pub fn initResumeFromConfigWithCapacity(
@@ -126,10 +150,48 @@ pub const SessionWriter = struct {
         env_map: ?*const std.process.Environ.Map,
         capacity: u32,
     ) Error!void {
+        return initResumeFromModularConfigWithCapacity(target, gpa, io, home_dir, session_id, null, database_server_url, database_auth_token, null, env_map, capacity);
+    }
+
+    pub fn initFromModularConfigWithCapacity(
+        target: *SessionWriter,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        home_dir: []const u8,
+        cwd: []const u8,
+        backend: ?session_mod.BackendKind,
+        url: ?[]const u8,
+        token: ?[]const u8,
+        custom_path: ?[]const u8,
+        env_map: ?*const std.process.Environ.Map,
+        capacity: u32,
+    ) Error!void {
+        assert(home_dir.len > 0);
+        assert(cwd.len > 0);
+        assert(capacity > 0);
+        var manager = try SessionManager.initFromModularConfig(gpa, io, home_dir, backend, url, token, custom_path, env_map);
+        errdefer manager.deinit();
+        const session = try manager.create(cwd, .{});
+        try target.initWithSession(gpa, io, manager, session, capacity);
+    }
+
+    pub fn initResumeFromModularConfigWithCapacity(
+        target: *SessionWriter,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        home_dir: []const u8,
+        session_id: []const u8,
+        backend: ?session_mod.BackendKind,
+        url: ?[]const u8,
+        token: ?[]const u8,
+        custom_path: ?[]const u8,
+        env_map: ?*const std.process.Environ.Map,
+        capacity: u32,
+    ) Error!void {
         assert(home_dir.len > 0);
         assert(session_id.len > 0);
         assert(capacity > 0);
-        var manager = try SessionManager.initFromConfig(gpa, io, home_dir, database_server_url, database_auth_token, env_map);
+        var manager = try SessionManager.initFromModularConfig(gpa, io, home_dir, backend, url, token, custom_path, env_map);
         errdefer manager.deinit();
         const session = try manager.@"resume"(session_id);
         try target.initWithSession(gpa, io, manager, session, capacity);

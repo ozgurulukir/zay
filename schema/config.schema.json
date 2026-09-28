@@ -50,6 +50,10 @@
       "type": "string",
       "description": "Optional authentication token or API key for the external database server / service. Legacy key 'database_auth_token' is parsed for backward compatibility but is not schema-valid; new configs must use 'databaseAuthToken'."
     },
+    "database": {
+      "$ref": "#/$defs/DatabaseConfig",
+      "description": "Database backend configuration for session storage, history synchronization, and roaming users. Takes precedence over legacy databaseServerUrl and databaseAuthToken."
+    },
     "providers": {
       "type": "object",
       "additionalProperties": { "$ref": "#/$defs/ProviderConfig" },
@@ -440,6 +444,31 @@
           "maximum": 0.99,
           "default": 0.85,
           "description": "Context usage fraction that transitions the meter to red alert."
+        }
+      },
+      "additionalProperties": false
+    },
+    "DatabaseConfig": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "type": "string",
+          "enum": ["local", "zay_service", "turso_http", "postgres_native"],
+          "default": "local",
+          "description": "Selected database storage backend: 'local' (embedded SQLite), 'zay_service' (HTTP companion service), 'turso_http' (LibSQL/Turso direct HTTP pipeline), 'postgres_native' (native PostgreSQL wire protocol)."
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Remote database service URL, LibSQL/Turso endpoint, or PostgreSQL connection URL."
+        },
+        "authToken": {
+          "type": "string",
+          "description": "Authentication token or API key for the remote database / service."
+        },
+        "path": {
+          "type": "string",
+          "description": "Filesystem path for local SQLite database file (overrides default ~/.config/zay/sessions.db)."
         }
       },
       "additionalProperties": false

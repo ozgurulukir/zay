@@ -23,6 +23,8 @@ const mcp_types = @import("mcp.zig");
 const plugin_types = @import("plugin.zig");
 
 const Config = config_mod.Config;
+const DatabaseConfig = config_mod.DatabaseConfig;
+const DatabaseBackendKind = config_mod.DatabaseBackendKind;
 const ContextSettings = config_mod.ContextSettings;
 const CompactionSettings = config_mod.CompactionSettings;
 const ToastSettings = config_mod.ToastSettings;
@@ -181,6 +183,7 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
     }
     try applyTextOverlay(gpa, &target.database_server_url, updates.database_server_url);
     try applyTextOverlay(gpa, &target.database_auth_token, updates.database_auth_token);
+    try applyDatabaseOverlay(gpa, &target.database, updates.database);
     for (updates.providers) |provider| try applyProviderOverlay(gpa, target, provider);
     for (updates.mcp_servers) |mcp_server| try applyMcpServerOverlay(gpa, target, mcp_server);
     for (updates.plugins) |plugin| try applyPluginOverlay(gpa, target, plugin);
@@ -189,6 +192,13 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
     try applyTuiOverlay(gpa, target, updates.tui);
     // Theme is independent of model selection, so it merges unconditionally.
     if (updates.theme) |s| try replaceOptionalSlice(gpa, &target.theme, s);
+}
+
+fn applyDatabaseOverlay(gpa: std.mem.Allocator, target: *DatabaseConfig, updates: DatabaseConfig) !void {
+    if (updates.backend) |b| target.backend = b;
+    try applyTextOverlay(gpa, &target.url, updates.url);
+    try applyTextOverlay(gpa, &target.auth_token, updates.auth_token);
+    try applyTextOverlay(gpa, &target.path, updates.path);
 }
 
 /// Overlay semantics for user-clearable text fields (`system_prompt`,
@@ -660,6 +670,11 @@ fn parseObject(
         if (tui_val == .object) out.tui = try parseTui(gpa, tui_val);
     }
 
+    // Database backend configuration.
+    if (value.object.get("database")) |db_val| {
+        if (db_val == .object) out.database = try parseDatabase(gpa, db_val);
+    }
+
     // Populate the typed `model_selection` when all required fields
     // are present. Missing any of them leaves it null — the legacy
     // optional fields stay so existing callers keep working until
@@ -805,6 +820,24 @@ const toast_duration_min: u32 = 500;
 const toast_duration_max: u32 = 30_000;
 const toast_max_visible_min: u8 = 1;
 const toast_max_visible_max: u8 = 5;
+
+fn parseDatabase(gpa: std.mem.Allocator, value: std.json.Value) !DatabaseConfig {
+    var db_cfg: DatabaseConfig = .{};
+    errdefer db_cfg.deinit(gpa);
+    if (stringFieldCompat(value, "backend", "backend")) |s| {
+        db_cfg.backend = DatabaseBackendKind.fromString(s);
+    }
+    if (stringFieldCompat(value, "url", "url")) |s| {
+        if (s.len > 0) db_cfg.url = try gpa.dupe(u8, s);
+    }
+    if (stringFieldCompat(value, "authToken", "auth_token")) |s| {
+        if (s.len > 0) db_cfg.auth_token = try gpa.dupe(u8, s);
+    }
+    if (stringFieldCompat(value, "path", "path")) |s| {
+        if (s.len > 0) db_cfg.path = try gpa.dupe(u8, s);
+    }
+    return db_cfg;
+}
 
 fn parseToast(gpa: std.mem.Allocator, value: std.json.Value) !ToastSettings {
     var toast: ToastSettings = .{};
@@ -1167,7 +1200,19 @@ fn loadEnv(
         if (s.len > 0) out.database_server_url = try gpa.dupe(u8, s);
     }
     if (env.get("ZAY_DATABASE_AUTH_TOKEN")) |s| {
-        if (s.len > 0) out.database_auth_token = try gpa.dupe(u8, s);
+        if (s.len > 0) {
+            out.database_auth_token = try gpa.dupe(u8, s);
+            out.database.auth_token = try gpa.dupe(u8, s);
+        }
+    }
+    if (env.get("ZAY_DATABASE_BACKEND")) |s| {
+        if (s.len > 0) out.database.backend = DatabaseBackendKind.fromString(s);
+    }
+    if (env.get("ZAY_DATABASE_URL")) |s| {
+        if (s.len > 0) out.database.url = try gpa.dupe(u8, s);
+    }
+    if (env.get("ZAY_DATABASE_PATH")) |s| {
+        if (s.len > 0) out.database.path = try gpa.dupe(u8, s);
     }
     if (env.get("ZAY_USE_RESPONSES_ENDPOINT")) |s| {
         out.use_responses_endpoint = parseBool(s);
@@ -1509,6 +1554,10 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
             try std.json.Stringify.value(tok, .{}, writer);
         }
     }
+    if (hasNonDefaultDatabase(config.database)) {
+        try writeKey(writer, "database", &wrote_any);
+        try writeDatabase(writer, config.database);
+    }
     if (config.providers.len > 0) {
         try writeKey(writer, "providers", &wrote_any);
         try writeProviders(writer, config.providers);
@@ -1544,6 +1593,42 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
         }
     }
     try writer.writeAll("\n}\n");
+}
+
+fn hasNonDefaultDatabase(db_cfg: DatabaseConfig) bool {
+    if (db_cfg.backend != null) return true;
+    if (db_cfg.url != null and db_cfg.url.?.len > 0) return true;
+    if (db_cfg.auth_token != null and db_cfg.auth_token.?.len > 0) return true;
+    if (db_cfg.path != null and db_cfg.path.?.len > 0) return true;
+    return false;
+}
+
+fn writeDatabase(writer: *std.Io.Writer, db_cfg: DatabaseConfig) !void {
+    try writer.writeByte('{');
+    var wrote_any = false;
+    if (db_cfg.backend) |b| {
+        try writeKeyNoIndent(writer, "backend", &wrote_any);
+        try std.json.Stringify.value(b.asString(), .{}, writer);
+    }
+    if (db_cfg.url) |u| {
+        if (u.len > 0) {
+            try writeKeyNoIndent(writer, "url", &wrote_any);
+            try std.json.Stringify.value(u, .{}, writer);
+        }
+    }
+    if (db_cfg.auth_token) |t| {
+        if (t.len > 0) {
+            try writeKeyNoIndent(writer, "authToken", &wrote_any);
+            try std.json.Stringify.value(t, .{}, writer);
+        }
+    }
+    if (db_cfg.path) |p| {
+        if (p.len > 0) {
+            try writeKeyNoIndent(writer, "path", &wrote_any);
+            try std.json.Stringify.value(p, .{}, writer);
+        }
+    }
+    try writer.writeByte('}');
 }
 
 fn hasNonDefaultToast(toast: ToastSettings) bool {
@@ -2972,6 +3057,94 @@ test "parseObject accepts legacy snake_case keys (backward compat)" {
     try std.testing.expectEqualStrings("http://old-db:8766", cfg.database_server_url.?);
     try std.testing.expectEqualStrings("old-token", cfg.database_auth_token.?);
     // The legacy snake_case `enable_thinking` key is accepted and discarded.
+}
+
+test "parseObject accepts modular database configuration" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    const json =
+        \\{"defaultModel":"openai/gpt-5.5","database":{"backend":"turso_http","url":"https://zay-db.turso.io","authToken":"turso-secret","path":"/custom/path.db"}}
+    ;
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqual(DatabaseBackendKind.turso_http, cfg.database.backend.?);
+    try std.testing.expectEqualStrings("https://zay-db.turso.io", cfg.database.url.?);
+    try std.testing.expectEqualStrings("turso-secret", cfg.database.auth_token.?);
+    try std.testing.expectEqualStrings("/custom/path.db", cfg.database.path.?);
+    try std.testing.expectEqual(DatabaseBackendKind.turso_http, cfg.effectiveDatabaseBackend());
+    try std.testing.expectEqualStrings("https://zay-db.turso.io", cfg.effectiveDatabaseUrl().?);
+    try std.testing.expectEqualStrings("turso-secret", cfg.effectiveDatabaseAuthToken().?);
+    try std.testing.expectEqualStrings("/custom/path.db", cfg.effectiveDatabasePath().?);
+    try std.testing.expectEqual(@as(usize, 0), sink.items.len);
+}
+
+test "effective database accessors resolve priority and fallback" {
+    const gpa = std.testing.allocator;
+
+    // Unset config defaults to local
+    var cfg_default: Config = .{};
+    defer cfg_default.deinit(gpa);
+    try std.testing.expectEqual(DatabaseBackendKind.local, cfg_default.effectiveDatabaseBackend());
+    try std.testing.expect(cfg_default.effectiveDatabaseUrl() == null);
+    try std.testing.expect(cfg_default.effectiveDatabaseAuthToken() == null);
+    try std.testing.expect(cfg_default.effectiveDatabasePath() == null);
+
+    // Legacy databaseServerUrl maps to zay_service
+    var cfg_legacy: Config = .{
+        .database_server_url = try gpa.dupe(u8, "http://localhost:8766"),
+        .database_auth_token = try gpa.dupe(u8, "legacy-token"),
+    };
+    defer cfg_legacy.deinit(gpa);
+    try std.testing.expectEqual(DatabaseBackendKind.zay_service, cfg_legacy.effectiveDatabaseBackend());
+    try std.testing.expectEqualStrings("http://localhost:8766", cfg_legacy.effectiveDatabaseUrl().?);
+    try std.testing.expectEqualStrings("legacy-token", cfg_legacy.effectiveDatabaseAuthToken().?);
+
+    // Modular database config takes precedence
+    var cfg_modular: Config = .{
+        .database_server_url = try gpa.dupe(u8, "http://legacy:8766"),
+        .database = .{
+            .backend = .postgres_native,
+            .url = try gpa.dupe(u8, "postgresql://user:pass@host/db"),
+            .auth_token = try gpa.dupe(u8, "modular-token"),
+        },
+    };
+    defer cfg_modular.deinit(gpa);
+    try std.testing.expectEqual(DatabaseBackendKind.postgres_native, cfg_modular.effectiveDatabaseBackend());
+    try std.testing.expectEqualStrings("postgresql://user:pass@host/db", cfg_modular.effectiveDatabaseUrl().?);
+    try std.testing.expectEqualStrings("modular-token", cfg_modular.effectiveDatabaseAuthToken().?);
+}
+
+test "serialize then parse roundtrips database section" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+
+    var orig: Config = .{
+        .provider_name = try gpa.dupe(u8, "openai"),
+        .model = .{ .id = try gpa.dupe(u8, "gpt-5.5") },
+        .base_url = try gpa.dupe(u8, "https://api.openai.com"),
+        .api_key = try gpa.dupe(u8, "sk-test"),
+        .database = .{
+            .backend = .zay_service,
+            .url = try gpa.dupe(u8, "http://localhost:8766"),
+            .auth_token = try gpa.dupe(u8, "secret-token"),
+            .path = try gpa.dupe(u8, "/tmp/sessions.db"),
+        },
+    };
+    defer orig.deinit(gpa);
+
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, orig);
+
+    var roundtripped = try parseFile(gpa, "<test>", buf.written(), &sink);
+    defer roundtripped.deinit(gpa);
+
+    try std.testing.expectEqual(DatabaseBackendKind.zay_service, roundtripped.database.backend.?);
+    try std.testing.expectEqualStrings("http://localhost:8766", roundtripped.database.url.?);
+    try std.testing.expectEqualStrings("secret-token", roundtripped.database.auth_token.?);
+    try std.testing.expectEqualStrings("/tmp/sessions.db", roundtripped.database.path.?);
 }
 
 test "parseObject: camelCase wins over snake_case when both present" {
