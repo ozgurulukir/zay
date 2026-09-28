@@ -326,10 +326,12 @@ class PostgresBackend(DatabaseBackend):
             FROM information_schema.columns
             WHERE table_schema = 'public'
         """
+        params: list[Any] = []
         if table:
-            sql += f" AND table_name = '{table}'"
+            sql += " AND table_name = $1"
+            params.append(table)
         async with self._pool.acquire() as conn:
-            records = await conn.fetch(sql)
+            records = await conn.fetch(sql, *params)
             tables: dict[str, Any] = {}
             for r in records:
                 t = r["table_name"]

@@ -356,6 +356,15 @@ fn writeQueuedEntry(writer: *SessionWriter, entry: *const QueuedEntry) Error!voi
     assert(entry.kind.len > 0);
     assert(entry.payload_json.len > 0);
 
+    const should_write_title = !writer.title_written and entry.title_candidate != null;
+    if (writer.manager.backend.kind == .remote_service) {
+        var id: [entry_id_len]u8 = undefined;
+        const title = if (should_write_title) entry.title_candidate else null;
+        try writer.session.appendQueuedPayload(entry.kind, entry.role, entry.payload_json, title, &id);
+        if (should_write_title) writer.title_written = true;
+        return;
+    }
+
     const previous_leaf = writer.session.leaf_entry_id;
     try writer.manager.backend.beginTransaction(writer.io);
     errdefer {
@@ -365,7 +374,6 @@ fn writeQueuedEntry(writer: *SessionWriter, entry: *const QueuedEntry) Error!voi
 
     var id: [entry_id_len]u8 = undefined;
     try writer.session.appendPayload(entry.kind, entry.role, entry.payload_json, &id);
-    const should_write_title = !writer.title_written and entry.title_candidate != null;
     if (should_write_title) try writer.session.setTitle(entry.title_candidate.?);
 
     try writer.manager.backend.commitTransaction(writer.io);

@@ -298,9 +298,14 @@ pub const Client = struct {
         const aa = arena.allocator();
 
         const url = try self.requestUrl(aa, "/v1/schema");
-        var payload: ?[]u8 = null;
+        var payload: []const u8 = "{}";
         if (table) |t| {
-            payload = try std.fmt.allocPrint(aa, "{{\"table\":\"{s}\"}}", .{t});
+            var out: std.Io.Writer.Allocating = .init(aa);
+            defer out.deinit();
+            try out.writer.writeAll("{\"table\":");
+            try std.json.Stringify.value(t, .{}, &out.writer);
+            try out.writer.writeByte('}');
+            payload = try out.toOwnedSlice();
         }
 
         const response_bytes = try self.fetch(aa, io, .POST, url, payload);
@@ -325,12 +330,18 @@ pub const Client = struct {
                 if (col_val != .object) continue;
                 const name_val = col_val.object.get("name") orelse continue;
                 const type_val = col_val.object.get("type");
-                const null_val = col_val.object.get("notnull") orelse col_val.object.get("nullable");
+                const notnull_val = col_val.object.get("notnull");
+                const nullable_val = col_val.object.get("nullable");
                 const pk_val = col_val.object.get("pk");
 
                 const c_name = if (name_val == .string) name_val.string else continue;
                 const c_type = if (type_val != null and type_val.? == .string) type_val.?.string else "text";
-                const is_null = if (null_val != null and null_val.? == .bool) !null_val.?.bool else true;
+                const is_null = if (notnull_val != null and notnull_val.? == .bool)
+                    !notnull_val.?.bool
+                else if (nullable_val != null and nullable_val.? == .bool)
+                    nullable_val.?.bool
+                else
+                    true;
                 const is_pk = if (pk_val != null and pk_val.? == .bool) pk_val.?.bool else false;
 
                 try cols.append(aa, .{
