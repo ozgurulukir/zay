@@ -8,6 +8,8 @@ pub const service = @import("db/service.zig");
 pub const Service = service.Client;
 pub const turso = @import("db/turso.zig");
 pub const Turso = turso.Client;
+pub const d1 = @import("db/d1.zig");
+pub const D1 = d1.Client;
 
 pub const Error = error{
     Misuse,

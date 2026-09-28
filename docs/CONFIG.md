@@ -389,8 +389,9 @@ Zay to apply changes. See `docs/plugins/` for the full plugin development guide.
 
 ### External Database & Roaming Session Configuration
 
-Zay supports delegating its internal session storage (`src/session/`) and application database inspection to a remote database service (such as `tools/db_server/`) or directly to **Turso / LibSQL Cloud** over HTTP (`turso_http`). This enables roaming users to access and sync their full session history, timeline branches, and resume points across multiple development machines without managing a local proxy.
+Zay supports delegating its internal session storage (`src/session/`) and application database inspection to a remote database service (such as `tools/db_server/`) or directly to cloud SQLite providers over HTTP (**Turso / LibSQL** via `turso_http` or **Cloudflare D1** via `d1_http`). This enables roaming users to access and sync their full session history, timeline branches, and resume points across multiple development machines without managing a local proxy.
 
+**Turso / LibSQL (`turso_http`):**
 ```json
 {
   "database": {
@@ -401,7 +402,18 @@ Zay supports delegating its internal session storage (`src/session/`) and applic
 }
 ```
 
-Or when using the local/remote companion service (`zay_service`):
+**Cloudflare D1 (`d1_http`):**
+```json
+{
+  "database": {
+    "backend": "d1_http",
+    "url": "d1://my-account-id/my-database-id",
+    "authToken": "your-cloudflare-api-token"
+  }
+}
+```
+
+**Companion Service (`zay_service`):**
 ```json
 {
   "database": {
@@ -415,9 +427,10 @@ Or when using the local/remote companion service (`zay_service`):
 - **Supported Backends (`database.backend`):**
   - `local` / `local_sqlite`: Local embedded SQLite file (`~/.config/zay/sessions.sqlite`).
   - `turso_http` / `turso` / `libsql`: Direct, native LibSQL Hrana v2 pipeline over HTTP. Reaches Turso Cloud directly with automatic `libsql://` -> `https://.../v2/pipeline` normalization, single-roundtrip pipeline batching, and zero daemon requirements.
+  - `d1_http` / `d1` / `cloudflare_d1`: Direct, native Cloudflare D1 client over Cloudflare's REST API (`POST .../d1/database/{id}/query`). Supports `d1://<account_id>/<database_id>` shorthand, atomic batch statement arrays, and zero daemon requirements.
   - `zay_service` / `remote_service`: Python or containerized database companion service supporting SQLite and PostgreSQL.
 - **Roaming User Synchronization:** Sessions and lane manifests record the local machine hostname (`host_id`), allowing filtering and clean multi-host coexistence.
-- **Fail-Safe Local Fallback:** If the external database server or Turso endpoint is unreachable or offline during startup, Zay emits a warning diagnostic and seamlessly falls back to the local embedded `sessions.sqlite` without crashing.
+- **Fail-Safe Local Fallback:** If the external database server or remote cloud endpoint is unreachable or offline during startup, Zay emits a warning diagnostic and seamlessly falls back to the local embedded `sessions.sqlite` without crashing.
 - **Agent Database Tool:** Setting an external database backend or server URL also activates the built-in `database` tool for the agent, enabling schema inspection (`inspect_schema`), read-only SQL queries (`query`), and DDL/DML execution (`execute`).
 
 ---

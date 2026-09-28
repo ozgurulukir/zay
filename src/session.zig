@@ -131,6 +131,21 @@ pub const SessionManager = struct {
         };
     }
 
+    pub fn initD1(gpa: std.mem.Allocator, io: std.Io, url: []const u8, auth_token: ?[]const u8, host_id: []const u8) Error!SessionManager {
+        assert(url.len > 0);
+        var b = try SessionBackend.openD1(gpa, url, auth_token, host_id);
+        errdefer b.deinit();
+        try session_migration.migrateBackend(&b, io);
+        const conn = db.Connection.open(":memory:", .{}) catch return error.SystemResources;
+        return .{
+            .gpa = gpa,
+            .io = io,
+            .backend = b,
+            .connection = conn,
+            .host_id = b.host_id,
+        };
+    }
+
     pub fn initFromConfig(
         gpa: std.mem.Allocator,
         io: std.Io,
@@ -206,6 +221,19 @@ pub const SessionManager = struct {
                         } else |err| {
                             const log = std.log.scoped(.session);
                             log.warn("session.turso_db_fallback url={s} err={s}", .{ url, @errorName(err) });
+                        }
+                    }
+                }
+                return initConfiguredLocal(gpa, io, home_dir, host_slice, resolved_path);
+            },
+            .d1_http => {
+                if (resolved_url) |url| {
+                    if (url.len > 0) {
+                        if (initD1(gpa, io, url, resolved_token, host_slice)) |d1_mgr| {
+                            return d1_mgr;
+                        } else |err| {
+                            const log = std.log.scoped(.session);
+                            log.warn("session.d1_db_fallback url={s} err={s}", .{ url, @errorName(err) });
                         }
                     }
                 }

@@ -441,3 +441,10 @@ Zay unifies local embedded SQLite and external REST database servers through `Se
    - **Hrana v2 JSON parameter mapping:** Encodes values into tagged `{ "type": "...", "value": "..." }` Hrana objects (with 64-bit integers string-encoded and blobs base64-encoded).
    - **Batch execution:** Sends one Hrana `batch` request whose conditional steps run `BEGIN`, each statement, and `COMMIT` only after the previous step succeeds. A final conditional `ROLLBACK` runs whenever commit did not succeed, fulfilling `INV-DB-BATCH` in one roundtrip. Separate pipeline `execute` requests are not atomic because Hrana continues after request errors.
    - **Schema introspection:** Queries `sqlite_master` and the parameterized `pragma_table_info(?)` table-valued function through the pipeline for table definitions and column details.
+
+7. **Direct Cloudflare D1 Backend (`d1_http`):**
+   `src/db/d1.zig` implements a native Cloudflare D1 HTTP client over Cloudflare's v4 REST API (`POST .../accounts/{account_id}/d1/database/{database_id}/query`).
+   - **Zero-daemon REST client:** Uses Zig's standard `std.http.Client` with bearer token auth and `std.json` serialization, requiring no Node/wrangler daemon at runtime.
+   - **URL normalization:** Expands shorthand `d1://<account_id>/<database_id>` or `d1://<account_id>:<database_id>` into the canonical Cloudflare v4 REST query endpoint, appending `/query` when needed.
+   - **Batch execution:** Sends batch queries as a JSON statement array (`[{"sql": "...", "params": [...]}, ...]`), fulfilling `INV-DB-BATCH` in a single HTTP request roundtrip.
+   - **Schema introspection:** Discovers tables from `sqlite_master` (excluding SQLite and Cloudflare internal tables) and queries column metadata via `PRAGMA table_info`.
