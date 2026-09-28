@@ -108,6 +108,12 @@ pub fn migrateBackend(backend: *backend_mod.SessionBackend, io: std.Io) !void {
         defer health.deinit();
         if (!std.mem.eql(u8, health.status, "ok")) return error.UnavailableBackend;
         is_postgres = false;
+    } else if (backend.kind == .d1_http) {
+        const client = backend.d1 orelse return error.MissingConnection;
+        var health = try client.health(io);
+        defer health.deinit();
+        if (!std.mem.eql(u8, health.status, "ok")) return error.UnavailableBackend;
+        is_postgres = false;
     } else {
         const service = backend.remote orelse return error.MissingConnection;
         var health = try service.health(io);

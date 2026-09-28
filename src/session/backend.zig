@@ -11,6 +11,7 @@ pub const BackendKind = enum {
     local_sqlite,
     remote_service,
     turso_http,
+    d1_http,
     postgres_native,
 
     pub const local = BackendKind.local_sqlite;
@@ -20,6 +21,7 @@ pub const BackendKind = enum {
         if (std.mem.eql(u8, str, "local") or std.mem.eql(u8, str, "local_sqlite") or std.mem.eql(u8, str, "sqlite")) return .local_sqlite;
         if (std.mem.eql(u8, str, "zay_service") or std.mem.eql(u8, str, "remote_service") or std.mem.eql(u8, str, "service")) return .remote_service;
         if (std.mem.eql(u8, str, "turso_http") or std.mem.eql(u8, str, "turso") or std.mem.eql(u8, str, "libsql")) return .turso_http;
+        if (std.mem.eql(u8, str, "d1_http") or std.mem.eql(u8, str, "d1") or std.mem.eql(u8, str, "cloudflare_d1") or std.mem.eql(u8, str, "cloudflare")) return .d1_http;
         if (std.mem.eql(u8, str, "postgres_native") or std.mem.eql(u8, str, "postgres") or std.mem.eql(u8, str, "postgresql")) return .postgres_native;
         return null;
     }
@@ -29,6 +31,7 @@ pub const BackendKind = enum {
             .local_sqlite => "local",
             .remote_service => "zay_service",
             .turso_http => "turso_http",
+            .d1_http => "d1_http",
             .postgres_native => "postgres_native",
         };
     }
@@ -48,6 +51,7 @@ pub const SessionBackend = struct {
     remote_url: ?[]const u8 = null,
     remote_token: ?[]const u8 = null,
     turso: ?db.Turso = null,
+    d1: ?db.D1 = null,
     host_id: []const u8,
 
     pub fn openLocal(gpa: std.mem.Allocator, conn: db.Connection, host_id: []const u8, path: []const u8) !SessionBackend {
@@ -60,6 +64,7 @@ pub const SessionBackend = struct {
             .local_path = owned_path,
             .remote = null,
             .turso = null,
+            .d1 = null,
             .host_id = try gpa.dupe(u8, host_id),
         };
     }
@@ -79,6 +84,7 @@ pub const SessionBackend = struct {
             .remote_url = owned_url,
             .remote_token = owned_token,
             .turso = null,
+            .d1 = null,
             .host_id = try gpa.dupe(u8, host_id),
         };
     }
@@ -99,6 +105,28 @@ pub const SessionBackend = struct {
             .remote_url = owned_url,
             .remote_token = owned_token,
             .turso = client,
+            .d1 = null,
+            .host_id = try gpa.dupe(u8, host_id),
+        };
+    }
+
+    pub fn openD1(gpa: std.mem.Allocator, url: []const u8, auth_token: ?[]const u8, host_id: []const u8) !SessionBackend {
+        const owned_url = try gpa.dupe(u8, url);
+        errdefer gpa.free(owned_url);
+        const owned_token = if (auth_token) |t| try gpa.dupe(u8, t) else null;
+        errdefer if (owned_token) |t| gpa.free(t);
+
+        const client = db.D1.init(gpa, owned_url, owned_token);
+        return .{
+            .gpa = gpa,
+            .kind = .d1_http,
+            .local = null,
+            .local_path = null,
+            .remote = null,
+            .remote_url = owned_url,
+            .remote_token = owned_token,
+            .turso = null,
+            .d1 = client,
             .host_id = try gpa.dupe(u8, host_id),
         };
     }
@@ -112,7 +140,7 @@ pub const SessionBackend = struct {
             .local_sqlite => {
                 if (self.local) |*conn| conn.close();
             },
-            .remote_service, .turso_http, .postgres_native => {},
+            .remote_service, .turso_http, .d1_http, .postgres_native => {},
         }
         self.* = undefined;
     }
@@ -141,6 +169,11 @@ pub const SessionBackend = struct {
                 const result = try client.exec(io, sql, params);
                 if (!result.success) return error.QueryFailed;
             },
+            .d1_http => {
+                const client = self.d1 orelse return error.MissingConnection;
+                const result = try client.exec(io, sql, params);
+                if (!result.success) return error.QueryFailed;
+            },
             .postgres_native => return error.BackendNotImplemented,
         }
     }
@@ -155,6 +188,11 @@ pub const SessionBackend = struct {
             },
             .turso_http => {
                 const client = self.turso orelse return error.MissingConnection;
+                const result = try client.batch(io, statements);
+                if (!result.success or result.results_count != statements.len) return error.QueryFailed;
+            },
+            .d1_http => {
+                const client = self.d1 orelse return error.MissingConnection;
                 const result = try client.batch(io, statements);
                 if (!result.success or result.results_count != statements.len) return error.QueryFailed;
             },
@@ -236,6 +274,10 @@ pub const SessionBackend = struct {
                 const client = self.turso orelse return error.MissingConnection;
                 return try client.query(io, sql, params);
             },
+            .d1_http => {
+                const client = self.d1 orelse return error.MissingConnection;
+                return try client.query(io, sql, params);
+            },
             .postgres_native => return error.BackendNotImplemented,
         }
     }
@@ -279,6 +321,14 @@ test "BackendKind correctly identifies turso_http" {
     try std.testing.expectEqualStrings("turso_http", BackendKind.turso_http.asString());
 }
 
+test "BackendKind correctly identifies d1_http" {
+    try std.testing.expectEqual(BackendKind.d1_http, BackendKind.fromString("d1_http").?);
+    try std.testing.expectEqual(BackendKind.d1_http, BackendKind.fromString("d1").?);
+    try std.testing.expectEqual(BackendKind.d1_http, BackendKind.fromString("cloudflare_d1").?);
+    try std.testing.expectEqual(BackendKind.d1_http, BackendKind.fromString("cloudflare").?);
+    try std.testing.expectEqualStrings("d1_http", BackendKind.d1_http.asString());
+}
+
 test "SessionBackend openTurso initializes and deinits cleanly without leaks" {
     const gpa = std.testing.allocator;
     var backend = try SessionBackend.openTurso(gpa, "https://my-db.turso.io", "secret-token", "test-host");
@@ -289,4 +339,16 @@ test "SessionBackend openTurso initializes and deinits cleanly without leaks" {
     try std.testing.expectEqualStrings("secret-token", backend.remote_token.?);
     try std.testing.expectEqualStrings("test-host", backend.host_id);
     try std.testing.expect(backend.turso != null);
+}
+
+test "SessionBackend openD1 initializes and deinits cleanly without leaks" {
+    const gpa = std.testing.allocator;
+    var backend = try SessionBackend.openD1(gpa, "d1://my-account/my-db", "secret-token", "test-host");
+    defer backend.deinit();
+
+    try std.testing.expectEqual(BackendKind.d1_http, backend.kind);
+    try std.testing.expectEqualStrings("d1://my-account/my-db", backend.remote_url.?);
+    try std.testing.expectEqualStrings("secret-token", backend.remote_token.?);
+    try std.testing.expectEqualStrings("test-host", backend.host_id);
+    try std.testing.expect(backend.d1 != null);
 }
