@@ -128,3 +128,10 @@ def test_to_pg_sql_translation():
     assert to_pg_sql("SELECT * FROM t WHERE a = ? AND b = ?") == "SELECT * FROM t WHERE a = $1 AND b = $2"
     assert to_pg_sql("UPDATE t SET a = ?1 WHERE b = ?2") == "UPDATE t SET a = $1 WHERE b = $2"
     assert to_pg_sql("SELECT 'what? is ?' FROM t WHERE x = ?") == "SELECT 'what? is ?' FROM t WHERE x = $1"
+
+
+def test_postgres_backend_ssl_parsing():
+    from backend import PostgresBackend
+
+    b = PostgresBackend("postgresql://user:pass@ep-xyz.neon.tech/neondb?sslmode=require")
+    assert b.connection_url.endswith("?sslmode=require")
