@@ -825,7 +825,7 @@ fn parseDatabase(gpa: std.mem.Allocator, value: std.json.Value) !DatabaseConfig 
     var db_cfg: DatabaseConfig = .{};
     errdefer db_cfg.deinit(gpa);
     if (stringFieldCompat(value, "backend", "backend")) |s| {
-        db_cfg.backend = DatabaseBackendKind.fromString(s);
+        db_cfg.backend = DatabaseBackendKind.fromString(s) orelse return error.InvalidDatabaseBackend;
     }
     if (stringFieldCompat(value, "url", "url")) |s| {
         if (s.len > 0) db_cfg.url = try gpa.dupe(u8, s);
@@ -1206,7 +1206,7 @@ fn loadEnv(
         }
     }
     if (env.get("ZAY_DATABASE_BACKEND")) |s| {
-        if (s.len > 0) out.database.backend = DatabaseBackendKind.fromString(s);
+        if (s.len > 0) out.database.backend = DatabaseBackendKind.fromString(s) orelse return error.InvalidDatabaseBackend;
     }
     if (env.get("ZAY_DATABASE_URL")) |s| {
         if (s.len > 0) out.database.url = try gpa.dupe(u8, s);

@@ -259,12 +259,12 @@ pub const DatabaseConfig = struct {
     }
 
     pub fn clone(self: DatabaseConfig, gpa: std.mem.Allocator) !DatabaseConfig {
-        return .{
-            .backend = self.backend,
-            .url = if (self.url) |u| try gpa.dupe(u8, u) else null,
-            .auth_token = if (self.auth_token) |t| try gpa.dupe(u8, t) else null,
-            .path = if (self.path) |p| try gpa.dupe(u8, p) else null,
-        };
+        var copy: DatabaseConfig = .{ .backend = self.backend };
+        errdefer copy.deinit(gpa);
+        if (self.url) |u| copy.url = try gpa.dupe(u8, u);
+        if (self.auth_token) |t| copy.auth_token = try gpa.dupe(u8, t);
+        if (self.path) |p| copy.path = try gpa.dupe(u8, p);
+        return copy;
     }
 };
 
@@ -409,6 +409,7 @@ pub const Config = struct {
     pub fn effectiveDatabaseBackend(self: *const Config) DatabaseBackendKind {
         if (self.database.backend) |b| return b;
         if (self.database.url != null and self.database.url.?.len > 0) return .zay_service;
+        if (self.database.path != null and self.database.path.?.len > 0) return .local;
         if (self.database_server_url != null and self.database_server_url.?.len > 0) return .zay_service;
         return .local;
     }
