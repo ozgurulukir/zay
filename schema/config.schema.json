@@ -454,8 +454,7 @@
         "backend": {
           "type": "string",
           "enum": ["local", "zay_service", "turso_http", "postgres_native"],
-          "default": "local",
-          "description": "Selected database storage backend: 'local' (embedded SQLite), 'zay_service' (HTTP companion service), 'turso_http' (LibSQL/Turso direct HTTP pipeline), 'postgres_native' (native PostgreSQL wire protocol)."
+          "description": "Selected database storage backend. When omitted, a configured URL selects zay_service; otherwise local SQLite is used. turso_http and postgres_native currently use local fallback storage."
         },
         "url": {
           "type": "string",
@@ -468,7 +467,7 @@
         },
         "path": {
           "type": "string",
-          "description": "Filesystem path for local SQLite database file (overrides default ~/.config/zay/sessions.db)."
+          "description": "Filesystem path for local SQLite database file, including when a remote service falls back to local storage (overrides the platform config directory's sessions.sqlite)."
         }
       },
       "additionalProperties": false

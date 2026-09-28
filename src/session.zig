@@ -52,7 +52,7 @@ pub const SessionManager = struct {
         assert(path.len > 0);
         // :memory: is a special SQLite path — no filesystem directory needed.
         if (!std.mem.eql(u8, path, ":memory:")) {
-            const dirname = std.fs.path.dirname(path) orelse return error.InvalidPath;
+            const dirname = std.fs.path.dirname(path) orelse ".";
             std.Io.Dir.createDirPath(.cwd(), io, dirname) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 error.FileNotFound,
@@ -92,6 +92,13 @@ pub const SessionManager = struct {
         const db_path = try session_migration.defaultPath(gpa, home_dir);
         defer gpa.free(db_path);
         return initWithHost(gpa, io, db_path, host_id);
+    }
+
+    fn initConfiguredLocal(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, host_id: []const u8, custom_path: ?[]const u8) Error!SessionManager {
+        if (custom_path) |path| {
+            if (path.len > 0) return initWithHost(gpa, io, path, host_id);
+        }
+        return initDefaultWithHost(gpa, io, home_dir, host_id);
     }
 
     pub fn initRemote(gpa: std.mem.Allocator, io: std.Io, url: []const u8, auth_token: ?[]const u8, host_id: []const u8) Error!SessionManager {
@@ -141,9 +148,7 @@ pub const SessionManager = struct {
 
         if (env_map) |em| {
             if (em.get("ZAY_DATABASE_BACKEND")) |b_str| {
-                if (backend_mod.BackendKind.fromString(b_str)) |bk| {
-                    resolved_backend = bk;
-                }
+                if (b_str.len > 0) resolved_backend = backend_mod.BackendKind.fromString(b_str) orelse return error.InvalidDatabaseBackend;
             }
             if (em.get("ZAY_DATABASE_URL")) |u| {
                 if (u.len > 0) resolved_url = u;
@@ -163,10 +168,7 @@ pub const SessionManager = struct {
 
         switch (kind) {
             .local_sqlite => {
-                if (resolved_path) |p| {
-                    if (p.len > 0) return initWithHost(gpa, io, p, host_slice);
-                }
-                return initDefaultWithHost(gpa, io, home_dir, host_slice);
+                return initConfiguredLocal(gpa, io, home_dir, host_slice, resolved_path);
             },
             .remote_service => {
                 if (resolved_url) |url| {
@@ -179,12 +181,12 @@ pub const SessionManager = struct {
                         }
                     }
                 }
-                return initDefaultWithHost(gpa, io, home_dir, host_slice);
+                return initConfiguredLocal(gpa, io, home_dir, host_slice, resolved_path);
             },
             .turso_http, .postgres_native => {
                 const log = std.log.scoped(.session);
                 log.warn("session.backend_not_implemented backend={s}; falling back to local storage", .{@tagName(kind)});
-                return initDefaultWithHost(gpa, io, home_dir, host_slice);
+                return initConfiguredLocal(gpa, io, home_dir, host_slice, resolved_path);
             },
         }
     }
