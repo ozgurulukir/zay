@@ -24,21 +24,11 @@ const commands = tui.commands;
 const command_prefix: u8 = '/';
 
 pub fn syncModeWithInput(app: *App, value: []const u8) !void {
-    // While typing an API key in the provider form, the input is the key —
-    // never reinterpret a leading '/' as a command.
+    // While typing an API key in the provider form, the input is the key.
     if (app.mode == .provider_picker and app.pickers.provider.stage == .form) return;
-    // While renaming a session, the palette input is not the rename target —
-    // don't reinterpret a leading '/' as a command.
+    // While renaming a session, the palette input is not the rename target.
     if (app.mode == .session_picker and app.nav.session_action != .browsing) return;
     if (app.mode == .session_picker or app.mode == .provider_picker or app.mode == .model_picker or app.mode == .tree_picker or app.mode == .theme_picker) {
-        if (value.len > 0 and value[0] == command_prefix) {
-            // Leaving `.theme_picker` via a leading '/' is a non-commit exit —
-            // revert the live preview before entering the command menu (M2).
-            if (app.mode == .theme_picker) theme_lifecycle.closeThemePicker(app);
-            app.mode = .command;
-            app.nav.command_selection = 0;
-            return;
-        }
         if (app.mode == .theme_picker) {
             // Keep the selection valid while filtering: a filter that removes
             // the selected row resets to the top instead of pointing past the
@@ -55,12 +45,6 @@ pub fn syncModeWithInput(app: *App, value: []const u8) !void {
         }
         return;
     }
-    if (value.len > 0 and value[0] == command_prefix) {
-        app.mode = .command;
-        app.nav.command_selection = 0;
-        return;
-    }
-    app.mode = .normal;
     app.nav.command_selection = 0;
 }
 
@@ -145,14 +129,14 @@ fn refuseOnIdleLane(app: *App) bool {
 pub fn commandNeedsRuntime(command: Command) bool {
     return switch (command) {
         .new, .resume_session, .timeline, .undo, .connect => true,
-        .model, .mcp, .plugins, .settings, .theme, .diff, .parallel, .save, .search, .close, .merge, .lanes, .clear, .compact, .status, .skills, .help, .export_session, .copy, .paste, .exit_cmd => false,
+        .model, .mcp, .plugins, .settings, .theme, .diff, .parallel, .save, .search, .close, .merge, .lanes, .clear, .compact, .status, .skills, .help, .export_session, .copy, .paste, .exit_cmd, .database => false,
     };
 }
 
 test "commandNeedsRuntime covers every command exactly once" {
     // Enumeration pin: add the new Command here AND decide its needs-runtime
     // bit in the switch above — the compiler only forces the switch.
-    const all = [_]Command{ .connect, .model, .mcp, .new, .resume_session, .timeline, .undo, .diff, .parallel, .save, .close, .merge, .lanes, .search, .clear, .compact, .status, .help, .export_session, .settings, .copy, .paste, .exit_cmd, .plugins, .skills, .theme };
+    const all = [_]Command{ .connect, .model, .mcp, .new, .resume_session, .timeline, .undo, .diff, .parallel, .save, .close, .merge, .lanes, .search, .clear, .compact, .status, .help, .export_session, .settings, .copy, .paste, .exit_cmd, .plugins, .skills, .theme, .database };
     const needs_runtime = [_]Command{ .new, .resume_session, .timeline, .undo, .connect };
     var seen = std.EnumSet(Command).initEmpty();
     var needs_runtime_seen: usize = 0;
@@ -498,6 +482,21 @@ pub fn submitMode(app: *App) !bool {
                     },
                     .exit_cmd => {
                         app.nav.quit = .confirmed;
+                    },
+                    .database => {
+                        app.mode = .normal;
+                        const db_cfg = app.cached_config.database;
+                        const backend_str = if (db_cfg.backend) |b| b.asString() else "local";
+                        const url_str = db_cfg.url orelse "(none)";
+                        var db_buf: [256]u8 = undefined;
+                        const db_text = try std.fmt.bufPrint(
+                            &db_buf,
+                            "Database Backend:\n" ++
+                                "  • Kind: {s}\n" ++
+                                "  • URL:  {s}",
+                            .{ backend_str, url_str },
+                        );
+                        _ = try app.thread.transcript.append(app.gpa, .notice, "database", db_text);
                     },
                 }
             }
