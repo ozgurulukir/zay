@@ -69,6 +69,72 @@ pub const SessionWriter = struct {
         try target.initWithSession(gpa, io, manager, session, capacity);
     }
 
+    pub fn initFromConfig(
+        target: *SessionWriter,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        home_dir: []const u8,
+        cwd: []const u8,
+        database_server_url: ?[]const u8,
+        database_auth_token: ?[]const u8,
+        env_map: ?*const std.process.Environ.Map,
+    ) Error!void {
+        return initFromConfigWithCapacity(target, gpa, io, home_dir, cwd, database_server_url, database_auth_token, env_map, queue_capacity_default);
+    }
+
+    pub fn initResumeFromConfig(
+        target: *SessionWriter,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        home_dir: []const u8,
+        session_id: []const u8,
+        database_server_url: ?[]const u8,
+        database_auth_token: ?[]const u8,
+        env_map: ?*const std.process.Environ.Map,
+    ) Error!void {
+        return initResumeFromConfigWithCapacity(target, gpa, io, home_dir, session_id, database_server_url, database_auth_token, env_map, queue_capacity_default);
+    }
+
+    pub fn initFromConfigWithCapacity(
+        target: *SessionWriter,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        home_dir: []const u8,
+        cwd: []const u8,
+        database_server_url: ?[]const u8,
+        database_auth_token: ?[]const u8,
+        env_map: ?*const std.process.Environ.Map,
+        capacity: u32,
+    ) Error!void {
+        assert(home_dir.len > 0);
+        assert(cwd.len > 0);
+        assert(capacity > 0);
+        var manager = try SessionManager.initFromConfig(gpa, io, home_dir, database_server_url, database_auth_token, env_map);
+        errdefer manager.deinit();
+        const session = try manager.create(cwd, .{});
+        try target.initWithSession(gpa, io, manager, session, capacity);
+    }
+
+    pub fn initResumeFromConfigWithCapacity(
+        target: *SessionWriter,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        home_dir: []const u8,
+        session_id: []const u8,
+        database_server_url: ?[]const u8,
+        database_auth_token: ?[]const u8,
+        env_map: ?*const std.process.Environ.Map,
+        capacity: u32,
+    ) Error!void {
+        assert(home_dir.len > 0);
+        assert(session_id.len > 0);
+        assert(capacity > 0);
+        var manager = try SessionManager.initFromConfig(gpa, io, home_dir, database_server_url, database_auth_token, env_map);
+        errdefer manager.deinit();
+        const session = try manager.@"resume"(session_id);
+        try target.initWithSession(gpa, io, manager, session, capacity);
+    }
+
     fn initWithSession(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, manager: SessionManager, session: Session, capacity: u32) Error!void {
         const queue = try gpa.alloc(QueuedEntry, capacity);
         errdefer gpa.free(queue);
@@ -291,9 +357,9 @@ fn writeQueuedEntry(writer: *SessionWriter, entry: *const QueuedEntry) Error!voi
     assert(entry.payload_json.len > 0);
 
     const previous_leaf = writer.session.leaf_entry_id;
-    try writer.manager.connection.exec("begin immediate");
+    try writer.manager.backend.beginTransaction(writer.io);
     errdefer {
-        writer.manager.connection.exec("rollback") catch {};
+        writer.manager.backend.rollbackTransaction(writer.io) catch {};
         writer.session.leaf_entry_id = previous_leaf;
     }
 
@@ -302,7 +368,7 @@ fn writeQueuedEntry(writer: *SessionWriter, entry: *const QueuedEntry) Error!voi
     const should_write_title = !writer.title_written and entry.title_candidate != null;
     if (should_write_title) try writer.session.setTitle(entry.title_candidate.?);
 
-    try writer.manager.connection.exec("commit");
+    try writer.manager.backend.commitTransaction(writer.io);
     if (should_write_title) writer.title_written = true;
 }
 

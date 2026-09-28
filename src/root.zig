@@ -201,7 +201,14 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     // lane sessions share the driver's cwd — a lane that wrote entries after
     // the driver's last message used to hijack auto-resume via findLatest.
     const resume_session_id = blk: {
-        var manager = session.SessionManager.initDefault(runtime_gpa, init.io, home_dir) catch break :blk null;
+        var manager = session.SessionManager.initFromConfig(
+            runtime_gpa,
+            init.io,
+            home_dir,
+            load_result.config.database_server_url,
+            load_result.config.database_auth_token,
+            init.environ_map,
+        ) catch break :blk null;
         defer manager.deinit();
         const id = lane_recovery.resolveStartupResumeId(runtime_gpa, &manager, cwd) catch null;
         break :blk id;

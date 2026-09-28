@@ -223,6 +223,38 @@ class SqliteBackend(DatabaseBackend):
                 cur.close()
 
 
+def to_pg_sql(sql: str) -> str:
+    """Translates '?' or '?1' placeholders in SQL to '$1, $2, ...' for Postgres/asyncpg."""
+    parts: list[str] = []
+    param_idx = 1
+    in_single_quote = False
+    in_double_quote = False
+    i = 0
+    while i < len(sql):
+        c = sql[i]
+        if c == "'" and not in_double_quote:
+            in_single_quote = not in_single_quote
+            parts.append(c)
+        elif c == '"' and not in_single_quote:
+            in_double_quote = not in_double_quote
+            parts.append(c)
+        elif c == '?' and not in_single_quote and not in_double_quote:
+            j = i + 1
+            while j < len(sql) and sql[j].isdigit():
+                j += 1
+            if j > i + 1:
+                digit = int(sql[i + 1 : j])
+                parts.append(f"${digit}")
+                i = j - 1
+            else:
+                parts.append(f"${param_idx}")
+                param_idx += 1
+        else:
+            parts.append(c)
+        i += 1
+    return "".join(parts)
+
+
 class PostgresBackend(DatabaseBackend):
     """PostgreSQL backend connector (using asyncpg or psycopg when available)."""
 
@@ -254,16 +286,18 @@ class PostgresBackend(DatabaseBackend):
         if not self._pool:
             raise RuntimeError("Postgres pool not connected")
         p = params or []
+        pg_sql = to_pg_sql(sql)
         async with self._pool.acquire() as conn:
-            status = await conn.execute(sql, *p)
+            status = await conn.execute(pg_sql, *p)
             return {"success": True, "status": status, "changes": 1}
 
     async def query(self, sql: str, params: list[Any] | None = None) -> dict[str, Any]:
         if not self._pool:
             raise RuntimeError("Postgres pool not connected")
         p = params or []
+        pg_sql = to_pg_sql(sql)
         async with self._pool.acquire() as conn:
-            records = await conn.fetch(sql, *p)
+            records = await conn.fetch(pg_sql, *p)
             if not records:
                 return {"success": True, "columns": [], "types": [], "rows": [], "count": 0}
             cols = list(records[0].keys())
@@ -279,7 +313,8 @@ class PostgresBackend(DatabaseBackend):
                 for s in statements:
                     sql = s.get("sql", "")
                     p = s.get("params", [])
-                    st = await conn.execute(sql, *p)
+                    pg_sql = to_pg_sql(sql)
+                    st = await conn.execute(pg_sql, *p)
                     results.append({"status": st})
                 return {"success": True, "results": results}
 

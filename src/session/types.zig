@@ -53,23 +53,7 @@ pub const SessionId = struct {
     }
 };
 
-pub const Error = db.Error || error{
-    BadSessionId,
-    BadEntryId,
-    MissingSession,
-    MissingEntry,
-    UnsupportedEntryKind,
-    CorruptPayload,
-    OutOfMemory,
-    WriteFailed,
-    SystemResources,
-    Unexpected,
-    LockedMemoryLimitExceeded,
-    ThreadQuotaExceeded,
-    QueueFull,
-    Canceled,
-    InvalidPath,
-};
+pub const Error = anyerror;
 
 /// A single entry queued for the background writer thread.
 pub const QueuedEntry = struct {
@@ -94,6 +78,7 @@ pub const CreateOptions = struct {
     title: ?[]const u8 = null,
     model_provider: ?[]const u8 = null,
     model_id: ?[]const u8 = null,
+    host_id: ?[]const u8 = null,
 };
 
 pub const SessionSummary = struct {
@@ -115,6 +100,8 @@ pub const SessionSummary = struct {
     /// null for sessions created before schema v5 or when the user never
     /// overrode the effort — resume then falls back to config/default.
     reasoning_effort: ?[]u8,
+    /// Machine or host identifier where the session originated.
+    host_id: ?[]u8 = null,
 
     pub fn deinit(self: *SessionSummary, gpa: std.mem.Allocator) void {
         gpa.free(self.id);
@@ -123,6 +110,7 @@ pub const SessionSummary = struct {
         if (self.model_provider) |mp| gpa.free(mp);
         if (self.model_id) |mid| gpa.free(mid);
         if (self.reasoning_effort) |effort| gpa.free(effort);
+        if (self.host_id) |hid| gpa.free(hid);
         self.* = undefined;
     }
 };

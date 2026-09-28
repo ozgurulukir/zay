@@ -8,11 +8,15 @@ const assert = std.debug.assert;
 
 const session_type = @import("session/types.zig");
 const session_migration = @import("session/migration.zig");
+const session_backend = @import("session/backend.zig");
 const serialize = @import("session/serialize.zig");
 const session_writer = @import("session/writer.zig");
 const paths = @import("paths.zig");
 
 pub const SessionWriter = session_writer.SessionWriter;
+pub const SessionBackend = session_backend.SessionBackend;
+pub const BackendKind = session_backend.BackendKind;
+const backend_mod = session_backend;
 
 pub const entry_id_len = session_type.entry_id_len;
 const session_id_len = session_type.session_id_len;
@@ -36,9 +40,15 @@ pub const EntrySummary = session_type.EntrySummary;
 pub const SessionManager = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
+    backend: SessionBackend,
     connection: db.Connection,
+    host_id: []const u8,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, path: []const u8) Error!SessionManager {
+        return initWithHost(gpa, io, path, "default-host");
+    }
+
+    pub fn initWithHost(gpa: std.mem.Allocator, io: std.Io, path: []const u8, host_id: []const u8) Error!SessionManager {
         assert(path.len > 0);
         // :memory: is a special SQLite path — no filesystem directory needed.
         if (!std.mem.eql(u8, path, ":memory:")) {
@@ -55,8 +65,16 @@ pub const SessionManager = struct {
         }
         var connection = try db.Connection.open(path, .{});
         errdefer connection.close();
-        try session_migration.migrate(&connection, io);
-        return .{ .gpa = gpa, .io = io, .connection = connection };
+        var b = try SessionBackend.openLocal(gpa, connection, host_id);
+        errdefer b.deinit();
+        try session_migration.migrateBackend(&b, io);
+        return .{
+            .gpa = gpa,
+            .io = io,
+            .backend = b,
+            .connection = connection,
+            .host_id = b.host_id,
+        };
     }
 
     pub fn initDefault(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) Error!SessionManager {
@@ -66,8 +84,74 @@ pub const SessionManager = struct {
         return init(gpa, io, db_path);
     }
 
+    pub fn initDefaultWithHost(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, host_id: []const u8) Error!SessionManager {
+        assert(home_dir.len > 0);
+        const db_path = try session_migration.defaultPath(gpa, home_dir);
+        defer gpa.free(db_path);
+        return initWithHost(gpa, io, db_path, host_id);
+    }
+
+    pub fn initRemote(gpa: std.mem.Allocator, io: std.Io, url: []const u8, auth_token: ?[]const u8, host_id: []const u8) Error!SessionManager {
+        assert(url.len > 0);
+        var b = try SessionBackend.openRemote(gpa, url, auth_token, host_id);
+        errdefer b.deinit();
+        try session_migration.migrateBackend(&b, io);
+        const conn = db.Connection.open(":memory:", .{}) catch return error.SystemResources;
+        return .{
+            .gpa = gpa,
+            .io = io,
+            .backend = b,
+            .connection = conn,
+            .host_id = b.host_id,
+        };
+    }
+
+    pub fn initFromConfig(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        home_dir: []const u8,
+        database_server_url: ?[]const u8,
+        database_auth_token: ?[]const u8,
+        env_map: ?*const std.process.Environ.Map,
+    ) Error!SessionManager {
+        const host_id = backend_mod.resolveHostId(gpa, env_map) catch null;
+        defer if (host_id) |h| gpa.free(h);
+        const host_slice = host_id orelse "default-host";
+
+        var url_opt = database_server_url;
+        if (url_opt == null or url_opt.?.len == 0) {
+            if (env_map) |em| {
+                if (em.get("ZAY_DATABASE_SERVER_URL")) |u| {
+                    if (u.len > 0) url_opt = u;
+                }
+            }
+        }
+
+        if (url_opt) |url| {
+            if (url.len > 0) {
+                var token = database_auth_token;
+                if ((token == null or token.?.len == 0) and env_map != null) {
+                    if (env_map.?.get("ZAY_DATABASE_AUTH_TOKEN")) |t| {
+                        if (t.len > 0) token = t;
+                    }
+                }
+                if (initRemote(gpa, io, url, token, host_slice)) |remote_mgr| {
+                    return remote_mgr;
+                } else |err| {
+                    const log = std.log.scoped(.session);
+                    log.warn("session.external_db_fallback url={s} err={s}", .{ url, @errorName(err) });
+                }
+            }
+        }
+
+        return initDefaultWithHost(gpa, io, home_dir, host_slice);
+    }
+
     pub fn deinit(self: *SessionManager) void {
-        self.connection.close();
+        if (self.backend.kind == .remote_service) {
+            self.connection.close();
+        }
+        self.backend.deinit();
         self.* = undefined;
     }
 
@@ -84,35 +168,27 @@ pub const SessionManager = struct {
         };
 
         const timestamp_ms = nowMs(self.io);
-        var statement = try self.connection.prepare("insert into sessions(id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id) values (?, ?, ?, ?, ?, null, ?, ?)");
-        defer statement.finalize();
-        try statement.bindText(1, session_id);
-        if (options.title) |title| {
-            try statement.bindText(2, title);
-        } else {
-            try statement.bindNull(2);
-        }
-        try statement.bindText(3, cwd);
-        try statement.bindInt(4, timestamp_ms);
-        try statement.bindInt(5, timestamp_ms);
-        if (options.model_provider) |mp| {
-            try statement.bindText(6, mp);
-        } else {
-            try statement.bindNull(6);
-        }
-        if (options.model_id) |mid| {
-            try statement.bindText(7, mid);
-        } else {
-            try statement.bindNull(7);
-        }
-        try expectDone(&statement);
+        const host = options.host_id orelse self.host_id;
+
+        const sql = "insert into sessions(id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id, host_id) values (?, ?, ?, ?, ?, null, ?, ?, ?)";
+        const params = [_]backend_mod.SqlParam{
+            .{ .text = session_id },
+            if (options.title) |t| .{ .text = t } else .null,
+            .{ .text = cwd },
+            .{ .int = timestamp_ms },
+            .{ .int = timestamp_ms },
+            if (options.model_provider) |mp| .{ .text = mp } else .null,
+            if (options.model_id) |mid| .{ .text = mid } else .null,
+            if (host.len > 0) .{ .text = host } else .null,
+        };
+
+        try self.backend.exec(self.io, sql, &params);
 
         const session = Session{
             .manager = self,
             .id = .{ .bytes = id_buffer },
             .leaf_entry_id = null,
         };
-        // Two-way assertion: created session round-trips through resume.
         assert(session.id.bytes.len == session_id_len);
         return session;
     }
@@ -121,17 +197,18 @@ pub const SessionManager = struct {
         assert(session_id.len > 0);
         if (session_id.len != session_id_len) return error.BadSessionId;
 
-        var statement = try self.connection.prepare("select leaf_entry_id from sessions where id = ?");
-        defer statement.finalize();
-        try statement.bindText(1, session_id);
-        const row = (try statement.step()) orelse return error.MissingSession;
+        const sql = "select leaf_entry_id from sessions where id = ?";
+        var qres = try self.backend.query(self.io, sql, &.{.{ .text = session_id }});
+        defer qres.deinit();
+
+        if (qres.rows.len == 0) return error.MissingSession;
+        const row = qres.rows[0];
 
         const id = try SessionId.fromSlice(session_id);
         var leaf_buffer: [entry_id_len]u8 = undefined;
-        const leaf = switch (row.columnType(0)) {
+        const leaf = switch (row[0]) {
             .null => null,
-            .text => blk: {
-                const value = row.text(0);
+            .text => |value| blk: {
                 if (value.len != entry_id_len) return error.BadEntryId;
                 @memcpy(leaf_buffer[0..], value);
                 break :blk EntryId{ .bytes = leaf_buffer };
@@ -143,20 +220,25 @@ pub const SessionManager = struct {
 
     pub fn list(self: *SessionManager, gpa: std.mem.Allocator, cwd: ?[]const u8) Error![]SessionSummary {
         const sql = if (cwd == null)
-            "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id, reasoning_effort from sessions where leaf_entry_id is not null order by updated_at_ms desc"
+            "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id, reasoning_effort, host_id from sessions where leaf_entry_id is not null order by updated_at_ms desc, id desc"
         else
-            "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id, reasoning_effort from sessions where cwd = ? and leaf_entry_id is not null order by updated_at_ms desc";
-        var statement = try self.connection.prepare(sql);
-        defer statement.finalize();
-        if (cwd) |path| try statement.bindText(1, path);
+            "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id, reasoning_effort, host_id from sessions where cwd = ? and leaf_entry_id is not null order by updated_at_ms desc, id desc";
+
+        const params = if (cwd) |path|
+            &[_]backend_mod.SqlParam{.{ .text = path }}
+        else
+            &[_]backend_mod.SqlParam{};
+
+        var qres = try self.backend.query(self.io, sql, params);
+        defer qres.deinit();
 
         var summaries: std.ArrayList(SessionSummary) = .empty;
         errdefer {
             for (summaries.items) |*summary| summary.deinit(gpa);
             summaries.deinit(gpa);
         }
-        while (try statement.step()) |row| {
-            try summaries.append(gpa, try readSummary(gpa, &row));
+        for (qres.rows) |row| {
+            try summaries.append(gpa, try readSummaryFromRow(gpa, row));
         }
         return summaries.toOwnedSlice(gpa);
     }
@@ -164,33 +246,35 @@ pub const SessionManager = struct {
     /// Find the most recently updated session for the given cwd. Returns null
     /// when no session exists for this directory. Caller owns the returned id.
     pub fn findLatest(self: *SessionManager, gpa: std.mem.Allocator, cwd: []const u8) Error!?[]u8 {
-        var statement = try self.connection.prepare("select id from sessions where cwd = ? and leaf_entry_id is not null order by updated_at_ms desc limit 1");
-        defer statement.finalize();
-        try statement.bindText(1, cwd);
-        const row = (try statement.step()) orelse return null;
-        return try gpa.dupe(u8, row.text(0));
+        const sql = "select id from sessions where cwd = ? and leaf_entry_id is not null order by updated_at_ms desc, id desc limit 1";
+        var qres = try self.backend.query(self.io, sql, &.{.{ .text = cwd }});
+        defer qres.deinit();
+
+        if (qres.rows.len == 0) return null;
+        switch (qres.rows[0][0]) {
+            .text => |t| return try gpa.dupe(u8, t),
+            else => return null,
+        }
     }
 
     /// Delete a session and its entries (cascade delete handles entries via
     /// the `on delete cascade` foreign key). Safe to call on a non-existent
     /// id — the statement simply matches no rows.
     pub fn deleteSession(self: *SessionManager, session_id: []const u8) Error!void {
-        var statement = try self.connection.prepare("delete from sessions where id = ?");
-        defer statement.finalize();
-        try statement.bindText(1, session_id);
-        try expectDone(&statement);
+        const sql = "delete from sessions where id = ?";
+        try self.backend.exec(self.io, sql, &.{.{ .text = session_id }});
     }
 
     /// Rename a session by id. The title is overwritten (or set if null).
     /// `new_title` must be non-empty — the caller validates.
     pub fn renameSession(self: *SessionManager, session_id: []const u8, new_title: []const u8) Error!void {
         assert(new_title.len > 0);
-        var statement = try self.connection.prepare("update sessions set title = ?, updated_at_ms = ? where id = ?");
-        defer statement.finalize();
-        try statement.bindText(1, new_title);
-        try statement.bindInt(2, nowMs(self.io));
-        try statement.bindText(3, session_id);
-        try expectDone(&statement);
+        const sql = "update sessions set title = ?, updated_at_ms = ? where id = ?";
+        try self.backend.exec(self.io, sql, &.{
+            .{ .text = new_title },
+            .{ .int = nowMs(self.io) },
+            .{ .text = session_id },
+        });
     }
 };
 pub const Session = struct {
@@ -219,12 +303,12 @@ pub const Session = struct {
         defer self.manager.gpa.free(payload);
         try self.insertEntry(id_out, "session_info", null, payload);
 
-        var statement = try self.manager.connection.prepare("update sessions set title = ?, updated_at_ms = ? where id = ?");
-        defer statement.finalize();
-        try statement.bindText(1, title);
-        try statement.bindInt(2, nowMs(self.manager.io));
-        try statement.bindText(3, self.id.slice());
-        try expectDone(&statement);
+        const sql = "update sessions set title = ?, updated_at_ms = ? where id = ?";
+        try self.manager.backend.exec(self.manager.io, sql, &.{
+            .{ .text = title },
+            .{ .int = nowMs(self.manager.io) },
+            .{ .text = self.id.slice() },
+        });
     }
 
     pub fn branch(self: *Session, entry_id: []const u8, branch_summary: ?[]const u8, id_out: ?*[entry_id_len]u8) Error!void {
@@ -273,12 +357,12 @@ pub const Session = struct {
     pub fn setSnapshot(self: *Session, entry_id: []const u8, sha: []const u8) Error!void {
         assert(entry_id.len == entry_id_len);
         assert(sha.len > 0);
-        var statement = try self.manager.connection.prepare("update session_entries set snapshot = ? where session_id = ? and id = ?");
-        defer statement.finalize();
-        try statement.bindText(1, sha);
-        try statement.bindText(2, self.id.slice());
-        try statement.bindText(3, entry_id);
-        try expectDone(&statement);
+        const sql = "update session_entries set snapshot = ? where session_id = ? and id = ?";
+        try self.manager.backend.exec(self.manager.io, sql, &.{
+            .{ .text = sha },
+            .{ .text = self.id.slice() },
+            .{ .text = entry_id },
+        });
     }
 
     /// Save a prompt to the session's prompt history. A plain append: the table
@@ -287,12 +371,12 @@ pub const Session = struct {
     pub fn savePromptHistory(self: *Session, prompt: []const u8) Error!void {
         assert(prompt.len > 0);
         const timestamp_ms = nowMs(self.manager.io);
-        var statement = try self.manager.connection.prepare("insert into prompt_history(session_id, prompt_text, created_at_ms) values (?, ?, ?)");
-        defer statement.finalize();
-        try statement.bindText(1, self.id.slice());
-        try statement.bindText(2, prompt);
-        try statement.bindInt(3, timestamp_ms);
-        try expectDone(&statement);
+        const sql = "insert into prompt_history(session_id, prompt_text, created_at_ms) values (?, ?, ?)";
+        try self.manager.backend.exec(self.manager.io, sql, &.{
+            .{ .text = self.id.slice() },
+            .{ .text = prompt },
+            .{ .int = timestamp_ms },
+        });
     }
 
     /// Load the prompt history for this session, newest first. Ordered by the
@@ -301,17 +385,20 @@ pub const Session = struct {
     /// `[0]` agreeing with `deleteNewestPromptHistory`'s victim. Caller owns
     /// the slice and each string.
     pub fn loadPromptHistory(self: *Session, gpa: std.mem.Allocator) Error![][]u8 {
-        var statement = try self.manager.connection.prepare("select prompt_text from prompt_history where session_id = ? order by id desc");
-        defer statement.finalize();
-        try statement.bindText(1, self.id.slice());
+        const sql = "select prompt_text from prompt_history where session_id = ? order by id desc";
+        var qres = try self.manager.backend.query(self.manager.io, sql, &.{.{ .text = self.id.slice() }});
+        defer qres.deinit();
 
         var prompts: std.ArrayList([]u8) = .empty;
         errdefer {
             for (prompts.items) |p| gpa.free(p);
             prompts.deinit(gpa);
         }
-        while (try statement.step()) |row| {
-            try prompts.append(gpa, try gpa.dupe(u8, row.text(0)));
+        for (qres.rows) |row| {
+            switch (row[0]) {
+                .text => |t| try prompts.append(gpa, try gpa.dupe(u8, t)),
+                else => {},
+            }
         }
         return prompts.toOwnedSlice(gpa);
     }
@@ -322,40 +409,34 @@ pub const Session = struct {
     /// the turn it already discarded. Idempotent by construction: deleting
     /// from an empty table is a no-op.
     pub fn deleteNewestPromptHistory(self: *Session) Error!void {
-        var statement = try self.manager.connection.prepare(
-            "delete from prompt_history where session_id = ?1 and id = (select id from prompt_history where session_id = ?1 order by id desc limit 1)",
-        );
-        defer statement.finalize();
-        try statement.bindText(1, self.id.slice());
-        try expectDone(&statement);
+        const sql = "delete from prompt_history where session_id = ? and id = (select id from prompt_history where session_id = ? order by id desc limit 1)";
+        try self.manager.backend.exec(self.manager.io, sql, &.{
+            .{ .text = self.id.slice() },
+            .{ .text = self.id.slice() },
+        });
     }
 
     /// Update the model provider, ID, and reasoning effort for this session.
     /// `effort_label` is null to clear a stored override (use config/default).
     pub fn updateModel(self: *Session, provider: []const u8, model_id: []const u8, effort_label: ?[]const u8) Error!void {
         assert(self.id.slice().len > 0);
-        var statement = try self.manager.connection.prepare("update sessions set model_provider = ?, model_id = ?, reasoning_effort = ?, updated_at_ms = ? where id = ?");
-        defer statement.finalize();
-        try statement.bindText(1, provider);
-        try statement.bindText(2, model_id);
-        if (effort_label) |label| {
-            try statement.bindText(3, label);
-        } else {
-            try statement.bindNull(3);
-        }
-        const timestamp_ms = nowMs(self.manager.io);
-        try statement.bindInt(4, timestamp_ms);
-        try statement.bindText(5, self.id.slice());
-        try expectDone(&statement);
+        const sql = "update sessions set model_provider = ?, model_id = ?, reasoning_effort = ?, updated_at_ms = ? where id = ?";
+        try self.manager.backend.exec(self.manager.io, sql, &.{
+            .{ .text = provider },
+            .{ .text = model_id },
+            if (effort_label) |label| .{ .text = label } else .null,
+            .{ .int = nowMs(self.manager.io) },
+            .{ .text = self.id.slice() },
+        });
     }
 
     /// Load the summary for this session. Caller owns the memory.
     pub fn summary(self: *Session, gpa: std.mem.Allocator) Error!SessionSummary {
-        var statement = try self.manager.connection.prepare("select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id, reasoning_effort from sessions where id = ?");
-        defer statement.finalize();
-        try statement.bindText(1, self.id.slice());
-        const row = (try statement.step()) orelse return error.MissingSession;
-        return try readSummary(gpa, &row);
+        const sql = "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id, reasoning_effort, host_id from sessions where id = ?";
+        var qres = try self.manager.backend.query(self.manager.io, sql, &.{.{ .text = self.id.slice() }});
+        defer qres.deinit();
+        if (qres.rows.len == 0) return error.MissingSession;
+        return try readSummaryFromRow(gpa, qres.rows[0]);
     }
 
     /// The git commit id of the nearest entry at or above the current leaf that
@@ -364,23 +445,28 @@ pub const Session = struct {
     /// session before any file change). Caller owns the returned string.
     pub fn snapshotAt(self: *Session, gpa: std.mem.Allocator) Error!?[]u8 {
         const leaf_id = self.leaf_entry_id orelse return null;
-        var statement = try self.manager.connection.prepare(
+        const sql =
             \\with recursive anc(id, parent_id, snapshot, depth) as (
             \\  select id, parent_id, snapshot, 0 from session_entries
-            \\    where session_id = ?1 and id = ?2
+            \\    where session_id = ? and id = ?
             \\  union all
             \\  select e.id, e.parent_id, e.snapshot, anc.depth + 1
             \\    from session_entries e join anc on e.id = anc.parent_id
-            \\    where e.session_id = ?1
+            \\    where e.session_id = ?
             \\)
             \\select snapshot from anc where snapshot is not null order by depth limit 1
-        );
-        defer statement.finalize();
-        try statement.bindText(1, self.id.slice());
-        try statement.bindText(2, leaf_id.slice());
-        const row = (try statement.step()) orelse return null;
-        if (row.columnType(0) == .null) return null;
-        return try gpa.dupe(u8, row.text(0));
+        ;
+        var qres = try self.manager.backend.query(self.manager.io, sql, &.{
+            .{ .text = self.id.slice() },
+            .{ .text = leaf_id.slice() },
+            .{ .text = self.id.slice() },
+        });
+        defer qres.deinit();
+        if (qres.rows.len == 0) return null;
+        return switch (qres.rows[0][0]) {
+            .text => |t| try gpa.dupe(u8, t),
+            else => null,
+        };
     }
 
     /// The newest user message entry on the active root→leaf path (walking
@@ -391,27 +477,35 @@ pub const Session = struct {
     /// database itself. Allocation-free: ids are fixed-size.
     pub fn lastUserEntry(self: *Session) Error!?UserEntryRef {
         const leaf_id = self.leaf_entry_id orelse return null;
-        var statement = try self.manager.connection.prepare(
+        const sql =
             \\with recursive anc(id, parent_id, kind, role, depth) as (
             \\  select id, parent_id, kind, role, 0 from session_entries
-            \\    where session_id = ?1 and id = ?2
+            \\    where session_id = ? and id = ?
             \\  union all
             \\  select e.id, e.parent_id, e.kind, e.role, anc.depth + 1
             \\    from session_entries e join anc on e.id = anc.parent_id
-            \\    where e.session_id = ?1
+            \\    where e.session_id = ?
             \\)
             \\select id, parent_id from anc
             \\  where kind = 'message' and role = 'user' order by depth limit 1
-        );
-        defer statement.finalize();
-        try statement.bindText(1, self.id.slice());
-        try statement.bindText(2, leaf_id.slice());
-        const row = (try statement.step()) orelse return null;
-        const id = try EntryId.fromSlice(row.text(0));
-        const parent_id: ?EntryId = if (row.columnType(1) == .null)
-            null
-        else
-            try EntryId.fromSlice(row.text(1));
+        ;
+        var qres = try self.manager.backend.query(self.manager.io, sql, &.{
+            .{ .text = self.id.slice() },
+            .{ .text = leaf_id.slice() },
+            .{ .text = self.id.slice() },
+        });
+        defer qres.deinit();
+        if (qres.rows.len == 0) return null;
+        const row = qres.rows[0];
+        const id_str = switch (row[0]) {
+            .text => |t| t,
+            else => return error.BadEntryId,
+        };
+        const id = try EntryId.fromSlice(id_str);
+        const parent_id: ?EntryId = switch (row[1]) {
+            .text => |t| try EntryId.fromSlice(t),
+            else => null,
+        };
         return .{ .id = id, .parent_id = parent_id };
     }
 
@@ -503,62 +597,59 @@ pub const Session = struct {
         assert(kind.len > 0);
         assert(payload_json.len > 0);
         const timestamp_ms = nowMs(self.manager.io);
-        var statement = try self.manager.connection.prepare("insert into session_entries(id, session_id, parent_id, kind, role, payload_json, created_at_ms) values (?, ?, ?, ?, ?, ?, ?)");
-        defer statement.finalize();
-        try statement.bindText(1, id[0..]);
-        try statement.bindText(2, self.id.slice());
-        if (parent_id) |parent| {
-            try statement.bindText(3, parent);
-        } else {
-            try statement.bindNull(3);
-        }
-        try statement.bindText(4, kind);
-        if (role) |value| {
-            try statement.bindText(5, value);
-        } else {
-            try statement.bindNull(5);
-        }
-        try statement.bindText(6, payload_json);
-        try statement.bindInt(7, timestamp_ms);
-        try expectDone(&statement);
+        const sql = "insert into session_entries(id, session_id, parent_id, kind, role, payload_json, created_at_ms) values (?, ?, ?, ?, ?, ?, ?)";
+        try self.manager.backend.exec(self.manager.io, sql, &.{
+            .{ .text = id[0..] },
+            .{ .text = self.id.slice() },
+            if (parent_id) |parent| .{ .text = parent } else .null,
+            .{ .text = kind },
+            if (role) |r| .{ .text = r } else .null,
+            .{ .text = payload_json },
+            .{ .int = timestamp_ms },
+        });
         self.leaf_entry_id = .{ .bytes = id.* };
         try self.updateLeaf(id[0..]);
     }
 
     pub fn setTitle(self: *Session, title: []const u8) Error!void {
         assert(title.len > 0);
-        var statement = try self.manager.connection.prepare("update sessions set title = ?, updated_at_ms = ? where id = ?");
-        defer statement.finalize();
-        try statement.bindText(1, title);
-        try statement.bindInt(2, nowMs(self.manager.io));
-        try statement.bindText(3, self.id.slice());
-        try expectDone(&statement);
+        const sql = "update sessions set title = ?, updated_at_ms = ? where id = ?";
+        try self.manager.backend.exec(self.manager.io, sql, &.{
+            .{ .text = title },
+            .{ .int = nowMs(self.manager.io) },
+            .{ .text = self.id.slice() },
+        });
     }
 
     pub fn hasTitle(self: *Session) Error!bool {
-        var statement = try self.manager.connection.prepare("select title from sessions where id = ?");
-        defer statement.finalize();
-        try statement.bindText(1, self.id.slice());
-        const row = (try statement.step()) orelse return error.MissingSession;
-        return row.columnType(0) != .null and row.text(0).len > 0;
+        const sql = "select title from sessions where id = ?";
+        var qres = try self.manager.backend.query(self.manager.io, sql, &.{.{ .text = self.id.slice() }});
+        defer qres.deinit();
+        if (qres.rows.len == 0) return error.MissingSession;
+        return switch (qres.rows[0][0]) {
+            .text => |t| t.len > 0,
+            else => false,
+        };
     }
 
     fn updateLeaf(self: *Session, leaf_id: []const u8) Error!void {
         assert(leaf_id.len == entry_id_len);
-        var statement = try self.manager.connection.prepare("update sessions set leaf_entry_id = ?, updated_at_ms = ? where id = ?");
-        defer statement.finalize();
-        try statement.bindText(1, leaf_id);
-        try statement.bindInt(2, nowMs(self.manager.io));
-        try statement.bindText(3, self.id.slice());
-        try expectDone(&statement);
+        const sql = "update sessions set leaf_entry_id = ?, updated_at_ms = ? where id = ?";
+        try self.manager.backend.exec(self.manager.io, sql, &.{
+            .{ .text = leaf_id },
+            .{ .int = nowMs(self.manager.io) },
+            .{ .text = self.id.slice() },
+        });
     }
 
     fn requireEntry(self: *Session, entry_id: []const u8) Error!void {
-        var statement = try self.manager.connection.prepare("select 1 from session_entries where session_id = ? and id = ?");
-        defer statement.finalize();
-        try statement.bindText(1, self.id.slice());
-        try statement.bindText(2, entry_id);
-        if (try statement.step()) |_| return;
+        const sql = "select 1 from session_entries where session_id = ? and id = ?";
+        var qres = try self.manager.backend.query(self.manager.io, sql, &.{
+            .{ .text = self.id.slice() },
+            .{ .text = entry_id },
+        });
+        defer qres.deinit();
+        if (qres.rows.len > 0) return;
         return error.MissingEntry;
     }
 
@@ -567,20 +658,17 @@ pub const Session = struct {
     /// are returned oldest-first by creation time so siblings keep a stable
     /// order. Caller owns the slice and each record.
     pub fn entries(self: *Session, gpa: std.mem.Allocator) Error![]EntryRecord {
-        // `rowid` breaks created_at_ms ties so "oldest-first" is strictly
-        // insertion order — entries written in the same millisecond (tests, fast
-        // turns) keep a deterministic sequence, which the tree pre-order relies on.
-        var statement = try self.manager.connection.prepare("select id, parent_id, kind, role, payload_json, created_at_ms, snapshot from session_entries where session_id = ? order by created_at_ms, rowid");
-        defer statement.finalize();
-        try statement.bindText(1, self.id.slice());
+        const sql = "select id, parent_id, kind, role, payload_json, created_at_ms, snapshot from session_entries where session_id = ? order by created_at_ms, rowid";
+        var qres = try self.manager.backend.query(self.manager.io, sql, &.{.{ .text = self.id.slice() }});
+        defer qres.deinit();
 
         var records: std.ArrayList(EntryRecord) = .empty;
         errdefer {
             for (records.items) |*record| record.deinit(gpa);
             records.deinit(gpa);
         }
-        while (try statement.step()) |row| {
-            try records.append(gpa, try readEntry(gpa, &row));
+        for (qres.rows) |row| {
+            try records.append(gpa, try readEntryFromRow(gpa, row));
         }
         return records.toOwnedSlice(gpa);
     }
@@ -588,7 +676,7 @@ pub const Session = struct {
     fn loadBranch(self: *Session, gpa: std.mem.Allocator) Error![]EntryRecord {
         const leaf_id = self.leaf_entry_id orelse return try gpa.alloc(EntryRecord, 0);
 
-        var statement = try self.manager.connection.prepare(
+        const sql =
             \\with recursive branch(id, parent_id, kind, role, payload_json, created_at_ms, snapshot, rowid) as (
             \\  select id, parent_id, kind, role, payload_json, created_at_ms, snapshot, rowid
             \\    from session_entries where session_id = ? and id = ?
@@ -598,23 +686,23 @@ pub const Session = struct {
             \\    where branch.parent_id is not null
             \\)
             \\select id, parent_id, kind, role, payload_json, created_at_ms, snapshot from branch order by created_at_ms, rowid
-        );
-        defer statement.finalize();
-        try statement.bindText(1, self.id.slice());
-        try statement.bindText(2, leaf_id.slice());
+        ;
+        var qres = try self.manager.backend.query(self.manager.io, sql, &.{
+            .{ .text = self.id.slice() },
+            .{ .text = leaf_id.slice() },
+        });
+        defer qres.deinit();
+
+        if (qres.rows.len == 0) return error.MissingEntry;
 
         var records: std.ArrayList(EntryRecord) = .empty;
         errdefer {
             for (records.items) |*record| record.deinit(gpa);
             records.deinit(gpa);
         }
-
-        var found = false;
-        while (try statement.step()) |row| {
-            found = true;
-            try records.append(gpa, try readEntry(gpa, &row));
+        for (qres.rows) |row| {
+            try records.append(gpa, try readEntryFromRow(gpa, row));
         }
-        if (!found) return error.MissingEntry;
         return records.toOwnedSlice(gpa);
     }
 };
@@ -862,6 +950,119 @@ fn readEntry(gpa: std.mem.Allocator, row: *const db.Row) Error!EntryRecord {
         .payload_json = try gpa.dupe(u8, row.text(4)),
         .created_at_ms = row.int(5),
         .snapshot = if (row.columnType(6) == .null) null else try gpa.dupe(u8, row.text(6)),
+    };
+}
+
+fn readSummaryFromRow(gpa: std.mem.Allocator, row: []const backend_mod.Value) Error!SessionSummary {
+    var leaf_buffer: [entry_id_len]u8 = undefined;
+    const id_str = switch (row[0]) {
+        .text => |t| t,
+        else => return error.CorruptData,
+    };
+    const title_opt = switch (row[1]) {
+        .text => |t| try gpa.dupe(u8, t),
+        else => null,
+    };
+    const cwd_str = switch (row[2]) {
+        .text => |t| t,
+        else => return error.CorruptData,
+    };
+    const created_at_ms = switch (row[3]) {
+        .int => |v| v,
+        else => 0,
+    };
+    const updated_at_ms = switch (row[4]) {
+        .int => |v| v,
+        else => 0,
+    };
+    const leaf_entry_id = switch (row[5]) {
+        .text => |t| blk: {
+            if (t.len != entry_id_len) break :blk null;
+            @memcpy(leaf_buffer[0..], t);
+            break :blk EntryId{ .bytes = leaf_buffer };
+        },
+        else => null,
+    };
+    const model_provider = switch (row[6]) {
+        .text => |t| try gpa.dupe(u8, t),
+        else => null,
+    };
+    const model_id = switch (row[7]) {
+        .text => |t| try gpa.dupe(u8, t),
+        else => null,
+    };
+    const reasoning_effort = switch (row[8]) {
+        .text => |t| try gpa.dupe(u8, t),
+        else => null,
+    };
+    const host_id = if (row.len > 9) switch (row[9]) {
+        .text => |t| try gpa.dupe(u8, t),
+        else => null,
+    } else null;
+
+    return .{
+        .id = try gpa.dupe(u8, id_str),
+        .title = title_opt,
+        .cwd = try gpa.dupe(u8, cwd_str),
+        .created_at_ms = created_at_ms,
+        .updated_at_ms = updated_at_ms,
+        .leaf_entry_id = leaf_entry_id,
+        .model_provider = model_provider,
+        .model_id = model_id,
+        .reasoning_effort = reasoning_effort,
+        .host_id = host_id,
+    };
+}
+
+fn readEntryFromRow(gpa: std.mem.Allocator, row: []const backend_mod.Value) Error!EntryRecord {
+    var id: [entry_id_len]u8 = undefined;
+    const id_text = switch (row[0]) {
+        .text => |t| t,
+        else => return error.BadEntryId,
+    };
+    if (id_text.len != entry_id_len) return error.BadEntryId;
+    @memcpy(id[0..], id_text);
+
+    var parent_id: ?[entry_id_len]u8 = null;
+    switch (row[1]) {
+        .text => |parent_text| {
+            if (parent_text.len != entry_id_len) return error.BadEntryId;
+            var parent_buffer: [entry_id_len]u8 = undefined;
+            @memcpy(parent_buffer[0..], parent_text);
+            parent_id = parent_buffer;
+        },
+        else => {},
+    }
+
+    const kind_text = switch (row[2]) {
+        .text => |t| t,
+        else => return error.CorruptData,
+    };
+    const role_opt = switch (row[3]) {
+        .text => |t| try gpa.dupe(u8, t),
+        else => null,
+    };
+    const payload_text = switch (row[4]) {
+        .text => |t| t,
+        else => return error.CorruptData,
+    };
+    const created_at_ms = switch (row[5]) {
+        .int => |v| v,
+        else => 0,
+    };
+    const snapshot_opt = switch (row[6]) {
+        .text => |t| try gpa.dupe(u8, t),
+        else => null,
+    };
+
+    return .{
+        .id = id,
+        .parent_id = parent_id,
+        .kind = try gpa.dupe(u8, kind_text),
+        .role = role_opt,
+        .payload_json = try gpa.dupe(u8, payload_text),
+        .created_at_ms = created_at_ms,
+        .snapshot = snapshot_opt,
     };
 }
 
@@ -1506,10 +1707,57 @@ test "hasTitle returns expected boolean based on title existence" {
     try std.testing.expect(try untitled_session.hasTitle());
 }
 
+test "session tracks host_id for roaming users" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.initWithHost(gpa, std.testing.io, ":memory:", "laptop-42");
+    defer manager.deinit();
+
+    var session = try manager.create("/tmp/zay", .{
+        .id = "h" ** session_id_len,
+        .title = "Roaming Session",
+    });
+
+    var summary = try session.summary(gpa);
+    defer summary.deinit(gpa);
+    try std.testing.expect(summary.host_id != null);
+    try std.testing.expectEqualStrings("laptop-42", summary.host_id.?);
+}
+
+test "initFromConfig gracefully falls back to local storage when external service is offline" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_dir);
+
+    // Provide an unreachable localhost port where no db server is running
+    var manager = try SessionManager.initFromConfig(
+        gpa,
+        std.testing.io,
+        home_dir,
+        "http://127.0.0.1:59999",
+        null,
+        null,
+    );
+    defer manager.deinit();
+
+    try std.testing.expectEqual(BackendKind.local_sqlite, manager.backend.kind);
+
+    var session = try manager.create("/tmp/zay", .{
+        .id = "f" ** session_id_len,
+        .title = "Fallback Session",
+    });
+    var summary = try session.summary(gpa);
+    defer summary.deinit(gpa);
+    try std.testing.expectEqualStrings("Fallback Session", summary.title.?);
+}
+
 test {
     // Silent-drop guard (AGENTS.md §Test runner quirks): the `lane_manifest`
     // re-export above is never analyzed by itself — root.zig's refAllDecls
     // only reaches one level down — so without this reference the module's
     // inline storage tests silently vanish from `zig build test`.
     _ = lane_manifest;
+    _ = @import("session/backend.zig");
 }

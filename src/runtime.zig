@@ -255,9 +255,9 @@ pub const AgentRuntime = struct {
         errdefer if (target.modelsdev_registry) |*reg| reg.deinit(gpa);
 
         if (session_id) |id| {
-            try target.session_writer.initResumeDefault(gpa, io, home_dir, id);
+            try target.session_writer.initResumeFromConfig(gpa, io, home_dir, id, config.database_server_url, config.database_auth_token, null);
         } else {
-            try target.session_writer.initDefault(gpa, io, home_dir, session_dir);
+            try target.session_writer.initFromConfig(gpa, io, home_dir, session_dir, config.database_server_url, config.database_auth_token, null);
         }
         target.session_writer_started = true;
         errdefer target.session_writer.deinit();
