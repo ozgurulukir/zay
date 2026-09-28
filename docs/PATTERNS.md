@@ -435,3 +435,9 @@ Zay unifies local embedded SQLite and external REST database servers through `Se
    - Column metadata reflection maps SQLite `PRAGMA table_info` and PostgreSQL `information_schema.columns`.
 5. **Agent Database Tool Seam:**
    The `database` tool (`src/tools/database.zig`) exposes `inspect_schema`, `query`, and `execute` to the LLM agent, operating over `ToolContext.database_server_url`. Read-only queries enforce maximum row limits, while DDL/DML executions report row change counts and are governed by Zay's tool approval policies.
+6. **Direct Cloud LibSQL Backend (`turso_http`):**
+   `src/db/turso.zig` implements a native LibSQL Hrana v2 pipeline client over HTTP (`POST /v2/pipeline`). It talks directly to Turso Cloud without needing an external Python daemon or local proxy:
+   - **URL normalization:** Automatically normalizes `libsql://<db>.turso.io` or `https://<db>.turso.io/` to `https://<db>.turso.io/v2/pipeline`.
+   - **Hrana v2 JSON parameter mapping:** Encodes values into tagged `{ "type": "...", "value": "..." }` Hrana objects (with 64-bit integers string-encoded and blobs base64-encoded).
+   - **Batch execution:** Groups all statements in a single HTTP request wrapped between `BEGIN` and `COMMIT` steps ending with `close`, fulfilling the `INV-DB-BATCH` invariant across the network in a single roundtrip.
+   - **Schema introspection:** Queries `sqlite_master` and `PRAGMA table_info` through the pipeline for table definitions and column details.

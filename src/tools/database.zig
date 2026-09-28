@@ -307,7 +307,14 @@ pub fn runTool(
                         defer health.deinit();
                         try writeFmt(&out, "[Database Health]\nBackend: {s}\nStatus: {s}\nVersion: {s}\nAuth required: {}\n", .{ health.backend, health.status, health.version, health.auth_required });
                     },
-                    .turso_http => try writeStr(&out, "[Database Health]\nBackend: turso_http (direct LibSQL pipeline)\nStatus: not implemented\n"),
+                    .turso_http => {
+                        const client = backend.turso orelse return common.failFmt(gpa, 1, "Turso database client is unavailable.\n", .{});
+                        var health = client.health(io) catch |err| {
+                            return common.failFmt(gpa, 1, "Database health check failed: {s}\n", .{@errorName(err)});
+                        };
+                        defer health.deinit();
+                        try writeFmt(&out, "[Database Health]\nBackend: {s}\nStatus: {s}\nVersion: {s}\nAuth required: {}\n", .{ health.backend, health.status, health.version, health.auth_required });
+                    },
                     .postgres_native => try writeStr(&out, "[Database Health]\nBackend: postgres_native (native wire protocol)\nStatus: not implemented\n"),
                 }
                 const stdout = out.toOwnedSlice() catch return error.OutOfMemory;
@@ -399,7 +406,33 @@ pub fn runTool(
                             }
                         }
                     },
-                    .turso_http, .postgres_native => {
+                    .turso_http => {
+                        if (backend.turso) |*client| {
+                            var s = client.schema(io, args.table) catch |err| {
+                                return common.failFmt(gpa, 1, "Database schema inspection failed: {s}\n", .{@errorName(err)});
+                            };
+                            defer s.deinit();
+
+                            try writeStr(&out, "[Database Schema]\n");
+                            if (s.tables.len == 0) {
+                                try writeStr(&out, "No tables discovered.\n");
+                            } else {
+                                for (s.tables) |t| {
+                                    try writeFmt(&out, "Table: {s}\n", .{t.name});
+                                    for (t.columns) |c| {
+                                        try writeFmt(&out, "  - {s} ({s}{s}{s})\n", .{
+                                            c.name,
+                                            c.type_name,
+                                            if (c.primary_key) ", PRIMARY KEY" else "",
+                                            if (!c.nullable) ", NOT NULL" else "",
+                                        });
+                                    }
+                                    try writeStr(&out, "\n");
+                                }
+                            }
+                        }
+                    },
+                    .postgres_native => {
                         return common.failFmt(gpa, 1, "Database schema inspection is not yet implemented for this backend.\n", .{});
                     },
                 }

@@ -6,6 +6,8 @@ const assert = std.debug.assert;
 
 pub const service = @import("db/service.zig");
 pub const Service = service.Client;
+pub const turso = @import("db/turso.zig");
+pub const Turso = turso.Client;
 
 pub const Error = error{
     Misuse,
@@ -341,4 +343,5 @@ test "getDbPath: resolves to zay.db under the platform config dir" {
 
 test "db.service declarations" {
     _ = service;
+    _ = turso;
 }

@@ -101,12 +101,21 @@ pub fn migrateBackend(backend: *backend_mod.SessionBackend, io: std.Io) !void {
         return error.MissingConnection;
     }
 
-    const service = backend.remote orelse return error.MissingConnection;
-    var health = try service.health(io);
-    defer health.deinit();
-    if (!std.mem.eql(u8, health.status, "ok")) return error.UnavailableBackend;
-    const is_postgres = std.mem.eql(u8, health.backend, "postgres");
-    if (!is_postgres and !std.mem.eql(u8, health.backend, "sqlite")) return error.UnsupportedBackend;
+    var is_postgres = false;
+    if (backend.kind == .turso_http) {
+        const client = backend.turso orelse return error.MissingConnection;
+        var health = try client.health(io);
+        defer health.deinit();
+        if (!std.mem.eql(u8, health.status, "ok")) return error.UnavailableBackend;
+        is_postgres = false;
+    } else {
+        const service = backend.remote orelse return error.MissingConnection;
+        var health = try service.health(io);
+        defer health.deinit();
+        if (!std.mem.eql(u8, health.status, "ok")) return error.UnavailableBackend;
+        is_postgres = std.mem.eql(u8, health.backend, "postgres");
+        if (!is_postgres and !std.mem.eql(u8, health.backend, "sqlite")) return error.UnsupportedBackend;
+    }
 
     // Run remote migrations via backend.exec.
     try backend.exec(io, "create table if not exists schema_migrations(version integer primary key, applied_at_ms bigint not null)", &.{});
