@@ -41,10 +41,12 @@ pub const help_lines = [_]HelpLine{
     .{ .key = "Alt+Right / Alt+Left", .desc = "Cycle right-pane worker: next / previous (dual split)", .scope = .lanes },
     .{ .key = "Esc", .desc = "Cancel turn / unselect block / close modal" },
 
+    .{ .key = "Ctrl+K", .desc = "Open interactive command palette" },
+
     .{ .key = "CONTEXT MENTIONS & SKILLS", .desc = "", .is_header = true },
     .{ .key = "@<file>", .desc = "Attach file contents to prompt" },
     .{ .key = "$<skill>", .desc = "Invoke a specialized agent skill" },
-    .{ .key = "/<command>", .desc = "Open interactive slash command palette" },
+    .{ .key = "/<command>", .desc = "Type slash command directly in prompt bar" },
 
     .{ .key = "SLASH COMMANDS", .desc = "", .is_header = true },
     .{ .key = "/connect", .desc = "Configure AI provider & API keys" },

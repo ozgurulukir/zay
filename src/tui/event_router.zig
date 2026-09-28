@@ -303,7 +303,7 @@ fn routeKey(
         }
         return;
     }
-    if (tui.shouldOpenCommandMenuForSlash(app, key)) {
+    if (app.isNormalMode() and key.matches('k', .{ .ctrl = true })) {
         try app.openCommandMenu();
         try root.syncFocus(ctx);
         ctx.consumeAndRedraw();
