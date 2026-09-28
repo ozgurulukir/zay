@@ -70,7 +70,7 @@ pub fn hintText(hint: HintInputs) []const u8 {
         .mcp => "[Space] Toggle" ++ symbols.separator_dot_padded ++ "Ctrl+R Reconnect" ++ symbols.separator_dot_padded ++ "[ESC] Close",
         .plugins => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ESC] Close",
         .search => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Jump to message" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
-        .normal => "Type prompt, /cmd, @file, $skill" ++ symbols.separator_dot_padded ++ "Ctrl+K Menu" ++ symbols.separator_dot_padded ++ "Ctrl+O Background" ++ symbols.separator_dot_padded ++ "Ctrl+F Search",
+        .normal => "Type prompt, @file, $skill or / for menu" ++ symbols.separator_dot_padded ++ "Ctrl+K Menu" ++ symbols.separator_dot_padded ++ "Ctrl+O Background" ++ symbols.separator_dot_padded ++ "Shift+Tab Lanes" ++ symbols.separator_dot_padded ++ "Ctrl+F Search",
     };
 }
 
@@ -97,7 +97,7 @@ test "hintText pins every mode's text" {
     try std.testing.expectEqualStrings("[Space] Toggle" ++ dot ++ "Ctrl+R Reconnect" ++ dot ++ "[ESC] Close", hintText(.{ .mode = .mcp }));
     try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ESC] Close", hintText(.{ .mode = .plugins }));
     try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ENTER] Jump to message" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .search }));
-    try std.testing.expectEqualStrings("Type prompt, /cmd, @file, $skill" ++ dot ++ "Ctrl+K Menu" ++ dot ++ "Ctrl+O Background" ++ dot ++ "Ctrl+F Search", hintText(.{ .mode = .normal }));
+    try std.testing.expectEqualStrings("Type prompt, @file, $skill or / for menu" ++ dot ++ "Ctrl+K Menu" ++ dot ++ "Ctrl+O Background" ++ dot ++ "Shift+Tab Lanes" ++ dot ++ "Ctrl+F Search", hintText(.{ .mode = .normal }));
 }
 
 pub fn writeDiffCounts(surface: *vxfw.Surface, ctx: vxfw.DrawContext, counts: DiffCounts) void {

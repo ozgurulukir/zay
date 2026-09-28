@@ -46,7 +46,7 @@ pub const help_lines = [_]HelpLine{
     .{ .key = "CONTEXT MENTIONS & SKILLS", .desc = "", .is_header = true },
     .{ .key = "@<file>", .desc = "Attach file contents to prompt" },
     .{ .key = "$<skill>", .desc = "Invoke a specialized agent skill" },
-    .{ .key = "/<command>", .desc = "Type slash command directly in prompt bar" },
+    .{ .key = "/<command>", .desc = "Open interactive slash command palette" },
 
     .{ .key = "SLASH COMMANDS", .desc = "", .is_header = true },
     .{ .key = "/connect", .desc = "Configure AI provider & API keys" },
