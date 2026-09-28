@@ -773,6 +773,7 @@ pub const Agent = struct {
             .skills = self.skills,
             .database_server_url = self.database_server_url,
             .database_auth_token = self.database_auth_token,
+            .session_backend = if (self.context_manager.session_writer) |sw| &sw.manager.backend else null,
             .cancel_requested = self.cancel_requested,
         });
         const results = executor.runAll(tool_calls, bridge.observer()) catch |err| {

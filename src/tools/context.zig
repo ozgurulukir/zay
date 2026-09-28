@@ -42,6 +42,8 @@ pub const ToolContext = struct {
     /// External database server / service endpoint and token.
     database_server_url: ?[]const u8 = null,
     database_auth_token: ?[]const u8 = null,
+    /// Active session backend (local embedded SQLite or remote service).
+    session_backend: ?*@import("../session/backend.zig").SessionBackend = null,
     /// MCP dispatch: resolved at dispatch time through the manager so
     /// registry records survive client reconnects.
     mcp_manager: ?*mcp_mod.McpManager = null,
