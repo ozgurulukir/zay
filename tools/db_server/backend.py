@@ -134,6 +134,7 @@ class SqliteBackend(DatabaseBackend):
             p = params or []
             cur = self._conn.cursor()
             try:
+                self._conn.execute("PRAGMA query_only = ON")
                 cur.execute(sql, p)
                 cols = [desc[0] for desc in cur.description] if cur.description else []
                 raw_rows = cur.fetchall()
@@ -167,6 +168,7 @@ class SqliteBackend(DatabaseBackend):
                     "count": len(formatted_rows),
                 }
             finally:
+                self._conn.execute("PRAGMA query_only = OFF")
                 cur.close()
 
     async def batch(self, statements: list[dict[str, Any]]) -> dict[str, Any]:
@@ -297,7 +299,8 @@ class PostgresBackend(DatabaseBackend):
         p = params or []
         pg_sql = to_pg_sql(sql)
         async with self._pool.acquire() as conn:
-            records = await conn.fetch(pg_sql, *p)
+            async with conn.transaction(readonly=True):
+                records = await conn.fetch(pg_sql, *p)
             if not records:
                 return {"success": True, "columns": [], "types": [], "rows": [], "count": 0}
             cols = list(records[0].keys())

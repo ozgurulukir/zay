@@ -168,6 +168,16 @@ pub const Statement = struct {
         return c.sqlite3_column_count(self.handle);
     }
 
+    pub fn columnName(self: *const Statement, index: i32) [:0]const u8 {
+        assert(index >= 0);
+        assert(index < self.columnCount());
+        return std.mem.span(c.sqlite3_column_name(self.handle, index));
+    }
+
+    pub fn isReadOnly(self: *const Statement) bool {
+        return c.sqlite3_stmt_readonly(self.handle) != 0;
+    }
+
     pub fn errorMessage(self: *const Statement) [:0]const u8 {
         return std.mem.span(c.sqlite3_errmsg(self.connection));
     }

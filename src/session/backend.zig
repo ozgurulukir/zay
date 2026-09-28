@@ -21,16 +21,20 @@ pub const SessionBackend = struct {
     gpa: std.mem.Allocator,
     kind: BackendKind,
     local: ?db.Connection = null,
+    local_path: ?[]u8 = null,
     remote: ?db.Service = null,
     remote_url: ?[]const u8 = null,
     remote_token: ?[]const u8 = null,
     host_id: []const u8,
 
-    pub fn openLocal(gpa: std.mem.Allocator, conn: db.Connection, host_id: []const u8) !SessionBackend {
+    pub fn openLocal(gpa: std.mem.Allocator, conn: db.Connection, host_id: []const u8, path: []const u8) !SessionBackend {
+        const owned_path = try gpa.dupe(u8, path);
+        errdefer gpa.free(owned_path);
         return .{
             .gpa = gpa,
             .kind = .local_sqlite,
             .local = conn,
+            .local_path = owned_path,
             .remote = null,
             .host_id = try gpa.dupe(u8, host_id),
         };
@@ -56,6 +60,7 @@ pub const SessionBackend = struct {
 
     pub fn deinit(self: *SessionBackend) void {
         self.gpa.free(self.host_id);
+        if (self.local_path) |path| self.gpa.free(path);
         if (self.remote_url) |u| self.gpa.free(u);
         if (self.remote_token) |t| self.gpa.free(t);
         switch (self.kind) {
@@ -101,6 +106,7 @@ pub const SessionBackend = struct {
                 var conn = self.local orelse return error.MissingConnection;
                 var stmt = try conn.prepare(sql);
                 defer stmt.finalize();
+                if (!stmt.isReadOnly()) return error.ReadOnlyQueryRequired;
                 for (params, 0..) |p, idx| {
                     const col_idx: i32 = @intCast(idx + 1);
                     try stmt.bindValue(col_idx, p);
@@ -118,17 +124,17 @@ pub const SessionBackend = struct {
                 var types_list: std.ArrayList(ColumnType) = .empty;
                 defer types_list.deinit(self.gpa);
 
-                var col_names_populated = false;
+                const num_cols: usize = @intCast(stmt.columnCount());
+                for (0..num_cols) |i| {
+                    try columns_list.append(self.gpa, try aa.dupe(u8, stmt.columnName(@intCast(i))));
+                    try types_list.append(self.gpa, .text);
+                }
 
                 while (try stmt.step()) |row| {
-                    const num_cols: usize = @intCast(row.columnCount());
-                    if (!col_names_populated) {
+                    if (rows_list.items.len == 0) {
                         for (0..num_cols) |i| {
-                            const name = row.columnName(@intCast(i));
-                            try columns_list.append(self.gpa, try aa.dupe(u8, name));
-                            try types_list.append(self.gpa, row.columnType(@intCast(i)));
+                            types_list.items[i] = row.columnType(@intCast(i));
                         }
-                        col_names_populated = true;
                     }
 
                     var cells = try aa.alloc(Value, num_cols);
