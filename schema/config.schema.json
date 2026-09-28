@@ -453,8 +453,8 @@
       "properties": {
         "backend": {
           "type": "string",
-          "enum": ["local", "zay_service", "turso_http", "postgres_native"],
-          "description": "Selected database storage backend. When omitted, a configured URL selects zay_service; otherwise local SQLite is used. turso_http and postgres_native currently use local fallback storage."
+          "enum": ["local", "zay_service", "turso_http", "d1_http", "postgres_native"],
+          "description": "Selected database storage backend. When omitted, a configured URL selects zay_service; otherwise local SQLite is used."
         },
         "url": {
           "type": "string",

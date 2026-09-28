@@ -206,6 +206,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
             .local => .local_sqlite,
             .zay_service => .remote_service,
             .turso_http => .turso_http,
+            .d1_http => .d1_http,
             .postgres_native => .postgres_native,
         };
         var manager = session.SessionManager.initFromModularConfig(

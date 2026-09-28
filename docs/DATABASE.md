@@ -18,9 +18,9 @@ Users can run Zay in four primary modes:
 | **Daemon Required?** | ❌ None | ❌ None (Direct HTTP pipeline) | ❌ None (Direct HTTPS REST) | ✅ Yes (`tools.db_server`) |
 | **Setup Complexity** | Zero configuration | Very Low (Turso CLI/Web token) | Very Low (Cloudflare API token) | Medium (Python server or Docker) |
 | **Multi-Machine Roaming** | Manual file copying | ✅ Automatic via `host_id` | ✅ Automatic via `host_id` | ✅ Automatic via `host_id` |
-| **Free-Tier Friendly** | Local disk | ✅ Turso Free Tier (9 GB, 500 DBs) | ✅ Cloudflare Free (5 GB, 5M reads/day) | ✅ Neon, Supabase, Render free tiers |
+| **Free-Tier Friendly** | Local disk | ✅ Turso Free Tier (9 GB, 500 DBs) | ✅ Cloudflare Free (500 MB per database) | ✅ Neon, Supabase, Render free tiers |
 | **Storage Engine** | SQLite WAL | LibSQL (SQLite dialect) | SQLite (Cloudflare D1) | SQLite or PostgreSQL |
-| **Atomic Transactions** | Native SQLite WAL | Hrana v2 conditional batches | REST batch array payload | REST batch endpoint (`POST /v1/batch`) |
+| **Atomic Transactions** | Native SQLite WAL | Hrana v2 conditional batches | REST `{ "batch": [...] }` payload | REST batch endpoint (`POST /v1/batch`) |
 
 ---
 

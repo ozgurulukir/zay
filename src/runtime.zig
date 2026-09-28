@@ -262,6 +262,7 @@ pub const AgentRuntime = struct {
             .local => .local_sqlite,
             .zay_service => .remote_service,
             .turso_http => .turso_http,
+            .d1_http => .d1_http,
             .postgres_native => .postgres_native,
         };
 

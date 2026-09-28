@@ -3079,6 +3079,23 @@ test "parseObject accepts modular database configuration" {
     try std.testing.expectEqual(@as(usize, 0), sink.items.len);
 }
 
+test "parseObject accepts Cloudflare D1 database configuration" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    const json =
+        \\{"database":{"backend":"d1_http","url":"d1://account/database","authToken":"d1-secret"}}
+    ;
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+
+    try std.testing.expectEqual(DatabaseBackendKind.d1_http, cfg.database.backend.?);
+    try std.testing.expectEqual(DatabaseBackendKind.d1_http, cfg.effectiveDatabaseBackend());
+    try std.testing.expectEqualStrings("d1://account/database", cfg.effectiveDatabaseUrl().?);
+    try std.testing.expectEqualStrings("d1-secret", cfg.effectiveDatabaseAuthToken().?);
+    try std.testing.expectEqual(@as(usize, 0), sink.items.len);
+}
+
 test "effective database accessors resolve priority and fallback" {
     const gpa = std.testing.allocator;
 

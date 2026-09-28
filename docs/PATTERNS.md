@@ -446,5 +446,5 @@ Zay unifies local embedded SQLite and external REST database servers through `Se
    `src/db/d1.zig` implements a native Cloudflare D1 HTTP client over Cloudflare's v4 REST API (`POST .../accounts/{account_id}/d1/database/{database_id}/query`).
    - **Zero-daemon REST client:** Uses Zig's standard `std.http.Client` with bearer token auth and `std.json` serialization, requiring no Node/wrangler daemon at runtime.
    - **URL normalization:** Expands shorthand `d1://<account_id>/<database_id>` or `d1://<account_id>:<database_id>` into the canonical Cloudflare v4 REST query endpoint, appending `/query` when needed.
-   - **Batch execution:** Sends batch queries as a JSON statement array (`[{"sql": "...", "params": [...]}, ...]`), fulfilling `INV-DB-BATCH` in a single HTTP request roundtrip.
-   - **Schema introspection:** Discovers tables from `sqlite_master` (excluding SQLite and Cloudflare internal tables) and queries column metadata via `PRAGMA table_info`.
+   - **Batch execution:** Sends batch queries using Cloudflare's public API envelope (`{"batch":[{"sql": "...", "params": [...]}, ...]`), fulfilling `INV-DB-BATCH` in a single HTTP request roundtrip.
+   - **Schema introspection:** Discovers tables from `sqlite_master` (excluding SQLite and Cloudflare internal tables) and queries column metadata through the parameterized `pragma_table_info(?)` table-valued function.
