@@ -15,7 +15,7 @@
 
 ---
 
-Zay is a **terminal-native coding agent** designed for speed, focus, and low latency. A single, compiled Zig binary that connects to OpenAI Codex (via ChatGPT OAuth) or any OpenAI-compatible provider, orchestrates parallel work across isolated git worktree lanes, logs every turn to local SQLite — and is extensible with sandboxed Lua plugins.
+Zay is a **terminal-native coding agent** designed for speed, focus, and low latency. A single, compiled Zig binary that connects to OpenAI Codex (via ChatGPT OAuth) or any OpenAI-compatible provider, orchestrates parallel work across isolated git worktree lanes, logs every turn to local SQLite (or optional remote Turso / PostgreSQL backends) — and is extensible with sandboxed Lua plugins.
 
 ---
 
@@ -41,7 +41,7 @@ Zay operates without granular per-action permission prompts (YOLO mode), relying
 - **Background Jobs:** Asynchronous test runs, builds, or dev servers with real-time log tailing (`Ctrl+O`).
 - **Context Compaction:** Dynamic, token-calibrated retention budgets that preserve critical history below model limits.
 - **Extensible via Lua & MCP:** Lua plugins can register custom tools and receive tool-call notifications; MCP servers can provide additional tools.
-- **Offline & Local-First:** Full SQLite timeline persistence, branch switching (`/timeline`), and single-keystroke rewind (`/undo`).
+- **Offline & Local-First (with Cloud Options):** Full SQLite timeline persistence by default, optional cloud roaming (Turso LibSQL / PostgreSQL), branch switching (`/timeline`), and single-keystroke rewind (`/undo`).
 
 ---
 
