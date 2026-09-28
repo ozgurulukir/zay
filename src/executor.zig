@@ -185,6 +185,8 @@ pub const ExecutorService = struct {
         cwd: []const u8,
         contained: bool = false,
         bash_classifier_url: ?[]const u8 = null,
+        database_server_url: ?[]const u8 = null,
+        database_auth_token: ?[]const u8 = null,
         background: ?BackgroundStart = null,
         mcp_manager: ?*mcp_mod.McpManager = null,
         tool_registry: ?*tools.ToolRegistry = null,
@@ -208,6 +210,8 @@ pub const ExecutorService = struct {
             .ctx = .{
                 .cancel_requested = options.cancel_requested,
                 .bash_classifier_url = options.bash_classifier_url,
+                .database_server_url = options.database_server_url,
+                .database_auth_token = options.database_auth_token,
                 .background_manager = if (options.background) |bg| bg.manager else null,
                 .owner_generation = if (options.background) |bg| bg.owner_generation else 1,
                 .mcp_manager = options.mcp_manager,

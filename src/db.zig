@@ -4,6 +4,9 @@ const paths = @import("paths.zig");
 
 const assert = std.debug.assert;
 
+pub const service = @import("db/service.zig");
+pub const Service = service.Client;
+
 pub const Error = error{
     Misuse,
     Sqlite,
@@ -324,4 +327,8 @@ test "getDbPath: resolves to zay.db under the platform config dir" {
     defer gpa.free(expected);
 
     try std.testing.expect(paths.pathsEqual(db_path, expected));
+}
+
+test "db.service declarations" {
+    _ = service;
 }

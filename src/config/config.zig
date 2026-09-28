@@ -232,6 +232,8 @@ pub const Config = struct {
     base_url: ?[]u8 = null,
     api_key: ?[]u8 = null,
     bash_classifier_url: ?[]u8 = null,
+    database_server_url: ?[]u8 = null,
+    database_auth_token: ?[]u8 = null,
     model: ?Model = null,
     providers: []ProviderConfig = &.{},
     mcp_servers: []McpServerConfig = &.{},
@@ -300,6 +302,8 @@ pub const Config = struct {
         if (self.base_url) |s| gpa.free(s);
         if (self.api_key) |s| gpa.free(s);
         if (self.bash_classifier_url) |s| gpa.free(s);
+        if (self.database_server_url) |s| gpa.free(s);
+        if (self.database_auth_token) |s| gpa.free(s);
         if (self.model) |*m| m.deinit(gpa);
         for (self.providers) |*provider| provider.deinit(gpa);
         if (self.providers.len > 0) gpa.free(self.providers);
@@ -329,6 +333,8 @@ pub const Config = struct {
         if (self.base_url) |s| out.base_url = try gpa.dupe(u8, s);
         if (self.api_key) |s| out.api_key = try gpa.dupe(u8, s);
         if (self.bash_classifier_url) |s| out.bash_classifier_url = try gpa.dupe(u8, s);
+        if (self.database_server_url) |s| out.database_server_url = try gpa.dupe(u8, s);
+        if (self.database_auth_token) |s| out.database_auth_token = try gpa.dupe(u8, s);
         if (self.model) |m| out.model = try m.clone(gpa);
         out.providers = try gpa.alloc(ProviderConfig, self.providers.len);
         for (self.providers, 0..) |provider, index| out.providers[index] = try provider.clone(gpa);

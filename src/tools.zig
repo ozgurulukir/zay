@@ -90,8 +90,8 @@ test "registry contains every tool exactly once" {
         const gop = try seen.getOrPut(std.testing.allocator, tool.name);
         try std.testing.expect(!gop.found_existing);
     }
-    // Always exactly one shell tool (bash-xor-pwsh) + lane + background + skill, on both hosts.
-    try std.testing.expectEqual(@as(usize, 4), builtinRegistry().len);
+    // Always exactly one shell tool (bash-xor-pwsh) + lane + background + skill + database, on both hosts.
+    try std.testing.expectEqual(@as(usize, 5), builtinRegistry().len);
 }
 
 test "lookup finds a registered tool" {
@@ -109,5 +109,6 @@ test {
     _ = lane_tool;
     _ = pwsh_tool;
     _ = @import("tools/skill.zig");
+    _ = @import("tools/database.zig");
     _ = common;
 }

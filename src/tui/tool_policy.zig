@@ -19,6 +19,7 @@ const entries = [_]struct { name: []const u8, policy: Policy }{
     .{ .name = "lane", .policy = .{ .expand_by_default = false, .render = .plain } },
     .{ .name = "background", .policy = .{ .expand_by_default = false, .render = .plain } },
     .{ .name = "skill", .policy = .{ .expand_by_default = false, .render = .plain } },
+    .{ .name = "database", .policy = .{ .expand_by_default = false, .render = .plain } },
 };
 
 comptime {
