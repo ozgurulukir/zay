@@ -27,6 +27,6 @@ Plugins and MCP are how a team specializes Zay; they are not what makes Zay work
 
 An agent with a shell has real power, so safety is part of the design, not an afterthought. Dangerous commands are gated before they run, and the human is always in the loop to approve the destructive ones. Power, yes — but power that asks first.
 
-## Local-first
+## Local-first (with Roaming Options)
 
-Every session lives in a SQLite database on your machine. Your conversations, your timeline, your history — yours, on your disk, resumable at any time. Nothing is held hostage by a cloud.
+Every session lives in a SQLite database on your machine by default. Your conversations, your timeline, your history — yours, on your disk, resumable at any time. When multi-machine roaming is needed, optional cloud and remote backends (Turso LibSQL, PostgreSQL) can be enabled without lock-in.
