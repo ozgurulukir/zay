@@ -179,6 +179,8 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
         // (which prefers model_selection) picks up the changes.
         try syncModelSelectionFromLegacy(gpa, target);
     }
+    try applyTextOverlay(gpa, &target.database_server_url, updates.database_server_url);
+    try applyTextOverlay(gpa, &target.database_auth_token, updates.database_auth_token);
     for (updates.providers) |provider| try applyProviderOverlay(gpa, target, provider);
     for (updates.mcp_servers) |mcp_server| try applyMcpServerOverlay(gpa, target, mcp_server);
     for (updates.plugins) |plugin| try applyPluginOverlay(gpa, target, plugin);
@@ -610,6 +612,12 @@ fn parseObject(
     }
     if (stringFieldCompat(value, "bashClassifierUrl", "bash_classifier_url")) |s| {
         if (s.len > 0) out.bash_classifier_url = try gpa.dupe(u8, s);
+    }
+    if (stringFieldCompat(value, "databaseServerUrl", "database_server_url")) |s| {
+        if (s.len > 0) out.database_server_url = try gpa.dupe(u8, s);
+    }
+    if (stringFieldCompat(value, "databaseAuthToken", "database_auth_token")) |s| {
+        if (s.len > 0) out.database_auth_token = try gpa.dupe(u8, s);
     }
     if (boolFieldCompat(value, "useResponsesEndpoint", "use_responses_endpoint")) |b| out.use_responses_endpoint = b;
     // The legacy `enableThinking` / `enable_thinking` key is accepted but
@@ -1155,6 +1163,12 @@ fn loadEnv(
     if (env.get("ZAY_BASH_CLASSIFIER_URL")) |s| {
         if (s.len > 0) out.bash_classifier_url = try gpa.dupe(u8, s);
     }
+    if (env.get("ZAY_DATABASE_SERVER_URL")) |s| {
+        if (s.len > 0) out.database_server_url = try gpa.dupe(u8, s);
+    }
+    if (env.get("ZAY_DATABASE_AUTH_TOKEN")) |s| {
+        if (s.len > 0) out.database_auth_token = try gpa.dupe(u8, s);
+    }
     if (env.get("ZAY_USE_RESPONSES_ENDPOINT")) |s| {
         out.use_responses_endpoint = parseBool(s);
     }
@@ -1481,6 +1495,18 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
                 try writeKey(writer, "bashClassifierUrl", &wrote_any);
                 try std.json.Stringify.value(url, .{}, writer);
             }
+        }
+    }
+    if (config.database_server_url) |url| {
+        if (url.len > 0) {
+            try writeKey(writer, "databaseServerUrl", &wrote_any);
+            try std.json.Stringify.value(url, .{}, writer);
+        }
+    }
+    if (config.database_auth_token) |tok| {
+        if (tok.len > 0) {
+            try writeKey(writer, "databaseAuthToken", &wrote_any);
+            try std.json.Stringify.value(tok, .{}, writer);
         }
     }
     if (config.providers.len > 0) {
@@ -2912,7 +2938,7 @@ test "parseObject accepts camelCase keys (schema v2)" {
     var sink: std.ArrayList(Diagnostic) = .empty;
     defer sink.deinit(gpa);
     const json =
-        \\{"defaultModel":"ollama/llama3.1:8b","baseURL":"http://localhost:11434","useResponsesEndpoint":true,"enableThinking":true,"systemPrompt":"You are Zay.","bashClassifierUrl":"http://localhost:9999"}
+        \\{"defaultModel":"ollama/llama3.1:8b","baseURL":"http://localhost:11434","useResponsesEndpoint":true,"enableThinking":true,"systemPrompt":"You are Zay.","bashClassifierUrl":"http://localhost:9999","databaseServerUrl":"http://localhost:8766","databaseAuthToken":"secret-123"}
     ;
     var cfg = try parseFile(gpa, "<test>", json, &sink);
     defer cfg.deinit(gpa);
@@ -2922,6 +2948,8 @@ test "parseObject accepts camelCase keys (schema v2)" {
     try std.testing.expectEqual(true, cfg.use_responses_endpoint.?);
     try std.testing.expectEqualStrings("You are Zay.", cfg.system_prompt.?);
     try std.testing.expectEqualStrings("http://localhost:9999", cfg.bash_classifier_url.?);
+    try std.testing.expectEqualStrings("http://localhost:8766", cfg.database_server_url.?);
+    try std.testing.expectEqualStrings("secret-123", cfg.database_auth_token.?);
     // The legacy `enableThinking` key is accepted and discarded — no diagnostics.
     try std.testing.expectEqual(@as(usize, 0), sink.items.len);
 }
@@ -2931,7 +2959,7 @@ test "parseObject accepts legacy snake_case keys (backward compat)" {
     var sink: std.ArrayList(Diagnostic) = .empty;
     defer sink.deinit(gpa);
     const json =
-        \\{"model":"openai/gpt-5.5","base_url":"https://api.openai.com","use_responses_endpoint":false,"enable_thinking":false,"system_prompt":"Legacy.","bash_classifier_url":"http://old:8080"}
+        \\{"model":"openai/gpt-5.5","base_url":"https://api.openai.com","use_responses_endpoint":false,"enable_thinking":false,"system_prompt":"Legacy.","bash_classifier_url":"http://old:8080","database_server_url":"http://old-db:8766","database_auth_token":"old-token"}
     ;
     var cfg = try parseFile(gpa, "<test>", json, &sink);
     defer cfg.deinit(gpa);
@@ -2941,6 +2969,8 @@ test "parseObject accepts legacy snake_case keys (backward compat)" {
     try std.testing.expectEqual(false, cfg.use_responses_endpoint.?);
     try std.testing.expectEqualStrings("Legacy.", cfg.system_prompt.?);
     try std.testing.expectEqualStrings("http://old:8080", cfg.bash_classifier_url.?);
+    try std.testing.expectEqualStrings("http://old-db:8766", cfg.database_server_url.?);
+    try std.testing.expectEqualStrings("old-token", cfg.database_auth_token.?);
     // The legacy snake_case `enable_thinking` key is accepted and discarded.
 }
 

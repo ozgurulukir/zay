@@ -119,6 +119,8 @@ pub const Agent = struct {
     compaction_client: ai.LanguageModel = .none,
     /// Optional local classifier endpoint for bash approval gating.
     bash_classifier_url: ?[]const u8 = null,
+    database_server_url: ?[]const u8 = null,
+    database_auth_token: ?[]const u8 = null,
     /// Optional synchronous approval hook used by the TUI worker.
     bash_approval: ?BashApproval = null,
     /// Optional shared manager for long-running bash commands launched with
@@ -262,6 +264,8 @@ pub const Agent = struct {
         }
         if (self.snapshotter) |*s| s.deinit();
         if (self.bash_classifier_url) |url| self.gpa.free(url);
+        if (self.database_server_url) |url| self.gpa.free(url);
+        if (self.database_auth_token) |tok| self.gpa.free(tok);
         self.* = undefined;
     }
 
@@ -767,6 +771,8 @@ pub const Agent = struct {
             .lane_bridge = self.lane_bridge,
             .lane_requester = self,
             .skills = self.skills,
+            .database_server_url = self.database_server_url,
+            .database_auth_token = self.database_auth_token,
             .cancel_requested = self.cancel_requested,
         });
         const results = executor.runAll(tool_calls, bridge.observer()) catch |err| {

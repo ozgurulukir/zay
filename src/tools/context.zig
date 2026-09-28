@@ -39,6 +39,9 @@ pub const ToolContext = struct {
     /// source of the derived `bash_classifier_url_slot` binding. Null keeps
     /// the always-armed local matcher.
     bash_classifier_url: ?[]const u8 = null,
+    /// External database server / service endpoint and token.
+    database_server_url: ?[]const u8 = null,
+    database_auth_token: ?[]const u8 = null,
     /// MCP dispatch: resolved at dispatch time through the manager so
     /// registry records survive client reconnects.
     mcp_manager: ?*mcp_mod.McpManager = null,
@@ -56,6 +59,8 @@ test "headless context degrades every dependency" {
     try std.testing.expect(ctx.cancel_requested == null);
     try std.testing.expect(ctx.lane_requester == null);
     try std.testing.expect(ctx.background_manager == null);
+    try std.testing.expect(ctx.database_server_url == null);
+    try std.testing.expect(ctx.database_auth_token == null);
     try std.testing.expectEqual(@as(u64, 1), ctx.owner_generation);
     try std.testing.expectEqual(@as(usize, 0), ctx.skills.len);
     try std.testing.expect(ctx.plugin_manager == null);

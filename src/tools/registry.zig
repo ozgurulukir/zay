@@ -3,6 +3,7 @@ const std = @import("std");
 const background_tool = @import("background.zig");
 const bash_tool = @import("bash.zig");
 const common = @import("common.zig");
+const database_tool = @import("database.zig");
 const lane_tool = @import("lane.zig");
 const mcp_bridge = @import("../mcp/registry_bridge.zig");
 const mcp_mod = @import("../mcp/manager.zig");
@@ -184,7 +185,7 @@ pub const shell_tool: Tool = shell_impl.tool;
 /// Canonical builtin tool list. Consumed by `ToolRegistry.init` and by
 /// `src/tools.zig`'s re-export (all single-registry call sites).
 pub fn builtin() []const Tool {
-    return &.{ shell_tool, lane_tool.tool, background_tool.tool, skill_tool.tool };
+    return &.{ shell_tool, lane_tool.tool, background_tool.tool, skill_tool.tool, database_tool.tool };
 }
 
 const tools_common = @import("common.zig");
@@ -284,12 +285,13 @@ test "ToolRegistry: addPluginTool makes plugin tool discoverable" {
     try std.testing.expectEqualStrings("plugin tool", tool.description);
 
     const all = try reg.all(gpa);
-    try std.testing.expectEqual(@as(usize, 5), all.len); // shell + lane + background + skill + plugin
+    try std.testing.expectEqual(@as(usize, 6), all.len); // shell + lane + background + skill + database + plugin
     try std.testing.expectEqualStrings(shell_tool.name, all[0].name);
     try std.testing.expectEqualStrings("lane", all[1].name);
     try std.testing.expectEqualStrings("background", all[2].name);
     try std.testing.expectEqualStrings("skill", all[3].name);
-    try std.testing.expectEqualStrings("lua__p__t", all[4].name);
+    try std.testing.expectEqualStrings("database", all[4].name);
+    try std.testing.expectEqualStrings("lua__p__t", all[5].name);
 }
 
 test "ToolRegistry: removePluginToolsWithPrefix strips matching tools" {
@@ -412,7 +414,7 @@ test "ToolRegistry: all() returns valid slices after multiple calls" {
     // First all(): tools are still allocated.
     {
         const all = try reg.all(gpa);
-        try std.testing.expect(all.len == 6); // shell + lane + background + skill + 2 plugin
+        try std.testing.expect(all.len == 7); // shell + lane + background + skill + database + 2 plugin
         for (all) |t| {
             try std.testing.expect(t.name.len > 0);
             try std.testing.expect(t.description.len > 0);
@@ -422,7 +424,7 @@ test "ToolRegistry: all() returns valid slices after multiple calls" {
     // Reuse the same registry; backing storage must still be intact.
     {
         const all = try reg.all(gpa);
-        try std.testing.expect(all.len == 6);
+        try std.testing.expect(all.len == 7);
         for (all) |t| {
             try std.testing.expect(t.name.len > 0);
             try std.testing.expect(t.description.len > 0);
@@ -432,13 +434,14 @@ test "ToolRegistry: all() returns valid slices after multiple calls" {
 
 test "registry builtin carries exactly one shell tool" {
     // SSOT vector (Phase 3): the builtin list must expose exactly one shell
-    // tool (`pwsh` on Windows, `bash` elsewhere) plus `lane`, `background`, and `skill`.
+    // tool (`pwsh` on Windows, `bash` elsewhere) plus `lane`, `background`, `skill`, and `database`.
     const tools = builtin();
-    try std.testing.expectEqual(@as(usize, 4), tools.len);
+    try std.testing.expectEqual(@as(usize, 5), tools.len);
     try std.testing.expect(std.mem.eql(u8, tools[0].name, shell_tool.name));
     try std.testing.expectEqualStrings("lane", tools[1].name);
     try std.testing.expectEqualStrings("background", tools[2].name);
     try std.testing.expectEqualStrings("skill", tools[3].name);
+    try std.testing.expectEqualStrings("database", tools[4].name);
     try std.testing.expect(shell_tool.name.len == 4 or std.mem.eql(u8, shell_tool.name, "pwsh"));
 }
 
@@ -465,9 +468,9 @@ test "ToolRegistry: plugin tool colliding with a builtin keeps builtin dispatch 
     const winner = reg.lookup(shell_tool.name).?;
     try std.testing.expectEqual(shell_tool.run, winner.run);
     try std.testing.expectEqualStrings(shell_tool.description, winner.description);
-    // Both records survive in all() (builtin + lane + background + skill + shadower).
+    // Both records survive in all() (builtin + lane + background + skill + database + shadower).
     const all = try reg.all(gpa);
-    try std.testing.expectEqual(@as(usize, 5), all.len);
+    try std.testing.expectEqual(@as(usize, 6), all.len);
     // deinit frees the heap-duped name/description without crashing — the
     // testing allocator's leak check is part of the assertion.
 }

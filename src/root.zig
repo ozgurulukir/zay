@@ -551,4 +551,5 @@ test {
     _ = @import("auth/keyring.zig");
     _ = @import("config/provider.zig");
     _ = @import("db.zig");
+    _ = @import("tools/database.zig");
 }

@@ -283,6 +283,12 @@ pub const AgentRuntime = struct {
                 target.agent.bash_classifier_url = try gpa.dupe(u8, url);
             }
         }
+        if (config.database_server_url) |url| {
+            target.agent.database_server_url = try gpa.dupe(u8, url);
+        }
+        if (config.database_auth_token) |token| {
+            target.agent.database_auth_token = try gpa.dupe(u8, token);
+        }
         target.agent.attachSessionWriter(&target.session_writer);
         try target.agent.addSystem(owned_system_prompt);
 
