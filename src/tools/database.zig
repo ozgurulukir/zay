@@ -307,6 +307,8 @@ pub fn runTool(
                         defer health.deinit();
                         try writeFmt(&out, "[Database Health]\nBackend: {s}\nStatus: {s}\nVersion: {s}\nAuth required: {}\n", .{ health.backend, health.status, health.version, health.auth_required });
                     },
+                    .turso_http => try writeStr(&out, "[Database Health]\nBackend: turso_http (direct LibSQL pipeline)\nStatus: not implemented\n"),
+                    .postgres_native => try writeStr(&out, "[Database Health]\nBackend: postgres_native (native wire protocol)\nStatus: not implemented\n"),
                 }
                 const stdout = out.toOwnedSlice() catch return error.OutOfMemory;
                 return common.ok(gpa, stdout);
@@ -396,6 +398,9 @@ pub fn runTool(
                                 }
                             }
                         }
+                    },
+                    .turso_http, .postgres_native => {
+                        return common.failFmt(gpa, 1, "Database schema inspection is not yet implemented for this backend.\n", .{});
                     },
                 }
 

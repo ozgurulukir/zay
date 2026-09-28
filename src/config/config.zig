@@ -219,6 +219,55 @@ pub const TuiSettings = struct {
     context_threshold_alert: f64 = 0.85,
 };
 
+/// Database backend selection for session persistence and roaming sync.
+pub const DatabaseBackendKind = enum {
+    local,
+    zay_service,
+    turso_http,
+    postgres_native,
+
+    pub fn fromString(str: []const u8) ?DatabaseBackendKind {
+        if (std.mem.eql(u8, str, "local") or std.mem.eql(u8, str, "local_sqlite") or std.mem.eql(u8, str, "sqlite")) return .local;
+        if (std.mem.eql(u8, str, "zay_service") or std.mem.eql(u8, str, "remote_service") or std.mem.eql(u8, str, "service")) return .zay_service;
+        if (std.mem.eql(u8, str, "turso_http") or std.mem.eql(u8, str, "turso") or std.mem.eql(u8, str, "libsql")) return .turso_http;
+        if (std.mem.eql(u8, str, "postgres_native") or std.mem.eql(u8, str, "postgres") or std.mem.eql(u8, str, "postgresql")) return .postgres_native;
+        return null;
+    }
+
+    pub fn asString(self: DatabaseBackendKind) []const u8 {
+        return switch (self) {
+            .local => "local",
+            .zay_service => "zay_service",
+            .turso_http => "turso_http",
+            .postgres_native => "postgres_native",
+        };
+    }
+};
+
+/// Database backend configuration.
+pub const DatabaseConfig = struct {
+    backend: ?DatabaseBackendKind = null,
+    url: ?[]u8 = null,
+    auth_token: ?[]u8 = null,
+    path: ?[]u8 = null,
+
+    pub fn deinit(self: *DatabaseConfig, gpa: std.mem.Allocator) void {
+        if (self.url) |u| gpa.free(u);
+        if (self.auth_token) |t| gpa.free(t);
+        if (self.path) |p| gpa.free(p);
+        self.* = undefined;
+    }
+
+    pub fn clone(self: DatabaseConfig, gpa: std.mem.Allocator) !DatabaseConfig {
+        return .{
+            .backend = self.backend,
+            .url = if (self.url) |u| try gpa.dupe(u8, u) else null,
+            .auth_token = if (self.auth_token) |t| try gpa.dupe(u8, t) else null,
+            .path = if (self.path) |p| try gpa.dupe(u8, p) else null,
+        };
+    }
+};
+
 pub const Config = struct {
     /// Semantic version of the configuration schema instance.
     /// Null means the default ("2.0.0"). Stored as an owned slice
@@ -234,6 +283,7 @@ pub const Config = struct {
     bash_classifier_url: ?[]u8 = null,
     database_server_url: ?[]u8 = null,
     database_auth_token: ?[]u8 = null,
+    database: DatabaseConfig = .{},
     model: ?Model = null,
     providers: []ProviderConfig = &.{},
     mcp_servers: []McpServerConfig = &.{},
@@ -304,6 +354,7 @@ pub const Config = struct {
         if (self.bash_classifier_url) |s| gpa.free(s);
         if (self.database_server_url) |s| gpa.free(s);
         if (self.database_auth_token) |s| gpa.free(s);
+        self.database.deinit(gpa);
         if (self.model) |*m| m.deinit(gpa);
         for (self.providers) |*provider| provider.deinit(gpa);
         if (self.providers.len > 0) gpa.free(self.providers);
@@ -335,6 +386,7 @@ pub const Config = struct {
         if (self.bash_classifier_url) |s| out.bash_classifier_url = try gpa.dupe(u8, s);
         if (self.database_server_url) |s| out.database_server_url = try gpa.dupe(u8, s);
         if (self.database_auth_token) |s| out.database_auth_token = try gpa.dupe(u8, s);
+        out.database = try self.database.clone(gpa);
         if (self.model) |m| out.model = try m.clone(gpa);
         out.providers = try gpa.alloc(ProviderConfig, self.providers.len);
         for (self.providers, 0..) |provider, index| out.providers[index] = try provider.clone(gpa);
@@ -351,6 +403,44 @@ pub const Config = struct {
         if (self.tui.custom_themes_dir) |s| out.tui.custom_themes_dir = try gpa.dupe(u8, s);
         if (self.model_selection) |ms| out.model_selection = try ms.clone(gpa);
         return out;
+    }
+
+    /// Resolve the active database backend kind.
+    pub fn effectiveDatabaseBackend(self: *const Config) DatabaseBackendKind {
+        if (self.database.backend) |b| return b;
+        if (self.database.url != null and self.database.url.?.len > 0) return .zay_service;
+        if (self.database_server_url != null and self.database_server_url.?.len > 0) return .zay_service;
+        return .local;
+    }
+
+    /// Resolve the active database service URL or endpoint.
+    pub fn effectiveDatabaseUrl(self: *const Config) ?[]const u8 {
+        if (self.database.url) |u| {
+            if (u.len > 0) return u;
+        }
+        if (self.database_server_url) |u| {
+            if (u.len > 0) return u;
+        }
+        return null;
+    }
+
+    /// Resolve the active database authentication token.
+    pub fn effectiveDatabaseAuthToken(self: *const Config) ?[]const u8 {
+        if (self.database.auth_token) |t| {
+            if (t.len > 0) return t;
+        }
+        if (self.database_auth_token) |t| {
+            if (t.len > 0) return t;
+        }
+        return null;
+    }
+
+    /// Resolve custom SQLite path if configured.
+    pub fn effectiveDatabasePath(self: *const Config) ?[]const u8 {
+        if (self.database.path) |p| {
+            if (p.len > 0) return p;
+        }
+        return null;
     }
 
     pub fn validate(self: *const Config, gpa: std.mem.Allocator) ![]Diagnostic {

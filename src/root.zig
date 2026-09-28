@@ -201,12 +201,21 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     // lane sessions share the driver's cwd — a lane that wrote entries after
     // the driver's last message used to hijack auto-resume via findLatest.
     const resume_session_id = blk: {
-        var manager = session.SessionManager.initFromConfig(
+        const db_backend = load_result.config.effectiveDatabaseBackend();
+        const session_backend_kind: ?session.BackendKind = switch (db_backend) {
+            .local => .local_sqlite,
+            .zay_service => .remote_service,
+            .turso_http => .turso_http,
+            .postgres_native => .postgres_native,
+        };
+        var manager = session.SessionManager.initFromModularConfig(
             runtime_gpa,
             init.io,
             home_dir,
-            load_result.config.database_server_url,
-            load_result.config.database_auth_token,
+            session_backend_kind,
+            load_result.config.effectiveDatabaseUrl(),
+            load_result.config.effectiveDatabaseAuthToken(),
+            load_result.config.effectiveDatabasePath(),
             init.environ_map,
         ) catch break :blk null;
         defer manager.deinit();
