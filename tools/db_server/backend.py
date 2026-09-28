@@ -267,7 +267,23 @@ class PostgresBackend(DatabaseBackend):
     async def connect(self) -> None:
         try:
             import asyncpg  # type: ignore
-            self._pool = await asyncpg.create_pool(self.connection_url)
+            url = self.connection_url
+            ssl_val: Any = None
+            if "sslmode=require" in url or "sslmode=verify-full" in url or "sslmode=verify-ca" in url:
+                ssl_val = "require"
+                url = url.replace("?sslmode=require", "").replace("&sslmode=require", "")
+                url = url.replace("?sslmode=verify-full", "").replace("&sslmode=verify-full", "")
+                url = url.replace("?sslmode=verify-ca", "").replace("&sslmode=verify-ca", "")
+
+            kwargs: dict[str, Any] = {
+                "min_size": 1,
+                "max_size": 10,
+                "statement_cache_size": 0,  # Critical for PgBouncer / Supavisor / Neon poolers
+            }
+            if ssl_val is not None:
+                kwargs["ssl"] = ssl_val
+
+            self._pool = await asyncpg.create_pool(url, **kwargs)
         except ImportError:
             # Fallback or informative notice
             pass
