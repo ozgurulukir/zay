@@ -501,15 +501,28 @@ pub fn submitMode(app: *App) !bool {
                     },
                     .database => {
                         app.mode = .normal;
-                        const backend_str = app.cached_config.effectiveDatabaseBackend().asString();
+                        const configured_backend = app.cached_config.effectiveDatabaseBackend().asString();
+                        const runtime = app.liveRuntime();
+                        const active_backend = if (runtime) |live|
+                            live.session_writer.manager.backend.kind.asString()
+                        else
+                            "(none)";
+                        const backend_state = if (runtime == null)
+                            "unavailable"
+                        else if (std.mem.eql(u8, configured_backend, active_backend))
+                            "active"
+                        else
+                            "fallback";
                         const url_str = app.cached_config.effectiveDatabaseUrl() orelse "(none)";
-                        var db_buf: [256]u8 = undefined;
+                        var db_buf: [320]u8 = undefined;
                         const db_text = try std.fmt.bufPrint(
                             &db_buf,
                             "Database Backend:\n" ++
-                                "  • Kind: {s}\n" ++
+                                "  • Configured: {s}\n" ++
+                                "  • Active:     {s}\n" ++
+                                "  • State:      {s}\n" ++
                                 "  • URL:  {s}",
-                            .{ backend_str, url_str },
+                            .{ configured_backend, active_backend, backend_state, url_str },
                         );
                         _ = try app.thread.transcript.append(app.gpa, .notice, "database", db_text);
                     },
