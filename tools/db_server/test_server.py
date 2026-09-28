@@ -120,3 +120,11 @@ def test_schema_inspection(client: TestClient):
     col_names = [col["name"] for col in tables["documents"]]
     assert "id" in col_names
     assert "title" in col_names
+
+
+def test_to_pg_sql_translation():
+    from backend import to_pg_sql
+
+    assert to_pg_sql("SELECT * FROM t WHERE a = ? AND b = ?") == "SELECT * FROM t WHERE a = $1 AND b = $2"
+    assert to_pg_sql("UPDATE t SET a = ?1 WHERE b = ?2") == "UPDATE t SET a = $1 WHERE b = $2"
+    assert to_pg_sql("SELECT 'what? is ?' FROM t WHERE x = ?") == "SELECT 'what? is ?' FROM t WHERE x = $1"
